@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// The key of [`specializes_query`]: whether `specializing` specializes `parent`.
-#[blaze_query::interned(debug)]
+#[blaze_memo::interned(debug)]
 pub struct ImplPair {
     #[returns(copy)]
     pub specializing: ImplId,
@@ -42,7 +42,7 @@ pub struct ImplPair {
 // and indeed I was unable to cause cycles even with erroneous code. However, in r-a we can
 // create a cycle if there is an error in the impl's where clauses. I believe well formed code
 // cannot create a cycle, but a cycle handler is required nevertheless.
-fn specializes_query_cycle(_db: &Db, _: blaze_query::db::Id, _pair: ImplPair) -> bool {
+fn specializes_query_cycle(_db: &Db, _pair: ImplPair) -> bool {
     false
 }
 
@@ -90,8 +90,8 @@ pub fn specialization_mode(db: &Db, krate: base_db::Crate) -> SpecializationMode
 
 /// Whether the crate of `impl_id` enables `specialization`, `min_specialization` or blaze's
 /// `#![blaze::specialization]`: only then may it specialize another impl.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
-pub(crate) fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
     specialization_mode(db, impl_id.krate(db)).may_specialize()
 }
 
@@ -106,8 +106,8 @@ pub(crate) fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
 /// `parent_impl_def_id` is a const impl (conditionally based off of some `[const]`
 /// bounds), then `specializing_impl_def_id` must also be const for the same
 /// set of types.
-#[blaze_query::tracked(cycle_result = specializes_query_cycle, returns(copy), mem_tag = Infer)]
-fn specializes_query<'db>(db: &'db Db, pair: ImplPair<'db>) -> bool {
+#[blaze_memo::tracked(cycle_result = specializes_query_cycle, returns(copy), mem_tag = Infer)]
+pub fn specializes_query<'db>(db: &'db Db, pair: ImplPair<'db>) -> bool {
     let (specializing_impl_def_id, parent_impl_def_id) = (pair.specializing(db), pair.parent(db));
     let trait_env = db.trait_environment(specializing_impl_def_id.into());
     let interner = DbInterner::new_with(db, specializing_impl_def_id.krate(db));
@@ -329,8 +329,8 @@ fn parameters_for<'db>(
 /// `enforce_impl_non_lifetime_params_are_constrained`). rustc's `assoc_def` refuses to
 /// project an item such an impl defines, which would leave the parameter an inference
 /// variable nothing constrains, and gives an error instead.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
-pub(crate) fn impl_has_unconstrained_params(db: &Db, impl_id: ImplId) -> bool {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn impl_has_unconstrained_params(db: &Db, impl_id: ImplId) -> bool {
     blaze_mem::frame::current(|frame| {
         let Some(constrained) = constrained_params(db, frame, impl_id) else { return false };
         type_or_const_params(db, impl_id)

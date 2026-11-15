@@ -59,7 +59,7 @@ pub(crate) type Key = (StoredTy, u32);
 /// (layouts, names, captures, discriminants) mostly stays as it was. It is of the type alone,
 /// with the types it is made of by their keys, so that it is kept once for every type that is
 /// made of it, and depends on nothing of theirs.
-#[blaze_query::tracked(returns(clone))]
+#[blaze_memo::tracked(returns(clone), owns)]
 pub(crate) fn told_type(
     db: &Db,
     env: StoredParamEnvAndCrate,

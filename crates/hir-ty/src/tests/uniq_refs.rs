@@ -107,7 +107,7 @@ fn function_in(db: &base_db::Db, krate: base_db::Crate, name: &str) -> FunctionI
 #[test]
 fn uniq_and_mut_references_are_accepted_for_each_other() {
     let db = fixture::db(ACCEPTED).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for name in ["by_uniq", "by_mut", "field", "field_mut", "takes_uniq", "takes_mut", "main"] {
             let def = DefWithBodyId::FunctionId(function(&db, name));
             let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
@@ -126,7 +126,7 @@ fn uniq_and_mut_references_are_accepted_for_each_other() {
 #[test]
 fn a_uniq_reference_pattern_is_a_mut_reference_pattern() {
     let db = fixture::db(ACCEPTED).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         for binding in ["by_uniq", "of_mut", "in_tuple", "in_closure"] {
             let (shown, mismatched) = binding_ty(&db, krate, "patterns", binding);
@@ -150,7 +150,7 @@ fn a_gated_crate_displays_unique_references_as_uniq() {
         ),
     ] {
         let db = fixture::db(fixture).into_db();
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
             let krate = fixture::test_crate(&db);
             let target = DisplayTarget::from_crate(&db, krate);
             let def = DefWithBodyId::FunctionId(function(&db, "main"));
@@ -251,7 +251,7 @@ pub fn gateds() {
 #[test]
 fn uniq_in_a_gated_crates_macros_is_the_unique_reference() {
     let db = fixture::db(IN_MACROS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let gated = crate_named(&db, "gated");
         for (func, binding, ty) in [
             ("in_calls", "handed", "&uniq u32"),
@@ -276,7 +276,7 @@ fn uniq_in_a_gated_crates_macros_is_the_unique_reference() {
 #[test]
 fn uniq_in_a_macro_is_read_under_the_gate_of_the_crate_that_wrote_it() {
     let db = fixture::db(IN_MACROS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (gated, plain) = (crate_named(&db, "gated"), crate_named(&db, "plain"));
         assert!(gated.extensions(&db).uniq() && plain.extensions(&db).is_none());
         // `gated` calls `rust`'s macros.

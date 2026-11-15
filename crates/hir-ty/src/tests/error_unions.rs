@@ -70,7 +70,7 @@ fn fields_of(
     check: impl FnOnce(&Db, &[Ty<'_>], &[TyLoweringDiagnostic]),
 ) {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = crate_named(&db, krate);
         let v = crate_def_map(&db, krate)
             .modules(&db)
@@ -141,7 +141,7 @@ fn a_member_that_is_not_a_known_named_type_is_refused_naming_why() {
 #[test]
 fn a_crate_without_the_attribute_parses_no_union() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (main, other) = (crate_named(&db, "main"), crate_named(&db, "other"));
         assert!(main.extensions(&db).error_unions());
         assert!(other.extensions(&db).is_none());
@@ -327,7 +327,7 @@ fn function(db: &Db, krate: &str, name: &str) -> FunctionId {
 /// were widened into a union by coercion.
 fn inferred(krate: &str, name: &str, check: impl FnOnce(&Db, &InferenceResult<'_>, usize)) {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let func = function(&db, krate, name);
         let result =
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)));
@@ -436,7 +436,7 @@ fn a_union_is_an_error_when_its_members_are() {
 /// How many of the patterns of `krate`'s function `name` match an error union by member.
 fn member_patterns(krate: &str, name: &str, check: impl FnOnce(&InferenceResult<'_>, usize)) {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let func = function(&db, krate, name);
         let result =
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)));

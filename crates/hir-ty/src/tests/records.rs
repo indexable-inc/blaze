@@ -61,7 +61,7 @@ fn crate_named(db: &Db, name: &str) -> Crate {
 /// lowering them.
 fn fields(fixture: &str, krate: &str, check: impl FnOnce(&Db, &[Ty<'_>], &[TyLoweringDiagnostic])) {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = crate_named(&db, krate);
         let v = crate_def_map(&db, krate)
             .modules(&db)
@@ -274,7 +274,7 @@ fn function(db: &Db, krate: &str, name: &str) -> FunctionId {
 /// Infers `krate`'s function `name` of [`BODIES`].
 fn inferred(krate: &str, name: &str, check: impl FnOnce(&Db, &InferenceResult<'_>)) {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let func = function(&db, krate, name);
         let body = InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func));
         check(&db, InferenceResult::of(&db, body));
@@ -393,7 +393,7 @@ fn parameter<'db>(db: &'db Db, function: FunctionId, index: usize) -> Ty<'db> {
 #[test]
 fn defaults_are_no_part_of_the_type_and_are_keyed_one_field_at_a_time() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let open = function(&db, "main", "open");
         let other = function(&db, "main", "same_but_mode");
         // The parameter is the record `{ create: bool, depth: u32, mode: u32 }` in both: a
@@ -402,12 +402,12 @@ fn defaults_are_no_part_of_the_type_and_are_keyed_one_field_at_a_time() {
         let lang_items = hir_def::lang_item::lang_items(&db, crate_named(&db, "main"));
         let record = record_fields(lang_items, parameter(&db, open, 1)).expect("a record");
         assert_eq!(record.names().collect::<Vec<_>>(), ["create", "depth", "mode"]);
-
+    
         // The defaults, in the order declared.
         let declared = record_param_defaults(&db, open);
         let names: Vec<_> = declared.iter().map(|it| (it.param, it.field.as_str())).collect();
         assert_eq!(names, [(1, "create"), (1, "mode"), (1, "depth")]);
-
+    
         // The key is the function, the parameter and the field; the value that one constant.
         // The two functions differ in `mode`'s default alone: a caller that leaves out
         // `create` or `depth` reads a value that did not change, and one that leaves out
@@ -449,7 +449,7 @@ fn impl_method(db: &Db, for_: &str, name: &str) -> FunctionId {
 #[test]
 fn a_trait_methods_defaults_are_its_declarations() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let disk = impl_method(&db, "Disk", "put");
         let declared = crate::record_defaults_owner(&db, disk);
         assert_ne!(declared, disk, "the trait's method declares them");
@@ -474,7 +474,7 @@ fn a_trait_methods_defaults_are_its_declarations() {
 #[test]
 fn a_function_of_another_abi_takes_no_record() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let foreign = function(&db, "main", "foreign");
         let lowered = crate::lower::fn_sig_for_fn(&db, foreign);
         assert_eq!(refusals(lowered.diagnostics()), [RecordRefusal::ExternAbi]);

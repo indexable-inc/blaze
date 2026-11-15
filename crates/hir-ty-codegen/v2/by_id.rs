@@ -41,11 +41,11 @@ impl Hashes for ById {
     }
 
     fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
-        Ok(blaze_query::db::attach(db, || by_id("test type", ty)))
+        Ok(blaze_memo::attach(db, || by_id("test type", ty)))
     }
 
     fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
-        Ok(blaze_query::db::attach(db, || by_id("test const", konst)))
+        Ok(blaze_memo::attach(db, || by_id("test const", konst)))
     }
 
     fn span(&self, _: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String> {

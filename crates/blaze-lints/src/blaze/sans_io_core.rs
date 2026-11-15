@@ -104,8 +104,8 @@ impl Effect {
 
 /// What `f` is to the ambient walk, by its crate, its module path and its name: once per
 /// function.
-#[blaze_query::tracked(returns(copy))]
-pub(crate) fn ambient(db: &Db, f: FunctionId) -> Ambient {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn ambient<'db>(db: &'db Db, f: FunctionId) -> Ambient {
     let function = hir::Function::from(f);
     let module = function.module(db);
     let krate = module.krate(db);

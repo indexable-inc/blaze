@@ -17,7 +17,7 @@
 //!   then the seen crates' for one self type ([`inherent_impls_of`]); a frozen crate's come
 //!   from its one frozen table ([`inherent_impls_in`]);
 //! - traits with an item of a name, for method candidates: one crate's for one name, from
-//!   hir-ty's maintained candidate slice ([`traits_named`]), then the seen crates'
+//!   hir-ty's candidates of that name ([`traits_named`]), then the seen crates'
 //!   ([`traits_with`]); a frozen crate's per module ([`traits_in_module`], [`traits_in`]);
 //! - names: one scope's, all of them ([`scope_names`]), from which [`scope`] picks one.
 //!
@@ -60,7 +60,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use hir_ty::{
     db::HirDatabase,
-    method_resolution::{InherentImpls, TraitImpls, delta, frozen, loaded_crates},
+    method_resolution::{self, InherentImpls, TraitImpls, frozen, loaded_crates},
     next_solver::{DbInterner, SimplifiedType as HirSimplifiedType},
 };
 use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
@@ -70,7 +70,7 @@ use crate::{
     SimplifiedType,
     hash::{self, Unhashable},
     key::{self, KeyHashing, Resolved},
-    table::column,
+    table::Keep,
 };
 
 const IMPLS_DOMAIN: &str = "blaze v2 index impls 2";
@@ -146,7 +146,7 @@ pub fn scope(db: &Db, key: ScopeIndexKey) -> Result<ScopeEntry, Unhashable> {
             unreachable!("{key:?} names something that is not a scope")
         }
     };
-    Ok(scope_names(db, owner, ()).get(key.name))
+    Ok(scope_names(db, owner).get(key.name))
 }
 
 /// The impls an index holds for one question, by key with each one's signature hash.
@@ -317,7 +317,9 @@ pub(crate) enum AnyImpl {
     BuiltinDerive(BuiltinDeriveImplId),
 }
 
-const _: () = assert!(size_of::<AnyImpl>() == 8);
+// Each id is a memo `Gid` (arena and local index, 8 bytes, aligned to 4), so the tag takes 4
+// more: 12 bytes (8 when ids were 4-byte salsa ids). An index row `(ItemKey, AnyImpl)` is 44.
+const _: () = assert!(size_of::<AnyImpl>() == 12);
 
 /// An impl's signature hash: an impl fact's value is computed inside a body's inference, which
 /// an interface hash, holding what bodies leak, may reach. A built-in derive impl has no item
@@ -351,17 +353,25 @@ where
 /// The crates `krate` sees ([`loaded_crates`]) that hold an impl of `trait_`, in that order: what
 /// each impl question of `krate` about `trait_` combines, so a crate with none of its impls
 /// costs a read here, once per asking crate and trait, and none per question.
-#[blaze_query::tracked(returns(deref))]
-fn trait_holders(db: &Db, krate: Crate, trait_: TraitId) -> Box<[Crate]> {
+#[blaze_memo::tracked(returns(copy))]
+fn trait_holders<'db>(db: &'db Db, krate: Crate, trait_: TraitId) -> &'db [Crate] {
     let _p = tracing::info_span!(target: "blaze", "trait_holders", ?krate, ?trait_).entered();
     frame::task(Tag::Other, |frame| {
         let mut found: Vec<Crate, &Frame> = Vec::new_in(frame);
-        for &seen in loaded_crates(db, krate) {
+        let loaded = loaded_crates(db, krate);
+        // Only the crates that can name the trait's crate are asked: one that cannot holds no
+        // impl of it, and a key pairing it with the trait names two arenas neither of which
+        // borrows the other, which the memo refuses (the panic that stopped a build at
+        // `codegen describe`). hir-ty's own walks ask the same crates
+        // (`TraitImpls::blanket_in_crate_and_deps`).
+        let names = method_resolution::crates_that_name(db, krate);
+        for at in names.holders(frame, trait_.krate(db), None) {
+            let seen = loaded[at];
             if trait_impls_in(db, seen, trait_).all().iter().len() != 0 {
                 found.push(seen);
             }
         }
-        Box::from(&found[..]) // alloc: the memo's value at its length.
+        Keep::run(db).slice(&found)
     })
 }
 
@@ -381,7 +391,7 @@ pub(crate) fn implements_value(
 /// The values of the impls of `trait_` for `self_ty` and of its blanket impls that `krate`
 /// sees, hashed once for every fact of `krate` that reads them: each holder's own values,
 /// combined ([`combined`]).
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn implements_entries(
     db: &Db,
     krate: Crate,
@@ -394,7 +404,7 @@ fn implements_entries(
 }
 
 /// The value of the blanket impls of `trait_` that `krate` sees, once per crate and trait.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn seen_blanket_value(db: &Db, krate: Crate, trait_: TraitId) -> Result<ContentId, Unhashable> {
     combined(trait_holders(db, krate, trait_).iter().map(|&it| own_blanket_impls(db, it, trait_)))
 }
@@ -410,7 +420,7 @@ fn seen_blanket_value(db: &Db, krate: Crate, trait_: TraitId) -> Result<ContentI
 ///
 /// It combines each holder's [`own_impls_value`], so a crate's impls are hashed once for every
 /// crate that sees it rather than once per one: O(holders) here.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn seen_impls_value(
     db: &Db,
     krate: Crate,
@@ -444,8 +454,8 @@ fn combined(
 
 /// The value of the impls of `trait_` in `krate` alone, sorted by key: `None` when it has
 /// none. What [`seen_impls_value`] combines over the crates a crate sees.
-#[blaze_query::tracked(returns(copy))]
-fn own_impls_value(
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn own_impls_value(
     db: &Db,
     krate: Crate,
     trait_: TraitId,
@@ -454,7 +464,7 @@ fn own_impls_value(
 }
 
 /// The value of the impls of `trait_` for `self_ty` in `krate` alone: `None` when it has none.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn own_impls_for(
     db: &Db,
     krate: Crate,
@@ -465,7 +475,7 @@ fn own_impls_for(
 }
 
 /// The value of the blanket impls of `trait_` in `krate` alone: `None` when it has none.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn own_blanket_impls(
     db: &Db,
     krate: Crate,
@@ -522,23 +532,24 @@ pub(crate) fn impl_self_ty(db: &Db, imp: ImplId) -> Option<SimplifiedType> {
 /// `starts[i]..starts[i + 1]` is the run of `searched[i]` in `keys` and `values`, and the
 /// rows before `starts[0]` have no searched value (a trait's blanket impls). `values` is
 /// read only after the search.
-#[derive(PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Runs<S, T> {
-    searched: Box<[S]>,
-    starts: Box<[u32]>,
-    keys: Box<[ItemKey]>,
-    values: Box<[T]>,
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Runs<'a, S, T> {
+    searched: &'a [S],
+    starts: &'a [u32],
+    keys: &'a [ItemKey],
+    values: &'a [T],
 }
 
-impl<S: Copy + Ord, T: Copy> Runs<S, T> {
-    /// The columns of `rows`, which it sorts.
-    fn new(rows: &mut [(Option<S>, ItemKey, T)]) -> Self {
+impl<'a, S: Copy + Ord + Send + Sync + 'static, T: Copy + Send + Sync + 'static> Runs<'a, S, T> {
+    /// The columns of `rows`, which it sorts, kept by `keep`; `frame` holds what they are
+    /// counted in.
+    fn new(keep: Keep<'a>, frame: &Frame, rows: &mut [(Option<S>, ItemKey, T)]) -> Self {
         rows.sort_unstable_by_key(|&(at, key, _)| (at, key));
         let opens =
             |row: usize| rows[row].0.is_some() && (row == 0 || rows[row - 1].0 != rows[row].0);
         let runs = (0..rows.len()).filter(|&row| opens(row)).count();
-        let mut searched = Vec::with_capacity(runs);
-        let mut starts = Vec::with_capacity(runs + 1);
+        let mut searched: Vec<S, &Frame> = Vec::with_capacity_in(runs, frame);
+        let mut starts: Vec<u32, &Frame> = Vec::with_capacity_in(runs + 1, frame);
         for (row, &(at, _, _)) in rows.iter().enumerate() {
             if let Some(at) = at
                 && opens(row)
@@ -549,15 +560,17 @@ impl<S: Copy + Ord, T: Copy> Runs<S, T> {
         }
         starts.push(row_index(rows.len()));
         Runs {
-            searched: searched.into_boxed_slice(),
-            starts: starts.into_boxed_slice(),
-            keys: column(rows.iter().map(|&(_, key, _)| key)),
-            values: column(rows.iter().map(|&(_, _, value)| value)),
+            searched: keep.slice(&searched),
+            starts: keep.slice(&starts),
+            keys: keep.column(rows.iter().map(|&(_, key, _)| key)),
+            values: keep.column(rows.iter().map(|&(_, _, value)| value)),
         }
     }
+}
 
+impl<'a, S: Copy + Ord, T: Copy> Runs<'a, S, T> {
     /// The rows whose searched value is `at`, sorted by key; `None` is the rows with none.
-    fn run(&self, at: Option<S>) -> Columns<'_, T> {
+    fn run(self, at: Option<S>) -> Columns<'a, T> {
         let rows = match at {
             None => 0..self.starts[0] as usize,
             Some(at) => match self.searched.binary_search(&at) {
@@ -570,8 +583,8 @@ impl<S: Copy + Ord, T: Copy> Runs<S, T> {
     }
 
     /// Every row, in order.
-    pub(crate) fn all(&self) -> Columns<'_, T> {
-        Columns { keys: &self.keys, values: &self.values }
+    pub(crate) fn all(self) -> Columns<'a, T> {
+        Columns { keys: self.keys, values: self.values }
     }
 }
 
@@ -593,38 +606,42 @@ impl<'a, T: Copy> Columns<'a, T> {
 }
 
 /// One question's rows, sorted by key, as two columns.
-#[derive(PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Keyed<T> {
-    keys: Box<[ItemKey]>,
-    values: Box<[T]>,
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Keyed<'a, T> {
+    keys: &'a [ItemKey],
+    values: &'a [T],
 }
 
-impl<T: Copy> Keyed<T> {
-    /// The columns of `rows`, which it sorts.
-    fn sorted(rows: &mut [(ItemKey, T)]) -> Self {
+impl<'a, T: Copy + Send + Sync + 'static> Keyed<'a, T> {
+    /// The columns of `rows`, which it sorts, kept by `keep`.
+    fn sorted(keep: Keep<'a>, rows: &mut [(ItemKey, T)]) -> Self {
         rows.sort_unstable_by_key(|&(key, _)| key);
-        Keyed::of(rows.iter().copied())
+        Keyed::of(keep, rows)
     }
 
-    fn of(rows: impl ExactSizeIterator<Item = (ItemKey, T)>) -> Self {
-        let mut keys = Vec::with_capacity(rows.len());
-        let mut values = Vec::with_capacity(rows.len());
-        for (key, value) in rows {
-            keys.push(key);
-            values.push(value);
+    /// The columns of `rows`, in their order, kept by `keep`.
+    fn of(keep: Keep<'a>, rows: &[(ItemKey, T)]) -> Self {
+        Keyed {
+            keys: keep.column(rows.iter().map(|&(key, _)| key)),
+            values: keep.column(rows.iter().map(|&(_, value)| value)),
         }
-        Keyed { keys: keys.into_boxed_slice(), values: values.into_boxed_slice() }
     }
+}
 
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (ItemKey, T)> + '_ {
-        Columns { keys: &self.keys, values: &self.values }.iter()
+impl<'a, T: Copy> Keyed<'a, T> {
+    pub(crate) fn iter(self) -> impl ExactSizeIterator<Item = (ItemKey, T)> + 'a {
+        Columns { keys: self.keys, values: self.values }.iter()
     }
 }
 
 /// The impls of `trait_` in `krate`, by simplified self type (the blanket ones as their own
 /// run, first), then key.
-#[blaze_query::tracked(returns(ref))]
-fn trait_impls_in(db: &Db, krate: Crate, trait_: TraitId) -> Runs<SimplifiedType, AnyImpl> {
+#[blaze_memo::tracked(returns(copy))]
+fn trait_impls_in<'db>(
+    db: &'db Db,
+    krate: Crate,
+    trait_: TraitId,
+) -> Runs<'db, SimplifiedType, AnyImpl> {
     frame::task(Tag::Other, |frame| {
         let mut found: Vec<_, &Frame> = Vec::new_in(frame);
         TraitImpls::for_crate_and_trait(db, krate, trait_).for_trait(trait_, |impls| match impls {
@@ -640,26 +657,32 @@ fn trait_impls_in(db: &Db, krate: Crate, trait_: TraitId) -> Runs<SimplifiedType
                 )
             })),
         });
-        Runs::new(&mut found)
+        Runs::new(Keep::run(db), frame, &mut found)
     })
 }
 
 /// The inherent impls of a frozen `krate`, from its one frozen table, by the hash of their
 /// simplified self type, then key.
-#[blaze_query::tracked(returns(ref))]
-fn inherent_impls_in(db: &Db, krate: Crate) -> Runs<SimplifiedType, ImplId> {
+#[blaze_memo::tracked(returns(copy))]
+fn inherent_impls_in<'db>(db: &'db Db, krate: Crate) -> Runs<'db, SimplifiedType, ImplId> {
     inherent_rows(db, InherentImpls::for_crate(db, krate))
 }
 
 /// The inherent impls of `module` and of the blocks in the bodies it holds, by the hash of
 /// their simplified self type, then key: equal unless one of them is added, removed or
 /// changes its self type.
-#[blaze_query::tracked(returns(ref))]
-fn inherent_impls_in_module(db: &Db, module: ModuleId) -> Runs<SimplifiedType, ImplId> {
+#[blaze_memo::tracked(returns(copy))]
+fn inherent_impls_in_module<'db>(
+    db: &'db Db,
+    module: ModuleId,
+) -> Runs<'db, SimplifiedType, ImplId> {
     inherent_rows(db, InherentImpls::for_module(db, module))
 }
 
-fn inherent_rows(db: &Db, impls: &InherentImpls<'_>) -> Runs<SimplifiedType, ImplId> {
+fn inherent_rows<'db>(
+    db: &'db Db,
+    impls: &InherentImpls<'_>,
+) -> Runs<'db, SimplifiedType, ImplId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
         for (self_ty, impls) in impls.iter() {
@@ -668,15 +691,15 @@ fn inherent_rows(db: &Db, impls: &InherentImpls<'_>) -> Runs<SimplifiedType, Imp
                 impls.iter().map(|&it| (Some(self_ty), key::item_key(db, ItemId::Impl(it)), it)),
             );
         }
-        Runs::new(&mut rows)
+        Runs::new(Keep::run(db), frame, &mut rows)
     })
 }
 
 /// The modules of `krate` with an inherent impl for each simplified self type, by its hash,
 /// then the module's key: equal unless a module gains its first impl for a type or loses its
 /// last.
-#[blaze_query::tracked(returns(ref))]
-fn inherent_impl_modules(db: &Db, krate: Crate) -> Runs<SimplifiedType, ModuleId> {
+#[blaze_memo::tracked(returns(copy))]
+fn inherent_impl_modules<'db>(db: &'db Db, krate: Crate) -> Runs<'db, SimplifiedType, ModuleId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
         for (module, _) in crate_def_map(db, krate).modules(db) {
@@ -687,29 +710,43 @@ fn inherent_impl_modules(db: &Db, krate: Crate) -> Runs<SimplifiedType, ModuleId
             let key = key::module_key(db, module);
             rows.extend(in_module.searched.iter().map(|&self_ty| (Some(self_ty), key, module)));
         }
-        Runs::new(&mut rows)
+        Runs::new(Keep::run(db), frame, &mut rows)
     })
 }
 
 /// The modules of `krate` with an inherent impl for `self_ty`: equal unless that list changes,
 /// whatever other types gain.
-#[blaze_query::tracked(returns(deref))]
-fn inherent_modules_of(db: &Db, krate: Crate, self_ty: SimplifiedType) -> Box<[ModuleId]> {
+#[blaze_memo::tracked(returns(copy))]
+fn inherent_modules_of<'db>(
+    db: &'db Db,
+    krate: Crate,
+    self_ty: SimplifiedType,
+) -> &'db [ModuleId] {
     let modules = inherent_impl_modules(db, krate).run(Some(self_ty));
-    column(modules.iter().map(|(_, module)| module))
+    Keep::run(db).column(modules.iter().map(|(_, module)| module))
 }
 
 /// The inherent impls of `module` for `self_ty`, sorted by key: equal unless one for that
 /// type is added there or removed.
-#[blaze_query::tracked(returns(ref))]
-fn module_inherent_impls_of(db: &Db, module: ModuleId, self_ty: SimplifiedType) -> Keyed<ImplId> {
-    Keyed::of(inherent_impls_in_module(db, module).run(Some(self_ty)).iter())
+#[blaze_memo::tracked(returns(copy))]
+fn module_inherent_impls_of<'db>(
+    db: &'db Db,
+    module: ModuleId,
+    self_ty: SimplifiedType,
+) -> Keyed<'db, ImplId> {
+    let run = inherent_impls_in_module(db, module).run(Some(self_ty));
+    let keep = Keep::run(db);
+    Keyed { keys: keep.slice(run.keys), values: keep.slice(run.values) }
 }
 
 /// The inherent impls for `self_ty` of the crates `krate` sees ([`loaded_crates`]), sorted by
 /// key. Reads, in each crate, only the modules with impls for that type.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn inherent_impls_of(db: &Db, krate: Crate, self_ty: SimplifiedType) -> Keyed<ImplId> {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn inherent_impls_of<'db>(
+    db: &'db Db,
+    krate: Crate,
+    self_ty: SimplifiedType,
+) -> Keyed<'db, ImplId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
         for &seen in loaded_crates(db, krate) {
@@ -721,15 +758,15 @@ pub(crate) fn inherent_impls_of(db: &Db, krate: Crate, self_ty: SimplifiedType) 
                 rows.extend(module_inherent_impls_of(db, module, self_ty).iter());
             }
         }
-        Keyed::sorted(&mut rows)
+        Keyed::sorted(Keep::run(db), &mut rows)
     })
 }
 
 /// The traits declared in `module` of a frozen crate, by the hash of each name one of their
 /// items has, then key, each pair once: equal unless such a trait or the names of its items
-/// change. A maintained crate's are its candidate slices ([`traits_named`]).
-#[blaze_query::tracked(returns(deref))]
-fn traits_in_module(db: &Db, module: ModuleId) -> Box<[(NameHash, ItemKey, TraitId)]> {
+/// change. A crate not served from pages is asked by name instead ([`traits_named`]).
+#[blaze_memo::tracked(returns(copy))]
+fn traits_in_module<'db>(db: &'db Db, module: ModuleId) -> &'db [(NameHash, ItemKey, TraitId)] {
     frame::task(Tag::Other, |frame| {
         let mut names: Vec<&str, &Frame> = Vec::new_in(frame);
         let mut traits: Vec<_, &Frame> = Vec::new_in(frame);
@@ -750,66 +787,67 @@ fn traits_in_module(db: &Db, module: ModuleId) -> Box<[(NameHash, ItemKey, Trait
         );
         found.sort_unstable_by_key(|&(name, key, _)| (name, key));
         found.dedup_by_key(|&mut (name, key, _)| (name, key));
-        column(found.iter().copied())
+        Keep::run(db).slice(&found)
     })
 }
 
 /// The traits declared in `krate`'s modules, by the hash of each name one of their items
 /// has, then key: reruns only when some module's [`traits_in_module`] changes. A trait is
 /// declared in one module, so the modules' rows never repeat one another.
-#[blaze_query::tracked(returns(ref))]
-fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
+#[blaze_memo::tracked(returns(copy))]
+fn traits_in<'db>(db: &'db Db, krate: Crate) -> Runs<'db, NameHash, TraitId> {
     frame::task(Tag::Other, |frame| {
         let mut found: Vec<_, &Frame> = Vec::new_in(frame);
         for (module, _) in crate_def_map(db, krate).modules(db) {
             let rows = traits_in_module(db, module);
             found.extend(rows.iter().map(|&(name, key, trait_)| (Some(name), key, trait_)));
         }
-        Runs::new(&mut found)
+        Runs::new(Keep::run(db), frame, &mut found)
     })
 }
 
-/// Every name a trait item of maintained `krate` has (hir-ty's candidate directory), by hash,
-/// then name: reruns only when the crate's traits gain a name never seen in it.
-#[blaze_query::tracked(returns(deref))]
-fn candidate_names(db: &Db, krate: Crate) -> Box<[(NameHash, Name)]> {
+/// Every name a trait item of `krate` has (hir-ty's `impl_directory`; `krate` is not served
+/// from impl table pages), by hash, then name: reruns only when the crate's set of trait item
+/// names changes.
+#[blaze_memo::tracked(returns(copy))]
+fn candidate_names<'db>(db: &'db Db, krate: Crate) -> &'db [(NameHash, Name)] {
     frame::task(Tag::Other, |frame| {
         let mut names: Vec<Name, &Frame> = Vec::new_in(frame);
-        names.extend(delta::candidate_names(db, krate));
+        names.extend(method_resolution::candidate_names(db, krate));
         let hashes = name_hashes(names.iter().map(Name::as_str));
         let mut rows: Vec<(NameHash, Name), &Frame> = Vec::with_capacity_in(names.len(), frame);
         rows.extend(hashes.into_iter().zip(names.iter().copied()));
         rows.sort_unstable();
-        column(rows.iter().copied())
+        Keep::run(db).slice(&rows)
     })
 }
 
-/// The traits declared in maintained `krate`'s modules with an item whose name hashes to
-/// `name`, sorted by key: the candidate slice of that name alone, so a trait gaining an item of
-/// another name leaves this as it was.
-#[blaze_query::tracked(returns(ref))]
-fn traits_named(db: &Db, krate: Crate, name: NameHash) -> Keyed<TraitId> {
+/// The traits declared in `krate`'s modules (not served from impl table pages) with an item
+/// whose name hashes to `name`, sorted by key: hir-ty's `candidates` of that name alone, so a
+/// trait gaining an item of another name leaves this as it was.
+#[blaze_memo::tracked(returns(copy))]
+fn traits_named<'db>(db: &'db Db, krate: Crate, name: NameHash) -> Keyed<'db, TraitId> {
     frame::task(Tag::Other, |frame| {
         let names = candidate_names(db, krate);
         let start = names.partition_point(|&(it, _)| it < name);
         let mut rows: Vec<(ItemKey, TraitId), &Frame> = Vec::new_in(frame);
         for &(_, named) in names[start..].iter().take_while(|&&(it, _)| it == name) {
             rows.extend(
-                delta::candidate_traits(db, krate, named)
+                method_resolution::candidates(db, krate, named)
                     .iter()
                     .map(|&trait_| (key::item_key(db, ItemId::Trait(trait_)), trait_)),
             );
         }
         rows.sort_unstable_by_key(|&(key, _)| key);
         rows.dedup_by_key(|&mut (key, _)| key);
-        Keyed::of(rows.iter().copied())
+        Keyed::of(Keep::run(db), &rows)
     })
 }
 
 /// The traits with an item whose name hashes to `name` of the crates `krate` sees
 /// ([`loaded_crates`]), sorted by key.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn traits_with(db: &Db, krate: Crate, name: NameHash) -> Keyed<TraitId> {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn traits_with<'db>(db: &'db Db, krate: Crate, name: NameHash) -> Keyed<'db, TraitId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
         for &seen in loaded_crates(db, krate) {
@@ -819,12 +857,12 @@ pub(crate) fn traits_with(db: &Db, krate: Crate, name: NameHash) -> Keyed<TraitI
                 rows.extend(traits_named(db, seen, name).iter());
             }
         }
-        Keyed::sorted(&mut rows)
+        Keyed::sorted(Keep::run(db), &mut rows)
     })
 }
 
 /// A scope names are looked up in.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_memo::Home)]
 pub(crate) enum ScopeOwner {
     Module(ModuleId),
     Enum(EnumId),
@@ -835,43 +873,43 @@ pub(crate) enum ScopeOwner {
 
 /// One scope's names as columns: `names`, sorted, is all a lookup's binary search touches;
 /// what the name at a position is sits at that position in `entries`.
-#[derive(PartialEq, Eq, Debug)]
-pub(crate) struct ScopeNames {
-    names: Box<[NameHash]>,
-    entries: ScopeColumns,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ScopeNames<'a> {
+    names: &'a [NameHash],
+    entries: ScopeColumns<'a>,
 }
 
 /// What each name of a scope is, one column per part (a scope's names are all of one kind).
 /// `starts[i]..starts[i + 1]` is name `i`'s run in the flat columns after it.
-#[derive(PartialEq, Eq, Debug)]
-enum ScopeColumns {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScopeColumns<'a> {
     Module {
-        types: Box<[Option<Binding>]>,
-        values: Box<[Option<Binding>]>,
-        macros: Box<[Option<Binding>]>,
-        starts: Box<[u32]>,
-        legacy_macros: Box<[ItemKey]>,
+        types: &'a [Option<Binding>],
+        values: &'a [Option<Binding>],
+        macros: &'a [Option<Binding>],
+        starts: &'a [u32],
+        legacy_macros: &'a [ItemKey],
     },
     Variant {
-        variants: Box<[ItemKey]>,
-        positions: Box<[u32]>,
+        variants: &'a [ItemKey],
+        positions: &'a [u32],
     },
     Field {
-        positions: Box<[u32]>,
-        visibilities: Box<[Vis]>,
+        positions: &'a [u32],
+        visibilities: &'a [Vis],
     },
     Assoc {
-        starts: Box<[u32]>,
-        keys: Box<[ItemKey]>,
-        visibilities: Box<[Vis]>,
+        starts: &'a [u32],
+        keys: &'a [ItemKey],
+        visibilities: &'a [Vis],
     },
 }
 
-impl ScopeNames {
-    fn get(&self, name: NameHash) -> ScopeEntry {
+impl ScopeNames<'_> {
+    fn get(self, name: NameHash) -> ScopeEntry {
         let Ok(at) = self.names.binary_search(&name) else { return ScopeEntry::Nothing };
         let run = |starts: &[u32]| starts[at] as usize..starts[at + 1] as usize;
-        match &self.entries {
+        match self.entries {
             ScopeColumns::Module { types, values, macros, starts, legacy_macros } => {
                 ScopeEntry::Module {
                     types: types[at],
@@ -898,12 +936,13 @@ impl ScopeNames {
 }
 
 /// Every name of `owner` with what it is there, sorted by the name's hash.
-#[blaze_query::tracked(returns(ref))]
-fn scope_names(db: &Db, owner: ScopeOwner, _: ()) -> ScopeNames {
+#[blaze_memo::tracked(returns(copy))]
+fn scope_names<'db>(db: &'db Db, owner: ScopeOwner) -> ScopeNames<'db> {
     frame::task(Tag::Nameres, |frame| scope_names_in(db, owner, frame))
 }
 
-fn scope_names_in(db: &Db, owner: ScopeOwner, frame: &Frame) -> ScopeNames {
+fn scope_names_in<'db>(db: &'db Db, owner: ScopeOwner, frame: &Frame) -> ScopeNames<'db> {
+    let keep = Keep::run(db);
     match owner {
         ScopeOwner::Module(module) => module_names(db, module, frame),
         ScopeOwner::Enum(it) => {
@@ -920,10 +959,10 @@ fn scope_names_in(db: &Db, owner: ScopeOwner, frame: &Frame) -> ScopeNames {
             );
             rows.sort_unstable_by_key(|&(name, _, _)| name);
             ScopeNames {
-                names: column(rows.iter().map(|it| it.0)),
+                names: keep.column(rows.iter().map(|it| it.0)),
                 entries: ScopeColumns::Variant {
-                    variants: column(rows.iter().map(|it| it.1)),
-                    positions: column(rows.iter().map(|it| it.2)),
+                    variants: keep.column(rows.iter().map(|it| it.1)),
+                    positions: keep.column(rows.iter().map(|it| it.2)),
                 },
             }
         }
@@ -943,10 +982,10 @@ fn scope_names_in(db: &Db, owner: ScopeOwner, frame: &Frame) -> ScopeNames {
             );
             rows.sort_unstable_by_key(|&(name, position, _)| (name, position));
             ScopeNames {
-                names: column(rows.iter().map(|it| it.0)),
+                names: keep.column(rows.iter().map(|it| it.0)),
                 entries: ScopeColumns::Field {
-                    positions: column(rows.iter().map(|it| it.1)),
-                    visibilities: column(rows.iter().map(|it| it.2)),
+                    positions: keep.column(rows.iter().map(|it| it.1)),
+                    visibilities: keep.column(rows.iter().map(|it| it.2)),
                 },
             }
         }
@@ -957,11 +996,12 @@ fn scope_names_in(db: &Db, owner: ScopeOwner, frame: &Frame) -> ScopeNames {
 
 /// A trait's or impl's items by name, each name's run sorted by key (a type and a value may
 /// share a name).
-fn assoc_names(
-    db: &Db,
+fn assoc_names<'db>(
+    db: &'db Db,
     items: &[(hir_expand::name::Name, AssocItemId)],
     frame: &Frame,
-) -> ScopeNames {
+) -> ScopeNames<'db> {
+    let keep = Keep::run(db);
     let mut rows: Vec<_, &Frame> = Vec::with_capacity_in(items.len(), frame);
     rows.extend(
         name_hashes(items.iter().map(|(name, _)| name.as_str())).into_iter().zip(items).map(
@@ -973,8 +1013,8 @@ fn assoc_names(
     rows.sort_unstable_by_key(|&(name, key, _)| (name, key));
     let opens = |row: usize| row == 0 || rows[row - 1].0 != rows[row].0;
     let runs = (0..rows.len()).filter(|&row| opens(row)).count();
-    let mut names = Vec::with_capacity(runs);
-    let mut starts = Vec::with_capacity(runs + 1);
+    let mut names: Vec<NameHash, &Frame> = Vec::with_capacity_in(runs, frame);
+    let mut starts: Vec<u32, &Frame> = Vec::with_capacity_in(runs + 1, frame);
     for (row, &(name, _, _)) in rows.iter().enumerate() {
         if opens(row) {
             names.push(name);
@@ -983,11 +1023,11 @@ fn assoc_names(
     }
     starts.push(row_index(rows.len()));
     ScopeNames {
-        names: names.into_boxed_slice(),
+        names: keep.slice(&names),
         entries: ScopeColumns::Assoc {
-            starts: starts.into_boxed_slice(),
-            keys: column(rows.iter().map(|it| it.1)),
-            visibilities: column(rows.iter().map(|it| it.2)),
+            starts: keep.slice(&starts),
+            keys: keep.column(rows.iter().map(|it| it.1)),
+            visibilities: keep.column(rows.iter().map(|it| it.2)),
         },
     }
 }
@@ -1002,7 +1042,8 @@ struct ModuleName {
     legacy: Option<usize>,
 }
 
-fn module_names(db: &Db, module: ModuleId, frame: &Frame) -> ScopeNames {
+fn module_names<'db>(db: &'db Db, module: ModuleId, frame: &Frame) -> ScopeNames<'db> {
+    let keep = Keep::run(db);
     let scope = module.def_map(db).module(db, module).scope(db);
     let mut entries: Vec<_, &Frame> = Vec::new_in(frame);
     entries.extend(scope.entries().filter(|(_, per_ns)| !per_ns.is_none()));
@@ -1052,9 +1093,9 @@ fn module_names(db: &Db, module: ModuleId, frame: &Frame) -> ScopeNames {
     let mut rows: Vec<_, &Frame> = Vec::with_capacity_in(by_name.len(), frame);
     rows.extend(by_name);
     rows.sort_unstable_by_key(|&(name, _)| name);
-    let mut starts = Vec::with_capacity(rows.len() + 1);
+    let mut starts: Vec<u32, &Frame> = Vec::with_capacity_in(rows.len() + 1, frame);
     let count = rows.iter().filter_map(|(_, it)| it.legacy).map(|at| legacy[at].1.len()).sum();
-    let mut legacy_macros = Vec::with_capacity(count);
+    let mut legacy_macros: Vec<ItemKey, &Frame> = Vec::with_capacity_in(count, frame);
     for (_, it) in rows.iter() {
         starts.push(row_index(legacy_macros.len()));
         if let Some(position) = it.legacy {
@@ -1064,13 +1105,13 @@ fn module_names(db: &Db, module: ModuleId, frame: &Frame) -> ScopeNames {
     }
     starts.push(row_index(legacy_macros.len()));
     ScopeNames {
-        names: column(rows.iter().map(|&(name, _)| name)),
+        names: keep.column(rows.iter().map(|&(name, _)| name)),
         entries: ScopeColumns::Module {
-            types: column(rows.iter().map(|(_, it)| it.types)),
-            values: column(rows.iter().map(|(_, it)| it.values)),
-            macros: column(rows.iter().map(|(_, it)| it.macros)),
-            starts: starts.into_boxed_slice(),
-            legacy_macros: legacy_macros.into_boxed_slice(),
+            types: keep.column(rows.iter().map(|(_, it)| it.types)),
+            values: keep.column(rows.iter().map(|(_, it)| it.values)),
+            macros: keep.column(rows.iter().map(|(_, it)| it.macros)),
+            starts: keep.slice(&starts),
+            legacy_macros: keep.slice(&legacy_macros),
         },
     }
 }

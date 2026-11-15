@@ -21,6 +21,8 @@
 //! role (`#[blaze::bounded_turn]`, `#[blaze::answers_request]`). Elsewhere an unknown is silent:
 //! most code reaches a body that does not lower, and a refusal of each would bury the findings.
 
+use std::alloc::Global;
+
 use base_db::Db;
 use hir_def::{
     AttrDefId, DefWithBodyId, FunctionId, HasModule as _,
@@ -31,8 +33,10 @@ use hir_ty_pure::{
     locks::{held_across, held_while_taking, lock_facts},
 };
 
+use intern::Symbol;
+
 use super::{Finding, Lint, effects::StepNote, facts};
-use crate::{check::Cx, diag};
+use crate::{check::Cx, diag, kept};
 
 /// How many modules one crate's graph reads at most.
 const MODULES: usize = 16_384;
@@ -94,23 +98,23 @@ fn asked(db: &Db, func: FunctionId) -> bool {
 }
 
 /// An edge of the crate's graph: the classes, the function of the crate whose summary has it,
-/// and whether its own body adds it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// and whether its own body adds it. The classes and the path are interned for the process
+/// ([`Symbol`]): a row kept in the query's arena owns nothing to drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CrateEdge {
-    held: Box<str>,
-    taken: Box<str>,
+    held: Symbol,
+    taken: Symbol,
     func: FunctionId,
     /// The function's path, what ties are broken by (an id's order is the interner's).
-    name: Box<str>,
+    name: Symbol,
     own: bool,
 }
 
 /// Every edge of the summaries of `krate`'s functions with bodies, sorted, each pair once (an
 /// own edge before an inherited one), once per crate.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn crate_edges(db: &Db, krate: base_db::Crate) -> Box<[CrateEdge]> {
-    // alloc: once per crate, the edges of its graph
-    let mut edges: Vec<CrateEdge> = Vec::new();
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn crate_edges<'db>(db: &'db Db, krate: base_db::Crate) -> &'db [CrateEdge] {
+    let mut edges: Vec<CrateEdge, Global> = Vec::new_in(Global);
     // alloc: the worklist of one crate's modules
     let mut modules = vec![hir::Crate::from(krate).root_module(db)];
     let mut seen = 0;
@@ -146,22 +150,27 @@ pub(crate) fn crate_edges(db: &Db, krate: base_db::Crate) -> Box<[CrateEdge]> {
             let facts = lock_facts(db, func);
             for edge in facts.order.iter() {
                 edges.push(CrateEdge {
-                    held: edge.held.clone(),       // clone: a class
-                    taken: edge.taken.clone(),     // clone: a class
+                    held: Symbol::intern(&edge.held),
+                    taken: Symbol::intern(&edge.taken),
                     func,
-                    name: facts.function.clone(), // clone: a path, once per edge
+                    name: Symbol::intern(&facts.function),
                     own: edge.own,
                 });
             }
         }
     }
     // The own edge of a pair first, then the least function by path, so the graph is the same
-    // however the modules were walked.
+    // however the modules were walked. By text: a symbol's own order is its address.
     edges.sort_by(|a, b| {
-        (&a.held, &a.taken, !a.own, &a.name).cmp(&(&b.held, &b.taken, !b.own, &b.name))
+        (a.held.as_str(), a.taken.as_str(), !a.own, a.name.as_str()).cmp(&(
+            b.held.as_str(),
+            b.taken.as_str(),
+            !b.own,
+            b.name.as_str(),
+        ))
     });
     edges.dedup_by(|b, a| a.held == b.held && a.taken == b.taken);
-    edges.into_boxed_slice()
+    kept::slice(db, edges)
 }
 
 /// The shortest path of edges from `from` to `to` in `edges` (sorted by `held`), by
@@ -172,8 +181,8 @@ fn path(edges: &[CrateEdge], from: &str, to: &str) -> Option<Vec<usize>> {
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new(); // alloc: as above
     /// The edges out of `class`: a run of the sorted edges.
     fn out<'e>(edges: &'e [CrateEdge], class: &'e str) -> impl Iterator<Item = usize> + 'e {
-        let start = edges.partition_point(|it| &*it.held < class);
-        (start..edges.len()).take_while(move |&at| &*edges[at].held == class)
+        let start = edges.partition_point(|it| it.held.as_str() < class);
+        (start..edges.len()).take_while(move |&at| edges[at].held.as_str() == class)
     }
     let mut reached = vec![false; edges.len()]; // alloc: as above
     for at in out(edges, from) {
@@ -181,7 +190,7 @@ fn path(edges: &[CrateEdge], from: &str, to: &str) -> Option<Vec<usize>> {
         queue.push_back(at);
     }
     while let Some(at) = queue.pop_front() {
-        if &*edges[at].taken == to {
+        if edges[at].taken.as_str() == to {
             let mut chain = vec![at]; // alloc: the cycle, once
             let mut back = at;
             while let Some(before) = parent[back] {
@@ -191,7 +200,7 @@ fn path(edges: &[CrateEdge], from: &str, to: &str) -> Option<Vec<usize>> {
             chain.reverse();
             return Some(chain);
         }
-        for next in out(edges, &edges[at].taken) {
+        for next in out(edges, edges[at].taken.as_str()) {
             if !reached[next] {
                 reached[next] = true;
                 parent[next] = Some(at);
@@ -269,18 +278,18 @@ fn find_order(
             .iter()
             .map(|&at| &edges[at])
             .filter(|it| it.own)
-            .all(|it| (&*edge.held, &*edge.taken) <= (&*it.held, &*it.taken));
+            .all(|it| (&*edge.held, &*edge.taken) <= (it.held.as_str(), it.taken.as_str()));
         if !least {
             continue;
         }
         let first = &edges[back[0]];
         let reverse = held_while_taking(db, first.func)
             .iter()
-            .find(|it| it.held == first.held && it.taken == first.taken)
+            .find(|it| *it.held == *first.held.as_str() && *it.taken == *first.taken.as_str())
             .cloned(); // clone: one edge's chain, once per finding
         let classes = std::iter::once(&*edge.held)
             .chain(std::iter::once(&*edge.taken))
-            .chain(back.iter().map(|&at| &*edges[at].taken))
+            .chain(back.iter().map(|&at| edges[at].taken.as_str()))
             .map(|it| format!("`{it}`"))
             .collect::<Vec<_>>() // alloc: a message's parts
             .join(" → ");

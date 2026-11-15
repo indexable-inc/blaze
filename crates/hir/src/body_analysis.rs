@@ -318,14 +318,18 @@ impl<'db> BodyAnalysis<'db> {
         let node = self.node(call.map(|it| it.syntax_node_ptr()))?;
         let path = ast::MacroCall::cast(node)?.path()?;
         let analyzer = self.analyzer(call.file_id, node, false)?;
+        // The table the path's contexts are of: its file's.
+        let arena = call.file_id.context_arena();
         let path = match call.file_id {
             HirFileId::MacroFile(call) => {
                 let map = call.expansion_span_map(db);
-                ModPath::from_src_view(db, path, &mut |range| map.span_at(range.start()).ctx)?
+                ModPath::from_src_view(db, arena, path, &mut |range| {
+                    map.span_at(range.start()).ctx
+                })?
             }
             HirFileId::FileId(file) => {
                 let root = SyntaxContext::root(file.edition(db));
-                ModPath::from_src_view(db, path, &mut |_| root)?
+                ModPath::from_src_view(db, arena, path, &mut |_| root)?
             }
         };
         let found = analyzer.resolver.resolve_path_as_macro(db, &path, Some(MacroSubNs::Bang))?;
@@ -457,7 +461,7 @@ impl<'db> BodyAnalysis<'db> {
                 }
             }
             Store::Fields(def) => {
-                let (store, source_map) = match VariantFields::relative(db, def) {
+                let (store, source_map) = match *VariantFields::relative(db, def) {
                     Some((fields, source_map)) => (&fields.store, source_map),
                     None => {
                         let (fields, source_map) = def.fields_with_source_map(db);

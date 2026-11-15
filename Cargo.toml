@@ -588,9 +588,14 @@ blaze-keyed = { path = "crates/blaze-keyed" }
 # Lint findings as records, their three-class scheduler, wait modes and the adoption ladder.
 blaze-findings = { path = "crates/blaze-findings" }
 # The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
-# and the process that performs the driver's effects.
+# the front end's tasks, and the process that performs the driver's effects.
 blaze-unitkey = { path = "crates/blaze-unitkey" }
+blaze-front = { path = "crates/blaze-front" }
 blaze-host = { path = "crates/blaze-host" }
+# `blaze check --no-daemon`: a checkout to a request for the host, run and printed.
+blaze-command = { path = "crates/blaze-command" }
+# The no-daemon leaf table and its sweep.
+blaze-solo = { path = "crates/blaze-solo" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }

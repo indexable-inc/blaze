@@ -59,7 +59,7 @@ use std::fmt;
 use base_db::Db;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, key};
-use blaze_query::db::{AsId, FromId, Id, NamesIds};
+use blaze_memo::{Home, Homes, Id as _};
 use hir_def::{DefWithBodyId, FunctionId};
 use hir_ty::{
     InferBodyId,
@@ -206,12 +206,12 @@ impl Shim {
 
 /// The body it is of: whose a query keyed by it is. A shim runs none of its own but the
 /// function a vtable shim adapts.
-impl NamesIds for Subject {
-    fn names_ids(&self, out: &mut Vec<Id>) {
+impl Home for Subject {
+    fn home(&self, homes: &mut Homes<'_>) {
         match *self {
-            Subject::Body(Body::Fn(it)) | Subject::Shim(Shim::Vtable(it)) => out.push(it.as_id()),
+            Subject::Body(Body::Fn(it)) | Subject::Shim(Shim::Vtable(it)) => it.home(homes),
             Subject::Body(Body::Closure(it) | Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
-                out.push(it)
+                it.home(homes)
             }
             Subject::Shim(
                 Shim::DropGlue | Shim::CallOnce | Shim::FnPointer | Shim::Reify { .. },
@@ -222,17 +222,17 @@ impl NamesIds for Subject {
 
 /// A subject with its generic arguments, none of them a parameter: a closure's or coroutine's
 /// are its parent's, as dispatch and the code generator have them.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Instance {
     pub subject: Subject,
     pub args: StoredGenericArgs,
 }
 
 /// Its subject and what its arguments name.
-impl NamesIds for Instance {
-    fn names_ids(&self, out: &mut Vec<Id>) {
-        self.subject.names_ids(out);
-        self.args.names_ids(out);
+impl Home for Instance {
+    fn home(&self, homes: &mut Homes<'_>) {
+        self.subject.home(homes);
+        self.args.home(homes);
     }
 }
 
@@ -326,9 +326,11 @@ impl OptionsSet {
 /// uninlined body as one. A build whose units all compile alike gives one options each, and
 /// the identity costs one walk. The rest of a unit's settings (overflow checks, the target,
 /// the backend) are in its `Settings`, beside the identity in its instance key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct Compiled {
+    #[home(skip)]
     pub lang: OptionsSet,
+    #[home(skip)]
     pub other: OptionsSet,
 }
 
@@ -402,10 +404,10 @@ pub(crate) fn name_of(db: &Db, subject: Subject) -> String {
     match subject {
         Subject::Body(Body::Fn(it)) => item_path(db, it.into()),
         Subject::Body(Body::Closure(it)) => {
-            format!("a closure in {}", owner(InternedClosureId::from_id(it).loc(db).owner)) // alloc: an error's name
+            format!("a closure in {}", owner(InternedClosureId::from_gid(it).loc(db).owner)) // alloc: an error's name
         }
         Subject::Body(Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
-            format!("an `async` block in {}", owner(InternedCoroutineId::from_id(it).loc(db).owner)) // alloc: an error's name
+            format!("an `async` block in {}", owner(InternedCoroutineId::from_gid(it).loc(db).owner)) // alloc: an error's name
         }
         Subject::Shim(shim) => shim.what().to_owned(), // alloc: an error's name
     }

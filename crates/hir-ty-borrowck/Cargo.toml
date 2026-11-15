@@ -18,7 +18,7 @@ la-arena.workspace = true
 smallvec.workspace = true
 tracing.workspace = true
 blaze-mem.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 
 ra-ap-rustc_ast_ir.workspace = true
 rustc_type_ir.workspace = true

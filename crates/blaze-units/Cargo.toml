@@ -18,6 +18,8 @@ anyhow.workspace = true
 # `blaze.lock`'s `[git]` and `[advisories]` tables, and the rule the load refuses an unpinned
 # git package by (`weak_source_pin`).
 blaze-audit.workspace = true
+# A std script's port described and its output read as cargo would (`stdlib::cfg::std_cfg`).
+blaze-build-script.workspace = true
 # A git package's tree digest (`Digest`), which its fetch is pinned by.
 blaze-fetch.workspace = true
 blaze-format.workspace = true
@@ -41,11 +43,12 @@ blaze-sha256.workspace = true
 target-features.workspace = true
 toml.workspace = true
 url.workspace = true
+# The view std's graph is resolved in (`stdlib::cfg::std_graph`).
+blaze-vfs.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-core.workspace = true
-blaze-vfs.workspace = true
 
 [lints]
 workspace = true

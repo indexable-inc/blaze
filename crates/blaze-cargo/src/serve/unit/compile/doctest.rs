@@ -47,9 +47,10 @@ const RUNNER: &str = "blaze doctest runner";
 pub(crate) struct Expanded {
     programs: Vec<Program>,
     /// The crate of each of `programs`, by its index; none for an ignored one, which is not
-    /// built.
-    crates: Vec<Option<base_db::Crate>>,
-    runner: base_db::Crate,
+    /// built. By key: a commit after the doctests were made kills their crates' ids, and each
+    /// reader takes them again in its own snapshot.
+    crates: Vec<Option<base_db::CrateKey>>,
+    runner: base_db::CrateKey,
 }
 
 /// The crates of `unit`'s examples and runner made in `lowered`, once a job, when `unit` is a
@@ -63,7 +64,7 @@ pub(crate) fn expand(lowered: &mut Lowered, job: &Job, unit: usize) -> Result<()
     }
     let u = job.unit(unit).map_err(|it| LowerError { what: it.what, at: None })?;
     let at = || span_unit(u);
-    let Some(krate) = lowered.crates().krate(unit) else {
+    let Some(krate) = lowered.krate(unit) else {
         return Err(LowerError {
             what: "a doctest unit with no crate in the front end".to_owned(),
             at: Some(at()),
@@ -178,7 +179,7 @@ fn harnesses(
     job: &Job,
     unit: usize,
     asked: &[DoctestProgram<'_>],
-    made: &[base_db::Crate],
+    made: &[base_db::CrateKey],
 ) -> Result<Vec<Option<Appended>>, String> {
     let toolchain = codegen::toolchain(job, unit)?;
     let policy = codegen::policy(job, unit, toolchain)?;
@@ -198,7 +199,7 @@ fn harnesses(
             continue;
         }
         let harness = frontend
-            .harness(*krate, policy.profile.panic, policy.mode, |_| {
+            .harness(lowered.db().krate(*krate), policy.profile.panic, policy.mode, |_| {
                 blaze_usercode::test::fork_server(false)
             })
             // alloc: an error
@@ -342,7 +343,7 @@ pub(super) fn generate(
     let built = blaze_graph::par::map(
         blaze_graph::par::zip(&expanded.programs, &expanded.crates),
         |(program, krate)| match *krate {
-            Some(krate) => example(job, reader, unit, part, files, program, krate),
+            Some(key) => example(job, reader, unit, part, files, program, reader.db().krate(key)),
             None => Ok(Example::Ignored),
         },
     );
@@ -362,12 +363,13 @@ pub(super) fn generate(
             }
         }
     }
+    let runner_crate = reader.db().krate(expanded.runner);
     let runner = {
         let _span =
             tracing::info_span!(target: "blaze", "doctest runner", unit = %span_unit(u)).entered();
         let base = {
             let _span = tracing::info_span!(target: "blaze", "doctest image key", function = "the doctests' runner").entered();
-            let base = base_key(reader.db(), part, expanded.runner, RUNNER);
+            let base = base_key(reader.db(), part, runner_crate, RUNNER);
             found(job, base)?.ok_or(base)
         };
         match base {
@@ -377,7 +379,7 @@ pub(super) fn generate(
                     job,
                     reader,
                     unit,
-                    expanded.runner,
+                    runner_crate,
                     &Makes::Executable,
                     &job.mounted,
                     None,
@@ -609,7 +611,7 @@ pub(super) fn link(
             Some(at) => expanded.crates[at],
             None => Some(expanded.runner),
         };
-        let krate = krate?;
+        let krate = reader.db().krate(krate?);
         let name = it.at.map_or("the doctests' runner", |at| expanded.programs[at].name.as_str());
         let _span = tracing::info_span!(target: "blaze", "doctest example link", unit = %span_unit(u), function = %name).entered();
         let generated = parts.over(reader, &job.mounted);

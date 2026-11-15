@@ -1,0 +1,14 @@
+{
+ "id": "keep-outside-a-run-blocks-value-port",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane L8b of the blaze-memo port (port-memo-1113)",
+ "where": "crates/blaze-memo/src/keep.rs keep/keep_slice/keep_iter/keep_str; crates/hir-ty-borrowck/src/lib.rs BorrowckResult, crates/hir-ty-matchck/src/lib.rs MatchCheck, crates/hir-ty-wfcheck/src/lib.rs WfResult",
+ "what": "A query value must own nothing that drops, but the only way to make the borrowed form (`keep_*`) panics outside a query run and requires `T: 'static`. Values that tests, a store read-back (`WfResultRef::to_result`) or a walker build outside a run, and values whose elements borrow `'db`, cannot be ported to arena slices mechanically, so the lane left them owned and they will trip the `!needs_drop` assert at monomorphization, which `cargo check` does not run.",
+ "cost": "three analysis value trees (borrowck, match check, wfcheck) left unported, each needing a decision; the gate (`cargo check`) cannot see the failure",
+ "cause": "a value's arena is reachable only through the running query's frame, not from the memo or a caller-owned arena, and the no-drop check is a post-monomorphization const assert",
+ "class": "an allocation API usable only in one execution context, while the same type is built in several",
+ "prevention": "make `keep_*` take an explicit arena (the run's, or a caller's for tests and read-backs) with `T: 'db`, and check no-drop at the `tracked` attribute's expansion (a trait bound on the value) so `cargo check` reports it",
+ "workaround": "values built outside a run stay owned and are listed in the lane report",
+ "fix": "not yet",
+ "state": "open"
+}

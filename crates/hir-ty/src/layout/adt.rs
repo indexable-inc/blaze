@@ -26,7 +26,7 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 
-#[blaze_query::tracked(cycle_result = layout_of_adt_cycle_result, returns(clone), mem_tag = Infer)]
+#[blaze_memo::tracked(cycle_result = layout_of_adt_cycle_result, returns(clone), owns, mem_tag = Infer)]
 pub fn layout_of_adt_query(
     db: &Db,
     def: AdtId,
@@ -218,7 +218,6 @@ fn variants_of<'a, 'b>(
 
 fn layout_of_adt_cycle_result(
     _: &Db,
-    _: blaze_query::db::Id,
     _def: AdtId,
     _args: StoredGenericArgs,
     _trait_env: StoredParamEnvAndCrate,

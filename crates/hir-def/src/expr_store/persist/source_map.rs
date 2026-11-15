@@ -19,7 +19,7 @@ use std::mem::{offset_of, size_of};
 use blaze_format::{
     FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema_of,
 };
-use blaze_query::db::FromId;
+use blaze_memo::Id;
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId};
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
@@ -37,7 +37,7 @@ use crate::{
     },
     hir::{
         BindingId, ExprId, ExprOrPatId, LabelId, PatId,
-        persist::{Code, Column, Placed, Read, Words, WordsRec, id_of_bits},
+        persist::{Code, Column, Placed, Read, Words, WordsRec, decode_session_id, session_id},
     },
     type_ref::{LifetimeRefId, TypeRefId},
 };
@@ -147,10 +147,10 @@ fn file_bits(file: HirFileId) -> (u32, u64) {
 
 /// The file of `file_kind` and `file`, `None` when no file is.
 fn file_of(file_kind: u32, file: u64) -> Option<HirFileId> {
-    let id = id_of_bits(file)?;
+    let id = session_id(file)?;
     match file_kind {
-        FILE => Some(HirFileId::FileId(FromId::from_id(id))),
-        MACRO_FILE => Some(HirFileId::MacroFile(FromId::from_id(id))),
+        FILE => Some(HirFileId::FileId(Id::from_gid(id))),
+        MACRO_FILE => Some(HirFileId::MacroFile(Id::from_gid(id))),
         _ => None,
     }
 }
@@ -163,7 +163,7 @@ fn ptr_of<N: AstNode>(kind: SyntaxKind, start: u32, end: u32) -> Option<AstPtr<N
 
 /// The file of `file_kind` and the id word `file`, read from a record at byte `rec` whose
 /// `file` field is at byte `word`: a kind out of range is refused at the record, and a word that
-/// is no id at its own byte, naming the word and `what` it is ([`blaze_query::db::Id::decode`]).
+/// is no id at its own byte, naming the word and `what` it is ([`decode_session_id`]).
 fn file_at(
     file_kind: u32,
     file: u64,
@@ -175,10 +175,10 @@ fn file_at(
         let what = "a file kind that is neither 1 (a file) nor 2 (a macro file)";
         return Err(FormatError::Invalid { at: rec, what });
     }
-    let id = blaze_query::db::Id::decode(file, word, what)?;
+    let id = decode_session_id(file, word, what)?;
     Ok(match file_kind {
-        FILE => HirFileId::FileId(FromId::from_id(id)),
-        _ => HirFileId::MacroFile(FromId::from_id(id)),
+        FILE => HirFileId::FileId(Id::from_gid(id)),
+        _ => HirFileId::MacroFile(Id::from_gid(id)),
     })
 }
 
@@ -799,7 +799,7 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
         )?;
         // A macro call's id is a word of its own, refused naming it (not as an arena index).
         for call in map.expansion_calls {
-            blaze_query::db::Id::decode(
+            decode_session_id(
                 *call,
                 at_of(call, buffer),
                 "a source table's macro call id",
@@ -839,7 +839,7 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
     /// As [`ExpressionStoreSourceMap::expansion`].
     pub fn expansion(self, src: InFile<MacroCallPtr>) -> Option<MacroCallId> {
         let call = table_get(self.expansions, self.expansion_calls, &src)?;
-        id_of_bits(call).map(<MacroCallId as FromId>::from_id)
+        session_id(call).map(<MacroCallId as Id>::from_gid)
     }
 
     pub fn has_exprs(self) -> bool {
@@ -907,8 +907,8 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
                 pat_field_map_back: get_table(&mut r, pats)?,
                 template_map: get_template(&mut r, exprs)?,
                 expansions: source_table(self.expansions, self.expansion_calls, buffer, |call| {
-                    <MacroCallId as FromId>::from_id(
-                        id_of_bits(call).expect("checked when the buffer was read"),
+                    <MacroCallId as Id>::from_gid(
+                        session_id(call).expect("checked when the buffer was read"),
                     )
                 })?,
                 diagnostics: r.get()?,
@@ -1384,16 +1384,11 @@ fn f(a: u32, (b, c): (u32, u32)) -> u32 {
             refused(&with_word(&bytes, run(0, offset_of!(FileRun, file_kind)), 7)),
             "a file kind"
         );
-        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), 0)), "an id of 0");
-        assert!(
-            refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)) + 4, 1)),
-            "an id word past `u32`"
-        );
-        let past = blaze_query::db::Id::MAX_U32 + 1;
-        assert!(
-            refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), past)),
-            "an id word past `Id::MAX_U32`"
-        );
+        // An id word is a `Gid`'s session word ([`crate::hir::persist::session_word`]): every word but 0
+        // is some id, so 0 is the one word refused.
+        let file = run(0, offset_of!(FileRun, file));
+        let zeroed = with_word(&with_word(&bytes, file, 0), file + 4, 0);
+        assert!(refused(&zeroed), "an id of 0");
         let second = offset_of!(FileRun, start);
         assert!(
             refused(&with_word(&bytes, run(1, second), exprs.runs[2].start)),

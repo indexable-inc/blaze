@@ -5,16 +5,18 @@
 
 use std::collections::BTreeMap;
 
-use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Relocs, Static, Target, Unwind};
+use blaze_codegen::text::{self, TextPart};
+use blaze_codegen::{Arch, CompiledFunction, Data, Init, InstanceKey, Relocs, Static, Target, Unwind};
 use blaze_core::{Completion, Effect};
+use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_sim::{Config, Tape};
 use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
 
 use super::{
-    Change, Disk, Image, Linked, Sparse, TO, edit, first, function, name, output, program, rel32,
-    returns,
+    Change, Disk, Image, Linked, Position, Span, SpanTable, Sparse, TO, edit, first, function,
+    name, output, program, rel32, returns,
 };
 use crate::Patch;
 use crate::digest::{BLOCK, Digest, Hash};
@@ -47,18 +49,21 @@ impl Func {
 /// The reference model: a program is its functions by name and its statics' values; what it
 /// does is what [`normal`] reads of a fresh link of it.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Program {
+pub(super) struct Program {
     funcs: BTreeMap<u8, Func>,
     values: BTreeMap<u8, u8>,
+    /// `f0` names a composed text (`concat!("at ", file!(), "!")`) whose span's file is
+    /// `src/v{n}.rs`: a rename is a change of the span table alone ([`Op::Text`]).
+    text: Option<u8>,
 }
 
 impl Program {
     /// `f0` calling `f1`.
-    fn start() -> Program {
+    pub(super) fn start() -> Program {
         let mut funcs = BTreeMap::new();
         funcs.insert(0, Func { callees: vec![1], ..Func::new() });
         funcs.insert(1, Func::new());
-        Program { funcs, values: BTreeMap::new() }
+        Program { funcs, values: BTreeMap::new(), text: None }
     }
 
     fn value(&self, of: u8) -> u8 {
@@ -115,13 +120,23 @@ fn compiled(program: &Program, n: u8) -> CompiledFunction {
     code.extend_from_slice(&[0xb8, f.version, 0, 0, 0, 0xc3]);
     code.resize(code.len() + usize::from(f.pad), 0x90);
     assert_eq!(code.len(), f.len());
+    let mut key = key_of(n, f);
+    let mut data = Vec::new();
+    // After the body, so what [`normal`] reads of it is the same: `lea rax, [rip + text]`.
+    if n == 0 && program.text.is_some() {
+        let recipe = text_recipe();
+        relocs.push(rel32(code.len() as u32 + 3, Target::Text(recipe.id)));
+        code.extend_from_slice(&[0x48, 0x8d, 0x05, 0, 0, 0, 0]);
+        data.push(recipe);
+        key.0.0[31] = 1;
+    }
     CompiledFunction {
-        key: key_of(n, f),
+        key,
         arch: Arch::X86_64,
         align: 16,
         code,
         relocs: relocs.into(),
-        data: Vec::new(),
+        data,
         inlined: Vec::new(),
         side: None,
         unwind: f.framed.then(|| Unwind::Dwarf {
@@ -139,26 +154,50 @@ fn compiled(program: &Program, n: u8) -> CompiledFunction {
     }
 }
 
-/// What a build of a program hands its link: every function as filled, every static some
-/// function reads, and each function's name.
-struct Built {
-    functions: Vec<(String, CompiledFunction)>,
-    statics: Vec<Static>,
+/// The anchor of the span table `f0`'s text names a file of.
+const TEXT_ANCHOR: ContentId = ContentId([77; 32]);
+
+/// `concat!("at ", file!(), "!")`, the file that of span 0 of [`TEXT_ANCHOR`]'s table.
+fn text_recipe() -> Data {
+    let parts = [
+        TextPart::Bytes(b"at "),
+        TextPart::FileOf(SpanRef { anchor: TEXT_ANCHOR, index: 0 }),
+        TextPart::Bytes(b"!"),
+    ];
+    text::recipe(&parts).expect("a recipe of three parts")
 }
 
-fn built(program: &Program) -> Built {
+/// The span table `f0`'s text reads: one span, in `src/v{version}.rs`.
+fn text_table(version: u8) -> Vec<u8> {
+    SpanTable {
+        files: vec![format!("src/v{version}.rs")],
+        spans: vec![Span::At(Position { file: 0, line: 1, column: 1 })],
+        bases: Vec::new(),
+    }
+    .encode()
+}
+
+/// What a build of a program hands its link: every function as filled, every static some
+/// function reads, each function's name, and the span table its text reads.
+pub(super) struct Built {
+    functions: Vec<(String, CompiledFunction)>,
+    statics: Vec<Static>,
+    spans: Option<Vec<u8>>,
+}
+
+pub(super) fn built(program: &Program) -> Built {
     let functions =
         program.funcs.keys().map(|n| (format!("f{n}"), compiled(program, *n))).collect();
     let mut read: Vec<u8> = program.funcs.values().filter_map(|it| it.reads).collect();
     read.sort_unstable();
     read.dedup();
     let statics = read.into_iter().map(|of| static_of(of, program.value(of))).collect();
-    Built { functions, statics }
+    Built { functions, statics, spans: program.text.map(text_table) }
 }
 
 /// A bug planted in the delta a link is given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Plant {
+pub(super) enum Plant {
     None,
     /// A function gone from the program is not removed from the image.
     KeepsRemoved,
@@ -166,7 +205,7 @@ enum Plant {
 
 /// The delta from `old` to `new`, as blaze-cargo's relink makes it: a function or static
 /// whose row changed is removed and added, one put again as it was is in neither.
-fn change<'a>(old: Option<&Built>, new: &'a Built, plant: Plant) -> Change<'a> {
+pub(super) fn change<'a>(old: Option<&Built>, new: &'a Built, plant: Plant) -> Change<'a> {
     let was = |it: &CompiledFunction| old.is_some_and(|old| old.functions.iter().any(|f| f.1 == *it));
     let is = |it: &CompiledFunction| new.functions.iter().any(|f| f.1 == *it);
     let named = |name: &str| new.functions.iter().any(|f| f.0 == name);
@@ -202,6 +241,7 @@ fn change<'a>(old: Option<&Built>, new: &'a Built, plant: Plant) -> Change<'a> {
             .unwrap_or_default(),
         names: vec![("_start".into(), Target::Direct(entry))],
         debug_names: new.functions.iter().map(|f| (f.1.key, f.0.clone())).collect(),
+        spans: new.spans.iter().map(|it| (TEXT_ANCHOR, &it[..])).collect(),
         ..Change::default()
     }
 }
@@ -404,7 +444,7 @@ fn as_fresh(file: &[u8], program: &Program) -> Result<(), String> {
 
 /// One edit of a program.
 #[derive(Clone, Debug)]
-enum Op {
+pub(super) enum Op {
     /// A body edit of the same size.
     Edit(u8, u8),
     /// A body edit to another size: smaller, or larger than the room its old body had.
@@ -419,9 +459,12 @@ enum Op {
     Reads(u8, Option<u8>),
     /// A static's value.
     Value(u8, u8),
+    /// `f0` names its text in the file of this version, or no text ([`Program::text`]); never
+    /// drawn by [`op`], whose oracle reads no text.
+    Text(Option<u8>),
 }
 
-fn op(tape: &Tape) -> Op {
+pub(super) fn op(tape: &Tape) -> Op {
     let n = tape.int_in(0..=NAMES - 1, "function");
     match tape.int_in(0..=7u8, "op") {
         0 => Op::Edit(n, tape.int_in(0..=3u8, "version")),
@@ -438,7 +481,7 @@ fn op(tape: &Tape) -> Op {
 impl Op {
     /// `program` after this edit; `program` itself where the edit names a function it has
     /// not, or changes nothing.
-    fn apply(&self, program: &Program) -> Program {
+    pub(super) fn apply(&self, program: &Program) -> Program {
         let mut next = program.clone();
         match *self {
             Op::Edit(n, version) => {
@@ -483,6 +526,7 @@ impl Op {
             Op::Value(of, value) => {
                 next.values.insert(of, value);
             }
+            Op::Text(version) => next.text = version,
         }
         next
     }

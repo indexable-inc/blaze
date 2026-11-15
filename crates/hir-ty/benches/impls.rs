@@ -9,7 +9,6 @@
 use std::{fmt::Write as _, time::Instant};
 
 use base_db::{Crate, Db, all_crates};
-use blaze_query::db::{Database as _, Durability};
 use hir_def::{AdtId, ModuleDefId, TraitId, nameres::crate_def_map};
 use hir_expand::fixture;
 use hir_ty::{
@@ -92,25 +91,23 @@ fn every_crate(db: &Db, krate: Crate, trait_: TraitId, self_ty: &SimplifiedType<
 /// A database with the fixture's def maps and loaded crates read, which both walks need.
 fn ready() -> Db {
     let db = fixture::db(&fixture()).into_db();
-    blaze_query::db::attach(&db, || {
-        let (main, asks) = asks(&db);
-        std::hint::black_box((loaded_crates(&db, main).len(), asks.len()));
-    });
+    let (main, asks) = asks(&db);
+    std::hint::black_box((loaded_crates(&db, main).len(), asks.len()));
     db
 }
 
 fn main() {
     let db = ready();
-    let (old, old_found) = blaze_query::db::attach(&db, || {
+    let (old, old_found) = {
         let (main, asks) = asks(&db);
         let started = Instant::now();
         let found: usize =
             asks.iter().map(|(trait_, ty)| every_crate(&db, main, *trait_, ty)).sum();
         (started.elapsed(), found)
-    });
+    };
 
     let mut db = ready();
-    let (new, new_found, count) = blaze_query::db::attach(&db, || {
+    let (new, new_found, count) = {
         let (main, asks) = asks(&db);
         let started = Instant::now();
         let found: usize = asks
@@ -126,11 +123,18 @@ fn main() {
             })
             .sum();
         (started.elapsed(), found, asks.len())
-    });
+    };
     assert_eq!(new_found, old_found, "both walks find the same impls");
 
-    db.storage_mut().synthetic_write(Durability::LOW);
-    let warm = blaze_query::db::attach(&db, || {
+    // The next snapshot with no input changed (an empty edit's commit): every crate's arena is
+    // carried, so the walk below is the warm one.
+    let committed = db.edit().commit();
+    assert!(
+        committed.dropped.is_empty(),
+        "an empty edit's commit made arenas {:?} again: the warm walk would be a cold one",
+        committed.dropped
+    );
+    let warm = {
         let (main, asks) = asks(&db);
         let started = Instant::now();
         let found: usize = asks
@@ -145,9 +149,9 @@ fn main() {
                 .len()
             })
             .sum();
-        assert_eq!(found, new_found, "a revision that changed nothing finds the same impls");
+        assert_eq!(found, new_found, "a snapshot that changed nothing finds the same impls");
         started.elapsed()
-    });
+    };
 
     let ratio = old.as_secs_f64() / new.as_secs_f64().max(1e-9);
     let verdict = if ratio > 1.1 { "a gain" } else { "NO GAIN: remove crates_that_name" };

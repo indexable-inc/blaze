@@ -202,7 +202,7 @@ impl DefMap {
         out: &mut Vec<Use, impl Allocator>,
     ) {
         let (_, db, mode) = q;
-        let all = super::path_resolution::Segments::of(path);
+        let all = super::path_resolution::Segments::of(path, self.ctx_table());
         let segments = path.segments();
         let kind = path.kind;
         let full = self.resolve_segments(q, module, kind, all, shadow, subns, around);
@@ -500,7 +500,7 @@ impl UsedImports {
 /// The uses of the imports of `krate` by every path of the crate: its imports, macro calls,
 /// signatures and bodies, block def maps included. The traits method resolution picks are
 /// not paths: [`used_imports_with`] adds them.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn used_imports(db: &Db, krate: Crate) -> UsedImports {
     finish(db, krate, crate_uses(db, krate), &[])
 }
@@ -537,7 +537,7 @@ pub(crate) struct CrateUses {
 /// before those its blocks declare (the order of [`crate::nameres::demand::walk_bodies`]). Reads
 /// no body itself: a body edit that leaves its [`body_uses`] equal does not run this again,
 /// nor the fold of [`used_imports`] over it.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn crate_uses(db: &Db, krate: Crate) -> CrateUses {
     let def_map = crate_def_map(db, krate);
     let mut walk = Walk::new(db);
@@ -566,7 +566,7 @@ pub(crate) struct BodyUses {
     owners: Box<[DefWithBodyId]>,
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn body_uses(db: &Db, owner: DefWithBodyId) -> BodyUses {
     let blocks = body_blocks(db, owner);
     let mut walk = Walk::new(db);
@@ -819,9 +819,10 @@ impl<'db> Walk<'db> {
         };
         let Some(ast_path) = ast_path else { return };
         let span_map = item.file_id.span_map(db);
-        let Some(path) =
-            ModPath::from_src_view(db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
-        else {
+        let table = item.file_id.context_arena();
+        let Some(path) = ModPath::from_src_view(db, table, ast_path, &mut |range| {
+            span_map.span_for_range(range).ctx
+        }) else {
             return;
         };
         let subns = Some(MacroSubNs::Attr);
@@ -992,9 +993,9 @@ impl<'db> Walk<'db> {
         let MacroCallKind::FnLike { .. } = loc.kind else { return };
         let Some(ast_path) = node.path() else { return };
         let span_map = file.span_map(db);
-        let Some(path) =
-            ModPath::from_src_view(db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
-        else {
+        let Some(path) = ModPath::from_src_view(db, file.context_arena(), ast_path, &mut |range| {
+            span_map.span_for_range(range).ctx
+        }) else {
             return;
         };
         let subns = Some(MacroSubNs::Bang);

@@ -177,23 +177,28 @@ pub(super) fn check(
         host_cpu: None,
         sealed: &sealed,
     };
-    let mut lowered =
-        blaze_lower::lower(lower).context("lowering the probe with the standard library")?;
+    // A probe files no records, so its queries keep no read lists and no fact boundary cuts
+    // them.
+    let mut lowered = blaze_lower::lower(lower, |_| {}, blaze_memo::Reads::Off)
+        .context("lowering the probe with the standard library")?;
     tree.failed()?;
     std_script(&mut lowered, &units, library)?;
-    let krate = lowered.krate(index).context("the probe's unit has no crate in the front end")?;
+    let key = lowered.crates().key(index).context("the probe's unit has no crate in the front end")?;
     let cfg: CfgOptions = asked.cfgs.iter().map(|it| atom(it)).collect::<anyhow::Result<_>>()?;
     let process: Env = std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect();
-    let trigger = base_db::Trigger::named("the probe's cfgs and environment set");
-    lowered.served_db().batch(trigger, |db| {
-        krate.set_cfg_options(db, cfg);
-        krate.set_env(db, Env::default());
-        base_db::set_process_env(db, process);
+    lowered.batch(blaze_lower::Trigger::named("the probe's cfgs and environment set"), |lowered| {
+        let mut edit = lowered.served_db().edit();
+        edit.set_crate_cfg_options(key, cfg)
+            .set_crate_env(key, Env::default())
+            .set_process_env(process);
+        _ = edit.commit();
     });
 
     let db = lowered.db();
+    // Taken in the snapshot the edit committed: the crate's id of the one before is dead.
+    let krate = db.krate(key);
     let root_file = krate.data(db).root_file_id;
     let mut paths: HashMap<FileId, String> = (**lowered.paths()).clone();
     paths.insert(root_file, shown.to_owned());
@@ -247,7 +252,8 @@ fn std_script(
                 && it.mode != UnitMode::RunCustomBuild
         })
         .context("the probe's load made no unit of std")?;
-    let krate = lowered.krate(index).context("std's unit has no crate in the front end")?;
+    let key = lowered.crates().key(index).context("std's unit has no crate in the front end")?;
+    let krate = lowered.db().krate(key);
     let mut cfg = krate.cfg_options(lowered.db()).clone();
     let mut env = krate.env(lowered.db()).clone();
     let value = |key: &str| cfg.get_cfg_values(key).next().map_or("", |it| it.as_str());
@@ -281,9 +287,10 @@ fn std_script(
             }
         }
     }
-    lowered.served_db().batch(base_db::Trigger::named("std's build script's run applied"), |db| {
-        krate.set_cfg_options(db, cfg);
-        krate.set_env(db, env);
+    lowered.batch(blaze_lower::Trigger::named("std's build script's run applied"), |lowered| {
+        let mut edit = lowered.served_db().edit();
+        edit.set_crate_cfg_options(key, cfg).set_crate_env(key, env);
+        _ = edit.commit();
     });
     Ok(())
 }

@@ -9,8 +9,11 @@
 //!   the bytes it filed (an uncommitted record has no mapped place).
 //! - [`Effect::Answer`]: [`Universe::answer`] over the tables the effect names
 //!   ([`TableRef`]): each surface mapped in place, each made table read once from its manifest
-//!   root and kept for the request, the asking unit's own made facts as given, the request's
-//!   late reads ([`Request::late`]). No front end is asked.
+//!   root and kept for the request, the made facts of the asking unit and of every unit whose
+//!   bodies are not asked (a `TableRef` with no manifest) as the effect gives them (its own
+//!   made table merged with the makers demanded in the request), the asking
+//!   unit's own late reads ([`Request::late`], one table per unit: a lookup in one table, the
+//!   floor; no unit sees another's). No front end is asked.
 //! - [`Effect::Run`]: the same tables handed to the task; on the request's thread while at most
 //!   one task is ready, else on blaze-graph's pool ([`crate::workers`]), started once with
 //!   [`Machine::workers_for`] threads. `remote` is refused: the executor is [`Local`].
@@ -19,6 +22,18 @@
 //!   [`StoreFault`] and the request fails by it. A request that files no value (the shape slots
 //!   are full, or an audit) commits at its end, and a failed sync then is [`HostError::Commit`].
 //! - [`Effect::Outside`] and [`Effect::Reads`]: [`crate::outside::Answerer`].
+//! - [`Effect::Link`] (a program's one link step, [`run_programs`]): each row's new code record
+//!   and each span table that came or moved read from the store, then [`Front::link`] on the
+//!   request's thread, its panic caught. The patch it returns is held until the driver's
+//!   [`Effect::Image`] for that program.
+//! - [`Effect::Image`]: [`Images::make`], the program's image made in the store under the kept
+//!   manifest's key: the held patch applied over its base ([`PatchBase`]), a clone of the last
+//!   image or an empty file.
+//! - [`Effect::Place`]: [`Images::place`], the path the user runs made to name the image: the
+//!   last effect of every answer, certified ones too.
+//!   A plan task ([`Task::Plan`]) is handed its bodies' records read where the driver names them;
+//!   a program's tasks and asks are of no unit ([`NO_UNIT`]) and see no late table, but a span
+//!   task ([`Task::Spans`]) is its owner's unit's and sees that unit's.
 //!
 //! The driver names a task's tables only once they are settled (a unit's own surface is in its
 //! bodies' universe only after it is proved), so nothing waits here: every effect is answered
@@ -40,7 +55,14 @@
 //!   table copied once for the request; a surface this request wrote copied once to be shared
 //!   by its readers.
 
-use std::{alloc::Global, collections::VecDeque, fmt, io, sync::Arc, time::Duration};
+use std::{
+    alloc::{Allocator, Global},
+    collections::VecDeque,
+    fmt, io,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+    time::Duration,
+};
 
 use blaze_core::wait::{Clock, Deadline, Monotonic, WaitError, Waited};
 use blaze_format::Aligned;
@@ -50,14 +72,21 @@ use blaze_graph::{
 };
 use blaze_ids::ContentId;
 use blaze_keyed::{
-    driver::{Asks, Done, Driver, Effect, Input, Outcome, Plan, PlanError, Step, StoreFault, TableRef, Task, TaskFailed},
+    driver::{
+        Asks, CertificateLookup, Done, Driver, Effect, Failure, Input, NO_UNIT, Outcome, Plan, PlanError, Step, StoreFault, TableRef,
+        Task, TaskFailed, certificate_with,
+    },
     exec::Local,
-    front::{Front, Unanswerable, Universe},
-    kind::{Body, Certificate, Key, Kind, Layout, Mark, Namespace, Shape, Surface, Tag, UnitChunk, UnitManifest},
+    front::{Front, Linked, Patch, PatchBase, Unanswerable, Universe},
+    kind::{
+        Body, Certificate, CodeRecord, Key, Kind, Layout, Mark, Namespace, PlanRecord, ProgramManifest, Shape, SpanTable, Surface, Tag,
+        UnitChunk, UnitManifest,
+    },
     machine::Machine,
     memo::Memo,
     outside::{MAX_SHAPES, shape_slot},
     pool::{Pool, Ticket},
+    program::{NoWalk, ProgramPlan, Walker},
     proof::{AnyHolds, Certified, Holds, Snapshot},
     record::{self, Fact, StableId, Traced},
     store::{Put, Store, StoreError},
@@ -65,7 +94,7 @@ use blaze_keyed::{
 
 use crate::{
     outside::{self, Answerer, Ask, Files, Leaves, Looked, OutsideError},
-    workers::{Bytes, Facts, Finish, Job, Made, Source, Workers, guarded, tables},
+    workers::{Bytes, Facts, Finish, Job, Made, Source, Workers, guarded, tables, unit_of},
 };
 
 /// One request as the command gives it.
@@ -79,10 +108,14 @@ pub struct Request<'r> {
     /// front end, [`outside::file_answer`]): settled against the answers now before the
     /// certificate is filed, so a read that moved meanwhile files nothing.
     pub then: &'r [ContentId],
-    /// The late reads its units' keys cover (`env!`, `include!`: [`record::late_id`]), with the
-    /// answers the keys were made with, sorted by id, each once: what an ask of a late fact is
-    /// answered from, by a task and by the driver alike.
-    pub late: &'r [Fact],
+    /// The late reads each unit's key covers (`env!`, `include!`: [`record::late_id`]), indexed
+    /// like `plan.units`: unit `u`'s table is `late[u]`, with the answers its key was made with,
+    /// sorted by id, each once. What an ask of a late fact by unit `u` is answered from, by a
+    /// task and by the driver alike, and by no other unit's table: two units read one name
+    /// (`env!("CARGO_PKG_VERSION")`) under one id and see their own values. A late id names no
+    /// unit because every table it is looked up in (a unit's dictionary, a record's reads, a
+    /// task's universe) is one unit's.
+    pub late: &'r [&'r [Fact]],
     /// The command's leaf memory: stamps that vouch for a file with no read.
     pub leaves: Leaves<'r>,
     /// The most one wait for a task may take with none finishing: past it the request stops,
@@ -110,6 +143,13 @@ pub struct Answered<'s> {
     pub manifests: Vec<Option<Key<UnitManifest>>, Global>,
     /// What each unit holds (empty when the certificate held: nothing below it was checked).
     pub units: Vec<UnitProved<'s>, Global>,
+    /// Each program's kept manifest ([`run_programs`]): the certificate's list when it held,
+    /// else what this request filed or kept (`None` for a program that failed). The next
+    /// request's [`ProgramPlan::last`]. Empty for [`run`].
+    pub programs: Vec<Option<Key<ProgramManifest>>, Global>,
+    /// Every failure of a failed request, in the order of what failed (units, then programs):
+    /// the outcome's `why` is the first. A failed task fails what depends on it; the rest went on.
+    pub failures: Vec<Failure, Global>,
     /// The store's own error behind a [`StoreFault`] the driver was given, or of the commit at
     /// the end of a request that failed.
     pub store_error: Option<StoreError>,
@@ -168,6 +208,10 @@ impl fmt::Display for HostError {
                 f,
                 "unit {unit} of the plan has a reserved owner or another unit's (rule: each unit owns the facts its crate key begins)"
             ),
+            HostError::Plan(PlanError::CertificateLookup { what }) => write!(
+                f,
+                "the certificate lookup handed to the request is wrong: {what} (rule: a lookup made beforehand stands in only for this request's own certificate key, finished)"
+            ),
             HostError::Request { what } => write!(f, "the request is not of its form: {what}"),
             HostError::Stalled { waited_for, in_flight } => {
                 write!(f, "the request stalled waiting for {waited_for}: {in_flight} tasks running (rule bounded-progress)")
@@ -179,9 +223,9 @@ impl fmt::Display for HostError {
                 write!(f, "the record of kind {} asked {asked:?}, which is not its kind's layout", tag.0)
             }
             HostError::Outside(error) => write!(f, "{error}"),
-            HostError::Answer { unit, why } => write!(f, "a fact asked as unit {unit} sees it has no answer: {why:?} ({})", match why.failed() {
-                TaskFailed::Refused { what } | TaskFailed::Panicked { what } => what,
-            }),
+            HostError::Answer { unit, why } => {
+                write!(f, "a fact asked as unit {unit} sees it has no answer: {why:?} ({})", why.failed().what())
+            }
             HostError::Table { unit, tag, key } => write!(
                 f,
                 "the universe names unit {unit}'s record of kind {} at {key:?}, which the store does not hold (rule: a task reads only what is filed)",
@@ -208,7 +252,7 @@ impl std::error::Error for HostError {}
 
 /// The driver the host runs: local tasks, allocating on the global heap (the request's frame is
 /// the missing piece: the driver's vectors live for the request).
-type Drv<'s, 'm, M> = Driver<'s, 'm, M, Local, Global>;
+type Drv<'s, 'm, M, WK> = Driver<'s, 'm, M, Local, Global, WK>;
 
 /// How a pump ended.
 enum Pumped {
@@ -243,10 +287,59 @@ enum Reply<'a> {
     /// A task queued: its answer comes when it finishes.
     Queued,
     Put { ticket: Ticket, put: Result<Put, StoreFault> },
+    /// A link step ran: the linker's new state, or why it failed.
+    Linked { ticket: Ticket, outcome: Result<Vec<u8, Global>, TaskFailed> },
+    /// A program's image made and durable, or why not.
+    Imaged { ticket: Ticket, outcome: Result<(), TaskFailed> },
+    /// A program's path placed, or why not.
+    Placed { ticket: Ticket, outcome: Result<(), TaskFailed> },
 }
 
-struct Host<'a, F, S: Store, W: Files> {
+/// Where a program's images are kept and its path is placed: the IO of [`Effect::Image`] and
+/// [`Effect::Place`], the command's to give.
+///
+/// The invariant: the path the user runs names the image of a kept manifest that is durable,
+/// and after an answer the one it certified. An image is never written at the path: it is a
+/// store file named by its kept manifest's key (O(1) to name, no hash of the image), made
+/// before that manifest is filed, and the path is renamed onto it only after.
+///
+/// Floor: per request that links, one clone of the last image (a reflink or `clonefile`, O(1)
+/// in its size where the filesystem has it) and the patch's bytes written, one sync; per answer
+/// and program, one look at the path and a rename only when it names another image.
+pub trait Images {
+    /// Makes program `program`'s image `to` durable in the store: a clone of image `from` (none:
+    /// an empty file) with `patch` applied, its writes then its length; with no patch, the clone
+    /// alone (a kept manifest filed again with no link step). The host gives `from` with a patch
+    /// only when the patch's base is [`PatchBase::Clone`]: for [`PatchBase::Empty`] it gives
+    /// none, so the old image is never read under a whole relink. Where the filesystem clones
+    /// nothing, a copy, which the implementation says it made. An image `to` already held is
+    /// left as it is: two makers of one key make equal bytes. `from` not held is refused.
+    fn make<A: Allocator>(&self, program: u32, from: Option<ContentId>, to: ContentId, patch: Option<&Patch<A>>) -> Result<(), TaskFailed>;
+
+    /// Makes program `program`'s path name image `image`: one look, and when it names another
+    /// (or nothing), a link of the image beside it renamed over it atomically, then the
+    /// directory synced.
+    fn place(&self, program: u32, image: ContentId) -> Result<(), TaskFailed>;
+}
+
+/// The [`Images`] of a request that builds no program ([`run`]): each effect is refused.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoImages;
+
+impl Images for NoImages {
+    fn make<A: Allocator>(&self, _: u32, _: Option<ContentId>, _: ContentId, _: Option<&Patch<A>>) -> Result<(), TaskFailed> {
+        Err(TaskFailed::Refused { what: "a program's image asked made in a request that builds no program" })
+    }
+
+    fn place(&self, _: u32, _: ContentId) -> Result<(), TaskFailed> {
+        Err(TaskFailed::Refused { what: "a program's path asked placed in a request that builds no program" })
+    }
+}
+
+struct Host<'a, F, S: Store, W: Files, I: Images> {
     request: &'a Request<'a>,
+    /// The programs the request builds ([`run_programs`]); empty for [`run`].
+    programs: &'a [ProgramPlan],
     store: &'a S,
     front: &'a F,
     machine: Machine,
@@ -266,14 +359,27 @@ struct Host<'a, F, S: Store, W: Files> {
     in_flight: u32,
     uncommitted: bool,
     store_error: Option<StoreError>,
+    /// The patch each program's link step returned, by program, held until the driver asks the
+    /// image made ([`Effect::Image`]): one link step per program per request.
+    patches: Vec<(u32, Patch<Global>), Global>,
+    images: &'a I,
 }
 
-impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
-    fn new(request: &'a Request<'a>, store: &'a S, front: &'a F, files: &'a W, machine: Machine) -> Self {
+impl<'a, F: Front, S: Store, W: Files, I: Images> Host<'a, F, S, W, I> {
+    fn new(
+        request: &'a Request<'a>,
+        programs: &'a [ProgramPlan],
+        store: &'a S,
+        front: &'a F,
+        files: &'a W,
+        images: &'a I,
+        machine: Machine,
+    ) -> Self {
         let mut shape = Vec::new_in(Global);
         outside::encode(request.reads, &mut shape);
         Host {
             request,
+            programs,
             store,
             front,
             machine,
@@ -290,13 +396,15 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
             in_flight: 0,
             uncommitted: false,
             store_error: None,
+            patches: Vec::new_in(Global),
+            images,
         }
     }
 
     /// Runs the driver until it exits, or, with no pool, until two or more tasks are ready.
-    fn pump<'scope, 'env, 's, M: Memo>(
+    fn pump<'scope, 'env, 's, M: Memo, WK: Walker>(
         &mut self,
-        driver: &mut Drv<'s, '_, M>,
+        driver: &mut Drv<'s, '_, M, WK>,
         mut workers: Option<&mut Workers<'scope, 'env, F>>,
     ) -> Result<Pumped, HostError>
     where
@@ -385,23 +493,143 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
                 }
                 Ok(Reply::Reads { ticket })
             }
-            Effect::Run { ticket, task, remote, universe, made } => {
+            Effect::Run { ticket, task, remote, universe, made, bytes, plans, bodies } => {
                 if remote {
                     return Err(HostError::Remote { task });
                 }
                 let sources = self.sources(universe)?;
                 let mut own = Vec::with_capacity_in(made.len(), Global);
                 own.extend_from_slice(made);
-                let job = Job { front: self.front, task, sources, made: own, late: self.request.late };
+                // The task's own unit's late table, never another's (none for a program's).
+                let late = self.late_of(unit_of(task))?;
+                let mut copied = Vec::with_capacity_in(bytes.len(), Global);
+                copied.extend_from_slice(bytes);
+                // A plan or code task reads its bodies' records where the driver names them:
+                // filed before it runs (this process reads its own puts at once).
+                let mut given = Vec::with_capacity_in(bodies.len(), Global);
+                for at in bodies {
+                    let key = at.address.id();
+                    let record = self.read_whole::<Body>(key, "a body record a plan or code task is given: the store does not hold it")?;
+                    let result = blaze_format::open::<Traced>(&record)
+                        .ok()
+                        .and_then(|root| record::result_digest(root, &record).ok())
+                        .ok_or(HostError::Record { tag: Body::TAG, key, what: "a body record a plan or code task is given does not open" })?;
+                    given.push((at.item, record, result));
+                }
+                // A code task's callees' plans, each read where the driver names it.
+                let mut callees = Vec::with_capacity_in(plans.len(), Global);
+                for at in plans {
+                    let what = "a callee's plan record a code task is given: the store does not hold it";
+                    callees.push((at.instance, self.read_whole::<PlanRecord>(at.address, what)?));
+                }
+                let job = Job { front: self.front, task, sources, made: own, late, bytes: copied, bodies: given, plans: callees };
                 self.runnable.push_back((ticket, job));
                 Ok(Reply::Queued)
             }
             Effect::Put { ticket, tag, key, namespace, bytes } => Ok(Reply::Put { ticket, put: self.put(tag, key, namespace, bytes)? }),
+            Effect::Link { ticket, program, changes, plans, spans, payload } => {
+                let _span = tracing::info_span!(target: "blaze", "host: link", program, changes = changes.len(), spans = spans.len()).entered();
+                // Each row's new code, read once; a row that went has none.
+                let mut held = Vec::with_capacity_in(changes.len(), Global);
+                for change in changes {
+                    held.push(match change.now {
+                        Some(code) => {
+                            Some(self.read_whole::<CodeRecord>(code.id(), "the code record a link step is given: the store does not hold it")?)
+                        }
+                        None => None,
+                    });
+                }
+                let mut code = Vec::with_capacity_in(held.len(), Global);
+                code.extend(held.iter().map(|record: &Option<Aligned>| record.as_deref().unwrap_or(&[])));
+                // The plans of the rows that came or moved and of their callees, read once.
+                let mut read = Vec::with_capacity_in(plans.len(), Global);
+                for at in plans {
+                    let what = "a plan record a link step is given: the store does not hold it";
+                    read.push((at.instance, self.read_whole::<PlanRecord>(at.address, what)?));
+                }
+                let mut given = Vec::with_capacity_in(read.len(), Global);
+                given.extend(read.iter().map(|(instance, record)| (*instance, &record[..])));
+                // The span tables that came or moved, each record read once, its payload (the
+                // table) handed on.
+                let mut tables = Vec::with_capacity_in(spans.len(), Global);
+                for at in spans {
+                    let what = "a span table a link step is given: the store does not hold it";
+                    tables.push((at.anchor, at.address.id(), self.read_whole::<SpanTable>(at.address.id(), what)?));
+                }
+                let mut span_payloads = Vec::with_capacity_in(tables.len(), Global);
+                for (anchor, key, record) in tables.iter() {
+                    let payload = blaze_format::open::<Traced>(record).and_then(|root| root.payload.follow(record)).map_err(|_| HostError::Record {
+                        tag: SpanTable::TAG,
+                        key: *key,
+                        what: "a span table a link step is given does not open",
+                    })?;
+                    span_payloads.push((*anchor, payload));
+                }
+                // On the request's thread: one step per program, after its code is quiet. A panic
+                // fails this program's link step alone (rule 20).
+                let front = self.front;
+                let outcome = catch_unwind(AssertUnwindSafe(|| front.link(program, changes, &code, &given, &span_payloads, payload, Global)))
+                    .unwrap_or(Err(TaskFailed::Panicked { what: "a link step" }));
+                // The patch waits here for the driver's `Effect::Image`; the state goes to it.
+                let outcome = outcome.map(|Linked { payload, patch }| {
+                    match self.patches.binary_search_by_key(&program, |(held, _)| *held) {
+                        Ok(at) => self.patches[at].1 = patch,
+                        Err(at) => self.patches.insert(at, (program, patch)),
+                    }
+                    payload
+                });
+                Ok(Reply::Linked { ticket, outcome })
+            }
+            Effect::Image { ticket, program, from, to, patched } => {
+                let _span = tracing::info_span!(target: "blaze", "host: make program image", program, patched).entered();
+                let (images, from) = (self.images, from.map(|from| from.id()));
+                let held = self.patches.binary_search_by_key(&program, |(held, _)| *held);
+                // A panic in the command's images fails this program alone (rule 20).
+                let outcome = match (patched, held) {
+                    (true, Err(_)) => Err(TaskFailed::Refused { what: "a program image asked patched with no link step's patch in this request" }),
+                    (true, Ok(at)) => {
+                        let (_, patch) = self.patches.remove(at);
+                        // The patch's base says what its writes start from: an empty file reads
+                        // no old image; a clone needs one.
+                        match (patch.base, from) {
+                            (PatchBase::Clone, None) => {
+                                Err(TaskFailed::Refused { what: "a link step's patch over a clone of the old image, with no old image" })
+                            }
+                            (base, from) => {
+                                let from = from.filter(|_| base == PatchBase::Clone);
+                                catch_unwind(AssertUnwindSafe(|| images.make(program, from, to.id(), Some(&patch))))
+                                    .unwrap_or(Err(TaskFailed::Panicked { what: "a program image's making" }))
+                            }
+                        }
+                    }
+                    (false, _) => catch_unwind(AssertUnwindSafe(|| images.make::<Global>(program, from, to.id(), None)))
+                        .unwrap_or(Err(TaskFailed::Panicked { what: "a program image's making" })),
+                };
+                Ok(Reply::Imaged { ticket, outcome })
+            }
+            Effect::Place { ticket, program, image } => {
+                let _span = tracing::info_span!(target: "blaze", "host: place program path", program).entered();
+                let images = self.images;
+                let outcome = catch_unwind(AssertUnwindSafe(|| images.place(program, image.id())))
+                    .unwrap_or(Err(TaskFailed::Panicked { what: "a program path's place" }));
+                Ok(Reply::Placed { ticket, outcome })
+            }
         }
     }
 
+    /// The record of kind `K` at `key`, whole and 16-aligned, for a task to own: refused with
+    /// `what` when the store does not hold it.
+    fn read_whole<K: Kind>(&self, key: ContentId, what: &'static str) -> Result<Aligned, HostError> {
+        let read = self
+            .store
+            .read::<K, Global>(&Key::from_id(key), Global)
+            .map_err(|error| HostError::Get { tag: K::TAG, key, error })?
+            .ok_or(HostError::Record { tag: K::TAG, key, what })?;
+        Ok(Aligned::copy_from(&read.bytes))
+    }
+
     /// Gives the driver the answer `reply` made.
-    fn reply<M: Memo>(&mut self, driver: &mut Drv<'_, '_, M>, reply: Reply<'a>) {
+    fn reply<M: Memo, WK: Walker>(&mut self, driver: &mut Drv<'_, '_, M, WK>, reply: Reply<'a>) {
         match reply {
             Reply::Got { ticket, got } => {
                 let record: Option<&[u8]> = match &got {
@@ -418,16 +646,31 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
             }
             Reply::Queued => {}
             Reply::Put { ticket, put } => driver.give(Input::Put { ticket, put }),
+            Reply::Linked { ticket, outcome } => {
+                driver.give(Input::Linked { ticket, outcome: outcome.as_deref().map_err(|failed| *failed) });
+            }
+            Reply::Imaged { ticket, outcome } => driver.give(Input::Imaged { ticket, outcome }),
+            Reply::Placed { ticket, outcome } => driver.give(Input::Placed { ticket, outcome }),
         }
     }
 
     /// Gives the driver what a task made.
-    fn ran<M: Memo>(driver: &mut Drv<'_, '_, M>, ticket: Ticket, made: Result<Made, TaskFailed>) {
+    fn ran<M: Memo, WK: Walker>(driver: &mut Drv<'_, '_, M, WK>, ticket: Ticket, made: Result<Made, TaskFailed>) {
+        // A span task's tables, borrowed as the driver takes them.
+        let mut tables = Vec::new_in(Global);
+        if let Ok(Made::Spans(spans)) = &made {
+            tables.extend(spans.tables.iter().map(|(anchor, bytes)| (*anchor, &bytes[..])));
+        }
         let outcome = match &made {
-            Ok(Made::Keyed(keyed)) => {
-                Ok(Done::Keyed { manifest: keyed.manifest, surface: keyed.surface, files: &keyed.files[..], items: &keyed.items[..] })
-            }
+            Ok(Made::Keyed(keyed)) => Ok(Done::Keyed {
+                manifest: keyed.manifest,
+                surface: keyed.surface,
+                files: &keyed.files[..],
+                items: &keyed.items[..],
+                names: &keyed.names[..],
+            }),
             Ok(Made::Wrote(record)) => Ok(Done::Wrote { record: &record[..] }),
+            Ok(Made::Spans(spans)) => Ok(Done::Spans { reads: &spans.reads[..], tables: &tables[..] }),
             Err(failed) => Err(*failed),
         };
         driver.give(Input::Ran { ticket, outcome });
@@ -438,12 +681,22 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
         let _span = tracing::info_span!(target: "blaze", "host: answer", unit, asks = asks.len()).entered();
         let sources = self.sources(refs)?;
         let tables = tables(&sources, made).map_err(|why| HostError::Answer { unit, why })?;
-        let universe = Universe { asker: unit, tables: &tables, outside: self.request.late };
+        let universe = Universe { asker: unit, tables: &tables, outside: self.late_of(unit)? };
         self.answers.clear();
         for id in asks {
             self.answers.push(universe.answer(id).map_err(|why| HostError::Answer { unit, why })?);
         }
         Ok(())
+    }
+
+    /// Unit `unit`'s own late table ([`Request::late`]): `run` checked there is one per unit, so
+    /// a unit past them is the driver's misuse, never an empty table.
+    fn late_of(&self, unit: u32) -> Result<&'a [Fact], HostError> {
+        // A program's asks and tasks are of no unit: a plan may read no late fact, so none.
+        if unit == NO_UNIT {
+            return Ok(&[]);
+        }
+        self.request.late.get(unit as usize).copied().ok_or(HostError::Misused("a unit with no late table of its own"))
     }
 
     /// The tables `refs` name: a table with no surface yet (the asking unit's own, before its
@@ -535,6 +788,10 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
             t if t == UnitChunk::TAG => self.fetch::<UnitChunk>(key, layout),
             t if t == UnitManifest::TAG => self.fetch::<UnitManifest>(key, layout),
             t if t == Certificate::TAG => self.fetch::<Certificate>(key, layout),
+            t if t == PlanRecord::TAG => self.fetch::<PlanRecord>(key, layout),
+            t if t == CodeRecord::TAG => self.fetch::<CodeRecord>(key, layout),
+            t if t == ProgramManifest::TAG => self.fetch::<ProgramManifest>(key, layout),
+            t if t == SpanTable::TAG => self.fetch::<SpanTable>(key, layout),
             other => Err(HostError::Kind { tag: other, what: "a read of a kind the driver asks none of" }),
         }
     }
@@ -579,7 +836,10 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
     /// Whether `key` is one of the certificate's shape slots (at most [`MAX_SHAPES`] hashes):
     /// else a certificate put is its value, the request's last put.
     fn is_shape_slot(&self, key: ContentId) -> bool {
-        (0..MAX_SHAPES).any(|slot| shape_slot(self.request.plan.certificate, slot).id() == key)
+        // The key the driver files under: the plan's base with which units' bodies are asked,
+        // and which programs are built.
+        let certificate = certificate_with(&self.request.plan, self.programs);
+        (0..MAX_SHAPES).any(|slot| shape_slot(certificate, slot).id() == key)
     }
 
     fn put(&mut self, tag: Tag, key: ContentId, namespace: Namespace, bytes: &[u8]) -> Result<Result<Put, StoreFault>, HostError> {
@@ -592,6 +852,10 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
             t if t == UnitChunk::TAG => store.put::<UnitChunk>(&Key::from_id(key), namespace, bytes),
             t if t == UnitManifest::TAG => store.put::<UnitManifest>(&Key::from_id(key), namespace, bytes),
             t if t == Certificate::TAG => store.put::<Certificate>(&Key::from_id(key), namespace, bytes),
+            t if t == PlanRecord::TAG => store.put::<PlanRecord>(&Key::from_id(key), namespace, bytes),
+            t if t == CodeRecord::TAG => store.put::<CodeRecord>(&Key::from_id(key), namespace, bytes),
+            t if t == ProgramManifest::TAG => store.put::<ProgramManifest>(&Key::from_id(key), namespace, bytes),
+            t if t == SpanTable::TAG => store.put::<SpanTable>(&Key::from_id(key), namespace, bytes),
             other => return Err(HostError::Kind { tag: other, what: "a put of a kind the driver files none of" }),
         };
         let put = match put {
@@ -635,7 +899,7 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
         self.store.commit().map(|_generation| ())
     }
 
-    fn finish<'s, M: Memo>(mut self, driver: &Drv<'s, '_, M>, outcome: Outcome) -> Result<Answered<'s>, HostError> {
+    fn finish<'s, M: Memo, WK: Walker>(mut self, driver: &Drv<'s, '_, M, WK>, outcome: Outcome) -> Result<Answered<'s>, HostError> {
         if let Err(error) = self.commit_left() {
             match outcome {
                 Outcome::Failed { .. } => self.keep_error(error),
@@ -649,28 +913,40 @@ impl<'a, F: Front, S: Store, W: Files> Host<'a, F, S, W> {
             records.extend(driver.proofs(unit));
             units.push(UnitProved { manifest: driver.manifest(unit), records });
         }
-        let manifests = match outcome {
-            Outcome::Certified { .. } => certified_manifests(driver.certified_value(), count)?,
+        let programs = self.programs.len();
+        let (manifests, kept) = match outcome {
+            Outcome::Certified { .. } => certified_manifests(driver.certified_value(), count, programs)?,
             _ => {
                 let mut manifests = Vec::with_capacity_in(count, Global);
                 manifests.extend(units.iter().map(|unit: &UnitProved<'s>| unit.manifest.map(|holds| holds.key())));
-                manifests
+                let mut kept = Vec::with_capacity_in(programs, Global);
+                kept.extend((0..programs as u32).map(|program| driver.program_manifest(program)));
+                (manifests, kept)
             }
         };
+        let mut failures = Vec::new_in(Global);
+        failures.extend(driver.failures().cloned());
         Ok(Answered {
             outcome,
             asks: driver.asks(),
             certified: driver.certified(),
             manifests,
             units,
+            programs: kept,
+            failures,
             store_error: self.store_error,
             looked: self.answerer.looked(),
         })
     }
 }
 
-/// The manifest roots the certificate's value names, 32 bytes each in plan order.
-fn certified_manifests(value: Option<&[u8]>, count: usize) -> Result<Vec<Option<Key<UnitManifest>>, Global>, HostError> {
+/// What a certificate's value names: each unit's manifest root, then each program's kept
+/// manifest.
+type Named = (Vec<Option<Key<UnitManifest>>, Global>, Vec<Option<Key<ProgramManifest>>, Global>);
+
+/// The unit manifest roots and then the kept program manifests the certificate's value names,
+/// 32 bytes each in plan order.
+fn certified_manifests(value: Option<&[u8]>, count: usize, programs: usize) -> Result<Named, HostError> {
     let bytes = value.ok_or(HostError::Certificate { what: "the driver holds no value of it" })?;
     let root =
         blaze_format::open::<Traced>(bytes).map_err(|_why| HostError::Certificate { what: "its value does not open as a traced record" })?;
@@ -678,43 +954,88 @@ fn certified_manifests(value: Option<&[u8]>, count: usize) -> Result<Vec<Option<
         .payload
         .follow(bytes)
         .map_err(|_why| HostError::Certificate { what: "its value's payload is out of its bounds" })?;
-    if payload.len() != count * 32 {
-        return Err(HostError::Certificate { what: "its value names another number of manifests than the plan has units" });
+    if payload.len() != (count + programs) * 32 {
+        return Err(HostError::Certificate { what: "its value names another number of manifests than the plan has units and programs" });
     }
-    let mut manifests = Vec::with_capacity_in(count, Global);
-    for chunk in payload.chunks_exact(32) {
+    let id = |chunk: &[u8]| {
         let mut id = [0u8; 32];
         id.copy_from_slice(chunk);
-        manifests.push(Some(Key::from_id(ContentId(id))));
-    }
-    Ok(manifests)
+        ContentId(id)
+    };
+    let (units, kept) = payload.split_at(count * 32);
+    let mut manifests = Vec::with_capacity_in(count, Global);
+    manifests.extend(units.chunks_exact(32).map(|chunk| Some(Key::from_id(id(chunk)))));
+    let mut programs = Vec::with_capacity_in(programs, Global);
+    programs.extend(kept.chunks_exact(32).map(|chunk| Some(Key::from_id(id(chunk)))));
+    Ok((manifests, programs))
 }
 
 /// Runs one request to its outcome in snapshot `snap`: the certificate checked, else every
 /// unit keyed and settled by its mark, or its records found by what they read or made, and
 /// filed, its marks and certificate last; with the records proved per unit.
 ///
+/// `certificate_lookup`: the certificate's lookup the caller made in this snapshot before it
+/// gathered anything (`None`: the driver looks it up itself). It must be finished and of this
+/// request's certificate key, checked once ([`HostError::Plan`] with
+/// `PlanError::CertificateLookup` else): the request then reads nothing of the certificate
+/// again, so a no-op is the sweep and one lookup.
+///
 /// Floors: as the module's. Threads: none unless two or more tasks are ready at once; then one
 /// pool of [`Machine::workers_for`] threads, for the rest of the request, stopped before return.
+#[expect(clippy::too_many_arguments, reason = "the request's parts, each its own borrow; a struct would only rename them")]
 pub fn run<'s, F: Front, S: Store, M: Memo, W: Files>(
     snap: Snapshot<'s>,
     request: &Request<'_>,
+    certificate_lookup: Option<CertificateLookup<'s>>,
     store: &S,
     front: &F,
     memo: &mut M,
     files: &W,
     machine: Machine,
 ) -> Result<Answered<'s>, HostError> {
+    run_programs(snap, request, certificate_lookup, &[], NoWalk, store, front, memo, files, &NoImages, machine)
+}
+
+/// [`run`], and then each of `programs` built once every unit is complete: its plans and code
+/// found or made, walked by `walker` (blaze-program's walk), and one link step given the rows
+/// that came, went or moved ([`Front::plan`], [`Front::code`], [`Front::link`]). The certificate
+/// names each program's kept manifest after the units' ([`Answered::programs`]). Each program's
+/// image is made in `images` before its kept manifest is filed, and its path placed after the
+/// certificate, on every answer, a certified one too.
+///
+/// Floors: as [`run`]'s, and per program: a request whose units all settle by their marks reads
+/// its kept manifest and answers its dictionary once, and looks at its path once; a one-body edit
+/// costs that body, the plans that read it, their code, one link step, one image clone with the
+/// patch's bytes written and one rename. Past the floor: a plan task's body record and a link
+/// step's code records are copied once each from the store.
+#[expect(clippy::too_many_arguments, reason = "the request's parts, each its own borrow; a struct would only rename them")]
+pub fn run_programs<'s, F: Front, S: Store, M: Memo, W: Files, I: Images, WK: Walker>(
+    snap: Snapshot<'s>,
+    request: &Request<'_>,
+    certificate_lookup: Option<CertificateLookup<'s>>,
+    programs: &[ProgramPlan],
+    walker: WK,
+    store: &S,
+    front: &F,
+    memo: &mut M,
+    files: &W,
+    images: &I,
+    machine: Machine,
+) -> Result<Answered<'s>, HostError> {
     if request.then.len() != request.reads.len() {
         return Err(HostError::Request { what: "`then` gives another number of answers than `reads` has asks" });
     }
-    if record::sorted(request.late).is_err() {
-        return Err(HostError::Request { what: "`late` is not sorted by id, each once" });
+    if request.late.len() != request.plan.units.len() {
+        return Err(HostError::Request { what: "`late` gives another number of tables than the plan has units" });
+    }
+    if request.late.iter().any(|table| record::sorted(table).is_err()) {
+        return Err(HostError::Request { what: "a unit's `late` table is not sorted by id, each once" });
     }
     // The pool is the bound on tasks at once: the driver asks every ready task, and the host
     // queues what the pool has no worker for.
-    let mut driver = Driver::new(snap, memo, Local { workers: u32::MAX }, request.plan, Global).map_err(HostError::Plan)?;
-    let mut host = Host::new(request, store, front, files, machine);
+    let mut driver =
+        Driver::build(snap, memo, Local { workers: u32::MAX }, request.plan, programs, walker, certificate_lookup, Global).map_err(HostError::Plan)?;
+    let mut host = Host::new(request, programs, store, front, files, images, machine);
     let pumped = match host.pump(&mut driver, None) {
         Ok(Pumped::Exit(outcome)) => Ok(outcome),
         Ok(Pumped::Workers(threads)) => pooled(&mut host, &mut driver, threads),
@@ -730,9 +1051,9 @@ pub fn run<'s, F: Front, S: Store, M: Memo, W: Files>(
 }
 
 /// The rest of a request on a pool of `threads` workers, stopped before return.
-fn pooled<'a, 's, F: Front, S: Store, M: Memo, W: Files>(
-    host: &mut Host<'a, F, S, W>,
-    driver: &mut Drv<'s, '_, M>,
+fn pooled<'a, 's, F: Front, S: Store, M: Memo, W: Files, I: Images, WK: Walker>(
+    host: &mut Host<'a, F, S, W, I>,
+    driver: &mut Drv<'s, '_, M, WK>,
     threads: u32,
 ) -> Result<Outcome, HostError> {
     let pool = GraphPool::new(&Topology::flat(threads as usize), false).map_err(|error| HostError::Pool { workers: threads, error })?;

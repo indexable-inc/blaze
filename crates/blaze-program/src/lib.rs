@@ -1,18 +1,19 @@
 //! Code as records and programs as manifests (target decisions 1, 5, 6 and 8;
 //! /Volumes/Projects/blaze-int-1112-notes/target-decisions-1113.md).
 //!
-//! - [`record::InstanceCode`]: one function instance's code, position-independent, every
-//!   address a relocation by stable symbol identity, panic locations and unwind and line rows
-//!   item-relative. Found by its [`key::InstanceKey`], which is computed before any lowering
-//!   from the body's key, the type arguments' content keys, the settings and tier, and the keys
-//!   of the bodies it takes in ([`inline`]: the two-step rule).
+//! - [`key`]: an instance's [`key::InstanceKey`], computed before any lowering from the body's
+//!   key, the type arguments' content keys, the settings and tier, and the keys of the bodies it
+//!   takes in ([`inline`]: the two-step rule). The code under it is codegen's record; this crate
+//!   reads only its head ([`record::CodeHead`]).
 //! - [`walk::Walk`]: the monomorphization walk as a streaming sans-IO state machine: roots
 //!   in, records asked for, one instance out at a time; it holds the frontier and the seen set,
 //!   never a crate's bodies. Checking is demand-driven through it.
-//! - [`program::Program`]: a program as a manifest (an ordered table of what is where, itself a
-//!   record) and the machine that turns a demand, an edit's delta or a tier-up into a
-//!   [`change::PlacementChange`] of bytes proportional to the edit. One driver applies it now:
-//!   the file writer ([`change::apply`]). Nothing is relinked.
+//! - [`program::Program`]: a program as a manifest (its rows, itself a record) and the machine
+//!   that turns a demand, an edit's delta or a tier-up into a [`change::RowChange`]: the rows
+//!   that came, went or moved, in proportion to the edit. The linker makes its change of it
+//!   (blaze-link's `Change`) and patches the file; nothing is relinked.
+//! - [`walker`]: the driver's walk seam (blaze-keyed's `program::Walker`) over [`walk::Walk`]
+//!   and [`program::Program`]: the same row rule, an instance named by its plan's name.
 //! - [`reach`]: tests are programs; a result's base key is the test's identity
 //!   ([`reach::test_key`]), and what it can run is its reach (calls and statics' values). The
 //!   result record, its asks and the suite index are blaze-testsel's.
@@ -50,6 +51,11 @@
 //! Records are the core's (`blaze_keyed`): code is its `Instance`, a test result its `TestRun`;
 //! [`keyed`] is the one adapter between this crate's key rules and layouts and the core's kinds,
 //! and [`codec`] lays out the payloads inside them.
+//!
+//! **The floor.** A build must read each reached instance's key and head once and make each
+//! missing record once; a delta must touch only the edit's neighbourhood. The walk's cost is
+//! that (see [`walk`]); a placement's is its change's length times a log of the program's
+//! (see [`program`]), plus the retiring mark, `O(rows)`, only when an edit drops an edge.
 
 #![feature(allocator_api, btreemap_alloc)]
 #![feature(register_tool, custom_inner_attributes)]
@@ -64,6 +70,7 @@ pub mod program;
 pub mod reach;
 pub mod record;
 pub mod walk;
+pub mod walker;
 
 #[cfg(test)]
 mod tests;
@@ -77,9 +84,15 @@ pub enum Plant {
     InlineeLeftOut,
     /// The walk's seen set forgets every other node it finished.
     SeenDrops,
-    /// A function or static that moved keeps its referrers pointing at its old place (the
-    /// file-only layout's counterpart of a slot not repointed).
-    SiteNotRepatched,
+    /// A row whose key moved is said to have come under its new key but not to have gone
+    /// under its old one, so the linker keeps the old code beside the new.
+    RekeyedNotGone,
     /// A test's reach leaves statics out.
     ReachWithoutStatics,
+    /// The driver's walker ([`walker`]) takes no kept instance as moved, so a delta keeps the
+    /// row of an instance whose plan moved under its stale code.
+    DeltaKeepsStale,
+    /// The driver's walker ([`walker`]) leaves each code ask's last span table out, so the
+    /// driver would not find or make a table the code names.
+    SpanLeftOut,
 }

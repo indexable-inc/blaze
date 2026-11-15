@@ -1926,9 +1926,10 @@ pub(crate) struct Resolved {
     /// The piece count and removals Rust's references were counted to.
     pieces: u32,
     removals: u64,
-    /// What it was resolved from.
-    inputs: Arc<Vec<Input>>,
-    names: Arc<BTreeMap<NameId, crate::state::RustName>>,
+    /// What it was resolved from: the state's, shared, which an opened state gives it
+    /// ([`Resolved::open`]).
+    pub inputs: Arc<Vec<Input>>,
+    pub names: Arc<BTreeMap<NameId, crate::state::RustName>>,
     wasm: Arc<HashMap<NameId, blaze_codegen::wasm::Import, std::alloc::Global>>,
     graph: Option<Arc<Graph>>,
     marks: Marks,
@@ -4206,6 +4207,10 @@ fn keep<T: PartialEq>(was: &Arc<Vec<T>>, now: Vec<T>) -> Arc<Vec<T>> {
         Arc::new(now)
     }
 }
+
+mod kept;
+
+pub(crate) use kept::open_input;
 
 #[cfg(test)]
 mod ties_tests;

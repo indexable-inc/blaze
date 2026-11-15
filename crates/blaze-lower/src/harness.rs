@@ -4,12 +4,12 @@
 //! of the crate's own ([`base_db::Db::alias`] of the file on disk, which [`super::lower`] gives
 //! every crate whose root is appended to), so no other crate of that file reads it.
 
-use base_db::{Crate, FileText};
+use base_db::{Crate, CrateKey, FileText};
 use blaze_hash::HashSet;
 use hir_expand::proc_macro::ProcMacros;
 use std::alloc::Global;
 
-use super::{ContentId, Db, LowerError, Lowered};
+use super::{ContentId, Db, LowerError, Lowered, Trigger};
 use blaze_units::{query::UnitPlan, schema::Unit};
 
 /// Whether `unit` is a proc macro built to run as a wasm module ([`UnitPlan::macro_wasm`]):
@@ -75,9 +75,9 @@ impl Lowered {
         let mut refused = Vec::new(); // alloc: none until a unit is refused
         for &unit in &units {
             let unit = unit as usize;
-            let Some(krate) = self.crates.krate(unit) else { continue };
-            match wanted(&self.db, unit, krate) {
-                Ok(Some(appended)) => asked.push((unit, krate, appended)),
+            let Some(key) = self.crates.key(unit) else { continue };
+            match wanted(&self.db, unit, self.db.krate(key)) {
+                Ok(Some(appended)) => asked.push((unit, key, appended)),
                 Ok(None) => {}
                 Err(error) => refused.push((unit, error)),
             }
@@ -85,9 +85,8 @@ impl Lowered {
         let written = match asked.is_empty() {
             true => 0,
             false => {
-                let trigger = base_db::Trigger::named(
-                    "crate roots appended to (test harnesses, wasm macro glue)",
-                );
+                let trigger =
+                    Trigger::named("crate roots appended to (test harnesses, wasm macro glue)");
                 self.batch(trigger, |this| this.write_roots(&units, asked, &mut refused))
             }
         };
@@ -105,26 +104,26 @@ impl Lowered {
     fn write_roots(
         &mut self,
         units: &[u32],
-        asked: Vec<(usize, Crate, Appended)>,
+        asked: Vec<(usize, CrateKey, Appended)>,
         refused: &mut Vec<(usize, LowerError)>,
     ) -> usize {
         let mut made: HashSet<base_db::FileId, Global> = HashSet::new_in(Global);
         let mut written = 0;
+        let mut edit = self.db.edit();
         for (unit, krate, appended) in asked {
-            let file = krate.data(&self.db).root_file_id;
+            let file = edit.written_crate(krate).data.root_file_id;
             let asked = FileText::content_of(&appended.after, Some(appended.module));
             match self.appended.get(&file) {
                 Some(&(_, was)) if was == asked => continue,
                 Some(&(by, _)) if made.contains(&file) || !units.contains(&(by as u32)) => {
-                    refused.push((unit, self.two_roots(by, unit, file)));
+                    refused.push((unit, two_roots(&self.crates, &self.paths, by, unit, file)));
                     continue;
                 }
                 _ => {}
             }
-            let before = self.db.file_text(file).content(&self.db);
-            if let Err(error) =
-                self.db.set_alias_appended(file, Some((appended.module, &appended.after)))
-            {
+            let content = |edit: &base_db::Edit<'_>| edit.written_file_text(file).map(|(_, it)| it);
+            let before = content(&edit);
+            if let Err(error) = edit.set_alias_appended(file, Some((appended.module, &appended.after))) {
                 let what = &self.crates.units[unit].what;
                 // alloc: the error's message
                 refused.push((
@@ -140,31 +139,40 @@ impl Lowered {
             // Its root's text is another: what a record carried of its texts is let go.
             self.carried.remove(&krate);
             self.appended.insert(file, (unit, asked));
-            if self.db.file_text(file).content(&self.db) != before {
+            if content(&edit) != before {
                 written += 1;
             }
         }
+        _ = edit.commit();
         if written > 0 {
             self.identities.clear();
             // In this batch: a root with a module appended is another text of its crate.
-            self.give_surfaces();
+            self.surfaces_due = true;
         }
         written
     }
+}
 
-    fn two_roots(&self, first: usize, second: usize, file: base_db::FileId) -> LowerError {
-        let (first, second) = (&self.crates.units[first].what, &self.crates.units[second].what);
-        // alloc: the error's place and message
-        let at = self.paths.get(&file).cloned().unwrap_or_else(|| format!("{file:?}"));
-        LowerError::at(
-            // alloc: as `at`
-            format!(
-                "{first} and {second} are one crate of the root file `{at}` and would each have its root end with \
-                 another test harness, which one root can't"
-            ),
-            at,
-        )
-    }
+/// Why units `first` and `second` of `crates` can't both have the root `file` (named by `paths`)
+/// made: each wants another module appended.
+fn two_roots(
+    crates: &super::Crates,
+    paths: &std::collections::HashMap<base_db::FileId, String>,
+    first: usize,
+    second: usize,
+    file: base_db::FileId,
+) -> LowerError {
+    let (first, second) = (&crates.units[first].what, &crates.units[second].what);
+    // alloc: the error's place and message
+    let at = paths.get(&file).cloned().unwrap_or_else(|| format!("{file:?}"));
+    LowerError::at(
+        // alloc: as `at`
+        format!(
+            "{first} and {second} are one crate of the root file `{at}` and would each have its root end with \
+             another test harness, which one root can't"
+        ),
+        at,
+    )
 }
 
 /// Whether every proc macro `krate` reaches through its dependencies has had its load

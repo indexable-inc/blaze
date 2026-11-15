@@ -70,7 +70,7 @@ pub(crate) fn query(job: &Job, reader: &UnitReader, rules: &str) -> Result<Rows,
 /// names in any of them. `Jobs::next` posted the job only after they were; checked again here.
 fn macros_built(job: &Job, reader: &UnitReader, what: &str) -> Result<(), Failed> {
     for at in 0..job.graph.len() {
-        let Some(krate) = job.crates.krate(at) else { continue };
+        let Some(krate) = job.crates.krate(reader.db(), at) else { continue };
         if job.cancelled() {
             return Err(Failed::Again);
         }
@@ -94,7 +94,7 @@ pub(crate) fn ahead(job: &Job, reader: &UnitReader, filter: &[String]) -> Result
         let unit = job.unit(at)?;
         // Its tests are listed from its def map: its proc macros were built and applied before
         // this was posted (`Jobs::next`); checked again here.
-        if let Some(krate) = job.crates.krate(at) {
+        if let Some(krate) = job.crates.krate(reader.db(), at) {
             answer_macros_built(reader.db(), krate, &unit.target.name, "ahead")?;
         }
         let roots = super::codegen::test_roots(job, reader, at)

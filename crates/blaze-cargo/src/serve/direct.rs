@@ -43,7 +43,7 @@ use std::{
 
 use blaze_cas::{
     Key, Reader,
-    direct::{Direct, Failed, Mapped, Placed, Read},
+    direct::{Direct, Failed, Mapped, Placed, Read, Residency},
 };
 use blaze_core::{Completion, Driver, Effect, wait::Deadline};
 use blaze_mem::frame::Frame;
@@ -275,14 +275,7 @@ pub(crate) fn thread_counts() -> blaze_cas::direct::Counts {
         let mut all = blaze_cas::direct::Counts::default();
         for (_, home, std) in &thread.directs {
             for own in [home.own_counts(), std.own_counts()] {
-                all.records += own.records;
-                all.bytes += own.bytes;
-                all.reads += own.reads;
-                all.runs += own.runs;
-                all.files_opened += own.files_opened;
-                all.maps += own.maps;
-                all.mapped_bytes += own.mapped_bytes;
-                all.leaked_bytes += own.leaked_bytes;
+                all.add(&own);
             }
         }
         all
@@ -302,9 +295,15 @@ fn with<R>(stores: &Stores, which: Which, f: impl FnOnce(&mut Direct, &mut Drivi
                 if directs.len() == KEPT {
                     directs.remove(0);
                 }
+                // A real file system's pages are the system's to tell (`mincore`); the
+                // simulation's files are in none, and its model stands for the cache.
+                let residency = || match stores.reads {
+                    Reads::Native { .. } => Residency::Kernel,
+                    Reads::Lent => Residency::model(),
+                };
                 // clone: refcounts, once a daemon a thread
-                let home = Direct::new(stores.home.clone(), HOME_TAGS);
-                let std = Direct::new(stores.std.clone(), STD_TAGS); // clone: as above
+                let home = Direct::new(stores.home.clone(), HOME_TAGS, residency());
+                let std = Direct::new(stores.std.clone(), STD_TAGS, residency()); // clone: as above
                 directs.push((stores.id, home, std));
                 directs.len() - 1
             }

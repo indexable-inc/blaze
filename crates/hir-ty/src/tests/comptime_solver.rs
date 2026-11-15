@@ -81,7 +81,7 @@ fn with_db(check: impl FnOnce(&base_db::Db)) {
         "//- minicore: sized, copy, clone, phantom_data\n#![feature(blaze_comptime, lang_items)]\n{REFLECT}{BODIES}"
     );
     let db = fixture::db(&fixture).into_db();
-    blaze_query::db::attach(&db, || check(&db));
+    blaze_memo::attach(&db, || check(&db));
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn encodes_good() { encode(&Good { a: 1, c: true }); }
 "#
     );
     let db = fixture::db(&fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let good = diagnostics(&db, "encodes_good");
         assert!(good.is_empty(), "{good:?}");
         let bad = diagnostics(&db, "encodes_bad");

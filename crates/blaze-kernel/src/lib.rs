@@ -8,12 +8,12 @@
 //! read hashes the same now. That is a verifying trace (Mokhov, Mitchell and Peyton Jones,
 //! "Build systems à la carte", 2018).
 //!
-//! - **Beside the front end, under codegen.** The front end keeps its own engine
-//!   (`blaze_query::db`, derived from salsa): dense ids, in memory, one view at a time. A kernel
-//!   entry is keyed by content, persisted, and shared by every process and checkout, so its
-//!   reads are narrow facts named by stable keys (an item key's layout, not the item). A
-//!   [`World`] that the wiring crate implements over the front end answers them. The kernel
-//!   does not depend on `blaze-query`.
+//! - **Beside the front end, under codegen.** The front end keeps its own session memo
+//!   (`blaze_memo`): ids per crate arena, in memory, one snapshot at a time. A kernel entry is
+//!   keyed by content, persisted, and shared by every process and checkout, so its reads are
+//!   narrow facts named by stable keys (an item key's layout, not the item). A [`World`] that
+//!   the wiring crate implements over the front end answers them. The kernel does not depend
+//!   on `blaze-memo`.
 //! - **Identity first.** An entry with no reads is kept under [`whole::key`] alone, as its bare
 //!   value: one probe, no header. A step that reads keeps the names of its reads (a read-list)
 //!   in a bounded chain of slots under its identity ([`MOST_SHAPES`]). Lookup hashes each

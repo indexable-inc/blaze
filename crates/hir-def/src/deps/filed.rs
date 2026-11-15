@@ -5,7 +5,7 @@
 //! values made from a crate's bodies (`blaze_diagnostics::cache`, `hir_ty::check_cache`), whose
 //! reads ([`checked_reads`]) are the expansions of its bodies besides those its image covers.
 
-use base_db::{Crate, Db, ExpansionRead, ReadBy};
+use base_db::{Crate, CrateKey, Db, ExpansionRead, ReadBy};
 use blaze_ids::{ContentId, Hasher};
 use hir_expand::MacroCallId;
 
@@ -72,9 +72,11 @@ pub fn closure_expansion_reads(
     db: &Db,
     krate: Crate,
 ) -> Result<Vec<(Crate, Vec<(Box<[u8]>, ContentId)>)>, Refused> {
+    // The log names crates by key, which outlives a snapshot: each is taken back to this
+    // snapshot's crate.
     // alloc: once per value keyed by a crate's closure, a crate of it each
-    let closure: blaze_hash::HashSet<Crate, std::alloc::Global> =
-        krate.transitive_deps(db).iter().copied().collect();
+    let closure: blaze_hash::HashSet<CrateKey, std::alloc::Global> =
+        krate.transitive_deps(db).iter().map(|&it| it.key(db)).collect();
     // alloc: as above, a crate whose expansions read something each
     let mut reads: Vec<(Crate, Vec<(Box<[u8]>, ContentId)>)> = Vec::new();
     let mut asked: Option<Crate> = None;
@@ -82,6 +84,7 @@ pub fn closure_expansion_reads(
         if !closure.contains(&by) {
             continue;
         }
+        let by = db.krate(by);
         match read {
             ExpansionRead::Traced { shape, values } => match reads.last_mut() {
                 Some((at, it)) if *at == by => it.push((shape, values)),
@@ -246,13 +249,15 @@ pub(super) fn search<T>(
     lookups: &blaze_record::Tally,
     mut found: impl FnMut(ContentId) -> Result<Option<T>, String>,
 ) -> Result<Result<T, bool>, String> {
+    // The logs name crates by key, which outlives the snapshot.
+    let krate_key = krate.key(db);
     let served = |expansions: Vec<ExpansionRead>| {
-        db.files().expansions_are_read(krate, ReadBy::Served(key), expansions);
+        db.files().expansions_are_read(krate_key, ReadBy::Served(key), expansions);
     };
     // The files outside the VFS a value was found by, as the crate's reads of them in place
     // of the resolution that never runs (`Files::included_by`); none when it is under `key`
     // alone or not found.
-    db.files().included_are_served(krate, Vec::new());
+    db.files().included_are_served(krate_key, Vec::new());
     if let Some(it) = found(key)? {
         served(Vec::new());
         return Ok(Ok(it));
@@ -294,14 +299,14 @@ pub(super) fn search<T>(
             let why = format!("the files of the reads of crate {} in slot {n}: {why}", name());
             Stopped::Said(why)
         })?;
-        db.files().included_are_served(krate, files);
+        db.files().included_are_served(krate_key, files);
         for name in reads.names().0 {
-            db.files().env_is_read(krate, name);
+            db.files().env_is_read(krate_key, name);
         }
         let closure = krate.transitive_deps(db);
         for &at in reads.primary() {
             if let Some(&by) = closure.get(at as usize) {
-                db.files().env_is_read(by, base_db::PRIMARY_PACKAGE);
+                db.files().env_is_read(by.key(db), base_db::PRIMARY_PACKAGE);
             }
         }
         served(expansions);
@@ -321,6 +326,25 @@ pub(super) fn search<T>(
             Err(format!("the reads of crate {} (key {key:?}): {why}", name()))
         }
     }
+}
+
+/// [`search`]'s first step alone: the value `found` finds under `key` itself, the crate having
+/// read nothing (no slot is walked, so no read is valued and no query of the crate runs), with
+/// the logs noted as [`search`] notes them for such a value (no `env!` variable, no expansion,
+/// no file outside the VFS). `None`, and nothing noted, when there is none: whether the
+/// crate's reads find one is [`search`]'s to say, which a start leaves to the first serve
+/// ([`super::serve::serve_found`]).
+pub(super) fn under_key_alone<T>(
+    db: &Db,
+    krate: Crate,
+    key: ContentId,
+    found: impl FnOnce(ContentId) -> Result<Option<T>, String>,
+) -> Result<Option<T>, String> {
+    let Some(it) = found(key)? else { return Ok(None) };
+    let krate_key = krate.key(db);
+    db.files().included_are_served(krate_key, Vec::new());
+    db.files().expansions_are_read(krate_key, ReadBy::Served(key), Vec::new());
+    Ok(Some(it))
 }
 
 /// Keeps `list`, the read-list of the reads of `krate` ([`reads::write_list`]), in the first

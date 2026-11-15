@@ -233,7 +233,7 @@ impl HirFrontend<'_> {
             .map_err(|what| refused(db, krate, what))?
             .into_iter()
             .collect();
-        linked.sort_unstable_by_key(|it| blaze_query::db::AsId::as_id(it));
+        linked.sort_unstable_by_key(|it| blaze_memo::Id::gid(*it));
         for linked in linked {
             add_kept(db, linked, listed);
         }

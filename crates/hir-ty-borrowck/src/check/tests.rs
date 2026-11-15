@@ -567,7 +567,7 @@ fn a_body_with_no_error_takes_nothing_from_the_global_allocator() {
     let fx = fixture::db(CLEAN);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut bodies = 0;
         for &krate in all_crates(&db).iter() {
             let def_map = crate_def_map(&db, krate);

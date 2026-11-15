@@ -60,7 +60,7 @@ fn prints(fixture: &str, expected: &str) {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    let (result, stdout) = blaze_query::db::attach(&db, || {
+    let (result, stdout) = blaze_memo::attach(&db, || {
         let main = function(&db, "main");
         let (result, output, Plain) = run_function(&db, main, Plain);
         (result.map_err(|e| format!("{e:?}")), output.stdout().into_owned())
@@ -259,7 +259,7 @@ fn transitions(fixture: &str) -> (BasicBlockId, Vec<(BasicBlockId, BasicBlockId)
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let body = db.mir_body(function(&db, "walk").into()).expect("the body of `walk`");
         let (head, start) = first_switch(&body, body.start_block);
         let writes_state = |kind: &StatementKind| match kind {
@@ -380,7 +380,7 @@ fn refusals(program: &str) -> Vec<&'static str> {
     let fx = fixture::db(&fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = hir_def::DefWithBodyId::FunctionId(function(&db, "f"));
         loop_match_check(&db, def).errors().iter().map(|it| it.kind.message()).collect()
     })

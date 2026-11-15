@@ -41,25 +41,65 @@ pub struct Patch {
     pub generation: u64,
 }
 
+/// One edit of the file a [`Patch`] is applied to, as a host that opened it does it: set its
+/// length (`ftruncate`: a shorter file loses its tail, a longer one reads zeros past the old
+/// end), or write bytes at an offset (`pwrite`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileEdit<'p> {
+    SetLen(u64),
+    Write { at: u64, bytes: &'p [u8] },
+}
+
+/// What a [`Patch`] is applied to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PatchBase {
+    /// A new empty file: the patch is the whole file ([`Patch::full`]).
+    Empty,
+    /// A clone of the file of [`Patch::base`] (a reflink or `clonefile`, else a copy).
+    Clone,
+}
+
 impl Patch {
     /// How many bytes the patch writes.
     pub fn written(&self) -> u64 {
         self.writes.iter().map(|it| it.1.len() as u64).sum()
     }
 
-    /// Applies the patch to `file`, which holds the file of [`Patch::base`]: what a commit's
-    /// effects do to a clone of it. A full patch starts from zeros.
+    /// What the edits are applied to: an empty file for a full patch, else a clone of the file
+    /// of [`Patch::base`].
+    pub fn applies_to(&self) -> PatchBase {
+        match self.full {
+            true => PatchBase::Empty,
+            false => PatchBase::Clone,
+        }
+    }
+
+    /// The edits that make the file of [`Patch::digest`] from [`Patch::applies_to`]: its
+    /// length, then each range by offset, none overlapping. Sans-IO: the host applies them to
+    /// the file it opened, in this order. Floor: bytes written in proportion to the change,
+    /// [`Patch::written`] (a full patch's are every range that is not zeros); one length set.
+    pub fn edits(&self) -> impl Iterator<Item = FileEdit<'_>> + '_ {
+        std::iter::once(FileEdit::SetLen(self.len))
+            .chain(self.writes.iter().map(|(at, bytes)| FileEdit::Write { at: *at, bytes }))
+    }
+
+    /// Applies the patch to `file`, which holds the file of [`Patch::base`] (or anything, for a
+    /// full patch, which starts from an empty file): the [`Patch::edits`] done in memory.
     pub fn apply(&self, file: &mut Vec<u8>) {
-        if self.full {
+        if self.applies_to() == PatchBase::Empty {
             file.clear();
         }
-        file.resize(self.len as usize, 0);
-        for (at, bytes) in &self.writes {
-            let end = *at as usize + bytes.len();
-            if end > file.len() {
-                file.resize(end, 0);
+        for edit in self.edits() {
+            match edit {
+                FileEdit::SetLen(len) => file.resize(len as usize, 0),
+                FileEdit::Write { at, bytes } => {
+                    let end = at as usize + bytes.len();
+                    if end > file.len() {
+                        file.resize(end, 0);
+                    }
+                    file[at as usize..end].copy_from_slice(bytes);
+                }
             }
-            file[*at as usize..end].copy_from_slice(bytes);
         }
     }
 }
@@ -111,6 +151,30 @@ impl Filed {
     /// A state was put back with no record of what differs: a failed commit's revert.
     pub(crate) fn wrote_any(&mut self) {
         self.stale = Stale::All;
+    }
+
+    /// The digest of `state`'s file as a kept state holds it ([`crate::keep`]): brought up to
+    /// date on a copy first (the stale blocks hashed), so what is kept is the file's canonical
+    /// tree and the opened image's first [`Image::digest`] hashes nothing.
+    pub(crate) fn keep<A: std::alloc::Allocator>(
+        &self,
+        state: &State,
+        out: &mut crate::keep::Out<A>,
+    ) {
+        let stale = match &self.stale {
+            Stale::All => Stale::All,
+            Stale::Ranges(ranges) => {
+                let mut copy = Vec::with_capacity_in(ranges.len(), std::alloc::Global);
+                copy.extend_from_slice(ranges);
+                Stale::Ranges(copy)
+            }
+        };
+        let mut current = Filed { digest: self.digest.copy(), stale };
+        current.of(state).keep(out);
+    }
+
+    pub(crate) fn open(input: &mut crate::keep::In<'_>) -> Result<Filed, crate::keep::Bad> {
+        Ok(Filed { digest: Digest::open(input)?, stale: Stale::Ranges(Vec::new_in(std::alloc::Global)) })
     }
 
     /// The digest of `state`'s file: the stale blocks read from the state and hashed.

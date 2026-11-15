@@ -9,7 +9,7 @@ const MOD_DEPTH_LIMIT: usize = 32;
 
 /// 16 bytes and `Copy`: the directory is an interned symbol, so the collector keeps one per module
 /// and hands it to every expansion collected there without copying the path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(super) struct ModDir {
     /// `` for `mod.rs`, `lib.rs`
     /// `foo/` for `foo.rs`
@@ -158,7 +158,7 @@ impl ModDir {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 struct DirPath(Symbol);
 
 impl DirPath {

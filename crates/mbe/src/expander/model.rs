@@ -99,7 +99,7 @@ pub(crate) fn expect_fragment<'t>(
 ) -> ExpandResult<tt::TokenTreesView<'t>> {
     use ::parser;
     let buffer = tt_iter.remaining();
-    let parser_input = to_matcher_input(buffer, &mut |ctx| ctx.edition(db));
+    let parser_input = to_matcher_input(buffer, &mut |ctx| ctx.edition());
     let tree_traversal = entry_point.parse(&parser_input);
     let mut cursor = buffer.cursor();
     let mut error = None;

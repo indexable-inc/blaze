@@ -82,7 +82,7 @@ impl ExprOrPatId {
     }
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, blaze_query::Value)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExprOrPatIdPacked(u32);
 
 const _: () = assert!(mem::size_of::<ExprOrPatIdPacked>() == mem::size_of::<u32>());

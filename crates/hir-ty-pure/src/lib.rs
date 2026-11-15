@@ -22,7 +22,7 @@
 //! other. That is the design, not a fallback.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api, register_tool)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
 // `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
 #![register_tool(blaze)]
 
@@ -37,11 +37,12 @@ mod loops;
 pub mod expect;
 mod memory;
 pub mod models;
+pub mod own;
 pub mod program_lifetime;
 pub mod reach;
 pub mod refined;
 pub mod roles;
-mod sealed;
+pub mod steps;
 pub mod trust;
 mod values;
 mod walk;
@@ -62,6 +63,8 @@ pub use function::{
     check_generic, derived_pure, fn_memory, fn_purity, fn_purity_generic, instance_effects,
 };
 pub use memory::{Access, MemoryEffects};
+pub use own::{OwnEffects, own_effects};
+pub use steps::{OutOfSteps, with_steps};
 pub use walk::{ScriptProof, main_of, script_proof, script_purity};
 /// What a pure script's code may do, as its proof says: what the first sandboxed run of it is
 /// checked against (`blaze_usercode::pure::check`), and what its key is made of.

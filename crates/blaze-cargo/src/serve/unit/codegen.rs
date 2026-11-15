@@ -921,6 +921,7 @@ impl Parts {
             .with_policy(&self.policy)
             .with_image(self.image);
         Generated {
+            db: reader.db(),
             built: &self.built,
             roots: &self.roots,
             frontend,
@@ -935,6 +936,8 @@ impl Parts {
 
 /// What a unit's codegen made, reading the task's front end.
 pub(crate) struct Generated<'a> {
+    /// The snapshot `frontend` reads: what the job's units' crates, held by key, are taken in.
+    pub(crate) db: &'a base_db::Db,
     pub(crate) built: &'a Built,
     pub(crate) roots: &'a Roots,
     pub(crate) frontend: HirFrontend<'a>,
@@ -1102,7 +1105,7 @@ pub(crate) fn hash_source(
 /// listing, names and attributes as the test binary's ([`generate`]).
 pub(crate) fn test_roots(job: &Job, reader: &UnitReader, unit: usize) -> Result<Roots, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
-    let krate = job.crates.krate(unit).ok_or_else(|| {
+    let krate = job.crates.krate(reader.db(), unit).ok_or_else(|| {
         format!("unit {unit} (`{}`) has no crate in the front end", u.target.name)
     })?;
     frontend(reader, &job.mounted, build_time(job, unit))
@@ -1270,7 +1273,7 @@ pub(crate) fn generate<'db>(
             let (walk, work) = (&built.walk, &built.work);
             tracing::info!(
                 target: "blaze",
-                stage = blaze_query::db::edit_work::CODEGEN_WALK,
+                stage = blaze_query::edit_work::CODEGEN_WALK,
                 asked = work.asked as u64,
                 named = work.named as u64,
                 held = work.held as u64,
@@ -1391,7 +1394,7 @@ fn refused(reader: &UnitReader, root: &str, errors: Vec<blaze_codegen::CodegenEr
         }
         // clone: the error path, the instance's name in its unit's line
         let named = front.named.clone();
-        let path = blaze_query::db::attach(db, || blaze_items::key::path(db, front.id));
+        let path = blaze_memo::attach(db, || blaze_items::key::path(db, front.id));
         if let Some(failed) = toolchain.iter_mut().find(|it| it.path == path && it.why == front.why)
         {
             failed.instances.push((at, named));
@@ -1595,6 +1598,7 @@ fn natives(
     job: &Job,
     unit: usize,
     krate: base_db::Crate,
+    db: &base_db::Db,
     frontend: &HirFrontend<'_>,
     triple: &str,
 ) -> Result<Natives, String> {
@@ -1630,7 +1634,7 @@ fn natives(
         // library's), the rest each unit's.
         let crate_of = match at == unit {
             true => Some(krate),
-            false => job.crates.krate(at as usize),
+            false => job.crates.krate(db, at as usize),
         };
         if let Some(krate) = crate_of {
             libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
@@ -2209,7 +2213,7 @@ fn link_at(
             let _span =
                 tracing::info_span!(target: "blaze", "link natives: the crates' libraries")
                     .entered();
-            natives(job, unit, krate, &generated.frontend, triple(job, u))?
+            natives(job, unit, krate, generated.db, &generated.frontend, triple(job, u))?
         };
         // What the rustflags' link options and the link arguments ask: set on the output, and
         // the arguments' libraries and directories after the rest, as rustc appends them to
@@ -2902,7 +2906,7 @@ fn relink(
     // part of a link that still grows with the program and not with the edit.
     tracing::info!(
         target: "blaze",
-        stage = blaze_query::db::edit_work::LINK,
+        stage = blaze_query::edit_work::LINK,
         rows = work.rows as u64,
         tables = work.tables as u64,
         symbols = names.len() as u64,
@@ -2999,7 +3003,7 @@ fn relink(
     // program running the earlier link is told to start again, naming each change.
     let (assumed, refused) = match linked.output.dev_run {
         Some(_) => {
-            let assumed = live_assumed(job, unit, &generated.frontend);
+            let assumed = live_assumed(job, unit, generated.db, &generated.frontend);
             let refused = changed_assumptions(&linked.assumed, &assumed, &generated.frontend);
             (assumed, refused)
         }
@@ -3267,11 +3271,16 @@ fn tests_table(
 
 /// What the code `unit` links of its workspace crates assumes of their items, by key, sorted
 /// ([`HirFrontend::live_assumed`]).
-fn live_assumed(job: &Job, unit: usize, frontend: &HirFrontend<'_>) -> Vec<(ItemKey, Assumed)> {
+fn live_assumed(
+    job: &Job,
+    unit: usize,
+    db: &base_db::Db,
+    frontend: &HirFrontend<'_>,
+) -> Vec<(ItemKey, Assumed)> {
     // alloc: per live link, kept by the image
     let mut rows = Vec::new();
     for at in job.graph.linked_in(unit as u32) {
-        if let Some(krate) = job.crates.krate(at as usize) {
+        if let Some(krate) = job.crates.krate(db, at as usize) {
             rows.extend(frontend.live_assumed(krate));
         }
     }

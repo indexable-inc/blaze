@@ -25,7 +25,7 @@
 //! an item's normalized form; [`hash`] fills the forms' slots and gives the four hashes
 //! ([`hashes`]); [`facts`] gives each [`Fact`] its value; `index` holds the negative-fact
 //! indexes; [`table`] holds hashes and facts as columns ([`HashColumns`], [`FactSet`]);
-//! [`goals`] gives the persistent goal cache its keys and facts. Each is computed by `#[blaze_query::tracked]` queries over the front end's database, so
+//! [`goals`] gives the persistent goal cache its keys and facts. Each is computed by `#[blaze_memo::tracked]` queries over the front end's database, so
 //! an edit recomputes only the forms it touched and stops where a hash comes out equal.
 //!
 //! Memory (docs/v2/plan/design/memory.md): a crate's tables (its key index, its hash columns)
@@ -80,7 +80,7 @@ pub use table::{FactSet, HashColumns, crate_hashes};
 
 /// Which item, in one database: its dense ids, never hashed, never kept past the database.
 /// [`ItemKey`] is what is kept.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_query::Supertype)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_memo::Home)]
 pub enum ItemId {
     Function(FunctionId),
     Adt(AdtId),
@@ -229,12 +229,16 @@ pub struct ItemHashes {
 }
 
 /// rustc's simplified self type (`SimplifiedType`), hashed: the key under which impls and
-/// method candidates are found.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+/// method candidates are found. A hash, so it names no arena (`blaze_memo::Home`).
+#[derive(
+    Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_memo::Home,
+)]
 pub struct SimplifiedType(pub ContentId);
 
-/// A name, hashed: `Hasher::new(NAME_DOMAIN).update(name)`.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+/// A name, hashed: `Hasher::new(NAME_DOMAIN).update(name)`. Names no arena.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_memo::Home,
+)]
 pub struct NameHash(pub ContentId);
 
 pub const NAME_DOMAIN: &str = "blaze v2 name 1";
@@ -372,7 +376,7 @@ pub mod kinds {
     pub const TRAITS_NAMED: QueryKind = QueryKind(0x1017);
     pub const SCOPE_TRAITS_NAMED: QueryKind = QueryKind(0x1018);
     pub const BLOCK_IMPLS: QueryKind = QueryKind(0x1019);
-    // 0x1800..0x1810 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
+    // 0x1800..0x1820 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
     // not hash, listed in `blaze_item_hash::values::kinds`. None is defined here.
 }
 

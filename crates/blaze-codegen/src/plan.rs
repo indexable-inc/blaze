@@ -36,6 +36,8 @@ use crate::{
     settings::{DebugInfo, Panic, Pgo, Sanitize, Spec, Toolchain},
 };
 
+pub mod cargo;
+
 pub const POLICY_DOMAIN: &str = "blaze v2 codegen policy 1";
 
 /// cargo's `opt-level`.

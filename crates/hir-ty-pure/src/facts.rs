@@ -118,7 +118,7 @@ const CHECKED: [(Fact, &EffectDef); 4] = [
 /// `proofs` (the asking body's, `hir_ty::facts::proofs_at` of its tier): the record of one
 /// mode is a row of its own and never read for the other's. A function with no body of its
 /// own to walk (a foreign function, a trait's method without a default) has none.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref))]
 fn fn_facts(db: &Db, func: FunctionId, proofs: Proofs) -> Facts {
     let mut facts = Facts::none(item_key(db, ItemId::Function(func)).0.0);
     let foreign = matches!(func.loc(db).container, ItemContainerId::ExternBlockId(_));
@@ -157,7 +157,7 @@ fn fn_facts(db: &Db, func: FunctionId, proofs: Proofs) -> Facts {
 /// and the type's shape is one it can hold of. Where instances are allocated and whether the
 /// type is another crate's to name are the lint's (`blaze::program_lifetime`), which sees
 /// the crate's bodies.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref))]
 fn adt_facts(db: &Db, adt: AdtId) -> Facts {
     let mut facts = Facts::none(item_key(db, ItemId::Adt(adt)).0.0);
     if program_lifetime::declared(db, adt) && program_lifetime::shape(db, adt).is_none()

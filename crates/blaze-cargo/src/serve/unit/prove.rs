@@ -229,7 +229,7 @@ fn members_of(job: &Job, db: &Db) -> Result<Vec<Member>, Failed> {
         {
             continue;
         }
-        let Some(krate) = job.crates.krate(at) else { continue };
+        let Some(krate) = job.crates.krate(db, at) else { continue };
         if members.iter().any(|it| it.krate == krate) {
             continue;
         }

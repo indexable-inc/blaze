@@ -1,7 +1,6 @@
 //! `borrow_workaround` and `nll_workaround`: one test per shape that is found, one per near
 //! miss (a fix the borrow checker would refuse, a fix that would change what runs).
 
-use blaze_query::db::Setter as _;
 use hir_expand::fixture::Fixture;
 
 use crate::{conf::Conf, tests::lint_given};
@@ -40,8 +39,18 @@ fn as_built(_: &mut Fixture) {}
 
 /// The database checks borrows as stable Rust does (`BLAZE_BORROWCK=nll`).
 fn nll(built: &mut Fixture) {
-    let settings = base_db::FrontSettings::get(built.db());
-    settings.set_borrowck(built.db_mut()).to(base_db::BorrowckMode::Nll);
+    built.edit(|edit| {
+        let db = edit.db();
+        let settings = base_db::FrontSettings::get(db);
+        let nll = base_db::FrontSettingsData {
+            borrowck: base_db::BorrowckMode::Nll,
+            // clone: the one debug string, once per test
+            borrowck_debug: settings.borrowck_debug(db).clone(),
+            trace_holders: settings.trace_holders(db),
+            check_relative_bodies: settings.check_relative_bodies(db),
+        };
+        edit.set_settings(nll);
+    });
 }
 
 /// NLL problem case #3: `contains_key` and then `get_mut` returned, where stable Rust rejects

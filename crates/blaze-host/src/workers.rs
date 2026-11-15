@@ -7,7 +7,7 @@
 //! A task is handed exactly its inputs: the tables the driver's
 //! [`Effect::Run`](blaze_keyed::driver::Effect::Run) names ([`Source`]), each surface in place
 //! (mapped from the store) or as the record this request wrote, shared, never copied per task;
-//! each made table read once per manifest root and shared; and the request's late reads. The
+//! each made table read once per manifest root and shared; and its own unit's late reads. The
 //! task sees them as a [`Universe`], and answers every ask of its own by
 //! [`Universe::answer`]: nothing else is readable.
 //!
@@ -29,12 +29,14 @@ use std::{
 use blaze_core::wait::Parker;
 use blaze_format::Aligned;
 use blaze_graph::pool::Scope;
+use blaze_ids::ContentId;
 use blaze_keyed::{
-    driver::{Task, TaskFailed},
-    front::{Front, Keyed, Table, Unanswerable, Universe},
+    driver::{NO_UNIT, Task, TaskFailed},
+    front::{Front, GivenBody, Keyed, SpanTables, Table, Unanswerable, Universe},
+    kind::{Key, PlanRecord},
     machine::Qos,
     pool::{Pool, PoolFull, Ticket},
-    record::{Fact, Owner},
+    record::{Fact, Owner, StableId},
 };
 use crossbeam_queue::SegQueue;
 
@@ -90,6 +92,7 @@ pub(crate) fn tables<'b>(sources: &'b [Source<'_>], made: &'b [Fact]) -> Result<
 pub(crate) enum Made {
     Keyed(Keyed<Global>),
     Wrote(Aligned),
+    Spans(SpanTables<Global>),
 }
 
 /// What a task is called in a failure: its kind.
@@ -98,12 +101,19 @@ pub(crate) fn what_of(task: Task) -> &'static str {
         Task::Key { .. } => "a unit's key task",
         Task::Surface { .. } => "a unit's surface task",
         Task::Body { .. } => "a body task",
+        Task::Plan { .. } => "a plan task",
+        Task::Code { .. } => "a code task",
+        Task::Spans { .. } => "a span task",
     }
 }
 
+/// The asker of a task's universe, whose late table it is handed: its unit, or [`NO_UNIT`] for
+/// a program's tasks (a plan reads only facts crates own; code reads nothing). A span task is
+/// its owner's unit's: it opens that unit as its surface task does.
 pub(crate) fn unit_of(task: Task) -> u32 {
     match task {
-        Task::Key { unit } | Task::Surface { unit, .. } | Task::Body { unit, .. } => unit,
+        Task::Key { unit } | Task::Surface { unit, .. } | Task::Body { unit, .. } | Task::Spans { unit, .. } => unit,
+        Task::Plan { .. } | Task::Code { .. } => NO_UNIT,
     }
 }
 
@@ -115,8 +125,18 @@ pub(crate) struct Job<'a, F> {
     pub(crate) sources: Vec<Source<'a>, Global>,
     /// The asking unit's own made facts, sorted by id.
     pub(crate) made: Vec<Fact, Global>,
-    /// The request's late reads, sorted by id.
+    /// The late reads of the task's own unit (`Request::late[unit]`), sorted by id; empty for a
+    /// program's tasks.
     pub(crate) late: &'a [Fact],
+    /// The effect's bytes: a plan task's ask, a code task's plan record (copied, as the effect's
+    /// borrow ends before the task runs); empty for the others.
+    pub(crate) bytes: Vec<u8, Global>,
+    /// A plan task's body records, by item, sorted, read from the store where the driver names
+    /// them, each with its result digest; empty for every other task.
+    pub(crate) bodies: Vec<(StableId, Aligned, ContentId), Global>,
+    /// A code task's callees' plan records, by instance, sorted, read where the driver names
+    /// them.
+    pub(crate) plans: Vec<(Key<PlanRecord>, Aligned), Global>,
 }
 
 /// Runs `job` with the front end over its universe, under a span naming it.
@@ -128,8 +148,26 @@ pub(crate) fn run_task<F: Front>(job: &Job<'_, F>) -> Result<Made, TaskFailed> {
     match task {
         Task::Key { unit } => job.front.key(unit, Global).map(Made::Keyed),
         Task::Surface { unit, key } => job.front.surface(unit, key, universe).map(Made::Wrote),
-        Task::Body { unit, item, key } => job.front.body(unit, item, key, universe).map(Made::Wrote),
+        Task::Body { unit, item, key, steps } => job.front.body_of(unit, item, key, steps, universe).map(Made::Wrote),
+        Task::Plan { program, key } => {
+            let given = given_bodies(&job.bodies);
+            job.front.plan(program, &job.bytes, key, &given, universe).map(Made::Wrote)
+        }
+        Task::Code { program, key } => {
+            let mut callees = Vec::with_capacity_in(job.plans.len(), Global);
+            callees.extend(job.plans.iter().map(|(instance, record)| (*instance, &record[..])));
+            let given = given_bodies(&job.bodies);
+            job.front.code(program, key, &job.bytes, &callees, &given, universe).map(Made::Wrote)
+        }
+        Task::Spans { program: _, unit, owner } => job.front.spans(unit, owner, universe, Global).map(Made::Spans),
     }
+}
+
+/// A plan or code task's bodies as the front end takes them, borrowing the records read.
+fn given_bodies(bodies: &[(StableId, Aligned, ContentId)]) -> Vec<GivenBody<'_>, Global> {
+    let mut given = Vec::with_capacity_in(bodies.len(), Global);
+    given.extend(bodies.iter().map(|(item, record, result)| GivenBody { item: *item, record, result: *result }));
+    given
 }
 
 /// [`run_task`], its panic caught and answered as the task's failure (rule 20).

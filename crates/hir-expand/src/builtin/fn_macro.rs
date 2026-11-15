@@ -113,6 +113,31 @@ impl EagerExpander {
     pub fn is_env_or_option_env(&self) -> bool {
         matches!(self, EagerExpander::Env | EagerExpander::OptionEnv)
     }
+
+    /// The variable an `env!` or `option_env!` call reads, from its argument `tt`: parsed as
+    /// the expanders parse it, and noting nothing as read. `None` for any other macro, and for
+    /// an argument that names no variable (that call is an error and reads nothing).
+    pub fn env_var_read(&self, db: &Db, arg_id: MacroCallId, tt: &tt::TopSubtree) -> Option<Symbol> {
+        match self {
+            EagerExpander::Env => {
+                let exprs = args::exprs(db, tt).ok()?;
+                let var = match exprs[..] {
+                    [var] => var,
+                    [var, message] => {
+                        args::string(&message, "expected string literal").ok()?;
+                        var
+                    }
+                    _ => return None,
+                };
+                args::string(&var, "expected string literal").ok()
+            }
+            EagerExpander::OptionEnv => {
+                let call = || call_span(db, arg_id, tt.top_subtree().delimiter.open);
+                args::single_string(db, tt, "option_env!", call).value.map(|(key, _)| key)
+            }
+            _ => None,
+        }
+    }
 }
 
 pub fn find_builtin_macro(
@@ -510,10 +535,10 @@ fn assert_expand<'f>(
         let mut message = blaze_mem::scratch::lend_string();
         message.push_str(HEAD);
         let extensions = span.anchor.file_id.extensions();
-        write_assert_condition(&mut message, &tokens, span.ctx.edition(db), extensions);
+        write_assert_condition(&mut message, &tokens, span.ctx.edition(), extensions);
         message
     });
-    let panic_2021 = message.is_none() && use_panic_2021(db, span);
+    let panic_2021 = message.is_none() && use_panic_2021(db, id, span);
     // Written in the expansion's own builder, in the invisible group a spliced `quote!` adds.
     let mac = group(call_site_span, |b| {
         let panic_args = rest.iter();
@@ -823,7 +848,7 @@ fn panic_expand<'f>(
     let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
 
-    let mac = if use_panic_2021(db, span) { sym::panic_2021 } else { sym::panic_2015 };
+    let mac = if use_panic_2021(db, id, span) { sym::panic_2021 } else { sym::panic_2015 };
 
     // Pass the original arguments
     let subtree = WithDelimiter {
@@ -851,7 +876,7 @@ fn unreachable_expand<'f>(
     let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), id.loc(db).def.edition);
 
-    let mac = if use_panic_2021(db, span) { sym::unreachable_2021 } else { sym::unreachable_2015 };
+    let mac = if use_panic_2021(db, id, span) { sym::unreachable_2021 } else { sym::unreachable_2015 };
 
     // Pass the original arguments
     let subtree = WithDelimiter {
@@ -899,20 +924,25 @@ fn blaze_unreachable_expand<'f>(
     ExpandResult::ok(call)
 }
 
-fn use_panic_2021(db: &Db, span: Span) -> bool {
+/// `span` is of the call `id`: its context is of `id`'s table (the calling crate's arena).
+fn use_panic_2021(db: &Db, id: MacroCallId, span: Span) -> bool {
     // To determine the edition, we check the first span up the expansion
     // stack that does not have #[allow_internal_unstable(edition_panic)].
     // (To avoid using the edition of e.g. the assert!() or debug_assert!() definition.)
     let mut ctx = span.ctx;
+    let mut arena = span::MacroCallId::from(id).arena();
     loop {
-        let Some(expn) = ctx.outer_expn(db) else {
-            break ctx.edition(db) >= Edition::Edition2021;
+        let Some(expn) = ctx.outer_expn(db, arena) else {
+            break ctx.edition() >= Edition::Edition2021;
         };
-        let expn = crate::MacroCallId::from(expn).loc(db);
-        if expn.def.edition_panic {
-            ctx = expn.ctxt;
+        let loc = crate::MacroCallId::from(expn).loc(db);
+        if loc.def.edition_panic {
+            // The call site of `expn` is in `expn`'s calling crate, so of its table.
+            ctx = loc.ctxt;
+            arena = expn.arena();
             continue;
         }
+        let expn = loc;
         break expn.def.edition >= Edition::Edition2021;
     }
 }
@@ -1297,7 +1327,9 @@ fn include_path(
     tt: &tt::TopSubtree,
     name: &str,
 ) -> ExpandResult<Option<(Symbol, Span)>> {
-    let call = call_span(db, id, tt.top_subtree().delimiter.open);
+    // The call's span reads its file's syntax: asked only for an error, so a crate given by its
+    // pages resolves a well-formed `include!` from its tokens without parsing the calling file.
+    let call = || call_span(db, id, tt.top_subtree().delimiter.open);
     args::single_string(db, tt, name, call)
 }
 
@@ -1617,7 +1649,7 @@ fn option_env_expand<'f>(
     tt: &tt::TopSubtree,
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    let call = call_span(db, arg_id, call_site);
+    let call = || call_span(db, arg_id, call_site);
     let ExpandResult { value, err } = args::single_string(db, tt, "option_env!", call);
     let Some((key, span)) = value else {
         let empty =

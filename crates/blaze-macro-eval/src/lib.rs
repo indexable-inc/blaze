@@ -23,6 +23,8 @@ mod code;
 mod expander;
 mod guest;
 mod keep;
+#[cfg(test)]
+mod kept_contexts_tests;
 mod lex;
 mod os;
 mod print;

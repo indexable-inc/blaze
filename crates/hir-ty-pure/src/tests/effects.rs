@@ -62,7 +62,7 @@ pub fn jump(at: usize) -> fn() {
     );
     let krate = crate_named(&db, "kernel");
     let (count, jump) = (fn_named(&db, krate, "count"), fn_named(&db, krate, "jump"));
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for effect in [&NOALLOC, &NONBLOCKING] {
             if let Err(refusal) = check_generic(&db, count, effect) {
                 panic!("`count` should be {}, but {}", effect.name, refusal.said());
@@ -114,7 +114,7 @@ pub fn raw(raw: &mut Raw, input: &u8) -> u8 {
     .into_db();
     let krate = crate_named(&db, "kernel");
     let (keys, raw) = (fn_named(&db, krate, "keys"), fn_named(&db, krate, "raw"));
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         if let Err(refusal) = check_generic(&db, keys, &PURE) {
             panic!(
                 "`keys` takes a `NonNull` of the toolchain, so it should be pure, but {}",
@@ -170,7 +170,7 @@ pub fn only_the_name(n: usize) {
 "#,
     );
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for clean in ["through_a_safe_function", "through_a_closure_of_a_safe_function"] {
             if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), &NOPANIC) {
                 panic!("`{clean}` should be nopanic, but {}", refusal.said());
@@ -274,7 +274,7 @@ pub fn hands_it_to_a_trusted_function(world: &World<'_>) {
 fn a_dyn_parameter_is_refused_only_for_a_call_through_it() {
     let db = hir_expand::fixture::db(PROBED).into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for clean in ["only_stores", "reads_beside_it", "hands_it_on"] {
             for effect in [&NOPANIC, &NOALLOC, &NONBLOCKING] {
                 if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), effect) {
@@ -367,7 +367,7 @@ pub fn takes_a_phantom_dyn(erased: &Erased) -> u32 {
     )
     .into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for clean in ["takes_an_id", "takes_a_phantom_dyn"] {
             for effect in [&NOALLOC, &NONBLOCKING] {
                 if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), effect) {

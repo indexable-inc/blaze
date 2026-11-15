@@ -52,6 +52,9 @@ blaze-kernel.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
+# The memo every query, input and interned id of hir-ty runs on.
+blaze-memo.workspace = true
+# Only `QueryKind` and `query_kinds!` (the kind numbers of `db::kinds`, for the profile).
 blaze-query.workspace = true
 blaze-reclaim.workspace = true
 blaze-record.workspace = true

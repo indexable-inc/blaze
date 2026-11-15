@@ -24,7 +24,7 @@ pub(super) static LINTED: blaze_core::lock::Lock<Vec<(base_db::Nonce, DefWithBod
 /// The bodies whose lints ran in `db` since the last take, once for each of the passes
 /// before the abort and the late passes, in no order.
 fn take_linted(db: &base_db::Db) -> Vec<DefWithBodyId> {
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     let mut linted = LINTED.lock();
     let mut own = Vec::new();
     linted.retain(|&(of, def, _)| {
@@ -61,7 +61,7 @@ fn fixture(n: usize) -> String {
 fn with_cx(n: usize, check: impl FnOnce(&Cx<'_, '_>)) {
     let checked = crate::tests::checked(&fixture(n));
     let db = &checked.db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
         let cx = Cx::new(db, krate, checked.files(), &frame);
@@ -161,7 +161,7 @@ fn linted_after_an_edit(near: usize, functions: usize, kept: bool) -> usize {
     let run = |db: &base_db::Db, codegen: bool, args: &[&str]| {
         let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
         let cmd = crate::lints::CommandLine::parse(&args).expect("the test's lint flags parse");
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
             let cx = Cx::new(db, krate, Files::unnamed(), &frame).with_lints(&cmd);
@@ -173,7 +173,7 @@ fn linted_after_an_edit(near: usize, functions: usize, kept: bool) -> usize {
     run(&db, true, &[]);
     let first = take_linted(&db).len();
     assert!(first >= 2 * functions, "the first check lints every body: {first} of {functions}");
-    db.set_file_text(main, &edited_main(near));
+    crate::tests::set_file_text(&mut db, main, &edited_main(near));
     match kept {
         true => run(&db, true, &[]),
         false => run(&db, false, &["-A", "unused-comparisons"]),
@@ -185,7 +185,12 @@ fn linted_after_an_edit(near: usize, functions: usize, kept: bool) -> usize {
 /// most those of the edited file (the edited body, and a body after it whose lints read
 /// where it is written, which the edit moved), whatever the size of the rest of the crate:
 /// never a body of a file the edit did not touch.
+///
+/// False by design on blaze-memo (port decision: reuse across edits comes from records, not
+/// the memo): an edit of a file now rebuilds its crate's arena, so every body of the crate is
+/// linted again, whatever file it is in. Left failing.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_one_body_lints_no_body_of_another_file_again() {
     let near = 4;
     let small = linted_after_an_edit(near, 20, true);

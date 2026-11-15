@@ -213,7 +213,7 @@ fn the_pruned_walk_is_the_walk_of_types_with_the_flags() {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let tys = field_tys(&db);
         assert!(tys.len() > 15, "{}", tys.len());
         for (_, ty) in tys {
@@ -232,7 +232,7 @@ fn inferred_outlives_finds_what_every_type_s_requirements_find() {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut found_any = false;
         for (_, ty) in field_tys(&db) {
             let mut all = Vec::new();
@@ -259,7 +259,7 @@ fn well_formedness_leaves_out_only_what_holds_and_tells_nothing() {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut inferred = Inferred::default();
         let mut left_out = 0;
         for (_, ty) in field_tys(&db) {
@@ -317,7 +317,7 @@ fn global_predicates_leave_out_only_what_holds() {
     let fx = fixture::db(TRAITS);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut globals = 0;
         for (adt, ty) in field_tys(&db) {
             blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
@@ -358,7 +358,7 @@ fn a_field_of_static_reference_to_a_parameter_needs_it_static() {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let named = |name: &str| {
             adts(&db)
                 .into_iter()

@@ -192,7 +192,7 @@ pub(crate) fn check_all(
     names: &HashMap<FileId, String>,
     options: &Options,
 ) -> Vec<Diag> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         hir::check::workspace_crates(db)
             .into_iter()
             .flat_map(|krate| crate::check::check_crate(db, krate, Files::new(names, ""), options))
@@ -251,14 +251,31 @@ fn checked_from(
     let files = fx.files().to_vec();
     let sysroot = fx.sysroot_files().to_vec();
     let mut db = fx.into_db();
-    if expand_derives {
-        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
-    }
-    if let Some(module) = appended {
-        let root = files[0].file_id(&db);
-        db.set_appended_root_module(root, Some(module), blaze_query::db::Durability::LOW);
-    }
+    // The files' names by their stable `FileId`s, taken before the commit below: `files` are
+    // interned ids of this snapshot, dead once a commit drops their arena.
     let (names, core) = names_of(&db, fixture, prefix, &files, sysroot);
+    // The fixture's settings in one commit, none when it has none: a commit drops arenas.
+    let root = appended.map(|module| (files[0].file_id(&db), module));
+    if expand_derives || root.is_some() {
+        let mut edit = db.edit();
+        if expand_derives {
+            // An input of the session arena, made each time it is, as the driver sets it.
+            edit.set_given(
+                None,
+                hir_def::nameres::builtin_derives_fact(true),
+                Box::new_in(
+                    |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+                        hir_def::nameres::set_expand_builtin_derives(inputs, true);
+                    },
+                    std::alloc::Global,
+                ),
+            );
+        }
+        if let Some((root, module)) = root {
+            edit.set_appended_root_module(root, Some(module));
+        }
+        _ = edit.commit();
+    }
     let diags = check_all(&db, &names, options);
     Checked { db, names, core, diags }
 }
@@ -272,6 +289,15 @@ const CORE_NAME: &str = "$SRC_DIR/core/src/lib.rs";
 fn sysroot_of(fixture: &str) -> (bool, bool) {
     let says = |meta: &str| fixture.lines().any(|line| line.trim_start().starts_with(meta));
     (says("//- minicore:"), says("//- proc_macros:"))
+}
+
+/// `file`'s text set to `text` in one edit, committed: every id of the arenas the commit drops
+/// (the file's crate's, and those above it) is dead after it, so a test takes again what it
+/// holds of them.
+pub(crate) fn set_file_text(db: &mut TestDB, file: FileId, text: &str) {
+    let mut edit = db.edit();
+    edit.set_file_text(file, text);
+    _ = edit.commit();
 }
 
 /// A frame for a test that makes its own [`crate::Cx`], as a check's task has one.

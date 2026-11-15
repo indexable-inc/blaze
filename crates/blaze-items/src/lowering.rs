@@ -29,7 +29,7 @@ use span::{FileId, TextRange};
 pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
     match error {
         MirLowerError::MissingFunctionDefinition(owner, call) => {
-            blaze_query::db::attach(db, || missing_function(db, *owner, *call, out));
+            blaze_memo::attach(db, || missing_function(db, *owner, *call, out));
         }
         MirLowerError::TraitFunctionDefinition(trait_, name) => {
             let edition = DisplayTarget::from_crate(db, trait_.krate(db)).edition;
@@ -43,7 +43,9 @@ pub fn write(db: &Db, error: &MirLowerError<'_>, out: &mut String) {
         MirLowerError::UnresolvedName { owner, path, at } => {
             unresolved_name(db, *owner, path.as_ref(), *at, out)
         }
-        other => _ = write!(out, "{other:?}"),
+        // An error's `Debug` names definitions (a `SolverDefId`, a type), which print only
+        // through the attached database: unattached, they refuse.
+        other => blaze_memo::attach(db, || _ = write!(out, "{other:?}")),
     }
 }
 

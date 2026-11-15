@@ -53,7 +53,7 @@ pub use ty::{contains_linear, is_holder_adt, is_linear_adt};
 
 /// An error of the check: a linear value dropped implicitly, or a linear type given where
 /// code may drop it.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearDiagnostic {
     /// What the error is about, as the drop or the call is written.
     pub span: MirSpan,

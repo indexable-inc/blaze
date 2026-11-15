@@ -977,11 +977,6 @@ impl Steps for Fake {
         None
     }
 
-    /// A fake front end has no database, so no run log.
-    fn kept_run_log(&self, _: &FakeInputs) -> blaze_query::db::Taken {
-        blaze_query::db::Taken::default()
-    }
-
     /// A fake front end holds nothing a build's end lets go.
     fn release_kept(&self, _: &mut FakeInputs, _: &std::sync::atomic::AtomicBool) {}
 
@@ -1143,11 +1138,6 @@ impl Writer<Fake> for FakeWriter {
     /// no-op lane's edit that changes no code is not theirs to vouch for.
     fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
         Err("the fakes lower no Rust source, so no key of theirs holds one by its code text".to_owned())
-    }
-
-    /// A fake front end has no database, so no run log.
-    fn run_log(&self) -> blaze_query::db::Taken {
-        blaze_query::db::Taken::default()
     }
 
     /// The fakes find nothing wrong only once a whole build ran.
@@ -4580,16 +4570,7 @@ fn direct_reads_after_a_restart(seed: u64) -> (blaze_cas::direct::Counts, bool) 
         client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
     let after = crate::serve::direct::thread_counts();
-    let moved = blaze_cas::direct::Counts {
-        records: after.records - before.records,
-        bytes: after.bytes - before.bytes,
-        reads: after.reads - before.reads,
-        runs: after.runs - before.runs,
-        files_opened: after.files_opened - before.files_opened,
-        maps: after.maps - before.maps,
-        mapped_bytes: after.mapped_bytes - before.mapped_bytes,
-        leaked_bytes: after.leaked_bytes - before.leaked_bytes,
-    };
+    let moved = after.since(&before);
     (moved, KEPT_READS.get() == reads + 1)
 }
 

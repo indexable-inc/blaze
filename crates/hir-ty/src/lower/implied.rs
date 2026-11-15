@@ -232,6 +232,9 @@ pub(super) fn shorthand_bounds<'db, 'f>(
 ) -> Vec<(TraitId, TraitRef<'db>), &'f Frame> {
     let db = ctx.db;
     let interner = ctx.interner;
+    // `assoc_name` is written in `owner`'s header: its hygiene key is a context of the owner's
+    // crate, whose table the comparison reads.
+    let table = crate::ctx_table(hir_def::HasModule::krate(&owner, db));
     let mut named = Vec::new_in(frame);
     Header { ctx, param, named: &mut named }.of(owner);
     let mut out = Vec::new_in(frame);
@@ -247,7 +250,7 @@ pub(super) fn shorthand_bounds<'db, 'f>(
             if bound.polarity != ClausePolarity::Positive
                 || subject.id != site.as_param
                 || assoc_name
-                    .is_some_and(|it| !super::trait_may_define_assoc_type(db, trait_, it))
+                    .is_some_and(|it| !super::trait_may_define_assoc_type(db, table, trait_, it))
             {
                 continue;
             }

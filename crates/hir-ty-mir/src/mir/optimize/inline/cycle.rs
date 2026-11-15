@@ -8,7 +8,7 @@ use std::hash::Hash;
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::AsId;
+use blaze_memo::Id as _;
 use hir_def::{FunctionId, HasModule, nameres::crate_def_map, signatures::FunctionSignature};
 use rustc_type_ir::inherent::GenericArgs as _;
 use smallvec::SmallVec;
@@ -49,25 +49,25 @@ fn callees_of(body: &MirBody<'_>) -> Vec<(FunctionId, StoredGenericArgs)> {
     callees
 }
 
-#[blaze_query::tracked(returns(ref))]
-pub(super) fn inliner_callees_of_fn(
-    db: &Db,
+#[blaze_memo::tracked(returns(copy))]
+pub(super) fn inliner_callees_of_fn<'db>(
+    db: &'db Db,
     func: FunctionId,
-) -> Vec<(FunctionId, StoredGenericArgs)> {
+) -> &'db [(FunctionId, StoredGenericArgs)] {
     match db.runtime_mir_body(func.into()) {
-        Ok(body) => callees_of(body),
-        Err(_) => Vec::new(), // alloc: empty, allocates nothing
+        Ok(body) => blaze_memo::keep_slice(blaze_memo::Database::memo(db), &callees_of(body)),
+        Err(_) => &[],
     }
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(copy))]
 pub(super) fn inliner_callees_of_closure<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
-) -> Vec<(FunctionId, StoredGenericArgs)> {
+) -> &'db [(FunctionId, StoredGenericArgs)] {
     match db.runtime_mir_body_for_closure(closure) {
-        Ok(body) => callees_of(body),
-        Err(_) => Vec::new(), // alloc: empty, allocates nothing
+        Ok(body) => blaze_memo::keep_slice(blaze_memo::Database::memo(db), &callees_of(body)),
+        Err(_) => &[],
     }
 }
 
@@ -91,16 +91,16 @@ pub(super) struct Walked<B: Eq + Hash> {
 }
 
 /// [`Walked`] of the bodies of the root's crate, each list sorted by [`key`].
-#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct Callgraph<'db> {
     cyclic: Vec<InlinedBody<'db>>,
     reached: Vec<InlinedBody<'db>>,
 }
 
-fn key(body: &InlinedBody<'_>) -> (bool, blaze_query::db::Id) {
+fn key(body: &InlinedBody<'_>) -> (bool, blaze_memo::Gid) {
     match *body {
-        InlinedBody::Fn(func) => (false, func.as_id()),
-        InlinedBody::Closure(closure) => (true, closure.as_id()),
+        InlinedBody::Fn(func) => (false, func.gid()),
+        InlinedBody::Closure(closure) => (true, closure.gid()),
     }
 }
 
@@ -128,12 +128,12 @@ impl<'db> Callgraph<'db> {
     }
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(super) fn callgraph_cyclic_fn<'db>(db: &'db Db, root: FunctionId) -> Option<Callgraph<'db>> {
     cyclic(db, InlinedBody::Fn(root))
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(super) fn callgraph_cyclic_closure<'db>(
     db: &'db Db,
     root: InternedClosureId<'db>,

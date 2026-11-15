@@ -52,7 +52,7 @@ use super::{
     framed::{Bits, bits_in},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstCheckDiagnostic {
     pub kind: ConstCheckKind,
     /// The const context of the body the error is in, which rustc's messages name.
@@ -68,7 +68,7 @@ pub struct ConstCheckDiagnostic {
 /// `ConditionallyConstCall`: the callee is const when its `[const]` bounds hold, which they do,
 /// and calling it needs `#![feature(const_trait_impl)]` (`E0658`); otherwise the callee is not
 /// const (`FnCallNonConst`, `E0015`).
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstCheckKind {
     /// `RawPtrToIntCast`.
     PointerToInt,
@@ -157,7 +157,7 @@ pub enum ConstCheckKind {
 }
 
 /// rustc's `NonConstClosureNote`: what the closure called is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureNote {
     FnDef(CallableDefId),
     FnPtr,
@@ -166,7 +166,7 @@ pub enum ClosureNote {
 }
 
 /// rustc's `CallDesugaringKind`, of the desugarings a const context can have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Desugaring {
     ForLoopIntoIter,
     ForLoopNext,
@@ -329,7 +329,7 @@ impl fmt::Display for TypeName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConstCheck {
     pub diagnostics: Vec<ConstCheckDiagnostic>,
 }
@@ -376,7 +376,7 @@ pub(crate) fn of_a_trait(db: &Db, func: FunctionId) -> bool {
 }
 
 /// What rustc's const checker reports in `def`'s body, when it is a const context.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
     let Some(context) = const_context(db, def) else { return ConstCheck::default() };
     if let DefWithBodyId::FunctionId(func) = def
@@ -391,7 +391,7 @@ pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
 /// count, a const generic argument or default, an enum discriminant's or a `const { .. }`
 /// block. rustc checks each as a body of its own, a `const` (`ConstContext::Const`), whatever
 /// the body it is written in is.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn anon_const_check<'db>(db: &'db Db, konst: AnonConstId<'db>) -> ConstCheck {
     // blaze: a `const static { .. }` block (`#![feature(blaze_comptime)]`) is evaluated with no
     // const checking; the evaluator refuses what cannot run at compile time.

@@ -334,6 +334,17 @@ pub struct FileAstId<N> {
     _marker: PhantomData<fn() -> N>,
 }
 
+/// An id within one file's tree: it names no arena (`blaze_memo::Home`).
+impl blaze_memo::Home for ErasedFileAstId {
+    #[inline]
+    fn home(&self, _: &mut blaze_memo::Homes<'_>) {}
+}
+
+impl<N> blaze_memo::Home for FileAstId<N> {
+    #[inline]
+    fn home(&self, _: &mut blaze_memo::Homes<'_>) {}
+}
+
 /// Traits are manually implemented because `derive` adds redundant bounds.
 impl<N> Clone for FileAstId<N> {
     #[inline]

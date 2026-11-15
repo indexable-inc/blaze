@@ -41,7 +41,7 @@ use crate::{
     macro_call_as_call_id,
     nameres::{
         DefMap, DiagnosticsByModule, Hygienic, LocalDefMap, MacroSubNs, ModuleData, ModuleOrigin,
-        ModuleScope, ModulesMap, ModulesSlot,
+        ModulesMap, ModulesSlot,
         attr_resolution::{attr_macro_as_call_id, derive_macro_as_call_id},
         crate_def_map,
         diagnostics::DefDiagnostic,
@@ -112,7 +112,6 @@ pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     let mut progress = false;
     let mut deferred_eager = false;
     for directive in macros {
-        let _reading = crate::nameres::delta::reads::reading(directive.module);
         let outcome = resolve_one(
             cx,
             sink,
@@ -144,7 +143,6 @@ pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
 
     expand_round(cx, sink.def_map().recursion_limit(), &resolved);
     for (module, depth, container, call, attr_macro_item) in resolved {
-        let _reading = crate::nameres::delta::reads::reading(module);
         collect::collect_expansion(cx, sink, side, module, call, depth, container, attr_macro_item);
         sink.take_macros(pending);
     }
@@ -422,7 +420,9 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                 let derive = attrs
                     .iter_after(Some(*attr_id))
                     .filter(|(_, later)| later.path.as_ident().is_some_and(|it| *it == sym::derive))
-                    .filter_map(|(_, later)| later.parse_path_comma_token_tree(db))
+                    .filter_map(|(_, later)| {
+                        later.parse_path_comma_token_tree(db, file_id.context_arena())
+                    })
                     .flatten()
                     .find_map(|(derive_path, span, _)| helper_of(&derive_path, span.ctx));
                 if let Some(derive) = derive {
@@ -481,7 +481,7 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
 
                 let ast_id = ast_id.with_value(ast_adt_id);
 
-                match attr.parse_path_comma_token_tree(db) {
+                match attr.parse_path_comma_token_tree(db, file_id.context_arena()) {
                     Some(derive_macros) => {
                         let call_id =
                             attr_call(cx, side, file_ast_id, attr, *attr_id, def, directive.depth);
@@ -1046,16 +1046,16 @@ impl<'db, 'f> StepSink<'db, 'f> {
         let module = queries::round_modules(db, round).order[at as usize];
         let handle = queries::fact_handle(db, queries::fact_key(db, round, at));
         let ran = FactKey::new(db, module, krate, queries::ran_by(db, round, at));
-        let scope = <ModuleScope<'_> as blaze_query::db::FromId>::from_id(handle);
+        let scope = queries::handle_scope(db, handle);
         let data = ModuleData::with_scope(
             row.origin,
             row.visibility,
             row.parent,
             // One module per step that has a directive (`nameres-core.md` §5).
             // clone: the step's own module, which its expansions write.
-            scope.scope(db).clone(),
+            scope.scope.clone(),
             // clone: as above.
-            scope.children(db).clone(),
+            scope.children.clone(),
         );
         let mut own = ModulesMap::new();
         own.insert(module, data);
@@ -1065,7 +1065,7 @@ impl<'db, 'f> StepSink<'db, 'f> {
             krate,
             block: None,
             root: queries::crate_root(db, krate),
-            modules: ModulesSlot::Unit { own, rows: blaze_query::db::AsId::as_id(&rows) },
+            modules: ModulesSlot::Unit { own, rows },
             prelude: None,
             macro_use_prelude: HashMap::new_in(Global),
             derive_helpers_in_scope: HashMap::new_in(Global),
@@ -1124,10 +1124,7 @@ impl<'db, 'f> StepSink<'db, 'f> {
     fn own(&self) -> &ModulesMap {
         match &self.def_map.modules {
             ModulesSlot::Unit { own, .. } => own,
-            ModulesSlot::Building(_)
-            | ModulesSlot::Collected(_)
-            | ModulesSlot::Maintained { .. }
-            | ModulesSlot::Published(_) => {
+            ModulesSlot::Building(_) | ModulesSlot::Collected(_) => {
                 unreachable!("a macro step's view is a resolver view")
             }
         }

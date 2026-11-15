@@ -82,8 +82,8 @@ pub(crate) struct Sites(HashMap<Atomic, Uses, Global>);
 
 /// Every body of `krate` read for [`Site`]s, once per crate: its functions, consts and statics,
 /// those of its traits and impls, and those of items nested in their blocks.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn atomic_sites(db: &Db, krate: base_db::Crate) -> Sites {
+#[blaze_memo::tracked(returns(ref), owns)]
+pub(crate) fn atomic_sites<'db>(db: &'db Db, krate: base_db::Crate) -> Sites {
     let mut sites = Sites::default();
     // alloc: the crate's bodies, once per crate and edit
     let mut defs = Vec::new();

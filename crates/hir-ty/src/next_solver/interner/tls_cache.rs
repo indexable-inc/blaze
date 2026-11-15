@@ -1,10 +1,10 @@
 //! The trait solver's caches of solved goals, in the two scopes of
 //! [`CacheScope`](rustc_type_ir::search_graph::CacheScope):
 //!
-//! - [`shared`]: a goal whose reads `blaze_query::db::capture_reads` recorded, for every query and
-//!   thread of one database, crate and revision. A query that takes an answer from it replays
-//!   the reads (`Tracked`), so it reruns when they change, as rustc's `with_cached_task` /
-//!   `get_tracked` do.
+//! - [`shared`]: a goal whose reads `blaze_memo::record` recorded, for every query and thread
+//!   of one database and crate, while the crate's arena is carried ([`View`]). A query that
+//!   takes an answer from it reads its facts again (`blaze_memo::read`), so its own record
+//!   lists them, as rustc's `with_cached_task` / `get_tracked` do.
 //! - [`of_query`]: a goal no other query may take on (its capture is `None`), one cache for
 //!   each interner, in a table every thread shares, so a query that moves to another thread
 //!   keeps what it solved. Made by the interner's first write, never by a lookup
@@ -29,7 +29,7 @@ use base_db::{Crate, Db, Nonce};
 use blaze_core::lock::Lock;
 use blaze_hash::FixedState;
 use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
-use blaze_query::db::View;
+use blaze_memo::{ArenaId, Epoch, Id as _};
 use blaze_reclaim::Horizon;
 use rustc_type_ir::search_graph::{GlobalCache, Sharing};
 use std::{
@@ -72,6 +72,26 @@ struct Scope {
     nonce: Nonce,
     krate: Option<Crate>,
     regions: bool,
+}
+
+/// What a scope's goals were solved against: for a crate, its arena as this snapshot holds it
+/// (index and generation), which a later snapshot carries unchanged exactly when nothing the
+/// crate's goals can read changed (a change to a dependency or the session drops the crate's
+/// arena too, and its remaking is another generation); for no crate, the snapshot, as such an
+/// interner may read any crate's arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Arena(ArenaId),
+    Snapshot(Epoch),
+}
+
+/// The state `db` is in for the goals of `krate` ([`View`]).
+#[inline]
+fn view(db: &Db, krate: Option<Crate>) -> View {
+    match krate {
+        Some(krate) => View::Arena(krate.gid().arena()),
+        None => View::Snapshot(blaze_memo::Database::memo(db).snapshot_epoch()),
+    }
 }
 
 /// The value of one key (for the solver, the goals of one scope or query) in one state
@@ -200,11 +220,11 @@ pub(super) fn shared<'db, R>(
     regions: bool,
     f: impl FnOnce(&GlobalCache<DbInterner<'db>>) -> R,
 ) -> R {
-    let (nonce, revision) = db.nonce_and_revision();
+    let (nonce, view) = (db.nonce(), view(db, krate));
     // Nested in the task the executor runs this in, so it writes nothing but a thread-local
     // count.
     let task = blaze_reclaim::enter();
-    f(unerase(&SHARED.of(&task, Scope { nonce, krate, regions }, revision).search))
+    f(unerase(&SHARED.of(&task, Scope { nonce, krate, regions }, view).search))
 }
 
 /// Runs `f` on the global-goal table of `krate` (and `regions`) in `db`, as it is now.
@@ -215,9 +235,9 @@ pub(super) fn global_goals<R>(
     regions: bool,
     f: impl FnOnce(&crate::next_solver::global_goals::Goals) -> R,
 ) -> R {
-    let (nonce, revision) = db.nonce_and_revision();
+    let (nonce, view) = (db.nonce(), view(db, krate));
     let task = blaze_reclaim::enter();
-    f(&SHARED.of(&task, Scope { nonce, krate, regions }, revision).goals)
+    f(&SHARED.of(&task, Scope { nonce, krate, regions }, view).goals)
 }
 
 /// A key of a [`Shared`] table.
@@ -551,7 +571,7 @@ struct OfQuery {
         clippy::disallowed_types,
         reason = "the database and revision, set once per interner cache: not global"
     )]
-    state: std::sync::OnceLock<(Nonce, View)>,
+    state: std::sync::OnceLock<(Nonce, Epoch)>,
     cache: Erased,
 }
 
@@ -599,10 +619,10 @@ pub(super) fn of_query<'db, R>(
     let of_query = OF_QUERY.of(&task, solved, ());
     #[cfg(debug_assertions)]
     {
-        let state = db.nonce_and_revision();
+        let state = (db.nonce(), blaze_memo::Database::memo(db).snapshot_epoch());
         assert!(
             *of_query.state.get_or_init(|| state) == state,
-            "an interner's solver cache was used in another database or revision"
+            "an interner's solver cache was used in another database or snapshot"
         );
     }
     #[cfg(not(debug_assertions))]
@@ -626,8 +646,8 @@ pub(super) fn of_query_to_read<'db, R>(
     #[cfg(debug_assertions)]
     if let Some(&state) = of_query.state.get() {
         assert!(
-            state == db.nonce_and_revision(),
-            "an interner's solver cache was used in another database or revision"
+            state == (db.nonce(), blaze_memo::Database::memo(db).snapshot_epoch()),
+            "an interner's solver cache was used in another database or snapshot"
         );
     }
     #[cfg(not(debug_assertions))]
@@ -645,7 +665,7 @@ pub(super) fn of_query_to_read<'db, R>(
 /// replaces it (memcap6, B5). A task reading one keeps it until it ends (the table's limbo);
 /// what is past its grace by then is dropped here, the rest by a later replace or release.
 pub(crate) fn drop_shared_solver_caches(db: &Db, crates: &[Crate], all: bool) -> usize {
-    let (nonce, _) = db.nonce_and_revision();
+    let nonce = db.nonce();
     SHARED.retire(|scope| scope.retired_by(nonce, crates, all))
 }
 
@@ -679,7 +699,7 @@ mod tests {
 
     use base_db::{Crate, Nonce};
     use blaze_core::lock::Lock;
-    use blaze_query::db::{FromId, Id};
+    use blaze_memo::{Gid, Id as _};
 
     use super::{EMPTY, Key, SOLVED_BLOCK, Scope, Shared, Solved, pool};
 
@@ -1042,20 +1062,41 @@ mod tests {
                 return;
             }
             SLOW_DROPPING.store(true, Ordering::Release);
-            assert!(
-                yield_until(|| SLOW_OTHER_MADE.load(Ordering::Acquire)),
-                "a retired generation was dropped under the table's lock: another thread's first \
-                 use of a key waited on the drop"
-            );
+            // Never a panic here: a destructor that panics while something unwinds aborts the
+            // whole test binary. What it saw is checked by the test, after the scope.
+            let waited = yield_until(|| SLOW_OTHER_MADE.load(Ordering::Acquire));
+            SLOW_DROP_SAW_OTHER.store(if waited { SAW } else { NOT_SEEN }, Ordering::Release);
         }
     }
+
+    /// What the armed drop saw: [`UNSET`] until it ran, then whether the other thread made its
+    /// key while the drop waited ([`SAW`]) or not ([`NOT_SEEN`]: the drop held the table's lock).
+    static SLOW_DROP_SAW_OTHER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(UNSET);
+    const UNSET: u8 = 0;
+    const SAW: u8 = 1;
+    const NOT_SEEN: u8 = 2;
 
     /// The selfbuild2 test run's panic (`a wait for a SpinLock ... spun and yielded 16777216
     /// rounds`, making tokio-macros): a new revision retires every crate's shared cache, and
     /// the replace that found them past their grace dropped them all under the table's spin
     /// lock, while every other thread's first use of a scope spun on it.
+    ///
+    /// Run in a process of its own: a grace is process-wide (`blaze_reclaim`'s one epoch), so
+    /// in the shared test binary any other test's task, a parked fiber's slot or a long query on
+    /// another thread, pins it, and whether the armed value passed its grace within the loop
+    /// below then hung on how other tests were scheduled (round 26: "the armed value was never
+    /// dropped"). Alone, the only tasks are this test's own, each ended before the next state,
+    /// so the armed generation, retired at state 1, passes its grace at state 2, every run.
     #[test]
     fn a_retired_generation_is_dropped_outside_the_tables_lock() {
+        if std::env::var_os(CHILD).is_none() {
+            in_own_process("a_retired_generation_is_dropped_outside_the_tables_lock");
+            return;
+        }
+        a_retired_generation_is_dropped_outside_the_tables_lock_here();
+    }
+
+    fn a_retired_generation_is_dropped_outside_the_tables_lock_here() {
         let table = table::<SlowDrop>(4);
         let (dropped, other) = (key(), key());
         {
@@ -1085,6 +1126,14 @@ mod tests {
                 thread::yield_now();
             }
         });
+        match SLOW_DROP_SAW_OTHER.load(Ordering::Acquire) {
+            SAW => {}
+            NOT_SEEN => panic!(
+                "a retired generation was dropped under the table's lock: another thread's first \
+                 use of a key waited on the drop"
+            ),
+            _ => panic!("the armed value was never dropped in 10000 states"),
+        }
         assert!(SLOW_OTHER_MADE.load(Ordering::Acquire));
     }
 
@@ -1311,7 +1360,7 @@ mod tests {
         // alloc: a test's pool, once a test.
         let table: Shared<'static, Scope, u32, SharedGoals> =
             Shared::new(6, Box::leak(Box::new(pool())));
-        let krate = |bits| Crate::from_id(Id::from_u32(bits));
+        let krate = |bits| Crate::from_gid(Gid::for_test(bits));
         let (a, b) = (krate(1), krate(2));
         let (ours, theirs) = (Nonce::new(), Nonce::new());
         let scope = |nonce, krate, regions| Scope { nonce, krate, regions };

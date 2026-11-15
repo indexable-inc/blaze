@@ -10,6 +10,12 @@
 //! - the manifest: `UnitInputs { tool, settings, unit, files, late }`, the file images' keys in
 //!   the unit's file order and every late read's answer.
 //!
+//! An item is named by its stable id, which its file's image gives every row by a rule that
+//! makes it unique in the file and moves it only with the item's own name or header, or with
+//! an equal sibling before it (`crate::image`, "Stable ids"). Files are told apart by their
+//! module paths, so the unit's ids are unique for every program rustc accepts; two of one id
+//! are refused by [`KeyError::TwoItems`] naming both places, never keyed (rule 21).
+//!
 //! A late read is in the manifest's key and nowhere else: the surface or body that made it asks
 //! for it like any fact. An item under a `#[cfg]` that is off is no item of the unit: no piece
 //! and no body key; `settings` covers the cfg options (rule 21: the caller's to keep).
@@ -45,7 +51,7 @@ use blaze_keyed::{
 use cfg::CfgOptions;
 
 use crate::{
-    KeyError, cfgs, quiet,
+    ItemAt, KeyError, cfgs, quiet,
     read::{Image, OutOfPool, stable_of},
     rows::{BODY, CALLS, ItemRow, LateRow, NODE, NONE},
 };
@@ -83,6 +89,12 @@ pub struct Unit<'a> {
     /// as the caller found it).
     pub files: &'a [UnitFile<'a>],
     pub answers: &'a [LateAnswer<'a>],
+    /// Per file of `files`, in that order: `blaze_keyed::record::printed_name` of the name the
+    /// program prints for it, or zero for a file it prints no name for
+    /// (`blaze_keyed::front::Keyed::names`). In the manifest's key alone ([`key`]): a renamed
+    /// file's span tables read its name, and nothing else of the unit does. Empty where no
+    /// manifest key is made ([`asks`]); else as long as `files` ([`KeyError::Names`]).
+    pub names: &'a [ContentId],
 }
 
 /// One late read to answer before keying.
@@ -179,9 +191,13 @@ fn late_of(late: &LateRow, file: u32) -> Result<Late, KeyError> {
 /// Cost and floor: in the module's doc. Scratch is in `frame`.
 pub fn key<'a, A: Allocator + Clone>(unit: &Unit<'a>, frame: A) -> Result<UnitKeys<A>, KeyError> {
     check_answers(unit.answers)?;
+    if unit.names.len() != unit.files.len() {
+        return Err(KeyError::Names { files: unit.files.len(), names: unit.names.len() });
+    }
     let mut files = Vec::with_capacity_in(unit.files.len(), frame.clone());
     let mut items: Vec<(StableId, Key<Body>), A> = Vec::new_in(frame.clone());
-    let mut pieces: Vec<(StableId, ContentId), A> = Vec::new_in(frame.clone());
+    // Each piece with its node's place, so two nodes of one id across files are named.
+    let mut pieces: Vec<(StableId, ContentId, ItemAt), A> = Vec::new_in(frame.clone());
     let mut lates: Vec<LateRead<'a>, A> = Vec::new_in(frame.clone());
     let mut alive = Vec::new_in(frame.clone());
     let mut file_keys = Vec::with_capacity_in(unit.files.len(), frame.clone());
@@ -198,8 +214,8 @@ pub fn key<'a, A: Allocator + Clone>(unit: &Unit<'a>, frame: A) -> Result<UnitKe
         for (at, row) in rows.iter().enumerate() {
             let at = at as u32;
             if row.flags & NODE != 0 {
-                if let Some((stable, _, hasher)) = open.take() {
-                    pieces.push((stable, hasher.finish()));
+                if let Some((stable, node, hasher)) = open.take() {
+                    pieces.push((stable, hasher.finish(), ItemAt { file, row: node }));
                 }
             } else {
                 // An associated row follows its node and the node's other associated rows.
@@ -235,12 +251,12 @@ pub fn key<'a, A: Allocator + Clone>(unit: &Unit<'a>, frame: A) -> Result<UnitKe
             }
             answer(unit, &image, file, row, &mut lates)?;
         }
-        if let Some((stable, _, hasher)) = open.take() {
-            pieces.push((stable, hasher.finish()));
+        if let Some((stable, node, hasher)) = open.take() {
+            pieces.push((stable, hasher.finish(), ItemAt { file, row: node }));
         }
         items[first..].sort_unstable_by_key(|(stable, _)| *stable);
         if let Some(pair) = items[first..].windows(2).find(|pair| pair[0].0 == pair[1].0) {
-            return Err(two_items(&image, entry.module, file, pair[0].0));
+            return Err(two_bodies(&image, entry.module, file, &alive, pair[0].0));
         }
         let at = u32::try_from(first).map_err(|_| KeyError::TooLarge { what: "a unit's items" })?;
         let len = u32::try_from(items.len() - first).map_err(|_| KeyError::TooLarge { what: "a file's items" })?;
@@ -248,20 +264,33 @@ pub fn key<'a, A: Allocator + Clone>(unit: &Unit<'a>, frame: A) -> Result<UnitKe
     }
 
     // The surface: the pieces in the order of the nodes' stable ids across the unit.
-    pieces.sort_unstable_by_key(|(stable, _)| *stable);
+    pieces.sort_unstable_by_key(|(stable, _, _)| *stable);
     if let Some(pair) = pieces.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(KeyError::TwoItems { file: None, stable: pair[0].0, path: Vec::new_in(Global) });
+        let (first, second) = (pair[0].2, pair[1].2);
+        let entry = &unit.files[first.file as usize];
+        let path = Image::open(entry.image, &entry.key)
+            .ok()
+            .map_or_else(|| Vec::new_in(Global), |image| path_of(&image, entry.module, first.row, Global));
+        return Err(KeyError::TwoItems { stable: pair[0].0, path, first, second });
     }
     let mut ids = Vec::with_capacity_in(pieces.len(), frame.clone());
-    ids.extend(pieces.iter().map(|(_, piece)| *piece));
+    ids.extend(pieces.iter().map(|(_, piece, _)| *piece));
     let surface = Surface::key(&SurfaceInputs { tool: unit.tool, settings: unit.settings, unit: unit.unit, pieces: &ids });
 
-    // The manifest: the file images in the unit's order, every late read's answer.
+    // The manifest: the file images in the unit's order, every late read's answer, and the
+    // files' printed names. `UnitInputs` has no field for the names, so they are folded into
+    // the identity the manifest's key takes (and only that key's: a body's and the surface's
+    // keep `unit.unit`), one hash per file.
     sort_lates(&mut lates);
+    let mut named = Hasher::new("blaze-unitkey manifest identity and printed names 1");
+    named.id(&unit.unit).update(&(unit.names.len() as u64).to_le_bytes());
+    for name in unit.names {
+        named.id(name);
+    }
     let manifest = UnitManifest::key(&UnitInputs {
         tool: unit.tool,
         settings: unit.settings,
-        unit: unit.unit,
+        unit: named.finish(),
         files: &file_keys,
         late: &lates,
     });
@@ -279,20 +308,36 @@ fn piece_part(hasher: &mut Hasher, image: &Image<'_>, row: &ItemRow) -> Result<(
     Ok(())
 }
 
-/// Two items of one stable id, refused by name (rule 21: one key, one value).
-fn two_items(image: &Image<'_>, module: &[u8], file: u32, stable: StableId) -> KeyError {
-    let mut path = Vec::new_in(Global);
-    for at in 0..image.items().len() as u32 {
+/// Two active bodies of file `file` with one stable id, refused by name with both rows (rule
+/// 21: one key, one value). Only reached by an image this crate's rule did not write: the
+/// image numbers equal rows apart (`image`, "Stable ids").
+fn two_bodies(image: &Image<'_>, module: &[u8], file: u32, alive: &[bool], stable: StableId) -> KeyError {
+    let mut found = [ItemAt { file, row: u32::MAX }; 2];
+    let mut count = 0;
+    for (at, row) in image.items().iter().enumerate() {
+        let at = at as u32;
+        if count == 2 || !alive[at as usize] || row.flags & BODY == 0 {
+            continue;
+        }
         if image.stable_id(module, at).is_ok_and(|id| id == stable) {
-            path.extend_from_slice(module);
-            if !module.is_empty() {
-                path.extend_from_slice(b"::");
-            }
-            path.extend_from_slice(image.str(image.items()[at as usize].path).unwrap_or(&[]));
-            break;
+            found[count].row = at;
+            count += 1;
         }
     }
-    KeyError::TwoItems { file: Some(file), stable, path }
+    // An error's text lives as long as the error: the global heap.
+    KeyError::TwoItems { stable, path: path_of(image, module, found[0].row, Global), first: found[0], second: found[1] }
+}
+
+/// Row `row`'s `module::path`, for an error; empty when the row or its path is not there.
+fn path_of<B: Allocator>(image: &Image<'_>, module: &[u8], row: u32, alloc: B) -> Vec<u8, B> {
+    let mut path = Vec::new_in(alloc);
+    let Some(item) = image.items().get(row as usize) else { return path };
+    path.extend_from_slice(module);
+    if !module.is_empty() {
+        path.extend_from_slice(b"::");
+    }
+    path.extend_from_slice(image.str(item.path).unwrap_or(&[]));
+    path
 }
 
 /// The answers to `row`'s late reads (file `file`'s), appended to `out`.

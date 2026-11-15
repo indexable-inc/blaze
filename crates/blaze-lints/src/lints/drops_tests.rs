@@ -259,7 +259,7 @@ pub(crate) fn fixed(lint_name: &str, main: &str) -> String {
     let fx = fixture::db(&fixture(main));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || crate::tests::main_crate(&db));
+    let key = crate::tests::main_crate_key(&db);
     let file = file.file_id(&db);
     let before = db.file_text(file).text(&db).to_string();
     let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
@@ -275,11 +275,12 @@ pub(crate) fn fixed(lint_name: &str, main: &str) -> String {
         command_line: CommandLine::parse(&flags).expect("the flags read"),
         conf: Conf::default(),
     };
-    let made = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let made = fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let after = db.file_text(file).text(&db).to_string();
     assert_ne!(after, before, "the fix of `{lint_name}` changed the file");
     assert!(made.applied > 0, "the fix of `{lint_name}` made a suggestion");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
+        let krate = hir::Crate::from(db.krate(key));
         let mut acc = Vec::new();
         for module in krate.modules(&db) {
             module.diagnostics(&db, &mut acc, false);

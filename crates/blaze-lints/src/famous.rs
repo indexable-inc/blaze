@@ -329,7 +329,7 @@ fn f() {{}}
             crate::tests::STD
         );
         let db = fixture::db(&fixture).into_db();
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
             let krate = crate::tests::main_crate(&db);
             let famous = Famous::new(&db, krate);
             let table = crate::query::famous_defs(&db, krate.base());

@@ -33,7 +33,7 @@ hir-ty-pure.workspace = true
 intern.workspace = true
 
 [dev-dependencies]
-blaze-query.workspace = true
+blaze-memo.workspace = true
 blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 

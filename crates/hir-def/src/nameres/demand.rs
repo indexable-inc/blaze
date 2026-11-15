@@ -603,16 +603,17 @@ fn settle(
 /// [`ROOT_WORDS`] or names one that may, a procedural one, and `include!`. By name, under each
 /// name a module has one, so a macro of the same name costs a lowering and nothing else.
 /// Sorted. Reads def maps and macro definitions, no body.
-#[blaze_query::tracked(returns(deref))]
-pub fn macros_declaring_roots(db: &Db, krate: Crate) -> Box<[Symbol]> {
-    Look::Roots.crate_macros(db, krate)
+#[blaze_memo::tracked(returns(copy))]
+pub fn macros_declaring_roots<'db>(db: &'db Db, krate: Crate) -> &'db [Symbol] {
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &Look::Roots.crate_macros(db, krate))
 }
 
 /// As [`macros_declaring_roots`], for the macros that may write an item with a diagnostic item
 /// (`#[rustc_diagnostic_item = ".."]`): what [`crate::diagnostic_item`] reads bodies for.
-#[blaze_query::tracked(returns(deref))]
-pub fn macros_writing_diagnostic_items(db: &Db, krate: Crate) -> Box<[Symbol]> {
-    Look::DiagnosticItems.crate_macros(db, krate)
+#[blaze_memo::tracked(returns(copy))]
+pub fn macros_writing_diagnostic_items<'db>(db: &'db Db, krate: Crate) -> &'db [Symbol] {
+    let names = Look::DiagnosticItems.crate_macros(db, krate);
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &names)
 }
 
 #[cfg(test)]

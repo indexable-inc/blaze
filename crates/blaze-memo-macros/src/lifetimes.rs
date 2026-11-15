@@ -75,14 +75,8 @@ impl Both {
     pub(crate) fn store(&self, value: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         let Both { db, stored, names_db } = self;
         if *names_db {
-            quote! {
-                // SAFETY: the two types differ in the database lifetime only. A `'db` borrow
-                // in a value points into an arena of the snapshot (`keep_*`, an interned
-                // field, another query's value), and the snapshot frees an arena only after
-                // every arena that borrowed from it (the carry closure of `Memo::next`); the
-                // memo hands a stored value out only under a borrow of the snapshot.
-                unsafe { ::core::mem::transmute::<#db, #stored>(#value) }
-            }
+            let plumbing = crate::plumbing();
+            quote!(#plumbing::relifetime_by_macro::<#db, #stored>(#value))
         } else {
             quote!(#value)
         }
@@ -92,12 +86,8 @@ impl Both {
     pub(crate) fn load(&self, value: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         let Both { db, stored, names_db } = self;
         if *names_db {
-            quote! {
-                // SAFETY: as in `store`: a value read under a borrow of the snapshot lives as
-                // long as that borrow, and its types differ from the stored ones in the
-                // lifetime alone.
-                unsafe { ::core::mem::transmute::<#stored, #db>(#value) }
-            }
+            let plumbing = crate::plumbing();
+            quote!(#plumbing::relifetime_by_macro::<#stored, #db>(#value))
         } else {
             quote!(#value)
         }
@@ -107,11 +97,8 @@ impl Both {
     pub(crate) fn load_ref(&self, value: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         let Both { db, stored, names_db } = self;
         if *names_db {
-            quote! {
-                // SAFETY: the pointee's types differ in the database lifetime alone, and the
-                // reference is no longer than the borrow of the snapshot it was read under.
-                unsafe { &*::core::ptr::from_ref::<#stored>(#value).cast::<#db>() }
-            }
+            let plumbing = crate::plumbing();
+            quote!(#plumbing::relifetime_ref_by_macro::<#stored, #db>(#value))
         } else {
             quote!(#value)
         }

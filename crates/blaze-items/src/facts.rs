@@ -171,7 +171,7 @@ pub(crate) fn value_as(
     seen_by: Option<Crate>,
     fact: &Fact,
 ) -> Result<ContentId, Unhashable> {
-    blaze_query::db::attach(db, || value_in(db, seen_by, fact))
+    blaze_memo::attach(db, || value_in(db, seen_by, fact))
 }
 
 fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, Unhashable> {
@@ -180,7 +180,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
     // missing from it.
     let seen_by = match (seen_by, asked_by_crate(fact.kind())) {
         (Some(krate), true) => {
-            hash::macros_built_for(db, krate, hash::Unhashed::Crate(krate))?;
+            hash::macros_built_for(db, krate, || hash::Unhashed::krate(db, krate))?;
             Some(krate)
         }
         (None, true) => unreachable!(
@@ -200,11 +200,11 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
     }
     match *fact {
         Fact::Signature(key) => {
-            let Some(id) = item(db, key, fact) else { return absent() };
+            let Some(id) = item(db, key)? else { return absent() };
             h.id(&hash::signature_hash(db, id)?.0);
         }
         Fact::Layout(key) => {
-            let Some(adt) = adt(db, key, fact) else { return absent() };
+            let Some(adt) = adt(db, key)? else { return absent() };
             h.id(&hash::layout_hash(db, adt)?.0);
         }
         Fact::Field { ty, field } => {
@@ -213,7 +213,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
                 Some(Resolved::Item(ItemId::Adt(AdtId::StructId(it)))) => VariantId::from(it),
                 Some(Resolved::Item(ItemId::Adt(AdtId::UnionId(it)))) => VariantId::from(it),
                 Some(Resolved::Variant(it)) => VariantId::from(it),
-                Some(other) => unreachable!("{fact:?} names {other:?}, which has no fields"),
+                Some(_) => return Err(misnamed(ty, NO_FIELDS)),
             };
             let Some((local, _)) = variant
                 .fields(db)
@@ -225,7 +225,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             };
             let adt = variant.adt_id(db);
             let sub = crate::form::Cx::new(db).field(variant, local);
-            h.id(&hash::filled(db, domain, &sub, ItemId::Adt(adt))?);
+            h.id(&hash::named_filled(db, domain, sub.view(), ItemId::Adt(adt))?);
             field_offset(db, &mut h, adt, variant, local)?;
         }
         Fact::Method { self_ty, name } => write_method(db, &mut h, seen(), self_ty, name)?,
@@ -240,7 +240,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             }
         },
         Fact::Code(key) => {
-            let Some(id) = item(db, key, fact) else { return absent() };
+            let Some(id) = item(db, key)? else { return absent() };
             write_code(&mut h, hash::code_hash(db, id)?.map(|it| it.0));
         }
         Fact::ConstValue(subject) => match key::resolve(db, subject) {
@@ -256,22 +256,20 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
                     Ok(value) => {
                         h.part(b"value").update(&value.to_le_bytes());
                     }
-                    Err(err) => write_eval_error(&mut h, &err),
+                    Err(err) => write_eval_error(db, &mut h, &err),
                 }
             }
-            Some(other) => {
-                unreachable!("{fact:?} names {other:?}, which is no const, static or variant")
-            }
+            Some(_) => return Err(misnamed(subject, NO_VALUE)),
         },
         Fact::Name(key) => {
-            let Some(id) = item(db, key, fact) else { return absent() };
+            let Some(id) = item(db, key)? else { return absent() };
             name_of(db, &mut h, id);
         }
         Fact::Captures(subject) => {
             let (store, expr, kind) = match key::resolve(db, subject) {
                 None => return absent(),
                 Some(Resolved::Closure { store, expr, kind }) => (store, expr, kind),
-                Some(other) => unreachable!("{fact:?} names {other:?}, which is no closure"),
+                Some(_) => return Err(misnamed(subject, NO_CLOSURE)),
             };
             let closure = match kind {
                 ClosureKind::Closure | ClosureKind::CoroutineClosure(_) => {
@@ -279,49 +277,54 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
                     InternedClosureId::new(db, InternedClosure { owner, expr, kind })
                 }
                 ClosureKind::OldCoroutine(_) | ClosureKind::Coroutine { .. } => {
-                    unreachable!("{fact:?} names a coroutine, which has no closure captures")
+                    return Err(misnamed(subject, NO_CAPTURES));
                 }
             };
             let sub = crate::form::Cx::new(db).captures(closure);
-            h.id(&hash::filled(db, domain, &sub, infer_owner_item(db, closure.loc(db).owner))?);
+            h.id(&hash::named_filled(
+                db,
+                domain,
+                sub.view(),
+                infer_owner_item(db, closure.loc(db).owner),
+            )?);
         }
         Fact::AutoTraits(subject) => {
             let (owner, index) = match key::resolve(db, subject) {
                 None => return absent(),
                 Some(Resolved::Opaque { owner, index }) => (owner, index),
-                Some(other) => unreachable!("{fact:?} names {other:?}, which is no opaque type"),
+                Some(_) => return Err(misnamed(subject, NO_OPAQUE)),
             };
             // The solver asks it inside a body's inference: refs by signature hash.
             let sub = crate::form::Cx::leak_free(db).auto_traits(owner, index);
-            h.id(&hash::signature_filled(db, domain, &sub, owner)?);
+            h.id(&hash::signature_filled(db, domain, sub.view(), owner)?);
         }
         Fact::HiddenTypes(subject) => {
-            let owner = match item(db, subject, fact) {
+            let owner = match item(db, subject)? {
                 None => return absent(),
                 Some(owner @ (ItemId::Function(_) | ItemId::Alias(_))) => owner,
-                Some(other) => unreachable!("{fact:?} names {other:?}, which has no opaque types"),
+                Some(_) => return Err(misnamed(subject, NO_OPAQUES)),
             };
             let sub = crate::form::Cx::leak_free(db).hidden_types(owner);
-            h.id(&hash::signature_filled(db, domain, &sub, owner)?);
+            h.id(&hash::signature_filled(db, domain, sub.view(), owner)?);
         }
         Fact::RpititTys(subject) => {
-            let func = match item(db, subject, fact) {
+            let func = match item(db, subject)? {
                 None => return absent(),
                 Some(ItemId::Function(it)) => it,
-                Some(other) => unreachable!("{fact:?} names {other:?}, which is no function"),
+                Some(_) => return Err(misnamed(subject, NO_FUNCTION)),
             };
             // The solver asks it inside a body's inference, and inside another impl method's
             // `impl_rpitit_tys`: refs by signature hash, and the method's own signature holds
             // none of it (`Fact::RpititTys`), so this never reads back into what asked it.
             let sub = crate::form::Cx::leak_free(db).rpitit_tys(func);
-            h.id(&hash::signature_filled(db, domain, &sub, ItemId::Function(func))?);
+            h.id(&hash::signature_filled(db, domain, sub.view(), ItemId::Function(func))?);
         }
         Fact::Coherence(key) => {
-            let Some(imp) = impl_of(db, key, fact) else { return absent() };
+            let Some(imp) = impl_of(db, key)? else { return absent() };
             write_coherence(db, &mut h, imp)?;
         }
         Fact::Specializes(key) => {
-            let Some(imp) = impl_of(db, key, fact) else { return absent() };
+            let Some(imp) = impl_of(db, key)? else { return absent() };
             h.id(&hash::signature_hash(db, ItemId::Impl(imp))?.0);
             write_coherence(db, &mut h, imp)?;
             // `may_specialize` reads the crate's mode: its features and its root's
@@ -330,7 +333,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             h.update(&[mode as u8]);
         }
         Fact::DropCheck(key) => {
-            let Some(adt) = adt(db, key, fact) else { return absent() };
+            let Some(adt) = adt(db, key)? else { return absent() };
             write_drop_check(db, &mut h, adt)?;
         }
         Fact::Vtable { trait_, self_ty } => {
@@ -363,7 +366,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             }
         }
         Fact::Derive(key) => {
-            let Some(adt) = adt(db, key, fact) else { return absent() };
+            let Some(adt) = adt(db, key)? else { return absent() };
             write_derive(db, &mut h, adt)?;
         }
         Fact::Target(krate) => {
@@ -398,7 +401,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             let module = match key::resolve(db, at) {
                 None => return absent(),
                 Some(Resolved::Module(it)) => it,
-                Some(other) => unreachable!("{fact:?} names {other:?}, which is no module"),
+                Some(_) => return Err(misnamed(at, NO_MODULE)),
             };
             let traits = module_trait_set(db, module).traits();
             let keyed = traits.iter().map(|&it| (key::item_key(db, ItemId::Trait(it)), it));
@@ -408,11 +411,9 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             let module = match key::resolve(db, at) {
                 None => return absent(),
                 Some(Resolved::Module(it)) => it,
-                Some(other) => unreachable!("{fact:?} names {other:?}, which is no module"),
+                Some(_) => return Err(misnamed(at, NO_MODULE)),
             };
-            let Some(block) = module.block(db) else {
-                unreachable!("{fact:?} names {module:?}, which is no block's module")
-            };
+            let Some(block) = module.block(db) else { return Err(misnamed(at, NO_BLOCK)) };
             write_block_impls(db, &mut h, block)?;
         }
     }
@@ -519,7 +520,7 @@ pub(crate) mod planted {
 /// const-eval budget, and its dependencies' content), the content of the source root of its
 /// root file (every file's path and text), and its proc macros with their libraries, as a
 /// dependency image's key (`hir_def::deps::key`) has them.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn crate_inputs(db: &Db, krate: base_db::Crate) -> ContentId {
     let mut h = Hasher::new(CRATE);
     let all = krate.transitive_deps(db);
@@ -576,7 +577,9 @@ fn write_noted_reads(db: &Db, h: &mut Hasher, krate: base_db::Crate) {
     // alloc: base-db hands the notes out as one list; made once per value of a crate fact
     let env_read = files.env_read();
     h.part(b"noted");
-    for &it in krate.transitive_deps(db) {
+    for &dep in krate.transitive_deps(db) {
+        // The notes are by the crate's stable key, never its id (`base_db::CrateKey`).
+        let it = dep.key(db);
         // alloc: as above, empty (no allocation) for a crate that included no such file
         let included = files.included_by(db, it);
         h.update(&(included.len() as u64).to_le_bytes());
@@ -661,7 +664,8 @@ pub fn scope_traits_named(db: &Db, module: ModuleId, name: &Name) -> Fact {
 /// The impls declared in `block`, by the key of its def map's root module: what
 /// `TraitImpls::for_block` and `InherentImpls::for_block` give.
 pub fn block_impls(db: &Db, block: BlockIdLt<'_>) -> Fact {
-    Fact::BlockImpls(key::module_key(db, hir_def::nameres::block_def_map(db, block).root))
+    let def_map = hir_def::nameres::block_def_map(db, block.to_static());
+    Fact::BlockImpls(key::module_key(db, def_map.root))
 }
 
 pub fn code(db: &Db, id: ItemId) -> Fact {
@@ -735,25 +739,49 @@ pub fn whole_crate(db: &Db, krate: base_db::Crate) -> Fact {
     Fact::Crate(key::crate_key(db, krate))
 }
 
-/// The item `subject` names, `None` if none does.
-fn item(db: &Db, subject: ItemKey, fact: &Fact) -> Option<ItemId> {
-    match key::resolve(db, subject)? {
-        Resolved::Item(id) => Some(id),
-        other => unreachable!("{fact:?} names {other:?}, which is no item"),
+/// A fact whose subject resolves to another class than its kind's (a `Signature` naming an
+/// enum variant, a `Captures` naming an item): refused, naming the subject and the mismatch,
+/// never a panic (rule 20). A fact is made from a kind and a raw subject key, by a reader of a
+/// record too, so the two can disagree; the value of such a fact is no value.
+fn misnamed(subject: ItemKey, what: &'static str) -> Unhashable {
+    Unhashable { of: hash::Unhashed::Item(subject), what, pending: None }
+}
+
+const NO_ITEM: &str = "a fact of an item's kind names what is no item (an enum variant, a module, a closure, an opaque type or an anonymous const): the fact's kind and its subject's class disagree";
+const NO_TYPE: &str = "a fact of a type's kind names an item that is no struct, enum or union";
+const NO_IMPL: &str = "a fact of an impl's kind names an item that is no impl";
+const NO_VALUE: &str = "a `ConstValue` fact names what is no const, static or enum variant";
+const NO_CLOSURE: &str = "a `Captures` fact names what is no closure";
+const NO_CAPTURES: &str = "a `Captures` fact names a coroutine, which has no closure captures";
+const NO_OPAQUE: &str = "an `AutoTraits` fact names what is no opaque type";
+const NO_OPAQUES: &str = "a `HiddenTypes` fact names an item that is no function or type alias";
+const NO_FUNCTION: &str = "a `RpititTys` fact names an item that is no function";
+const NO_MODULE: &str = "a fact of a scope's kind names what is no module";
+const NO_BLOCK: &str = "a `BlockImpls` fact names a module that is no block's";
+const NO_FIELDS: &str = "a `Field` fact names what is no struct, union or enum variant";
+
+/// The item `subject` names, `None` if none does; refused if it names what is no item.
+fn item(db: &Db, subject: ItemKey) -> Result<Option<ItemId>, Unhashable> {
+    match key::resolve(db, subject) {
+        None => Ok(None),
+        Some(Resolved::Item(id)) => Ok(Some(id)),
+        Some(_) => Err(misnamed(subject, NO_ITEM)),
     }
 }
 
-fn adt(db: &Db, key: ItemKey, fact: &Fact) -> Option<AdtId> {
-    match item(db, key, fact)? {
-        ItemId::Adt(it) => Some(it),
-        other => unreachable!("{fact:?} names {other:?}, which is no type"),
+fn adt(db: &Db, key: ItemKey) -> Result<Option<AdtId>, Unhashable> {
+    match item(db, key)? {
+        None => Ok(None),
+        Some(ItemId::Adt(it)) => Ok(Some(it)),
+        Some(_) => Err(misnamed(key, NO_TYPE)),
     }
 }
 
-fn impl_of(db: &Db, key: ItemKey, fact: &Fact) -> Option<ImplId> {
-    match item(db, key, fact)? {
-        ItemId::Impl(it) => Some(it),
-        other => unreachable!("{fact:?} names {other:?}, which is no impl"),
+fn impl_of(db: &Db, key: ItemKey) -> Result<Option<ImplId>, Unhashable> {
+    match item(db, key)? {
+        None => Ok(None),
+        Some(ItemId::Impl(it)) => Ok(Some(it)),
+        Some(_) => Err(misnamed(key, NO_IMPL)),
     }
 }
 
@@ -899,7 +927,7 @@ fn write_evaluated<'db>(
     let value = match value {
         Ok(value) => value,
         Err(err) => {
-            write_eval_error(h, &err);
+            write_eval_error(db, h, &err);
             return Ok(());
         }
     };
@@ -963,19 +991,20 @@ fn write_evaluated<'db>(
 
 fn ty_hash<'db>(db: &'db Db, owner: ItemId, ty: Ty<'db>) -> Result<ContentId, Unhashable> {
     let sub = crate::form::Cx::new(db).ty(ty);
-    hash::filled(db, CONST_TYPE, sub, owner)
+    hash::named_filled(db, CONST_TYPE, sub, owner)
 }
 
-fn write_eval_error(h: &mut Hasher, err: &ConstEvalError<'_>) {
+fn write_eval_error(db: &Db, h: &mut Hasher, err: &ConstEvalError<'_>) {
     scratch::with_string(|kind| {
-        eval_error_kind(err, kind);
+        eval_error_kind(db, err, kind);
         h.part(b"error").part(kind.as_bytes());
     });
 }
 
 /// Which error stopped an evaluation, written to `out`: its stage and kind, never its text,
-/// which names spans.
-fn eval_error_kind(err: &ConstEvalError<'_>, out: &mut String) {
+/// which names spans. The kind is the start of the error's `Debug`, written with `db`
+/// attached: the rest names definitions (a `SolverDefId`), which print only through it.
+fn eval_error_kind(db: &Db, err: &ConstEvalError<'_>, out: &mut String) {
     let stage = match err {
         ConstEvalError::MirLowerError(_) => "lower",
         ConstEvalError::MirEvalError(_) => "eval",
@@ -983,10 +1012,10 @@ fn eval_error_kind(err: &ConstEvalError<'_>, out: &mut String) {
     out.push_str(stage);
     out.push(' ');
     let start = out.len();
-    let written = match err {
+    let written = blaze_memo::attach(db, || match err {
         ConstEvalError::MirLowerError(it) => write!(out, "{it:?}"),
         ConstEvalError::MirEvalError(it) => write!(out, "{it:?}"),
-    };
+    });
     written.expect("writing to a string cannot fail");
     let kind = out[start..]
         .find(|c: char| !(c.is_alphanumeric() || c == '_'))

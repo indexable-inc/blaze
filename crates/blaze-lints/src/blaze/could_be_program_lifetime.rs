@@ -24,6 +24,8 @@
 //! is not), and the gain. No fix: the type's holders change with it (`could_be_ref32` finds
 //! them once the type is marked).
 
+use std::alloc::Global;
+
 use base_db::Db;
 use hir_def::{
     AdtId, DefWithBodyId, VariantId,
@@ -65,13 +67,13 @@ pub(crate) struct Construction {
 
 /// Every record literal in the bodies of `krate`, with what its value goes into, in the
 /// order of the crate's bodies; and how many `clone` calls give an `Arc` or `Rc` of each ADT.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Constructions {
-    sites: Vec<Construction>,
-    clones: Vec<(AdtId, u32)>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Constructions<'db> {
+    sites: &'db [Construction],
+    clones: &'db [(AdtId, u32)],
 }
 
-impl Constructions {
+impl Constructions<'_> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Construction> {
         self.sites.iter()
     }
@@ -138,9 +140,10 @@ fn into<'db>(
 }
 
 /// [`Constructions`] of `krate`, once per crate.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn constructions(db: &Db, krate: base_db::Crate) -> Constructions {
-    let mut out = Constructions::default();
+#[blaze_memo::tracked(returns(ref))]
+pub(crate) fn constructions<'db>(db: &'db Db, krate: base_db::Crate) -> Constructions<'db> {
+    let mut sites: Vec<Construction, Global> = Vec::new_in(Global);
+    let mut clones: Vec<(AdtId, u32), Global> = Vec::new_in(Global);
     let shared = |adt: hir::Adt| {
         general_facts::std_adt(db, adt, "sync", &["Arc"])
             || general_facts::std_adt(db, adt, "rc", &["Rc"])
@@ -162,7 +165,7 @@ pub(crate) fn constructions(db: &Db, krate: base_db::Crate) -> Constructions {
                     };
                     let parents = parents.get_or_insert_with(|| facts::Parents::of(body));
                     let into = into(db, &analysis, parents, def, id);
-                    out.sites.push(Construction { adt, def, expr: id, into });
+                    sites.push(Construction { adt, def, expr: id, into });
                 }
                 Expr::MethodCall { .. } | Expr::Call { .. } => {
                     let Some((callee, _)) = written_callee(infer, body, id) else { continue };
@@ -177,16 +180,19 @@ pub(crate) fn constructions(db: &Db, krate: base_db::Crate) -> Constructions {
                         continue;
                     };
                     let held = AdtId::from(held);
-                    match out.clones.iter_mut().find(|it| it.0 == held) {
+                    match clones.iter_mut().find(|it| it.0 == held) {
                         Some(found) => found.1 += 1,
-                        None => out.clones.push((held, 1)),
+                        None => clones.push((held, 1)),
                     }
                 }
                 _ => {}
             }
         }
     }
-    out
+    Constructions {
+        sites: crate::kept::slice(db, sites),
+        clones: crate::kept::slice(db, clones),
+    }
 }
 
 /// Where `site` is written: its file and its range there; `None` for one a macro wrote.

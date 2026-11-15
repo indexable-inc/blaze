@@ -39,10 +39,10 @@ pub trait Entries: Send + Sync + 'static {
     fn put(&self, set: &ContentId, key: ContentId, bytes: &[u8]) -> R;
 }
 
-/// Where this database's entries are kept, set once by its driver before any crate is served
-/// from them. One value a database, never one a crate: a row that reads it depends on no
-/// other crate's records.
-#[blaze_query::input(singleton, debug)]
+/// Where this database's entries are kept, set by its driver in the session arena while it
+/// builds a snapshot, before any crate is served from them. One value a database, never one a
+/// crate: a row that reads it depends on no other crate's records.
+#[blaze_memo::input(singleton, debug)]
 pub struct EntryStore {
     #[returns(ref)]
     pub held: Holder,
@@ -67,22 +67,43 @@ impl std::fmt::Debug for Holder {
     }
 }
 
-/// Has `db` keep and find its entries in `entries`: those of this crate's families, and
+/// The fact the entry store of a database is read by: one holder a database, which the driver
+/// names by `holder` (any id it gives each holder it makes, the same for the same holder).
+pub fn store_fact(holder: ContentId) -> blaze_memo::Fact {
+    blaze_memo::Fact { id: ContentId::of("hir-def entry store", &[]), digest: holder }
+}
+
+/// Has the snapshot `inputs` builds (the session arena's) keep and find its entries in
+/// `entries`, read by `fact` ([`store_fact`]): those of this crate's families, and
 /// hir-expand's macro definitions (`hir_expand::declarative::stored`), which reach the same
 /// store through [`ForExpansion`].
 // dyn: the driver's one holder
-pub fn set(db: &mut Db, entries: Arc<dyn Entries>) {
-    use blaze_query::db::{Durability, Setter};
-    // alloc: the one bridge of a database, when its driver sets its entry store
-    hir_expand::declarative::stored::set(db, Arc::new(ForExpansion));
-    match EntryStore::try_get(&*db) {
-        Some(it) => {
-            it.set_held(db).with_durability(Durability::HIGH).to(Holder(entries));
-        }
-        None => {
-            _ = EntryStore::new(db, Durability::HIGH, Holder(entries));
-        }
-    }
+pub fn set(inputs: &blaze_memo::Inputs<'_>, fact: blaze_memo::Fact, entries: Arc<dyn Entries>) {
+    hir_expand::declarative::stored::set(inputs, fact, Arc::new_in(ForExpansion, Global));
+    EntryStore::set(inputs, fact, Holder(entries));
+}
+
+/// A test's [`set`] of `entries` from the next commit of `db` on, in its session arena, named
+/// by a count of the holders a test set: given each time a commit makes that arena, as a
+/// driver's is.
+#[cfg(test)]
+// dyn: a test's one holder
+pub(crate) fn set_for_test(db: &mut Db, entries: Arc<dyn Entries>) {
+    static HOLDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = HOLDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fact = store_fact(ContentId::of("blaze test entry store", &n.to_le_bytes()));
+    let mut edit = db.edit();
+    edit.set_given(
+        None,
+        fact,
+        Box::new_in(
+            move |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+                set(inputs, fact, Arc::clone(&entries));
+            },
+            Global,
+        ),
+    );
+    _ = edit.commit();
 }
 
 /// Where the entries of `db` are kept, if its driver said.
@@ -93,8 +114,8 @@ pub fn of(db: &Db) -> Option<&dyn Entries> {
 
 /// The entry of `family` under `key`, read by `decode`: `Ok(None)` when none is kept (the
 /// caller says whether that is an error), `Err` naming the family and the key when one is
-/// kept and does not read, or when the database has nowhere to look. Tells the engine the
-/// value is a record's (`row::STORED`).
+/// kept and does not read, or when the database has nowhere to look. A read of the entry is a
+/// read of the fact its key is (equal keys are equal bytes, so the key is its own digest).
 pub fn entry<T>(
     db: &Db,
     family: &'static str,
@@ -117,7 +138,7 @@ pub fn entry<T>(
     match (found, out) {
         (false, _) => Ok(None),
         (true, Some(Ok(it))) => {
-            blaze_query::db::report_stored_read(db);
+            blaze_memo::read(blaze_memo::Database::memo(db), blaze_memo::Fact { id: key, digest: key });
             Ok(Some(it))
         }
         // alloc: error path

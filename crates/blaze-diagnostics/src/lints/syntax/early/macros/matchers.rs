@@ -84,7 +84,7 @@ pub(super) fn definition(
     let root = SyntaxContext::root(tree.file.edition(cx.db));
     let span = |offset: TextSize| {
         let ctx = map.map_or(root, |it| it.span_at(offset).ctx);
-        (ctx.edition(cx.db), ctx.is_root())
+        (ctx.edition(), ctx.is_root())
     };
     let Some(tokens) = Tokens::of(def, &span) else { return };
     let (macro_rules, keyword) = match def {

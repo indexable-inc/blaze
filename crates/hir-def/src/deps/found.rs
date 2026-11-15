@@ -27,6 +27,9 @@
 //! being where the filed key began). Nothing read the filed key: every serve keys the crate
 //! from its database ([`super::image_key`]) and asks the store by that. So the field went, and
 //! the families with it, which said what one writer happened to put under its filed key.
+//! The crate's key the serve walked (`Found::base`, which a start gave its image under) went
+//! for the same reason before it was ever merged: it covers the runs and the proc-macro
+//! libraries too, so it is no function of the found key either.
 
 use blaze_ids::{ContentId, Hasher};
 

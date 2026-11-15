@@ -62,7 +62,10 @@ pub fn encode(db: &Db, plan: &[(AdtId, AdtPlan)]) -> Vec<u8> {
 pub struct Decoded {
     pub plan: FieldOrderPlan,
     /// ADTs the file names that this database has no item for (renamed, moved, or of a crate
-    /// not loaded): left out of the plan, so they keep rustc's order.
+    /// not loaded). Each stays in the plan under its key and applies once an ADT of that key
+    /// exists: a plan is by stable key, not by what exists now, and is installed once and held
+    /// across commits, so a crate loaded or an item restored by a later edit is laid out as
+    /// the profile ranked it. Until then no layout asks for the key and nothing changes.
     pub unresolved: u32,
     /// ADTs whose ranks don't fit their fields here (a field renamed or removed since the
     /// profile, or a variant added), in the file's order (by item key), each with why: they
@@ -90,8 +93,9 @@ fn refuse(line: usize, what: impl Into<String>) -> DecodeError {
     DecodeError { line, what: what.into() }
 }
 
-/// Reads a plan file, resolving its ADTs' keys in `db`. A malformed line, an item that is no
-/// ADT, or an ADT named twice is refused, naming the line.
+/// Reads a plan file, resolving its ADTs' keys in `db` only to count the unresolved and check
+/// the stale: the plan holds every ADT by its key ([`adt_key`]). A malformed line, an item that
+/// is no ADT, or a key named twice is refused, naming the line.
 pub fn decode(db: &Db, bytes: &[u8]) -> Result<Decoded, DecodeError> {
     let text = std::str::from_utf8(bytes).map_err(|err| refuse(0, format!("not UTF-8: {err}")))?;
     let mut lines = text.lines().enumerate().map(|(at, line)| (at + 1, line));
@@ -104,19 +108,22 @@ pub fn decode(db: &Db, bytes: &[u8]) -> Result<Decoded, DecodeError> {
             ));
         }
     }
-    let mut by_adt: HashMap<AdtId, AdtPlan, Global> = HashMap::new_in(Global);
+    let mut by_key: HashMap<ContentId, AdtPlan, Global> = HashMap::new_in(Global);
     let mut unresolved = 0;
     // alloc: the decoded plan's, one entry per stale ADT
     let mut stale = Vec::new();
-    // The ADT being read (`None`: not in this database), its line and its variants.
-    let mut current: Option<(Option<AdtId>, usize, Vec<Box<[Name]>>)> = None;
-    let mut finish = |current: Option<(Option<AdtId>, usize, Vec<Box<[Name]>>)>| {
-        let Some((Some(adt), line, variants)) = current else { return Ok(()) };
+    // The ADT being read: its key, its id here (`None`: not in this database), its line and
+    // its variants.
+    let mut current: Option<Current> = None;
+    let mut finish = |current: Option<Current>| {
+        let Some((key, adt, line, variants)) = current else { return Ok(()) };
         let plan = AdtPlan { variants: variants.into_boxed_slice() };
-        if let Some(why) = field_order::stale(db, adt, &plan) {
+        if let Some(adt) = adt
+            && let Some(why) = field_order::stale(db, adt, &plan)
+        {
             stale.push((adt, why));
         }
-        match by_adt.insert(adt, plan) {
+        match by_key.insert(key, plan) {
             None => Ok(()),
             Some(_) => Err(refuse(line, "names an ADT a line before names too")),
         }
@@ -149,10 +156,10 @@ pub fn decode(db: &Db, bytes: &[u8]) -> Result<Decoded, DecodeError> {
                     }
                 };
                 // alloc: the plan's
-                current = Some((adt, line, vec![Box::default(); count]));
+                current = Some((key, adt, line, vec![Box::default(); count]));
             }
             Some("v") => {
-                let Some((_, _, variants)) = &mut current else {
+                let Some((_, _, _, variants)) = &mut current else {
                     return Err(refuse(line, "a `v` line before any `adt` line"));
                 };
                 let usage = "expected `v <variant index> <field name>...`";
@@ -180,8 +187,18 @@ pub fn decode(db: &Db, bytes: &[u8]) -> Result<Decoded, DecodeError> {
         }
     }
     finish(current.take())?;
-    let plan = FieldOrderPlan::new(ContentId::of(PLAN_DOMAIN, bytes), by_adt);
+    let plan = FieldOrderPlan::new(ContentId::of(PLAN_DOMAIN, bytes), adt_key, by_key);
     Ok(Decoded { plan, unresolved, stale })
+}
+
+/// An `adt` line being read: the ADT's key, its id in the database read against (`None`: none
+/// there), the line and its variants' hot fields.
+type Current = (ContentId, Option<AdtId>, usize, Vec<Box<[Name]>>);
+
+/// The stable key a plan names `adt` by ([`field_order::AdtKeyOf`]): its item key, as
+/// [`encode`] writes it.
+pub fn adt_key(db: &Db, adt: AdtId) -> ContentId {
+    key::item_key(db, ItemId::Adt(adt)).0
 }
 
 /// 64 lowercase hex digits.

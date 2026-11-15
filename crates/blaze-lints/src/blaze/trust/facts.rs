@@ -39,7 +39,7 @@ use super::{
     capability::{ANYWHERE, Capability, Caps, IO_SPLIT, UNSEEN_STANDS_FOR, of_done},
     grants::order,
 };
-use crate::check;
+use crate::{check, kept};
 
 /// The build-script dependencies that build or link foreign code: a package whose build script
 /// depends on one of them is counted [`Capability::Ffi`].
@@ -147,8 +147,8 @@ pub fn workspace(db: &Db) -> Workspace {
             }
             continue;
         }
-        for (capability, witness) in anywhere(db, krate).iter() {
-            deps[at].offer(*capability, u32::MAX, witness.clone());
+        for &(capability, witness) in anywhere(db, krate) {
+            deps[at].offer(capability, u32::MAX, witness.into());
         }
         deps[at].libs.push(krate);
     }
@@ -157,19 +157,19 @@ pub fn workspace(db: &Db) -> Workspace {
         for found in reached.iter() {
             let Some(package) = package_of(db, found.krate) else { continue };
             let at = building(&mut deps, package, found.krate.extra_data(db).version.as_deref());
-            deps[at].offer(found.capability, found.calls, found.witness.clone());
+            deps[at].offer(found.capability, found.calls, found.witness.into());
         }
     }
     let mut out: Vec<Dep> = Vec::with_capacity_in(deps.len(), Global);
     for dep in deps {
         let mut unreached: Vec<Used> = Vec::new_in(Global);
         for &lib in &dep.libs {
-            for (capability, witness) in self::unreached(db, lib).iter() {
-                let taken = dep.uses.iter().any(|it| it.0 == *capability)
-                    || unreached.iter().any(|it| it.capability == *capability)
-                    || ANYWHERE.has(*capability);
+            for &(capability, witness) in self::unreached(db, lib) {
+                let taken = dep.uses.iter().any(|it| it.0 == capability)
+                    || unreached.iter().any(|it| it.capability == capability)
+                    || ANYWHERE.has(capability);
                 if !taken {
-                    unreached.push(Used { capability: *capability, witness: witness.clone() });
+                    unreached.push(Used { capability, witness: witness.into() });
                 }
             }
         }
@@ -247,23 +247,24 @@ fn crate_name(db: &Db, krate: Crate) -> &str {
     krate.extra_data(db).display_name.as_ref().map_or("", |it| it.crate_name().as_str())
 }
 
-/// One (crate, capability) a workspace crate reaches.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Reached {
+/// One (crate, capability) a workspace crate reaches, kept in its arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reached<'db> {
     pub krate: Crate,
     pub capability: Capability,
     /// The calls from the workspace crate's function to the node that uses it.
     pub calls: u32,
-    pub witness: Box<str>,
+    pub witness: &'db str,
 }
 
-/// What the functions of the workspace crate `krate` reach in the dependencies.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn reached(db: &Db, krate: Crate) -> Box<[Reached]> {
+/// What the functions of the workspace crate `krate` reach in the dependencies. Kept in the
+/// crate's arena, owning nothing.
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn reached<'db>(db: &'db Db, krate: Crate) -> &'db [Reached<'db>] {
     let roots = functions_of(db, krate);
     let reach = reach(db, &roots, None);
     let (graph, crates) = graph_of(db, &reach);
-    let mut out: Vec<Reached> = Vec::new_in(Global);
+    let mut out: Vec<Reached<'db>> = Vec::new_in(Global);
     for found in attribute(&graph) {
         let mut witness = String::new();
         for (at, &node) in found.chain.iter().enumerate() {
@@ -279,31 +280,32 @@ pub(crate) fn reached(db: &Db, krate: Crate) -> Box<[Reached]> {
             krate: crates[found.krate as usize],
             capability: found.capability,
             calls,
-            witness: witness.into(),
+            witness: kept::text(db, &witness),
         });
     }
-    out.into_boxed_slice()
+    kept::slice(db, out)
 }
 
 /// What each function of the dependency crate `krate` does itself, reached or not: each
-/// capability once, with the first function met that uses it.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn unreached(db: &Db, krate: Crate) -> Box<[(Capability, Box<str>)]> {
+/// capability once, with the first function met that uses it. Kept in the crate's arena,
+/// owning nothing.
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn unreached<'db>(db: &'db Db, krate: Crate) -> &'db [(Capability, &'db str)] {
     let roots = functions_of(db, krate);
     let reach = reach(db, &roots, Some(krate));
-    let mut out: Vec<(Capability, Box<str>)> = Vec::new_in(Global);
+    let mut out: Vec<(Capability, &'db str)> = Vec::new_in(Global);
     for node in &reach.nodes {
         for done in &node.done {
             for (capability, what) in uses_of(done) {
                 if ANYWHERE.has(capability) || out.iter().any(|it| it.0 == capability) {
                     continue;
                 }
-                out.push((capability, format!("{} {what}", node.name).into()));
+                out.push((capability, kept::text(db, &format!("{} {what}", node.name))));
             }
         }
     }
     out.sort_by_key(|it| it.0);
-    out.into_boxed_slice()
+    kept::slice(db, out)
 }
 
 /// The graph [`attribute`] reads of `reach`, and the crate of each crate index.
@@ -427,13 +429,13 @@ fn foreign(db: &Db, func: FunctionId) -> bool {
 }
 
 /// What the items of the dependency crate `krate` say wherever they are: each capability once,
-/// with the first item met that says it.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn anywhere(db: &Db, krate: Crate) -> Box<[(Capability, Box<str>)]> {
-    let mut out: Vec<(Capability, Box<str>)> = Vec::new_in(Global);
+/// with the first item met that says it. Kept in the crate's arena, owning nothing.
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn anywhere<'db>(db: &'db Db, krate: Crate) -> &'db [(Capability, &'db str)] {
+    let mut out: Vec<(Capability, &'db str)> = Vec::new_in(Global);
     let mut say = |capability: Capability, witness: String| {
         if !out.iter().any(|it| it.0 == capability) {
-            out.push((capability, witness.into()));
+            out.push((capability, kept::text(db, &witness)));
         }
     };
     if krate.data(db).target_kind.is_proc_macro() {
@@ -509,7 +511,7 @@ pub(crate) fn anywhere(db: &Db, krate: Crate) -> Box<[(Capability, Box<str>)]> {
         }
     }
     out.sort_by_key(|it| it.0);
-    out.into_boxed_slice()
+    kept::slice(db, out)
 }
 
 /// The attributes that name a symbol or a section, which only `unsafe` may write (Rust 2024's

@@ -10,6 +10,7 @@
 //! `bindings_with_variant_name`. Witnesses become text only when they go into an error.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
 
@@ -287,7 +288,7 @@ pub enum ManualPartialEq {
 
 /// Match checking of `def`, once per body: the closures and inline constants written in it are
 /// checked with it, as they are lowered with it.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn match_check(db: &Db, def: DefWithBodyId) -> MatchCheck {
     let infer = InferenceResult::of(db, def);
     // rustc's `thir_body` is `Err` for a body type checking found an error in.
@@ -299,8 +300,8 @@ pub fn match_check(db: &Db, def: DefWithBodyId) -> MatchCheck {
 
 /// The catch-alls of `def`'s `match`es and the variants each stands for ([`CatchAll`]), for
 /// `blaze::wildcard_arm`; nothing for a body type checking found an error in.
-#[blaze_query::tracked(returns(ref))]
-pub fn catch_alls(db: &Db, def: DefWithBodyId) -> CatchAlls {
+#[blaze_memo::tracked(returns(copy))]
+pub fn catch_alls<'db>(db: &'db Db, def: DefWithBodyId) -> CatchAlls<'db> {
     let infer = InferenceResult::of(db, def);
     if infer.has_errors || infer.has_type_mismatches() || infer.is_erroneous() {
         return CatchAlls { incomplete: true, ..CatchAlls::default() };

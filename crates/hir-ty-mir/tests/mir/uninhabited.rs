@@ -33,7 +33,7 @@ fn entries(src: &str, name: &str) -> Vec<(String, String, &'static str)> {
     let fx = fixture::db(&format!("//- minicore: sized\n{text}"));
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let func = function(&db, name);
         let body = db
             .mir_body(func.into())
@@ -64,7 +64,7 @@ fn a_never_to_any_coercion_has_no_return_path() {
     let fx = fixture::db("//- minicore: sized\n#![feature(never_type)]\nfn coerce(value: !) -> u32 { value }\n");
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let body = db.mir_body(function(&db, "coerce").into()).expect("the MIR of `coerce`");
         assert!(body.basic_blocks.iter().any(|(_, block)| {
             matches!(block.terminator.as_ref().map(|it| &it.kind), Some(TerminatorKind::Unreachable))
@@ -99,7 +99,7 @@ fn the_kept_body_ends_at_the_call() {
     let fx = fixture::db(&format!("//- minicore: sized\n{ITEMS}{src}"));
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let body = db.mir_body(function(&db, "main").into()).expect("the MIR of `main`");
         let calls: Vec<_> = body
             .basic_blocks

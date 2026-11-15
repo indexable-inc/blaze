@@ -693,7 +693,7 @@ fn all_agree<'db>(db: &'db Db, tys: &[Ty<'db>]) {
 #[test]
 fn the_identity_tells_apart_what_both_old_spellings_did() {
     let db = fixture(CORPUS);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let tys = corpus(&db);
         all_agree(&db, &tys);
         let spelled = |name: &str| {
@@ -721,7 +721,7 @@ fn a_named_or_computed_length_is_its_value() {
          pub type Computed = [u8; 1 + 1];\n\
          pub type Three = [u8; N + 1];\n",
     );
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let spelled = |name: &str| {
             identity::ty(&db, db.ty(TyDefId::TypeAliasId(alias(&db, name))).skip_binder())
                 .unwrap_or_else(|why| panic!("`{name}`: {why}"))
@@ -735,7 +735,7 @@ fn a_named_or_computed_length_is_its_value() {
 #[test]
 fn constants_and_argument_lists_agree_with_the_old_spellings() {
     let db = fixture(CORPUS);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let konsts: Vec<Const<'_>> =
             [0, 1, 1, 2, u32::MAX as u128].map(|it| usize_const(&db, Some(it), krate)).to_vec();
@@ -746,7 +746,7 @@ fn constants_and_argument_lists_agree_with_the_old_spellings() {
                 konsts.iter().map(|&it| OldSpell::konst_of(&db, old, it).ok()).collect();
             agree(&format!("{old:?}'s constants"), &names, &one, &then);
         }
-
+    
         let tys = corpus(&db);
         let lists: Vec<GenericArgs<'_>> = tys
             .iter()
@@ -794,7 +794,7 @@ fn a_coroutines_identity_holds_its_binding_names() {
     let mut db = fx.into_db();
     let file = file.file_id(&db);
     let spelled = |db: &TestDB| {
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let ty = coroutine_local(db, "make");
             (
                 identity::ty(db, ty).expect("the one spelling"),
@@ -806,7 +806,11 @@ fn a_coroutines_identity_holds_its_binding_names() {
     let before = spelled(&db);
     assert_eq!(spelled(&db), before, "asked twice");
 
-    db.set_file_text(file, &ASYNC.replace("one", "uno"));
+    // `file` is the file's key and `before` content ids, so neither dies with the arena the
+    // commit drops; `spelled` takes the function and its coroutine again in the new snapshot.
+    let mut edit = db.edit();
+    edit.set_file_text(file, &ASYNC.replace("one", "uno"));
+    let _: base_db::Committed = edit.commit();
     let after = spelled(&db);
     assert_ne!(after.0, before.0, "the one spelling holds the coroutine's binding names");
     assert_ne!(after.1, before.1, "as the code generator's did");
@@ -816,7 +820,7 @@ fn a_coroutines_identity_holds_its_binding_names() {
 #[test]
 fn is_plain_data_is_the_code_generators() {
     let db = fixture(CORPUS);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let interner = DbInterner::new_with(&db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
@@ -870,7 +874,7 @@ fn random_types_agree(tape: &Tape) {
         program.push_str(&format!("pub type A{at} = {text};\npub type B{at} = {text};\n"));
     }
     let db = fixture(&program);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let tys: Vec<Ty<'_>> = (0..texts.len())
             .flat_map(|at| [format!("A{at}"), format!("B{at}")])
             .map(|name| db.ty(TyDefId::TypeAliasId(alias(&db, &name))).skip_binder())

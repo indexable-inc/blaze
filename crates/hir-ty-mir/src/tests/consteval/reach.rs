@@ -507,7 +507,7 @@ fn walk_says(walk: &str, structs: &[Vec<Ty>], root: usize) -> Option<bool> {
     let fx = fixture::db(&fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || match eval_goal(&db, file_id) {
+    blaze_memo::attach(&db, || match eval_goal(&db, file_id) {
         Ok(_) => Some(true),
         Err(e) => match simplify(e) {
             ConstEvalError::MirEvalError(MirEvalError::Panic(_)) => Some(false),

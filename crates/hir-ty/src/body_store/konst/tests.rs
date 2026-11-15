@@ -44,7 +44,7 @@ fn keyed_by_its_crate_every_constant_misses() {
     let crate_key = |source: &str| ContentId::of("blaze v2 item store constant control 1", source.as_bytes());
     let (before, after) = (crate_key(&fixture(2)), crate_key(&fixture(20)));
     let db = db_of(&fixture(2));
-    let moved = blaze_query::db::attach(&db, || {
+    let moved = blaze_memo::attach(&db, || {
         NAMES
             .iter()
             .filter(|name| {

@@ -372,7 +372,7 @@ fn other_parameter_types_are_another_behaviour() {
 /// The fingerprint of each body of `main`, on a database of its own.
 fn fingerprints(text: &str) -> Vec<Option<u64>, Global> {
     let db = fixture::db(text).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = main_crate(&db).base();
         vec_of(query::lint_plan(&db, krate).bodies.iter().map(|it| body_semantic(&db, it.def).as_ref().map(|row| row.hash)))
     })

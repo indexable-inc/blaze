@@ -109,7 +109,7 @@ impl Memo for Resident {
             // SAFETY: `bytes` is `record.len()` fresh bytes at least.
             unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), bytes, record.len()) };
             local.alloc(Entry {
-                head: Head::new(hash, &RECORD, &[], 0),
+                head: Head::new(hash, &RECORD, 0),
                 key,
                 value: Bytes { at: bytes, len: record.len() },
             })

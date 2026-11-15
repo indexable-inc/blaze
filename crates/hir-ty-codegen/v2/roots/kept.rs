@@ -48,7 +48,7 @@ pub(super) struct Kept {
 /// function by function, each root's generics were read again every build: 352
 /// `FunctionSignature::kept` verified for a one-line body edit of hello world (2026-11-12),
 /// a count of the names the program's crates keep.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(super) fn kept_roots(db: &Db, krate: Crate) -> Box<[crate::v2::HirInstance]> {
     let functions = kept(db, krate).functions.iter();
     // alloc: once a crate a revision, the memo's list
@@ -57,7 +57,7 @@ pub(super) fn kept_roots(db: &Db, krate: Crate) -> Box<[crate::v2::HirInstance]>
 
 /// Once per crate and revision of it: the standard library's is found once a daemon, and
 /// read from its record when it is served.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(super) fn kept(db: &Db, krate: Crate) -> Kept {
     match frozen::served(db, krate) {
         Some(listed) => from_record(db, listed),

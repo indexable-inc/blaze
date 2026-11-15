@@ -38,6 +38,7 @@ use hir_def::{
 use std::alloc::Global;
 
 use super::{alloc::written_callee, facts, frozen_collection};
+use crate::kept;
 
 /// Where a field's index uses go.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,10 +85,10 @@ pub(crate) struct FieldFacts {
 }
 
 /// Every field some body of the crate uses or builds, and how.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct GooseFields(HashMap<FieldId, FieldFacts, Global>);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GooseFields<'db>(kept::Map<'db, FieldId, FieldFacts>);
 
-impl GooseFields {
+impl GooseFields<'_> {
     /// What the crate does with `field`; the default (nothing) when no body names it.
     pub(crate) fn of(&self, field: FieldId) -> FieldFacts {
         self.0.get(&field).copied().unwrap_or_default()
@@ -98,13 +99,13 @@ impl GooseFields {
 const UP: usize = 4;
 
 /// The fields of `krate` and what its bodies do with them, once per crate.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn goose_fields(db: &Db, krate: base_db::Crate) -> GooseFields {
-    let mut out = GooseFields(HashMap::new_in(Global));
+#[blaze_memo::tracked(returns(ref))]
+pub(crate) fn goose_fields<'db>(db: &'db Db, krate: base_db::Crate) -> GooseFields<'db> {
+    let mut out: HashMap<FieldId, FieldFacts, Global> = HashMap::new_in(Global);
     for def in frozen_collection::crate_bodies(db, krate) {
-        read_body(db, def, &mut out.0);
+        read_body(db, def, &mut out);
     }
-    out
+    GooseFields(kept::Map::keep(db, out))
 }
 
 /// Whether `def` is a function of an `#[automatically_derived]` impl.

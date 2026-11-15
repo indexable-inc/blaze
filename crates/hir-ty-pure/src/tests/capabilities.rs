@@ -2,7 +2,9 @@
 //! stand-in toolchain: per effect, a refused crate with its call path and one that passes, the
 //! trusted list of `[workspace.metadata.blaze.trusted]`, and what `blaze explain trusted` reads.
 
-use base_db::{Crate, CrateOrigin, CrateWorkspaceData, Db, TrustedCrate, all_crates};
+use std::alloc::Global;
+
+use base_db::{Crate, CrateKey, CrateOrigin, CrateWorkspaceData, Db, TrustedCrate, all_crates};
 
 use super::{
     fixture::{crate_named, db_with},
@@ -39,23 +41,30 @@ fn trust(db: &mut Db, names: &[&str]) {
             reason: "checked by hand".into(),
         })
         .collect();
-    let crates: Vec<Crate> = all_crates(&*db)
+    // Each crate's key and new data, read before the edit: one commit sets them all, and the
+    // crates are taken again after it.
+    let changed: Vec<(CrateKey, triomphe::Arc<CrateWorkspaceData>), Global> = all_crates(&*db)
         .iter()
         .copied()
         .filter(|krate| !matches!(krate.data(&*db).origin, CrateOrigin::Lang(_)))
+        .map(|krate: Crate| {
+            let mut data = CrateWorkspaceData::clone(krate.workspace_data(&*db));
+            data.trusted = listed.clone();
+            (krate.key(&*db), triomphe::Arc::new(data))
+        })
         .collect();
-    for krate in crates {
-        let mut data = CrateWorkspaceData::clone(krate.workspace_data(&*db));
-        data.trusted = listed.clone();
-        krate.set_workspace_data(db, triomphe::Arc::new(data));
+    let mut edit = db.edit();
+    for (key, data) in changed {
+        edit.set_crate_workspace_data(key, data);
     }
+    _ = edit.commit();
 }
 
 #[track_caller]
 fn refused(db: &Db, krate: &str, name: &str, effect: &EffectDef) -> Refusal {
     let krate = crate_named(db, krate);
     let func = fn_named(db, krate, name);
-    blaze_query::db::attach(db, || match check_generic(db, func, effect) {
+    blaze_memo::attach(db, || match check_generic(db, func, effect) {
         Err(refusal) => refusal,
         Ok(proof) => panic!("`{name}` should be refused `{}`, but has it: {proof:?}", effect.name),
     })
@@ -65,7 +74,7 @@ fn refused(db: &Db, krate: &str, name: &str, effect: &EffectDef) -> Refusal {
 fn passes(db: &Db, krate: &str, name: &str, effect: &EffectDef) {
     let krate = crate_named(db, krate);
     let func = fn_named(db, krate, name);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         if let Err(refusal) = check_generic(db, func, effect) {
             panic!("`{name}` should pass `{}`, but {}", effect.name, refusal.said());
         }
@@ -113,7 +122,7 @@ pub fn start() -> bool {
         ),
         "{said}"
     );
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         assert!(capabilities_asked(&db, crate_named(&db, "app")), "`app` asks for capabilities");
     });
 }
@@ -157,7 +166,7 @@ fn unsafe_passes_in_a_trusted_crate() {
     trust(&mut db, &["raw"]);
     passes(&db, "app", "run", &UNSAFE);
     let app = crate_named(&db, "app");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let reached: Vec<(&str, &str, &str)> = trusted_reached(&db, app)
             .into_iter()
             .map(|it| (&*it.name, &*it.owner, &*it.reason))

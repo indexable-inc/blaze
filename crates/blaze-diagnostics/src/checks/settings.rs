@@ -19,6 +19,7 @@ use base_db::{Db, EditionedFileId};
 use blaze_mem::{Tag, frame};
 use either::Either;
 use hir::{HirFileId, InFile};
+use intern::Symbol;
 use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
@@ -28,44 +29,63 @@ use crate::{
 };
 
 /// The settings of a crate a piece's probe is given ([`crate_settings`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CrateSettings {
+///
+/// A memo value: its lists are kept in the query's arena, each name the process's interned
+/// [`Symbol`], so it owns nothing to drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CrateSettings<'db> {
     /// The crate root's file: where an inner attribute written elsewhere is told to go.
     pub(crate) root: Option<EditionedFileId>,
     /// What `#![feature]` enables, as `features::configured` takes it (a removed feature left
     /// out), the language features first, each in the order written.
-    pub(crate) features: Box<[Box<str>]>,
+    pub(crate) features: &'db [Symbol],
     /// `features::Features::nightly`.
     pub(crate) nightly: bool,
     /// `features::Features::crate_nightly`.
     pub(crate) crate_nightly: bool,
     /// What `#![register_tool(..)]` registers, in the order written.
-    pub(crate) tools: Box<[Box<str>]>,
+    pub(crate) tools: &'db [Symbol],
 }
 
-impl CrateSettings {
+impl<'db> CrateSettings<'db> {
     /// The settings of a crate whose root is `root`, whose features are `features` and whose
-    /// registered tools are `tools`: what the check reads off its own walk, and what
-    /// [`crate_settings`] reads off the root's outline.
-    pub(crate) fn of_parts(
+    /// registered tools are `tools`, kept in the current run's arena: what [`crate_settings`]
+    /// reads off the root's outline.
+    fn of_parts(
+        db: &'db Db,
         root: Option<EditionedFileId>,
         features: &features::Features,
         tools: &[String],
-    ) -> CrateSettings {
+    ) -> CrateSettings<'db> {
+        let memo = blaze_memo::Database::memo(db);
         CrateSettings {
             root,
-            // alloc: a query's value, once per crate, one entry a feature
-            features: features.names_in_stable_order().map(Box::from).collect(),
+            features: blaze_memo::keep_iter(memo, features.names_in_stable_order().map(Symbol::intern)),
             nightly: features.nightly,
             crate_nightly: features.crate_nightly,
-            // alloc: as above, one entry a tool
-            tools: tools.iter().map(|it| Box::from(it.as_str())).collect(),
+            tools: blaze_memo::keep_iter(memo, tools.iter().map(|it| Symbol::intern(it))),
         }
+    }
+
+    /// Whether these are the settings of a crate whose root is `root`, whose features are
+    /// `features` and whose registered tools are `tools`: what the check reads off its own
+    /// walk (`checks::check`), compared with what a probe is given.
+    pub(crate) fn are(
+        &self,
+        root: Option<EditionedFileId>,
+        features: &features::Features,
+        tools: &[String],
+    ) -> bool {
+        self.root == root
+            && self.nightly == features.nightly
+            && self.crate_nightly == features.crate_nightly
+            && self.features.iter().map(Symbol::as_str).eq(features.names_in_stable_order())
+            && self.tools.iter().map(Symbol::as_str).eq(tools.iter().map(String::as_str))
     }
 
     /// Whether `#![feature]` enables `name`.
     pub(crate) fn enabled(&self, name: &str) -> bool {
-        self.features.iter().any(|it| &**it == name)
+        self.features.iter().any(|it| it.as_str() == name)
     }
 }
 
@@ -74,8 +94,8 @@ impl CrateSettings {
 /// (`lints::syntax::attrs::owners`), then read by the check's own readers of it
 /// (`features::configured`, `attrs::registered_tools`). What they say of a malformed
 /// attribute is the check's to give, at the crate root, and is dropped here.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn crate_settings(db: &Db, krate: base_db::Crate) -> CrateSettings {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn crate_settings<'db>(db: &'db Db, krate: base_db::Crate) -> CrateSettings<'db> {
     frame::task(Tag::Diagnostics, |frame| {
         let cx = Cx::new(db, hir::Crate::from(krate), Files::unnamed(), frame);
         let root = cx.krate.root_module(db).as_source_file_id(db);
@@ -85,7 +105,7 @@ pub(crate) fn crate_settings(db: &Db, krate: base_db::Crate) -> CrateSettings {
         let tools = attrs::registered_tools(&cx, owners);
         #[cfg(test)]
         let tools = planted_tools(db, tools);
-        CrateSettings::of_parts(root, &features, &tools)
+        CrateSettings::of_parts(db, root, &features, &tools)
     })
 }
 

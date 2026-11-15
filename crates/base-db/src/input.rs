@@ -2,34 +2,38 @@
 //! **the** most important module, because all other fancy stuff is strictly
 //! derived from this input.
 //!
-//! Nothing here does IO: files come in as blaze-vfs views ([`crate::Db::set_view_root`]) and
+//! Nothing here does IO: files come in as blaze-vfs views ([`crate::Edit::set_view_root`]) and
 //! the crate graph from `blaze-lower`.
+//!
+//! The crate graph is the world's ([`crate::world::Crates`], by [`CrateKey`]); a [`Crate`] is
+//! the snapshot's input made from a crate's entry each time its arena is made, in that arena.
+//! Cost (rule 67): a getter is one input read (an index into the arena and the fact noted); a
+//! crate's content ID is hashed when a field or a dependency's content moved, never on a read;
+//! [`Crate::transitive_deps`] is memoized once per crate per snapshot (O(the crates it
+//! reaches)), [`Crate::transitive_rev_deps`] walks the list each call (O(crates + edges)) into
+//! the caller's buffer.
 
-use blaze_hash::hash_map::Entry;
 use std::error::Error;
 use std::str::FromStr;
 use std::{fmt, mem, ops};
-
-use blaze_core::lock::{Lock, LockGuard};
 
 use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, VfsPath};
 use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_lint_defs::LintOptions;
 use blaze_mem::Frame;
-use blaze_query::db::{Database as _, Durability, SealGroup, SealKind, Setter};
-use cfg::{CfgOptions, HashableCfgOptions};
+use blaze_memo::{Database as _, Id as _};
+use cfg::CfgOptions;
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use span::Edition;
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use triomphe::Arc;
 
 use crate::{
-    CrateWorkspaceData, Db, EditionedFileId, FxIndexSet, all_crates,
+    CrateWorkspaceData, Db, EditionedFileId, all_crates,
     content::{self, InputId, cfg_options_content},
-    maintain::Note,
-    refresh_crate_graph_content, set_all_crates_with_durability,
+    world::CrateKey,
 };
 
 pub type ProcMacroPaths =
@@ -160,6 +164,16 @@ impl SourceRoot {
         self.file_set.aliases()
     }
 
+    /// See [`FileSet::own_path`].
+    pub(crate) fn own_path(&self, file: &FileId) -> Option<&VfsPath> {
+        self.file_set.own_path(file)
+    }
+
+    /// See [`FileSet::alias_target`].
+    pub(crate) fn alias_target(&self, alias: &FileId) -> Option<FileId> {
+        self.file_set.alias_target(alias)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.file_set.len()
     }
@@ -187,6 +201,13 @@ pub struct CrateBuilder {
     pub cfg_options: CfgOptions,
     pub env: Env,
     ws_data: Arc<CrateWorkspaceData>,
+}
+
+impl CrateBuilder {
+    /// What the crate shares with every crate of its target.
+    pub(crate) fn workspace(&self) -> &Arc<CrateWorkspaceData> {
+        &self.ws_data
+    }
 }
 
 impl fmt::Debug for CrateGraphBuilder {
@@ -569,24 +590,6 @@ impl FromStr for ReleaseChannel {
     }
 }
 
-/// The crate data from which we derive the `Crate`.
-///
-/// We want this to contain as little data as possible, because if it contains dependencies and
-/// something changes, this crate and all of its dependencies ids are invalidated, which causes
-/// pretty much everything to be recomputed. If the crate id is not invalidated, only this crate's
-/// information needs to be recomputed.
-///
-/// *Most* different crates have different root files (actually, pretty much all of them).
-/// Still, it is possible to have crates distinguished by other factors (e.g. dependencies).
-/// So we store only the root file - unless we find that this crate has the same root file as
-/// another crate, in which case we store all data for one of them (if one is a dependency of
-/// the other, we store for it, because it has more dependencies to be invalidated).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: setup: the crate graph, once per load
-pub struct UniqueCrateData {
-    root_file_id: FileId,
-    disambiguator: Option<Box<(BuiltCrateData, HashableCfgOptions)>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: setup: the crate graph, once per load
 pub struct CrateData<Id> {
     pub root_file_id: FileId,
@@ -631,6 +634,35 @@ pub struct CrateData<Id> {
 
 pub type CrateDataBuilder = CrateData<CrateBuilderId>;
 pub type BuiltCrateData = CrateData<Crate>;
+
+impl CrateData<Crate> {
+    /// This data (a crate's, as a snapshot's input holds it) with each dependency by its
+    /// world key ([`Crate::key`]): what [`crate::Edit::set_crate_data`] takes, so a caller
+    /// changes one field of a crate's data by reading it, setting the field and giving it back.
+    /// Every field is kept as it is, the dependencies' prelude, sysroot and private flags too.
+    pub fn keyed(&self, db: &Db) -> crate::WorldCrateData {
+        let mut dependencies = Vec::with_capacity_in(self.dependencies.len(), Global);
+        dependencies.extend(self.dependencies.iter().map(|dep| Dependency {
+            crate_id: dep.crate_id.key(db),
+            name: dep.name.clone(), // clone: a crate's name, once per dependency (setup)
+            prelude: dep.prelude,
+            sysroot: dep.sysroot,
+            private: dep.private,
+        }));
+        CrateData {
+            root_file_id: self.root_file_id,
+            edition: self.edition,
+            dependencies,
+            origin: self.origin.clone(), // clone: as above
+            crate_attrs: self.crate_attrs.clone(), // clone: as above
+            target_kind: self.target_kind,
+            manifest_kind: self.manifest_kind,
+            crate_types: self.crate_types,
+            proc_macro_cwd: self.proc_macro_cwd.clone(), // clone: an `Arc`
+            sealed: self.sealed,
+        }
+    }
+}
 
 /// Crate data unrelated to analysis.
 #[derive(Debug, Clone, PartialEq, Eq)] // clone: setup: the crate graph, once per load
@@ -717,43 +749,32 @@ impl fmt::Debug for Env {
 pub struct Dependency<Id> {
     pub crate_id: Id,
     pub name: CrateName,
-    prelude: bool,
-    sysroot: bool,
-    private: bool,
+    pub(crate) prelude: bool,
+    pub(crate) sysroot: bool,
+    pub(crate) private: bool,
 }
 
 pub type DependencyBuilder = Dependency<CrateBuilderId>;
 pub type BuiltDependency = Dependency<Crate>;
 
-impl DependencyBuilder {
-    pub fn new(name: CrateName, crate_id: CrateBuilderId) -> Self {
-        Self { name, crate_id, prelude: true, sysroot: false, private: false }
-    }
+/// A dependency as the world keeps it: on a crate by its key ([`crate::Edit::create_crate`]'s
+/// data, [`crate::WorldCrateData`]).
+pub type WorldDependency = Dependency<CrateKey>;
 
-    pub fn with_prelude(
-        name: CrateName,
-        crate_id: CrateBuilderId,
-        prelude: bool,
-        sysroot: bool,
-    ) -> Self {
-        Self { name, crate_id, prelude, sysroot, private: false }
-    }
-}
-
-impl BuiltDependency {
-    /// A dependency of a crate added after the graph was built, in the extern prelude.
-    pub fn new(name: CrateName, crate_id: Crate) -> Self {
-        Self { name, crate_id, prelude: true, sysroot: false, private: false }
-    }
-
-    /// A dependency of a crate added after the graph was built, saying whether it is in the
-    /// extern prelude (not for cargo's `noprelude`) and whether it is a sysroot crate.
-    pub fn with_prelude(name: CrateName, crate_id: Crate, prelude: bool, sysroot: bool) -> Self {
-        Self { name, crate_id, prelude, sysroot, private: false }
-    }
-}
-
+/// One home for the constructors of every form (a graph builder's, a snapshot's, the world's):
+/// the form is the crate id's type.
 impl<Id> Dependency<Id> {
+    /// A dependency on `crate_id` by `name`, in the extern prelude, not a sysroot one.
+    pub fn new(name: CrateName, crate_id: Id) -> Self {
+        Self { name, crate_id, prelude: true, sysroot: false, private: false }
+    }
+
+    /// A dependency on `crate_id` by `name`, saying whether it is in the extern prelude (not
+    /// for cargo's `noprelude`) and whether it is a sysroot crate.
+    pub fn with_prelude(name: CrateName, crate_id: Id, prelude: bool, sysroot: bool) -> Self {
+        Self { name, crate_id, prelude, sysroot, private: false }
+    }
+
     /// The dependency, private (rustc's `--extern priv:name`, which cargo passes for a
     /// dependency without `public = true` under `-Zpublic-dependency`) or not.
     pub fn with_private(self, private: bool) -> Self {
@@ -777,137 +798,90 @@ impl<Id> Dependency<Id> {
     }
 }
 
-pub type CratesIdMap = HashMap<CrateBuilderId, Crate, Global>;
+/// Each crate of a [`CrateGraphBuilder`] as the world keyed it ([`crate::Edit::set_crate_graph`]).
+pub type CratesIdMap = HashMap<CrateBuilderId, CrateKey, Global>;
 
-/// A crate. Its fields are set only through base-db ([`Crate::create`], [`Crate::set_env`] and
-/// the other setters, [`CrateGraphBuilder::set_in_db`]), which keep [`Crate::content`] the
-/// content ID of them all and of its dependencies' content IDs.
-#[blaze_query::input]
-#[derive(Debug, PartialOrd, Ord)]
+/// A crate, as one snapshot holds it: an input the world makes in the crate's own arena from
+/// its [`CrateKey`]'s entry each time that arena is made. The world keeps the entry and
+/// [`Crate::content`], the content ID of its fields and of its dependencies' content IDs
+/// ([`keyed_content`]); nothing here writes a field.
+#[blaze_memo::input(debug)]
 pub struct Crate {
-    #[returns(ref)]
-    #[get(data_field)]
-    #[set(set_data_field)]
-    data: BuiltCrateData,
+    pub data: BuiltCrateData,
     /// Crate data that is not needed for analysis.
-    ///
-    /// This is split into a separate field to increase incrementality.
-    #[returns(ref)]
-    #[get(extra_data_field)]
-    #[set(set_extra_data_field)]
-    extra_data: ExtraCrateData,
-    // This is in `Arc` because it is shared for all crates in a workspace.
-    #[returns(ref)]
-    #[get(workspace_data_field)]
-    #[set(set_workspace_data_field)]
-    workspace_data: Arc<CrateWorkspaceData>,
-    #[returns(ref)]
-    #[get(cfg_options_field)]
-    #[set(set_cfg_options_field)]
-    cfg_options: CfgOptions,
-    #[returns(ref)]
-    #[get(env_field)]
-    #[set(set_env_field)]
-    env: Env,
+    pub extra_data: ExtraCrateData,
+    /// Shared by every crate of a workspace.
+    pub workspace_data: Arc<CrateWorkspaceData>,
+    pub cfg_options: CfgOptions,
+    pub env: Env,
     #[returns(copy)]
     #[get(content_field)]
-    #[set(set_content_field)]
     content: InputId,
     /// The files of its crate attributes ([`crate::crate_attrs`]), kept with its data: not in
     /// its content ID, which has the attributes' text.
-    #[default]
-    #[returns(ref)]
-    #[get(attr_files_field)]
-    #[set(set_attr_files_field)]
     pub(crate) attr_files: Box<[FileId]>,
     /// The lint flags its compile is given: rustc's `-A`/`-W`/`--force-warn`/`-D`/`-F` in order
     /// and `--cap-lints` (rustc_session's `lint_opts` and `lint_cap`). Read only by
     /// `hir_lint_levels`' level queries; in its content ID, which persisted results are keyed by.
-    #[default]
-    #[returns(ref)]
-    #[get(lint_options_field)]
-    #[set(set_lint_options_field)]
-    lint_options: LintOptions,
-    /// What the crates above base-db gave this crate, a slot a kind ([`Crate::give`]): which
-    /// slots there are, added to when a kind is first given and never else. Not in its
-    /// content ID.
-    #[default]
-    #[returns(ref)]
+    pub lint_options: LintOptions,
+    /// What the crates above base-db gave this crate, a slot a kind
+    /// ([`crate::Edit::give`]). Not in its content ID.
     #[get(slots_field)]
-    #[set(set_slots_field)]
     slots: Vec<(std::any::TypeId, CrateSlot)>,
+    /// The `OUT_DIR`s of the other listed crates of its root file's source root, each without
+    /// a trailing separator, its own left out, sorted, each once ([`crate::other_out_dirs`]).
+    /// Made by the world each commit from every crate's variables (`world::out_dirs_of`); a
+    /// commit where they moved marks this crate's arena alone. Not in its content ID: what it
+    /// selects is in [`crate::crate_root_content`].
+    #[get(out_dirs_field)]
+    out_dirs: crate::world::Dirs,
 }
 
-/// One thing given to one crate ([`Crate::give`]): an input of its own, of the crate's seal
-/// group, so a write of it is a write of that crate's and of that kind alone.
-#[blaze_query::input(debug)]
+/// One thing given to one crate ([`crate::Edit::give`]): an input of its own, in the crate's
+/// arena, so a gift is a change of that crate's alone.
+#[blaze_memo::input(debug)]
 pub struct CrateSlot {
-    #[returns(ref)]
     pub value: Given,
 }
 
 impl Crate {
-    /// What was given to this crate as kind `K` ([`Crate::give`]), if it is a `T`; `None`
-    /// when nothing was. Reads the crate's list of slots and the one slot: inside a query,
-    /// both are recorded, and neither is written by a gift to another crate or of another
-    /// kind.
+    /// The crate's other `OUT_DIR`s as the world made them at the last commit (the field's
+    /// getter is this module's own): what [`crate::other_out_dirs`] keeps for its callers.
+    pub(crate) fn out_dirs(self, db: &Db) -> &crate::world::Dirs {
+        self.out_dirs_field(db)
+    }
+
+    /// What was given to this crate as kind `K` ([`crate::Edit::give`]), if it is a `T`;
+    /// `None` when nothing was. Reads the crate's list of slots and the one slot, both facts of
+    /// the crate's own arena: a gift to another crate or of another kind is not read.
     ///
     /// The invariant: what is "one value a crate" is kept a crate, never as an entry of one
     /// map of every crate. A map of every crate is an input every crate's rows read, so
     /// giving one crate its value was a write all of them verified after (the proc-macro
     /// map: a build of reth with nothing changed, 53 writes and 23 million rows verified,
-    /// 2026-11-12), and no seal group could own it (`blaze_query::db::seal`).
+    /// 2026-11-12).
     pub fn given<K: 'static, T: std::any::Any>(self, db: &Db) -> Option<&T> {
         let kind = std::any::TypeId::of::<K>();
         let slot = self.slots_field(db).iter().find(|it| it.0 == kind)?.1;
         slot.value(db).get::<T>()
     }
 
-    /// Gives this crate `value` as kind `K` (a type of the giver's, naming what it is), of
-    /// durability `durability`: whether anything was written. The kind's first gift makes its
-    /// slot, in the crate's seal group, and adds it to the crate's list; later ones write the
-    /// slot alone. The giver compares what the crate holds first: two [`Given`] are equal
-    /// only when they are one value.
-    pub fn give<K: 'static>(self, db: &mut Db, value: Given, durability: Durability) -> bool {
+    /// What was given to this crate as the located kind `K` ([`crate::Edit::give_located`]), if
+    /// it is a `T`; `None` when nothing was. Read off the snapshot's table, no input of any
+    /// arena: no reader depends on it, which the kind's promise makes sound ([`crate::Located`]:
+    /// a reader computes the same value with the gift as without it). The giver's fact is
+    /// listed as read (`blaze_memo::read`), so a read list kept for a store names it.
+    pub fn located<K: crate::Located, T: std::any::Any>(self, db: &Db) -> Option<&T> {
         let kind = std::any::TypeId::of::<K>();
-        let found = self.slots_field(&*db).iter().find(|it| it.0 == kind).map(|it| it.1);
-        match found {
-            Some(slot) => {
-                if *slot.value(&*db) == value {
-                    return false;
-                }
-                slot.set_value(db).with_durability(durability).to(value);
-                // The one case that is a write of `CrateSlot` to the engine: a kind's first
-                // gift below makes the input (no write) and writes the crate's `slots`.
-                count_given(std::any::type_name::<K>());
-            }
-            None => {
-                let slot = CrateSlot::new(&*db, durability, value);
-                if let Some(group) = self.seal_group_of(&*db) {
-                    slot.seal_group(db, group);
-                }
-                let mut slots = self.slots_field(&*db).clone(); // clone: a crate's few slots, once a kind
-                slots.push((kind, slot)); // alloc: as above
-                // `HIGH`: the list only gains a slot, the first time a kind is given.
-                self.set_slots_field(db).with_durability(Durability::HIGH).to(slots);
-            }
-        }
-        true
+        let row = db.snap().table.located.get(self.key(db).0 as usize)?;
+        let (_, fact, value) = row.iter().find(|it| it.0 == kind)?;
+        blaze_memo::read(blaze_memo::Database::memo(db), *fact);
+        value.get::<T>()
     }
 
-    /// This crate's seal group (`blaze_query::db::seal`), made with the crate ([`seal_crate`]):
-    /// what an input made for one crate by a crate above base-db is given, so a write of it
-    /// opens that crate's group and no other.
-    pub fn seal_group_of(self, db: &Db) -> Option<SealGroup> {
-        db.crates_map().lock().seal.get(&self).copied()
-    }
-
-    /// The seal group of the source root this crate's root file is in (`Files::seal_root`):
-    /// the group the crate's own files are inputs of, which the crate's group opens with.
-    /// `None` when the root has none yet.
-    pub fn seal_root_group_of(self, db: &Db) -> Option<SealGroup> {
-        let root = db.file_source_root(self.data(db).root_file_id).source_root_id(db);
-        db.files().lock().seal_roots.get(&root).copied()
+    /// The world's key of this crate: what an edit names it by, the same in every snapshot.
+    pub fn key(self, db: &Db) -> CrateKey {
+        db.snap().table.key_of(self.gid().arena())
     }
 }
 
@@ -924,11 +898,10 @@ static GIVEN: [(std::sync::OnceLock<&'static str>, std::sync::atomic::AtomicU64)
     [const { (std::sync::OnceLock::new(), std::sync::atomic::AtomicU64::new(0)) }; GIVEN_KINDS];
 static GIVEN_PAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// One write of a slot of `kind`: a [`Crate::give`] that set a slot the crate already had,
-/// which is what the engine counts as a write of `CrateSlot` (making a slot is none). Every [`CrateSlot`] is one
-/// input to the query engine, whose count of writes is by input, so who wrote a slot (a
-/// plan's proc macros, a resolution blaze published) is told by its kind, counted here.
-fn count_given(kind: &'static str) {
+/// One write of a slot of `kind`: a gift ([`crate::Edit::give`]) that changed a slot the
+/// crate already had (a kind's first gift is none). Who wrote a slot (a plan's proc macros, a
+/// resolution blaze published) is told by its kind, counted here.
+pub(crate) fn count_given(kind: &'static str) {
     use std::sync::atomic::Ordering;
     // Bounded: `GIVEN_KINDS` entries.
     for (name, count) in &GIVEN {
@@ -941,7 +914,7 @@ fn count_given(kind: &'static str) {
 }
 
 /// Gives `each` every kind of crate slot written since the last take with its writes (the
-/// kind as `std::any::type_name` of [`Crate::give`]'s `K`), and counts from nothing again:
+/// kind as `std::any::type_name` of [`crate::Edit::give`]'s `K`), and counts from nothing again:
 /// what a build's account attributes its `CrateSlot` writes by (blaze-profile's `account`).
 pub fn take_given(mut each: impl FnMut(&'static str, u64)) {
     use std::sync::atomic::Ordering;
@@ -961,7 +934,7 @@ pub fn take_given(mut each: impl FnMut(&'static str, u64)) {
 /// What a crate above base-db gives one crate and base-db only keeps: a value of a type of
 /// that crate's, behind one field of the [`Crate`] it is of. Two are equal when they are the
 /// same value (the same allocation) or both nothing: whoever gives one compares what it
-/// holds first (a set of an equal value opens no view, `InputSetter::to`).
+/// holds first (a gift of an equal value changes nothing).
 #[derive(Clone, Default)]
 pub struct Given(Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>); // dyn: a type of a crate above this one, read back by that crate alone
 
@@ -997,53 +970,14 @@ impl Crate {
     /// A crate's content ID is of its root file's path, its [`BuiltCrateData`] (each
     /// dependency as its crate's content ID, so a crate's ID covers everything it depends on),
     /// its [`ExtraCrateData`], [`CrateWorkspaceData::content`], [`cfg_options_content`] and
-    /// [`Env::content`]. [`UniqueCrateData`] adds nothing: its root file is hashed as its
-    /// path, and its disambiguator is the crate's own data and cfg. A dependency is its
+    /// [`Env::content`]. A dependency is its
     /// crate's ID, its name and a byte each of prelude, sysroot and private. Its
     /// [`LintOptions`] follow, each flag's lint and level and then the cap.
     pub const DOMAIN: &'static str = "blaze v2 crate 7";
 
-    pub fn data<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> &'db BuiltCrateData {
-        self.data_field(db)
-    }
-
-    pub fn extra_data<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> &'db ExtraCrateData {
-        self.extra_data_field(db)
-    }
-
-    pub fn workspace_data<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> &'db Arc<CrateWorkspaceData> {
-        self.workspace_data_field(db)
-    }
-
-    pub fn cfg_options<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> &'db CfgOptions {
-        self.cfg_options_field(db)
-    }
-
-    pub fn env<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db Env {
-        self.env_field(db)
-    }
-
-    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
+    /// The crate's content ID ([`Crate::DOMAIN`]), as the world made it.
+    pub fn content<D: ?Sized + blaze_memo::Database>(self, db: &D) -> ContentId {
         self.content_field(db).id()
-    }
-
-    pub fn lint_options<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> &'db LintOptions {
-        self.lint_options_field(db)
     }
 
     /// The crate's name as Rust code and rustc know it: its `--crate-name`, the manifest's
@@ -1055,9 +989,9 @@ impl Crate {
     /// A crate set up with no name (a test fixture's, a detached file's) is an
     /// [`UnnamedCrate`]: what needs its name refuses, naming the crate and what needed it,
     /// never writes a stand-in (`std`, `?`, `{crate}`), which names another crate or none.
-    pub fn rust_name<'db, Db: ?Sized + blaze_query::db::Database>(
+    pub fn rust_name<'db, D: ?Sized + blaze_memo::Database>(
         self,
-        db: &'db Db,
+        db: &'db D,
     ) -> Result<&'db Symbol, UnnamedCrate> {
         match &self.extra_data(db).display_name {
             Some(name) => Ok(name.crate_name().symbol()),
@@ -1069,161 +1003,11 @@ impl Crate {
     /// [`rust_name`](Crate::rust_name), or for a crate with none the [`UnnamedCrate`] it is,
     /// by its content ID. Never the database's id, a number of one process, which would put
     /// that process into the keys and binaries a message is written into.
-    pub fn named<'db, Db: ?Sized + blaze_query::db::Database>(
+    pub fn named<'db, D: ?Sized + blaze_memo::Database>(
         self,
-        db: &'db Db,
+        db: &'db D,
     ) -> CrateNamed<'db> {
         CrateNamed(self.rust_name(db))
-    }
-
-    /// A crate outside a [`CrateGraphBuilder`], all its fields with `durability`. Its root
-    /// file must be in a source root already, and its dependencies made.
-    pub fn create(
-        db: &mut Db,
-        data: BuiltCrateData,
-        extra: ExtraCrateData,
-        workspace: Arc<CrateWorkspaceData>,
-        cfg: CfgOptions,
-        env: Env,
-        durability: Durability,
-    ) -> Crate {
-        Crate::create_noting(db, "Crate::create", data, extra, workspace, cfg, env, durability, false)
-    }
-
-    /// [`Crate::create`] for a crate that is put into the graph beside the crates there
-    /// ([`crate::add_crates`]), noted as that crate added ([`crate::Written::crates_added`]) and
-    /// not as a change of the whole graph: no crate there depends on it or was made from it, so
-    /// what the maintainers hold of every other crate stands. What a plan lowered into a front
-    /// end that holds other plans' crates makes its own with.
-    pub fn create_added(
-        db: &mut Db,
-        data: BuiltCrateData,
-        extra: ExtraCrateData,
-        workspace: Arc<CrateWorkspaceData>,
-        cfg: CfgOptions,
-        env: Env,
-        durability: Durability,
-    ) -> Crate {
-        Crate::create_noting(db, "Crate::create_added", data, extra, workspace, cfg, env, durability, true)
-    }
-
-    /// [`Crate::create`] as the write method `write`, noted as one crate added (`added`) or as
-    /// a change of the graph.
-    #[allow(clippy::too_many_arguments, reason = "a crate's fields, as `Crate::create` takes them")]
-    fn create_noting(
-        db: &mut Db,
-        write: &'static str,
-        data: BuiltCrateData,
-        extra: ExtraCrateData,
-        workspace: Arc<CrateWorkspaceData>,
-        cfg: CfgOptions,
-        env: Env,
-        durability: Durability,
-        added: bool,
-    ) -> Crate {
-        db.write(write, |db| {
-            let root = root_path(&*db, data.root_file_id);
-            // A library crate's fields are `HIGH` (`graph_durability`, `crate_durability`):
-            // what a sealed crate's cover reads may read nothing below it. A caller that
-            // makes one with less is named here, where the crate is made, since the cost
-            // shows far away (every summary of the crate's functions is made a row:
-            // agents/annoyances/proofs-1113-17.json).
-            if !matches!(data.origin, CrateOrigin::Local { .. }) && durability != Durability::HIGH {
-                tracing::warn!(
-                    target: "blaze",
-                    write,
-                    origin = ?data.origin,
-                    durability = ?durability,
-                    root = %root,
-                    "a library crate is made below HIGH"
-                );
-            }
-            let lints = LintOptions::default();
-            let content =
-                Crate::content_of(&*db, root, &data, &extra, &workspace, &cfg, &env, &lints);
-            let krate =
-                Crate::new(&*db, durability, data, extra, workspace, cfg, env, InputId(content));
-            db.crates_map().lock().note(krate, root, true);
-            // Not in the graph yet, so this moves no graph content and notes nothing of it.
-            db.set_crate_attr_files(krate, false, Some(durability));
-            let map = db.crates_map();
-            seal_crate(db, &mut map.lock(), krate);
-            db.note(match added {
-                true => Note::CrateAdded(krate),
-                false => Note::Crates,
-            });
-            krate
-        })
-    }
-
-    pub fn set_data(self, db: &mut Db, data: BuiltCrateData) {
-        db.write_crates("Crate::set_data", |db| {
-            self.set_data_field(db).to(data);
-            db.set_crate_attr_files(self, false, None);
-            seal_crate_depends(db, self);
-            refresh_contents(db, self);
-        })
-    }
-
-    pub fn set_extra_data(self, db: &mut Db, extra: ExtraCrateData) {
-        db.write_crates("Crate::set_extra_data", |db| {
-            self.set_extra_data_field(db).to(extra);
-            refresh_contents(db, self);
-        })
-    }
-
-    pub fn set_workspace_data(self, db: &mut Db, workspace: Arc<CrateWorkspaceData>) {
-        db.write_crates("Crate::set_workspace_data", |db| {
-            self.set_workspace_data_field(db).to(workspace);
-            refresh_contents(db, self);
-        })
-    }
-
-    pub fn set_cfg_options(self, db: &mut Db, cfg: CfgOptions) {
-        db.write_crates("Crate::set_cfg_options", |db| {
-            self.set_cfg_options_field(db).to(cfg);
-            refresh_contents(db, self);
-        })
-    }
-
-    pub fn set_env(self, db: &mut Db, env: Env) {
-        db.write_crates("Crate::set_env", |db| {
-            self.set_env_field(db).to(env);
-            refresh_contents(db, self);
-        })
-    }
-
-    pub fn set_lint_options(self, db: &mut Db, options: LintOptions) {
-        db.write_crates("Crate::set_lint_options", |db| {
-            self.set_lint_options_field(db).to(options);
-            refresh_contents(db, self);
-        })
-    }
-
-    /// `root` is the path of `data.root_file_id` ([`root_path`]).
-    fn content_of(
-        db: &Db,
-        root: &VfsPath,
-        data: &BuiltCrateData,
-        extra: &ExtraCrateData,
-        workspace: &CrateWorkspaceData,
-        cfg: &CfgOptions,
-        env: &Env,
-        lints: &LintOptions,
-    ) -> ContentId {
-        let as_it_is = |bytes: &[u8]| -> Vec<u8> { bytes.to_vec() }; // alloc: a path, once per crate content ID (setup)
-        Crate::content_with(
-            Crate::DOMAIN,
-            root,
-            data,
-            extra,
-            workspace,
-            cfg,
-            env,
-            lints,
-            &as_it_is,
-            &|dep| dep.content(db),
-        )
     }
 
     /// The domain of [`Crate::ported_content`].
@@ -1233,14 +1017,14 @@ impl Crate {
     /// write paths ([`crate::Files::ported`]: its root file's path, the directory its proc
     /// macros run in, each variable's value), and each crate it depends on as `dep` gives it
     /// (its own ported content, the caller's memo). Everything else as the content ID has it,
-    /// from the one function both are made by ([`Crate::content_with`]), so a field one covers
+    /// from the one function both are made by ([`content_with`]), so a field one covers
     /// the other does. What a key that must be the same for the same sources in another
     /// directory holds of a crate's settings (docs/v2/plan/design/store.md, "Content keys");
     /// what reads a path's own bytes (`env!("CARGO_MANIFEST_DIR")`) is the reader's to key.
     pub fn ported_content(self, db: &Db, dep: &dyn Fn(Crate) -> ContentId) -> ContentId {
         let data = self.data(db);
         let files = db.files();
-        Crate::content_with(
+        content_with(
             Crate::PORTED_DOMAIN,
             root_path(db, data.root_file_id),
             data,
@@ -1253,68 +1037,185 @@ impl Crate {
             dep,
         )
     }
+}
 
-    /// What [`Crate::content_of`] and [`Crate::ported_content`] hash: `text` writes what may
-    /// hold a path, `dep` gives each crate depended on.
-    fn content_with(
-        domain: &'static str,
-        root: &VfsPath,
-        data: &BuiltCrateData,
-        extra: &ExtraCrateData,
-        workspace: &CrateWorkspaceData,
-        cfg: &CfgOptions,
-        env: &Env,
-        lints: &LintOptions,
-        text: &dyn Fn(&[u8]) -> Vec<u8>,
-        dep_content: &dyn Fn(Crate) -> ContentId,
-    ) -> ContentId {
-        let mut hasher = Hasher::new(domain);
-        hasher.part(&text(&content::path_key(root)));
-        hasher.update(&(data.edition.number() as u64).to_le_bytes());
-        content::len(&mut hasher, data.dependencies.len());
-        for dep in &data.dependencies {
-            hasher.id(&dep_content(dep.crate_id)).part(dep.name.as_str().as_bytes()).update(&[
-                dep.prelude as u8,
-                dep.sysroot as u8,
-                dep.private as u8,
-            ]);
-        }
-        data.origin.hash_into(&mut hasher);
-        content::len(&mut hasher, data.crate_attrs.len());
-        for attr in &data.crate_attrs {
-            hasher.part(attr.as_bytes());
-        }
-        hasher
-            .update(&[data.target_kind.tag(), data.manifest_kind.tag(), data.crate_types.bits()])
-            .part(&text(data.proc_macro_cwd.as_str().as_bytes()))
-            .opt_part(extra.version.as_deref());
-        match &extra.display_name {
-            None => hasher.update(&[0]),
-            Some(name) => hasher
-                .update(&[1])
-                .part(name.crate_name().as_str().as_bytes())
-                .part(name.canonical_name().as_str().as_bytes()),
-        };
-        match &extra.potential_cfg_options {
-            None => hasher.update(&[0]),
-            Some(cfg) => hasher.update(&[1]).id(&cfg_options_content(cfg)),
-        };
-        extra.built_for.hash_into(&mut hasher);
-        content::len(&mut hasher, extra.build_script_runs.len());
-        for run in &extra.build_script_runs {
-            hasher.part(&text(run.as_bytes()));
-        }
-        hasher.id(&workspace.content()).id(&cfg_options_content(cfg)).id(&env.content_with(text));
-        content::len(&mut hasher, lints.opts.len());
-        for (lint, level) in &lints.opts {
-            hasher.part(lint.as_bytes()).update(&[*level as u8]);
-        }
-        match lints.cap {
-            None => hasher.update(&[0]),
-            Some(cap) => hasher.update(&[1, cap as u8]),
-        };
-        hasher.finish()
+/// [`Crate::content`] of a crate the world holds by key: `root` is the path of
+/// `data.root_file_id`, `dep` gives each dependency's content ID by its key. The same bytes
+/// as a snapshot's crate of the same fields hashes to ([`content_with`] for both).
+#[allow(clippy::too_many_arguments, reason = "a crate's fields, as the world's entry holds them")]
+pub(crate) fn keyed_content(
+    root: &VfsPath,
+    data: &CrateData<CrateKey>,
+    extra: &ExtraCrateData,
+    workspace: &CrateWorkspaceData,
+    cfg: &CfgOptions,
+    env: &Env,
+    lints: &LintOptions,
+    dep: &dyn Fn(CrateKey) -> ContentId,
+) -> ContentId {
+    // A path, once per crate content ID hashed (a field or a dependency's content moved).
+    let as_it_is = |bytes: &[u8]| -> Vec<u8, Global> { bytes.to_vec_in(Global) };
+    content_with(Crate::DOMAIN, root, data, extra, workspace, cfg, env, lints, &as_it_is, dep)
+}
+
+/// What [`keyed_content`] and [`Crate::ported_content`] hash, of a crate whose dependencies are
+/// `Dep`s (a key of the world's, or a snapshot's [`Crate`]): `text` writes what may hold a
+/// path, `dep_content` gives each crate depended on. Nothing of `Dep` itself is hashed.
+#[allow(clippy::too_many_arguments, reason = "a crate's fields and how to write two of them")]
+fn content_with<Dep: Copy>(
+    domain: &'static str,
+    root: &VfsPath,
+    data: &CrateData<Dep>,
+    extra: &ExtraCrateData,
+    workspace: &CrateWorkspaceData,
+    cfg: &CfgOptions,
+    env: &Env,
+    lints: &LintOptions,
+    text: &dyn Fn(&[u8]) -> Vec<u8>,
+    dep_content: &dyn Fn(Dep) -> ContentId,
+) -> ContentId {
+    let mut hasher = Hasher::new(domain);
+    hasher.part(&text(&content::path_key(root)));
+    hasher.update(&(data.edition.number() as u64).to_le_bytes());
+    content::len(&mut hasher, data.dependencies.len());
+    for dep in &data.dependencies {
+        hasher.id(&dep_content(dep.crate_id)).part(dep.name.as_str().as_bytes()).update(&[
+            dep.prelude as u8,
+            dep.sysroot as u8,
+            dep.private as u8,
+        ]);
     }
+    data.origin.hash_into(&mut hasher);
+    content::len(&mut hasher, data.crate_attrs.len());
+    for attr in &data.crate_attrs {
+        hasher.part(attr.as_bytes());
+    }
+    hasher
+        .update(&[data.target_kind.tag(), data.manifest_kind.tag(), data.crate_types.bits()])
+        .part(&text(data.proc_macro_cwd.as_str().as_bytes()))
+        .opt_part(extra.version.as_deref());
+    match &extra.display_name {
+        None => hasher.update(&[0]),
+        Some(name) => hasher
+            .update(&[1])
+            .part(name.crate_name().as_str().as_bytes())
+            .part(name.canonical_name().as_str().as_bytes()),
+    };
+    match &extra.potential_cfg_options {
+        None => hasher.update(&[0]),
+        Some(cfg) => hasher.update(&[1]).id(&cfg_options_content(cfg)),
+    };
+    extra.built_for.hash_into(&mut hasher);
+    content::len(&mut hasher, extra.build_script_runs.len());
+    for run in &extra.build_script_runs {
+        hasher.part(&text(run.as_bytes()));
+    }
+    hasher.id(&workspace.content()).id(&cfg_options_content(cfg)).id(&env.content_with(text));
+    content::len(&mut hasher, lints.opts.len());
+    for (lint, level) in &lints.opts {
+        hasher.part(lint.as_bytes()).update(&[*level as u8]);
+    }
+    match lints.cap {
+        None => hasher.update(&[0]),
+        Some(cap) => hasher.update(&[1, cap as u8]),
+    };
+    hasher.finish()
+}
+
+/// The domain of a crate's item key ([`crate_item_key`]): blaze-items' `CRATE_DOMAIN`, where
+/// the key's preimage is described. Persisted item keys are of it: changing it moves them all.
+pub const CRATE_ITEM_KEY_DOMAIN: &str = "blaze v2 crate key 5";
+
+/// A crate's item key, blaze-items' `crate_key`: its content, never its id or anything that
+/// holds a path, so one crate has one key across checkouts. The one home of its hash: a
+/// snapshot's crate (`Dep` = [`Crate`]) and the world's (`Dep` = [`CrateKey`], for the session
+/// list [`CrateItemKeys`]) both come here, with `dep_key` giving each dependency's own.
+///
+/// What it is of, and why (blaze-items' module doc has the rest): the display name and
+/// version; the origin; what it is built for (two builds of one package and cfg for the host,
+/// a target or the wasm proc macros are two crates) and its build script runs (runs apart in
+/// their profile are told apart by a cfg atom); which target of its package it is (the
+/// manifest's target kind and what it is built as); its edition, `-Z crate-attr`s and each
+/// dependency by name, flags and key; and its cfg atoms, sorted as byte strings.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a cfg atom's end is a u32 offset into the crate's cfg bytes, and nothing checks a crate's cfg is under 4 GiB: a larger one needs a typed refusal where the crate is loaded"
+)]
+pub fn crate_item_key<Dep: Copy>(
+    data: &CrateData<Dep>,
+    extra: &ExtraCrateData,
+    cfg: &CfgOptions,
+    dep_key: &dyn Fn(Dep) -> ContentId,
+) -> ContentId {
+    use blaze_format::cursor::Put as _;
+    use blaze_mem::scratch;
+    let mut h = Hasher::new(CRATE_ITEM_KEY_DOMAIN);
+    h.opt_part(extra.display_name.as_ref().map(|name| name.canonical_name().as_str()))
+        .opt_part(extra.version.as_deref());
+    data.origin.hash_into(&mut h);
+    // What it is built for: the host, a target or the wasm proc macros. Two builds of one
+    // package and cfg for two of these (std for the host and for `--target` of the host's own
+    // triple, or for `wasm32-wasip1` and its proc macros) differ in what the key leaves out,
+    // their `OUT_DIR` and build script runs, so they are two crates. Within one of these, the
+    // runs of one build script apart only in their `OUT_DIR` are one run in the front end, so
+    // their crates are one; runs apart in their profile's `OPT_LEVEL` or `DEBUG` too (a
+    // release build's host package as a normal and as a `build-override` dependency) may give
+    // other output, so their crates are two, told apart by the cfg atom
+    // `blaze::build_script_profile` below (`blaze_lower`'s `run_classes`).
+    extra.built_for.hash_into(&mut h);
+    h.update(&(extra.build_script_runs.len() as u64).to_le_bytes());
+    for run in &extra.build_script_runs {
+        h.part(run.as_bytes());
+    }
+    // Which of its package's targets it is, as cargo's units tell them apart: the kind of
+    // the manifest's target with its name above, and what it is built as (`--test` makes any
+    // target a test). An example and an integration test of one name are two crates, both
+    // `Test` under `--all-targets`.
+    h.update(&[data.target_kind.tag(), data.manifest_kind.tag()]);
+    // What a path in it resolves to: its edition, its `-Z crate-attr`s and each dependency by
+    // its name, its flags and its own key. One package of one cfg built twice in one graph (a
+    // build dependency reached from the host side and the target side) has two `Crate`s only
+    // when these differ, and its items then name different things.
+    h.update(&[data.edition as u8]);
+    h.update(&(data.crate_attrs.len() as u64).to_le_bytes());
+    for attr in data.crate_attrs.iter() {
+        h.part(attr.as_bytes());
+    }
+    h.update(&(data.dependencies.len() as u64).to_le_bytes());
+    for dep in &data.dependencies {
+        h.part(dep.name.symbol().as_str().as_bytes())
+            .update(&[u8::from(dep.is_prelude()), u8::from(dep.is_sysroot()), u8::from(dep.is_private())])
+            .id(&dep_key(dep.crate_id));
+    }
+    // Every atom's bytes in one buffer, sorted as byte strings; an atom is its start and end
+    // in the buffer, packed into a `u64`.
+    let range = |atom: u64| (atom >> 32) as usize..(atom as u32) as usize;
+    scratch::with_bytes(|bytes| {
+        scratch::with_u64s(|atoms| {
+            for atom in cfg {
+                let start = bytes.len();
+                match atom {
+                    cfg::CfgAtom::Flag(name) => {
+                        bytes.push(0);
+                        bytes.put_bytes_u64(name.as_str().as_bytes());
+                    }
+                    cfg::CfgAtom::KeyValue { key, value } => {
+                        bytes.push(1);
+                        bytes.put_bytes_u64(key.as_str().as_bytes());
+                        bytes.put_bytes_u64(value.as_str().as_bytes());
+                    }
+                }
+                let end = u32::try_from(bytes.len()).expect("base-db: a crate's cfg under 4 GiB");
+                atoms.push(u64::from(start as u32) << 32 | u64::from(end));
+            }
+            atoms.sort_unstable_by(|&a, &b| bytes[range(a)].cmp(&bytes[range(b)]));
+            h.update(&(atoms.len() as u64).to_le_bytes());
+            for &atom in atoms.iter() {
+                h.part(&bytes[range(atom)]);
+            }
+        })
+    });
+    h.finish()
 }
 
 /// The domain of each hash [`Crate::settings_parts`] gives: of a message, never of a key.
@@ -1437,63 +1338,19 @@ fn root_path(db: &Db, file: FileId) -> &VfsPath {
     }
 }
 
-/// Sets the content ID of `krate`, and of every crate that depends on it whose ID changes
-/// with it, after one of its fields was set.
-fn refresh_contents(db: &mut Db, krate: Crate) {
-    if !refresh_content(db, krate) {
-        return;
-    }
-    let mut changed = HashSet::new_in(Global);
-    changed.insert(krate);
-    // In topological order: a crate's dependencies are refreshed before it.
-    for dependent in all_crates(&*db).iter().copied() {
-        if dependent != krate
-            && dependent.data(&*db).dependencies.iter().any(|dep| changed.contains(&dep.crate_id))
-            && refresh_content(db, dependent)
-        {
-            changed.insert(dependent);
-        }
-    }
-    refresh_crate_graph_content(db);
-}
-
-/// Sets `krate`'s content ID from its fields as they are; whether it changed.
-fn refresh_content(db: &mut Db, krate: Crate) -> bool {
-    let root = root_path(&*db, krate.data(&*db).root_file_id);
-    let content = Crate::content_of(
-        &*db,
-        root,
-        krate.data(&*db),
-        krate.extra_data(&*db),
-        krate.workspace_data(&*db),
-        krate.cfg_options(&*db),
-        krate.env(&*db),
-        krate.lint_options(&*db),
-    );
-    let changed = krate.content(&*db) != content;
-    db.crates_map().lock().note(krate, root, changed);
-    if changed {
-        krate.set_content_field(db).to(InputId(content));
-    }
-    changed
-}
-
 #[cfg(test)]
 impl Crate {
-    /// The content ID hashing the crate's fields as they are now gives.
+    /// The content ID hashing the crate's fields as the snapshot holds them gives: what the
+    /// world's ([`Crate::content`]) must equal.
     pub(crate) fn content_from_fields(self, db: &Db) -> ContentId {
         let data = self.data(db);
         let (extra, workspace) = (self.extra_data(db), self.workspace_data(db));
         let root = root_path(db, data.root_file_id);
         let (cfg, env, lints) = (self.cfg_options(db), self.env(db), self.lint_options(db));
-        Crate::content_of(db, root, data, extra, workspace, cfg, env, lints)
+        let as_it_is = |bytes: &[u8]| -> Vec<u8, Global> { bytes.to_vec_in(Global) };
+        let dep = |dep: Crate| dep.content(db);
+        content_with(Crate::DOMAIN, root, data, extra, workspace, cfg, env, lints, &as_it_is, &dep)
     }
-}
-
-/// How many crate content IDs base-db has made in `db`.
-#[cfg(test)]
-pub(crate) fn crates_hashed(db: &Db) -> u64 {
-    db.crates_map().lock().clock
 }
 
 impl Crate {
@@ -1503,6 +1360,20 @@ impl Crate {
     /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
     pub fn transitive_deps(self, db: &Db) -> &[Crate] {
         transitive_deps(db, self)
+    }
+
+    /// The crate and every crate that depends on it, directly or not, in the order a walk from
+    /// it first reaches them, written into `out` (cleared first): the caller's buffer, so a
+    /// warm one makes a call allocate nothing. Not memoized, and cannot be: a query keyed by
+    /// the crate lives in its arena, which may read only its dependencies and the session
+    /// (`blaze_memo`'s declared borrows), never a dependent. A walk of the snapshot's list
+    /// each call (O(crates + edges)), its scratch in a frame, so a reader of it reads every
+    /// crate's data.
+    ///
+    /// **Warning**: do not use this in `hir-*` crates! It kills incrementality across crate
+    /// metadata modifications.
+    pub fn transitive_rev_deps<A: Allocator>(self, db: &Db, out: &mut Vec<Crate, A>) {
+        transitive_rev_deps(db, self, out);
     }
 
     /// Whether a crate that depends on this one loads its macros alone: a proc-macro crate.
@@ -1523,17 +1394,21 @@ impl Crate {
         transitive_loaded_deps(db, self)
     }
 
-    /// The crate and every crate that depends on it, directly or not, in the order a walk from
-    /// it first reaches them.
-    ///
-    /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
-    pub fn transitive_rev_deps(self, db: &Db) -> &[Crate] {
-        transitive_rev_deps(db, self)
+    /// The crate's item key ([`crate_item_key`], each dependency by its own): what names this
+    /// crate in bytes another database reads, the same in every database of the same crate.
+    /// blaze-items' `crate_key` is this.
+    pub fn item_key(self, db: &Db) -> ContentId {
+        item_key(db, self)
     }
 }
 
-#[blaze_query::tracked(returns(deref))]
-fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
+#[blaze_memo::tracked(returns(copy))]
+fn item_key(db: &Db, krate: Crate) -> ContentId {
+    crate_item_key(krate.data(db), krate.extra_data(db), krate.cfg_options(db), &|dep: Crate| item_key(db, dep))
+}
+
+#[blaze_memo::tracked(returns(copy))]
+fn transitive_deps<'db>(db: &'db Db, krate: Crate) -> &'db [Crate] {
     blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let mut worklist = Vec::new_in(frame);
         worklist.push(krate);
@@ -1547,12 +1422,12 @@ fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
             deps.push(krate);
             worklist.extend(krate.data(db).dependencies.iter().map(|dep| dep.crate_id));
         }
-        Box::from(&deps[..]) // alloc: the memo's value at its size.
+        blaze_memo::keep_slice(db.memo(), &deps)
     })
 }
 
-#[blaze_query::tracked(returns(deref))]
-fn transitive_loaded_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
+#[blaze_memo::tracked(returns(copy))]
+fn transitive_loaded_deps<'db>(db: &'db Db, krate: Crate) -> &'db [Crate] {
     blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let mut worklist = Vec::new_in(frame);
         worklist.push(krate);
@@ -1573,12 +1448,13 @@ fn transitive_loaded_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
                     .filter(|dep| !dep.loads_only_macros(db)),
             );
         }
-        Box::from(&deps[..]) // alloc: the memo's value at its size.
+        blaze_memo::keep_slice(db.memo(), &deps)
     })
 }
 
-#[blaze_query::tracked(returns(deref))]
-fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
+/// [`Crate::transitive_rev_deps`]: a plain walk, outside any query run, its scratch in a frame
+/// and its answer written into the caller's `out`.
+fn transitive_rev_deps<A: Allocator>(db: &Db, krate: Crate, out: &mut Vec<Crate, A>) {
     blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let all = all_crates(db);
         // The reverse edges as CSR: for each crate (by its place in `all`), the crates that
@@ -1620,377 +1496,9 @@ fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
                 }
             }
         }
-        Box::from(&order[..]) // alloc: the memo's value at its size.
+        out.clear();
+        out.extend_from_slice(&order);
     })
-}
-
-/// The mapping from [`UniqueCrateData`] to their [`Crate`] input, and what each crate's content
-/// ID was last made from. Read and written only by the setters, on `&mut` of the database
-/// ([`CrateGraphBuilder::set_in_db`] locks it once for the whole graph); no query reads it.
-#[derive(Debug)]
-pub struct CratesMap(Lock<Crates>);
-
-impl Default for CratesMap {
-    fn default() -> CratesMap {
-        CratesMap(Lock::new("db.crates_map", Crates::default()))
-    }
-}
-
-impl CratesMap {
-    #[track_caller]
-    fn lock(&self) -> LockGuard<'_, Crates> {
-        self.0.lock()
-    }
-}
-
-#[derive(Debug, Default)]
-struct Crates {
-    /// Each crate's seal group ([`seal_crate`]).
-    seal: HashMap<Crate, SealGroup, Global>,
-    by_data: HashMap<UniqueCrateData, Crate, Global>,
-    /// For each crate whose content ID base-db made, when and from which root path: what lets
-    /// [`CrateGraphBuilder::set_in_db`] keep the ID of a crate whose fields are what they were
-    /// without hashing it.
-    stamps: HashMap<Crate, Stamp, Global>,
-    /// Ticks once per content ID made.
-    clock: u64,
-}
-
-#[derive(Debug)]
-struct Stamp {
-    /// When the crate's content ID was last made.
-    hashed: u64,
-    /// When it last changed: a crate hashed before this, of a crate depending on this one, is
-    /// out of date.
-    changed: u64,
-    /// The path of the root file it was made with ([`root_path`]).
-    root: VfsPath,
-}
-
-impl Crates {
-    /// Notes that `krate`'s content ID was just made, with `root` its root file's path, and
-    /// whether it `changed`. Returns when it last changed.
-    fn note(&mut self, krate: Crate, root: &VfsPath, changed: bool) -> u64 {
-        self.clock += 1;
-        let clock = self.clock;
-        match self.stamps.entry(krate) {
-            Entry::Occupied(mut entry) => {
-                let stamp = entry.get_mut();
-                stamp.hashed = clock;
-                if changed {
-                    stamp.changed = clock;
-                }
-                if stamp.root != *root {
-                    // clone: a crate's root path, when it is first hashed or its path moved (setup).
-                    stamp.root = root.clone();
-                }
-                stamp.changed
-            }
-            Entry::Vacant(entry) => {
-                // clone: as above.
-                entry.insert(Stamp { hashed: clock, changed: clock, root: root.clone() });
-                clock
-            }
-        }
-    }
-
-    /// When `krate`'s content ID last changed, if it was made from `root` after every
-    /// dependency's last changed (`deps_changed`, the latest of them): then it is what hashing
-    /// the crate again would give, as long as its fields are what they were.
-    fn fresh(&self, krate: Crate, root: &VfsPath, deps_changed: u64) -> Option<u64> {
-        let stamp = self.stamps.get(&krate)?;
-        (stamp.root == *root && deps_changed < stamp.hashed).then_some(stamp.changed)
-    }
-}
-
-/// [`CrateGraphBuilder::set_in_db`]'s walk of the graph, each crate after its dependencies.
-struct Walk<'a, 'f> {
-    graph: &'a CrateGraphBuilder,
-    crates: &'a mut Crates,
-    all: FxIndexSet<Crate>,
-    visited: CratesIdMap,
-    root_files: HashSet<FileId, Global>,
-    /// Each builder crate walked, by its index: its crate, and when that crate's content ID
-    /// last changed ([`Stamp::changed`]).
-    done: &'f mut [Option<(Crate, u64)>],
-    frame: &'f Frame,
-}
-
-impl Walk<'_, '_> {
-    fn go(&mut self, db: &mut Db, source: CrateBuilderId) -> (Crate, u64) {
-        let at = source.into_raw().into_u32() as usize;
-        if let Some(done) = self.done[at] {
-            return done;
-        }
-        let graph = self.graph;
-        let krate = &graph[source];
-        let mut deps = Vec::with_capacity_in(krate.basic.dependencies.len(), self.frame);
-        let mut deps_changed = 0;
-        for dep in &krate.basic.dependencies {
-            let (id, changed) = self.go(db, dep.crate_id);
-            deps.push(id);
-            deps_changed = deps_changed.max(changed);
-        }
-        let root_file_id = krate.basic.root_file_id;
-        let key = match self.root_files.insert(root_file_id) {
-            true => UniqueCrateData { root_file_id, disambiguator: None },
-            false => UniqueCrateData {
-                root_file_id,
-                // alloc: a second crate on one root file is keyed by its data (setup).
-                disambiguator: Some(Box::new((
-                    built_data(krate, &deps),
-                    krate.cfg_options.to_hashable(),
-                ))),
-            },
-        };
-        let (input, changed) = match self.crates.by_data.get(&key) {
-            Some(&old) => (old, self.update(db, old, krate, &deps, deps_changed)),
-            None => {
-                let made = self.create(db, krate, &deps);
-                self.crates.by_data.insert(key, made.0);
-                made
-            }
-        };
-        let durability = graph_durability(&*db, krate);
-        db.set_crate_attr_files(input, false, Some(durability));
-        self.all.insert(input);
-        self.visited.insert(source, input);
-        self.done[at] = Some((input, changed));
-        (input, changed)
-    }
-
-    /// Sets each field of `old` that differs from `krate`'s (`deps` its dependencies' crates),
-    /// then its content ID unless it is fresh ([`Crates::fresh`]). Returns when the content
-    /// ID last changed.
-    fn update(
-        &mut self,
-        db: &mut Db,
-        old: Crate,
-        krate: &CrateBuilder,
-        deps: &[Crate],
-        deps_changed: u64,
-    ) -> u64 {
-        let durability = graph_durability(&*db, krate);
-        let mut set = false;
-        if !same_data(&krate.basic, deps, old.data(db)) {
-            old.set_data_field(db).with_durability(durability).to(built_data(krate, deps));
-            set = true;
-        }
-        if krate.extra != *old.extra_data(db) {
-            // clone: only a field that changed is set (setup).
-            old.set_extra_data_field(db).with_durability(durability).to(krate.extra.clone());
-            set = true;
-        }
-        if krate.cfg_options != *old.cfg_options(db) {
-            // clone: only a field that changed is set (setup).
-            old.set_cfg_options_field(db).with_durability(durability).to(krate.cfg_options.clone());
-            set = true;
-        }
-        if krate.env != *old.env(db) {
-            // clone: only a field that changed is set (setup).
-            old.set_env_field(db).with_durability(durability).to(krate.env.clone());
-            set = true;
-        }
-        if krate.ws_data != *old.workspace_data(db) {
-            // clone: only a field that changed is set (setup).
-            old.set_workspace_data_field(db).with_durability(durability).to(krate.ws_data.clone());
-            set = true;
-        }
-        let root = root_path(&*db, krate.basic.root_file_id);
-        if !set && let Some(changed) = self.crates.fresh(old, root, deps_changed) {
-            return changed;
-        }
-        let content = Crate::content_of(
-            &*db,
-            root,
-            old.data(&*db),
-            old.extra_data(&*db),
-            old.workspace_data(&*db),
-            old.cfg_options(&*db),
-            old.env(&*db),
-            old.lint_options(&*db),
-        );
-        let changed = content != old.content(&*db);
-        let stamp = self.crates.note(old, root, changed);
-        if changed {
-            old.set_content_field(db).with_durability(durability).to(InputId(content));
-        }
-        stamp
-    }
-
-    /// A crate made of `krate` (`deps` its dependencies' crates), and when its content ID
-    /// changed: now.
-    fn create(&mut self, db: &mut Db, krate: &CrateBuilder, deps: &[Crate]) -> (Crate, u64) {
-        let data = built_data(krate, deps);
-        let root = root_path(&*db, data.root_file_id);
-        let content = Crate::content_of(
-            &*db,
-            root,
-            &data,
-            &krate.extra,
-            &krate.ws_data,
-            &krate.cfg_options,
-            &krate.env,
-            &LintOptions::default(),
-        );
-        let input = Crate::new(
-            &*db,
-            graph_durability(&*db, krate),
-            data,
-            // clone: a new crate's fields (setup).
-            krate.extra.clone(),
-            // clone: a new crate's fields (setup).
-            krate.ws_data.clone(),
-            // clone: a new crate's fields (setup).
-            krate.cfg_options.clone(),
-            // clone: a new crate's fields (setup).
-            krate.env.clone(),
-            InputId(content),
-        );
-        let changed = self.crates.note(input, root, true);
-        seal_crate(db, &mut *self.crates, input);
-        (input, changed)
-    }
-}
-
-/// Makes `krate`'s seal group (`blaze_query::db::seal`) as the crate is made: the crate's own
-/// fields are its inputs; it depends on its dependencies' groups and on its source root's,
-/// and it opens with its source root's, so an edit of one of its files opens it at the write.
-/// A workspace member's group is sealed after two builds that wrote nothing of it, any other
-/// crate's at once (`SealKind`).
-///
-/// A crate whose dependencies are set again later keeps the group, with the new ones added
-/// ([`seal_crate_depends`]).
-fn seal_crate(db: &mut Db, crates: &mut Crates, krate: Crate) {
-    let data = krate.data(&*db);
-    let kind = match data.origin.is_local() {
-        true => SealKind::Local,
-        false => SealKind::Library,
-    };
-    let root_file = data.root_file_id;
-    let deps: Vec<SealGroup> = // alloc: a crate's dependencies' groups, once a crate
-        data.dependencies.iter().filter_map(|dep| crates.seal.get(&dep.crate_id).copied()).collect();
-    let name = match krate.rust_name(&*db) {
-        Ok(name) => name.as_str().to_owned(), // alloc: a group's name, once a crate
-        Err(_) => String::from("a crate with no name"), // alloc: as above
-    };
-    let files = db.shared_files();
-    let root = {
-        let mut writer = files.lock();
-        let root = files.file_source_root(&*db, root_file).source_root_id(&*db);
-        files.seal_root(&mut writer, db, root)
-    };
-    let storage = db.storage_mut();
-    let group = storage.seal_group(&name, kind, &deps);
-    if let Some(root) = root {
-        storage.seal_group_opens_with(root, group);
-    }
-    krate.seal_group(db, group);
-    crates.seal.insert(krate, group);
-}
-
-/// Adds the groups of `krate`'s dependencies, as its data names them now, to what its seal
-/// group depends on: after its data was set again.
-fn seal_crate_depends(db: &mut Db, krate: Crate) {
-    let map = db.crates_map();
-    let crates = map.lock();
-    let Some(&group) = crates.seal.get(&krate) else { return };
-    let deps: Vec<SealGroup> = krate // alloc: a crate's dependencies' groups, at a change of them
-        .data(&*db)
-        .dependencies
-        .iter()
-        .filter_map(|dep| crates.seal.get(&dep.crate_id).copied())
-        .collect();
-    drop(crates);
-    db.storage_mut().seal_group_depends(group, &deps);
-}
-
-/// The kind of a crate's inputs when a [`CrateGraphBuilder`] makes it: `HIGH` for a library's
-/// (the toolchain's crates, registry and git dependencies), as blaze-lower states them
-/// ([`Crate::create`]), so [`crate::crate_durability`] of such a crate reads nothing below
-/// `HIGH`; `MEDIUM` for a workspace crate's, its structure. A library crate is one whose root
-/// file is in a library root (what a sealed crate's cover reads, which may read nothing below
-/// `HIGH`) or whose origin is not `Local` (what [`crate::crate_durability`] decides by); the
-/// two agree for every crate blaze-lower makes, and where a hand-made graph has them disagree
-/// the higher kind is taken, which costs a verify and is never stale.
-fn graph_durability(db: &Db, krate: &CrateBuilder) -> Durability {
-    let library_origin = match krate.basic.origin {
-        CrateOrigin::Local { .. } => false,
-        CrateOrigin::Library { .. } | CrateOrigin::Lang(_) | CrateOrigin::Rustc { .. } => true,
-    };
-    match library_origin || db.files().in_library_root(db, krate.basic.root_file_id) {
-        true => Durability::HIGH,
-        false => Durability::MEDIUM,
-    }
-}
-
-/// `krate`'s data with `deps` its dependencies' crates: built only for a crate that is new or
-/// whose data changed.
-fn built_data(krate: &CrateBuilder, deps: &[Crate]) -> BuiltCrateData {
-    let basic = &krate.basic;
-    let dependencies = basic
-        .dependencies
-        .iter()
-        .zip(deps)
-        .map(|(dep, &crate_id)| BuiltDependency {
-            crate_id,
-            // clone: a dependency's name, in the data of a crate that changed (setup).
-            name: dep.name.clone(),
-            prelude: dep.prelude,
-            sysroot: dep.sysroot,
-            private: dep.private,
-        })
-        // alloc: as above.
-        .collect();
-    BuiltCrateData {
-        root_file_id: basic.root_file_id,
-        edition: basic.edition,
-        dependencies,
-        // clone: as above.
-        origin: basic.origin.clone(),
-        // clone: as above.
-        crate_attrs: basic.crate_attrs.clone(),
-        target_kind: basic.target_kind,
-        manifest_kind: basic.manifest_kind,
-        crate_types: basic.crate_types,
-        // clone: as above.
-        proc_macro_cwd: basic.proc_macro_cwd.clone(),
-        sealed: basic.sealed,
-    }
-}
-
-/// Whether `old` is [`built_data`] of `new` and `deps`, told without building it.
-fn same_data(new: &CrateDataBuilder, deps: &[Crate], old: &BuiltCrateData) -> bool {
-    let CrateData {
-        root_file_id,
-        edition,
-        dependencies,
-        origin,
-        crate_attrs,
-        target_kind,
-        manifest_kind,
-        crate_types,
-        proc_macro_cwd,
-        sealed,
-    } = new;
-    *root_file_id == old.root_file_id
-        && *edition == old.edition
-        && *target_kind == old.target_kind
-        && *manifest_kind == old.manifest_kind
-        && *crate_types == old.crate_types
-        && *origin == old.origin
-        && *crate_attrs == old.crate_attrs
-        && *proc_macro_cwd == old.proc_macro_cwd
-        && *sealed == old.sealed
-        && dependencies.len() == old.dependencies.len()
-        && dependencies.iter().zip(deps).zip(&old.dependencies).all(|((new, &crate_id), old)| {
-            let Dependency { crate_id: _, name, prelude, sysroot, private } = new;
-            crate_id == old.crate_id
-                && *name == old.name
-                && *prelude == old.prelude
-                && *sysroot == old.sysroot
-                && *private == old.private
-        })
 }
 
 impl CrateGraphBuilder {
@@ -2076,51 +1584,6 @@ impl CrateGraphBuilder {
 
         self.arena[from].basic.dependencies.push(dep);
         Ok(())
-    }
-
-    /// Sets the graph's crates in `db`, writing only what differs from what is set (the query engine does
-    /// not compare an input's new value with its old one). A crate whose fields, root path and
-    /// dependencies' content IDs are what its content ID was made from is not hashed again.
-    pub fn set_in_db(self, db: &mut Db) -> CratesIdMap {
-        db.write_crates("CrateGraphBuilder::set_in_db", |db| self.set_in_db_inner(db))
-    }
-
-    fn set_in_db_inner(self, db: &mut Db) -> CratesIdMap {
-        let old_all_crates = all_crates(db);
-        let crates_map = db.crates_map();
-        let mut crates = crates_map.lock();
-        let (visited, all) = blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
-            let len = self.arena.len();
-            let mut walk = Walk {
-                graph: &self,
-                crates: &mut *crates,
-                // For some reason in some repositories we have duplicate crates, so we use a set and not `Vec`.
-                // We use an `IndexSet` because the list needs to be topologically sorted.
-                all: FxIndexSet::with_capacity_and_hasher(len, FixedState),
-                visited: HashMap::with_capacity_in(len, Global),
-                root_files: HashSet::with_capacity_in(len, Global),
-                done: frame.alloc_slice_fill_with(len, |_| None),
-                frame,
-            };
-            for krate in self.iter() {
-                walk.go(db, krate);
-            }
-            (walk.visited, walk.all)
-        });
-        drop(crates);
-
-        for &krate in old_all_crates.iter() {
-            if !all.contains(&krate) {
-                db.set_crate_attr_files(krate, true, Some(Durability::MEDIUM));
-            }
-        }
-        if old_all_crates.len() != all.len()
-            || old_all_crates.iter().any(|&krate| !all.contains(&krate))
-        {
-            set_all_crates_with_durability(db, all, Durability::MEDIUM);
-        }
-        refresh_crate_graph_content(db);
-        visited
     }
 
     pub fn iter(&self) -> impl Iterator<Item = CrateBuilderId> + '_ {

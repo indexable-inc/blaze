@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: A proposal to change how target.md finds a body, a surface and a unit manifest. Today each is keyed by its text and everything reachable from it by name, with a read list checked and the record copied under a new key when the key moves. Proposed, each is found by what it read, so an unrelated edit moves no key, nothing is refiled or copied, and correctness rests on one claim (the read set is complete) and not two. Says what was found in the code, the change as an outside review amended it, why it is sound, its cost against the floor, and what it does to the crates built on blaze-keyed. Decided (D39); blaze-keyed, blaze-host and blaze-unitkey are built on it and landing on main; blaze-front is not built on main yet.
+summary: A proposal to change how target.md finds a body, a surface and a unit manifest. Today each is keyed by its text and everything reachable from it by name, with a read list checked and the record copied under a new key when the key moves. Proposed, each is found by what it read, so an unrelated edit moves no key, nothing is refiled or copied, and correctness rests on one claim (the read set is complete) and not two. Says what was found in the code, the change as an outside review amended it, why it is sound, its cost against the floor, and what it does to the crates built on blaze-keyed. Decided (D39); blaze-keyed, blaze-host and blaze-unitkey are built on it on main; blaze-front is built on it over the ported front end.
 date: 2026-11-13
 ---
 # Read-addressed records: find a result by what it read
@@ -15,7 +15,7 @@ not the author's reasoning) said: adopt with changes; its changes are folded in 
 **Status (2026-11-14).** Decided as decision D39. Built by task K1 and landing on main:
 blaze-keyed (`driver.rs`, `record.rs`, `kind.rs`, `front.rs`, `memo.rs` with `Audit`, the
 simulation in `tests.rs`) and blaze-host on it; blaze-unitkey (K2) keys units for it.
-blaze-front, the surface and body tasks on the `Front` seam, is not built on main yet. Where
+blaze-front, the surface and body tasks on the `Front` seam, is built over the ported front end. Where
 this page and the code differ, the code's doc comments say what was
 built: one change from the text below is that the certificate's 64-shape cap stays (it is an
 outside record) but costs a mark lookup per unit on the next request, never a failed build.
@@ -61,7 +61,7 @@ outside record) but costs a mark lookup per unit on the next request, never a fa
 8. **Nothing runs the driver.** No crate outside blaze-keyed's tests constructs `Driver` or
    implements `Pool`; no front-end crate depends on blaze-keyed; no surface is made from source.
    *Partly:* blaze-host runs the driver on a real store and pool; a surface from source waits
-   on blaze-front, not built on main yet.
+   on blaze-front.
 9. **The plan key disagrees with itself**: by the body's key (`kind.rs:511-524`), by its result
    in the doc beside it (`kind.rs:558`) and in target.md. *Fixed:* `PlanInputs.body` is the
    body record's result digest, and blaze-program and blaze-findings key by it.

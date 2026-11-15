@@ -54,7 +54,7 @@ fn main() {
 fn with_crate(check: impl FnOnce(&Crate<'_, '_, '_>)) {
     let checked = crate::tests::checked(FIXTURE);
     let db = &checked.db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
         let cx = Cx::new(db, krate, checked.files(), &frame);
@@ -315,7 +315,7 @@ fn each_fixture(mut check: impl FnMut(&str, &Cx<'_, '_>)) {
     for &(name, source) in UI.iter().chain([("shapes", SHAPES), ("marks", MARKS)].iter()) {
         let fixture = format!("//- minicore: {CORE}\n//- /main.rs crate:other:main edition:2021\n{source}");
         let (db, names, _) = crate::tests::fixture_db(&fixture, "");
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
             let krate = hir::check::workspace_crates(&db)[0];
             let frame = crate::tests::frame();
             let cx = Cx::new(&db, krate, crate::Files::new(&names, ""), &frame);
@@ -410,7 +410,7 @@ pub(super) fn executed(db: &Db, owner: ExpressionStoreOwnerId) {
     if !RECORDING.load(Ordering::Relaxed) {
         return;
     }
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     if RECORDED.lock().contains(&nonce) {
         EXECUTED.lock().push((nonce, owner));
     }
@@ -418,7 +418,7 @@ pub(super) fn executed(db: &Db, owner: ExpressionStoreOwnerId) {
 
 /// The stores the walks of `db` ran for since the last take, each once, in the order first run.
 fn take_executed(db: &Db) -> Vec<ExpressionStoreOwnerId> {
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     let mut own: Vec<ExpressionStoreOwnerId> = Vec::new();
     EXECUTED.lock().retain(|&(of, owner)| {
         let mine = of == nonce;
@@ -433,7 +433,7 @@ fn take_executed(db: &Db) -> Vec<ExpressionStoreOwnerId> {
 /// The bug planted in `db`'s walks, if it has it: each store's marks carry the length of its
 /// root's text ([`StoreMark::Planted`]), which a body edit changes and no mark should.
 pub(super) fn planted_text_len(db: &Db, owner: ExpressionStoreOwnerId) -> Option<u32> {
-    if !PLANTING.load(Ordering::Relaxed) || !PLANTED.lock().contains(&db.nonce_and_revision().0) {
+    if !PLANTING.load(Ordering::Relaxed) || !PLANTED.lock().contains(&db.nonce()) {
         return None;
     }
     let (store, source_map) = ExpressionStore::with_source_map(db, owner);
@@ -466,10 +466,31 @@ fn main() {
 fn edited() -> u32 { 1 }
 "#;
 
+/// Every expression store of `db`'s first workspace crate, each once, in the order of the
+/// crate's numbering ([`Defs`], in the order its items are written): an owner's place here is
+/// the same in every snapshot of the same items, so a test holds it across a commit.
+fn every_store(db: &Db) -> Vec<ExpressionStoreOwnerId> {
+    blaze_memo::attach(db, || {
+        let krate = hir::check::workspace_crates(db)[0];
+        let frame = crate::tests::frame();
+        let cx = Cx::new(db, krate, crate::cx::Files::unnamed(), &frame);
+        let defs = Defs::of(&cx);
+        let mut stores: Vec<ExpressionStoreOwnerId> = Vec::new();
+        for def in defs.all() {
+            super::defs::stores(db, defs[def].id, |owner| {
+                if !stores.contains(&owner) {
+                    stores.push(owner);
+                }
+            });
+        }
+        stores
+    })
+}
+
 /// The edit of [`EDITED`]: a literal of the last body made longer, which changes no name.
 fn edit_holds(planted: bool) -> Result<(), String> {
     let (mut db, names, first) = fixture_db(EDITED, "");
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     RECORDED.lock().push(nonce);
     RECORDING.store(true, Ordering::Relaxed);
     if planted {
@@ -478,7 +499,7 @@ fn edit_holds(planted: bool) -> Result<(), String> {
     }
     let options = Options::default();
     let marks = |db: &Db, owners: &[ExpressionStoreOwnerId]| -> Vec<Vec<StoreMark>> {
-        blaze_query::db::attach(db, || owners.iter().map(|&it| store_marks(db, it, ()).to_vec()).collect())
+        blaze_memo::attach(db, || owners.iter().map(|&it| store_marks(db, it).to_vec()).collect())
     };
     let before = check_all(&db, &names, &options);
     let owners = take_executed(&db);
@@ -487,12 +508,20 @@ fn edit_holds(planted: bool) -> Result<(), String> {
         "the pass walked no body of the fixture: {owners:?}"
     );
     let marks_before = marks(&db, &owners);
+    // Each owner by its place among the crate's stores: the edit's commit drops the crate's
+    // arena, and every owner id with it, so the owners are taken again after it there.
+    let stores = every_store(&db);
+    let at: Vec<usize> = (owners.iter())
+        .map(|owner| stores.iter().position(|it| it == owner).expect("a walked store is numbered"))
+        .collect();
     let text = db.file_text(first).text(&db).as_str().to_owned();
     let new = text.replacen("{ 1 }", "{ 12 }", 1);
     assert_ne!(new, text, "the fixture has the literal the edit lengthens");
-    db.set_file_text(first, &new);
+    crate::tests::set_file_text(&mut db, first, &new);
     let after = check_all(&db, &names, &options);
     let rerun = take_executed(&db);
+    let stores = every_store(&db);
+    let owners: Vec<ExpressionStoreOwnerId> = at.iter().map(|&at| stores[at]).collect();
     let marks_after = marks(&db, &owners);
     take_executed(&db);
     if rerun.len() > 1 || rerun.iter().any(|it| !matches!(it, ExpressionStoreOwnerId::Body(_))) {
@@ -514,7 +543,12 @@ fn edit_holds(planted: bool) -> Result<(), String> {
 /// kept ones, so the fold reads the same records and the pass finds the same. Control: marks
 /// that carry the length of their store's text (a fact of the syntax, not of what is named)
 /// differ after the same edit, and the oracle sees it.
+///
+/// False by design on blaze-memo (port decision: reuse across edits comes from records, not
+/// the memo): it claimed a body edit walks only the edited body again; an edit of a file now
+/// rebuilds its crate's arena, so every store of the crate is walked again. Left failing.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_with_equal_marks_reruns_no_fold() {
     if let Err(violation) = edit_holds(false) {
         panic!("{violation}");

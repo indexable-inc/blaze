@@ -1086,8 +1086,11 @@ fn check_surface(items: &[Item], at: usize, edit: Edit) -> Result<(), String> {
         Edit::Body => front_reads(item.kind),
         Edit::Lines if item.has_body() => front_reads(item.kind) || later_placed,
         Edit::Lines | Edit::Signature | Edit::Removed | Edit::Added | Edit::Cfg => true,
-        // A macro's definition is held as its bytes, a comment among them too.
-        Edit::Comment => item.kind == Kind::Macro,
+        // A `//` comment at a line's end moves no token and no position, and is no token a
+        // macro is given: a macro's definition is held as its tokens with their lines and
+        // columns (`SURFACE_TEXT` 2), no longer as its bytes, so no front end observes it there
+        // either.
+        Edit::Comment => false,
     };
     let (after, _) = edited(items, at, edit);
     let (before, after) = (file(items), file(&after));

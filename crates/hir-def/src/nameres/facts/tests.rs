@@ -1,10 +1,8 @@
 //! Tests of the per-module resolver, and the helpers they share.
 //!
-//! A crate's map as `facts::collect_crate` makes it, the maintained map `crate_local_def_map`
-//! serves (`nameres::delta`) and a fresh maintainer's are three maps of the same inputs, and a
-//! block's map built twice is two: [`compare_db`] checks they agree. Each is made by a query of
-//! its own, so the `ModuleId`s of their modules differ (tracked structs), and with them every
-//! item id whose loc names its module. [`project`] maps a def map to a canonical form that names
+//! A block's map built twice is two maps of the same inputs: [`compare_db`] checks they agree.
+//! Each is made by a query of its own, so the `ModuleId`s of their modules can differ, and with
+//! them every item id whose loc names its module. [`project`] maps a def map to a canonical form that names
 //! a module of the map by its path and origin and every item by its kind, its container's
 //! canonical form and its `AstId`, orders what the notes' §8 lets differ in order, and keeps
 //! everything else as it is.
@@ -16,7 +14,6 @@ mod features;
 pub(in crate::nameres) mod generated;
 mod graph;
 mod impls;
-mod trace;
 
 use std::{fmt, fmt::Write as _, sync};
 
@@ -41,7 +38,7 @@ use std::alloc::Global;
 use syntax::ast;
 
 use crate::{
-    AdtId, BlockIdLt, BuiltinDeriveImplId, BuiltinType, DefWithBodyId, ExternBlockId,
+    AdtId, BlockId, BuiltinDeriveImplId, BuiltinType, DefWithBodyId, ExternBlockId,
     ExternCrateId, ImplId, ItemContainerId, Lookup, MacroExpander, MacroId, MacroRulesLocFlags,
     ModuleDefId, ModuleId, TraitId, UseId,
     builtin_derive::BuiltinDeriveImplTrait,
@@ -52,8 +49,8 @@ use crate::{
     },
     item_tree::TreeId,
     nameres::{
-        BlockInfo, DefMap, DefMapCrateData, DefMapPair, LocalDefMap, ModuleData, ModuleOrigin,
-        ModulesSlot, ScopeSlot, crate_local_def_map,
+        BlockInfo, CrateResolution, DefMap, DefMapCrateData, LocalDefMap, ModuleData,
+        ModuleOrigin, ModulesSlot, ScopeSlot, crate_local_def_map, crate_resolution,
         diagnostics::{DefDiagnostic, DefDiagnosticKind},
     },
     per_ns::Item,
@@ -62,19 +59,14 @@ use crate::{
     visibility::{Visibility, VisibilityExplicitness},
 };
 
-/// The crate's def map as the per-module resolver makes it (`facts::collect_crate`), the
-/// reference the maintained map is checked against.
-#[blaze_query::tracked(returns(ref))]
-pub(in crate::nameres) fn facts_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
-    blaze_mem::frame::task(Tag::Nameres, |frame| {
-        let (def_map, local_def_map) = super::collect_crate(db, frame, krate);
-        DefMapPair::new(db, def_map, local_def_map)
-    })
+/// The crate's def map as the per-module resolver makes it (`facts::collect_crate`), never one
+/// served from an image: what a served map is checked against.
+pub(in crate::nameres) fn facts_crate_local_def_map(db: &Db, krate: Crate) -> &CrateResolution {
+    crate_resolution(db, krate)
 }
 
 /// The empty def map of `block` that `block_def_map` starts from, and the tree it collects.
-fn empty_block_def_map(db: &Db, block_id: BlockIdLt<'_>) -> (DefMap, TreeId) {
-    let block_id = block_id.to_static();
+fn empty_block_def_map(db: &Db, block_id: BlockId) -> (DefMap, TreeId) {
     let ast_id = block_id.ast_id(db);
     let module = block_id.module(db).to_static();
     let visibility = Visibility::Module(module, VisibilityExplicitness::Implicit);
@@ -93,8 +85,8 @@ fn empty_block_def_map(db: &Db, block_id: BlockIdLt<'_>) -> (DefMap, TreeId) {
 
 /// `block`'s def map made again, as `block_def_map` makes it, in a query of its own: the same
 /// inputs give the same map.
-#[blaze_query::tracked(returns(ref))]
-pub(super) fn block_def_map_again<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
+#[blaze_memo::tracked(returns(ref), owns)]
+pub(super) fn block_def_map_again(db: &Db, block_id: BlockId) -> DefMap {
     blaze_mem::frame::task(Tag::Nameres, |frame| {
         let (def_map, tree_id) = empty_block_def_map(db, block_id);
         let krate = def_map.krate;
@@ -1160,7 +1152,7 @@ pub(in crate::nameres) fn compare(old: &CDefMap<'_>, new: &CDefMap<'_>) -> Strin
 }
 
 /// Panics naming `what` unless every scope of `def_map` and its modules were handed to the
-/// database, as `crate_local_def_map` and `block_def_map` return them.
+/// database, as `crate_local_def_map` and `block_def_map` return them: none is still building.
 pub(super) fn assert_handed_over(db: &Db, def_map: &DefMap, what: &str) {
     assert!(
         matches!(def_map.modules, ModulesSlot::Collected(_)),
@@ -1168,10 +1160,23 @@ pub(super) fn assert_handed_over(db: &Db, def_map: &DefMap, what: &str) {
     );
     for (id, data) in def_map.table(db).iter() {
         assert!(
-            matches!(data.scope, ScopeSlot::Collected(_)),
+            !matches!(data.scope, ScopeSlot::Building(_)),
             "{what}: the scope of {id:?} was not handed over"
         );
     }
+}
+
+/// `module`'s path from its def map's root, `crate::a::b`, for messages and expected lists.
+pub(in crate::nameres) fn module_path(db: &Db, module: ModuleId) -> String {
+    let mut names = Vec::new();
+    let mut at = module;
+    while let Some(parent) = at.containing_module_inside_def_map(db) {
+        names.push(at.name(db).map_or_else(|| "?".to_owned(), |it| it.as_str().to_owned()));
+        at = parent;
+    }
+    names.push("crate".to_owned());
+    names.reverse();
+    names.join("::")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1292,20 +1297,16 @@ fn bodies(db: &Db, def_map: &DefMap) -> Vec<DefWithBodyId> {
     out
 }
 
-/// Compares the maps of every crate of `db`: the maintained one with a fresh maintainer's and
-/// with `facts::collect_crate`'s, as `delta::tests::check_db` does (§6's fourth difference left
-/// out where an attribute is unresolved); and the map of every block of their bodies with the
-/// block's map built again ([`block_def_map_again`]). Appends each difference to `out` under
-/// `name`.
+/// Checks every crate map of `db` was handed over, and compares the map of every block of their
+/// bodies with the block's map built again ([`block_def_map_again`]). Appends each difference
+/// to `out` under `name`.
 pub(super) fn compare_db(db: &TestDB, name: &str, exempt: &Exempt, out: &mut String) {
-    crate::nameres::delta::tests::check_db(db, name, exempt, true, out);
     for &krate in all_crates(db).iter() {
         assert_handed_over(db, facts_crate_local_def_map(db, krate).def_map(db), name);
         let mut maps = vec![crate_local_def_map(db, krate).def_map(db)];
         while let Some(map) = maps.pop() {
             for body in bodies(db, map) {
                 for (block, real) in Body::of(db, body).blocks(db) {
-                    let block = block.to_db(db);
                     let again = block_def_map_again(db, block);
                     assert_handed_over(db, again, name);
                     let diff = compare(

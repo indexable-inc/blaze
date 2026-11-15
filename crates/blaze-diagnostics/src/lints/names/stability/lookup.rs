@@ -202,7 +202,7 @@ fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: 
         return true;
     }
     let ctxt = file.span_map(db).span_for_range(range).ctx;
-    let Some(call) = ctxt.outer_expn(db) else { return false };
+    let Some(call) = ctxt.outer_expn(db, crate::cx::context_arena(file)) else { return false };
     let def = hir_expand::MacroCallId::from(call).loc(db).def;
     let node: Node<'_> = match def.kind {
         MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => match def.ast_id() {

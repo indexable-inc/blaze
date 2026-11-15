@@ -141,7 +141,7 @@ fn privacy(it: &InferenceDiagnostic) -> bool {
 #[test]
 fn fields_a_macro_names_are_found_by_its_expansion_alone() {
     let db = fixture::db(FIELDS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, "main"));
         let body = Body::of(&db, def);
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
@@ -173,7 +173,7 @@ fn fields_a_macro_names_are_found_by_its_expansion_alone() {
                 (2, 0),
             ],
         );
-
+    
         // `get!`'s `.x` of `P`, a struct of a real file: the name adjusted to `P`'s scope is
         // the plain `x`.
         let def = DefWithBodyId::FunctionId(function(&db, "adjusted"));
@@ -195,7 +195,7 @@ fn fields_a_macro_names_are_found_by_its_expansion_alone() {
 #[test]
 fn methods_a_macro_names_are_found_by_its_expansion_alone() {
     let db = fixture::db(IMPL_ITEMS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let impls = impls(&db);
         let ours = impls.iter().find(|it| it.len() == 2).expect("the `macro`'s impl");
         let foo = impls.iter().find(|it| it.len() == 1).expect("`foo`'s impl");
@@ -260,7 +260,7 @@ impl OsString {
 #[test]
 fn a_macro_a_block_defines_finds_the_items_of_the_block_and_its_module() {
     let db = fixture::db(OS_STRING_PUSH).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let push = impls(&db).into_iter().flatten().next().expect("`OsString::push`");
         let push_def = DefWithBodyId::FunctionId(push);
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(push_def));
@@ -354,7 +354,7 @@ fn block_trait_fns(db: &base_db::Db, def: DefWithBodyId) -> Vec<FunctionId> {
 #[test]
 fn trait_methods_a_macro_names_are_found_by_its_expansion_alone() {
     let db = fixture::db(TRAIT_ITEMS_2).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, "main"));
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
         assert!(infer.diagnostics().is_empty(), "{:?}", infer.diagnostics());
@@ -407,7 +407,7 @@ mod baz {
 #[test]
 fn the_traits_in_scope_of_a_macros_call_are_its_def_sites() {
     let db = fixture::db(TRAIT_ITEMS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let bodies: Vec<FunctionId> = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
@@ -469,7 +469,7 @@ fn main() {
 #[test]
 fn a_macros_impl_of_a_real_files_trait_overrides_its_default() {
     let db = fixture::db(SPECIALIZATION).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, "main"));
         let body = Body::of(&db, def);
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
@@ -551,7 +551,7 @@ fn caller_bound<T: Tr<A = u16>>(a: <T as Tr>::A) -> u16 { a }
 fn associated_items_a_macro_names_through_paths_are_found_by_its_expansion_alone() {
     use rustc_type_ir::TypeVisitableExt as _;
     let db = fixture::db(ASSOC_PATHS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut defs: Vec<FunctionId> = ["own", "bound", "caller", "caller_bound"]
             .into_iter()
             .map(|it| function(&db, it))
@@ -689,7 +689,7 @@ fn accesses_and_diagnostics<'db>(
 #[test]
 fn privacy_is_checked_from_the_def_site_of_the_name() {
     let db = fixture::db(NESTED_MACRO_PRIVACY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (fields, diagnostics) = accesses_and_diagnostics(&db, "main");
         // `S::default().i` alone: `m!`'s `$e.$i` is checked from `foo`, where `m` is defined.
         assert!(
@@ -699,7 +699,7 @@ fn privacy_is_checked_from_the_def_site_of_the_name() {
     });
 
     let db = fixture::db(NESTED_MACRO_METHOD_PRIVACY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (_, diagnostics) = accesses_and_diagnostics(&db, "main");
         assert!(
             matches!(diagnostics, [InferenceDiagnostic::PrivateAssocItem { .. }]),
@@ -708,7 +708,7 @@ fn privacy_is_checked_from_the_def_site_of_the_name() {
     });
 
     let db = fixture::db(FIELDS_OF_THE_DEF_SITE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (_, diagnostics) = accesses_and_diagnostics(&db, "main");
         assert!(diagnostics.is_empty(), "`foo::m!`: {diagnostics:?}");
         let (fields, diagnostics) = accesses_and_diagnostics(&db, "outside");
@@ -723,7 +723,7 @@ fn privacy_is_checked_from_the_def_site_of_the_name() {
     });
 
     let db = fixture::db(BLOCK_MACRO_PRIVACY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (fields, diagnostics) = accesses_and_diagnostics(&db, "main");
         assert!(
             matches!(diagnostics, [InferenceDiagnostic::PrivateField { expr, .. }] if *expr == fields[0]),

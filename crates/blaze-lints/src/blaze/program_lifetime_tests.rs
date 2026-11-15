@@ -408,12 +408,7 @@ fn could_be_ref32_fix_rewrites_the_field_its_writes_and_its_reads() {
     let fx = fixture::db(&fixture_of(FIXABLE));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || {
-        hir::Crate::all(&db)
-            .into_iter()
-            .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
-            .expect("the fixture has `main`")
-    });
+    let key = crate::tests::main_crate_key(&db);
     let file = file.file_id(&db);
     let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
     let flags: Vec<String> = FLAGS.split_whitespace().map(str::to_owned).collect();
@@ -421,10 +416,11 @@ fn could_be_ref32_fix_rewrites_the_field_its_writes_and_its_reads() {
         command_line: CommandLine::parse(&flags).expect("the flags read"),
         conf: Conf::default(),
     };
-    fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let text = db.file_text(file).text(&db).to_string();
     assert_eq!(text, FIXED.trim_start_matches('\n'));
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
+        let krate = hir::Crate::from(db.krate(key));
         let found = check(&db, krate, &setup, &name_of).expect("the file is named");
         let left: Vec<&str> = found
             .iter()

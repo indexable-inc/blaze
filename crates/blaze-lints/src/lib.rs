@@ -16,6 +16,7 @@ pub mod conf;
 pub mod diag;
 mod famous;
 pub mod fix;
+mod kept;
 pub mod level;
 mod lints;
 pub mod manifest;

@@ -22,7 +22,7 @@
 
 use std::{cell::Cell, collections::BTreeMap, sync::Arc};
 
-use base_db::{Crate, Db, all_crates};
+use base_db::{Crate, CrateKey, Db, all_crates};
 use blaze_cas::{Key as StoreKey, Kind as StoreKind, Mismatch, content_of};
 use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_front_items::{
@@ -37,32 +37,33 @@ use blaze_kernel::{
 };
 use blaze_core::lock::Lock;
 use blaze_query::QueryKind;
-use blaze_query::db::AsId;
 use blaze_store_check::Setting;
 use hir_def::{
-    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, ModuleDefId, StaticId,
-    StructId, TraitId, TypeAliasId, UnionId, VariantId,
-    deps::{PortableIds, body_key as hir_body_key},
+    AdtId, AssocItemId, DefWithBodyId, HasModule as _, Lookup as _, ModuleDefId, StructId, VariantId,
+    deps::body_key as hir_body_key,
     expr_store::Body,
     nameres::{crate_def_map, demand::crate_body_owners},
     signatures::{ConstSignature, FunctionSignature},
 };
-use hir_expand::fixture::{self, Fixture};
+use hir_expand::{
+    HirFileId, MacroCallKind,
+    fixture::{self, Fixture},
+};
 use std::alloc::Global;
 use syntax::{Edition, Extensions};
 
 use super::{
-    ANY_KIND, ANY_REVISION, BodyDelta, answering, BodyKey, BodyWorld, BorrowckEntry, DROPPED, Exact, HELD,
+    ANY_KIND, UNCHECKED, BodyDelta, answering, BodyKey, BodyWorld, BorrowckEntry, DROPPED, Exact, HELD,
     How, InferEntry, KEEP_ALL, Keyed, MirEntry, OWN_FACTS_ONLY, Of, OwnerKey, Place, RUNS,
     Written, borrowck_schema, claim_keeps, fact_read, join, key_of, keyed, places, reads,
-    register, run_infer, serve, stamp, unpost, written,
+    register, run_infer, serve, unpost, written,
 };
 use crate::{
     InferenceResult,
     body_store::{
         BodyFacts, Classified, Installed, Mode, Step, StepCounts, capture, infer, install,
         lookup_passed, offer, offer_passed,
-        tests::{BUILD, Memory as Images, OWN, is_impl_table, own, portable},
+        tests::{BUILD, Memory as Images, OWN, is_impl_table, own},
     },
     db::HirDatabase,
     next_solver::{
@@ -72,9 +73,13 @@ use crate::{
     traits::ParamEnvAndCrate,
 };
 
+/// `leaf` is a workspace crate the tests edit, so its root is local: a library root's crate is
+/// sealed (a dependency that does not change in a session), and an edit of a sealed crate's
+/// file starts a fresh session in which every crate's queries run again (base-db's
+/// `Fresh::SealedMarked`), `core`'s impl tables too.
 const FIXTURE: &str = r#"
 //- minicore: sized, copy, add
-//- /leaf.rs crate:leaf deps:core new_source_root:library
+//- /leaf.rs crate:leaf deps:core new_source_root:local
 pub fn leaf() -> u32 { 1 }
 pub fn other() -> u32 { 2 }
 //- /main.rs crate:main deps:core,leaf new_source_root:local
@@ -185,36 +190,113 @@ fn impls(db: &Db) -> ContentId {
 /// fixture (a stand-in for item-hash's "entries" part: what each id the body names is), so a
 /// signature edit reaches every body's identity and a body edit only its own.
 ///
-/// An item an answer names is keyed by its kind and its id in this one database ([`def_key`]):
-/// the same in every revision of it, so an answer's bytes are a function of what the entry
-/// read. (The item store's [`TestFacts`](super::super::tests::TestFacts) keys an item by its
-/// portable form, whose header holds the text of the item's file: any edit of `leaf.rs`, a
-/// comment's too, gave every caller's answer other bytes than the entry had read, with no read
-/// of that file in its trace.)
-/// What [`EntryFacts::def_key`] gave each id it named, by its key: shared by two trees, so a
-/// second database decodes what the first encoded (the keys are a tag and the interned id's
-/// bits, equal in two fixture databases built alike).
-type Defs = Arc<Lock<HashMap<ContentId, (u8, PortableIds), Global>>>;
+/// An item an answer names is keyed by what names it in every snapshot of the session
+/// ([`item_name`]: its kind, its crate's key and where it is written), never by its id: an
+/// edit rebuilds the arenas of the edited crate and of the crates above it, and every id of a
+/// rebuilt arena is another one after the commit. Keyed by its id (as it was), a caller's
+/// answer kept across an edit of `leaf.rs` named the leaf by an id a fresh run does not have
+/// (other bytes than the oracle's), and read back after the edit gave an id of a dropped
+/// arena. So an answer's bytes are a function of what the entry read. (The item store's
+/// [`TestFacts`](super::super::tests::TestFacts) keys an item by its portable form, whose
+/// header holds the text of the item's file: any edit of `leaf.rs`, a comment's too, gave
+/// every caller's answer other bytes than the entry had read, with no read of that file in
+/// its trace.)
+/// What [`EntryFacts::def_key`] gave each item it named, by its key: its tag, its crate's key
+/// and its name ([`item_name`]); shared by two trees, so a second database decodes what the
+/// first encoded (a name is the same in two fixture databases built alike).
+type Defs = Arc<Lock<HashMap<ContentId, (u8, CrateKey, Vec<u8>), Global>>>;
 
 struct EntryFacts {
     defs: Defs,
 }
 
-/// `def`'s id in its database, as its interned id's bits.
-fn raw(def: SolverDefId<'_>) -> u32 {
-    match def {
-        SolverDefId::FunctionId(it) => it.as_id().as_u32(),
-        SolverDefId::AdtId(AdtId::StructId(it)) => it.as_id().as_u32(),
-        SolverDefId::AdtId(AdtId::UnionId(it)) => it.as_id().as_u32(),
-        SolverDefId::AdtId(AdtId::EnumId(it)) => it.as_id().as_u32(),
-        SolverDefId::ConstId(it) => it.as_id().as_u32(),
-        SolverDefId::StaticId(it) => it.as_id().as_u32(),
-        SolverDefId::TraitId(it) => it.as_id().as_u32(),
-        SolverDefId::TypeAliasId(it) => it.as_id().as_u32(),
-        SolverDefId::ImplId(it) => it.as_id().as_u32(),
-        SolverDefId::EnumVariantId(it) => it.as_id().as_u32(),
+/// What names `def` in every snapshot of a session and in two databases built alike: its tag
+/// (as [`EntryFacts::def_of`] reads it), its crate's key, and where it is written: its ast id
+/// (a hash of what its node is keyed by and an ordinal among those of one hash, never a
+/// position: `span::ast_id`), then for an item a macro wrote each call it is expanded from,
+/// innermost first (the call's kind, a derive's attribute and place, the call's ast id), then
+/// the real file's id.
+fn item_name(db: &Db, def: SolverDefId<'_>) -> (u8, CrateKey, Vec<u8>) {
+    let (tag, krate, at) = match def {
+        SolverDefId::FunctionId(it) => (0, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::AdtId(AdtId::StructId(it)) => (1, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::AdtId(AdtId::UnionId(it)) => (2, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::AdtId(AdtId::EnumId(it)) => (3, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::ConstId(it) => (4, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::StaticId(it) => (5, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::TraitId(it) => (6, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::TypeAliasId(it) => (7, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::ImplId(it) => (8, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::EnumVariantId(it) => (9, it.krate(db), it.lookup(db).id.erase()),
         _ => panic!("a key asked of a definition that is no item"),
+    };
+    let mut name = Vec::new_in(Global);
+    name.extend_from_slice(&at.value.into_raw().to_le_bytes());
+    let mut file = at.file_id;
+    let file = loop {
+        match file {
+            HirFileId::FileId(it) => break it.file_id(db),
+            HirFileId::MacroFile(call) => {
+                let kind = &call.loc(db).kind;
+                match kind {
+                    MacroCallKind::FnLike { .. } => name.push(0),
+                    MacroCallKind::Derive { derive_attr_index, derive_index, .. } => {
+                        name.push(1);
+                        name.extend_from_slice(&derive_attr_index.item_tree_index().to_le_bytes());
+                        name.extend_from_slice(&derive_index.to_le_bytes());
+                    }
+                    MacroCallKind::Attr { .. } => name.push(2),
+                }
+                name.extend_from_slice(&kind.erased_ast_id().into_raw().to_le_bytes());
+                file = kind.file_id();
+            }
+        }
+    };
+    name.extend_from_slice(&file.index().to_le_bytes());
+    (tag, krate.key(db), name)
+}
+
+/// Every item of `krate` an answer may name ([`item_name`]'s kinds): each declaration and impl
+/// of each module of its def map, each item of each trait and impl, each variant of each enum.
+fn items_of<'db>(db: &'db Db, krate: Crate) -> Vec<SolverDefId<'db>> {
+    fn assoc<'db>(out: &mut Vec<SolverDefId<'db>>, items: &[(hir_expand::name::Name, AssocItemId)]) {
+        for (_, item) in items {
+            out.push(match *item {
+                AssocItemId::FunctionId(it) => SolverDefId::FunctionId(it),
+                AssocItemId::ConstId(it) => SolverDefId::ConstId(it),
+                AssocItemId::TypeAliasId(it) => SolverDefId::TypeAliasId(it),
+            });
+        }
     }
+    let mut out = Vec::new_in(Global);
+    let def_map = crate_def_map(db, krate);
+    for (_, module) in def_map.modules(db) {
+        let scope = module.scope(db);
+        for it in scope.declarations() {
+            match it {
+                ModuleDefId::FunctionId(it) => out.push(SolverDefId::FunctionId(it)),
+                ModuleDefId::AdtId(it) => {
+                    out.push(SolverDefId::AdtId(it));
+                    if let AdtId::EnumId(it) = it {
+                        out.extend(it.enum_variants(db).variants.values().map(|&(variant, _)| SolverDefId::EnumVariantId(variant)));
+                    }
+                }
+                ModuleDefId::ConstId(it) => out.push(SolverDefId::ConstId(it)),
+                ModuleDefId::StaticId(it) => out.push(SolverDefId::StaticId(it)),
+                ModuleDefId::TraitId(it) => {
+                    out.push(SolverDefId::TraitId(it));
+                    assoc(&mut out, &it.trait_items(db).items);
+                }
+                ModuleDefId::TypeAliasId(it) => out.push(SolverDefId::TypeAliasId(it)),
+                _ => {}
+            }
+        }
+        for it in scope.impls() {
+            out.push(SolverDefId::ImplId(it));
+            assoc(&mut out, &it.impl_items(db).items);
+        }
+    }
+    out
 }
 
 fn signatures(db: &Db) -> ContentId {
@@ -223,11 +305,46 @@ fn signatures(db: &Db) -> ContentId {
         for def in crate_body_owners(db, crate_named(db, krate)) {
             let DefWithBodyId::FunctionId(it) = def else { continue };
             // The signature as it is written: its name, its types' store (no positions; the
-            // source map is not in it), its flags.
-            h.part(format!("{:?}", FunctionSignature::of(db, it)).as_bytes());
+            // source map is not in it), its flags. Any id its print names renumbered by first
+            // use ([`fixture::stable_ids`]): an id's bits are another after a commit that
+            // rebuilt its arena, and the identity is of what is written.
+            h.part(fixture::stable_ids(&format!("{:?}", FunctionSignature::of(db, it))).as_bytes());
         }
     }
     h.finish()
+}
+
+/// The test's fact boundaries ([`EntryFacts::fact_of`]'s `Fact` answers), marked in the
+/// database's first snapshot: what the old classifier answered a fact for by name. The layout
+/// rows are not among them: their reads are flattened into the asker, as `Through` read them
+/// through.
+fn boundaries(builder: &mut blaze_memo::Builder) {
+    let own = [crate::infer::infer_body_query::KIND_NAME, fake_mir::KIND_NAME];
+    for &name in crate::lower::FIELD_TYPES_KINDS
+        .iter()
+        .chain(&own)
+        .chain(crate::method_resolution::IMPL_TABLE_KINDS)
+    {
+        builder.mark_boundary(name);
+    }
+}
+
+/// The invariant: every kind [`boundaries`] marks is one [`EntryFacts::fact_of`] answers a fact
+/// for by its name, so no boundary row is left covered.
+#[test]
+fn every_boundary_is_classified_as_a_fact() {
+    let own = [crate::infer::infer_body_query::KIND_NAME, fake_mir::KIND_NAME];
+    for &name in crate::lower::FIELD_TYPES_KINDS
+        .iter()
+        .chain(&own)
+        .chain(crate::method_resolution::IMPL_TABLE_KINDS)
+    {
+        let named = name.contains("field_types")
+            || name.contains("infer_body_query")
+            || name.contains("fake_mir")
+            || is_impl_table(name);
+        assert!(named, "`{name}` is marked a boundary and classified as none");
+    }
 }
 
 impl BodyFacts for EntryFacts {
@@ -243,19 +360,15 @@ impl BodyFacts for EntryFacts {
         )
     }
 
-    fn classify(
-        &self,
-        _: &Db,
-        _: DefWithBodyId,
-        step: Step,
-        _: blaze_query::db::DatabaseKeyIndex,
-        _: blaze_query::db::ReadKind,
-        name: &'static str,
-    ) -> Classified {
-        if name.contains("layout_of_") {
-            // As item-hash's `Rule::Through`: the layout row's own reads in its place.
-            Classified::Through
-        } else if step == Step::Mir && name.contains("field_types") {
+    fn fact_of(&self, _: &Db, _: DefWithBodyId, step: Step, read: blaze_memo::Read) -> Classified {
+        // Only the boundary kinds ([`BOUNDARY`]) are rows of their own; every other query,
+        // the layout rows among them (item-hash's old `Through`), is flattened by the memo,
+        // its own reads in its place. An input's row is covered.
+        let blaze_memo::Read::Query { kind, .. } = read else {
+            return Classified::Covered;
+        };
+        let name = kind.name();
+        if step == Step::Mir && name.contains("field_types") {
             Classified::Fact(LAYOUT)
         } else if name.contains("infer_body_query") {
             Classified::Fact(OWN_INFER)
@@ -285,45 +398,40 @@ impl BodyFacts for EntryFacts {
         }
     }
 
-    fn def_key<'db>(&self, _: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
         if def == own(body) {
             return OWN;
         }
-        let (tag, ids) = portable(def);
-        let key = Hasher::new("blaze v2 body entries test def")
+        let (tag, krate, name) = item_name(db, def);
+        let key = Hasher::new("blaze v2 body entries test def 2")
             .update(&[tag])
-            .update(&raw(def).to_le_bytes())
+            .update(&krate.index().to_le_bytes())
+            .part(&name)
             .finish();
-        self.defs.lock().insert(key, (tag, ids));
+        self.defs.lock().insert(key, (tag, krate, name));
         key
     }
 
-    fn def_of<'db>(&self, _: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    /// The item of this database named as [`EntryFacts::def_key`] named it, found by walking
+    /// its crate's items ([`items_of`]): no id is kept, as none outlives its arena.
+    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
         if key == OWN {
             return Some(own(body));
         }
-        let defs = self.defs.lock();
-        let (tag, ids) = defs.get(&key)?;
-        match tag {
-            0 => ids.get::<FunctionId>(0).map(SolverDefId::FunctionId),
-            1 => ids.get::<StructId>(0).map(|it| SolverDefId::AdtId(AdtId::StructId(it))),
-            2 => ids.get::<UnionId>(0).map(|it| SolverDefId::AdtId(AdtId::UnionId(it))),
-            3 => ids.get::<EnumId>(0).map(|it| SolverDefId::AdtId(AdtId::EnumId(it))),
-            4 => ids.get::<ConstId>(0).map(SolverDefId::ConstId),
-            5 => ids.get::<StaticId>(0).map(SolverDefId::StaticId),
-            6 => ids.get::<TraitId>(0).map(SolverDefId::TraitId),
-            7 => ids.get::<TypeAliasId>(0).map(SolverDefId::TypeAliasId),
-            8 => ids.get::<ImplId>(0).map(SolverDefId::ImplId),
-            9 => ids.get::<EnumVariantId>(0).map(SolverDefId::EnumVariantId),
-            _ => None,
-        }
+        // clone: a test item's name, so no lock is held across the walk's queries
+        let (tag, krate, name) = self.defs.lock().get(&key)?.clone();
+        let krate = *all_crates(db).iter().find(|it| it.key(db) == krate)?;
+        items_of(db, krate).into_iter().find(|&def| {
+            let (at, _, named) = item_name(db, def);
+            at == tag && named == name
+        })
     }
 }
 
 /// The MIR stand-in: the body's inference read, and its answer offered as the MIR's. Where
 /// the leaf crate has a struct ([`SIZED`]) it reads the struct's size, by its layout, as a
 /// real body's MIR reads a literal's type's, and its answer holds that size.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn fake_mir(db: &Db, def: DefWithBodyId) -> bool {
     let (size, reads) = capture(db, || {
         let _ = InferenceResult::of(db, def);
@@ -343,7 +451,7 @@ fn fake_mir(db: &Db, def: DefWithBodyId) -> bool {
 }
 
 /// The borrow check stand-in: the stand-in MIR read, and a pass offered.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn fake_borrowck(db: &Db, def: DefWithBodyId) -> bool {
     let (passes, reads) = capture(db, || fake_mir(db, def));
     if passes {
@@ -362,6 +470,9 @@ struct Tree {
     files: BTreeMap<String, String>,
     bodies: HashMap<(String, ItemId), DefWithBodyId, Global>,
     keys: Vec<BodyKey>,
+    /// The crate of the file the last [`Tree::edit`] set, if any: whose impl tables
+    /// [`Tree::impls_written`] asks about.
+    edited: Option<&'static str>,
 }
 
 impl Tree {
@@ -371,7 +482,8 @@ impl Tree {
 
     /// A tree whose facts name ids through `defs`, as another tree's do.
     fn with_defs(defs: Defs) -> Tree {
-        let fixture = fixture::db(FIXTURE);
+        // Read lists kept: the stand-ins' `capture` answers from them.
+        let fixture = fixture::db_with_boundaries(FIXTURE, boundaries, blaze_memo::Reads::Kept);
         // clone: a counted reference
         let facts = Arc::new(EntryFacts { defs: defs.clone() });
         let installed = install(fixture.db(), Arc::new(Images::default()), facts, BUILD, Mode::Serve)
@@ -379,7 +491,7 @@ impl Tree {
         // The fixture's files as the database has them; `edit` sets both.
         let files = BTreeMap::from([("leaf.rs".to_owned(), LEAF.to_owned()), ("main.rs".to_owned(), MAIN.to_owned())]);
         let mut tree =
-            Tree { installed, defs, fixture, files, bodies: HashMap::new_in(Global), keys: Vec::new() };
+            Tree { installed, defs, fixture, files, bodies: HashMap::new_in(Global), keys: Vec::new(), edited: None };
         tree.map();
         tree
     }
@@ -405,17 +517,56 @@ impl Tree {
     fn edit(&mut self, name: &str, text: &str) {
         let at = FILES.iter().position(|(it, _)| *it == name).expect("a fixture file");
         let id = self.fixture.file(at).file_id(self.fixture.db());
-        self.fixture.db_mut().set_file_text(id, text);
+        // The runs before the edit are not the edit's: `impls_written` reads the runs since.
+        let _ = self.fixture.db().runs().expect("a fixture's database logs its runs").take();
+        // A new snapshot per change: the file's text set through an edit, the snapshot its
+        // commit makes (the fixture takes its file ids again in it).
+        _ = self.fixture.edit(|edit| _ = edit.set_file_text(id, text));
+        self.edited = Some(FILES[at].1);
         self.files.insert(name.to_owned(), text.to_owned());
         self.map();
     }
 
-    /// Whether the impls maintainer's last write changed any crate's impl keys or traits.
+    /// Asks every crate's impl tables in the snapshot now: what [`Tree::impls_written`] asks
+    /// after an edit, asked before it, so a run it sees after is a run again and never a first
+    /// one. (Without it, an impl table no body's inference had asked, `core`'s inherent impls
+    /// among them, ran first after the edit, homed in `core`'s arena, which the edit did not
+    /// rebuild, and was taken for a table the edit reached.)
+    fn ask_impl_tables(&self) {
+        use crate::method_resolution::{InherentImpls, TraitImpls};
+        let db = self.fixture.db();
+        for &krate in all_crates(db).iter() {
+            TraitImpls::for_crate(db, krate);
+            InherentImpls::for_crate(db, krate);
+        }
+    }
+
+    /// Whether the last edit wrote the impl tables (port decision 1: what the deleted impls
+    /// maintainer's last write said, restated on the run log): after it, the impl-table
+    /// queries of the edited crate ran, and those of no crate it cannot reach (the crates it
+    /// depends on: `core`, and the files before it in [`FILES`]) ran again. Asks them all
+    /// ([`Tree::ask_impl_tables`]), which the caller did before the edit too.
     fn impls_written(&mut self) -> bool {
-        use crate::method_resolution::delta::LastWrite;
-        self.fixture.db_mut().with_state::<LastWrite, _>(|_, last| {
-            last.crates.iter().any(|it| !it.keys_changed.is_empty() || !it.traits_changed.is_empty())
-        })
+        let Some(edited) = self.edited else { return false };
+        self.ask_impl_tables();
+        let db = self.fixture.db();
+        let ran = db.runs().expect("a fixture's database logs its runs").take();
+        // By the arena a run is homed in, the crate's own (its key's greatest id is the
+        // crate's or an item of it): no key is printed to compare.
+        let ran_of = |krate: Crate| {
+            let arena = blaze_memo::Id::gid(krate).arena();
+            ran.iter().any(|it| is_impl_table(it.query) && it.arena() == arena)
+        };
+        let at = FILES.iter().position(|(_, it)| *it == edited).expect("a fixture crate");
+        let mut after = Vec::new_in(Global);
+        after.extend(FILES[at + 1..].iter().map(|(_, it)| crate_named(db, it)));
+        let edited = crate_named(db, edited);
+        for &krate in all_crates(db).iter() {
+            if krate != edited && !after.contains(&krate) {
+                assert!(!ran_of(krate), "the impl tables of {krate:?}, which the edit cannot reach, ran: {ran:?}");
+            }
+        }
+        ran_of(edited)
     }
 }
 
@@ -754,6 +905,8 @@ fn carried_from(first: Option<&str>, then: &str, dropped: Option<ReadKind>, says
     assert_eq!(before.len(), BODIES, "every body of the fixture");
     let layout = session.names_of(&store, ReadKind(LAYOUT.kind.0)).unwrap();
     let from = tree.pin();
+    // At the first pin, so a run of an impl table after the edit is one the edit reached.
+    tree.ask_impl_tables();
     tree.edit("leaf.rs", then);
     let delta = delta(&mut tree, &before_ids, says);
     let mut changed = Changed::between(from, tree.pin());
@@ -989,8 +1142,8 @@ fn ask_and_serve(kernel: &Kernel<Tree>, session: &mut Session, store: &mut Memor
 
 /// A first session keeps every entry in a store; a second tree, with a new database and item
 /// store, gets them in a new session (each a hit, nothing run) and serves them; with
-/// `moved`, its database then moves to another revision (a comment edit, which changes no
-/// identity and no fact). Then each body's inference and borrow check is asked of the second
+/// `edit`, `leaf.rs` is then given that text in a next snapshot. Then each body's inference and
+/// borrow check is asked of the second
 /// database: what its item store counted of those asks alone, by step.
 ///
 /// The count is of the asks alone ([`counted_since`]), and the serve infers nothing in the
@@ -998,7 +1151,7 @@ fn ask_and_serve(kernel: &Kernel<Tree>, session: &mut Session, store: &mut Memor
 /// finding the places there looked up each inference just posted, six hits at the serve's
 /// revision that every later count included, and whose memos then answered the asks with no
 /// lookup at all, so a stale row could neither show in the count nor be ruled out by it.
-fn answered_in_a_second_database(moved: bool) -> [StepCounts; Step::COUNT] {
+fn answered_in_a_second_database(edit: Option<&str>) -> [StepCounts; Step::COUNT] {
     let kernel = kernel();
     let mut store = Memory::default();
     let first = Tree::new();
@@ -1014,8 +1167,8 @@ fn answered_in_a_second_database(moved: bool) -> [StepCounts; Step::COUNT] {
         ask_and_serve(&kernel, &mut session, &mut store, &second, &first);
         assert_eq!(runs(), [0; Step::COUNT], "no entry runs in the second session: each is the store's");
     }
-    if moved {
-        second.edit("leaf.rs", &format!("{LEAF}// a comment\n"));
+    if let Some(text) = edit {
+        second.edit("leaf.rs", text);
     }
     let before = second.installed.steps();
     let db = second.db();
@@ -1042,16 +1195,15 @@ fn counted_since(before: [StepCounts; Step::COUNT], after: [StepCounts; Step::CO
 
 /// A second database served every entry (as [`answered_in_a_second_database`]), then
 /// `leaf.rs`'s first body edited and the session carried to the new pin; as the driver does,
-/// `leaf.rs`'s bodies are unposted (the edit reached their file) and each crate stamped at the
-/// new revision since the serve. Then each body's inference and borrow check is asked of the
-/// second database. The invariant: every row the carry did not reach (`main.rs`'s bodies)
-/// answers at the new revision with no step run, every other runs, and no answer disagrees
-/// with the database (`Installed::errors`, which checks each served answer's identity and
-/// facts again). And, asked of the rows themselves with no query run ([`answering`]): every
-/// row that answers at the new revision was verified with the body's identity now, so a
-/// stale row is caught whether or not the engine still holds a memo of its step (the carry
-/// runs the edited bodies' steps before the stamp, and their memos would hide a stale row
-/// from any count). `Err` names what broke it.
+/// `leaf.rs`'s bodies are unposted (the edit reached their file). Then each body's inference
+/// and borrow check is asked of the second database. The invariant: every row the carry did
+/// not reach (`main.rs`'s bodies) answers in the next snapshot with no step run, as what it
+/// read holds (no stamp: a row's validity is its read list), every other runs, and no step
+/// fails (`Installed::errors`). And, asked of the rows themselves with no step run
+/// ([`answering`]): every row that answers was verified with the body's identity now, so a
+/// stale row is caught whether or not the memo still holds an entry of its step (the carry
+/// runs the edited bodies' steps, and their entries would hide a stale row from any count).
+/// `Err` names what broke it.
 fn carried_rows_answer() -> Result<(), String> {
     let kernel = kernel();
     let mut store = Memory::default();
@@ -1064,7 +1216,6 @@ fn carried_rows_answer() -> Result<(), String> {
     let mut second = Tree::with_defs(first.defs.clone());
     let mut session = Session::new(&second);
     ask_and_serve(&kernel, &mut session, &mut store, &second, &first);
-    let (_, since) = second.db().nonce_and_revision();
     let edited: Vec<DefWithBodyId> =
         second.bodies.iter().filter(|((file, _), _)| file == "leaf.rs").map(|(_, def)| *def).collect();
     let others = BODIES - edited.len();
@@ -1081,9 +1232,6 @@ fn carried_rows_answer() -> Result<(), String> {
     for &def in &edited {
         unpost(db, def);
     }
-    for (_, krate) in FILES {
-        stamp(db, crate_named(db, krate), since);
-    }
     for &def in second.bodies.values() {
         let now = crate::body_store::with_store(db, |store| store.facts.identity(db, def))
             .ok_or("the test database has an item store")?;
@@ -1092,7 +1240,7 @@ fn carried_rows_answer() -> Result<(), String> {
                 && Some(verified) != now
             {
                 return Err(format!(
-                    "{def:?}'s {step:?} row answers at the new revision, verified with identity {verified:x}; the body's is {now:?}"
+                    "{def:?}'s {step:?} row answers after the edit, verified with identity {verified:x}; the body's is {now:?}"
                 ));
             }
         }
@@ -1116,23 +1264,26 @@ fn carried_rows_answer() -> Result<(), String> {
 }
 
 #[test]
-fn a_row_the_carry_did_not_reach_answers_at_the_next_revision() {
+fn a_row_the_carry_did_not_reach_answers_in_the_next_snapshot() {
     carried_rows_answer().unwrap();
 }
 
 /// The control: a driver whose unpost drops nothing (`KEEP_ALL`) leaves the edited bodies'
-/// rows under the stamp, and they answer for bodies whose identity moved: caught.
+/// rows posted, and a store that answers a row without reading what it read again
+/// (`UNCHECKED`) gives them for bodies whose identity moved: caught.
 #[test]
-fn the_oracle_catches_a_stamp_over_a_moved_entrys_row() {
+fn the_oracle_catches_a_moved_entrys_row_answered_unchecked() {
     KEEP_ALL.with(|it| it.set(true));
+    UNCHECKED.with(|it| it.set(true));
     let planted = carried_rows_answer();
+    UNCHECKED.with(|it| it.set(false));
     KEEP_ALL.with(|it| it.set(false));
-    assert!(planted.is_err(), "an edited body's row answered under the stamp");
+    assert!(planted.is_err(), "an edited body's row answered unchecked");
 }
 
 #[test]
 fn a_query_in_a_second_database_answers_from_the_kernels_entries_without_running() {
-    let steps = answered_in_a_second_database(false);
+    let steps = answered_in_a_second_database(None);
     let bodies = BODIES as u64;
     assert_eq!(
         steps[Step::Infer as usize],
@@ -1142,43 +1293,59 @@ fn a_query_in_a_second_database_answers_from_the_kernels_entries_without_running
     assert_eq!(steps[Step::Borrowck as usize].hits, bodies, "each borrow check is the kernel's entry");
 }
 
-/// The invariant: a served answer is the query's answer only at the revision it was posted
-/// at; at any other, the step runs. `Err` names the steps that answered from another
-/// revision's posts.
-fn served_only_at_its_revision() -> Result<(), String> {
-    let steps = answered_in_a_second_database(true);
-    let (infer, check) = (steps[Step::Infer as usize].hits, steps[Step::Borrowck as usize].hits);
-    match (infer, check) {
-        (0, 0) => Ok(()),
-        _ => Err(format!("{infer} inferences and {check} borrow checks answered at another revision")),
+/// The invariant: a served answer is the query's answer exactly while the identity and every
+/// fact it read hash as they did (a kept record's validity is its read list; it replaced "only
+/// at the revision it was posted at"): after a comment edit in a next snapshot, which changes
+/// no identity and no fact, every body answers from its row with nothing run; after an edit
+/// of `leaf.rs`'s first body, whose rows nothing unposts here, that body's steps run. `Err`
+/// names what broke it.
+fn served_while_its_reads_hold() -> Result<(), String> {
+    let bodies = BODIES as u64;
+    let kept = answered_in_a_second_database(Some(&format!("{LEAF}// a comment\n")));
+    let (infer, check) = (kept[Step::Infer as usize], kept[Step::Borrowck as usize]);
+    if (infer.hits, infer.ran, check.hits) != (bodies, 0, bodies) {
+        return Err(format!(
+            "after a comment edit {} inferences and {} borrow checks answered and {} inferences ran, of {bodies}",
+            infer.hits, check.hits, infer.ran
+        ));
+    }
+    let moved = answered_in_a_second_database(Some(&LEAF.replace("{ 1 }", "{ 3 }")));
+    match moved[Step::Infer as usize].ran {
+        0 => Err("an edited body's served inference answered for its new identity".to_owned()),
+        _ => Ok(()),
     }
 }
 
 #[test]
-fn a_served_answer_is_used_only_at_the_revision_it_was_posted_at() {
-    served_only_at_its_revision().unwrap();
+fn a_served_answer_is_used_while_what_it_read_holds() {
+    served_while_its_reads_hold().unwrap();
 }
 
-/// The control: a store that gives a served answer at any revision (`ANY_REVISION`) must be
-/// caught.
+/// The control: a store that gives a served answer without reading its identity and facts
+/// again (`UNCHECKED`) must be caught.
 #[test]
-fn the_oracle_catches_a_served_answer_used_at_another_revision() {
-    ANY_REVISION.with(|it| it.set(true));
-    let caught = served_only_at_its_revision();
-    ANY_REVISION.with(|it| it.set(false));
+fn the_oracle_catches_a_served_answer_used_without_its_reads_checked() {
+    UNCHECKED.with(|it| it.set(true));
+    let caught = served_while_its_reads_hold();
+    UNCHECKED.with(|it| it.set(false));
     assert!(caught.is_err(), "the planted bug went unseen");
 }
 
 /// The served steps' lookup of the item store's own records is gone: the one record lookup
-/// left is a constant's value's (`Store::find_constant`).
+/// left is that of the steps with no kernel entry yet, a constant's value and a lowering
+/// (`Store::find_record`, asked only when `step.served()` is false; it was `find_constant`).
 #[test]
 fn the_served_steps_have_no_lookup_of_the_item_stores_records() {
     let source = include_str!("../../body_store.rs");
     assert_eq!(source.matches("blaze_record::lookup(").count(), 1, "one record lookup");
     let at = source.find("blaze_record::lookup(").unwrap();
-    let constant = source.find("fn find_constant(").expect("the constant's lookup");
+    let constant = source.find("fn find_record(").expect("the unserved steps' lookup");
     let next = source[constant + 1..].find("\n    fn ").map_or(source.len(), |it| it + constant + 1);
-    assert!((constant..next).contains(&at), "the record lookup is the constant's");
+    assert!((constant..next).contains(&at), "the record lookup is the unserved steps'");
+    assert_eq!(source.matches(".find_record(").count(), 1, "one caller of the lookup");
+    let called = source.find(".find_record(").unwrap();
+    let arm = source[..called].rfind("=> ").expect("the lookup is asked in a match arm");
+    assert!(source[..arm].ends_with("false "), "the lookup is asked only for an unserved step");
     for gone in ["fn find(", "self.find("] {
         assert!(!source.contains(gone), "`{gone}` is deleted");
     }
@@ -1370,7 +1537,7 @@ fn the_oracle_catches_a_failed_keep_that_holds_its_claims() {
 
 /// What the database's query of a body's borrow check does (`hir_ty_borrowck`'s `borrowck`):
 /// the served verdict, looked up in a query so the engine keeps its row and what it read.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn served_check(db: &Db, def: DefWithBodyId) -> bool {
     lookup_passed(db, def, CHECKER, || panic!("no store here verifies"))
 }

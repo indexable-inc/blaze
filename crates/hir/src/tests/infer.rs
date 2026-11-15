@@ -56,7 +56,7 @@ fn place() {
 #[test]
 fn an_invalid_left_hand_side_names_its_assignment() {
     let db = fixture::db(ASSIGN).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (body, result) = infer(&db, "plain");
         let assign = find_expr(&body, |it| matches!(it, Expr::Assignment { .. }));
         let found: Vec<_> = result
@@ -70,7 +70,7 @@ fn an_invalid_left_hand_side_names_its_assignment() {
             })
             .collect();
         assert_eq!(found, [(assign, None)], "`=` is E0070");
-
+    
         let (body, result) = infer(&db, "compound");
         let assign = find_expr(&body, |it| {
             matches!(it, Expr::BinaryOp { op: Some(BinaryOp::Assignment { op: Some(_) }), .. })
@@ -86,7 +86,7 @@ fn an_invalid_left_hand_side_names_its_assignment() {
             })
             .collect();
         assert_eq!(found, [(assign, Some(ArithOp::Add))], "`+=` is E0067");
-
+    
         let (_, result) = infer(&db, "place");
         assert!(
             !result
@@ -173,7 +173,7 @@ fn undecided(db: &TestDB, name: &str) -> Vec<(TypeAnnotationNeeded, Option<Strin
 #[test]
 fn an_ambiguous_bound_is_e0283_with_its_goal() {
     let db = fixture::db(AMBIGUOUS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         // rustc: E0283 "type annotations needed", "cannot satisfy `_: Tr`"; the `T: Sized` of
         // the same variable gives none after it, and writeback none for the variable.
         assert_eq!(
@@ -191,7 +191,7 @@ fn an_ambiguous_bound_is_e0283_with_its_goal() {
 #[test]
 fn an_ambiguity_keeps_why_its_goal_was_required() {
     let db = fixture::db(AMBIGUOUS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (_, result) = infer(&db, "ambiguous");
         let DefWithBodyId::FunctionId(need) = function(&db, "need") else {
             panic!("`need` is a function");
@@ -214,7 +214,7 @@ fn an_ambiguity_keeps_why_its_goal_was_required() {
 #[test]
 fn an_undecided_variable_names_the_parameter_it_was_made_for() {
     let db = fixture::db(AMBIGUOUS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         // rustc: "cannot infer type of the type parameter `T` declared on the function `need`",
         // and the same of `any`'s `U`, which only its `Sized` bound constrains.
         assert_eq!(origins(&db, "ambiguous"), [Some(("need".to_owned(), "T".to_owned()))]);
@@ -236,7 +236,7 @@ fn decided() {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let at_error = |name| {
             let (_, result) = infer(&db, name);
             let found: Vec<_> = result
@@ -300,7 +300,7 @@ fn bound() {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mismatches = |name| {
             let (_, result) = infer(&db, name);
             result
@@ -328,7 +328,7 @@ fn bound() {
         // `return` give.
         assert_eq!(mismatches("no_else"), [ObligationCauseCode::IfExpressionWithNoElse]);
         assert_eq!(mismatches("bare_return"), [ObligationCauseCode::ReturnNoExpression]);
-
+    
         // rustc: "required by a bound in `needs`".
         let (_, result) = infer(&db, "bound");
         let causes: Vec<_> = result
@@ -387,7 +387,7 @@ fn need<T: Copy + Tr>(_: T) where T: Clone {}
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let DefWithBodyId::FunctionId(need) = function(&db, "need") else { unreachable!() };
         let need = GenericDefId::FunctionId(need);
         let written = |index| match bound_source(&db, need, index) {
@@ -421,7 +421,7 @@ fn undecided() { let _x = make(); }
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (body, result) = infer(&db, "undecided");
         let names = |named: &hir_ty::solver_errors::NamedTerm| -> Vec<String> {
             named
@@ -452,7 +452,7 @@ fn undecided() { let _x = make(); }
             panic!("one undecided term, the const's: {errors:?}");
         };
         assert_eq!((*kind, names(blamed)), (TypeAnnotationNeeded::E0284, vec!["N".to_owned()]));
-
+    
         let binding = body
             .pats()
             .find_map(|(id, pat)| match pat {
@@ -486,7 +486,7 @@ fn undecided() { let x = make(); let y = 1u8; }
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (body, result) = infer(&db, "undecided");
         let binding = |name: &str| {
             body.pats()
@@ -524,7 +524,7 @@ fn mismatch() { need(S); }
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (_, result) = infer(&db, "mismatch");
         let normalized: Vec<_> = result
             .diagnostics()
@@ -574,7 +574,7 @@ fn casts(x: &i32) {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (_, result) = infer(&db, "casts");
         let casts: Vec<_> = result
             .diagnostics()
@@ -623,7 +623,7 @@ fn sized_two(x: [u8], s: &str) { let t = *s; }
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         use ObligationCauseCode as C;
         assert_eq!(unmet_causes(&db, "sized_param"), [C::SizedArgumentType]);
         assert_eq!(unmet_causes(&db, "sized_ret"), [C::SizedReturnType]);
@@ -653,7 +653,7 @@ extern "C" {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut methods = Vec::new();
         for &krate in base_db::all_crates(&db).iter() {
             let def_map = hir_def::nameres::crate_def_map(&db, krate);
@@ -695,7 +695,7 @@ fn unsized_binding(s: &str) { let t = *s; }
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         use ObligationCauseCode as C;
         assert_eq!(unmet_causes(&db, "unsized_param"), []);
         assert_eq!(unmet_causes(&db, "unsized_closure_param"), [C::SizedArgumentType]);
@@ -762,7 +762,7 @@ fn in_closure() {
 #[test]
 fn an_unlabeled_jump_in_a_labeled_block_is_e0695() {
     let db = fixture::db(JUMPS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let jumps = |name: &str| -> Vec<bool> {
             let (_, result) = infer(&db, name);
             result
@@ -818,7 +818,7 @@ fn in_closure_in_async() {
 #[test]
 fn a_yield_in_an_async_body_is_e0727() {
     let db = fixture::db(ASYNC_YIELD).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let count = |name: &str| {
             let (body, result) = infer(&db, name);
             let found: Vec<ExprId> = result
@@ -895,7 +895,7 @@ fn question(x: Option<u8>) -> Option<u8> {
 #[test]
 fn type_checking_finds_where_a_body_stops_being_reachable() {
     let db = fixture::db(REACHABLE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let found = |name: &str| -> (&Body, Vec<Unreachable>) {
             let (body, result) = infer(&db, name);
             (body, result.unreachable().to_vec())
@@ -904,7 +904,7 @@ fn type_checking_finds_where_a_body_stops_being_reachable() {
             ExprOrPatId::ExprId(it) => matches!(body.expr(it), Expr::Return { .. }),
             ExprOrPatId::PatId(_) => false,
         };
-
+    
         // "unreachable expression": the tail after `return;`.
         let (body, all) = found("tail");
         let literal = find_expr(&body, |it| matches!(it, Expr::Literal(_)));
@@ -914,7 +914,7 @@ fn type_checking_finds_where_a_body_stops_being_reachable() {
         );
         assert!(after_return(&body, &all[0]));
         assert_eq!(all[0].note, None);
-
+    
         // "unreachable expression": an argument after a diverging one, and not the call too.
         let (body, all) = found("diverge_first");
         let outer = find_expr(&body, |it| matches!(it, Expr::Call { args, .. } if args.len() == 2));
@@ -922,14 +922,14 @@ fn type_checking_finds_where_a_body_stops_being_reachable() {
         let (first, second) = (args[0], args[1]);
         assert_eq!(all.iter().map(|it| it.what).collect::<Vec<_>>(), [UnreachableAt::Expr(second)]);
         assert_eq!(all[0].after, ExprOrPatId::ExprId(first));
-
+    
         // "unreachable call": the last argument diverged.
         let (body, all) = found("diverge_second");
         let outer = find_expr(&body, |it| matches!(it, Expr::Call { args, .. } if args.len() == 2));
         let Expr::Call { args, .. } = body.expr(outer) else { unreachable!() };
         assert_eq!(all.iter().map(|it| it.what).collect::<Vec<_>>(), [UnreachableAt::Call(outer)]);
         assert_eq!(all[0].after, ExprOrPatId::ExprId(args[1]));
-
+    
         // "unreachable statement": the first after `return;`, once.
         let (body, all) = found("statements");
         assert_eq!(
@@ -937,13 +937,13 @@ fn type_checking_finds_where_a_body_stops_being_reachable() {
             [UnreachableAt::Stmt { block: body.root_expr(), index: 1 }]
         );
         assert!(after_return(&body, &all[0]));
-
+    
         // "unreachable block in `if` or `while` expression".
         let (body, all) = found("if_condition");
         let if_ = find_expr(&body, |it| matches!(it, Expr::If { .. }));
         assert_eq!(all.iter().map(|it| it.what).collect::<Vec<_>>(), [UnreachableAt::IfBlock(if_)]);
         assert!(after_return(&body, &all[0]));
-
+    
         // A `match` whose arms all diverge, a guard not counted.
         let (body, all) = found("arms_diverge");
         let match_ = find_expr(&body, |it| matches!(it, Expr::Match { .. }));
@@ -956,7 +956,7 @@ fn type_checking_finds_where_a_body_stops_being_reachable() {
             }]
         );
         assert_eq!(found("an_arm_converges").1, []);
-
+    
         // "unreachable arm": the scrutinee diverged.
         let (body, all) = found("scrutinee");
         let match_ = find_expr(&body, |it| matches!(it, Expr::Match { .. }));
@@ -965,7 +965,7 @@ fn type_checking_finds_where_a_body_stops_being_reachable() {
             [UnreachableAt::Arm { match_expr: match_, index: 0 }]
         );
         assert!(after_return(&body, &all[0]));
-
+    
         // An explicit match on `!` is quiet, and so is the `match` of a desugared `?`.
         assert_eq!(found("never").1, []);
         assert_eq!(found("question").1, []);
@@ -995,7 +995,7 @@ fn neg() {
 #[test]
 fn an_operator_error_carries_its_unmet_goals() {
     let db = fixture::db(OPERATORS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         // Each goal as `Trait` and the name of its self type.
         let names = |goals: &[StoredGoal]| -> Vec<(String, String)> {
             goals
@@ -1034,7 +1034,7 @@ fn an_operator_error_carries_its_unmet_goals() {
         };
         let pair = |trait_: &str, self_ty: &str| (trait_.to_owned(), self_ty.to_owned());
         let types = default_types();
-
+    
         // rustc: "an implementation of `PartialEq` might be missing for `X`", from the leaf
         // goal of `W<X>: PartialEq`, and the `bool` the comparison is expected to be.
         assert_eq!(
@@ -1043,7 +1043,7 @@ fn an_operator_error_carries_its_unmet_goals() {
         );
         let own: Vec<_> = binary("own").into_iter().map(|(goals, _)| goals).collect();
         assert_eq!(own, [vec![pair("PartialEq", "X")]], "the trait's own goal is its leaf");
-
+    
         let (_, result) = infer(&db, "neg");
         let found: Vec<_> = result
             .diagnostics()
@@ -1080,7 +1080,7 @@ fn not() {
 #[test]
 fn an_operator_error_keeps_an_undecided_literal_type() {
     let db = fixture::db(AT_ERROR).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let types = default_types();
         let fresh_int = TyKind::Infer(InferTy::FreshIntTy(0));
         let at_error = |name: &str| -> Vec<Vec<TyKind<'_>>> {
@@ -1140,7 +1140,7 @@ fn fits() {
 #[test]
 fn a_call_whose_arguments_do_not_fit_carries_its_argument_matrix() {
     let db = fixture::db(ARGUMENTS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let types = default_types();
         let fresh_int = TyKind::Infer(InferTy::FreshIntTy(0));
         // (whether the count fits, is_fn_trait_call, the call's `CallArguments`)
@@ -1163,7 +1163,7 @@ fn a_call_whose_arguments_do_not_fit_carries_its_argument_matrix() {
         let rows = |args: &hir_ty::CallArguments| {
             (0..args.provided.len()).map(|it| args.compatible_with(it).to_vec()).collect::<Vec<_>>()
         };
-
+    
         let count = calls("count");
         let [(fits, trait_call, args)] = &count[..] else { panic!("one count error") };
         assert!(!fits && !trait_call && !args.is_method && args.method.is_none());
@@ -1171,7 +1171,7 @@ fn a_call_whose_arguments_do_not_fit_carries_its_argument_matrix() {
         let provided: Vec<_> = args.provided.iter().map(|it| it.as_ref().kind()).collect();
         assert_eq!(provided, [types.types.u8.kind(), fresh_int], "`2` is undecided at the error");
         assert_eq!(rows(args), [vec![0], vec![0]], "either argument fits `u8`");
-
+    
         for name in ["swapped", "method"] {
             let found = calls(name);
             let [(fits, _, args)] = &found[..] else { panic!("one error of {name}") };
@@ -1181,13 +1181,13 @@ fn a_call_whose_arguments_do_not_fit_carries_its_argument_matrix() {
             assert_eq!(args.provided[1].as_ref().kind(), fresh_int);
             assert_eq!(rows(args), [vec![1], vec![0]], "{name}: each fits only the other's input");
         }
-
+    
         let closure = calls("closure");
         let [(fits, trait_call, args)] = &closure[..] else { panic!("one E0057") };
         assert!(!fits && *trait_call && !args.is_method);
         assert!(matches!(args.callee.as_ref().kind(), TyKind::Closure(..)));
         assert_eq!(rows(args), [vec![0], vec![0]]);
-
+    
         assert!(calls("fits").is_empty());
     });
 }
@@ -1220,7 +1220,7 @@ fn enum_plain() {
 #[test]
 fn a_cast_to_a_pointer_of_unknown_kind_is_e0641() {
     let db = fixture::db(CASTS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let errors = |name: &str| -> Vec<CastError> {
             let (_, result) = infer(&db, name);
             result
@@ -1265,7 +1265,7 @@ fn count() {
 #[test]
 fn pattern_errors_carry_what_rustc_reports() {
     let db = fixture::db(PATTERNS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let ranges = |name: &str| -> Vec<(Option<(TyKind<'_>, bool)>, Option<bool>)> {
             let (_, result) = infer(&db, name);
             result
@@ -1292,7 +1292,7 @@ fn pattern_errors_carry_what_rustc_reports() {
             (both[0].0.as_ref().map(|(_, fail)| *fail), both[0].1),
             (Some(true), Some(true))
         );
-
+    
         let counts = |name: &str| -> Vec<bool> {
             let (_, result) = infer(&db, name);
             result
@@ -1328,7 +1328,7 @@ fn values() {
 #[test]
 fn inference_records_the_value_each_path_resolved_to() {
     let db = fixture::db(VALUES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (body, result) = infer(&db, "values");
         let values: Vec<_> = body
             .exprs()
@@ -1372,7 +1372,7 @@ fn bar(arg: private::B) {
 #[test]
 fn a_sized_bound_on_a_trait_object_carries_the_pick() {
     let db = fixture::db(SIZED_BOUND).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (_, result) = infer(&db, "bar");
         let found: Vec<_> = result
             .diagnostics()
@@ -1436,7 +1436,7 @@ impl S {
 #[test]
 fn a_probe_records_the_unstable_items_it_passed_over() {
     let db = fixture::db(UNSTABLE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for name in ["call", "path"] {
             let (body, result) = infer(&db, name);
             let call =
@@ -1463,7 +1463,7 @@ fn a_probe_records_the_unstable_items_it_passed_over() {
 #[test]
 fn a_field_naming_a_method_keeps_its_probe_s_unstable_items() {
     let db = fixture::db(UNSTABLE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (body, result) = infer(&db, "field");
         let field = find_expr(&body, |it| matches!(it, Expr::Field { .. }));
         let nodes: Vec<_> = result.unstable_candidate_nodes().collect();
@@ -1521,7 +1521,7 @@ fn new_call() {
 #[test]
 fn a_2018_crate_records_the_calls_the_2021_prelude_makes_ambiguous() {
     let db = fixture::db(EDITIONS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let lints = |name: &str| -> Vec<InferenceDiagnostic> {
             let (_, result) = infer(&db, name);
             let lint = |it: &&InferenceDiagnostic| {
@@ -1533,7 +1533,7 @@ fn a_2018_crate_records_the_calls_the_2021_prelude_makes_ambiguous() {
             };
             result.diagnostics().iter().filter(lint).cloned().collect()
         };
-
+    
         let call = lints("old_call");
         let [
             InferenceDiagnostic::EditionDependentMethodCall {
@@ -1551,7 +1551,7 @@ fn a_2018_crate_records_the_calls_the_2021_prelude_makes_ambiguous() {
         let ItemContainerId::TraitId(_) = method.lookup(&db).container else {
             panic!("a trait pick is the trait's `try_into`");
         };
-
+    
         let path = lints("old_path");
         let [
             InferenceDiagnostic::FullyQualifiedCallFrom2018 {
@@ -1562,7 +1562,7 @@ fn a_2018_crate_records_the_calls_the_2021_prelude_makes_ambiguous() {
         else {
             panic!("`u8::try_from` is linted as a 2021 prelude collision, not {path:?}");
         };
-
+    
         assert!(lints("new_call").is_empty(), "a 2021 crate has the new prelude already");
     });
 }
@@ -1595,7 +1595,7 @@ fn ident() { nope; }
 #[test]
 fn a_path_that_names_nothing_reports_its_first_failing_segment() {
     let db = fixture::db(UNRESOLVED_PATHS).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let segments = |name: &str| -> Vec<u32> {
             let (_, result) = infer(&db, name);
             result
@@ -1673,7 +1673,7 @@ fn path() -> i32 {
 #[test]
 fn a_method_call_keeps_the_unstable_method_its_probe_passed_over() {
     let db = fixture::db(UNSTABLE_METHOD).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for name in ["call", "path"] {
             let (_, result) = infer(&db, name);
             let found: Vec<_> = result // alloc: a test's list

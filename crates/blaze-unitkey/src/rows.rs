@@ -12,10 +12,15 @@ use blaze_ids::ContentId;
 /// No row: a `parent` at the top, a table index not given.
 pub const NONE: u32 = u32::MAX;
 
-/// The layout of a file image's tables, [`ImageTables::layout`]. 2: the read-addressed image
-/// (D39): no name pool, a row's header and own-text digests and its escapes; 1 was the
-/// text-closure image, whose rows a reader of this layout refuses by name.
-pub const LAYOUT: u32 = 2;
+/// The layout of a file image's tables, [`ImageTables::layout`]. 5: a module spelled in a macro
+/// definition's body has a mod row ([`IN_MACRO`]), and the macros defined and called are a
+/// table ([`MacroRow`]). 4: a module spelled in an item-level macro call's tokens has a mod row
+/// ([`IN_CALL`]; both `crate::mods`, "Modules a macro call writes"). 3: every row's path is its own (`crate::image`,
+/// "Stable ids"), and had no row for such a module. 2, the first read-addressed image (D39: no name pool, a
+/// row's header and own-text digests and its escapes), gave the third of three equal rows the
+/// first one's path, so an image of it can hold two rows of one stable id: a reader of this
+/// layout refuses it by name. 1 was the text-closure image.
+pub const LAYOUT: u32 = 5;
 
 blaze_format::record! {
     /// A run of a pool: `len` elements from element `at`.
@@ -108,7 +113,8 @@ blaze_format::record! {
         /// The digests of the items written in the row's body that escape it (the escape
         /// pool), in token order.
         pub escapes: Span,
-        /// The in-file path (the string pool): `a::b`, `{impl ...}::f`, with `#n` for a repeat.
+        /// The in-file path (the string pool): `a::b`, `{impl ...}::f`, with `#k` on the `k`-th
+        /// repeat of one (path, kind) in file order (`crate::image`, "Stable ids").
         pub path: Span,
         /// The item's own `#[cfg]`, encoded ([`crate::cfgs`]); empty for none.
         pub cfg: Span,
@@ -144,6 +150,37 @@ blaze_format::record! {
 /// [`ModRow::flags`]: an inline module (`mod a { .. }`), which only gives its children a
 /// directory.
 pub const INLINE: u32 = 1;
+/// [`ModRow::flags`]: a module spelled in the tokens of an item-level macro call (or of a call
+/// nested in its token tree), not parsed as an item (`crate::mods`, "Modules a macro call
+/// writes"): `row` is the call's item row; its `#[path]`s are every `path = ".."` in the
+/// attributes before it in the tokens, each unconditional; every candidate file of it that
+/// exists is the unit's, whatever cfg the tokens around it say.
+pub const IN_CALL: u32 = 1 << 1;
+/// [`ModRow::flags`]: a module spelled in the body of a `macro_rules!` (or `macro`) the file
+/// defines: `row` is the definition's item row and `parent` an inline module of the body or
+/// [`NONE`]. It is declared at every call of a macro of that name in the unit, not here
+/// (`crate::mods::macro_files`); its `#[path]`s are as [`IN_CALL`]'s.
+pub const IN_MACRO: u32 = 1 << 2;
+
+/// [`MacroRow::flags`]: a definition, `macro_rules! name` or `macro name`.
+pub const DEFINES: u32 = 1;
+/// [`MacroRow::flags`]: a call, at item level or in the tokens of an item-level call.
+pub const CALLED: u32 = 1 << 1;
+
+blaze_format::record! {
+    /// A macro the file defines or calls where it can write a `mod` (`crate::mods`, "Modules a
+    /// macro call writes"): its name (a call's last path segment, `r#` cut), the item row of the
+    /// definition or of the item-level call it is (or is in), and for a call the inline module
+    /// it is in ([`NONE`] at the file's top level).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct MacroRow: 1 {
+        pub name: Span,
+        pub row: u32,
+        pub parent: u32,
+        pub flags: u32,
+        pub pad: u32,
+    }
+}
 
 blaze_format::record! {
     /// One module declaration: `mod name;` (a file the caller reads) or `mod name { .. }`.
@@ -153,7 +190,7 @@ blaze_format::record! {
         pub name: Span,
         /// Its `#[path]`s, each with the `cfg_attr` condition it sits under (the path table).
         pub paths: Span,
-        /// The item row of the declaration (its `#[cfg]`).
+        /// The item row of the declaration (its `#[cfg]`), or of the macro call it is in.
         pub row: u32,
         /// The enclosing inline module's mod row, or [`NONE`].
         pub parent: u32,
@@ -185,6 +222,7 @@ pub mod section {
     pub const MODS: u32 = 8;
     pub const PATHS: u32 = 9;
     pub const TREE: u32 = 10;
+    pub const MACROS: u32 = 11;
 }
 
 blaze_format::record! {
@@ -200,6 +238,7 @@ blaze_format::record! {
         pub lates: Slice<LateRow>,
         pub mods: Slice<ModRow>,
         pub paths: Slice<PathRow>,
+        pub macros: Slice<MacroRow>,
         /// The parse record (`syntax::image::write`), at a multiple of 16 of the buffer.
         pub tree: Slice<u8>,
         /// The file's inner `#![cfg]`, encoded; empty for none.

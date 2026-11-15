@@ -56,7 +56,7 @@ pub struct Semantics<'db> {
 /// blaze-diagnostics' `pieces`) reads no tree this hands out, which is the live file's and so
 /// moves with every edit. The unwind is the probe's answer, "beyond its key", caught by the
 /// probe's own query; nothing stands in for what was asked, and no panic hook runs
-/// (`resume_unwind`), as with `blaze_query`'s `Cancelled`.
+/// (`resume_unwind`), as with `blaze_memo`'s `Cancelled`.
 #[derive(Debug)]
 pub struct Asked;
 

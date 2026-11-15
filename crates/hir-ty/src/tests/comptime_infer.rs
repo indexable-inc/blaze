@@ -127,7 +127,7 @@ fn a_for_const_body_is_checked_once_against_its_binders_bounds() {
         "//- minicore: sized, copy, clone\n#![feature(blaze_comptime, lang_items)]\n{REFLECT}{BODIES}"
     );
     let db = fixture::db(&fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let bounded = function(&db, "bounded");
         let lowered =
             GenericPredicates::query_with_diagnostics(&db, GenericDefId::FunctionId(bounded));
@@ -148,7 +148,7 @@ fn a_for_const_body_is_checked_once_against_its_binders_bounds() {
             binder_clauses, 1,
             "`for<F: Field<T>> F::Type: Show` is one field binder clause"
         );
-
+    
         assert_env_has_no_error(&db, bounded);
         let result = infer(&db, bounded);
         assert!(result.diagnostics().is_empty(), "{:?}", result.diagnostics());
@@ -159,7 +159,7 @@ fn a_for_const_body_is_checked_once_against_its_binders_bounds() {
         };
         assert!(matches!(comptime_loop.binder.as_ref().kind(), TyKind::Placeholder(_)));
         assert!(result.comptime_max_universe() >= comptime_loop.universe());
-
+    
         // The same body with no bound on the fields' types: `show` is refused once, for `F`,
         // not once per field.
         let result = infer(&db, function(&db, "unbounded"));
@@ -180,7 +180,7 @@ fn a_for_const_body_is_checked_once_against_its_binders_bounds() {
 fn without_the_feature_inference_sees_no_comptime_loop() {
     let fixture = format!("//- minicore: sized, copy, clone\n{REFLECT}{BODIES}");
     let db = fixture::db(&fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for name in ["bounded", "unbounded"] {
             let func = function(&db, name);
             let result = infer(&db, func);
@@ -226,7 +226,7 @@ where
 "#
     );
     let db = fixture::db(&fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let nested = function(&db, "nested");
         assert_env_has_no_error(&db, nested);
         let result = infer(&db, nested);
@@ -274,7 +274,7 @@ where
 "#
     );
     let db = fixture::db(&fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let through = function(&db, "through");
         assert_env_has_no_error(&db, through);
         let result = infer(&db, through);
@@ -320,7 +320,7 @@ where
 "#
     );
     let db = fixture::db(&fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let dependent = function(&db, "dependent");
         let lowered =
             GenericPredicates::query_with_diagnostics(&db, GenericDefId::FunctionId(dependent));
@@ -357,7 +357,7 @@ impl<T> Source<T> for S where for<G: Field<T>> G::Type: Show {
 "#
     );
     let db = fixture::db(&fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for func in [function(&db, "member"), method(&db, "S", "take")] {
             assert_env_has_no_error(&db, func);
             let result = infer(&db, func);

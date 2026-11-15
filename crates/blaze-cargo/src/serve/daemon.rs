@@ -1198,10 +1198,6 @@ pub struct MemoryLine<'a> {
     pub heap: u64,
     /// The chunks no owner holds ([`blaze_mem::chunks::cached`]).
     pub chunks: blaze_mem::chunks::Cached,
-    /// The most reads one query run held (and the run, `` `query` of key ``) and the most
-    /// pending rows one task held ([`blaze_query::db::stack_high_water`]), what the runaway
-    /// bounds are set against; not shown while both counts are 0.
-    pub stacks: blaze_query::db::StackHighWater,
 }
 
 impl MemoryLine<'_> {
@@ -1333,14 +1329,6 @@ impl fmt::Display for MemoryLine<'_> {
                 gib(self.chunks.cold),
             )?;
         }
-        let blaze_query::db::StackHighWater { run_reads, run, pending } = &self.stacks;
-        if (*run_reads, *pending) != (0, 0) {
-            write!(f, "; query stack most reads one run {run_reads}")?;
-            if !run.is_empty() {
-                write!(f, " ({run})")?;
-            }
-            write!(f, ", most pending rows one task {pending}")?;
-        }
         let total = self.blocks.total();
         if total.carved == 0 {
             return Ok(());
@@ -1385,8 +1373,7 @@ pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     let heap = blaze_graph::arena::held();
     let blocks = blaze_mem::blocks::snapshot();
     let chunks = blaze_mem::chunks::cached();
-    let stacks = blaze_query::db::stack_high_water();
-    let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks, stacks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
+    let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
     // logged: the info event below
     eprintln!("blaze serve: {said}");
     tracing::info!(target: "blaze", "{said}");
@@ -2842,10 +2829,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         for build in self.jobs.answered.drain(..) {
             self.observe.answered(build);
         }
-        // The run logs of builds whose front end was kept, named after their answers.
-        if !self.jobs.ran.is_empty() {
-            self.observe.ran(std::mem::take(&mut self.jobs.ran));
-        }
     }
 
     /// The stall watchdog's turn: once the plane's tasks run and none of its counts (the worker
@@ -2880,7 +2863,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         let progress = Progress {
             jobs: pool.ended(),
-            queries: blaze_query::db::completed(),
+            queries: blaze_memo::completed() + blaze_query::db::completed(),
             steps: self.settled + self.job_effects,
             working: self.working,
         };
@@ -4471,14 +4454,11 @@ mod tests {
             ..Default::default()
         };
         let chunks = blaze_mem::chunks::Cached { warm: 1 << 29, cold: 1 << 30 };
-        let said = MemoryLine {
-            memory: &memory,
-            blocks: &blocks,
-            resident: Some(12 << 30),
-            heap: 6 << 30,
-            chunks,
-            stacks: blaze_query::db::StackHighWater::default(),
-        }
+        let said = MemoryLine { memory: &memory,
+        blocks: &blocks,
+        resident: Some(12 << 30),
+        heap: 6 << 30,
+        chunks }
         .to_string();
         let infer = said
             .find(&format!(
@@ -4506,14 +4486,11 @@ mod tests {
         );
         // An allocator that keeps no tags says so, rather than show every tag holding none.
         let untagged = Snapshot { heap_by_tag: false, ..memory };
-        let said_untagged = MemoryLine {
-            memory: &untagged,
-            blocks: &blocks,
-            resident: None,
-            heap: 6 << 30,
-            chunks,
-            stacks: blaze_query::db::StackHighWater::default(),
-        }
+        let said_untagged = MemoryLine { memory: &untagged,
+        blocks: &blocks,
+        resident: None,
+        heap: 6 << 30,
+        chunks }
         .to_string();
         assert!(
             said_untagged
@@ -4531,14 +4508,11 @@ mod tests {
             "{said}"
         );
         let none = blaze_mem::blocks::Snapshot::default();
-        let unknown = MemoryLine {
-            memory: &memory,
-            blocks: &none,
-            resident: None,
-            heap: 0,
-            chunks: blaze_mem::chunks::Cached::default(),
-            stacks: blaze_query::db::StackHighWater::default(),
-        }
+        let unknown = MemoryLine { memory: &memory,
+        blocks: &none,
+        resident: None,
+        heap: 0,
+        chunks: blaze_mem::chunks::Cached::default() }
         .to_string();
         assert!(unknown.starts_with("memory: committed 5.00 GiB"), "{unknown}");
         assert!(!unknown.contains("blocks"), "{unknown}");

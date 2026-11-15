@@ -12,7 +12,7 @@ use super::stop_of;
 fn an_evaluator_error_names_its_type_outside_an_attach() {
     let db = fixture::db("pub struct Wrapper { pub inner: [u8] }").into_db();
     let krate = fixture::test_crate(&db);
-    let error = blaze_query::db::attach(&db, || {
+    let error = blaze_memo::attach(&db, || {
         let adt = test_items::declarations(&db, krate)
             .into_iter()
             .find_map(|it| match it {

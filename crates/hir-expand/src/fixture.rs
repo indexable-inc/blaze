@@ -1,7 +1,7 @@
 //! Test databases from fixture text: a fixture ([`FixtureWithProjectMeta`]) read into a [`Db`]
-//! through the inputs a build sets. Each source root's files are one view
-//! ([`Db::set_view_root`]), the crate graph is set by [`CrateGraphBuilder::set_in_db`], and the
-//! test proc macros by [`ProcMacrosBuilder`]. [`db`] makes one; the [`Fixture`] it returns
+//! through the edits a build makes ([`Db::edit`]). Each source root's files are one view
+//! (`Edit::set_view_root`), the crate graph is one commit (`Edit::set_crate_graph`), and the
+//! test proc macros the next ([`ProcMacrosBuilder`]). [`db`] makes one; the [`Fixture`] it returns
 //! owns the database and answers the files, the `$0` position or range and the test crate.
 //!
 //! # Fixture syntax
@@ -48,7 +48,8 @@
 //! Each file is at its fixture path under `/`, the one directory the fixture's views are of;
 //! minicore is `/sysroot/core/lib.rs` and the proc macros' crate `/sysroot/proc_macros/lib.rs`.
 //! A fixture's files have the file IDs from 0 in its order, then minicore's, then the proc
-//! macros'. An edit after setup is [`Db::set_file_text`].
+//! macros'. An edit after setup is [`Fixture::edit`], which commits and makes the fixture's
+//! file ids again (an id of an arena the commit dropped is dead).
 
 use std::{any::TypeId, str::FromStr, sync};
 
@@ -60,7 +61,6 @@ use base_db::{
     target::{Arch, TargetData},
 };
 use blaze_hash::HashSet;
-use blaze_query::db::{Durability, Setter};
 use cfg::CfgOptions;
 use intern::{Symbol, sym};
 use itertools::Itertools;
@@ -98,14 +98,18 @@ const FIXTURE_ENV: &str = "__ra_is_test_fixture";
 /// A database made from a fixture, with the files it has and where its `$0` is.
 pub struct Fixture {
     db: Db,
-    /// The fixture's own files, in its order.
+    /// The fixture's own files, in its order, as ids of the current snapshot: made again from
+    /// `keys` after each commit ([`Fixture::refresh`]).
     files: Vec<EditionedFileId>,
+    /// What each of `files` is: its file, edition and syntax extensions, stable across commits.
+    keys: Vec<(FileId, Edition, Extensions)>,
     paths: Vec<String>,
     /// The line of the fixture each file's text starts at.
     lines: Vec<usize>,
     /// Minicore's file and the proc macros', those it has.
     sysroot_files: Vec<FileId>,
-    marked: Option<(EditionedFileId, RangeOrOffset)>,
+    /// The index in `files` of the file `$0` marks, and what it marks.
+    marked: Option<(usize, RangeOrOffset)>,
 }
 
 /// The database of `fixture`, with every test proc macro its `//- proc_macros:` names.
@@ -122,7 +126,49 @@ pub fn db_with_proc_macros(
     #[rust_analyzer::rust_fixture] fixture: &str,
     extra: Vec<(String, ProcMacro)>,
 ) -> Fixture {
-    build(fixture, extra)
+    // No fact boundaries for this crate's own tests (hir-expand's queries are below every
+    // boundary; blaze-item-hash, above this crate, marks them).
+    build(fixture, extra, || for_tests(|_| {}, blaze_memo::Reads::Off))
+}
+
+/// [`db`] in a build's database ([`Db::logged`]: single flight across tasks,
+/// `blaze_memo::Scheduled`, and batches on the pool), with a run log and no read lists: for a
+/// test whose queries are asked from several threads at once (a store's own threads,
+/// `hir_def::deps::ImageStore::for_each`). A test database's single flight is one task's
+/// (`blaze_memo::Alone`): it refuses, by name, an ask of a key another task runs.
+#[track_caller]
+pub fn db_on_threads(#[rust_analyzer::rust_fixture] fixture: &str) -> Fixture {
+    build(fixture, Vec::new(), || Db::logged(|_| {}, blaze_memo::Reads::Off))
+}
+
+/// [`db`] that several tasks drive at once while its batches stay on the calling thread in
+/// this thread's order ([`Db::for_tests_driven`]: single flight across tasks,
+/// `blaze_memo::Scheduled`): for a test that runs a build driver or a simulation's tasks over
+/// the fixture and needs the same order every run. It goes when a test database's own flight
+/// can wait off a fiber (`blaze_graph::pool`'s off-fiber waits are not deadline waits yet).
+#[track_caller]
+pub fn db_driven(#[rust_analyzer::rust_fixture] fixture: &str) -> Fixture {
+    build(fixture, Vec::new(), || Db::for_tests_driven(|_| {}, blaze_memo::Reads::Off))
+}
+
+/// [`db`] whose queries keep read lists ([`Db::for_tests_with_reads`]), so
+/// `blaze_memo::record` answers on it: for a test that checks what a query read.
+#[track_caller]
+pub fn db_with_reads(#[rust_analyzer::rust_fixture] fixture: &str) -> Fixture {
+    build(fixture, Vec::new(), || for_tests(|_| {}, blaze_memo::Reads::Kept))
+}
+
+/// [`db`] whose first snapshot marks its fact boundaries with `boundaries` (a boundary can be
+/// marked only as a database's first snapshot is built, `blaze_memo::Builder::mark_boundary`)
+/// and keeps read lists or not as `reads` says: for the tests of a crate above this one that
+/// check which boundary rows a query's read list holds (`hir-ty`'s body store).
+#[track_caller]
+pub fn db_with_boundaries(
+    #[rust_analyzer::rust_fixture] fixture: &str,
+    boundaries: fn(&mut blaze_memo::Builder),
+    reads: blaze_memo::Reads,
+) -> Fixture {
+    build(fixture, Vec::new(), || for_tests(boundaries, reads))
 }
 
 /// Sets the file at `path` (absolute, as a fixture names its files) to `bytes`, as a checkout's
@@ -183,7 +229,8 @@ pub fn set_bytes(db: &mut Db, path: &str, bytes: &[u8]) -> FileId {
         })
         .collect();
     let partition = Default::default();
-    let change = db
+    let mut edit = db.edit();
+    let change = edit
         .set_view_root(ViewRoot {
             base: &dir,
             built: &[],
@@ -193,6 +240,7 @@ pub fn set_bytes(db: &mut Db, path: &str, bytes: &[u8]) -> FileId {
         })
         .unwrap_or_else(|error| panic!("`{path}`: {error}"));
     assert!(change.removed.is_empty(), "setting `{path}` removed {:?}", change.removed);
+    _ = edit.commit();
     let set = db.source_root(other).source_root(&*db);
     *set.file_for_path(&VfsPath::from(path.clone()))
         .unwrap_or_else(|| panic!("`{path}` is in no source root"))
@@ -214,40 +262,85 @@ pub fn test_crate(db: &Db) -> Crate {
         .expect("the fixture has a crate that is neither a language crate nor a dependency")
 }
 
-/// `out` with each raw interned id renumbered, per id type, in the order `out` first names it:
-/// `Crate(Id(10240))` is `Crate(Id(#0))`, `FunctionId(8c03)` is `FunctionId(#0)`. A raw id is
-/// its place in interning order (its ingredient's page, made when the ingredient first
-/// interns), which anything interned first moves; which lines name the same id is what an
-/// expectation holds. For every test whose expectation prints ids.
+/// `out` with each raw id renumbered, per id type, in the order `out` first names it:
+/// `StructId(1.0:25)` is `StructId(#0)`, and the id an interned struct's print begins with,
+/// `ModuleIdLt { [id]: 1.0:7, .. }`, is `ModuleIdLt { [id]: #0, .. }`. A raw id is its arena,
+/// the arena's generation and its place in that arena's interning order (`arena.generation:place`),
+/// which anything interned first moves; which lines name the same id is what an expectation
+/// holds. For every test whose expectation prints ids.
 pub fn stable_ids(out: &str) -> String {
     use std::fmt::Write as _;
+    /// What an interned struct's print names its own id by, before the id.
+    const FIELD: &str = "[id]: ";
     let mut labels = blaze_hash::HashMap::<(&str, &str), usize, Global>::default();
     let mut counts = blaze_hash::HashMap::<&str, usize, Global>::default();
     // alloc: a test's expectation text, once
     let mut result = String::with_capacity(out.len());
     let (mut at, mut copied) = (0, 0);
-    while let Some(found) = out[at..].find("Id(") {
-        let open = at + found + 2;
-        let name_start = out[..open]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .map_or(0, |it| it + 1);
-        let name = &out[name_start..open];
-        let end = out[open + 1..].find(|c: char| !c.is_ascii_hexdigit()).map(|it| open + 1 + it);
-        match end {
-            Some(end) if end > open + 1 && out[end..].starts_with(')') => {
-                let raw = &out[open + 1..end];
-                let label = *labels.entry((name, raw)).or_insert_with(|| {
-                    let count = counts.entry(name).or_default();
-                    *count += 1;
-                    *count - 1
-                });
-                result.push_str(&out[copied..=open]);
-                write!(result, "#{label}").unwrap();
-                copied = end;
-                at = end;
+    let ident_start = |end: usize| {
+        out[..end].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |it| it + 1)
+    };
+    /// Whether `raw` is `arena.generation:place`, each a decimal number.
+    fn memo_id(raw: &str) -> bool {
+        let number = |it: &str| !it.is_empty() && it.bytes().all(|c| c.is_ascii_digit());
+        raw.split_once('.').is_some_and(|(arena, rest)| {
+            number(arena)
+                && rest.split_once(':').is_some_and(|(generation, place)| number(generation) && number(place))
+        })
+    }
+    loop {
+        // The next place a raw id can begin: after a `(` or after `[id]: `.
+        let bare = out[at..].find('(').map(|it| at + it + 1);
+        let field = out[at..].find(FIELD).map(|it| at + it + FIELD.len());
+        let (start, is_field) = match (bare, field) {
+            (Some(bare), Some(field)) if field < bare => (field, true),
+            (Some(bare), _) => (bare, false),
+            (None, Some(field)) => (field, true),
+            (None, None) => break,
+        };
+        // The id's type: the name before `(`, or the struct's name before ` { [id]: `.
+        let name = if is_field {
+            let before = start - FIELD.len();
+            match out[..before].strip_suffix(" { ") {
+                Some(head) => &out[ident_start(head.len())..head.len()],
+                None => FIELD,
             }
-            _ => at = open + 1,
+        } else {
+            &out[ident_start(start - 1)..start - 1]
+        };
+        // An id is `arena.generation:place`, or, in a type named `..Id`, hex digits alone. A
+        // pretty print (`{:#?}`) puts a bare id on a line of its own, with a comma after it:
+        // `BlockId(\n    3.0:26,\n)`.
+        let from = match is_field {
+            true => start,
+            false => out.len() - out[start..].trim_start().len(),
+        };
+        let end = out[from..]
+            .find(|c: char| !(c.is_ascii_hexdigit() || c == '.' || c == ':'))
+            .map_or(out.len(), |it| from + it);
+        let raw = &out[from..end];
+        let hex = !raw.is_empty() && raw.bytes().all(|c| c.is_ascii_hexdigit());
+        /// Whether `rest` ends a bare id: `)`, or a pretty print's `,` and then `)`.
+        fn closes(rest: &str) -> bool {
+            rest.starts_with(')') || rest.strip_prefix(',').is_some_and(|it| it.trim_start().starts_with(')'))
         }
+        let is_id = match is_field {
+            true => (memo_id(raw) || hex) && out[end..].starts_with([',', ' ', '}']),
+            false => (memo_id(raw) || (hex && name.ends_with("Id"))) && closes(&out[end..]),
+        };
+        if !is_id {
+            at = start;
+            continue;
+        }
+        let label = *labels.entry((name, raw)).or_insert_with(|| {
+            let count = counts.entry(name).or_default();
+            *count += 1;
+            *count - 1
+        });
+        result.push_str(&out[copied..from]);
+        write!(result, "#{label}").unwrap();
+        copied = end;
+        at = end;
     }
     result.push_str(&out[copied..]);
     result
@@ -317,12 +410,12 @@ impl Fixture {
 
     /// The file and position or range `$0` marks, if it marks one.
     pub fn marked(&self) -> Option<(EditionedFileId, RangeOrOffset)> {
-        self.marked
+        self.marked.map(|(at, marks)| (self.files[at], marks))
     }
 
     #[track_caller]
     pub fn range_or_offset(&self) -> (EditionedFileId, RangeOrOffset) {
-        self.marked
+        self.marked()
             .expect("Could not find file position in fixture. Did you forget to add an `$0`?")
     }
 
@@ -348,8 +441,31 @@ impl Fixture {
 
     /// Gives `krate` the proc macros `macros` in place of those it had, as loading its dylib
     /// would: a fixture's own `crate:proc-macro:name` has none until it is given some.
+    /// The fixture's ids are made again after the commit; a `Crate` held from before is looked
+    /// up again by its key ([`Crate::key`], [`Db::krate`]).
     pub fn set_proc_macros(&mut self, krate: Crate, macros: Vec<ProcMacro>) {
         ProcMacros::give(&mut self.db, [(krate, Ok(macros))]);
+        self.refresh();
+    }
+
+    /// Makes `change` to the database's world as one commit, then the fixture's file ids
+    /// again: an edit after setup (`edit.set_file_text(file.file_id(db), ..)`, read the file
+    /// id before the call). Ids of the snapshot before are dead where their arena dropped.
+    pub fn edit(&mut self, change: impl FnOnce(&mut base_db::Edit<'_>)) -> base_db::Committed {
+        let mut edit = self.db.edit();
+        change(&mut edit);
+        let committed = edit.commit();
+        self.refresh();
+        committed
+    }
+
+    /// The fixture's file ids made again in the current snapshot, from their keys.
+    fn refresh(&mut self) {
+        let db = &self.db;
+        self.files.clear();
+        self.files.extend(self.keys.iter().map(|&(file, edition, extensions)| {
+            EditionedFileId::new_with_extensions(db, file, edition, extensions)
+        }));
     }
 }
 
@@ -377,7 +493,21 @@ struct PlannedCrate {
 }
 
 #[track_caller]
-fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
+/// The test database of `boundaries` and `reads`: one that runs its batches on the calling
+/// thread and keeps a run log ([`Db::for_tests`]).
+fn for_tests(boundaries: fn(&mut blaze_memo::Builder), reads: blaze_memo::Reads) -> Db {
+    match reads {
+        blaze_memo::Reads::Off => Db::for_tests(boundaries),
+        blaze_memo::Reads::Kept => Db::for_tests_with_reads(boundaries),
+    }
+}
+
+/// The fixture `fixture` written into the empty database `make` makes.
+fn build(
+    fixture: &str,
+    mut extra: Vec<(String, ProcMacro)>,
+    make: impl FnOnce() -> Db,
+) -> Fixture {
     let FixtureWithProjectMeta {
         fixture,
         mini_core,
@@ -517,7 +647,7 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         });
     }
 
-    let mut db = Db::for_tests();
+    let mut db = make();
     let ids = set_files(&mut db, &base, &planned, &roots);
     let sysroot_files = ids[own_files..].to_vec();
     let core_file = has_core.then(|| ids[own_files]);
@@ -547,9 +677,18 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         );
         let prev = by_name.insert(name.clone(), id);
         assert!(prev.is_none(), "multiple crates with same name: {name}");
+        // `deps:a,b=c`: `a` under its own name, and the crate `c` under the name `b`, as a
+        // manifest's `b = { package = "c" }` renames it (std's crates name the facade
+        // `rustc-std-workspace-core` `core` so).
         for dep in meta.deps {
-            let prelude = meta.extern_prelude.as_ref().is_none_or(|it| it.contains(&dep));
-            deps.push((name.clone(), CrateName::normalize_dashes(&dep), prelude));
+            let (as_name, of) = dep.split_once('=').unwrap_or((dep.as_str(), dep.as_str()));
+            let prelude = meta.extern_prelude.as_ref().is_none_or(|it| it.iter().any(|it| it == as_name));
+            deps.push((
+                name.clone(),
+                CrateName::normalize_dashes(as_name),
+                CrateName::normalize_dashes(of),
+                prelude,
+            ));
         }
     }
 
@@ -604,7 +743,7 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
                 graph.add_dep(krate, core_dep(core)).unwrap();
             }
         }
-        for (from, to, prelude) in deps {
+        for (from, as_name, to, prelude) in deps {
             let from_id = by_name[&from];
             // `deps:core` beside `//- minicore:` names minicore's, a dependency of every crate.
             if core.is_some() && to.as_str() == "core" && !by_name.contains_key(&to) {
@@ -613,9 +752,13 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
             let Some(&to_id) = by_name.get(&to) else {
                 panic!("crate `{from}` depends on `{to}`, which the fixture has no crate of")
             };
-            let sysroot = graph[to_id].basic.origin.is_lang();
+            // A sysroot dependency is one the toolchain injects (`Dependency::is_sysroot`): a
+            // language crate under a crate that is not one. A language crate's own dependency is
+            // declared in its manifest (the facade `rustc-std-workspace-core` names `core`), so
+            // `#![no_core]` keeps it in its extern prelude, as rustc keeps an `--extern`.
+            let sysroot = graph[to_id].basic.origin.is_lang() && !graph[from_id].basic.origin.is_lang();
             graph
-                .add_dep(from_id, DependencyBuilder::with_prelude(to, to_id, prelude, sysroot))
+                .add_dep(from_id, DependencyBuilder::with_prelude(as_name, to_id, prelude, sysroot))
                 .unwrap();
         }
     }
@@ -669,14 +812,14 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         graph.seal(krate, base_db::ContentId::of("blaze v2 fixture pin 1", &(at as u64).to_le_bytes()));
     }
 
-    // Setting the crate graph maintains every crate's def map, which reads the proc macros: one
-    // write sets both, so the maintainers run once and see the fixture's.
-    let crates_id_map =
-        db.batch(base_db::Trigger::named("the fixture's crate graph and proc macros"), |db| {
-            let crates_id_map = graph.set_in_db(db);
-            macros.build_in(db, &crates_id_map);
-            crates_id_map
-        });
+    // The crate graph, then the proc macros given to the crates it made (a gift names a crate's
+    // key, known once the graph is committed). Nothing reads the snapshot between the two.
+    let committed = {
+        let mut edit = db.edit();
+        edit.set_crate_graph(graph);
+        edit.commit()
+    };
+    _ = macros.build_in(&mut db, &committed.crates);
 
     let all = all_crates(&db);
     // The syntax extensions of the crate of the fixture's `at`th file (`Fixture::files`).
@@ -686,13 +829,15 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         let krate = all.iter().find(|krate| krate.data(&db).root_file_id == ids[root]);
         krate.map_or(Extensions::NONE, |krate| krate.extensions(&db))
     };
-    let id = |at: usize, edition: Edition| {
-        EditionedFileId::new_with_extensions(&db, ids[at], edition, extensions(at))
-    };
-    let files = editions.iter().enumerate().map(|(at, &edition)| id(at, edition)).collect();
-    let marked = marked.map(|(at, edition, marks)| (id(at, edition), marks));
+    let keys: Vec<(FileId, Edition, Extensions)> =
+        editions.iter().enumerate().map(|(at, &edition)| (ids[at], edition, extensions(at))).collect();
+    // The marked file is the fixture's `at`th, read in its own edition.
+    let marked = marked.map(|(at, _, marks)| (at, marks));
     let paths = planned.into_iter().take(own_files).map(|it| it.path).collect();
-    Fixture { db, files, paths, lines, sysroot_files, marked }
+    let mut fixture =
+        Fixture { db, files: Vec::new_in(Global), keys, paths, lines, sysroot_files, marked };
+    fixture.refresh();
+    fixture
 }
 
 /// Makes the source roots, empty, then sets each one's files (those `Planned::root` puts in
@@ -708,6 +853,7 @@ fn set_files(
     by_id.sort_unstable_by_key(|(id, _)| id.0);
     let mut local = HashSet::new_in(Global);
     let mut library = HashSet::new_in(Global);
+    let mut edit = db.edit();
     for (id, kind) in by_id {
         let root = match kind {
             SourceRootKind::Local => {
@@ -719,13 +865,10 @@ fn set_files(
                 SourceRoot::new_library(FileSet::default())
             }
         };
-        // A library root's set is `HIGH`, a local one's `MEDIUM`, as base-db writes them
-        // (`base_db::FileChange`): a sealed crate's cover reads a library root's.
-        let durability = if root.is_library { Durability::HIGH } else { Durability::MEDIUM };
-        db.set_source_root_with_durability(id, Arc::new(root), durability);
+        edit.set_source_root(id, Arc::new(root));
     }
-    LocalRoots::get(&*db).set_roots(db).to(local);
-    LibraryRoots::get(&*db).set_roots(db).to(library);
+    edit.set_local_roots(local);
+    edit.set_library_roots(library);
 
     let bytes: Vec<blaze_vfs::Bytes> = planned
         .iter()
@@ -756,11 +899,14 @@ fn set_files(
             .collect();
         let view =
             ViewRoot { base, built: &built, partition: &partition, other: id, files: &files };
-        let change =
-            db.set_view_root(view).unwrap_or_else(|error| panic!("the fixture's files: {error}"));
+        let change = edit
+            .set_view_root(view)
+            .unwrap_or_else(|error| panic!("the fixture's files: {error}"));
         assert!(change.removed.is_empty(), "a fixture's view removed {:?}", change.removed);
         assert!(change.no_text.is_empty(), "a fixture's file has no text: {:?}", change.no_text);
     }
+    // The roots and their views, one commit.
+    _ = edit.commit();
 
     planned
         .iter()
@@ -791,10 +937,12 @@ fn sysroot_attr(
                 line.trim().strip_prefix("#![").and_then(|it| it.strip_suffix(']')) == Some(attr)
             })
     };
-    if meta.deps.iter().any(|it| it == "std") || says("no_std") || says("no_core") {
+    // A dependency by the name it is under (`deps:core=rustc_std_workspace_core` is `core`).
+    let named = |name: &str| meta.deps.iter().any(|it| it.split_once('=').map_or(&**it, |(as_name, _)| as_name) == name);
+    if named("std") || says("no_std") || says("no_core") {
         return None;
     }
-    match has_core || meta.deps.iter().any(|it| it == "core") {
+    match has_core || named("core") {
         true => Some(&["no_std"]),
         false => Some(&["feature(no_core)", "no_core"]),
     }

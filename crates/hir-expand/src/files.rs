@@ -18,7 +18,7 @@ use crate::{
 /// * `InFile<SyntaxNode>` -- syntax node in a file
 /// * `InFile<ast::FnDef>` -- ast node in a file
 /// * `InFile<TextSize>` -- offset in a file
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, blaze_memo::Home)]
 pub struct InFileWrapper<FileKind, T> {
     pub file_id: FileKind,
     pub value: T,
@@ -100,7 +100,8 @@ impl<N: AstNode> AstId<N> {
         self.to_ptr(db).text_range()
     }
     pub fn to_ptr(&self, db: &Db) -> AstPtr<N> {
-        self.file_id.ast_id_map(db).get(self.value)
+        let ptr = ptr_in(db, self.file_id, self.value.erase());
+        AstPtr::try_from_raw(ptr).unwrap_or_else(|| panic!("AstIdMap node mismatch with node `{ptr:?}`"))
     }
     pub fn erase(&self) -> ErasedAstId {
         crate::InFile::new(self.file_id, self.value.erase())
@@ -133,8 +134,25 @@ impl ErasedAstId {
         self.to_ptr(db).text_range()
     }
     pub fn to_ptr(&self, db: &Db) -> SyntaxNodePtr {
-        self.file_id.ast_id_map(db).get_erased(self.value)
+        ptr_in(db, self.file_id, self.value)
     }
+}
+
+/// The node `id` names in `file`'s text here. Where the text has no such item, and `file` is a
+/// file of a crate given by its address, the crate's demand stops first with its typed error
+/// (`declarative::stored::missing_ast_id`): the crate's records were found by a key that this
+/// text is not of (an item's id is its kind, its name's hash and an index among its equals,
+/// so no comment, whitespace or body edit moves one, and the key moves with every item added,
+/// removed or renamed). Anything else without the item is a bug of the asker: the map's panic.
+fn ptr_in(db: &Db, file: HirFileId, id: ErasedFileAstId) -> SyntaxNodePtr {
+    let map = file.ast_id_map(db);
+    if let Some(ptr) = map.try_get_erased(id) {
+        return ptr;
+    }
+    if let HirFileId::FileId(file) = file {
+        crate::declarative::stored::missing_ast_id(db, file.file_id(db), id);
+    }
+    map.get_erased(id)
 }
 
 impl<FileKind, N: AstNode> InFileWrapper<FileKind, AstPtr<N>> {

@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Representability {
+pub enum Representability {
     Representable,
     Infinite,
 }
@@ -27,8 +27,8 @@ macro_rules! rtry {
     };
 }
 
-#[blaze_query::tracked(cycle_result = representability_cycle, returns(copy), mem_tag = Infer)]
-pub(crate) fn representability(db: &Db, id: AdtId) -> Representability {
+#[blaze_memo::tracked(cycle_result = representability_cycle, returns(copy), mem_tag = Infer)]
+pub fn representability(db: &Db, id: AdtId) -> Representability {
     match id {
         AdtId::StructId(id) => variant_representability(db, id.into()),
         AdtId::UnionId(id) => variant_representability(db, id.into()),
@@ -43,7 +43,6 @@ pub(crate) fn representability(db: &Db, id: AdtId) -> Representability {
 
 pub(crate) fn representability_cycle(
     _db: &Db,
-    _: blaze_query::db::Id,
     _id: AdtId,
 ) -> Representability {
     Representability::Infinite
@@ -119,13 +118,13 @@ impl<'f> ParamsInReprBuilder<'f> {
     }
 }
 
-fn params_in_repr_cycle(_db: &Db, _: blaze_query::db::Id, _def_id: AdtId) -> ParamsInRepr {
+fn params_in_repr_cycle(_db: &Db, _def_id: AdtId) -> ParamsInRepr {
     ParamsInRepr::default()
 }
 
 // This is a query because a chain of types that each hold the one before several times would
 // otherwise be walked once per path through it.
-#[blaze_query::tracked(cycle_result = params_in_repr_cycle, returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(cycle_result = params_in_repr_cycle, returns(ref), owns, mem_tag = Infer)]
 fn params_in_repr(db: &Db, def_id: AdtId) -> ParamsInRepr {
     blaze_mem::frame::current(|frame| {
         let mut params_in_repr = ParamsInReprBuilder::new(frame);

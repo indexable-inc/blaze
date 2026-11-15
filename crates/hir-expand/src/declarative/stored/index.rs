@@ -285,7 +285,7 @@ pub fn key(set: &ContentId) -> ContentId {
 /// read). Found by the file's content where this database keeps entries, with no parse; made
 /// from the file's parse and kept where it is not found. A database that keeps no entries
 /// makes it from the parse.
-#[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
 pub fn of(db: &Db, file: EditionedFileId, krate: Crate) -> FileIndex {
     let kept = super::of(db);
     let set = super::file_set(db, file);
@@ -300,6 +300,9 @@ pub fn of(db: &Db, file: EditionedFileId, krate: Crate) -> FileIndex {
             return found;
         }
     }
+    // Not found by its content (or no entries are kept): made from its parse, which a file of
+    // a crate given by its address and with no text here may not be (refused, typed, naming it).
+    super::demand_text(db, krate, file);
     let bytes = make(file.parse(db).root(), HirFileId::FileId(file).ast_id_map(db));
     if let Some(kept) = kept {
         kept.put(db, krate, FAMILY, &set, key, &bytes);
@@ -315,7 +318,7 @@ pub fn of(db: &Db, file: EditionedFileId, krate: Crate) -> FileIndex {
 /// A row is a function of its item's tokens, as a file's is; the positions are of the
 /// expansion's text, which the key determines (an expansion's text is made from its tokens
 /// and their spacing, never from the spaces of the text its call or definition is in).
-#[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
 pub fn of_expansion(db: &Db, call: MacroCallId, krate: Crate) -> Option<FileIndex> {
     let set = super::expansion::key(db, call)?;
     let key = key(&set);
@@ -362,13 +365,58 @@ pub fn range(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate) -> Op
 
 /// The hash of every token of the item `ast` of `file`, nothing cut ([`whole_tokens`]): what a
 /// derive or an attribute macro on the item is given, every body included (an enum's
-/// discriminants, an `impl`'s methods), which its row's `header` and `body` leave out. Read
-/// from where the index places the item and the file's text, with no parse. `None` for a node
-/// with no row.
+/// discriminants, an `impl`'s methods), which its row's `header` and `body` leave out. `None`
+/// for a node with no row.
+///
+/// Where this database keeps entries, the hash is an entry of the file ([`WHOLE`], under the
+/// file's content and the item's ast id, both of which the hash is a function of), so a file
+/// whose content is known and whose text is not here (a crate given by its address) answers
+/// with no text. Not kept, it is read from where the index places the item and the file's
+/// text, with no parse, refused first (typed, naming the crate and the file:
+/// [`super::demand_text`]) where the file has no text here; then kept.
+///
+/// Floor (rule 67): one entry read of 16 bytes, found by a hash of the file's set and the ast
+/// id. Cost: 16 bytes and a key an item a derive or an attribute macro is on, whose call's
+/// identity was asked.
 pub fn whole(db: &Db, file: EditionedFileId, ast: ErasedFileAstId, krate: Crate) -> Option<u128> {
     let range = of(db, file, krate).range(ast)?;
+    let kept = super::of(db);
+    let set = super::file_set(db, file);
+    let key = whole_key(&set, ast);
+    if let Some(kept) = kept {
+        let mut found = None;
+        kept.get(db, krate, WHOLE, &set, key, &mut |bytes| {
+            let bytes: [u8; 16] = bytes
+                .try_into()
+                // alloc: error path
+                .map_err(|_| format!("{} bytes, and a whole item's hash is 16", bytes.len()))?;
+            found = Some(u128::from_le_bytes(bytes));
+            Ok(())
+        });
+        if found.is_some() {
+            return found;
+        }
+    }
+    super::demand_text(db, krate, file);
     let text: &str = db.file_text(file.file_id(db)).text(db);
-    Some(whole_tokens(text.get(std::ops::Range::<usize>::from(range))?))
+    let whole = whole_tokens(text.get(std::ops::Range::<usize>::from(range))?);
+    if let Some(kept) = kept {
+        kept.put(db, krate, WHOLE, &set, key, &whole.to_le_bytes());
+    }
+    Some(whole)
+}
+
+/// The family of an item's [`whole`] hash.
+pub const WHOLE: &str = "whole item hash";
+
+const WHOLE_KEY_DOMAIN: &str = "blaze v2 whole item hash";
+
+/// The key of the [`whole`] hash of the item `ast` of the file whose set is `set`: the file's
+/// content and how it is read, which place the item and give its tokens, and the item's id.
+fn whole_key(set: &ContentId, ast: ErasedFileAstId) -> ContentId {
+    let mut hasher = Hasher::new(WHOLE_KEY_DOMAIN);
+    hasher.id(set).update(&LAYOUT.to_le_bytes()).update(&ast.into_raw().to_le_bytes());
+    hasher.finish()
 }
 
 /// The hash of every token of `text` ([`tokens`]), one piece.

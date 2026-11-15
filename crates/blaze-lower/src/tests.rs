@@ -20,7 +20,12 @@ use intern::Symbol;
 use span::Edition;
 use triomphe::Arc;
 
-use super::{Appended, Db, Lower, LowerError, Lowered, Ran, crates, files, lower};
+use super::{Appended, Db, Lower, LowerError, Lowered, Ran, crates, files};
+
+/// [`super::lower`] as a build lowers: the item hash's fact boundaries, no read lists.
+fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
+    super::lower(lower, blaze_item_hash::reads::mark_boundaries, blaze_memo::Reads::Off)
+}
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 const LIBRARY: &str = "/rustc/abc/library";
@@ -300,6 +305,12 @@ fn krate(built: &Built, unit: usize) -> Crate {
     built.lowered.krate(unit).unwrap_or_else(|| panic!("unit {unit} has no crate"))
 }
 
+/// The stable key of `unit`'s crate: what a test compares and keeps across a commit, where a
+/// `Crate` id is of the snapshot it was taken in.
+fn crate_key(built: &Built, unit: usize) -> base_db::CrateKey {
+    krate(built, unit).key(built.lowered.db())
+}
+
 /// The source root `krate`'s root file is in: what the crate reads files from.
 fn root_of(db: &Db, krate: Crate) -> Arc<SourceRoot> {
     let file = krate.data(db).root_file_id;
@@ -337,7 +348,7 @@ fn every_unit_that_compiles_is_a_crate() {
     let crates = built.lowered.crates();
     shared(&*crates);
     for unit in [CORE, RUN, LIB, MACRO, BIN] {
-        assert_eq!(crates.krate(unit), built.lowered.krate(unit));
+        assert_eq!(crates.krate(db, unit), built.lowered.krate(unit));
     }
     assert!(crates.is_proc_macro(MACRO) && !crates.is_proc_macro(LIB));
     // The lib and its test are two crates of one root file: the lib's is the file, the test's
@@ -428,8 +439,9 @@ fn gen_ran(out_dir: &str, cfg: &str) -> Ran {
 fn a_run_applied_leaves_its_build_scripts_crate_as_it_was() {
     let units = units();
     let mut built = lowered(&units).unwrap();
-    let (script, lib) = (krate(&built, BUILD_SCRIPT), krate(&built, LIB));
     let seen = |built: &mut Built| {
+        // The crates taken in the snapshot read: the run commits, and an id is of one snapshot.
+        let (script, lib) = (krate(built, BUILD_SCRIPT), krate(built, LIB));
         let db = built.lowered.db();
         let root = db.file_source_root(script.data(db).root_file_id).source_root_id(db);
         assert_eq!(root, db.file_source_root(lib.data(db).root_file_id).source_root_id(db));
@@ -503,13 +515,16 @@ fn units_apart_only_in_their_profile_and_its_runs_out_dir_are_one_crate() {
 
     // Its twin is taken and changes nothing the front end reads, whatever it gave; the class's
     // own run again is applied again.
+    // Each run commits: the shared crate is taken again in the snapshot read.
     built.lowered.ran(RUN, &gen_ran(OUT_DIR, "other")).unwrap();
     let db = built.lowered.db();
+    let shared = krate(&built, LIB);
     assert!(
         shared.cfg_options(db).check_atom(&flag("has_gen"))
             && !shared.cfg_options(db).check_atom(&flag("other"))
     );
     built.lowered.ran(run, &gen_ran(OUT_FAST, "again")).unwrap();
+    let shared = krate(&built, LIB);
     assert!(shared.cfg_options(built.lowered.db()).check_atom(&flag("again")));
 }
 
@@ -548,7 +563,9 @@ fn units_apart_in_their_runs_opt_level_are_two_crates_each_of_its_own_run() {
     built.lowered.ran(run, &gen_ran(OUT_FAST, "fast_gen")).unwrap();
     built.lowered.ran(RUN, &gen_ran(OUT_DIR, "slow_gen")).unwrap();
     let db = built.lowered.db();
-    let has = |krate: Crate, name: &str| krate.cfg_options(db).check_atom(&flag(name));
+    // The runs commit: the twins are taken again in the snapshot read.
+    let (slow, fast) = (krate(&built, LIB), krate(&built, lib));
+    let has =|krate: Crate, name: &str| krate.cfg_options(db).check_atom(&flag(name));
     assert!(has(fast, "fast_gen") && !has(fast, "slow_gen"));
     assert!(has(slow, "slow_gen") && !has(slow, "fast_gen"));
     for (krate, out_dir) in [(slow, OUT_DIR), (fast, OUT_FAST)] {
@@ -613,11 +630,12 @@ fn readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities() {
     // Taking away the run identity brings back the clash and its diagnostic names the runs.
     let mut same = second.extra_data(db).clone(); // clone: remove the key's distinguishing input
     same.build_script_runs = first.extra_data(db).build_script_runs.clone(); // clone: test control
-    // One change, in the batch that names it (`Db::require_batches`).
-    built.lowered.served_db().batch(
-        base_db::Trigger::named("the test takes away the run identity"),
-        |db| second.set_extra_data(db, same),
-    );
+    // One change: its own edit and commit.
+    let second = second.key(db);
+    let db = built.lowered.served_db();
+    let mut edit = db.edit();
+    edit.set_crate_extra_data(second, same);
+    _ = edit.commit();
     let clash = blaze_items::key::check_crate_keys(built.lowered.db()).unwrap_err().to_string();
     assert!(clash.contains("build-script runs") && clash.contains("release-run"), "{clash}");
 }
@@ -1130,18 +1148,19 @@ fn relowered(built: &mut Built, plan: &Units) -> crate::Relowered {
     built.lowered.relower(lower()).unwrap()
 }
 
-/// What a plan lowered again must leave as it was: the database's view (no input written),
-/// its maintainers' passes, and the crate graph.
-fn written(built: &Built) -> (blaze_query::db::View, u64, ContentId) {
+/// What a plan lowered again must leave as it was: the snapshot (a commit, which a change that
+/// writes nothing never makes, moves its epoch) and the crate graph.
+fn written(built: &Built) -> (blaze_memo::Epoch, ContentId) {
     let db = built.lowered.db();
-    (db.nonce_and_revision().1, db.maintain_passes(), base_db::all_crates_content(db))
+    let epoch = blaze_memo::Database::memo(db).snapshot_epoch();
+    (epoch, base_db::all_crates_content(db))
 }
 
 /// The invariant ([`crate::Graph`]): a request's units are a view over the one crate graph a
 /// front end keeps. Lowering plan A (`build`), then B (`test`: A's units and the library's
 /// `cfg(test)` twin), then A, then B: B makes one crate, the twin, beside A's, each of A's
 /// units keeps its crate, and from then on each plan is found whole: no crate made, no
-/// directory read, no input written (the database's view stands), no maintainer's pass, and
+/// directory read, no input written (the database's view stands), no commit, and
 /// each unit has the crate it had the first time. A build script's run applied under A is
 /// still applied when A is back.
 ///
@@ -1151,11 +1170,13 @@ fn a_plan_lowered_again_is_found_whole_and_writes_nothing() {
     let (build, test) = (build_units(), units());
     let mut built = lowered(&build).unwrap();
     built.lowered.ran(RUN, &gen_ran(OUT_DIR, "made")).unwrap();
-    let of_build: Vec<Crate> =
-        [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().map(|&unit| krate(&built, unit)).collect();
+    // Each unit's crate by its stable key: every relowering commits, and a `Crate` id is of
+    // the snapshot it was taken in.
+    let of_build: Vec<base_db::CrateKey> =
+        [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().map(|&unit| crate_key(&built, unit)).collect();
     let ran_cfg = |built: &Built| {
         let db = built.lowered.db();
-        of_build[2].cfg_options(db).check_atom(&flag("made"))
+        db.krate(of_build[2]).cfg_options(db).check_atom(&flag("made"))
     };
     assert!(ran_cfg(&built), "the run's cfg is the library's");
     let crates_of_build = base_db::all_crates(built.lowered.db()).len();
@@ -1167,14 +1188,15 @@ fn a_plan_lowered_again_is_found_whole_and_writes_nothing() {
         crate::Relowered::Into(crate::Placed { crates_made: 1, roots_made: 0, dirs_read: 0 }),
         "the `cfg(test)` twin, of a package and a directory the front end has"
     );
-    let twin = krate(&built, LIB_TEST);
+    let twin = crate_key(&built, LIB_TEST);
     assert!(!of_build.contains(&twin), "the twin is a crate of its own");
     for (at, &unit) in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().enumerate() {
-        assert_eq!(krate(&built, unit), of_build[at], "unit {unit} keeps its crate");
+        assert_eq!(crate_key(&built, unit), of_build[at], "unit {unit} keeps its crate");
     }
-    let all = base_db::all_crates(built.lowered.db());
+    let db = built.lowered.db();
+    let all = base_db::all_crates(db);
     assert_eq!(all.len(), crates_of_build + 1);
-    assert_eq!(all.last(), Some(&twin), "added after the crates that were there");
+    assert_eq!(all.last().map(|it| it.key(db)), Some(twin), "added after the crates that were there");
     assert!(ran_cfg(&built), "the run applied to the library under `build` stays applied");
 
     // A again, B again, A again: each found whole, nothing written.
@@ -1186,12 +1208,12 @@ fn a_plan_lowered_again_is_found_whole_and_writes_nothing() {
             crate::Relowered::Into(crate::Placed::default()),
             "`{name}` again makes nothing"
         );
-        assert_eq!(written(&built), before, "`{name}` again writes no input and runs no pass");
+        assert_eq!(written(&built), before, "`{name}` again writes no input and commits nothing");
         for (at, &unit) in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().enumerate() {
-            assert_eq!(krate(&built, unit), of_build[at], "`{name}` again: unit {unit}");
+            assert_eq!(crate_key(&built, unit), of_build[at], "`{name}` again: unit {unit}");
         }
         if name == "test" {
-            assert_eq!(krate(&built, LIB_TEST), twin, "the twin is found again");
+            assert_eq!(crate_key(&built, LIB_TEST), twin, "the twin is found again");
         } else {
             assert_eq!(built.lowered.krate(LIB_TEST), None, "`build` has no such unit");
         }
@@ -1304,7 +1326,7 @@ fn many_threads_read_the_one_database_by_reference() {
                     let mut seen: Vec<_> = units
                         .into_iter()
                         .map(|unit| {
-                            let krate = lowered.crates().krate(unit).unwrap();
+                            let krate = lowered.crates().krate(db, unit).unwrap();
                             (
                                 unit,
                                 krate.cfg_options(db).check_atom(&flag("test")),
@@ -1496,21 +1518,23 @@ fn a_plan_key_moves_with_its_packages_files_and_those_below_and_no_other() {
     let units = units();
     let mut built = lowered(&units).unwrap();
     let again = lowered(&units).unwrap();
-    let crates: Vec<Crate> = [CORE, LIB, MACRO, BIN].map(|unit| krate(&built, unit)).to_vec();
-    let keys_of = |lowered: &Lowered, crates: &[Crate]| {
-        let keys = lowered.plan_keys(crates);
+    // A crate id is of one snapshot: each is looked up again in the snapshot it is asked of.
+    let crates_of = |built: &Built| [CORE, LIB, MACRO, BIN].map(|unit| krate(built, unit)).to_vec();
+    let keys_of = |built: &Built| {
+        let crates: Vec<Crate> = crates_of(built);
+        let keys = built.lowered.plan_keys(&crates);
         crates.iter().map(|it| keys[it].clone()).collect::<Vec<_>>()
     };
-    let before = keys_of(&built.lowered, &crates);
+    let before = keys_of(&built);
     for (unit, key) in [CORE, LIB, MACRO, BIN].into_iter().zip(&before) {
         assert!(key.is_ok(), "unit {unit}: {key:?}");
     }
-    let other: Vec<Crate> = [CORE, LIB, MACRO, BIN].map(|unit| krate(&again, unit)).to_vec();
-    assert_eq!(keys_of(&again.lowered, &other), before, "two databases of one plan and tree");
+    assert_eq!(keys_of(&again), before, "two databases of one plan and tree");
 
     // The planted bug of the control: a key that leaves the dependencies out.
-    let planted = |lowered: &Lowered, krate: Crate| {
-        let planned = &lowered.graph.planned[&krate];
+    let planted = |built: &Built| {
+        let lowered = &built.lowered;
+        let planned = &lowered.graph.planned[&krate(built, BIN).key(lowered.db())];
         let mut dirs: Vec<(&str, ContentId)> = (lowered.loads.iter())
             .filter(|it| it.set == planned.set)
             .map(|it| (it.dir.as_str(), it.key.clone().unwrap()))
@@ -1519,7 +1543,7 @@ fn a_plan_key_moves_with_its_packages_files_and_those_below_and_no_other() {
         let dirs: Vec<ContentId> = dirs.into_iter().map(|(_, key)| key).collect();
         crate::found::joined(planned.own.clone().unwrap(), &[], &dirs)
     };
-    let planted_before = planted(&built.lowered, crates[3]);
+    let planted_before = planted(&built);
 
     // An edit of the proc macro's package: `m` moves, and `b` above it; `a` and `core` not.
     let tree = MemTree::default();
@@ -1531,14 +1555,14 @@ fn a_plan_key_moves_with_its_packages_files_and_those_below_and_no_other() {
         |_| Ok(()),
     );
     assert_eq!(refreshed, Ok(true));
-    let after = keys_of(&built.lowered, &crates);
+    let after = keys_of(&built);
     assert_eq!(after[0], before[0], "core: nothing of the library moved");
     assert_eq!(after[1], before[1], "a: none of its files moved, nor any below it");
     assert_ne!(after[2], before[2], "m: its root moved");
     assert_ne!(after[3], before[3], "b: a crate below it moved");
     // The oracle catches the planted bug: `b`'s own files did not move, so a key without its
     // dependencies would find `b`'s record of the macro before the edit.
-    assert_eq!(planted(&built.lowered, crates[3]), planted_before, "the planted key did not move");
+    assert_eq!(planted(&built), planted_before, "the planted key did not move");
 }
 
 #[test]
@@ -1836,6 +1860,12 @@ fn bin_span(built: &Built) -> (u32, u32, u32, u32) {
     (file.index(), editioned.as_u32(), span::ROOT_ERASED_FILE_AST_ID.into_raw(), ctx)
 }
 
+/// The table a proc macro called in the bin asks in: the bin's arena, where its calls are
+/// homed.
+fn bin_contexts(built: &Built) -> blaze_memo::ArenaId {
+    blaze_memo::Id::gid(krate(built, BIN)).arena()
+}
+
 #[test]
 fn what_a_proc_macro_asks_of_its_input_is_answered_from_the_file() {
     use super::{SubRequest, SubResponse, answer};
@@ -1843,31 +1873,32 @@ fn what_a_proc_macro_asks_of_its_input_is_answered_from_the_file() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
     let (raw, file_id, ast_id, _) = bin_span(&built);
+    let contexts = bin_contexts(&built);
     let name = "/w/b/src/main.rs".to_owned();
     assert_eq!(
-        answer(db, SubRequest::FilePath { file_id: raw }),
+        answer(db, contexts, SubRequest::FilePath { file_id: raw }),
         SubResponse::FilePathResult { name: name.clone() }
     );
     assert_eq!(
-        answer(db, SubRequest::LocalFilePath { file_id: raw }),
+        answer(db, contexts, SubRequest::LocalFilePath { file_id: raw }),
         SubResponse::LocalFilePathResult { name: Some(name) }
     );
     assert_eq!(
-        answer(db, SubRequest::SourceText { file_id, ast_id, start: 3, end: 7 }),
+        answer(db, contexts, SubRequest::SourceText { file_id, ast_id, start: 3, end: 7 }),
         SubResponse::SourceTextResult { text: Some("main".to_owned()) }
     );
     assert_eq!(
-        answer(db, SubRequest::SourceText { file_id, ast_id, start: 3, end: 700 }),
+        answer(db, contexts, SubRequest::SourceText { file_id, ast_id, start: 3, end: 700 }),
         SubResponse::SourceTextResult { text: None },
         "a range past the file's end has no text"
     );
     assert_eq!(
-        answer(db, SubRequest::LineColumn { file_id, ast_id, offset: 12 }),
+        answer(db, contexts, SubRequest::LineColumn { file_id, ast_id, offset: 12 }),
         SubResponse::LineColumnResult { line: 1, column: 13 },
         "1-based, as proc_macro's"
     );
     assert_eq!(
-        answer(db, SubRequest::ByteRange { file_id, ast_id, start: 3, end: 7 }),
+        answer(db, contexts, SubRequest::ByteRange { file_id, ast_id, start: 3, end: 7 }),
         SubResponse::ByteRangeResult { range: 3..7 }
     );
 }
@@ -1879,12 +1910,13 @@ fn a_span_written_in_a_file_is_its_own_source_and_has_no_parent() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
     let (_, file_id, ast_id, ctx) = bin_span(&built);
+    let contexts = bin_contexts(&built);
     assert_eq!(
-        answer(db, SubRequest::SpanSource { file_id, ast_id, start: 12, end: 17, ctx }),
+        answer(db, contexts, SubRequest::SpanSource { file_id, ast_id, start: 12, end: 17, ctx }),
         SubResponse::SpanSourceResult { file_id, ast_id, start: 12, end: 17, ctx }
     );
     assert_eq!(
-        answer(db, SubRequest::SpanParent { file_id, ast_id, start: 12, end: 17, ctx }),
+        answer(db, contexts, SubRequest::SpanParent { file_id, ast_id, start: 12, end: 17, ctx }),
         SubResponse::SpanParentResult { parent_span: None }
     );
 }
@@ -1900,7 +1932,8 @@ fn two_spans_of_one_file_join_to_the_span_covering_both() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
     let (_, file_id, ast_id, ctx) = bin_span(&built);
-    let join = |ctx_second: u32| SubRequest::SpanJoin {
+    let contexts = bin_contexts(&built);
+    let join =|ctx_second: u32| SubRequest::SpanJoin {
         file_id,
         ast_id_first: ast_id,
         start_first: 0,
@@ -1912,13 +1945,13 @@ fn two_spans_of_one_file_join_to_the_span_covering_both() {
         ctx_second,
     };
     assert_eq!(
-        answer(db, join(ctx)),
+        answer(db, contexts, join(ctx)),
         SubResponse::SpanJoinResult { span: Some(SpanJoin { ast_id, start: 0, end: 17, ctx }) }
     );
     let other = span::SyntaxContext::root(Edition::Edition2021).into_u32();
     assert_ne!(other, ctx);
     assert_eq!(
-        answer(db, join(other)),
+        answer(db, contexts, join(other)),
         SubResponse::SpanJoinResult { span: Some(SpanJoin { ast_id, start: 0, end: 2, ctx }) }
     );
 }
@@ -1932,7 +1965,8 @@ fn a_question_naming_nothing_of_the_build_is_refused() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
     let (raw, file_id, ast_id, ctx) = bin_span(&built);
-    let refused = |req: SubRequest, field: &str| match answer(db, req) {
+    let contexts = bin_contexts(&built);
+    let refused = |req: SubRequest, field: &str| match answer(db, contexts, req) {
         SubResponse::Cancel { reason } => assert!(reason.contains(field), "{field}: {reason}"),
         other => panic!("{field}: answered {other:?}"),
     };
@@ -1950,7 +1984,8 @@ fn a_question_naming_nothing_of_the_build_is_refused() {
     refused(SubRequest::ByteRange { file_id, ast_id: 1_000_000, start: 0, end: 1 }, "ast_id");
     refused(SubRequest::LineColumn { file_id, ast_id, offset: 1_000_000 }, "offset");
     refused(SubRequest::SpanSource { file_id, ast_id, start: 0, end: 1, ctx: u32::MAX }, "ctx");
-    let unowned = blaze_query::db::Id::MAX_U32 - 2;
+    // A number no snapshot of this size interns a context at.
+    let unowned = u32::MAX - 2;
     refused(SubRequest::SpanParent { file_id, ast_id, start: 0, end: 1, ctx: unowned }, "ctx");
     refused(
         SubRequest::SpanJoin {
@@ -2133,7 +2168,9 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
     let tree = MemTree::default();
     let mut built =
         lowered_with(&units, &tree, &[("a/src/macros.rs", Some(CONST_MACROS))]).unwrap();
-    let macros = dependency_of(built.lowered.db(), krate(&built, LIB), "macros").unwrap();
+    // A crate id dies with the commit that remakes its arena: the refresh is looked up by key.
+    let db = built.lowered.db();
+    let macros = dependency_of(db, krate(&built, LIB), "macros").unwrap().key(db);
     let more: &'static [u8] = b"#[proc_macro]\npub fn double(input: TokenStream) -> TokenStream { input }\n\
         #[proc_macro_attribute]\npub fn twice(attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
     let root = changed(&tree, &[("a/src/macros.rs", Some(more))]);
@@ -2143,7 +2180,8 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
         |_| Ok(()),
     );
     assert_eq!(refreshed, Ok(true));
-    assert_eq!(const_macros_of(built.lowered.db(), macros), ["double", "twice"]);
+    let db = built.lowered.db();
+    assert_eq!(const_macros_of(db, db.krate(macros)), ["double", "twice"]);
 
     let root = changed(&tree, &[]);
     let without = config(root, library_with_proc_macro(&tree));
@@ -2394,7 +2432,6 @@ fn a_kept_front_end_is_lowered_into_whatever_the_plan_alone_reads() {
 #[test]
 fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
     use base_db::AbsPathBuf;
-    use blaze_query::db::Durability;
 
     let units = units();
     let mut built = lowered(&units).unwrap();
@@ -2403,10 +2440,11 @@ fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
     let (moving, still) = (dir.join("moving.bin"), dir.join("still.bin"));
     std::fs::write(&moving, b"old").unwrap();
     std::fs::write(&still, b"same").unwrap();
-    let bin = krate(&built, BIN);
+    // The bin's crate of each snapshot: a commit that reads a file again makes its arena again.
     let read = |built: &Built, path: &AbsPathBuf| {
         let db = built.lowered.db();
-        let file = db.files().included_file(db, bin, path, Durability::LOW);
+        let disk = db.files().disk().expect("a test database reads the disk");
+        let file = db.files().included_file(disk, db, krate(built, BIN).key(db), path);
         (file.read(db).clone().map(|it| it.to_vec()), file.content(db))
     };
     let (_, still_content) = read(&built, &still);
@@ -2414,23 +2452,25 @@ fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
     let tree = MemTree::default();
     let root = view(&tree);
     let config = config(root, library(&tree));
+    let epoch = |built: &Built| blaze_memo::Database::memo(built.lowered.db()).snapshot_epoch();
+    // Whether the refresh committed: a commit is a new snapshot.
     let refresh = |built: &mut Built| {
-        let passes = built.lowered.db().maintain_passes();
+        let before = epoch(built);
         let lower = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) };
         assert_eq!(built.lowered.refresh(lower, &base_db::Looks::none(), |_| Ok(())), Ok(true));
-        built.lowered.db().maintain_passes() - passes
+        epoch(built) != before
     };
-    let unmoved = refresh(&mut built);
+    assert!(!refresh(&mut built), "nothing moved: no commit");
     assert_eq!(read(&built, &moving).0, Ok(b"old".to_vec()), "nothing moved");
 
     std::fs::write(&moving, b"new").unwrap();
-    assert_eq!(refresh(&mut built), unmoved + 1, "one pass for the file that moved");
+    assert!(refresh(&mut built), "one commit for the file that moved");
     assert_eq!(read(&built, &moving).0, Ok(b"new".to_vec()), "the view did not move, the file did");
     assert_eq!(read(&built, &still).1, still_content, "a file that did not move is not set");
-    assert_eq!(refresh(&mut built), unmoved, "read again, unmoved: nothing written");
+    assert!(!refresh(&mut built), "read again, unmoved: nothing written");
 
     std::fs::remove_file(&moving).unwrap();
-    assert_eq!(refresh(&mut built), unmoved + 1);
+    assert!(refresh(&mut built));
     assert!(read(&built, &moving).0.is_err(), "a file gone is a moved read: its error");
 }
 
@@ -3266,9 +3306,10 @@ fn every_crate_is_given_its_surface_and_what_no_front_end_reads_moves_none() {
     let surfaces = |lib: &'static [u8]| {
         let mut front = front_over(&[("a/src/lib.rs", Some(lib))]);
         front.give_surfaces();
-        let passes = front.db().maintain_passes();
+        let epoch = |front: &Lowered| blaze_memo::Database::memo(front.db()).snapshot_epoch();
+        let before = epoch(&front);
         front.give_surfaces();
-        assert_eq!(front.db().maintain_passes(), passes, "given again, nothing is written");
+        assert_eq!(epoch(&front), before, "given again, nothing is written: no commit");
         [LIB, BIN].map(|unit| {
             let krate = front.krate(unit).expect("the unit's crate");
             let given = hir_def::deps::given::surface(front.db(), krate)

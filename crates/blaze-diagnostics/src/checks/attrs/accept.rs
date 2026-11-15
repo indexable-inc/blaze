@@ -142,7 +142,7 @@ impl Session {
     /// What a piece's probe is given (`checks::syntax_clean`): the crate's settings, read off
     /// its root's outline (`checks::settings::crate_settings`), which the check finds equal to
     /// what its own walk reads (`checks::check`).
-    pub(crate) fn of_settings(cx: &Cx<'_, '_>, settings: &CrateSettings) -> Session {
+    pub(crate) fn of_settings(cx: &Cx<'_, '_>, settings: &CrateSettings<'_>) -> Session {
         Session {
             krate: Krate::of(cx),
             features: Features::of_settings(settings),

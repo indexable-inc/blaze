@@ -19,8 +19,8 @@ Owner: the main agent. Part of `target.md` (its Order, step 2). Records are read
   store in its tests) and blaze-graph's pool, with a scripted `Front` in its tests.
 - `crates/blaze-cas/src/plain`: the store. `crates/blaze-unitkey`: `unit::key`, a unit's keys
   from text.
-- Not built on main yet: `crates/blaze-front`, the surface and body tasks over the ported front
-  end, on this seam.
+- `crates/blaze-front`: the surface and body tasks over the ported front end (blaze-memo), on
+  this seam.
 
 ## The rule everything below follows
 
@@ -36,7 +36,7 @@ def map.
 | Crate | IO | Does | Depends on |
 |---|---|---|---|
 | `blaze-unitkey` | none | `Task::Key`: file images and every key of a unit | parser, syntax, cfg, blaze-keyed |
-| `blaze-front` (not built on main yet) | none | `Task::Surface`, `Task::Body` | the ported front end, blaze-item-hash, blaze-items, blaze-keyed |
+| `blaze-front` | none | `Task::Surface`, `Task::Body` | the ported front end, blaze-item-hash, blaze-items, blaze-keyed |
 | `blaze-host` | yes | the process: performs every effect, with a `Front` it is given | blaze-keyed, blaze-graph, blaze-vfs |
 
 `blaze_keyed::front::Front` is the seam, in blaze-keyed so neither side depends on the other:
@@ -60,7 +60,7 @@ functions; the adapter that implements `Front` with them is a few lines in the c
 - **Floor.** A comment edit: one file reparsed, no other key computed again. A body edit: one
   file reparsed and one body key.
 
-## `blaze-front`: the tasks over the front end (not built on main yet)
+## `blaze-front`: the tasks over the front end
 
 - **`Surface` task.** Runs the unit's scopes, signatures, fields, layouts, impl index and const
   values, and writes one `Surface` record: `facts`, one row per exported fact (ids from
@@ -96,7 +96,7 @@ functions; the adapter that implements `Front` with them is a few lines in the c
 - blaze-unitkey: a comment or whitespace edit moves only the file image's key; a private body
   edit moves exactly that body's key; a signature edit moves the surface key and that item's body
   key, nothing else.
-- blaze-front (when built): a record's shape replays (every fact's answer equal on the same tree); one planted
+- blaze-front: a record's shape replays (every fact's answer equal on the same tree); one planted
   missing ask per fact kind is caught by the audit.
 - blaze-host (`crates/blaze-host/src/tests.rs`), the real loop on a real store with a scripted
   `Front`, each with its control: cold and no-op; a body edit runs one task and marks the unit

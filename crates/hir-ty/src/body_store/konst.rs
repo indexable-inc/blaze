@@ -43,7 +43,7 @@ use base_db::Db;
 use blaze_format::{Part, SchemaHash, schema_of};
 use hir_def::{ConstId, DefWithBodyId};
 
-use super::{Lookup, REGISTRY, Step};
+use super::{Lookup, REGISTRY, Reads, Step};
 use crate::{
     consteval::{ConstEvalError, deps::codec},
     next_solver::StoredAllocation,
@@ -81,7 +81,7 @@ fn stored<'db>(
     match lookup(db, body) {
         Lookup::Off => run(),
         Lookup::Miss => {
-            let (value, reads) = blaze_query::db::capture_reads(db, run);
+            let (value, reads) = super::capture(db, run);
             // An error is not a value: the next build evaluates again and says it again.
             if let Ok(value) = &value {
                 offer(db, body, value, reads);
@@ -117,7 +117,7 @@ fn offer(
     db: &Db,
     def: DefWithBodyId,
     value: &StoredAllocation,
-    reads: Option<blaze_query::db::Reads>,
+    reads: Option<Reads>,
 ) {
     super::offer(db, def, Step::Const, SCHEMA, reads, |_, out| match codec::encode(value.as_ref()) {
         Some(body) => {

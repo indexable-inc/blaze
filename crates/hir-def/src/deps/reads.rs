@@ -208,14 +208,7 @@ impl Reads {
                     reads.macros.push((shape.clone(), Some(*values)));
                 }
                 &ExpansionReads::Unknown(why) => {
-                    // alloc: why a crate is refused, once per refused crate
-                    // Named for a person: the call's own text (its first line), and the
-                    // macro's crate. The id alone named nothing a person can find.
-                    let text = call.call_node_view(db).value.to_string();
-                    let line = text.lines().find(|it| !it.trim().is_empty()).unwrap_or("").trim();
-                    let line: String = line.chars().take(96).collect();
-                    let call = format!("`{line}` ({call:?}) of crate {}", loc.def.krate.named(db));
-                    return Err(Refused::ProcMacro { call, why });
+                    return Err(Refused::ProcMacro { call: named_call(db, call, loc), why });
                 }
             }
             Ok(())
@@ -432,7 +425,7 @@ impl Reads {
 /// expanded in: `calls` (those its signatures name, [`super::signatures::encode`]) and every
 /// macro call of its modules' scopes, those at assoc-item position in their traits and impls
 /// too ([`super::signatures::scope_calls`]). One list for what the image's reads cover
-/// ([`Reads::of`]) and the files it may read (`serve::include_refusal`), so the two never walk
+/// ([`Reads::of`]) and the files it may read (`late::walk`), so the two never walk
 /// different calls.
 pub(super) fn image_calls(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Vec<MacroCallId> {
     // alloc: setup: the calls of one crate, walked once as its image is written
@@ -441,6 +434,18 @@ pub(super) fn image_calls(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Vec<M
         todo.extend(super::signatures::scope_calls(db, module.scope(db)));
     }
     todo
+}
+
+/// A macro call as a refusal names it for a person: the call's own text (its first line,
+/// at most 96 characters), its id, and the macro's crate. The id alone names nothing a person
+/// can find.
+pub(super) fn named_call(db: &Db, call: MacroCallId, loc: &hir_expand::MacroCallLoc) -> String {
+    // alloc: why a crate is refused, once per refused crate
+    let text = call.call_node_view(db).value.to_string();
+    let line = text.lines().find(|it| !it.trim().is_empty()).unwrap_or("").trim();
+    let line: String = line.chars().take(96).collect();
+    // alloc: as above
+    format!("`{line}` ({call:?}) of crate {}", loc.def.krate.named(db))
 }
 
 /// Runs `each` once for every call of `todo` that `krate` makes and every call one of them is in
@@ -480,7 +485,7 @@ fn served(db: &Db, krate: Crate, base: ContentId) -> Result<Reads, Refused> {
     // What serving it noted (`base_db::Files::included_are_served`): the files it was found by.
     file_reads(db, krate, &mut reads);
     reads.settle_files()?;
-    for read in db.files().expansions_read_by(krate, base_db::ReadBy::Served(base)) {
+    for read in db.files().expansions_read_by(krate.key(db), base_db::ReadBy::Served(base)) {
         match read {
             base_db::ExpansionRead::Traced { shape, values } => {
                 reads.macros.push((shape.into(), Some(values)))
@@ -510,8 +515,10 @@ fn served(db: &Db, krate: Crate, base: ContentId) -> Result<Reads, Refused> {
 /// its own variables `own` lack, and `CARGO_PRIMARY_PACKAGE` as the crate's own read of it
 /// ([`Reads::primary`], at its own place in its closure).
 fn env_reads(db: &Db, krate: Crate, own: &base_db::Env, reads: &mut Reads) {
+    // The log names crates by key, which outlives the snapshot.
+    let key = krate.key(db);
     for (read, name) in db.files().env_read() {
-        if read != krate {
+        if read != key {
             continue;
         }
         if name == base_db::PRIMARY_PACKAGE {
@@ -530,7 +537,7 @@ fn env_reads(db: &Db, krate: Crate, own: &base_db::Env, reads: &mut Reads) {
 /// The files outside the VFS that `krate` read, or was served by, into `reads`
 /// ([`Reads::files`]), each path as a portable key writes it.
 fn file_reads(db: &Db, krate: Crate, reads: &mut Reads) {
-    for (path, content) in db.files().included_by(db, krate) {
+    for (path, content) in db.files().included_by(db, krate.key(db)) {
         let ported = db.files().ported(path.as_str().as_bytes());
         // alloc: once per file outside the VFS a crate imaged read
         reads.files.push((ported.into_owned().into_boxed_slice(), Some(content)));

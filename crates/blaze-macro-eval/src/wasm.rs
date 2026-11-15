@@ -163,6 +163,8 @@ struct Given<'a> {
     inputs: &'a [Stream],
     /// The def, call and mixed sites.
     sites: [Span; 3],
+    /// The table the sites' contexts are words of: the calling crate's arena.
+    contexts: blaze_memo::ArenaId,
     edition: Edition,
     forced_keywords: bool,
 }
@@ -275,6 +277,7 @@ impl Library {
                 let given = Given {
                     inputs: it.inputs,
                     sites: it.sites,
+                    contexts: it.contexts,
                     edition: it.edition,
                     forced_keywords: it.forced_keywords,
                 };
@@ -332,14 +335,15 @@ impl Library {
         let mut runs: Vec<host::Call> = calls
             .iter()
             .map(|(index, given)| {
-                let mut server = Server::new(given.sites, given.edition, given.forced_keywords);
+                let mut server =
+                    Server::new(given.sites, given.contexts, given.edition, given.forced_keywords);
                 let mut input = Vec::new(); // alloc: as above
                 server.input(given.inputs, &mut input);
                 host::Call { index: *index, server, input }
             })
             .collect();
         // The run's server until its first call's takes its place ([`host::expand`]).
-        let server = Server::new(last.sites, last.edition, last.forced_keywords);
+        let server = Server::new(last.sites, last.contexts, last.edition, last.forced_keywords);
         // clone: a handle of the module's code, given to the expansion's thread
         let pre = self.pre.clone();
         // clone: the calling crate's variables, given to the expansion's thread once per run

@@ -383,11 +383,14 @@ fn read_head(db: &Db, krate: Crate, source: &dyn PageSource) -> R<Head> {
 }
 
 /// The head of the impl table pages of `krate`. Depends on which pages the crate has and on
-/// the files they name.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+/// the files they name. The value is the record's, found by content: the read of the crate's
+/// slot ([`super::tables`]) notes the fact the driver gave with it, whose digest is the
+/// record's key ([`super::tables_fact`]), and equal keys are equal bytes.
+///
+/// `owns`: the head's files table is `hir_def`'s `segments::Files`, a boxed slice, which
+/// `segments::reader` borrows.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 fn impl_pages_head(db: &Db, krate: Crate) -> Head {
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
     let Some(tables) = super::tables(db, krate) else {
         // alloc: error path
         refuse(db, krate, "the crate has no impl table pages".to_owned())
@@ -415,10 +418,9 @@ struct Pages<'a> {
 }
 
 impl<'a> Pages<'a> {
-    /// The pages of `krate`, which must be served ([`super::served`]). Tells the engine the
-    /// running query's value is a record's (`row::STORED`): every reader here is one.
+    /// The pages of `krate`, which must be served ([`super::served`]). The read of the crate's
+    /// slot notes the record's fact ([`super::tables_fact`]): every reader here reads it.
     fn of(db: &'a Db, krate: Crate) -> Pages<'a> {
-        blaze_query::db::report_stored_read(db);
         let Some(tables) = super::tables(db, krate) else {
             // alloc: error path
             refuse(db, krate, "the crate has no impl table pages".to_owned())
@@ -905,7 +907,7 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
 
     // Each trait in the order of its fingerprint, and its rows in the order of their self
     // types': the order of no database's ids, so two databases write the same bytes.
-    let trait_impls = &**TraitImpls::for_crate(db, krate);
+    let trait_impls = TraitImpls::for_crate(db, krate);
     let traits = writer
         .enc()
         .sorted(trait_impls.trait_indices(), |enc, it| enc.def(ModuleDefId::TraitId(*it)))?;

@@ -27,7 +27,7 @@ Prior art, and what is taken from each:
 
 | prior art | taken |
 |---|---|
-| Unison: a definition is the hash of its AST, names are metadata | the identity hashes content with every reference by hash, no names of the item itself, no positions |
+| Unison: a definition is the hash of its AST, names are metadata | the identity hashes content with no name of the item itself and no positions; a reference is by its target's key and hash (D51), not by hash alone, since Rust's types are nominal |
 | Build Systems à la Carte: constructive traces (Shake's cloud, Bazel's action cache) | dynamic dependencies (which impls a solve read) are a trace stored beside the key: a shape lists the facts read, the answer is filed under their values |
 | Bazel, Nix: actions keyed by declared inputs, outputs by content | the a-priori part of the key is everything a body can read that is known before running it |
 | rustc: `DefPathHash`, `hir_owner` hashes, the SVH | `ItemKey` is our `DefPathHash`; the identity is a `hir_owner` hash with resolved references in place of `DefPathHash`es, so it is stable across sessions as rustc's is not across crate edits |
@@ -43,6 +43,16 @@ Prior art, and what is taken from each:
   visibility, a trait's items, layout-affecting attributes (`repr`, `align`, `packed`,
   `transparent`, `non_exhaustive`), visibility as "public, crate, or the module n levels up",
   plus what a body leaks (section 4). Computed by `blaze_items::hash::interface_hash`.
+  What validates a type-check result names each target by key as well as by hash (D51): the
+  signature hash, and a fact's value that spells a form (a field's type, a closure's captures, a
+  constant's type). `struct Meters(u32)` and `struct Feet(u32)` have one hash, so a hash alone
+  made `fn f(m: Meters)` and `fn f(f: Feet)` one signature, and a caller's stored inference and
+  MIR were served stale after the edit. A rename keeps the item's own hashes and moves every
+  signature hash that names it; inside a strongly connected component a reference is the
+  member's position and its key. The interface, layout, code and deep hashes stay name-free:
+  they key what codegen compiles, which depends on shapes only, and which item a compiled body
+  calls or names is bound by key beside its code (the bound hash, the instance keys), never
+  inside it.
 - **Identity** (new, `blaze_item_hash::identity`): *what a body's results are a function of*,
   known before running them. Section 3.
 
@@ -139,7 +149,7 @@ a type or an impl changes that fact's key and the body misses once.
 
 | entry kind | hashed as |
 |---|---|
-| an item (`Function`, `Struct`, ..., `EnumVariant`) | its item key and its signature hash (a variant: its enum's) |
+| an item (`Function`, `Struct`, ..., `EnumVariant`) | its item key and its signature hash (a variant: its enum's), which names every item it refers to by key and hash (section 2) |
 | a macro (`Macro2`, `MacroRules`, `ProcMacro`) | its item key and its signature hash (its rules or its expander's identity) |
 | `Crate` | its crate key |
 | `Block` | its index among the body's blocks (blocks are the body's own) and whether it holds items |

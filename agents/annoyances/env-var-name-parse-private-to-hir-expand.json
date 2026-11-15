@@ -1,0 +1,14 @@
+{
+ "id": "env-var-name-parse-private-to-hir-expand",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, host round 2 piece \"surface image\" second pass, port-memo-1113",
+ "where": "crates/hir-expand/src/builtin/fn_macro.rs (`env_expand`, `option_env_expand`, private `args` module); crates/hir-def/src/deps/late.rs `walk`",
+ "what": "Listing which variable an `env!`/`option_env!` call reads needs the expander's own argument parse, which is private to hir-expand's fn_macro.rs; the only public record of what was read is a log of what ran (`Files::env_read`), which the late list must never be built from. hir-def had to call a new hir-expand method (`EagerExpander::env_var_read`) outside its lane's files.",
+ "cost": "a quarter hour finding the parse and writing the method for another lane to add",
+ "cause": "a builtin macro's reads are worked out inside its expansion and only logged, never exposed as a function of the call",
+ "class": "what an expansion reads known only as a side effect of running it, not as a typed function of the call",
+ "prevention": "each eager builtin exposes its reads as a pure function of the call (`reads(db, call, arg) -> Late`) used by both its expansion and every list of late inputs, so the two cannot differ",
+ "workaround": "`EagerExpander::env_var_read` in hir-expand, using the same `args` parse as the expansion",
+ "fix": "listed in the lane report for the main agent (hir-expand is not this lane's file)",
+ "state": "open"
+}

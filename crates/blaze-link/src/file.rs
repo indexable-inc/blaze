@@ -6,8 +6,17 @@
 //! commit submits together. An incremental link writes what changed: each piece it wrote whose
 //! bytes differ from before, each jump-table cell it set (8 bytes, not the cells array), the
 //! zero length after the call frame entries a patch adds in its code region, the synthetic
-//! regions' changed blocks and the changed headers, with ranges closer than [`GAP`]
-//! merged into one write. Every range's bytes are copied once, from the regions' pages
+//! regions' and the writer's parts' changed bytes, with ranges closer than [`PATCH_GAP`]
+//! merged into one write. A table or header is compared by [`BLOCK`] (an unchanged block is
+//! passed over in one compare), and each block that differs is narrowed to its runs of
+//! differing [`GRAIN`]-byte words ([`narrowed`]): one moved entry is its own bytes in the
+//! patch, never the block around it. Until 2026-11-15 the block itself was written and
+//! ranges within [`GAP`] merged, so one body edit wrote each table's block whole: in an image
+//! of 250 functions `.rela.dyn` 6,072 bytes, `.blaze.table` 2,008 and the symbol tables' block
+//! 3,306, for entries of 24, 8 and 24 bytes (`a_body_edits_patch_does_not_grow_with_the_image`).
+//! The file system still copies a cloned file's block whole on a write (4 KiB on APFS, btrfs
+//! and XFS), so that is the floor of disk work; the patch's bytes are the floor of what is
+//! said, kept, and sent. Every range's bytes are copied once, from the regions' pages
 //! straight into the write. The undo is only ranges: the state the history keeps holds the
 //! old bytes, read when a rollback needs them ([`restore`]).
 
@@ -44,10 +53,53 @@ pub(crate) struct Finished {
 /// The longest write of a full link: large enough to keep a device's queue full in few
 /// writes, small enough that the writes of one file run side by side.
 const RUN: u64 = 8 << 20;
-/// Ranges of an incremental link closer than this are one write, the bytes between included.
+/// Runs of a full link's file closer than this are one write, the zeros between included.
 const GAP: u64 = 4096;
-/// The block a synthetic region is compared in.
+/// Ranges of an incremental link closer than this are one write, the bytes between included:
+/// a write costs a call, so two entries a few words apart are one, but a block's unchanged
+/// bytes are never said again.
+const PATCH_GAP: u64 = 64;
+/// The block a synthetic region or a writer's part is compared in.
 const BLOCK: usize = 4096;
+/// The word a block that differs is narrowed to: every table entry is a whole number of them
+/// (a slot 8 bytes, a symbol or a relocation 24, a header field 2 to 8 at its alignment).
+const GRAIN: usize = 8;
+
+/// Pushes to `ranges`, at `offset`, each run of [`GRAIN`]-byte words in which `new` (the
+/// block at `at` of a table) differs from `old` (the same block before; shorter where the table
+/// grew, its missing bytes counted as differing). One pass over the block, which a compare
+/// already found differs.
+fn narrowed<A: std::alloc::Allocator>(offset: u64, at: usize, old: &[u8], new: &[u8], ranges: &mut Vec<(u64, u64), A>) {
+    let words = new.len().div_ceil(GRAIN);
+    let mut run: Option<usize> = None;
+    for word in 0..=words {
+        let (from, to) = (word * GRAIN, ((word + 1) * GRAIN).min(new.len()));
+        let differs = word < words && old.get(from..to) != Some(&new[from..to]);
+        match (differs, run) {
+            (true, None) => run = Some(from),
+            (false, Some(start)) => {
+                let end = from.min(new.len());
+                ranges.push((offset + (at + start) as u64, (end - start) as u64));
+                run = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// [`narrowed`] for the block `at..at + len` of `new`, a table kept in pages, against `old`.
+fn narrowed_cow<A: std::alloc::Allocator>(
+    offset: u64,
+    at: usize,
+    len: usize,
+    old: &CowBytes,
+    new: &CowBytes,
+    ranges: &mut Vec<(u64, u64), A>,
+) {
+    let have = old.len().saturating_sub(at).min(len);
+    let before = if have == 0 { std::borrow::Cow::Borrowed(&[][..]) } else { old.read(at, have) };
+    narrowed(offset, at, &before, &new.read(at, len), ranges);
+}
 
 /// Where each byte of a state's file comes from: its regions in the file and the writer's
 /// parts, each sorted by offset, and the slots the writer encodes, laid over the regions.
@@ -579,7 +631,7 @@ impl<'a> Stage<'a> {
                     if matches!(space.region.class, Class::Synthetic(_)) {
                         let ranges = &mut ranges;
                         space.bytes.changed_blocks(&old.bytes, BLOCK, scratch, |at, len| {
-                            ranges.push((offset + at as u64, len as u64))
+                            narrowed_cow(offset, at, len, &old.bytes, &space.bytes, ranges)
                         });
                     }
                 }
@@ -599,7 +651,7 @@ impl<'a> Stage<'a> {
                 (Ok(Part::Writer(old)), Part::Writer(new)) => {
                     let ranges = &mut ranges;
                     new.changed_blocks(old, BLOCK, scratch, |at, len| {
-                        ranges.push((offset + at as u64, len as u64))
+                        narrowed_cow(offset, at, len, old, new, ranges)
                     });
                 }
                 (Ok(Part::Debug(old)), Part::Debug(new)) if same_bytes(old, new) => {}
@@ -609,7 +661,7 @@ impl<'a> Stage<'a> {
                 _ => ranges.push((offset, part.len() as u64)),
             }
         }
-        fill(&Layout::of(&self.new), &merge(ranges, GAP))
+        fill(&Layout::of(&self.new), &merge(ranges, PATCH_GAP))
     }
 }
 
@@ -652,13 +704,14 @@ fn delta<'d>(
     })
 }
 
-/// Pushes each `BLOCK` of `new`, at file offset `offset`, that differs from `old`, the bytes the
-/// last link wrote there.
+/// Pushes, at file offset `offset`, the changed words ([`narrowed`]) of each `BLOCK` of `new`
+/// that differs from `old`, the bytes the last link wrote there.
 fn changed_blocks(offset: u64, old: &[u8], new: &[u8], ranges: &mut Vec<(u64, u64)>) {
     for start in (0..new.len()).step_by(BLOCK) {
         let end = (start + BLOCK).min(new.len());
         if old.get(start..end) != Some(&new[start..end]) {
-            ranges.push((offset + start as u64, (end - start) as u64));
+            let before = old.get(start..end.min(old.len())).unwrap_or_default();
+            narrowed(offset, start, before, &new[start..end], ranges);
         }
     }
 }
@@ -677,21 +730,36 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_part_rewrites_only_its_changed_blocks() {
+    fn a_changed_part_rewrites_only_its_changed_words() {
         let old = vec![7u8; 3 * BLOCK];
         let mut new = old.clone();
         new[BLOCK + 5] = 0;
+        new[BLOCK + 16..BLOCK + 40].fill(0);
         new.extend_from_slice(&[1, 2, 3]);
         let mut ranges = Vec::new();
         changed_blocks(100, &old, &new, &mut ranges);
-        assert_eq!(ranges, [(100 + BLOCK as u64, BLOCK as u64), (100 + 3 * BLOCK as u64, 3)]);
+        let block = 100 + BLOCK as u64;
+        assert_eq!(ranges, [(block, 8), (block + 16, 24), (100 + 3 * BLOCK as u64, 3)]);
         ranges.clear();
         changed_blocks(0, &new, &old, &mut ranges);
         assert_eq!(
             ranges,
-            [(BLOCK as u64, BLOCK as u64)],
+            [(BLOCK as u64, 8), (BLOCK as u64 + 16, 24)],
             "a shorter part rewrites none past its end"
         );
+    }
+
+    /// The control for [`narrowed`]: a word changed at a block's last bytes, and a block of
+    /// a table that grew, are their own words; nothing else of the block is said.
+    #[test]
+    fn a_differing_block_is_narrowed_to_its_words() {
+        let old = vec![1u8; 64];
+        let mut new = old.clone();
+        new[63] = 2;
+        new.extend_from_slice(&[3; 5]);
+        let mut ranges = Vec::new();
+        narrowed(1000, 4096, &old, &new, &mut ranges);
+        assert_eq!(ranges, [(1000 + 4096 + 56, 8 + 5)]);
     }
 
     #[test]

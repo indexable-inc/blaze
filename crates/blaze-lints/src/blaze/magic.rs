@@ -91,7 +91,7 @@ use syntax::{
 
 use self::shared::{Access, UseClass};
 use super::{Finding, Lint, dup, facts, frozen_collection, general_facts, test_code};
-use crate::{check::Cx, diag::Applicability};
+use crate::{check::Cx, diag::Applicability, kept};
 
 /// How many `as` casts, borrows and string conversions a literal's use is followed up through.
 const USE_DEPTH: u32 = 4;
@@ -245,7 +245,7 @@ impl Prim {
 }
 
 /// A place a literal is compared with that other bodies can compare with too.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) enum Place {
     Field(FieldId),
     Static(StaticId),
@@ -254,7 +254,7 @@ pub(crate) enum Place {
 }
 
 /// How a literal is used, the same in every body of the crate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) enum Role {
     /// The argument at `index` of a call of `f`, `self` being 0 for a method.
     Arg { f: FunctionId, index: u32 },
@@ -262,13 +262,14 @@ pub(crate) enum Role {
     Compare(Place),
 }
 
-/// What a body asks of the crate's literals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// What a body asks of the crate's literals. Its home is the arena of the ids it names (a
+/// value, a type and a string name none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) enum Ask {
     /// The bodies with a number of this value and type in this use.
-    Use(Role, Value, Prim),
+    Use(Role, #[home(skip)] Value, #[home(skip)] Prim),
     /// The bodies that write this string.
-    Text(Symbol),
+    Text(#[home(skip)] Symbol),
     /// The `const`s passed in this use, with their values.
     Consts(Role),
     /// The strings written in this use, and where.
@@ -276,27 +277,65 @@ pub(crate) enum Ask {
     /// The enums whose discriminant indexes the array in this field.
     EnumIndex(FieldId),
     /// The string `const`s whose value is this string ([`named_index`]).
-    Named(Symbol),
+    Named(#[home(skip)] Symbol),
     /// The bodies that write this format template, normalised ([`template::normalise`]).
-    Template(Symbol),
+    Template(#[home(skip)] Symbol),
     /// The fieldless enums whose variants' names are this set ([`variant_set_key`]).
-    VariantSet(Symbol),
+    VariantSet(#[home(skip)] Symbol),
 }
 
-/// The crate's answer to an [`Ask`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Answer {
+/// The crate's answer to an [`Ask`], as an [`Index`] holds it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Collected {
     /// Each body, in the crate's walk order, and how many sites it has.
-    bodies: Vec<(DefWithBodyId, u32)>,
-    consts: Vec<(ConstId, Value, Prim)>,
-    spellings: Vec<(Symbol, DefWithBodyId)>,
-    enums: Vec<EnumId>,
+    bodies: Vec<(DefWithBodyId, u32), Global>,
+    consts: Vec<(ConstId, Value, Prim), Global>,
+    spellings: Vec<(Symbol, DefWithBodyId), Global>,
+    enums: Vec<EnumId, Global>,
     /// The `const`s that hold a string, in the crate's walk order.
-    named: Vec<ConstId>,
+    named: Vec<ConstId, Global>,
     /// How many sites of a template are not the error of an `Err(..)`.
     outside_err: u32,
     /// The error types of the `Err(..)`s a template's sites are in, distinct.
-    errors: Vec<AdtId>,
+    errors: Vec<AdtId, Global>,
+}
+
+/// The crate's answer to an [`Ask`], kept ([`magic_answer`]): what [`Collected`] was, each list a
+/// slice of the answer's arena.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Answer<'db> {
+    /// Each body, in the crate's walk order, and how many sites it has.
+    bodies: &'db [(DefWithBodyId, u32)],
+    consts: &'db [(ConstId, Value, Prim)],
+    spellings: &'db [(Symbol, DefWithBodyId)],
+    enums: &'db [EnumId],
+    /// The `const`s that hold a string, in the crate's walk order.
+    named: &'db [ConstId],
+    /// How many sites of a template are not the error of an `Err(..)`.
+    outside_err: u32,
+    /// The error types of the `Err(..)`s a template's sites are in, distinct.
+    errors: &'db [AdtId],
+}
+
+/// Where one row's part of a list a kept value holds is: `len` rows from `start`. A kept row is
+/// `'static` and holds no slice of its own, so a list in a row is a part of one list beside it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Part {
+    start: u32,
+    len: u32,
+}
+
+impl Part {
+    /// The part `rows` will be given next: `added` rows after its `len` rows.
+    fn next<T>(rows: &[T], added: usize) -> Part {
+        let start = u32::try_from(rows.len()).expect("a value's list fits in u32 rows");
+        let len = u32::try_from(added).expect("a value's list fits in u32 rows");
+        Part { start, len }
+    }
+
+    fn of<T>(self, rows: &[T]) -> &[T] {
+        &rows[self.start as usize..(self.start + self.len) as usize]
+    }
 }
 
 /// A place compared against strings in one body: a [`Place`] or a local.
@@ -452,28 +491,103 @@ pub(crate) struct Indexed {
     len: usize,
 }
 
-/// What [`literals`] finds in a body.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Literals {
-    lits: Vec<Lit>,
-    matched: Vec<Matched>,
-    indexed: Vec<Indexed>,
-    consts: Vec<(Role, ConstId, Value, Prim)>,
-    enum_fields: Vec<(FieldId, EnumId)>,
-    templates: Vec<Template>,
-    whole_sets: Vec<WholeSet>,
+/// What a body's walk finds, as it finds it: [`Literals`] once kept.
+#[derive(Debug, Default)]
+struct Gathered {
+    lits: Vec<Lit, Global>,
+    matched: Vec<Matched, Global>,
+    indexed: Vec<Indexed, Global>,
+    consts: Vec<(Role, ConstId, Value, Prim), Global>,
+    enum_fields: Vec<(FieldId, EnumId), Global>,
+    templates: Vec<Template, Global>,
+    whole_sets: Vec<WholeSet, Global>,
+}
+
+/// A [`Matched`] kept: its values a part of [`Literals::values`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeptMatched {
+    scrutinee: ExprId,
+    range: TextRange,
+    role: Option<Role>,
+    values: Part,
+}
+
+/// A [`WholeSet`] kept: its names a part of [`Literals::names`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeptWholeSet {
+    at: ExprId,
+    of: Option<EnumId>,
+    key: Option<Symbol>,
+    names: Part,
+    case: Case,
+}
+
+/// What [`literals`] finds in a body, kept in the body's arena.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Literals<'db> {
+    lits: &'db [Lit],
+    matched: &'db [KeptMatched],
+    indexed: &'db [Indexed],
+    consts: &'db [(Role, ConstId, Value, Prim)],
+    enum_fields: &'db [(FieldId, EnumId)],
+    templates: &'db [Template],
+    whole_sets: &'db [KeptWholeSet],
+    /// The values of every `match` of `matched`, each one's a part.
+    values: &'db [Symbol],
+    /// The names of every set of `whole_sets`, each one's a part.
+    names: &'db [ExprId],
+}
+
+impl<'db> Literals<'db> {
+    fn keep(db: &'db Db, found: Gathered) -> Literals<'db> {
+        let mut values: Vec<Symbol, Global> = Vec::new_in(Global);
+        let mut matched: Vec<KeptMatched, Global> = Vec::with_capacity_in(found.matched.len(), Global);
+        for it in found.matched {
+            let part = Part::next(&values, it.values.len());
+            values.extend(it.values);
+            matched.push(KeptMatched { scrutinee: it.scrutinee, range: it.range, role: it.role, values: part });
+        }
+        let mut names: Vec<ExprId, Global> = Vec::new_in(Global);
+        let mut whole_sets: Vec<KeptWholeSet, Global> = Vec::with_capacity_in(found.whole_sets.len(), Global);
+        for it in found.whole_sets {
+            let part = Part::next(&names, it.names.len());
+            names.extend(it.names);
+            whole_sets.push(KeptWholeSet { at: it.at, of: it.of, key: it.key, names: part, case: it.case });
+        }
+        Literals {
+            lits: kept::slice(db, found.lits),
+            matched: kept::slice(db, matched),
+            indexed: kept::slice(db, found.indexed),
+            consts: kept::slice(db, found.consts),
+            enum_fields: kept::slice(db, found.enum_fields),
+            templates: kept::slice(db, found.templates),
+            whole_sets: kept::slice(db, whole_sets),
+            values: kept::slice(db, values),
+            names: kept::slice(db, names),
+        }
+    }
+
+    /// The strings `matched` matches against.
+    fn values_of(&self, matched: &KeptMatched) -> &'db [Symbol] {
+        matched.values.of(self.values)
+    }
+
+    /// The string literals of `whole`, each of one variant.
+    fn names_of(&self, whole: &KeptWholeSet) -> &'db [ExprId] {
+        whole.names.of(self.names)
+    }
 }
 
 /// The literals of the body of `def` that are not exempt, once per body and edit.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn literals(db: &Db, def: DefWithBodyId) -> Literals {
-    let mut out = Literals::default();
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn literals<'db>(db: &'db Db, def: DefWithBodyId) -> Literals<'db> {
+    let mut out = Gathered::default();
     let named_home = matches!(
         def,
         DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_) | DefWithBodyId::VariantId(_)
     );
     if named_home || test_code::is_test_def(db, def) {
-        return out;
+        return Literals::default();
     }
     let analysis = hir::BodyAnalysis::new(db, hir::DefWithBody::from(def));
     let krate = hir::DefWithBody::from(def).module(db).krate(db);
@@ -486,14 +600,14 @@ pub(crate) fn literals(db: &Db, def: DefWithBodyId) -> Literals {
         crate_name: krate.display_name(db).map(|it| it.crate_name().symbol().clone()),
     };
     walk.gather(&mut out);
-    out
+    Literals::keep(db, out)
 }
 
 /// The string `const`s of `krate` (not test code), by value, in the crate's walk order: what a
 /// literal of the crate, or of a crate that depends on it, is told already names it. Its own
 /// query, apart from [`magic_index`], so a dependent crate reads its dependencies' `const`s
 /// and never their bodies' literals.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn named_index(db: &Db, krate: base_db::Crate) -> Index {
     let mut index = Index::default();
     if dup::index::is_test_target(db, krate) {
@@ -517,7 +631,7 @@ pub(crate) fn named_index(db: &Db, krate: base_db::Crate) -> Index {
 
 /// The fieldless enums of `krate` with [`SET_MIN`] variants or more, by the key of their
 /// variants' names ([`variant_set_key`]): what an array of strings is asked spells.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn variant_sets(db: &Db, krate: base_db::Crate) -> Index {
     let mut index = Index::default();
     for module in hir::Crate::from(krate).modules(db) {
@@ -571,14 +685,14 @@ fn variant_set_key(names: impl Iterator<Item = Symbol>) -> Option<Symbol> {
     Some(Symbol::intern(core::str::from_utf8(&out).ok()?))
 }
 
-/// Every [`Ask`] of a crate and its [`Answer`].
+/// Every [`Ask`] of a crate and its answer: a map kept whole, its value `owns`.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Index(HashMap<Ask, Answer, Global>);
+pub(crate) struct Index(HashMap<Ask, Collected, Global>);
 
 impl Index {
-    fn answer(&mut self, ask: Ask) -> Option<&mut Answer> {
+    fn answer(&mut self, ask: Ask) -> Option<&mut Collected> {
         if self.0.get(&ask).is_none() {
-            self.0.insert(ask, Answer::default());
+            self.0.insert(ask, Collected::default());
         }
         self.0.get_mut(&ask)
     }
@@ -593,12 +707,12 @@ impl Index {
 }
 
 /// The literals of every body of `krate`, merged by [`Ask`], once per crate and edit.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn magic_index(db: &Db, krate: base_db::Crate) -> Index {
     let mut index = Index::default();
     for def in frozen_collection::crate_bodies(db, krate) {
         let found = literals(db, def);
-        for lit in &found.lits {
+        for lit in found.lits {
             match (lit.value, lit.role) {
                 (Value::Str(text), role) => {
                     index.body(Ask::Text(text), def);
@@ -610,8 +724,8 @@ pub(crate) fn magic_index(db: &Db, krate: base_db::Crate) -> Index {
                 (_, None) => {}
             }
         }
-        for matched in &found.matched {
-            for &text in &matched.values {
+        for matched in found.matched {
+            for &text in found.values_of(matched) {
                 index.body(Ask::Text(text), def);
                 if let Some(answer) = matched.role.and_then(|it| index.answer(Ask::Spellings(it)))
                 {
@@ -619,19 +733,19 @@ pub(crate) fn magic_index(db: &Db, krate: base_db::Crate) -> Index {
                 }
             }
         }
-        for &(role, konst, value, prim) in &found.consts {
+        for &(role, konst, value, prim) in found.consts {
             let Some(answer) = index.answer(Ask::Consts(role)) else { continue };
             if !answer.consts.contains(&(konst, value, prim)) {
                 answer.consts.push((konst, value, prim));
             }
         }
-        for &(field, of) in &found.enum_fields {
+        for &(field, of) in found.enum_fields {
             let Some(answer) = index.answer(Ask::EnumIndex(field)) else { continue };
             if !answer.enums.contains(&of) {
                 answer.enums.push(of);
             }
         }
-        for template in &found.templates {
+        for template in found.templates {
             index.body(Ask::Template(template.text), def);
             let Some(answer) = index.answer(Ask::Template(template.text)) else { continue };
             match template.error {
@@ -645,25 +759,40 @@ pub(crate) fn magic_index(db: &Db, krate: base_db::Crate) -> Index {
 }
 
 /// One [`Ask`] of one crate: the key of [`magic_answer`].
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+/// Plain data (two ids and a value), so a key as it is: nothing to intern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct MagicKey {
-    #[returns(copy)]
-    pub(crate) krate: base_db::Crate,
-    #[returns(copy)]
-    pub(crate) ask: Ask,
+    krate: base_db::Crate,
+    ask: Ask,
+}
+
+impl MagicKey {
+    pub(crate) fn new(_db: &Db, krate: base_db::Crate, ask: Ask) -> MagicKey {
+        MagicKey { krate, ask }
+    }
 }
 
 /// The answer to one [`Ask`]: what a body's lint reads, so an edit elsewhere in the crate that
-/// leaves this answer as it was leaves the body's lint as it was.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn magic_answer(db: &Db, key: MagicKey) -> Answer {
-    let (krate, ask) = (key.krate(db), key.ask(db));
+/// leaves this answer as it was leaves the body's lint as it was. A copy of the index's rows,
+/// kept in the answer's arena.
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn magic_answer<'db>(db: &'db Db, key: MagicKey) -> Answer<'db> {
+    let MagicKey { krate, ask } = key;
     let index = match ask {
         Ask::Named(_) => named_index(db, krate),
         Ask::VariantSet(_) => variant_sets(db, krate),
         _ => magic_index(db, krate),
     };
-    index.0.get(&ask).cloned().unwrap_or_default()
+    let Some(found) = index.0.get(&ask) else { return Answer::default() };
+    Answer {
+        bodies: kept::slice(db, found.bodies.iter().copied()),
+        consts: kept::slice(db, found.consts.iter().copied()),
+        spellings: kept::slice(db, found.spellings.iter().copied()),
+        enums: kept::slice(db, found.enums.iter().copied()),
+        named: kept::slice(db, found.named.iter().copied()),
+        outside_err: found.outside_err,
+        errors: kept::slice(db, found.errors.iter().copied()),
+    }
 }
 
 /// Where a literal is used: the expression it is used as (through casts, borrows and
@@ -686,7 +815,7 @@ struct Walk<'a, 'db> {
 }
 
 impl<'db> Walk<'_, 'db> {
-    fn gather(&self, out: &mut Literals) {
+    fn gather(&self, out: &mut Gathered) {
         self.templates(out);
         self.name_arrays(out);
         let mut in_pattern = Vec::new_in(Global);
@@ -737,7 +866,7 @@ impl<'db> Walk<'_, 'db> {
     /// The format templates of the body: each `format_args!` a macro wrote whose template is a
     /// string literal of [`template::TEMPLATE_WORDS_FLOOR`] words or more, normalised, with the
     /// error type of the `Err(..)` it is the error of.
-    fn templates(&self, out: &mut Literals) {
+    fn templates(&self, out: &mut Gathered) {
         let map = self.analysis.source_map();
         // Lowering one `format_args!` makes several expressions (the `Arguments` call, its
         // pieces, its arguments) that all map back to its syntax: the template is read once,
@@ -839,7 +968,7 @@ impl<'db> Walk<'_, 'db> {
 
     /// The arrays of [`SET_MIN`] or more string literals the body writes, with the key of the
     /// set their texts spell ([`variant_set_key`]), which the crate is asked the enum of.
-    fn name_arrays(&self, out: &mut Literals) {
+    fn name_arrays(&self, out: &mut Gathered) {
         for (id, expr) in self.body.exprs() {
             let Expr::Array(Array::ElementList { elements, .. }) = expr else { continue };
             if elements.len() < SET_MIN || !self.written(id) || self.in_const(id) {
@@ -905,7 +1034,7 @@ impl<'db> Walk<'_, 'db> {
     /// The locals indexed by a fieldless enum's discriminant (`counts[tag as usize]`), and the
     /// enum; adds the fields indexed so to `out`, and the indexes of an array whose length is
     /// not the enum's variant count.
-    fn enum_indexes(&self, out: &mut Literals) -> Vec<(BindingId, EnumId), Global> {
+    fn enum_indexes(&self, out: &mut Gathered) -> Vec<(BindingId, EnumId), Global> {
         let mut locals = Vec::new_in(Global);
         for (id, expr) in self.body.exprs() {
             let Expr::Index { base, index } = expr else { continue };
@@ -1410,7 +1539,7 @@ impl<'db> Walk<'_, 'db> {
     }
 
     /// A `const` passed as an argument: what [`Ask::Consts`] answers.
-    fn const_arg(&self, id: ExprId, out: &mut Literals) {
+    fn const_arg(&self, id: ExprId, out: &mut Gathered) {
         let Some(ValueNs::ConstId(konst)) = general_facts::value_of(self.db, self.def, self.body, id) else {
             return;
         };
@@ -1594,20 +1723,20 @@ fn find(cx: &Cx<'_, '_>) -> Vec<(Finding, Option<Fix>)> {
         formats: cx.on_blaze(Lint::RepeatedFormat),
     };
     let found = literals(db, def);
-    report.sets(found, &mut out);
+    report.sets(&found, &mut out);
     if report.strings {
-        for whole in &found.whole_sets {
+        for whole in found.whole_sets {
             out.extend(report.whole_set(whole));
         }
     }
     if report.formats {
-        for template in &found.templates {
+        for template in found.templates {
             out.extend(report.template(template));
         }
     }
-    for lit in &found.lits {
+    for lit in found.lits {
         let one = match lit.value {
-            Value::Str(text) if report.strings => report.string(lit, text, found),
+            Value::Str(text) if report.strings => report.string(lit, text, &found),
             Value::Str(_) => None,
             _ if report.numbers => report.number(lit),
             _ => None,
@@ -1615,7 +1744,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<(Finding, Option<Fix>)> {
         out.extend(one);
     }
     if report.numbers {
-        for indexed in &found.indexed {
+        for indexed in found.indexed {
             out.extend(report.indexed(indexed));
         }
     }
@@ -1623,7 +1752,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<(Finding, Option<Fix>)> {
 }
 
 impl<'c> Report<'_, 'c, '_> {
-    fn ask(&self, ask: Ask) -> &'c Answer {
+    fn ask(&self, ask: Ask) -> Answer<'c> {
         magic_answer(self.db, MagicKey::new(self.db, self.krate, ask))
     }
 
@@ -1650,7 +1779,7 @@ impl<'c> Report<'_, 'c, '_> {
     }
 
     /// The other bodies of an answer, as a message lists them: "`a`, `b` and 3 more".
-    fn others(&self, answer: &Answer) -> (String, u32) {
+    fn others(&self, answer: Answer<'_>) -> (String, u32) {
         let total = answer.bodies.iter().map(|(_, it)| *it).sum();
         let named: Vec<String> = answer // alloc: a finding's message part
             .bodies
@@ -1685,8 +1814,8 @@ impl<'c> Report<'_, 'c, '_> {
             }
             Known::VariantsDisagree(of) => return self.variants(lit, &text, of, false),
             Known::FieldLen(field) => {
-                let enums = &self.ask(Ask::EnumIndex(field)).enums;
-                if let [of] = enums.as_slice() {
+                let enums = self.ask(Ask::EnumIndex(field)).enums;
+                if let [of] = enums {
                     let count = hir::Enum::from(*of).variants(self.db).len();
                     let agrees = lit.value.int().and_then(|it| usize::try_from(it).ok()) == Some(count);
                     return self.variants(lit, &text, *of, agrees);
@@ -1847,12 +1976,12 @@ impl<'c> Report<'_, 'c, '_> {
         }
     }
 
-    fn string(&self, lit: &Lit, text: Symbol, found: &Literals) -> Option<(Finding, Option<Fix>)> {
+    fn string(&self, lit: &Lit, text: Symbol, found: &Literals<'c>) -> Option<(Finding, Option<Fix>)> {
         const LINT: Lint = Lint::MagicString;
         const NOTE: &str = "a string the program branches or looks up by names a thing: its home is one `const`, or a type (an enum where the set is closed, a newtype over an interned name) the compiler checks every use of";
         let s = text.as_str();
         let db = self.db;
-        if found.whole_sets.iter().any(|it| it.names.contains(&lit.at) && self.whole_enum(it).is_some()) {
+        if found.whole_sets.iter().any(|it| found.names_of(it).contains(&lit.at) && self.whole_enum(it).is_some()) {
             // The `match` or array is the finding, once.
             return None;
         }
@@ -1891,7 +2020,7 @@ impl<'c> Report<'_, 'c, '_> {
             return Some((self.finding(LINT, lit.at, message, NOTE)?, None));
         }
         if let Some(role) = lit.role {
-            for &(other, at) in &self.ask(Ask::Spellings(role)).spellings {
+            for &(other, at) in self.ask(Ask::Spellings(role)).spellings {
                 if at == self.def {
                     continue;
                 }
@@ -1980,11 +2109,11 @@ impl<'c> Report<'_, 'c, '_> {
 
     /// The enum a whole set of names spells: a `match`'s own, or the one enum of the crate
     /// whose variants an array's strings are.
-    fn whole_enum(&self, whole: &WholeSet) -> Option<EnumId> {
+    fn whole_enum(&self, whole: &KeptWholeSet) -> Option<EnumId> {
         if let Some(of) = whole.of {
             return Some(of);
         }
-        match self.ask(Ask::VariantSet(whole.key?)).enums.as_slice() {
+        match self.ask(Ask::VariantSet(whole.key?)).enums {
             [one] => Some(*one),
             _ => None,
         }
@@ -1993,7 +2122,7 @@ impl<'c> Report<'_, 'c, '_> {
     /// A `match` or an array that spells every variant's name: one finding, whose fix is the
     /// reflection form where the crate has blaze's compile-time reflection on, else one `const`
     /// table beside the enum.
-    fn whole_set(&self, whole: &WholeSet) -> Option<(Finding, Option<Fix>)> {
+    fn whole_set(&self, whole: &KeptWholeSet) -> Option<(Finding, Option<Fix>)> {
         const NOTE: &str = "names written once per variant by hand are a second list of the variants: a variant added or renamed leaves the list behind, and nothing but a reader checks they agree";
         let of = hir::Enum::from(self.whole_enum(whole)?);
         let name = of.name(self.db);
@@ -2025,7 +2154,7 @@ impl<'c> Report<'_, 'c, '_> {
         if total < 2 {
             return None;
         }
-        let owner = match (answer.outside_err, answer.errors.as_slice()) {
+        let owner = match (answer.outside_err, answer.errors) {
             (0, [one]) => format!(
                 "a variant of `{}`, the error every place returns, whose `Display` writes it",
                 hir::Adt::from(*one).name(self.db).as_str()
@@ -2045,9 +2174,9 @@ impl<'c> Report<'_, 'c, '_> {
     }
 
     /// The strings compared with `place` in the body, distinct, in order.
-    fn set_values(&self, found: &Literals, place: SetPlace) -> Vec<Symbol, Global> {
+    fn set_values(&self, found: &Literals<'c>,place: SetPlace) -> Vec<Symbol, Global> {
         let mut values = Vec::new_in(Global);
-        for lit in &found.lits {
+        for lit in found.lits {
             if let (Some(at), Value::Str(text)) = (lit.set, lit.value)
                 && at == place
                 && !values.contains(&text)
@@ -2060,7 +2189,7 @@ impl<'c> Report<'_, 'c, '_> {
 
     /// The closed sets of the body: a `match` on strings, and a place compared against two or
     /// more strings.
-    fn sets(&self, found: &Literals, out: &mut Vec<(Finding, Option<Fix>)>) {
+    fn sets(&self, found: &Literals<'c>,out: &mut Vec<(Finding, Option<Fix>)>) {
         if !self.strings {
             return;
         }
@@ -2069,17 +2198,17 @@ impl<'c> Report<'_, 'c, '_> {
             // alloc: a finding's message part
             values.iter().map(|it| format!("\"{}\"", it.as_str())).collect::<Vec<_>>().join(", ")
         };
-        for matched in &found.matched {
+        for matched in found.matched {
             let message = format!(
                 "`{}` is matched against {}: the set is closed, make it an enum with these variants",
                 self.text(matched.scrutinee),
-                quoted(&matched.values),
+                quoted(found.values_of(matched)),
             );
             out.extend(self.finding(Lint::MagicString, matched.scrutinee, message, NOTE).map(|it| (it, None)));
         }
         // alloc: the places of one body's compares, a few
         let mut seen: Vec<SetPlace, Global> = Vec::new_in(Global);
-        for lit in &found.lits {
+        for lit in found.lits {
             let (Some(place), Some(other)) = (lit.set, lit.other) else { continue };
             if seen.contains(&place) {
                 continue;

@@ -128,7 +128,7 @@ impl DiscrInt {
 /// from `firsts[r]`. A run whose variants have no discriminant (an explicit one failed to
 /// evaluate, or a count passed the type's greatest value) is in `failed` with why; its values
 /// are still rustc's, counted on as its recovery does, for the errors' messages.
-#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct EnumDiscriminants<'db> {
     /// The type the values are of; `None` when it is not known (no target layout), and every
     /// variant failed.
@@ -385,19 +385,20 @@ impl<'db> Builder<'db> {
 
 /// The indices of the variants of `e` written with an explicit discriminant, ascending: where
 /// its runs start, read off the syntax, so a variant finds its run's start without evaluating.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub fn explicit_discriminant_indices(db: &Db, e: EnumId) -> Box<[u32]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn explicit_discriminant_indices<'db>(db: &'db Db, e: EnumId) -> &'db [u32] {
     let variants = e.enum_variants(db).with_explicit_discriminant();
-    // alloc: the memo, empty (no allocation) for an enum without explicit discriminants
-    variants
-        .enumerate()
-        .filter(|(_, (_, _, explicit))| *explicit)
-        .map(|(at, _)| at as u32)
-        .collect()
+    blaze_memo::keep_iter(
+        blaze_memo::Database::memo(db),
+        variants
+            .enumerate()
+            .filter(|(_, (_, _, explicit))| *explicit)
+            .map(|(at, _)| at as u32),
+    )
 }
 
 /// The value of `variant`'s explicit discriminant expression, in the enum's `repr` type.
-#[blaze_query::tracked(cycle_result = explicit_discriminant_cycle_result, returns(clone), mem_tag = Infer)]
+#[blaze_memo::tracked(cycle_result = explicit_discriminant_cycle_result, returns(clone), owns, mem_tag = Infer)]
 pub fn explicit_discriminant<'db>(
     db: &'db Db,
     variant: EnumVariantId,
@@ -411,7 +412,6 @@ pub fn explicit_discriminant<'db>(
 
 fn explicit_discriminant_cycle_result<'db>(
     _: &'db Db,
-    _: blaze_query::db::Id,
     _: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
@@ -420,7 +420,7 @@ fn explicit_discriminant_cycle_result<'db>(
 /// Every variant's discriminant of `e`, in one pass over its variants: each explicit one by its
 /// own [`explicit_discriminant`], so an edit of one evaluates only it, each other one after the
 /// last.
-#[blaze_query::tracked(returns(ref), cycle_result = enum_discriminants_cycle_result, mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), cycle_result = enum_discriminants_cycle_result, owns, mem_tag = Infer)]
 pub fn enum_discriminants<'db>(db: &'db Db, e: EnumId) -> EnumDiscriminants<'db> {
     let variants = e.enum_variants(db);
     let int = match DiscrInt::of(db, e) {
@@ -439,7 +439,6 @@ pub fn enum_discriminants<'db>(db: &'db Db, e: EnumId) -> EnumDiscriminants<'db>
 
 fn enum_discriminants_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     e: EnumId,
 ) -> EnumDiscriminants<'db> {
     let count = e.enum_variants(db).variants.len();

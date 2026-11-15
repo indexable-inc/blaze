@@ -62,7 +62,7 @@ use crate::{
     blaze::{Lint, test_code},
     check::Cx,
     diag::Span,
-    query,
+    kept, query,
 };
 
 /// The version of the canonical form, hashed into every fingerprint: a change to any step
@@ -1548,7 +1548,7 @@ pub(crate) struct SemanticRow {
 /// function of a module, impl or trait, test code, a body a macro writes (a derive's
 /// methods among them), a `const fn` that is one constant, a body outside
 /// [`SEMANTIC_FLOOR`]..=[`SEMANTIC_MOST`], and one whose MIR or form cannot be made.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref))]
 pub(crate) fn body_semantic(db: &Db, def: DefWithBodyId) -> Option<SemanticRow> {
     let DefWithBodyId::FunctionId(f) = def else { return None };
     let role = index::body_shape(db, def).role;
@@ -1575,8 +1575,8 @@ pub(crate) type SemanticWhole = (u64, DefWithBodyId);
 
 /// The compared functions of a crate by fingerprint, sorted: what a dependent crate searches
 /// for its own. Empty for a test, bench or example target.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn crate_semantic(db: &Db, krate: base_db::Crate) -> Box<[SemanticWhole]> {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn crate_semantic<'db>(db: &'db Db, krate: base_db::Crate) -> &'db [SemanticWhole] {
     let mut out: Vec<SemanticWhole, Global> = Vec::new_in(Global);
     if !index::is_test_target(db, krate) {
         for body in query::lint_plan(db, krate).bodies.iter() {
@@ -1586,7 +1586,7 @@ pub(crate) fn crate_semantic(db: &Db, krate: base_db::Crate) -> Box<[SemanticWho
         }
     }
     out.sort_unstable();
-    out.into_boxed_slice()
+    kept::slice(db, out)
 }
 
 /// A finding of `same_behaviour` in a body.
@@ -1643,7 +1643,7 @@ fn shapes_differ(a: Option<u64>, b: Option<u64>) -> bool {
 
 /// Every finding of `krate`'s functions: one pass over their fingerprints, and its local
 /// dependencies' searched per fingerprint.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn semantic_index(db: &Db, krate: base_db::Crate) -> SemanticIndex {
     if index::is_test_target(db, krate) {
         return SemanticIndex::default();
@@ -1731,7 +1731,7 @@ fn expose(db: &Db, original: &Member, here: DefWithBodyId, label: Option<&Site>)
 }
 
 /// The findings of `def`'s body: its slice of its crate's [`semantic_index`].
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn semantic_findings(db: &Db, def: DefWithBodyId) -> Box<[Finding]> {
     let all = semantic_index(db, def.krate(db));
     let start = all.findings.partition_point(|(it, _)| *it < def);

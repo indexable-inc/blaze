@@ -1858,7 +1858,7 @@ fn ty_segment<'db>(db: &'db Db, ty: HTy<'db>) -> Result<String, String> {
         TyKind::Coroutine(..) | TyKind::CoroutineWitness(..) => {
             return Err("`async` or a coroutine (rule Async)".to_owned());
         }
-        _ => return Err(blaze_query::db::attach(db, || format!("the type `{ty:?}`"))),
+        _ => return Err(blaze_memo::attach(db, || format!("the type `{ty:?}`"))),
     })
 }
 
@@ -1872,7 +1872,7 @@ fn rust_args<'db>(db: &'db Db, args: impl IntoIterator<Item = GenericArg<'db>>) 
         } else if let Some(konst) = arg.konst() {
             parts.push(match const_value(konst) {
                 Ok(value) => value.to_string(),
-                Err(_) => blaze_query::db::attach(db, || format!("{konst:?}")),
+                Err(_) => blaze_memo::attach(db, || format!("{konst:?}")),
             });
         }
     }
@@ -1901,7 +1901,7 @@ fn rust_of<'db>(db: &'db Db, ty: HTy<'db>) -> String {
         TyKind::Slice(elem) => format!("[{}]", rust_of(db, elem)),
         TyKind::Array(elem, len) => match const_value(len) {
             Ok(len) => format!("[{}; {len}]", rust_of(db, elem)),
-            Err(_) => blaze_query::db::attach(db, || format!("{ty:?}")),
+            Err(_) => blaze_memo::attach(db, || format!("{ty:?}")),
         },
         TyKind::Adt(def, args) => {
             let adt = def.def_id();
@@ -1911,9 +1911,9 @@ fn rust_of<'db>(db: &'db Db, ty: HTy<'db>) -> String {
         }
         TyKind::Closure(id, args) => match closure_of(db, id.0, args.as_closure().parent_args()) {
             Ok(of) => of.env.display,
-            Err(_) => blaze_query::db::attach(db, || format!("{ty:?}")),
+            Err(_) => blaze_memo::attach(db, || format!("{ty:?}")),
         },
-        _ => blaze_query::db::attach(db, || format!("{ty:?}")),
+        _ => blaze_memo::attach(db, || format!("{ty:?}")),
     }
 }
 
@@ -2054,7 +2054,7 @@ fn owner<'db>(
                             each implementor a call reaches)"
                     .to_owned());
             };
-            return blaze_query::db::attach(db, || {
+            return blaze_memo::attach(db, || {
                 let interner = DbInterner::new_with(db, func.krate(db));
                 let parent = hir_ty::generics::generics(db, func.into()).len_parent();
                 let trait_args: GenericArgs<'db> = GenericArgs::new_from_iter(args.iter().take(parent));
@@ -2063,7 +2063,7 @@ fn owner<'db>(
             });
         }
     };
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let interner = DbInterner::new_with(db, func.krate(db));
         let generic_impl = GenericParams::of(db, imp.into()).len_type_or_consts() != 0;
         let (self_ty, of) = match args {
@@ -2439,7 +2439,7 @@ impl<'db> Cx<'db> {
                 return Err(self.refuse("`async` or a coroutine (rule Async)", at));
             }
             _ => {
-                let what = blaze_query::db::attach(self.db, || format!("the type `{ty:?}`"));
+                let what = blaze_memo::attach(self.db, || format!("the type `{ty:?}`"));
                 return Err(self.refuse(what, at));
             }
         })
@@ -2704,7 +2704,7 @@ impl<'db> Cx<'db> {
                 match ocx.deeply_normalize(&ObligationCause::dummy(), self.env.param_env, field_ty) {
                     Ok(normalized) if !normalized.has_aliases() && !normalized.has_infer() => normalized,
                     _ => {
-                        let shown = blaze_query::db::attach(db, || format!("{field_ty:?}"));
+                        let shown = blaze_memo::attach(db, || format!("{field_ty:?}"));
                         return Err(self.refuse(
                             format!(
                                 "a field whose type is an associated type of a type argument \
@@ -5079,7 +5079,7 @@ impl<'db> Cx<'db> {
             _ => Err(self.refuse(
                 format!(
                     "the order of `{}`, a field of a derived order, which has no model (rule NoModel)",
-                    blaze_query::db::attach(db, || format!("{ty:?}"))
+                    blaze_memo::attach(db, || format!("{ty:?}"))
                 ),
                 at,
             )),
@@ -5410,7 +5410,7 @@ impl<'db> Cx<'db> {
                 Ok(())
             }
             _ => Err(self.refuse(
-                format!("{what} of `{}`, which has no model (rule NoModel)", blaze_query::db::attach(db, || format!("{ty:?}"))),
+                format!("{what} of `{}`, which has no model (rule NoModel)", blaze_memo::attach(db, || format!("{ty:?}"))),
                 at,
             )),
         }

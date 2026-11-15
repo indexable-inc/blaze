@@ -308,10 +308,12 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 let variant_fields = variant.fields(db);
                 let arity = variant_fields.fields().len();
                 let mut fields = Vec::with_capacity(args.len());
+                // The body's contexts are of its crate's table.
+                let table = hir_ty::ctx_table(self.cx.krate);
                 for field in args {
                     let hygiene = self.body.record_field_hygiene(field.pat);
                     let fid = variant_fields
-                        .field_written(db, variant, &field.name, hygiene)
+                        .field_written(db, table, variant, &field.name, hygiene)
                         .ok_or(LowerError::Failed)?;
                     let idx = u32::from(fid.into_raw()) as usize;
                     fields.push(self.lower(field.pat)?.at_index(idx));

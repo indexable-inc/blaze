@@ -156,14 +156,6 @@ pub(crate) fn built_nothing(job: &Job, unit: usize) -> bool {
 /// larger walk after at most about 6 s.
 const PROOF_STEPS: u64 = 1 << 12;
 
-/// The most rows of the front end a purity proof may bring up to date (each run or verified,
-/// each time it is reached): a bound on the query engine under the proof, not on the script,
-/// so an engine that would not end the proof stops with an error that says so (rule 18).
-/// Unlike [`PROOF_STEPS`] it counts what was not cached, so it sits far above any proof's
-/// real work: a verify checks each row of a cycle once (`blaze_query`'s pending rows), and a
-/// cold proof of cranelift-codegen's build script brought fewer than 2^25 up to date.
-const ENGINE_FUEL: u64 = 1 << 28;
-
 /// What the pure path finds of the script compiled by unit `compile`, its target `target`
 /// (`build-script-build`) and `unit` its name (`serde v1.0.219 (build script)`), which the
 /// proof's span carries.
@@ -175,7 +167,7 @@ fn work_out(
     unit: &str,
 ) -> Result<Purity, ApiError> {
     let db = reader.db();
-    let krate = job.crates.krate(compile).ok_or(UnitError::NoCrate { unit: compile })?;
+    let krate = job.crates.krate(db, compile).ok_or(UnitError::NoCrate { unit: compile })?;
     // Not proved, so built and run in the sandbox as any script: the proof is asked of a free
     // `main` only.
     let Some(main) = hir_ty_pure::main_of(db, krate) else { return Ok(Purity::Unproved) };
@@ -187,30 +179,23 @@ fn work_out(
             unit: blaze_profile::span::Name::of(unit),
         }
         .open();
-        let proved = blaze_query::db::with_fuel(ENGINE_FUEL, || {
-            blaze_query::db::with_steps(PROOF_STEPS, || {
-                blaze_query::db::attach(db, || hir_ty_pure::script_proof(db, main))
-            })
+        // No bound on the engine under the proof: the memo has no rows to bring up to date
+        // (a snapshot's entries are settled by holding them) and bounds a cycle by its rounds
+        // (`blaze_memo::MAX_ROUNDS`), so the proof's own steps are the one bound.
+        let proved = hir_ty_pure::with_steps(PROOF_STEPS, || {
+            blaze_memo::attach(db, || hir_ty_pure::script_proof(db, main))
         });
         match proved {
             // A proof kept from a walk with no bound on it is held to the bound as well.
-            Ok((Ok((proof, _)), _)) if u64::from(proof.steps) <= PROOF_STEPS => {
+            Ok((proof, _)) if u64::from(proof.steps) <= PROOF_STEPS => {
                 span.ended(blaze_profile::span::ScriptProved { steps: u64::from(proof.steps) });
                 proof
             }
             // alloc: once per script past the bound: what the build's report says of it
-            Ok((Ok((proof, _)), _)) => {
+            Ok((proof, _)) => {
                 return Ok(past_bound(&format!("it walked {}", proof.steps)));
             }
-            Ok((Err(out), _)) => return Ok(past_bound(&format!("it {out}"))), // alloc: as above
-            Err(out) => {
-                let what = format!(
-                    "did not end: the query engine under it {out}, past the {ENGINE_FUEL} rows a proof may bring up to \
-                     date (rule 18). The walk itself is bounded by the instances it reaches, so this is the engine \
-                     not ending, a blaze bug, not the script"
-                ); // alloc: an error, once
-                return Err(proof_error(job, compile, &what));
-            }
+            Err(out) => return Ok(past_bound(&format!("it {out}"))), // alloc: as above
         }
     };
     let proved = match &proof.purity {
@@ -284,19 +269,6 @@ fn past_bound(how: &str) -> Purity {
     Purity::Impure(format!(
         "not proved pure: its proof walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 18): {how}"
     ))
-}
-
-/// The error of the purity proof of the script compiled by unit `compile`, naming the script;
-/// `what` says what the proof did.
-fn proof_error(job: &Job, compile: usize, what: &str) -> ApiError {
-    let unit = job.unit(compile);
-    let script = unit
-        .as_ref()
-        .map_or_else(|it| it.what.clone(), |it| format!("`{}` of `{}`", it.target.name, it.pkg_id)); // alloc: an error, once
-    let what = format!(
-        "the purity proof of the build script {script} (`script_proof` of its `main`) {what}"
-    ); // alloc: an error, once
-    ApiError::new(what, unit.ok().map(|it| it.pkg_id.clone())) // clone: an error, once
 }
 
 /// Run unit `run` as `blaze_build_script` describes it, and the environment it is started in:

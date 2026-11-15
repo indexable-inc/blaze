@@ -561,7 +561,7 @@ pub fn expect_fragment<'t>(
 ) -> ExpandResult<tt::TokenTreesView<'t>> {
     use ::parser;
     let buffer = tt_iter.remaining();
-    let mut edition = |ctx: SyntaxContext| ctx.edition(db);
+    let mut edition = |ctx: SyntaxContext| ctx.edition();
     // The parser reads only the first top-level trees of the level, doubled until it provably
     // read nothing past them: its position only moves forward, and it reads at most
     // `PARSER_LOOKAHEAD - 1` tokens past it (`Parser::nth` asserts `n <= 3`, and glued

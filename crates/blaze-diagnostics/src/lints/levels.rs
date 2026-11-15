@@ -527,7 +527,7 @@ mod tests {
         let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
         let cmd = CommandLine::parse(&args).unwrap();
         let db = &checked.db;
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
             let cx = Cx::new(db, krate, checked.files(), &frame).with_lints(&cmd);
@@ -784,7 +784,7 @@ fn main() {}
                         );
                         let node = hir_lint_levels::query::owner_node(cx.db, owner);
                         let at = InFile::new(node.file_id, ast::ptr(node.value));
-                        let front = hir_lint_levels::lint_levels_on(cx.db, owner, ());
+                        let front = hir_lint_levels::lint_levels_on(cx.db, owner);
                         for lint in registry::all() {
                             assert_eq!(
                                 map.level(lint.id(), at),

@@ -18,6 +18,8 @@ blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+blaze-memo.workspace = true
+# `QueryKind` and `QueryKey` only: the fact kinds, outside the deleted engine.
 blaze-query.workspace = true
 blaze-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }

@@ -47,7 +47,7 @@ macro_rules! query_ids {
             fn put(&self, w: &mut $crate::hir::persist::Words) {
                 w.query_id(
                     <$ty as $crate::hir::persist::Relocate>::KIND,
-                    blaze_query::db::AsId::as_id(self),
+                    blaze_memo::Id::gid(*self),
                 );
             }
 
@@ -55,22 +55,114 @@ macro_rules! query_ids {
                 r: &mut $crate::hir::persist::Read<'_>,
             ) -> Result<Self, ::blaze_format::FormatError> {
                 let kind = <$ty as $crate::hir::persist::Relocate>::KIND;
-                Ok(<$ty as blaze_query::db::FromId>::from_id(r.query_id_of(kind)?))
+                Ok(<$ty as blaze_memo::Id>::from_gid(r.query_id_of(kind)?))
             }
         }
     )*};
 }
 pub(crate) use query_ids;
 
-/// The id whose bits are the word `bits`: `None` for 0 or a word past
-/// [`blaze_query::db::Id::MAX_U32`], which no id is.
-pub(crate) fn id_of_bits(bits: u64) -> Option<blaze_query::db::Id> {
-    u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)
+/// The session word of `id` ([`blaze_memo::Gid::session_bits`]): what it is in this process
+/// only, never in another or after a restart. Never 0 for an id hir-def writes: every one is
+/// homed in a crate's arena, whose index is at least 1 (0 is the session arena). Bytes holding
+/// one are [`SessionBytes`] until a [`Relocation`] table has replaced it.
+#[inline]
+pub(crate) fn session_word(id: blaze_memo::Gid) -> u64 {
+    id.session_bits()
 }
 
-/// The id of a [`Relocation`] entry's bits, which this database made.
-pub(crate) fn entry_id(bits: u64) -> blaze_query::db::Id {
-    id_of_bits(bits).expect("a relocation entry of an id that is no id of this database")
+/// The id whose session word is `bits` ([`session_word`]): `None` for a word no id has (0, or
+/// any with a zero local), which no id hir-def writes is.
+pub(crate) fn session_id(bits: u64) -> Option<blaze_memo::Gid> {
+    blaze_memo::Gid::from_session_bits(bits)
+}
+
+/// The id of a [`Relocation`] entry's session word, which this process made.
+pub(crate) fn entry_id(bits: u64) -> blaze_memo::Gid {
+    session_id(bits).expect("a relocation entry of an id that is no id of this process")
+}
+
+/// [`session_id`] of a word read at `at`, a format error naming `what` where it is no id.
+pub(crate) fn decode_session_id(
+    bits: u64,
+    at: u64,
+    what: &'static str,
+) -> Result<blaze_memo::Gid, FormatError> {
+    session_id(bits).ok_or(FormatError::Invalid { at, what })
+}
+
+/// The bytes of a value with ids, as this process wrote them: an expression store, a body or
+/// a source map whose blocks, macro calls and files are [`session_word`]s, which mean
+/// something only to this process. They are read back here and nowhere else.
+///
+/// The type is the rule (rule 76): it has no [`blaze_format::Persist`] impl and no
+/// conversion to [`Portable`], and everything that files bytes (an image part, a signature
+/// record, the image itself, [`crate::deps::write_image`]) takes [`Portable`]. The one way
+/// from these to filed bytes is `deps::signatures::table::relocate_store`, which moves every
+/// session word to its place in a [`Relocation`] table.
+#[must_use = "session bytes are made to be read back in this process"]
+pub struct SessionBytes(Vec<u8, Global>);
+
+impl SessionBytes {
+    /// `value` written as this process does ([`blaze_format::to_bytes`]). Inside a
+    /// [`relocating`] scope its [`Words`] go through the table; the words a store writes raw
+    /// (`expr_store::persist`'s blocks, calls and files) are session words either way.
+    pub fn of<P: blaze_format::Persist>(value: &P) -> SessionBytes {
+        SessionBytes(blaze_format::to_bytes(value))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The bytes, to patch in place: only `relocate_store`, which is what makes them
+    /// [`Portable`].
+    pub(crate) fn into_patched(self) -> Vec<u8, Global> {
+        self.0
+    }
+}
+
+/// Bytes every id in which is a [`Relocation`] index or a portable id ([`crate::deps::PortableIds`]),
+/// or that name no id at all, only keys and text: what may be filed in a store, put in an
+/// image, or kept past this process. [`SessionBytes`] never become these except through
+/// `relocate_store`.
+#[must_use = "portable bytes are made to be filed"]
+pub struct Portable(Vec<u8, Global>);
+
+impl Portable {
+    /// The bytes an encoder wrote whose every id went through a [`Relocation`] table or a
+    /// portable id, or that writes none (`nameres::frozen`'s keyed encoders, an image's own
+    /// columns). Its callers are the encoders that file: `deps::signatures`' records and
+    /// part, `relocate_store`, and the image's parts in `deps::serve`.
+    pub(crate) fn written(bytes: Vec<u8, Global>) -> Portable {
+        Portable(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl PartialEq for Portable {
+    fn eq(&self, other: &Portable) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Portable {}
+
+impl std::fmt::Debug for Portable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Portable({} bytes)", self.0.len())
+    }
 }
 
 /// What an id in a [`Relocation`] table is: which query database type, or a syntax context, or a span's
@@ -451,10 +543,10 @@ impl Words {
         value.put(self);
     }
 
-    /// An id the query database made: its bits as a `u64` word, or inside [`relocating`] its
-    /// index in the table.
-    pub(crate) fn query_id(&mut self, kind: Kind, id: blaze_query::db::Id) {
-        let bits = u64::from(id.as_u32());
+    /// An id the memo made: its session word ([`session_word`]), or inside [`relocating`]
+    /// its index in the table.
+    pub(crate) fn query_id(&mut self, kind: Kind, id: blaze_memo::Gid) {
+        let bits = session_word(id);
         match relocated(kind, bits) {
             Some(index) => self.u32(index),
             None => self.u64(bits),
@@ -652,21 +744,21 @@ impl<'a> Read<'a> {
 
     /// The id of something the query database made, as [`query_ids`] wrote it outside
     /// [`relocating`].
-    pub(crate) fn query_id(&mut self) -> Result<blaze_query::db::Id, FormatError> {
+    pub(crate) fn query_id(&mut self) -> Result<blaze_memo::Gid, FormatError> {
         let at = self.here();
         let bits = self.u64()?;
-        blaze_query::db::Id::decode(bits, at, "a query id")
+        decode_session_id(bits, at, "a query id")
     }
 
     /// The id of something the query database made of `kind`, as [`Words::query_id`] wrote it:
     /// inside [`relocating`], looked up in the table.
-    pub(crate) fn query_id_of(&mut self, kind: Kind) -> Result<blaze_query::db::Id, FormatError> {
+    pub(crate) fn query_id_of(&mut self, kind: Kind) -> Result<blaze_memo::Gid, FormatError> {
         if !in_scope() {
             return self.query_id();
         }
         let at = self.here();
         let bits = self.relocated(kind)?;
-        blaze_query::db::Id::decode(bits, at, "a relocated query id")
+        decode_session_id(bits, at, "a relocated query id")
     }
 
     /// The bits of the id of `kind` the next word names in the [`relocating`] table.
@@ -1411,12 +1503,22 @@ mod tests {
         blaze_alloc_count::assert_at_most(0, "names on warm words", name_all);
     }
 
-    fn crate_of(bits: u32) -> base_db::Crate {
-        <base_db::Crate as blaze_query::db::FromId>::from_id(blaze_query::db::Id::from_u32(bits))
+    /// The id at `local` in a crate arena: its session word is never 0 ([`session_word`]).
+    fn gid_at(local: u32) -> blaze_memo::Gid {
+        blaze_memo::Gid::for_test(local)
     }
 
-    fn call_of(bits: u32) -> MacroCallId {
-        <MacroCallId as blaze_query::db::FromId>::from_id(blaze_query::db::Id::from_u32(bits))
+    fn crate_of(local: u32) -> base_db::Crate {
+        <base_db::Crate as blaze_memo::Id>::from_gid(gid_at(local))
+    }
+
+    fn call_of(local: u32) -> MacroCallId {
+        <MacroCallId as blaze_memo::Id>::from_gid(gid_at(local))
+    }
+
+    /// The two words a `u64` is written as, low first.
+    fn words_of_bits(bits: u64) -> [u32; 2] {
+        [bits as u32, (bits >> 32) as u32]
     }
 
     /// The words `value` is written as, in a scope of `table` when there is one.
@@ -1445,9 +1547,11 @@ mod tests {
 
     #[test]
     fn ids_outside_a_relocation_are_their_bits() {
-        assert_eq!(words_of(&crate_of(5), None), [5, 0]);
-        let high = blaze_query::db::Id::MAX_U32;
-        assert_eq!(words_of(&crate_of(high), None), [high, 0]);
+        assert_eq!(words_of(&crate_of(5), None), words_of_bits(session_word(gid_at(5))));
+        // The highest local an arena hands out (`Gid::for_test`'s bound): its word keeps every
+        // bit of it.
+        let high = blaze_memo::SPILL - 2;
+        assert_eq!(words_of(&crate_of(high), None), words_of_bits(session_word(gid_at(high))));
         let context = SyntaxContext::root(Edition::Edition2021);
         assert_eq!(words_of(&context, None), [context.into_u32()]);
         let file = span::EditionedFileId::new(span::FileId::from_raw(9), Edition::Edition2018);
@@ -1460,10 +1564,10 @@ mod tests {
         let value = (crate_of(7), (call_of(7), (crate_of(9), crate_of(7))));
         let words = words_of(&value, Some(&mut table));
         assert_eq!(words, [0, 1, 2, 0], "one index per distinct id and kind");
-        let bits = |it: base_db::Crate| u64::from(blaze_query::db::AsId::as_id(&it).as_u32());
+        let bits = |local| session_word(gid_at(local));
         assert_eq!(
             table.entries(),
-            [(Kind::Crate, bits(crate_of(7))), (Kind::MacroCall, 7), (Kind::Crate, 9)]
+            [(Kind::Crate, bits(7)), (Kind::MacroCall, bits(7)), (Kind::Crate, bits(9))]
         );
         let mut reading = Relocation::of(table.entries().to_vec());
         let back: (base_db::Crate, (MacroCallId, (base_db::Crate, base_db::Crate))) =
@@ -1492,7 +1596,8 @@ mod tests {
 
     #[test]
     fn an_index_of_another_kind_or_past_the_table_is_refused() {
-        let mut reading = Relocation::of(vec![(Kind::MacroCall, 7)]);
+        // An entry holds the id's session word ([`session_word`]), not its local.
+        let mut reading = Relocation::of(vec![(Kind::MacroCall, session_word(gid_at(7)))]);
         assert!(read_back::<base_db::Crate>(&[0], &mut reading).is_err(), "another kind");
         assert!(read_back::<MacroCallId>(&[1], &mut reading).is_err(), "past the table");
         assert_eq!(read_back::<MacroCallId>(&[0], &mut reading).unwrap(), call_of(7));

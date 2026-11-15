@@ -1,32 +1,20 @@
 //! The model a simulation runs on: a program of generic functions and statics, its front end
-//! (body keys, statics' values, spans, checks), and the maker of plans and code records.
+//! (body keys, statics' values, spans, checks), and the maker of plans and code heads.
 //!
-//! The code a maker makes is in a small instruction set of 4-byte op words, so the image can be
-//! run ([`super::world::trace`]): `HEAD` and the first 8 bytes of the plan key (the same at both
-//! tiers), `CALL` and a branch field, `STATIC` and an 8-byte address, `PANIC` and an 8-byte
-//! location address and a branch field to the extern `blaze_panic`, `RET`. An inlined callee's
-//! ops are emitted in place of its `CALL`, without its `RET`, so a run of an image prints the
-//! same events whatever was inlined.
+//! The maker makes a code record's head only (what the code refers to after inlining): the
+//! code itself is codegen's, and the walk and the row rule read nothing else of it. An inlined
+//! callee's calls and statics stand in place of its call, as its code would.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_sim::Tape;
 
-use crate::inline::{InlineAttr, InlineEdge, OwnFacts, SizeClass};
-use crate::key::{ArgsKey, BodyKey, ItemId, Settings, Symbol, Tier, TypeKey, plan_key};
-use crate::program::Arch;
-use crate::record::{CallerFacts, CodeParts, InstanceCode, LineRow, LocRow, Plan, Reloc, RelocKind, StaticValue, Target};
 use crate::codec::{Digest, Hasher};
+use crate::inline::{InlineAttr, InlineEdge, OwnFacts, SizeClass};
+use crate::key::{ArgsKey, BodyKey, ItemId, Settings, Symbol, Tier, TypeKey};
+use crate::record::{CodeHead, Plan, Reloc, RelocKind, StaticValue, Target};
 use crate::walk::{BodyError, Front, Span};
 
-pub(super) const OP_HEAD: u8 = 1;
-pub(super) const OP_CALL: u8 = 2;
-pub(super) const OP_STATIC: u8 = 3;
-pub(super) const OP_PANIC: u8 = 4;
-pub(super) const OP_RET: u8 = 0xc3;
-/// An arm64 `bl` with a zero offset: the template of every arm64 branch field.
-pub(super) const ARM64_BL: u32 = 0x9400_0000;
-pub(super) const PANIC_EXTERN: &[u8] = b"blaze_panic";
 pub(super) const TYPES: u8 = 3;
 
 /// True `num` times in `den`, drawn from the tape; calm (a draw of 0) is false.
@@ -204,14 +192,13 @@ pub(super) fn fn_symbol(model: &Model, index: usize, args: &[u8]) -> Symbol {
 pub(super) struct ModelFront {
     pub(super) model: Model,
     pub(super) settings: Settings,
-    pub(super) arch: Arch,
     by_item: BTreeMap<ItemId, usize>,
     instances: BTreeMap<Symbol, (usize, Vec<u8>)>,
     statics: BTreeMap<Symbol, usize>,
 }
 
 impl ModelFront {
-    pub(super) fn new(model: &Model, settings: Settings, arch: Arch) -> ModelFront {
+    pub(super) fn new(model: &Model, settings: Settings) -> ModelFront {
         let mut by_item = BTreeMap::new();
         let mut instances = BTreeMap::new();
         for (index, function) in model.fns.iter().enumerate() {
@@ -231,7 +218,7 @@ impl ModelFront {
         for index in 0..model.statics.len() {
             statics.insert(static_symbol(index), index);
         }
-        ModelFront { model: model.clone(), settings, arch, by_item, instances, statics }
+        ModelFront { model: model.clone(), settings, by_item, instances, statics }
     }
 
     pub(super) fn instance(&self, symbol: &Symbol) -> (usize, Vec<u8>) {
@@ -284,97 +271,40 @@ impl ModelFront {
         }
     }
 
-    /// The code of `symbol` at `tier`, taking in the callees of `inline`.
-    pub(super) fn make_code(&self, symbol: &Symbol, tier: Tier, inline: &[InlineEdge]) -> InstanceCode {
+    /// The head of the code of `symbol` at `tier`, taking in the callees of `inline`: its calls
+    /// not taken in, and its statics, each once in the order its code would refer to them.
+    pub(super) fn make_head(&self, symbol: &Symbol, tier: Tier, inline: &[InlineEdge]) -> CodeHead {
         let _ = tier;
         let mut edges = BTreeSet::new();
         for edge in inline {
             edges.insert((edge.caller, edge.callee));
         }
-        let mut out = Emit::default();
-        self.emit(symbol, &edges, &mut out, 0);
-        out.code.extend_from_slice(&[OP_RET, 0, 0, 0]);
-        let externs = match out.panics {
-            true => vec![PANIC_EXTERN.to_vec()],
-            false => Vec::new(),
-        };
-        let size = out.code.len() as u32;
-        let parts = CodeParts {
-            symbol: *symbol,
-            facts: CallerFacts { noreturn: false, nounwind: !out.panics, size },
-            code: out.code,
-            unwind: vec![0xee; 4],
-            relocs: out.relocs,
-            locations: out.locations,
-            lines: out.lines,
-            externs,
-        };
-        match InstanceCode::new(parts) {
-            Ok(code) => code,
-            Err(error) => panic!("the model made a code record its checks refuse: {error}"),
-        }
+        let mut head = CodeHead { calls: Vec::new(), statics: Vec::new() };
+        self.emit(symbol, &edges, &mut head, 0);
+        head
     }
 
-    fn branch(&self, out: &mut Emit, target: Target) {
-        let at = out.code.len() as u32;
-        match self.arch {
-            Arch::X86_64 => {
-                out.code.extend_from_slice(&[0; 4]);
-                out.relocs.push(Reloc { at, kind: RelocKind::Rel32, target, addend: -4 });
-            }
-            Arch::Arm64 => {
-                out.code.extend_from_slice(&ARM64_BL.to_le_bytes());
-                out.relocs.push(Reloc { at, kind: RelocKind::Arm64Branch26, target, addend: 0 });
-            }
-        }
-    }
-
-    fn emit(&self, symbol: &Symbol, inline: &BTreeSet<(Symbol, Symbol)>, out: &mut Emit, depth: u32) {
+    fn emit(&self, symbol: &Symbol, inline: &BTreeSet<(Symbol, Symbol)>, head: &mut CodeHead, depth: u32) {
         assert!(depth < 64, "an inline tree deeper than 64: the component rule is broken");
-        let (index, args) = self.instance(symbol);
+        let (index, _) = self.instance(symbol);
         let function = &self.model.fns[index];
-        let body = match self.body_key(&item(index)) {
-            Ok(body) => body,
-            Err(error) => panic!("the maker was asked for {symbol}, which has no body: {error:?}"),
-        };
-        let plan = plan_key(symbol, &body, &self.settings.plan_key());
-        out.lines.push(LineRow { offset: out.code.len() as u32, item: item(index), line: 0 });
-        out.code.extend_from_slice(&[OP_HEAD, 0, 0, 0]);
-        out.code.extend_from_slice(&plan.0.0[..8]);
+        if let Err(error) = self.body_key(&item(index)) {
+            panic!("the maker was asked for {symbol}, which has no body: {error:?}");
+        }
         for callee in self.plan(symbol).calls {
             if inline.contains(&(*symbol, callee)) {
-                self.emit(&callee, inline, out, depth + 1);
-            } else {
-                out.code.extend_from_slice(&[OP_CALL, 0, 0, 0]);
-                self.branch(out, Target::Function(callee));
+                self.emit(&callee, inline, head, depth + 1);
+            } else if !head.calls.contains(&callee) {
+                head.calls.push(callee);
             }
         }
         for target in &function.statics {
-            out.code.extend_from_slice(&[OP_STATIC, 0, 0, 0]);
-            let at = out.code.len() as u32;
-            out.code.extend_from_slice(&[0; 8]);
-            out.relocs.push(Reloc { at, kind: RelocKind::Abs64, target: Target::Static(static_symbol(*target)), addend: 0 });
-        }
-        for panic in 0..function.panics {
-            out.code.extend_from_slice(&[OP_PANIC, 0, 0, 0]);
-            let at = out.code.len() as u32;
-            out.code.extend_from_slice(&[0; 8]);
-            let location = out.locations.len() as u32;
-            out.locations.push(LocRow { item: item(index), line: u32::from(panic) + 1, col: u32::from(panic) + 5 });
-            out.relocs.push(Reloc { at, kind: RelocKind::Abs64, target: Target::Location(location), addend: 0 });
-            self.branch(out, Target::Extern(0));
-            out.panics = true;
+            let target = static_symbol(*target);
+            if !head.statics.contains(&target) {
+                head.statics.push(target);
+            }
         }
     }
-}
-
-#[derive(Default)]
-struct Emit {
-    code: Vec<u8>,
-    relocs: Vec<Reloc>,
-    locations: Vec<LocRow>,
-    lines: Vec<LineRow>,
-    panics: bool,
 }
 
 impl Front for ModelFront {

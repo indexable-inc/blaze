@@ -61,7 +61,7 @@ fn shape(ty: Ty<'_>) -> String {
 /// inference.
 fn bindings(fixture: &str, name: &str) -> BTreeMap<String, String> {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, name));
         let body = Body::of(&db, def);
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));

@@ -29,7 +29,7 @@
 // unsafe.
 #![allow(unsafe_code)]
 
-use core::{fmt, mem::offset_of};
+use core::{alloc::Allocator, fmt, mem::offset_of};
 
 use blaze_format::{FormatError, Record, Slice, Writer};
 use blaze_ids::{ContentId, Hasher};
@@ -121,10 +121,17 @@ blaze_format::record! {
     }
 }
 
+/// The address and result of the [`Entry`] of a silent item: one the key task names (text) and
+/// its unit's surface does not (no maker row: text the def map does not reach, such as an item
+/// only an unused macro arm holds). No body task runs for it and no record is filed; its shape
+/// is empty. Not a digest of anything, so no record is ever filed at it.
+pub const SILENT: ContentId = ContentId([0; 32]);
+
 blaze_format::record! {
     /// One item of a unit's chunk: its stable id, its key, the address its record is filed at,
     /// the record's result digest ([`result_digest`]), its shape (`shape_len` ordinals into the
-    /// chunk's dictionary at `shape_at` of `shapes`) and its kind.
+    /// chunk's dictionary at `shape_at` of `shapes`) and its kind. A silent item's address and
+    /// result are [`SILENT`].
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Entry: 1 {
         pub item: ContentId,
@@ -236,6 +243,7 @@ macro_rules! headed {
 }
 
 headed!(Traced, Opaque, Sections, ShapeRoot, MarkRoot, ChunkRoot, ManifestRoot);
+// `PlanPayload` and `ProgramKeptRoot` are payloads inside a headed record, not roots: no head.
 
 /// What an item is across edits: the hash of its path and its kind. Never a position, never a
 /// dense id.
@@ -310,56 +318,95 @@ pub enum FactKind {
     /// What the asking unit sees as a whole ([`seen_id`]): the row an [`Owner::ASKER`] fact the
     /// asker's table has no row of is answered by.
     Seen = 40,
+    /// Another crate's settings (its `Crate` input's content id): a row of that crate's
+    /// surface, as its surface key covers its settings.
+    CrateSettings = 41,
+    // Byte 42 is retired, unused forever: it was `BlockScope`, a block's def map as one fact.
+    // A body that reads its own block now lists the block's lookups as ordinary rows
+    // (`Resolves`, `TraitsInScope`, `WholeScope`, `Modules`, `CrateNames`), so nothing makes
+    // or asks it; an id persisted with byte 42 is no kind.
+    /// Every module of a crate (a walk of them): a row of the crate's surface.
+    Modules = 43,
+    /// Which body makes the facts about a subject: one row of the subject's crate's surface per
+    /// body-bearing definition, its id [`maker_row`] of the subject (formed from any made
+    /// fact's id about it by [`maker_row_of`]), its digest the body's text id (the
+    /// [`StableId`] the unit's key task gives the item). What a driver finds a demanded maker
+    /// by when the maker's unit's bodies are not checked; no task reads it.
+    Maker = 44,
+    /// What a plan reads of a body: the body record's result digest ([`result_digest`]), its
+    /// subject the body's item ([`mir_id`]). Made by the body, so a plan of an item of a unit
+    /// whose bodies are not asked demands its maker as a body's reader does a const's value. No
+    /// unit's made table holds it (a body edit moves no universe digest, so no dependent's
+    /// mark): the driver answers it from the bodies it settled or the manifests that name them.
+    Mir = 45,
+    /// A file of a unit as a span table reads it: its id [`span_file_id`] of the unit's owner
+    /// and the name the program prints for the file ([`printed_name`]), its digest
+    /// [`span_file_digest`] of the file's image key, so a read covers the file's text (every
+    /// base and position a table holds) and its printed name. Owned by the unit and answered by
+    /// the driver alone from the unit's key rows this request ([`crate::front::Keyed::names`]):
+    /// no table holds it ([`crate::front::Unanswerable::DriverOwn`]). Only span records read it.
+    SpanFile = 46,
 }
 
 impl FactKind {
-    const ALL: [FactKind; 40] = [
-        FactKind::Own,
-        FactKind::Signature,
-        FactKind::Fields,
-        FactKind::Layout,
-        FactKind::ImplRows,
-        FactKind::Binding,
-        FactKind::ConstValue,
-        FactKind::InlineCode,
-        FactKind::Late,
-        FactKind::HiddenType,
-        FactKind::Escaped,
-        FactKind::Effects,
-        FactKind::Attrs,
-        FactKind::CrateRoot,
-        FactKind::TraitsInScope,
-        FactKind::WholeScope,
-        FactKind::CrateNames,
-        FactKind::FieldOrder,
-        FactKind::Setting,
-        FactKind::InherentAssocTypes,
-        FactKind::Name,
-        FactKind::Coherence,
-        FactKind::Specializes,
-        FactKind::DropCheck,
-        FactKind::Target,
-        FactKind::RpititTys,
-        FactKind::StepInfer,
-        FactKind::StepMir,
-        FactKind::StepLower,
-        FactKind::MatchCheck,
-        FactKind::Hashes,
-        FactKind::Method,
-        FactKind::Vtable,
-        FactKind::InherentImpls,
-        FactKind::TraitImpls,
-        FactKind::TraitsNamed,
-        FactKind::ScopeTraitsNamed,
-        FactKind::BlockImpls,
-        FactKind::Exports,
-        FactKind::Seen,
+    /// Every kind, at index `byte - 1`, and `None` at a retired byte (42, once `BlockScope`).
+    /// A new kind takes the next byte: an id's byte is persisted, so no kind is ever
+    /// renumbered and no retired byte is ever given again.
+    const ALL: [Option<FactKind>; 46] = [
+        Some(FactKind::Own),
+        Some(FactKind::Signature),
+        Some(FactKind::Fields),
+        Some(FactKind::Layout),
+        Some(FactKind::ImplRows),
+        Some(FactKind::Binding),
+        Some(FactKind::ConstValue),
+        Some(FactKind::InlineCode),
+        Some(FactKind::Late),
+        Some(FactKind::HiddenType),
+        Some(FactKind::Escaped),
+        Some(FactKind::Effects),
+        Some(FactKind::Attrs),
+        Some(FactKind::CrateRoot),
+        Some(FactKind::TraitsInScope),
+        Some(FactKind::WholeScope),
+        Some(FactKind::CrateNames),
+        Some(FactKind::FieldOrder),
+        Some(FactKind::Setting),
+        Some(FactKind::InherentAssocTypes),
+        Some(FactKind::Name),
+        Some(FactKind::Coherence),
+        Some(FactKind::Specializes),
+        Some(FactKind::DropCheck),
+        Some(FactKind::Target),
+        Some(FactKind::RpititTys),
+        Some(FactKind::StepInfer),
+        Some(FactKind::StepMir),
+        Some(FactKind::StepLower),
+        Some(FactKind::MatchCheck),
+        Some(FactKind::Hashes),
+        Some(FactKind::Method),
+        Some(FactKind::Vtable),
+        Some(FactKind::InherentImpls),
+        Some(FactKind::TraitImpls),
+        Some(FactKind::TraitsNamed),
+        Some(FactKind::ScopeTraitsNamed),
+        Some(FactKind::BlockImpls),
+        Some(FactKind::Exports),
+        Some(FactKind::Seen),
+        Some(FactKind::CrateSettings),
+        // 42: retired (once `BlockScope`), never given again.
+        None,
+        Some(FactKind::Modules),
+        Some(FactKind::Maker),
+        Some(FactKind::Mir),
+        Some(FactKind::SpanFile),
     ];
 
-    /// The kind of byte `byte`, if any.
+    /// The kind of byte `byte`, if any: none for 0, a retired byte (42) or a byte past the
+    /// last kind.
     pub const fn of_byte(byte: u8) -> Option<FactKind> {
         match byte {
-            1..=40 => Some(FactKind::ALL[byte as usize - 1]),
+            1..=46 => FactKind::ALL[byte as usize - 1],
             _ => None,
         }
     }
@@ -367,7 +414,14 @@ impl FactKind {
     /// Whether a body's task makes facts of this kind (its readers ask them of the maker's
     /// unit manifest); else the owner's surface does (they are rows of its table).
     pub const fn made_by_body(self) -> bool {
-        matches!(self, FactKind::ConstValue | FactKind::HiddenType | FactKind::Escaped | FactKind::Effects)
+        matches!(self, FactKind::ConstValue | FactKind::HiddenType | FactKind::Escaped | FactKind::Effects | FactKind::Mir)
+    }
+
+    /// Whether an id of this kind of no object names its subject by [`maker_tag`] rather than
+    /// by a hash ([`fact`]): the made kinds and [`FactKind::Maker`], so a made fact's id turns
+    /// into its maker row's by its code and kind bytes alone ([`maker_row_of`]).
+    pub const fn tags_subject(self) -> bool {
+        self.made_by_body() || matches!(self, FactKind::Maker)
     }
 }
 
@@ -415,12 +469,393 @@ pub fn fact_id(kind: FactKind, item: &StableId, what: &[u8]) -> ContentId {
 /// end's query code `code`: [`fact_id`] with the owner, the code and the kind stamped over its
 /// first eleven bytes. The one id function every side (the surface, the body task, the driver)
 /// writes ids through.
+///
+/// A fact a body makes ([`FactKind::made_by_body`]) of no object (`what` empty, as every made
+/// fact is: blaze-front refuses a made kind with an object), and a [`FactKind::Maker`] row,
+/// name their subject instead of a hash: the last 21 bytes are [`maker_tag`] of `item`, so a
+/// driver asked such a fact of a unit whose bodies it does not check forms the id of the
+/// subject's maker row ([`maker_row_of`]) and finds the body there.
 pub fn fact(kind: FactKind, owner: Owner, code: u16, item: &StableId, what: &[u8]) -> ContentId {
-    let mut id = fact_id(kind, item, what);
+    let mut id = match kind.tags_subject() && what.is_empty() {
+        true => {
+            let mut id = ContentId([0; 32]);
+            id.0[11..].copy_from_slice(&maker_tag(item));
+            id
+        }
+        false => fact_id(kind, item, what),
+    };
     id.0[..8].copy_from_slice(&owner.0);
     id.0[8..10].copy_from_slice(&code.to_le_bytes());
     id.0[10] = kind as u8;
     id
+}
+
+/// The bytes a made fact's id and its maker row's id name their subject by: bytes 8..29 of the
+/// subject (a blaze-items item key), whose first eight bytes are its crate's [`Owner`], already
+/// in the id, and whose next 21 are the item's own hash.
+pub fn maker_tag(subject: &StableId) -> [u8; 21] {
+    let mut tag = [0; 21];
+    tag.copy_from_slice(&subject.0.0[8..29]);
+    tag
+}
+
+/// The query code a [`FactKind::Maker`] row is stamped with: no query reads it, so it is one
+/// of the codes the front end keeps for its own rows (blaze-front's `facts::MAKER`).
+pub const MAKER_CODE: u16 = 0xf005;
+
+/// The id of the maker row of `subject` (a body-bearing definition's item key): a row of the
+/// subject's crate's surface, its digest the body's text id.
+pub fn maker_row(subject: &StableId) -> ContentId {
+    fact(FactKind::Maker, Owner::of_subject(&subject.0), MAKER_CODE, subject, b"")
+}
+
+/// The id of the maker row of the subject made fact `id` is about: `id` with the maker code and
+/// kind stamped over its bytes 8..11 (both name the subject by [`maker_tag`]). `None` for an
+/// id of a kind no body makes. Floor: O(1), no table.
+pub fn maker_row_of(id: &ContentId) -> Option<ContentId> {
+    if !kind_of(id)?.made_by_body() {
+        return None;
+    }
+    let mut row = *id;
+    row.0[8..10].copy_from_slice(&MAKER_CODE.to_le_bytes());
+    row.0[10] = FactKind::Maker as u8;
+    Some(row)
+}
+
+/// The query code a [`FactKind::Mir`] fact is stamped with: no front-end query makes it; the
+/// driver answers it ([`mir_id`]).
+pub const MIR_CODE: u16 = 0xf006;
+
+/// The id of the fact "the body of `subject`", as a plan reads it: a made fact of the subject's
+/// crate, so [`maker_row_of`] names the subject's maker row and a body not asked is demanded by
+/// it. Its digest is the body record's result digest.
+pub fn mir_id(subject: &StableId) -> ContentId {
+    fact(FactKind::Mir, Owner::of_subject(&subject.0), MIR_CODE, subject, b"")
+}
+
+/// The query code a [`FactKind::SpanFile`] fact is stamped with: no front-end query makes it;
+/// the driver answers it ([`span_file_id`]).
+pub const SPAN_FILE_CODE: u16 = 0xf007;
+
+/// The id of a printed file name (`file!()`, a panic's location: a std file's
+/// `/rustc/<commit>/library/...`, a workspace member's path from the checkout), whole: what a
+/// front end's [`crate::front::Keyed::names`] holds per file. Never `ZERO`, which says a file
+/// has no printed name.
+pub fn printed_name(name: &[u8]) -> ContentId {
+    ContentId::of("blaze-keyed printed file name", name)
+}
+
+/// The id of the fact "the file of unit `owner` the program prints as `name`" ([`printed_name`]
+/// of it), as a span table reads it. By name, not by the file's place in the unit, so a file
+/// added before it moves nothing, and a file renamed is another fact (its old id answers
+/// `absent`). Floor: one hash.
+pub fn span_file_id(owner: Owner, name: &ContentId) -> ContentId {
+    fact(FactKind::SpanFile, owner, SPAN_FILE_CODE, &StableId(*name), b"")
+}
+
+/// The digest of a [`FactKind::SpanFile`] fact: the file's image key, which covers its text,
+/// so every base and position a table of it holds. The name is the id's.
+pub fn span_file_digest(image: &Key<crate::kind::FileImage>) -> ContentId {
+    image.id()
+}
+
+blaze_format::record! {
+    /// One edge of a plan ([`PlanPayload`]): an instance the planned code calls or refers to (a
+    /// static, a vtable's method, drop glue), by item and its type arguments' bytes
+    /// (`args[args_at..args_at + args_len]` of the payload), and what the edge is (`kind`, the
+    /// codegen's own byte: the driver reads none of it). The driver keys the callee's plan from
+    /// these alone ([`crate::kind::PlanRecordInputs`]), with no database.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct PlanEdge: 1 {
+        pub item: ContentId,
+        pub args_at: u32,
+        pub args_len: u32,
+        pub kind: u16,
+        pub pad: u16,
+        pub pad2: u32,
+    }
+}
+
+blaze_format::record! {
+    /// A plan record's payload: its edges, the bytes their type arguments are in, and the
+    /// codegen's own description of the instance (`describe`, opaque to the driver: what a code
+    /// task reads, the layouts and impls it was planned with included, so a code key over the
+    /// plan's result covers them).
+    #[derive(Clone, Copy, Debug)]
+    pub struct PlanPayload: 1 {
+        pub edges: Slice<PlanEdge>,
+        pub args: Slice<u8>,
+        pub describe: Slice<u8>,
+    }
+}
+
+/// A plan's payload, read in place: what the driver and a walker read of a plan record.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanView<'a> {
+    pub edges: &'a [PlanEdge],
+    pub args: &'a [u8],
+    pub describe: &'a [u8],
+}
+
+impl<'a> PlanView<'a> {
+    /// The type arguments of edge `edge`, or `None` past the payload's bytes.
+    pub fn args_of(&self, edge: &PlanEdge) -> Option<&'a [u8]> {
+        self.args.get(edge.args_at as usize..(edge.args_at as usize).checked_add(edge.args_len as usize)?)
+    }
+}
+
+/// The bytes of a plan's payload, in `alloc`. Floor: one copy of its parts.
+pub fn write_plan_payload<A: Allocator>(edges: &[PlanEdge], args: &[u8], describe: &[u8], alloc: A) -> Vec<u8, A> {
+    let mut out = Writer::new_in(PlanPayload::SCHEMA, alloc);
+    let edges_at = out.push_slice(edges);
+    // Bytes go in as buffers, as a traced record's payload does.
+    let args_at = out.push_buffer(args);
+    let describe_at = out.push_buffer(describe);
+    let at = out.next::<PlanPayload>();
+    let field = |offset: usize| at + offset as u64;
+    let root = PlanPayload {
+        edges: Slice::between(field(offset_of!(PlanPayload, edges)), edges_at, edges.len()),
+        args: Slice::between(field(offset_of!(PlanPayload, args)), args_at, args.len()),
+        describe: Slice::between(field(offset_of!(PlanPayload, describe)), describe_at, describe.len()),
+    };
+    let root_at = out.push(&root);
+    out.finish(root_at)
+}
+
+/// A plan record's payload (a [`Traced`] record's `payload`, 16-aligned in place: it is pushed as
+/// a buffer), opened: every edge's arguments inside the payload's bytes.
+pub fn read_plan_payload(payload: &[u8]) -> Result<PlanView<'_>, RecordError> {
+    let root = blaze_format::open::<PlanPayload>(payload).map_err(RecordError::Format)?;
+    let view = PlanView {
+        edges: root.edges.follow(payload).map_err(RecordError::Format)?,
+        args: root.args.follow(payload).map_err(RecordError::Format)?,
+        describe: root.describe.follow(payload).map_err(RecordError::Format)?,
+    };
+    if let Some(at) = view.edges.iter().position(|edge| view.args_of(edge).is_none()) {
+        return Err(RecordError::Malformed { at: at as u32, what: "plan edge arguments" });
+    }
+    Ok(view)
+}
+
+blaze_format::record! {
+    /// One row of a kept program ([`ProgramKeptRoot`]): an instance (its plan's key), the plan's
+    /// address and result, the code record's key and tier, what its code refers to as instance
+    /// keys (`targets[target_at..target_at + target_len]`: first the `call_len` it calls, then
+    /// the statics it reads, each part sorted, each once), and the front end's ask its plan task
+    /// was given (`asks[ask_at..ask_at + ask_len]`), so a moved instance is asked by itself.
+    /// What a walker's prior reads.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct KeptRow: 2 {
+        pub instance: ContentId,
+        pub item: ContentId,
+        pub plan: ContentId,
+        pub result: ContentId,
+        pub code: ContentId,
+        pub shape_at: u32,
+        pub shape_len: u32,
+        pub target_at: u32,
+        pub target_len: u32,
+        pub call_len: u32,
+        /// The tier the walker's code key holds (blaze-program's `Tier`, by its number): the
+        /// seam carries it, its meaning is the walker's.
+        pub tier: u32,
+        pub ask_at: u32,
+        pub ask_len: u32,
+    }
+}
+
+blaze_format::record! {
+    /// One span table a kept program's rows name ([`ProgramKeptRoot`]): its anchor, its
+    /// [`crate::kind::SpanTable`] key, its owner (the item whose span task makes it), the
+    /// address its record is filed at, its result digest (what the link step was given), and
+    /// the files it read with the digests seen (`span_reads[read_at..read_at + read_len]`,
+    /// sorted by id; the tables of one owner share one range).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct KeptSpan: 1 {
+        pub anchor: ContentId,
+        pub key: ContentId,
+        pub owner: ContentId,
+        pub address: ContentId,
+        pub digest: ContentId,
+        pub read_at: u32,
+        pub read_len: u32,
+    }
+}
+
+blaze_format::record! {
+    /// A program's kept state, the payload of its [`crate::kind::ProgramManifest`]: its rows
+    /// sorted by instance, each plan's shape as ordinals into the dictionary of every fact a plan
+    /// read (with the digest seen), the postings (dictionary ordinal to rows reading it), every
+    /// row's ask bytes, the unit manifests its reads of bodies were answered against
+    /// (`manifests`, sorted, each once), the span tables its rows name (`spans`, sorted by
+    /// anchor, each once, with their reads in `span_reads`; row `r`'s are the ordinals
+    /// `row_spans[row_span_at[r]..row_span_at[r + 1]]`), and the linker's own state (`linker`,
+    /// opaque here).
+    #[derive(Clone, Copy, Debug)]
+    pub struct ProgramKeptRoot: 3 {
+        pub program: ContentId,
+        pub manifests: Slice<ContentId>,
+        pub rows: Slice<KeptRow>,
+        pub targets: Slice<ContentId>,
+        pub asks: Slice<u8>,
+        pub shapes: Slice<u32>,
+        pub dictionary: Slice<Fact>,
+        pub postings: Slice<u32>,
+        pub posting_at: Slice<u32>,
+        pub spans: Slice<KeptSpan>,
+        pub span_reads: Slice<Fact>,
+        pub row_spans: Slice<u32>,
+        pub row_span_at: Slice<u32>,
+        pub linker: Slice<u8>,
+    }
+}
+
+/// The parts of a kept program ([`ProgramKeptRoot`]).
+#[derive(Clone, Copy, Debug)]
+pub struct KeptParts<'a> {
+    pub program: ContentId,
+    /// Every unit manifest (by address) whose bodies the rows' reads were answered against:
+    /// a body of a unit whose manifest now is one of them stands without being read again.
+    pub manifests: &'a [ContentId],
+    pub rows: &'a [KeptRow],
+    pub targets: &'a [ContentId],
+    pub asks: &'a [u8],
+    pub shapes: &'a [u32],
+    pub dictionary: &'a [Fact],
+    pub postings: &'a [u32],
+    pub posting_at: &'a [u32],
+    /// The span tables the rows name, sorted by anchor, each once.
+    pub spans: &'a [KeptSpan],
+    pub span_reads: &'a [Fact],
+    /// Ordinals into `spans`: row `r`'s are `row_spans[row_span_at[r]..row_span_at[r + 1]]`,
+    /// sorted, each once (`row_span_at` has one more entry than `rows`).
+    pub row_spans: &'a [u32],
+    pub row_span_at: &'a [u32],
+    pub linker: &'a [u8],
+}
+
+impl<'a> KeptParts<'a> {
+    /// The kept span of `anchor` (one binary search).
+    pub fn span(&self, anchor: &ContentId) -> Option<&'a KeptSpan> {
+        self.spans.binary_search_by(|span| span.anchor.cmp(anchor)).ok().map(|at| &self.spans[at])
+    }
+
+    /// The files `span` read, with the digests seen.
+    pub fn span_reads_of(&self, span: &KeptSpan) -> &'a [Fact] {
+        &self.span_reads[span.read_at as usize..(span.read_at + span.read_len) as usize]
+    }
+
+    /// The ordinals into `spans` of the tables row `r` names.
+    pub fn spans_of_row(&self, r: usize) -> &'a [u32] {
+        &self.row_spans[self.row_span_at[r] as usize..self.row_span_at[r + 1] as usize]
+    }
+}
+
+/// The bytes of a kept program's payload, in `alloc`. Floor: one copy of its parts.
+pub fn write_kept<A: Allocator>(parts: &KeptParts<'_>, alloc: A) -> Vec<u8, A> {
+    let mut out = Writer::new_in(ProgramKeptRoot::SCHEMA, alloc);
+    let manifests_at = out.push_slice(parts.manifests);
+    let rows_at = out.push_slice(parts.rows);
+    let targets_at = out.push_slice(parts.targets);
+    let asks_at = out.push_buffer(parts.asks);
+    let shapes_at = out.push_slice(parts.shapes);
+    let dictionary_at = out.push_slice(parts.dictionary);
+    let postings_at = out.push_slice(parts.postings);
+    let posting_at_at = out.push_slice(parts.posting_at);
+    let spans_at = out.push_slice(parts.spans);
+    let span_reads_at = out.push_slice(parts.span_reads);
+    let row_spans_at = out.push_slice(parts.row_spans);
+    let row_span_at_at = out.push_slice(parts.row_span_at);
+    let linker_at = out.push_buffer(parts.linker);
+    let at = out.next::<ProgramKeptRoot>();
+    let field = |offset: usize| at + offset as u64;
+    let root = ProgramKeptRoot {
+        program: parts.program,
+        manifests: Slice::between(field(offset_of!(ProgramKeptRoot, manifests)), manifests_at, parts.manifests.len()),
+        rows: Slice::between(field(offset_of!(ProgramKeptRoot, rows)), rows_at, parts.rows.len()),
+        targets: Slice::between(field(offset_of!(ProgramKeptRoot, targets)), targets_at, parts.targets.len()),
+        asks: Slice::between(field(offset_of!(ProgramKeptRoot, asks)), asks_at, parts.asks.len()),
+        shapes: Slice::between(field(offset_of!(ProgramKeptRoot, shapes)), shapes_at, parts.shapes.len()),
+        dictionary: Slice::between(field(offset_of!(ProgramKeptRoot, dictionary)), dictionary_at, parts.dictionary.len()),
+        postings: Slice::between(field(offset_of!(ProgramKeptRoot, postings)), postings_at, parts.postings.len()),
+        posting_at: Slice::between(field(offset_of!(ProgramKeptRoot, posting_at)), posting_at_at, parts.posting_at.len()),
+        spans: Slice::between(field(offset_of!(ProgramKeptRoot, spans)), spans_at, parts.spans.len()),
+        span_reads: Slice::between(field(offset_of!(ProgramKeptRoot, span_reads)), span_reads_at, parts.span_reads.len()),
+        row_spans: Slice::between(field(offset_of!(ProgramKeptRoot, row_spans)), row_spans_at, parts.row_spans.len()),
+        row_span_at: Slice::between(field(offset_of!(ProgramKeptRoot, row_span_at)), row_span_at_at, parts.row_span_at.len()),
+        linker: Slice::between(field(offset_of!(ProgramKeptRoot, linker)), linker_at, parts.linker.len()),
+    };
+    let root_at = out.push(&root);
+    out.finish(root_at)
+}
+
+/// A kept program's payload, opened: every part in bounds, the rows sorted by instance, the
+/// dictionary by id, every ordinal and posting inside its table.
+pub fn read_kept(payload: &[u8]) -> Result<KeptParts<'_>, RecordError> {
+    let root = blaze_format::open::<ProgramKeptRoot>(payload).map_err(RecordError::Format)?;
+    let f = RecordError::Format;
+    let parts = KeptParts {
+        program: root.program,
+        manifests: root.manifests.follow(payload).map_err(f)?,
+        rows: root.rows.follow(payload).map_err(f)?,
+        targets: root.targets.follow(payload).map_err(f)?,
+        asks: root.asks.follow(payload).map_err(f)?,
+        shapes: root.shapes.follow(payload).map_err(f)?,
+        dictionary: root.dictionary.follow(payload).map_err(f)?,
+        postings: root.postings.follow(payload).map_err(f)?,
+        posting_at: root.posting_at.follow(payload).map_err(f)?,
+        spans: root.spans.follow(payload).map_err(f)?,
+        span_reads: root.span_reads.follow(payload).map_err(f)?,
+        row_spans: root.row_spans.follow(payload).map_err(f)?,
+        row_span_at: root.row_span_at.follow(payload).map_err(f)?,
+        linker: root.linker.follow(payload).map_err(f)?,
+    };
+    sorted(parts.dictionary)?;
+    if let Some(at) = parts.manifests.windows(2).position(|pair| pair[0] >= pair[1]) {
+        return Err(RecordError::Unsorted { at: at as u32 + 1 });
+    }
+    if let Some(at) = parts.rows.windows(2).position(|pair| pair[0].instance >= pair[1].instance) {
+        return Err(RecordError::Unsorted { at: at as u32 + 1 });
+    }
+    let inside = |at: u32, len: u32, of: usize| (at as usize).checked_add(len as usize).is_some_and(|end| end <= of);
+    if let Some(at) = parts.rows.iter().position(|row| {
+        !inside(row.shape_at, row.shape_len, parts.shapes.len())
+            || !inside(row.target_at, row.target_len, parts.targets.len())
+            || row.call_len > row.target_len
+            || !inside(row.ask_at, row.ask_len, parts.asks.len())
+    }) {
+        return Err(RecordError::Malformed { at: at as u32, what: "kept program row" });
+    }
+    if let Some(at) = parts.shapes.iter().position(|&ord| ord as usize >= parts.dictionary.len()) {
+        return Err(RecordError::Malformed { at: at as u32, what: "kept program shape" });
+    }
+    if parts.posting_at.len() != parts.dictionary.len() + 1
+        || parts.posting_at.windows(2).any(|pair| pair[0] > pair[1])
+        || parts.posting_at.last().is_some_and(|&end| end as usize > parts.postings.len())
+        || parts.postings.iter().any(|&row| row as usize >= parts.rows.len())
+    {
+        return Err(RecordError::Malformed { at: 0, what: "kept program postings" });
+    }
+    if let Some(at) = parts.spans.windows(2).position(|pair| pair[0].anchor >= pair[1].anchor) {
+        return Err(RecordError::Unsorted { at: at as u32 + 1 });
+    }
+    if let Some(at) = parts.spans.iter().position(|span| {
+        !inside(span.read_at, span.read_len, parts.span_reads.len())
+            || parts.span_reads[span.read_at as usize..(span.read_at + span.read_len) as usize]
+                .iter()
+                .any(|read| kind_of(&read.id) != Some(FactKind::SpanFile))
+    }) {
+        return Err(RecordError::Malformed { at: at as u32, what: "kept program span table" });
+    }
+    if parts.row_span_at.len() != parts.rows.len() + 1
+        || parts.row_span_at.windows(2).any(|pair| pair[0] > pair[1])
+        || parts.row_span_at.first().is_some_and(|&start| start != 0)
+        || parts.row_span_at.last().is_some_and(|&end| end as usize != parts.row_spans.len())
+        || parts.row_spans.iter().any(|&span| span as usize >= parts.spans.len())
+    {
+        return Err(RecordError::Malformed { at: 0, what: "kept program row spans" });
+    }
+    Ok(parts)
 }
 
 /// The query code stamped in `id`.
@@ -433,7 +868,11 @@ pub fn kind_of(id: &ContentId) -> Option<FactKind> {
     FactKind::of_byte(id.0[10])
 }
 
-/// The id of a late read: `which` macro (its [`crate::kind::Late`] byte) of `name`.
+/// The id of a late read: `which` macro (its [`crate::kind::Late`] byte) of `name`. It names no
+/// unit, and need not: every table it is looked up in (a unit's dictionary, a record's reads, a
+/// task's universe, whose late table is its own unit's) is one unit's, so two units that read
+/// one name with two values never meet under it. A table that mixed units would need the unit
+/// in the id.
 pub fn late_id(which: u8, name: &[u8]) -> ContentId {
     let mut what = [0u8; 1];
     what[0] = which;
@@ -688,7 +1127,9 @@ pub fn write_traced<K: Kind<Root = Traced>>(key: &Key<K>, reads: &[Fact], facts:
     let mut out = Writer::new(Traced::SCHEMA);
     let reads_at = out.push_slice(reads);
     let facts_at = out.push_slice(facts);
-    let payload_at = out.push_slice(payload);
+    // Aligned as a buffer is: a payload that is itself a blaze-format buffer (a surface's
+    // sections, a file image) is opened in place, where the record is mapped.
+    let payload_at = out.push_buffer(payload);
     let at = out.next::<Traced>();
     let field = |offset: usize| at + offset as u64;
     let root = Traced {
@@ -713,7 +1154,9 @@ pub fn write_read<K: Kind<Root = Traced>>(key: Key<K>, reads: &[Fact], facts: &[
 /// An [`Opaque`] record of kind `K`.
 pub fn write_opaque<K: Kind<Root = Opaque>>(key: &Key<K>, payload: &[u8]) -> Vec<u8> {
     let mut out = Writer::new(Opaque::SCHEMA);
-    let payload_at = out.push_slice(payload);
+    // Aligned as a buffer is: a payload that is itself a blaze-format buffer (a surface's
+    // sections, a file image) is opened in place, where the record is mapped.
+    let payload_at = out.push_buffer(payload);
     let at = out.next::<Opaque>();
     let root = Opaque {
         head: head_of(key),

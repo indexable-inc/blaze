@@ -225,7 +225,7 @@ pub fn file_item_tree(db: &Db, file_id: HirFileId, krate: Crate) -> &ItemTree {
 /// lowers only the items it touches, and one that touches none returns the last tree itself;
 /// a macro file's is lowered whole, as each expansion is made anew. The tree is behind an
 /// `Arc` so the last one is kept beside the query database without a copy.
-#[blaze_query::tracked(returns(deref))]
+#[blaze_memo::tracked(returns(deref), owns)]
 fn file_item_tree_query(db: &Db, file_id: HirFileId, krate: Crate) -> Arc<ItemTree> {
     let _p = crate::span_names::of_file(
         db,
@@ -238,6 +238,10 @@ fn file_item_tree_query(db: &Db, file_id: HirFileId, krate: Crate) -> Arc<ItemTr
         ),
     )
     .entered();
+    // A file of a crate given by its address with no text here (or another than its pages were
+    // made from): refused, typed, naming the crate and the file, before anything parses it. An
+    // expansion's tree reads its call's file, which the expansion's own lowering demands.
+    crate::nameres::frozen::pages::demand_text(db, krate, file_id);
     match file_id {
         HirFileId::FileId(file) => items::file_item_tree(db, file, krate),
         // alloc: the tree's handle, once an expansion's tree
@@ -381,7 +385,7 @@ pub fn extern_crate_item(db: &Db, id: crate::ExternCrateId) -> ExternCrateItem<'
     }
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn block_item_tree_query(db: &Db, block: BlockId, krate: Crate) -> ItemTree {
     let _p = tracing::info_span!("block_item_tree_query", ?block).entered();
     let ast_id = block.ast_id(db);
@@ -393,6 +397,7 @@ pub(crate) fn block_item_tree_query(db: &Db, block: BlockId, krate: Crate) -> It
         .and_then(|owner| body_syntax(db, owner).as_ref())
         .filter(|syntax| syntax.file_id == ast_id.file_id);
     let Some(syntax) = syntax else {
+        crate::nameres::frozen::pages::demand_text(db, krate, ast_id.file_id);
         return lower::Ctx::new(db, ast_id.file_id, krate).lower_block(ast_id.to_view(db));
     };
     let tree = syntax.tree(db);
@@ -729,7 +734,7 @@ pub(crate) enum SpanItem<'a> {
 pub(crate) type ItemTreeAstId<T: ItemTreeNode> = FileAstId<T::Source>;
 
 /// Identifies a particular [`ItemTree`].
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, blaze_memo::Home)]
 pub struct TreeId {
     file: HirFileId,
     block: Option<BlockId>,
@@ -763,6 +768,13 @@ blaze_format::record! {
     pub struct ModItemId: 1 {
         index: u32,
     }
+}
+
+/// An index into one tree's columns: it names no arena (the tree's id, beside it in a key,
+/// does).
+impl blaze_memo::Home for ModItemId {
+    #[inline]
+    fn home(&self, _: &mut blaze_memo::Homes<'_>) {}
 }
 
 impl ModItemId {

@@ -136,7 +136,7 @@ pub(crate) fn resolved<'r, 'db, R>(
             Err(error) => return Ok(Staged::Failed(error)),
         },
     };
-    let sources = match Sources::new(&ctx.config, &spec.sources, offline, pins) {
+    let sources = match Sources::new(&ctx.config, &spec.workspace.config, &spec.sources, offline, pins) {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };

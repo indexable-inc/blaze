@@ -111,7 +111,7 @@ fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
 /// matcher's.
 fn assert_same_parses(db: &Db, tt: &tt::TopSubtree, what: &impl Fn() -> String) {
     use syntax_bridge::reference;
-    let mut edition = |ctx: SyntaxContext| ctx.edition(db);
+    let mut edition = |ctx: SyntaxContext| ctx.edition();
     for view in [tt.view().strip_invisible(), tt.token_trees(), tt.view().as_token_trees()] {
         let new = caught(|| syntax_bridge::to_parser_input(view, &mut edition));
         let old = caught(|| reference::to_parser_input(view, &mut edition));
@@ -296,7 +296,7 @@ const EDITION_PAIRS: [(Edition, Edition); 3] = [
 
 #[test]
 fn corpus() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     for &(decl, inputs) in CORPUS {
         for (pair, (def_edition, call_edition)) in EDITION_PAIRS.into_iter().enumerate() {
             let def = token_tree(0, def_edition, decl).expect("a corpus macro lexes");
@@ -325,7 +325,7 @@ fn corpus() {
 
 #[test]
 fn long_fragments() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let mut texts = vec![
         "a < b < c < d < e < f < g < h < i < j > > > > > > > > > , x".to_owned(),
         "Vec :: < u8 > :: new ( ) . iter ( ) . map ( | x | x + 1 ) . collect :: < Vec < _ > > ( ) ;"
@@ -359,7 +359,7 @@ fn benchmark_macros() {
     if test_utils::skip_slow_tests() {
         return;
     }
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let rules = crate::benchmark::macro_rules_fixtures();
     let invocations = crate::benchmark::invocation_fixtures(&db, &rules);
     for (id, input) in &invocations {
@@ -683,7 +683,7 @@ const INPUTS_PER_MACRO: usize = 5;
 
 #[test]
 fn random_macros() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let seeds = if test_utils::skip_slow_tests() { SEEDS } else { SLOW_SEEDS };
     let mut checked = 0;
     for seed in 0..seeds {

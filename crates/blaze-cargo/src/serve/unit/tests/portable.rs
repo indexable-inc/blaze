@@ -141,7 +141,7 @@ fn checkout(at: Where, a: &str, b: &str) -> Checkout {
         root: view,
         host_cpu: None,
         sealed: &blaze_lower::unsealed(&units),
-    })
+    }, blaze_item_hash::reads::mark_boundaries, blaze_memo::Reads::Kept)
     .unwrap();
     let places = at.places();
     // clone: the test's places, told the front end as the daemon tells it

@@ -33,7 +33,7 @@ use crate::next_solver::{
 
 /// The content ID of a program's [`World`]: what an optimized body is devirtualized against,
 /// in its [`super::MirOptions`]. Equal IDs are equal facts.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_memo::Home)]
 pub struct DevirtWorld(pub [u8; 32]);
 
 impl fmt::Debug for DevirtWorld {

@@ -135,7 +135,7 @@ fn toolchain_adt(db: &Db, name: &str) -> AdtId {
 #[test]
 fn the_toolchains_containers_only_free() {
     let db = db_with(TYPES);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for name in ["Vec", "String"] {
             let adt = toolchain_adt(&db, name);
             let kinds = drop_effects(&db, adt).unwrap_or_else(|| panic!("`{name}` has a drop"));
@@ -149,7 +149,7 @@ fn the_toolchains_containers_only_free() {
 fn a_destructor_is_frees_only_by_what_its_body_does() {
     let db = db_with(TYPES);
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let of = |name: &str| frees_only(&db, adt_named(&db, krate, name));
         assert_eq!(of("Stack"), Ok(()), "a container that frees its buffer");
         assert_eq!(of("Plain"), Ok(()), "a type with no `Drop` impl has nothing to refuse");
@@ -163,7 +163,7 @@ fn a_destructor_is_frees_only_by_what_its_body_does() {
 fn the_attribute_is_held_to_the_impl() {
     let db = db_with(TYPES);
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let of = |name: &str| check_drop_attr(&db, adt_named(&db, krate, name));
         for fine in ["Stack", "Plain", "Guard", "Pooled", "Token"] {
             assert_eq!(of(fine), Ok(()), "`{fine}`");

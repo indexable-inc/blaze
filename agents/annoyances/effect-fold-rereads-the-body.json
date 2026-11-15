@@ -1,0 +1,14 @@
+{
+ "id": "effect-fold-rereads-the-body",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), host round 2 lane 'made facts', port-memo-1113",
+ "where": "crates/hir-ty-pure/src/walk.rs fold; crates/hir-ty-pure/src/values.rs Values::solve; crates/hir-ty-pure/src/memory.rs infer; crates/hir-ty-pure/src/locks.rs of",
+ "what": "Cutting a body's own effects (the made Effects fact) at the point the walk first reads a callee's summary leaves three passes that still need the body's MIR after the cut: the locals' values (a fixpoint over statements fed callees' returned values), the memory inference and the lock summary. So the own part is not body-free, and its digest has to cover the body's text, so a statement edit that changes no effect still moves it.",
+ "cost": "an hour finding that the fold could not be made over own parts alone, and a digest weaker than the end state",
+ "cause": "each dataflow pass takes the callees' answers as inputs at the point it reads them inside a body walk, instead of reducing the body once to a callee-parametric transfer (a per-site summary with holes for each callee's answer)",
+ "class": "an interprocedural analysis whose per-body part is not separated from its join, so the per-body fact cannot be cached by what it reads",
+ "prevention": "give values, memory and locks a body-free reduced form (per site: what flows in and out, the callee's answer as a parameter), made in own_part, and make fold read only that",
+ "workaround": "OwnEffects::code (the body's early identity) is in the digest, so the made fact is correct but moves on any body edit",
+ "fix": "not yet",
+ "state": "open"
+}

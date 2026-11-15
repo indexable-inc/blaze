@@ -308,7 +308,9 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
     /// A field of `variant` by the name it is written with, if it is the crate's.
     fn field(&self, variant: VariantId, name: &Name, hygiene: HygieneId) -> Option<DefIdx> {
         let db = self.m.k.cx.db;
-        let local_id = variant.fields(db).field_written(db, variant, name, hygiene)?;
+        // The body is of the crate being checked: its hygiene's contexts are of its table.
+        let table = hir_ty::ctx_table(self.m.k.cx.krate.base());
+        let local_id = variant.fields(db).field_written(db, table, variant, name, hygiene)?;
         self.m.k.defs.get(Id::Field(FieldId { parent: variant, local_id }))
     }
 

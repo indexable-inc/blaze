@@ -425,7 +425,7 @@ fn ellipsis_range(
         ast::Pat::RefPat(it) => (true, ellipsis(it.pat()?)?),
         _ => (false, ellipsis(pat)?),
     };
-    let edition = ctxt(cx, tree.file, join.text_range()).edition(cx.db);
+    let edition = ctxt(cx, tree.file, join.text_range()).edition();
     let pat_span = cx.span(InFile::new(tree.file, node.text_range()));
     let join_span = cx.span(InFile::new(tree.file, join.text_range()));
     let message = "`...` range patterns are deprecated";

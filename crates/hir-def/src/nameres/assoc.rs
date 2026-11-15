@@ -38,22 +38,30 @@ pub struct TraitItems {
     pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl TraitItems {
     #[inline]
     pub(crate) fn query(db: &Db, tr: TraitId) -> &TraitItems {
         &Self::query_with_diagnostics(db, tr).0
     }
 
-    #[blaze_query::tracked(returns(ref))]
+    #[blaze_memo::tracked(returns(ref), owns)]
     pub fn query_with_diagnostics(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
+        // Of a crate read from an image's pages, its record (no file of the crate is read).
+        if let Some(served) = crate::deps::signatures::served_trait_items(db, tr) {
+            let items = TraitItems { items: served.items, macro_calls: served.macro_calls };
+            // A crate read from an image reports nothing of its items' collection.
+            return (items, DefDiagnostics::new(Vec::new()));
+        }
         // The trait's own entry where one is kept (rule 65), else collected and kept.
         crate::nameres::frozen::entries::items::trait_items(db, tr, || Self::collected(db, tr))
     }
 
     /// The trait's items collected from its syntax: the work its entry saves.
-    fn collected(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
+    pub(crate) fn collected(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *tr.lookup(db);
+        // Of a crate given by its address, with no text for its file here: refused, typed.
+        super::frozen::pages::demand_text(db, module_id.krate(db), ast_id.file_id);
         let source = ast_id.to_view(db);
         if source.eq_token().is_some() {
             // FIXME(trait-alias) probably needs special handling here
@@ -128,18 +136,26 @@ pub struct ImplItems {
     pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl ImplItems {
-    #[blaze_query::tracked(returns(ref))]
+    #[blaze_memo::tracked(returns(ref), owns)]
     pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
+        // Of a crate read from an image's pages, its record (no file of the crate is read).
+        if let Some(served) = crate::deps::signatures::served_impl_items(db, id) {
+            let items = ImplItems { items: served.items, macro_calls: served.macro_calls };
+            // A crate read from an image reports nothing of its items' collection.
+            return (items, DefDiagnostics::new(Vec::new()));
+        }
         // The impl's own entry where one is kept (rule 65), else collected and kept.
         crate::nameres::frozen::entries::items::impl_items(db, id, || Self::collected(db, id))
     }
 
     /// The impl's items collected from its syntax: the work its entry saves.
-    fn collected(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
+    pub(crate) fn collected(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *id.lookup(db);
+        // Of a crate given by its address, with no text for its file here: refused, typed.
+        super::frozen::pages::demand_text(db, module_id.krate(db), ast_id.file_id);
 
         let collector =
             AssocItemCollector::new(db, module_id, ItemContainerId::ImplId(id), ast_id.file_id);
@@ -217,7 +233,9 @@ impl<'db> AssocItemCollector<'db> {
 
     fn collect_item(&mut self, item: view::AssocItem<'db>) {
         let ast_id = self.ast_id_map.ast_id_of_view::<ast::AssocItem>(item);
-        let attrs = match AttrsOrCfg::lower(self.db, item, &|| self.cfg_options, self.span_map) {
+        let table = self.file_id.context_arena();
+        let attrs = match AttrsOrCfg::lower(self.db, table, item, &|| self.cfg_options, self.span_map)
+        {
             AttrsOrCfg::Enabled { attrs } => attrs,
             AttrsOrCfg::CfgDisabled(cfg) => {
                 self.diagnostics.push(DefDiagnostic::unconfigured_code(
@@ -318,7 +336,8 @@ impl<'db> AssocItemCollector<'db> {
                 let ast_id = InFile::new(self.file_id, ast_id);
                 let Some(path) = call.path() else { return };
                 let range = path.syntax().text_range();
-                let Some(path) = ModPath::from_src_view(self.db, path, &mut |range| {
+                let table = self.file_id.context_arena();
+                let Some(path) = ModPath::from_src_view(self.db, table, path, &mut |range| {
                     self.span_map.span_for_range(range).ctx
                 }) else {
                     return;

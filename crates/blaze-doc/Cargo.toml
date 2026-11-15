@@ -15,8 +15,8 @@ doctest = false
 
 [dependencies]
 base-db.workspace = true
-blaze-query.workspace = true
 blaze-graph.workspace = true
+blaze-memo.workspace = true
 blaze-hash.workspace = true
 either.workspace = true
 hir.workspace = true

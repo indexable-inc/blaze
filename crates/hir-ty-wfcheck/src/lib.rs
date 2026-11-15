@@ -65,11 +65,11 @@ pub use compare::{
 };
 pub use outlives::{Inferred, unrigid};
 use outlives::{Known, Needs, Wfcx};
-pub use persist::{WfDiagnosticRef, WfResultRef, WfRow};
+pub use persist::{WfDiagnosticRef, WfReadError, WfResultRef, WfRow, WfWriteError};
 pub use refine::{ImplTraitRefinement, RefinementKind, Undercapture, impl_trait_refinement};
 
 /// Where an error is: rustc's span of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Site {
     /// The type of a field.
     Field(VariantId, LocalFieldId),
@@ -90,7 +90,7 @@ pub enum Site {
     SelfTy(ImplId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WfDiagnostic {
     /// rustc's error code, as `E0310`.
     pub code: &'static str,
@@ -98,13 +98,13 @@ pub struct WfDiagnostic {
     pub site: Site,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct WfResult {
     pub diagnostics: Vec<WfDiagnostic>,
 }
 
 /// The well-formedness errors of the item `def`: an ADT, an impl, a trait or a function.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn wfcheck(db: &Db, def: GenericDefId) -> WfResult {
     check_item(db, def)
 }

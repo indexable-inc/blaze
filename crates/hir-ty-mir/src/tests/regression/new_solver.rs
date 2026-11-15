@@ -37,7 +37,7 @@ fn f<'a, 'b>(x: &'a u8, y: &'b u8) {}
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
@@ -65,7 +65,7 @@ fn f<'a, 'b>(x: &'a u8, y: &'b u8) {}
         let RegionKind::ReLateParam(_second_late_param) = second_region.kind() else {
             panic!("expected late parameter region, got {second_region:?}");
         };
-
+    
         assert_ne!(first_region, second_region);
     });
 }
@@ -439,7 +439,7 @@ pub union U {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let union_id = def_map

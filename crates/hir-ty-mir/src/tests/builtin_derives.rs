@@ -11,7 +11,7 @@ fn check_trait_refs(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation
     let def_map = crate_def_map(&db, fixture::test_crate(&db));
 
     let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut trait_refs = Vec::new();
         for (_, module) in def_map.modules(&db) {
             for derive in module.scope(&db).builtin_derive_impls() {
@@ -19,7 +19,7 @@ fn check_trait_refs(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation
                 trait_refs.push(format!("{trait_ref:?}"));
             }
         }
-
+    
         expectation.assert_eq(&trait_refs.join("\n"));
     });
 }
@@ -28,7 +28,7 @@ fn check_predicates(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation
     let db = fixture::db(ra_fixture).into_db();
     let def_map = crate_def_map(&db, fixture::test_crate(&db));
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut predicates = String::new();
         for (_, module) in def_map.modules(&db) {
             for derive in module.scope(&db).builtin_derive_impls() {
@@ -41,7 +41,7 @@ fn check_predicates(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation
                 );
             }
         }
-
+    
         expectation.assert_eq(&predicates);
     });
 }

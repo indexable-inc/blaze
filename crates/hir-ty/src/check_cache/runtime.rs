@@ -37,7 +37,7 @@ use blaze_format::{
     schema_of,
 };
 use blaze_ids::{ContentId, Domain, Hasher};
-use blaze_query::db::Durability;
+use blaze_memo::{Database as _, Fact};
 use hir_def::{
     ConstId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, StaticId,
     deps::{BODY_KEY_DOMAIN, KEY_DOMAIN, body_key},
@@ -256,17 +256,17 @@ fn decode_entry<'db>(db: &'db Db, krate: Crate, bytes: &[u8]) -> R<MirBody<'db>>
         .map_err(format_error)
 }
 
-// The entry of each owner kind: a memo of its bytes, so the engine keeps it true between the
-// lowering that made the body and the store that writes the crate's value.
+// The entry of each owner kind: a memo of its bytes (kept in the owner's arena), so the
+// snapshot that made the body is the one whose bytes the store writes of the crate's value.
 
-/// `owner`'s entry: its runtime body from its memo, in an entry's bytes. Asked right after
-/// the body is made ([`made`]'s callers have it) or by [`encode`]; the body is the lowering
-/// task's own value, never built for the record.
-fn entry<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<Box<[u8]>, Left> {
+/// `owner`'s entry: its runtime body from its memo, in an entry's bytes, kept in the arena of
+/// the query that asks it. Asked right after the body is made ([`made`]'s callers have it) or
+/// by [`encode`]; the body is the lowering task's own value, never built for the record.
+fn entry<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<&'db [u8], Left> {
     let (def, _) = entry_key(db, owner).ok_or(Left::Unwritable("an owner with no key"))?;
     let body = mir_at(db, owner, MirStage::Runtime).map_err(|_| Left::Failed)?;
     match encode_entry(db, def.krate(db), def, body) {
-        Ok(Ok(bytes)) => Ok(bytes.into_boxed_slice()),
+        Ok(Ok(bytes)) => Ok(blaze_memo::keep_slice(db.memo(), &bytes)),
         Ok(Err(left)) => Err(left),
         Err(why) => panic!(
             "the runtime MIR of {owner:?} does not encode: {why}; its crate's value is not \
@@ -275,33 +275,33 @@ fn entry<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<Box<[u8]>, Left> {
     }
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn body_entry<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<Box<[u8]>, Left> {
+#[blaze_memo::tracked(returns(copy))]
+fn body_entry<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<&'db [u8], Left> {
     entry(db, MirOwner::Body(def))
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn closure_entry<'db>(db: &'db Db, closure: InternedClosureId<'db>) -> Result<Box<[u8]>, Left> {
+#[blaze_memo::tracked(returns(copy))]
+fn closure_entry<'db>(db: &'db Db, closure: InternedClosureId<'db>) -> Result<&'db [u8], Left> {
     entry(db, MirOwner::Closure(closure))
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(copy))]
 fn coroutine_entry<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
-) -> Result<Box<[u8]>, Left> {
+) -> Result<&'db [u8], Left> {
     entry(db, MirOwner::Coroutine(coroutine))
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(copy))]
 fn coroutine_by_move_entry<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
-) -> Result<Box<[u8]>, Left> {
+) -> Result<&'db [u8], Left> {
     entry(db, MirOwner::CoroutineByMove(coroutine))
 }
 
-fn entry_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> &'db Result<Box<[u8]>, Left> {
+fn entry_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<&'db [u8], Left> {
     match owner {
         MirOwner::Body(it) => body_entry(db, it),
         MirOwner::Closure(it) => closure_entry(db, it),
@@ -341,7 +341,7 @@ pub struct Recording {
 /// Has `db` note each library crate's owner whose runtime body it makes, until the guard is
 /// dropped: what [`encode`] writes of a crate. A database recording already is refused.
 pub fn record(db: &Db) -> Result<Recording, String> {
-    let (nonce, _) = db.nonce_and_revision();
+    let nonce = db.nonce();
     let mut seen = SEEN.lock();
     if seen.iter().any(|it| it.0 == nonce) {
         // alloc: error text
@@ -421,7 +421,7 @@ fn note<'db>(db: &'db Db, owner: MirOwner<'db>) {
     if krate.data(db).origin.is_local() {
         return;
     }
-    let (nonce, _) = db.nonce_and_revision();
+    let nonce = db.nonce();
     let seen = seen_of(owner);
     let mut all = SEEN.lock();
     if let Some((_, noted)) = all.iter_mut().find(|it| it.0 == nonce) {
@@ -448,7 +448,7 @@ pub struct Encoded {
 /// crate's owners noted are taken: a second call writes only what was made since. Refused when an
 /// entry does not build into the container (two owners with one key).
 pub fn encode(db: &Db, krate: Crate) -> R<(Vec<u8>, Encoded)> {
-    let (nonce, _) = db.nonce_and_revision();
+    let nonce = db.nonce();
     // Only this crate's, taken under the lock: another crate's stay for its own call, which
     // may run beside this one.
     // alloc: the crate's noted owners, once per crate at store time
@@ -526,7 +526,14 @@ pub fn serve(
             Given::new(Served { pages })
         }
     };
-    Ok(krate.give::<RuntimeSlot>(db, given, Durability::HIGH))
+    // Given by the crate's key and committed: the commit drops the crate's arena, so `krate`
+    // (and every id of it the caller holds) is to be taken again by its key after this. A
+    // `Given` equals only itself, so the slot moved whenever a gift is made here.
+    let key = krate.key(&*db);
+    let mut edit = db.edit();
+    edit.give::<RuntimeSlot>(key, given);
+    _ = edit.commit();
+    Ok(true)
 }
 
 /// Whether `krate`'s runtime MIR is read from a value it was given.
@@ -536,10 +543,10 @@ pub fn is_served(db: &Db, krate: Crate) -> bool {
 
 /// `owner`'s runtime body from its crate's value, made in this database: `None` when its
 /// crate was given none, the owner has no key, or the value holds no entry of it (it is built
-/// here then). The running query is told its value is a record's
-/// (`blaze_query::db::report_stored_read`); its reads are the crate's slot and the owner's
-/// key. An entry that does not read is a panic naming the crate and the owner: the store
-/// checked the bytes against their key, so building the body instead would hide a bug.
+/// here then). The running query lists the entry it read as a fact (`blaze_memo::read`: the
+/// entry's key, the digest of its bytes) beside the crate's slot, which the getter lists. An
+/// entry that does not read is a panic naming the crate and the owner: the store checked the
+/// bytes against their key, so building the body instead would hide a bug.
 pub(crate) fn served<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<MirBody<'db>> {
     let krate = owner.written_in(db).module(db).krate(db);
     let served = krate.given::<RuntimeSlot, Served>(db)?;
@@ -550,7 +557,10 @@ pub(crate) fn served<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<MirBody<'
         Err(why) => corrupt(db, krate, owner, &why),
     };
     let body = decode_entry(db, krate, &bytes).unwrap_or_else(|why| corrupt(db, krate, owner, &why));
-    blaze_query::db::report_stored_read(db);
+    blaze_memo::read(
+        db.memo(),
+        Fact { id: ContentId(key), digest: ContentId::of(RUNTIME_DOMAIN, &bytes) },
+    );
     Some(body)
 }
 
@@ -588,7 +598,7 @@ pub mod testing {
     /// `owner`'s entry as [`encode`] would write it, or why it has none.
     pub fn entry_bytes<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<Vec<u8>, Left> {
         // clone: the entry's bytes, for a test to keep past the database
-        entry_of(db, owner).as_ref().map(|it| it.to_vec()).map_err(|left| *left)
+        entry_of(db, owner).map(<[u8]>::to_vec)
     }
 
     /// The body in `bytes`, an entry of an owner of `krate`, made in `db`.

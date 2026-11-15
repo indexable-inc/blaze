@@ -6,7 +6,7 @@
 //! so each part is walked once: the cleanups ask for nothing the way without unwinding does
 //! not. Resuming the unwinding is `outside`'s.
 
-use blaze_query::db::AsId;
+use blaze_memo::Id as _;
 use hir_def::{
     AdtId, CallableDefId, FunctionId, VariantId,
     layout::Variants,
@@ -248,7 +248,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
             return Err(format!("call_once shim for {ty:?}"));
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let def = InstanceDef::Closure(id.0.as_id());
+        let def = InstanceDef::Closure(id.0.gid());
         let body = self.fx.body_types(def, parent_args).map_err(told)?;
         self.fx.body_signature(body).map_err(told)?;
         let Some(receiver) = body.params.first() else {
@@ -315,7 +315,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
             return Err(format!("fn pointer shim for {ty:?}"));
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let def = InstanceDef::Closure(id.0.as_id());
+        let def = InstanceDef::Closure(id.0.gid());
         let body = self.fx.body_types(def, parent_args).map_err(told)?;
         self.fx.body_signature(body).map_err(told)?;
         self.fx.closure_pointer_abi(body).map_err(told)?;
