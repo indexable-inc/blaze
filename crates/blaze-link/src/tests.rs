@@ -758,6 +758,47 @@ fn a_removed_functions_got_cell_goes_with_it() {
     );
 }
 
+/// `start` reads `g`'s address through `g`'s slot's GOT cell (`Target::Function` in an image
+/// with a jump table: what `format_args!` does with a `fmt` it is handed). A rebuild in which
+/// both go, `start` replaced by one that reads nothing, empties `g`'s slot: the cell goes with
+/// it, and the relink takes the change (ripgrep's `rg` relinked by `blaze test` was refused:
+/// "`<Result<Metadata, ignore::Error> as Debug>::fmt` is removed with nothing put in its
+/// slot, and the GOT cell of the function .. still calls it"). Control: `g` removed while
+/// `start` still reads it is refused, naming `start`, not the linker's cell.
+#[test]
+fn an_emptied_slots_got_cell_goes_with_it() {
+    // `mov rax, [rip + slot@GOTPCREL]; ret`
+    let through_got = |n: u8, target: u8| {
+        let reloc = blaze_codegen::Relocation {
+            at: 3,
+            kind: RelocKind::GotPcRel32,
+            target: Target::Function(key(target)),
+            addend: -4,
+        };
+        function(n, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], vec![reloc])
+    };
+    let (start, g) = (through_got(1, 2), function(2, &returns(1), Vec::new()));
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, first(&start, &g)).unwrap();
+
+    let error = image.stage(Change { removed: vec![key(2)], ..Change::default() }).unwrap_err();
+    assert!(error.what.contains("the function `start`"), "the reader is named: {error}");
+    assert!(!error.what.contains("GOT cell"), "not the linker's cell: {error}");
+    assert_eq!(image.generation(), 1);
+
+    let start2 = function(4, &returns(2), Vec::new());
+    let rebuilt = Change {
+        added: vec![&start2],
+        removed: vec![key(1), key(2)],
+        names: vec![("_start".into(), Target::Direct(key(4)))],
+        debug_names: vec![(key(4), "start2".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, rebuilt).expect("the emptied slot's cell goes with it");
+    assert_eq!(image.generation(), 2);
+}
+
 /// A vtable reached only through a GOT cell from code that goes, and naming a function that
 /// goes with that code (smallvec's `from_buf` doctest edited from comparing slices to
 /// comparing lengths: `<&i32 as Debug>::fmt` and the vtable that names it are dead with the

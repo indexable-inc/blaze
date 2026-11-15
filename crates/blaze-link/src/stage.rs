@@ -2167,14 +2167,25 @@ impl<'a> Stage<'a> {
             self.thunks_of(sym, &mut cells);
         }
         // A slot emptied and not filled again ([`Stage::unslot`]) keeps its symbol, so the
-        // walk above never meets it: its thunks, made for callers out of reach of the cells
-        // piece, go as a removed function's do, and a caller still reaching one is
-        // [`Stage::dangling`]'s to name, as a removed piece's referrer.
+        // walk above never meets it: its GOT cells and PLT stub (code that took the
+        // function's address through the slot: a `fmt` handed to `format_args!`) and its
+        // thunks, made for callers out of reach of the cells piece, go as a removed
+        // function's do, and a caller still reaching one is [`Stage::dangling`]'s to name, as
+        // a removed piece's referrer. (A cell left behind was named as the slot's caller, and
+        // the relink refused: ripgrep's `rg` relinked by `blaze test`.)
         for slot in self.emptied.iter() {
             if self.new.cell(*slot).is_some() {
                 continue;
             }
             if let Some(slot_sym) = self.new.slot_syms.get(*slot as usize).copied() {
+                let keys = GotKind::ALL.map(|kind| SymKey::Got(kind, slot_sym));
+                for key in keys.into_iter().chain([SymKey::Plt(slot_sym)]) {
+                    if let Some(Def::Piece { piece, .. }) =
+                        self.symbols.find(key).map(|it| self.new.def(it))
+                    {
+                        cells.push(piece);
+                    }
+                }
                 self.thunks_of(slot_sym, &mut cells);
             }
         }
