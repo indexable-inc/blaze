@@ -68,6 +68,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_lower::{ProcMacroLoadResult, ProcMacroLoadingError};
 use blaze_profile::span::{self, Name};
+use blaze_usercode::roots::RoleSet;
 use blaze_units::{
     query::{BuildConfig, Units},
     schema::{Mode, Unit},
@@ -83,7 +84,7 @@ use super::{
     drawn::{self, Drawing, Item, Said},
     files::Mounted,
     graph,
-    portable::{self, Places},
+    portable::{self, Places, Tied},
     reads, say, script,
 };
 use crate::serve::direct::{self, Which};
@@ -991,13 +992,17 @@ fn check_puts(
     let bytes = Checked { items_broken, placed }.encoded().map_err(failed)?;
     // An outcome that holds a directory of the build (a diagnostic naming a file by where it
     // is), or whose closure's code was given a path it could have made something of, is
-    // filed under its key here ([`Places::here`], as a record is: [`store`]).
+    // filed under its key here ([`Places::here`], as a record is: [`store`]); one that holds
+    // only directories every checkout of the home shares, under its key in this home
+    // ([`Places::home`]).
     let places = Places::of(job);
-    let tied = places.tied(&bytes)
-        || portable::path_reads(reader.db(), crate_of(job, unit, u)?, &places).is_some();
+    let tied = match portable::path_reads(reader.db(), crate_of(job, unit, u)?, &places) {
+        Some(_) => Some(portable::Tied::Here),
+        None => places.reach(&bytes),
+    };
     let base = match tied {
-        true => places.here(base),
-        false => base,
+        Some(tied) => places.tied_key(base, tied),
+        None => base,
     };
     // Every slot of `base` read at once into the task's frame at the first slot asked
     // (`direct::slots`), a slot that does not read taken as not kept, as the pooled walk took it.
@@ -1203,8 +1208,9 @@ pub(crate) struct PendingRecord {
     /// What each profile did to its functions ([`codegen::counted`]).
     counted: Vec<(ContentId, ProfileCounts)>,
     places: Places,
-    /// Why its outputs tie it to the build's directories, the first reason found.
-    tie: Option<String>,
+    /// Why its outputs tie it to the build's directories, and how far ([`portable::Tied`]):
+    /// the first reason found of the farthest reach.
+    tie: Option<(String, portable::Tied)>,
     /// Why what its closure's code was given ties it ([`portable::path_reads`]), read by the
     /// unit's task where `tie` is none; asked after the record's own bytes.
     reads_tie: Option<String>,
@@ -1318,22 +1324,37 @@ fn file_record(
     };
     // What ties it to where it was made: an output, a root its bytes still hold, or a path its
     // closure's code was given and could have made something of ([`portable::path_reads`]).
-    let tie = tie
-        .or_else(|| {
-            places.tied(&bytes).then(|| {
-                // alloc: once per record tied
-                "its record names a directory of the build where no path starts (a diagnostic, a variable its program is run with)".to_owned()
-            })
-        })
-        .or(reads_tie);
-    if let Some(why) = &tie {
-        tracing::info!(target: "blaze", unit, item = %item, "unit record kept for this build's directories alone: {why}");
+    // Each is asked while what is found so far reaches no farther than the home
+    // ([`portable::Tied`]): the reason kept is the farthest's, the first of those.
+    let mut tie = tie;
+    if tie.as_ref().is_none_or(|it| it.1 == Tied::Home)
+        && let Some(reach) = places.reach(&bytes)
+    {
+        let why = || {
+            // alloc: once per record tied
+            "its record names a directory of the build where no path starts (a diagnostic, a variable its program is run with)".to_owned()
+        };
+        tie = match tie {
+            Some((first, Tied::Home)) if reach == Tied::Home => Some((first, Tied::Home)),
+            _ => Some((why(), reach)),
+        };
+    }
+    if let Some(why) = reads_tie {
+        tie = Some((why, Tied::Here));
+    }
+    if let Some((why, tied)) = &tie {
+        let alone = match tied {
+            Tied::Home => "this home's directories alone, which its every checkout shares",
+            Tied::Here => "this build's directories alone",
+        };
+        tracing::info!(target: "blaze", unit, item = %item, "unit record kept for {alone}: {why}");
     }
     // Every slot of the base key holding other names leaves the record unkept, and the unit
     // compiles again next time. A record tied to the build's directories is filed under its
-    // key here ([`Places::here`]).
-    let base = match tie {
-        Some(_) => places.here(base),
+    // key here ([`Places::here`]), or in this home ([`Places::home`]) where all it holds is of
+    // the home.
+    let base = match &tie {
+        Some((_, tied)) => places.tied_key(base, *tied),
         None => base,
     };
     let primary = |manifest: &str| units.is_primary_manifest(manifest);
@@ -2261,8 +2282,13 @@ fn filed_in<'f>(
 ) -> Result<Option<(reads::Found, direct::Value<'f>, usize)>, ApiError> {
     // Under its key, then under its key here ([`Places::here`]): where a record is that is
     // tied to the directories of the build that made it ([`tied`]).
+    // Between them, under its key in this home ([`Places::home`]): a record tied only to the
+    // directories every checkout of the home shares.
     let places = Places::of(job);
     if let Some(found) = filed_under(job, &places, frame, base)? {
+        return Ok(Some(found));
+    }
+    if let Some(found) = filed_under(job, &places, frame, places.home(base))? {
         return Ok(Some(found));
     }
     filed_under(job, &places, frame, places.here(base))
@@ -2837,17 +2863,23 @@ impl Written {
     /// changed of the last one, or as the bytes the store already keeps, is not read here and
     /// is taken as tied: whether the image it is made of held a directory is not kept with
     /// it (docs/v2/plan/design/store.md, "Content keys", open).
-    fn tied(&self, places: &Places) -> Option<&'static str> {
+    /// How far it ties ([`portable::Tied`]): to the home where all its bytes hold is roots of
+    /// the home, to this build's directories for any other, and for bytes not read.
+    fn tied(&self, places: &Places) -> Option<(&'static str, portable::Tied)> {
         let held = "its bytes hold a directory of the build";
+        let reach = |roles: RoleSet| (!roles.is_empty()).then(|| (held, portable::Tied::of(roles)));
         match self {
-            Written::Bytes(bytes) | Written::Linked(bytes, _) => places.tied(bytes).then_some(held),
-            Written::Runs { runs, .. } => {
-                runs.iter().any(|(_, bytes)| places.tied(bytes)).then_some(held)
+            Written::Bytes(bytes) | Written::Linked(bytes, _) => reach(places.held(bytes)),
+            Written::Runs { runs, .. } => reach(
+                runs.iter().fold(RoleSet::default(), |all, (_, bytes)| all.union(places.held(bytes))),
+            ),
+            Written::Derived { .. } => Some((
+                "it is an image patched from the last one, whose bytes are not read again",
+                portable::Tied::Here,
+            )),
+            Written::Kept(_) => {
+                Some(("it is an image the store already keeps, not read again", portable::Tied::Here))
             }
-            Written::Derived { .. } => {
-                Some("it is an image patched from the last one, whose bytes are not read again")
-            }
-            Written::Kept(_) => Some("it is an image the store already keeps, not read again"),
         }
     }
 
@@ -3686,7 +3718,7 @@ fn store(
     // The build's directories, which its record is written against, and why what it made is
     // tied to them, if anything is ([`portable`]): the first reason found.
     let places = Places::of(job);
-    let mut tie: Option<String> = None;
+    let mut tie: Option<(String, portable::Tied)> = None;
     // The outputs (by index) the record names by their text written against the directories,
     // each with that text's key.
     let mut ported_outputs: Vec<(u32, Key)> = Vec::new(); // alloc: none until a dep-info file
@@ -3715,9 +3747,15 @@ fn store(
         };
         let main_file = files.first().map(|it| it.0.clone());
         for (path, written, executable) in files {
-            if tie.is_none() {
+            // Read until one ties it to the checkout: one tied to the home alone may be
+            // followed by one that is.
+            if tie.as_ref().is_none_or(|it| it.1 == portable::Tied::Home) {
                 let _span = tracing::info_span!(target: "blaze", "unit output root scan", path = %path).entered();
-                tie = written.tied(&places).map(|why| format!("its output {path}: {why}")); // alloc: once per record tied
+                if let Some((why, reach)) = written.tied(&places)
+                    && (tie.is_none() || reach == portable::Tied::Here)
+                {
+                    tie = Some((format!("its output {path}: {why}"), reach)); // alloc: once per record tied
+                }
             }
             let key = match written {
                 Written::Bytes(bytes) => put_output(&mut puts, bytes, None),
@@ -3824,9 +3862,12 @@ fn store(
                     // written against the build's directories, which a build elsewhere
                     // writes back against its own ([`unported`]).
                     if let std::borrow::Cow::Owned(ported) = places.text(text.as_bytes()) {
-                        if tie.is_none() && places.tied(&ported) {
+                        if tie.as_ref().is_none_or(|it| it.1 == portable::Tied::Home)
+                            && let Some(reach) = places.reach(&ported)
+                            && (tie.is_none() || reach == portable::Tied::Here)
+                        {
                             // alloc: once per record tied
-                            tie = Some(format!("its dep-info {path} names a directory of the build where no path starts"));
+                            tie = Some((format!("its dep-info {path} names a directory of the build where no path starts"), reach));
                         }
                         let key = put_output(&mut puts, ported, None);
                         ported_outputs.push((outputs.len() as u32, key));
@@ -3913,11 +3954,11 @@ fn store(
     let key = key.filter(|_| !script::pure::built_nothing(job, unit));
     match (key, read) {
         (Some(base), Ok(read)) => {
-            // Asked only where its outputs tie it to nothing; its bytes are asked first after
-            // the answer, as they were before the path reads ([`file_record`]).
+            // Asked only where its outputs tie it to nothing beyond the home; its bytes are
+            // asked first after the answer, as they were before the path reads ([`file_record`]).
             let reads_tie = match tie {
-                Some(_) => None,
-                None => {
+                Some((_, Tied::Here)) => None,
+                None | Some((_, Tied::Home)) => {
                     let _span =
                         tracing::info_span!(target: "blaze", "unit record path reads").entered();
                     portable::path_reads(reader.db(), krate, &places)

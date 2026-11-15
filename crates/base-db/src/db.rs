@@ -608,6 +608,12 @@ impl Db {
         self.files.env_is_read(krate, key);
     }
 
+    /// [`Files::env_is_read_for_path`].
+    #[inline]
+    pub fn env_is_read_for_path(&self, krate: Crate, key: &str) {
+        self.files.env_is_read_for_path(krate, key);
+    }
+
     /// Notes that `env!` in `krate` found the variable `key` unset, which rustc turns the
     /// crate down for.
     #[inline]

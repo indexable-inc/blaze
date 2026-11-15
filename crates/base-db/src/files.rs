@@ -118,6 +118,11 @@ pub struct Files {
     env_read: Table<(Crate, Box<str>)>,
     /// The variables `env!` has found unset, by the crate asking.
     env_unset: Table<(Crate, Box<str>)>,
+    /// Of `env_read`, those a crate's code may have been made from by value: every read but
+    /// one shown to give its value only to the path an `include!`, `include_str!` or
+    /// `include_bytes!` reads ([`Files::env_is_read_for_path`]). A read noted any other way,
+    /// a served crate's among them (`hir_def::deps::filed`), is here.
+    env_exposed: Table<(Crate, Box<str>)>,
     /// What each proc-macro expansion read besides its call, by the crate the call is in and
     /// where the reads come from: a later note from the same place replaces them.
     expansions_read: ReadLock<HashMap<(Crate, ReadBy), Box<[ExpansionRead]>, Global>>,
@@ -391,6 +396,7 @@ impl Default for Files {
             sources_included_by: Table::new(1 << 22),
             env_read: Table::new(1 << 22),
             env_unset: Table::new(1 << 22),
+            env_exposed: Table::new(1 << 22),
             expansions_read: ReadLock::new("db.files.expansions_read", Default::default()),
             included_served: ReadLock::new("db.files.included_served", Default::default()),
             views: Log::new(1 << 16),
@@ -1205,6 +1211,23 @@ impl Files {
 
     pub fn env_is_read(&self, krate: Crate, key: &str) {
         note_env(&self.env_read, krate, key);
+        note_env(&self.env_exposed, krate, key);
+    }
+
+    /// Notes a read of `key` in `krate` whose value goes only to the path an `include!`,
+    /// `include_str!` or `include_bytes!` reads (`hir_expand`'s `read_for_include_path`): in
+    /// the log as any read, and not among [`Files::env_exposed`]. What the crate is made from
+    /// is the file the path names, which its source root's content and the included files'
+    /// keys hold, never the value: so a value that names a directory of the build ties
+    /// nothing of where that directory is.
+    pub fn env_is_read_for_path(&self, krate: Crate, key: &str) {
+        note_env(&self.env_read, krate, key);
+    }
+
+    /// The reads of [`Files::env_read`] whose value a crate's code may have been made from
+    /// ([`Files::env_is_read_for_path`] says which are not). Sorted.
+    pub fn env_exposed(&self) -> Vec<(Crate, String)> {
+        env_list(&self.env_exposed)
     }
 
     /// Tells the database how its portable keys write paths ([`Port`]): once, before any is

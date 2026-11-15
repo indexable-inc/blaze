@@ -25,6 +25,11 @@
 //!   absolute path, an image with a search path linked in) is kept under its key *here*
 //!   ([`Places::here`]: the key and each root's real path), which only a build with the same
 //!   roots asks. Nothing is guessed about what a crate does with a path: what it made is read.
+//!   A record whose bytes hold only roots every checkout of one home shares ([`HOME`]: a
+//!   registry crate's object code naming its files under the fetched sources, a build
+//!   script's program) is kept under its key *in this home* ([`Places::home`]: the key and
+//!   those roots' real paths alone, [`Tied::Home`]), which every checkout built by a daemon
+//!   of this home asks: what ties it is where those roots are, never where the checkout is.
 //!
 //! What this does not cover, and so is never shared (rule keys-cover-every-input): a crate
 //! whose code read a path it was given and made something that depends on the path without
@@ -46,9 +51,48 @@ use std::borrow::Cow;
 
 use blaze_cas::Key;
 use blaze_ids::Hasher;
-use blaze_usercode::roots::{Role, Roots, port::Dirs};
+use blaze_usercode::roots::{Role, RoleSet, Roots, port::Dirs};
 
 use super::Job;
+
+/// The roots every checkout one daemon builds shares: blaze's tools and launcher, the
+/// machine's shared standard library directory and where the home keeps fetched packages.
+/// The workspace and the build directory (`<home>/build/<name>-<id of the checkout>`) are
+/// each checkout's own.
+pub(crate) const HOME: [Role; 4] = [Role::Tools, Role::Launcher, Role::Std, Role::Sources];
+
+/// How far a record tied to the build's directories reaches: which key it is kept under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Tied {
+    /// What it holds is only roots of [`HOME`], in any spelling ([`Places::held`]): kept under
+    /// [`Places::home`], which another checkout of the same home asks too. Its bytes are the
+    /// same there: they are made from what the key covers, with the checkout's roots written
+    /// as placeholders, and what holds none of the checkout's roots holds nothing of where
+    /// it is.
+    Home,
+    /// Anything else: a root of the checkout's held (or a path between roots of two tops,
+    /// which `Roots::embedded` names both of), bytes not read again, or a path the closure's
+    /// code was given ([`path_reads`]): kept under [`Places::here`].
+    Here,
+}
+
+impl Tied {
+    /// How far bytes that hold the roots `held` (not empty) reach.
+    pub(crate) fn of(held: RoleSet) -> Tied {
+        match held.iter().all(|role| HOME.contains(&role)) {
+            true => Tied::Home,
+            false => Tied::Here,
+        }
+    }
+
+    /// The farther of the two: what a record tied both ways is kept under.
+    pub(crate) fn and(self, other: Tied) -> Tied {
+        match (self, other) {
+            (Tied::Home, Tied::Home) => Tied::Home,
+            _ => Tied::Here,
+        }
+    }
+}
 
 /// The directories of one build that its keys and records are written against, each by what
 /// it is.
@@ -61,6 +105,9 @@ pub(crate) struct Places {
 
 /// The domain of [`Places::here`].
 const HERE: &str = "blaze v2 cargo unit record here 1";
+
+/// The domain of [`Places::home`].
+const HOME_DOMAIN: &str = "blaze v2 cargo unit record in this home 1";
 
 impl Places {
     /// The roots of a build of the workspace at `workspace` whose build directory is `target`,
@@ -145,7 +192,19 @@ impl Places {
     /// Whether `bytes` hold one of the roots, in any spelling (`Roots::embedded`): what does
     /// is of this build's directories alone.
     pub(crate) fn tied(&self, bytes: &[u8]) -> bool {
-        !self.view().embedded(bytes).is_empty()
+        !self.held(bytes).is_empty()
+    }
+
+    /// Which roots `bytes` hold, in any spelling (`Roots::embedded`): none for bytes of no
+    /// build's directories alone.
+    pub(crate) fn held(&self, bytes: &[u8]) -> RoleSet {
+        self.view().embedded(bytes)
+    }
+
+    /// How far `bytes` tie what holds them ([`Tied::of`]), if they hold a root.
+    pub(crate) fn reach(&self, bytes: &[u8]) -> Option<Tied> {
+        let held = self.held(bytes);
+        (!held.is_empty()).then(|| Tied::of(held))
     }
 
     /// How the roots sit to each other (`Roots::layout`), for a key: which is under which and
@@ -165,6 +224,27 @@ impl Places {
             hasher.update(&[role.tag()]).part(root.as_bytes());
         }
         Key(hasher.finish())
+    }
+
+    /// The key a record of base key `base` tied only to roots of [`HOME`] is under: `base` and
+    /// the real path of each of this build's roots of those roles, in role order, so every
+    /// checkout a daemon of one home builds asks the same. Asked after `base`, before
+    /// [`Places::here`].
+    pub(crate) fn home(&self, base: Key) -> Key {
+        let mut hasher = Hasher::new(HOME_DOMAIN);
+        hasher.id(&base.0);
+        for (role, root) in self.dirs.roots().filter(|(role, _)| HOME.contains(role)) {
+            hasher.update(&[role.tag()]).part(root.as_bytes());
+        }
+        Key(hasher.finish())
+    }
+
+    /// The key a record of base key `base` tied as `tied` is kept under.
+    pub(crate) fn tied_key(&self, base: Key, tied: Tied) -> Key {
+        match tied {
+            Tied::Home => self.home(base),
+            Tied::Here => self.here(base),
+        }
     }
 }
 
@@ -280,7 +360,9 @@ pub(crate) fn path_reads(db: &base_db::Db, krate: base_db::Crate, places: &Place
     // alloc: once per unit stored, a crate of its closure each
     let closure: blaze_hash::HashSet<base_db::Crate, std::alloc::Global> =
         krate.transitive_deps(db).iter().copied().collect();
-    for (by, name) in db.files().env_read() {
+    // A read that gives its value only to an `include!`'s path is none of these: the crate is
+    // made from the file, which its key holds by content ([`base_db::Files::env_exposed`]).
+    for (by, name) in db.files().env_exposed() {
         if closure.contains(&by) && by.env(db).get(&name).is_some_and(|value| rooted(&value)) {
             // alloc: once per record tied
             return Some(format!(

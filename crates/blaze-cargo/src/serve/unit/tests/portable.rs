@@ -347,3 +347,48 @@ fn a_tied_record_is_under_its_key_here() {
     let moved = Where { machine: "/var/cache/blaze", ..FIRST };
     assert_ne!(first.here(base), moved.places().here(base), "each directory is in it");
 }
+
+/// A record whose bytes hold only roots every checkout of one home shares (a registry crate's
+/// object code naming its files under the fetched sources, a build script's program) is kept
+/// under its key in this home ([`Places::home`]): two checkouts of the home, each with its own
+/// build directory, ask the same key, another home asks another; anything that holds a
+/// checkout's own root is kept here, as before. The oracle (one key for both checkouts, another
+/// for another home) is run on [`Places::here`] as a planted bug, a key that holds the
+/// checkout, and has to refuse it.
+#[test]
+fn a_record_tied_to_the_home_alone_is_found_by_every_checkout_of_it() {
+    use super::super::portable::Tied;
+    let at = |checkout: &str, home: &str, id: &str| {
+        Places::new(
+            checkout,
+            &format!("{home}/build/w-{id}"),
+            "/home/a/.cache/blaze/std/m",
+            Path::new(&format!("{home}/tools")),
+            Path::new(&format!("{home}/bin/blaze")),
+            Path::new(&format!("{home}/sources")),
+        )
+    };
+    let (one, two) = (at("/home/a/wt/one", "/home/a/.blaze", "11"), at("/home/a/wt/two", "/home/a/.blaze", "22"));
+    let elsewhere = at("/home/a/wt/one", "/home/b/.blaze", "11");
+    let registry = b"\x00panicked at /home/a/.blaze/sources/registry/src/i/anyhow-1.0.100/build.rs:1\x00";
+    assert_eq!(one.reach(registry), Some(Tied::Home), "the fetched sources are the home's");
+    assert_eq!(two.reach(registry), Some(Tied::Home));
+    for (bytes, what) in [
+        (b"/home/a/wt/one/src/main.rs".as_slice(), "the workspace"),
+        (b"/home/a/.blaze/build/w-11/debug/build/x/out/a.rs".as_slice(), "the build directory"),
+        (b"/home/a/.blaze/sources/r/lib.rs and /home/a/wt/one/src/main.rs".as_slice(), "both"),
+    ] {
+        assert_eq!(one.reach(bytes), Some(Tied::Here), "{what} is the checkout's");
+    }
+    assert_eq!(one.reach(b"no directory at all"), None);
+    assert_eq!(Tied::Home.and(Tied::Here), Tied::Here);
+    let base = blaze_cas::Key(blaze_ids::ContentId::of("blaze v2 cargo test record makers", b"base"));
+    let oracle = |key: &dyn Fn(&Places, blaze_cas::Key) -> blaze_cas::Key| {
+        key(&one, base) == key(&two, base) && key(&one, base) != key(&elsewhere, base) && key(&one, base) != base
+    };
+    assert!(oracle(&|places, base| places.home(base)), "every checkout of the home asks one key");
+    assert!(!oracle(&|places, base| places.here(base)), "planted: a key that holds the checkout is caught");
+    assert_ne!(one.home(base), one.here(base));
+    assert_eq!(one.tied_key(base, Tied::Home), one.home(base));
+    assert_eq!(one.tied_key(base, Tied::Here), one.here(base));
+}
