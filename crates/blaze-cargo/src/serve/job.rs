@@ -942,7 +942,7 @@ impl<S: Steps> plane::Work for Step<S> {
                     .expect("the documentation's task is posted with its job's writer");
                 self.settle(front.doc(writer, *no_deps, *private), Value::Answers)
             }
-            Does::StoreKept { steps, kept, build, logs, wanted, filing, .. } => {
+            Does::StoreKept { steps, kept, checkout, build, logs, wanted, filing } => {
                 // The units' records first: they need no front end, and their puts reach the
                 // loop whatever the store below comes to.
                 let filed = match filing {
@@ -974,10 +974,10 @@ impl<S: Steps> plane::Work for Step<S> {
                     }
                 };
                 let Some(mut front) = kept.lock().take() else {
-                    let error = ApiError::new(
-                        "the kept front end to store was taken before its task ran",
-                        None,
-                    );
+                    let what = "the kept front end to store was taken before its task ran";
+                    // No task serves the launched runs' first calls from it.
+                    steps.lose_needs(checkout, what);
+                    let error = ApiError::new(what, None);
                     // alloc: none, an empty vec
                     return self.settle(Err(Failed::Error(error)), |it| {
                         Value::StoredKept(None, it, Vec::new(), filed)
@@ -1008,14 +1008,22 @@ impl<S: Steps> plane::Work for Step<S> {
                     };
                     // The checkout's launched runs' first calls, made with the front end until a
                     // request wants it back or no launcher is left (`run::needs`); what they made
-                    // is stored with the rest.
-                    if let Ok(puts) = &mut stored {
-                        let _span = tracing::info_span!(
-                            target: "blaze",
-                            "kept front end: serve a launched run's first calls",
-                        )
-                        .entered();
-                        puts.extend(steps.serve_needs(&mut front, wanted));
+                    // is stored with the rest. A store that failed drops the front end, so they
+                    // are refused naming the failure: a launched program never waits on a task
+                    // that will not come (the ripgrep hang, `blaze: ok` then 900 s of nothing).
+                    match &mut stored {
+                        Ok(puts) => {
+                            let _span = tracing::info_span!(
+                                target: "blaze",
+                                "kept front end: serve a launched run's first calls",
+                            )
+                            .entered();
+                            puts.extend(steps.serve_needs(&mut front, wanted));
+                        }
+                        Err(error) => {
+                            let why = format!("storing what its build left for the store failed: {}", error.what);
+                            steps.lose_needs(checkout, &why);
+                        }
                     }
                     // A store that failed drops the front end: nothing of it is let go first.
                     if stored.is_ok() {
@@ -1038,6 +1046,7 @@ impl<S: Steps> plane::Work for Step<S> {
                         let what = format!(
                             "blaze {panic}, storing what the build left for the store; its front end is dropped, as it may be half written"
                         );
+                        steps.lose_needs(checkout, &what);
                         (None, Err(ApiError::new(what, None)), Vec::new()) // alloc: none
                     }
                 };
@@ -7690,6 +7699,8 @@ impl<S: Steps> Jobs<S> {
                     "the plane refused the task storing what the build of {checkout} left for the store, so its \
                      front end is dropped and the checkout's next build lowers it anew: {error}"
                 );
+                // No task serves the launched runs' first calls from it.
+                w.steps.lose_needs(&checkout, &what);
                 Some((command, checkout, what))
             }
         };

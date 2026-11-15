@@ -26,6 +26,20 @@
 //! `blaze run` it last answered for the program, whose build loads the front end and whose
 //! task after it serves the queue; or the needs are refused by name, once, when that build
 //! fails, makes no start of the program, or holds nothing within [`BUILD`].
+//!
+//! Between a build's link, which holds the front end for the program ([`Front::held`]), and
+//! the task after its answer, which serves from it ([`Front::serving`]), no one serves. The
+//! needs queued then wait for that task, and the task may never come: the store before it
+//! failed (ripgrep on the build VM: a launched program waited 900 s on its first call after
+//! `blaze: ok`, because the task served needs only when the store succeeded), or a request
+//! that wanted the front end back never linked. So a loss is said at once ([`Front::lost`]:
+//! every need refused naming why, until a link holds a front end again), and what nothing says
+//! is bounded ([`SERVED_WITHIN`]). The launched program's own wait for a first call has no
+//! clock of its own (`blaze-launch-rt`), so this bound is the one its wait has: a run either
+//! starts, or ends with a named failure, within [`SERVED_WITHIN`] of its build's answer.
+//!
+//! **The floor**: a need is one queue push and, at the end, one frame; the bound adds one
+//! deadline to the loop's existing wait (`Launches::wants`, every turn), no thread or timer.
 
 
 use std::collections::VecDeque;
@@ -198,6 +212,15 @@ impl Serve {
 /// ([`Front`]) before it is refused by name.
 pub(crate) const BUILD: Duration = Duration::from_secs(120);
 
+/// How long a first call queued while a build's link holds the front end and no task serves
+/// it yet ([`Front::held`]) waits for the task after that build's answer to take it, before
+/// it is refused by name ([`Refuse::Unserved`]). That task starts once the build's front end
+/// is kept and its store is made (`Does::StoreKept`); a store that fails says so at once
+/// ([`Front::lost`]), so this bounds what nothing says: a request that wanted the front end
+/// back and never linked, a task never posted. The same as [`BUILD`], which bounds a whole
+/// build's way to a link: a store is part of a build's end.
+pub(crate) const SERVED_WITHIN: Duration = Duration::from_secs(120);
+
 /// What a launched program's first call no record answers does ([`Front::want`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Want {
@@ -206,6 +229,9 @@ pub(crate) enum Want {
     /// It is queued, and the daemon sends itself the `blaze run` it last answered for the
     /// program: no task holds the front end and none was asked.
     Build,
+    /// It is refused at once, for the reason [`Front::lost_why`] gives: the front end the
+    /// program's last link held was lost before any task served from it.
+    Refuse,
 }
 
 /// Why the queued first calls of a program are refused ([`Front::built`], [`Front::tick`]).
@@ -217,6 +243,9 @@ pub(crate) enum Refuse {
     NoStart,
     /// [`BUILD`] passed since it was asked and no build's link held the front end.
     Late,
+    /// [`SERVED_WITHIN`] passed since a need was queued while a link held the front end, and
+    /// no task took it.
+    Unserved,
 }
 
 /// A safeguard of [`Front`] taken out, for the tests' controls: always `FrontPlant::None`
@@ -230,6 +259,12 @@ pub(crate) enum FrontPlant {
     AsksTwice,
     /// An asked build never times out.
     NeverLate,
+    /// A loss of the held front end is not heard: the needs stay queued for a task that will
+    /// never run (the ripgrep hang: a store that failed after the answer).
+    LeftOpen,
+    /// A need queued while a link holds the front end and no task serves is never refused
+    /// late: it waits as long as nothing takes it.
+    Unbounded,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -238,8 +273,14 @@ enum Holds {
     None,
     /// The daemon sent itself a build, at this time on the driver's clock.
     Asked { at: Duration },
-    /// A build's link held it: the task after that build serves the needs.
-    Held,
+    /// A build's link held it: the task after that build serves the needs. `serving`: that
+    /// task runs now. `since`: while it does not, when the first need still queued was
+    /// queued, on the driver's clock ([`SERVED_WITHIN`] runs from it).
+    Held { serving: bool, since: Option<Duration> },
+    /// The front end the last link held was lost before a task served from it
+    /// ([`Front::lost`]): every need is refused at once, by [`Front::lost_why`], until a
+    /// build's link holds one again or the task after a later build of the checkout serves.
+    Lost,
 }
 
 /// Who holds the front end for one launched program's needs: a sans-IO core on an injected
@@ -247,8 +288,11 @@ enum Holds {
 /// (`launch::wanted`, the daemon's `launch_turn`) sends the build and refuses the needs.
 ///
 /// **The invariant** (`tests`): over every order of wants, links, the build's end, the
-/// serving task's end and ticks, at most one build is asked while one is asked or held, and
-/// from every state a queued need is served by a task or refused once, within [`BUILD`].
+/// serving task's start and end, the held front end's loss and ticks, at most one build is
+/// asked while one is asked or held, and from every state a queued need is served by a task
+/// or refused once: within [`BUILD`] of a build asked, within [`SERVED_WITHIN`] of its
+/// queueing while a link holds the front end and no task serves, and at once once the held
+/// front end is lost.
 pub(crate) struct Front {
     holds: Holds,
     /// Whether the build the daemon sent itself has not ended yet ([`Front::built`]), whatever
@@ -256,19 +300,22 @@ pub(crate) struct Front {
     /// front end go, is still under way, and no second is sent beside it. Its end is the only
     /// one [`Front::built`] hears, so it never ends a build asked after it.
     running: bool,
+    /// Why the held front end was lost, while it is ([`Holds::Lost`]).
+    lost: Option<String>,
     pub(crate) plant: FrontPlant,
 }
 
 impl Front {
     pub(crate) fn new() -> Front {
-        Front { holds: Holds::None, running: false, plant: FrontPlant::None }
+        Front { holds: Holds::None, running: false, lost: None, plant: FrontPlant::None }
     }
 
     /// A first call no record answers, at `now`: [`Want::Build`] when none holds or was asked
     /// and no build the daemon sent itself is still under way (and it is asked from then),
     /// else [`Want::Queue`]. With one under way (refused late, or its task let go) the need
     /// waits for that build, bounded by [`BUILD`] from now: its link holds the front end, or
-    /// its end refuses the need ([`Front::built`]).
+    /// its end refuses the need ([`Front::built`]). While a link holds it and no task serves,
+    /// the need waits [`SERVED_WITHIN`] at most; once it was lost, [`Want::Refuse`].
     pub(crate) fn want(&mut self, now: Duration) -> Want {
         match self.holds {
             Holds::None if self.running => {
@@ -285,13 +332,18 @@ impl Front {
                 self.running = true;
                 Want::Build
             }
-            Holds::Asked { .. } | Holds::Held => Want::Queue,
+            Holds::Held { serving: false, since: None } if self.plant != FrontPlant::Unbounded => {
+                self.holds = Holds::Held { serving: false, since: Some(now) };
+                Want::Queue
+            }
+            Holds::Asked { .. } | Holds::Held { .. } => Want::Queue,
+            Holds::Lost => Want::Refuse,
         }
     }
 
     /// Whether a task holds the front end for the program's needs, or the next build's will.
     pub(crate) fn is_held(&self) -> bool {
-        self.holds == Holds::Held
+        matches!(self.holds, Holds::Held { .. })
     }
 
     /// Whether a build was asked and has not held the front end yet.
@@ -299,9 +351,59 @@ impl Front {
         matches!(self.holds, Holds::Asked { .. })
     }
 
-    /// A build's link: the task after it serves the needs.
-    pub(crate) fn held(&mut self) {
-        self.holds = Holds::Held;
+    /// A build's link, at `now`: the task after it serves the needs. `waiting`: needs are
+    /// queued already, and [`SERVED_WITHIN`] runs for them from now.
+    pub(crate) fn held(&mut self, now: Duration, waiting: bool) {
+        let since = (waiting && self.plant != FrontPlant::Unbounded).then_some(now);
+        self.holds = Holds::Held { serving: false, since };
+        self.lost = None;
+    }
+
+    /// Whether the task after a build's answer of the program's checkout serves its needs
+    /// from the front end it holds: a link held it for them, or held one that was lost (the
+    /// checkout's later build kept a front end again, which serves the program on).
+    pub(crate) fn servable(&self) -> bool {
+        matches!(self.holds, Holds::Held { .. } | Holds::Lost)
+    }
+
+    /// The task after a build's answer started serving the needs ([`Front::servable`]):
+    /// nothing waits unserved, and nothing is lost.
+    pub(crate) fn serving(&mut self) {
+        if self.servable() {
+            self.holds = Holds::Held { serving: true, since: None };
+            self.lost = None;
+        }
+    }
+
+    /// The serving task handed the front end to a request that wants it (`Wanted`), at `now`:
+    /// the link still holds it for the task after that request's build. `waiting`: it handed
+    /// back needs not made, and [`SERVED_WITHIN`] runs for them from now.
+    pub(crate) fn handed_back(&mut self, now: Duration, waiting: bool) {
+        if let Holds::Held { .. } = self.holds {
+            let since = (waiting && self.plant != FrontPlant::Unbounded).then_some(now);
+            self.holds = Holds::Held { serving: false, since };
+        }
+    }
+
+    /// The front end a link held is lost: the store after the build's answer failed or
+    /// panicked (a panic while the task served from it too), or the front end was taken
+    /// before its task ran, so no task after that build will serve. Says whether the queued
+    /// needs are refused now, by `why`, as every later one is ([`Want::Refuse`]) until a link
+    /// holds a front end again. Nothing when no link holds it. Only the task that holds the
+    /// checkout's one kept front end says so, so a task serving is that task.
+    pub(crate) fn lost(&mut self, why: &str) -> bool {
+        if self.plant == FrontPlant::LeftOpen || !self.is_held() {
+            return false;
+        }
+        self.holds = Holds::Lost;
+        // Kept, not borrowed: every first call until the next link is refused by it.
+        self.lost = Some(why.to_owned());
+        true
+    }
+
+    /// Why the held front end was lost, while it is.
+    pub(crate) fn lost_why(&self) -> Option<&str> {
+        self.lost.as_deref()
     }
 
     /// The serving task ended with no request wanting the front end (`Detached`,
@@ -322,22 +424,29 @@ impl Front {
     }
 
     /// The time on the driver's clock: a build asked [`BUILD`] ago that never held the front
-    /// end is [`Refuse::Late`], and none holds it.
+    /// end is [`Refuse::Late`], and a need queued [`SERVED_WITHIN`] ago while a link held it
+    /// and no task took it is [`Refuse::Unserved`]; either way none holds it after.
     pub(crate) fn tick(&mut self, now: Duration) -> Option<Refuse> {
-        let Holds::Asked { at } = self.holds else { return None };
-        if self.plant == FrontPlant::NeverLate || now.saturating_sub(at) < BUILD {
-            return None;
+        match self.holds {
+            Holds::Asked { at } if self.plant != FrontPlant::NeverLate && now.saturating_sub(at) >= BUILD => {
+                self.holds = Holds::None;
+                Some(Refuse::Late)
+            }
+            Holds::Held { serving: false, since: Some(at) } if now.saturating_sub(at) >= SERVED_WITHIN => {
+                self.holds = Holds::None;
+                Some(Refuse::Unserved)
+            }
+            Holds::None | Holds::Asked { .. } | Holds::Held { .. } | Holds::Lost => None,
         }
-        self.holds = Holds::None;
-        Some(Refuse::Late)
     }
 
-    /// When [`Front::tick`] refuses next, if a build is asked: what its driver's wait is
-    /// bounded by.
+    /// When [`Front::tick`] refuses next, if a build is asked or a need waits unserved: what
+    /// its driver's wait is bounded by.
     pub(crate) fn due(&self) -> Option<Deadline> {
         match self.holds {
             Holds::Asked { at } => Some(Deadline::after(at, BUILD)),
-            Holds::None | Holds::Held => None,
+            Holds::Held { serving: false, since: Some(at) } => Some(Deadline::after(at, SERVED_WITHIN)),
+            Holds::None | Holds::Held { .. } | Holds::Lost => None,
         }
     }
 }

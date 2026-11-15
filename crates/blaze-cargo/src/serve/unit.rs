@@ -382,6 +382,10 @@ impl Steps for Real {
             .collect()
     }
 
+    fn lose_needs(&self, checkout: &str, why: &str) {
+        run::launch::lose_needs(&self.shared.launches, checkout, why);
+    }
+
     fn wake_needs(&self) {
         self.shared.launches.wake();
     }

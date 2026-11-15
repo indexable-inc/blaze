@@ -47,7 +47,7 @@ pub mod places;
 #[cfg(test)]
 mod tests;
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::{borrow::Cow, cell::Cell, collections::HashMap, fmt};
 
 use base_db::{
@@ -241,10 +241,6 @@ pub struct Lowered {
     /// which [`slot_of`] takes in place of parsing the crate's files: let go for a crate in
     /// the write that changes a file of its source root, its settings or its root's text.
     carried: blaze_hash::HashMap<Crate, code::OwnNarrow, Global>,
-    /// What a found record said each crate's image is filed under ([`Lowered::take_found`]),
-    /// let go as `carried` is, and whole when any file of the front end moves (a crate's plan
-    /// key covers every crate below it).
-    found: blaze_hash::HashMap<Crate, ContentId, Global>,
     /// How cargo passes each crate's root, which the build's naming of files reads and each
     /// crate's identity covers.
     spellings: std::sync::Arc<Spellings>,
@@ -668,7 +664,6 @@ pub fn lower_into<T: blaze_query::Tree>(
         library: blaze_hash::HashMap::new_in(Global),
         library_made: Vec::new(), // alloc: none
         carried: blaze_hash::HashMap::new_in(Global),
-        found: blaze_hash::HashMap::new_in(Global),
         spellings,
         appended: blaze_hash::HashMap::new_in(Global),
         loads,
@@ -1530,32 +1525,48 @@ impl Lowered {
     }
 
     /// Takes what the found record of `krate` (filed under its plan key, [`Lowered::plan_keys`])
-    /// says, before the crate is identified or served: the key its image is filed under
-    /// ([`Lowered::found_filed`]) and, unless a build script's run is applied to it or to a
-    /// crate below it (what a run gives is in no plan key), its own surface
+    /// says, before the crate is identified or served: unless a build script's run is applied
+    /// to it or to a crate below it (what a run gives is in no plan key), its own surface
     /// ([`Lowered::carry_own_surface`]: none of its files is parsed for it). Call
-    /// [`Lowered::give_surfaces`] after the last one. Both are let go in the write that
-    /// moves a file of the front end or applies a run below the crate.
-    pub fn take_found(
-        &mut self,
-        krate: Crate,
-        filed: ContentId,
-        own_surface: Option<&[u8]>,
-    ) -> Result<(), LowerError> {
-        self.found.insert(krate, filed);
+    /// [`Lowered::give_surfaces`] after the last one. It is let go in the write that moves a
+    /// file of the crate's source root or applies a run below the crate.
+    pub fn take_found(&mut self, krate: Crate, own_surface: Option<&[u8]>) -> Result<(), LowerError> {
         let Some(own) = own_surface else { return Ok(()) };
-        // alloc: once a find, a crate of the closure each
-        let mut seen = blaze_hash::HashMap::new_in(Global);
-        if runs_at_or_below(&self.graph, krate, &mut seen) {
+        if self.runs_at_or_below(krate) {
             return Ok(());
         }
         self.carry_own_surface(krate, own)
     }
 
-    /// What a found record said `krate`'s image is filed under ([`Lowered::take_found`]), while
-    /// no write moved it.
-    pub fn found_filed(&self, krate: Crate) -> Option<ContentId> {
-        self.found.get(&krate).copied()
+    /// What the found record of `krate` keeps of its surface: [`Lowered::own_surface`], or
+    /// None when a build script's run is applied to it or to a crate below it. The run's cfgs,
+    /// variables and files are under no plan key, so a surface made with them would make the
+    /// record a function of more than its key: two homes with other runs would write two
+    /// values under one found key (rule keys-cover-every-input), and the second is refused by
+    /// the machine's sealed layer both share. [`Lowered::take_found`] leaves it uncarried by
+    /// the same rule, so a writer and a reader never disagree on what the record may hold.
+    pub fn found_surface<A: Allocator + Clone>(&self, krate: Crate, alloc: A) -> Option<Vec<u8, A>> {
+        if self.runs_at_or_below(krate) {
+            return None;
+        }
+        let own = match self.carried.get(&krate) {
+            Some(own) => *own,
+            None => code::own_narrow(&self.db, krate),
+        };
+        if own.code.is_none() {
+            return None;
+        }
+        let kept = own.kept();
+        let mut bytes = Vec::with_capacity_in(kept.len(), alloc);
+        bytes.extend_from_slice(&kept);
+        Some(bytes)
+    }
+
+    /// [`runs_at_or_below`] of `krate`, asked alone: the one rule the found record's writer
+    /// ([`Lowered::found_surface`]) and reader ([`Lowered::take_found`]) both keep.
+    fn runs_at_or_below(&self, krate: Crate) -> bool {
+        let mut seen = blaze_hash::HashMap::new_in(Global);
+        runs_at_or_below(&self.graph, krate, &mut seen)
     }
 
     /// The files of `krate`'s source root under its package's directory, each by its path
@@ -2304,11 +2315,6 @@ impl Lowered {
                 !written.contains(krate)
                     && !krate.transitive_deps(db).iter().any(|below| written.contains(below))
             });
-            // And what a found record said its image is filed under: of the crate before.
-            self.found.retain(|krate, _| {
-                !written.contains(krate)
-                    && !krate.transitive_deps(db).iter().any(|below| written.contains(below))
-            });
             // In this run's batch: the crates given the run have other settings or files.
             self.give_surfaces();
         }
@@ -2424,9 +2430,6 @@ impl Lowered {
                 self.carried.retain(|krate, _| {
                     db.file_source_root(krate.data(&*db).root_file_id).source_root_id(&*db) != root
                 });
-                // A crate below moved too: its plan key, and so every found record above it,
-                // is another. What was found is let go whole; the next find asks again.
-                self.found.clear();
             }
             note(paths, db, load.set, &change);
         }

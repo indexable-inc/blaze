@@ -767,8 +767,15 @@ pub(crate) fn store(
     // image: the next front end reads the crate's impls from them and keys none. A crate
     // read from tables already writes nothing. One whose tables do not encode has none kept,
     // and every front end maintains its impls from its def map: said here, naming it.
-    let untabled = hir_ty::method_resolution::frozen::store(db, &imaged, images)
-        .map_err(|why| ApiError::new(why, Some(root.to_owned())))?; // alloc: error path
+    let untabled = hir_ty::method_resolution::frozen::store(db, &imaged, images).map_err(|why| {
+        ApiError::new(
+            format!(
+                "the impl tables (`hir_ty::method_resolution::frozen`) of the dependency crates \
+                 imaged, written for the build of {root}: {why}"
+            ),
+            Some(root.to_owned()),
+        )
+    })?;
     for (krate, why) in &untabled {
         tracing::warn!(
             target: "blaze",
@@ -783,8 +790,15 @@ pub(crate) fn store(
     // whose blocks declare one. One read from its record already writes nothing. One whose
     // record does not encode has none kept, and every build finds its kept roots from the
     // bodies whose text can say one: said here, naming it.
-    let unrecorded = hir_ty_codegen::v2::kept_record::store(db, &imaged, images)
-        .map_err(|why| ApiError::new(why, Some(root.to_owned())))?; // alloc: error path
+    let unrecorded = hir_ty_codegen::v2::kept_record::store(db, &imaged, images).map_err(|why| {
+        ApiError::new(
+            format!(
+                "the kept roots (`hir_ty_codegen::v2::kept_record`) of the dependency crates \
+                 imaged, written for the build of {root}: {why}"
+            ),
+            Some(root.to_owned()),
+        )
+    })?;
     for (krate, why) in &unrecorded {
         tracing::warn!(
             target: "blaze",
@@ -794,35 +808,35 @@ pub(crate) fn store(
         );
     }
     stage("the kept roots of a dependency crate");
-    // Each found record, now that what was put under the filed key is known: the image's
-    // families as `hir_def::deps::store` wrote them, and the impl tables unless they did not
-    // encode. A record that will not encode is a bug of the lowering's (a path not under the
-    // package): said, naming the crate, and the build's store stops (no record half-said).
-    if let Some(stored) = &stored {
-        use hir_def::deps::found::{Found, family};
+    // Each found record: of what its plan key covers alone (`hir_def::deps::found`), so every
+    // home that writes it writes the same bytes; the surface is left out of a crate a build
+    // script's run applies to ([`Lowered::found_surface`]). A record that will not encode is a
+    // bug of the lowering's (a path not under the package), and one the store refuses is a
+    // key that misses an input (rule keys-cover-every-input): each said naming the record's
+    // kind, its crate and its writer, and the build's store stops (no record half-said).
+    if !found_keys.is_empty() {
+        use hir_def::deps::found::{Found, LAYOUT};
+        let front = front_end()?;
         for &(krate, key) in &found_keys {
-            let Some(&filed) = stored.filed.get(&krate) else { continue };
-            let tables = match untabled.iter().any(|(it, _)| *it == krate) {
-                true => 0,
-                false => family::IMPL_TABLES,
+            // Said only when the record is refused: the crate, its kind and its writer.
+            let named = || {
+                format!(
+                    "the found record (`hir_def::deps::found`, layout {LAYOUT}) of dependency crate {}, \
+                     under {key:?}, written by front end {front:?} for the build of {root}",
+                    krate.named(db)
+                )
             };
-            let named = || format!("{}", krate.named(db)); // alloc: error path
             let files = lowered.found_files(krate).ok_or_else(|| {
                 ApiError::new(
-                    format!("the crate {} has a plan key and no files the lowering planned", named()),
+                    format!("{}: the crate has a plan key and no files the lowering planned", named()),
                     Some(root.to_owned()),
                 )
             })?;
-            let bytes = Found::new(filed, stored.families | tables, lowered.own_surface(krate), files)
+            let bytes = Found::new(lowered.found_surface(krate, Global), files)
                 .and_then(|found| found.encode())
-                .map_err(|why| {
-                    ApiError::new(
-                        format!("the found record of the crate {}: {why}", named()),
-                        Some(root.to_owned()),
-                    )
-                })?;
+                .map_err(|why| ApiError::new(format!("{}: {why}", named()), Some(root.to_owned())))?;
             ImageStore::put(images, key, bytes)
-                .map_err(|why| ApiError::new(why, Some(root.to_owned())))?;
+                .map_err(|why| ApiError::new(format!("{}: {why}", named()), Some(root.to_owned())))?;
         }
     }
     stage("the found record of a dependency crate");
@@ -955,7 +969,7 @@ pub(crate) fn find(lowered: &mut Lowered, store: &blaze_cas::Reader) -> Result<(
             )
         })?;
         lowered
-            .take_found(krate, found.filed(), found.own_surface())
+            .take_found(krate, found.own_surface())
             .map_err(super::lower_error)?;
         hits += 1;
     }
