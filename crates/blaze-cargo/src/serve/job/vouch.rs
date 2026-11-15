@@ -18,6 +18,8 @@
 //! No IO, no clock: the driver asks the looks and the read and tells their outcomes. The read's
 //! hash is no step of the loop's ([`Hashes`]): a worker's, told back as the read is.
 
+use std::alloc::Allocator;
+
 use blaze_core::Stamp;
 use blaze_graph::pool::Class;
 use blaze_ids::ContentId;
@@ -54,7 +56,13 @@ impl Hashes {
     /// The bytes vouch `serial` read, hashed as the output's key is made with `wanted` the
     /// key placed ([`super::certify::content_of`]), under `span`, the vouch's; told back
     /// through [`Hashes::back`].
-    pub(super) fn hash(&mut self, serial: u32, bytes: Vec<u8>, wanted: ContentId, span: Option<tracing::Span>) {
+    pub(super) fn hash<A: Allocator + Send + 'static>(
+        &mut self,
+        serial: u32,
+        bytes: Vec<u8, A>,
+        wanted: ContentId,
+        span: Option<tracing::Span>,
+    ) {
         self.out += 1;
         // clone: a channel's sender, once a hash
         let send = self.send.clone();

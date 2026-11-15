@@ -5087,7 +5087,7 @@ impl<S: Steps> Jobs<S> {
             store_heard: Duration::ZERO,
             commit_steps: 0,
             recheck: None,
-            vouching: Vec::new(), // alloc: none until an output is placed inside its racy window
+            vouching: Vec::new_in(Global),
             next_vouch: 0,
             vouch_hashes: vouch::Hashes::new(),
         })
@@ -8416,7 +8416,7 @@ impl<S: Steps> Jobs<S> {
         let mut last = vec![u32::MAX; all.len()]; // alloc: once per build
         let fresh_units = vec![None; all.len()]; // alloc: once per build
         let verdicts = vec![Verdict::Unsettled; all.len()]; // alloc: once per build
-        let moved = vec![false; all.len()]; // alloc: once per build
+        let moved = vec![false; all.len()];
         let mut units_of = Vec::new(); // alloc: once per build, a unit a node
         // Each package's `name version` by its id, what a node is named by.
         let mut packages = HashMap::new_in(Global); // alloc: once per build, a package an entry
@@ -9609,7 +9609,6 @@ impl<S: Steps> Jobs<S> {
         let Some(vouch) = vouch::Vouch::of(path, key.0, placed.stamp, placed.looked_ns) else { return };
         let serial = self.next_vouch;
         self.next_vouch = self.next_vouch.wrapping_add(1);
-        // alloc: one entry a path placed inside its window, until vouched for
         self.vouching.push(Vouching { serial, vouch, parked: false, span: None });
         self.vouch_wait(w, serial);
     }
@@ -9660,7 +9659,6 @@ impl<S: Steps> Jobs<S> {
         if !self.idle() || !self.vouching.iter().any(|it| it.parked) {
             return;
         }
-        // alloc: the serials parked, once a winding up with one
         let parked: Vec<u32> = self.vouching.iter_mut().filter(|it| it.parked).map(|it| {
             it.parked = false;
             it.serial
@@ -9691,7 +9689,6 @@ impl<S: Steps> Jobs<S> {
                 Ok(tag) if next == vouch::Next::Look => {
                     let mut files = blaze_core::Names::with_capacity(1, file.as_str().len() + 1);
                     files.push(&file);
-                    // alloc: the effect's batch of one name, once a look
                     Ok(Effect::Stamp { files: Arc::new(files), tag })
                 }
                 Ok(tag) => Ok(Effect::ReadAll { file, tag }),

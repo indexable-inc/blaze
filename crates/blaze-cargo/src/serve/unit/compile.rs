@@ -54,7 +54,7 @@ pub(super) mod doctest;
 )]
 pub(super) mod parts;
 
-use std::{fmt, sync::Arc};
+use std::{alloc::Allocator, fmt, sync::Arc};
 
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
 use blaze_cas::{Key, Kind};
@@ -1331,7 +1331,6 @@ fn file_record(
         && let Some(reach) = places.reach(&bytes)
     {
         let why = || {
-            // alloc: once per record tied
             "its record names a directory of the build where no path starts (a diagnostic, a variable its program is run with)".to_owned()
         };
         tie = match tie {
@@ -1427,10 +1426,16 @@ pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
     // The workspace's root too: one `BLAZE_HOME`'s ledger holds every workspace's units, and a
     // registry crate's package id is the same in each (rule 21).
     subject_among(&job.input.config.invocation.root, u, &job.units().graph.units)
+        .map_err(|why| format!("encoding what unit `{}` is: {why}", span_unit(u)))
 }
 
-/// [`unit_subject`] of `u`, one of `units`, in the workspace at `workspace`.
-pub(super) fn subject_among(workspace: &str, u: &Unit, units: &[Unit]) -> Result<ContentId, String> {
+/// [`unit_subject`] of `u`, one of `units`, in the workspace at `workspace`; the error is the
+/// encoding's.
+pub(super) fn subject_among(
+    workspace: &str,
+    u: &Unit,
+    units: &[Unit],
+) -> Result<ContentId, blaze_protocol::cbor::Error> {
     let named = (
         workspace,
         &u.pkg_id,
@@ -1453,8 +1458,7 @@ pub(super) fn subject_among(workspace: &str, u: &Unit, units: &[Unit]) -> Result
     let twinned = !TWINS_UNTOLD.get()
         && units.iter().any(|other| !std::ptr::eq(other, u) && alike(other));
     let told = twinned.then_some((&u.features, &u.profile));
-    let bytes = blaze_protocol::cbor::to_vec(&(named, told))
-        .map_err(|why| format!("encoding what unit `{}` is: {why}", span_unit(u)))?;
+    let bytes = blaze_protocol::cbor::to_vec(&(named, told))?;
     Ok(Hasher::new(SUBJECT).part(&bytes).finish())
 }
 
@@ -2706,14 +2710,11 @@ fn share(job: &Job, unit: usize, compiled: &mut Compiled) -> Result<Vec<Put>, Ap
         // `Kind::Output` or, a linked image's recipe, `Kind::Derived`), which a direct read
         // does not say: it moves once `blaze_cas::direct` answers with the header's kind.
         match job.input.store.get(&blaze_cas::enter(), key) {
-            // alloc: a copy for the layer, once per value of a sealed unit an earlier build made
             Ok(Some(it)) => Ok(Put { key: *key, kind: it.kind, bytes: it.bytes.to_vec() }),
-            // alloc: an error, once
             Ok(None) => Err(ApiError::new(
                 format!("unit {unit}'s {what} is neither made now nor in the store"),
                 None,
             )),
-            // alloc: an error, once
             Err(corrupt) => Err(ApiError::new(format!("unit {unit}'s {what}: {corrupt}"), None)),
         }
     };
@@ -2724,7 +2725,6 @@ fn share(job: &Job, unit: usize, compiled: &mut Compiled) -> Result<Vec<Put>, Ap
         }
         let put = match compiled.puts.iter().position(|it| it.key == output.key) {
             Some(at) => compiled.puts.remove(at),
-            // alloc: the error's text, once
             None => read(&output.key, &format_args!("output {}", output.path))?,
         };
         share.push(put);
@@ -2742,8 +2742,8 @@ fn share(job: &Job, unit: usize, compiled: &mut Compiled) -> Result<Vec<Put>, Ap
 /// the machine's layer whole without any home's records ([`share`]). Bounded as the store
 /// bounds a chain ([`blaze_cas::derived::CHAIN_MOST`]), a chain a value; a recipe that does
 /// not read, or a chain past the bound, is the error naming it.
-pub(super) fn with_bases(
-    share: &mut Vec<Put>,
+pub(super) fn with_bases<A: Allocator>(
+    share: &mut Vec<Put, A>,
     mut base_of: impl FnMut(&Key) -> Result<Put, ApiError>,
 ) -> Result<(), ApiError> {
     let most = blaze_cas::derived::CHAIN_MOST as usize * share.len();
@@ -2755,14 +2755,12 @@ pub(super) fn with_bases(
             continue;
         }
         let base = blaze_cas::derived::decode(&put.bytes).map(|recipe| recipe.base).map_err(|why| {
-            // alloc: an error, once
             ApiError::new(format!("the recipe {:?} of a sealed unit: {why}", put.key), None)
         })?;
         if share.iter().any(|it| it.key == base) {
             continue;
         }
         if share.len() >= most {
-            // alloc: an error, once
             let what = format!(
                 "the recipe {:?} of a sealed unit is made from a chain of more than {} bases",
                 share[at - 1].key,
@@ -3801,7 +3799,7 @@ fn store(
                 if let Some((why, reach)) = written.tied(&places)
                     && (tie.is_none() || reach == portable::Tied::Here)
                 {
-                    tie = Some((format!("its output {path}: {why}"), reach)); // alloc: once per record tied
+                    tie = Some((format!("its output {path}: {why}"), reach));
                 }
             }
             let key = match written {
