@@ -11,7 +11,10 @@ description: "How blaze tests its own code, the one home for it: few tests, each
 
 A causal claim (this change caused the regression, this lock causes the convoy, this index makes it
 fast) is tested by removing the cause and watching the effect go, not by checking that its premises
-hold. Pin a load-bearing one with a test named for the property.
+hold. Pin a load-bearing one with a test named for the property. Run the control before the claim is
+written anywhere, the pull request included: the same steps on the same machine state with the
+binary from before the fix. When the old binary no longer shows the effect, the reproduction is
+gone; say so, and rest the claim on the tests of the mechanism alone.
 
 ## persisted-state-round-trips (rule 26)
 

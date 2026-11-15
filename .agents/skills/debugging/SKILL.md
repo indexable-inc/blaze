@@ -36,7 +36,12 @@ program itself prints, a generator's last line saying what it wrote; the absence
 evidence of nothing, and a check, a row or a gate step that can succeed having run nothing is a bug
 to fix where it is found (`blaze test` refuses a run of no test; a harness row goes through
 harness/v2/ran.py). When the evidence is lost or the tool could not run, say that, not the
-conclusion you expected.
+conclusion you expected. Read raw output before a filtered copy: save what a command printed to a
+file, filter only with patterns anchored to the lines they drop, and say that something is missing
+(a row, a step, a line) only after reading the raw file; an unanchored `grep -v` once deleted the
+rows it was then reported a tool had not printed. A date is a claim too: say when something will
+work only with the measured run that date rests on, and otherwise name the run that will give the
+number.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 
