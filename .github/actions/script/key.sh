@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # The cache key of the repository's built scripts (scripts/, docs/v2/plan/design/scripts.md):
-# prints `scripts-<os>-<arch>-<blaze version>-<sha256>`, run from the checkout's top. No
+# prints `scripts-<os>-<arch>-cargo-<nightly>-<sha256>`, run from the checkout's top. No
 # argument, and it reads only the files below, so the `changes` job's sparse checkout has them.
 #
 # Why the key covers every input of what `build.sh` makes (AGENTS.md keys-cover-every-input):
-# the binaries are what the pinned release builds from these, and nothing else is read:
-# - the compiler: .github/blaze-version (the release, with its own toolchain; rule own-nightly),
-#   harness/toolchain (the nightly blaze pins), and the runner's OS and architecture;
+# the binaries are what cargo with the pinned nightly builds from these, and nothing else is read:
+# - the compiler: harness/toolchain (the nightly, which build.sh's cargo runs), and the runner's
+#   OS and architecture;
 # - the sources: every file under scripts/ and crates/blaze-script/, by content;
 # - the dependencies: the Cargo.lock blocks of the scripts package's whole dependency closure
 #   (name, version, registry and checksum, so each crate's source is fixed by its checksum); a
@@ -27,7 +27,7 @@ set -euo pipefail
 sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
 die() { echo "::error::$*" >&2; echo "key.sh: $*" >&2; exit 1; }
 
-for need in .github/blaze-version harness/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-script/Cargo.toml; do
+for need in harness/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-script/Cargo.toml; do
   [ -f "$need" ] || die "no $need in $(pwd -P): run from the checkout's top, with this file checked out"
 done
 export LC_ALL=C
@@ -82,7 +82,7 @@ manifest=$(awk -v direct=" $direct " '
   { print }' Cargo.toml)
 
 digest=$({
-  printf 'blaze-version %s\n' "$(cat .github/blaze-version)"
+  printf 'builder cargo\n'
   printf 'toolchain %s\n' "$(cat harness/toolchain)"
   printf 'host %s %s\n' "$(uname -s)" "$(uname -m)"
   printf 'checkout %s\n' "$(pwd -P)"
@@ -93,4 +93,4 @@ digest=$({
   printf '%s\n' "$closure" "$manifest"
   cat .cargo/config.toml
 } | sha | cut -d' ' -f1)
-echo "scripts-$(uname -s)-$(uname -m)-$(cat .github/blaze-version)-$digest"
+echo "scripts-$(uname -s)-$(uname -m)-cargo-$(cat harness/toolchain)-$digest"

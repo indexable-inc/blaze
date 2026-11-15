@@ -57,6 +57,9 @@ ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "harness" / "known-failures.toml"
 type Profile = Literal["dev", "release"]
 type Os = Literal["linux", "macos", "windows"]
+# What compiled the tests: blaze (blaze builds blaze) or cargo with the pinned nightly (CI's
+# required tests while blaze's self-build does not fit a runner; docs/contributing.md).
+type Builder = Literal["blaze", "cargo"]
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 # The binary of a `Running` line: `Running unittests src/lib.rs (target/debug/deps/x-<hash>)`,
@@ -316,8 +319,9 @@ def test_binaries(root: Path = ROOT) -> dict[str, list[str]]:
 
 OSES: tuple[Os, ...] = ("linux", "macos", "windows")
 PROFILES: tuple[Profile, ...] = ("dev", "release")
+BUILDERS: tuple[Builder, ...] = ("blaze", "cargo")
 ENTRY_KEYS = {"cause", "only"}
-ONLY_KEYS = {"profile", "os"}
+ONLY_KEYS = {"profile", "os", "builder"}
 # `[crates.<package>] "*"`: no test binary of the package runs (its test build fails).
 NOT_RUN = "*"
 # `[crates.<package>] "<binary>::*"`: the binary does not finish.
@@ -328,6 +332,7 @@ UNFINISHED = "::*"
 class Context:
     profile: Profile
     os: Os
+    builder: Builder = "blaze"
 
 
 @dataclass(frozen=True)
@@ -339,6 +344,8 @@ class Entry:
     profile: Profile | None = None
     # The OSes it holds for, sorted; None is all.
     oses: tuple[Os, ...] | None = None
+    # What compiled the tests it holds for; None is either.
+    builder: Builder | None = None
 
     @property
     def binary(self) -> str:
@@ -353,13 +360,17 @@ class Entry:
         return self.test.endswith(UNFINISHED) and self.test.count("::") == 1
 
     def applies(self, context: Context) -> bool:
-        return self.profile in (None, context.profile) and (self.oses is None or context.os in self.oses)
+        return (
+            self.profile in (None, context.profile)
+            and (self.oses is None or context.os in self.oses)
+            and self.builder in (None, context.builder)
+        )
 
     @property
     def only(self) -> str:
         said = ([f"profile {self.profile}"] if self.profile else []) + (
             [f"os {' or '.join(self.oses)}"] if self.oses is not None else []
-        )
+        ) + ([f"builder {self.builder}"] if self.builder else [])
         return ", ".join(said)
 
 
@@ -398,6 +409,7 @@ def load_baseline(path: Path, targets: dict[str, list[str]]) -> list[Entry]:
             only_raw = entry.get("only", {})
             profile: Profile | None = None
             oses: tuple[Os, ...] | None = None
+            builder: Builder | None = None
             if not isinstance(only_raw, dict):
                 problems.append(f"{where}: `only` is a table")
             else:
@@ -422,6 +434,15 @@ def load_baseline(path: Path, targets: dict[str, list[str]]) -> list[Entry]:
                         oses = tuple(sorted(set(cast(list[Os], named))))
                     else:
                         problems.append(f"{where}: `only.os = {only['os']!r}` is not one or a list of {OSES}")
+                if "builder" in only:
+                    if only["builder"] == "blaze":
+                        builder = "blaze"
+                    elif only["builder"] == "cargo":
+                        builder = "cargo"
+                    else:
+                        problems.append(
+                            f"{where}: `only.builder = {only['builder']!r}` is not one of {BUILDERS}"
+                        )
             if test != NOT_RUN:
                 if "::" not in test:
                     problems.append(f"{where} is not `<binary>::<test>`, `<binary>::*` or `*`")
@@ -432,7 +453,7 @@ def load_baseline(path: Path, targets: dict[str, list[str]]) -> list[Entry]:
                         f"belongs to {', '.join(owners)}" if owners else "is no test binary of the workspace"
                     )
                     problems.append(f"{where}: the binary `{binary}` {said}, not {crate}")
-            entries.append(Entry(crate, test, str(cause), profile, oses))
+            entries.append(Entry(crate, test, str(cause), profile, oses, builder))
     if problems:
         raise Refused(f"{path} does not hold together:\n  " + "\n  ".join(problems))
     return entries
@@ -457,8 +478,9 @@ HEADER = """\
 #   cause  one line: what fails and why, as far as it is known. `unittests.py` with
 #          `{"record": true}` writes the first line of the failure where the entry is new, and
 #          keeps the cause of an entry that was here;
-#   only   optional, { profile = "dev"|"release", os = "linux"|"macos"|"windows" or a list of them }:
-#          the entry holds only for such a run, and is unchecked by others.
+#   only   optional, { profile = "dev"|"release", os = "linux"|"macos"|"windows" or a list of them,
+#          builder = "blaze"|"cargo" }: the entry holds only for such a run (builder: what
+#          compiled the tests), and is unchecked by others.
 # `[recorded]` is the last run this list was written from: python3 harness/unittests.py '{"record": true}'
 """
 
@@ -487,6 +509,8 @@ def render(entries: Iterable[Entry], recorded: dict[str, str]) -> str:
             if entry.oses is not None:
                 oses = [_toml_string(it) for it in entry.oses]
                 only.append(f"os = {oses[0]}" if len(oses) == 1 else f"os = [{', '.join(oses)}]")
+            if entry.builder is not None:
+                only.append(f"builder = {_toml_string(entry.builder)}")
             said = f"cause = {_toml_string(entry.cause)}" + (
                 f", only = {{ {', '.join(only)} }}" if only else ""
             )
@@ -807,7 +831,7 @@ def recorded(
             after.add(context.os)
         if after:
             oses = None if after == set(OSES) else tuple(sorted(after))
-            keep(Entry(entry.crate, entry.test, entry.cause, entry.profile, oses))
+            keep(Entry(entry.crate, entry.test, entry.cause, entry.profile, oses, entry.builder))
 
     def new(crate: str, test: str, cause: str) -> None:
         had = out.get((crate, test))
@@ -818,7 +842,8 @@ def recorded(
         profile = had.profile if had.profile == context.profile else None
         named = {*(had.oses if had.oses is not None else OSES), context.os}
         oses = None if named == set(OSES) else cast(tuple[Os, ...], tuple(sorted(named)))
-        keep(Entry(crate, test, had.cause, profile, oses))
+        builder = had.builder if had.builder == context.builder else None
+        keep(Entry(crate, test, had.cause, profile, oses, builder))
 
     for test in verdict.new:
         owners = targets.get(test.binary, [])
@@ -1022,6 +1047,14 @@ def selftest() -> None:
         listed, results({"a::fails": "ok", "b::t": "ok", "c::t": "ok"}), linux, asked, binaries
     ).fixed
     assert compare(listed, ran, macos, asked, binaries).fixed, "a::mac passes on macOS: take it out"
+    # An entry for blaze's builds excuses nothing in a cargo run and is unchecked there, so a test
+    # that fails only when blaze compiles it may pass under cargo.
+    by_blaze = [*listed, Entry("pkg-a", "a::ok", "blaze's", None, None, "blaze")]
+    cargo = Context("release", "linux", "cargo")
+    assert compare(by_blaze, ran, linux, asked, binaries).fixed, "a::ok passes under blaze: take it out"
+    under_cargo = compare(by_blaze, ran, cargo, asked, binaries)
+    assert not under_cargo.failed and "only for builder blaze" in under_cargo.unchecked, under_cargo
+    assert recorded(by_blaze, ran, cargo, asked, targets, binaries)[-1].builder == "blaze"
     crashed = results({"a::fails": "failed", "c::t": "ok"}, unfinished=("b",))
     assert [b.name for b in compare(listed, crashed, linux, asked, binaries).crashed] == ["b"]
     assert compare(listed, results({"a::fails": "failed", "b::t": "ok"}), linux, asked, binaries).not_run == [
@@ -1068,9 +1101,11 @@ def selftest() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "known-failures.toml"
-        text = render(after, {"tree": "t", "os": "linux"})
+        text = render([*after, Entry("pkg-a", "a::ok", "blaze's", None, ("linux",), "blaze")], {"tree": "t", "os": "linux"})
         path.write_text(text)
-        assert load_baseline(path, targets) == after
+        assert load_baseline(path, targets) == sorted(
+            [*after, Entry("pkg-a", "a::ok", "blaze's", None, ("linux",), "blaze")], key=lambda e: (e.crate, e.test)
+        )
         assert render(load_baseline(path, targets), {"os": "linux", "tree": "t"}) == text
     assert first_line(
         ["", "thread 'a::b' (123) panicked at crates/x/src/lib.rs:10:5:", "assertion failed: x"]

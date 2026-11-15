@@ -5,7 +5,7 @@ usage: unittests.py [CONFIG]
 
 CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` when left out:
 
-    {"build": false, "record": false, "reached": false, "args": ["<test argument>", ...], "max_mb": 0, "at_least": 1}
+    {"builder": "cargo", "build": false, "record": false, "reached": false, "args": ["<test argument>", ...], "max_mb": 0, "at_least": 1}
 
 Runs `blaze test --release --locked --no-fail-fast --workspace` from the root: every package of
 the workspace with its default features (blaze tests blaze, AGENTS.md rule blaze-builds-blaze),
@@ -34,6 +34,16 @@ workspace is keyed by its features, by whether it is of a package named, `CARGO_
 and by the keys of the crates it is built on), and the tests job takes those from the store the
 build job hands it (.github/workflows/blaze-platform.yaml). Only the crates built with
 `cfg(test)` are then compiled again.
+
+`"builder"` is what builds and runs the tests: `"cargo"`, the default for now, runs `cargo
++<harness/toolchain> test --release --locked --no-fail-fast --workspace` with every package rustc
+cannot compile left out (blaze-std and what is built on it), since blaze's build of its own
+workspace does not fit a runner yet (it passed 120 GB of a 128 GB machine on 2026-11-15;
+docs/contributing.md, "CI"); `"blaze"` runs `blaze test` as above. A cargo run is held to the
+entries of the list that hold for a cargo build (`only.builder`); blaze's `--events FORMAT` among
+`args` is dropped from it, and it takes no `reached`. Its `build` is stage 0, `cargo build
+--release --locked -p blaze-engine --bin blaze --bin blaze-engine` into target/release, what CI's
+build job packs.
 
 `at_least` is the fewest tests the run has to have run (1 without it; the gate may say more): a
 run that ran fewer fails whatever its exit status and whatever the list says, since a run of no
@@ -247,6 +257,8 @@ def read(proc, seen, failed, kept):
 
 @dataclasses.dataclass(frozen=True)
 class Config:
+    # What builds and runs the tests: `blaze test`, or cargo with the pinned nightly.
+    builder: str = "cargo"
     # `blaze build` of what the tests are built on, and no tests: CI's build job.
     build: bool = False
     # Write harness/known-failures.toml again from the run, instead of holding the run to it.
@@ -259,6 +271,42 @@ class Config:
     max_mb: int = 0
     # The fewest tests the run has to have run: a run of fewer is a failure, never a pass.
     at_least: int = 1
+
+
+# The package rustc cannot compile: blaze's own standard library, written in blaze's syntax
+# (decision D25). A cargo run leaves it and every package of the workspace built on it out.
+BLAZE_ONLY = "blaze-std"
+
+
+def blaze_only(toolchain):
+    """`BLAZE_ONLY` and the packages of the workspace that depend on it, from `cargo metadata`."""
+    said = subprocess.run(
+        ["cargo", f"+{toolchain}", "metadata", "--format-version", "1", "--no-deps", "--locked"],
+        cwd=ROOT, capture_output=True, text=True, timeout=300,
+    )
+    if said.returncode:
+        sys.exit(f"unittests.py: cargo metadata failed:\n{said.stderr}")
+    deps = {p["name"]: {d["name"] for d in p["dependencies"] if d.get("path")} for p in json.loads(said.stdout)["packages"]}
+    if BLAZE_ONLY not in deps:
+        sys.exit(f"unittests.py: {BLAZE_ONLY} is no package of the workspace: take BLAZE_ONLY out")
+    out = {BLAZE_ONLY}
+    while grown := {name for name, on in deps.items() if name not in out and on & out}:
+        out |= grown
+    return sorted(out)
+
+
+def cargo_args(args):
+    """`args` for cargo: blaze's `--events FORMAT` (its progress as events, which cargo has no
+    form of) dropped, and said so."""
+    out, it = [], iter(args)
+    for arg in it:
+        if arg == "--events":
+            print(f"`--events {next(it, '')}` is blaze's: left out of the cargo run", flush=True)
+        elif arg.startswith("--events="):
+            print(f"`{arg}` is blaze's: left out of the cargo run", flush=True)
+        else:
+            out.append(arg)
+    return out
 
 
 def config(argv: list[str]) -> Config:
@@ -282,6 +330,10 @@ def config(argv: list[str]) -> Config:
             sys.exit(f"unittests.py: `{key}` is a {hints[key].__name__}, not {json.dumps(item)}")
     if not all(isinstance(it, str) for it in value.get("args", [])):
         sys.exit("unittests.py: `args` is a list of strings")
+    if value.get("builder", "cargo") not in ("blaze", "cargo"):
+        sys.exit("unittests.py: `builder` is \"blaze\" or \"cargo\"")
+    if value.get("builder", "cargo") == "cargo" and value.get("reached"):
+        sys.exit("unittests.py: a cargo run takes no `reached`, which is blaze's")
     if value.get("at_least", 1) < 1:
         sys.exit("unittests.py: `at_least` is 1 or more: a run that may run no test checks nothing")
     return Config(**value)
@@ -295,9 +347,27 @@ def main():
     if cfg.record and cfg.reached:
         sys.exit("unittests.py: `record` writes the list from every test, so it takes no `reached`")
     verb = ["build"] if cfg.build else ["test", "--no-fail-fast", *(["--reached"] if cfg.reached else [])]
-    command = ["blaze", *verb, "--release", "--locked", "--workspace", *args]
+    left_out = []
+    if cfg.builder == "cargo":
+        with open(os.path.join(ROOT, "harness", "toolchain")) as f:
+            toolchain = f.read().strip()
+        args = cargo_args(args)
+        if cfg.build:
+            command = ["cargo", f"+{toolchain}", "build", "--release", "--locked", "-p", "blaze-engine", "--bin", "blaze", "--bin", "blaze-engine", *args]
+        else:
+            left_out = blaze_only(toolchain)
+            print(f"left out of the cargo run, as rustc cannot compile them: {', '.join(left_out)}", flush=True)
+            excluded = [arg for name in left_out for arg in ("--exclude", name)]
+            command = ["cargo", f"+{toolchain}", "test", "--release", "--locked", "--no-fail-fast", "--workspace", *excluded, *args]
+    else:
+        command = ["blaze", *verb, "--release", "--locked", "--workspace", *args]
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
-    env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
+    # cargo's is target/cargo, as .github/actions/blaze's stage 0 has it: blaze writes
+    # target/release in a format cargo refuses ("found invalid metadata files"), and an ix
+    # runner's snapshot keeps it.
+    env = {**os.environ, "CARGO_TARGET_DIR": os.path.join(ROOT, "target", *(["cargo"] if cfg.builder == "cargo" else []))}
+    if cfg.builder != "cargo":
+        env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
     # blaze's frames are larger than rustc's, and blaze-diagnostics' 5204-arm test overflows the
     # 2 MiB a test thread has, which aborts its whole program
     # (https://github.com/indexable-inc/blaze/issues/894). Not a `--skip`: an argument to the
@@ -319,10 +389,18 @@ def main():
     over = cfg.max_mb and watch.at_peak and watch.peak > cfg.max_mb
     if over:
         print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb; docs/memory-budget.md)")
+    if cfg.build and cfg.builder == "cargo" and not status:
+        # Where CI's build job packs it from (target/release), and the jobs after it run it.
+        os.makedirs(os.path.join(ROOT, "target", "release"), exist_ok=True)
+        for name in ("blaze", "blaze-engine"):
+            # A blaze build's output there may be a read-only clone of its store's file.
+            if os.path.lexists(placed := os.path.join(ROOT, "target", "release", name)):
+                os.remove(placed)
+            shutil.copy2(os.path.join(env["CARGO_TARGET_DIR"], "release", name), os.path.join(ROOT, "target", "release", name))
     if cfg.build:
         sys.exit(status or (1 if over else 0))
-    context = failures.Context("release", failures.this_os())
-    asked = failures.workspace_packages()
+    context = failures.Context("release", failures.this_os(), "cargo" if cfg.builder == "cargo" else "blaze")
+    asked = [it for it in failures.workspace_packages() if cfg.builder != "cargo" or it not in left_out]
     logged = failures.Path(log)
     # What the run was expected to run, held before anything reads its failures: a run of no
     # test, or of fewer than asked for, has none to hold to the list.
