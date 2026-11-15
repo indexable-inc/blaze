@@ -536,6 +536,14 @@ fn looked_as(kind: LookKind) -> Looked {
 /// linker's digest (`linked_key`). Both are functions of the bytes alone.
 pub(super) fn content_of(bytes: &[u8], wanted: Option<ContentId>) -> ContentId {
     use super::super::unit::{linked_key, output_key};
+    // An image is wanted by its linked key: that hash first, so the whole one is made only
+    // where it is not the one wanted (each is a pass over the file: 40 ms of a 158 MB one).
+    if wanted.is_some() && bytes.starts_with(b"\x7fELF") {
+        let linked = linked_key(&blaze_link::digest::Digest::of(bytes).root()).0;
+        if wanted == Some(linked) {
+            return linked;
+        }
+    }
     let whole = output_key(bytes).0;
     if wanted == Some(whole) || wanted.is_none() {
         return whole;
