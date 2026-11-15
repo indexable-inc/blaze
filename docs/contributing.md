@@ -234,7 +234,7 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   simulation test (`blaze_sim::check`) whose oracle checks the invariant, with a planted bug it
   catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
-  you did not run. CI's merge gate is the build and the unit tests on Linux AArch64 (on ix runners), and
+  you did not run. CI's merge gate is the build and the unit tests on Linux AArch64 (on ix runners, [CI](#ci)), and
   `blaze check --workspace` with the released blaze on Linux AArch64 and macOS, with astlog's
   rules after it (`tools/astlog/README.md`), and the lint baselines held by the blaze the
   change builds ([cargo.md](cargo.md#lints)); every
@@ -243,10 +243,9 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   main after the merge, and a red train opens or adds to the issue "Release train is red",
   with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
   change through is not the harnesses passing on it.
-- blaze builds blaze, never cargo or rustc: with the release `.github/blaze-version` names as
-  stage 0 (`sh site/install.sh --version "$(cat .github/blaze-version)"`, as
-  `.github/actions/blaze` installs it), `blaze build --release --locked -p blaze-engine`, against
-  the LLVM blaze pins and fetches itself ([LLVM](#llvm)).
+- blaze builds blaze: with stage 0 (the tree's blaze built by cargo, [rust-analyzer](#rust-analyzer);
+  no release builds today's tree, [CI](#ci)), `blaze build --release --locked -p blaze-engine`,
+  against the LLVM blaze pins and fetches itself ([LLVM](#llvm)).
 - `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
   `blaze test --release --locked -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
@@ -401,6 +400,24 @@ writing to `.git/land/pr-N.log` in the main checkout; `land.py '{"follow": true}
 polls GitHub by hand. Once it has merged, GitHub deletes the branch on origin;
 remove the worktree and the local branch
 (`git worktree remove <dir> && git branch -D <branch>`).
+
+## CI
+
+CI bootstraps as a compiler does. `.github/actions/blaze` builds stage 0, the tree's blaze, with
+cargo and the pinned nightly against the pinned LLVM, and puts it on PATH for every job but those
+that test the release itself (release.yaml, install.yaml); no release builds today's tree
+(0.20261105.4, the last, cannot compile crates/blaze-std). The repository's scripts are built by
+cargo too (`.github/actions/script`). `harness/unittests.py` builds and runs the unit tests with
+cargo by default (`"builder": "cargo"`): every package rustc compiles, so not blaze-std and what is
+built on it, held to the entries of `harness/known-failures.toml` that hold for a cargo build;
+its `build` is stage 0 into target/release, what the build job packs. cargo's target directory in
+CI is target/cargo: blaze writes target/release in a form cargo refuses.
+
+So CI runs no blaze-built blaze for now: blaze's build of its own workspace passed 120 GB of a
+128 GB machine on 2026-11-15 and was killed. It comes back as a job of its own that `ci` does not
+wait on, with its wall time and peak memory in view, once CI's workflows can be
+changed for it, and the unit
+tests go back to `blaze test` once that build's peak memory is bounded.
 
 ## The build that ships
 
