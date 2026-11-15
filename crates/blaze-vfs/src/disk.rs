@@ -99,9 +99,13 @@ pub(crate) fn steady_at(stamp: &Stamp) -> u64 {
 }
 
 /// Whether `stamp`, asked for at `asked_ns` or later, is within its [`window_ns`] of its
-/// change: a racy stamp vouches for nothing.
+/// change: a racy stamp vouches for nothing. A [`Stamp::GONE`] is never racy: it records no
+/// change (its times are zeros, not a change at the epoch), and nothing is there to be written
+/// a second time in a tick; a name made since moves it off `GONE`. Without this its zero times
+/// read as a whole-second change at the epoch, racy for any look before 2 s past it, so the
+/// answer for a path still absent hung on the clock's value.
 pub fn racy(stamp: &Stamp, asked_ns: u64) -> bool {
-    steady_at(stamp) > asked_ns
+    !stamp.is_gone() && steady_at(stamp) > asked_ns
 }
 
 /// One entry of a `SEEN` record: a name and its stamp ([`Stamp::GONE`]: it and everything

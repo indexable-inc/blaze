@@ -15,8 +15,9 @@
 //! - Watching: what the system's journal says changed ([`blaze_core::Done::Journaled`]),
 //!   from the cursor saved with the tracked paths' stamps, becomes ops on the workspace's head
 //!   ([`Watcher`]); a file whose stamp did not move is never read.
-//! - Outside every view: the directories user code reads that no view holds, watched so a
-//!   check asks a lock-free table whether anything under a path changed ([`outside`]).
+//! - Outside every view: what user code reads that no view holds, remembered by stamp and
+//!   checked with one stat per leaf by the racy rule ([`outside`]); no directory outside a
+//!   checkout is watched.
 //!
 //! Unsafe code is only in `store` and `lent` (docs/v2/plan/design/unsafe.md), whose APIs are
 //! safe.
@@ -64,7 +65,6 @@ pub use crate::{
     disk::{COARSE_NS, FINE_NS, MARK_MOST, racy, window_ns},
     image::{Bytes, DisksUnused, ImageError, ImageFile, ImageMark, ImageUse, tree_layout},
     lent::lent,
-    outside::{Cover, Outside, cover, generation, unchanged_since, want},
     reader::{Pinned, Reader},
     section::Section,
     settle::{Settled, Unsettled},
