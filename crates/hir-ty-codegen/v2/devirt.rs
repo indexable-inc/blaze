@@ -240,6 +240,12 @@ impl State {
         }
     }
 
+    /// Whether the unit's roots said it makes a library: a walk that closes no dyn facts,
+    /// whatever its units inline ([`Self::closed`]). `false` before its roots.
+    pub(crate) fn makes_library(&self) -> bool {
+        self.makes.get().is_some_and(|it| it.0 == RootKind::Library)
+    }
+
     /// The world the walk's bodies are built against: `None` before the first walk ends, and
     /// for a program that has none. One acquire load.
     pub(crate) fn world(&self) -> Option<DevirtWorld> {

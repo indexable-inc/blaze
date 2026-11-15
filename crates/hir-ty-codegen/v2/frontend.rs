@@ -1528,8 +1528,14 @@ impl Frontend for HirFrontend<'_> {
 
     /// A walk closes dyn facts only where some body takes the program's world
     /// ([`super::devirt::takes_world`]), which needs a unit that MIR-inlines: with none of
-    /// any origin (a dev build), or an origin whose plan fails, it closes none.
+    /// any origin (a dev build), or an origin whose plan fails, it closes none. Nor does the
+    /// walk of a library, whose roots said so ([`super::devirt::State::makes_library`]): a
+    /// library has no world ([`super::devirt::State::closed`]), however its origins inline,
+    /// so an edit of one patches its kept walk as a program's does.
     fn closes(&self) -> bool {
+        if self.devirt.makes_library() {
+            return false;
+        }
         match &self.units {
             Some(units) => units.inlines.values().any(|it| *it != Ok(false)),
             None => true,
