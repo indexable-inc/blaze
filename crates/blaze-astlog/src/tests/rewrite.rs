@@ -334,3 +334,156 @@ fn retarget_writes_the_new_item_as_the_paths_module_names_it() {
     let text = &after(&files, &applied.edited.ops)[0].1;
     assert!(text.contains("{ new(1) }") && text.contains("{ crate::new(2) }"), "{text}");
 }
+
+const MOVED: &str = r#"
+//- /lib.rs crate:lib edition:2021
+macro_rules! id {
+    ($($t:tt)*) => { $($t)* };
+}
+pub mod m {
+    pub fn old(x: u32) -> u32 { x }
+    pub fn new(x: u32) -> u32 { x }
+}
+mod alone {
+    use crate::m::old;
+    pub fn f() -> u32 { old(1) + old(2) }
+}
+mod listed {
+    use crate::m::{self, old};
+    pub fn f() -> u32 { old(1) + m::old(2) }
+}
+mod still_read {
+    use crate::m::old;
+    pub fn f() -> u32 { old(1) + id!(old(3)) }
+    pub fn keep() -> fn(u32) -> u32 { old }
+}
+"#;
+
+/// The paths of `lib::m::old` in a fn other than `keep`, or anywhere (`use` paths included).
+const IN_FN: &str = r#"
+    (rule (old-path p) (path p "lib::m::old"))
+    (rule (kept p) (old-path p) (syntax n "FN") (defines n d) (def-name d "keep") (ancestor n p))
+    (rule (in-fn p) (old-path p) (syntax n "FN") (ancestor n p))
+"#;
+
+/// A bare name the retarget moves came through a `use` of the old item: the new item is
+/// imported where that `use` is, and the `use` goes when nothing else reads what it imports,
+/// whether or not the rule retargets the `use` too. A read the rules leave keeps the `use`,
+/// and the import goes beside it; a retargeted `use` a read still needs is refused.
+#[test]
+fn a_bare_retarget_imports_the_new_item_and_drops_the_use_nothing_else_reads() {
+    let (db, files) = view(MOVED, 0, &["lib.rs"]);
+    let run = |only: &str| {
+        let rules = format!("{IN_FN}(rewrite moved (old-path p) {only} (retarget p \"lib::m::new\"))");
+        edit(&db, &files, &rules, &[])
+    };
+    let alone = "mod alone {\n    use crate::m::new;\n    pub fn f() -> u32 { new(1) + new(2) }\n}";
+    // The import is the path the module names the item by: `m` is imported here.
+    let listed = "mod listed {\n    use crate::m::{self};\n    use m::new;\n    \
+                  pub fn f() -> u32 { new(1) + m::new(2) }\n}";
+    // Only the reads whose syntax is in a fn other than `keep`: no `use` is retargeted, and
+    // nor is the path in `id!`'s input, whose syntax is the expansion's.
+    let applied = run("(in-fn p) (not (kept p))").unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains(alone) && text.contains(listed), "{text}");
+    let kept = "mod still_read {\n    use crate::m::old;\n    use crate::m::new;\n    \
+                pub fn f() -> u32 { new(1) + id!(old(3)) }\n    \
+                pub fn keep() -> fn(u32) -> u32 { old }\n}";
+    assert!(text.contains(kept), "{text}");
+    // Every path, `use`s included: each `use` goes, the last read with it.
+    let applied = run("").unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains(alone) && text.contains(listed), "{text}");
+    let all = "mod still_read {\n    use crate::m::new;\n    \
+               pub fn f() -> u32 { new(1) + id!(new(3)) }\n    \
+               pub fn keep() -> fn(u32) -> u32 { new }\n}";
+    assert!(text.contains(all), "{text}");
+    // The `use` of `still_read`, but not `keep`'s read of it.
+    let error = refused(run("(not (kept p))"));
+    assert!(
+        error.contains("retargets the import `crate::m::old`, which `old` at lib.rs:19 still reads"),
+        "{error}"
+    );
+}
+
+/// The new item's name already means something else where the bare name is: importing it
+/// would clash with that or shadow it, so the retarget is refused, naming both.
+#[test]
+fn a_bare_retarget_whose_new_name_is_taken_is_refused_naming_what_has_it() {
+    let fixture = r#"
+//- /lib.rs crate:lib edition:2021
+pub mod m {
+    pub fn old(x: u32) -> u32 { x }
+    pub fn new(x: u32) -> u32 { x }
+}
+mod taken {
+    use crate::m::old;
+    fn new() {}
+    pub fn f() -> u32 { new(); old(1) }
+}
+"#;
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (old-path p) (path p "lib::m::old"))
+        (rewrite moved (old-path p) (retarget p "lib::m::new"))
+    "#;
+    let error = refused(edit(&db, &files, rules, &[]));
+    assert!(
+        error.contains("`new` already names `lib::taken::new` here, so `lib::m::new` can't be imported"),
+        "{error}"
+    );
+}
+
+const PARAMS: &str = r#"
+//- /lib.rs crate:lib edition:2021
+pub fn mix(a: u32, b: u32, unused: u32) -> u32 { a - b }
+pub fn call(x: u32) -> u32 { mix(1, x, 3) + mix(x, 2, x) }
+"#;
+
+#[test]
+fn remove_param_and_reorder_params_change_the_fn_and_every_call() {
+    let (db, files) = view(PARAMS, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (mix d) (def-path d "lib::mix"))
+        (rewrite drop (mix d) (remove-param d "unused"))
+        (rewrite swap (mix d) (reorder-params d "b" "a" "unused"))
+    "#;
+    // Both rewrites make one `Edit::Params` each for one fn: blaze-intent refuses the pair.
+    let both = refused(edit(&db, &files, rules, &[]));
+    assert!(both.contains("two changes of `mix`'s parameters"), "{both}");
+    let rules = r#"
+        (rule (mix d) (def-path d "lib::mix"))
+        (rewrite drop (mix d) (remove-param d "unused"))
+    "#;
+    let applied = edit(&db, &files, rules, &[]).unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains("pub fn mix(a: u32, b: u32) -> u32"), "{text}");
+    assert!(text.contains("{ mix(1, x) + mix(x, 2) }"), "{text}");
+    let rules = r#"
+        (rule (mix d) (def-path d "lib::mix"))
+        (rewrite swap (mix d) (reorder-params d "unused" "b" "a"))
+    "#;
+    let applied = edit(&db, &files, rules, &[]).unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains("pub fn mix(unused: u32, b: u32, a: u32) -> u32"), "{text}");
+    assert!(text.contains("{ mix(3, x, 1) + mix(x, 2, x) }"), "{text}");
+}
+
+#[test]
+fn a_param_action_that_names_no_parameter_or_not_every_one_is_refused_naming_the_fn() {
+    let (db, files) = view(PARAMS, 0, &["lib.rs"]);
+    let run = |action: &str| {
+        let rules = format!("(rule (mix d) (def-path d \"lib::mix\"))\n(rewrite r (mix d) {action})");
+        refused(edit(&db, &files, &rules, &[]))
+    };
+    let missing = run(r#"(remove-param d "c")"#);
+    assert!(missing.contains("`lib::mix` has no parameter `c` (it has `a`, `b`, `unused`)"), "{missing}");
+    let partial = run(r#"(reorder-params d "b" "a")"#);
+    assert!(partial.contains("names every parameter of `lib::mix` once"), "{partial}");
+    let past = run(r#"(add-param d "c: u32" "0" 4)"#);
+    assert!(past.contains("index 4 is past `lib::mix`'s 3 parameters"), "{past}");
+    let reads = run(r#"(remove-param d "a")"#);
+    assert!(reads.contains("removes parameter `a`, which the body still reads"), "{reads}");
+    let arity = refused(edit(&db, &files, "(rule (mix d) (def-path d \"lib::mix\"))\n(rewrite r (mix d) (add-param d \"c: u32\"))", &[]));
+    assert!(arity.contains("`add-param` takes 3 or 4 arguments, got 2"), "{arity}");
+}

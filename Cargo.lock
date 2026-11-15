@@ -1457,6 +1457,7 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "memchr",
+ "snafu",
  "syntax",
 ]
 

@@ -9,7 +9,7 @@
 base-db	158	0	48	105
 blaze-alloc-count	0	0	0	2
 blaze-api	199	0	13	125
-blaze-astlog	21	0	15	40
+blaze-astlog	21	0	18	39
 blaze-audit	0	0	65	25
 blaze-bench	0	0	0	12
 blaze-build-script	67	0	7	26
@@ -53,7 +53,7 @@ blaze-hub	59	0	0	17
 blaze-ids	24	0	2	18
 blaze-image	11	0	0	13
 blaze-inproc	6	0	0	7
-blaze-intent	40	0	14	53
+blaze-intent	40	0	30	52
 blaze-item-hash	11	0	0	1
 blaze-items	61	0	11	42
 blaze-kernel	246	0	22	80
