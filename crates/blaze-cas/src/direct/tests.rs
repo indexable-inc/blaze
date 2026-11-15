@@ -483,11 +483,46 @@ fn the_direct_reader_reads_format_8_records() {
         let (file, payload, _) = direct.where_of(&key(n)).unwrap();
         let byte = sim.contents(&file)[payload as usize];
         sim.rot(&file, payload, &[!byte]);
+        // A reader that maps the pack after the rot: the simulation's mapping is a copy of the
+        // file as it was mapped, and the batch above mapped it (a short record is copied out of
+        // its pack's mapping).
+        let mut fresh = Direct::new(store.reader(), DIRECT_TAGS);
         let mut into = Vec::new();
-        let read = direct.read(&mut sim, &key(n), &mut into);
+        let read = fresh.read(&mut sim, &key(n), &mut into);
         sim.rot(&file, payload, &[byte]);
         assert!(matches!(read, Read::Failed(Failed::Corrupt { .. })), "key {n}'s rotted byte: {read:?}");
     }
+}
+
+/// The invariant: a run shorter than [`MAP_FROM`] is copied out of its pack's mapping and asks
+/// no read; a run of [`MAP_FROM`] bytes or more is read, one read a part; both are runs, and
+/// both answer what was put.
+#[test]
+fn a_short_run_is_copied_out_of_its_mapping_and_a_long_one_read() {
+    let mut sim = Sim::new(7, Faults::default());
+    let mut store = open(&mut sim);
+    // Short values first, then a value of `MAP_FROM` bytes or more kept raw (key 0) past them,
+    // so no run of the short ones reaches it.
+    for batch in [&[1, 2, 5, 6][..], &[0][..]] {
+        for &n in batch {
+            let (kind, bytes) = value(n);
+            store.put(key(n), kind, &bytes).unwrap();
+        }
+        flush(&mut sim, &mut store);
+    }
+    let model: BTreeMap<u64, State> = [0, 1, 2, 5, 6].into_iter().map(|n| (n, State::Durable)).collect();
+    let mut direct = Direct::new(store.reader(), DIRECT_TAGS);
+    read_batch(&mut sim, &mut direct, &model, &[6, 1, 5, 2], b"before", false).unwrap();
+    let short = direct.own_counts();
+    assert_eq!(short.reads, 0, "short runs ask no read: {short:?}");
+    assert!(short.copied > 0 && short.copied == short.runs, "every short run is copied: {short:?}");
+    read_one(&mut sim, &mut direct, &model, 0, false).unwrap();
+    let long = direct.own_counts();
+    assert_eq!(
+        (long.reads - short.reads, long.copied - short.copied, long.runs - short.runs),
+        (1, 0, 1),
+        "a run of MAP_FROM bytes or more is read: {long:?}"
+    );
 }
 
 #[test]
@@ -526,4 +561,34 @@ fn the_plan_joins_neighbours_within_the_gap() {
     assert_eq!(plan.outcome(b), Ok(100 + plan::GAP_MOST));
     assert_eq!(plan.outcome(far), Ok(100 + plan::GAP_MOST + 50));
     assert_eq!(plan.outcome(other), Ok(100 + plan::GAP_MOST + 50 + 100));
+}
+
+/// The core alone: a short run the shell copied is asked of no driver, and its records' bytes
+/// are where the plan says, as a read's would be; one whose copy failed fails its records.
+#[test]
+fn the_plan_asks_no_read_of_a_copied_run() {
+    let mut plan = plan::Plan::new(0);
+    plan.begin();
+    let short = plan.want(0, 0, 100);
+    let long = plan.want(1, 0, MAP_FROM);
+    let failed = plan.want(2, 0, 10);
+    let total = plan.plan();
+    let copying: Vec<_> = plan.short(MAP_FROM).collect();
+    assert_eq!(copying.len(), 2, "the two short runs, not the long one");
+    plan.copied(copying[0].part, Ok(copying[0].len));
+    plan.copied(copying[1].part, Err(IoError("not mapped".into())));
+    let mut effects = Vec::new();
+    let mut region = vec![0u8; total as usize];
+    // SAFETY: as in `the_plan_joins_neighbours_within_the_gap`.
+    let registered =
+        unsafe { Spans::register("direct plan test", NonNull::new(region.as_mut_ptr()).unwrap(), region.len()) }
+            .unwrap();
+    plan.issue(registered.region(), |file| name(&format!("f{file}")), &mut effects);
+    assert_eq!((effects.len(), plan.left()), (1, 1), "the long run alone is read");
+    let Some(Effect::ReadInto { into, tag, .. }) = effects.pop() else { unreachable!() };
+    assert!(plan.complete(Completion { tag, done: Done::ReadInto { len: into.len } }).is_none());
+    assert_eq!(plan.left(), 0);
+    assert_eq!(plan.outcome(short), Ok(0));
+    assert_eq!(plan.outcome(long), Ok(100));
+    assert!(matches!(plan.outcome(failed), Err(plan::Missed::Failed { .. })));
 }
