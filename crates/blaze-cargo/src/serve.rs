@@ -1317,8 +1317,18 @@ pub(crate) fn engine(
     let scratch = paths.state.join("spawn");
     let driver = {
         let _s = tracing::info_span!(target: "blaze", "daemon start: make the driver").entered();
-        blaze_core::native(std::path::Path::new("/"), threads)
-            .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?
+        let driver = blaze_core::native(std::path::Path::new("/"), threads)
+            .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
+        // Each thread that reads the store makes its own driver at its first read
+        // (`direct::Reads::Native`), of another kind on Linux (a ring with no kernel thread,
+        // `IORING_SETUP_DEFER_TASKRUN`, which the daemon's ring does not ask): one is made and
+        // dropped here, so a kernel that refuses it stops the start, naming what it lacks and
+        // the fix, and not a build at its first store read. Elsewhere it is the daemon's kind.
+        #[cfg(target_os = "linux")]
+        blaze_core::thread_native(std::path::Path::new("/"), 1).context(
+            "starting a thread's own native driver for its store reads (io_uring with no kernel thread)",
+        )?;
+        driver
     };
     // A plane task's end ends the loop's wait in this driver, where it has a waker.
     let wake = blaze_core::Driver::waker(&driver);
