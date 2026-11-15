@@ -1034,10 +1034,11 @@ def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
         report_ = json.loads(printed)
     except json.JSONDecodeError as error:
         raise ValueError(f"{what}: `blaze slow --json` printed no JSON: {error}") from error
-    spots = report_.get("blind_spots") if isinstance(report_, dict) else None
+    fields = cast(dict[str, Any], report_) if isinstance(report_, dict) else {}
+    spots = fields.get("blind_spots")
     if not isinstance(spots, list):
         raise ValueError(f"{what}: `blaze slow --json` printed no `blind_spots`")
-    lost = [spot for spot in spots if isinstance(spot, dict) and spot.get("kind") == "unrecorded"]
+    lost = [spot for spot in json_objects(cast(list[Any], spots)) if spot.get("kind") == "unrecorded"]
     hidden = 0.0
     for spot in lost:
         ns = spot.get("hidden_ns")
@@ -1047,8 +1048,8 @@ def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
     # Where each stretch is, as the report's `gaps` say it (report version 9): its thread and the
     # spans of its lane before and after it. A stretch its lane ran inside no span (`no_span`) is
     # no `unrecorded` blind spot, and is held to the same bound, each on its own.
-    gaps = [gap for gap in report_.get("gaps", []) if isinstance(gap, dict)]
-    out = []
+    gaps = json_objects(fields.get("gaps", []))
+    out: list[str] = []
     for gap in gaps:
         ms = gap.get("dur_ns", 0) / 1e6
         if gap.get("kind") == "no_span" and ms > most_ms:
@@ -1060,6 +1061,11 @@ def gap_failures(printed: str, most_ms: float, what: str) -> list[str]:
                       or [str(line) for spot in lost for line in spot.get("evidence", [])])
     return out + [f"{hidden:.4g} ms of the critical path is under no span, over the bound of {most_ms:.4g} ms "
                   f"(slow-is-p0-traced: name it with a span first): {where or 'the report names no lane'}"]
+
+
+def json_objects(items: Iterable[Any]) -> list[dict[str, Any]]:
+    """The items of a JSON list that are objects, in order; the others are left out."""
+    return [cast(dict[str, Any], item) for item in items if isinstance(item, dict)]
 
 
 def gap_where(gap: dict[str, Any]) -> str:

@@ -22,8 +22,11 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[2] / "agents"
+# A row: one JSON object, as its file has it (its fields are KINDS' and whatever else a lane wrote).
+Row = dict[str, Any]
 KINDS = {"howto": ("id", "date", "who", "task", "do", "why", "state"), "annoyances": ("id", "date", "who", "where", "what", "state")}
 
 
@@ -34,7 +37,7 @@ class Ask:
     full: bool = False
     show: str | None = None
     classes: bool = False
-    add: dict | None = None
+    add: Row | None = None
     check: bool = False
     imported: str | None = None
     lane: str | None = None
@@ -46,7 +49,7 @@ def ask() -> Ask:
     raw = json.loads(sys.argv[1])
     if not isinstance(raw, dict):
         sys.exit("agents.py: the input is one JSON object")
-    raw = dict(raw)
+    raw = dict(cast(Row, raw))
     if "import" in raw:
         raw["imported"] = raw.pop("import")
     unknown = set(raw) - set(Ask.__dataclass_fields__)
@@ -55,16 +58,16 @@ def ask() -> Ask:
     return Ask(**raw)
 
 
-def rows(kind: str) -> list[dict]:
-    out = []
+def rows(kind: str) -> list[Row]:
+    out: list[Row] = []
     for path in sorted((ROOT / kind).glob("*.json")):
-        row = json.loads(path.read_text())
+        row: Row = json.loads(path.read_text())
         row["id"] = path.stem
         out.append(row)
     return out
 
 
-def write(kind: str, name: str, row: dict) -> str:
+def write(kind: str, name: str, row: Row) -> str:
     safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in name).strip("-.")
     if not safe:
         sys.exit(f"agents.py: `{name}` names no file")
@@ -80,11 +83,11 @@ def write(kind: str, name: str, row: dict) -> str:
     return safe
 
 
-def text(row: dict) -> str:
+def text(row: Row) -> str:
     return json.dumps(row, ensure_ascii=False).lower()
 
 
-def one_line(row: dict) -> str:
+def one_line(row: Row) -> str:
     what = " ".join(str(row.get("what") or row.get("task") or "").split())
     return f"{row['id']:22s} {row.get('date', ''):10s} {row.get('state', ''):8.8s} {row.get('where', '')[:28]:28s} {what[:110]}"
 

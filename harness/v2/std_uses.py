@@ -367,7 +367,7 @@ def judge(rep: report.Report, crates: list[Crate], clean: int, unread: list[str]
         rep.add("std-uses", "fail", f"{numbers['findings']} findings in {len(crates)} crates; port first: {first}",
                 **numbers)
     else:
-        rep.add("std-uses", "pass", **numbers)
+        rep.add("std-uses", "pass", "", **numbers)
 
 
 def main(it: Input) -> None:

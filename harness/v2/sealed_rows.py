@@ -9,6 +9,7 @@ Prints one row a line (`label | row | value`) and, last, the rows as one JSON li
 import json, os, re, shutil, statistics, subprocess, sys, time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -61,11 +62,11 @@ def comment(d: Path, i: int) -> None:
         h.write(f"// d{i}\n")
 
 
-def series(label: str, args: list[str], n: int, d: Path, edit=None, warm: int = 0) -> None:
+def series(label: str, args: list[str], n: int, d: Path, edit: Callable[[int], str] | None = None, warm: int = 0) -> None:
     xs: list[float] = []
     bad = 0
     for i in range(n + warm):
-        want = None
+        want: str | None = None
         if edit:
             want = edit(i)
         ms, r = timed(args, d)
@@ -98,7 +99,8 @@ def memory(label: str) -> None:
         row(label, "no daemon found")
         return
     status = dict(l.split(":", 1) for l in Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in l)
-    mb = lambda k: int(status[k].split()[0]) // 1024
+    def mb(k: str) -> int:
+        return int(status[k].split()[0]) // 1024
     rollup = dict(l.split(":", 1) for l in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines()[1:] if ":" in l)
     row(label, f"resident {mb('VmRSS')} MB (anonymous {mb('RssAnon')}, file {mb('RssFile')}, shared {mb('RssShmem')}), "
                f"huge pages {int(rollup['AnonHugePages'].split()[0]) // 1024} MB")

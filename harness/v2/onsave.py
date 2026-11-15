@@ -17,6 +17,7 @@ one JSON line."""
 import json, os, re, shutil, statistics, subprocess, sys, time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -29,12 +30,13 @@ class Input:
     n: int = 15
     warm: int = 30
     pauses: tuple[int, ...] = (0, 50, 200, 1000)
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict[str, str])
 
 
-RAW = json.loads(sys.argv[1])
+RAW: dict[str, Any] = json.loads(sys.argv[1])
 assert set(RAW) <= set(Input.__dataclass_fields__), RAW
-IN = Input(**{**RAW, "pauses": tuple(RAW.get("pauses", (0, 50, 200, 1000)))})
+FIELDS: dict[str, Any] = {**RAW, "pauses": tuple(RAW.get("pauses", (0, 50, 200, 1000)))}
+IN = Input(**FIELDS)
 assert IN.project in ("hello", "six"), IN.project
 WORK = Path(IN.work).resolve()
 HOME = WORK / "home"
@@ -185,13 +187,14 @@ def main() -> None:
     row("daemon pid", daemon)
 
     row("no-op run", stats([run(VALUE[0], "no-op") for _ in range(IN.n)]))
-    times = []
+    times: list[float] = []
     for i in range(IN.n):
         write(VALUE[0], f"// comment {i}\n")
         times.append(run(VALUE[0], "comment"))
     row("comment edit + run, no pause", stats(times))
     for pause in IN.pauses:
-        times, cpus = [], []
+        times = []
+        cpus: list[float] = []
         before_log = said(log())
         for _ in range(IN.n):
             value = next_value()

@@ -290,7 +290,8 @@ def expect(holds: bool, what: str) -> None:
 def test_elf(sections: list[tuple[str, bytes]]) -> bytes:
     """An ELF64 file of `sections`, as far as `elf_sections` reads one."""
     names = b"\0" + b"".join(name.encode() + b"\0" for name, _ in sections) + b".shstrtab\0"
-    body, placed = bytearray(64), []
+    body = bytearray(64)
+    placed: list[tuple[int, int, int]] = []
     for name, data in [*sections, (".shstrtab", names)]:
         placed.append((names.index(name.encode() + b"\0"), len(body), len(data)))
         body += data

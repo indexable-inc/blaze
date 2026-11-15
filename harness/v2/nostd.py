@@ -262,7 +262,7 @@ def selftest() -> None:
     done = problems(Bans("", ("crates/sys",), (), ("b",), ("cfg-if",), ()), {"crates/sys/src/lib.rs": 9},
                     {"b": True, "sys": True}, [], [], "check")
     expect(done == [], f"an empty list, no_std crates and a known closure pass: {done}")
-    packages = [("a", True, ["b", "cfg-if"]), ("b", True, ["serde"]), ("serde", False, ["serde_core"]),
+    packages: list[tuple[str, bool, list[str]]] = [("a", True, ["b", "cfg-if"]), ("b", True, ["serde"]), ("serde", False, ["serde_core"]),
                 ("serde_core", False, []), ("cfg-if", False, []), ("unreached", False, [])]
     expect(closure_outsiders(packages, {"cfg-if"}) == ["serde", "serde_core"],
            f"the closure's unknown packages: {closure_outsiders(packages, {'cfg-if'})}")

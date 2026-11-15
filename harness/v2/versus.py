@@ -565,7 +565,8 @@ def held(tool: Tool, row: str) -> dict[str, int]:
         status = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in line)
         rollup = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines()[1:]
                       if ":" in line)
-        kb = lambda table, key: int(table[key].split()[0]) * 1024
+        def kb(table: dict[str, str], key: str) -> int:
+            return int(table[key].split()[0]) * 1024
         # Footprint as macOS counts it: pages that are dirty (private or shared) plus swapped.
         return {"resident": kb(status, "VmRSS"),
                 "footprint": kb(rollup, "Private_Dirty") + kb(rollup, "Shared_Dirty") + kb(rollup, "Swap")}
@@ -608,7 +609,7 @@ def measure(tool: Tool, source: Source, n: int, shared_home: Path) -> dict[str, 
     shared_before = blocks(shared_home) if tool.name == "blaze" else 0
     source.write(body, comment)
 
-    cold = []
+    cold: list[float] = []
     for _ in range(COLD_RUNS):
         tool.wipe("cold")
         cold.append(tool.run("cold", source.expect(body, comment)).ms)
@@ -616,13 +617,14 @@ def measure(tool: Tool, source: Source, n: int, shared_home: Path) -> dict[str, 
 
     for _ in range(WARM):
         tool.run("noop", source.expect(body, comment))
-    samples, after = [], []
+    samples: list[float] = []
+    after: list[bool] = []
     for _ in range(n):
         samples.append(tool.run("noop", source.expect(body, comment)).ms)
         after.append(tool.daemon_after("noop"))
     rows["noop"] = summary(samples)
     if tool.name == "blaze":
-        rows["noop"] = with_daemon_after(typing.cast(dict[str, object], rows["noop"]), after)
+        rows["noop"] = with_daemon_after(rows["noop"], after)
 
     samples = []
     for i in range(WARM + n):
@@ -635,7 +637,9 @@ def measure(tool: Tool, source: Source, n: int, shared_home: Path) -> dict[str, 
         time.sleep(SETTLE_S)
     rows["comment"] = summary(samples)
 
-    samples, resident, footprint = [], [], []
+    samples = []
+    resident: list[float] = []
+    footprint: list[float] = []
     for i in range(WARM + n):
         body += 1
         began = time.perf_counter()
@@ -663,7 +667,8 @@ def measure(tool: Tool, source: Source, n: int, shared_home: Path) -> dict[str, 
         # blaze's state before it (stopped, and its lock seen free), so the peak is a run that
         # waits for no daemon; whether the run left one is said beside it, as that daemon's
         # memory is not in this process's peak.
-        peaks, after = [], []
+        peaks: list[dict[str, int]] = []
+        after = []
         for i in range(WARM + n):
             tool.stop("held")
             if tool.daemon_after("held"):
@@ -680,8 +685,8 @@ def measure(tool: Tool, source: Source, n: int, shared_home: Path) -> dict[str, 
             typing.cast(dict[str, object], rows["held"])["run_peak_footprint"] = summary(
                 [float(p["footprint"]) for p in peaks])
     else:
-        rows["restart"] = dict(typing.cast(dict[str, object], rows["noop"]), same_as="noop: Relax keeps no process")
-        peaks: list[dict[str, int]] = []
+        rows["restart"] = dict(rows["noop"], same_as="noop: Relax keeps no process")
+        peaks = []
         for i in range(WARM + n):
             ran = tool.run("held", source.expect(body, comment), timed=True)
             if i >= WARM:
@@ -741,7 +746,7 @@ def base_env(tmp: Path) -> dict[str, str]:
 
 
 def tools_for(asked: Input, root: Path, project: str, extra: Extra | None) -> list[tuple[Tool, Source]]:
-    made = []
+    made: list[tuple[Tool, Source]] = []
     for name in TOOLS:
         if name != "blaze" and project in ONLY_BLAZE:
             continue
@@ -816,7 +821,8 @@ def judged_memory(rows: dict[str, object]) -> tuple[str, float, dict[str, object
 
 def cell(row: str, value: dict[str, object]) -> str:
     if row in ("held", "disk"):
-        mb = lambda b: f"{typing.cast(float, b) / (1 << 20):.1f}"
+        def mb(b: object) -> str:
+            return f"{typing.cast(float, b) / (1 << 20):.1f}"
         if row == "disk":
             return f"{mb(value['bytes'])} MB"
         return f"{mb(value['median'])} MB ({mb(value['min'])}-{mb(value['max'])}, n {value['n']})"
@@ -859,7 +865,7 @@ def plain(tool: str, row: str, rows: dict[str, object]) -> str:
 def verdicts(project: str, found: dict[str, object], factor: float) -> list[dict[str, object]]:
     """Each row of `project` judged; `found` holds both tools' rows (for a blaze-only fixture,
     Relax's are those of the project it is judged against, and `project` says so)."""
-    out = []
+    out: list[dict[str, object]] = []
     relax, blaze = found["relax"], found["blaze"]
     relax_failed = isinstance(relax, dict) and "failed" in relax
     blaze_failed = isinstance(blaze, dict) and "failed" in blaze
@@ -907,7 +913,8 @@ def table(lines: list[dict[str, object]]) -> str:
     body = [(f"{l['project']} {ROW_TITLES[typing.cast(str, l['row'])]}", str(l["relax"]), str(l["blaze"]),
              "-" if l["ratio"] is None else f"{l['ratio']:.2f}x", "won" if l["won"] else "lost") for l in lines]
     widths = [max(len(r[i]) for r in [head, *body]) for i in range(len(head))]
-    fmt = lambda r: "  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip()
+    def fmt(r: tuple[str, ...]) -> str:
+        return "  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip()
     return "\n".join([fmt(head), fmt(tuple("-" * w for w in widths)), *(fmt(r) for r in body)])
 
 

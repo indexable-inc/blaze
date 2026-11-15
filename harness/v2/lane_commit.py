@@ -19,6 +19,7 @@ lane's half-written hunk (row onsave-1112-1). Why the hunks are renumbered: a hu
 context is placed by its line in the new file, which the hunks left out had shifted. A kept
 hunk that removes a line is refused: say which lines are yours by adding them."""
 import json, os, re, subprocess, sys, tempfile
+from typing import Any
 from dataclasses import dataclass, field
 
 
@@ -28,14 +29,15 @@ class Input:
     base: str
     message: str
     whole: tuple[str, ...] = ()
-    hunks: dict[str, str] = field(default_factory=dict)
+    hunks: dict[str, str] = field(default_factory=dict[str, str])
     push: str | None = None
 
 
 def main() -> None:
-    raw = json.loads(sys.argv[1])
+    raw: dict[str, Any] = json.loads(sys.argv[1])
     assert set(raw) <= set(Input.__dataclass_fields__), sorted(raw)
-    ask = Input(**{**raw, "whole": tuple(raw.get("whole", ()))})
+    fields: dict[str, Any] = {**raw, "whole": tuple(raw.get("whole", ()))}
+    ask = Input(**fields)
     with tempfile.TemporaryDirectory() as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
 
@@ -51,7 +53,8 @@ def main() -> None:
         for path, pattern in ask.hunks.items():
             mine = re.compile(pattern)
             head, *hunks = re.split(r"(?m)^(?=@@ )", git("diff", "--no-ext-diff", "-U0", ask.base, "--", path))
-            added, kept = 0, []
+            added = 0
+            kept: list[str] = []
             for hunk in hunks:
                 lines = hunk.splitlines(keepends=True)
                 if not any(mine.search(line) for line in lines[1:] if line.startswith("+")):
