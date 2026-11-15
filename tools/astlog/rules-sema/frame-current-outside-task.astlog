@@ -1,0 +1,29 @@
+;; A function nothing in the view calls that reaches `blaze_mem::frame::current` through calls
+;; none of which is inside a `blaze_mem::frame::task` closure: an entry where a task must open.
+;;
+;; `frame::current` panics "frame::current outside any frame::task". On 2026-11-14 a debug
+;; blaze of main (eca2e8c643) panicked there at crates/blaze-cargo/src/serve/unit/deps.rs:1712
+;; on every `blaze check --query` over a home a `blaze check` had just filled: a loop turn
+;; serving dependencies reached `PagedRecord::of`'s not-mappable branch in no task. Rule 20
+;; (a panic fails one job) and rule 3. The call graph is followed by `callee`, recursively,
+;; and a call written inside a `frame::task(.., |frame| ..)` closure cuts the path.
+;;
+;; Rule 73: a type is the end (`PagedRecord::of` takes `&Frame`, as `frame::task` gives one);
+;; `frame::current` exists for code that cannot be handed one, so this rule finds where the
+;; handing stops.
+
+(rule (in-task c) (syntax c "CALL_EXPR") (expr t "blaze_mem::frame::task($tag, $body)") (ancestor body c))
+(rule (in-task c) (syntax c "METHOD_CALL_EXPR") (expr t "blaze_mem::frame::task($tag, $body)") (ancestor body c))
+
+(rule (needs f c)
+  (expr c "blaze_mem::frame::current($g)")
+  (not (in-task c))
+  (enclosing-fn c f))
+(rule (needs f c) (syntax c "CALL_EXPR") (callee c g) (needs g x) (not (in-task c)) (enclosing-fn c f))
+(rule (needs f c) (syntax c "METHOD_CALL_EXPR") (callee c g) (needs g x) (not (in-task c)) (enclosing-fn c f))
+
+(rule (called g) (syntax c "CALL_EXPR") (callee c g))
+(rule (called g) (syntax c "METHOD_CALL_EXPR") (callee c g))
+(rule (frame-current-outside-task c f) (needs f c) (not (called f)))
+
+(lint frame-current-outside-task warning "`$f` is called by nothing here and reaches `frame::current` through this call in no `frame::task`")

@@ -1,0 +1,33 @@
+;; A `match` that picks enum variants by hand-kept integers: four or more arms `k => E::V ..`.
+;;
+;; crates/blaze-api/src/frames/identity.rs picks 39 requests and 48 responses this way, beside
+;; `const REQUESTS: usize = 39` and `const RESPONSES: usize = 48`. A new variant must be added
+;; to the enum, the table, the count and the index by hand, and a skipped integer (`34` in
+;; `fn request`) silently hands its variant to the `_` arm. The tool sees the variants by
+;; resolution, so the integers are counted per `match` only where each arm makes a variant.
+;;
+;; Rule 73: a type is the end (draw from `E::ALL`, or a reflected variant list); the lint
+;; `blaze::hand_kept_variant_list` reads lists in the enum's own impls only. This is the
+;; advice until that lint reads integer pickers too.
+
+(rule (int-arm a k)
+  (syntax k "LITERAL_PAT")
+  (text-match k "^[0-9]+$")
+  (parent a k)
+  (kind a "MATCH_ARM"))
+
+(rule (made a k p d)
+  (syntax p "PATH")
+  (resolves p d)
+  (def-kind d "variant")
+  (ancestor a p)
+  (int-arm a k)
+  (precedes k p))
+(rule (made-earlier a p) (made a k p d) (made a k q e) (precedes q p))
+(rule (generated a d) (made a k p d) (not (made-earlier a p)))
+
+;; The match an arm belongs to: arm, MATCH_ARM_LIST, MATCH_EXPR.
+(rule (picks m a) (generated a d) (parent l a) (parent m l))
+(rule (int-arm-variant-picker m n) (picks m a) (count n (picks m x)) (le 4 n))
+
+(lint int-arm-variant-picker warning "$n arms pick a variant by a hand-kept integer: draw from the enum's own list")

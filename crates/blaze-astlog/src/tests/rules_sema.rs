@@ -1,295 +1,323 @@
-//! Two rules from the rules lane (`tools/astlog/rules-sema/`), rewritten with the language's new
-//! forms and run beside their old text over the lane's fixtures. The tests run the blocks below,
-//! read from this comment, so the text a reader sees is the text that ran.
+//! The rule pack `tools/astlog/rules-sema/`, each rule run over its fixture crate through a real
+//! front end. The rule file and the fixture are read from the pack, not copied, so a rule that
+//! stops loading or a fixture that stops matching fails here.
 //!
-//! The shared library, `rules/lib/int-arms.astlog` in the view, 7 lines (5 of forms). Both rules
-//! include it: before `include`, each kept its own copy of `int-arm`, `made`, `made-earlier`
-//! and `generated`.
+//! A fixture is `tests/<rule>/`: every `src/lib.rs` under it with a `Cargo.toml` beside is a
+//! crate (the root one depends on the others), and `expected.txt` holds the findings as
+//! `blaze check --query` prints them, or `fixed.rs` the root crate's `src/lib.rs` after the
+//! rule's rewrites. The view holds the fixture's files at their paths in the fixture and the
+//! pack's `lib/` at its path in blaze's checkout, so an `(include ...)` resolves as the daemon
+//! resolves it in that checkout: from the view's root.
 //!
-//! ```lisp
-//! ;; Each path that names an enum variant.
-//! (rule (variant-path p d) (syntax p "PATH") (resolves p d) (def-kind d "variant"))
-//! ;; `k => ..`: an arm keyed by an integer, the integer, and the first variant its expression names.
-//! (rule (makes m a i p d) (match-arm m a k b) (int-value k i) (descendant b p) (variant-path p d))
-//! (rule (makes-later a p) (makes m a i p d) (makes m a i q e) (precedes q p))
-//! (rule (generated m a i d) (makes m a i p d) (not (makes-later a p)))
-//! ```
-//!
-//! `variant-table-disagrees`, old: 60 lines in the lane's file, 27 of them forms. The forms:
-//!
-//! ```lisp
-//! (rule (int-arm a k)
-//!   (syntax k "LITERAL_PAT")
-//!   (text-match k "^[0-9]+$")
-//!   (parent a k)
-//!   (kind a "MATCH_ARM"))
-//! (rule (made a k p d)
-//!   (syntax p "PATH")
-//!   (resolves p d)
-//!   (def-kind d "variant")
-//!   (ancestor a p)
-//!   (int-arm a k)
-//!   (precedes k p))
-//! (rule (made-earlier a p) (made a k p d) (made a k q e) (precedes q p))
-//! (rule (generated a k d) (made a k p d) (not (made-earlier a p)))
-//! (rule (counted a k p d)
-//!   (syntax k "LITERAL")
-//!   (text-match k "^[0-9]+$")
-//!   (parent a k)
-//!   (kind a "MATCH_ARM")
-//!   (syntax p "PATH")
-//!   (resolves p d)
-//!   (def-kind d "variant")
-//!   (ancestor a p)
-//!   (precedes p k))
-//! (rule (counted-earlier a p) (counted a k p d) (counted a k q e) (precedes q p))
-//! (rule (indexed a k d) (counted a k p d) (not (counted-earlier a p)))
-//! (rule (pair g gk i ik d) (generated g gk d) (indexed i ik d) (same-file g i))
-//! (rule (agrees g i) (pair g gk i ik d) (same-text gk ik))
-//! (rule (variant-table-disagrees g gk d ik) (pair g gk i ik d) (not (agrees g i)))
-//! (lint variant-table-disagrees error "this arm makes `$d` from $gk, and its index arm counts it as $ik")
-//! ```
-//!
-//! New: 8 lines, 7 of forms, plus the library. `match-arm` gives the arm, its pattern and its
-//! expression in place of `parent`, `kind` and `ancestor`; `int-value` reads `0x6` and `0b1`
-//! where `text-match "^[0-9]+$"` skipped them, so an arm written in hex is joined, and two
-//! numbers agree by value where `same-text` compared spellings.
-//!
-//! ```lisp
-//! (include "rules/lib/int-arms.astlog")
-//! ;; `E::V .. => k`: an arm whose expression is an integer, and the first variant its pattern names.
-//! (rule (counts a i p d) (match-arm m a q b) (int-value b i) (descendant q p) (variant-path p d))
-//! (rule (counts-later a p) (counts a i p d) (counts a i q e) (precedes q p))
-//! (rule (indexed a i d) (counts a i p d) (not (counts-later a p)))
-//! (rule (pair g gi x xi d) (generated m g gi d) (indexed x xi d) (same-file g x))
-//! (rule (variant-table-disagrees g gi d xi) (pair g gi x xi d) (not (pair g gi x gi d)))
-//! (lint variant-table-disagrees error "this arm makes `$d` from $gi, and its index arm counts it as $xi")
-//! ```
-//!
-//! `int-arm-variant-picker`, old: 33 lines in the lane's file, 15 of them forms. The forms:
-//!
-//! ```lisp
-//! (rule (int-arm a k)
-//!   (syntax k "LITERAL_PAT")
-//!   (text-match k "^[0-9]+$")
-//!   (parent a k)
-//!   (kind a "MATCH_ARM"))
-//! (rule (made a k p d)
-//!   (syntax p "PATH")
-//!   (resolves p d)
-//!   (def-kind d "variant")
-//!   (ancestor a p)
-//!   (int-arm a k)
-//!   (precedes k p))
-//! (rule (made-earlier a p) (made a k p d) (made a k q e) (precedes q p))
-//! (rule (generated a d) (made a k p d) (not (made-earlier a p)))
-//! (rule (picks m a) (generated a d) (parent l a) (parent m l))
-//! (rule (int-arm-variant-picker m n) (picks m a) (count n (picks m x)) (le 4 n))
-//! (lint int-arm-variant-picker warning "$n arms pick a variant by a hand-kept integer: draw from the enum's own list")
-//! ```
-//!
-//! New: 4 lines, all forms, plus the library. `match-arm` names the arm's `match`, so `picks`
-//! needs no walk up through the arm list; `def-parent` and `variant-count` put the enum and how
-//! many variants it has in the message, and the arms are counted per enum.
-//!
-//! ```lisp
-//! (include "rules/lib/int-arms.astlog")
-//! (rule (picks m a e) (generated m a i d) (def-parent d e))
-//! (rule (int-arm-variant-picker m n e v) (picks m a e) (count n (picks m x e)) (le 4 n) (variant-count e v))
-//! (lint int-arm-variant-picker warning "$n arms pick a `$e` variant of $v by a hand-kept integer: draw from the enum's own list")
-//! ```
+//! `std` is [`STD`], the few items the fixtures name, with the paths the real one has.
 
-use blaze_api::query::{Cell, Rows};
+use std::path::{Path, PathBuf};
 
+use blaze_api::query::{Cell, Rows, Severity};
+
+use super::rewrite::after;
 use super::view;
-use crate::query;
+use crate::{edit, query};
 
-const SOURCE: &str = include_str!("rules_sema.rs");
+/// The pack, from this crate's directory.
+const PACK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/astlog/rules-sema");
 
-/// The `n`th ```lisp block of this file's module comment.
-fn block(n: usize) -> String {
-    let comment: String = SOURCE
-        .lines()
-        .take_while(|line| line.starts_with("//!"))
-        .map(|line| format!("{}\n", line.strip_prefix("//! ").unwrap_or(line.trim_start_matches("//!"))))
+/// The pack's path in blaze's checkout, the view root an include is resolved from.
+const PACK_IN_CHECKOUT: &str = "tools/astlog/rules-sema";
+
+const STD: &str = r#"
+//- /std/lib.rs crate:std edition:2024
+pub mod string {
+    pub struct String(u8);
+    impl String {
+        pub fn new() -> String { String(0) }
+        pub fn from(_: &str) -> String { String(0) }
+        pub fn len(&self) -> usize { 0 }
+        pub fn push_str(&mut self, _: &str) {}
+    }
+    pub trait ToString { fn to_string(&self) -> String; }
+    impl<T: ?Sized> ToString for T { fn to_string(&self) -> String { String(0) } }
+}
+pub mod borrow {
+    pub enum Cow<'a, B: ?Sized + 'a> { Borrowed(&'a B), Owned(crate::string::String) }
+    impl<'a> Cow<'a, str> {
+        pub fn into_owned(self) -> crate::string::String { crate::string::String(0) }
+    }
+}
+pub mod vec { pub struct Vec<T>(T); impl<T> Vec<T> { pub fn new() -> Vec<T> { loop {} } pub fn len(&self) -> usize { 0 } } }
+pub mod option { pub enum Option<T> { None, Some(T) } }
+pub mod result { pub enum Result<T, E> { Ok(T), Err(E) } }
+pub mod ffi {
+    pub struct OsStr(u8);
+    impl OsStr {
+        pub fn new(_: &str) -> &OsStr { loop {} }
+        pub fn to_string_lossy(&self) -> crate::borrow::Cow<'_, str> { loop {} }
+    }
+    pub struct OsString(u8);
+}
+pub mod path {
+    pub struct Path(u8);
+    impl Path {
+        pub fn new(_: &str) -> &Path { loop {} }
+        pub fn join(&self, _: &str) -> PathBuf { loop {} }
+        pub fn to_string_lossy(&self) -> crate::borrow::Cow<'_, str> { loop {} }
+        pub fn as_os_str(&self) -> &crate::ffi::OsStr { loop {} }
+        pub fn to_path_buf(&self) -> PathBuf { loop {} }
+    }
+    pub struct PathBuf(u8);
+    impl PathBuf {
+        pub fn from(_: &str) -> PathBuf { loop {} }
+        pub fn join(&self, _: &str) -> PathBuf { loop {} }
+        pub fn push(&mut self, _: &str) {}
+        pub fn as_path(&self) -> &Path { loop {} }
+    }
+}
+pub mod io {
+    pub struct Error(u8);
+    pub type Result<T> = crate::result::Result<T, Error>;
+    pub struct Stdout(u8);
+    pub struct Stderr(u8);
+    pub fn stdout() -> Stdout { Stdout(0) }
+    pub fn stderr() -> Stderr { Stderr(0) }
+    pub trait Write { fn write_str(&mut self, _: &str) -> Result<()>; }
+    impl Write for Stdout { fn write_str(&mut self, _: &str) -> Result<()> { loop {} } }
+    impl Write for Stderr { fn write_str(&mut self, _: &str) -> Result<()> { loop {} } }
+}
+pub mod env {
+    pub fn current_exe() -> crate::io::Result<crate::path::PathBuf> { loop {} }
+    pub fn var(_: &str) -> crate::result::Result<crate::string::String, crate::io::Error> { loop {} }
+    pub fn var_os(_: &str) -> crate::option::Option<crate::ffi::OsString> { loop {} }
+}
+pub mod process {
+    pub struct Command(u8);
+    pub struct ExitStatus(u8);
+    impl ExitStatus { pub fn success(&self) -> bool { true } }
+    impl Command {
+        pub fn new<S>(_: S) -> Command { Command(0) }
+        pub fn arg<S>(&mut self, _: S) -> &mut Command { self }
+        pub fn status(&mut self) -> crate::io::Result<ExitStatus> { loop {} }
+    }
+}
+pub mod thread {
+    pub struct JoinHandle<T>(T);
+    impl<T> JoinHandle<T> { pub fn join(self) -> crate::result::Result<T, ()> { loop {} } }
+    pub fn spawn<F, T>(_: F) -> JoinHandle<T> { loop {} }
+}
+#[macro_export]
+macro_rules! format { ($($t:tt)*) => { $crate::string::String::new() }; }
+#[macro_export]
+macro_rules! writeln { ($out:expr, $($t:tt)*) => { $crate::io::Write::write_str(&mut $out, "") }; }
+#[macro_export]
+macro_rules! assert { ($($t:tt)*) => { () }; }
+#[macro_export]
+macro_rules! assert_eq { ($($t:tt)*) => { () }; }
+pub mod prelude {
+    pub mod rust_2024 {
+        pub use crate::option::Option::{self, None, Some};
+        pub use crate::result::Result::{self, Err, Ok};
+        pub use crate::string::{String, ToString};
+        pub use crate::vec::Vec;
+    }
+}
+"#;
+
+/// A fixture crate: its directory under the fixture, relative (`""` for the root), and the
+/// name its `Cargo.toml` gives it, as Rust spells it.
+struct Krate {
+    dir: String,
+    name: String,
+}
+
+/// Each crate of the fixture at `root`, the root first.
+fn crates(root: &Path) -> Vec<Krate> {
+    let mut out = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(dir) = stack.pop() {
+        let at = root.join(&dir);
+        let manifest = at.join("Cargo.toml");
+        if manifest.is_file() && at.join("src/lib.rs").is_file() {
+            let text = std::fs::read_to_string(&manifest).unwrap();
+            let name = text
+                .lines()
+                .find_map(|it| it.strip_prefix("name = \""))
+                .and_then(|it| it.strip_suffix('"'))
+                .unwrap_or_else(|| panic!("no package name in {}", manifest.display()));
+            out.push(Krate { dir: dir.to_str().unwrap().to_owned(), name: name.replace('-', "_") });
+        }
+        let mut subdirs: Vec<PathBuf> = std::fs::read_dir(&at)
+            .unwrap()
+            .map(|it| it.unwrap().path())
+            .filter(|it| it.is_dir() && it.file_name().is_some_and(|it| it != "src"))
+            .map(|it| it.strip_prefix(root).unwrap().to_owned())
+            .collect();
+        subdirs.sort();
+        stack.extend(subdirs.into_iter().rev());
+    }
+    out.sort_by_key(|it| !it.dir.is_empty());
+    out
+}
+
+/// The pack's shared rules files, each as its path in blaze's checkout and its text.
+fn library() -> Vec<(String, String)> {
+    let dir = Path::new(PACK).join("lib");
+    let mut out: Vec<(String, String)> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .map(|it| it.unwrap().path())
+            .map(|it| {
+                let name = it.file_name().unwrap().to_str().unwrap().to_owned();
+                (format!("{PACK_IN_CHECKOUT}/lib/{name}"), std::fs::read_to_string(&it).unwrap())
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    out.sort();
+    out
+}
+
+/// The front end of `rule`'s fixture beside [`STD`] and the pack's library, and the rule's text.
+fn fixture(rule: &str) -> (base_db::Db, super::View, String) {
+    let root = Path::new(PACK).join("tests").join(rule);
+    let crates = crates(&root);
+    assert!(!crates.is_empty(), "no fixture crate under {}", root.display());
+    let mut text = STD.to_owned();
+    let mut paths: Vec<String> = Vec::new();
+    // Dependencies first, so each crate's `deps:` names a crate already declared.
+    for (at, krate) in crates.iter().enumerate().rev() {
+        let path = match krate.dir.as_str() {
+            "" => "src/lib.rs".to_owned(),
+            dir => format!("{dir}/src/lib.rs"),
+        };
+        let mut deps = vec!["std".to_owned()];
+        if at == 0 {
+            deps.extend(crates[1..].iter().map(|it| it.name.clone()));
+        }
+        let source = std::fs::read_to_string(root.join(&path)).unwrap();
+        text.push_str(&format!("//- /{path} crate:{} deps:{} edition:2024\n{source}", krate.name, deps.join(",")));
+        paths.push(path);
+    }
+    for (path, rules) in library() {
+        text.push_str(&format!("//- /{path}\n{rules}"));
+        paths.push(path);
+    }
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let (db, files) = view(&text, 1, &paths);
+    let rules = std::fs::read_to_string(Path::new(PACK).join(format!("{rule}.astlog"))).unwrap();
+    (db, files, rules)
+}
+
+/// The findings as `blaze check --query` prints them ahead of the relations.
+fn shown(outcome: &Rows) -> String {
+    let mut out = String::new();
+    for finding in &outcome.findings {
+        let severity = match finding.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        let at = match &finding.at {
+            Some(Cell::Code { path, line: Some(line), .. }) => format!("{path}:{line}"),
+            Some(Cell::Expanded { call, .. }) => call.clone(),
+            other => panic!("a finding at {other:?}"),
+        };
+        out.push_str(&format!("{severity}: {}\n  --> {at}\n", finding.message));
+    }
+    out
+}
+
+/// `rule`'s findings over its fixture against `expected.txt`.
+fn lints(rule: &str) {
+    let (db, files, rules) = fixture(rule);
+    let outcome = query(&db, &files, &rules).unwrap_or_else(|error| panic!("{rule}: {error}"));
+    let expected = Path::new(PACK).join("tests").join(rule).join("expected.txt");
+    let want = std::fs::read_to_string(&expected).unwrap();
+    let got = shown(&outcome);
+    assert!(got == want, "{rule}: found\n{got}\nwhere {} has\n{want}", expected.display());
+}
+
+/// `rule`'s rewrites of its fixture's root crate against `fixed.rs`.
+fn rewrites(rule: &str) {
+    let (db, files, rules) = fixture(rule);
+    let applied = edit(&db, &files, &rules, &[]).unwrap_or_else(|error| panic!("{rule}: {error}"));
+    let texts = after(&files, &applied.edited.ops);
+    let got = &texts.iter().find(|it| it.0 == "src/lib.rs").expect("the root crate").1;
+    let fixed = Path::new(PACK).join("tests").join(rule).join("fixed.rs");
+    let want = std::fs::read_to_string(&fixed).unwrap();
+    assert!(*got == want, "{rule}: rewrote to\n{got}\nwhere {} has\n{want}", fixed.display());
+}
+
+#[test]
+fn every_rule_of_the_pack_has_a_test_here() {
+    let source = include_str!("rules_sema.rs");
+    let mut rules: Vec<String> = std::fs::read_dir(PACK)
+        .unwrap()
+        .map(|it| it.unwrap().path())
+        .filter(|it| it.extension().is_some_and(|it| it == "astlog"))
+        .map(|it| it.file_stem().unwrap().to_str().unwrap().to_owned())
         .collect();
-    let block = comment.split("```lisp\n").nth(n + 1).expect("the comment's lisp block");
-    block.split("```").next().expect("a closed block").to_owned()
+    rules.sort();
+    assert_eq!(rules.len(), 12, "{rules:?}");
+    for rule in rules {
+        let call = [format!("lints(\"{rule}\")"), format!("rewrites(\"{rule}\")")];
+        assert!(call.iter().any(|it| source.contains(it.as_str())), "no test runs `{rule}`");
+        assert!(Path::new(PACK).join("tests").join(&rule).is_dir(), "`{rule}` has no fixture");
+    }
 }
 
-const LIBRARY: usize = 0;
-const TABLE_OLD: usize = 1;
-const TABLE_NEW: usize = 2;
-const PICKER_OLD: usize = 3;
-const PICKER_NEW: usize = 4;
-
-/// Each finding's line and message, in the order the query gives them.
-#[track_caller]
-fn findings(outcome: &Rows) -> Vec<(u32, String)> {
-    outcome
-        .findings
-        .iter()
-        .map(|it| match &it.at {
-            Some(Cell::Code { line: Some(line), .. }) => (*line, it.message.clone()),
-            other => panic!("a finding not at code with a line: {other:?}"),
-        })
-        .collect()
-}
-
-/// The findings of `rules` over `lib`, with the shared library in the view.
-fn run(lib: &str, rules: &str) -> Vec<(u32, String)> {
-    let fixture = format!(
-        "//- /lib.rs crate:lib edition:2021\n{lib}//- /rules/lib/int-arms.astlog\n{}",
-        block(LIBRARY)
-    );
-    let (db, files) = view(&fixture, 0, &["lib.rs", "rules/lib/int-arms.astlog"]);
-    let outcome = query(&db, &files, rules).unwrap_or_else(|error| panic!("{error}"));
-    findings(&outcome)
-}
-
-/// The lane's `variant-table-disagrees` fixture, with `Check`'s arm written `0b1` (it agrees
-/// with its index arm) and `Query`'s `0x6` (its index arm counts it as 5).
-const TABLE: &str = r#"pub enum Verb {
-    Compiling,
-    Checking,
-}
-pub enum Request {
-    Commit { base: u64 },
-    Check,
-    Build,
-    Status,
-    Stop,
-    Query(u32),
-}
-pub enum Response {
-    Committed { root: u64 },
-    Unit(Verb),
-    Done,
-}
-pub struct Gen {
-    n: u64,
-}
-impl Gen {
-    fn below(&mut self, n: u64) -> u64 {
-        self.n % n
-    }
-    pub fn request(&mut self) -> Request {
-        match self.below(6) {
-            0 => Request::Commit { base: self.below(9) },
-            0b1 => Request::Check,
-            2 => Request::Status,
-            3 => {
-                Request::Build
-            }
-            0x6 => Request::Query(self.below(3) as u32),
-            _ => Request::Stop,
-        }
-    }
-    pub fn response(&mut self) -> Response {
-        match self.below(3) {
-            0 => Response::Committed { root: self.below(7) },
-            1 => Response::Unit(match self.below(2) {
-                0 => Verb::Compiling,
-                _ => Verb::Checking,
-            }),
-            _ => Response::Done,
-        }
-    }
-}
-pub fn request_index(request: &Request) -> usize {
-    match request {
-        Request::Commit { .. } => 0,
-        Request::Check => 1,
-        Request::Build => 2,
-        Request::Status => 3,
-        Request::Stop => 4,
-        Request::Query(_) => 5,
-    }
-}
-pub fn response_index(response: &Response) -> usize {
-    match response {
-        Response::Committed { .. } => 0,
-        Response::Unit(_) => 1,
-        Response::Done => 2,
-    }
-}
-pub fn width(n: u64) -> u32 {
-    match n {
-        0 => 8,
-        1 => 16,
-        _ => 32,
-    }
-}
-"#;
-
-/// The new `variant-table-disagrees` finds the two swapped arms the old one finds, and the arm
-/// written `0x6` that the old one skipped; `0b1 => Request::Check` agrees with `=> 1`, so it is
-/// not reported, where comparing spellings would have.
 #[test]
-fn variant_table_disagrees_rewritten_with_match_arm_and_int_value_also_joins_a_hex_arm() {
-    let swapped = [
-        (29, "this arm makes `lib::Request::Status` from 2, and its index arm counts it as 3".to_owned()),
-        (30, "this arm makes `lib::Request::Build` from 3, and its index arm counts it as 2".to_owned()),
-    ];
-    assert_eq!(run(TABLE, &block(TABLE_OLD)), swapped);
-    let mut new = swapped.to_vec();
-    new.push((33, "this arm makes `lib::Request::Query` from 6, and its index arm counts it as 5".to_owned()));
-    assert_eq!(run(TABLE, &block(TABLE_NEW)), new);
+fn cargo_home_homes() {
+    lints("cargo-home-homes");
 }
 
-/// The lane's `int-arm-variant-picker` fixture.
-const PICKER: &str = r#"pub enum Kind {
-    Lib,
-    Bin,
-    Test,
-    Bench,
-    Example,
-}
-pub enum Goal {
-    Check,
-    Build,
-}
-pub fn kind(n: u64) -> Kind {
-    match n % 5 {
-        0 => Kind::Lib,
-        1 => Kind::Bin,
-        2 => Kind::Test,
-        3 => Kind::Bench,
-        _ => Kind::Example,
-    }
-}
-pub fn goal(n: u64) -> Goal {
-    match n % 2 {
-        0 => Goal::Check,
-        _ => Goal::Build,
-    }
-}
-pub fn width(n: u64) -> u32 {
-    match n % 4 {
-        0 => 8,
-        1 => 16,
-        2 => 32,
-        _ => 64,
-    }
-}
-pub fn index(kind: &Kind) -> u64 {
-    match kind {
-        Kind::Lib => 0,
-        Kind::Bin => 1,
-        Kind::Test => 2,
-        Kind::Bench => 3,
-        Kind::Example => 4,
-    }
-}
-"#;
-
-/// The new `int-arm-variant-picker` finds the one `match` the old one finds, and names the enum
-/// and its five variants beside the four arms.
 #[test]
-fn int_arm_variant_picker_rewritten_with_match_arm_names_the_enum_and_its_variant_count() {
-    let old = run(PICKER, &block(PICKER_OLD));
-    assert_eq!(old, [(13, "4 arms pick a variant by a hand-kept integer: draw from the enum's own list".to_owned())]);
-    let new = run(PICKER, &block(PICKER_NEW));
-    let message = "4 arms pick a `lib::Kind` variant of 5 by a hand-kept integer: draw from the enum's own list";
-    assert_eq!(new, [(13, message.to_owned())]);
+fn cow_to_string() {
+    rewrites("cow-to-string");
+}
+
+#[test]
+fn current_exe_respawn() {
+    lints("current-exe-respawn");
+}
+
+#[test]
+fn deprecated_forwarder_port() {
+    rewrites("deprecated-forwarder-port");
+}
+
+#[test]
+fn enum_cast_index() {
+    lints("enum-cast-index");
+}
+
+#[test]
+fn frame_current_outside_task() {
+    lints("frame-current-outside-task");
+}
+
+#[test]
+fn int_arm_variant_picker() {
+    lints("int-arm-variant-picker");
+}
+
+#[test]
+fn picker_count_const() {
+    lints("picker-count-const");
+}
+
+#[test]
+fn registry_misses_const() {
+    lints("registry-misses-const");
+}
+
+#[test]
+fn stdout_in_spawned_thread() {
+    lints("stdout-in-spawned-thread");
+}
+
+#[test]
+fn tag_collision() {
+    lints("tag-collision");
+}
+
+#[test]
+fn variant_table_disagrees() {
+    lints("variant-table-disagrees");
 }

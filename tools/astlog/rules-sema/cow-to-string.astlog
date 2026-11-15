@@ -1,0 +1,21 @@
+;; `x.to_string()` on an owned `Cow<str>` as `x.into_owned()`.
+;;
+;; `ToString` for `Cow<str>` copies the text whether the `Cow` borrows or owns it; `into_owned`
+;; returns the owned `String` as it is and copies only a borrowed one. The common source is
+;; `.to_string_lossy().to_string()` (172 sites in crates/ and tools/ by `rg`), whose `Cow` owns
+;; a new `String` whenever the bytes were not UTF-8. Rule 11 (don't allocate where you need
+;; not). The receiver is selected by its type, so `&str`, `String` and number receivers of the
+;; same text are left alone, and a `&Cow` (which `into_owned` cannot move out of) is too.
+;;
+;; Rule 73: neither a type nor clippy covers it (`clippy::unnecessary_to_owned` reads
+;; `to_owned` and `to_string` on borrowed data passed on, not this); a lint with this fix is
+;; the end, and this rule is that fix today.
+
+(rule (cow-to-string e x)
+  (expr e "$x.to_string()")
+  (type-of x t)
+  (type-matches t "std::borrow::Cow<str>"))
+
+(rewrite cow-into-owned (cow-to-string e x)
+  (not (in-macro-expansion e))
+  (replace e "$x.into_owned()"))

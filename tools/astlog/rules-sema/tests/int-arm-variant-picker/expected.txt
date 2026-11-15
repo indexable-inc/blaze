@@ -1,0 +1,2 @@
+warning: 4 arms pick a variant by a hand-kept integer: draw from the enum's own list
+  --> src/lib.rs:19

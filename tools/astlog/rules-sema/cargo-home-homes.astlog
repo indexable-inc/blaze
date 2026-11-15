@@ -1,0 +1,25 @@
+;; Every function that derives cargo's home itself: it names `"CARGO_HOME"` and `".cargo"`.
+;;
+;; agents/annoyances/home-2.json: the rule "`CARGO_HOME`, else `.cargo` in `HOME`" was written
+;; out in six functions across crates, and a fix to one (an empty value, a relative path) missed
+;; the others. Rule 30 (one concept, one home). The finding is each such function, and it fires
+;; only when there are two or more, counted across the whole view; a function that names
+;; `CARGO_HOME` to pass it on, `.cargo` of a project directory, and tests are left alone.
+;;
+;; Rule 73: the one home is a function (`blaze_client::place::cargo_home`) and a `.clippy.toml`
+;; ban on the others is the lint; this rule finds the copies to delete first.
+
+(rule (names-var f)
+  (syntax l "LITERAL")
+  (text-match l "^\"CARGO_HOME\"$")
+  (not (in-test l))
+  (enclosing-fn l f))
+(rule (names-dir f)
+  (syntax l "LITERAL")
+  (text-match l "^\"\\.cargo\"$")
+  (not (in-test l))
+  (enclosing-fn l f))
+(rule (derives f) (names-var f) (names-dir f))
+(rule (cargo-home-homes n f c) (derives f) (count c (derives g)) (le 2 c) (defines n f))
+
+(lint cargo-home-homes warning "derives cargo's home itself, one of $c functions that do: call the one home")

@@ -1,0 +1,2 @@
+error: this arm's tag 2 is already an earlier arm's, for another variant
+  --> src/lib.rs:25

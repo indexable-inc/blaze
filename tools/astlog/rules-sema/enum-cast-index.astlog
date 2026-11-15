@@ -1,0 +1,39 @@
+;; An index `a[e as usize]` whose `e` is not a number, a `bool` or a `char`: an enum's
+;; discriminant used as a position.
+;;
+;; agents/annoyances/image-part-array-positional-callers.json: crates/hir-def/src/deps/image.rs
+;; indexes `parts: [&[u8]; Part::ALL.len()]` by `part as usize`, and `Part::DefMap` held tag 2,
+;; the next part's place, so a new part read the def map's bytes. Rule 76 (a value with a
+;; meaning is a type: a typed index). `as_cast` reports every `as` and `untyped_index` integer
+;; fields; neither says the cast's source is an enum.
+;;
+;; There is no "this type is an enum" relation, so the rule says what the type is not, one
+;; primitive at a time; a `type-def` relation would make it one atom.
+;;
+;; Rule 73: the type is the end (an array keyed by the enum, `[T; N]` behind `Index<Part>`);
+;; this lint finds where.
+
+(rule (cast-index i e t)
+  (expr i "$a[$e as usize]")
+  (type-of e t))
+
+(rule (primitive t) (cast-index i e t) (type-matches t "u8"))
+(rule (primitive t) (cast-index i e t) (type-matches t "u16"))
+(rule (primitive t) (cast-index i e t) (type-matches t "u32"))
+(rule (primitive t) (cast-index i e t) (type-matches t "u64"))
+(rule (primitive t) (cast-index i e t) (type-matches t "u128"))
+(rule (primitive t) (cast-index i e t) (type-matches t "usize"))
+(rule (primitive t) (cast-index i e t) (type-matches t "i8"))
+(rule (primitive t) (cast-index i e t) (type-matches t "i16"))
+(rule (primitive t) (cast-index i e t) (type-matches t "i32"))
+(rule (primitive t) (cast-index i e t) (type-matches t "i64"))
+(rule (primitive t) (cast-index i e t) (type-matches t "i128"))
+(rule (primitive t) (cast-index i e t) (type-matches t "isize"))
+(rule (primitive t) (cast-index i e t) (type-matches t "bool"))
+(rule (primitive t) (cast-index i e t) (type-matches t "char"))
+(rule (primitive t) (cast-index i e t) (type-matches t "f32"))
+(rule (primitive t) (cast-index i e t) (type-matches t "f64"))
+
+(rule (enum-cast-index i e t) (cast-index i e t) (not (primitive t)))
+
+(lint enum-cast-index warning "indexes by `$e` of type `$t` cast to `usize`: key the array by the type")

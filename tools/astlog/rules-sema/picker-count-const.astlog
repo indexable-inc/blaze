@@ -1,0 +1,35 @@
+;; A `match` over `x.below(N)` or `x % N`, `N` a const, whose arms do not number `N`.
+;;
+;; crates/blaze-api/src/frames/identity.rs bounds `fn request`'s integer by
+;; `const REQUESTS: usize = 39` and `fn response`'s by `RESPONSES = 48`, and keeps the arms
+;; in step by hand. Fewer arms than `N` hand the missing integers to `_`, which then comes up
+;; twice as often and hides the variant whose integer was skipped; more arms are dead. The
+;; const is found by resolution, so a `use`d or re-exported const is the same const, and its
+;; value is compared as text with the arms' count (`same-text`: there is no integer value of a
+;; literal yet, so `39usize` or `0x27` is never equal).
+;;
+;; Rule 73: a type ends it (the bound derived from the enum, `E::ALL.len()`); `magic_number`
+;; leaves `const` initializers alone. A rule is right until then.
+
+(rule (bound s b) (expr s "$r.below($b)"))
+(rule (bound s b) (expr s "$x % $b"))
+
+;; The const a match's bound names, and the literal it is.
+(rule (bounded m d lit)
+  (bound s b)
+  (parent m s)
+  (kind m "MATCH_EXPR")
+  (syntax cp "PATH")
+  (ancestor b cp)
+  (resolves cp d)
+  (def-kind d "const")
+  (defines cn d)
+  (syntax lit "LITERAL")
+  (parent cn lit))
+
+(rule (arm-of m a) (bounded m d lit) (syntax a "MATCH_ARM") (parent l a) (parent m l))
+(rule (arms m d lit n) (bounded m d lit) (count n (arm-of m x)))
+(rule (agrees m) (arms m d lit n) (same-text n lit))
+(rule (picker-count-const m d lit n) (arms m d lit n) (not (agrees m)))
+
+(lint picker-count-const error "this match is bounded by `$d` = $lit but has $n arms")

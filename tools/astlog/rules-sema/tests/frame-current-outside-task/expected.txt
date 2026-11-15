@@ -1,0 +1,4 @@
+warning: `fixture_frame_current_outside_task::serve_deps` is called by nothing here and reaches `frame::current` through this call in no `frame::task`
+  --> src/lib.rs:17
+warning: `fixture_frame_current_outside_task::direct` is called by nothing here and reaches `frame::current` through this call in no `frame::task`
+  --> src/lib.rs:32

@@ -1,0 +1,4 @@
+warning: indexes by `part` of type `Part` cast to `usize`: key the array by the type
+  --> src/lib.rs:23
+warning: indexes by `Part::Signatures` of type `Part` cast to `usize`: key the array by the type
+  --> src/lib.rs:28

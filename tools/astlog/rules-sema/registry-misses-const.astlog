@@ -1,0 +1,34 @@
+;; A `const` of type `T` in a module that keeps a registry array of `&T` consts, listed in none.
+;;
+;; crates/blaze-profile/src/schema.rs declares 33 `const X: Table` and lists them by hand in
+;; `TABLES: [&Table; 31]` and `RESULTS: [&Table; 2]`; a table in neither is never written or
+;; read (agents/annoyances/telemetry-1112-1.json: adding a table meant editing the array, its
+;; length, a struct field, an initializer and a write line). The type is matched by resolution
+;; and the listing by `references`, so `&schema::SPANS` and `&SPANS` are both a listing.
+;;
+;; Rule 73: a type or one macro that declares a table and registers it at once is the end;
+;; no lint reads a registry's completeness (`registry_spread` reads enum lists). Rule meanwhile.
+
+;; `const X: T = ..`: its def, the def of `T`, its module.
+(rule (entry n d t m)
+  (syntax n "CONST")
+  (syntax ty "PATH_TYPE")
+  (parent n ty)
+  (resolves ty t)
+  (defines n d)
+  (enclosing-module n m))
+
+;; `const R: [&T; N] = [..]` in the same module.
+(rule (registry r t m)
+  (syntax r "CONST")
+  (syntax at "ARRAY_TYPE")
+  (parent r at)
+  (syntax pt "PATH_TYPE")
+  (ancestor at pt)
+  (resolves pt t)
+  (enclosing-module r m))
+
+(rule (listed d) (entry n d t m) (registry r t m) (references d x) (ancestor r x))
+(rule (registry-misses-const n d) (entry n d t m) (registry r t m) (not (listed d)))
+
+(lint registry-misses-const error "`$d` is in no registry array of its module")

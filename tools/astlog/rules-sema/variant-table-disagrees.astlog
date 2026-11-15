@@ -1,0 +1,60 @@
+;; Two hand-kept integer tables of one enum that must be inverses and are not.
+;;
+;; The shape: a generator `match` whose arms are `k => E::V ..` and an index `match` whose arms
+;; are `E::V .. => k`. crates/blaze-api/src/frames/identity.rs keeps two pairs of them
+;; (`fn request` / `fn request_index`, `fn response` / `fn response_index`), 87 arms in all,
+;; by hand, and every hand-written codec keeps the same pair as its encoder's `E::V => tag`
+;; and its decoder's `tag => E::V` (crates/hir-ty/src/mir/persist.rs). A variant whose two
+;; numbers differ is decoded as another variant, or, in identity.rs, generated under one number
+;; and counted under another.
+;; The arms are joined by the variant each one's path resolves to, not by its spelling: an
+;; alias or a `use` of the variant still joins.
+;;
+;; Rule 73: the right end is a type (`#[derive]` of the index from the enum, or the generator
+;; drawing from `E::ALL`), so no table is kept by hand. `blaze::variant_list_drift` reads lists
+;; in the enum's own impls, not a pair of tables in another crate's test; this rule is the
+;; stopgap until it does.
+
+;; `k => ...`: an arm whose pattern is an integer literal.
+(rule (int-arm a k)
+  (syntax k "LITERAL_PAT")
+  (text-match k "^[0-9]+$")
+  (parent a k)
+  (kind a "MATCH_ARM"))
+
+;; Each path to a variant written after the arm's integer.
+(rule (made a k p d)
+  (syntax p "PATH")
+  (resolves p d)
+  (def-kind d "variant")
+  (ancestor a p)
+  (int-arm a k)
+  (precedes k p))
+(rule (made-earlier a p) (made a k p d) (made a k q e) (precedes q p))
+
+;; The variant an arm makes is the first one written in it: `1 => E::Unit(match .. { 0 =>
+;; Verb::A, .. })` makes `E::Unit`.
+(rule (generated a k d) (made a k p d) (not (made-earlier a p)))
+
+;; `E::V .. => k`: an arm whose expression is an integer literal, and the first variant its
+;; pattern names.
+(rule (counted a k p d)
+  (syntax k "LITERAL")
+  (text-match k "^[0-9]+$")
+  (parent a k)
+  (kind a "MATCH_ARM")
+  (syntax p "PATH")
+  (resolves p d)
+  (def-kind d "variant")
+  (ancestor a p)
+  (precedes p k))
+(rule (counted-earlier a p) (counted a k p d) (counted a k q e) (precedes q p))
+(rule (indexed a k d) (counted a k p d) (not (counted-earlier a p)))
+
+;; The two tables are one codec only in one file: a variant's tag and its, say, priority in
+;; another file are two facts, not one.
+(rule (pair g gk i ik d) (generated g gk d) (indexed i ik d) (same-file g i))
+(rule (agrees g i) (pair g gk i ik d) (same-text gk ik))
+(rule (variant-table-disagrees g gk d ik) (pair g gk i ik d) (not (agrees g i)))
+
+(lint variant-table-disagrees error "this arm makes `$d` from $gk, and its index arm counts it as $ik")

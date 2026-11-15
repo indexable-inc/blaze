@@ -1,0 +1,2 @@
+error: this match is bounded by `fixture_picker_count_const::RESPONSES` = 4 but has 3 arms
+  --> src/lib.rs:44

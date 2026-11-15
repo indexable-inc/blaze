@@ -1,0 +1,10 @@
+[package]
+name = "fixture-frame-current-outside-task"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blaze-mem = { path = "blaze-mem" }
+
+[workspace]
+members = ["blaze-mem"]
