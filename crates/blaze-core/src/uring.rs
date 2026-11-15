@@ -23,8 +23,10 @@
 //! through an eventfd it reads.
 //!
 //! The ring is set up with the system calls themselves (`io_uring_setup`, `io_uring_enter`,
-//! `io_uring_register` and `mmap`), the layouts as `linux/io_uring.h` has them. Linux 6.0 or
-//! later: each feature's absence is an error naming it and the kernel that has it. Before 6.1
+//! `io_uring_register` and `mmap`), the layouts as `linux/io_uring.h` has them. [`Polled`] needs
+//! Linux 6.0 and [`Entered`] 6.1, both under blaze's floor, Linux 7.3 (`wait/ring.rs`, whose
+//! wait ring every thread's first wait makes); each feature's absence is an error naming it and
+//! the kernel that has it, which the daemon meets as it starts (it makes one of each). Before 6.1
 //! `statx` says no alignment for writes that bypass the cache, so none does.
 //!
 //! A request in flight is a slot of columns ([`ops`]): 32 bytes a completion reads, the buffer
@@ -43,6 +45,8 @@
 //! a pointer; a provided buffer's id is checked against its group (`Provided::buffer`); and a
 //! ring offset against its mapping (`Map::at`), in every build.
 
+#[cfg(test)]
+mod entered_sim;
 mod files;
 mod flight;
 mod ops;
@@ -958,6 +962,22 @@ struct Ring<S: Submission> {
     /// The `io_uring_enter`s made, for the tests that count them.
     #[cfg(test)]
     enters: u64,
+    /// A safeguard of [`Ring::enter`] removed, for the entered ring's simulation's controls.
+    #[cfg(test)]
+    plant: Plant,
+}
+
+/// A safeguard of [`Ring::enter`] removed: only the entered ring's simulation
+/// (`uring/entered_sim.rs`) plants one.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Plant {
+    None,
+    /// What is submitted is counted from the tail last shown, before this enter's publish: the
+    /// requests written since the last enter are shown and not handed to the kernel.
+    StaleTail,
+    /// A submission does not get events: what the kernel ended in it is not posted.
+    NoGetevents,
 }
 
 impl<S: Submission> Ring<S> {
@@ -1049,6 +1069,8 @@ impl<S: Submission> Ring<S> {
             _submission: std::marker::PhantomData,
             #[cfg(test)]
             enters: 0,
+            #[cfg(test)]
+            plant: Plant::None,
         })
     }
 
@@ -1108,6 +1130,20 @@ impl<S: Submission> Ring<S> {
     /// sleep. Completions the kernel held for want of room are flushed to the ring by any
     /// enter that gets events.
     fn enter(&mut self, until: Option<Deadline>, clock: &impl Clock) -> io::Result<()> {
+        let fd = self.fd.as_raw_fd();
+        self.enter_by(until, clock, |it| wait::enter_ring(fd, it))
+    }
+
+    /// [`Ring::enter`], each `io_uring_enter` made by `call`: the kernel's, or the model of it
+    /// the entered ring's simulation runs (`uring/entered_sim.rs`).
+    fn enter_by(
+        &mut self,
+        until: Option<Deadline>,
+        clock: &impl Clock,
+        call: impl FnMut(wait::Enter) -> Result<u32, i32>,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        let shown = self.sq_shown;
         self.publish();
         let flags = self.flags();
         // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while `self`
@@ -1117,6 +1153,11 @@ impl<S: Submission> Ring<S> {
         // Written and shown, not yet taken by the kernel. With no kernel thread only an enter
         // takes them, so this is exactly what is left to submit.
         let queued = self.sq_local.wrapping_sub(head);
+        #[cfg(test)]
+        let queued = match self.plant {
+            Plant::StaleTail => shown.wrapping_sub(head),
+            Plant::None | Plant::NoGetevents => queued,
+        };
         self.unsubmitted = 0;
         let until = until.or((flags & SQ_CQ_OVERFLOW != 0).then_some(Deadline::PASSED));
         // With no kernel thread, a submission also gets events: under DEFER_TASKRUN the kernel
@@ -1129,6 +1170,11 @@ impl<S: Submission> Ring<S> {
             false if queued > 0 => (queued, ENTER_GETEVENTS),
             false => (0, 0),
         };
+        #[cfg(test)]
+        let flags = match self.plant {
+            Plant::NoGetevents => flags & !ENTER_GETEVENTS,
+            Plant::None | Plant::StaleTail => flags,
+        };
         if until.is_none() && to_submit == 0 && flags == 0 {
             return Ok(());
         }
@@ -1137,7 +1183,7 @@ impl<S: Submission> Ring<S> {
             self.enters += 1;
         }
         let what = "a completion of the io_uring driver";
-        wait::uring_enter(what, self.fd.as_raw_fd(), to_submit, flags, until, clock)?;
+        wait::uring_enter(what, to_submit, flags, until, clock, call)?;
         Ok(())
     }
 
