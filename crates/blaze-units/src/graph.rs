@@ -2063,8 +2063,10 @@ fn schema_target(pkg: PackageId, target: &Target) -> anyhow::Result<schema::Targ
         .with_context(|| format!("`{}`'s target `{}` has no source file", pkg, target.name))?;
     let (kind, crate_types) = kinds(&target.kind);
     Ok(schema::Target {
-        kind,
-        crate_types,
+        // alloc: the output owns its strings.
+        kind: kind.map(str::to_owned).collect(),
+        // alloc: the output owns its strings.
+        crate_types: crate_types.map(str::to_owned).collect(),
         // clone: the output owns its strings.
         name: target.name.clone(),
         // clone: the output owns its strings.
@@ -2079,27 +2081,28 @@ fn schema_target(pkg: PackageId, target: &Target) -> anyhow::Result<schema::Targ
     })
 }
 
-/// A target's `kind` and `crate_types` as `cargo metadata` prints them.
-pub(crate) fn kinds(kind: &TargetKind) -> (Vec<String>, Vec<String>) {
-    // alloc: the output owns its strings.
-    let one = |name: &str| vec![name.to_owned()];
-    // alloc: the output owns its strings.
-    let types = |kinds: &[CrateType]| -> Vec<String> {
-        kinds.iter().map(|it| it.as_str().to_owned()).collect()
+/// A target's `kind` and `crate_types` as `cargo metadata` prints them, borrowed: each is a
+/// library's crate types or one word.
+pub(crate) fn kinds(
+    kind: &TargetKind,
+) -> (impl Iterator<Item = &str>, impl Iterator<Item = &str>) {
+    fn words<'a>(types: &'a [CrateType], one: Option<&'a str>) -> impl Iterator<Item = &'a str> {
+        types.iter().map(CrateType::as_str).chain(one)
+    }
+    let (types, one): (&[CrateType], _) = match kind {
+        TargetKind::Lib(kinds) => (kinds, None),
+        TargetKind::Bin => (&[], Some("bin")),
+        TargetKind::ExampleBin | TargetKind::ExampleLib(_) => (&[], Some("example")),
+        TargetKind::Test => (&[], Some("test")),
+        TargetKind::CustomBuild => (&[], Some("custom-build")),
+        TargetKind::Bench => (&[], Some("bench")),
     };
-    let words = match kind {
-        TargetKind::Lib(kinds) => types(kinds),
-        TargetKind::Bin => one("bin"),
-        TargetKind::ExampleBin | TargetKind::ExampleLib(_) => one("example"),
-        TargetKind::Test => one("test"),
-        TargetKind::CustomBuild => one("custom-build"),
-        TargetKind::Bench => one("bench"),
+    let (crate_types, crate_one): (&[CrateType], _) = match kind {
+        TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => (kinds, None),
+        TargetKind::Bin | TargetKind::ExampleBin | TargetKind::Test | TargetKind::CustomBuild
+        | TargetKind::Bench => (&[], Some("bin")),
     };
-    let crate_types = match kind {
-        TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => types(kinds),
-        _ => one("bin"),
-    };
-    (words, crate_types)
+    (words(types, one), words(crate_types, crate_one))
 }
 
 #[cfg(test)]

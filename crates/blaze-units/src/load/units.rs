@@ -1495,8 +1495,12 @@ fn package_plan(
             .iter()
             .map(|it| {
                 let (kind, crate_types) = crate::graph::kinds(&it.kind);
-                // clone: the plan owns its strings.
-                PackageTarget { name: it.name.clone(), kind, crate_types }
+                PackageTarget {
+                    // clone: the plan owns its strings.
+                    name: it.name.clone(),
+                    kind: kind.map(str::to_owned).collect(),
+                    crate_types: crate_types.map(str::to_owned).collect(),
+                }
             })
             .collect(),
     }
