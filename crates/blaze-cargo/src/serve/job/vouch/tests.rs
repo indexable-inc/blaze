@@ -149,3 +149,37 @@ fn the_oracle_catches_each_planted_bug() {
         assert!(caught.is_err(), "{plant:?} was not caught");
     }
 }
+
+/// The invariant: a read's hash made on the worker pool, off the loop, is the hash the loop
+/// made in line, told back by its vouch's serial, once each; and `out` says whether one is
+/// still out, so the loop polls for it only then. Of 8 reads of 1 MiB, each hashed both ways.
+#[test]
+fn a_hash_on_the_pool_is_told_back_as_the_one_made_in_line() {
+    use super::super::super::settle::Compress;
+    use super::Hashes;
+    let reads: Vec<Vec<u8>> = (0..8u8).map(|n| vec![n; 1 << 20]).collect();
+    let wanted = super::super::certify::content_of(&reads[3], None);
+    let mut inline = Hashes::new();
+    let mut pool = Hashes::new();
+    pool.on(Compress::Pool);
+    for (serial, bytes) in reads.iter().enumerate() {
+        inline.hash(serial as u32, bytes.clone(), wanted, None);
+        pool.hash(serial as u32, bytes.clone(), wanted, None);
+    }
+    let mut made: Vec<_> = std::iter::from_fn(|| inline.back()).collect();
+    assert!(!inline.out(), "a hash in line is back as it is asked");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut told = Vec::new();
+    while pool.out() {
+        assert!(std::time::Instant::now() < deadline, "the pool told {} of 8 hashes back in 30 s", told.len());
+        match pool.back() {
+            Some(back) => told.push(back),
+            None => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
+    made.sort_unstable_by_key(|it| it.0);
+    told.sort_unstable_by_key(|it| it.0);
+    assert_eq!(told, made);
+    assert_eq!(made[3].1, Some(wanted), "the read of the bytes placed hashes to their key");
+    assert!(made.iter().filter(|it| it.1 == Some(wanted)).count() == 1);
+}

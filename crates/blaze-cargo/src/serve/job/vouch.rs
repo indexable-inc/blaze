@@ -15,10 +15,81 @@
 //! record and evidence keep it with the steady look's time. Anything else drops the vouch, and
 //! the next check hashes the output as before: never a condition, never a fallback.
 //!
-//! No IO, no clock: the driver asks the looks and the read and tells their outcomes.
+//! No IO, no clock: the driver asks the looks and the read and tells their outcomes. The read's
+//! hash is no step of the loop's ([`Hashes`]): a worker's, told back as the read is.
 
 use blaze_core::Stamp;
+use blaze_graph::pool::Class;
 use blaze_ids::ContentId;
+use crossbeam_channel::{Receiver, Sender};
+
+use super::super::settle::Compress;
+
+/// The hashes of vouches' reads out on the worker pool, each told back by its vouch's serial
+/// over a channel the loop takes from as it turns ([`super::Jobs::vouch_hashed`]). Until
+/// 2026-11-15 the loop hashed each read itself: after every build each placed program, 20 ms
+/// a 20 MB one on the gauntlet, two to four of them, and a request that came in meanwhile
+/// (the next build's client asking which blaze answers) waited behind them, 85 ms.
+pub(super) struct Hashes {
+    on: Compress,
+    /// How many are out.
+    out: usize,
+    /// A hash made, or `None` for one a panic on its worker lost.
+    send: Sender<(u32, Option<ContentId>)>,
+    recv: Receiver<(u32, Option<ContentId>)>,
+}
+
+impl Hashes {
+    /// Hashed where asked ([`Compress::Inline`]): the simulation's daemons, which run on one
+    /// thread, until the daemon says the pool ([`Hashes::on`]).
+    pub(super) fn new() -> Hashes {
+        let (send, recv) = crossbeam_channel::unbounded();
+        Hashes { on: Compress::Inline, out: 0, send, recv }
+    }
+
+    pub(super) fn on(&mut self, on: Compress) {
+        self.on = on;
+    }
+
+    /// The bytes vouch `serial` read, hashed as the output's key is made with `wanted` the
+    /// key placed ([`super::certify::content_of`]), under `span`, the vouch's; told back
+    /// through [`Hashes::back`].
+    pub(super) fn hash(&mut self, serial: u32, bytes: Vec<u8>, wanted: ContentId, span: Option<tracing::Span>) {
+        self.out += 1;
+        // clone: a channel's sender, once a hash
+        let send = self.send.clone();
+        let work = move || {
+            let _hash = span.map(|span| {
+                tracing::info_span!(target: "blaze", parent: &span, "hash the placed output", bytes = bytes.len()).entered()
+            });
+            super::certify::content_of(&bytes, Some(wanted))
+        };
+        match self.on {
+            Compress::Inline => _ = send.send((serial, Some(work()))),
+            // A panic fails this one vouch: told as no hash, it is dropped and the next check
+            // hashes the output as before.
+            Compress::Pool => blaze_graph::exec::shared().submit_as(
+                None,
+                Class::Background,
+                work,
+                move |done| _ = send.send((serial, done.ok())),
+            ),
+        }
+    }
+
+    /// Whether a hash is out.
+    pub(super) fn out(&self) -> bool {
+        self.out != 0
+    }
+
+    /// A hash told back, if one was: its vouch's serial and the key, `None` where a panic
+    /// lost it.
+    pub(super) fn back(&mut self) -> Option<(u32, Option<ContentId>)> {
+        let back = self.recv.try_recv().ok()?;
+        self.out -= 1;
+        Some(back)
+    }
+}
 
 /// A bug planted here, for a test's control. Never planted outside a test.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
