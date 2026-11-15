@@ -27,10 +27,11 @@
 //! - A checkout whose directory or a changed file of it can't be read, or whose watch ended,
 //!   fails the requests waiting on it, naming it, and its watch stops: the head never keeps a
 //!   file's old bytes as current. The next request watches it again.
-//! - A request that runs user code (a build, check, test or run) starts a round of the watches
-//!   of directories outside views ([`Outside`]) and is held until the round is in, so what its
-//!   checks of user code's inputs trust was heard before it ([`blaze_vfs::unchanged_since`]).
-//!   Until a round is in those checks stat everything: the hold is for speed, not soundness.
+//! - Nothing outside a checkout is watched: what user code reads outside every view is checked
+//!   by stamp, one stat a leaf ([`blaze_vfs::outside`]), so a request waits for no round of
+//!   outside watches. Until 2026-11-14 a request that ran user code waited for one, and setting
+//!   up a watch walked the tree under it on the daemon's loop (256,216 directories under
+//!   `/root` for one watch), which killed the daemon on every real project.
 //!
 //! A checkout is a slot, its watcher's tags `watchers + slot * 2^32`, so a completion finds its
 //! checkout by one shift; a head's name is looked up once, as a request arrives. A batch of
@@ -42,7 +43,7 @@ use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef
 use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use blaze_vfs::{Outside, Vfs, Watched, Watcher};
+use blaze_vfs::{Vfs, Watched, Watcher};
 use std::alloc::Global;
 
 /// How many tags one watcher uses ([`Watcher::new`]).
@@ -59,15 +60,12 @@ pub enum Out {
     Moved { head: String, root: ContentId },
 }
 
-/// A request whose checkouts' watchers, or the watches outside views, have not caught up with
-/// it.
+/// A request whose checkouts' watchers have not caught up with it.
 struct Held {
     from: RequestRef,
     request: Request,
     /// Each checkout it names, by slot, and the flush it waits for there.
     waits: Vec<(u32, u64)>,
-    /// It runs user code: it waits for the round of the watches outside views.
-    outside: bool,
     /// The span of its wait (every-wait-says-what), closed as it is handed on, fails or is
     /// cancelled: how long the watches took to hear every change made before the request.
     /// The wait ends with each flush's completion, which every driver tells, done or failed.
@@ -125,8 +123,6 @@ pub struct Heads {
     /// By flush tag: the checkout's slot and the flush's number.
     flushing: HashMap<Tag, (u32, u64), Global>,
     held: Vec<Held>,
-    /// Kept for the daemon's life: dropping it leaves every directory unconfirmed.
-    outside: Outside<'static>,
 }
 
 /// Whether a head is a checkout's: one the CLI names by the checkout's absolute path.
@@ -177,9 +173,9 @@ pub fn named(request: &Request) -> Vec<&str> {
     heads
 }
 
-/// Whether `request` runs user code (build scripts, proc macros, tests, a binary), whose checks
-/// of their inputs outside views read the watches' round. A reach, an edit, a rules query and a
-/// build ahead build their views' proc macros and run their build scripts before they read them.
+/// Whether `request` runs user code (build scripts, proc macros, tests, a binary). A reach, an
+/// edit, a rules query and a build ahead build their views' proc macros and run their build
+/// scripts before they read them.
 pub fn runs_user_code(request: &Request) -> bool {
     matches!(
         request,
@@ -202,8 +198,8 @@ pub fn runs_user_code(request: &Request) -> bool {
 
 impl Heads {
     /// Flushes take the tags `tags..tags + 2^32`; watchers take ranges of `2^32` from
-    /// `watchers` on, up to `watchers_end`; `outside` its own ([`Outside::owns`]).
-    pub fn new(tags: u64, watchers: u64, watchers_end: u64, outside: Outside<'static>) -> Heads {
+    /// `watchers` on, up to `watchers_end`.
+    pub fn new(tags: u64, watchers: u64, watchers_end: u64) -> Heads {
         Heads {
             tags,
             watchers,
@@ -213,14 +209,11 @@ impl Heads {
             slots: HashMap::new_in(Global),
             flushing: HashMap::new_in(Global),
             held: Vec::new(),
-            outside,
         }
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
-        tag.0.wrapping_sub(self.tags) < 1 << 32
-            || (tag.0 >= self.watchers && tag.0 < self.watcher_end)
-            || self.outside.owns(tag)
+        tag.0.wrapping_sub(self.tags) < 1 << 32 || (tag.0 >= self.watchers && tag.0 < self.watcher_end)
     }
 
     /// The checkout's slot a watcher's tag is of.
@@ -290,8 +283,7 @@ impl Heads {
             return;
         }
         let heads = named(&request);
-        let outside = runs_user_code(&request);
-        if heads.is_empty() && !outside {
+        if heads.is_empty() {
             out.push(Out::Pass(Arrived::Request { from, request }));
             return;
         }
@@ -309,17 +301,13 @@ impl Heads {
                 }
             }
         }
-        if outside {
-            self.outside.flush(effects);
-        }
         let _waiting = tracing::info_span!(
             target: "blaze",
             "the request waits for the watches to hear every change made before it",
             checkouts = waits.len(),
             first_looks,
-            outside,
         );
-        self.held.push(Held { from, request, waits, outside, _waiting });
+        self.held.push(Held { from, request, waits, _waiting });
         self.release(out);
     }
 
@@ -420,8 +408,6 @@ impl Heads {
     ) {
         if completion.tag.0.wrapping_sub(self.tags) < 1 << 32 {
             self.flushed(completion, out);
-        } else if self.outside.owns(completion.tag) {
-            self.outside.complete(completion, effects);
         } else {
             self.watched(vfs, wall_ns, completion, effects, out);
         }
@@ -533,10 +519,9 @@ impl Heads {
     }
 
     /// Hands on every held request whose every checkout's flush is told and committed what
-    /// it was told before, and, if it runs user code, whose round outside views is in, oldest
-    /// first. A request held for an older round waits for the newer one too.
+    /// it was told before, oldest first.
     fn release(&mut self, out: &mut Vec<Out>) {
-        let (checkouts, flushed) = (&self.checkouts, self.outside.flushed());
+        let checkouts = &self.checkouts;
         let caught_up = |(slot, number): &(u32, u64)| {
             checkouts.get(*slot as usize).and_then(Option::as_deref).is_some_and(|it| {
                 #[cfg(test)]
@@ -546,10 +531,7 @@ impl Heads {
                 it.watcher.idle() && it.flushes.get(number).is_some_and(|told| *told)
             })
         };
-        for held in self
-            .held
-            .extract_if(.., |it| (flushed || !it.outside) && it.waits.iter().all(&caught_up))
-        {
+        for held in self.held.extract_if(.., |it| it.waits.iter().all(&caught_up)) {
             out.push(Out::Pass(Arrived::Request { from: held.from, request: held.request }));
         }
     }
@@ -587,8 +569,6 @@ fn answer(out: &mut Vec<Out>, to: RequestRef, error: Option<ApiError>, ok: bool)
 
 #[cfg(test)]
 mod tests {
-    use blaze_vfs::outside::Dirs;
-
     use super::*;
 
     /// The wall clock the tests' driver reads: a real epoch's, long after every stamp they
@@ -621,17 +601,13 @@ mod tests {
         assert_eq!(named(&diff), vec!["/w"]);
     }
 
-    /// A table of its own, so tests that run at once each drive one.
-    fn outside(tags: u64) -> (&'static Dirs, Outside<'static>) {
-        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
-        (dirs, Outside::new(dirs, "/", tags))
-    }
-
+    /// The invariant: a request that runs user code on no checkout is handed on at once and
+    /// asks the driver for nothing, no `Effect::Watch` of any directory outside a checkout
+    /// above all: nothing outside a checkout is watched.
     #[test]
-    fn a_request_that_runs_user_code_waits_for_the_round_outside_views() {
-        let (dirs, outside) = outside(1 << 40);
-        let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside);
-        let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 1 << 50, &[]);
+    fn a_request_that_runs_user_code_asks_no_watch_outside_a_checkout() {
+        let mut heads = Heads::new(0, 1 << 32, 1 << 40);
+        let (vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 1 << 50, &[]);
         let (mut effects, mut out) = (Vec::new(), Vec::new());
         let targets = blaze_api::Targets {
             packages: Vec::new(),
@@ -660,56 +636,13 @@ mod tests {
                 .collect()
         };
 
-        heads.arrive(&vfs, NOW_NS, build(1), &mut effects, &mut out);
-        assert_eq!(passed(&mut out), [1], "nothing is watched: the round is in at once");
-
-        dirs.want(std::path::Path::new("/usr/include"));
-        heads.arrive(&vfs, NOW_NS, build(2), &mut effects, &mut out);
-        assert_eq!(passed(&mut out), [2], "a watch not yet confirmed has nothing to flush");
-        let stat = effects
-            .iter()
-            .find_map(|it| match it {
-                Effect::Stat { tag, .. } => Some(*tag),
-                _ => None,
-            })
-            .expect("the new watch is confirmed by a stat");
-        let meta = blaze_core::Meta { len: 0, dir: true, modified_ns: 0 };
-        heads.complete(
-            &mut vfs,
-            NOW_NS,
-            Completion { tag: stat, done: Done::Stat(Some(meta)) },
-            &mut effects,
-            &mut out,
-        );
-        effects.clear();
-
-        heads.arrive(&vfs, NOW_NS, build(3), &mut effects, &mut out);
-        let flush = effects
-            .iter()
-            .find_map(|it| match it {
-                Effect::Flush { tag, .. } => Some(*tag),
-                _ => None,
-            })
-            .expect("the confirmed watch is flushed");
-        assert!(out.is_empty());
-        assert_eq!(heads.waiting(), 1);
-        heads.arrive(
-            &vfs,
-            NOW_NS,
-            Arrived::Request { from: from(4), request: Request::Status },
-            &mut effects,
-            &mut out,
-        );
-        assert_eq!(passed(&mut out), [4], "what runs no user code waits for no round");
-
-        heads.complete(
-            &mut vfs,
-            NOW_NS,
-            Completion { tag: flush, done: Done::Flushed },
-            &mut effects,
-            &mut out,
-        );
-        assert_eq!(passed(&mut out), [3]);
+        for id in 1..=3 {
+            heads.arrive(&vfs, NOW_NS, build(id), &mut effects, &mut out);
+            assert_eq!(passed(&mut out), [id], "held for nothing");
+        }
+        assert!(runs_user_code(&Request::Build { view: ViewRef::Head("ci/main".to_owned()), targets }));
+        assert!(effects.is_empty(), "nothing asked of the driver: {effects:?}");
+        assert!(!effects.iter().any(|it| matches!(it, Effect::Watch { .. })), "a watch outside a checkout");
         assert_eq!(heads.waiting(), 0);
     }
 
@@ -787,7 +720,7 @@ mod tests {
     /// checkout for it: no file of a cookie, no build directory.
     #[test]
     fn a_checkout_is_caught_up_with_by_a_flush_that_writes_nothing() {
-        let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside(1 << 40).1);
+        let mut heads = Heads::new(0, 1 << 32, 1 << 40);
         let mut effects = Vec::new();
         let vfs = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]).0;
         let numbers: Vec<u64> =
@@ -819,7 +752,7 @@ mod tests {
     fn the_request_that_starts_a_watch_waits_for_its_look_and_asks_no_flush() {
         for planted in [false, true] {
             plant_passes_before_the_look(planted);
-            let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside(1 << 40).1);
+            let mut heads = Heads::new(0, 1 << 32, 1 << 40);
             let mut vfs = Vfs::recover(FileName::new("journal").unwrap(), 1 << 50, &[]).0;
             let (mut effects, mut out) = (Vec::new(), Vec::new());
             let open = |id| Arrived::Request {

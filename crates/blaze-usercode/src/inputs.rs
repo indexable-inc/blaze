@@ -6,26 +6,22 @@
 //! The machine's files are the one thing of user code read outside a view: they are hashed
 //! once per change of what `stat` says of them, in one table every check of the process shares
 //! ([`Files`]), and a file that is there and can't be read is an error naming it, never left
-//! out. A path under a directory the vfs watches ([`blaze_vfs::outside`]) is not even
-//! `stat`ed while the watch has heard nothing under it.
+//! out. Every check is one `stat` (an `lstat` for an entry or a listing) and nothing else while
+//! the stamp holds ([`blaze_vfs::outside::holds`]): the floor, since nothing watches a
+//! directory outside a checkout. A file is read again only when its stamp moved or was racy.
 
 use std::{
     ffi::{OsStr, OsString},
-    fmt,
-    hash::Hasher as _,
-    io,
+    fmt, io,
     path::{Path, PathBuf},
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering, fence},
-    },
+    sync::OnceLock,
 };
 
-use blaze_hash::FixedHasher;
+use blaze_core::Stamp;
 use blaze_ids::{ContentId, Hasher, Interner, Sharded};
 use blaze_mem::{Tag, frame};
 use blaze_query::{Cancelled, Cx};
-use blaze_vfs::outside::{Cover, Dirs, LookKind, Looks};
+use blaze_vfs::outside::{LookKind, Looks};
 
 use crate::trace::{DIRECTORY, Entry, Inputs, Names, entry_digest, listing, os_bytes};
 
@@ -50,80 +46,26 @@ impl fmt::Display for Unreadable {
     }
 }
 
-/// What `stat` says of a file: a hash made when it said this is the file's hash now.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Stamp {
-    len: u64,
-    modified: i128,
-    changed: i128,
-    inode: u64,
-    device: u64,
+/// A stamp's bytes as part of a key ([`Stamp::encode`]'s layout), on the stack.
+fn stamp_bytes(stamp: &Stamp) -> [u8; Stamp::BYTES] {
+    let mut out = [0; Stamp::BYTES];
+    out[..8].copy_from_slice(&stamp.ino.to_le_bytes());
+    out[8..16].copy_from_slice(&stamp.size.to_le_bytes());
+    out[16..24].copy_from_slice(&stamp.mtime_ns.to_le_bytes());
+    out[24..32].copy_from_slice(&stamp.ctime_ns.to_le_bytes());
+    out[32..].copy_from_slice(&stamp.mode.to_le_bytes());
+    out
 }
 
-impl Stamp {
-    fn of(meta: &std::fs::Metadata) -> Stamp {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            Stamp {
-                len: meta.len(),
-                modified: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-                changed: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
-                inode: meta.ino(),
-                device: meta.dev(),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let nanos = |time: io::Result<std::time::SystemTime>| {
-                time.ok()
-                    .and_then(|it| it.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(-1, |it| it.as_nanos() as i128)
-            };
-            Stamp {
-                len: meta.len(),
-                modified: nanos(meta.modified()),
-                changed: nanos(meta.created()),
-                inode: 0,
-                device: 0,
-            }
-        }
-    }
-
-    /// Whether a write could still land under this stamp, `now_ns` being the wall clock: the
-    /// file last changed less than [`RACY_NS`] ago, or after now (another machine's clock, a
-    /// clock set back). A kernel stamps a write with a clock that ticks every few
-    /// milliseconds (a second on some file systems), so a file hashed in the tick it was
-    /// written in and written again in that tick, to the same length, has the stamp it was
-    /// hashed under and other bytes. Git's index has the same hole and the same answer
-    /// ("racy git"): such a stamp stands for nothing yet, and the file is hashed again at its
-    /// next check, until its last change is old enough that no write can share its tick.
-    fn racy(&self, now_ns: i128) -> bool {
-        self.modified.max(self.changed).saturating_add(RACY_NS) > now_ns
-    }
-
-    fn bytes(&self) -> [u8; 56] {
-        let mut out = [0; 56];
-        out[..8].copy_from_slice(&self.len.to_le_bytes());
-        out[8..24].copy_from_slice(&self.modified.to_le_bytes());
-        out[24..40].copy_from_slice(&self.changed.to_le_bytes());
-        out[40..48].copy_from_slice(&self.inode.to_le_bytes());
-        out[48..].copy_from_slice(&self.device.to_le_bytes());
-        out
-    }
+/// The wall clock, the one a kernel stamps a write with ([`blaze_core::system_wall_ns`]).
+fn wall_ns() -> u64 {
+    blaze_core::system_wall_ns()
 }
 
-/// How long after a file's last change its stamp is not taken for its content
-/// ([`Stamp::racy`]): above the coarsest tick a file system blaze reads stamps a write with
-/// (FAT's two seconds).
-const RACY_NS: i128 = 2_000_000_000;
-
-/// The wall clock in nanoseconds since the epoch, the clock a kernel stamps a file with; the
-/// least value when it cannot be read, under which every stamp is racy and none is kept.
-fn wall_ns() -> i128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(i128::MIN, |it| i128::try_from(it.as_nanos()).unwrap_or(i128::MAX))
+/// The stamp of a metadata, as every driver makes one: the one definition
+/// ([`blaze_vfs::outside::stamp_of`]).
+fn stamp_of(meta: &std::fs::Metadata) -> Stamp {
+    blaze_vfs::outside::stamp_of(meta)
 }
 
 /// When a run began, for asking whether what it read can have moved since ([`Began::moved`]).
@@ -133,24 +75,21 @@ fn wall_ns() -> i128 {
 /// is the next check's to find; what changed before it is this one's.
 #[derive(Clone, Copy, Debug)]
 pub struct Began {
-    /// The watches' generation ([`Dirs::generation`]) before the run.
-    generation: u64,
     /// The wall clock ([`wall_ns`]) before the run, as a kernel stamps a write.
-    wall_ns: i128,
+    wall_ns: u64,
 }
 
 impl Began {
     /// Now, read before a run starts.
     pub fn now() -> Began {
-        Began { generation: blaze_vfs::outside::generation(), wall_ns: wall_ns() }
+        Began { wall_ns: wall_ns() }
     }
 
     /// The first thing `traced` read that can have changed since the run began, so the hashes
     /// it was assembled with need not be what the run read; `None` when nothing can have.
-    /// Each path is asked of by every name its answer rests on ([`names`]): a watch that
-    /// heard nothing of the name since vouches for it with no syscall; else the name and
-    /// every directory above it are `stat`ed, and one whose last change can share a tick
-    /// with the run's start or come after it ([`Stamp::racy`]) has moved. A path whose names
+    /// Each path is asked of by every name its answer rests on ([`names`]): the name and
+    /// every directory above it are `lstat`ed, and one whose last change can share a tick
+    /// with the run's start or come after it ([`blaze_vfs::racy`]) has moved. A path whose names
     /// can't be told has moved: it is never taken as still. Conservative: a change beside the
     /// name in its directory, or the run's own write of what it read, counts as a move, and
     /// the pass is not kept, never a stale one kept.
@@ -179,12 +118,8 @@ impl Began {
             // alloc: once per run not kept, the path its line names
             return Some(Moved { read: path.to_path_buf(), at: path.to_path_buf(), why: MovedWhy::Untold });
         };
-        let dirs = blaze_vfs::outside::dirs();
         let last = names.len() - 1; // `names` ends with the name the path leads to
         names.iter().enumerate().find_map(|(n, name)| {
-            if dirs.name_unchanged_since(name, self.generation) {
-                return None;
-            }
             let at = stamped_since(name, self.wall_ns)?;
             let why = MovedWhy::of(path, name, n == last, at);
             tracing::info!(
@@ -192,7 +127,7 @@ impl Began {
                 read = %path.display(),
                 at = %at.display(),
                 why = why.word(),
-                "a run's read is taken as changed since the run began: no watch vouches for it, and this name's stamp can share a tick with the run's start or is after it, or it can't be asked"
+                "a run's read is taken as changed since the run began: this name's stamp can share a tick with the run's start or is after it, or it can't be asked"
             );
             // alloc: once per run not kept, the paths its line names
             Some(Moved { read: path.to_path_buf(), at: at.to_path_buf(), why })
@@ -292,12 +227,13 @@ impl fmt::Display for Said<'_> {
 }
 
 /// `name` (with no link in it, as [`names`] gives it) or the first directory above it that
-/// last changed within [`RACY_NS`] of `since_ns` or after it; `None` when none did. A name
+/// last changed within its racy window ([`blaze_vfs::racy`]) of `since_ns` or after it; `None`
+/// when none did. A name
 /// that is not there is a name whose removal its directory's stamp says; one that can't be
 /// `stat`ed has moved.
-fn stamped_since(name: &Path, since_ns: i128) -> Option<&Path> {
+fn stamped_since(name: &Path, since_ns: u64) -> Option<&Path> {
     name.ancestors().find(|at| match std::fs::symlink_metadata(at) {
-        Ok(meta) => Stamp::of(&meta).racy(since_ns),
+        Ok(meta) => blaze_vfs::racy(&stamp_of(&meta), since_ns),
         Err(error) => !missing(&error),
     })
 }
@@ -306,28 +242,17 @@ fn stamped_since(name: &Path, since_ns: i128) -> Option<&Path> {
 /// was hashed. Append-only: a lookup takes no lock and writes nothing shared, a file is hashed
 /// outside any lock, and an edit adds an entry under its new stamp rather than changing one.
 ///
-/// Each path's last answer is also kept with the watched directories covering it
-/// ([`blaze_vfs::Cover`]: its own, and for a path named through symlinks each link's and the
-/// file's they end at, [`names`]) and the generation read before it was looked at: while the
-/// watches have heard nothing under those directories since, the answer is returned with no
-/// syscall.
+/// The floor of a check: one `stat` (an `lstat` for an entry or a listing) and nothing read
+/// while the stamp is known; a check costs exactly that (ratio 1.0). A listing kept under its
+/// directory's stamp is listed again only when a name was made, removed or renamed in it.
 pub struct Files {
     stamped: Sharded<[u8; 32]>,
-    vouched: Sharded<Vouched>,
-    /// What [`Files::entry`] last said of a path whose directory has no link in its name,
-    /// with the generation read before it looked: vouched for while the watches heard
-    /// nothing under a directory at or above it since.
-    entries: blaze_core::lock::Lock<
-        blaze_hash::HashMap<PathBuf, (u64, Entry), std::alloc::Global>,
-    >,
-    /// What [`Inputs::names`] last listed of a directory (each name and whether it is a
-    /// directory), with the generation read before it listed.
+    /// What [`Inputs::names`] last listed of a directory, under the directory's stamp.
     listings: blaze_core::lock::Lock<blaze_hash::HashMap<PathBuf, Listed, std::alloc::Global>>,
-    dirs: &'static Dirs,
-    /// The wall clock a stamp is judged racy against ([`Stamp::racy`]): [`wall_ns`], or a
+    /// The wall clock a stamp is judged racy against ([`blaze_vfs::racy`]): [`wall_ns`], or a
     /// test's own ([`Files::with_clock`]), so a file just written is not racy to a test that
     /// says its clock is past the racy window.
-    clock: fn() -> i128,
+    clock: fn() -> u64,
 }
 
 thread_local! {
@@ -338,88 +263,9 @@ thread_local! {
     pub static MISSING_PARENT_IS_UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// A directory's listing as kept: the generation read before it was listed, and each name
-/// with whether it is a directory.
-type Listed = (u64, std::sync::Arc<[(OsString, bool)]>);
-
-/// The name a listing's watch is asked of: one no entry of a directory has (a NUL in it).
-const LISTING: &str = "\0the listing";
-
-thread_local! {
-    /// A planted bug, for a test's control: a directory is listed off the disk on every ask,
-    /// as until 2026-11-12. Never set outside a test.
-    #[doc(hidden)]
-    pub static LISTING_LOOKS_EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-thread_local! {
-    /// A planted bug, for a test's control: [`Files::entry`] looks at the disk on every ask,
-    /// as until 2026-11-12. Never set outside a test.
-    #[doc(hidden)]
-    pub static ENTRY_LOOKS_EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// A path's last answer, under a sequence lock: written on a miss (rare, and a writer that
-/// finds another writing skips), read with three loads and a compare.
-struct Vouched {
-    path: Box<OsStr>,
-    /// One for each name the answer rests on ([`names`]): all must have heard nothing. `None`
-    /// for a path with `..` in it, one whose links don't resolve, or one a name of
-    /// which no watched directory covers: each of its checks looks at the disk.
-    names: Option<Box<[PathBuf]>>,
-    sequence: AtomicU64,
-    generation: AtomicU64,
-    present: AtomicBool,
-    hash: [AtomicU64; 4],
-}
-
-impl Vouched {
-    fn read(&self) -> Option<(u64, Option<[u8; 32]>)> {
-        let sequence = self.sequence.load(Ordering::Acquire);
-        if sequence & 1 == 1 {
-            return None;
-        }
-        let generation = self.generation.load(Ordering::Relaxed);
-        let present = self.present.load(Ordering::Relaxed);
-        let mut hash = [0; 32];
-        for (at, word) in self.hash.iter().enumerate() {
-            hash[at * 8..at * 8 + 8].copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
-        }
-        fence(Ordering::Acquire);
-        (self.sequence.load(Ordering::Relaxed) == sequence)
-            .then_some((generation, present.then_some(hash)))
-    }
-
-    fn write(&self, generation: u64, answer: Option<[u8; 32]>) {
-        let sequence = self.sequence.load(Ordering::Relaxed);
-        if sequence & 1 == 1
-            || self
-                .sequence
-                .compare_exchange(sequence, sequence + 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-        {
-            return;
-        }
-        fence(Ordering::Release);
-        self.generation.store(generation, Ordering::Relaxed);
-        self.present.store(answer.is_some(), Ordering::Relaxed);
-        let hash = answer.unwrap_or_default();
-        for (at, word) in self.hash.iter().enumerate() {
-            let mut bytes = [0; 8];
-            bytes.copy_from_slice(&hash[at * 8..at * 8 + 8]);
-            word.store(u64::from_le_bytes(bytes), Ordering::Relaxed);
-        }
-        self.sequence.store(sequence + 2, Ordering::Release);
-    }
-}
-
-/// splitmix64's finalizer: every bit of the result depends on every bit of `word`, as the table's
-/// shard and probe bits need.
-fn mix(mut word: u64) -> u64 {
-    word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    word ^ (word >> 31)
-}
+/// A directory's listing as kept: the directory's `lstat` stamp before it was listed, the
+/// instant of that look, and each name with whether it is a directory.
+type Listed = (Stamp, u64, std::sync::Arc<[(OsString, bool)]>);
 
 /// The most symlinks one path is followed through, as the kernel's own bound is (`MAXSYMLINKS`
 /// is 32 on macOS, 40 on Linux): past it the path is not vouched for.
@@ -499,30 +345,19 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
 
 impl Files {
     pub fn new() -> Files {
-        Files::watched_by(blaze_vfs::outside::dirs())
-    }
-
-    /// A table whose answers are vouched for by `dirs`' watches.
-    pub fn watched_by(dirs: &'static Dirs) -> Files {
         Files {
             stamped: Sharded::new(),
-            vouched: Sharded::new(),
-            entries: blaze_core::lock::Lock::new(
-                "usercode.inputs.entries",
-                blaze_hash::HashMap::new_in(std::alloc::Global),
-            ),
             listings: blaze_core::lock::Lock::new(
                 "usercode.inputs.listings",
                 blaze_hash::HashMap::new_in(std::alloc::Global),
             ),
-            dirs,
             clock: wall_ns,
         }
     }
 
     /// The same table judging stamps against `clock` in place of the wall clock.
     #[cfg(test)]
-    pub(crate) fn with_clock(self, clock: fn() -> i128) -> Files {
+    pub(crate) fn with_clock(self, clock: fn() -> u64) -> Files {
         Files { clock, ..self }
     }
 
@@ -532,178 +367,90 @@ impl Files {
         FILES.get_or_init(Files::new)
     }
 
-    /// Where `path`'s answer is kept: two seeded `FixedHasher` passes, mixed, in place of BLAKE3,
-    /// which costs ten times the rest of a check. The table never leaves the process, and
-    /// [`Vouched::path`] is compared on each find, so two paths that collide are told apart
-    /// (the later one is looked at on the disk every time).
-    fn path_id(path: &Path) -> ContentId {
-        let bytes = path.as_os_str().as_encoded_bytes();
-        let pass = |seed: u64| {
-            let mut hasher = FixedHasher::with_seed(seed);
-            hasher.write(bytes);
-            mix(hasher.finish())
-        };
-        let (a, b) = (pass(0x243f_6a88_85a3_08d3), pass(0x1319_8a2e_0370_7344));
-        let mut id = [0; 32];
-        // identity: two seeded passes over one path's bytes mixed into one key of a table that never leaves the process and compares the path on each find; not the identity of a set
-        for (at, word) in [a, b, mix(a ^ b), mix(a.wrapping_add(b))].into_iter().enumerate() {
-            id[at * 8..at * 8 + 8].copy_from_slice(&word.to_le_bytes());
-        }
-        ContentId(id)
-    }
-
+    /// The key of a hash kept under `stamp` for `path`. The domain is new with the stamp's
+    /// layout ([`blaze_core::Stamp`], which has the mode and no device).
     fn key(path: &Path, stamp: &Stamp) -> ContentId {
-        Hasher::new(crate::trace::os_domain!("blaze v2 disk stamp 1"))
+        Hasher::new(crate::trace::os_domain!("blaze v2 disk stamp 2"))
             .part(&os_bytes(path.as_os_str()))
-            .part(&stamp.bytes())
+            .part(&stamp_bytes(stamp))
             .finish()
     }
 
-    /// What `path` hashes as, links followed. When no watch vouches for the answer kept the
-    /// disk is looked at, and the look is pushed to `looks` with what it said; a file that
-    /// can't be read pushes nothing.
+    /// What `path` hashes as, links followed: one `stat`, and a read only when no hash is kept
+    /// under its stamp. The look is pushed to `looks` with what it said and the stamp it said
+    /// it under ([`Looks::push_stamped`]; [`Stamp::UNKNOWN`] for a file that moved while it
+    /// was read, which is never held); a file that can't be read pushes nothing.
     fn file(&self, path: &Path, looks: &Looks) -> Result<Option<[u8; 32]>, Unreadable> {
-        let id = Files::path_id(path);
-        let found = self.vouched.find(&id).map(|it| self.vouched.get(it));
-        let known = found.filter(|it| *it.path == *path.as_os_str());
-        if let Some(known) = known
-            && let Some(names) = &known.names
-            && let Some((generation, answer)) = known.read()
-            && names.iter().all(|name| self.dirs.name_unchanged_since(name, generation))
-        {
-            return Ok(answer);
-        }
-        let generation = self.dirs.generation();
-        // No watch vouched for the answer kept, or none was kept: the disk is looked at, and
-        // the look kept by the build it was made for, with what it said.
-        let (answer, settled) = self.look(path)?;
-        looks.push(path, LookKind::File, answer);
-        if settled {
-            match (known, found) {
-                (Some(known), _) => known.write(generation, answer),
-                (None, None) => self.vouch(id, path, generation, answer),
-                (None, Some(_)) => {}
-            }
-        }
+        let looked_ns = (self.clock)();
+        let (answer, stamp) = self.look(path)?;
+        looks.push_stamped(path, LookKind::File, answer, stamp, looked_ns);
         Ok(answer)
     }
 
-    /// Keeps a first answer for `path`, with the directory to vouch for it if it is canonical:
-    /// its parent is watched from the driver's next round.
-    fn vouch(&self, id: ContentId, path: &Path, generation: u64, answer: Option<[u8; 32]>) {
-        // Every name the answer rests on has its directory wanted, and all are covered or the
-        // answer is not vouched for.
-        // Every name the answer rests on is asked of by name ([`Dirs::watch_name`]): what
-        // is written elsewhere under its directory does not move it.
-        let names = names(path, answer).map(|names| {
-            for name in &names {
-                self.dirs.watch_name(name);
-            }
-            names.into_boxed_slice()
-        });
-        let at = self.vouched.intern(id, || Vouched {
-            path: path.as_os_str().into(), // alloc: once per path, on its first miss
-            names,
-            sequence: AtomicU64::new(0),
-            generation: AtomicU64::new(0),
-            present: AtomicBool::new(false),
-            hash: Default::default(),
-        });
-        let kept = self.vouched.get(at);
-        if *kept.path == *path.as_os_str() {
-            kept.write(generation, answer);
-        }
-    }
-
-    /// What `path` hashes as on the disk now, and whether that held while it was looked at.
-    fn look(&self, path: &Path) -> Result<(Option<[u8; 32]>, bool), Unreadable> {
+    /// What `path` hashes as on the disk now, and the stamp (a `stat`) it held under while it
+    /// was looked at: [`Stamp::GONE`] for nothing there, [`Stamp::UNKNOWN`] when the stamp
+    /// moved during the read.
+    fn look(&self, path: &Path) -> Result<(Option<[u8; 32]>, Stamp), Unreadable> {
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
-            Err(error) if missing(&error) => return Ok((None, true)),
+            Err(error) if missing(&error) => return Ok((None, Stamp::GONE)),
             Err(error) => return Err(unreadable(error)),
         };
+        let stamp = stamp_of(&meta);
         if meta.is_dir() {
-            return Ok((Some(DIRECTORY), true));
+            return Ok((Some(DIRECTORY), stamp));
         }
         if !meta.is_file() {
             // A pipe (the jobserver's), a socket or a device: reading it would take what is in
             // it from whoever it is for, or never end. What comes out of one is no file's
             // contents: the sandbox notes a read of the random devices as `T random`.
-            return Ok((Some(SPECIAL), true));
+            return Ok((Some(SPECIAL), stamp));
         }
-        let stamp = Stamp::of(&meta);
         let key = Files::key(path, &stamp);
         if let Some(found) = self.stamped.find(&key) {
-            return Ok((Some(*self.stamped.get(found)), true));
+            return Ok((Some(*self.stamped.get(found)), stamp));
         }
         let file = std::fs::File::open(path).map_err(unreadable)?;
         let hash = hash_reader(file).map_err(unreadable)?;
         // A file changed while it was read is hashed again at its next check.
-        let after = std::fs::metadata(path).map(|it| Stamp::of(&it)).ok();
-        let settled = after == Some(stamp);
-        // Kept only under a stamp no later write can share ([`Stamp::racy`]).
-        if settled && !stamp.racy((self.clock)()) {
+        let after = std::fs::metadata(path).map(|it| stamp_of(&it)).ok();
+        if after != Some(stamp) {
+            return Ok((Some(hash), Stamp::UNKNOWN));
+        }
+        // Kept only under a stamp no later write can share ([`blaze_vfs::racy`]).
+        if !blaze_vfs::racy(&stamp, (self.clock)()) {
             self.stamped.intern(key, || hash);
         }
-        Ok((Some(hash), settled))
+        Ok((Some(hash), stamp))
     }
 
     /// What `path` is as a view holds it ([`Inputs::entry`]), a link not followed, as
     /// blaze-cargo's fetch reads a tree into one: a link is its target, `/`-separated; a file
     /// is executable when any of its execute bits is set. A file's content ID is kept under
     /// what `stat` says of it, as its hash is.
+    ///
+    /// One `lstat`, and a read only when no id is kept under the stamp; the look is pushed to
+    /// `looks` with what it said ([`entry_digest`]) and that stamp; a path that can't be read
+    /// as an entry pushes nothing.
     fn entry(&self, path: &Path, looks: &Looks) -> Result<Entry, Unreadable> {
         // alloc: error path
         let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
-        // alloc: error path
-        let unreadable =
-            |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         if path.file_name().is_some_and(|it| it.to_str().is_none()) {
             return Err(refused("its name is not UTF-8, which no view holds"));
         }
-        // The invariant: the disk is looked at only while no watch vouches for the answer
-        // kept. An entry is the path itself, a link not followed, so its answer rests on the
-        // names of its directory alone: kept when that directory's name has no link in it
-        // (it is its own canonical name, the form a watch is asked in), with the generation
-        // read before the look. Until 2026-11-12 every ask looked: a link's native inputs
-        // (glibc's `crt*.o` and `lib*.so`, ten each a build) kept every build on NixOS from
-        // being answered again without a walk.
-        let kept = self.entries.lock().get(path).copied();
-        if let Some((generation, entry)) = kept
-            && self.dirs.name_unchanged_since(path, generation)
-            && !ENTRY_LOOKS_EVERY_TIME.get()
-        {
-            return Ok(entry);
-        }
-        let generation = self.dirs.generation();
-        let plain = path.parent().is_some_and(|dir| {
-            let canonical = std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
-            if canonical && kept.is_none() {
-                self.dirs.watch_name(path);
-            }
-            canonical
-        });
-        let entry = self.entry_now(path, looks)?;
-        if plain {
-            // alloc: once per path asked of, its name as the key of what was said of it
-            self.entries.lock().insert(path.to_path_buf(), (generation, entry));
-        }
+        let looked_ns = (self.clock)();
+        let (entry, stamp) = self.entry_on_disk(path)?;
+        looks.push_stamped(path, LookKind::Entry, entry_digest(&entry), stamp, looked_ns);
         Ok(entry)
     }
 
-    /// [`Files::entry`] of the disk now: a look, pushed to `looks` with what it said
-    /// ([`entry_digest`]); a path that can't be read as an entry pushes nothing.
-    fn entry_now(&self, path: &Path, looks: &Looks) -> Result<Entry, Unreadable> {
-        let entry = self.entry_on_disk(path)?;
-        looks.push(path, LookKind::Entry, entry_digest(&entry));
-        Ok(entry)
-    }
-
-    /// What the disk says `path` itself is, a link not followed.
-    fn entry_on_disk(&self, path: &Path) -> Result<Entry, Unreadable> {
+    /// What the disk says `path` itself is, a link not followed, and its `lstat` stamp from
+    /// before anything of it was read ([`Stamp::UNKNOWN`] when a file's moved while it was
+    /// read).
+    fn entry_on_disk(&self, path: &Path) -> Result<(Entry, Stamp), Unreadable> {
         // alloc: error path
         let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
         // alloc: error path
@@ -711,12 +458,13 @@ impl Files {
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
-            Err(error) if missing(&error) => return Ok(Entry::Missing),
+            Err(error) if missing(&error) => return Ok((Entry::Missing, Stamp::GONE)),
             Err(error) => return Err(unreadable(error)),
         };
+        let stamp = stamp_of(&meta);
         let kind = meta.file_type();
         if kind.is_dir() {
-            return Ok(Entry::Dir);
+            return Ok((Entry::Dir, stamp));
         }
         if kind.is_symlink() {
             let target = std::fs::read_link(path).map_err(unreadable)?;
@@ -732,7 +480,8 @@ impl Files {
                 // alloc: a link off Unix, its target with `/` for each `\`, as a view has it.
                 ContentId::of(blaze_vfs::FILE_DOMAIN, target.replace('\\', "/").as_bytes())
             };
-            return Ok(Entry::File(id, blaze_vfs::Mode::Symlink));
+            // A link is never written in place, only replaced: its own stamp moves with it.
+            return Ok((Entry::File(id, blaze_vfs::Mode::Symlink), stamp));
         }
         if !kind.is_file() {
             return Err(refused(
@@ -744,26 +493,26 @@ impl Files {
         #[cfg(not(unix))]
         let executable = false;
         let mode = if executable { blaze_vfs::Mode::Executable } else { blaze_vfs::Mode::Regular };
-        let stamp = Stamp::of(&meta);
-        let key = Hasher::new(crate::trace::os_domain!("blaze v2 disk view id stamp 1"))
+        let key = Hasher::new(crate::trace::os_domain!("blaze v2 disk view id stamp 2"))
             .part(&os_bytes(path.as_os_str()))
-            .part(&stamp.bytes())
+            .part(&stamp_bytes(&stamp))
             .finish();
         if let Some(found) = self.stamped.find(&key) {
-            return Ok(Entry::File(ContentId(*self.stamped.get(found)), mode));
+            return Ok((Entry::File(ContentId(*self.stamped.get(found)), mode), stamp));
         }
         let file = std::fs::File::open(path).map_err(unreadable)?;
         let mut hasher = Hasher::new(blaze_vfs::FILE_DOMAIN);
         read_all(file, |bytes| _ = hasher.update(bytes)).map_err(unreadable)?;
         let id = hasher.finish();
         // A file changed while it was read is hashed again at its next check.
-        // And kept only under a stamp no later write can share ([`Stamp::racy`]).
-        if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp)
-            && !stamp.racy((self.clock)())
-        {
+        if !std::fs::symlink_metadata(path).is_ok_and(|it| stamp_of(&it) == stamp) {
+            return Ok((Entry::File(id, mode), Stamp::UNKNOWN));
+        }
+        // And kept only under a stamp no later write can share ([`blaze_vfs::racy`]).
+        if !blaze_vfs::racy(&stamp, (self.clock)()) {
             self.stamped.intern(key, || id.0);
         }
-        Ok(Entry::File(id, mode))
+        Ok((Entry::File(id, mode), stamp))
     }
 }
 
@@ -910,32 +659,34 @@ impl Inputs for Now<'_> {
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
-        // The invariant: the disk is listed only while no watch vouches for the listing kept.
+        // The invariant: the disk is listed only when the directory's stamp moved or was racy.
         // A listing is the names directly in the directory and whether each is a directory:
-        // it moves only with a change that names an entry of it, the directory itself or
-        // one above it, which is what the watches keep of a name in it
-        // ([`Dirs::watch_name`], asked here of a name no entry has). Kept for a directory
-        // whose own name has no link in it and that lists no link (what a link leads to is
-        // not in its directory). Until 2026-11-12 every ask listed: a build script that
-        // globs its sources (ring's `crypto/**`, zstd-sys's `zstd/lib/*`) kept every build
-        // of anything above it from being answered again without a walk.
-        let asked = path.join(LISTING);
+        // it moves only when a name is made, removed or renamed in it, which moves the
+        // directory's own `lstat` stamp. Kept for a directory that is not a link and lists no
+        // link (what a link leads to is not in its directory, and its stamp is not the
+        // directory's); one `lstat` a check. Until 2026-11-12 every ask listed: a build
+        // script that globs its sources (ring's `crypto/**`, zstd-sys's `zstd/lib/*`) kept
+        // every build of anything above it from being answered again without a walk.
+        let looked_ns = (self.files.clock)();
+        let stamp = blaze_vfs::outside::lstat(path);
         let kept = self.files.listings.lock().get(path).cloned(); // clone: an `Arc`
-        if let Some((generation, names)) = &kept
-            && self.files.dirs.name_unchanged_since(&asked, *generation)
-            && !LISTING_LOOKS_EVERY_TIME.get()
+        if let Some((was, at, names)) = &kept
+            && blaze_vfs::outside::holds(was, *at, &stamp)
         {
             for (name, dir) in names.iter() {
                 out.push(name, *dir);
             }
             out.sort();
+            if self.looks.keeps() {
+                let answer = listing(names.iter().map(|it| it.0.as_os_str()));
+                self.looks.push_stamped(path, LookKind::Listing, Some(answer), *was, *at);
+            }
             return Ok(true);
         }
-        let generation = self.files.dirs.generation();
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if missing(&error) => {
-                self.looks.push(path, LookKind::Listing, None);
+                self.looks.push_stamped(path, LookKind::Listing, None, stamp, looked_ns);
                 return Ok(false);
             }
             Err(error) => return Err(unreadable(error)),
@@ -959,16 +710,17 @@ impl Inputs for Now<'_> {
             listed.push((name, dir));
         }
         out.sort();
-        // The look, once the whole listing was read: what [`Inputs::dir`] says of these names.
+        // The look, once the whole listing was read: what [`Inputs::dir`] says of these names,
+        // under the directory's stamp from before it was listed, or none when the listing
+        // rests on more than that stamp (a link in it, or the directory itself a link).
+        let held = !links && stamp.is_dir();
+        let said = if held { stamp } else { Stamp::UNKNOWN };
         if self.looks.keeps() {
-            self.looks.push(path, LookKind::Listing, Some(listing(listed.iter().map(|it| it.0.as_os_str()))));
+            let answer = listing(listed.iter().map(|it| it.0.as_os_str()));
+            self.looks.push_stamped(path, LookKind::Listing, Some(answer), said, looked_ns);
         }
-        if !links && std::fs::canonicalize(path).is_ok_and(|it| it == path) {
-            if kept.is_none() {
-                self.files.dirs.watch_name(&asked);
-            }
-            // alloc: once a directory listed off the disk, its path as the key
-            self.files.listings.lock().insert(path.to_path_buf(), (generation, listed.into()));
+        if held {
+            self.files.listings.lock().insert(path.to_path_buf(), (stamp, looked_ns, listed.into()));
         }
         Ok(true)
     }
@@ -1163,26 +915,8 @@ mod tests {
 
     use super::*;
 
-    /// The invariant: a stamp stands for a file's content only once no write can share it. A
-    /// file changed within [`RACY_NS`] of now, or stamped after now, is racy; an older one is
-    /// not; with no clock every stamp is. The control is the rule this replaced (any settled
-    /// stamp is kept): the rewrite below has the stamp of the bytes before it.
-    #[test]
-    fn a_stamp_a_later_write_can_share_is_not_kept() {
-        let at = |modified: i128, changed: i128| Stamp { len: 4, modified, changed, inode: 7, device: 1 };
-        let now = 1_700_000_000_000_000_000i128;
-        assert!(at(now, now).racy(now), "written this tick");
-        assert!(at(now - RACY_NS + 1, now - 10 * RACY_NS).racy(now), "modified a moment ago");
-        assert!(at(now - 10 * RACY_NS, now - 1).racy(now), "its inode changed a moment ago");
-        assert!(at(now + 5, now + 5).racy(now), "stamped after now");
-        assert!(!at(now - RACY_NS, now - RACY_NS).racy(now), "old enough");
-        assert!(at(0, 0).racy(i128::MIN), "no clock: nothing is kept");
-        // Two writes of one length in one tick: equal stamps, other bytes. Kept by the stamp
-        // alone, the first hash would answer for the second.
-        let (first, second) = (at(now, now), at(now, now));
-        assert_eq!(first, second);
-        assert!(first.racy(now) && second.racy(now));
-    }
+    /// Past every racy window ([`blaze_vfs::COARSE_NS`] is the widest).
+    const RACY_NS: u64 = blaze_vfs::COARSE_NS;
 
     /// A file just written is hashed from the disk each time it is looked at, so a rewrite of
     /// the same length under the same stamp is seen; nothing was kept for it to hide behind.
@@ -1228,7 +962,7 @@ mod tests {
             read(&removed, None),
             listed,
         ];
-        let later = Began { generation: 0, wall_ns: wall_ns() + 3 * RACY_NS };
+        let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
         for traced in &asked {
             assert!(began.moved(traced).is_some(), "changed after the run began: {traced:?}");
             assert_eq!(later.moved(traced), None, "the control: nothing changed after it began: {traced:?}");
@@ -1283,7 +1017,7 @@ mod tests {
         for untold in [Path::new("relative/file"), Path::new("/a/../b")] {
             let said = began.moved(&read(untold, Some([1; 32])));
             assert_eq!(said, Some(moved(untold, untold, MovedWhy::Untold)));
-            let later = Began { generation: 0, wall_ns: wall_ns() + 3 * RACY_NS };
+            let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
             assert_eq!(later.moved(&read(untold, Some([1; 32]))), said, "untold is never taken as still");
         }
 
@@ -1297,7 +1031,7 @@ mod tests {
         assert_eq!(MovedWhy::of(f, Path::new("/x/f"), true, Path::new("/x/f")), MovedWhy::Through);
         assert_eq!(MovedWhy::of(f, Path::new("/x/f"), true, Path::new("/x")), MovedWhy::Through);
 
-        let later = Began { generation: 0, wall_ns: wall_ns() + 3 * RACY_NS };
+        let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
         assert_eq!(later.moved(&read(&file, Some([1; 32]))), None, "the control");
         assert_eq!(later.moved(&read(&below, None)), None, "the control");
         drop(dir);
@@ -1376,7 +1110,7 @@ mod tests {
         let path = dir.join("a");
         std::fs::write(&path, b"one").unwrap();
         // A clock past the racy window of the writes here, so each hash is kept under its
-        // stamp ([`Stamp::racy`], which `a_stamp_a_later_write_can_share_is_not_kept` tests).
+        // stamp ([`blaze_vfs::racy`], which blaze-vfs's `outside` tests).
         let files = Files::new().with_clock(|| wall_ns() + 10 * RACY_NS);
         let (one, two) = (Env::new(vec![("X".into(), "1".into())]), Env::default());
         let hashes: Vec<_> = std::thread::scope(|scope| {
@@ -1400,8 +1134,8 @@ mod tests {
     /// The invariant: each look at the disk is pushed once to the build's [`Looks`], with its
     /// kind and the answer the ask returned (an entry's through [`entry_digest`]), and the
     /// same ask of the unchanged disk, through [`Looks::none`] as the daemon's later check
-    /// makes it, gives that answer again. No driver runs here, so no watch vouches and every
-    /// ask looks. The control: a handle that keeps nothing ([`Looks::none`]) holds no look.
+    /// makes it, gives that answer again, each look with a stamp that holds while nothing
+    /// changed. The control: a handle that keeps nothing ([`Looks::none`]) holds no look.
     #[test]
     fn each_look_is_pushed_once_with_the_answer_a_second_ask_gives() {
         let made = TempDir::for_test("blaze-files-looks-");
@@ -1409,8 +1143,7 @@ mod tests {
         let dir = std::fs::canonicalize(&made).unwrap();
         let (file, gone) = (dir.join("a"), dir.join("gone"));
         std::fs::write(&file, b"one").unwrap();
-        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
-        let files = Files::watched_by(dirs);
+        let files = Files::new();
         let (env, looks, none) = (Env::default(), Looks::new(), Looks::none());
         let mut now = Now { files: &files, env: &env, looks: &looks };
         let mut again = Now { files: &files, env: &env, looks: &none };
@@ -1458,34 +1191,9 @@ mod tests {
         assert_eq!((twice[0].0.path.as_path(), twice[0].0.kind), (file.as_path(), LookKind::File));
     }
 
-    #[test]
-    fn a_canonical_miss_wants_its_parent_and_nothing_is_vouched_before_the_watch_settles() {
-        let made = TempDir::for_test("blaze-files-vouch-");
-        std::fs::create_dir_all(made.join("sub")).unwrap();
-        let dir = std::fs::canonicalize(&made).unwrap();
-        let path = dir.join("a");
-        std::fs::write(&path, b"one").unwrap();
-        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
-        let files = Files::watched_by(dirs);
-        let mut now = Now { files: &files, env: &Env::default(), looks: &Looks::none() };
-        assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"one")));
-        assert_eq!(dirs.len(), 1);
-        assert_eq!(dirs.dir(0).path(), dir.as_path());
-        std::fs::write(&path, b"two, longer").unwrap();
-        assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
-        assert_eq!(now.file(&dir.join("gone")).unwrap(), None);
-        assert_eq!(dirs.len(), 1);
-        let roundabout = dir.join("sub").join("..").join("a");
-        assert_eq!(now.file(&roundabout).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
-        let id = Files::path_id(&roundabout);
-        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).names.is_none());
-        assert_eq!(dirs.len(), 1);
-    }
-
-    /// A path named through symlinks rests on each link and on the file they end at: every
-    /// one's directory is wanted, so its answer is vouched for as a canonical path's is (the
-    /// macOS SDK's `MacOSX27.2.sdk/usr/lib/libm.tbd` is two links, and a link looks at it in
-    /// every build).
+    /// A path named through symlinks rests on each link and on the file they end at
+    /// ([`names`], what [`Began::moved`] stamps): the macOS SDK's
+    /// `MacOSX27.2.sdk/usr/lib/libm.tbd` is two links.
     #[cfg(unix)]
     #[test]
     fn a_path_through_symlinks_rests_on_each_link_and_the_file_they_end_at() {
@@ -1528,26 +1236,21 @@ mod tests {
         std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
         assert_eq!(names(&dir.join("loop"), hash), None, "a link to itself ends at the bound");
 
-        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
-        let files = Files::watched_by(dirs);
+        // Read through the links, the file's answer is the file's.
         let path = dir.join("sdks/named/lib/m");
-        assert_eq!(files.file(&path, &Looks::none()).unwrap(), hash);
-        let vouched = files.vouched.get(files.vouched.find(&Files::path_id(&path)).unwrap());
-        assert_eq!(vouched.names.as_ref().map(|it| it.len()), Some(3));
-        let wanted: Vec<&Path> = (0..dirs.len()).map(|at| dirs.dir(at).path()).collect();
-        assert!(wanted.contains(&dir.join("sdks").as_path()), "{wanted:?}");
+        assert_eq!(Files::new().file(&path, &Looks::none()).unwrap(), hash);
     }
 
-    /// A file asked again, its answer vouched for or its stamp known, allocates nothing: the
-    /// path is hashed in place and `stat`ed through a name on the stack.
+    /// A file asked again, its stamp known, allocates nothing: the path is hashed in place and
+    /// `stat`ed through a name on the stack.
     #[cfg(unix)]
     #[test]
     fn a_warm_file_allocates_nothing() {
         let made = TempDir::for_test("blaze-files-warm-");
         let path = std::fs::canonicalize(&made).unwrap().join("a");
         std::fs::write(&path, b"one").unwrap();
-        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
-        let files = Files::watched_by(dirs);
+        // A clock past the write's racy window, so its hash is kept under its stamp.
+        let files = Files::new().with_clock(|| wall_ns() + 10 * RACY_NS);
         let hash = Some(blaze_ids::b3::hash(b"one"));
         assert_eq!(files.file(&path, &Looks::none()).unwrap(), hash);
         let warm =
@@ -1561,26 +1264,6 @@ mod tests {
         assert_eq!(warm, None);
     }
 
-    #[test]
-    fn a_vouched_answer_reads_back_as_written() {
-        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
-        let vouched = Vouched {
-            path: OsStr::new("/nowhere/a").into(),
-            names: Some(vec![PathBuf::from("/nowhere/a")].into()),
-            sequence: AtomicU64::new(0),
-            generation: AtomicU64::new(0),
-            present: AtomicBool::new(false),
-            hash: Default::default(),
-        };
-        vouched.write(7, Some([3; 32]));
-        assert_eq!(vouched.read(), Some((7, Some([3; 32]))));
-        vouched.write(9, None);
-        assert_eq!(vouched.read(), Some((9, None)));
-        vouched.sequence.store(5, Ordering::Relaxed);
-        assert_eq!(vouched.read(), None);
-        vouched.write(11, Some([1; 32]));
-        assert_eq!(vouched.read(), None);
-    }
     blaze_format::record! {
         #[derive(Clone, Copy)]
         struct BothRoot: 1 {
