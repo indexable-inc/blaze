@@ -185,6 +185,24 @@ pub(crate) struct Welcome {
 /// Why the program cannot serve a launcher.
 pub type Refusal = String;
 
+/// The most bytes of an image's code and data the record `bound` can take
+/// (`blaze_launch::image::lay`): its own bytes and each of its data, each at its alignment
+/// (a datum another record placed first takes none, which this does not count).
+pub(crate) fn room_of(bound: &Bound) -> Result<u64, Refusal> {
+    let record = Record::decode(&bound.made.bytes).map_err(|why| format!("a record of the program's: {why}"))?;
+    let own = match record.what {
+        What::Static { .. } => record.size + u64::from(record.align),
+        _ => bound.made.len + u64::from(bound.made.align),
+    };
+    Ok(record.data.iter().fold(own, |sum, datum| sum + datum.bytes.len() as u64 + u64::from(datum.align)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's room of one message in place of [`placed::LONGEST`] ([`Program::welcome`]).
+    pub(crate) static ROOM: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// The daemon's state of one program. See the module's documentation.
 pub struct Program {
     /// By slot identity: its slot.
@@ -611,6 +629,11 @@ impl Program {
     /// Makes the answer to a `Hello` of a launcher of `arch` and `os` in pages of `page`
     /// bytes, and keeps it as `welcome`: the start's functions, then what the runs before
     /// this one called, those of them the program holds a record of, bound in one image.
+    /// Of what the runs before called, as many as one message carries with the statics and
+    /// the start's ([`room_of`], the image's [`placed::LONGEST`]), in the order first asked:
+    /// the rest are each asked for by the launcher's stub on its first call, as a first run
+    /// asks for all of them. (Every one of them, bound, refused every run after one that
+    /// called more than a message carries: ripgrep's dev `rg` searching a tree, 15.5 MB.)
     fn welcome(&mut self, arch: wire::Arch, os: wire::Os, page: u32) -> Result<(), Refusal> {
         let Some(entry) = self.entry else {
             return Err("a launcher said hello and no build of its program is held".to_owned()); // alloc: an error
@@ -630,14 +653,31 @@ impl Program {
                 binds.push(slot);
             }
         }
+        // What the statics and the start's functions leave of one message's room.
+        #[cfg(test)]
+        let mut room = ROOM.get().unwrap_or(placed::LONGEST as u64);
+        #[cfg(not(test))]
+        let mut room = placed::LONGEST as u64;
+        for (_, bound) in &self.statics {
+            room = room.saturating_sub(room_of(bound)?);
+        }
+        for slot in &binds {
+            if let Some(bound) = self.held(*slot) {
+                room = room.saturating_sub(room_of(&bound)?);
+            }
+        }
         for slot in self.needed.clone() { // clone: a list of numbers, once an answer
             if taken.len() <= slot as usize {
                 taken.resize(slot as usize + 1, false);
             }
-            if !taken[slot as usize] && self.held(slot).is_some() {
-                taken[slot as usize] = true;
-                binds.push(slot);
+            let Some(bound) = self.held(slot).filter(|_| !taken[slot as usize]) else { continue };
+            let takes = room_of(&bound)?;
+            if takes > room {
+                break;
             }
+            room -= takes;
+            taken[slot as usize] = true;
+            binds.push(slot);
         }
         let (frame, declared, bound) = self.start_image(arch, os, page, &binds, entry)?;
         let statics = self.statics.len() as u32;
