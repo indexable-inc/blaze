@@ -264,7 +264,7 @@ fn base() -> World {
     world
 }
 
-/// The invariant (b): a record's shape replays: every fact of it answered again on the same
+/// The invariant: (b) a record's shape replays: every fact of it answered again on the same
 /// universe gives the digest the shape holds, the shape is sorted by id with each id once, the
 /// record's head is its address, and its made facts are sorted; whatever facts and asks were
 /// drawn. 200 seeds.
@@ -301,7 +301,7 @@ fn a_shape_replays_on_the_same_universe() {
     }
 }
 
-/// The invariant (a): a body that asks a fact another body makes lists it in its shape with
+/// The invariant: (a) a body that asks a fact another body makes lists it in its shape with
 /// the digest the made table gave, and a made fact no body made with `record::absent`. Control:
 /// the maker's row taken out of the made table, the same ask is absent and the address moves.
 #[test]
@@ -377,7 +377,7 @@ fn a_change_to_an_asked_fact_moves_the_address_and_to_another_does_not() {
     assert_ne!(own.key(item(0)), world.key(item(0)), "an edit of the body's own text is not seen");
 }
 
-/// The invariant (c): a fact the check read and did not ask through [`Asks`] (planted in the
+/// The invariant: (c) a fact the check read and did not ask through [`Asks`] (planted in the
 /// model, one kind at a time) is a hole the address cannot see: after a change of that fact the
 /// old shape gives the old address (the driver would take the old record), and the audit's
 /// rerun on the changed universe writes other bytes, so the comparison catches it. Controls:
@@ -410,7 +410,7 @@ fn a_planted_missing_ask_is_caught_by_a_rerun() {
 /// The invariant: the record is a function of the universe alone: two runs write equal bytes,
 /// and so does a run that asks in another order; a fact asked twice is one row. 100 seeds.
 #[test]
-fn the_record_is_deterministic() {
+fn the_body_record_is_deterministic() {
     for seed in 0..100 {
         let mut rng = SplitMix64::new(seed);
         let mut world = base();

@@ -4,6 +4,7 @@
 # `none`, persisted with no such test yet, so a change of its value is refused until one is written and named;
 # or `not persisted: <why>`. Checked by scripts/src/bin/layouts.rs in CI.
 # file	const	verdict
+crates/base-db/src/files.rs	NO_VERSION	not persisted: a version's `prev` that says it is its row's first, in memory
 crates/base-db/src/lib.rs	VERSION_187	not persisted: a Rust release compared against
 crates/blaze-api/src/frames.rs	ENVELOPE_SCHEMA	not persisted: a frame's envelope on the socket, between a client and its daemon
 crates/blaze-api/src/lib.rs	SCHEMA	not persisted: the socket's schema, compared at hello
@@ -63,6 +64,10 @@ crates/blaze-codegen/src/blob.rs	MASKED_MAGIC	none
 crates/blaze-codegen/src/blob.rs	STATIC_MAGIC	none
 crates/blaze-codegen/src/blob.rs	TEMPLATE_MAGIC	none
 crates/blaze-codegen/src/summary.rs	SUMMARY_MAGIC	none
+crates/blaze-command/src/images.rs	PLACED_MAGIC	none
+crates/blaze-command/src/program.rs	KEPT_MAGIC	none
+crates/blaze-command/src/run.rs	LAST_LAYOUT	none
+crates/blaze-command/src/run.rs	LAST_MAGIC	none
 crates/blaze-diagnostics/src/cache.rs	MAGIC	none
 crates/blaze-diagnostics/src/checks/attrs/parsers/stability.rs	VERSION_PLACEHOLDER	not persisted: rustc's placeholder text for an unknown version
 crates/blaze-diagnostics/src/checks/features/library.rs	VERSION_PLACEHOLDER	not persisted: rustc's placeholder text for an unknown version
@@ -79,6 +84,7 @@ crates/blaze-format/src/lib.rs	SCHEMA	none
 crates/blaze-format/src/schema.rs	SCHEMA_DOMAIN	none
 crates/blaze-format/src/tiers.rs	COLD_VERSION	none
 crates/blaze-format/src/tiers/buffer.rs	FORM_VERSION	none
+crates/blaze-front/src/body/payload.rs	FORMAT	none
 crates/blaze-gc/src/ledger.rs	FORMAT	test a_file_of_the_previous_layout_is_refused_by_name
 crates/blaze-gc/src/record.rs	FORMAT	none
 crates/blaze-global/src/wire.rs	VERSION	not persisted: the remote protocol's version, said at hello
@@ -110,6 +116,7 @@ crates/blaze-launch/src/image.rs	VERSION	none
 crates/blaze-launch/src/record.rs	LAYOUT	none
 crates/blaze-launch/src/wire.rs	SCHEMA	not persisted: the launcher's messages
 crates/blaze-link/src/beside.rs	MH_MAGIC_64	not persisted: Mach-O's, not blaze's
+crates/blaze-link/src/keep.rs	LAYOUT	none
 crates/blaze-link/src/macho/chained.rs	POINTER_FORMAT	not persisted: Mach-O's, not blaze's
 crates/blaze-link/src/macho/sign.rs	VERSION	not persisted: Mach-O's code directory, not blaze's
 crates/blaze-link/src/macho/unwind.rs	VERSION	not persisted: Mach-O's unwind info, not blaze's
@@ -259,6 +266,9 @@ crates/hir-ty-codegen/unwind/seh.rs	CXX_MAGIC	not persisted: MSVC's exception ma
 crates/hir-ty-codegen/v2/frontend/described.rs	ASK_MAGIC	none
 crates/hir-ty-codegen/v2/frontend/described.rs	LAYOUT	none
 crates/hir-ty-codegen/v2/frontend/described.rs	SCHEMA	none
+crates/hir-ty-codegen/v2/frontend/described/plan.rs	PLAN_MAGIC	none
+crates/hir-ty-codegen/v2/frontend/described/plan.rs	STATIC_ASK_MAGIC	none
+crates/hir-ty-codegen/v2/frontend/described/plan.rs	STATIC_PLAN_MAGIC	none
 crates/hir-ty-codegen/v2/linked.rs	SPAN_TABLE_MAGIC	none
 crates/hir-ty-codegen/v2/report.rs	VERSION	none
 crates/hir-ty-codegen/v2/roots/kept/frozen.rs	MAGIC	none
@@ -268,6 +278,7 @@ crates/hir-ty-lean/src/plan.rs	LEAN_VERSION	not persisted: the Lean release pinn
 crates/hir-ty-mir/src/mir/eval/shim/thread.rs	ATTR_MAGIC	not persisted: a word in an interpreted program's memory
 crates/hir-ty-mir/src/mir/eval/shim/thread.rs	SEMAPHORE_MAGIC	not persisted: a word in an interpreted program's memory
 crates/hir-ty-ub/src/borrows/diagnostics.rs	DEFAULT_FORMATTER	not persisted: a display setting
+crates/hir-ty-wfcheck/src/persist.rs	PREVIOUS_SCHEMA	not persisted: the schema of the previous layout, refused by name; the current one is SCHEMA
 crates/hir-ty-wfcheck/src/persist.rs	SCHEMA	none
 crates/hir-ty/src/body_store/infer.rs	SCHEMA	none
 crates/hir-ty/src/body_store/konst.rs	SCHEMA	none

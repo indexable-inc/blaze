@@ -759,7 +759,7 @@ fn a_blocks_use_is_read_as_the_names_it_looked_up() {
     );
 }
 
-/// The invariant (soundness): a change of the signature of the function a block's `use`
+/// The invariant, soundness: a change of the signature of the function a block's `use`
 /// imports moves a fact of the body's steps, so a record kept before misses. The control (the
 /// plant: a key of the body's text alone): `f`'s own key is the same in both databases, so
 /// only the rows of what its block looked up can tell the two apart.

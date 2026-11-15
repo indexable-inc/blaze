@@ -48,7 +48,7 @@ class Config:
 def schema_version() -> int:
     """`VERSION` of crates/blaze-profile/src/schema.rs."""
     path = Path(__file__).resolve().parent.parent / "crates/blaze-profile/src/schema.rs"
-    found = re.search(r"^pub const VERSION: u32 = (\d+);", path.read_text(), re.M)
+    found = re.search(r"^pub const VERSION: u32 = (\d+);", path.read_text(), re.MULTILINE)
     if found is None:
         sys.exit(f"{SCRIPT}: {path} has no `pub const VERSION: u32 = N;`")
     return int(found.group(1))
