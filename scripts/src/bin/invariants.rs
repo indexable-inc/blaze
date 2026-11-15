@@ -30,12 +30,19 @@ oracle proves nothing).
     blaze run -q -p scripts --bin invariants -- '{"command": "write"}'
     blaze run -q -p scripts --bin invariants -- selftest
 
-    command   check   every invariant and refinement has a control in its file, every control
-                      has a statement in its file, no two statements share an id, and
+    command   check   every invariant and refinement has a control in its file (or is one of
+                      the statements scripts/uncontrolled-invariants.txt lists), every control
+                      has a statement in its file, no two statements share an id, every line of
+                      the uncontrolled list is a statement that still has no control, and
                       invariants.md is what `write` would write (CI). So removing or rewording
                       an invariant is a visible change to that file in the same pull request
-              write   regenerate invariants.md
+              write   regenerate invariants.md, and take out of the uncontrolled list the lines
+                      whose statement has a control now or is gone; it never adds one (only
+                      when there is no list does it write one, of every uncontrolled statement)
     root      the checkout (".")
+
+The uncontrolled list holds the statements that had no control when this check began to hold
+them: a debt that only shrinks. A new statement comes with its control.
 
 An entry's id is `<crate>::<item>`, so it moves only when the item is renamed.
 
@@ -87,6 +94,13 @@ use blaze_script::{
 
 const SCRIPT: &str = "invariants.py";
 const LIST: &str = "docs/v2/plan/invariants.md";
+/// The statements that had no control when `check` began to hold them, one id a line; it only
+/// shrinks (`DOC`).
+const UNCONTROLLED: &str = "scripts/uncontrolled-invariants.txt";
+const UNCONTROLLED_HEAD: &str = "# The invariants and refinements that had no control (a test `the_oracle_catches_<bug>` in\n\
+# their file) when scripts/src/bin/invariants.rs began to hold them, one id a line, sorted. `check`\n\
+# refuses an uncontrolled statement that is not here and a line whose statement has a control now\n\
+# or is gone; `write` takes such lines out and never adds one, so the list only shrinks.\n";
 const KINDS: [(&str, &str); 3] =
     [("invariant", "Invariants"), ("refinement", "Refinements"), ("model", "Reference models")];
 const LEVELS: [&str; 4] = ["tested", "simulated", "model-checked", "proved"];
@@ -326,8 +340,48 @@ fn held_by(p: &Patterns, words: &str) -> (String, &'static str, Vec<String>) {
 
 /// The claims of one file and the names of its tests (a function with a test attribute, or any
 /// function of a test file: an oracle, a simulation's helper).
+/// For each line, whether it is inside a raw string literal (`r"…"`, `r#"…"#`) that opened on
+/// a line before it: a test's source text (a lint's fixture), whose doc comments promise
+/// nothing of the crate that holds them.
+fn in_raw_strings(lines: &[&str]) -> Vec<bool> {
+    let mut inside = Vec::with_capacity(lines.len());
+    // The closing quote and hashes of the raw string open at the end of the line before.
+    let mut close: Option<String> = None;
+    for line in lines {
+        inside.push(close.is_some());
+        let mut rest: &str = line;
+        loop {
+            match &close {
+                Some(end) => match rest.find(end.as_str()) {
+                    Some(at) => {
+                        rest = &rest[at + end.len()..];
+                        close = None;
+                    }
+                    None => break,
+                },
+                None => {
+                    let Some(at) = rest.find('r') else { break };
+                    let after = &rest[at + 1..];
+                    let hashes = after.len() - after.trim_start_matches('#').len();
+                    // An `r` that ends a word (`bar"`, `for#`) opens nothing; nor does a raw
+                    // identifier (`r#type`).
+                    let word = rest[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    if word || !after[hashes..].starts_with('"') {
+                        rest = after;
+                        continue;
+                    }
+                    close = Some(format!("\"{}", "#".repeat(hashes)));
+                    rest = &after[hashes + 1..];
+                }
+            }
+        }
+    }
+    inside
+}
+
 fn scan_claims(p: &Patterns, path: &str, text: &str) -> (Vec<Claim>, Vec<String>) {
     let lines = splitlines(text);
+    let fixture = in_raw_strings(&lines);
     let test_file = path.ends_with("tests.rs") || path.contains("/tests/");
     let krate = crate_of(path);
     let module = module_of(path);
@@ -335,6 +389,9 @@ fn scan_claims(p: &Patterns, path: &str, text: &str) -> (Vec<Claim>, Vec<String>
     let mut tests: Vec<String> = Vec::new();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for (at, line) in lines.iter().enumerate() {
+        if fixture[at] {
+            continue;
+        }
         let Some(item) = p.item.captures(line) else { continue };
         let name = item[1].to_owned();
         // The attribute and comment lines above the item, then its doc comment.
@@ -672,7 +729,33 @@ fn find(p: &Patterns, root: &Path) -> Found {
     Found { entries, controls, claims, tests }
 }
 
-fn problems(found: &Found, root: Option<&Path>) -> Vec<String> {
+/// The ids of the invariants and refinements whose file has no control.
+fn uncontrolled(found: &Found) -> BTreeSet<String> {
+    found
+        .entries
+        .iter()
+        .filter(|e| e.kind != "model" && !found.controls.contains_key(&e.path))
+        .map(Entry::id)
+        .collect()
+}
+
+/// The ids the uncontrolled list holds, in its order (its comment lines and blank lines left out).
+fn listed(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_owned).collect()
+}
+
+/// The uncontrolled list holding `ids`.
+fn uncontrolled_page<'a>(ids: impl IntoIterator<Item = &'a String>) -> String {
+    let mut text = UNCONTROLLED_HEAD.to_owned();
+    for id in ids {
+        text.push_str(id);
+        text.push('\n');
+    }
+    text
+}
+
+/// What is wrong with the statements, the controls and the uncontrolled list `held` (its lines).
+fn problems(found: &Found, root: Option<&Path>, held: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for e in &found.entries {
         if e.level == "proved" && e.proof.is_empty() {
@@ -692,8 +775,10 @@ fn problems(found: &Found, root: Option<&Path>) -> Vec<String> {
     out.extend(twice.iter().map(|i| format!("{i}: two statements have this id; rename one item")));
     let stated: BTreeSet<&str> =
         found.entries.iter().filter(|e| e.kind != "model").map(|e| e.path.as_str()).collect();
+    let open = uncontrolled(found);
+    let excused: BTreeSet<&String> = held.iter().collect();
     for e in &found.entries {
-        if e.kind != "model" && !found.controls.contains_key(&e.path) {
+        if e.kind != "model" && !found.controls.contains_key(&e.path) && !excused.contains(&e.id()) {
             out.push(format!(
                 "{}:{}: {} has no control: add a test `the_oracle_catches_<bug>` that \
                  plants a bug and requires this oracle to find it",
@@ -711,6 +796,17 @@ fn problems(found: &Found, root: Option<&Path>) -> Vec<String> {
                 its[0]
             ));
         }
+    }
+    for id in held {
+        if open.contains(id) {
+            continue;
+        }
+        let why = if ids.contains(id) { "has a control now" } else { "is no statement any more" };
+        out.push(format!("{UNCONTROLLED}: {id} {why}: delete its line (the list only shrinks)"));
+    }
+    // A set is sorted and holds each id once: the list is so when it is the set in order.
+    if held.iter().collect::<Vec<_>>() != excused.iter().copied().collect::<Vec<_>>() {
+        out.push(format!("{UNCONTROLLED}: not sorted, or an id twice: run {SCRIPT} with command `write`"));
     }
     out
 }
@@ -792,13 +888,24 @@ fn main_with(p: &Patterns, it: &Args) {
         return;
     }
     let text = page(&found);
+    let list_text = read_text(&root.join(UNCONTROLLED));
+    let excused = list_text.as_deref().map(listed).unwrap_or_default();
     if it.command == "write" {
         if let Err(e) = std::fs::write(root.join(LIST), &text) {
             fail(SCRIPT, &format!("{LIST} is not written: {e}"));
         }
+        let open = uncontrolled(&found);
+        // Only what is still open stays; nothing is added, but to a list that is not there.
+        let kept: BTreeSet<String> = match list_text {
+            Some(_) => excused.into_iter().filter(|id| open.contains(id)).collect(),
+            None => open,
+        };
+        if let Err(e) = std::fs::write(root.join(UNCONTROLLED), uncontrolled_page(&kept)) {
+            fail(SCRIPT, &format!("{UNCONTROLLED} is not written: {e}"));
+        }
         return;
     }
-    let mut wrong = problems(&found, Some(&root));
+    let mut wrong = problems(&found, Some(&root), &excused);
     let root_arg = root.to_string_lossy();
     let shown = format!("{}:{LIST}", it.base);
     let base = match git(&root, &["-C", root_arg.as_ref(), "show", &shown]) {
@@ -852,13 +959,29 @@ fn selftest(p: &Patterns) {
     let found =
         Found { entries: entries.clone(), controls: in_file(controls.clone()), claims: vec![], tests: BTreeMap::new() };
     expect(
-        problems(&found, None).is_empty(),
-        &format!("a stated and controlled invariant has no problems: {:?}", problems(&found, None)),
+        problems(&found, None, &[]).is_empty(),
+        &format!("a stated and controlled invariant has no problems: {:?}", problems(&found, None, &[])),
     );
     let blind = Found { entries: entries.clone(), controls: BTreeMap::new(), claims: vec![], tests: BTreeMap::new() };
-    let blind_problems = problems(&blind, None);
+    let blind_problems = problems(&blind, None, &[]);
     expect(blind_problems.iter().any(|p| p.contains("has no control")), "an invariant with no control is a problem");
     expect(blind_problems.iter().filter(|p| p.contains("has no control")).count() == 1, "a model needs no control");
+    // The uncontrolled list: what it lists passes, what it does not is refused, and a line whose
+    // statement has a control or is gone is refused, so it only shrinks.
+    let id = entries[0].id();
+    expect(uncontrolled(&blind) == BTreeSet::from([id.clone()]), "the uncontrolled are the statements alone");
+    let excused = problems(&blind, None, std::slice::from_ref(&id));
+    expect(excused.is_empty(), &format!("a listed uncontrolled statement passes: {excused:?}"));
+    let healed = problems(&found, None, std::slice::from_ref(&id));
+    expect(
+        healed.iter().any(|p| p.contains("has a control now")),
+        &format!("a listed statement that has a control is refused: {healed:?}"),
+    );
+    let gone = problems(&blind, None, &[id.clone(), "blaze-cas::gone".to_owned()]);
+    expect(gone.iter().any(|p| p.contains("is no statement any more")), &format!("a listed id gone: {gone:?}"));
+    let doubled = problems(&blind, None, &[id.clone(), id.clone()]);
+    expect(doubled.iter().any(|p| p.contains("not sorted, or an id twice")), &format!("an id twice: {doubled:?}"));
+    expect(listed(&uncontrolled_page(&[id.clone()])) == [id.clone()], "the list reads back what it writes");
     let loose = Found {
         entries: vec![],
         controls: BTreeMap::from([("crates/a/src/t.rs".to_owned(), vec!["the_oracle_catches_x".to_owned()])]),
@@ -866,7 +989,7 @@ fn selftest(p: &Patterns) {
         tests: BTreeMap::new(),
     };
     expect(
-        problems(&loose, None).iter().any(|p| p.contains("controls no stated invariant")),
+        problems(&loose, None, &[]).iter().any(|p| p.contains("controls no stated invariant")),
         "a control with no statement is a problem",
     );
     let twice = Found {
@@ -876,7 +999,7 @@ fn selftest(p: &Patterns) {
         tests: BTreeMap::new(),
     };
     expect(
-        problems(&twice, None).iter().any(|p| p.contains("two statements have this id")),
+        problems(&twice, None, &[]).iter().any(|p| p.contains("two statements have this id")),
         "a repeated id is a problem",
     );
     let page = listing(&found);
@@ -922,11 +1045,19 @@ fn selftest(p: &Patterns) {
         claims: vec![],
         tests: BTreeMap::new(),
     };
-    expect(problems(&bare, None).iter().any(|p| p.contains("names no proof")), "proved needs its proof");
+    expect(problems(&bare, None, &[]).iter().any(|p| p.contains("names no proof")), "proved needs its proof");
     match scan(p, "a.rs", "/// The invariant (certain): x.\nfn t() {}\n") {
         Ok(_) => expect(false, "an unknown level is refused"),
         Err(e) => expect(e.contains("certain"), &e),
     }
+    let source = ["let s = r#\"", "/// Doc.", "pub fn f() {}", "\"#; let t = \"bar\";", "let r#type = r\"x\";", "fn g() {}"];
+    expect(
+        in_raw_strings(&source) == [false, true, true, true, false, false],
+        &format!("a raw string's lines are a fixture, and nothing else is: {:?}", in_raw_strings(&source)),
+    );
+    let fixture = "#[test]\nfn t() {\n    let out = out(\n        r#\"\n/// # Guarantees\n///\n/// - Total. Evidence: [`tests::gone`]\npub fn mix() {}\n\"#,\n    );\n}\n";
+    let (claims, _) = scan_claims(p, "crates/a/src/tests.rs", fixture);
+    expect(claims.is_empty(), &format!("a fixture's doc comment is no claim: {claims:?}"));
     claims_selftest(p);
     println!("{SCRIPT} selftest: ok");
 }

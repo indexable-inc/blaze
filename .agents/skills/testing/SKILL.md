@@ -58,13 +58,16 @@ to a bound), proved (Lean, from the same contract and model; say it as `/// The 
 sans-IO cores and what must never be wrong; a disagreement between two levels is a bug in one of
 them. `scripts/src/bin/invariants.rs` (`blaze run -q -p scripts --bin invariants -- '<json>'`)
 collects every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the
-gate (`check`) when one has no control, names a missing proof, or the list is stale. Before changing
-or regenerating code, read the invariants its crate states: they are what the new code is judged
-against. A promise in a doc comment is either derived (an effect attribute the build checks) or a `#
-Guarantees` / `# Invariants` item ending in ``Evidence: [`test`]``, ``Evidence: Lean `Name` `` or
-`Unverified: why`; never prose alone. The `claims` lints refuse a doc the effect walk refutes, a
-promise held by nothing and a stale pointer; the ledger refuses a crate's count of open claims
-growing or any claim's level dropping (docs/v2/plan/design/claims.md).
+gate (`check`) when one has no control, names a missing proof, or the list is stale.
+`scripts/uncontrolled-invariants.txt` lists the statements that had no control when the check began
+to hold them, one id a line, the only ones excused. It only shrinks: a new statement comes with its
+control, and a line whose statement gained a control or is gone fails `check` until `write` takes it
+out. Before changing or regenerating code, read the invariants its crate states: they are what the
+new code is judged against. A promise in a doc comment is either derived (an effect attribute the
+build checks) or a `# Guarantees` / `# Invariants` item ending in ``Evidence: [`test`]``,
+``Evidence: Lean `Name` `` or `Unverified: why`; never prose alone. The `claims` lints refuse a doc
+the effect walk refutes, a promise held by nothing and a stale pointer; the ledger refuses a crate's
+count of open claims growing or any claim's level dropping (docs/v2/plan/design/claims.md).
 
 See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
 
