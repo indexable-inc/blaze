@@ -2466,6 +2466,9 @@ pub(crate) enum Plant {
     /// whose call may make a macro of a plain one's name keeps a surface that leaves out
     /// bodies that call it.
     Unresolved,
+    /// An `impl Trait` anywhere in an `impl` is taken as a function's own: a body that gives
+    /// an associated type its hidden type (`type Item = impl Sized;`) is left out.
+    Opaque,
     /// A library with no surface stands in for one by its dependencies' surfaces alone, not
     /// its own code text: a body edit of it moves no key above it, a stale unit
     /// ([`crate::Lowered::narrowed`]).
@@ -2627,8 +2630,15 @@ pub(crate) fn left_out(body: &SyntaxNode, by: Reader) -> bool {
                     _ => true,
                 },
             // An associated type that hides its type (`type Item = impl Trait;`) is given it
-            // by the bodies of its `impl`'s functions, whatever their signatures say.
-            }) && !at.descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+            // by the bodies of its `impl`'s functions, whatever their signatures say. A
+            // function's own `impl Trait` (`-> impl Iterator`, `f: impl Fn()`) is its own
+            // body's alone, which its signature keeps (above): the `impl`'s other bodies are
+            // not read for it.
+            }) && !at.descendants().any(|it| {
+                it.kind() == SyntaxKind::IMPL_TRAIT_TYPE
+                    && !planted(Plant::Opaque)
+                    && !it.ancestors().take_while(|up| *up != at).any(|up| up.kind() == SyntaxKind::FN)
+            })
         }
         // A default method: never a `const` trait's, whose methods a constant may call.
         SyntaxKind::TRAIT => {

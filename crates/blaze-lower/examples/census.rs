@@ -86,6 +86,9 @@ fn package(name: &str, dir: &Path, edition: Edition, lib: &str, others: &str) {
     for (file, (text, root)) in &parsed {
         let (code, denials) = blaze_lower::census_of(root, text, edition);
         unplain |= code.unplain;
+        if std::env::var_os("CENSUS_HASH").is_some() {
+            println!("H\t{}\t{:?}\t{:?}\t{:?}\t{:?}", file.display(), code.interface, code.interface_strict, code.surface_strict, code.globbed);
+        }
         for (flag, it) in flags.iter_mut().zip([
             code.shadows,
             code.whole,
