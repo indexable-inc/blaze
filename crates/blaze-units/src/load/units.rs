@@ -28,8 +28,8 @@ use super::sandbox::PackageOptOut;
 use super::{ForeignAsk, Spec, Staged, load_error};
 use crate::Read;
 use crate::query::{
-    LoadError, LockWrite, PackagePlan, StdGraph, StdKey, StdPlanned, StdUnits, TestSandbox,
-    UnitPlan,
+    LoadError, LockWrite, PackagePlan, PackageTarget, StdGraph, StdKey, StdPlanned, StdUnits,
+    TestSandbox, UnitPlan,
 };
 use crate::schema::{self, BuiltFor, Mode, Unit, UnitDep};
 use crate::stdlib::target::{self as platform, CfgArgs};
@@ -1490,5 +1490,14 @@ fn package_plan(
         tree,
         tests,
         const_macros,
+        targets: manifest
+            .targets
+            .iter()
+            .map(|it| {
+                let (kind, crate_types) = crate::graph::kinds(&it.kind);
+                // clone: the plan owns its strings.
+                PackageTarget { name: it.name.clone(), kind, crate_types }
+            })
+            .collect(),
     }
 }

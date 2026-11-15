@@ -440,7 +440,8 @@ impl Versioned for Planned {
     // 10: a git fetch carries the tree digest it is pinned by (`FetchKind::Git::tree`).
     // 11: its `Units` lost `sandboxed_tests`, and `TestSandbox::opted_in` became
     // `outside_by_host` (tests are sandboxed by default where the host can keep them apart).
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 11");
+    // 12: [`PackagePlan::targets`].
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 12");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -556,7 +557,8 @@ impl Versioned for Units {
     // 16: a git package's tree digest ([`PackagePlan::tree`]).
     // 17: `sandboxed_tests` left and `TestSandbox::opted_in` became `outside_by_host`: tests
     // are sandboxed by default where the host can keep them apart.
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 17");
+    // 18: [`PackagePlan::targets`].
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 18");
 }
 
 /// One pinned native input for one target: an archive named by its digest, which blaze fetches,
@@ -732,6 +734,19 @@ pub struct PackagePlan {
     /// front end runs, which every crate of the package depends on (docs/future/const-macros.md,
     /// the workspace's experiment `const-macros`). Whether it is there is the front end's to say.
     pub const_macros: Option<String>,
+    /// Every target of the manifest, in its order, whether or not the build has a unit of it:
+    /// what cargo checks a build script's output against (`Package::targets`), so a
+    /// `rustc-link-arg-benches` is read in a build of the package's bin alone.
+    pub targets: Vec<PackageTarget>,
+}
+
+/// One of a package's targets, its kinds as `cargo metadata` writes them
+/// ([`crate::schema::Target`]'s `kind` and `crate_types`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct PackageTarget {
+    pub name: String,
+    pub kind: Vec<String>,
+    pub crate_types: Vec<String>,
 }
 
 impl PackagePlan {
@@ -924,7 +939,8 @@ pub enum StdPlanned {
 
 impl Versioned for StdPlanned {
     // 8: [`PackagePlan::tree`].
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 8");
+    // 9: [`PackagePlan::targets`].
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 9");
 }
 
 /// The standard library's units: a graph of their own, whose units the user's units depend on

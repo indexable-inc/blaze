@@ -35,7 +35,7 @@ use blaze_build_script::{
 use blaze_cas::Store;
 use blaze_core::{Command, Completion, Done, Effect, FileName, Names, Sandbox, Stamp, Tag};
 use blaze_units::{
-    query::{UnitPlan, Units},
+    query::{PackagePlan, UnitPlan, Units},
     schema::{DebugInfo, Mode, Unit},
     stdlib,
 };
@@ -305,7 +305,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     let manifest_path = PathBuf::from(&package.manifest_path);
     let manifest_dir =
         manifest_dir(&package.name, &package.manifest_path).map_err(|it| it.to_string())?;
-    let targets = targets(units, &unit.pkg_id);
+    let targets = targets(package);
     let text = |name: &str| var(plan, name).filter(|it| !it.is_empty()).map(str::to_owned);
     let descr = match &package.source {
         Some(source) if super::compile::local(Some(source)) => {
@@ -427,15 +427,20 @@ pub(crate) fn target_of(unit: &Unit) -> bs::Target {
     }
 }
 
-/// The targets of package `pkg_id` the build has a unit of, each once, in the graph's order.
-pub(crate) fn targets(units: &Units, pkg_id: &str) -> Vec<bs::Target> {
-    let mut all = Vec::new();
-    for it in units.graph.units.iter().filter(|it| it.pkg_id == pkg_id).map(target_of) {
-        if !all.contains(&it) {
-            all.push(it);
-        }
-    }
-    all
+/// Every target of `package`'s manifest, as `blaze_build_script` names it: cargo checks a
+/// script's `rustc-link-arg-benches` and the rest against these, not against the targets the
+/// build has a unit of (nushell's `nu` prints `rustc-link-arg-benches` in a build of its bin).
+pub(crate) fn targets(package: &PackagePlan) -> Vec<bs::Target> {
+    package
+        .targets
+        .iter()
+        .map(|it| bs::Target {
+            // clone: the run's description owns its strings, once a run.
+            name: it.name.clone(),
+            kind: it.kind.clone(),
+            crate_types: it.crate_types.clone(),
+        })
+        .collect()
 }
 
 fn triple_of<'a>(unit: &'a Unit, host: &'a str) -> &'a str {
