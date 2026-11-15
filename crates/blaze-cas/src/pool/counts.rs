@@ -88,6 +88,8 @@ pub(crate) const PINNED_LEAST: u64 = 64 << 20;
 /// 1,073,741,824 bytes, waited at the bound 177 times and was killed at 900 s.
 pub(crate) fn pinned_bound(budget: u64) -> u64 {
     match budget {
+        #[cfg(test)]
+        u64::MAX if UNSET.with(Cell::get).old_bound => PINNED_UNSET_PLANTED >> unset_shift(),
         u64::MAX => u64::MAX,
         budget => (budget / 2).max(PINNED_LEAST),
     }
@@ -103,9 +105,54 @@ pub(crate) const PINS_MOST_UNSET: u64 = 256 << 20;
 /// meant no bound.
 pub(crate) fn pins_most(budget: u64) -> u64 {
     match budget {
-        u64::MAX => PINS_MOST_UNSET,
+        u64::MAX => PINS_MOST_UNSET >> unset_shift(),
         budget => pinned_bound(budget) / 4,
     }
+}
+
+/// How the unset budget's numbers are held on a test's own thread: the DST of readers under
+/// no budget (`tests/pinned_unset.rs`) runs a simulated store of a few megabytes, so it
+/// divides them by `1 << shift`, and plants the mapping this replaced.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Unset {
+    /// [`PINS_MOST_UNSET`] (and the planted bound) divided by `1 << shift`.
+    pub(crate) shift: u32,
+    /// The planted bug: an unset budget is a bound of [`PINNED_UNSET_PLANTED`], as it was
+    /// before no budget meant no bound, and a read at it waits one tick, not five seconds.
+    pub(crate) old_bound: bool,
+}
+
+/// The bound an unset budget was before it meant none: what [`Unset::old_bound`] plants.
+#[cfg(test)]
+pub(crate) const PINNED_UNSET_PLANTED: u64 = 1 << 30;
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    /// [`Unset`] on the test's own thread; as it is (no shift, nothing planted) elsewhere.
+    pub(crate) static UNSET: Cell<Unset> = const { Cell::new(Unset { shift: 0, old_bound: false }) };
+}
+
+/// The shift of [`Unset::shift`]: 0 outside a test.
+#[inline]
+fn unset_shift() -> u32 {
+    #[cfg(test)]
+    let shift = UNSET.with(Cell::get).shift;
+    #[cfg(not(test))]
+    let shift = 0;
+    shift
+}
+
+/// How many ticks a read waits at the pinned bound ([`crate::read`]'s `BOUND_TICKS` outside
+/// a test): one under [`Unset::old_bound`], so the planted control is refused at once.
+#[inline]
+pub(crate) fn bound_ticks(ticks: u32) -> u32 {
+    #[cfg(test)]
+    let ticks = if UNSET.with(Cell::get).old_bound { 1 } else { ticks };
+    ticks
 }
 
 pub(crate) fn pinned(bytes: u64) {
