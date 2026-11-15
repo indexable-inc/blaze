@@ -16,6 +16,18 @@ inputs:
   llvm:
     description: also the pinned LLVM, as LLVM_SYS_231_PREFIX (true or false)
     default: "false"
+  # The builder. `release`: the release .github/blaze-version names. `cargo`: the tree's own blaze,
+  # stage 0, built by cargo with the nightly harness/toolchain names (docs/contributing.md), as
+  # a compiler bootstraps: for the jobs whose release cannot build the tree any more (the pinned
+  # 0.20261105.4 cannot compile today's crates/blaze-std). `artifact`: the stage 0 a `cargo` job
+  # of this run uploaded as `stage0-artifact`, so that a later job's store keys are the same
+  # compiler's (the tests job takes the build job's packs).
+  stage0:
+    description: release, cargo or artifact
+    default: release
+  stage0-artifact:
+    description: the artifact name a `cargo` stage 0 is uploaded under and an `artifact` one downloaded from
+    default: ""
 runs:
   using: composite
   steps:
@@ -49,7 +61,13 @@ runs:
     # run whose canary changed blaze's sources would be cold. A pull request that moves the gate
     # to a release built from other sources, and main's next run, are cold once; one that moves
     # it to a release of the same sources keeps the store.
+    - if: inputs.stage0 != 'release' && inputs.stage0 != 'cargo' && inputs.stage0 != 'artifact'
+      shell: bash
+      run: |
+        echo "::error::.github/actions/blaze: stage0 is '${{ inputs.stage0 }}', none of release, cargo and artifact"
+        exit 1
     - name: blaze (the release .github/blaze-version names)
+      if: inputs.stage0 == 'release'
       id: install
       shell: bash
       env:
@@ -66,6 +84,9 @@ runs:
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }
+    - name: the store
+      shell: bash
+      run: |
         if [ "$RUNNER_ENVIRONMENT" = self-hosted ]; then
           # On an ix runner (the only self-hosted runners that run this action; docs/harness.md
           # "ix runners") the machine is a fork of the
@@ -94,7 +115,7 @@ runs:
     # and SIG_IGN is inherited across fork and exec: every later step's bash sources BASH_ENV,
     # so the daemon it starts inherits the ignored signal. Linux only: macOS has no RTMIN.
     - name: SIGRTMIN+6 ignored (the pinned release's signal sampler off)
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && inputs.stage0 == 'release'
       shell: bash
       run: |
         env_file="$RUNNER_TEMP/blaze-sigrtmin6.sh"
@@ -102,14 +123,19 @@ runs:
         echo "BASH_ENV=$env_file" >> "$GITHUB_ENV"
     # The cause, shown: the release's daemon, started from a step whose bash read BASH_ENV, has
     # SIGRTMIN+6 (signal 40, bit 39 of SigIgn) ignored and says its sampler is off.
+    # Every wait here is bounded and ends in a kill. The daemon prints "no CPU samples" before it
+    # listens, and a `blaze stop` that finds no socket says "no daemon is running" and exits 0, so
+    # a stop sent between the two leaves the daemon serving with nothing to end it: that is how
+    # `wait` sat for 2.5 hours on 2026-11-15 (job 132860954801). So the stop waits for the
+    # socket, and a daemon that outlives its stop by 30 s is killed and fails the step.
     - name: the release's daemon has its sampler off
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && inputs.stage0 == 'release'
       shell: bash
       run: |
         log="$RUNNER_TEMP/blaze-sigcheck.log"
         blaze serve > "$log" 2>&1 & serve=$!
         for _ in $(seq 120); do
-          grep -q "no CPU samples" "$log" && break
+          grep -q "listening on" "$log" && break
           kill -0 "$serve" 2>/dev/null || break
           sleep 0.5
         done
@@ -117,8 +143,22 @@ runs:
         sigign=$(awk '/^SigIgn:/ { print $2 }' "/proc/$serve/status" 2>/dev/null || true)
         echo "daemon $serve: SigIgn $sigign; SIGRTMIN+6 is $rtmin6 (bit $(( rtmin6 - 1 )))"
         cat "$log"
-        blaze stop >/dev/null 2>&1 || kill "$serve" 2>/dev/null || true
+        # Gone or a zombie (a child not yet waited for answers kill -0).
+        ended() { state=$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/$serve/status" 2>/dev/null); [ -z "$state" ] || [ "$state" = Z ]; }
+        timeout 30 blaze stop || echo "blaze stop: exit $?"
+        for _ in $(seq 60); do ended && break; sleep 0.5; done
+        stuck=
+        if ! ended; then
+          stuck=1
+          echo "::error::the release's daemon (pid $serve) did not stop within 30 s of blaze stop: killed"
+          tail -n 20 "$log"
+          kill -TERM "$serve" 2>/dev/null || true
+          for _ in $(seq 20); do ended && break; sleep 0.5; done
+          kill -KILL "$serve" 2>/dev/null || true
+        fi
         wait "$serve" 2>/dev/null || true
+        [ -z "$stuck" ] || exit 1
+        grep -q "listening on" "$log" || { echo "::error::the release's daemon did not listen within 60 s (its log is above)"; exit 1; }
         [ -n "$sigign" ] && (( (16#$sigign >> (rtmin6 - 1)) & 1 )) || { echo "::error::the release's daemon does not ignore SIGRTMIN+6 (SigIgn ${sigign:-unread}): BASH_ENV's trap did not reach it"; exit 1; }
         grep -q "no CPU samples" "$log" || { echo "::error::the release's daemon did not say its sampler is off"; exit 1; }
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
@@ -173,3 +213,47 @@ runs:
         sudo mkswap "$swap" > /dev/null
         sudo swapon "$swap"
         free -g
+    # Stage 0, the tree's blaze, built by cargo with the pinned nightly (docs/contributing.md,
+    # "stage 0") against the pinned LLVM above, with the runner's C compiler and linker. Its own
+    # target directory, so that the blaze the job then builds into target/release is not this one.
+    # blaze and blaze-engine run each other from next to themselves: both go in one directory.
+    - if: inputs.stage0 == 'cargo' && inputs.llvm != 'true'
+      shell: bash
+      run: |
+        echo "::error::.github/actions/blaze: a cargo stage 0 links the pinned LLVM; set llvm: true"
+        exit 1
+    - if: inputs.stage0 == 'cargo'
+      uses: ./.github/actions/rustup
+    - name: stage 0 (the tree's blaze, built by cargo)
+      if: inputs.stage0 == 'cargo'
+      shell: bash
+      run: |
+        tc=$(cat harness/toolchain)
+        timeout 600 rustup toolchain install "$tc" --profile minimal
+        CARGO_TARGET_DIR="$RUNNER_TEMP/stage0-target" timeout 2400 cargo +"$tc" build --release --locked -p blaze-engine -p blaze-launcher
+        dir="$RUNNER_TEMP/stage0"
+        mkdir -p "$dir"
+        cp "$RUNNER_TEMP/stage0-target/release/blaze" "$RUNNER_TEMP/stage0-target/release/blaze-engine" "$dir/"
+        tar -C "$dir" -cf "$RUNNER_TEMP/stage0.tar" blaze blaze-engine
+        echo "$dir" >> "$GITHUB_PATH"
+        "$dir/blaze-engine" --version
+    - if: inputs.stage0 == 'cargo' && inputs.stage0-artifact != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.stage0-artifact }}
+        path: ${{ runner.temp }}/stage0.tar
+        retention-days: 1
+        if-no-files-found: error
+    - if: inputs.stage0 == 'artifact'
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ inputs.stage0-artifact }}
+        path: ${{ runner.temp }}/stage0
+    - name: stage 0 (this run's, from its artifact)
+      if: inputs.stage0 == 'artifact'
+      shell: bash
+      run: |
+        dir="$RUNNER_TEMP/stage0"
+        tar -C "$dir" -xf "$dir/stage0.tar"
+        echo "$dir" >> "$GITHUB_PATH"
+        "$dir/blaze-engine" --version

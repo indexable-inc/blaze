@@ -111,6 +111,9 @@ jobs:
         with:
           job: tests
           llvm: true
+          # The build job's stage 0: the packs it hands over are that compiler's.
+          stage0: artifact
+          stage0-artifact: stage0-${{ inputs.platform }}
       # What this run's build job compiled, which main's remote has only once main pushes it:
       # a pull request's build pushes nowhere.
       - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
@@ -180,6 +183,10 @@ jobs:
         with:
           job: build
           llvm: true
+          # The tree's blaze built by cargo is the builder: no release builds today's tree
+          # (0.20261105.4 cannot compile its crates/blaze-std).
+          stage0: cargo
+          stage0-artifact: stage0-${{ inputs.platform }}
       # The packs the store has before the build, so that what it adds can be handed on.
       - if: env.BLAZE == 'true'
         run: find "$BLAZE_CACHE" -maxdepth 1 -name '*.pack' -exec basename {} \; | sort > "$RUNNER_TEMP/packs-pulled.txt"
@@ -192,11 +199,14 @@ jobs:
         run: touch "$RUNNER_TEMP/profile-since"
       - name: blaze build --release --workspace, what the unit tests are built on
         if: env.BLAZE == 'true'
+        # Under the job's limit, so that the stop, the daemon's log and the profile still run.
+        timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 200 || 110 }}
         run: |
           $PYTHON harness/unittests.py '{"build": true}'
       # The daemon ends first: its last pack seals when it does.
       - if: always() && env.BLAZE == 'true' && steps.blaze.outcome == 'success'
-        run: blaze stop
+        timeout-minutes: 3
+        run: timeout 120 blaze stop
       # The self-build's profile history (blaze's root, docs/profiling.md), for the profile-gate
       # job. After the stop, which flushes and merges the last of it. A build that wrote none
       # hands over its list alone, and the gate says it found no build.
