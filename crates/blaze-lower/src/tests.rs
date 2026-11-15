@@ -3571,3 +3571,22 @@ fn the_oracle_catches_a_stand_in_without_its_own_code() {
     assert!(!checked());
     assert!(crate::code::planting(crate::code::Plant::Standin, checked));
 }
+
+/// As [`LIB_UNPLAIN`], and positioned: a `#[track_caller] const fn` that reads a `Location`,
+/// called in a constant, so a crate above reads it by its interface ([`super::narrow_of`]).
+const LIB_PLACED: &[u8] = b"other!();\n#[track_caller]\npub const fn here() -> u32 {\n    core::panic::Location::caller().line()\n}\npub const X: u32 = here();\npub fn gen() -> u8 {\n    1\n}\n";
+const LIB_PLACED_BODY: &[u8] = b"other!();\n#[track_caller]\npub const fn here() -> u32 {\n    core::panic::Location::caller().line()\n}\npub const X: u32 = here();\npub fn gen() -> u8 {\n    2\n}\n";
+
+/// A positioned library with no surface stands in by its own code text and its dependencies'
+/// interfaces: its body edit moves the check above it, and with the stand-in made of its
+/// dependencies alone (the planted bug) it does not.
+#[test]
+fn a_positioned_crate_with_no_surface_is_read_above_by_its_whole_code_text() {
+    let checked = || {
+        let [_, (_, was)] = narrowed_over(LIB_PLACED);
+        let [_, (_, now)] = narrowed_over(LIB_PLACED_BODY);
+        was.checked == now.checked
+    };
+    assert!(!checked());
+    assert!(crate::code::planting(crate::code::Plant::Standin, checked));
+}

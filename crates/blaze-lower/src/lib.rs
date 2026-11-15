@@ -2949,9 +2949,11 @@ struct Narrow {
     /// [`Narrowed::code`]; the whole identity for a crate with no code text of its own.
     code: ContentId,
     /// What a crate that only checks against it observes of it and, through it, of what it
-    /// depends on: its interface text and its dependencies' interfaces. `code` where no body
-    /// may be left out: a proc macro, a build script or a program (what depends on those runs
-    /// them), a const macro crate, a crate that names blaze's extensions.
+    /// depends on: its interface text and its dependencies' interfaces; for a library no body
+    /// of which may be left out, its code text and its dependencies' interfaces. `code` for a
+    /// proc macro, a build script or a program (what depends on those runs them), a const
+    /// macro crate, a crate that names blaze's extensions, and one made from Rust of another
+    /// crate's file.
     interface: ContentId,
     /// [`Narrowed::checked`].
     checked: ContentId,
@@ -2985,6 +2987,9 @@ const NARROW_SURFACE: &str = "blaze v2 cargo unit narrow surface 1";
 /// What stands in for the surface of a crate with none: its own code text, and its
 /// dependencies' surfaces.
 const NARROW_SURFACE_OWN: &str = "blaze v2 cargo unit narrow surface by own code 1";
+/// What stands in for the interface of a library with none: its own code text, and its
+/// dependencies' interfaces.
+const NARROW_INTERFACE_OWN: &str = "blaze v2 cargo unit narrow interface by own code 1";
 
 /// [`Lowered::narrowed`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own; `whole` holds the whole identity
@@ -3076,19 +3081,28 @@ fn narrow_of(
         // Only a library that runs nowhere at compile time is read through its interface.
         let library = matches!(data.target_kind, base_db::TargetKind::Lib { is_proc_macro: false })
             && const_macros.iter().all(|it| it.krate != at);
+        // A crate made from Rust of another crate's source root holds that file's bodies, which
+        // the other's surface leaves out: it is keyed by the code below it. Exact for a
+        // workspace crate, by where each path it reads resolves ([`code::reaches_beyond`]).
+        let reaches = own.reaches && (given.contains_key(&at) || code::reaches_beyond(db, at));
+        // Its own code text where no body of it may be left out ([`code::CodeText::unplain`]),
+        // and its dependencies by what a check reads of them through it, as for any library.
+        let own_whole = match code::planted(code::Plant::Standin) {
+            true => ContentId([0; 32]),
+            false => own_code,
+        };
         let interface = match own.interface {
             Some(own_interface) if library && !extends => {
                 folded(NARROW_INTERFACE, own_interface, |it| it.interface)
+            }
+            None if library && !extends && !reaches => {
+                folded(NARROW_INTERFACE_OWN, own_whole, |it| it.interface)
             }
             _ => code,
         };
         // A constant of this crate made by a call of a function that gives its caller's
         // position holds a position no token says: then the interface, which holds them all.
         let positioned = locates && own.calls && !code::planted(code::Plant::Located);
-        // A crate made from Rust of another crate's source root holds that file's bodies, which
-        // the other's surface leaves out: it is keyed by the code below it. Exact for a
-        // workspace crate, by where each path it reads resolves ([`code::reaches_beyond`]).
-        let reaches = own.reaches && (given.contains_key(&at) || code::reaches_beyond(db, at));
         let surface = match own.surface {
             Some(own_surface) if library && !extends && !positioned => {
                 folded(NARROW_SURFACE, own_surface, |it| it.surface)
@@ -3099,10 +3113,7 @@ fn narrow_of(
             // its slot is ([`slot_of`]). Not one made from Rust of another crate's file,
             // whose bodies are the other's and which no surface holds.
             None if library && !extends && !positioned && !reaches => {
-                match code::planted(code::Plant::Standin) {
-                    true => folded(NARROW_SURFACE_OWN, ContentId([0; 32]), |it| it.surface),
-                    false => folded(NARROW_SURFACE_OWN, own_code, |it| it.surface),
-                }
+                folded(NARROW_SURFACE_OWN, own_whole, |it| it.surface)
             }
             _ => interface,
         };
