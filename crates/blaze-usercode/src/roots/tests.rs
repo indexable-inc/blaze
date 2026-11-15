@@ -257,8 +257,8 @@ fn a_root_that_is_not_absolute_or_is_the_file_systems_names_none() {
 }
 
 /// A run that read a file outside its roots and the machine-wide places (a sibling checkout's
-/// `../../proto/x.proto`) is kept against where its roots are: another checkout, which would
-/// check that same absolute path, never takes it.
+/// `../../proto/x.proto`) is kept with an above mark per root: another checkout elsewhere,
+/// which would check that same absolute path, never takes it.
 #[test]
 fn a_read_outside_the_roots_is_not_shared() {
     let (a, b) = (checkout("/home/a"), checkout("/srv/b"));
@@ -279,9 +279,12 @@ fn a_read_outside_the_roots_is_not_shared() {
         files: Vec::new(),
     };
     let (kept, _) = a.view().kept(&read("/home/a", &disk_a), &value).unwrap();
-    assert!(kept.shared.is_none(), "no copy for another checkout to verify");
+    let shared = kept.shared.expect("a copy for another checkout to verify, above marks in it");
+    assert_eq!(aboves(&shared), a.view().all().iter().count(), "an above mark per root");
     let run = key("/home/a", &a);
+    assert_eq!(key("/srv/b", &b), run);
     let store = kept_store(&run, &kept.local);
+    let mut copy = kept_store(&run, &shared);
     let mut disk_b = Disk::of("/srv/b", b"int x;");
     disk_b.files.extend(
         disk_a
@@ -292,6 +295,13 @@ fn a_read_outside_the_roots_is_not_shared() {
     );
     assert_eq!(found(&store, &key("/srv/b", &b), &b, &mut disk_b), None);
     assert!(found(&store, &run, &a, &mut disk_a).is_some(), "found again where its roots are");
+    assert_eq!(found(&copy, &run, &b, &mut disk_b), None, "its above marks are not B's");
+    assert!(found(&copy, &run, &a, &mut disk_a).is_some(), "its above marks are A's");
+    // The control: the same trace with no above marks is taken by B.
+    let mut bare = shared.clone();
+    bare.files.retain(|it| !is_mark(&it.0));
+    copy = kept_store(&run, &bare);
+    assert!(found(&copy, &run, &b, &mut disk_b).is_some(), "the marks are what refuse B");
     // A read in a machine-wide place alone leaves a copy for another checkout to verify.
     let mut system = Disk::of("/home/a", b"int x;");
     system.files.insert(
@@ -300,6 +310,54 @@ fn a_read_outside_the_roots_is_not_shared() {
     );
     let (kept, _) = a.view().kept(&read("/home/a", &system), &value).unwrap();
     assert!(kept.bound.is_empty() && kept.shared.is_some());
+}
+
+/// How many above marks `traced` holds ([`Roots::above`]).
+fn aboves(traced: &Traced) -> usize {
+    traced.files.iter().filter(|it| marked_above(&it.0).is_some()).count()
+}
+
+/// Checkouts side by side under one directory (`/h/a`, `/h/b`) that each read `/h/shared/x`,
+/// next to their workspaces (`$WORKSPACE/../shared/x`), verify each other's run, and a third
+/// beside them is given it. One as deep under another directory, whose run reads its own
+/// `/srv/shared/x` but would find `/h/shared/x` unchanged, is not: its workspace's directory
+/// one up is not `/h`. Nor is one deeper under `/h`. The user's git configuration under
+/// `$HOME`, read by a build script's `git` in checkouts under `$HOME`, is this case.
+#[test]
+fn a_read_next_to_the_roots_is_verified_only_where_they_sit_as_deep_under_it() {
+    let shared = ContentId::of("test file", b"shared").0;
+    let disk = |home: &str| {
+        let mut disk = Disk::of(home, b"int x;");
+        disk.files.insert(PathBuf::from("/h/shared/x"), shared);
+        disk
+    };
+    let keep = |store: &mut BTreeMap<Key, Vec<u8>>, home: &str, map: &RootMap| {
+        let roots = map.view();
+        let (marked, stored) = roots.kept(&read(home, &disk(home)), &printed(b"")).unwrap();
+        assert!(marked.bound.is_empty(), "{marked:?}");
+        let (puts, verdict) = verify::keeps(
+            |key| Ok(store.get(key).map(Vec::as_slice)),
+            &roots,
+            &key(home, map),
+            marked,
+            stored.encode(),
+            crate::run::ported_differs,
+        )
+        .unwrap();
+        apply(store, puts);
+        verdict
+    };
+    let look = |store: &BTreeMap<Key, Vec<u8>>, home: &str| {
+        let map = checkout(home);
+        found(store, &key(home, &map), &map, &mut disk(home))
+    };
+    let mut store = BTreeMap::new();
+    assert_eq!(keep(&mut store, "/h/a", &checkout("/h/a")), verify::Verdict::Copied);
+    assert_eq!(keep(&mut store, "/h/b", &checkout("/h/b")), verify::Verdict::Verified);
+    assert!(look(&store, "/h/c").is_some(), "a third beside them is given it");
+    assert_eq!(key("/srv/d", &checkout("/srv/d")), key("/h/a", &checkout("/h/a")));
+    assert_eq!(look(&store, "/srv/d"), None, "one elsewhere reads its own sibling");
+    assert_eq!(look(&store, "/h/e/f"), None, "one deeper under /h reads another");
 }
 
 fn kept_store(run: &RunKey, traced: &Traced) -> BTreeMap<Key, Vec<u8>> {
@@ -482,8 +540,9 @@ fn a_path_between_roots_of_two_tops_is_kept_against_them() {
 }
 
 /// A git dependency's build script, its package in blaze's sources, reading `../` of it reads
-/// another revision's files: marked. The registry, and `/nix/store` that blaze's tools are in,
-/// stay machine-wide.
+/// files next to that revision: not machine-wide, so kept with an above mark per root, the
+/// package's one name up (found only where the package sits under the same directory). The
+/// registry, and `/nix/store` that blaze's tools are in, stay machine-wide: no mark.
 #[test]
 fn a_read_next_to_a_root_in_blazes_sources_is_kept_against_it() {
     let map = RootMap::default()
@@ -497,8 +556,11 @@ fn a_read_next_to_a_root_in_blazes_sources_is_kept_against_it() {
     let (kept, _) = roots
         .kept(&reading(&["/b/sources/git/checkouts/dep-1/proto/x.proto"]), &printed(b""))
         .unwrap();
-    assert!(kept.shared.is_none());
-    assert_eq!(kept.bound, roots.all());
+    let shared = kept.shared.expect("placed by its above marks");
+    assert!(kept.bound.is_empty());
+    let package = shared.files.iter().find(|it| marked_above(&it.0) == Some((b'p', 1)));
+    let hash = package.and_then(|it| it.1);
+    assert_eq!(hash, Some(root_hash("/b/sources/git/checkouts/dep-1")), "{shared:?}");
     let (kept, _) = roots
         .kept(
             &reading(&[
@@ -508,7 +570,7 @@ fn a_read_next_to_a_root_in_blazes_sources_is_kept_against_it() {
             &printed(b""),
         )
         .unwrap();
-    assert!(kept.bound.is_empty() && kept.shared.is_some());
+    assert!(kept.bound.is_empty() && kept.shared.is_some_and(|it| aboves(&it) == 0));
 }
 
 /// What `puts` say, kept in `store` as [`index::keep`] keeps them: each value under its key,
@@ -999,6 +1061,35 @@ fn a_root_relinked_since_its_map_was_made_is_kept_against_where_it_is() {
     assert!(map.view().relinked());
     let (kept, _) = map.view().kept(&reading(&[]), &printed(b"")).unwrap();
     assert!(kept.relinked && kept.shared.is_none());
+    // A root not there yet when its map is made (an `OUT_DIR` the run's setup makes) was
+    // spelled as itself: made as a directory it still is, and nothing moved.
+    let out = dir.join("out");
+    let map = RootMap::default().with(Role::OutDir, &out, &Looks::none());
+    std::fs::create_dir_all(&out).unwrap();
+    assert!(!map.view().relinked(), "a root made after its map, where it was named");
+    // The control: made as a link to elsewhere, it is spelled otherwise now.
+    std::fs::remove_dir(&out).unwrap();
+    std::os::unix::fs::symlink(dir.join("two"), &out).unwrap();
+    assert!(map.view().relinked(), "a root made after its map as a link elsewhere");
+}
+
+/// A read outside the roots that a root's links resolved hold more of than the root does (the
+/// workspace a link to `far/one`, the run read `far/one/x`) is no read next to the root: where
+/// it is from is not known, and the run is kept against where every root is.
+#[test]
+fn a_read_under_a_roots_resolved_spelling_is_kept_against_where_it_is() {
+    let dir = blaze_core::temp::TempDir::for_test("blaze-roots-above-");
+    std::fs::create_dir_all(dir.join("far/one")).unwrap();
+    std::os::unix::fs::symlink(dir.join("far/one"), dir.join("ws")).unwrap();
+    let map = RootMap::default().with(Role::Workspace, &dir.join("ws"), &Looks::none());
+    let roots = map.view();
+    let under = dir.join("far/one/x");
+    let (kept, _) = roots.kept(&reading(&[under.to_str().unwrap()]), &printed(b"")).unwrap();
+    assert!(kept.shared.is_none() && kept.bound == roots.all(), "{kept:?}");
+    // The control: a read next to the root's own spelling is placed by an above mark.
+    let next = dir.join("shared/x");
+    let (kept, _) = roots.kept(&reading(&[next.to_str().unwrap()]), &printed(b"")).unwrap();
+    assert!(kept.bound.is_empty() && kept.shared.is_some_and(|it| aboves(&it) == 1));
 }
 
 /// A link a run left in its `OUT_DIR` into its own package is kept as the package's

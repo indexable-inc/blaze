@@ -11,8 +11,8 @@
 //!   the path: `/home/a/ws/p/build.rs` is `\0p/build.rs` in this checkout and in every other
 //!   ([`Roots::path`]). Under two roots, the nearer one. A path under no root stays absolute,
 //!   and means the same file in another checkout only when it is in a machine-wide place
-//!   ([`MACHINE`], blaze's fetched packages): a run that read any other is kept against where every one
-//!   of its roots is ([`Roots::kept`]), as its key no longer says which checkout it ran in.
+//!   ([`MACHINE`], blaze's fetched packages), or where every root sits as it did under the
+//!   nearest directory that holds it (below, [`Roots::above`]).
 //! - A variable's value, or what a run printed, has each root in it that starts a path (after
 //!   the string's start or a byte no path has) and ends a name replaced by its placeholder,
 //!   and every `\0` already in it doubled ([`Roots::port`]): in one checkout a ported string
@@ -40,9 +40,19 @@
 //! in a variable it read or in a string its key was given ([`RootMap::bind`]), once ported,
 //! in any spelling (its links resolved, `/private` on macOS, separators doubled or turned,
 //! case, `%`-escaped, UTF-16), the path from one root to another that the layout doesn't fix
-//! (of two tops, [`Roots::embedded`]); a read outside its roots and the machine-wide places;
+//! (of two tops, [`Roots::embedded`]); a read outside its roots and the machine-wide places
+//! that one of its roots' other spellings (links resolved) holds more of than the root does;
 //! or a root whose links resolve elsewhere than when its map was made. A kept value never
 //! embeds another checkout's path.
+//!
+//! Any other read outside the roots and the machine-wide places (the user's git
+//! configuration under `$HOME`, a library directory a variable names) is the same file in
+//! every checkout only where it is not reached from a root by going up: a run that read
+//! `/a/shared` in a checkout at `/a/ws` may have read `$WORKSPACE/../shared`, which is
+//! `/b/shared` in one at `/b/ws`. Such a run is kept with an above mark per root
+//! ([`Roots::above`]): the directory nearest the root that also holds the path, and how many
+//! names up it is, so it is found and verified only where every root sits as deep under that
+//! same directory.
 //!
 //! On Windows a run has no roots (a path's bytes there are UTF-16 units, which the ports here
 //! don't read): its keys are absolute, so nothing is shared between checkouts there.
@@ -178,6 +188,9 @@ const MARK: u8 = 0;
 
 /// The last name of a mark's path ([`Roots::mark`]): no file has it, a name being a C string.
 pub const ROOT: &str = "\0root";
+
+/// The name after a root's tag in an above mark's path ([`above_path`]).
+const ABOVE: &str = "\0above";
 
 /// What a mark's hash, a root's path, is hashed under.
 const ROOT_DOMAIN: &str = "blaze v2 root path 1";
@@ -851,6 +864,30 @@ impl<'a> Roots<'a> {
             && !self.machine.iter().any(|dir| wide(dir.as_path()))
     }
 
+    /// How many names up from `root`, `role`'s, the nearest directory that also holds `path`
+    /// (read outside every root, [`Roots::outside`]) is: what a run that found `path` by going
+    /// up from its root and down again went up by at most. A run kept with a read there is
+    /// kept with an above mark per root ([`above_path`]: the hash of the directory that many
+    /// names up), so it is found, or verified, only where each root sits as deep under that
+    /// same directory: a checkout whose workspace is elsewhere reads the sibling of its own,
+    /// and never finds this one. None when another spelling of the root (its links resolved)
+    /// shares more of `path` than the root does, or `path` is not absolute: where `path` is
+    /// from it is not known.
+    fn above(&self, role: Role, root: &str, path: &Path) -> Option<usize> {
+        if !path.is_absolute() {
+            return None;
+        }
+        let shared = |root: &str| {
+            Path::new(root).components().zip(path.components()).take_while(|(a, b)| a == b).count()
+        };
+        let ours = shared(root);
+        let spelled = self.aliases.iter().filter(|it| it.0 == role);
+        if spelled.into_iter().any(|(_, alias)| shared(alias) > ours) {
+            return None;
+        }
+        Some(Path::new(root).components().count() - ours)
+    }
+
     /// The roots still in `bytes` once ported, in any spelling ([`Roots::embedded`]): what a
     /// string a run's key was given, a variable it read, or what it printed ties it to.
     pub fn left(&self, bytes: &[u8]) -> RoleSet {
@@ -861,9 +898,16 @@ impl<'a> Roots<'a> {
     /// ([`RootMap::set`], read again here as a run is kept): the spellings its output was
     /// scanned for may not be the ones it saw. No look is kept of this: it compares with what
     /// the map's making resolved, whose looks the map's build holds ([`look_through`]).
+    ///
+    /// A root that resolved to nothing (it was not there yet: an `OUT_DIR` made for the run)
+    /// was spelled as itself, as one that resolves to itself is ([`spellings`]): only a
+    /// spelling other than the root's own, then or now, is a move.
     pub fn relinked(&self) -> bool {
         self.resolved.iter().any(|(role, then)| {
-            self.get(*role).is_some_and(|root| resolve(root, &Looks::none()) != *then)
+            self.get(*role).is_some_and(|root| {
+                let now = resolve(root, &Looks::none());
+                now.as_deref().unwrap_or(root) != then.as_deref().unwrap_or(root)
+            })
         })
     }
 
@@ -892,19 +936,45 @@ impl<'a> Roots<'a> {
     /// `traced` kept ([`Roots::kept`]), what the run gave still holding the roots `left`: tied
     /// to its roots' strings, so with no copy for another checkout, when any root is left in
     /// it, in a string its key was given ([`RootMap::bind`]) or in a variable it read, when it
-    /// read outside its roots and the machine-wide places (whose path is this checkout's), or
-    /// when a root's links moved ([`Roots::relinked`]).
+    /// read outside its roots and the machine-wide places where no above mark places the read
+    /// ([`Roots::above`]), or when a root's links moved ([`Roots::relinked`]). A read an above
+    /// mark places adds the mark to both traces.
     fn kept_trace(&self, traced: &Traced, left: RoleSet) -> Marked {
-        let ported = self.traced(traced);
+        let mut ported = self.traced(traced);
         let mut bound = left.union(self.given);
         for value in ported.env.iter().filter_map(|it| it.1.as_deref()) {
             // A ported value: a root left in it is one no port took (`-I/ws/p/include`).
             bound = bound.union(self.embedded(value.as_encoded_bytes()));
         }
         let read = ported.files.iter().map(|it| &it.0).chain(ported.dirs.iter().map(|it| &it.0));
-        if read.into_iter().any(|path| self.outside(path)) {
+        let mut outside = None;
+        // Per role, the fewest names up from its root to a directory that holds a path read
+        // outside every root ([`Roots::above`]): none read, or none placeable.
+        let mut above = [None::<usize>; Role::ALL.len()];
+        let mut placed = true;
+        for path in read.filter(|path| self.outside(path)) {
+            if outside.is_none() {
+                outside = Some(path.clone()); // clone: once per run kept outside its roots
+            }
+            for &(role, root) in &self.roots[..self.len] {
+                let Some(hops) = self.above(role, root, path) else {
+                    placed = false;
+                    continue;
+                };
+                let at = role as usize;
+                above[at] = Some(above[at].map_or(hops, |it: usize| it.min(hops)));
+            }
+        }
+        if !placed {
             bound = bound.union(self.all());
         }
+        for &(role, root) in &self.roots[..self.len] {
+            if let Some(hops) = above[role as usize] {
+                let up = Path::new(root).ancestors().nth(hops).and_then(Path::to_str);
+                ported.files.push((above_path(role, hops), up.map(root_hash)));
+            }
+        }
+        trace::normalize(&mut ported);
         let relinked = self.relinked();
         if relinked {
             bound = bound.union(self.all());
@@ -912,7 +982,7 @@ impl<'a> Roots<'a> {
         let shared = (bound.is_empty() && !self.is_empty()).then(|| ported.clone()); // clone: once per run kept, its copy's trace
         let mut local = ported;
         self.mark(&mut local, self.all());
-        Marked { local, shared, bound, relinked }
+        Marked { local, shared, bound, relinked, outside }
     }
 
     /// `value` as it is kept: what it printed ported, and the roots still in that once ported
@@ -1184,16 +1254,36 @@ pub struct Marked {
     /// given the value ([`verify`]). None when the run is tied to its roots' strings, or has
     /// no roots.
     pub shared: Option<Traced>,
-    /// The roots found tying it to its roots' strings ([`Roots::kept`]): every root for a read outside them or
-    /// moved links.
+    /// The roots found tying it to its roots' strings ([`Roots::kept`]): every root for a read
+    /// outside them that no above mark places ([`Roots::above`]) or moved links.
     pub bound: RoleSet,
     /// Whether a root's links moved since its map was made ([`Roots::relinked`]).
     pub relinked: bool,
+    /// The first path it read outside its roots and the machine-wide places, if any: what
+    /// says why it is kept here alone.
+    pub outside: Option<PathBuf>,
 }
 
 /// The path of `role`'s mark.
 fn mark_path(role: Role) -> PathBuf {
     PathBuf::from(format!("{}{}/{ROOT}", char::from(MARK), char::from(role.tag()))) // alloc: a mark, once per root of a run kept
+}
+
+/// The path of `role`'s above mark ([`Roots::above`]): `\0<tag>/\0above/<hops>`, whose hash
+/// is the path of the directory `hops` names above the root, or none past the file system's
+/// root.
+fn above_path(role: Role, hops: usize) -> PathBuf {
+    PathBuf::from(format!("{}{}/{ABOVE}/{hops}", char::from(MARK), char::from(role.tag()))) // alloc: a mark, once per root of a run kept that read outside its roots
+}
+
+/// The tag of the root `path` is an above mark of, and how many names up ([`above_path`]).
+fn marked_above(path: &Path) -> Option<(u8, usize)> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let (head, hops) = bytes.split_at_checked(3)?;
+    let [MARK, tag, b'/'] = *head else { return None };
+    let hops = hops.strip_prefix(ABOVE.as_bytes())?.strip_prefix(b"/")?;
+    let hops = std::str::from_utf8(hops).ok()?;
+    hops.bytes().all(|it| it.is_ascii_digit()).then(|| hops.parse().ok()).flatten().map(|it| (tag, it))
 }
 
 /// What a mark of the root at `root` hashes as.
@@ -1204,7 +1294,7 @@ fn root_hash(root: &str) -> [u8; 32] {
 /// Whether `path`, written against roots, is a root's mark ([`Roots::mark`]): an entry whose
 /// value is the root's path, which names no file on disk.
 pub fn is_mark(path: &Path) -> bool {
-    marked(path).is_some()
+    marked(path).is_some() || marked_above(path).is_some()
 }
 
 /// The tag of the root `path` is the mark of, when it is one.
@@ -1274,6 +1364,11 @@ where
         if let Some(tag) = marked(path) {
             let root = self.roots.root_of(tag, path.as_os_str().as_encoded_bytes())?;
             return Ok(Some(root_hash(root)));
+        }
+        if let Some((tag, hops)) = marked_above(path) {
+            let root = self.roots.root_of(tag, path.as_os_str().as_encoded_bytes())?;
+            let up = Path::new(root).ancestors().nth(hops).and_then(Path::to_str);
+            return Ok(up.map(root_hash));
         }
         let real = self.roots.real_path(path)?;
         self.inner.file(&real)
