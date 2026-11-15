@@ -42,8 +42,9 @@ workspace does not fit a runner yet (it passed 120 GB of a 128 GB machine on 202
 docs/contributing.md, "CI"); `"blaze"` runs `blaze test` as above. A cargo run is held to the
 entries of the list that hold for a cargo build (`only.builder`); blaze's `--events FORMAT` among
 `args` is dropped from it, and it takes no `reached`. Its `build` is stage 0, `cargo build
---release --locked -p blaze-engine --bin blaze --bin blaze-engine` into target/release, what CI's
-build job packs.
+--release --locked -p blaze-engine --bin blaze --bin blaze-engine`, copied into target/release,
+what CI's build job packs, and then `blaze build --release --locked -p scripts --bins` by that
+stage 0, so that the profile gate has a build's history to read.
 
 `at_least` is the fewest tests the run has to have run (1 without it; the gate may say more): a
 run that ran fewer fails whatever its exit status and whatever the list says, since a run of no
@@ -377,6 +378,16 @@ def main():
     watch_dirs = [ROOT, *(d for d in [os.environ.get("BLAZE_CACHE"), "/mnt"] if d)]
     log = os.path.join(env["CARGO_TARGET_DIR"], "known-failures", "unittests.log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
+    if cfg.builder == "cargo" and not cfg.build:
+        # Every binary of the packages tested, first: the tests run the workspace's programs
+        # from target's profile directory (blaze-engine's revisions run `blaze-thin` there), and
+        # `cargo test` builds a package's binaries only for that package's own integration tests,
+        # where `blaze test --workspace` builds them all.
+        bins = ["cargo", f"+{toolchain}", "build", "--release", "--locked", "--workspace", *excluded, "--bins"]
+        print(" ".join(bins), flush=True)
+        if built := subprocess.run(bins, cwd=ROOT, env=env, timeout=5400).returncode:
+            print(f"::error::{' '.join(bins)} failed (exit status {built}): the tests run these programs")
+            sys.exit(1)
     status, _, watch = run(command, ROOT, env, seen, failed, watch_dirs, log)
     sys.stdout.flush()
     took = (time.monotonic() - watch.began) / 60
@@ -397,6 +408,18 @@ def main():
             if os.path.lexists(placed := os.path.join(ROOT, "target", "release", name)):
                 os.remove(placed)
             shutil.copy2(os.path.join(env["CARGO_TARGET_DIR"], "release", name), os.path.join(ROOT, "target", "release", name))
+        # One blaze build by that stage 0, of the scripts (about a minute), so that the daemon's
+        # profile history has a build for CI's profile gate (harness/profile_gate.py) while the
+        # build of blaze itself does not fit a runner; its daemon is left for the job's
+        # `blaze stop`. In target/, blaze's own build directory.
+        scripts = [os.path.join(env["CARGO_TARGET_DIR"], "release", "blaze"), "build", "--release", "--locked", "-p", "scripts", "--bins"]
+        print(" ".join(scripts), flush=True)
+        blaze_env = {**os.environ, "CARGO_TARGET_DIR": os.path.join(ROOT, "target")}
+        try:
+            status = subprocess.run(scripts, cwd=ROOT, env=blaze_env, timeout=1800).returncode
+        except subprocess.TimeoutExpired:
+            print(f"::error::{' '.join(scripts)} ran past 30 min")
+            status = 1
     if cfg.build:
         sys.exit(status or (1 if over else 0))
     context = failures.Context("release", failures.this_os(), "cargo" if cfg.builder == "cargo" else "blaze")
