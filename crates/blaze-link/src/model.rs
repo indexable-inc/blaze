@@ -957,15 +957,19 @@ const LOCAL_ORDER: blaze_hash::SipKey = blaze_hash::SipKey::new(0x626c_617a_652d
 /// fixed order would. Mach-O's symbol table, not yet kept by place, still relies on it to keep
 /// a body edit at one entry. ELF's `.symtab` and Mach-O's `LC_SYMTAB` both list locals in any
 /// order (no loader reads them; debuggers sort them). One hash a name and one radix sort,
-/// `O(functions)`.
-pub(crate) fn local_order(functions: &[Function], local: impl Fn(&str) -> bool) -> Vec<u32, std::alloc::Global> {
-    let mut keyed: Vec<(u128, u32), std::alloc::Global> = Vec::with_capacity_in(functions.len(), std::alloc::Global);
+/// `O(functions)`. Made in `alloc`, as are the keys it sorts.
+pub(crate) fn local_order<A: std::alloc::Allocator + Clone>(
+    functions: &[Function],
+    local: impl Fn(&str) -> bool,
+    alloc: A,
+) -> Vec<u32, A> {
+    let mut keyed: Vec<(u128, u32), A> = Vec::with_capacity_in(functions.len(), alloc.clone());
     keyed.extend(functions.iter().enumerate().filter_map(|(at, function)| {
         let name = function.name.as_deref().filter(|it| local(it))?;
         Some((blaze_ids::radix::pack_64(LOCAL_ORDER.hash(name.as_bytes()), at as u64), at as u32))
     }));
     blaze_ids::radix::sort_copy_by_key(&mut keyed, |it| it.0);
-    let mut order = Vec::with_capacity_in(keyed.len(), std::alloc::Global);
+    let mut order = Vec::with_capacity_in(keyed.len(), alloc);
     order.extend(keyed.iter().map(|it| it.1));
     order
 }

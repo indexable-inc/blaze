@@ -30,7 +30,7 @@
 //!
 //! Nothing on the plan, code and link path reads a file's name, text or root (rule 25): a
 //! plan's and a code record's keys hold none, and the front end is made naming no file
-//! ([`no_names`]). Only [`spans`] reads text and names files, and its records read what they
+//! ([`code::front_end`]). Only [`spans`] reads text and names files, and its records read what they
 //! name ([`span_file_fact`]).
 
 #![blaze::sans_io]
@@ -129,13 +129,6 @@ pub const NO_ROOTS: &str = "a program's roots: the front end could not list them
 
 /// The first bytes of the kept payload [`link`] writes.
 pub const KEPT_MAGIC: &[u8; 8] = b"bzlkept1";
-
-/// What a plan or code task's front end calls a file: nothing. Neither key holds a file's name
-/// (rule 25; hir-ty-codegen's plan module doc), so a describe that asks is a bug, refused by
-/// the name it asked for.
-pub fn no_names(_: FileId) -> Option<String> {
-    None
-}
 
 /// Which plan layout `payload` is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -276,7 +269,7 @@ fn caught<T, A: Allocator + Clone + Send + Sync>(
 
 /// The front end of a program task over `snapshot`, naming no file.
 fn front_of<'db, A: Allocator>(snapshot: &'db Snapshot<A>, policy: &Policy, settings: FrontSettings) -> HirFrontend<'db> {
-    code::front_end(snapshot, policy, settings, no_names)
+    code::front_end(snapshot, policy, settings)
 }
 
 /// `Front::plan` for the command: the plan record named `key` of program `program`, whose
@@ -769,8 +762,8 @@ fn take_u32(bytes: &mut &[u8]) -> Result<u32, TaskFailed> {
 }
 
 /// The kept table and the linker's kept state of `payload` (empty: a first link).
-fn kept_of(payload: &[u8]) -> Result<(Vec<KeptRow<'_>, Global>, &[u8]), TaskFailed> {
-    let mut rows = Vec::new_in(Global);
+fn kept_of<B: Allocator>(payload: &[u8], alloc: B) -> Result<(Vec<KeptRow<'_>, B>, &[u8]), TaskFailed> {
+    let mut rows = Vec::new_in(alloc);
     if payload.is_empty() {
         return Ok((rows, &[]));
     }
@@ -852,7 +845,7 @@ pub fn link<A: Allocator + Clone, F: Allocator + Clone>(
     payload: &[u8],
     frame: F,
 ) -> Result<Linked<F>, TaskFailed> {
-    let (old, linker) = kept_of(payload)?;
+    let (old, linker) = kept_of(payload, frame.clone())?;
     let mut fn_plans: Vec<(ContentId, &[u8]), Global> = Vec::with_capacity_in(plans.len(), Global);
     let mut static_plans: Vec<(ContentId, &[u8]), Global> = Vec::new_in(Global);
     for &(instance, bytes) in plans {

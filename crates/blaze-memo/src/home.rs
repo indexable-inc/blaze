@@ -71,7 +71,7 @@ pub(crate) fn mark_borrows<K: Home + ?Sized>(
     memo: &Memo,
     slot: &Slot,
     key: &K,
-    name: &dyn Fn(&mut String),
+    name: &dyn Fn(&mut dyn std::fmt::Write),
 ) {
     let mut homes = Homes { max: None, marking: Some((memo, slot)), outside: None };
     key.home(&mut homes);

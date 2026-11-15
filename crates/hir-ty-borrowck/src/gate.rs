@@ -13,7 +13,11 @@
 //! reuse of stored code takes a [`Checked`], so nothing the live path made can reach one by its
 //! types.
 
-use std::{alloc::Global, fmt, marker::PhantomData};
+use std::{
+    alloc::{Allocator, Global},
+    fmt,
+    marker::PhantomData,
+};
 
 use base_db::Db;
 use hir_def::{DefWithBodyId, ExpressionStoreOwnerId};
@@ -40,9 +44,9 @@ pub enum Refused {
     /// checked.
     Unsupported { owner: DefWithBodyId, what: String },
     /// The MIR asked for could not be built.
-    Lowering { owner: DefWithBodyId, error: String },
+    Lowering { owner: DefWithBodyId, error: blaze_mem::String<Global> },
     /// The MIR given is of another body than the one checked.
-    NotOf { owner: DefWithBodyId, mir_owner: String },
+    NotOf { owner: DefWithBodyId, mir_owner: blaze_mem::String<Global> },
 }
 
 impl Refused {
@@ -147,7 +151,7 @@ const NOT_OF: u8 = 5;
 /// id); the verdict is what refuses a body.
 ///
 /// Floor: one pass over the errors, writing each once; a pass writes nothing.
-pub fn encode_verdict(refused: Option<&Refused>, out: &mut Vec<u8>) {
+pub fn encode_verdict<A: Allocator>(refused: Option<&Refused>, out: &mut Vec<u8, A>) {
     let Some(refused) = refused else { return };
     match refused {
         Refused::Errors { errors, .. } => {
@@ -175,11 +179,11 @@ pub fn encode_verdict(refused: Option<&Refused>, out: &mut Vec<u8>) {
 }
 
 /// A verdict [`encode_verdict`] wrote, read in place.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict<'a> {
     Passed,
     /// The errors, in the check's order.
-    Errors(Vec<VerdictError<'a>, Global>),
+    Errors(VerdictErrors<'a>),
     NotChecked(NotChecked),
     Unsupported,
     Lowering,
@@ -205,57 +209,162 @@ impl VerdictError<'_> {
     }
 }
 
-/// Reads a verdict [`encode_verdict`] wrote; an error naming what does not read and where.
-pub fn decode_verdict(bytes: &[u8]) -> Result<Verdict<'_>, String> {
+/// The errors of an encoded verdict, read in place: [`decode_verdict`] read each once, so this
+/// is the proof that every one reads, and iterating them reads the bytes again with nothing
+/// left to refuse. Nothing is allocated for them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VerdictErrors<'a> {
+    /// At the first error.
+    at: Cursor<'a>,
+    len: usize,
+}
+
+impl<'a> VerdictErrors<'a> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The errors, in the check's order.
+    pub fn iter(&self) -> VerdictErrorsIter<'a> {
+        VerdictErrorsIter { at: self.at, left: self.len }
+    }
+}
+
+impl fmt::Debug for VerdictErrors<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<'a> IntoIterator for VerdictErrors<'a> {
+    type Item = VerdictError<'a>;
+    type IntoIter = VerdictErrorsIter<'a>;
+
+    fn into_iter(self) -> VerdictErrorsIter<'a> {
+        self.iter()
+    }
+}
+
+/// The errors of a [`VerdictErrors`], each read in place as it is reached.
+#[derive(Clone)]
+pub struct VerdictErrorsIter<'a> {
+    at: Cursor<'a>,
+    left: usize,
+}
+
+impl<'a> Iterator for VerdictErrorsIter<'a> {
+    type Item = VerdictError<'a>;
+
+    fn next(&mut self) -> Option<VerdictError<'a>> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        Some(self.at.error().expect("decode_verdict read each error of the verdict, so it reads again"))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for VerdictErrorsIter<'_> {}
+
+/// Why bytes are no verdict [`encode_verdict`] wrote: what does not read, and at which byte of
+/// the verdict.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerdictDecodeError {
+    /// More errors than the bytes after the count could hold.
+    Count { count: u64, len: usize },
+    /// A span's kind byte that names no kind.
+    Span { kind: u8, at: usize },
+    /// An `at_signature` byte that is neither 0 nor 1.
+    AtSignature(u8),
+    /// A not-checked byte that names no reason.
+    Why(u8),
+    /// A tag that names no kind of refusal.
+    Tag(u8),
+    /// Bytes after the verdict's end.
+    PastEnd(usize),
+    /// The verdict ends at byte `at` where `more` bytes are read.
+    Ends { at: usize, more: usize },
+    /// A text longer than the bytes left.
+    TextLen { len: u64, at: usize },
+    /// A text that is not UTF-8.
+    NotUtf8 { at: usize },
+}
+
+impl fmt::Display for VerdictDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            VerdictDecodeError::Count { count, len } => {
+                write!(f, "an encoded verdict of {count} errors in {len} bytes")
+            }
+            VerdictDecodeError::Span { kind, at } => {
+                write!(f, "an encoded verdict's span of kind {kind} at byte {at}")
+            }
+            VerdictDecodeError::AtSignature(other) => {
+                write!(f, "an encoded verdict's `at_signature` of {other}")
+            }
+            VerdictDecodeError::Why(code) => write!(f, "an encoded verdict's why of {code}"),
+            VerdictDecodeError::Tag(other) => write!(f, "an encoded verdict's tag of {other}"),
+            VerdictDecodeError::PastEnd(len) => {
+                write!(f, "an encoded verdict with {len} bytes past its end")
+            }
+            VerdictDecodeError::Ends { at, more } => {
+                write!(f, "an encoded verdict ends at byte {at} where {more} more are read")
+            }
+            VerdictDecodeError::TextLen { len, at } => {
+                write!(f, "an encoded verdict's text of {len} bytes at byte {at}")
+            }
+            VerdictDecodeError::NotUtf8 { at } => {
+                write!(f, "an encoded verdict's text at byte {at} is not UTF-8")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VerdictDecodeError {}
+
+/// Reads a verdict [`encode_verdict`] wrote, in place; an error naming what does not read and
+/// where. Floor: one pass over the bytes, nothing allocated.
+pub fn decode_verdict(bytes: &[u8]) -> Result<Verdict<'_>, VerdictDecodeError> {
     let Some((&tag, rest)) = bytes.split_first() else { return Ok(Verdict::Passed) };
     let mut at = Cursor { bytes: rest, at: 1 };
     let verdict = match tag {
         ERRORS => {
             let count = at.u64()?;
-            // Each error is at least 22 bytes: a bound on the count before it is allocated.
+            // Each error is at least 22 bytes: a bound on the count before it is read.
             let bound = rest.len() / 22;
             if count > bound as u64 {
-                // alloc: error path
-                return Err(format!("an encoded verdict of {count} errors in {} bytes", rest.len()));
+                return Err(VerdictDecodeError::Count { count, len: rest.len() });
             }
-            let mut errors = Vec::with_capacity_in(count as usize, Global);
+            let errors = VerdictErrors { at, len: count as usize };
             for _ in 0..count {
-                let code = at.text()?;
-                let kind = at.byte()?;
-                let index = at.u32()?;
-                let span = span_of(kind, index).ok_or_else(|| {
-                    // alloc: error path
-                    format!("an encoded verdict's span of kind {kind} at byte {}", at.at)
-                })?;
-                let at_signature = match at.byte()? {
-                    0 => false,
-                    1 => true,
-                    // alloc: error path
-                    other => return Err(format!("an encoded verdict's `at_signature` of {other}")),
-                };
-                let message = at.text()?;
-                errors.push(VerdictError { code, span, at_signature, message });
+                at.error()?;
             }
             Verdict::Errors(errors)
         }
         NOT_CHECKED => {
             let code = at.byte()?;
-            // alloc: error path
-            Verdict::NotChecked(not_checked_of(code).ok_or_else(|| format!("an encoded verdict's why of {code}"))?)
+            Verdict::NotChecked(not_checked_of(code).ok_or(VerdictDecodeError::Why(code))?)
         }
         UNSUPPORTED => Verdict::Unsupported,
         LOWERING => Verdict::Lowering,
         NOT_OF => Verdict::NotOf,
-        // alloc: error path
-        other => return Err(format!("an encoded verdict's tag of {other}")),
+        other => return Err(VerdictDecodeError::Tag(other)),
     };
     if !at.bytes.is_empty() {
-        // alloc: error path
-        return Err(format!("an encoded verdict with {} bytes past its end", at.bytes.len()));
+        return Err(VerdictDecodeError::PastEnd(at.bytes.len()));
     }
     Ok(verdict)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Cursor<'a> {
     bytes: &'a [u8],
     /// Where `bytes` starts in the verdict, for an error.
@@ -263,10 +372,9 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], VerdictDecodeError> {
         if self.bytes.len() < n {
-            // alloc: error path
-            return Err(format!("an encoded verdict ends at byte {} where {n} more are read", self.at));
+            return Err(VerdictDecodeError::Ends { at: self.at, more: n });
         }
         let (taken, rest) = self.bytes.split_at(n);
         self.bytes = rest;
@@ -274,27 +382,40 @@ impl<'a> Cursor<'a> {
         Ok(taken)
     }
 
-    fn byte(&mut self) -> Result<u8, String> {
+    fn byte(&mut self) -> Result<u8, VerdictDecodeError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    fn u32(&mut self) -> Result<u32, VerdictDecodeError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
+    fn u64(&mut self) -> Result<u64, VerdictDecodeError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
     }
 
-    fn text(&mut self) -> Result<&'a str, String> {
+    fn text(&mut self) -> Result<&'a str, VerdictDecodeError> {
         let len = self.u64()?;
         if len > self.bytes.len() as u64 {
-            // alloc: error path
-            return Err(format!("an encoded verdict's text of {len} bytes at byte {}", self.at));
+            return Err(VerdictDecodeError::TextLen { len, at: self.at });
         }
         let at = self.at;
-        // alloc: error path
-        std::str::from_utf8(self.take(len as usize)?).map_err(|_| format!("an encoded verdict's text at byte {at} is not UTF-8"))
+        std::str::from_utf8(self.take(len as usize)?).map_err(|_| VerdictDecodeError::NotUtf8 { at })
+    }
+
+    /// One error of an errors verdict.
+    fn error(&mut self) -> Result<VerdictError<'a>, VerdictDecodeError> {
+        let code = self.text()?;
+        let kind = self.byte()?;
+        let index = self.u32()?;
+        let span = span_of(kind, index).ok_or(VerdictDecodeError::Span { kind, at: self.at })?;
+        let at_signature = match self.byte()? {
+            0 => false,
+            1 => true,
+            other => return Err(VerdictDecodeError::AtSignature(other)),
+        };
+        let message = self.text()?;
+        Ok(VerdictError { code, span, at_signature, message })
     }
 }
 
@@ -363,13 +484,13 @@ fn mir_of<'db>(
 ) -> Result<&'db MirBody<'db>, Refused> {
     let body = body.map_err(|error| {
         // Rendered with `db` attached: the error's types name themselves only through it.
-        let error = blaze_memo::attach(db, || format!("{error:?}")); // alloc: a refusal's message, on the error path
+        let error = blaze_memo::attach(db, || blaze_mem::format_in!(Global, "{error:?}"));
         Refused::Lowering { owner: def, error }
     })?;
     // MIR of `def`'s body or of a closure, coroutine or `const` block in it, which its borrow
     // check covers.
     if body.owner.expression_store_owner(db) != ExpressionStoreOwnerId::Body(def) {
-        let mir_owner = format!("{:?}", body.owner); // alloc: a refusal's message, error path
+        let mir_owner = blaze_mem::format_in!(Global, "{:?}", body.owner);
         return Err(Refused::NotOf { owner: def, mir_owner });
     }
     Ok(body)

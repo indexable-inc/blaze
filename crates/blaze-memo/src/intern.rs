@@ -43,9 +43,8 @@ pub fn intern<T: Interned>(memo: &Memo, fields: T::Fields) -> Gid {
         return gid_of(slot.id, head);
     }
     counts::miss();
-    mark_borrows(memo, slot, &fields, &|out: &mut String| {
-        out.push_str("interned ");
-        out.push_str(T::KIND.name());
+    mark_borrows(memo, slot, &fields, &|out: &mut dyn std::fmt::Write| {
+        let _ = write!(out, "interned {}", T::KIND.name());
     });
     let spill = !slot.writable_by(memo.epoch());
     let column = if spill { memo.spill() } else { slot };

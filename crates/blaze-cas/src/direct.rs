@@ -966,6 +966,8 @@ pub enum Failed {
     Short { key: Key, file: FileName, at: u64, asked: u64, read: u64 },
     /// The bytes read are not the record the index names, or not the value it recorded.
     Corrupt { key: Key, file: FileName, at: u64, what: String },
+    /// The live layer the record was found in is gone before its read resolved.
+    LayerGone { key: Key, file: FileName, at: u64 },
     /// The index itself is corrupt where it names the key.
     Index { key: Key, file: FileName, what: String },
     /// The record is kept in a form this reader does not read into memory.
@@ -984,6 +986,7 @@ impl Failed {
             Failed::Read { key, .. }
             | Failed::Short { key, .. }
             | Failed::Corrupt { key, .. }
+            | Failed::LayerGone { key, .. }
             | Failed::Index { key, .. }
             | Failed::Form { key, .. }
             | Failed::NotMappable { key, .. }
@@ -1024,6 +1027,12 @@ impl fmt::Display for Failed {
                 f,
                 "the record of {:x} at {at} of {file} is corrupt: {what} (every record is checked \
                  whole on every direct read)",
+                key.0
+            ),
+            Failed::LayerGone { key, file, at } => write!(
+                f,
+                "the record of {:x} at {at} of {file} is corrupt: the live layer it was found in is \
+                 gone (every record is checked whole on every direct read)",
                 key.0
             ),
             Failed::Index { key, file, what } => {
@@ -2237,13 +2246,7 @@ impl Direct {
                     }
                 }
             } else {
-                Where::Failed(Failed::Corrupt {
-                    key: ask.key,
-                    file: ask.file,
-                    at: ask.loc.offset,
-                    // alloc: the error's message
-                    what: "the live layer it was found in is gone".into(),
-                })
+                Where::Failed(Failed::LayerGone { key: ask.key, file: ask.file, at: ask.loc.offset })
             };
             self.targets[at] = target;
         }

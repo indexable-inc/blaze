@@ -241,8 +241,8 @@ pub fn check<F: Gathers, A: Allocator + Clone>(
     let last_at = keyed.join("last").join(&place);
 
     let began = Instant::now();
-    let look = DiskLook::new(Path::new(&*graph.checkout));
-    let fresh = leaves::sweep(&look, leaves::load(&leaves_at)?)?;
+    let mut look = DiskLook::new(Path::new(&*graph.checkout));
+    let fresh = leaves::sweep(&mut look, leaves::load(&leaves_at)?)?;
     let mut table = fresh.table.clone();
     let moved = fresh.moved();
     let last = load_last(&last_at, alloc.clone())?;
@@ -486,8 +486,8 @@ pub fn build<A: Allocator + Clone + Send + Sync>(
     let programs_at = keyed.join("programs").join(&place);
 
     let began = Instant::now();
-    let look = DiskLook::new(Path::new(&*graph.checkout));
-    let fresh = leaves::sweep(&look, leaves::load(&leaves_at)?)?;
+    let mut look = DiskLook::new(Path::new(&*graph.checkout));
+    let fresh = leaves::sweep(&mut look, leaves::load(&leaves_at)?)?;
     let mut table = fresh.table.clone();
     let moved = fresh.moved();
     let last = load_last(&last_at, alloc.clone())?;
@@ -530,7 +530,7 @@ pub fn build<A: Allocator + Clone + Send + Sync>(
         last: last_programs.iter().find(|it| it.0 == identity).map(|it| Key::from_id(it.1)),
     }];
     let files = Disk::new(Path::new(&*graph.checkout));
-    let images = crate::images::HomeImages::new(&keyed, &[(identity, path.clone())])?;
+    let images = crate::images::HomeImages::new(&keyed, &[(identity, path.clone())], Global)?;
     let plan_took = began.elapsed();
 
     let _quiet = quiet_refusals();
@@ -743,17 +743,18 @@ impl ClosureTable {
 /// The tables of `program`'s closure (it and every unit it depends on, to the end), sorted by
 /// owner as [`Universe::tables`] is, each read from the manifest the units' request filed.
 /// One manifest and one surface read per unit of the closure.
-fn closure_of<A: Allocator + Clone, S: Store>(
+fn closure_of<A: Allocator + Clone, S: Store, B: Allocator + Clone>(
     graph: &Graph<A>,
     program: u32,
     manifests: &[Key<UnitManifest>],
     store: &S,
-) -> Result<Vec<ClosureTable, Global>, CommandError> {
-    let mut seen = Vec::with_capacity_in(graph.units.len(), Global);
+    alloc: B,
+) -> Result<Vec<ClosureTable, B>, CommandError> {
+    let mut seen = Vec::with_capacity_in(graph.units.len(), alloc.clone());
     seen.resize(graph.units.len(), false);
-    let mut stack = Vec::with_capacity_in(graph.units.len(), Global);
+    let mut stack = Vec::with_capacity_in(graph.units.len(), alloc.clone());
     stack.push(program);
-    let mut out = Vec::with_capacity_in(graph.units.len(), Global);
+    let mut out = Vec::with_capacity_in(graph.units.len(), alloc);
     while let Some(at) = stack.pop() {
         if std::mem::replace(&mut seen[at as usize], true) {
             continue;
@@ -807,7 +808,7 @@ impl<A: Allocator + Clone + Send + Sync, S: Store> Rooted<'_, '_, A, S> {
     /// The program's roots over `units`, given to the inner walker.
     fn list(&mut self, units: &[Key<UnitManifest>]) -> Result<(), CommandError> {
         let unit = self.program.unit;
-        let parts = closure_of(self.graph, unit, units, self.store)?;
+        let parts = closure_of(self.graph, unit, units, self.store, Global)?;
         let mut tables = Vec::with_capacity_in(parts.len(), Global);
         for part in parts.iter() {
             tables.push(part.table(self.graph)?);
@@ -1330,13 +1331,16 @@ pub(crate) fn quiet_refusals() -> Quiet {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
         let before = std::panic::take_hook();
-        // alloc: the process's one wrapper of the hook before it
-        std::panic::set_hook(Box::new(move |info| {
-            if QUIET.load(Ordering::Acquire) > 0 && crate::front::is_refusal(info.payload()) {
-                return;
-            }
-            before(info)
-        }));
+        // The process's one wrapper of the hook before it, on the global heap as the process's.
+        std::panic::set_hook(Box::new_in(
+            move |info: &std::panic::PanicHookInfo<'_>| {
+                if QUIET.load(Ordering::Acquire) > 0 && crate::front::is_refusal(info.payload()) {
+                    return;
+                }
+                before(info)
+            },
+            Global,
+        ));
     });
     QUIET.fetch_add(1, Ordering::AcqRel);
     Quiet(())

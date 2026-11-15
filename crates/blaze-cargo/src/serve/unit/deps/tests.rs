@@ -187,7 +187,7 @@ fn values_asked_at_once_from_many_threads_are_each_taken_once_by_key() {
     // The control: other bytes under a key asked since the last take are refused.
     asked.ask(key(0), std::borrow::Cow::Owned(value(0))).unwrap();
     let other = asked.ask(key(0), std::borrow::Cow::Borrowed(b"other")).unwrap_err();
-    assert!(other.contains("two values"), "{other}");
+    assert!(matches!(other, super::Unkept::TwoValues { in_store: false, .. }), "{other}");
 }
 
 /// The invariant: a per-item entry is found by its key alone, under any set, once the loop

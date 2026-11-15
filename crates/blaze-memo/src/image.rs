@@ -472,7 +472,7 @@ pub(crate) fn probe<'db, K: Copy + Eq + Debug + crate::Home + 'static, V: 'stati
                 size_of::<V>()
             )
         });
-        mark_borrows(memo, slot, key, &|out: &mut String| crate::task::write_key(out, kind, key));
+        mark_borrows(memo, slot, key, &|out: &mut dyn std::fmt::Write| crate::task::write_key(out, kind, key));
         // The record's facts, as this entry's rows: what a reader of it now depends on (the
         // same facts the check above compared).
         let boundary = boundary_local(memo, slot, kind);

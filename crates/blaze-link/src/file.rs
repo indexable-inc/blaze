@@ -69,7 +69,7 @@ const GRAIN: usize = 8;
 /// block at `at` of a table) differs from `old` (the same block before; shorter where the table
 /// grew, its missing bytes counted as differing). One pass over the block, which a compare
 /// already found differs.
-fn narrowed(offset: u64, at: usize, old: &[u8], new: &[u8], ranges: &mut Vec<(u64, u64)>) {
+fn narrowed<A: std::alloc::Allocator>(offset: u64, at: usize, old: &[u8], new: &[u8], ranges: &mut Vec<(u64, u64), A>) {
     let words = new.len().div_ceil(GRAIN);
     let mut run: Option<usize> = None;
     for word in 0..=words {
@@ -88,7 +88,14 @@ fn narrowed(offset: u64, at: usize, old: &[u8], new: &[u8], ranges: &mut Vec<(u6
 }
 
 /// [`narrowed`] for the block `at..at + len` of `new`, a table kept in pages, against `old`.
-fn narrowed_cow(offset: u64, at: usize, len: usize, old: &CowBytes, new: &CowBytes, ranges: &mut Vec<(u64, u64)>) {
+fn narrowed_cow<A: std::alloc::Allocator>(
+    offset: u64,
+    at: usize,
+    len: usize,
+    old: &CowBytes,
+    new: &CowBytes,
+    ranges: &mut Vec<(u64, u64), A>,
+) {
     let have = old.len().saturating_sub(at).min(len);
     let before = if have == 0 { std::borrow::Cow::Borrowed(&[][..]) } else { old.read(at, have) };
     narrowed(offset, at, &before, &new.read(at, len), ranges);

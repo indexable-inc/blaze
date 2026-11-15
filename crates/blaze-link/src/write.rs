@@ -1643,7 +1643,7 @@ impl Lists {
     pub(crate) fn keep<A: std::alloc::Allocator>(
         &self,
         out: &mut crate::keep::Out<A>,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::keep::Unkept> {
         use crate::keep::Kept as _;
         let Lists { rebase, binds, got, functions, debug, totals } = self;
         rebase.put(out);
@@ -1653,7 +1653,7 @@ impl Lists {
         out.len(debug.len());
         for (name, bytes) in debug.iter() {
             if crate::keep::static_name(name).is_none() {
-                return Err(format!("the debug section `{name}`, which a kept state has no name for"));
+                return Err(crate::keep::Unkept::Debug(*name));
             }
             out.text(name);
             out.bytes(bytes);

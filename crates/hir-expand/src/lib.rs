@@ -713,18 +713,31 @@ fn fn_like_arg(db: &Db, loc: &MacroCallLoc, ast_id: AstId<ast::MacroCall>) -> Ma
         // deeply nested code. The expansion is refused, with why.
         cov_mark::hit!(issue9358_bad_macro_stack_overflow);
 
-        // alloc: an error's message, on the error path
-        let why = match tt.right_delimiter_token() {
-            None => {
-                format!("this macro call's `{}` is never closed, so it is not expanded", first.text())
+        // Every pair of delimiters is one of a few, so each message is a constant: nothing is
+        // allocated for it. `first` is `(`, `[` or `{` (the left delimiter, or `(` where there
+        // is none); `last` is `)`, `]` or `}`, or `.` where there is no right delimiter.
+        let why = match (first, last) {
+            (T!['['], T![.]) => "this macro call's `[` is never closed, so it is not expanded",
+            (T!['{'], T![.]) => "this macro call's `{` is never closed, so it is not expanded",
+            (_, T![.]) => "this macro call's `(` is never closed, so it is not expanded",
+            (T!['('], T![']']) => {
+                "this macro call opens with `(` and closes with `]`, so it is not expanded"
             }
-            Some(_) => format!(
-                "this macro call opens with `{}` and closes with `{}`, so it is not expanded",
-                first.text(),
-                last.text()
-            ),
+            (T!['('], _) => {
+                "this macro call opens with `(` and closes with `}`, so it is not expanded"
+            }
+            (T!['['], T![')']) => {
+                "this macro call opens with `[` and closes with `)`, so it is not expanded"
+            }
+            (T!['['], _) => {
+                "this macro call opens with `[` and closes with `}`, so it is not expanded"
+            }
+            (_, T![')']) => {
+                "this macro call opens with `{` and closes with `)`, so it is not expanded"
+            }
+            (_, _) => "this macro call opens with `{` and closes with `]`, so it is not expanded",
         };
-        return refused(&why);
+        return refused(why);
     }
 
     let mode =

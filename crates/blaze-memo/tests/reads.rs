@@ -224,7 +224,7 @@ fn flat_is_eager(tape: &Tape, plant: Plant, fan: bool) -> Result<(), String> {
         let [row] = rows.as_slice() else {
             return Err(format!("wall({id}) asked under a recorder listed {rows:?}, not one boundary row"));
         };
-        let behind = flat_reads_behind(&db.memo, *row)
+        let behind = flat_reads_behind(&db.memo, *row, std::alloc::Global)
             .ok_or_else(|| format!("wall({id})'s row {row:?} names no entry"))?;
         let listed = rows_of(&db.memo, &behind)?;
         if listed != want {

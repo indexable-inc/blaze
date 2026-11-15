@@ -280,21 +280,18 @@ impl KeptSymtab {
             return false;
         }
         const UNSET: u32 = u32::MAX;
-        // alloc: once per patch, a local a spliced function and one a local taken out
         let (mut taken, mut gone) = (Vec::new_in(Global), Vec::new_in(Global));
         for splice in splices {
             let old = &self.locals[splice.old.start as usize..splice.old.end as usize];
             let new = &functions[splice.new.start as usize..splice.new.end as usize];
             let bytes = &self.bytes;
             // The splice's old locals by name, read where they are in the kept `.strtab`.
-            // alloc: once per splice, an entry an old local
             let mut by_name = Vec::with_capacity_in(old.len(), Global);
             by_name.extend((0..old.len()).filter(|at| old[*at].sym != 0).map(|at| {
                 let local = old[at];
                 (bytes.read(strtab + local.name as usize, (local.stored as usize).saturating_sub(1)), at)
             }));
             by_name.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            // alloc: once per splice, a flag an old local
             let mut used = Vec::with_capacity_in(old.len(), Global);
             used.resize(old.len(), false);
             for function in new {
@@ -432,7 +429,6 @@ impl KeptSymtab {
         let [len, named, function_names, global_names, globals, shstrtab_len, shdrs] = sizes;
         let layout = Layout { tail, len, named, function_names, global_names, globals, shstrtab_len, shdrs };
         let count = input.count(12)?;
-        // alloc: once per open, a local a function
         let mut locals = Vec::with_capacity_in(count, Global);
         for _ in 0..count {
             locals.push(Local { sym: input.u32()?, name: input.u32()?, stored: input.u32()? });
@@ -472,21 +468,6 @@ impl KeptSymtab {
         // clone: two reference counts, the tail shared with the opened state's part
         Ok(KeptSymtab { synthesis, layout, locals, free, holes, bytes: bytes.clone(), ..KeptSymtab::default() })
     }
-}
-
-/// Every named function's index in `functions`, in `.symtab`'s order of locals
-/// ([`crate::model::local_order`]).
-fn local_order(functions: &[Function]) -> Vec<u32, Global> {
-    crate::model::local_order(functions, |_| true)
-}
-
-/// By chunk of [`CHUNK`] locals of `order` ([`local_order`]): how many there are and the bytes
-/// their names take.
-fn name_counts(functions: &[Function], order: &[u32]) -> Vec<(usize, usize)> {
-    par::map(par::chunks(order, CHUNK), |chunk| {
-        let len = (chunk.iter().filter_map(|at| functions[*at as usize].name.as_deref())).map(stored).sum();
-        (chunk.len(), len)
-    }) // alloc: once per image, one count per chunk of functions
 }
 
 fn local_symbol(regions: &[Region], function: &Function, name: u32) -> Sym {
@@ -969,11 +950,17 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         _ => false,
     };
     let (order, chunks, named, function_names) = match kept.as_deref() {
-        // alloc: none, an empty Vec holds no buffer
-        Some(kept) if patched => (Vec::new_in(Global), Vec::new(), kept.layout.named, kept.layout.function_names),
+        Some(kept) if patched => (Vec::new_in(Global), Vec::new_in(Global), kept.layout.named, kept.layout.function_names),
         _ => {
-            let order = local_order(placed.functions);
-            let chunks = name_counts(placed.functions, &order);
+            // Every named function's index, in `.symtab`'s order of locals
+            // ([`crate::model::local_order`]); by chunk of [`CHUNK`] of them, how many there are
+            // and the bytes their names take.
+            let order = crate::model::local_order(placed.functions, |_| true, Global);
+            let chunks = par::map(par::chunks(&order, CHUNK), |chunk| {
+                let len: usize =
+                    (chunk.iter().filter_map(|at| placed.functions[*at as usize].name.as_deref())).map(stored).sum();
+                (chunk.len(), len)
+            });
             let live: usize = chunks.iter().map(|it| it.0).sum();
             let live_names: usize = chunks.iter().map(|it| it.1).sum();
             let (named, function_names) = match writer.output.incremental {
@@ -988,7 +975,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     if u32::try_from(strtab_len).is_err() {
         return Err(error(format!(
             "{strtab_len} bytes of symbol names, more than .strtab offsets reach"
-        ))); // alloc: error path
+        )));
     }
     let first_global = 1 + named as u32;
 

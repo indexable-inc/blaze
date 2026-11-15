@@ -112,14 +112,6 @@ pub struct StdName<'g, 'p> {
     pub rest: &'p str,
 }
 
-impl StdName<'_, '_> {
-    /// Its bytes appended to `out`: the name whole, as one part to hash or print.
-    pub fn push_into(&self, out: &mut String) {
-        out.push_str(self.library);
-        out.push_str(self.rest);
-    }
-}
-
 impl std::fmt::Display for StdName<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}{}", self.library, self.rest)
@@ -523,9 +515,9 @@ fn mount(tree: &DiskTree, fetch: &query::Fetch) -> Result<Mount, CommandError> {
 /// The graph of a plan's units.
 /// Which units of `units` are crates of the graph, by their index there, and those crates in
 /// the graph's order: graph unit `i` is units' unit `order[i]`.
-pub(crate) fn crates_of(units: &Units) -> Result<(Vec<bool, Global>, Vec<usize, Global>), CommandError> {
+pub(crate) fn crates_of<A: Allocator + Clone>(units: &Units, alloc: A) -> Result<(Vec<bool, A>, Vec<usize, A>), CommandError> {
     let all = &units.graph.units;
-    let mut kept = Vec::with_capacity_in(all.len(), Global);
+    let mut kept = Vec::with_capacity_in(all.len(), alloc.clone());
     for (at, unit) in all.iter().enumerate() {
         let script_run = unit.mode == Mode::RunCustomBuild;
         let std_script = unit.is_std && unit.target.is_custom_build();
@@ -534,7 +526,7 @@ pub(crate) fn crates_of(units: &Units) -> Result<(Vec<bool, Global>, Vec<usize, 
             return Err(unit_error(describe(units, at), "check builds no documentation", format!("a {:?} unit", unit.mode)));
         }
     }
-    let order = dependency_order(units, &kept, Global)?;
+    let order = dependency_order(units, &kept, alloc)?;
     Ok((kept, order))
 }
 
@@ -546,7 +538,7 @@ pub(crate) fn from_units<A: Allocator + Clone>(units: &Units, inputs: &Inputs<'_
         return Err(load_error(format!("the plan has {} units and {} unit plans", all.len(), units.plans.len())));
     }
     let what = |at: usize| describe(units, at);
-    let (kept, order) = crates_of(units)?;
+    let (kept, order) = crates_of(units, Global)?;
     let links = matches!(inputs.invocation.command, query::Command::Build | query::Command::Run);
     let mut index = Vec::with_capacity_in(all.len(), Global);
     index.resize(all.len(), u32::MAX);
@@ -627,7 +619,8 @@ pub(crate) fn from_units<A: Allocator + Clone>(units: &Units, inputs: &Inputs<'_
                     inherited: &inputs.invocation.env,
                     jobs: u32::try_from(jobs).unwrap_or(u32::MAX),
                 };
-                let std = stdlib::cfg::std_cfg(all, &units.plans, &units.packages, old, &triple, &run).map_err(refused)?;
+                let std = stdlib::cfg::std_cfg(all, &units.plans, &units.packages, old, &triple, &run)
+                    .map_err(|why| refused(why.to_string()))?;
                 scripts += ran_at.elapsed();
                 for (name, value) in &std.env {
                     env.push((boxed(name, alloc.clone()), boxed(value, alloc.clone())));
@@ -929,11 +922,12 @@ fn asked(package: &PackagePlan, unit: &schema::Unit) -> (bool, Bodies) {
 /// The unit's cfg atoms: its `lines` (blaze-units' `stdlib::cfg`, the one source of what rustc
 /// is given), and blaze's contract atom when the profile checks contracts, which is blaze's own
 /// and no line of rustc's.
-fn cfg_of<A: Allocator + Clone>(unit: &schema::Unit, lines: &[String], what: &str, alloc: A) -> Result<Vec<CfgAtom<A>, A>, CommandError> {
+fn cfg_of<A: Allocator + Clone, L: AsRef<str>>(unit: &schema::Unit, lines: &[L], what: &str, alloc: A) -> Result<Vec<CfgAtom<A>, A>, CommandError> {
     let profile = &unit.profile;
     let mut atoms = Vec::with_capacity_in(lines.len() + 1, alloc.clone());
     for line in lines {
-        atoms.push(CfgAtom::parse(line, alloc.clone()).map_err(|why| unit_error(what.to_owned(), why, line.clone()))?);
+        let line = line.as_ref();
+        atoms.push(CfgAtom::parse(line, alloc.clone()).map_err(|why| unit_error(what, why, line))?);
     }
     if profile.contract_checks {
         atoms.push(CfgAtom::Flag(boxed(cfg::CONTRACT_CHECKS, alloc)));
@@ -1152,8 +1146,11 @@ impl DiskTree {
         id
     }
 
-    fn root(&self, id: ContentId) -> Option<Arc<DiskRoot>> {
-        self.roots.lock().iter().find(|it| it.0 == id).map(|it| Arc::clone(&it.1))
+    /// `read` of the root under `id`, or `None` for an id with none: the root is shared out of
+    /// the lock (the guard drops with the `let`), so `read` reads the disk unlocked.
+    fn with_root<R>(&self, id: ContentId, read: impl FnOnce(&DiskRoot) -> R) -> Option<R> {
+        let root = self.roots.lock().iter().find(|it| it.0 == id).map(|it| Arc::clone(&it.1))?;
+        Some(read(&root))
     }
 
     fn fail(&self, path: &Path, error: &std::io::Error) {
@@ -1183,8 +1180,7 @@ impl DiskTree {
 
 impl Tree for DiskTree {
     fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, FileMode, Bytes)>, Corrupt> {
-        let Some(root) = self.root(root) else { return Ok(None) };
-        let Some(place) = DiskTree::place(&root, path) else { return Ok(None) };
+        let Some(place) = self.with_root(root, |root| DiskTree::place(root, path)).flatten() else { return Ok(None) };
         let meta = match std::fs::symlink_metadata(&place) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1219,15 +1215,35 @@ impl Tree for DiskTree {
 
     fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool {
         // dyn: see `Tree::read_dir`
-        let Some(root) = self.root(root) else { return false };
-        if let DiskRoot::One { name, .. } = &*root {
+        self.with_root(root, |root| self.list(root, path, read)).unwrap_or(false)
+    }
+
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        let place = self.with_root(root, |found| DiskTree::place(found, path))??;
+        match std::fs::symlink_metadata(&place) {
+            Ok(meta) if meta.is_dir() => Some(Hasher::new("blaze-command dir 1").id(&root).part(path.as_bytes()).finish()),
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                self.fail(&place, &error);
+                None
+            }
+        }
+    }
+}
+
+impl DiskTree {
+    /// [`Tree::read_dir`] of `path` under `root`.
+    fn list(&self, root: &DiskRoot, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool {
+        // dyn: see `Tree::read_dir`
+        if let DiskRoot::One { name, .. } = root {
             if !path.is_empty() {
                 return false;
             }
             read(&mut std::iter::once((name.as_str(), false)));
             return true;
         }
-        let Some(place) = DiskTree::place(&root, path) else { return false };
+        let Some(place) = DiskTree::place(root, path) else { return false };
         let entries = match std::fs::read_dir(&place) {
             Ok(entries) => entries,
             Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return false,
@@ -1236,7 +1252,7 @@ impl Tree for DiskTree {
                 return false;
             }
         };
-        let view = matches!(&*root, DiskRoot::View(_));
+        let view = matches!(root, DiskRoot::View(_));
         let mut names: Vec<(String, bool), Global> = Vec::new_in(Global);
         for entry in entries {
             let entry = match entry {
@@ -1266,19 +1282,5 @@ impl Tree for DiskTree {
         names.sort();
         read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
         true
-    }
-
-    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
-        let found = self.root(root)?;
-        let place = DiskTree::place(&found, path)?;
-        match std::fs::symlink_metadata(&place) {
-            Ok(meta) if meta.is_dir() => Some(Hasher::new("blaze-command dir 1").id(&root).part(path.as_bytes()).finish()),
-            Ok(_) => None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                self.fail(&place, &error);
-                None
-            }
-        }
     }
 }

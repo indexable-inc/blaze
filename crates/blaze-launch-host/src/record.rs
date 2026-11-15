@@ -255,7 +255,7 @@ impl<'a, P: Positions> Maker<'a, P> {
                 };
                 // The text: the recipe's bytes, each hole its span's file's name.
                 let positions = self.positions;
-                let mut composed = Vec::with_capacity(recipe.bytes.len() + 64); // alloc: a datum's bytes
+                let mut composed = Vec::with_capacity_in(recipe.bytes.len() + 64, Global);
                 text::compose(&recipe.bytes, recipe.relocs.view(), |span| positions.of(&span).map(|it| it.0), &mut composed)
                     .map_err(|why| match why {
                         text::TextError::NoFile(why) => {
@@ -276,21 +276,21 @@ impl<'a, P: Positions> Maker<'a, P> {
                     id: bytes_id,
                     align: 1,
                     bytes: composed.into(),
-                    fixups: Vec::new(), // alloc: none, empty
+                    fixups: Vec::new_in(Global),
                     writable: false,
                 });
                 // The `&str`: a pointer to the bytes, then the length.
                 let mut record = [0u8; 16];
                 record[8..].copy_from_slice(&len.to_le_bytes());
-                let mut keyed = Vec::with_capacity(48); // alloc: the id's input
+                let mut keyed = Vec::with_capacity_in(48, Global);
                 keyed.extend_from_slice(&bytes_id);
                 keyed.extend_from_slice(&record);
                 let pointer = Fixup { at: 0, kind: Kind::Abs64, to: To::Data(bytes), addend: 0 };
                 let str_record = self.datum(Owned {
                     id: ContentId::of(STR_DOMAIN, &keyed).0,
                     align: 8,
-                    bytes: record.to_vec().into(), // alloc: a datum's bytes
-                    fixups: vec![pointer],         // alloc: its one fixup
+                    bytes: record.to_vec_in(Global).into(),
+                    fixups: [pointer].to_vec_in(Global),
                     writable: false,
                 });
                 return Ok(To::Data(str_record));
@@ -454,7 +454,7 @@ pub fn function<P: Positions>(
             "it is instrumented (SanitizerCoverage or PGO), which only a linked image runs"
         )));
     }
-    let mut tables = Vec::with_capacity(1 + function.data.len()); // alloc: the tables' references, once per record
+    let mut tables = Vec::with_capacity_in(1 + function.data.len(), Global);
     tables.push(&function.relocs);
     tables.extend(function.data.iter().map(|it| &it.relocs));
     maker.own_data(&function.data, &tables)?;
@@ -523,7 +523,7 @@ pub fn of_static<P: Positions>(
     if !of.imports.is_empty() {
         return Err(maker.refuse(format_args!("it has WebAssembly imports")));
     }
-    let mut tables = Vec::with_capacity(1 + of.data.len()); // alloc: the tables' references, once per record
+    let mut tables = Vec::with_capacity_in(1 + of.data.len(), Global);
     if let Init::Bytes { relocs, .. } = &of.init {
         tables.push(relocs);
     }

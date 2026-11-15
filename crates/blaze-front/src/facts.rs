@@ -383,11 +383,8 @@ pub fn value_of(db: &Db, krate: Crate, fact: &FactRef) -> Result<ContentId, Fact
 /// said by the refusal itself (`blaze_items::Unhashable::describe`, the item and what could not
 /// be hashed), or the rule.
 #[blaze::renders_positions]
-pub fn unhashed_line(db: &Db, krate: Crate, fact: &FactRef) -> String {
-    use core::fmt::Write as _;
+pub fn unhashed_line<W: core::fmt::Write + ?Sized>(db: &Db, krate: Crate, fact: &FactRef, said: &mut W) {
     use hir_def::{Lookup as _, MacroId};
-    // alloc: one line of error text, once per refused task
-    let mut said = String::new();
     _ = write!(said, "{} (query kind {:#06x}) of ", name_of(fact.kind.0), fact.kind.0);
     let site = |ast| hir_def::deps::ast_site(db, ast);
     match key::resolve(db, ItemKey(fact.subject)) {
@@ -426,9 +423,8 @@ pub fn unhashed_line(db: &Db, krate: Crate, fact: &FactRef) -> String {
         Err(values::NoValue::Why(why)) => _ = write!(said, ": {why}"),
         // Asked again, it has one: the first ask was refused and this one was not, which is a
         // bug of its own (a value is a function of the snapshot); said so, never hidden.
-        Ok(_) => said.push_str(": it has a value when asked again, in the same snapshot"),
+        Ok(_) => _ = said.write_str(": it has a value when asked again, in the same snapshot"),
     }
-    said
 }
 
 /// The body the item key `subject` names in this build: a function, const, static, or a

@@ -8,15 +8,13 @@
 #![forbid(unsafe_code)]
 
 use std::alloc::Allocator;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use blaze_ids::ContentId;
 
 use crate::keep::{Bad, In, Kept, Out};
 use crate::model::{Formats, Writer};
-use crate::state::{Input, RustName};
-use crate::symbols::NameId;
+use crate::state::Input;
 use crate::NativeKind;
 
 use super::{CowFlags, Marks, Refs, Resolved, check_file};
@@ -52,7 +50,7 @@ impl Resolved {
             refs,
             pieces,
             removals,
-            // The state's own, shared: `open` takes them from the state.
+            // The state's own, shared: `open`'s caller sets them from the state.
             inputs: _,
             names: _,
             // Empty: `Image::keep` refuses a wasm import.
@@ -82,11 +80,9 @@ impl Resolved {
         commons.put(out);
     }
 
-    pub(crate) fn open(
-        input: &mut In<'_>,
-        inputs: &Arc<Vec<Input>>,
-        names: &Arc<BTreeMap<NameId, RustName>>,
-    ) -> Result<Resolved, Bad> {
+    /// The resolution `keep` wrote, but its inputs and names: the state's, shared, which the
+    /// caller sets in place of the empty ones here.
+    pub(crate) fn open(input: &mut In<'_>) -> Result<Resolved, Bad> {
         let imports = Kept::take(input)?;
         let import_syms = Kept::take(input)?;
         let libraries = Kept::take(input)?;
@@ -111,8 +107,8 @@ impl Resolved {
             refs,
             pieces,
             removals,
-            inputs: Arc::clone(inputs),
-            names: Arc::clone(names),
+            inputs: Arc::default(),
+            names: Arc::default(),
             wasm: Arc::default(),
             graph: None,
             marks: Marks::default(),

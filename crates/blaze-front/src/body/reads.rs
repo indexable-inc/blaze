@@ -20,7 +20,7 @@
 
 #![blaze::sans_io]
 
-use std::alloc::Global;
+use std::alloc::Allocator;
 
 use blaze_ids::ContentId;
 use blaze_keyed::{
@@ -46,14 +46,15 @@ pub enum Row {
 }
 
 /// The one reader of facts of a body task: answers each ask and keeps it for the shape.
-pub struct Asks<'u> {
+pub struct Asks<'u, A: Allocator> {
     universe: Universe<'u>,
-    shape: Vec<Fact, Global>,
+    shape: Vec<Fact, A>,
 }
 
-impl<'u> Asks<'u> {
-    pub fn new(universe: Universe<'u>) -> Asks<'u> {
-        Asks { universe, shape: Vec::new_in(Global) }
+impl<'u, A: Allocator> Asks<'u, A> {
+    /// The shape kept in `alloc`.
+    pub fn new(universe: Universe<'u>, alloc: A) -> Asks<'u, A> {
+        Asks { universe, shape: Vec::new_in(alloc) }
     }
 
     /// The answer now of fact `id`, kept for the shape. An id the universe cannot answer fails
@@ -78,7 +79,7 @@ impl<'u> Asks<'u> {
     }
 
     /// The shape as the record keeps it: sorted by id, each once.
-    pub fn finish(mut self) -> Vec<Fact, Global> {
+    pub fn finish(mut self) -> Vec<Fact, A> {
         self.shape.sort_unstable();
         self.shape.dedup_by_key(|fact| fact.id);
         self.shape

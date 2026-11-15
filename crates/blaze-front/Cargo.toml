@@ -40,6 +40,8 @@ tracing.workspace = true
 # Who read a row a body task refused (`record_readers`), told on that failure alone; and
 # `Reads::Kept`, the body tests' database marking item boundaries as the command's does.
 blaze-memo.workspace = true
+# The text of a refused task's lines, in an allocator named where it is made.
+blaze-mem.workspace = true
 
 [dev-dependencies]
 # The seeds of the body task's model tests.

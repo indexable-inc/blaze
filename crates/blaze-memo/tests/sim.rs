@@ -210,7 +210,7 @@ impl Flight for SimFlight {
     fn single<'f>(
         &'f self,
         key: FlightKey,
-        _: &dyn Fn(&mut String),
+        _: &dyn Fn(&mut dyn std::fmt::Write),
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f> {
         let sim = &*self.sim;

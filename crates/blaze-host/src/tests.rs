@@ -372,7 +372,7 @@ impl Front for Scripted {
                 edges.push(PlanEdge { item: subject(callee_at, callee.name).0, args_at: 0, args_len: 0, kind: 0, pad: 0, pad2: 0 });
             }
         }
-        let payload = record::write_plan_payload(&edges, &[], &body.result.0);
+        let payload = record::write_plan_payload(&edges, &[], &body.result.0, Global);
         let (_, bytes) = record::write_read::<PlanRecord>(key, &facts_of(&asked), &[], &payload);
         Ok(Aligned::copy_from(&bytes))
     }

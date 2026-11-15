@@ -33,7 +33,7 @@
 
 mod codegen;
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::fmt;
 
 use base_db::{Crate, CrateKey, Db, FileId};
@@ -258,11 +258,39 @@ impl Listed {
     }
 }
 
+/// What the harness refuses of a database or its crate graph, typed: its message is made only
+/// where it reaches the harness's own errors, which carry text.
+#[derive(Debug, Clone, Copy)]
+enum Refused {
+    /// The database keeps no run log ([`log`]).
+    NoRunLog,
+    /// The crate is not in the crate graph ([`arena_index`]).
+    NotInGraph(Crate),
+    /// The crate's place in the crate graph is past `u32::MAX` ([`arena_index`]).
+    PastU32(Crate),
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refused::NoRunLog => {
+                f.write_str("the database keeps no run log: make it with `Db::logged` or `Db::for_tests`")
+            }
+            Refused::NotInGraph(krate) => write!(f, "{krate:?} is not in the crate graph"),
+            Refused::PastU32(krate) => write!(f, "{krate:?} is past `u32::MAX` crates"),
+        }
+    }
+}
+
+impl From<Refused> for String {
+    fn from(it: Refused) -> String {
+        it.to_string()
+    }
+}
+
 /// The run log of `db`: a harness reads what each request ran from it.
-fn log(db: &Db) -> Result<&RunLog, String> {
-    db.runs().ok_or_else(|| {
-        "the database keeps no run log: make it with `Db::logged` or `Db::for_tests`".to_owned()
-    })
+fn log(db: &Db) -> Result<&RunLog, Refused> {
+    db.runs().ok_or(Refused::NoRunLog)
 }
 
 /// Writes `text` as `file`'s, in one edit and its commit: every id of the snapshot before is
@@ -275,12 +303,9 @@ fn write(db: &mut Db, file: FileId, text: &str) {
 
 /// The arena of `krate`: one past its place in the crate graph's topological order, as the
 /// driver numbers arenas ([`blaze_memo::Builder::arena`]; 0 is the session's).
-fn arena_index(all: &[Crate], krate: Crate) -> Result<u32, String> {
-    let at = all
-        .iter()
-        .position(|&it| it == krate)
-        .ok_or_else(|| format!("{krate:?} is not in the crate graph"))?;
-    u32::try_from(at + 1).map_err(|_| format!("{krate:?} is past `u32::MAX` crates"))
+fn arena_index(all: &[Crate], krate: Crate) -> Result<u32, Refused> {
+    let at = all.iter().position(|&it| it == krate).ok_or(Refused::NotInGraph(krate))?;
+    u32::try_from(at + 1).map_err(|_| Refused::PastU32(krate))
 }
 
 impl Harness {
@@ -583,7 +608,7 @@ fn take(log: &RunLog, request: Request, pass: &mut Pass) {
 /// Adds every body of `krate` declared in its modules, impls and traits, in the def map's
 /// order; `own` for A's, whose functions get their sites. Each is keyed by its crate's key, its
 /// name and which of the crate's bodies of that name it is.
-fn collect(db: &Db, krate: Crate, own: bool, out: &mut Vec<Body, Global>) {
+fn collect<A: Allocator>(db: &Db, krate: Crate, own: bool, out: &mut Vec<Body, A>) {
     let key = krate.key(db);
     let start = out.len();
     let other = |def: DefWithBodyId, name: &str| Body {
@@ -637,7 +662,13 @@ fn collect(db: &Db, krate: Crate, own: bool, out: &mut Vec<Body, Global>) {
 
 /// Adds `func` when it has a body: a trait's function without a default has none. Only an
 /// `own` function gets a site.
-fn function(db: &Db, krate: CrateKey, func: FunctionId, own: bool, out: &mut Vec<Body, Global>) {
+fn function<A: Allocator>(
+    db: &Db,
+    krate: CrateKey,
+    func: FunctionId,
+    own: bool,
+    out: &mut Vec<Body, A>,
+) {
     let loc = func.lookup(db);
     let source = loc.source_view(db);
     let Some(body) = source.value.body() else { return };

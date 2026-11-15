@@ -1047,7 +1047,7 @@ pub(crate) fn find(lowered: &mut Lowered, store: &blaze_cas::Reader) -> Result<(
     use hir_def::deps::found::{Found, found_key};
     let _span = tracing::info_span!(target: "blaze", "found records").entered();
     let front = front_end()?;
-    let crates = lowered.crates().named(lowered.db());
+    let crates = lowered.crates().named(lowered.db(), Global);
     let plans = lowered.plan_keys(&crates);
     let (mut asked, mut hits) = (0u64, 0u64);
     for krate in crates {
@@ -1610,7 +1610,7 @@ const NO_SET: ContentId = ContentId([0; 32]);
 impl Asked {
     /// [`Asked::ask_in`] in no set: the tests' ask of a value of no file.
     #[cfg(test)]
-    fn ask(&self, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
+    fn ask(&self, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), Unkept> {
         self.ask_in(NO_SET, key, value)
     }
 
@@ -1619,7 +1619,7 @@ impl Asked {
     /// holds others (two values under one key: the key misses an input). A borrowed value's
     /// bytes are copied only when the key is new. One value asked in two sets is kept in the
     /// lesser, so a take's order does not depend on which ask came first.
-    fn ask_in(&self, set: ContentId, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
+    fn ask_in(&self, set: ContentId, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), Unkept> {
         let asked = self.by_key.pin();
         if let Some((held_set, held)) = asked.get(&key) {
             same(key, held, &value)?;
@@ -1672,15 +1672,39 @@ impl Asked {
     }
 }
 
+/// Why a value was not asked to be kept ([`Images::ask`]): each names the key.
+#[derive(Debug)]
+enum Unkept {
+    /// Two values under `key` (the key misses an input): asked twice in this build, or (with
+    /// `in_store`) held by the store with other bytes; `differ` says how the two differ
+    /// (`entries::differ`).
+    TwoValues { key: ContentId, in_store: bool, differ: String },
+    /// The store could not be read under `key`: its message.
+    Store { key: ContentId, why: String },
+}
+
+impl std::fmt::Display for Unkept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unkept::TwoValues { key, in_store: false, differ } => {
+                write!(f, "two values were made under {key:?} in this build: {differ}")
+            }
+            Unkept::TwoValues { key, in_store: true, differ } => {
+                write!(f, "the store holds other bytes under {key:?}: {differ}")
+            }
+            Unkept::Store { key, why } => write!(f, "reading {key:?} from the store: {why}"),
+        }
+    }
+}
+
 /// `given` is `held`, asked under `key` before it; else the error naming the key and how the
 /// two differ (`entries::differ`).
-fn same(key: ContentId, held: &[u8], given: &[u8]) -> Result<(), String> {
+fn same(key: ContentId, held: &[u8], given: &[u8]) -> Result<(), Unkept> {
     if held == given {
         return Ok(());
     }
     let differ = hir_def::nameres::frozen::entries::differ(held, given);
-    // alloc: error path
-    Err(format!("two values were made under {key:?} in this build: {differ}"))
+    Err(Unkept::TwoValues { key, in_store: false, differ })
 }
 
 impl Images {
@@ -1711,7 +1735,7 @@ impl Images {
     /// A get does not read what was asked: a value is in the store once the loop put it, after
     /// the flush that asked. A flush that writes two values of one family of keys in turn (two
     /// shapes of one base key) keeps what it placed itself (`goal_store::slots`).
-    fn ask(&self, into: &Asked, set: ContentId, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
+    fn ask(&self, into: &Asked, set: ContentId, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), Unkept> {
         if self.held(key, &value)? {
             return Ok(());
         }
@@ -1720,18 +1744,17 @@ impl Images {
 
     /// Whether the store holds `value` under `key`: read into the task's frame (or mapped) and
     /// compared in the scope; an error naming the key when it holds other bytes.
-    fn held(&self, key: ContentId, value: &[u8]) -> Result<bool, String> {
+    fn held(&self, key: ContentId, value: &[u8]) -> Result<bool, Unkept> {
         use crate::serve::direct::{self, Which};
         blaze_mem::frame::current(|frame| {
             match direct::value(&self.stores, Which::Home, &Key(key), frame) {
                 Ok(Some(entry)) if entry[..] == *value => Ok(true),
                 Ok(Some(entry)) => {
                     let differ = hir_def::nameres::frozen::entries::differ(&entry[..], value);
-                    // alloc: error path
-                    Err(format!("the store holds other bytes under {key:?}: {differ}"))
+                    Err(Unkept::TwoValues { key, in_store: true, differ })
                 }
                 Ok(None) => Ok(false),
-                Err(failed) => Err(failed.to_string()),
+                Err(failed) => Err(Unkept::Store { key, why: failed.to_string() }),
             }
         })
     }
@@ -1768,7 +1791,8 @@ impl hir_def::nameres::frozen::entries::Entries for Images {
 
     fn put(&self, set: &ContentId, key: ContentId, bytes: &[u8]) -> Result<(), String> {
         // In its set, so a file's entries lie together on disk ([`Asked`]).
-        self.ask(&self.entries, *set, key, std::borrow::Cow::Borrowed(bytes))
+        // The trait's error is text: the refusal is written once, here.
+        self.ask(&self.entries, *set, key, std::borrow::Cow::Borrowed(bytes)).map_err(|why| why.to_string())
     }
 }
 
@@ -1988,7 +2012,8 @@ impl ImageStore for Images {
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
-        self.ask(&self.puts, NO_SET, key, std::borrow::Cow::Owned(value))
+        // As `Entries::put`: the trait's error is text.
+        self.ask(&self.puts, NO_SET, key, std::borrow::Cow::Owned(value)).map_err(|why| why.to_string())
     }
 
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {

@@ -386,7 +386,7 @@ fn check_unit(
     };
     let root = match stdlib::cfg::on_disk(named, run) {
         Ok(root) => root,
-        Err(why) => return refuse(out, why),
+        Err(why) => return refuse(out, why.to_string()),
     };
     let Some(root) = root.to_str() else {
         return refuse(out, format!("{}: not UTF-8", root.display()));

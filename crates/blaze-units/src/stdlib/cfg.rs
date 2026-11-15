@@ -79,12 +79,53 @@ pub struct StdCfg {
     pub env: Vec<(String, String)>,
 }
 
+/// Why [`on_disk`], [`std_cfg`] or [`std_graph`] refused: each names the unit, path or step it
+/// is about.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CfgError {
+    /// The std path `named` is not under the library's name `library`.
+    NotUnder { named: String, library: String },
+    /// Unit `at` is past the plan's `units` units.
+    PastUnits { at: usize, units: usize },
+    /// Unit or script run `at` has no plan.
+    NoPlan { at: usize },
+    /// Unit `name` is not std's: its build script runs, it is not ported.
+    NotStd { name: String },
+    /// The plan names package `package` and has no plan of it.
+    NoPackage { package: String },
+    /// The script sets variable `name` to `first` and to `second`.
+    SetTwice { name: String, first: String, second: String },
+    /// The script run lacks what its port needs (`what`: its compiled script, its OUT_DIR, ...).
+    Run { what: &'static str },
+    /// A step of the port or of std's graph refused (`step` names it): its own message.
+    Step { step: &'static str, why: String },
+}
+
+impl std::fmt::Display for CfgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CfgError::NotUnder { named, library } => write!(f, "{named} is not under {library}"),
+            CfgError::PastUnits { at, units } => write!(f, "unit {at} is past the plan's {units} units"),
+            CfgError::NoPlan { at } => write!(f, "unit {at} has no plan"),
+            CfgError::NotStd { name } => {
+                write!(f, "`{name}` is no unit of the standard library: its build script runs, it is not ported")
+            }
+            CfgError::NoPackage { package } => write!(f, "the plan names package {package} and has no plan of it"),
+            CfgError::SetTwice { name, first, second } => {
+                write!(f, "its script sets `{name}` to `{first}` and to `{second}`")
+            }
+            CfgError::Run { what } => write!(f, "the script run {what}"),
+            CfgError::Step { step, why } => write!(f, "{step}: {why}"),
+        }
+    }
+}
+
 /// The std path `named` (`<library>/<rest>`) where the library is on disk.
-pub fn on_disk(named: &str, run: &ScriptRun<'_>) -> Result<PathBuf, String> {
+pub fn on_disk(named: &str, run: &ScriptRun<'_>) -> Result<PathBuf, CfgError> {
     let rest = named
         .strip_prefix(run.library)
         .filter(|rest| rest.is_empty() || rest.starts_with('/'))
-        .ok_or_else(|| format!("{named} is not under {}", run.library))?;
+        .ok_or_else(|| CfgError::NotUnder { named: named.to_owned(), library: run.library.to_owned() })?;
     let mut path = run.dir.as_os_str().to_owned();
     path.push(rest);
     Ok(PathBuf::from(path))
@@ -103,36 +144,33 @@ pub fn std_cfg(
     at: usize,
     triple: &str,
     run: &ScriptRun<'_>,
-) -> Result<StdCfg, String> {
-    let unit = units.get(at).ok_or_else(|| format!("unit {at} is past the plan's {} units", units.len()))?;
-    let plan = plans.get(at).ok_or_else(|| format!("unit {at} has no plan"))?;
+) -> Result<StdCfg, CfgError> {
+    let unit = units.get(at).ok_or(CfgError::PastUnits { at, units: units.len() })?;
+    let plan = plans.get(at).ok_or(CfgError::NoPlan { at })?;
     if !unit.is_std {
-        return Err(format!("`{}` is no unit of the standard library: its build script runs, it is not ported", unit.target.name));
+        return Err(CfgError::NotStd { name: unit.target.name.clone() });
     }
-    let mut lines = unit_cfg(unit, plan, triple)?;
-    let mut env = Vec::new();
+    let lines = unit_cfg(unit, plan, triple).map_err(|why| CfgError::Step { step: "the unit's cfg", why })?;
+    let mut cfg = StdCfg { lines, env: Vec::new() };
     let script = unit.dependencies.iter().map(|it| it.index).find(|&dep| units.get(dep).is_some_and(|it| it.mode == Mode::RunCustomBuild));
     if let Some(script) = script {
         let package = packages
             .iter()
             .find(|it| it.id == unit.pkg_id)
-            .ok_or_else(|| format!("the plan names package {} and has no plan of it", unit.pkg_id))?;
-        let (cfgs, vars) = ported(units, plans, script, package, triple, run)?;
-        lines.extend(cfgs);
-        env = vars;
+            .ok_or_else(|| CfgError::NoPackage { package: unit.pkg_id.to_string() })?;
+        ported(units, plans, script, package, triple, run, &mut cfg)?;
     }
-    lines.sort();
-    lines.dedup();
-    env.sort();
-    if let Some(pair) = env.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(format!("its script sets `{}` to `{}` and to `{}`", pair[0].0, pair[0].1, pair[1].1));
+    cfg.lines.sort();
+    cfg.lines.dedup();
+    cfg.env.sort();
+    if let Some(pair) = cfg.env.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(CfgError::SetTwice { name: pair[0].0.clone(), first: pair[0].1.clone(), second: pair[1].1.clone() });
     }
-    Ok(StdCfg { lines, env })
+    Ok(cfg)
 }
 
-/// What std's script run `script` prints that its crate is given: its `rustc-cfg`s and
-/// `rustc-env`s.
-#[allow(clippy::type_complexity)]
+/// What std's script run `script` prints that its crate is given, added to `into`: its
+/// `rustc-cfg`s to the lines, its `rustc-env`s as the variables.
 fn ported(
     units: &[schema::Unit],
     plans: &[UnitPlan],
@@ -140,31 +178,40 @@ fn ported(
     package: &PackagePlan,
     triple: &str,
     run: &ScriptRun<'_>,
-) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+    into: &mut StdCfg,
+) -> Result<(), CfgError> {
     let run_unit = &units[script];
-    let run_plan = plans.get(script).ok_or_else(|| format!("script run {script} has no plan"))?;
+    let run_plan = plans.get(script).ok_or(CfgError::NoPlan { at: script })?;
     let compile = run_unit
         .dependencies
         .iter()
         .map(|it| it.index)
         .find(|at| units.get(*at).is_some_and(|it| it.target.is_custom_build() && it.mode != Mode::RunCustomBuild))
-        .ok_or_else(|| "the run has no compiled script among its dependencies".to_owned())?;
-    let script_root = units[compile].target.src_path.to_str().ok_or_else(|| "the script's file is not named in UTF-8".to_owned())?;
+        .ok_or(CfgError::Run { what: "has no compiled script among its dependencies" })?;
+    let script_root =
+        units[compile].target.src_path.to_str().ok_or(CfgError::Run { what: "names its script's file not in UTF-8" })?;
     let read = |path: &str| {
-        let disk = on_disk(path, run)?;
+        let disk = on_disk(path, run).map_err(|why| why.to_string())?;
         std::fs::read(&disk).map_err(|error| format!("{}: {error}", disk.display()))
     };
-    let which = scripts::identify(&package.name, script_root, read)?;
+    let which = scripts::identify(&package.name, script_root, read)
+        .map_err(|why| CfgError::Step { step: "identifying the script", why })?;
     let manifest_path = on_disk(&package.manifest_path, run)?;
-    let manifest_dir = manifest_path.parent().map(Path::to_path_buf).ok_or_else(|| format!("{} has no directory", manifest_path.display()))?;
-    let out_dir = run_plan.out_dir.clone().ok_or_else(|| "the run has no OUT_DIR".to_owned())?;
-    let program = plans.get(compile).and_then(|it| it.outputs.first()).ok_or_else(|| "the compiled script names no program".to_owned())?;
+    let manifest_dir =
+        manifest_path.parent().map(Path::to_path_buf).ok_or(CfgError::Run { what: "has a manifest path with no directory" })?;
+    let out_dir = run_plan.out_dir.clone().ok_or(CfgError::Run { what: "has no OUT_DIR" })?;
+    let program = plans
+        .get(compile)
+        .and_then(|it| it.outputs.first())
+        .ok_or(CfgError::Run { what: "has a compiled script that names no program" })?;
     let var = |name: &str| run_plan.env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
     let profile = &run_unit.profile;
     let debuginfo = !matches!(&profile.debuginfo, DebugInfo::Level(0))
         && !matches!(&profile.debuginfo, DebugInfo::Named(name) if name == "none" || name == "false");
-    let cfg_args = target::CfgArgs::from_flags(&run_plan.rustflags)?;
-    let target_cfgs = target::target_cfg(triple, &cfg_args)?;
+    let cfg_args = target::CfgArgs::from_flags(&run_plan.rustflags)
+        .map_err(|why| CfgError::Step { step: "the run's rustflags", why })?;
+    let target_cfgs =
+        target::target_cfg(triple, &cfg_args).map_err(|why| CfgError::Step { step: "the target's cfg", why })?;
     let tool = |name: &str| run.tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let described = blaze_build_script::Unit {
         package: blaze_build_script::unit::Package {
@@ -201,20 +248,30 @@ fn ported(
     inherited.extend(run_plan.env.iter().chain(run.inherited.iter()).map(|(name, value)| (OsString::from(name), OsString::from(value))));
     inherited.sort_by(|a, b| a.0.cmp(&b.0));
     inherited.dedup_by(|later, first| later.0 == first.0);
-    let vars = blaze_build_script::env(&described, &inherited).map_err(|error| error.0)?.vars;
-    let printed = scripts::printed(which, &vars, &described.package.manifest_dir)?;
+    let vars = blaze_build_script::env(&described, &inherited)
+        .map_err(|error| CfgError::Step { step: "the script's environment", why: error.0 })?
+        .vars;
+    let printed = scripts::printed(which, &vars, &described.package.manifest_dir)
+        .map_err(|why| CfgError::Step { step: "the ported script's output", why })?;
     let context = blaze_build_script::output::Context::of(&described, &inherited);
-    let output = blaze_build_script::parse(&printed, &context).map_err(|error| error.0)?;
-    Ok((output.cfgs, output.env))
+    let output = blaze_build_script::parse(&printed, &context)
+        .map_err(|error| CfgError::Step { step: "reading the script's output", why: error.0 })?;
+    into.lines.extend(output.cfgs);
+    into.env = output.env;
+    Ok(())
 }
 
 /// std's graph as the load resolves it ([`StdUnits`]), from the library's files `files` (every
 /// file of `library/` a load reads, by its path under it), under the key `key` makes of the
 /// library's mount ([`super::library_mount`] at [`super::library_at`] of the commit
 /// `library/UPSTREAM` names, checked by [`super::library_commit`]).
-pub fn std_graph(files: &[(&str, &[u8])], key: impl FnOnce(Mount) -> StdKey) -> Result<StdGraph, String> {
-    let upstream = files.iter().find(|(path, _)| *path == "UPSTREAM").ok_or_else(|| "the library has no UPSTREAM".to_owned())?;
-    let commit = super::library_commit(&String::from_utf8_lossy(upstream.1))?;
+pub fn std_graph(files: &[(&str, &[u8])], key: impl FnOnce(Mount) -> StdKey) -> Result<StdGraph, CfgError> {
+    let upstream = files
+        .iter()
+        .find(|(path, _)| *path == "UPSTREAM")
+        .ok_or_else(|| CfgError::Step { step: "the library", why: "it has no UPSTREAM".to_owned() })?;
+    let commit = super::library_commit(&String::from_utf8_lossy(upstream.1))
+        .map_err(|why| CfgError::Step { step: "the library's UPSTREAM", why })?;
     let tree = Arc::new(MemTree::default());
     let root = tree.root(files);
     let mut db = Database::new(blaze_query::Config { tree: Some(tree.clone()), dir: None, tags: 0 });
@@ -222,10 +279,14 @@ pub fn std_graph(files: &[(&str, &[u8])], key: impl FnOnce(Mount) -> StdKey) -> 
     // The std graph reads nothing of a view: an empty one is opened for the query to run in.
     let view = db.open(View { root: tree.root(&[]) });
     let key = key(super::library_mount(root, &commit));
-    let planned = db.pin().get::<StdUnits>(view, &key).map_err(|cancelled| format!("the std graph's query: {cancelled:?}"))?.get();
+    let planned = db
+        .pin()
+        .get::<StdUnits>(view, &key)
+        .map_err(|cancelled| CfgError::Step { step: "the std graph's query", why: format!("{cancelled:?}") })?
+        .get();
     match planned {
         StdPlanned::Ready(graph) => Ok(graph),
-        StdPlanned::Failed(error) => Err(format!("the standard library did not load: {}", error.what)),
+        StdPlanned::Failed(error) => Err(CfgError::Step { step: "the standard library did not load", why: error.what }),
     }
 }
 

@@ -9,7 +9,7 @@
 use std::{
     alloc::Global,
     cell::{Cell, RefCell},
-    fmt::Write as _,
+    fmt::{self, Write as _},
     num::NonZeroUsize,
     ptr,
     sync::Once,
@@ -191,7 +191,7 @@ pub(crate) struct Run {
     hash: u64,
     key: *const (),
     same_key: unsafe fn(*const (), *const ()) -> bool,
-    describe: unsafe fn(&'static Kind, *const (), &mut String),
+    describe: unsafe fn(&'static Kind, *const (), &mut dyn fmt::Write),
     /// Whether a run below was a cycle's head or member when this one was pushed.
     inside: bool,
     /// The outermost head of a cycle this run is a member of; null when none.
@@ -243,7 +243,7 @@ pub(crate) unsafe fn same_key<K: Eq>(a: *const (), b: *const ()) -> bool {
 pub(crate) unsafe fn describe<K: std::fmt::Debug>(
     kind: &'static Kind,
     key: *const (),
-    out: &mut String,
+    out: &mut dyn fmt::Write,
 ) {
     // SAFETY: the caller's.
     let key = unsafe { &*key.cast::<K>() };
@@ -254,7 +254,7 @@ pub(crate) unsafe fn describe<K: std::fmt::Debug>(
 /// [`crate::KEY_CAP`] bytes ([`crate::Bounded::key`]) and each id in it printed one level
 /// deep (`attach`'s `shallow`). Called only once a refusal is certain: a message is never
 /// built ahead of its check.
-pub(crate) fn write_key<K: std::fmt::Debug + ?Sized>(out: &mut String, kind: &'static Kind, key: &K) {
+pub(crate) fn write_key<K: std::fmt::Debug + ?Sized>(out: &mut dyn fmt::Write, kind: &'static Kind, key: &K) {
     let _ = write!(out, "{}({:?})", kind.name(), crate::Bounded::key(key));
 }
 
@@ -340,11 +340,9 @@ impl Run {
         ptr::eq(self.kind, &RECORDER)
     }
 
-    fn name(&self) -> String {
-        let mut out = String::new();
-        // SAFETY: `key` points at the key `describe` was made for, on this task's stack.
-        unsafe { (self.describe)(self.kind, self.key, &mut out) };
-        out
+    /// The run as a message names it, `kind(key)` ([`write_key`]), written when printed.
+    fn name(&self) -> RunName<'_> {
+        RunName(self)
     }
 
     fn matches(&self, kind: &'static Kind, hash: u64, key: *const ()) -> bool {
@@ -384,7 +382,7 @@ impl Run {
         let mut reads = std::mem::replace(&mut *self.reads.borrow_mut(), Vec::new_in(Global));
         reads.sort_unstable();
         reads.dedup();
-        crate::record::one_digest_each(&reads, &|out: &mut String| {
+        crate::record::one_digest_each(&reads, &|out: &mut dyn fmt::Write| {
             // SAFETY: `key` points at the key `describe` was made for, on this task's stack.
             unsafe { (self.describe)(self.kind, self.key, out) };
         });
@@ -459,24 +457,60 @@ fn set_innermost(run: *const Run) {
 /// The runs of this task from its root down to `run`, each by kind and key as a cycle's path
 /// names them ([`reenter`]), joined by " -> ": who asked the run a refusal is about. A
 /// recorder's frame runs nothing and is left out; "(the task's root)" where none is below.
-/// For a panic's message alone: it allocates on the global heap.
+/// For a panic's message alone: written when printed, its list of runs on the global heap.
 #[cold]
-fn asked_through(run: &Run) -> String {
-    let mut names: Vec<String, Global> = Vec::new_in(Global);
-    // SAFETY: an outer run is below on the same stack.
-    let mut at = unsafe { run.outer.as_ref() };
-    while let Some(outer) = at {
-        if !outer.is_recorder() {
-            names.push(outer.name());
+fn asked_through(run: &Run) -> AskedThrough<'_> {
+    AskedThrough(run)
+}
+
+/// [`Run::name`]: the run's `kind(key)`, written by its `describe` into the formatter.
+struct RunName<'a>(&'a Run);
+
+impl fmt::Display for RunName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let run = self.0;
+        // SAFETY: `key` points at the key `describe` was made for, on this task's stack.
+        unsafe { (run.describe)(run.kind, run.key, f) };
+        Ok(())
+    }
+}
+
+/// Runs named in order ([`Run::name`]), joined by " -> ": a cycle's path, or who asked a run.
+struct Path<'a>(&'a [&'a Run]);
+
+impl fmt::Display for Path<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (at, run) in self.0.iter().enumerate() {
+            if at > 0 {
+                f.write_str(" -> ")?;
+            }
+            write!(f, "{}", run.name())?;
         }
-        // SAFETY: as above.
-        at = unsafe { outer.outer.as_ref() };
+        Ok(())
     }
-    if names.is_empty() {
-        return "(the task's root)".to_owned();
+}
+
+/// [`asked_through`]'s text.
+struct AskedThrough<'a>(&'a Run);
+
+impl fmt::Display for AskedThrough<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut runs: Vec<&Run, Global> = Vec::new_in(Global);
+        // SAFETY: an outer run is below on the same stack.
+        let mut at = unsafe { self.0.outer.as_ref() };
+        while let Some(outer) = at {
+            if !outer.is_recorder() {
+                runs.push(outer);
+            }
+            // SAFETY: as above.
+            at = unsafe { outer.outer.as_ref() };
+        }
+        if runs.is_empty() {
+            return f.write_str("(the task's root)");
+        }
+        runs.reverse();
+        write!(f, "{}", Path(&runs))
     }
-    names.reverse();
-    names.join(" -> ")
 }
 
 fn innermost<'a>() -> Option<&'a Run> {
@@ -616,7 +650,7 @@ pub(crate) fn home_slot<'a>() -> &'a Slot {
 
 /// The innermost run's name, for messages.
 pub(crate) fn innermost_name() -> Option<String> {
-    innermost().map(Run::name)
+    innermost().map(|run| run.name().to_string())
 }
 
 /// The value an ask of `key` gets when this task is running `key` already: the cycle's
@@ -657,14 +691,11 @@ pub(crate) fn reenter(
     };
     let refuses = |run: &Run| run.kind.cycle() == crate::CycleKind::Panic;
     if refuses(found) || path.iter().any(|it| refuses(*it)) {
-        let mut names: Vec<String, Global> = Vec::new_in(Global);
-        names.push(found.name());
-        names.extend(path.iter().rev().map(|it| it.name()));
-        names.push(found.name());
-        panic!(
-            "cycle with no recovery (declare `cycle_result` or `cycle_initial`): {}",
-            names.join(" -> ")
-        );
+        let mut runs: Vec<&Run, Global> = Vec::new_in(Global);
+        runs.push(found);
+        runs.extend(path.iter().rev().copied());
+        runs.push(found);
+        panic!("cycle with no recovery (declare `cycle_result` or `cycle_initial`): {}", Path(&runs));
     }
     let head = match found.head_of.get() {
         it if it.is_null() => ptr::from_ref(found),

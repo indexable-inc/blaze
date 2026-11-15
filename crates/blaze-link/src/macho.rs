@@ -1782,7 +1782,7 @@ impl MachO {
         // The locals by their names' hash, never by address ([`crate::model::local_order`]):
         // an edited function keeps its entry and its name's place.
         let functions = placed.functions;
-        let order = crate::model::local_order(functions, |name| !exported.contains(&name));
+        let order = crate::model::local_order(functions, |name| !exported.contains(&name), std::alloc::Global);
         let mut locals: Vec<(u64, &str), std::alloc::Global> = Vec::with_capacity_in(order.len(), std::alloc::Global);
         let mut locals_of: Vec<u32, std::alloc::Global> =
             Vec::with_capacity_in(if keep { functions.len() } else { 0 }, std::alloc::Global);

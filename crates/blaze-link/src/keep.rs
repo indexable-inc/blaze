@@ -278,7 +278,7 @@ pub struct KeepError {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum KeepRefusal {
     /// `keep` of a state this layout does not hold yet: what it is.
-    Unkept(String),
+    Unkept(Unkept),
     /// The bytes are not as long as their header says, or too short to have one.
     Truncated { have: u64, header: Option<u64> },
     /// Of another layout tag: another blaze's, or not a kept link state.
@@ -327,6 +327,45 @@ impl fmt::Display for KeepError {
 }
 
 impl std::error::Error for KeepError {}
+
+/// What of an image a kept state does not hold yet ([`KeepRefusal::Unkept`]), found before
+/// anything is written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unkept {
+    /// A commit is in flight.
+    Pending,
+    /// A lazy image: its session is this process's.
+    Lazy,
+    /// The lazy placer gave counter pairs no commit took.
+    CounterPairs,
+    /// An image of a format whose state is not kept: only ELF's and Mach-O's are.
+    Format(Format),
+    /// A wasm import.
+    WasmImport,
+    /// A region the linker made whose name a kept state has none for.
+    Synthetic(&'static str),
+    /// A debug section whose name a kept state has none for.
+    Debug(&'static str),
+    /// A special, by index, at an address the writer places that no name defines.
+    UnnamedSpecial(usize),
+}
+
+impl fmt::Display for Unkept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unkept::Pending => write!(f, "a commit is in flight: keep the image before or after it"),
+            Unkept::Lazy => write!(f, "a lazy image: its session is this process's"),
+            Unkept::CounterPairs => write!(f, "the lazy placer gave counter pairs no commit took"),
+            Unkept::Format(format) => write!(f, "a {format:?} image: only ELF and Mach-O states are kept"),
+            Unkept::WasmImport => write!(f, "a wasm import: only ELF and Mach-O states are kept"),
+            Unkept::Synthetic(name) => write!(f, "the synthetic region `{name}`, which a kept state has no name for"),
+            Unkept::Debug(name) => write!(f, "the debug section `{name}`, which a kept state has no name for"),
+            Unkept::UnnamedSpecial(index) => {
+                write!(f, "special {index}, an address the writer places, is defined by no name")
+            }
+        }
+    }
+}
 
 /// Why a section did not decode.
 #[derive(Debug)]
@@ -1106,7 +1145,7 @@ impl Image {
     /// writes the same file as here. Made in `alloc`. Refused, naming the image, for a state
     /// the layout does not hold yet (a commit in flight, a lazy image, a PE or wasm image).
     pub fn keep<A: Allocator>(&self, alloc: A) -> Result<Vec<u8, A>, KeepError> {
-        let unkept = |what: String| KeepError {
+        let unkept = |what: Unkept| KeepError {
             image: self.to.as_str().to_owned(),
             why: KeepRefusal::Unkept(what),
         };
@@ -1175,23 +1214,23 @@ impl Image {
     }
 
     /// What `keep` refuses, before anything is written.
-    fn can_keep(&self) -> Result<(), String> {
+    fn can_keep(&self) -> Result<(), Unkept> {
         if self.pending.is_some() {
-            return Err("a commit is in flight: keep the image before or after it".to_owned());
+            return Err(Unkept::Pending);
         }
         if self.lazy.is_some() {
-            return Err("a lazy image: its session is this process's".to_owned());
+            return Err(Unkept::Lazy);
         }
         if !self.placed_pairs.is_empty() {
-            return Err("the lazy placer gave counter pairs no commit took".to_owned());
+            return Err(Unkept::CounterPairs);
         }
         if matches!(self.output.format, Format::Pe | Format::Wasm) {
-            return Err(format!("a {:?} image: only ELF and Mach-O states are kept", self.output.format));
+            return Err(Unkept::Format(self.output.format));
         }
         if !self.state.wasm_imports.is_empty()
             || self.state.resolved.imports.iter().any(|it| it.wasm.is_some())
         {
-            return Err("a wasm import: only ELF and Mach-O states are kept".to_owned());
+            return Err(Unkept::WasmImport);
         }
         Ok(())
     }

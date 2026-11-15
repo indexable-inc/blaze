@@ -53,6 +53,8 @@ mod mir_tests;
 #[cfg(test)]
 mod tests;
 
+use std::alloc::{Allocator, Global};
+
 use blaze_format::Aligned;
 use blaze_keyed::{
     driver::TaskFailed,
@@ -85,7 +87,7 @@ pub trait Check {
     /// Runs the body's `steps`: each step's answer into `payload`, every fact it reads asked
     /// through `asks`, whose answer is the one the check goes on with. A step that refused a
     /// read fails here, by the name of what it read.
-    fn check(&self, def: Self::Def, steps: Steps, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed>;
+    fn check<A: Allocator>(&self, def: Self::Def, steps: Steps, asks: &mut Asks<'_, A>, payload: &mut Writer) -> Result<(), TaskFailed>;
 
     /// The facts the body `def` makes, into `out`.
     fn exports(&self, def: Self::Def, out: &mut Exports) -> Result<(), TaskFailed>;
@@ -113,13 +115,13 @@ pub fn body_with<C: Check>(
     let owner = universe.own().ok_or(TaskFailed::Refused { what: NO_OWN_TABLE })?.owner;
     let def = check.def(item)?;
     let mut payload = Writer::new();
-    let mut asks = Asks::new(universe);
+    let mut asks = Asks::new(universe, Global);
     check.check(def, steps, &mut asks, &mut payload)?;
     let shape = asks.finish();
     let mut exports = Exports::new();
     check.exports(def, &mut exports)?;
-    let made = exports.finish(owner)?;
-    let payload = payload.finish();
+    let made = exports.finish(owner, Global)?;
+    let payload = payload.finish(Global);
     let (_, bytes) = record::write_read::<Body>(key, &shape, &made, &payload);
     Ok(Aligned::copy_from(&bytes))
 }

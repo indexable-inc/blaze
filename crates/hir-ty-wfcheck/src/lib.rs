@@ -65,7 +65,7 @@ pub use compare::{
 };
 pub use outlives::{Inferred, unrigid};
 use outlives::{Known, Needs, Wfcx};
-pub use persist::{WfDiagnosticRef, WfReadError, WfResultRef, WfRow};
+pub use persist::{WfDiagnosticRef, WfReadError, WfResultRef, WfRow, WfWriteError};
 pub use refine::{ImplTraitRefinement, RefinementKind, Undercapture, impl_trait_refinement};
 
 /// Where an error is: rustc's span of it.

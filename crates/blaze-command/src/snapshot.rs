@@ -92,6 +92,9 @@ use cfg::CfgOptions;
 use hir_def::{DefWithBodyId, Lookup as _, deps::ImageBuf, src::HasSource};
 use hir_ty::body_store::Installed;
 use intern::Symbol;
+// triomphe's `Arc` takes no allocator (`blaze::unwritten_allocator` judges none of it); named
+// apart from std's, which does.
+use triomphe::Arc as TArc;
 
 use crate::{
     CommandError,
@@ -310,7 +313,7 @@ pub fn refused(what: &'static str) -> TaskFailed {
 /// refuses a graph where it is not.
 pub fn crate_keys<A: Allocator + Clone>(
     graph: &Graph<A>,
-    workspace: &triomphe::Arc<CrateWorkspaceData>,
+    workspace: &TArc<CrateWorkspaceData>,
     cfgs: &[CfgOptions],
     alloc: A,
 ) -> Result<Vec<ContentId, A>, CommandError> {
@@ -337,7 +340,7 @@ pub fn crate_graph<A: Allocator + Clone>(
     graph: &Graph<A>,
     units: &[u32],
     mut root_of: impl FnMut(u32) -> FileId,
-    workspace: &triomphe::Arc<CrateWorkspaceData>,
+    workspace: &TArc<CrateWorkspaceData>,
     cfgs: &[CfgOptions],
     alloc: A,
 ) -> Result<(CrateGraphBuilder, Vec<(u32, base_db::CrateBuilderId), A>), (u32, &'static str)> {

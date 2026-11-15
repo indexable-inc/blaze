@@ -79,7 +79,7 @@ use blaze_items::ItemKey;
 use blaze_mem::Frame;
 use std::alloc::Global;
 
-pub use keep::{KeepError, KeepRefusal, LAYOUT, Verified, verify};
+pub use keep::{KeepError, KeepRefusal, LAYOUT, Unkept, Verified, verify};
 pub use layout::Heat;
 pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};

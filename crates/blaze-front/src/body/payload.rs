@@ -16,7 +16,7 @@
 
 #![blaze::sans_io]
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use blaze_ids::ContentId;
 
@@ -60,11 +60,11 @@ impl Writer {
         blaze::narrowed_len,
         reason = "a body's step answer and the count of a body's steps fit in u32; a larger one is refused by the item store's own u32 framing first"
     )]
-    pub fn finish(mut self) -> Vec<u8, Global> {
+    pub fn finish<A: Allocator>(mut self, alloc: A) -> Vec<u8, A> {
         self.sections.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         let len = HEADER
             + self.sections.iter().map(|(_, _, bytes)| SECTION + bytes.len().next_multiple_of(ALIGN)).sum::<usize>();
-        let mut out = Vec::with_capacity_in(len, Global);
+        let mut out = Vec::with_capacity_in(len, alloc);
         out.extend_from_slice(&FORMAT.to_le_bytes());
         out.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
         out.extend_from_slice(&[0; 8]);
@@ -132,7 +132,7 @@ pub fn find(bytes: &[u8], step: u8, schema: ContentId) -> Result<Option<core::op
 }
 
 /// Every section of `bytes`, checked once: the format, each length, the padding, the order.
-pub fn sections(bytes: &[u8]) -> Result<Vec<Section<'_>, Global>, PayloadError> {
+pub fn sections<A: Allocator>(bytes: &[u8], alloc: A) -> Result<Vec<Section<'_>, A>, PayloadError> {
     let word = |at: usize| -> Result<u32, PayloadError> {
         let slice = bytes.get(at..at + 4).ok_or(PayloadError::Short { at })?;
         Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
@@ -145,7 +145,7 @@ pub fn sections(bytes: &[u8]) -> Result<Vec<Section<'_>, Global>, PayloadError> 
     if word(8)? != 0 || word(12)? != 0 {
         return Err(PayloadError::Padding { at: 8 });
     }
-    let mut out: Vec<Section<'_>, Global> = Vec::with_capacity_in(count.min(bytes.len() / SECTION), Global);
+    let mut out: Vec<Section<'_>, A> = Vec::with_capacity_in(count.min(bytes.len() / SECTION), alloc);
     let mut at = HEADER;
     for _ in 0..count {
         let head = bytes.get(at..at + SECTION).ok_or(PayloadError::Short { at })?;

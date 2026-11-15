@@ -307,14 +307,14 @@ pub(super) fn find(
 
 /// Keeps the tokens of the definition `ast` of `file`, whose tree hashes to `hash`, as
 /// `written` wrote them, when every span was the definition's own.
-pub(super) fn keep(
+pub(super) fn keep<W: std::alloc::Allocator>(
     db: &Db,
     kept: &dyn Kept,
     file: EditionedFileId,
     ast: ErasedFileAstId,
     def_crate: Crate,
     hash: u128,
-    written: Writer,
+    written: Writer<W>,
 ) {
     if let Some(bytes) = written.finish() {
         let set = file_set(db, file);
@@ -370,7 +370,7 @@ impl Place {
                 demand_text(db, def_crate, file);
                 let text: &str = db.file_text(file.file_id(db)).text(db);
                 let squeeze = Squeeze::of(text.get(std::ops::Range::<usize>::from(range))?);
-                kept.put(db, def_crate, SQUEEZE, &set, key, &squeeze.encode());
+                kept.put(db, def_crate, SQUEEZE, &set, key, &squeeze.encode(Global));
                 squeeze
             }
         };
@@ -424,9 +424,8 @@ impl Squeeze {
 
     /// The squeeze as its [`SQUEEZE`] entry holds it: each token's three numbers, little
     /// endian, in order.
-    fn encode(&self) -> Vec<u8, Global> {
-        // alloc: one entry's bytes, while it is kept
-        let mut out = Vec::with_capacity_in(self.tokens.len() * 12, Global);
+    fn encode<A: std::alloc::Allocator>(&self, alloc: A) -> Vec<u8, A> {
+        let mut out = Vec::with_capacity_in(self.tokens.len() * 12, alloc);
         for token in &self.tokens {
             for it in token {
                 out.extend_from_slice(&it.to_le_bytes());
@@ -443,7 +442,6 @@ impl Squeeze {
             return Err(format!("a squeeze of {} bytes, not 12 a token", bytes.len()));
         }
         let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
-        // alloc: the place's tokens, as `Squeeze::of` holds them
         let mut tokens = Vec::with_capacity_in(bytes.len() / 12, Global);
         let mut past = [0u32; 2];
         for at in (0..bytes.len()).step_by(12) {
@@ -546,18 +544,18 @@ impl Def {
     }
 }
 
-/// Writes a definition's tokens entry as `decl_macro_expander` makes its trees.
-pub(super) struct Writer {
-    out: Vec<u8>,
+/// Writes a definition's tokens entry as `decl_macro_expander` makes its trees, its bytes in
+/// `W`, the caller's (the expander's task frame: the bytes live until they are kept).
+pub(super) struct Writer<W: std::alloc::Allocator> {
+    out: Vec<u8, W>,
     place: Place,
     /// Every span so far was the definition's own ([`Place`]).
     own: bool,
 }
 
-impl Writer {
-    pub(super) fn new(place: Place) -> Writer {
-        // alloc: an entry's bytes, once per definition whose tokens are not kept yet
-        let mut out = Vec::new();
+impl<W: std::alloc::Allocator> Writer<W> {
+    pub(super) fn new(place: Place, alloc: W) -> Writer<W> {
+        let mut out = Vec::new_in(alloc);
         out.extend_from_slice(&LAYOUT.to_le_bytes());
         // The transparency and the shape, said when they are known.
         out.extend_from_slice(&[0, 0]);
@@ -608,7 +606,7 @@ impl Writer {
     }
 
     /// The entry's bytes; `None` when a span was not the definition's own.
-    pub(super) fn finish(self) -> Option<Vec<u8>> {
+    pub(super) fn finish(self) -> Option<Vec<u8, W>> {
         self.own.then_some(self.out)
     }
 
@@ -930,7 +928,7 @@ mod tests {
     }
 
     fn written(place: &Place, tt: &tt::TopSubtree) -> Option<Vec<u8>> {
-        let mut w = Writer::new(place.clone());
+        let mut w = Writer::new(place.clone(), Global);
         w.transparency(Transparency::Opaque);
         w.macro2(Some(tt), tt);
         w.finish()
@@ -971,7 +969,7 @@ mod tests {
         let (own, wider) = (place(11), place(3));
         assert!(written(&own, &tree(&own, &own)).is_some());
         assert!(written(&own, &tree(&own, &wider)).is_none());
-        let mut w = Writer::new(own.clone());
+        let mut w = Writer::new(own.clone(), Global);
         w.rules(Some(&tree(&own, &own)));
         w.disown();
         assert!(w.finish().is_none());
@@ -989,7 +987,7 @@ mod tests {
                 kind: tt::DelimiterKind::Invisible,
             });
             b.push(tt::Leaf::Ident(tt::Ident::new("b", span(&place, start, len))));
-            let mut w = Writer::new(place.clone());
+            let mut w = Writer::new(place.clone(), Global);
             w.rules(Some(&b.build()));
             w.finish()
         };
@@ -1051,7 +1049,7 @@ mod tests {
     }
 
     fn rules_written(place: &Place, tt: &tt::TopSubtree) -> Vec<u8> {
-        let mut w = Writer::new(place.clone());
+        let mut w = Writer::new(place.clone(), Global);
         w.transparency(Transparency::SemiOpaque);
         w.rules(Some(tt));
         w.finish().expect("every span is the definition's own")

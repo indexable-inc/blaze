@@ -333,8 +333,8 @@ impl ProcMacros {
 impl ProcMacros {
     /// Incrementality query to prevent queries from directly depending on [`Self::get`].
     #[blaze_memo::tracked(returns(copy), mem_tag = Expand)]
-    pub fn get_for_crate<'db>(db: &'db Db, krate: Crate) -> Option<&'db Arc<CrateProcMacros>> {
-        krate.given::<ProcMacros, Arc<CrateProcMacros>>(db)
+    pub fn get_for_crate<'db>(db: &'db Db, krate: Crate) -> Option<&'db CrateProcMacros> {
+        krate.given::<ProcMacros, Arc<CrateProcMacros>>(db).map(|it| &**it)
     }
 }
 

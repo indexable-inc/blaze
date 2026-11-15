@@ -176,8 +176,9 @@ pub struct FrontSettings {
 }
 
 /// The front end a plan or code task describes and prepares with, over `snapshot`'s database:
-/// the fields one describe reads and no other. The database; blaze items' hashes, with `names`
-/// what the program calls a file; build time; whether the build links an image; and the
+/// the fields one describe reads and no other. The database; blaze items' hashes, naming no
+/// file (neither a plan's nor a code record's key holds a file's name, rule 25; hir-ty-codegen's
+/// plan module doc), so a describe that asks is a bug, refused by the name it asked for; build time; whether the build links an image; and the
 /// policy's units and stage (`with_policy`, which also sets the table of what the database read
 /// from describe records). Not set, as one describe reads none of them: kept walks (no build
 /// is kept between tasks, rule 70), the body checks (a body record is the check), the stop and
@@ -190,9 +191,8 @@ pub fn front_end<'db, S: Allocator>(
     snapshot: &'db Snapshot<S>,
     policy: &Policy,
     settings: FrontSettings,
-    names: impl Fn(FileId) -> Option<String> + Send + Sync + 'static,
 ) -> HirFrontend<'db> {
-    let names = ItemHashes::new(Box::new(names));
+    let names = ItemHashes::new(Box::new(|_: FileId| None));
     HirFrontend::new(
         Databases::new(&snapshot.db),
         HashSource::Items(names),
@@ -263,7 +263,7 @@ pub fn plan_static<S: Allocator, A: Allocator + Clone>(
 
 /// The read list of a plan whose describe read `reads`, asked by `home` and covering no body
 /// (this module's doc): each read classified, its fact asked of `universe`, sorted and each
-/// once, copied into `alloc`.
+/// once, kept in `alloc`.
 fn read_list<A: Allocator + Clone>(
     db: &base_db::Db,
     home: Option<base_db::Crate>,
@@ -271,7 +271,7 @@ fn read_list<A: Allocator + Clone>(
     universe: Universe<'_>,
     alloc: A,
 ) -> Result<Vec<Fact, A>, CodeError<A>> {
-    let mut asks = Asks::new(universe);
+    let mut asks = Asks::new(universe, alloc.clone());
     let mut rows = reads.iter().peekable();
     let home = match (home, rows.peek()) {
         (Some(home), _) => home,
@@ -289,10 +289,7 @@ fn read_list<A: Allocator + Clone>(
         let id = blaze_front::facts::id_of(&fact).map_err(|error| CodeError::Task(error.failed()))?;
         asks.ask(&id)?;
     }
-    let shape = asks.finish();
-    let mut facts = Vec::with_capacity_in(shape.len(), alloc);
-    facts.extend_from_slice(&shape);
-    Ok(facts)
+    Ok(asks.finish())
 }
 
 /// A code record: the dev template's store key and bytes, with the function's side table.
@@ -482,21 +479,22 @@ pub fn places<'r, A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Vec<Target, A>, CodeError<A>> {
     let mut out = Vec::with_capacity_in(edges.size_hint().0, alloc);
+    // A place's own name, as `Target` holds it: a `String`, so on the global heap until
+    // `Target` takes its names' allocator.
+    let owned = |name: &str| Box::<str, std::alloc::Global>::from(name).into_string();
     for edge in edges {
         out.push(match edge? {
             Edge::Function { name, .. } => {
                 let callee = plan_named(plans, &name)?;
                 match (callee.head.linkage(), callee.head.symbol) {
-                    // alloc: the place's own name, as `Target` holds it
-                    (blaze_codegen::Linkage::Weak, Some(symbol)) => Target::Extern(symbol.to_owned()),
+                    (blaze_codegen::Linkage::Weak, Some(symbol)) => Target::Extern(owned(symbol)),
                     _ => Target::Function(instance_key(policy, &callee.head)?),
                 }
             }
-            // alloc: the place's own name, as `Target` holds it
-            Edge::Static { weak: Some(symbol), .. } => Target::Extern(symbol.to_owned()),
+            Edge::Static { weak: Some(symbol), .. } => Target::Extern(owned(symbol)),
             Edge::Static { item, instance, weak: None, .. } => Target::Static { item, instance },
-            Edge::Extern(name) => Target::Extern(name.to_owned()), // alloc: as above
-            Edge::Weak(name) => Target::Weak(name.to_owned()),     // alloc: as above
+            Edge::Extern(name) => Target::Extern(owned(name)),
+            Edge::Weak(name) => Target::Weak(owned(name)),
         });
     }
     Ok(out)

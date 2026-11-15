@@ -4,7 +4,7 @@
 //! message in the buffer. A reader makes the table's items again in its own database, so no
 //! word of the record is an id of the session that wrote it.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::fmt;
 use std::mem::offset_of;
 
@@ -103,6 +103,26 @@ impl fmt::Display for WfReadError {
 
 impl std::error::Error for WfReadError {}
 
+/// Why a [`WfResult`] is not written ([`WfResult::to_bytes`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WfWriteError {
+    /// A definition a site names is not one the crate's portable table of items can write:
+    /// the table's own reason (`hir_def::deps::PortableIds::encode`).
+    Items(String),
+}
+
+impl fmt::Display for WfWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WfWriteError::Items(why) => {
+                write!(f, "a well-formedness result's table of items is not written: {why}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WfWriteError {}
+
 impl From<FormatError> for WfReadError {
     fn from(error: FormatError) -> WfReadError {
         WfReadError::Format(error)
@@ -168,14 +188,19 @@ impl WfResult {
     /// The result in blaze's format: every definition a site names is written as its index in a
     /// portable table of `krate`'s items, the table in the buffer. An error names a definition
     /// the table cannot write ([`PortableIds::encode`]).
-    pub fn to_bytes(&self, db: &Db, krate: Crate) -> Result<Vec<u8>, String> {
+    pub fn to_bytes<A: Allocator>(
+        &self,
+        db: &Db,
+        krate: Crate,
+        alloc: A,
+    ) -> Result<Vec<u8, A>, WfWriteError> {
         let mut ids = PortableIds::new();
         let mut sites = Vec::with_capacity_in(self.diagnostics.len(), Global);
         for diagnostic in &self.diagnostics {
             sites.push(encode_site(&mut ids, diagnostic.site));
         }
-        let table = ids.encode(db, krate)?;
-        let mut out = Writer::new(SCHEMA);
+        let table = ids.encode(db, krate).map_err(WfWriteError::Items)?;
+        let mut out = Writer::new_in(SCHEMA, alloc);
         let text: usize = self.diagnostics.iter().map(|it| it.message.len()).sum();
         out.bytes.reserve(
             text + table.len() + (self.diagnostics.len() + 1) * size_of::<WfRow>() + size_of::<WfRoot>(),
@@ -338,6 +363,7 @@ mod tests {
     };
     use hir_expand::fixture;
     use la_arena::{Idx, RawIdx};
+    use std::alloc::Global;
 
     use super::{PREVIOUS_SCHEMA, WfReadError, WfRow};
     use crate::{Site, WfDiagnostic, WfResult, outlives::tests::db::TestDB};
@@ -401,7 +427,7 @@ impl<'a, T> Tr for S<'a, T> {}
     fn a_result_written_by_one_database_comes_back_equal_in_another() {
         let (writer, writer_crate) = fixture_db();
         let bytes = blaze_memo::attach(&writer, || {
-            result(&writer, writer_crate).to_bytes(&writer, writer_crate).unwrap()
+            result(&writer, writer_crate).to_bytes(&writer, writer_crate, Global).unwrap()
         });
         let (reader, reader_crate) = fixture_db();
         blaze_memo::attach(&reader, || {
@@ -424,7 +450,7 @@ impl<'a, T> Tr for S<'a, T> {}
                     site,
                 }],
             };
-            let bytes = Aligned::copy_from(&result.to_bytes(&db, krate).unwrap());
+            let bytes = Aligned::copy_from(&result.to_bytes(&db, krate, Global).unwrap());
             let read = WfResult::read(&bytes).unwrap();
             let ids = read.ids(&db, krate).unwrap();
             let first = read.iter(&ids).next().unwrap().unwrap();
@@ -437,7 +463,7 @@ impl<'a, T> Tr for S<'a, T> {}
     fn an_empty_result_comes_back_empty() {
         let (db, krate) = fixture_db();
         blaze_memo::attach(&db, || {
-            let bytes = Aligned::copy_from(&WfResult::default().to_bytes(&db, krate).unwrap());
+            let bytes = Aligned::copy_from(&WfResult::default().to_bytes(&db, krate, Global).unwrap());
             let read = WfResult::read(&bytes).unwrap();
             assert!(read.is_empty());
             assert_eq!(read.to_result(&db, krate).unwrap(), WfResult::default());
@@ -450,8 +476,8 @@ impl<'a, T> Tr for S<'a, T> {}
         blaze_memo::attach(&db, || {
             let result = result(&db, krate);
             assert_eq!(
-                result.to_bytes(&db, krate).unwrap(),
-                result.clone().to_bytes(&db, krate).unwrap()
+                result.to_bytes(&db, krate, Global).unwrap(),
+                result.clone().to_bytes(&db, krate, Global).unwrap()
             );
         });
     }
@@ -470,7 +496,7 @@ impl<'a, T> Tr for S<'a, T> {}
                     WfDiagnostic { code: "E0310", message: "n".to_owned(), site: Site::SelfTy(impl_) },
                 ],
             };
-            let written = result.to_bytes(&db, krate).unwrap();
+            let written = result.to_bytes(&db, krate, Global).unwrap();
             let rows_at = {
                 let bytes = Aligned::copy_from(&written);
                 let read = WfResult::read(&bytes).unwrap();

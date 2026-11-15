@@ -688,7 +688,7 @@ fn plan_task(c: usize, i: usize, args: &[u8], mir: ContentId, also: Option<Conte
     let mut describe = mir.0.to_vec();
     describe.extend(also.iter().flat_map(|also| also.0));
     describe.push(parity);
-    let payload = record::write_plan_payload(&edges, &bytes, &describe);
+    let payload = record::write_plan_payload(&edges, &bytes, &describe, Global);
     let (address, record) = record::write_read::<PlanRecord>(plan_key(c, i, args), &reads, &[], &payload);
     Ok((address.id(), record))
 }

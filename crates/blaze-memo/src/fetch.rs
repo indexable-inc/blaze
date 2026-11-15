@@ -186,7 +186,7 @@ pub fn fetch<'db, Q: Query>(
         return execute::<Q>(memo, slot, hash, &key, run, recovery, image).0;
     }
     let flight = FlightKey::of(Q::KIND, slot.id, hash);
-    let named = |out: &mut String| {
+    let named = |out: &mut dyn std::fmt::Write| {
         // SAFETY: `key_ptr` points at `key`, a `Q::Key`.
         unsafe { task::describe::<Q::Key>(Q::KIND, key_ptr, out) }
     };
@@ -399,7 +399,7 @@ fn execute<'db, Q: Query>(
         }
         Settled::Final(value) => {
             let taken = taken.expect("a final value's reads are taken");
-            mark_borrows(memo, slot, key, &|out: &mut String| {
+            mark_borrows(memo, slot, key, &|out: &mut dyn std::fmt::Write| {
                 // SAFETY: `key` is a `Q::Key`.
                 unsafe { task::describe::<Q::Key>(Q::KIND, ptr::from_ref(key).cast(), out) }
             });
@@ -504,7 +504,7 @@ unsafe fn publish_member_placed<K: Copy + Eq + Home + Debug + 'static, V: 'stati
     let entry = unsafe { value.byte_sub(std::mem::offset_of!(Entry<K, V>, value)) }.cast::<Entry<K, V>>().cast_mut();
     // SAFETY: the caller's: `key` is a `K`.
     let key = unsafe { *key.cast::<K>() };
-    mark_borrows(memo, slot, &key, &|out: &mut String| task::write_key(out, kind, &key));
+    mark_borrows(memo, slot, &key, &|out: &mut dyn std::fmt::Write| task::write_key(out, kind, &key));
     let boundary = boundary_local(memo, slot, kind);
     if let Some((_, at)) = boundary {
         // SAFETY: the caller's: the entry is unpublished and nothing refers to its head; the
@@ -548,7 +548,7 @@ unsafe fn publish_member<K: Copy + Eq + Home + Debug + 'static, V: 'static>(
     let (key, value) = unsafe { (*key.cast::<K>(), ptr::read(value.cast::<V>())) };
     // A bitwise copy of a value that owns nothing to drop: the original in the arena is never
     // dropped, and both are immutable.
-    mark_borrows(memo, slot, &key, &|out: &mut String| task::write_key(out, kind, &key));
+    mark_borrows(memo, slot, &key, &|out: &mut dyn std::fmt::Write| task::write_key(out, kind, &key));
     let boundary = boundary_local(memo, slot, kind);
     let entry = with_local(slot, |local| -> *const Entry<K, V> {
         local.alloc(Entry {

@@ -27,7 +27,7 @@ use cfg::CfgOptions;
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use span::Edition;
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use triomphe::Arc;
 
 use crate::{
@@ -1372,7 +1372,7 @@ impl Crate {
     ///
     /// **Warning**: do not use this in `hir-*` crates! It kills incrementality across crate
     /// metadata modifications.
-    pub fn transitive_rev_deps(self, db: &Db, out: &mut Vec<Crate, Global>) {
+    pub fn transitive_rev_deps<A: Allocator>(self, db: &Db, out: &mut Vec<Crate, A>) {
         transitive_rev_deps(db, self, out);
     }
 
@@ -1454,7 +1454,7 @@ fn transitive_loaded_deps<'db>(db: &'db Db, krate: Crate) -> &'db [Crate] {
 
 /// [`Crate::transitive_rev_deps`]: a plain walk, outside any query run, its scratch in a frame
 /// and its answer written into the caller's `out`.
-fn transitive_rev_deps(db: &Db, krate: Crate, out: &mut Vec<Crate, Global>) {
+fn transitive_rev_deps<A: Allocator>(db: &Db, krate: Crate, out: &mut Vec<Crate, A>) {
     blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let all = all_crates(db);
         // The reverse edges as CSR: for each crate (by its place in `all`), the crates that

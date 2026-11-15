@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::cow::{Chunked, CowVec};
-use crate::keep::{Bad, In, Kept, Out, Section, kept_enum, kept_struct, static_name};
+use crate::keep::{Bad, In, Kept, Out, Section, Unkept, kept_enum, kept_struct, static_name};
 use crate::model::{Class, Formats, Special, Sym, Writer};
 use crate::native::Resolved;
 use crate::position::Spans;
@@ -151,11 +151,9 @@ fn put_input<A: Allocator>(input: &Input, out: &mut Out<A>) {
 }
 
 /// Whether every name the linker made that `class` holds is one a kept state can name.
-fn known(class: &Class) -> Result<(), String> {
+fn known(class: &Class) -> Result<(), Unkept> {
     match class {
-        Class::Synthetic(name) if static_name(name).is_none() => {
-            Err(format!("the synthetic region `{name}`, which a kept state has no name for"))
-        }
+        Class::Synthetic(name) if static_name(name).is_none() => Err(Unkept::Synthetic(*name)),
         _ => Ok(()),
     }
 }
@@ -167,7 +165,7 @@ fn put_specials<A: Allocator>(
     defs: &[CowVec<Def>; SHARDS],
     symbols: &Symbols,
     out: &mut Out<A>,
-) -> Result<(), String> {
+) -> Result<(), Unkept> {
     let mut named: Vec<Option<Sym>> = Vec::with_capacity_in(specials.len(), Global);
     named.resize(specials.len(), None);
     for (shard, column) in defs.iter().enumerate() {
@@ -204,9 +202,8 @@ fn put_specials<A: Allocator>(
                 end.put(out);
             }
             Special::Placed(_) => {
-                let name = named[index].and_then(|sym| symbols.name_of(sym)).ok_or_else(|| {
-                    format!("special {index}, an address the writer places, is defined by no name")
-                })?;
+                let name =
+                    named[index].and_then(|sym| symbols.name_of(sym)).ok_or(Unkept::UnnamedSpecial(index))?;
                 out.u8(5);
                 out.text(name);
             }
@@ -224,9 +221,13 @@ fn put_specials<A: Allocator>(
     Ok(())
 }
 
-fn take_specials(input: &mut In<'_>, writer: &Formats) -> Result<Arc<Vec<Special>>, Bad> {
+fn take_specials<A: Allocator + Clone>(
+    input: &mut In<'_>,
+    writer: &Formats,
+    alloc: A,
+) -> Result<Arc<Vec<Special, A>, A>, Bad> {
     let count = input.count(1)?;
-    let mut specials = Vec::with_capacity_in(count, Global);
+    let mut specials = Vec::with_capacity_in(count, alloc.clone());
     for _ in 0..count {
         specials.push(match input.u8()? {
             0 => Special::ImageBase,
@@ -244,7 +245,7 @@ fn take_specials(input: &mut In<'_>, writer: &Formats) -> Result<Arc<Vec<Special
             _ => return Err(Bad::What("a tag that is no Special")),
         });
     }
-    Ok(Arc::new(specials))
+    Ok(Arc::new_in(specials, alloc))
 }
 
 impl State {
@@ -255,7 +256,7 @@ impl State {
         section: Section,
         symbols: &Symbols,
         out: &mut Out<A>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Unkept> {
         let State {
             generation,
             specials,
@@ -316,7 +317,7 @@ impl State {
             }
             Section::State => {
                 if !wasm_imports.is_empty() {
-                    return Err("a wasm import: only ELF and Mach-O states are kept".to_owned());
+                    return Err(Unkept::WasmImport);
                 }
                 generation.put(out);
                 slots.put(out);
@@ -483,7 +484,7 @@ impl State {
                 *laid_out = Kept::take(input)?;
                 *islands = Kept::take(input)?;
             }
-            Section::Specials => *specials = take_specials(input, opening.writer)?,
+            Section::Specials => *specials = take_specials(input, opening.writer, Global)?,
             Section::Spaces => *spaces = Kept::take(input)?,
             Section::Names => {
                 let count = input.count(4)?;
@@ -504,7 +505,12 @@ impl State {
                 }
                 *inputs = Arc::new(kept);
             }
-            Section::Resolved => *resolved = Arc::new(Resolved::open(input, inputs, names)?),
+            Section::Resolved => {
+                let mut opened = Resolved::open(input)?;
+                opened.inputs = Arc::clone(inputs);
+                opened.names = Arc::clone(names);
+                *resolved = Arc::new(opened);
+            }
             Section::SlotSyms => *slot_syms = Kept::take(input)?,
             Section::Pairs => *pairs = Kept::take(input)?,
             Section::Parts => *parts = Kept::take(input)?,

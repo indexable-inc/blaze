@@ -40,7 +40,11 @@
 //! the table is copied (O(files + crates), a vector copy), which a resident helper pays only
 //! when a reader outlives a commit.
 
-use std::{alloc::Global, any::TypeId, io::Write as _};
+use std::{
+    alloc::{Allocator, Global},
+    any::TypeId,
+    io::Write as _,
+};
 
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
@@ -224,7 +228,7 @@ pub(crate) struct Maker {
 /// anything moved, with the maker it replaced (`None`: it had none of that fact id), for undo.
 /// One of an equal fact moves nothing and is dropped: the giver promises that two makers under
 /// one fact make inputs no reader tells apart.
-pub(crate) fn put_maker(makers: &mut Vec<Maker, Global>, maker: Maker) -> Option<Option<Maker>> {
+pub(crate) fn put_maker<A: Allocator>(makers: &mut Vec<Maker, A>, maker: Maker) -> Option<Option<Maker>> {
     match makers.binary_search_by(|it| it.fact.id.cmp(&maker.fact.id)) {
         Ok(at) if makers[at].fact == maker.fact => None,
         Ok(at) => Some(Some(std::mem::replace(&mut makers[at], maker))),
@@ -236,7 +240,7 @@ pub(crate) fn put_maker(makers: &mut Vec<Maker, Global>, maker: Maker) -> Option
 }
 
 /// Puts back what [`put_maker`] replaced under the fact id `id`: `was`, or no maker.
-fn unput_maker(makers: &mut Vec<Maker, Global>, id: ContentId, was: Option<Maker>) {
+fn unput_maker<A: Allocator>(makers: &mut Vec<Maker, A>, id: ContentId, was: Option<Maker>) {
     let at = makers.binary_search_by(|it| it.fact.id.cmp(&id));
     match (at, was) {
         (Ok(at), Some(was)) => makers[at] = was,
@@ -1445,7 +1449,7 @@ fn by_prefix(item_keys: &[(CrateKey, ContentId)]) -> (std::sync::Arc<[(u64, Crat
     (std::sync::Arc::from(&sorted[..]), clash)
 }
 
-fn put<T>(rows: &mut Vec<Option<T>, Global>, at: usize, value: Option<T>) {
+fn put<T, A: Allocator>(rows: &mut Vec<Option<T>, A>, at: usize, value: Option<T>) {
     if rows.len() <= at {
         if value.is_none() {
             return;

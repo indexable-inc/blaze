@@ -169,7 +169,7 @@ impl Check for Model<'_, '_> {
         }
     }
 
-    fn check(&self, def: StableId, _steps: Steps, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed> {
+    fn check<A: std::alloc::Allocator>(&self, def: StableId, _steps: Steps, asks: &mut Asks<'_, A>, payload: &mut Writer) -> Result<(), TaskFailed> {
         let body = &self.world.bodies[&def];
         let mut reads = Vec::new_in(Global);
         reads.extend_from_slice(&body.reads);
@@ -476,16 +476,16 @@ fn a_callee_body_edit_moves_only_its_askers() {
 fn made_facts_are_its_units_each_once() {
     let mut other = Exports::new();
     other.export(&subject(DEP, 1), Export::Effects, digest(b"a"));
-    assert_eq!(other.finish(OWN).err(), Some(TaskFailed::Refused { what: NOT_OURS }));
+    assert_eq!(other.finish(OWN, Global).err(), Some(TaskFailed::Refused { what: NOT_OURS }));
     let mut twice = Exports::new();
     twice.export(&subject(OWN, 1), Export::Effects, digest(b"a"));
     twice.export(&subject(OWN, 1), Export::Effects, digest(b"b"));
-    assert_eq!(twice.finish(OWN).err(), Some(TaskFailed::Refused { what: TWO_EXPORTS }));
+    assert_eq!(twice.finish(OWN, Global).err(), Some(TaskFailed::Refused { what: TWO_EXPORTS }));
     // Control: one digest, the unit's own owner.
     let mut once = Exports::new();
     once.export(&subject(OWN, 1), Export::Effects, digest(b"a"));
     once.export(&subject(OWN, 1), Export::Effects, digest(b"a"));
-    assert_eq!(once.finish(OWN).map(|it| it.len()), Ok(1));
+    assert_eq!(once.finish(OWN, Global).map(|it| it.len()), Ok(1));
 }
 
 /// The invariant: a payload reads back as the sections written, sorted by (step, schema),
@@ -495,10 +495,10 @@ fn a_payload_round_trips() {
     let mut writer = Writer::new();
     writer.push(2, digest(b"b"), b"borrowck");
     writer.push(0, digest(b"a"), b"inference!");
-    let bytes = writer.finish();
-    let read = payload::sections(&bytes).expect("a payload");
+    let bytes = writer.finish(Global);
+    let read = payload::sections(&bytes, Global).expect("a payload");
     assert_eq!(read.len(), 2);
     assert_eq!((read[0].step, read[0].bytes), (0, &b"inference!"[..]));
     assert_eq!((read[1].step, read[1].bytes), (2, &b"borrowck"[..]));
-    assert!(payload::sections(&bytes[..bytes.len() - 8]).is_err());
+    assert!(payload::sections(&bytes[..bytes.len() - 8], Global).is_err());
 }

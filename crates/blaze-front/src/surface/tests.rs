@@ -143,7 +143,10 @@ fn rows_with(db: &Db, krate: Crate, omit: Option<QueryKind>, text_ids: &Derived<
     let mut rows = Vec::new_in(Global);
     let mut unvalued = None;
     if let Err(failed) = exports::collect(db, krate, omit, text_ids, &mut rows, &mut unvalued) {
-        let said = unvalued.map(|fact| facts::unhashed_line(db, krate, &fact)).unwrap_or_default();
+        let mut said = String::new();
+        if let Some(fact) = unvalued {
+            facts::unhashed_line(db, krate, &fact, &mut said);
+        }
         panic!("the surface's rows: {failed:?} {said}");
     }
     finish_rows(rows, &key::crate_key(db, krate)).expect("each id one digest").0

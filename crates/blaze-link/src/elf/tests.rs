@@ -1413,7 +1413,7 @@ fn many_functions_are_named_in_the_symbol_table() {
     let sections = file.elf_section_table();
     let symtab = sections.symbols(endian, data, elf::SHT_SYMTAB).unwrap();
     let named: Vec<&Function> =
-        crate::model::local_order(&image.functions, |_| true).iter().map(|at| &image.functions[*at as usize]).collect();
+        crate::model::local_order(&image.functions, |_| true, std::alloc::Global).iter().map(|at| &image.functions[*at as usize]).collect();
     assert_eq!(named.len(), image.functions.iter().filter(|it| it.name.is_some()).count());
     let symbols = symtab.symbols();
     assert_eq!(symbols.len(), 1 + named.len() + 2);

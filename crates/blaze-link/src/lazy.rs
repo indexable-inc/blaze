@@ -459,7 +459,6 @@ impl Scratch {
         let tables = || std::iter::once(&function.relocs).chain(function.data.iter().map(|it| &it.relocs));
         for data in &function.data {
             if crate::stage::is_recipe(data, tables()) {
-                // alloc: reused across placements, as below
                 self.data_at.push(NOT_PLACED);
                 continue;
             }
@@ -649,25 +648,20 @@ impl Scratch {
                     return Ok(Resolved::Sym(sym));
                 }
                 let Some(recipe) = function.data.iter().find(|it| it.id == *id) else {
-                    // alloc: error path
                     return Err(fail(format!("refers to the text of recipe {id:?}, which is not among its data")));
                 };
                 let file_of = |span: SpanRef| -> Result<&str, String> {
                     let table = symbols.find_id(&span.anchor).and_then(|it| state.span_table(it)).ok_or_else(|| {
-                        // alloc: error path
                         format!("a position in {:?}, whose span table the image was not given", span.anchor)
                     })?;
                     let at = table.span(span.index).ok_or_else(|| {
-                        // alloc: error path
                         format!("span {} of {:?}, whose table has {}", span.index, span.anchor, table.len())
                     })?;
                     Ok(table.file(at.file))
                 };
                 let from = self.text.len();
-                // alloc: reused across placements; grows only for a function with longer texts
                 text::compose(&recipe.bytes, recipe.relocs.view(), file_of, &mut self.text).map_err(|it| match it {
                     text::TextError::NoFile(why) => fail(why),
-                    // alloc: error path
                     other => fail(format!("its text recipe {id:?} does not compose: {other:?}")),
                 })?;
                 let len = self.text.len() - from;
@@ -688,7 +682,6 @@ impl Scratch {
                         Name::Own(at)
                     }
                 };
-                // alloc: reused across placements; grows only for a function with more texts
                 self.strs.push(Str { at: record, from, len, name });
                 Resolved::Own(record)
             }

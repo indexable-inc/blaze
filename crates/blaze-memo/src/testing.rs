@@ -9,7 +9,12 @@
 //! and a run starts with none. A row is rendered as text only when it is read
 //! ([`Ran::key`], `Debug`), by the reader, inside `attach`.
 
-use std::{alloc::Global, any::Any, fmt, ptr, sync::Arc};
+use std::{
+    alloc::{Allocator, Global},
+    any::Any,
+    fmt, ptr,
+    sync::Arc,
+};
 
 use blaze_core::lock::Lock;
 
@@ -25,13 +30,13 @@ pub struct Ran {
     arena: ArenaId,
     key: Arc<dyn Any + Send + Sync, Global>,
     /// Writes `key` as `name(key)` ([`crate::task::write_key`]); `key` is the query's key type.
-    render: fn(&'static Kind, &dyn Any, &mut String),
+    render: fn(&'static Kind, &dyn Any, &mut dyn fmt::Write),
     /// Whether two keys of this query's key type are equal.
     same: fn(&dyn Any, &dyn Any) -> bool,
 }
 
 /// [`Ran::render`] for a query whose key type is `K`.
-fn render_key<K: fmt::Debug + 'static>(kind: &'static Kind, key: &dyn Any, out: &mut String) {
+fn render_key<K: fmt::Debug + 'static>(kind: &'static Kind, key: &dyn Any, out: &mut dyn fmt::Write) {
     let key = key.downcast_ref::<K>().expect("a run's key is its query's key type");
     crate::task::write_key(out, kind, key);
 }
@@ -163,15 +168,16 @@ impl RunLog {
 /// The flat read list of the boundary entry a [`crate::Read::Query`] row names (`row` from a
 /// [`crate::record`] in `memo`): what a test compares a boundary's own reads against, which
 /// its askers' lists keep behind the row. `None` for an input row, or a row naming no entry
-/// of its kind in `memo`. Makes and keeps the entry's flat list, as any ask of it does.
-pub fn flat_reads_behind(memo: &crate::Memo, row: crate::Read) -> Option<Vec<crate::Read, Global>> {
+/// of its kind in `memo`. Makes and keeps the entry's flat list, as any ask of it does. The
+/// copy is in `alloc`.
+pub fn flat_reads_behind<A: Allocator>(memo: &crate::Memo, row: crate::Read, alloc: A) -> Option<Vec<crate::Read, A>> {
     let crate::Read::Query { kind, key } = row else { return None };
     let slot = if key.is_spill() { Some(memo.spill()) } else { memo.try_slot(key.arena()) }?;
     let head = slot.local(key.local())?;
     if !ptr::eq(head.kind, kind.kind()) {
         return None;
     }
-    let mut out = Vec::new_in(Global);
+    let mut out = Vec::new_in(alloc);
     out.extend_from_slice(crate::record::flat_of(memo, head));
     Some(out)
 }

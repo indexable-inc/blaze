@@ -23,7 +23,7 @@
 
 #![blaze::sans_io]
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use blaze_ids::ContentId;
 use blaze_items::kinds as items;
@@ -103,9 +103,9 @@ impl Exports {
 
     /// The facts as the record keeps them: sorted by id, each once, each routed to the made
     /// table of `owner`, the unit whose body makes them.
-    pub fn finish(mut self, owner: Owner) -> Result<Vec<Fact, Global>, TaskFailed> {
+    pub fn finish<A: Allocator>(mut self, owner: Owner, alloc: A) -> Result<Vec<Fact, A>, TaskFailed> {
         self.facts.sort_unstable();
-        let mut out: Vec<Fact, Global> = Vec::with_capacity_in(self.facts.len(), Global);
+        let mut out: Vec<Fact, A> = Vec::with_capacity_in(self.facts.len(), alloc);
         for fact in self.facts {
             if record::route(&fact.id) != Ok(Route::Made(owner)) {
                 return Err(TaskFailed::Refused { what: NOT_OURS });

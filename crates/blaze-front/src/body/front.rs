@@ -81,6 +81,8 @@
 
 #![blaze::sans_io]
 
+use std::alloc::{Allocator, Global};
+
 use base_db::Db;
 use blaze_ids::ContentId;
 use blaze_item_hash::values;
@@ -155,12 +157,12 @@ impl Front<'_> {
     /// Takes the trace of `step` of `def` under `schema`: its answer as a section, each of its
     /// facts classified and asked. `run` is the step's own query, asked again only where a
     /// read of it was refused ([`Front::tell_readers`]).
-    fn take(
+    fn take<A: Allocator>(
         &self,
         def: DefWithBodyId,
         step: Step,
         schema: blaze_format::SchemaHash,
-        asks: &mut Asks<'_>,
+        asks: &mut Asks<'_, A>,
         payload: &mut Writer,
         run: impl FnOnce(),
     ) -> Result<(), TaskFailed> {
@@ -250,18 +252,21 @@ impl Front<'_> {
         let db = self.db;
         let item = ItemId::of_body(db, def);
         let Ok(((), readers)) = blaze_memo::record_readers(blaze_memo::Database::memo(db), run) else {
-            // alloc: one line of error text, once per refused task
-            (self.told)(&format!(
-                "{:?} `{}`: its {step:?} step read a row no fact stands for; its readers were not recorded (the snapshot keeps no read lists)",
-                item.kind(),
-                key::path(db, item),
-            ));
+            let mut line = blaze_mem::String::new_in(Global);
+            blaze_mem::text::format_into(
+                &mut line,
+                format_args!(
+                    "{:?} `{}`: its {step:?} step read a row no fact stands for; its readers were not recorded (the snapshot keeps no read lists)",
+                    item.kind(),
+                    key::path(db, item),
+                ),
+            );
+            (self.told)(line.as_str());
             return;
         };
         for (read, reader) in readers.rows.iter() {
             let Classified::Refused(rule) = blaze_item_hash::reads::fact_of(db, def, step, *read) else { continue };
-            // alloc: one line of error text per refused row, once per refused task
-            let mut line = String::new();
+            let mut line = blaze_mem::String::new_in(Global);
             _ = write!(
                 line,
                 "{:?} `{}`: its {step:?} step read `{}` ({rule}), read by {reader}",
@@ -276,7 +281,7 @@ impl Front<'_> {
                 _ = write!(line, " <- {}", kind.name());
             }
             line.push_str(" <- (the step)");
-            (self.told)(&line);
+            (self.told)(line.as_str());
         }
     }
 
@@ -300,7 +305,7 @@ impl Check for Front<'_> {
         (self.find)(item).ok_or(TaskFailed::Refused { what: NO_BODY })
     }
 
-    fn check(&self, def: DefWithBodyId, steps: Steps, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed> {
+    fn check<A: Allocator>(&self, def: DefWithBodyId, steps: Steps, asks: &mut Asks<'_, A>, payload: &mut Writer) -> Result<(), TaskFailed> {
         let db = self.db;
         let schema = entries::run_infer(db, def);
         self.take(def, Step::Infer, schema, asks, payload, || entries::rerun_unstored(db, def, Step::Infer, entries::Place::BODY))?;

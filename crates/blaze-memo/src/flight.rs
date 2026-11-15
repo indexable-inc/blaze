@@ -11,7 +11,7 @@
 //! `Mine`: [`Scheduled`] waits for the holder (or gives way where waiting would close a cycle
 //! of tasks), and [`Alone`], which cannot wait, refuses it with a panic naming the key.
 
-use std::alloc::Global;
+use std::{alloc::Global, fmt};
 
 use blaze_core::lock::Lock;
 use blaze_graph::{
@@ -97,7 +97,7 @@ pub trait Flight: Send + Sync + 'static {
     fn single<'f>(
         &'f self,
         key: FlightKey,
-        named: &dyn Fn(&mut String),
+        named: &dyn Fn(&mut dyn fmt::Write),
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f>;
 }
@@ -125,7 +125,7 @@ impl Flight for Scheduled {
     fn single<'f>(
         &'f self,
         key: FlightKey,
-        named: &dyn Fn(&mut String),
+        named: &dyn Fn(&mut dyn fmt::Write),
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f> {
         let key = Key(key.0);
@@ -176,7 +176,7 @@ impl Alone {
 /// The ask of a key `holder` holds by another task, `asker`, on [`Alone`]: refused, by name.
 #[cold]
 #[inline(never)]
-fn another_holder(named: &dyn Fn(&mut String), asker: JobId, holder: JobId) -> ! {
+fn another_holder(named: &dyn Fn(&mut dyn fmt::Write), asker: JobId, holder: JobId) -> ! {
     let mut what = String::new();
     named(&mut what);
     panic!(
@@ -197,7 +197,7 @@ impl Flight for Alone {
     fn single<'f>(
         &'f self,
         key: FlightKey,
-        named: &dyn Fn(&mut String),
+        named: &dyn Fn(&mut dyn fmt::Write),
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f> {
         let me = sched::job_here();
@@ -238,8 +238,8 @@ mod tests {
 
     use super::{Alone, Flight, FlightKey, Flown, Hold};
 
-    fn named(out: &mut String) {
-        out.push_str("the_query(the key)");
+    fn named(out: &mut dyn std::fmt::Write) {
+        out.write_str("the_query(the key)").expect("a name is written");
     }
 
     /// The invariant: on [`Alone`] a key's holder asking it again is `Mine`, and another task

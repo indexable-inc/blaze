@@ -1416,7 +1416,6 @@ impl<'a> Stage<'a> {
             let at = reloc.at as usize;
             let span = match (reloc.kind, reloc.addend, reloc.target) {
                 (RelocKind::Abs64, 0, Target::Position(span)) => span,
-                // alloc: error path
                 _ => {
                     return Err(error(
                         function,
@@ -1425,7 +1424,6 @@ impl<'a> Stage<'a> {
                 }
             };
             if at < from || at.checked_add(text::HOLE).is_none_or(|end| end > data.bytes.len()) {
-                // alloc: error path
                 return Err(error(
                     function,
                     format!("its text recipe {:?} has a hole at {at} out of order or past its end", data.id),
@@ -1459,18 +1457,15 @@ impl<'a> Stage<'a> {
             let table = symbols
                 .find_id(&span.anchor)
                 .and_then(|it| state.span_table(it))
-                // alloc: error path
                 .ok_or_else(|| format!("a position in {:?}, whose span table the link was not given", span.anchor))?;
             let at = table
                 .span(span.index)
-                // alloc: error path
                 .ok_or_else(|| format!("span {} of {:?}, whose table has {}", span.index, span.anchor, table.len()))?;
             Ok(table.file(at.file))
         };
         let mut out = Vec::with_capacity_in(recipe.bytes.len() + 64, self.arena);
         text::compose(&recipe.bytes, relocs.view(), file_of, &mut out).map_err(|it| match it {
             text::TextError::NoFile(why) => error(None, why),
-            // alloc: error path
             other => error(None, format!("a text recipe that does not compose: {other:?}")),
         })?;
         let out = out.leak();
@@ -1539,7 +1534,6 @@ impl<'a> Stage<'a> {
             }
             let Some(kept) = self.new.texts.get(&recipe) else {
                 let id = self.symbols.content(recipe);
-                // alloc: error path
                 return Err(error(None, format!("a text of recipe {id:?}, which no function or static gave")));
             };
             let text = self.compose(kept)?;

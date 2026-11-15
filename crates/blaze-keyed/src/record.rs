@@ -29,7 +29,7 @@
 // unsafe.
 #![allow(unsafe_code)]
 
-use core::{fmt, mem::offset_of};
+use core::{alloc::Allocator, fmt, mem::offset_of};
 
 use blaze_format::{FormatError, Record, Slice, Writer};
 use blaze_ids::{ContentId, Hasher};
@@ -604,9 +604,9 @@ impl<'a> PlanView<'a> {
     }
 }
 
-/// The bytes of a plan's payload. Floor: one copy of its parts.
-pub fn write_plan_payload(edges: &[PlanEdge], args: &[u8], describe: &[u8]) -> Vec<u8> {
-    let mut out = Writer::new(PlanPayload::SCHEMA);
+/// The bytes of a plan's payload, in `alloc`. Floor: one copy of its parts.
+pub fn write_plan_payload<A: Allocator>(edges: &[PlanEdge], args: &[u8], describe: &[u8], alloc: A) -> Vec<u8, A> {
+    let mut out = Writer::new_in(PlanPayload::SCHEMA, alloc);
     let edges_at = out.push_slice(edges);
     // Bytes go in as buffers, as a traced record's payload does.
     let args_at = out.push_buffer(args);
@@ -751,9 +751,9 @@ impl<'a> KeptParts<'a> {
     }
 }
 
-/// The bytes of a kept program's payload. Floor: one copy of its parts.
-pub fn write_kept(parts: &KeptParts<'_>) -> Vec<u8> {
-    let mut out = Writer::new(ProgramKeptRoot::SCHEMA);
+/// The bytes of a kept program's payload, in `alloc`. Floor: one copy of its parts.
+pub fn write_kept<A: Allocator>(parts: &KeptParts<'_>, alloc: A) -> Vec<u8, A> {
+    let mut out = Writer::new_in(ProgramKeptRoot::SCHEMA, alloc);
     let manifests_at = out.push_slice(parts.manifests);
     let rows_at = out.push_slice(parts.rows);
     let targets_at = out.push_slice(parts.targets);

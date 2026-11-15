@@ -215,8 +215,8 @@ pub fn record_in<T, A: Allocator>(
     // An outer run read what this work read: its direct rows and the entries it asked, as
     // though asked there (the outer run's own flat list reaches the rest through them).
     task::replay_taken(&taken);
-    let rows = flatten_in(memo, &taken.reads, &taken.callees, alloc, &|out: &mut String| {
-        out.push_str("a piece of work recorded by `blaze_memo::record`");
+    let rows = flatten_in(memo, &taken.reads, &taken.callees, alloc, &|out: &mut dyn fmt::Write| {
+        let _ = out.write_str("a piece of work recorded by `blaze_memo::record`");
     });
     Ok((value, rows))
 }
@@ -410,7 +410,7 @@ impl Lists {
     /// # Panics
     ///
     /// Where the rows hold one fact with two digests: two snapshots' reads mixed.
-    pub(crate) fn flat(&self, memo: &Memo, named: &dyn Fn(&mut String)) -> &[Read] {
+    pub(crate) fn flat(&self, memo: &Memo, named: &dyn Fn(&mut dyn fmt::Write)) -> &[Read] {
         if let Some(made) = self.made() {
             return made;
         }
@@ -436,13 +436,12 @@ impl Lists {
 /// The flat list of the entry `head` starts ([`Lists::flat`]); empty when it read nothing.
 pub(crate) fn flat_of<'a>(memo: &Memo, head: &'a Head) -> &'a [Read] {
     let Some(lists) = head.lists() else { return &[] };
-    lists.flat(memo, &|out: &mut String| name_entry(head, out))
+    lists.flat(memo, &|out: &mut dyn fmt::Write| name_entry(head, out))
 }
 
 /// An entry as a refusal names it when its key's type is not known here: its kind and its
 /// key's hash.
-fn name_entry(head: &Head, out: &mut String) {
-    use fmt::Write as _;
+fn name_entry(head: &Head, out: &mut dyn fmt::Write) {
     let _ = write!(out, "an entry of {} (key hash {:#018x})", head.kind.name(), head.hash);
 }
 
@@ -460,7 +459,7 @@ fn flatten_in<A: Allocator>(
     direct: &[Read],
     callees: &[*const Head],
     alloc: A,
-    named: &dyn Fn(&mut String),
+    named: &dyn Fn(&mut dyn fmt::Write),
 ) -> Vec<Read, A> {
     let mut rows = Vec::new_in(alloc);
     rows.extend_from_slice(direct);
@@ -494,7 +493,7 @@ fn flatten_in<A: Allocator>(
 /// Refuses sorted, deduplicated `rows` that hold one fact (of one input kind) with two digests,
 /// `named` naming whose they are: inputs are fixed for a snapshot, so that is two snapshots'
 /// reads mixed. Untracked reads are exempt (each is its snapshot's own).
-pub(crate) fn one_digest_each(rows: &[Read], named: &dyn Fn(&mut String)) {
+pub(crate) fn one_digest_each(rows: &[Read], named: &dyn Fn(&mut dyn fmt::Write)) {
     for pair in rows.windows(2) {
         if let (Read::Input { kind: a, fact: x }, Read::Input { kind: b, fact: y }) = (pair[0], pair[1])
             && a == b

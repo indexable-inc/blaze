@@ -1289,8 +1289,8 @@ impl BuildEnd {
         made.len()
     }
 
-    /// The crates every unit of which compiled, in the order of their first unit.
-    fn finished(&self) -> Vec<base_db::CrateKey> {
+    /// The crates every unit of which compiled, in the order of their first unit, in `alloc`.
+    fn finished<A: std::alloc::Allocator>(&self, alloc: A) -> Vec<base_db::CrateKey, A> {
         // Each crate's place in `crates` and whether every unit of it compiled so far.
         let mut seen = blaze_hash::HashMap::new_in(std::alloc::Global);
         let mut crates: Vec<(base_db::CrateKey, bool)> = Vec::new(); // alloc: a crate a build, once per build
@@ -1302,7 +1302,9 @@ impl BuildEnd {
             });
             crates[at].1 &= self.compiled[unit];
         }
-        crates.into_iter().filter(|it| it.1).map(|it| it.0).collect() // alloc: as above
+        let mut finished = Vec::new_in(alloc);
+        finished.extend(crates.into_iter().filter(|it| it.1).map(|it| it.0));
+        finished
     }
 
     /// Lets go of what the build's end lets go (the type's doc), under a span naming it.
@@ -1315,7 +1317,7 @@ impl BuildEnd {
             (false, _) | (true, true) => Vec::new_in(std::alloc::Global),
             (true, false) => {
                 // Taken in the snapshot the build ended in, by key.
-                let keys = self.finished();
+                let keys = self.finished(std::alloc::Global);
                 let mut finished = Vec::with_capacity_in(keys.len(), std::alloc::Global);
                 finished.extend(
                     keys.into_iter()

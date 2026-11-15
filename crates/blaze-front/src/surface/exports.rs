@@ -36,7 +36,7 @@
 
 #![blaze::sans_io]
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use base_db::{Crate, Db};
 use blaze_ids::ContentId;
@@ -60,12 +60,12 @@ use crate::{
 /// the control of the test that every kind has a row, and nothing else. Where a row is refused
 /// for a fact with no value ([`facts::UNHASHED`]), that fact is put in `unvalued`, so the
 /// caller can say the item and why ([`facts::unhashed_line`]).
-pub fn collect<T: TextIds>(
+pub fn collect<T: TextIds, A: Allocator>(
     db: &Db,
     krate: Crate,
     omit: Option<QueryKind>,
     text_ids: &T,
-    rows: &mut Vec<Fact, Global>,
+    rows: &mut Vec<Fact, A>,
     unvalued: &mut Option<FactRef>,
 ) -> Result<(), TaskFailed> {
     // One span a phase, so a profile says which part of a slow surface is which (rules 15,
@@ -173,11 +173,11 @@ fn named(kind: QueryKind, subject: ContentId, name: &str) -> FactRef {
     FactRef { kind, subject, object: FactObject::Id(key::name_hash(name).0) }
 }
 
-struct Sink<'a> {
+struct Sink<'a, A: Allocator> {
     db: &'a Db,
     krate: Crate,
     omit: Option<QueryKind>,
-    rows: &'a mut Vec<Fact, Global>,
+    rows: &'a mut Vec<Fact, A>,
     /// The subjects of the ADTs reached, whose `Layout` and `DropCheck` rows [`Self::layouts`]
     /// writes after the walk, under a span of their own: layouts are the costly kind, and
     /// asked inline they would hide inside the items' span. Each ADT reached is pushed once a
@@ -190,7 +190,7 @@ struct Sink<'a> {
     unvalued: &'a mut Option<FactRef>,
 }
 
-impl Sink<'_> {
+impl<A: Allocator> Sink<'_, A> {
     /// The row of `fact`, if it has one; a fact a surface holds no row of by rule (a listing, a
     /// fact a body makes, a refused kind) is a bug of this walk, refused by name
     /// ([`facts::value_of`]).

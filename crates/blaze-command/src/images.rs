@@ -73,13 +73,14 @@ pub const STALLED: &str = "a program's images: the file system answered nothing 
 pub const NO_PROGRAM_PATH: &str = "a program's images: its number is no program the command named a path for";
 
 /// The command's [`Images`] under `<home>/v2/keyed/images`.
-pub struct HomeImages {
+pub struct HomeImages<A: Allocator + Clone> {
     images: FileName,
-    programs: Vec<Placing, Global>,
+    programs: Vec<Placing, A>,
     /// What a make or a place said beyond its answer (a copy made, a refusal's paths), for the
     /// command to print.
-    notes: Lock<Vec<Box<str, Global>, Global>>,
+    notes: Lock<Vec<Box<str, A>, A>>,
     plant: Plant,
+    alloc: A,
 }
 
 /// One program's path and where its place is recorded.
@@ -98,18 +99,19 @@ pub(crate) enum Plant {
     TrustsRecord,
 }
 
-impl HomeImages {
+impl<A: Allocator + Clone> HomeImages<A> {
     /// The images under `keyed` (`<home>/v2/keyed`), and each program's path by its identity
     /// ([`blaze_keyed::program::ProgramPlan::program`]), in the driver's program order. Makes
-    /// the images' directories and each path's (setup, once per command).
-    pub fn new(keyed: &Path, programs: &[(ContentId, PathBuf)]) -> Result<HomeImages, CommandError> {
+    /// the images' directories and each path's (setup, once per command). Its paths and notes
+    /// are in `alloc`.
+    pub fn new(keyed: &Path, programs: &[(ContentId, PathBuf)], alloc: A) -> Result<HomeImages<A>, CommandError> {
         let dir = keyed.join("images");
         let placed = dir.join("placed");
         for at in [&dir, &placed] {
             make_dir(at)?;
         }
         let images = name_of(&dir)?;
-        let mut out = Vec::with_capacity_in(programs.len(), Global);
+        let mut out = Vec::with_capacity_in(programs.len(), alloc.clone());
         for (identity, path) in programs {
             if let Some(parent) = path.parent() {
                 make_dir(parent)?;
@@ -119,15 +121,16 @@ impl HomeImages {
             out.push(Placing {
                 path: name_of(path)?,
                 beside: name_of(Path::new(&beside))?,
-                record: name_of(&placed.join(hex(identity)))?,
+                record: name_of(&placed.join(hex(identity).as_str()))?,
             });
         }
-        Ok(HomeImages { images, programs: out, notes: Lock::new("command.images.notes", Vec::new_in(Global)), plant: Plant::None })
+        let notes = Lock::new("command.images.notes", Vec::new_in(alloc.clone()));
+        Ok(HomeImages { images, programs: out, notes, plant: Plant::None, alloc })
     }
 
     /// What the makes and places said beyond their answers, each once, in order.
-    pub fn notes(&self) -> Vec<Box<str, Global>, Global> {
-        core::mem::replace(&mut *self.notes.lock(), Vec::new_in(Global))
+    pub fn notes(&self) -> Vec<Box<str, A>, A> {
+        core::mem::replace(&mut *self.notes.lock(), Vec::new_in(self.alloc.clone()))
     }
 
     #[cfg(test)]
@@ -136,11 +139,13 @@ impl HomeImages {
     }
 
     fn image(&self, id: &ContentId) -> FileName {
-        joined(&self.images, &hex(id))
+        joined(&self.images, hex(id).as_str())
     }
 
-    fn note(&self, line: String) {
-        self.notes.lock().push(line.into_boxed_str());
+    fn note(&self, line: core::fmt::Arguments<'_>) {
+        let mut text = blaze_mem::String::new_in(self.alloc.clone());
+        blaze_mem::text::format_into(&mut text, line);
+        self.notes.lock().push(text.into_boxed_str());
     }
 
     /// Runs `machine` to its end on a driver of its own: each wait bounded by [`STEP_MOST`] and
@@ -148,7 +153,7 @@ impl HomeImages {
     /// rule.
     fn drive<M: Steps>(&self, machine: &mut M, what: &'static str) -> Result<M::Out, TaskFailed> {
         let mut driver = blaze_core::native(Path::new("/"), 1).map_err(|error| {
-            self.note(format!("{what}: {error} (rule: {NO_DRIVER})"));
+            self.note(format_args!("{what}: {error} (rule: {NO_DRIVER})"));
             TaskFailed::Refused { what: NO_DRIVER }
         })?;
         // The driver's own vectors (`Driver::submit`, `Driver::poll`): the global heap.
@@ -158,7 +163,7 @@ impl HomeImages {
         loop {
             driver.submit(&mut effects);
             if driver.in_flight() == 0 {
-                self.note(format!("{what}: nothing in flight and no answer (rule: {STALLED})"));
+                self.note(format_args!("{what}: nothing in flight and no answer (rule: {STALLED})"));
                 return Err(TaskFailed::Refused { what: STALLED });
             }
             let until = Deadline::after(driver.now(), STEP_MOST);
@@ -167,7 +172,7 @@ impl HomeImages {
                 driver.poll(&mut done, until)
             };
             if got == 0 && until.passed(driver.now()) {
-                self.note(format!("{what}: {STEP_MOST:?} with nothing completing (rule: {STALLED})"));
+                self.note(format_args!("{what}: {STEP_MOST:?} with nothing completing (rule: {STALLED})"));
                 return Err(TaskFailed::Refused { what: STALLED });
             }
             for completion in done.drain(..) {
@@ -175,7 +180,7 @@ impl HomeImages {
                     Ok(Some(out)) => return Ok(out),
                     Ok(None) => {}
                     Err(Refusal { rule, what: why }) => {
-                        self.note(format!("{what}: {why} (rule: {rule})"));
+                        self.note(format_args!("{what}: {why} (rule: {rule})"));
                         return Err(TaskFailed::Refused { what: rule });
                     }
                 }
@@ -184,14 +189,14 @@ impl HomeImages {
     }
 }
 
-impl Images for HomeImages {
+impl<H: Allocator + Clone> Images for HomeImages<H> {
     fn make<A: Allocator>(&self, program: u32, from: Option<ContentId>, to: ContentId, patch: Option<&Patch<A>>) -> Result<(), TaskFailed> {
         let to_name = self.image(&to);
-        let staged = joined(&self.images, &format!("{}.making.{}", hex(&to), std::process::id()));
+        let staged = joined(&self.images, &format!("{}.making.{}", hex(&to).as_str(), std::process::id()));
         let mut machine = Make::new(from.map(|from| self.image(&from)), to_name.clone(), staged, patch);
         let made = self.drive(&mut machine, "making a program's image")?;
         if made == Made::Copied {
-            self.note(format!(
+            self.note(format_args!(
                 "program {program}: image {to_name} copied, not cloned: the home's file system shares no blocks, so each link writes the whole image"
             ));
         }
@@ -211,11 +216,11 @@ impl Images for HomeImages {
         let placed = self.drive(&mut machine, "placing a program's path")?;
         match placed {
             Placed::InPlace | Placed::Cloned => {}
-            Placed::Linked => self.note(format!(
+            Placed::Linked => self.note(format_args!(
                 "/{}: a hard link to the home's read-only image, not a clone: the file system clones nothing; make it writable and write it in place, and the store's image changes",
                 placing.path
             )),
-            Placed::Copied => self.note(format!(
+            Placed::Copied => self.note(format_args!(
                 "/{}: copied from the home, not cloned or linked: the path is on another volume than the home, so each place writes the whole image",
                 placing.path
             )),
@@ -243,13 +248,23 @@ fn make_dir(dir: &Path) -> Result<(), CommandError> {
     })
 }
 
-fn hex(id: &ContentId) -> String {
-    let mut out = String::with_capacity(64);
-    for byte in id.0 {
-        out.push(char::from_digit(u32::from(byte >> 4), 16).expect("a nibble"));
-        out.push(char::from_digit(u32::from(byte & 15), 16).expect("a nibble"));
+/// An id's 64 lowercase hex digits, in a fixed buffer: no allocation.
+struct Hex([u8; 64]);
+
+impl Hex {
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.0).expect("hex digits are ASCII")
     }
-    out
+}
+
+fn hex(id: &ContentId) -> Hex {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (at, byte) in id.0.iter().enumerate() {
+        out[2 * at] = DIGITS[usize::from(byte >> 4)];
+        out[2 * at + 1] = DIGITS[usize::from(byte & 15)];
+    }
+    Hex(out)
 }
 
 /// The layout of a placed record: `magic "BZPL" | image key 32 B | the path's stamp (ino,
@@ -261,7 +276,7 @@ pub mod steps {
     #![blaze::sans_io]
 
     use core::alloc::Allocator;
-    use std::sync::Arc;
+    use std::{alloc::Global, sync::Arc};
 
     use blaze_core::{Completion, Done, Effect, FileName, Names, Stamp, Tag};
     use blaze_ids::ContentId;
@@ -287,8 +302,8 @@ pub mod steps {
     /// A machine the driver runs: started once, then given each completion until it answers.
     pub trait Steps {
         type Out;
-        fn start(&mut self, effects: &mut Vec<Effect>);
-        fn give(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Result<Option<Self::Out>, Refusal>;
+        fn start<E: Allocator>(&mut self, effects: &mut Vec<Effect, E>);
+        fn give<E: Allocator>(&mut self, completion: Completion, effects: &mut Vec<Effect, E>) -> Result<Option<Self::Out>, Refusal>;
     }
 
     const LOOK: Tag = Tag(1);
@@ -340,7 +355,7 @@ pub mod steps {
         }
 
         /// After the base: the patch (cut, then each write), or straight to the mode.
-        fn after_base(&mut self, effects: &mut Vec<Effect>) {
+        fn after_base<E: Allocator>(&mut self, effects: &mut Vec<Effect, E>) {
             match self.patch {
                 Some(patch) => {
                     effects.push(Effect::Truncate { file: self.staged.clone(), len: patch.len, tag: STEP });
@@ -350,7 +365,7 @@ pub mod steps {
             }
         }
 
-        fn mode(&mut self, effects: &mut Vec<Effect>) {
+        fn mode<E: Allocator>(&mut self, effects: &mut Vec<Effect, E>) {
             effects.push(Effect::Mode { file: self.staged.clone(), mode: 0o555, tag: STEP });
             self.step = MakeStep::Mode;
         }
@@ -359,7 +374,7 @@ pub mod steps {
     impl<A: Allocator> Steps for Make<'_, A> {
         type Out = Made;
 
-        fn start(&mut self, effects: &mut Vec<Effect>) {
+        fn start<E: Allocator>(&mut self, effects: &mut Vec<Effect, E>) {
             let mut names = Names::with_capacity(2, 160);
             names.push(&self.to);
             if let Some(from) = &self.from {
@@ -368,7 +383,7 @@ pub mod steps {
             effects.push(Effect::Stamp { files: Arc::new(names), tag: LOOK });
         }
 
-        fn give(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Result<Option<Made>, Refusal> {
+        fn give<E: Allocator>(&mut self, completion: Completion, effects: &mut Vec<Effect, E>) -> Result<Option<Made>, Refusal> {
             match (self.step, completion.done) {
                 (MakeStep::Look, Done::Stamped(stamps)) => {
                     if stamps.first().is_some_and(|it| !it.is_gone()) {
@@ -510,22 +525,24 @@ pub mod steps {
             Refusal { rule, what: format!("{:?} of /{} (image {}): {why}", self.step, self.path, self.image) }
         }
 
-        fn rename(&mut self, effects: &mut Vec<Effect>) {
+        fn rename<E: Allocator>(&mut self, effects: &mut Vec<Effect, E>) {
             effects.push(Effect::Rename { from: self.beside.clone(), to: self.path.clone(), tag: STEP });
             self.step = PlaceStep::Rename;
         }
     }
 
-    /// The record of `id` placed with the path at `stamp`.
-    pub fn encode(id: &ContentId, stamp: &Stamp) -> Vec<u8> {
-        // The effect's own bytes (`Effect::Write`): the global heap.
-        let mut out = Vec::with_capacity_in(72, std::alloc::Global);
-        out.extend_from_slice(&PLACED_MAGIC);
-        out.extend_from_slice(&id.0);
-        for word in [stamp.ino, stamp.size, stamp.mtime_ns, stamp.ctime_ns] {
-            out.extend_from_slice(&word.to_le_bytes());
+    /// A placed record's length: magic, image key, four words and the mode.
+    pub const PLACED_LEN: usize = 72;
+
+    /// The record of `id` placed with the path at `stamp`, in a fixed buffer.
+    pub fn encode(id: &ContentId, stamp: &Stamp) -> [u8; PLACED_LEN] {
+        let mut out = [0u8; PLACED_LEN];
+        out[..4].copy_from_slice(&PLACED_MAGIC);
+        out[4..36].copy_from_slice(&id.0);
+        for (at, word) in [stamp.ino, stamp.size, stamp.mtime_ns, stamp.ctime_ns].into_iter().enumerate() {
+            out[36 + 8 * at..44 + 8 * at].copy_from_slice(&word.to_le_bytes());
         }
-        out.extend_from_slice(&stamp.mode.to_le_bytes());
+        out[68..].copy_from_slice(&stamp.mode.to_le_bytes());
         out
     }
 
@@ -537,14 +554,14 @@ pub mod steps {
     impl Steps for Place {
         type Out = Placed;
 
-        fn start(&mut self, effects: &mut Vec<Effect>) {
+        fn start<E: Allocator>(&mut self, effects: &mut Vec<Effect, E>) {
             let mut names = Names::with_capacity(1, 160);
             names.push(&self.path);
             effects.push(Effect::Stamp { files: Arc::new(names), tag: LOOK });
             effects.push(Effect::ReadAll { file: self.record.clone(), tag: RECORD });
         }
 
-        fn give(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Result<Option<Placed>, Refusal> {
+        fn give<E: Allocator>(&mut self, completion: Completion, effects: &mut Vec<Effect, E>) -> Result<Option<Placed>, Refusal> {
             match (self.step, completion.tag, completion.done) {
                 (PlaceStep::Look, LOOK, Done::Stamped(stamps)) => self.stamp = Some(stamps.first().copied().unwrap_or(Stamp::GONE)),
                 (PlaceStep::Look, RECORD, Done::Read(bytes)) => self.recorded = Some(bytes),
@@ -595,7 +612,10 @@ pub mod steps {
                     if stamp.is_gone() {
                         return Err(self.refuse(NOT_PLACED, "the path is gone right after its rename"));
                     }
-                    effects.push(Effect::Write { file: self.record.clone(), bytes: encode(&self.id, &stamp), tag: STEP });
+                    // The effect owns its bytes (`Effect::Write` holds a vector of the global heap).
+                    let mut bytes = Vec::with_capacity_in(PLACED_LEN, Global);
+                    bytes.extend_from_slice(&encode(&self.id, &stamp));
+                    effects.push(Effect::Write { file: self.record.clone(), bytes, tag: STEP });
                     self.step = PlaceStep::Record;
                 }
                 (PlaceStep::Record, _, Done::Written) => return Ok(Some(self.placed)),
@@ -648,7 +668,7 @@ mod tests {
         let path = root.join("target").join("hello");
         let program = ContentId::of("blaze-command images test", b"program");
         let image = ContentId::of("blaze-command images test", b"image");
-        let mut images = HomeImages::new(&root.join("keyed"), &[(program, path.clone())]).expect("the images open");
+        let mut images = HomeImages::new(&root.join("keyed"), &[(program, path.clone())], Global).expect("the images open");
         images.plant(plant);
         let bytes = b"\x7fELF a whole first image".to_vec();
         let mut writes = Vec::new_in(Global);

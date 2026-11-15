@@ -447,7 +447,7 @@ fn the_snapshot_marks_every_edge_as_the_units_graph_does() {
     with_hello(|inputs| {
         let (units, _) = crate::graph::resolve(inputs).unwrap_or_else(|error| panic!("resolving hello world: {error}"));
         let graph = crate::graph::from_units(&units, inputs, Global).unwrap_or_else(|error| panic!("hello world's graph: {error}"));
-        let (kept, order) = crate::graph::crates_of(&units).unwrap_or_else(|error| panic!("hello world's crates: {error}"));
+        let (kept, order) = crate::graph::crates_of(&units, Global).unwrap_or_else(|error| panic!("hello world's crates: {error}"));
         let triple = host().expect("the test runs on a host blaze has a target for");
         let workspace = triomphe::Arc::new(workspace_of(triple).expect("the host's target"));
         let mut cfgs = Vec::new_in(Global);

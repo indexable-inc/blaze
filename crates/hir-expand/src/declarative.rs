@@ -137,7 +137,7 @@ impl AstId<ast::Macro> {
             // no row, whose text its spans could not be read back to (`stored::Place::of`).
             let mut written = kept.and_then(|(kept, file, _)| {
                 stored::Place::of(db, kept, file, id.value.erase(), def_crate)
-                    .map(stored::Writer::new)
+                    .map(|place| stored::Writer::new(place, frame))
             });
             let read_cfg = std::cell::Cell::new(false);
 

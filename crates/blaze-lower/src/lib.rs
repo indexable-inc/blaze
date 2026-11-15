@@ -379,19 +379,10 @@ impl Crates {
         self.units.get(unit).filter(|it| it.krate.is_some()).map(|it| &it.cfg)
     }
 
-    /// Each crate a unit of the plan has, once, sorted: of `db`'s snapshot.
-    pub fn named(&self, db: &Db) -> Vec<Crate> {
-        // alloc: once per caller, one per crate of the plan
-        let mut crates: Vec<Crate> = self.units.iter().filter_map(|it| it.krate).map(|it| db.krate(it)).collect();
-        crates.sort_unstable();
-        crates.dedup();
-        crates
-    }
-
-    /// [`Crates::named`] by key, sorted.
-    fn named_keys(&self) -> Vec<CrateKey> {
-        // alloc: once per caller, one per crate of the plan
-        let mut crates: Vec<CrateKey> = self.units.iter().filter_map(|it| it.krate).collect();
+    /// Each crate a unit of the plan has, once, sorted: of `db`'s snapshot, in `alloc`.
+    pub fn named<A: Allocator>(&self, db: &Db, alloc: A) -> Vec<Crate, A> {
+        let mut crates = Vec::with_capacity_in(self.units.len(), alloc);
+        crates.extend(self.units.iter().filter_map(|it| it.krate).map(|it| db.krate(it)));
         crates.sort_unstable();
         crates.dedup();
         crates
@@ -2362,14 +2353,15 @@ impl Lowered {
     /// edit uncommitted, so no run of `prepared` is in the world, and the caller's catch fails
     /// each of them, naming the panic: never a commit of the runs before it, which a later
     /// commit would be needed to finish.
-    pub fn apply_runs(
+    pub fn apply_runs<A: Allocator + Clone>(
         &mut self,
-        prepared: Vec<PreparedRun, Global>,
-    ) -> Vec<(usize, Result<(), LowerError>), Global> {
+        prepared: Vec<PreparedRun, A>,
+    ) -> Vec<(usize, Result<(), LowerError>), A> {
         let crates = std::sync::Arc::clone(&self.crates);
         let Lowered { db, paths, applied, identities, narrowed, carried, surfaces_due, .. } = self;
         let mut beside = Beside { paths, applied, identities, narrowed, carried, surfaces_due };
-        let mut outcomes = Vec::with_capacity_in(prepared.len(), Global);
+        // The outcomes in the caller's allocator, the one its runs came in.
+        let mut outcomes = Vec::with_capacity_in(prepared.len(), prepared.allocator().clone());
         // The change's one edit: dropped, with every write in it, at a panic below.
         let mut edit = db.edit();
         for prepared in prepared {
@@ -2959,7 +2951,7 @@ impl Lowered {
     /// A commit of its own, when any digest moved; none when none did.
     pub fn give_surfaces(&mut self) {
         // Sorted, each once.
-        let crates: Vec<Crate> = self.crates.named(&self.db);
+        let crates: Vec<Crate, Global> = self.crates.named(&self.db, Global);
         // The whole identities of every crate of the closures: what a library crate's slot is.
         for &krate in &crates {
             identity_of(&self.db, krate, &self.spellings, &mut self.identities);

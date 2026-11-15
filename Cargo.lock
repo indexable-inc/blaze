@@ -1214,6 +1214,7 @@ dependencies = [
  "blaze-item-hash",
  "blaze-items",
  "blaze-keyed",
+ "blaze-mem",
  "blaze-memo",
  "blaze-query",
  "blaze-rng",

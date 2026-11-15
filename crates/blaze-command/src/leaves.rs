@@ -30,6 +30,7 @@
 
 use std::{
     alloc::{Allocator, Global},
+    fmt,
     io::Read as _,
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
@@ -65,10 +66,11 @@ pub trait Look {
     /// The stamp of `path` (relative, `""` for the checkout), by `lstat`; [`Stamp::GONE`] for
     /// nothing there.
     fn stamp(&self, path: &str) -> Result<Stamp, CommandError>;
-    /// Each entry's name and stamp, of the directory at `path`, into `out` (cleared first).
-    fn list(&self, path: &str, out: &mut Vec<(String, Stamp), Global>) -> Result<(), CommandError>;
-    /// The bytes of the file at `path`, into `out` (cleared first); at most `most` when given.
-    fn read(&self, path: &str, most: Option<usize>, out: &mut Vec<u8, Global>) -> Result<(), CommandError>;
+    /// Each entry's name and stamp, of the directory at `path`, given to `each`.
+    fn list(&self, path: &str, each: &mut dyn FnMut(&str, Stamp)) -> Result<(), CommandError>;
+    /// The bytes of the file at `path`, at most `most` when given: lent from the look's one
+    /// buffer, which the next read fills again.
+    fn read(&mut self, path: &str, most: Option<usize>) -> Result<&[u8], CommandError>;
     /// The wall clock, in nanoseconds since the epoch: the table's instant.
     fn now_ns(&self) -> u64;
 }
@@ -77,11 +79,13 @@ pub trait Look {
 pub struct DiskLook {
     root: PathBuf,
     disk: Disk,
+    /// The one buffer every read fills: no allocation once it has grown.
+    bytes: Vec<u8, Global>,
 }
 
 impl DiskLook {
     pub fn new(root: &Path) -> DiskLook {
-        DiskLook { root: root.to_path_buf(), disk: Disk::new(root) }
+        DiskLook { root: root.to_path_buf(), disk: Disk::new(root), bytes: Vec::new_in(Global) }
     }
 
     fn path(&self, path: &str) -> PathBuf {
@@ -89,48 +93,46 @@ impl DiskLook {
     }
 }
 
-fn file_error(path: &Path, what: String) -> CommandError {
-    CommandError::File { path: path.display().to_string().into_boxed_str(), what: what.into_boxed_str() }
+fn file_error(path: &Path, what: impl fmt::Display) -> CommandError {
+    CommandError::File { path: path.display().to_string().into_boxed_str(), what: what.to_string().into_boxed_str() }
 }
 
 impl Look for DiskLook {
     fn stamp(&self, path: &str) -> Result<Stamp, CommandError> {
         self.disk
             .stamp(path.as_bytes())
-            .map_err(|error| file_error(&self.path(path), format!("{} failed: errno {}", error.call, error.errno)))
+            .map_err(|error| file_error(&self.path(path), format_args!("{} failed: errno {}", error.call, error.errno)))
     }
 
-    fn list(&self, path: &str, out: &mut Vec<(String, Stamp), Global>) -> Result<(), CommandError> {
-        out.clear();
+    fn list(&self, path: &str, each: &mut dyn FnMut(&str, Stamp)) -> Result<(), CommandError> {
         let dir = self.path(path);
         let entries = std::fs::read_dir(&dir).map_err(|error| file_error(&dir, error.to_string()))?;
         for entry in entries {
             let entry = entry.map_err(|error| file_error(&dir, error.to_string()))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
-                return Err(file_error(&entry.path(), "a name that is not UTF-8, which a leaf table cannot hold".to_owned()));
+                return Err(file_error(&entry.path(), "a name that is not UTF-8, which a leaf table cannot hold"));
             };
             let below = if path.is_empty() { name.to_owned() } else { format!("{path}/{name}") };
-            let stamp = self.stamp(&below)?;
-            out.push((name.to_owned(), stamp));
+            each(name, self.stamp(&below)?);
         }
         Ok(())
     }
 
-    fn read(&self, path: &str, most: Option<usize>, out: &mut Vec<u8, Global>) -> Result<(), CommandError> {
+    fn read(&mut self, path: &str, most: Option<usize>) -> Result<&[u8], CommandError> {
         match most {
             None => self
                 .disk
-                .read(path.as_bytes(), out)
-                .map_err(|error| file_error(&self.path(path), format!("{} failed: errno {}", error.call, error.errno))),
+                .read(path.as_bytes(), &mut self.bytes)
+                .map_err(|error| file_error(&self.path(path), format_args!("{} failed: errno {}", error.call, error.errno)))?,
             Some(most) => {
-                out.clear();
+                self.bytes.clear();
                 let at = self.path(path);
                 let file = std::fs::File::open(&at).map_err(|error| file_error(&at, error.to_string()))?;
-                file.take(most as u64).read_to_end(out).map_err(|error| file_error(&at, error.to_string()))?;
-                Ok(())
+                file.take(most as u64).read_to_end(&mut self.bytes).map_err(|error| file_error(&at, error.to_string()))?;
             }
         }
+        Ok(&self.bytes)
     }
 
     #[expect(clippy::disallowed_methods, reason = "the leaf table's instant is the wall clock, the clock file stamps are on")]
@@ -169,7 +171,7 @@ impl Fresh {
 
 /// The rows now: `old` swept against the disk, every read hashed, with what it cost. The
 /// rows' instant is the clock before the first stat.
-pub fn sweep<L: Look>(look: &L, old: Table) -> Result<Fresh, CommandError> {
+pub fn sweep<L: Look>(look: &mut L, old: Table) -> Result<Fresh, CommandError> {
     let instant_ns = look.now_ns();
     let mut sweep = Sweep::new(old.rows, old.instant_ns);
     let mut stamps = Vec::with_capacity_in(sweep.name_count(), Global);
@@ -186,8 +188,7 @@ pub fn sweep<L: Look>(look: &L, old: Table) -> Result<Fresh, CommandError> {
         probes.extend(walk.probes);
     };
     push(first, &mut lists, &mut probes);
-    let mut entries = Vec::new_in(Global);
-    let mut bytes = Vec::new_in(Global);
+    let mut entries: Vec<(String, Stamp), Global> = Vec::new_in(Global);
     let mut looks = 0u64;
     loop {
         looks += 1;
@@ -195,11 +196,12 @@ pub fn sweep<L: Look>(look: &L, old: Table) -> Result<Fresh, CommandError> {
             return Err(CommandError::File { path: "the checkout".into(), what: format!("its sweep took more than {MOST_LOOKS} looks").into_boxed_str() });
         }
         if let Some(probe) = probes.pop() {
-            look.read(&probe, Some(blaze_solo::sweep::SIGNATURE.len()), &mut bytes)?;
-            let walk = sweep.probed(&probe, &bytes);
+            let bytes = look.read(&probe, Some(blaze_solo::sweep::SIGNATURE.len()))?;
+            let walk = sweep.probed(&probe, bytes);
             push(walk, &mut lists, &mut probes);
         } else if let Some(dir) = lists.pop() {
-            look.list(&dir, &mut entries)?;
+            entries.clear();
+            look.list(&dir, &mut |name, stamp| entries.push((name.to_owned(), stamp)))?;
             let walk = sweep.listed(&dir, &entries);
             push(walk, &mut lists, &mut probes);
         } else {
@@ -214,8 +216,7 @@ pub fn sweep<L: Look>(look: &L, old: Table) -> Result<Fresh, CommandError> {
             continue;
         }
         if row.id.is_none() || dirty.binary_search(&row.path).is_ok() {
-            look.read(&row.path, None, &mut bytes)?;
-            row.id = Some(file_answer(&bytes));
+            row.id = Some(file_answer(look.read(&row.path, None)?));
             cost.hashed += 1;
         }
     }
@@ -287,7 +288,7 @@ pub fn save(path: &Path, table: &Table) -> Result<(), CommandError> {
 
 /// `bytes` at `path` by a write beside it and a rename: a reader sees the old file or the new.
 pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> Result<(), CommandError> {
-    let dir = path.parent().ok_or_else(|| file_error(path, "names no directory".to_owned()))?;
+    let dir = path.parent().ok_or_else(|| file_error(path, "names no directory"))?;
     std::fs::create_dir_all(dir).map_err(|error| file_error(dir, error.to_string()))?;
     let mut name = path.file_name().map(|it| it.as_bytes().to_vec()).unwrap_or_default();
     name.extend_from_slice(format!(".{}.new", std::process::id()).as_bytes());

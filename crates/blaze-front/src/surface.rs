@@ -66,7 +66,10 @@ pub mod exports;
 mod tests;
 
 use core::{fmt, mem::offset_of, ops::Range};
-use std::{alloc::Global, sync::Arc};
+use std::{
+    alloc::{Allocator, Global},
+    sync::Arc,
+};
 
 use base_db::{Crate, Db};
 use blaze_format::{ALIGN, Aligned, Record as _, Slice, Writer};
@@ -182,8 +185,9 @@ pub fn surface_telling<T: TextIds>(
         let _span = tracing::info_span!(target: "blaze", "surface: image parts of the crate").entered();
         hir_def::deps::image_parts(db, krate).map_err(|why| {
             let rule = image_refused(&why);
-            // alloc: one line of error text, once per refused task
-            told(&format!("{why} ({rule})"));
+            let mut line = blaze_mem::String::new_in(Global);
+            blaze_mem::text::format_into(&mut line, format_args!("{why} ({rule})"));
+            told(line.as_str());
             refused(rule)
         })?
     };
@@ -194,7 +198,9 @@ pub fn surface_telling<T: TextIds>(
         let mut unvalued = None;
         let collected = exports::collect(db, krate, None, text_ids, &mut rows, &mut unvalued);
         if let (Err(_), Some(fact)) = (&collected, unvalued) {
-            told(&facts::unhashed_line(db, krate, &fact));
+            let mut line = blaze_mem::String::new_in(Global);
+            facts::unhashed_line(db, krate, &fact, &mut line);
+            told(line.as_str());
         }
         collected?;
     }
@@ -233,7 +239,7 @@ pub fn surface_telling<T: TextIds>(
     let tables = hir_ty::method_resolution::frozen::encode(db, krate).map_err(|_| refused(TABLES_REFUSED))?;
     let meta = Meta { crate_key };
     let sections: [(u32, u32, &[u8]); 4] = [(META, 1, &meta.bytes()), (IMAGE, 1, &image), (PAGES, 1, &pages), (TABLES, 1, &tables)];
-    let payload = payload(&at, &sections);
+    let payload = payload(&at, &sections, Global);
     let (filed, bytes) = record::write_read::<Surface>(key, &shape, &rows, &payload);
     debug_assert_eq!(filed, at);
     let out = Aligned::copy_from(&bytes);
@@ -256,7 +262,7 @@ pub trait TextIds {
 
 /// Inserts `row` into `rows` (sorted by id, each once) at its place; an id already there is
 /// refused.
-fn insert(rows: &mut Vec<Fact, Global>, row: Fact) -> Result<(), TaskFailed> {
+fn insert<A: Allocator>(rows: &mut Vec<Fact, A>, row: Fact) -> Result<(), TaskFailed> {
     let at = rows.partition_point(|it| it.id < row.id);
     if rows.get(at).is_some_and(|it| it.id == row.id) {
         return Err(TaskFailed::Refused { what: TWO_DIGESTS });
@@ -299,7 +305,7 @@ pub fn late_digest(value: &hir_def::deps::LateValue) -> ContentId {
 /// `shape` with the digest seen: sorted by id, each once. Two values seen for one id are
 /// refused ([`LATE_TWO_VALUES`]); an answer other than the value seen fails the task
 /// ([`LATE_MOVED`]), so a record is never filed at an address its expansions did not see.
-fn late_asks(seen: &[hir_def::deps::LateSeen], universe: &Universe<'_>, shape: &mut Vec<Fact, Global>) -> Result<(), TaskFailed> {
+fn late_asks<A: Allocator>(seen: &[hir_def::deps::LateSeen], universe: &Universe<'_>, shape: &mut Vec<Fact, A>) -> Result<(), TaskFailed> {
     let refused = |what| TaskFailed::Refused { what };
     let mut asks: Vec<Fact, Global> = Vec::with_capacity_in(seen.len(), Global);
     for read in seen {
@@ -327,9 +333,9 @@ fn late_asks(seen: &[hir_def::deps::LateSeen], universe: &Universe<'_>, shape: &
 
 /// `rows` sorted by id with each id once (two digests of one id refused), and the exports row
 /// added: the digest of every other row.
-fn finish_rows(mut rows: Vec<Fact, Global>, crate_key: &ContentId) -> Result<(Vec<Fact, Global>, ContentId), TaskFailed> {
+fn finish_rows<A: Allocator + Clone>(mut rows: Vec<Fact, A>, crate_key: &ContentId) -> Result<(Vec<Fact, A>, ContentId), TaskFailed> {
     rows.sort_unstable();
-    let mut out: Vec<Fact, Global> = Vec::with_capacity_in(rows.len() + 2, Global);
+    let mut out: Vec<Fact, A> = Vec::with_capacity_in(rows.len() + 2, rows.allocator().clone());
     for row in rows {
         match out.last() {
             Some(last) if last.id == row.id => {
@@ -382,8 +388,8 @@ fn head(at: &Key<Surface>) -> RecordHead {
 
 /// The payload: a buffer of root [`Sections`], headed by the record's address, each section
 /// 16-aligned in it.
-fn payload(at: &Key<Surface>, sections: &[(u32, u32, &[u8])]) -> Vec<u8> {
-    let mut inner = Writer::new(Sections::SCHEMA);
+fn payload<A: Allocator>(at: &Key<Surface>, sections: &[(u32, u32, &[u8])], alloc: A) -> Vec<u8, A> {
+    let mut inner = Writer::new_in(Sections::SCHEMA, alloc);
     let mut table = Vec::with_capacity_in(sections.len(), Global);
     for &(id, elem, bytes) in sections {
         let start = inner.bytes.len().next_multiple_of(ALIGN);

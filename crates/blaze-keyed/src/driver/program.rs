@@ -1453,7 +1453,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             row_spans: &row_spans,
             row_span_at: &row_span_at,
             linker,
-        });
+        }, self.alloc.clone());
         let key = ProgramManifest::key(&ProgramInputs { program, header: &payload, chunks: &[] });
         let bytes = record::write_opaque(&key, &payload);
         let prog = &mut self.progs.list[p as usize];

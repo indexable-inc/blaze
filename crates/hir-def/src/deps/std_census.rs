@@ -286,7 +286,7 @@ fn std_crates(library: &Path, out: &mut String) -> Vec<StdCrate, Global> {
             note(out, &name, &format!("edition `{}`", unit.target.edition));
             continue;
         };
-        let disk = |named: &str| stdlib::cfg::on_disk(named, &run);
+        let disk = |named: &str| stdlib::cfg::on_disk(named, &run).map_err(|why| why.to_string());
         let root = match unit.target.src_path.to_str().ok_or_else(|| "its root is not UTF-8".to_owned()).and_then(disk) {
             Ok(root) => root,
             Err(why) => {
