@@ -361,19 +361,17 @@ pub fn socket_of(manager: Manager, text: &str) -> Option<PathBuf> {
     }
 }
 
-/// This user's [`Place`], from the environment (`HOME`, `XDG_CONFIG_HOME`) and the process's
-/// user.
+/// This user's [`Place`], from the user's home ([`blaze_core::home::user`]), the environment
+/// (`XDG_CONFIG_HOME`) and the process's user.
 #[cfg(unix)]
 pub fn place_here() -> Result<Place, UnitError> {
     let manager = Manager::here().ok_or_else(|| {
         // alloc: error path, no manager here.
         refused("no service manager blaze can be socket-activated by runs here: systemd on Linux, launchd on macOS".to_owned())
     })?;
-    let home = std::env::var_os("HOME")
-        .filter(|it| !it.is_empty())
-        .map(PathBuf::from)
-        // alloc: error path, no HOME.
-        .ok_or_else(|| refused("HOME is not set, and the units go under it".to_owned()))?;
+    let home = blaze_core::home::user()
+        // alloc: error path, no home.
+        .map_err(|why| refused(format!("the units go under the home directory, and {why}")))?;
     let config = std::env::var_os("XDG_CONFIG_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
     Ok(Place {
         manager,

@@ -132,9 +132,10 @@ pub fn whole_env(what: &str) -> bool {
     what == ALL_ENV || what.starts_with("* ")
 }
 
-/// The name a [`Traced`] of a run that read the whole environment has, beside every variable,
-/// with the [`listing`] hash of the names (in hex) as its value: a variable added later is
-/// one it would have seen. No variable has this name: a name is a C string.
+/// The name a [`Traced`] of a run that walked its environment has, beside every variable the
+/// walk saw ([`Inputs::env_all`]: the whole environment, or the walk set of a run lent its
+/// environment), with the [`listing`] hash of those names (in hex) as its value: a variable
+/// added later is one it would have seen. No variable has this name: a name is a C string.
 pub const ALL_ENV_NAME: &str = "\0*";
 
 /// One line of a record: the letter, the scope and what, by tabs, ended by a line break. The
@@ -231,8 +232,10 @@ pub trait Inputs {
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Self::Error>;
     /// The variable's value, lent: a check hashes it where it is.
     fn env(&mut self, name: &OsStr) -> Option<&OsStr>;
-    /// The whole environment, for a run that read all of it: sorted by name, each name once,
-    /// lent rather than copied, as [`crate::inputs::Env`] keeps it.
+    /// What a walk of the environment sees, for a run that walked it: all of it, or the walk
+    /// set of a run that is lent its environment ([`crate::inputs::Env::lent`]), in which a
+    /// variable outside the set is still read by name ([`Inputs::env`]). Sorted by name, each
+    /// name once, lent rather than copied, as [`crate::inputs::Env`] keeps it.
     fn env_all(&mut self) -> &[(OsString, OsString)];
     /// The names in the directory, each with whether it is a directory, pushed to `out` (given
     /// empty) and sorted ([`Names::sort`]); `false` for no directory there. What [`walk`]
@@ -255,6 +258,20 @@ pub enum Entry {
     Dir,
     File(ContentId, blaze_vfs::Mode),
     Missing,
+}
+
+/// What a look at the disk for an [`Entry`] is kept by ([`blaze_vfs::outside::LookKind::Entry`]):
+/// `None` for a path that is not there, else a hash of which it is, and for a file of its
+/// content ID and git mode. Equal entries give equal digests and unequal ones do not, so a
+/// later ask of an unchanged disk gives the digest kept.
+pub fn entry_digest(entry: &Entry) -> Option<[u8; 32]> {
+    let mut hasher = Hasher::new("blaze v2 disk entry look 1");
+    match entry {
+        Entry::Missing => return None,
+        Entry::Dir => hasher.update(&[0]),
+        Entry::File(id, mode) => hasher.update(&[1]).part(&id.0).part(&mode.git().to_le_bytes()),
+    };
+    Some(hasher.finish().0)
 }
 
 /// A directory's names as [`Inputs::names`] gives them, in a task's frame, each with whether it

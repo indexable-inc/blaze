@@ -39,8 +39,11 @@ struct Inode {
 #[derive(Default)]
 pub(super) struct Disk {
     pub(super) kind: Journal,
-    /// Moves once per change: the simulation's mtimes and ctimes.
+    /// The last change time given: the simulation's mtimes and ctimes, in nanoseconds since
+    /// the epoch.
     clock: u64,
+    /// The wall clock now ([`super::Sim::wall_ns`]), set as the virtual clock moves ([`Disk::at`]).
+    wall_ns: u64,
     next_ino: u64,
     /// Every file and directory there, by name.
     inodes: HashMap<FileName, Inode, Global>,
@@ -57,8 +60,17 @@ fn parent(name: &FileName) -> Option<FileName> {
 }
 
 impl Disk {
+    /// The wall clock is `wall_ns` from now on: each change after this is stamped with it.
+    pub(super) fn at(&mut self, wall_ns: u64) {
+        self.wall_ns = wall_ns;
+    }
+
+    /// A change's time: the wall clock now, as a real file system stamps one, so a look within
+    /// the racy window of it sees a racy stamp. Two changes at one virtual instant are a
+    /// nanosecond apart: change times never repeat here, so the racy rule is exercised by
+    /// looks inside the window, not by a second write under an equal stamp.
     fn tick(&mut self) -> u64 {
-        self.clock += 1;
+        self.clock = self.wall_ns.max(self.clock + 1);
         self.clock
     }
 
@@ -96,8 +108,14 @@ impl Disk {
             self.renamed_to = None;
         }
         match (there, self.inodes.get_mut(file)) {
-            (true, Some(inode)) if renamed => inode.ctime = now,
-            (true, Some(inode)) => (inode.mtime, inode.ctime) = (now, now),
+            (true, Some(inode)) if renamed => {
+                inode.ctime = now;
+                self.share(file);
+            }
+            (true, Some(inode)) => {
+                (inode.mtime, inode.ctime) = (now, now);
+                self.share(file);
+            }
             (true, None) => {
                 let inode = self.new_inode();
                 // clone: the simulated disk's name of a new file.
@@ -173,11 +191,41 @@ impl Disk {
         }
     }
 
+    /// `to` made another name of `from`'s inode (a hard link): one inode, so the same `ino`,
+    /// mtime and change time under both, and the link moves that change time, as a link
+    /// count's change does; `to`'s touch, which comes next, moves its change time only, as a
+    /// rename's. Every later change of either name is the other's ([`Disk::share`]). A name
+    /// of the pair removed leaves the other its inode.
+    pub(super) fn linked(&mut self, from: &FileName, to: &FileName, files: &HashMap<FileName, SimFile, Global>) {
+        // The source's inode, made if it was never looked at.
+        self.stamp(from, files);
+        let mut inode = self.inodes[from];
+        inode.ctime = self.tick();
+        // clone: the simulated disk's second name of the file.
+        self.inodes.insert(to.clone(), inode);
+        self.entered(to);
+        self.share(to);
+        // clone: as a rename's, until its touch.
+        self.renamed_to = Some(to.clone());
+    }
+
+    /// Every other name of `name`'s inode (a hard link, [`Disk::linked`]) takes its times:
+    /// one inode under two names. A few names a simulation, so a walk of them all.
+    fn share(&mut self, name: &FileName) {
+        let Some(inode) = self.inodes.get(name).copied() else { return };
+        for (other, it) in self.inodes.iter_mut() {
+            if it.ino == inode.ino && other != name {
+                *it = inode;
+            }
+        }
+    }
+
     /// A chmod: the inode's change time moves, its mtime does not.
     pub(super) fn attributes(&mut self, file: &FileName) -> Cursor {
         let now = self.tick();
         if let Some(inode) = self.inodes.get_mut(file) {
             inode.ctime = now;
+            self.share(file);
         }
         // clone: the simulated journal's entry.
         self.log.push(Entry::Changed(file.clone()));
@@ -198,6 +246,7 @@ impl Disk {
         let now = self.tick();
         let inode = self.inodes.get_mut(name).expect("stamped, so it has an inode");
         (inode.mtime, inode.ctime) = (modified_ns, now);
+        self.share(name);
         // clone: the simulated journal's entry.
         self.log.push(Entry::Changed(name.clone()));
         true

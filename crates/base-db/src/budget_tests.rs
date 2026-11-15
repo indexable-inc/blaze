@@ -46,7 +46,8 @@ fn lib_root(graph: &mut CrateGraphBuilder, root: FileId) -> CrateBuilderId {
         CrateOrigin::Local { repo: None, name: None },
         Vec::new(),
         TargetKind::Lib { is_proc_macro: false },
-        Arc::new(AbsPathBuf::assert_utf8(std::env::temp_dir())),
+        // No proc macro runs here: the cwd is only hashed, so the crate's own directory.
+        Arc::new(AbsPathBuf::assert_utf8(env!("CARGO_MANIFEST_DIR").into())),
         Arc::new(CrateWorkspaceData {
             target: Err("no target in budget tests".into()),
             toolchain: None,
@@ -163,7 +164,9 @@ fn reads_allocate_nothing() {
 /// Source roots 0 (the checkout) and 1 (everything else), both empty.
 fn checkout() -> (Db, AbsPathBuf, FileSetConfig) {
     let mut db = Db::for_tests();
-    let base = AbsPathBuf::assert_utf8(std::env::temp_dir().join("blaze-base-db-budgets"));
+    // A view is held in memory and its base is never read from disk: a path that is not there.
+    let base =
+        AbsPathBuf::assert_utf8(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("blaze-base-db-budgets"));
     let mut partition = FileSetConfig::builder();
     partition.add_file_set(vec![VfsPath::from(base.clone())]);
     for root in [0, 1] {

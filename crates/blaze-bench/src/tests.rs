@@ -17,11 +17,11 @@ fn options(noise_threshold: f64, filter_outliers: bool) -> Options {
 #[test]
 fn ci_and_query_hit_command_lines_parse() {
     let Ok(Mode::Compare(base, it)) =
-        Mode::parse(&args("--bench --color never compare /tmp/base -t 4 --noise-threshold 5 -o"))
+        Mode::parse(&args("--bench --color never compare /work/base -t 4 --noise-threshold 5 -o"))
     else {
         panic!("a comparison");
     };
-    assert_eq!(base, PathBuf::from("/tmp/base"));
+    assert_eq!(base, PathBuf::from("/work/base"));
     assert!(matches!(it.budget, Budget::Time(time) if time == Duration::from_secs(4)));
     assert_eq!(it.noise_threshold, 5.0);
     assert!(it.filter_outliers);

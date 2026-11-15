@@ -8,6 +8,11 @@
 //! | [`table`] | what a program thread touches: the slot words, the published epoch, a stub's wait for code, a safepoint's report of the thread's own stack |
 //! | [`drive`] | [`Driver`]: the core over real memory, each `Write` carried out in order; an edit as one transaction |
 //! | [`control`] | the control thread: the patch protocol over a Unix socket, the stubs' needs, the threads' reports |
+//! | [`records`] | [`Loaded`]: the records the daemon sends, checked against their ids; the program's data and statics in a mapping of their own; outside symbols by `dlsym` |
+//! | [`tls`] | the program's thread-locals: a table a thread, a copy made on first touch, reached through a record's pool |
+//! | [`threads`] | the program's own threads told to the core: its `pthread_create` announces each birth, a key's destructor each end |
+//! | [`symbols`] | the names of placed code where the program's own backtrace looks: one more image of `dl_iterate_phdr`, whose file is a symbol table (Linux) |
+//! | [`unwind`] | a placed function's unwind entry, told to the system's unwinder and taken back when the body is freed |
 //!
 //! Who touches what, which is the whole of the design's safety:
 //!
@@ -20,8 +25,7 @@
 //!
 //! Not built here, each named where it is missing: the scan of a thread from outside
 //! (`thread_suspend`, a signal), so a thread that never reaches a safepoint holds every batch;
-//! unwind entries and symbols for placed code (`Write::Forget` takes nothing back yet); the
-//! store's records ([`drive::Records`] is the seam); `Probe` and `Restart`. The crate is on
+//! thread-locals on x86-64 (`tls`); `Probe` and `Restart`. The crate is on
 //! `std`, not bstd, for the reason blaze-launch's documentation gives.
 //!
 //! Built for AArch64 macOS and for x86-64 and AArch64 Linux; on any other target the crate is
@@ -36,12 +40,18 @@
 pub mod arch;
 pub mod control;
 pub mod drive;
+pub mod records;
+pub mod symbols;
 pub mod sys;
 pub mod table;
+pub mod threads;
+pub mod tls;
+pub mod unwind;
 
 #[cfg(test)]
 mod tests;
 
-pub use control::{ControlError, run};
+pub use control::{ControlError, Start, run};
 pub use drive::{Config, Driver, EditError, Error, Place, REACH, Records};
+pub use records::Loaded;
 pub use table::{Birth, Bound, Event, Mutator, Shared, Told};

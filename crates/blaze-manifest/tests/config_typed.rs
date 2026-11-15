@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use blaze_core::temp::TempDir;
 use blaze_manifest::Config;
 use blaze_manifest::config::{CompileKind, Flags, Replacement};
 use blaze_manifest::files::Disk;
@@ -12,13 +13,14 @@ use cargo_platform::Cfg;
 
 struct Tree {
     root: PathBuf,
+    /// The directory `root` is, removed with all it holds when the tree drops.
+    _dir: TempDir,
 }
 
 impl Tree {
     fn new(name: &str, files: &[(&str, &str)]) -> Tree {
-        let root =
-            std::env::temp_dir().join(format!("blaze-config-typed-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let dir = TempDir::for_test(&format!("blaze-config-typed-{name}-"));
+        let root = dir.path();
         for (path, contents) in files {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -27,7 +29,7 @@ impl Tree {
         std::fs::create_dir_all(root.join("home")).unwrap();
         // Not the `\\?\` form `canonicalize` gives on Windows, which a path read back from a
         // `file:` URL is not, as cargo's is not.
-        Tree { root: dunce::canonicalize(root).unwrap() }
+        Tree { root: dunce::canonicalize(root).unwrap(), _dir: dir }
     }
 
     fn config(&self, env: &[(&str, &str)]) -> Config<Disk> {
@@ -35,12 +37,6 @@ impl Tree {
             vec![("CARGO_HOME".to_owned(), self.root.join("home").display().to_string())];
         vars.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
         Config::load(&self.root, vars, &[]).unwrap()
-    }
-}
-
-impl Drop for Tree {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

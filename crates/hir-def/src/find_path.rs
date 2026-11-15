@@ -160,6 +160,10 @@ impl FindPathScratch {
         }
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "segments are indexed by u32 and a search's candidates stay far below 2^32; a table that could reach it needs a typed refusal"
+    )]
     fn push_segment(&mut self, parent: u32, name: Name) -> u32 {
         let at = u32::try_from(self.segments.len()).expect("more than u32::MAX path segments");
         self.segments.push(Segment { name, parent });

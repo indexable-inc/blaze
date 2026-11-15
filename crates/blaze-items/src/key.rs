@@ -102,6 +102,10 @@ pub enum Resolved {
 
 /// The key of a crate: its content, never its id (see the module doc).
 #[blaze_query::tracked(returns(copy))]
+#[expect(
+    blaze::narrowed_len,
+    reason = "a cfg atom's end is a u32 offset into the crate's cfg bytes, and nothing checks a crate's cfg is under 4 GiB: a larger one needs a typed refusal where the crate is loaded"
+)]
 pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     let data = krate.data(db);
     let extra = krate.extra_data(db);
@@ -275,6 +279,10 @@ impl<T: Copy + Ord> Batch<T> {
     }
 
     /// Adds `id`, whose preimage `write` appends and whose parent it returns.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a batch's ends are u32 offsets into its preimage bytes, and nothing caps a batch's bytes: a batch past 4 GiB needs a typed refusal or a split into batches"
+    )]
     fn push(&mut self, id: T, write: impl FnOnce(&mut Bytes) -> ItemKey) {
         let parent = write(&mut self.bytes);
         self.rows.push((id, parent));
@@ -497,6 +505,11 @@ fn assoc_item_keys(db: &Db, items: &[(Name, hir_def::AssocItemId)]) -> Vec<(Item
 
 /// Appends the bytes an item's key is the hash of to `b`: its parent's key, its kind, its name
 /// (the interned symbol's bytes, read in place) and where it is written. Gives the parent.
+#[expect(
+    blaze::reads_positions,
+    reason = "a macro's name is read off the live tree (`AstId::to_view`): hir-def must keep the name as \
+              written, raw prefix included, in the macro's item-tree entry, read here in its place"
+)]
 fn item_preimage(db: &Db, id: ItemId, b: &mut Bytes) -> ItemKey {
     fn head(b: &mut Bytes, parent: ItemKey, prefix: &[u8], tag: &[u8], name: Option<&str>) {
         b.id(&parent.0).part(prefix).part(tag).opt(name);
@@ -926,6 +939,11 @@ fn module_path<'db>(db: &'db Db, module: ModuleIdLt<'db>, write: &mut impl FnMut
 }
 
 /// Writes an item's name, `_` for one without.
+#[expect(
+    blaze::reads_positions,
+    reason = "a macro's name is read off the live tree (`AstId::to_view`): hir-def must keep the name as \
+              written in the macro's item-tree entry, read here in its place"
+)]
 fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
     fn macro_name(name: Option<syntax::view::Name<'_>>, write: &mut impl FnMut(&str)) {
         write(name.map_or("_", |it| it.text()))

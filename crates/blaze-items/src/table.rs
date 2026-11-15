@@ -239,7 +239,12 @@ fn split(fact: &Fact) -> (u8, ContentId, Object) {
         | Fact::DropCheck(it)
         | Fact::Derive(it)
         | Fact::HiddenTypes(it)
-        | Fact::RpititTys(it) => (tag, it.0, Object::None),
+        | Fact::RpititTys(it)
+        | Fact::TraitImpls(it)
+        | Fact::BlockImpls(it) => (tag, it.0, Object::None),
+        Fact::InherentImpls(self_ty) => (tag, self_ty.0, Object::None),
+        Fact::TraitsNamed(name) => (tag, name.0, Object::None),
+        Fact::ScopeTraitsNamed { scope, name } => (tag, scope.0, Object::Id(name.0)),
         Fact::Field { ty, field } => (tag, ty.0, Object::Field(field)),
         Fact::Method { self_ty, name } => (tag, self_ty.0, Object::Id(name.0)),
         Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {
@@ -283,6 +288,11 @@ fn joined(tag: u8, subject: ContentId, object: Object) -> Option<Fact> {
         kinds::CRATE => return alone(Fact::Crate(subject)),
         kinds::HIDDEN_TYPES => return alone(Fact::HiddenTypes(item)),
         kinds::RPITIT_TYS => return alone(Fact::RpititTys(item)),
+        kinds::INHERENT_IMPLS => return alone(Fact::InherentImpls(SimplifiedType(subject))),
+        kinds::TRAIT_IMPLS => return alone(Fact::TraitImpls(item)),
+        kinds::TRAITS_NAMED => return alone(Fact::TraitsNamed(NameHash(subject))),
+        kinds::SCOPE_TRAITS_NAMED => Fact::ScopeTraitsNamed { scope: item, name: NameHash(id?) },
+        kinds::BLOCK_IMPLS => return alone(Fact::BlockImpls(item)),
         _ => return None,
     })
 }

@@ -58,12 +58,33 @@ fn type_or_union(p: &mut Parser<'_>, allow_bounds: bool) {
         m.abandon(p);
         return;
     }
+    union_members(p, allow_bounds);
+    m.complete(p, UNION_TYPE);
+}
+
+/// The `| B | C` of an error union, each member a type that is no union itself.
+fn union_members(p: &mut Parser<'_>, allow_bounds: bool) {
     // blaze, under `#![blaze::error_unions]`: `type E = io::Error | ParseIntError;`
     while at_union_bar(p) {
         p.bump(T![|]);
         p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
     }
-    m.complete(p, UNION_TYPE);
+}
+
+/// The rest of an error union whose first member, `first`, a caller parsed itself (a generic
+/// argument that starts with a name is parsed there, to tell `Item = T` and `Item: Bound` from
+/// a type): `first | B | C` as one `UNION_TYPE`, or `first` where no union may be or none
+/// follows.
+pub(super) fn union_after(p: &mut Parser<'_>, first: CompletedMarker) -> CompletedMarker {
+    if !p.unions() || !at_union_bar(p) {
+        return first;
+    }
+    let m = first.precede(p);
+    while at_union_bar(p) {
+        p.bump(T![|]);
+        p.with_unions(false, |p| type_with_bounds_cond(p, true));
+    }
+    m.complete(p, UNION_TYPE)
 }
 
 /// Whether the parser is at the `|` between two members of an error union: a lone `|`, not

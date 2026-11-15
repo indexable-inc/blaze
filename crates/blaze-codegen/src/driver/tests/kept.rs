@@ -292,7 +292,7 @@ fn built(
 /// functions and statics are built, each one's code and what its places name, the symbols,
 /// the slots, the owners, what dedupe merged, what each root reaches, and a refused build's
 /// errors. What a build counts of its compiles and the store is not the walk's.
-fn difference(
+pub(super) fn difference(
     kept: &Result<Built, Vec<CodegenError>>,
     fresh: &Result<Built, Vec<CodegenError>>,
 ) -> Option<String> {
@@ -341,6 +341,7 @@ fn difference(
     same!(versions);
     same!(digests);
     same!(identities);
+    same!(abis);
     same!(cold);
     same!(made);
     same!(walked);
@@ -350,16 +351,15 @@ fn difference(
     same!(stats.instances);
     same!(stats.statics);
     same!(walk.reached);
-    // Every function a round of a whole walk reached was described or taken from the kept
-    // walk, once; a patched walk asks only of what the front end names and what is asked
-    // each build.
-    if kept.walk.whole.is_some()
-        && kept.walk.described + kept.walk.verified != fresh.walk.described
-    {
+    // Every function a round of a whole walk reached was described, taken from the kept
+    // walk or read from a record of the store (`tests/recorded.rs`), once; a patched walk
+    // asks only of what the front end names and what is asked each build.
+    let accounted = |walk: &Walk| walk.described + walk.verified + walk.found;
+    if kept.walk.whole.is_some() && accounted(&kept.walk) != accounted(&fresh.walk) {
         return Some(format!(
-            "the walk over kept describes asked for {} describes and took {} kept, where the \
-             fresh walk described {}",
-            kept.walk.described, kept.walk.verified, fresh.walk.described
+            "the walk over kept describes asked for {} describes, took {} kept and read {} \
+             records, where the fresh walk described {}",
+            kept.walk.described, kept.walk.verified, kept.walk.found, fresh.walk.described
         ));
     }
     None
@@ -522,15 +522,14 @@ fn delta_differs(base: Option<&Built>, now: &Built) -> Option<String> {
 /// describes); up to two
 /// statics some function names, one maybe pointing to a function; a body per function for the
 /// recursion limit to count; maybe a call through a `dyn`. And how it is built.
-fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
-    use hegel::generators as gs;
-    let count: u32 = tc.draw(gs::integers::<u32>().min_value(3).max_value(8));
-    let among = || gs::integers::<u32>().min_value(1).max_value(count);
+fn drawn(tape: &blaze_sim::Tape) -> (Program, Run) {
+    let count: u32 = tape.int_in(3..=8u32, "functions");
+    let among = |label: &'static str| tape.int_in(1..=count, label);
     let mut program = Program::default();
     for id in 1..=count {
         let mut calls: Vec<u32> = Vec::new();
         for callee in id + 1..=count {
-            if callee == id + 1 || tc.draw(gs::integers::<u8>().max_value(2)) == 0 {
+            if callee == id + 1 || tape.int_in(0..=2u8, "skips a call") == 0 {
                 calls.push(callee);
             }
         }
@@ -540,7 +539,7 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
             program.functions.get_mut(&1).expect("just made").symbol = Some("main".to_owned());
             continue;
         }
-        let kind = tc.draw(gs::integers::<u8>().max_value(5));
+        let kind = tape.int_in(0..=5u8, "kind");
         if kind == 3 && id > 2 {
             // One code with the function before it, and its calls: one key of two describes,
             // as two instances of a generic whose code reads their arguments alike.
@@ -569,22 +568,23 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
             _ => {}
         }
     }
-    let statics: u32 = tc.draw(gs::integers::<u32>().max_value(2));
+    let statics: u32 = tape.int_in(0..=2u32, "statics");
     for id in 1..=statics {
         program.statics.insert(id, (id as u8, None));
-        let names = tc.draw(among());
+        let names = among("named by");
         program.functions.get_mut(&names).expect("drawn among them").statics.push(id);
-        if tc.draw(gs::booleans()) {
-            program.static_calls.insert(id, vec![tc.draw(among())]);
+        if tape.bool("points to a function") {
+            program.static_calls.insert(id, vec![among("points to")]);
         }
     }
-    if tc.draw(gs::booleans()) {
-        program.dyn_sites.insert(tc.draw(among()), tc.draw(among()));
+    if tape.bool("a dyn site") {
+        let site = among("dyn caller");
+        program.dyn_sites.insert(site, among("dyn callee"));
     }
     let run = Run {
-        live: tc.draw(gs::booleans()),
-        static_root: statics > 0 && tc.draw(gs::booleans()),
-        check: tc.draw(gs::booleans()).then(|| tc.draw(among())),
+        live: tape.bool("live"),
+        static_root: statics > 0 && tape.bool("static root"),
+        check: tape.bool("check").then(|| among("checked")),
     };
     (program, run)
 }
@@ -599,23 +599,67 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
 /// asks only of what the front end names as changed since the kept walk's view
 /// (`Frontend::changed_since`) and of the functions asked each build, whose body edits the
 /// front end names nowhere: so the walk patched from the named set is the whole walk's.
-#[hegel::test(test_cases = 64)]
-fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let (program, run) = drawn(&tc);
-    let count: usize = tc.draw(gs::integers::<usize>().max_value(8));
-    let mut edits = Vec::with_capacity(count);
-    for _ in 0..count {
-        let edit = EDITS[tc.draw(gs::integers::<usize>().max_value(EDITS.len() - 1))];
-        let picks = (tc.draw(gs::integers::<u32>()), tc.draw(gs::integers::<u32>()));
-        edits.push((edit, picks));
-    }
-    if let Some(found) = first_difference(program, run, &edits, None) {
-        panic!("{found}");
-    }
+#[test]
+fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds() {
+    blaze_sim::check(blaze_sim::Config::cases(64), |tape| {
+        let (program, run) = drawn(tape);
+        let count: usize = tape.int_in(0..=8usize, "edits");
+        let mut edits = Vec::with_capacity(count);
+        for _ in 0..count {
+            let edit = EDITS[tape.index(EDITS.len(), "edit")];
+            let picks = (tape.int::<u32>("first pick"), tape.int::<u32>("second pick"));
+            edits.push((edit, picks));
+        }
+        if let Some(found) = first_difference(program, run, &edits, None) {
+            panic!("{found}");
+        }
+    })
 }
 
 const WHOLE: Run = Run { live: false, static_root: false, check: None };
+
+/// Five functions, each calling some after it, the second's call through a `dyn` made
+/// direct to the fifth: the program of the case the refinement's search found on 2026-11-11
+/// (`AXicbYqxDQBACAL/8lZ27r+sJNqQSMEBoZ6UyGKwDWs3wL6Bki+Dv/8GLHwAwg==`, two runs of three).
+fn with_one_dyn_site() -> Program {
+    let mut program = Program::default();
+    let calls: [&[u32]; 5] = [&[2, 3, 4, 5], &[3, 4], &[4, 5], &[5], &[]];
+    for (id, calls) in (1..).zip(calls) {
+        program.function(id, 0x10 + id as u8, calls);
+        program.bodies.insert(id, (id % 3, false));
+    }
+    program.functions.get_mut(&1).expect("just made").symbol = Some("main".to_owned());
+    for id in 2..=5 {
+        let function = program.functions.get_mut(&id).expect("just made");
+        (function.foreign, function.over_editable) = (true, true);
+    }
+    program.dyn_sites.insert(2, 5);
+    program
+}
+
+/// The refinement's case pinned: the fifth function is removed, and with it the program's one
+/// call through a `dyn`, so the build after the edit closes no dyn facts where the build
+/// before it did. The kept walk's describes are against the closed facts (the second
+/// function's code calls the fifth direct), which no changed set names: the build walks
+/// whole, and builds what a fresh walk builds.
+#[test]
+fn a_walk_kept_against_closed_dyn_facts_is_not_patched_by_a_build_that_closes_none() {
+    // `Edit::RemoveFunction` of the fifth of five.
+    let edits = [(Edit::RemoveFunction, (4, 0))];
+    assert_eq!(first_difference(with_one_dyn_site(), WHOLE, &edits, None), None);
+}
+
+/// The control of the refinement for a walk kept against closed dyn facts: a driver that
+/// asks only the patching build's front end whether it closes any patches that walk, keeps
+/// the removed function and its caller's direct call, and the oracle says so.
+#[test]
+fn the_oracle_catches_a_walk_kept_against_closed_dyn_facts_patched() {
+    let edits = [(Edit::RemoveFunction, (4, 0))];
+    let plant = Some(Plant::Patch(Planted::PatchesClosed));
+    let found = first_difference(with_one_dyn_site(), WHOLE, &edits, plant)
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
 
 /// The control of the refinement for a changed function: an edit of 4's body gives it a new
 /// key, which its caller's places name. A driver that takes its kept describe without asking
@@ -706,7 +750,7 @@ fn an_edit_of_one_leaf_describes_it_alone() {
     assert_eq!(counts(&first), (COUNT, 0, COUNT, 0));
     assert_eq!((first.fresh, asked), (Some(Fresh::Restart), (COUNT, 0)));
     assert!(first.whole.is_some(), "nothing was kept to patch");
-    assert_eq!(kept.len(), COUNT);
+    assert_eq!(kept.functions(), COUNT, "the kept walk's nodes, the one copy of its describes");
 
     program.functions.get_mut(&(COUNT as u32)).expect("the last leaf").body = 0x12;
     program.touch(COUNT as u32);
@@ -740,11 +784,18 @@ fn a_build_that_keeps_no_walk_says_so() {
     assert_eq!((walk.fresh, walk.whole), (Some(Fresh::Unkept), Some("the build keeps no walk")));
 }
 
-/// The two rounds of a walk over a program with dyn facts keep their describes apart: the
-/// next build takes each round's, and a changed fact describes again only the body that read
-/// it, in the round against the facts.
+/// The invariant: a whole walk takes no describe from memory, so what a [`Kept`] holds of the
+/// front end's describes is its kept walks' nodes and nothing beside them. A program with dyn
+/// facts closes them, so each of its builds walks whole, both rounds; with no store to read
+/// records from, every build describes every function of both rounds again, and what is kept
+/// after any of them is the one walk of the program: an entry no root reaches any more
+/// (function 5, once the fact moves) is held by nothing.
+///
+/// Control: before 2026-11-13 the walk kept every describe in a table a round besides, by the
+/// instance; the second build then read `(0, 10, 5)` and `Kept` held 10 describes past its
+/// walk, which `functions` and these counts catch.
 #[test]
-fn each_round_of_a_walk_keeps_its_own_describes() {
+fn a_whole_walk_keeps_no_describe_beside_its_walk() {
     let mut program = program();
     program.dyn_sites.insert(2, 5);
     let kept = Kept::new();
@@ -754,11 +805,13 @@ fn each_round_of_a_walk_keeps_its_own_describes() {
     };
     let first = walk(&program);
     assert_eq!((first.described, first.verified, first.reached), (10, 0, 5));
+    assert!(kept.functions() <= first.reached, "{} kept past a walk of {}", kept.functions(), first.reached);
     let again = walk(&program);
-    assert_eq!((again.described, again.verified, again.reached), (0, 10, 5));
+    assert_eq!((again.described, again.verified, again.reached), (10, 0, 5));
     set_fact(&mut program, 2, 3);
     let flipped = walk(&program);
-    assert_eq!((flipped.described, flipped.verified, flipped.reached), (1, 9, 5));
+    assert_eq!((flipped.described, flipped.verified), (10, 0));
+    assert!(kept.functions() <= flipped.reached, "{} kept past a walk of {}", kept.functions(), flipped.reached);
 }
 
 /// A function's entry holds what the link reads of it beside its code: a leaf whose owner

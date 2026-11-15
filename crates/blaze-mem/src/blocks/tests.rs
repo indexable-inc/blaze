@@ -1,7 +1,6 @@
 use std::cell::Cell;
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -23,19 +22,23 @@ fn fill(block: &Owned, byte: u8) {
 /// Blocks taken and given in any order: every live block is at least what was asked, aligned
 /// as asked, disjoint from every other, and keeps what its owner wrote; a zeroed take is zeros
 /// whether the block was carved or recycled.
-#[hegel::test(test_cases = 200)]
-fn live_blocks_are_disjoint_aligned_and_keep_their_bytes(tc: TestCase) {
+#[test]
+fn live_blocks_are_disjoint_aligned_and_keep_their_bytes() {
+    blaze_sim::check(Config::cases(200), |tape| live_blocks(tape))
+}
+
+fn live_blocks(tape: &Tape) {
     let mut live: Vec<(Owned, usize, u8)> = Vec::new();
-    let steps: usize = tc.draw(gs::integers::<usize>().max_value(64));
+    let steps: usize = tape.int_in(0..=64usize, "steps");
     for step in 0..steps {
-        if !live.is_empty() && tc.draw(gs::booleans()) {
-            let at = tc.draw(gs::integers::<usize>().max_value(live.len() - 1));
+        if !live.is_empty() && tape.bool("give one back") {
+            let at = tape.index(live.len(), "which block");
             drop(live.swap_remove(at));
             continue;
         }
-        let bytes = tc.draw(gs::integers::<usize>().max_value(1 << 16));
-        let align = 1usize << tc.draw(gs::integers::<u32>().max_value(MAX_ALIGN.trailing_zeros()));
-        let zeroed = tc.draw(gs::booleans());
+        let bytes = tape.int_in(0..=1usize << 16, "bytes");
+        let align = 1usize << tape.int_in(0..=MAX_ALIGN.trailing_zeros(), "align shift");
+        let zeroed = tape.bool("zeroed");
         let block = take(bytes, align, if zeroed { Fill::Zeroed } else { Fill::Any }, Tag::Other)
             .expect("a block");
         assert!(block.len() >= bytes && block.len() >= SMALLEST);
@@ -62,11 +65,15 @@ fn live_blocks_are_disjoint_aligned_and_keep_their_bytes(tc: TestCase) {
 
 /// A block given back is the next one its class hands out, carving nothing; asked zeroed, it
 /// comes back zeros however its owner left it, and asked for anything, untouched.
-#[hegel::test(test_cases = 100)]
-fn a_recycled_block_comes_back_zeroed_when_asked(tc: TestCase) {
-    let index = tc.draw(gs::integers::<usize>().max_value((16 - MIN_SHIFT) as usize * STEPS));
+#[test]
+fn a_recycled_block_comes_back_zeroed_when_asked() {
+    blaze_sim::check(Config::cases(100), |tape| a_recycled_block(tape))
+}
+
+fn a_recycled_block(tape: &Tape) {
+    let index = tape.int_in(0..=(16 - MIN_SHIFT) as usize * STEPS, "class index");
     let class = own_class(class_size(index), 64 << 16);
-    let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(32));
+    let count = tape.int_in(1..=32usize, "count");
     let blocks: Vec<Owned> =
         (0..count).map(|_| class.take(Fill::Any, Tag::Other).expect("a block")).collect();
     for block in &blocks {
@@ -76,7 +83,7 @@ fn a_recycled_block_comes_back_zeroed_when_asked(tc: TestCase) {
     let carved = class.carved();
     drop(blocks);
     for _ in 0..count {
-        let zeroed = tc.draw(gs::booleans());
+        let zeroed = tape.bool("zeroed");
         let block =
             class.take(if zeroed { Fill::Zeroed } else { Fill::Any }, Tag::Other).expect("a block");
         let want = if zeroed { 0 } else { 0xAB };
@@ -182,10 +189,14 @@ fn a_slice_of_over_aligned_values_is_aligned() {
 
 /// Every class is at least the size that picks it and at most a step past it, aligned as asked;
 /// the classes rise with the size.
-#[hegel::test(test_cases = 500)]
-fn a_size_picks_the_smallest_class_aligned_as_asked(tc: TestCase) {
-    let bytes = tc.draw(gs::integers::<usize>().max_value(LARGEST));
-    let align = 1usize << tc.draw(gs::integers::<u32>().max_value(MAX_ALIGN.trailing_zeros()));
+#[test]
+fn a_size_picks_the_smallest_class_aligned_as_asked() {
+    blaze_sim::check(Config::cases(500), |tape| a_size_picks(tape))
+}
+
+fn a_size_picks(tape: &Tape) {
+    let bytes = tape.int_in(0..=LARGEST, "bytes");
+    let align = 1usize << tape.int_in(0..=MAX_ALIGN.trailing_zeros(), "align shift");
     let index = class_of(bytes, align, Tag::Other).expect("a class");
     let wanted = bytes.max(align).max(SMALLEST);
     assert!(class_size(index) >= wanted, "class {index} holds {bytes}");

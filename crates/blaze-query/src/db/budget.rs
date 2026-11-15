@@ -63,27 +63,31 @@ pub(crate) fn plan(values: &mut [Held], weight: u64, budget: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
-    fn values(tc: &TestCase) -> Vec<Held> {
-        let len = tc.draw(gs::integers::<u32>().max_value(200));
+    fn values(tape: &Tape) -> Vec<Held> {
+        let len = tape.int_in(0..=200u32, "values");
         (0..len)
             .map(|key| Held {
-                view: tc.draw(gs::integers::<u32>().min_value(1).max_value(9)),
-                ingredient: tc.draw(gs::integers::<u32>().max_value(2)),
+                view: tape.int_in(1..=9u32, "view"),
+                ingredient: tape.int_in(0..=2u32, "ingredient"),
                 key,
-                bytes: tc.draw(gs::integers::<u64>().max_value(5000)),
+                bytes: tape.int_in(0..=5000u64, "bytes"),
             })
             .collect() // alloc: a test's values
     }
 
-    #[hegel::test]
-    fn a_pass_brings_the_values_under_the_budget_and_lets_go_of_the_oldest(tc: TestCase) {
-        let mut values = values(&tc);
+    #[test]
+    fn a_pass_brings_the_values_under_the_budget_and_lets_go_of_the_oldest() {
+        blaze_sim::check(Config::DEFAULT, |tape| a_pass_brings_the_values_under(tape))
+    }
+
+    fn a_pass_brings_the_values_under(tape: &Tape) {
+        let mut values = values(tape);
         let weight: u64 = values.iter().map(|it| it.bytes).sum();
-        let budget = tc.draw(gs::integers::<u64>().max_value(weight.max(1) * 2));
+        let budget = tape.int_in(0..=weight.max(1) * 2, "budget");
         let gone = plan(&mut values, weight, budget);
         let (evicted, kept) = values.split_at(gone);
         let left: u64 = kept.iter().map(|it| it.bytes).sum();
@@ -102,15 +106,17 @@ mod tests {
         }
     }
 
-    #[hegel::test]
-    fn a_plan_depends_only_on_the_set_of_values(tc: TestCase) {
-        let mut values = values(&tc);
-        let weight: u64 = values.iter().map(|it| it.bytes).sum();
-        let budget = tc.draw(gs::integers::<u64>().max_value(weight.max(1)));
-        let mut reversed = values.clone();
-        reversed.reverse();
-        assert_eq!(plan(&mut values, weight, budget), plan(&mut reversed, weight, budget));
-        assert_eq!(values, reversed, "the same values go, in the same order");
+    #[test]
+    fn a_plan_depends_only_on_the_set_of_values() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let mut values = values(tape);
+            let weight: u64 = values.iter().map(|it| it.bytes).sum();
+            let budget = tape.int_in(0..=weight.max(1), "budget");
+            let mut reversed = values.clone();
+            reversed.reverse();
+            assert_eq!(plan(&mut values, weight, budget), plan(&mut reversed, weight, budget));
+            assert_eq!(values, reversed, "the same values go, in the same order");
+        })
     }
 
     #[test]

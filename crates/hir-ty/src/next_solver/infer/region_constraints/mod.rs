@@ -372,6 +372,11 @@ impl<'db> RegionConstraints<'db> {
         self.iter().collect()
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "constraints index their regions by u32 and one inference's regions are not \
+                  bounded below 2^32 anywhere: a larger inference needs a typed refusal"
+    )]
     fn push(&mut self, constraint: Constraint<'db>, visible_for_leak_check: VisibleForLeakCheck) {
         let mut region = |region: Region<'db>| {
             let at = u32::try_from(self.regions.len()).expect("too many region constraints");

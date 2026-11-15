@@ -1,0 +1,12 @@
+{
+ "id": "bstd-sim-test-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-sim-test",
+ "where": "scripts: invariants and docs, run with cargo",
+ "what": "At 136432aa02 plus this lane, `cargo run -q -p scripts --bin invariants -- '{\"command\": \"check\"}'` fails with 12 statements that have no control, one control with no statement, and a stale docs/v2/plan/invariants.md (150 invariants listed, 167 found); `docs write` rewrites five unrelated lines of docs/README.md. None is from this lane's files, so the lane left both generated files as they were but for its own README line.",
+ "cost": "10 minutes",
+ "cause": "the two checks are not holding the head",
+ "class": "a generated file with a check nobody runs goes stale, and the next lane that regenerates it carries everyone's drift into its diff",
+ "prevention": "run both checks in the integration step that moves the head; state: not built",
+ "state": "open"
+}

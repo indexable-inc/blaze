@@ -54,7 +54,11 @@ pub(super) fn write(
     let appended = units
         .iter()
         .copied()
-        .filter(|&unit| tested(job, unit as usize) || codegen::wasm_macro(job, unit as usize));
+        .filter(|&unit| {
+            tested(job, unit as usize)
+                || codegen::wasm_macro(job, unit as usize)
+                || edition_program(job, unit as usize)
+        });
     let made = lowered.append_roots(appended, |db, unit, krate| {
         if !blaze_lower::macros_loaded(db, krate) {
             return Ok(None);
@@ -68,6 +72,24 @@ pub(super) fn write(
         if codegen::wasm_macro(job, unit) {
             let glue = blaze_macro_eval::wasm_glue(db, krate).map_err(refused)?;
             return Ok(Some(Appended { after: glue, module: blaze_macro_eval::GLUE_MODULE }));
+        }
+        // A program of a blaze edition: its entry, the `main` that calls the crate's own
+        // with the roots it takes (`hir_ty::entry`). A `main` the entry rule refuses, or
+        // none, appends nothing: the unit's check reports it by name.
+        if edition_program(job, unit) {
+            return Ok(hir_ty::entry::appended(db, krate)
+                .map(|after| Appended { after, module: span::BlazeEdition::ENTRY_MODULE }));
+        }
+        // Tests of a crate of a blaze edition are not built yet: a test is to be handed the
+        // simulation's `Io` (docs/v2/plan/design/std.md, row S5b), and libtest's harness
+        // names Rust's `std`, which such a crate does not have. Stop naming that, rather
+        // than append a harness that cannot resolve.
+        if krate.blaze_edition(db).is_some() {
+            return Err(refused(
+                "tests of a package of the blaze edition are not built yet (docs/v2/plan/design/std.md, \
+                 row S5b: a test takes the simulation's `Io`); `blaze build` and `blaze run` are"
+                    .to_owned(),
+            ));
         }
         let toolchain = codegen::toolchain(job, unit).map_err(refused)?;
         let policy = codegen::policy(job, unit, toolchain).map_err(refused)?;
@@ -157,6 +179,15 @@ pub(super) fn reached(job: &Job, waits: &Waits, loaded: &[u32], ready: &[u32]) -
     radix::sort_by_key(&mut reached, |&it| u64::from(it));
     written.extend(reached);
     written
+}
+
+/// Whether `unit` is a program of a blaze edition ([`blaze_lower::edition_program`]), whose
+/// root has its entry appended.
+fn edition_program(job: &Job, unit: usize) -> bool {
+    match (job.unit(unit), job.plan(unit)) {
+        (Ok(u), Ok(plan)) => blaze_lower::edition_program(u, plan),
+        _ => false,
+    }
 }
 
 /// Whether `unit`'s crate is built with `cfg(test)`, as blaze-lower makes it: a test, or a check

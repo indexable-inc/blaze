@@ -1,0 +1,12 @@
+{
+ "id": "bstd-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+ "where": "git worktree add, in an agent's shell",
+ "what": "`git worktree add -b bstd-builds-1112 ../blaze-bstd-builds-1112 origin/main 2>&1 | tail -2` printed one line of 14,000 characters: git's `Updating files: N%` progress uses carriage returns, so `tail` sees one line.",
+ "cost": "context",
+ "cause": "progress written to a pipe because of `2>&1`",
+ "workaround": "`git worktree add -q`",
+ "fix": "the lane how-to says `-q`",
+ "state": "open"
+}

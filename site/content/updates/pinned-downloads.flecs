@@ -1,5 +1,5 @@
 // Update: build scripts' downloads pinned by sha256 (`blaze lock --fetches`, #637), on stable since v0.20261027.0
-// (docs/CHANGELOG.md). Extends lesson 4: a sealed build script has no network, so what it would download is handed in.
+// (docs/CHANGELOG.md). Extends Hermetic builds: a sealed build script has no network, so what it would download is handed in.
 site {
   updates {
     "pinned-downloads" : Page {
@@ -8,11 +8,11 @@ site {
       (InTheme, themes.basics)
       (Requires, site.learn.hermetic)
       Title: {"Pinned downloads"}
-      Description: {"Update to lesson 4: blaze lock --fetches pins what build scripts download, so they build with no network."}
+      Description: {"Update to Hermetic builds: blaze lock --fetches pins what build scripts download, so they build with no network."}
 
       Step download("Some build scripts download") {
         P fetch("A few crates' build scripts download something big as they build: `v8` its prebuilt library, `ort-sys` ONNX Runtime, `webrtc-sys` WebRTC.")
-        P sealed("In lesson 4, a build script runs sealed, with no network. So where does the download come from?")
+        P sealed("In *Hermetic builds*, a build script runs sealed, with no network. So where does the download come from?")
       }
 
       Step lock("Pinned, as Nix pins") {

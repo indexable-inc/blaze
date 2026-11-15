@@ -1,0 +1,14 @@
+{
+ "id": "dup-grouping-copied-per-fingerprint",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane lints-dup-semantic",
+ "where": "crates/blaze-lints/src/blaze/dup/index.rs and dup/semantic.rs",
+ "what": "Adding a duplicate lint over a new fingerprint (the canonical MIR hash of `same_behaviour`) meant copying index.rs's per-crate grouping: the per-crate list, the merge of local dependencies' lists, the sort by site and the group walk. index.rs's `wholes()` is written for the syntax shape alone.",
+ "cost": "about 150 lines in semantic.rs that repeat index.rs's grouping, two homes for the rule of which crates are compared",
+ "cause": "the dup index is keyed by one concrete fingerprint type instead of being generic over a per-body fingerprint query",
+ "class": "one-concept-one-home: a grouping rule duplicated per key type",
+ "prevention": "one generic `dup::group<F: Fingerprint>` over a per-body query (`fn of(db, def) -> Option<(u64, size)>`), the crate set and the sort in one place; each dup lint names its fingerprint",
+ "workaround": "semantic.rs reuses `index::local_deps` and `index::is_test_target` and copies the rest",
+ "fix": "not built: make index.rs's grouping generic over the fingerprint and port same_fn, near_duplicate and same_behaviour to it",
+ "state": "open"
+}

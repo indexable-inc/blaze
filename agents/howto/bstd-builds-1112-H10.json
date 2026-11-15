@@ -1,0 +1,9 @@
+{
+ "id": "bstd-builds-1112-H10",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+ "task": "Run a blaze command longer than a few minutes on the shared build VM",
+ "do": "Always through `/root/loop.sh <branch> <command>` (it alone checks your branch out). For a run longer than the call: inside the loop call, copy `/root/inst/blaze` and `/root/inst/blaze-engine` to a directory of your lane, put a worktree of the tip at `/root/wt/<branch>` (`git -C /root/blaze worktree add --detach`, or `git -C /root/wt/<branch> checkout --detach <tip>`), and start the command as a systemd unit that uses those and `BLAZE_HOME=/root/homes/<branch>`; poll with `systemctl is-active <unit>` and read its log. The lane's wrapper was three scripts on the Mac (prep.sh sent base64 through `ix shell`, go.sh, poll.sh).",
+ "why": "Another lane's loop call replaces `/root/inst`, kills its daemon and moves `/root/blaze` to its branch (annoyances bstd-1, bstd-3).",
+ "state": "current"
+}

@@ -78,15 +78,14 @@ fn config(args: &[&str], env: &[(&str, &str)]) -> Config {
 
 #[test]
 fn a_memory64_module_reaches_args_env_clock_stdout_and_files_through_the_64_bit_wasi() {
-    let dir = std::env::temp_dir().join(format!("blaze-seed-run-wasi64-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let out = dir.canonicalize().unwrap().join("out");
+    let dir = blaze_core::temp::TempDir::for_test("blaze-seed-run-wasi64-");
+    let out = dir.path().canonicalize().unwrap().join("out");
     let relative = out.to_str().unwrap().strip_prefix('/').unwrap().to_owned();
     let env = [("A", "1"), ("SEED", "yes")];
     let exit = run(&wat::parse_str(WASI64).unwrap(), &config(&["seed", &relative], &env)).unwrap();
     assert_eq!(exit.code, 7, "{exit:?}");
     let written = std::fs::read(&out).unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
+    drop(dir);
     assert_eq!(written, format!("seed\0{relative}\0A=1\0SEED=yes\0").into_bytes());
 }
 
@@ -211,7 +210,8 @@ const SEED_CALLS: &str = r#"
 
 #[test]
 fn the_seeds_own_calls_make_and_remove_a_directory_at_an_absolute_path() {
-    let dir = std::env::temp_dir().join(format!("blaze-seed-run-calls-{}", std::process::id()));
+    let held = blaze_core::temp::TempDir::for_test("blaze-seed-run-calls-");
+    let dir = held.join("made");
     let exit =
         run(&wat::parse_str(SEED_CALLS).unwrap(), &config(&["seed", dir.to_str().unwrap()], &[]))
             .unwrap();

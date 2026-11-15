@@ -333,6 +333,10 @@ mod freed {
         clippy::disallowed_types,
         reason = "below blaze-core: blaze-mem is a dependency of blaze-core; the released ranges, taken only as a reservation is made or released"
     )]
+    #[expect(
+        blaze::process_static,
+        reason = "the released address ranges, merged with their neighbours: bounded by the process's one reserved address space"
+    )]
     static FREE: parking_lot::Mutex<BTreeMap<usize, usize>> =
         parking_lot::Mutex::new(BTreeMap::new());
 

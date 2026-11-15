@@ -7,5 +7,6 @@
  "cost": "one build misread",
  "cause": "the tree is linted by blaze, so cargo's own warnings are nobody's",
  "workaround": "`RUSTFLAGS=\"--cap-lints allow\"` and grep `^error` in the kept log",
- "state": "open"
+ "state": "open",
+ "class": "vacuous success (A39): a failure looked for by a filter that could match nothing"
 }

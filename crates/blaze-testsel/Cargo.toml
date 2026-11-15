@@ -14,16 +14,23 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-blaze-api.workspace = true
-blaze-cas.workspace = true
 blaze-core.workspace = true
-blaze-hash.workspace = true
+# `Aligned`: a record the store gives unaligned, copied once to be read in place.
+blaze-format.workspace = true
 blaze-ids.workspace = true
+# Keys, records, proofs and the outside form: what a test result and the suite's index are.
+blaze-keyed.workspace = true
 blaze-usercode.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# `Aligned`: the simulated store's records, 16-aligned as the real store's are.
+blaze-format.workspace = true
 blaze-protocol.workspace = true
+blaze-rng.workspace = true
+# The machine's simulation (`machine/tests.rs`), the runner host's (`host/tests.rs`) and the
+# detached machine's (`machine/wired_tests.rs`).
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

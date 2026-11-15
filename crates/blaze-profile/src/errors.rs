@@ -384,8 +384,7 @@ mod tests {
     use super::*;
 
     /// A log with each kind of error the self-build logs of 2026-11-01 have, in their words.
-    const LOG: &str = "\
-   Compiling stacker v0.1.21
+    const LOG: &str = r#"Compiling stacker v0.1.21
 error: linking `/t/debug/build/stacker/5d3b/out/build_script_build`: finding the native inputs: linking: the native library `iconv` is not found: no libiconv.tbd in /sdk/usr/lib
 error: could not compile `stacker` (build script) due to 1 previous error
    Compiling libm v0.2.16
@@ -401,7 +400,7 @@ error: proc-macro derive panicked
 49 |     #[derive(Deserialize, Debug)]
    |              ^^^^^^^^^^^
    |
-   = help: message: the proc macro `Deserialize` of `serde_derive` stopped in the evaluator: NotSupported(\"unsizing\")
+   = help: message: the proc macro `Deserialize` of `serde_derive` stopped in the evaluator: NotSupported("unsizing")
              in `std::panicking::take_hook`
 
 error[E0277]: the trait bound `u8: Foo` is not satisfied
@@ -414,7 +413,7 @@ error[E0277]: the trait bound `u8: Foo` is not satisfied
 error: could not compile `blaze-protocol` (lib) due to 2 previous errors
 error: the daemon panicked at crates/blaze-diagnostics/src/api.rs:120:13 on thread blaze-work-0: a span at byte 12114
 blaze time: 279376.8 ms: client 279376.7 (100%), unaccounted 0.0 (0%)
-";
+"#;
 
     fn kinds(rows: &[ErrorRow]) -> Vec<(&str, Option<&str>, Option<&str>)> {
         rows.iter()

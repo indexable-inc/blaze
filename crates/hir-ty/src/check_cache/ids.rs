@@ -669,7 +669,10 @@ fn coroutine_kind_code(kind: CoroutineKind) -> u8 {
     }
 }
 
-fn closure_kind_code(kind: ClosureKind) -> [u8; 3] {
+/// A closure's kind as three bytes, the same in every database: what a stored id of a closure
+/// and a body-relative record key (`blaze_item_hash::keys`) carry, so reading one back opens
+/// no expression store.
+pub fn closure_kind_code(kind: ClosureKind) -> [u8; 3] {
     match kind {
         ClosureKind::Closure => [0, 0, 0],
         ClosureKind::OldCoroutine(movability) => [
@@ -703,7 +706,8 @@ fn coroutine_kind_of(code: u8) -> R<CoroutineKind> {
     })
 }
 
-fn closure_kind_of([tag, a, b]: [u8; 3]) -> R<ClosureKind> {
+/// The kind [`closure_kind_code`] wrote, or why the bytes are no kind.
+pub fn closure_kind_of([tag, a, b]: [u8; 3]) -> R<ClosureKind> {
     Ok(match (tag, a, b) {
         (0, 0, 0) => ClosureKind::Closure,
         (1, 0, 0) => ClosureKind::OldCoroutine(Movability::Static),

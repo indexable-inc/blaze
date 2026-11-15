@@ -1,0 +1,12 @@
+{
+ "id": "disk2-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "crates/blaze-core/src/kqueue.rs:1783",
+ "what": "blaze-core's unit tests did not compile on macOS on main: `driver.poll(&mut out, Duration::from_millis(20))` where `poll` takes a `Deadline`. No macOS test of blaze-core could run.",
+ "cost": "found only when a macOS check of the new effect was needed",
+ "cause": "the deadline-waits port missed one test, and nothing compiles macOS test targets",
+ "workaround": "fixed the line",
+ "fix": "the gate compiles every test target on macOS (rev-1's fix, for macOS too)",
+ "state": "fixed on disk2-1111"
+}

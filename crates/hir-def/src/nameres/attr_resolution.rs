@@ -112,8 +112,8 @@ impl DefMap {
             // the third from `AttrFlags::CHECKFREE`, `hir-ty-pure` the fourth from
             // `AttrFlags::PURE`, the layout and MIR the fifth from `AttrFlags::BLAZE_BITS`),
             // and `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`,
-            // `#[blaze::may(..)]` and `#![blaze::effects]` (`hir-ty-pure`, from
-            // `AttrFlags::effect_attr`, `AttrFlags::may_attr` and `AttrFlags::BLAZE_EFFECTS`),
+            // `#[blaze::expect(..)]` and `#![blaze::effects]` (`hir-ty-pure`, from
+            // `AttrFlags::effect_attr`, `AttrFlags::expect_attr` and `AttrFlags::BLAZE_EFFECTS`),
             // and `#![blaze::specialization]`
             // and `#[blaze::specialization_trait]` (`hir-ty-specialization`, from
             // `AttrFlags::BLAZE_SPECIALIZATION` and `TraitFlags::BLAZE_SPECIALIZATION_TRAIT`).
@@ -131,6 +131,17 @@ impl DefMap {
                         | "nopanic"
                         | "noalloc"
                         | "nonblocking"
+                        // `hir-ty-pure`'s roles, from `AttrFlags::role_attr`
+                        // (docs/v2/plan/design/effect-summary.md).
+                        | "bounded_turn"
+                        | "answers_request"
+                        // `#[blaze::lock_checked]`, from `AttrFlags::LOCK_CHECKED`
+                        // (blaze-lints' `blaze::lock_order`).
+                        | "lock_checked"
+                        | "expect"
+                        // `#[blaze::may(..)]`, the deleted spelling of `expect`: inert here so
+                        // that it is refused by name, with the fix that respells it
+                        // (blaze-lints' `blaze::undeclared_effect`), not as an unresolved macro.
                         | "may"
                         | "effects"
                         | "specialization"
@@ -139,9 +150,16 @@ impl DefMap {
                         | "linear"
                         | "consumes"
                         | "holds"
+                        // `#[blaze::theorem]`, from `AttrFlags::THEOREM` (`hir-ty-lean`,
+                        // docs/v2/plan/design/proofs-for-sans-io.md).
+                        | "theorem"
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::edition = "2026.11"]`, the crate's blaze edition, read off
+                        // the root's tokens (`base_db::Crate::blaze_edition`,
+                        // docs/v2/plan/design/std.md, "The blaze edition: opting in").
+                        | "edition"
                         // `#![blaze::handles]`, from `DefMap::handles`, and the effect
                         // `#[blaze::norefcount]`, from `AttrFlags::NOREFCOUNT`
                         // (docs/v2/plan/design/edition.md, change 1).
@@ -193,6 +211,15 @@ impl DefMap {
                         // docs/v2/plan/design/facts.md). `Acyclic` has no attribute: it is
                         // derived by reflection (docs/v2/plan/design/ownership.md).
                         | "program_lifetime"
+                        // `#![blaze::canonical_cbor]` and `#[blaze::renders_positions]`, from
+                        // `AttrFlags::CANONICAL_CBOR` and `AttrFlags::RENDERS_POSITIONS`
+                        // (blaze-lints' `blaze::cbor_field_order` and `blaze::reads_positions`).
+                        | "canonical_cbor"
+                        | "renders_positions"
+                        // `#[blaze::invariant(..)]` on a struct, from
+                        // `AttrFlags::blaze_invariants` (`hir_ty_pure::refined`,
+                        // docs/v2/plan/design/refined-values.md).
+                        | "invariant"
                 )
             {
                 return true;

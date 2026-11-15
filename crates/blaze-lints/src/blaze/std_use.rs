@@ -322,7 +322,7 @@ pub(crate) const TABLE: &[Entry] = &[
     row(&[("std", "sync")], "std::sync", I::Types(&["Condvar", "Barrier"]), K::Ambient, "waits with no deadline or name", "`Signal` of `bstd::sync`, or a scope's `join(cx)`"),
     row(&[("std", "sync")], "std::sync", I::Types(&["Once", "OnceState"]), K::Ambient, "is one-time state nobody owns", "`Once<T>` of `bstd::sync`, a value to own and pass, never in a `static`"),
     row(&[("std", "hash"), ("std", "collections")], "std::hash", I::Types(&["RandomState", "DefaultHasher"]), K::Ambient, "seeds a hasher from the system's randomness, so a map's order differs from run to run", "`bstd::hash::FixedState`, the one fixed seed; under keys an attacker picks, `SipKey` from an `Rng`").covered(&[Lint::DefaultHasher]),
-    row(&[("std", "collections")], "std::collections", I::Types(&["HashMap", "HashSet"]), K::Ambient, "seeds its hasher from the system's randomness and allocates from the global heap", "`bstd::map::Map` and `bstd::set::Set`, made with `new_in(alloc)`").covered(&[Lint::DefaultHasher, Lint::ImplicitAllocator]),
+    row(&[("std", "collections")], "std::collections", I::Types(&["HashMap", "HashSet"]), K::Ambient, "seeds its hasher from the system's randomness and allocates from the global heap", "`bstd::map::HashMap` and `bstd::set::HashSet`, made with `new_in(alloc)`").covered(&[Lint::DefaultHasher, Lint::ImplicitAllocator]),
     row(&[("std", "random")], "std::random", I::AnyFn, K::Ambient, "takes randomness from the system", "take an `Rng` (`rng.next_u64()`, `rng.fill(..)`), which is seeded in a simulation"),
     // Renamed: one definition, bstd's name for it.
     row(&[("alloc", "sync")], "std::sync", I::Renamed(&["Arc"], &[("Arc", "bstd::sync::Shared")]), K::Renamed, ONE_NAME, ""),

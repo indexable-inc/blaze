@@ -672,12 +672,18 @@ fn layout_of_ty_in(
             let parent_args = GenericArgs::new_from_slice(args.parent_args());
             let owner = crate::mir::MirOwner::coroutine(db, id.0, args);
             let runtime = crate::mir::MirStage::Runtime;
-            let body = db
-                .monomorphized_mir(owner, runtime, parent_args.store(), trait_env.clone()) // clone: two `u32` handles
-                // alloc: an error's text, kept in the layout query's memo
-                .map_err(|error| {
-                    LayoutError::CoroutineBody(format!("{error:?}").into_boxed_str())
-                })?;
+            // Read once, for this layout, and dropped with it: the layout is the row a later
+            // build reads, never the instance's body ([`crate::providers::monomorphized_once`]).
+            let body = crate::providers::monomorphized_once(
+                db,
+                owner,
+                runtime,
+                &parent_args.store(),
+                &trait_env,
+            )
+            // alloc: an error's text, kept in the layout query's memo
+            .map_err(|error| LayoutError::CoroutineBody(format!("{error:?}").into_boxed_str()))?;
+            let body = &body;
             let held = body.held_locals_in(frame);
             let upvar_tys = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty());
             let mut upvars = Vec::with_capacity_in(upvar_tys.len(), frame);

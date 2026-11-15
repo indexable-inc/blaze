@@ -28,7 +28,7 @@ partial def answerAll (input : IO.FS.Stream) (output : IO.FS.Stream) : IO Unit :
   let line ← input.getLine
   if line.isEmpty then
     return ()
-  output.putStrLn (answer line.trimRight)
+  output.putStrLn (answer line.trimAsciiEnd.copy)
   answerAll input output
 
 def main : IO Unit := do

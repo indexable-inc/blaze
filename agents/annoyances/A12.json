@@ -7,5 +7,6 @@
  "cost": "small each time; a standing risk that the gate's check fails later",
  "cause": "generated docs need a working self-build",
  "workaround": "hand edit, say so in the PR",
- "state": "open"
+ "state": "open",
+ "class": "two answers to one question (A38): a generated file edited by hand beside its generator"
 }

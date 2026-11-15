@@ -354,12 +354,12 @@ fn proc_macros_are_a_crate_every_crate_depends_on() {
 #[test]
 fn every_test_proc_macro_is_there() {
     let fixture = db(r#"
-//- proc_macros: identity, derive_identity, input_replace, mirror, shorten, issue_18089, issue_18840, issue_17479, issue_18898, disallow_cfg, generate_suffixed_type
+//- proc_macros: identity, derive_identity, input_replace, mirror, shorten, issue_18089, issue_18840, issue_17479, issue_18898, disallow_cfg, generate_suffixed_type, pass
 //- /main.rs crate:main
 "#);
     let db = fixture.db();
     let loaded = ProcMacros::get_for_crate(db, named(db, "proc_macros")).expect("macros");
-    assert_eq!(loaded.macros().expect("they loaded").len(), 11);
+    assert_eq!(loaded.macros().expect("they loaded").len(), 12);
 }
 
 #[test]

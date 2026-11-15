@@ -72,6 +72,10 @@ pub fn boot() -> Option<&'static str> {
 /// is not the image loaded (its build id differs: replaced since).
 pub fn blake3(image: &Image) -> Result<String, String> {
     // alloc: once a process
+    #[expect(
+        blaze::process_static,
+        reason = "one hash per loaded image (base, path), bounded by the images the process maps"
+    )]
     static HASHED: Lock<BTreeMap<(u64, String), Result<String, String>>> =
         Lock::new("ixprof.images.hashed", BTreeMap::new());
     let key = (image.base, image.path.clone());

@@ -20,28 +20,44 @@
 //! (the tree and an element's number), and the subtree a view stands for is the elements
 //! `index() .. index() + len()`.
 //!
+//! A macro's output is a tree too, not text: a [`Builder`] opens a node of a [`Kind`], writes a
+//! token (its text and a [`Span`] of the call's table), splices a node or token of its input by
+//! reference (the input's element, with its spans), and closes; [`Builder::finish`] gives the
+//! [`Built`] arrays the host reads back, which a const macro returns as an [`Output`]. The host
+//! parses the output's tokens once and refuses a tree that is not their parse, so the parser
+//! stays the grammar's one home. `quote!` is the library authors write on the builder.
+//!
 //! `tests` compares every view with `syntax::ast`'s accessor of the same name, on every node of
-//! the files of real crates; `crates/hir-ty-mir`'s `const_ast` test runs the views in the
-//! evaluator and compares what they read with the same code compiled.
+//! the files of real crates, and rebuilds every item of them through the builder;
+//! `crates/hir-ty-mir`'s `const_ast` test runs the views in the evaluator and compares what they
+//! read with the same code compiled.
 
 #![no_std]
-#![forbid(unsafe_code)]
+// The const heap a growing `Builder` writes into is reached through `const_allocate` and
+// `transmute`: only in the macro graph (`cfg(blaze_const_eval)`, which blaze sets and cargo
+// never does), and there only in `builder::heap`, which says why each block is sound.
+#![cfg_attr(not(blaze_const_eval), forbid(unsafe_code))]
+#![cfg_attr(blaze_const_eval, deny(unsafe_code))]
+#![cfg_attr(blaze_const_eval, feature(intrinsics))]
 
+mod builder;
 mod kinds;
 mod views;
 
 #[cfg(test)]
 mod tests;
 
+pub use builder::*;
 pub use views::*;
 
 /// The crate's files, by their path from its root: what blaze puts in a const macro's crate
 /// graph, so that the views a macro reads its input with are the code that wrote the input.
 #[cfg(feature = "source")]
-pub const SOURCE: [(&str, &str); 3] = [
+pub const SOURCE: [(&str, &str); 4] = [
     ("lib.rs", include_str!("lib.rs")),
     ("kinds.rs", include_str!("kinds.rs")),
     ("views.rs", include_str!("views.rs")),
+    ("builder.rs", include_str!("builder.rs")),
 ];
 
 /// Set on the kind of an element that is a token. A node and a token can have the same
@@ -51,9 +67,17 @@ pub const TOKEN: u16 = 1 << 15;
 /// The span index of an element that has none of its own (a node).
 pub const NO_SPAN: u32 = !0;
 
+/// Set on the kind of an output element that is a splice: the element is element `spans[i]` of
+/// input `kind & !SPLICE` (the [`Tree::input`] number of the tree it came from), copied with
+/// its subtree and spans by the host. Only in a [`Built`], never in a [`Tree`].
+pub const SPLICE: u16 = 1 << 14;
+
 /// A flat syntax tree: element `i` is `kinds[i]` (with [`TOKEN`] set for a token), ends at
 /// `ends[i]` (the number after its subtree), has the span `spans[i]` and, if it is a token,
 /// the text `texts[i]`. Element 0 is the root.
+///
+/// `input` is which of the macro's parameters the tree is (0 for the first), so a splice of
+/// one of its elements names it.
 ///
 /// The layout is `repr(C)` so that a host can write one into the evaluator's memory.
 #[repr(C)]
@@ -63,6 +87,7 @@ pub struct Tree<'a> {
     ends: &'a [u32],
     spans: &'a [u32],
     texts: &'a [&'a str],
+    input: u32,
 }
 
 impl<'a> Tree<'a> {
@@ -81,7 +106,12 @@ impl<'a> Tree<'a> {
         if len == 0 || ends.len() != len || spans.len() != len || texts.len() != len {
             panic!("a flat tree's arrays are as long as each other and not empty");
         }
-        Tree { kinds, ends, spans, texts }
+        Tree { kinds, ends, spans, texts, input: 0 }
+    }
+
+    /// Which of the macro's parameters it is: what a splice of one of its elements names.
+    pub const fn input(&self) -> u32 {
+        self.input
     }
 
     /// How many nodes and tokens the tree has.
@@ -219,9 +249,9 @@ impl<'a> Token<'a> {
         self.tree.texts[self.at as usize]
     }
 
-    /// The index of its span in the call's span table.
-    pub const fn span(self) -> u32 {
-        self.tree.spans[self.at as usize]
+    /// Its span, an index into the call's span table.
+    pub const fn span(self) -> Span {
+        Span(self.tree.spans[self.at as usize])
     }
 
     /// The element's number.
@@ -314,3 +344,124 @@ pub const fn str_eq(a: &str, b: &str) -> bool {
     }
     true
 }
+
+/// A span: an index into the call's span table, whose first three are the call's sites
+/// ([`Span::def_site`], [`Span::call_site`], [`Span::mixed_site`]) and the rest the input's
+/// tokens' spans. A macro gets one from a site or from a token of its input; it cannot make,
+/// join or look into one, and the host refuses an index past the table by name.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Span(u32);
+
+impl Span {
+    /// The macro's definition (unstable in rustc; allowed here): names resolve where the macro
+    /// is written.
+    pub const fn def_site() -> Span {
+        Span(0)
+    }
+
+    /// The call: names resolve as if the caller had written the token.
+    pub const fn call_site() -> Span {
+        Span(1)
+    }
+
+    /// `macro_rules!` hygiene: locals and labels resolve at the definition, everything else at
+    /// the call. What a macro should write its own tokens with.
+    pub const fn mixed_site() -> Span {
+        Span(2)
+    }
+
+    /// Its index in the call's span table.
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// A node kind, for [`Builder::open`]: `Kind::STRUCT`, `Kind::IMPL`, one constant for every
+/// node kind of the grammar, named as `SyntaxKind` names it. Opaque, so that no macro matches
+/// on a number the grammar can move.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Kind(pub(crate) u16);
+
+/// What an output is, which the host parses it as: items (a derive's, an attribute's, an
+/// item-position call's), statements, an expression, a type or a pattern.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum Entry {
+    Items = 0,
+    Stmts = 1,
+    Expr = 2,
+    Type = 3,
+    Pat = 4,
+}
+
+/// A built tree, what [`Builder::finish`] gives: element `i` is `kinds[i]` (a node kind, or
+/// [`TOKEN`] for a written token, or [`SPLICE`] with the input's number for a splice), the
+/// `sizes[i]` elements from `i` are its subtree (relative, so a run of elements means the same
+/// wherever it is), `spans[i]` is a token's span index, a splice's element number in its
+/// input, or [`NO_SPAN`] for a node, and `texts[i]` is a written token's text (empty
+/// otherwise). The arrays are as long as each other.
+///
+/// The layout is `repr(C)`, nine words, so that the host reads one out of the evaluator's
+/// memory.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Built<'a> {
+    kinds: &'a [u16],
+    sizes: &'a [u32],
+    spans: &'a [u32],
+    texts: &'a [&'a str],
+    entry: Entry,
+}
+
+/// What a const macro returns: a derive is `const fn(&const_ast::Item) -> const_ast::Output`,
+/// an attribute `(&const_ast::TokenTree, &const_ast::Item)`, a function-like macro
+/// `(&const_ast::TokenTree)`.
+pub type Output = Built<'static>;
+
+impl<'a> Built<'a> {
+    /// How many elements it has.
+    pub const fn len(&self) -> u32 {
+        self.kinds.len() as u32
+    }
+
+    /// Whether it has none (a derive that writes nothing).
+    pub const fn is_empty(&self) -> bool {
+        self.kinds.len() == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kinds(&self) -> &'a [u16] {
+        self.kinds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sizes(&self) -> &'a [u32] {
+        self.sizes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spans(&self) -> &'a [u32] {
+        self.spans
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texts(&self) -> &'a [&'a str] {
+        self.texts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry(&self) -> Entry {
+        self.entry
+    }
+}
+
+/// `const_ast::quote!(b, items => impl Named for #name { .. })`: tokens checked by blaze's
+/// parser where the macro is written and lowered by the host to calls on the builder `b`. The
+/// declaration of the proc-macro crate `const_ast_quote`, which blaze makes from this file.
+#[cfg(blaze_const_quote)]
+#[proc_macro]
+pub fn quote(_input: ()) {}
+
+#[cfg(all(blaze_const_eval, not(blaze_const_quote)))]
+pub use const_ast_quote::quote;

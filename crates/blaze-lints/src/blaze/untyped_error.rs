@@ -13,7 +13,7 @@ use hir::{AsAssocItem as _, HirDisplay as _};
 use hir_def::lang_item::lang_items;
 use syntax::view::{self as ast, AstNode as _};
 
-use super::{Lint, facts};
+use super::{Lint, facts, library_code};
 use crate::check::Cx;
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, f: ast::Fn<'t>) {
@@ -22,13 +22,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, f: ast::Fn<'t>) {
     }
     let db = cx.db();
     let Some(func) = cx.fn_def(f) else { return };
-    let module = func.module(db);
-    let checked = match cx.krate().target_kind(db) {
-        base_db::TargetKind::Lib { .. } => true,
-        base_db::TargetKind::Bin | base_db::TargetKind::Example => !module.is_crate_root(db),
-        _ => false,
-    };
-    if !checked || func.as_assoc_item(db).is_some_and(|it| it.implemented_trait(db).is_some()) {
+    if !library_code(cx, func.module(db))
+        || func.as_assoc_item(db).is_some_and(|it| it.implemented_trait(db).is_some())
+    {
         return;
     }
     if cx.is_in_test(f.syntax()) {

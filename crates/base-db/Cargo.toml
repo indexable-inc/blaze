@@ -27,7 +27,6 @@ indexmap.workspace = true
 inventory.workspace = true
 
 # local deps
-blaze-bytes.workspace = true
 blaze-dbsp.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
@@ -43,8 +42,8 @@ intern.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-sim.workspace = true
 crossbeam-channel.workspace = true
-hegeltest.workspace = true
 
 [lints]
 workspace = true

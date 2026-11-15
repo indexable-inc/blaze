@@ -1,0 +1,57 @@
+// Lesson: blaze's attribute extensions, all behind `#![register_tool(blaze)]`: linear types (`#[blaze::linear]`,
+// checked on MIR by crates/hir-ty-linear; docs/v2/plan/design/linear.md), effects (`#[blaze::may(..)]`,
+// crates/blaze-lints/src/blaze/may.rs; effects.md; ledger E11) and purity (`#[blaze::pure]`, crates/hir-ty/src/facts.rs).
+// Designs are `status: plan`; say so.
+site {
+  learn {
+    extensions : Page {
+      Narrow
+      Lesson: {7, "Say what a function may do, and what a value must not be dropped without.", "contract"}
+      (InTheme, themes.beyond)
+      (Requires, site.learn.const_exprs)
+      Title: {"Effects and linear types"}
+      Description: {"blaze's opt-in extensions: linear types that can't be forgotten, effects a signature lists, and pure functions."}
+
+      Step idea("A signature that tells the truth") {
+        P sig("A Rust signature doesn't say whether a function can panic, allocate or block. blaze lets you say it, and checks it.")
+        Code opt(lang: "rust", text: `#![feature(register_tool)]
+        #![register_tool(blaze)]`)
+      }
+
+      Step effects("Effects") {
+        Art tree(piece: "effects", label: "A call tree. A call far below blocks; the effect climbs the wires to the top function, whose promise breaks.")
+        Code parse(lang: "rust", text: `#[blaze::may(alloc)]
+        pub fn parse(text: &str) -> Tree \{ ... }`)
+        P may("Anything not listed is refused, **in every function it calls** too.")
+      }
+
+      Step effects_q("Check: effects") {
+        Quiz q(prompt: "`render` is marked `#[blaze::may(alloc)]` and calls `log`, which can block on a file write. What happens?") {
+          Choice ok("It builds: only `render`'s own body is checked.", "The check follows calls. A blocking call anywhere below `render` breaks its promise.")
+          Choice err("The build fails, naming the call to `log` and the effect it adds: block.", "Right. The list is checked through every call, and the error names where it broke.") {
+            Right
+          }
+          Choice warn("It builds, with a warning at run time.", "It's a compile-time check: nothing extra runs in your program.")
+        }
+      }
+
+      Step linear("Linear types") {
+        Code txn(lang: "rust", text: `#[blaze::linear]
+        pub struct Txn \{ id: u32 }
+
+        impl Txn \{
+            #[blaze::consumes] pub fn commit(self) \{}
+        }`)
+        P must("A linear value can't be quietly dropped: every path out, `?` included, must use it up.")
+      }
+
+      Step pure("Pure functions") {
+        P pure("`#[blaze::pure]`: reads the world only through its arguments. Checked through every call, so its result can be reused.")
+      }
+
+      Step status("Where it stands") {
+        P now("Experimental: written and used by blaze's own crates first. Designs: [the RFCs](/rfcs).")
+      }
+    }
+  }
+}

@@ -73,7 +73,7 @@ impl Drop for Held {
 }
 
 fn put(n: u32) -> Put {
-    Put { key: Key(id("blaze-lazy test put", n)), kind: Kind::Code, bytes: vec![n as u8] }
+    Put { key: Key(id("blaze-lazy test put", n)), kind: Kind::Code, bytes: vec![n as u8], of: None }
 }
 
 fn made(at: InstanceKey, puts: u32) -> Kept {

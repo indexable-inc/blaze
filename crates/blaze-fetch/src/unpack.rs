@@ -918,7 +918,7 @@ mod tests {
                 "`..`",
                 vec![raw(Directory, "top/", "", b""), raw(Regular, "top/../escaped", "", b"x")],
             ),
-            ("absolute", vec![raw(Regular, "/tmp/escaped", "", b"x")]),
+            ("absolute", vec![raw(Regular, "/blaze-nowhere/escaped", "", b"x")]),
             ("link out", vec![ok(), raw(Symlink, "top/lib/out", "../../..", b"")]),
             (
                 "link through a link",

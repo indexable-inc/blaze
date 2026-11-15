@@ -1162,7 +1162,7 @@ fn selftest(p: &Patterns) {
     expect(refused(p, &changed(&|d| d["rewrites"][0]["colour"] = json!("red")), "no field"), "an unknown field is refused");
 
     {
-        let tmp = TempDir::new("tmp").unwrap_or_else(|e| blaze_script::fail(SCRIPT, &e));
+        let tmp = TempDir::new("tmp").unwrap_or_else(|e| blaze_script::fail(SCRIPT, &e.to_string()));
         let root = tmp.path();
         let mut missing = stale(&files, root);
         missing.sort();

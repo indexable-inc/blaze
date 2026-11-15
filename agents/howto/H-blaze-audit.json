@@ -1,0 +1,9 @@
+{
+ "id": "H-blaze-audit",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-audit",
+ "task": "Build a workspace with a git dependency, or audit a workspace's dependencies, under strong source pins",
+ "do": "Run `blaze audit pin` at the workspace root. It fetches each git source's tree fresh, hashes it, and writes `[git.\"<url>\"] <commit> = \"blake3:...\"` into blaze.lock. Review the printed digests and the file's diff, then commit it. To audit, clone https://github.com/rustsec/advisory-db somewhere, set `[workspace.metadata.blaze.audit] database = \"<dir>\"` (or BLAZE_AUDIT_DB), run `blaze audit pin` again to pin the database's tree, then run `blaze audit` (or `--json`, with `--today YYYY-MM-DD` for a reproducible report). Accept a known finding with `accept = [{ id = \"RUSTSEC-...\", reason = \"...\", until = \"YYYY-MM-DD\" }]`. All the logic is in crates/blaze-audit (sans-IO, tests in src/tests.rs); the drivers are crates/blaze-cargo/src/cli/audit.rs, blaze-units load/source.rs (`require_git`) and blaze-cargo serve/fetch/git.rs (`verify_git`).",
+ "why": "A commit id is SHA-1, which is no pin: a git dependency whose tree digest blaze.lock does not record is refused at load (rule `weak_source_pin`), and a fetched tree that differs from its pin is refused before it is mounted. The advisory database is a pinned input too, so its tree must match before it is parsed. docs/v2/plan/design/audit.md has the formats and the threat model.",
+ "state": "current"
+}

@@ -19,6 +19,20 @@ pub fn wasm_macro(unit: &Unit, plan: &UnitPlan) -> bool {
     plan.macro_wasm && unit.target.is_proc_macro() && !super::crates::is_test(unit, plan)
 }
 
+/// Whether `unit` is a program of a blaze edition (docs/v2/plan/design/std.md, "The blaze
+/// edition: opting in"): a binary or an example of a package whose `edition` is a blaze
+/// edition's, not built as a test. Its root has its entry appended (`hir_ty::entry::module`,
+/// the `main` that calls the crate's own with the roots it takes), so its crate's root is an
+/// alias of its own. A unit whose edition blaze does not know is none here: the lowering
+/// refuses it by name where it reads the edition.
+pub fn edition_program(unit: &Unit, plan: &UnitPlan) -> bool {
+    let program = unit.target.kind.iter().any(|it| it == "bin" || it == "example")
+        && unit.target.crate_types.iter().any(|it| it == "bin")
+        && !unit.is_std
+        && !super::crates::is_test(unit, plan);
+    program && matches!(span::BlazeEdition::from_manifest(&unit.target.edition), Ok(Some(_)))
+}
+
 /// What a crate's root is to be: the file on disk, then `after`, the module named `module`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Appended {
@@ -123,6 +137,8 @@ impl Lowered {
                 continue;
             }
             made.insert(file);
+            // Its root's text is another: what a record carried of its texts is let go.
+            self.carried.remove(&krate);
             self.appended.insert(file, (unit, asked));
             if self.db.file_text(file).content(&self.db) != before {
                 written += 1;
@@ -130,6 +146,8 @@ impl Lowered {
         }
         if written > 0 {
             self.identities.clear();
+            // In this batch: a root with a module appended is another text of its crate.
+            self.give_surfaces();
         }
         written
     }
@@ -158,7 +176,6 @@ impl Lowered {
 /// i18n-embed): waiting for it left the crate's wasm module without its glue, built and
 /// linked, and every `fl!` failed on a module with no `blaze_proc_macro_alloc`.
 pub fn macros_loaded(db: &Db, krate: Crate) -> bool {
-    let by_crate = ProcMacros::get(db).by_crate(db);
     // alloc: once a test crate a write, its closure walked
     let mut seen: HashSet<Crate, Global> = HashSet::new_in(Global);
     let mut stack = vec![krate]; // alloc: as `seen`
@@ -167,7 +184,7 @@ pub fn macros_loaded(db: &Db, krate: Crate) -> bool {
             if !seen.insert(dep.crate_id) {
                 continue;
             }
-            let unbuilt = by_crate.get(&dep.crate_id).is_some_and(|it| {
+            let unbuilt = ProcMacros::given(db, dep.crate_id).is_some_and(|it| {
                 matches!(it.get_error(), Some(base_db::ProcMacroLoadingError::NotYetBuilt))
             });
             if unbuilt {

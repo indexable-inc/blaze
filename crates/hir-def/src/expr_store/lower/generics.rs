@@ -44,15 +44,49 @@ pub enum ImplTraitLowering<'l> {
     /// written, a `TypeRef::ImplTrait`, for the type lowering to refuse with E0562.
     Error,
     /// An argument's: a new type parameter of the generics being collected, its bounds that
-    /// parameter's where predicates.
+    /// parameter's where predicates. With `anonymous` (a function's parameter types, with
+    /// `#![feature(blaze_anon_params)]`), a `_` is a new parameter too ([`Self::anonymous`]).
     Argument {
         type_or_consts: &'l mut Arena<TypeOrConstParamData>,
         where_predicates: &'l mut Vec<WherePredicate>,
         parent: GenericDefId,
+        anonymous: bool,
+    },
+    /// An impl's self type or trait, with `#![feature(blaze_anon_params)]`: an `impl Trait` as
+    /// [`ImplTraitLowering::Opaque`] (`opaque`) or [`ImplTraitLowering::Error`], and a `_` a new
+    /// parameter of the impl ([`Self::anonymous`]).
+    ImplHeader {
+        type_or_consts: &'l mut Arena<TypeOrConstParamData>,
+        parent: GenericDefId,
+        opaque: bool,
     },
 }
 
 impl ImplTraitLowering<'_> {
+    /// A `_` written where this lowers types: a new type parameter of the item, unnamed
+    /// (`TypeParamProvenance::Anonymous`), where `_` is one (docs/v2/plan/design/implied-bounds.md);
+    /// `None` elsewhere, where it stays the placeholder it is in Rust.
+    pub(crate) fn anonymous(
+        &mut self,
+        ec: &mut ExprCollector<'_>,
+        ptr: TypePtr,
+    ) -> Option<TypeRefId> {
+        let (type_or_consts, parent) = match self {
+            ImplTraitLowering::Argument { type_or_consts, parent, anonymous: true, .. }
+            | ImplTraitLowering::ImplHeader { type_or_consts, parent, .. } => {
+                (type_or_consts, *parent)
+            }
+            _ => return None,
+        };
+        let param =
+            TypeParamData { name: None, default: None, provenance: TypeParamProvenance::Anonymous };
+        let param_id = TypeRef::TypeParam(TypeParamId::from_unchecked(TypeOrConstParamId {
+            parent,
+            local_id: type_or_consts.alloc(param.into()),
+        }));
+        Some(ec.alloc_type_ref(param_id, ptr))
+    }
+
     pub(crate) fn lower(
         &mut self,
         ec: &mut ExprCollector<'_>,
@@ -60,13 +94,19 @@ impl ImplTraitLowering<'_> {
         bounds: ListMark,
     ) -> TypeRefId {
         match self {
+            ImplTraitLowering::ImplHeader { opaque: true, .. } => {
+                ImplTraitLowering::Opaque.lower(ec, ptr, bounds)
+            }
+            ImplTraitLowering::ImplHeader { opaque: false, .. } => {
+                ImplTraitLowering::Error.lower(ec, ptr, bounds)
+            }
             ImplTraitLowering::Opaque | ImplTraitLowering::Error => {
                 let id = ec.with_lists(bounds, |ec, lists| {
                     ec.store.alloc_type_ref(TypeRef::ImplTrait(lists.bounds_since(bounds)))
                 });
                 ec.map_type_ref(id, ptr, false)
             }
-            ImplTraitLowering::Argument { type_or_consts, where_predicates, parent } => {
+            ImplTraitLowering::Argument { type_or_consts, where_predicates, parent, .. } => {
                 let param = TypeParamData {
                     name: None,
                     default: None,
@@ -148,12 +188,34 @@ impl GenericParamsCollector {
         }
     }
 
+    /// `cb` with the lowering of a function's parameter types: an `impl Trait` is a new
+    /// parameter, and so is a `_` with `#![feature(blaze_anon_params)]`.
     pub(crate) fn collect_impl_trait<R>(
         &mut self,
         ec: &mut ExprCollector<'_>,
         cb: impl FnOnce(&mut ExprCollector<'_>, &mut ImplTraitLowering<'_>) -> R,
     ) -> R {
-        cb(ec, &mut self.argument_impl_trait())
+        let anonymous = ec.features().blaze_anon_params;
+        cb(ec, &mut self.argument_impl_trait(anonymous))
+    }
+
+    /// `cb` with the lowering of an impl's header with `#![feature(blaze_anon_params)]`: a `_`
+    /// is a new parameter of the impl, after those its parameter list names, and an
+    /// `impl Trait` is lowered as `opaque` says ([`ImplTraitLowering::ImplHeader`]).
+    pub(crate) fn collect_impl_header<R>(
+        &mut self,
+        ec: &mut ExprCollector<'_>,
+        opaque: bool,
+        cb: impl FnOnce(&mut ExprCollector<'_>, &mut ImplTraitLowering<'_>) -> R,
+    ) -> R {
+        cb(
+            ec,
+            &mut ImplTraitLowering::ImplHeader {
+                type_or_consts: &mut self.type_or_consts,
+                parent: self.parent,
+                opaque,
+            },
+        )
     }
 
     pub(crate) fn finish(self) -> GenericParams {
@@ -343,7 +405,7 @@ impl GenericParamsCollector {
         binder: BinderParams,
         target: Either<TypeRefId, LifetimeRefId>,
     ) {
-        let bound = ec.lower_type_bound(bound, &mut self.argument_impl_trait());
+        let bound = ec.lower_type_bound(bound, &mut self.argument_impl_trait(false));
         let predicate = match (target, bound) {
             (_, TypeBound::Error | TypeBound::Use(_)) => return,
             (Either::Left(type_ref), bound) => WherePredicate::TypeBound {
@@ -363,11 +425,14 @@ impl GenericParamsCollector {
         self.where_predicates.push(predicate);
     }
 
-    fn argument_impl_trait(&mut self) -> ImplTraitLowering<'_> {
+    /// The lowering of an argument's `impl Trait`; `anonymous` where a `_` is a parameter too
+    /// (a function's parameter types, never a bound or a where clause).
+    fn argument_impl_trait(&mut self, anonymous: bool) -> ImplTraitLowering<'_> {
         ImplTraitLowering::Argument {
             type_or_consts: &mut self.type_or_consts,
             where_predicates: &mut self.where_predicates,
             parent: self.parent,
+            anonymous,
         }
     }
 

@@ -1,124 +1,168 @@
-//! Which slot a shape takes among those of its key, for the goal store's flush and the item
-//! store's (`crate::body_store`): one key (a goal's, or a body's step's base key) keeps a few
-//! shapes at once, each in a slot of its own, and a flush places each shape it writes in the
-//! first slot that holds it or is free.
+//! How the goal store and the item store (`crate::body_store`) keep their records in the
+//! driver's store: both are `blaze_record`'s form (a base key, read-lists called **shapes** in
+//! a chain of slots under it, an answer under a shape's bytes and its facts' values), and this
+//! is what they share over it: the driver's store as `blaze_record` reads and writes it
+//! ([`Records`], with where its lookups are counted), the name a shape has for a fact ([`fact_name`], [`fact_of`]), the placing of
+//! one key's shapes by one flush ([`filing`]), the order a flush writes in ([`groups`]) and
+//! the words of an error ([`Refused`]).
 //!
 //! One flush can write several shapes of one key: two bodies alike enough to share an identity
 //! whose steps read different facts, a goal evaluated again after a write. So a flush places
 //! the entries of one key one after another, in an order that is of their bytes alone
-//! ([`groups`]), against what the flush itself placed before ([`Claimed`]): the store's `get`
-//! need not show a put the driver has not made yet (blaze-cargo's buffers every put until the
-//! flush has ended), and which slot a shape takes must not depend on which thread wrote first.
+//! ([`groups`]), against what the flush itself placed before (`blaze_record::Filing`): the
+//! store's `get` need not show a put the driver has not made yet (blaze-cargo's buffers every
+//! put until the flush has ended), and which slot a shape takes must not depend on which
+//! thread wrote first.
 
 use std::{cmp::Ordering, ops::Range};
 
 use blaze_ids::ContentId;
-use hir_def::deps::ImageStore;
+use blaze_query::QueryKind;
+use blaze_record::{Bounds, Doing, Filing, Kind};
+use hir_def::deps::{ImageBuf, ImageStore};
 
-/// The shapes one flush found or put in the slots of one key, by slot.
-pub(crate) struct Claimed<'a, const SLOTS: usize> {
-    shapes: [Option<&'a [u8]>; SLOTS],
-    /// The planted bug of the flush's control: nothing placed is remembered, so the second
-    /// shape of a key is placed against the store alone.
-    #[cfg(test)]
-    forgetful: bool,
+use super::{FactObject, FactRef};
+
+/// The driver's store as `blaze_record` reads and writes a record's parts. `at` gives the key
+/// the store keeps a part under, from the part's own key: the goal store's is that key, the
+/// item store's is under its step, a shape and an answer apart. `tally` is where the lookups
+/// through it are counted: the goal store's one, the item store's of that step.
+pub(crate) struct Records<'a, At> {
+    // dyn: the driver's store, as the stores that flush hold it
+    pub(crate) images: &'a dyn ImageStore,
+    pub(crate) at: At,
+    pub(crate) tally: &'a blaze_record::Tally,
 }
 
-/// Where a shape was placed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Slot {
-    pub(crate) n: u32,
-    /// Whether this placing put the shape, or the slot held it already.
-    pub(crate) written: bool,
+impl<At: Fn(Kind, &ContentId) -> ContentId> blaze_record::Store for Records<'_, At> {
+    type Held = ImageBuf;
+    type Error = String;
+
+    fn get(&self, kind: Kind, key: &ContentId) -> Result<Option<ImageBuf>, String> {
+        self.images.get(&(self.at)(kind, key))
+    }
+
+    fn put(&self, kind: Kind, key: ContentId, bytes: &[u8]) -> Result<(), String> {
+        // alloc: the bytes of a shape or an answer, once per one written
+        self.images.put((self.at)(kind, &key), bytes.to_vec())
+    }
+
+    fn bytes(held: &ImageBuf) -> &[u8] {
+        held.bytes()
+    }
+
+    fn tally(&self) -> &blaze_record::Tally {
+        self.tally
+    }
 }
 
-/// Why a shape could not be placed: what the flush was `doing` and the store's reason.
+/// A fact as a shape names it: its kind, its object's tag, a pad byte, its subject, then its
+/// object (a field as its first four bytes, the rest zero). Every number is little-endian.
+pub(crate) const FACT_BYTES: usize = 2 + 1 + 1 + 32 + 32;
+
+/// The name a shape has for `fact`: what `blaze_record` keeps as a read's name.
+pub(crate) fn fact_name(fact: &FactRef) -> [u8; FACT_BYTES] {
+    let mut bytes = [0; FACT_BYTES];
+    bytes[..2].copy_from_slice(&fact.kind.0.to_le_bytes());
+    bytes[4..36].copy_from_slice(&fact.subject.0);
+    match fact.object {
+        FactObject::None => bytes[2] = 0,
+        FactObject::Field(field) => {
+            bytes[2] = 1;
+            bytes[36..40].copy_from_slice(&field.to_le_bytes());
+        }
+        FactObject::Id(id) => {
+            bytes[2] = 2;
+            bytes[36..].copy_from_slice(&id.0);
+        }
+    }
+    bytes
+}
+
+/// The fact a shape names `name`: [`fact_name`]'s inverse, refusing every other name.
+pub(crate) fn fact_of(name: &[u8]) -> Result<FactRef, &'static str> {
+    let Ok(bytes) = <&[u8; FACT_BYTES]>::try_from(name) else {
+        return Err("a fact's name is not a fact's length");
+    };
+    let id = |at: usize| ContentId(bytes[at..at + 32].try_into().expect("32 bytes"));
+    let kind = QueryKind(u16::from_le_bytes([bytes[0], bytes[1]]));
+    let rest_zero = |from: usize| bytes[from..].iter().all(|&b| b == 0);
+    if bytes[3] != 0 {
+        return Err("a fact's pad byte is not zero");
+    }
+    let object = match bytes[2] {
+        0 if rest_zero(36) => FactObject::None,
+        1 if rest_zero(40) => {
+            FactObject::Field(u32::from_le_bytes(bytes[36..40].try_into().expect("4 bytes")))
+        }
+        2 => FactObject::Id(id(36)),
+        0 | 1 => return Err("a fact's object has bytes past its end"),
+        _ => return Err("a fact's object has an unknown tag"),
+    };
+    Ok(FactRef { kind, subject: id(4), object })
+}
+
+/// The placing of the shapes of the key `base` by one flush, one after another: what it
+/// placed before is looked at before the store.
+#[cfg(not(test))]
+pub(crate) fn filing<'a>(base: ContentId) -> Filing<'a> {
+    Filing::new(base, Bounds::STANDARD)
+}
+
+/// As above; on a thread whose control set [`FORGETFUL`], the planted bug.
+#[cfg(test)]
+pub(crate) fn filing<'a>(base: ContentId) -> Filing<'a> {
+    let filing = Filing::new(base, Bounds::STANDARD);
+    match FORGETFUL.get() {
+        true => filing.planted_forgetful(),
+        false => filing,
+    }
+}
+
+/// How many shapes a key's chain holds at its bound, where [`filing`]'s placing says
+/// `blaze_record::Placed::Full`.
+pub(crate) fn full_chain() -> u32 {
+    Bounds::STANDARD.width() * Bounds::STANDARD.generations()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a control on its own thread: every [`filing`] made on it forgets what it placed,
+    /// so the second shape of a key is placed against the store alone.
+    pub(crate) static FORGETFUL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Why a record was not read or kept: what the store was `doing` and the reason. `doing` ends
+/// where the store names its thing (a goal, a step of a body).
 #[derive(Debug)]
 pub(crate) struct Refused {
     pub(crate) doing: &'static str,
     pub(crate) why: String,
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Set by a control on its own thread: every [`Claimed`] made on it forgets what it placed.
-    pub(crate) static FORGETFUL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-impl<'a, const SLOTS: usize> Claimed<'a, SLOTS> {
-    pub(crate) fn new() -> Claimed<'a, SLOTS> {
-        Claimed {
-            shapes: [None; SLOTS],
-            #[cfg(test)]
-            forgetful: FORGETFUL.get(),
-        }
-    }
-
-    #[cfg(test)]
-    fn forgets(&self) -> bool {
-        self.forgetful
-    }
-
-    #[cfg(not(test))]
-    fn forgets(&self) -> bool {
-        false
-    }
-
-    fn remember(&mut self, n: usize, shape: &'a [u8]) {
-        if !self.forgets() {
-            self.shapes[n] = Some(shape);
-        }
-    }
-
-    /// Places `shape` in the first slot that holds it or is free, `at(n)` the store key of slot
-    /// `n`: `None` when every slot holds another shape.
-    ///
-    /// A slot this flush placed a shape in is known from here; any other is read from the
-    /// store, and a free one is put. A put the store refuses is read again: another writer's
-    /// shape kept in between takes the slot, and this one goes on to the next.
-    pub(crate) fn claim(
-        &mut self,
-        // dyn: the driver's store, as the stores that flush hold it
-        images: &dyn ImageStore,
-        shape: &'a [u8],
-        at: impl Fn(u32) -> ContentId,
-    ) -> Result<Option<Slot>, Refused> {
-        for n in 0..SLOTS {
-            let slot = u32::try_from(n).expect("a few slots");
-            match self.shapes[n] {
-                Some(placed) if placed == shape => return Ok(Some(Slot { n: slot, written: false })),
-                Some(_) => continue,
-                None => {}
-            }
-            let key = at(slot);
-            let read = || {
-                images.get(&key).map_err(|why| Refused { doing: "reading the shape of", why })
-            };
-            match read()? {
-                Some(kept) if kept.bytes() == shape => {
-                    self.remember(n, shape);
-                    return Ok(Some(Slot { n: slot, written: false }));
-                }
-                Some(_) => continue,
-                None => {}
-            }
-            // alloc: the shape's bytes, once per shape written
-            match images.put(key, shape.to_vec()) {
-                Ok(()) => {
-                    self.remember(n, shape);
-                    return Ok(Some(Slot { n: slot, written: true }));
-                }
-                Err(why) => match read()? {
-                    Some(kept) if kept.bytes() == shape => {
-                        self.remember(n, shape);
-                        return Ok(Some(Slot { n: slot, written: false }));
-                    }
-                    Some(_) => continue,
-                    None => return Err(Refused { doing: "keeping the shape of", why }),
+impl From<blaze_record::Error<String>> for Refused {
+    fn from(error: blaze_record::Error<String>) -> Refused {
+        match error {
+            blaze_record::Error::Store { doing, error, key: _ } => Refused {
+                doing: match doing {
+                    Doing::ReadingList => "reading the shape of",
+                    Doing::KeepingList => "keeping the shape of",
+                    Doing::ReadingAnswer => "reading the answer of",
+                    Doing::KeepingAnswer => "keeping the answer of",
                 },
-            }
+                why: error,
+            },
+            blaze_record::Error::List { at, why } => Refused {
+                doing: "opening the shape of",
+                // alloc: error text
+                why: format!("generation {} slot {} of its chain holds {why}", at.generation, at.n),
+            },
+            blaze_record::Error::TwoAnswers { key: _ } => Refused {
+                doing: "two answers under the same fact values of",
+                // alloc: error text
+                why: String::from("the work read something its facts do not cover"),
+            },
         }
-        Ok(None)
     }
 }
 

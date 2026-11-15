@@ -29,7 +29,11 @@ use crate::span;
 /// last typed column of the span registry, nullable and at the table's end: a file from before
 /// reads it as null through the table's schema file. Still 5 with `spans.owned_by` after it
 /// (2026-11-11), who ends a `wait`, said by every one: null in a file from before, where a null
-/// `owner` meant "not known".
+/// `owner` meant "not known". Still 5 with `query_counts`' validity census (2026-11-12:
+/// `proved_*`, `edge_*` and `edges_compared`), nullable and at the table's end: null in a file
+/// from before, where nothing counted them. Still 5 with `builds.solo_slot` and
+/// `solo_certified_by` (2026-11-12), a solo answer's build, nullable and at the table's end:
+/// null in a file from before, where every build was a daemon's.
 pub const VERSION: u32 = 5;
 
 /// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
@@ -491,6 +495,16 @@ pub const BUILDS: Table = Table {
             Type::I64,
             "the daemon process's system CPU over the build, as `daemon_user_ns`",
         ),
+        opt(
+            "solo_slot",
+            Type::Utf8,
+            "for a solo answer, the key of the request slot it was answered from: its client checked that nothing changed and answered with no daemon asked, and the next daemon took its kept rows; its `started_ns` and `client_started_ns` are the client's start, `client_ended_ns` its end, `misses` 0, `hits` and `tree` null. Null for a build a daemon ran, and in rows of a blaze before it",
+        ),
+        opt(
+            "solo_certified_by",
+            Type::U64,
+            "for a solo answer, the build whose answer its slot held: the build that last ran the request; null for none, and as `solo_slot`",
+        ),
     ],
 };
 
@@ -573,6 +587,11 @@ pub const PROVENANCE: Table = Table {
             "what",
             Type::Utf8,
             "for untracked read: what was read and why it can't be a tracked read (`blaze_query::db::Untracked::what`)",
+        ),
+        opt(
+            "weight",
+            Type::U32,
+            "how many logged runs the row stands for: 1 for a run kept whole; 64 for a sample, one kept of each 64 runs past the 524,288 the log keeps whole between two builds, so `sum(weight)` estimates the runs and a `GROUP BY cause_key` keeps its proportions (`query_counts` holds the exact totals); null in files of a blaze before it, where every row is one run",
         ),
     ],
 };
@@ -942,6 +961,66 @@ pub const QUERY_COUNTS: Table = Table {
             "ran_cycle",
             Type::U64,
             "of its runs, those for a cycle: a stale provisional row, or a verify that re-entered a cycle; null before it",
+        ),
+        opt(
+            "proved_seal",
+            Type::U64,
+            "of its rows proved unchanged, those proved by their seal with no look at an edge (the validity census: each row counted under the first proof to answer, in the engine's order); null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_durability",
+            Type::U64,
+            "those proved by durability from the view they were verified in: no input of their kind or above was written since; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_summary",
+            Type::U64,
+            "those proved by their input summary from the view they were verified in: no bit of it was written since; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_floor_durability",
+            Type::U64,
+            "those proved by durability from the changed set's floor; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_floor_summary",
+            Type::U64,
+            "those proved by their input summary from the changed set's floor; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_walk_end",
+            Type::U64,
+            "those proved by a changed-set walk that ended in the view and did not set them apart; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_reach",
+            Type::U64,
+            "those proved by being outside the reach of a changed-set walk under way; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_first",
+            Type::U64,
+            "of `proved_walk_end` and `proved_reach`, those a fetch asked before any other proof, so no shortcut ahead of them had its turn; null in files of a blaze before the census",
+        ),
+        opt(
+            "edge_walked",
+            Type::U64,
+            "its rows the claim-free walk proved by comparing every edge; null in files of a blaze before the census",
+        ),
+        opt(
+            "edge_gave_up",
+            Type::U64,
+            "its rows on a claim-free walk's stack when the walk gave up (the claimed path looks at the walk's root again); null in files of a blaze before the census",
+        ),
+        opt(
+            "edge_claimed",
+            Type::U64,
+            "its rows whose edges the claimed path compared, whatever it found; null in files of a blaze before the census",
+        ),
+        opt(
+            "edges_compared",
+            Type::U64,
+            "the edges compared for `edge_walked`, `edge_gave_up` and `edge_claimed`; null in files of a blaze before the census",
         ),
     ],
 };
@@ -1351,8 +1430,95 @@ pub const TEST_RUNS: Table = Table {
     ],
 };
 
+/// One row a build: its account (`crate::account`), the change it saw, the work it did by
+/// cause, and what does not add up.
+pub const ACCOUNTS: Table = Table {
+    name: "accounts",
+    doc: "one row a build that ended: the change it saw, the work it did by cause, and what of it is unexplained",
+    columns: &[
+        col("build_id", Type::U64, "the build"),
+        col(
+            "written",
+            Type::U64,
+            "the query engine's input writes, an equal value too (`query_counts.written` summed): the change the build saw",
+        ),
+        col("written_source", Type::U64, "of `written`, writes of a file's bytes (`FileText`, `IncludedFile`)"),
+        col("written_environment", Type::U64, "of `written`, writes of the process environment"),
+        col(
+            "written_plan",
+            Type::U64,
+            "of `written`, writes of the build's plan: crates, source roots, settings, proc macros, the front end's identity",
+        ),
+        col(
+            "written_derived",
+            Type::U64,
+            "of `written`, writes of what blaze publishes into the engine from its own results (resolutions, impl slices, frozen maps): blaze's own, no change a person made",
+        ),
+        col(
+            "written_unattributed",
+            Type::U64,
+            "of `written`, writes of an input kind `account::Writer::of_input` does not name: must be 0",
+        ),
+        col("executed", Type::U64, "the engine's rows run (`query_counts.executed` summed)"),
+        col("verified", Type::U64, "the engine's rows proved unchanged without running"),
+        col("ran_new", Type::U64, "of `executed`, first runs"),
+        col("ran_changed", Type::U64, "of `executed`, runs because a read changed"),
+        col("ran_untracked", Type::U64, "of `executed`, runs because of an untracked read"),
+        col("ran_cycle", Type::U64, "of `executed`, runs for a cycle"),
+        col("ran_evicted", Type::U64, "of `executed`, runs for a value evicted and asked for again"),
+        col(
+            "ran_uncaused",
+            Type::U64,
+            "of `executed`, runs no cause counts (per query function, its runs less its causes): must be 0",
+        ),
+        col(
+            "unbalanced",
+            Type::U64,
+            "how many of the account's sums do not hold (a query function's causes against its runs, the writers against the writes, the ends and the kinds against the steps): must be 0",
+        ),
+        col("steps", Type::U64, "the steps computed again: the build's `misses` rows"),
+        col("units", Type::U64, "of `steps`, units whose record was not found (step `unit`)"),
+        col(
+            "unkept",
+            Type::U64,
+            "of `steps`, units made whose record was not kept (step `unit record`): the next build makes them again",
+        ),
+        col("scripts", Type::U64, "of `steps`, build scripts' runs"),
+        col("functions", Type::U64, "of `steps`, functions whose code was made again (steps `codegen ..`)"),
+        col("other_steps", Type::U64, "of `steps`, the rest"),
+        col("links", Type::U64, "images linked (`links` rows)"),
+        col(
+            "by_workspace_file",
+            Type::U64,
+            "steps whose chain of reasons ends in a changed file of the workspace: each step is counted under one `by_` column, a bug first, then a change, then a standing reason",
+        ),
+        col("by_built_file", Type::U64, "steps that end in a changed file under a build directory (a build script's output, another step's)"),
+        col("by_lock_file", Type::U64, "steps that end in a changed lock file"),
+        col("by_outside_file", Type::U64, "steps that end in a changed file outside the workspace"),
+        col("by_input", Type::U64, "steps that end in a changed input that is no file: a variable, a flag, a setting, the toolchain"),
+        col("by_first", Type::U64, "steps computed for the first time"),
+        col("by_evicted", Type::U64, "steps whose result or record was dropped since they were last computed"),
+        col("by_left", Type::U64, "steps the build before left: it failed or was stopped, and kept nothing"),
+        col("by_forced", Type::U64, "steps computed because that was asked for"),
+        col("by_unstable", Type::U64, "steps whose key differs with the same inputs (a determinism bug): must be 0"),
+        col("by_unexplained", Type::U64, "steps with no recorded reason (`blaze why --unexplained`): must be 0"),
+        col("changes", Type::U64, "the distinct changed inputs the steps' chains name"),
+        opt("first_change", Type::Utf8, "the first of them by name; null when none"),
+        col(
+            "history_dropped",
+            Type::U64,
+            "rows the history could not write since the daemon began, of every table, by this build's end (`blaze daemon status` says which tables)",
+        ),
+        opt(
+            "alarms",
+            Type::Utf8,
+            "what the account warns of, by name, joined with `, `: unexplained, unbalanced, unattributed, work-without-change, needless-writes, disproportionate, rows-per-write, unkept; null when the work is explained and fits the change",
+        ),
+    ],
+};
+
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 30] = [
+pub const TABLES: [&Table; 31] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -1383,6 +1549,7 @@ pub const TABLES: [&Table; 30] = [
     &IMAGES,
     &KEY_PARTS,
     &HELD_SAMPLES,
+    &ACCOUNTS,
 ];
 
 /// The tables that are results, made on request and not kept.

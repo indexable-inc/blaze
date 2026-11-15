@@ -1,0 +1,14 @@
+{
+ "id": "layer-writes-unseen-by-home",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor 3f, int-1112; fixed in part by claude-opus-5-5 (Claude Opus 5.5), executor 3g, int-1112",
+ "where": "crates/blaze-cas (Config::layers, peers.rs), crates/blaze-cargo/src/serve/unit/compile.rs store, serve/packs.rs Packs::fetch",
+ "what": "The plan said a sealed crate's record and outputs, and a pack fetched on a miss for one, go into the machine's layer and not the home. But the home store reads its layer only through the layer writer's committed heads, after its own look_again: a put into the layer writer (the same process's std store) is invisible to the home until that writer commits and the home lists it again. This build's places and lookups (all through the home) and the next build's lookup would miss, and a sealed unit would build again.",
+ "cost": "the share-only put could not be made; sealed units still keep a home copy of their record (outputs are held once as placed files only once 3e-next item 1 lands)",
+ "cause": "two in-process stores whose only channel is the disk: the home sees the layer as another machine's daemon would",
+ "class": "a reader of state written in the same process that can only see it after a durable round trip",
+ "prevention": "a layer the home's own process writes is read live: the home's Reader falls through to the layer writer's Reader (its segment and packs) before its listed tiers, and a place plans from a record found there",
+ "workaround": "none needed in blaze-cas; until daemon.rs calls read_live, only the `blaze serve` daemon (Handle::install_layer) reads its layer live",
+ "fix": "blaze-cas: Shared::live / Store::read_live / Handle::install_layer make the home read its in-process layer writer live (Look::reading falls through to it on a miss of every tier: get, part, get_from, get_in_place, has, pinned; Store::has, Store::pinned; a place of a key found only live writes its bytes). compile.rs store puts a sealed unit's record, slot, outputs and ported texts into compiled.share only; packs.rs fetch installs a sealed unit's pack through Handle::layer(). Left (/tmp/plan/3g-next.md): daemon.rs read_live as the home opens, job.rs waits on and flushes the layer's tickets, deps.rs front-end records of a sealed crate.",
+ "state": "open: callers in daemon.rs, job.rs, deps.rs (/tmp/plan/3g-next.md)"
+}

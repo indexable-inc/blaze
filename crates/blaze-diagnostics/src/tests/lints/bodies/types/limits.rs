@@ -62,6 +62,18 @@ fn lint_type_overflow2() {
     );
 }
 
+/// A literal right under a `-` is negative however many negations are above it: `--128_i8`
+/// is `arithmetic_overflow`'s, not `overflowing_literals`' (Rust 1.99, rust-lang/rust#158302).
+#[test]
+fn lint_type_overflow3() {
+    check(
+        "lint-type-overflow3.rs",
+        &[],
+        include_str!("limits/ui/lint-type-overflow3.rs"),
+        include_str!("limits/ui/lint-type-overflow3.stderr"),
+    );
+}
+
 #[test]
 fn lint_overflowing_int_136675() {
     check(

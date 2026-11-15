@@ -445,40 +445,37 @@ fn main() {}
     );
 }
 
-/// `tests/ui/lint/linker-warning.rs`: the function's lint before the crate's.
+/// `tests/ui/lint/linker-warning.rs` at the pinned nightly: below the root the lint is a
+/// crate-level one the levels ignore, and at the root of a library it is unused, at its name.
 #[test]
 fn linker_messages_below_the_root_and_in_a_library() {
     let source = r##"//@ check-pass
 #![crate_type = "lib"]
 #![warn(unused_attributes)]
 #![allow(linker_messages)]
-//~^ WARNING unused attribute
+//~^ WARN unused attribute
 
 #[allow(linker_messages)]
-//~^ WARNING should be an inner attribute
+//~^ WARN allow(linker_messages) is ignored unless specified at crate level
 fn foo() {}
 "##;
-    let expected = r##"warning: crate-level attribute should be an inner attribute
-  --> $DIR/linker-warning.rs:7:1
+    let expected = r##"warning: allow(linker_messages) is ignored unless specified at crate level
+  --> $DIR/linker-warning.rs:7:9
    |
 LL | #[allow(linker_messages)]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |         ^^^^^^^^^^^^^^^
    |
 note: the lint level is defined here
   --> $DIR/linker-warning.rs:3:9
    |
 LL | #![warn(unused_attributes)]
    |         ^^^^^^^^^^^^^^^^^
-help: add a `!`
-   |
-LL | #![allow(linker_messages)]
-   |  +
 
 warning: unused attribute
-  --> $DIR/linker-warning.rs:4:1
+  --> $DIR/linker-warning.rs:4:10
    |
 LL | #![allow(linker_messages)]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
+   |          ^^^^^^^^^^^^^^^ help: remove this attribute
    |
    = note: the `linker_messages` and `linker_info` lints can only be controlled at the root of a crate that needs to be linked
 
@@ -508,7 +505,7 @@ fn linker_messages_by_case() {
     let unused = |source: &str| messages(source, "unused_attributes");
     assert_eq!(
         unused("mod m {\n    #![allow(linker_info)]\n}\n"),
-        ["unused_attributes: crate-level attribute should be in the root module"]
+        ["unused_attributes: allow(linker_info) is ignored unless specified at crate level"]
     );
     assert_eq!(unused("#![allow(linker_messages)]\n"), Vec::<String>::new());
     assert_eq!(
@@ -532,10 +529,10 @@ pub fn unused_pub_fn() {} // Should NOT error because it's a library
 fn unused_priv_fn() {} //~ ERROR function `unused_priv_fn` is never used
 "##;
     let expected = r##"warning: unused attribute
-  --> $DIR/library.rs:2:1
+  --> $DIR/library.rs:2:9
    |
 LL | #![deny(dead_code_pub_in_binary)]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
+   |         ^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
    |
    = note: the `dead_code_pub_in_binary` lint has no effect in library crates
    = note: requested on the command line with `-W unused-attributes`

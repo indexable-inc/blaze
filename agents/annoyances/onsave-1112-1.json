@@ -1,0 +1,18 @@
+{
+ "id": "onsave-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onsave-1112",
+ "where": "the shared checkout (/Volumes/Projects/blaze-int-1112): two lanes' uncommitted hunks in one file",
+ "what": "`serve/daemon.rs`, `serve.rs` and `serve/job.rs` held this lane's uncommitted hunks and lane storegc-1112's (17 hunks of theirs in daemon.rs, a new field of `Worked` used in job.rs whose definition was uncommitted in blaze-api). The brief's `git commit -m ... -- <your files>` commits a file as the checkout has it, so it would have committed their half-written hunks without the files those need, and the shared branch would not have compiled. The index also held their staged new files (`A crates/blaze-cas/src/collect.rs`), so a plain `git commit` was no way either.",
+ "cost": "about 40 minutes: finding it (a diff stat that grew by itself), a commit made in an index of its own, and one queued build lost to a first version of that which placed hunks wrongly (`git apply --unidiff-zero` places a hunk with no context by its line in the new file, which the hunks left out had shifted)",
+ "cause": "one working tree for every lane and commits by file: a file is the unit of ownership in the brief, a hunk is the unit lanes actually share",
+ "whys": [
+  "lanes were told to commit `-- <your files>`",
+  "the hooks a lane adds to the daemon's loop are in the same three files for every lane",
+  "one directory was chosen (H12) to save a cold build and a merge per lane, and its rule (lanes do not run git, the main agent commits) was not what this brief said"
+ ],
+ "class": "a shared working tree committed by file",
+ "prevention": "built: harness/v2/lane_commit.py makes a lane's commit in an index of its own from whole files and, for shared files, only the hunks matching the lane's pattern, on top of a named base, and can push it to a scratch branch; it refuses a kept hunk that removes lines",
+ "workaround": "python3 -I harness/v2/lane_commit.py '<json>'",
+ "state": "open: lane briefs still say `git commit -- <your files>`; the how-to H12 should name the tool"
+}

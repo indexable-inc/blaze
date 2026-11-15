@@ -54,7 +54,9 @@ hooks.
    [concurrency.md](concurrency.md)). See [lanes/fastcompile/inproc.md](compile-time.md).
 7. **Dependencies as one premapped image.** Everything below the workspace members is
    prelinked once into one shared image, keyed by the dependency graph's hash and mapped by
-   every dev run, so a dev link covers only the workspace's own code.
+   every dev run, so a dev link covers only the workspace's own code. Not built: `blaze-premap`,
+   which no crate used, was deleted on 2026-11-12; an image keyed by the whole graph is one
+   entry a graph, and what replaces it is keyed a function (AGENTS.md `granular-caching`).
 8. **One global cache.** Results that depend only on public inputs are computed once for
    everyone and fetched instead of built:
    - crates.io crate versions, std, sandboxed proc-macro outputs and build-script outputs;

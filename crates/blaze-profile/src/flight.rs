@@ -241,6 +241,10 @@ const _: () = assert!(FOREIGN_FROM + FOREIGN_MAX <= u16::MAX as usize, "a foreig
 static FOREIGN: [OnceLock<SiteText>; FOREIGN_MAX] = [const { OnceLock::new() }; FOREIGN_MAX];
 /// The [`FOREIGN`] slots of each hash of a text ([`foreign_key`]), and how many are taken.
 // alloc: none until a postmortem names a site; grows to the distinct sites of dead processes
+#[expect(
+    blaze::process_static,
+    reason = "indexes the FOREIGN slots, so at most FOREIGN_MAX entries in all"
+)]
 static FOREIGN_BY_TEXT: Lock<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> =
     Lock::unrecorded("profile.flight.foreign_by_text", (0, None));
 
@@ -381,15 +385,18 @@ impl ReadTable {
         READER_SYM | epoch << 24
     }
 
-    fn sym_of(&mut self, text: std::sync::Arc<str>) -> Sym {
-        if let Some(&id) = self.current.ids.get(&text) {
+    /// The sym of `text`, copied into the table only where it holds none: a name read back
+    /// from a ring is borrowed from the readers' definitions until here
+    /// ([`names::Streams::resolve_str`]).
+    fn sym_of(&mut self, text: &str) -> Sym {
+        if let Some(&id) = self.current.ids.get(text) {
             return id;
         }
         if self.current.names.len() >= READER_GENERATION {
             self.previous = std::mem::take(&mut self.current);
             self.epoch = (self.epoch + 1) % READER_EPOCHS;
         }
-        self.current.add_arc(Self::base(self.epoch), text)
+        self.current.add(Self::base(self.epoch), text)
     }
 
     fn get(&self, sym: Sym) -> Option<&std::sync::Arc<str>> {
@@ -434,6 +441,25 @@ fn reader() -> ReaderGuard {
     let mut guard = lock(&READER);
     guard.get_or_insert_with(|| Reader { streams: names::Streams::default(), table: ReadTable::default() });
     ReaderGuard(guard)
+}
+
+/// The bytes of the heap the readers hold of the rings' names ([`names::Streams::held_bytes`]):
+/// each ring's definitions of its last [`names::RETAIN`] generations, one text buffer a
+/// generation. What an idle daemon's planner lists as the names it can give back
+/// ([`trim_names`]); 0 before anything was read.
+pub fn names_held() -> u64 {
+    lock(&READER).as_ref().map_or(0, |it| it.streams.held_bytes())
+}
+
+/// Lets go of the readers' names no read can need again ([`names::Streams::trim`]): every
+/// generation but the newest of each ring whose thread ended, and the spare room of the rest.
+/// The bytes [`names_held`] fell by.
+pub fn trim_names() -> u64 {
+    let mut reader = lock(&READER);
+    let Some(reader) = reader.as_mut() else { return 0 };
+    reader.streams.trim(|ring| {
+        by_number(usize::from(ring)).is_none_or(|it| !it.live.load(Ordering::Acquire))
+    })
 }
 
 /// The live rings, as the readers' [`names::Source`].
@@ -586,7 +612,7 @@ pub(crate) fn token_text(token: Token) -> Option<std::sync::Arc<str>> {
 /// A sym of this process for `text`, from the readers' table: what a name read back from a
 /// table is given ([`span::Value::of_text`]).
 pub fn read_sym(text: &str) -> Sym {
-    reader().table.sym_of(text.into())
+    reader().table.sym_of(text)
 }
 
 /// The key the hot sketches keep `token` under ([`names::hot_key`]).
@@ -689,7 +715,7 @@ impl Namer for LiveNamer<'_> {
             return word;
         }
         let Reader { streams, table } = &mut *self.0;
-        match streams.resolve(ring, at, word, &mut Rings) {
+        match streams.resolve_str(ring, at, word, &mut Rings) {
             Some(text) => table.sym_of(text),
             None => 0,
         }
@@ -786,17 +812,24 @@ pub enum Plot {
     Named,
     /// Bytes the process's footprint holds past the live heap and blaze-mem's resident
     /// committed memory: what the allocators keep freed and resident, the bytes a purge can
-    /// give back. mimalloc's own committed count is no measure of it, since a purge never
-    /// lowers that count (`mi_os_decommit_ex` on a release build). Sampled by the daemon with
-    /// [`Plot::Footprint`].
+    /// give back, and the stacks ([`Plot::StackBytes`] says how much of it the fibers' are).
+    /// mimalloc's own committed count is no measure of it: it counts arenas committed whole
+    /// and never touched. Sampled by the daemon with [`Plot::Footprint`].
     AllocatorKeptBytes,
     /// Bytes purges gave back so far, each one's footprint before less its footprint after
     /// once every worker gave back its heaps (`blaze_cargo::raw::memory::purged_bytes`).
     AllocatorPurgedBytes,
+    /// Bytes the live fibers' stacks hold, each to the deepest page it switched out from
+    /// (`blaze_graph::sched::stack::resident`): the part of [`Plot::AllocatorKeptBytes`] that
+    /// is stacks, not an allocator's pages. Sampled with the memory's breakdown.
+    StackBytes,
+    /// Threads the process runs now (Linux `/proc/self/stat`, macOS `proc_pidinfo`): each holds
+    /// a stack and its own heaps' pages. Sampled with the memory's breakdown.
+    Threads,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 32] = [
+    pub const ALL: [Plot; 34] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -829,6 +862,8 @@ impl Plot {
         Plot::Named,
         Plot::AllocatorKeptBytes,
         Plot::AllocatorPurgedBytes,
+        Plot::StackBytes,
+        Plot::Threads,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -865,6 +900,8 @@ impl Plot {
             Plot::Named => "named",
             Plot::AllocatorKeptBytes => "allocator kept bytes",
             Plot::AllocatorPurgedBytes => "allocator purged bytes",
+            Plot::StackBytes => "stack bytes",
+            Plot::Threads => "threads",
         }
     }
 
@@ -1058,6 +1095,10 @@ struct Parked {
 }
 
 // alloc: none here; grows to the most jobs parked at once, then is kept.
+#[expect(
+    blaze::process_static,
+    reason = "slots of the jobs parked now, reused through `free`: at most the most jobs parked at once"
+)]
 static PARKED: Lock<Parked> = Lock::unrecorded("profile.flight.parked", Parked { jobs: Vec::new(), free: Vec::new() });
 
 /// Moves the parking job's enter stack and build off this thread, leaving it inside no span and
@@ -2873,6 +2914,10 @@ fn slot_of(id: u64) -> usize {
 
 /// Every ring, in the order made: a ring's number is its place here plus one.
 // alloc: once a process
+#[expect(
+    blaze::process_static,
+    reason = "one leaked ring per thread that recorded, at most RINGS_MAX numbered: the flight recorder is the process's by design"
+)]
 static RINGS: Lock<Vec<&'static Ring>> = Lock::unrecorded("profile.flight.rings", Vec::new());
 /// Every ring by its number, read with no lock by a span closed on another thread.
 static BY_NUMBER: [OnceLock<&'static Ring>; RINGS_MAX] = [const { OnceLock::new() }; RINGS_MAX];
@@ -2903,6 +2948,10 @@ impl Drop for Held {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread text buffers: TEXT grows to the thread's longest field value, REST to FIELDS_TEXT_MAX at most"
+)]
 thread_local! {
     /// This thread's ring, read by every span: no destructor, so it is there to the end.
     static MINE: Cell<Option<&'static Ring>> = const { Cell::new(None) };
@@ -4180,10 +4229,17 @@ pub struct Read {
 /// `decode`'s blocks on an idle hello-world daemon's heap).
 const READ_KEPT: usize = 1 << 14;
 
-/// Empties `rows`, keeping room for [`READ_KEPT`] of them at most.
+/// Empties `rows`, keeping room for [`READ_KEPT`] of them at most once a read used under a
+/// quarter of the room it had: a read that filled its room is one of a busy stretch, whose
+/// next read fills it again. Until 2026-11-12 every read's room was cut back, so each flush
+/// of a cold build grew it again from [`READ_KEPT`] by doubling: on tempo's, `decode` and
+/// this function were 6.2 GiB of the `profile` tag's 135.31 GiB of heap churn, in blocks of
+/// 60 MB and 3.3 MB (`alloc_samples`; int-1112 d45e70ddc). An idle daemon's first small read
+/// after a burst still lets the room go, which is what the cut is for.
 fn let_go<T>(rows: &mut Vec<T>) {
+    let used = rows.len();
     rows.clear();
-    if rows.capacity() > READ_KEPT {
+    if rows.capacity() > READ_KEPT && used < rows.capacity() / 4 {
         rows.shrink_to(READ_KEPT);
     }
 }
@@ -4746,6 +4802,10 @@ pub struct OpenSpan {
     pub build: u32,
     /// A daemon `task` span's plane node ([`crate::span::col::Node`]); `None` for any other.
     pub node: Option<u64>,
+    /// Its fields that fill no column, as `name=value` text ([`crate::span::col::Fields`]):
+    /// the loop's `piece` and `completion`, which a stuck line names.
+    /// Shared with the span's own record, which holds it on the global heap.
+    pub fields: Option<std::sync::Arc<str, std::alloc::Global>>,
 }
 
 /// A live thread and the spans it is inside now, outermost first.
@@ -4795,6 +4855,7 @@ pub fn threads_now() -> Vec<ThreadNow> {
                     owner: opened.said().value::<span::col::Owner>(),
                     build: opened.build,
                     node: opened.said().value::<span::col::Node>(),
+                    fields: opened.said().value::<span::col::Fields>().and_then(span::Name::text),
                 })
             })
             // alloc: a dump, on demand
@@ -4810,6 +4871,67 @@ pub fn threads_now() -> Vec<ThreadNow> {
         });
     }
     threads
+}
+
+/// A thread running a scheduler job now, as the task watchdog reads it ([`crate::tasks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Running {
+    pub tid: u64,
+    /// The job running on it, as `blaze_graph::sched::observed` numbers it.
+    pub job: u64,
+    /// Its innermost open span (0 for none), and when that opened, on [`clock::mono_ns`].
+    pub span: u64,
+    pub span_since_ns: u64,
+    /// The build its innermost span is for, 0 for none.
+    pub build: u32,
+    /// The plane node of the innermost daemon `task` span it is inside, if any.
+    pub node: Option<u64>,
+    /// Its own CPU time, where the system lets another thread read it.
+    pub cpu_ns: Option<u64>,
+}
+
+/// Every live thread running a job now into `into` (cleared first), with `rings` as scratch:
+/// atomics and each ring's leave lock, nothing allocated once both have grown. A thread running
+/// no job (a pool worker between jobs, a driver's thread) is no task of the watchdog's: its
+/// waits are for work, and work that comes is no progress of its own.
+pub(crate) fn running_into(rings: &mut Vec<&'static Ring>, into: &mut Vec<Running>) {
+    rings.clear();
+    rings.extend(lock(&RINGS).iter().copied());
+    into.clear();
+    let scale = clock::Scale::now();
+    for ring in rings.iter() {
+        let job = ring.job.load(Ordering::Relaxed);
+        if job == 0 || !ring.live.load(Ordering::Acquire) {
+            continue;
+        }
+        let depth = (ring.depth.load(Ordering::Acquire) as usize).min(OPEN_MAX);
+        let innermost = ring.innermost();
+        let now_ticks = clock::ticks();
+        let now_ns = clock::mono_ns() as u64;
+        let (mut since_ns, mut build) = (now_ns, 0);
+        let opened = |id: u64| {
+            (id != 0 && id != UNRECORDED).then(|| by_number(ring_of(id))?.opened(id)).flatten()
+        };
+        if let Some(opened) = opened(innermost) {
+            since_ns = now_ns.saturating_sub(scale.ns(now_ticks.saturating_sub(opened.start)));
+            build = opened.build;
+        }
+        let node = ring.entered[..depth]
+            .iter()
+            .rev()
+            .find_map(|it| opened(it.load(Ordering::Relaxed))?.said().value::<span::col::Node>());
+        let (tid, _) = ring.current();
+        let cpu_ns = lock(&ring.sampled).cpu_ns();
+        into.push(Running {
+            tid: u64::from(tid),
+            job,
+            span: innermost,
+            span_since_ns: since_ns,
+            build,
+            node,
+            cpu_ns,
+        });
+    }
 }
 
 // --- The Chrome trace of a window ---------------------------------------------------------
@@ -4907,6 +5029,21 @@ pub fn dump(window: Duration) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How long a test's thread waits for another's word before the test fails.
+    const WAIT: Duration = Duration::from_secs(60);
+
+    /// The next message on `rx`, or `None` once its senders are gone; past [`WAIT`] the test
+    /// fails naming `what` it waited for.
+    fn heard<T>(rx: &crossbeam_channel::Receiver<T>, what: &str) -> Option<T> {
+        match rx.recv_timeout(WAIT) {
+            Ok(it) => Some(it),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                panic!("waited {WAIT:?} for {what}")
+            }
+        }
+    }
 
     fn plot_row(i: u64) -> [u64; WORDS] {
         [i, i, i, i, KIND_PLOT << 62, i, i, i]
@@ -5200,22 +5337,22 @@ mod tests {
             let got = flights.get_or_run_named(key, named, || {
                 started.send(()).unwrap();
                 // Ends when the asker says it asks, or when its thread ended without asking.
-                _ = is_asking.recv();
+                _ = heard(&is_asking, "the asker to say it asks");
                 blaze_graph::spin::busy(Duration::from_millis(300));
                 Ok(5)
             });
             ran_out.send(()).unwrap();
-            _ = has_asked_out.recv();
+            _ = heard(&has_asked_out, "the asker to end");
             (crate::sampler::os_tid() as u32, got)
         });
-        has_started.recv().unwrap();
+        has_started.recv_timeout(WAIT).expect("the runner started its run");
         let asker = std::thread::spawn(move || {
             let asking = tracing::info_span!(target: "blaze", "flight asking").entered();
             let asking_id = asking.id().unwrap().into_u64();
             asking_now.send(()).unwrap();
             let got = flights.get_or_run_named(key, named, || Ok(0));
             drop(asking);
-            has_ran_out.recv().unwrap();
+            has_ran_out.recv_timeout(WAIT).expect("the runner's run ended");
             (crate::sampler::os_tid() as u32, asking_id, got)
         });
         let (asker, asking_id, asked) = asker.join().unwrap();
@@ -5294,13 +5431,13 @@ mod tests {
             let ending_ns = crate::clock::mono_ns();
             hold.end(&9);
             ended.send(()).unwrap();
-            _ = has_waited.recv();
+            _ = heard(&has_waited, "the waiter to end");
             (crate::sampler::os_tid() as u32, ending_ns)
         });
-        has_held.recv().unwrap();
+        has_held.recv_timeout(WAIT).expect("the holder took its hold");
         let waiter = std::thread::spawn(move || {
             let got = flights.get_or_run_named(key, |it| it.push_str("codegen round 3"), || Ok(0));
-            has_ended.recv().unwrap();
+            has_ended.recv_timeout(WAIT).expect("the holder ended its hold");
             (crate::sampler::os_tid() as u32, got)
         });
         let (waiter, got) = waiter.join().unwrap();
@@ -5410,10 +5547,10 @@ mod tests {
                 std::thread::spawn(move || {
                     took.send(ring().unwrap().number).unwrap();
                     // The span to close here, or none.
-                    drop(close.recv().unwrap());
+                    drop(close.recv_timeout(WAIT).expect("the test said which span to close"));
                 }),
             ));
-            if taken.recv().unwrap() == ring_of_maker {
+            if taken.recv_timeout(WAIT).expect("the holder said which ring it took") == ring_of_maker {
                 taker = Some(holders.len() - 1);
             }
         }
@@ -5695,7 +5832,7 @@ mod tests {
             },
             move |got| first.send(got.unwrap()).unwrap(),
         );
-        has_started.recv().unwrap();
+        has_started.recv_timeout(WAIT).expect("the first job started its run");
         pool.submit(
             None,
             move || {
@@ -5705,8 +5842,9 @@ mod tests {
             },
             move |got| second.send(got.unwrap()).unwrap(),
         );
-        let (got, ran_on) = first_done.recv().unwrap();
-        let (asked, asked_on, resumed_on) = second_done.recv().unwrap();
+        let (got, ran_on) = first_done.recv_timeout(WAIT).expect("the pool ran the first job");
+        let (asked, asked_on, resumed_on) =
+            second_done.recv_timeout(WAIT).expect("the pool ran the second job");
         assert_eq!((got, asked), (Ok(5), Ok(5)), "the second job waited for the first's run");
         drop(pool);
 
@@ -5900,7 +6038,7 @@ mod tests {
         let creator = giver.id().unwrap().into_u64();
         pool.submit(None, tid, move |on| done.send(on.unwrap()).unwrap());
         drop(giver);
-        let on = ran.recv().unwrap();
+        let on = ran.recv_timeout(WAIT).expect("the pool ran the job");
         drop(pool);
         let mut read = Read::default();
         window(Duration::from_secs(60), &mut read);
@@ -5927,17 +6065,16 @@ mod tests {
         spin_us: Vec<u64>,
     }
 
-    fn tree(tc: &hegel::TestCase) -> Tree {
-        use hegel::generators as gs;
-        let jobs = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    fn tree(tape: &blaze_sim::Tape) -> Tree {
+        let jobs = tape.int_in(1..=6usize, "jobs");
         let mut it = Tree { parent: vec![0], key: Vec::new(), spin_us: Vec::new() };
         for i in 1..jobs {
-            it.parent.push(tc.draw(gs::integers::<usize>().max_value(i - 1)));
+            it.parent.push(tape.index(i, "parent"));
         }
         for _ in 0..jobs {
-            let key = tc.draw(gs::integers::<u8>().max_value(2));
+            let key = tape.int_in(0..=2u8, "key");
             it.key.push((key < 2).then_some(key));
-            it.spin_us.push(tc.draw(gs::integers::<u64>().max_value(300)));
+            it.spin_us.push(tape.int_in(0..=300u64, "spin us"));
         }
         it
     }
@@ -6044,10 +6181,12 @@ mod tests {
     /// row with no unrecorded time, and the critical path crosses from each job's start to its
     /// spawner and from each wait to its waker without a gap, from the build's first row to its
     /// last.
-    #[hegel::test(test_cases = 40)]
-    fn a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build(
-        tc: hegel::TestCase,
-    ) {
+    #[test]
+    fn a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build() {
+        blaze_sim::check(blaze_sim::Config::cases(40), recorded_pool_run);
+    }
+
+    fn recorded_pool_run(tape: &blaze_sim::Tape) {
         use blaze_graph::{pool::Pool, pump::Flights, topology::Topology};
 
         use crate::time::{Begin, End, Input, Model, path};
@@ -6056,7 +6195,7 @@ mod tests {
         crate::install();
         let pool =
             std::sync::Arc::new(Pool::new(&Topology::flat(2), false).expect("the pool starts"));
-        let tree = tree(&tc);
+        let tree = tree(tape);
         let jobs = tree.parent.len();
         let build = BUILDS.fetch_add(1, Ordering::Relaxed);
         let (done, finished) = crossbeam_channel::unbounded();
@@ -6289,12 +6428,12 @@ mod tests {
             // wait in its row.
             drop(tracing::info_span!(target: "blaze", "cpu waits inner").entered());
             ready.send(()).unwrap();
-            has_read.recv().unwrap();
+            has_read.recv_timeout(WAIT).expect("the test read once");
             spend(1);
             // A root closing past `cpu::ROOT_AGE`: the boundary the inner span waits for.
             drop(outer);
         });
-        is_ready.recv().unwrap();
+        is_ready.recv_timeout(WAIT).expect("the thread closed its inner span");
         let mut before = Read::default();
         self::read(&mut cursor, &mut before);
         read_once.send(()).unwrap();

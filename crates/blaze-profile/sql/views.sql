@@ -184,6 +184,11 @@ SELECT * FROM read_parquet(@open, union_by_name = true);
 CREATE OR REPLACE VIEW misses AS
 SELECT * FROM read_parquet(@misses, union_by_name = true);
 
+-- One row a build that ended: its account (crates/blaze-profile/src/account.rs), the change it
+-- saw, the work it did by cause, and what of it is unexplained (`blaze explain account`).
+CREATE OR REPLACE VIEW accounts AS
+SELECT * FROM read_parquet(@accounts, union_by_name = true);
+
 -- The parts of the key of each miss (schema 4 on): what two builds' keys, or two homes', are
 -- diffed by (`key_part_diff`).
 CREATE OR REPLACE VIEW key_parts AS

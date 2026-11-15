@@ -1,0 +1,18 @@
+{
+ "id": "onsave-1112-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onsave-1112",
+ "where": "blaze: an edit build, between `lower workspace` ending and the first `unit names` starting (asked by lane launch through the main agent)",
+ "what": "Measured on blaze-vm (binaries of 856004fa0, hello world, 14 body edits 1.5 s apart, load average 80 to 140, profile in /dev/shm/onsave-1112/gap/home, query /root/wt/onsave-1112/q1.sql): the gap is 0.5 to 12.2 ms, median 3.0 (one of 116 ms). It is not `job.rs`: the loop's `loop: a build's units posted` span ends 0.37 to 0.42 ms after the lowering in 11 of 14 builds (0.34 ms of work; 1.5 to 2.7 ms in the 3 where the loop's own turn came late), and the tasks' `admission` spans say `nothing` held them. Two parts are left. (1) The loop then blocks twice in `store pool load` / `wait io store pool pages 1..2` and `0..1` on its own thread: 0.19 to 0.33 ms a build, 4.51 ms once. (2) The rest ends at the instant a worker's `worker` `idle` span ends, within 0.1 ms of the first `unit names` in 13 of 14 builds: from the posting to a parked worker being awake is 1.7 to 11.7 ms, and 0.1 to 0.2 ms in the two builds where it was not parked long (gaps of 0.53 and 0.59 ms). No span names that stretch: it is the end of `worker idle` that shows it.",
+ "cost": "2 to 5 ms of a 12 ms edit build, as lane launch found (5 to 11 ms there)",
+ "cause": "the hand-off from the loop to a parked pool worker. Not told apart here: the kernel's wake of a thread on a machine at load 80 to 140 from the pool's own park (how it is woken, and whether the plane's task reaches the pool at the posting or at a later step of the turn). On an idle machine the same query tells them apart",
+ "whys": [
+  "a plane task posted by the loop runs on a pool worker, which parks in the kernel when idle",
+  "an edit's chain is one short task after another with the loop between each (incremental-walk.md: `the edit's chain is one thread within a stage, not yet across them`)",
+  "the wake has no span of its own, so a profile shows a hole"
+ ],
+ "class": "a hand-off between threads on an edit's serial chain",
+ "prevention": "not built (blaze-graph's pool and the store's pool are not this lane's): a span from a task's posting to its job's first instruction (`queued`, in `job_intervals` as a state already) so the hole is named in `spans`; a worker kept spinning for a few hundred microseconds after the loop posts on an edit's chain, or the chain's next short task run where the last ended; the loop's two page loads as effects, not waits on the loop",
+ "workaround": "none",
+ "state": "open, for the owners of blaze-graph's pool (the wake) and the store's pool (a wait on the loop's thread): rows above"
+}

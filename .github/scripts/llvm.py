@@ -203,6 +203,77 @@ def pack(prefix, out, top):
                 tar.addfile(info)
 
 
+MERGED = "LLVMBlaze"
+
+
+async def manifest(prefix, exe):
+    """What a build that links this prefix needs to know of it, as data in `blaze-llvm.json`, so
+    that building blaze runs no `llvm-config`: the archive for another platform is then linked
+    from any host (vendor/llvm-sys/pin.rs reads it; docs/v2/plan/design/toolchain-c.md, "Cross
+    compilation"). Asked of the `llvm-config` just built, on the machine that built it, once.
+
+    The static libraries are merged into one, lib/libLLVMBlaze.a (LLVMBlaze.lib), and the
+    components are removed: `libs` is then one name and the link needs no order. One static
+    archive and not one shared library (`LLVM_BUILD_LLVM_DYLIB`): a link of blaze takes only the
+    members it reaches (blaze-engine with LLVM is 302 MB against 280 MB of archives on
+    aarch64 Linux, 2026-11-12), and a shared libLLVM would be loaded and bound whole at every
+    start of the engine.
+
+    A flag is a word with no quote, backslash or `{`: the reader is a few lines of std-only Rust.
+    The prefix is written `{prefix}`, since the archive is unpacked somewhere else."""
+    config = prefix / "bin" / f"llvm-config{exe}"
+
+    async def said(*query):
+        return (await run("llvm-config", config, *query, limit=60)).split()
+
+    def words(what, items):
+        root = str(prefix).replace("\\", "/")
+        out = [it.replace("\\", "/").replace(root, "{prefix}") for it in items]
+        for it in out:
+            if any(c in it for c in '"\\') or ("{" in it and "{prefix}" not in it):
+                sys.exit(f"error: llvm.py: llvm-config's {what} has `{it}`, which the manifest does not hold")
+        return out
+
+    names = await said("--libnames", "--link-static")
+    lib = prefix / "lib"
+    await merge(lib, names)
+    return {
+        "manifest": 1,
+        "targets_built": words("--targets-built", await said("--targets-built")),
+        "libs": [MERGED],
+        "system_libs": words("--system-libs", await said("--system-libs", "--link-static")),
+        "cflags": words("--cflags", await said("--cflags")),
+        "cxxflags": words("--cxxflags", await said("--cxxflags")),
+        "build_mode": words("--build-mode", await said("--build-mode"))[0],
+    }
+
+
+async def merge(lib, names):
+    """lib/<names> as one archive, the components removed. The members keep their order, which
+    no linker needs within one archive (each resolves an archive's members until none is new)."""
+    files = [lib / name for name in names]
+    missing = [str(it) for it in files if not it.is_file()]
+    if missing:
+        sys.exit(f"error: llvm.py: llvm-config names libraries the prefix lacks: {' '.join(missing)}")
+    if WINDOWS:
+        merged = lib / f"{MERGED}.lib"
+        await run("lib", "lib", "/NOLOGO", f"/OUT:{merged}", *files, limit=1800)
+    elif sys.platform == "darwin":
+        merged = lib / f"lib{MERGED}.a"
+        await run("libtool", "libtool", "-static", "-no_warning_for_no_symbols", "-o", merged, *files, limit=1800)
+    else:
+        merged = lib / f"lib{MERGED}.a"
+        script = "".join([f"create {merged}\n", *[f"addlib {it}\n" for it in files], "save\nend\n"])
+        mri = lib / "merge.mri"
+        mri.write_text(script)
+        await run("ar", "sh", "-c", f"ar -M < '{mri}'", limit=1800)
+        mri.unlink()
+    for it in files:
+        it.unlink()
+    # The cmake exports name the components, which are gone: nothing of blaze reads them.
+    shutil.rmtree(lib / "cmake", ignore_errors=True)
+
+
 async def build(args):
     p = pin()
     origin = source(p, args.origin)
@@ -225,9 +296,10 @@ async def build(args):
     said = (await run("llvm-config", prefix / "bin" / f"llvm-config{exe}", "--version", limit=60)).strip()
     if said != p["version"]:
         sys.exit(f"error: llvm.py: the build says LLVM {said}, llvm.json pins {p['version']}")
+    link = await manifest(prefix, exe)
     (prefix / MARKER).write_text(json.dumps(
         {"version": p["version"], "repo": p["repo"], "ref": p["ref"], "commit": p["commit"],
-         "target": args.target}, indent=2) + "\n")
+         "target": args.target, **link}, indent=2) + "\n")
     stem = archive_stem(p, args.target)
     packed = out / f"{stem}.tar.xz"
     await asyncio.to_thread(pack, prefix, packed, stem)

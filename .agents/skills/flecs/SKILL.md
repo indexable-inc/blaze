@@ -113,7 +113,7 @@ Symmetric, Target and Trait need the `FLECS_CONSTRAINT_TRAITS` addon.
 - **Pages are scripts.** `site/content/schema.flecs` defines the element types (structs such as `P`, `Li`, `Code`,
   `Section`, `Issue`; container tags `Ul`, `Ol`, `Table`, `Tr`; widget tags `RfcIndex`, `References`, `Course`,
   `UpdateLog`, `BenchHistory`), the relationships (`Status`, `Cites`, `DependsOn`, and the course graph's `Requires`
-  and `InTheme`) and the page prefabs (`Page`, `Doc : Page`, `Rfc : Doc`). `refs.flecs` holds `Ref` entities. Every
+  and `InTheme`) and the page prefabs (`Page`, `Rfc : Page`). `refs.flecs` holds `Ref` entities. Every
   other file adds pages under `site { ... }`; entity paths are URLs (`site.rfcs.capabilities` is `/rfcs/capabilities`,
   `site.index` is `/`).
 - **Order:** `schema.flecs`, `refs.flecs`, then the rest in path order, all in one world (`site/gen/build.ts`). Names
@@ -125,20 +125,22 @@ Symmetric, Target and Trait need the `FLECS_CONSTRAINT_TRAITS` addon.
   `site/renderer/README.md`.
 - **The renderer** is `site.wasm` (`site/renderer/core`, Rust, no Flecs inside): `world.rs` is the entity store loaded
   from the snapshot (prefab values merged, nearest wins), `render.rs` maps each element type to HTML and builds the
-  widgets. The build renders static pages with it, the worker renders comment pages per request with the same module.
+  widgets. The build renders every page with it to static HTML; the worker only serves them.
   A node with no known element type fails the build with its path.
 - **The type checker** (`site/flecs-mapper`, TS 7.1 content mapper) runs scripts in `site/flecs/flecs-doc.wasm`
   (`flecs-doc.c` plus amalgamated Flecs, wasm32-wasi, built by `site/flecs/build.py`). A script must pass both.
 
 ### Site conventions
 
-- `Page`, `Doc`, `Rfc` carry what every instance shares (`OrderedChildren`, `Discussable`, `(Status, Draft)`).
+- `Page` and `Rfc` carry what every instance shares (`OrderedChildren`, `(Status, Draft)`).
   Every container type gets `(With, flecs.core.OrderedChildren)`, and a new container type needs the same line.
 - Links are pairs: `(Cites, refs.koka)`, `(DependsOn, site.charter)`. Inline `[[name]]` references are checked by the
   renderer instead.
-- **Names are anchors.** In a `Doc` (anything people comment on), every block needs a name: its path under the page
-  is the comment anchor (`motivation.why`). Renaming or moving a block orphans its comments (they still show, under
-  the page discussion, with their quote). Choose names that describe the content, not its position.
+- **The front door** is `site.index` (`/`): a `Hero` page, rendered with no sidebar, whose title is the wordmark
+  (client/intro.ts draws it live) over its few blocks, one of them a `Go` (the big button, a link to a page). Lesson 1
+  is `site.start` (`/start`); link to the first lesson there, never to `/`.
+- **Name every block** after its content, not its position: its path under the page is its link target and search
+  anchor (`motivation.why`).
 - **Sort by data across files.** Child order is creation order, and across files that depends on file names and
   forward references: naming `site.rfcs.x` in a pair, or opening `x {}` early, creates `x` at that point (RFC 0003
   opening `"linear-types" {}` once made the index read 0001, 0003, 0002). Sorted things carry a key (`Number` on an

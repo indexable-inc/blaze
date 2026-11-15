@@ -1,0 +1,14 @@
+{
+ "id": "toolchain-fetch-not-one-sans-io-core",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of T1 (tokio out of blaze-cargo), fix-hello-1113",
+ "where": "crates/blaze-cargo/src/toolchain/own.rs (download_all, Feed, Pieces, download), toolchain.rs download_whole, toolchain/library.rs download; crates/blaze-resolve/src/poll.rs",
+ "what": "blaze-cargo started a tokio runtime only to fetch and unpack the pinned toolchain, and retried each download four times. The fetch's decisions are now a sans-IO core (own/keep.rs, Keep), but the rest is still drivers holding logic: a thread per file, a crossbeam handoff with parked waits, xz and tar pulled through a blocking Read, file IO in place, and block_on at the edge where a synchronous caller waits for blaze-http's client. The user asked 'why block on? shouldn't it be sans io': it should, end to end.",
+ "cost": "a lane's time spent re-plumbing a fetch that should have been one core with one driver; two retry loops (own.rs, library.rs) that hid failed downloads",
+ "cause": "the toolchain fetch was written as async IO code over tokio rather than as a core of effects, so taking the runtime out leaves threads and blocking reads where a driver loop should be",
+ "class": "IO-first code whose decisions live in the drivers, so removing one runtime means another hand-built concurrency scheme instead of swapping a driver",
+ "prevention": "one toolchain-fetch core: HTTP events in (blaze-http's sans-IO client), file writes and syncs out as blaze-core Effects, xz and tar decoding fed bytes push-style, decisions and deadlines out; one driver loop, no block_on, driven under blaze_core::sim::Sim; and a manifest gate that no crate under crates/ except crates/harness/ depends on tokio (no gate checks dependencies today: nostd.rs reads manifests only for no_std)",
+ "workaround": "none needed: the fetch works on threads and parked deadline waits",
+ "fix": "not started; also watch HyperHttp::stream_watched: an unpacking that holds the sink for its stall bound makes the client report Stalled",
+ "state": "open"
+}

@@ -246,7 +246,8 @@ pub(super) struct PanicSite {
 /// `Result`; a call into core's or std's panic machinery (what `panic!`, `assert!`,
 /// `unreachable!`, `todo!` and `unimplemented!` expand to, `panic_any`, `resume_unwind`); an
 /// index (`a[i]`, through `Index`); and an integer `/` or `%` whose divisor is not a nonzero
-/// literal. Overflow of `+`, `-` and `*` (a panic only with overflow checks) is not counted.
+/// literal. Overflow of `+`, `-` and `*` (a panic only with overflow checks) is not counted,
+/// and neither is a site `hir_ty_pure::reach` discharges.
 pub(super) fn panic_sites<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>) -> Vec<PanicSite> {
     // alloc: the few panic sites of one body
     let mut found = Vec::new();
@@ -281,6 +282,15 @@ pub(super) fn panic_sites<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>) -
         if let Some(what) = what {
             found.push(PanicSite { expr: id, what });
         }
+    }
+    // A site proved never reached, or unable to fail where it is (an index under its bound
+    // check, an `unwrap` of a known `Some`, a division by a divisor known not zero), is no
+    // panic (docs/v2/plan/design/proved-unreachable.md). Asked only of a body that has one.
+    if !found.is_empty()
+        && let Ok(def) = DefWithBodyId::try_from(analysis.def())
+    {
+        let reach = hir_ty_pure::reach::of_body(db, def);
+        found.retain(|site| !reach.discharged(site.expr));
     }
     found
 }

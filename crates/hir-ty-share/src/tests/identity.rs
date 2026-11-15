@@ -9,8 +9,7 @@ use base_db::Db;
 use blaze_hash::HashSet;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, coroutine_code, interface_hash, item_key, key, layout_hash};
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use hir_def::{AdtId, CallableDefId, ModuleDefId};
 use hir_expand::fixture;
 use hir_ty::{
@@ -836,19 +835,19 @@ fn is_plain_data_is_the_code_generators() {
 /// A type written in the fixture's language: scalars, `P` and `Q` (one `u32` each), and what
 /// references, pointers, arrays, tuples, `W<_>` and function pointers make of them.
 /// At most `depth` levels of nesting, half the time stopping at a scalar.
-fn ty_text(tc: &TestCase, depth: u32) -> String {
-    if depth == 0 || !tc.draw(gs::booleans()) {
+fn ty_text(tape: &Tape, depth: u32) -> String {
+    if depth == 0 || !tape.bool("nested") {
         let leaf = ["u8", "u32", "i64", "bool", "char", "P", "Q", "()", "&'static str"];
-        return tc.draw(gs::sampled_from(leaf.to_vec())).to_owned();
+        return (*tape.one_of(&leaf, "leaf")).to_owned();
     }
-    let inner = || ty_text(tc, depth - 1);
-    match tc.draw(gs::integers::<u8>().max_value(6)) {
+    let inner = || ty_text(tape, depth - 1);
+    match tape.int_in(0..=6u8, "ty") {
         0 => format!("&'static {}", inner()),
         1 => format!("&'static mut {}", inner()),
         2 => format!("*const {}", inner()),
         3 => {
             let t = inner();
-            format!("[{t}; {}]", tc.draw(gs::integers::<usize>().max_value(2)))
+            format!("[{t}; {}]", tape.int_in(0..=2usize, "array length"))
         }
         4 => format!("({}, {})", inner(), inner()),
         5 => format!("W<{}>", inner()),
@@ -857,10 +856,14 @@ fn ty_text(tc: &TestCase, depth: u32) -> String {
 }
 
 /// Random types, each written twice under two names, agree with both old spellings.
-#[hegel::test(test_cases = 32)]
-fn random_types_agree_with_both_old_spellings(tc: TestCase) {
-    let len: usize = tc.draw(gs::integers().min_value(1).max_value(9));
-    let texts: Vec<String> = (0..len).map(|_| ty_text(&tc, 3)).collect();
+#[test]
+fn random_types_agree_with_both_old_spellings() {
+    blaze_sim::check(Config::cases(32), random_types_agree);
+}
+
+fn random_types_agree(tape: &Tape) {
+    let len: usize = tape.int_in(1..=9, "types");
+    let texts: Vec<String> = (0..len).map(|_| ty_text(tape, 3)).collect();
     let mut program =
         String::from("pub struct P(pub u32);\npub struct Q(pub u32);\npub struct W<T>(pub T);\n");
     for (at, text) in texts.iter().enumerate() {

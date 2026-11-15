@@ -1,0 +1,19 @@
+{
+ "id": "kernel-api-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane kernel-api",
+ "where": "crates/blaze-record (a read-list holds names only), crates/blaze-kernel/src/nest.rs (`Engine::lookup`)",
+ "what": "A read-list is shared by every entry of its shape, so it holds the reads' names and not the hashes any entry saw. A lookup therefore cannot stop at a list's first changed read: with steps that ask for steps it must value every step read every list names, including children the step would not ask for now. Those are run and kept for nothing, and one that asks back for the value being looked up looks like a cycle. The kernel now treats a child that cannot be valued during a lookup as 'that list does not hold', and walks the lists twice (collect the step reads, value them with no walk holding the store, walk again).",
+ "cost": "most of the design time of nesting; at run time a second walk of the identity's lists whenever a list names a step, and runs of children no longer needed",
+ "whys": [
+  "why value every step read: the answer key is derived from all digests, and the list has no expected digest to compare one read against",
+  "why no expected digests: one list serves many entries (list -> answers by digest)",
+  "why two walks: blaze-record's walk holds a value read from the store while the visitor runs, and a child's keep must put"
+ ],
+ "cause": "the record form (base -> read-lists -> answer) was drawn for flat reads valued by a world, before a read could itself be a step that must be run",
+ "class": "a storage form that fixes the order of verification (all reads, then one probe) where the semantics want reads verified in the order the run made them",
+ "prevention": "keep with each answer the digests in run order, or file lists as a trie by (read, digest) so a lookup follows the run's own decisions and never values a read the run would not make; decide with blaze-record's owner before front-end steps nest deeply",
+ "workaround": "`Engine::lookup` (two walks) and `KernelError::unvaluable`",
+ "fix": "not done",
+ "state": "open"
+}

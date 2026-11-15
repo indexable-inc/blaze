@@ -26,7 +26,10 @@ first, each with a daemon home of its own (`home`):
     sandbox with the workspace's `sandbox_tests`: `sandboxed-tests` added to `experimental`
             in `[workspace.metadata.blaze]` of the copy's root Cargo.toml (merged into a table
             that is there; refused, naming the file, where it cannot be merged), so every test
-            runs in blaze's sandbox. The fetched source in `sources` is never edited.
+            runs in blaze's sandbox. The fetched source in `sources` is never edited. On macOS
+            the step is the opt-in; on Linux a blaze since tests became sandboxed by default
+            runs them so without it and notes that it does nothing there, and the step stays
+            for a blaze from before, as a baseline may be.
     tree    the BLAKE3 of the copy as built (every path, its executable bit and its bytes;
             `.git` left out; after the `sandbox` edit), the lock's sha256, and the blaze
             binary's BLAKE3: the exact tree the result is of (rule measure-the-exact-tree).
@@ -1255,7 +1258,9 @@ def report(result: Result, compared: Mapping[str, Changes], baseline: str) -> st
         lines.append("")
         lines.append(
             f"Tests ran sandboxed (`{SANDBOXED_TESTS}`, added to the copy's Cargo.toml; files BLAKE3 before the edit "
-            f"`{p.tree.digest_before_sandbox[:16]}`)." if p.sandbox_tests else "Tests ran unsandboxed."
+            f"`{p.tree.digest_before_sandbox[:16]}`)." if p.sandbox_tests
+            else f"Tests ran without `{SANDBOXED_TESTS}`: sandboxed on Linux by a blaze since tests became "
+                 "sandboxed by default there, outside on macOS and before that."
         )
         lines.append("")
         lines.append("Steps: " + ", ".join(

@@ -49,7 +49,8 @@ fn seeds() -> Vec<Vec<u8>> {
     let file = |path: &str, executable, bytes: Option<&[u8]>| OutFile {
         path: path.into(),
         executable,
-        bytes: bytes.map(<[u8]>::to_vec),
+        bytes: bytes.map(std::sync::Arc::<[u8]>::from),
+        link: None,
     };
     [
         Value {

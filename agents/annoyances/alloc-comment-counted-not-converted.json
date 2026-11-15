@@ -1,0 +1,14 @@
+{
+ "id": "alloc-comment-counted-not-converted",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), test-strength lint lane, worktree blaze-merge-1113",
+ "where": "crates/blaze-lints/src/blaze/test_strength/*.rs; crates/blaze-lints/baselines/alloc-sites.txt; docs/lints.md implicit_allocator",
+ "what": "A lane that writes new code by copying the files around it (magic.rs, implicit_allocator.rs itself) copies their `// alloc: <why>` comments, but those comments stopped exempting anything on 2026-11-13. Now each one counts against the crate's row in alloc-sites.txt, and the implied allocations under them are still denied. This lane wrote 118 such comments and removed them with ast-grep (a line_comment rule with regex `^// alloc:`). It left the allocations themselves for `blaze check --fix`, because it may not run blaze.",
+ "cost": "one ast-grep pass, plus a `blaze check --fix` and a fmt pass for the main agent; about 150 implied allocations to name",
+ "cause": "the old idiom is still all over the crate that enforces the new one, so the nearest example teaches the banned form",
+ "class": "a rule changed in one place while its examples elsewhere still show the old form, so new code copies what is now banned",
+ "prevention": "run `blaze check --fix -p blaze-lints` over the whole crate once, so no `// alloc:` line is left to copy and the row in alloc-sites.txt goes to 0",
+ "workaround": "write `Vec::new_in(Global)`, `Vec::with_capacity_in(n, Global)` and `blaze_mem::format_in!(Global, ..)` from the start, with `#![feature(allocator_api)]` already at crates/blaze-lints/src/lib.rs:10",
+ "fix": "not yet",
+ "state": "open"
+}

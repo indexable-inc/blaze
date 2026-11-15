@@ -48,10 +48,12 @@ fn build_finished() {
         served: Served::Daemon,
         took_ms: 812,
         work: Some(work),
+        program: None,
+        size_bytes: None,
     };
     assert_eq!(
         line(|out| super::build_finished(out, &done)),
-        r#"{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0}}"#
+        r#"{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0},"program":null,"size_bytes":null}"#
     );
     let failed = Finished {
         success: false,
@@ -59,10 +61,12 @@ fn build_finished() {
         served: Served::InProcess,
         took_ms: 3,
         work: None,
+        program: None,
+        size_bytes: None,
     };
     assert_eq!(
         line(|out| super::build_finished(out, &failed)),
-        r#"{"reason":"build-finished","success":false,"profile":null,"served":"in-process","took_ms":3,"build_id":null,"units":null,"links":null}"#
+        r#"{"reason":"build-finished","success":false,"profile":null,"served":"in-process","took_ms":3,"build_id":null,"units":null,"links":null,"program":null,"size_bytes":null}"#
     );
     // Every field is JSON a reader takes as it is.
     let value: serde_json::Value =
@@ -83,6 +87,7 @@ fn work_counts_each_link_by_how() {
     let link = |how| Linked { how, path: "target/debug/foo".to_owned() };
     let worked = blaze_api::Worked {
         why: None,
+        storage: None,
         tiers: None,
         link: blaze_api::LinkKind::Placed,
         found: 5,
@@ -248,6 +253,7 @@ fn a_compiler_message_as_cargo_writes_it_again() {
         target: bin_target(&root),
         test: false,
         doctest: false,
+        primary: true,
     };
     let rendered = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
@@ -300,6 +306,7 @@ fn a_compiler_message_in_color_is_rustcs_as_it_wrote_it() {
         target: bin_target(&root),
         test: false,
         doctest: false,
+        primary: true,
     };
     let rendered = "\u{1b}[33mwarning\u{1b}[0m\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
@@ -377,6 +384,7 @@ fn a_compiler_message_warm_allocates_nothing() {
         target: bin_target(&root),
         test: false,
         doctest: false,
+        primary: true,
     });
     let diagnostic = sent(&unused("\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n"));
     let (unit, diagnostic): (UnitOfRef<'_>, DiagnosticRef<'_>) = (lent(&unit), lent(&diagnostic));

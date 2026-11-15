@@ -12,7 +12,7 @@
 #![feature(allocator_api)]
 #![feature(alloc_error_hook)]
 // `#[blaze::nonblocking]` on the daemon's loop turn (`serve::daemon`, docs/v2/plan/design/effects.md).
-#![feature(register_tool)]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
 use std::path::{Path, PathBuf};

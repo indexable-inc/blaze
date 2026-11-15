@@ -273,6 +273,7 @@ fn ran(units: &Units, unit: usize, std: &str) -> Result<Ran, String> {
         )
     })?;
     let mut ran = Ran { out_dir: out_dir.to_owned(), ..Ran::default() };
+    let mut env = Vec::new();
     for line in String::from_utf8_lossy(&output).lines() {
         let Some(directive) = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:"))
         else {
@@ -285,12 +286,16 @@ fn ran(units: &Units, unit: usize, std: &str) -> Result<Ran, String> {
                 let (name, value) = value
                     .split_once('=')
                     .ok_or_else(|| format!("{}: `{line}` sets no variable", output_at.display()))?;
-                ran.env.push((name.to_owned(), value.to_owned()));
+                env.push((name.to_owned(), value.to_owned()));
             }
             _ => {}
         }
     }
-    ran.files = read_tree(Path::new(&read_from), &|_: &str| true, &[])?;
+    ran.env = env.into();
+    ran.files = read_tree(Path::new(&read_from), &|_: &str| true, &[])?
+        .into_iter()
+        .map(|(path, bytes)| (path, bytes.into()))
+        .collect();
     Ok(ran)
 }
 
@@ -368,6 +373,7 @@ pub(crate) fn lower_with(
         files: &**tree,
         root: view,
         host_cpu: None,
+        sealed: &blaze_lower::unsealed(&units),
     })
     .map_err(|error| format!("lowering {dir}: {error}"))?;
     for (unit, it) in units.graph.units.iter().enumerate() {

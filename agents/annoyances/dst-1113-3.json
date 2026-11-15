@@ -1,0 +1,14 @@
+{
+ "id": "dst-1113-3",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "crates/tt/src/storage/tests.rs:541, storage::tests::refused_wire_bytes_intern_nothing",
+ "what": "The test fails about one run in twenty with `round N: a read allocated Used { allocations: 2, bytes: 2080, largest: 2048 }` (N was 510 and 452). On blaze-vm, `cargo +nightly-2026-10-27 test -p tt --lib`: the unported tree 398ae458e8 failed 1 of 22 runs, the tree with tt`s Hegel tests ported (062b5c63d8) 1 of 22. Alone (`-- --exact`) it passed.",
+ "cost": "a red run of a port that did not touch the test, and 40 runs to show it was there before",
+ "cause": "not established. The test skips a round when one of its texts is already interned (`Symbol::find`), and the interner is the process`s, written by the tests running beside it, so which damaged bytes each round reads depends on thread timing; for some damage `TopSubtree::read_wire` allocates 2080 bytes, past the test`s bound of four times the wire`s length.",
+ "whys": "the test is not a function of its inputs: it reads state other tests write; and the bound it asserts does not hold for every damaged input, which a fixed seed with a timing-dependent path only sometimes reaches",
+ "class": "a test whose path depends on process-wide state shared with parallel tests",
+ "prevention": "draw the damage from a blaze-sim tape with an interner of the test`s own (or texts no other test makes), so the failing damage is found every run and shrunk; then fix the reader`s allocation or the bound; not built",
+ "workaround": "none taken; the port was judged against the base tree`s rate",
+ "state": "open"
+}

@@ -208,6 +208,7 @@ fn against(held: &Held) -> MirOptions {
         inline: true,
         heap_to_stack: false,
         world: Some(held.world().id),
+        tier: MirOptions::at(MirOptLevel::Release).tier,
     }
 }
 

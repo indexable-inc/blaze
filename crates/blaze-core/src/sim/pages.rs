@@ -16,18 +16,21 @@
 //! page's; a page is refused as corrupt only where the disk rotted under it; after every crash the
 //! open finds exactly the pages whose head write completed; at the end every load has ended, and
 //! every page reads back. Five planted bugs ([`Plant`]), each a safeguard of the pool's removed,
-//! must each be caught on one of [`CONTROL_SEEDS`] seeded plans: a page loaded as its read is
+//! must each be caught, saying what the oracle saw, in one of [`CONTROL_SEEDS`] cases of
+//! `blaze_sim::control` (whose clean run of the same cases passes): a page loaded as its read is
 //! asked (the pool's plant 4), a failed load kept (6), no block check on load (5), the evictor
 //! ignoring the commit's pin (8), the head written before the data's sync (7).
 //!
-//! Replay: a failure names its plan, the simulator's seed in it; a control names a seed of
-//! [`plan_of`] for [`REPLAY`].
+//! The plan (the simulator's seed, the faults it turns on, the acts) is drawn from the case's
+//! `blaze_sim::Tape`, so a failure is shrunk to its fewest and calmest choices. Replay: a failure
+//! prints the least tape by label, the plan in its notes, and the one line that runs that case
+//! again (`BLAZE_SIM_TAPE`, or `BLAZE_SIM_SEED` for its seed).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 
-use super::{Faults, Rng, SCRIBBLE, Sim};
+use super::{Faults, SCRIBBLE, Sim};
 use crate::{
     Cache, Completion, DIRECT_ALIGN, Done, Driver, Effect, FileName, Memory, Priority, Tag,
     wait::Deadline,
@@ -47,9 +50,7 @@ const MOST_ACTS: u64 = 80;
 /// Polls the end of a run may take to let everything in flight end (bounded-progress).
 const DRAIN: u32 = 10_000;
 /// Seeded plans a control searches for one its plant breaks.
-const CONTROL_SEEDS: u64 = 256;
-/// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
-const REPLAY: (u64, Plant) = (0, Plant::None);
+const CONTROL_SEEDS: u32 = 256;
 
 fn data() -> FileName {
     FileName::new("pages/data").expect("a name")
@@ -343,51 +344,27 @@ struct Plan {
     acts: Vec<Act>,
 }
 
-/// A source of draws: Hegel's (shrunk, replayed by Hegel) or a seed's ([`plan_of`]).
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Rng {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
-}
-
 /// A plan: the simulator's seed, the fault classes it turns on (a swarm, so a rare class is not
-/// drowned by a common one), and its acts.
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let fail_one_in = match d.coin() {
-        true => d.int(4, 40) as u32,
+/// drowned by a common one), and its acts, all drawn from `tape`.
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let fail_one_in = match tape.coin("any effect fails") {
+        true => tape.int_in(4..=40u32, "fail one in"),
         false => 0,
     };
-    let (fail_reads, short_reads, hold_reads, rot) = (d.coin(), d.coin(), d.coin(), d.coin());
-    let n = d.int(1, MOST_ACTS);
+    let fail_reads = tape.coin("fail reads");
+    let short_reads = tape.coin("short reads");
+    let hold_reads = tape.coin("hold reads");
+    let rot = tape.coin("rot");
+    let n = tape.int_in(1..=MOST_ACTS, "acts");
     let mut acts = Vec::new();
     for _ in 0..n {
-        let page = d.int(0, PAGES as u64 - 1) as u8;
-        acts.push(match d.int(0, 15) {
-            0..=2 => Act::Put { fill: d.int(0, u64::from(CONTENT) - 1) as u8 },
+        let page = tape.int_in(0..=(PAGES - 1) as u8, "page");
+        acts.push(match tape.int_in(0..=15u8, "act") {
+            0..=2 => Act::Put { fill: tape.int_in(0..=CONTENT - 1, "fill") },
             3..=6 => Act::Read { page },
             7..=8 => Act::Evict { page },
-            9..=12 => Act::Step { us: d.int(0, 400) as u16 },
+            9..=12 => Act::Step { us: tape.int_in(0..=400u16, "us") },
             13 if rot => Act::Rot { page },
             14 if hold_reads => Act::Release,
             15 => Act::Crash,
@@ -397,27 +374,7 @@ fn plan(d: &mut impl Draw) -> Plan {
     Plan { seed, fail_one_in, fail_reads, short_reads, hold_reads, acts }
 }
 
-fn plan_of(seed: u64) -> Plan {
-    plan(&mut Rng::new(seed))
-}
-
 // --- A run ----------------------------------------------------------------------------------
-
-/// Why a run failed: the oracle, or the harness itself.
-#[derive(Debug)]
-enum Broke {
-    Oracle(String),
-    Harness(String),
-}
-
-impl std::fmt::Display for Broke {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Broke::Oracle(why) => write!(f, "the oracle: {why}"),
-            Broke::Harness(why) => write!(f, "the harness: {why}"),
-        }
-    }
-}
 
 #[allow(unsafe_code, reason = "test memory: under `Sim`, which touches it only inside poll and crash")]
 fn memory() -> Memory {
@@ -621,63 +578,51 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
 
 /// The invariant: whatever the faults, wherever the power goes out, a read hands back the bytes
 /// put or a refusal the disk's rot explains, the open finds what completed, and every load ends.
-#[hegel::test(test_cases = 200)]
-fn pages_read_back_what_was_put_after_any_crash(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nreplay: simulator seed {}, plan {plan:?}", plan.seed);
-    }
+#[test]
+fn pages_read_back_what_was_put_after_any_crash() {
+    blaze_sim::check(Config::cases(200), |tape| drawn_run(tape, Plant::None));
 }
 
-/// A plant the oracle must catch on one of [`CONTROL_SEEDS`] seeded plans (test-the-cause on
-/// the test itself): a green DST with a blind oracle proves nothing.
-fn control(plant: Plant) {
-    for seed in 0..CONTROL_SEEDS {
-        match run(&plan_of(seed), plant) {
-            Err(Broke::Oracle(why)) => {
-                eprintln!("{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})): {why}");
-                return;
-            }
-            Err(broke @ Broke::Harness(_)) => panic!("seed {seed}, {plant:?}: {broke}"),
-            Ok(()) => {}
-        }
-    }
-    panic!(
-        "the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, \
-         are too weak"
-    );
+/// The case of `tape`: its plan drawn, noted for the report, and run with `plant`.
+fn drawn_run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let plan = plan(tape);
+    tape.note(format_args!("plan {plan:?}"));
+    run(&plan, plant)
+}
+
+/// A plant the oracle must catch, saying `says`, in one of [`CONTROL_SEEDS`] cases, whose clean
+/// run passes (test-the-cause on the test itself): a green DST with a blind oracle proves nothing.
+#[track_caller]
+fn control(plant: Plant, says: &str) {
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, plant, says, drawn_run);
 }
 
 #[test]
 fn the_oracle_catches_a_page_loaded_as_its_read_is_asked() {
-    control(Plant::LoadedAtAsk);
+    // The read in flight scribbles the slot the plant already calls loaded.
+    control(Plant::LoadedAtAsk, "read bytes that were not put");
 }
 
 #[test]
 fn the_oracle_catches_a_failed_load_kept() {
-    control(Plant::FailedLoadKept);
+    // The failed read's slot, scribbled, is kept as loaded.
+    control(Plant::FailedLoadKept, "read bytes that were not put");
 }
 
 #[test]
 fn the_oracle_catches_a_load_with_no_check() {
-    control(Plant::NoCheck);
+    // The rotted block loads unchecked and is handed back.
+    control(Plant::NoCheck, "read bytes that were not put");
 }
 
 #[test]
 fn the_oracle_catches_an_eviction_of_a_page_the_commit_pinned() {
-    control(Plant::EvictPinned);
+    // The commit's write takes the poisoned slot as it completes; its load fails the CRC.
+    control(Plant::EvictPinned, "refused as corrupt, and nothing rotted it");
 }
 
 #[test]
 fn the_oracle_catches_a_head_written_before_the_data_s_sync() {
-    control(Plant::HeadBeforeSync);
-}
-
-/// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
-#[test]
-fn replay_one_seed() {
-    let (seed, plant) = REPLAY;
-    if let Err(broke) = run(&plan_of(seed), plant) {
-        panic!("seed {seed}, Plant::{plant:?}: {broke}");
-    }
+    // A crash tears the unsynced data the head already counts; its load fails the CRC.
+    control(Plant::HeadBeforeSync, "refused as corrupt, and nothing rotted it");
 }

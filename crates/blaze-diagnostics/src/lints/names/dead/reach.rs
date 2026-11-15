@@ -2,10 +2,7 @@
 //! can name or reach. Read once from the crate's effective visibilities (`names::effective`)
 //! into a bitset over the numbering, so that each question the pass asks is a bit test.
 
-use blaze_hash::HashMap;
-use hir::{InFile, ModuleDef};
-use hir_def::{Lookup as _, ModuleId};
-use std::alloc::Global;
+use hir::ModuleDef;
 
 use super::defs::{DefIdx, DefSet, Defs, Id};
 use crate::{
@@ -18,18 +15,7 @@ pub(super) struct Reach {
 }
 
 impl Reach {
-    pub(super) fn of(cx: &Cx<'_, '_>, defs: &Defs, effective: &Effective) -> Reach {
-        let db = cx.db;
-        // The `use`s of the crate's modules by their nodes; one in a body has no effective
-        // visibility.
-        let mut uses = HashMap::new_in(Global); // alloc: setup, once per crate
-        for &module in &defs.module_ids {
-            let id: ModuleId = module.into();
-            for use_ in id.def_map(db).module(db, id).scope(db).use_decls() {
-                let ast = use_.lookup(db).id;
-                uses.insert(InFile::new(ast.file_id, ast.erase().to_ptr(db)), use_);
-            }
-        }
+    pub(super) fn of(_cx: &Cx<'_, '_>, defs: &Defs, effective: &Effective) -> Reach {
         let mut public = DefSet::new(defs.len());
         for def in defs.all() {
             let key = match defs[def].id {
@@ -45,10 +31,7 @@ impl Reach {
                 // A trait impl's items have no visibility of their own: they are as reachable as
                 // the impl.
                 Id::Derive(it) | Id::DeriveMethod(it) => Def::Impl(it.into()),
-                Id::Use(node) => match uses.get(&node) {
-                    Some(&it) => Def::Use(it),
-                    None => continue,
-                },
+                Id::Use(it) => Def::Use(it),
             };
             if effective.is_reachable(key) {
                 public.insert(def);

@@ -44,6 +44,8 @@ blaze-lint-defs.workspace = true
 blaze-mem.workspace = true
 blaze-phf.workspace = true
 blaze-query.workspace = true
+# Messages written with `say!`, whose parts are typed (`blaze_report::say`).
+blaze-report.workspace = true
 cfg.workspace = true
 hir.workspace = true
 hir-def.workspace = true
@@ -63,7 +65,7 @@ tt.workspace = true
 [dev-dependencies]
 blaze-core.workspace = true
 blaze-alloc-count.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

@@ -1504,3 +1504,105 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
 }
+
+// A Question is one native interaction (genui/question.rs), with stable keyed parts, using the app's editor and roles.
+// Choosing a row answers immediately; a recommendation never does. The receipt replaces the entire control surface.
+@tree ChildOf
+hn {
+  prefab GenQuestion : ui.Column {
+    Flex: {axis: Column, gap: $question_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: $question_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenQuestionDetail : ui.Words {
+    Fill: $tone_ink_muted
+    TextStyle: {size: $question_detail_size, line: $question_detail_line, role: 0, bold: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenQuestionHeading : ui.Column {
+    Flex: {axis: Column, gap: $question_heading_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    eyebrow : ui.Line {
+      Fill: $tone_ink_faint
+      Text: {s: "YOUR INPUT"}
+      TextStyle: {size: $question_eyebrow_size, line: $question_eyebrow_line, role: 0, bold: 0, weight: $weight_label}
+    }
+    title : ui.Words {
+      Fill: $tone_ink_strong
+      TextStyle: {size: $question_title_size, line: $question_title_line, role: 0, bold: 0, weight: $weight_label}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    detail : hn.GenQuestionDetail {}
+  }
+  prefab GenQuestionOptions : hn.GenScroll {
+    Flex: {axis: Column, gap: $question_heading_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $question_options_max_h}}
+  }
+  prefab GenQuestionOption : ui.Column {
+    Fill: $tone_clear
+    Edge: {dark: $tone_line.dark, light: $tone_line.light}
+    Shape: {radius: $question_radius, n: 4, border: $question_border, feather: 0}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_press.dark, light: $tone_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Column, gap: $question_option_gap, align: Stretch, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: $question_option_min_h, max: 0}}
+    Padding: {l: $question_option_pad, r: $question_option_pad, t: $question_option_pad, b: $question_option_pad}
+    head : ui.Row {
+      Flex: {axis: Row, gap: $question_action_gap, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      label : ui.Words {
+        Fill: $tone_ink_strong
+        TextStyle: {size: $question_label_size, line: $question_label_line, role: 0, bold: 0, weight: $weight_label}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      }
+      recommendation : ui.Line {
+        Fill: $tone_ink_muted
+        TextStyle: {size: $question_eyebrow_size, line: $question_eyebrow_line, role: 0, bold: 0, weight: $weight_label}
+      }
+      arrow : ui.Symbol {
+        Fill: $tone_ink_faint
+        Icon: {glyph: ""}
+        Size: {w: {kind: Fixed, value: $tree_chevron, min: 0, max: 0}, h: {kind: Fixed, value: $tree_chevron, min: 0, max: 0}}
+      }
+    }
+    detail : hn.GenQuestionDetail {}
+  }
+  prefab GenQuestionOptionRecommended : hn.GenQuestionOption {
+    Fill: $tone_wash
+    Edge: {dark: $tone_line_strong.dark, light: $tone_line_strong.light}
+  }
+  prefab GenQuestionResponse : hn.GenLabelled {
+    Flex: {axis: Column, gap: $question_heading_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenQuestionField : hn.GenInputBox {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $question_field_h, min: 0, max: 0}}
+    Padding: {l: $question_option_pad, r: $question_option_pad, t: 0, b: 0}
+  }
+  prefab GenQuestionActions : ui.Row {
+    Flex: {axis: Row, gap: $question_action_gap, align: Center, justify: End, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    hint : hn.GenQuestionDetail {
+      Fill: $tone_ink_faint
+    }
+    submit : hn.GenButtonAccent {
+      Size: {w: {kind: Fit, value: 0, min: $question_submit_min_w, max: 0}, h: {kind: Fixed, value: $question_submit_h, min: 0, max: 0}}
+      Padding: {l: $question_option_pad, r: $question_option_pad, t: 0, b: 0}
+    }
+  }
+  prefab GenQuestionReceipt : ui.Column {
+    Flex: {axis: Column, gap: $question_receipt_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    question : hn.GenQuestionDetail {}
+    answer : ui.Words {
+      Fill: $tone_ink_strong
+      TextStyle: {size: $question_label_size, line: $question_label_line, role: 0, bold: 0, weight: $weight_label}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+    status : ui.Line {
+      Fill: $tone_ink_faint
+      Text: {s: "Answered"}
+      TextStyle: {size: $question_eyebrow_size, line: $question_eyebrow_line, role: 0, bold: 0}
+    }
+  }
+}

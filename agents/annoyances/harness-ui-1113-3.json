@@ -1,0 +1,21 @@
+{
+  "id": "harness-ui-1113-3",
+  "date": "2026-11-13",
+  "who": "Codex GPT-6, main agent",
+  "where": "Harness sidebar selectors and Command-O input/scroll surfaces",
+  "what": "Andrew requested model/effort selection directly on each sidebar row, a local-machine icon beside the hostname, and a real caret plus scrolling in search. The earlier search field was only drawn text and the results swapped a fixed eight-row slice.",
+  "cost": "The installed UI lacked ordinary editing and mouse/trackpad behavior despite displaying a search field.",
+  "cause": "A manually maintained query string and sliced result rows stood in for the existing editor and scroll primitives. Model identity and model selection lived in different sidebar locations.",
+  "whys": [
+    "The field displayed Text without owning a text editor or selection.",
+    "Typing only appended and erasing only popped the query.",
+    "Only a bounded visible slice existed, so there was no scrollable result content.",
+    "The recognition label and its selector were implemented separately.",
+    "The view used text-shaped placeholders for interactive primitives rather than sharing the editor, scroll surface and selector state."
+  ],
+  "class": "An interactive-looking control is rendered as static text or a manual slice, without the primitive that owns its interaction.",
+  "prevention": "Palette query is now the shared Draft editor with TextEdit, IME, pointer and clipboard routing. Full bounded results and the preview each use the existing scroll surface/physics, with modal input ownership and selected-row reveal. Sidebar identity and selection share the same row targets and picker state.",
+  "workaround": "None.",
+  "fix": "Model and effort are separate inline hit targets; the bottom model control is removed. The local device header has a computer icon and an explicit connection tooltip. Native scene tests and offscreen clicks, selection, I-beam hover and independent wheel gestures verify the interaction.",
+  "state": "fixed in this change"
+}

@@ -551,9 +551,9 @@ fn written(db: &Db, body: &MirBody<'_>) -> Vec<u8> {
 /// the sample's binding ids index, and no location literals.
 fn locations(db: &Db) -> Locations<'_> {
     let ModuleDefId::FunctionId(owner) = item(db, "owner") else { panic!("`owner` is a function") };
-    let store =
-        ExpressionStore::of(db, ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(owner)));
-    Locations { store, exprs: &[], word: 8 }
+    let owner = ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(owner));
+    let store = ExpressionStore::of(db, owner);
+    Locations { db, owner, store, exprs: &[], word: 8 }
 }
 
 fn read_back<'db>(db: &'db Db, bytes: &[u8]) -> Result<MirBody<'db>, FormatError> {

@@ -15,9 +15,8 @@
 
 use std::alloc::Global;
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn};
 use crate::video::{Colour, ContentLight, Layout, Mastering, MuxError, Muxer, Packet, Track};
 
 const TIMESCALE: u32 = 90_000;
@@ -36,17 +35,17 @@ fn packet(data: Vec<u8>, dts: i64, pts: i64, duration: u32, key: bool) -> Packet
 /// A run of packets as an encoder with B-frames gives them, in decode order: decode times
 /// rising by 1 to 3 ticks of `unit`, presentation at decode plus one or two units (so never
 /// before the first's), a key frame every `gop`, bytes random.
-fn draw_packets(d: &mut impl Draw) -> Vec<Packet<Global>> {
-    let count = d.int(1, 40) as usize;
-    let gop = d.int(1, 12) as usize;
-    let unit = d.pick(&[1i64, 1001, 3000]);
-    let mut dts = d.int(0, 1 << 40) as i64 - (1 << 39);
+fn draw_packets(tape: &Tape) -> Vec<Packet<Global>> {
+    let count = tape.int_in(1..=40u64, "packets") as usize;
+    let gop = tape.int_in(1..=12u64, "gop") as usize;
+    let unit = *tape.one_of(&[1i64, 1001, 3000], "unit");
+    let mut dts = tape.int_in(0..=1u64 << 40, "first dts") as i64 - (1 << 39);
     let mut packets = Vec::with_capacity(count);
     for i in 0..count {
-        let len = d.int(1, 200) as usize;
-        let data = (0..len).map(|_| d.int(0, 255) as u8).collect();
-        let offset = if i == 0 { unit } else { unit * d.int(1, 2) as i64 };
-        let step = unit * d.int(1, 3) as i64;
+        let len = tape.int_in(1..=200u64, "len") as usize;
+        let data = (0..len).map(|_| tape.int_in(0..=255u64, "byte") as u8).collect();
+        let offset = if i == 0 { unit } else { unit * tape.int_in(1..=2u64, "offset units") as i64 };
+        let step = unit * tape.int_in(1..=3u64, "step units") as i64;
         packets.push(packet(data, dts, dts + offset, step as u32, i % gop == 0));
         dts += step;
     }
@@ -286,26 +285,27 @@ fn mux(packets: &[Packet<Global>], layout: Layout, colour: Colour, pieces: bool)
     Ok(file)
 }
 
-#[hegel::test(test_cases = 300)]
-fn muxed_boxes_read_back_as_the_packets(tc: TestCase) {
-    let d = &mut Drawn(&tc);
-    let packets = draw_packets(d);
-    let layout = d.pick(&[Layout::Progressive, Layout::Fragmented]);
-    let colour = if d.coin() {
-        Colour::hdr10(Mastering::P3_D65_1000, Some(ContentLight { max_cll: 1000, max_fall: 400 }))
-    } else {
-        Colour::BT709
-    };
-    let pieces = d.coin();
-    let file = mux(&packets, layout, colour, pieces).expect("valid packets mux");
-    let (got, start) = match layout {
-        Layout::Progressive => read_progressive(&file),
-        Layout::Fragmented => read_fragmented(&file),
-    };
-    assert_eq!(got, expected(&packets), "the samples read back are the packets ({layout:?})");
-    assert_eq!(start as i64, packets[0].pts - packets[0].dts, "the edit starts at the first presentation");
-    let again = mux(&packets, layout, colour, !pieces).expect("valid packets mux");
-    assert!(file == again, "the same packets give the same bytes, in pieces or whole ({layout:?})");
+#[test]
+fn muxed_boxes_read_back_as_the_packets() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let packets = draw_packets(tape);
+        let layout = *tape.one_of(&[Layout::Progressive, Layout::Fragmented], "layout");
+        let colour = if tape.coin("hdr10") {
+            Colour::hdr10(Mastering::P3_D65_1000, Some(ContentLight { max_cll: 1000, max_fall: 400 }))
+        } else {
+            Colour::BT709
+        };
+        let pieces = tape.coin("in pieces");
+        let file = mux(&packets, layout, colour, pieces).expect("valid packets mux");
+        let (got, start) = match layout {
+            Layout::Progressive => read_progressive(&file),
+            Layout::Fragmented => read_fragmented(&file),
+        };
+        assert_eq!(got, expected(&packets), "the samples read back are the packets ({layout:?})");
+        assert_eq!(start as i64, packets[0].pts - packets[0].dts, "the edit starts at the first presentation");
+        let again = mux(&packets, layout, colour, !pieces).expect("valid packets mux");
+        assert!(file == again, "the same packets give the same bytes, in pieces or whole ({layout:?})");
+    });
 }
 
 #[test]

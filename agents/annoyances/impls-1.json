@@ -1,0 +1,14 @@
+{
+ "id": "impls-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane impls (V15) under proofs-1113",
+ "where": "blaze-vm, cargovm2.sh with a new VM_LANE (impls)",
+ "what": "The first cargo test -p hir-ty-lean in a new VM lane took 23 min 17 s (load average 880 on blaze-vm while it ran); the brief said several minutes.",
+ "cost": "about 25 minutes of a lane waiting on one compile",
+ "cause": "a new VM lane gets its own target directory, so the whole dependency graph of hir-ty-lean is built from nothing on a VM shared by many lanes",
+ "whys": "one target per lane keeps lanes apart; nothing shares compiled dependencies between lane targets; the VM is oversubscribed by parallel lanes",
+ "class": "per-lane cold builds on a shared VM cost each lane the whole graph",
+ "prevention": "not done: seed a new lane target from a warm one (a copy, or a shared read-only dependency cache) before its first run",
+ "workaround": "start the first build of a lane before reading the code",
+ "state": "open"
+}

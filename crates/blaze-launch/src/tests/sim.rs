@@ -5,7 +5,8 @@
 //! carry out, and program threads that call through words, sit in gates and stubs, report at
 //! safepoints, get scanned from outside, start threads and end. A schedule ([`Op`]) says who
 //! takes the next step, so every interleaving of the control thread's stores with the
-//! threads' loads is a list of ops: Hegel draws lists, and each control below writes one out.
+//! threads' loads is a list of ops: a case's tape draws lists, and each control below writes
+//! one out.
 //!
 //! The oracle ([`Sim::check`], [`Sim::land`], [`Sim::apply`], [`Sim::settle`]) states what
 //! launcher.md promises, from the machine's side only (it never asks the core what it
@@ -23,8 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::Tape;
 
 use crate::launch::Plant;
 use crate::{
@@ -592,35 +592,34 @@ fn run(ops: &[Op], plant: Plant) -> Result<(), String> {
     sim.settle().map_err(|why| format!("{why} (settling)"))
 }
 
-fn pick(tc: &TestCase, max: usize) -> usize {
-    tc.draw(gs::integers::<usize>().max_value(max))
+fn pick(tape: &Tape, max: usize, label: &'static str) -> usize {
+    tape.int_in(0..=max, label)
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let thread = pick(tc, MOST_THREADS - 1);
-    match pick(tc, 15) {
-        0..=2 => Op::Call(thread, pick(tc, SLOTS as usize - 1) as u32),
+fn op(tape: &Tape) -> Op {
+    let thread = pick(tape, MOST_THREADS - 1, "thread");
+    match pick(tape, 15, "op") {
+        0..=2 => Op::Call(thread, pick(tape, SLOTS as usize - 1, "slot") as u32),
         3 | 4 => Op::Step(thread),
         5 => Op::Return(thread),
-        6 => Op::Safepoint(thread, pick(tc, 7) != 0),
-        7 => match pick(tc, 1) {
+        6 => Op::Safepoint(thread, pick(tape, 7, "whole stack") != 0),
+        7 => match pick(tape, 1, "spawn or end") {
             0 => Op::Spawn(thread),
             _ => Op::End(thread),
         },
         8 => Op::Edit {
-            first: pick(tc, SLOTS as usize - 1) as u32,
-            count: pick(tc, 2) as u32,
-            together: tc.draw(gs::booleans()),
+            first: pick(tape, SLOTS as usize - 1, "first slot") as u32,
+            count: pick(tape, 2, "count") as u32,
+            together: tape.bool("together"),
         },
-        9 => match pick(tc, 3) {
+        9 => match pick(tape, 3, "abort or commit") {
             0 => Op::Abort,
             _ => Op::Commit,
         },
         10..=12 => Op::Write,
         13 => Op::Flush,
         14 => Op::Deliver,
-        _ => match pick(tc, 1) {
+        _ => match pick(tape, 1, "scan or collect") {
             0 => Op::Scan(thread),
             _ => Op::Collect,
         },
@@ -632,12 +631,12 @@ fn op(tc: &TestCase) -> Op {
 /// that was not written or bound, no thread sees an edit's functions new and then old, an
 /// abort changes no word, no offset is handed out twice, no page with live code is given
 /// back, and once every thread has left all code everything unlinked is freed.
-#[hegel::test(test_cases = 400)]
-fn no_schedule_breaks_what_the_core_promises(tc: TestCase) {
-    let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(160));
-    if let Err(why) = run(&ops, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn no_schedule_breaks_what_the_core_promises() {
+    blaze_sim::check(blaze_sim::Config::cases(400), |tape| {
+        let ops = tape.vec(1..=160, "ops", op);
+        run(&ops, Plant::None)
+    });
 }
 
 /// A control: the schedule passes on the core as it is, and with `plant` the oracle names

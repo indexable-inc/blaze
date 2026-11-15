@@ -3,14 +3,21 @@
 //! This means that `DynMap` stores a bunch of hash maps inside, and those maps
 //! can be of different types: one per key in [`keys`], each a field of [`keys::Maps`].
 //!
+//! A `DynMap` is of one file: its keys are pointers ([`syntax::AstPtr`], a kind and a text
+//! range), which name a node only within a file. A container has children in many files (a
+//! body has the blocks of every macro expansion in it, and two expansions of the same text
+//! have nodes of the same kind and range), so the map holds the file it is of and its one
+//! insert takes the pointer with its file and keeps only pointers of the map's file.
+//!
 //! It is used like this:
 //!
 //! ```ignore
 //! # use hir_def::dyn_map::{DynMap, keys};
-//! let mut map = DynMap::default();
+//! let mut map = DynMap::of(file);
 //!
-//! // To access a specific map, index the `DynMap` by a key:
-//! map[keys::FUNCTION].insert(ptr, function_id);
+//! // The one insert: the key, the pointer with its file, the value.
+//! map.insert(keys::FUNCTION, InFile::new(file, ptr), function_id);
+//! // To read a specific map, index the `DynMap` by a key:
 //! let value = map[keys::CONST].get(&const_ptr);
 //! ```
 //!
@@ -121,13 +128,10 @@ pub mod keys {
     }
 }
 
-use std::{
-    hash::Hash,
-    marker::PhantomData,
-    ops::{Index, IndexMut},
-};
+use std::{hash::Hash, marker::PhantomData, ops::Index};
 
 use blaze_hash::HashMap;
+use hir_expand::{HirFileId, InFile};
 use std::alloc::Global;
 
 pub struct Key<K, V, P> {
@@ -157,9 +161,36 @@ pub trait Policy {
     fn map_mut(map: &mut DynMap) -> &mut KeyMap<Self::K, Self::V>;
 }
 
-#[derive(Default)]
+/// The invariant: every key of every map is a pointer to a node of `file`. [`DynMap::insert`]
+/// is the only way in, and it is given each pointer's file.
 pub struct DynMap {
+    /// The file the pointers of every map are of.
+    file: HirFileId,
     pub(crate) maps: keys::Maps,
+}
+
+impl DynMap {
+    /// The empty map of `file`'s nodes.
+    pub fn of(file: HirFileId) -> DynMap {
+        DynMap { file, maps: keys::Maps::default() }
+    }
+
+    /// The file the pointers of every map are of.
+    pub fn file(&self) -> HirFileId {
+        self.file
+    }
+
+    /// `value` under the pointer `at` in `key`'s map, when `at` is of the map's file. A pointer
+    /// of another file is not of this map: the same kind and range there is another node (the
+    /// twin of this one in a macro expansion of the same text, for one).
+    pub fn insert<P: Policy>(&mut self, _key: Key<P::K, P::V, P>, at: InFile<P::K>, value: P::V)
+    where
+        P::K: Hash + Eq,
+    {
+        if at.file_id == self.file {
+            P::map_mut(self).map.insert(at.value, value);
+        }
+    }
 }
 
 /// The map of one key: indexing a [`DynMap`] by the key is a field access.
@@ -174,9 +205,6 @@ impl<K, V> Default for KeyMap<K, V> {
 }
 
 impl<K: Hash + Eq, V> KeyMap<K, V> {
-    pub fn insert(&mut self, key: K, value: V) {
-        self.map.insert(key, value);
-    }
     pub fn get(&self, key: &K) -> Option<&V> {
         self.map.get(key)
     }
@@ -193,15 +221,9 @@ impl<P: Policy> Index<Key<P::K, P::V, P>> for DynMap {
     }
 }
 
-impl<P: Policy> IndexMut<Key<P::K, P::V, P>> for DynMap {
-    fn index_mut(&mut self, _key: Key<P::K, P::V, P>) -> &mut Self::Output {
-        P::map_mut(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use hir_expand::fixture;
+    use hir_expand::{HirFileId, InFile, fixture};
     use syntax::{AstPtr, ast};
 
     use super::{DynMap, keys};
@@ -213,13 +235,14 @@ mod tests {
         let krate = db.fetch_test_crate();
         let f = test_items::function(&db, krate, "f");
         let c = test_items::constant(&db, krate, "C");
+        let file = f.lookup(&db).source_view(&db).file_id;
         let f_ptr = AstPtr::<ast::Fn>::of(f.lookup(&db).source_view(&db).value);
         let c_ptr = AstPtr::<ast::Const>::of(c.lookup(&db).source_view(&db).value);
 
-        let mut map = DynMap::default();
+        let mut map = DynMap::of(file);
         assert!(map[keys::FUNCTION].is_empty());
-        map[keys::FUNCTION].insert(f_ptr, f);
-        map[keys::CONST].insert(c_ptr, c);
+        map.insert(keys::FUNCTION, InFile::new(file, f_ptr), f);
+        map.insert(keys::CONST, InFile::new(file, c_ptr), c);
 
         assert!(!map[keys::FUNCTION].is_empty());
         assert_eq!(map[keys::FUNCTION].get(&f_ptr), Some(&f));
@@ -228,5 +251,30 @@ mod tests {
         assert!(map[keys::PROC_MACRO].is_empty());
         assert_eq!(map[keys::PROC_MACRO].get(&f_ptr), None);
         assert!(map[keys::STATIC].is_empty());
+    }
+
+    /// The invariant: every key of a [`DynMap`] is a pointer to a node of the map's file.
+    #[test]
+    fn a_pointer_of_another_file_is_not_of_the_map() {
+        // `f` of main.rs and `g` of m.rs are a function at the same range: one pointer.
+        let fx = fixture::db("//- /main.rs\nfn f() {}\nmod m;\n//- /m.rs\nfn g() {}\n");
+        let other = HirFileId::from(*fx.files().last().expect("m.rs"));
+        let db = fx.into_db();
+        let krate = db.fetch_test_crate();
+        let f = test_items::function(&db, krate, "f");
+        let source = f.lookup(&db).source_view(&db);
+        let file = source.file_id;
+        assert_ne!(file, other, "`f` of the crate root is in main.rs");
+        let ptr = AstPtr::<ast::Fn>::of(source.value);
+
+        let mut map = DynMap::of(other);
+        assert_eq!(map.file(), other);
+        map.insert(keys::FUNCTION, InFile::new(file, ptr), f);
+        assert!(map[keys::FUNCTION].is_empty(), "main.rs's `f` is not a node of m.rs");
+        assert_eq!(map[keys::FUNCTION].get(&ptr), None);
+
+        let mut map = DynMap::of(file);
+        map.insert(keys::FUNCTION, InFile::new(file, ptr), f);
+        assert_eq!(map[keys::FUNCTION].get(&ptr), Some(&f));
     }
 }

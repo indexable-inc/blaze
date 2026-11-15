@@ -1,26 +1,21 @@
 use std::{
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::*;
 
-static REPOS: AtomicU64 = AtomicU64::new(0);
-
 /// A repository in a temporary directory, removed when dropped.
 struct Repo {
     dir: PathBuf,
+    /// The directory `dir` is, removed with all it holds when the repository drops.
+    _tmp: blaze_core::temp::TempDir,
 }
 
 impl Repo {
     fn new(name: &str) -> Repo {
-        let unique = REPOS.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("blaze-ci-{name}-{}-{unique}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let repo = Repo { dir };
+        let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-ci-{name}-"));
+        let repo = Repo { dir: tmp.path().to_path_buf(), _tmp: tmp };
         repo.git(&["init", "-q"]);
         repo
     }
@@ -75,12 +70,6 @@ impl Repo {
             dir: self.dir.clone(),
             remote: "https://github.com/indexable-inc/blaze.git".to_owned(),
         }
-    }
-}
-
-impl Drop for Repo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -258,9 +247,9 @@ fn needs_git_fetch_from_a_local_path_is_refused_and_shows_no_token() {
 #[test]
 fn arguments_git_would_take_as_options_are_refused() {
     let git = Git { dir: Path::new("/nonexistent").to_path_buf(), remote: "origin".to_owned() };
-    assert!(git.ops(None, "--output=/tmp/x").is_err());
+    assert!(git.ops(None, "--output=/nonexistent/x").is_err());
     assert!(git.ops(Some("-p"), "HEAD").is_err());
-    assert!(git.fetch(&["--upload-pack=touch /tmp/x".to_owned()], None).is_err());
+    assert!(git.fetch(&["--upload-pack=touch /nonexistent/x".to_owned()], None).is_err());
     let flagged = Git { dir: git.dir.clone(), remote: "--upload-pack=x".to_owned() };
     assert!(flagged.fetch(&["main".to_owned()], None).is_err());
     assert_eq!(git.fetch(&[], None), Ok(()));

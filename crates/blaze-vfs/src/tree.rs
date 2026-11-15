@@ -28,10 +28,11 @@ use hashbrown::{HashTable, hash_table};
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
-    Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError,
+    Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, ImageUse, MOST_FILE_BYTES, Mode, Op, OpError,
     image::Bytes,
     reader::Reader,
-    store::{Building, DIR, Entries, Shape, Table, Writer, adopt, mode_byte, mode_of},
+    settle::Unsettled,
+    store::{Building, DIR, Entries, Shape, Source, Table, Writer, adopt, mode_byte, mode_of},
 };
 
 /// Runs `job(0..n)`, each once, on the caller's workers, returning once all have run: what the
@@ -112,17 +113,19 @@ const MAX_LINKS: usize = 40;
 
 /// A file a transaction puts at a path, with its mode: one the tree has (the base's, or one
 /// moved), kept as its node so it is never read or hashed again; or new bytes, which become
-/// the file's own (an owned op's, or an edit's, without a copy).
+/// the file's own (an owned op's, or an edit's, without a copy); or new bytes whose ID the
+/// caller made from them when it read them ([`Tree::apply_known_files`]), not hashed again.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Blob {
     Node(NodeId, Mode),
     New(Bytes, Mode),
+    Known(ContentId, Bytes, Mode),
 }
 
 impl Blob {
     fn mode(&self) -> Mode {
         match self {
-            Blob::Node(_, mode) | Blob::New(_, mode) => *mode,
+            Blob::Node(_, mode) | Blob::New(_, mode) | Blob::Known(_, _, mode) => *mode,
         }
     }
 }
@@ -286,23 +289,21 @@ impl Tree {
         shape.is_dir().then(|| Dir(self.table().entries(shape)))
     }
 
-    /// A file's bytes, read in place; `None` for a directory. A file of the image whose page
-    /// group fails its CRC32C is `Err`, never read.
+    /// A file's bytes, read in place; `None` for a directory. A file of the image whose text
+    /// the content store does not give as that file's is `Err` naming it, never read.
     pub(crate) fn bytes(&self, node: NodeId) -> Result<Option<&[u8]>, Corrupt> {
-        let shape = self.shape(node);
-        if shape.is_dir() {
+        if self.shape(node).is_dir() {
             return Ok(None);
         }
-        self.table().blob(shape).map(Some)
+        self.table().blob(node.0).map(Some)
     }
 
-    /// A file's bytes, held for as long as wanted: one count of the file's or the image's.
+    /// A file's bytes, held for as long as wanted: one count of the file's or the store's.
     pub(crate) fn owned(&self, node: NodeId) -> Result<Option<Bytes>, Corrupt> {
-        let shape = self.shape(node);
-        if shape.is_dir() {
+        if self.shape(node).is_dir() {
             return Ok(None);
         }
-        self.table().bytes(shape).map(Some)
+        self.table().bytes(node.0).map(Some)
     }
 
     pub(crate) fn name(&mut self, name: &str) -> NameId {
@@ -345,7 +346,11 @@ impl Tree {
     pub(crate) fn file_with(&mut self, id: ContentId, bytes: Bytes) -> NodeId {
         debug_assert_eq!(id, ContentId::of(FILE_DOMAIN, &bytes));
         if let Some(node) = self.table().find(&id).map(NodeId) {
-            if self.bytes(node).is_err() {
+            // A file of the image is paged from the store only when read: it is checked here
+            // only once a read found one the store does not give, so a file added again is not
+            // read to be found whole.
+            let refused = self.table().mapped().is_some_and(|it| it.corrupt().is_some());
+            if refused && self.bytes(node).is_err() {
                 self.repair(node, bytes);
             }
             return node;
@@ -374,7 +379,7 @@ impl Tree {
             } else if at == node.0 {
                 next.file(id, bytes.take().expect("one node is repaired"))
             } else {
-                next.file_of(id, old, shape)
+                next.file_of(id, old, at)
             };
             assert_eq!(made, at, "a repair keeps every node's number");
         }
@@ -472,7 +477,7 @@ impl Tree {
     fn staged_bytes<'a>(&'a self, blob: &'a Blob) -> Result<&'a [u8], Corrupt> {
         match blob {
             Blob::Node(node, _) => Ok(self.bytes(*node)?.expect("a staged node is a file")),
-            Blob::New(bytes, _) => Ok(&bytes[..]),
+            Blob::New(bytes, _) | Blob::Known(_, bytes, _) => Ok(&bytes[..]),
         }
     }
 
@@ -640,12 +645,33 @@ impl Tree {
         let mut pending = Pending::new();
         for (path, bytes, mode) in files {
             check(&path)?;
-            self.stage_write(base, &mut pending, Cow::Owned(path), bytes, mode)?;
+            self.stage_write(base, &mut pending, Cow::Owned(path), Blob::New(bytes, mode))?;
+        }
+        Ok(self.commit_pending(base, &pending))
+    }
+
+    /// [`Tree::apply_files`] of files whose IDs their caller made from their bytes when it read
+    /// them (a texts file's listing, written as the shipped tree was placed): the IDs are taken
+    /// as they are, so no byte is hashed here. The caller's contract is the tree's own: an ID
+    /// is [`FILE_DOMAIN`]'s hash of the bytes it is given with (asserted in debug builds).
+    pub(crate) fn apply_known_files(
+        &mut self,
+        base: NodeId,
+        files: impl IntoIterator<Item = (String, ContentId, Bytes, Mode)>,
+    ) -> Result<NodeId, OpError> {
+        let mut pending = Pending::new();
+        for (path, id, bytes, mode) in files {
+            check(&path)?;
+            self.stage_write(base, &mut pending, Cow::Owned(path), Blob::Known(id, bytes, mode))?;
         }
         Ok(self.commit_pending(base, &pending))
     }
 
     /// The root the staged changes make of `base`.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a staged change names its new file by a u32 place; a commit of 2^32 new files needs a typed refusal from staging"
+    )]
     fn commit_pending(&mut self, base: NodeId, pending: &Pending) -> NodeId {
         // By component, so each directory's changes are one run, in its entries' order: every
         // path's components in one column, and each change its run of them.
@@ -762,16 +788,20 @@ impl Tree {
         found
     }
 
-    /// A whole file of `bytes` with `mode` at `path` (checked), staged: refused under a file or
-    /// over a directory.
+    /// A whole new file `blob` ([`Blob::New`] or [`Blob::Known`]) at `path` (checked), staged:
+    /// refused under a file or over a directory.
     fn stage_write(
         &self,
         base: NodeId,
         pending: &mut Pending,
         path: Cow<'_, str>,
-        bytes: Bytes,
-        mode: Mode,
+        blob: Blob,
     ) -> Result<(), OpError> {
+        let len = match &blob {
+            Blob::New(bytes, _) | Blob::Known(_, bytes, _) => bytes.len(),
+            Blob::Node(..) => unreachable!("a write stages new bytes"),
+        };
+        too_large(&path, len)?;
         if ancestors(&path).any(|up| self.file_now(base, pending, up).is_some()) {
             // alloc: the error's path
             return Err(OpError::NotADirectory(path.into_owned()));
@@ -780,7 +810,7 @@ impl Tree {
             // alloc: the error's path
             return Err(OpError::IsADirectory(path.into_owned()));
         }
-        put_owned(pending, path, Some(Blob::New(bytes, mode)));
+        put_owned(pending, path, Some(blob));
         Ok(())
     }
 
@@ -819,7 +849,7 @@ impl Tree {
                 }
                 _ => unreachable!("a write, matched above"),
             };
-            return self.stage_write(base, pending, path, bytes, mode);
+            return self.stage_write(base, pending, path, Blob::New(bytes, mode));
         }
         match &*op {
             Op::Write { .. } => unreachable!("staged above"),
@@ -838,6 +868,7 @@ impl Tree {
                         size,
                     });
                 }
+                too_large(path, (size - *len) as usize + bytes.len())?;
                 let (at, end) = (*at as usize, (*at + *len) as usize);
                 // alloc: the edited file's bytes, made once and kept as they are.
                 let new = adopt([&old[..at], bytes, &old[end..]].concat());
@@ -952,6 +983,10 @@ impl Tree {
                         Blob::New(bytes, mode) => {
                             // clone: the store keeps the new file's bytes, as one more count.
                             (self.file_with(hashed[at as usize], bytes.clone()), *mode)
+                        }
+                        Blob::Known(id, bytes, mode) => {
+                            // clone: the store keeps the new file's bytes, as one more count.
+                            (self.file_with(*id, bytes.clone()), *mode)
                         }
                     })
                 }
@@ -1097,6 +1132,106 @@ impl Tree {
         }
     }
 
+    /// The directories whose listing (names, and whether each is a directory) differs between
+    /// `from` and `to`, sorted bytewise ([`crate::Vfs::relisted`]). Descends only where node
+    /// numbers differ, as [`Tree::diff`] does; a directory on one side alone is listed with
+    /// every directory under it.
+    pub(crate) fn relisted(&self, from: NodeId, to: NodeId) -> Vec<String> {
+        // alloc: the output, one path per directory relisted.
+        let mut out = Vec::new();
+        // alloc: the one buffer every path is built in.
+        self.relisted_into(Some(from), Some(to), &mut String::new(), &mut out);
+        out.sort_unstable();
+        out
+    }
+
+    fn relisted_into(
+        &self,
+        from: Option<NodeId>,
+        to: Option<NodeId>,
+        path: &mut String,
+        out: &mut Vec<String>,
+    ) {
+        if from == to {
+            return;
+        }
+        let (x, y) = (from.and_then(|it| self.entries(it)), to.and_then(|it| self.entries(it)));
+        match (x, y) {
+            (None, None) => {}
+            (Some(x), None) => {
+                out.push(path.clone()); // clone: the output's path
+                for at in 0..x.len() {
+                    let (name, node, _) = x.get(at);
+                    self.relisted_child(name, Some(node), None, path, out);
+                }
+            }
+            (None, Some(y)) => {
+                out.push(path.clone()); // clone: the output's path
+                for at in 0..y.len() {
+                    let (name, node, _) = y.get(at);
+                    self.relisted_child(name, None, Some(node), path, out);
+                }
+            }
+            (Some(x), Some(y)) => {
+                let (mut i, mut j) = (0, 0);
+                let mut same = x.len() == y.len();
+                while i < x.len() || j < y.len() {
+                    let order = match (i < x.len(), j < y.len()) {
+                        (true, true) if x.0.names[i] == y.0.names[j] => Ordering::Equal,
+                        (true, true) => self
+                            .name_bytes(NameId(x.0.names[i]))
+                            .cmp(self.name_bytes(NameId(y.0.names[j]))),
+                        (true, false) => Ordering::Less,
+                        _ => Ordering::Greater,
+                    };
+                    match order {
+                        Ordering::Less => {
+                            same = false;
+                            let (name, node, _) = x.get(i);
+                            self.relisted_child(name, Some(node), None, path, out);
+                        }
+                        Ordering::Greater => {
+                            same = false;
+                            let (name, node, _) = y.get(j);
+                            self.relisted_child(name, None, Some(node), path, out);
+                        }
+                        Ordering::Equal => {
+                            same &= x.is_dir(i) == y.is_dir(j);
+                            let ((name, left, _), (_, right, _)) = (x.get(i), y.get(j));
+                            self.relisted_child(name, Some(left), Some(right), path, out);
+                        }
+                    }
+                    i += usize::from(order.is_le());
+                    j += usize::from(order.is_ge());
+                }
+                if !same {
+                    out.push(path.clone()); // clone: the output's path
+                }
+            }
+        }
+    }
+
+    /// [`Tree::relisted_into`] of the entry `name` of a directory at `path`.
+    fn relisted_child(
+        &self,
+        name: NameId,
+        left: Option<NodeId>,
+        right: Option<NodeId>,
+        path: &mut String,
+        out: &mut Vec<String>,
+    ) {
+        if left == right {
+            return;
+        }
+        let len = path.len();
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(self.name_str(name));
+        self.relisted_into(left, right, path, out);
+        path.truncate(len);
+    }
+
     /// Drops every node no root in `live` reaches, and renumbers the rest into a new table that
     /// readers move to at once; `live` is updated in place. Names are kept. Returns each old
     /// node's new one, `None` for a node dropped.
@@ -1132,7 +1267,7 @@ impl Tree {
                 }));
                 next.dir(id, &columns)
             } else {
-                next.file_of(id, old, shape)
+                next.file_of(id, old, at)
             };
             renumbered[at as usize] = Some(NodeId(node));
         }
@@ -1144,6 +1279,65 @@ impl Tree {
         }
         renumbered
     }
+
+    /// Publishes, as [`Tree::collect`] and [`Tree::repair`] do (readers move to it at once,
+    /// the old table is freed once no reader is in it), a generation whose base is `image`'s
+    /// (a tree [`crate::image::open`] made of an image this tree wrote): every node the image
+    /// holds is read from its mapping, and each node of this tree it lacks follows, its bytes
+    /// the same `Arc` (no copy). Names keep their numbers; nodes take the image's, and one the
+    /// image lacks the next after it, so [`Onto::renumbered`] says each old node's new one
+    /// (none is dropped). Nodes the image holds that this tree dropped since come back, read
+    /// from the mapping until a collection drops them again.
+    pub(crate) fn onto(&mut self, image: &Tree) -> Result<Onto, Unsettled> {
+        let old = self.store.table();
+        let len = old.len();
+        let mut next = Building::onto(image.table(), old, 0)
+            .map_err(|why| Unsettled::Image(ImageUse::Malformed(why)))?;
+        // alloc: once per settle, each old node's new number.
+        let mut renumbered: Vec<Option<NodeId>> = vec![None; len as usize];
+        // alloc: once per settle, one directory's entries at a time.
+        let mut columns = Vec::new();
+        let mut freed = 0u64;
+        // Children have smaller numbers than their parents, so they are renumbered first.
+        for at in 0..len {
+            let (id, shape) = (*old.id(at), old.shape(at));
+            let node = match next.find(&id) {
+                Some(node) => {
+                    if !shape.is_dir()
+                        && let Source::Heap(bytes) = old.source(at)
+                    {
+                        freed += bytes.len() as u64;
+                    }
+                    node
+                }
+                None if shape.is_dir() => {
+                    let from = old.entries(shape);
+                    columns.clear();
+                    columns.extend((0..from.len()).map(|k| {
+                        let child = renumbered[from.nodes[k] as usize].expect("a child first");
+                        (from.names[k], child.0, from.modes[k])
+                    }));
+                    next.dir(id, &columns)
+                }
+                None => next.file(id, old.bytes(at).map_err(Unsettled::Corrupt)?),
+            };
+            renumbered[at as usize] = Some(NodeId(node));
+        }
+        self.retired = self.store.replace(next);
+        let now = self.len();
+        self.kept += now.saturating_sub(len as usize);
+        self.empty = renumbered[self.empty.0 as usize].expect("every node is kept");
+        let base = self.store.names().base_len();
+        self.name_index.retain(|&mut (_, name)| name >= base);
+        Ok(Onto { renumbered, freed })
+    }
+}
+
+/// What [`Tree::onto`] did: each old node's new number (every one `Some`), and the bytes of
+/// the files whose own copy it let go for the image's.
+pub(crate) struct Onto {
+    pub(crate) renumbered: Vec<Option<NodeId>>,
+    pub(crate) freed: u64,
 }
 
 /// Stages `blob` at `path`, making a key only for a path not staged before.
@@ -1166,6 +1360,17 @@ fn put_owned(pending: &mut Pending, path: Cow<'_, str>, blob: Option<Blob>) {
 /// base's contents there are gone.
 fn shadowed(pending: &Pending, path: &str) -> bool {
     ancestors(path).any(|up| pending.contains_key(up))
+}
+
+/// Refuses a file of `len` bytes at `path` over [`MOST_FILE_BYTES`]: the journal could not
+/// record it.
+fn too_large(path: &str, len: usize) -> Result<(), OpError> {
+    let size = len as u64;
+    match size > MOST_FILE_BYTES {
+        // alloc: the error's path
+        true => Err(OpError::TooLarge { path: path.to_owned(), size, most: MOST_FILE_BYTES }),
+        false => Ok(()),
+    }
 }
 
 /// `a/b/c` -> `a/b`, `a`.

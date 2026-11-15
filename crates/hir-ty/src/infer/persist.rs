@@ -810,6 +810,10 @@ impl Columns {
 
 impl InferenceRecord {
     /// `result` with its types written into `tys`.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the inference record's columns hold u32 tuple lengths and a u32 diagnostic count; a body past 2^32 of either needs a typed refusal from the write"
+    )]
     fn of<'db>(result: &InferenceResult<'db>, tys: &mut impl TyEncode<'db>) -> InferenceRecord {
         let InferenceResult {
             method_resolutions,
@@ -926,6 +930,7 @@ impl InferenceRecord {
             pat_adjustments.items().iter().map(|it| match it.kind {
                 PatAdjust::BuiltinDeref => 0,
                 PatAdjust::OverloadedDeref => 1,
+                PatAdjust::UnionMember => 2,
             }),
         );
         record.put32(
@@ -1040,7 +1045,8 @@ impl Persist for InferenceRecord {
         //     `Adjust::ErrorUnion` (adjust code 16).
         // 29: `InferenceDiagnostic::UnresolvedMethodCall::numeric_var`.
         // 30: `InferenceDiagnostic::RecordRefused` (tag 81).
-        Part::U64(30),
+        // 31: `PatAdjust::UnionMember` (pattern adjustment kind 2).
+        Part::U64(31),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -1457,6 +1463,7 @@ impl<'a> InferenceRecordRef<'a> {
                     let kind = match kind {
                         0 => PatAdjust::BuiltinDeref,
                         1 => PatAdjust::OverloadedDeref,
+                        2 => PatAdjust::UnionMember,
                         _ => return Err(self.invalid("a pattern adjustment of no kind")),
                     };
                     Ok(PatAdjustment { kind, source: tys.ty(source)? })
@@ -1724,6 +1731,10 @@ impl Sink {
         self.word(u32::from(value));
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the inference record writes a side-table list's count as one u32 word; a list of 2^32 entries needs a typed refusal from the write"
+    )]
     fn len(&mut self, len: usize) {
         self.word(u32::try_from(len).expect("a side table list of 2^32 entries"));
     }
@@ -2201,6 +2212,10 @@ impl Sink {
 
     /// A lowering diagnostic in `lower::persist`'s words, after their count, so that
     /// [`Source::lowering_words`] reads exactly them.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a lowering diagnostic's word count is one u32 word in the record; a diagnostic of 2^32 words needs a typed refusal from the write"
+    )]
     fn lowering_words(&mut self, put: impl FnOnce(&mut Vec<u32>)) {
         let at = self.words.len();
         self.word(0);
@@ -2668,6 +2683,10 @@ impl Sink {
             }
             D::TyvarBehindRawPointer { span } => {
                 self.word(56);
+                self.span(*span);
+            }
+            D::MethodCallOnDivergingInferVar { span } => {
+                self.word(57);
                 self.span(*span);
             }
             D::InheritedRefMutabilityMismatch { pat } => self.words.extend([53, local(*pat)]),
@@ -3751,6 +3770,7 @@ impl Source<'_> {
             54 => D::FnTraitArgsNotTuple { call_expr: self.local()? },
             55 => D::SelfCtorNotTupleOrUnit { expr: self.local()?, self_ty: self.ty(tys)? },
             56 => D::TyvarBehindRawPointer { span: self.span()? },
+            57 => D::MethodCallOnDivergingInferVar { span: self.span()? },
             90 => D::WholeValueWriteThroughRefinement { place: self.local()?, ty: self.ty(tys)? },
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
         })
@@ -4173,6 +4193,7 @@ mod tests {
             },
             D::MethodOnUnknownRawPointee { span: Span::PatId(pat(4)) },
             D::TyvarBehindRawPointer { span: Span::ExprId(expr(5)) },
+            D::MethodCallOnDivergingInferVar { span: Span::ExprId(expr(6)) },
             D::InheritedRefMutabilityMismatch { pat: pat(3) },
             D::FnTraitArgsNotTuple { call_expr: expr(9) },
             D::SelfCtorNotTupleOrUnit { expr: expr(2), self_ty: ty(types.never) },
@@ -4753,6 +4774,10 @@ mod tests {
         pat_adjustments.push(
             pat(2),
             PatAdjustment { kind: PatAdjust::BuiltinDeref, source: types.u8.store() },
+        );
+        pat_adjustments.push(
+            pat(5),
+            PatAdjustment { kind: PatAdjust::UnionMember, source: types.i32.store() },
         );
         let mut mismatches = ExprOrPatSet::default();
         mismatches.insert(expr(70).into());

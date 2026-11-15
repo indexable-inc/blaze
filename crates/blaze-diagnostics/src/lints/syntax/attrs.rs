@@ -293,13 +293,18 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
             });
         }
     }
-    // `-Z crate-attr`'s, each a file of its own, after the crate root's own inner attributes.
+    // `-Z crate-attr`'s, each a file of its own, after the crate root's own inner attributes:
+    // the crate owner's, so read only by a walk that has the crate root's tree. A walk without
+    // it (a probe of another piece, or a scoped walk whose root pieces are all clean) has no
+    // crate owner; the root's outline piece, whose probe walks them, answers for them.
     let applied = base_db::applied_crate_attr_files(cx.db, cx.krate.into());
-    if !applied.is_empty() {
+    if !applied.is_empty()
+        && let Some(root_tree) = walk.tree(crate_root)
+    {
         let at = match owners.iter().position(|it| it.target == Target::Crate) {
             Some(at) => at,
             None => {
-                let root = walk.tree(crate_root).expect("the walk has the crate root's tree").root;
+                let root = root_tree.root;
                 // alloc: empty, filled below
                 owners.insert(
                     0,

@@ -25,14 +25,18 @@ use crate::{
     walk::{Def, Instance, fn_item_path, summary},
 };
 
-/// The kinds a destructor that only frees memory may have: the global allocator, and a call
-/// only an instance decides (the drop of a type argument, which each use's type answers).
-pub const FREES_ONLY: EffectSet = EffectSet::of(&[Rule::Alloc, Rule::Open]);
+/// The kinds a destructor that only frees memory may have: the global allocator, a call only
+/// an instance decides (the drop of a type argument, which each use's type answers), and
+/// `unsafe` code, which is how a destructor reaches `dealloc` at all. `Unsafe` is the
+/// capabilities check's kind (code that check cannot see into), not an effect a drop's
+/// timing shows: what the `unsafe` code calls is counted at its calls (a foreign call is
+/// `Foreign`, an environment read `Env`), so it is refused there.
+pub const FREES_ONLY: EffectSet = EffectSet::of(&[Rule::Alloc, Rule::Open, Rule::Unsafe]);
 
 /// What the toolchain's destructors may have beside: a panic entry point, which there is an
 /// `unsafe` precondition check that aborts on what is already undefined.
 pub const FREES_ONLY_TOOLCHAIN: EffectSet =
-    EffectSet::of(&[Rule::Alloc, Rule::Open, Rule::Panic, Rule::Overflow]);
+    EffectSet::of(&[Rule::Alloc, Rule::Open, Rule::Unsafe, Rule::Panic, Rule::Overflow]);
 
 /// The `drop` of `adt`'s `Drop` impl, if it has one.
 pub fn drop_fn(db: &Db, adt: AdtId) -> Option<FunctionId> {

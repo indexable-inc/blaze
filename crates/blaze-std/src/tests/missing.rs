@@ -9,9 +9,9 @@
 //!
 //! Plant: [`Plant::OffersIgnored`], accessors that hand out what the host does not offer.
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control};
+use super::{check, control};
 use crate::{
     Plant,
     io::{Io, Limits, Missing, Offers, SimWorld},
@@ -24,8 +24,8 @@ struct Plan {
     offered: u64,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    Plan { seed: d.int(0, u64::MAX), offered: d.int(0, (1 << Offers::NAMES.len()) - 1) }
+fn plan(tape: &Tape) -> Plan {
+    Plan { seed: tape.next_u64("sim seed"), offered: tape.int_in(0..=(1u64 << Offers::NAMES.len()) - 1, "offered") }
 }
 
 /// The capability `name` is reached through, if it is not a root of `Io` itself.
@@ -130,14 +130,14 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The invariant: a capability the host withholds is missing at the root. Each root accessor
 /// of `Io` is `Some` exactly when the host offers it, and its `need_` form is `Ok` then and
 /// otherwise a `Missing` naming it, for every flag of `Offers`.
-#[hegel::test(test_cases = 100)]
-fn a_withheld_capability_is_missing_and_named(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_withheld_capability_is_missing_and_named() {
+    blaze_sim::check(Config::cases(100), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_accessors_that_ignore_the_offers() {
-    control(Plant::OffersIgnored, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::OffersIgnored, plan, run);
 }
 
 #[test]

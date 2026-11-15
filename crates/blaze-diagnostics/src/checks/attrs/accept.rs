@@ -15,7 +15,7 @@ use syntax::{TextRange, TextSize};
 
 use super::args::{ArgParser, Ident, Lit, MetaItem, MetaItemOrLit, MetaList, NameValue};
 use crate::{
-    checks::features::Features,
+    checks::{features::Features, settings::CrateSettings},
     cx::{Cx, item_range_view as item_range},
     lints::syntax::attrs::{
         Attr, Owner, Target,
@@ -102,6 +102,32 @@ impl TargetInfo {
     }
 }
 
+/// The tools the crate's `#![register_tool(..)]`s register, in the order written: rustc's
+/// `registered_tools`, besides the builtin ones. The crate's attributes are those of `owners`'
+/// crate owner; a malformed list registers what it can, its errors given by attribute parsing.
+pub(crate) fn registered_tools<'db>(cx: &Cx<'_, 'db>, owners: &[Owner<'db>]) -> Vec<String> {
+    // alloc: setup, once per check: the tools the crate registers
+    let mut tools = Vec::new();
+    let crate_attrs =
+        owners.iter().filter(|it| it.target == Target::Crate).flat_map(|it| &it.attrs);
+    for attr in crate_attrs.filter(|it| super::is(it, "register_tool")) {
+        // alloc: setup, once per `#![register_tool]`: its parse errors, dropped here
+        let mut quiet = Vec::new();
+        let Some(ArgParser::List(list)) =
+            super::args::parse(cx, attr, &["register_tool"], &mut quiet)
+        else {
+            continue;
+        };
+        for item in list.mixed() {
+            if let Some(ident) = item.meta_item_no_args().and_then(MetaItem::ident) {
+                // alloc: once per tool a crate registers, at setup.
+                tools.push(ident.name.to_string());
+            }
+        }
+    }
+    tools
+}
+
 /// rustc's builtin tools, which `#![register_tool(..)]` adds to.
 const BUILTIN_TOOLS: [&str; 5] = ["clippy", "rustfmt", "diagnostic", "miri", "rust_analyzer"];
 
@@ -109,26 +135,26 @@ impl Session {
     /// Built once per check, by `checks::check`, from the crate's attributes and `features`
     /// (what `checks::features::configured` found).
     pub(crate) fn of<'db>(cx: &Cx<'_, 'db>, owners: &[Owner<'db>], features: Features) -> Session {
-        // alloc: setup, once per check: the tools the crate registers
-        let mut tools = Vec::new();
-        let crate_attrs =
-            owners.iter().filter(|it| it.target == Target::Crate).flat_map(|it| &it.attrs);
-        for attr in crate_attrs.filter(|it| super::is(it, "register_tool")) {
-            // alloc: setup, once per `#![register_tool]`: its parse errors, dropped here
-            let mut quiet = Vec::new();
-            let Some(ArgParser::List(list)) =
-                super::args::parse(cx, attr, &["register_tool"], &mut quiet)
-            else {
-                continue;
-            };
-            for item in list.mixed() {
-                if let Some(ident) = item.meta_item_no_args().and_then(MetaItem::ident) {
-                    // alloc: once per tool a crate registers, at setup.
-                    tools.push(ident.name.to_string());
-                }
-            }
+        let tools = registered_tools(cx, owners);
+        Session { krate: Krate::of(cx), features, target: TargetInfo::of(cx), tools }
+    }
+
+    /// What a piece's probe is given (`checks::syntax_clean`): the crate's settings, read off
+    /// its root's outline (`checks::settings::crate_settings`), which the check finds equal to
+    /// what its own walk reads (`checks::check`).
+    pub(crate) fn of_settings(cx: &Cx<'_, '_>, settings: &CrateSettings) -> Session {
+        Session {
+            krate: Krate::of(cx),
+            features: Features::of_settings(settings),
+            target: TargetInfo::of(cx),
+            // alloc: setup, once per probe, the tools the crate registers
+            tools: settings.tools.iter().map(|it| it.to_string()).collect(),
         }
-        Session { krate: Krate::of(cx, owners), features, target: TargetInfo::of(cx), tools }
+    }
+
+    /// The tools `#![register_tool(..)]` registers, in the order written.
+    pub(crate) fn tools(&self) -> &[String] {
+        &self.tools
     }
 
     pub(crate) fn is_tool(&self, name: &str) -> bool {

@@ -1,0 +1,24 @@
+about = "A blaze replaced while no daemon ran does not answer from the slot the old one wrote (track 10, task C), over six registry crates (regex, hashbrown, bitflags, itoa, memchr, smallvec, pinned by harness/v2/versus/six's lock): run, run, `blaze stop`, the engine copied over itself (the same bytes under a new inode and times, so its stamp moves), run: the slot's first premise is the engine's stamp, so the client leaves the run to a daemon, which starts, and the output is the built program's. The control of each revision is its expected output altered, which fails."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = []
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = ["stop", "replace engine"]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+starts = 1
+daemon_after = true

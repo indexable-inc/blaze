@@ -20,7 +20,7 @@ use crate::{
     ImplTraitId, InferBodyId, InferenceResult,
     db::{HirDatabase, InternedOpaqueTyId},
     lower::{ImplTraitIdx, SelfAndAssocBounds},
-    method_resolution::may_hold,
+    method_resolution::{item_range, may_hold},
     next_solver::{
         DbInterner, ErrorGuaranteed, SolverDefId, StoredEarlyBinder, StoredTy, Ty, TypingMode,
         infer::{DbInternerInferExt, traits::ObligationCause},
@@ -389,7 +389,7 @@ fn text_may_define_opaque<N: syntax::AstNode>(
     let says = || {
         let at = define_opaque_at(db, file);
         !at.is_empty() && {
-            let range = id.file_id.ast_id_map(db).get(id.value).text_range();
+            let range = item_range(db, krate, id);
             at.iter().any(|&at| range.contains(at))
         }
     };

@@ -32,6 +32,7 @@ fn status() -> Status {
         memory_bytes: 4,
         budget_bytes: 5,
         uptime_ms: 40,
+        placed_by: None,
         build: crate::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),
@@ -468,10 +469,8 @@ fn a_passed_socket_is_listened_on_as_inherited_and_kept_open() {
 
     use crate::activation::{Manager, Passed};
 
-    let dir = std::env::temp_dir().join(format!("blaze-server-passed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = blaze_core::temp::TempDir::for_test_socket("blaze-server-passed-");
     let path = dir.join("blaze.sock");
-    _ = std::fs::remove_file(&path);
     let socket = Passed::new(OwnedFd::from(UnixListener::bind(&path).unwrap()), Manager::Launchd);
     let fd = socket.fd();
     let at = FileName::new("run/blaze.sock").unwrap();
@@ -494,7 +493,6 @@ fn a_passed_socket_is_listened_on_as_inherited_and_kept_open() {
     assert!(failed.contains(&format!("the socket run/blaze.sock passed as fd {fd}")), "{failed}");
     drop(rig);
     assert!(std::os::unix::net::UnixStream::connect(&path).is_err(), "closed with the server");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

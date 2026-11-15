@@ -63,7 +63,8 @@ fn pop_takes_the_last_component_until_none_is_left() {
 #[cfg(unix)]
 #[test]
 fn disk_and_virtual_paths_never_meet() {
-    let disk = VfsPath::from(AbsPathBuf::assert_utf8(std::env::temp_dir().join("a")));
+    // Only compared, never read: a disk path that is not there.
+    let disk = VfsPath::from(AbsPathBuf::assert_utf8(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("a")));
     let text = disk.to_string();
     let virt = path(&text);
     assert_ne!(disk, virt);
@@ -98,7 +99,7 @@ fn a_windows_key_ignores_drive_case_and_separators() {
 
 #[test]
 fn a_disk_path_is_normalized_when_made_and_joined() {
-    let base = AbsPathBuf::assert_utf8(std::env::temp_dir());
+    let base = AbsPathBuf::assert_utf8(env!("CARGO_MANIFEST_DIR").into());
     let made = VfsPath::from(base.join("a/../b.rs"));
     assert_eq!(made, VfsPath::from(base.join("b.rs")));
     let dir = VfsPath::from(base.join("d"));

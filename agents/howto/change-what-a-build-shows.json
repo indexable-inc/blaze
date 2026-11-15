@@ -1,0 +1,9 @@
+{
+ "id": "change-what-a-build-shows",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "task": "Change what build, run, check or test show",
+ "do": "Change blaze-screen's core (crates/blaze-screen/src/screen.rs) and read the frames: UPDATE_EXPECT=1 cargo test -p blaze-screen rewrites tests/golden/*.txt from the recorded transcripts at 80x24, 200x60 and 40x10; read the diff. Record a new transcript from a real build with BLAZE_UI_TRANSCRIPT=<file> blaze build.",
+ "why": "The screen is a sans-IO core fed events; a transcript replays into the frames a terminal showed, so a layout is judged from real builds without a terminal or a daemon (docs/terminal.md).",
+ "state": "current"
+}

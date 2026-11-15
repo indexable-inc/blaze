@@ -1,0 +1,17 @@
+{
+ "id": "noopkeep-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane noopkeep-1112",
+ "where": "crates/blaze-cargo/src/serve/unit/*.rs: every reader of `job.input.config.invocation.env`",
+ "what": "About fifteen places read the request's environment directly (blaze's own knobs by name, the lent environment of scripts, record reads). There is no one accessor that notes which variable a step read, so `what did this build read of its environment` had to be assembled from four places (Noting::env, Reads::hash, process_env_reads, Session::env_read) plus a prefix rule for BLAZE_*; a new direct read of a variable that is not BLAZE_* and not in the walk set would be missed by the no-op lane.",
+ "cost": "not measured",
+ "cause": "the environment travels as a plain Vec<(String, String)> on the config",
+ "whys": [
+  "each step was keyed by its own reads one at a time",
+  "nothing made a read of the request's environment go through a noting type"
+ ],
+ "class": "an input read through many doors, with no single place that records the read",
+ "prevention": "a `.clippy.toml` ban on reading `Invocation::env` outside one accessor that takes the reader's name and notes the variable (as `EnvReads::var` does); not built",
+ "workaround": "`serve::job::read_unasked` compares every BLAZE_* variable and the whole walk set for every answer",
+ "state": "open"
+}

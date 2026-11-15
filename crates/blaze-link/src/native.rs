@@ -3539,7 +3539,10 @@ impl<'a> Stage<'a> {
                             None,
                             // alloc: error path
                             format!(
-                                "`{name}` is defined outside every section (an absolute symbol) by {}, and a shared                                  library {} links defines or refers to it or an `--export-dynamic-symbol` pattern                                  matches it, so the executable exports it: blaze's ELF writer exports only what is                                  in the image",
+                                "`{name}` is defined outside every section (an absolute symbol) by {}, and a shared \
+                                 library {} links defines or refers to it or an `--export-dynamic-symbol` pattern \
+                                 matches it, so the executable exports it: blaze's ELF writer exports only what is \
+                                 in the image",
                                 self.input_name(graph.loads[load as usize].input),
                                 self.name
                             ),

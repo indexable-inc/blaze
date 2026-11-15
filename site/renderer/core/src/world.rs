@@ -1,6 +1,5 @@
 //! The world the renderer reads: the site's entities as Flecs has them (name, parent, ordered children, tags, pairs,
-//! component values and prefabs), loaded from a snapshot (`snapshot.rs`). Comments are entities too, added for one
-//! render and removed after it (`World::mark`, `World::rollback`).
+//! component values and prefabs), loaded from a snapshot (`snapshot.rs`).
 //!
 //! The shape is runtime data, the same a host sees in the snapshot: component values are maps of scalars keyed by the
 //! component's path, so nothing here is generic over the schema.
@@ -31,13 +30,13 @@ pub struct Entity {
     pub parent: Option<Id>,
     /// In Flecs's order: declared order under OrderedChildren.
     pub children: Vec<Id>,
-    /// Tags, own and inherited, with `flecs.core.` dropped (`OrderedChildren`, `Discussable`).
+    /// Tags, own and inherited, with `flecs.core.` dropped (`OrderedChildren`, `Hero`).
     pub tags: Vec<String>,
     /// Relationship to targets: `Status` to `["Draft"]`, `Cites` to `["refs.zig_016", ...]`.
     pub pairs: Vec<(String, Vec<String>)>,
     /// Component values, own and inherited (the nearest wins), by component path.
     pub values: Vec<(String, Value)>,
-    /// Every prefab this entity is an instance of, nearest first: `["Rfc", "Doc", "Page"]`.
+    /// Every prefab this entity is an instance of, nearest first: `["Rfc", "Page"]`.
     pub isa: Vec<String>,
 }
 
@@ -68,10 +67,6 @@ pub struct World {
     entities: Vec<Entity>,
     by_path: HashMap<String, Id>,
 }
-
-/// What `World::mark` returns: the world's size at that point.
-#[derive(Clone, Copy, Debug)]
-pub struct Mark(usize);
 
 impl World {
     pub fn get(&self, id: Id) -> &Entity {
@@ -203,23 +198,5 @@ impl World {
             self.entities[p].children.push(id);
         }
         Ok(id)
-    }
-
-    pub fn mark(&self) -> Mark {
-        Mark(self.entities.len())
-    }
-
-    /// Removes every entity spawned since `mark`, newest first.
-    pub fn rollback(&mut self, mark: Mark) {
-        while self.entities.len() > mark.0 {
-            let e = self.entities.pop().expect("len > mark");
-            self.by_path.remove(&e.path);
-            if let Some(p) = e.parent
-                && p < self.entities.len()
-            {
-                let popped = self.entities[p].children.pop();
-                debug_assert_eq!(popped, Some(self.entities.len()));
-            }
-        }
     }
 }

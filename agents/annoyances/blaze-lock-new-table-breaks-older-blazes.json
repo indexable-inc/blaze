@@ -1,0 +1,14 @@
+{
+ "id": "blaze-lock-new-table-breaks-older-blazes",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-audit",
+ "where": "crates/blaze-units/src/lock.rs BlazeLock::parse; crates/blaze-audit/src/pins.rs",
+ "what": "Adding the `[git]` and `[advisories]` tables to blaze.lock (the strong pins of git trees and the advisory database) needs a parse change in blaze-units, and every older blaze refuses a blaze.lock that carries them, because unknown keys are errors and the `version` was not bumped for an additive table.",
+ "cost": "one lane edits the lock's owner crate for a table that belongs to blaze-audit; a workspace pinned by a newer blaze cannot be built by an older one, with an error that says 'unknown key' rather than 'written by a newer blaze'",
+ "cause": "blaze.lock's sections are one closed match in one parser, with no notion of which blaze wrote a section or of a section a reader may require",
+ "class": "a persisted format with closed keys and no per-section version, so every new pin kind is a breaking edit to a shared parser",
+ "prevention": "give each blaze.lock table a declared owner and a `since` format version, have the parser dispatch tables to their owners, and make an unknown table name the release that introduced it (or 'written by a newer blaze')",
+ "workaround": "added the two keys to BlazeLock::parse and rendered them through blaze_audit::pins::SourcePins",
+ "fix": "not yet",
+ "state": "open"
+}

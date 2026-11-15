@@ -1,4 +1,4 @@
-//! Maintained = fresh after random edit sequences (design §12): Hegel edit scripts over the
+//! Maintained = fresh after random edit sequences (design §12): drawn edit scripts over the
 //! fixtures of the name resolution and macro expansion tests, and over generated crates. After
 //! every write, each crate's maintained map equals a fresh maintainer's exactly and
 //! `facts::collect_crate`'s up to §6 ([`super::check_db`]).
@@ -8,14 +8,13 @@
 //! model (`facts/tests/generated.rs`), rendered again and written file by file, with derives,
 //! impls and traits added on top of what the model writes.
 //!
-//! Each script test runs a fixed number of cases; `HEGEL_TEST_CASES=<n>` runs `n` instead, for a
+//! Each script test runs a fixed number of cases; `BLAZE_SIM_SEEDS=<n>` runs `n` instead, for a
 //! long run. A failure is shrunk to the shortest script that still breaks.
 
 use std::panic::{self, AssertUnwindSafe};
 
 use blaze_ids::rng::SplitMix64;
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Config, Tape};
 use hir_expand::fixture;
 use span::FileId;
 use test_utils::FixtureWithProjectMeta;
@@ -28,13 +27,6 @@ use crate::nameres::facts::tests::{
     generated::{Gen, MODULE_NAMES, MacroBody, Model, Module, TYPE_NAMES, UseTail, VALUE_NAMES},
     with_fast_path,
 };
-
-/// Runs `property` over `cases` scripts, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_scripts(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
 
 /// Checks `loaded`'s database, failing the case with `what` and the step.
 fn check(loaded: &Loaded, what: &str, exempt: &Exempt) {
@@ -167,14 +159,13 @@ enum TextEdit {
 }
 
 /// Inserts, removes and renames, 3 : 2 : 2.
-#[hegel::composite]
-fn text_edit(tc: &TestCase) -> TextEdit {
-    let kind: u8 = tc.draw(gs::integers().max_value(6));
-    let at: u64 = tc.draw(gs::integers());
+fn text_edit(tape: &Tape) -> TextEdit {
+    let kind: u8 = tape.int_in(0..=6, "kind");
+    let at: u64 = tape.int("at");
     match kind {
-        0..=2 => TextEdit::Insert { at, snippet: tc.draw(gs::integers()) },
+        0..=2 => TextEdit::Insert { at, snippet: tape.int("snippet") },
         3 | 4 => TextEdit::Remove { at },
-        _ => TextEdit::Rename { at, to: tc.draw(gs::integers()) },
+        _ => TextEdit::Rename { at, to: tape.int("to") },
     }
 }
 
@@ -359,10 +350,10 @@ fn every_fixture_loads_like_a_fresh_run() {
 #[test]
 fn edit_scripts_over_the_fixtures() {
     let all = all_fixtures();
-    run_scripts(192, |tc| {
-        let fixture = tc.draw(gs::integers::<usize>().max_value(all.len() - 1));
-        let edits = tc.draw(gs::vecs(text_edit()).min_size(1).max_size(6));
-        let fast_path = tc.draw(gs::booleans());
+    blaze_sim::check(Config::cases(192), |tape| {
+        let fixture = tape.index(all.len(), "fixture");
+        let edits = tape.vec(1..=6, "edits", text_edit);
+        let fast_path = tape.bool("fast path");
         fixture_script(&all[fixture], &edits, fast_path);
     });
 }
@@ -391,10 +382,9 @@ fn fixture_script(
 #[test]
 fn batched_edits_over_the_fixtures() {
     let all = all_fixtures();
-    run_scripts(64, |tc| {
-        let fixture = tc.draw(gs::integers::<usize>().max_value(all.len() - 1));
-        let edits =
-            tc.draw(gs::vecs(gs::tuples!(text_edit(), text_edit())).min_size(1).max_size(4));
+    blaze_sim::check(Config::cases(64), |tape| {
+        let fixture = tape.index(all.len(), "fixture");
+        let edits = tape.vec(1..=4, "batches", |tape| (text_edit(tape), text_edit(tape)));
         fixture_batches(&all[fixture], &edits);
     });
 }
@@ -609,10 +599,9 @@ enum ModelEdit {
 }
 
 /// The edits weighted 4 : 3 : 2 : 1 : 1 : 1 : 2 : 1, in [`ModelEdit`]'s order.
-#[hegel::composite]
-fn model_edit(tc: &TestCase) -> ModelEdit {
-    let kind: u8 = tc.draw(gs::integers().max_value(14));
-    let n = || -> u64 { tc.draw(gs::integers()) };
+fn model_edit(tape: &Tape) -> ModelEdit {
+    let kind: u8 = tape.int_in(0..=14, "kind");
+    let n = || -> u64 { tape.int("edit field") };
     match kind {
         0..=3 => ModelEdit::AddItem { module: n(), at: n(), seed: n() },
         4..=6 => ModelEdit::RemoveItem { module: n(), at: n() },
@@ -817,10 +806,10 @@ fn generated_script(seed: u64, edits: &[ModelEdit], fast_path: bool) {
 
 #[test]
 fn edit_scripts_over_generated_crates() {
-    run_scripts(160, |tc| {
-        let seed: u64 = tc.draw(gs::integers());
-        let edits = tc.draw(gs::vecs(model_edit()).min_size(1).max_size(8));
-        let fast_path = tc.draw(gs::booleans());
+    blaze_sim::check(Config::cases(160), |tape| {
+        let seed: u64 = tape.int("seed");
+        let edits = tape.vec(1..=8, "edits", model_edit);
+        let fast_path = tape.bool("fast path");
         generated_script(seed, &edits, fast_path);
     });
 }
@@ -857,9 +846,9 @@ fn the_generated_scripts_that_once_failed_keep_the_maps_equal() {
 /// are collected and reused between revisions), then in full against a fresh maintainer.
 #[test]
 fn undoing_a_script_restores_the_first_map() {
-    run_scripts(48, |tc| {
-        let seed: u64 = tc.draw(gs::integers());
-        let edits = tc.draw(gs::vecs(model_edit()).min_size(1).max_size(6));
+    blaze_sim::check(Config::cases(48), |tape| {
+        let seed: u64 = tape.int("seed");
+        let edits = tape.vec(1..=6, "edits", model_edit);
         let first =
             Generated { model: Model::generate(&mut SplitMix64::new(seed)), extras: Vec::new() };
         let mut loaded = Loaded::new(&first.fixture());

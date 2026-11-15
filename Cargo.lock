@@ -147,15 +147,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "approx"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -335,6 +326,7 @@ name = "astlog-core"
 version = "0.0.0"
 dependencies = [
  "ast-merge-langs",
+ "astlog-engine",
  "blaze-hash",
  "edit-applier",
  "ignore",
@@ -342,6 +334,16 @@ dependencies = [
  "snafu",
  "tempfile",
  "tree-sitter",
+]
+
+[[package]]
+name = "astlog-engine"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-sim",
+ "regex",
+ "snafu",
 ]
 
 [[package]]
@@ -375,7 +377,6 @@ name = "base-db"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "blaze-bytes",
  "blaze-core",
  "blaze-dbsp",
  "blaze-format",
@@ -385,12 +386,12 @@ dependencies = [
  "blaze-lint-defs",
  "blaze-mem",
  "blaze-query",
+ "blaze-sim",
  "blaze-vfs",
  "cfg",
  "crossbeam-channel",
  "crossbeam-queue",
  "hashbrown 0.17.1",
- "hegeltest",
  "indexmap",
  "intern",
  "inventory",
@@ -491,11 +492,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-astlog"
+version = "0.0.0"
+dependencies = [
+ "astlog-engine",
+ "base-db",
+ "blaze-api",
+ "blaze-hash",
+ "blaze-intent",
+ "blaze-query",
+ "blaze-vfs",
+ "either",
+ "hir",
+ "hir-def",
+ "hir-expand",
+ "memchr",
+ "snafu",
+ "syntax",
+]
+
+[[package]]
+name = "blaze-audit"
+version = "0.0.0"
+dependencies = [
+ "blaze-fetch",
+ "blaze-sim",
+ "semver",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "blaze-bench"
 version = "0.0.0"
 dependencies = [
  "blaze-cas",
  "blaze-codegen",
+ "blaze-core",
  "blaze-format",
  "blaze-ids",
  "blaze-profile",
@@ -537,8 +571,11 @@ dependencies = [
  "base-db",
  "blaze-alloc-count",
  "blaze-api",
+ "blaze-astlog",
+ "blaze-audit",
  "blaze-build-script",
  "blaze-cas",
+ "blaze-certify",
  "blaze-codegen",
  "blaze-codegen-code",
  "blaze-core",
@@ -548,6 +585,7 @@ dependencies = [
  "blaze-fetch",
  "blaze-fmt",
  "blaze-format",
+ "blaze-front-items",
  "blaze-gc",
  "blaze-global",
  "blaze-graph",
@@ -560,6 +598,9 @@ dependencies = [
  "blaze-item-hash",
  "blaze-items",
  "blaze-kernel",
+ "blaze-keyed",
+ "blaze-launch",
+ "blaze-launch-host",
  "blaze-lazy",
  "blaze-link",
  "blaze-lints",
@@ -570,14 +611,19 @@ dependencies = [
  "blaze-mem",
  "blaze-metadata",
  "blaze-new",
+ "blaze-pack",
  "blaze-profile",
  "blaze-protocol",
  "blaze-query",
+ "blaze-record",
  "blaze-registry",
+ "blaze-remote",
  "blaze-report",
+ "blaze-screen",
  "blaze-serde",
  "blaze-sha256",
  "blaze-shader",
+ "blaze-sim",
  "blaze-source",
  "blaze-store-check",
  "blaze-testsel",
@@ -591,34 +637,32 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "flate2",
- "futures-util",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "hir-ty-borrowck",
  "hir-ty-codegen",
+ "hir-ty-lean",
  "hir-ty-pure",
  "hir-ty-ub",
  "intern",
  "ix-prof",
  "libc",
- "libmimalloc-sys",
  "lzma-rust2",
  "paths",
  "proc-macro-api",
- "ratatui",
  "regex",
  "semver",
  "serde",
  "serde_json",
+ "similar",
  "span",
  "stdx",
  "syntax",
  "tar",
  "tempfile",
  "test-utils",
- "tokio",
  "toml",
  "tracing",
  "uds_windows",
@@ -640,18 +684,42 @@ dependencies = [
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
+ "blaze-keyed",
  "blaze-mem",
  "blaze-reclaim",
  "blaze-serde",
+ "blaze-sim",
  "blaze-spin",
  "blaze-v2-proof",
  "crossbeam-channel",
  "crossbeam-queue",
- "hegeltest",
+ "libc",
  "lz4_flex",
  "serde",
+ "serde_json",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "blaze-cast"
+version = "0.0.0"
+dependencies = [
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-certify"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-core",
+ "blaze-ids",
+ "blaze-protocol",
+ "blaze-record",
+ "blaze-report",
+ "blaze-sim",
+ "blaze-vfs",
 ]
 
 [[package]]
@@ -700,8 +768,8 @@ dependencies = [
  "blaze-core",
  "blaze-protocol",
  "blaze-report",
- "blaze-rng",
- "hegeltest",
+ "blaze-screen",
+ "blaze-sim",
  "libc",
  "serde",
  "sonic-rs",
@@ -734,12 +802,13 @@ dependencies = [
  "blaze-kernel",
  "blaze-mem",
  "blaze-query",
+ "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "blaze-store-check",
  "crossbeam-channel",
  "crossbeam-queue",
  "hashbrown 0.17.1",
- "hegeltest",
  "serde",
  "serde_json",
  "tracing",
@@ -766,11 +835,11 @@ dependencies = [
  "blaze-mem",
  "blaze-radix",
  "blaze-rng",
+ "blaze-sim",
  "blaze-spin",
  "blaze-sys",
  "crossbeam-channel",
  "crossbeam-queue",
- "hegeltest",
  "libc",
  "parking_lot",
  "windows-sys 0.61.2",
@@ -783,7 +852,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-hash",
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
  "smallvec",
 ]
 
@@ -804,11 +873,12 @@ dependencies = [
  "blaze-mem",
  "blaze-phf",
  "blaze-query",
+ "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "cfg",
  "either",
  "hashbrown 0.17.1",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -841,7 +911,7 @@ name = "blaze-diff"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -852,7 +922,7 @@ dependencies = [
  "blaze-diff",
  "blaze-hash",
  "blaze-query",
- "hegeltest",
+ "blaze-sim",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -868,6 +938,7 @@ name = "blaze-doc"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-core",
  "blaze-graph",
  "blaze-hash",
  "blaze-query",
@@ -905,7 +976,9 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-registry",
+ "blaze-report",
  "blaze-sha256",
+ "blaze-sim",
  "blaze-thin",
  "blaze-units",
  "blaze-vfs",
@@ -915,8 +988,6 @@ dependencies = [
  "hir-ty-codegen",
  "intern",
  "ix-prof",
- "libmimalloc-sys",
- "llvm-sys",
  "lzma-rust2",
  "serde_json",
  "stdx",
@@ -925,6 +996,18 @@ dependencies = [
  "toml_edit",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "blaze-expansion"
+version = "0.0.0"
+dependencies = [
+ "blaze-build-script",
+ "blaze-format",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -942,12 +1025,14 @@ dependencies = [
  "blaze-protocol",
  "blaze-rng",
  "blaze-serde",
+ "blaze-sha256",
+ "blaze-sim",
  "crossbeam-channel",
  "ix-prof",
  "serde",
  "serde_derive",
  "serde_json",
- "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -992,7 +1077,7 @@ dependencies = [
  "blaze-lints",
  "blaze-mem",
  "blaze-query",
- "hegeltest",
+ "blaze-sim",
  "hir",
  "hir-def",
  "hir-expand",
@@ -1013,9 +1098,9 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-sha256",
+ "blaze-sim",
  "crossbeam-channel",
  "filetime",
- "hegeltest",
  "papaya",
  "serde",
  "serde_json",
@@ -1028,11 +1113,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-findings"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-fmt"
 version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
+ "blaze-core",
  "blaze-manifest",
  "blaze-serde",
  "diff",
@@ -1061,10 +1156,26 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
  "blaze-serde",
+ "blaze-sim",
  "blaze-v2-proof",
- "hegeltest",
  "serde",
  "zstd",
+]
+
+[[package]]
+name = "blaze-front-items"
+version = "0.0.0"
+dependencies = [
+ "blaze-bytes",
+ "blaze-cas",
+ "blaze-ids",
+ "blaze-kernel",
+ "blaze-report",
+ "blaze-sim",
+ "blaze-store-check",
+ "hir-expand",
+ "span",
+ "syntax",
 ]
 
 [[package]]
@@ -1100,7 +1211,6 @@ dependencies = [
  "blaze-vfs",
  "hir-def",
  "hir-expand",
- "intern",
  "object 0.40.0",
  "parser",
  "serde",
@@ -1113,6 +1223,7 @@ dependencies = [
 name = "blaze-gc"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-serde",
@@ -1158,7 +1269,6 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-check",
  "blaze-core",
- "blaze-format",
  "blaze-hash",
  "blaze-ids",
  "blaze-image",
@@ -1168,13 +1278,13 @@ dependencies = [
  "blaze-reclaim",
  "blaze-rng",
  "blaze-serde",
+ "blaze-sim",
  "blaze-spin",
  "corosensei",
  "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-queue",
  "expect-test",
- "hegeltest",
  "libc",
  "serde",
  "serde_json",
@@ -1187,9 +1297,10 @@ name = "blaze-hash"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-sim",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
- "hegeltest",
+ "indexmap",
  "papaya",
  "serde",
 ]
@@ -1201,6 +1312,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-core",
  "blaze-format",
+ "blaze-hash",
  "blaze-ids",
  "blaze-mem",
 ]
@@ -1220,12 +1332,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-host"
+version = "0.0.0"
+dependencies = [
+ "blaze-cas",
+ "blaze-core",
+ "blaze-format",
+ "blaze-graph",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-sim",
+ "blaze-vfs",
+ "crossbeam-queue",
+ "tracing",
+]
+
+[[package]]
 name = "blaze-http"
 version = "0.0.0"
 dependencies = [
  "base64",
  "blaze-core",
  "blaze-sha256",
+ "blaze-sim",
  "bytes",
  "flate2",
  "http",
@@ -1235,7 +1364,6 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-native-certs",
- "tokio",
  "url",
 ]
 
@@ -1244,9 +1372,9 @@ name = "blaze-hub"
 version = "0.0.0"
 dependencies = [
  "blaze-protocol",
+ "blaze-sim",
  "blaze-std",
  "blaze-vfs",
- "hegeltest",
  "serde",
 ]
 
@@ -1264,7 +1392,7 @@ dependencies = [
  "blaze-radix",
  "blaze-rng",
  "blaze-serde",
- "hegeltest",
+ "blaze-sim",
  "postcard",
  "serde",
  "serde_json",
@@ -1281,7 +1409,7 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1329,6 +1457,7 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "memchr",
+ "snafu",
  "syntax",
 ]
 
@@ -1345,8 +1474,8 @@ dependencies = [
  "blaze-items",
  "blaze-mem",
  "blaze-query",
+ "blaze-sim",
  "cfg",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -1365,6 +1494,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
@@ -1393,11 +1523,23 @@ name = "blaze-kernel"
 version = "0.0.0"
 dependencies = [
  "blaze-cas",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-record",
+ "blaze-report",
+ "blaze-sim",
  "blaze-store-check",
- "hegeltest",
+]
+
+[[package]]
+name = "blaze-keyed"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-ids",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1405,14 +1547,45 @@ name = "blaze-launch"
 version = "0.0.0"
 dependencies = [
  "blaze-protocol",
- "hegeltest",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-launch-host"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "blaze-cas",
+ "blaze-codegen",
+ "blaze-format",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-items",
+ "blaze-launch",
+ "blaze-link",
+ "blaze-report",
+ "blaze-sim",
 ]
 
 [[package]]
 name = "blaze-launch-rt"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "blaze-launch",
+ "crossbeam-channel",
+ "crossbeam-queue",
+ "libc",
+]
+
+[[package]]
+name = "blaze-launcher"
+version = "0.0.0"
+dependencies = [
+ "blaze-client",
+ "blaze-core",
+ "blaze-launch",
+ "blaze-launch-rt",
  "crossbeam-channel",
  "libc",
 ]
@@ -1455,8 +1628,8 @@ dependencies = [
  "blaze-live",
  "blaze-mem",
  "blaze-sha256",
+ "blaze-sim",
  "gimli",
- "hegeltest",
  "object 0.40.0",
  "smallvec",
  "tracing",
@@ -1482,6 +1655,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-core",
  "blaze-diagnostics",
+ "blaze-findings",
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
@@ -1491,12 +1665,13 @@ dependencies = [
  "blaze-phf",
  "blaze-profile",
  "blaze-query",
+ "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "blaze-vfs",
  "cfg",
  "either",
  "expect-test",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -1524,7 +1699,7 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1544,14 +1719,15 @@ name = "blaze-lower"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-items",
  "blaze-query",
+ "blaze-sim",
  "blaze-units",
  "blaze-vfs",
  "cfg",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty-mir",
@@ -1577,6 +1753,7 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-lower",
+ "blaze-mem",
  "blaze-profile",
  "blaze-query",
  "blaze-serde",
@@ -1613,16 +1790,18 @@ version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-resolve",
  "blaze-serde",
+ "blaze-sim",
  "blaze-source",
  "cargo-platform",
  "cargo-util-schemas",
  "dunce",
+ "edition",
  "glob",
- "hegeltest",
  "pathdiff",
  "semver",
  "serde",
@@ -1643,11 +1822,35 @@ dependencies = [
  "blaze-check",
  "blaze-reclaim",
  "blaze-rng",
+ "blaze-sim",
  "crossbeam-channel",
- "hegeltest",
  "libc",
  "parking_lot",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "blaze-memo"
+version = "0.0.0"
+dependencies = [
+ "blaze-core",
+ "blaze-graph",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-mem",
+ "blaze-memo-macros",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-memo-macros"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1666,6 +1869,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-mutants"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-program",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-napi"
 version = "0.0.0"
 dependencies = [
@@ -1681,9 +1894,28 @@ dependencies = [
  "anyhow",
  "blaze-manifest",
  "cargo-util-schemas",
+ "edition",
  "glob",
  "pathdiff",
  "toml_edit",
+]
+
+[[package]]
+name = "blaze-pack"
+version = "0.0.0"
+dependencies = [
+ "blaze-report",
+]
+
+[[package]]
+name = "blaze-pg"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "blaze-cast",
+ "blaze-sha256",
+ "blaze-sim",
+ "blaze-sql",
 ]
 
 [[package]]
@@ -1691,26 +1923,7 @@ name = "blaze-phf"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
- "hegeltest",
-]
-
-[[package]]
-name = "blaze-premap"
-version = "0.0.0"
-dependencies = [
- "blaze-alloc-count",
- "blaze-bytes",
- "blaze-cas",
- "blaze-codegen",
- "blaze-core",
- "blaze-format",
- "blaze-graph",
- "blaze-hash",
- "blaze-ids",
- "blaze-inproc",
- "blaze-items",
- "blaze-link",
- "blaze-mem",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1727,12 +1940,13 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "blaze-v2-proof",
  "bytes",
  "crossbeam-channel",
  "crossbeam-queue",
- "hegeltest",
  "ix-prof",
  "libc",
  "parquet",
@@ -1746,15 +1960,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-program"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-protocol"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-fuzz",
  "blaze-hash",
  "blaze-ids",
  "blaze-serde",
- "hegeltest",
+ "blaze-sim",
  "serde",
  "serde_json",
 ]
@@ -1764,7 +1990,6 @@ name = "blaze-query"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "blaze-bytes",
  "blaze-check",
  "blaze-core",
  "blaze-format",
@@ -1776,15 +2001,15 @@ dependencies = [
  "blaze-protocol",
  "blaze-query-macros",
  "blaze-reclaim",
+ "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "blaze-vfs",
  "crossbeam-channel",
  "crossbeam-queue",
  "either",
  "hashbrown 0.17.1",
- "hegeltest",
  "indexmap",
- "intern",
  "serde",
  "smallvec",
  "thin-vec",
@@ -1798,6 +2023,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-hash",
  "blaze-query",
+ "blaze-report",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -1809,7 +2035,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-rng",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1817,6 +2043,14 @@ name = "blaze-reclaim"
 version = "0.0.0"
 dependencies = [
  "blaze-check",
+]
+
+[[package]]
+name = "blaze-record"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-rng",
 ]
 
 [[package]]
@@ -1848,10 +2082,26 @@ dependencies = [
  "serde_json",
  "stdx",
  "tar",
- "tokio",
  "toml",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "blaze-remote"
+version = "0.0.0"
+dependencies = [
+ "blaze-cas",
+ "blaze-format",
+ "blaze-http",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-sha256",
+ "blaze-sim",
+ "http",
+ "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1861,6 +2111,7 @@ dependencies = [
  "blaze-protocol",
  "serde",
  "sonic-rs",
+ "stdx",
  "toml",
  "unicode-width 0.2.3",
 ]
@@ -1893,13 +2144,27 @@ name = "blaze-rng"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "hegeltest",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-screen"
+version = "0.0.0"
+dependencies = [
+ "blaze-protocol",
+ "blaze-report",
+ "blaze-sim",
+ "expect-test",
+ "serde",
+ "serde_json",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
 name = "blaze-script"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "regex",
  "serde_json",
  "toml",
@@ -1909,6 +2174,7 @@ dependencies = [
 name = "blaze-seed-run"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-wasi",
  "libc",
  "wasmtime",
@@ -1935,7 +2201,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1946,8 +2212,8 @@ dependencies = [
  "blaze-hash",
  "blaze-items",
  "blaze-query",
+ "blaze-sim",
  "expect-test",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -1957,6 +2223,31 @@ dependencies = [
  "naga",
  "rustc_abi",
  "rustc_type_ir",
+]
+
+[[package]]
+name = "blaze-sim"
+version = "0.0.0"
+dependencies = [
+ "blaze-rng",
+]
+
+[[package]]
+name = "blaze-solo"
+version = "0.0.0"
+dependencies = [
+ "blaze-cas",
+ "blaze-core",
+ "blaze-front-items",
+ "blaze-ids",
+ "blaze-kernel",
+ "blaze-sim",
+ "blaze-store-check",
+ "blaze-vfs",
+ "serde",
+ "serde_json",
+ "syntax",
+ "tracing",
 ]
 
 [[package]]
@@ -1981,6 +2272,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-sql"
+version = "0.0.0"
+dependencies = [
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-sqlite"
+version = "0.0.0"
+dependencies = [
+ "blaze-cast",
+ "blaze-sim",
+ "blaze-sql",
+ "libsqlite3-sys",
+]
+
+[[package]]
 name = "blaze-std"
 version = "0.0.0"
 dependencies = [
@@ -1990,6 +2298,7 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-hash",
+ "blaze-hashcons",
  "blaze-http",
  "blaze-ids",
  "blaze-mem",
@@ -1999,8 +2308,8 @@ dependencies = [
  "blaze-report",
  "blaze-rng",
  "blaze-sha256",
+ "blaze-sim",
  "blaze-spin",
- "hegeltest",
  "http",
  "miniz_oxide",
  "objc2-core-foundation",
@@ -2014,6 +2323,7 @@ name = "blaze-stencil"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blake3",
  "blaze-alloc-count",
  "blaze-bytes",
  "blaze-codegen",
@@ -2021,6 +2331,8 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-inproc",
+ "blaze-launch",
+ "blaze-launch-rt",
  "blaze-lower",
  "blaze-macro-eval",
  "blaze-mem",
@@ -2033,6 +2345,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-interpreter",
  "cranelift-reader",
+ "crossbeam-channel",
  "gimli",
  "hir-ty-codegen",
  "libc",
@@ -2048,7 +2361,7 @@ name = "blaze-store-check"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
  "serde",
  "serde_json",
 ]
@@ -2078,12 +2391,13 @@ name = "blaze-testsel"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "blaze-api",
- "blaze-cas",
  "blaze-core",
- "blaze-hash",
+ "blaze-format",
  "blaze-ids",
+ "blaze-keyed",
  "blaze-protocol",
+ "blaze-rng",
+ "blaze-sim",
  "blaze-usercode",
 ]
 
@@ -2092,12 +2406,17 @@ name = "blaze-thin"
 version = "0.0.0"
 dependencies = [
  "blaze-api",
+ "blaze-certify",
  "blaze-client",
  "blaze-core",
  "blaze-format",
  "blaze-ids",
+ "blaze-protocol",
  "blaze-report",
+ "blaze-screen",
  "libc",
+ "stdx",
+ "toml",
  "tracing",
 ]
 
@@ -2124,20 +2443,27 @@ dependencies = [
 name = "blaze-ui"
 version = "0.0.0"
 dependencies = [
- "blaze-alloc-count",
  "blaze-api",
- "blaze-hash",
  "blaze-ids",
  "blaze-protocol",
  "blaze-query",
  "blaze-report",
  "blaze-v2-proof",
  "blaze-vfs",
- "expect-test",
- "hashbrown 0.17.1",
- "ratatui",
  "serde_json",
- "unicode-width 0.2.3",
+]
+
+[[package]]
+name = "blaze-unitkey"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-sim",
+ "cfg",
+ "intern",
+ "syntax",
 ]
 
 [[package]]
@@ -2146,6 +2472,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-alloc-count",
+ "blaze-audit",
+ "blaze-core",
+ "blaze-fetch",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
@@ -2174,6 +2503,7 @@ name = "blaze-usercode"
 version = "0.0.0"
 dependencies = [
  "aho-corasick",
+ "base-db",
  "blaze-alloc-count",
  "blaze-build-script",
  "blaze-cas",
@@ -2186,13 +2516,14 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-serde",
+ "blaze-sim",
  "blaze-vfs",
- "hegeltest",
  "libc",
  "memchr",
  "postcard",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2229,6 +2560,7 @@ dependencies = [
  "blaze-mem",
  "blaze-protocol",
  "blaze-reclaim",
+ "blaze-report",
  "blaze-serde",
  "hashbrown 0.17.1",
  "serde",
@@ -2299,12 +2631,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "by_address"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64fa3c856b712db6612c019f14756e64e4bcea13337a6b33b696333a9eaa2d06"
-
-[[package]]
 name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2356,15 +2682,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "castaway"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "cc"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2381,8 +2698,8 @@ name = "cfg"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
+ "blaze-sim",
  "expect-test",
- "hegeltest",
  "intern",
  "syntax",
  "syntax-bridge",
@@ -2523,20 +2840,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
-name = "compact_str"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dfdd1c2274d9aa354115b09dc9a901d6c5576818cdf70d14cae2bdb47df00ab"
-dependencies = [
- "castaway",
- "cfg-if",
- "itoa",
- "rustversion",
- "ryu",
- "static_assertions",
-]
-
-[[package]]
 name = "const-ast"
 version = "0.0.0"
 dependencies = [
@@ -2580,15 +2883,6 @@ name = "convert_case"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
-dependencies = [
- "unicode-segmentation",
-]
-
-[[package]]
-name = "convert_case"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -2912,33 +3206,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
-name = "crossterm"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
-dependencies = [
- "bitflags 2.13.2",
- "crossterm_winapi",
- "derive_more",
- "document-features",
- "mio",
- "parking_lot",
- "rustix",
- "signal-hook",
- "signal-hook-mio",
- "winapi",
-]
-
-[[package]]
-name = "crossterm_winapi"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
-dependencies = [
- "winapi",
-]
-
-[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2964,29 +3231,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cty"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
-
-[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
 dependencies = [
- "darling_core 0.20.11",
- "darling_macro 0.20.11",
-]
-
-[[package]]
-name = "darling"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec"
-dependencies = [
- "darling_core 0.24.1",
- "darling_macro 0.24.1",
+ "darling_core",
+ "darling_macro",
 ]
 
 [[package]]
@@ -3004,59 +3255,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "darling_core"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6837e2cf7485aaae18f86181d2f0e9a7ed297a025e220aeabf63fdebd3a2ddff"
-dependencies = [
- "ident_case",
- "proc-macro2",
- "quote",
- "strsim",
- "syn 3.0.9",
-]
-
-[[package]]
 name = "darling_macro"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
 dependencies = [
- "darling_core 0.20.11",
+ "darling_core",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "darling_macro"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785"
-dependencies = [
- "darling_core 0.24.1",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
-name = "dashu-base"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "861a614e79388a4c72aa66b0bdabc91e3a4f30d53e0c8d962953e207d75884d0"
-dependencies = [
- "num-modular",
-]
-
-[[package]]
-name = "dashu-int"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64a0490b40a6a3f6427970035f17f76fd59c01d3cd9f9140809672863a0d64c8"
-dependencies = [
- "cfg-if",
- "dashu-base",
- "num-modular",
- "static_assertions",
 ]
 
 [[package]]
@@ -3146,33 +3352,11 @@ version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "079c2738859003286c4940c2f7bd50f2f6f7f7688ad53cf8e6acda2dd0a918f2"
 dependencies = [
- "convert_case 0.6.0",
- "darling 0.20.11",
+ "convert_case",
+ "darling",
  "itertools 0.13.0",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "derive_more"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
-dependencies = [
- "derive_more-impl",
-]
-
-[[package]]
-name = "derive_more-impl"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
-dependencies = [
- "convert_case 0.10.0",
- "proc-macro2",
- "quote",
- "rustc_version",
  "syn 2.0.117",
 ]
 
@@ -3229,15 +3413,6 @@ name = "dissimilar"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aeda16ab4059c5fd2a83f2b9c9e9c981327b18aa8e3b313f7e6563799d4f093e"
-
-[[package]]
-name = "document-features"
-version = "0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
-dependencies = [
- "litrs",
-]
 
 [[package]]
 name = "drop_bomb"
@@ -3608,8 +3783,8 @@ dependencies = [
 name = "gpu"
 version = "0.0.0"
 dependencies = [
+ "blaze-sim",
  "gpu-macros",
- "hegeltest",
 ]
 
 [[package]]
@@ -3663,8 +3838,6 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
  "serde",
  "serde_core",
@@ -3691,40 +3864,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hegeltest"
-version = "0.50.3"
-dependencies = [
- "hegeltest-c",
- "hegeltest-macros",
- "parking_lot",
-]
-
-[[package]]
-name = "hegeltest-c"
-version = "0.48.0"
-dependencies = [
- "dashu-int",
- "hashbrown 0.17.1",
- "libm",
- "miniz_oxide",
- "once_cell",
- "rand",
- "rustc-hash 2.1.3",
- "rustix",
- "toml",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "hegeltest-macros"
-version = "0.50.3"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "hir"
 version = "0.0.0"
 dependencies = [
@@ -3738,6 +3877,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-query",
+ "blaze-report",
  "cfg",
  "either",
  "expect-test",
@@ -3782,6 +3922,8 @@ dependencies = [
  "blaze-mem",
  "blaze-phf",
  "blaze-query",
+ "blaze-record",
+ "blaze-sim",
  "cfg",
  "cov-mark",
  "crossbeam-channel",
@@ -3790,7 +3932,6 @@ dependencies = [
  "expect-test",
  "fst",
  "hashbrown 0.17.1",
- "hegeltest",
  "hir-expand",
  "indexmap",
  "intern",
@@ -3858,9 +3999,9 @@ dependencies = [
  "blaze-macro-eval",
  "blaze-query",
  "blaze-serde",
+ "blaze-sim",
  "blaze-units",
  "blaze-vfs",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -3901,20 +4042,25 @@ dependencies = [
  "base-db",
  "bitflags 2.13.2",
  "blaze-alloc-count",
+ "blaze-cas",
  "blaze-check",
  "blaze-codegen-code",
  "blaze-core",
  "blaze-dbsp",
  "blaze-format",
+ "blaze-front-items",
  "blaze-graph",
  "blaze-hash",
  "blaze-hashcons",
  "blaze-ids",
+ "blaze-kernel",
  "blaze-mem",
  "blaze-phf",
  "blaze-query",
  "blaze-reclaim",
+ "blaze-record",
  "blaze-serde",
+ "blaze-store-check",
  "cfg",
  "cov-mark",
  "crossbeam-channel",
@@ -4015,6 +4161,7 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-serde",
+ "blaze-sim",
  "blaze-stencil",
  "blaze-store-check",
  "blaze-v2-proof",
@@ -4025,7 +4172,6 @@ dependencies = [
  "cranelift-object",
  "either",
  "hashbrown 0.17.1",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -4135,11 +4281,12 @@ name = "hir-ty-lean"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-core",
  "blaze-ids",
  "blaze-query",
+ "blaze-sim",
  "cfg",
  "expect-test",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4201,6 +4348,7 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-rng",
+ "blaze-sim",
  "blaze-units",
  "cfg",
  "const-ast",
@@ -4208,7 +4356,6 @@ dependencies = [
  "either",
  "expect-test",
  "hashbrown 0.17.1",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -4269,8 +4416,8 @@ dependencies = [
  "blaze-items",
  "blaze-mem",
  "blaze-query",
+ "blaze-sim",
  "either",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4283,6 +4430,7 @@ dependencies = [
  "smallvec",
  "span",
  "syntax",
+ "tracing",
  "triomphe",
 ]
 
@@ -4295,7 +4443,7 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-query",
- "hegeltest",
+ "blaze-sim",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4669,29 +4817,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "instability"
-version = "0.3.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c3b5acc1e2fd9375041a388da33d1eb8aed5f7a8c0dd3543e3ea2805adfbe20"
-dependencies = [
- "darling 0.24.1",
- "indoc",
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
 name = "intern"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-check",
  "blaze-core",
- "blaze-format",
  "blaze-hash",
  "blaze-ids",
- "blaze-image",
  "blaze-mem",
  "blaze-phf",
 ]
@@ -4758,11 +4891,11 @@ dependencies = [
  "blaze-http",
  "blaze-inproc-rt",
  "blaze-sha256",
+ "blaze-sim",
  "crossbeam-channel",
  "crossbeam-queue",
  "flate2",
  "gimli",
- "hegeltest",
  "libc",
  "object 0.40.0",
  "rcgen",
@@ -4770,7 +4903,6 @@ dependencies = [
  "rustc-demangle",
  "serde",
  "serde_json",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4835,17 +4967,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kasuari"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f14c90e40a6133f4805b83542a7ed7364f56070b447f56e7f4e90297122209"
-dependencies = [
- "hashbrown 0.17.1",
- "portable-atomic",
- "thiserror",
-]
-
-[[package]]
 name = "la-arena"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4876,13 +4997,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "libmimalloc-sys"
-version = "0.1.49"
+name = "libsqlite3-sys"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
- "cty",
+ "pkg-config",
+ "vcpkg",
 ]
 
 [[package]]
@@ -4890,15 +5012,6 @@ name = "libzstd-rs-sys"
 version = "0.0.1-prerelease.2"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "line-clipping"
-version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e752191d037c44ad111a8caa762921926658402f01cc1253f7bef2020ece4f5e"
-dependencies = [
- "bitflags 2.13.2",
 ]
 
 [[package]]
@@ -4912,12 +5025,6 @@ name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
-
-[[package]]
-name = "litrs"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "llvm-sys"
@@ -4943,15 +5050,6 @@ name = "log"
 version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
-
-[[package]]
-name = "lru"
-version = "0.18.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
-dependencies = [
- "hashbrown 0.17.1",
-]
 
 [[package]]
 name = "lru-slab"
@@ -5062,18 +5160,6 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
-]
-
-[[package]]
-name = "mio"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
-dependencies = [
- "libc",
- "log",
- "wasi",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5207,12 +5293,6 @@ checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
 dependencies = [
  "num-traits",
 ]
-
-[[package]]
-name = "num-modular"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd8e500409e6cd603b03e477c26a6caecdc27ac58979a53e881c75eafc079f44"
 
 [[package]]
 name = "num-traits"
@@ -5407,39 +5487,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "palette"
-version = "0.7.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddeed8580d347d2abf3dcf06a5f0b3dc020258338526b277847cd4248a70fc64"
-dependencies = [
- "approx",
- "libm",
- "palette_derive",
- "palette_math",
-]
-
-[[package]]
-name = "palette_derive"
-version = "0.7.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88537020289b719d81be994ccf1bbf4990f477e2f69ee52fe3e45f43a02e56be"
-dependencies = [
- "by_address",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "palette_math"
-version = "0.7.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e6eb142958d64335fb0e345c5b9ead2ecd6fc438c307e9d7d3c4fd428dbaf12"
-dependencies = [
- "libm",
-]
-
-[[package]]
 name = "panic-in-drop"
 version = "0.1.0"
 dependencies = [
@@ -5514,10 +5561,10 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",
+ "blaze-sim",
  "crossbeam-channel",
  "edition",
  "expect-test",
- "hegeltest",
  "rustc-literal-escaper",
  "rustc_lexer",
  "smallvec",
@@ -5845,72 +5892,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ratatui"
-version = "0.30.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3274ba0a2c5e1bcad2a2005d20f4dc59dad26b2eb0940fb094500dba4099d57d"
-dependencies = [
- "instability",
- "ratatui-core",
- "ratatui-crossterm",
- "ratatui-widgets",
- "serde",
-]
-
-[[package]]
-name = "ratatui-core"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbb175c433c8e28a809d1f5773a2ae96e68c0ce40db865cbab1020bf33ae479c"
-dependencies = [
- "bitflags 2.13.2",
- "compact_str",
- "hashbrown 0.17.1",
- "itertools 0.14.0",
- "kasuari",
- "lru",
- "palette",
- "serde",
- "strum",
- "thiserror",
- "unicode-segmentation",
- "unicode-truncate",
- "unicode-width 0.2.3",
-]
-
-[[package]]
-name = "ratatui-crossterm"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "567584a3b0e6a8203c23de40b4861497266725eb5363dbfd18a1edd603cca9f0"
-dependencies = [
- "cfg-if",
- "crossterm",
- "instability",
- "ratatui-core",
-]
-
-[[package]]
-name = "ratatui-widgets"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66e3d19bcc9130ca376277d93b60767ff121ace3be06f5f95f81dd68956407d1"
-dependencies = [
- "bitflags 2.13.2",
- "hashbrown 0.17.1",
- "indoc",
- "instability",
- "itertools 0.14.0",
- "line-clipping",
- "ratatui-core",
- "serde",
- "strum",
- "time",
- "unicode-segmentation",
- "unicode-width 0.2.3",
-]
-
-[[package]]
 name = "rcgen"
 version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6200,8 +6181,6 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",
@@ -6251,12 +6230,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
-name = "ryu"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
 name = "safe_arch"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6294,6 +6267,7 @@ name = "scripts"
 version = "0.0.0"
 dependencies = [
  "blaze-script",
+ "blaze-sha256",
  "regex",
  "serde_json",
  "toml",
@@ -6500,37 +6474,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "signal-hook"
-version = "0.3.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
-dependencies = [
- "libc",
- "signal-hook-registry",
-]
-
-[[package]]
-name = "signal-hook-mio"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
-dependencies = [
- "libc",
- "mio",
- "signal-hook",
-]
-
-[[package]]
-name = "signal-hook-registry"
-version = "1.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
-dependencies = [
- "errno",
- "libc",
-]
-
-[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6595,16 +6538,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "socket2"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6698,18 +6631,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
 name = "stdx"
 version = "0.0.0"
 dependencies = [
  "blaze-core",
+ "blaze-sim",
  "crossbeam-channel",
- "hegeltest",
  "itertools 0.15.0",
  "libc",
  "stacker",
@@ -6727,27 +6654,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "strum"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
-dependencies = [
- "strum_macros",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
 
 [[package]]
 name = "subtle"
@@ -6798,6 +6704,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-phf",
  "crossbeam-channel",
  "either",
  "expect-test",
@@ -6872,7 +6779,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-ids",
  "blaze-phf",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -7012,32 +6919,6 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
-
-[[package]]
-name = "tokio"
-version = "1.54.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
-dependencies = [
- "bytes",
- "libc",
- "mio",
- "pin-project-lite",
- "socket2",
- "tokio-macros",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
 
 [[package]]
 name = "toml"
@@ -7232,7 +7113,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",
- "hegeltest",
+ "blaze-sim",
  "intern",
  "rustc_lexer",
  "span",
@@ -7326,17 +7207,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
 
 [[package]]
-name = "unicode-truncate"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
-dependencies = [
- "itertools 0.14.0",
- "unicode-segmentation",
- "unicode-width 0.2.3",
-]
-
-[[package]]
 name = "unicode-width"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7406,6 +7276,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"
@@ -7790,22 +7666,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "winapi"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
-dependencies = [
- "winapi-i686-pc-windows-gnu",
- "winapi-x86_64-pc-windows-gnu",
-]
-
-[[package]]
-name = "winapi-i686-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7813,12 +7673,6 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-core"

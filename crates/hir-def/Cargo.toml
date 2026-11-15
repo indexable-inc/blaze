@@ -55,6 +55,7 @@ blaze-mem.workspace = true
 inventory.workspace = true
 blaze-phf.workspace = true
 blaze-query.workspace = true
+blaze-record.workspace = true
 
 # This is a transitive dep, but we need to specify this
 # for the workspace-wide pinning
@@ -63,10 +64,10 @@ unicode-ident.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
+blaze-sim.workspace = true
 crossbeam-channel.workspace = true
 expect-test.workspace = true
 fst.workspace = true
-hegeltest.workspace = true
 
 # local deps
 test-utils.workspace = true

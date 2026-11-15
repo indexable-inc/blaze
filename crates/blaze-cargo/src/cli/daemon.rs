@@ -1,6 +1,10 @@
 //! The daemon this CLI is a client of: found at its socket ([`crate::serve::socket`]), started
 //! as `blaze serve` when none answers there, spoken to through [`blaze_api::client::Client`].
 //!
+//! With `[serve] host = "process"` in blaze's `config.toml` ([`host`]) a command that would
+//! start a daemon runs the daemon's engine in its own process instead ([`crate::serve::once`]):
+//! no socket, no second process, nothing left running when it exits.
+//!
 //! Without blaze-cargo's `native` feature (the wasm seed, docs/future/bootstrap.md) there is no
 //! daemon to find or start: [`connect`] hands back a client of the same engine run in this
 //! process for this command alone ([`crate::serve::once`]), and `blaze stop`, `status` and
@@ -12,6 +16,10 @@
         unused_imports,
         reason = "the daemon's start and its helpers are not in the seed"
     )
+)]
+#![cfg_attr(
+    not(feature = "native"),
+    expect(blaze::unwired, reason = "wired under `native`; the wasm seed has no daemon to start")
 )]
 
 use std::{
@@ -26,6 +34,8 @@ use blaze_api::{
     Request, ResponseRef, Status,
     client::{Client, ClientError},
 };
+
+pub use blaze_thin::host::Host;
 
 use super::args::DaemonVerb;
 use crate::{raw::process::Reaped, serve::Phase};
@@ -103,6 +113,9 @@ pub(crate) fn told_to_stop(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Start {
     IfMissing,
+    /// As [`Start::IfMissing`], for a request that said `--no-prebuilt`: a home's first daemon
+    /// started for it installs no sealed layer from a pack ([`super::store::first_use`]).
+    IfMissingNoPrebuilt,
     Never,
 }
 
@@ -214,6 +227,9 @@ pub fn nothing_listens(error: &ClientError) -> bool {
 #[cfg(all(unix, feature = "native"))]
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     let socket = crate::serve::socket()?;
+    if start != Start::Never && host().map_err(anyhow::Error::msg)? == Host::Process {
+        return in_process(start, &socket).map(Some);
+    }
     let refused = match Client::unix(&socket) {
         Ok(client) if start == Start::Never => return Ok(Some(client)),
         Ok(client) => match this_build(client, &socket)? {
@@ -229,6 +245,9 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     if let Some(refused) = refused {
         say_start(&socket, &refused)?;
     }
+    // Lane packs-1112: a home with no store yet and an `install` base in its settings gets
+    // the configured packs before its first daemon starts (`super::store::first_use`).
+    super::store::first_use(start != Start::IfMissingNoPrebuilt).map_err(anyhow::Error::msg)?;
     use anyhow::Context as _;
     let (log, ready, mut child) = started()?;
     let pid = child.id();
@@ -253,11 +272,25 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
             crate::raw::process::ended_within(pid, ENDING)
                 .context("waiting for the daemon that closed its pipe to end")?;
             let status = child.try_wait().context("asking how the daemon it started ended")?;
-            Err(match status.and_then(reaped) {
-                Some(ended) => DaemonError::Exited { socket, log, pid, phase, ended },
-                None => DaemonError::Closed { socket, log, pid, phase, inside },
+            match status.and_then(reaped) {
+                // Another command started a daemon of this home at the same time, and that one
+                // took the state and listens (`serve::Served`): this command is its client.
+                Some(Reaped::Code(code)) if code == blaze_core::exit::Exit::Served.code() => {
+                    let client = Client::unix(&socket)
+                        .map_err(|error| DaemonError::Connect { socket: socket.clone(), error })?;
+                    match this_build(client, &socket)? {
+                        Some(client) => Ok(Some(client)),
+                        None => anyhow::bail!(
+                            "the daemon another command started at {} at the same time as this one's (pid {pid}) \
+                             was another build of blaze, and was stopped: run this command again to start this \
+                             build's",
+                            socket.display()
+                        ),
+                    }
+                }
+                Some(ended) => Err(DaemonError::Exited { socket, log, pid, phase, ended }.into()),
+                None => Err(DaemonError::Closed { socket, log, pid, phase, inside }.into()),
             }
-            .into())
         }
         Heard::Nothing { phase, inside } => {
             Err(DaemonError::NotListening { socket, log, pid, phase, inside }.into())
@@ -272,10 +305,10 @@ fn say_started(log: &Path, pid: u32) {
     match tail(log) {
         Ok(bytes) => {
             for said in start_said(&String::from_utf8_lossy(&bytes), pid) {
-                eprintln!("blaze: the daemon it started (pid {pid}) {said}");
+                blaze_report::errln!("blaze: the daemon it started (pid {pid}) {said}");
             }
         }
-        Err(error) => eprintln!(
+        Err(error) => blaze_report::errln!(
             "blaze: how the daemon it started (pid {pid}) started is unread: {}: {error}",
             log.display()
         ),
@@ -415,7 +448,7 @@ fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client
             named(&ours)
         );
     }
-    eprintln!(
+    blaze_report::errln!(
         "blaze: the daemon at {} (pid {pid}) is another build of blaze ({}), not this one ({}): stopping it and \
          starting this one",
         socket.display(),
@@ -476,13 +509,13 @@ fn say_start(socket: &Path, refused: &ClientError) -> anyhow::Result<()> {
                 blaze_api::units::main_file(&place).display()
             );
         }
-        Installed::Elsewhere(theirs) => eprintln!(
+        Installed::Elsewhere(theirs) => blaze_report::errln!(
             "blaze: starting the daemon for {}: the installed units serve {} (`blaze daemon install` with this \
              environment serves this one)",
             socket.display(),
             theirs.display()
         ),
-        Installed::No => eprintln!(
+        Installed::No => blaze_report::errln!(
             "blaze: starting the daemon (no socket activation is installed: `blaze daemon install` has the system \
              start it on demand)"
         ),
@@ -625,13 +658,11 @@ fn heard(ready: &std::io::PipeReader, long: Duration) -> io::Result<Heard> {
     }
 }
 
-/// Whether a launchd or systemd unit serves `socket`. Units live under `HOME`: without one,
-/// none is installed.
+/// Whether a launchd or systemd unit serves `socket`. Units live under the user's home
+/// ([`blaze_core::home::user`]): without one, none is installed.
 #[cfg(all(unix, feature = "native"))]
 fn activation(socket: &Path) -> anyhow::Result<Installed> {
-    if blaze_api::activation::Manager::here().is_none()
-        || std::env::var_os("HOME").is_none_or(|it| it.is_empty())
-    {
+    if blaze_api::activation::Manager::here().is_none() || blaze_core::home::user().is_err() {
         return Ok(Installed::No);
     }
     Ok(blaze_api::units::installed(&blaze_api::units::place_here()?, socket)?)
@@ -664,6 +695,9 @@ const ASK_AGAIN: Duration = Duration::from_millis(20);
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     use anyhow::Context as _;
     let socket = crate::serve::socket()?;
+    if start != Start::Never && host().map_err(anyhow::Error::msg)? == Host::Process {
+        return in_process(start, &socket).map(Some);
+    }
     let refused = match Client::unix(&socket) {
         Ok(client) if start == Start::Never => return Ok(Some(client)),
         Ok(client) => match this_build(client, &socket)? {
@@ -677,8 +711,8 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
         Err(error) => Some(error),
     };
     match &refused {
-        Some(refused) => eprintln!("blaze: starting the daemon ({refused})"),
-        None => eprintln!("blaze: starting the daemon"),
+        Some(refused) => blaze_report::errln!("blaze: starting the daemon ({refused})"),
+        None => blaze_report::errln!("blaze: starting the daemon"),
     }
     let (log, mut child) = started()?;
     let pid = child.id();
@@ -723,6 +757,49 @@ pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
          Unix sockets on Unix and Windows only",
         crate::serve::socket()?.display()
     )
+}
+
+/// Where this command's build is served: `[serve] host` of blaze's `config.toml`
+/// ([`blaze_thin::host`], the thin `blaze`'s reader too, so the two can't differ), the daemon
+/// where there is no file or no home. A file that can't be read, or that says what `[serve]`
+/// does not take, is an error naming it.
+pub fn host() -> Result<Host, String> {
+    let Ok(home) = blaze_manifest::user_config::home() else {
+        return Ok(Host::Daemon);
+    };
+    let file = blaze_manifest::user_config::file(&home);
+    match std::fs::read_to_string(&file) {
+        Ok(text) => Host::from_toml(&text).map_err(|why| format!("{}: {why}", file.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Host::Daemon),
+        Err(error) => Err(format!("{} can't be read: {error}", file.display())),
+    }
+}
+
+/// The connection of a command whose build is served in its own process (`[serve] host =
+/// "process"`, [`blaze_thin::host`]): the daemon's own engine started here for this command
+/// alone, its one client this command, stopped and its durable state written as the client
+/// closes, then the process exits with nothing torn down ([`crate::serve::once`]).
+///
+/// A daemon listening at the home's `socket` holds the state this process would serve from,
+/// and serves for as long as it is used: refused, naming it and the way out, never waited
+/// for. Another command of this home serving in its own process is waited for, as one daemon
+/// waits for the one before it (`serve::hold`), since it ends with its command.
+#[cfg(feature = "native")]
+fn in_process(start: Start, socket: &Path) -> anyhow::Result<Client> {
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        anyhow::bail!(
+            "blaze's config.toml sets `[serve] host = \"process\"`, and a daemon (`blaze serve`) listens at {} and holds \
+             this home's state: `blaze stop` ends it, and the next command serves in its own process",
+            socket.display()
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = socket;
+    // A home with no store yet gets the configured packs first, as before a daemon's first
+    // start ([`connect`]).
+    super::store::first_use(start != Start::IfMissingNoPrebuilt).map_err(anyhow::Error::msg)?;
+    crate::serve::once::connect()
 }
 
 /// The seed's connection: the engine `blaze serve` runs, started in this process for this
@@ -812,84 +889,9 @@ pub struct Died {
     /// ([`blaze_profile::crash`]), for a daemon that is gone: `Ok(None)` where it left no record
     /// of one, the error where the record was refused or could not be read.
     pub crash: Result<Option<blaze_profile::panics::PanicRow>, String>,
-    /// What it said in its log of its memory ceiling ([`ceiling_said`]); `None` where it said
-    /// nothing of one.
-    pub memory: Option<CeilingSaid>,
-    /// The flight recording it wrote as it went down (`crate::serve::flightrec`: a panic, its
-    /// memory ceiling, a stall), the newest of its pid; `None` where it wrote none.
+    /// The flight recording it wrote as it went down (`crate::serve::flightrec`: a panic, a
+    /// stall), the newest of its pid; `None` where it wrote none.
     pub flightrec: Option<PathBuf>,
-}
-
-/// What a daemon said in its log of its memory ceiling ([`crate::serve::ceiling`]): the last
-/// ceiling it set, whether the kernel holds it there, and its last word on how near it came.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CeilingSaid {
-    /// The ceiling, in bytes.
-    pub bytes: u64,
-    /// The kernel's limit at the ceiling, where its line says one.
-    pub kernel: Option<Kernel>,
-    /// What made the ceiling (its budget's `from`); empty where its line was not read.
-    pub from: String,
-    /// The footprint its last line on it said came within 1/8 of the ceiling; `None` before
-    /// one, or after a line that said it eased.
-    pub near: Option<u64>,
-    /// The footprint its own watch said passed the ceiling, as it ended
-    /// ([`blaze_core::exit::Exit::MemoryCeiling`]).
-    pub passed: Option<u64>,
-}
-
-/// The kernel's limit a daemon's ceiling is held at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kernel {
-    /// macOS: a fatal memorystatus limit, which jetsam kills it at.
-    Jetsam,
-    /// Linux: its cgroup's `memory.max`, which the OOM killer kills it at.
-    Cgroup,
-}
-
-/// How a daemon's end came of its memory ceiling ([`Died::at_ceiling`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AtCeiling {
-    /// Its own watch ended it: its footprint passed the ceiling at this many bytes.
-    Stopped { passed: u64 },
-    /// The kernel killed it at its limit (a SIGKILL, which it can't say), its last line on
-    /// memory having said it came near, at this many bytes.
-    Killed { kernel: Kernel, near: u64 },
-}
-
-/// SIGKILL's number on every system blaze runs a daemon on (Linux, macOS): what a kill at the
-/// kernel's memory limit ends a process with.
-const SIGKILL: i32 = 9;
-
-/// What the line a catchable signal that ends the daemon writes says after its pid
-/// (`serve::signals::record_ends`): a daemon whose log says it was ended so was not killed.
-const ENDED_BY_SIGNAL: &str = " ended by signal ";
-
-impl Died {
-    /// Whether, and how, its end came of its memory ceiling: its exit status says its own
-    /// watch ended it, or its log does; or it is gone (or ended by SIGKILL) with nothing said,
-    /// its ceiling held by the kernel and its last line on memory near it, so the kernel killed
-    /// it at its limit. `None` for any other end.
-    pub fn at_ceiling(&self) -> Option<AtCeiling> {
-        let (_, ended) = self.ended?;
-        let said = self.memory.as_ref()?;
-        let stopped = AtCeiling::Stopped { passed: said.passed.unwrap_or(said.bytes) };
-        match ended {
-            Ended::Running => None,
-            Ended::Reaped(Reaped::Code(code)) => {
-                (code == blaze_core::exit::Exit::MemoryCeiling.code()).then_some(stopped)
-            }
-            Ended::Gone if said.passed.is_some() => Some(stopped),
-            Ended::Gone | Ended::Reaped(Reaped::Signal(SIGKILL)) => {
-                let signalled = self.said.iter().any(|line| line.contains(ENDED_BY_SIGNAL));
-                match (said.kernel, said.near, signalled) {
-                    (Some(kernel), Some(near), false) => Some(AtCeiling::Killed { kernel, near }),
-                    _ => None,
-                }
-            }
-            Ended::Reaped(Reaped::Signal(_)) => None,
-        }
-    }
 }
 
 /// How many frames of a dead daemon's crash record the CLI names.
@@ -900,48 +902,13 @@ const INSIDE_THREADS: usize = 16;
 
 impl std::fmt::Display for Died {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::serve::ceiling::Gib;
-        let at_ceiling = self.at_ceiling();
-        match (self.ended, at_ceiling, &self.memory) {
-            (Some((pid, _)), Some(end), Some(said)) => {
-                let ceiling = Gib(said.bytes);
-                match end {
-                    AtCeiling::Stopped { passed } => write!(
-                        f,
-                        "the daemon (pid {pid}) was stopped at its memory ceiling of {ceiling} GiB: its footprint reached {} GiB",
-                        Gib(passed)
-                    )?,
-                    AtCeiling::Killed { kernel, near } => {
-                        let by = match kernel {
-                            Kernel::Jetsam => "jetsam",
-                            Kernel::Cgroup => "its cgroup's memory.max, the OOM killer",
-                        };
-                        write!(
-                            f,
-                            "the daemon (pid {pid}) was killed by the kernel at its memory limit ({by}) of {ceiling} GiB: its footprint was last said at {} GiB",
-                            Gib(near)
-                        )?;
-                    }
-                }
-                write!(
-                    f,
-                    "; to raise the ceiling, start the daemon with {}=<GiB> (or `blaze serve --memory-gb <GiB>`), \
-                     which is never more than the machine budget (3/4 of the machine's memory)",
-                    crate::serve::MEMORY_VAR
-                )?;
-                if !said.from.is_empty() {
-                    write!(f, "; its ceiling was {}", said.from)?;
-                }
-            }
-            _ => self.ended_said(f)?,
-        }
-        self.rest_said(f, at_ceiling.is_some())
+        self.ended_said(f)?;
+        self.rest_said(f)
     }
 }
 
 impl Died {
-    /// The head of what it says of a daemon whose end did not come of its ceiling: how it
-    /// ended.
+    /// The head of what it says of a daemon: how it ended.
     fn ended_said(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use crate::raw::process::Reaped;
         match self.ended {
@@ -974,12 +941,11 @@ impl Died {
     }
 
     /// The rest of what it says after its head: its log's last lines, what its threads were
-    /// inside and its crash record. `at_ceiling`: its end came of its ceiling, so no other
-    /// cause of a silent end is offered.
-    fn rest_said(&self, f: &mut std::fmt::Formatter<'_>, at_ceiling: bool) -> std::fmt::Result {
+    /// inside and its crash record.
+    fn rest_said(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.said.is_empty() {
             write!(f, "; its log {} says nothing since it listened", self.log.display())?;
-            if matches!(self.ended, Some((_, Ended::Gone))) && !at_ceiling {
+            if matches!(self.ended, Some((_, Ended::Gone))) {
                 // A signal it catches writes its line (`serve::signals::record_ends`).
                 f.write_str(
                     " (a SIGKILL, as an out-of-memory kill or `kill -9` sends, or a SIGSEGV that is no stack \
@@ -1063,64 +1029,6 @@ pub fn last_start(log: &str) -> Option<(u32, Vec<&str>)> {
     Some((pid, said))
 }
 
-/// What the daemon `pid` said of its memory ceiling anywhere in `log` (its start's line comes
-/// before it listens): its last ceiling line ([`crate::serve::ceiling::SAYS`]), and after it its
-/// last word on memory, near the ceiling ([`crate::serve::ceiling::NEAR`]) or eased
-/// ([`crate::serve::ceiling::EASED`]), and whether its own watch stopped it
-/// ([`crate::serve::ceiling::STOPPED`]). A near or stopped line names the ceiling too, so one
-/// read past the end of a long log's tail still gives it. `None` where it said nothing of one.
-#[cfg(feature = "native")]
-pub fn ceiling_said(log: &str, pid: u32) -> Option<CeilingSaid> {
-    use crate::serve::ceiling::{BY_CGROUP, BY_JETSAM, EASED, FROM, NEAR, SAYS, STOPPED};
-    /// The bytes `text` begins with, and what follows ` bytes`.
-    fn bytes(text: &str) -> Option<(u64, &str)> {
-        let end = text.find(|it: char| !it.is_ascii_digit()).unwrap_or(text.len());
-        let n = text[..end].parse().ok()?;
-        Some((n, text[end..].strip_prefix(" bytes")?))
-    }
-    /// `F bytes <word> C bytes`: the footprint and the ceiling.
-    fn two(text: &str, word: &str) -> Option<(u64, u64)> {
-        let (footprint, rest) = bytes(text)?;
-        let (ceiling, _) = bytes(rest.strip_prefix(word)?)?;
-        Some((footprint, ceiling))
-    }
-    let blank = |bytes| CeilingSaid {
-        bytes,
-        kernel: None,
-        from: String::new(),
-        near: None,
-        passed: None,
-    };
-    let own = format!("blaze serve: pid {pid}"); // alloc: an error path, once a command
-    let mut said: Option<CeilingSaid> = None;
-    for line in log.lines() {
-        let Some(rest) = line.strip_prefix(own.as_str()) else { continue };
-        if let Some(rest) = rest.strip_prefix(SAYS) {
-            let Some((ceiling, rest)) = bytes(rest) else { continue };
-            let it = said.get_or_insert_with(|| blank(ceiling));
-            it.bytes = ceiling;
-            it.kernel = if rest.contains(BY_JETSAM) {
-                Some(Kernel::Jetsam)
-            } else if rest.contains(BY_CGROUP) {
-                Some(Kernel::Cgroup)
-            } else {
-                None
-            };
-            // alloc: as above
-            it.from = rest.split_once(FROM).map(|(_, from)| from.to_owned()).unwrap_or_default();
-        } else if let Some((footprint, ceiling)) = rest.strip_prefix(NEAR).and_then(|it| two(it, " of ")) {
-            said.get_or_insert_with(|| blank(ceiling)).near = Some(footprint);
-        } else if let Some((_, ceiling)) = rest.strip_prefix(EASED).and_then(|it| two(it, " of ")) {
-            said.get_or_insert_with(|| blank(ceiling)).near = None;
-        } else if let Some((footprint, ceiling)) =
-            rest.strip_prefix(STOPPED).and_then(|it| two(it, " passed "))
-        {
-            said.get_or_insert_with(|| blank(ceiling)).passed = Some(footprint);
-        }
-    }
-    said
-}
-
 /// `7` of `blaze serve: listening on /run/blaze/v2.sock (pid 7)`.
 #[cfg(feature = "native")]
 fn listening_pid(line: &str) -> Option<u32> {
@@ -1146,12 +1054,10 @@ pub fn died() -> anyhow::Result<Died> {
             said: Vec::new(),
             inside: Ok(None),
             crash: Ok(None),
-            memory: None,
             flightrec: None,
         });
     };
     let said = said.into_iter().map(str::to_owned).collect(); // alloc: as above
-    let memory = ceiling_said(&text, pid);
     let ended = crate::raw::process::ended_within(pid, ENDING)
         .with_context(|| format!("waiting for the daemon (pid {pid}) that hung up to end"))?;
     // Only a Unix parent hears how its child ended; a Windows one has its exit code only from a
@@ -1178,7 +1084,7 @@ pub fn died() -> anyhow::Result<Died> {
     // Written before it ended, whether or not it is gone yet: a build's stall writes one and
     // the daemon stops after.
     let flightrec = crate::serve::flightrec::latest(&crate::serve::state()?, pid);
-    Ok(Died { log, ended: Some((pid, ended)), said, inside, crash, memory, flightrec })
+    Ok(Died { log, ended: Some((pid, ended)), said, inside, crash, flightrec })
 }
 
 /// The last [`TAIL_BYTES`] of the daemon's log.
@@ -1277,11 +1183,77 @@ fn started() -> anyhow::Result<(std::path::PathBuf, std::process::Child)> {
     Ok((log, child?))
 }
 
+/// What a command that found nothing listening at `socket` may say: nothing more (`Ok`: no
+/// daemon is running) only when no daemon holds blaze's state either. One that does is named,
+/// and is the error: "no daemon is running" is never said while one runs (agents.json A37;
+/// the class: two answers to "which daemon", the socket's and the state's).
+pub fn absent(holder: &crate::serve::Holder, socket: &Path) -> Result<(), String> {
+    let crate::serve::Holder::Daemon { pid, lock } = holder else { return Ok(()) };
+    let who = match pid {
+        Some(pid) => format!("pid {pid}"), // alloc: an error's text, once
+        None => "its pid not yet written".to_owned(),
+    };
+    Err(format!(
+        "a daemon is running ({who}: it holds blaze's state, {}) and nothing listens at {}, the socket this \
+         command uses: it was started with another XDG_RUNTIME_DIR, where its socket is, or its socket's file \
+         was removed. This command told it nothing; run it with the daemon's XDG_RUNTIME_DIR, or end that \
+         process",
+        lock.display(),
+        socket.display()
+    ))
+}
+
+/// [`absent`], of this blaze's state and socket. Where the state has no lock (not Unix) there
+/// is no second answer to ask for.
+#[cfg(feature = "native")]
+fn none_runs() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let holder = crate::serve::holder(&crate::serve::state()?)?;
+        absent(&holder, &crate::serve::socket()?).map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// A failed call to the daemon at this blaze's socket, as an error that names the daemon: one
+/// of another API schema ([`ClientError::Schema`]) is another build of blaze, running, named
+/// by its schema and by the pid its state's lock holds, with what stops it.
+#[cfg(feature = "native")]
+fn of_daemon(error: ClientError) -> anyhow::Error {
+    let ClientError::Schema { theirs } = error else { return error.into() };
+    let socket = match crate::serve::socket() {
+        Ok(socket) => socket,
+        Err(error) => return error,
+    };
+    #[cfg(unix)]
+    let holder = crate::serve::state().and_then(|state| crate::serve::holder(&state));
+    #[cfg(not(unix))]
+    let holder: anyhow::Result<crate::serve::Holder> = Ok(crate::serve::Holder::None);
+    anyhow::Error::msg(other_schema(theirs, holder.ok().as_ref(), &socket))
+}
+
+/// What is said of a running daemon that speaks API schema `theirs`, not this blaze's.
+pub fn other_schema(theirs: u32, holder: Option<&crate::serve::Holder>, socket: &Path) -> String {
+    let who = match holder {
+        Some(crate::serve::Holder::Daemon { pid: Some(pid), .. }) => format!("pid {pid}"), // alloc: an error's text, once
+        _ => "its pid is the first word of `serve.lock` in blaze's state".to_owned(),
+    };
+    format!(
+        "a daemon is running at {} ({who}) and speaks API schema {theirs}, this blaze {}: it is another build \
+         of blaze, which this one can ask nothing and can't tell to stop. That build's own `blaze stop` stops \
+         it; so does ending that process",
+        socket.display(),
+        blaze_api::SCHEMA
+    )
+}
+
 /// `blaze stop`: the daemon made durable and ended, waited for until its socket is gone.
 // dyn: the CLI's output writer, written a few times per command.
 #[cfg(feature = "native")]
 pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     let Some(mut client) = connect(Start::Never)? else {
+        // Nothing listens at the socket: said as "no daemon" only once the state says so too.
+        none_runs()?;
         writeln!(err, "no daemon is running")?;
         return Ok(0);
     };
@@ -1291,7 +1263,8 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
             // alloc: error path, the daemon's errors, said once it is done.
             said.push(error.what.to_owned());
         }
-    })?;
+    })
+    .map_err(of_daemon)?;
     for what in said {
         err.write_all(super::say::error(&what, color).as_bytes())?;
     }
@@ -1351,6 +1324,8 @@ pub fn status(
         false => None,
     };
     let Some(mut client) = connect(Start::Never)? else {
+        // Nothing listens at the socket: said as "no daemon" only once the state says so too.
+        none_runs()?;
         match &place {
             Some(place) => out.write_all(status_json(place, None)?.as_bytes())?,
             None => writeln!(out, "no daemon is running")?,
@@ -1364,7 +1339,8 @@ pub fn status(
         // alloc: error path, the daemon's errors, said once it is done.
         ResponseRef::Error(error) => said.push(error.what.to_owned()),
         _ => {}
-    })?;
+    })
+    .map_err(of_daemon)?;
     for what in said {
         err.write_all(super::say::error(&what, color).as_bytes())?;
     }
@@ -1551,6 +1527,24 @@ pub fn units(_: DaemonVerb, _: &mut dyn std::io::Write, _: bool) -> anyhow::Resu
     anyhow::bail!("blaze daemon: {NO_DAEMON}")
 }
 
+/// Each task the daemon's task watchdog found stuck in a build under way, with that build's
+/// id, as one line each (`#3 stuck 4 min: codegen of seq-macro 0.3.6 waits on ...`); empty when
+/// nothing is stuck. What `blaze status` says first, and the doctor's "is anything stuck".
+pub fn stuck_lines(status: &Status) -> Vec<String> {
+    let (mut lines, mut said) = (Vec::new(), Vec::new());
+    for build in &status.builds {
+        for stuck in &build.now.stuck {
+            // A task of no build is in every build's model: said once, at the first.
+            if said.contains(&stuck) {
+                continue;
+            }
+            said.push(stuck);
+            lines.push(format!("#{} {stuck}", build.id)); // alloc: a stuck task, once a status
+        }
+    }
+    lines
+}
+
 /// The daemon's [`Status`] for people.
 pub fn status_lines(status: &Status) -> String {
     let ids: Vec<String> = status.requests.iter().map(u64::to_string).collect();
@@ -1558,15 +1552,26 @@ pub fn status_lines(status: &Status) -> String {
         true => "0".to_owned(),
         false => format!("{} ({})", ids.len(), ids.join(", ")),
     };
-    let mut lines = format!(
-        "pid: {}\nrequests: {requests}\nviews: {}\nmemory: {} of {}\n",
+    // What is stuck, first: a stuck task fails its build, and is why the rest looks as it does.
+    let stuck = stuck_lines(status);
+    let mut lines = String::new();
+    if !stuck.is_empty() {
+        lines.push_str(&format!("stuck: {}\n", stuck.len()));
+        for line in &stuck {
+            lines.push_str(&format!("  {line}\n"));
+        }
+    }
+    lines += &format!(
+        "pid: {}\nrequests: {requests}\nviews: {}\nmemory: {}\n",
         status.pid,
         status.views,
-        bytes(status.memory_bytes),
-        bytes(status.budget_bytes)
+        bytes(status.memory_bytes)
     );
     if let Some(why) = &status.history {
         lines.push_str(&format!("history: {why}\n"));
+    }
+    if let Some(how) = &status.placed_by {
+        lines.push_str(&format!("placing: {how}\n"));
     }
     // The settings it was started with that are set: what a client setting other values is
     // refused over ([`crate::serve::settings`]).
@@ -1592,11 +1597,8 @@ pub fn status_lines(status: &Status) -> String {
         lines.push_str(&format!("builds: {}\n", status.builds.len()));
     }
     for build in &status.builds {
-        let mut board = blaze_ui::board::Board::new(&build.what, blaze_ui::test_view::Paint::Plain);
-        board.take(build.now.clone()); // clone: the status is borrowed, and read once
-        let mut compact = String::new(); // alloc: a line a build
-        // A fresh board's first line is always due.
-        board.line(&mut compact);
+        // alloc: a line a build
+        let compact = blaze_screen::progress_fields(&build.now, build.now.at_ms);
         lines.push_str(&format!("  #{} {}: {compact}\n", build.id, build.what));
         for span in &build.spans {
             lines.push_str(&format!("    {span}\n"));
@@ -1953,90 +1955,6 @@ mod refusals {
         );
     }
 
-    /// A daemon's lines on its memory ceiling are read from anywhere in its log, its own pid's
-    /// alone. One its own watch stopped, or one the kernel killed after it said it came near
-    /// its limit, is said as that failure, naming the ceiling and how to raise it, never as a
-    /// hang-up; one gone after its footprint eased, or ended by a signal it said, is not.
-    #[test]
-    fn a_daemon_ended_at_its_memory_ceiling_says_so_and_how_to_raise_it() {
-        use crate::serve::{
-            LISTENING,
-            ceiling::{BY_JETSAM, EASED, FROM, NEAR, SAYS, STOPPED},
-        };
-        const GIB: u64 = 1 << 30;
-        let from = "BLAZE_DAEMON_MEMORY_GB=48, 48.00 GB, less a margin of 1.07 GB";
-        let log = format!(
-            "blaze serve: pid 70{SAYS}{one} bytes (1 GiB), held by the daemon's own watch alone\n\
-             blaze serve: pid 7{SAYS}{ceiling} bytes (48 GiB), {BY_JETSAM}a fatal memorystatus limit of 49152 MiB), and by its own watch every 100 ms{FROM}{from}\n\
-             {LISTENING}/run/blaze/v2.sock (pid 7)\n\
-             blaze serve: pid 7{NEAR}{near} bytes of {ceiling} bytes (45 of 48 GiB)\n",
-            one = GIB,
-            ceiling = 48 * GIB,
-            near = 45 * GIB,
-        );
-        let said = ceiling_said(&log, 7).unwrap();
-        assert_eq!(
-            said,
-            CeilingSaid {
-                bytes: 48 * GIB,
-                kernel: Some(Kernel::Jetsam),
-                from: from.to_owned(),
-                near: Some(45 * GIB),
-                passed: None,
-            }
-        );
-        assert_eq!(ceiling_said(&log, 8), None, "another pid's lines are not its");
-        let died = |ended, said: Vec<String>, memory| Died {
-            log: PathBuf::from("/b/v2/serve.log"),
-            ended: Some((7, ended)),
-            said,
-            inside: Ok(None),
-            crash: Ok(None),
-            memory,
-            flightrec: None,
-        };
-        let killed = died(Ended::Gone, Vec::new(), Some(said.clone()));
-        assert_eq!(killed.at_ceiling(), Some(AtCeiling::Killed { kernel: Kernel::Jetsam, near: 45 * GIB }));
-        let text = killed.to_string();
-        assert!(
-            text.starts_with(
-                "the daemon (pid 7) was killed by the kernel at its memory limit (jetsam) of 48 GiB: \
-                 its footprint was last said at 45 GiB; to raise the ceiling, start the daemon with \
-                 BLAZE_DAEMON_MEMORY_GB=<GiB> (or `blaze serve --memory-gb <GiB>`)"
-            ),
-            "{text}"
-        );
-        assert!(text.contains(&format!("; its ceiling was {from}")), "{text}");
-        assert!(!text.contains("as an out-of-memory kill"), "no other cause is offered: {text}");
-        // Eased since: a kill then is no kill at its limit.
-        let eased = format!("{log}blaze serve: pid 7{EASED}{} bytes of {} bytes (30 of 48 GiB)\n", 30 * GIB, 48 * GIB);
-        let gone = died(Ended::Gone, Vec::new(), ceiling_said(&eased, 7));
-        assert_eq!(gone.at_ceiling(), None);
-        assert!(gone.to_string().starts_with("the daemon (`blaze serve`, pid 7) is gone"));
-        // A signal it said ended it.
-        let signalled = vec!["blaze serve: pid 7 ended by signal 15, SIGTERM: termination signal".to_owned()];
-        assert_eq!(died(Ended::Gone, signalled, Some(said.clone())).at_ceiling(), None);
-        // Stopped by its own watch: its exit status, or its line where it is gone.
-        let stopped = format!(
-            "{log}blaze serve: pid 7{STOPPED}{} bytes passed {} bytes (48.00 of 48 GiB): it ends with exit status 77\n",
-            48 * GIB + 1,
-            48 * GIB
-        );
-        let stopped = ceiling_said(&stopped, 7).unwrap();
-        assert_eq!(stopped.passed, Some(48 * GIB + 1));
-        for ended in [Ended::Gone, Ended::Reaped(Reaped::Code(blaze_core::exit::Exit::MemoryCeiling.code()))] {
-            let text = died(ended, Vec::new(), Some(stopped.clone())).to_string();
-            assert!(
-                text.starts_with(
-                    "the daemon (pid 7) was stopped at its memory ceiling of 48 GiB: its footprint reached 48.00 GiB; to raise"
-                ),
-                "{ended:?}: {text}"
-            );
-        }
-        // Another exit status is another end, whatever the log says.
-        assert_eq!(died(Ended::Reaped(Reaped::Code(101)), Vec::new(), Some(stopped)).at_ceiling(), None);
-    }
-
     #[cfg(unix)]
     #[test]
     fn a_daemon_that_died_says_how_and_quotes_its_log() {
@@ -2050,7 +1968,6 @@ mod refusals {
             said,
             inside: Ok(None),
             crash: Ok(None),
-            memory: None,
             flightrec: Some(PathBuf::from("/b/v2/flightrec/7-1700000000000.cbor")),
         };
         let text = died.to_string();
@@ -2069,8 +1986,9 @@ mod refusals {
             )),
             "{text}"
         );
+        // The log's last line and the reading come before the recording, which ends the text.
         assert!(
-            text.ends_with("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal\nits profile history holds no reading of what its threads were inside"),
+            text.contains("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal\nits profile history holds no reading of what its threads were inside\nits flight recording"),
             "{text}"
         );
         let inside = blaze_profile::reading::Reading {
@@ -2093,7 +2011,6 @@ mod refusals {
             said: Vec::new(),
             inside: Ok(Some(inside)),
             crash: Ok(None),
-            memory: None,
             flightrec: None,
         }
         .to_string();
@@ -2116,7 +2033,6 @@ mod refusals {
             said: Vec::new(),
             inside: Ok(None),
             crash: Ok(None),
-            memory: None,
             flightrec: None,
         }
         .to_string();

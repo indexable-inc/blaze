@@ -37,7 +37,7 @@ use crate::{
 pub(super) fn lints<'db>(
     cx: &Cx<'_, 'db>,
     walk: &Walk<'db>,
-    uses: &Uses<'_, '_>,
+    uses: &Uses<'_>,
     unused: &Unused,
 ) -> Vec<Found> {
     // alloc: holds only diagnostics that fire; empty, it allocates nothing
@@ -66,7 +66,7 @@ fn qualification<'db>(
     cx: &Cx<'_, 'db>,
     file: HirFileId,
     path: ast::Path<'db>,
-    uses: &Uses<'_, '_>,
+    uses: &Uses<'_>,
     unused: &Unused,
     scratch: &mut Scratch<'db>,
 ) -> Option<Found> {

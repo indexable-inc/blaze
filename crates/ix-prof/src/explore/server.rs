@@ -1,50 +1,51 @@
 //! The driver: one WebTransport endpoint on `127.0.0.1` at a port the OS picks, on a thread of
-//! its own with a current-thread tokio runtime, so the program's threads never wait on it. What
-//! a session answers is [`session`]'s; this module reads and writes the streams.
+//! its own, so the program's threads never wait on it. Everything the server decides is
+//! [`Serving`]'s, a sans-IO machine; this module only runs it: blaze-http's HTTP/3 driver loop
+//! ([`Loop`]: the UDP socket and QUIC's timers) and the machine on one blaze-core native
+//! driver, whose one wait is its poll, and each [`Job`] the machine asks for (a source's
+//! answer, a live tick, a new certificate) on a thread of its own, whose result comes back on
+//! a queue and wakes the poll ([`blaze_core::Waker`]).
 //!
-//! A session is refused before it opens unless its CONNECT is to [`link::PATH`] (404) from an
-//! allowed Origin (403). Opened, its requests are read and answered one at a time until a good
-//! `hello` ([`session::Step`]); then the server opens the live stream and answers each
-//! bidirectional stream on its own, at most [`session::MAX_IN_FLIGHT`] at once. A request the
-//! page stops (`STOP_SENDING`, a reset) is dropped where it waits and its [`Stop`] set, so the
-//! source's work on the blocking pool ends with it and is thrown away.
-//!
-//! The transport is blaze-http's HTTP/3 core (`blaze_http::h3`) under its tokio driver, which
-//! owns the UDP socket and the timers.
+//! A step of the loop is: the stop asked for, the jobs' results handed to the machine, the
+//! machine stepped, its jobs started and its lines said, the certificate it serves published to
+//! [`Explorer::link`], the HTTP/3 loop stepped, the effects submitted, and one poll to the
+//! earlier of the two machines' deadlines. No thread or wake is added per input beyond the h3
+//! driver's own: a job is one thread and one wake.
 
 use std::{
+    alloc::Global,
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    panic::AssertUnwindSafe,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::JoinHandle,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use blaze_http::h3::{
-    self, Identity, ServerConfig, Transport,
-    tokio_driver::{Driver, RecvStream, Request as Incoming, SendStream, Session},
+use blaze_core::{Driver as _, Waker, lock::Lock};
+use blaze_http::{
+    h3::{self, Endpoint, Identity, ServerConfig, Transport, driver::Loop},
+    mailbox::{self, Rx, Tx},
 };
-use blaze_core::lock::Lock;
-use serde::Serialize;
+use crossbeam_queue::SegQueue;
 use serde_json::Value;
-use tokio::{
-    sync::{mpsc, oneshot, watch},
-    time::MissedTickBehavior,
-};
 
 use super::{
-    CoreWasm, Kind, OpError, Source, Stop, Tick,
+    CoreWasm, Kind, OpError, Source,
     cert::{Cert, CertError, Rotation},
     frame,
     link::{self, Origins, Token},
-    session::{self, Emit, Served, Slot, Step},
+    serving::{Clock, Done, Feeding, Job, JobId, SHUTDOWN, Serving, Setup, TAGS, Work},
+    session::{self, Served},
 };
 use crate::clock;
 
-/// How often the wall clock is asked whether the certificate is due.
-pub const CHECK: Duration = Duration::from_secs(600);
-/// How long dropping an [`Explorer`] waits for the blocking pool's work (a source's answer)
-/// before leaving it to finish on its own.
-pub const SHUTDOWN: Duration = Duration::from_secs(1);
+/// How long the explorer's thread may take to make its driver and bind its socket: both take
+/// milliseconds; past this the thread is stuck and the start says so.
+const START_WAIT: Duration = Duration::from_secs(10);
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_secs(30);
 
@@ -57,7 +58,8 @@ pub struct Config {
     /// to run it, and the server's log lines, its close reason, its certificate's common name
     /// and its thread (`blaze-explore`, the spaces as dashes) are named by it.
     pub name: &'static str,
-    /// How often each session's live stream ticks, as `hello`'s `live_every_ms` says it.
+    /// How often each session's live stream ticks, as `hello`'s `live_every_ms` says it; never
+    /// zero.
     pub every: Duration,
     /// The explorer core this program serves the page (explore-core.md decision 3): `hello`
     /// names it and the `core` op answers its bytes. `Err` is why there is none (where the
@@ -66,22 +68,24 @@ pub struct Config {
     pub core: Result<CoreWasm, String>,
 }
 
+/// What the program's threads share with the explorer's.
 struct Shared {
     token: Token,
-    origins: Origins,
     port: u16,
     name: &'static str,
-    every: Duration,
-    source: Arc<dyn Source>,
-    cert: watch::Sender<Arc<Served>>,
-    core: Result<CoreWasm, String>,
+    /// The certificate served now, as the loop last published it.
+    served: Lock<Arc<Served>>,
+    /// Set by [`Explorer`]'s drop, then the loop woken.
+    stop: AtomicBool,
+    waker: Waker,
 }
 
 /// A running explorer; dropping it closes every session and stops the server, waiting at most
-/// [`SHUTDOWN`] for work under way.
+/// [`SHUTDOWN`] for the pages to acknowledge their closes.
 pub struct Explorer {
     shared: Arc<Shared>,
-    stop: Option<oneshot::Sender<()>>,
+    /// Ends (its sender dropped) as the explorer's thread ends, however it ends.
+    ended: Option<Rx<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -92,20 +96,27 @@ impl Explorer {
 
     /// The SHA-256 of the certificate served now, as the link carries it.
     pub fn certhash(&self) -> String {
-        // clone: the hash out of the watch's lock, once a link
-        self.shared.cert.borrow().hash.clone()
+        // clone: the hash out of the lock, once a link
+        self.shared.served.lock().hash.clone()
     }
 
     /// The link to print and open: it changes when the certificate is made anew.
     pub fn link(&self) -> String {
-        link::link(self.shared.port, &self.shared.token, &self.shared.cert.borrow().hash)
+        link::link(self.shared.port, &self.shared.token, &self.shared.served.lock().hash)
     }
 }
 
 impl Drop for Explorer {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            _ = stop.send(());
+        self.shared.stop.store(true, Ordering::Release);
+        self.shared.waker.wake();
+        let Some(ended) = self.ended.take() else { return };
+        // The loop ends at most SHUTDOWN after it sees the stop; past twice that it is stuck,
+        // and is left rather than joined.
+        let waited = mailbox::block_on("the explorer's thread to close its sessions", Some(SHUTDOWN * 2), ended.recv());
+        if let Err(why) = waited {
+            eprintln!("{}: the explorer's thread was left running: {why}", self.shared.name);
+            return;
         }
         if let Some(thread) = self.thread.take() {
             let _wait = tracing::info_span!(target: "blaze::ix_prof", "join the explorer's thread", wait = "thread", on = self.shared.name).entered();
@@ -119,9 +130,10 @@ impl Drop for Explorer {
 pub enum StartError {
     Clock(std::time::SystemTimeError),
     Cert(CertError),
-    Runtime(std::io::Error),
-    Bind(std::io::Error),
+    /// blaze-core's native driver, or the explorer's thread's start: what failed.
+    Driver(String),
     Thread(std::io::Error),
+    /// The HTTP/3 endpoint refused its config, or its socket was not bound.
     Config(h3::Error),
 }
 
@@ -132,15 +144,10 @@ impl std::fmt::Display for StartError {
                 write!(f, "the wall clock is before 1970, so no certificate can be dated: {why}")
             }
             StartError::Cert(why) => write!(f, "{why}"),
-            StartError::Runtime(why) => {
-                write!(f, "the explorer's tokio runtime did not start: {why}")
-            }
-            StartError::Bind(why) => {
-                write!(f, "the explorer could not listen on 127.0.0.1 (UDP): {why}")
-            }
+            StartError::Driver(why) => write!(f, "the explorer's driver did not start: {why}"),
             StartError::Thread(why) => write!(f, "the explorer's thread did not start: {why}"),
             StartError::Config(why) => {
-                write!(f, "the explorer's HTTP/3 endpoint refused its config: {why}")
+                write!(f, "the explorer could not listen on 127.0.0.1 (UDP): {why}")
             }
         }
     }
@@ -153,74 +160,31 @@ pub fn serve(config: Config) -> Result<Explorer, StartError> {
     let rotation = Rotation::new(unix_now_s()?);
     let cert = Cert::make(rotation.current(), config.name).map_err(StartError::Cert)?;
     let identity = cert.identity().map_err(StartError::Cert)?;
-    let (ready_to, ready) = crossbeam_channel::unbounded::<Result<Arc<Shared>, StartError>>();
-    let (stop, stopped) = oneshot::channel();
+    let served = Served { hash: cert.hash, not_after_s: cert.validity.not_after_s };
+    let (ready_to, ready) = mailbox::channel::<Result<Arc<Shared>, StartError>>(Some(1));
+    let (ended_to, ended) = mailbox::channel::<()>(Some(1));
     let name = config.name;
     let thread = std::thread::Builder::new()
-        // alloc: once a server, its thread's name
         .name(name.replace(' ', "-"))
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(it) => it,
-                Err(why) => {
-                    _ = ready_to.send(Err(StartError::Runtime(why)));
-                    return;
-                }
-            };
-            runtime.block_on(async move {
-                let bound = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-                    .map_err(StartError::Bind)
-                    .and_then(|socket| {
-                        let runtime = tokio::runtime::Handle::current();
-                        Driver::spawn(&runtime, socket, Some(server_config(identity)), None)
-                            .map_err(StartError::Config)
-                    })
-                    .map(|(driver, incoming)| {
-                        let port = driver.local_addr().port();
-                        ((driver, incoming), port)
-                    });
-                let (transport, port) = match bound {
-                    Ok(it) => it,
-                    Err(why) => {
-                        _ = ready_to.send(Err(why));
-                        return;
-                    }
-                };
-                let served = Served { hash: cert.hash, not_after_s: cert.validity.not_after_s };
-                let shared = Arc::new(Shared {
-                    token: Token::random(),
-                    origins: Origins { dev: config.dev_origin },
-                    port,
-                    name: config.name,
-                    every: config.every,
-                    source: config.source,
-                    cert: watch::Sender::new(Arc::new(served)),
-                    core: config.core,
-                });
-                if ready_to.send(Ok(Arc::clone(&shared))).is_err() {
-                    return;
-                }
-                run(transport, shared, rotation, stopped).await;
-            });
-            runtime.shutdown_timeout(SHUTDOWN);
+            // Dropped as the thread ends, however it ends: the drop's wait ends with it.
+            let _ended = ended_to;
+            start(config, identity, served, rotation, &ready_to);
         })
         .map_err(StartError::Thread)?;
-    let started = {
-        let _wait = tracing::info_span!(target: "blaze::ix_prof", "wait for the explorer to listen", wait = "channel", on = name).entered();
-        ready.recv()
-    };
+    let started = mailbox::block_on("the explorer's thread to bind its socket", Some(START_WAIT + SHUTDOWN), ready.recv());
     match started {
-        Ok(Ok(shared)) => Ok(Explorer { shared, stop: Some(stop), thread: Some(thread) }),
-        Ok(Err(why)) => {
+        Ok(Some(Ok(shared))) => Ok(Explorer { shared, ended: Some(ended), thread: Some(thread) }),
+        Ok(Some(Err(why))) => {
             _ = thread.join();
             Err(why)
         }
-        Err(_) => {
+        Ok(None) => {
             _ = thread.join();
-            Err(StartError::Thread(std::io::Error::other(
-                "the explorer's thread ended before it listened",
-            )))
+            Err(StartError::Thread(std::io::Error::other("the explorer's thread ended before it listened")))
         }
+        // The thread is stuck past its own bound: it is left, not joined.
+        Err(blocked) => Err(StartError::Driver(blocked.to_string())),
     }
 }
 
@@ -229,357 +193,209 @@ fn unix_now_s() -> Result<u64, StartError> {
 }
 
 fn server_config(identity: Identity) -> ServerConfig {
-    ServerConfig { identity, transport: Transport { idle: IDLE, keep_alive: Some(KEEP_ALIVE) } }
-}
-
-async fn run(
-    (driver, mut incoming): (Driver, mpsc::UnboundedReceiver<Incoming>),
-    shared: Arc<Shared>,
-    mut rotation: Rotation,
-    mut stop: oneshot::Receiver<()>,
-) {
-    let mut check = tokio::time::interval(CHECK);
-    check.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            request = incoming.recv() => match request {
-                Some(request) => {
-                    tokio::spawn(session(Arc::clone(&shared), request));
-                }
-                None => break,
-            },
-            _ = check.tick() => rotate(&driver, &shared, &mut rotation).await,
-            _ = &mut stop => break,
-        }
+    ServerConfig {
+        identity,
+        transport: Transport { idle: IDLE, keep_alive: Some(KEEP_ALIVE) },
+        requests: false,
     }
-    // Each session is told the code; a page that does not acknowledge in LINGER is closed
-    // anyway, and SHUTDOWN bounds the whole of it.
-    let reason = format!("{} stopped", shared.name);
-    _ = tokio::time::timeout(SHUTDOWN, driver.close(session::CLOSE_STOPPED, &reason)).await;
 }
 
-/// Makes and serves a new certificate when [`Rotation`] says it is due. One not made is said
-/// on stderr and tried again at the next check; the one served keeps being served until then,
-/// and until it expires.
-async fn rotate(driver: &Driver, shared: &Shared, rotation: &mut Rotation) {
-    let now = match unix_now_s() {
+/// The explorer's thread: its driver, its endpoint bound, then the loop.
+fn start(config: Config, identity: Identity, served: Served, rotation: Rotation, ready_to: &Tx<Result<Arc<Shared>, StartError>>) {
+    // A caller that went away wants no answer.
+    let refuse = |why: StartError| {
+        _ = ready_to.send(Err(why));
+    };
+    // No file effect is asked: the root is never read.
+    let mut driver = match blaze_core::native(Path::new("/"), 1) {
         Ok(it) => it,
-        Err(why) => {
-            eprintln!("{}: the certificate is not checked: {why}", shared.name);
+        Err(why) => return refuse(StartError::Driver(format!("blaze-core's native driver: {why}"))),
+    };
+    let Some(waker) = driver.waker() else {
+        return refuse(StartError::Driver(
+            "blaze-core's native driver gives no waker: a finished job could not end the loop's wait".to_owned(),
+        ));
+    };
+    // quinn-proto's clock is an `Instant`: the epoch is read once, right after the native
+    // driver whose clock (`Driver::now`, from its start) it stands for.
+    let epoch = Instant::now();
+    let endpoint = match Endpoint::new(epoch, Some(server_config(identity)), None) {
+        Ok(it) => it,
+        Err(why) => return refuse(StartError::Config(why)),
+    };
+    let at = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    let mut core = Loop::new(endpoint, 0, at);
+    let mut effects = Vec::new_in(Global);
+    let mut done = Vec::new_in(Global);
+    // Bounded by START_WAIT on the driver's clock.
+    let local = loop {
+        if let Some(local) = core.local() {
+            break local;
+        }
+        if let Some(error) = core.failed() {
+            return refuse(StartError::Config(error.clone()));
+        }
+        if driver.now() > START_WAIT {
+            return refuse(StartError::Driver(format!("binding the UDP socket at {at}: not bound in {START_WAIT:?}")));
+        }
+        core.step(driver.now(), &mut effects);
+        driver.submit(&mut effects);
+        {
+            let _wait = tracing::info_span!(target: "blaze::ix_prof", "bind the explorer's socket", wait = "driver", on = config.name).entered();
+            driver.poll(&mut done, blaze_core::wait::Deadline::after(driver.now(), START_WAIT));
+        }
+        for completion in done.drain(..) {
+            core.complete(completion);
+        }
+    };
+    let Config { source, dev_origin, name, every, core: wasm } = config;
+    let token = Token::random();
+    let setup = Setup {
+        // clone: once a server, the core's copy beside the link's
+        token: token.clone(),
+        origins: Origins { dev: dev_origin },
+        name,
+        every,
+        served,
+        rotation,
+        core: wasm,
+    };
+    let serving = Serving::new(setup, TAGS, clock_of(&driver));
+    let shared = Shared {
+        token,
+        port: local.port(),
+        name,
+        served: Lock::new("ixprof.explore.served", Arc::clone(serving.served())),
+        stop: AtomicBool::new(false),
+        waker,
+    };
+    let shared = Arc::new_in(shared, Global);
+    if ready_to.send(Ok(Arc::clone(&shared))).is_err() {
+        return;
+    }
+    run(&mut driver, core, serving, &shared, &source);
+}
+
+fn clock_of(driver: &impl blaze_core::Driver) -> Clock {
+    Clock { now: driver.now(), now_ns: clock::now_ns(), wall_s: driver.wall_ns() / 1_000_000_000 }
+}
+
+/// The loop, until the explorer stops (and its sessions are closed, or [`SHUTDOWN`] passed) or
+/// its socket fails.
+fn run(driver: &mut impl blaze_core::Driver, mut core: Loop, mut serving: Serving, shared: &Shared, source: &Arc<dyn Source>) {
+    let results: Arc<SegQueue<(JobId, Done)>> = Arc::new_in(SegQueue::new(), Global);
+    let mut effects = Vec::new_in(Global);
+    let mut done = Vec::new_in(Global);
+    let mut jobs = Vec::new_in(Global);
+    let mut said = Vec::new_in(Global);
+    let mut published = Arc::clone(serving.served());
+    loop {
+        if shared.stop.load(Ordering::Acquire) {
+            serving.stop(driver.now(), format!("{} stopped", shared.name));
+        }
+        let now = driver.now();
+        core.endpoint().advance_clock(now);
+        while let Some((id, result)) = results.pop() {
+            serving.done(id, result);
+        }
+        serving.step(clock_of(driver), core.endpoint(), &mut effects);
+        serving.take_jobs(&mut jobs);
+        for job in jobs.drain(..) {
+            run_job(job, source, &results, &shared.waker);
+        }
+        serving.take_said(&mut said);
+        for line in said.drain(..) {
+            eprintln!("{line}");
+        }
+        if !Arc::ptr_eq(&published, serving.served()) {
+            published = Arc::clone(serving.served());
+            *shared.served.lock() = Arc::clone(&published);
+        }
+        // Closed, or a page did not acknowledge its close in SHUTDOWN: either way the server is
+        // done.
+        if serving.over(core.endpoint()).is_some() {
             return;
         }
-    };
-    let Some(validity) = rotation.due(now) else { return };
-    let made = Cert::make(validity, shared.name).and_then(|cert| Ok((cert.identity()?, cert)));
-    let served = match made {
-        Ok((identity, cert)) => {
-            driver.set_identity(identity).await.map(|()| cert).map_err(StartError::Config)
+        if let Some(error) = core.failed() {
+            eprintln!("{}: the explorer stopped: {error}", shared.name);
+            return;
         }
-        Err(why) => Err(StartError::Cert(why)),
-    };
-    match served {
-        Ok(cert) => {
-            rotation.rotated(validity);
-            let served = Served { hash: cert.hash, not_after_s: validity.not_after_s };
-            shared.cert.send_replace(Arc::new(served));
+        core.step(now, &mut effects);
+        driver.submit(&mut effects);
+        {
+            let _wait = tracing::info_span!(target: "blaze::ix_prof", "wait for the explorer's socket, timers and jobs", wait = "driver", on = shared.name).entered();
+            driver.poll(&mut done, core.deadline().min(serving.deadline()));
         }
-        Err(why) => eprintln!(
-            "{}: the certificate was not made anew ({why}); the one served expires at {} (Unix \
-             seconds) and a new one is tried in {} minutes",
-            shared.name,
-            rotation.current().not_after_s,
-            CHECK.as_secs() / 60
-        ),
-    }
-}
-
-/// A session's core, shared by its streams: each locks it for one step.
-type Core = Arc<Lock<session::Session>>;
-
-/// A request's [`Slot`], given back to the core however the request's task ends.
-struct Held {
-    core: Core,
-    /// `Some` until dropped.
-    slot: Option<Slot>,
-    started_ns: i64,
-}
-
-impl Held {
-    fn new(core: &Core, slot: Slot) -> Held {
-        // clone: a handle (an `Arc`) of the session's core
-        Held { core: Arc::clone(core), started_ns: slot.started_ns(), slot: Some(slot) }
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            self.core.lock().ended(slot);
-        }
-    }
-}
-
-/// The session's next request stream and its slot; `None` when the session is over. A stream
-/// over the limit is refused on its own task and the next one taken.
-async fn next_stream(connection: &Session, core: &Core) -> Option<(SendStream, RecvStream, Held)> {
-    loop {
-        let (send, recv) = connection.accept_bi().await.ok()?;
-        let opened = core.lock().opened(clock::now_ns());
-        match opened {
-            Ok(slot) => return Some((send, recv, Held::new(core, slot))),
-            Err(refused) => {
-                tokio::spawn(refuse(send, recv, refused));
+        // What came is received at the time it came, not at the time the poll began.
+        core.endpoint().advance_clock(driver.now());
+        for completion in done.drain(..) {
+            if core.owns(completion.tag) {
+                core.complete(completion);
+            } else if serving.owns(completion.tag) {
+                serving.complete(completion);
+            } else {
+                panic!("the explorer's loop: {:?} is neither its HTTP/3 driver's nor its serving core's", completion.tag);
             }
         }
     }
 }
 
-async fn session(shared: Arc<Shared>, request: Incoming) {
-    if request.path() != link::PATH {
-        request.refuse(404);
-        return;
-    }
-    if !shared.origins.allows(request.origin()) {
-        request.refuse(403);
-        return;
-    }
-    let Ok(connection) = request.accept().await else { return };
-    let core: Core = Arc::new(Lock::new("ixprof.explore.core", session::Session::new(shared.name)));
-    // Until a good hello, one request at a time.
-    loop {
-        let Some((mut send, mut recv, held)) = next_stream(&connection, &core).await else {
-            return;
+/// Runs `job` on a thread of its own; its result is queued on `results` and the loop woken.
+fn run_job(job: Job, source: &Arc<dyn Source>, results: &Arc<SegQueue<(JobId, Done)>>, waker: &Waker) {
+    let Job { id, work } = job;
+    let (to, wake, source) = (Arc::clone(results), waker.clone(), Arc::clone(source));
+    let spawned = std::thread::Builder::new().spawn(move || {
+        let done = match std::panic::catch_unwind(AssertUnwindSafe(|| work_on(work, &*source, &clock::now_ns))) {
+            Ok(done) => done,
+            Err(panic) => Done::Failed(OpError::new(
+                Kind::Encode,
+                format!("the answer's work did not end: it panicked: {}", panic_message(&*panic)),
+            )),
         };
-        let (step, request) = step(&shared, &core, &mut recv).await;
-        let first = answer(&shared, &connection, &mut send, step, request, held).await;
-        if first {
-            break;
-        }
-        if core.lock().phase() == session::Phase::Closed {
-            return;
-        }
-    }
-    // clone: a handle (an `Arc`) of the session's connection
-    let feed = live(Arc::clone(&shared), connection.clone(), shared.cert.subscribe());
-    let live = tokio::spawn(feed);
-    while let Some((send, recv, held)) = next_stream(&connection, &core).await {
-        let (shared, core) = (Arc::clone(&shared), Arc::clone(&core));
-        // clone: a handle (an `Arc`) of the session's connection
-        tokio::spawn(stream(shared, connection.clone(), core, send, recv, held));
-    }
-    live.abort();
-}
-
-/// A request's stream after hello: read, answered, written.
-async fn stream(
-    shared: Arc<Shared>,
-    connection: Session,
-    core: Core,
-    mut send: SendStream,
-    mut recv: RecvStream,
-    held: Held,
-) {
-    let (step, request) = step(&shared, &core, &mut recv).await;
-    answer(&shared, &connection, &mut send, step, request, held).await;
-}
-
-/// The core's step for the request on `recv`, and the request's bytes, which a
-/// [`Step::Op`]'s source is given parsed.
-async fn step(shared: &Shared, core: &Core, recv: &mut RecvStream) -> (Step, Vec<u8>) {
-    match read(recv).await {
-        Ok(bytes) => (core.lock().request(&shared.token, &bytes), bytes),
-        // alloc: none, an empty request: a refusal reads nothing of it
-        Err(why) => (Step::Refuse(why), Vec::new()),
+        to.push((id, done));
+        wake.wake();
+    });
+    if let Err(why) = spawned {
+        results.push((id, Done::Failed(OpError::new(Kind::Encode, format!("the answer's work did not start: {why}")))));
+        waker.wake();
     }
 }
 
-/// Carries out `step` on `send`, `request` the bytes it was decided on: whether it was the
-/// session's first good hello.
-async fn answer(
-    shared: &Shared,
-    connection: &Session,
-    send: &mut SendStream,
-    step: Step,
-    request: Vec<u8>,
-    held: Held,
-) -> bool {
-    match step {
-        Step::Hello { first } => {
-            let served = Arc::clone(&shared.cert.borrow());
-            let core = shared.core.as_ref().ok();
-            let bytes = session::hello_bytes(&shared.source.hello(), &served, shared.every, core);
-            send_bytes(send, &bytes).await;
-            first
-        }
-        Step::Core => {
-            send_bytes(send, &session::core_bytes(&shared.core)).await;
-            false
-        }
-        Step::Refuse(error) => {
-            send_bytes(send, &session::error_bytes(&error)).await;
-            false
-        }
-        Step::Close { error, code } => {
-            send_bytes(send, &session::error_bytes(&error)).await;
-            connection.close(code, error.kind);
-            false
-        }
-        Step::Op { name } => {
-            let source = Arc::clone(&shared.source);
-            let started_ns = held.started_ns;
-            // Dropped as this ends however it ends (answered, stopped by the page, the session
-            // gone, the server stopping): the sender gone is the source's stop.
-            let (_stop, stopping): (_, Stop) = crossbeam_channel::bounded::<()>(0);
-            let work = tokio::task::spawn_blocking(move || {
-                // The request whole, for the source: the core read only its `op`. The core
-                // took these bytes as a JSON object, so a failure here is the two readings
-                // disagreeing, answered as what it is.
-                let answer = match serde_json::from_slice::<Value>(&request) {
-                    Ok(args) => source
-                        .op(&name, &args, &stopping)
-                        .unwrap_or_else(|| Err(session::unknown_op(&name, &source.hello()))),
-                    Err(why) => Err(OpError::new(
-                        Kind::BadArgs,
-                        format!("the request of `{name}` is not JSON: {why}"),
-                    )
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    match (panic.downcast_ref::<&'static str>(), panic.downcast_ref::<String>()) {
+        (Some(message), _) => message,
+        (None, Some(message)) => message,
+        (None, None) => "a panic with no message",
+    }
+}
+
+/// Does `work` with `source`, `now_ns` the source's clock: the one runner of a [`Job`], the
+/// native loop's and the simulation's.
+pub(crate) fn work_on(work: Work, source: &dyn Source, now_ns: &dyn Fn() -> i64) -> Done {
+    match work {
+        Work::Hello => Done::Hello(source.hello()),
+        Work::Op { name, request, started_ns, stop } => {
+            // The request whole, for the source: the core read only its `op`. The core took
+            // these bytes as a JSON object, so a failure here is the two readings disagreeing,
+            // answered as what it is.
+            let answer = match serde_json::from_slice::<Value>(&request) {
+                Ok(args) => source
+                    .op(&name, &args, &stop)
+                    .unwrap_or_else(|| Err(session::unknown_op(&name, &source.hello()))),
+                Err(why) => Err(OpError::new(Kind::BadArgs, format!("the request of `{name}` is not JSON: {why}"))
                     .with("op", name.as_str())),
-                };
-                frame::answer_bytes(answer, session::elapsed_ns(started_ns, clock::now_ns()))
-            });
-            let bytes = tokio::select! {
-                done = work => match done {
-                    Ok(bytes) => bytes,
-                    Err(why) => session::error_bytes(&OpError::new(
-                        Kind::Encode,
-                        format!("the answer's work did not end: {why}"),
-                    )),
-                },
-                _ = send.stopped() => return false,
             };
-            send_bytes(send, &bytes).await;
-            drop(held);
-            false
+            Done::Op(frame::answer_bytes(answer, session::elapsed_ns(started_ns, now_ns())))
+        }
+        Work::Tick { mut feeding, at_ns } => {
+            let Feeding { live, tick } = &mut *feeding;
+            let live = live.get_or_insert_with(|| source.live());
+            tick.clear(at_ns);
+            let read = live.tick(at_ns, tick);
+            Done::Tick { feeding, read }
+        }
+        Work::Cert { validity, name } => {
+            Done::Cert(Cert::make(validity, name).and_then(|cert| Ok((cert.identity()?, cert.hash))))
         }
     }
-}
-
-async fn refuse(mut send: SendStream, mut recv: RecvStream, refused: OpError) {
-    recv.stop(0);
-    send_bytes(&mut send, &session::error_bytes(&refused)).await;
-}
-
-/// The request on `recv`: at most [`session::MAX_REQUEST`] bytes, whole within
-/// [`session::REQUEST_WAIT`].
-async fn read(recv: &mut RecvStream) -> Result<Vec<u8>, OpError> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let reading = async {
-        loop {
-            match recv.read(&mut chunk).await {
-                Ok(Some(n)) if bytes.len() + n > session::MAX_REQUEST => {
-                    return Err(session::too_long());
-                }
-                // alloc: a request, at most MAX_REQUEST
-                Ok(Some(n)) => bytes.extend_from_slice(&chunk[..n]),
-                Ok(None) => return Ok(()),
-                Err(why) => return Err(session::unread(why)),
-            }
-        }
-    };
-    match tokio::time::timeout(session::REQUEST_WAIT, reading).await {
-        Ok(Ok(())) => Ok(bytes),
-        Ok(Err(why)) => Err(why),
-        Err(_) => Err(session::late()),
-    }
-}
-
-async fn send_bytes(send: &mut SendStream, bytes: &[u8]) {
-    if send.write_all(bytes).await.is_ok() {
-        send.finish();
-    }
-}
-
-/// The live stream: every [`Config::every`], a frame of each table of the session's own feed
-/// with rows (and of a [`super::Rule::Replace`] table once when it empties); and a `cert` frame
-/// when the certificate is made anew.
-///
-/// A page that reads slower than the frames come falls behind by at most one frame: while a
-/// write waits on the page, ticks are skipped, not queued, and the next tick takes everything
-/// since this session's last one. What the source dropped meanwhile is counted in `skipped`.
-async fn live(shared: Arc<Shared>, connection: Session, mut cert: watch::Receiver<Arc<Served>>) {
-    let Ok(mut send) = connection.open_uni().await else { return };
-    let mut every = tokio::time::interval(shared.every);
-    every.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // alloc: once a session, the feed moved to and from the blocking pool each tick
-    let mut state = Box::new((shared.source.live(), Tick::default()));
-    let mut feed = session::Feed::default();
-    let mut out = Vec::new();
-    loop {
-        tokio::select! {
-            _ = every.tick() => {
-                let at_ns = clock::now_ns();
-                let read = tokio::task::spawn_blocking(move || {
-                    let (live, tick) = &mut *state;
-                    tick.clear(at_ns);
-                    let read = live.tick(at_ns, tick);
-                    (state, read)
-                });
-                let Ok((back, read)) = read.await else { return };
-                state = back;
-                let written = match read {
-                    Ok(()) => live_tables(&mut send, &mut out, &state.1, &mut feed).await,
-                    Err(error) => {
-                        let header = session::live_error_header(&error);
-                        live_frame(&mut send, &mut out, &header, &[]).await
-                    }
-                };
-                if !written {
-                    return;
-                }
-            }
-            changed = cert.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                let current = Arc::clone(&cert.borrow_and_update());
-                if !live_frame(&mut send, &mut out, &session::cert_header(&current), &[]).await {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Writes the frames [`session::Feed::emit`] says of `tick`'s tables; `false` when the page is
-/// gone.
-async fn live_tables(
-    send: &mut SendStream,
-    out: &mut Vec<u8>,
-    tick: &Tick,
-    feed: &mut session::Feed,
-) -> bool {
-    for table in &tick.tables {
-        let ipc: &[u8] = match feed.emit(table.name, table.rule, table.rows) {
-            Emit::Nothing => continue,
-            Emit::Rows => &table.ipc,
-            Emit::Cleared => &[],
-        };
-        let header = session::live_header(table.name, table.rows, tick);
-        if !live_frame(send, out, &header, ipc).await {
-            return false;
-        }
-    }
-    true
-}
-
-async fn live_frame<H: Serialize>(
-    send: &mut SendStream,
-    out: &mut Vec<u8>,
-    header: &H,
-    ipc: &[u8],
-) -> bool {
-    out.clear();
-    frame::live_head(out, header, ipc.len())
-        .expect("a live frame's header of strings and integers always serializes");
-    send.write_all(out).await.is_ok() && send.write_all(ipc).await.is_ok()
 }

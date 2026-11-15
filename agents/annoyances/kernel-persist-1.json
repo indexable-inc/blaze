@@ -1,0 +1,19 @@
+{
+ "id": "kernel-persist-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane kernel-cover, from lane kernel-persist's notes (/tmp/kernel-persist/next.md)",
+ "where": "crates/blaze-kernel/src/session.rs (`known`, `seed`, `load_post`, `row_of`), crates/blaze-kernel/src/trie.rs",
+ "what": "The spec for the session as records said `known` and `seed` read a posting from the store whole and at once, with every reader's row. Built that way, reading one posting pulls in the row of every reader, each reader's own posting, and so the whole cone above one changed fact, which is the memory an opened session was meant not to hold. Two things the spec did not have were needed: a reader's row as a placeholder that is not read until something asks what it holds, and a posting made in memory that is partial until the store's record is merged in.",
+ "cost": "a redesign of the session's maps in the middle of the piece (`Row::loaded`, `Post::loaded`, `Names::whole`) and most of one lane's context",
+ "whys": [
+  "why the spec read eagerly: it treated the in-memory maps as the session and the store as a copy to fault in, map entry by map entry",
+  "why that pulls the cone: a posting's readers are rows, and a row was assumed to be loaded once it has a number",
+  "why nothing said so: the spec gave the records and the calls but no statement of what an opened session may hold after one carry"
+ ],
+ "cause": "a persistence spec written as record layouts and call signatures, with no stated bound on what a read brings into memory",
+ "class": "a lazily read structure whose spec does not say what each read may load, so the first build loads the transitive closure",
+ "prevention": "a spec for anything read on demand states, for each call, what it may read and hold, as a number a test pins (`Session::held` after a carry: 18 rows of 256, pinned in tests/cost.rs)",
+ "workaround": "",
+ "fix": "done by lane kernel-persist: placeholder rows and partial postings; `held()` is pinned after each opened carry",
+ "state": "closed"
+}

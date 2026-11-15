@@ -1,0 +1,11 @@
+{
+ "id": "redit-14",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: `blaze explain edit_work` and `blaze why` on reth",
+ "what": "After a body edit's build that took 74 s and printed 47 `Compiling` lines, `blaze explain edit_work` said `build 32 counted no work in any stage`; `blaze why` could not read the build's problems (`DuckDB .. Out of Memory Error .. 3.7 GiB/3.7 GiB used`) with the history's cap raised to hold reth's builds.",
+ "cost": "the brief's `explain edit_work` row for reth could not be given",
+ "cause": "not looked into",
+ "workaround": "`query_counts` and `misses` by hand",
+ "state": "open"
+}

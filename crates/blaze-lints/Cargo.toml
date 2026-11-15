@@ -17,6 +17,9 @@ doctest = false
 blaze-core.workspace = true
 base-db.workspace = true
 blaze-diagnostics.workspace = true
+# The one join of `blaze::could_be_narrower` (`blaze_findings::fold::Narrow`), the rule its
+# workspace fold applies too.
+blaze-findings.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-intent.workspace = true
@@ -26,9 +29,11 @@ blaze-mem.workspace = true
 blaze-phf.workspace = true
 # The rule of which spans the flight recorder keeps, for `blaze::unrecorded_span`.
 blaze-profile.workspace = true
+# Messages written with `say!`, whose parts are typed (`blaze_report::say`).
+blaze-report.workspace = true
 blaze-serde.workspace = true
-# Counts the read of a lint profile as a look at the disk no watch vouches for
-# (`blaze_vfs::outside::looked`).
+# Keeps the read of a lint profile as a look at the disk no watch vouches for, in the
+# build's own list (`blaze_vfs::outside::Looks`).
 blaze-vfs.workspace = true
 cfg.workspace = true
 either.workspace = true
@@ -58,8 +63,8 @@ toml.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
+blaze-sim.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

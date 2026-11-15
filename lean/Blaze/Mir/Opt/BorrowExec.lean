@@ -76,7 +76,7 @@ theorem binaryOp_ok (P : Pointer → Prop) (checked : Bool) (op : BinOp) (a b : 
 
 theorem ok_pair (P : Pointer → Prop) {x y : Value} (hx : Value.Ok P x) (hy : Value.Ok P y) :
     Value.Ok P (Value.adt 0 [x, y]) :=
-  Value.Ok.adt 0 [x, y] (fun v hv =>
+  Value.Ok.adt 0 [x, y] (fun _ hv =>
     (List.mem_cons.mp hv).elim (fun e => Value.Ok.of_eq e hx)
       (fun m =>
         (List.mem_cons.mp m).elim (fun e => Value.Ok.of_eq e hy) (fun m2 => mem_nil_elim m2)))
@@ -236,7 +236,7 @@ theorem evalOperands_okAt {B : FnId → Local → Prop} {ids : List (Nat × FnId
   | [], _, hs => Outcome.all_ok (And.intro (fun _ hv => mem_nil_elim hv) hs)
   | o :: rest, st, hs =>
     Outcome.all_bind (evalOperand_okAt st hs o) (fun a ha =>
-      Outcome.all_bind (evalOperands_okAt rest a.2 (And.right ha)) (fun b hb =>
+      Outcome.all_bind (evalOperands_okAt rest a.2 (And.right ha)) (fun _ hb =>
         Outcome.all_ok
           (And.intro
             (fun v hv =>

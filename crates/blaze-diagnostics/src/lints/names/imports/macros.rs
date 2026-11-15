@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// rustc's `unused_macros` and `unused_macro_rules`, each at the macro's item.
-pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, uses: &Uses<'_, '_>) -> Vec<Found> {
+pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, uses: &Uses<'_>) -> Vec<Found> {
     // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
     let (macros, arms) = (

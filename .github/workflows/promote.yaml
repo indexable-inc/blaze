@@ -379,6 +379,9 @@ jobs:
         id: promote
         if: needs.smoke.result == 'success' && needs.apps.result == 'success' && needs.train.result == 'success' && needs.main-tests.result == 'success' && inputs.promote
         run: |
+          # promote.py's exit status is the step's: without this, `tee`'s 0 is, and a promotion
+          # that failed reads as `promoted` (steps.promote.outcome) to the jobs after it.
+          set -o pipefail
           jq -n --arg tag "$TAG" --arg run "$RUN" '{tag: $tag, run: $run, bench: "results"}' > "$RUNNER_TEMP/promote.json"
           python3 -I .github/scripts/promote.py promote "$RUNNER_TEMP/promote.json" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: passed, not promoted

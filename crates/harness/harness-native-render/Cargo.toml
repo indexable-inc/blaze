@@ -71,11 +71,11 @@ objc2-core-media = { version = "0.3.2", default-features = false, features = ["s
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVReturn", "objc2", "objc2-metal"] }
 
 [dev-dependencies]
+# Property tests: blaze's own test engine (crates/blaze-sim).
+blaze-sim = { path = "../../blaze-sim" }
 # shader_port.rs checks harness-native-shaders' port of shaders/harness.slang against this crate's structs, binding table
 # and HDR curves until it replaces the Slang.
 gpu = { path = "../../gpu" }
-# Property tests: Hegel, imported as `hegel` (blaze's vendor/hegeltest).
-hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
 
 [lints.rust]
 unsafe_code = "allow"

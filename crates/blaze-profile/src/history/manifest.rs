@@ -66,6 +66,7 @@ use parquet::file::{
     metadata::{ParquetMetaData, ParquetMetaDataReader},
     statistics::Statistics,
 };
+use blaze_report::{say, say::Code};
 use bytes::Bytes;
 use serde_derive::{Deserialize, Serialize};
 
@@ -80,8 +81,10 @@ pub const LOCK: &str = "manifest.lock";
 
 /// The manifest's format: a reader refuses another, naming it. Format 2 (2026-11-04) added
 /// [`Consumed`]; a manifest of format 1 reads as one that consumed nothing, and is written
-/// as format 2 at its next commit.
-pub const FORMAT: u32 = 2;
+/// as format 2 at its next commit. Format 3 (2026-11-14) added [`CappedBuilds`]: one of format 2
+/// reads as one whose cap retired no build, and an older blaze refuses format 3 by its number,
+/// not by an unknown field.
+pub const FORMAT: u32 = 3;
 
 /// The oldest format this blaze reads.
 const FORMAT_OLDEST: u32 = 1;
@@ -113,6 +116,21 @@ pub struct Manifest {
     /// of this manifest's files. Left out while empty.
     #[serde(default, skip_serializing_if = "Consumed::is_empty")]
     consumed: Consumed,
+    /// What the cap last retired of builds ([`CappedBuilds`]), so a reader that finds no build
+    /// can say why. Left out while the cap never retired a build's rows, so a manifest written
+    /// before 2026-11-14 reads as one whose cap retired none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capped: Option<CappedBuilds>,
+}
+
+/// The builds the cap retired, as of the last trim that retired any: every build up to
+/// `through` may be gone, and `flush` is the flush whose trim retired them. A reader whose
+/// question is "the last build" and that finds none says this instead of an empty answer.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CappedBuilds {
+    pub through: u64,
+    pub flush: u64,
 }
 
 /// What a commit consumed of the files beside the history that hold rows it writes, so the
@@ -413,9 +431,14 @@ impl fmt::Display for ManifestError {
                 f,
                 "it lists `{file}` under the table {table}, which is no file of that table blaze lists"
             ),
-            ManifestError::Missing { file } => write!(
-                f,
-                "it lists `{file}`, which is not in the directory: something other than the history deleted it, and its rows are gone (delete the directory to start a history afresh)"
+            // alloc: an error's text
+            ManifestError::Missing { file } => f.write_str(
+                &say!(
+                    "it lists ",
+                    Code(file),
+                    ", which is not in the directory: something other than the history deleted it, and its rows are gone (delete the directory to start a history afresh)"
+                )
+                .flat(),
             ),
             ManifestError::Locked => write!(
                 f,
@@ -450,7 +473,13 @@ impl Manifest {
             tables: BTreeMap::new(),
             retired: Retired::default(),
             consumed: Consumed::default(),
+            capped: None,
         }
+    }
+
+    /// What the cap last retired of builds, or `None` if it never retired a build's rows.
+    pub fn capped(&self) -> Option<CappedBuilds> {
+        self.capped
     }
 
     /// The number of the last flush the history committed.
@@ -901,6 +930,13 @@ impl Held {
         self.manifest.flush_committed(seq);
     }
 
+    /// Notes that this commit's trim retired builds up to `through`: kept as the highest any
+    /// trim retired, with the flush this manifest says is the last committed.
+    pub(crate) fn capped_builds(&mut self, through: u64) {
+        let through = self.manifest.capped.map_or(through, |it| it.through.max(through));
+        self.manifest.capped = Some(CappedBuilds { through, flush: self.manifest.flushed });
+    }
+
     /// Notes that this commit holds the rows of flush `seq` of the process `pid` whose
     /// flight recorder mapping has `nonce`: a postmortem of it reads past that flush's marks.
     pub(crate) fn recorder_flushed(&mut self, pid: u32, nonce: u64, seq: u64) {
@@ -957,5 +993,27 @@ mod consumed {
         let old = Manifest::decode(br#"{"format":1,"flushed":4,"tables":{}}"#).unwrap();
         assert_eq!(old.format, FORMAT, "read as this format, written so at its next commit");
         assert!(old.consumed().is_empty());
+    }
+
+    /// persisted-state-round-trips: what the cap retired of builds reads back as written, byte
+    /// for byte, through a held change; a manifest written before the field reads as one whose
+    /// cap retired no build, and one whose cap never did writes no such field.
+    #[test]
+    fn a_manifest_reads_back_what_the_cap_retired_byte_for_byte() {
+        let mut held = Held::read(Manifest::new());
+        held.flush_committed(9);
+        held.capped_builds(4);
+        held.capped_builds(2);
+        let manifest = held.manifest().clone();
+        assert_eq!(manifest.capped(), Some(CappedBuilds { through: 4, flush: 9 }), "the highest stays");
+        let bytes = manifest.encode().unwrap();
+        let read = Manifest::decode(&bytes).unwrap();
+        assert_eq!(read, manifest);
+        assert_eq!(read.encode().unwrap(), bytes, "the encoding is deterministic");
+
+        let before = Manifest::decode(br#"{"format":2,"flushed":4,"tables":{}}"#).unwrap();
+        assert_eq!(before.capped(), None, "a manifest of before reads as one the cap retired no build of");
+        let never = String::from_utf8(Manifest::new().encode().unwrap()).unwrap();
+        assert!(!never.contains("capped"), "{never}");
     }
 }

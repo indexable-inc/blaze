@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-19",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "the measuring lane's own process (reth-1112)",
+ "what": "Mistakes of mine tonight, each of which cost another lane or the machine: started tempo's cold build on the shared VM without asking the round runner (it spoiled the first rows of its low-load measurement); told the runner 80 GiB for a build that reached 128; a guard unit that exited at once for want of PATH (twice) before the third worked; a chain script that went on to its no-op step after the guard killed the daemon, so the client started a new daemon; `pkill -f` whose pattern matched my own shell (the second time today); three Mac daemons left up after their measurements, which split the Mac's memory budget and put a hello-world measurement under a 21.78 GiB limit; an `ix shell` call with no timeout that hung 84 minutes; hunks written into the integration directory a minute before I read the freeze note.",
+ "cost": "about two hours of mine and several of other lanes' rows marked as under load",
+ "cause": "hand-written shell around each measurement, with no shared runner that takes a machine lease, sets a memory ceiling, stops its daemons and has a deadline",
+ "whys": [
+  "why a neighbour was disturbed: I looked at load 0 and started",
+  "why: nothing holds the machine as a lease",
+  "why daemons stayed: my scripts start a daemon as its own unit and never stop it",
+  "why a guard failed: a systemd unit has no PATH",
+  "property: every lane re-invents `run this build under a lease, a ceiling and a deadline`"
+ ],
+ "class": "measurement without a harness (rule scripts-take-typed-input; H3 again)",
+ "prevention": "not built: one harness script that takes {tree, project, rows, memory_gb, minutes}, takes the VM's queue lock, runs the daemon with --memory-gb, stops it at the end or the deadline, and writes rows with their load. The round runner's units are the nearest thing",
+ "fix": "harness/v2: a `measure.py` every lane uses; ban `pkill -f` in the lanes' shell by a guard on the VM",
+ "state": "open"
+}

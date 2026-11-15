@@ -98,6 +98,12 @@ export interface BadgeProps extends CommonProps { text?: string; tone?: Tone }
 export interface StatProps extends CommonProps { label?: string; value?: string | number; note?: string; tone?: Tone }
 /** A plate that holds its children, under an optional `title`. */
 export interface CardProps extends CommonProps { title?: string; gap?: number; pad?: number }
+/** A question with rich options, an explicit recommendation, free-text response and an answered receipt. */
+export interface QuestionProps extends CommonProps {
+  text: string; detail?: string; options?: readonly { label: string; detail?: string }[];
+  recommended?: string; ahead?: string; value?: string; answer?: string; allowText?: boolean;
+  onchoose?: Handle<string>; onchange?: Handle<string>; onsubmit?: Handle<string>;
+}
 export interface DividerProps extends CommonProps {}
 export interface SpacerProps extends CommonProps { size?: number }
 
@@ -322,7 +328,7 @@ export interface MapProps extends CommonProps { markers?: readonly MapMarker[]; 
 /** Every built-in element's props, by element name. */
 export interface ElementProps {
   Column: ColumnProps; Row: RowProps; Text: TextProps; Markdown: MarkdownProps; Code: CodeProps; Table: TableProps;
-  Badge: BadgeProps; Stat: StatProps; Card: CardProps; Divider: DividerProps; Spacer: SpacerProps; Chart: ChartProps;
+  Badge: BadgeProps; Stat: StatProps; Card: CardProps; Question: QuestionProps; Divider: DividerProps; Spacer: SpacerProps; Chart: ChartProps;
   Canvas: CanvasProps; Group: GroupProps; Path: PathProps; Rect: RectProps; Circle: CircleProps; Line: LineProps; Polyline: PolylineProps;
   Button: ButtonProps; Toggle: ToggleProps; Checkbox: CheckboxProps; Slider: SliderProps; NumberField: NumberFieldProps; Input: InputProps;
   TextArea: TextAreaProps; Select: SelectProps; Choice: ChoiceProps; Radio: RadioProps; ColorPicker: ColorPickerProps; DropZone: DropZoneProps;

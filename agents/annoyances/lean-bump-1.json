@@ -1,0 +1,11 @@
+{
+ "id": "lean-bump-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5, lane lean-bump",
+ "where": "harness/v2/lean_gate.py and scripts/src/bin/lean_gate.rs (the two packages pin one toolchain)",
+ "what": "Bumping lean/lean-toolchain alone (4.20.0 to 4.35.0) leaves lean/analysis on 4.20.0 with its Mathlib, and the gate refuses that: the packages pin different toolchains. A core-only bump cannot pass the gate.",
+ "cost": "a lane scoped to the core package cannot reach a green gate on its own",
+ "cause": "one rule ties both packages to one pin while lean/analysis carries a Mathlib built for one exact Lean release",
+ "workaround": "bump lean/analysis (toolchain, Mathlib rev, lake-manifest) in the same batch before the gate runs",
+ "state": "open"
+}

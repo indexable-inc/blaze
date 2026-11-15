@@ -1,0 +1,12 @@
+{
+ "id": "termui-1112-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "where": "blaze_protocol::now::Span::item",
+ "what": "A span's `item` is sometimes a value printed whole instead of a path: `{macro MacroCallId { loc: MacroCallLoc { def: MacroDefId { krate: Crate(Id(19460)), ...` for thousands of characters, twice a second, in every `Now`.",
+ "cost": "transcripts of a cold build are mostly these; the screen cuts it to its first word",
+ "cause": "a Debug of a macro file id where a name was meant (`file_item_tree_query`)",
+ "workaround": "`blaze_screen::text::item` shows `{macro …}`",
+ "fix": "the span names the macro by its path",
+ "state": "open"
+}

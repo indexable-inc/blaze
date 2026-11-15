@@ -45,7 +45,18 @@ protocol, run on the real Rust state machines rather than a separate TLA+ spec. 
   - A prefix of each file's unsynced changes is kept, the last perhaps torn at its first byte,
     its middle, or one byte short. This is ALICE's model (Pillai et al., OSDI 2014).
   - Each effect in flight may have happened or not.
-  - A failed sync dooms what it covered ("fsyncgate").
+  - A failed sync dooms what it covered ("fsyncgate"), and so does a failed barrier.
+  - A barrier (`Effect::Barrier`, which a commit asks of its packs and checks in place of a
+    sync) makes nothing durable and orders: a crash that keeps anything asked after it
+    completed keeps all it covers, whole, and a sync asked after it makes that durable.
+  - A write or a rename that waits for no sync (`WriteUnsynced`, `RenameUnsynced`) is a pending
+    entry: a crash leaves the name as it was or as it is now, the new file's bytes torn by block.
+  - Two models of blocks (`Clones`), each searched by every scenario, since a store's open
+    tries one clone to decide how it places (`blaze_cas::PlaceBy`):
+    - `Made`: a clone is a second file holding its source's bytes whole, its entry pending.
+    - `Refused`: every clone fails saying the file system cannot share blocks (ext4, tmpfs).
+  - Every variant of `Effect` is named in one match with no arm for the rest (`Files::change`):
+    an effect added to `blaze_core` does not compile until it has a rule here.
   - Two models of directory entries (`Persist`):
     - `Ordered`: journaled in order, and any sync commits the journal (ext4, XFS, APFS).
     - `Posix`: an entry is durable only once its directory is synced, and a crash keeps any
@@ -126,7 +137,15 @@ Further tests:
 - `the_oracle_catches_a_kept_answer_relied_on_before_its_tickets_were_durable` and `the_oracle_catches_a_settling_failure_dropped_silently`: the model's own checks (rule
   23). What is kept before it is durable must be caught at the crash that loses it, and a
   settling that ends with the store stopped and says nothing must be caught.
-- `a_crash_keeps_what_the_file_system_model_says`: the crash model's rules.
+- `an_open_cut_short_by_a_crash_opens_again_and_leaves_nothing_of_its_try_behind`: a store that
+  stopped cleanly opened again, its open's IO in every order with a failure anywhere and a crash
+  after every step. The files of the clone the open tries, which a crash leaves, are removed by
+  the next open, which decides how it places as its file system says; the test fails unless
+  the search saw a crash leave each of them.
+- `a_crash_keeps_what_the_file_system_model_says`, `a_crash_may_undo_or_tear_a_write_that_waited_for_no_sync`,
+  `a_clone_is_made_whole_or_refused_as_the_file_system_says` and
+  `a_barrier_orders_what_it_covers_before_what_is_asked_after` (with its control: no barrier,
+  no order): the crash model's rules.
 
 ## Findings (by reading the code; the ignored tests pin them)
 
@@ -206,6 +225,12 @@ whole daemon. That lane owns those files, so the cut is proposed, not made:
 - The daemon's `Jobs`.
 
 ## Running
+
+While cargo builds blaze (AGENTS.md, blaze-builds-blaze) the same with `cargo test`. A change to
+`crates/blaze-cas`, `crates/blaze-kernel`, `crates/blaze-record` or `blaze_core::Effect` runs
+it: on 2026-11-12 ten of its tests were found stopping at their first step, at an effect the
+store's open had begun to ask and the model had no rule for, and nothing had run them
+(`agents/annoyances/storemodel-fix-1.json`).
 
 ```
 blaze test -p blaze-storemodel

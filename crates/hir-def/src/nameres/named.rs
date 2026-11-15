@@ -117,10 +117,15 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
         read: HashSet::new_in(Global),
     };
     walk.crate_(krate);
+    // blaze: a crate of a blaze edition loads its `std`, bstd, whatever its code says, as
+    // rustc injects `std`: its paths say `std`, which the walk above does not read as the
+    // dependency's own name (docs/v2/plan/design/std.md, "The blaze edition: opting in").
+    let edition_std = krate.blaze_edition(db).map(|_| span::BlazeEdition::STD);
     dependencies
         .iter()
         .filter(|it| {
             walk.named.contains(it.name.as_str())
+                || edition_std == Some(it.name.as_str())
                 || (lang(it.crate_id)
                     && !by_name(it.crate_id, it.name.as_str())
                     && !is_panic_runtime(db, it.crate_id))

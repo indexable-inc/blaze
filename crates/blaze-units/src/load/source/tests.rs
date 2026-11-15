@@ -39,6 +39,8 @@ struct Asked {
     name: String,
     version: String,
     checksum: Option<String>,
+    /// Whether `blaze.lock` pins the git trees of [`PINNED`].
+    pinned: bool,
 }
 
 fn asked(source: &str, name: &str, version: &str, checksum: Option<&str>) -> Asked {
@@ -49,7 +51,17 @@ fn asked(source: &str, name: &str, version: &str, checksum: Option<&str>) -> Ask
         name: name.to_owned(),
         version: version.to_owned(),
         checksum: checksum.map(str::to_owned),
+        pinned: true,
     }
+}
+
+/// The git sources the tests' `blaze.lock` pins, at [`GIT_COMMIT`].
+const PINNED: [&str; 2] = ["https://github.com/serde-rs/serde", "https://github.com/o/r"];
+const GIT_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The tree digest the tests' `blaze.lock` pins `url` by.
+fn tree_of(url: &str) -> blaze_fetch::Digest {
+    blaze_fetch::Digest::of(blaze_fetch::Algo::Blake3, url.as_bytes())
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -67,7 +79,17 @@ fn sources(asked: &Asked) -> Sources {
     let env = [("HOME".to_owned(), "/home/u".to_owned())];
     let config = blaze_manifest::Config::load(Path::new("/home/u/ws"), env, &asked.config)
         .expect("a configuration");
-    Sources::new(&config, SOURCES, asked.offline.then_some("--offline")).expect("the sources")
+    let mut pins = blaze_audit::pins::SourcePins::default();
+    if asked.pinned {
+        for url in PINNED {
+            pins.set_git(blaze_audit::pins::GitPin {
+                url: url.to_owned(),
+                commit: GIT_COMMIT.to_owned(),
+                tree: tree_of(url),
+            });
+        }
+    }
+    Sources::new(&config, SOURCES, asked.offline.then_some("--offline"), pins).expect("the sources")
 }
 
 struct Locate;
@@ -383,9 +405,20 @@ fn a_git_package_is_found_in_its_checkout() {
         Answer::Needs(Fetch {
             what: "git repository `https://github.com/serde-rs/serde`".to_owned(),
             url: "https://github.com/serde-rs/serde".to_owned(),
-            kind: FetchKind::Git { commit: commit.to_owned() },
+            kind: FetchKind::Git {
+                commit: commit.to_owned(),
+                tree: tree_of("https://github.com/serde-rs/serde").to_string(),
+            },
             at: at.clone(),
         })
+    );
+    // Its tree not pinned in `blaze.lock`, the package is refused, its checkout neither read
+    // nor fetched: a commit id is no pin.
+    let unpinned = Asked { pinned: false, ..asked(&url, "serde", "1.0.219", None) };
+    let error = failed(locate(&[], vec![], &unpinned));
+    assert!(
+        error.contains("weak_source_pin") && error.contains("`serde v1.0.219`") && error.contains(commit),
+        "{error}"
     );
     let package =
         |name: &str, version: &str| format!("[package]\nname = \"{name}\"\nversion = {version}\n");

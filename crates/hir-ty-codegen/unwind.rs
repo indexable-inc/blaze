@@ -568,6 +568,10 @@ pub(super) fn write_fde(
     data_align: i32,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
+    #[expect(
+        blaze::process_static,
+        reason = "a per-thread encode buffer, uncapped: it keeps the largest frame description entry the thread wrote"
+    )]
     thread_local! {
         // alloc: one buffer a thread, grown to its largest entry and reused
         static WRITTEN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };

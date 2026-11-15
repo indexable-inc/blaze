@@ -56,6 +56,11 @@ impl BestOf {
     }
 
     /// The number the next candidate gets.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "candidate numbers are u32: a best-of request with 2^32 candidates needs a typed \
+                  refusal where candidates are started"
+    )]
     pub(super) fn next(&self) -> u32 {
         u32::try_from(self.candidates.len()).expect("fewer than 2^32 candidates")
     }
@@ -89,7 +94,7 @@ impl BestOf {
             Response::TestResult(result) => match result.outcome {
                 TestOutcome::Passed => candidate.passed += 1,
                 TestOutcome::Failed => candidate.failed += 1,
-                TestOutcome::Ignored | TestOutcome::Unreached => {}
+                TestOutcome::Ignored => {}
             },
             Response::Report { report, .. } => match report.severity {
                 crate::Severity::Error => candidate.errors += 1,

@@ -134,7 +134,7 @@ def lit (ty : ScalarTy) (x : Int) : Scalar ty :=
 theorem lit_val (ty : ScalarTy) (x : Int) (h : ty.min ≤ x ∧ x ≤ ty.max) :
     (lit ty x).val = x := by
   unfold lit
-  rw [dif_pos h]
+  rw [dite_eq_left h]
 
 /-- An integer written back from its own value is itself. -/
 theorem lit_self {ty : ScalarTy} (x : Scalar ty) : lit ty x.val = x :=
@@ -155,12 +155,12 @@ def checked (ty : ScalarTy) (x : Int) : Result (Scalar ty) :=
 theorem checked_ok (ty : ScalarTy) (x : Int) (h : ty.min ≤ x ∧ x ≤ ty.max) :
     checked ty x = Result.ok ⟨x, h.1, h.2⟩ := by
   unfold checked
-  rw [dif_pos h]
+  rw [dite_eq_left h]
 
 theorem checked_fail (ty : ScalarTy) (x : Int) (h : ¬ (ty.min ≤ x ∧ x ≤ ty.max)) :
     checked ty x = Result.fail Error.arithmetic := by
   unfold checked
-  rw [dif_neg h]
+  rw [dite_eq_right h]
 
 /-- `x` brought to the nearest end of `ty`'s range. -/
 def clamp (ty : ScalarTy) (x : Int) : Scalar ty :=

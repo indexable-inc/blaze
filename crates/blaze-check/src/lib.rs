@@ -10,7 +10,9 @@
 //! the seed and the schedule, which `CHECK_REPLAY` runs again.
 
 #![deny(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod cell;
 mod clock;

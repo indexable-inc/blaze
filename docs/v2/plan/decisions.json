@@ -2,6 +2,14 @@
  "about": "Decisions the main agent made on its own authority, with what it recommended and where each stands. Andrew, 2026-11-11: \"just be proactive and do what you need to do; make a decisions.json file with all your decisions and what you recommended and just do things and get blaze to work\". A decision here is reversed by Andrew saying so; one that changes a rule also changes tools/agents/rules.ts.",
  "decisions": [
   {
+   "id": "memgive-1112-D1",
+   "date": "2026-11-12",
+   "decision": "When memory is short the daemon gives back in one order, cheapest to make again first, each step measured before the next (`blaze_graph::giveback::Planner`): the allocators' freed pages, the stores' pool pages, caches, a front end's values by bytes, and last one checkout's kept front end. Three behaviours change with it. (1) A system memory-pressure event takes the values of every kept front end and no front end whole; before, it dropped every kept front end. (2) The builds under way are asked for a release (`Writer::short`) only when their MIR and inference are in proportion to what is short (at most four times the need and its margin), not on every task held back. (3) The front end of the checkout built last (the floor) is never dropped: a task whose wait only the floor could meet waits for a task to end or starts alone, and when the limit falls under what the daemon holds with only the floor left the daemon says so by name and keeps it.",
+   "why": "lane memgive-1112 (claude-fable-5-2). On 2026-11-12 a task that waited for 0.09 GiB made the daemon drop reth's kept front end (about 55 GiB held of a limit of 67.08 GiB) and the next build, a one-line revert, took 195.4 s where it takes 4 to 16 s; the same night three daemons squeezed each other and each pressure event dropped every kept front end. Rule incremental-first: the edit loop is what blaze is judged by, and a front end is the dearest thing the daemon holds. What is given up: under real pressure the daemon keeps up to one front end it would have freed (the ceiling's guard and admission's cap are still the last line), and a large task may start alone, serially, where dropping the floor would have let it run beside others.",
+   "recommended": "Yes. Confirm on reth's daemon with the limit lowered in steps (docs/v2/plan/design/memory.md, \"Giving memory back\"): no `is let go` line and edits in seconds while the footprint is under the limit.",
+   "state": "written on int-1112 (34b4f5600e), not compiled or measured; the coordinator confirmed the three changes on 2026-11-12; the owner has not seen it"
+  },
+  {
    "id": "D1",
    "date": "2026-11-11",
    "decision": "Lanes with their own ix VM build, check and test their own work. Merges to main, measurements that claims rest on, persisted-state and bootstrap changes, and the check before a merge stay with the main agent.",
@@ -224,6 +232,180 @@
    "why": "Andrew, 2026-11-11: the comparison in the film should be \"to the existing system\" and \"data driven\"; \"more comparisons\".",
    "recommended": "Yes, as a second narrow exception beside D6.",
    "state": "in force; first numbers measured on hello-world"
+  },
+  {
+   "id": "D29",
+   "date": "2026-11-12",
+   "decision": "The daemon stays, as a bounded cache over content-keyed store records read through the store's pool (crates/blaze-cas/src/pool): warm in memory are the workspace's memos and the pool pages read since the sweep last came by, a sealed dependency is its interface records and the code the program reaches, and the idle footprint is held to a budget that grows with the workspace, not with its dependencies. The allocator's kept memory is fixed apart from that. Not a process a run, as Relax is.",
+   "why": "Andrew, 2026-11-12, as the main agent relayed it to lane memstrat-1111: \"ok do everything SOTA\", agreeing the daemon stays. The head-to-head (docs/v2/plan/design/restore.md, \"Memory: a bounded cache over records\"): Relax runs an edit in 87 to 212 MB with no process between runs, but its no-op is 52 ms where the daemon's is 12, it is incremental a crate, and its memory grows with the project.",
+   "recommended": "Yes.",
+   "state": "steps a and c built on memstrat-1111; b and d not built"
+  },
+  {
+   "id": "D-S5-1",
+   "date": "2026-11-12",
+   "decision": "The blaze edition's opt-in is the manifest's `edition = \"blaze-2026.11\"`, one spelling, carried to the front end as the crate attribute `#![blaze::edition = \"2026.11\"]`; `main` takes the roots the runtime makes in its order (`&Cx`, then `Io`), by rule `entry-takes-roots`; the entry is library code (`bstd::entry::run`) called from a module appended to the root. docs/v2/plan/design/std.md, \"The blaze edition: opting in\".",
+   "why": "Andrew, 2026-11-12: bstd should be what programs use, entry `fn main(io: Io)` \"or whatever it is\", opt-in so old things compile. A cargo-readable key lost: a package of the edition is not a cargo package. Lane bstd-entry-1112.",
+   "recommended": "Yes.",
+   "state": "in force; slice 1 on bstd-entry-1112"
+  },
+  {
+   "id": "D-S5-2",
+   "date": "2026-11-12",
+   "decision": "`blaze new` defaults to the blaze edition, and `blaze::not_latest_edition` warns by default, from the day bstd ships with blaze (std.md row S5d): one switch each, `blaze_new::BSTD_SHIPS` and `ready::EDITION_SHIPS`, both false today. Until then `blaze new --bstd <PATH>` writes the edition package, `--rust` the plain one, and the lint is `allow` unless asked for. blaze's own workspace allows the lint while cargo builds blaze (D25).",
+   "why": "Andrew asked for the edition as `blaze new`'s default and a warning for packages not on it. Today a package of the edition names bstd by path into a checkout of blaze, so the default would break `blaze new` + `blaze run` on every installed blaze (the release's install check), and the warning would tell people to move to something they cannot build. Lane bstd-entry-1112; for Andrew to overrule.",
+   "recommended": "Yes, until S5d; then flip both.",
+   "state": "in force; for Andrew to confirm"
+  },
+  {
+   "id": "D30",
+   "date": "2026-11-12",
+   "decision": "A function's error type is the exact set of failures it may return, checked like effects: the set is an error union (`A | B`, edition change 2, ledger E3), `?` widens a member or a smaller set with no `From` written, a failure the set lacks is an error naming the call, the member and the set, and a `match` covers every member. bstd's errors move onto sets: a kind variant that only holds another error (`FsKind::Stopped`, `HttpKind::Net`, `Refused::Stopped`, ...) becomes a member of the function's set (docs/v2/plan/design/error-sets.md has the list).",
+   "why": "Asked for by Andrew, 2026-11-12: bstd's ~30 error types should compose, so that `fn main(cx: &Cx) -> Result<(), E>` works when one function mixes `need_fs()?` (Missing) and `open_dir()?` (FsError) with no glue. The union type and its widening were already on main (E3 parts 1 and 2); what was missing was a set as a generic argument (a parser bug), matching by member, the error's words and the proof.",
+   "recommended": "Yes: a set costs what the hand-written enum costs (measured for layout), and each area keeps its own error; the alternative, one named enum per mix of areas with `From` impls, is the pattern the edition removes.",
+   "state": "built and tested under cargo on branch bstd-error-sets (parser, matching by member, diagnostics, determinism and layout tests); the bstd port waits for D29; the typed binding `e: T`, the unneeded-member advice and inferred sets are not built"
+  },
+  {
+   "id": "D31",
+   "date": "2026-11-12",
+   "decision": "`blaze::implicit_overflow` (edition group, allow by default) refuses integer `+ - * << >>`, unary `-`, compound forms, value-losing casts and profile-dependent or panicking calls (`pow`, `abs`, `next_power_of_two`, `sum`, `product`, `strict_*`) unless the code writes `checked_*`/`wrapping_*`/`saturating_*`/`overflowing_*`/`try_from` or the reach prover shows the operation fits. The proof treats an operation it can't show fits as fitting from then on, so the verdict is the same with and without overflow checks. `/` and `%` are excluded because their panics are the same in every profile. `blaze-std` and `blaze-mem` deny it once `bstd-fallible-alloc` (D29) lands (docs/v2/plan/design/explicit-overflow.md).",
+   "why": "Asked for by Andrew, 2026-11-12: code written by LLMs should say whether arithmetic wraps, checks or saturates, denying plain `+ -` or at least linting for it."
+  },
+  {
+   "id": "D32",
+   "date": "2026-11-12",
+   "decision": "What build, run, check and test show is blaze's own, not cargo's lines: on a terminal a region redrawn while the build runs and at most one line when it ends (nothing for a run that built nothing); off a terminal `blaze: progress` every 10 s and one `blaze: ok` or `blaze: failed` line of key=value fields. `Compiling`, `Finished`, `Running`, `link:` and the per-unit `generated N warnings` and `could not compile` lines are gone; the JSON messages on stdout are unchanged. A frontier (a row a unit under way with how many wait on it) over a dependency tree or a lane a worker, from frames of recorded builds. docs/terminal.md.",
+   "why": "Andrew, 2026-11-12: \"can you improve the terminal output too? like `blaze run` could be more like nom + buck2 ... proper TUI thing ... reinvent, super modern\"; rule useful-not-parity.",
+   "recommended": "Yes. The cost: a tool that reads cargo's human lines from blaze's stderr reads nothing it knows (the harnesses filter `blaze:` lines already and read build-finished), and the `blaze check --fix` hint that the per-unit warning line carried is not said anywhere now.",
+   "state": "built on termui-1112, not merged"
+  },
+  {
+   "id": "reth-1112-D1",
+   "date": "2026-11-12",
+   "decision": "A proc-macro call whose session moved on (a stateful crate: jsonrpsee's `proc_macro_crate::CACHE`), or whose crate the store has not seen yet, has known reads when it gives, run once more from the fresh state, exactly what it gave in its session: its unit's record and its crate's image are then kept. A call that gives otherwise from the fresh state (a counter) stays unknown and its unit is made again every build, loudly (`misses` step `unit record`).",
+   "why": "lane reth-1112 (claude-fable-5-2), on the owner's `make sure reth fast as fuck`: 7 units of reth were made again in every build and 217 in the first build after a cold one for this alone. What is given up: a macro that is truly order-dependent and happens to give the fresh state's output in one build has that output kept; before, nothing of such a crate was ever kept.",
+   "recommended": "Yes; run blaze-macro-eval's tests/kept.rs and corpus.rs (BLAZE_MACRO_CORPUS) before it lands.",
+   "state": "built on reth-1112 (77c4d94579), merged into int-1112; fixtures measured, reth being measured; the owner has not seen it"
+  },
+  {
+   "id": "reth-1112-D2",
+   "date": "2026-11-12",
+   "decision": "A build script's run that read what can't be traced (the clock, randomness, the network) and whose script said what reruns it (`rerun-if-changed`, `rerun-if-env-changed`) is kept by cargo's rule and by what it read of its own package; what it read elsewhere (the checkout's other files through `git`, the toolchain's) is no input of it. A traceable run keeps every read, as before, and so does an untraceable one that named nothing.",
+   "why": "lane reth-1112: rule useful-not-parity matches cargo where real code depends on it, and reth does: its `reth-node-core` script stamps the build time and asks `git` whether the checkout is dirty, and says in its source that debug builds must not run it again. Traced, it read 2,916 files of the checkout: every build hashed them (13 s of each edit) and every edit ran it again and remade the crates above it. What is given up: such a script is not run again when a file it read outside its package changes (the `-dirty` suffix of a version string goes stale, as under cargo).",
+   "recommended": "Yes.",
+   "state": "built on reth-1112 (4787b9a562), not yet measured on reth; the owner has not seen it"
+  },
+  {
+   "id": "D33",
+   "date": "2026-11-12",
+   "decision": "A run with nothing changed is answered with no daemon: the thin client checks the request's slot (`<state>/slots/<key>`, blaze-certify) by lstat and execs the program; the daemon exits 600 s after the last edit (30 s if it did no work), never while a launcher is connected, and is held to D29's bound while it stays. Reverses D29's 'not a process a run'.",
+   "why": "Andrew, 2026-11-12 17:52: \"it needs to be better, not just 3x, but better\": Relax holds nothing between runs, so a daemon that stays loses the held row whatever it holds.",
+   "recommended": "Yes. The cost: the first edit after an idle exit pays a daemon start and a restore from disk.",
+   "state": "written on int-1112, not compiled"
+  },
+  {
+   "id": "D34",
+   "date": "2026-11-13",
+   "decision": "blaze gets its own typed SQL (docs/v2/plan/design/sql.md, rows Q1 to Q7): one sans-IO checker over a SQL subset with a schema made of Rust structs, drivers for C SQLite (libsqlite3-sys's amalgamation, no rusqlite) and Postgres (an own sans-IO wire protocol), SQL only as a const generic string, parameters named (`$name`) and bound by a record, row types computed with `type_of!`. Not wrapped: sqlx. Not forked: Turso. The work is on branch sql-1113 in its own worktree, because int-1112 does not compile and another session owns it.",
+   "why": "Andrew, 2026-11-13: \"make ur own sqlite thing\", \"be nice if it work for postgres too\", \"it should DENY any injection stuff i.e., should require prepared statement like things and imo should be NAMED\", and \"ok sounds good\" to the plan; executors are Opus 5.5 medium (\"doit with subagnt opus 5.5 medium not fable\").",
+   "recommended": "Yes. What it costs: it does nothing for the edit loop on reth and tempo; its use to blaze is as the first consumer of `type_of!`, records and field types.",
+   "state": "merged to main as d46689c21e (#2119), by admin merge before its jobs ended: the checker, the SQLite driver and the Postgres core pass their tests under cargo (76, 24, 28); not yet run: blaze check and its lints, the workspace check, a long run of the refinement, a real Postgres; Q4 to Q9 (the typed surface and its language pieces) not started"
+  },
+  {
+   "id": "D35",
+   "date": "2026-11-13",
+   "decision": "The fresh core (docs/v2/plan/design/target.md, interface crate crates/blaze-keyed): one process per command answers from records keyed from text before the work, each carrying the read list its work made; on a key miss the read list is checked against the current surfaces and a verified result is filed under the new key byte for byte. No daemon, no query graph, no memory admission; the memo (`RecordsOnly` for one-shot commands, `Resident` for watch and live runs) and the executor (`Local`, or a remote service) are static type parameters of one driver. Records are the unit of sharing: deterministic bytes, namespaced keys (public only for registry archives by checksum and the toolchain), segments as the wire format, signed statements. It supersedes end-state.md and end-state/*.md.",
+   "why": "Decided by the main agent on the owner's instruction, 2026-11-13. The owner's priority order: \"incremental comp being short > memory usage > cold comp > disk gc being good/not locking > disk usage\"; \"dont measure just build\". Builds on the outside audit accepted 2026-11-13 (/Volumes/Projects/blaze-int-1112-notes/audit-1113.md) and target-decisions-1113.md beside it; both traces from the start because incremental time comes first and disk last.",
+   "recommended": "Yes. Wave 2 (front end over surface images, body records, blaze-memo, blaze-program, blaze-expansion, test records) builds on blaze-keyed's vocabulary.",
+   "state": "page and crate written on fix-hello-1113 by claude-opus-5-5, not compiled"
+  },
+  {
+   "id": "D36",
+   "date": "2026-11-13",
+   "decision": "Scope of the target design, as the owner answered it. In: cargo workspaces, accepted on reth, tempo and blaze; hosts macOS arm64 and Linux (arm64 first; x86-64 is CI's, no x86 VM for now); a build runs when asked and may leave a helper process with an expiry that holds only what records rebuild and never builds on its own; `run` and `build` check only what the program reaches, `check` checks everything asked; dependencies and everything from the bucket maximally optimized, workspace code fast first and tiered up in the background, the top tier optimizing across functions at function grain (keyed by its body and the keys of every body it took in); the shared cache read without a login, written only by CI and later the remote workers; fully local private builds always possible; an old home detected, reported and rebuilt, never migrated; new crates move to bstd once blaze builds blaze; long-term code sans-IO; every design aims within 10% of the floor from the start. Not now: `blaze watch` or building on save (edits come in transactions), live patching that keeps a running program's state, Windows, Buck or Bazel. Content-addressed code as in Unison, except that a body's key holds the interfaces of what it calls, not their bodies. AGENTS.md's Scope section, docs/v2/plan/design/target.md's Scope section, and rules 2, 6, 14, 20, 26, 28, 34, 60, 67 and 70 carry it. Verify once, by construction (the owner's decision 18, 16:13) is the new rule 74, verify-once, and a section of target.md. The day's general principles are rules for all code: 75 nothing-ambient, 76 correct-by-construction, 77 work-once, 78 strategy-is-a-type-parameter, 79 interfaces-first, 80 act-on-snapshots; 18 (bounded by construction) and 25 (nothing of the machine in what is kept or shared) are widened.",
+   "why": "Decided by the owner, 2026-11-13 15:59 (/Volumes/Projects/blaze-int-1112-notes/target-decisions-1113.md, \"Scope, as the owner answered it\"), with his words that day: \"10% of floor should AIM for the right thing from the start! it is ok if we don't get there but think properly; just work for something you are highly proud of even on first try likely and then iterate\" and \"always make sure what you build is something you are proud of ... on first iteration even\".",
+   "recommended": "Yes, as the owner's decision; recorded by claude-opus-5-5.",
+   "state": "rules and AGENTS.md regenerated on fix-hello-1113 by claude-opus-5-5, not committed"
+  },
+  {
+   "id": "D37",
+   "date": "2026-11-13",
+   "decision": "blaze owns its test engine and its simulated machine (docs/v2/plan/design/sim.md, interface crate crates/blaze-sim, row V12). A test case is a function of one tape of labelled, bounded choices in which 0 is the calm choice; blaze-sim draws the tape from a seed, shrinks a failing tape, prints it and replays it from one line, and holds what the simulations copied (answers in flight, planted-bug controls, reach points). blaze stops depending on Hegel: vendor/hegeltest goes once every `#[hegel::test]`, the fresh core's hand-rolled simulations, `blaze_core::sim::Sim` and the code `#[blaze::contract_test]` generates draw from the tape. This reverses the testing skill's \"moving to Hegel's own `hegel::sim`\". Nothing is taken as a dependency from indexable-inc/hegel; its design (every choice a draw, 0 calm, a disk in three layers) is prior art.",
+   "why": "Andrew, 2026-11-13: on the plan to move the simulation into `hegel::sim`, \"reverse yea and just make dst as good as possible\"; then, told that `hegel::sim` is on the fork's main and was never pinned here, \"i think dont use indexable-inc/hegel dont depend on hegel nayrmoe jsut contro ldirectly in blaze (use opus 5.5)\". Found that day on main at e6635c9ba7: every simulation's schedule is one opaque seed that Hegel cannot shrink; `Sim`, blaze-check and the fresh core's loops are three machines that do not meet; 14 draw traits, 92 `enum Plant` and 21 control helpers are copies; the vendored engine is about 128,000 lines pinned 13 commits behind its fork, and bstd cannot depend on it.",
+   "recommended": "Yes. What it costs: a port of 354 tests in 70 crates and of the compiler's contract-test code generation, and a shrinker blaze now maintains. What is given up from Hegel: generation from a regular expression (10 uses) and its targeted search (not used here).",
+   "state": "spec and interface crate written on dst-1113 (design by claude-fable-5-2, code by claude-opus-5-5 lanes); not compiled"
+  },
+  {
+   "id": "D38",
+   "date": "2026-11-13",
+   "decision": "The host of the keyed driver is built now (docs/v2/plan/design/host.md): blaze-unitkey keys a unit from text, blaze-front writes Surface and Body records and answers a read list's facts from mapped tables, blaze-host performs the driver's effects. A body is checked against records, never against a crate built in memory: every crate a body task reads, its own included, is opened from its Surface record and read in place. Of the four changes considered for the memo: top-down validity is the one taken (the driver already has it; a unit's manifest key covers its dependencies' surface keys, never their manifest keys); the surface-and-bodies split is carried by that key, with no second arena; dependency facts are read in place through the Surface record; crate-local ids with an import table are not taken: in a process that takes one snapshot an id never outlives what it points to, and reuse across processes is records. `Gid` stays process-local; a persisted form never holds a raw `SyntaxContext` word; a generation that would wrap is refused. An outside review (2026-11-13) recommended moving the port to stable ids now; not followed, for the reason above. Its list of how a dependent can observe a body is in target.md's key rules.",
+   "why": "The owner: \"ok do these with opus if u think this will be categorical imporvement\". The review's estimate for a 300-crate workspace: a probe per item on every command (0.4-1 s on an 8-core Mac) against 10-30 ms top-down; not measured.",
+   "recommended": "The main agent recommended top-down validity and reading in place; an outside reviewer recommended also moving to stable cross-crate ids now (not taken).",
+   "state": "Landed in part: blaze-unitkey and blaze-host with the keyed driver (2026-11-14); blaze-front waits for the front-end port to compile."
+  },
+  {
+   "id": "D39",
+   "date": "2026-11-13",
+   "decision": "Records are read-addressed (docs/v2/plan/design/read-addressed.md, proposed by the test-engine session with an outside review). A body, a surface and a unit manifest are found by what their work read: the key says what the record is (its own text and settings), its shape is the set of facts it asked for, and the key, the shape and the facts' digests now give the address of its value. The text-closure keys (blaze-keyed's text.rs, Relax's rules), the reuse path that refiles a record under a new key, and blaze-unitkey's name graph go. Soundness rests on one claim, that a shape holds every fact the work read, guarded by the recording reader, a simulation whose model reads by value, and an audit mode that redoes every hit and compares bytes. Added here to the proposal: a fact a body makes is routed by its owner so an ask is a lookup in the unit's manifest, with the maker settled before its readers; a manifest's chunk is findable by its file's key. Kept from the test-selection work and not replaced by reach digests: a kept test result is addressed by the functions it executed and its outside reads.",
+   "why": "A key hit with no check is unsound for real Rust: `a + b`, `?`, `for`, a deref and auto traits look up what the text does not name, and blaze-unitkey (read 2026-11-13) covers none of them; the simulation could not see it because its model's reads were the key's names. A list of implicit lookups would be a patch per missed case, each a silent stale answer (rules 21, 54). It also removes a copy of every reused record and a re-key of every unit above an interface edit.",
+   "recommended": "The test-engine session proposed it and an outside reviewer said adopt with changes; the main agent of the port (claude-fable-5-2) agrees and builds it. The owner has not ruled; it is his to reverse.",
+   "state": "Built: blaze-keyed rewritten with its simulation and an audit policy, blaze-host on it, blaze-unitkey keyed from own text; tests pass on blaze-vm (2026-11-14). blaze-front and the command are not on it yet."
+  },
+  {
+   "id": "D40",
+   "date": "2026-11-13",
+   "decision": "For sans-IO code, a Lean proof takes the place of the deterministic-simulation test: once Lean has checked an invariant's proof in the gate, the test that stood for it is deleted. This reverses \"DST stays the requirement\" of docs/v2/plan/design/formal-verification.md for code the translator reads. What a proof does not cover keeps a test: one conformance test per world model against each real driver, and a run of each translated function as its Lean model and as built code on the same drawn inputs until the translation is proved. Code that is not proved keeps its simulation test, on blaze's own engine (D37, blaze-sim).",
+   "why": "Decided by the owner, 2026-11-13 20:17: \"can we make a system so that we can remove these DST stuff and formally verify? ... if things are jank u can imprvoe the lean/ formal veification system this is for dog fooding ... this should be useable by anyone instead of doing dst :) for anything sans io rust\".",
+   "recommended": "Yes, as the owner's decision; recorded by claude-fable-5-2. The residual tests are my reading of what the proof leaves out, not his words.",
+   "state": "design written and reviewed from outside the work (docs/v2/plan/design/proofs-for-sans-io.md); ledger rows V13 to V17; first done for blaze-core's ETXTBSY retry schedule on proofs-1113 (two theorems proved, one sampled test deleted)"
+  },
+  {
+   "id": "D41",
+   "date": "2026-11-13",
+   "decision": "How D40 is built. (1) A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its Lean statement is total correctness (for every argument it returns `true`, and returns). (2) A state machine is proved a step at a time over a well-formedness predicate written in Rust, and one Lean lemma gives every run. (3) A world is a Rust predicate `allows(asked, answer)` with `apply`, not a script of choices and not a kernel model written by hand in Lean. (4) Both Lean packages move from 4.20.0 to 4.35.0. (5) `blaze prove` is its own command; generated models are build outputs, and the tree holds proofs.",
+   "why": "claude-fable-5-2, main agent. (1) cargo still builds blaze's crates, so they cannot carry clause syntax, and a property test and a theorem are then one function. (1) to (3) as changed by an outside review the same evening (an Opus 5.5 advise agent given the spec and the code): a statement that let a non-returning core pass would prove less than the test it replaces; a choice script proves nothing about the answers it cannot produce; a per-step goal is what automation closes. (4) 4.35.0 ships grind, mvcgen with Std.Do, and verified maps; the move cost three String API fixes and renames.",
+   "recommended": "Yes.",
+   "state": "on proofs-1113: (4) done; (1) the attribute and total statements, the translator's methods and integer primitives, `Blaze.Machine`, `blaze_auto`; (5) `blaze prove` with its plan and its sandboxed driver written; (2) used once by hand (a counter); (3) not started"
+  },
+  {
+   "id": "D42",
+   "date": "2026-11-14",
+   "decision": "blaze carries a patched copy of rustls 0.23.46 (vendor/rustls; vendor/rustls/SOURCE.md lists the change). The patch is additive, two functions: a TLS 1.3 client session ticket written as bytes (`Tls13ClientSessionValue::to_bytes`) and read back under a config (`ClientConfig::tls13_ticket_from_bytes`). With it a blaze process keeps the tickets its cache origin sent in an owner-only file beside the credentials (`remote-tickets.bin`, mode 0600, none older than seven days), and the next process sends its first anonymous reads of the public cache as 0-RTT early data. Only a GET or HEAD of an immutable, content-addressed `public/` object goes as early data; everything signed stays on HTTP/1.1.",
+   "why": "A blaze command is a process that answers and exits, so each one opens its QUIC connection to the cache from cold: without a ticket from an earlier process that is one round trip before the first request leaves. rustls 0.23 cannot hand a ticket to another process (the value's fields are private, its constructor is crate-private, it has no encoding, and it is tied by pointer to the config that received it), so the piece is built where the fields are (rule build-the-missing-piece), as the tree already does for quinn-proto, cranelift and 20 other crates under vendor/.",
+   "recommended": "The main agent (claude-fable-5-2) decided it, after raising it with the owner several times without an answer. A patched TLS library is a thing an owner may not want: the owner has not ruled and it is his to reverse. Reversing is deleting vendor/rustls and its `[patch]` line and blaze-http's `Tickets::add` and `fresh` (crates/blaze-http/src/h3/config.rs) with blaze-remote's tickets file; resumption then works inside one process only.",
+   "state": "Built with the HTTP/3 reads of the remote cache (crates/blaze-http/src/h3, crates/blaze-remote/src/http3.rs); no bucket is configured, so nothing uses it against a real origin yet."
+  },
+  {
+   "id": "D43",
+   "date": "2026-11-14",
+   "decision": "A sans-IO loop takes its world as one value, and is proved by running it: the retry loop of every blocking wait (`blaze_core::wait::retry::drive`) takes a `Kernel` (its calls and its clock; a clock and a closure are one), a theorem's function gives the real loop a kernel that answers from a list of answers the world (`crates/blaze-core/src/world/blocking.rs`) allows, and its statement for every list is every run. The loop's simulation test and that test's hand-written kernel are deleted (wait/tests.rs), `a_wait_ends_by_its_deadline` being proved in Lean.",
+   "why": "The loop read its clock through `&self` beside a closure that moved it, which only a `Cell` can share; the translator has no model of interior mutability and a functional model should not need one. One value needs none, callers of `until` do not change, and the loop the theorem runs is the loop production runs. The world is at least as liberal as the deleted test's kernel (each of its behaviours is an answer the world allows) and allows more: a timeout early with the event still to come, a call that starts after the clock was read.",
+   "recommended": "The main agent (claude-fable-5-2) decided it under the owner's 2026-11-13 request that proofs replace simulation tests. Reversing is restoring wait/tests.rs's deleted section from git and keeping both.",
+   "state": "on proofs-1113: built and proved (Lean 4.35.0, the three allowed axioms)"
+  },
+  {
+   "id": "D44",
+   "date": "2026-11-14",
+   "decision": "Threads that share atomics are modelled as programs over one world (`lean/Blaze/Threads.lean`): a function that reaches an atomic operation is a tree of operations, `blaze_core::world::threads::two(schedule, first, second)` runs two closures one operation at a time in the schedule's order, and a theorem for every schedule is every interleaving. The world's memory is sequentially consistent and it refuses, never approximates, a run it is not the meaning of: orderings weaker than `SeqCst` are accepted only where the run's threads touch one cell (where every memory model is sequentially consistent); weaker orderings over two or more cells are `Error.unmodelled` until the world has views, and `Relaxed` there until it has promises.",
+   "why": "The park's simulation test ran an unpark whole between two of the park's atomics, so it never tried a park's step between the unpark's swap and its wake; an exhaustive statement needs both threads as steppable programs. Treating a weaker ordering as `SeqCst` would be a proof about a program blaze does not compile (rule no-fallback); the single-cell rule makes the first slice sound on real code (a park, a once, a flag, a lock word) without the weak world.",
+   "recommended": "The main agent (claude-fable-5-2) decided it. The weak world (views, then promises) is objective V17's remainder.",
+   "state": "on proofs-1113: the Lean library and its tests by evaluation are built; the translator's support, the Rust `two` and the park's proof are in lanes"
+  },
+  {
+   "id": "D45",
+   "date": "2026-11-14",
+   "decision": "An output path has one writer: the job's placement (`Jobs`). The code-memory host, which starts dev test binaries and dev runs, writes no file. A program is launched from a path only after its job's placements have ended, with the key the job's record holds for that path; the host starts it only where that key is its image's key, and otherwise the launch fails with a typed error naming the path, the key placed and the key held. There is no fallback write.",
+   "why": "claude-fable-5-2, from measurements of #2145's binaries: a `blaze test` that executed tests replaced its test executable every time (a new inode, 168 MB on macOS, 173 MB on Linux, with `built=0`), where an all-cached run and `test --no-run` did not. The cause, read out of the code by a Claude Opus 5.5 lane: two writers of one path, each with its own record of what the path holds (the build's placement in serve/job.rs and `Host::write_executable` in blaze-inproc), so each one's write made the other's record stale and the next build placed the file again. On macOS a sandboxed test's trace holds its own executable's path, so the rewrite after the test began made `Began::moved` refuse every pass: an opted-in package kept nothing. The two writers always wrote the same bytes under the same key.",
+   "recommended": "One writer, not two records kept in sync: a record that is told of the other's writes drifts (it compared length and time only), and any new launch site that forgets to tell it brings the rewriting back. The floor of a run that executes tests is to do nothing to its executable; one writer is at the floor.",
+   "state": "Built on branch fix-test-place-1114: the code-memory host writes no file, a launch takes the key the job's record holds, a certificate names what its build left at each output and answers only where the record still holds it. Open beside it: after a restart with no certificate the jobs place every output again."
+  },
+  {
+   "id": "D46",
+   "date": "2026-11-14",
+   "decision": "Which memory a theorem about threads is stated in is said by the theorem, not found by trying: `blaze_core::world::threads::two` runs the sequentially consistent world (which refuses a run it is not the meaning of, D44), and `threads::two_weak` runs the weak world (`lean/Blaze/ThreadsWeak.lean`: views, release and acquire, stale reads by the schedule's pick). A theorem whose code reaches `two_weak` has its statement over `Prog.valueWeak`; one that reaches `two`, over `Prog.value`; one that reaches both is refused. `Prog.valueAny` (run sequentially consistent, and run again weakly where that refuses) goes. The Rust `two_weak` is the Lean weak world's step, operation for operation, on the same scheduled atomics.",
+   "why": "The Rust runner cannot do what `valueAny` does without running the theorem's function twice (a stale read changes what the code does next, so a refused run cannot be replayed, only redone), and a run that is redone another way when the first way refuses is the shape rule no-fallback forbids; nor could a reader tell from a theorem's text which world its `for every schedule` ranges over, though a schedule's picks mean different things in the two. Stated in the weak world a theorem is at least as strong (it allows every stale read the orderings allow), so the choice is the author's: the single-cell rule's cheaper proof where it applies, the weak world where the code's orderings are the point (`handoff::Wake`).",
+   "recommended": "The main agent (claude-fable-5-2) decided it. Not covered by either world: a relaxed read followed by a non-releasing write of another cell (rule R1, load buffering), which needs promises; `handoff::Claims` has that shape and keeps its model-checked test.",
+   "state": "built and on main (#2156, #2164, 686efb152a): the Rust `two_weak` and its pure world; the translator's part (a theorem that reaches `two_weak` is stated over `Prog.valueWeak`; `valueAny` gone); the weak world's induction (`lean/Blaze/ThreadsWeakAuto.lean`); and the first theorem against it, `handoff::no_hand_back_is_missed` of the real `Wake`, which `blaze prove -p blaze-core` proves with fifteen others"
   }
  ]
 }

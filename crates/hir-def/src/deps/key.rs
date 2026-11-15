@@ -5,8 +5,10 @@
 //! - The crate ([`crate_inputs`]): its root file's path, edition, origin, crate attributes,
 //!   target kind and crate types, the directory its proc macros run in, version, display name,
 //!   potential cfg, cfg (features are cfg), env, and the workspace's target, toolchain and
-//!   const-eval budget ([`base_db::CrateWorkspaceData::content`]); each dependency as its key,
-//!   its name and whether it is a prelude, sysroot or private dependency. Each of
+//!   const-eval budget ([`base_db::CrateWorkspaceData::content`]); each dependency as its
+//!   surface where the lowering gave it one ([`super::given::surface`]: what a front end
+//!   above may read of it and of the crates below it), else as its key; its name and whether
+//!   it is a prelude, sysroot or private dependency. Each of
 //!   [`base_db::BuiltCrateData`]'s and [`ExtraCrateData`]'s fields is named where it is hashed,
 //!   so a field added to either does not build until the key covers it. One is named and left
 //!   out on purpose: `manifest_kind`, the kind of the manifest target a `--test` crate is built
@@ -63,8 +65,12 @@ use crate::{
     nameres::frozen,
 };
 
-/// The domain of an image key.
-pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 6";
+/// The domain of an image key. 7: a dependency enters by its surface where the lowering gave
+/// it one ([`super::given::surface`]), in place of its key. 8: the image holds no def map,
+/// which is the crate's pages alone (`super::image::IMAGE_SCHEMA` 3), so an image of 7 is
+/// never asked for. 9: a workspace member, and every crate above one, has a key too
+/// ([`eligible`]); no record filed under 8 changes meaning, and none is asked for.
+pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 9";
 
 /// What makes the images: the version of each encoding in them, so an image of another
 /// encoding is never found.
@@ -82,16 +88,19 @@ pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|
     hasher.finish()
 });
 
-/// Whether `krate` is read from an image: a crate no workspace member, none of whose
-/// dependencies is one either (a member's def map changes with every edit, so nothing that
-/// names it is kept), and every proc-macro crate among them with its library known.
+/// Whether `krate` is read from an image: every proc-macro crate among it and its
+/// dependencies has its library known. A workspace member is, and so is every crate above
+/// one: its key covers its files, so an edit moves it and the image of the crate as it was
+/// is never served for the crate as it is. Within one process a crate the maintainers hold
+/// state for is not served again (`super::serve`); its pages are written for the next
+/// process (`super::store` with [`super::Which::All`]).
 pub fn eligible(db: &Db, krate: Crate) -> bool {
     fn of(db: &Db, krate: Crate, memo: &mut HashMap<Crate, bool, Global>) -> bool {
         if let Some(&known) = memo.get(&krate) {
             return known;
         }
         let data = krate.data(db);
-        let mut eligible = !data.origin.is_local() && libraries_known(db, krate);
+        let mut eligible = libraries_known(db, krate);
         for dep in &data.dependencies {
             eligible &= of(db, dep.crate_id, memo);
         }
@@ -99,6 +108,32 @@ pub fn eligible(db: &Db, krate: Crate) -> bool {
         eligible
     }
     of(db, krate, &mut HashMap::new_in(Global))
+}
+
+/// Whether `krate` is sealed: its sources, and those of every crate below it, cannot change,
+/// as the planner recorded on each ([`base_db::CrateData::sealed`], decided by the driver's one
+/// rule, blaze-cargo's `serve::sealed::pin`: a tree named by a digest that pins it). Nothing
+/// else is read: not the origin, not the source root's kind, not a name. A workspace member,
+/// a path dependency and a doctest crate carry no pin, so neither they nor any crate above
+/// them is sealed. What a build's end stores (`super::store` with [`super::Which::Sealed`]):
+/// a sealed crate's resolution does not change with an edit of the workspace, so its pages
+/// are written once; a member's are written when its front end is let go, or at a stop.
+pub fn sealed(db: &Db, krate: Crate) -> bool {
+    sealed_in(db, krate, &mut HashMap::new_in(Global))
+}
+
+/// [`sealed`], memoized in `memo` across the crates of one caller's walk.
+pub fn sealed_in(db: &Db, krate: Crate, memo: &mut HashMap<Crate, bool, Global>) -> bool {
+    if let Some(&known) = memo.get(&krate) {
+        return known;
+    }
+    let data = krate.data(db);
+    let mut sealed = data.sealed.is_some();
+    for dep in &data.dependencies {
+        sealed &= sealed_in(db, dep.crate_id, memo);
+    }
+    memo.insert(krate, sealed);
+    sealed
 }
 
 /// The key of `krate`'s image by `build`, or `None` when the crate is not [`eligible`]: the
@@ -127,15 +162,29 @@ pub(crate) fn image_key(db: &Db, krate: Crate, build: ContentId) -> Option<Conte
     #[cfg(test)]
     super::tests::KEYED.lock().push((db.nonce_and_revision().0, krate));
     let data = krate.data(db);
-    let mut eligible = !data.origin.is_local() && libraries_known(db, krate);
+    let mut eligible = libraries_known(db, krate);
     // alloc: once per run of a crate's key, one key a dependency
     let mut deps = Vec::with_capacity(data.dependencies.len());
     // Every dependency is asked, eligible or not: a dependency that becomes eligible, or
     // stops being, is a read of this key.
+    //
+    // What the key holds of a dependency is its surface where the lowering gave it one
+    // ([`super::given::surface`], a tracked read of the dependency's own slot): the digest of
+    // everything this crate's front end may read of it and of the crates below it (its
+    // tokens outside the bodies no other crate's front end reads, its macros' definitions
+    // with where they are, its settings, its `OUT_DIR` files; a crate that runs at compile
+    // time, a proc macro, by its code). A body edit or a moved line in the dependency then
+    // leaves this key as it was: the dependency's key moved, this run was asked again, and
+    // it gives the key it gave before, so nothing above runs (docs/v2/plan/design/store.md,
+    // "Early cutoff between crates"). A dependency with no surface (a front end no driver
+    // lowered: this crate's own tests) enters by its key, which covers its every byte.
     for dep in &data.dependencies {
         let key = image_key(db, dep.crate_id, build);
         eligible &= key.is_some();
-        deps.push(key.unwrap_or_default());
+        deps.push(match super::given::surface(db, dep.crate_id) {
+            Some(surface) => surface,
+            None => key.unwrap_or_default(),
+        });
     }
     eligible.then(|| key(db, krate, build, &deps))
 }
@@ -336,6 +385,9 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, deps: &[ContentId], hasher: 
         manifest_kind: _,
         crate_types,
         proc_macro_cwd,
+        // Where the crate's records are kept, never what they hold; a function of the files
+        // hashed below.
+        sealed: _,
     } = krate.data(db);
     let ExtraCrateData { version, display_name, potential_cfg_options, built_for, build_script_runs } =
         krate.extra_data(db);
@@ -410,9 +462,20 @@ fn files(db: &Db, krate: Crate, base: &Base, hasher: &mut Hasher) {
     // alloc: setup: the directory frozen images name this crate's files from
     let root_path = root.path_for_file(&file).map(|it| it.to_string());
     let dir = root_path.as_deref().and_then(|it| it.rsplit_once('/')).map(|it| it.0);
+    // The files below another crate's `OUT_DIR` (a build script's crate's own run's) are not
+    // what this crate is made from: left out, as its identity leaves them out
+    // ([`base_db::crate_root_content`], which says why that covers every input).
+    let others = base_db::other_out_dirs(db, krate);
     // alloc: setup: the root's files, once per crate per session
     let mut files: Vec<(Vec<u8>, ContentId)> = root
         .iter()
+        .filter(|file| {
+            others.is_empty()
+                || !root
+                    .path_for_file(file)
+                    .and_then(|it| it.as_path())
+                    .is_some_and(|it| base_db::below_any(it.as_str(), others))
+        })
         .map(|file| {
             // alloc: setup: one path a file, once per crate per session
             let path = root.path_for_file(&file)
@@ -557,12 +620,13 @@ impl Base {
         };
     }
 
-    /// Why an image whose parts are `parts` would depend on a path its key does not hold: the
-    /// first part that holds one, and the path.
-    pub(crate) fn held_by(&self, parts: &[Vec<u8>; 3]) -> Option<Refused> {
+    /// Why the records of a crate whose bytes are `parts` (its image's parts and its def map
+    /// pages, each with what it is) would depend on a path its key does not hold: the first
+    /// part that holds one, and the path.
+    pub(crate) fn held_by(&self, parts: &[(super::Part, &[u8])]) -> Option<Refused> {
         let paths = self.dir.iter().chain(&self.out).chain(&self.others);
         for path in paths.filter(|it| it.len() >= SHORTEST_HELD) {
-            for (part, bytes) in super::Part::ALL.into_iter().zip(parts) {
+            for &(part, bytes) in parts {
                 if find(bytes, path.as_bytes()).is_some() {
                     // clone: why a crate is refused, once per refused crate
                     return Some(Refused::MachinePath { part, path: path.clone() });
@@ -599,6 +663,115 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         at = start + 1;
     }
     None
+}
+
+/// Why a crate has no image key ([`why_not_eligible`]): the rule of [`eligible`] that
+/// refused it and the crate the rule was met at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ineligible {
+    /// The crate is a proc-macro crate whose library's content ID is not known.
+    LibraryNotKnown,
+    /// A crate it depends on, directly or through others, is `on`, a proc-macro crate whose
+    /// library's content ID is not known.
+    AboveLibraryNotKnown { on: Crate },
+}
+
+impl Ineligible {
+    /// The reason's kind, for a count by kind: one word, the same for every crate.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Ineligible::LibraryNotKnown => "proc macro library not known",
+            Ineligible::AboveLibraryNotKnown { .. } => "above a proc macro whose library is not known",
+        }
+    }
+
+    /// The crate the rule was met at, when it is not the crate asked about.
+    pub fn on(self) -> Option<Crate> {
+        match self {
+            Ineligible::LibraryNotKnown => None,
+            Ineligible::AboveLibraryNotKnown { on } => Some(on),
+        }
+    }
+}
+
+/// Why `krate` is not [`eligible`], or `None` when it is: its own reason first, else that of
+/// the first dependency, in the crate's order and depth first, that has one. The same walk as
+/// [`eligible`], so `why_not_eligible(db, k).is_none() == eligible(db, k)` (tested), kept
+/// apart from it so the serve's hot path carries no reason. For the driver's report of the
+/// crates it did not ask an image for: on reth's restart 318 of about 1,100 crates were
+/// asked and nothing said why the rest were not (lane reth-1112, build 43).
+pub fn why_not_eligible(db: &Db, krate: Crate) -> Option<Ineligible> {
+    fn of(
+        db: &Db,
+        krate: Crate,
+        memo: &mut HashMap<Crate, Option<Ineligible>, Global>,
+    ) -> Option<Ineligible> {
+        if let Some(&known) = memo.get(&krate) {
+            return known;
+        }
+        let data = krate.data(db);
+        let mut why = (!libraries_known(db, krate)).then_some(Ineligible::LibraryNotKnown);
+        for dep in &data.dependencies {
+            let below = of(db, dep.crate_id, memo);
+            if why.is_none() {
+                why = below.map(|below| match below {
+                    Ineligible::LibraryNotKnown => {
+                        Ineligible::AboveLibraryNotKnown { on: dep.crate_id }
+                    }
+                    above @ Ineligible::AboveLibraryNotKnown { .. } => above,
+                });
+            }
+        }
+        memo.insert(krate, why);
+        why
+    }
+    of(db, krate, &mut HashMap::new_in(Global))
+}
+
+/// The markers of a key ([`Base`]) for a crate that is in no database yet: what a lowering
+/// writes a crate's plan key with (`blaze_lower`'s `found`), so a plan key and an image key
+/// write one path one way and neither holds a path of the machine.
+pub struct PlanBase(Base);
+
+impl PlanBase {
+    /// Of a crate whose package directory is `dir`, whose `OUT_DIR` is `out`, and whose
+    /// variables' values are `values`: as [`Base::of`] makes one of the crate once it is in a
+    /// database with `CARGO_MANIFEST_DIR = dir`, `OUT_DIR = out` and those variables.
+    pub fn new<'v>(dir: Option<&str>, out: Option<&str>, values: impl Iterator<Item = &'v str>) -> PlanBase {
+        let trimmed = |it: &str| -> Option<String> {
+            let it = it.trim_end_matches(['/', '\\']);
+            // alloc: setup: once per crate per lowering
+            (!it.is_empty()).then(|| it.to_owned())
+        };
+        // alloc: setup, as above
+        let mut base = Base { dir: dir.and_then(trimmed), out: out.and_then(trimmed), others: Vec::new() };
+        for value in values {
+            if base.marked(value.as_bytes()).is_none() && absolute(value) {
+                base.others.push(value.to_owned()); // alloc: setup, as above
+            }
+        }
+        base.others.sort_unstable();
+        base.others.dedup();
+        PlanBase(base)
+    }
+
+    /// Hashes a path with the package directory and `OUT_DIR` in it written as their markers.
+    pub fn path(&self, hasher: &mut Hasher, path: &str) {
+        self.0.part(hasher, path);
+    }
+
+    /// Hashes a variable's value: as [`PlanBase::path`], or as the one marker of any other
+    /// absolute path.
+    pub fn value(&self, hasher: &mut Hasher, value: &str) {
+        self.0.value(hasher, value);
+    }
+
+    /// Whether `text`, written with the markers, still holds an absolute path: one the key
+    /// would carry as it is on this machine.
+    pub fn holds_machine_path(&self, text: &str) -> bool {
+        let portable = self.0.portable(text);
+        std::str::from_utf8(&portable).is_ok_and(absolute)
+    }
 }
 
 #[cfg(test)]

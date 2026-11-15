@@ -22,6 +22,8 @@
 mod globs;
 mod macros;
 mod qualifications;
+#[cfg(test)]
+mod tests;
 mod unused;
 mod used;
 
@@ -60,7 +62,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
     }
     let walk = cx.walk();
     let places = Places::of(cx);
-    let uses = used::Uses::of(cx, walk, &places);
+    let uses = used::Uses::of(cx, &places);
     let mut buffered = macros::lints(cx, walk, &uses);
     buffered.extend(globs::lints(cx, &uses));
     let mut unused = unused::Unused::of(cx, &uses);
@@ -73,6 +75,17 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
         found.lint_at.map(|at| places.place(cx, at)).unwrap_or_default()
     });
     debug_assert!(found.iter().all(|it| it.phase == Phase::Resolve));
+    // Type checking's trait imports by where each import is, the key the resolve phase sorts
+    // by: rustc emits them in the order late resolution first asked the traits in scope, but
+    // the front end's records are position-free (def map, then bodies in `walk_bodies` order)
+    // and the candidates' list is reordered as used ones are taken out, so neither order is
+    // source order. No fixture of src/tests/lints/names/** has two of these (the only expected
+    // `unused import` pairs, `use-redundant.stderr`'s globs, are the resolve phase's), so the
+    // import's place, which is source order whenever imports are declared in the order their
+    // traits are first used, is the key.
+    unused.bodies.sort_by_cached_key(|found| {
+        found.lint_at.map(|at| places.place(cx, at)).unwrap_or_default()
+    });
     found.append(&mut unused.bodies);
     found
 }

@@ -52,7 +52,22 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 113);
+    // 151 before the 17 suspicious-code lints (`blaze::skipped_pair` .. `blaze::doc_names_nothing`)
+    // and the 5 magic-literal lints (`blaze::magic_number` .. `blaze::string_near_miss_across_crates`),
+    // and the 10 lints of code that carries no weight (`blaze::swapped_arguments` ..
+    // `blaze::swappable_parameters`), and the 12 complexity lints (`blaze::function_weight` ..
+    // `blaze::module_cycle`), and the 10 correct-by-construction lints (`blaze::proof_forgotten`
+    // .. `blaze::validated_but_raw`), and the 6 claim lints (`blaze::claim_contradicts_facts` ..
+    // `blaze::comment_claims`), and the 11 duplicate-code lints (`blaze::same_fn` ..
+    // `blaze::duplicate_across_crates`), and the 7 test-strength lints
+    // (`blaze::result_part_unobserved` .. `blaze::property_over_examples`), and the 4 suggestion
+    // lints (`blaze::could_be_narrower` .. `blaze::could_have_invariant`), and the 10 structural
+    // lints (`blaze::hand_written_derivable` .. `blaze::registry_spread`), and
+    // `blaze::same_behaviour`, and the 5 trust lints (`blaze::dependency_capability` ..
+    // `blaze::workspace_unsafe`), `blaze::implied_bound_written` and `blaze::loop_match_candidate`,
+    // and `blaze::default_refuses`, `blaze::one_at_a_time` and `blaze::unwritten_allocator`.
+    // (The refinement gate, `blaze::refinement`, is the one more.)
+    assert_eq!(blaze_lints().len(), 255);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -65,6 +80,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let internal = group("blaze::internal").expect("blaze's internal group");
     let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
     let edition = group("blaze::edition").expect("blaze's edition group");
+    let suggest = group("blaze::suggest").expect("blaze's suggest group");
     // The edition lints whose advice this blaze already has warn by default (`ready`): a
     // function-like proc macro's replacement, `const fn`, needs nothing new; the rest wait for
     // their switch.
@@ -73,9 +89,11 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::proc_macro_derive", ready::REFLECTION_REPLACES_MACROS),
         ("blaze::proc_macro_attribute", ready::REFLECTION_REPLACES_MACROS),
         ("blaze::build_script_ambient", ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+        ("blaze::not_latest_edition", ready::EDITION_SHIPS),
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
-        ("blaze::lossy_as", false),
+        ("blaze::as_cast", false),
+        ("blaze::implicit_overflow", false),
         ("blaze::global_state", false),
         ("blaze::async_fn", false),
         ("blaze::unmarked_pure", false),
@@ -84,38 +102,45 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::unmarked_nonblocking", false),
         ("blaze::mut_ref", false),
         // `program_lifetime` is `deny` where it fires (below); the two that say where it would
-        // pay wait for the group.
+        // pay are `blaze::suggest`'s.
         ("blaze::program_lifetime", false),
-        ("blaze::could_be_program_lifetime", false),
-        ("blaze::could_be_ref32", false),
     ];
     for it in edition.lints.iter() {
         assert!(warns.iter().any(|(name, _)| *name == it.name), "`{}` says when it warns", it.name);
     }
     // `deny` by default: they fire only where the code asked for them (`#[blaze::checkfree]`,
     // `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`, `#[blaze::pure]`, a
-    // `#[blaze::may(..)]`, `#![blaze::effects]` or `#![blaze::capabilities]`).
+    // `#[blaze::expect(..)]`, `#![blaze::effects]` or `#![blaze::capabilities]`).
     let deny = [
         "blaze::checkfree",
         "blaze::nopanic",
         "blaze::noalloc",
         "blaze::nonblocking",
+        "blaze::loop_turn_effects",
+        "blaze::sync_on_answer_path",
         "blaze::pure",
         "blaze::capabilities",
         "blaze::undeclared_effect",
+        "blaze::unfulfilled_effect",
         "blaze::program_lifetime",
+        "blaze::unreachable",
+        "blaze::refinement",
+        // A dependency doing what the workspace did not grant it.
+        "blaze::dependency_capability",
+        "blaze::dependency_unsafe",
     ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
-        let (in_general, in_internal, in_pedantic, in_edition) =
-            (in_(general), in_(internal), in_(pedantic), in_(edition));
+        let (in_general, in_internal, in_pedantic, in_edition, in_suggest) =
+            (in_(general), in_(internal), in_(pedantic), in_(edition), in_(suggest));
         assert_eq!(
             usize::from(in_general)
                 + usize::from(in_internal)
                 + usize::from(in_pedantic)
-                + usize::from(in_edition),
+                + usize::from(in_edition)
+                + usize::from(in_suggest),
             1,
-            "`{}` is general, internal, pedantic_perf or edition, once",
+            "`{}` is general, internal, pedantic_perf, edition or suggest, once",
             it.name
         );
         let level = if deny.contains(&it.name) {
@@ -127,7 +152,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         };
         assert_eq!(
             it.default_level, level,
-            "`{}`: a general lint warns, an internal, pedantic_perf or edition one waits, but \
+            "`{}`: a general lint warns, an internal, pedantic_perf, edition or suggest one waits, but \
              for an edition lint whose advice is ready",
             it.name
         );
@@ -193,6 +218,7 @@ fn the_proc_macro_lints_are_a_group_of_the_edition_lints() {
         level("blaze::build_script_ambient"),
         ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS)
     );
+    assert_eq!(level("blaze::not_latest_edition"), ready::level(ready::EDITION_SHIPS));
     assert_eq!(ready::level(true), Level::Warn);
     assert_eq!(ready::level(false), Level::Allow);
 }
@@ -227,11 +253,13 @@ fn group_of_is_the_first_group_without_aliases() {
 
 #[test]
 fn counts_are_rustcs() {
-    // 108 of the builtin passes and `foreign_modules`, 141 hardwired.
-    assert_eq!(lints().len(), 249);
+    // 107 of the builtin passes and `foreign_modules`, 148 hardwired, at the pinned nightly
+    // (rustc 1.101.0-nightly 16d1ffac1), as `rustc.rs` is generated from its source: a bump
+    // that changes a count changes it here, on purpose.
+    assert_eq!(lints().len(), 255);
     assert_eq!(internal_lints().len(), 17);
-    assert_eq!(internal_group().lints.len(), 16);
-    assert_eq!(unregistered().len(), 2);
+    assert_eq!(internal_group().lints.len(), 15);
+    assert_eq!(unregistered().len(), 3);
     let names: Vec<&str> = groups().iter().map(|it| it.name).collect();
     assert_eq!(
         names,
@@ -254,15 +282,20 @@ fn counts_are_rustcs() {
             "blaze::pedantic_perf",
             "blaze::edition",
             "blaze::internal",
-            "blaze::edition",
             "blaze::reach",
             "blaze::proc_macro",
+            "blaze::suggest",
+            "blaze::trust",
         ]
     );
-    assert_eq!(group("unused").unwrap().lints.len(), 24);
+    // With `repeated_reprs`, since Rust 1.100.
+    assert_eq!(group("unused").unwrap().lints.len(), 25);
     // rustc's renames; blaze's own (`blaze::`) are blaze-lints'.
     assert_eq!(renamed().iter().filter(|(old, _)| !old.starts_with("blaze::")).count(), 18);
-    assert_eq!(removed().len(), 66);
+    // With `no_mangle_generic_items` (an error since 1.99) and
+    // `dependency_on_unit_never_type_fallback` (the never type's stabilization, 1.100), and
+    // blaze's own `blaze::unneeded_effect`.
+    assert_eq!(removed().len(), 69);
 }
 
 #[test]
@@ -337,6 +370,9 @@ fn future_incompatible() {
 fn renamed_and_removed() {
     assert_eq!(named("bare_trait_object"), Named::Renamed("bare_trait_objects"));
     assert_eq!(named("raw_pointer_derive"), Named::Removed("using derive with raw pointers is ok"));
+    // Deleted, not renamed: no alias stands for it.
+    assert!(matches!(named("blaze::unneeded_effect"), Named::Removed(_)));
+    assert!(lint("blaze::unneeded_effect").is_none());
     assert_eq!(named("broken_intra_doc_links"), Named::Ignored);
     assert_eq!(named("no_such_lint"), Named::Unknown);
     assert!(matches!(named("nonstandard_style"), Named::Group(_)));
@@ -363,7 +399,7 @@ fn check_lint_name() {
     assert_eq!(store.check("internal", Some("rustc")), Checked::MissingTool);
     let store = Store { internal: true, registered_tools: Vec::new() };
     assert!(
-        matches!(store.check("internal", Some("rustc")), Checked::Tool(lints, None) if lints.len() == 16)
+        matches!(store.check("internal", Some("rustc")), Checked::Tool(lints, None) if lints.len() == 15)
     );
     assert_eq!(store.check("default_hash_type", Some("rustc")), Checked::NoLint { suggest: true });
     assert!(store.is_lint_group("warnings"));

@@ -37,6 +37,10 @@ struct LaneIds {
 /// The lane indices of the process: a thread takes one when it first copies in and gives it
 /// back when it ends, so the lanes in use stay as many as the threads.
 // alloc: none: an empty `Vec` in a static; it grows by one a thread.
+#[expect(
+    blaze::process_static,
+    reason = "free lane numbers, given back as threads end: at most the most threads alive at once"
+)]
 static LANE_IDS: ShortLock<LaneIds> = ShortLock::new("query.segment.lane_ids", LaneIds { next: 0, free: Vec::new() });
 
 struct Lane(u32);
@@ -515,7 +519,7 @@ impl Drop for Segments {
 
 #[cfg(test)]
 mod tests {
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::{Segments, Span};
 
@@ -532,14 +536,18 @@ mod tests {
     /// Copies of any sizes and alignments, in any order (past a lane's next segment, past a
     /// quarter of the largest), each keep their own bytes at their alignment: none was written
     /// past its segment or over another.
-    #[hegel::test]
-    fn every_copy_keeps_its_bytes_whatever_the_sizes(tc: TestCase) {
+    #[test]
+    fn every_copy_keeps_its_bytes_whatever_the_sizes() {
+        blaze_sim::check(Config::DEFAULT, |tape| every_copy_keeps_its_bytes(tape))
+    }
+
+    fn every_copy_keeps_its_bytes(tape: &Tape) {
         let segments = Segments::new(64, 1024, 8);
-        let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(40));
+        let count: usize = tape.int_in(1..=40usize, "copies");
         let spans: Vec<(Span, Vec<u8>, usize)> = (0..count)
             .map(|at| {
-                let len: usize = tc.draw(gs::integers::<usize>().max_value(400));
-                let align = 1 << tc.draw(gs::integers::<u32>().max_value(4));
+                let len: usize = tape.int_in(0..=400usize, "len");
+                let align = 1 << tape.int_in(0..=4u32, "align shift");
                 let bytes: Vec<u8> = (0..len).map(|i| (at * 31 + i) as u8).collect();
                 (segments.copy(&bytes, align), bytes, align)
             })

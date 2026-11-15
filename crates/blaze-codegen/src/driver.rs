@@ -16,7 +16,7 @@
 //! [`Built::puts`]: what the build compiled, its keys. A store entry that fails to read is an
 //! error naming the unit, never a reason to compile again.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
@@ -34,7 +34,8 @@ use blaze_mem::{Tag, frame};
 use crossbeam_queue::SegQueue;
 
 use crate::{
-    CodegenError, CompiledFunction, Instance, InstanceKey, Linkage, Static, Target, Unit,
+    CodegenError, CompiledFunction, Instance, InstanceKey, Linkage, Settings, Static, Target,
+    Unit,
     backend::{
         Address, Described, DescribedStatic, Emitted, FrontRef, Frontend, Import, Prepare, Shape,
         laid_out, release_refs,
@@ -69,12 +70,160 @@ impl Lookup for blaze_cas::Store {
     }
 }
 
-/// A value for the store.
-#[derive(PartialEq, Eq, Debug)]
+/// A value for the store. Two are equal when the store would keep the same: their key, kind
+/// and bytes; `of` describes how one was made and is no part of what is kept.
+#[derive(Debug)]
 pub struct Put {
     pub key: Key,
     pub kind: Kind,
     pub bytes: Vec<u8>,
+    /// What the value is and how it was made, carried from where it is made to the put: what
+    /// a refusal of the put names (rule 19). Set for every code value codegen makes (a
+    /// template, a launched function's bind record); `None` for a describe record, a side
+    /// table, a profile.
+    pub of: Option<Arc<PutOf>>,
+}
+
+impl PartialEq for Put {
+    fn eq(&self, other: &Put) -> bool {
+        (self.key, self.kind, &self.bytes) == (other.key, other.kind, &other.bytes)
+    }
+}
+
+impl Eq for Put {}
+
+/// What a code value for the store is ([`Put::of`]): the function or static it is of, as
+/// codegen spells it, the build mode that made it and how, and the parts of its key.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PutOf {
+    /// Its path as codegen spells it ([`Described::name`]); `None` where the walk has no name
+    /// of what put it.
+    pub name: Option<String>,
+    /// The instance it was made for, and the item that instance is of.
+    pub instance: InstanceKey,
+    pub item: ItemKey,
+    pub made: MadeIn,
+    /// Whose code the describe it was made from is ([`Described::origin`]), where known.
+    pub origin: Option<Origin>,
+    /// Whether its template holds its own positions by table ([`Described::anchors`]): the
+    /// relative form, kept under its name-free [`Described::template_code`]; `None` where not
+    /// known.
+    pub relative: Option<bool>,
+    /// The parts of its key where it is a dev template ([`dev_template_key`]).
+    pub parts: Option<TemplateKeyParts>,
+}
+
+/// The build mode a code value was made in ([`PutOf::made`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MadeIn {
+    /// A walked build (whole, patched, or a lazy build's walk), as [`Out::finish`] names its
+    /// putter: `what` is which of its values (a function's template, a folded body, a static,
+    /// the memo's earlier template).
+    Walked { what: &'static str },
+    /// A lazy build's function compiled ahead ([`Build::run_later`]).
+    LazyAhead(How),
+    /// A lazy build's function on its first call ([`Later::compile_kept`]).
+    FirstCall(How),
+    /// A tier-up of a lazy run's function ([`Later::tier_up`]).
+    TierUp(How),
+    /// A launched run's function made alone, with no walk ([`Build::one`], [`Build::start`]).
+    Alone(How),
+    /// A launched run's bind record of a function or static (`blaze_launch_host::bind`).
+    BindRecord,
+}
+
+/// How a template made outside a walk came to be ([`MadeIn`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum How {
+    /// Compiled here, from this function's own IR.
+    Compiled,
+    /// Taken from the memo under this function's shape: compiled for another function of it.
+    Memo { shape: ContentId },
+    /// Taken from the memo under the shape another compile of its flight key landed.
+    Landed { shape: ContentId },
+}
+
+/// The parts of a dev template's key ([`dev_template_key`]), each by its hash: what the key
+/// is made of, in its order, so two keys or one key and its value can be compared part by part.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TemplateKeyParts {
+    /// The step's code: the toolchain's id.
+    pub toolchain: ContentId,
+    /// The template instance: its template code ([`Described::template_code`]), arguments and
+    /// settings.
+    pub template_code: CodeHash,
+    pub args: ContentId,
+    pub settings: Settings,
+    /// The instance key its function is compiled under (`own`).
+    pub own: InstanceKey,
+    /// How many bodies its code builds in, and [`stored`] of them.
+    pub built_in: usize,
+    pub stored: InstanceKey,
+    /// How many references it has, the place of the function itself among them, and
+    /// [`placed`] of their kinds: what the key is of.
+    pub refs: usize,
+    pub own_place: Option<u32>,
+    pub placed: InstanceKey,
+}
+
+impl std::fmt::Display for PutOf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "`{name}`")?,
+            None => f.write_str("a value the walk has no name of")?,
+        }
+        write!(f, " (instance {:x}, item {:x}), made by ", self.instance.0, self.item.0)?;
+        match self.made {
+            MadeIn::Walked { what } => write!(f, "a walked build, as {what}")?,
+            MadeIn::LazyAhead(how) => write!(f, "a lazy build's compile ahead, {how}")?,
+            MadeIn::FirstCall(how) => write!(f, "a lazy run's first call, {how}")?,
+            MadeIn::TierUp(how) => write!(f, "a tier-up, {how}")?,
+            MadeIn::Alone(how) => write!(f, "a launched run's function made alone, {how}")?,
+            MadeIn::BindRecord => f.write_str("a launched run, as its bind record")?,
+        }
+        if let Some(origin) = &self.origin {
+            write!(f, ", for {origin:?}")?;
+        }
+        match self.relative {
+            Some(true) => f.write_str(", relative to its own anchors")?,
+            Some(false) => f.write_str(", its positions as compiled")?,
+            None => {}
+        }
+        if let Some(parts) = &self.parts {
+            let TemplateKeyParts {
+                toolchain,
+                template_code,
+                args,
+                settings,
+                own,
+                built_in,
+                stored,
+                refs,
+                own_place,
+                placed,
+            } = parts;
+            write!(
+                f,
+                "; its key's parts: the toolchain {:x}, template code {:x}, arguments {:x}, \
+                 settings {:x}, own {:x}, {built_in} built in (stored {:x}), {refs} references \
+                 with its own place {own_place:?} (placed {:x})",
+                toolchain, template_code.0, args, settings.0, own.0, stored.0, placed.0
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for How {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            How::Compiled => f.write_str("compiled"),
+            How::Memo { shape } => write!(f, "from the memo's template of its shape {shape:x}"),
+            How::Landed { shape } => {
+                write!(f, "from the memo's template of shape {shape:x}, landed by its flight")
+            }
+        }
+    }
 }
 
 /// One dev template a build took from the store or made, as the kernel keeps it: the entry of
@@ -241,6 +390,12 @@ pub struct Built {
     /// its members' identities: what a profile of an earlier build names it by
     /// (docs/v2/plan/design/code-layout.md).
     pub identities: Vec<(InstanceKey, ContentId)>,
+    /// Every instance the walk reached by key, with what a caller's code assumes of it
+    /// beyond its address ([`Described::abi`]): with [`Self::identities`], what a running
+    /// program's slot of it is keyed by. Whole in every `Built`; [`Delta`] does not name a
+    /// function whose `abi` alone changed (its key and code are what they were), so a reader
+    /// that applies deltas reads this list whole.
+    pub abis: Vec<(InstanceKey, ContentId)>,
     /// The instances the front end inferred cold ([`Described::cold`]), by key: a full link
     /// puts them after every other function.
     pub cold: Vec<InstanceKey>,
@@ -424,8 +579,32 @@ pub fn dev_template_key(
     refs: &[Target],
     toolchain: &ContentId,
 ) -> Key {
-    let placed = placed(stored(instance.key(), built_in), refs, own_place(own, refs));
-    kernel::template(&placed, &instance.settings, toolchain)
+    let parts = template_key_parts(instance, own, built_in, refs, toolchain);
+    kernel::template(&parts.placed, &instance.settings, toolchain)
+}
+
+/// The parts [`dev_template_key`] makes its key of, each by its hash: the one formula of it.
+pub fn template_key_parts(
+    instance: &Instance,
+    own: InstanceKey,
+    built_in: &[InstanceKey],
+    refs: &[Target],
+    toolchain: &ContentId,
+) -> TemplateKeyParts {
+    let stored = stored(instance.key(), built_in);
+    let own_place = own_place(own, refs);
+    TemplateKeyParts {
+        toolchain: *toolchain,
+        template_code: instance.code,
+        args: instance.args,
+        settings: instance.settings,
+        own,
+        built_in: built_in.len(),
+        stored,
+        refs: refs.len(),
+        own_place,
+        placed: placed(stored, refs, own_place),
+    }
 }
 
 /// The references and the store key of the release compile of `instance` (its template
@@ -539,6 +718,22 @@ pub const GROUP_FLIGHT_DOMAIN: &str = "blaze v2 group flight 2";
 /// thunk (`keys::thunk(key, stored)`) are its flight's. A landing is the memo holding exactly
 /// those, and a member edited in a body it builds in, its instance key and the group's key
 /// the same, asks for another thunk, so flies another merge.
+/// What a dev compile of the function kept as `stored` flies under ([`crate::flight`]):
+/// `stored` itself for a template whose positions are as compiled, and `stored` under
+/// [`RELATIVE_FLIGHT_DOMAIN`] for one `relative` to its own anchors ([`Described::anchors`]).
+/// The one formula of a function's flight key, whichever build flies it (a walk's
+/// [`FnNode::flight`], a lazy, tier-up or launched compile's `later::claimed`): a landing of
+/// one form handed to a compile of the other would be kept under the other's template key,
+/// whose template code holds the other form's inputs (rule 21).
+pub(crate) fn flight_key(stored: InstanceKey, relative: bool) -> InstanceKey {
+    if !relative {
+        return stored;
+    }
+    let mut hasher = Hasher::new(RELATIVE_FLIGHT_DOMAIN);
+    hasher.id(&stored.0);
+    InstanceKey(hasher.finish())
+}
+
 fn group_flight(group: &Group) -> InstanceKey {
     let mut hasher = Hasher::new(GROUP_FLIGHT_DOMAIN);
     hasher.id(&group.key().0).update(&(group.members.len() as u64).to_le_bytes());
@@ -564,13 +759,27 @@ impl<I, S> FnNode<I, S> {
     /// template would keep another function's positions under a key with no name or place in
     /// it (rule 21), as [`Shape::relative`] keeps the two forms apart in the memo.
     fn flight(&self) -> InstanceKey {
-        let stored = self.stored();
-        if self.described.anchors.is_none() {
-            return stored;
-        }
-        let mut hasher = Hasher::new(RELATIVE_FLIGHT_DOMAIN);
-        hasher.id(&stored.0);
-        InstanceKey(hasher.finish())
+        flight_key(self.stored(), self.described.anchors.is_some())
+    }
+
+    /// What a code value made of it at `unit` (its own or a tier's, compiled at `toolchain`) by
+    /// `made` is ([`Put::of`]): its name, its origin, its form and its dev template key's parts.
+    fn put_of<A: Allocator + Clone>(&self, unit: &Unit, toolchain: &ContentId, made: MadeIn, alloc: A) -> Arc<PutOf, A> {
+        let instance = Instance { code: self.described.template_code, ..unit.instance };
+        let own = unit.instance.key();
+        Arc::new_in(
+            PutOf {
+                // clone: its path, once a code value made outside a walk
+                name: Some(self.described.name.clone()),
+                instance: own,
+                item: unit.item,
+                made,
+                origin: Some(self.described.origin),
+                relative: Some(self.described.anchors.is_some()),
+                parts: Some(template_key_parts(&instance, own, &self.built_in, &self.refs, toolchain)),
+            },
+            alloc,
+        )
     }
 
     /// The store key of its dev template: the kernel's entry of its stored key, of its
@@ -833,6 +1042,41 @@ fn summarized(stored: InstanceKey, refs: &[Target]) -> InstanceKey {
 
 fn error(unit: InstanceKey, item: ItemKey, what: impl Into<String>) -> CodegenError {
     CodegenError { unit, item, what: what.into(), front: None }
+}
+
+/// The bugs a test plants in the driver.
+#[cfg(test)]
+pub(crate) mod plant {
+    use std::cell::Cell;
+
+    use blaze_core::lock::Lock;
+
+    use super::Prepare;
+
+    thread_local! {
+        /// `dev_of` keeps each fold candidate's IR until it ends, as it did when it kept it
+        /// for the compiles after (the IR beside each shape in its map of prepared functions).
+        pub(crate) static KEEPS_MADE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The fold candidates' IR `dev_of` keeps while [`KEEPS_MADE`] is set on its thread.
+    pub(super) struct Held<B: Prepare> {
+        keeps: bool,
+        held: Lock<Vec<B::Prepared>>,
+    }
+
+    impl<B: Prepare> Held<B> {
+        pub(super) fn new() -> Self {
+            let held = Lock::new("test.codegen.driver.plant.held", Vec::new());
+            Held { keeps: KEEPS_MADE.get(), held }
+        }
+
+        pub(super) fn keep(&self, made: B::Prepared) {
+            if self.keeps {
+                self.held.lock().push(made);
+            }
+        }
+    }
 }
 
 /// [`Prepare::prepare`] of `node` as `unit`, its shape [`Shape::relative`] when its template
@@ -1176,7 +1420,7 @@ impl Out {
     }
 
     fn put(&mut self, by: By, key: Key, kind: Kind, bytes: Vec<u8>) {
-        self.puts.push((by, Put { key, kind, bytes }));
+        self.puts.push((by, Put { key, kind, bytes, of: None }));
     }
 
     /// A template that is no dev template of a function (a release compile, a folded body, a
@@ -1393,7 +1637,13 @@ impl Out {
                 }
                 _ => {
                     kept_by = Some(by);
-                    puts.push(put);
+                    // What a compile outside the walk said it is (a lazy build's ahead), else
+                    // what the walk names its putter.
+                    let of = match put.of {
+                        Some(of) => Some(of),
+                        None => (put.kind == Kind::Code).then(|| put_by(by, &name_of, Global)),
+                    };
+                    puts.push(Put { of, ..put });
                 }
             }
         }
@@ -1432,6 +1682,29 @@ where
         Of::Static(id) => statics?.get(&id).map(|it| it.described.name.as_str()),
         Of::Memo => None,
     }
+}
+
+/// What a walked build's code value put by `by` is ([`Put::of`]), named as [`put_twice`]
+/// names its putters.
+fn put_by<'n, A: Allocator + Clone>(by: By, name_of: &impl Fn(Of) -> Option<&'n str>, alloc: A) -> Arc<PutOf, A> {
+    let what = match by.of {
+        Of::Function(_) => "the function's template",
+        Of::Folded(_) => "the folded body of the group of the function",
+        Of::Static(_) => "the static's template",
+        Of::Memo => "the template the memo already kept under its key",
+    };
+    Arc::new_in(
+        PutOf {
+            name: name_of(by.of).map(str::to_owned),
+            instance: by.unit,
+            item: by.item,
+            made: MadeIn::Walked { what },
+            origin: None,
+            relative: None,
+            parts: None,
+        },
+        alloc,
+    )
 }
 
 /// A second put under `mismatch.key` in one build, by `then`, of another kind or other bytes
@@ -1481,6 +1754,37 @@ fn put_twice<'n>(
         who(then),
     );
     error(then.unit, then.item, what)
+}
+
+/// Where two code values put under one key (`kept`, the store's, and `given`, made now) first
+/// differ, for a refusal of the put (rule 19): both lengths, the offset of the first byte
+/// that differs and the part of a template it is in ([`blob::part_at`] of `given`, else of
+/// `kept`), then the first field of the template that differs ([`template_difference`]).
+/// Values that are no templates (a launched function's bind record) are named by offset and
+/// lengths alone here; their own format names its part. Made only by a refusal, and worked
+/// out only as it is printed: it holds the two values' bytes, borrowed.
+pub struct CodeDifference<'a> {
+    pub kept: &'a [u8],
+    pub given: &'a [u8],
+}
+
+impl std::fmt::Display for CodeDifference<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kept, given) = (self.kept, self.given);
+        let at = kept.iter().zip(given).position(|(a, b)| a != b).unwrap_or(kept.len().min(given.len()));
+        write!(
+            f,
+            "the kept value is {} bytes and the given {}, first differing at byte {at}",
+            kept.len(),
+            given.len()
+        )?;
+        match (blob::part_at(given, at), blob::part_at(kept, at)) {
+            (Ok(Some(part)), _) | (_, Ok(Some(part))) => write!(f, ", in {part} of the template")?,
+            (Err(why), _) => write!(f, " (the value made now is no template: {why})")?,
+            (Ok(None), _) => {}
+        }
+        f.write_str(&template_difference((Kind::Code, Kind::Code), kept, given))
+    }
 }
 
 /// Where two templates put under one key differ, for [`put_twice`]'s error: the first field
@@ -1633,6 +1937,13 @@ pub struct Build<'a, B: Prepare> {
     /// The bug planted in a patched build, for a control of the test that holds it to the
     /// whole one: none, but in that control.
     planted: Option<Planted>,
+    /// The store the walk asks for a function's describe before it asks the front end
+    /// ([`Build::recording`]); `None` for a build whose every describe is the front end's.
+    // dyn: one call a function the walk has no kept describe of, against a store lookup
+    records: Option<&'a dyn Records>,
+    /// The records of the describes the front end made in this build, pushed by whichever
+    /// core made each: taken as the build ends ([`records::sorted`]), into its puts.
+    recorded: SegQueue<Put>,
 }
 
 /// What the walk's worklist visits: a function or static the walk reached and has not
@@ -1655,8 +1966,8 @@ struct Walking<'w, I, S> {
     /// Writes the walk's entries refused, as errors: none, but for a bug of the walk.
     refused: SegQueue<CodegenError>,
     counts: &'w kept::Counts,
-    /// Which round of the walk, from 0 ([`Build::described`]).
-    round: usize,
+    /// How far the round is, said on the walk's span while it runs.
+    progress: progress::Progress,
 }
 
 impl<I, S> Walking<'_, I, S> {
@@ -1751,6 +2062,7 @@ impl<I, S> Hints<I, S> {
 /// of [`patch`] or [`lists`], and the refinement's oracle must find the difference.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), expect(dead_code, reason = "made only by the controls of the tests"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 enum Planted {
     /// A referrer of a function whose key changed keeps the function it was made of.
     KeptTemplates,
@@ -1764,6 +2076,13 @@ enum Planted {
     DeltaOmitsRemoved,
     /// A `Built` given back keeps the rows of the functions the build removed.
     StaleBuilt,
+    /// A walk kept by a front end that may close dyn facts is patched once it closes none.
+    PatchesClosed,
+    /// What a describe sends on is not counted as known ([`progress`]): only the roots are.
+    UncountedSends,
+    /// A launched function's call to a weakly defined callee names its key, not its symbol
+    /// ([`Build::resolve`]).
+    WeakByKey,
 }
 
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
@@ -1894,7 +2213,21 @@ impl<'a, B: Prepare> Build<'a, B> {
             checks_shape: true,
             renames: true,
             planted: None,
+            records: None,
+            recorded: SegQueue::new(),
         }
+    }
+
+    /// Asks `records` for each function's describe before the front end, where the front end
+    /// has a content key for it ([`Frontend::record_key`]), and gives back, among the build's
+    /// puts, a record of each describe the front end made
+    /// (docs/v2/plan/design/store.md, "Describe records"). The walk reaches the same
+    /// functions either way; with it, a function another database of the same sources
+    /// described costs a store lookup and its record's decode in place of a describe.
+    // dyn: as the field's
+    pub fn recording(mut self, records: &'a dyn Records) -> Self {
+        self.records = Some(records);
+        self
     }
 
     /// Plants `bug` in this build's patch ([`Planted`]), for a control.
@@ -2029,49 +2362,75 @@ impl<'a, B: Prepare> Build<'a, B> {
         })
     }
 
-    /// What the front end says of `asked`, a function and whose code asks for it, in the
-    /// walk's round `round` (from 0): the describe an earlier walk kept, where the front end
-    /// says a describe now would give it ([`Frontend::redescribe`]); else a describe, kept
-    /// for the next walk. A describe that fails is the build's error and nothing is kept of
-    /// it, so the next walk asks again.
+    /// What the front end says of `asked`, a function and whose code asks for it, as a walk
+    /// that visits it takes it: the store's record of it, else a describe
+    /// ([`Self::found_or_described`]). Nothing is kept of it but the walk's node, so between
+    /// builds the record is its one holder (docs/v2/plan/design/end-state/memory.md 4.4): a
+    /// describe is never held a second time by the instance it is of. A describe that fails
+    /// is the build's error.
     fn described(
         &self,
         asked: &(FrontInstance<B>, Origin),
-        round: usize,
         counts: &kept::Counts,
     ) -> Result<Arc<Described<FrontInstance<B>, FrontStatic<B>>>, CodegenError> {
         let (instance, requester) = asked;
-        let now = match self.kept.and_then(|kept| kept.function(round, asked)) {
-            Some(was) if !self.asks => {
-                counts.verified();
-                return Ok(was);
-            }
-            Some(was) => match self.frontend.redescribe(instance, requester, &was) {
-                Ok(None) => {
-                    counts.verified();
-                    return Ok(was);
-                }
-                Ok(Some(now)) => {
-                    counts.described();
-                    now
-                }
-                Err(why) => {
-                    counts.described();
-                    return Err(why);
-                }
-            },
-            None => {
-                counts.described();
-                self.frontend.describe(instance, requester)?
-            }
+        // alloc: once per function a walk visits, its node's, freed with the node
+        Ok(Arc::new(self.found_or_described(instance, requester, counts)?))
+    }
+
+    /// The describe of `instance` for `requester`, as a whole walk or a frontier form visits
+    /// it: the store's record of it where the build reads records ([`Build::recording`]) and the
+    /// front end has a content key for it ([`Frontend::record_key`]); else the front end's
+    /// describe, with its record pushed for the build's puts where the front end can write
+    /// one. A record that is there and does not read is the build's error, naming the
+    /// function and the key: never a reason to describe again.
+    fn found_or_described(
+        &self,
+        instance: &FrontInstance<B>,
+        requester: &Origin,
+        counts: &kept::Counts,
+    ) -> Result<Described<FrontInstance<B>, FrontStatic<B>>, CodegenError> {
+        let key = match self.records {
+            Some(_) => self.frontend.record_key(instance, requester),
+            None => None,
         };
-        // alloc: once per describe, shared by the walk's node and the walk kept
-        let now = Arc::new(now);
-        if let Some(kept) = self.kept {
-            // clone: a reference count, once per describe
-            kept.keep(round, asked, now.clone());
+        let (Some(records), Some(key)) = (self.records, key) else {
+            counts.described();
+            return self.frontend.describe(instance, requester);
+        };
+        let unread = |why: String| {
+            error(
+                InstanceKey(ContentId::default()),
+                ItemKey(ContentId::default()),
+                // alloc: an error
+                format!(
+                    "the record of the describe of `{}` under the store key {:x} does not read: \
+                     {why}",
+                    self.frontend.spell(instance),
+                    key.0
+                ),
+            )
+        };
+        let mut found = None;
+        let had = records
+            .read(&key, &mut |bytes| {
+                found = Some(self.frontend.from_record(instance, requester, bytes));
+            })
+            .map_err(unread)?;
+        match (had, found) {
+            (true, Some(read)) => {
+                counts.found();
+                read.map_err(unread)
+            }
+            _ => {
+                counts.described();
+                let now = self.frontend.describe(instance, requester)?;
+                if let Some(bytes) = self.frontend.to_record(instance, requester, &now) {
+                    self.recorded.push(Put { key, kind: records::KIND, bytes, of: None });
+                }
+                Ok(now)
+            }
         }
-        Ok(now)
     }
 
     fn static_node(
@@ -2117,7 +2476,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             hints: Hints::new(),
             refused: SegQueue::new(),
             counts,
-            round,
+            progress: progress::Progress::here(),
         };
         // alloc: none unless the check refuses
         let mut errors = Vec::new();
@@ -2141,15 +2500,22 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut passes = 0;
         let order = loop {
             {
-                let _span = tracing::info_span!(
+                let span = tracing::info_span!(
                     target: "blaze",
                     "codegen walk describe",
                     round,
                     pass = passes + 1,
-                )
-                .entered();
+                    done = tracing::field::Empty,
+                    known = tracing::field::Empty,
+                );
+                let _entered = span.enter();
                 walking.work.run(&|ask: &Ask<_, _>| self.visit(&walking, ask));
                 walking.hints.flush(self.frontend);
+                // The pass's own counts as it ends, and the walk's on the span above it.
+                let (done, known) = walking.progress.counts();
+                span.record("done", done);
+                span.record("known", known);
+                walking.progress.tell();
             }
             let order = Order::of(&walking.frontier, roots, static_roots, check);
             if walking.stopped.load(Ordering::Relaxed) {
@@ -2162,6 +2528,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                         // Deferred with its count: the check sends back no other.
                         let Some(counted) = entry.counted.get() else { continue };
                         let step = Step::place_past(entry.from.as_ref(), counted);
+                        walking.progress.known(1);
                         walking.work.push(Ask::Function(entry, step));
                     }
                 }
@@ -2199,7 +2566,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     Some(made) => made,
                     None => {
                         let made = self
-                            .described(&entry.asked, walking.round, walking.counts)
+                            .described(&entry.asked, walking.counts)
                             .and_then(|it| self.node(&entry.asked.0, entry.asked.1, it));
                         match entry.made.set(made) {
                             Ok(made) => made,
@@ -2237,6 +2604,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             }
         }
+        // Past everything that can give way: a visit run again is counted once, as it ends.
+        walking.progress.done();
     }
 
     /// Sends on what `refs`, the references of a function or static at `step` asked for by
@@ -2330,6 +2699,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             sent_statics.push(entry.value.clone());
             walking.work.push(Ask::Static(entry, Step::place_static(from)));
         }
+        // What a describe reached and sent; the roots (`from` is none) are counted whatever
+        // a control plants.
+        if from.is_none() || self.planted != Some(Planted::UncountedSends) {
+            walking.progress.known(sent.len() + sent_statics.len());
+        }
         (sent, sent_statics)
     }
 
@@ -2366,7 +2740,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut described_functions = Vec::new();
         let fresh = match self.kept {
             None => Some(Fresh::Unkept),
-            Some(kept) if kept.is_empty() => Some(kept.empty_because()),
+            Some(kept) if kept.is_empty() => Some(Fresh::Restart),
             Some(_) => None,
         };
         let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>, Global> =
@@ -2818,10 +3192,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
         }
         drop(resolving);
-        let (described, verified) = counts.get();
         let walk = Walk {
-            described,
-            verified,
+            described: counts.described_so_far(),
+            // A whole walk takes no describe from memory: each is a record's or a describe.
+            verified: 0,
+            found: counts.found_so_far(),
             reached: nodes.len(),
             dropped: 0,
             fresh,
@@ -2965,20 +3340,6 @@ impl<'a, B: Prepare> Build<'a, B> {
         flown.into_iter().flatten().collect()
     }
 
-    /// Builds the IR of each of `keys`, on all cores, until the build is stopped.
-    fn prepare_all(
-        &self,
-        nodes: &Sorted<InstanceKey, Node<B>>,
-        keys: &[InstanceKey],
-        errors: &mut Vec<CodegenError>,
-    ) -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
-        self.until_stopped(keys, errors, |key| {
-            let node = &nodes[key];
-            let made = prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node);
-            (*key, made)
-        })
-    }
-
     /// Compiles everything `roots` reach. Each root is an instance and whose code asks for it.
     /// The recursion limit's check walks from the roots in their order.
     pub fn run(
@@ -3041,8 +3402,35 @@ impl<'a, B: Prepare> Build<'a, B> {
     }
 
     /// A whole build, or with `later` a lazy one whose entry is the roots at those places
-    /// ([`Build::run_later`]).
+    /// ([`Build::run_later`]): [`Self::run_built`], then the records of the describes its walk
+    /// made, added to its puts ([`Build::recording`]). A build that is refused puts nothing,
+    /// its records with the rest.
     fn run_as(
+        &mut self,
+        roots: &[(FrontInstance<B>, Origin)],
+        static_roots: &[FrontStatic<B>],
+        check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
+        later: Option<&[usize]>,
+        store: &impl Lookup,
+    ) -> Result<Built, Vec<CodegenError>> {
+        let built = self.run_built(roots, static_roots, check, later, store);
+        // alloc: per build, the records its describes made
+        let made: Vec<Put> = std::iter::from_fn(|| self.recorded.pop()).collect();
+        let mut built = built?;
+        if made.is_empty() {
+            return Ok(built);
+        }
+        // alloc: an error, once
+        let records = records::sorted(made).map_err(|why| vec![why])?;
+        // A record's key is of its own domain (the front end's schema of it), so none is a
+        // key of the build's other puts: the two sorted lists merge into one, by key.
+        built.puts.extend(records);
+        built.puts.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(built)
+    }
+
+    /// [`Self::run_as`], before the records of its describes are added to its puts.
+    fn run_built(
         &mut self,
         roots: &[(FrontInstance<B>, Origin)],
         static_roots: &[FrontStatic<B>],
@@ -3081,8 +3469,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                 // 2026-11-10 a 2 s walk's row said nothing of which walk it was.
                 function = tracing::field::Empty,
                 roots = roots.len(),
+                // How far the walk is, while it runs ([`progress`]): visits ended of items sent.
+                done = tracing::field::Empty,
+                known = tracing::field::Empty,
                 described = tracing::field::Empty,
                 verified = tracing::field::Empty,
+                found = tracing::field::Empty,
                 reached = tracing::field::Empty,
                 visited = tracing::field::Empty,
                 fresh = tracing::field::Empty,
@@ -3173,6 +3565,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             let walk = &walked.3;
             span.record("described", walk.described);
             span.record("verified", walk.verified);
+            span.record("found", walk.found);
             span.record("reached", walk.reached);
             span.record("visited", walk.visited);
             if let Some(fresh) = walk.fresh {
@@ -3183,8 +3576,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 span.record(
                     "function",
                     tracing::field::display(format_args!(
-                        "whole ({whole}): described {}, verified {}, reached {}",
-                        walk.described, walk.verified, walk.reached
+                        "whole ({whole}): described {}, found {}, verified {}, reached {}",
+                        walk.described, walk.found, walk.verified, walk.reached
                     )),
                 );
             }
@@ -3444,6 +3837,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut identities: Vec<(InstanceKey, ContentId)> =
             nodes.iter().map(|(key, node)| (*key, node.subject())).collect();
         identities.append(&mut out.folded);
+        // alloc: per build, what it gives a running program's slots
+        let abis = nodes.iter().map(|(key, node)| (*key, node.described.abi)).collect();
         // alloc: per build, what it gives the linker
         let cold = nodes.iter().filter(|it| it.1.described.cold).map(|it| *it.0).collect();
         let made = nodes
@@ -3515,6 +3910,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             digests: pieces,
             memo_used: used,
             identities,
+            abis,
             cold,
             made,
             kernel,
@@ -3715,24 +4111,43 @@ impl<'a, B: Prepare> Build<'a, B> {
         store: &impl Lookup,
         out: &mut Out,
     ) {
-        let mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)> = HashMap::new();
+        // Each fold candidate's shape, as this build prepared it: what a landing under its
+        // flight key must be (`landed`, rule 21).
+        // alloc: per build, a key and a hash a fold candidate
+        let mut shapes: HashMap<InstanceKey, Shape> = HashMap::new();
 
         // Folding: every candidate's masked IR from its own IR, prepared in this build. No key
         // known before preparing holds what a masked data object is told by (its positions'
         // anchors, its file names), so a mask kept from another build or unit could name
         // other data than the IR a group merges. Each form interned once in `self.masks`
-        // (hashed only when new).
+        // (hashed only when new). Its IR is let go the moment it is masked: a candidate's IR
+        // held while others are prepared and compiled was the build's top held site, every
+        // candidate's at once. One the store misses, or a group merges, is prepared again
+        // where it is compiled (`compile_missing`, `merge_group`), each at most the pool's
+        // width at once.
         // alloc: per build, sized by its units
         let candidates_of: Vec<InstanceKey> =
             dev.iter().filter(|key| nodes[*key].spec.fold).copied().collect();
+        #[cfg(test)]
+        let held = plant::Held::<B>::new();
+        let made_masks = self.until_stopped(candidates_of.as_slice(), &mut out.errors, |key| {
+            let node = &nodes[key];
+            let made = prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node);
+            let masked = made.map(|(shape, made)| {
+                let masked = self.backend.masked(&node.unit, &made, &node.refs);
+                #[cfg(test)]
+                held.keep(made);
+                (shape, masked)
+            });
+            (*key, masked)
+        });
         // alloc: per build, sized by its units
-        let mut masks: Vec<(InstanceKey, Option<Masked>)> = Vec::with_capacity(candidates_of.len());
-        for (key, made) in self.prepare_all(nodes, &candidates_of, &mut out.errors) {
+        let mut masks: Vec<(InstanceKey, Option<Masked>)> = Vec::with_capacity(made_masks.len());
+        for (key, made) in made_masks {
             match made {
-                Ok((shape, made)) => {
-                    let node = &nodes[&key];
-                    masks.push((key, self.backend.masked(&node.unit, &made, &node.refs)));
-                    prepared.insert(key, (shape, made));
+                Ok((shape, masked)) => {
+                    masks.push((key, masked));
+                    shapes.insert(key, shape);
                 }
                 Err(why) => out.errors.push(why),
             }
@@ -3796,9 +4211,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                         key: at,
                         hit: true,
                     });
-                    let ir = prepared.remove(key);
                     if self.verify.sampled(&at.0) {
-                        sampled.push((*key, at, ir.map(|it| it.1)));
+                        sampled.push((*key, at));
                     }
                     out.made(&node.unit, &node.described.name, *key, Whence::Store(at), made);
                 }
@@ -3808,19 +4222,19 @@ impl<'a, B: Prepare> Build<'a, B> {
                     }
                     missing.push(*key);
                 }
-                Read::Failed => {
-                    prepared.remove(key);
-                }
+                // Its error is the build's already.
+                Read::Failed => {}
             }
         }
         self.verify_dev(nodes, sampled, store, out);
         // Each function the store missed is compiled by one build of the memo
         // ([`crate::flight`]), by its stored key: this one when it asks first, landed the
         // moment its compile ends; else the other's template, waited for, that function
-        // alone, once this build's own compiles ended.
+        // alone, once this build's own compiles ended. Each is prepared where it is compiled
+        // (`own` is `None`).
         let items: Vec<(InstanceKey, (InstanceKey, Option<(Shape, B::Prepared)>))> =
             // alloc: per build, sized by its store misses
-            missing.into_iter().map(|key| (nodes[&key].flight(), (key, prepared.remove(&key)))).collect();
+            missing.into_iter().map(|key| (nodes[&key].flight(), (key, None))).collect();
         let name = |(key, _): &(InstanceKey, Option<(Shape, B::Prepared)>)| {
             let node = &nodes[key];
             (*key, node.unit.item, node.described.name.as_str())
@@ -3834,8 +4248,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         for it in flown {
             match it {
                 Flown::Ran(piece) => out.absorb(piece),
-                Flown::Landed((key, own), shape) => {
-                    self.landed(nodes, key, shape, own.as_ref().map(|(own, _)| own), out)
+                Flown::Landed((key, _), shape) => {
+                    self.landed(nodes, key, shape, shapes.get(&key), out)
                 }
             }
         }
@@ -3844,43 +4258,29 @@ impl<'a, B: Prepare> Build<'a, B> {
             return;
         }
 
-        self.folded(nodes, &groups, prepared, store, out);
+        self.folded(nodes, &groups, store, out);
     }
 
     /// The store check of `sampled`, dev functions whose templates the store gave
-    /// ([`Build::verify_store`]): each compiled again from its IR (the one folding prepared,
-    /// else prepared here) with neither the store nor the memo, and its template's bytes
+    /// ([`Build::verify_store`]): each prepared again and compiled from that IR with neither
+    /// the store nor the memo, its IR let go as its compile ends, and its template's bytes
     /// compared with the stored.
     fn verify_dev(
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
-        sampled: Vec<(InstanceKey, Key, Option<B::Prepared>)>,
+        sampled: Vec<(InstanceKey, Key)>,
         store: &impl Lookup,
         out: &mut Out,
     ) {
         if sampled.is_empty() {
             return;
         }
-        // alloc: per build, the store hits the store check samples
-        let unprepared: Vec<InstanceKey> =
-            sampled.iter().filter(|it| it.2.is_none()).map(|it| it.0).collect();
-        let mut made: HashMap<InstanceKey, B::Prepared> = HashMap::new();
-        for (key, it) in self.prepare_all(nodes, &unprepared, &mut out.errors) {
-            match it {
-                Ok((_, ir)) => {
-                    made.insert(key, ir);
-                }
-                Err(why) => out.errors.push(why),
-            }
-        }
-        let jobs: Vec<(InstanceKey, Key, B::Prepared)> = (sampled.into_iter())
-            .filter_map(|(key, at, ir)| Some((key, at, ir.or_else(|| made.remove(&key))?)))
-            // alloc: per build, the store hits the store check samples
-            .collect();
-        let emitted = self.until_stopped(jobs, &mut out.errors, |(key, at, ir)| {
+        let emitted = self.until_stopped(sampled, &mut out.errors, |(key, at)| {
             let node = &nodes[&key];
-            let emitted = self.backend.emit(&node.unit, &node.spec, ir, &node.refs, None);
-            (key, at, emitted.map_err(|why| naming(why, &node.described.name)))
+            let emitted = prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node)
+                .and_then(|(_, ir)| self.backend.emit(&node.unit, &node.spec, ir, &node.refs, None))
+                .map_err(|why| naming(why, &node.described.name));
+            (key, at, emitted)
         });
         for (key, at, emitted) in emitted {
             let node = &nodes[&key];
@@ -4103,7 +4503,6 @@ impl<'a, B: Prepare> Build<'a, B> {
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
         groups: &[Group],
-        mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)>,
         store: &impl Lookup,
         out: &mut Out,
     ) {
@@ -4165,16 +4564,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         // Each group the store missed is merged by one build of the memo ([`crate::flight`]),
         // by its key and members; its body and thunks are kept in the memo under their store
-        // keys, so a build that waited for it or asks after takes them there.
+        // keys, so a build that waited for it or asks after takes them there. Its members are
+        // prepared as it is merged (each `own` is `None`): no group's IR is held while another
+        // group or function is compiled.
         let items: Vec<(InstanceKey, (&Group, Vec<Option<(Shape, B::Prepared)>>))> = merging
             .into_iter()
-            // alloc: per group the store missed, its members' IR
-            .map(|group| {
-                (
-                    group_flight(group),
-                    (group, group.members.iter().map(|it| prepared.remove(it)).collect()),
-                )
-            })
+            // alloc: per group the store missed, a `None` a member
+            .map(|group| (group_flight(group), (group, group.members.iter().map(|_| None).collect())))
             // alloc: per build, sized by its groups
             .collect();
         let name = |(group, _): &(&Group, Vec<Option<(Shape, B::Prepared)>>)| {
@@ -5181,9 +5577,16 @@ mod frontier;
 use frontier::{Frontier, Order};
 mod kept;
 pub use kept::{Kept, Walk, Work};
+mod records;
+pub use records::Records;
 mod later;
 mod lists;
+mod near;
+pub use near::{Callee, Near};
+mod start;
+pub use start::{One, OneStatic, Start};
 mod patch;
+mod progress;
 mod recursion;
 use recursion::Step;
 mod rows;

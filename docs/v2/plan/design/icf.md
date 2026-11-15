@@ -58,8 +58,7 @@ every symbol a relocation reaches resolves to it:
 - **statics' values (new).** A `static TABLE: [fn() -> u32; 2] = [f::<u32>, f::<i32>]` names
   both instances. Before this change dedupe left the static naming the instance it merged
   away, which no piece defines, and the link failed with an undefined symbol. Now the value's
-  relocations and its data's are renamed. Its digest (`digests::static_definition`, which
-  `blaze_premap` keys and checks images by) is made again from the renamed value;
+  relocations and its data's are renamed. Its digest (`digests::static_definition`) is made again from the renamed value;
 - **data, in one forward pass.** A datum's ID is its content, relocations included, so
   renaming one renames whatever points at it. A datum names only data before it
   (`Template::of` refuses others, `TemplateError::DataOrder`), so one pass in list order gives
@@ -172,8 +171,8 @@ Nothing here was run (lanes don't build). The coordinator runs:
   computed on, as its layout, not its identity. That belongs to `hir-ty-share`.
 - **Dependency images.** If a dependency's function folds into a workspace function with a
   smaller key, a dependency static that named it now names the workspace function, and
-  `blaze_premap::split` refuses that ("points at ... which is the workspace's"), as it already
-  does for dependency code. Whether dev builds can fold across that line, and whether
+  a dependency image has to refuse that, as it does for dependency code (`blaze-premap`'s
+  `split` did, until the crate was deleted on 2026-11-12: caches.md). Whether dev builds can fold across that line, and whether
   `mergeable` should stop at it, is open. Code compiled after the build (`driver/later.rs`, a
   live patch) still names keys merged away. Both predate this lane.
 - **Lines.** `code_id` hashes the function's line table, so two *different* source functions

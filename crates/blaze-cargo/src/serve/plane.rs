@@ -1,17 +1,19 @@
 //! The plane (docs/v2/plan.md) as the daemon's loop steps it: every job's
-//! tasks are nodes of one [`blaze_graph::Plane`], with single flight, fair share, critical path
-//! and memory admission. The loop owns the plane and steps it with the driver's clock, so a run
-//! under the simulation driver is a function of its seed.
+//! tasks are nodes of one [`blaze_graph::Plane`], with single flight, fair share and critical
+//! path; a task starts when a thread of its pool is free (admission is by cores alone: nothing
+//! holds a task back, wounds it or parks it for memory, and the kernel's limit is the one
+//! ceiling). The loop owns the plane and steps it with the driver's clock, so a run under the
+//! simulation driver is a function of its seed.
 //!
 //! A node's task runs where its [`Task`] says: on a thread ([`Task::Thread`]: the process's
 //! worker pool for [`Pool::Work`], an IO thread for [`Pool::Io`]) through a [`Runner`] (the
 //! daemon's [`Threads`], or the simulation's [`Inline`]), its batch's [`Work`] called, or on
 //! the loop itself ([`Task::Loop`]: user code, which runs as the driver's spawns). Every node is
-//! given its cost and memory by the plane's [`Predict`] (the daemon's is a
-//! `blaze_history::History`) from its kind and key, and each one's own run teaches it: a
-//! thread task's time and what its work held at most, its fan-out to the pool included and
-//! nothing any other task held ([`arena::account`]), a loop task's time from its start to its
-//! end; a run that replays what was kept teaches nothing ([`Plane::replays`]).
+//! given its cost by the plane's [`Predict`] (the daemon's is a `blaze_history::History`) from
+//! its kind and key, and each one's own run teaches it: a thread task's time and what its work
+//! held at most, its fan-out to the pool included and nothing any other task held
+//! ([`admission::run_as`]), a loop task's time from its start to its end; a run that replays
+//! what was kept teaches nothing ([`Plane::replays`]).
 
 #![forbid(unsafe_code)]
 
@@ -26,21 +28,21 @@ use std::{
 };
 
 use blaze_graph::{
-    Budget, Error, Plane as Graph, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
-    admission::{self, Predict, Prediction, TaskKind},
-    arena,
+    Error, Plane as Graph, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
+    admission::{self, Predict, TaskKind},
     machine::{NodeId, Outcome, Pool},
     plane::{Key, NodeRef, Nodes, Unsettled},
 };
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64 as Rng;
+use blaze_profile::stuck::again::{AGAIN_BOUND, Again, Inputs, SameAgain};
 use blaze_protocol::{
     events::{Event, NodeState},
     now::{self, Fold, Now},
 };
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
-/// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
+/// The kinds of the daemon's own tasks, for their estimates and their subsystems' tags.
 pub use blaze_graph::admission::kinds;
 
 /// The kinds of the loop's tasks, past every one of [`kinds`]: they hold none of the daemon's
@@ -68,15 +70,12 @@ pub trait Work: Send + Sync + 'static {
     type Readers: Default + Send + 'static;
 
     /// Task `arg` run with the readers the loop posted it with: what it came to, or `None`
-    /// when it gave way (a cycle of waits, a cancel, memory), to be posted again whole.
+    /// when it gave way (a cycle of waits, a cancel), to be posted again whole.
     fn run(&self, arg: u32, readers: Self::Readers) -> Option<Did<Self::Value>>;
 
     /// Task `arg`'s crate and unit, for its `task` span: a unit phase's, `None` for a task of
-    /// no unit.
-    fn subject(&self, arg: u32) -> Option<(String, String)> {
-        let _ = arg;
-        None
-    }
+    /// no unit, said by the batch: no default, so a batch of units never inherits "no unit".
+    fn subject(&self, arg: u32) -> Option<(String, String)>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,11 +98,6 @@ pub struct Fresh {
     nodes: Nodes,
     tasks: Vec<Task>,
     keys: Vec<Option<Key>>,
-    /// Each node's unit's source bytes ([`Plane::push_sized`]); 0 for a node not sized.
-    sizes: Vec<u64>,
-    /// Each node whose own measured runs predict more than the whole budget, and that peak:
-    /// what the plane's refusal of it says it came from ([`Plane::admit`]). Few, usually none.
-    over: Vec<(NodeId, u64)>,
     count: u32,
 }
 
@@ -205,6 +199,15 @@ impl<W: Work> Runner<W> {
         }
     }
 
+    /// Whether a task's end ends the wait of the loop's driver ([`Back`]): the loop then sets
+    /// no deadline of its own to read the ends by. The simulation's tasks run on the loop.
+    pub fn wakes(&self) -> bool {
+        match self {
+            Runner::Threads(it) => it.wakes(),
+            Runner::Inline(_) => false,
+        }
+    }
+
     /// How many of [`Runner::running`] were posted to the process's worker pool ([`Pool::Work`]
     /// on [`Threads`]): each ends only as its pool job's `done` runs, so with the pool idle and
     /// none of its jobs parked, such a task can never end. The simulation's run on the loop.
@@ -229,56 +232,40 @@ pub struct Posting {
     pub reads: bool,
     /// The number of its request, the build its spans are of ([`blaze_profile::flight::building`]).
     pub build: u32,
-    /// What memory admission did with it as it started ([`blaze_graph::plane::Admitted`]),
-    /// for its `task` span: the bytes granted, and the times passed over for memory.
-    pub granted: u64,
-    pub passed: u32,
-    /// Where it says the memory account it runs in as it starts, so the loop reads what it
-    /// has realized while it runs ([`PlaneInput::Realized`]); `None` posted outside a plane.
-    pub began: Option<&'static Began>,
 }
 
-/// A running task's memory account, as [`run_measured`] says it to its plane: read with
-/// [`arena::peak_now`] while the task runs.
-pub type Began = Sender<(NodeId, arena::Account)>;
-
-/// A running task's account as the loop reads it, and the realized bytes it last told the plane.
-#[derive(Clone, Copy, Debug)]
-struct Realizing {
-    account: arena::Account,
-    told: u64,
-}
-
-/// A purge admission asked of the purger's thread ([`crate::raw::memory::Purger`]), not yet
-/// heard done.
-#[derive(Clone, Copy, Debug)]
-struct Purging {
-    /// Its ticket: done once [`crate::raw::memory::Purger::done`] reaches it.
-    ticket: u64,
-    /// A task ended or gave way since it was asked, so freed bytes its reading would hold.
-    freed: bool,
-}
-
-impl Purging {
-    fn asked() -> Purging {
-        Purging { ticket: crate::raw::memory::purger().ask(), freed: false }
-    }
-}
-
-/// How much a running task's realized bytes grow before the plane is told again: 1/16 of its
-/// grant, and at least 64 MiB. Each telling is a step of the plane; past its grant it is told
-/// at once ([`Plane::realized`]).
-const REALIZED_STEP: u64 = 64 << 20;
+/// What a `task` and `admission` span says its forecast came from: nothing forecasts a task's
+/// memory (admission is by cores alone), so its `granted_bytes` is 0.
+const NOT_FORECAST: &str = "not forecast";
 
 /// The daemon's: work tasks on the process's worker pool, IO tasks on threads of their own.
 pub struct Threads<W: Work> {
     /// Every task's way back, shared by reference: a task posted counts no sender.
-    done_tx: &'static Sender<Ran<W::Value>>,
+    done_tx: &'static Back<W::Value>,
     done: Receiver<Ran<W::Value>>,
     io: Sender<IoJob<W>>,
     running: usize,
     /// Of `running`, those posted to the worker pool.
     on_pool: usize,
+}
+
+/// A task's way back to the loop: its end queued, then the loop's wait ended where its driver
+/// has a waker ([`blaze_core::Driver::waker`]), in that order, so the turn the wake starts
+/// reads the end. With none (`wake` is `None`), the loop reads the queue at its own deadline
+/// (`daemon::Woken::PlaneTasks`).
+struct Back<V> {
+    tx: Sender<Ran<V>>,
+    wake: Option<blaze_core::Waker>,
+}
+
+impl<V> Back<V> {
+    fn send(&self, ran: Ran<V>) {
+        // The loop holds the receiver for as long as the process lives.
+        _ = self.tx.send(ran);
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
+    }
 }
 
 struct IoJob<W: Work> {
@@ -295,10 +282,13 @@ impl<W: Work> Threads<W> {
     /// # Panics
     ///
     /// When a thread cannot be started, as [`std::thread::spawn`].
-    pub fn new(io: usize, work: usize) -> Threads<W> {
+    ///
+    /// `wake` is the waker of the driver the plane's loop waits in, which each task's end
+    /// calls ([`Back`]); `None` for a loop that reads the ends at a deadline of its own.
+    pub fn new(io: usize, work: usize, wake: Option<blaze_core::Waker>) -> Threads<W> {
         let (done_tx, done) = bounded(io.max(1) + work.max(1) + 1);
         // alloc: one sender per runner, kept for the process's life so no task clones it.
-        let done_tx: &'static Sender<Ran<W::Value>> = Box::leak(Box::new(done_tx));
+        let done_tx: &'static Back<W::Value> = Box::leak(Box::new(Back { tx: done_tx, wake }));
         let (io_tx, io_rx) = unbounded::<IoJob<W>>();
         for at in 0..io.max(1) {
             let io_rx = io_rx.clone();
@@ -325,7 +315,7 @@ impl<W: Work> Threads<W> {
                                 (None, ..) => {}
                             }
                         };
-                        _ = done_tx.send(Ran { task: job.task, ended, peak, ran_ns, puts });
+                        done_tx.send(Ran { task: job.task, ended, peak, ran_ns, puts });
                     }
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
@@ -346,11 +336,10 @@ fn run_measured<W: Work>(
     task: Posting,
     readers: W::Readers,
 ) -> (Option<Ended<W::Value>>, u64, u64, Vec<proc_macro_api::kept::Put>) {
-    let Posting { id, arg, build, kind, granted, passed, began, .. } = task;
+    let Posting { id, arg, build, kind, .. } = task;
     let _build = blaze_profile::flight::building(build);
-    // Named for the profile: what the task is, what admission granted and how often it held it
-    // back, and as it ends the most it held, so a forecast that serialized the plane is a
-    // query (`task_memory` in crates/blaze-profile/sql/examples.sql), not a guess.
+    // Named for the profile: what the task is, and as it ends the most it held (`task_memory`
+    // in crates/blaze-profile/sql/examples.sql). Nothing is granted: admission is by cores.
     // Interned here, on the thread the span opens on: a name is a token of its thread's.
     let (krate, unit) = match work.subject(arg) {
         Some((krate, unit)) => {
@@ -361,25 +350,32 @@ fn run_measured<W: Work>(
     let span = blaze_profile::span::Task {
         kind: task_name(kind),
         node: u64::from(id.0),
-        granted,
-        passed: u64::from(passed),
+        granted: 0,
+        passed: 0,
+        basis: blaze_profile::span::Name::kept(NOT_FORECAST),
         krate,
         unit,
     }
     .open();
     let start = Instant::now();
-    let (result, spent) = admission::run_as(kind, || {
-        if let Some(began) = began {
-            // The account `run_as` opened: what this task's work is charged to, read by the
-            // loop as it runs. The loop holds the receiver for its life, so a send fails only
-            // as the daemon ends.
-            // alloc: a block of the channel per 31 tasks, reused
-            _ = began.send((id, arena::current()));
-        }
+    let run = || {
         let _job = InJob::enter();
         catch_unwind(AssertUnwindSafe(|| work.run(arg, readers)))
-    });
+    };
+    let measured = catch_unwind(AssertUnwindSafe(|| admission::run_as(kind, run)));
     let ran_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let (result, spent) = match measured {
+        Ok(ran) => ran,
+        Err(word) => {
+            span.ended(blaze_profile::span::TaskEnded {
+                peak: None,
+                heap_allocated: None,
+                heap_freed: None,
+            });
+            // A panic of the frame's task itself (outside `run`) fails it as any panic does.
+            return (Some(Ended::Panicked(panicked(&*word))), 0, ran_ns, Vec::new());
+        }
+    };
     let ended = matches!(result, Ok(Some(_)));
     span.ended(blaze_profile::span::TaskEnded {
         peak: ended.then_some(spent.peak),
@@ -400,7 +396,7 @@ fn run_measured<W: Work>(
 }
 
 /// A task kind as its `task` span names it: the daemon's own by name, a query kind by number,
-/// each with the subsystem whose budget admits it (`unit bodies (Infer)`). Interned once a
+/// each with the subsystem its memory is tagged by (`unit bodies (Infer)`). Interned once a
 /// kind: the kinds are few.
 fn task_name(kind: TaskKind) -> blaze_profile::span::Name {
     let tag = admission::tag_of(kind);
@@ -436,8 +432,7 @@ impl fmt::Display for Panic {
     }
 }
 
-/// Whether a task of `kind` is a part of a program's build: admitted by that program's own
-/// measure, and alone until it has one ([`Plane::push_program`]).
+/// Whether a task of `kind` is a part of a program's build ([`Plane::push_program`]).
 const fn of_program(kind: TaskKind) -> bool {
     matches!(kind, kinds::PROGRAM | kinds::PROGRAM_LINK)
 }
@@ -533,7 +528,7 @@ fn post_work<W: Work>(
     task: Posting,
     work: Arc<W>,
     readers: W::Readers,
-    done: &'static Sender<Ran<W::Value>>,
+    done: &'static Back<W::Value>,
 ) {
     let pool = blaze_graph::exec::shared();
     // The batch's work comes back with the result, for a task that gave way to be posted again
@@ -541,11 +536,11 @@ fn post_work<W: Work>(
     let run = move || (run_measured(&*work, task, readers), work);
     let then = move |result: std::thread::Result<_>| match result {
         Ok(((Some(ended), peak, ran_ns, puts), _)) => {
-            _ = done.send(Ran { task, ended, peak, ran_ns, puts })
+            done.send(Ran { task, ended, peak, ran_ns, puts })
         }
         Ok(((None, peak, ran_ns, puts), _)) if task.reads => {
             let ended = Ended::GaveWay { group: blaze_graph::pool::group() };
-            _ = done.send(Ran { task, ended, peak, ran_ns, puts });
+            done.send(Ran { task, ended, peak, ran_ns, puts });
         }
         // Gave way: posted again behind what is ready on the group it ran on.
         Ok(((None, ..), work)) => {
@@ -558,7 +553,7 @@ fn post_work<W: Work>(
         }
         // A panic outside the measure: its puts stay in the thread's buffer.
         Err(panic) => {
-            _ = done.send(Ran {
+            done.send(Ran {
                 task,
                 ended: Ended::Panicked(panicked(&*panic)),
                 peak: 0,
@@ -605,6 +600,11 @@ impl<W: Work> Threads<W> {
 
     fn running(&self) -> usize {
         self.running
+    }
+
+    /// Whether a task's end ends the loop's wait ([`Back`]).
+    fn wakes(&self) -> bool {
+        self.done_tx.wake.is_some()
     }
 }
 
@@ -705,11 +705,6 @@ struct Batch<W> {
     tasks: Vec<Task>,
     /// Each node's key, read once when it ends, for what its run teaches.
     keys: Vec<Option<Key>>,
-    /// Each node's unit's source bytes, 0 for none ([`Plane::push_sized`]): what its peak
-    /// teaches its kind's bytes held per KiB of source.
-    sizes: Vec<u64>,
-    /// [`Fresh::over`]'s nodes that have not run.
-    over: Vec<(NodeId, u64)>,
     live: u32,
     work: Option<Arc<W>>,
     reads: bool,
@@ -717,7 +712,26 @@ struct Batch<W> {
     request: u32,
 }
 
-/// The plane of thread tasks whose batches are each a `W`, given their costs and memory by `P`.
+/// What gives the first request's number when the plane first opens one.
+// dyn: once a daemon, the history's open it waits for
+pub type Later = Box<dyn FnOnce() -> Result<u32, super::observe::Unopened> + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the lazy numbering's control: [`Plane::number`] asks for the number
+    /// at once, as the start did when it waited for the history.
+    static ASKS_AT_NUMBER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How the plane numbers its requests ([`Plane::number`]).
+pub enum Numbered {
+    /// From this number on.
+    From(u32),
+    /// From the number this gives, asked at the first [`Plane::open`].
+    Later(Later),
+}
+
+/// The plane of thread tasks whose batches are each a `W`, given their costs by `P`.
 pub struct Plane<W: Work, P: Predict> {
     graph: Graph,
     predict: P,
@@ -727,6 +741,11 @@ pub struct Plane<W: Work, P: Predict> {
     batches: BTreeMap<u32, Batch<W>>,
     next_node: u32,
     next_request: u32,
+    /// The first request's number, asked at the first [`Plane::open`] ([`Numbered::Later`]).
+    later: Option<Later>,
+    /// Why the requests could not be numbered, for the daemon to stop on
+    /// ([`Plane::unnumbered`]).
+    unnumbered: Option<super::observe::Unopened>,
     happened: Vec<Happened<W::Value>>,
     ran: Vec<Ran<W::Value>>,
     said: Vec<PlaneOutput>,
@@ -737,29 +756,21 @@ pub struct Plane<W: Work, P: Predict> {
     /// Each node whose task replays what was kept, so its run teaches nothing
     /// ([`Plane::replays`]), until it ends or settles.
     replays: HashSet<NodeId, Global>,
-    /// By kind, the bytes a unit's phase held per KiB of its source, learned as sized nodes
-    /// end ([`Plane::push_sized`]) by [`admission::Estimate`]'s rule: a high quantile of the
-    /// kind's recent ratios. Not kept in the image: a daemon starts from [`PER_SOURCE_KIB`]
-    /// and learns again in its first build.
-    per_kib: HashMap<TaskKind, admission::Estimate, Global>, // alloc: the plane's, an entry a kind
+    /// Each thread task failed while its thread still runs it, stuck where nothing can unwind
+    /// it ([`Plane::abandon`]): its late end, if one ever comes, is dropped.
+    abandoned: HashSet<NodeId, Global>,
     /// Each node ready and not started: its `admission` span, open from the step it became
     /// ready, and that step's time ([`Plane::admitting`]).
     admitting: HashMap<NodeId, Admitting, Global>, // alloc: the plane's, an entry a ready node
-    /// What the system last said of memory ([`Plane::pressed`]), and the cap on the budget it
-    /// makes as last given to the plane ([`PlaneInput::Cap`]).
-    pressure: blaze_graph::pressure::Pressured,
-    capped: Option<u64>,
-    /// Where each thread task says its memory account as it starts, and the accounts of those
-    /// that run, by node ([`Plane::measure`]).
-    began_tx: &'static Began,
-    began: Receiver<(NodeId, arena::Account)>,
-    realizing: HashMap<NodeId, Realizing, Global>, // alloc: the plane's, an entry a running task
-    /// The plane asked a purge since the loop last did one ([`Graph::purge_due`]).
-    purge_due: bool,
-    /// The purge asked of the purger's thread and not yet done ([`Purging`]).
-    purging: Option<Purging>,
     /// Each request's live model, fed every record the plane says of it ([`Folds`]).
     folds: Folds,
+    /// The thread tasks that gave way and are posted again, counted while nothing they wait
+    /// on changes ([`blaze_profile::stuck::again`]): past its bound, the task fails as stuck
+    /// ([`Plane::same_again`]).
+    again: Again,
+    /// How many tasks of the plane have ended (done, failed or panicked): what a task that
+    /// gave way waits on, as [`Inputs::ended`].
+    ended: u64,
 }
 
 /// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/design/build-view.md):
@@ -836,70 +847,12 @@ struct Admitting {
     since_ns: u64,
 }
 
-/// What a unit's phase of a kind with no ratio measured yet is predicted to hold per KiB of
-/// its source: 1 MiB, a thousand bytes for each byte of source. Never more than the kind's own
-/// peak once a task of the kind was measured ([`Plane::push_sized`]), so a guess too high costs
-/// no more than the kind floor did; before that, the guess stands (under a budget, at most the
-/// budget, [`admitted`]). Capping it then by the history's prediction for a kind never seen,
-/// [`SIZED_FLOOR`], granted every unit of a cold daemon's first build 64 MiB, whatever its
-/// size: hir-def's front end held 2.39 GiB on its grant of 64 MiB, and a cold `blaze test
-/// --workspace` reached 169 GiB on a 127 GiB Mac (#1726).
-pub const PER_SOURCE_KIB: u64 = 1 << 20;
-
-/// The least a sized unit's phase is predicted to hold, however small its source: the
-/// history's prediction for a kind never seen (`blaze_history::Config::unseen_bytes`).
-pub const SIZED_FLOOR: u64 = 64 << 20;
-
-/// Where a node's predicted peak came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Basis {
-    /// Its own key's record: what its own last runs held, as charged to each run's memory
-    /// account (`blaze_graph::arena::account`), never what the daemon held besides.
-    Own,
-    /// Its unit's source size times what its kind held per KiB lately ([`Plane::push_sized`]):
-    /// a guess from other units.
-    Sized,
-    /// Its kind's peak, or a kind never seen's: a guess from other tasks.
-    Kind,
-}
-
-/// The memory a node predicted to hold `peak` from `basis` asks of the plane under a budget of
-/// `budget` bytes: its prediction, but a guess (from its kind or its size) over the whole budget
-/// is the whole budget. Such a node then runs alone, once nothing granted memory runs, and its
-/// run measures it; refusing it would fail a unit for what other tasks held (a kind's peak is
-/// the largest of any task of it lately: 121.59 GB refused every build script of a test build,
-/// nftest2). Only its own measured runs over the budget stay over it, which the plane refuses
-/// ([`blaze_graph::Plane`]'s `too_big`), since running it could only exhaust the machine.
-pub fn admitted(peak: u64, basis: Basis, budget: Option<u64>) -> u64 {
-    match (basis, budget) {
-        (Basis::Sized | Basis::Kind, Some(budget)) => peak.min(budget),
-        _ => peak,
-    }
-}
-
-/// `why` a node failed, saying where its predicted peak came from when the plane refused it for
-/// memory by `over`, its own measured runs' peak ([`Plane::take_over`]).
-fn refused_by_own_runs(why: String, over: Option<u64>) -> String {
-    match over {
-        // alloc: the message of a node refused for memory, once
-        Some(peak) => format!(
-            "{why}; {:.2} GB is what this unit's own last runs held at most (its key's record in the \
-             daemon's history), not a guess from its kind or size",
-            peak as f64 / f64::from(1 << 30)
-        ),
-        None => why,
-    }
-}
-
 pub(crate) fn ns(at: Duration) -> u64 {
     u64::try_from(at.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl<W: Work, P: Predict> Plane<W, P> {
     pub fn new(config: PlaneConfig, predict: P, runner: Runner<W>) -> Result<Plane<W, P>, Error> {
-        let (began_tx, began) = unbounded();
-        // alloc: one sender per plane, kept for the process's life so no task clones it
-        let began_tx: &'static Began = Box::leak(Box::new(began_tx));
         Ok(Plane {
             graph: Graph::new(config)?,
             predict,
@@ -907,78 +860,20 @@ impl<W: Work, P: Predict> Plane<W, P> {
             batches: BTreeMap::new(),
             next_node: 0,
             next_request: 0,
+            later: None,
+            unnumbered: None,
             happened: Vec::new(),
             ran: Vec::new(),
             said: Vec::new(),
             now_ns: 0,
             loops: BTreeMap::new(),
             replays: HashSet::new_in(Global), // alloc: the plane's, once
-            per_kib: HashMap::new_in(Global), // alloc: the plane's, once
+            abandoned: HashSet::new_in(Global),
             admitting: HashMap::new_in(Global), // alloc: the plane's, once
-            pressure: blaze_graph::pressure::Pressured::default(),
-            capped: None,
-            began_tx,
-            began,
-            realizing: HashMap::new_in(Global), // alloc: the plane's, once
-            purge_due: false,
-            purging: None,
             folds: Folds::new(),
+            again: Again::new(),
+            ended: 0,
         })
-    }
-
-    /// The system says memory is short at `at` (docs/memory-budget.md section 7, "Pressure"):
-    /// from the next [`Plane::poll`] until [`blaze_graph::pressure::HOLD_NS`] after the last
-    /// such event, the budget the plane admits against is held at what the process holds now.
-    /// Whether the front ends are to be asked for a release for it
-    /// ([`blaze_graph::pressure::Pressured::release_due`]).
-    pub fn pressed(&mut self, at: Duration) -> bool {
-        self.pressure = self.pressure.pressed(ns(at), arena::own());
-        self.pressure.release_due(ns(at))
-    }
-
-    /// What admission counts the daemon at (its footprint as the plane last heard it and its
-    /// running tasks' grants not yet in it, at least what is granted), the budget it admits
-    /// against (its allowance; `None` with no budget), and the pressure cap on it while there is
-    /// one.
-    pub fn memory(&self) -> (u64, Option<u64>, Option<u64>) {
-        let budget = self.graph.config().budget.as_ref().map(|it| it.bytes);
-        (self.graph.charged(), budget, self.graph.cap())
-    }
-
-    /// How the measured peaks of the tasks that ended compared with their grants, and the
-    /// purges admission asked ([`blaze_graph::footprint::Grades`]).
-    pub fn grades(&self) -> blaze_graph::footprint::Grades {
-        self.graph.grades()
-    }
-
-    /// The requests (by number) with a ready task held back for memory alone now
-    /// ([`blaze_graph::Plane::waits_for_memory`]), into `into`, ascending, each once.
-    pub fn held_back(&self, into: &mut Vec<u32>) {
-        for &id in self.admitting.keys() {
-            if self.graph.waits_for_memory(id)
-                && let Some((batch, _)) = self.task(id)
-            {
-                into.push(batch.request); // alloc: none once it has held this many.
-            }
-        }
-        into.sort_unstable();
-        into.dedup();
-    }
-
-    /// Each running task granted memory, by its node and name, to `each`: what a task held back
-    /// for memory waits on. A task several requests share comes once each.
-    pub fn granted_running<'a>(&'a self, mut each: impl FnMut(NodeId, &'a str)) {
-        self.graph.unsettled(|it| {
-            if matches!(it.state, NodeState::Running)
-                && self.graph.admitted(it.id).is_some_and(|admitted| admitted.granted > 0)
-            {
-                each(it.id, it.name);
-            }
-        });
-    }
-
-    pub fn budget(&self) -> Option<&Budget> {
-        self.graph.config().budget.as_ref()
     }
 
     /// What the plane predicts by, for the daemon's image.
@@ -1004,16 +899,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
     pub fn fresh(&mut self, count: u32, name_bytes: usize, deps: usize) -> Fresh {
         let first = self.reserve(count);
         let nodes = Nodes::with_capacity(first, count as usize, name_bytes, deps);
-        let (tasks, keys, sizes) = (
-            Vec::with_capacity(count as usize),
-            Vec::with_capacity(count as usize),
-            Vec::with_capacity(count as usize),
-        );
-        Fresh { nodes, tasks, keys, sizes, over: Vec::new(), count }
+        let (tasks, keys) = (Vec::with_capacity(count as usize), Vec::with_capacity(count as usize));
+        Fresh { nodes, tasks, keys, count }
     }
 
-    /// The next node of `fresh`, its id; its memory raised to what its kind and key are
-    /// predicted to hold, its cost the predicted one where there is one.
+    /// The next node of `fresh`, its id; its cost the predicted one where there is one.
     ///
     /// # Panics
     ///
@@ -1023,19 +913,29 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.push_predicted(fresh, node, task, learn)
     }
 
+    /// The next node of `fresh`, as [`Plane::push`], but with the cost `node` says and no
+    /// prediction, and nothing its run teaches.
+    ///
+    /// # Panics
+    ///
+    /// As [`Plane::push`].
+    pub fn push_free(&self, fresh: &mut Fresh, node: NodeRef<'_>, task: Task) -> NodeId {
+        assert!(
+            (fresh.tasks.len() as u32) < fresh.count,
+            "a batch of {} nodes given another",
+            fresh.count
+        );
+        assert!(task != Task::Gone, "node {} is pushed with no task", node.name);
+        fresh.tasks.push(task);
+        fresh.keys.push(node.key);
+        fresh.nodes.push(node)
+    }
+
     /// The next node of `fresh`, as [`Plane::push`], but predicted and taught by `learn`, a
     /// key of the predictor's alone: the node has no key of the plane's, so nothing
     /// single-flights or memoizes it by `learn`. A unit's phase is so given the cost of its own
     /// last runs, not its kind's mean, and the plane starts the longest chain first by what
     /// each node takes (docs/v2/plan/design/scheduler.md §6, step 1).
-    ///
-    /// Its memory is its key's own record once a run of it was measured: what that run's work
-    /// held at most, the jobs it handed to the pool (a library's codegen, the front end's
-    /// fan-out) included ([`arena::account`]). Before accounts a task learned only what its own
-    /// thread held, so its memory was floored at its kind's peak, the largest of any task of
-    /// the kind lately, and every unit predicted the biggest one's. Under a budget, a guess (its
-    /// kind's peak, its key never measured) is never more than the whole budget: such a node
-    /// runs alone, never refused for what other tasks held ([`admitted`]).
     ///
     /// # Panics
     ///
@@ -1055,8 +955,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.push_predicted(fresh, node, task, Some(learn))
     }
 
-    /// The next node of `fresh`, its memory and cost predicted by `learn` (or its kind alone),
-    /// which its run then teaches ([`Plane::key`]).
+    /// The next node of `fresh`, its cost predicted by `learn` (or its kind alone), which its
+    /// run then teaches ([`Plane::key`]).
     fn push_predicted(
         &self,
         fresh: &mut Fresh,
@@ -1073,34 +973,18 @@ impl<W: Work, P: Predict> Plane<W, P> {
             Task::Thread { kind, .. } | Task::Loop { kind } => kind,
             Task::Gone => panic!("node {} is pushed with no task", node.name),
         };
-        let Prediction { cost, peak } = self.predict.predict(kind, learn);
-        let basis = match learn.is_some_and(|key| self.predict.measured(kind, Some(key))) {
-            true => Basis::Own,
-            false => Basis::Kind,
-        };
-        self.admit(fresh, &mut node, peak, basis);
-        if let Some(cost) = cost {
+        if let Some(cost) = self.predict.predict(kind, learn).cost {
             node.cost = cost;
         }
         fresh.tasks.push(task);
         fresh.keys.push(learn);
-        fresh.sizes.push(0);
         fresh.nodes.push(node)
     }
 
-    /// The next node of `fresh`, a phase of a unit of `source` bytes of Rust source, predicted
-    /// and taught by `learn` as [`Plane::push_learned`] is, but sized by the unit itself, not
-    /// floored at its kind's peak.
-    ///
-    /// A kind's peak is the most any task of it held lately (it rises at once and comes down
-    /// by halves only after [`admission::WINDOW`] smaller ones in a row): one large crate's
-    /// codegen (15.78 GB of blaze's own) made every unit's codegen predict that much,
-    /// `ahash`'s and a build script's alike, and a test build with 31 GB held refused ten
-    /// targets for it (memadmit). A unit is instead predicted its source's KiB times what its
-    /// kind held per KiB lately ([`Plane::per_kib`]; [`PER_SOURCE_KIB`] until measured), at
-    /// least [`SIZED_FLOOR`] and at most the kind's peak. One whose key has a record is
-    /// predicted the more of that record and its sized prediction. `source` 0 (not read)
-    /// predicts as [`Plane::push_learned`].
+    /// The next node of `fresh`, a phase of a unit, predicted and taught by `learn` as
+    /// [`Plane::push_learned`] is. `_source`, the unit's bytes of Rust source, is read by
+    /// nothing since memory forecasts were deleted (2026-11-13): its caller's sizing walk is
+    /// the next to go.
     ///
     /// # Panics
     ///
@@ -1108,143 +992,27 @@ impl<W: Work, P: Predict> Plane<W, P> {
     pub fn push_sized(
         &self,
         fresh: &mut Fresh,
-        mut node: NodeRef<'_>,
+        node: NodeRef<'_>,
         task: Task,
         learn: Key,
-        source: u64,
+        _source: u64,
     ) -> NodeId {
-        if source == 0 {
-            return self.push_learned(fresh, node, task, learn);
+        self.push_learned(fresh, node, task, learn)
+    }
+
+    /// The kind of node `id`'s task, while the plane holds it and it has not settled.
+    pub fn kind_of(&self, id: NodeId) -> Option<TaskKind> {
+        match self.task(id)?.1 {
+            Task::Thread { kind, .. } | Task::Loop { kind } => Some(kind),
+            Task::Gone => None,
         }
-        assert!(
-            node.key.is_none(),
-            "node {} is given a key of the plane's beside the one it learns by",
-            node.name
-        );
-        assert!(
-            (fresh.tasks.len() as u32) < fresh.count,
-            "a batch of {} nodes given another",
-            fresh.count
-        );
-        let kind = match task {
-            Task::Thread { kind, .. } | Task::Loop { kind } => kind,
-            Task::Gone => panic!("node {} is pushed with no task", node.name),
-        };
-        let Prediction { cost, peak } = self.predict.predict(kind, Some(learn));
-        let sized = self.sized(kind, source);
-        let (predicted, basis) = match self.predict.measured(kind, Some(learn)) {
-            true if peak >= sized => (peak, Basis::Own),
-            _ => (sized, Basis::Sized),
-        };
-        self.admit(fresh, &mut node, predicted, basis);
-        if let Some(cost) = cost {
-            node.cost = cost;
-        }
-        fresh.tasks.push(task);
-        fresh.keys.push(Some(learn));
-        fresh.sizes.push(source);
-        fresh.nodes.push(node)
-    }
-
-    /// Gives `node`, the next of `fresh`, the memory it asks of the plane: `peak`, predicted
-    /// from `basis`, as [`admitted`] bounds it by the budget. One whose own measured runs say
-    /// more than the whole budget keeps that, for the plane to refuse it as it becomes ready,
-    /// and is noted so the refusal says where the number came from.
-    fn admit(&self, fresh: &mut Fresh, node: &mut NodeRef<'_>, peak: u64, basis: Basis) {
-        let budget = self.budget().map(|it| it.bytes);
-        node.memory = admitted(node.memory.max(peak), basis, budget);
-        if budget.is_some_and(|budget| node.memory > budget) {
-            let id = NodeId(fresh.nodes.first().0 + fresh.nodes.len() as u32);
-            fresh.over.push((id, node.memory));
-        }
-    }
-
-    /// The peak node `id` was refused by, its own measured runs' over the whole budget
-    /// ([`Plane::admit`]), if it was noted and has not run; taken.
-    fn take_over(&mut self, id: NodeId) -> Option<u64> {
-        let (_, batch) = self.batches.range_mut(..=id.0).next_back()?;
-        let at = batch.over.iter().position(|(it, _)| *it == id)?;
-        Some(batch.over.swap_remove(at).1)
-    }
-
-    /// What a unit of `source` bytes of source is predicted to hold in a task of `kind`: its
-    /// KiB times the kind's bytes per KiB, at least [`SIZED_FLOOR`], at most the kind's peak
-    /// (or the floor, where that is less) once a task of the kind was measured.
-    fn sized(&self, kind: TaskKind, source: u64) -> u64 {
-        let per_kib = self.per_kib(kind).unwrap_or(PER_SOURCE_KIB);
-        let guess = source.div_ceil(1024).saturating_mul(per_kib).max(SIZED_FLOOR);
-        match self.predict.measured(kind, None) {
-            true => guess.min(self.predict.predict(kind, None).peak.max(SIZED_FLOOR)),
-            // No task of the kind measured: its "peak" is the default for a kind never seen,
-            // no measure of anything, so the unit's own size says what it may hold.
-            false => guess,
-        }
-    }
-
-    /// The bytes a sized node of `kind` held per KiB of its source lately, once one ended:
-    /// what [`Plane::push_sized`] predicts by.
-    pub fn per_kib(&self, kind: TaskKind) -> Option<u64> {
-        self.per_kib.get(&kind).filter(|it| it.seen > 0).map(|it| it.predicted)
-    }
-
-    /// The bytes of what the process holds besides the tasks granted memory that held back a
-    /// task for memory as the plane last dispatched ([`blaze_graph::Plane::short`]): 0 when
-    /// none was, or only granted tasks did. The loop lets go of what it can for it.
-    pub fn short(&self) -> u64 {
-        self.graph.short()
-    }
-
-    /// The machine ledger's word on what this daemon may grant now, taken at `at` while the
-    /// daemon holds the ledger's lock ([`PlaneInput::Allowance`], `super::machine`): what now
-    /// fits starts, and until the next one the plane grants no more than it then holds and
-    /// its lease ([`Plane::lease`]).
-    pub fn allow(&mut self, at: Duration, bytes: u64) {
-        self.step(PlaneInput::Allowance { at_ns: ns(at), bytes })
-            .unwrap_or_else(|error| panic!("the plane refused the machine's allowance: {error}"));
-    }
-
-    /// What the process held at the plane's last measure ([`Plane::poll`]).
-    pub fn held(&self) -> u64 {
-        self.graph.held()
-    }
-
-    /// What the tasks running now were granted.
-    pub fn granted(&self) -> u64 {
-        self.graph.granted()
-    }
-
-    /// The most the plane grants until the next [`Plane::allow`]
-    /// ([`blaze_graph::Plane::room`]).
-    pub fn room(&self) -> u64 {
-        self.graph.room()
-    }
-
-    /// What the plane may grant past what it holds or granted until the next [`Plane::allow`],
-    /// which the ledger records in this daemon's charge ([`blaze_graph::Plane::lease`]).
-    pub fn lease(&self) -> u64 {
-        self.graph.lease()
-    }
-
-    /// Whether a task with memory was held back for it as the plane last dispatched.
-    pub fn held_any_back(&self) -> bool {
-        self.graph.held_back()
-    }
-
-    /// Whether a turn of the ledger now would change what the plane may grant
-    /// ([`blaze_graph::Plane::turn_wanted`]): the room holds a task back, the lease runs low,
-    /// or a lease is held with no work.
-    pub fn turn_wanted(&self) -> bool {
-        self.graph.turn_wanted()
     }
 
     /// The next node of `fresh`, a part of a program's build of `kind` ([`kinds::PROGRAM`], its
-    /// codegen, or [`kinds::PROGRAM_LINK`], its link), task `arg` of the batch's work. It is
-    /// predicted and taught by `program`, the key of that part of the program, which the plane
-    /// never sees: the node has no key, so nothing single-flights or memoizes it by that. With
-    /// a budget, a part the predictor has not measured, or one measured to hold all of it, is
-    /// predicted the whole budget and runs alone; its peak is then what its own work held, its
-    /// account's (`arena::account`), as any task's is, never what the whole process held
-    /// beyond its start (docs/memory-budget.md).
+    /// codegen, or [`kinds::PROGRAM_LINK`], its link), task `arg` of the batch's work. Its cost
+    /// is predicted and taught by `program`, the key of that part of the program, which the
+    /// plane never sees: the node has no key, so nothing single-flights or memoizes it by that.
+    /// `_source` is read by nothing, as [`Plane::push_sized`]'s.
     ///
     /// # Panics
     ///
@@ -1256,6 +1024,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         kind: TaskKind,
         arg: u32,
         program: Key,
+        _source: u64,
     ) -> NodeId {
         assert!(
             (fresh.tasks.len() as u32) < fresh.count,
@@ -1264,19 +1033,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
         );
         assert!(node.key.is_none(), "program build {} is given a key of the plane's", node.name);
         assert!(of_program(kind), "{kind:?} is no part of a program's build");
-        let Prediction { cost, peak } = self.predict.predict(kind, Some(program));
-        node.memory = node.memory.max(peak);
-        if let Some(cost) = cost {
+        if let Some(cost) = self.predict.predict(kind, Some(program)).cost {
             node.cost = cost;
-        }
-        if let Some(budget) = self.budget()
-            && (!self.predict.measured(kind, Some(program)) || node.memory >= budget.bytes)
-        {
-            node.memory = budget.bytes;
         }
         fresh.tasks.push(Task::Thread { kind, arg });
         fresh.keys.push(Some(program));
-        fresh.sizes.push(0);
         fresh.nodes.push(node)
     }
 
@@ -1306,14 +1067,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
         batch.keys.get((id.0 - first) as usize).copied().flatten()
     }
 
-    /// Node `id`'s unit's source bytes, 0 for a node not sized.
-    fn size(&self, id: NodeId) -> u64 {
-        let Some((first, batch)) = self.batches.range(..=id.0).next_back() else { return 0 };
-        batch.sizes.get((id.0 - first) as usize).copied().unwrap_or(0)
-    }
-
     fn settled(&mut self, id: NodeId) {
         self.replays.remove(&id);
+        self.again.forget(u64::from(id.0));
         let Some((&first, batch)) = self.batches.range_mut(..=id.0).next_back() else { return };
         let Some(task) = batch.tasks.get_mut((id.0 - first) as usize) else { return };
         if *task != Task::Gone {
@@ -1325,18 +1081,53 @@ impl<W: Work, P: Predict> Plane<W, P> {
         }
     }
 
-    /// Requests are numbered from `first` on: the daemon's first build's number
-    /// ([`super::observe::Observe::first_build`]), past every build its history names, so a
-    /// request's number is its build's id in the flight recorder and the history. Never 0.
-    pub fn number_from(&mut self, first: u32) {
-        self.next_request = first.max(1);
+    /// How requests are numbered ([`super::observe::Observe::numbering`]): from the daemon's
+    /// first build's number on, past every build its history names, so a request's number is
+    /// its build's id in the flight recorder and the history. Never 0. [`Numbered::Later`] is
+    /// asked at the first [`Plane::open`], not before: a daemon answering from certificates
+    /// opens none, and its start waits for nothing of the history.
+    pub fn number(&mut self, by: Numbered) {
+        match by {
+            Numbered::From(first) => {
+                self.next_request = first.max(1);
+                self.later = None;
+            }
+            #[cfg(test)]
+            Numbered::Later(later) if ASKS_AT_NUMBER.get() => {
+                self.next_request = later().unwrap_or(1).max(1);
+            }
+            Numbered::Later(later) => self.later = Some(later),
+        }
+    }
+
+    /// Why the requests could not be numbered, once: the history did not open, so the daemon
+    /// stops on it (the request opened meanwhile was numbered 1 and is written to no history).
+    pub fn unnumbered(&mut self) -> Option<super::observe::Unopened> {
+        self.unnumbered.take()
     }
 
     /// A request, of weight 1: every job's share of the threads is the same. An `idle` one runs
     /// on what no other can use until it is promoted ([`Plane::promote`]).
-    pub fn open(&mut self, at: Duration, keep_going: bool, idle: bool) -> RequestId {
-        let request = RequestId(self.next_request);
+    /// The next request number, taken for a build the plane runs nothing of (a solo answer the
+    /// daemon took from its kept rows, `Daemon::solo_taken`): the one sequence of build ids. A
+    /// [`Numbered::Later`] numbering is asked here as at the first [`Plane::open`].
+    pub fn number_unplanned(&mut self) -> u32 {
+        if let Some(later) = self.later.take() {
+            self.next_request = match later() {
+                Ok(first) => first.max(1),
+                Err(unopened) => {
+                    self.unnumbered = Some(unopened);
+                    1
+                }
+            };
+        }
+        let number = self.next_request;
         self.next_request = self.next_request.wrapping_add(1).max(1);
+        number
+    }
+
+    pub fn open(&mut self, at: Duration, keep_going: bool, idle: bool) -> RequestId {
+        let request = RequestId(self.number_unplanned());
         let input = PlaneInput::Open { at_ns: ns(at), request, weight: 1, keep_going, idle };
         // alloc: a request's live model, once per request
         self.folds.by.insert(request, Live { fold: Fold::new(), began_ns: ns(at) });
@@ -1379,7 +1170,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         work: Option<W>,
         reads: bool,
     ) -> Result<(), Error> {
-        let Fresh { nodes, tasks, keys, sizes, over, count } = fresh;
+        let Fresh { nodes, tasks, keys, count } = fresh;
         let work = work.map(Arc::new); // alloc: one per batch, shared by its tasks
         assert_eq!(tasks.len() as u32, count, "a batch is added with every node it was made for");
         assert!(
@@ -1390,7 +1181,14 @@ impl<W: Work, P: Predict> Plane<W, P> {
         if count > 0 {
             self.batches.insert(
                 first.0,
-                Batch { tasks, keys, sizes, over, live: count, work, reads, request: request.0 },
+                Batch {
+                    tasks,
+                    keys,
+                    live: count,
+                    work,
+                    reads,
+                    request: request.0,
+                },
             );
         }
         match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
@@ -1439,6 +1237,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             let key = self.key(id);
             self.predict.observe(kind, key, ns(at).saturating_sub(start), 0);
         }
+        self.ended += 1;
         let input = PlaneInput::Done {
             at_ns: ns(at),
             id,
@@ -1488,23 +1287,97 @@ impl<W: Work, P: Predict> Plane<W, P> {
         });
     }
 
-    /// Takes the thread tasks that ended into the plane, then measures: what each running task
-    /// has realized and the footprint ([`Plane::measure`]), purging first when admission asked.
+    /// The thread task of node `id` is failed with `why` while its thread still runs it: the
+    /// task watchdog found that thread stuck where nothing can unwind it (a lock or a signal
+    /// that never comes, `serve::stuck`). Its request goes on without it and ends failed with
+    /// `why`; its task's end, if the thread ever comes back, is dropped ([`Plane::poll`]).
+    /// `false`, doing nothing, when `id` is no thread task that runs now (it ended since the
+    /// watchdog looked, or is a loop task, which the loop's own guard bounds).
+    pub fn abandon(&mut self, at: Duration, id: NodeId, why: String) -> bool {
+        if !matches!(self.task(id), Some((_, Task::Thread { .. }))) || self.abandoned.contains(&id)
+        {
+            return false;
+        }
+        let mut running = false;
+        self.graph.unsettled(|it| {
+            running |= it.id == id && matches!(it.state, NodeState::Running);
+        });
+        if !running {
+            return false;
+        }
+        let input = PlaneInput::Done {
+            at_ns: ns(at),
+            id,
+            outcome: Outcome::Failed { why },
+            added: Vec::new(),
+            group: None,
+            peak: 0,
+        };
+        self.step(input)
+            .unwrap_or_else(|error| panic!("the plane refused the end of stuck task {id}: {error}"));
+        self.abandoned.insert(id);
+        true
+    }
+
+    /// Node `task.id`'s task, which gave way and was posted again more than [`AGAIN_BOUND`]
+    /// times in a row with nothing it waits on changed ([`SameAgain`]: no task ended), fails:
+    /// said once as a stuck line, the watchdog's words ([`blaze_profile::stuck::SAID`]), with
+    /// how many times, and its build ends failed with the same words rather than loop (rules
+    /// bounded-progress, no-fallback).
+    fn same_again(&mut self, at: Duration, task: &Posting, same: SameAgain) {
+        let id = task.id;
+        // alloc: a task failed as the same work again, once per such task
+        let step = match admission::name_of(task.kind) {
+            Some(name) => format!("{name} (node {id})"),
+            None => format!("query kind {:#x} (node {id})", task.kind.0),
+        };
+        let why = format!(
+            "{step}: it gave way and was posted again {} times in a row with nothing it waits on changed (no task ended), past the bound of {AGAIN_BOUND}: the same work again, not progress",
+            same.times,
+        );
+        tracing::error!(target: "blaze", build = same.build, "{why}");
+        // logged: the event above
+        eprintln!("blaze serve: pid {}{}{why}", std::process::id(), blaze_profile::stuck::SAID);
+        self.ended += 1;
+        self.again.forget(u64::from(id.0));
+        let input = PlaneInput::Done {
+            at_ns: ns(at),
+            id,
+            outcome: Outcome::Failed { why },
+            added: Vec::new(),
+            group: None,
+            peak: 0,
+        };
+        self.step(input).unwrap_or_else(|error| {
+            panic!("the plane refused the end of task {id}, failed as the same work again: {error}")
+        });
+    }
+
+    /// Takes the thread tasks that ended into the plane: a task done teaches its time to the
+    /// predictor; one that gave way is posted again, unless it has given way past
+    /// [`AGAIN_BOUND`] times with no task ended ([`Plane::same_again`]).
     pub fn poll(&mut self, at: Duration) {
-        self.began_now();
         let mut ran = std::mem::take(&mut self.ran);
         self.runner.take(&mut ran);
         for Ran { task, ended, peak, ran_ns, puts } in ran.drain(..) {
             let id = task.id;
-            if let Some(purging) = &mut self.purging {
-                purging.freed = true;
+            // Failed already, as its thread was found stuck: its late end is of nothing now.
+            if self.abandoned.remove(&id) {
+                self.replays.remove(&id);
+                continue;
             }
-            self.realizing.remove(&id);
             if !puts.is_empty() {
                 self.happened.push(Happened::Kept { id, puts });
             }
             let outcome = match ended {
                 Ended::GaveWay { group } => {
+                    // The same work again with nothing it waits on changed, past the bound: a
+                    // loop, not progress (rule bounded-progress). It fails, said as stuck.
+                    let now = Inputs { ended: self.ended };
+                    if let Some(same) = self.again.restarted(task.build, u64::from(id.0), now) {
+                        self.same_again(at, &task, same);
+                        continue;
+                    }
                     self.happened.push(Happened::Post {
                         task: Posting { near: group, ..task },
                         again: true,
@@ -1521,18 +1394,14 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     Outcome::Failed { why }
                 }
             };
+            // An end is what a task that gave way waits on: a change for each.
+            self.ended += 1;
+            self.again.forget(u64::from(id.0));
             // What its work held at most, as its memory account was charged: its own and its
             // fan-out's bytes, never another task's, so it is what its key learns as it is.
             let key = self.key(id);
             if !self.replays.remove(&id) {
                 self.predict.observe(task.kind, key, ran_ns, peak);
-                let source = self.size(id);
-                if source > 0 {
-                    self.per_kib
-                        .entry(task.kind)
-                        .or_default()
-                        .observe(peak / source.div_ceil(1024));
-                }
             }
             let input = PlaneInput::Done {
                 at_ns: ns(at),
@@ -1546,80 +1415,6 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 .unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
         }
         self.ran = ran;
-        self.measure(at, false);
-        if std::mem::take(&mut self.purge_due) && self.purging.is_none() {
-            // Admission held work back while the allocators may keep freed memory: the purger's
-            // thread gives it back (it waits for every worker's heaps, which the loop must not),
-            // and the plane hears a reading marked purged only once that purge ended. Until
-            // then its readings say nothing of what a purge gives back, so it neither asks again
-            // nor lets a task start alone (`blaze_graph::footprint::Charge::read`).
-            self.purging = Some(Purging::asked());
-        }
-        if let Some(purging) = self.purging {
-            // A purger that stopped serves no purge again, and admission waits on one: the
-            // daemon stops naming why, as it does when the plane refuses what it is told.
-            let done = crate::raw::memory::purger().done().unwrap_or_else(|why| {
-                panic!("admission waits on a memory purge that cannot finish: {why}")
-            });
-            if done >= purging.ticket {
-                if purging.freed {
-                    // A task ended or gave way after the ask: what it freed, a worker that
-                    // already gave back keeps, so a reading now would call kept bytes gone.
-                    // Asked again; bounded, since each round needs another task to end.
-                    self.purging = Some(Purging::asked());
-                } else {
-                    self.purging = None;
-                    self.measure(at, true);
-                }
-            }
-        }
-        // The pressure cap, given as it changes: on an event, and once it passes.
-        let cap = self.pressure.cap(ns(at));
-        if cap != self.capped {
-            self.capped = cap;
-            let input = PlaneInput::Cap { at_ns: ns(at), bytes: cap };
-            self.step(input)
-                .unwrap_or_else(|error| panic!("the plane refused the pressure cap: {error}"));
-        }
-    }
-
-    /// The accounts the thread tasks that started since said ([`Posting::began`]).
-    fn began_now(&mut self) {
-        while let Ok((id, account)) = self.began.try_recv() {
-            self.realizing.insert(id, Realizing { account, told: 0 });
-        }
-    }
-
-    /// Tells the plane what each running task has realized, where it grew past its grant or
-    /// by a [`REALIZED_STEP`] since it was last told, then the process's footprint and what of
-    /// it the allocators keep freed ([`PlaneInput::Footprint`]), `purged` when a purge came
-    /// just before. A task whose account closed ended: its bytes are the footprint's to say.
-    fn measure(&mut self, at: Duration, purged: bool) {
-        self.began_now();
-        let at_ns = ns(at);
-        let mut realizing = std::mem::take(&mut self.realizing);
-        realizing.retain(|&id, seen| {
-            let Some(bytes) = arena::peak_now(seen.account) else { return false };
-            let granted = self.graph.admitted(id).map_or(0, |it| it.granted);
-            let step = (granted / 16).max(REALIZED_STEP);
-            if bytes > granted || bytes >= seen.told.saturating_add(step) {
-                seen.told = bytes;
-                let input = PlaneInput::Realized { at_ns, id, bytes };
-                self.step(input).unwrap_or_else(|error| {
-                    panic!("the plane refused what task {id} realized: {error}")
-                });
-            }
-            true
-        });
-        self.realizing = realizing;
-        let snapshot = blaze_mem::tag::snapshot();
-        let footprint = arena::own_of(&snapshot);
-        // The free pages the allocators keep ([`arena::kept_of`]). An estimate (it holds the
-        // code and the stacks too, never purged), so a purge is asked at most every
-        // `blaze_graph::footprint::PURGE_EVERY_NS` while work is held back.
-        let kept = arena::kept_of(&snapshot, footprint);
-        let input = PlaneInput::Footprint { at_ns, bytes: footprint, kept, purged };
-        self.step(input).unwrap_or_else(|error| panic!("the plane refused the footprint: {error}"));
     }
 
     /// What happened since the last call, in order, swapped into `into`, which is empty: the
@@ -1637,6 +1432,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// How many thread tasks run.
     pub fn running(&self) -> usize {
         self.runner.running()
+    }
+
+    /// Whether a thread task's end ends the loop's wait ([`Runner::wakes`]).
+    pub fn wakes(&self) -> bool {
+        self.runner.wakes()
     }
 
     /// How many thread tasks run on the worker pool ([`Runner::running_on_pool`]).
@@ -1670,8 +1470,6 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.now_ns = input.at_ns();
         let mut said = std::mem::take(&mut self.said);
         let taken = self.graph.step_into(input, &mut said);
-        // Asked once a reading: kept until the loop purges, whatever steps follow.
-        self.purge_due |= self.graph.purge_due();
         if taken.is_ok() {
             self.outputs(&mut said);
         }
@@ -1697,13 +1495,10 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     let id = NodeId(id);
                     // One that settles unstarted ends its wait unsaid.
                     self.admitting.remove(&id);
-                    let over = self.take_over(id);
                     self.settled(id);
                     let (ok, why, skipped) = match state {
                         NodeState::Built | NodeState::Cached { .. } => (true, None, None),
-                        NodeState::Failed { why } => {
-                            (false, Some(refused_by_own_runs(why, over)), None)
-                        }
+                        NodeState::Failed { why } => (false, Some(why), None),
                         NodeState::Skipped { because } => {
                             let why =
                                 format!("skipped: node {because} it waited for did not end well"); // alloc: a node skipped, once
@@ -1749,36 +1544,26 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.admitting.insert(id, Admitting { span, since_ns: self.now_ns });
     }
 
-    /// Node `id` started: its wait for admission ends, saying what held it back. Memory, when
-    /// another task with memory started while it did not fit ([`blaze_graph::plane::Admitted::passed`]);
-    /// else a thread of its pool; nothing, when it started in the step it became ready.
+    /// Node `id` started: its wait for admission ends, saying what held it back: a thread of
+    /// its pool, or nothing, when it started in the step it became ready. Admission is by
+    /// cores alone, so nothing is granted and no task passes another (`passed` 0).
     fn admitted(&mut self, id: NodeId) {
-        let Some(Admitting { span, since_ns }) = self.admitting.remove(&id) else { return };
-        let Some(admitted) = self.graph.admitted(id) else { return };
-        let waited_for = if since_ns == self.now_ns {
-            "nothing"
-        } else if admitted.passed > 0 {
-            "memory"
-        } else {
-            match admitted.pool {
-                Pool::Io => "an io thread",
-                Pool::Work => "a work thread",
-            }
+        let Some(Admitting { span, since_ns }) = self.admitting.remove(&id) else {
+            return;
         };
+        let waited_for = if since_ns == self.now_ns { "nothing" } else { "a thread" };
         span.ended(blaze_profile::span::Admitted {
             waited_for: blaze_profile::span::Name::kept(waited_for),
-            passed: u64::from(admitted.passed),
-            granted: admitted.granted,
+            passed: 0,
+            granted: 0,
+            basis: blaze_profile::span::Name::kept(NOT_FORECAST),
         });
     }
 
     /// The node the plane runs: its thread task posted, or its loop task handed to the loop.
     fn run(&mut self, id: NodeId, pool: Pool, near: Option<u32>, critical: bool) {
-        // It runs, so no refusal for memory is its to say ([`Plane::take_over`]).
-        _ = self.take_over(id);
         match self.task(id) {
             Some((batch, Task::Thread { kind, arg })) => {
-                let admitted = self.graph.admitted(id);
                 let task = Posting {
                     id,
                     pool,
@@ -1788,9 +1573,6 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     arg,
                     reads: batch.reads,
                     build: batch.request,
-                    granted: admitted.map_or(0, |it| it.granted),
-                    passed: admitted.map_or(0, |it| it.passed),
-                    began: Some(self.began_tx),
                 };
                 if batch.reads {
                     self.happened.push(Happened::Post { task, again: false });
@@ -1816,6 +1598,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use blaze_core::Traced;
+    use blaze_graph::admission::Prediction;
     use blaze_ids::ContentId;
     use blaze_protocol::events::NodeKind;
     use blaze_usercode::RunKey;
@@ -1849,6 +1632,11 @@ mod tests {
         fn run(&self, arg: u32, (): ()) -> Option<Did<u32>> {
             (self.0)(arg)
         }
+
+        /// A test's tasks are of no unit.
+        fn subject(&self, _: u32) -> Option<(String, String)> {
+            None
+        }
     }
 
     fn built(value: u32) -> Option<Did<u32>> {
@@ -1872,13 +1660,10 @@ mod tests {
             arg: 20,
             reads: false,
             build: 1,
-            granted: 0,
-            passed: 0,
-            began: None,
         };
         let runners: [(Runner<Next>, Pool); 3] = [
-            (Runner::Threads(Threads::new(1, 1)), Pool::Io),
-            (Runner::Threads(Threads::new(1, 1)), Pool::Work),
+            (Runner::Threads(Threads::new(1, 1, None)), Pool::Io),
+            (Runner::Threads(Threads::new(1, 1, None)), Pool::Work),
             (Runner::Inline(Inline::new(1)), Pool::Work),
         ];
         for (mut runner, pool) in runners {
@@ -1914,8 +1699,8 @@ mod tests {
             kinds::UNIT_STORE,
         ] {
             let runners: [(Runner<Next>, Pool); 3] = [
-                (Runner::Threads(Threads::new(1, 1)), Pool::Io),
-                (Runner::Threads(Threads::new(1, 1)), Pool::Work),
+                (Runner::Threads(Threads::new(1, 1, None)), Pool::Io),
+                (Runner::Threads(Threads::new(1, 1, None)), Pool::Work),
                 (Runner::Inline(Inline::new(1)), Pool::Work),
             ];
             for (mut runner, pool) in runners {
@@ -1928,9 +1713,6 @@ mod tests {
                     arg: 0,
                     reads: false,
                     build: 1,
-                    granted: 0,
-                    passed: 0,
-                    began: None,
                 };
                 runner.post(task, Arc::new(Each(running as fn(u32) -> Option<Did<u32>>)), ());
                 let mut ran = Vec::new();
@@ -1967,9 +1749,6 @@ mod tests {
             arg: 0,
             reads: false,
             build: 1,
-            granted: 0,
-            passed: 0,
-            began: None,
         };
         let mut runner = Inline::new(5);
         runner.post(task, work, ());
@@ -2015,9 +1794,6 @@ mod tests {
                 arg,
                 reads: false,
                 build: 1,
-                granted: 0,
-                passed: 0,
-                began: None,
             };
             runner.post(task, work.clone(), ());
         }
@@ -2066,9 +1842,6 @@ mod tests {
             arg: 0,
             reads: false,
             build: 1,
-            granted: 0,
-            passed: 0,
-            began: None,
         };
         let mut runner = Inline::new(3);
         runner.post(task, work, ());
@@ -2097,9 +1870,6 @@ mod tests {
             arg: 0,
             reads: true,
             build: 1,
-            granted: 0,
-            passed: 0,
-            began: None,
         };
         let mut runner = Inline::new(5);
         runner.post(task, work, ());
@@ -2123,7 +1893,7 @@ mod tests {
     impl Predict for Recording {
         fn predict(&self, kind: TaskKind, key: Option<Key>) -> Prediction {
             self.asked.lock().push((kind, key));
-            Prediction { cost: Some(1000), peak: 0 }
+            Prediction { cost: Some(1000) }
         }
 
         fn observe(&mut self, kind: TaskKind, key: Option<Key>, ran_ns: u64, peak: u64) {
@@ -2141,7 +1911,7 @@ mod tests {
         let observed =
             Arc::new(blaze_core::lock::Lock::new("serve.plane.tests.observed", Vec::new()));
         let predict = Recording { asked: Arc::clone(&asked), observed: Arc::clone(&observed) };
-        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
+        let config = PlaneConfig { io: 1, work: 2 };
         let mut plane = Plane::new(config, predict, Runner::Inline(Inline::new(9))).unwrap();
         let request = plane.open(Duration::ZERO, false, false);
         let key = Key([3; 32]);
@@ -2152,7 +1922,6 @@ mod tests {
             pool: Pool::Work,
             cost: 1,
             key,
-            memory: 0,
         };
         let mut fresh = plane.fresh(2, 16, 0);
         plane.push(
@@ -2193,10 +1962,10 @@ mod tests {
     fn programs_built_at_once_share_the_one_pool_whatever_their_count() {
         const PROGRAMS: u32 = 256;
         let pool = blaze_graph::exec::shared().workers();
-        let config = PlaneConfig { io: 1, work: pool, budget: None, starve_after: 8 };
+        let config = PlaneConfig { io: 1, work: pool };
         let history = blaze_history::History::new(blaze_history::Config::default());
         let mut plane =
-            Plane::new(config, history, Runner::Threads(Threads::new(1, pool))).unwrap();
+            Plane::new(config, history, Runner::Threads(Threads::new(1, pool, None))).unwrap();
         let ran_on = Arc::new(blaze_core::lock::Lock::new("serve.plane.tests.ran_on", Vec::<String>::new()));
         let work = Each({
             let ran_on = Arc::clone(&ran_on);
@@ -2225,7 +1994,6 @@ mod tests {
                     pool: Pool::Work,
                     cost: 1,
                     key: None,
-                    memory: 0,
                 };
                 plane.push(&mut fresh, node, Task::Thread { kind: kinds::COMPILE, arg: at })
             })
@@ -2253,100 +2021,6 @@ mod tests {
         );
     }
 
-    /// A guess over the whole budget asks for the budget and runs alone; only a unit's own
-    /// measured runs over it refuse it, and the refusal says the number is its own. nftest2: a
-    /// kind's peak of 121.59 GB (a daemon's heap, as the uncarried measure read it) refused
-    /// every build script of a test build under a 59 GB budget.
-    #[test]
-    fn a_guess_over_the_budget_runs_alone_and_only_a_units_own_runs_refuse_it() {
-        let gib = 1u64 << 30;
-        assert_eq!(admitted(5 * gib, Basis::Kind, Some(gib)), gib);
-        assert_eq!(admitted(5 * gib, Basis::Sized, Some(gib)), gib);
-        assert_eq!(admitted(5 * gib, Basis::Own, Some(gib)), 5 * gib);
-        assert_eq!(admitted(5 * gib, Basis::Kind, None), 5 * gib);
-        assert_eq!(admitted(gib / 4, Basis::Kind, Some(gib)), gib / 4);
-
-        let budget = Budget { bytes: gib, from: "the test's budget".to_owned(), kept_back: 0 };
-        let config = PlaneConfig { io: 1, work: 2, budget: Some(budget), starve_after: 8 };
-        let mut history = blaze_history::History::new(blaze_history::Config::default());
-        let (other, script, unseen, big) =
-            (Key([7; 32]), Key([8; 32]), Key([9; 32]), Key([10; 32]));
-        // Another unit's codegen held 120 GB: its kind's peak from now on.
-        history.observe(kinds::COMPILE, Some(&other), 1_000, 120 * gib);
-        history.observe(kinds::COMPILE, Some(&big), 1_000, 2 * gib);
-        let mut plane = Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
-        let request = plane.open(Duration::ZERO, true, false);
-        let node = |name| NodeRef {
-            kind: NodeKind::Codegen,
-            name,
-            deps: &[],
-            pool: Pool::Work,
-            cost: 1,
-            key: None,
-            memory: 0,
-        };
-        let task = |arg| Task::Thread { kind: kinds::COMPILE, arg };
-        let mut fresh = plane.fresh(3, 64, 0);
-        // A build script of 4 KiB never measured: sized, at the floor, nowhere near the kind's.
-        let sized = plane.push_sized(&mut fresh, node("build script"), task(0), script, 4 << 10);
-        // Never measured and not sized: its kind's peak, a guess, so the whole budget, alone.
-        let guessed = plane.push_learned(&mut fresh, node("never measured"), task(1), unseen);
-        // Its own last run held 2 GiB, more than the whole budget: that alone refuses it.
-        let own = plane.push_sized(&mut fresh, node("measured big"), task(2), big, 4 << 10);
-        plane.add(Duration::ZERO, request, fresh, Some(Each(built)), false).unwrap();
-        let (mut happened, mut settled) = (Vec::new(), Vec::new());
-        while settled.len() < 3 {
-            plane.poll(Duration::ZERO);
-            plane.happened(&mut happened);
-            for it in happened.drain(..) {
-                if let Happened::Settled { id, ok, why, .. } = it {
-                    settled.push((id, ok, why));
-                }
-            }
-        }
-        settled.sort_by_key(|it| it.0);
-        assert_eq!(settled[0].0, sized);
-        assert!(
-            settled[0].1,
-            "a small unit is not refused for its kind's peak: {:?}",
-            settled[0].2
-        );
-        assert_eq!(settled[1].0, guessed);
-        assert!(settled[1].1, "a guess over the budget runs alone: {:?}", settled[1].2);
-        assert_eq!(settled[2].0, own);
-        assert!(!settled[2].1, "a unit whose own runs held more than the budget is refused");
-        let why = settled[2].2.as_deref().unwrap_or_default();
-        assert!(why.contains("measured big needs 2.00 GB of memory"), "{why}");
-        assert!(why.contains("2.00 GB is what this unit's own last runs held at most"), "{why}");
-    }
-
-    /// A cold daemon has measured no task of any kind: a unit is predicted by its own size, not
-    /// capped at the default for a kind never seen. #1726: every unit of a cold workspace build
-    /// was granted 64 MiB, hir-def's front end held 2.39 GiB on it, and the daemon went past its
-    /// limit.
-    #[test]
-    fn a_cold_daemon_predicts_a_unit_by_its_size_not_the_unseen_kinds_default() {
-        let mib = 1u64 << 20;
-        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
-        let history = blaze_history::History::new(blaze_history::Config::default());
-        // No task runs: the batch's type only names one.
-        type Idle = Each<fn(u32) -> Option<Did<u32>>>;
-        let plane: Plane<Idle, _> =
-            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
-        // 4 MiB of source at PER_SOURCE_KIB: 4 GiB, though the kind was never seen.
-        assert_eq!(plane.sized(kinds::COMPILE, 4 * mib), 4096 * mib);
-        // A small unit stays at the floor.
-        assert_eq!(plane.sized(kinds::COMPILE, 4 << 10), SIZED_FLOOR);
-
-        // Once the kind is measured, its peak caps the guess again.
-        let mut history = blaze_history::History::new(blaze_history::Config::default());
-        history.observe(kinds::COMPILE, None, 1_000, 512 * mib);
-        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 8 };
-        let plane: Plane<Idle, _> =
-            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
-        assert_eq!(plane.sized(kinds::COMPILE, 4 * mib), 512 * mib);
-    }
-
     /// Runs `plane` until each of `ids` settled, saying which did well.
     fn settle<W: Work, P: Predict>(plane: &mut Plane<W, P>, ids: &[NodeId]) -> Vec<(NodeId, bool)> {
         let (mut happened, mut settled) = (Vec::new(), Vec::new());
@@ -2366,12 +2040,11 @@ mod tests {
     }
 
     /// A program's build is taught by its program's key and never single-flighted by it: two
-    /// builds of one program both run. One the history has not measured runs alone and is
-    /// measured, after which the program is predicted by what it held.
+    /// builds of one program both run, and its runs teach its key's cost, not another
+    /// program's.
     #[test]
-    fn a_program_is_admitted_by_its_own_measure_and_one_never_measured_runs_alone() {
-        let budget = Budget { bytes: 1 << 30, from: "the test's budget".to_owned(), kept_back: 0 };
-        let config = PlaneConfig { io: 1, work: 2, budget: Some(budget), starve_after: 8 };
+    fn a_program_is_taught_by_its_own_key_and_never_single_flighted_by_it() {
+        let config = PlaneConfig { io: 1, work: 2 };
         let history = blaze_history::History::new(blaze_history::Config::default());
         let mut plane = Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
         let (program, other) = (Key([5; 32]), Key([6; 32]));
@@ -2382,14 +2055,15 @@ mod tests {
             pool: Pool::Work,
             cost: 1,
             key: None,
-            memory: 0,
         };
         assert!(!plane.predict().measured(kinds::PROGRAM, Some(program)));
 
         let request = plane.open(Duration::ZERO, true, false);
         let mut fresh = plane.fresh(2, 16, 0);
-        let first = plane.push_program(&mut fresh, node("app"), kinds::PROGRAM, 0, program);
-        let again = plane.push_program(&mut fresh, node("app again"), kinds::PROGRAM, 1, program);
+        let first =
+            plane.push_program(&mut fresh, node("app"), kinds::PROGRAM, 0, program, 4 << 10);
+        let again =
+            plane.push_program(&mut fresh, node("app again"), kinds::PROGRAM, 1, program, 4 << 10);
         plane.add(Duration::ZERO, request, fresh, Some(Each(built)), false).unwrap();
         assert_eq!(settle(&mut plane, &[first, again]), [(first, true), (again, true)]);
         assert!(plane.predict().measured(kinds::PROGRAM, Some(program)));
@@ -2400,5 +2074,55 @@ mod tests {
         let record =
             plane.predict().record(kinds::PROGRAM, &program).expect("its runs teach its key");
         assert_eq!(record.seen, 2);
+    }
+
+    /// The invariant: a plane numbered later asks for its first number at its first open and
+    /// not before, once; its requests are numbered from the answer on; an answer that is the
+    /// history's failure numbers the request 1 and is kept, once, for the daemon to stop on,
+    /// never a panic. Control: the planted `ASKS_AT_NUMBER` asks before any open, and the
+    /// oracle sees it.
+    #[test]
+    fn a_plane_numbered_later_asks_once_at_its_first_open() {
+        type Idle = Each<fn(u32) -> Option<Did<u32>>>;
+        let plane = || -> Plane<Idle, _> {
+            let config = PlaneConfig { io: 1, work: 2 };
+            let history = blaze_history::History::new(blaze_history::Config::default());
+            Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap()
+        };
+        let asked_before_open = |planted: bool| {
+            ASKS_AT_NUMBER.set(planted);
+            let mut plane = plane();
+            let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let counted = std::sync::Arc::clone(&asked);
+            plane.number(Numbered::Later(Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(41)
+            })));
+            ASKS_AT_NUMBER.set(false);
+            let before = asked.load(Ordering::SeqCst);
+            assert_eq!(plane.open(Duration::ZERO, false, false), RequestId(41));
+            assert_eq!(plane.open(Duration::ZERO, false, false), RequestId(42));
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once");
+            assert!(plane.unnumbered().is_none());
+            before
+        };
+        assert_eq!(asked_before_open(false), 0, "not asked before the first open");
+        assert_eq!(asked_before_open(true), 1, "the control: the planted plane asks before any open");
+
+        let mut failed = plane();
+        let unopened = super::super::observe::Unopened {
+            dir: "/home/u/.cache/blaze/v2/profile".into(),
+            why: super::super::observe::Unopen::Gone,
+        };
+        let said = unopened.clone(); // clone: compared below
+        failed.number(Numbered::Later(Box::new(move || Err(said))));
+        assert_eq!(failed.open(Duration::ZERO, false, false), RequestId(1));
+        assert_eq!(failed.unnumbered(), Some(unopened));
+        assert_eq!(failed.unnumbered(), None, "said once");
+        assert_eq!(failed.open(Duration::ZERO, false, false), RequestId(2));
+
+        let mut from = plane();
+        from.number(Numbered::From(0));
+        assert_eq!(from.open(Duration::ZERO, false, false), RequestId(1), "never 0");
     }
 }

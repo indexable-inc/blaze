@@ -358,3 +358,49 @@ fn an_error_gives_the_item_back_so_its_uses_resolve() {
     assert!(text.contains("struct S"), "{text}");
     assert!(!text.contains("returns"), "{text}");
 }
+
+#[test]
+fn a_task_scoped_function_hands_out_copies_and_serves_cycles_by_cycle_initial_alone() {
+    refused(&tracked_tokens(quote!(scope = frame), query()), "`scope` is `task`");
+    refused(
+        &tracked_tokens(quote!(scope = task), query()),
+        "task-scoped `f`: its values are dropped with its task scope",
+    );
+    refused(
+        &tracked_tokens(quote!(scope = task, returns(ref)), query()),
+        "`returns(clone)` or `returns(copy)`",
+    );
+    refused(
+        &tracked_tokens(quote!(scope = task, returns(clone), lru = 0), query()),
+        "task-scoped `f`: its values are dropped whole with its scope: no `lru`",
+    );
+    refused(
+        &tracked_tokens(quote!(scope = task, returns(clone), cycle_result = r), query()),
+        "task-scoped `f`: a scope serves a cycle by `cycle_initial` alone: no `cycle_result`",
+    );
+    refused(
+        &tracked_tokens(quote!(scope = task, returns(clone), cycle_initial = i, cycle_fn = g), query()),
+        "no `cycle_fn`",
+    );
+    accepted(tracked_tokens(quote!(scope = task, returns(clone)), query()));
+    accepted(tracked_tokens(
+        quote!(scope = task, returns(copy), cycle_initial = |_, _| V::default()),
+        query(),
+    ));
+}
+
+/// The invariant: `settled = <path>` is an option of a task-scoped function only, and on one
+/// it expands to the `Scoped::settled` hook calling that path.
+#[test]
+fn settled_is_an_option_of_a_task_scoped_function_alone() {
+    refused(
+        &tracked_tokens(quote!(returns(clone), settled = publish), query()),
+        "`settled` is for `scope = task`",
+    );
+    let tokens = tracked_tokens(quote!(scope = task, returns(clone), settled = publish), query());
+    // The control: the same option on a scoped function expands, and to the hook.
+    let text = tokens.to_string();
+    assert!(text.contains("fn settled"), "no `settled` hook in the expansion: {text}");
+    assert!(text.contains("(publish)"), "the hook does not call the path given: {text}");
+    accepted(tokens);
+}

@@ -98,10 +98,11 @@ fn the_oracles_name_is_refused_for_a_check() {
 
 #[test]
 fn a_secret_hides_in_debug_and_loses_its_newline() {
-    let path = std::env::temp_dir().join(format!("blaze-ci-secret-{}", std::process::id()));
+    let dir = blaze_core::temp::TempDir::for_test("blaze-ci-secret-");
+    let path = dir.join("secret");
     std::fs::write(&path, "hunter2\n").unwrap();
     let secret = Secret::read(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
+    drop(dir);
     assert_eq!(secret.expose(), b"hunter2");
     assert!(!format!("{secret:?}").contains("hunter2"));
 }

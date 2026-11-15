@@ -3,7 +3,10 @@
 //! `unmarked_code_gets_no_error` is the opt-in property: code with no mark gets nothing.
 
 use base_db::all_crates;
-use hir_def::{AssocItemId, DefWithBodyId, ModuleDefId, expr_store::Body, nameres::crate_def_map};
+use hir_def::{
+    AssocItemId, DefWithBodyId, FunctionId, ModuleDefId, expr_store::Body, nameres::crate_def_map,
+    signatures::FunctionSignature,
+};
 use hir_expand::fixture;
 use hir_ty::{InferBodyId, db::HirDatabase, next_solver::TyKind};
 use hir_ty_mir::mir::{AggregateKind, MirBody, MirSpan, Rvalue, StatementKind};
@@ -13,24 +16,33 @@ use crate::{BodyKind, LinearDiagnostic, check_body};
 
 use hir_ty_mir as _;
 
+mod owed;
+
 type TestDB = base_db::Db;
 
-/// The functions of every module and impl of every crate.
+/// The functions with a body of every module and impl of every crate. A function declared
+/// without one (minicore's `#[rustc_intrinsic] fn transmute(..) -> ..;`) has no MIR: its body
+/// is `Expr::Missing`, which lowering refuses with `IncompleteExpr`.
 fn functions(db: &TestDB) -> Vec<DefWithBodyId> {
     let mut found = Vec::new();
+    let mut push = |it: FunctionId| {
+        if FunctionSignature::of(db, it).has_body() {
+            found.push(it.into());
+        }
+    };
     for &krate in all_crates(db).iter() {
         let def_map = crate_def_map(db, krate);
         for (_, module) in def_map.modules(db) {
             let scope = module.scope(db);
             for def in scope.declarations() {
                 if let ModuleDefId::FunctionId(it) = def {
-                    found.push(it.into());
+                    push(it);
                 }
             }
             for it in scope.impls() {
                 for &(_, item) in it.impl_items(db).items.iter() {
                     if let AssocItemId::FunctionId(it) = item {
-                        found.push(it.into());
+                        push(it);
                     }
                 }
             }
@@ -63,6 +75,13 @@ fn with_nested<'db>(db: &'db TestDB, body: &'db MirBody<'db>, out: &mut Vec<&'db
 /// character for the end of an expression (a scope's closing brace).
 #[track_caller]
 fn check(src: &str) -> Vec<(String, String)> {
+    diagnostics(src).into_iter().map(|(it, at)| (it.message, at)).collect()
+}
+
+/// Each error of every body in `src`, whole (its notes too), with the text its span covers as
+/// [`check`] gives it.
+#[track_caller]
+fn diagnostics(src: &str) -> Vec<(LinearDiagnostic, String)> {
     let fixture_text = format!(
         "//- minicore: sized, drop, fn, result, option, try, from, future, async_fn\n\
          #![feature(register_tool)]\n#![register_tool(blaze)]\n{src}"
@@ -104,7 +123,10 @@ fn check(src: &str) -> Vec<(String, String)> {
                 let kind = if index == 0 { BodyKind::Item(def) } else { BodyKind::Nested };
                 let mut out: Vec<LinearDiagnostic> = Vec::new();
                 check_body(&db, body, kind, &mut out);
-                found.extend(out.into_iter().map(|it| (it.message, at(it.span))));
+                found.extend(out.into_iter().map(|it| {
+                    let span = at(it.span);
+                    (it, span)
+                }));
             }
         }
         found

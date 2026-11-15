@@ -79,3 +79,14 @@ pub(crate) fn stderr_columns() -> Option<u16> {
     let asked = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &raw mut size) };
     (asked == 0 && size.ws_col > 0).then_some(size.ws_col)
 }
+
+/// The columns and rows of the terminal stderr is (`TIOCGWINSZ`); `None` when it is none.
+/// As blaze-cargo's `cli::show::stderr_size`.
+pub(crate) fn stderr_size() -> Option<(u16, u16)> {
+    // SAFETY: `winsize` is plain integers, for which zeroes are a value.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: descriptor 2 is this process's stderr, or closed (then the call fails); the
+    // request writes one `winsize` at the pointer, which is `size`, alive across the call.
+    let asked = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &raw mut size) };
+    (asked == 0 && size.ws_col > 0 && size.ws_row > 0).then_some((size.ws_col, size.ws_row))
+}

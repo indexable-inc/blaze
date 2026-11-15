@@ -11,7 +11,7 @@
 //! every impl that could apply in that crate or one it depends on, so no dependent can add one.
 //! rustc evaluates it once, in its crate, and every dependent reads the value from `.rmeta`.
 
-mod codec;
+pub(crate) mod codec;
 #[cfg(test)]
 mod tests;
 

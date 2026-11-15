@@ -18,6 +18,8 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod borrows;
 pub mod check;

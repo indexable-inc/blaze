@@ -33,6 +33,9 @@
 //! Rounding to power-of-two alignments is [`align`]'s, one copy for the whole tree; the
 //! SwissTable group probe every interner shares is [`swiss`]'s.
 //!
+//! Nothing here limits memory: a commit the kernel refuses is a typed [`MemError`], and the
+//! kernel's limit is the one ceiling.
+//!
 //! The store's buffer pool reads and gives back pages of one sparse [`Region`] by ranges
 //! ([`Region::reuse`], [`Region::evict`]), counted to [`Tag::Pool`], and copies bytes the evictor
 //! may drop meanwhile through [`racy`]'s atomic copies (docs/v2/plan/design/store-pool.md).
@@ -41,9 +44,12 @@
 //! allocator that turn a committed address into a typed place; every block says which
 //! invariant holds and where it is upheld (docs/v2/plan/design/unsafe.md).
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_ext)]
 // `memory.grow` on wasm64 (`os.rs`), whose intrinsics are not stable there yet.
 #![cfg_attr(target_arch = "wasm64", feature(simd_wasm64))]
+// blaze's lints (`blaze::process_static`, ...) name their tool; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod align;
 pub mod append;

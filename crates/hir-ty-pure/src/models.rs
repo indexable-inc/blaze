@@ -24,7 +24,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use hir_ty::{
     db::HirDatabase,
-    method_resolution::{InherentImpls, TraitImpls},
+    method_resolution::{InherentImpls, SelfTyKey, TraitImpls},
     next_solver::{SimplifiedType, SolverDefId, TyKind},
 };
 use intern::Symbol;
@@ -992,7 +992,9 @@ impl<'db> Resolver<'db> {
                 let Some(ModuleDefId::AdtId(adt)) = self.item(self.krate, ty, true) else { return };
                 let name = Symbol::intern(name);
                 let self_ty = SimplifiedType::Adt(SolverDefId::AdtId(adt));
-                for &imp in InherentImpls::for_crate(db, self.krate).for_self_ty(&self_ty) {
+                // The type's inherent impls alone, not the crate's whole table.
+                let impls = InherentImpls::in_crate_for_self_ty(db, self.krate, SelfTyKey(self_ty));
+                for &imp in impls {
                     methods(db, imp, std::slice::from_ref(&name), found);
                 }
             }
@@ -1009,7 +1011,8 @@ impl<'db> Resolver<'db> {
                 // alloc: setup, once per toolchain crate's table entry
                 let names: smallvec::SmallVec<[Symbol; 2]> =
                     names.iter().map(|it| Symbol::intern(it)).collect();
-                TraitImpls::for_crate(db, self.krate).for_trait(trait_, |impls| {
+                // The trait's table alone, not the crate's whole table.
+                TraitImpls::for_crate_and_trait(db, self.krate, trait_).for_trait(trait_, |impls| {
                     let Either::Left(impls) = impls else { return };
                     for &imp in impls {
                         if self_ty_is(db, imp, want) {
@@ -1027,9 +1030,10 @@ impl<'db> Resolver<'db> {
                     ],
                     Prim::Slice => &[SimplifiedType::Slice],
                 };
-                let inherent = InherentImpls::for_crate(db, self.krate);
                 for self_ty in self_tys {
-                    for &imp in inherent.for_self_ty(self_ty) {
+                    let impls =
+                        InherentImpls::in_crate_for_self_ty(db, self.krate, SelfTyKey(*self_ty));
+                    for &imp in impls {
                         methods(db, imp, std::slice::from_ref(&name), found);
                     }
                 }

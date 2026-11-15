@@ -4,16 +4,17 @@
 
 use std::path::{Path, PathBuf};
 
+use blaze_core::temp::TempDir;
 use blaze_manifest::files::Disk;
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::profiles::Profiles;
 use blaze_manifest::{Config, Context, Workspace};
 
-/// A fresh directory holding `files`, each a path under it and its text.
-fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
-    let root = std::env::temp_dir()
-        .join(format!("blaze-manifest-cargo-features-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+/// A fresh directory holding `files`, each a path under it and its text, and the path to it
+/// cargo is given; the directory goes when the first drops.
+fn tree(name: &str, files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let dir = TempDir::for_test(&format!("blaze-manifest-cargo-features-{name}-"));
+    let root = dir.path();
     for (path, text) in files {
         let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -22,7 +23,8 @@ fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
     std::fs::create_dir_all(root.join("cargo-home")).unwrap();
     // As cargo is given it: not the `\\?\` form `canonicalize` gives on Windows, which a
     // path read back from a `file:` URL is not.
-    dunce::canonicalize(root).unwrap()
+    let root = dunce::canonicalize(root).unwrap();
+    (dir, root)
 }
 
 fn context(root: &Path) -> Context<Disk> {
@@ -57,7 +59,7 @@ trim-paths = "all"
 #[test]
 fn a_listed_unstable_feature_is_activated() {
     let manifest = format!("cargo-features = [\"profile-rustflags\"]\n{PROFILES}");
-    let root = tree("listed", &[("Cargo.toml", &manifest), ("src/lib.rs", "")]);
+    let (_dir, root) = tree("listed", &[("Cargo.toml", &manifest), ("src/lib.rs", "")]);
     let ctx = context(&root);
     let ws = workspace(&ctx).unwrap();
     assert_eq!(ws.unstable_features().activated(), ["profile-rustflags"]);
@@ -75,7 +77,7 @@ fn a_listed_unstable_feature_is_activated() {
 
 #[test]
 fn an_unlisted_unstable_feature_is_refused() {
-    let root = tree("unlisted", &[("Cargo.toml", PROFILES), ("src/lib.rs", "")]);
+    let (_dir, root) = tree("unlisted", &[("Cargo.toml", PROFILES), ("src/lib.rs", "")]);
     let ctx = context(&root);
     let err = format!("{:#}", workspace(&ctx).err().expect("profile-rustflags is not listed"));
     assert!(err.contains("feature `profile-rustflags` is required"), "{err}");
@@ -101,7 +103,7 @@ fn unknown_and_repeated_features_are_refused() {
         let manifest = format!(
             "{features}\n[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
         );
-        let root = tree(&format!("bad-{i}"), &[("Cargo.toml", &manifest), ("src/lib.rs", "")]);
+        let (_dir, root) = tree(&format!("bad-{i}"), &[("Cargo.toml", &manifest), ("src/lib.rs", "")]);
         let ctx = context(&root);
         let err = format!("{:#}", workspace(&ctx).err().expect(features));
         assert!(err.contains(expected), "{features}: {err}");
@@ -110,7 +112,7 @@ fn unknown_and_repeated_features_are_refused() {
 
 #[test]
 fn a_path_base_joins_the_workspace_root() {
-    let root = tree(
+    let (_dir, root) = tree(
         "path-bases",
         &[
             ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"3\"\n"),

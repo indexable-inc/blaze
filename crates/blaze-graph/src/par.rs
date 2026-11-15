@@ -469,7 +469,7 @@ pub fn enumerate<S: IntoSource>(items: S) -> Enumerate<S::Source> {
     Enumerate(items.into_source())
 }
 
-/// The workers a loop called here splits across.
+/// The workers a loop called here splits across: those its pool may run at once.
 pub fn threads() -> usize {
     pool::threads_here()
 }

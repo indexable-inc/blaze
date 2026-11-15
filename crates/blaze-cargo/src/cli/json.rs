@@ -297,14 +297,16 @@ fn outcome(out: &mut String, outcome: TestOutcome) {
         TestOutcome::Passed => "passed",
         TestOutcome::Failed => "failed",
         TestOutcome::Ignored => "ignored",
-        TestOutcome::Unreached => "unreached",
     });
 }
 
 /// `blaze-test-result`, blaze's own (cargo has none), without its newline: one
-/// [`TestResult`] of `blaze test --reached` whole, so a harness or an agent reads what ran,
-/// what stood in for a run (`cached`: the run kept, by what, and why when by reach) and what
-/// ran outside the sandbox (`outside`) from fields, not from libtest's text.
+/// [`TestResult`] the daemon ran or kept, whole, so a harness or an agent reads what ran,
+/// what stood in for a run (`cached`: the pass kept, by what, and why when by reach; the
+/// result itself `passed` in 0 ms), a pass not kept (`kept`: `{"no": WORD}`, only then), why
+/// a test ran although selection was asked (`ran`, always: `null` when it did not, else
+/// `{"why": WORD, "ask": .., "before": .., "now": ..}`), and what ran outside the sandbox
+/// (`outside`) from fields, not from libtest's text.
 pub fn test_result(out: &mut String, result: &TestResult) {
     out.push_str(r#"{"reason":"blaze-test-result","binary":"#);
     quote(out, &result.binary);
@@ -337,9 +339,67 @@ pub fn test_result(out: &mut String, result: &TestResult) {
             out.push('}');
         }
     }
+    if let Some(not) = &result.not_kept {
+        out.push_str(r#","kept":{"no":"#);
+        quote(out, &not.no);
+        out.push('}');
+    }
+    out.push_str(r#","ran":"#);
+    match &result.ran {
+        None => out.push_str("null"),
+        Some(ran) => {
+            out.push_str(r#"{"why":"#);
+            quote(out, &ran.why);
+            out.push_str(r#","ask":"#);
+            opt(out, ran.ask.as_deref());
+            out.push_str(r#","before":"#);
+            opt(out, ran.before.as_deref());
+            out.push_str(r#","now":"#);
+            opt(out, ran.now.as_deref());
+            out.push('}');
+        }
+    }
     out.push_str(r#","output":"#);
     // alloc: only for output that is not UTF-8, which is written with U+FFFD in its place
     quote(out, &String::from_utf8_lossy(&result.output));
+    out.push('}');
+}
+
+/// `blaze-test-summary`, blaze's own (cargo has none), without its newline: the end of a
+/// `test` or `bench` run, its counts whole ([`blaze_screen::Tally`]), so a harness or an agent
+/// checks how many tests ran from fields and never takes a run of none for a pass. `ok` is
+/// the command's verdict (its exit code is 0); `why` is what refused a run in which no test
+/// failed (`cli::test::refusal`).
+pub fn test_summary(
+    out: &mut String,
+    tally: &blaze_screen::Tally,
+    ok: bool,
+    why: Option<&str>,
+    elapsed_ms: u64,
+) {
+    out.push_str(r#"{"reason":"blaze-test-summary","ok":"#);
+    boolean(out, ok);
+    for (name, count) in [
+        ("selected", tally.selected()),
+        ("ran", tally.ran()),
+        ("passed", tally.passed),
+        ("failed", tally.failed),
+        ("ignored", tally.ignored),
+        ("measured", tally.measured),
+        ("filtered_out", tally.filtered_out),
+        ("cached", tally.cached),
+        ("binaries", tally.binaries),
+        ("unbuilt", tally.unbuilt),
+    ] {
+        out.push_str(",\"");
+        out.push_str(name);
+        out.push_str("\":");
+        num(out, u64::from(count));
+    }
+    out.push_str(r#","elapsed_ms":"#);
+    num(out, elapsed_ms);
+    out.push_str(r#","why":"#);
+    opt(out, why);
     out.push('}');
 }
 
@@ -409,13 +469,18 @@ pub struct Finished<'a> {
     pub took_ms: u64,
     /// `None` for a request that sent no work report (a failed load, `doc`).
     pub work: Option<Work>,
+    /// The one program the build placed, where it placed exactly one: its path, whole.
+    pub program: Option<&'a str>,
+    /// What that program takes on disk, in bytes.
+    pub size_bytes: Option<u64>,
 }
 
 /// `build-finished`, without its newline: cargo's `reason` and `success` first, then blaze's
 /// own fields, each always present (`null` where unknown), so a reader's shape never varies:
 /// `{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,
 /// "build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,
-/// "full":0}}`. docs/cargo.md names each field.
+/// "full":0},"program":"/w/target/debug/app","size_bytes":4123456}`. docs/cargo.md names each
+/// field.
 pub fn build_finished(out: &mut String, finished: &Finished<'_>) {
     out.push_str(r#"{"reason":"build-finished","success":"#);
     boolean(out, finished.success);
@@ -444,10 +509,18 @@ pub fn build_finished(out: &mut String, finished: &Finished<'_>) {
             num(out, work.unchanged);
             out.push_str(r#","full":"#);
             num(out, work.full);
-            out.push_str("}}");
+            out.push('}');
         }
-        None => out.push_str(r#","units":null,"links":null}"#),
+        None => out.push_str(r#","units":null,"links":null"#),
     }
+    out.push_str(r#","program":"#);
+    opt(out, finished.program);
+    out.push_str(r#","size_bytes":"#);
+    match finished.size_bytes {
+        Some(bytes) => num(out, bytes),
+        None => out.push_str("null"),
+    }
+    out.push('}');
 }
 
 /// The name of the profile a `Finished` text names (`` `dev` profile [unoptimized + debuginfo]

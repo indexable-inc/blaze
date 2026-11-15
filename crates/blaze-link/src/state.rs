@@ -1152,6 +1152,10 @@ impl State {
         self.classes.iter().position(|it| it == class).map(|it| ClassId(it as u16))
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a class id is u16 and an image gets one class per distinct section kind, a few dozen for its life; 2^16 classes would need a typed refusal here"
+    )]
     pub fn class_id(&mut self, class: &Class) -> ClassId {
         if let Some(id) = self.find_class(class) {
             return id;

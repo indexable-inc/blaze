@@ -133,7 +133,7 @@ theorem evalOperands_putFar {B : FnId → Local → Prop} {g : List (Nat × FnId
       evalOperands (st.put f l sl) os =
         Outcome.map (keepState (fun s => State.put s f l sl)) (evalOperands st os)
   | [], _, _ => rfl
-  | o :: rest, st, h =>
+  | o :: rest, _, h =>
     Outcome.bind_commutes_map (evalOperand_putFar h sl o) (fun a ha =>
       Outcome.bind_commutes_map (evalOperands_putFar sl rest a.2 (h.operand o a ha))
         (fun _ _ => rfl))

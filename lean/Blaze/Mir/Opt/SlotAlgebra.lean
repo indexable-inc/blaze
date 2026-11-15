@@ -52,19 +52,19 @@ theorem setFrame_setFrame (id : Nat) (x y : List Slot) :
     by_cases h : fr.id = id
     · have h' : (fr.withLocals x).id = id := h
       have e1 : setFrame (fr :: rest) id x = fr.withLocals x :: rest :=
-        (setFrame_cons fr rest id x).trans (if_pos h)
+        (setFrame_cons fr rest id x).trans (ite_eq_left h)
       have e2 : setFrame (fr.withLocals x :: rest) id y = (fr.withLocals x).withLocals y :: rest :=
-        (setFrame_cons (fr.withLocals x) rest id y).trans (if_pos h')
+        (setFrame_cons (fr.withLocals x) rest id y).trans (ite_eq_left h')
       have e3 : setFrame (fr :: rest) id y = fr.withLocals y :: rest :=
-        (setFrame_cons fr rest id y).trans (if_pos h)
+        (setFrame_cons fr rest id y).trans (ite_eq_left h)
       exact (congrTo (fun t => setFrame t id y) e1).trans (e2.trans e3.symm)
     · have e1 : setFrame (fr :: rest) id x = fr :: setFrame rest id x :=
-        (setFrame_cons fr rest id x).trans (if_neg h)
+        (setFrame_cons fr rest id x).trans (ite_eq_right h)
       have e2 : setFrame (fr :: setFrame rest id x) id y =
           fr :: setFrame (setFrame rest id x) id y :=
-        (setFrame_cons fr (setFrame rest id x) id y).trans (if_neg h)
+        (setFrame_cons fr (setFrame rest id x) id y).trans (ite_eq_right h)
       have e3 : setFrame (fr :: rest) id y = fr :: setFrame rest id y :=
-        (setFrame_cons fr rest id y).trans (if_neg h)
+        (setFrame_cons fr rest id y).trans (ite_eq_right h)
       exact (congrTo (fun t => setFrame t id y) e1).trans
         (e2.trans ((congrTo (fun t => fr :: t) ih).trans e3.symm))
 
@@ -79,41 +79,41 @@ theorem setFrame_comm (id id' : Nat) (hne : ¬ id = id') (x y : List Slot) :
     · have h2 : ¬ fr.id = id' := fun e => hne (h.symm.trans e)
       have h2' : ¬ (fr.withLocals x).id = id' := h2
       have a1 : setFrame (fr :: rest) id x = fr.withLocals x :: rest :=
-        (setFrame_cons fr rest id x).trans (if_pos h)
+        (setFrame_cons fr rest id x).trans (ite_eq_left h)
       have a2 : setFrame (fr.withLocals x :: rest) id' y =
           fr.withLocals x :: setFrame rest id' y :=
-        (setFrame_cons (fr.withLocals x) rest id' y).trans (if_neg h2')
+        (setFrame_cons (fr.withLocals x) rest id' y).trans (ite_eq_right h2')
       have b1 : setFrame (fr :: rest) id' y = fr :: setFrame rest id' y :=
-        (setFrame_cons fr rest id' y).trans (if_neg h2)
+        (setFrame_cons fr rest id' y).trans (ite_eq_right h2)
       have b2 : setFrame (fr :: setFrame rest id' y) id x =
           fr.withLocals x :: setFrame rest id' y :=
-        (setFrame_cons fr (setFrame rest id' y) id x).trans (if_pos h)
+        (setFrame_cons fr (setFrame rest id' y) id x).trans (ite_eq_left h)
       exact ((congrTo (fun t => setFrame t id' y) a1).trans a2).trans
         ((congrTo (fun t => setFrame t id x) b1).trans b2).symm
     · by_cases h2 : fr.id = id'
       · have h' : ¬ (fr.withLocals y).id = id := h
         have a1 : setFrame (fr :: rest) id x = fr :: setFrame rest id x :=
-          (setFrame_cons fr rest id x).trans (if_neg h)
+          (setFrame_cons fr rest id x).trans (ite_eq_right h)
         have a2 : setFrame (fr :: setFrame rest id x) id' y =
             fr.withLocals y :: setFrame rest id x :=
-          (setFrame_cons fr (setFrame rest id x) id' y).trans (if_pos h2)
+          (setFrame_cons fr (setFrame rest id x) id' y).trans (ite_eq_left h2)
         have b1 : setFrame (fr :: rest) id' y = fr.withLocals y :: rest :=
-          (setFrame_cons fr rest id' y).trans (if_pos h2)
+          (setFrame_cons fr rest id' y).trans (ite_eq_left h2)
         have b2 : setFrame (fr.withLocals y :: rest) id x =
             fr.withLocals y :: setFrame rest id x :=
-          (setFrame_cons (fr.withLocals y) rest id x).trans (if_neg h')
+          (setFrame_cons (fr.withLocals y) rest id x).trans (ite_eq_right h')
         exact ((congrTo (fun t => setFrame t id' y) a1).trans a2).trans
           ((congrTo (fun t => setFrame t id x) b1).trans b2).symm
       · have a1 : setFrame (fr :: rest) id x = fr :: setFrame rest id x :=
-          (setFrame_cons fr rest id x).trans (if_neg h)
+          (setFrame_cons fr rest id x).trans (ite_eq_right h)
         have a2 : setFrame (fr :: setFrame rest id x) id' y =
             fr :: setFrame (setFrame rest id x) id' y :=
-          (setFrame_cons fr (setFrame rest id x) id' y).trans (if_neg h2)
+          (setFrame_cons fr (setFrame rest id x) id' y).trans (ite_eq_right h2)
         have b1 : setFrame (fr :: rest) id' y = fr :: setFrame rest id' y :=
-          (setFrame_cons fr rest id' y).trans (if_neg h2)
+          (setFrame_cons fr rest id' y).trans (ite_eq_right h2)
         have b2 : setFrame (fr :: setFrame rest id' y) id x =
             fr :: setFrame (setFrame rest id' y) id x :=
-          (setFrame_cons fr (setFrame rest id' y) id x).trans (if_neg h)
+          (setFrame_cons fr (setFrame rest id' y) id x).trans (ite_eq_right h)
         exact ((congrTo (fun t => setFrame t id' y) a1).trans a2).trans
           ((congrTo (fun t => fr :: t) ih).trans
             ((congrTo (fun t => setFrame t id x) b1).trans b2).symm)
@@ -122,12 +122,12 @@ theorem setFrame_comm (id id' : Nat) (hne : ¬ id = id') (x y : List Slot) :
 
 theorem State.setSlots_zero (st : State) (f : Nat) (hf : f = 0) (slots : List Slot) :
     st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
-  (State.setSlots_def st f slots).trans (if_pos hf)
+  (State.setSlots_def st f slots).trans (ite_eq_left hf)
 
 theorem State.setSlots_frame (st : State) (f : Nat) (hf : ¬ f = 0) (slots : List Slot) :
     st.setSlots f slots =
       { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-  (State.setSlots_def st f slots).trans (if_neg hf)
+  (State.setSlots_def st f slots).trans (ite_eq_right hf)
 
 theorem State.setSlots_setSlots (st : State) (f : Nat) (x y : List Slot) :
     (st.setSlots f x).setSlots f y = st.setSlots f y := by

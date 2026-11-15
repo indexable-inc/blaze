@@ -102,7 +102,7 @@ fn writes_are_of_out_dir_paths() {
     );
     refused(apply_leaf(Leaf::WriteFile, &[Abs::Root(Root::Package)]), "a path in its package");
     refused(apply_leaf(Leaf::WriteFile, &[env("CARGO_MANIFEST_DIR")]), "a path in its package");
-    refused(apply_leaf(Leaf::WriteFile, &[c("/tmp/x")]), "`/tmp/x`");
+    refused(apply_leaf(Leaf::WriteFile, &[c("/srv/x")]), "`/srv/x`");
     assert_eq!(apply_leaf(Leaf::WriteFile, &[Abs::Param(0)]), Applied::Deferred);
 }
 

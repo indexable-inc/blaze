@@ -1,7 +1,9 @@
 //! The type system. We currently use this to infer types for completion, hover
 //! information and various assists.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 // It's useful to refer to code that is private in doc comments.
 #![allow(rustdoc::private_intra_doc_links)]
 
@@ -46,6 +48,8 @@ pub mod drop;
 pub mod dropck;
 pub mod dyn_compatibility;
 pub mod effects;
+pub mod entry;
+pub mod error_union;
 pub mod evict;
 pub mod facts;
 pub mod fn_cache;
@@ -58,7 +62,9 @@ pub mod primitive;
 pub mod providers;
 pub mod record;
 pub mod solver_errors;
+mod store_registry;
 pub mod traits;
+pub mod type_of;
 pub mod used_imports;
 pub mod where_const;
 
@@ -133,6 +139,7 @@ pub use lower::{
     elided_groups, elided_lifetimes, hir_mutability, hybrid_param_env, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
     predicate_sources,
+    written_implied_predicates,
     record::{
         RecordParamDefault, record_defaults_owner, record_param_default, record_param_defaults,
     },

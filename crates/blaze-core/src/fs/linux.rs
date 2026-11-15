@@ -168,13 +168,35 @@ pub(crate) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_all(&Kernel, file.fd(), bytes, None, Plant::None)
 }
 
+/// The file at `path` opened to be synced: read-only where it is there, as `fsync` and
+/// `fdatasync` need no write access and a file sealed read-only (a placed output, mode 0444)
+/// refuses an open for writing with `EACCES`; made, opened to append as an append makes it,
+/// only where it is missing (the contract of a sync and a barrier: "made where it is
+/// missing"). A file that is there is never opened for writing.
+fn to_sync(path: &Path) -> io::Result<OwnedFd> {
+    match open(path, OpenFlags::READ, Plant::None) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            open(path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND, Plant::None)
+        }
+        opened => opened,
+    }
+}
+
 /// [`crate::Effect::Sync`]: the file at `path`, made where it is missing, synced to the
-/// device.
+/// device. Opened read-only where it is there ([`to_sync`]).
 pub(crate) fn sync(path: &Path) -> io::Result<()> {
-    let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND;
-    let file = open(path, flags, Plant::None)?;
+    let file = to_sync(path)?;
     // durable: the effect is the sync its caller asked for.
     sys::fsync(file.fd()).map_err(|errno| os_error(errno, Plant::None))
+}
+
+/// [`crate::Effect::Barrier`]: the file at `path`, made where it is missing, with its data
+/// (and the metadata a read of it needs: its length) on the device: `fdatasync`. Opened
+/// read-only where it is there ([`to_sync`]).
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    let file = to_sync(path)?;
+    // durable: the effect is the ordering its caller asked for; Linux's cheapest call for it is a data sync.
+    sys::fdatasync(file.fd()).map_err(|errno| os_error(errno, Plant::None))
 }
 
 /// [`crate::Effect::WriteBack`]: the file's data that is only in memory written to its
@@ -218,11 +240,8 @@ mod tests {
 
     use super::*;
 
-    fn dir(what: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-core-fs-linux-{what}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn dir(what: &str) -> crate::temp::TempDir {
+        crate::temp::TempDir::for_test(&format!("blaze-core-fs-linux-{what}-"))
     }
 
     /// The real kernel, made to move at most `most` bytes a call and to interrupt every
@@ -283,7 +302,8 @@ mod tests {
     /// Writes `bytes` at 0 of a new file in `what`'s directory through a kernel that writes
     /// three bytes a call and interrupts every other call, with `plant`.
     fn short_write(what: &str, bytes: &[u8], plant: Plant) -> Result<(), String> {
-        let path = dir(what).join("file");
+        let held = dir(what);
+        let path = held.join("file");
         std::fs::write(&path, b"").unwrap();
         let file = open(&path, OpenFlags::WRITE, Plant::None).unwrap();
         let stingy = Stingy { most: 3, every: 2, calls: Cell::new(0) };
@@ -307,7 +327,8 @@ mod tests {
 
     #[test]
     fn a_short_read_is_continued_to_the_files_end() {
-        let path = dir("short-read").join("file");
+        let held = dir("short-read");
+        let path = held.join("file");
         let bytes: Vec<u8> = (0..=255).cycle().take(700).collect();
         std::fs::write(&path, &bytes).unwrap();
         let file = open(&path, OpenFlags::READ, Plant::None).unwrap();
@@ -319,7 +340,8 @@ mod tests {
 
     #[test]
     fn a_call_always_interrupted_ends_with_the_interruption() {
-        let path = dir("storm").join("file");
+        let held = dir("storm");
+        let path = held.join("file");
         std::fs::write(&path, b"x").unwrap();
         let file = open(&path, OpenFlags::WRITE, Plant::None).unwrap();
         let storm = Stingy { most: 1, every: 1, calls: Cell::new(0) };
@@ -332,7 +354,8 @@ mod tests {
     /// directory (`making_parent`) and what an empty `ReadAll` reads. The oracle is
     /// `std::fs`'s error for the same path.
     fn missing_is_not_found(what: &str, plant: Plant) -> Result<(), String> {
-        let path = dir(what).join("no/such/file");
+        let held = dir(what);
+        let path = held.join("no/such/file");
         let ours = open(&path, OpenFlags::READ, plant).expect_err("a missing file opened");
         let stds = std::fs::File::open(&path).expect_err("a missing file opened");
         match (ours.kind(), ours.raw_os_error()) == (stds.kind(), stds.raw_os_error()) {

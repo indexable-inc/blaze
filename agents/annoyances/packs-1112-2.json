@@ -1,0 +1,20 @@
+{
+ "id": "packs-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane packs-1112",
+ "where": "crates/blaze-registry/src/http.rs (Http::get), used by crates/blaze-cargo/src/serve/packs.rs",
+ "what": "The daemon's HTTP client returns a whole body in memory with no caller-given bound, so a reader of untrusted sources cannot say `at most N bytes` for an answer; packs check the length after the fact.",
+ "cost": "a stated gap in the security rule (size limits on what is read from a network)",
+ "cause": "`get` was written for registry files of known small size",
+ "whys": [
+  "a pack read cannot bound an answer",
+  "`Http::get` has no bound parameter",
+  "its `stream` form's sink can refuse but its signature is its own and undocumented for this use",
+  "every caller trusted its server's sizes"
+ ],
+ "class": "an unbounded read of bytes from a network",
+ "prevention": "a `most: u64` on `Http::get` (the request fails past it, before the bytes are held); then a lint that bans the unbounded form",
+ "workaround": "ranged GETs ask for at most 4 MiB or one record, and an answer longer than asked is refused after it arrived",
+ "fix": "none yet",
+ "state": "open"
+}

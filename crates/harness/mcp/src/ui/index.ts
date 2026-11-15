@@ -262,9 +262,9 @@ export const uiDocs: Docs = {
   },
   ask: {
     area: 'ui',
-    for: "ask the person a question; confirm; choose",
+    for: "ask the person any question, including casual conversation; clarify goals, specifics, constraints, priorities and tradeoffs; choose",
     sig: "ask(text, { options?: (string | { label, detail? })[], default?, detail?, allowText?, block? = true }): Promise<string>",
-    about: "Ask the person a question under the cell and get the label picked or the words typed. An answer that comes after the tool call replied reaches you as a message. Stopping the cell withdraws the question.",
+    about: "Use this for every question you expect the person to answer, including casual follow-ups and requests to ask a question; do not substitute plain chat text. Shows the question under the cell and gets the label picked or the words typed. Waits for an answer by default; a default only preselects a recommendation, never answers for the person. Only block: false with a valid default proceeds immediately with it, for a cheap-to-change assumption. No options means free text. An answer after the tool call replied reaches you as a message. Stopping a waiting cell withdraws the question.",
     example: "await ask('Deploy to production?', { options: ['Deploy', 'Cancel'], default: 'Cancel' })",
     throws: "RangeError past 16 questions in one cell; Error when the question is withdrawn unanswered (the cell stopped).",
   },

@@ -18,7 +18,7 @@ use blaze_units::{
 };
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
-use span::Edition;
+use span::{BlazeEdition, Edition};
 use triomphe::Arc;
 
 use super::{LowerError, files};
@@ -412,13 +412,46 @@ pub(crate) fn dependency(
     Ok(BuiltDependency::with_prelude(name, krate, prelude, on.is_std && !unit.is_std))
 }
 
+/// The Rust edition `unit`'s crate is parsed and resolved in: its target's, or for a target
+/// of a blaze edition (`edition = "blaze-2026.11"`) the Rust edition that fixes
+/// ([`BlazeEdition::rust`]). The blaze edition itself reaches the front end as a crate
+/// attribute ([`blaze_edition_attrs`]).
 pub(crate) fn edition(unit: &Unit, what: &str) -> Result<Edition, LowerError> {
+    if let Some(blaze) = blaze_edition(unit, what)? {
+        return Ok(blaze.rust());
+    }
     unit.target.edition.parse::<Edition>().map_err(|_| {
         LowerError::at(
             format!("{what} has edition `{}`, which blaze does not know", unit.target.edition),
             what,
         )
     })
+}
+
+/// The blaze edition `unit`'s target says (docs/v2/plan/design/std.md, "The blaze edition:
+/// opting in"), or none for a Rust edition; one that starts `blaze-` and is no blaze
+/// edition's is refused, naming it.
+pub(crate) fn blaze_edition(unit: &Unit, what: &str) -> Result<Option<BlazeEdition>, LowerError> {
+    BlazeEdition::from_manifest(&unit.target.edition)
+        .map_err(|unknown| LowerError::at(format!("{what}: {unknown}"), what))
+}
+
+/// The crate attributes `unit`'s crate is given beside its root's own
+/// (`base_db::BuiltCrateData::crate_attrs`): for a target of a blaze edition, the edition's
+/// attribute ([`BlazeEdition::crate_attr`]), which is how the opt-in is a tracked input of
+/// the front end: the crate's key hashes every crate attribute (`blaze_items::key::crate_key`),
+/// so nothing made for the crate under one edition is ever served under another (rule
+/// keys-cover-every-input). A build script and a proc-macro target stay Rust's: neither is
+/// handed capabilities yet (std.md, row S5f), and a unit of the standard library is never of
+/// a blaze edition. A crate of a Rust edition is given none, as before.
+pub(crate) fn blaze_edition_attrs(unit: &Unit, what: &str) -> Result<Box<[Box<str>]>, LowerError> {
+    let rust_only =
+        unit.is_std || unit.target.is_proc_macro() || unit.target.kind.iter().any(|it| it == "custom-build");
+    match blaze_edition(unit, what)? {
+        // alloc: once per crate of a blaze edition, its one attribute
+        Some(blaze) if !rust_only => Ok(Box::new([Box::from(blaze.crate_attr())])),
+        _ => Ok(Box::new([])),
+    }
 }
 
 /// The front end's form of what a unit is built for ([`Unit::built_for`], the source of truth),
@@ -701,12 +734,34 @@ pub(crate) fn manifest_kind(unit: &Unit, what: &str) -> Result<TargetKind, Lower
 }
 
 /// Where a proc macro runs for the crate: the workspace's root for a member, its package's
-/// directory otherwise, as cargo runs rustc.
-pub(crate) fn proc_macro_cwd(root: &Root, package: &PackagePlan) -> String {
-    match (&root.dir, package.is_member) {
-        (Some(dir), true) => dir.clone(),
+/// directory otherwise, as cargo runs rustc. A package of the standard library (`library`,
+/// where the library is named, when the crate's unit is one of its units) is a member of the
+/// library's own workspace, which is loaded as one more workspace: its root is the library's,
+/// never the root of the workspace that asked for it.
+///
+/// The invariant: nothing of a crate of the standard library names the workspace that builds
+/// it, so its settings ([`base_db::Crate::content`]), its identity and every key made of them
+/// (dependency images, the item store, unit records) are the same in every workspace of the
+/// machine. Until 2026-11-11 the library's members were given the asking workspace's root
+/// here, so every one of the library's units missed its record in each new workspace and a
+/// new hello-world was built as a cold one (14 s where its second build takes 1 s). Test:
+/// `the_standard_library_is_keyed_the_same_whatever_workspace_builds_it`.
+pub(crate) fn proc_macro_cwd(root: &Root, package: &PackagePlan, library: Option<&str>) -> String {
+    #[cfg(test)]
+    let library = library.filter(|_| !LIBRARY_RUNS_IN_THE_WORKSPACE.get());
+    match (library, &root.dir, package.is_member) {
+        (Some(library), _, true) => library.trim_end_matches('/').to_owned(),
+        (None, Some(dir), true) => dir.clone(),
         _ => files::parent(&package.manifest_path).to_owned(),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a member of the standard library's workspace runs its proc
+    /// macros in the root of the workspace that asked for it, as it did until 2026-11-11.
+    pub(crate) static LIBRARY_RUNS_IN_THE_WORKSPACE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// The workspace's root, as cargo finds it from a member, and what its manifest sets.
@@ -727,7 +782,24 @@ pub(crate) fn root<T: blaze_query::Tree>(
     units: &Units,
     tree: &files::Mounts<'_, T>,
 ) -> Result<Root, LowerError> {
-    let Some(member) = units.packages.iter().find(|it| it.is_member) else {
+    // A member of the workspace asked for, never of the standard library's own workspace,
+    // whose packages are members too: the first in the plan's order could be either.
+    let of_library = |package: &PackagePlan| {
+        let mut any = false;
+        for unit in units.graph.units.iter().filter(|it| it.pkg_id == package.id) {
+            if !unit.is_std {
+                return false;
+            }
+            any = true;
+        }
+        any
+    };
+    let builds = |package: &PackagePlan| {
+        units.graph.units.iter().any(|it| it.pkg_id == package.id && !it.is_std)
+    };
+    let members = || units.packages.iter().filter(|it| it.is_member);
+    let Some(member) = members().find(|it| builds(it)).or_else(|| members().find(|it| !of_library(it)))
+    else {
         return Ok(Root {
             dir: None,
             const_eval: ConstEvalBudget::default(),
@@ -901,7 +973,18 @@ pub fn lint_flags(unit: &Unit, plan: &UnitPlan, local: bool, extra_verbose: bool
     const SHORT: [&str; 4] = ["-A", "-W", "-D", "-F"];
     const LONG: [&str; 6] =
         ["--allow", "--warn", "--deny", "--forbid", "--force-warn", "--cap-lints"];
-    let mut out = plan.lints.clone(); // clone: the unit's own list, once per unit per build
+    let mut out = Vec::with_capacity(plan.lints.len() + 2); // alloc: the unit's list, once per unit per build
+    // A crate of a blaze edition denies `blaze::std_use` (docs/v2/plan/design/std.md, "The
+    // blaze edition: opting in", memory): a use of Rust std's global heap (`Vec::new()`,
+    // `Box::new`, `format!`, ..) or of anything else bstd replaces is an error of `blaze
+    // check` that names the explicit form. First, so the workspace's table and the command
+    // line still have the last word; the build's own refusal is the `global_alloc` effect
+    // (row S5g).
+    if blaze_edition_attrs(unit, "").is_ok_and(|attrs| !attrs.is_empty()) {
+        out.push("-D".to_owned()); // alloc: as above
+        out.push("blaze::std_use".to_owned()); // alloc: as above
+    }
+    out.extend(plan.lints.iter().cloned()); // clone: the unit's own list, once per unit per build
     let mut flags = plan.rustflags.iter();
     while let Some(flag) = flags.next() {
         let flag = flag.as_str();

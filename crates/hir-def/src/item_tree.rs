@@ -53,6 +53,7 @@ mod attrs;
 mod block;
 mod items;
 mod lower;
+mod order;
 pub mod persist;
 mod pretty;
 #[cfg(test)]
@@ -74,6 +75,8 @@ use hir_expand::{
     name::Name,
 };
 use la_arena::{Idx, RawIdx};
+
+pub use self::order::{BodyItem, body_items};
 use span::{AstIdNode, Edition, FileAstId, SyntaxContext};
 use syntax::{
     ast, match_ast,
@@ -272,6 +275,112 @@ pub(crate) fn lower_whole(db: &Db, file_id: HirFileId, krate: Crate) -> ItemTree
     }
 }
 
+/// The item tree of the block `block` of a body of `krate`: the items among its statements
+/// ([`ItemTree::top_level_items`]), what its [`crate::nameres::block_def_map`] is collected from.
+pub fn block_item_tree(db: &Db, block: BlockId, krate: Crate) -> &ItemTree {
+    block_item_tree_query(db, block, krate)
+}
+
+/// One `use` tree of an import as its item tree lowered it, numbered in the pre-order
+/// `ImportId::idx` and `GlobId::idx` name (a tree before its children, as [`Use::expand`] counts).
+pub struct UseTreeOf<'a> {
+    /// Its index: the one `ImportId::idx` / `GlobId::idx` names, and a list's own.
+    pub idx: Idx<ast::UseTree>,
+    /// The index (into [`UseItemTrees::trees`]) of the list it is in.
+    pub parent: Option<u32>,
+    pub kind: UseTreeKind<'a>,
+}
+
+/// A `use` item as its item tree lowered it: no syntax read.
+pub struct UseItemTrees<'a> {
+    /// As written: [`RawVisibility::Public`] exactly for `pub`.
+    pub visibility: &'a RawVisibility,
+    pub trees: Box<[UseTreeOf<'a>]>,
+}
+
+/// The tree an item of the module `container` is lowered in, and the item of kind `kind` whose
+/// ast id is `ast` in it. Panics naming `what` when the tree has none: an id of an item is made
+/// only from that tree.
+fn item_of<'db>(
+    db: &'db Db,
+    container: crate::ModuleId,
+    ast: hir_expand::ErasedAstId,
+    kind: ItemKind,
+    what: &dyn fmt::Debug,
+) -> (&'db ItemTree, ModItemId) {
+    let block = container.block(db).map(|it| it.to_static());
+    let tree = TreeId::new(ast.file_id, block).item_tree(db, container.krate(db));
+    // A scan of the per-item ast id column: 4 bytes an item, no index kept for it.
+    let found = (tree.ast_ids().iter())
+        .zip(tree.kinds())
+        .position(|(id, &k)| id.erase() == ast.value && k == kind);
+    match found {
+        Some(at) => (tree, ModItemId::new(at as u32)),
+        None => panic!("{what:?}: its tree has no {kind:?} item {:?}", ast.value),
+    }
+}
+
+/// The `use` item `id`: its trees walked in [`Use::expand`]'s order (a prefixed tree, then each
+/// child of its list, each numbered). Its tree is its module's file's, or its block's.
+pub fn use_item_trees(db: &Db, id: crate::UseId) -> UseItemTrees<'_> {
+    use crate::Lookup as _;
+    let loc = id.lookup(db);
+    let ast = hir_expand::InFile::new(loc.id.file_id, loc.id.value.erase());
+    let (tree, item) = item_of(db, loc.container, ast, ItemKind::Use, &id);
+    let ModItemKind::Use(_, use_) = tree.index(item) else {
+        unreachable!("{id:?}: an item of kind `Use` is a `use`")
+    };
+    let mut trees = Vec::new(); // alloc: the result, one per tree (one for most items)
+    // (tree, the index of its list in `trees`)
+    let mut stack: smallvec::SmallVec<[(UseTreeId, Option<u32>); 8]> = smallvec::SmallVec::new();
+    stack.push((use_.use_tree, None));
+    let mut next = 0u32;
+    while let Some((at, parent)) = stack.pop() {
+        let kind = tree.use_tree(at).kind(tree);
+        let own = trees.len() as u32;
+        if let UseTreeKind::Prefixed { list, .. } = kind {
+            // Pushed reversed, so the first child is numbered next.
+            stack.extend(list.iter().rev().map(|&child| (child, Some(own))));
+        }
+        trees.push(UseTreeOf { idx: Idx::from_raw(RawIdx::from_u32(next)), parent, kind });
+        next += 1;
+    }
+    UseItemTrees { visibility: &tree[use_.visibility], trees: trees.into_boxed_slice() }
+}
+
+/// An `extern crate` item as its item tree lowered it: no syntax read.
+pub struct ExternCrateItem<'a> {
+    /// `extern crate name` / `extern crate name as alias`.
+    pub name: Name,
+    pub alias: Option<ImportAlias>,
+    /// As written: [`RawVisibility::Public`] exactly for `pub`.
+    pub visibility: &'a RawVisibility,
+    /// Whether it has `#[macro_use]` or `#[macro_use(..)]`, its `cfg_attr`s expanded.
+    pub macro_use: bool,
+}
+
+/// The `extern crate` item `id`, found as [`use_item_trees`] finds a `use`.
+pub fn extern_crate_item(db: &Db, id: crate::ExternCrateId) -> ExternCrateItem<'_> {
+    use crate::Lookup as _;
+    let loc = id.lookup(db);
+    let ast = hir_expand::InFile::new(loc.id.file_id, loc.id.value.erase());
+    let (tree, item) = item_of(db, loc.container, ast, ItemKind::ExternCrate, &id);
+    let ModItemKind::ExternCrate(_, krate) = tree.index(item) else {
+        unreachable!("{id:?}: an item of kind `ExternCrate` is an `extern crate`")
+    };
+    let macro_use = match tree.attrs(item) {
+        Some(AttrsOrCfgRef::Enabled { attrs }) => attrs.by_key(intern::sym::macro_use).exists(),
+        // A `cfg`'d-out `extern crate` makes no id.
+        Some(AttrsOrCfgRef::CfgDisabled(..)) | None => false,
+    };
+    ExternCrateItem {
+        name: tree[krate.name],
+        alias: tree.import_alias(krate.alias),
+        visibility: &tree[krate.visibility],
+        macro_use,
+    }
+}
+
 #[blaze_query::tracked(returns(ref))]
 pub(crate) fn block_item_tree_query(db: &Db, block: BlockId, krate: Crate) -> ItemTree {
     let _p = tracing::info_span!("block_item_tree_query", ?block).entered();
@@ -406,10 +515,30 @@ fn attr_blocks(owners: &[AttrOwner], items: usize) -> impl ExactSizeIterator<Ite
 }
 
 impl ItemTree {
-    /// Returns an iterator over all items located at the top level of the `HirFileId` this
-    /// `ItemTree` was created from.
-    pub(crate) fn top_level_items(&self) -> &[ModItemId] {
+    /// The items at the top level of the file, macro expansion or block this tree was lowered
+    /// from, in source order: a block's are the items among its statements, a macro call
+    /// written as a statement among them.
+    pub fn top_level_items(&self) -> &[ModItemId] {
         self.top_level()
+    }
+
+    /// Which kind the item `id` of this tree is.
+    #[inline]
+    pub fn kind(&self, id: ModItemId) -> ItemKind {
+        self.kinds()[id.index as usize]
+    }
+
+    /// The items of the inline module or the extern block `id`, in source order; empty for an
+    /// outline module (its items are its file's) and for any other kind of item.
+    pub fn nested_items(&self, id: ModItemId) -> &[ModItemId] {
+        match self.index(id) {
+            ModItemKind::Mod(_, m) => match self.mod_kind(m) {
+                ModKind::Inline { items } => items,
+                ModKind::Outline => &[],
+            },
+            ModItemKind::ExternBlock(_, block) => self.items(block.children),
+            _ => &[],
+        }
     }
 
     /// Returns the inner attributes of the source file.
@@ -645,8 +774,9 @@ impl ModItemId {
         Self { index }
     }
 
+    /// The item's ast id, in the file its tree is of ([`TreeId::file_id`]).
     #[inline]
-    pub(crate) fn ast_id(self, item_tree: &ItemTree) -> FileAstId<ast::Item> {
+    pub fn ast_id(self, item_tree: &ItemTree) -> FileAstId<ast::Item> {
         item_tree.ast_ids()[self.index as usize]
     }
 }
@@ -656,7 +786,7 @@ macro_rules! mod_items {
         /// Which kind an item is: which payload column its data word indexes.
         #[derive(Debug, Copy, Clone, PartialEq, Eq)]
         #[repr(u8)]
-        pub(crate) enum ItemKind {
+        pub enum ItemKind {
             $( $typ, )+
         }
 

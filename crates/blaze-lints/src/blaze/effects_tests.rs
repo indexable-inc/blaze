@@ -87,10 +87,22 @@ pub mod time {
 }
 "#;
 
+/// [`MINICORE`] with the lang items a call through `dyn` needs: without `Unsize` and
+/// `DispatchFromDyn` no method is dispatchable (`dyn_compatibility::receiver_is_dispatchable`),
+/// so no trait is dyn-compatible and `dyn Job` is a type error, as no real `core` has it.
+pub(super) fn minicore_with_dyn() -> String {
+    MINICORE.replace("allocator_api", "allocator_api, unsize, coerce_unsized, dispatch_from_dyn")
+}
+
 /// What the three lints say of `main` (`src/lib.rs`, its crate's meta `meta` after `crate:main`).
 fn effects_of(meta: &str, main: &str) -> String {
+    effects_over(MINICORE, meta, main)
+}
+
+/// [`effects_of`] over `minicore`.
+fn effects_over(minicore: &str, meta: &str, main: &str) -> String {
     let fixture = format!(
-        "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std{meta}\n{}",
+        "{minicore}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std{meta}\n{}",
         main.trim_start_matches('\n')
     );
     lint(
@@ -248,7 +260,8 @@ pub fn scratch(frame: &Frame) -> alloc::vec::Vec<u32, &Frame> {
 /// hides code, refused.
 #[test]
 fn noalloc_refuses_a_dyn_behind_a_raw_pointer() {
-    let out = effects_of(
+    let out = effects_over(
+        &minicore_with_dyn(),
         "",
         r#"
 pub trait Job {

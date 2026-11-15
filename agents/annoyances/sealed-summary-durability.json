@@ -1,0 +1,14 @@
+{
+ "id": "sealed-summary-durability",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 5b T3, then of the base-db HIGH task, int-1112",
+ "where": "crates/hir-ty-pure/src/sealed.rs; base-db change.rs source_root_durability, files.rs root_set_durability/in_library_root, input.rs graph_durability, lib.rs AllCrates; hir-ty-pure tests/fixture.rs TOOLCHAIN",
+ "what": "Summaries of a sealed crate's instances run under a covered frame, which refuses any read below HIGH. Read on the tree: the cover row (image keys) reads source roots, written at MEDIUM for library roots too, so it cannot be read under the frame; and the test toolchain put the Lang crates `alloc` and `std` in a local root (files at LOW), which no build makes.",
+ "cost": "the plan's shape (callees read `sealed` again under the frame) would refuse at the first callee; every hir-ty-pure test over the stand-in std would have refused at its first file read",
+ "cause": "which crates cannot change is said twice, by origin (`hir_def::deps::sealed`) and by durability (the source root's `is_library`, roots at MEDIUM), and the two disagree for source roots and in the fixture",
+ "class": "one fact (this input cannot change in an edit loop) with two homes that drift apart",
+ "prevention": "a library root's file set, file-to-root map and texts are HIGH by the one rule (files::root_set_durability / root_content_durability, by the root's kind); a crate whose root is in a library root is HIGH; the crate list carries a `library` part at HIGH beside the whole list (MEDIUM), and a library root's source_root_crates reads that part alone",
+ "workaround": "Sealed carries the tables of every crate below it, handed to a covered run in its key and through Cx, so nothing under the frame reads `sealed`",
+ "fix": "base-db 2026-11-12: FileChange writes library roots at HIGH, CrateGraphBuilder writes a crate in a library root at HIGH, AllCrates split (`library` HIGH, `local`, `crates` whole) with an implied write keeping the split; tests/durable_roots.rs. Not HIGH still: named-path buckets (MEDIUM, a path outside the anchor's root), ProcessEnv (MEDIUM, `env!` of a process variable), a registry library's doctest crates (local Example root)",
+ "state": "written, not yet built (2026-11-12)"
+}

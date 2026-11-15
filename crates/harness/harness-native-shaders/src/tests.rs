@@ -115,15 +115,16 @@ fn mascot_quad_vs_covers_its_rect() {
 
 /// The transfer functions are odd (extended sRGB carries negative values), invert each other over
 /// the extended range, and meet the pinned points: 0, 1, and the encoding's 0.5 at 0.214 linear.
-#[hegel::test]
-fn mascot_transfer_functions_invert_each_other(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let x = tc.draw(gs::floats::<f32>().min_value(-8.0).max_value(8.0).allow_nan(false).allow_infinity(false));
-    let back = m_linear_to_srgb(m_srgb_to_linear(x));
-    assert!((back - x).abs() <= 1e-5 * x.abs().max(1.0), "{x} decodes and encodes to {back}");
-    assert_eq!(m_srgb_to_linear(-x), -m_srgb_to_linear(x));
-    assert_eq!(m_linear_to_srgb(-x), -m_linear_to_srgb(x));
-    assert_eq!(m_srgb_to_linear(0.0), 0.0);
-    assert!((m_srgb_to_linear(1.0) - 1.0).abs() < 1e-6);
-    assert!((m_srgb_to_linear(0.5) - 0.214_041).abs() < 1e-5);
+#[test]
+fn mascot_transfer_functions_invert_each_other() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let x = tape.f32_in(-8.0..=8.0, "x");
+        let back = m_linear_to_srgb(m_srgb_to_linear(x));
+        assert!((back - x).abs() <= 1e-5 * x.abs().max(1.0), "{x} decodes and encodes to {back}");
+        assert_eq!(m_srgb_to_linear(-x), -m_srgb_to_linear(x));
+        assert_eq!(m_linear_to_srgb(-x), -m_linear_to_srgb(x));
+        assert_eq!(m_srgb_to_linear(0.0), 0.0);
+        assert!((m_srgb_to_linear(1.0) - 1.0).abs() < 1e-6);
+        assert!((m_srgb_to_linear(0.5) - 0.214_041).abs() < 1e-5);
+    });
 }

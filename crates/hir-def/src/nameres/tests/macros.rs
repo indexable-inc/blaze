@@ -1838,6 +1838,42 @@ enum MyEnum {}
 }
 
 #[test]
+fn macro_rules_attr_with_arguments() {
+    // An `attr(..)` rule's first pattern matches the attribute's arguments, its second the item;
+    // `#[m]` and `#[m()]` give the first no tokens.
+    check(
+        r#"
+
+macro_rules! my_attr {
+    attr($($prefix:ident)?) (fn $name:ident() {}) => { $(fn $prefix() {})? fn $name() {} };
+    attr(not $($tt:tt)*) ($($item:tt)*) => {};
+}
+
+#[my_attr(named)]
+fn plain() {}
+
+#[my_attr]
+fn bare() {}
+
+#[my_attr()]
+fn empty() {}
+
+#[my_attr(not used)]
+fn dropped() {}
+
+"#,
+        &expect![[r#"
+            crate
+            - bare : value
+            - empty : value
+            - named : value
+            - plain : value
+            - (legacy) my_attr : macro#
+        "#]],
+    );
+}
+
+#[test]
 fn macro_2_attr() {
     check(
         r#"
@@ -1994,8 +2030,7 @@ extern "C" {}
 /// (`Db::reload_included_file`) moves them.
 #[test]
 fn include_of_a_file_outside_every_source_root_is_read_from_disk() {
-    let dir = std::env::temp_dir().join(format!("blaze-include-outside-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("the temporary directory");
+    let dir = blaze_core::temp::TempDir::for_test("blaze-include-outside-");
     let code = dir.join("code.rs");
     std::fs::write(&code, "pub fn far() {}\npub mod inner { include!(\"nested.rs\"); }\n")
         .expect("code.rs");
@@ -2027,9 +2062,9 @@ include!({path:?});
     }
 
     std::fs::write(&code, "pub fn moved() {}\n").expect("code.rs");
-    assert!(db.reload_included_file(&at), "the file changed on disk");
+    assert!(db.reload_included_file(&at, &base_db::Looks::none()), "the file changed on disk");
     let dump = crate_def_map(&db, krate).dump(&db);
-    std::fs::remove_dir_all(&dir).expect("the temporary directory");
+    drop(dir);
     expect![[r#"
         crate
         - moved : value

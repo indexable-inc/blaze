@@ -1,0 +1,14 @@
+{
+ "id": "item-order-private",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of plan 12 E2c (rounds 3-4), int-1112",
+ "where": "crates/hir-def/src/item_tree.rs (top_level_items, block_item_tree_query), item_tree/persist.rs (ItemTreeRef::read), crates/blaze-diagnostics/src/lints/names/dead/defs.rs, crates/hir-def/src/item_tree/order.rs (body_items), crates/blaze-diagnostics/src/lints/names/uses.rs (resolve_in)",
+ "what": "dead code's numbering (defs.rs) walks the live syntax and calls vsema.to_def on every item because the only position-free source of an item's order and id, the item tree, keeps its order pub(crate) and has no public ModItemId -> interned id map. Its output order is the walk's (diagnostics are sorted only by phase), so a def-map port must reproduce source order exactly, which hir-def does not let a downstream crate read.",
+ "cost": "E2c step 1 (and so steps 2-4, which index its numbering) waited two rounds on hir-def's exports; the to_def calls of the numbering stayed on every check until round 3",
+ "cause": "hir-def exposes what an item is (ItemScope, signatures) but not where it stands among its siblings, so every pass that needs source order falls back to the live tree",
+ "class": "a position-free fact (item order) kept private, forcing callers onto the position-bound tree",
+ "prevention": "hir-def exports item order and the item-to-id map as public queries (handoff-12-E2c.md)",
+ "workaround": "none",
+ "fix": "exported (unbuilt): ItemTree::top_level_items/kind/nested_items, ModItemId::ast_id, ItemKind pub, item_tree::block_item_tree, ItemScope::items_by_ast(db) -> ItemsByAst::def_of_ast (read from the ids' locs, no persisted change), item_tree::body_items(db, DefWithBodyId) -> [BodyItem{block, item}] in source order (the order a block's own items take among its nested blocks'); dead/defs.rs ported onto them in round 3 (unbuilt): Defs::of numbers from file and block item trees, ItemsByAst, TraitItems/ImplItems, EnumVariants/VariantFields and body_items, Def.node became Defs::node, Id::Use(UseId), Parent::Anon((DefWithBodyId, ExprId)); the old syntax walk kept only as the test's reference (dead/defs/reference.rs, test the_numbering_equals_the_syntax_walk); round 4 (unbuilt): body_items no longer lists an inline asm!/naked_asm! (an ASM_EXPR with no global_asm token) as an item, which panicked on one in a block with no def map (test an_inline_asm_is_no_body_item); uses.rs's resolution moved into resolve_in over StorePaths {owner: ExpressionStoreOwnerId, infer: Option}, BodyPaths::resolve now a call of it, so a signature store's paths resolve through the same one home",
+ "state": "exports, dead/defs.rs port, the asm fix and resolve_in written, unbuilt; mark.rs signature walk over stores (step 2), body_marks (step 3), fold over replayed marks (step 4) open: /tmp/plan/12-E2c4-next.md"
+}

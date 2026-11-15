@@ -254,6 +254,20 @@ classified by `BodyFacts::classify`:
   entry names the part of section 3 that covers it (the body and its scopes by content, the def
   map by names, the owner's signature by owner, the crate's data by crate inputs).
 - **fact**: it stands for one fact of section 5; the fact goes into the shape.
+- **read through**: its value is a function of its own row's reads and of nothing else, and no
+  fact is keyed by its arguments (a type's layout, `layout_of_ty_query` and
+  `layout_of_adt_query`, keyed by a type and an environment whose interned ids are one
+  process's; and the derived tables a layout reads: a struct's flags, an enum's discriminants,
+  a `bits` struct's packing, a field's bit width, the plan's ranks of an ADT's fields). The store
+  brings the row up to date by its key (`blaze_query::db::refresh`, the engine's own verify,
+  which also gives the running query a read edge on it) and classifies the row's reads in its
+  place, through again where one is read through, down to covered reads, facts or refusals. So
+  a body's MIR that reads `size_of::<S>()` is traced as the facts that decide `S`'s layout (its
+  fields' types, its `#[repr]` in its `Attrs` fact, its variants and fields in its `Fields`
+  fact, each variant's discriminant as its `ConstValue`, the target, the build's field order
+  plan as `FieldOrder`), and no type is ever keyed. Cutoff is by those inputs, not by the
+  layout: a field's type edited to another of the same layout still misses. A row a store
+  answered, or one that cannot be brought up to date (a cycle through it), is refused by name.
 - **refused**: anything else. The result is not stored and the refusal is counted by query name
   (as the goal store's `inexpressible`). A refused body is inferred as it always is; nothing is
   answered another way.
@@ -449,7 +463,7 @@ rest is stated here as what remains.
 | signatures, generics and bounds, types' fields and layout attributes, visibility, re-exports, impls, attributes a check reads (`must_use`, `deprecated`) | every dependent | kept as text in the interface text |
 | exported macros' tokens | expansion in the dependent | kept as text |
 | bodies it instantiates, evaluates, inlines or types through: a type or const parameter (of the fn, its `impl`, its trait), `const`, `#[inline]`, `impl Trait`, `async`, a body that defines an item | check and codegen | kept as text (`blaze_lower::code::plain_body` refuses each) |
-| every other body | codegen only: its walk compiles or finds every instance it reaches, across crates | a unit that builds code is keyed by its dependencies' code text, deeply (`Narrowed::code`); only a unit that only checks is keyed by their interfaces (`Narrowed::checked`) |
+| every other body | a program's codegen and link: its walk compiles or finds every instance it reaches, across crates; an optimized library's inliner | a program's unit, and an optimized library's, is keyed by its dependencies' code text, deeply (`Narrowed::code`); a unit that only checks, and since 2026-11-12 a library built at `opt-level` 0, by their interfaces (`Narrowed::checked`, `Narrowed::built`: store.md, "Early cutoff between crates") |
 | cfg, features, edition, env, target, a build script's cfgs and `OUT_DIR` files | every dependent | the crate's settings (`Crate::content`) and files, in every identity |
 | what blaze's extensions prove over callee bodies (effects, contracts, `fn_info`'s code identity) | a check | a crate that names them, or depends on a workspace crate that does, takes and gives no interface |
 | a proc macro's, build script's or const macro crate's code | run by the dependent | its interface is its code |
@@ -474,8 +488,9 @@ keeps its text: it is an error, which a shape would hide.
 changed or removed at a line's end or after the last line; spaces before a line's end; blank
 lines at a file's end): no unit's key, in the edited crate itself or above it, so no unit, no
 codegen and no link runs. A plain body's edit that keeps its lines: no checking dependent's
-key. Any body edit: every unit that builds code above it, which then finds every function but
-the edited one in the store.
+key. A plain body's edit that keeps its lines: also no library built at `opt-level` 0 above it
+(2026-11-12, written, not yet run). Any body edit: every program above it, and every optimized
+library, which then finds every function but the edited one in the store.
 
 **What it does not, and why.**
 

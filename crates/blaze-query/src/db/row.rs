@@ -65,6 +65,9 @@ pub(crate) const HEAD: u32 = 1 << 4;
 pub(crate) const STALE: u32 = 1 << 5;
 /// `meta`: `extra` is the 64-bit hash of the value an eviction dropped.
 pub(crate) const HASHED: u32 = 1 << 6;
+/// `meta`: its last run was answered from a store by a key ([`super::report_stored_read`]):
+/// its edges are what the lookup read, fewer than the reads its value was first made from.
+pub(crate) const STORED: u32 = 1 << 7;
 
 /// A row's header: the same for every function, so the verify walk reads any row untyped.
 #[repr(C, align(8))]

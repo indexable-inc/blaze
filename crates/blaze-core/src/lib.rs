@@ -25,7 +25,7 @@
 //! the simulation with it, is safe Rust.
 
 #![deny(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 // `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
@@ -35,6 +35,7 @@
 // The seed's: WASI's positional reads and writes (`std::os::wasi::fs::FileExt`).
 #![cfg_attr(target_os = "wasi", feature(wasi_ext))]
 
+pub mod atomic;
 pub mod busy;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
@@ -45,6 +46,8 @@ pub mod cgroup;
 pub mod cores;
 pub mod create_process;
 pub mod decimal;
+mod descriptors;
+pub mod dgram;
 pub mod exit;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the fanotify driver: its system calls and the events it reads")]
@@ -56,6 +59,7 @@ pub mod fs;
 #[allow(unsafe_code, reason = "the FSEvents driver: CoreFoundation, FSEvents and dispatch calls")]
 mod fsevents;
 mod handoff;
+pub mod home;
 mod host;
 #[cfg(windows)]
 #[allow(unsafe_code, reason = "the IOCP driver: Win32 calls and the OVERLAPPEDs the kernel writes")]
@@ -75,7 +79,7 @@ mod process;
 /// ([`children::unreaped`]).
 #[cfg(unix)]
 pub mod children {
-    pub use crate::process::{State, Unreaped, Waiter, unreaped};
+    pub use crate::process::{State, Unreaped, Waiter, each_child, kill_listed, unreaped};
 }
 #[allow(
     unsafe_code,
@@ -83,8 +87,15 @@ pub mod children {
 )]
 mod raw;
 pub mod reaped;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    unsafe_code,
+    reason = "a file mapped shared as atomic words; its waits are blaze_core::wait::wait_shared's"
+)]
+pub mod shared;
 pub mod signal;
 pub mod sim;
+pub mod site;
 #[allow(
     unsafe_code,
     reason = "registered memory the drivers read into and write from by address, behind safe accessors"
@@ -92,6 +103,7 @@ pub mod sim;
 pub mod spans;
 mod sync;
 mod tags;
+pub mod temp;
 pub mod threads;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the io_uring driver: its mapped rings, buffers and system calls")]
@@ -102,12 +114,14 @@ pub mod utf8;
 mod watch;
 pub mod wait;
 pub mod wheel;
+pub mod world;
 
 use std::{fmt, time::Duration};
 
 pub use crate::journal::{
     Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp,
 };
+pub use crate::descriptors::Opens;
 pub use crate::spans::{DIRECT_ALIGN, Memory, Registered, Span, SpanRegion, Spans};
 pub use crate::tags::Tags;
 
@@ -247,6 +261,34 @@ impl fmt::Display for FileName {
     }
 }
 
+impl FileName {
+    /// The name as a path under `root`, the root of the driver that carries out its effects:
+    /// how a driver writes a name for a person. A core prints its names as they are, relative
+    /// to that root, which it does not know; where a core's message becomes one a person
+    /// reads, the driver writes each name through this.
+    pub fn under<'a>(&'a self, root: &'a std::path::Path) -> Under<'a> {
+        Under { name: self, root }
+    }
+}
+
+/// A [`FileName`] written as a path under a root ([`FileName::under`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Under<'a> {
+    name: &'a FileName,
+    root: &'a std::path::Path,
+}
+
+impl fmt::Display for Under<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.root.join(self.name.as_str()).display())
+    }
+}
+
+/// The most bytes one [`Effect::Prewarm`] asks the system to read ahead: what a program's last
+/// run held of its image is a few MiB to tens; a file held whole (one just written) is asked
+/// for up to this from its start, so no prewarm reads a large image from the disk whole.
+pub const PREWARM_MOST: u64 = 256 << 20;
+
 /// What an [`Effect::Clone`] whose source is a symbolic link fails with, after the source's
 /// name: a clone is made of a file, never through a link. Every driver says it the same, so an
 /// asker can tell this refusal (the name is something other than the file it made) from a file
@@ -318,6 +360,27 @@ pub enum Effect {
         priority: Priority,
         tag: Tag,
     },
+    /// Every part of `parts` read as [`Effect::ReadInto`] reads one, all through `cache` at
+    /// `priority`, asked as one submission and told as one completion: [`Done::ReadMany`], the
+    /// asker's `parts` handed back with each part's [`ReadPart::got`] set. A part that fails
+    /// fails alone, its error naming its file and offset; the others are read. The store's
+    /// direct reader asks a page's records this way (blaze_cas::direct).
+    ///
+    /// How each driver serves it, against the floor of one system call a batch: io_uring puts
+    /// every part on the ring in one submission (one `io_uring_enter`); the threads, kqueue and
+    /// IOCP drivers read it on one file thread, a run of parts of one file each adjacent to the
+    /// last (`at` where the last ended) as one `preadv` on Unix, on the file's kept descriptor
+    /// (no open after its first). The simulation reads each part as it reads a `ReadInto`.
+    ///
+    /// The asker's contract is [`Effect::ReadInto`]'s for every part's span, and no two parts'
+    /// spans overlap (the threads' `preadv` checks it, failing the run's parts, naming both
+    /// spans). `parts` is not empty, and its parts' `got` are [`Got::Asked`].
+    ReadMany {
+        parts: Vec<ReadPart>,
+        cache: Cache,
+        priority: Priority,
+        tag: Tag,
+    },
     /// The registered span `from` written at `at` of `file`, which exists, past its end making
     /// it longer; durable once a later [`Effect::Sync`] of the file completes. Completes with
     /// [`Done::Written`]. What [`Effect::ReadInto`] refuses of a span, this refuses too.
@@ -348,6 +411,25 @@ pub enum Effect {
     },
     /// Everything appended to the file before this was asked for is durable once it completes.
     Sync {
+        file: FileName,
+        tag: Tag,
+    },
+    /// Everything written to the file before this was asked for is ordered before every write
+    /// (to any file of its file system) asked for after this completes: a crash never keeps
+    /// one of those and loses any of these. It does not wait for the drive to keep them, so a
+    /// power failure right after may lose both; they are durable once any sync of the file
+    /// system that waits for the drive ([`Effect::Sync`], [`Effect::SyncDir`],
+    /// [`Effect::Write`], [`Effect::Rename`]) asked for after this completes has completed.
+    /// What a commit point needs of the bytes it names when losing the commit whole costs
+    /// only work: the bytes ordered before the name, at a fraction of a sync's wait.
+    ///
+    /// Apple's systems: `fcntl(F_BARRIERFSYNC)`, the file written out and a barrier sent to
+    /// the drive, with no flush of its cache (`F_FULLFSYNC`, which [`Effect::Sync`] is, waits
+    /// for that flush). Linux has no barrier without the flush: `fdatasync` (the ring's
+    /// `IORING_OP_FSYNC` with `IORING_FSYNC_DATASYNC`), the cheapest call that orders, which
+    /// is also durable. Elsewhere the data sync the system has. The file is made where it is
+    /// missing, as a sync makes it. Completes with [`Done::Ordered`].
+    Barrier {
         file: FileName,
         tag: Tag,
     },
@@ -490,6 +572,48 @@ pub enum Effect {
         to: FileName,
         tag: Tag,
     },
+    /// `to` made a file with `from`'s contents by a copy the kernel makes of `from`'s data
+    /// only: `to` is made new (it must not exist), given `from`'s length, and each extent of
+    /// `from` that holds data (`lseek` with `SEEK_DATA` and `SEEK_HOLE`) is copied at its own
+    /// offset (`copy_file_range` on Linux), so a hole of `from` stays a hole of `to` and no
+    /// byte passes through this process. For a file system that cannot share blocks (tmpfs,
+    /// ext4), where it stands in for [`Effect::Clone`] under a patched place: the new file
+    /// costs the data `from` holds, never its length. A new file's mode (0o666 less the
+    /// umask) and modified now, as a clone's. A symbolic link `from` is refused with
+    /// [`CLONE_THROUGH_A_LINK`], and what is no regular file with [`CLONE_OF_NO_FILE`]. `from`
+    /// is not to be written while this runs (the store's paths are replaced by rename, never
+    /// written in place). Completes with [`Done::Copied`], the data bytes the kernel copied;
+    /// a driver whose system has no such copy fails, naming that, and copies nothing through
+    /// memory instead.
+    CopyData {
+        from: FileName,
+        to: FileName,
+        tag: Tag,
+    },
+    /// The parts of `like` that the system's page cache holds are asked to be read into the
+    /// cache of `file`, which holds the same bytes there (a clone of it, [`Effect::Clone`]):
+    /// a clone shares its source's blocks and none of its cached pages, so the first run of a
+    /// program from a clone of its last image read from the disk every page the last run had
+    /// in memory (measured 2026-11-11 on APFS, hello world's 158 MB dev image: 755 pages in 93
+    /// runs, 30 to 45 ms of the first `exec`, against 4 ms for the file it was cloned from;
+    /// asked for those ranges first, 7 ms). The read is the system's own read-ahead and is not
+    /// waited for: the completion, [`Done::Prewarmed`], says how many bytes were asked for, and
+    /// comes once they are asked. Which pages `like` holds is read as the effect is carried
+    /// out, so it is asked before `like`'s name is given to another file. Only what lies in
+    /// `like`'s data extents is asked for (`lseek` `SEEK_DATA`/`SEEK_HOLE`): its holes are
+    /// the clone's, which read as zeros from no device (measured 2026-11-12 on xfs: a first
+    /// edit read ahead the whole 158 MB file, 134 MB of it two reserves of zeros). At most
+    /// [`PREWARM_MOST`] bytes are asked for, from the file's start. macOS: `mincore` of a
+    /// mapping of `like`, then `F_RDADVISE` a run; Linux: `mincore`, then
+    /// `posix_fadvise(WILLNEED)` a run; Windows asks for nothing and says 0 bytes (no call that
+    /// says which ranges of another file the cache holds is used there). A `like` that is not
+    /// there holds nothing, and 0 bytes are asked for (the first file placed at a path); a
+    /// `file` that is not there fails.
+    Prewarm {
+        like: FileName,
+        file: FileName,
+        tag: Tag,
+    },
     /// `to` made another name of `from`, for outputs nothing writes in place.
     Link {
         from: FileName,
@@ -539,6 +663,13 @@ pub enum Effect {
     /// completion of its own but the watch's end. A change that names `dir` itself says the
     /// directory may have been replaced or moved (inotify, which watches an inode, says so of
     /// an overflow too): a watcher that must hear of every later change watches again.
+    ///
+    /// The submit returns at once, whatever the tree's size: under inotify the start is a walk
+    /// of every directory under `dir`, which the drivers run off the thread that submits. A
+    /// watch is in place once a look under `dir` (a stat, a read, a listing, stamps), or an
+    /// [`Effect::Flush`] of it, asked after it is answered: such a look is held until the start
+    /// is done, so a change made after it is answered is heard. A change made before that may
+    /// go unheard; a watcher confirms its watch with a look or a flush before it relies on it.
     Watch {
         dir: FileName,
         tag: Tag,
@@ -589,15 +720,23 @@ pub enum Effect {
         after: Duration,
         tag: Tag,
     },
-    /// The whole file mapped read-only into memory, shared with every other mapping of it
-    /// (a pack of the store, the daemon's image). Completes with [`Done::Mapped`].
+    /// `extent` of the file mapped read-only into memory, shared with every other mapping of it
+    /// (a pack of the store, the daemon's image). Completes with [`Done::Mapped`], whose
+    /// [`Mapping::bytes`] are exactly the extent's. A range is mapped from its offset rounded
+    /// down to the system's mapping granularity (a page; 64 KiB on Windows), and
+    /// [`Mapping::slack`] says how many bytes before it that took; nothing past its end is
+    /// shown. A range that runs past the file's length fails, naming the file, the range and the
+    /// length.
     ///
-    /// The asker's contract: while any [`Mapping`] of the file lives, no effect writes,
-    /// appends to or truncates that file in place; it is replaced only by renaming another
-    /// file over it, as the store and the image do. An in-place write would change bytes under
-    /// a live `&[u8]`, and a truncate would fault on the next read of the pages cut.
+    /// The asker's contract: while any [`Mapping`] of the file lives, the file may be appended
+    /// to, but the bytes below the length it had when mapped are never written again, and it is
+    /// never truncated; it is replaced only by renaming another file over it, as the store and
+    /// the image do. A write below that length would change bytes under a live `&[u8]`, and a
+    /// truncate would fault on the next read of the pages cut. An append changes nothing a
+    /// mapping shows: its bytes are past every mapping made before it.
     Map {
         file: FileName,
+        extent: Extent,
         tag: Tag,
     },
     /// A process started as `command` says, in its sandbox; completes with [`Done::Exited`]
@@ -667,39 +806,57 @@ pub enum Effect {
     Pressure {
         tag: Tag,
     },
-    /// A UDP socket bound at `at` (port 0: one the system picks). Completes with
-    /// [`Done::Bound`] of the socket and the address it is bound at; an address another socket
-    /// has fails, naming it.
+    /// A UDP socket bound at `at` (port 0: one the system picks), v4 or v6 by `at`'s family,
+    /// set up as `options` asks. Completes with [`Done::Bound`] of the socket and the address it
+    /// is bound at; an address another socket has, or an option the system refuses, fails
+    /// naming it.
     Bind {
         at: std::net::SocketAddr,
+        options: dgram::Options,
         tag: Tag,
     },
-    /// `bytes` sent from `sock` to `to` as one datagram. Completes with [`Done::Sent`] of
-    /// `bytes` cleared, its capacity kept, once the system took it: not once it arrived, as a
-    /// datagram may be lost, duplicated or reordered on its way. More than [`DATAGRAM_MOST`]
-    /// bytes, a socket not bound, or a send the system refuses completes with [`Done::Broken`]
-    /// of `bytes` cleared, naming the socket's address and `to`.
+    /// Every datagram of `batch` sent from `sock`, each to its head's peer, in order: on Linux
+    /// one `sendmmsg` per [`dgram::BATCH_MOST`] runs, a run of several datagrams one
+    /// `UDP_SEGMENT` message; on macOS one `sendmsg_x`. Completes with
+    /// [`Done::SentDatagrams`] of `batch` cleared, its capacity kept, once the system took
+    /// every datagram: not once they arrived, as a datagram may be lost, duplicated or
+    /// reordered on its way. A batch [`dgram::Batch::refused`] refuses, a socket not bound, or
+    /// a send the system fails completes with [`Done::DatagramsFailed`] of `batch` as given,
+    /// naming the socket, the peer and the error number; what of it the system took before
+    /// the failure is sent.
     SendTo {
         sock: Dgram,
-        to: std::net::SocketAddr,
-        bytes: Vec<u8>,
+        batch: dgram::Batch,
         tag: Tag,
     },
-    /// The next datagram `sock` receives, and who sent it: completes with
-    /// [`Done::Datagram`], its bytes in `into` (cleared first, its capacity kept, grown once to
-    /// [`DATAGRAM_MOST`]), so an asker that hands each datagram's buffer to its next receive
-    /// allocates nothing once it has grown. Waits for as long as nothing comes; an
-    /// [`Effect::Unbind`] of the socket with it in flight ends it with [`Done::Broken`] of
-    /// `into` as given, naming the socket, as does a receive the system fails.
+    /// The next datagrams `sock` receives, at least one and as many as are there at once up to
+    /// `slots`: completes with [`Done::Datagrams`] of `into`, cleared first, its capacity kept
+    /// (its bytes grown once to `slots.most * slots.size`), so an asker that hands each batch
+    /// to its next receive allocates nothing once it has grown. On Linux one `recvmmsg`; on
+    /// macOS one `recvmsg_x`. Waits for as long as nothing comes; an [`Effect::Unbind`] of the
+    /// socket with it in flight ends it with [`Done::DatagramsFailed`] of `into`, naming the
+    /// socket, as do slots [`dgram::Slots::refused`] refuses and a receive the system fails.
     RecvFrom {
         sock: Dgram,
-        into: Vec<u8>,
+        into: dgram::Batch,
+        slots: dgram::Slots,
         tag: Tag,
     },
     /// `sock` closed: completes with [`Done::Unbound`], and each receive in flight on it ends
     /// as [`Effect::RecvFrom`] says. A socket not bound fails, naming it.
     Unbind {
         sock: Dgram,
+        tag: Tag,
+    },
+    /// The addresses `name` resolves to, each with `port`: completes with [`Done::Resolved`],
+    /// in the order the system gave them, or [`Done::Unresolved`] naming the name and why. A
+    /// name that is an address resolves to itself. Native drivers call `getaddrinfo` on a
+    /// thread of the host's, which fails the resolve once [`dgram::RESOLVE_WAIT`] passes; the
+    /// simulation answers from the names its test gave ([`sim::Sim::name`]). A name longer
+    /// than [`dgram::NAME_MOST`] or holding a NUL is refused naming it.
+    Resolve {
+        name: String,
+        port: u16,
         tag: Tag,
     },
     /// What the process's standard input holds next, at most `most` bytes and at most
@@ -750,7 +907,7 @@ pub enum Effect {
 }
 
 /// The most bytes one datagram of [`Effect::SendTo`] carries: UDP's most over IPv4 (65,535
-/// less its 8-byte header and IPv4's 20-byte one), which a receive's buffer is grown to.
+/// less its 8-byte header and IPv4's 20-byte one), which [`dgram::Slots::ONE`]'s slot is.
 pub const DATAGRAM_MOST: usize = 65_507;
 
 /// The most bytes one [`Effect::Random`] draws.
@@ -790,10 +947,12 @@ impl Effect {
             Effect::ReadAll { tag, .. }
             | Effect::Read { tag, .. }
             | Effect::ReadInto { tag, .. }
+            | Effect::ReadMany { tag, .. }
             | Effect::WriteFrom { tag, .. }
             | Effect::ReadLink { tag, .. }
             | Effect::Append { tag, .. }
             | Effect::Sync { tag, .. }
+            | Effect::Barrier { tag, .. }
             | Effect::WriteBack { tag, .. }
             | Effect::SyncDir { tag, .. }
             | Effect::Truncate { tag, .. }
@@ -808,6 +967,8 @@ impl Effect {
             | Effect::Private { tag, .. }
             | Effect::Times { tag, .. }
             | Effect::Clone { tag, .. }
+            | Effect::CopyData { tag, .. }
+            | Effect::Prewarm { tag, .. }
             | Effect::Link { tag, .. }
             | Effect::Stat { tag, .. }
             | Effect::Lstat { tag, .. }
@@ -835,6 +996,7 @@ impl Effect {
             | Effect::SendTo { tag, .. }
             | Effect::RecvFrom { tag, .. }
             | Effect::Unbind { tag, .. }
+            | Effect::Resolve { tag, .. }
             | Effect::ReadStdin { tag, .. }
             | Effect::WriteOut { tag, .. }
             | Effect::Now { tag }
@@ -868,6 +1030,46 @@ pub enum Priority {
     /// `IOPRIO_CLASS_IDLE` (honoured under `mq-deadline` and BFQ), macOS's `IOPOL_THROTTLE` on
     /// the thread that reads it. Windows has no per-read class: there it fails, naming why.
     Idle,
+}
+
+/// One part of an [`Effect::ReadMany`]: `into.len` bytes at `at` of `file` read into the
+/// registered span `into`, and how that went.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: as `Effect`'s, tests' logs
+pub struct ReadPart {
+    pub file: FileName,
+    pub at: u64,
+    pub into: Span,
+    /// [`Got::Asked`] as asked; set by the driver.
+    pub got: Got,
+}
+
+impl ReadPart {
+    /// A part asked: `into.len` bytes at `at` of `file`.
+    pub fn asked(file: FileName, at: u64, into: Span) -> ReadPart {
+        ReadPart { file, at, into, got: Got::Asked }
+    }
+}
+
+/// How one [`ReadPart`] went.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error's message, in tests' logs
+pub enum Got {
+    /// Not read yet: as the asker hands it in.
+    Asked,
+    /// How many bytes of its span were read, from its first: fewer than the span only at the
+    /// end of the file.
+    Read(u32),
+    /// Why it was not read, naming its file and offset (and [`ABANDONED_SPAN`] where its span
+    /// is the kernel's still). The batch's other parts are not failed by it.
+    Failed(IoError),
+}
+
+/// What of a file an [`Effect::Map`] maps.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Extent {
+    /// All of it, at the length it has as it is mapped.
+    Whole,
+    /// `len` bytes at `at`, which lie inside the file.
+    Range { at: u64, len: u64 },
 }
 
 /// How [`Effect::Lock`] takes a file's lock.
@@ -991,9 +1193,9 @@ pub struct Exit {
     pub peak_memory: u64,
 }
 
-/// A file mapped read-only by [`Effect::Map`]: its bytes, which stay as they are for as long
-/// as any clone of it lives (the store and the image only ever replace a file by renaming
-/// another over it, never write one in place).
+/// A file, or a range of one, mapped read-only by [`Effect::Map`]: its bytes, which stay as
+/// they are for as long as any clone of it lives (the store and the image only append to a file
+/// or replace it by renaming another over it, never write its bytes in place or cut it).
 #[derive(Clone)]
 pub struct Mapping(std::sync::Arc<Held>);
 
@@ -1018,10 +1220,32 @@ impl Mapping {
         Mapping(std::sync::Arc::new(Held::Copied(raw::Aligned::copy(bytes))))
     }
 
+    /// The file at `path` mapped read-only and shared, as [`Effect::Map`] maps one, for a
+    /// driver that maps outside a state machine (a shipped tree's texts, mapped once at a
+    /// daemon's first use of the tree). The contract is [`Effect::Map`]'s: while the mapping
+    /// lives the file may be appended to, but the bytes below the length it had when mapped are
+    /// never written again and it is never truncated; it is otherwise only ever replaced by
+    /// renaming another over it.
+    pub fn map_file(path: &std::path::Path) -> std::io::Result<Mapping> {
+        fs::map(path)
+    }
+
+    /// The bytes of the extent mapped, exactly: nothing before its offset, nothing past its
+    /// length.
     pub fn bytes(&self) -> &[u8] {
         match &*self.0 {
             Held::File(mapped) => mapped.bytes(),
             Held::Copied(copied) => copied.bytes(),
+        }
+    }
+
+    /// The bytes mapped before the first of [`Mapping::bytes`]: a range's offset past the
+    /// system's mapping granularity (`blaze_core::fs::granularity`), which the mapping holds in
+    /// memory too. 0 for a whole file and for bytes copied.
+    pub fn slack(&self) -> usize {
+        match &*self.0 {
+            Held::File(mapped) => mapped.slack(),
+            Held::Copied(_) => 0,
         }
     }
 
@@ -1117,8 +1341,13 @@ pub enum Done {
     ReadInto {
         len: u32,
     },
+    /// Of an [`Effect::ReadMany`]: its parts, each with how it went.
+    ReadMany(Vec<ReadPart>),
     Appended,
     Synced,
+    /// Of an [`Effect::Barrier`]: what was written to the file is ordered before what is
+    /// written after (not durably).
+    Ordered,
     /// Of an [`Effect::WriteBack`]: the file's data was written to its device (not durably).
     WrittenBack,
     Truncated,
@@ -1132,6 +1361,15 @@ pub enum Done {
     /// Of an [`Effect::Times`].
     Timed,
     Cloned,
+    /// Of an [`Effect::CopyData`]: the bytes of data the kernel copied, which is the source's
+    /// length less its holes.
+    Copied {
+        bytes: u64,
+    },
+    /// Of an [`Effect::Prewarm`]: the bytes of the file asked to be read ahead.
+    Prewarmed {
+        bytes: u64,
+    },
     Linked,
     Stat(Option<Meta>),
     Removed,
@@ -1191,13 +1429,23 @@ pub enum Done {
         sock: Dgram,
         local: std::net::SocketAddr,
     },
-    /// Of an [`Effect::RecvFrom`]: who sent the datagram, and its bytes in the receive's buffer.
-    Datagram {
-        from: std::net::SocketAddr,
-        bytes: Vec<u8>,
+    /// Of an [`Effect::RecvFrom`]: at least one datagram, each head saying who sent it.
+    Datagrams(dgram::Batch),
+    /// Of an [`Effect::SendTo`]: its batch, cleared, its capacity kept.
+    SentDatagrams(dgram::Batch),
+    /// An [`Effect::SendTo`] or [`Effect::RecvFrom`] that failed, and its batch back: a send's
+    /// as given, a receive's cleared. The error is boxed so that a completion stays the size
+    /// of a [`Done::Broken`].
+    DatagramsFailed {
+        batch: dgram::Batch,
+        error: Box<dgram::DgramError>,
     },
     /// Of an [`Effect::Unbind`].
     Unbound,
+    /// Of an [`Effect::Resolve`]: at least one address.
+    Resolved(Vec<std::net::SocketAddr>),
+    /// Of an [`Effect::Resolve`]: the name has no address, or the system could not say.
+    Unresolved(dgram::Unresolved),
     /// Of an [`Effect::Now`]: the time since the Unix epoch.
     Wall(Duration),
     /// Of an [`Effect::Random`]: its bytes.
@@ -1216,6 +1464,23 @@ impl Done {
         bytes.clear();
         // alloc: an error path.
         Done::Broken { buffer: bytes, error: IoError(error.to_string()) }
+    }
+
+    /// [`Done::DatagramsFailed`] of `batch` on `sock`, cleared where `clear` (a receive's).
+    pub(crate) fn dgram_failed(
+        mut batch: dgram::Batch,
+        clear: bool,
+        sock: Dgram,
+        local: Option<std::net::SocketAddr>,
+        peer: Option<std::net::SocketAddr>,
+        errno: Option<i32>,
+        why: impl fmt::Display,
+    ) -> Done {
+        if clear {
+            batch.clear();
+        }
+        let error = dgram::DgramError { sock, local, peer, errno, why: why.to_string() };
+        Done::DatagramsFailed { batch, error: Box::new_in(error, std::alloc::Global) }
     }
 
     /// [`Done::Broken`] of a receive's buffer `into`, as it was given.
@@ -1250,13 +1515,88 @@ pub trait Driver {
     /// Moves completions into `out`, waiting until `until` (on [`Driver::now`]'s clock) for
     /// the first if none is ready: [`wait::Deadline::PASSED`] only looks, and
     /// [`wait::Deadline::NEVER`] waits until one comes. An absolute deadline, never a length,
-    /// so no layer between the caller and the kernel restarts it (rule deadline-waits).
-    /// Returns how many it moved.
+    /// so no layer between the caller and the kernel restarts it (rule deadline-waits). With
+    /// nothing in flight it returns at once, unless a waker was handed out: the rule on
+    /// [`Driver::waker`]. Returns how many it moved.
     fn poll(&mut self, out: &mut Vec<Completion>, until: wait::Deadline) -> usize;
     /// How many effects were submitted and have not completed.
     fn in_flight(&self) -> usize;
     /// Monotonic time since the driver began.
     fn now(&self) -> Duration;
+    /// The wall clock now, in nanoseconds since the Unix epoch: the clock the driver's file
+    /// system stamps change times by, so what every racy question asks (a stamp within
+    /// `blaze_vfs::racy`'s window of this is not trusted). A native driver reads the system's
+    /// ([`system_wall_ns`]); the simulation reads its virtual clock from the seed's start
+    /// ([`sim::Sim::wall_start`]), the clock its disk stamps mtimes from, so a stamp taken
+    /// just after a write is racy there as on a real disk.
+    fn wall_ns(&self) -> u64;
+    /// A handle another thread ends this driver's wait with ([`Waker`]), where the driver has
+    /// one: what a thread that finished work the loop reads from a queue of its own (a plane
+    /// task's end) calls after it queued it, so the loop turns then and not at its next
+    /// deadline. `None` says the driver has none (the simulation unless a test asked it for one
+    /// with [`sim::Sim::give_wakers`]; a driver not yet given one): its caller then bounds its
+    /// wait by a deadline of its own and says so in the wait's name.
+    ///
+    /// The rule every driver with a waker keeps, the one place it is stated (the io_uring and
+    /// kqueue drivers point here, and each has a test `a_wake_ends_a_wait_parked_in_the_kernel`;
+    /// the simulation keeps it too, with another thread's wake an entry of its timeline,
+    /// [`sim::Sim::wake_at`], landing before the poll looks, between the look and the park, or
+    /// while it is parked, and `a_wake_ends_the_poll_wherever_it_lands` in `sim/wake.rs` its
+    /// test):
+    /// once a waker is handed out, a poll with nothing in flight parks until a wake or its
+    /// deadline; and a wake made at any point (before the poll, before it parks, while it is
+    /// parked in the kernel) ends that poll, or the next if none is under way. A driver keeps
+    /// whatever its wake writes to (an eventfd's read, a `kqueue` trigger) armed before every
+    /// wait in the kernel, never only while some other work is out.
+    fn waker(&self) -> Option<Waker> {
+        None
+    }
+}
+
+/// The system's wall clock now, in nanoseconds since the Unix epoch: what every native
+/// [`Driver::wall_ns`] reads, and what code that stamps the real disk outside a driver (a
+/// start's look at its own executable, before any loop) compares those stamps with. A
+/// question on a loop asks its driver instead, so a simulation answers it. A reading before
+/// the epoch is a clock no stamp can be compared with: it panics, naming the reading, as a
+/// window measured from it would trust every stamp.
+pub fn system_wall_ns() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        // A reading past 2554 saturates: every stamp is then within its window, none trusted.
+        Ok(since) => u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
+        Err(error) => panic!(
+            "the system's wall clock reads {:?} before the Unix epoch: no file's change time can be compared with it",
+            error.duration()
+        ),
+    }
+}
+
+/// Ends a [`Driver`]'s wait from any thread ([`Driver::waker`]): the poll under way, or the
+/// next one if none is, returns though no effect completed. Calls between two polls make one
+/// return. The order that loses no wake is the caller's half: queue what the loop is to read,
+/// then call [`Waker::wake`].
+#[derive(Clone)] // clone: a handle, once per thread pool that wakes the loop
+pub struct Waker(std::sync::Arc<dyn Wake>); // dyn: one call a task's end, to whichever driver the daemon runs on
+
+/// What a driver gives a [`Waker`]: its own way to end its wait.
+pub trait Wake: Send + Sync {
+    fn wake(&self);
+}
+
+impl Waker {
+    pub fn new(wake: std::sync::Arc<dyn Wake>) -> Waker {
+        Waker(wake)
+    }
+
+    /// Ends the driver's wait under way, or its next.
+    pub fn wake(&self) {
+        self.0.wake();
+    }
+}
+
+impl fmt::Debug for Waker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Waker")
+    }
 }
 
 /// How long [`run_until_idle`] waits, on the driver's clock, for its next completion before it

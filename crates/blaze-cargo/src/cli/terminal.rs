@@ -11,7 +11,7 @@ use blaze_report::terminal::{Config, Terminal};
 /// `[terminal]` of blaze's `config.toml`, its defaults where there is no file. A file that can't
 /// be read, or that says what `[terminal]` does not take, is an error naming it.
 pub fn config() -> Result<Config, String> {
-    let Some(home) = blaze_manifest::user_config::home() else {
+    let Ok(home) = blaze_manifest::user_config::home() else {
         return Ok(Config::DEFAULT);
     };
     let file = blaze_manifest::user_config::file(&home);

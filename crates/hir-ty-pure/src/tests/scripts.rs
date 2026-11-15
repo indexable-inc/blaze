@@ -651,7 +651,7 @@ fn same_parts(a: &str, b: &str, how: &str) {
     let parts = |crates: &str| {
         let (db, main) = script(crates);
         blaze_query::db::attach(&db, || {
-            let main_body = blaze_item_hash::identity::identity_parts(&db, main.into());
+            let main_body = blaze_item_hash::identity::early_parts(&db, main.into());
             (main_body, crate::walk::identity_parts(&db, main))
         })
     };
@@ -698,7 +698,7 @@ fn main()
     println!( "cargo:rerun-if-changed=build.rs" );
 }
 
-/// Writes `text` at `path`.
+// Writes `text` at `path`. (A doc comment is an attribute, part of the item's own text.)
 fn emit(path: &Path, text: &str)
 {
     fs::write(path, text).unwrap();

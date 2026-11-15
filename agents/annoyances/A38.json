@@ -8,5 +8,14 @@
  "cause": "commit 2476469518 (2026-11-10) added the new row and left the old one; nothing checks a table for two rows with the same first cells",
  "workaround": "merged into one true row",
  "fix": "the docs check refuses a table with two rows whose first two cells are equal",
- "state": "open"
+ "state": "prevention written on vacuous-1112 (83f6882263), not yet compiled",
+ "whys": [
+  "why wrong: two rows for one workflow and event, one after the other, said different things",
+  "why possible: a commit added the new row and left the old one",
+  "why not caught: the docs check holds links, anchors and paths, and reads no table",
+  "why easy: a table row is added by pasting a line; nothing says a key is already there",
+  "property: a table can hold two rows with one key"
+ ],
+ "class": "two answers to one question: one fact kept in two places with nothing that compares them (two rows of a table with one key; neighbours: A37's two answers to `which daemon`, a generated file and its source, a doc and the code). A neighbour of vacuous success: both pass a check that never looked",
+ "prevention": "scripts/src/bin/docs.rs `duplicate_rows`: `docs check` refuses a table of a current doc with two rows whose key cells are equal (the first two cells of a table of three columns or more, the first of a narrower one), naming the table and the key; a row with empty key cells continues the row above. A Python model of the rule refuses docs/harness.md as it stood before #2068 (line 680 = 679) and nothing in today's current docs; the Rust has unit tests with a control and is in the script's selftest (83f6882263). Not compiled and not run by the lane (write-only): the main agent's combined build and tests are the proof."
 }

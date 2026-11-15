@@ -3,7 +3,9 @@
 //! Every local lives in memory. Calls follow rustc's (unstable) Rust ABI so the
 //! output can be linked against rustc-compiled objects.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 // Unsafe code is in `llvm` (LLVM's C API) and `lent` alone (docs/v2/plan/design/unsafe.md).
 #![deny(unsafe_code)]
 
@@ -998,12 +1000,18 @@ const CHAINED: usize = 256;
 
 /// What tells compiled code from any other: equal for the same code however often an edit
 /// went away from it and came back, so that a patch holds what differs from its base alone.
+///
+/// It is an identity (equal prints are taken as equal code, with no compare after), so it is
+/// BLAKE3 under a domain, 128 bits kept (docs/v2/plan/design/caches.md, "Hash functions"):
+/// until 2026-11-12 it was SipHash-128 under a fixed public key, which is no identity.
 fn print_of(code: &impl std::hash::Hash) -> u128 {
-    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-    code.hash(&mut hasher);
-    let type_id::Fingerprint(low, high) = hasher.finish();
-    u128::from(low) | u128::from(high) << 64
+    let mut hasher = blaze_ids::Hasher::new(PRINT_DOMAIN);
+    code.hash(&mut blaze_hash::Blake3Hasher(&mut hasher));
+    hasher.finish().fingerprint().0
 }
+
+/// The domain of [`print_of`].
+const PRINT_DOMAIN: &str = "blaze v2 compiled code print 1";
 
 /// The print of the function's code. The database runs this again only when compiling gave
 /// something else, not each time it compiled.
@@ -1029,16 +1037,19 @@ type Row = (u32, base_db::FileId, u32, u32);
 
 /// The rows of the code of a non-generic function, in the order of [`Code::lines`].
 #[blaze_query::tracked(returns(ref))]
+#[blaze::renders_positions]
 fn root_rows(db: &Db, func: FunctionId) -> Vec<Row> {
     compiled_root(db, func).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
 /// The rows of the code of an instance, in the order of [`Code::lines`].
 #[blaze_query::tracked(returns(ref))]
+#[blaze::renders_positions]
 fn instance_rows(db: &Db, instance: Instance, env: StoredParamEnvAndCrate) -> Vec<Row> {
     compiled_instance(db, instance, env).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
+#[blaze::renders_positions]
 fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
     // alloc: empty, allocates nothing
     let Some(source) = &compiled.source else { return Vec::new() };
@@ -1767,16 +1778,26 @@ fn rustc_mir_opt_level(lang: bool, optimized: bool) -> MirOptLevel {
 /// inlined as rustc's `Inline::is_enabled` says at level 2 ([`rustc_inlines`]).
 fn mir_options_of(db: &Db, krate: Crate) -> Result<MirOptions> {
     let level = mir_opt_level_of(db, krate)?;
+    let lang = krate.data(db).origin.is_lang();
+    // The library's bodies as shipped (rustc's pipeline, no pass on facts); another crate's
+    // optimizing where its level is 2, else tier 0. v1 keeps the library inlined at every
+    // level, as it was; v2's `Build::options` decides per unit.
+    let tier = match (level, lang) {
+        (_, true) => hir_ty::facts::Tier::Shipped,
+        (MirOptLevel::Release, false) => hir_ty::facts::Tier::Optimizing,
+        (_, false) => hir_ty::facts::Tier::Zero,
+    };
     Ok(MirOptions {
         level,
         ub_checks: debug_assertions(db, krate),
         lifetime_markers: true,
-        inline: rustc_inlines(level, krate.data(db).origin.is_lang(), backend::optimizing()),
+        inline: rustc_inlines(level, lang, backend::optimizing()),
         // v1 knows nothing of the program its crates are linked into, so not what allocator
         // it has: no allocation moves to the stack.
         heap_to_stack: false,
         // Nor what trait objects it makes.
         world: None,
+        tier,
     })
 }
 
@@ -1840,6 +1861,12 @@ fn instance_body<'db>(
 /// coroutine's by the body it is written in), and the lowering error in words, which for a call
 /// with no function is the callee as written, where the call is and why it resolved to nothing,
 /// in the body it was met in (rule 19).
+#[expect(
+    blaze::reads_positions,
+    reason = "the codegen query words a lowering error, where the call is included, inside itself: the \
+              `CodegenError` must carry the `MirLowerError` and be worded by `blaze_items::lowering::write` at \
+              the edge"
+)]
 fn mir_failed(
     db: &Db,
     owner: MirOwner<'_>,
@@ -2055,6 +2082,11 @@ fn compiled_static(db: &Db, id: StaticId) -> Result<CompiledStatic> {
 /// it; or its value points to memory allocated while evaluating it; or it calls a function whose
 /// body blaze could not lower, which is named with where it was called. `None` for any other
 /// error.
+#[expect(
+    blaze::reads_positions,
+    reason = "the static's compile words a refused evaluation, where the refused call is included, inside the \
+              query: the `CodegenError` must carry the error and its span, worded at the edge"
+)]
 fn refused_const_eval(
     db: &Db,
     of: GeneralConstId<'_>,
@@ -2163,6 +2195,7 @@ fn refused_const_eval(
 /// macro is called only if the macro is another crate's or the compiler's, and of where the
 /// macro has it otherwise, as it is of what a macro writes of the code of `closure`, or of
 /// the body when there is none, where that is itself what the macro writes.
+#[blaze::renders_positions]
 fn row_location_in_file(
     db: &Db,
     owner: DefWithBodyId,
@@ -2213,6 +2246,7 @@ fn written_place(
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
 /// what a pointer to a `#[track_caller]` function reports as its caller, as rustc's shim does.
 #[blaze_query::tracked]
+#[blaze::renders_positions]
 fn declaration_location(db: &Db, func: FunctionId) -> Option<(base_db::FileId, u32, u32)> {
     let source = written_node(db, func.lookup(db));
     location_of(db, source.file_id, written_range(source.value))
@@ -2220,6 +2254,7 @@ fn declaration_location(db: &Db, func: FunctionId) -> Option<(base_db::FileId, u
 
 /// The node `loc` is written as, viewed in the tree the database keeps for its file: what
 /// `source(db)` is, with no handle made.
+#[blaze::renders_positions]
 fn written_node<'db>(db: &'db Db, loc: &impl HasSource) -> InFile<syntax::view::Node<'db>> {
     let InFile { file_id, value } = loc.ast_ptr(db);
     InFile::new(file_id, syntax::view::to_node(value.syntax_node_ptr(), file_id.root(db)))
@@ -2249,9 +2284,11 @@ pub fn exported_symbol(db: &Db, func: FunctionId) -> Option<String> {
 }
 
 /// Whether a function is `#[rustc_comptime]`: one the const evaluator alone runs, such as
-/// `TypeId::size` over the reflection intrinsics, of which rustc compiles no code.
+/// `TypeId::size` over the reflection intrinsics, of which rustc compiles no code. Nothing that
+/// runs calls one in a crate the check passed
+/// (`hir_ty_mir::mir::const_check::comptime::comptime_calls`).
 pub fn compile_time_only(db: &Db, func: FunctionId) -> bool {
-    AttrFlags::has_word(db, func.into(), "rustc_comptime")
+    hir_ty_mir::mir::const_check::comptime::is_comptime(db, func)
 }
 
 /// The refusal of `method` of the impl a builtin derive makes for `self_ty`, as `lookup_impl_method`
@@ -3434,6 +3471,10 @@ fn root_body<'db>(
     Ok((body, env))
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread relocation buffers reused from one function to the next, uncapped: they keep the most relocations one function had"
+)]
 thread_local! {
     /// The relocations of the function [`ObjectCodegen::define_code`] puts in the object, and
     /// those of them Cranelift is given: kept by the thread from one function to the next. A
@@ -3905,6 +3946,15 @@ struct SuspendedState {
     held: hir_ty_mir::mir::HeldLocals,
 }
 
+/// The bugs a test plants in the process caches of interned rows.
+#[cfg(test)]
+pub(crate) mod plant {
+    /// [`super::erase_regions`]' map is kept across a release of the interner's tables, as
+    /// before it kept the release it was filled under.
+    pub(crate) static KEEPS_ERASED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+}
+
 /// `args` with every lifetime but a bound one erased: lifetimes change nothing about the
 /// code, and the ones a caller passes on are its own parameters, which mean nothing in the
 /// callee. The fold is compile identity's ([`hir_ty_identity::instance::erased`]), which folds
@@ -3921,25 +3971,41 @@ pub(crate) fn erase_regions<'db>(
     use rustc_type_ir::TypeVisitableExt;
     /// How many are kept before they are let go, as each keeps its types interned.
     const KEPT: usize = 1 << 16;
+    /// The release of the interner's tables ([`hir_ty::evict::tables_released`]) the map was
+    /// filled under, and the map: a release frees the rows it names, and the next row interned
+    /// takes a freed one's number, so the map starts over when the count moved. A release runs
+    /// only while no task does, so this thread's first use after it sees the move.
+    type Erased = (u64, HashMap<StoredGenericArgs, StoredGenericArgs, Global>);
     thread_local! {
-        static ERASED: std::cell::RefCell<HashMap<StoredGenericArgs, StoredGenericArgs, Global>> =
-            std::cell::RefCell::default();
+        static ERASED: std::cell::RefCell<Erased> = std::cell::RefCell::default();
     }
     // Binders are anonymized too (`erased`), so a type with bound variables but no free region
     // is erased as well: `for<'a> fn(&'a u8)` and `for<'b> fn(&'b u8)` are one instance.
     if !args.has_type_flags(hir_ty_identity::instance::ERASES) {
         return args;
     }
+    let released = hir_ty::evict::tables_released();
     let key = args.store();
-    if let Some(known) = ERASED.with_borrow(|it| it.get(&key).map(|it| it.as_ref())) {
+    let known = ERASED.with_borrow_mut(|(under, map)| {
+        #[cfg(test)]
+        if plant::KEEPS_ERASED.load(std::sync::atomic::Ordering::Relaxed) {
+            *under = released;
+        }
+        if *under != released {
+            map.clear();
+            *under = released;
+        }
+        map.get(&key).map(|it| it.as_ref())
+    });
+    if let Some(known) = known {
         return known;
     }
     let erased = hir_ty_identity::instance::erased(interner, args);
-    ERASED.with_borrow_mut(|it| {
-        if it.len() >= KEPT {
-            it.clear();
+    ERASED.with_borrow_mut(|(_, map)| {
+        if map.len() >= KEPT {
+            map.clear();
         }
-        it.insert(key, erased.store());
+        map.insert(key, erased.store());
     });
     erased
 }
@@ -16849,6 +16915,24 @@ mod number_ranges {
 #[cfg(test)]
 mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
+
+    /// The invariant: a print is the first 128 bits of the BLAKE3 of the code's `Hash` under
+    /// `PRINT_DOMAIN`, the same in every process, and other code has another print. The
+    /// control is the hash it replaced: SipHash-128 of the same value is not the print.
+    #[test]
+    fn a_print_is_blake3_under_its_domain() {
+        use std::hash::Hash as _;
+        let code = (7u32, "body", [1u8, 2, 3]);
+        let mut hasher = blaze_ids::Hasher::new(super::PRINT_DOMAIN);
+        code.hash(&mut blaze_hash::Blake3Hasher(&mut hasher));
+        assert_eq!(super::print_of(&code), hasher.finish().fingerprint().0);
+        assert_eq!(super::print_of(&code), super::print_of(&(7u32, "body", [1u8, 2, 3])));
+        assert_ne!(super::print_of(&code), super::print_of(&(7u32, "body", [1u8, 2, 4])));
+        let mut sip = rustc_stable_hash::StableSipHasher128::new();
+        code.hash(&mut sip);
+        let super::type_id::Fingerprint(low, high) = sip.finish();
+        assert_ne!(super::print_of(&code), u128::from(low) | u128::from(high) << 64);
+    }
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
     /// core's two UB checks are known by their pre-interned symbols, however the name was

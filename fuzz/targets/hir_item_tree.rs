@@ -217,11 +217,12 @@ fn span(w: &mut Words, start: u32, end: u32) {
     }
 }
 
-/// A plain path of one segment.
+/// A plain path of one segment, without contexts (`ModPath::contexts` is `None`).
 fn plain(w: &mut Words, segment: &str) {
     w.u32(0);
     w.u32(1);
     w.name(segment);
+    w.u32(0);
 }
 
 /// `N` empty tables from `w.at()` on, and where each begins.
@@ -245,8 +246,8 @@ fn items() -> Valid {
     w.u32(1);
     plain(&mut w, "a");
     let vis = w.at();
-    // `Module(ModPath { Super(1), [] }, Explicit)`.
-    [1, 0, 1, 1, 0, 0].into_iter().for_each(|word| w.u32(word));
+    // `Module(ModPath { Super(1), [], no contexts }, Explicit, root context)`.
+    [1, 0, 1, 1, 0, 0, 0, ctx()].into_iter().for_each(|word| w.u32(word));
     let attrs = w.at();
     // `#[inline]`: its path, no input, its context.
     w.u32(1);

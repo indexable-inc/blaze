@@ -12,7 +12,7 @@ use std::{
     cell::{OnceCell, RefCell},
 };
 
-use base_db::{Db, EditionedFileId};
+use base_db::{Db, EditionedFileId, TargetKind};
 use blaze_diagnostics::model;
 use blaze_hash::{HashMap, HashSet};
 use cfg::{CfgAtom, CfgDiff, CfgExpr, CfgOptions};
@@ -80,6 +80,20 @@ pub fn check(
     name_of: NameOf<'_>,
 ) -> Result<Vec<Found>, diag::CheckError> {
     blaze_query::db::attach(db, || {
+        // A flag that names a lint no level waives, below `deny`, refuses the check: it is
+        // never read as if it had not been given.
+        for (name, level) in &setup.command_line.lints.opts {
+            let waived = !matches!(level, Level::Deny | Level::Forbid)
+                && blaze::UNWAIVABLE
+                    .iter()
+                    .any(|it| Target::of(name) == Some(Target::Blaze(it.bit())));
+            if waived {
+                return Err(diag::CheckError::Unwaivable {
+                    lint: name.clone(), // clone: the error's own copy
+                    level: crate::level::flag_of(*level).trim_start_matches("--").to_owned(), // alloc: an error's part
+                });
+            }
+        }
         let levels = Levels::new(&setup.command_line);
         let mut driver = Driver::new(db, krate, setup, name_of, lints::command_line_on(&levels));
         driver.run()?;
@@ -134,6 +148,17 @@ struct Driver<'q> {
     cfg: &'q CfgOptions,
     /// The crate's cfg without `test`, when it has `test`.
     without_test: Option<CfgOptions>,
+    /// Whether the crate is the `--test` build of a manifest target cargo also builds plain
+    /// (a library, a binary, an example), so an `#[expect]` the plain build also has is the
+    /// plain build's to judge, never this one's ([`Driver::plain_build_judges`]). Every
+    /// expectation has one judge: a lint that leaves a test build's production code unjudged
+    /// (`test_code::is_test_code`, `env_read`) or folds test bodies into its facts
+    /// (`untyped_index`) does not find in that code here what the plain build finds, so "what
+    /// it finds outside `cfg(test)` is what the plain build finds" (`serve.rs`) does not hold
+    /// for its expectations, and this build would call one unfulfilled that the plain build
+    /// sees fulfilled, which the person who gets it cannot fix. A stale one is still said by
+    /// every run that lints the plain build.
+    production_judged_plain: bool,
     name_of: NameOf<'q>,
     command_line: On,
     files: Vec<File<'q>>,
@@ -161,6 +186,16 @@ impl<'q> Driver<'q> {
             it.apply_diff(CfgDiff::new(Vec::new(), vec![test]));
             it
         });
+        let has_plain_build = match krate.base().data(db).manifest_kind {
+            // Built plain by cargo (a build script is never built with `--test` at all).
+            TargetKind::Lib { .. }
+            | TargetKind::Bin
+            | TargetKind::Example
+            | TargetKind::BuildScript => true,
+            // Built only with `--test`, or no cargo target: no other build judges its code.
+            TargetKind::Test | TargetKind::Bench | TargetKind::Other => false,
+        };
+        let production_judged_plain = without_test.is_some() && has_plain_build;
         let hits = setup.conf.profile.as_ref().map(|loaded| {
             // clone: the profile's settings and a refcount, once per crate
             query::profile_hits(db, krate.base(), query::ProfileKey::new(db, loaded.clone()))
@@ -172,6 +207,7 @@ impl<'q> Driver<'q> {
             conf: &setup.conf,
             cfg,
             without_test,
+            production_judged_plain,
             name_of,
             command_line,
             files: Vec::new(),
@@ -377,24 +413,7 @@ impl<'q> Driver<'q> {
     }
 
     fn sets_at(&self, file: usize, at: TextRange) -> (Vec<Set>, bool) {
-        let db = self.db;
-        let mut owners: Vec<(usize, ast::AnyHasAttrs<'q>)> = Vec::new();
-        let mut place = Some((file, at));
-        while let Some((file, at)) = place.take() {
-            let root = self.files[file].id.parse(db).root();
-            if root.text_range().contains_range(at) {
-                let start = match root.covering_element(at) {
-                    NodeOrToken::Node(it) => Some(it),
-                    NodeOrToken::Token(it) => it.parent(),
-                };
-                for node in start.into_iter().flat_map(|it| it.ancestors()) {
-                    if let Some(owner) = ast::AnyHasAttrs::cast(node) {
-                        owners.push((file, owner));
-                    }
-                }
-            }
-            place = self.files[file].declared;
-        }
+        let owners = self.owners_at(file, at);
         let mut sets = Vec::new();
         let mut test_only = false;
         for &(file, owner) in owners.iter().rev() {
@@ -418,6 +437,62 @@ impl<'q> Driver<'q> {
             }
         }
         (sets, test_only)
+    }
+
+    /// What has attributes around `at` of `file`, innermost first, each with its file: the
+    /// nodes of `file` that hold it, then the `mod` item declaring the file, and so on up.
+    fn owners_at(&self, file: usize, at: TextRange) -> Vec<(usize, ast::AnyHasAttrs<'q>)> {
+        let db = self.db;
+        let mut owners: Vec<(usize, ast::AnyHasAttrs<'q>)> = Vec::new();
+        let mut place = Some((file, at));
+        while let Some((file, at)) = place.take() {
+            let root = self.files[file].id.parse(db).root();
+            if root.text_range().contains_range(at) {
+                let start = match root.covering_element(at) {
+                    NodeOrToken::Node(it) => Some(it),
+                    NodeOrToken::Token(it) => it.parent(),
+                };
+                for node in start.into_iter().flat_map(|it| it.ancestors()) {
+                    if let Some(owner) = ast::AnyHasAttrs::cast(node) {
+                        owners.push((file, owner));
+                    }
+                }
+            }
+            place = self.files[file].declared;
+        }
+        owners
+    }
+
+    /// Whether `expectation` is the plain build's to judge, so this build says nothing of it:
+    /// an `#[expect]` the plain build of the same target also has is judged there alone
+    /// ([`Driver::production_judged_plain`]). The plain build has none of these, so this build
+    /// judges them: one in code only `cfg(test)` keeps (`test_only`, [`Driver::sets_at`]'s),
+    /// one on or in a `#[test]` function, and one written under `cfg_attr(test, ..)`, which
+    /// the attributes read without `test` do not hold.
+    fn plain_build_judges(&self, expectation: &Expectation, test_only: bool) -> bool {
+        let Some(without_test) = &self.without_test else { return false };
+        if !self.production_judged_plain || test_only {
+            return false;
+        }
+        let owners = self.owners_at(expectation.file, expectation.at);
+        let in_test_fn = owners.iter().any(|&(_, owner)| {
+            let mut test = false;
+            if ast::Fn::can_cast(owner.syntax().kind()) {
+                for_each_meta(self.cfg, owner.attrs(), |meta| {
+                    test |= meta.simple_name() == Some("test");
+                });
+            }
+            test
+        });
+        if in_test_fn {
+            return false;
+        }
+        owners.iter().any(|&(file, owner)| {
+            let name = &self.files[file].name;
+            lint_attrs(without_test, owner).iter().any(|it| {
+                matches!(it.level, Level::Expect) && Span::new(name, it.range) == expectation.span
+            })
+        })
     }
 
     /// The diagnostics of the lints found, at their levels, with what `#[expect]` was set for
@@ -505,6 +580,9 @@ impl<'q> Driver<'q> {
                 continue;
             }
             let (sets, test_only) = self.sets_at(expectation.file, expectation.at);
+            if self.plain_build_judges(&expectation, test_only) {
+                continue;
+            }
             let spec = levels.of(unfulfilled, &sets);
             if matches!(spec.level, Level::Allow | Level::Expect) {
                 continue;
@@ -623,7 +701,7 @@ pub(crate) fn plan_of(db: &Db, krate: base_db::Crate) -> Plan {
 }
 
 /// Where `def`'s body is in the file the driver names it by.
-fn body_at(db: &Db, def: DefWithBodyId) -> Option<BodyAt> {
+pub(crate) fn body_at(db: &Db, def: DefWithBodyId) -> Option<BodyAt> {
     let (file, offset, item) = match body_syntax(db, def) {
         Some(syntax) => {
             let file = syntax.file_id.file_id()?;
@@ -940,6 +1018,16 @@ impl<'q: 't, 't> Cx<'q, 't> {
         hir::Crate::from(self.krate)
     }
 
+    /// The body the query lints; `None` for the items of a file.
+    pub(crate) fn body_def(&self) -> Option<DefWithBodyId> {
+        self.def
+    }
+
+    /// The file the query's tree is written in.
+    pub(crate) fn file(&self) -> EditionedFileId {
+        self.base.file
+    }
+
     pub(crate) fn edition(&self) -> Edition {
         self.edition
     }
@@ -960,6 +1048,33 @@ impl<'q: 't, 't> Cx<'q, 't> {
     #[inline]
     pub(crate) fn on_blaze(&self, lint: blaze::Lint) -> bool {
         self.on.intersects(lint.bit())
+    }
+
+    /// Where the lint attributes on `node` name exactly `lint` at a level below `deny`
+    /// (`allow`, `expect`, `warn`), `cfg_attr`s expanded: each name's range in `node`'s tree,
+    /// with the level as written.
+    pub(crate) fn waivers(
+        &self,
+        node: ast::Node<'_>,
+        lint: blaze::Lint,
+    ) -> Vec<(TextRange, &'static str)> {
+        let Some(owner) = ast::AnyHasAttrs::cast(node) else { return Vec::new() };
+        if owner.attrs().next().is_none() {
+            return Vec::new();
+        }
+        lint_attrs(self.cfg, owner)
+            .into_iter()
+            .filter(|it| it.target == Target::Blaze(lint.bit()))
+            .filter_map(|it| {
+                let level = match it.level {
+                    Level::Allow => "allow",
+                    Level::Expect => "expect",
+                    Level::Warn | Level::ForceWarn => "warn",
+                    Level::Deny | Level::Forbid => return None,
+                };
+                Some((it.range, level))
+            })
+            .collect() // alloc: the waivers on one node, none in almost every crate
     }
 
     /// Whether the crate's root denies or forbids `lint` (`blaze::hot` counts for its lints)
@@ -1015,6 +1130,44 @@ impl<'q: 't, 't> Cx<'q, 't> {
         self.range(node)
     }
 
+    /// Where `node` is written in its file, as `hir`'s source maps give it: [`Cx::range`],
+    /// moved by where the anchor begins in a body's query, whose tree is the body's anchor
+    /// alone. Reads where the body is in the file, so a query that asks reruns when it moves:
+    /// ask only once a node is known to be compared with a source map's pointer.
+    pub(crate) fn file_range(&self, node: ast::Node<'_>) -> Option<TextRange> {
+        let range = self.range(node)?;
+        if !self.base.relative {
+            return Some(range);
+        }
+        Some(range + Body::anchor_offset(self.db, self.def?)?)
+    }
+
+    /// Where `range` of `file` (the walked file or an expansion) is written in the tree of
+    /// [`Cx::text`]: `None` for what a macro made up, or a range of another file. An argument
+    /// of a macro call is written where the call is, so a lint of expressions reaches it: the
+    /// invisible group a `$e:expr` fragment is spliced in, whose tokens carry the macro's
+    /// spans, is trimmed off its ends first.
+    pub(crate) fn written_range(&self, file: HirFileId, range: TextRange) -> Option<TextRange> {
+        let HirFileId::MacroFile(call) = file else { return Some(range) };
+        let map = &call.parse_macro_expansion(self.db).value.1;
+        // alloc: the spans of one expression of an expansion, few
+        let spans: Vec<_> = map.spans_for_range(range).collect();
+        let written = |span: &span::Span| span.ctx.is_root();
+        let start = spans.iter().position(written)?;
+        let end = spans.iter().rposition(written)?;
+        let inner = &spans[start..=end];
+        let first = inner[0];
+        if inner.iter().any(|it| it.anchor != first.anchor || it.ctx != first.ctx)
+            || first.anchor.file_id != self.base.file.span_file_id(self.db)
+        {
+            return None;
+        }
+        let low = inner.iter().map(|it| it.range.start()).min()?;
+        let high = inner.iter().map(|it| it.range.end()).max()?;
+        let anchor = self.base.ast_id_map.try_get_erased(first.anchor.ast_id)?;
+        Some(TextRange::new(low, high) + anchor.text_range().start())
+    }
+
     /// Where `token`, of the tree walked or of an expansion, is written in the tree of
     /// [`Cx::text`]; `None` for one a macro made up.
     pub(crate) fn token_range(&self, token: ast::Token<'_>) -> Option<TextRange> {
@@ -1031,6 +1184,12 @@ impl<'q: 't, 't> Cx<'q, 't> {
             Some(text) => Cow::Borrowed(text),
             None => Cow::Borrowed(node.text()),
         }
+    }
+
+    /// Whether the walk is of the crate's root file itself: not a body's, not another file's,
+    /// not an expansion's. Where a lint about the crate as a whole says its one finding.
+    pub(crate) fn at_crate_root(&self) -> bool {
+        self.def.is_none() && self.in_file() && self.base.file == self.krate.root_file_id(self.db)
     }
 
     /// Whether the walk is in the file's own tree, not in an expansion of a macro.
@@ -2122,7 +2281,7 @@ fn is_body_owner(node: ast::Node<'_>) -> bool {
 
 /// clippy's `is_cfg_test`: the `cfg`'s list has the word `test`, as `cfg(test)` and two `cfg`s
 /// one of which is `cfg(test)` do.
-fn names_test(cfg: &CfgExpr) -> bool {
+pub(crate) fn names_test(cfg: &CfgExpr) -> bool {
     let is_test =
         |it: &CfgExpr| matches!(it, CfgExpr::Atom(CfgAtom::Flag(it)) if *it == intern::sym::test);
     match cfg {

@@ -326,6 +326,10 @@ impl Store {
     }
 
     /// The number of a schema and producer pair, the same for every memo of it.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a memo's code is u32 and there is one per schema and producer pair, a few thousand in any build; 2^32 pairs would need a typed refusal here"
+    )]
     pub(crate) fn code(&self, schema: SchemaHash, producer: ContentId) -> u32 {
         let mut codes = self.codes.lock();
         if let Some(code) = codes.by.get(&(schema, producer)) {
@@ -339,13 +343,6 @@ impl Store {
 
     pub(crate) fn parts(&self, code: u32) -> (SchemaHash, ContentId) {
         self.codes.lock().all[code as usize]
-    }
-
-    /// Every code's schema and producer, indexed by code: for a pass over many memos, which
-    /// would otherwise take the codes' lock once a memo.
-    pub(crate) fn codes(&self) -> Vec<(SchemaHash, ContentId)> {
-        // clone: once per image write, a list of every schema and producer.
-        self.codes.lock().all.clone()
     }
 
     /// Above every memo ID handed out so far.
@@ -447,6 +444,10 @@ impl Store {
 
     /// The memo's word, from the row it names: `value` is 0, a row this thread just put, or a
     /// shared row it took a name on.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "MemoHot holds a memo's edge count in u32 and nothing caps the edges one query records: a query past 2^32 edges needs a typed refusal where its edges are pushed"
+    )]
     fn add(
         &self,
         key: QueryKey,
@@ -516,30 +517,6 @@ impl Store {
         let edges = self.edges.copy(EdgeRecord::as_bytes(edges), align_of::<EdgeRecord>());
         let task = blaze_reclaim::enter();
         let value = self.take_shared(&task, shared, fingerprint, value);
-        self.add(key, fingerprint, code, edges, value)
-    }
-
-    /// A memo of the image: its edges and value stay in the mapping.
-    ///
-    /// # Safety
-    ///
-    /// `edges` and the value's bytes are in a mapping kept, unchanged, as long as the store
-    /// lives ([`Span::mapped`]).
-    pub(crate) unsafe fn make_mapped(
-        &self,
-        key: QueryKey,
-        fingerprint: Fingerprint,
-        code: u32,
-        edges: &[EdgeRecord],
-        value: Option<(&[u8], ContentId)>,
-    ) -> MemoId {
-        // SAFETY: the caller's contract.
-        let edges = unsafe { Span::mapped(EdgeRecord::as_bytes(edges)) };
-        let value = value.map_or(0, |(bytes, id)| {
-            // SAFETY: as above.
-            let span = unsafe { Span::mapped(bytes) };
-            self.frees(|frees| self.put_value(frees, span, false, id, false))
-        });
         self.add(key, fingerprint, code, edges, value)
     }
 
@@ -998,7 +975,7 @@ impl Store {
     /// with `&mut`, no task reads the store.
     pub(crate) fn reclaim(&mut self, held: impl Fn(MemoId) -> bool) {
         let dying = std::mem::take(self.dying.get_mut());
-        // alloc: once a `&mut` reclaim (settle, or a driver's full free).
+        // alloc: once a `&mut` reclaim (`Database::reclaim`, a driver's full free).
         let pinned: Vec<MemoId> = self.pins.get_mut().keys().copied().collect();
         let mut keep = Dying::default();
         let all = dying
@@ -1036,6 +1013,10 @@ impl Store {
 
     /// A slot of `memos` (the newest last) and `key`: up to [`INLINE`] memos in the slot
     /// itself, more in a list copied into this thread's key segment.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a slot holds its memo count in u32 and the memos of one key are its revisions kept, far below 2^32; more would need a typed refusal here"
+    )]
     pub(crate) fn slot(&self, key: Option<Span>, memos: &[MemoId]) -> Slot {
         let len = u32::try_from(memos.len()).expect("2^32 memos of one key");
         if memos.len() <= INLINE {

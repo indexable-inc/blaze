@@ -816,12 +816,13 @@ struct Builder<'c, 'a, 'db> {
     scratch: Scratch<'a, 'db>,
 }
 
+/// The expressions of the body's store lowering made with no syntax of their own, as the
+/// store records them ([`ExpressionStore::is_synthesized`](hir_def::expr_store::ExpressionStore::is_synthesized)):
+/// a fact of the lowered body, read with it, and not of its source map, whose positions no
+/// verdict depends on and whose read would keep the check's trace out of the store.
 fn synthesized<'a>(ctx: &Ctx<'a, '_>) -> BitSet<'a> {
-    let exprs = ctx.store.expr_ids();
-    let mut out = bits(ctx.frame, exprs.len());
-    let InferBodyId::DefWithBodyId(def) = ctx.owner else { return out };
-    let source_map = hir_def::expr_store::Body::unmoved_source_map(ctx.db, def);
-    for expr in exprs.filter(|&expr| source_map.expr_syntax(expr).is_err()) {
+    let mut out = bits(ctx.frame, ctx.store.expr_count());
+    for &expr in ctx.store.synthesized_exprs() {
         out.insert(expr.into_raw().into_u32() as usize);
     }
     out
@@ -7778,13 +7779,46 @@ fn normalizes_to_error<'db>(ctx: &Ctx<'_, 'db>, tys: impl IntoIterator<Item = Ty
             }
             _ => Region::new_static(interner),
         });
-        !ty.references_error()
-            && ctx.infcx.probe(|_| {
-                ObligationCtxt::new(&ctx.infcx)
-                    .deeply_normalize(&ObligationCause::dummy(), ctx.env, ty)
-                    .is_ok_and(|it| it.references_error())
-            })
+        if ty.references_error() {
+            return false;
+        }
+        // A type with no inference variable is asked of the query, as `is_copy` asks: the
+        // solver's reads are the query's, which a kept trace reads through, and the answer is
+        // the same in every body of the environment.
+        if !ty.has_non_region_infer() {
+            let env = hir_ty::ParamEnvAndCrate { param_env: ctx.env, krate: ctx.krate };
+            return *normalizes_to_error_query(ctx.db, env.store(), ty.store());
+        }
+        ctx.infcx.probe(|_| {
+            ObligationCtxt::new(&ctx.infcx)
+                .deeply_normalize(&ObligationCause::dummy(), ctx.env, ty)
+                .is_ok_and(|it| it.references_error())
+        })
     })
+}
+
+/// Whether `ty`, its regions `'static` but those bound in it, has an error type in it once
+/// deeply normalized in `env`: [`normalizes_to_error`] as a query, as `is_copy_query` is, so
+/// it is asked once per environment and its solver reads are its own.
+#[blaze_query::tracked]
+fn normalizes_to_error_query(
+    db: &Db,
+    env: hir_ty::traits::StoredParamEnvAndCrate,
+    ty: StoredTy,
+) -> bool {
+    use hir_ty::next_solver::{
+        DbInterner, TypingMode,
+        infer::{DbInternerInferExt as _, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    use rustc_type_ir::TypeVisitableExt as _;
+    let env = env.as_ref(db);
+    let interner = DbInterner::new_with(db, env.krate).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
+    ObligationCtxt::new(&infcx)
+        .deeply_normalize(&ObligationCause::dummy(), env.param_env, ty.as_ref())
+        .is_ok_and(|it| it.references_error())
 }
 
 fn normalize_impl<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, allow_fresh: bool) -> Option<Ty<'db>> {

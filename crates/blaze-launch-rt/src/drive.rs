@@ -12,7 +12,7 @@
 //! | `Slot` | one atomic store of an address to the slot's word (and, for a slot being declared, its stub's code first) |
 //! | `Commit` | one atomic store of 1 to the gate's flag |
 //! | `Epoch` | one atomic store to the published epoch |
-//! | `Forget` | nothing yet: no unwind or symbol entry is kept until step 3 of launcher.md |
+//! | `Forget` | tells [`Records::forget`], which takes back the range's unwind entry and name |
 //! | `Decommit` | gives the pages' memory back (`sys::Code::decommit`) |
 //!
 //! An edit is the core's transaction ([`Driver::edit`]): staged, filled, committed; a failure
@@ -36,29 +36,65 @@
 use core::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use blaze_launch::image::Image;
 use blaze_launch::wire;
 use blaze_launch::{
     Committed, Edit, Frame, KEPT, Kept, Launch, Placed, Slot, Target, Txn, Write,
 };
-use crossbeam_channel::Receiver;
 
 use crate::arch::{self, GATE_ALIGN, GATE_ENTRY, GATE_HEAD, OutOfReach, STUB, STUB_HEAD, THUNK};
 use crate::sys::{self, Code, SysError};
 use crate::table::{Event, Shared, Told};
 
-/// Where a bind's code comes from: the store's records, to the launcher. Step 3 of
-/// launcher.md makes the one that reads the store's directory, applies a record's fixups and
-/// checks its content id; a test has its bytes in a table.
+/// Where a bind's code comes from: the daemon's records, to the launcher.
+/// [`crate::records::Loaded`] is the one a program runs on: it keeps the records the daemon
+/// sends, checks each against its id, places a record's data and statics in memory of its
+/// own and writes the code against them (`blaze_launch::place`). A test of the stores alone
+/// has its bytes in a table.
 pub trait Records {
-    /// The daemon's [`wire::Tell::Welcome`]: where the store is and how long the statics'
-    /// initial image is.
-    fn open(&mut self, store: &str, statics: u64) -> Result<(), String>;
+    /// The daemon's [`wire::Tell::Record`]: the bytes of the record `id`, kept until the
+    /// next edit or definition of statics was carried out. A refusal says why.
+    fn record(&mut self, id: wire::RecordId, bytes: &[u8]) -> Result<(), String>;
+
+    /// The daemon's [`wire::Tell::Statics`]: gives each static its memory, then its initial
+    /// value. `place` has no `at`: a static's value holds only absolute addresses.
+    fn statics(&mut self, defs: &[wire::StaticDef<'_>], place: Place) -> Result<(), String>;
 
     /// Clears `into` and fills it with the code of `bind` as it must be at `place`: exactly
     /// `bind.len` bytes, its fixups applied, checked against `bind.record`. A refusal says
     /// which record and why.
-    fn code(&mut self, bind: &wire::Bind, place: Place, into: &mut Vec<u8>)
-    -> Result<(), String>;
+    fn code(
+        &mut self,
+        bind: &wire::Bind<'_>,
+        place: Place,
+        into: &mut Vec<u8>,
+    ) -> Result<(), String>;
+
+    /// The code [`Records::code`] gave for the range that begins at address `at` is where a
+    /// thread can run it: its unwind entry and its name are told to whoever asks for them.
+    fn placed(&mut self, at: u64, len: u64) -> Result<(), String>;
+
+    /// The range that begins at address `at` is freed: no thread is or will be in it. What
+    /// [`Records::placed`] told of it is taken back.
+    fn forget(&mut self, at: u64);
+
+    /// The message that named the records given so far was carried out, or failed: they are
+    /// let go. The daemon gives a record again before each message that names it.
+    fn release(&mut self);
+
+    /// The address of static `number`, when it is defined and is no thread-local.
+    fn static_at(&self, number: u32) -> Option<usize>;
+
+    /// The daemon's [`wire::Tell::Image`], for records that hold nothing yet: takes the
+    /// image's data, statics, thread-locals and outside symbols as its own, moves the
+    /// image's addresses to this process's ([`Image::rebase`]: `place` gives the code
+    /// mapping's, `area` the address of the code area's first byte) and keeps what it knows
+    /// of each body, as [`Records::code`] does of one. The image's code is then what the
+    /// driver copies into the area. Refused by records that are a test's table.
+    fn image(&mut self, image: &mut Image, place: Place, area: u64) -> Result<(), String> {
+        let _ = (image, place, area);
+        Err("these records take no image of placed code".to_owned()) // alloc: an error
+    }
 }
 
 /// Where a bind's code goes, and the addresses its fixups name.
@@ -70,17 +106,21 @@ pub struct Place {
     pub words: u64,
     /// The address of slot 0's entry thunk.
     pub thunks: u64,
+    /// How many slots are declared: a word and a thunk exist for each below it.
+    pub slots: u32,
 }
 
 impl Place {
-    /// The address of `slot`'s word: what a call of the function loads.
-    pub fn word(&self, slot: Slot) -> u64 {
-        self.words + u64::from(slot.0) * 8
+    /// The address of `slot`'s word: what a call of the function loads. `None` for a slot
+    /// that is not declared.
+    pub fn word(&self, slot: Slot) -> Option<u64> {
+        (slot.0 < self.slots).then(|| self.words + u64::from(slot.0) * 8)
     }
 
-    /// The address of `slot`'s entry thunk: what the function's address is.
-    pub fn thunk(&self, slot: Slot) -> u64 {
-        self.thunks + u64::from(slot.0) * THUNK as u64
+    /// The address of `slot`'s entry thunk: what the function's address is. `None` for a
+    /// slot that is not declared.
+    pub fn thunk(&self, slot: Slot) -> Option<u64> {
+        (slot.0 < self.slots).then(|| self.thunks + u64::from(slot.0) * THUNK as u64)
     }
 }
 
@@ -119,6 +159,8 @@ pub enum Error {
     Write { during: &'static str, write: Write },
     /// An event only a control thread serves arrived where there is none.
     Unserved { what: &'static str },
+    /// An image of placed code this launcher cannot take, and why.
+    Image { why: String },
 }
 
 impl core::fmt::Display for Error {
@@ -141,6 +183,7 @@ impl core::fmt::Display for Error {
             Error::Unserved { what } => {
                 write!(f, "{what} arrived and no control thread is running to serve it")
             }
+            Error::Image { why } => write!(f, "the daemon's image of placed code: {why}"),
         }
     }
 }
@@ -197,7 +240,6 @@ pub struct Driver {
     /// The offset in the mapping of the code area's offset 0.
     area: usize,
     shared: Arc<Shared>,
-    inbox: Receiver<Event>,
     /// The writes of the core's last call.
     out: Vec<Write, Kept>,
     /// The staged edit's binds, as the core takes them.
@@ -238,14 +280,12 @@ impl Driver {
         }
         let mut code = Code::map(whole as usize)?;
         let base = code.base();
-        let (send, inbox) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared::new(
             config.slots,
             base,
             base + stubs,
             base + thunks,
             base + area..base + whole as usize,
-            send,
         ));
         // The stubs hand this pointer to `table::resolve` for as long as the process runs
         // code: one count of the `Arc` is leaked for it, so it never dangles, whatever
@@ -260,7 +300,6 @@ impl Driver {
             thunks,
             area,
             shared,
-            inbox,
             out: Vec::new_in(KEPT),
             binds: Vec::new(),
             scratch: Vec::new(),
@@ -332,7 +371,7 @@ impl Driver {
         }
         let at = self.thunks + first.0 as usize * THUNK;
         self.code.write(at, &self.scratch)?;
-        self.switch("declare")?;
+        self.switch("declare", &mut Nothing)?;
         Ok(first)
     }
 
@@ -341,7 +380,7 @@ impl Driver {
     pub fn edit(
         &mut self,
         txn: Txn,
-        binds: &[wire::Bind],
+        binds: &[wire::Bind<'_>],
         together: bool,
         records: &mut dyn Records,
     ) -> Result<Committed, EditError> {
@@ -361,7 +400,7 @@ impl Driver {
             // Nothing names what was staged: give it up, and free what was handed out.
             self.out.clear();
             let undone = match self.core.abort(txn, &mut self.out) {
-                Ok(()) => self.switch("abort"),
+                Ok(()) => self.switch("abort", records),
                 Err(core) => Err(Error::Core(core)),
             };
             return Err(match undone {
@@ -374,26 +413,119 @@ impl Driver {
             Ok(committed) => committed,
             Err(core) => return Err(EditError::Broken(Error::Core(core))),
         };
-        self.switch("commit").map_err(EditError::Broken)?;
+        self.switch("commit", records).map_err(EditError::Broken)?;
         Ok(committed)
+    }
+
+    /// A launcher's whole start from an image of placed code (`blaze_launch::image`), for a
+    /// driver that has declared and placed nothing: declares the image's slots, has
+    /// `records` take its data and move its addresses to this process's, checks that the
+    /// core hands each body the range the image has it at, copies the code in with one
+    /// write, and commits as an edit of every body does. Gives the address of the entry's
+    /// thunk and of each initializer static.
+    ///
+    /// What is checked before a byte is used: the image is for this instruction set, system
+    /// and page size; the table's and the area's offsets in the mapping are this driver's;
+    /// every range is the core's. A failure leaves the process with no program to run, and
+    /// says why (rule `no-fallback`): the daemon made the image for this launcher.
+    pub fn image(&mut self, mut image: Image, records: &mut dyn Records) -> Result<(usize, Vec<usize>), Error> {
+        let refuse = |why: String| Error::Image { why };
+        let page = sys::page()?;
+        if self.core.declared() != 0 {
+            return Err(refuse(format!("{} slots are declared already: an image is a launcher's start", self.core.declared())));
+        }
+        #[cfg(target_arch = "aarch64")]
+        let arch = wire::Arch::Aarch64;
+        #[cfg(target_arch = "x86_64")]
+        let arch = wire::Arch::X86_64;
+        #[cfg(target_os = "macos")]
+        let os = wire::Os::Macos;
+        #[cfg(target_os = "linux")]
+        let os = wire::Os::Linux;
+        if (image.arch, image.os, image.page) != (arch, os, page as u64) {
+            return Err(refuse(format!(
+                "made for {:?} on {:?} in pages of {}, and this launcher is {arch:?} on {os:?} in pages of {page}",
+                image.arch, image.os, image.page
+            )));
+        }
+        let geometry = image.geometry;
+        if (geometry.thunks, geometry.thunk, geometry.area) != (self.thunks as u64, THUNK as u64, self.area as u64) {
+            return Err(refuse(format!(
+                "made for a mapping whose thunks are at {} ({} bytes each) and whose area is at \
+                 {}, and this launcher's are at {} ({THUNK} bytes each) and {}",
+                geometry.thunks, geometry.thunk, geometry.area, self.thunks, self.area
+            )));
+        }
+        self.declare(image.slots)?;
+        let base = self.base() as u64;
+        records.image(&mut image, self.place(), base).map_err(refuse)?;
+        if !image.bodies.is_empty() {
+            // The image's own transaction: the daemon numbers its edits from 1.
+            let txn = Txn(0);
+            self.binds.clear();
+            self.binds.extend(image.bodies.iter().map(|body| blaze_launch::Bind {
+                slot: body.slot,
+                len: body.len,
+                align: u64::from(body.align),
+                tier: body.tier,
+                code: body.code,
+            }));
+            self.out.clear();
+            self.core.stage(&Edit { txn, binds: &self.binds, together: false }, &mut self.out)?;
+            for write in self.out.iter() {
+                let Write::Place { bind, range } = *write else {
+                    return Err(Error::Write { during: "stage of an image", write: *write });
+                };
+                let body = &image.bodies[bind as usize];
+                if (range.at, range.len) != (body.at, body.len) {
+                    return Err(refuse(format!(
+                        "`{}` is at {} of the area in the image ({} bytes), and this launcher's \
+                         core puts it at {} ({} bytes)",
+                        body.name, body.at, body.len, range.at, range.len
+                    )));
+                }
+            }
+            // One write of every body, none of which a word names yet, and one barrier.
+            self.code.copy(self.area, &image.area)?;
+            self.code.settle()?;
+            for body in &image.bodies {
+                records.placed(base + body.at, body.len).map_err(refuse)?;
+            }
+            self.out.clear();
+            self.core.commit(txn, &mut self.out)?;
+            self.switch("commit of an image", records)?;
+        }
+        let Some(entry) = self.thunk(image.entry) else {
+            return Err(refuse(format!("its entry is slot {}, which is not declared", image.entry.0)));
+        };
+        // alloc: the addresses of the program's initializer statics, once a process
+        let mut inits = Vec::with_capacity(image.inits.len());
+        for number in &image.inits {
+            match records.static_at(*number) {
+                Some(address) => inits.push(address),
+                None => return Err(refuse(format!("static {number} is an initializer and has no address here"))),
+            }
+        }
+        Ok((entry, inits))
     }
 
     /// Carries out the writes of a `stage`: code and gates into ranges nothing names.
     fn fill(
         &mut self,
         txn: Txn,
-        binds: &[wire::Bind],
+        binds: &[wire::Bind<'_>],
         records: &mut dyn Records,
     ) -> Result<(), Error> {
         let base = self.base() as u64;
         let words = self.code.base() as u64;
         let thunks = (self.code.base() + self.thunks) as u64;
+        let slots = self.core.declared();
         for index in 0..self.out.len() {
             match self.out[index] {
                 Write::Place { bind, range } => {
                     let bind = &binds[bind as usize];
                     let slot = bind.slot;
-                    let place = Place { at: base + range.at, words, thunks };
+                    let place = Place { at: base + range.at, words, thunks, slots };
                     self.scratch.clear();
                     records
                         .code(bind, place, &mut self.scratch)
@@ -402,13 +534,16 @@ impl Driver {
                     if got != range.len {
                         return Err(Error::Length { txn, slot, said: range.len, got });
                     }
-                    self.code.write(self.area + range.at as usize, &self.scratch)?;
+                    self.code.copy(self.area + range.at as usize, &self.scratch)?;
+                    records
+                        .placed(base + range.at, range.len)
+                        .map_err(|why| Error::Record { txn, slot, why })?;
                 }
                 // The flag, clear. The area's offsets are never used twice, so the bytes are
                 // the zeroes the mapping began with; they are written all the same, so the
                 // gate does not rest on that.
                 Write::Gate { range, .. } => {
-                    self.code.write(self.area + range.at as usize, &[0; 8])?;
+                    self.code.copy(self.area + range.at as usize, &[0; 8])?;
                 }
                 Write::GateEntry { gate, entry, old, new } => {
                     let offset = gate.at + GATE_HEAD + u64::from(entry) * GATE_ENTRY;
@@ -416,7 +551,7 @@ impl Driver {
                     let old = self.address(slot, old) as u64;
                     let code = arch::gate_entry(base + offset, base + gate.at, old, base + new.at)
                         .map_err(Error::Reach)?;
-                    self.code.write(self.area + offset as usize, &code)?;
+                    self.code.copy(self.area + offset as usize, &code)?;
                 }
                 write @ (Write::Slot { .. }
                 | Write::Commit { .. }
@@ -427,12 +562,14 @@ impl Driver {
                 }
             }
         }
+        // Once for the whole edit, before the commit stores a word that names any of it.
+        self.code.settle()?;
         Ok(())
     }
 
     /// Carries out the writes of a `declare`, a `commit`, an `abort` or a `collect`, in the
     /// order given: the stores a running thread can see, and what is freed.
-    fn switch(&mut self, during: &'static str) -> Result<(), Error> {
+    fn switch(&mut self, during: &'static str, records: &mut dyn Records) -> Result<(), Error> {
         for index in 0..self.out.len() {
             match self.out[index] {
                 // The word is 8 bytes times the slot into the mapping; a slot past the table
@@ -446,9 +583,9 @@ impl Driver {
                 }
                 Write::Commit { gate } => self.code.store(self.area + gate.at as usize, 1)?,
                 Write::Epoch { epoch } => self.shared.epoch.store(epoch, Ordering::SeqCst),
-                // No unwind or symbol entry is kept yet (launcher.md, step 3): nothing to
-                // take back.
-                Write::Forget { .. } => {}
+                // Its unwind entry and its name go: no thread is in it, so no unwinder or
+                // backtrace can ask for them any more.
+                Write::Forget { range } => records.forget(self.base() as u64 + range.at),
                 Write::Decommit { range } => {
                     self.code.decommit(self.area + range.at as usize, range.len as usize)?;
                     self.decommitted += range.len;
@@ -477,31 +614,41 @@ impl Driver {
 
     /// The next event, when one is there.
     pub fn ready(&self) -> Option<Event> {
-        self.inbox.try_recv().ok()
+        self.shared.next()
     }
 
-    /// The next event: the control thread's one wait while it has nothing to do, for a
-    /// thread's report, a stub's need, a frame from the daemon or the word to stop. It has
-    /// no bound: an idle launcher waits as long as its program runs. The queue cannot
-    /// disconnect while `self` lives (its `Shared` holds a sender); were it to, that is the
-    /// word to stop.
+    /// The next event: the control thread's one wait while it has nothing to do
+    /// (`Shared::wait`).
     pub fn wait(&self) -> Event {
-        self.inbox.recv().unwrap_or(Event::Stop)
+        self.shared.wait()
     }
 
     /// Frees every batch every thread cleared, and gives how many. Every birth announced
     /// before this call must have been given to [`Driver::told`] first: [`Driver::settle`]
     /// and the control thread's loop both drain the queue before they collect.
-    pub fn collect(&mut self) -> Result<usize, Error> {
+    pub fn collect(&mut self, records: &mut dyn Records) -> Result<usize, Error> {
         self.out.clear();
         let freed = self.core.collect(&mut self.out);
-        self.switch("collect")?;
+        self.switch("collect", records)?;
         Ok(freed)
+    }
+
+    /// The addresses a record's fixups name, for what is placed outside the code area (a
+    /// static's value): the words and the thunks, and no address of its own.
+    pub fn place(&self) -> Place {
+        let base = self.code.base();
+        let slots = self.core.declared();
+        Place { at: 0, words: base as u64, thunks: (base + self.thunks) as u64, slots }
+    }
+
+    /// The address of `slot`'s entry thunk: the function's address.
+    pub fn thunk(&self, slot: Slot) -> Option<usize> {
+        self.shared.thunk(slot)
     }
 
     /// For a driver with no control thread (a test that is its own): gives the core every
     /// thread event that is ready, then collects. Any other event is refused by name.
-    pub fn settle(&mut self) -> Result<usize, Error> {
+    pub fn settle(&mut self, records: &mut dyn Records) -> Result<usize, Error> {
         while let Some(event) = self.ready() {
             match event {
                 Event::Thread(told) => self.told(told)?,
@@ -511,6 +658,36 @@ impl Driver {
                 Event::Stop => return Err(Error::Unserved { what: "the word to stop" }),
             }
         }
-        self.collect()
+        self.collect(records)
+    }
+}
+
+/// The records of a call that places and frees no code (a declaration): every method is a
+/// refusal, since the core hands such a call no write that would reach one.
+struct Nothing;
+
+impl Records for Nothing {
+    fn record(&mut self, _: wire::RecordId, _: &[u8]) -> Result<(), String> {
+        Err("a record given where no code is placed".to_owned()) // alloc: an error
+    }
+
+    fn statics(&mut self, _: &[wire::StaticDef<'_>], _: Place) -> Result<(), String> {
+        Err("statics defined where no code is placed".to_owned()) // alloc: an error
+    }
+
+    fn code(&mut self, _: &wire::Bind<'_>, _: Place, _: &mut Vec<u8>) -> Result<(), String> {
+        Err("code asked for where none is placed".to_owned()) // alloc: an error
+    }
+
+    fn placed(&mut self, _: u64, _: u64) -> Result<(), String> {
+        Err("code placed by a declaration".to_owned()) // alloc: an error
+    }
+
+    fn forget(&mut self, _: u64) {}
+
+    fn release(&mut self) {}
+
+    fn static_at(&self, _: u32) -> Option<usize> {
+        None
     }
 }

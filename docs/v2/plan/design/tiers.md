@@ -61,16 +61,86 @@ summary or an inlining decision, so a body edit dirties one tier 0 node. Today, 
 written in the workspace or a dependency: true. A tier 0 unit asks for MIR level 1, no inliner,
 no devirtualization (`hir-ty-codegen/v2/build.rs:86` `Build::of`; test
 `a_tier_zero_unit_builds_no_callee_into_its_bodies`), and `hir-ty-mir`'s `optimize` runs
-`Inline` only with `options.inline` (`optimize.rs:232`) and `SpendFacts` only at `Release`
-(`optimize.rs:249`, `:282`). So **tier 0 does not run the effect-summary pass**, with one
-exception: a body written in core, alloc or std is at level 2 and inlined under every unit
-(`build.rs:130`, `:137`, "as shipped"), so a std generic instantiated at tier 0 was inlined and
-had `SpendFacts` run on its MIR; what it built in and relied on are std's. Its key covers them
-(`refs.rs:344` adds `body.inlined.relied` to what the instance reads; `dev_template_key`,
-`driver.rs:416`, hashes `built_in`). To make the invariant hold without the exception, tier 0
-would compile std's bodies at level 1 too; not done here, since it changes dev code's speed.
-The tier 0 template key also hashes `refs` (the callees' keys it calls, for placement), not
-their bodies.
+`Inline` only with `options.inline` and `SpendFacts` at no tier for now (`optimize.rs`
+`passes_at`; only at `Release` when a test switches it on). Until 2026-11-13 a body written in core, alloc or std was at
+level 2 and MIR-inlined under every unit, "as shipped", so a std generic instantiated at tier
+0 was inlined and had `SpendFacts` run on its MIR, which asked the effect summary of every
+callee: a cold hello-world spent 17.6 s of one codegen task in `SpendFacts unwind` under std's
+`__rg_oom`. That exception is gone (below). The tier 0 template key also hashes `refs` (the
+callees' keys it calls, for placement), not their bodies.
+
+**The tier is in the MIR key, and decides the passes** (2026-11-13). `MirOptions::tier`
+(`hir_ty::facts::Tier`) keys every optimized body; `hir-ty-mir`'s `passes_at(tier)` is the one
+declaration of which passes that read past the body may run (each still under its settings),
+`hir_ty::facts::proofs_at(tier)` of whether the facts they read spend proofs, and
+`hir-ty-codegen`'s `Build::tier_of` of which tier a unit builds a body at:
+
+| tier | who | passes past the body | proofs |
+|---|---|---|---|
+| `Zero` | every body of a unit that does not optimize (stencils, Cranelift, LLVM `-O0`), the library's included, and `Build::WALK` | none: no MIR `Inline` (`#[inline(always)]` callees are the code generator's), no `Devirtualize`, no `SpendFacts`, no `Specialize` | none |
+| `Shipped` | the library's bodies under an optimizing unit, the copy the MIR inliner builds in, `shipped_cross_crate_inlinable` | `Inline`, `Specialize` (rustc's own) | none |
+| `Optimizing` | the program's bodies under an optimizing unit, the interpreter at level 2 | `Inline`, `Devirtualize`, `Specialize`; not `SpendFacts`, for now (below) | spent, though nothing reads them while `SpendFacts` is off |
+
+**`SpendFacts` runs at no tier, for now** (2026-11-13). Its two runs (unwind edges, repeated
+calls) ask every callee's effect summary, and a summary walks all the callee reaches, holding
+each instance's monomorphized body while it does. On a cold build of reth's 30 packages (main
+at e6635c9ba7 with the purity proof bounded, 128 cores) the units built optimizing (proc
+macros and what they depend on) ran `mir SpendFacts unwind` 3,635 times for 2,275 s in all, the
+longest 298.9 s, with 36,783 `sealed summary reads below HIGH` spans (9,991 s); the footprint
+rose about 35 GiB a minute and the daemon was killed at 213 GiB, 141 GiB of it live in the
+global heap, the last three minutes' samples under `walk::summarized` < `dispatch::body_once` <
+`monomorphized`. With the pass off the same build ended at 84 GiB. The measurement is on
+`passes_at`'s doc (`optimize.rs`). The pass stays in the tree, tested: its tests run it at the
+optimizing tier through the one switch, `hir_ty_mir::mir::spend_facts_at` (a thread's guard,
+no input of the MIR key, so each such test builds in a database of its own), and the tier 0
+control plants it at tier 0 through the same switch. `proofs_at(Optimizing)` stays `Spent`:
+the two runs are its only readers in `optimize`. **What brings it back**: a callee's summary
+that is a record read in place (a body's own effects, cut before the fold over its callees),
+so that asking one costs a lookup and not a walk; then `passes_at(Optimizing)` lists it again.
+
+The library's bodies are MIR-inlined only where the unit MIR-inlines (`Spec::mir_inline`), so
+`WALK` and `WALKS_INLINED` still list what every unit asks for. The checks (`nopanic`, `pure`,
+`noalloc`, `nonblocking`, the role lints, `unreachable`) are no tier: they ask summaries on
+demand with proofs spent. Every summary key holds its proofs (the sealed tables,
+`summary_in`, `fn_facts`). Under `Spent` a function is proved once per definition where its
+instances keep its blocks (`walk.rs` `proof_of`).
+
+The floor (rule 67): optimizing a tier 0 body is a pass over its own statements per pass, and
+nothing that grows with its callees: no summary, no proof, no callee's body is read. Tests:
+`each_tier_runs_the_passes_its_declaration_lists`, `a_tier_zero_body_computes_no_effect_summary`
+(hir-ty-pure), `a_tier_zero_unit_spends_no_proof` (hir-ty-codegen). Not measured on this tree.
+
+**What making tier 0 hold for the library's bodies takes** (read from the code and a profile
+of a new hello-world, 2026-11-12, lane newproj-1111; not built). Changing `Build::options` so a
+library body follows a unit that is not optimized is the small part. Three more things read a
+callee's optimized body under a tier 0 unit today:
+
+1. *The walk is one answer for every requester.* An instance its users compile (a generic, a
+   closure, an `#[inline]` function) is walked with the inlined passes when any origin's
+   units inline (`Units::any`, `frontend.rs` `inlines_as`), and std's own units are `-O3` in
+   every dev build, so every such instance a tier 0 member asks for is described under
+   `Build::WALKS_INLINED` too, and its tier 0 template key hashes the references those passes
+   list. A per-requester walk needs the origin where a function is prepared
+   (`Prepare::prepare` has the unit and its spec, not its origin) and one rule for two origins
+   of equal settings whose later specs differ (a node merges their describes by key).
+2. *`Build::WALK` is every unit's pass.* It lists what a unit that optimizes and does not
+   MIR-inline (`opt-level` 1, `s`, `z`, a release build that patches) builds: its own body
+   plain, the library's inlined. With the library at level 1 under `WALK`, such a unit needs
+   a pass of its own (optimized, not inlining), or its references are not listed.
+3. *Which library functions a user compiles is inferred from optimized bodies.*
+   `home::compiled_by_user` asks `shipped_cross_crate_inlinable` of each library function no
+   attribute decides, which builds its body at level 2 with the inliner
+   (`optimize/inline.rs`), and that reads its callees' and their effect summaries: in the
+   profile, `key cross_crate_inlinable` held the walk up 2.7 s and `summary_in` ran 58,602
+   times. The answer is one for the whole program (std's own units and the user's must
+   agree), a function of the library crate's identity and the front end's code, so it is a
+   record to keep under those (rule 52), a table a library crate, not a thing to compute in
+   each database.
+
+On Linux a dev program is walked whole (14,202 describes for hello-world, 12,043 functions
+reached, all but `main` a store hit by a key that needs the describe first), so there the
+describes are std's own `-O3` ones and only a kept describe (R7) or the trace-keyed entry
+below takes them away.
 
 **Optimized code cannot have one.** What it inlined and which summaries it read are found while
 compiling. The design: store it under (f, tier, stage identity) with a recorded trace of

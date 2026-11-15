@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: an idle daemon on Linux",
+ "what": "An idle daemon of 60 GiB (reth built, no request) held its `iou-sqp` kernel thread at 84% of a core (top -H), and the process showed 129% while `debug inspect` said `idle: true, working: 0`; redit-11 saw the same as I/O pressure.",
+ "cost": "about a core per idle daemon on a machine shared by several",
+ "cause": "not found: an io_uring submission-queue poll thread that does not sleep",
+ "class": "an idle process that is not idle",
+ "prevention": "none built: a test that an idle daemon's CPU over ten seconds is under 1%",
+ "fix": "set the SQPOLL idle time, or do not use SQPOLL for the daemon's loop",
+ "state": "open"
+}

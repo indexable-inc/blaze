@@ -269,6 +269,11 @@ impl<'db> CrateFieldTypes<'db> {
 
     /// The batch of `lower` of each of `variants`, which are ascending and distinct.
     /// Each variant is lowered in a task of its own, as [`Batch::build`]'s items are.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the batch's starts are u32 and a crate's fields are not bounded below 2^32 \
+                  before this: a larger crate needs a typed refusal"
+    )]
     pub(crate) fn build(
         variants: &[VariantId],
         frame: &Frame,

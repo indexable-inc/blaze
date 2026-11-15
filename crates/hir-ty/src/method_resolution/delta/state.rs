@@ -300,6 +300,7 @@ pub(crate) fn prepare(db: &mut Db, state: &mut State, written: &Written<'_>) {
     let crates = base_db::all_crates(&*db);
     if written.crates {
         drop_gone(state, &crates);
+        drop_served(&*db, state);
     }
     let mut slots = std::mem::take(&mut state.scratch.slots);
     slots.clear();
@@ -884,6 +885,23 @@ fn drop_gone(state: &mut State, crates: &[Crate]) {
     let live: HashSet<Crate, Global> = crates.iter().copied().collect();
     let gone: Vec<Crate> = state.crates.keys().copied().filter(|it| !live.contains(it)).collect(); // alloc: as above
     for krate in gone {
+        let Some(crate_state) = state.crates.remove(&krate) else { continue };
+        for imp in crate_state.impls.keys() {
+            forget_reads(state, *imp);
+            state.owner.remove(imp);
+        }
+    }
+}
+
+/// Drops the state of every crate whose impls are now read from frozen tables
+/// ([`frozen::served`]), with its impls' read sets: a crate maintained before that a serve gave
+/// tables (`frozen::serve`, in a write that changes the crate graph whole) is passed over from
+/// here on, and what was held of it would never be read or dropped.
+fn drop_served(db: &Db, state: &mut State) {
+    // alloc: a crate graph change, once; none when no maintained crate came to be served
+    let served: Vec<Crate> =
+        state.crates.keys().copied().filter(|&it| frozen::served(db, it)).collect();
+    for krate in served {
         let Some(crate_state) = state.crates.remove(&krate) else { continue };
         for imp in crate_state.impls.keys() {
             forget_reads(state, *imp);
@@ -1494,8 +1512,9 @@ fn apply_bodies(
 
 /// The modules whose body parts `krate`'s work reads ([`apply_bodies`]), sorted, into
 /// `modules`: every module on a `sweep` or a change of which macros may write impls, else
-/// those of the defs, impls and bindings the delta touched, and every module whose bodies held
-/// an impl.
+/// those of the defs, impls and bindings the delta touched, those whose scope it set (a module
+/// macros wrote in this write, or one that gained a `const _` and no name), and every module
+/// whose bodies held an impl.
 fn bodies_to_read(
     db: &Db,
     crate_state: &CrateState,
@@ -1512,10 +1531,24 @@ fn bodies_to_read(
         modules.extend(delta.touched.iter().filter_map(|def| def.module(db)));
         modules.extend(delta.touched_impls.iter().map(|imp| imp.loc(db).container));
         modules.extend(delta.bindings.iter().map(|&(module, _)| module));
+        #[cfg(test)]
+        let planted = SET_SCOPES_ARE_NOT_READ.get();
+        #[cfg(not(test))]
+        let planted = false;
+        if !planted {
+            modules.extend(delta.scopes.iter().copied());
+        }
     }
     modules.extend(crate_state.bodies.keys().copied());
     modules.sort_unstable();
     modules.dedup();
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: the bodies of a module are read again only where the write
+    /// touched a def or an impl or changed a binding, not where it set a scope.
+    pub(super) static SET_SCOPES_ARE_NOT_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A key a crate's node reads before its work, across the database's workers: the work goes

@@ -1,0 +1,14 @@
+{
+ "id": "fix-hirdef-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane fix-hirdef",
+ "where": "hir_def::deps::serve::withdraw_moved and test fixtures with two crates in one source root",
+ "what": "A hegel test failed with 'an edit of `main` took `lib`'s pages away' and read as a defect of the per-crate slot split. It was the fixture: both crates were in one source root, and a write of any file of a source root withdraws every served crate of that root (the grain of the image key).",
+ "cost": "about 25k tokens of reading (slots, maintainers, implied writes) before the fixture",
+ "cause": "the withdrawal's grain (source root) is said only in `withdraw_moved`'s doc; the shared fixture has no `new_source_root`, unlike deps/tests.rs's",
+ "class": "a test fixture whose layout differs from the layout the rule under test is keyed by",
+ "prevention": "the test now builds its fixture with lib in a root of its own and has a control that states the one-root behaviour; not built: withdrawal by the crate's own key or file list rather than by root (design note in /tmp/fix-hirdef/next.md)",
+ "workaround": "`new_source_root:local` on the dependency's root file in the fixture",
+ "fix": "pages/tests.rs `apart()` and `a_crate_of_the_edited_source_root_loses_its_pages`",
+ "state": "fixed"
+}

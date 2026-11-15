@@ -19,8 +19,8 @@
 //!
 //! Labels are counted from the inside: `Break(0)` leaves the nearest enclosing `Block` or
 //! `Loop`. The normal form [`reconstruct`] returns has no `Break` at the end of the `Block` it
-//! leaves, no `Continue` at the end of the `Loop` it repeats, and no `Block` nothing breaks
-//! out of. Reaching the end of a `Loop`'s body repeats it, as in Rust.
+//! leaves, no `Continue` at the end of the `Loop` it repeats, no `Block` nothing breaks out
+//! of, and no `Block` that starts with a statement (it goes before the `Block`). Reaching the end of a `Loop`'s body repeats it, as in Rust.
 
 use std::fmt;
 
@@ -488,6 +488,11 @@ pub fn normalize<S, C>(nodes: Vec<Node<S, C>>) -> Vec<Node<S, C>> {
                 let mut body = normalize(body);
                 drop_tail_jump(&mut body, 0, true);
                 if jumps_to(&body, 0) {
+                    // The statements it starts with run before anything in it can break,
+                    // so they go before it: where a block's code is split into graph blocks
+                    // decides nothing.
+                    let lead = body.iter().take_while(|it| matches!(it, Node::Do(_))).count();
+                    out.extend(body.drain(..lead));
                     out.push(Node::Block(body));
                 } else {
                     unlabel(&mut body, 0);

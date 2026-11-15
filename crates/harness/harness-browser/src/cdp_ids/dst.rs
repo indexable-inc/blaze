@@ -14,10 +14,11 @@
 //!
 //! Control: freeing a dropped connection's ids at once (the bug the tombstones fix) must be caught.
 use super::*;
+use blaze_sim::{Broke, Config, Tape};
 use std::collections::{BTreeSet, VecDeque};
 
 const SPACE: i32 = 4;
-const CONTROL_SEEDS: u64 = 3000;
+const CONTROL_SEEDS: u32 = 3000;
 
 enum Cmd {
     Kernel { conn: usize, view: u64, text: String },
@@ -243,44 +244,36 @@ fn run(ops: &[(u8, u8, u8)], plant: bool) -> Result<(), String> {
     w.settle()
 }
 
-fn plan_of(seed: u64) -> Vec<(u8, u8, u8)> {
-    let mut s = seed;
-    let mut next = || {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    let n = 10 + next() % 90;
-    (0..n).map(|_| { let r = next(); (r as u8, (r >> 8) as u8, (r >> 16) as u8) }).collect() // alloc: a test plan
+/// A plan drawn from the tape: 10 to 99 steps, each an op and its two arguments, uniform over `u8`.
+fn plan(tape: &Tape) -> Vec<(u8, u8, u8)> {
+    let n = tape.int_in(10..=99usize, "steps");
+    (0..n)
+        .map(|_| {
+            tape.span("step", |tape| {
+                (tape.int_in(0..=u8::MAX, "op"), tape.int_in(0..=u8::MAX, "conn"), tape.int_in(0..=u8::MAX, "view"))
+            })
+        })
+        .collect() // alloc: a test plan
 }
 
-#[hegel::test]
-fn every_cdp_answer_reaches_only_its_asker_once_and_every_live_request_is_answered(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let ops: Vec<(u8, u8, u8)> = tc.draw(gs::vecs(gs::tuples3(gs::integers(), gs::integers(), gs::integers())).max_size(150));
-    if let Err(e) = run(&ops, false) {
-        panic!("{e}");
-    }
+#[test]
+fn every_cdp_answer_reaches_only_its_asker_once_and_every_live_request_is_answered() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let ops: Vec<(u8, u8, u8)> =
+            tape.vec(0..=150, "ops", |tape| (tape.int::<u8>("op"), tape.int::<u8>("conn"), tape.int::<u8>("view")));
+        if let Err(e) = run(&ops, false) {
+            panic!("{e}");
+        }
+    });
 }
 
 #[test]
 fn seeded_plans_pass() {
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(e) = run(&plan_of(seed), false) {
-            panic!("seed {seed}: {e}");
-        }
-    }
+    blaze_sim::check(Config::cases(CONTROL_SEEDS), |tape| run(&plan(tape), false));
 }
 
+/// Any error of a planted run counts as the catch, as the seed loop this replaced accepted any.
 #[test]
 fn the_oracle_catches_a_dropped_connections_ids_freed_at_once() {
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(e) = run(&plan_of(seed), true) {
-            eprintln!("the planted free-on-drop caught at seed {seed}: {e}");
-            return;
-        }
-    }
-    panic!("the oracle caught the planted free-on-drop at none of seeds 0..{CONTROL_SEEDS}");
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), false, true, "", |tape, plant| run(&plan(tape), plant).map_err(Broke::Oracle));
 }

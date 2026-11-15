@@ -260,16 +260,6 @@ impl<T> Rows<T> {
         Some(unsafe { &*self.row(row) })
     }
 
-    /// The value at `row`, to change.
-    ///
-    /// # Safety
-    ///
-    /// `row` holds a value.
-    pub(crate) unsafe fn get_mut(&mut self, row: u32) -> &mut T {
-        // SAFETY: the caller's contract; `&mut self` excludes every reader.
-        unsafe { &mut *self.row(row) }
-    }
-
     /// Drops the value at `row`.
     ///
     /// # Safety
@@ -1278,15 +1268,6 @@ impl<V: Send + Sync + 'static> Map<V> {
     }
 }
 
-impl<V: Send + Sync + Clone + 'static> Map<V> {
-    pub(crate) fn snapshot(&self, task: &Guard) -> Vec<(QueryKey, V)> {
-        // alloc: once per image write, the inputs it lists; clone: see above.
-        let mut all = Vec::new();
-        self.for_each(task, |key, value| all.push((*key, value.clone()))); // clone: see above
-        all
-    }
-}
-
 impl<V> Drop for Map<V> {
     fn drop(&mut self) {
         for shard in self.shards.iter_mut() {
@@ -1389,22 +1370,6 @@ impl<T: Send + Sync + 'static> Column<T> {
             })
     }
 
-    /// Every value, taken out, and the next index; for [`Column::restore`].
-    pub(crate) fn take_all(&mut self) -> (u32, Vec<Box<T>>) {
-        let next = *self.next.get_mut();
-        (next, (0..next).filter_map(|index| self.take(index)).collect()) // alloc: once a settle
-    }
-
-    /// `values` at the indices `index_of` gives, the next index pushed `next`.
-    pub(crate) fn restore(&mut self, next: u32, values: Vec<Box<T>>, index_of: impl Fn(&T) -> u32) {
-        *self.next.get_mut() = next;
-        for value in values {
-            let index = index_of(&value);
-            assert!(index < next, "a value restored past the column's end");
-            let old = self.place(index).swap(Box::into_raw(value), Ordering::AcqRel);
-            assert!(old.is_null(), "two values restored at index {index}");
-        }
-    }
 }
 
 impl<T> Drop for Column<T> {
@@ -1424,10 +1389,10 @@ impl<T> Drop for Column<T> {
 
 pub(crate) const EDGE_RECORD: usize = 56;
 
-/// One dependency edge as the database keeps it, in its edge segments and in the image alike:
-/// the kind (little-endian), six bytes of padding, the input, and the fingerprint seen
-/// (little-endian). Plain bytes, so a mapped image's edge section is read as `&[EdgeRecord]`
-/// in place once its bounds and alignment are checked.
+/// One dependency edge as the database keeps it in its edge segments: the kind
+/// (little-endian), six bytes of padding, the input, and the fingerprint seen (little-endian).
+/// Plain bytes, so a run of them is read as `&[EdgeRecord]` in place once its bounds and
+/// alignment are checked.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]
 pub(crate) struct EdgeRecord {
@@ -1462,66 +1427,10 @@ impl EdgeRecord {
         Edge { read: self.read(), saw: self.saw() }
     }
 
-    /// The image's order of a memo's edges.
-    pub(crate) fn order(&self) -> (QueryKey, Fingerprint) {
-        (self.read(), self.saw())
-    }
-
     pub(crate) fn as_bytes(records: &[EdgeRecord]) -> &[u8] {
         // SAFETY: `EdgeRecord` is `repr(C)` byte arrays filling its 56 bytes, with no padding
         // the compiler adds, so every byte of the slice is initialized.
         unsafe { std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), size_of_val(records)) }
-    }
-
-    /// `bytes` as records, in place.
-    ///
-    /// # Safety
-    ///
-    /// `bytes` is empty or starts at an 8-byte boundary. (Any bytes are a valid record.) An
-    /// empty `bytes` may be dangling at any address (`&[]` of `u8` is at 1).
-    pub(crate) unsafe fn from_bytes(bytes: &[u8]) -> &[EdgeRecord] {
-        if bytes.len() < EDGE_RECORD {
-            debug_assert!(bytes.is_empty(), "{} bytes: less than one edge record", bytes.len());
-            return &[];
-        }
-        debug_assert!(bytes.as_ptr().addr() % align_of::<EdgeRecord>() == 0);
-        // SAFETY: aligned by the caller's contract, in bounds (`len / 56` whole records), and
-        // every bit pattern of a record's byte arrays is valid.
-        unsafe {
-            std::slice::from_raw_parts(
-                bytes.as_ptr().cast::<EdgeRecord>(),
-                bytes.len() / EDGE_RECORD,
-            )
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-#[repr(C, align(16))]
-struct Block([u8; 16]);
-
-/// Bytes at a 16-byte-aligned address ([`blaze_format::ALIGN`]), as a mapping a test makes.
-#[cfg(test)]
-pub(crate) struct Aligned {
-    blocks: Box<[Block]>,
-    len: usize,
-}
-
-#[cfg(test)]
-impl Aligned {
-    pub(crate) fn copy(bytes: &[u8]) -> Aligned {
-        let mut blocks = vec![Block([0; 16]); bytes.len().div_ceil(16)].into_boxed_slice();
-        for (block, chunk) in blocks.iter_mut().zip(bytes.chunks(16)) {
-            block.0[..chunk.len()].copy_from_slice(chunk);
-        }
-        Aligned { blocks, len: bytes.len() }
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8] {
-        // SAFETY: `blocks` is `len.div_ceil(16)` blocks of 16 initialized bytes with no
-        // padding (`Block` is a `[u8; 16]`), so its first `len` bytes are in bounds.
-        unsafe { std::slice::from_raw_parts(self.blocks.as_ptr().cast::<u8>(), self.len) }
     }
 }
 

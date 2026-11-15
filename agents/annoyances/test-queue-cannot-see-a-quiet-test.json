@@ -1,0 +1,14 @@
+{
+ "id": "test-queue-cannot-see-a-quiet-test",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: task watchdog over every task, int-1112",
+ "where": "crates/blaze-usercode/src/test/queue.rs (Queue, Due), crates/blaze-usercode/src/test/wire.rs (Frame), crates/blaze-usercode/src/test/fork_server.rs",
+ "what": "A test parked on thread::park ran 10 hours: the test queue judges a running test only by its wall-clock timeout. The task watchdog's core (blaze_profile::stuck::Watch) can judge a test by its CPU and its output, but the queue learns neither while a test runs: the fork server answers once, at the test's end, with its whole output, and never says the forked child's pid, so no one can read the child's CPU clock.",
+ "cost": "a quiet test is caught only at its timeout, never named with its stacks or last output while it hangs",
+ "cause": "the wire protocol has no frame for a started child (its pid) and no streamed output; the queue is sans-IO with only Run/Ended/Kill",
+ "class": "a watched process whose progress signals never reach its watcher",
+ "prevention": "a Frame::Started { id, pid } from the fork server and output streamed in chunks (Frame::Output { id, bytes }); the queue keeps a Watch, a TaskSeen per running attempt (Task::Child(pid), span = output bytes seen, cpu from the driver's child_cpu_ns), a Due::Look on its wheel each LOOK_EVERY, a per-test quiet bound (Job::quiet, default 300 s, overridable as the timeout is) and Failure::Stuck naming the test with its last output",
+ "workaround": "the test's timeout",
+ "fix": "not yet",
+ "state": "open"
+}

@@ -36,6 +36,63 @@ fn a_response_handed_in_place_is_the_one_sent() {
     assert_eq!(got, [(sent[0].clone(), true), (sent[1].clone(), false)]);
 }
 
+/// What `stop` and `status` may say when nothing listens at their socket. The invariant: "no
+/// daemon is running" (`Ok`) only when no daemon holds the state; one that does is the error,
+/// named by its pid, its lock and the socket that was asked (agents.json A37).
+#[test]
+fn no_daemon_is_said_only_when_none_holds_the_state() {
+    use crate::serve::Holder;
+    let socket = Path::new("/home/me/.cache/blaze/v2.sock");
+    assert_eq!(absent(&Holder::None, socket), Ok(()));
+    let lock = std::path::PathBuf::from("/home/me/.cache/blaze/v2/serve.lock");
+    let said = absent(&Holder::Daemon { pid: Some(4242), lock: lock.clone() }, socket).unwrap_err();
+    assert!(
+        said.starts_with(
+            "a daemon is running (pid 4242: it holds blaze's state, /home/me/.cache/blaze/v2/serve.lock) and \
+             nothing listens at /home/me/.cache/blaze/v2.sock, the socket this command uses"
+        ),
+        "{said}"
+    );
+    assert!(said.contains("XDG_RUNTIME_DIR") && said.contains("told it nothing"), "{said}");
+    let unwritten = absent(&Holder::Daemon { pid: None, lock }, socket).unwrap_err();
+    assert!(unwritten.starts_with("a daemon is running (its pid not yet written: "), "{unwritten}");
+}
+
+/// The planted bug: the answer `stop` gave before, from the socket alone. With a daemon
+/// holding the state and nothing at the socket it says "no daemon is running"; the rule above
+/// refuses exactly that case, so the two differ on it and agree where no daemon holds the state.
+#[test]
+fn the_oracle_catches_no_daemon_said_from_the_socket_alone() {
+    use crate::serve::Holder;
+    let socket = Path::new("/run/user/501/blaze/v2.sock");
+    let from_the_socket_alone = |_: &Holder| -> Result<(), String> { Ok(()) };
+    let held = Holder::Daemon { pid: Some(7), lock: "/home/me/.cache/blaze/v2/serve.lock".into() };
+    assert!(from_the_socket_alone(&held).is_ok() && absent(&held, socket).is_err());
+    assert_eq!(from_the_socket_alone(&Holder::None), absent(&Holder::None, socket));
+}
+
+/// A daemon of another API schema is running, and is said to be: named by its schema, the
+/// socket and the pid its state's lock holds, with what stops it (agents.json A6).
+#[test]
+fn a_daemon_of_another_schema_is_named_as_running() {
+    use crate::serve::Holder;
+    let socket = Path::new("/home/me/.cache/blaze/v2.sock");
+    let held = Holder::Daemon { pid: Some(4242), lock: "/home/me/.cache/blaze/v2/serve.lock".into() };
+    let theirs = blaze_api::SCHEMA + 1;
+    let said = other_schema(theirs, Some(&held), socket);
+    assert!(
+        said.starts_with(&format!(
+            "a daemon is running at /home/me/.cache/blaze/v2.sock (pid 4242) and speaks API schema {theirs}, \
+             this blaze {}",
+            blaze_api::SCHEMA
+        )),
+        "{said}"
+    );
+    assert!(said.contains("`blaze stop`") && !said.contains("no daemon"), "{said}");
+    let unknown = other_schema(theirs, None, socket);
+    assert!(unknown.contains("(its pid is the first word of `serve.lock` in blaze's state)"), "{unknown}");
+}
+
 #[test]
 fn a_start_that_never_listens_names_the_socket() {
     let said = not_listening(
@@ -55,6 +112,8 @@ fn a_start_that_never_listens_names_the_socket() {
 
 #[test]
 fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
+    // The status says which blaze the client is, which the program's main hands over.
+    crate::release::for_tests();
     let place = StatusPlace {
         home: PathBuf::from("/h"),
         state: PathBuf::from("/h/v2"),
@@ -80,14 +139,12 @@ fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
         memory_bytes: 3 << 29,
         budget_bytes: 8 << 30,
         uptime_ms: 9000,
+        placed_by: None,
         build: blaze_api::Build::default(),
         bugs: vec![bug(2), bug(1)],
         settings: vec![
             blaze_api::Setting { name: "BLAZE_OPT".to_owned(), value: None },
-            blaze_api::Setting {
-                name: "BLAZE_DAEMON_MEMORY_GB".to_owned(),
-                value: Some("80".to_owned()),
-            },
+            blaze_api::Setting { name: "BLAZE_EMIT".to_owned(), value: Some("obj".to_owned()) },
         ],
         builds: Vec::new(),
         downloads: Vec::new(),
@@ -101,7 +158,7 @@ fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
     assert_eq!(daemon["requests"], serde_json::json!([3, 7]));
     assert_eq!(
         daemon["settings"],
-        serde_json::json!({"BLAZE_DAEMON_MEMORY_GB": "80", "BLAZE_OPT": null})
+        serde_json::json!({"BLAZE_EMIT": "obj", "BLAZE_OPT": null})
     );
     assert_eq!(daemon["build"].as_str().map(str::len), Some(64), "the build's hash in hex");
 }
@@ -116,6 +173,7 @@ fn the_status_for_people() {
         memory_bytes: 3 << 29,
         budget_bytes: 8 << 30,
         uptime_ms: 40,
+        placed_by: None,
         build: blaze_api::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),
@@ -124,7 +182,7 @@ fn the_status_for_people() {
     };
     assert_eq!(
         status_lines(&status),
-        "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB of 8.0 GiB\nbugs: 0\n"
+        "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB\nbugs: 0\n"
     );
     let idle = Status {
         pid: 7,
@@ -134,6 +192,7 @@ fn the_status_for_people() {
         memory_bytes: 512,
         budget_bytes: 1536,
         uptime_ms: 40,
+        placed_by: None,
         build: blaze_api::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),
@@ -142,21 +201,18 @@ fn the_status_for_people() {
     };
     assert_eq!(
         status_lines(&idle),
-        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\nbugs: 0\n"
+        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B\nbugs: 0\n"
     );
     let told = Status {
         settings: vec![
-            blaze_api::Setting {
-                name: "BLAZE_DAEMON_MEMORY_GB".to_owned(),
-                value: Some("80".to_owned()),
-            },
+            blaze_api::Setting { name: "BLAZE_EMIT".to_owned(), value: Some("obj".to_owned()) },
             blaze_api::Setting { name: "BLAZE_OPT".to_owned(), value: None },
         ],
         ..idle.clone()
     };
     assert_eq!(
         status_lines(&told),
-        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\nsettings: BLAZE_DAEMON_MEMORY_GB=80\nbugs: 0\n"
+        "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B\nsettings: BLAZE_EMIT=obj\nbugs: 0\n"
     );
     let failed = Status {
         history: Some(
@@ -212,7 +268,8 @@ fn the_status_for_people() {
     };
     assert!(
         status_lines(&building).ends_with(
-            "builds: 1\n  #12 test -p blaze-api: [2m05s] compiling · mem 0 B · builds 412 units, 1 running\n    \
+            "builds: 1\n  #12 test -p blaze-api: phase=compiling done=0/0 running=0 elapsed_ms=125400 \
+             waits=\"builds 412 units, 1 running\"\n    \
              blaze-worker-3: task (2 min 05 s) > unit bodies `app::main` in app (4 s)\n\
              downloads: 1\n  llvm.tar.xz: 34.0 of 410.0 MB (8%)\n    from https://example.com/llvm.tar.xz\n"
         ),
@@ -247,6 +304,7 @@ impl Api for OfBuild {
                     memory_bytes: 0,
                     budget_bytes: 0,
                     uptime_ms: 40,
+                    placed_by: None,
                     build: self.build.clone(),
                     bugs: Vec::new(),
                     builds: Vec::new(),
@@ -301,35 +359,30 @@ fn a_daemon_of_this_very_file_is_this_build_with_nothing_hashed() {
 #[test]
 fn a_daemon_of_another_file_with_the_same_bytes_is_this_build() {
     let a = build(1, "/opt/blaze", 10);
-    let copy = build(1, "/tmp/blaze", 11);
+    let copy = build(1, "/elsewhere/blaze", 11);
     let mut daemon = OfBuild { build: a, asked: Vec::new(), settings: Vec::new() };
     let got = builds(&mut daemon, Path::new(SOCKET), &copy.exe, &[], || Ok(copy.clone())).unwrap();
     assert_eq!(got, Builds::Same);
 }
 
-/// A daemon of this build told another memory limit than this command sets (the 80 GB daemon
-/// a client with `BLAZE_DAEMON_MEMORY_GB=100` built on, failing ten minutes in) is found from its
-/// Status alone, with the setting and both values, for the CLI to refuse before any request. A
-/// command that leaves the limit unset builds with the daemon's, `--memory-gb 80` included.
+/// A daemon of this build started with another setting than this command sets (a daemon of
+/// `BLAZE_OPT=2` a client with `BLAZE_OPT=3` would build on) is found from its Status alone,
+/// with the setting and both values, for the CLI to refuse before any request. A command that
+/// leaves the setting unset builds with the daemon's.
 #[test]
-fn a_daemon_started_with_another_limit_is_found_before_any_request() {
+fn a_daemon_started_with_another_setting_is_found_before_any_request() {
     let a = build(1, "/opt/blaze", 10);
-    let theirs = crate::serve::settings::of_daemon(
-        Some(&(80u64 << 30, "--memory-gb=80".to_owned())),
-        |_| None,
-    );
-    let ours = crate::serve::settings::of_client(|name| {
-        (name == crate::serve::MEMORY_VAR).then(|| "100".into())
-    });
+    let theirs = crate::serve::settings::of_daemon(|name| (name == "BLAZE_OPT").then(|| "2".into()));
+    let ours = crate::serve::settings::of_client(|name| (name == "BLAZE_OPT").then(|| "3".into()));
     let mut daemon = OfBuild { build: a.clone(), asked: Vec::new(), settings: theirs.clone() };
     let got = builds(&mut daemon, Path::new(SOCKET), &a.exe, &ours, || {
         panic!("hashed this blaze for an unchanged file")
     })
     .unwrap();
     let drift = vec![crate::serve::settings::Drift {
-        name: crate::serve::MEMORY_VAR.to_owned(),
-        theirs: Some("80".to_owned()),
-        ours: "100".to_owned(),
+        name: "BLAZE_OPT".to_owned(),
+        theirs: Some("2".to_owned()),
+        ours: "3".to_owned(),
     }];
     assert_eq!(got, Builds::Settings { pid: 77, drift });
     assert_eq!(
@@ -337,10 +390,10 @@ fn a_daemon_started_with_another_limit_is_found_before_any_request() {
         [Request::Status],
         "nothing but its Status is asked before the settings agree"
     );
-    for asked in [Some("80"), None] {
+    for asked in [Some("2"), None] {
         let mut same = OfBuild { build: a.clone(), asked: Vec::new(), settings: theirs.clone() };
         let ours = crate::serve::settings::of_client(|name| {
-            (name == crate::serve::MEMORY_VAR).then_some(asked).flatten().map(Into::into)
+            (name == "BLAZE_OPT").then_some(asked).flatten().map(Into::into)
         });
         assert_eq!(
             builds(&mut same, Path::new(SOCKET), &a.exe, &ours, || panic!("hashed")).unwrap(),

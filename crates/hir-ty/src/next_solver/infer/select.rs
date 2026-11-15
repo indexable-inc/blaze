@@ -1,4 +1,5 @@
 #![expect(dead_code, reason = "this is used by rustc")]
+#![expect(blaze::unwired, reason = "rustc's selection, ported whole; only part of it is called here")]
 
 use std::ops::ControlFlow;
 

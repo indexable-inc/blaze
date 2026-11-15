@@ -11,6 +11,7 @@ use hir_expand::fixture;
 use syntax::view::{self, AstNode as _};
 
 use super::{HasSourceView, Semantics};
+use crate::semantics::child_by_source::BLOCKS_OF_ANY_FILE;
 use crate::ModuleDef;
 
 const FIXTURE: &str = r#"
@@ -449,6 +450,320 @@ pub fn inner() {
                 Some(crate::PathResolution::Def(ModuleDef::Function(_)))
             ),
             "`crate::d` in m.rs resolves to `a`'s function `d`"
+        );
+    });
+}
+
+/// Two calls of one macro with the same tokens in one body, each expanding to a block that
+/// declares a module whose enum a macro called in the module makes: the shape of two
+/// `tokio::select!` of the same arms in one function.
+const TWO_SELECTS: &str = r#"
+//- /main.rs crate:main
+#[macro_export]
+macro_rules! declare_output_enum {
+    ($($name:ident)*) => {
+        pub(super) enum Out<$($name),*> { $($name($name),)* Disabled }
+    };
+}
+macro_rules! select {
+    () => {{
+        mod util {
+            $crate::declare_output_enum!(_0 _1);
+        }
+    }};
+}
+fn main() {
+    let _first = select!();
+    let _second = select!();
+}
+"#;
+
+/// [`TWO_SELECTS`] with tokio's own split: `select!` hands its branches, one `_` each, to a
+/// proc macro that declares `enum Out<_0, _1>` and `Mask` with every token at the call site,
+/// as tokio-macros' `select_priv_declare_output_enum` does.
+const TWO_SELECTS_OF_A_PROC_MACRO: &str = r#"
+//- proc_macros: select_priv_declare_output_enum
+//- /main.rs crate:main
+pub use proc_macros::select_priv_declare_output_enum;
+macro_rules! select {
+    ($($count:tt)*) => {{ mod __tokio_select_util { $crate::select_priv_declare_output_enum!( ( $($count)* ) ); } }};
+}
+fn main() { let _first = select!(_ _); let _second = select!(_ _); }
+"#;
+
+/// The planted bug [`BLOCKS_OF_ANY_FILE`] for as long as this lives.
+struct BlocksOfAnyFile;
+
+impl BlocksOfAnyFile {
+    fn planted() -> BlocksOfAnyFile {
+        BLOCKS_OF_ANY_FILE.set(true);
+        BlocksOfAnyFile
+    }
+}
+
+impl Drop for BlocksOfAnyFile {
+    fn drop(&mut self) {
+        BLOCKS_OF_ANY_FILE.set(false);
+    }
+}
+
+/// The invariant: a node of a macro expansion maps to the def made from that node, never to
+/// the def of the node at the same range of another expansion. Two calls of one macro with the
+/// same tokens have expansions of the same text, so every node of one has a twin of the same
+/// kind and range in the other; only the file tells them apart.
+#[test]
+fn each_of_two_identical_expansions_in_a_body_maps_its_block_module_and_enum_to_its_own_defs() {
+    // The shape of two `tokio::select!` of the same arms in one function (tempo's zone-node,
+    // `role.rs`): each expands to a block declaring `mod __tokio_select_util`, whose enum
+    // `Out<_0, _1> { _0(_0), _1(_1), Disabled }` a macro called in the module makes.
+    two_expansions_map_to_their_own_defs(fixture::db(TWO_SELECTS));
+}
+
+/// The invariant: a node of a macro expansion maps to the def made from that node, never to
+/// the def of the node at the same range of another expansion. Two calls of one macro with the
+/// same tokens have expansions of the same text, so every node of one has a twin of the same
+/// kind and range in the other; only the file tells them apart. Here a proc macro declares the
+/// enum, every token at the call site, as tokio-macros does.
+#[test]
+fn each_of_two_identical_selects_maps_the_enum_its_proc_macro_declares_to_its_own_defs() {
+    two_expansions_map_to_their_own_defs(fixture::db(TWO_SELECTS_OF_A_PROC_MACRO));
+}
+
+/// The checks of the two tests above on `fx`, a fixture of two `select!` of the same tokens in
+/// one body, each expanding to a block that declares a module with `enum Out` in it: each
+/// module and each enum maps to its own def, and each type in a variant is the enum's own
+/// parameter.
+fn two_expansions_map_to_their_own_defs(fx: fixture::Fixture) {
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let vsema = Semantics::new(&db);
+        let roots = roots(&vsema, file_id);
+
+        let mut modules = Vec::new();
+        for &(file, root) in &roots {
+            for module in root.descendants().filter_map(view::Module::cast) {
+                let def = vsema
+                    .to_module_def(module)
+                    .unwrap_or_else(|| panic!("the module of {file:?} is a module"));
+                modules.push((file, def));
+            }
+        }
+        assert_eq!(modules.len(), 2, "one module per `select!()`: {modules:?}");
+        assert_ne!(
+            modules[0].1, modules[1].1,
+            "each expansion's module is the module of its own block: {modules:?}"
+        );
+
+        let mut enums = 0u32;
+        for &(file, root) in &roots {
+            for node in root.descendants().filter_map(view::Enum::cast) {
+                enums += 1;
+                let def = vsema
+                    .to_enum_def(node)
+                    .unwrap_or_else(|| panic!("`enum Out` of {file:?} is an enum"));
+                let source = vsema.source(def).expect("the enum's source");
+                assert_eq!(
+                    (source.file_id, source.value.syntax().text_range()),
+                    (file, node.syntax().text_range()),
+                    "`enum Out` of {file:?} maps to the enum made from it"
+                );
+                for ty in node.syntax().descendants().filter_map(view::PathType::cast) {
+                    let path = ty.path().expect("a path type has a path");
+                    assert!(
+                        matches!(
+                            vsema.resolve_path(path),
+                            Some(crate::PathResolution::TypeParam(_))
+                        ),
+                        "`{}` in a variant of `enum Out` of {file:?} is the enum's own parameter",
+                        path.syntax().text()
+                    );
+                }
+            }
+        }
+        assert_eq!(enums, 2, "one `enum Out` per `select!()`");
+    });
+}
+
+/// The control of the test above: with a body's blocks given to the map of any file (the
+/// planted old behaviour), the later expansion's block replaces the earlier one's at the same
+/// range, and both `mod util` are one module.
+#[test]
+fn planted_blocks_of_any_file_make_the_two_expansions_modules_one() {
+    let fx = fixture::db(TWO_SELECTS);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let _planted = BlocksOfAnyFile::planted();
+        let vsema = Semantics::new(&db);
+        let mut modules = Vec::new();
+        for (_, root) in roots(&vsema, file_id) {
+            for module in root.descendants().filter_map(view::Module::cast) {
+                modules.push(vsema.to_module_def(module).expect("`mod util` is a module"));
+            }
+        }
+        assert_eq!(modules.len(), 2, "one `mod util` per `select!()`: {modules:?}");
+        assert_eq!(modules[0], modules[1], "the planted bug: one block for both expansions");
+    });
+}
+
+/// The invariant: the container of a node is never read from an item further out because an
+/// item around the node mapped to no def, unless a `cfg` removes that item or it is an
+/// attribute macro's input. Under the planted bug the first expansion's `enum Out` maps to no
+/// def (its module is the other expansion's), and asking for the scope of its `T` stops naming
+/// the enum, where it answered with the module's scope: "cannot find type `T`".
+#[test]
+#[should_panic(expected = "maps to no def")]
+fn an_enum_that_maps_to_no_def_is_named_not_walked_past() {
+    let fx = fixture::db(
+        r#"
+//- /main.rs crate:main
+macro_rules! select {
+    () => {{
+        mod util {
+            pub(super) enum Out<T> { V(T) }
+        }
+    }};
+}
+fn main() {
+    let _first = select!();
+    let _second = select!();
+}
+"#,
+    );
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let _planted = BlocksOfAnyFile::planted();
+        let vsema = Semantics::new(&db);
+        for (_, root) in roots(&vsema, file_id) {
+            for ty in root.descendants().filter_map(view::PathType::cast) {
+                let _ = vsema.scope(ty.syntax());
+            }
+        }
+    });
+}
+
+/// The control of
+/// [`each_of_two_identical_selects_maps_the_enum_its_proc_macro_declares_to_its_own_defs`], as
+/// [`an_enum_that_maps_to_no_def_is_named_not_walked_past`] is of the `macro_rules!` shape:
+/// under the planted bug the first `select!`'s `enum Out`, which the proc macro declares, maps
+/// to no def, and asking for the scope of its `_0` stops naming the enum.
+///
+/// The expansions are found before the bug is planted, by a `Semantics` of their own: under
+/// it the first `select!`'s proc-macro call is looked up in the other expansion's module, so
+/// the first expansion is never found from the syntax and none of its nodes would be asked.
+/// The planted `Semantics` reads each file's tree from the file's ID, not through the map
+/// under test, and its own maps are made with the bug in.
+#[test]
+#[should_panic(expected = "maps to no def")]
+fn planted_blocks_of_any_file_stop_at_the_enum_a_proc_macro_declares() {
+    let fx = fixture::db(TWO_SELECTS_OF_A_PROC_MACRO);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let files: Vec<HirFileId> = {
+            let vsema = Semantics::new(&db);
+            roots(&vsema, file_id).into_iter().map(|(file, _)| file).collect()
+        };
+        assert_eq!(files.len(), 5, "main.rs, two `select!` and two proc-macro calls: {files:?}");
+        let _planted = BlocksOfAnyFile::planted();
+        let vsema = Semantics::new(&db);
+        for file in files {
+            let root = vsema.parse_or_expand(file);
+            for ty in root.descendants().filter_map(view::PathType::cast) {
+                let _ = vsema.scope(ty.syntax());
+            }
+        }
+    });
+}
+
+/// The reason [`super::source_to_def::Unmapped::RemovedByCfg`]: a node in an item a `cfg`
+/// removes, or in one inside such an item, has the container around the removed item.
+#[test]
+fn a_node_in_an_item_a_cfg_removes_has_the_scope_around_it() {
+    let fx = fixture::db(
+        r#"
+//- /main.rs crate:main
+#[cfg(never)]
+mod removed {
+    pub fn in_removed_module(x: u8) -> u8 { x }
+}
+fn main() {
+    #[cfg(never)]
+    fn removed_in_a_body(x: u8) -> u8 { x }
+}
+"#,
+    );
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let vsema = Semantics::new(&db);
+        let root = vsema.parse(file_id).syntax();
+        let mut asked = 0u32;
+        for ty in root.descendants().filter_map(view::PathType::cast) {
+            asked += 1;
+            assert!(
+                vsema.scope(ty.syntax()).is_some(),
+                "`{}` at {:?} is in an item a `cfg` removes: the scope around that item",
+                ty.syntax().text(),
+                ty.syntax().text_range()
+            );
+        }
+        assert_eq!(asked, 4, "the two `u8` of each removed function");
+    });
+}
+
+/// The invariant: an item written in a block of a type (an anonymous constant of a signature:
+/// an array's length, a const argument; of a function, a type alias, a struct's field, an
+/// impl's header) maps to the def made from it, as one in a body's block does, and a node in it
+/// is read in its own scope, never in the one around the type. The signature's store has
+/// blocks of its own, which the map of the signature lists as a body's lists its blocks.
+#[test]
+fn an_item_in_a_block_of_a_type_maps_to_its_def() {
+    let fx = fixture::db(
+        r#"
+//- /main.rs crate:main
+pub struct A<const N: usize>;
+pub trait Tr {}
+fn ret() -> [u8; { fn in_return() -> usize { 1 } in_return() }] { loop {} }
+fn param(_: A<{ fn in_param<T>(_: T) -> usize { 1 } 1 }>) {}
+type Alias = [u8; { fn in_alias() {} 1 }];
+pub struct Field { a: [u8; { fn in_field() {} 1 }] }
+impl Tr for A<{ fn in_impl() {} 1 }> {}
+"#,
+    );
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let vsema = Semantics::new(&db);
+        let root = vsema.parse(file_id).syntax();
+        let mut fns = 0u32;
+        for node in root.descendants().filter_map(view::Fn::cast) {
+            fns += 1;
+            let def = vsema.to_fn_def(node).unwrap_or_else(|| {
+                panic!("`fn` at {:?} maps to its def", node.syntax().text_range())
+            });
+            let source = vsema.source(def).expect("the function's source");
+            assert_eq!(
+                source.value.syntax().text_range(),
+                node.syntax().text_range(),
+                "the `fn` at {:?} maps to the function made from it",
+                node.syntax().text_range()
+            );
+        }
+        assert_eq!(fns, 7, "`ret`, `param` and the five in blocks of types");
+        let t = root
+            .descendants()
+            .filter_map(view::PathType::cast)
+            .find(|it| it.syntax().text() == "T")
+            .expect("`T` of `in_param`");
+        assert!(
+            matches!(
+                vsema.resolve_path(t.path().expect("a path type has a path")),
+                Some(crate::PathResolution::TypeParam(_))
+            ),
+            "`T` in `in_param` is its own parameter"
         );
     });
 }

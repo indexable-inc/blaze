@@ -318,8 +318,8 @@ fn root_params(
     body: Body,
     args: &StoredGenericArgs,
 ) -> Result<(), String> {
-    // clone: the query's keys, reference counts
-    let mir = dispatch::body_of(db, env.clone(), body, args.clone())
+    // Read once, for the root's parameters, and dropped with them (`dispatch::body_once`).
+    let mir = dispatch::body_once(db, env, body, args)
         .map_err(|error| format!("its MIR does not lower: {error:?}"))?; // alloc: error path
     let cx = Cx::new(db, env);
     let mut seen = HashSet::new_in(Global);
@@ -422,9 +422,12 @@ fn summary(
             h.finish()
         }
         Node::Walk(body, args) => {
-            // clone: the query's keys, reference counts
-            let mir = dispatch::body_of(db, env.clone(), *body, args.clone())
+            // Read once and dropped as the part is made: the row keeps the instance's part and
+            // callees, never its body, which a memo would hold one of an instance the step
+            // reaches for the build's life (`dispatch::body_once`).
+            let mir = body_once(db, &env, *body, args)
                 .map_err(|error| format!("its MIR does not lower: {error:?}"))?; // alloc: error path
+            let mir = &mir;
             // Its arithmetic checks overflow when the crate it is written in keeps the checks
             // (or it takes its callers') and the crate compiling the step runs them, as rustc's
             // code generator drops an optional overflow check its crate does not run.
@@ -448,6 +451,46 @@ fn summary(
         return Err(what.into_boxed_str());
     }
     Ok(Summary { content, callees: follow.callees.into_boxed_slice() })
+}
+
+/// The monomorphized runtime body of `body` with `args` in `env`, made for the caller and
+/// dropped by it.
+fn body_once<'db>(
+    db: &'db Db,
+    env: &StoredParamEnvAndCrate,
+    body: Body,
+    args: &StoredGenericArgs,
+) -> Result<hir_ty_mir::mir::MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
+    #[cfg(test)]
+    if plant::keeps_bodies() {
+        // The planted bug of the held-count test: the memoized body, as until 2026-11-13.
+        // clone: the body query's keys, reference counts; the memo's body, a planted bug's copy
+        return dispatch::body_of(db, env.clone(), body, args.clone()).map(Clone::clone);
+    }
+    dispatch::body_once(db, env, body, args)
+}
+
+/// What a test plants in the walk.
+#[cfg(test)]
+pub(crate) mod plant {
+    use std::cell::Cell;
+
+    thread_local! {
+        static KEEPS_BODIES: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn keeps_bodies() -> bool {
+        KEEPS_BODIES.with(Cell::get)
+    }
+
+    /// `work` with every instance's body read on this thread from the memo that keeps one an
+    /// instance.
+    pub(crate) fn keeping_bodies<R>(work: impl FnOnce() -> R) -> R {
+        KEEPS_BODIES.with(|it| it.set(true));
+        let made = work();
+        KEEPS_BODIES.with(|it| it.set(false));
+        made
+    }
 }
 
 fn summary_cycle(

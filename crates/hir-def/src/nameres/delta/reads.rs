@@ -21,6 +21,10 @@ use crate::ModuleId;
 /// `(reader, (module, name))`.
 pub(crate) type Read = (Option<ModuleId>, (ModuleId, Option<Name>));
 
+#[expect(
+    blaze::process_static,
+    reason = "READS holds one job's reads, taken or cleared when the job ends and carried across its waits; the job should own it"
+)]
 thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
     static READER: Cell<Option<ModuleId>> = const { Cell::new(None) };

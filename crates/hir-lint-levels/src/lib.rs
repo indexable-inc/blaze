@@ -20,6 +20,8 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod attrs;
 pub mod builder;

@@ -12,7 +12,7 @@ import { ID_RULE, aspectOf, shaderWire, texturesProblem, uniformsOf } from './sh
 
 /** The element names the app draws (genui.rs `ELEMENTS`, one `hn.Gen<Name>` prefab each in scene/widgets/genui.flecs). */
 export const ELEMENT_NAMES = [
-  'Column', 'Row', 'Text', 'Markdown', 'Code', 'Table', 'Badge', 'Stat', 'Card', 'Divider', 'Spacer',
+  'Column', 'Row', 'Text', 'Markdown', 'Code', 'Table', 'Badge', 'Stat', 'Card', 'Question', 'Divider', 'Spacer',
   // Charts, and drawing: shapes in a Canvas's own coordinates, in the scene's inks (draw.ts maps SVG onto these).
   'Chart', 'Canvas', 'Group', 'Path', 'Rect', 'Circle', 'Line', 'Polyline',
   // Controls: what the person presses, drags, types and picks; each sends its event back by handler id (index.ts `dispatch`).
@@ -88,6 +88,7 @@ export const OWN_PROPS: Record<ElementName, readonly string[]> = {
   Badge: ['text', 'tone', 'tip', 'children'],
   Stat: ['label', 'value', 'note', 'tone', 'tip'],
   Card: ['title', 'gap', 'pad', 'tip', 'children'],
+  Question: ['text', 'detail', 'options', 'recommended', 'ahead', 'value', 'answer', 'allowText', 'onchoose', 'onchange', 'onsubmit'],
   Divider: ['tip'],
   Spacer: ['size', 'tip'],
   Chart: ['kind', 'data', 'labels', 'series', 'height', 'unit', 'center', 'caption', 'hole', 'pop', 'sep', 'fillOpacity', 'tone', 'legend', 'onselect', 'tip'],
@@ -180,6 +181,7 @@ export const MAX_POINTS = 2000;
 /** The most options a Select, Choice or Radio offers, the longest label a control or an option shows, and the most lines a TextArea is tall. */
 export const MAX_OPTIONS = 200;
 export const MAX_LABEL = 200;
+export const MAX_QUESTION = 140;
 export const MAX_LINES = 40;
 /**
  * The words a Kip's `mood` takes (harness-native-kip act.rs reads the same), each a mood it plays: `celebrate` is two hops. `then`
@@ -392,6 +394,7 @@ const affine: Rule = v => typeof v === 'string' || (Array.isArray(v) && v.length
 
 const label: Rule = v => (typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v))) && String(v).length <= MAX_LABEL ? undefined : `words (a string) of at most ${MAX_LABEL} characters`;
 const text: Rule = v => typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)) ? undefined : 'words (a string)';
+const questionWords: Rule = v => typeof v === 'string' ? undefined : 'a string';
 const positive: Rule = numeral(n => n > 0, 'a number above 0');
 const lines: Rule = whole(1, MAX_LINES, 'lines');
 
@@ -497,6 +500,23 @@ export function optionsOf(value: unknown): WireOption[] | string {
   return out;
 }
 const options: Rule = v => { const o = optionsOf(v); return typeof o === 'string' ? o : undefined; };
+
+/** Rich question options retain each explanation beside its label, rather than flattening it into unrelated text. */
+export function questionOptionsOf(value: unknown): { label: string; detail?: string }[] | string {
+  if (!Array.isArray(value) || value.length > MAX_OPTIONS) return `a list of at most ${MAX_OPTIONS} {label, detail?} options`;
+  const out: { label: string; detail?: string }[] = [];
+  for (const [i, option] of value.entries()) {
+    if (!option || typeof option !== 'object' || Array.isArray(option)) return `options[${i}] must be {label, detail?}`;
+    const stray = Object.keys(option).find(k => k !== 'label' && k !== 'detail');
+    if (stray) return `options[${i}] has unknown field ${JSON.stringify(stray)}`;
+    if (typeof option.label !== 'string' || !option.label.trim() || option.label.length > MAX_LABEL) return `options[${i}].label must contain 1 to ${MAX_LABEL} characters`;
+    if (option.detail !== undefined && typeof option.detail !== 'string') return `options[${i}].detail must be a string`;
+    out.push(option.detail === undefined ? { label: option.label } : { label: option.label, detail: option.detail });
+  }
+  if (new Set(out.map(o => o.label)).size !== out.length) return 'question option labels must be unique';
+  return out;
+}
+const questionOptions: Rule = v => { const options = questionOptionsOf(v); return typeof options === 'string' ? options : undefined; };
 
 /** A transition as the app springs it: every field said, with Svelte's defaults (svelte.ts `trans` maps Svelte's own params onto it). */
 export interface Transition { kind: typeof TRANSITIONS[number]; x: number; y: number; start: number; opacity: number; axis: 'x' | 'y'; ms: number; delay: number }
@@ -636,6 +656,7 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
   Slider: { value: number, min: number, max: number, step: positive, label, disabled: flag, id },
   NumberField: { value: number, min: number, max: number, step: positive, label, disabled: flag, id },
   Input: { value: text, placeholder: label, label, disabled: flag },
+  Question: { text: questionWords, detail: questionWords, options: questionOptions, recommended: questionWords, ahead: questionWords, value: questionWords, answer: questionWords, allowText: flag },
   TextArea: { value: text, placeholder: label, lines, disabled: flag },
   Select: { options, placeholder: label, disabled: flag },
   Choice: { options, disabled: flag },
@@ -684,7 +705,7 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
 
 /** The elements that go to the app as exactly the props `elementWire` gives them: the controls, and every element of tier 3. */
 export const WIRED: ReadonlySet<string> = new Set([
-  'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio', 'ColorPicker', 'DropZone',
+  'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio', 'ColorPicker', 'DropZone', 'Question',
   'Grid', 'Stack', 'Layer', 'Wrap', 'Scroll', 'Split', 'Tabs', 'Accordion', 'Disclosure', 'Popover', 'Menu', 'Dialog', 'Sheet', 'Toast',
   'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'File', 'CellRef', 'Kip', 'Video', 'Shader', 'Browser',
 ]);
@@ -712,6 +733,21 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
     return String(props[name]);
   };
   switch (element) {
+    case 'Question': {
+      out.text = needs('text', 'the question to answer');
+      if ((out.text as string).length > MAX_QUESTION) throw fail(`has a question longer than ${MAX_QUESTION} characters`, 'put supporting context in detail');
+      const options = questionOptionsOf(props.options ?? []);
+      if (typeof options === 'string') throw fail(options);
+      out.options = options;
+      out.value = given('value') ? String(props.value) : '';
+      out.allowText = yes('allowText', options.length === 0);
+      if (!out.allowText && options.length === 0 && !given('answer')) throw fail('has no way to answer', 'provide options or allowText');
+      for (const name of ['recommended', 'ahead']) {
+        if (given(name) && !options.some(o => o.label === props[name])) throw fail(`${name} must name one of its options`);
+      }
+      put('detail', 'recommended', 'ahead', 'answer', 'onChoose', 'onChange', 'onSubmit');
+      break;
+    }
     case 'Button': {
       if (!given('label') || String(props.label).trim() === '') throw fail('has no label', 'say label="Save", or write its words between its tags, <Button>Save</Button>');
       const words = String(props.label);

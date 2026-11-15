@@ -31,6 +31,8 @@ pub struct HostFacts {
 impl HostFacts {
     /// The simulation's machine unless a test says otherwise: process 1 on a four-core host
     /// named `sim`.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn simulated() -> HostFacts {
         HostFacts {
             pid: 1,
@@ -55,6 +57,9 @@ pub struct Host {
 }
 
 impl Host {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Host {
         Host { io }
     }

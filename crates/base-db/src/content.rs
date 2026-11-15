@@ -89,6 +89,10 @@ pub(crate) fn opt_bytes(out: &mut Vec<u8>, part: Option<&str>) {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread batch scratch kept at the largest batch hashed, uncapped"
+)]
 thread_local! {
     /// The IDs of the batch being hashed, kept across setter calls.
     static IDS: RefCell<Scratch<ContentId>> = const { RefCell::new(Scratch::new()) };

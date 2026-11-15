@@ -141,6 +141,14 @@ impl fmt::Display for SlotError {
 
 impl std::error::Error for SlotError {}
 
+/// A slot is itself alone: each has its own serial, so a slot given to an input's setter is
+/// never the one the field holds, and the set is a write (`InputSetter::to` compares).
+impl<T> PartialEq for Slot<T> {
+    fn eq(&self, other: &Slot<T>) -> bool {
+        self.serial == other.serial
+    }
+}
+
 /// A write-once slot of `T`: see the module.
 pub struct Slot<T> {
     name: SlotName,

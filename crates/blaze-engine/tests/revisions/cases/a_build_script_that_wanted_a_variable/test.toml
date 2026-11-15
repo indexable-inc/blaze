@@ -1,0 +1,26 @@
+about = "A build that fails in one build script for want of a variable, run again with the variable set, runs that script and makes what was blocked behind it (its library, the program), and nothing else: every unit and every other script's run the failed build finished is found, though the request's environment differs (tempo, 2026-11-12: one more variable, LIBCLANG_PATH, redid about 6,700 of 7,909 steps)."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "other"]
+prints = "52\n"
+
+[[revision]]
+steps = []
+action = "build"
+args = ["-p", "app"]
+fails = "NEEDED_BY_THE_SCRIPT"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { NEEDED_BY_THE_SCRIPT = "here" }
+prints = "52 here\n"
+reused = ["up::sum"]
+# The script's run, its library and the program: a run is counted among the units made.
+max_units = 3
+max_records = 2
+max_runs = 1
+known = { alarms = "the build after one that failed first does the work that one left, and `blaze why` has no recorded reason for 1 step it recomputed (2026-11-12, int-1112 d45e70ddcd: unexplained=1); the units made are as bounded (3)" }

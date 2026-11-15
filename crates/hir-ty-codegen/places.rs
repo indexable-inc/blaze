@@ -37,6 +37,7 @@ pub(crate) enum Place {
 }
 
 /// File, line and column of a place in a body, as rustc reports them.
+#[blaze::renders_positions]
 pub(crate) fn source_location(
     db: &Db,
     owner: DefWithBodyId,
@@ -50,6 +51,7 @@ pub(crate) fn source_location(
 }
 
 /// File, line and column of a place in a body for a debugger: [`row_location_in_file`].
+#[blaze::renders_positions]
 pub(crate) fn row_location(
     db: &Db,
     owner: DefWithBodyId,
@@ -85,17 +87,35 @@ fn compare<T: PartialEq + fmt::Debug + Copy>(
 
 fn resolve(db: &Db, owner: DefWithBodyId, place: Place) -> Option<(base_db::FileId, u32, u32)> {
     match place {
+        Place::At(..) => placed(None, place),
+        Place::Anchored { .. } => placed(*anchor_location(db, owner), place),
+    }
+}
+
+/// File, line and column of `place`, the anchor of its body beginning at `anchor`
+/// ([`anchor_location`]): the one rule that makes an item-relative place absolute, where a
+/// position is printed or written for the program to read. `None` for a place in an anchor
+/// that begins nowhere.
+pub(crate) fn placed(
+    anchor: Option<(base_db::FileId, u32, u32)>,
+    place: Place,
+) -> Option<(base_db::FileId, u32, u32)> {
+    match place {
         Place::At(file, line, column) => Some((file, line, column)),
         Place::Anchored { row, column } => {
-            let (file, line, first) = (*anchor_location(db, owner))?;
+            let (file, line, first) = anchor?;
             Some((file, line + row, if row == 0 { first + column } else { column + 1 }))
         }
     }
 }
 
-/// File, line and column of where the anchor of the body begins.
+/// File, line and column of where the anchor of the body begins: the one thing of a body's
+/// places that a line added or removed above it moves.
 #[blaze_query::tracked]
-fn anchor_location(db: &Db, owner: DefWithBodyId) -> Option<(base_db::FileId, u32, u32)> {
+pub(crate) fn anchor_location(
+    db: &Db,
+    owner: DefWithBodyId,
+) -> Option<(base_db::FileId, u32, u32)> {
     let file_id = body_syntax(db, owner).as_ref()?.file_id.file_id()?;
     let start = Body::anchor_offset(db, owner)?;
     line_and_column(db, FileRange { file_id, range: TextRange::empty(start) })
@@ -146,6 +166,7 @@ fn call_node<'db>(db: &'db Db, syntax: &BodySyntax, call: MacroCallId) -> CallNo
 
 /// The file a place in a body is written in, and where in it rustc has the place begin: in
 /// the tree of [`BodySyntax::tree`] when that file is the body's own.
+#[blaze::renders_positions]
 fn source_range(
     db: &Db,
     owner: DefWithBodyId,
@@ -200,7 +221,8 @@ fn source_range(
 }
 
 /// The [`Place`] of [`source_location_in_file`].
-fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
+#[blaze::renders_positions]
+pub(crate) fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
     let Some(syntax) = body_syntax(db, owner).as_ref() else {
         let (file, line, column) = source_location_in_file(db, owner, span)?;
         return Some(Place::At(file, line, column));
@@ -210,6 +232,7 @@ fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
 }
 
 /// The [`Place`] of [`row_location_in_file`].
+#[blaze::renders_positions]
 fn row_place(
     db: &Db,
     owner: DefWithBodyId,

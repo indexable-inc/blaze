@@ -24,7 +24,7 @@ use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId, GenericDefId,
     HasModule, ItemContainerId, Lookup, TraitId, VariantId,
     attrs::AttrFlags,
-    expr_store::{Body, ExpressionStore, ExpressionStoreSourceMap, path::Path},
+    expr_store::{Body, ExpressionStore, path::Path},
     hir::{
         Array, AsmOperand, BinaryOp, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
         InlineAsmKind, Pat, PatId, RecordSpread, Statement, UnaryOp, Unsafe,
@@ -281,8 +281,6 @@ struct Walker<'a, 'db, 'i, S> {
     /// [`Walker::requires_unsafe`] can read it, in an `unsafe fn` with `suggest_unsafe_block`
     /// set: inside an expression entered without both, neither comes back.
     hir_context: Option<ExprId>,
-    /// The store's, once `hir_context` is first kept.
-    source_map: Option<&'db ExpressionStoreSourceMap>,
     /// rustc's `assignment_info`: the place being walked is the left side of a `=`.
     assigning: bool,
     in_union_destructure: bool,
@@ -326,7 +324,6 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             context,
             suggest_unsafe_block: true,
             hir_context: None,
-            source_map: None,
             assigning: false,
             in_union_destructure: false,
             inside_adt: false,
@@ -405,16 +402,14 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     }
 
     /// rustc's `ExprKind::Scope`: an expression with syntax is the `hir_context` of what is in
-    /// it. A desugared one has none, and leaves the context of what it is in.
+    /// it. A desugared one has none ([`ExpressionStore::is_synthesized`], a fact of the store, so
+    /// the walk reads no position), and leaves the context of what it is in.
     fn walk_expr(&mut self, current: ExprId) {
         if self.context != Context::UnsafeFn || !self.suggest_unsafe_block {
             return self.walk_expr_in(current);
         }
-        let (db, owner) = (self.db, self.owner);
-        let source_map =
-            *self.source_map.get_or_insert_with(|| ExpressionStore::with_source_map(db, owner).1);
         let outer = self.hir_context;
-        if source_map.expr_syntax(current).is_ok() {
+        if !self.store.is_synthesized(current) {
             self.hir_context = Some(current);
         }
         self.walk_expr_in(current);

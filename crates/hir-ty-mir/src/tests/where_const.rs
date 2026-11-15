@@ -254,6 +254,37 @@ fn an_expression_is_never_solved_for_its_parameters() {
     });
 }
 
+const RANGES: &str = r#"
+//- minicore: sized, int_bounds
+#![feature(blaze_comptime, blaze_const_exprs)]
+struct Int<const LO: i128, const HI: i128>(i128);
+fn new<const LO: i128, const HI: i128, const V: i128>() -> Int<LO, HI> where const { LO <= V && V <= HI } {
+    Int(V)
+}
+fn add<const A: i128, const B: i128, const C: i128, const D: i128>(a: Int<A, B>, b: Int<C, D>) -> Int<{ A + C }, { B + D }> {
+    Int(a.0 + b.0)
+}
+
+fn doubled() -> Int<0, 2147483646> { add(new::<0, 1073741823, 5>(), new::<0, 1073741823, 7>()) }
+fn too_narrow() { let _: Int<0, 100> = add(new::<0, 50, 1>(), new::<0, 51, 1>()); }
+fn too_wide() { let _ = add(new::<0, { i128::MAX }, 0>(), new::<0, 1, 0>()); }
+fn out_of_range() { let _ = new::<0, 10, 11>(); }
+"#;
+
+/// `Int<LO, HI>` as a library over `where const` (docs/v2/plan/design/refined-values.md,
+/// "`Int<LO, HI>`"): the sum of two `0..=i32::MAX/2` is `0..=i32::MAX - 1` by the types; a
+/// range that does not contain the sum is a type error; a bound that overflows `i128` is an
+/// error, never a wrapped range; a literal outside its range is refused by the condition.
+#[test]
+fn ranged_integers_are_checked_in_the_types() {
+    with_db(RANGES, |db| {
+        accepted(db, "doubled");
+        assert!(!diagnostics(db, "too_narrow").is_empty(), "`Int<0, 101>` given for `Int<0, 100>`");
+        assert!(!diagnostics(db, "too_wide").is_empty(), "`i128::MAX + 1` as a bound");
+        assert_eq!(condition_refused(db, "out_of_range"), Failure::False);
+    });
+}
+
 /// The whole of it: `Acyclic` derived by bstd's walk through a `where const` impl. A type the
 /// walk clears meets the bound; one it refuses does not, and the bound's error has the path.
 #[test]

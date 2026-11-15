@@ -1,7 +1,7 @@
 //! An output placed from its maker's bytes ([`Store::place_made`]): the edit path's place, on
 //! the simulation ([`Sim`]), with the store's own whole files in every state beside it (a cold
 //! place writes one, seals it and begins its write-back), write-backs that never complete
-//! ([`Sim::hold_syncs`]), clean reopens and crashes at any completion. Hegel draws the run.
+//! ([`Sim::hold_syncs`]), clean reopens and crashes at any completion. The case's tape draws the run.
 //!
 //! What the simulation shows of a clone of a file with data not written back: the bytes the
 //! clone forces out of its source ([`Sim::bytes_forced`]), which on a real disk the clone
@@ -19,10 +19,8 @@
 //! once the write-back each place asks for as it ends has completed
 //! ([`PlacePlant::MadeNoWriteBack`] takes it out).
 
-use hegel::TestCase;
-use hegel::generators as gs;
-
 use blaze_core::sim::SECTOR;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 
@@ -38,7 +36,7 @@ enum Op {
     /// so the store's own files are being made while made outputs are placed.
     Cold { seed: u64, path: u8, steps: Option<u8> },
     /// The image `image` placed at path `path` from its maker's bytes, as a build's job does:
-    /// the whole file of what the path held is let go of first ([`Store::unplace_made`]).
+    /// the whole file of what the path held is let go of as it is answered ([`crate::whole`]).
     /// Then `steps` completions are delivered (none: all of them).
     Place { image: u8, path: u8, steps: Option<u8> },
     /// What path `path` holds brought to another file by a patch ([`Store::place_patched`]):
@@ -62,10 +60,9 @@ struct Case {
     ops: Vec<Op>,
 }
 
-/// What a place puts at a path: its bytes, and for a value of the store its key.
+/// What a place puts at a path: its bytes.
 struct Value {
     bytes: Vec<u8>,
-    key: Option<Key>,
 }
 
 /// A place asked and not yet answered; `made`, by [`Store::place_made`].
@@ -90,8 +87,6 @@ struct World {
     values: Vec<Value>,
     /// What each path holds: none, or exactly these bytes.
     holds: [Option<Vec<u8>>; PATHS.len()],
-    /// The value each path was last placed with.
-    last: [Option<usize>; PATHS.len()],
     /// Every value a place was ever asked of at each path, a patch's with the bytes it was
     /// a patch over.
     ever: [Vec<(usize, Option<Vec<u8>>)>; PATHS.len()],
@@ -148,7 +143,6 @@ impl World {
             images: Vec::new(),
             values: Vec::new(),
             holds: [None, None, None],
-            last: [None; PATHS.len()],
             ever: [Vec::new(), Vec::new(), Vec::new()],
             dirty: [0; PATHS.len()],
             allowed: 0,
@@ -168,9 +162,12 @@ impl World {
     }
 
     /// What the store asks the driver for now, held to the rule while only made places were
-    /// asked since it opened: no clone but of a path's own file to a name beside it (a
-    /// patch's), no write-back but of a path's own file (asked as its place ends, waited for
-    /// by nothing), and no write or rename that waits for a sync.
+    /// asked since it opened: no clone and no copy of data but of a path's own file to a name
+    /// beside it (a patch's), no link but between two names outside the store (a second
+    /// path's), no write-back but of a path's own file (asked as its place ends, waited for by
+    /// nothing), no prewarm but of a clone beside a path from that path's own file (a patch's:
+    /// what reads no file of the store's and writes nothing), and no write or rename that
+    /// waits for a sync.
     fn asks(&self) -> Result<(), String> {
         if self.cold {
             return Ok(());
@@ -178,9 +175,23 @@ impl World {
         let own = |file: &FileName| PATHS.iter().any(|it| name(it) == *file);
         for effect in &self.effects {
             let what = match effect {
-                Effect::Clone { from, to, .. } if own(from) && !to.is_under(&name("store")) => continue,
+                Effect::Clone { from, to, .. } | Effect::CopyData { from, to, .. }
+                    if own(from) && !to.is_under(&name("store")) =>
+                {
+                    continue
+                }
+                // The second path of one program, a name of the first's staged file.
+                Effect::Link { from, to, .. }
+                    if !from.is_under(&name("store")) && !to.is_under(&name("store")) =>
+                {
+                    continue
+                }
                 Effect::WriteBack { file, .. } if own(file) => continue,
+                Effect::Prewarm { like, file, .. } if own(like) && !file.is_under(&name("store")) => continue,
+                Effect::Prewarm { .. } => "a prewarm from a file that is no path's own",
                 Effect::Clone { .. } => "a clone",
+                Effect::CopyData { .. } => "a copy of a file's data",
+                Effect::Link { .. } => "a link to a file of the store's",
                 Effect::WriteBack { .. } => "a write-back",
                 Effect::Sync { .. } => "a sync",
                 Effect::Write { .. } => "a write that waits for a sync",
@@ -261,7 +272,6 @@ impl World {
                     self.dirty[n] = placed.bytes.copied;
                     // clone: the model's copy of what the path holds.
                     self.holds[n] = Some(want.clone());
-                    self.last[n] = Some(value);
                 }
                 // Nothing here fills the disk or fails an effect: a made place has no
                 // reason to fail.
@@ -339,10 +349,6 @@ impl World {
                     there.map(|it| it.len())
                 ));
             }
-            self.last[n] = self.ever[n]
-                .iter()
-                .map(|it| it.0)
-                .find(|value| Some(&self.values[*value].bytes) == there.as_ref());
             self.holds[n] = there;
             // What the device holds is all there is: nothing of it is in memory alone.
             self.dirty[n] = 0;
@@ -375,7 +381,7 @@ impl World {
             Op::Make { seed, sectors, tail, runs } => {
                 let (file, bytes) = image_of(seed, sectors, tail, runs);
                 self.images.push((file, self.values.len()));
-                self.values.push(Value { bytes, key: None });
+                self.values.push(Value { bytes });
             }
             Op::Cold { seed, path: n, steps } => {
                 let n = usize::from(n) % PATHS.len();
@@ -391,14 +397,11 @@ impl World {
                 store.flush(&mut self.effects);
                 self.pump(None)?;
                 let store = self.store.as_mut().expect("the store is open");
-                if let Some(before) = self.last[n].and_then(|it| self.values[it].key) {
-                    store.unplace(&before, &key, &mut self.effects);
-                }
                 let tag = store
                     .place(&key, path(n), &mut self.effects)
                     .ok_or_else(|| "the store has no value to place".to_owned())?;
                 let value = self.values.len();
-                self.values.push(Value { bytes, key: Some(key) });
+                self.values.push(Value { bytes });
                 self.asked.push(Asked { tag, path: n, value, made: false, reports: None });
                 self.ever[n].push((value, None));
                 self.pump(steps)?;
@@ -415,9 +418,6 @@ impl World {
                 // clone: the runs the place's writes own, as a link's are handed over.
                 let (file, value) = self.images[usize::from(image) % self.images.len()].clone();
                 let store = self.store.as_mut().expect("the store is open");
-                if let Some(before) = self.last[n].and_then(|it| self.values[it].key) {
-                    store.unplace_made(&before, &mut self.effects);
-                }
                 let reports = Some((file.bytes(), 0));
                 let tag = store.place_made(path(n), file, &mut self.effects);
                 self.asked.push(Asked { tag, path: n, value, made: true, reports });
@@ -434,7 +434,10 @@ impl World {
                 let Some(base) = self.holds[n].clone() else { return Ok(()) };
                 let mut rng = Rng::new(seed);
                 let len = (base.len() as u64 + u64::from(grow)).saturating_sub(100).max(1);
-                let count = rng.below(4);
+                // No more runs than bytes: each run has a byte of room of its own, so no two
+                // begin at one offset (a file of 1 byte drew two runs at 0, which is no file,
+                // and the case failed in the place's own check before it tested anything).
+                let count = rng.below(4).min(len);
                 let room = len / count.max(1);
                 let runs: Vec<(u64, Vec<u8>)> = (0..count)
                     .map(|k| {
@@ -453,13 +456,10 @@ impl World {
                 let file = Sparse { len, runs };
                 let wrote = file.bytes();
                 let store = self.store.as_mut().expect("the store is open");
-                if let Some(before) = self.last[n].and_then(|it| self.values[it].key) {
-                    store.unplace_made(&before, &mut self.effects);
-                }
                 self.allowed += self.dirty[n];
-                let tag = store.place_patched(path(n), file, &mut self.effects);
+                let tag = store.place_patched(path(n), file, n % 2 == 0, &mut self.effects);
                 let value = self.values.len();
-                self.values.push(Value { bytes, key: None });
+                self.values.push(Value { bytes });
                 let reports = Some((wrote, len.saturating_sub(wrote)));
                 self.asked.push(Asked { tag, path: n, value, made: true, reports });
                 self.ever[n].push((value, Some(base)));
@@ -501,41 +501,36 @@ fn forced(case: &Case, plant: PlacePlant) -> Result<u64, String> {
     Ok(world.sim.bytes_forced().saturating_sub(world.allowed))
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let byte = |tc: &TestCase| tc.draw(gs::integers::<u8>());
-    let steps = |tc: &TestCase| match tc.draw(gs::booleans()) {
-        true => Some(tc.draw(gs::integers::<u8>().max_value(12))),
-        false => None,
-    };
-    match tc.draw(gs::integers::<u8>().max_value(21)) {
+fn op(tape: &Tape) -> Op {
+    let byte = |tape: &Tape, label: &'static str| tape.int::<u8>(label);
+    let steps = |tape: &Tape| tape.option("steps", |tape| tape.int_in(0..=12u8, "steps"));
+    match tape.int_in(0..=21u8, "op") {
         16.. => Op::Patch {
-            seed: tc.draw(gs::integers()),
-            path: byte(tc),
-            grow: byte(tc),
-            steps: steps(tc),
+            seed: tape.int::<u64>("patch seed"),
+            path: byte(tape, "path"),
+            grow: byte(tape, "grow"),
+            steps: steps(tape),
         },
         0..3 => Op::Make {
-            seed: tc.draw(gs::integers()),
-            sectors: tc.draw(gs::integers::<u8>().max_value(60)),
-            tail: byte(tc),
-            runs: byte(tc),
+            seed: tape.int::<u64>("make seed"),
+            sectors: tape.int_in(0..=60u8, "sectors"),
+            tail: byte(tape, "tail"),
+            runs: byte(tape, "runs"),
         },
-        3 | 4 => Op::Cold { seed: tc.draw(gs::integers()), path: byte(tc), steps: steps(tc) },
-        5..12 => Op::Place { image: byte(tc), path: byte(tc), steps: steps(tc) },
+        3 | 4 => Op::Cold { seed: tape.int::<u64>("cold seed"), path: byte(tape, "path"), steps: steps(tape) },
+        5..12 => Op::Place { image: byte(tape, "image"), path: byte(tape, "path"), steps: steps(tape) },
         12 => Op::Settle,
         13 | 14 => Op::Crash,
         _ => Op::Reopen,
     }
 }
 
-#[hegel::composite]
-fn case(tc: &TestCase) -> Case {
+fn case(tape: &Tape) -> Case {
     Case {
-        seed: tc.draw(gs::integers()),
-        latency_us: tc.draw(gs::integers().min_value(1).max_value(2000)),
-        held: tc.draw(gs::booleans()),
-        ops: tc.draw(gs::vecs(op()).min_size(1).max_size(24)),
+        seed: tape.next_u64("sim seed"),
+        latency_us: tape.int_in(1..=2000u64, "latency us"),
+        held: tape.bool("held"),
+        ops: tape.vec(1..=24, "ops", op),
     }
 }
 
@@ -553,11 +548,11 @@ fn case(tc: &TestCase) -> Case {
 /// path holds nothing, a value once placed there whole, or what the power left of one (each
 /// byte the value's, a zero or, for a patch, its base's), never bytes of anything else; and
 /// the store opens.
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back() {
-    super::model_check::run_cases(96, |tc| {
-        let case = tc.draw(case());
+    blaze_sim::check(SimConfig::cases(96), |tape| {
+        let case = case(tape);
         match forced(&case, PlacePlant::None) {
             Err(why) => panic!("{case:?}: {why}"),
             Ok(0) => {}
@@ -638,7 +633,7 @@ fn a_made_outputs_place_writes_its_runs_and_no_patch_room() {
     for (at, bytes) in &file.runs {
         want[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes);
     }
-    let (wrote, read) = (sim.bytes_written(), sim.bytes_read());
+    let (wrote, read) = (own(sim.bytes_written(), &store), sim.bytes_read());
     let mut effects = Vec::new();
     // clone: the second path's writes own their runs, as the first's do.
     store.place_made(name("one/build/deps/app"), file.clone(), &mut effects);
@@ -648,12 +643,12 @@ fn a_made_outputs_place_writes_its_runs_and_no_patch_room() {
     assert_eq!(placed.len(), 2, "{placed:?}");
     for it in &placed {
         assert_eq!(it.result, Ok(()));
-        let bytes = PlacedBytes { cloned: 0, written: 0, copied: 4 * RUN as u64 };
+        let bytes = PlacedBytes { cloned: 0, written: 0, copied: 4 * RUN as u64, kernel: 0 };
         assert_eq!(it.bytes, bytes);
     }
     assert_eq!(sim.contents(&name("one/build/deps/app")), want);
     assert_eq!(sim.contents(&name("one/build/app")), want);
-    assert_eq!(sim.bytes_written() - wrote, 2 * 4 * RUN as u64, "the runs, once a path");
+    assert_eq!(own(sim.bytes_written(), &store) - wrote, 2 * 4 * RUN as u64, "the runs, once a path");
     assert_eq!(sim.bytes_read(), read, "nothing of the store is read");
     assert_eq!(sim.bytes_forced(), 0);
 }
@@ -708,7 +703,7 @@ fn a_patched_outputs_place_writes_its_patch_whatever_the_files_length() {
         }
         drive(&mut sim, &mut store, &mut effects);
         assert!(store.placed().iter().all(|it| it.result == Ok(())));
-        let (wrote, read) = (sim.bytes_written(), sim.bytes_read());
+        let (wrote, read) = (own(sim.bytes_written(), &store), sim.bytes_read());
         for edit in 0..2u64 {
             let patch = Sparse {
                 len,
@@ -719,7 +714,7 @@ fn a_patched_outputs_place_writes_its_patch_whatever_the_files_length() {
             }
             for to in &paths {
                 // clone: each path's writes own their runs.
-                store.place_patched(to.clone(), patch.clone(), &mut effects);
+                store.place_patched(to.clone(), patch.clone(), true, &mut effects);
             }
             drive(&mut sim, &mut store, &mut effects);
             let placed = store.placed();
@@ -727,7 +722,7 @@ fn a_patched_outputs_place_writes_its_patch_whatever_the_files_length() {
             for it in &placed {
                 assert_eq!(it.result, Ok(()));
                 let bytes =
-                    PlacedBytes { cloned: len - 2 * RUN as u64, written: 0, copied: 2 * RUN as u64 };
+                    PlacedBytes { cloned: len - 2 * RUN as u64, written: 0, copied: 2 * RUN as u64, kernel: 0 };
                 assert_eq!(it.bytes, bytes);
             }
             for to in &paths {
@@ -736,7 +731,7 @@ fn a_patched_outputs_place_writes_its_patch_whatever_the_files_length() {
         }
         assert_eq!(sim.bytes_read(), read, "nothing is read");
         assert_eq!(sim.bytes_forced(), 0, "each clone is of a file written back");
-        sim.bytes_written() - wrote
+        own(sim.bytes_written(), &store) - wrote
     };
     let (small, large) = (wrote_by(16 << 20), wrote_by(64 << 20));
     assert_eq!(small, 2 * 2 * 2 * RUN as u64, "two edits, two paths, two runs of 4 KiB");
@@ -774,7 +769,7 @@ fn a_patch_of_a_path_with_no_file_fails_naming_it() {
     let mut store = open(&mut sim, "store");
     let mut effects = Vec::new();
     let patch = Sparse { len: 100, runs: vec![(10, vec![1; 20])] };
-    store.place_patched(name("one/build/app"), patch, &mut effects);
+    store.place_patched(name("one/build/app"), patch, true, &mut effects);
     drive(&mut sim, &mut store, &mut effects);
     let placed = store.placed();
     let why = placed[0].result.clone().unwrap_err();

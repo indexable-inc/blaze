@@ -1,0 +1,18 @@
+{
+ "id": "telemetry-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane telemetry-1112",
+ "where": "blaze-query: an input's write says nothing of who wrote it (crates/blaze-query/src/db/input.rs, counts::WRITTEN)",
+ "what": "The build's account has to say who wrote each input (a person's edit, a build script's output, blaze's own publication, a plan change, the watcher's wake). The engine counts a write per input kind and the setter takes no writer, so the account attributes by kind alone (`account::Writer::of_input`): a no-op's 53 writes read as `derived` and not as the call that made them.",
+ "cost": "outcome 1 of the lane is met by kind, not by site; the no-op that wrote 53 inputs is flagged (`needless-writes`) and still not named to its caller",
+ "cause": "a setter is `set_field(db).to(value)` with no argument for the cause",
+ "whys": [
+  "why by kind: the count is per ingredient",
+  "why no writer: a setter's signature has none, and 40-odd input kinds have callers across the front end",
+  "property: work (a view opened, every run after it) can be started with no recorded cause"
+ ],
+ "class": "work without a recorded cause",
+ "prevention": "not built: the setter takes a `Writer` (a static site name) as a required argument and counts written by (input, writer); a whole port of every setter call. Built meanwhile: the account's `written_*` by kind, a test that every `#[blaze_query::input]` of the tree has a writer named, and `account::Ledger::did` whose cause is a required argument",
+ "workaround": "`blaze explain writes build=N` names the fields reruns followed",
+ "state": "open, for the lane that owns blaze-query's inputs"
+}

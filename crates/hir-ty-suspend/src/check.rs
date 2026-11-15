@@ -24,7 +24,7 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::{
     BasicBlockId, LocalId, MirBody, MirSpan, StatementKind, TerminatorKind,
-    dispatch::{Body, body_of},
+    dispatch::Body,
 };
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use smallvec::SmallVec;
@@ -33,7 +33,7 @@ use std::alloc::Global;
 use crate::{
     dispatch::{Cx, Instance, Target, Unseen, concrete_args, sites},
     root::{MissingRoot, roots, send_trait},
-    summary::{owner_of, path, summary, suspends},
+    summary::{body_once, owner_of, path, summary, suspends},
 };
 
 /// A place in a body: the item whose body it is written in, and where in it.
@@ -415,9 +415,13 @@ fn instance_check(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> C
             path: Box::default(),
         }),
     }
-    let Ok(body) = body_of(db, cx.stored, instance.def, instance.args) else {
+    // Read again, once, for the check, and dropped with it: `summary` dropped its own. Two
+    // instantiations of an instance this crate checks, where the memo kept one per instance the
+    // walk reached for the build's life.
+    let Ok(body) = body_once(db, &cx.stored, &instance) else {
         return Checked { broken: broken.into_boxed_slice(), ..Checked::default() };
     };
+    let body = &body;
     let sites = sites(&cx, body);
 
     let mut blocks: SmallVec<[BasicBlockId; 8]> = SmallVec::new();

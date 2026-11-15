@@ -37,7 +37,7 @@ use std::alloc::Allocator;
 use std::fmt;
 use std::sync::Arc;
 
-pub use crate::macro_call_style::{MacroCallStyle, MacroCallStyles};
+pub use crate::macro_call_style::{MacroCall, MacroCallStyle, MacroCallStyles};
 use crate::parser::{MetaTemplate, MetaVarKind, Op};
 
 pub use tt::{Delimiter, DelimiterKind, Punct};
@@ -342,10 +342,10 @@ impl DeclarativeMacro {
         db: &Db,
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
-        call_style: MacroCallStyle,
+        call: MacroCall<'_>,
         call_site: Span,
     ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
-        self.expand_making(db, tt, marker, call_style, call_site).map(|(tree, arm, _)| (tree, arm))
+        self.expand_making(db, tt, marker, call, call_site).map(|(tree, arm, _)| (tree, arm))
     }
 
     /// [`Self::expand`], with the spans of the identifiers the expansion's `${concat(..)}`s made.
@@ -354,10 +354,12 @@ impl DeclarativeMacro {
         db: &Db,
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
-        call_style: MacroCallStyle,
+        call: MacroCall<'_>,
         call_site: Span,
     ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex, MadeIdents)> {
-        expander::expand_rules(db, &self.rules, tt, marker, call_style, call_site)
+        let input = self.input(tt, call, call_site);
+        let input = input.as_ref().unwrap_or(tt);
+        expander::expand_rules(db, &self.rules, input, marker, call.style(), call_site)
     }
 
     /// [`Self::expand`] with the output in `frame`, a temporary of the caller's task; the
@@ -368,10 +370,10 @@ impl DeclarativeMacro {
         db: &Db,
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
-        call_style: MacroCallStyle,
+        call: MacroCall<'_>,
         call_site: Span,
     ) -> ExpandResult<(tt::TopSubtree<&'f Frame>, MatchedArmIndex)> {
-        self.expand_making_in(frame, db, tt, marker, call_style, call_site)
+        self.expand_making_in(frame, db, tt, marker, call, call_site)
             .map(|(tree, arm, _)| (tree, arm))
     }
 
@@ -382,14 +384,33 @@ impl DeclarativeMacro {
         db: &Db,
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
-        call_style: MacroCallStyle,
+        call: MacroCall<'_>,
         call_site: Span,
     ) -> ExpandResult<(tt::TopSubtree<&'f Frame>, MatchedArmIndex, MadeIdents)> {
         let build = move |builder: tt::TopSubtreeBuilder| builder.build_in(frame);
+        let input = self.input(tt, call, call_site);
+        let input = input.as_ref().unwrap_or(tt);
+        let style = call.style();
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |scratch| {
             let rules = &self.rules;
-            expander::expand_rules_in(scratch, build, db, rules, tt, marker, call_style, call_site)
+            expander::expand_rules_in(scratch, build, db, rules, input, marker, style, call_site)
         })
+    }
+
+    /// The input the rules of `call`'s style match, when it is not `tt`: for an attribute, its
+    /// arguments and the item, as `attr(..)` rules match them. `None` when no rule is an
+    /// `attr(..)` rule, as then no rule is tried.
+    fn input(
+        &self,
+        tt: &tt::TopSubtree,
+        call: MacroCall<'_>,
+        call_site: Span,
+    ) -> Option<tt::TopSubtree> {
+        let MacroCall::Attr { args } = call else { return None };
+        if !self.rules.iter().any(|rule| rule.style == MacroCallStyle::Attr) {
+            return None;
+        }
+        Some(expander::attr_input(tt, args, call_site))
     }
 }
 
@@ -403,9 +424,9 @@ impl Rule {
         src: &mut TtIter<'_>,
     ) -> Result<Self, ParseError> {
         // Parse an optional `attr()` or `derive()` prefix before the LHS pattern.
-        let style = parser::parse_rule_style(src)?;
+        let (style, args) = parser::parse_rule_style(src)?;
 
-        let (_, lhs) =
+        let (item, lhs) =
             src.expect_subtree().map_err(|()| ParseError::expected("expected subtree"))?;
         src.expect_char('=').map_err(|()| ParseError::expected("expected `=`"))?;
         src.expect_char('>').map_err(|()| ParseError::expected("expected `>`"))?;
@@ -413,6 +434,23 @@ impl Rule {
             src.expect_subtree().map_err(|()| ParseError::expected("expected subtree"))?;
 
         let lhs = MetaTemplate::parse_pattern(edition, lhs)?;
+        // An `attr(..)` rule matches one input of two groups, the attribute's arguments and the
+        // item (`attr_input`), so its bindings from both are one match's.
+        let lhs = match args {
+            None => lhs,
+            Some((args, args_pattern)) => {
+                let args_pattern = MetaTemplate::parse_pattern(edition, args_pattern)?;
+                let group = |delimiter: tt::Delimiter, tokens| Op::Subtree {
+                    tokens,
+                    delimiter: tt::Delimiter { kind: tt::DelimiterKind::Parenthesis, ..delimiter },
+                };
+                // alloc: the rule's pattern, once per rule, when the macro is defined.
+                MetaTemplate(Box::new([
+                    group(args.delimiter, args_pattern),
+                    group(item.delimiter, lhs),
+                ]))
+            }
+        };
         let rhs = MetaTemplate::parse_template(edition, rhs)?;
 
         Ok(crate::Rule::new(style, lhs, rhs))

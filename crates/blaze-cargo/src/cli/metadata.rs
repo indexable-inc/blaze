@@ -104,13 +104,13 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         Version::One => {}
         Version::Unsaid => {
             let what = "please specify `--format-version` flag explicitly to avoid compatibility problems";
-            eprint!("{}", say::warning(what, color));
+            blaze_report::err!("{}", say::warning(what, color));
         }
         Version::Other(other) => {
             let what = format!(
                 "invalid value '{other}' for '--format-version <VERSION>'\n  [possible values: 1]"
             );
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             return Exit::Usage.code();
         }
     }
@@ -118,13 +118,13 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         Ok(cwd) => cwd,
         Err(error) => {
             let what = format!("blaze metadata: the current directory: {error}");
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             return Exit::Failed.code();
         }
     };
     match printed(&read, &cwd, own::env()) {
         Ok(json) => {
-            println!("{json}");
+            blaze_report::outln!("{json}");
             0
         }
         Err(error) => own::failed(&error, &cwd, color),

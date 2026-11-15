@@ -10,10 +10,10 @@ use std::sync::Arc;
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
 use blaze_hash::HashMap;
 use blaze_ids::radix;
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use serde::Serialize;
 use std::alloc::Global;
+use std::ops::RangeInclusive;
 
 use super::{Style, WIDTH};
 use crate::model::{
@@ -623,72 +623,96 @@ fn json_span(
 const FILE: &str = "src/lib.rs";
 const OTHER: &str = "src/other.rs";
 
+/// `sizes` printable ASCII characters (a space to `~`).
+fn printable(tape: &Tape, sizes: RangeInclusive<usize>, label: &'static str) -> String {
+    tape.vec(sizes, label, |tape| char::from(tape.int_in(b' '..=b'~', label))).into_iter().collect()
+}
+
+/// `sizes` lowercase ASCII letters.
+fn lowercase(tape: &Tape, sizes: RangeInclusive<usize>, label: &'static str) -> String {
+    tape.vec(sizes, label, |tape| char::from(tape.int_in(b'a'..=b'z', label))).into_iter().collect()
+}
+
 /// ASCII lines with `\n` ends, the last with or without one.
-fn text(tc: &TestCase) -> String {
-    let lines: Vec<String> =
-        tc.draw(gs::vecs(gs::from_regex("[ -~]{0,30}")).min_size(1).max_size(7));
+fn text(tape: &Tape) -> String {
+    let lines = tape.vec(1..=7, "lines", |tape| printable(tape, 0..=30, "line"));
     let mut text = lines.join("\n");
-    if tc.draw(gs::booleans()) {
+    if tape.bool("last newline") {
         text.push('\n');
     }
     text
 }
 
-fn span(tc: &TestCase, len: u32, other: u32) -> Span {
-    let in_other = tc.draw(gs::weighted_booleans(0.2));
+fn span(tape: &Tape, len: u32, other: u32) -> Span {
+    let in_other = tape.chance(0.2, "in other");
     let end = if in_other { other } else { len };
-    let (a, b): (u32, u32) =
-        tc.draw(gs::tuples!(gs::integers().max_value(end), gs::integers().max_value(end)));
+    let (a, b) = (tape.int_in(0..=end, "span end"), tape.int_in(0..=end, "span end"));
     let file = if in_other { OTHER } else { FILE };
     Span { file: file.to_owned(), lo: a.min(b), hi: a.max(b), expansion: None }
 }
 
-fn label(tc: &TestCase) -> String {
-    tc.draw(gs::from_regex("[ -~\t]{0,20}"))
+/// Up to 20 characters, each printable ASCII or a tab.
+fn label(tape: &Tape) -> String {
+    let characters = tape.vec(0..=20, "label", |tape| match tape.int_in(0..=95u8, "label") {
+        95 => '\t',
+        n => char::from(b' ' + n),
+    });
+    characters.into_iter().collect()
 }
 
-/// Between `min` and `max` of `item`.
-fn some<T>(tc: &TestCase, min: usize, max: usize, mut item: impl FnMut() -> T) -> Vec<T> {
-    let count: usize = tc.draw(gs::integers().min_value(min).max_value(max));
-    (0..count).map(|_| item()).collect()
+/// Between `min` and `max` of `item`, each one's draws a span.
+fn some<T>(
+    tape: &Tape,
+    min: usize,
+    max: usize,
+    what: &'static str,
+    mut item: impl FnMut() -> T,
+) -> Vec<T> {
+    let count = tape.int_in(min..=max, what);
+    (0..count).map(|_| tape.span(what, |_| item())).collect()
 }
 
 /// At least one primary span, some labels of their own and some on a primary span.
-fn multi(tc: &TestCase, len: u32, other: u32) -> MultiSpan {
-    let primary = some(tc, 1, 2, || span(tc, len, other));
-    let mut labels = some(tc, 0, 2, || (span(tc, len, other), label(tc)));
-    for _ in 0..tc.draw(gs::integers::<usize>().max_value(1)) {
-        let at: usize = tc.draw(gs::integers().max_value(primary.len() - 1));
-        labels.push((primary[at].clone(), label(tc)));
+fn multi(tape: &Tape, len: u32, other: u32) -> MultiSpan {
+    let primary = some(tape, 1, 2, "primary", || span(tape, len, other));
+    let mut labels = some(tape, 0, 2, "labels", || (span(tape, len, other), label(tape)));
+    for _ in 0..tape.int_in(0..=1usize, "primary labels") {
+        let at = tape.index(primary.len(), "labelled primary");
+        labels.push((primary[at].clone(), label(tape)));
     }
     MultiSpan { primary, labels }
 }
 
-fn child(tc: &TestCase, len: u32, other: u32) -> Child {
-    let level = match tc.draw(gs::integers::<u8>().max_value(2)) {
+fn child(tape: &Tape, len: u32, other: u32) -> Child {
+    let level = match tape.int_in(0..=2u8, "sublevel") {
         0 => Sublevel::Note,
         1 => Sublevel::Help,
         _ => Sublevel::Warning,
     };
-    let message = tc.draw(gs::from_regex("[ -~]{1,30}"));
-    let span = if tc.draw(gs::booleans()) { multi(tc, len, other) } else { MultiSpan::default() };
+    let message = printable(tape, 1..=30, "child message");
+    let span = if tape.bool("child span") { multi(tape, len, other) } else { MultiSpan::default() };
     Child { level, message, span, once: false }
 }
 
 /// Never empty: the JSON of an empty replacement of whole lines removes the line, as rustc's
 /// does and the reference's did not.
-fn replacement(tc: &TestCase) -> String {
-    match tc.draw(gs::integers::<u8>().max_value(2)) {
-        0 => tc.draw(gs::from_regex("[ -~]{1,12}")),
-        1 => tc.draw(gs::from_regex("[ -~]{1,6}\n[ -~]{0,6}")),
+fn replacement(tape: &Tape) -> String {
+    match tape.int_in(0..=2u8, "replacement") {
+        0 => printable(tape, 1..=12, "replacement"),
+        1 => {
+            let mut text = printable(tape, 1..=6, "replacement");
+            text.push('\n');
+            text.push_str(&printable(tape, 0..=6, "replacement"));
+            text
+        }
         _ => "#[inline]\n".to_owned(),
     }
 }
 
 /// One or two disjoint parts of the main file.
-fn substitution(tc: &TestCase, len: u32) -> Vec<(Span, String)> {
-    let mut at: [u32; 4] = tc.draw(gs::arrays(gs::integers().max_value(len)));
-    let (first, second, two) = (replacement(tc), replacement(tc), tc.draw(gs::booleans()));
+fn substitution(tape: &Tape, len: u32) -> Vec<(Span, String)> {
+    let mut at: [u32; 4] = tape.array("at", |tape| tape.int_in(0..=len, "at"));
+    let (first, second, two) = (replacement(tape), replacement(tape), tape.bool("two parts"));
     at.sort_unstable();
     let at_file = |lo: u32, hi: u32| Span { file: FILE.to_owned(), lo, hi, expansion: None };
     let mut parts = vec![(at_file(at[0], at[1]), first)];
@@ -698,16 +722,26 @@ fn substitution(tc: &TestCase, len: u32) -> Vec<(Span, String)> {
     parts
 }
 
-fn suggestion(tc: &TestCase, len: u32) -> Suggestion {
-    let message = tc.draw(gs::from_regex("[a-z]{1,8}( [a-z]{1,8}){0,12}"));
-    let substitutions = some(tc, 1, 6, || substitution(tc, len));
-    let applicability = match tc.draw(gs::integers::<u8>().max_value(3)) {
+/// One to thirteen words of one to eight lowercase letters, with a space between each two.
+fn words(tape: &Tape) -> String {
+    let mut message = lowercase(tape, 1..=8, "word");
+    for word in tape.vec(0..=12, "words", |tape| lowercase(tape, 1..=8, "word")) {
+        message.push(' ');
+        message.push_str(&word);
+    }
+    message
+}
+
+fn suggestion(tape: &Tape, len: u32) -> Suggestion {
+    let message = words(tape);
+    let substitutions = some(tape, 1, 6, "substitutions", || substitution(tape, len));
+    let applicability = match tape.int_in(0..=3u8, "applicability") {
         0 => Applicability::MachineApplicable,
         1 => Applicability::MaybeIncorrect,
         2 => Applicability::HasPlaceholders,
         _ => Applicability::Unspecified,
     };
-    let style = match tc.draw(gs::integers::<u8>().max_value(4)) {
+    let style = match tape.int_in(0..=4u8, "suggestion style") {
         0 => SuggestionStyle::HideCodeInline,
         1 => SuggestionStyle::HideCodeAlways,
         2 => SuggestionStyle::CompletelyHidden,
@@ -717,23 +751,26 @@ fn suggestion(tc: &TestCase, len: u32) -> Suggestion {
     Suggestion { message, substitutions, applicability, style }
 }
 
-fn diag(tc: &TestCase, len: u32, other: u32) -> Diag {
-    let level = if tc.draw(gs::booleans()) { Level::Warning } else { Level::Error };
-    let message = tc.draw(gs::from_regex("[ -~]{1,40}"));
+fn diag(tape: &Tape, len: u32, other: u32) -> Diag {
+    let level = if tape.bool("warning") { Level::Warning } else { Level::Error };
+    let message = printable(tape, 1..=40, "message");
     let mut diag = Diag::new(level, Some(Code::Lint("clippy::needless_bool".to_owned())), message);
-    diag.span = multi(tc, len, other);
-    diag.children = some(tc, 0, 2, || child(tc, len, other));
-    diag.suggestions = some(tc, 0, 2, || suggestion(tc, len));
-    diag.suggestions_disabled = tc.draw(gs::booleans());
+    diag.span = multi(tape, len, other);
+    diag.children = some(tape, 0, 2, "children", || child(tape, len, other));
+    diag.suggestions = some(tape, 0, 2, "suggestions", || suggestion(tape, len));
+    diag.suggestions_disabled = tape.bool("suggestions disabled");
     diag
 }
 
-#[hegel::test(test_cases = 512)]
-fn the_emitter_writes_what_the_reference_wrote(tc: TestCase) {
-    let (main, other) = (text(&tc), text(&tc));
-    let diag = diag(&tc, main.len() as u32, other.len() as u32);
-    let (short, ansi, narrow) =
-        tc.draw(gs::tuples!(gs::booleans(), gs::booleans(), gs::booleans()));
+#[test]
+fn the_emitter_writes_what_the_reference_wrote() {
+    blaze_sim::check(Config::cases(512), emits_as_the_reference);
+}
+
+fn emits_as_the_reference(tape: &Tape) {
+    let (main, other) = (text(tape), text(tape));
+    let diag = diag(tape, main.len() as u32, other.len() as u32);
+    let (short, ansi, narrow) = (tape.bool("short"), tape.bool("ansi"), tape.bool("narrow"));
     let style = Style { short, ansi, width: if narrow { 40 } else { WIDTH }, ui_testing: false };
     let files = [(FILE.to_owned(), main), (OTHER.to_owned(), other)];
     let mut ours = super::Sources::of(files.clone());

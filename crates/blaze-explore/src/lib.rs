@@ -10,11 +10,17 @@
 //! - `source`: the daemon's `ix_prof::explore::Source` over the history,
 //!   blaze-profile's flight recorder and the daemon's tasks, and [`start`].
 //! - [`tasks`]: the plane's tasks and the downloads as the `tasks` and `task_edges` tables.
+//! - [`probe`]: the WebTransport probe's echo (`blaze-explore-probe`), a sans-IO machine.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, btreemap_alloc)]
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core` (`probe`); inert under
+// rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 mod ops;
+pub mod probe;
 mod source;
 pub mod tasks;
 pub mod tiles;

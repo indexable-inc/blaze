@@ -1,0 +1,8 @@
+{
+ "id": "dst-1113-2",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane dst-1113 P1",
+ "where": "crates/blaze-sim/src/control.rs (control says)",
+ "what": "blaze_sim::control matches `says` against the first failing case only (shrink_runs 0), so a plant that can trip two oracle checks (blaze-expansion ModuleOutOfKey: stale output or answered-without-run) cannot name one message without a guess at which check fires first; porting writers must reason about check order or pass an empty needle. A list of accepted messages, or matching any failing case, would let every control say what it catches.",
+ "state": "open"
+}

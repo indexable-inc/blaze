@@ -573,18 +573,25 @@ pub fn cannot_clone(directory: &Path) -> Result<Option<String>, std::io::Error> 
 }
 
 /// Where a work directory nobody named may go, best first: `/tmp`, then `blaze-harness` in the
-/// user's cache directory.
+/// user's cache directory (`XDG_CACHE_HOME`, else `.cache` in the user's home,
+/// [`blaze_core::home::user`]). A user with neither has `/tmp` alone: no directory is guessed
+/// (it was a literal `~` under the current directory).
+#[expect(
+    blaze::tmp_path,
+    reason = "the real /tmp is the first base by policy: a work directory outlives this call (removed at exit only when \
+              empty), so no TempDir guard fits, and its short path keeps a daemon home's socket within the socket path \
+              limit that macOS's long TMPDIR can pass"
+)]
 pub fn work_bases() -> Vec<PathBuf> {
     #[allow(clippy::disallowed_methods, reason = "storelib's rule, read where it is used as the Python read it")]
-    let caches = std::env::var("XDG_CACHE_HOME").ok().filter(|it| !it.is_empty()).map_or_else(
-        || {
-            #[allow(clippy::disallowed_methods, reason = "as above")]
-            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_owned());
-            PathBuf::from(home).join(".cache")
-        },
-        PathBuf::from,
-    );
-    vec![PathBuf::from("/tmp"), caches.join("blaze-harness")]
+    let caches = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|it| !it.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| blaze_core::home::user().ok().map(|home| home.join(".cache")));
+    let mut bases = vec![PathBuf::from("/tmp")];
+    bases.extend(caches.map(|caches| caches.join("blaze-harness")));
+    bases
 }
 
 /// The directory a script keeps its checkouts and daemon homes in, its real path: `given`,
@@ -1261,12 +1268,10 @@ impl Engine {
     /// What this harness assumes of the binary, held to the binary before any build; each miss
     /// is a `Failed` naming the assumption and what the binary said instead.
     fn preflight(&mut self) -> Result<(), Fault> {
-        let base = if Path::new("/tmp").is_dir() { PathBuf::from("/tmp") } else { std::env::temp_dir() };
-        let tmp = base.join(unique("bz-pre-"));
-        std::fs::create_dir(&tmp).map_err(|e| Fault::os(&e, &tmp))?;
-        let checked = self.preflight_in(&tmp);
-        let _ = std::fs::remove_dir_all(&tmp);
-        checked
+        // The probe's home holds a daemon socket: under the short `/tmp` where there is one, as
+        // engine.py chose. The error names the directory.
+        let tmp = crate::TempDir::for_socket("bz-pre-").map_err(|e| Fault::Os(format!("{}: {e}", os_error_name(&e))))?;
+        self.preflight_in(tmp.path())
     }
 
     fn preflight_in(&mut self, tmp: &Path) -> Result<(), Fault> {

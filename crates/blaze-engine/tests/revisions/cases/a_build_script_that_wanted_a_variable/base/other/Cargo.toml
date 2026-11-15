@@ -1,0 +1,8 @@
+[package]
+name = "other"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+up = { path = "../up" }
+made = { path = "../vendor/made" }

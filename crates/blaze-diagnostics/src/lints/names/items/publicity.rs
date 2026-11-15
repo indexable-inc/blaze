@@ -4,17 +4,24 @@
 //! A `use` is linted at each of its leaves, as rustc's HIR splits it; fields never.
 //!
 //! The effective visibility of a `use`, an `extern crate` and an item in a body is its
-//! modules': a `pub use` another `use` re-exports is taken as its module leaves it.
+//! modules': its own `pub` and what its module is, and a module another crate can name through
+//! a `use` (`pub use lock::lot;` of a private `lock`) is one its `pub use`s are reachable in, as
+//! rustc's import takes its module's effective visibility. A `pub use` in a private module that
+//! only another `use` re-exports is still taken as its module leaves it.
+//!
+//! A function that is a proc macro's entry (`#[proc_macro]`, `#[proc_macro_derive]`,
+//! `#[proc_macro_attribute]`) is what the crate exports, and the compiler requires it `pub`:
+//! it is never linted.
 //!
 //! Follows `compiler/rustc_lint/src/builtin.rs` (`UnreachablePub`) (MIT or Apache-2.0).
 
-use syntax::view::{self as ast, AstNode, HasVisibility};
+use syntax::view::{self as ast, AstNode, HasAttrs, HasVisibility};
 
 use super::{
     def_span, visibility,
     walk::{Container, Item},
 };
-use crate::lints::names::effective::Effective;
+use crate::lints::names::effective::{Def, Effective};
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
@@ -24,6 +31,9 @@ use crate::{
 pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effective) -> Vec<Found> {
     let node = item.node.value;
     let Some(vis) = public(node) else { return Vec::new() }; // alloc: empty, no allocation
+    if proc_macro_entry(node) {
+        return Vec::new(); // alloc: empty, no allocation
+    }
     let exportable = match item.container {
         Container::Module | Container::Extern(_) => true,
         Container::Impl(imp) if imp.value.trait_().is_none() => false,
@@ -33,7 +43,9 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
     let (reachable, restricted) = match node {
         ast::Item::Use(_) | ast::Item::ExternCrate(_) => {
             let restricted = visibility::restricted_to(cx, item);
-            (item.in_body.is_none() && restricted.is_none(), Some(restricted))
+            let module = Def::Item(hir::ModuleDef::Module(item.module));
+            let reachable = restricted.is_none() || effective.is_exported(module);
+            (item.in_body.is_none() && reachable, Some(restricted))
         }
         _ => match visibility::def(cx, item) {
             Some(def) => (effective.is_reachable(def), None),
@@ -87,6 +99,17 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effectiv
             Found::lint(diag, Phase::Late, at)
         })
         .collect() // alloc: the lints that fire, returned
+}
+
+/// Whether `node` is a function a proc-macro crate exports as a macro.
+fn proc_macro_entry(node: ast::Item<'_>) -> bool {
+    let ast::Item::Fn(function) = node else { return false };
+    function.attrs().any(|attr| {
+        matches!(
+            attr.simple_name(),
+            Some("proc_macro" | "proc_macro_derive" | "proc_macro_attribute")
+        )
+    })
 }
 
 /// The visibility of an item written plain `pub`.

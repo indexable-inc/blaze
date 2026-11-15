@@ -210,7 +210,7 @@ mod tests {
     ) -> R {
         let (tx, rx) = crossbeam_channel::unbounded();
         worker.send(Box::new(move || tx.send(f()).unwrap())).unwrap();
-        rx.recv().unwrap()
+        rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the worker ran the call")
     }
 
     fn take() -> Option<std::num::NonZeroUsize> {

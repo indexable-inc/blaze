@@ -1249,6 +1249,12 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
                     walk_deref_pat(this, inner, place);
                     return Ok(());
                 }
+                // blaze: a pattern of a member of an error union reads which member the
+                // union holds, as a variant's pattern reads its enum's discriminant.
+                CatPatternPat::UnionMember => {
+                    this.delegate.borrow(place, BorrowKind::Immutable, this.cx);
+                    return Ok(());
+                }
             };
 
             debug!("walk_pat: pat.kind={:?}", this.cx.store.pat(pat));
@@ -1496,6 +1502,9 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
 enum CatPatternPat {
     PatId(PatId),
     DerefPat { inner: PatId },
+    /// The place is an error union a pattern of one of its members is matched against
+    /// (`PatAdjust::UnionMember`).
+    UnionMember,
 }
 impl_from!(PatId for CatPatternPat);
 
@@ -1876,6 +1885,44 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
 
     /// Returns the variant index for an ADT used within a Struct or TupleStruct pattern
     /// Here `pat_hir_id` is the ExprId of the pattern itself.
+    /// blaze: the place of the member that `pat`, a pattern of a member of the error union
+    /// `union`, matches, in the union at `base_place`: the union's one field (its `Repr`
+    /// enum), then the one field of that enum's variant of the member
+    /// ([`crate::error_union`]).
+    fn cat_union_member(
+        &mut self,
+        pat: PatId,
+        base_place: PlaceWithOrigin<'f>,
+        union: Ty<'db>,
+    ) -> Result<PlaceWithOrigin<'f>> {
+        let interner = self.cx.interner();
+        let members = crate::error_union::members(interner, union).ok_or(ErrorGuaranteed)?;
+        // The member is the type of the constructor pattern, which under `x @` is the
+        // pattern after it: a binding by reference has the reference's type.
+        let mut of_member = pat;
+        while let Pat::Bind { subpat: Some(inner), .. } = self.cx.store.pat(of_member) {
+            of_member = inner;
+        }
+        let pat_ty = self.node_ty(of_member.into())?;
+        let pat_ty = self.cx.structurally_resolve_type(pat.into(), pat_ty);
+        let at = crate::error_union::member_index(members, pat_ty).ok_or(ErrorGuaranteed)?;
+        let repr =
+            crate::error_union::repr_field(self.cx.db, interner, union).ok_or(ErrorGuaranteed)?;
+        let repr = self.cx.structurally_resolve_type(pat.into(), repr);
+        let held = self.cat_projection(
+            pat.into(),
+            base_place,
+            repr,
+            ProjectionKind::Field { field_idx: 0, variant_idx: 0 },
+        );
+        Ok(self.cat_projection(
+            pat.into(),
+            held,
+            members.as_slice()[at],
+            ProjectionKind::Field { field_idx: 0, variant_idx: at as u32 },
+        ))
+    }
+
     fn variant_index_for_adt(&self, pat_id: PatId) -> Result<(u32, VariantId)> {
         let variant = self.cx.result.variant_resolution_for_pat(pat_id).ok_or(ErrorGuaranteed)?;
         let variant_idx = match variant {
@@ -1961,6 +2008,11 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                         None => self.pat_ty_unadjusted(pat)?,
                     };
                     self.pat_deref_place(pat.into(), place_with_id, pat, target_ty)?
+                }
+                PatAdjust::UnionMember => {
+                    // clone: frame copy, the member's place is built from the union's after
+                    op(self, place_with_id.clone(), CatPatternPat::UnionMember)?;
+                    self.cat_union_member(pat, place_with_id, adjust.source.as_ref())?
                 }
             };
         }

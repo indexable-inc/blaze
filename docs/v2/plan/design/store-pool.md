@@ -3,6 +3,23 @@ status: plan
 summary: The store's hot tier as a vmcache-style buffer pool - one reserved range with a fixed slot per page of every store file, a state word per page (optimistic and pinned reads), misses as explicit reads around the page cache through blaze-core that the task yields on, immutable records written once through the pool, eviction by the one evictor (a second-chance sweep that takes a page read once first) with MADV_DONTNEED / MADV_FREE_REUSABLE, prefetch we plan ourselves (each view's recorded trace replayed in order and paced by its hits, then the change set's cone in the query graph), codegen outputs then memos then the image on it, a DST, and the lanes.
 date: 2026-11-10
 ---
+## Superseded for the read path (2026-11-13)
+
+Decided: the store keeps no private page pool. A small record is read with one positional read
+(`pread`) into the reading task's frame and verified there; a value of 16 KiB or more is read in
+place through a shared read-only mapping; the kernel's page cache is the one cache. The end state
+runs no daemon, so a private pool would die with every command, and memory must come out ahead of
+every other build system's.
+
+Measured on the Mac (APFS, 16 KiB pages, a 2 GiB file of 256-byte records, cached, a fresh process
+per sample): one record at a random offset costs 593 ns by `pread` and 707 ns by a mapping; 10,000
+records leave 4.8 MB resident and 4.2 MB of footprint by `pread`, against 160 MB resident and 2.6 MB
+of footprint by mapping; opening and mapping a file costs about 15 µs.
+
+`blaze_cas::direct` (`crates/blaze-cas/src/direct.rs`) is that read path, and where the pool's
+callers move. The pool is deleted once the last of them has moved. The rest of this doc records
+the pool as designed and built.
+
 # The store's buffer pool
 
 What a task makes and something else reads later (a compiled function, a unit's object code, a
@@ -817,7 +834,7 @@ after (rule `slow-is-p0-traced`).
 
 ### The DST
 
-`crates/blaze-cas/src/pool/tests.rs` is one Hegel test (the `testing` skill) of the real pool, loads
+`crates/blaze-cas/src/pool/tests.rs` is one `blaze_sim::check` (the `testing` skill) of the real pool, loads
 core, sweep and store, driven by `blaze_core::sim::Sim`. `Sim` gains `ReadInto` and `WriteFrom`
 against the registered region. The test's `os::evict` poisons the bytes it gives back with
 `0xDB`, standing in for Linux's zeros and macOS's anything.
@@ -831,8 +848,9 @@ What it draws:
 - **Actors and schedule:** several readers, the commit, the sweep and the loader's completions.
   Which one takes its next step is drawn, at the granularity of state-word operations.
   `Sim` is one thread, so the test steps each actor's state machine one CAS at a time. Two
-  threads' atomics interleaving at every operation waits for `hegel::sim`'s scheduled atomics,
-  and the test moves there once they are on the fork's main.
+  threads' atomics interleaving at every operation are `blaze-check`'s; one case that
+  interleaves threads and crashes a disk waits for the tape to drive both ([sim.md](sim.md),
+  "Order"), and the test moves there once it does.
 - **Faults, as a swarm:** failed reads, short reads, torn writes, failed and held syncs, ENOSPC
   (`fill`), a block of a pack changed on disk (rot), and completions delayed and shuffled.
 - **Crash points:** after any completion count. The reopen runs the open's recovery scan.
@@ -944,7 +962,7 @@ kept as a record yet.
      read's span as it is submitted, takes a write's bytes as it completes, lands any of a failed
      or in-flight write's 512-byte sectors, tears unsynced writes from memory by sector at a
      crash, and has `hold_reads`, `fail_reads`, `short_reads` and `rot`. `Memory` is a
-     registered buffer for tests. `crates/blaze-core/src/sim/pages.rs` is a Hegel DST of a
+     registered buffer for tests. `crates/blaze-core/src/sim/pages.rs` is a blaze-sim DST of a
      pool-shaped page store on them, with planted bugs 4 to 8 of section 7 in miniature: the
      scaffolding lane 3's DST grows from.
 3. **blaze-cas: the pool core and its DST.**

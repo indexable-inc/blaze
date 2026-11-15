@@ -794,7 +794,6 @@ pub(super) fn carry_stack_limit() {
         carry(Carried::word(blaze_mem::frame::take_below, blaze_mem::frame::put_below));
         carry(Carried::word(blaze_mem::frame::take_peak, blaze_mem::frame::put_peak));
         carry(Carried::word(crate::arena::take_account, crate::arena::put_account));
-        carry(Carried::word(blaze_mem::frame::take_cancelling, blaze_mem::frame::put_cancelling));
         carry(Carried::word(crate::pump::take_gave_ways, crate::pump::put_gave_ways));
         carry(Carried::word(super::host::take_retry, super::host::put_retry));
         carry(Carried::word(

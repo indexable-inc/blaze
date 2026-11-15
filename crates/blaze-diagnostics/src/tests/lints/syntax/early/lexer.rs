@@ -211,253 +211,31 @@ fn main() {
     );
 }
 
+/// tests/ui/rust-2021/reserved-prefixes-migration.rs and
+/// tests/ui/rust-2024/reserved-guarded-strings-migration.rs at the pinned nightly: rustc's
+/// one `ReservedPrefixLint` ("`z` is parsed as a prefix in Rust 2021 and onward"), and the
+/// prefix lint as a change of meaning, not an error.
 #[test]
 fn unknown_prefixes_before_2021_are_linted() {
-    // tests/ui/rust-2021/reserved-prefixes-migration.rs
-    let source = r#"//@ check-pass
-//@ run-rustfix
-//@ edition:2018
-
-#![warn(rust_2021_prefixes_incompatible_syntax)]
-
-macro_rules! m2 {
-    ($a:tt $b:tt) => {};
-}
-
-macro_rules! m3 {
-    ($a:tt $b:tt $c:tt) => {};
-}
-
-fn main() {
-    m2!(z"hey");
-    //~^ WARNING prefix `z` is unknown [rust_2021_prefixes_incompatible_syntax]
-    //~| WARNING hard error in Rust 2021
-    m2!(prefix"hey");
-    //~^ WARNING prefix `prefix` is unknown [rust_2021_prefixes_incompatible_syntax]
-    //~| WARNING hard error in Rust 2021
-    m3!(hey#123);
-    //~^ WARNING prefix `hey` is unknown [rust_2021_prefixes_incompatible_syntax]
-    //~| WARNING hard error in Rust 2021
-    m3!(hey#hey);
-    //~^ WARNING prefix `hey` is unknown [rust_2021_prefixes_incompatible_syntax]
-    //~| WARNING hard error in Rust 2021
-}
-
-macro_rules! quote {
-    (# name = # kind # value) => {};
-}
-
-quote! {
-    #name = #kind#value
-    //~^ WARNING prefix `kind` is unknown [rust_2021_prefixes_incompatible_syntax]
-    //~| WARNING hard error in Rust 2021
-}
-"#;
-    let expected = r#"warning: prefix `z` is unknown
-  --> $DIR/reserved-prefixes-migration.rs:16:9
-   |
-LL |     m2!(z"hey");
-   |         ^ unknown prefix
-   |
-   = warning: this is accepted in the current edition (Rust 2018) but is a hard error in Rust 2021!
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/reserving-syntax.html>
-note: the lint level is defined here
-  --> $DIR/reserved-prefixes-migration.rs:5:9
-   |
-LL | #![warn(rust_2021_prefixes_incompatible_syntax)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-help: insert whitespace here to avoid this being parsed as a prefix in Rust 2021
-   |
-LL |     m2!(z "hey");
-   |          +
-
-warning: prefix `prefix` is unknown
-  --> $DIR/reserved-prefixes-migration.rs:19:9
-   |
-LL |     m2!(prefix"hey");
-   |         ^^^^^^ unknown prefix
-   |
-   = warning: this is accepted in the current edition (Rust 2018) but is a hard error in Rust 2021!
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/reserving-syntax.html>
-help: insert whitespace here to avoid this being parsed as a prefix in Rust 2021
-   |
-LL |     m2!(prefix "hey");
-   |               +
-
-warning: prefix `hey` is unknown
-  --> $DIR/reserved-prefixes-migration.rs:22:9
-   |
-LL |     m3!(hey#123);
-   |         ^^^ unknown prefix
-   |
-   = warning: this is accepted in the current edition (Rust 2018) but is a hard error in Rust 2021!
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/reserving-syntax.html>
-help: insert whitespace here to avoid this being parsed as a prefix in Rust 2021
-   |
-LL |     m3!(hey #123);
-   |            +
-
-warning: prefix `hey` is unknown
-  --> $DIR/reserved-prefixes-migration.rs:25:9
-   |
-LL |     m3!(hey#hey);
-   |         ^^^ unknown prefix
-   |
-   = warning: this is accepted in the current edition (Rust 2018) but is a hard error in Rust 2021!
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/reserving-syntax.html>
-help: insert whitespace here to avoid this being parsed as a prefix in Rust 2021
-   |
-LL |     m3!(hey #hey);
-   |            +
-
-warning: prefix `kind` is unknown
-  --> $DIR/reserved-prefixes-migration.rs:35:14
-   |
-LL |     #name = #kind#value
-   |              ^^^^ unknown prefix
-   |
-   = warning: this is accepted in the current edition (Rust 2018) but is a hard error in Rust 2021!
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/reserving-syntax.html>
-help: insert whitespace here to avoid this being parsed as a prefix in Rust 2021
-   |
-LL |     #name = #kind #value
-   |                  +
-
-warning: 5 warnings emitted
-
-"#;
-    assert_eq!(ui_with_std("reserved-prefixes-migration.rs", "2018", source), expected);
+    assert_eq!(
+        ui_with_std(
+            "reserved-prefixes-migration.rs",
+            "2018",
+            include_str!("lexer/reserved-prefixes-migration.rs")
+        ),
+        include_str!("lexer/reserved-prefixes-migration.stderr")
+    );
 }
 
 #[test]
 fn guarded_strings_before_2024_are_linted() {
-    // tests/ui/rust-2024/reserved-guarded-strings-migration.rs
-    let source = r####"//@ check-pass
-//@ run-rustfix
-//@ edition:2021
-
-#![warn(rust_2024_guarded_string_incompatible_syntax)]
-
-macro_rules! demo1 {
-    ( $a:tt ) => { println!("one tokens") };
-}
-
-macro_rules! demo2 {
-    ( $a:tt $b:tt ) => { println!("two tokens") };
-}
-
-macro_rules! demo3 {
-    ( $a:tt $b:tt $c:tt ) => { println!("three tokens") };
-}
-
-macro_rules! demo4 {
-    ( $a:tt $b:tt $c:tt $d:tt ) => { println!("four tokens") };
-}
-
-macro_rules! demo5 {
-    ( $a:tt $b:tt $c:tt $d:tt $e:tt ) => { println!("five tokens") };
-}
-
-macro_rules! demo6 {
-    ( $a:tt $b:tt $c:tt $d:tt $e:tt $f:tt ) => { println!("six tokens") };
-}
-
-
-fn main() {
-    demo1!("");
-    demo2!(# "");
-    demo3!(# ""#);
-    demo2!(# "foo");
-    demo3!(# "foo"#);
-    demo2!("foo"#);
-
-    demo3!(## "foo");
-    //~^ WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo4!(### "foo");
-    //~^ WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo4!(## "foo"#);
-    //~^ WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo6!(### "foo"##);
-    //~^ WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-
-    demo4!("foo"###);
-    //~^ WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-
-    demo2!(#"");
-    //~^ WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo3!(#""#);
-    //~^ WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo3!(##"");
-    //~^ WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo2!(#"foo");
-    //~^ WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo3!(##"foo");
-    //~^ WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo3!(#"foo"#);
-    //~^ WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo4!(##"foo"#);
-    //~^ WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    demo5!(##"foo"##);
-    //~^ WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING parsed as a guarded string in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-    //~| WARNING reserved token in Rust 2024 [rust_2024_guarded_string_incompatible_syntax]
-    //~| WARNING hard error in Rust 2024
-}
-"####;
-    assert_reports(
-        &ui_with_std("reserved-guarded-strings-migration.rs", "2021", source),
-        &[
-            warning(40, &[]),
-            warning(43, &[]),
-            warning(43, &[]),
-            warning(48, &[]),
-            warning(51, &[]),
-            warning(51, &[]),
-            warning(51, &[]),
-            warning(59, &[]),
-            warning(59, &[]),
-            warning(65, &[]),
-            warning(68, &[]),
-            warning(71, &[]),
-            warning(71, &[]),
-            warning(76, &[]),
-            warning(79, &[]),
-            warning(79, &[]),
-            warning(84, &[]),
-            warning(87, &[]),
-            warning(87, &[]),
-            warning(92, &[]),
-            warning(92, &[]),
-            warning(92, &[]),
-        ],
+    assert_eq!(
+        ui_with_std(
+            "reserved-guarded-strings-migration.rs",
+            "2021",
+            include_str!("lexer/reserved-guarded-strings-migration.rs")
+        ),
+        include_str!("lexer/reserved-guarded-strings-migration.stderr")
     );
 }
 

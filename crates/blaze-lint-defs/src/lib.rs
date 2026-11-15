@@ -29,6 +29,7 @@ mod lints;
 mod names;
 mod options;
 pub mod ready;
+mod rustc;
 mod set;
 
 use std::sync::OnceLock;

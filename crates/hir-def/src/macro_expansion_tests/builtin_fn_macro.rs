@@ -21,7 +21,7 @@ fn main() { column!(); }
 #[rustc_builtin_macro]
 macro_rules! column {() => {}}
 
-fn main() { 13u32; }
+fn main() { 0u32; }
 "#]],
     );
 }
@@ -98,9 +98,25 @@ fn main() { line!() }
 #[rustc_builtin_macro]
 macro_rules! line {() => {}}
 
-fn main() { 4u32 }
+fn main() { 0u32 }
 "#]],
     );
+}
+
+/// What a reader of the literal `call` expanded to (`expanded`) takes it for: a `line!()` or
+/// `column!()` placeholder is the place [`hir_expand::builtin::written_place`] gives, as
+/// `hir_ty::body_store::placed_literal` resolves it; any other expansion is itself.
+fn placed_text(db: &base_db::Db, call: hir_expand::MacroCallId, expanded: &str) -> String {
+    if expanded != "0u32" {
+        return expanded.to_owned();
+    }
+    let (line, column) =
+        hir_expand::builtin::written_place(db, call).expect("the call is in its file's text");
+    let is_line = matches!(
+        call.loc(db).def.kind,
+        hir_expand::MacroDefKind::BuiltIn(_, hir_expand::builtin::BuiltinFnLikeExpander::Line)
+    );
+    format!("{}u32", if is_line { line } else { column })
 }
 
 /// rustc's `expansion_cause`: a call that a macro's body writes is where that macro is called, a
@@ -137,7 +153,10 @@ fn main() {
         .map(|(_, call)| {
             let written = call.loc(&db).to_node_view(&db).value.to_string();
             let expansion = call.parse_macro_expansion(&db);
-            (written, expansion.value.0.root().to_string(), expansion.err.is_some())
+            // The expansion is the placeholder; the place is what a reader resolves it to.
+            let expanded = expansion.value.0.root().to_string();
+            assert!(!expanded.ends_with("u32") || expanded == "0u32", "{written}: {expanded}");
+            (written, placed_text(&db, call, &expanded), expansion.err.is_some())
         })
         .filter(|(_, expanded, _)| expanded.ends_with("u32"))
         .collect::<Vec<_>>();
@@ -167,7 +186,9 @@ fn line_and_column_after_a_byte_order_mark_and_crlf_lines() {
         .into_iter()
         .map(|call| {
             let written = call.loc(&db).to_node_view(&db).value.to_string();
-            (written, call.parse_macro_expansion(&db).value.0.root().to_string())
+            let expanded = call.parse_macro_expansion(&db).value.0.root().to_string();
+            assert_eq!(expanded, "0u32", "{written} expands to the placeholder");
+            (written, placed_text(&db, call, &expanded))
         })
         .collect::<Vec<_>>();
     placed.sort();

@@ -80,6 +80,36 @@ pub enum Edit {
         to: String,
         from: String,
     },
+    /// An astlog rules file over the view's front end (`blaze_astlog`,
+    /// docs/v2/plan/design/astlog-sema.md): every `(rewrite ...)`'s actions, after the
+    /// request's other edits. Its text edits are placed at the code they match, a macro's
+    /// expansion at its input; overlapping ones of two rules, a match a macro made, and a file
+    /// left unparsable fail the request, naming the rules and the place. One per request.
+    Rules {
+        rules: String,
+    },
+    /// The fn's parameters become `params`, `self` kept first, and every call the front end
+    /// resolves to it in the crates that can name it passes the arguments that list says: a
+    /// path call, a method call, a call by a path through a `use` alias or a re-export, and a
+    /// call written in a macro's input. A trait's fn changes in the trait and in every impl.
+    /// Each use it cannot rewrite fails the request, naming the place: the fn used as a value,
+    /// a call a macro made, a call with another number of arguments, a removed parameter the
+    /// body reads, an argument that is no literal or path dropped or moved; and so does an
+    /// `extern`, exported or C-variadic fn, whose callers are not all in the view.
+    Params {
+        item: Target,
+        params: Vec<Param>,
+    },
+}
+
+/// One parameter of [`Edit::Params`]' new list.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum Param {
+    /// A parameter the fn has, by its pattern as written (`x`, `mut y`); a parameter the list
+    /// leaves out is removed, with its argument at every call.
+    Kept { name: String },
+    /// A new parameter (`name: Type`), and the expression every call passes for it.
+    Added { param: String, default: String },
 }
 
 /// What an edit request did: the ops it commits, and each item they touched.

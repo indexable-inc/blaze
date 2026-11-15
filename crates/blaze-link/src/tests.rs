@@ -23,7 +23,7 @@ use object::{
 
 use crate::{
     COLUMN, Change, Debug, Format, Image, LINE, LinkError, Live, Native, NativeKind, Output,
-    OutputKind, Position, SpanTable,
+    OutputKind, Position, Span, SpanTable,
 };
 
 const TO: &str = "out/app";
@@ -176,6 +176,9 @@ fn edit(g2: &CompiledFunction) -> Change<'_> {
     }
 }
 
+/// A page of zeros: what a [`Sparse`] page it has not got reads as.
+static ZERO_PAGE: [u8; PAGE as usize] = [0; PAGE as usize];
+
 /// A file as pages, most of an incremental image being room nothing has written.
 #[derive(Clone, Default, Debug)]
 struct Sparse {
@@ -192,8 +195,9 @@ impl Sparse {
             let n = (PAGE as usize - from).min(bytes.len() - done);
             let chunk = &bytes[done..done + n];
             // A page it has not got reads as zeros: zeros written there change nothing, and a
-            // gigabyte of zeroed code costs no memory.
-            if !self.pages.contains_key(&(addr / PAGE)) && chunk.iter().all(|it| *it == 0) {
+            // gigabyte of zeroed code costs no memory. Compared as slices (a `memcmp`), not byte
+            // by byte: a link writes hundreds of MiB here, and the test is built unoptimized.
+            if !self.pages.contains_key(&(addr / PAGE)) && chunk == &ZERO_PAGE[..n] {
                 done += n;
                 continue;
             }
@@ -213,8 +217,7 @@ impl Sparse {
     }
 
     fn page(&self, page: u64) -> &[u8] {
-        static ZERO: [u8; PAGE as usize] = [0; PAGE as usize];
-        self.pages.get(&page).map_or(&ZERO[..], |it| &it[..])
+        self.pages.get(&page).map_or(&ZERO_PAGE[..], |it| &it[..])
     }
 
     /// Whether two files have the same bytes.
@@ -1598,12 +1601,15 @@ fn a_relink_that_drops_a_covered_function_drops_its_entries() {
 #[test]
 fn positions_are_filled_from_span_tables_and_a_reformat_rewrites_only_them() {
     let anchor = id(50);
+    // Span 1 is item-relative: on its base's line, 8 columns right of it. A reformat that
+    // moves the item is a change of the base alone.
     let table = |line| SpanTable {
         files: vec!["src/main.rs".into()],
         spans: vec![
-            Position { file: 0, line: 1, column: 1 },
-            Position { file: 0, line, column: 9 },
+            Span::At(Position { file: 0, line: 1, column: 1 }),
+            Span::From { base: 0, line: 0, column: 8 },
         ],
+        bases: vec![Position { file: 0, line, column: 1 }],
     };
     // `lea rax, [rip + location]; ret`
     let start = function(
@@ -2077,7 +2083,8 @@ fn line_tables_are_written_from_the_span_tables() {
     let anchor = id(70);
     let spans = SpanTable {
         files: vec!["src/lib.rs".into()],
-        spans: vec![Position { file: 0, line: 4, column: 1 }],
+        spans: vec![Span::At(Position { file: 0, line: 4, column: 1 })],
+        bases: Vec::new(),
     }
     .encode();
     let mut start = function(1, &returns(0), Vec::new());
@@ -2106,8 +2113,11 @@ fn line_tables_across_many_tasks_name_each_rows_file() {
         SpanTable {
             files: files.iter().map(|it| (*it).into()).collect(),
             spans: (0..spans)
-                .map(|it| Position { file: it % files.len() as u32, line: it + 1, column: 1 })
+                .map(|it| {
+                    Span::At(Position { file: it % files.len() as u32, line: it + 1, column: 1 })
+                })
                 .collect(),
+            bases: Vec::new(),
         }
         .encode()
     };

@@ -1,0 +1,14 @@
+{
+ "id": "body-entries-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane body-entries",
+ "where": "crates/hir-ty/src/body_store/entries.rs",
+ "what": "A kernel step cannot run a front-end query and see what it read: `Reads` hands out no world, and `blaze_query::db::capture_reads` captures nothing outside a running query, while a salsa memo that validates without running leaves no reads to capture at all. The body entries take the db through their identity read (`IdentityOf::get` returns the world) and take the trace from the item store, which keeps the last run's facts per (body, step, schema).",
+ "cost": "most of a lane's design time; a second home for a run's trace (the store's trace table beside its record path)",
+ "cause": "the front end's engine and the kernel are two engines over one computation: the kernel's step is defined by a salsa query whose reads only salsa sees",
+ "class": "two engines memoizing one value, each blind to the other's reads",
+ "prevention": "the kernel entry becomes the only lookup of a body's step (the query side reads the session's verified entry); then the record path and its blaze_record shapes are deleted",
+ "workaround": "Store::traces, written in Store::offer",
+ "fix": "owed: the query side through the kernel session (see the lane report)",
+ "state": "open"
+}

@@ -3,15 +3,12 @@
   "compatibility_date": "2026-10-01",
   "workers_dev": false,
   // The site is https://ix.dev/blaze/ (Served in content/site.flecs). worker/ takes every request: it redirects the old
-  // hosts, strips /blaze (worker/base.ts), handles sign-in, comments and discussable pages, and serves
-  // everything else from dist/ (bun gen/build.ts) through ASSETS.
+  // hosts, strips /blaze (worker/base.ts), serves /latest.json from RELEASES and the installer to curl, and serves
+  // every page, all static, from dist/ (bun gen/build.ts) through ASSETS.
   "main": "worker/index.ts",
   // `wrangler dev` rebuilds dist/ and .gen/ when a page, style or client script changes. The renderer's wasm modules
   // come from renderer/fetch.py or renderer/build.py (README.md), which this does not run.
   "build": { "command": "bun gen/build.ts", "watch_dir": ["content", "gen", "client", "styles", "static"] },
-  // worker/renderer.ts imports .gen/site.wasm (CompiledWasm, wrangler's default for .wasm) and the snapshot
-  // .gen/site.cbor as bytes.
-  "rules": [{ "type": "Data", "globs": ["**/*.cbor"], "fallthrough": false }],
   "assets": {
     "directory": "dist",
     "binding": "ASSETS",
@@ -20,9 +17,6 @@
     "run_worker_first": true,
     "not_found_handling": "404-page"
   },
-  // The deployed version's id is part of the cache key of anonymous discussable pages (worker/pages.ts), so a deploy
-  // (new code or new vars) never serves pages rendered by the one before.
-  "version_metadata": { "binding": "CF_VERSION" },
   // ix.dev/blaze* on the ix.dev zone: more specific than ix-web's ix.dev/* (indexable-inc/ix,
   // nix/terraform/cloudflare/template.json), so it wins. One pattern with the trailing *, because a pattern without
   // one does not match a query (`ix.dev/blaze` missed /blaze?x=1); /blazefoo also lands here and gets a 404. ra-jit.ix.dev (the old home) and blaze.ix.dev are custom // rename: old name
@@ -32,26 +26,14 @@
     { "pattern": "ra-jit.ix.dev", "custom_domain": true }, // rename: old name, the Cloudflare resource is still called this
     { "pattern": "blaze.ix.dev", "custom_domain": true }
   ],
-  "vars": {
-    // GitHub OAuth App client id (public). Empty turns sign-in off. Secret: GITHUB_CLIENT_SECRET.
-    "GITHUB_CLIENT_ID": "Ov23liKCekdY039uBlQf",
-    // Comma-separated numeric GitHub user ids (https://api.github.com/users/<login> -> "id") that may delete any
-    // comment. Ids, not logins: a login can be renamed and then registered by someone else.
-    "COMMENT_ADMINS": "7644264"
-  },
-  // Who is on the site right now (worker/presence.ts): one object, holding a hibernating WebSocket per open tab.
-  "durable_objects": { "bindings": [{ "name": "PRESENCE", "class_name": "Presence" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Presence"] }],
+  // The Presence Durable Object (live presence and chat) is gone: v2 deletes its class and its storage. Keep both
+  // tags; Cloudflare applies each migration once, in order.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Presence"] },
+    { "tag": "v2", "deleted_classes": ["Presence"] }
+  ],
   // blaze's release metadata (docs/release.md, "latest.json"): `latest.json`, which release.yaml, promote.yaml and
   // yank.yaml put with `wrangler r2 object put` and worker/index.ts serves at /latest.json. Made once by hand:
   // `wrangler r2 bucket create blaze-releases`.
-  "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "blaze-releases" }],
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "ra-jit-updates", // rename: old name, the Cloudflare resource is still called this
-      "database_id": "c8d4a72a-3d01-48d5-9af5-46ce7b0f4670",
-      "migrations_dir": "migrations"
-    }
-  ]
+  "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "blaze-releases" }]
 }

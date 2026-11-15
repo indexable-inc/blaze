@@ -383,9 +383,8 @@ fn options_parse() {
 
 #[test]
 fn kept_files_appear_whole_and_listings_skip_the_partial() {
-    let dir = std::env::temp_dir().join(format!("blaze-fuzzer-corpus-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let held = blaze_core::temp::TempDir::for_test("blaze-fuzzer-corpus-");
+    let dir = held.path().to_path_buf();
     let path = corpus::write(&dir, "", b"input").unwrap();
     std::fs::write(dir.join(".1234-being-written.hex"), "00").unwrap();
     let names = corpus::names(&dir).unwrap();
@@ -398,7 +397,6 @@ fn kept_files_appear_whole_and_listings_skip_the_partial() {
     assert_eq!(corpus::key("other.hex".as_ref()), corpus::hash(b"other.hex"));
     assert_eq!(corpus::read_dir(&dir).unwrap(), vec![b"input".to_vec()]);
     assert_eq!(corpus::names(&dir.join("missing")).unwrap(), Vec::<std::ffi::OsString>::new());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Keeping an input (the rare run that reaches something new) copies it into the corpus's
@@ -406,9 +404,8 @@ fn kept_files_appear_whole_and_listings_skip_the_partial() {
 /// once the scratch has grown to the longest input.
 #[test]
 fn keeping_an_input_allocates_nothing() {
-    let dir = std::env::temp_dir().join(format!("blaze-fuzzer-keep-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let held = blaze_core::temp::TempDir::for_test("blaze-fuzzer-keep-");
+    let dir = held.path().to_path_buf();
     let mut corpus = Corpus::new().unwrap();
     let mut scratch = corpus::Scratch::default();
     let mut input = vec![0u8; 200];
@@ -426,5 +423,4 @@ fn keeping_an_input_allocates_nothing() {
         corpus::read(&dir.join(format!("{:016x}.hex", corpus::hash(&input)))).unwrap(),
         input
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }

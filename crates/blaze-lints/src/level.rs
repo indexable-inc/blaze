@@ -98,8 +98,23 @@ const BLAZE_PROC_MACRO: On = {
     }
     bits
 };
-/// The group `blaze::edition`: what the blaze edition removes or respells (`lossy_as`,
-/// `global_state`, `async_fn`, `mut_ref`), what it writes at a crate's border (`unmarked_*`),
+/// The group `blaze::trust` ([`blaze::TRUST`]): what a dependency may do only when the
+/// workspace grants it, and a workspace crate's own `unsafe`.
+const BLAZE_TRUST: On = {
+    let mut bits = On::EMPTY;
+    let mut at = 0;
+    while at < blaze::TRUST.len() {
+        bits = bits.or(blaze::TRUST[at].bit());
+        at += 1;
+    }
+    bits
+};
+/// The group `blaze::suggest`, the adoption ladder's second step: where a plain Rust project
+/// gains from a blaze feature or a tighter type, every lint of [`blaze::Kind::Suggest`].
+pub(crate) const BLAZE_SUGGEST: On = blaze_kind(blaze::Kind::Suggest);
+/// The group `blaze::edition`: what the blaze edition removes or respells (`as_cast`,
+/// `implicit_overflow`, `global_state`, `async_fn`, `mut_ref`), what it writes at a crate's border
+/// (`unmarked_*`),
 /// the code blaze cannot analyse (`proc_macro_*`, `build_script_ambient`), what blaze's
 /// standard library replaces (`std_use`) and code written the way the edition wants it
 /// (`could_be_*`), allowed until a workspace or crate turns it on to get ready for the edition,
@@ -162,6 +177,8 @@ impl Target {
             "pedantic_perf" => return Some(BLAZE_PEDANTIC_PERF),
             "edition" => return Some(BLAZE_EDITION),
             "proc_macro" => return Some(BLAZE_PROC_MACRO),
+            "suggest" => return Some(BLAZE_SUGGEST),
+            "trust" => return Some(BLAZE_TRUST),
             _ => {}
         }
         blaze::Lint::named(name).map(blaze::Lint::bit)
@@ -213,9 +230,10 @@ impl Lint<'_> {
             Lint::Blaze(lint) => match lint.kind() {
                 blaze::Kind::General => Level::Warn,
                 blaze::Kind::Edition if lint.warns_by_default() => Level::Warn,
-                blaze::Kind::Internal | blaze::Kind::PedanticPerf | blaze::Kind::Edition => {
-                    Level::Allow
-                }
+                blaze::Kind::Internal
+                | blaze::Kind::PedanticPerf
+                | blaze::Kind::Edition
+                | blaze::Kind::Suggest => Level::Allow,
             },
             Lint::Warnings | Lint::Rustc(_) => Level::Warn,
         }
@@ -303,6 +321,13 @@ impl Levels {
     /// The level of `lint` where the attributes `sets` are, outermost first and each node's in
     /// their order: rustc's `reveal_actual_level_spec`.
     pub fn of(&self, lint: Lint<'_>, sets: &[Set]) -> Spec {
+        // A lint no level waives is `deny` here whatever is set: not an attribute, a flag,
+        // `warnings` or the cap reaches it ([`blaze::UNWAIVABLE`]).
+        if let Lint::Blaze(it) = lint
+            && blaze::UNWAIVABLE.contains(&it)
+        {
+            return Spec { level: Level::Deny, source: Source::Default };
+        }
         let mut spec = self.probe(lint, sets).unwrap_or_else(|| self.default_spec(lint, sets));
         if spec.level == Level::Warn
             && let Some(warnings) = self.probe(Lint::Warnings, sets)
@@ -574,7 +599,13 @@ mod tests {
         assert_eq!(of(&asked, blaze::Lint::StdUse), Level::Warn);
         assert_eq!(of(&asked, blaze::Lint::BuildScriptAmbient), of(&none, blaze::Lint::BuildScriptAmbient));
         assert_eq!(capabilities_asks_for(), blaze::Lint::StdUse);
-        assert_eq!(Target::blaze(CAPABILITIES), None, "an attribute, not a lint's or a group's name");
+        // The attribute shares its name with the lint it makes `deny` at the crate's root
+        // (`blaze::capabilities`), so a level set by that name is the lint's, no group's.
+        assert_eq!(
+            Target::blaze(CAPABILITIES),
+            Some(blaze::Lint::Capabilities.bit()),
+            "the attribute's name is its lint's, not a group's"
+        );
     }
 
     #[test]
@@ -646,17 +677,18 @@ mod tests {
         })
     }
 
-    #[hegel::test]
-    fn levels_are_named_as_the_reference_named_them(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let names = ["allow", "expect", "warn", "force-warn", "deny", "forbid"].map(String::from);
-        let name: String = tc.draw(hegel::one_of!(
-            gs::sampled_from(names.to_vec()),
-            gs::text().alphabet("abcdefghijklmnopqrstuvwxyz-").max_size(12),
-        ));
-        assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
-        let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
-        assert_eq!(Level::of_cap(&name), cap);
+    #[test]
+    fn levels_are_named_as_the_reference_named_them() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let names = ["allow", "expect", "warn", "force-warn", "deny", "forbid"].map(String::from);
+            let name: String = match tape.below(2, "a level's name or any word") {
+                0 => tape.one_of(&names, "name").clone(),
+                _ => tape.text_from("abcdefghijklmnopqrstuvwxyz-", 0..=12, "name"),
+            };
+            assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
+            let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
+            assert_eq!(Level::of_cap(&name), cap);
+        });
     }
 
     #[test]

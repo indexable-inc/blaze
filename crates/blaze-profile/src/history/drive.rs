@@ -180,7 +180,7 @@ fn recovered_files(
             &schema::COUNTERS,
             batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?,
         ),
-        (&schema::BUILDS, builds(&crashed, recovered.pid).map_err(arrow_error(&schema::BUILDS))?),
+        (&schema::BUILDS, builds(&crashed, &[], recovered.pid).map_err(arrow_error(&schema::BUILDS))?),
         (
             &schema::SWITCHES,
             batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?,

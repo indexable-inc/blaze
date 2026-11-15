@@ -51,6 +51,11 @@ impl From<cursor::Error> for BlobError {
     }
 }
 
+#[expect(
+    blaze::narrowed_len,
+    reason = "the template blob holds u32 lengths: a template part of 4 GiB or more needs a typed \
+              refusal from the encoder"
+)]
 fn put_len(out: &mut Vec<u8>, len: usize) {
     out.put_u32(u32::try_from(len).expect("a template's parts are under 4 GiB"));
 }
@@ -586,6 +591,58 @@ pub fn decode_view<'a>(bytes: &'a [u8], frame: &'a Frame) -> Result<TemplateView
         externs: externs.leak(),
         coverage,
         profile,
+    })
+}
+
+/// The part of the template in `bytes` that byte `offset` is in, as [`encode`] lays it out:
+/// what a refusal of two values under one key names the first byte they differ at by
+/// (rule 19). `None` for an offset past its end; an error where `bytes` are no template.
+pub fn part_at(bytes: &[u8], offset: usize) -> Result<Option<&'static str>, BlobError> {
+    frame::task(Tag::Codegen, |frame| {
+        let mut input = In(Reader::new(bytes));
+        // Each part read in `encode`'s order, with the offset it ends at.
+        let mut ends = [("", 0); 13];
+        let mut part = 0;
+        let mut ended = |input: &In<'_>, name: &'static str| {
+            ends[part] = (name, input.0.at());
+            part += 1;
+        };
+        input.magic(TEMPLATE_MAGIC)?;
+        input.0.u8()?;
+        ended(&input, "its magic and architecture");
+        input.0.u32()?;
+        ended(&input, "its alignment");
+        input.slice()?;
+        ended(&input, "its code");
+        input.relocs_in(frame)?;
+        ended(&input, "its relocations");
+        input.data_in(frame)?;
+        ended(&input, "its data");
+        let count = input.0.count_u32(32)?;
+        for _ in 0..count {
+            input.id()?;
+        }
+        ended(&input, "the code hashes it built in");
+        if input.bool()? {
+            input.id()?;
+        }
+        ended(&input, "its side table's key");
+        input.unwind_view()?;
+        ended(&input, "its unwind information");
+        input.lines_in(frame)?;
+        ended(&input, "its lines");
+        input.0.u32()?;
+        ended(&input, "its count of references");
+        let count = input.0.count_u32(4)?;
+        for _ in 0..count {
+            input.slice()?;
+        }
+        ended(&input, "its extern symbols");
+        input.coverage()?;
+        ended(&input, "its coverage");
+        input.profile()?;
+        ended(&input, "its profile");
+        Ok(ends.iter().find(|(_, end)| offset < *end).map(|(name, _)| *name))
     })
 }
 

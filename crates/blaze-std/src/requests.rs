@@ -112,6 +112,7 @@ impl fmt::Display for HeaderError {
 impl core::error::Error for HeaderError {}
 
 impl Header {
+    #[blaze::nonblocking]
     pub fn new(name: &str, value: &str) -> Result<Header, HeaderError> {
         if let Some(why) = h1::refuse_header(name, value) {
             // alloc: an error's message.
@@ -121,10 +122,16 @@ impl Header {
         Ok(Header { name: Arc::from(name), value: Arc::from(value) })
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn value(&self) -> &str {
         &self.value
     }
@@ -141,6 +148,9 @@ pub struct Request<'a> {
 
 impl<'a> Request<'a> {
     /// A `GET` of `url` with no headers.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn get(url: &'a Url) -> Request<'a> {
         Request { method: Method::Get, url, headers: &[], body: &[] }
     }
@@ -224,6 +234,10 @@ impl fmt::Display for HttpError {
 impl core::error::Error for HttpError {}
 
 impl From<Stopped> for HttpKind {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn from(stopped: Stopped) -> HttpKind {
         HttpKind::Stopped(stopped)
     }
@@ -258,9 +272,11 @@ enum Provider {
         /// Kept for the idle and transfer timeouts of blaze-http's `Client` core, once
         /// `over` drives it; a request's bound today is its `Cx`'s deadline.
         #[expect(dead_code, reason = "held for the Client core's timeouts; see the module's doc")]
+        #[expect(blaze::unwired, reason = "unwired until `over` drives blaze-http's `Client` core")]
         clock: Clock,
         /// Kept for TLS; trusted for nothing until then.
         #[expect(dead_code, reason = "held for TLS, which over refuses today; see the module's doc")]
+        #[expect(blaze::unwired, reason = "unwired until `over` speaks TLS, which it refuses today")]
         roots: Roots,
         wire: Wire,
     },
@@ -288,6 +304,8 @@ impl Http {
     }
 
     /// Requests answered by `handler`: a fake for a test, a cache, a proxy.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn handler(
         handler: impl Fn(&Cx, &Request<'_>, &mut Bytes<'_>) -> Result<u16, Stopped> + Send + Sync + 'static,
     ) -> Http {

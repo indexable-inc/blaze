@@ -15,6 +15,12 @@ mod rng;
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod exec;
 
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+))]
+mod launched;
+
 mod clif;
 mod func;
 mod fuzz;

@@ -8,13 +8,13 @@ mod dual;
 mod print;
 mod simplify;
 
-use hegel::generators as gs;
+use blaze_sim::Tape;
 
 use crate::expr::{Graph, Id, Op};
 
-/// A number in `0..=max`.
-fn pick(tc: &hegel::TestCase, max: u32) -> u32 {
-    tc.draw(gs::integers::<u32>().max_value(max))
+/// A number in `0..=max`, drawn from `tape` as `label`.
+fn pick(tape: &Tape, max: u32, label: &'static str) -> u32 {
+    tape.int_in(0..=max, label)
 }
 
 /// The plan's example, `f(x, y) = (x * y).sin() / (1.0 + x * x)`, built in its order.
@@ -35,23 +35,23 @@ const CONSTANTS: &[f64] = &[1.0, 2.0, 0.5, -1.0, 3.0, -1.5, 0.0, -0.0];
 /// A drawn float term over `vars` variables, at most `depth` operations deep, over every
 /// operation. With `tame`, an operation with a pole or a domain gets an argument inside it
 /// (`ln(e * e + 0.5)`), and the constants are not zeros: a term to differentiate.
-fn float_term(tc: &hegel::TestCase, graph: &mut Graph, vars: u32, depth: u32, tame: bool) -> Id {
-    if depth == 0 || pick(tc, 5) == 0 {
-        return if pick(tc, 2) == 0 {
+fn float_term(tape: &Tape, graph: &mut Graph, vars: u32, depth: u32, tame: bool) -> Id {
+    if depth == 0 || pick(tape, 5, "stop at a leaf") == 0 {
+        return if pick(tape, 2, "leaf") == 0 {
             let constants = if tame { &CONSTANTS[..6] } else { CONSTANTS };
-            graph.constant(constants[pick(tc, constants.len() as u32 - 1) as usize])
+            graph.constant(constants[tape.index(constants.len(), "constant")])
         } else {
-            graph.var(pick(tc, vars - 1))
+            graph.var(pick(tape, vars - 1, "var"))
         };
     }
-    let sub = |graph: &mut Graph| float_term(tc, graph, vars, depth - 1, tame);
+    let sub = |graph: &mut Graph| float_term(tape, graph, vars, depth - 1, tame);
     // `e * e + 0.5`: above 0, and `e` is used twice.
     let positive = |graph: &mut Graph, e: Id| {
         let square = graph.binary(Op::Mul, e, e);
         let half = graph.constant(0.5);
         graph.binary(Op::Add, square, half)
     };
-    match pick(tc, 19) {
+    match pick(tape, 19, "operation") {
         0 => {
             let (a, b) = (sub(graph), sub(graph));
             graph.binary(Op::Add, a, b)
@@ -75,7 +75,7 @@ fn float_term(tc: &hegel::TestCase, graph: &mut Graph, vars: u32, depth: u32, ta
         }
         5 => {
             let a = sub(graph);
-            graph.powi(a, 2 + pick(tc, 1) as i32)
+            graph.powi(a, 2 + pick(tape, 1, "power past 2") as i32)
         }
         6 => {
             let (a, b) = (sub(graph), sub(graph));
@@ -132,9 +132,9 @@ fn float_term(tc: &hegel::TestCase, graph: &mut Graph, vars: u32, depth: u32, ta
         }
         _ => {
             let (l, r) = (sub(graph), sub(graph));
-            let compare = [Op::Lt, Op::Le, Op::Gt, Op::Ge, Op::Eq, Op::Ne][pick(tc, 5) as usize];
+            let compare = [Op::Lt, Op::Le, Op::Gt, Op::Ge, Op::Eq, Op::Ne][pick(tape, 5, "compare") as usize];
             let mut cond = graph.binary(compare, l, r);
-            if !tame && pick(tc, 3) == 0 {
+            if !tame && pick(tape, 3, "not") == 0 {
                 cond = graph.unary(Op::Not, cond);
             }
             let (a, b) = (sub(graph), sub(graph));

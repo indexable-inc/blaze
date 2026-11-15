@@ -47,6 +47,8 @@ const ROOT_FILE: &str = "probe.rs";
 
 const VIEW_DOMAIN: &str = "blaze v2 rustc stand-in probe view 1";
 const LIBRARY_DOMAIN: &str = "blaze v2 rustc stand-in library root 1";
+/// A directory of the library on disk ([`Tree::dir`]): each entry's name, kind and ID.
+const LIBRARY_DIR_DOMAIN: &str = "blaze v2 rustc stand-in library directory 1";
 
 /// The editions rustc's `--edition` takes.
 const EDITIONS: [&str; 4] = ["2015", "2018", "2021", "2024"];
@@ -165,12 +167,15 @@ pub(super) fn check(
         .iter()
         .position(|it| !it.is_std && it.mode != UnitMode::RunCustomBuild && it.target.is_lib())
         .context("the load made no unit of the probe's crate")?;
+    // A probe keeps no records: nothing of it is sealed.
+    let sealed = blaze_lower::unsealed(&units);
     let lower = blaze_lower::Lower {
         units: &units,
         config: &config,
         files: &*tree,
         root: tree.view,
         host_cpu: None,
+        sealed: &sealed,
     };
     let mut lowered =
         blaze_lower::lower(lower).context("lowering the probe with the standard library")?;
@@ -488,6 +493,27 @@ impl ProbeFiles {
     }
 }
 
+impl ProbeFiles {
+    /// [`Tree::dir`] of a directory of the library below its root. This tree holds no ID of
+    /// what is on disk, so unlike the VFS's it reads every file below `path` to make one;
+    /// nothing in a probe asks (a probe keys nothing by a directory), and a caller that does
+    /// gets a true ID. A file [`Tree::file`] does not answer for is not in it.
+    fn library_dir(&self, path: &str) -> Option<ContentId> {
+        let names = self.library_names(path)?;
+        let mut hasher = blaze_ids::Hasher::new(LIBRARY_DIR_DOMAIN);
+        for (name, dir) in &names {
+            let at = format!("{path}/{name}");
+            if *dir {
+                let id = self.library_dir(&at)?;
+                hasher.part(name.as_bytes()).update(&[1]).id(&id);
+            } else if let Some((id, mode, _)) = self.library_file(&at) {
+                hasher.part(name.as_bytes()).update(&[0]).update(&mode.git().to_le_bytes()).id(&id);
+            }
+        }
+        Some(hasher.finish())
+    }
+}
+
 fn gone(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
 }
@@ -533,5 +559,19 @@ impl Tree for ProbeFiles {
         let Some(names) = self.library_names(path) else { return false };
         read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
         true
+    }
+
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        if root == self.view {
+            // The package is two files and no directory below its root.
+            return path.is_empty().then_some(self.view);
+        }
+        if root != self.library {
+            return None;
+        }
+        if path.is_empty() {
+            return Some(self.library);
+        }
+        self.library_dir(path)
     }
 }

@@ -1,0 +1,14 @@
+{
+ "id": "vfs-image-held-every-text",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, vfs-image lane, int-1112",
+ "where": "crates/blaze-vfs/src/image.rs write_image, the `vfs blobs` section (0x0301)",
+ "what": "The daemon image of tempo was 1389.6 MiB, 1323.0 MiB of it the VFS (3 sections), and took 18.6 s to write: the image copied every file's bytes into its own blobs section, though each file already has a content id and the store is content-addressed.",
+ "cost": "an image of about 1.3 GB rewritten each settle, 18.6 s a write, a restart that maps it all",
+ "cause": "the VFS had no store to name a text in (it does no IO and did not see blaze-cas), so its image became the text's home",
+ "class": "a persisted structure that holds bytes another content-addressed home already holds, because the injected dependency it needed was missing",
+ "prevention": "the image holds a content id and size per file (tree schema 3); the texts are an injected `Texts` (the daemon's store); `an_image_is_o_of_its_files_not_of_their_bytes` fails when the bytes are written back in",
+ "workaround": "none",
+ "fix": "written, not yet compiled: see /tmp/plan/vfs-image-next.md and /tmp/plan/handoff-vfs-image.md",
+ "state": "open"
+}

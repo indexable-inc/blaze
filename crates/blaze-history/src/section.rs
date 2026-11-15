@@ -17,7 +17,7 @@ use crate::{Config, DecodeError, History};
 
 /// The section's schema: [`History::encode`]'s bytes, by their version.
 pub const SCHEMA: SchemaHash = blaze_format::schema(
-    "blaze plane history 4: blaze_history::History::encode bytes, version blzhis03",
+    "blaze plane history 5: blaze_history::History::encode bytes, version blzhis04",
 );
 
 /// Writes `history` into `builder`'s image.
@@ -81,7 +81,7 @@ mod tests {
     use super::*;
 
     fn config() -> Config {
-        Config { slots: 256, unseen_ns: 5_000, unseen_bytes: 1 << 20 }
+        Config { slots: 256, unseen_ns: 5_000 }
     }
 
     fn learned() -> History {

@@ -69,6 +69,22 @@ fn scrutinee() {
     }
 }
 
+// The last use in a loop: `c` is used on every turn and not after it, so under the attribute
+// its drop (and its borrow) ends where the loop is left; without it, `c` is dropped where its
+// scope ends, after `len(&buf)`, as rustc refuses it (E0502).
+
+fn in_a_loop() {
+    let mut buf = Buf(0);
+    let mut c = Cursor::new(&mut buf);
+    let mut i = 0;
+    while i < 3 {
+        c.put(i);
+        i += 1;
+    }
+    len(&buf);
+    pause();
+}
+
 // A guard is not early: its drop where the scope ends is still a use.
 
 fn guarded() {
@@ -94,18 +110,6 @@ fn reborrowed() {
     let r = &mut c;
     pause();
     r.put(1);
-    pause();
-}
-
-fn in_a_loop() {
-    let mut buf = Buf(0);
-    let mut c = Cursor::new(&mut buf);
-    let mut i = 0;
-    while i < 3 {
-        c.put(i);
-        i += 1;
-    }
-    len(&buf);
     pause();
 }
 
@@ -217,6 +221,18 @@ fn the_three_programs_are_accepted_under_the_attribute_and_refused_without_it() 
     }
 }
 
+/// A borrow last used in a loop ends where the loop is left under the attribute; without it,
+/// the drop where the scope ends is a use after the shared borrow, as rustc refuses it.
+#[test]
+fn a_borrow_last_used_in_a_loop_ends_with_the_loop_under_the_attribute() {
+    for codes in codes(true, "in_a_loop") {
+        assert!(codes.is_empty(), "`in_a_loop` under the attribute: {codes:?}");
+    }
+    for codes in codes(false, "in_a_loop") {
+        assert_eq!(codes, ["E0502"], "`in_a_loop` without the attribute");
+    }
+}
+
 #[test]
 fn a_guards_drop_is_still_a_use_where_its_scope_ends() {
     for early in [true, false] {
@@ -231,7 +247,6 @@ fn nothing_accepted_without_the_attribute_is_refused_with_it() {
     for name in [
         "used_to_the_end",
         "reborrowed",
-        "in_a_loop",
         "moved_on_one_arm",
         "captured",
         "two_cursors",

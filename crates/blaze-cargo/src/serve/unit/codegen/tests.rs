@@ -191,16 +191,16 @@ fn a_profile_to_make_stops_with_the_flag_and_why() {
 fn a_profile_to_use_is_its_path_in_every_form_of_the_flag() {
     let words = |words: &[&str]| words.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
     for flags in [
-        &["-Cprofile-use=/tmp/merged.profdata"][..],
-        &["-C", "profile-use=/tmp/merged.profdata"][..],
-        &["--codegen=profile-use=/tmp/merged.profdata"][..],
-        &["--codegen", "profile-use=/tmp/merged.profdata"][..],
-        &["-C", "opt-level=3", "-Cprofile_use=/tmp/merged.profdata", "-Ctarget-cpu=native"][..],
+        &["-Cprofile-use=/p/merged.profdata"][..],
+        &["-C", "profile-use=/p/merged.profdata"][..],
+        &["--codegen=profile-use=/p/merged.profdata"][..],
+        &["--codegen", "profile-use=/p/merged.profdata"][..],
+        &["-C", "opt-level=3", "-Cprofile_use=/p/merged.profdata", "-Ctarget-cpu=native"][..],
         // The last one given is the one, as rustc takes a codegen option.
-        &["-Cprofile-use=/tmp/old.profdata", "-C", "profile-use=/tmp/merged.profdata"][..],
+        &["-Cprofile-use=/tmp/old.profdata", "-C", "profile-use=/p/merged.profdata"][..],
     ] {
         let flags = words(flags);
-        assert_eq!(pgo(&flags), Ok(PgoFlag::Use("/tmp/merged.profdata")), "{flags:?}");
+        assert_eq!(pgo(&flags), Ok(PgoFlag::Use("/p/merged.profdata")), "{flags:?}");
     }
     for flags in [&["-Cprofile-use"][..], &["-C", "profile-use="][..]] {
         let refused = pgo(&words(flags)).unwrap_err();

@@ -1,0 +1,20 @@
+{
+ "id": "proofs-1113-19",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "the one checkout several lanes write in; my commit of one lane`s piece",
+ "what": "Committing lane xlweak`s finished piece I added `lean/Blaze.lean` whole. A second lane still at work (weakauto) had added its own line to that file, `import Blaze.ThreadsWeakAuto`, for a module not yet committed, so the commit`s tree would not have built in Lean. Seen one command later by reading the committed file; amended before anything was built from it.",
+ "cost": "one amend; had it reached a landing branch, a failed Lean build of that round",
+ "cause": "two lanes` briefs each allowed one import line in the same file, and I staged the file by path without reading its diff",
+ "whys": [
+  "a commit held a line of a lane that was not finished",
+  "the file was staged whole",
+  "two lanes were given the same file",
+  "the root import list is one file every new library module must touch"
+ ],
+ "class": "a shared list every new piece must add a line to: any two pieces in flight meet there",
+ "prevention": "before staging a file two lanes may touch, read `git diff --no-ext-diff -- <file>` and stage by hunk; better, a library root that needs no line per module (lake globs the modules; `Blaze.lean` could import by glob or go). Not built.",
+ "workaround": "amend, keeping the lane`s line in the working tree",
+ "fix": "",
+ "state": "open"
+}

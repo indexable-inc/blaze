@@ -14,7 +14,8 @@ use hir_def::{
         },
     },
     hir::generics::{
-        GenericParamDataRef, TypeOrConstParamData, TypeParamData, TypeParamProvenance,
+        GenericParamDataRef, GenericParams, TypeOrConstParamData, TypeParamData,
+        TypeParamProvenance,
     },
     nameres::{assoc_item_binding_name, impl_item_name, trait_item_name, written_name},
     resolver::{ResolveValueResult, Resolver, TypeNs, ValueNs},
@@ -1462,10 +1463,12 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
         match (args.peek(), params.peek()) {
             (Some(&(arg_idx, arg)), Some(&(param_id, param))) => match (arg, param) {
                 (HirGenericArg::Type(_), GenericParamDataRef::TypeParamData(type_param))
-                    if type_param.provenance == TypeParamProvenance::ArgumentImplTrait =>
+                    if type_param.provenance.is_synthetic() =>
                 {
                     // Do not allow specifying `impl Trait` explicitly. We already err at that, but if we won't handle it here
                     // we will handle it as if it was specified, instead of inferring it.
+                    // An anonymous `_` (`#![feature(blaze_anon_params)]`) is never given
+                    // either: explicit arguments are the named parameters'.
                     substs.push(ctx.inferred_kind(
                         def,
                         param_id,
@@ -1515,7 +1518,7 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
                     force_infer_lt = Some((arg_idx as u32, param_id));
                 }
                 (HirGenericArg::Type(type_ref), GenericParamDataRef::ConstParamData(_)) => {
-                    if let Some(konst) = type_looks_like_const(store, *type_ref) {
+                    if let Some(konst) = type_looks_like_const(db, store, *type_ref) {
                         let GenericParamId::ConstParamId(param_id) = param_id else {
                             panic!("unmatching param kinds");
                         };
@@ -1643,10 +1646,11 @@ fn object_lifetime_default<'db>(
     }
 }
 
-fn type_looks_like_const(
-    store: &ExpressionStore,
+fn type_looks_like_const<'s>(
+    db: &Db,
+    store: &'s ExpressionStore,
     type_ref: TypeRefId,
-) -> Option<TypeLikeConst<'_>> {
+) -> Option<TypeLikeConst<'s>> {
     // A path/`_` const will be parsed as a type, instead of a const, because when parsing/lowering
     // in hir-def we don't yet know the expected argument kind. rustc does this a bit differently,
     // when lowering to HIR it resolves the path, and if it doesn't resolve to the type namespace
@@ -1656,6 +1660,17 @@ fn type_looks_like_const(
     match type_ref {
         TypeRef::Path(path) => Some(TypeLikeConst::Path(path)),
         TypeRef::Placeholder => Some(TypeLikeConst::Infer),
+        // A `_` that `#![feature(blaze_anon_params)]` made a type parameter, given for a const
+        // parameter: the `_` it is written as, which a signature refuses (E0121, with the
+        // note that a const argument is never an anonymous parameter). Only type arguments
+        // are (docs/v2/plan/design/implied-bounds.md).
+        TypeRef::TypeParam(param)
+            if GenericParams::of(db, param.parent())[param.local_id()]
+                .type_param()
+                .is_some_and(|it| it.provenance == TypeParamProvenance::Anonymous) =>
+        {
+            Some(TypeLikeConst::Infer)
+        }
         _ => None,
     }
 }

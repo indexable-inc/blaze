@@ -10,7 +10,7 @@ use std::alloc::Global;
 
 use blaze_format::{Aligned, SpanRef};
 use blaze_ids::ContentId;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 
 use crate::{
     builder::{
@@ -76,21 +76,21 @@ struct BlockPlan {
     term: Vec<u32>,
 }
 
-fn words(tc: &TestCase, n: usize) -> Vec<u32> {
-    tc.draw(gs::vecs(gs::integers::<u32>()).min_size(n).max_size(n))
+fn words(tape: &Tape, n: usize, label: &'static str) -> Vec<u32> {
+    tape.vec(n..=n, label, |tape| tape.int::<u32>("word"))
 }
 
-fn plan(tc: &TestCase) -> Plan {
-    let ptr_bits = if tc.draw(gs::booleans()) { 64 } else { 32 };
-    let params = tc.draw(gs::vecs(gs::integers::<u32>()).max_size(4));
-    let rets = tc.draw(gs::vecs(gs::integers::<u32>()).max_size(2));
-    let blocks = tc.draw(gs::integers::<u32>().min_value(1).max_value(5));
+fn plan(tape: &Tape) -> Plan {
+    let ptr_bits = if tape.bool("64-bit pointers") { 64 } else { 32 };
+    let params = tape.vec(0..=4, "params", |tape| tape.int::<u32>("param"));
+    let rets = tape.vec(0..=2, "rets", |tape| tape.int::<u32>("ret"));
+    let blocks = tape.int_in(1u32..=5, "blocks");
     let blocks = (0..blocks)
         .map(|_| BlockPlan {
-            params: tc.draw(gs::vecs(gs::integers::<u32>()).max_size(2)),
-            cold: tc.draw(gs::booleans()),
-            ops: tc.draw(gs::vecs(gs::vecs(gs::integers::<u32>()).min_size(4).max_size(4)).max_size(10)),
-            term: words(tc, 4),
+            params: tape.vec(0..=2, "block params", |tape| tape.int::<u32>("block param")),
+            cold: tape.bool("cold"),
+            ops: tape.vec(0..=10, "ops", |tape| words(tape, 4, "op")),
+            term: words(tape, 4, "term"),
         })
         .collect();
     Plan { ptr_bits, params, rets, blocks }
@@ -604,69 +604,81 @@ fn generated(plan: &Plan) -> Func<Global> {
     }
 }
 
-#[hegel::test]
-fn a_record_reads_back_as_the_function(tc: TestCase) {
-    let func = generated(&plan(&tc));
-    let view = func.view();
-    let bytes = persist::to_bytes(&view);
-    let aligned = Aligned::copy_from(&bytes);
-    let read = persist::read(&aligned).expect("a record written reads");
-    assert_eq!(read, view);
-    assert_eq!(persist::to_bytes(&read), bytes, "a record read and written again is the same bytes");
-    verify(read).expect("a record read is the function verified");
+#[test]
+fn a_record_reads_back_as_the_function() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let func = generated(&plan(tape));
+        let view = func.view();
+        let bytes = persist::to_bytes(&view);
+        let aligned = Aligned::copy_from(&bytes);
+        let read = persist::read(&aligned).expect("a record written reads");
+        assert_eq!(read, view);
+        assert_eq!(persist::to_bytes(&read), bytes, "a record read and written again is the same bytes");
+        verify(read).expect("a record read is the function verified");
+    });
 }
 
-#[hegel::test]
-fn the_text_form_reads_back_as_the_function(tc: TestCase) {
-    let func = generated(&plan(&tc));
-    let text = print(func.view());
-    let parsed = match parse(&text) {
-        Ok(parsed) => parsed,
-        Err(error) => panic!("{error}\n{text}"),
-    };
-    assert_eq!(parsed.view(), func.view(), "\n{text}");
-    assert_eq!(print(parsed.view()), text);
+#[test]
+fn the_text_form_reads_back_as_the_function() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let func = generated(&plan(tape));
+        let text = print(func.view());
+        let parsed = match parse(&text) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("{error}\n{text}"),
+        };
+        assert_eq!(parsed.view(), func.view(), "\n{text}");
+        assert_eq!(print(parsed.view()), text);
+    });
 }
 
-#[hegel::test]
-fn the_walk_requests_what_the_function_refers_to(tc: TestCase) {
-    let plan = plan(&tc);
-    let func = generated(&plan);
-    let requests = build::<RequestsOnly>(&plan).finish().expect("the walk of a valid lowering").0;
-    assert_eq!(requests.refs, func.refs);
-    assert_eq!(requests.datas, func.datas);
-    assert_eq!(requests.data_bytes, func.data_bytes);
-    assert_eq!(requests.data_relocs, func.data_relocs);
-    assert_eq!(requests.intrinsics, func.intrinsics);
-    assert_eq!(requests.names, func.names);
-    assert_eq!(requests.tys, func.tys, "the walk types every value as the build does");
-    assert!(requests.ops.is_empty() && requests.extra.is_empty(), "the walk makes no instructions");
+#[test]
+fn the_walk_requests_what_the_function_refers_to() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let plan = plan(tape);
+        let func = generated(&plan);
+        let requests = build::<RequestsOnly>(&plan).finish().expect("the walk of a valid lowering").0;
+        assert_eq!(requests.refs, func.refs);
+        assert_eq!(requests.datas, func.datas);
+        assert_eq!(requests.data_bytes, func.data_bytes);
+        assert_eq!(requests.data_relocs, func.data_relocs);
+        assert_eq!(requests.intrinsics, func.intrinsics);
+        assert_eq!(requests.names, func.names);
+        assert_eq!(requests.tys, func.tys, "the walk types every value as the build does");
+        assert!(requests.ops.is_empty() && requests.extra.is_empty(), "the walk makes no instructions");
+    });
 }
 
-#[hegel::test]
-fn corrupted_bytes_are_refused_without_a_panic(tc: TestCase) {
-    let func = generated(&plan(&tc));
-    let mut bytes = persist::to_bytes(&func.view());
-    let flips = tc.draw(gs::vecs(gs::tuples!(gs::integers::<u32>(), gs::integers::<u8>())).min_size(1).max_size(4));
-    for (at, byte) in flips {
-        let at = at as usize % bytes.len();
-        bytes[at] ^= byte | 1;
-    }
-    let aligned = Aligned::copy_from(&bytes);
-    if let Ok(view) = persist::read(&aligned)
-        && verify(view).is_ok()
-    {
-        let text = print(view);
-        assert_eq!(parse(&text).map(|it| print(it.view())).as_deref(), Ok(text.as_str()));
-    }
+#[test]
+fn corrupted_bytes_are_refused_without_a_panic() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let func = generated(&plan(tape));
+        let mut bytes = persist::to_bytes(&func.view());
+        let flips = tape.vec(1..=4, "flips", |tape| (tape.int::<u32>("flip at"), tape.int::<u8>("flip bits")));
+        for (at, byte) in flips {
+            let at = at as usize % bytes.len();
+            bytes[at] ^= byte | 1;
+        }
+        let aligned = Aligned::copy_from(&bytes);
+        if let Ok(view) = persist::read(&aligned)
+            && verify(view).is_ok()
+        {
+            let text = print(view);
+            assert_eq!(parse(&text).map(|it| print(it.view())).as_deref(), Ok(text.as_str()));
+        }
+    });
 }
 
-#[hegel::test]
-fn corrupted_columns_are_refused_without_a_panic(tc: TestCase) {
-    let mut func = generated(&plan(&tc));
-    let which = tc.draw(gs::integers::<u32>().max_value(4));
-    let at = tc.draw(gs::integers::<u32>());
-    let word = tc.draw(gs::integers::<u32>());
+#[test]
+fn corrupted_columns_are_refused_without_a_panic() {
+    blaze_sim::check(Config::DEFAULT, |tape| corrupted_columns_case(tape));
+}
+
+fn corrupted_columns_case(tape: &Tape) {
+    let mut func = generated(&plan(tape));
+    let which = tape.int_in(0u32..=4, "which column");
+    let at = tape.int::<u32>("at");
+    let word = tape.int::<u32>("word");
     let column: &mut [u32] = match which {
         0 => &mut func.data[..],
         1 => &mut func.extra[..],

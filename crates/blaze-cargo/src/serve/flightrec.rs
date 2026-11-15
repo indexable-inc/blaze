@@ -29,6 +29,9 @@
 //! Nothing here blocks a recorded thread: the rings are read as every reader reads them, by
 //! the thread that writes the file.
 
+// The field order promised above, held by `blaze::cbor_field_order`.
+#![blaze::canonical_cbor]
+
 use std::{
     io::Write as _,
     path::{Path, PathBuf},
@@ -70,15 +73,13 @@ pub const KEPT: usize = 16;
 /// How much of the recorder a recording takes: the stall watchdog's two minutes.
 pub const WINDOW: Duration = Duration::from_secs(120);
 
-/// How much one taken at the memory ceiling takes: the daemon is over its memory already.
-pub const WINDOW_AT_CEILING: Duration = Duration::from_secs(5);
-
 /// Why a recording was written.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Why {
     /// A panic no job's runner caught.
     Panic,
-    /// The daemon's footprint passed its ceiling.
+    /// The daemon's footprint passed its ceiling. The ceiling watch is deleted and writes none
+    /// now; the variant stays so a recording it wrote still reads.
     MemoryCeiling,
     /// A build made no progress for the stall bound.
     Stall,
@@ -86,6 +87,9 @@ pub enum Why {
     LoopStalled,
     /// A stop made no progress for the stall bound.
     StopStalled,
+    /// The task watchdog found a task that made no progress for its bound (`serve::stuck`),
+    /// or more threads stuck for good than its bound of lost workers.
+    Stuck,
     /// `blaze debug inspect --record`.
     Asked,
 }
@@ -415,11 +419,8 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-flightrec-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> blaze_core::temp::TempDir {
+        blaze_core::temp::TempDir::for_test(&format!("blaze-flightrec-{name}-"))
     }
 
     /// Persisted state round-trips: a recording written is read back equal, its bytes are
@@ -427,7 +428,8 @@ mod tests {
     /// the newest of a process is the one the client names.
     #[test]
     fn a_recording_written_reads_back_equal_and_the_newest_of_a_pid_is_found() {
-        let state = scratch("round-trip");
+        let made = scratch("round-trip");
+        let state = made.path().to_owned();
         let first = recording(41, 1_700_000_000_000_000_000);
         let second = recording(41, 1_700_000_001_000_000_000);
         let other = recording(42, 1_700_000_002_000_000_000);
@@ -443,7 +445,6 @@ mod tests {
         write(&state, &other).unwrap();
         assert_eq!(latest(&state, 41), Some(newest));
         assert_eq!(latest(&state, 43), None);
-        std::fs::remove_dir_all(&state).unwrap();
     }
 
     /// A file of the previous layout is handled: one of another format is refused naming both
@@ -506,7 +507,8 @@ mod tests {
     /// wrote them, and no other file is touched.
     #[test]
     fn the_directory_keeps_the_newest_recordings() {
-        let state = scratch("kept");
+        let made = scratch("kept");
+        let state = made.path().to_owned();
         std::fs::create_dir_all(state.join(DIR)).unwrap();
         std::fs::write(state.join(DIR).join("notes.txt"), b"mine").unwrap();
         for at in 0..KEPT as u64 + 3 {
@@ -520,6 +522,5 @@ mod tests {
         left.sort_unstable();
         assert_eq!(left, (3..KEPT as u64 + 3).collect::<Vec<_>>());
         assert!(state.join(DIR).join("notes.txt").exists());
-        std::fs::remove_dir_all(&state).unwrap();
     }
 }

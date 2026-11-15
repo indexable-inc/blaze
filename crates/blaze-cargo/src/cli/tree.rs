@@ -93,26 +93,26 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         Err(code) => return code,
     };
     if read.has("--version") {
-        println!("{}", crate::version());
+        blaze_report::outln!("{}", crate::version());
         return 0;
     }
-    let mut warn = |what: &str| eprint!("{}", say::warning(what, color));
+    let mut warn = |what: &str| blaze_report::err!("{}", say::warning(what, color));
     let opts = match options(&read, Shown::of_process(), &mut warn) {
         Ok(opts) => opts,
         Err(Refused { why, usage: true }) => {
-            eprint!("{}", say::error(&why, color));
-            eprintln!("\nUsage: {USAGE}\n\nFor more information, try '--help'.");
+            blaze_report::err!("{}", say::error(&why, color));
+            blaze_report::errln!("\nUsage: {USAGE}\n\nFor more information, try '--help'.");
             return Exit::Usage.code();
         }
         Err(Refused { why, usage: false }) => {
-            eprint!("{}", say::error(&why, color));
+            blaze_report::err!("{}", say::error(&why, color));
             return Exit::Failed.code();
         }
     };
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(error) => {
-            eprint!("{}", say::error(&format!("blaze tree: the current directory: {error}"), color));
+            blaze_report::err!("{}", say::error(&format!("blaze tree: the current directory: {error}"), color));
             return Exit::Failed.code();
         }
     };
@@ -165,13 +165,13 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         };
         let mut out = String::new(); // alloc: the tree, printed once
         blaze_tree::print_tree(&asked, &opts, &kinds, &mut out, &mut |it: &str| {
-            eprint!("{}", say::warning(it, color))
+            blaze_report::err!("{}", say::warning(it, color))
         })?;
         Ok(out)
     };
     match printed() {
         Ok(out) => {
-            print!("{out}");
+            blaze_report::out!("{out}");
             0
         }
         Err(error) => own::failed(&error, &cwd, color),

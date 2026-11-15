@@ -21,12 +21,9 @@ impl Http for NoNetwork {
     }
 }
 
-fn temporary(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("blaze-registry-git-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh directory for `name`, removed with all it holds when the guard drops.
+fn temporary(name: &str) -> blaze_core::temp::TempDir {
+    blaze_core::temp::TempDir::for_test(&format!("blaze-registry-git-{name}-"))
 }
 
 #[expect(clippy::disallowed_methods, reason = "every `git` is run in the repository it is about")]
@@ -68,7 +65,8 @@ fn url(dir: &Path) -> url::Url {
 }
 
 struct Repos {
-    work: PathBuf,
+    /// Removed with all it holds (the repositories and the home) when `Repos` drops.
+    work: blaze_core::temp::TempDir,
     upstream: PathBuf,
     first: String,
     dev: String,

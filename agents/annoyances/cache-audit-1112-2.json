@@ -1,0 +1,19 @@
+{
+ "id": "cache-audit-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane cache-audit-1112",
+ "where": "crates/blaze-diagnostics/src/cache.rs `bodies_key`, crates/hir-ty/src/consteval/deps.rs `key`, crates/hir-ty-codegen/v2/frontend/described.rs",
+ "what": "Four record families are filed under a crate's key rather than an item's: a dependency's bodies part, its check outcome, each of its constants (the crate's check key is hashed into every constant's key) and each describe (the home crate's image key is in every describe's key). The check key also hashes every dependency's check key, so it is deep. Read from the code, not measured.",
+ "cost": "none today, because only registry crates are served (`hir_def::deps::eligible`); once local crates are, one body edit misses every constant, outcome and bodies part of its crate and of every crate above it",
+ "cause": "each family was added beside the dependency image and took the image's key as its base, since for a crate that never changes a crate's key is as good as an item's",
+ "whys": [
+  "the image was the first record and is a crate",
+  "the families after it were filed `beside the image`",
+  "a crate key was enough while a served crate could not be edited",
+  "no list said which caches are keyed by what, so the pattern was copied unseen"
+ ],
+ "class": "a key borrowed from the container the entry sits in: right while the container never changes, all-miss the day it can",
+ "prevention": "built: docs/v2/plan/design/caches.md lists every cache with its key's grain, and scripts/src/bin/domains.rs fails on a domain that is in no row and on a crate-grained row that names no owner. Not built: the per-item keys themselves (a constant under its item key and the facts its evaluation read)",
+ "workaround": "none",
+ "state": "open: bodies with records-bodies; the outcome and the constants have no owner"
+}

@@ -1,0 +1,12 @@
+{
+ "id": "launch3-10",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "the daemon, a project deleted and made again at one path",
+ "what": "Once, after `rm -rf` of a project and writing it again at the same path with other sources while its daemon ran (and the daemon's home was being removed under it by the same script), `blaze run` built nothing and ran the old program: the source said `1` and the program printed `value 2`.",
+ "cost": "unknown: seen once, in a run whose home was in a bad state, and not tried again",
+ "cause": "unverified; the watcher lane's ground",
+ "workaround": "none",
+ "state": "open, unverified",
+ "fix": ""
+}

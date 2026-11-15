@@ -267,53 +267,54 @@ fn disagreement(cfg: &Cfg, choices: &[u8], plant: Plant) -> Option<String> {
 
 /// The invariant: for any reducible graph and any sequence of branch choices, the graph, its
 /// labelled structure, the simplified structure and naga's shape run the same blocks in the same
-/// order and leave from the same block, compared up to `FUEL` blocks. The oracle over Hegel's
+/// order and leave from the same block, compared up to `FUEL` blocks. The oracle over the tape's
 /// graphs and choices.
-#[hegel::test(test_cases = 500)]
-fn structured_control_flow_runs_as_the_graph_does(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let cfg = reducible(14, &mut |lo, hi| tc.draw(gs::integers::<usize>().min_value(lo).max_value(hi)));
-    let choices = tc.draw(gs::vecs(gs::integers::<u8>()).max_size(40));
-    if let Some(d) = disagreement(&cfg, &choices, Plant::None) {
-        panic!("{cfg:?} under {choices:?}:\n    {d}");
-    }
+#[test]
+fn structured_control_flow_runs_as_the_graph_does() {
+    blaze_sim::check(blaze_sim::Config::cases(500), |tape| {
+        let (cfg, choices) = graph_and_choices(tape);
+        if let Some(d) = disagreement(&cfg, &choices, Plant::None) {
+            panic!("{cfg:?} under {choices:?}:\n    {d}");
+        }
+    });
 }
 
-/// A small deterministic generator for the planted-bug controls, which must find a disagreement
-/// within a fixed budget (and so can't stop at Hegel's first failure).
-struct Lcg(u64);
-
-impl Lcg {
-    fn draw(&mut self, lo: usize, hi: usize) -> usize {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        lo + ((self.0 >> 33) as usize) % (hi - lo + 1)
-    }
+/// A reducible graph of up to 14 blocks and up to 40 branch choices, drawn from `tape`.
+fn graph_and_choices(tape: &blaze_sim::Tape) -> (Cfg, Vec<u8>) {
+    let cfg = reducible(14, &mut |lo, hi| tape.int_in(lo..=hi, "graph"));
+    let choices = tape.vec(0..=40, "choices", |tape| tape.int::<u8>("choice"));
+    (cfg, choices)
 }
 
-/// How many of `budget` random graphs and choices `plant` makes run differently from the graph.
-fn caught(plant: Plant, budget: u32) -> u32 {
-    let mut r = Lcg(0x5eed);
-    let mut found = 0;
-    for _ in 0..budget {
-        let cfg = reducible(14, &mut |lo, hi| r.draw(lo, hi));
-        let choices: Vec<u8> = (0..r.draw(0, 40)).map(|_| r.draw(0, 255) as u8).collect();
-        // A planted bug may also break the structure's own shape (a branch outside its construct).
-        let bad = match std::panic::catch_unwind(|| disagreement(&cfg, &choices, plant)) {
-            Ok(d) => d.is_some(),
-            Err(_) => true,
-        };
-        found += u32::from(bad);
+/// One case of a control: the drawn graph and choices run under `plant`, a disagreement with the
+/// graph the oracle's finding. A planted bug may also break the structure's own shape (a branch
+/// outside its construct), which panics: that is caught here and counts as the oracle's finding.
+fn planted_case(tape: &blaze_sim::Tape, plant: Plant) -> Result<(), blaze_sim::Broke> {
+    let (cfg, choices) = graph_and_choices(tape);
+    match std::panic::catch_unwind(|| disagreement(&cfg, &choices, plant)) {
+        Ok(None) => Ok(()),
+        Ok(Some(d)) => Err(blaze_sim::Broke::Oracle(format!(
+            "runs differently from the graph: {cfg:?} under {choices:?}:\n    {d}"
+        ))),
+        Err(_) => Err(blaze_sim::Broke::Oracle(format!(
+            "runs differently from the graph: {cfg:?} under {choices:?}: the structure panicked"
+        ))),
     }
-    found
 }
 
 /// The controls: with the merges nested inside out, or the flag's check left out, the oracle
 /// finds runs that go wrong. A green oracle that missed these would prove nothing.
 #[test]
 fn the_oracle_catches_planted_bugs() {
-    assert_eq!(caught(Plant::None, 300), 0, "the unplanted structurizer disagreed with the graph");
-    assert!(caught(Plant::MergesInsideOut, 300) > 0, "merges nested inside out went unnoticed");
-    assert!(caught(Plant::NoFlagCheck, 300) > 0, "a missing flag check went unnoticed");
+    for plant in [Plant::MergesInsideOut, Plant::NoFlagCheck] {
+        blaze_sim::control(
+            blaze_sim::Config::cases(300),
+            Plant::None,
+            plant,
+            "runs differently from the graph",
+            planted_case,
+        );
+    }
 }
 
 /// A loop entered in its middle as well as at its top has no structured form, and the error names

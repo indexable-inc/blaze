@@ -43,6 +43,10 @@ pub const CRATE_ATTR_SUFFIX: &str = "]";
 /// [`CRATE_ATTR_PREFIX`]). rustc reports it and the crate does not build; the attribute is not
 /// applied. Delimiters are matched over the whole file, the `[` and `]` around the attribute as
 /// given among them.
+#[expect(
+    blaze::absolute_position,
+    reason = "a refusal's ranges are rendered by its diagnostic: it keys nothing, and is a value only of a crate that does not build, whose crate attributes are read again with its root file's every edit"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CrateAttrError {
     /// The file's syntax errors ([`EditionedFileId::parse_errors`]) are the error, reported as

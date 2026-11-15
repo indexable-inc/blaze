@@ -1,0 +1,12 @@
+{
+ "id": "termui-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "where": "blaze run after a failed build (main at 248d8f0326 and termui-1112)",
+ "what": "After a build that failed on a compile error, fixing the source and building again fails in the link: `error: linking <image>: staging the change: linking: span 4 of 49f511a4b0b8, whose table has 4`, and every later build of the checkout fails the same way until the home is removed. Seen with the untouched binary of main too.",
+ "cost": "the piped scenarios after a failure had to be run in a fresh BLAZE_HOME",
+ "cause": "not looked for: the linker's kept image after a failed build",
+ "workaround": "a fresh BLAZE_HOME",
+ "fix": "the link lane's",
+ "state": "open"
+}

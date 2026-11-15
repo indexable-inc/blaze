@@ -1,4 +1,4 @@
-//! `could_be_ref32` (in `blaze::edition`, allowed by default): a field of a struct stored
+//! `could_be_ref32` (in `blaze::suggest`, allowed by default): a field of a struct stored
 //! many times that holds a `#[blaze::program_lifetime]` type as `&'static T`, `Arc<T>`,
 //! `Rc<T>` or `Box<T>`, itself or as the element of the field's collection or `Option`
 //! (docs/v2/plan/design/facts.md "The two lints"). A `blaze_mem::Ref32<T>` is 4 bytes where

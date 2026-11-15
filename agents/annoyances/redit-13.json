@@ -1,0 +1,11 @@
+{
+ "id": "redit-13",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: a build of reth with nothing changed",
+ "what": "With a warm daemon and no edit, `blaze build` of reth-node-ethereum's 30 workspace dependencies takes 47 to 85 s (five runs: 85.3, 50.5, 64.6, 50.6, 65.6 s by the client's clock): each build writes 53 inputs, verifies 20 to 24 million memos, runs 42,000 to 48,000 and makes 48 units again, for all of which `misses` says `its crate's identity was not worked out since the front end's last write`. Build 13's rows name `reth-node-core v2.11.0 (build script run)` as dropped and computed again; the same request was never answered by the no-op lane.",
+ "cost": "every row of the edit loop on reth is this floor: a comment edit 65 s, a body edit 73 s",
+ "cause": "not found by this lane. A lead only: reth-node-core's build script (vergen) ran again in the builds looked at, and the 48 units are above it",
+ "workaround": "none",
+ "state": "open: the first thing to fix for reth's edit loop"
+}

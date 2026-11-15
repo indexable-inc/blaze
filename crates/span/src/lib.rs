@@ -2,6 +2,9 @@
 
 #![deny(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::fmt::{self, Write};
 
@@ -25,7 +28,7 @@ pub use self::{
     map::{RealSpanMap, SpanMap, kept_maps},
 };
 
-pub use syntax::{Edition, Extensions};
+pub use syntax::{BlazeEdition, Edition, Extensions, UnknownBlazeEdition};
 pub use text_size::{TextRange, TextSize};
 
 /// A source file: a dense number base-db hands out, at most [`EditionedFileId::MAX_FILE_ID`].

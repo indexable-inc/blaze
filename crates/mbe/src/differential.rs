@@ -16,11 +16,19 @@ use span::{
 };
 use tt::{TextRange, TextSize};
 
-use crate::{DeclarativeMacro, MacroCallStyle, expander};
+use crate::{DeclarativeMacro, MacroCall, expander};
 
 const EDITIONS: [Edition; 3] = [Edition::Edition2015, Edition::Edition2021, Edition::Edition2024];
-const STYLES: [MacroCallStyle; 3] =
-    [MacroCallStyle::FnLike, MacroCallStyle::Attr, MacroCallStyle::Derive];
+/// The calls every input is expanded as; an attribute's with no arguments and with the input as
+/// its arguments too.
+fn calls(input: &tt::TopSubtree) -> [MacroCall<'_>; 4] {
+    [
+        MacroCall::FnLike,
+        MacroCall::Attr { args: None },
+        MacroCall::Attr { args: Some(input) },
+        MacroCall::Derive,
+    ]
+}
 
 fn anchor(file: u32, edition: Edition) -> SpanAnchor {
     SpanAnchor {
@@ -58,12 +66,16 @@ fn assert_same(
     let call_site = call_site();
     let mut expansions = Vec::new();
     assert_same_parses(db, input, &|| format!("{}\nthe input", what()));
-    for style in STYLES {
+    for call in calls(input) {
+        let style = call.style();
+        let what = || format!("{}\ncall: {call:?}", what());
+        let call_input = mac.input(input, call, call_site);
+        let input = call_input.as_ref().unwrap_or(input);
         let new = expander::expand_rules(db, &mac.rules, input, |_| (), style, call_site)
             .map(|(tree, arm, _)| (tree, arm));
         let old = expander::model::expand_rules(db, &mac.rules, input, |_| (), style, call_site);
-        assert_eq!(new, old, "{}\nstyle: {style:?}", what());
-        assert_same_parses(db, &new.value.0, &|| format!("{}\nstyle: {style:?}", what()));
+        assert_eq!(new, old, "{}", what());
+        assert_same_parses(db, &new.value.0, &what);
         expansions.push(new.value.0);
         if marked {
             let marker = |span: &mut Span| span.range = TextRange::empty(TextSize::from(7));
@@ -71,7 +83,7 @@ fn assert_same(
                 .map(|(tree, arm, _)| (tree, arm));
             let old =
                 expander::model::expand_rules(db, &mac.rules, input, marker, style, call_site);
-            assert_eq!(new, old, "{}\nstyle: {style:?}, marked", what());
+            assert_eq!(new, old, "{}, marked", what());
         }
     }
     expansions
@@ -244,6 +256,10 @@ const CORPUS: &[(&str, &[&str])] = &[
     (
         "attr() ( $x:ident ) => { attr $x }; derive() ( $x:ident ) => { derive $x }; ( $x:ident ) => { fnlike $x };",
         &["x", "1"],
+    ),
+    (
+        "attr( $a:ident ) ( $x:ident ) => { attr $a $x }; attr( $( $a:tt )* ) [ $( $x:tt )* ] => { $( $a )* ; $( $x )* }; ( $x:ident ) => { fnlike $x };",
+        &["x", "1", "a b", ""],
     ),
     (
         "( $a:ident += $b:expr ) => { $a = $a + $b }; ( $a:ident :: $b:ident ) => { $a :: $b }; ( $a:ident ..= $b:literal ) => { $a .. $b };",

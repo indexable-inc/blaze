@@ -4,6 +4,9 @@
 //! tree originates not from the text of some `FileId`, but from some macro
 //! expansion.
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 // It's useful to refer to code that is private in doc comments.
 #![allow(rustdoc::private_intra_doc_links)]
 #![forbid(unsafe_code)]
@@ -76,8 +79,7 @@ pub use crate::files::{AstId, ErasedAstId, FileRange, InFile, InMacroFile, InRea
 
 pub use base_db::EditionedFileId;
 pub use mbe::{
-    DeclarativeMacro, ExpandErrorKind as MbeErrorKind, MacroCallStyle, MacroCallStyles,
-    MatchFailure, ValueResult,
+    DeclarativeMacro, ExpandErrorKind as MbeErrorKind, MacroCallStyles, MatchFailure, ValueResult,
 };
 
 pub use syntax_bridge::parse_to_token_tree_static_span;
@@ -109,6 +111,10 @@ impl Expansion<'_, '_> {
 
 static NO_FIXUPS: SyntaxFixupUndoInfo = SyntaxFixupUndoInfo::NONE;
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread sort scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     /// The scratch of the radix sorts of ranges, kept by the worker.
     static RANGE_SORT: std::cell::RefCell<blaze_mem::scratch::Scratch<TextRange>> =
@@ -556,11 +562,14 @@ impl AttrMacroAttrIds {
 }
 
 impl MacroCallKind {
-    pub(crate) fn call_style(&self) -> MacroCallStyle {
+    /// The call as a declarative macro is given it: for an attribute, with its arguments.
+    pub(crate) fn mbe_call(&self) -> mbe::MacroCall<'_> {
         match self {
-            MacroCallKind::FnLike { .. } => MacroCallStyle::FnLike,
-            MacroCallKind::Derive { .. } => MacroCallStyle::Derive,
-            MacroCallKind::Attr { .. } => MacroCallStyle::Attr,
+            MacroCallKind::FnLike { .. } => mbe::MacroCall::FnLike,
+            MacroCallKind::Derive { .. } => mbe::MacroCall::Derive,
+            MacroCallKind::Attr { attr_args, .. } => {
+                mbe::MacroCall::Attr { args: attr_args.as_deref() }
+            }
         }
     }
 }

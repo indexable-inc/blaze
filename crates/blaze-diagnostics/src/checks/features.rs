@@ -58,7 +58,7 @@ use crate::{
 
 /// What rustc says of the crate's features and of what it uses without them, each part called
 /// by `checks::check` at its pass: [`configured`] before expansion, [`expansion`] as expansion
-/// meets macro calls, [`early`] in `early_lint_checks`, [`unused_or_stable`] in
+/// meets macro calls, [`staged`] then [`gates`] in `early_lint_checks`, [`unused_or_stable`] in
 /// `misc_checking_1`.
 ///
 /// The gates of the attributes of macro calls, as expansion gives them.
@@ -71,18 +71,17 @@ pub(crate) fn expansion(
     attributes::expansion(cx, walk, owners, features)
 }
 
-/// `feature_gate::check_crate`: the checks of the features themselves ([`staged`]), then the
-/// gates of syntax.
-pub(crate) fn early(
+/// `feature_gate::check_crate` after its checks of the features themselves ([`staged`], of the
+/// crate root, run on the whole crate): the gates of the syntax of `walk`, which may be the
+/// pieces of a by-piece check or one piece's probe, as each gate reads only its own node and
+/// `features`.
+pub(crate) fn gates(
     cx: &Cx<'_, '_>,
     walk: &Walk<'_>,
-    owners: &[Owner<'_>],
     features: &Features,
     flags: &Flags,
 ) -> Vec<Found> {
-    let mut found = staged(cx, owners, features, flags);
-    found.extend(gates::check(cx, walk, features, flags));
-    found
+    gates::check(cx, walk, features, flags)
 }
 
 /// `check_unused_or_stable_features`: E0635, E0557 of a removed library feature,
@@ -136,6 +135,29 @@ impl Features {
     /// not.
     pub(crate) fn enabled(&self, name: &str) -> bool {
         self.names.contains(name)
+    }
+
+    /// What a piece's probe is given of the crate's features: the names `settings` holds
+    /// (`checks::settings::crate_settings`) and the channel, with no `#![feature]`'s place, so
+    /// [`Features::lang`] and [`Features::lib`] are empty: they are read only by the checks of
+    /// the crate root's features ([`staged`], `on_non_nightly`, [`unused_or_stable`]), which a
+    /// probe never runs.
+    pub(crate) fn of_settings(settings: &super::settings::CrateSettings) -> Features {
+        let mut features = Features {
+            nightly: settings.nightly,
+            crate_nightly: settings.crate_nightly,
+            ..Features::default()
+        };
+        for name in &settings.features {
+            // alloc: setup, once per `#![feature]`, once per probe
+            features.names.insert(name.to_string());
+        }
+        features
+    }
+
+    /// The names of what is enabled, in [`Features::in_stable_order`].
+    pub(crate) fn names_in_stable_order(&self) -> impl Iterator<Item = &str> + '_ {
+        self.in_stable_order().map(|it| it.name.as_str())
     }
 
     /// rustc's `enabled_features_iter_stable_order`: the language features, then the rest.

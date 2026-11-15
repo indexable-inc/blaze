@@ -38,12 +38,20 @@ pub struct Secret {
 
 impl Secret {
     /// The secret's bytes: every use of them is this call, by name.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn expose(&self) -> &[u8] {
         &self.bytes
     }
 }
 
 impl Drop for Secret {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn drop(&mut self) {
         for byte in &mut self.bytes {
             *byte = 0;
@@ -99,6 +107,9 @@ pub struct Keys {
 }
 
 impl Keys {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Keys {
         Keys { io, allowed: Allowed::Any }
     }

@@ -11,24 +11,39 @@ pub struct Args {
 }
 
 impl Args {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(args: Arc<[String]>) -> Args {
         Args { args }
     }
 
     /// The argument at `at`, 0 being the program's name.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn get(&self, at: usize) -> Option<&str> {
         self.args.get(at).map(String::as_str)
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn len(&self) -> usize {
         self.args.len()
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn is_empty(&self) -> bool {
         self.args.is_empty()
     }
 
     /// Each argument, in order.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn each(&self) -> impl Iterator<Item = &str> {
         self.args.iter().map(String::as_str)
     }

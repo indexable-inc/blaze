@@ -47,6 +47,10 @@ pub type EagerCall =
 // dyn: one call per nested macro call, given by hir-def, which hir-expand can't name
 pub type EagerResolver<'a> = &'a dyn Fn(&ModPath, SyntaxContext) -> Option<MacroDefId>;
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread spare pool of emptied span maps, one slot per eager nesting level reached"
+)]
 thread_local! {
     /// The span maps of eager inputs being expanded, one per nesting level, kept emptied.
     static ARG_MAPS: std::cell::RefCell<Vec<ExpansionSpanMap>> =

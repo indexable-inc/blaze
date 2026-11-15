@@ -1,6 +1,6 @@
 // The charter: what blaze holds to, and what every RFC is checked against.
 site {
-  charter : Doc {
+  charter : Page {
     Title: {"Charter"}
     Nav: {"Charter", 3}
     Icon: {"scroll"}
@@ -33,7 +33,7 @@ site {
     }
 
     Section open(title: "5. Decided in the open") {
-      P rfcs("Additions start as an RFC on this site. Anyone signed in with GitHub can comment on any paragraph. An RFC says what it adds, what it breaks (nothing, in old editions), what it costs at build time and at run time, and what is still open.")
+      P rfcs("Additions start as an RFC on this site. An RFC says what it adds, what it breaks (nothing, in old editions), what it costs at build time and at run time, and what is still open.")
       P upstream("Where Rust itself is working on the same problem, an RFC follows upstream's design and names, so what works here can go back to Rust.")
     }
   }

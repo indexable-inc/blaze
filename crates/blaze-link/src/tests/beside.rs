@@ -10,8 +10,8 @@ use blaze_format::SpanRef;
 use object::{Object as _, ObjectSection as _};
 
 use super::{
-    Change, Debug, Disk, Format, Image, Linked, Output, Position, SpanTable, Sparse, TO, function,
-    id, name, output, wide_key,
+    Change, Debug, Disk, Format, Image, Linked, Output, Position, Span, SpanTable, Sparse, TO,
+    function, id, name, output, wide_key,
 };
 
 /// Each function by name with its rows as (offset in the function, file, line): what a
@@ -68,7 +68,10 @@ fn resolved<'a>(get: impl Fn(&str) -> &'a [u8]) -> Resolved {
 fn program(count: u32) -> (Vec<CompiledFunction>, Vec<u8>) {
     let spans = SpanTable {
         files: vec!["src/main.rs".into(), "src/lib.rs".into()],
-        spans: (0..16).map(|it| Position { file: it % 2, line: 3 + it * 5, column: 1 }).collect(),
+        spans: (0..16)
+            .map(|it| Span::At(Position { file: it % 2, line: 3 + it * 5, column: 1 }))
+            .collect(),
+        bases: Vec::new(),
     }
     .encode();
     let functions = (0..count).map(|n| lined(n, n)).collect();

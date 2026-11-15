@@ -1,0 +1,20 @@
+{
+ "id": "proofs-1113-14",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "main a8e9780f07: the lib tests of blaze-diagnostics, hir-def, hir-ty-contracts and hir-ty-mir",
+ "what": "`cargo +nightly-<pinned> test --no-fail-fast -p hir-ty-mir -p hir-ty-contracts -p hir-def -p blaze-diagnostics --lib` on blaze-vm, on a clean checkout of main a8e9780f07 (0 files dirty), fails 95 tests: blaze-diagnostics 54 of 1451, hir-def 13 of 1272, hir-ty-contracts 1 of 2, hir-ty-mir 27 of 1470. I met them while checking that a change to the shared test library (minicore) broke no other crate, and had to run the same tests three times (the branch, the branch with main`s minicore, main itself) to learn that all 95 are main`s own: the three failing sets are equal.",
+ "cost": "about 25 minutes of VM builds and one landing round held while the question was open",
+ "cause": "not looked for: the failing tests are other lanes` (the dependency store`s serve counts, incremental event logs, lint expectations, consteval reach); none is in a file this lane changes",
+ "whys": [
+  "a change to a shared file had to be shown not to break other crates` tests",
+  "those crates` tests were already red on main, so a red run said nothing by itself",
+  "nothing says which tests are red on main at a commit: the merge gate does not run these, and an admin merge skips it",
+  "so each lane that touches shared code pays for its own baseline run"
+ ],
+ "class": "a head that is not green makes every later red run ambiguous: each lane must measure the baseline itself to tell its failures from main`s",
+ "prevention": "main`s failing unit tests are a list kept with the commit (the test table rule 35 names, taken on the green head) so a lane compares against it in seconds; and the 95 are fixed or marked by their owners. Not built: outside this lane.",
+ "workaround": "run the same tests on a clean checkout of main in another VM lane (`tipvm2.sh <worktree at origin/main> <lane>`) and compare the sorted lists of `test .. FAILED` lines with `comm`",
+ "fix": "",
+ "state": "open"
+}

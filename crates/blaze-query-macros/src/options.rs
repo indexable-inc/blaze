@@ -53,6 +53,11 @@ pub(crate) struct Options {
     pub(crate) constructor: Option<Ident>,
     pub(crate) self_ty: Option<Type>,
     pub(crate) mem_tag: Option<Path>,
+    /// `scope = task`: the values live in the task scope that asked, not in the storage.
+    pub(crate) scope: Option<Ident>,
+    /// `settled = <path>`: with `scope = task`, told each value that becomes final in a scope
+    /// (`Scoped::settled`), as `fn(&Db, &Key, &Value)`.
+    pub(crate) settled: Option<Path>,
 }
 
 impl Options {
@@ -175,6 +180,24 @@ impl Options {
                     input.parse::<Token![=]>()?;
                     set(&mut options.self_ty, &name, input.parse::<Type>()?)?;
                 }
+                "scope" => {
+                    allowed(&[Site::TrackedFn])?;
+                    input.parse::<Token![=]>()?;
+                    let scope = Ident::parse_any(input)?;
+                    if scope != "task" {
+                        return Err(syn::Error::new(
+                            scope.span(),
+                            "`scope` is `task`: the values live in the task scope that asked \
+                             (`blaze_query::db::task_scope`), dropped when it ends",
+                        ));
+                    }
+                    set(&mut options.scope, &name, scope)?;
+                }
+                "settled" => {
+                    allowed(&[Site::TrackedFn])?;
+                    input.parse::<Token![=]>()?;
+                    set(&mut options.settled, &name, input.parse::<Path>()?)?;
+                }
                 "mem_tag" => {
                     allowed(&[Site::TrackedFn])?;
                     input.parse::<Token![=]>()?;
@@ -232,6 +255,13 @@ impl Options {
                 ));
             }
             _ => {}
+        }
+        if let (Some(settled), None) = (&self.settled, &self.scope) {
+            return Err(syn::Error::new_spanned(
+                settled,
+                "`settled` is for `scope = task`: a scoped function's values are told to it as \
+                 they become final; a persistent row is read, not told",
+            ));
         }
         if let (Some(no_eq), Some(_)) = (&self.no_eq, &self.cycle_fn) {
             return Err(syn::Error::new_spanned(

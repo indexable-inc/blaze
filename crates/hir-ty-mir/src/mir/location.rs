@@ -48,6 +48,11 @@ fn calls_location_macros(db: &Db, body: &Body) -> bool {
 /// build's rule's ([`name_sources`]), not the expander's. The source map changes with every
 /// edit above the body, and this keeps code without such literals from changing with it.
 #[blaze_query::tracked(returns(ref))]
+#[expect(
+    blaze::reads_positions,
+    reason = "which expansion each literal came from is read off the unmoved source map: the lowered body \
+              must record the expansion of each literal a location macro made"
+)]
 pub fn location_macros<'db>(
     db: &'db Db,
     owner: DefWithBodyId,
@@ -74,6 +79,11 @@ pub fn location_macros<'db>(
 /// move above the body changes no MIR of it. `column!()` stays a literal: a `Location`'s column
 /// is rustc's display width, `column!()`'s counts chars, and no move above a body changes it.
 #[blaze_query::tracked(returns(ref))]
+#[expect(
+    blaze::reads_positions,
+    reason = "which expansion each literal came from is read off the unmoved source map: the lowered body \
+              must record the expansion of each literal `line!()` made"
+)]
 pub fn line_literals<'db>(db: &'db Db, owner: DefWithBodyId) -> HashSet<ExprId, Global> {
     let line = |kind| matches!(kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Line));
     let body = Body::of(db, owner);
@@ -142,6 +152,11 @@ pub fn mentions_location(db: &Db, owner: DefWithBodyId, expr: ExprId) -> bool {
 /// The literals of a body that `concat!` made of arguments with `file!()` among them, each with
 /// the expansion it is in.
 #[blaze_query::tracked(returns(ref))]
+#[expect(
+    blaze::reads_positions,
+    reason = "which expansion each literal came from is read off the unmoved source map: the lowered body \
+              must record the expansion of each literal a location macro made"
+)]
 pub fn located_concats<'db>(
     db: &'db Db,
     owner: DefWithBodyId,
@@ -180,6 +195,14 @@ pub struct NamingRule {
     paths: std::sync::Arc<SourcePaths>,
 }
 
+/// Two rules with the same key name every file the same (the type's docs): what an input's
+/// setter compares to write nothing for an equal value.
+impl PartialEq for NamingRule {
+    fn eq(&self, other: &NamingRule) -> bool {
+        self.key == other.key
+    }
+}
+
 impl std::fmt::Debug for NamingRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("NamingRule").field(&self.key).finish()
@@ -210,11 +233,9 @@ pub fn name_sources(
             names.set_rule(db).with_durability(blaze_query::db::Durability::HIGH).to(rule);
         }
         None => {
+            // What read the singleton's absence (`file_source_path`) read its field's node,
+            // which making it changes (blaze-query's `a_singletons_absence_is_a_tracked_read`).
             _ = SourceNames::new(db, blaze_query::db::Durability::HIGH, rule);
-            // Reading a singleton that does not exist yet is not tracked: what read it before
-            // reported an untracked read (`file_source_path`), which a new revision makes stale.
-            // The read may be under a memo of any durability, so the write is of the highest.
-            db.storage_mut().synthetic_write(blaze_query::db::Durability::HIGH);
         }
     }
 }
@@ -235,13 +256,8 @@ fn file_source_path<'db>(
     krate: base_db::Crate,
     file: base_db::FileText,
 ) -> Option<String> {
+    // The absence is a tracked read: the row runs again when `name_sources` makes it.
     let Some(names) = SourceNames::try_get(db) else {
-        blaze_query::db::report_untracked_read(
-            db,
-            blaze_query::db::Untracked {
-                what: "the absence of the `SourceNames` singleton (`name_sources` not told yet)",
-            },
-        );
         return None;
     };
     (names.rule(db).paths)(db, krate, *file.file_id(db))
@@ -514,6 +530,7 @@ pub fn line_and_column(
 /// The file and range of a place in a body as rustc reports it (the range whose start
 /// [`source_location_in_file`] gives the line and column of), in the file it is written in,
 /// not a macro's expansion.
+#[blaze::renders_positions]
 pub fn source_file_range(
     db: &Db,
     owner: DefWithBodyId,
@@ -528,6 +545,7 @@ pub fn source_file_range(
 /// body is in its file: the code generator also finds them from the body alone. Not a memo:
 /// what reads it is memoized per body or reads it once, and a memo per span would be kept for
 /// every span a build places.
+#[blaze::renders_positions]
 pub fn source_location_in_file(
     db: &Db,
     owner: DefWithBodyId,
@@ -549,6 +567,7 @@ pub enum SpanSource {
 
 /// Where `span` of `owner` is written by `source_map`: the map moved into the body's file
 /// ([`Body::with_source_map`]) or that of the tree of its anchor ([`Body::relative`]).
+#[blaze::renders_positions]
 pub fn span_source(
     db: &Db,
     owner: DefWithBodyId,
@@ -589,6 +608,7 @@ pub fn span_source(
 
 /// The file a place in a body is written in, which may be what a macro expands to, and
 /// where in it rustc has the place begin.
+#[blaze::renders_positions]
 pub fn source_range<'db>(
     db: &'db Db,
     owner: DefWithBodyId,

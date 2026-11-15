@@ -109,7 +109,7 @@ pub fn own(what: Inspected, words: Vec<OsString>) -> Result<Own, String> {
 /// `blaze codegen-inputs|trace|tables WORDS`: its exit code.
 pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
     let refused = |what: &str, code: i32| {
-        eprint!("{}", say::error(what, color));
+        blaze_report::err!("{}", say::error(what, color));
         code
     };
     let own = match own(what, words) {
@@ -119,7 +119,7 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
     let build = match args::command_line(Command::Build, own.build) {
         Ok(build) => build,
         Err(usage) => {
-            eprint!("{}", args::refusal(&usage, color));
+            blaze_report::err!("{}", args::refusal(&usage, color));
             return Exit::Usage.code();
         }
     };

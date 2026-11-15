@@ -68,6 +68,14 @@ pub enum CheckError {
         file: String,
         why: String,
     },
+    /// The crate's lint flags (the command line's, a `[lints]` table's, the workspace's
+    /// `[workspace.metadata.blaze.lints]`, its ratchet or a baseline) set `lint`, which no
+    /// level waives (`blaze::UNWAIVABLE`), to `level`, below `deny`. The crate is not checked
+    /// as if the flag had not been given.
+    Unwaivable {
+        lint: String,
+        level: String,
+    },
 }
 
 impl std::fmt::Display for CheckError {
@@ -85,6 +93,10 @@ impl std::fmt::Display for CheckError {
             CheckError::NotInAstIdMap { file, why } => write!(
                 f,
                 "a lint run over `{file}` resolves a path the analysis can't: {why}; a bug in hir's source analyzer"
+            ),
+            CheckError::Unwaivable { lint, level } => write!(
+                f,
+                "`{lint}` is set to `{level}` (by a lint flag, a `[lints]` table, `[workspace.metadata.blaze.lints]`, its ratchet or a baseline), and it can't be set below `deny`: a `blaze::unreachable!()` compiles only where blaze proves no path reaches it; take the level off, and where a site can't be proved return a `Result` or write core's `unreachable!()`, which counts as a panic"
             ),
         }
     }

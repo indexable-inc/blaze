@@ -1,5 +1,4 @@
 use crate::busy;
-use crate::sim::Rng;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod path {
@@ -12,14 +11,13 @@ mod path {
 
     use crate::{Command, Sandbox};
 
-    struct Dir(PathBuf);
+    /// The test's directory, and the guard that removes it when the test ends.
+    struct Dir(PathBuf, crate::temp::TempDir);
 
     impl Dir {
         fn new(name: &str) -> Dir {
-            let dir = std::env::temp_dir()
-                .join(format!("blaze-spawn-path-{name}-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Dir(dir)
+            let held = crate::temp::TempDir::for_test(&format!("blaze-spawn-path-{name}-"));
+            Dir(held.path().to_path_buf(), held)
         }
 
         fn tool(&self, name: &str, says: &str) -> PathBuf {
@@ -28,12 +26,6 @@ mod path {
             std::fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{says}'\n")).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -109,18 +101,6 @@ mod path {
     }
 }
 
-/// [`busy::next`] as a loop: the wait doubled once per try, held at the cap, cut at the bound.
-fn reference(tried: u32, waited: u64) -> Option<u64> {
-    if waited >= busy::MOST_NS {
-        return None;
-    }
-    let mut wait = busy::FIRST_NS;
-    for _ in 0..tried {
-        wait = (wait * 2).min(busy::CAP_NS);
-    }
-    Some(wait.min(busy::MOST_NS - waited))
-}
-
 /// Followed from the first try, the waits start at the first, never pass the cap, never get
 /// shorter but for the last, and add up to the bound exactly in a few dozen tries.
 #[test]
@@ -144,27 +124,10 @@ fn busy_waits_add_up_to_the_bound() {
     assert!(tried >= 20, "{tried} tries: the cap keeps the tries close together");
 }
 
-/// The schedule against its loop, from any point: random tries (past the shift's limit too)
-/// and time waited (past the bound too).
-#[test]
-fn busy_waits_are_the_reference_schedule() {
-    for seed in 0..64 {
-        let mut rng = Rng::new(seed);
-        for _ in 0..1000 {
-            let tried = rng.below(80) as u32;
-            let waited = match rng.below(4) {
-                0 => busy::MOST_NS + rng.below(busy::MOST_NS),
-                1 => busy::MOST_NS - rng.below(busy::CAP_NS * 2).min(busy::MOST_NS),
-                _ => rng.below(busy::MOST_NS),
-            };
-            assert_eq!(
-                busy::next(tried, waited),
-                reference(tried, waited),
-                "seed {seed}: {tried} tries, {waited} ns"
-            );
-        }
-    }
-}
+// That the schedule is its loop, from any point (any number of tries, any time waited), is
+// proved, not sampled: `busy::next_is_the_doubling_schedule` (crates/blaze-core/src/busy.rs),
+// by crates/blaze-core/lean/BlazeCore/Busy.lean. The test that sampled 64,000 points of it
+// stood here until 2026-11-13.
 
 mod held {
     use std::{
@@ -179,10 +142,8 @@ mod held {
     /// A program in a directory of the test's own, executable: a file this process wrote, as
     /// the daemon writes a program it built. On Linux a copy of the system's shell; elsewhere a
     /// script of it, since macOS kills a copy of a platform binary as it starts.
-    fn written(what: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("blaze-busy-{what}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn written(what: &str) -> (crate::temp::TempDir, PathBuf) {
+        let dir = crate::temp::TempDir::for_test(&format!("blaze-busy-{what}-"));
         let program = dir.join("sh");
         #[cfg(target_os = "linux")]
         std::fs::copy("/bin/sh", &program).unwrap();
@@ -214,7 +175,7 @@ mod held {
             blaze_spin::busy(held);
             drop(file);
         });
-        open.recv().unwrap();
+        open.recv_timeout(Duration::from_secs(60)).expect("the holder opened the program for writing");
         holder
     }
 
@@ -233,7 +194,7 @@ mod held {
         std::fs::File::from(started.stderr).read_to_end(&mut stderr).unwrap();
         let exit = started.finish.exited(started.pid, stdout, stderr).unwrap();
         assert_eq!((exit.code, exit.signal), (Some(7), None), "{exit:?}");
-        _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 
     /// Held past the bound, the spawn fails naming the program and why, after about the
@@ -256,7 +217,7 @@ mod held {
         assert_eq!(error.kind(), std::io::ErrorKind::ExecutableFileBusy, "{said}");
         let bound = Duration::from_nanos(super::busy::MOST_NS);
         assert!(took >= bound && took < bound + Duration::from_millis(400), "{took:?}");
-        _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
     }
 }
 

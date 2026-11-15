@@ -158,14 +158,49 @@ impl Form {
 pub(crate) const RECORD_HEADER: u64 = 96;
 /// [`RecordHeader::dictionary`] of a value compressed without one.
 pub(crate) const NO_DICTIONARY: u32 = u32::MAX;
-const RECORD_MAGIC: [u8; 4] = *b"BLZR";
-/// Where a record header keeps its CRC-32C, taken over the header with these bytes zero.
+/// A record of format 8 and before: its CRC-32C covers its header only, so its payload is
+/// checked against `content` (BLAKE3) when it is read. Read forward, never written.
+const RECORD_MAGIC_HEADER: [u8; 4] = *b"BLZR";
+/// A record of format 9 on: its CRC-32C covers its header and then its payload, so a read
+/// checks the whole record for the cost of a CRC (~0.03 ns a byte, hardware) instead of a
+/// BLAKE3 of the value (~1 ns a byte). BLAKE3 stays for bytes that crossed a trust boundary
+/// (a remote's, `remote.rs`) and for the scrub ([`crate::read::Use::Check`]).
+const RECORD_MAGIC_WHOLE: [u8; 4] = *b"BLZW";
+/// Where a record header keeps its CRC-32C, taken with these bytes zero.
 const RECORD_CHECK: std::ops::Range<usize> = 12..16;
 /// A chunk in a chunked value's payload: its key and its length.
 pub(crate) const CHUNK_REF: usize = 40;
 
-/// What a record starts with. Its CRC-32C finds a torn append without reading the payload;
-/// the payload is checked against `content` when it is read.
+#[cfg(test)]
+thread_local! {
+    /// A test's store writes its records as format 8 did while this is set: how a test makes
+    /// the store a blaze of format 8 left, for this one to read forward.
+    pub(crate) static WRITE_FORMAT_8: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What a record's CRC-32C covers, as its magic says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Seal {
+    /// Its header only (format 8 and before), checked by [`RecordHeader::decode`]: the payload
+    /// is the value only once its BLAKE3 matches `content`.
+    Header,
+    /// Its header and payload (format 9 on), checked by [`RecordHeader::check`] once the
+    /// payload is read: the CRC it must match.
+    Whole(u32),
+}
+
+/// What a record's check showed of it once its payload was read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sealed {
+    /// The header and payload are the bytes written: no BLAKE3 is needed for a read.
+    Whole,
+    /// The header is whole; the payload is the value only once its BLAKE3 matches `content`.
+    Header,
+}
+
+/// What a record starts with. Format 9's CRC-32C covers the header and the payload, checked
+/// on every read ([`RecordHeader::check`]); a format-8 record's covers the header only, and
+/// its payload is checked against `content` when it is read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RecordHeader {
     pub kind: Kind,
@@ -180,9 +215,33 @@ pub(crate) struct RecordHeader {
 }
 
 impl RecordHeader {
-    pub(crate) fn encode(&self) -> [u8; RECORD_HEADER as usize] {
+    /// The header of a record whose payload is `payload` (`stored` bytes), in format 9: its
+    /// CRC-32C over the header, check bytes zero, then the payload.
+    pub(crate) fn encode(&self, payload: &[u8]) -> [u8; RECORD_HEADER as usize] {
+        debug_assert_eq!(self.stored, payload.len() as u64, "a header is encoded with its own payload");
+        #[cfg(test)]
+        if WRITE_FORMAT_8.get() {
+            return self.encode_format8();
+        }
+        let mut out = self.fields(RECORD_MAGIC_WHOLE);
+        let check = crc::extend(crc::crc32c(&out), payload);
+        out[RECORD_CHECK].copy_from_slice(&check.to_le_bytes());
+        out
+    }
+
+    /// The header as format 8 wrote it, its CRC over the header only: what a test of a store
+    /// written before format 9 writes.
+    #[cfg(test)]
+    pub(crate) fn encode_format8(&self) -> [u8; RECORD_HEADER as usize] {
+        let mut out = self.fields(RECORD_MAGIC_HEADER);
+        let check = crc::crc32c(&out);
+        out[RECORD_CHECK].copy_from_slice(&check.to_le_bytes());
+        out
+    }
+
+    fn fields(&self, magic: [u8; 4]) -> [u8; RECORD_HEADER as usize] {
         let mut out = [0; RECORD_HEADER as usize];
-        out[..4].copy_from_slice(&RECORD_MAGIC);
+        out[..4].copy_from_slice(&magic);
         out[4] = self.kind.code();
         out[5] = self.form.code();
         out[8..12].copy_from_slice(&self.dictionary.to_le_bytes());
@@ -190,31 +249,41 @@ impl RecordHeader {
         out[24..32].copy_from_slice(&self.raw.to_le_bytes());
         out[32..64].copy_from_slice(&self.key.0.0);
         out[64..96].copy_from_slice(&self.content.0);
-        let check = crc::crc32c(&out);
-        out[RECORD_CHECK].copy_from_slice(&check.to_le_bytes());
         out
     }
 
+    /// What `bytes` (a record's header, at least) says, and what its CRC covers. A format-8
+    /// header's CRC is checked here; a format-9 header's covers its payload too, so it is
+    /// checked by [`RecordHeader::check`] once the payload is read: until then its fields are
+    /// only bounded (its length has a span), which is what a walk over a pack needs.
     pub(crate) fn decode(bytes: &[u8]) -> Result<RecordHeader, &'static str> {
+        RecordHeader::decode_sealed(bytes).map(|(header, _)| header)
+    }
+
+    /// [`RecordHeader::decode`], and what the header's CRC covers.
+    pub(crate) fn decode_sealed(bytes: &[u8]) -> Result<(RecordHeader, Seal), &'static str> {
         if bytes.len() < RECORD_HEADER as usize {
             return Err("its header is cut short");
         }
         let bytes = &bytes[..RECORD_HEADER as usize];
-        if bytes[..4] != RECORD_MAGIC {
-            return Err("its header has no record's magic");
-        }
-        let mut unchecked = [0; RECORD_HEADER as usize];
-        unchecked.copy_from_slice(bytes);
-        unchecked[RECORD_CHECK].fill(0);
-        if u32_at(bytes, RECORD_CHECK.start) != crc::crc32c(&unchecked) {
-            return Err("its header does not match its check");
-        }
+        let check = u32_at(bytes, RECORD_CHECK.start);
+        let magic: [u8; 4] = bytes[..4].try_into().expect("a header's first four bytes");
+        let seal = match magic {
+            RECORD_MAGIC_WHOLE => Seal::Whole(check),
+            RECORD_MAGIC_HEADER => {
+                if check != crc::crc32c(&unchecked(bytes)) {
+                    return Err("its header does not match its check");
+                }
+                Seal::Header
+            }
+            _ => return Err("its header has no record's magic"),
+        };
         let kind = Kind::from_code(bytes[4]).ok_or("its header names no kind")?;
         let form = Form::from_code(bytes[5]).ok_or("its header names no form")?;
         if span_of(u64_at(bytes, 16)).is_none() {
             return Err("its header says a length no record can have");
         }
-        Ok(RecordHeader {
+        let header = RecordHeader {
             kind,
             form,
             dictionary: u32_at(bytes, 8),
@@ -222,7 +291,31 @@ impl RecordHeader {
             raw: u64_at(bytes, 24),
             key: Key(id_at(bytes, 32)),
             content: id_at(bytes, 64),
-        })
+        };
+        Ok((header, seal))
+    }
+
+    /// The record whose header is `header` (its first [`RECORD_HEADER`] bytes) and whose
+    /// payload is `payload` checked whole: its header, and what the check covered. Every read
+    /// of a record's payload goes through this (the one place a record is checked): a format-9
+    /// record's CRC covers the payload, so a payload byte rotted under an intact header is
+    /// refused here; a format-8 record's leaves its payload to the BLAKE3 of the value
+    /// ([`Sealed::Header`]).
+    pub(crate) fn check(header: &[u8], payload: &[u8]) -> Result<(RecordHeader, Sealed), &'static str> {
+        let (decoded, seal) = RecordHeader::decode_sealed(header)?;
+        if payload.len() as u64 != decoded.stored {
+            return Err("its payload is not the length its header says");
+        }
+        match seal {
+            Seal::Header => Ok((decoded, Sealed::Header)),
+            Seal::Whole(want) => {
+                let found = crc::extend(crc::crc32c(&unchecked(&header[..RECORD_HEADER as usize])), payload);
+                if found != want {
+                    return Err("its header and payload do not match its check");
+                }
+                Ok((decoded, Sealed::Whole))
+            }
+        }
     }
 
     /// The bytes the record takes in its pack, padding included.
@@ -232,11 +325,19 @@ impl RecordHeader {
     }
 }
 
+/// A record header with its check bytes zero, as its CRC is taken over.
+fn unchecked(bytes: &[u8]) -> [u8; RECORD_HEADER as usize] {
+    let mut out = [0; RECORD_HEADER as usize];
+    out.copy_from_slice(&bytes[..RECORD_HEADER as usize]);
+    out[RECORD_CHECK].fill(0);
+    out
+}
+
 /// A whole record: header, payload, zeros to the next alignment.
 pub(crate) fn record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
     debug_assert_eq!(header.stored, payload.len() as u64);
     let mut out = Vec::with_capacity(header.span() as usize);
-    out.extend_from_slice(&header.encode());
+    out.extend_from_slice(&header.encode(payload));
     out.extend_from_slice(payload);
     out.resize(header.span() as usize, 0);
     out
@@ -280,12 +381,17 @@ pub(crate) struct Loc {
 
 const HEAD_MAGIC: [u8; 8] = *b"BLZHEAD\x04";
 const HEAD_FIXED: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + 4 + 4;
-const PACK_REF: usize = 32;
+/// A pack in a head of format 6: format 5's and when it was last used.
+const PACK_REF: usize = 40;
+/// A pack in a head of formats 4 and 5.
+const PACK_REF_5: usize = 32;
 const DICTIONARY_REF: usize = 16;
 const EXTERNAL_REF: usize = 40;
 const UNIT_REF: usize = 32;
+/// A record forgotten alone ([`ForgottenRef`], format 7): its pack, four zeros, its offset.
+const FORGOTTEN_REF: usize = 16;
 const HEAD_CHECK: usize = 4;
-const _: () = assert!(HEAD_FIXED == 72 && PACK_REF == 32);
+const _: () = assert!(HEAD_FIXED == 72 && PACK_REF == 40 && PACK_REF_5 == 32);
 
 /// The index table a head names: which of the two slots, its length and its CRC-32C.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -312,6 +418,11 @@ pub(crate) struct PackRef {
     /// Its live records were all copied on and the file is gone, or going: it is not mapped.
     /// It keeps its place in the list, which is the number index slots name.
     pub removed: bool,
+    /// When a record of it was last read, or it was last appended to with a new value, in
+    /// seconds since the Unix epoch on its store's clock ([`crate::Store::clock`]): what the
+    /// collector orders packs by (format 6). 0 for not known: a head of format 5 has none,
+    /// and the store that opens it stamps each pack with its clock.
+    pub used: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -321,10 +432,68 @@ pub(crate) struct DictionaryRef {
     pub offset: u64,
 }
 
+/// A whole file of the store as a head lists it: its content and length, or, with
+/// [`EXTERNAL_REMOVED`] for its length, a file no key names any more, which whoever opens the
+/// store removes if it is still there. `placed` (format 8): the file is a placed output's
+/// whole file, `placed/<content>`, made the home of its value's record once it was synced
+/// (`Store::home_placed`), not a hot value's `file-<content>` ([`external_file`]). A placed one
+/// listed as removed is not removed by the open: it is a placed file again, which the open's
+/// sweep of `placed/` keeps while a path names it and removes otherwise.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ExternalRef {
     pub content: ContentId,
     pub len: u64,
+    pub placed: bool,
+}
+
+/// [`ExternalRef::len`] of a whole file to remove (format 5): no file is this long.
+pub(crate) const EXTERNAL_REMOVED: u64 = u64::MAX;
+
+/// The word a head of format 8 writes for a placed file listed as removed ([`ExternalRef`]).
+const EXTERNAL_REMOVED_PLACED: u64 = u64::MAX - 1;
+
+/// The bit of a head's length word that says a file is placed (format 8): no file is 4 EiB
+/// long, and neither removal word is read as it ([`EXTERNAL_REMOVED`] and
+/// [`EXTERNAL_REMOVED_PLACED`] are matched first).
+pub(crate) const EXTERNAL_PLACED: u64 = 1 << 62;
+
+impl ExternalRef {
+    /// The length word a head of `format` writes for it.
+    fn word(&self, format: u32) -> u64 {
+        debug_assert!(format >= 8 || !self.placed, "a head of format {format} lists no placed file");
+        match (self.len == EXTERNAL_REMOVED, self.placed) {
+            (true, false) => EXTERNAL_REMOVED,
+            (true, true) => EXTERNAL_REMOVED_PLACED,
+            (false, false) => self.len,
+            (false, true) => self.len | EXTERNAL_PLACED,
+        }
+    }
+
+    /// It as a head of `format` wrote `word` for `content`. Before format 8 no word is placed.
+    fn of_word(content: ContentId, word: u64, format: u32) -> Result<ExternalRef, String> {
+        let (len, placed) = match word {
+            EXTERNAL_REMOVED => (EXTERNAL_REMOVED, false),
+            _ if format < 8 => (word, false),
+            EXTERNAL_REMOVED_PLACED => (EXTERNAL_REMOVED, true),
+            _ if word & EXTERNAL_PLACED != 0 => (word & !EXTERNAL_PLACED, true),
+            _ => (word, false),
+        };
+        if len != EXTERNAL_REMOVED && len & EXTERNAL_PLACED != 0 {
+            // alloc: the error's message
+            return Err(format!("it lists the whole file {content:x} at a length no file has"));
+        }
+        Ok(ExternalRef { content, len, placed })
+    }
+}
+
+/// A record forgotten alone (format 7, [`crate::forget`]): the record at `offset` of pack
+/// `pack` is no key's, though the pack is kept. A slot or a spot that points at it finds
+/// nothing, and an opening's scan past the index does not read it. Listed until its pack is
+/// removed, which forgets it with the rest.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct ForgottenRef {
+    pub pack: u32,
+    pub offset: u64,
 }
 
 /// What a store is: written whole and at once (`Effect::Write`) after everything it names is
@@ -340,21 +509,33 @@ pub(crate) struct Head {
     /// The crate versions with packs of their own, each once and never zero; a pack's unit `n`
     /// is `units[n - 1]`.
     pub units: Vec<ContentId>,
+    /// The records forgotten alone in packs it keeps, in order (format 7; none before).
+    pub forgotten: Vec<ForgottenRef>,
 }
 
 impl Head {
     pub(crate) fn encode(&self) -> Vec<u8> {
+        self.encode_as(crate::FORMAT)
+    }
+
+    /// Its bytes as a store of `format` writes them: this one's, or (a test's, of a store an
+    /// older blaze left) format 4's and 5's, whose packs carry no time of use.
+    pub(crate) fn encode_as(&self, format: u32) -> Vec<u8> {
+        debug_assert!(format == crate::FORMAT || cfg!(test), "a head is written in this format");
         let mut out = Vec::with_capacity(
             HEAD_FIXED
                 + self.packs.len() * PACK_REF
                 + self.dictionaries.len() * DICTIONARY_REF
                 + self.externals.len() * EXTERNAL_REF
                 + self.units.len() * UNIT_REF
+                + self.forgotten.len() * FORGOTTEN_REF
                 + HEAD_CHECK,
         );
+        debug_assert!(format >= 7 || self.forgotten.is_empty(), "a head of format {format} forgets no record");
         out.put_bytes(&HEAD_MAGIC);
-        out.put_u32(crate::FORMAT);
-        out.put_u32(0);
+        out.put_u32(format);
+        // How many records it lists forgotten (format 7): zero in every head before.
+        out.put_u32(if format >= 7 { self.forgotten.len() as u32 } else { 0 });
         out.put_u64(self.generation);
         let index = self.index.unwrap_or(IndexRef { slot: u8::MAX, len: 0, check: 0, count: 0 });
         out.put_u64(u64::from(index.slot));
@@ -374,6 +555,9 @@ impl Head {
             out.put_u64(pack.committed);
             out.put_u64(pack.indexed);
             out.put_u64(pack.dead);
+            if format >= 6 {
+                out.put_u64(pack.used);
+            }
         }
         for dictionary in &self.dictionaries {
             out.put_u8(dictionary.kind.code());
@@ -383,10 +567,17 @@ impl Head {
         }
         for external in &self.externals {
             out.put_bytes(&external.content.0);
-            out.put_u64(external.len);
+            out.put_u64(external.word(format));
         }
         for unit in &self.units {
             out.put_bytes(&unit.0);
+        }
+        if format >= 7 {
+            for forgotten in &self.forgotten {
+                out.put_u32(forgotten.pack);
+                out.put_u32(0);
+                out.put_u64(forgotten.offset);
+            }
         }
         let check = crc::crc32c(&out);
         out.put_u32(check);
@@ -398,7 +589,7 @@ impl Head {
             return Err("it is not the head of a store of this format".into());
         }
         let format = u32_at(bytes, 8);
-        if format != crate::FORMAT {
+        if !(crate::FORMAT_READ..=crate::FORMAT).contains(&format) {
             // alloc: the error's message
             return Err(format!(
                 "it is of store format {format}, not {}: remove the directory to start a new \
@@ -426,13 +617,17 @@ impl Head {
         let dictionaries = u32_at(body, 60) as usize;
         let externals = u32_at(body, 64) as usize;
         let units = u32_at(body, 68) as usize;
+        // A head before format 7 wrote zero there.
+        let forgotten = if format >= 7 { u32_at(body, 12) as usize } else { 0 };
+        let pack_ref = if format >= 6 { PACK_REF } else { PACK_REF_5 };
         let want = packs
-            .checked_mul(PACK_REF)
+            .checked_mul(pack_ref)
             .zip(dictionaries.checked_mul(DICTIONARY_REF))
             .zip(externals.checked_mul(EXTERNAL_REF))
             .zip(units.checked_mul(UNIT_REF))
-            .and_then(|(((a, b), c), d)| {
-                a.checked_add(b)?.checked_add(c)?.checked_add(d)?.checked_add(HEAD_FIXED)
+            .zip(forgotten.checked_mul(FORGOTTEN_REF))
+            .and_then(|((((a, b), c), d), e)| {
+                a.checked_add(b)?.checked_add(c)?.checked_add(d)?.checked_add(e)?.checked_add(HEAD_FIXED)
             });
         if want != Some(body.len()) {
             return Err("its length is not what its counts say".into());
@@ -450,7 +645,8 @@ impl Head {
             }
             let unit = read.u32()?;
             let (committed, indexed, dead) = (read.u64()?, read.u64()?, read.u64()?);
-            head.packs.push(PackRef { unit, committed, indexed, dead, removed });
+            let used = if format >= 6 { read.u64()? } else { 0 };
+            head.packs.push(PackRef { unit, committed, indexed, dead, removed, used });
         }
         for _ in 0..dictionaries {
             let kind = Kind::from_code(read.u8()?).ok_or("a dictionary of no kind")?;
@@ -463,7 +659,7 @@ impl Head {
         }
         for _ in 0..externals {
             let content = ContentId(*read.array()?);
-            head.externals.push(ExternalRef { content, len: read.u64()? });
+            head.externals.push(ExternalRef::of_word(content, read.u64()?, format)?);
         }
         // The units seen live only while the head is read: a frame's.
         blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
@@ -477,6 +673,24 @@ impl Head {
             }
             Ok::<(), String>(())
         })?;
+        for _ in 0..forgotten {
+            let pack = read.u32()?;
+            if read.u32()? != 0 {
+                return Err("a forgotten record has bytes set that no head sets".into());
+            }
+            let it = ForgottenRef { pack, offset: read.u64()? };
+            let fits = head.packs.get(pack as usize).is_some_and(|it_pack| {
+                !it_pack.removed && it.offset >= PACK_HEADER && it.offset < it_pack.committed
+            });
+            if !fits || it.offset % ALIGN != 0 {
+                // alloc: the error's message
+                return Err(format!("it lists a forgotten record at {} of {} that is no record's place", it.offset, pack_file(pack as usize)));
+            }
+            if head.forgotten.last().is_some_and(|last| *last >= it) {
+                return Err("it lists forgotten records out of order, or one twice".into());
+            }
+            head.forgotten.push(it);
+        }
         for (number, pack) in head.packs.iter().enumerate() {
             if pack.indexed > pack.committed
                 || pack.dead > pack.committed

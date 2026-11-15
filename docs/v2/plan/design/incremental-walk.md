@@ -263,7 +263,7 @@ anchors, all unchanged for an untouched node (rule keys-cover-every-input). A fu
 folded or built by a release backend is compiled with the whole build: such a build's lists
 are made whole.
 
-`Built`'s fields stay contiguous `Vec`s, which blaze-link, blaze-premap and
+`Built`'s fields stay contiguous `Vec`s, which blaze-link and
 hir-ty-codegen index and slice: they are copied from the rows each build (`Work::copied`).
 
 ## Cost after an edit

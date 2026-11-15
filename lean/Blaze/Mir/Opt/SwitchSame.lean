@@ -123,9 +123,9 @@ theorem Outcome.Calm.bind {α β : Type} {x : Outcome α} {f : α → Outcome β
 theorem Outcome.calm_ite {α : Type} (c : Prop) [Decidable c] (a : α) (why : Undefined) :
     (if c then Outcome.ok a else Outcome.undefined why : Outcome α).Calm := by
   by_cases h : c
-  · rw [if_pos h]
+  · rw [ite_eq_left h]
     exact Outcome.calm_ok a
-  · rw [if_neg h]
+  · rw [ite_eq_right h]
     exact Outcome.calm_undefined why
 
 theorem slotOf_calm : ∀ (o : Option Slot), (slotOf o).Calm
@@ -254,8 +254,8 @@ theorem switchTarget_allTo (o : BlockId) (key : Int) :
     intro h
     have here : arm.2 = o := of_decide_eq_true (and_true_left h)
     by_cases hk : key = arm.1
-    · exact ((switchTarget_cons key arm rest o).trans (if_pos hk)).trans here
-    · exact ((switchTarget_cons key arm rest o).trans (if_neg hk)).trans (ih (and_true_right h))
+    · exact ((switchTarget_cons key arm rest o).trans (ite_eq_left hk)).trans here
+    · exact ((switchTarget_cons key arm rest o).trans (ite_eq_right hk)).trans (ih (and_true_right h))
 
 /-- The `switchInt` on a copy of `p`, or the `goto` it is when every arm agrees. -/
 def switchOrGoto (p : Place) (arms : List (Int × BlockId)) (otherwise : BlockId) : Terminator :=
@@ -278,7 +278,7 @@ theorem execTerm_switchOrGoto (sig : FnId → Option FnSig) (st : State) (p : Pl
       (execTerm sig st (Terminator.switchInt (Operand.copy p) arms otherwise)) := by
   unfold switchOrGoto
   by_cases hc : (plainProj p.proj && allTo otherwise arms) = true
-  · rw [if_pos hc]
+  · rw [ite_eq_left hc]
     have hev : (∃ v, evalOperand st (Operand.copy p) = Outcome.ok (v, st)) ∨
         ∃ why, evalOperand st (Operand.copy p) = Outcome.undefined why :=
       evalCopy_calm st p (and_true_left hc)
@@ -306,7 +306,7 @@ theorem execTerm_switchOrGoto (sig : FnId → Option FnSig) (st : State) (p : Pl
             (congrTo (State.jump st) (switchTarget_allTo otherwise key arms (and_true_right hc)))
         have tgt : execTerm sig st (Terminator.goto otherwise) = st.jump otherwise := rfl
         exact Or.inr (tgt.trans (jump.symm.trans src.symm))
-  · rw [if_neg hc]
+  · rw [ite_eq_right hc]
     exact Outcome.Refines.of_eq rfl
 
 theorem execTerm_switchToGotoTerm (sig : FnId → Option FnSig) (st : State) (t : Terminator) :

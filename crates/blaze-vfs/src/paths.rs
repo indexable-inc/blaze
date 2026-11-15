@@ -103,6 +103,10 @@ impl Paths {
         self.index.find(hash, same).map(|it| PathId(it.1))
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "path ids and text ends are u32; 2^32 names or 4 GiB of names in flight needs a typed refusal from `intern`'s callers"
+    )]
     pub(crate) fn intern(&mut self, name: &str) -> PathId {
         let hash = Paths::hash(self.key, name);
         let Paths { text, ends, index, .. } = self;

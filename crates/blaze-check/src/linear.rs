@@ -165,6 +165,11 @@ struct Memo<S> {
 
 impl<S: Spec> Memo<S> {
     /// Adds the pair; its index, or `None` if it is there already.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the memo chains states by u32 index: a search past 2^32 states needs a typed \
+                  refusal from the linearizability check"
+    )]
     fn insert(&mut self, done: u64, state: S) -> Option<u32> {
         let hash = FixedState.hash_one((done, &state));
         let at = u32::try_from(self.seen.len()).expect("a memo of fewer than 2^32 states");

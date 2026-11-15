@@ -5,6 +5,9 @@
 
 #![feature(allocator_api, allocator_ext)]
 #![feature(portable_simd)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![deny(unsafe_code)]
 
 extern crate rustc_lexer;
@@ -603,6 +606,11 @@ pub fn token_to_literal(text: &str, span: Span) -> Literal {
 }
 
 /// A token's length as a `u32`, as every offset into a source text is.
+#[expect(
+    blaze::narrowed_len,
+    reason = "source offsets are u32 and a token comes from a file whose size nothing checks is \
+              under 4 GiB: a larger file needs a typed refusal where it is read"
+)]
 fn text_len(text: &str) -> u32 {
     u32::try_from(text.len()).expect("a token of 4 GiB or more")
 }

@@ -29,7 +29,7 @@ passes, the test fork servers. A job is:
 | fetch | `git fetch` of the commit, checkout in the machine's clone | 1 s | built (`warm_ci.py`) |
 | view | the watcher reports the files that differ; a new root | 0.1 s | exists; one clone, so one job at a time |
 | check | `blaze check --workspace` of what the change reaches | 5 s | the client's own overhead (part A of lane fast-noop-1110), then T1/T2: work in proportion to the change |
-| reached tests | `blaze test --reached`: tests whose executed functions and reads moved | 8 s | exists; holds for a small change once the check does |
+| selected tests | `blaze test`: tests whose executed functions and reads moved | 8 s | exists; holds for a small change once the check does |
 | report | the job's status, the steps' times | 0.5 s | built |
 | **total** | | **under 17 s** | |
 
@@ -46,7 +46,7 @@ What must be true of blaze:
   makes that one cheap too.
 - **Work in proportion to the change** (T1 to T4): a check of the whole workspace after a
   small edit reruns that edit's queries.
-- **A selection that fails is a failure.** `blaze test --reached` reports every test, run or
+- **A selection that fails is a failure.** `blaze test` reports every test, run or
   kept; a run with no result is refused by the job, never read as a pass.
 
 ## Trust
@@ -56,7 +56,7 @@ itself**. What blaze's sandbox covers, and what it does not:
 
 - **Covered:** build scripts and proc macros, always (AGENTS.md `sandbox-everything`,
   `proc-macros-on-wasm`): a build script writes only its `OUT_DIR` and has no network; a proc
-  macro is wasm in Wasmtime. Tests the daemon runs under `--reached` run in the sandbox too.
+  macro is wasm in Wasmtime. Tests the daemon runs under `blaze test` run in the sandbox too.
 - **Not covered:** a test that runs outside the sandbox (docs/cargo.md, "Which tests run":
   it runs every time and is named), `blaze run`, and anything a test does that the sandbox
   allows. A test is arbitrary code as the runner's user, beside a daemon and a store every

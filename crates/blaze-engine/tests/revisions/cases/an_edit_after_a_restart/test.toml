@@ -17,6 +17,12 @@ action = "run"
 prints = "3 11\n"
 redone = ["app::f"]
 max_ms = 60000
+max_executed = 20000
+max_written = 400
+
+[revision.known]
+"real: max_executed" = "a restart resolves the workspace's crates from source before the edit is looked at: about 2.3 million rows on hello-world (2026-11-11); expected under 20,000 once a crate is found by its records (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", pieces E and F)"
+"real: max_written" = "a restart writes every file of every package of the plan as an input of a new database: 4,722 on hello-world (2026-11-11); expected about 250 and the edited file (the same section, pieces A to D)"
 
 [[revision]]
 steps = ["edit", "stop"]
@@ -24,3 +30,9 @@ action = "run"
 prints = "3 101\n"
 redone = ["app::f"]
 max_ms = 60000
+max_executed = 20000
+max_written = 400
+
+[revision.known]
+"real: max_executed" = "a restart resolves the workspace's crates from source before the edit is looked at: about 2.3 million rows on hello-world (2026-11-11); expected under 20,000 once a crate is found by its records (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", pieces E and F)"
+"real: max_written" = "a restart writes every file of every package of the plan as an input of a new database: 4,722 on hello-world (2026-11-11); expected about 250 and the edited file (the same section, pieces A to D)"

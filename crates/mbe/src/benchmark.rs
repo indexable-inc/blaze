@@ -13,7 +13,7 @@ use syntax_bridge::{
 use test_utils::{bench, bench_fixture, skip_slow_tests};
 
 use crate::{
-    DeclarativeMacro, MacroCallStyle,
+    DeclarativeMacro, MacroCall,
     parser::{MetaVarKind, Op, RepeatKind, Separator},
 };
 
@@ -50,7 +50,7 @@ fn benchmark_expand_macro_rules() {
         invocations
             .into_iter()
             .map(|(id, tt)| {
-                let res = rules[&id].expand(&db, &tt, |_| (), MacroCallStyle::FnLike, DUMMY);
+                let res = rules[&id].expand(&db, &tt, |_| (), MacroCall::FnLike, DUMMY);
                 assert!(res.err.is_none());
                 res.value.0.as_token_trees().len()
             })
@@ -123,8 +123,7 @@ pub(crate) fn invocation_fixtures(
                     }
                     let subtree = builder.build();
 
-                    if it.expand(db, &subtree, |_| (), MacroCallStyle::FnLike, DUMMY).err.is_none()
-                    {
+                    if it.expand(db, &subtree, |_| (), MacroCall::FnLike, DUMMY).err.is_none() {
                         res.push((name.clone(), subtree));
                         break;
                     }

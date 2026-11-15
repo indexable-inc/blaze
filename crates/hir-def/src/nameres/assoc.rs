@@ -47,6 +47,12 @@ impl TraitItems {
 
     #[blaze_query::tracked(returns(ref))]
     pub fn query_with_diagnostics(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
+        // The trait's own entry where one is kept (rule 65), else collected and kept.
+        crate::nameres::frozen::entries::items::trait_items(db, tr, || Self::collected(db, tr))
+    }
+
+    /// The trait's items collected from its syntax: the work its entry saves.
+    fn collected(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *tr.lookup(db);
         let source = ast_id.to_view(db);
         if source.eq_token().is_some() {
@@ -127,6 +133,12 @@ impl ImplItems {
     #[blaze_query::tracked(returns(ref))]
     pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
+        // The impl's own entry where one is kept (rule 65), else collected and kept.
+        crate::nameres::frozen::entries::items::impl_items(db, id, || Self::collected(db, id))
+    }
+
+    /// The impl's items collected from its syntax: the work its entry saves.
+    fn collected(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *id.lookup(db);
 
         let collector =

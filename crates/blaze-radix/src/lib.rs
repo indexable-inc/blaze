@@ -23,7 +23,7 @@
 //! depends on, uses it, so it can depend on nothing that takes `blaze-check`
 //! (docs/v2/plan/design/model-checker.md). `blaze-ids` re-exports it as `blaze_ids::radix`.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_ext)]
 
 use std::{
     mem::MaybeUninit,

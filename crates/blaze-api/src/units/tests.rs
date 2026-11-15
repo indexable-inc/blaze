@@ -189,7 +189,7 @@ fn what_no_unit_can_hold_is_refused() {
 
     let relative = Unit { socket: "v2.sock".into(), ..unit.clone() };
     assert!(refused(&relative, &place).contains("v2.sock is not an absolute path"));
-    let control = Unit { log: "/tmp/a\nb".into(), ..unit.clone() };
+    let control = Unit { log: "/logs/a\nb".into(), ..unit.clone() };
     assert!(refused(&control, &place).contains("control character"));
     let long = Unit { socket: PathBuf::from(format!("/{}", "s".repeat(103))), ..unit.clone() };
     assert!(
@@ -213,7 +213,7 @@ fn what_no_unit_can_hold_is_refused() {
     let (unit, place) = linux();
     let spaced = Unit { socket: "/run/a b/v2.sock".into(), ..unit.clone() };
     assert!(refused(&spaced, &place).contains("which a systemd unit cannot name it with"));
-    let slashed = Unit { log: "/tmp/a\\b".into(), ..unit.clone() };
+    let slashed = Unit { log: "/logs/a\\b".into(), ..unit.clone() };
     assert!(refused(&slashed, &place).contains("'\\\\'"));
     let long = Unit { socket: PathBuf::from(format!("/{}", "s".repeat(107))), ..unit.clone() };
     assert!(refused(&long, &place).contains("at most 107"));
@@ -284,12 +284,10 @@ fn install_and_uninstall_steps() {
 
 #[test]
 fn installed_is_read_from_the_main_file() {
-    let dir = std::env::temp_dir().join(format!("blaze-units-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = blaze_core::temp::TempDir::for_test("blaze-units-");
     for manager in [Manager::Launchd, Manager::Systemd] {
         let (unit, _) = if manager == Manager::Launchd { mac() } else { linux() };
-        let place = Place { manager, dir: dir.clone(), uid: 501 };
+        let place = Place { manager, dir: dir.path().to_path_buf(), uid: 501 };
         assert_eq!(installed(&place, &unit.socket), Ok(Installed::No));
         for file in files(&unit, &place).unwrap() {
             std::fs::write(&file.path, &file.text).unwrap();
@@ -303,7 +301,6 @@ fn installed_is_read_from_the_main_file() {
         let error = installed(&place, &unit.socket).expect_err("a main file of no socket");
         assert!(error.what.contains("names no socket"), "{error}");
     }
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -346,8 +343,7 @@ fn steps_run_in_order_and_the_first_failure_is_named() {
     use super::run;
 
     let words = |argv: &[&str]| argv.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
-    let dir = std::env::temp_dir().join(format!("blaze-units-run-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
+    let dir = blaze_core::temp::TempDir::for_test("blaze-units-run-");
     let file = dir.join("a/b/unit");
     run(&[
         Step::MakeDir(dir.join("a/b")),
@@ -376,5 +372,4 @@ fn steps_run_in_order_and_the_first_failure_is_named() {
     assert!(missing.what.contains("did not start"), "{missing}");
     run(&[Step::Remove(file.clone())]).unwrap();
     assert!(!file.exists());
-    std::fs::remove_dir_all(&dir).unwrap();
 }

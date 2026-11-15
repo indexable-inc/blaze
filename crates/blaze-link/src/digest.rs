@@ -28,6 +28,9 @@ pub const BLOCK: usize = 4096;
 /// A leaf, a node or a root.
 pub type Hash = [u8; 32];
 
+/// A block of zeros: what a block read is compared with before it is hashed.
+static ZERO_BLOCK: [u8; BLOCK] = [0; BLOCK];
+
 const LEAF: &str = "blaze v2 link file block 1";
 const NODE: &str = "blaze v2 link file node 1";
 const ROOT: &str = "blaze v2 link file 1";
@@ -140,6 +143,13 @@ impl Digest {
         self.nodes.get(&place(level, index)).copied().unwrap_or(self.zeros[level])
     }
 
+    /// The node at `level` over `left` and `right`: two zero subtrees make the zero subtree a
+    /// level up, known ahead and not hashed.
+    fn parent(&self, level: usize, left: &Hash, right: &Hash) -> Hash {
+        let zero = &self.zeros[level - 1];
+        if left == zero && right == zero { self.zeros[level] } else { node(left, right) }
+    }
+
     /// Keeps `hash` as the node at `level` and `index`, canonically: a zero subtree's is not
     /// kept.
     fn set(&mut self, level: usize, index: u64, hash: Hash) {
@@ -170,17 +180,23 @@ impl Digest {
         let (old, new) = (Digest::blocks(self.len), Digest::blocks(len));
         self.dirty.clear();
         if len < self.len {
-            // Every leaf kept past the new end goes, through the tree as it stands (the taller
-            // one), so no node above the new top is left saying what the file no longer holds.
-            let mut gone: Vec<u64> = self // alloc: a file made shorter, which a splice does not
+            // Every leaf kept past the new end goes, and every node above the new top: those
+            // are no part of the shorter file's tree, and a digest of it hashed whole keeps
+            // none of them. The nodes on the gone leaves' paths up to the new top are hashed
+            // again below, so none of them says what the file no longer holds.
+            let top = Digest::height_of(new);
+            let (mut gone, above): (Vec<u64>, Vec<u64>) = self // alloc: a file made shorter, which a splice does not
                 .nodes
                 .keys()
                 .copied()
-                .filter(|at| at >> 56 == 0 && *at >= new)
-                .collect();
+                .filter(|at| (at >> 56 == 0 && *at >= new) || (at >> 56) as usize > top)
+                .partition(|at| at >> 56 == 0);
             gone.sort_unstable();
             for &index in &gone {
                 self.nodes.remove(&place(0, index));
+            }
+            for at in &above {
+                self.nodes.remove(at);
             }
             self.dirty.extend(gone);
             if new > 0 && len % BLOCK as u64 != 0 {
@@ -191,13 +207,13 @@ impl Digest {
                 self.dirty.push(new - 1);
                 self.dirty.sort_unstable();
             }
-            self.raise(Digest::height_of(old));
+            self.raise(top);
         }
         self.len = len;
         // A taller tree's new levels are over the old top and zeros beside it.
         for level in Digest::height_of(old.min(new)) + 1..=Digest::height_of(new) {
             let (left, right) = (self.get(level - 1, 0), self.get(level - 1, 1));
-            self.set(level, 0, node(&left, &right));
+            self.set(level, 0, self.parent(level, &left, &right));
         }
     }
 
@@ -238,7 +254,10 @@ impl Digest {
                 // What a reader left past the end is not the file's.
                 block[BLOCK - (end - self.len) as usize..].fill(0);
             }
-            self.set(0, index, leaf(&block));
+            // A block of zeros is the zero leaf, known ahead: an image is mostly room nothing
+            // wrote, and a compare costs a fraction of a hash.
+            let hash = if block == ZERO_BLOCK { self.zeros[0] } else { leaf(&block) };
+            self.set(0, index, hash);
         }
         let height = self.height();
         self.raise(height);
@@ -259,7 +278,7 @@ impl Digest {
             for at in 0..self.dirty.len() {
                 let index = self.dirty[at];
                 let (left, right) = (self.get(level - 1, 2 * index), self.get(level - 1, 2 * index + 1));
-                self.set(level, index, node(&left, &right));
+                self.set(level, index, self.parent(level, &left, &right));
             }
         }
         self.dirty.clear();
@@ -291,7 +310,7 @@ impl Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     /// One step of a file's life: bytes written at an offset, or a new length.
     #[derive(Clone, Debug)]
@@ -300,15 +319,14 @@ mod tests {
         Resize(u32),
     }
 
-    #[hegel::composite]
-    fn op(tc: &hegel::TestCase) -> Op {
+    fn op(tape: &Tape) -> Op {
         // Offsets up to 40 blocks, so trees of several levels and files that cross a power of
         // two both ways.
-        match tc.draw(gs::integers::<u8>().max_value(3)) {
-            0 => Op::Resize(tc.draw(gs::integers::<u32>().max_value(40 * BLOCK as u32))),
+        match tape.int_in(0..=3u8, "op") {
+            0 => Op::Resize(tape.int_in(0..=40 * BLOCK as u32, "length")),
             _ => Op::Write {
-                at: tc.draw(gs::integers::<u32>().max_value(40 * BLOCK as u32)),
-                bytes: tc.draw(gs::binary().max_size(3 * BLOCK)),
+                at: tape.int_in(0..=40 * BLOCK as u32, "at"),
+                bytes: tape.bytes(0..=3 * BLOCK, "bytes"),
             },
         }
     }
@@ -365,12 +383,14 @@ mod tests {
     /// The refinement: after any sequence of writes and changes of length, the digest kept by
     /// updating only the blocks written is the digest of the file hashed whole, root and
     /// nodes.
-    #[hegel::test]
-    fn a_digest_kept_by_updates_is_the_files(tc: hegel::TestCase) {
-        let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(12));
-        if let Err(why) = kept_is_whole(&ops, false) {
-            panic!("{why}");
-        }
+    #[test]
+    fn a_digest_kept_by_updates_is_the_files() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let ops: Vec<Op> = tape.vec(0..=12, "ops", op);
+            if let Err(why) = kept_is_whole(&ops, false) {
+                panic!("{why}");
+            }
+        })
     }
 
     /// A control of [`a_digest_kept_by_updates_is_the_files`]: with an update that skips a

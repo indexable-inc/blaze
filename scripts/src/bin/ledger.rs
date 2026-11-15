@@ -13,6 +13,10 @@
 //! Where this differs from the Python, on purpose: the default `work` directory is
 //! `/tmp/ledger-<pid>-<nanoseconds>`, not `mkdtemp`'s random name; the date is `date +%Y-%m-%d`'s.
 
+// `#[expect(blaze::..)]` names a blaze lint; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
+
 /// What the usage error prints: harness/v2/ledger.py's docstring, with this script's commands.
 const DOC: &str = r#"ledger.py: the objectives ledger (docs/v2/plan.md, "How the work is run"). The rows are data,
 `docs/v2/plan/objectives.json`; this script checks them, runs their checks and writes what they
@@ -546,6 +550,12 @@ fn git_said(root: &Path, args: &[&str]) -> String {
 }
 
 /// The ledger after the chosen rows' checks ran, and which rows those were.
+#[expect(
+    blaze::tmp_path,
+    reason = "the default `work` is the documented `/tmp/ledger-<pid>-<ns>` (DOC and the module doc), and it keeps \
+              each check's result file after the run for a person to read; a TempDir would remove them at exit, so \
+              moving it is a change to the script's interface, not this sweep's"
+)]
 fn run_checks(it: &Args, root: &Path, ledger: &Ledger) -> (Ledger, Vec<usize>) {
     let Some(engine) = &it.engine else { fail(SCRIPT, "run needs `engine`") };
     let dirty = !git_said(root, &["status", "--porcelain", "--untracked-files=no"]).is_empty();
@@ -759,10 +769,7 @@ fn selftest() {
         page.contains("*write: a lint*") && page.contains("3 objectives: 1 met, 0 open, 0 blocked, 2 not measured."),
         "the page",
     );
-    let tmp = std::env::temp_dir().join(format!("ledger-selftest-{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&tmp) {
-        fail(SCRIPT, &format!("{} is not made: {e}", tmp.display()));
-    }
+    let tmp = blaze_script::TempDir::new("ledger-selftest-").unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
     let out = tmp.join("r.json");
     write_or_fail(
         &out,
@@ -771,7 +778,7 @@ fn selftest() {
     let words = said(&out, 1);
     let none = said(&tmp.join("none.json"), 2);
     // Removed before the checks, so a failing one leaves nothing behind.
-    let _ = std::fs::remove_dir_all(&tmp);
+    drop(tmp);
     expect(words == "noop fail (11 ms over 5)", &format!("a failure's words: {words}"));
     expect(none == "exit 2 and no result read", "no result is said so");
     let docs = Check {

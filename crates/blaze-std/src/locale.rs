@@ -37,6 +37,7 @@ pub struct Locale {
 impl Locale {
     /// The simulation's unless a test says otherwise: UTC, `en`, a 24-hour clock, `.`, weeks
     /// from Monday.
+    #[blaze::nonblocking]
     pub fn simulated() -> Locale {
         Locale {
             zone: ZoneName::new("UTC").expect("UTC is a name"),

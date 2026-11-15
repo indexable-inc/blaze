@@ -21,12 +21,12 @@
 //! it, started by the kernel, so `current_exe`, `/proc/self/exe`, dyld's image 0, the PEB,
 //! `dl_iterate_phdr` and backtraces all see the program there, as in a whole build.
 //!
-//! 1. The daemon writes the executable's bytes, as the memory object holds them, to cargo's
-//!    path once per content key ([`host::Host::write_executable`]): not again while the key
-//!    is the same, never for a patch, and not at all where the build placed that very file
-//!    there as its output and says so ([`host::Program::command_placed`]: `blaze run`'s
-//!    launch, which then writes nothing, so the build's placement and its outputs' watch see
-//!    no change).
+//! 1. The build places the executable at cargo's path, as any output: the bytes the memory
+//!    object holds, under the same content key. That placement is the path's one writer; the
+//!    daemon's host writes no file. A launch is asked once its job's placements have ended,
+//!    with the key the build's record holds for the path, and starts only where that is the
+//!    memory's file's key ([`host::Program::command`]); else it is refused naming the path
+//!    and both keys ([`host::StartError::NotPlaced`]).
 //! 2. It spawns that file through `blaze-core`'s `Effect::Spawn` in the run's sandbox, with
 //!    `BLAZE_INPROC` naming its host and a token ([`host::Program::command`]).
 //! 3. Before `main` and before any other code of the program, the program's runtime
@@ -46,8 +46,8 @@
 //!    object (Linux `mmap` `MAP_FIXED|MAP_SHARED`, macOS `mach_vm_map` with
 //!    `VM_FLAGS_OVERWRITE` of the entry it got through the rendezvous; on Windows the daemon
 //!    rebuilds the image's region in the process from the section and the bytes it held).
-//!    The bytes are equal at the moment of the swap: the file was written from the object,
-//!    and the daemon writes only code no thread can reach yet. The hook says STARTED and
+//!    The bytes are equal at the moment of the swap: the file placed is the object's file,
+//!    under the same content key, and the daemon writes only code no thread can reach yet. The hook says STARTED and
 //!    returns; the program starts as it would anywhere.
 //! 5. A program started otherwise (no `BLAZE_INPROC`: run by hand) runs its file as it is;
 //!    [`runtime::attach`] says so, and [`runtime::quiesce`] does nothing.

@@ -473,6 +473,10 @@ fn waits_the_record_never_ends_are_told_apart_by_the_wall_they_cover() {
 /// starts build 1, closes one span in it, enters a wait it never leaves, flushes, says it is
 /// ready, and sleeps until it is killed.
 #[cfg(unix)]
+#[expect(
+    blaze::unbounded_test_wait,
+    reason = "the child process's wait it never leaves, as the daemon it stands for; the parent test kills it within 60 s of its start"
+)]
 fn killed_daemon(dir: &std::path::Path) -> ! {
     use std::io::Write as _;
     crate::install();
@@ -480,7 +484,7 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
     owner.lock().unwrap();
     write!(&owner, "{}", std::process::id()).unwrap();
     let mut history =
-        crate::history::History::open(dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+        crate::history::History::open(dir, crate::history::CAP_MOST, crate::sampler::unsampled())
             .unwrap();
     history.build_started(crate::history::BuildRow {
         build_id: 1,
@@ -555,9 +559,8 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
     let duckdb = std::path::PathBuf::from(
         std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
     );
-    let dir = std::env::temp_dir().join(format!("blaze-slow-killed-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = blaze_core::temp::TempDir::for_test("blaze-slow-killed-");
+    let dir = tmp.path().to_path_buf();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "slow::tests::a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running",
@@ -567,6 +570,7 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
         ])
         .env(CHILD, &dir)
         .spawn()
+        .map(stdx::JodChild)
         .unwrap();
     let pid = child.id();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -605,15 +609,18 @@ fn a_build_whose_daemon_was_killed_is_reported_with_what_it_was_running() {
     ] {
         assert!(text.contains(said), "the report says {said:?}:\n{text}");
     }
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Runs `fixture`, DuckDB's SQL writing a history's Parquet files into `dir` (`{d}`), beside the
-/// history's schema files.
-fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-slow-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    crate::history::History::open(&dir, crate::history::CAP_BYTES, crate::sampler::unsampled())
+/// history's schema files. The guard returned beside the path removes it when it drops.
+fn history_of(
+    duckdb: &std::path::Path,
+    name: &str,
+    fixture: &str,
+) -> (blaze_core::temp::TempDir, std::path::PathBuf) {
+    let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-slow-{name}-"));
+    let dir = tmp.path().to_path_buf();
+    crate::history::History::open(&dir, crate::history::CAP_MOST, crate::sampler::unsampled())
         .unwrap();
     let fixture = fixture.replace("{d}", &dir.display().to_string());
     let written = std::process::Command::new(duckdb)
@@ -622,7 +629,7 @@ fn history_of(duckdb: &std::path::Path, name: &str, fixture: &str) -> std::path:
         .unwrap();
     assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
     crate::history::list_written(&dir);
-    dir
+    (tmp, dir)
 }
 
 /// Two daemons in one history, pid 7 and then pid 8, each with a build 1 (as every daemon
@@ -638,7 +645,7 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
     );
     let builds = "COPY (SELECT * FROM (VALUES (1::UBIGINT, 1000::BIGINT, 100::BIGINT, 'ok', '/work', 'build')) \
         AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000002.builds.parquet';\n";
-    let mixed = history_of(
+    let (mixed_dir, mixed) = history_of(
         &duckdb,
         "mixed",
         &format!(
@@ -660,9 +667,9 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
         }
         other => panic!("two daemons' build 1 read as one build: {other:?}"),
     }
-    _ = std::fs::remove_dir_all(&mixed);
+    drop(mixed_dir);
 
-    let apart = history_of(
+    let (_apart_dir, apart) = history_of(
         &duckdb,
         "apart",
         &format!(
@@ -688,7 +695,6 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
         "another process's row of no build in the window is not the build's"
     );
     load::run(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
-    _ = std::fs::remove_dir_all(&apart);
 }
 
 /// Every query `blaze slow` asks beside the time model (`load::facts`: the build's row, threads,
@@ -729,7 +735,7 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
             (1, 8, 10, 1030, 'INFO', 'blaze', 'event job.rs:1', 'fine', 3), \
             (1, 8, 10, 1040, 'ERROR', 'blaze', 'event stop.rs:5', 'stall', 4)) \
             AS t(build_id, process, thread, t_ns, level, target, name, message, event_id)) TO '{d}/1-00000001.events.parquet';\n";
-    let dir = history_of(&duckdb, "facts", fixture);
+    let (_tmp, dir) = history_of(&duckdb, "facts", fixture);
     let source = crate::time::load::Source { duckdb: &duckdb, history: &dir };
     let stack = |name: &str, on_cpu, frames: &[&str], samples| SpanStack {
         name: name.to_owned(),
@@ -780,5 +786,52 @@ fn every_query_of_slow_is_answered_and_the_stacks_are_the_commonest_of_each_span
             assert_eq!(facts.recorder.spans_made, Some(2), "the window's recorder");
         }
     }
-    _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The proportionality warning reaches the person who asks why: a build whose account names
+/// an alarm (here the no-op that wrote 53 inputs, 2026-11-12) says it in `blaze slow`, with
+/// the account's line and its ratios; the control is the same build with nothing written,
+/// which warns of nothing, and a history with no account, which says that it holds none.
+#[test]
+fn a_builds_account_and_its_warnings_are_said_before_the_findings() {
+    use crate::{
+        account::{Account, Seen},
+        facts::QueryCountRow,
+    };
+    let quiet = QueryCountRow {
+        build_id: 1,
+        query: "ScopeInput",
+        executed: 0,
+        verified: 0,
+        reran: 0,
+        evicted_asked: 0,
+        evicted: 0,
+        dropped: 0,
+        reads_recorded: 0,
+        reads_kept: 0,
+        reads_most: 0,
+        written: 0,
+        ran_new: 0,
+        ran_changed: 0,
+        ran_untracked: 0,
+        ran_cycle: 0,
+        validity: crate::facts::Validity::default(),
+    };
+    let switches = || vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
+    let spans = || vec![span(1, 1, None, "job", 0, 100, 1)];
+    // The report of build 1, as the account's row is: a `Facts` left at its default says
+    // build 0, the id of no build.
+    let said = |facts: &Facts| {
+        let facts = Facts { build: BuildFacts { id: 1, ..BuildFacts::default() }, ..facts.clone() };
+        text(&report(switches(), spans(), 100, &facts), 10)
+    };
+    let wrote = Account::of(1, &[QueryCountRow { written: 53, ..quiet }], &[], Seen::default());
+    let warned = said(&Facts { account: Some(wrote.row), ..workers([1]) });
+    assert!(warned.contains("  account: 53 inputs written (0 source, 0 environment, 0 plan, 53 derived, 0 unattributed)"), "{warned}");
+    assert!(warned.contains("    warning (needless-writes): build 1 wrote 53 inputs and no row ran for a changed read"), "{warned}");
+    let calm = Account::of(1, &[quiet], &[], Seen::default());
+    let calm = said(&Facts { account: Some(calm.row), ..workers([1]) });
+    assert!(calm.contains("  account: 0 inputs written") && !calm.contains("warning ("), "{calm}");
+    let none = said(&workers([1]));
+    assert!(none.contains("  account: the history holds none for build 1"), "{none}");
 }

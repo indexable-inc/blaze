@@ -1,0 +1,11 @@
+{
+ "id": "lang1100-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane rust-1100-lang",
+ "where": "crates/hir-def nameres::delta::tests::random::edit_scripts_over_the_fixtures; crates/base-db/src/reparse.rs:329",
+ "what": "The random test fails on some seeds, on main too: `a reparse whose errors are not the whole parse's`, the whole parse has `prefix `S` is unknown` and the reparse does not, after a `Rename` edit that puts an identifier right before a string literal. On 136432aa02 with HEGEL_TEST_CASES=4000 it failed (draws 399, [Rename { at: 768, to: 0 }], false); on this lane it failed once at the default 192 cases (draws 316, [Rename { at: 2816, to: 0 }], false) and looked like a regression of the lane.",
+ "cost": "a base tree exported and built again to tell it from my change",
+ "cause": "not found: an incremental reparse that does not relex across the edit's left edge, so a new unknown-prefix error at the token before it is missed (a guess from the two failures)",
+ "workaround": "rerun; compare with main under HEGEL_TEST_CASES=4000",
+ "state": "open: a real reparse bug the test finds only on some seeds; the test has no pinned failing case"
+}

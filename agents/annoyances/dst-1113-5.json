@@ -1,0 +1,8 @@
+{
+ "id": "dst-1113-5",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane dst-1113 Q1",
+ "where": "crates/blaze-sim (Config) vs blaze-cas, blaze-solo, blaze-hub test modules",
+ "what": "blaze_sim::Config collides with the crate under test own Config (the store config in blaze-cas tests, run::Config in blaze-solo, crate::Config in blaze-hub), so every port imports it as `Config as SimConfig`; a name like blaze_sim::Cases or Search would not collide",
+ "state": "open"
+}

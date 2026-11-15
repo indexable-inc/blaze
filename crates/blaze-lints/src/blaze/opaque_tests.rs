@@ -391,6 +391,7 @@ fn the_docs_table_has_each_lints_default_level() {
         Lint::ProcMacroAttribute,
         Lint::ProcMacroFnLike,
         Lint::BuildScriptAmbient,
+        Lint::NotLatestEdition,
         Lint::StdUse,
     ] {
         let row = format!("| `blaze::{}` | `", lint.name());

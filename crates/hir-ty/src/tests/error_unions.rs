@@ -4,6 +4,8 @@
 //! the attribute is refused. A member, or a union of some of the members, widens to a union:
 //! by coercion where a union is expected, and by `?` through core's `From`; anything else is
 //! refused. A union is `Debug`, `Display`, `Error`, `Clone` and `Hash` when its members are.
+//! A constructor pattern of a member matches the union by member (`PatAdjust::UnionMember`),
+//! through references and under `x @`, only in a crate with the attribute.
 
 use base_db::{Crate, Db, all_crates};
 use hir_def::{
@@ -19,6 +21,7 @@ use rustc_type_ir::{TyKind, inherent::IntoKind as _};
 use crate::{
     Adjust, ErrorUnionRefusal, InferBodyId, InferenceDiagnostic, InferenceResult,
     TyLoweringDiagnostic,
+    infer::PatAdjust,
     db::HirDatabase,
     next_solver::{DbInterner, Ty},
     solver_errors::SolverDiagnosticKind,
@@ -255,9 +258,54 @@ fn delegated(e: AB) {
     needs_display(&e);
     needs_clone(&e);
 }
+
+pub struct S { pub n: u8 }
+pub enum E { X, Y(u8) }
+pub struct NotIn;
+pub type SE = S | E;
+fn takes_s(_: S) {}
+fn takes_s_ref(_: &S) {}
+fn by_member(u: S | E) -> u8 {
+    match u {
+        S { n } => n,
+        E::X => 0,
+        E::Y(n) => n,
+    }
+}
+fn by_member_through_a_reference(u: &(S | E)) -> u8 {
+    match u {
+        S { n } => *n,
+        E::X => 0,
+        E::Y(n) => *n,
+    }
+}
+fn bound_whole(u: S | E) {
+    match u {
+        s @ S { .. } => takes_s(s),
+        E::X | E::Y(_) => {}
+    }
+}
+fn bound_whole_through_a_reference(u: &(S | E)) {
+    match u {
+        s @ S { .. } => takes_s_ref(s),
+        _ => {}
+    }
+}
+fn no_member(u: S | E) {
+    match u {
+        NotIn => {}
+        _ => {}
+    }
+}
 //- /plain.rs crate:plain deps:main
 fn not_gated() {
     main::take(main::A);
+}
+fn not_gated_pattern(u: main::SE) {
+    match u {
+        main::S { .. } => {}
+        _ => {}
+    }
 }
 "#;
 
@@ -383,4 +431,165 @@ fn question_mark_refuses_what_is_not_a_subset() {
 #[test]
 fn a_union_is_an_error_when_its_members_are() {
     inferred("main", "delegated", |_, result, _| assert_clean("delegated", result));
+}
+
+/// How many of the patterns of `krate`'s function `name` match an error union by member.
+fn member_patterns(krate: &str, name: &str, check: impl FnOnce(&InferenceResult<'_>, usize)) {
+    let db = fixture::db(BODIES).into_db();
+    blaze_query::db::attach(&db, || {
+        let func = function(&db, krate, name);
+        let result =
+            InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)));
+        let by_member = Body::of(&db, DefWithBodyId::FunctionId(func))
+            .pats()
+            .filter(|(id, _)| {
+                result
+                    .pat_adjustment(*id)
+                    .is_some_and(|it| it.iter().any(|it| it.kind == PatAdjust::UnionMember))
+            })
+            .count();
+        check(result, by_member);
+    })
+}
+
+/// A struct pattern and an enum's variant patterns each match the member they are of: one
+/// adjustment per pattern, last after the references peeled, and the bindings have the
+/// member's field types (the bodies type-check, `*n` of a binding by reference included).
+#[test]
+fn a_constructor_pattern_of_a_member_matches_the_union_by_member() {
+    for name in ["by_member", "by_member_through_a_reference"] {
+        member_patterns("main", name, |result, by_member| {
+            assert_clean(name, result);
+            assert_eq!(by_member, 3, "{name}: `S {{ n }}`, `E::X` and `E::Y(n)`");
+        });
+    }
+}
+
+/// `s @ S { .. }` binds the member, not the union: `s` is an `S` (a `&S` through a
+/// reference), and the adjustment is on the binding, so the pattern after `@` has none.
+#[test]
+fn a_binding_at_a_member_pattern_binds_the_member() {
+    member_patterns("main", "bound_whole", |result, by_member| {
+        assert_clean("bound_whole", result);
+        assert_eq!(by_member, 3, "`s @ S {{ .. }}`, `E::X` and `E::Y(_)`");
+    });
+    member_patterns("main", "bound_whole_through_a_reference", |result, by_member| {
+        assert_clean("bound_whole_through_a_reference", result);
+        assert_eq!(by_member, 1);
+    });
+}
+
+/// A pattern of a type that is no member is checked against the union as it is: a mismatch,
+/// never a match of nothing. And a crate without the attribute matches nothing by member.
+#[test]
+fn a_pattern_of_no_member_and_a_crate_without_the_attribute_are_mismatches() {
+    member_patterns("main", "no_member", |result, by_member| {
+        assert_eq!(by_member, 0);
+        assert!(result.has_type_mismatches(), "{:?}", result.diagnostics());
+    });
+    member_patterns("plain", "not_gated_pattern", |result, by_member| {
+        assert_eq!(by_member, 0);
+        assert!(result.has_type_mismatches(), "{:?}", result.diagnostics());
+    });
+}
+
+/// The members of the union `ty`, in the order the type has them, each with its name.
+fn members_of(db: &Db, ty: Ty<'_>) -> Vec<(hir_def::StructId, String)> {
+    let interner = DbInterner::new_with(db, crate_named(db, "main"));
+    let members = crate::error_union::members(interner, ty).expect("an error union");
+    members
+        .iter()
+        .map(|member| match member.kind() {
+            TyKind::Adt(def, _) => match def.def_id() {
+                AdtId::StructId(it) => (it, StructSignature::of(db, it).name.as_str().to_owned()),
+                other => panic!("the fixture's members are structs, not {other:?}"),
+            },
+            other => panic!("a member that is no item: {other:?}"),
+        })
+        .collect()
+}
+
+/// The same three members, as two builds of one crate have them: `items` declares them in
+/// one order (so the database numbers them in that order), and the unions are written in
+/// `orders`, in the crate that declares the members and in one that depends on it.
+fn a_build(items: &str, orders: [&str; 3]) -> String {
+    let [first, second, elsewhere] = orders;
+    format!(
+        "//- minicore: sized, error_union\n\
+         //- /main.rs crate:main\n#![blaze::error_unions]\n{items}\n\
+         pub struct V {{ first: {first}, second: {second} }}\n\
+         //- /user.rs crate:user deps:main\n#![blaze::error_unions]\n\
+         use main::{{FsError, Missing, Stopped}};\n\
+         struct V {{ elsewhere: {elsewhere} }}\n"
+    )
+}
+
+/// Two builds of the same members, declared and written in opposite orders.
+fn two_builds() -> [String; 2] {
+    [
+        a_build(
+            "pub struct Missing;\npub struct FsError;\npub struct Stopped;",
+            ["Missing | FsError | Stopped", "Stopped | FsError | Missing", "FsError | Stopped | Missing"],
+        ),
+        a_build(
+            "pub struct Unrelated;\npub struct Stopped;\npub struct FsError;\npub struct Missing;",
+            ["Stopped | Missing | FsError", "FsError | Missing | Stopped", "Missing | Stopped | FsError"],
+        ),
+    ]
+}
+
+/// What a build says of the set of `Missing`, `FsError` and `Stopped`: its members' names in
+/// the order the type has them, checked to be one type however it is written and the very
+/// type the depending crate has; and the same names in the order the build's database
+/// numbers their items, which is what an order by interned ID would be.
+fn orders_of(build: &str) -> (Vec<String>, Vec<String>) {
+    let mut in_main = None;
+    let mut numbered = None;
+    fields_of(build, "main", |db, tys, diagnostics| {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let [first, second] = tys else { panic!("{tys:?}") };
+        assert_eq!(first, second, "one type, whatever order it is written in");
+        let mut members = members_of(db, *first);
+        in_main = Some(members.iter().map(|(_, name)| name.clone()).collect::<Vec<_>>());
+        members.sort_by_key(|(id, _)| *id);
+        numbered = Some(members.into_iter().map(|(_, name)| name).collect::<Vec<_>>());
+    });
+    fields_of(build, "user", |db, tys, diagnostics| {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let [elsewhere] = tys else { panic!("{tys:?}") };
+        let names: Vec<String> = members_of(db, *elsewhere).into_iter().map(|it| it.1).collect();
+        assert_eq!(Some(names), in_main, "one order in every crate");
+    });
+    (in_main.expect("the union of `main`"), numbered.expect("the union of `main`"))
+}
+
+/// The oracle: every build has the set's members in one order.
+fn one_order(orders: &[Vec<String>]) -> bool {
+    orders.windows(2).all(|pair| pair[0] == pair[1])
+}
+
+/// The invariant: a set's members have one order, whatever order they are written in,
+/// whatever order their items are declared in (which is the order a database numbers them
+/// in), whichever crate writes the set and whichever build lowers it; so the set is one
+/// type, with one representation, everywhere ((c) of the feature's check, rule
+/// `deterministic-output`). Two builds that declare and write the members in opposite
+/// orders agree on the order, and the crate that depends on the members' crate has the very
+/// type that crate has.
+#[test]
+fn a_sets_members_have_one_order_in_every_crate_and_every_build() {
+    let orders = two_builds().map(|build| orders_of(&build).0);
+    assert!(one_order(&orders), "{orders:?}");
+    let mut sorted = orders[0].clone();
+    sorted.sort();
+    assert_eq!(sorted, ["FsError", "Missing", "Stopped"]);
+}
+
+/// The control of the invariant above. The planted bug is the order a union would have if
+/// its members were sorted by their interned IDs, the numbers a database gives items as it
+/// meets them: the two builds, which declare the members in opposite orders, then disagree,
+/// and the oracle refuses them.
+#[test]
+fn the_oracle_catches_an_order_by_the_databases_numbering() {
+    let numbered = two_builds().map(|build| orders_of(&build).1);
+    assert!(!one_order(&numbered), "the builds number the members alike: {numbered:?}");
 }

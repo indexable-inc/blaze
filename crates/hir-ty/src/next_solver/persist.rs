@@ -288,6 +288,12 @@ unit_code!(ErrorGuaranteed, ExprConst);
 /// word zero-padded. The text, not a declared symbol's index, which another build may number
 /// otherwise.
 impl<'db> Code<'db> for Symbol {
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the type table's format holds a name's length as a u32 word, and a name comes \
+                  from source text that nothing checks is under 4 GiB: a larger name needs a \
+                  typed refusal"
+    )]
     fn put(&self, sink: &mut impl Sink<'db>) {
         let bytes = self.0.as_str().as_bytes();
         sink.word(u32::try_from(bytes.len()).expect("a name shorter than 4 GiB"));
@@ -1920,6 +1926,11 @@ impl<'db> TyTableWriter<'db> {
     }
 
     #[cold]
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the type table's format places nodes and words by u32, and nothing bounds a \
+                  table below 2^32 before this: a larger table needs a typed refusal from the writer"
+    )]
     fn add<N: Node<'db>>(&mut self, key: (Kind, NonZeroU32), node: N) -> u32 {
         let start = self.pending.len();
         ensure_sufficient_stack(|| node.put_node(&mut Children { writer: self }));

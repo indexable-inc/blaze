@@ -9,7 +9,7 @@ site {
       (InTheme, themes.basics)
       (Requires, site.learn.hermetic)
       Title: {"Sharing work"}
-      Description: {"Lesson 5: blaze's store, sharing it with your team, and what's planned next."}
+      Description: {"Blaze's store, sharing it with your team, and what's planned next."}
 
       Step store("Your store") {
         P holds("Everything blaze compiles goes into a **store** on your disk: compiled functions, macro expansions, build-script runs, the standard library and, if you opt in, test passes.")
@@ -67,7 +67,7 @@ site {
       }
 
       Step next("Where to go next") {
-        P install("Installing is one line: `curl -fsSL https://ix.dev/blaze | sh`. [Install](/install) has the other ways in, [Usage](/usage) the day to day. The [course map](/) shows what you've done.")
+        P install("Installing is one line: `curl -fsSL https://ix.dev/blaze | sh`. [Install](/install) has the other ways in. The [course map](/learn) shows what you've done.")
       }
     }
   }

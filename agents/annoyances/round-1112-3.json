@@ -1,0 +1,17 @@
+{
+ "id": "round-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), round runner for the main agent",
+ "where": "cargo test on the VM, one package set after another",
+ "what": "`cargo test -p A` after `cargo build --tests -p A -p B ... (29 packages)` rebuilt blaze-cargo and its dependencies: features are resolved for the packages selected, so each different -p set is another build of the big crates, and four test units each waited on the build directory`s lock while one compiled.",
+ "cost": "about 4 minutes before it was seen; would have been a rebuild per test command (tens of minutes)",
+ "whys": [
+  "feature resolution is per selected package set",
+  "lanes name their tests as separate cargo commands",
+  "one target directory, one lock"
+ ],
+ "class": "per-command cargo test in a shared tree rebuilding for each package set",
+ "prevention": "build every test executable once with one package set and run the executables directly (the round`s run_tests.py: cargo test --no-run --message-format=json, then each executable with its package directory as cwd); lanes name tests as crate + test name, not as cargo commands",
+ "workaround": "run_tests.py",
+ "state": "open: run_tests.py lives in /tmp/round1 on the Mac; it belongs in harness/v2"
+}

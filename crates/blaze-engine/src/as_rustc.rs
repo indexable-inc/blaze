@@ -52,7 +52,7 @@ pub(crate) fn command() -> ! {
             match said {
                 Ok(()) => outcome.code,
                 Err(error) => {
-                    eprintln!("error: writing rustc's answer: {error}");
+                    blaze_report::errln!("error: writing rustc's answer: {error}");
                     1
                 }
             }
@@ -60,7 +60,7 @@ pub(crate) fn command() -> ! {
         Err(why) => {
             let shown: Vec<_> = args.iter().map(|it| it.to_string_lossy()).collect();
             let shown = shown.join(" ");
-            eprintln!("error: blaze can't answer `rustc {shown}` for a build script: {why:#}");
+            blaze_report::errln!("error: blaze can't answer `rustc {shown}` for a build script: {why:#}");
             1
         }
     };

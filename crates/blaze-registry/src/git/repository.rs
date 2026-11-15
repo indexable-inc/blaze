@@ -259,25 +259,15 @@ mod tests {
     use super::*;
 
     /// A directory of the test's own, removed when it ends.
-    struct Scratch(std::path::PathBuf);
+    struct Scratch(blaze_core::temp::TempDir);
 
     impl Scratch {
         fn new(name: &str) -> Scratch {
-            let dir = std::env::temp_dir()
-                .join(format!("blaze-kept-repository-{name}-{}", std::process::id()));
-            _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
+            Scratch(blaze_core::temp::TempDir::for_test(&format!("blaze-kept-repository-{name}-")))
         }
 
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 

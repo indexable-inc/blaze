@@ -227,6 +227,17 @@ impl Code {
         Ok(())
     }
 
+    /// As [`Code::write`]: on macOS `sys_icache_invalidate` is all a write needs, so there
+    /// is nothing to put off.
+    pub fn copy(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
+        self.write(at, bytes)
+    }
+
+    /// Nothing: [`Code::copy`] is a whole write here.
+    pub fn settle(&mut self) -> Result<(), SysError> {
+        Ok(())
+    }
+
     /// Gives the memory of whole pages back to the system. Their addresses stay reserved and
     /// are never used again (the core hands an offset out once).
     pub fn decommit(&mut self, at: usize, len: usize) -> Result<(), SysError> {
@@ -360,11 +371,32 @@ impl Code {
             unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
         });
         #[cfg(target_arch = "aarch64")]
-        {
-            linux::icache(self.base() + at, bytes.len());
-            if !linux::membarrier(linux::PRIVATE_EXPEDITED_SYNC_CORE) {
-                return Err(failed("membarrier(PRIVATE_EXPEDITED_SYNC_CORE)", at, bytes.len()));
-            }
+        linux::icache(self.base() + at, bytes.len());
+        self.settle()
+    }
+
+    /// [`Code::write`] without its last step: the bytes are in memory and the instruction
+    /// caches were told, and no core has yet been made to drop what it fetched before. For
+    /// several writes of one edit, each of bytes nothing names: the caller calls
+    /// [`Code::settle`] once after the last, before any word names what was written. (One
+    /// `membarrier` a function made a launcher's start of 210 functions 210 system calls.)
+    pub fn copy(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
+        self.within("write", at, bytes.len())?;
+        self.writable(|to| {
+            // SAFETY: as `write`'s copy.
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
+        });
+        #[cfg(target_arch = "aarch64")]
+        linux::icache(self.base() + at, bytes.len());
+        Ok(())
+    }
+
+    /// Every core runs what [`Code::copy`] wrote from here on: on AArch64,
+    /// `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`; on x86-64 nothing is needed.
+    pub fn settle(&mut self) -> Result<(), SysError> {
+        #[cfg(target_arch = "aarch64")]
+        if !linux::membarrier(linux::PRIVATE_EXPEDITED_SYNC_CORE) {
+            return Err(failed("membarrier(PRIVATE_EXPEDITED_SYNC_CORE)", 0, 0));
         }
         Ok(())
     }
@@ -444,4 +476,172 @@ pub fn frame_pointer() -> usize {
         core::arch::asm!("mov {}, rbp", out(reg) at, options(nomem, nostack, preserves_flags))
     };
     at
+}
+
+/// Memory the program's data lives in: the constants its code refers to and its statics.
+/// Address space reserved once and handed out from its end, as the code area is; readable
+/// and writable by every thread, never executable.
+///
+/// The invariant every `unsafe` block of it rests on, kept by its owner (the records, which
+/// the control thread owns): **a range is written only between [`Data::reserve`] handing it
+/// out and the first store of a word or a pool cell that names it**, so no program thread
+/// can be reading it; after that it is the program's own memory, as a linked image's data
+/// is. A range is never handed out twice and the mapping is never unmapped (no `Drop`): the
+/// program may keep an address into it for as long as it runs.
+pub struct Data {
+    base: NonNull<u8>,
+    len: usize,
+    /// The offset the next range begins at or after.
+    end: usize,
+}
+
+// SAFETY: a `Data` is the sole owner of its mapping, and nothing in it is tied to a thread.
+unsafe impl Send for Data {}
+
+impl Data {
+    /// Reserves `len` bytes. Nothing is committed until written.
+    pub fn map(len: usize) -> Result<Data, SysError> {
+        #[cfg(target_os = "linux")]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE;
+        #[cfg(target_os = "macos")]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
+        let protection = libc::PROT_READ | libc::PROT_WRITE;
+        // SAFETY: an anonymous mapping at no fixed address; the result is checked.
+        let at = unsafe { libc::mmap(ptr::null_mut(), len, protection, flags, -1, 0) };
+        if at == libc::MAP_FAILED {
+            return Err(failed("mmap(the program's data)", 0, len));
+        }
+        match NonNull::new(at.cast::<u8>()) {
+            Some(base) => Ok(Data { base, len, end: 0 }),
+            None => Err(SysError { call: "mmap(the program's data)", errno: 0, at: 0, len }),
+        }
+    }
+
+    /// The address of the mapping's first byte.
+    pub fn base(&self) -> usize {
+        self.base.as_ptr() as usize
+    }
+
+    /// How many bytes were handed out, alignment's gaps included.
+    pub fn used(&self) -> usize {
+        self.end
+    }
+
+    /// Hands out `size` bytes aligned to `align` (a power of two), zeroed, and gives their
+    /// address. ENOMEM when the reservation has no room: the program is started again.
+    pub fn reserve(&mut self, size: usize, align: usize) -> Result<usize, SysError> {
+        let full = SysError { call: "reserving the program's data", errno: libc::ENOMEM, at: self.end, len: size };
+        // The base is page aligned, so an aligned offset is an aligned address up to a page;
+        // a larger alignment is taken of the address itself.
+        let base = self.base.as_ptr() as usize;
+        let at = (base + self.end).checked_next_multiple_of(align.max(1)).ok_or(full)? - base;
+        let end = at.checked_add(size.max(1)).filter(|end| *end <= self.len).ok_or(full)?;
+        self.end = end;
+        Ok(base + at)
+    }
+
+    /// Copies `bytes` to `address`, a range [`Data::reserve`] handed out that nothing the
+    /// program can reach names yet (the type's invariant).
+    pub fn fill(&mut self, address: usize, bytes: &[u8]) -> Result<(), SysError> {
+        let base = self.base.as_ptr() as usize;
+        let inside = address
+            .checked_sub(base)
+            .and_then(|at| at.checked_add(bytes.len()))
+            .is_some_and(|end| end <= self.end);
+        if !inside {
+            return Err(SysError { call: "filling the program's data", errno: libc::EFAULT, at: address, len: bytes.len() });
+        }
+        // SAFETY: `address..address + bytes.len()` is inside what `reserve` handed out
+        // (checked above), in a mapping that is readable, writable and never unmapped;
+        // `bytes` is a live slice that cannot overlap it (the mapping is never borrowed as a
+        // slice); no thread reads the range yet (the type's invariant).
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
+        Ok(())
+    }
+}
+
+/// One value handed from a thread to another that waits for it, with nothing of the Rust
+/// runtime under it: a pthread mutex and condition variable.
+///
+/// Why not a channel or `std::sync`: a program thread waits here (a stub's wait for its
+/// code) and says things to the control thread at any point of its life, its end included,
+/// where the launcher's own thread-locals for that thread may be gone. A channel finds a
+/// waiting receiver through the sender's thread id, which lives in a thread-local, and
+/// `std::thread::current()` panics once that is destroyed (found on Linux: a function
+/// first called while a thread was ending aborted the program). pthread's primitives need
+/// no thread-local.
+pub struct Handoff<T> {
+    lock: core::cell::UnsafeCell<libc::pthread_mutex_t>,
+    cond: core::cell::UnsafeCell<libc::pthread_cond_t>,
+    /// Read and written only with `lock` held.
+    value: core::cell::UnsafeCell<Option<T>>,
+}
+
+// SAFETY: `value` is touched only under the pthread mutex, which makes a `Handoff<T>` a
+// lock around an `Option<T>`: shared between threads when `T` may be sent between them.
+unsafe impl<T: Send> Send for Handoff<T> {}
+// SAFETY: as above.
+unsafe impl<T: Send> Sync for Handoff<T> {}
+
+impl<T> Handoff<T> {
+    /// Empty. A `Handoff` must not be moved once a thread uses it (pthread's objects are
+    /// tied to their address): every user keeps it behind an `Arc` or in a value that stays.
+    pub const fn new() -> Handoff<T> {
+        Handoff {
+            lock: core::cell::UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
+            cond: core::cell::UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER),
+            value: core::cell::UnsafeCell::new(None),
+        }
+    }
+
+    /// Runs `with` on the value, with the mutex held.
+    fn locked<R>(&self, with: impl FnOnce(&mut Option<T>) -> R) -> R {
+        // SAFETY: the mutex was statically initialized and is at a fixed address (`new`'s
+        // contract); locking it is sound from any thread.
+        unsafe { libc::pthread_mutex_lock(self.lock.get()) };
+        // SAFETY: the mutex is held, so this thread alone touches `value`.
+        let result = with(unsafe { &mut *self.value.get() });
+        // SAFETY: held by this thread, locked above.
+        unsafe { libc::pthread_mutex_unlock(self.lock.get()) };
+        result
+    }
+
+    /// Hands `value` over, replacing one not yet taken, and wakes a thread that waits.
+    pub fn put(&self, value: T) {
+        self.locked(|held| *held = Some(value));
+        // SAFETY: a statically initialized condition variable at a fixed address.
+        unsafe { libc::pthread_cond_signal(self.cond.get()) };
+    }
+
+    /// Waits for a value and takes it. The wait has no clock: it ends when another thread
+    /// calls [`Handoff::put`], which every user arranges (the control thread answers every
+    /// stub, with code or with why none can come).
+    pub fn take(&self) -> T {
+        // SAFETY: as `locked`.
+        unsafe { libc::pthread_mutex_lock(self.lock.get()) };
+        loop {
+            // SAFETY: the mutex is held.
+            if let Some(value) = unsafe { (*self.value.get()).take() } {
+                // SAFETY: held by this thread.
+                unsafe { libc::pthread_mutex_unlock(self.lock.get()) };
+                return value;
+            }
+            // SAFETY: the mutex is held by this thread, as `pthread_cond_wait` asks; it
+            // comes back with it held. A spurious return loops.
+            unsafe { libc::pthread_cond_wait(self.cond.get(), self.lock.get()) };
+        }
+    }
+}
+
+impl<T> core::fmt::Debug for Handoff<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // What it holds is behind its mutex: not read for a debug line.
+        f.write_str("Handoff")
+    }
+}
+
+impl<T> Default for Handoff<T> {
+    fn default() -> Handoff<T> {
+        Handoff::new()
+    }
 }

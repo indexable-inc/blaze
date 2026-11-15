@@ -1,0 +1,12 @@
+{
+ "id": "home-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane home-1112",
+ "where": "blaze's own crates: where the user's home directory is",
+ "what": "`blaze check` in a systemd unit with `BLAZE_HOME=/root/bh` and no `HOME` stopped with `error: blaze builds with Rust nightly-2026-10-27 and keeps it in .blaze/toolchains in your home directory, for every BLAZE_HOME, and no home directory is set (HOME, or USERPROFILE on Windows)` (crates/blaze-cargo/src/toolchain.rs). The question was answered separately in the seven sites the brief named (blaze-cargo toolchain.rs and serve.rs, blaze-api client.rs, blaze-manifest user_config.rs and config/mod.rs, blaze-fmt config/mod.rs, blaze-engine update.rs) and in more found by search: blaze-manifest home.rs, blaze-api units.rs, blaze-client start.rs (twice), blaze-thin pin.rs, blaze-cargo serve.rs `user_shared`, sandbox/macos.rs, sandbox/linux.rs, cli.rs, cli/live.rs and cli/daemon.rs, blaze-registry lib.rs, blaze-gc fs.rs, blaze-script engine.rs. They disagreed: some read `HOME` alone, some `HOME` then `USERPROFILE` on every system, some `USERPROFILE` alone on Windows, four called `std::env::home_dir` (which does ask the user database), and blaze-script used a literal `~`.",
+ "cost": "a build that could not start in a unit; agents run blaze in units, CI runners, sandboxes and cron, where `HOME` is often unset",
+ "cause": "no one home for the answer, so each site wrote its own; nothing banned `std::env::home_dir`, and the ban on `std::env::var_os` did not stop `var_os(\"HOME\")`",
+ "workaround": "set `HOME` in the unit",
+ "fix": "`blaze_core::home::user()` (crates/blaze-core/src/home.rs): `HOME` when set and not empty, else `getpwuid_r` of the effective uid (the Windows profile directory on Windows), else a typed `NoHome` saying what was tried; `home::decide` is the pure decision and the cores take the system's record as an input. Every site above calls it; `std::env::home_dir` and `blaze_manifest::user_config::user_home` are banned in `.clippy.toml` and the hot crates' `clippy.toml`; `BLAZE_TOOLCHAINS` names where toolchains live and the error names it. Written without a build (write-only lane): the main agent's check of the branch is the first compile.",
+ "state": "fixed in 1f5ae300e7 (branch home-1112), not compiled by the lane"
+}

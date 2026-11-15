@@ -70,7 +70,8 @@ fn a_prefix_in_two_lists_is_the_first_lists() {
 
 #[test]
 fn a_disk_prefix_takes_no_virtual_path() {
-    let dir = std::env::temp_dir().join("blaze-file-set");
+    // Only classified, never read: a disk path that is not there.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("blaze-file-set");
     let disk = VfsPath::from(paths::AbsPathBuf::assert_utf8(dir.clone()));
     let mut config = FileSetConfig::builder();
     config.add_file_set(vec![disk]);

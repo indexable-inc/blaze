@@ -1,0 +1,14 @@
+{
+ "id": "own-tables-per-item",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), refusals3 lane, int-1112",
+ "where": "crates/blaze-item-hash/src/reads.rs Rule::DepCrate, crates/blaze-items/src/goals.rs fact_of_read, hir_def crate_body_owners",
+ "what": "Turning a body's reads of its own crate's impl and trait tables into facts meant writing the same read-to-fact mapping twice: once in reads.rs for the body store and once in goals.rs for the goal store. A test that walks every body with `crate_body_owners` also never reaches bodies inside a fn body's block, because blocks hold their own items; their reads go untested unless `nameres::demand::body_blocks` is walked as well.",
+ "cost": "time spent reading both mappings to keep them consistent, and a fixture rewrite once the block bodies turned out to be missing from the walk",
+ "cause": "two homes for one concept (which fact names a table read); body enumeration split by item tree with no one walk of every body",
+ "class": "one concept with two homes; an enumeration that silently drops a subset",
+ "prevention": "reads.rs now delegates every own-crate table read to `Goals.fact_of`, so goals::fact_of_read is the one mapping; a test walks crate_body_owners plus body_blocks owners",
+ "workaround": "none needed after the delegation",
+ "fix": "fact_of_read maps InherentImpls/TraitImpls/in_crate_trait_value_items/module_items_named/block reads; reads.rs Rule::DepCrate and Rule::Block call it",
+ "state": "fixed, not yet compiled"
+}

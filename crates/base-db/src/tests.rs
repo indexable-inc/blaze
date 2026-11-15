@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, VfsPath};
+use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, Looks, VfsPath};
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_query::db::Durability;
 use cfg::{CfgAtom, CfgOptions};
@@ -24,6 +24,7 @@ use crate::{
     target::{Arch, TargetData},
 };
 
+mod durable_roots;
 mod memo_properties;
 
 #[global_allocator]
@@ -84,7 +85,8 @@ fn add_with_attrs(
         CrateOrigin::Local { repo: None, name: None },
         attrs.iter().map(|it| it.to_string()).collect(),
         TargetKind::Lib { is_proc_macro: false },
-        Arc::new(AbsPathBuf::assert_utf8(std::env::temp_dir())),
+        // No proc macro runs here: the cwd is only hashed, so the crate's own directory.
+        Arc::new(AbsPathBuf::assert_utf8(env!("CARGO_MANIFEST_DIR").into())),
         Arc::new(CrateWorkspaceData {
             target: Err("no target in tests".into()),
             toolchain: None,
@@ -457,7 +459,8 @@ fn a_crate_attr_is_one_attribute_or_rustcs_error() {
 
 /// Source roots 0 (the checkout) and 1 (everything else), both empty.
 fn checkout(db: &mut Db) -> (AbsPathBuf, FileSetConfig) {
-    let base = AbsPathBuf::assert_utf8(std::env::temp_dir().join("blaze-base-db-view"));
+    // A view is held in memory and its base is never read from disk: a path that is not there.
+    let base = AbsPathBuf::assert_utf8(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("blaze-base-db-view"));
     let mut partition = FileSetConfig::builder();
     partition.add_file_set(vec![VfsPath::from(base.clone())]);
     for root in [0, 1] {
@@ -519,6 +522,49 @@ fn setting_a_view_twice_writes_nothing() {
     assert_eq!(second, ViewChange::default());
     assert_eq!(revision(&db), then);
     assert_eq!(db.source_root(SourceRootId(0)).content(&db), root);
+}
+
+/// The invariant: a view read from a tree, whose IDs are taken without hashing, writes the
+/// same inputs, file IDs and source roots as the same view checked against its bytes.
+/// Control: the checked entry refuses a lying ID, so the two differ only by the hash.
+#[test]
+fn a_view_from_a_tree_writes_what_a_checked_view_writes() {
+    let mut checked = Db::for_tests();
+    let mut from_tree = Db::for_tests();
+    let (base, partition) = checkout(&mut checked);
+    checkout(&mut from_tree);
+    let bytes: Vec<blaze_vfs::Bytes> = VIEW.iter().map(|&(_, bytes)| vfs_bytes(bytes)).collect();
+    let files: Vec<ViewFile<'_>> =
+        VIEW.iter().zip(&bytes).map(|(&(path, _), bytes)| view_file(path, bytes)).collect();
+    let view = ViewRoot {
+        base: &base,
+        built: &[],
+        partition: &partition,
+        other: SourceRootId(1),
+        files: &files,
+    };
+    let a = checked.set_view_root(view).unwrap();
+    let b = from_tree.set_view_root_from_tree(view).unwrap();
+    assert_eq!(a, b);
+    for &(path, text) in VIEW {
+        let x = file_at(&checked, &base, path).unwrap();
+        let y = file_at(&from_tree, &base, path).unwrap();
+        assert_eq!(x, y, "{path}");
+        assert_eq!(checked.file_text(x).text(&checked).as_bytes(), text, "{path}");
+        assert_eq!(from_tree.file_text(y).text(&from_tree).as_bytes(), text, "{path}");
+        assert_eq!(checked.file_content(x), from_tree.file_content(y), "{path}");
+    }
+    let then = revision(&from_tree);
+    assert_eq!(from_tree.set_view_root_from_tree(view).unwrap(), ViewChange::default());
+    assert_eq!(revision(&from_tree), then);
+
+    // Control: an ID that is not its bytes' is refused where IDs are checked (a new ID, so the
+    // file is not skipped as unchanged before its bytes are hashed).
+    let edited = vfs_bytes(b"fn g() {}");
+    let other = ContentId::of(blaze_vfs::FILE_DOMAIN, b"fn h() {}");
+    let lying = [files[0], ViewFile { path: "src/a.rs", id: other, bytes: &edited }, files[2]];
+    let lie = ViewRoot { files: &lying, ..view };
+    assert!(matches!(checked.set_view_root(lie), Err(ViewError::Mismatch { .. })));
 }
 
 #[test]
@@ -1017,7 +1063,8 @@ fn what_queries_note_is_kept_once_and_sorted() {
     assert_eq!(db.files().env_read(), expected);
     assert_eq!(db.files().env_unset(), vec![(a, "X".to_owned())]);
 
-    let dir = AbsPathBuf::assert_utf8(std::env::temp_dir());
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-included-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let (x, y) = (dir.join("blaze-base-db-x.rs"), dir.join("blaze-base-db-y.rs"));
     for (path, krate) in [(&y, a), (&x, c), (&y, a), (&y, c)] {
         db.files().include_source(path, SourceRootId(0), krate);
@@ -1040,9 +1087,9 @@ fn an_unreadable_included_file_keeps_its_error() {
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let a = graph.set_in_db(&mut db)[&a];
-    let dir = AbsPathBuf::assert_utf8(std::env::temp_dir());
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-unreadable-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let missing = dir.join("blaze-base-db-unreadable-include.rs");
-    let _ = std::fs::remove_file(&missing);
     let read = |path: &AbsPathBuf| {
         let file = db.files().included_file(&db, a, path, Durability::LOW);
         (file.read(&db).clone(), file.content(&db))
@@ -1053,7 +1100,7 @@ fn an_unreadable_included_file_keeps_its_error() {
     assert_eq!(missing_read.unwrap_err().to_string(), expected(&missing));
     assert_eq!(dir_read.unwrap_err().to_string(), expected(&dir));
     assert_ne!(missing_content, dir_content, "a different error is a different input");
-    assert!(db.files().included_is_read(&db, &missing), "the same error is what was read");
+    assert!(db.files().included_is_read(&db, &missing, &Looks::none()), "the same error is what was read");
 }
 
 /// The view a seed makes at a step: some of a fixed set of paths, each with one of a few
@@ -1418,8 +1465,8 @@ fn disk_module_runs() -> usize {
 /// is read again.
 #[test]
 fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns_the_reader() {
-    let dir = std::env::temp_dir().join(format!("blaze-base-db-module-{}", std::process::id()));
-    let dir = AbsPathBuf::assert_utf8(dir);
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-module-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let (src, shared) = (dir.join("member/src"), dir.join("shared"));
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&shared).unwrap();
@@ -1456,16 +1503,15 @@ fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns
 
     // An edit on disk, read again: the reader runs again and reads the new text.
     std::fs::write(&m, "pub fn f() { 1 }").unwrap();
-    assert!(db.reload_included_files(Trigger::named("a test's edit")).contains(&m));
+    assert!(db.reload_included_files(Trigger::named("a test's edit"), &Looks::none()).contains(&m));
     assert_eq!(disk_module(&db, krate), Some((file.index(), 16)));
     assert_eq!(disk_module_runs(), runs + 2);
 
     // Gone from disk: no module file, never the old text.
     std::fs::remove_file(&m).unwrap();
-    assert!(db.reload_included_files(Trigger::named("a test's removal")).contains(&m));
+    assert!(db.reload_included_files(Trigger::named("a test's removal"), &Looks::none()).contains(&m));
     assert_eq!(disk_module(&db, krate), None);
     assert_eq!(disk_module_runs(), runs + 3);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -1588,14 +1634,23 @@ fn a_parse_after_random_edits_is_the_whole_parse() {
         let mut rng = Rng::new(seed);
         let mut text = source.to_owned();
         let start = reparsed();
+        // An edit that gives the text the file has writes nothing, so nothing is parsed.
+        let mut changed = 0;
         for step in 0..80 {
-            text = random_edit(&mut rng, &text);
+            let edited = random_edit(&mut rng, &text);
+            changed += usize::from(edited != text);
+            text = edited;
             db.set_file_text(file, &text);
             let parse = id.parse(&db);
             assert_eq!(parse.root().text(), text, "step {step}");
             assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, library);
         }
-        assert_eq!(reparsed() - start, 80, "seed {seed}: every edit after a kept parse reparses");
+        assert!(changed >= 70, "seed {seed}: {changed} of 80 edits changed the text");
+        assert_eq!(
+            reparsed() - start,
+            changed,
+            "seed {seed}: every edit after a kept parse that changes the text reparses, and no other"
+        );
     }
 }
 

@@ -12,8 +12,8 @@ pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
         dir: FileName::new("store").unwrap(),
         layers: Vec::new(),
         tags: 1 << 40,
-        load_tags: (1 << 40) + (1 << 32),
-        loader: blaze_cas::Loader::Pumped,
+        load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+        loader: crate::serve::direct::pool::pumped(),
     };
     let mut effects = Vec::new();
     let mut store = blaze_cas::Store::open(config, &mut effects);
@@ -26,8 +26,31 @@ pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
     store
 }
 
+/// `reader`'s store as a session's tasks read it (`serve::direct`): on the simulation's
+/// driver, which a test lends to them (`serve::direct::lend`), as the loop's runner does.
+pub(crate) fn stores_of(reader: &blaze_cas::Reader) -> Arc<crate::serve::direct::Stores> {
+    // clone: a count of the store's reader, twice
+    crate::serve::direct::Stores::new(
+        reader.clone(),
+        reader.clone(),
+        crate::serve::direct::Reads::Lent,
+    )
+}
+
+/// `f` as a session's task runs it: in a frame of its own, with `sim` lent to its store reads
+/// (`serve::direct::lend`), as the daemon's in-line runner lends its driver. A read here asks
+/// only the store's own files, so the lend hands back no completion of anything else.
+pub(crate) fn as_task<R>(sim: &mut Sim, f: impl FnOnce() -> R) -> R {
+    let mut back = Vec::new();
+    let out = crate::serve::direct::lend(sim, &mut back, || {
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |_| f())
+    });
+    assert!(back.is_empty(), "a store read was handed completions it did not ask: {back:?}");
+    out
+}
+
 /// Proc macros that keep nothing: these tests read no expansion's reads.
-pub(crate) fn no_macros() -> Arc<blaze_macro_eval::Macros> {
+pub(crate) fn no_macros()-> Arc<blaze_macro_eval::Macros> {
     blaze_macro_eval::Macros::nothing("a test of the images alone")
 }
 
@@ -55,15 +78,17 @@ fn each_daemons_images_work_out_an_expansions_reads_with_its_own_macros_and_none
     let shape = blaze_usercode::index::Shape::of(&traced).encode();
     let reported = blaze_usercode::index::VALUES.traced(&traced);
     let call = Env::default();
-    let one = Images::new(store.reader(), macros_of(&store, "/one/bin"));
-    let other = Images::new(store.reader(), macros_of(&store, "/other/bin"));
+    let stores = stores_of(&store.reader());
+    let one = Images::new(store.reader(), Arc::clone(&stores), macros_of(&store, "/one/bin"));
+    let other = Images::new(store.reader(), Arc::clone(&stores), macros_of(&store, "/other/bin"));
     assert_eq!(one.reads_now(&call, &shape), Ok(reported));
     assert_ne!(
         other.reads_now(&call, &shape),
         Ok(reported),
         "one daemon's images read another's shell"
     );
-    let refused = Images::new(store.reader(), no_macros()).reads_now(&call, &shape).unwrap_err();
+    let refused =
+        Images::new(store.reader(), stores, no_macros()).reads_now(&call, &shape).unwrap_err();
     assert!(refused.contains("not kept here"), "{refused}");
 }
 
@@ -76,28 +101,140 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     let mut sim = Sim::new(1, Faults::default());
     let mut store = opened(&mut sim);
     let reader = store.reader();
-    let images = Images::new(reader.clone(), no_macros());
-    assert!(images.get(&key(1)).unwrap().is_none());
-    images.put(key(1), b"image one".to_vec()).unwrap();
-    images.put(key(1), b"image one".to_vec()).unwrap();
-    assert!(images.put(key(1), b"another".to_vec()).unwrap_err().contains("two images"));
-    images.put(key(2), b"image two".to_vec()).unwrap();
+    let images = Images::new(reader.clone(), stores_of(&reader), no_macros());
+    as_task(&mut sim, || {
+        assert!(images.get(&key(1)).unwrap().is_none());
+        images.put(key(1), b"image one".to_vec()).unwrap();
+        images.put(key(1), b"image one".to_vec()).unwrap();
+        assert!(images.put(key(1), b"another".to_vec()).unwrap_err().contains("two values"));
+        images.put(key(2), b"image two".to_vec()).unwrap();
+    });
     let puts = images.take_puts();
     assert!(images.take_puts().is_empty(), "a take empties what was asked for");
     let keys: Vec<Key> = puts.iter().map(|it| it.key).collect();
-    assert_eq!(keys, [Key(key(1)), Key(key(2))]);
+    let mut sorted = [Key(key(1)), Key(key(2))];
+    sorted.sort_unstable_by_key(|it| it.0);
+    assert_eq!(keys, sorted, "each key once, by key");
     assert!(puts.iter().all(|it| it.kind == Kind::Query));
 
     // Once the loop has put them, they are read in place and not asked for again.
     for put in puts {
         store.put(put.key, put.kind, &put.bytes).unwrap();
     }
-    let images = Images::new(reader, no_macros());
-    let found = images.get(&key(1)).unwrap().expect("put by the loop");
-    assert_eq!(found.bytes(), b"image one");
-    images.put(key(2), b"image two".to_vec()).unwrap();
-    assert!(images.put(key(2), b"changed".to_vec()).unwrap_err().contains("other bytes"));
-    assert!(images.puts.into_inner().list.is_empty());
+    let images = Images::new(reader.clone(), stores_of(&reader), no_macros());
+    as_task(&mut sim, || {
+        let found = images.get(&key(1)).unwrap().expect("put by the loop");
+        assert_eq!(found.bytes(), b"image one");
+        images.put(key(2), b"image two".to_vec()).unwrap();
+        assert!(images.put(key(2), b"changed".to_vec()).unwrap_err().contains("other bytes"));
+    });
+    assert!(images.take_puts().is_empty());
+}
+
+/// The invariant: values asked at once from many threads (a build's tasks resolving files and
+/// reading macro definitions) are each taken once, under their own key, with the bytes asked,
+/// sorted by key whatever order the threads asked in; two asks of one key with other bytes are
+/// the error naming it; and an ask that races a take is in that take or the next, never lost
+/// and never twice in one. No ask waits on another: the table is lock-free ([`Asked`]), where
+/// a lock (`serve.deps.images.entries`) had 55 workers queued behind one asker.
+///
+/// The control is the error: other bytes asked under a key asked since the last take are
+/// refused, so a take that hands back one value per key is not an ask that kept none.
+#[test]
+fn values_asked_at_once_from_many_threads_are_each_taken_once_by_key() {
+    const THREADS: usize = 16;
+    const KEYS: u8 = 64;
+    let asked = Asked::default();
+    let value = |n: u8| vec![n; 1 + usize::from(n) % 7];
+    let taken = std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let asked = &asked;
+            scope.spawn(move || {
+                // Each thread asks every key, starting at its own, each twice: the asks of one
+                // key from all threads meet.
+                for at in 0..2 * usize::from(KEYS) {
+                    let n = u8::try_from((thread + at) % usize::from(KEYS)).unwrap();
+                    asked.ask(key(n), std::borrow::Cow::Owned(value(n))).unwrap();
+                }
+            });
+        }
+        // Takes race the asks: what each takes is added up below.
+        let mut taken = Vec::new();
+        for _ in 0..8 {
+            taken.push(asked.take());
+            std::thread::yield_now();
+        }
+        taken
+    });
+    let mut taken = taken;
+    taken.push(asked.take());
+    for one in &taken {
+        assert!(
+            one.windows(2).all(|it| it[0].key.0 < it[1].key.0),
+            "a take is sorted by key, each key once"
+        );
+        for put in one {
+            let n = (0..KEYS).find(|&n| key(n) == put.key.0).expect("a key that was asked");
+            assert_eq!(put.bytes, value(n), "key {n}'s bytes");
+            assert_eq!(put.kind, Kind::Query);
+        }
+    }
+    // Every key reached some take: a race with a take loses none.
+    for n in 0..KEYS {
+        assert!(taken.iter().flatten().any(|it| it.key.0 == key(n)), "key {n} was never taken");
+    }
+    assert!(asked.take().is_empty(), "a take empties what was asked");
+    // The control: other bytes under a key asked since the last take are refused.
+    asked.ask(key(0), std::borrow::Cow::Owned(value(0))).unwrap();
+    let other = asked.ask(key(0), std::borrow::Cow::Borrowed(b"other")).unwrap_err();
+    assert!(other.contains("two values"), "{other}");
+}
+
+/// The invariant: a per-item entry is found by its key alone, under any set, once the loop
+/// has put it; it is asked for once, in a list of its own that a take of the images' puts
+/// does not empty (a serve takes those and must lose no entry a query kept while it ran);
+/// other bytes under its key are an error naming the key and how the two values differ. What a
+/// get does not see until the loop's put is what hir-def's `Memory::within_one_build` models
+/// for its tests of two items of one key.
+///
+/// The control is the read before the put: the same key under the same set finds nothing.
+#[test]
+fn an_entry_is_kept_apart_from_the_images_and_found_by_its_key_under_any_set() {
+    use hir_def::nameres::frozen::entries::Entries;
+    let mut sim = Sim::new(1, Faults::default());
+    let mut store = opened(&mut sim);
+    let reader = store.reader();
+    let images = Images::new(reader.clone(), stores_of(&reader), no_macros());
+    let read = |images: &Images, set: u8, at: u8| {
+        let mut found = Vec::new();
+        let held = Entries::get(images, &key(set), &key(at), &mut |bytes| found.extend_from_slice(bytes));
+        held.unwrap().then_some(found)
+    };
+    as_task(&mut sim, || {
+        assert_eq!(read(&images, 9, 1), None, "the control: nothing is kept yet");
+        Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
+        Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
+        let twice = Entries::put(&images, &key(9), key(1), b"another").unwrap_err();
+        assert!(twice.contains("two values") && twice.contains("first differ at byte 0"), "{twice}");
+        assert!(twice.contains("is 9 bytes and the one given 7"), "{twice}");
+        assert_eq!(read(&images, 9, 1), None, "asked, not yet put by the loop");
+    });
+    assert!(images.take_puts().is_empty(), "an entry is no put of a flush");
+    let puts = images.take_entries();
+    assert!(images.take_entries().is_empty(), "a take empties what was asked for");
+    assert_eq!(puts.iter().map(|it| it.key).collect::<Vec<Key>>(), [Key(key(1))]);
+    assert!(puts.iter().all(|it| it.kind == Kind::Query));
+    for put in puts {
+        store.put(put.key, put.kind, &put.bytes).unwrap();
+    }
+    as_task(&mut sim, || {
+        assert_eq!(read(&images, 9, 1).as_deref(), Some(&b"entry one"[..]));
+        assert_eq!(read(&images, 8, 1).as_deref(), Some(&b"entry one"[..]), "under a set that moved");
+        Entries::put(&images, &key(8), key(1), b"entry one").unwrap();
+    });
+    assert!(images.take_entries().is_empty(), "held by the store: not asked for again");
+    let other = as_task(&mut sim, || Entries::put(&images, &key(8), key(1), b"changed").unwrap_err());
+    assert!(other.contains("other bytes") && other.contains("first differ at byte 0"), "{other}");
 }
 
 #[test]
@@ -150,10 +287,17 @@ fn a_task_that_would_wait_on_itself_runs_again_and_another_panic_goes_on() {
 
 #[test]
 fn the_goal_note_names_every_count_that_kept_goals_out() {
-    let plain = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
+    // What its lookups came to is said as `blaze_record` says it (`Counts`' `Display`).
+    let plain = goal_store::Flushed {
+        written: 3,
+        kept: 5,
+        lookups: blaze_record::Counts { lookups: 9, hits: 5, lists: 7, reads: 12 },
+        ..goal_store::Flushed::default()
+    };
     assert_eq!(
         flushed(&plain).message,
-        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full"
+        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full; \
+         9 lookups, 5 hit, 7 read-lists read, 12 reads valued"
     );
     let out = goal_store::Flushed {
         slots_full: 1,
@@ -166,7 +310,29 @@ fn the_goal_note_names_every_count_that_kept_goals_out() {
     assert_eq!(
         note.message,
         "the persistent goal cache, of the last build: 0 written, 0 kept, 1 with every slot full; \
+         0 lookups, 0 hit, 0 read-lists read, 0 reads valued; \
          goals kept out by `impl_datum` (4), `crate_env` (2); 7 too long to keep"
+    );
+}
+
+/// A chain at its bound is named, not only counted: the first goal whose shape was not placed,
+/// and how many lookups met a full chain. With neither, the note says nothing of them (the
+/// test above).
+#[test]
+fn the_goal_note_names_the_first_goal_of_a_full_chain() {
+    let full = goal_store::Flushed {
+        slots_full: 2,
+        lookups_full: 3,
+        lookups: blaze_record::Counts { lookups: 3, hits: 0, lists: 33, reads: 33 },
+        full: Some("goal ab, whose chain holds 4096 other shapes".to_owned()),
+        ..goal_store::Flushed::default()
+    };
+    assert_eq!(
+        flushed(&full).message,
+        "the persistent goal cache, of the last build: 0 written, 0 kept, 2 with every slot full \
+         (the first: goal ab, whose chain holds 4096 other shapes); \
+         3 lookups met a chain with every slot full; \
+         3 lookups, 0 hit, 33 read-lists read, 33 reads valued"
     );
 }
 
@@ -209,11 +375,22 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
     let alone = noted(Some(&Flushes { goals, items: None }), None).unwrap();
     assert_eq!(
         alone.message,
-        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full"
+        "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full; \
+         0 lookups, 0 hit, 0 read-lists read, 0 reads valued"
     );
+    let looked =
+        |lookups, hits, lists, reads| blaze_record::Counts { lookups, hits, lists, reads };
     let items = body_store::Flushed {
         written: 2,
         kept: 9,
+        // By step: inference, MIR, borrow check, constant, lowering.
+        lookups: [
+            looked(7, 6, 6, 40),
+            looked(7, 5, 6, 31),
+            looked(0, 0, 0, 0),
+            looked(5, 4, 4, 9),
+            looked(3, 2, 2, 5),
+        ],
         refused: vec![("crate_env", 3)],
         no_identity: 4,
         ..body_store::Flushed::default()
@@ -223,14 +400,23 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
         body_store::StepCounts { hits: 6, ran: 1, refused: 0 },
         body_store::StepCounts { hits: 5, ran: 2, refused: 1 },
         body_store::StepCounts::default(),
+        body_store::StepCounts { hits: 4, ran: 1, refused: 0 },
+        body_store::StepCounts { hits: 2, ran: 1, refused: 1 },
     ];
     let note = noted(Some(&Flushes { goals, items: Some(items) }), Some(&steps)).unwrap();
     assert_eq!(
         note.message,
         "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full; \
-         the item store: 2 written, 9 kept, 0 with every slot full; steps kept out by reads of \
+         0 lookups, 0 hit, 0 read-lists read, 0 reads valued; \
+         the item store: 2 written, 9 kept, 0 with every slot full; lookups by step: \
+         inference (7 lookups, 6 hit, 6 read-lists read, 40 reads valued), \
+         MIR (7 lookups, 5 hit, 6 read-lists read, 31 reads valued), \
+         borrow check (0 lookups, 0 hit, 0 read-lists read, 0 reads valued), \
+         constant (5 lookups, 4 hit, 4 read-lists read, 9 reads valued), \
+         lowering (3 lookups, 2 hit, 2 read-lists read, 5 reads valued); steps kept out by reads of \
          `crate_env` (3); 4 of bodies with no identity; the item store, this build: inference 6 hit, \
-         1 ran, 0 refused; MIR 5 hit, 2 ran, 1 refused; borrow check 0 hit, 0 ran, 0 refused"
+         1 ran, 0 refused; MIR 5 hit, 2 ran, 1 refused; borrow check 0 hit, 0 ran, 0 refused; \
+         constant 4 hit, 1 ran, 0 refused; lowering 2 hit, 1 ran, 1 refused"
     );
     assert_eq!(note.rendered, format!("note: {}\n", note.message));
 }
@@ -238,11 +424,12 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
 #[test]
 fn a_first_build_notes_its_steps_alone() {
     assert!(noted(None, None).is_none());
-    let steps = [body_store::StepCounts { hits: 0, ran: 3, refused: 0 }; 3];
+    let steps = [body_store::StepCounts { hits: 0, ran: 3, refused: 0 }; body_store::Step::COUNT];
     let note = noted(None, Some(&steps)).unwrap();
     assert_eq!(
         note.message,
         "the item store, this build: inference 0 hit, 3 ran, 0 refused; MIR 0 hit, 3 ran, 0 refused; \
-         borrow check 0 hit, 3 ran, 0 refused"
+         borrow check 0 hit, 3 ran, 0 refused; constant 0 hit, 3 ran, 0 refused; \
+         lowering 0 hit, 3 ran, 0 refused"
     );
 }

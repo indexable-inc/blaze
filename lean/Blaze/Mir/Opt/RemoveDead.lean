@@ -105,14 +105,14 @@ theorem mem_keepReps (top : Nat) (s : Statement) :
   | x :: rest, r, m => by
     by_cases ha : absorbs top s x = true
     · have kept : keepReps top s (x :: rest) = keepReps top s rest :=
-        (keepReps_cons top s x rest).trans (if_pos ha)
+        (keepReps_cons top s x rest).trans (ite_eq_left ha)
       have m' : r ∈ keepReps top s rest := by
         rw [kept] at m
         exact m
       have ih := mem_keepReps top s rest r m'
       exact And.intro (List.mem_cons.mpr (Or.inr (And.left ih))) (And.right ih)
     · have kept : keepReps top s (x :: rest) = x :: keepReps top s rest :=
-        (keepReps_cons top s x rest).trans (if_neg ha)
+        (keepReps_cons top s x rest).trans (ite_eq_right ha)
       have m' : r ∈ x :: keepReps top s rest := by
         rw [kept] at m
         exact m
@@ -143,11 +143,11 @@ theorem switchTarget_mem (key : Int) (otherwise : BlockId) :
   | arm :: rest => by
     by_cases h : key = arm.1
     · have e : switchTarget key (arm :: rest) otherwise = arm.2 :=
-        (switchTarget_cons key arm rest otherwise).trans (if_pos h)
+        (switchTarget_cons key arm rest otherwise).trans (ite_eq_left h)
       rw [e]
       exact List.mem_cons.mpr (Or.inl rfl)
     · have e : switchTarget key (arm :: rest) otherwise = switchTarget key rest otherwise :=
-        (switchTarget_cons key arm rest otherwise).trans (if_neg h)
+        (switchTarget_cons key arm rest otherwise).trans (ite_eq_right h)
       rw [e]
       exact List.mem_cons.mpr (Or.inr (switchTarget_mem key otherwise rest))
 
@@ -525,16 +525,16 @@ theorem assertOn_rel {B : FnId → Local → Prop} {D : FnId → BlockId → Loc
     by_cases h : b = expected
     · have left : assertOn (puts t reps) expected kind target (Value.bool b) =
           (puts t reps).jump target :=
-        (assertOn_bool (puts t reps) expected kind target b).trans (if_pos h)
+        (assertOn_bool (puts t reps) expected kind target b).trans (ite_eq_left h)
       have right : assertOn t expected kind target (Value.bool b) = t.jump target :=
-        (assertOn_bool t expected kind target b).trans (if_pos h)
+        (assertOn_bool t expected kind target b).trans (ite_eq_left h)
       rw [left, right]
       exact jump_rel ctx target reps hg
     · have left : assertOn (puts t reps) expected kind target (Value.bool b) =
           Outcome.panic kind :=
-        (assertOn_bool (puts t reps) expected kind target b).trans (if_neg h)
+        (assertOn_bool (puts t reps) expected kind target b).trans (ite_eq_right h)
       have right : assertOn t expected kind target (Value.bool b) = Outcome.panic kind :=
-        (assertOn_bool t expected kind target b).trans (if_neg h)
+        (assertOn_bool t expected kind target b).trans (ite_eq_right h)
       rw [left, right]
       exact StepRel.panic kind
   | Value.unit => StepRel.undefined Undefined.illTyped
@@ -688,9 +688,9 @@ theorem callOn_fn_all (sig : FnId → Option FnSig) (st : State) (id : FnId) (ar
     show Outcome.All (fun (n : Next) => ∃ s, n = Next.state (enterState st id s args dest target))
       (st.enter id s args dest target)
     by_cases hl : args.length = s.args
-    · rw [State.enter_eq, if_pos hl]
+    · rw [State.enter_eq, ite_eq_left hl]
       exact Outcome.all_ok (Exists.intro s rfl)
-    · rw [State.enter_eq, if_neg hl]
+    · rw [State.enter_eq, ite_eq_right hl]
       exact Outcome.all_undefined _ _
 
 /-- The state a call of a function enters is related. -/
@@ -1198,7 +1198,7 @@ theorem block_rel (prog : Program) (cert : List (List (List (List Local))))
           killDead body.locals.length (borrowed body) (after :: more) ss := rfl
     rw [kd]
     by_cases hdead : deadStore body.locals.length (borrowed body) after s = true
-    · rw [if_pos hdead]
+    · rw [ite_eq_left hdead]
       have src := dead_store_src prog.adts ctx body.locals.length (borrowed body) after reps
         (fun r m => (hg' r m).slot) s hsB hdead
       cases src with
@@ -1270,7 +1270,7 @@ theorem block_rel (prog : Program) (cert : List (List (List (List Local))))
         rw [srcBlock, tgtBlock]
         exact block_rel prog cert borrowed body hbody term ss (after :: more) t
           (reps ++ [(fr.id, l, Slot.init v)]) hrest hterm' ctx hBrest goods
-    · rw [if_neg hdead]
+    · rw [ite_eq_right hdead]
       have fits : ∀ (r : Rep), r ∈ reps → RepFits (BorrowedIn borrowed prog) g fr.id s r :=
         fun r m => fits_of ctx body.locals.length before after s hs r (hg' r m)
       have ex : execStmt prog.adts (puts t reps) s =
@@ -1570,13 +1570,13 @@ theorem start_ordered (prog : Program) (id : FnId) (base : List Slot) (args : Li
         (State.enter { base := base, stack := [], next := 1 } id s args
           { frame := 0, slot := 0, path := [] } none) := by
       by_cases hl : args.length = s.args
-      · rw [State.enter_eq, if_pos hl]
+      · rw [State.enter_eq, ite_eq_left hl]
         have o : Ordered
             [bare (newFrame (State.mk base [] 1) id s args { frame := 0, slot := 0, path := [] }
               none)] :=
           And.intro (Nat.succ_pos 0) (And.intro (fun _ m => mem_nil_elim m) True.intro)
         exact Outcome.all_ok o
-      · rw [State.enter_eq, if_neg hl]
+      · rw [State.enter_eq, ite_eq_right hl]
         exact Outcome.all_undefined _ _
     exact Outcome.all_bind entered (fun next hn => by
       cases next with

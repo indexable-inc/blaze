@@ -289,6 +289,10 @@ fn an_empty_outcome_reads_without_allocating() {
     assert_eq!(empty.len(), HEADER + 2);
     let flags = flags(&["--cap-lints", "allow"]);
     let inputs = inputs(&flags);
+    // What a process does once before its first hash (the hash backend's start-up,
+    // `blake3_servil::initialize`, and the domain's context key) is not a read's: under a test
+    // runner that gives each test a process of its own it would land in the measurement.
+    let _ = key(ContentId([1; 32]), &inputs);
     let read =
         blaze_alloc_count::assert_at_most(0, "an empty outcome read and its key made", || {
             let _ = key(ContentId([1; 32]), &inputs);
@@ -410,6 +414,18 @@ impl ImageStore for Memory {
     fn reads_now(&self, _: &Env, _: &[u8]) -> Result<ContentId, String> {
         Err("the fixture's crates read nothing".to_owned())
     }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<std::sync::Arc<dyn hir_def::deps::PageSource>>, String> {
+        // A test's store holds each value whole: no part of one is read alone.
+        Ok(hir_def::deps::whole_pages(self.get(key)?, std::alloc::Global))
+    }
+
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        // A test's store runs a batch in order on its own thread: the same result.
+        (0..count).for_each(task);
+    }
 }
 
 /// `core`'s and `lib`'s images made and kept in `store` from `db`, with the keys they are filed
@@ -418,7 +434,7 @@ fn imaged(db: &mut Db, store: &Memory) -> (ContentId, ContentId) {
     let all = base_db::all_crates(db).to_vec();
     let served = deps::serve(db, &all, BUILD, store, deps::Mode::Serve).unwrap();
     assert!(served.hits.is_empty());
-    let stored = deps::store(db, &served, store).unwrap();
+    let stored = deps::store(db, &served, store, deps::Which::Sealed).unwrap();
     (stored.filed[&crate_named(db, "core")], stored.filed[&crate_named(db, "lib")])
 }
 
@@ -681,14 +697,16 @@ fn header_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-#[hegel::test]
-fn any_bytes_read_as_before_the_cursor(tc: hegel::TestCase) {
-    let mut bytes = tc.draw(hegel::generators::binary().max_size(23));
-    let magic = tc.draw(hegel::generators::booleans());
-    if magic && bytes.len() >= 4 {
-        bytes[..4].copy_from_slice(&MAGIC);
-    }
-    assert_eq!(header(&bytes), header_reference(&bytes));
+#[test]
+fn any_bytes_read_as_before_the_cursor() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let mut bytes = tape.bytes(0..=23, "bytes");
+        let magic = tape.bool("magic");
+        if magic && bytes.len() >= 4 {
+            bytes[..4].copy_from_slice(&MAGIC);
+        }
+        assert_eq!(header(&bytes), header_reference(&bytes));
+    });
 }
 
 /// The copy of `absolute` this file had before it called hir-def's.
@@ -724,8 +742,15 @@ fn a_path_is_absolute_as_the_old_copy_said() {
     }
 }
 
-#[hegel::test]
-fn any_path_is_absolute_as_the_old_copy_said(tc: hegel::TestCase) {
-    let path = tc.draw(hegel::generators::from_regex("[/\\\\a-zA-Z0-9:._~é$]{0,6}"));
-    assert_eq!(hir_def::deps::absolute(&path), absolute_reference(&path));
+/// Paths of up to six characters, each a slash, a backslash, an ASCII letter or digit, or one of
+/// `:._~é$`.
+const PATH_CHARACTERS: &str =
+    "/\\abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:._~é$";
+
+#[test]
+fn any_path_is_absolute_as_the_old_copy_said() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let path = tape.text_from(PATH_CHARACTERS, 0..=6, "path");
+        assert_eq!(hir_def::deps::absolute(&path), absolute_reference(&path));
+    });
 }

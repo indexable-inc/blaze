@@ -1,0 +1,14 @@
+{
+ "id": "crate-passes-under-no-span",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 11 T2, int-1112",
+ "where": "crates/blaze-diagnostics/src/check.rs run, checks.rs check, lints.rs early/late, lints/names.rs before_abort/after_abort",
+ "what": "A six body edit spent 20.4 ms of `unit bodies` (47.5 ms in the daemon) under no span: the crate's passes (`checks::check`, `lints::early`, `lints::late`) run whole on every body edit, and the profile could only show `find_container` (24,812 spans) and `analyze_impl` (5,672) folded beneath, not which pass called them.",
+ "cost": "the biggest stretch of the six body row could not be attributed, so no design for lints by item could be chosen from evidence",
+ "cause": "the passes over the whole crate were written as plain calls with no span, and nothing checked that a pass of `run` opens one",
+ "class": "a stretch of worker time with no span naming it (rule 16)",
+ "prevention": "every pass over the whole crate runs through `check::crate_pass` (span `crate pass`, `function`, `krate`); tests/passes_named.rs lists the passes and fails naming one that opened no span",
+ "workaround": "none",
+ "fix": "crate_pass around each pass and each statement group of checks::check; test every_crate_pass_runs_under_its_span with the planted control Plant::Unnamed",
+ "state": "fixed, not yet built"
+}

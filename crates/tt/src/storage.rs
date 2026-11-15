@@ -970,6 +970,10 @@ impl Tree {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "one per-thread set, kept only while it holds at most KEEP parts"
+)]
 thread_local! {
     /// [`has_duplicates`]' set, kept for the next column of more than [`SCAN`] parts.
     // alloc: one set per thread, grown to the most parts checked, up to `KEEP`.

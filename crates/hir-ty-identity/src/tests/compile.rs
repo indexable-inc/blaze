@@ -37,6 +37,8 @@ const fn options(level: MirOptLevel, ub_checks: bool, inline: bool) -> MirOption
         inline,
         heap_to_stack: false,
         world: None,
+        // As a tier 0 unit's, and as the library's bodies under every unit (`Build::options`).
+        tier: hir_ty::facts::Tier::Zero,
     }
 }
 

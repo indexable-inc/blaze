@@ -1,0 +1,14 @@
+{
+ "id": "remote-store-error-loses-the-object",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-remote, fix-hello-1113, round 3",
+ "where": "crates/blaze-remote/src/pull.rs store_error, at the Source boundary; crates/blaze-keyed/src/store.rs StoreError::Remote",
+ "what": "A bucket failure or a refused index object (a root, key list or shard) crosses into the store as StoreError::Remote { what: &'static str, status: u32 }, which cannot name the object or the signer, so the store's error says 'an object of the bucket refused: its signature does not verify' without saying which object.",
+ "cost": "an error that does not name its thing (rule errors-name-the-thing) on every remote find that fails; the remote's own Failure names the object but is dropped at the boundary",
+ "cause": "StoreError is a closed, string-free enum and the remote's refusals of its own objects have no variant in it; only a segment's statement (Refused) and wire layouts (WireError) do",
+ "class": "a typed error boundary whose target enum has no variant carrying the source's identifying fields",
+ "prevention": "a StoreError variant for a refused remote object carrying the object's name (a bucket key, which is built only from validated parts) and a typed reason, e.g. RemoteRefused { object: String, why: RemoteWhy }; asked of the store's owner in the round 3 report",
+ "workaround": "store_error maps each Why and Failure to a fixed phrase; the full Failure (with the object) is still what blaze-remote's own commands print",
+ "fix": "none yet: needs the store's owner to add the variant",
+ "state": "open"
+}

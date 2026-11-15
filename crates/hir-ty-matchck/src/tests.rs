@@ -723,3 +723,84 @@ fn base(c: Conn) -> u32 {
         &[("c", "E0004: Conn::Closed"), ("c", "E0004: Conn::Closed | Conn::Pending(_)")],
     );
 }
+
+/// blaze's error unions (`#![blaze::error_unions]`, docs/v2/plan/design/error-sets.md,
+/// "Matching"): a `match` on a union is exhaustive when its arms cover every member, each by
+/// a pattern of that member, and a member left out is the witness, written as the pattern
+/// that covers it; an arm of a member already covered is unreachable.
+#[test]
+fn a_match_on_an_error_union_is_exhaustive_over_its_members() {
+    check(
+        r#"
+//- minicore: sized, error_union, result, str, slice
+#![blaze::error_unions]
+pub struct Missing { pub capability: &'static str }
+pub enum FsKind { NotFound, NotADirectory }
+pub struct FsError { pub op: u8, pub kind: FsKind }
+pub enum Stopped { Deadline { at: u32 }, Cancelled }
+
+fn every_member(e: Missing | FsError | Stopped) -> u8 {
+    match e {
+        Missing { .. } => 0,
+        FsError { kind: FsKind::NotFound, .. } => 1,
+        FsError { .. } => 2,
+        Stopped::Deadline { .. } | Stopped::Cancelled => 3,
+    }
+}
+
+fn a_struct_member_left_out(e: Missing | FsError) -> u8 {
+    match e {
+        Missing { .. } => 0,
+    }
+}
+
+fn an_enum_member_left_out(r: Result<u8, Stopped | Missing>) -> u8 {
+    match r {
+        Ok(n) => n,
+        Err(Missing { .. }) => 0,
+    }
+}
+
+fn a_variant_of_a_member_left_out(e: &(Missing | Stopped)) -> u8 {
+    match e {
+        Missing { .. } => 0,
+        Stopped::Cancelled => 1,
+    }
+}
+
+fn a_part_of_a_member_left_out(e: Missing | FsError) -> u8 {
+    match e {
+        Missing { .. } => 0,
+        FsError { kind: FsKind::NotFound, .. } => 1,
+    }
+}
+
+fn a_member_covered_twice(e: Missing | FsError) -> u8 {
+    match e {
+        Missing { .. } => 0,
+        FsError { .. } => 1,
+        Missing { capability: _ } => 2,
+    }
+}
+
+fn a_let_of_one_member(e: Missing | FsError) {
+    let FsError { op: _, .. } = e;
+}
+
+fn a_member_bound_whole_through_a_reference(e: &(Missing | FsError)) -> usize {
+    match e {
+        m @ Missing { .. } => m.capability.as_bytes().len(),
+    }
+}
+"#,
+        &[
+            ("e", "E0004: FsError { .. }"),
+            ("r", "E0004: Err(Stopped::_)"),
+            ("e", "E0004: &Stopped::Deadline { .. }"),
+            ("e", "E0004: FsError { kind: FsKind::NotADirectory, .. }"),
+            ("Missing { capability: _ }", "unreachable_patterns"),
+            ("FsError { op: _, .. }", "E0005 local binding: Missing { .. }"),
+            ("e", "E0004: &FsError { .. }"),
+        ],
+    );
+}

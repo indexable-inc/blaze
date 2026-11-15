@@ -1,0 +1,19 @@
+{
+ "id": "kernel-cover-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane kernel-cover",
+ "where": "crates/blaze-kernel/src/trie.rs, crates/blaze-kernel/src/tests/cost.rs",
+ "what": "The session's maps were built with leaves of at most 8 entries on a 16-way trie and tested for the number of records a save after a carry writes, never for the records of a full save against the entries. At 256 keys every second-level node held about 16 entries, so each was a branch over leaves of 1.5 entries: 537 records for 256 entries, where the store pays a couple of hundred bytes of overhead a record. A path was also read from its root for every row and posting (89 gets for a carry that is 26 in memory), because the trie was pure functions over the store with nothing remembered between two gets.",
+ "cost": "a layout change (t 1 to t 2, s 1 to s 2) one piece after the layout was made, and a successor lane's first piece",
+ "whys": [
+  "why the leaves were 8: the leaf size was picked for the bytes a changed row writes again, with no count of records",
+  "why no count: the cost tests pinned what a carry and a save after it cost, and the full save only had a loose bound (at most 900)",
+  "why a loose bound passed: the lane could not run its tests, so it wrote bounds for the main agent to tighten, and a bound wide enough to pass says nothing"
+ ],
+ "cause": "a persisted form was designed against one of its costs (bytes rewritten a change) with the others (records, bytes an entry, gets) not stated against a floor",
+ "class": "a cost with no stated floor is not designed: whichever cost the author thought of is the only one that is near its floor",
+ "prevention": "every persisted form's test states records an entry, bytes an entry and gets an operation, each beside its floor, as exact pins (tests/cost.rs now does for the session; kernel.md lists what is still over the floor)",
+ "workaround": "",
+ "fix": "done: leaves of 64, one-byte counts, `trie::Nodes` (a node is one get a carry); owed and listed in kernel.md: posting keys derived from names, readers as row numbers",
+ "state": "open"
+}

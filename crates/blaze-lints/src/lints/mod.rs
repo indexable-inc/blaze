@@ -961,7 +961,8 @@ mod tests {
         let (edition, _) = named_in("#[warn(blaze::edition)]");
         let (macros, _) = named_in("#[allow(blaze::proc_macro)]");
         assert!(
-            edition.intersects(blaze::Lint::LossyAs.bit())
+            edition.intersects(blaze::Lint::AsCast.bit())
+                && edition.intersects(blaze::Lint::ImplicitOverflow.bit())
                 && edition.intersects(blaze::Lint::GlobalState.bit())
                 && edition.intersects(blaze::Lint::AsyncFn.bit())
                 && edition.intersects(blaze::Lint::UnmarkedPure.bit())
@@ -999,8 +1000,21 @@ mod tests {
                 || pedantic.intersects(edition)),
             "the kinds are disjoint"
         );
+        let (suggest, _) = named_in("#[warn(blaze::suggest)]");
+        assert!(
+            suggest.intersects(blaze::Lint::CouldBeNarrower.bit())
+                && suggest.intersects(blaze::Lint::CouldBeRef32.bit())
+                && !suggest.intersects(blaze::Lint::UnmarkedPure.bit())
+        );
+        assert!(
+            !(general.intersects(suggest)
+                || internal.intersects(suggest)
+                || pedantic.intersects(suggest)
+                || edition.intersects(suggest)),
+            "the kinds are disjoint"
+        );
         assert_eq!(
-            general | internal | pedantic | edition,
+            general | internal | pedantic | edition | suggest,
             On::BLAZE,
             "every blaze lint is of one kind"
         );
@@ -1041,9 +1055,16 @@ mod tests {
             "`clippy::all` is clippy's five groups only"
         );
         let on = command_line_on(&flags(&format!(
-            "{} -A blaze::general -W clippy::dbg_macro -D blaze::hot_alloc",
+            "{} -A blaze::general -A blaze::edition -W clippy::dbg_macro -D blaze::hot_alloc",
             crate::tests::CLIPPY_OFF
         )));
-        assert_eq!(named(on), ["dbg_macro", "blaze::hot_alloc"]);
+        // Beside what the flags turn on: only the two no flag turns off, `blaze::refinement`
+        // and `blaze::unreachable`. The edition lints that are on by default
+        // (`proc_macro_fn_like`, `program_lifetime`) are of `blaze::edition`, which the flags
+        // allow, so they are off here.
+        assert_eq!(
+            named(on),
+            ["dbg_macro", "blaze::hot_alloc", "blaze::refinement", "blaze::unreachable"]
+        );
     }
 }

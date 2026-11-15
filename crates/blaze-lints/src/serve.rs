@@ -198,7 +198,10 @@ pub fn answer_with<P: AsRef<Path>>(
         })
     };
     // A crate built for its tests as well is linted once, as that build: what it finds outside
-    // `cfg(test)` is what the plain build finds.
+    // `cfg(test)` is what the plain build finds. Not so for `#[expect]`: a test build leaves an
+    // expectation outside `cfg(test)` to the plain build (`check::Driver::production_judged_plain`),
+    // so a stale one on production code is said by a run that lints the plain build, never here,
+    // and its silence here is no verdict.
     let tested: HashSet<FileId, Global> = crates
         .iter()
         .filter(|&&it| has_tests(it))
@@ -249,7 +252,9 @@ fn setup(package: &Package) -> Result<Setup, String> {
     let path = conf::find(package.conf_dir.as_deref(), &package.manifest_dir);
     // The profile `clippy.toml` names, read once per request; this path is given no workspace
     // metadata, so `[workspace.metadata.blaze.lints]`'s `profile` is `blaze check`'s alone.
-    let conf = Conf::load(path, package.rust_version.as_deref())?.with_profile(None)?;
+    // This server is no daemon's build: no build keeps its look at the profile.
+    let conf = Conf::load(path, package.rust_version.as_deref())?
+        .with_profile(None, &blaze_vfs::outside::Looks::none())?;
     Ok(Setup { command_line, conf })
 }
 
@@ -348,12 +353,11 @@ mod tests {
     /// `clippy.toml`, and one after [`Setups::forget`] reads it again.
     #[test]
     fn a_setup_is_kept_until_forgotten() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-setups-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-setups-");
         std::fs::write(dir.join("clippy.toml"), "msrv = \"1.60\"\n").unwrap();
         let package = |flags: &[&str]| Package {
             name: "p".to_owned(),
-            manifest_dir: dir.clone(),
+            manifest_dir: dir.path().to_path_buf(),
             flags: flags.iter().map(|it| (*it).to_owned()).collect(),
             conf_dir: None,
             rust_version: None,
@@ -382,6 +386,5 @@ mod tests {
         setups.forget();
         setups.load(&plain);
         assert_eq!(msrv(&setups, &plain), Ok(Some(crate::conf::Version(1, 70, 0))));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -82,12 +82,26 @@ impl<H: Http + 'static> Fetcher<H> {
             .with_policy(blaze_registry::pinned::policy(&self.retry))
     }
 
+    /// The BLAKE3 tree digest of the git repository `url` at `commit`, fetched fresh into
+    /// the fetcher's scratch and pinned by nothing: what `blaze audit pin` records on trust
+    /// at first use. `at` is the checkout's place as the load names it
+    /// (`<sources>/git/checkouts/<ident>/<commit>`); nothing is written there.
+    pub fn unpinned_git_digest(&self, url: &str, commit: &str, at: &str) -> anyhow::Result<blaze_fetch::Digest> {
+        let fetch = Fetch {
+            what: format!("git repository `{url}`"),
+            url: url.to_owned(),
+            kind: FetchKind::Git { commit: commit.to_owned(), tree: String::new() },
+            at: at.to_owned(),
+        };
+        git::unpinned_digest(self, &fetch, commit)
+    }
+
     /// `fetch`, fetched and checked, as the daemon puts it into the VFS.
     pub fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         let source = match &fetch.kind {
             FetchKind::Crate { sha256 } => self.package(fetch, sha256)?,
             FetchKind::IndexFile => self.index_file(fetch)?,
-            FetchKind::Git { commit } => git::tree(self, fetch, commit)?,
+            FetchKind::Git { commit, tree } => git::tree(self, fetch, commit, tree)?,
             // Read where it is, never fetched: the job reads it through `Steps::local`.
             FetchKind::Local { .. } => {
                 return Err(failed(fetch, &[format!("`{}` is a path on the disk, which is read where it is, not fetched", fetch.at)], None));
@@ -162,11 +176,11 @@ impl<H: Http + 'static> Fetcher<H> {
                 None,
             ));
         }
-        files.push(SourceFile {
-            path: PACKAGE_SOURCE_LOCK.to_owned(),
-            bytes: blaze_vfs::Bytes::from_static(br#"{"v":1}"#),
-            mode: Mode::Regular,
-        });
+        files.push(SourceFile::of(
+            PACKAGE_SOURCE_LOCK.to_owned(),
+            blaze_vfs::Bytes::from_static(br#"{"v":1}"#),
+            Mode::Regular,
+        ));
         blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
         Ok(Source { files, under: String::new() })
     }
@@ -186,7 +200,7 @@ impl<H: Http + 'static> Fetcher<H> {
             true => Vec::new(),
             false => {
                 let bytes = blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, &answer.body);
-                vec![SourceFile { path: name.to_owned(), bytes, mode: Mode::Regular }]
+                vec![SourceFile::of(name.to_owned(), bytes, Mode::Regular)]
             }
         };
         Ok(Source { files, under: name.to_owned() })
@@ -233,13 +247,9 @@ pub fn on_disk_id<'a>(files: impl Iterator<Item = (&'a str, Mode, ContentId)>) -
     hasher.finish()
 }
 
-/// [`on_disk_id`] of a fetched source's files.
+/// [`on_disk_id`] of a fetched source's files, by the IDs they carry.
 pub fn source_on_disk_id(source: &Source) -> ContentId {
-    on_disk_id(
-        source.files.iter().map(|it| {
-            (it.path.as_str(), it.mode, ContentId::of(blaze_vfs::FILE_DOMAIN, &it.bytes))
-        }),
-    )
+    on_disk_id(source.files.iter().map(|it| (it.path.as_str(), it.mode, it.id)))
 }
 
 /// The id `dir`'s [`ON_DISK_MARK`] holds: `Ok(None)` for no mark, an error for one that is

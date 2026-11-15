@@ -40,6 +40,11 @@ refuses to read.
 
 ## Skills
 
+Every agent's note starts with the goal-understanding policy: recover the root objective, concrete constraints and
+success criteria, and ranked priorities from context; use the existing `ask()` UI for material gaps and challenge
+misaligned proxy metrics with evidence. Every question addressed to the person, including casual questions,
+uses `await ask(...)` rather than a question in plain chat text. Clear small requests stay autonomous.
+
 An agent's system note carries what every turn needs (`harness/src/system_note/`) and ends with an index of skills,
 one line each (name and description), generated from the skill files at each launch. The full text of a skill loads
 on demand: `await skill('github')` in ts returns it and the person sees a quiet "Read skill github" step; `skills()`
@@ -51,6 +56,11 @@ serves are one list, for claude, codex and cursor alike. A topic only some tasks
 
 The daemon finds the TypeScript kernel at `$HARNESS_ROOT/src/mcp.ts`, by default `crates/harness/mcp`
 in the checkout it was built from. UI work: the `flecs-ui` skill (`.agents/skills/flecs-ui`).
+
+For offscreen visual checks, `HARNESS_NATIVE_SHOT_CALLS=<file.json>` schedules live native world calls:
+`[{"at": 0.8, "call": {"op": "emotion", "device": "/private/tmp/shot/harnessd.sock", "session": 1,
+"emotion": "focused", "reason": "Checking the design"}}]`. Use a private `HARNESS_HOME` and shot fixture;
+calls are never journaled. The input is bounded to 1 MiB, 128 calls, and times within the shot duration.
 
 ## Protocol and chat logs
 

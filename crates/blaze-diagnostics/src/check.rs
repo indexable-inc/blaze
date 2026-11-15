@@ -27,6 +27,7 @@ use crate::{
     emit, lints,
     lower::{self, Found, Phase},
     model::{Breakage, Diag},
+    pieces,
 };
 
 /// What a crate is checked with: the flags of rustc's that change what it says.
@@ -200,7 +201,7 @@ fn run(
     frame: &Frame,
 ) -> CrateCheck {
     let cx = Cx::new(db, krate, files, frame).with_lints(&options.lints);
-    let parsed = lower::parse::parsed(&cx);
+    let parsed = crate_pass(&cx, "parsed", || lower::parse::parsed(&cx));
     if parsed.fatal {
         // A file that does not parse: no item of it is known.
         // alloc: a file that does not parse, the error path
@@ -218,13 +219,31 @@ fn run(
         items_broken |= !in_body && found[at..].iter().any(breaks_items);
     }
     let at = found.len();
-    found.extend(checks::check(&cx));
-    found.extend(lints::early(&cx, &options.lints));
+    // The pieces each group's passes find nothing in (plan 12 E1), swept on the database's
+    // workers and counted by why in the span `crate pieces sweep`: a group not yet run by
+    // piece leaves every piece unclean (`unconverted`). The syntax group's passes (the syntax
+    // lints and those of `checks::check` that read a node's own syntax) walk only the pieces
+    // of the syntax group left unclean (`Cx::scoped`); every other pass walks the whole crate.
+    // In the check's frame, so the context keeps them for the passes that fold the pieces'
+    // facts (`Cx::pieces`); a frame runs no destructor, and the pieces' lists are its own.
+    let all: &pieces::Pieces<'_> = frame.alloc(crate_pass(&cx, "pieces", || pieces::pieces(&cx)));
+    cx.set_pieces(all);
+    let mut syntax_unclean = None;
+    for group in pieces::Group::ALL {
+        let unclean = pieces::unclean(&cx, all, pieces::PieceGate::of(&cx, group, &options.lints));
+        if group == pieces::Group::Syntax {
+            syntax_unclean = Some(unclean);
+        }
+    }
+    let syntax_unclean = syntax_unclean.expect("Group::ALL has the syntax group");
+    let scoped = cx.scoped(all, &syntax_unclean);
+    found.extend(crate_pass(&cx, "checks", || checks::check(&cx, &scoped)));
+    found.extend(crate_pass(&cx, "lints early", || lints::early(&cx, &scoped, &options.lints)));
     items_broken |= found[at..].iter().any(breaks_items);
     radix::sort_by_key(&mut found, |it| it.phase as u8);
     if let Some(at) = found.iter().position(|it| it.diag.fatal) {
         found.truncate(at + 1);
-        let mut diags = lints::decide(&cx, &options.lints, found, true);
+        let mut diags = crate_pass(&cx, "levels", || lints::decide(&cx, &options.lints, found, true));
         let stop = diags.iter().position(|it| it.fatal).expect("deciding levels keeps every error");
         diags.truncate(stop + 1);
         // rustc stops at a fatal error: what it did not check is not known to be sound.
@@ -232,19 +251,35 @@ fn run(
     }
     let aborted = found.iter().any(stops_before_late);
     if !aborted {
-        let mut late = lints::late(&cx);
+        let mut late = crate_pass(&cx, "lints late", || lints::late(&cx));
         late.iter_mut().filter(|it| it.phase < Phase::Late).for_each(|it| it.phase = Phase::Late);
         items_broken |= late.iter().any(breaks_items);
         found.extend(late);
     }
     let (stashed, found): (Vec<Found>, Vec<Found>) =
         found.into_iter().partition(|it| it.phase == Phase::Stashed);
-    let mut diags = lints::decide(&cx, &options.lints, found, aborted);
+    let mut diags = crate_pass(&cx, "levels", || lints::decide(&cx, &options.lints, found, aborted));
     diags.extend(unstashed(stashed, &diags));
     let diags = written(diags, options);
     // Only a failed check leaves its items broken.
     let items_broken = items_broken && diags.iter().any(Diag::is_error);
     CrateCheck { diags, items_broken }
+}
+
+/// `run` as one of the crate's passes, under the span `crate pass`: `function` the pass,
+/// `krate` the crate. The passes over the whole crate run whole on every check, so a profile
+/// names each one's time here (`select function, sum(dur_ns) from spans where name = 'crate
+/// pass' group by 1`); no span is opened inside a pass's per-node functions. The crate's name
+/// is made only when the span is recorded.
+pub(crate) fn crate_pass<T>(cx: &Cx<'_, '_>, function: &'static str, run: impl FnOnce() -> T) -> T {
+    let _pass = tracing::info_span!(
+        target: "blaze",
+        "crate pass",
+        function = function,
+        krate = %cx.crate_name(cx.krate),
+    )
+    .entered();
+    run()
 }
 
 /// rustc's stashed warnings, written at the very end and only when nothing before them was an

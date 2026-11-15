@@ -18,10 +18,13 @@ blaze-cas.workspace = true
 blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+blaze-record.workspace = true
+blaze-report.workspace = true
 blaze-store-check.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-core.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

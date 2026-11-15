@@ -16,6 +16,8 @@
 //! `&str`s.
 
 #![feature(allocator_api, allocator_ext, variant_count)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![deny(unsafe_code)]
 
 pub mod args;
@@ -84,7 +86,8 @@ pub use output::{
     Undefined,
 };
 pub use position::{
-    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
+    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, Span, SpanTable, file_name, location,
+    position_in,
 };
 pub use premap::{NoOutside, Outside};
 pub use shape::RegionShape;
@@ -671,6 +674,9 @@ impl Image {
             island: None,
             text: None,
         };
+        // A stage's steps, each its own span (rule 16): what of a link's time is the change
+        // applied, the pieces placed, the fixups applied, and the lists, tables and file made.
+        let step = tracing::info_span!(target: "blaze", "link stage: apply the change").entered();
         stage.inputs(&change)?;
         stage.apply(&change)?;
         stage.sanitize(&change)?;
@@ -686,6 +692,8 @@ impl Image {
         stage.cells_of_removed();
         stage.asan_globals(&change)?;
         stage.dangling()?;
+        drop(step);
+        let step = tracing::info_span!(target: "blaze", "link stage: place").entered();
         // Each round places what the last made; GOT cells and PLT stubs need nothing past the
         // next, and thunks (`thunk`) only what islands' bytes moved out of reach, so a stage
         // that still makes pieces after `ROUNDS` would write them unplaced.
@@ -712,6 +720,8 @@ impl Image {
                 ),
             ));
         }
+        drop(step);
+        let step = tracing::info_span!(target: "blaze", "link stage: relocate").entered();
         stage.coverage_moved();
         if let Some(place) = self.place {
             stage.fix_tls(&place)?;
@@ -725,6 +735,7 @@ impl Image {
         stage.check_reach(&layout)?;
         stage.fill_descriptor()?;
         stage.relocate_all().map_err(|error| shape::explained(error, &layout, stage.plan.base))?;
+        drop(step);
         let base = self.state.generation;
         let image_base = stage.plan.base;
         let finished =
@@ -1045,6 +1056,14 @@ impl Image {
     /// How many jump-table slots the image has given out: every [`Image::slot`] index is below it.
     pub fn slots(&self) -> u32 {
         self.state.slots
+    }
+
+    /// How many slots the jump table has room for: the count its header and its live
+    /// descriptor hold, fixed at the image's first link (an incremental link that would pass
+    /// it is refused), which the program's runtime arms a byte of the execution log for each
+    /// of; [`Image::slots`] of them are given out.
+    pub fn capacity(&self) -> u32 {
+        self.state.capacity
     }
 
     pub fn slot(&self, function: &InstanceKey) -> Option<Slot> {

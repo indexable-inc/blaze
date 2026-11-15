@@ -182,15 +182,33 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
     RecordBatch::try_new(schema_of(&schema::SPANS), columns)
 }
 
+/// A text column of `texts`, its bytes allocated once at their exact size. Until 2026-11-12
+/// the column was collected with no size given, so its bytes grew by doubling: on a cold build
+/// of tempo the largest site of the `profile` tag's heap churn, 22.25 GiB of 135.31 in blocks
+/// of 6.3 MB on average (`alloc_samples`, site `GenericByteBuilder::append_value::<&str>`,
+/// under `in_row_batches::<SpanRow, ..>`; int-1112 d45e70ddc).
+fn texts_column(texts: &[Option<std::sync::Arc<str>>]) -> ArrayRef {
+    let bytes: usize = texts.iter().map(|it| it.as_deref().map_or(0, str::len)).sum();
+    // alloc: a batch's column, once a read, at its size
+    let mut column_of = arrow_array::builder::StringBuilder::with_capacity(texts.len(), bytes);
+    for text in texts {
+        match text {
+            Some(text) => column_of.append_value(&**text),
+            None => column_of.append_null(),
+        }
+    }
+    column(column_of.finish())
+}
+
 /// The column of `spans` a span kind's field fills ([`span::CELLS`]), as its schema types it.
 fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, ArrowError> {
     let words = spans.iter().map(|it| it.said().get(cells.at));
     Ok(match cells.column.ty {
         schema::Type::U64 => column(UInt64Array::from_iter(words.map(cells.number))),
         schema::Type::Utf8 => {
-            // alloc: a batch's column, once a read
+            // alloc: a batch's texts, once a read
             let texts: Vec<Option<std::sync::Arc<str>>> = words.map(cells.text).collect();
-            column(StringArray::from_iter(texts.iter().map(|it| it.as_deref())))
+            texts_column(&texts)
         }
         schema::Type::Dict => {
             let mut values = Dict::new();
@@ -609,7 +627,7 @@ pub fn event_fields(fields: &[FieldRow], process: Process<'_>) -> Result<RecordB
             FieldValue::Bool(it) => Some(it),
             _ => None,
         }))),
-        column(StringArray::from_iter(texts.iter().map(|it| it.as_deref()))),
+        texts_column(&texts),
     ];
     RecordBatch::try_new(schema_of(&schema::EVENT_FIELDS), columns)
 }

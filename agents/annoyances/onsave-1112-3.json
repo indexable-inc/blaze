@@ -1,0 +1,17 @@
+{
+ "id": "onsave-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onsave-1112",
+ "where": "my own method: a queued build read through `| tail`, and an `ix shell` call that waits in the queue",
+ "what": "Two queue turns gave me nothing. (1) I piped `loop.sh`'s output through `tail -80`: a failed build prints `BUILD FAILED` and its errors first and 150 lines of warnings after, so I got the warnings and exit 0 (tail's). (2) A call waiting for the lock in a foreground `ix shell` was moved to the background by my tool after 180 s and its remote `loop.sh` was gone before its turn: no output, no build.",
+ "cost": "about 25 minutes",
+ "cause": "the queue's answer comes only on the caller's terminal; a caller that goes away loses its place and its output",
+ "whys": [
+  "loop.sh prints to its caller",
+  "an agent's foreground call has a shorter life than the queue's wait"
+ ],
+ "class": "an answer that lives only on the caller's connection",
+ "prevention": "not built in loop.sh (not this lane's file): it should write each call's output to /root/loop-out/<branch>-<time>.log and print the path first. This lane's /root/wt/onsave-1112/queue.sh starts the call as a systemd unit with its output in a file and `exit N` as its last line, and I poll the file",
+ "workaround": "systemd-run --unit=<lane>-q <a script that calls loop.sh with its output in a file>",
+ "state": "open: for whoever owns /root/loop.sh"
+}

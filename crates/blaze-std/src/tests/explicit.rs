@@ -437,7 +437,8 @@ fn a_buffered_writer_holds_bytes_until_it_is_full_or_finished_and_says_which() {
 }
 
 /// The bounds a world's waits, closes and trace end by are the ones its maker said: there is
-/// no constant bstd picked. A trace told to keep two records keeps two and counts the rest.
+/// no constant bstd picked. A trace told to keep two records keeps two and counts the rest:
+/// the root's opening is a record too, so of five it counts three.
 #[test]
 fn a_worlds_limits_are_the_ones_its_maker_said() {
     let limits = Limits {
@@ -453,7 +454,7 @@ fn a_worlds_limits_are_the_ones_its_maker_said() {
         cx.event(what);
     }
     let (kept, dropped) = io.trace(|trace| (trace.records().len(), trace.dropped()));
-    assert_eq!((kept, dropped), (2, 2), "two kept, two counted");
+    assert_eq!((kept, dropped), (2, 3), "two kept, three counted");
     // The usual world's are the named value, said at its call.
     assert_eq!(world(21, Plant::None).limits(), Limits::USUAL);
 }

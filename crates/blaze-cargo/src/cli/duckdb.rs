@@ -1,6 +1,8 @@
 //! The DuckDB that reads the profile history (`blaze slow`, `blaze explain <view>`, `blaze debug
 //! sql`, `blaze debug time`), found without Nix: an installed blaze fetches the DuckDB it pins
-//! on first use, as it fetches its toolchain and LLVM.
+//! on first use, as it fetches its toolchain and LLVM. Only those commands look for it: `blaze
+//! explain memory` reads the history's Parquet itself (blaze_profile::memory), and no daemon's
+//! start or build reads [`observe::DUCKDB`].
 //!
 //! The order ([`locate`]), each step an answer or an error, never a quiet next:
 //!
@@ -108,6 +110,14 @@ fn unpack(archive: &Path, to: &Path) -> io::Result<()> {
 /// `pin`'s archive, fetched by the daemon into its store against the pin's SHA-256 and written
 /// out under `scratch`: the path of that file.
 fn fetch(pin: &Pin, scratch: &Path) -> Result<PathBuf, String> {
+    // Once a machine: said, so the first `blaze debug sql` or `blaze explain` that waits on the
+    // download says what it waits for.
+    blaze_report::errln!(
+        "fetching the DuckDB {} blaze pins ({}, sha256:{}): once, for the commands that run SQL over the profile",
+        observe::DUCKDB_VERSION,
+        pin.url(),
+        pin.sha256
+    );
     let out = scratch
         .to_str()
         .ok_or_else(|| format!("{} is not UTF-8", scratch.display()))? // alloc: error path

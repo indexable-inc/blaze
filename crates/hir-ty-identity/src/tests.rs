@@ -9,6 +9,7 @@ use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::Funct
 use hir_expand::fixture;
 use hir_ty::{
     ParamEnvAndCrate,
+    facts::Tier,
     mir::{MirOptLevel, MirOptions, MirOwner, MirStage},
     next_solver::{GenericArgs, ParamEnv},
     providers::monomorphized_mir_at,
@@ -29,17 +30,11 @@ const DEBUG: Compiled = Compiled::every(MirOptions {
     inline: false,
     heap_to_stack: false,
     world: None,
+    tier: Tier::Zero,
 });
 
 /// A release unit: MIR at level 2 with the inliner on.
-const INLINE: Compiled = Compiled::every(MirOptions {
-    level: MirOptLevel::Release,
-    ub_checks: false,
-    lifetime_markers: true,
-    inline: true,
-    heap_to_stack: false,
-    world: None,
-});
+const INLINE: Compiled = Compiled::every(INLINE_OPTIONS);
 
 /// The options [`INLINE`] compiles every body with.
 const INLINE_OPTIONS: MirOptions = MirOptions {
@@ -49,6 +44,7 @@ const INLINE_OPTIONS: MirOptions = MirOptions {
     inline: true,
     heap_to_stack: false,
     world: None,
+    tier: Tier::Optimizing,
 };
 
 /// A crate `kernel` whose root file is at `path`, with `text`, in a database of its own.
@@ -140,7 +136,7 @@ pub fn f(x: u32) -> usize {
 #[test]
 fn same_source_in_two_checkouts_has_one_identity() {
     let here = program("/home/a/checkout/src/lib.rs", PLAIN);
-    let there = program("/tmp/elsewhere/blaze/src/lib.rs", PLAIN);
+    let there = program("/srv/elsewhere/blaze/src/lib.rs", PLAIN);
     assert_eq!(all(&here, "f"), all(&there, "f"));
 }
 
@@ -934,4 +930,89 @@ pub fn run(x: u32) -> u32 {{ walk(&F(x)) }}
     let wide = walk_of_f(&nested("Wide", "Wide(1, self.0 as u64)"));
     assert_ne!(small.0, wide.0, "debug identity covers the nested `impl Trait`'s type");
     assert_ne!(small.2, wide.2, "CodeId covers the nested `impl Trait`'s type");
+}
+
+/// A `kernel` whose `root` calls one generic function, `leaf`, with `instances` different type
+/// arguments (`u8`, `(u8,)`, `((u8,),)`, ...): two bodies whatever `instances` is.
+fn ladder(instances: usize) -> Db {
+    let mut ty = String::from("u8");
+    let mut calls = String::new();
+    for _ in 0..instances {
+        calls.push_str(&format!("    n = leaf::<{ty}>(n);\n"));
+        ty = format!("({ty},)");
+    }
+    program(
+        "/src/lib.rs",
+        &format!(
+            "fn leaf<T>(x: u32) -> u32 {{\n    x\n}}\n\n\
+             pub fn root(mut n: u32) -> u32 {{\n{calls}    n\n}}\n"
+        ),
+    )
+}
+
+/// How many MIR values the database holds once the CodeId of the step rooted at `root` of
+/// [`ladder`] is made: each instance it runs summarized from its body.
+fn held_after_the_step(instances: usize, keeps_bodies: bool) -> usize {
+    use blaze_query::db::Database as _;
+    let db = ladder(instances);
+    let made = || _ = step(&db, "root");
+    match keeps_bodies {
+        true => crate::walk::plant::keeping_bodies(made),
+        false => made(),
+    }
+    db.storage().values_of(blaze_query::db::plumbing::Tag::Mir)
+}
+
+/// The invariant: a step's walk keeps each instance's part and callees, never the body it read
+/// them from: the CodeId of a step running 8 instances of one generic and of one running 64
+/// leave the same number of MIR values held.
+#[test]
+fn the_step_walk_holds_no_body_an_instance() {
+    let (few, many) = (held_after_the_step(8, false), held_after_the_step(64, false));
+    assert_eq!(few, many, "MIR values held after a step of 8 instances and of 64");
+}
+
+/// The planted bug: each instance's summary reads its body from the memo that keeps one an
+/// instance, as it did until 2026-11-13: 56 more instances hold at least 56 more bodies.
+#[test]
+fn the_oracle_catches_a_step_walk_that_keeps_each_instances_body() {
+    let (few, many) = (held_after_the_step(8, true), held_after_the_step(64, true));
+    assert!(
+        many >= few + 56,
+        "the memoized walk held {few} MIR values for 8 instances and {many} for 64"
+    );
+}
+
+const STR_PARAM: &str = r#"
+#![feature(adt_const_params, unsized_const_params)]
+pub fn named<const S: &'static str>() -> &'static str { S }
+"#;
+
+/// The compile identity of `named::<s>`, in `db`.
+fn str_instance(db: &Db, s: &str) -> CompileIdentity {
+    blaze_query::db::attach(db, || {
+        let interner = hir_ty::next_solver::DbInterner::new_with(db, fixture::test_crate(db));
+        let arg = hir_ty::record::names_const(interner, s);
+        let instance = Instance {
+            subject: Subject::Body(Body::Fn(function(db, "named"))),
+            args: GenericArgs::new_from_slice(&[arg.into()]).store(),
+        };
+        match instance_identity(db, &instance, &env(db), DEBUG) {
+            Ok(it) => *it,
+            Err(error) => panic!("`named::<{s:?}>` has no identity: {error}"),
+        }
+    })
+}
+
+/// A `&'static str` const argument (row Q5 of docs/v2/plan/design/sql.md) keys its instance
+/// by its bytes: `named::<"abc">` has one identity in two databases, as in two processes, and
+/// `named::<"abd">` another. The link name is the instance key, so it is bounded whatever the
+/// string's length.
+#[test]
+fn a_str_const_argument_keys_its_instance_by_its_bytes() {
+    let one = program("/src/lib.rs", STR_PARAM);
+    let two = program("/src/lib.rs", STR_PARAM);
+    assert_eq!(str_instance(&one, "abc"), str_instance(&two, "abc"), "built twice");
+    assert_ne!(str_instance(&one, "abc"), str_instance(&one, "abd"), "other bytes");
+    assert_ne!(str_instance(&one, "abc"), str_instance(&one, "abc\0"), "a longer string");
 }

@@ -1,0 +1,2 @@
+== end
+✓ hello::add recompiled in 0.70s · src/main.rs changed · tier 0

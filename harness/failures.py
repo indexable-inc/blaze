@@ -749,6 +749,13 @@ def checked(
     targets = workspace_targets()
     entries = load_baseline(baseline, targets)
     results = read_logs(logs)
+    # Logs with no test in them hold nothing to the list (agents.json A39, vacuous success): no
+    # new failure, no crash, and without `asked` no package that did not run. Refused, by name.
+    if not results.tests:
+        raise Refused(
+            "the logs hold no test result (" + ", ".join(str(log) for log in logs) + "): "
+            "the run built nothing, ran no test, or these are not its logs"
+        )
     verdict = compare(entries, results, context, asked, test_binaries())
     print("\n".join(say(verdict, results, targets, context, count, baseline)), flush=True)
     if report is not None:

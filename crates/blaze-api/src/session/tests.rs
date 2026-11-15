@@ -4,7 +4,10 @@ use std::{
 };
 
 use blaze_core::{Conn, FileName};
-use blaze_ids::{ContentId, rng::SplitMix64};
+use blaze_ids::{
+    ContentId,
+    rng::{SplitMix64, choose},
+};
 use blaze_mem::{
     Tag,
     tag::{Counters, Snapshot},
@@ -86,6 +89,7 @@ impl World {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -130,7 +134,7 @@ impl World {
     }
 
     fn tick(&mut self, now_ns: u64) -> Vec<Reply> {
-        self.call(|session, cx, _| session.tick(cx, now_ns))
+        self.call(|session, cx, out| session.tick(cx, now_ns, out))
     }
 
     /// `main` with `files` written, made durable.
@@ -193,6 +197,7 @@ fn diagnostic(level: Level) -> Response {
 
 fn test_result(outcome: TestOutcome) -> Response {
     Response::TestResult(TestResult {
+        ran: None,
         binary: "tests".to_owned(),
         name: "a_test".to_owned(),
         cached: None,
@@ -201,6 +206,7 @@ fn test_result(outcome: TestOutcome) -> Response {
         millis: 1,
         outside: false,
         executable: 0,
+        not_kept: None,
     })
 }
 
@@ -478,7 +484,7 @@ fn why_keeps_the_view_a_build_ran_in_when_the_daemon_hands_it_over() {
     let job = world.last_job();
     let built = world.db.open(View { root });
     let replies =
-        world.call(|session, cx, out| session.finish_in(cx, job, true, None, Some(built), out));
+        world.call(|session, cx, out| session.finish_in(cx, job, true, None, Some((built, root)), out));
     assert_eq!(replies, [done(1, 1, true)]);
     assert_eq!(world.session.kept.iter().copied().collect::<Vec<_>>(), [(root, built)]);
 
@@ -486,7 +492,7 @@ fn why_keeps_the_view_a_build_ran_in_when_the_daemon_hands_it_over() {
     let job = world.last_job();
     let failed = world.db.open(View { root });
     let error = Some(ApiError::new("no".to_owned(), None));
-    world.call(|session, cx, out| session.finish_in(cx, job, false, error, Some(failed), out));
+    world.call(|session, cx, out| session.finish_in(cx, job, false, error, Some((failed, root)), out));
     assert_eq!(
         world.session.kept.iter().copied().collect::<Vec<_>>(),
         [(root, built)],
@@ -514,6 +520,7 @@ fn status_lists_every_connections_requests_sorted() {
         memory_bytes: 10,
         budget_bytes: 20,
         uptime_ms: 40,
+        placed_by: None,
         build: BUILD.clone(),
         bugs: Vec::new(),
         settings: Vec::new(),
@@ -547,6 +554,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -570,6 +578,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             build: BUILD.clone(),
             bugs: Vec::new(),
             settings: Vec::new(),
@@ -697,7 +706,7 @@ fn a_profile_is_the_daemons_dump_and_the_loops_requests_are_refused_by_name() {
         (2, Request::Explore { dev: false }, "blaze explore"),
         (3, Request::Live, "blaze debug live"),
         (4, Request::Flush, "a read of the profile history"),
-        (5, Request::Gc { dry_run: true }, "blaze cache gc"),
+        (5, Request::Gc { dry_run: true, unkept: false }, "blaze cache gc"),
     ] {
         let refused = world.request(1, id, request);
         assert_eq!(error_at(&refused).as_deref(), Some(named), "{refused:?}");
@@ -850,6 +859,7 @@ fn a_duplicate_id_is_refused_without_touching_the_first() {
 fn worked() -> Response {
     Response::Work(crate::Worked {
         why: None,
+        storage: None,
         reran: 3,
         misses: 0,
         green: 9,
@@ -1017,6 +1027,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -1040,6 +1051,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             memory_bytes: 10,
             budget_bytes: 20,
             uptime_ms: 40,
+            placed_by: None,
             memory: counters,
             profile: dumped,
             hot: hotted,
@@ -1134,7 +1146,7 @@ fn best_of_tests_rank_by_failed_then_passed() {
     world.report(jobs[1], test_result(TestOutcome::Passed));
     world.report(jobs[2], test_result(TestOutcome::Passed));
     world.report(jobs[2], test_result(TestOutcome::Passed));
-    world.report(jobs[2], test_result(TestOutcome::Unreached));
+    world.report(jobs[2], test_result(TestOutcome::Ignored));
     world.finish(jobs[0], false, None);
     world.finish(jobs[1], true, None);
     let error = ApiError::new("the sandbox could not start", Some("tests".to_owned()));
@@ -1239,10 +1251,10 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                     let next = ids.entry(conn).or_insert(0);
                     let id = *next;
                     *next += 1;
-                    let request = match rng.index(7) {
-                        0 => Request::Check { view: head("main"), targets: targets() },
-                        1 => Request::Snapshot,
-                        2 => Request::BestOf {
+                    let request = choose!(rng;
+                        Request::Check { view: head("main"), targets: targets() },
+                        Request::Snapshot,
+                        Request::BestOf {
                             base: head("main"),
                             candidates: vec![
                                 vec![write("x.rs", "x")],
@@ -1253,16 +1265,16 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                             test: rng.index(2) == 0,
                             filter: Vec::new(),
                         },
-                        3 => {
+                        {
                             written += 1;
                             let base = world.vfs.head("main").unwrap_or_else(|| world.vfs.empty());
                             let ops = vec![write(&format!("f{written}.rs"), "")];
                             Request::Commit { head: "main".to_owned(), base, ops }
-                        }
-                        4 if id > 0 => Request::Cancel { id: rng.index(id as usize) as u64 },
-                        5 => Request::Open { view: head("main") },
-                        _ => Request::Status,
-                    };
+                        },
+                        if id > 0 => Request::Cancel { id: rng.index(id as usize) as u64 },
+                        Request::Open { view: head("main") },
+                        Request::Status,
+                    );
                     seen.asked.insert(to(conn, id));
                     let replies = world.request(conn, id, request);
                     seen.take(replies);
@@ -1345,7 +1357,7 @@ fn body_edited() -> Edited {
 }
 
 fn edit_request(base: ContentId) -> Request {
-    Request::Edit { base, head: "main".to_owned(), edits: body_edit() }
+    Request::Edit { base, head: Some("main".to_owned()), edits: body_edit() }
 }
 
 #[test]
@@ -1370,6 +1382,27 @@ fn an_edit_reports_what_it_changed_then_commits_its_ops_once_durable() {
     );
     let replies = world.request(1, 2, Request::Cancel { id: 1 });
     assert_eq!(error_at(&replies), Some("request 1".to_owned()), "it is over");
+}
+
+#[test]
+fn a_dry_run_edit_reports_what_it_would_change_and_commits_nothing() {
+    let mut world = World::new();
+    let base = world.commit(&[("src/lib.rs", "fn a() {}\n")]);
+    let dry = Request::Edit { base, head: None, edits: body_edit() };
+    assert_eq!(world.request(1, 1, dry), []);
+    let job = world.last_job();
+    let edited = Response::Edited(body_edited());
+    assert_eq!(world.report(job, edited.clone()), [reply(1, 1, edited)]);
+    assert_eq!(world.finish(job, true, None), [done(1, 1, true)], "over with no commit");
+    assert_eq!(world.vfs.head("main"), Some(base), "the head did not move");
+    assert!(world.session.tickets.is_empty());
+    assert_eq!(world.session.views(), 0);
+    // The control: the same edit with its head commits.
+    world.request(1, 2, edit_request(base));
+    let job = world.last_job();
+    world.report(job, Response::Edited(body_edited()));
+    world.finish(job, true, None);
+    assert_ne!(world.vfs.head("main"), Some(base));
 }
 
 #[test]
@@ -1609,30 +1642,30 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
                     *next += 1;
                     let text = texts[rng.index(texts.len())];
                     let wait_ms = rng.index(40) as u64;
-                    let request = match rng.index(5) {
-                        0 => Request::WillSave {
+                    let request = choose!(rng;
+                        Request::WillSave {
                             ops: vec![write("a.rs", text)],
                             head: "main".to_owned(),
                             test: rng.index(2) == 0,
                             targets: targets(),
                             wait_ms,
                         },
-                        1 => Request::WillTest {
+                        Request::WillTest {
                             view: head("main"),
                             filter: Vec::new(),
                             targets: targets(),
                             wait_ms,
                         },
-                        2 => {
+                        {
                             let base = world.vfs.head("main").unwrap_or_else(|| world.vfs.empty());
                             Request::Commit {
                                 head: "main".to_owned(),
                                 base,
                                 ops: vec![write("a.rs", text)],
                             }
-                        }
-                        _ => Request::Check { view: head("main"), targets: targets() },
-                    };
+                        },
+                        Request::Check { view: head("main"), targets: targets() },
+                    );
                     seen.asked.insert(to(conn, id));
                     let replies = world.request(conn, id, request);
                     seen.take(replies);
@@ -1709,4 +1742,197 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
         assert_eq!(world.session.views(), 0, "seed {seed}");
         assert_eq!(world.session.deadline(), None, "seed {seed}");
     }
+}
+
+/// A build that ran on another root than the one its request was asked on (its plan's lock
+/// files were written into its view) is kept under the root it built: `why` of that root,
+/// which is where the checkout's head is once the watcher reports the files, finds it. Until
+/// 2026-11-12 it was kept under the root asked, and `why` on the head after a cold build
+/// found no build.
+#[test]
+fn why_keeps_a_handed_view_under_the_root_the_job_built() {
+    let mut world = World::new();
+    let asked = world.commit(&[("src/lib.rs", "")]);
+    world.request(1, 1, Request::Check { view: head("main"), targets: targets() });
+    let job = world.last_job();
+    let built_root = world.commit(&[("Cargo.lock", "# a lock\n")]);
+    assert_ne!(built_root, asked);
+    let built = world.db.open(View { root: built_root });
+    world.call(|session, cx, out| session.finish_in(cx, job, true, None, Some((built, built_root)), out));
+    assert_eq!(world.session.kept.iter().copied().collect::<Vec<_>>(), [(built_root, built)]);
+}
+
+/// A `Request::Diagnostics` of the agent's session `agent` on `main`.
+fn asked_since(since: Option<ContentId>, wait_ms: u64) -> Request {
+    Request::Diagnostics {
+        view: head("main"),
+        since,
+        client: "agent".to_owned(),
+        targets: targets(),
+        wait_ms,
+    }
+}
+
+/// A diagnostic of the check at `src/lib.rs:line`.
+fn said_at(level: Level, message: &str, line: u32) -> Response {
+    let span = crate::Span {
+        file: "src/lib.rs".to_owned(),
+        line,
+        label: None,
+        column: 4,
+        primary: true,
+        byte_end: 0,
+        end_line: line,
+        byte_start: 0,
+        end_column: 5,
+        replacement: None,
+        applicability: None,
+    };
+    Response::Diagnostic(Diagnostic {
+        level,
+        code: Some("c".to_owned()),
+        message: message.to_owned(),
+        spans: vec![span],
+        children: Vec::new(),
+        facts: Vec::new(),
+        rendered: message.to_owned(),
+        unit: None,
+        explanation: None,
+    })
+}
+
+/// The one answer of a diagnostics request in `replies`, and its Done's `ok`.
+fn answer_of(replies: &[Reply]) -> (crate::Seen, bool) {
+    match replies {
+        [
+            Reply { response: Response::Diagnostics(seen), .. },
+            Reply { response: Response::Done { ok }, .. },
+        ] => (seen.clone(), *ok),
+        replies => panic!("not one answer and its Done: {replies:?}"),
+    }
+}
+
+fn messages(found: &[crate::Found]) -> Vec<&str> {
+    found.iter().map(|it| it.message.as_str()).collect()
+}
+
+/// One diagnostics request of the check of `main` as it is, its job reporting `said`, ending
+/// `ok`: the answer.
+fn checked(
+    world: &mut World,
+    id: u64,
+    since: Option<ContentId>,
+    said: &[Response],
+    ok: bool,
+) -> crate::Seen {
+    assert_eq!(world.request(1, id, asked_since(since, 0)), []);
+    let (job, _, work) = world.builder.started.last().cloned().expect("the check started");
+    assert_eq!(work, Work::Check(targets()));
+    for it in said {
+        assert_eq!(world.report(job, it.clone()), [], "a diagnostics check forwards nothing");
+    }
+    let (seen, done) = answer_of(&world.finish(job, ok, None));
+    assert!(done, "{seen:?}");
+    assert!(seen.ended && seen.failed.is_none(), "{seen:?}");
+    seen
+}
+
+/// The invariant: each answer says, against the last answer to the same client, exactly the
+/// diagnostics added (new), gone (fixed) and kept (unchanged), counted by id; an edit that
+/// only moves lines says nothing new and nothing fixed; a token the daemon does not hold
+/// answers everything new and says so. Control: the moved check with the line's text changed
+/// is a fixed one and a new one, so the id does read the line.
+#[test]
+fn a_diagnostics_check_says_what_is_new_fixed_and_unchanged_since_its_token() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "fn a() {}\nfn b() {}\n")]);
+    let warning = |line| said_at(Level::Warning, "function `b` is never used", line);
+    let error = |line| said_at(Level::Error, "mismatched types", line);
+
+    let first = checked(&mut world, 1, None, &[warning(2)], true);
+    assert_eq!(first.base, crate::Base::First);
+    assert_eq!(messages(&first.new), ["function `b` is never used"]);
+    assert!(first.fixed.is_empty() && first.unchanged.is_empty());
+    assert_eq!(world.session.views(), 0, "its view closed");
+
+    world.commit(&[("src/lib.rs", "fn a() {}\nfn b() {}\nfn c() -> u8 {}\n")]);
+    let added = checked(&mut world, 2, first.token, &[warning(2), error(3)], false);
+    assert_eq!(added.base, crate::Base::Held);
+    assert_eq!(messages(&added.new), ["mismatched types"], "the edit that adds an error");
+    assert_eq!(messages(&added.unchanged), ["function `b` is never used"]);
+    assert!(added.fixed.is_empty());
+
+    world.commit(&[("src/lib.rs", "fn a() {}\npub fn b() {}\nfn c() -> u8 {}\n")]);
+    let fixed = checked(&mut world, 3, added.token, &[error(3)], false);
+    assert!(fixed.new.is_empty(), "the edit that fixes a warning: {fixed:?}");
+    assert_eq!(messages(&fixed.fixed), ["function `b` is never used"]);
+    assert_eq!(messages(&fixed.unchanged), ["mismatched types"]);
+
+    world.commit(&[("src/lib.rs", "\n\nfn a() {}\npub fn b() {}\nfn c() -> u8 {}\n")]);
+    let moved = checked(&mut world, 4, fixed.token, &[error(5)], false);
+    assert!(moved.new.is_empty() && moved.fixed.is_empty(), "lines only moved: {moved:?}");
+    assert_eq!(messages(&moved.unchanged), ["mismatched types"]);
+    assert_eq!(moved.token, fixed.token, "the same diagnostics are the same base");
+
+    world.commit(&[("src/lib.rs", "\n\nfn a() {}\npub fn b() {}\nfn c() -> u16 {}\n")]);
+    let control = checked(&mut world, 5, moved.token, &[error(5)], false);
+    assert_eq!((control.new.len(), control.fixed.len()), (1, 1), "the control: {control:?}");
+
+    let unknown = checked(&mut world, 6, Some(ContentId([9; 32])), &[error(5)], false);
+    assert_eq!(unknown.base, crate::Base::Unknown);
+    assert_eq!(messages(&unknown.new), ["mismatched types"], "everything is new");
+}
+
+/// The invariant: a check still running at the request's wait is answered `ended: false`
+/// with its base kept and its token unchanged, the request over (its id free); its end then
+/// says nothing and moves no base. Control: the next request with the old token is diffed.
+#[test]
+fn a_diagnostics_check_past_its_wait_is_answered_still_running_and_keeps_its_base() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "fn a() {}\n")]);
+    let warning = said_at(Level::Warning, "function `a` is never used", 1);
+    let first = checked(&mut world, 1, None, &[warning.clone()], true);
+
+    world.tick(1_000);
+    assert_eq!(world.request(1, 2, asked_since(first.token, 20)), []);
+    let job = world.last_job();
+    assert_eq!(world.session.deadline(), Some(20_001_000));
+    assert_eq!(world.tick(20_000_999), []);
+    let (waited, done) = answer_of(&world.tick(20_001_000));
+    assert!(done && !waited.ended, "{waited:?}");
+    assert_eq!((waited.base, waited.token), (crate::Base::Held, first.token));
+    assert!(waited.new.is_empty() && waited.fixed.is_empty() && waited.unchanged.is_empty());
+    assert_eq!(world.session.deadline(), None);
+    assert!(world.session.live.is_empty(), "the request is over for its client");
+    assert_eq!(world.report(job, warning.clone()), []);
+    assert_eq!(world.finish(job, true, None), [], "its end says nothing more");
+    assert_eq!(world.session.views(), 0);
+
+    let again = checked(&mut world, 2, first.token, &[warning], true);
+    assert_eq!(again.base, crate::Base::Held, "the base was kept: {again:?}");
+    assert_eq!(again.unchanged.len(), 1);
+}
+
+/// The invariant: a check that could not run, or failed and said no error, is answered as
+/// blaze's failure (`failed`, Done not ok) and keeps the base. Control: a failed check with an
+/// error is the code's, answered as diagnostics.
+#[test]
+fn a_diagnostics_check_that_blaze_failed_is_said_as_blazes_and_keeps_the_base() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "fn a() {}\n")]);
+    let first = checked(&mut world, 1, None, &[], true);
+
+    world.request(1, 2, asked_since(first.token, 0));
+    let error = ApiError::new("the daemon's store broke", Some("store".to_owned()));
+    let (seen, done) = answer_of(&world.finish(world.last_job(), true, Some(error.clone())));
+    assert!(!done && seen.ended, "{seen:?}");
+    assert_eq!((seen.failed, seen.token), (Some(error), first.token));
+
+    world.request(1, 3, asked_since(first.token, 0));
+    let (seen, done) = answer_of(&world.finish(world.last_job(), false, None));
+    assert!(!done, "{seen:?}");
+    assert!(seen.failed.unwrap().what.contains("said no error"));
+
+    let code = checked(&mut world, 4, first.token, &[said_at(Level::Error, "e", 1)], false);
+    assert_eq!((code.base, code.new.len()), (crate::Base::Held, 1), "the control");
 }

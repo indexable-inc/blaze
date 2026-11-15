@@ -6,7 +6,11 @@
 //! fields: what a build changed, which names the input behind every run that follows. And
 //! why each run ran, by its [`Cause`]: first runs, a read that changed, an untracked read, a
 //! cycle (an evicted value is `evicted_asked`), so "which kinds reran, and why" is a count
-//! with no per-run record. Process-wide, as ingredient numbers are.
+//! with no per-run record. And how each row proved unchanged was proved (the validity census,
+//! [`Validity`]): by which of the shortcuts that look at no edge, or by its edges, and how many
+//! edges were compared, so which shortcut earns its keep is a count
+//! (docs/v2/plan/design/end-state.md, the review's point 4). Process-wide, as ingredient
+//! numbers are.
 //!
 //! [`Cause`]: super::Cause
 //!
@@ -64,7 +68,53 @@ pub(crate) const RAN_UNTRACKED: usize = 11;
 ///
 /// [`Cause::Cycle`]: super::Cause::Cycle
 pub(crate) const RAN_CYCLE: usize = 12;
-const KINDS: usize = 13;
+/// [`Storage::holds`] proved a row by its seal: its group's one check stood for it.
+///
+/// [`Storage::holds`]: super::storage::Storage::holds
+pub(crate) const PROVED_SEAL: usize = 13;
+/// [`Storage::holds`] proved a row by its durability: no input of its kind or above was
+/// written since the view it was verified in.
+///
+/// [`Storage::holds`]: super::storage::Storage::holds
+pub(crate) const PROVED_DURABILITY: usize = 14;
+/// [`Storage::holds`] proved a row by its summary: no bit of it was written since the view it
+/// was verified in (and its durability did not prove it).
+///
+/// [`Storage::holds`]: super::storage::Storage::holds
+pub(crate) const PROVED_SUMMARY: usize = 15;
+/// [`Storage::holds`] proved a row from the floor by its durability (and neither test from
+/// the row's own view proved it).
+///
+/// [`Storage::holds`]: super::storage::Storage::holds
+pub(crate) const PROVED_FLOOR_DURABILITY: usize = 16;
+/// [`Storage::holds`] proved a row from the floor by its summary.
+///
+/// [`Storage::holds`]: super::storage::Storage::holds
+pub(crate) const PROVED_FLOOR_SUMMARY: usize = 17;
+/// A walk of the changed set ended in this view and the row is not set apart: everything it
+/// did not reach holds (`frontier::unreached`, asked by [`Storage::holds`] last and by
+/// `frontier::clean` first).
+///
+/// [`Storage::holds`]: super::storage::Storage::holds
+pub(crate) const PROVED_WALK_END: usize = 18;
+/// A walk of this view is under way and the row is outside its reach (`frontier::unreached`).
+pub(crate) const PROVED_REACH: usize = 19;
+/// Of [`PROVED_WALK_END`] and [`PROVED_REACH`]: the rows `frontier::clean` proved for a fetch
+/// before any other proof was asked, so no shortcut ahead of it in [`Storage::holds`] had its
+/// turn.
+///
+/// [`Storage::holds`]: super::storage::Storage::holds
+pub(crate) const PROVED_FIRST: usize = 20;
+/// The claim-free walk proved a row by comparing every one of its edges (`verify::walk`).
+pub(crate) const EDGE_WALKED: usize = 21;
+/// A row was on the claim-free walk's stack when the walk gave up: its edges compared so far
+/// are counted, and the claimed path looks at the walk's root again.
+pub(crate) const EDGE_GAVE_UP: usize = 22;
+/// The claimed path compared a row's edges (`function::verify_claimed`), whatever it found.
+pub(crate) const EDGE_CLAIMED: usize = 23;
+/// Edges compared by the rows of [`EDGE_WALKED`], [`EDGE_GAVE_UP`] and [`EDGE_CLAIMED`].
+const EDGES_COMPARED: usize = 24;
+const KINDS: usize = 25;
 
 /// The most reads one run of each ingredient held on its thread's edge stack at its end since
 /// the last [`take`], which resets it: a mark, not a sum, so one word an ingredient shared by
@@ -113,6 +163,65 @@ pub struct Counts {
     /// Of `executed`, runs for a cycle: a stale provisional row, or a verify that re-entered
     /// a cycle. A cycle whose results are never reused runs here on every build.
     pub ran_cycle: u64,
+    /// How its rows were proved unchanged: the validity census.
+    pub validity: Validity,
+}
+
+/// The validity census of one ingredient: how its rows of an earlier view were proved
+/// unchanged, by the proof that answered first in the order the engine asks them, and what
+/// proving by edges cost.
+///
+/// A row is counted where its proof is made, so a proof whose mark another task won, and the
+/// seal pass's question whether a row may go behind a seal (it asks `Storage::holds` as a
+/// fetch does), are counted too: the `proved_*` sum can pass `verified` by those.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Validity {
+    /// By its seal: its group's one check stood for it.
+    pub proved_seal: u64,
+    /// By its durability, from the view it was verified in.
+    pub proved_durability: u64,
+    /// By its summary, from the view it was verified in.
+    pub proved_summary: u64,
+    /// By its durability, from the floor.
+    pub proved_floor_durability: u64,
+    /// By its summary, from the floor.
+    pub proved_floor_summary: u64,
+    /// By a walk of the changed set that ended in this view and did not set it apart.
+    pub proved_walk_end: u64,
+    /// By the reach of a walk under way: the row is outside it.
+    pub proved_reach: u64,
+    /// Of `proved_walk_end` and `proved_reach`, those asked for a fetch before any other
+    /// proof: no shortcut ahead of them had its turn.
+    pub proved_first: u64,
+    /// Rows the claim-free walk proved by comparing every edge.
+    pub edge_walked: u64,
+    /// Rows on a claim-free walk's stack when it gave up.
+    pub edge_gave_up: u64,
+    /// Rows whose edges the claimed path compared, whatever it found.
+    pub edge_claimed: u64,
+    /// Edges compared for the three counts above.
+    pub edges_compared: u64,
+}
+
+impl Validity {
+    /// Each count with `other`'s added.
+    #[must_use]
+    pub fn plus(self, other: Validity) -> Validity {
+        Validity {
+            proved_seal: self.proved_seal + other.proved_seal,
+            proved_durability: self.proved_durability + other.proved_durability,
+            proved_summary: self.proved_summary + other.proved_summary,
+            proved_floor_durability: self.proved_floor_durability + other.proved_floor_durability,
+            proved_floor_summary: self.proved_floor_summary + other.proved_floor_summary,
+            proved_walk_end: self.proved_walk_end + other.proved_walk_end,
+            proved_reach: self.proved_reach + other.proved_reach,
+            proved_first: self.proved_first + other.proved_first,
+            edge_walked: self.edge_walked + other.edge_walked,
+            edge_gave_up: self.edge_gave_up + other.edge_gave_up,
+            edge_claimed: self.edge_claimed + other.edge_claimed,
+            edges_compared: self.edges_compared + other.edges_compared,
+        }
+    }
 }
 
 impl Counts {
@@ -131,6 +240,18 @@ impl Counts {
             ran_changed,
             ran_untracked,
             ran_cycle,
+            proved_seal,
+            proved_durability,
+            proved_summary,
+            proved_floor_durability,
+            proved_floor_summary,
+            proved_walk_end,
+            proved_reach,
+            proved_first,
+            edge_walked,
+            edge_gave_up,
+            edge_claimed,
+            edges_compared,
         ] = gained;
         Counts {
             executed,
@@ -147,6 +268,20 @@ impl Counts {
             ran_changed,
             ran_untracked,
             ran_cycle,
+            validity: Validity {
+                proved_seal,
+                proved_durability,
+                proved_summary,
+                proved_floor_durability,
+                proved_floor_summary,
+                proved_walk_end,
+                proved_reach,
+                proved_first,
+                edge_walked,
+                edge_gave_up,
+                edge_claimed,
+                edges_compared,
+            },
         }
     }
 }
@@ -250,6 +385,76 @@ pub(crate) fn reads(ingredient: u32, reads: Reads) {
     }
 }
 
+/// Counts a row of `ingredient` proved unchanged with no look at its edges, by the shortcut
+/// `by` (a `PROVED_*` kind): the validity census, counted where the proof is made.
+#[inline(never)]
+pub(crate) fn proved(ingredient: u32, by: usize) {
+    #[cfg(test)]
+    let by = probe::wired(by);
+    with_counters(ingredient, |counters| bump(counters, by, 1));
+}
+
+/// Counts a row of `ingredient` whose edges were looked at, as `rows` says ([`EDGE_WALKED`],
+/// [`EDGE_GAVE_UP`] or [`EDGE_CLAIMED`]), and the `compared` edges compared for it.
+#[inline(never)]
+pub(crate) fn edges(ingredient: u32, rows: usize, compared: u64) {
+    with_counters(ingredient, |counters| {
+        bump(counters, rows, 1);
+        bump(counters, EDGES_COMPARED, compared);
+    });
+}
+
+/// The edges the claimed path compares for one row, counted when it stops looking: at its
+/// end, at the first edge that changed, or at an unwind. Nothing is counted while it lives
+/// (a verify of an edge may wait, and the task may resume on another thread).
+pub(crate) struct Claimed {
+    ingredient: u32,
+    pub(crate) compared: u64,
+}
+
+impl Claimed {
+    pub(crate) fn of(ingredient: u32) -> Claimed {
+        Claimed { ingredient, compared: 0 }
+    }
+}
+
+impl Drop for Claimed {
+    fn drop(&mut self) {
+        edges(self.ingredient, EDGE_CLAIMED, self.compared);
+    }
+}
+
+/// What a test plants on its own thread: the control of the validity census's test.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        /// The planted bug: this thread counts a proof by durability as one by summary, a
+        /// counter wired to the wrong branch.
+        pub(crate) static MISWIRED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn wired(by: usize) -> usize {
+        if by == super::PROVED_DURABILITY && MISWIRED.with(Cell::get) {
+            super::PROVED_SUMMARY
+        } else {
+            by
+        }
+    }
+}
+
+/// The validity census of `ingredient` now, summed over every thread, taken or not: for a
+/// test, as [`now`] is.
+#[cfg(test)]
+pub(crate) fn validity_now(ingredient: u32) -> Validity {
+    let mut gained = [0u64; KINDS];
+    for (what, gained) in gained.iter_mut().enumerate() {
+        *gained = now(ingredient, what);
+    }
+    Counts::of(gained, 0).validity
+}
+
 fn bump(counters: &Counters, what: usize, by: u64) {
     let at = &counters.now[what];
     at.store(at.load(Ordering::Relaxed) + by, Ordering::Relaxed);
@@ -271,6 +476,16 @@ fn with_counters(ingredient: u32, f: impl FnOnce(&Counters)) {
             f(counters);
         }
     });
+}
+
+/// Counter `what` of `ingredient` now, summed over every thread, taken or not: for a test
+/// that counts one query's work without taking the process's counts from the tests beside it.
+#[cfg(test)]
+pub(crate) fn now(ingredient: u32, what: usize) -> u64 {
+    blocks()
+        .filter_map(|block| block.counters.get(ingredient as usize))
+        .map(|counters| counters.now[what].load(Ordering::Relaxed))
+        .sum()
 }
 
 /// What each ingredient's counts gained since the last take, summed over every thread, and the

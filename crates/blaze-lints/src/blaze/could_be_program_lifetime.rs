@@ -1,4 +1,4 @@
-//! `could_be_program_lifetime` (in `blaze::edition`, allowed by default): a type of the
+//! `could_be_program_lifetime` (in `blaze::suggest`, allowed by default): a type of the
 //! crate whose every instance already lives until the program exits, and so could be
 //! `#[blaze::program_lifetime]`, held in the program arena by 4-byte `Ref32`s with no
 //! reference count (docs/v2/plan/design/facts.md "The two lints").

@@ -134,7 +134,10 @@ pub(crate) fn try_lint_once(
                 let root = db.source_root(root).source_root(&db);
                 let Some(path) = root.path_for_file(&file) else { continue };
                 let name = path.to_string().trim_start_matches('/').to_owned();
-                if module == crate_root && name == "src/lib.rs" {
+                // A library's root, else a binary's: a fixture that writes both lints the library.
+                if module == crate_root
+                    && (name == "src/lib.rs" || (name == "src/main.rs" && linted.is_none()))
+                {
                     linted = Some(krate);
                 }
                 if names.insert(file, name.clone()).is_none() {
@@ -142,7 +145,8 @@ pub(crate) fn try_lint_once(
                 }
             }
         }
-        let krate = linted.expect("the fixture writes the crate it lints at `/src/lib.rs`");
+        let krate = linted
+            .expect("the fixture writes the crate it lints at `/src/lib.rs` or `/src/main.rs`");
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
         let setup =
             Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
@@ -163,6 +167,206 @@ pub(crate) fn main_crate(db: &Db) -> hir::Crate {
         .into_iter()
         .find(|it| it.display_name(db).is_some_and(|it| it.to_string() == "main"))
         .expect("the fixture has a crate `main`")
+}
+
+/// The `Setup` of a lint test's flags.
+fn setup_of(flags: &str) -> Setup {
+    let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
+    Setup {
+        command_line: CommandLine::parse(&flags).expect("the flags read"),
+        conf: Conf::default(),
+    }
+}
+
+/// The text of the fixture's last file (the crate `main`'s `src/lib.rs`), the findings `flags`
+/// turn on in it, and the first substitution of each finding's first suggestion, whatever its
+/// applicability, in order.
+pub(crate) fn suggested_in(
+    fixture: &str,
+    flags: &str,
+) -> (String, Vec<String>, Vec<(syntax::TextRange, String)>) {
+    use syntax::{TextRange, TextSize};
+    let fx = fixture::db(fixture);
+    let file = *fx.files().last().expect("src/lib.rs");
+    let db = fx.into_db();
+    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let file = file.file_id(&db);
+    let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
+    let setup = setup_of(flags);
+    let text = db.file_text(file).text(&db).to_string();
+    let found = blaze_query::db::attach(&db, || {
+        check(&db, krate, &setup, &name_of).expect("the file is named")
+    });
+    let messages = found.iter().map(|it| it.diagnostic.message.clone()).collect();
+    let mut parts: Vec<(TextRange, String)> = found
+        .iter()
+        .filter_map(|it| it.diagnostic.suggestions.first()?.substitutions.first())
+        .flatten()
+        .map(|(span, text)| {
+            (TextRange::new(TextSize::new(span.lo), TextSize::new(span.hi)), text.clone())
+        })
+        .collect();
+    parts.sort_by_key(|(range, _)| (range.start(), range.end()));
+    (text, messages, parts)
+}
+
+/// The fixture's last file after every suggestion `flags` turn on is made, a `MaybeIncorrect`
+/// one too (which `blaze check --fix` leaves to the author), after checking that the
+/// suggestions changed it, that linting it again finds nothing, and that it offers nothing
+/// more, so making the suggestions again changes nothing. `header` is the fixture before the
+/// file's text, which the made file is linted again under.
+pub(crate) fn offered_in(header: &str, main: &str, flags: &str) -> String {
+    let (before, _, parts) = suggested_in(&format!("{header}{main}"), flags);
+    assert!(!parts.is_empty(), "the lints of `{flags}` offer a fix of:\n{before}");
+    let mut after = before.clone();
+    for (range, text) in parts.iter().rev() {
+        after.replace_range(std::ops::Range::<usize>::from(*range), text);
+    }
+    assert_ne!(after, before, "the suggestions of `{flags}` changed the file");
+    let (_, left, more) = suggested_in(&format!("{header}{after}"), flags);
+    assert!(left.is_empty(), "the file the suggestions made lints clean:\n{after}\n{left:#?}");
+    assert!(more.is_empty(), "the file the suggestions made has nothing left to offer");
+    after
+}
+
+/// The fixture's last file after `blaze check --fix` with `flags`, after checking that the fix
+/// changed it, that linting it again finds nothing, and that fixing it again changes nothing.
+pub(crate) fn fixed_in(fixture: &str, flags: &str) -> String {
+    let fx = fixture::db(fixture);
+    let file = *fx.files().last().expect("src/lib.rs");
+    let mut db = fx.into_db();
+    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let file = file.file_id(&db);
+    let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
+    let setup = setup_of(flags);
+    let before = db.file_text(file).text(&db).to_string();
+    let made =
+        crate::fix::fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let after = db.file_text(file).text(&db).to_string();
+    assert_ne!(after, before, "the fix of `{flags}` changed the file");
+    assert!(made.applied > 0, "the fix of `{flags}` made a suggestion");
+    blaze_query::db::attach(&db, || {
+        let found = check(&db, krate, &setup, &name_of).expect("the file is named");
+        let left: Vec<&str> = found.iter().map(|it| it.diagnostic.message.as_str()).collect();
+        assert!(left.is_empty(), "the fixed file lints clean:\n{after}\n{left:#?}");
+    });
+    let again =
+        crate::fix::fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let twice = db.file_text(file).text(&db).to_string();
+    assert_eq!(again.applied, 0, "the fixed file has nothing left to fix:\n{twice}");
+    assert_eq!(twice, after, "fixing the fixed file changes nothing");
+    after
+}
+
+/// Makes the fixture's crate `main` a crate of `target` built from a manifest target of kind
+/// `manifest`, as blaze's lowering sets them (`blaze-lower`'s `crates::target_kind` and
+/// `manifest_kind`); its cfg is the fixture's (`cfg:test` on the crate for a `--test` build).
+fn built_as(fx: &mut fixture::Fixture, target: base_db::TargetKind, manifest: base_db::TargetKind) {
+    let main = blaze_query::db::attach(fx.db(), || main_crate(fx.db()).base());
+    // clone: the crate's data, to change two fields of
+    let mut data = blaze_query::db::attach(fx.db(), || main.data(fx.db()).clone());
+    data.target_kind = target;
+    data.manifest_kind = manifest;
+    main.set_data(fx.db_mut(), data);
+    fx.db_mut().note_crates_changed();
+}
+
+/// The `--test` build of a library: a test crate whose manifest target is the library.
+fn library_built_with_test(fx: &mut fixture::Fixture) {
+    let lib = base_db::TargetKind::Lib { is_proc_macro: false };
+    built_as(fx, base_db::TargetKind::Test, lib);
+}
+
+/// An integration test: built only with `--test`, its manifest target a test.
+fn integration_test(fx: &mut fixture::Fixture) {
+    built_as(fx, base_db::TargetKind::Test, base_db::TargetKind::Test);
+}
+
+/// The refinement: every `#[expect]` has one judge. One on code the plain build has too is the
+/// plain build's to judge, and a library's `--test` build never says it unfulfilled; one the
+/// plain build does not have (in code only `cfg(test)` keeps, on a `#[test]` function, under
+/// `cfg_attr(test, ..)`) is judged by the test build; a target built only with `--test`
+/// judges all of its own. (dst-1113-15: an expectation the plain build saw fulfilled was said
+/// unfulfilled by the test build, whose lints leave its production code unjudged.)
+#[test]
+fn a_test_build_leaves_production_expectations_to_the_plain_build() {
+    const FLAGS: &str = "-A clippy::all --warn=blaze::tmp_path";
+    const UNFULFILLED: &str = "lint expectation is unfulfilled";
+    let production = r#"
+#[expect(blaze::tmp_path, reason = "a production item the lint does not fire on")]
+pub const HOME: &str = "/home";
+"#;
+    let in_tests = r#"
+pub const HOME: &str = "/home";
+#[cfg(test)]
+mod tests {
+    #[expect(blaze::tmp_path, reason = "an item only the test build has")]
+    pub const HERE: &str = "/here";
+}
+"#;
+    let fixture = |cfg: &str, main: &str| {
+        format!(
+            "{}//- /src/lib.rs crate:main deps:std{cfg}\n{}",
+            STD.trim_start_matches('\n'),
+            main.trim_start_matches('\n')
+        )
+    };
+    let count = |out: &str| out.matches(UNFULFILLED).count();
+    // 1. The plain build of a library judges its production expectation.
+    let plain = lint(&fixture("", production), FLAGS);
+    assert_eq!(count(&plain), 1, "the plain build:\n{plain}");
+    // 2. The library's `--test` build leaves it to the plain build.
+    let test = lint_given(
+        &fixture(" cfg:test", production),
+        FLAGS,
+        Conf::default(),
+        library_built_with_test,
+    );
+    assert_eq!(count(&test), 0, "the library's test build:\n{test}");
+    // 3. One inside `#[cfg(test)]` is the test build's alone, and judged there.
+    let only = lint_given(
+        &fixture(" cfg:test", in_tests),
+        FLAGS,
+        Conf::default(),
+        library_built_with_test,
+    );
+    assert_eq!(count(&only), 1, "the library's test build, an expectation in its tests:\n{only}");
+    // 4. A target built only with `--test` has no other build to leave it to.
+    let integration =
+        lint_given(&fixture(" cfg:test", production), FLAGS, Conf::default(), integration_test);
+    assert_eq!(count(&integration), 1, "an integration test:\n{integration}");
+    // 5. One on a `#[test]` function outside a `cfg(test)` module: the test build judges it.
+    let test_fn = r#"
+#[expect(blaze::tmp_path, reason = "a test function the lint does not fire in")]
+#[test]
+fn finds_home() {}
+"#;
+    let out =
+        lint_given(&fixture(" cfg:test", test_fn), FLAGS, Conf::default(), library_built_with_test);
+    assert_eq!(
+        count(&out),
+        1,
+        "the library's test build, an expectation on a `#[test]` function:\n{out}"
+    );
+    // 6. One written under `cfg_attr(test, ..)` is the test build's alone, and judged there.
+    let under_test = r#"
+#[cfg_attr(test, expect(blaze::tmp_path, reason = "only the test build has this attribute"))]
+pub const HOME: &str = "/home";
+"#;
+    let out = lint_given(
+        &fixture(" cfg:test", under_test),
+        FLAGS,
+        Conf::default(),
+        library_built_with_test,
+    );
+    assert_eq!(
+        count(&out),
+        1,
+        "the library's test build, an expectation under `cfg_attr(test)`:\n{out}"
+    );
+    // 7. The plain build does not have that attribute at all.
+    let out = lint(&fixture("", under_test), FLAGS);
+    assert_eq!(count(&out), 0, "the plain build, an expectation under `cfg_attr(test)`:\n{out}");
 }
 
 #[test]

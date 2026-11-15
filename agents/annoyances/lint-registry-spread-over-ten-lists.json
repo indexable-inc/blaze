@@ -1,0 +1,14 @@
+{
+ "id": "lint-registry-spread-over-ten-lists",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane suspicious-code lints, fix-hello-1113",
+ "where": "crates/blaze-lints/src/blaze.rs (enum Lint, Lint::ALL, kind, name, docs_url, help, check_node); crates/blaze-lints/src/blaze/exempt.rs tag; crates/blaze-lint-defs/src/lints.rs BLAZE; crates/blaze-lint-defs/src/names.rs blaze::internal; crates/blaze-lint-defs/src/tests.rs count",
+ "what": "One new blaze lint is ten edits in five files, each a hand-kept list in the same order (the enum, ALL, six matches, the lint-defs table, the group, a count); four lanes adding lints at once all edit the same lines and bump the same count.",
+ "cost": "17 lints took about 170 hand edits; each lane must read every registry file's diff before each edit, and a missed list is a compile error or a test failure found only when the main agent builds",
+ "cause": "a lint's facts (name, kind, docs anchor, help, description, group) live in parallel lists keyed by position and variant, not in one record per lint",
+ "class": "a closed set whose members' facts are spread over parallel lists, so a new member touches every list",
+ "prevention": "one declaration per lint (a `const` record or one table row with name, kind, help, description, group) from which the enum, ALL, the matches, blaze-lint-defs' table and the group are derived by reflection or a const table, so a new lint is one row and the count follows",
+ "workaround": "add the variant last in each list, after reading `git --no-pager diff --no-ext-diff HEAD` of the file; bump the count by your lints on top of what other lanes already bumped",
+ "fix": "not yet",
+ "state": "open"
+}

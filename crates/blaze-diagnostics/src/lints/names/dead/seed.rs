@@ -114,7 +114,7 @@ impl<'db> Crate<'_, '_, 'db> {
             _ => return None,
         };
         let adt = defs.get(Id::Adt(derive.loc(self.cx.db).adt))?;
-        Some(self.cx.syntax_view(defs[adt].node?))
+        Some(self.cx.syntax_view(defs.node(self.cx, adt)?))
     }
 
     /// The level of `dead_code` at `def` (rustc's `lint_level_spec_at_node`).
@@ -123,7 +123,7 @@ impl<'db> Crate<'_, '_, 'db> {
         if let Some(it) = slot.get() {
             return it;
         }
-        let level = match (self.defs[def].node, self.derived_from(def)) {
+        let level = match (self.defs.node(self.cx, def), self.derived_from(def)) {
             (Some(node), _) => self.levels.at(self.cx, self.cx.syntax_view(node)),
             (None, Some(adt)) => self.levels.at_derived(self.cx, adt),
             (None, None) => self.levels.at(self.cx, self.crate_root()),
@@ -135,7 +135,7 @@ impl<'db> Crate<'_, '_, 'db> {
     fn crate_root(&self) -> InFile<ast::Node<'db>> {
         let db = self.cx.db;
         let file: HirFileId = self.cx.krate.root_module(db).definition_source_file_id(db);
-        InFile::new(file, self.cx.vsema.parse_or_expand(file))
+        InFile::new(file, self.cx.root(file))
     }
 
     /// rustc's `has_allow_dead_code_or_lang_attr`: `Some(true)` when `dead_code` is allowed or
@@ -247,7 +247,7 @@ impl<'db> Crate<'_, '_, 'db> {
             if d.kind != Kind::Fn {
                 continue;
             }
-            let Some(node) = d.node else { continue };
+            let Some(node) = self.defs.node(self.cx, def) else { continue };
             let Some(call) = node.file_id.macro_file() else { continue };
             let test = match call.loc(db).def.kind {
                 MacroDefKind::BuiltInAttr(_, it) => it.is_test() || it.is_bench(),

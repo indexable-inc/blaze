@@ -7,5 +7,5 @@ open Blaze
 set_option linter.unusedVariables false
 
 def calls.quadruple (x : U32) : Result U32 := do
-  let t2 ← calls.double x
-  calls.double t2
+  let t0 ← calls.double x
+  calls.double t0

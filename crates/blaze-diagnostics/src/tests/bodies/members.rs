@@ -1040,6 +1040,49 @@ For more information about this error, try `rustc --explain E0436`.
     );
 }
 
+/// The method of the closest name is looked for among the items of every trait, in scope or
+/// not, and only the traits with an item of a close name are probed for it
+/// (`TraitIndex::with_item_close_to`): `Near::frob` is found though `Near` is not imported, and
+/// `Far`, which has no such item, is not asked.
+#[test]
+fn a_method_of_a_similar_name_in_a_trait_that_is_not_in_scope() {
+    let source = r#"struct S;
+mod a {
+    pub trait Near { fn frob(&self) {} }
+    impl Near for super::S {}
+}
+mod b {
+    pub trait Far { fn unrelated(&self) {} }
+    impl Far for super::S {}
+}
+fn main() {
+    S.frobb();
+}
+"#;
+    assert_eq!(
+        ui("similar-in-trait.rs", "2021", source),
+        r#"error[E0599]: no method named `frobb` found for struct `S` in the current scope
+  --> $DIR/similar-in-trait.rs:11:7
+   |
+LL | struct S;
+   | -------- method `frobb` not found for this struct
+...
+LL |     S.frobb();
+   |       ^^^^^
+   |
+help: there is a method `frob` with a similar name
+   |
+LL -     S.frobb();
+LL +     S.frob();
+   |
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0599`.
+"#
+    );
+}
+
 #[test]
 fn an_associated_item_a_pattern_path_names_that_its_type_lacks() {
     // tests/ui/error-codes/E0599.rs

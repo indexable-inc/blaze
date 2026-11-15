@@ -1,5 +1,5 @@
 //! What the maintainer publishes (design §9): one [`ScopeInput`] per module, one
-//! [`CrateResolution`] per crate, and the singleton [`Resolutions`] that finds the latter. Each is
+//! [`CrateResolution`] per crate, found through a slot of the crate's own ([`enter`]). Each is
 //! set only when its content changed, so a query reads a change only when its slice changed. A
 //! read of a published scope during a maintainer run is noted (`reads`): another crate's, or
 //! one of this crate the run does not hold.
@@ -94,12 +94,11 @@ pub(in crate::nameres) struct CrateResolution {
     records: OwnedRecords,
 }
 
-/// Every maintained crate's [`CrateResolution`]: changes only when a crate gains or loses its
-/// state.
-#[blaze_query::input(singleton)]
-pub(in crate::nameres) struct Resolutions {
-    #[returns(ref)]
-    crates: HashMap<Crate, CrateResolution, Global>,
+/// The kind of the slot that finds `krate`'s resolution: `HIGH` for a library crate (so a
+/// reader of a library crate's resolution reads nothing below `HIGH`), `MEDIUM` for a
+/// workspace crate (it changes only as the crate gains or loses its state).
+fn slot_durability(db: &Db, krate: Crate) -> Durability {
+    base_db::crate_durability(db, krate).max(Durability::MEDIUM)
 }
 
 fn scope_input(id: blaze_query::db::Id) -> ScopeInput {
@@ -108,6 +107,39 @@ fn scope_input(id: blaze_query::db::Id) -> ScopeInput {
 
 fn resolution(id: blaze_query::db::Id) -> CrateResolution {
     <CrateResolution as blaze_query::db::FromId>::from_id(id)
+}
+
+/// What a read of one of this file's rows was of (`crate::nameres::name_read`): `name` is the
+/// row's name as the engine has it, `key` its key.
+pub(in crate::nameres) fn name_read(
+    db: &Db,
+    name: &str,
+    kind: blaze_query::db::ReadKind,
+    key: blaze_query::db::Id,
+) -> Option<crate::nameres::NameRead> {
+    use crate::nameres::NameRead;
+    use blaze_query::db::ReadKind;
+    Some(match (name, kind) {
+        ("ScopeInput::name", ReadKind::Function) => {
+            let (input, name) = ScopeInput_name::arguments(db, key)?;
+            NameRead::Name(input.module(db), name)
+        }
+        ("ScopeInput::legacy_macro", ReadKind::Function) => {
+            let (input, name) = ScopeInput_legacy_macro::arguments(db, key)?;
+            NameRead::Name(input.module(db), name)
+        }
+        ("ScopeInput::traits", ReadKind::Function) => {
+            NameRead::Traits(scope_input(key).module(db))
+        }
+        ("scope", ReadKind::InputField(_)) => NameRead::WholeScope(scope_input(key).module(db)),
+        ("children", ReadKind::InputField(_)) => NameRead::Children(scope_input(key).module(db)),
+        // Which module a scope is of, and a module's row (its origin, visibility, parent and
+        // the id of its scope): what a name means is read through the scope's own rows.
+        ("module", ReadKind::InputField(_)) | ("CrateResolution::module", ReadKind::Function) => {
+            NameRead::Handle
+        }
+        _ => return None,
+    })
 }
 
 // What `nameres.rs` reads.
@@ -185,11 +217,16 @@ pub(in crate::nameres) fn published_records(db: &Db, id: blaze_query::db::Id) ->
     resolution(id).records(db)
 }
 
-/// `krate`'s entry of [`Resolutions`]: what a reader of one crate's resolution depends on, so a
-/// crate that gains or loses its resolution leaves every other crate's readers as they were.
+/// `krate`'s resolution, as its maintainer entered it ([`enter`]): a slot of the crate's own
+/// (`base_db::Crate::give`), in the crate's seal group.
+///
+/// The invariant: a crate that gains or loses its resolution writes that crate's slot and no
+/// other, so no reader of another crate's resolution verifies again and no other crate's seal
+/// is checked. Until 2026-11-12 two maps of every crate held them (`Resolutions` and
+/// `LibraryResolutions`), which every crate's rows read.
 #[blaze_query::tracked(returns(copy))]
 fn resolution_of(db: &Db, krate: Crate) -> Option<CrateResolution> {
-    Resolutions::try_get(db)?.crates(db).get(&krate).copied()
+    krate.given::<CrateResolution, CrateResolution>(db).copied()
 }
 
 /// The crate's def map as the maintainer published it, `None` when no maintainer ran for it.
@@ -225,7 +262,6 @@ pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, Lo
 /// write that changes none of them runs no `crate_local_def_map` of the crate again.
 #[cfg(test)]
 pub(in crate::nameres) struct Slices {
-    resolutions: HashMap<Crate, CrateResolution, Global>,
     resolution: CrateResolution,
     root: ModuleId,
     local: LocalDefMap,
@@ -238,10 +274,10 @@ pub(in crate::nameres) struct Slices {
 #[cfg(test)]
 impl Slices {
     pub(in crate::nameres) fn of(db: &Db, krate: Crate) -> Slices {
-        let resolutions = Resolutions::get(db).crates(db);
-        let resolution = *resolutions.get(&krate).expect("the crate is maintained");
+        let resolution = *krate
+            .given::<CrateResolution, CrateResolution>(db)
+            .expect("the crate is maintained");
         Slices {
-            resolutions: resolutions.clone(), // clone: a test's snapshot of the crate -> input map
             resolution,
             root: resolution.root(db),
             local: LocalDefMap { extern_prelude: resolution.local(db).extern_prelude.clone() },
@@ -255,7 +291,6 @@ impl Slices {
     /// The fields that differ between `self` and `other`, by name, `data` with both values.
     pub(in crate::nameres) fn differing(&self, other: &Slices) -> Vec<String> {
         let fields = [
-            ("resolutions", self.resolutions == other.resolutions),
             ("resolution", self.resolution == other.resolution),
             ("root", self.root == other.root),
             ("local", self.local == other.local),
@@ -287,7 +322,12 @@ pub(super) fn set_scope(
 ) -> bool {
     let Some(input) = *slot else {
         let durability = base_db::crate_durability(&*db, krate);
-        *slot = Some(ScopeInput::new(db, durability, module, scope, children));
+        let input = ScopeInput::new(db, durability, module, scope, children);
+        // The crate's own input, of the crate's seal group.
+        if let Some(group) = krate.seal_group_of(&*db) {
+            input.seal_group(db, group);
+        }
+        *slot = Some(input);
         return true;
     };
     let mut set = false;
@@ -330,7 +370,7 @@ pub(super) struct Assembled {
 }
 
 /// Sets each field of the crate's resolution that differs from `new` (makes the input for a
-/// crate first seen, and enters it in [`Resolutions`]); the number of fields set.
+/// crate first seen, and enters it in the crate's slot, [`enter`]); the number of fields set.
 pub(super) fn set_resolution(
     db: &mut Db,
     krate: Crate,
@@ -360,6 +400,10 @@ pub(super) fn set_resolution(
             session_macros,
             records.expect("nameres delta: a crate's first resolution has its records"),
         );
+        // The crate's own input, of the crate's seal group.
+        if let Some(group) = krate.seal_group_of(&*db) {
+            it.seal_group(db, group);
+        }
         *slot = Some(it);
         enter(db, krate, Some(it));
         return 1;
@@ -404,28 +448,16 @@ pub(super) fn set_resolution(
     set
 }
 
-/// Enters `krate`'s resolution in [`Resolutions`] (`None` takes it out).
+/// Enters `krate`'s resolution in the crate's slot (`None` takes it out): where
+/// [`resolution_of`] looks. Writes nothing when the slot holds it already.
 pub(super) fn enter(db: &mut Db, krate: Crate, resolution: Option<CrateResolution>) {
-    match Resolutions::try_get(db) {
-        Some(all) => {
-            if all.crates(db).get(&krate).copied() == resolution {
-                return;
-            }
-            // clone: the crate -> input map, once per crate gained or lost
-            let mut crates = all.crates(db).clone();
-            match resolution {
-                Some(it) => crates.insert(krate, it),
-                None => crates.remove(&krate),
-            };
-            all.set_crates(db).to(crates);
-        }
-        None => {
-            let mut crates = HashMap::new_in(Global);
-            if let Some(it) = resolution {
-                crates.insert(krate, it);
-            }
-            // MEDIUM: set only as a crate gains or loses its state; std's def maps read it too.
-            _ = Resolutions::new(db, Durability::MEDIUM, crates);
-        }
+    if krate.given::<CrateResolution, CrateResolution>(&*db).copied() == resolution {
+        return;
     }
+    let given = match resolution {
+        Some(it) => base_db::Given::new(it),
+        None => base_db::Given::default(),
+    };
+    let durability = slot_durability(&*db, krate);
+    krate.give::<CrateResolution>(db, given, durability);
 }

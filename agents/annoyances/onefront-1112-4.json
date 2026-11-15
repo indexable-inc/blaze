@@ -1,0 +1,18 @@
+{
+ "id": "onefront-1112-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onefront-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs (`Roots`)",
+ "what": "Seven per-checkout slots (`plans`, `fronts`, `outputs`, `sized`, `answers`, `walked`, `stills`) each hold `the last one`, each with its own rule for when it is dropped; making one of them keyed (`plans`) meant reading every site of the other six to see which assumed the last plan was the only plan.",
+ "cost": "most of the reading for the plan store; `answers`, `sized`, `outputs` left single because their validity rules could not be changed blind",
+ "cause": "each slot was added for one sequence (no-op build, edit, edit) and `the last` was the cheapest key",
+ "whys": [
+  "a checkout was assumed to have one request shape at a time",
+  "nothing measured a switch until 2026-11-12"
+ ],
+ "class": "single-slot cache",
+ "prevention": "proposed: one `Kept<K, V>` store type in serve (keyed, bounded by footprint, least recently used let go) that every per-checkout slot uses, and a lint row banning `Vec<Option<_>>` slots in `Roots`",
+ "workaround": "`keep_plan`/`use_plan` for plans only",
+ "fix": "plans written in this lane; the rest not done",
+ "state": "open"
+}

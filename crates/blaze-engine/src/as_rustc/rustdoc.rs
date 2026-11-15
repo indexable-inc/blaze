@@ -26,13 +26,13 @@ pub(crate) fn command() -> ! {
         {
             Ok(()) => 0,
             Err(error) => {
-                eprintln!("error: writing rustdoc's answer: {error}");
+                blaze_report::errln!("error: writing rustdoc's answer: {error}");
                 1
             }
         },
         Err(why) => {
             let shown: Vec<_> = args.iter().map(|it| it.to_string_lossy()).collect();
-            eprintln!(
+            blaze_report::errln!(
                 "error: blaze can't answer `rustdoc {}` for a build script: {why}",
                 shown.join(" ")
             );

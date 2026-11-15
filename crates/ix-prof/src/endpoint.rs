@@ -887,25 +887,24 @@ mod tests {
 
     use super::{Endpoint, FILE, PrivateDir};
 
-    struct Tmp(std::path::PathBuf);
+    /// A directory of the given mode, inside a [`blaze_core::temp::TempDir`] that also holds
+    /// what a test makes beside it (a link to it) and is removed with all of it on drop.
+    struct Tmp(std::path::PathBuf, blaze_core::temp::TempDir);
 
     impl Tmp {
         fn new(what: &str, mode: u32) -> Tmp {
-            let dir = std::env::temp_dir().join(format!(
-                "ix-prof-endpoint-{what}-{}-{}",
-                std::process::id(),
-                crate::nonce()
-            ));
+            let tmp = blaze_core::temp::TempDir::for_test(&format!("ix-prof-endpoint-{what}-"));
+            let dir = tmp.join("dir");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
-            Tmp(dir)
+            Tmp(dir, tmp)
         }
     }
 
     impl Drop for Tmp {
         fn drop(&mut self) {
+            // A mode the test left closed would keep the TempDir from removing what it holds.
             let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -1099,19 +1098,15 @@ mod tests {
     /// A disk image attached for one test, detached and deleted on drop (a failed assertion too).
     #[cfg(target_os = "macos")]
     struct Image {
-        base: std::path::PathBuf,
+        /// Removed with the image and its mount point once the image is detached.
+        base: blaze_core::temp::TempDir,
         mnt: std::path::PathBuf,
     }
 
     #[cfg(target_os = "macos")]
     impl Image {
         fn attach(what: &str, attach: &[&str]) -> Image {
-            let base = std::env::temp_dir().join(format!(
-                "ix-prof-endpoint-{what}-{}-{}",
-                std::process::id(),
-                crate::nonce()
-            ));
-            std::fs::create_dir_all(&base).unwrap();
+            let base = blaze_core::temp::TempDir::for_test(&format!("ix-prof-endpoint-{what}-"));
             let (dmg, mnt) = (base.join("v.dmg"), base.join("mnt"));
             let made = std::process::Command::new("/usr/bin/hdiutil")
                 .args(["create", "-quiet", "-size", "20m", "-fs", "APFS", "-volname", "ixprof"])
@@ -1163,7 +1158,6 @@ mod tests {
                 .args(["detach", "-quiet", "-force"])
                 .arg(&self.mnt)
                 .status();
-            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 
@@ -1281,6 +1275,10 @@ mod tests {
     /// The table is in the kernel's format (fs/proc_namespace.c, fs/fuse/inode.c's
     /// `fuse_show_options`), with its lines as an Ubuntu host shows them.
     #[test]
+    #[expect(
+        blaze::tmp_path,
+        reason = "a mount table as an Ubuntu host shows it: the attack is another user's FUSE mount under the shared `/tmp`, and nothing here is made on disk"
+    )]
     fn a_fuse_mount_another_user_made_is_refused() {
         use super::mountinfo::{find, fuse_verdict};
         let table = "\
@@ -1351,6 +1349,10 @@ mod tests {
     /// same line in the initial namespace is still this user's own, so the namespace is the
     /// cause. `user_id=0` stays accepted in any namespace (rootless podman's fuse-overlayfs).
     #[test]
+    #[expect(
+        blaze::gapped_literal,
+        reason = "uid_map fixtures in the kernel's fixed-width `%10u %10u %10u` columns, spaces as written"
+    )]
     fn a_fuse_mount_seen_from_another_user_namespace_is_not_this_users() {
         use super::mountinfo::{fuse_verdict, initial_userns};
         // The kernel's format: "%10u %10u %10u\n".

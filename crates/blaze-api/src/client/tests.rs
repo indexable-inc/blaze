@@ -17,6 +17,7 @@ fn status() -> Status {
         memory_bytes: 2,
         budget_bytes: 3,
         uptime_ms: 40,
+        placed_by: None,
         build: crate::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),

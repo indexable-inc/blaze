@@ -31,6 +31,7 @@ const CHEVRON: &str = "\u{EAB4}";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Input,
+    Question,
     Area,
     Number,
     Slider,
@@ -44,6 +45,7 @@ impl Kind {
     fn name(self) -> &'static str {
         match self {
             Kind::Input => "input",
+            Kind::Question => "question",
             Kind::Area => "area",
             Kind::Number => "number",
             Kind::Slider => "slider",
@@ -57,6 +59,7 @@ impl Kind {
     fn of(s: &str) -> Option<Self> {
         Some(match s {
             "input" => Kind::Input,
+            "question" => Kind::Question,
             "area" => Kind::Area,
             "number" => Kind::Number,
             "slider" => Kind::Slider,
@@ -74,7 +77,7 @@ impl Kind {
     }
 
     fn typed(self) -> bool {
-        matches!(self, Kind::Input | Kind::Area | Kind::Number)
+        matches!(self, Kind::Input | Kind::Question | Kind::Area | Kind::Number)
     }
 }
 
@@ -87,19 +90,23 @@ struct Spec {
     k: Kind,
     change: Option<String>,
     submit: Option<String>,
+    recommendation: Option<String>,
     min: f64,
     max: f64,
     step: f64,
 }
 
 impl Spec {
-    fn action(&self) -> String {
+    fn value(&self) -> Value {
         let n = |x: f64| if x.is_finite() { serde_json::json!(x) } else { Value::Null };
-        let v = serde_json::json!({
+        serde_json::json!({
             "cell": self.cell, "node": self.node, "k": self.k.name(), "change": self.change, "submit": self.submit,
-            "min": n(self.min), "max": n(self.max), "step": n(self.step),
-        });
-        format!("ui:{v}")
+            "min": n(self.min), "max": n(self.max), "step": n(self.step), "recommendation": self.recommendation,
+        })
+    }
+
+    fn action(&self) -> String {
+        format!("ui:{}", self.value())
     }
 
     fn parse(v: &Value) -> Option<Self> {
@@ -110,6 +117,7 @@ impl Spec {
             k: Kind::of(v["k"].as_str()?)?,
             change: text("change"),
             submit: text("submit"),
+            recommendation: text("recommendation"),
             min: v["min"].as_f64().unwrap_or(f64::NEG_INFINITY),
             max: v["max"].as_f64().unwrap_or(f64::INFINITY),
             step: v["step"].as_f64().unwrap_or(0.0),
@@ -161,6 +169,8 @@ pub(super) fn then(cell: &str, events: &[(String, Value)], open: Option<&str>, s
 #[derive(Default)]
 pub struct Live {
     field: Option<Field>,
+    /// A typed value stays authoritative across focus loss until its onChange is echoed.
+    pending_text: BTreeMap<u64, PendingText>,
     slide: Option<Slide>,
     open: Option<u64>,
     now: f32,
@@ -216,7 +226,7 @@ pub(super) fn scrubbing(live: &Live) -> Option<(u64, f64)> {
 /// The Action of video `node`'s scrub rail in cell `cell`: dragged as a slider over 0 to `duration` seconds, to a
 /// millisecond; it seeks the player and sends nothing itself (its timeupdate does: genui/surface.rs).
 pub(super) fn scrub_action(cell: &str, node: u64, duration: f64) -> String {
-    Spec { cell: cell.to_owned(), node, k: Kind::Scrub, change: None, submit: None, min: 0.0, max: duration.max(0.001), step: 0.001 }.action()
+    Spec { cell: cell.to_owned(), node, k: Kind::Scrub, change: None, submit: None, recommendation: None, min: 0.0, max: duration.max(0.001), step: 0.001 }.action()
 }
 
 /// A split's ratio as dragged (`at`) while the tree still says `from`.
@@ -254,6 +264,52 @@ struct Field {
     /// A press on it is held: the unit it selects by and the span it selected, which a drag extends from and keeps whole
     /// ([`Draft::drag_to`]). Held, it keeps the keys until the input pass has given it focus.
     drag: Option<(Unit, (usize, usize))>,
+}
+
+impl Field {
+    fn begin(spec: Spec, text: String, now: f32) -> Self {
+        let n = text.len();
+        Self {
+            spec,
+            draft: Draft { text: text.clone(), caret: n, anchor: n, ..Draft::default() },
+            sent: text.clone(), last: f32::NEG_INFINITY, since: now, adopt: false,
+            echoes: vec![text], drag: None,
+        }
+    }
+}
+
+/// Words waiting for the kernel's echo after a typed field lost focus. The existing Draft/editor remains the
+/// only editor; this small value binding prevents an old tree from replacing freshly typed words before Send.
+struct PendingText {
+    text: String,
+    echoes: Vec<String>,
+}
+
+/// Resolve one pending text binding for every text control. Acknowledgement releases it; older known echoes keep
+/// the local value; an intentional new value from the kernel replaces it. There is one native editor, unchanged.
+fn pending_text(live: &mut Live, node: u64, value: String) -> String {
+    if let Some(kept) = live.pending_text.get(&node) {
+        if kept.text == value {
+            live.pending_text.remove(&node);
+        } else if kept.echoes.contains(&value) {
+            return kept.text.clone();
+        } else {
+            live.pending_text.remove(&node);
+        }
+    }
+    value
+}
+
+fn retire_field(live: &mut Live, f: Field) -> Option<Out> {
+    let out = commit(&f);
+    // Numbers commit a parsed, bounded value and restore their canonical tree representation on blur. Text fields
+    // retain exactly what was typed; an asynchronous older tree must not replace it between blur and refocus.
+    if matches!(f.spec.k, Kind::Input | Kind::Area | Kind::Question) {
+        let mut echoes = f.echoes;
+        echoes.push(f.sent);
+        live.pending_text.insert(f.spec.node, PendingText { text: f.draft.text, echoes });
+    }
+    out
 }
 
 struct Slide {
@@ -625,7 +681,7 @@ pub(super) fn control(v: View<'_>, node: &Value, kind: &str, within: &Within, b:
                 arm(s, h.as_deref().filter(|_| moves).map(|h| send(cell, h, num_value(to))).as_deref());
                 inert(s, h.is_some() && !moves);
             }
-            let spec = Spec { cell: cell.to_owned(), node: v.id(), k: Kind::Number, change: h, submit: None, min, max, step };
+            let spec = Spec { cell: cell.to_owned(), node: v.id(), k: Kind::Number, change: h, submit: None, recommendation: None, min, max, step };
             let shown = value.map(|x| fmt_num(x, step)).unwrap_or_default();
             if let Some(bx) = body.part("box") {
                 field(bx, body, &spec, shown, &words(node, "placeholder"), "hn.GenNumberBody", b);
@@ -649,7 +705,7 @@ pub(super) fn control(v: View<'_>, node: &Value, kind: &str, within: &Within, b:
                 }
             }
             let k = if area { Kind::Area } else { Kind::Input };
-            let spec = Spec { cell: cell.to_owned(), node: v.id(), k, change: h, submit: s, min: 0.0, max: 0.0, step: 0.0 };
+            let spec = Spec { cell: cell.to_owned(), node: v.id(), k, change: h, submit: s, recommendation: None, min: 0.0, max: 0.0, step: 0.0 };
             let value = match prop(node, "value") {
                 Value::Null => String::new(),
                 v => shown(v),
@@ -665,7 +721,7 @@ fn slider(v: View<'_>, node: &Value, label: &str, b: &mut Budget<'_, '_>) {
     let (min, max) = (number(node, "min").unwrap_or(0.0), number(node, "max").unwrap_or(100.0));
     let step = number(node, "step").filter(|s| *s > 0.0).unwrap_or_else(|| slider_step(min, max));
     let h = handler(node, "onChange");
-    let spec = Spec { cell: b.cell.to_owned(), node: v.id(), k: Kind::Slider, change: h, submit: None, min, max, step };
+    let spec = Spec { cell: b.cell.to_owned(), node: v.id(), k: Kind::Slider, change: h, submit: None, recommendation: None, min, max, step };
     let mut value = number(node, "value").unwrap_or(min).clamp(min, max);
     // Dragged: where the pointer has it, not where the tree last said.
     if let Some(s) = b.live.as_deref_mut().and_then(|l| l.slide.as_mut()).filter(|s| s.spec.node == v.id()) {
@@ -698,7 +754,7 @@ fn slider(v: View<'_>, node: &Value, label: &str, b: &mut Budget<'_, '_>) {
 /// ([`Kept`], the split's own state) until the tree says another; an onChange only hears of it.
 pub(super) fn split(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
     let h = handler(node, "onChange");
-    let spec = Spec { cell: b.cell.to_owned(), node: v.id(), k: Kind::Split, change: h, submit: None, min: 0.05, max: 0.95, step: 0.001 };
+    let spec = Spec { cell: b.cell.to_owned(), node: v.id(), k: Kind::Split, change: h, submit: None, recommendation: None, min: 0.05, max: 0.95, step: 0.001 };
     let said = number(node, "ratio").unwrap_or(0.5).clamp(0.05, 0.95);
     let mut ratio = said;
     if let Some(live) = b.live.as_deref_mut() {
@@ -736,7 +792,7 @@ pub(super) fn split(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b:
 
 /// The Action of a toast's plate: a press hides it and sends its onDismiss (when it has one).
 pub(super) fn toast_action(cell: &str, node: u64, dismiss: Option<String>) -> String {
-    Spec { cell: cell.to_owned(), node, k: Kind::Toast, change: dismiss, submit: None, min: 0.0, max: 0.0, step: 0.0 }.action()
+    Spec { cell: cell.to_owned(), node, k: Kind::Toast, change: dismiss, submit: None, recommendation: None, min: 0.0, max: 0.0, step: 0.0 }.action()
 }
 
 fn select(v: View<'_>, node: &Value, label: &str, b: &mut Budget<'_, '_>) {
@@ -759,7 +815,7 @@ fn select(v: View<'_>, node: &Value, label: &str, b: &mut Budget<'_, '_>) {
     if let Some(c) = button.part("chevron") {
         c.icon(CHEVRON);
     }
-    let spec = Spec { cell: cell.to_owned(), node: v.id(), k: Kind::Select, change: h.clone(), submit: None, min: 0.0, max: 0.0, step: 0.0 };
+    let spec = Spec { cell: cell.to_owned(), node: v.id(), k: Kind::Select, change: h.clone(), submit: None, recommendation: None, min: 0.0, max: 0.0, step: 0.0 };
     arm(button, h.is_some().then(|| spec.action()).as_deref());
     if let Some(menu) = v.part("menu") {
         let rows = opts.iter().enumerate().map(|(i, o)| {
@@ -780,7 +836,8 @@ fn select(v: View<'_>, node: &Value, label: &str, b: &mut Budget<'_, '_>) {
 /// A field's box `bx` (its words in `text`, the placeholder in `hint`) and the node whose hairline shows it has the keys
 /// (`edged`, the box or the plate it sits in, made from `prefab`): the tree's `value`, or while it has the keys its own
 /// words, caret and selection.
-fn field(bx: View<'_>, edged: View<'_>, spec: &Spec, value: String, placeholder: &str, prefab: &str, b: &mut Budget<'_, '_>) {
+fn field(bx: View<'_>, edged: View<'_>, spec: &Spec, value: String, placeholder: &str, prefab: &str, b: &mut Budget<'_, '_>) -> String {
+    let value = if let Some(live) = b.live.as_deref_mut() { pending_text(live, spec.node, value) } else { value };
     let mut shown = value.clone();
     let mut edit = None;
     if let Some(l) = b.live.as_deref_mut() {
@@ -847,6 +904,55 @@ fn field(bx: View<'_>, edged: View<'_>, spec: &Spec, value: String, placeholder:
     }
     let takes = spec.change.is_some() || spec.submit.is_some();
     arm(bx, takes.then(|| spec.action()).as_deref());
+    shown
+}
+
+/// A Question's response uses the same one-line editor, selection, caret, IME and focus path as Input. Its submit
+/// Action names the field, so dispatch can read the live draft even before the debounced onChange reaches the kernel.
+pub(super) fn question_field(v: View<'_>, node: &Value, b: &mut Budget<'_, '_>) -> (String, bool, bool) {
+    let spec = Spec {
+        cell: b.cell.to_owned(), node: v.id(), k: Kind::Question,
+        change: handler(node, "onChange"), submit: handler(node, "onSubmit"),
+        recommendation: prop(node, "recommended").as_str().filter(|s| !s.trim().is_empty()).map(str::to_owned),
+        min: 0.0, max: 0.0, step: 0.0,
+    };
+    let value = words(node, "value");
+    let shown = if let Some(bx) = labelled(v, "Your answer", "hn.GenQuestionField", None) {
+        field(bx, bx, &spec, value, "Type your answer…", "hn.GenQuestionField", b)
+    } else { value };
+    let has_text = !shown.trim().is_empty();
+    let enabled = spec.submit.is_some() && (has_text || spec.recommendation.is_some());
+    let mut action = spec.value();
+    action["questionSubmit"] = Value::Bool(true);
+    (format!("ui:{action}"), enabled, has_text)
+}
+
+/// A recommendation is sent only by explicit submission; blank text with no recommendation sends
+/// nothing. Every text submission flushes the actual field words before its answer, in that order.
+fn question_events(spec: &Spec, text: &str) -> Vec<Out> {
+    if spec.submit.is_none() {
+        return Vec::new();
+    }
+    let answer = if text.trim().is_empty() { spec.recommendation.as_deref() } else { Some(text) };
+    let Some(answer) = answer else { return Vec::new() };
+    let mut out = Vec::with_capacity(2);
+    out.extend(Out::new(spec, spec.change.as_ref(), Value::String(text.to_owned())));
+    out.extend(Out::new(spec, spec.submit.as_ref(), Value::String(answer.to_owned())));
+    out
+}
+
+fn question_dispatch(w: WorldRef<'_>, live: &Live, spec: &Spec) -> Vec<Out> {
+    if spec.k != Kind::Question || !w.entity_from_id(spec.node).is_alive() {
+        return Vec::new();
+    }
+    if let Some(f) = live.field.as_ref().filter(|f| f.spec.node == spec.node) {
+        return question_events(spec, &f.draft.text);
+    }
+    if let Some(kept) = live.pending_text.get(&spec.node) {
+        return question_events(spec, &kept.text);
+    }
+    let text = text_node(w, spec).and_then(|t| t.entity().try_cloned::<&Text>());
+    text.map_or_else(Vec::new, |t| question_events(spec, t.s.as_str()))
 }
 
 // ---- Using them ----
@@ -897,6 +1003,14 @@ impl App {
                 }
                 flush(&self.link, out);
                 self.genui.borrow_mut().open = None;
+            }
+            Ok(v @ Value::Object(_)) if v["questionSubmit"] == true => {
+                let Some(spec) = Spec::parse(&v) else {
+                    eprintln!("harness-native: genui: Question submit has no field: {payload}");
+                    return;
+                };
+                let out = question_dispatch(self.world.world_ref(), &self.genui.borrow(), &spec);
+                flush(&self.link, out);
             }
             Ok(v @ Value::Object(_)) if v["k"] == "color" => self.genui_color(&v),
             // A press that does more than send (a FileRef's: open the file, then tell its onClick; a context menu's row: pick,
@@ -956,7 +1070,7 @@ impl App {
                             flush(&self.link, Out::new(&spec, spec.change.as_ref(), num_value(v)).into_iter().collect());
                         }
                     }
-                    Kind::Input | Kind::Area | Kind::Number => self.field_press(spec),
+                    Kind::Input | Kind::Question | Kind::Area | Kind::Number => self.field_press(spec),
                 }
             }
             _ => eprintln!("harness-native: genui: a press's action is not an event: {payload}"),
@@ -1095,19 +1209,9 @@ impl App {
         if live.field.as_ref().is_some_and(|f| f.spec.node == spec.node) {
             return;
         }
-        let out: Vec<Out> = live.field.take().and_then(|f| commit(&f)).into_iter().collect();
+        let out: Vec<Out> = live.field.take().and_then(|f| retire_field(&mut live, f)).into_iter().collect();
         let text = text_node(w, spec).and_then(|t| t.entity().try_cloned::<&Text>()).map(|t| t.s.as_str().to_owned()).unwrap_or_default();
-        let n = text.len();
-        live.field = Some(Field {
-            spec: spec.clone(),
-            draft: Draft { text: text.clone(), caret: n, anchor: n, ..Draft::default() },
-            sent: text,
-            last: f32::NEG_INFINITY,
-            since: self.time,
-            adopt: false,
-            echoes: Vec::new(),
-            drag: None,
-        });
+        live.field = Some(Field::begin(spec.clone(), text, self.time));
         drop(live);
         flush(&self.link, out);
     }
@@ -1134,7 +1238,7 @@ impl App {
             // press (`genui_pointer_down`), before focus reaches it.
             let settled = !went_down;
             if settled && let Some(f) = live.field.take_if(|f| focused.as_ref().is_none_or(|s| s.node != f.spec.node)) {
-                out.extend(commit(&f));
+                out.extend(retire_field(&mut live, f));
             }
             if settled
                 && live.field.is_none()
@@ -1278,10 +1382,11 @@ impl App {
         let w = self.world.world_ref();
         let Some(h) = w.entity_named(APP).target(Hovered::id(), 0) else { return false };
         let (down, across) = (view::prefab(w, "hn.GenScroll"), view::prefab(w, "hn.GenScrollAcross"));
+        let question = view::prefab(w, "hn.GenQuestionOptions");
         let is = |e: EntityView<'_>, p: Option<EntityView<'_>>| p.is_some_and(|p| e.owns((flecs::IsA::ID, *p.id())));
         for e in std::iter::successors(Some(h), |n| n.parent()).take(64) {
             let sideways = is(e, across);
-            if !sideways && !is(e, down) {
+            if !sideways && !is(e, down) && !is(e, question) {
                 continue;
             }
             let (Some(l), Some(x), st) = (e.try_cloned::<&Laid>(), e.try_cloned::<&ScrollExtent>(), e.try_cloned::<&ScrollState>().unwrap_or_default()) else {
@@ -1362,6 +1467,18 @@ impl App {
         let out = {
             let mut live = self.genui.borrow_mut();
             let Some(f) = live.field.as_mut() else { return };
+            if f.spec.k == Kind::Question {
+                let out = question_events(&f.spec, &f.draft.text);
+                if !out.is_empty() {
+                    f.sent = f.draft.text.clone();
+                    f.last = now;
+                }
+                f.since = now;
+                drop(live);
+                flush(&self.link, out);
+                self.poke();
+                return;
+            }
             let mut out: Vec<Out> = commit(f).into_iter().collect();
             if f.spec.k == Kind::Number {
                 // The number as sent (bounded), or the tree's again when it was not one.
@@ -1436,6 +1553,7 @@ fn prune(w: WorldRef<'_>, live: &mut Live) {
         let e = w.entity_from_id(*el);
         e.is_alive() && (View::of(e).part("float").is_some() || View::of(e).part("scrim").is_some())
     });
+    live.pending_text.retain(|el, _| w.entity_from_id(*el).is_alive());
     live.toasts.retain(|el, _| w.entity_from_id(*el).is_alive());
     live.splits.retain(|el, _| w.entity_from_id(*el).is_alive());
     live.hovering.retain(|el, _| w.entity_from_id(*el).is_alive());
@@ -1487,4 +1605,103 @@ mod tests {
         assert_eq!(split_ratio(100.0 + 6.5 + 160.0, 100.0, 413.0, 13.0), 0.4);
         assert_eq!(split_ratio(123.4567, 0.0, 413.0, 13.0), 0.292);
     }
+
+    /// The native dispatch core is driven synchronously: editing, a Send press before the debounce, losing focus,
+    /// an older onChange echo and an explicit recommendation. Its output oracle uses the editor's words, never props.
+    #[test]
+    fn question_submit_flushes_live_words_across_focus_and_old_echoes() {
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        let row = View::root(w, "hn.ChatUi");
+        let mut ui = serde_json::json!({"type":"Question", "props": {
+            "text":"Where should this run?", "options":[{"label":"Staging","detail":"No customer traffic"}],
+            "recommended":"Staging", "allowText":true, "value":"old",
+            "onChoose":"choose", "onChange":"change", "onSubmit":"submit"
+        }, "children":[]});
+        let live = std::cell::RefCell::new(Live::default());
+        let mut measure = |s: &str, style: &TextStyle, _md: bool| s.chars().count() as f32 * style.size.max(1.0) * 0.55;
+        fill(row, &ui, "test.question", Some(&live), false, &mut measure);
+        let question = row.part("body").unwrap().part("g0").unwrap();
+        let response = question.part("response").unwrap();
+        let spec = Spec::of(response.part("body").unwrap().entity()).expect("the shared editor action");
+        let decode = |events: Vec<Out>| events.into_iter().map(|e| (e.handler, e.value)).collect::<Vec<_>>();
+        let mut draft = Draft { text: "old".to_owned(), caret: 3, anchor: 3, ..Draft::default() };
+        draft.insert(" + current 🐉");
+        let expected = draft.text.clone();
+        live.borrow_mut().field = Some(Field {
+            spec: spec.clone(), draft, sent: "intermediate".to_owned(), last: 10.0, since: 10.0,
+            adopt: false, echoes: vec!["old".to_owned(), "intermediate".to_owned()], drag: None,
+        });
+        let oracle = vec![("change".to_owned(), Value::String(expected.clone())), ("submit".to_owned(), Value::String(expected.clone()))];
+        assert_eq!(decode(question_dispatch(w, &live.borrow(), &spec)), oracle, "Send uses the field before debounce");
+        assert_eq!(decode(question_events(&spec, &expected)), oracle, "Return and Send use the same submission rule");
+        // The click moves focus before activation. The real retirement path flushes once and keeps its unacknowledged
+        // words; neither the original tree nor an intermediate debounced echo may overwrite them.
+        let blur = {
+            let mut live = live.borrow_mut();
+            let field = live.field.take().unwrap();
+            retire_field(&mut live, field)
+        };
+        assert_eq!(decode(blur.into_iter().collect()), vec![("change".to_owned(), Value::String(expected.clone()))]);
+        for value in ["old", "intermediate"] {
+            ui["props"]["value"] = serde_json::json!(value);
+            fill(row, &ui, "test.question", Some(&live), false, &mut measure);
+            assert_eq!(decode(question_dispatch(w, &live.borrow(), &spec)), oracle, "old echo {value:?}");
+            assert_eq!(text_node(w, &spec).unwrap().entity().try_cloned::<&Text>().unwrap().s.as_str(), expected);
+        }
+        ui["props"]["value"] = Value::String(expected.clone());
+        fill(row, &ui, "test.question", Some(&live), false, &mut measure);
+        assert!(!live.borrow().pending_text.contains_key(&spec.node), "the latest echo releases the retained binding");
+        assert_eq!(decode(question_dispatch(w, &live.borrow(), &spec)), oracle);
+        let mut no_recommendation = spec.clone();
+        no_recommendation.recommendation = None;
+        assert!(question_events(&no_recommendation, "  ").is_empty(), "blank input cannot submit");
+        assert_eq!(decode(question_events(&spec, "")), vec![
+            ("change".to_owned(), Value::String(String::new())),
+            ("submit".to_owned(), Value::String("Staging".to_owned())),
+        ], "an explicit confirmation may use the recommendation");
+        assert!(live.borrow().pending.is_empty(), "drawing a recommendation never auto-answers");
+        ui["props"]["value"] = serde_json::json!("");
+        ui["props"].as_object_mut().unwrap().remove("recommended");
+        fill(row, &ui, "test.question", Some(&live), false, &mut measure);
+        assert!(question.part("actions").unwrap().part("submit").unwrap().entity().try_cloned::<&Action>().is_none(), "empty answer has a disabled primary action");
+    }
+
+
+    /// The same pending-value owner serves ordinary Input/TextArea and Question. A rapid blur/refocus cannot revive
+    /// the old kernel value; numeric fields retain their existing parse/bound/canonicalize behavior.
+    #[test]
+    fn typed_fields_keep_pending_words_until_the_latest_echo() {
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        let row = View::root(w, "hn.ChatUi");
+        let live = std::cell::RefCell::new(Live::default());
+        let mut measure = |s: &str, style: &TextStyle, _md: bool| s.chars().count() as f32 * style.size.max(1.0) * 0.55;
+        for kind in ["Input", "TextArea"] {
+            let mut ui = serde_json::json!({"type":kind, "props":{"value":"old", "onChange":"change"}, "children":[]});
+            fill(row, &ui, "test.field", Some(&live), false, &mut measure);
+            let input = row.part("body").unwrap().part("g0").unwrap();
+            let spec = Spec::of(input.part("body").unwrap().entity()).unwrap();
+            let mut editing = Field::begin(spec.clone(), "old".to_owned(), 1.0);
+            editing.draft.insert(" + unsent");
+            let expected = editing.draft.text.clone();
+            let out = retire_field(&mut live.borrow_mut(), editing).unwrap();
+            assert_eq!(out.value, Value::String(expected.clone()));
+            fill(row, &ui, "test.field", Some(&live), false, &mut measure);
+            let shown = text_node(w, &spec).unwrap().entity().try_cloned::<&Text>().unwrap().s.as_str().to_owned();
+            let refocused = Field::begin(spec.clone(), shown, 2.0);
+            assert_eq!(refocused.draft.text, expected, "{kind} refocus before echo");
+            assert!(commit(&refocused).is_none(), "blur already flushed these words");
+            ui["props"]["value"] = Value::String(expected);
+            fill(row, &ui, "test.field", Some(&live), false, &mut measure);
+            assert!(!live.borrow().pending_text.contains_key(&spec.node), "{kind} echo releases its pending binding");
+        }
+        let numeric = Spec { cell: "test.number".to_owned(), node: 123, k: Kind::Number, change: Some("number".to_owned()),
+            submit: None, recommendation: None, min: 0.0, max: 3.0, step: 1.0 };
+        let mut editing = Field::begin(numeric, "1".to_owned(), 3.0);
+        editing.draft.text = "100".to_owned();
+        assert_eq!(retire_field(&mut live.borrow_mut(), editing).unwrap().value, serde_json::json!(3));
+        assert!(!live.borrow().pending_text.contains_key(&123), "a number commits its bounded value rather than retaining unparsed text");
+    }
+
 }

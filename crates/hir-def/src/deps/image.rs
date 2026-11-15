@@ -34,15 +34,40 @@ const _: () = {
 };
 
 /// The schema of an image buffer: its root record's, and the version of what the parts are.
+/// Version 3: the def map is no part of it; a crate's def map is its pages, a record of its
+/// own (`super::serve::pages_key`), read a name at a time. Version 4: a third part, the
+/// crate's diagnostic items ([`Part::DiagnosticItems`]), so a served crate's are read from
+/// it and not by a walk of its pages. The key moves with it (`super::key::PRODUCER` hashes
+/// this schema), so an image of version 3 is never found; one read all the same is refused
+/// here by its schema, never read as an image with no diagnostic items.
 pub const IMAGE_SCHEMA: SchemaHash = blaze_format::schema_of(&[
+    SchemaPart::Str("blaze v2 dependency image"),
+    SchemaPart::U64(4),
+    SchemaPart::Schema(<Root as Record>::SCHEMA),
+]);
+
+/// The schema of version 3 ([`IMAGE_SCHEMA`]), two parts: what a test writes to show an
+/// image of it is refused.
+#[cfg(test)]
+const LAYOUT_3_SCHEMA: SchemaHash = blaze_format::schema_of(&[
+    SchemaPart::Str("blaze v2 dependency image"),
+    SchemaPart::U64(3),
+    SchemaPart::Schema(<Root as Record>::SCHEMA),
+]);
+
+/// The schema of an image of the layout image keys of domain 7 filed (`super::key`): three
+/// parts, the first the crate's whole def map. Never read: an image of it found under a key is
+/// the named miss [`ImageRef::is_layout_7`] tells, its crate made again from source.
+const LAYOUT_7_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Str("blaze v2 dependency image"),
     SchemaPart::U64(2),
     SchemaPart::Schema(<Root as Record>::SCHEMA),
 ]);
 
-/// What holds the bytes of an image or a crate's reads as the store gave them: the store's own
-/// mapping, held in place (`blaze_cas::Reader::pinned`, through the driver's adapter), or a
-/// buffer of its own. The bytes start at a multiple of [`blaze_format::ALIGN`] (an image whose
+/// What holds the bytes of an image or a crate's reads as the store gave them: a mapping of
+/// the store's file (`blaze_cas::direct::map`, through the driver's adapter), read in place
+/// with the kernel's page cache the one copy and nothing pinned in a pool, or, for a value
+/// `direct` reads rather than maps, one aligned copy of its own. The bytes start at a multiple of [`blaze_format::ALIGN`] (an image whose
 /// parts are not aligned does not open) and neither move nor change while it lives.
 pub trait Held: Send + Sync + 'static {
     fn bytes(&self) -> &[u8];
@@ -64,25 +89,45 @@ pub type ImageBuf = Arc<dyn Held>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Part {
-    /// The crate's `DefMap` and `LocalDefMap`, as [`crate::nameres::frozen::encode`] writes them.
-    DefMap = 0,
     /// The crate's lang items, as [`crate::nameres::frozen::encode_lang_items`] writes them.
-    LangItems = 1,
+    LangItems = 0,
     /// The signatures of the crate's items, a buffer of [`super::signatures`]'s schema.
-    Signatures = 2,
+    Signatures = 1,
+    /// The crate's own diagnostic items, as
+    /// [`crate::nameres::frozen::encode_diagnostic_items`] writes them: a table of a few
+    /// hundred rows read whole, so `crate_diagnostic_items` of a served crate reads no page of
+    /// its def map and no item's attributes.
+    DiagnosticItems = 2,
+    /// The crate's `DefMap` and `LocalDefMap`: no part of an image, which holds the three
+    /// above. A crate's def map is its pages (`crate::nameres::frozen::pages`), a record of its
+    /// own; this names them in a refusal of the crate ([`super::Refused`]). Its tag follows
+    /// the parts' so the tag of each part is its place in [`Part::ALL`]; the tag is never
+    /// written.
+    DefMap = 3,
 }
 
 impl Part {
-    pub const ALL: [Part; 3] = [Part::DefMap, Part::LangItems, Part::Signatures];
+    /// The parts an image holds, in the order of their tags: each part's tag is its place
+    /// here, which [`ImageRef::part`] and [`PartBytes::of`] index by.
+    pub const ALL: [Part; 3] = [Part::LangItems, Part::Signatures, Part::DiagnosticItems];
 
     pub fn name(self) -> &'static str {
         match self {
-            Part::DefMap => "def map",
+            Part::DefMap => "def map pages",
             Part::LangItems => "lang items",
             Part::Signatures => "signatures",
+            Part::DiagnosticItems => "diagnostic items",
         }
     }
 }
+
+const _: () = {
+    let mut at = 0;
+    while at < Part::ALL.len() {
+        assert!(Part::ALL[at] as usize == at, "a part's tag is not its place in `Part::ALL`");
+        at += 1;
+    }
+};
 
 /// Why an image does not read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +193,14 @@ impl<'a> ImageRef<'a> {
         Ok(ImageRef { parts })
     }
 
+    /// Whether `buffer` is an image of the layout keys of domain 7 filed, its def map a part
+    /// of it ([`LAYOUT_7_SCHEMA`]): what [`ImageRef::open`] refuses as another schema, and
+    /// what a serve takes as the named miss of its crate rather than an error. Checks the
+    /// header and the root alone.
+    pub fn is_layout_7(buffer: &[u8]) -> bool {
+        blaze_format::open_as::<Root>(buffer, LAYOUT_7_SCHEMA).is_ok()
+    }
+
     /// The bytes of `part`, in place.
     #[inline]
     pub fn part(self, part: Part) -> &'a [u8] {
@@ -167,10 +220,10 @@ impl<'a> ImageRef<'a> {
     }
 
     /// The image whose parts are `ranges` of `buffer`, as [`ImageRef::ranges`] gave them for
-    /// it: three slices, no check of the buffer.
+    /// it: a slice a part, no check of the buffer.
     #[inline]
     pub(crate) fn at(buffer: &'a [u8], ranges: &[Range<usize>; Part::ALL.len()]) -> ImageRef<'a> {
-        // clone: three `Range<usize>`s, which are not `Copy`
+        // clone: a `Range<usize>` a part, which is not `Copy`
         ImageRef { parts: ranges.clone().map(|it| &buffer[it]) }
     }
 }
@@ -248,17 +301,44 @@ impl From<Arc<[u8]>> for PartBytes {
 
 /// The image of `key` whose parts are `parts`, one of each of [`Part::ALL`] in that order.
 pub fn write_image(key: ContentId, parts: [&[u8]; Part::ALL.len()]) -> Vec<u8> {
+    write_parts(IMAGE_SCHEMA, key, parts, Part::ALL.map(|it| it as u32))
+}
+
+/// An image of layout 7 ([`LAYOUT_7_SCHEMA`]), its three parts tagged 0, 1 and 2 (its def
+/// map, its lang items, its signatures): what a store written before the def map left the
+/// image holds, for a test of the named miss a serve makes of it.
+#[cfg(test)]
+pub(super) fn write_layout_7_image(key: ContentId, parts: [&[u8]; 3]) -> Vec<u8> {
+    write_parts(LAYOUT_7_SCHEMA, key, parts, [0, 1, 2])
+}
+
+/// An image without the diagnostic items part: of version 3's schema when `old_schema`, else
+/// of this schema with two parts. What a test writes to show either is refused, never read
+/// as an image whose crate has no diagnostic items.
+#[cfg(test)]
+pub(super) fn write_two_part_image(key: ContentId, parts: [&[u8]; 2], old_schema: bool) -> Vec<u8> {
+    let schema = if old_schema { LAYOUT_3_SCHEMA } else { IMAGE_SCHEMA };
+    write_parts(schema, key, parts, [0, 1])
+}
+
+/// The image of `key` under `schema` whose parts are `parts`, tagged `tags`.
+fn write_parts<const N: usize>(
+    schema: SchemaHash,
+    key: ContentId,
+    parts: [&[u8]; N],
+    tags: [u32; N],
+) -> Vec<u8> {
     let total: usize = parts.iter().map(|it| it.len().next_multiple_of(blaze_format::ALIGN)).sum();
-    let mut out = Writer::new(IMAGE_SCHEMA);
+    let mut out = Writer::new(schema);
     out.bytes.reserve(total + 4 * blaze_format::ALIGN + size_of::<Root>());
-    let mut placed = [(0u64, 0usize); Part::ALL.len()];
+    let mut placed = [(0u64, 0usize); N];
     for (at, bytes) in parts.iter().enumerate() {
         let start = out.bytes.len().next_multiple_of(blaze_format::ALIGN);
         out.bytes.resize(start, 0);
         placed[at] = (out.push_slice(bytes), bytes.len());
     }
     let recs_at = out.next::<PartRec>();
-    let recs: [PartRec; Part::ALL.len()] = std::array::from_fn(|index| {
+    let recs: [PartRec; N] = std::array::from_fn(|index| {
         let (bytes_at, len) = placed[index];
         let field = recs_at
             + (index * size_of::<PartRec>()) as u64
@@ -267,7 +347,7 @@ pub fn write_image(key: ContentId, parts: [&[u8]; Part::ALL.len()]) -> Vec<u8> {
             0 => Slice::EMPTY,
             len => Slice::between(field, bytes_at, len),
         };
-        PartRec { tag: Part::ALL[index] as u32, bytes }
+        PartRec { tag: tags[index], bytes }
     });
     let written = out.push_slice(&recs);
     debug_assert_eq!(written, recs_at, "`Writer::next` is not where `push_slice` writes");

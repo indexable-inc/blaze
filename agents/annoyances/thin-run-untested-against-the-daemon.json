@@ -1,0 +1,14 @@
+{
+ "id": "thin-run-untested-against-the-daemon",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), core2 executor, int-1112",
+ "where": "crates/blaze-cargo/src/serve/tests/client_spans.rs; serve/observe.rs CLIENT_ROWS; serve/daemon.rs DROPS_A_CLIENT_SPAN",
+ "what": "The thin client's spans (five client, two program) were each unit-tested in its own crate (talk, ProgramTimes, spans_of) but nothing ran the thin client's own `talk` against a daemon, so a span dropped or doubled between them (the daemon's ClientRows arm, the launch host's join, the history's rows) was in no test. The sim's daemon kept no history (`profiling: None`), so the rows it was given were dropped unread.",
+ "cost": "a profile with a span missing or twice reads as a wrong split of an edit's wall time; no test would say so",
+ "cause": "the client's rows were tested at each end, not across the wire; the sim's history had no read-back point",
+ "class": "a pipeline whose stages are tested apart and whose join is in no test",
+ "prevention": "a sans-IO client core (`blaze_thin::talk::Link`) driven by the sim's socket in serve::tests, with the rows the history is given recorded on the loop's thread",
+ "workaround": "none",
+ "fix": "serve::tests::client_spans: a warm `run -q` through `talk` on a link to the sim's socket, the launcher's Hello and end played into the real ProgramTimes; oracle: each of the seven spans exactly once and the client's times once. Control DROPS_A_CLIENT_SPAN is caught naming `client: request on the wire`.",
+ "state": "fixed, uncompiled"
+}

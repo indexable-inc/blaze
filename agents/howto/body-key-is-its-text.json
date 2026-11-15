@@ -1,0 +1,9 @@
+{
+ "id": "body-key-is-its-text",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane engine-1112",
+ "task": "The query engine and front end reach their designed end state (engine.md), and the old paths are deleted",
+ "do": "A body's key is `blaze_item_hash::identity::early_identity` (four parts: crate inputs, owner by key, module chain, the ItemSource text or macro chain), made before lowering. Everything a body resolves is a fact (`reads::classify`, `name_fact`), never part of the key: write a test of a resolution change as a fact's value changing, not the key. The old identity over the lowered HIR (`identity::identity`, `identity_parts`, `covered_queries`, `RecordedNames`, `reads::Names`, `classify_with`, `hir_def::item_hash::portable_body`) is deleted and banned in .clippy.toml. Two traps: a `///` doc comment and an attribute are in the ItemSource header, so editing one changes the key (use `//` in a test that means 'comments keep it'); and an item in a block has no key (`Unidentified`), so a pure script or cache that reaches a nested fn refuses it.",
+ "why": "Tests written for the old identity asserted anonymity across renames and key changes from resolution; under the text key both are wrong, and the switch between the two is gone. check_cache (crate-keyed) still serves verdicts and runtime MIR; deleting it needs its ids.rs moved into body_store and its served path out of infer.rs, hir-ty-borrowck gate.rs, blaze-diagnostics cache.rs, blaze-cargo serve/compile.rs and blaze-global first.",
+ "state": "current"
+}

@@ -116,6 +116,10 @@ pub(crate) fn real_span_map(db: &Db, editioned_file_id: base_db::EditionedFileId
     })
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread sort scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     /// The scratch of the anchor sort, kept by the worker.
     static ANCHOR_SORT: std::cell::RefCell<blaze_mem::scratch::Scratch<(syntax::TextSize, span::ErasedFileAstId)>> =

@@ -1,0 +1,20 @@
+{
+ "id": "A-certificate4-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane certificate4",
+ "where": "crates/blaze-cargo/src/serve/job.rs (Jobs::begin, Jobs::heard, Jobs::keep_answer), crates/blaze-cargo/src/serve/job/certify.rs",
+ "what": "Wiring the request machine met four facts the design had not read, each of which cut what the first wiring can do: (1) a job's words reach `Jobs::heard` with no `World` in hand, so nothing can be put in the store or said to the client where a build's answer is known to be kept; (2) what a build with nothing to do says is known only from such a build (`noop::Recording`), so a build that compiled cannot write a certificate until `said` is made from its parts; (3) the config, and so the certificate's base, names where the standard library is mounted, which a daemon learns in its first build's first task, so that request cannot be checked before it is a job; (4) the outside reads of the steps' records are kept for the process by path with no hash (`serve/unit/reads.rs` `PATHS`).",
+ "cost": "the wired piece hits on the third request after an edit (build, walk that writes, hit), not the second, and on the second after a daemon restart, not the first; the lane's context went on finding these in a 9,500-line file read 60 lines at a time",
+ "cause": "the no-op answer was built as an exception with its own recorder at the session's edge (`heard`), not as the build's last state; and `job.rs` holds the whole job life in one file, so no site can be found without reading around it",
+ "whys": [
+  "why not the second request: the first build compiled, and only a no-op build's words are recorded",
+  "why only those: `said` was defined as what the walk said, not composed from what a build knows (its diagnostics, its artifact, its Work)",
+  "why no store at the write: the recorder listens to `Said`, which the daemon passes after the jobs' call returned",
+  "why that design: the kept answer was memory's, so it never needed the store"
+ ],
+ "class": "an answer recorded by listening to output instead of being a state of the build that made it",
+ "prevention": "the build's end state hands over one value (reads, outputs, said) in the wind-up, where `World` is in hand; `Jobs::heard` records nothing",
+ "workaround": "`certify::Ended` is queued in `keep_answer` and written at the next `Jobs::step`, before any request asked since is checked",
+ "fix": "open: certificate.md, \"State\", items 1-3",
+ "state": "open"
+}

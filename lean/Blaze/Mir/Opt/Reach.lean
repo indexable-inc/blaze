@@ -74,9 +74,9 @@ theorem switchTarget_live (P : BlockId → Prop) (key : Int) (otherwise : BlockI
     have here : P arm.2 := And.left ha
     have there : P (switchTarget key rest otherwise) := ih (And.right ha)
     by_cases h : key = arm.1
-    · rw [switchTarget_cons, if_pos h]
+    · rw [switchTarget_cons, ite_eq_left h]
       exact here
-    · rw [switchTarget_cons, if_neg h]
+    · rw [switchTarget_cons, ite_eq_right h]
       exact there
 
 theorem State.jump_reaches (L : FnId → BlockId → Prop) (st : State) (fn : FnId)
@@ -111,9 +111,9 @@ theorem assertOn_reaches (L : FnId → BlockId → Prop) (st : State) (fn : FnId
     ∀ (v : Value), Outcome.All (NextReaches L) (assertOn st expected kind target v)
   | Value.bool b => by
     by_cases h : b = expected
-    · rw [assertOn_bool, if_pos h]
+    · rw [assertOn_bool, ite_eq_left h]
       exact State.jump_reaches L st fn hfn target hc ht
-    · rw [assertOn_bool, if_neg h]
+    · rw [assertOn_bool, ite_eq_right h]
       exact Outcome.all_panic _ _
   | Value.unit => Outcome.all_undefined _ _
   | Value.int _ _ => Outcome.all_undefined _ _
@@ -130,9 +130,9 @@ theorem State.enter_reaches (L : FnId → BlockId → Prop) (st : State) (fn : F
     Outcome.All (NextReaches L) (st.enter id sig args dest target) := by
   subst hfn
   by_cases hl : args.length = sig.args
-  · rw [State.enter_eq, if_pos hl]
+  · rw [State.enter_eq, ite_eq_left hl]
     exact Outcome.all_ok (And.intro h0 (And.intro ht hc))
-  · rw [State.enter_eq, if_neg hl]
+  · rw [State.enter_eq, ite_eq_right hl]
     exact Outcome.all_undefined _ _
 
 theorem State.ret_reaches (L : FnId → BlockId → Prop) (st : State) (h : Reaches L st) :
@@ -188,7 +188,7 @@ theorem execTerm_reaches (L : FnId → BlockId → Prop) (sig : FnId → Option 
       switchOn_reaches L r.2 fn ((State.topFn_of_ctl hr).trans hfn)
         (CtlLive.of_ctl hr (And.right h)) arms otherwise (And.left ht) (And.right ht)
         (switchKey r.1))
-  | Terminator.call callee args dest target, ht =>
+  | Terminator.call callee args _ target, ht =>
     Outcome.all_bind (evalOperands_ctl args st) (fun r hr =>
       Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
         callOn_reaches L sig h0 r.2 fn ((State.topFn_of_ctl hr).trans hfn)

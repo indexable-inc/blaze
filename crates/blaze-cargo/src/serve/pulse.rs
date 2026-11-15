@@ -1,7 +1,6 @@
 //! The loop's pulse as threads outside it read it ([`Pulse`]), the judge of a loop that
-//! stopped turning ([`LoopWatch`]), the judge of a footprint against the daemon's memory
-//! ceiling ([`CeilingWatch`]) and the dedupe of the wait-for graph's stalls ([`StallWatch`]):
-//! sans-IO cores the stop's guard (`serve::stop`) drives.
+//! stopped turning ([`LoopWatch`]) and the dedupe of the wait-for graph's stalls
+//! ([`StallWatch`]): sans-IO cores the stop's guard (`serve::stop`) drives.
 //!
 //! The loop is the one thread that reaps the daemon's children and hands their completions on
 //! (blaze-core's drivers reap a child only as their `poll` sees it exit). A loop stuck inside a
@@ -35,7 +34,32 @@ pub struct Pulse {
     /// on, which nothing it runs after its wait may do (`Daemon::turn_after_wait`). A queue
     /// has no holder to wait for. At most [`STALLS_KEPT`] are kept: the guard drops the oldest.
     stalls: SegQueue<Option<String>>,
+    /// The task watchdog's word to the loop (`serve::stuck`): each task it found stuck, once,
+    /// for the loop to put in its build's live model and, for a thread nothing can unwind, to
+    /// fail its plane node ([`StuckSaid::lost`]). A queue, as `stalls` is: the loop never
+    /// parks on the watchdog. At most [`STUCK_KEPT`]: the watchdog drops the oldest.
+    stuck: SegQueue<StuckSaid>,
+    /// Each job's write that waits, as the loop last looked (`Daemon::doing`, once a second
+    /// while a build runs), for `blaze debug inspect`. The loop only tries it, so it never
+    /// parks on a reader; a look it could not take is taken at the next.
+    writes: blaze_core::lock::Lock<Vec<super::work::WriteWaiting>>,
 }
+
+/// A task the watchdog found stuck, as it tells the loop.
+#[derive(Clone, Debug, PartialEq, Eq)] // clone: a stuck task, once
+pub struct StuckSaid {
+    /// The build its thread works for; 0 for none (it is said in every build's model).
+    pub build: u32,
+    /// The plane node of the daemon `task` span it is inside, if any.
+    pub node: Option<u64>,
+    /// A thread stuck where nothing can unwind it: its node is failed at the plane with
+    /// `said`'s line and the late end of its task, if one ever comes, is dropped.
+    pub lost: bool,
+    pub said: blaze_protocol::now::Stuck,
+}
+
+/// The most stuck tasks the queue holds for the loop: more than a 128-core pool's convoy.
+const STUCK_KEPT: usize = 512;
 
 /// The most stall lines the queue holds for the loop: a loop that builds nothing takes none,
 /// and the guard says one each look while a stall lasts.
@@ -43,11 +67,47 @@ const STALLS_KEPT: usize = 4;
 
 impl Default for Pulse {
     fn default() -> Pulse {
-        Pulse { moved: AtomicU64::new(0), turns: AtomicU64::new(0), stalls: SegQueue::new() }
+        Pulse {
+            moved: AtomicU64::new(0),
+            turns: AtomicU64::new(0),
+            stalls: SegQueue::new(),
+            stuck: SegQueue::new(),
+            writes: blaze_core::lock::Lock::new("serve.pulse.writes", Vec::new()),
+        }
     }
 }
 
 impl Pulse {
+    /// On the loop: the writes that wait now. Never waits: a reader holding the lock leaves
+    /// the last look in place.
+    pub fn set_writes(&self, writes: Vec<super::work::WriteWaiting>) {
+        if let Some(mut it) = self.writes.try_lock() {
+            *it = writes;
+        }
+    }
+
+    /// The writes that waited at the loop's last look; waits for the loop's swap at most.
+    pub fn writes(&self) -> Vec<super::work::WriteWaiting> {
+        self.writes.lock().clone() // clone: an answer, on demand
+    }
+
+    /// The task watchdog found `said` stuck. Never waits: past [`STUCK_KEPT`] untaken, the
+    /// oldest goes (it was logged and recorded as it was said).
+    pub fn say_stuck(&self, said: StuckSaid) {
+        if self.stuck.len() >= STUCK_KEPT {
+            drop(self.stuck.pop());
+        }
+        self.stuck.push(said);
+    }
+
+    /// On the loop: each stuck task said since the last take, oldest first. Never waits;
+    /// bounded by [`STUCK_KEPT`] and what the watchdog says meanwhile, a look every few seconds.
+    pub fn take_stuck(&self, mut each: impl FnMut(StuckSaid)) {
+        while let Some(said) = self.stuck.pop() {
+            each(said);
+        }
+    }
+
     /// The guard's latest stall line, `None` once none lasts. Never waits: the oldest line
     /// the loop has not taken goes when [`STALLS_KEPT`] are queued, and the last said stays.
     pub fn set_stall(&self, line: Option<String>) {
@@ -135,74 +195,6 @@ impl LoopWatch {
                 self.said = false;
                 Look::Turning
             }
-        }
-    }
-}
-
-/// What one look at the daemon's footprint against its memory ceiling found
-/// ([`CeilingWatch::look`]).
-#[cfg(all(unix, feature = "native"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CeilingLook {
-    /// Under the ceiling, and no nearer or further than the last look said.
-    Under,
-    /// Within 1/8 of the ceiling, the first look so since it was last under 3/4 of it: said
-    /// once, so the log's last word on memory before a kill by the kernel says it was near.
-    Near,
-    /// Back under 3/4 of the ceiling after a look that said [`CeilingLook::Near`].
-    Eased,
-    /// Past the ceiling, the first look so since it was last at or under it: the driver purges
-    /// what the allocators keep freed (`raw::memory::purge`) and looks again at once. A freed
-    /// page the allocator keeps is no reason to end a daemon (a build died at 23.04 GiB with
-    /// 7.52 GiB of it freed and kept).
-    Purge,
-    /// Still past the ceiling after a purge: the daemon ends
-    /// ([`blaze_core::exit::Exit::MemoryCeiling`]).
-    Passed,
-}
-
-/// Judges the daemon's footprint against its ceiling, told both at each look: past it, the
-/// daemon ends; near it, or eased from near it, a line says so once. A ceiling of 0 is none,
-/// and a footprint at the ceiling is not past it. Allocates nothing, so the guard may look
-/// every 100 ms (`serve::ceiling::EVERY`).
-#[cfg(all(unix, feature = "native"))]
-#[derive(Debug, Default)]
-pub struct CeilingWatch {
-    /// The last look that was not under said near, and none has said eased since.
-    near: bool,
-    /// A look past the ceiling said purge, and none since was at or under it.
-    purged: bool,
-}
-
-#[cfg(all(unix, feature = "native"))]
-impl CeilingWatch {
-    /// One look: `footprint` the daemon's bytes as the system counts them
-    /// (`raw::memory::own_footprint`), `ceiling` its ceiling's (`serve::ceiling::ceiling`).
-    pub fn look(&mut self, footprint: u64, ceiling: u64) -> CeilingLook {
-        if ceiling == 0 {
-            self.near = false;
-            self.purged = false;
-            return CeilingLook::Under;
-        }
-        if footprint > ceiling {
-            if !std::mem::replace(&mut self.purged, true) {
-                return CeilingLook::Purge;
-            }
-            return CeilingLook::Passed;
-        }
-        self.purged = false;
-        let near = footprint >= ceiling - ceiling / 8;
-        let eased = footprint < ceiling / 4 * 3;
-        match (self.near, near, eased) {
-            (false, true, _) => {
-                self.near = true;
-                CeilingLook::Near
-            }
-            (true, _, true) => {
-                self.near = false;
-                CeilingLook::Eased
-            }
-            _ => CeilingLook::Under,
         }
     }
 }
@@ -342,60 +334,18 @@ mod tests {
         }
     }
 
-    const GIB: u64 = 1 << 30;
-
-    /// The guard's decision on a daemon's footprint against a ceiling of 48 GiB: under it, or
-    /// at it exactly, the daemon runs on; one byte past it, it purges, and still past it after
-    /// the purge, it ends. Near (42 GiB, 7/8) and back
-    /// under 3/4 (36 GiB) are each said once a crossing, never on every look. Make `look` never
-    /// say `Passed` and a daemon past its ceiling runs on; make it compare with `>=` and one
-    /// exactly at its ceiling is ended; make it skip the purge and one whose allocator only
-    /// kept freed pages is ended.
-    #[test]
-    fn a_footprint_past_its_ceiling_ends_the_daemon_and_near_it_is_said_once() {
-        let ceiling = 48 * GIB;
-        let mut watch = CeilingWatch::default();
-        let looks = [
-            GIB,
-            36 * GIB,
-            42 * GIB - 1,
-            42 * GIB,
-            45 * GIB,
-            ceiling,
-            40 * GIB,
-            36 * GIB,
-            35 * GIB,
-            30 * GIB,
-            47 * GIB,
-            ceiling + 1,
-            // The purge gave enough back.
-            ceiling,
-            ceiling + 1,
-            ceiling + 1,
-        ];
-        let said: Vec<CeilingLook> = looks.iter().map(|&at| watch.look(at, ceiling)).collect();
-        use CeilingLook::{Eased, Near, Passed, Purge, Under};
-        assert_eq!(
-            said,
-            [
-                Under, Under, Under, Near, Under, Under, Under, Under, Eased, Under, Near, Purge,
-                Under, Purge, Passed
-            ]
-        );
-        // No ceiling is no bound, whatever the footprint.
-        assert_eq!(CeilingWatch::default().look(u64::MAX, 0), Under);
-        // A tiny ceiling holds as a large one does.
-        let mut small = CeilingWatch::default();
-        assert_eq!(small.look(8, 8), Near);
-        assert_eq!(small.look(9, 8), Purge);
-        assert_eq!(small.look(9, 8), Passed);
-    }
-
     fn convoy(head: u64, waiters: usize) -> Stall {
         use blaze_core::lock::stall::{Blocked, WaitRow};
         let on = Blocked::Signal("test.gate");
-        let oldest =
-            WaitRow { thread: head + 100, span: 0, since_ns: 0, on, holder: Some(head), site: None };
+        let oldest = WaitRow {
+            thread: head + 100,
+            span: 0,
+            since_ns: 0,
+            deadline_ns: None,
+            on,
+            holder: Some(head),
+            site: None,
+        };
         Stall::Convoy { head, head_wait: None, holds: on, waiters, oldest }
     }
 
@@ -407,6 +357,7 @@ mod tests {
                 thread,
                 span: 0,
                 since_ns: 0,
+                deadline_ns: None,
                 on: Blocked::Signal("test.gate"),
                 holder: None,
                 site: None,

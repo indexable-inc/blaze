@@ -10,6 +10,9 @@
 //! holds each message to them before it changes anything: [`FRAME_MOST`] is the driver's (a
 //! frame past it is never read), the rest are the core's.
 
+// The order promised above, held by `blaze::cbor_field_order`.
+#![blaze::canonical_cbor]
+
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 
@@ -195,11 +198,11 @@ pub struct JobSpec {
     /// The root the verdict is asked of: the lane's, or one of its last [`ROOTS_KEPT`]. Any
     /// other is a refusal naming both: no job judges a tree other than the one named.
     pub at: ContentId,
-    /// The schema of blaze-api `targets` is written in.
-    pub api: u32,
     /// For [`Kind::Test`]: every test, not only the tests the lane's change reaches. With
     /// another kind it is refused, not ignored.
     pub all: bool,
+    /// The schema of blaze-api `targets` is written in.
+    pub api: u32,
     pub kind: Kind,
     pub lane: String,
     /// The objective or the named piece of one this job is for.

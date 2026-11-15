@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 aho-corasick.workspace = true
+base-db.workspace = true
 blaze-build-script.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
@@ -29,15 +30,16 @@ blaze-serde.workspace = true
 blaze-vfs.workspace = true
 memchr.workspace = true
 postcard.workspace = true
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 serde_json.workspace = true
+tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

@@ -333,8 +333,9 @@ fn object(code_relocs: &[(u8, u32, u32, i64)]) -> Vec<u8> {
 
     reloc_section(&mut out, "reloc.CODE", 4, code_relocs);
     reloc_section(&mut out, "reloc.DATA", 5, &[(2, 28, 1, 0)]);
-    // `.debug_info`'s contents start with its name: 12 bytes.
-    reloc_section(&mut out, "reloc..debug_info", 7, &[(9, 12, 9, 0)]);
+    // At `.debug_info`'s payload's first byte: offsets in a custom section are from after its
+    // name, as LLVM writes and reads them (`wasm::object`'s own `object_bytes`).
+    reloc_section(&mut out, "reloc..debug_info", 7, &[(9, 0, 9, 0)]);
     out
 }
 

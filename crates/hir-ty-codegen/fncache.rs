@@ -858,6 +858,11 @@ impl<'db> Walk<'db> {
 
     /// Looks through the MIR of code of the workspace for what its machine code does not
     /// tell: a raw pointer dereferenced, or an address taken as a number.
+    #[expect(
+        blaze::reads_positions,
+        reason = "the cache's purity walk keeps the reason a function is impure worded with where it is: keep \
+                  the span, and word the place where the reason is shown"
+    )]
     fn look_into(
         &mut self,
         at: u32,
@@ -977,6 +982,11 @@ impl<'db> Walk<'db> {
         told
     }
 
+    #[expect(
+        blaze::reads_positions,
+        reason = "the cache's purity walk words where a call site is inside its own run: keep the site, and word \
+                  the place where the reason is shown"
+    )]
     fn site_location(&self, at: u32, site: Site) -> Option<String> {
         let db = self.db;
         let body = match &self.nodes[at as usize].node {
@@ -1373,6 +1383,7 @@ fn describe(db: &Db, node: &Node) -> String {
 }
 
 /// File, line and column of a place in a body, the file relative to the workspace.
+#[blaze::renders_positions]
 pub(super) fn location(db: &Db, owner: InferBodyId<'_>, span: MirSpan) -> Option<String> {
     let owner = match owner {
         InferBodyId::DefWithBodyId(owner) => owner,

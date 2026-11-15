@@ -41,10 +41,12 @@ struct V {
     twice: { a: A, b: B, a: B },
     defaulted: { a: u8 = 1 },
 }
-//- /other.rs crate:other
+#[macro_export]
+macro_rules! one { ($t:ty) => { { a: $t } } }
+//- /other.rs crate:other deps:main
 struct A;
 struct V {
-    a: { a: A },
+    a: main::one!(A),
 }
 "#;
 
@@ -130,8 +132,10 @@ fn a_record_type_is_refused_naming_the_field_and_the_rule() {
     });
 }
 
-/// `other` shares `main`'s source root, so its file parses with the record; hir-ty refuses
-/// it, as the crate lacks the attribute.
+/// `other` writes the record type through `main`'s macro, whose tokens parse under `main`'s
+/// `#![blaze::records]` (a token is parsed under the extensions of the crate that wrote it,
+/// d53c5a25ab; written in `other`'s own file it would not parse as a record at all); hir-ty
+/// refuses it, as the crate it is in lacks the attribute.
 #[test]
 fn a_crate_without_the_attribute_is_refused() {
     fields(TYPES, "other", |_, _, diagnostics| {
@@ -245,9 +249,11 @@ fn pattern_misses_a_field(p: { x: i32, y: i32 }) { let { x } = p; }
 fn pattern_names_no_field(p: { x: i32, y: i32 }) { let { x, z, .. } = p; }
 fn pattern_on_no_record(p: u8) { let { x, .. } = p; }
 fn field_of_no_such_name(p: { x: i32 }) -> i32 { p.z }
+#[macro_export]
+macro_rules! point { () => { { x: 1, y: 2 } } }
 //- /plain.rs crate:plain deps:main
 fn not_gated() {
-    main::takes({ x: 1, y: 2 });
+    main::takes(main::point!());
 }
 "#;
 
@@ -364,8 +370,9 @@ fn a_field_left_out_with_no_default_names_the_field_and_the_function() {
     });
 }
 
-/// `plain` lacks the attribute: the record value it writes is refused, whatever it is
-/// passed to.
+/// `plain` lacks the attribute: the record value in its body is refused, whatever it is
+/// passed to. The value is `main`'s macro's, whose tokens parse as a record under `main`'s
+/// attribute (d53c5a25ab); written in `plain`'s file it would parse as a block.
 #[test]
 fn a_crate_without_the_attribute_writes_no_record_value() {
     inferred("plain", "not_gated", |_, result| {

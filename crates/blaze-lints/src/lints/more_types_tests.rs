@@ -165,7 +165,9 @@ fn todo() {
 
 "
     );
-    assert_eq!(lint(&fixture, &only("todo")), expected);
+    // blaze's own lint of the same call (`blaze::todo`, on by default) says the hole's type;
+    // it has its tests in `blaze/reach_tests.rs`.
+    assert_eq!(lint(&fixture, &format!("{} -A blaze::todo", only("todo"))), expected);
 }
 
 #[test]
@@ -553,7 +555,14 @@ fn f(s: S) -> u32 {
     ), "{found}");
     assert!(found.contains("or consider marking this type as `Copy`"), "{found}");
     assert!(found.contains("consider taking a reference instead"), "{found}");
-    assert!(found.contains("4 | fn f(s: &S) -> u32 {\n  |         +\n"), "{found}");
+    assert!(
+        found.contains(
+            r"4 | fn f(s: &S) -> u32 {
+  |         +
+"
+        ),
+        "{found}"
+    );
 }
 
 #[test]

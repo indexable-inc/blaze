@@ -1,0 +1,14 @@
+{
+ "id": "shared-task-looks",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor 2b, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs native_shared, Stage::Native; serve/work.rs Shared; crates/blaze-lower/src/lib.rs Ran, apply_run",
+ "what": "Once each build owns its looks, a look made inside a task that two jobs share (single-flighted by its plane key) reached only the build whose job ran it; the native layout's look was patched in by hand at Stage::Native as a made-up Dir answer. Separately, a build script's run left its OUT_DIR files twice in memory: Ran held a Vec copy and apply_run copied each into the front end's texts, and every dependent crate's Applied cloned the run's env and cfgs.",
+ "cost": "a certificate of a build that joined a shared task could miss the read it rests on; tempo's plane tag held 5.6 GiB at its peak (not measured how much of it was run files)",
+ "cause": "a shared task's result carried its value but not what it looked at; a run's result and the front end each owned their bytes",
+ "class": "a value shared by many takers whose evidence (or bytes) stays with whoever made it",
+ "prevention": "a shared task's result is `serve::work::Shared<T>` (value plus the task's own looks), taken by every job with `Shared::take`; a run's files are `Arc<[u8]>` from `blaze_usercode::run::OutFile` to the front end's text",
+ "workaround": "none",
+ "fix": "Shared<T>, native_shared (the task's real entry look); Ran.files Arc<[u8]>, Ran.env Arc<[..]>, Applied shares cfgs and env. Tests: request::tests both_builds_sharing_a_task_miss_once_what_it_looked_at_moved (control Plant::LooksToRunner), blaze-lower an_applied_run_shares_its_bytes_and_copies_none. Open: a root resolved through a link in the macro expander's KeptRoots (/tmp/plan/handoff-2.md)",
+ "state": "fixed, one site handed off"
+}

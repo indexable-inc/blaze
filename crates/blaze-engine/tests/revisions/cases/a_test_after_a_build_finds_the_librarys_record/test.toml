@@ -1,0 +1,21 @@
+about = "Build, then test, then build: the unit record of a library a test plan and a build plan share (`up`, built the same for both) is found by the test, whose only new unit is the test program, and the build after the test makes nothing. The job's kind is in a unit's key only as whether it checks. The front end's side of the same question (one front end for every plan) is lane sealed-1112's."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+args = ["-p", "app"]
+
+[[revision]]
+steps = []
+action = "test"
+args = ["-p", "app"]
+says = ["test tests::shown_is_twelve ... ok"]
+max_records = 1
+
+[[revision]]
+steps = []
+action = "build"
+args = ["-p", "app"]
+redone = []
+max_units = 0
+max_records = 0

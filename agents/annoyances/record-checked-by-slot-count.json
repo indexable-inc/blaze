@@ -1,0 +1,14 @@
+{
+ "id": "record-checked-by-slot-count",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), test-selection lane, fix-hello-1113",
+ "where": "crates/blaze-testsel/src/table.rs Image::executed; crates/blaze-cargo/src/serve/unit/codegen.rs tests_table; library/blaze_inproc_rt/src/live/log.rs __blaze_exec_table; crates/blaze-usercode/src/test/wire.rs Table",
+ "what": "On Linux AArch64 every kept pass of a sandboxed suite failed the run: 'the execution record has 86595 slots and the binary 21059: it is of another binary'. Both numbers were slot counts of one jump table: the runtime's is the table's capacity (blaze-link's header count, table::capacity = max(2f, f + 65536) = 21059 + 65536 = 86595), the daemon's the slots the link gave out (Image::slots). Selection had never kept a whole record of a real link before the Linux sandbox made sandboxed tests the default.",
+ "cost": "a coordinator round on Linux and a lane pass reading the runtime, the linker header and the fork server",
+ "cause": "'this record is of this binary' was checked by comparing two counts that each side computed from a different notion of 'slots', and a count is no identity anyway: every generation of an image has one capacity, so a record of the binary's previous link would have passed",
+ "class": "an identity check made with a derived quantity (a count, a length) instead of the identity both sides can carry",
+ "prevention": "the runtime names its table by identity (__blaze_exec_table: lineage and generation from the live descriptor, slot count = capacity), every whole record on the wire carries that Table (protocol version 4), the execution table keeps the link's JumpTable (lineage, generation, capacity, given; unit record layout 15), and Image::executed reads a record only when its Table equals the image's, before any slot; a mismatch stays a run failure (blaze inconsistent, never a test's doing), a slot past those given out is EmptySlot. Tests: blaze-testsel table/tests.rs a_record_is_read_only_against_the_table_it_names (controls: next generation, other lineage, the given-out count), blaze-cargo test/tests.rs a_table_is_its_image_slot_for_slot (named by capacity)",
+ "workaround": "none",
+ "fix": "in the working tree of fix-hello-1113 (blaze-merge-1113), not yet compiled",
+ "state": "open"
+}

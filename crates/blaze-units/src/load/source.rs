@@ -42,6 +42,9 @@ pub(crate) struct Sources {
     /// `/`-separated.
     kept: String,
     offline: Option<&'static str>,
+    /// What `blaze.lock` pins each git source's tree by: a git package is located only when
+    /// its source is pinned here (rule `weak_source_pin`, [`blaze_audit::source`]).
+    pins: blaze_audit::pins::SourcePins,
 }
 
 /// Where a package is.
@@ -73,16 +76,23 @@ impl Sources {
     /// `[registries]`, `registry.index`, `registries.crates-io.protocol` (sparse by default).
     /// `kept` is where the daemon keeps fetched packages ([`crate::query::BuildConfig::sources`]).
     /// `offline` is `Some("--offline")` or `Some("--frozen")` when the command line or
-    /// `net.offline` makes the build offline.
+    /// `net.offline` makes the build offline. `pins` is what the workspace's `blaze.lock` pins
+    /// git trees by ([`crate::lock::source_pins`]).
     pub(crate) fn new<F: Files>(
         config: &Config<F>,
         kept: &str,
         offline: Option<&'static str>,
+        pins: blaze_audit::pins::SourcePins,
     ) -> anyhow::Result<Sources> {
         let kept = normal(std::path::Path::new(kept)).ok_or_else(|| {
             anyhow!("the daemon names `{kept}`, no absolute directory, for where it keeps the packages it fetches")
         })?;
-        Ok(Sources { map: source_map(config)?, kept, offline })
+        Ok(Sources { map: source_map(config)?, kept, offline, pins })
+    }
+
+    /// What `blaze.lock` pins git trees by.
+    pub(crate) fn pins(&self) -> &blaze_audit::pins::SourcePins {
+        &self.pins
     }
 
     /// A package the resolve pins that is not a path package: where cargo has its `Cargo.toml`,
@@ -239,7 +249,10 @@ impl Sources {
         })))
     }
 
-    /// A package of a git source: in the checkout of the commit the lock file pins.
+    /// A package of a git source: in the checkout of the commit the lock file pins, whose tree
+    /// `blaze.lock` pins by its digest. A commit id (SHA-1) is no pin, so a package whose tree
+    /// is not pinned is refused before its checkout is read or fetched, and the fetch carries
+    /// the digest the fetcher checks the tree against before it is mounted.
     fn git_package(
         &self,
         cx: &mut Cx<'_>,
@@ -266,6 +279,11 @@ impl Sources {
                 id.version()
             )));
         }
+        let package = format!("{} v{}", id.name(), id.version());
+        let tree = match blaze_audit::source::require_git(&self.pins, &package, source.url().as_str(), commit) {
+            Ok(tree) => tree.to_string(),
+            Err(refused) => return Ok(Err(anyhow!("{refused}"))),
+        };
         let at = format!("{}/git/checkouts/{}/{commit}", self.kept, from.git_ident());
         if let Found::Here(_) = read_dir(cx, &at)? {
             return Ok(
@@ -278,7 +296,7 @@ impl Sources {
         Ok(Ok(Located::Needs(Fetch {
             what: format!("git repository `{}`", from.url()),
             url: from.url().to_string(),
-            kind: FetchKind::Git { commit: commit.to_owned() },
+            kind: FetchKind::Git { commit: commit.to_owned(), tree },
             at,
         })))
     }

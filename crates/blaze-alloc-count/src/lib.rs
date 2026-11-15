@@ -24,6 +24,10 @@
 //! thread's last measurement after the panic message, so a budget assertion right after its
 //! measurement shows where the allocations it counted came from.
 
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     backtrace::Backtrace,
@@ -46,6 +50,10 @@ pub struct Used {
     pub largest: u64,
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "TRACES holds a measurement's traces only while tracing is on, truncated back as each measurement ends"
+)]
 thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };

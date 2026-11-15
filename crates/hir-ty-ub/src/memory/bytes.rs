@@ -118,6 +118,10 @@ impl Bytes {
     }
 
     /// A pointer of `size` bytes with provenance `prov`, initialized.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "`size` is a target's pointer size (at most 16 bytes, from the target's data layout), so it fits a u8 run length"
+    )]
     pub fn pointer(size: usize, prov: Option<Prov>) -> Bytes {
         let mut bytes = Bytes::init(size);
         if let Some(prov) = prov

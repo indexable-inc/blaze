@@ -1,0 +1,15 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+loud = []
+
+[dependencies]
+
+[workspace]
+members = []
+exclude = ["vendor"]
+resolver = "3"

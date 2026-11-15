@@ -11,8 +11,7 @@ use std::{
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::{HashMap, HashSet};
 use blaze_query::db::Database as _;
-use hegel::generators as gs;
-use hegel::{Hegel, Settings};
+use blaze_sim::Config;
 use hir_expand::fixture;
 use blaze_core::lock::Lock;
 use std::alloc::Global;
@@ -89,13 +88,12 @@ fn crate_text(types: u8, blocks: usize, nested: bool, unnamed: usize, called: us
 
 #[test]
 fn no_two_bodies_of_a_crate_share_a_span_name() {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(48);
-    Hegel::new(|tc| {
-        let types = tc.draw(gs::integers::<u8>().max_value(63));
-        let blocks = tc.draw(gs::integers::<usize>().max_value(4));
-        let nested = tc.draw(gs::booleans());
-        let unnamed = tc.draw(gs::integers::<usize>().max_value(3));
-        let called = tc.draw(gs::integers::<usize>().max_value(3));
+    blaze_sim::check(Config::cases(48), |tape| {
+        let types = tape.int_in(0..=63u8, "types");
+        let blocks = tape.int_in(0..=4usize, "blocks");
+        let nested = tape.bool("nested");
+        let unnamed = tape.int_in(0..=3usize, "unnamed");
+        let called = tape.int_in(0..=3usize, "called");
         let text = crate_text(types, blocks, nested, unnamed, called);
         let fixture = fixture::db(&text);
         let db = fixture.db();
@@ -106,9 +104,7 @@ fn no_two_bodies_of_a_crate_share_a_span_name() {
             blocks * (1 + usize::from(nested)),
             "a block's `inner` lost to another of\n{text}"
         );
-    })
-    .settings(Settings::new().test_cases(cases).database(None))
-    .run();
+    });
 }
 
 const EXACT: &str = r#"

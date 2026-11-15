@@ -36,6 +36,12 @@ impl std::error::Error for TlsSetup {}
 /// rustls on ring with the machine's roots, as hyper-rustls's `with_native_roots` read them: a
 /// certificate that does not parse is skipped, none at all is [`TlsSetup::NoRoots`].
 pub fn native() -> Result<Arc<rustls::ClientConfig>, TlsSetup> {
+    with_roots(native_roots()?)
+}
+
+/// The machine's roots, as [`native`] reads them: for a client that makes its own rustls
+/// config (h3's, with ALPN `h3` and resumption).
+pub fn native_roots() -> Result<rustls::RootCertStore, TlsSetup> {
     let found = rustls_native_certs::load_native_certs();
     let mut roots = rustls::RootCertStore::empty();
     let (added, skipped) = roots.add_parsable_certificates(found.certs);
@@ -44,7 +50,7 @@ pub fn native() -> Result<Arc<rustls::ClientConfig>, TlsSetup> {
         let errors = found.errors.iter().map(ToString::to_string).collect();
         return Err(TlsSetup::NoRoots { skipped, errors });
     }
-    with_roots(roots)
+    Ok(roots)
 }
 
 /// rustls on ring at its safe default versions, checking servers against `roots`, with no

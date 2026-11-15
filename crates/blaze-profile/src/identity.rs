@@ -25,17 +25,39 @@ pub fn binary() -> io::Result<String> {
     Ok(hex(&binary_hash()?))
 }
 
+/// The process's hash of its own executable, once known: [`seed`]ed by the one home of it
+/// (blaze-cargo's `serve::local::tool_hash`, by the executable's stamp), or read whole by
+/// [`binary_hash`].
+static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// The running executable's file: Linux's `/proc/self/exe`, which follows the running inode
+/// even once another file is renamed over its path; elsewhere the path it was started from
+/// (`std::env::current_exe`), which holds the running file unless something renamed another
+/// over it while it runs.
+pub fn running() -> io::Result<std::path::PathBuf> {
+    let proc = Path::new("/proc/self/exe");
+    match proc.exists() {
+        true => Ok(proc.to_path_buf()),
+        false => std::env::current_exe(),
+    }
+}
+
 /// The BLAKE3 hash of the executable running now, read once a process: the executable is not
 /// written in place while it runs (see ix-prof's `map`), so the first hash is every later one.
-/// A read that fails is not kept, and the next call tries again.
+/// [`seed`]ed, it reads nothing. A read that fails is not kept, and the next call tries again.
 pub fn binary_hash() -> io::Result<[u8; 32]> {
-    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     if let Some(hash) = HASH.get() {
         return Ok(*hash);
     }
-    let exe = std::env::current_exe()?;
-    let hash = tree::hash_file(&exe)?.1;
+    let hash = tree::hash_file(&running()?)?.1;
     Ok(*HASH.get_or_init(|| hash))
+}
+
+/// Gives the process its hash of its own executable, `hash`, as known by the executable's
+/// stamp, so no reader of [`binary_hash`] reads the executable; whether it took. A hash
+/// already known stays (`false`): the first is every later one.
+pub fn seed(hash: [u8; 32]) -> bool {
+    HASH.set(hash).is_ok()
 }
 
 /// `hash` as 64 hex digits.
@@ -57,17 +79,16 @@ mod tests {
 
     use super::*;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-identity-{name}-{}", std::process::id()));
-        _ = fs::remove_dir_all(&dir);
+    fn scratch(name: &str) -> blaze_core::temp::TempDir {
+        let dir = blaze_core::temp::TempDir::for_test(&format!("blaze-identity-{name}-"));
         fs::create_dir_all(dir.join("src")).unwrap();
         dir
     }
 
     #[test]
     fn a_trees_digest_changes_with_a_source_file_and_not_with_its_outputs() {
-        let dir = scratch("tree");
+        let tmp = scratch("tree");
+        let dir = tmp.path();
         fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let before = tree_digest(&dir).unwrap();
         assert_eq!(before.len(), 64);
@@ -80,8 +101,7 @@ mod tests {
         assert_eq!(tree_digest(&dir).unwrap(), before, "outputs and git's files are not the tree");
 
         fs::write(dir.join("src/lib.rs"), "pub fn f() { }\n").unwrap();
-        assert_ne!(tree_digest(&dir).unwrap(), before, "an edited source file is another tree");
-        _ = fs::remove_dir_all(&dir);
+        assert_ne!(tree_digest(dir).unwrap(), before, "an edited source file is another tree");
     }
 
     #[test]

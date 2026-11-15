@@ -139,11 +139,11 @@ fn a_configured_profile_that_does_not_read_is_an_error_naming_it() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("clippy.toml");
     std::fs::write(&path, "profile = \"missing.profdata\"\nprofile-hot-percent = 5\n").unwrap();
-    let error = Conf::load(Some(path.clone()), None).unwrap().with_profile(None).unwrap_err();
+    let error = Conf::load(Some(path.clone()), None).unwrap().with_profile(None, &blaze_vfs::outside::Looks::none()).unwrap_err();
     assert!(error.contains(&dir.join("missing.profdata").display().to_string()), "{error}");
     std::fs::write(dir.join("raw.profdata"), b"not indexed").unwrap();
     std::fs::write(&path, "profile = \"raw.profdata\"\n").unwrap();
-    let error = Conf::load(Some(path.clone()), None).unwrap().with_profile(None).unwrap_err();
+    let error = Conf::load(Some(path.clone()), None).unwrap().with_profile(None, &blaze_vfs::outside::Looks::none()).unwrap_err();
     assert!(error.contains("is not an indexed profile"), "{error}");
     for (text, says) in [
         ("profile = 3\n", "expected a path for `profile`"),
@@ -159,6 +159,6 @@ fn a_configured_profile_that_does_not_read_is_an_error_naming_it() {
     }
     // No profile named: nothing to read, nothing on.
     std::fs::write(&path, "msrv = \"1.70\"\n").unwrap();
-    assert!(Conf::load(Some(path), None).unwrap().with_profile(None).unwrap().profile.is_none());
+    assert!(Conf::load(Some(path), None).unwrap().with_profile(None, &blaze_vfs::outside::Looks::none()).unwrap().profile.is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }

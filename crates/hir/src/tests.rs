@@ -562,21 +562,35 @@ fn checking_the_same_edits_twice_retains_nothing_more() {
             .collect::<Vec<_>>()
     };
     // A first round makes every row and interned key both texts need.
-    round(&mut db, B);
-    round(&mut db, A);
+    let warm = [round(&mut db, B), round(&mut db, A)];
     let first = [round(&mut db, B), round(&mut db, A)];
     let second = [round(&mut db, B), round(&mut db, A)];
-    for (first, second) in first.iter().zip(&second) {
-        let grew: Vec<_> = first
+    for (at, (first_round, second_round)) in first.iter().zip(&second).enumerate() {
+        let grew: Vec<_> = first_round
             .iter()
-            .zip(second)
+            .zip(second_round)
             .filter(|(was, now)| was.0 != now.0 || now.1 > was.1 || now.2 > was.2 || now.3 > was.3)
+            .collect();
+        // What each ingredient that grew held after each of the six rounds, in order: a step
+        // once is a value made late, a step every round is one kept or counted every round.
+        let by_round: Vec<_> = grew
+            .iter()
+            .map(|(was, _)| {
+                let held: Vec<_> = [&warm, &first, &second]
+                    .into_iter()
+                    .flatten()
+                    .map(|round| round.iter().find(|it| it.0 == was.0).map(|it| (it.1, it.2, it.3)))
+                    .collect();
+                (was.0, held)
+            })
             .collect();
         assert!(
             grew.is_empty(),
-            "the second round of the same edits retains more than the first: {grew:#?}"
+            "the second round of the same edits retains more than the first (text {}): \
+             {grew:#?}\n(rows used, row bytes, value bytes) after each round: {by_round:#?}",
+            ["B", "A"][at]
         );
-        assert_eq!(first.len(), second.len(), "an ingredient appeared");
+        assert_eq!(first_round.len(), second_round.len(), "an ingredient appeared");
     }
 }
 

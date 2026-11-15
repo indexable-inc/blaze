@@ -212,6 +212,33 @@ static CONTRACT_TEST: std::sync::LazyLock<[Name; 3]> = std::sync::LazyLock::new(
         .map(Name::new_symbol_root)
 });
 
+/// `::core::blaze::unreachable`, what the macro path `blaze::unreachable` names where it names
+/// nothing else.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one alias path: its names are interned once"
+)]
+static BLAZE_UNREACHABLE: std::sync::LazyLock<[Name; 3]> = std::sync::LazyLock::new(|| {
+    [intern::sym::core, Symbol::intern("blaze"), Symbol::intern("unreachable")]
+        .map(Name::new_symbol_root)
+});
+
+/// The path a function-like macro's `path` falls back to when it resolves to no macro:
+/// `blaze::unreachable` is blaze's builtin `::core::blaze::unreachable`
+/// (docs/v2/plan/design/proved-unreachable.md). A fallback, not an alias: a crate whose own
+/// `blaze::unreachable` is a macro keeps it, so no program that does not use the extension
+/// changes (rule `superset-of-rust`).
+fn bang_path_fallback(path: &ModPath, expected: Option<MacroSubNs>) -> Option<Segments<'static>> {
+    match (expected, path.kind, path.segments()) {
+        (Some(MacroSubNs::Bang), PathKind::Plain, [first, second])
+            if first.symbol().as_str() == "blaze" && second.symbol().as_str() == "unreachable" =>
+        {
+            Some(Segments::plain(&BLAZE_UNREACHABLE[..]))
+        }
+        _ => None,
+    }
+}
+
 /// The path an attribute macro's `path` resolves as: `blaze::contract_test` is blaze's builtin
 /// `::core::blaze::contract_test` (docs/v2/plan/design/contracts.md, part 2) in every crate,
 /// whatever else `blaze` names there, as `blaze::pure` and the other inert `blaze::` attributes
@@ -319,7 +346,13 @@ impl DefMap {
         let q =
             PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         let (kind, segments) = attr_path_alias(path, expected_macro_subns);
-        self.resolve_fp(q, original_module, kind, segments, &mut |_| {})
+        let result = self.resolve_fp(q, original_module, kind, segments, &mut |_| {});
+        match bang_path_fallback(path, expected_macro_subns) {
+            Some(fallback) if result.resolved_def.macros.is_none() => {
+                self.resolve_fp(q, original_module, PathKind::Abs, fallback, &mut |_| {})
+            }
+            _ => result,
+        }
     }
 
     /// [`Self::resolve_path_fp_with_macro`], calling `reads` with everything the lookup read,
@@ -338,7 +371,13 @@ impl DefMap {
         let q =
             PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         let (kind, segments) = attr_path_alias(path, expected_macro_subns);
-        self.resolve_fp(q, original_module, kind, segments, reads)
+        let result = self.resolve_fp(q, original_module, kind, segments, reads);
+        match bang_path_fallback(path, expected_macro_subns) {
+            Some(fallback) if result.resolved_def.macros.is_none() => {
+                self.resolve_fp(q, original_module, PathKind::Abs, fallback, reads)
+            }
+            _ => result,
+        }
     }
 
     pub(super) fn resolve_path_fp_with_macro_single(
@@ -409,8 +448,12 @@ impl DefMap {
                     if original_module != current_map.root && current_map.block.is_some() {
                         // A module inside a block. Do not resolve items declared in upper blocks, but we do need to get
                         // the prelude items (which are not inserted into blocks because they can be overridden there).
-                        original_module = current_map.root;
+                        // They are looked up from the crate's root, a module of the crate's map:
+                        // the block's root is not one, and the rest of a path a prelude starts
+                        // (`proc_macros::pass` from a `mod` in a block) is checked against the
+                        // map it is looked up in.
                         current_map = crate_def_map(q.db, self.krate);
+                        original_module = current_map.root;
 
                         let new = current_map.resolve_in_all_preludes(
                             q,

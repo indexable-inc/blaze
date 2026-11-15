@@ -47,7 +47,7 @@ function needless(t: HTMLElement, text: string): boolean {
 
 function show(t: HTMLElement): void {
 	if (!t.isConnected || !t.dataset.tip || needless(t, t.dataset.tip)) return;
-	// Redrawn away (the presence lists redraw on every change): go with it.
+	// Gone from the page (a swap by the client router, say): go with it.
 	clearInterval(watch);
 	watch = setInterval(() => {
 		if (!t.isConnected) hide();

@@ -1,0 +1,14 @@
+{
+ "id": "per-item-baseline-not-loaded-by-build",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane complexity lints (function_weight .. module_cycle), fix-hello-1113",
+ "where": "crates/blaze-lints/src/baseline/items.rs (load, Loaded); crates/blaze-lints/src/conf.rs (Conf::items); crates/blaze-cargo/src/compile.rs (`linted`, where `conf.profile` is set); blaze-units (the `lints-ratchet` baselines directory)",
+ "what": "The complexity lints hold each existing item at its value from crates/blaze-lints/baselines/items.tsv, but the lint crate cannot load the file itself: the build that runs the lints (blaze-cargo's `linted`) is the one place that knows the ratchet's baselines directory and records the files a job looked at, and the lane may not edit it. Until it sets `conf.items = items::load(&baselines, &job.input.looks)?`, every item over a bound is a finding, so the lints stay at `warn`.",
+ "cost": "the ratchet's per-crate counts and the per-item held values are read in two different places; the lints cannot go to `deny` until a second lane wires the loader and blesses",
+ "cause": "the lint configuration (Conf) is assembled in the build driver from pieces each lint family adds (the profile, now the held values), so each new input of a lint needs a driver edit outside the lint crate",
+ "class": "lint inputs that live beside the workspace config but are loaded by the driver one by one",
+ "prevention": "one loader in blaze-lints, called once by the driver with the ratchet's directory and the job's looks, that fills every file-backed part of Conf (profile, baselines, held values); a new lint input is then a field and a line in that loader",
+ "workaround": "set `conf.items` in compile.rs next to `conf.profile`, with the directory from `[workspace.metadata.blaze.lints-ratchet] baselines`",
+ "fix": "not yet",
+ "state": "open"
+}

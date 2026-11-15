@@ -1,0 +1,37 @@
+[package]
+name = "blaze-astlog"
+description = "astlog over blaze's own front end: Rust code patterns whose paths match by name resolution, semantic relations from the database, and rewrites that go out as blaze-intent's edits"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+astlog-engine.workspace = true
+blaze-api.workspace = true
+blaze-hash.workspace = true
+blaze-intent.workspace = true
+blaze-query.workspace = true
+
+either.workspace = true
+memchr.workspace = true
+snafu.workspace = true
+
+base-db.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+blaze-vfs.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

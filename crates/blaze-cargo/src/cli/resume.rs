@@ -32,6 +32,18 @@ struct Answered {
     sent: bool,
 }
 
+/// Whether `frame`, one whole request's, is a `ClientRows`.
+#[cfg(unix)]
+fn is_client_rows(frame: &[u8]) -> bool {
+    let mut frames = blaze_api::frames::Frames::new();
+    frames.push(frame);
+    let Ok(Some(item)) = frames.next_ref() else { return false };
+    matches!(
+        blaze_api::frames::decode::<blaze_api::Request>(item),
+        Ok(blaze_api::Envelope { body: blaze_api::Request::ClientRows { .. }, .. })
+    )
+}
+
 /// Where two frames first differ, for the refusal.
 #[cfg(unix)]
 fn differs_at(ours: &[u8], theirs: &[u8]) -> usize {
@@ -41,12 +53,19 @@ fn differs_at(ours: &[u8], theirs: &[u8]) -> usize {
 #[cfg(unix)]
 impl blaze_api::client::Local for Answered {
     /// The command's request, which the thin `blaze` already sent: nothing is sent, and a
-    /// frame that is not the one it sent is refused.
+    /// frame that is not the one it sent is refused. After it, the connection carries the
+    /// command's client rows (`ClientRows`, `client_rows::send`) and nothing else: they are
+    /// written to it, so a command is one connection (handoff-12 request 2a).
     fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
         if self.sent {
-            return Err(std::io::Error::other(
-                "a second request on the connection the thin `blaze` began, which carries its one request",
-            ));
+            if !is_client_rows(frame) {
+                return Err(std::io::Error::other(
+                    "a second request on the connection the thin `blaze` began, which carries its one request and \
+                     then only the command's client rows",
+                ));
+            }
+            return self.socket.write_all(frame);
         }
         self.sent = true;
         if frame != self.request {
@@ -122,6 +141,9 @@ pub fn client(began: Began) -> Result<Client, String> {
         answer: held.answer.to_vec(),   // alloc: once a command
         sent: false,
     };
+    // The thin `blaze`'s own spans until it handed over: sent with this process's as the
+    // build's client rows (`client_rows::rows`), so the command's time is one build's.
+    super::client_rows::handed(held.timed, held.started_ns);
     // alloc: once a command, the client's link
     Ok(Client::local_from(Box::new(answered), began.id))
 }
@@ -171,8 +193,10 @@ mod tests {
         assert_eq!(seen, [true, true]);
     }
 
-    /// The control: a request the engine makes differently from the one sent is refused, and a
-    /// second request is too.
+    /// The invariant: the connection carries the one request the thin `blaze` sent, then the
+    /// command's client rows and nothing else. Controls: a request the engine makes
+    /// differently from the one sent is refused, and a second request that is not the rows is
+    /// too.
     #[test]
     fn another_request_than_the_one_sent_is_refused() {
         let sent = frames::encode(&Envelope::new(2, Request::Status)).unwrap();
@@ -180,9 +204,25 @@ mod tests {
         let (mut other, _daemon) = answered(&sent, &[]);
         let refused = other.send(&made).unwrap_err().to_string();
         assert!(refused.contains("another request than this blaze makes"), "{refused}");
-        let (mut same, _daemon) = answered(&sent, &[]);
+        let (mut same, mut daemon) = answered(&sent, &[]);
         same.send(&sent).unwrap();
         assert!(same.send(&sent).is_err());
+        // After it, the command's client rows go on the same connection, written as made.
+        let rows = Request::ClientRows {
+            pid: 41,
+            build: 7,
+            spans: Vec::new(),
+            timed: Vec::new(),
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns: 2,
+            started_ns: 1,
+        };
+        let rows = frames::encode(&Envelope::new(3, rows)).unwrap();
+        same.send(&rows).unwrap();
+        let mut written = vec![0; rows.len()];
+        std::io::Read::read_exact(&mut daemon, &mut written).unwrap();
+        assert_eq!(written, rows);
         // Another id is another frame: the client is made with the id the thin `blaze` used.
         let (answered, _daemon) = answered(&sent, &[]);
         let mut client = Client::local_from(Box::new(answered), 3);

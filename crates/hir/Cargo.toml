@@ -31,6 +31,7 @@ base-db.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+blaze-report.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true

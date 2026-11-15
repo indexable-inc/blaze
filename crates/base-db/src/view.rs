@@ -8,8 +8,11 @@
 //! were made with ([`FileSetConfig`]) puts it in.
 //!
 //! The content ID a view gives is blaze-vfs's ([`blaze_vfs::FILE_DOMAIN`], of the bytes
-//! alone), checked against the bytes: the one time a file's bytes are hashed, every file of a
-//! call in one batch. A file's [`FileText::content`] is built on it
+//! alone). A view read from a [`blaze_query::Tree`] ([`Files::set_view_root_from_tree`]) is
+//! not hashed here at all: the tree made each ID from the bytes when it read them (its
+//! contract), and that one hash is the only one a file's bytes get. A view whose IDs a caller
+//! wrote by hand ([`Files::set_view_root`], fixtures and tests) has them checked against the
+//! bytes, every file of a call in one batch. A file's [`FileText::content`] is built on it
 //! ([`FileText::content_of_file`], adding the module the compiler appends), and blaze-vfs's is
 //! kept to tell next time that a file is unchanged without reading it.
 //!
@@ -196,6 +199,10 @@ fn under(rel: &str, dir: &str) -> bool {
         || rel.strip_prefix(dir).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread sort scratch kept at the largest it grew to, uncapped"
+)]
 thread_local! {
     static ROOT_SORT: RefCell<Scratch<SourceRootId>> = const { RefCell::new(Scratch::new()) };
     static FILE_SORT: RefCell<Scratch<FileId>> = const { RefCell::new(Scratch::new()) };
@@ -230,6 +237,15 @@ struct Plan<'f> {
     next_file: u32,
 }
 
+/// Who made a view's content IDs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ids {
+    /// Its caller: each is checked against the bytes.
+    Given,
+    /// A [`blaze_query::Tree`], from the bytes as it read them: taken as they are.
+    Tree,
+}
+
 struct Write {
     /// Where it is in [`ViewRoot::files`].
     at: usize,
@@ -247,6 +263,30 @@ impl Files {
     /// ([`Files::raw_file`]), hashed again only when they change. Every file's ID is checked
     /// against its bytes before anything is written, and a mismatch refuses the whole view.
     pub fn set_view_root(&self, db: &mut Db, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
+        self.write_view_root(db, view, Ids::Given)
+    }
+
+    /// [`Files::set_view_root`] for a view read from a [`blaze_query::Tree`]: each ID is the
+    /// one the tree made from the bytes when it read them, so they are not hashed again. The
+    /// floor of a view set is one hash of each new file's bytes, and the tree paid it; checking
+    /// here was a second pass over every changed byte (all of them, at a start).
+    pub fn set_view_root_from_tree(
+        &self,
+        db: &mut Db,
+        view: ViewRoot<'_>,
+    ) -> Result<ViewChange, ViewError> {
+        self.write_view_root(db, view, Ids::Tree)
+    }
+
+    /// [`Files::set_view_root`] and [`Files::set_view_root_from_tree`]: the view written, its
+    /// IDs checked against its bytes when `ids` is [`Ids::Given`]. Not [`Files::set_view`],
+    /// which says where a path is read from on disk.
+    fn write_view_root(
+        &self,
+        db: &mut Db,
+        view: ViewRoot<'_>,
+        ids: Ids,
+    ) -> Result<ViewChange, ViewError> {
         frame::task(Tag::Parse, |frame| {
             let mut writer = self.lock();
             // The paths a source root names are normalized (`VfsPath::from`), so the base must be.
@@ -263,7 +303,7 @@ impl Files {
                 Some(index) => std::mem::take(index),
                 None => ViewIndex::new(base, &writer.by_path),
             };
-            let plan = self.plan_view(&writer, &mut index, &view, frame);
+            let plan = self.plan_view(&writer, &mut index, &view, ids, frame);
             match writer.views.get_mut(base) {
                 Some(slot) => *slot = index,
                 None => {
@@ -281,6 +321,7 @@ impl Files {
         writer: &Writer,
         index: &mut ViewIndex,
         view: &ViewRoot<'_>,
+        ids: Ids,
         frame: &'f Frame,
     ) -> Result<Plan<'f>, ViewError> {
         let call = index.begin();
@@ -342,18 +383,20 @@ impl Files {
             plan.writes.push(Write { at, id, root, added });
         }
 
-        let bytes =
-            frame.alloc_slice_from_iter(plan.writes.iter().map(|it| &view.files[it.at].bytes[..]));
-        let ids = content::hash_many(blaze_vfs::FILE_DOMAIN, bytes, frame);
-        for (write, &bytes) in plan.writes.iter().zip(ids) {
-            let file = &view.files[write.at];
-            if bytes != file.id {
-                return Err(ViewError::Mismatch {
-                    // alloc: the refusal's message (an error path).
-                    path: file.path.to_owned(),
-                    given: file.id,
-                    bytes,
-                });
+        if ids == Ids::Given {
+            let bytes = frame
+                .alloc_slice_from_iter(plan.writes.iter().map(|it| &view.files[it.at].bytes[..]));
+            let hashed = content::hash_many(blaze_vfs::FILE_DOMAIN, bytes, frame);
+            for (write, &bytes) in plan.writes.iter().zip(hashed) {
+                let file = &view.files[write.at];
+                if bytes != file.id {
+                    return Err(ViewError::Mismatch {
+                        // alloc: the refusal's message (an error path).
+                        path: file.path.to_owned(),
+                        given: file.id,
+                        bytes,
+                    });
+                }
             }
         }
 
@@ -452,7 +495,8 @@ impl Files {
         }
 
         for &(id, root, _) in &plan.added {
-            self.set_file_source_root_in(writer, db, id, root, Durability::MEDIUM);
+            let durability = crate::files::root_durability(writer, root);
+            self.set_file_source_root_in(writer, db, id, root, durability);
         }
         let mut roots: Vec<SourceRootId, &Frame> =
             Vec::with_capacity_in(plan.added.len() + plan.removed.len(), frame);
@@ -516,9 +560,10 @@ impl Files {
             gone.extend(plan.removed.iter().filter(|it| it.0 == root).map(|it| it.1));
             // The root's set, taken out of its input to be edited where it is: no reader holds
             // it by then (they read it by reference), so `make_mut` copies nothing.
+            let root_kind = crate::files::root_durability(writer, root);
             let spare = writer.spare_root();
             let mut source_root =
-                input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(spare);
+                input.set_source_root_field(db).with_durability(root_kind).to(spare);
             let index = writer
                 .root_contents
                 .get_mut(&root)
@@ -572,7 +617,7 @@ impl Files {
                 }
                 writer.note_path(path, *id);
             }
-            input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(source_root);
+            input.set_source_root_field(db).with_durability(root_kind).to(source_root);
             if !changed.contains(&root) {
                 changed.push(root);
             }

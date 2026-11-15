@@ -85,6 +85,45 @@ impl Thread {
     pub(crate) fn leave(&mut self) {
         self.live = false;
     }
+
+    /// The CPU time the thread has used, read from another thread: `thread_info` of
+    /// `THREAD_BASIC_INFO` on its Mach port, its user and system time (microseconds). `None`
+    /// for a thread that left, whose port is no longer its. The caller holds the lock the
+    /// thread takes to leave.
+    pub(crate) fn cpu_ns(&self) -> Option<u64> {
+        if !self.live {
+            return None;
+        }
+        let info = basic_info(self)?;
+        let us = |it: libc::time_value_t| it.seconds as u64 * 1_000_000 + it.microseconds as u64;
+        Some((us(info.user_time) + us(info.system_time)) * 1_000)
+    }
+}
+
+/// The thread's `THREAD_BASIC_INFO`, `None` if the kernel refused it.
+fn basic_info(thread: &Thread) -> Option<libc::thread_basic_info> {
+    let mut info = libc::thread_basic_info {
+        user_time: libc::time_value_t { seconds: 0, microseconds: 0 },
+        system_time: libc::time_value_t { seconds: 0, microseconds: 0 },
+        cpu_usage: 0,
+        policy: 0,
+        run_state: 0,
+        flags: 0,
+        suspend_count: 0,
+        sleep_time: 0,
+    };
+    let mut count = libc::THREAD_BASIC_INFO_COUNT;
+    // SAFETY: `info` is a `thread_basic_info` of `count` words to fill, for a live thread's
+    // port (the caller holds the lock its thread takes to leave).
+    let got = unsafe {
+        libc::thread_info(
+            thread.port,
+            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+            (&raw mut info).cast(),
+            &mut count,
+        )
+    };
+    (got == libc::KERN_SUCCESS).then_some(info)
 }
 
 fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
@@ -127,28 +166,7 @@ pub(super) fn run(hz: u32) {
 
 /// Whether the thread is on a CPU now: a thread blocked in the kernel uses none.
 fn running(thread: &Thread) -> bool {
-    let mut info = libc::thread_basic_info {
-        user_time: libc::time_value_t { seconds: 0, microseconds: 0 },
-        system_time: libc::time_value_t { seconds: 0, microseconds: 0 },
-        cpu_usage: 0,
-        policy: 0,
-        run_state: 0,
-        flags: 0,
-        suspend_count: 0,
-        sleep_time: 0,
-    };
-    let mut count = libc::THREAD_BASIC_INFO_COUNT;
-    // SAFETY: `info` is a `thread_basic_info` of `count` words to fill, for a live thread's
-    // port (the caller holds the lock its thread takes to leave).
-    let got = unsafe {
-        libc::thread_info(
-            thread.port,
-            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
-            (&raw mut info).cast(),
-            &mut count,
-        )
-    };
-    got == libc::KERN_SUCCESS && info.run_state == libc::TH_STATE_RUNNING
+    basic_info(thread).is_some_and(|info| info.run_state == libc::TH_STATE_RUNNING)
 }
 
 /// Stops the thread, reads its stack and lets it go: nothing allocated and no lock taken

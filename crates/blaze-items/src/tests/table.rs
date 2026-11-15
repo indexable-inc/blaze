@@ -48,6 +48,11 @@ pub(super) fn every_kind() -> Vec<Fact> {
         Fact::Crate(id(7)),
         Fact::HiddenTypes(b),
         Fact::RpititTys(a),
+        Fact::InherentImpls(SimplifiedType(id(3))),
+        Fact::TraitImpls(b),
+        Fact::TraitsNamed(NameHash(id(4))),
+        Fact::ScopeTraitsNamed { scope: a, name: NameHash(id(4)) },
+        Fact::BlockImpls(b),
     ]
 }
 
@@ -76,7 +81,11 @@ fn order(fact: &Fact) -> (u16, QueryOrder) {
         Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {
             (trait_.0, Some(self_ty.0), None)
         }
-        Fact::Resolves { scope, name } => (scope.0, Some(name.0), None),
+        Fact::Resolves { scope, name } | Fact::ScopeTraitsNamed { scope, name } => {
+            (scope.0, Some(name.0), None)
+        }
+        Fact::InherentImpls(it) => (it.0, None, None),
+        Fact::TraitsNamed(it) => (it.0, None, None),
         Fact::Signature(it)
         | Fact::Layout(it)
         | Fact::Code(it)
@@ -89,7 +98,9 @@ fn order(fact: &Fact) -> (u16, QueryOrder) {
         | Fact::DropCheck(it)
         | Fact::Derive(it)
         | Fact::HiddenTypes(it)
-        | Fact::RpititTys(it) => (it.0, None, None),
+        | Fact::RpititTys(it)
+        | Fact::TraitImpls(it)
+        | Fact::BlockImpls(it) => (it.0, None, None),
         Fact::Target(it) | Fact::Crate(it) => (it, None, None),
     };
     (fact.kind().0, parts)

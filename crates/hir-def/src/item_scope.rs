@@ -650,10 +650,39 @@ impl<D, I> Clone for Column<D, I> {
     }
 }
 
+/// The invariant: two columns are equal when they map the same names to the same items, in
+/// any order, as the `IndexMap` a column replaced was and as [`Keyed`] is. A column lists its
+/// names in the order they were added, which is the order imports happened to resolve in: a
+/// crate collected again (its proc macros given again, its dependencies' def maps ready this
+/// time) adds the same names in another order, and means the same. Compared in order, such a
+/// scope was a changed input: set again, every reader of the module verified again. A
+/// hello-world's second `blaze run` set 15 scopes of serde_derive, zerovec_derive,
+/// thiserror_impl and displaydoc so (each the same entries in another order), and reth's
+/// first build after a cold one 88 (2026-11-12). The order itself is still what resolution
+/// happened to do; a scope that is equal is not published again, so its listing stays.
 impl<D, I> PartialEq for Column<D, I> {
     fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries
+        if self.entries == other.entries {
+            return true;
+        }
+        if self.entries.len() != other.entries.len() || ORDER_IS_COMPARED.get() {
+            return false;
+        }
+        // A name is in a column once: sorted by name, the two are the same entries or not.
+        // alloc: only for columns of one length that differ in order or in an entry
+        let mut mine: Vec<&Entry> = self.entries.iter().collect();
+        let mut theirs: Vec<&Entry> = other.entries.iter().collect(); // alloc: as above
+        mine.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        theirs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        mine == theirs
     }
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: two columns of the same entries in another order
+    /// are not equal, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static ORDER_IS_COMPARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl<D, I> Eq for Column<D, I> {}
@@ -1337,6 +1366,60 @@ impl ItemScope {
     }
 }
 
+/// What the collector made of one item of an item tree ([`ItemScope::items_by_ast`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ItemOfAst {
+    /// A function, an ADT, a const (named or `_`), a static, a trait, a type alias or a macro.
+    Def(ModuleDefId),
+    Impl(ImplId),
+    Use(UseId),
+    ExternBlock(ExternBlockId),
+    ExternCrate(ExternCrateId),
+}
+
+/// The items of one scope by the ast id of their item: [`ItemScope::items_by_ast`].
+pub struct ItemsByAst {
+    map: blaze_hash::HashMap<hir_expand::ErasedAstId, ItemOfAst, Global>,
+}
+
+impl ItemsByAst {
+    /// The definition the collector made of the item `ast` (in the file of its tree), if it
+    /// made one here.
+    #[inline]
+    pub fn def_of_ast(&self, ast: hir_expand::ErasedAstId) -> Option<ItemOfAst> {
+        self.map.get(&ast).copied()
+    }
+
+    /// How many items have an entry.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// The map without the items `drop` picks: a test's planted collector bug.
+    #[cfg(test)]
+    pub(crate) fn without(mut self, drop: impl Fn(ItemOfAst) -> bool) -> Self {
+        self.map.retain(|_, item| !drop(*item));
+        self
+    }
+
+    /// Two ids of one item would make the map answer for one of them only: the collector made
+    /// an item twice, which is its bug, said with both.
+    fn insert(&mut self, ast: hir_expand::ErasedAstId, item: ItemOfAst) {
+        if let Some(other) = self.map.insert(ast, item) {
+            panic!("item {ast:?} has two ids in one scope: {other:?} and {item:?}");
+        }
+    }
+}
+
+/// `id` with its node's type erased.
+fn erased<N: span::AstIdNode>(id: AstId<N>) -> hir_expand::ErasedAstId {
+    hir_expand::InFile::new(id.file_id, id.value.erase())
+}
+
 /// Legacy macros can only be accessed through special methods like `get_legacy_macros`.
 /// Other methods will only resolve values, types and module scoped macros only.
 impl ItemScope {
@@ -1419,6 +1502,64 @@ impl ItemScope {
 
     pub fn declarations(&self) -> impl Iterator<Item = ModuleDefId> + '_ {
         self.declarations.iter().copied()
+    }
+
+    /// Every item the collector made here, by the ast id of the item it made it of: the one map
+    /// from an item of an item tree ([`crate::item_tree::ModItemId::ast_id`], in the file of its
+    /// tree) to its id. Read from the ids' own locations, which hold their ast ids, so the scope
+    /// keeps no second copy of them (and its persisted form is as it was).
+    ///
+    /// A `mod`, a `macro_rules!` that is not exported, an item `cfg`'d out and a macro call
+    /// make no entry; a `#[proc_macro]` function's entry is the function, not the macro it
+    /// also defines. One scan of the scope's lists, one hash map: build it once per scope.
+    pub fn items_by_ast(&self, db: &Db) -> ItemsByAst {
+        let len = self.declarations.len()
+            + self.impls.len()
+            + self.use_decls.len()
+            + self.extern_blocks.len()
+            + self.extern_crate_decls.len()
+            + self.unnamed_consts.len();
+        let mut by_ast = ItemsByAst { map: blaze_hash::HashMap::new_in(Global) };
+        // alloc: the caller's map, once per scope it reads
+        by_ast.map.reserve(len);
+        for &def in &self.declarations {
+            let ast = match def {
+                ModuleDefId::FunctionId(it) => erased(it.lookup(db).id),
+                ModuleDefId::AdtId(AdtId::StructId(it)) => erased(it.lookup(db).id),
+                ModuleDefId::AdtId(AdtId::UnionId(it)) => erased(it.lookup(db).id),
+                ModuleDefId::AdtId(AdtId::EnumId(it)) => erased(it.lookup(db).id),
+                ModuleDefId::ConstId(it) => erased(it.lookup(db).id),
+                ModuleDefId::StaticId(it) => erased(it.lookup(db).id),
+                ModuleDefId::TraitId(it) => erased(it.lookup(db).id),
+                ModuleDefId::TypeAliasId(it) => erased(it.lookup(db).id),
+                ModuleDefId::MacroId(MacroId::Macro2Id(it)) => erased(it.lookup(db).id),
+                ModuleDefId::MacroId(MacroId::MacroRulesId(it)) => erased(it.lookup(db).id),
+                // The function it is made of is declared too, and is the item's entry.
+                ModuleDefId::MacroId(MacroId::ProcMacroId(_)) => continue,
+                // A module is a def map's, not an item's of this tree; a variant and a builtin
+                // type are never declared.
+                ModuleDefId::ModuleId(_)
+                | ModuleDefId::EnumVariantId(_)
+                | ModuleDefId::BuiltinType(_) => continue,
+            };
+            by_ast.insert(ast, ItemOfAst::Def(def));
+        }
+        for &konst in &self.unnamed_consts {
+            by_ast.insert(erased(konst.lookup(db).id), ItemOfAst::Def(konst.into()));
+        }
+        for &imp in &self.impls {
+            by_ast.insert(erased(imp.lookup(db).id), ItemOfAst::Impl(imp));
+        }
+        for &use_ in &self.use_decls {
+            by_ast.insert(erased(use_.lookup(db).id), ItemOfAst::Use(use_));
+        }
+        for &block in &self.extern_blocks {
+            by_ast.insert(erased(block.lookup(db).id), ItemOfAst::ExternBlock(block));
+        }
+        for &krate in &self.extern_crate_decls {
+            by_ast.insert(erased(krate.lookup(db).id), ItemOfAst::ExternCrate(krate));
+        }
+        by_ast
     }
 
     pub fn extern_crate_decls(&self) -> impl ExactSizeIterator<Item = ExternCrateId> + '_ {
@@ -2848,14 +2989,21 @@ mod tests {
         scope
     }
 
-    /// Equal as the maps were, but for the namespaces' order, which is what they list.
+    /// Equal as the maps were: by what each name means, in any order.
     #[test]
     fn scopes_are_equal_by_their_columns() {
         let all = names();
         let (a, b, c, d) = (all[0], all[1], all[2], all[3]);
         assert_eq!(scope_of(&[a, b], &[c, d]), scope_of(&[a, b], &[c, d]));
         assert_eq!(scope_of(&[a, b], &[c, d]), scope_of(&[a, b], &[d, c]));
-        assert_ne!(scope_of(&[a, b], &[]), scope_of(&[b, a], &[]));
+        assert_eq!(scope_of(&[a, b], &[]), scope_of(&[b, a], &[]));
+        assert_ne!(scope_of(&[a, b], &[]), scope_of(&[a, c], &[]));
+        // The control: with the order compared, as until 2026-11-12, the same names in
+        // another order are a change.
+        ORDER_IS_COMPARED.set(true);
+        let in_order = scope_of(&[a, b], &[]) == scope_of(&[b, a], &[]);
+        ORDER_IS_COMPARED.set(false);
+        assert!(!in_order, "planted: the order of names is a difference");
         assert_ne!(scope_of(&[a, b], &[c]), scope_of(&[a, b], &[d]));
         let many: Vec<_> = all[..30].to_vec();
         let mut reversed = all[10..30].to_vec();

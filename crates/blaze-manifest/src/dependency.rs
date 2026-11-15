@@ -486,28 +486,29 @@ mod tests {
         agree(&features, &deps);
     }
 
-    #[hegel::test]
-    fn the_feature_map_is_the_old_one_on_any_table(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let deps: Vec<(usize, bool, u8)> = tc.draw(
-            gs::vecs(gs::tuples!(
-                gs::integers().max_value(4),
-                gs::booleans(),
-                gs::integers().max_value(3)
-            ))
-            .max_size(5),
-        );
-        let features: BTreeMap<usize, Vec<(usize, u8, usize)>> = tc.draw(
-            gs::btree_maps(
-                gs::integers().max_value(8),
-                gs::vecs(gs::tuples!(
-                    gs::integers().max_value(4),
-                    gs::integers().max_value(6),
-                    gs::integers().max_value(2),
-                ))
-                .max_size(3),
-            )
-            .max_size(5),
+    #[test]
+    fn the_feature_map_is_the_old_one_on_any_table() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, feature_map_case);
+    }
+
+    /// One case of [`the_feature_map_is_the_old_one_on_any_table`].
+    fn feature_map_case(tape: &blaze_sim::Tape) {
+        let deps: Vec<(usize, bool, u8)> = tape.vec(0..=5, "deps", |tape| {
+            (tape.int_in(0usize..=4, "dep name"), tape.bool("optional"), tape.int_in(0u8..=3, "dep kind"))
+        });
+        let features: BTreeMap<usize, Vec<(usize, u8, usize)>> = tape.btree_map(
+            0..=5,
+            "features",
+            |tape| tape.int_in(0usize..=8, "feature name"),
+            |tape| {
+                tape.vec(0..=3, "feature values", |tape| {
+                    (
+                        tape.int_in(0usize..=4, "value dep"),
+                        tape.int_in(0u8..=6, "value shape"),
+                        tape.int_in(0usize..=2, "value at"),
+                    )
+                })
+            },
         );
         const DEPS: [&str; 5] = ["a", "b", "c", "std", "serde"];
         const FEATURES: [&str; 9] = ["default", "std", "a", "b", "x", "dep:f", "1x", "-x", "s/t"];

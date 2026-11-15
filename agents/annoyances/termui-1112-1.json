@@ -1,0 +1,12 @@
+{
+ "id": "termui-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "where": "tmux 3.8, any redrawn region",
+ "what": "Erasing from the cursor to the end of the screen (ED, ESC[J) with the cursor at the top-left corner is a clear of the whole screen to tmux, which pushes the screen into its history first: a region redrawn that way left a copy of itself in the scrollback every frame whenever it started on the pane's first row.",
+ "cost": "an hour; found only in the history capture",
+ "cause": "tmux's scroll-on-clear",
+ "workaround": "none needed",
+ "fix": "the encoder erases the last region a row at a time (EL) and the reference terminal of blaze-screen's tests refuses ED",
+ "state": "fixed on termui-1112"
+}

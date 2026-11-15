@@ -279,6 +279,11 @@ pub(crate) struct Thread;
 impl Thread {
     pub(crate) fn enter(&mut self, _tid: u64) {}
     pub(crate) fn leave(&mut self) {}
+    /// No read of another thread's CPU here: the task watchdog judges such a thread by its
+    /// span and wait alone.
+    pub(crate) fn cpu_ns(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The operating system's number for this thread, as `perf` and `top` show it.

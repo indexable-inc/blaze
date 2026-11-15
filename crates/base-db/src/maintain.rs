@@ -93,8 +93,14 @@ pub struct Written<'a> {
     pub removed: &'a [FileId],
     /// Source roots whose file sets changed (a `mod` probe may now hit).
     pub roots: &'a [SourceRootId],
-    /// The crate graph, cfg or env changed, or proc macros set by [`Db::note_crates_changed`].
+    /// The crate graph, cfg or env changed, or proc macros set by [`Db::note_crates_changed`]:
+    /// anything of the graph but crates added to it, which `crates_added` names.
     pub crates: bool,
+    /// Crates made by this write and added to the graph ([`Crate::create_added`],
+    /// [`crate::add_crates`]): no crate that was there depends on one, and none of them was
+    /// read before, so a maintainer owes each a first run and the others nothing for it. A
+    /// plan lowered into a front end that holds another plan's crates adds its own this way.
+    pub crates_added: &'a [Crate],
     /// Crates given proc macros in place of those they had ([`Db::note_proc_macros`]).
     pub proc_macros: &'a [Crate],
     /// Files `include_bytes!` or `include_str!` read whose bytes changed.
@@ -108,8 +114,15 @@ impl Written<'_> {
             && self.removed.is_empty()
             && self.roots.is_empty()
             && !self.crates
+            && self.crates_added.is_empty()
             && self.proc_macros.is_empty()
             && self.included.is_empty()
+    }
+
+    /// Whether the write changed the crate graph in a way that may reach `krate` whatever
+    /// it read: the graph changed whole (`crates`), or `krate` is one the write added.
+    pub fn crate_graph_reaches(&self, krate: Crate) -> bool {
+        self.crates || self.crates_added.binary_search(&krate).is_ok()
     }
 }
 
@@ -360,6 +373,7 @@ struct Pending {
     removed: Vec<FileId>,
     roots: Vec<SourceRootId>,
     crates: bool,
+    crates_added: Vec<Crate>,
     proc_macros: Vec<Crate>,
     included: Vec<IncludedFile>,
 }
@@ -376,6 +390,7 @@ impl Default for Pending {
             removed: Vec::with_capacity(PENDING_ROOM),
             roots: Vec::with_capacity(PENDING_ROOM),
             crates: false,
+            crates_added: Vec::new(), // alloc: grows to the crates a lowering adds, kept from one pass to the next
             proc_macros: Vec::new(), // alloc: grows to the proc-macro crates, kept from one pass to the next
             included: Vec::with_capacity(PENDING_ROOM),
         }
@@ -392,6 +407,7 @@ impl Pending {
             removed: Vec::new(), // alloc: see above
             roots: Vec::new(),   // alloc: see above
             crates: false,
+            crates_added: Vec::new(), // alloc: see above
             proc_macros: Vec::new(), // alloc: see above
             included: Vec::new(),    // alloc: see above
         }
@@ -408,6 +424,7 @@ impl Pending {
             removed: &self.removed,
             roots: &self.roots,
             crates: self.crates,
+            crates_added: &self.crates_added,
             proc_macros: &self.proc_macros,
             included: &self.included,
         }
@@ -420,6 +437,7 @@ impl Pending {
         self.removed.extend_from_slice(&other.removed);
         self.roots.extend_from_slice(&other.roots);
         self.crates |= other.crates;
+        self.crates_added.extend_from_slice(&other.crates_added);
         self.proc_macros.extend_from_slice(&other.proc_macros);
         for &file in &other.included {
             if !self.included.contains(&file) {
@@ -438,6 +456,8 @@ impl Pending {
         self.roots.dedup();
         self.proc_macros.sort_unstable();
         self.proc_macros.dedup();
+        self.crates_added.sort_unstable();
+        self.crates_added.dedup();
         let (added, removed) = (&self.added, &self.removed);
         self.set.retain(|file| {
             added.binary_search(file).is_err() && removed.binary_search(file).is_err()
@@ -450,6 +470,7 @@ impl Pending {
         self.removed.clear();
         self.roots.clear();
         self.crates = false;
+        self.crates_added.clear();
         self.proc_macros.clear();
         self.included.clear();
     }
@@ -467,6 +488,8 @@ pub(crate) enum Note<'a> {
     },
     Root(SourceRootId),
     Crates,
+    /// A crate made and to be added to the graph ([`Written::crates_added`]).
+    CrateAdded(Crate),
     ProcMacros(Crate),
     Included(IncludedFile),
 }
@@ -633,6 +656,7 @@ impl Db {
             }
             Note::Root(root) => pending.roots.push(root),
             Note::Crates => pending.crates = true,
+            Note::CrateAdded(krate) => pending.crates_added.push(krate),
             Note::ProcMacros(krate) => pending.proc_macros.push(krate),
             Note::Included(file) => {
                 if !pending.included.contains(&file) {

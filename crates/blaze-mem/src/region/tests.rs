@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 
 use crate::{Region, Tag, racy, tag};
 
@@ -118,11 +118,10 @@ enum Step {
 
 const PAGES: usize = 48;
 
-#[hegel::composite]
-fn step(tc: &TestCase) -> Step {
-    let page = tc.draw(gs::integers::<usize>().max_value(PAGES - 1));
-    let len = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
-    if tc.draw(gs::booleans()) { Step::Reuse { page, len } } else { Step::Evict { page, len } }
+fn step(tape: &Tape) -> Step {
+    let page = tape.index(PAGES, "page");
+    let len = tape.int_in(1..=12usize, "len");
+    if tape.bool("reuse") { Step::Reuse { page, len } } else { Step::Evict { page, len } }
 }
 
 /// Every reuse adds its bytes to the region's tag and every eviction takes off what the kernel
@@ -130,12 +129,16 @@ fn step(tc: &TestCase) -> Step {
 /// `Tag::Pool` equals the loaded pages times `PAGE`, for the layer below the pool); held pages
 /// keep their bytes across other pages' evictions; on Linux a page given back reads zeros; and
 /// dropping the region takes the rest off. The only test that moves `Tag::Pool`.
-#[hegel::test(test_cases = 64)]
-fn the_tag_follows_reuses_and_evictions(tc: TestCase) {
+#[test]
+fn the_tag_follows_reuses_and_evictions() {
+    blaze_sim::check(Config::cases(64), |tape| the_tag_follows(tape))
+}
+
+fn the_tag_follows(tape: &Tape) {
     let before = tag::snapshot().get(Tag::Pool).live;
     let region = Region::reserve_sparse(PAGES * PAGE, Tag::Pool).expect("reserve");
     let mut held: [Option<u8>; PAGES] = [None; PAGES];
-    let steps = tc.draw(gs::vecs(step()).max_size(40));
+    let steps = tape.vec(0..=40, "steps", step);
     for (n, step) in steps.into_iter().enumerate() {
         match step {
             Step::Reuse { page, len } => {

@@ -1,0 +1,14 @@
+{
+ "id": "racy-stamp-coarse-clock",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor T1+T2 of track 6 (restart from disk), int-1112",
+ "where": "crates/blaze-vfs/src/watch.rs Watcher::save, Watcher::steady; crates/blaze-vfs/src/disk.rs racy",
+ "what": "Persisting the watcher's file stamps (SEEN records) so a restart reads no unchanged file means a stamp now vouches for bytes across a crash. On a filesystem with a coarse clock (1 s or 2 s mtime), a file written twice in the same tick keeps one stamp across two contents, so a stamp taken right after a write can vouch for bytes the file no longer has. Also: heads.rs needed the daemon's wall clock, but certify::wall_ns is private to serve/job, so the watcher's call sites cannot name it without a change in another track's file.",
+ "cost": "would have been a silent stale build after a restart (a file edited twice within a second read as unchanged); the wall_ns visibility leaves heads.rs uncompiled until track 2 re-exports it",
+ "cause": "a stamp is a claim about content made from metadata whose resolution is coarser than the writes it is meant to tell apart; and one clock had no shared home in serve",
+ "class": "a cache key (here, a file stamp) trusted at a resolution finer than its input provides; a shared service (the wall clock) hidden in one caller's module",
+ "prevention": "a stamp taken inside RACY_NS of its own change time is saved as UNKNOWN and read again once steady (git's racy-git rule); the DST plants a stamp trusted inside the window and the oracle catches it. The wall clock should live in one serve-level home every caller names.",
+ "workaround": "none",
+ "fix": "Watcher keeps racy names and steady() re-tells them once past the window; tests/stamps.rs control the_oracle_catches_a_stamp_trusted_inside_the_racy_window. wall_ns: wanted pub(in crate::serve) plus a re-export in job.rs (written to /tmp/plan/6-T1-next.md).",
+ "state": "open"
+}

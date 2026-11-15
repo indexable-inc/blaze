@@ -17,6 +17,7 @@ use crate::{
         assoc::{ImplItems, TraitItems},
         crate_def_map, crate_local_def_map,
         demand::{self, Look},
+        frozen,
     },
 };
 
@@ -77,9 +78,16 @@ fn settle(mut by_name: FrameMap<'_>, mut duplicates: Duplicates<'_>) -> Diagnost
 /// blocks, macros, `use`s and `extern crate`s, and those declared in bodies). Lowers only the
 /// bodies that may declare one ([`demand::walk_bodies_saying`]): those whose text says
 /// `rustc_diagnostic_item` or names a macro that may write it.
+///
+/// A crate served from its image reads the table its image holds
+/// ([`frozen::served_diagnostic_items`]): no module's scope, no page of its def map and no
+/// item's attributes. Only a crate that is not served is walked.
 #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     let _p = tracing::info_span!("crate_diagnostic_items_query").entered();
+    if let Some(served) = frozen::served_diagnostic_items(db, krate) {
+        return served;
+    }
     blaze_mem::frame::current(|frame| {
         let mut collect = Collect {
             db,

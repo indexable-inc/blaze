@@ -5,6 +5,7 @@ import Blaze.Mir.State
 import Blaze.Mir.Step
 import Blaze.Mir.Run
 import Blaze.Mir.Lemmas
+import Blaze.Mir.Walk
 import Blaze.Mir.Opt.Local
 import Blaze.Mir.Opt.SimplifyConstCondition
 import Blaze.Mir.Opt.RemoveStorageMarkers

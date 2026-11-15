@@ -181,8 +181,7 @@ fn an_executables_tls_descriptors_are_relaxed_and_it_reads_its_thread_locals() {
     if !host {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("blaze-link-tls-desc-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = blaze_core::temp::TempDir::for_test("blaze-link-tls-desc-");
     let program = dir.join("app");
     std::fs::write(&program, &bytes).unwrap();
     std::fs::write(dir.join("libtv.so"), &library[..]).unwrap();
@@ -191,8 +190,7 @@ fn an_executables_tls_descriptors_are_relaxed_and_it_reads_its_thread_locals() {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let status =
-        std::process::Command::new(&program).env("LD_LIBRARY_PATH", &dir).status().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+        std::process::Command::new(&program).env("LD_LIBRARY_PATH", dir.path()).status().unwrap();
     // `_start` exits with a bit for each read that was wrong (tls_desc/main.c).
     assert_eq!(
         status.code(),

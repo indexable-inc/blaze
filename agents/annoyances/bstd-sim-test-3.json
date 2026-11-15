@@ -1,0 +1,18 @@
+{
+ "id": "bstd-sim-test-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-sim-test",
+ "where": "blaze: mbe (macro_rules attr rules)",
+ "what": "A `macro_rules!` attribute rule's arguments were dropped: `attr(<args>) (<item>) => ..` kept its item pattern only (crates/mbe/src/parser.rs had a FIXME), so `#[m(anything)]` expanded as `#[m]` with no error, where the pinned nightly matches the arguments. Found because #[bstd::test(without(Crashes))] needs them.",
+ "cost": "one sub-agent, about 10 minutes",
+ "cause": "rust-analyzer's partial support was inherited with its FIXME",
+ "whys": [
+  "arguments were parsed and thrown away",
+  "an unsupported shape was accepted quietly instead of refused (rule no-fallback)",
+  "no test called a declarative attr macro with arguments"
+ ],
+ "class": "a syntax blaze parses and then ignores: the program builds and means something else",
+ "prevention": "built: the arguments are matched (mbe::MacroCall carries them; 02d84d0b43). Still open in the same class: `#[m = value]` on a declarative attr macro arrives with no arguments and is taken as `#[m]`, where rustc refuses it",
+ "fix": "02d84d0b43 on branch bstd-sim-test",
+ "state": "fixed: 02d84d0b43; the `#[m = value]` case open"
+}

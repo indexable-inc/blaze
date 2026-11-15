@@ -1,0 +1,11 @@
+{
+ "id": "drift-lean-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5, lane drift-lean",
+ "where": "lean/BlazeModel/*_agrees.lean, crates/blaze-graph/lean/BlazeGraph/LedgerMir.lean, lean/theorems.json",
+ "what": "The agreement theorems state an exact fuel (4*len+4, extra+1+1, loopFuel 2 2) and every proof wrote down each intermediate state; the first real encoder output added storage markers, temporaries and goto/return blocks, so every block lemma broke and three gate theorems became false (fuel one step short) and had to be restated.",
+ "cost": "four hand-written proofs rewritten; three theorems.json statements changed",
+ "cause": "the step count of a body is part of the theorem statement, and the proofs were written against a predicted body Lean never checked",
+ "workaround": "mir_walk (lean/Blaze/Mir/Walk.lean) runs blocks by simp so no intermediate state is written; a statement of the form: some fuel suffices and every larger fuel gives the model result, would not change with the body",
+ "state": "open"
+}

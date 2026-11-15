@@ -1,6 +1,6 @@
 ---
 name: testing
-description: "How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests with Hegel (vendor/hegeltest, imported as `hegel`); deterministic simulation tests (DST) on blaze-core's seeded `sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes), moving to Hegel's own `hegel::sim`; an invariant oracle with planted-bug controls and seed replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. What a persisted type is and where memory lives are the `memory-and-data` skill. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the daemon image, the profile history, a lock-free structure, a ring), and before claiming such code is correct."
+description: "How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests and deterministic simulation tests (DST) on blaze's own engine, `blaze-sim` (a case is a function of one tape of choices, shrunk and replayed), which replaces Hegel; `blaze_core::sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes) for blaze-core's effects and `blaze-check` for interleaved atomics; an invariant oracle with planted-bug controls and tape replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. What a persisted type is and where memory lives are the `memory-and-data` skill. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the daemon image, the profile history, a lock-free structure, a ring), and before claiming such code is correct."
 ---
 
 # Testing blaze
@@ -11,32 +11,37 @@ description: "How blaze tests its own code, the one home for it: few tests, each
 
 A causal claim (this change caused the regression, this lock causes the convoy, this index makes it
 fast) is tested by removing the cause and watching the effect go, not by checking that its premises
-hold. Pin a load-bearing one with a test named for the property.
+hold. Pin a load-bearing one with a test named for the property. Run the control before the claim is
+written anywhere, the pull request included: the same steps on the same machine state with the
+binary from before the fix. When the old binary no longer shows the effect, the reproduction is
+gone; say so, and rest the claim on the tests of the mechanism alone.
 
 ## persisted-state-round-trips (rule 26)
 
-Anything blaze persists (the daemon image, the store, the plane's history; what a persisted value
-is, is `outputs-are-records`) has a test that restores it and checks the result equals a fresh build
-byte for byte, and a budget for restart to first answer. A file that another version of blaze can
-find (in the state directory, in a home, in `/tmp`) also has a test that a file of its previous
-layout is handled: refused by name with what to do, or read, or left alone under a name that carries
-its layout; docs/cargo.md, "Files that outlive a version", lists each with its test. A restore that
-silently starts empty is a failure the daemon reports, naming why. A format that is written while
-blaze runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point
-and checks the restore.
+Anything blaze persists (the store's records, the certificate, the profile history, and the daemon
+image while it exists; what a persisted value is, is `outputs-are-records`) has a test that restores
+it and checks the result equals a fresh build byte for byte, and a budget for a fresh process to
+first answer. A file that another version of blaze can find (in the state directory, in a home, in
+`/tmp`) also has a test that a file of its previous layout is handled: an old home after an upgrade
+is detected, reported by name and rebuilt, and nothing is migrated (scope decision D36); a file
+outside a home is refused by name with what to do, or left alone under a name that carries its
+layout; docs/cargo.md, "Files that outlive a version", lists each with its test. A restore that
+silently starts empty is a failure blaze reports, naming why. A format that is written while blaze
+runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point and
+checks the restore.
 
 ## dst-not-review (rule 43)
 
 Code that is concurrent (atomics, locks, lock-free rings, two threads or processes sharing state),
 durable (anything written to disk that must survive), crash-recovering, billing or data-deleting is
-proven by a deterministic simulation test (DST): one Hegel test that draws an operation sequence,
-the fault classes to turn on, crash points and schedules, runs the code as a sans-IO core in the
-simulation (`blaze_core::sim::Sim` today, `hegel::sim` as it lands), and checks an oracle that
-states the invariant ("every row recorded appears exactly once after any crash"), with planted-bug
-controls the oracle must catch and a failing seed that replays. A code review is not evidence that
-such code is right: it finds candidates, and each one it finds becomes a case the DST must catch
-before the fix lands. A change to such code without a DST that covers it is unfinished, whoever
-reviewed it.
+proven by a deterministic simulation test (DST): one test on blaze's own engine (`blaze_sim::check`)
+that draws an operation sequence, the fault classes to turn on, crash points and schedules from one
+tape, runs the code as a sans-IO core in the simulation (`blaze_core::sim::Sim` for blaze-core's
+effects; `blaze-check` where two threads' atomics must interleave), and checks an oracle that states
+the invariant ("every row recorded appears exactly once after any crash"), with planted-bug controls
+the oracle must catch and a failing tape that replays. A code review is not evidence that such code
+is right: it finds candidates, and each one it finds becomes a case the DST must catch before the
+fix lands. A change to such code without a DST that covers it is unfinished, whoever reviewed it.
 
 ## invariants-are-stated (rule 53)
 
@@ -55,7 +60,11 @@ them. `scripts/src/bin/invariants.rs` (`blaze run -q -p scripts --bin invariants
 collects every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the
 gate (`check`) when one has no control, names a missing proof, or the list is stale. Before changing
 or regenerating code, read the invariants its crate states: they are what the new code is judged
-against.
+against. A promise in a doc comment is either derived (an effect attribute the build checks) or a `#
+Guarantees` / `# Invariants` item ending in ``Evidence: [`test`]``, ``Evidence: Lean `Name` `` or
+`Unverified: why`; never prose alone. The `claims` lints refuse a doc the effect walk refutes, a
+promise held by nothing and a stale pointer; the ledger refuses a crate's count of open claims
+growing or any claim's level dropping (docs/v2/plan/design/claims.md).
 
 See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
 
@@ -71,7 +80,7 @@ proof is about what blaze compiles and not a hand-written copy; (3) each MIR tra
 correct against it: a small pass by a Lean theorem that its output refines its input, a large one by
 translation validation (a checker, itself proved sound, that accepts each run's before and after),
 run in the gate on real crates; (4) then lowering to LIR and to machine code against machine models,
-the front end's rules, and the daemon's state machines by refinement from their reference models
+the front end's rules, and the driver's state machines by refinement from their reference models
 (`invariants-are-stated`). Nothing counts as proved until Lean has checked it in the gate with only
 its allowed axioms and no `sorry`; `docs/v2/plan/invariants.md` gives each claim its level, and
 docs/v2/plan/design/formal-verification.md lists the trusted base (the Lean kernel, the semantics'
@@ -86,7 +95,7 @@ Default to the simulation. When you test behaviour over time (an edit after a bu
 crash, two requests at once, a file replaced under a watcher, a cache hit after a key change, a
 retry, a timeout), write the test against the sans-IO core driven by `blaze_core::sim::Sim` (virtual
 clock, simulated filesystem and network that can be slow, fail, tear or reorder, crashes at any
-step), not against a spawned daemon, real files, real sleeps or real threads. Such a test is
+step), not against a spawned blaze process, real files, real sleeps or real threads. Such a test is
 declarative (the steps and what must hold after each), runs under many seeds, prints the seed and
 the step on failure so it replays exactly, checks an oracle that states the invariant, and has a
 planted bug the oracle catches (`dst-not-review`). For incremental behaviour the shape is the
@@ -123,37 +132,44 @@ Write few tests, each where it pays:
 - **A bug found in a real crate**: that crate's own tests under `blaze test`
   (`verify-on-real-projects`); a daemon bug: a step in the edit harness
   ([docs/harness.md](../../../docs/harness.md#adding-a-test)).
-- **A slow or flaky reproduction**: shrink it (Hegel's shrinker, treereduce, `git bisect`) into a
+- **A slow or flaky reproduction**: shrink it (blaze-sim's shrinker, treereduce, `git bisect`) into a
   test that runs in seconds, named for the property it breaks. That one is always allowed.
 - **Parsers of hostile bytes**: fuzzing (`crates/blaze-fuzz`, `fuzz/`).
 
 No big suites, no tests of code whose shape is still changing, no red/green ritual on a dev
 host: push and let CI and the harnesses catch breakage.
 
-## Property tests with Hegel
+## Property tests and simulations: `blaze-sim`
 
-A property test (a rule over generated inputs, the failing case shrunk) uses Hegel, Hypothesis's
-engine ported to Rust and linked as a crate (vendor/hegeltest, our fork
-[indexable-inc/hegel](https://github.com/indexable-inc/hegel); pin and changes in
-[vendor/hegeltest/SOURCE.md](../../../vendor/hegeltest/SOURCE.md)):
+blaze owns its test engine (decision D37,
+[docs/v2/plan/design/sim.md](../../../docs/v2/plan/design/sim.md)): `crates/blaze-sim`. A case is
+a function of one tape of labelled, bounded choices in which 0 is the calm choice; the engine
+draws tapes from fixed seeds, shrinks a failing tape to the fewest and smallest choices that
+still fail, and prints one line that replays it.
 
-- `hegeltest.workspace = true` under `[dev-dependencies]`, imported as `hegel`.
-- `#[hegel::test]` on a `fn(tc: hegel::TestCase)` that draws with `tc.draw(..)` from
-  `hegel::generators` (`use hegel::generators as gs;`); `#[hegel::composite]` makes a generator
-  of a domain value (an `Op`).
-- Keep the default case count to seconds per crate (`#[hegel::test(test_cases = N)]`, 256 by
-  default from the root `hegel.toml`); run longer with `HEGEL_TEST_CASES`. Hegel applies that
-  only to tests that set no count, so a test with its own count that is worth a long run reads
-  it itself (`run_cases` in `crates/blaze-cas/src/tests/model_check.rs`, which also turns the
-  example database off: failing examples are never written into the tree).
-- Never proptest, quickcheck, arbitrary or bolero.
+- `blaze-sim.workspace = true` under `[dev-dependencies]`. A test is a plain `#[test]` that
+  calls `blaze_sim::check(Config::cases(200), |tape| { .. })`; the body draws from `tape` and
+  panics, or returns `Result<(), Broke>`.
+- Every draw has a label, which a failure prints: `tape.below(n, "kill")`,
+  `tape.int_in(1..=60, "size")`, `tape.coin("the sync fails")`, `tape.pick(&KINDS, "kind")`,
+  `tape.vec(0..=40, "ops", op)`. A generator of a domain value is a function of the tape
+  (`fn op(tape: &Tape) -> Op`). Make the calm choice the quiet one: no fault, the first
+  alternative, the list ends.
+- Seeds are fixed (256 from 0 unless the test says), so a green run is green again. From
+  outside: `BLAZE_SIM_SEEDS=<n>` runs more, `BLAZE_SIM_SEED=<n>` one seed, and
+  `BLAZE_SIM_TAPE='<tape>'` the tape a failure printed.
+- A check fails by name when its cases drew nothing, were all discarded, or never reached a
+  point it lists (`Config::must_reach`, `tape.reached(..)`). Mark the state a bug needs with a
+  reach point, so a green run shows the run got there.
+- Hegel is gone from the tree (ledger row V12): every property test and simulation is a
+  `blaze_sim::check`. Never proptest, quickcheck, arbitrary or bolero.
 
 ## Deterministic simulation tests (DST)
 
-A DST runs real blaze code (not a model of it) against a simulated machine whose every choice
-comes from one seed: when a completion arrives, which effect fails, where the power goes out,
-which thread runs next. Hegel draws those choices, so it searches them, shrinks a failure to the
-smallest run that still fails, and replays it exactly.
+A DST runs real blaze code (not a model of it) against a simulated machine whose every choice is
+drawn: when a completion arrives, which effect fails, where the power goes out, which thread
+runs next. The engine searches those choices, shrinks a failure to the smallest run that still
+fails, and replays it exactly.
 
 ### What exists today: `blaze_core::sim::Sim`
 
@@ -186,33 +202,37 @@ smallest run that still fails, and replays it exactly.
   block changed on disk under what was synced). `crates/blaze-core/src/sim/pages.rs` is the
   worked example: a pool-shaped page store, its oracle, five planted bugs and seed replay.
 
-Examples: `crates/blaze-cas/src/tests/model_check.rs` (Hegel draws the store's operation
-sequence and the `Sim` seed, checks it against a `BTreeMap`) and the crash tests in
+Examples: `crates/blaze-cas/src/tests/model_check.rs` (the store's operation sequence and the
+`Sim` seed are drawn, and the store is checked against a `BTreeMap`) and the crash tests in
 `crates/blaze-cas/src/tests.rs`; `crates/blaze-graph/src/sched/tests.rs` for the scheduler core.
 
-Its limits: it is one thread, so it interleaves a core's steps and the IO completions between
-them, not two threads' atomics; it has one process and one version of the code; and its file
-system is simpler than a kernel's (a completed whole-file write or rename is durable).
+Its limits: its own choices (latency, delivery order, what a crash tears) hang off one seed the
+test draws, so a failure's plan is shrunk and its schedule is not, until `Sim` takes the tape;
+it is one thread, so it interleaves a core's steps and the IO completions between them, not two
+threads' atomics (that is `blaze-check`, next); it has one process and one version of the code;
+and its file system is simpler than a kernel's (a completed whole-file write or rename is
+durable).
 
-### Where it is going: `hegel::sim`
+### Interleaved atomics: `blaze-check`
 
-The harness is moving to Hegel's own DST, `hegel::sim`, in progress on our fork
-(indexable-inc/hegel, branch `dst`):
+`crates/blaze-check` is blaze's model checker for lock-free code
+([docs/v2/plan/design/model-checker.md](../../../docs/v2/plan/design/model-checker.md)): under
+`--cfg blaze_check` a crate's `sync.rs` hands out the checker's atomics, locks and threads, every
+atomic operation is a switch point, and `blaze_check::model(..)` runs the schedules (every one
+to a bound, or a sample) on one OS thread; `CHECK_REPLAY` reruns a failing one. Two atomics that
+must move together, a ring, a table: a model test there, with its planted bug. It has no disk
+and no crash: a structure that is both lock-free and durable is also stepped one atomic at a
+time as an actor under `Sim`, until the two share a tape.
 
-- **Scheduled atomics**: every atomic op is a switch point the scheduler chooses at, so two
-  threads' loads, stores and CASes interleave in every order Hegel draws.
-- **A simulated kernel** with Linux and macOS semantics for fsync (and `F_FULLFSYNC`), rename (a
-  rename durable before the data it names, unless synced), errseq (a writeback error reported
-  once, to whoever asks first), ENOSPC, mmap (what a crash keeps of a dirty mapped page) and
-  signals.
-- **Multi-process** crash and restart, and **version skew**: an old and a new build of the same
-  code sharing one directory.
-- **A WASI host** that instruments wasm atomics, so code built to wasm runs under the same
-  scheduler.
+### Where it is going: one tape
 
-Until it lands, use `blaze_core::sim::Sim` and model what it lacks in the test (draw which actor
-steps next; run the old and new codec against one simulated disk). Port a DST to `hegel::sim` once
-the capability it needs is on the fork's `main` and pinned in vendor/hegeltest.
+[docs/v2/plan/design/sim.md](../../../docs/v2/plan/design/sim.md), in its order: `Sim`'s generator becomes the tape, so its latencies, delivery order, tears and
+failures are shrunk with the plan; `blaze-check`'s sampled schedules draw from the tape, so one
+case interleaves threads and crashes a disk; `Sim`'s disk takes the three-layer crash model (a
+write durable only through a sync, a directory entry only through its directory's), with
+several processes and two versions of the code on one disk. Until a piece lands, model what it
+lacks in the test (draw which actor steps next; run the old and new codec against one simulated
+disk).
 
 ### The recipe
 
@@ -220,14 +240,14 @@ the capability it needs is on the fork's `main` and pinned in vendor/hegeltest.
    the injected clock, hands back effects, and takes completions. A core that opens files,
    spawns threads or sleeps cannot be put in the simulation; making it a core is the first part
    of the change, not optional cleanup.
-2. **Write one Hegel test** that draws everything:
-   - the operation sequence (`gs::vecs(op())`: record, flush, merge, read, retire, restart, ...);
+2. **Write one check** (`blaze_sim::check`) that draws everything from the tape:
+   - the operation sequence (`tape.vec(1..=40, "ops", op)`: record, flush, merge, read, retire,
+     restart, ...);
    - the fault classes to turn on, as a swarm: each run draws a subset (sync failures, short
      writes, latency, ENOSPC, lost watch changes) so a rare class is not drowned by a common one;
    - the crash points (after which op, or after how many completions);
-   - the schedule: which actor (thread, process, the daemon or a reader) takes its next step,
-     and with `hegel::sim`, the switch at every atomic op;
-   - the `Sim` seed (`tc.draw(gs::integers())`), so Hegel shrinks and replays it with the rest.
+   - the schedule: which actor (thread, process, the daemon or a reader) takes its next step;
+   - the `Sim` seed (`tape.next_u64("sim seed")`), until `Sim` takes the tape itself.
 3. **Run it in the simulation**: drive the core with the `Sim` driver, crash it, reopen it (the
    restart runs recovery exactly as the daemon would), and keep going.
 4. **Check an oracle that states the invariant**, against a plain model kept beside the run, at
@@ -240,13 +260,14 @@ the capability it needs is on the fork's `main` and pinned in vendor/hegeltest.
    and expects the DST to find a counterexample within its case budget. An oracle that misses a
    plant is too weak; fix the oracle or the draws before trusting a green run. This is
    `test-the-cause` applied to the test itself.
-6. **Replay a failing seed**: Hegel prints the shrunk draws (ops, faults, crash point, seed).
-   Pin it as a plain `#[test]` named for the property it broke, with those values written out,
-   or rerun with `Settings::new().seed(Some(n))`; it replays exactly because nothing in the run
-   reads real time, real threads or hash order (`deterministic-output`).
+6. **Replay a failure**: the report prints the least tape, its choices that are not calm by
+   label, and the line that replays it (`BLAZE_SIM_TAPE='..'`). Pin it as a plain `#[test]`
+   named for the property it broke, which gives that tape. It replays exactly because nothing
+   in the run reads real time, real threads or hash order (`deterministic-output`); a case that
+   does is reported as not a function of its tape.
 
 A DST is fast enough for the merge gate at its default case count, and runs long
-(`HEGEL_TEST_CASES`) in the release train.
+(`BLAZE_SIM_SEEDS`) in the release train.
 
 ### Worked example: blaze-profile's history
 
@@ -260,14 +281,14 @@ each maps to a DST capability that does:
 
 | Bug class the review found | What catches it |
 |---|---|
-| No fsync of the new manifest (and its directory) before the rename: after a crash the name points at a torn or empty file | Crash points plus the kernel's rename-before-data semantics (`hegel::sim`; today's `Sim` keeps a completed whole-file write whole, so write it through appends and syncs to see it there) |
+| No fsync of the new manifest (and its directory) before the rename: after a crash the name points at a torn or empty file | Crash points plus a rename that is durable before the data it names (the three-layer disk of sim.md; today's `Sim` keeps a completed whole-file write whole, so write it through appends and syncs to see it there) |
 | A crash between the commit and its consumption (files listed, ring cursor not yet advanced) double-counts rows on restart | A crash point at every effect and the exactly-once oracle (today's `Sim::crash`) |
-| A flush that fails part way (one table written, the next not) leaves a manifest naming half a flush | Swarm fault classes: `fail_one_in`, `fail_syncs`, short writes, ENOSPC (`hegel::sim`) |
+| A flush that fails part way (one table written, the next not) leaves a manifest naming half a flush | Swarm fault classes: `fail_one_in`, `fail_syncs`, short writes, ENOSPC (`fill`) |
 | A DEBUG hold (data kept for a reader) is lost on a crash, and the data is deleted under it | Crash and restart with the oracle "nothing a live hold names is deleted" |
-| Recovery runs on the writer's open but not on a read: a reader after a crash sees what a crash left | Draw a reader as its own actor after each crash, with the oracle on what it reads; multi-process crash and restart (`hegel::sim`) |
-| Version skew on retired names: an older daemon reads the newer naming of retired files as live, or deletes them | Version skew, two builds' cores on one directory (`hegel::sim`; today, both codecs in one test on one `Sim`) |
-| A lost `flushed` update when a ring moves between two atomics: a writer's store lands between the mover's load and its store | Scheduled atomics, a switch point at every atomic op, plus mmap semantics for what a crash keeps of the ring (`hegel::sim` only) |
-| Recovery holds `manifest.lock` while it walks the directory, so a daemon that starts during it blocks | Multi-process restart on the virtual clock with a bounded-progress oracle: the second daemon's first answer arrives within its bound (`hold_lists`/`slow_writes` today, a second process in `hegel::sim`) |
+| Recovery runs on the writer's open but not on a read: a reader after a crash sees what a crash left | Draw a reader as its own actor after each crash, with the oracle on what it reads; several processes on one disk (sim.md) |
+| Version skew on retired names: an older daemon reads the newer naming of retired files as live, or deletes them | Version skew, two builds' cores on one directory (today, both codecs in one test on one `Sim`) |
+| A lost `flushed` update when a ring moves between two atomics: a writer's store lands between the mover's load and its store | A switch point at every atomic operation (`blaze-check`), plus what a crash keeps of a mapped ring (not modelled yet) |
+| Recovery holds `manifest.lock` while it walks the directory, so a daemon that starts during it blocks | Multi-process restart on the virtual clock with a bounded-progress oracle: the second daemon's first answer arrives within its bound (`hold_lists`/`slow_writes` today; a second process once the disk holds several) |
 
 Since 2026-11-04 the writer is a sans-IO core (`crates/blaze-profile/src/history/files.rs`,
 marked `#![blaze::sans_io]`; `manifest.rs`, `retire.rs`, `compact.rs` and `merge.rs` too) driven

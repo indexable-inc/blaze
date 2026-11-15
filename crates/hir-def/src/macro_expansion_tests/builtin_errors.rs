@@ -372,7 +372,8 @@ fn main() {
 /// rustc's `expand_include_str` refuses a file that isn't UTF-8, at the call.
 #[test]
 fn include_str_of_a_file_that_is_not_utf_8_is_an_error() {
-    let file = std::env::temp_dir().join(format!("blaze-include-str-{}.bin", std::process::id()));
+    let dir = blaze_core::temp::TempDir::for_test("blaze-include-str-");
+    let file = dir.join("file.bin");
     std::fs::write(&file, [b'a', 0xff, 0xfe]).expect("the temporary file");
     let path = file.to_str().expect("a UTF-8 temporary path");
     let text = format!(
@@ -391,7 +392,6 @@ fn main() {{
         .filter_map(|call| call.parse_macro_expansion(&db).err.clone())
         .map(|err| (err.render_to_string(&db).message, text_at(&db, err.span())))
         .collect();
-    std::fs::remove_file(&file).expect("the temporary file");
     assert_eq!(
         errors,
         [(format!("`{path}` wasn't a utf-8 file"), format!("include_str!({path:?})"))]
@@ -402,8 +402,7 @@ fn main() {{
 /// with its loader's "couldn't read" at the call.
 #[test]
 fn include_of_an_outside_file_that_cannot_be_read_is_rustc_s_error() {
-    let dir = std::env::temp_dir().join(format!("blaze-include-unread-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("the temporary directory");
+    let dir = blaze_core::temp::TempDir::for_test("blaze-include-unread-");
     let (missing, binary) = (dir.join("missing.rs"), dir.join("binary.rs"));
     std::fs::write(&binary, [b'a', 0xff, 0xfe]).expect("the temporary file");
     let (missing, binary) = (missing.to_str().expect("UTF-8"), binary.to_str().expect("UTF-8"));
@@ -424,7 +423,6 @@ fn main() {{
         .filter_map(|call| call.parse_macro_expansion(&db).err.clone())
         .map(|err| (err.render_to_string(&db).message, text_at(&db, err.span())))
         .collect();
-    std::fs::remove_dir_all(&dir).expect("the temporary directory");
     assert_eq!(
         errors,
         [

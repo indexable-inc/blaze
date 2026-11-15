@@ -856,6 +856,13 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         span: Span,
     },
+    /// `method_call_on_diverging_infer_var` (warn by default, to be a hard error) of a method
+    /// called at `span` on a type variable a coercion of `!` made, which the probe set to `!`:
+    /// "method call on a diverging inference variable".
+    MethodCallOnDivergingInferVar {
+        #[type_visitable(ignore)]
+        span: Span,
+    },
     /// E0308 "mismatched types" of a `&mut` pattern `pat` matching an inherited shared
     /// reference (rustc's `error_inherited_ref_mutability_mismatch`, only under
     /// `ref_pat_eat_one_layer_2024*`): noted "cannot match inherited `&` with `&mut` pattern".
@@ -981,7 +988,7 @@ fn trait_item_struct_path_def(db: &Db, trait_: TraitId, name: &Name) -> Option<S
 impl InferenceDiagnostic {
     /// Whether this is an error that leaves the body tainted by errors, like rustc's
     /// `InferCtxt::tainted_by_errors`: once it is, "type annotations needed" is not reported.
-    pub(crate) fn taints_body(&self) -> bool {
+    pub fn taints_body(&self) -> bool {
         let is_lint = |diag: &PathLoweringDiagnostic| {
             matches!(diag, PathLoweringDiagnostic::ElidedLifetimesInPath { hard_error: false, .. })
         };
@@ -993,7 +1000,8 @@ impl InferenceDiagnostic {
             } => !is_lint(diag),
             InferenceDiagnostic::EditionDependentMethodCall { .. }
             | InferenceDiagnostic::FullyQualifiedCallFrom2018 { .. }
-            | InferenceDiagnostic::TyvarBehindRawPointer { .. } => false,
+            | InferenceDiagnostic::TyvarBehindRawPointer { .. }
+            | InferenceDiagnostic::MethodCallOnDivergingInferVar { .. } => false,
             _ => true,
         }
     }
@@ -1238,7 +1246,6 @@ pub enum PointerCast {
     /// Go from a mut raw pointer to a const raw pointer.
     MutToConstPointer,
 
-    #[allow(dead_code)]
     /// Go from `*const [T; N]` to `*const T`
     ArrayToPointer,
 
@@ -1274,6 +1281,12 @@ pub enum PatAdjust {
     /// An implicit call to `Deref(Mut)::deref(_mut)` before matching, such as when matching the
     /// pattern `[..]` against a scrutinee of type `Vec<T>`.
     OverloadedDeref,
+    /// blaze (`#![blaze::error_unions]`): the scrutinee is an error union (the adjustment's
+    /// `source`) and the pattern is of one of its members: it matches when the union holds
+    /// that member, against the member's value. Which member is the pattern's own type
+    /// ([`crate::error_union::member_index`]), so nothing but the kind is recorded
+    /// (docs/v2/plan/design/error-sets.md, "Matching").
+    UnionMember,
 }
 
 /// The result of type inference: A mapping from expressions and patterns to types.
@@ -2620,6 +2633,10 @@ impl<'db, 'f> TupleFieldTypes<'db, 'f> {
 
     /// The place of `tys`, which is added at the end if it is new: `IndexSet::insert_full`'s
     /// index.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "tuple-type places are u32 in the inference record; a body with 2^32 tuple types needs a typed refusal from inference"
+    )]
     pub(crate) fn insert(&mut self, tys: Tys<'db>) -> u32 {
         let TupleFieldTypes { tys: list, places } = self;
         *places.entry(tys).or_insert_with(|| {
@@ -3649,6 +3666,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let reported = |diagnostic: &InferenceDiagnostic| matches!(diagnostic, InferenceDiagnostic::TyvarBehindRawPointer { span: at } if *at == span);
         if !self.diagnostics.any(reported) {
             self.push_diagnostic(InferenceDiagnostic::TyvarBehindRawPointer { span });
+        }
+    }
+
+    /// rustc's `method_call_on_diverging_infer_var` from `probe_op`, once per call at `span`.
+    pub(crate) fn lint_method_call_on_diverging_infer_var(&self, span: Span) {
+        let reported = |diagnostic: &InferenceDiagnostic| matches!(diagnostic, InferenceDiagnostic::MethodCallOnDivergingInferVar { span: at } if *at == span);
+        if !self.diagnostics.any(reported) {
+            self.push_diagnostic(InferenceDiagnostic::MethodCallOnDivergingInferVar { span });
         }
     }
 

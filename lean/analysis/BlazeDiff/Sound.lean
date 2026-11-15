@@ -83,14 +83,14 @@ theorem rule_sound_powi (n : Blaze.I32) (hf : HasDerivAt f f' x) (hd : 1 ≤ n.v
   have key : (if n.val = Blaze.ScalarTy.min .I32 then f x ^ n.val / f x
       else f x ^ (Blaze.Scalar.wrap .I32 (n.val - 1)).val) = f x ^ (n.val - 1) := by
     by_cases hn : n.val = Blaze.ScalarTy.min .I32
-    · rw [if_pos hn]
+    · rw [ite_eq_left hn]
       have hn' : n.val = (-2147483648 : Int) := hn
       have hx : f x ≠ 0 := by
         rcases hd with h1 | h1
         · exact absurd h1 (by omega)
         · exact h1
       rw [zpow_sub_one₀ hx, div_eq_mul_inv]
-    · rw [if_neg hn]
+    · rw [ite_eq_right hn]
       have hn' : n.val ≠ (-2147483648 : Int) := hn
       have hw : (Blaze.Scalar.wrap .I32 (n.val - 1)).val = n.val - 1 :=
         Blaze.Scalar.wrap_val .I32 (n.val - 1)

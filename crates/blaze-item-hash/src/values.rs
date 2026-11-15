@@ -15,6 +15,26 @@
 //!   item key, the crates it loads and depends on by crate key, its `#![feature]`s and its
 //!   recursion limit. Unlike `blaze_items::Fact::Crate` it holds no file of the crate, so an edit
 //!   of a body leaves it as it was.
+//! - `TraitsInScope(module)`: the traits in scope in a module (its blocks', its own and the
+//!   prelude's, as `module_trait_set` gives them), by key, sorted: what a read of a scope's
+//!   traits by a body's step stands for (docs/v2/plan/design/restore.md, "One form, a
+//!   function: the end state").
+//! - `WholeScope(module)`: every name of a module's scope with what it is there (each name's
+//!   `Resolves` value): what a read of a whole scope stands for, an iteration and never a
+//!   lookup. Any name added to the module changes it; it is per module, never per crate.
+//! - `FieldOrder`: the field order plan every layout reads (`hir_ty::layout::field_order`), by
+//!   its content ID, or that there is none: one fact for the build, no subject but a tag.
+//! - `Setting(field)`: a field of the front end's settings (`base_db::FrontSettings`) a step
+//!   reads, by the field's name: one fact for the build. Only `borrowck_debug` is read by a
+//!   step: the borrow check prints its regions where it is set, so a verdict kept without it
+//!   is checked again, and printed, with it.
+//! - `InherentAssocTypes(adt)`: the associated types of an ADT's inherent impls a path's
+//!   lowering looks `Type::Name` up in, each by name, alias key and impl key: a list made by
+//!   iterating every module of the ADT's crate, which no lookup fact stands for.
+//!
+//! A name looked up in a module, found or not, in any namespace or in textual macro scope, is
+//! lane items' `Resolves { scope, name }` ("nothing" is a value), and a macro's definition is
+//! its `Signature`: neither has a kind here.
 //!
 //! A fact whose subject no longer resolves has the value [`absent`]; one that names what is not
 //! its kind's (a record is data, which this build may not have written) has none.
@@ -29,16 +49,17 @@ use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Resolved, goals::Goals, key};
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, DefWithBodyId, HasModule as _, VariantId,
+    AdtId, AssocItemId, AttrDefId, DefWithBodyId, HasModule as _, ModuleId, VariantId,
     attrs::AttrFlags,
     lang_item::{LangItemEnum, lang_items},
-    nameres::crate_recursion_limit,
+    nameres::{CrateName, crate_def_map, crate_recursion_limit},
     unstable_features::UnstableFeatures,
 };
 use hir_expand::name::Name;
 use hir_ty::{
     body_store::{Step, step_value},
-    method_resolution::loaded_crates,
+    layout::field_order::FieldOrder,
+    method_resolution::{loaded_crates, scope_sets::module_trait_set},
     next_solver::goal_store::{FactObject, FactRef, GoalFacts},
 };
 use smallvec::SmallVec;
@@ -60,6 +81,23 @@ pub mod kinds {
     pub const STEP_MIR: QueryKind = QueryKind(0x1804);
     /// Whether a body's match checking failed, which keeps its borrow check from running.
     pub const MATCH_CHECK: QueryKind = QueryKind(0x1805);
+    /// The traits in scope in a module.
+    pub const TRAITS_IN_SCOPE: QueryKind = QueryKind(0x1806);
+    /// Every name of a module's scope: what an iteration of the scope read.
+    pub const WHOLE_SCOPE: QueryKind = QueryKind(0x1807);
+    /// What a crate's def map holds outside its modules' scopes: its preludes, what its
+    /// root's attributes decide for name resolution, whether it shadows a primitive type.
+    pub const CRATE_NAMES: QueryKind = QueryKind(0x1808);
+    /// The build's field order plan, which every ADT's layout reads.
+    pub const FIELD_ORDER: QueryKind = QueryKind(0x1809);
+    /// A field of the build's front-end settings, which a step reads.
+    pub const SETTING: QueryKind = QueryKind(0x180a);
+    /// The associated types of an ADT's inherent impls, by binding name, that a path's
+    /// lowering looks a name up in (`Type::Name` of an ADT).
+    pub const INHERENT_ASSOC_TYPES: QueryKind = QueryKind(0x180b);
+    /// A body's own lowering, as each other step of it reads it: valued by the digest of
+    /// what the lowering read (`hir_ty::body_store::Lowered::value`), not by its answer.
+    pub const STEP_LOWER: QueryKind = QueryKind(0x180c);
 }
 
 const FIELDS_DOMAIN: &str = "blaze v2 item-hash fields 1";
@@ -67,6 +105,20 @@ const ATTRS_DOMAIN: &str = "blaze v2 item-hash attrs 1";
 const CRATE_ROOT_DOMAIN: &str = "blaze v2 item-hash crate root 1";
 const MATCH_CHECK_DOMAIN: &str = "blaze v2 item-hash match check 1";
 const ABSENT_DOMAIN: &str = "blaze v2 item-hash absent 1";
+const TRAITS_DOMAIN: &str = "blaze v2 item-hash traits in scope 1";
+const WHOLE_SCOPE_DOMAIN: &str = "blaze v2 item-hash whole scope 1";
+const CRATE_NAMES_DOMAIN: &str = "blaze v2 item-hash crate names 1";
+const FIELD_ORDER_DOMAIN: &str = "blaze v2 item-hash field order 1";
+const SETTING_DOMAIN: &str = "blaze v2 item-hash setting 1";
+const INHERENT_ASSOC_TYPES_DOMAIN: &str = "blaze v2 item-hash inherent assoc types 1";
+
+/// The subject of the [`kinds::SETTING`] fact of `FrontSettings::borrowck_debug`: a tag, which
+/// no key is. The settings are one for the build, so the fact names nothing else.
+const BORROWCK_DEBUG_SUBJECT: ContentId = ContentId(*b"blaze v2 item-hash: borrowck dbg");
+
+/// The subject of the [`kinds::FIELD_ORDER`] fact: a tag, which no key is. The plan is one
+/// for the build, so the fact names nothing else.
+const FIELD_ORDER_SUBJECT: ContentId = ContentId(*b"blaze v2 item-hash: field order!");
 
 /// The subject of a fact about the body's own item (a function, const or static, or a
 /// discriminant's variant), in place of its key: a tag, which no hash is. What it stands for
@@ -121,8 +173,14 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
             None => Some(absent(kind)),
             Some(krate) => Some(crate_root_of(db, krate)),
         }
-    } else if kind == kinds::STEP_INFER || kind == kinds::STEP_MIR {
-        let step = if kind == kinds::STEP_INFER { Step::Infer } else { Step::Mir };
+    } else if kind == kinds::STEP_INFER || kind == kinds::STEP_MIR || kind == kinds::STEP_LOWER {
+        let step = if kind == kinds::STEP_INFER {
+            Step::Infer
+        } else if kind == kinds::STEP_MIR {
+            Step::Mir
+        } else {
+            Step::Lower
+        };
         match body_of(db, fact.subject)? {
             None => Some(absent(kind)),
             Some(body) => step_value(db, body, step),
@@ -135,9 +193,225 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
                 Some(Hasher::new(MATCH_CHECK_DOMAIN).update(&[u8::from(failed)]).finish())
             }
         }
+    } else if kind == kinds::CRATE_NAMES {
+        match key::resolve(db, ItemKey(fact.subject)) {
+            None => Some(absent(kind)),
+            Some(Resolved::Module(root)) => Some(crate_names_of(db, root.krate(db))),
+            Some(_) => None,
+        }
+    } else if kind == kinds::FIELD_ORDER {
+        (fact.subject == FIELD_ORDER_SUBJECT).then(|| field_order_of(db))
+    } else if kind == kinds::SETTING {
+        (fact.subject == BORROWCK_DEBUG_SUBJECT).then(|| borrowck_debug_of(db))
+    } else if kind == kinds::INHERENT_ASSOC_TYPES {
+        match key::resolve(db, ItemKey(fact.subject)) {
+            None => Some(absent(kind)),
+            Some(Resolved::Item(ItemId::Adt(adt))) => Some(inherent_assoc_types_of(db, adt)),
+            Some(_) => None,
+        }
+    } else if kind == kinds::TRAITS_IN_SCOPE || kind == kinds::WHOLE_SCOPE {
+        match key::resolve(db, ItemKey(fact.subject)) {
+            None => Some(absent(kind)),
+            Some(Resolved::Module(module)) if kind == kinds::TRAITS_IN_SCOPE => {
+                Some(traits_in_scope_of(db, module))
+            }
+            Some(Resolved::Module(module)) => whole_scope_of(db, module),
+            Some(_) => None,
+        }
     } else {
         None
     }
+}
+
+/// The `FieldOrder` fact: what a read of the field order plan's input stands for.
+pub fn field_order() -> FactRef {
+    FactRef { kind: kinds::FIELD_ORDER, subject: FIELD_ORDER_SUBJECT, object: FactObject::None }
+}
+
+/// The plan's content ID, or that the build has none: what every layout reads of it. Equal
+/// plans are equal IDs (`FieldOrderPlan`'s own equality).
+fn field_order_of(db: &Db) -> ContentId {
+    let plan = FieldOrder::try_get(db).and_then(|it| it.plan(db).as_ref().map(|plan| plan.id()));
+    let mut h = Hasher::new(FIELD_ORDER_DOMAIN);
+    match plan {
+        Some(id) => h.update(&[1]).id(&id),
+        None => h.update(&[0]),
+    };
+    h.finish()
+}
+
+/// The `Setting` fact a read of the front end's setting `name` stands for (an ingredient's
+/// debug name, a field of `base_db::FrontSettings`); `None` for a field no step is known to
+/// read, which is then refused.
+pub fn setting(name: &str) -> Option<FactRef> {
+    let subject = match name {
+        "borrowck_debug" => BORROWCK_DEBUG_SUBJECT,
+        _ => return None,
+    };
+    Some(FactRef { kind: kinds::SETTING, subject, object: FactObject::None })
+}
+
+/// `BLAZE_BORROWCK_DEBUG` as the build has it, or that it has none: what the borrow check
+/// reads of it.
+fn borrowck_debug_of(db: &Db) -> ContentId {
+    let mut h = Hasher::new(SETTING_DOMAIN);
+    h.part(b"borrowck_debug");
+    match base_db::FrontSettings::try_get(db).and_then(|it| it.borrowck_debug(db).as_deref()) {
+        Some(it) => h.update(&[1]).part(it.as_bytes()),
+        None => h.update(&[0]),
+    };
+    h.finish()
+}
+
+/// The `TraitsInScope` fact of `module`.
+pub fn traits_in_scope(db: &Db, module: ModuleId) -> FactRef {
+    FactRef {
+        kind: kinds::TRAITS_IN_SCOPE,
+        subject: key::module_key(db, module).0,
+        object: FactObject::None,
+    }
+}
+
+/// The `WholeScope` fact of `module`.
+pub fn whole_scope(db: &Db, module: ModuleId) -> FactRef {
+    FactRef {
+        kind: kinds::WHOLE_SCOPE,
+        subject: key::module_key(db, module).0,
+        object: FactObject::None,
+    }
+}
+
+/// The `CrateNames` fact of `krate`, named by its root module's key.
+pub fn crate_names(db: &Db, krate: Crate) -> FactRef {
+    FactRef {
+        kind: kinds::CRATE_NAMES,
+        subject: key::module_key(db, crate_def_map(db, krate).root).0,
+        object: FactObject::None,
+    }
+}
+
+/// What `krate`'s def map holds outside its modules' scopes (`hir_def::nameres::crate_names`),
+/// each module and macro by key.
+#[blaze_query::tracked(returns(copy))]
+fn crate_names_of(db: &Db, krate: Crate) -> ContentId {
+    let mut h = Hasher::new(CRATE_NAMES_DOMAIN);
+    hir_def::nameres::crate_names(db, krate, &mut |row| {
+        match row {
+            CrateName::Prelude(module) => {
+                h.part(b"prelude").id(&key::module_key(db, module).0);
+            }
+            CrateName::Extern(name, root) => {
+                h.part(b"extern")
+                    .id(&key::name_hash(name.as_str()).0)
+                    .id(&key::module_key(db, root).0);
+            }
+            CrateName::MacroUse(name, it) => {
+                h.part(b"macro use")
+                    .id(&key::name_hash(name.as_str()).0)
+                    .id(&key::item_key(db, ItemId::Macro(it)).0);
+            }
+            CrateName::Tool(tool) => {
+                h.part(b"tool").part(tool.as_bytes());
+            }
+            CrateName::Flags(flags, edition) => {
+                h.part(b"flags").update(&(flags.len() as u64).to_le_bytes());
+                for &flag in flags {
+                    h.update(&[u8::from(flag)]);
+                }
+                h.update(&[edition as u8]);
+            }
+        }
+    });
+    h.finish()
+}
+
+/// Lane items' `Resolves` fact of `name` in `module`: what the name is there in each
+/// namespace and in textual macro scope, "nothing" a value like any.
+pub fn resolves(db: &Db, module: ModuleId, name: &Name) -> FactRef {
+    FactRef {
+        kind: blaze_items::kinds::RESOLVES,
+        subject: key::module_key(db, module).0,
+        object: FactObject::Id(key::name_hash(name.as_str()).0),
+    }
+}
+
+/// The `InherentAssocTypes` fact of `adt`: what a step's read of
+/// `hir_ty::lower::path::inherent_assoc_types(adt)` stands for.
+pub fn inherent_assoc_types(db: &Db, adt: AdtId) -> FactRef {
+    FactRef {
+        kind: kinds::INHERENT_ASSOC_TYPES,
+        subject: key::item_key(db, ItemId::Adt(adt)).0,
+        object: FactObject::None,
+    }
+}
+
+/// The list `inherent_assoc_types(adt)` gives, in its order, each row by its binding name's
+/// text and whether a `macro`'s context keys it, the alias's key and the impl's key. Sound as a
+/// fact (keys-cover-every-input): the value is the query's whole result with each id written
+/// as its item key, the same in every database, so two values are equal exactly when the
+/// results are; what a reader does with a row (the impl's self type, the alias's type) is a
+/// read of its own, recorded by its own rule. Not read through: the query iterates every
+/// module of the ADT's crate (`Modules::table`, each scope's inherent impls), reads no single
+/// fact names.
+#[blaze_query::tracked(returns(copy))]
+fn inherent_assoc_types_of(db: &Db, adt: AdtId) -> ContentId {
+    let rows = hir_ty::body_store::inherent_assoc_types_of(db, adt);
+    let mut h = Hasher::new(INHERENT_ASSOC_TYPES_DOMAIN);
+    h.update(&(rows.len() as u64).to_le_bytes());
+    for (name, alias, impl_) in rows {
+        h.part(name.as_str().as_bytes())
+            .update(&[u8::from(name.key().is_some())])
+            .id(&key::item_key(db, ItemId::Alias(*alias)).0)
+            .id(&key::item_key(db, ItemId::Impl(*impl_)).0);
+    }
+    h.finish()
+}
+
+/// The traits in scope in `module`, by key, sorted.
+#[blaze_query::tracked(returns(copy))]
+fn traits_in_scope_of(db: &Db, module: ModuleId) -> ContentId {
+    let traits = module_trait_set(db, module).traits();
+    // alloc: none for up to 32 traits in scope; a module past that spills once per change of
+    // its set.
+    let mut keys: SmallVec<[ContentId; 32]> =
+        traits.iter().map(|&it| key::item_key(db, ItemId::Trait(it)).0).collect();
+    keys.sort_unstable();
+    let mut h = Hasher::new(TRAITS_DOMAIN);
+    h.update(&(keys.len() as u64).to_le_bytes());
+    for key in &keys {
+        h.id(key);
+    }
+    h.finish()
+}
+
+/// Every name of `module`'s scope (its items and imports in each namespace, its textual
+/// macros) with its `Resolves` value, sorted by the name's hash; `None` when one of them
+/// cannot be hashed.
+#[blaze_query::tracked(returns(copy))]
+fn whole_scope_of(db: &Db, module: ModuleId) -> Option<ContentId> {
+    let scope = module.def_map(db).module(db, module).scope(db);
+    let subject = key::module_key(db, module).0;
+    let krate = module.krate(db);
+    // alloc: one row per name of the scope, once per change of a scope something iterated
+    let mut rows: Vec<(ContentId, ContentId)> = Vec::new();
+    let named = scope.entries().filter(|(_, per_ns)| !per_ns.is_none()).map(|(name, _)| name);
+    for name in named.chain(scope.legacy_macros().map(|(name, _)| name)) {
+        let name = key::name_hash(name.as_str()).0;
+        let fact = FactRef {
+            kind: blaze_items::kinds::RESOLVES,
+            subject,
+            object: FactObject::Id(name),
+        };
+        rows.push((name, Goals.value(db, Some(krate), fact)?));
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    let mut h = Hasher::new(WHOLE_SCOPE_DOMAIN);
+    h.update(&(rows.len() as u64).to_le_bytes());
+    for (name, value) in &rows {
+        h.id(name).id(value);
+    }
+    Some(h.finish())
 }
 
 /// The body a step fact's subject names: `Some(None)` when it no longer resolves, `None` when
@@ -154,14 +428,25 @@ fn body_of(db: &Db, subject: ContentId) -> Option<Option<DefWithBodyId>> {
 }
 
 /// The fact of `step` of a body, as a later step of the same body reads it, the body named as
-/// [`OWN`]; `None` for the borrow check, which no step reads.
+/// [`OWN`]; `None` for the borrow check, which no step reads, and a constant's value, which is
+/// read as its `ConstValue` fact.
 pub fn step_fact(step: Step) -> Option<FactRef> {
     let kind = match step {
         Step::Infer => kinds::STEP_INFER,
         Step::Mir => kinds::STEP_MIR,
-        Step::Borrowck => return None,
+        Step::Lower => kinds::STEP_LOWER,
+        Step::Borrowck | Step::Const => return None,
     };
     Some(FactRef { kind, subject: OWN, object: FactObject::None })
+}
+
+/// The fact of `step` of another body `body`, by its key, as a step of some other body reads
+/// it (a `const fn` evaluated, a closure's signature, a coroutine's witnesses); `None` where
+/// [`step_fact`] has none. Its value is [`step_value`] of `body` ([`value`]'s arm for the
+/// step kinds, through [`body_of`]): the hash of its answer, so two of these facts are equal
+/// exactly when the answers are. A reader of `body` itself names it [`OWN`] ([`relative`]).
+pub fn step_fact_of(db: &Db, body: DefWithBodyId, step: Step) -> Option<FactRef> {
+    Some(FactRef { subject: body_key(db, body), ..step_fact(step)? })
 }
 
 /// The `MatchCheck` fact of a body, as its own borrow check reads it, the body named as
@@ -313,6 +598,20 @@ fn attrs_of(db: &Db, owner: AttrDefId) -> ContentId {
         Some(feature) => h.update(&[1]).part(feature.as_str().as_bytes()),
         None => h.update(&[0]),
     };
+    // What a layout reads besides the flags: the `#[repr]` an ADT's flags say it has, and
+    // what its `#[blaze::bits]` says of its backing, each as its value's `Debug` text, fed to
+    // the hasher as it is written (both values are made of the attributes' tokens alone, so
+    // the text is the same in every process).
+    if let AttrDefId::AdtId(adt) = owner
+        && flags.contains(AttrFlags::HAS_REPR)
+    {
+        h.update(b"repr");
+        feed_debug(&mut h, &AttrFlags::repr_assume_has(db, adt));
+    }
+    if let Some(bits) = AttrFlags::blaze_bits(db, owner) {
+        h.update(b"bits");
+        feed_debug(&mut h, &bits);
+    }
     if let AttrDefId::FunctionId(function) = owner {
         let features = AttrFlags::target_features(db, function).iter().map(|it| it.as_str());
         // alloc: none for up to 8 target features, the most a function names in practice.
@@ -324,6 +623,21 @@ fn attrs_of(db: &Db, owner: AttrDefId) -> ContentId {
         }
     }
     h.finish()
+}
+
+/// Hashes `value`'s `Debug` text into `h` as it is written, with no buffer, then an end mark
+/// no text holds (`0xff` is no UTF-8 byte).
+fn feed_debug(h: &mut Hasher, value: &impl std::fmt::Debug) {
+    struct Fed<'a>(&'a mut Hasher);
+    impl std::fmt::Write for Fed<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0.update(text.as_bytes());
+            Ok(())
+        }
+    }
+    std::fmt::Write::write_fmt(&mut Fed(&mut *h), format_args!("{value:?}"))
+        .expect("a `Debug` into a hasher does not fail");
+    h.update(&[0xff]);
 }
 
 /// A crate's lang items by item key, the crates it loads and depends on by crate key (itself

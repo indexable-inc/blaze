@@ -38,7 +38,7 @@ fn a_fact_reads_back_from_its_parts() {
     let mut kinds: Vec<u16> = facts.iter().map(|it| it.kind().0).collect();
     kinds.sort_unstable();
     kinds.dedup();
-    assert_eq!(kinds.len(), 20, "one fact of each kind");
+    assert_eq!(kinds.len(), 25, "one fact of each kind");
     for fact in facts {
         let parts = fact_ref(&fact);
         assert_eq!(parts.kind, fact.kind());
@@ -62,6 +62,8 @@ fn parts_that_are_no_fact_read_back_as_none() {
         parts(kinds::IMPLEMENTS, FactObject::None),
         parts(kinds::METHOD, FactObject::Field(1)),
         parts(kinds::TARGET, FactObject::Id(id(2))),
+        parts(kinds::SCOPE_TRAITS_NAMED, FactObject::None),
+        parts(kinds::BLOCK_IMPLS, FactObject::Id(id(2))),
     ] {
         assert_eq!(fact_of_ref(refused), None, "{refused:?}");
         assert_eq!(Goals.value(&db, Some(fixture::test_crate(&db)), refused), None, "{refused:?}");

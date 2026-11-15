@@ -6,6 +6,9 @@
 //! from where is said at the top of each module; the plan is `docs/v2/plan.md`.
 
 #![feature(allocator_api)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod api;
 pub mod auth;
@@ -110,7 +113,7 @@ pub fn cargo_home() -> Option<PathBuf> {
             std::env::current_dir().ok()?.join(home)
         });
     }
-    std::env::home_dir().map(|it| it.join(".cargo"))
+    blaze_core::home::user().ok().map(|it| it.join(".cargo"))
 }
 
 /// cargo's lock on its package cache (`$CARGO_HOME/.package-cache`, the lock of

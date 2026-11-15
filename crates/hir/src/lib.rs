@@ -18,6 +18,9 @@
 //! <https://www.tedinski.com/2018/02/06/system-boundaries.html>.
 
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![recursion_limit = "512"]
 
 extern crate rustc_type_ir;
@@ -127,6 +130,8 @@ use syntax::{
     view::{HasName as _, HasVisibility as _},
 };
 
+pub use syntax::builtin_attrs::AttributeTemplate;
+
 use crate::db::HirDatabase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +225,6 @@ pub use {
             HirFileRange, InFile, InFileWrapper, InMacroFile, InRealFile, MacroFilePosition,
             MacroFileRange,
         },
-        inert_attr_macro::AttributeTemplate,
         mod_path::{ModPath, PathKind, tool_path},
         name::{self, Name},
         proc_macro::{ProcMacros, ProcMacrosBuilder},
@@ -3642,18 +3646,17 @@ pub struct BuiltinAttr {
 
 impl BuiltinAttr {
     fn builtin(name: &str) -> Option<Self> {
-        hir_expand::inert_attr_macro::find_builtin_attr_idx(&Symbol::intern(name))
-            .map(|idx| BuiltinAttr { idx: idx as u32 })
+        syntax::builtin_attrs::find(name).map(|idx| BuiltinAttr { idx: idx as u32 })
     }
 
     pub fn name(&self) -> Name {
         Name::new_symbol_root(Symbol::intern(
-            hir_expand::inert_attr_macro::INERT_ATTRIBUTES[self.idx as usize].name,
+            syntax::builtin_attrs::INERT_ATTRIBUTES[self.idx as usize].name,
         ))
     }
 
     pub fn template(&self) -> Option<AttributeTemplate> {
-        Some(hir_expand::inert_attr_macro::INERT_ATTRIBUTES[self.idx as usize].template)
+        Some(syntax::builtin_attrs::INERT_ATTRIBUTES[self.idx as usize].template)
     }
 }
 
@@ -3811,7 +3814,9 @@ impl TypeParam {
         let data = &params[self.id.local_id()];
         match data.type_param().unwrap().provenance {
             TypeParamProvenance::TypeParamList => false,
-            TypeParamProvenance::TraitSelf | TypeParamProvenance::ArgumentImplTrait => true,
+            TypeParamProvenance::TraitSelf
+            | TypeParamProvenance::ArgumentImplTrait
+            | TypeParamProvenance::Anonymous => true,
         }
     }
 
@@ -4060,18 +4065,23 @@ impl Impl {
             extend_with_impls(Either::Left(impls))
         });
         if let Some(module) = method_resolution::simplified_type_module(db, &simplified_ty) {
-            InherentImpls::for_each_crate_and_block(
+            InherentImpls::for_self_ty_in_crate_and_block(
                 db,
                 module.krate(db),
                 module.block(db),
-                &mut |impls| extend_with_impls(Either::Left(impls.for_self_ty(&simplified_ty))),
+                &simplified_ty,
+                &mut |impls| extend_with_impls(Either::Left(impls)),
             );
             std::iter::successors(module.block(db), |block| block.module(db).block(db))
                 .filter_map(|block| TraitImpls::for_block(db, block))
                 .for_each(|impls| impls.for_self_ty(&simplified_ty, &mut extend_with_impls));
         }
+        // Each crate's trait impls for the type alone: of a crate read from impl table pages,
+        // the type's entry and its rows, not the crate's whole table.
+        let key = method_resolution::SelfTyKey(simplified_ty);
         for &seen in method_resolution::loaded_crates(db, krate.id) {
-            TraitImpls::for_crate(db, seen).for_self_ty(&simplified_ty, &mut extend_with_impls);
+            let impls = TraitImpls::in_crate_for_self_ty(db, seen, key);
+            result.extend(impls.iter().copied().map(|id| Impl { id }));
         }
         // An impl in a block is one of its crate as well as of the block.
         let mut seen = HashSet::new_in(Global); // alloc: editor edge, sized by the impls found
@@ -4091,7 +4101,7 @@ impl Impl {
             });
         };
         for &seen in method_resolution::loaded_crates(db, krate.id) {
-            handle_impls(TraitImpls::for_crate(db, seen));
+            handle_impls(TraitImpls::for_crate_and_trait(db, seen, trait_.id));
         }
         if let Some(block) = module.block(db)
             && let Some(impls) = TraitImpls::for_block(db, block)
@@ -5709,12 +5719,13 @@ impl<'db> Type<'db> {
         );
 
         if let Some(module) = method_resolution::simplified_type_module(db, &simplified_type) {
-            InherentImpls::for_each_crate_and_block(
+            InherentImpls::for_self_ty_in_crate_and_block(
                 db,
                 module.krate(db),
                 module.block(db),
+                &simplified_type,
                 &mut |impls| {
-                    handle_impls(impls.for_self_ty(&simplified_type));
+                    handle_impls(impls);
                 },
             );
         }
@@ -5880,6 +5891,7 @@ impl<'db> Type<'db> {
                 receiver_span: hir_ty::Span::Dummy,
                 frame,
                 errors: None,
+                diverging_type_vars: None,
             };
             f(&ctx)
         })

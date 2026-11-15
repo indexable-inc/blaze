@@ -46,7 +46,10 @@ pub struct OutFile {
     pub path: String,
     pub executable: bool,
     /// `None` for a directory, which is kept even when empty, and for a link ([`OutFile::link`]).
-    pub bytes: Option<Vec<u8>>,
+    /// Shared: the front end's text of the file is this allocation (`blaze_lower::Ran::files`),
+    /// so a clone of the value and its file applied are one copy of the bytes. Encoded as the
+    /// bytes it holds, as a `Vec<u8>` was (serde's `rc`).
+    pub bytes: Option<std::sync::Arc<[u8]>>,
     /// For a link the run left that leads into its own package ([`collect`]): where it leads,
     /// absolute. In a value as it is kept that path is ported ([`crate::roots::Roots::stored`]),
     /// the package's root its placeholder, so a reuse in another checkout
@@ -89,7 +92,7 @@ struct Plain {
 struct PlainFile {
     path: String,
     executable: bool,
-    bytes: Option<Vec<u8>>,
+    bytes: Option<std::sync::Arc<[u8]>>,
 }
 
 /// What the bytes of a kept value start with when no file of it is a link ([`PlainRef`]).
@@ -345,6 +348,9 @@ pub struct Run {
     /// In verify mode, the key of the unmarked result when what the store had was verified
     /// across checkouts ([`Found::Hit`]'s `verified`): a rerun that differs retracts it.
     verified: Option<Key>,
+    /// Read just before its spawn was asked for: what [`Run::complete`]'s `moved` asks whether
+    /// a read changed since ([`crate::inputs::Began::moved`]).
+    began: crate::inputs::Began,
 }
 
 /// What [`Run::complete`] gave.
@@ -358,6 +364,42 @@ pub struct Completed {
     /// The ticket of a record that the run depends on where its roots are
     /// ([`verify::Kept::retracted`]): durable before the run is reported done.
     pub retracted: Option<Ticket>,
+    /// Why a run that succeeded was kept under no key, `None` for one that was kept (or failed,
+    /// which no run is kept for).
+    pub not_kept: Option<NotKept>,
+}
+
+/// Why a run that ended well was kept under no key: its result is this build's, and a later
+/// one runs it again.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum NotKept {
+    /// Something it read can have changed after it began ([`crate::inputs::Began::moved`]),
+    /// the first such named: what it read is hashed as it ends, so those hashes need not be
+    /// of the bytes it read, and a result kept under them would be reused for an input it
+    /// never ran on.
+    Moved(crate::inputs::Moved),
+}
+
+impl NotKept {
+    /// The reason as one word, for a profile row or a line: `moved`.
+    pub fn word(&self) -> &'static str {
+        match self {
+            NotKept::Moved(_) => "moved",
+        }
+    }
+}
+
+impl fmt::Display for NotKept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotKept::Moved(moved) => write!(
+                f,
+                "{}, so what it read is not known to be what its trace was hashed at; its result \
+                 is this build's and is kept under no key",
+                moved.said("the run")
+            ),
+        }
+    }
 }
 
 /// How a run began.
@@ -429,13 +471,21 @@ impl Run {
         if let Some(out_dir) = &spec.out_dir {
             empty(out_dir).map_err(RunError::OutDir)?;
         }
+        // Before the spawn is asked for, so any write after the run's first read is after it.
+        let began = crate::inputs::Began::now();
         // alloc: a spawn, at the edge: the effect owns its command, and the run keeps its spec
         effects.push(Effect::Spawn { command: Box::new(spec.command.clone()), tag });
-        Ok(Begun::Running(Run { spec, tag, kept, verified }))
+        Ok(Begun::Running(Run { spec, tag, kept, verified, began }))
     }
 
     pub fn tag(&self) -> Tag {
         self.tag
+    }
+
+    /// When it began, read before its spawn was asked for: what the caller's `moved` of
+    /// [`Run::complete`] asks of ([`crate::inputs::Began::moved`]).
+    pub fn began(&self) -> crate::inputs::Began {
+        self.began
     }
 
     /// Takes the spawn's completion: the result, kept when it succeeded (what `rule` says
@@ -452,6 +502,13 @@ impl Run {
     /// in [`Mode::Verify`] of a value verified across checkouts that gives otherwise records
     /// that the run depends on where its roots are ([`verify::retraction`]), keeps its own
     /// value here, and is [`RunError::Differs`] with the record's ticket.
+    ///
+    /// `moved` names something the trace names that can have changed since the run began
+    /// (the caller's [`crate::inputs::Began::moved`] of [`Run::began`]): the trace is hashed
+    /// as the run ends, so such a run's hashes need not be of what it read. Its result is
+    /// given for this build and kept by no key ([`NotKept::Moved`]), never compared with what
+    /// was kept: neither a stale result kept nor a difference that a change made said as the
+    /// run's. Asked of the trace as the run gave it, before cargo's rule widens it.
     pub fn complete<I: Inputs>(
         self,
         completion: Completion,
@@ -459,6 +516,7 @@ impl Run {
         inputs: &mut I,
         rule: impl FnOnce(&Exit) -> Result<CargoRule, blaze_build_script::Error>,
         keyed: impl FnOnce(&mut Traced) -> Result<(), blaze_build_script::Error>,
+        moved: impl FnOnce(&Traced) -> Option<crate::inputs::Moved>,
     ) -> Result<Completed, RunError<I::Error>>
     where
         I::Error: From<NoRoot>,
@@ -508,6 +566,15 @@ impl Run {
             .transpose()
             .map_err(|error| RunError::Output { key, error })?;
         let value = Value::of(exit, files);
+        // A run that would be kept or compared, whose reads can have changed since it began:
+        // this build's, kept under no key and compared with nothing (`moved` above).
+        if (rule.is_some() || self.kept.is_some())
+            && let Some(moved) = moved(&traced)
+        {
+            let tickets = Vec::new_in(std::alloc::Global);
+            let not_kept = Some(NotKept::Moved(moved));
+            return Ok(Completed { value, traced, tickets, retracted: None, not_kept });
+        }
         // One comparison for verify mode, stderr included: the one sharing makes
         // ([`ported_differs`]), so a rerun that differs only in stderr is a difference said
         // here, never a silent retraction in `verify::keep` or a mismatch of its own key.
@@ -579,7 +646,7 @@ impl Run {
         }
         let Some(rule) = rule else {
             // alloc: none, no tickets
-            return Ok(Completed { value, traced, tickets: Vec::new(), retracted: None });
+            return Ok(Completed { value, traced, tickets: Vec::new(), retracted: None, not_kept: None });
         };
         rule::widen(&mut traced, &rule, inputs).map_err(RunError::Inputs)?;
         let roots = self.spec.roots.view();
@@ -626,7 +693,7 @@ impl Run {
                 landed: kept.tickets,
             });
         }
-        Ok(Completed { value, traced, tickets: kept.tickets, retracted: kept.retracted })
+        Ok(Completed { value, traced, tickets: kept.tickets, retracted: kept.retracted, not_kept: None })
     }
 }
 
@@ -853,6 +920,9 @@ pub fn collect(dir: &Path, package: Option<&Path>) -> Result<Vec<OutFile>, Strin
                     // alloc: error path
                     let (executable, bytes) =
                         read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                    // alloc: once a file the run left, its bytes moved into the one shared
+                    // allocation every holder of the value reads (the read buffer let go)
+                    let bytes: std::sync::Arc<[u8]> = bytes.into();
                     out.push(OutFile { path: name, executable, bytes: Some(bytes), link: None });
                 }
             }
@@ -985,6 +1055,10 @@ struct Left {
 
 /// Each `OUT_DIR` this process left files in ([`left`], [`restore`]), by its path: a few
 /// dozen a build, scanned. In memory only: a restarted daemon restores each once.
+#[expect(
+    blaze::process_static,
+    reason = "one row per OUT_DIR the daemon left files in, replaced per directory but never capped: the daemon should own it"
+)]
 static LEFT: blaze_core::lock::Lock<Vec<(PathBuf, Left)>> =
     blaze_core::lock::Lock::new("usercode.run.left", Vec::new());
 
@@ -1303,7 +1377,7 @@ mod tests {
             services: Vec::new(),
         };
         spec.roots =
-            crate::roots::RootMap::default().with(crate::roots::Role::Package, Path::new(dir));
+            crate::roots::RootMap::default().with(crate::roots::Role::Package, Path::new(dir), &blaze_vfs::outside::Looks::none());
         spec
     }
 
@@ -1346,17 +1420,85 @@ mod tests {
         inputs: &mut Fixed,
         spec: Spec,
     ) -> Result<(Value, bool), RunError<String>> {
+        go_moved(sim, store, inputs, spec, false).map(|(value, ran, _)| (value, ran))
+    }
+
+    /// [`go_with`], its run's reads said to have moved since it began when `moved` is: with
+    /// why it was not kept.
+    fn go_moved(
+        sim: &mut Sim,
+        store: &mut Store,
+        inputs: &mut Fixed,
+        spec: Spec,
+        moved: bool,
+    ) -> Result<(Value, bool, Option<NotKept>), RunError<String>> {
         let mut effects = Vec::new();
         let run = match Run::begin(spec, store, inputs, Tag(1), &mut effects)? {
-            Begun::Reused(value) => return Ok((value, false)),
+            Begun::Reused(value) => return Ok((value, false, None)),
             Begun::Running(run) => run,
         };
         let mut done = None;
         run_until_idle(sim, &mut effects, |completion, _| done = Some(completion))
         .expect("the effects end");
-        let completed =
-            run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| Ok(()))?;
-        Ok((completed.value, true))
+        let completed = run.complete(
+            done.unwrap(),
+            store,
+            inputs,
+            |_| Ok(CargoRule::default()),
+            |_| Ok(()),
+            |_| moved.then(data_moved),
+        )?;
+        Ok((completed.value, true, completed.not_kept))
+    }
+
+    /// What a test of a moved read says moved: the data file the script reads, itself.
+    fn data_moved() -> crate::inputs::Moved {
+        crate::inputs::Moved {
+            read: "/ws/data".into(),
+            at: "/ws/data".into(),
+            why: crate::inputs::MovedWhy::Itself,
+        }
+    }
+
+    /// The invariant: a run whose reads can have changed after it began (its trace is hashed
+    /// as it ends) is kept under no key, so the next run with the same inputs runs it again
+    /// rather than reuse a result for bytes it may never have read; and in verify mode it is
+    /// compared with nothing, so a change under it is no difference said as the run's. The
+    /// control: the same runs with nothing moved are kept, reused, and their difference said.
+    #[test]
+    fn a_run_whose_reads_moved_after_it_began_is_kept_under_no_key() {
+        for moved in [true, false] {
+            let mut sim = Sim::new(7, Faults::default());
+            let mut store = opened(&mut sim);
+            let data = Rc::new(RefCell::new([1; 32]));
+            let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
+            let runs = Rc::new(RefCell::new(0));
+            script(&mut sim, data.clone(), printed.clone(), runs.clone());
+            let mut inputs = Fixed {
+                files: [("/ws/data".into(), [1; 32])].into(),
+                env: vec![("CC".into(), "cc".into())],
+            };
+            let first =
+                go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Normal), moved).unwrap();
+            assert!(first.1, "the first run runs");
+            assert_eq!(first.2, moved.then(|| NotKept::Moved(data_moved())), "moved: {moved}");
+            if let Some(not_kept) = &first.2 {
+                assert!(
+                    not_kept.to_string().starts_with("/ws/data changed after the run began, so "),
+                    "a run not kept names what moved: {not_kept}"
+                );
+            }
+            let again = go_with(&mut sim, &mut store, &mut inputs, spec(Mode::Normal)).unwrap();
+            assert_eq!(again.1, moved, "a run kept under no key runs again; moved: {moved}");
+            // Kept by the run just made in either case: one result, and a verify of a rerun
+            // that gives otherwise under a moved read says no difference.
+            *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+            let verified = go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Verify), moved);
+            match moved {
+                true => assert_eq!(verified.unwrap().2, Some(NotKept::Moved(data_moved()))),
+                false => assert!(matches!(verified, Err(RunError::Differs { .. })), "{verified:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1579,7 +1721,7 @@ mod tests {
                 OutFile {
                     path: "gen/a.rs".into(),
                     executable: false,
-                    bytes: Some(b"x".to_vec()),
+                    bytes: Some(b"x".to_vec().into()),
                     link: None,
                 },
             ],
@@ -1604,7 +1746,7 @@ mod tests {
             )
         );
         let mut file = value();
-        file.files[1].bytes = Some(b"y".to_vec());
+        file.files[1].bytes = Some(b"y".to_vec().into());
         let file_differs = differs(&value(), &file).unwrap();
         assert!(
             file_differs.starts_with("gen/a.rs in its OUT_DIR differs: 1 bytes hashing "),
@@ -1618,14 +1760,15 @@ mod tests {
 
     #[test]
     fn an_out_dir_is_collected_and_restored_and_kept_inside() {
-        let dir = std::env::temp_dir().join(format!("blaze-out-dir-test-{}", std::process::id()));
-        empty(&dir).unwrap();
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-out-dir-test-");
+        let dir = tmp.path();
+        empty(dir).unwrap();
         restore(&dir, &value().files).unwrap();
         assert_eq!(collect(&dir, None).unwrap(), value().files);
         let bad = [OutFile {
             path: "../x".into(),
             executable: false,
-            bytes: Some(Vec::new()),
+            bytes: Some(Vec::new().into()),
             link: None,
         }];
         assert!(restore(&dir, &bad).is_err());
@@ -1642,7 +1785,6 @@ mod tests {
                     .any(|it| it.path == "in" && it.bytes.as_deref() == Some(b"x".as_slice()))
             );
         }
-        _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A link a run left in its `OUT_DIR` into its own package (gmp-mpfr-sys links its bundled
@@ -1653,8 +1795,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_link_into_the_runs_own_package_is_kept_as_a_link_and_any_other_is_refused() {
-        let top = std::env::temp_dir().join(format!("blaze-out-dir-link-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&top);
+        let top = blaze_core::temp::TempDir::for_test("blaze-out-dir-link-");
         let (package, out, sibling) = (top.join("pkg"), top.join("out"), top.join("sibling"));
         for dir in [package.join("vendor"), out.join("build"), sibling.clone()] {
             std::fs::create_dir_all(dir).unwrap();
@@ -1720,7 +1861,6 @@ mod tests {
         std::fs::remove_file(out.join("away")).unwrap();
         let refused = collect(&out, None).unwrap_err();
         assert!(refused.contains("build/src is a link to") && refused.contains("it has none"));
-        _ = std::fs::remove_dir_all(&top);
     }
 
     /// A value with no link is the bytes it was before a link could be kept (the previous
@@ -1736,7 +1876,7 @@ mod tests {
             files: vec![OutFile {
                 path: "a".into(),
                 executable: false,
-                bytes: Some(b"x".to_vec()),
+                bytes: Some(b"x".to_vec().into()),
                 link: None,
             }],
         };
@@ -1764,11 +1904,12 @@ mod tests {
     /// directory listed after a file in it, and a file's mode set on its descriptor.
     #[test]
     fn a_restore_makes_each_directory_once_and_collect_reads_it_back() {
-        let dir = std::env::temp_dir().join(format!("blaze-out-dir-once-{}", std::process::id()));
-        let file = |path: &str, executable: bool, bytes: &[u8]| OutFile {
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-out-dir-once-");
+        let dir = tmp.path();
+        let file =|path: &str, executable: bool, bytes: &[u8]| OutFile {
             path: path.into(),
             executable,
-            bytes: Some(bytes.to_vec()),
+            bytes: Some(bytes.into()),
             link: None,
         };
         let listed =
@@ -1803,6 +1944,5 @@ mod tests {
         // Restored again over what is there: emptied first, the same files.
         restore(&dir, &expected).unwrap();
         assert_eq!(collect(&dir, None).unwrap(), expected);
-        _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,12 @@
+{
+ "id": "termui-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "where": "crates/blaze-cargo/src/cli/daemon.rs (the connect path, lane edit3-1111's)",
+ "what": "A command that starts the daemon prints two long lines before anything else (`blaze: starting the daemon (no socket activation is installed ...)`, `blaze: the daemon it started (pid ..) started: the database starts empty ...`) with eprintln, before the screen exists, so they stay in the scrollback above a region and wrap at 80 columns.",
+ "cost": "none; they are the one thing of a cold start the screen does not own",
+ "cause": "the connect path writes stderr itself",
+ "workaround": "none",
+ "fix": "hand them to the screen as events (a note under -v, the status row's words otherwise) once the connect path is settled",
+ "state": "open"
+}

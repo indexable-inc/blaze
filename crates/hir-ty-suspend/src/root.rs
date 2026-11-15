@@ -133,8 +133,8 @@ fn inherent_method(
     };
     let name = Symbol::intern(method);
     let self_ty = SimplifiedType::Adt(SolverDefId::AdtId(adt));
-    InherentImpls::for_crate(db, krate)
-        .for_self_ty(&self_ty)
+    // The type's inherent impls alone, not the crate's whole table.
+    InherentImpls::in_crate_for_self_ty(db, krate, hir_ty::method_resolution::SelfTyKey(self_ty))
         .iter()
         .find_map(|&imp| {
             imp.impl_items(db).items.iter().find_map(|(it, item)| match *item {

@@ -35,7 +35,7 @@ use blaze_format::{
 };
 use blaze_hash::HashMap;
 use hir_def::{
-    DefWithBodyId, FieldId, LocalFieldId, VariantId,
+    DefWithBodyId, ExpressionStoreOwnerId, FieldId, LocalFieldId, VariantId,
     expr_store::ExpressionStore,
     hir::{
         AsmOperand as HirAsmOperand, AsmOptions, AsmPiece, BindingId, Expr, ExprId,
@@ -79,6 +79,10 @@ const WORDS_VERSION: u64 = 6;
 /// from the store on reading.
 #[derive(Clone, Copy)]
 pub(crate) struct Locations<'a> {
+    pub(crate) db: &'a Db,
+    /// Whose store `store` is: what a `line!()` or `column!()` placeholder is resolved in
+    /// ([`crate::body_store::placed_literal`]).
+    pub(crate) owner: ExpressionStoreOwnerId,
     pub(crate) store: &'a ExpressionStore,
     pub(crate) exprs: &'a [ExprId],
     /// How many bytes an address of the body's target takes.
@@ -118,9 +122,18 @@ impl Locations<'_> {
 
     /// The constant of type `ty` that MIR building makes of the literal `expr` as the store
     /// has it now, by its rule (`lower_literal_to_operand`) for the literals location macros
-    /// expand to; `None` for another.
+    /// expand to; `None` for another. A `line!()` or `column!()` literal is the placeholder the
+    /// expansion leaves, so its value is the one [`crate::body_store::placed_literal`] reads
+    /// from where the call is written now; a call written nowhere is `None`, a refusal.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a location slot is filled with the value its literal has where it is written \
+                  now: that is what lets the record itself hold none"
+    )]
     fn constant<'db>(&self, expr: ExprId, ty: Ty<'db>) -> Option<StoredAllocation> {
         let Expr::Literal(literal) = self.store.expr(expr) else { return None };
+        let placed = crate::body_store::placed_literal(self.db, self.owner, expr).ok()?;
+        let literal = placed.as_ref().unwrap_or(literal);
         let word = self.word;
         let (memory, memory_map): (Box<[u8]>, MemoryMap<'db>) = match *literal {
             Literal::String(ref text) => {
@@ -381,11 +394,43 @@ pub(crate) fn read<'db>(
     buffer: &[u8],
     locations: Locations<'_>,
 ) -> Result<MirBody<'db>, FormatError> {
+    read_in(db, buffer, Bounds::of(locations.store), Some(locations))
+}
+
+/// How many expressions, patterns and bindings the store of a body has: what [`read_in`]
+/// checks every index of the body's store against. [`Bounds::of`] counts a store that is
+/// there; a record of a crate no edit reaches keeps the counts of the store its writer had
+/// (`check_cache::runtime`), so its reader lowers no body to have them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Bounds {
+    pub(crate) exprs: u32,
+    pub(crate) pats: u32,
+    pub(crate) bindings: u32,
+}
+
+impl Bounds {
+    pub(crate) fn of(store: &ExpressionStore) -> Bounds {
+        Bounds {
+            exprs: table_len(store.expr_count()),
+            pats: table_len(store.pat_count()),
+            bindings: table_len(store.bindings().count()),
+        }
+    }
+}
+
+/// [`read`] against `bounds`, with the location literals only when the body has any: with
+/// `None` a location slot in the words is refused by name (the writer said the body has none),
+/// and nothing of the body's store is read.
+pub(crate) fn read_in<'db>(
+    db: &'db Db,
+    buffer: &[u8],
+    bounds: Bounds,
+    locations: Option<Locations<'_>>,
+) -> Result<MirBody<'db>, FormatError> {
     let root = open_as::<MirRoot>(buffer, SCHEMA)?;
     let tys = TyTableReader::open(DbInterner::new_no_crate(db), buffer, root.tys)?;
     let allocs = root.allocs.follow(buffer)?;
     let words = root.words.follow(buffer)?;
-    let store = locations.store;
     let mut decode = Decode {
         db,
         words,
@@ -399,9 +444,9 @@ pub(crate) fn read<'db>(
         buffer,
         locals: 0,
         blocks: 0,
-        exprs: table_len(store.expr_count()),
-        pats: table_len(store.pat_count()),
-        bindings: table_len(store.bindings().count()),
+        exprs: bounds.exprs,
+        pats: bounds.pats,
+        bindings: bounds.bindings,
         locations,
     };
     let body = decode.body()?;
@@ -462,6 +507,11 @@ impl<'db> Encode<'_, 'db> {
     }
 
     #[inline]
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the MIR record format holds a list's length as a u32 word, and a body's lists \
+                  are not checked under 2^32 before this: a larger list needs a typed refusal"
+    )]
     fn count(&mut self, len: usize) {
         self.word(u32::try_from(len).expect("a MIR list of fewer than 2^32 items"));
     }
@@ -487,6 +537,11 @@ impl<'db> Encode<'_, 'db> {
         self.word(place);
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the MIR record format numbers a body's allocations by u32, not checked under \
+                  2^32 before this: a larger body needs a typed refusal"
+    )]
     fn allocation(&mut self, allocation: &StoredAllocation) {
         let allocation = allocation.as_ref();
         let index = match self.alloc_places.get(&allocation) {
@@ -502,6 +557,11 @@ impl<'db> Encode<'_, 'db> {
         self.word(index);
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the MIR record format places a body's text by a u32 start, and the text is not \
+                  checked under 4 GiB before this: a larger body needs a typed refusal"
+    )]
     fn text(&mut self, text: &str) {
         let start = u32::try_from(self.text.len()).expect("a body's text under 4 GiB");
         self.word(start);
@@ -1319,7 +1379,8 @@ struct Decode<'a, 'db> {
     exprs: u32,
     pats: u32,
     bindings: u32,
-    locations: Locations<'a>,
+    /// The body's location literals; `None` for a body its writer said has none.
+    locations: Option<Locations<'a>>,
 }
 
 type R<T> = Result<T, FormatError>;
@@ -1868,7 +1929,11 @@ impl<'a, 'db> Decode<'a, 'db> {
         let Some(MirSpan::ExprId(expr)) = span else {
             return Err(self.invalid("a location slot with no expression"));
         };
-        let locations = self.locations;
+        let Some(locations) = self.locations else {
+            return Err(self.invalid(
+                "a location slot in a body written as one with no location literal",
+            ));
+        };
         if !locations.has(expr) {
             return Err(
                 self.invalid("a location slot of an expression that is no location literal now")

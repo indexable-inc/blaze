@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-17",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: the watches outside every view on Linux (blaze-vfs outside, blaze-usercode inputs)",
+ "what": "The no-op lane never answered on Linux. Four causes found with a serde fixture on blaze-vm and an event that says, for each path a walk looked at, who looked and the watch's generations: a watch's wake that names no file (Linux marks the whole file system, so every write wakes every watch) was taken as a change; a cover kept with an answer stayed on a directory whose watch a directory above had taken over; `Files::entry` looked every time; a traced name's whole directory was asked of, so `/root/wt` made `/root` (the daemon's home under it) never quiet.",
+ "cost": "every build with nothing changed walked: 3 s on reth, 3.1 s on a serde fixture (78 ms after the first three fixes)",
+ "cause": "the watch table was only ever exercised where the watch is per directory and quiet (macOS FSEvents on a dev machine)",
+ "whys": [
+  "why a walk: the lane refuses",
+  "why: the walk looked at a path",
+  "why: no watch vouched",
+  "why: on Linux every watch hears every write and an empty wake counted as a change; a name was vouched for by its whole directory tree",
+  "property: semantics tested on one platform's event shape and one directory layout"
+ ],
+ "class": "a platform's event shape assumed (rule simulate-first: the simulation never delivered an empty wake or noise beside a name)",
+ "prevention": "built (lane reth-1112, merged by noopkeep): empty wake is no change; a cover follows its taker; names are asked of by name (`Dirs::watch_name`); a walk's file looks are kept and looked at again; each with an invariant and a control in outside/tests.rs and noop/tests.rs. Not built: the simulated driver delivering empty wakes and file-system-wide noise by default",
+ "fix": "5c53498.., 45d5677.., ab8b2fb416, efaf95ca43 on reth-1112; in int-good 7b970bbe0d",
+ "state": "fixed on a fixture (walk 78 ms; the lane's answer on Linux not yet measured on the merged tree)"
+}

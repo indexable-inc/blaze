@@ -190,9 +190,9 @@ mod tests {
 
     #[test]
     fn a_baseline_is_started_checked_both_ways_and_lowered() {
-        let root =
-            std::env::temp_dir().join(format!("blaze-clippy-baselines-{}", std::process::id()));
-        let lint = "clippy::disallowed_types".to_owned();
+        let made = blaze_core::temp::TempDir::for_test("blaze-clippy-baselines-");
+        let root = made.path().to_owned();
+        let lint ="clippy::disallowed_types".to_owned();
         let run =
             counted(&[("clippy::disallowed_types", "a", 2), ("clippy::disallowed_types", "b", 1)]);
         let said = run.finish(&root, "b", T, false, std::slice::from_ref(&lint)).unwrap();
@@ -283,15 +283,15 @@ mod tests {
             !root.join("b/blaze.wall_clock.txt").exists(),
             "a list with a wrong name writes nothing"
         );
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn a_finding_with_no_unit_fails_the_run_naming_it() {
         let mut run = Counted::default();
         run.unowned.push("blaze::wall_clock at src/a.rs: a clock read".to_owned());
-        let root = std::env::temp_dir();
-        let error = run.finish(&root, "no-such-baselines", T, false, &[]).unwrap_err();
+        let made = blaze_core::temp::TempDir::for_test("blaze-clippy-unowned-");
+        let root = made.path().to_owned();
+        let error = run.finish(&root,"no-such-baselines", T, false, &[]).unwrap_err();
         assert!(
             error.contains("no unit") && error.contains("blaze::wall_clock at src/a.rs"),
             "{error}"

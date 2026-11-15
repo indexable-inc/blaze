@@ -32,7 +32,8 @@ use blaze_mem::RegionVec;
 use super::{
     flight::{error, failed, filled, raw, spare_of},
     ops::{
-        DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, SECOND, UNSYNCED, WHOLE,
+        DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, READ_ONLY, SECOND, UNSYNCED,
+        WHOLE,
         arena_of,
     },
     *,
@@ -436,8 +437,8 @@ impl Uring {
         Ok(())
     }
 
-    /// Starts [`Effect::Map`] (with `kind` [`Kind::Map`]) or [`Effect::Stat`] (with
-    /// [`Kind::Stat`]; with `follow` false [`Effect::Lstat`]) `tag` of `file`.
+    /// Starts [`Effect::Stat`] (with [`Kind::Stat`]; with `follow` false [`Effect::Lstat`]) `tag`
+    /// of `file` ([`Uring::map`] starts a [`Kind::Map`]).
     pub(super) fn look(
         &mut self,
         tag: Tag,
@@ -457,6 +458,25 @@ impl Uring {
             hot.flags |= NO_FOLLOW;
         }
         self.named(hot, ops::NO_BYTES, Cold::EMPTY, push, file)?;
+        Ok(())
+    }
+
+    /// Starts [`Effect::Map`] `tag` of `extent` of `file`: the open on the ring, the map at its
+    /// completion ([`Uring::mapped`]), a range's offset and length kept in the cold record.
+    pub(super) fn map(&mut self, tag: Tag, file: &FileName, extent: crate::Extent) -> io::Result<()> {
+        let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
+            at[0] = push_c(names, path.as_os_str().as_bytes())?;
+            Ok(())
+        };
+        let mut hot = Hot::new(tag, Kind::Map, 0);
+        let mut cold = Cold::EMPTY;
+        if let crate::Extent::Range { at, len } = extent {
+            hot.flags |= ops::RANGE;
+            cold.at = at;
+            cold.names[3] = len as u32;
+            cold.names[4] = (len >> 32) as u32;
+        }
+        self.named(hot, ops::NO_BYTES, cold, push, file)?;
         Ok(())
     }
 
@@ -570,7 +590,9 @@ impl Uring {
         Step::Ends(Some(Done::Read(mem::take(bytes))))
     }
 
-    /// Starts the open of the kept file `file`, named `name`, made if missing with `make`.
+    /// Starts the open of the kept file `file`, named `name`, made if missing with `make`. A
+    /// file kept read-only ([`Kept::read_only`]) is opened `O_RDONLY` first, with no `make`:
+    /// where it is missing, [`Uring::opened`] opens it again to make it.
     pub(super) fn open(
         &mut self,
         file: Handle<Kept>,
@@ -578,10 +600,12 @@ impl Uring {
         make: bool,
     ) -> io::Result<()> {
         let mut hot = Hot::new(NOBODYS, Kind::Open, file.to_bits());
-        if make {
+        let kept = self.kept.get(file).expect("a file just kept");
+        if kept.read_only {
+            hot.flags |= READ_ONLY;
+        } else if make {
             hot.flags |= MAKE;
         }
-        let kept = self.kept.get(file).expect("a file just kept");
         if kept.positional {
             hot.flags |= ops::POSITIONAL;
         }
@@ -858,7 +882,12 @@ impl Uring {
                 let flags = match (hot.flags & ops::POSITIONAL != 0, hot.flags & DIRECT != 0) {
                     (true, true) => POSITIONAL_KEEP | libc::O_DIRECT,
                     (true, false) => POSITIONAL_KEEP,
-                    (false, _) => KEEP | if hot.flags & MAKE != 0 { libc::O_CREAT } else { 0 },
+                    // Made where missing is opened to append, a sync's too (`Kept::read_only`).
+                    (false, _) => match (hot.flags & MAKE != 0, hot.flags & READ_ONLY != 0) {
+                        (true, _) => KEEP | libc::O_CREAT,
+                        (false, true) => libc::O_RDONLY,
+                        (false, false) => KEEP,
+                    },
                 };
                 sqes[0] = open(name(0), flags, 0o644, NO_SLOT, 0, ud(0));
                 1
@@ -1139,7 +1168,10 @@ impl Uring {
             // alloc: an error.
             let why = format!("opening {}: {}", self.name_of(id, 0).to_string_lossy(), error(res));
             self.wake(file, Some((res, &why)), true);
-            self.ops.get_mut(id).expect("in flight").flags |= MAKE;
+            // Made, it is opened to append: no longer read-only (`Kept::read_only`).
+            self.kept.get_mut(file).expect("held by its open").read_only = false;
+            let open = self.ops.get_mut(id).expect("in flight");
+            open.flags = open.flags & !READ_ONLY | MAKE;
             return Step::Again;
         }
         if res == -libc::ENOENT && hot.flags & MAKE != 0 && hot.flags & MADE == 0 {
@@ -1181,6 +1213,11 @@ impl Uring {
             }
             self.on_open.remove(at);
             let (tag, whole) = (hot.tag, hot.flags & WHOLE != 0);
+            // A part of a batched read ends into its batch (`WHOLE` is `IDLE` on a read into
+            // memory, so it is read only for a `Kind::Read`).
+            let part = (hot.kind == Kind::ReadInto && hot.flags & ops::PART != 0)
+                .then(|| self.ops.cold(id).names[3]);
+            let whole = whole && hot.kind == Kind::Read;
             let Some((res, why)) = failed else {
                 self.queue(id);
                 continue;
@@ -1189,7 +1226,10 @@ impl Uring {
                 true => Done::Read(mem::take(self.ops.buf_mut(id))),
                 false => Done::Failed(IoError(why.to_owned())), // alloc: clone: an error.
             };
-            self.ready.push(Completion { tag, done });
+            match part {
+                Some(index) => self.read_part_ended(tag, index, done),
+                None => self.ready.push(Completion { tag, done }),
+            }
             self.end(id);
         }
     }
@@ -1326,12 +1366,27 @@ impl Uring {
         }
         // SAFETY: the open's completion: a descriptor of the driver's, owned by no other.
         let file = File::from(unsafe { OwnedFd::from_raw_fd(res) });
-        // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, no effect
-        // writes, appends to or truncates it in place; the store and the image replace a file
+        let hot = *self.ops.get(id).expect("in flight");
+        let cold = self.ops.cold(id);
+        let range = (hot.flags & ops::RANGE != 0)
+            .then(|| (cold.at, u64::from(cold.names[3]) | u64::from(cold.names[4]) << 32));
+        // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, the bytes
+        // below the length it had when mapped are never written again and it is never
+        // truncated (it may be appended to); the store and the image otherwise replace a file
         // only by renaming another over it.
-        let done = match unsafe { crate::fs::Mapped::map(&file) } {
+        let mapped = unsafe {
+            match range {
+                None => crate::fs::Mapped::map(&file),
+                Some((at, len)) => crate::fs::MapOptions::new().map_range(&file, at, len),
+            }
+        };
+        let done = match mapped {
             Ok(mapped) => Done::Mapped(crate::Mapping::file(mapped)),
-            Err(error) => Done::Failed(IoError(error.to_string())), // alloc: an error.
+            Err(error) => {
+                // alloc: an error.
+                let path = self.name_of(id, 0).to_string_lossy().into_owned();
+                Done::Failed(IoError(format!("{path}: {error}")))
+            }
         };
         Step::Ends(Some(done))
     }

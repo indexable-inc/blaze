@@ -35,3 +35,5 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 pub use check::{Found, Setup, check};
 pub use level::Level;
 pub use lints::names as implemented;
+/// The trust lints' grants, facts and the table `blaze audit grants` prints.
+pub use blaze::trust;

@@ -50,7 +50,6 @@ pub use graph::Graph;
 pub use names::{validate_feature_name, validate_package_name, validate_registry_name};
 pub use package_id::PackageId;
 pub use package_id_spec::PackageIdSpec;
-pub use poll::block_on;
 pub use registry::{IndexSummary, MemRegistry, QueryKind, Registry, query_pinned};
 pub use resolve::{LockfileMetadata, Resolve, ResolveVersion};
 pub use summary::{

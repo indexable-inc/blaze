@@ -172,14 +172,13 @@ fn the_oracle_catches_a_walk_in_the_order_its_describes_ran() {
 }
 
 /// No round stands between a describe and what it reached: `main` (1) calls 2 and 3, and 2
-/// calls 4. The describe of 3 waits until 4's describe is kept under its key, which a walk by
-/// levels never gets to (4 is of the level after 3's): here 4 is described, and visible by
-/// its key, while 3, reached a step before it, is still being described and long before the
-/// walk ends.
+/// calls 4. The describe of 3 waits until 4's describe has begun, which a walk by levels never
+/// gets to (4 is of the level after 3's): here 4 is described while 3, reached a step before
+/// it, is still being described and long before the walk ends.
 #[test]
-fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
+fn a_function_is_described_while_one_reached_before_it_still_is() {
     const LONG: Duration = Duration::from_secs(60);
-    let kept: Arc<Kept<u32, u32>> = Arc::new(Kept::new());
+    let four = Arc::new(AtomicBool::new(false));
     let waited = Arc::new(AtomicBool::new(false));
     let mut program = Program::default();
     program.function(1, 0x11, &[2, 3]);
@@ -187,11 +186,14 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     program.function(3, 0x33, &[]);
     program.function(4, 0x44, &[]);
     program.watch = Some(Box::new({
-        let (kept, waited) = (Arc::clone(&kept), Arc::clone(&waited));
+        let (four, waited) = (Arc::clone(&four), Arc::clone(&waited));
         move |id: u32| {
+            if id == 4 {
+                four.store(true, Ordering::Release);
+            }
             if id == 3 {
-                SpinWait::within("the describe of f4, kept while f3 is described", LONG, || {
-                    kept.function(0, &(4, member())).is_some()
+                SpinWait::within("the describe of f4, begun while f3 is described", LONG, || {
+                    four.load(Ordering::Acquire)
                 });
                 waited.store(true, Ordering::Release);
             }
@@ -201,7 +203,7 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     let reached = pool.install(|| {
         let policy = policy(OptLevel::O0, Mode::Output);
         let (machine, memo) = (Machine::default(), Memo::new());
-        let build = Build::new(&machine, &program, &policy, &memo).keeping(&kept);
+        let build = Build::new(&machine, &program, &policy, &memo);
         let mut errors = Vec::new();
         let (nodes, ..) = build.walk(&[(1, member())], &[], &[], None, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
@@ -209,4 +211,192 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     });
     assert_eq!(reached, 4);
     assert!(waited.load(Ordering::Acquire), "f3's describe saw f4's before it ended");
+}
+
+/// The last `done` and `known` recorded on any span of a [`Route`]: what a walk's span
+/// carries, as the profile's subscriber reads it.
+#[derive(Default)]
+struct Counts {
+    done: std::sync::atomic::AtomicU64,
+    known: std::sync::atomic::AtomicU64,
+    /// How many records named either field.
+    records: std::sync::atomic::AtomicU64,
+}
+
+struct CountsOf<'a>(&'a Counts);
+
+impl tracing::field::Visit for CountsOf<'_> {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        let slot = match field.name() {
+            "done" => &self.0.done,
+            "known" => &self.0.known,
+            _ => return,
+        };
+        slot.store(value, Ordering::Release);
+        self.0.records.fetch_add(1, Ordering::Release);
+    }
+
+    // dyn: tracing's visitor takes any other value by its `Debug`
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+/// The test binary's one subscriber, its global default: every callsite's interest is
+/// `sometimes`, so each span is asked of [`Router::enabled`] as it is made, and goes to the
+/// [`Counts`] the making thread routes to ([`Route`]), else nowhere.
+///
+/// The race it removes. The recorder was a scoped default (`with_default`), and what it
+/// counts is recorded on `codegen walk describe` (`driver.rs`), a callsite every walk in
+/// this crate hits, nearly all on threads with no subscriber. A callsite's interest is cached
+/// process-wide when it is first hit, and while one scoped dispatcher was the only live one
+/// `tracing-core` asked only the registering thread's default (`Rebuilder::JustOne`): a test
+/// that first hit that callsite then, on its own thread, cached it as never interesting, and
+/// the walk tests' spans were never made: "done 0, known 0", one parallel run in three. With
+/// one global dispatcher whose answer is never `never`, no thread's first hit can switch off
+/// another's recorder, whatever the order.
+struct Router;
+
+/// Each live route's id and the counts it records into; no route has id 0.
+static ROUTES: blaze_core::lock::Lock<Vec<(u64, Arc<Counts>), std::alloc::Global>> =
+    blaze_core::lock::Lock::unrecorded("codegen.tests.walk.routes", Vec::new_in(std::alloc::Global));
+
+/// The id the next route takes.
+static NEXT_ROUTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// [`Router`] made the global default, once a test binary.
+static ROUTER: std::sync::Once = std::sync::Once::new();
+
+thread_local! {
+    /// The route this thread's spans go to; 0 for none.
+    static ROUTE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// While it lives, the spans this thread makes, and what is recorded on them from any thread,
+/// go to its counts.
+struct Route(u64);
+
+impl Route {
+    fn install(counts: &Arc<Counts>) -> Route {
+        ROUTER.call_once(|| {
+            if let Err(why) = tracing::subscriber::set_global_default(Router) {
+                panic!("the walk tests' router could not be the global subscriber: {why}");
+            }
+        });
+        let id = NEXT_ROUTE.fetch_add(1, Ordering::Relaxed);
+        ROUTES.lock().push((id, Arc::clone(counts)));
+        let was = ROUTE.with(|it| it.replace(id));
+        assert_eq!(was, 0, "a thread routes to one recorder at a time");
+        Route(id)
+    }
+}
+
+impl Drop for Route {
+    fn drop(&mut self) {
+        ROUTE.with(|it| it.set(0));
+        ROUTES.lock().retain(|it| it.0 != self.0);
+    }
+}
+
+impl Router {
+    /// The counts of route `id`, while it lives.
+    fn counts(id: u64) -> Option<Arc<Counts>> {
+        ROUTES.lock().iter().find(|it| it.0 == id).map(|it| Arc::clone(&it.1))
+    }
+}
+
+impl tracing::Subscriber for Router {
+    fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        ROUTE.with(std::cell::Cell::get) != 0
+    }
+
+    /// Made only on a thread [`Self::enabled`] said yes to, so its route is not 0.
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let route = ROUTE.with(std::cell::Cell::get);
+        if let Some(counts) = Self::counts(route) {
+            attributes.record(&mut CountsOf(&counts));
+        }
+        tracing::span::Id::from_u64(route)
+    }
+
+    fn record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        if let Some(counts) = Self::counts(id.into_u64()) {
+            values.record(&mut CountsOf(&counts));
+        }
+    }
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// What the span over a walk of `program` on `workers` carried last: (`done`, `known`), how
+/// many records named them, and how many functions and statics the walk gave.
+fn carried(program: &Program, workers: usize, bug: Option<Planted>) -> (u64, u64, u64, usize) {
+    let counts = Arc::new(Counts::default());
+    let pool = Pool::new(&Topology::flat(workers), false).unwrap();
+    let items = pool.install(|| {
+        let route = Route::install(&counts);
+        let items = {
+            let policy = policy(OptLevel::O0, Mode::Output);
+            let (machine, memo) = (Machine::default(), Memo::new());
+            let build = Build::new(&machine, program, &policy, &memo);
+            let build = match bug {
+                Some(bug) => build.planting(bug),
+                None => build,
+            };
+            let roots: Vec<(u32, Origin)> = ROOTS.iter().map(|it| (*it, member())).collect();
+            let mut errors = Vec::new();
+            let span = tracing::info_span!(
+                target: "blaze",
+                "codegen walk",
+                done = tracing::field::Empty,
+                known = tracing::field::Empty,
+            );
+            let (nodes, statics, ..) =
+                span.in_scope(|| build.walk(&roots, &STATIC_ROOTS, &[], None, &mut errors));
+            assert!(errors.is_empty(), "{errors:?}");
+            nodes.len() + statics.len()
+        };
+        drop(route);
+        items
+    });
+    (
+        counts.done.load(Ordering::Acquire),
+        counts.known.load(Ordering::Acquire),
+        counts.records.load(Ordering::Acquire),
+        items,
+    )
+}
+
+/// The invariant: the walk's span carries how far the walk is: as it ends, every item sent
+/// was visited (`done == known`), that count is the walk's functions and statics, and it is
+/// the same on one worker and on eight.
+#[test]
+fn the_walks_span_carries_done_and_known() {
+    let program = generated(3);
+    let (done, known, records, items) = carried(&program, 1, None);
+    assert!(records >= 2, "the span was told its counts: {records} records");
+    assert_eq!(done, known, "every item sent was visited");
+    // One key a function here (`generated` gives each its own code), so the walk's nodes
+    // are its entries.
+    assert_eq!(done as usize, items, "the count is the walk's functions and statics");
+    let (done_8, known_8, ..) = carried(&program, 8, None);
+    assert_eq!((done_8, known_8), (done, known), "the same counts on eight workers");
+}
+
+/// The planted bug: only the roots are counted as known. The oracle of
+/// [`the_walks_span_carries_done_and_known`] compares `done` with `known`, and here more
+/// visits ended than items were said to be known.
+#[test]
+fn the_oracle_catches_a_walk_that_counts_only_its_roots() {
+    let program = generated(3);
+    let (done, known, ..) = carried(&program, 1, Some(Planted::UncountedSends));
+    assert!(done > known, "done {done}, known {known}");
 }

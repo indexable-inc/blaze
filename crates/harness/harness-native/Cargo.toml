@@ -18,6 +18,7 @@ path = "src/main.rs"
 harness-native-blaze = { path = "../harness-native-blaze" }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 harness-native-model = { path = "../harness-native-model" }
+harness-chat-library = { path = "../harness-chat-library" }
 harness-native-ui-inline = { path = "../harness-native-ui-inline" }
 harness-native-flecs = { path = "../harness-native-flecs", features = ["json"] }
 harness-native-ecs = { path = "../harness-native-ecs" }

@@ -227,7 +227,7 @@ unsafe fn run_jobs(shared: *mut Shared) -> ! {
 
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn entry_point() -> usize {
-    entry as usize
+    entry as *const () as usize
 }
 
 /// The coroutine's first Rust frame, called by `trampoline` with the argument `prepare` left.
@@ -424,7 +424,7 @@ mod arch {
         let mut frame = [0usize; 20];
         frame[0] = arg;
         frame[1] = entry;
-        frame[11] = trampoline as usize;
+        frame[11] = trampoline as *const () as usize;
         // SAFETY: the caller's contract.
         unsafe {
             let sp = top.sub(frame.len());

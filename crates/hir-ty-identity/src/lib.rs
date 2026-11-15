@@ -64,6 +64,7 @@ use hir_def::{DefWithBodyId, FunctionId};
 use hir_ty::{
     InferBodyId,
     db::{InternedClosureId, InternedCoroutineId},
+    facts::Tier,
     mir::{MirOptLevel, MirOptions},
     next_solver::StoredGenericArgs,
 };
@@ -235,47 +236,58 @@ impl NamesIds for Instance {
     }
 }
 
-/// A set of [`MirOptions`], one bit for each of the forty-eight (three levels, UB checks or
-/// not, lifetime markers or not, inlined or not, allocations moved to the stack or not).
+/// A set of [`MirOptions`], one bit for each of the 144 (three levels, UB checks or not,
+/// lifetime markers or not, inlined or not, allocations moved to the stack or not, three tiers:
+/// [`MirOptions::tier`]), in two words.
 /// Options with a program's dyn facts ([`MirOptions::world`]) are in no set: [`OptionsSet::of`]
 /// would fold them into theirs without, which the code generator's `options_set` refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OptionsSet(u64);
+pub struct OptionsSet([u128; 2]);
 
 const LEVELS: [MirOptLevel; 3] = [MirOptLevel::Off, MirOptLevel::Debug, MirOptLevel::Release];
+const TIERS: [Tier; 3] = [Tier::Zero, Tier::Shipped, Tier::Optimizing];
 
 impl OptionsSet {
-    pub const EMPTY: OptionsSet = OptionsSet(0);
+    pub const EMPTY: OptionsSet = OptionsSet([0; 2]);
 
     pub const fn of(options: &[MirOptions]) -> OptionsSet {
-        let mut bits = 0;
+        let mut bits = [0u128; 2];
         let mut at = 0;
         while at < options.len() {
-            bits |= 1 << OptionsSet::index(options[at]);
+            let index = OptionsSet::index(options[at]);
+            bits[(index / 128) as usize] |= 1 << (index % 128);
             at += 1;
         }
         OptionsSet(bits)
     }
 
+    /// The bit of `options`, below 144: what `instance.rs` hashes as one byte.
     pub(crate) const fn index(options: MirOptions) -> u32 {
         let level = match options.level {
             MirOptLevel::Off => 0,
             MirOptLevel::Debug => 1,
             MirOptLevel::Release => 2,
         };
-        level * 16
-            + (options.ub_checks as u32) * 8
-            + (options.lifetime_markers as u32) * 4
-            + (options.inline as u32) * 2
-            + options.heap_to_stack as u32
+        let tier = match options.tier {
+            Tier::Zero => 0,
+            Tier::Shipped => 1,
+            Tier::Optimizing => 2,
+        };
+        level * 48
+            + (options.ub_checks as u32) * 24
+            + (options.lifetime_markers as u32) * 12
+            + (options.inline as u32) * 6
+            + (options.heap_to_stack as u32) * 3
+            + tier
     }
 
     pub const fn contains(self, options: MirOptions) -> bool {
-        self.0 & (1 << OptionsSet::index(options)) != 0
+        let index = OptionsSet::index(options);
+        self.0[(index / 128) as usize] & (1 << (index % 128)) != 0
     }
 
     pub const fn is_empty(self) -> bool {
-        self.0 == 0
+        self.0[0] == 0 && self.0[1] == 0
     }
 
     /// The options, in [`MirOptions`]' order.
@@ -286,13 +298,16 @@ impl OptionsSet {
                 [false, true].into_iter().flat_map(move |ub_checks| {
                     [false, true].into_iter().flat_map(move |lifetime_markers| {
                         [false, true].into_iter().flat_map(move |inline| {
-                            [false, true].map(|heap_to_stack| MirOptions {
-                                level,
-                                ub_checks,
-                                lifetime_markers,
-                                inline,
-                                heap_to_stack,
-                                world: None,
+                            [false, true].into_iter().flat_map(move |heap_to_stack| {
+                                TIERS.map(|tier| MirOptions {
+                                    level,
+                                    ub_checks,
+                                    lifetime_markers,
+                                    inline,
+                                    heap_to_stack,
+                                    world: None,
+                                    tier,
+                                })
                             })
                         })
                     })

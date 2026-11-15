@@ -1,0 +1,9 @@
+{
+ "id": "closures-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (lane closures)",
+ "where": "crates/hir-ty-lean/src/lib.rs accepted()",
+ "state": "fixed",
+ "what": "A fixture refused with only \"a function the borrow checker did not accept\" when the cause was a type error (u32::MAX without minicore int_bounds; minicore Result is not Copy): three VM rounds spent guessing.",
+ "fix": "accepted() now names the borrow checker first diagnostic, or the not_checked / skipped reason, in the refusal."
+}

@@ -76,7 +76,7 @@ impl<'a> Input<'a> {
 // The bytes on disk, as `disk.rs` and `index.rs` lay them out.
 
 /// `crate::FORMAT` of blaze-cas: the head and the index table carry it.
-pub(crate) const FORMAT: u32 = 3;
+pub(crate) const FORMAT: u32 = 8;
 pub(crate) const BLOCK: usize = 4096;
 pub(crate) const PACK_HEADER: usize = 16;
 pub(crate) const RECORD_HEADER: usize = 96;
@@ -106,7 +106,9 @@ const HEAD_INDEX_LEN: usize = 32;
 const HEAD_INDEX_CHECK: usize = 40;
 const HEAD_INDEX_COUNT: usize = 48;
 const HEAD_PACKS: usize = 56;
-const PACK_REF: usize = 32;
+/// A pack in a head (format 6 on): removed, three zeros, its unit, then its committed, indexed,
+/// dead and last-used lengths.
+const PACK_REF: usize = 40;
 
 const INDEX_HEADER: usize = 64;
 const INDEX_ROW: usize = 64;
@@ -301,6 +303,7 @@ pub(crate) struct PackRef {
     pub(crate) committed: u64,
     pub(crate) indexed: u64,
     pub(crate) dead: u64,
+    pub(crate) used: u64,
 }
 
 pub(crate) struct IndexRef {
@@ -326,7 +329,7 @@ pub(crate) struct DictionaryRef {
 }
 
 /// A head naming `packs`, `dictionaries` and the index table `index`, with no files of their
-/// own and no units.
+/// own, no units and no record forgotten alone (the count at byte 12 is zero).
 pub(crate) fn head(
     index: Option<IndexRef>,
     packs: &[PackRef],
@@ -354,6 +357,7 @@ pub(crate) fn head(
         out.extend_from_slice(&pack.committed.to_le_bytes());
         out.extend_from_slice(&pack.indexed.to_le_bytes());
         out.extend_from_slice(&pack.dead.to_le_bytes());
+        out.extend_from_slice(&pack.used.to_le_bytes());
     }
     for dictionary in dictionaries {
         out.push(dictionary.kind);
@@ -482,6 +486,22 @@ pub(crate) fn pack_file(at: usize) -> String {
     format!("pack-{at:06}")
 }
 
+/// The file of `pack-<at>`'s block checks (`checks.rs`).
+pub(crate) fn checks_file(at: usize) -> String {
+    format!("checks-{at:06}")
+}
+
+/// The block checks of `pack` as `checks.rs` lays them out: one CRC-32C of each 4 KiB block,
+/// little-endian, in order, with no header.
+pub(crate) fn checks_of(pack: &[u8]) -> Vec<u8> {
+    pack.chunks(BLOCK).flat_map(|block| crc32c(block).to_le_bytes()).collect()
+}
+
+/// The checks file beside `pack` (a pack's name in the store's directory).
+fn checks_beside(pack: &FileName) -> FileName {
+    file(&checks_file(pack_number(pack) as usize))
+}
+
 pub(crate) fn file(name: &str) -> FileName {
     FileName::new(&format!("{DIR}/{name}")).expect("a name in the store's directory")
 }
@@ -496,7 +516,7 @@ pub(crate) fn sim() -> Sim {
 }
 
 pub(crate) fn config() -> Config {
-    Config { dir: FileName::new(DIR).expect("the store's directory"), layers: Vec::new(), tags: 0 }
+    Config { dir: FileName::new(DIR).expect("the store's directory"), layers: Vec::new(), tags: 0, load_tags: 1 << 32, loader: blaze_cas::Loader::Pumped }
 }
 
 /// Runs what the store asked for, handing it each completion, until nothing is in flight.
@@ -533,11 +553,16 @@ pub(crate) fn files(sim: &mut Sim) -> Vec<(FileName, u64)> {
     found
 }
 
-/// A simulation whose store directory holds `files`, by name, and nothing else.
+/// A simulation whose store directory holds `files`, by name, and beside each pack its block
+/// checks (as every commit leaves them), and nothing else.
 pub(crate) fn store_of(files: &[(&str, &[u8])]) -> Sim {
     let mut sim = sim();
     for (name, bytes) in files {
-        sim.change(&file(name), bytes);
+        let name = file(name);
+        if is_pack(&name) {
+            sim.change(&checks_beside(&name), &checks_of(bytes));
+        }
+        sim.change(&name, bytes);
     }
     sim
 }
@@ -563,7 +588,7 @@ pub(crate) fn lone_slot() -> Slot {
 
 /// [`lone_pack`] as pack 0 of a head, indexed up to `indexed`.
 pub(crate) fn lone_ref(indexed: u64) -> PackRef {
-    PackRef { removed: false, unit: 0, committed: BLOCK as u64, indexed, dead: 0 }
+    PackRef { removed: false, unit: 0, committed: BLOCK as u64, indexed, dead: 0, used: 0 }
 }
 
 // Values written through the API.
@@ -791,20 +816,39 @@ pub(crate) fn damage_file(
 }
 
 /// Damages one of the store's packs (the input's next byte picks which); with `reseal`, every
-/// record header that was whole before gets its check again, so the damage reaches what is
-/// behind the check.
+/// record header that was whole before gets its check again and so does every block the checks
+/// file names, so the damage reaches what is behind both checks.
 pub(crate) fn damage_packs(sim: &mut Sim, input: &mut Input<'_>, reseal: bool) -> bool {
     let packs = packs(sim);
     if packs.is_empty() || input.is_empty() {
         return false;
     }
     let pack = &packs[usize::from(input.u8()) % packs.len()];
-    damage_file(sim, pack, input, |bytes, before| {
+    let mut resealed = None;
+    let changed = damage_file(sim, pack, input, |bytes, before| {
         if reseal {
             let starts: Vec<usize> = walk(before).iter().map(|(at, _)| *at).collect();
             reseal_records(bytes, &starts);
+            resealed = Some(bytes.clone());
         }
-    })
+    });
+    if let (true, Some(bytes)) = (changed, resealed) {
+        reseal_checks(sim, pack, &bytes);
+    }
+    changed
+}
+
+/// Gives each block `pack`'s checks file names the check of `bytes`' block there, where
+/// `bytes` has it: a block the damage cut off keeps its old check, so the open finds the pack
+/// short, not its checks file.
+fn reseal_checks(sim: &mut Sim, pack: &FileName, bytes: &[u8]) {
+    let checks = checks_beside(pack);
+    let mut held = sim.contents(&checks);
+    let fresh = checks_of(bytes);
+    let whole = held.len() / 4 * 4;
+    let common = whole.min(fresh.len());
+    held[..common].copy_from_slice(&fresh[..common]);
+    sim.change(&checks, &held);
 }
 
 /// Damages the one record of the store's packs the input's next two bytes pick, among those
@@ -845,6 +889,9 @@ pub(crate) fn damage_record(
     let changed = bytes != before;
     if changed {
         sim.change(pack, &bytes);
+        if reseal {
+            reseal_checks(sim, pack, &bytes);
+        }
     }
     changed
 }

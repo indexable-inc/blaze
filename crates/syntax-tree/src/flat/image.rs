@@ -1,5 +1,5 @@
-//! A tree as stored bytes read in place (base-db's store of library trees, kept in the
-//! daemon's mapped image): its columns one after another behind a head saying where each is,
+//! A tree as stored bytes read in place (the front end's parse step's record,
+//! `blaze_front_items::parse`): its columns one after another behind a head saying where each is,
 //! so reading a tree back is checking the head and lending each column from the bytes as they
 //! are mapped. Nothing is decoded: [`FlatTree::from_image`] copies only the kept hashes (written
 //! as they are made, so not in read-only bytes), the lazy nodes' list and the parsed parts'

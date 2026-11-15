@@ -2,6 +2,7 @@
 //! walk lists of what the IR builder asks for.
 
 mod db;
+mod witnessed;
 
 use base_db::Db;
 use blaze_codegen::{
@@ -127,6 +128,7 @@ fn spec() -> Spec {
         proc_macro_bridge: false,
         report: false,
         fuel: false,
+        slots: false,
         heap_to_stack: false,
     }
 }
@@ -140,17 +142,18 @@ fn o3() -> Build {
 /// The invariant (docs/v2/plan/design/tiers.md, "Key shape"): tier 0 code of a crate that is
 /// not the library's is built from its own body alone. A unit at tier 0 (stencils, or LLVM at
 /// `-O0` for a CPU the stencils do not cover) asks for MIR level 1, no inliner and no
-/// devirtualization, so `hir-ty-mir`'s `optimize` runs neither `Inline` nor `SpendFacts` on
-/// it and its body reads no callee's body or effect summary: a body edit changes the key of
-/// one tier 0 function. The optimized tier asks for all three. (The library's own bodies are
-/// at level 2 and inlined under every unit, [`Build::options`]: they are std's, which no edit
-/// of the workspace reaches.)
+/// devirtualization, so `hir-ty-mir`'s `optimize` runs no `Inline` on it and its body reads no
+/// callee's body: a body edit changes the key of one tier 0 function. The optimized tier asks
+/// for all three. No tier runs `SpendFacts` for now (`hir_ty_mir::mir::passes_at`), so no
+/// unit's body reads an effect summary; tier 0's would not even with it switched on, as it
+/// runs only at level 2. (The library's own bodies are at level 2 and inlined under every
+/// unit, [`Build::options`]: they are std's, which no edit of the workspace reaches.)
 #[test]
 fn a_tier_zero_unit_builds_no_callee_into_its_bodies() {
     let tier_zero = [Backend::Stencil, Backend::Llvm { opt: 0 }];
     for backend in tier_zero {
         let build = Build::of(&Spec { backend, ..spec() });
-        assert!(!build.optimized, "{backend:?}: MIR level 2 runs `SpendFacts`");
+        assert!(!build.optimized, "{backend:?}: MIR level 2, which passes on facts run at");
         assert!(!build.inlines, "{backend:?}: the inliner builds callees in");
         assert!(build.world.is_none(), "{backend:?}: devirtualized against the program");
     }
@@ -838,10 +841,11 @@ fn described_in(
     })
 }
 
-/// The library's bodies are MIR-inlined in every unit, as shipped (`Build::options`), so a
-/// body of a `Lang` crate is its callees' bodies too: it is kept under its code, never a
-/// template code its callees' interfaces alone make, and fills no anchors of its own. Two
-/// forwarders written alike over two callees of one signature are so two keys.
+/// The library's bodies are MIR-inlined as shipped wherever a unit inlines (`Build::options`),
+/// so a body of a `Lang` crate may be its callees' bodies too: it is kept under its code under
+/// every unit, a tier 0 one included, never a template code its callees' interfaces alone
+/// make, and fills no anchors of its own. Two forwarders written alike over two callees of one
+/// signature are so two keys.
 #[test]
 fn a_library_body_the_library_inlines_into_is_kept_under_its_code() {
     let policy = policy(OptLevel::O0);
@@ -861,13 +865,18 @@ fn a_unit_that_names_its_code_keeps_it_under_its_code() {
     let plain = described_in(FORWARDERS, &policy(OptLevel::O0), "main", "via_one");
     assert!(plain.2, "the premise: a member's body at -O0 is held by table");
     assert_ne!(plain.0, plain.1, "under a template code of its own");
+    // A report is LLVM's alone (`Policy::choose`: stencil and Cranelift code reports
+    // nothing), and -O0 is stencils: its units put no row in their code, so the body is held by
+    // table as without one.
     let mut report = policy(OptLevel::O0);
     report.report = true;
+    let (template, code, anchored) = described_in(FORWARDERS, &report, "main", "via_one");
+    assert!(anchored && template != code, "a report at a stencil level names nothing");
     let mut pgo = policy(OptLevel::O0);
     pgo.pgo = blaze_codegen::settings::Pgo::Generate;
     let mut sanitize = policy(OptLevel::O0);
     sanitize.sanitize.sanitizers = blaze_codegen::settings::Sanitizers::ADDRESS;
-    for (why, policy) in [("a report", report), ("PGO", pgo), ("a sanitizer", sanitize)] {
+    for (why, policy) in [("PGO", pgo), ("a sanitizer", sanitize)] {
         let (template, code, anchored) = described_in(FORWARDERS, &policy, "main", "via_one");
         assert_eq!((template, anchored), (code, false), "under {why}, kept under its code");
     }
@@ -1049,8 +1058,9 @@ fn a_root_takes_function_items_for_its_type_parameters() {
 
 /// A generic is shared under every options a unit of its origin builds a body with: the
 /// first spec's, the LLVM spec a live build tiers it up to, the LLVM tier of a tiered run,
-/// and UB checks where its crate has debug assertions. The library's bodies are at level 2,
-/// inlined, as shipped. Leaving one out would key two bodies as one under it.
+/// and UB checks where its crate has debug assertions. The library's bodies are at level 2:
+/// at tier 0 under a tier 0 unit, uninlined; as shipped, inlined, under one that inlines.
+/// Leaving one out would key two bodies as one under it.
 #[test]
 fn a_generic_is_shared_under_every_options_its_units_build_with() {
     use hir_ty_mir::mir::{
@@ -1065,6 +1075,10 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
             .with_policy(policy);
         frontend.body_options(&origin).expect("the options")
     };
+    use hir_ty::facts::Tier;
+    // A body of the program's crates is at the optimizing tier where its unit optimizes (level
+    // 2 here), else at tier 0; the library's as shipped where the unit optimizes
+    // (`Build::tier_of`).
     let at = |level, ub_checks, inline| MirOptions {
         level,
         ub_checks,
@@ -1072,11 +1086,19 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
         inline,
         heap_to_stack: false,
         world: None,
+        tier: match level {
+            Release => Tier::Optimizing,
+            _ => Tier::Zero,
+        },
     };
+    let lang_zero = MirOptions { tier: Tier::Zero, ..at(Release, false, false) };
+    let lang_shipped = MirOptions { tier: Tier::Shipped, ..at(Release, false, true) };
     let o0 = options(&policy(OptLevel::O0));
     assert!(o0.other.contains(at(Debug, false, false)), "{o0:?}");
     assert!(!o0.other.contains(at(Release, false, false)), "{o0:?}");
-    assert!(o0.lang.contains(at(Release, false, true)), "{o0:?}");
+    assert!(o0.lang.contains(lang_zero), "{o0:?}");
+    assert!(!o0.lang.contains(lang_shipped), "a tier 0 unit inlines none of the library: {o0:?}");
+    assert!(!o0.lang.contains(at(Release, false, true)), "nor spends facts on it: {o0:?}");
     let live = options(&Policy { mode: Mode::Live, ..policy(OptLevel::O3) });
     assert!(live.other.contains(at(Debug, false, false)), "{live:?}");
     assert!(live.other.contains(at(Release, false, false)), "{live:?}");
@@ -1087,6 +1109,7 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
     assert!(tiered.other.contains(at(Release, false, false)), "{tiered:?}");
     let o3 = options(&policy(OptLevel::O3));
     assert!(o3.other.contains(at(Release, false, true)), "{o3:?}");
+    assert!(o3.lang.contains(lang_shipped), "{o3:?}");
     let mut checked = policy(OptLevel::O0);
     checked.profile.debug_assertions = true;
     let checked = options(&checked);
@@ -1570,6 +1593,52 @@ fn a_units_mir_level_is_rustcs() {
     assert!(Build::of(&spec).options(db, krate, false).ub_checks);
 }
 
+/// The invariant: a tier 0 unit builds every body at tier 0, the library's (at level 2) and
+/// the walk's included, so it spends no proof and runs no pass that reads past the body; an
+/// optimizing unit builds the program's bodies at the optimizing tier, whose proofs are
+/// `Proofs::Spent`, and the library's as shipped, spending none.
+///
+/// What the optimizing tier's `Proofs::Spent` is spent on: in `hir-ty-mir`'s `optimize` the
+/// tier's proofs go only to the two runs of `SpendFacts`, which no tier's list has for now
+/// (`hir_ty_mir::mir::passes_at`), so a build at the optimizing tier reads no proof today; the
+/// pass's tests run it through `hir_ty_mir::mir::spend_facts_at` and ask with these proofs. The
+/// checks (`#[blaze::nopanic]`, `pure`, ...) are no tier's: they ask `Proofs::Spent` on their
+/// own.
+#[test]
+fn a_tier_zero_unit_spends_no_proof() {
+    use hir_ty::facts::{Proofs, Tier, proofs_at};
+    let (db, _) = frontend(SIBLINGS);
+    let krate = fixture::test_crate(&db);
+    let core = base_db::all_crates(db)
+        .iter()
+        .copied()
+        .find(|it| it.data(db).origin.is_lang())
+        .expect("minicore's crate");
+    let tier = |build: Build, written, per_user| build.options(db, written, per_user).tier;
+    let proofs = |build: Build, written, per_user| proofs_at(tier(build, written, per_user));
+    for backend in [
+        Backend::Cranelift { speed: false },
+        Backend::Cranelift { speed: true },
+        Backend::Llvm { opt: 0 },
+        Backend::Stencil,
+    ] {
+        let build = Build::of(&Spec { backend, ..spec() });
+        for (written, per_user) in [(krate, false), (krate, true), (core, false), (core, true)] {
+            assert_eq!(tier(build, written, per_user), Tier::Zero, "{backend:?}");
+            assert_eq!(proofs(build, written, per_user), Proofs::None, "{backend:?}");
+            assert!(!build.options(db, written, per_user).inline, "{backend:?} inlines");
+        }
+    }
+    let optimized = Build::of(&Spec { backend: Backend::Llvm { opt: 3 }, mir_inline: true, ..spec() });
+    assert_eq!(tier(optimized, krate, false), Tier::Optimizing);
+    assert_eq!(proofs(optimized, krate, false), Proofs::Spent);
+    assert_eq!(tier(optimized, core, true), Tier::Shipped, "the library's bodies are as shipped");
+    assert_eq!(proofs(optimized, core, true), Proofs::None);
+    for written in [krate, core] {
+        assert_eq!(tier(Build::WALK, written, false), Tier::Zero);
+    }
+}
+
 /// An entry of the allocator shim is built against what its walk lists, the function it
 /// calls by symbol, and is another code for another callee.
 #[test]
@@ -2028,8 +2097,9 @@ fn built_as(db: &Db, spec: &Spec, instance: &HirInstance) -> super::Built {
         .unwrap_or_else(|e| panic!("{instance:?}: {e}"))
 }
 
-/// A unit's bodies are MIR-inlined as rustc's: the library's always, as shipped; every other
-/// crate's only in an LLVM unit at level 2 or 3, and in the walk for such a unit.
+/// A unit's bodies are MIR-inlined as rustc's `Inline::is_enabled` says of the unit: only in
+/// an LLVM unit at level 2 or 3, and in the walk for such a unit, the library's as every other
+/// crate's (a tier 0 unit inlines nothing at the MIR level).
 #[test]
 fn a_units_bodies_are_inlined_as_rustcs() {
     let (db, _) = frontend(SIBLINGS);
@@ -2051,14 +2121,16 @@ fn a_units_bodies_are_inlined_as_rustcs() {
     for (backend, inlines) in backends {
         let build = Build::of(&Spec { backend, mir_inline: inlines, ..spec() });
         assert_eq!(inline(build, krate), inlines, "{backend:?}");
-        assert!(inline(build, core), "the library's at {backend:?}");
+        assert_eq!(inline(build, core), inlines, "the library's at {backend:?}");
     }
     // `s`, `z` and a build that patches are at LLVM's level 2 without the inliner.
     let sized = Build::of(&Spec { backend: Backend::Llvm { opt: 2 }, mir_inline: false, ..spec() });
     assert!(!inline(sized, krate));
-    assert!(inline(sized, core));
+    assert!(!inline(sized, core));
     assert!(!inline(Build::WALK, krate));
+    assert!(!inline(Build::WALK, core));
     assert!(inline(Build::WALK_INLINED, krate));
+    assert!(inline(Build::WALK_INLINED, core));
 }
 
 /// A member at O3 is inlined, at O0 not, and a package the profile sets apart is as the
@@ -4324,4 +4396,195 @@ fn a_wasm32_pair_is_returned_as_llvm_returns_it_whatever_blaze_was_built_with() 
     frontend
         .with(|db| built(db, &copied, target, false, Build::of(&spec())))
         .unwrap_or_else(|e| panic!("copied: {e}"));
+}
+
+/// What a build interns before the release: its closure captures a reference, so the arguments
+/// of `call` and of the closure hold regions `erase_regions` erases and keeps.
+const RELEASED: &str = r#"
+//- minicore: sized, fn
+pub struct P(pub u16);
+pub fn outer<T>(x: &T) -> &T { x }
+pub fn call<F: Fn() -> u16>(f: F) -> u16 { f() }
+pub fn roots() -> u16 {
+    let p = P(1);
+    let r = &p;
+    outer(&p);
+    call(|| r.0)
+}
+"#;
+
+/// What is built after the release, and in a fresh process: the same calls over other types, so
+/// a row a stale cache names after the release is another value than it was before.
+const AFTER_RELEASE: &str = r#"
+//- minicore: sized, fn
+pub struct Q(pub u64, pub u8);
+pub fn outer<T>(x: &T) -> &T { x }
+pub fn call<F: Fn() -> u8>(f: F) -> u8 { f() }
+pub fn roots() -> u8 {
+    let q = Q(1, 2);
+    let r = &q;
+    outer(&q);
+    call(|| r.1)
+}
+"#;
+
+/// The shapes of `text`'s `roots` and of every function it reaches, in the walk's order, built
+/// over a database the caller then drops as a daemon lets go of a kept one: counted kept, let go
+/// (`hir::evict::front_end_dropped`), dropped.
+fn shapes_let_go(text: &str) -> Vec<Shape> {
+    let db: TestDB = fixture::db(text).into_db();
+    let shapes = {
+        let frontend =
+            HirFrontend::new(Databases::new(&db), HashSource::ById(ById), BuildTime::default())
+                .with_policy(&policy(OptLevel::O0));
+        let root = frontend.root(function(&db, "roots"));
+        let reached = frontend.with(|db| {
+            refs::walk(db, &root, refs::Walking::plain(false)).expect("the walk of the root")
+        });
+        let mut shapes = vec![shape(&frontend, &root)];
+        for it in reached {
+            if let FrontRef::Function(instance) = it {
+                shapes.push(shape(&frontend, &instance));
+            }
+        }
+        shapes
+    };
+    hir::evict::front_end_kept();
+    hir::evict::front_end_dropped(&db);
+    drop(db);
+    // No front end here was given [`super::Walks`], so nothing of its walks outlives it.
+    assert_eq!(super::kept_walks(), 0);
+    shapes
+}
+
+/// What a child prints its shapes after, one line, for [`a_build_after_a_release_equals_a_fresh_build`].
+const SHAPES_AFTER: &str = "shapes of the build after: ";
+
+/// Builds [`RELEASED`], releases the process's tables, then builds [`AFTER_RELEASE`] and prints
+/// its shapes: run alone in a process by [`a_build_after_a_release_equals_a_fresh_build`], as a
+/// release needs no other test's task or database in the process.
+fn built_after_a_release() {
+    let before = shapes_let_go(RELEASED);
+    assert!(!before.is_empty());
+    let released = hir::evict::release_process_tables();
+    assert!(released.tables > 0, "{released:?}");
+    println!("{SHAPES_AFTER}{:?}", shapes_let_go(AFTER_RELEASE));
+}
+
+#[test]
+#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+fn child_builds_fresh() {
+    println!("{SHAPES_AFTER}{:?}", shapes_let_go(AFTER_RELEASE));
+}
+
+#[test]
+#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+fn child_builds_after_a_release() {
+    built_after_a_release();
+}
+
+#[test]
+#[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
+fn child_builds_after_a_release_keeping_erased() {
+    crate::plant::KEEPS_ERASED.store(true, std::sync::atomic::Ordering::Relaxed);
+    built_after_a_release();
+}
+
+/// Runs the child test `name` alone in a process of its own: whether it passed, and the shapes
+/// it printed.
+fn child(name: &str) -> (bool, Option<String>) {
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let path = format!("v2::tests::{name}");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", &path, "--ignored", "--nocapture", "--test-threads=1"])
+        .output()
+        .unwrap_or_else(|e| panic!("running {path}: {e}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Under `--nocapture` with one thread, libtest writes `test <name> ... ` and then the
+    // test's own output on the same line, so the shapes are found after the marker, not at
+    // the line's start.
+    let shapes = stdout
+        .lines()
+        .find_map(|line| line.find(SHAPES_AFTER).map(|at| &line[at + SHAPES_AFTER.len()..]))
+        .map(str::to_owned);
+    if out.status.success() && shapes.is_none() {
+        panic!(
+            "{path} passed and printed no shapes\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    (out.status.success(), shapes)
+}
+
+/// The refinement: building a fixture, dropping its database as a daemon does, releasing the
+/// trait solver's interner tables (`hir::evict::release_process_tables`) and building another
+/// fixture gives that one's shapes (hashes of its prepared IR's bytes) equal to those a fresh
+/// process builds: nothing in the process names a row the release freed. Each build runs alone
+/// in a child process, as a release refuses while another test's task runs.
+///
+/// Control: `plant::KEEPS_ERASED` keeps `erase_regions`' map across the release, so a row it
+/// names was another value when it was kept: that build differs or fails.
+#[test]
+fn a_build_after_a_release_equals_a_fresh_build() {
+    let (fresh_passed, fresh) = child("child_builds_fresh");
+    assert!(fresh_passed, "the fresh build failed");
+    let (after_passed, after) = child("child_builds_after_a_release");
+    assert!(after_passed, "the build after a release failed");
+    assert_eq!(after, fresh, "the build after a release differs from a fresh build");
+    let (kept_passed, kept) = child("child_builds_after_a_release_keeping_erased");
+    assert!(
+        !kept_passed || kept != fresh,
+        "the control: with `erase_regions`' map kept across the release the build is still \
+         the fresh one's, so the test does not see a stale row"
+    );
+}
+
+/// The invariant: what the builds over a database keep for the next walk (its kept walks,
+/// witnesses and records found) is held by the database's owner's [`super::Walks`] and by
+/// nothing else, so it goes when the owner drops it: two front ends given one `Walks` share
+/// one kept walk a configuration, a front end given none keeps nothing past itself, and
+/// once the owner is dropped no `Walks` is alive.
+///
+/// Control: the process static these were held in until 2026-11-13 (`KEPT`, by the
+/// database's nonce) gave the two front ends without `Walks` one kept walk, which the
+/// `ptr_eq` below refuses.
+#[test]
+fn what_the_walks_keep_goes_with_the_databases_owner() {
+    let db: TestDB = fixture::db("fn main() {}").into_db();
+    fn made(db: &TestDB) -> HirFrontend<'_> {
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
+            .with_policy(&policy(OptLevel::O0))
+    }
+    let walks = super::Walks::new(&db);
+    let (a, b) = (made(&db).with_walks(&walks), made(&db).with_walks(&walks));
+    let kept = a.kept();
+    assert!(std::sync::Arc::ptr_eq(&kept, &b.kept()), "one kept walk a configuration");
+    let (c, d) = (made(&db), made(&db));
+    let own = c.kept();
+    assert!(
+        !std::sync::Arc::ptr_eq(&own, &d.kept()),
+        "a front end with no `Walks` keeps its own, and nothing holds it past the front end"
+    );
+    let (kept, own) = {
+        let weak = (std::sync::Arc::downgrade(&kept), std::sync::Arc::downgrade(&own));
+        drop((kept, own));
+        weak
+    };
+    assert!(own.upgrade().is_none(), "nothing but its build held a walk with no owner");
+    assert!(kept.upgrade().is_some(), "the owner holds its kept walk between builds");
+    drop((a, b, c, d));
+    drop(walks);
+    assert!(kept.upgrade().is_none(), "the kept walk went with its owner");
+}
+
+/// A `Walks` names its database's ids: given to a front end of another database, it is
+/// refused, naming the rule.
+#[test]
+#[should_panic(expected = "keys-cover-every-input")]
+fn walks_of_another_database_are_refused() {
+    let (one, other): (TestDB, TestDB) =
+        (fixture::db("fn main() {}").into_db(), fixture::db("fn main() {}").into_db());
+    let walks = super::Walks::new(&one);
+    let _ = HirFrontend::new(Databases::new(&other), HashSource::ById(ById), BuildTime::default())
+        .with_walks(&walks);
 }

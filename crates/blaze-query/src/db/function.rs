@@ -50,8 +50,8 @@ use super::{
         UNTRACKED, VALUE, VIEW_MASK, span,
     },
     storage::{
-        ALL, Durability, FIELD, Relocate, Restamp, Storage, Summary, Table, color, key_parts,
-        node_key, or,
+        ALL, Durability, FIELD, LOOSE, Relocate, Restamp, Storage, Summary, Table, color,
+        key_parts, node_key, or,
     },
     verify,
 };
@@ -171,7 +171,9 @@ impl Vtable {
             made: None,
             memory: memory::<F>,
             used: Some(used::<F> as fn(&Storage, u32) -> u64),
+            values: Some(values::<F> as fn(&Storage, u32) -> u64),
             verify: Some(verify_edge::<F> as unsafe fn(*const (), &Storage, Id) -> Verified),
+            db: Some(std::any::TypeId::of::<F::Db> as fn() -> std::any::TypeId),
             reset: Some(reset_row::<F> as unsafe fn(&Storage, u32, Id)),
             weighed: if F::BUDGETED {
                 Some(Weighed {
@@ -467,6 +469,18 @@ fn refresh<F: Function>(
             }
             return State::OnStack(at);
         }
+        // A row behind a seal a write may have reached: its group is checked once, here, and
+        // every row of it is proved by that check, or the seal is broken and the row is
+        // verified as any other is ([`super::seal`]).
+        if word & (RUNNING | PROVISIONAL) == 0
+            && node != 0
+            && word & VIEW_MASK != 0
+            && word & VIEW_MASK != view
+            && let Some(group) = storage.seals.suspect_of(node)
+            && super::seal::resolve(std::ptr::from_ref(db).cast::<()>(), storage, group, None)
+        {
+            continue;
+        }
         if word & PROVISIONAL != 0 {
             let head = header.extra.load(Ordering::Relaxed) as u32;
             match local::with(|local| local.find(storage, head)) {
@@ -490,6 +504,7 @@ fn refresh<F: Function>(
         {
             // A changed-set walk ended in this view and did not reach the row: it is
             // unchanged, with no look at its edges. A mark another task won is looked at again.
+            counts::count(index, counts::PROVED_FIRST);
             mark(storage, header, word, node, index, id);
             continue;
         } else if word & RUNNING == 0
@@ -655,9 +670,7 @@ fn claimed<F: Function>(
         run::<F>(db, storage, index, row, key, None, false);
         return None;
     }
-    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
-        || storage.inputs_unchanged(storage.node(node), word & VIEW_MASK)
-    {
+    if storage.holds(node, storage.node(node), meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
         if mark(storage, header, word, node, index, id) && value && word & VALUE == 0 {
             storage.record_run(node, Cause::Evicted);
             run::<F>(db, storage, index, row, key, None, true);
@@ -757,6 +770,19 @@ pub(crate) mod probe {
         pub(crate) static BEFORE_FLIGHT: Cell<Option<fn(u32, Id)>> = const { Cell::new(None) };
         /// The planted bug: this thread runs a stale head of a cycle that is another task's.
         pub(crate) static FOREIGN_STALE_RUNS: Cell<bool> = const { Cell::new(false) };
+        /// The planted bug: on this thread a head that ends a member of a lower cycle keeps to
+        /// itself that a row above it moved this round, so the outermost head never hears of
+        /// it ([`super::participate`], `tests/inner_heads.rs`).
+        pub(crate) static INNER_HEADS_FORGET: Cell<bool> = const { Cell::new(false) };
+        /// The planted bug: on this thread a head kept from a cycle's last round starts its
+        /// frame at round 1 again, so its `cycle_recover` is told 1 in every round
+        /// ([`super::run`], `tests/inner_heads.rs`).
+        pub(crate) static KEPT_HEADS_START_AGAIN: Cell<bool> = const { Cell::new(false) };
+        /// The planted bug: on this thread [`super::refresh_by_key`] stamps a row current with
+        /// no look at its edges.
+        pub(crate) static REFRESH_UNVERIFIED: Cell<bool> = const { Cell::new(false) };
+        /// The planted bug: on this thread [`super::refresh_by_key`] records no read edge.
+        pub(crate) static REFRESH_RECORDS_NO_READ: Cell<bool> = const { Cell::new(false) };
     }
 }
 
@@ -825,10 +851,20 @@ fn verify_claimed(
     row_node: u32,
     verified: u32,
 ) -> Option<u32> {
+    // A row whose edges a seal pass let go has none to look at: what it read is not known,
+    // so it runs again, named as the read that changed itself (its provenance reads
+    // `Changed` of its own node: its reads were let go, [`super::seal::Seals::let_go`]).
+    // Without this an empty span would prove it unchanged.
+    if storage.seals.let_go(row_node) {
+        return Some(row_node);
+    }
     let edges = header.edges.load(Ordering::Acquire);
     let (start, len) = (span::start(edges), span::len(edges));
     let mut summary = [0; 2];
+    // The census: this row's edges are looked at, and how many, counted when the look ends.
+    let mut census = counts::Claimed::of(key_parts(storage.key_of(row_node)).0);
     for at in start..start + len {
+        census.compared += 1;
         let node = storage.edge(at);
         let row = storage.node(node);
         let mut seen = row.color();
@@ -876,12 +912,102 @@ unsafe fn verify_edge<F: Function>(db: *const (), storage: &Storage, id: Id) -> 
     }
 }
 
+/// What [`refresh_by_key`] found of a row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refreshed {
+    /// A function's row, verified (or run) in this view: its kept reads are those of its last
+    /// run and are not replaced in this view. Its value may have been let go: none is made for
+    /// this.
+    Current,
+    /// A function's row that cannot be brought up to date from here: running on this task (a
+    /// cycle through it), provisional, proved only on the assumption of a verify open lower
+    /// on this task's stack, or of a key its function no longer takes. No read is recorded.
+    Unsettled,
+    /// Not a function's row (an input's field, an interned or a tracked struct): it keeps no
+    /// reads, and there is nothing to bring up to date.
+    NotAFunction,
+}
+
+/// Brings the row `key` names up to date in this view, without knowing which function it is
+/// a row of: [`Vtable::verify`], what a reader's edge on the row does, asked by its key.
+///
+/// The invariant: a row this answers [`Refreshed::Current`] for is what a fresh run of its
+/// function gives in this view (its value, and the reads its run kept: verified by its edges,
+/// each dependency brought up to date first, and run again if one changed, or run when it
+/// never ran), and the running query, if any, now has a read edge on it, as a fetch of it
+/// leaves. So a query that uses what the row holds besides its value (its kept reads:
+/// [`super::Storage::row_reads`], [`super::Reads::for_each_read_through`], which asks this
+/// itself) runs again when the row does. A row a reader proved by durability, with no look
+/// at its edges, keeps the stamp of the view it was last verified in until it is asked for:
+/// this is the asking. No value is made for a row whose value was let go.
+///
+/// For the engine's own operation reachable by key alone, so no caller keeps a list of the
+/// queries it may meet (a `match` over each function's typed `arguments`).
+///
+/// # Panics
+///
+/// When `D` is not the database type of `key`'s function or of the storage, or `key` is an
+/// ID the storage never gave ([`super::NeverGiven`]). Unwinds as a fetch does (a pending
+/// write, a bound that ran out).
+pub fn refresh_by_key<D: Database>(db: &D, key: DatabaseKeyIndex) -> Refreshed {
+    let storage = db.storage();
+    let (index, id) = (key.ingredient_index(), key.key_index());
+    let Some(vtable) = ingredient::vtable(index) else {
+        return Refreshed::NotAFunction;
+    };
+    let (Some(verify), Some(db_type)) = (vtable.verify, vtable.db) else {
+        return Refreshed::NotAFunction;
+    };
+    // The cast below is to the function's own database type, so `D` must be it: a key of
+    // another database's function (ingredients are the process's) is refused by name. Its
+    // table, made by the verify if this storage has none, checks `F::Db` against the
+    // storage's one database type.
+    assert!(
+        db_type() == std::any::TypeId::of::<D>(),
+        "{}",
+        blaze_report::say!(
+            blaze_report::say::Code(vtable.name),
+            " was asked to refresh with a database of another type (",
+            blaze_report::say::Words(std::any::type_name::<D>()),
+            ")",
+        )
+        .flat()
+    );
+    #[cfg(test)]
+    if probe::REFRESH_UNVERIFIED.with(Cell::get)
+        && let Some(header) = header_of(storage, index, id)
+    {
+        // The planted bug: the row is stamped current with no look at its edges.
+        let word = header.verified.load(Ordering::Acquire);
+        header.verified.store(storage.view_bits() | (word & VALUE), Ordering::Release);
+        read(storage, header);
+        return Refreshed::Current;
+    }
+    // SAFETY: `db` is a `&D`, and `D` is the function's `F::Db` (checked above);
+    // `id` is passed as it is, and `verify_edge` refuses an ID that is not a key of its
+    // function (`FromIdIn`) or that the storage never gave.
+    match unsafe { verify(std::ptr::from_ref(db).cast::<()>(), storage, id) } {
+        Verified::Current => {
+            let header = header_of(storage, index, id)
+                .expect("a row verified in this view has its page: `verify_edge` made it");
+            #[cfg(test)]
+            if probe::REFRESH_RECORDS_NO_READ.with(Cell::get) {
+                return Refreshed::Current;
+            }
+            read(storage, header);
+            Refreshed::Current
+        }
+        Verified::Changed | Verified::Assumed => Refreshed::Unsettled,
+    }
+}
+
 /// What a run leaves on its frame.
 struct Ran {
     head: u32,
     reentered: bool,
     unconverged: bool,
     untracked: bool,
+    stored: bool,
     durability: u8,
     changed: u32,
     round: u32,
@@ -898,6 +1024,7 @@ fn ran(at: u32) -> Ran {
             reentered: frame.reentered,
             unconverged: frame.unconverged,
             untracked: frame.untracked,
+            stored: frame.stored,
             durability: frame.durability,
             changed: frame.changed,
             round: frame.round,
@@ -1011,9 +1138,12 @@ fn run<F: Function>(
     let id = key.as_id();
     let node = node_of(storage, index, id, header);
     let mut word = header.verified.load(Ordering::Acquire);
+    // The node of the head that kept this row from its cycle's last round, 0 when none did.
+    let mut keeper = 0;
     if word & RUNNING == 0 {
         let meta = header.meta.load(Ordering::Relaxed);
         if meta & STALE != 0 {
+            keeper = header.extra.load(Ordering::Relaxed) as u32;
             header.meta.store(meta & !STALE, Ordering::Relaxed);
         }
         if header
@@ -1032,6 +1162,23 @@ fn run<F: Function>(
     let at = frame.unwrap_or_else(|| {
         local::with(|local| local.push(Frame::new(storage, FrameKind::Run, node, index, id)))
     });
+    // The planted bug (`tests/inner_heads.rs`): a kept head counts its rounds from 1 again.
+    #[cfg(test)]
+    if probe::KEPT_HEADS_START_AGAIN.with(Cell::get) {
+        keeper = 0;
+    }
+    if keeper != 0 {
+        // A head kept from the last round of a lower head's cycle runs again as part of that
+        // head's round: its frame is new, but the round is not its first. It starts at its
+        // keeper's, so its `cycle_recover` and its members' are told the cycle's round
+        // ([`participate`]), not 1 in every round. The keeper's run is on this stack
+        // ([`claimed`] runs a stale row nowhere else).
+        local::with(|local| {
+            if let Some(below) = local.find(storage, keeper) {
+                local.frames[at as usize].round = local.frames[below as usize].round;
+            }
+        });
+    }
     let mut running = Running { storage, header, word, at, index, id, armed: true };
     storage.event(|| EventKind::WillExecute { database_key: DatabaseKeyIndex::new(index, id) });
     counts::count(index, counts::EXECUTED);
@@ -1093,15 +1240,18 @@ fn store_edges(storage: &Storage, header: &Header, at: u32) {
 }
 
 /// Sets the summary of the run at `at` (node `node`): the OR of its edges' and its replayed
-/// reads', all bits when it made an untracked read.
-fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool) {
+/// reads', all bits when it made an untracked read. Its seal group is worked out from the
+/// same edges ([`super::seal::Seals::derived`]); `made`: the row had run before.
+fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool, made: bool) {
     let summary = if untracked {
         ALL
     } else {
         local::with(|local| {
             let frame = &local.frames[at as usize];
             let start = frame.edges_start as usize;
-            or(frame.summary, storage.summary_of_edges(&local.edges[start..]))
+            let edges = &local.edges[start..];
+            let summary = or(frame.summary, storage.summary_of_edges(edges));
+            storage.seals.derived(storage, node, edges, summary, made)
         })
     };
     storage.set_summary(node, summary);
@@ -1154,7 +1304,9 @@ fn finish<F: Function>(
     } else {
         gained(table, id);
     }
-    let meta = durability | if done.untracked { UNTRACKED } else { 0 };
+    let meta = durability
+        | if done.untracked { UNTRACKED } else { 0 }
+        | if done.stored { row::STORED } else { 0 };
     // SAFETY: the flight holder, `RUNNING` set; the value was dropped above (rule 1).
     unsafe { put(table, row, new) };
     // A head whose last round read no row of its cycle (or a verify turned run that was met
@@ -1171,7 +1323,7 @@ fn finish<F: Function>(
     // publishes, so a task waiting on this flight finds them never made.
     drop_orphans(storage, done.members, done.node);
     store_edges(storage, header, at);
-    summarize(storage, done.node, at, done.untracked);
+    summarize(storage, done.node, at, done.untracked, made_before);
     header.changed.store(changed, Ordering::Relaxed);
     header.meta.store(meta, Ordering::Relaxed);
     storage.paint(done.node, color(view, changed));
@@ -1216,10 +1368,22 @@ fn participate<F: Function>(
     let header = row.header;
     let id = key.as_id();
     let head = local::with(|local| local.frames[done.head as usize].node);
+    // The planted bug (`tests/inner_heads.rs`): what the rows above this one told it of the
+    // round stops at its frame, as it did when each told only the frame of its own head.
+    #[cfg(test)]
+    if probe::INNER_HEADS_FORGET.with(Cell::get) {
+        local::with(|local| local.frames[at as usize].unconverged = false);
+    }
     let value = match (F::CYCLE, done.reentered) {
         (CycleKind::Result, _) => blaze_mem::frame::task(F::TAG, |_| F::cycle_result(db, id, key)),
         (CycleKind::Fixpoint, true) => {
-            let round = local::with(|local| local.frames[done.head as usize].round);
+            // The cycle's round as far as this row knows it: its head's, or its own where that
+            // is later (a head kept from an earlier round, read again under a head that is new
+            // this round). A kept head's frame starts at its keeper's round ([`run`]), so the
+            // outermost head's round reaches every row its cycle kept, however deep.
+            let round = local::with(|local| {
+                local.frames[at as usize].round.max(local.frames[done.head as usize].round)
+            });
             let heads = heads_of(storage, done.members, id);
             let cycle = Cycle { heads: &heads, id, iteration: round };
             // SAFETY: the row's provisional value, this task's own (rule 4).
@@ -1227,7 +1391,11 @@ fn participate<F: Function>(
             let value =
                 blaze_mem::frame::task(F::TAG, |_| F::cycle_recover(db, &cycle, last, new, key));
             if !F::equal(last, &value) {
-                local::with(|local| local.frames[done.head as usize].unconverged = true);
+                // A run above read `last` from this row on the stack, and the row ends the
+                // round with another value: the round is not the cycle's last. Said on this
+                // row's own frame; `hand_over` takes it to the head with the rest it carries,
+                // and each head that ends a member hands it on in turn, down to the outermost.
+                local::with(|local| local.frames[at as usize].unconverged = true);
             }
             value
         }
@@ -1334,7 +1502,8 @@ fn head_round<F: Function>(
         if reads.untracked != 0 {
             storage.frontier.untracked(done.node);
         }
-        storage.set_summary(done.node, reads.summary);
+        // A cycle's rows are of no seal group: what they read is no one group's to cover.
+        storage.set_summary(done.node, or(reads.summary, LOOSE));
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(meta, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
@@ -1443,7 +1612,8 @@ fn finalize(storage: &Storage, from: u32, head: u32, reads: Converged) -> u32 {
         if reads.untracked != 0 {
             storage.frontier.untracked(node);
         }
-        storage.set_summary(node, reads.summary);
+        // As its head: of no seal group.
+        storage.set_summary(node, or(reads.summary, LOOSE));
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(lowest | CYCLE | reads.untracked, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
@@ -1468,7 +1638,12 @@ struct Converged {
 /// Hands what the run at `at` read outside its cycle, now that it ended a member of the cycle
 /// headed at `head` (below it), on toward the head:
 ///
-/// - what it carries (durability, an untracked read, replayed summaries) to the head's frame;
+/// - what it carries (durability, an untracked read, replayed summaries) to the head's frame,
+///   and whether the round is unconverged: a row of the cycle, this one or one that handed to
+///   it, was read on the stack and ended the round with another value. This is the one place a
+///   frame's word reaches its head's, so a head that ends a member of a lower cycle hands on
+///   all it was told, and the outermost head, alone the one that decides ([`head_round`]),
+///   hears of every row of its cycle;
 /// - its reads in read order: an inner head's earlier rounds' first, then its own run's (which
 ///   hold what the runs below it handed it, at their places), then what it was handed while it
 ///   ran and could not place;
@@ -1491,6 +1666,8 @@ fn hand_over(storage: &Storage, local: &mut local::Local, at: u32, head: u32) {
     let durability = frame.durability.min(frame.cycle.durability);
     let untracked = frame.untracked | frame.cycle.untracked;
     let summary = or(frame.summary, frame.cycle.summary);
+    let unconverged = frame.unconverged;
+    local.frames[head as usize].unconverged |= unconverged;
     let cycle = &mut local.frames[head as usize].cycle;
     cycle.durability = cycle.durability.min(durability);
     cycle.untracked |= untracked;
@@ -1511,7 +1688,9 @@ fn hand_over(storage: &Storage, local: &mut local::Local, at: u32, head: u32) {
         below -= 1;
         let frame = &mut local.frames[below];
         match frame.kind {
-            FrameKind::Barrier { .. } => {
+            // A witness frame is passed through as a barrier is: a cycle member's hand-over reaches
+            // the run below it, and the witness ends not complete (its provisional read set its head).
+            FrameKind::Barrier { .. } | FrameKind::Witness { .. } => {
                 // Its pop must not cut the reads it is under.
                 frame.edges_start = top as u32;
             }
@@ -2002,6 +2181,11 @@ fn memory<F: Function>(storage: &Storage, index: u32) -> MemoryUsage {
         // A budgeted function's values say what they hold beside themselves ([`Function::weigh`]).
         value_bytes: weighed,
     }
+}
+
+/// [`Vtable::values`] of `F`: the values its table holds now, one load.
+fn values<F: Function>(storage: &Storage, index: u32) -> u64 {
+    storage.table::<FnTable<F>>(index).map_or(0, |table| table.values.load(Ordering::Relaxed) as u64)
 }
 
 /// [`Vtable::used`] of `F`: its rows that ran, each holding a node from its first run

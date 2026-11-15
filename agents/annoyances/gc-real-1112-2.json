@@ -1,0 +1,21 @@
+{
+ "id": "gc-real-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane gc-real-1112",
+ "where": "crates/blaze-gc/src/fs.rs scan(); ~/.cache/blaze on the Mac",
+ "what": "840 GB of a 1,337 GB home was in names no collector lists: coord/ (578 GB of lane worktrees and scratch homes), runner-blaze/ (70 GB, a nested home), v2.store-format-3.backup-20261111 (208 GB, v2 renamed aside by hand after the daemon refused a format-3 store), and the directories of the daemon before v2. The report said 'nothing of blaze's that was collected holds the rest' and named none of them.",
+ "cost": "a full disk; the report gave nobody a name to act on",
+ "cause": "a scan that lists three names (build, std, trash) and an account that counts only what it lists",
+ "whys": [
+  "840 GB was unaccounted",
+  "the scan lists only build/, std/ and .blaze-trash",
+  "nothing registers what may be under a home",
+  "agents and old daemons wrote there freely, and a refused store was renamed aside instead of removed",
+  "there was no guard that a home holds only registered names, and no lifetime for anything outside the three"
+ ],
+ "class": "bytes with no owner (unregistered writes under a managed root)",
+ "prevention": "roots::ROOTS registry, the home's pass counting every entry, holders named in the report, roots_fs::unregistered as the guard (crates/blaze-gc/src/roots.rs, roots_fs.rs)",
+ "workaround": "the owner moves coord/ and runner-blaze/ out and removes the backup",
+ "fix": "written in int-1112; the daemon does not run the pass yet",
+ "state": "open"
+}

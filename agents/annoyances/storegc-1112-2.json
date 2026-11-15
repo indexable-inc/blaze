@@ -1,0 +1,18 @@
+{
+ "id": "storegc-1112-2",
+ "where": "crates/blaze-cas/src/lib.rs `start_commit` (the index table built when the delta holds INDEX_AFTER records)",
+ "what": "A commit that writes a new index table builds it on the store's thread: every row of the old table and the delta is walked, encoded and checksummed there, and `try_flip` then walks the whole old delta. It grows with the store and is on a build's commit path. The collector's own commits skip it (`small_commit`), so it is no worse than before, but it is the largest pause left on the loop.",
+ "cost": "not measured: found reading the code for the collector's 1 ms bound",
+ "cause": "the index is built where the commit is begun",
+ "workaround": "none",
+ "fix": "build the table on a worker from a `Reader` (as the period scan now is), hand the bytes back for the write",
+ "whys": [
+  "the index build predates the pool of workers the store can hand batches to",
+  "nothing measures a commit's time on the loop by rows"
+ ],
+ "class": "loop-work-grows-with-store",
+ "prevention": "a span on the index build with its rows, and the profile test's bound on any loop span",
+ "state": "open",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane storegc-1112"
+}

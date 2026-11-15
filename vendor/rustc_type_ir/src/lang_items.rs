@@ -13,6 +13,9 @@ pub enum SolverProjectionLangItem {
     FieldType,
     FutureOutput,
     Metadata,
+    /// blaze: `<Described<'a, D, Args> as core::reflect::TypeOf>::Type`, the type the
+    /// description `D` describes (`type_of!`).
+    ReflectTypeOfType,
     /// blaze: `<V as core::reflect::Variant<E>>::View`, the variant view `VariantOf<E, v>`.
     ReflectVariantView,
     // tidy-alphabetical-end
@@ -82,6 +85,8 @@ pub enum SolverTraitLangItem {
     /// blaze: `core::reflect::Struct`: a struct whose fields reflection may read, a tuple, or
     /// a variant view.
     ReflectStruct,
+    /// blaze: `core::reflect::TypeOf`: a `Described` whose description names a type.
+    ReflectTypeOf,
     /// blaze: `V: core::reflect::Variant<E>`: `V` is the variant representing type of a variant
     /// of the enum `E`.
     ReflectVariant,

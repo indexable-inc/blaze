@@ -9,7 +9,7 @@ site {
       (InTheme, themes.basics)
       (Requires, site.learn.builds)
       Title: {"Proc macros"}
-      Description: {"Lesson 3: what proc macros are, and why blaze runs them as sandboxed WebAssembly."}
+      Description: {"What proc macros are, and why blaze runs them as sandboxed WebAssembly."}
 
       Step what("Code that writes code") {
         P program("A **proc macro** is a small Rust program that runs while your code compiles.")

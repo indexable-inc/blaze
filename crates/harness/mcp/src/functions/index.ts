@@ -23,6 +23,7 @@ import { vfs, docs as vfsDocs } from "../vfs.ts";
 import { sh, procs, out, err, lines, kill, ptree, runs, stage, runInfo, docs as procDocs } from "../proc.ts";
 import { skill, skills, docs as skillDocs } from "../skills.ts";
 import { world, docs as worldDocs } from "../world.ts";
+import { updateEmotion, docs as emotionDocs } from "../emotion.ts";
 import { phone, docs as phoneDocs } from "../phone.ts";
 import { call, docs as callDocs } from "../call.ts";
 import { uiDocs, type UiGlobals } from "../ui/index.ts";
@@ -32,7 +33,7 @@ import type { Docs } from "../docs.ts";
 export const docs: Docs = {
   ...cellDocs, ...taskDocs, ...progressDocs, ...pmapDocs, ...skillDocs, ...searchDocs, ...gitLogDocs, ...imageDocs, ...vfsDocs, ...dollarDocs, ...procDocs,
   ...followDocs, ...tableDocs, ...nuonDocs, ...sqlDocs, ...googleDocs, ...browserDocs, ...cdpDocs, ...githubDocs, ...gmailDocs, ...objDocs, ...agentsDocs,
-  ...uiDocs, ...worldDocs, ...phoneDocs, ...callDocs,
+  ...uiDocs, ...worldDocs, ...emotionDocs, ...phoneDocs, ...callDocs,
 };
 
 export const help = makeHelp(docs);
@@ -40,7 +41,7 @@ export const help = makeHelp(docs);
 export const functions = {
   help, more, rerun, cancel, signal, progress, skill, skills, rg, ls, glob, du, cargo, follow, $, pmap, image, vfs, spawn, obj, objects, tree, sql, googleSearch, gmail, github,
   browser, location, places, withHiddenPage, table, Table, LazyTable, col, lit, gitLog, nuon, tasks, task, taskValue, wait, sh, procs, out, err, lines, kill, ptree, runs,
-  stage, runInfo, agents, world, phone, call,
+  stage, runInfo, agents, world, updateEmotion, phone, call,
 };
 
 /** Every global a cell's TypeScript is checked against (typecheck.ts), by name. */

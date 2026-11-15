@@ -1,5 +1,4 @@
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -81,10 +80,9 @@ enum Value<'a> {
     Text(&'a str),
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(6)) {
-        0 => Op::Take(tc.draw(gs::integers().max_value(11))),
+fn op(tape: &Tape) -> Op {
+    match tape.int_in(0..=6u8, "op") {
+        0 => Op::Take(tape.int_in(0..=11, "len")),
         1 => Op::U8,
         2 => Op::U16,
         3 => Op::U32,
@@ -146,99 +144,100 @@ fn by_reader<'a>(reader: &mut Reader<'a>, op: Op) -> Result<Value<'a>, Error> {
     })
 }
 
-#[hegel::test]
-fn reads_what_the_copies_read(tc: TestCase) {
-    let bytes: Vec<u8> = tc.draw(gs::binary().max_size(63));
-    let ops = tc.draw(gs::vecs(op()).max_size(23));
-    let mut at = 0;
-    let mut reader = Reader::new(&bytes);
-    for op in ops {
-        let before = reader.at();
-        let ours = by_reader(&mut reader, op);
-        let theirs = by_reference(&bytes, &mut at, op);
-        match (ours, theirs) {
-            (Ok(ours), Some(theirs)) => {
-                assert_eq!(ours, theirs);
-                assert_eq!(reader.at(), at);
+#[test]
+fn reads_what_the_copies_read() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let bytes: Vec<u8> = tape.bytes(0..=63, "bytes");
+        let ops = tape.vec(0..=23, "ops", op);
+        let mut at = 0;
+        let mut reader = Reader::new(&bytes);
+        for op in ops {
+            let before = reader.at();
+            let ours = by_reader(&mut reader, op);
+            let theirs = by_reference(&bytes, &mut at, op);
+            match (ours, theirs) {
+                (Ok(ours), Some(theirs)) => {
+                    assert_eq!(ours, theirs);
+                    assert_eq!(reader.at(), at);
+                }
+                (Err(error), None) => {
+                    assert_eq!(reader.at(), before, "a failed read moves nothing");
+                    assert!(error.at >= before && error.at <= bytes.len());
+                    break;
+                }
+                (ours, theirs) => panic!("{:?}: ours {:?}, theirs {:?}", op, ours, theirs),
             }
-            (Err(error), None) => {
-                assert_eq!(reader.at(), before, "a failed read moves nothing");
-                assert!(error.at >= before && error.at <= bytes.len());
-                break;
-            }
-            (ours, theirs) => panic!("{:?}: ours {:?}, theirs {:?}", op, ours, theirs),
         }
-    }
+    });
 }
 
-#[hegel::test]
-fn reads_back_what_put_wrote(tc: TestCase) {
-    let (a, b, c, d, e): (u8, u16, u32, u64, u128) = tc.draw(gs::tuples!(
-        gs::integers(),
-        gs::integers(),
-        gs::integers(),
-        gs::integers(),
-        gs::integers(),
-    ));
-    let (f, g, h, i): (i8, i16, i32, i64) =
-        tc.draw(gs::tuples!(gs::integers(), gs::integers(), gs::integers(), gs::integers()));
-    let (uleb, sleb): (u64, i64) = tc.draw(gs::tuples!(gs::integers(), gs::integers()));
-    let raw: Vec<u8> = tc.draw(gs::binary().max_size(19));
-    let text = tc.draw(gs::text().alphabet("abcdefghijklmnopqrstuvwxyzé").max_size(12));
-    let cstr = tc.draw(gs::vecs(gs::integers::<u8>().min_value(1)).max_size(11));
-    let mut out = Vec::new();
-    out.put_u8(a);
-    out.put_u16(b);
-    out.put_u32(c);
-    out.put_u64(d);
-    out.put_u128(e);
-    out.put_i8(f);
-    out.put_i16(g);
-    out.put_i32(h);
-    out.put_i64(i);
-    out.put_uleb(uleb);
-    out.put_sleb(sleb);
-    out.put_bytes_u32(&raw);
-    out.put_bytes_u64(&raw);
-    out.put_bytes_uleb(&raw);
-    out.put_bytes_u32(text.as_bytes());
-    out.put_bytes_u64(text.as_bytes());
-    out.put_bytes_uleb(text.as_bytes());
-    out.put_cstr(&cstr);
-    out.put_bytes(&raw);
+#[test]
+fn reads_back_what_put_wrote() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (a, b, c, d, e): (u8, u16, u32, u64, u128) =
+            (tape.int("a"), tape.int("b"), tape.int("c"), tape.int("d"), tape.u128("e"));
+        let (f, g, h, i): (i8, i16, i32, i64) =
+            (tape.int("f"), tape.int("g"), tape.int("h"), tape.int("i"));
+        let (uleb, sleb): (u64, i64) = (tape.int("uleb"), tape.int("sleb"));
+        let raw: Vec<u8> = tape.bytes(0..=19, "raw");
+        let text = tape.text_from("abcdefghijklmnopqrstuvwxyzé", 0..=12, "text");
+        let cstr: Vec<u8> = tape.vec(0..=11, "cstr", |tape| tape.int_in(1..=u8::MAX, "byte"));
+        let mut out = Vec::new();
+        out.put_u8(a);
+        out.put_u16(b);
+        out.put_u32(c);
+        out.put_u64(d);
+        out.put_u128(e);
+        out.put_i8(f);
+        out.put_i16(g);
+        out.put_i32(h);
+        out.put_i64(i);
+        out.put_uleb(uleb);
+        out.put_sleb(sleb);
+        out.put_bytes_u32(&raw);
+        out.put_bytes_u64(&raw);
+        out.put_bytes_uleb(&raw);
+        out.put_bytes_u32(text.as_bytes());
+        out.put_bytes_u64(text.as_bytes());
+        out.put_bytes_uleb(text.as_bytes());
+        out.put_cstr(&cstr);
+        out.put_bytes(&raw);
 
-    let mut read = Reader::new(&out);
-    assert_eq!(read.u8().unwrap(), a);
-    assert_eq!(read.u16().unwrap(), b);
-    assert_eq!(read.u32().unwrap(), c);
-    assert_eq!(read.u64().unwrap(), d);
-    assert_eq!(read.u128().unwrap(), e);
-    assert_eq!(read.i8().unwrap(), f);
-    assert_eq!(read.i16().unwrap(), g);
-    assert_eq!(read.i32().unwrap(), h);
-    assert_eq!(read.i64().unwrap(), i);
-    assert_eq!(read.uleb().unwrap(), uleb);
-    assert_eq!(read.sleb().unwrap(), sleb);
-    assert_eq!(read.bytes_u32().unwrap(), &raw[..]);
-    assert_eq!(read.bytes_u64().unwrap(), &raw[..]);
-    assert_eq!(read.bytes_uleb().unwrap(), &raw[..]);
-    assert_eq!(read.str_u32().unwrap(), &text[..]);
-    assert_eq!(read.str_u64().unwrap(), &text[..]);
-    assert_eq!(read.str_uleb().unwrap(), &text[..]);
-    assert_eq!(read.cstr().unwrap(), &cstr[..]);
-    assert_eq!(read.take(raw.len()).unwrap(), &raw[..]);
-    assert!(read.is_done());
-    assert_eq!(read.finish(), Ok(()));
+        let mut read = Reader::new(&out);
+        assert_eq!(read.u8().unwrap(), a);
+        assert_eq!(read.u16().unwrap(), b);
+        assert_eq!(read.u32().unwrap(), c);
+        assert_eq!(read.u64().unwrap(), d);
+        assert_eq!(read.u128().unwrap(), e);
+        assert_eq!(read.i8().unwrap(), f);
+        assert_eq!(read.i16().unwrap(), g);
+        assert_eq!(read.i32().unwrap(), h);
+        assert_eq!(read.i64().unwrap(), i);
+        assert_eq!(read.uleb().unwrap(), uleb);
+        assert_eq!(read.sleb().unwrap(), sleb);
+        assert_eq!(read.bytes_u32().unwrap(), &raw[..]);
+        assert_eq!(read.bytes_u64().unwrap(), &raw[..]);
+        assert_eq!(read.bytes_uleb().unwrap(), &raw[..]);
+        assert_eq!(read.str_u32().unwrap(), &text[..]);
+        assert_eq!(read.str_u64().unwrap(), &text[..]);
+        assert_eq!(read.str_uleb().unwrap(), &text[..]);
+        assert_eq!(read.cstr().unwrap(), &cstr[..]);
+        assert_eq!(read.take(raw.len()).unwrap(), &raw[..]);
+        assert!(read.is_done());
+        assert_eq!(read.finish(), Ok(()));
+    });
 }
 
-#[hegel::test]
-fn lebs_read_as_leb_reads_them(tc: TestCase) {
-    let bytes: Vec<u8> = tc.draw(gs::binary().max_size(15));
-    same_leb(&bytes, leb::read_u64, |read: &mut Reader<'_>| read.uleb());
-    same_leb(&bytes, leb::read_i64, |read: &mut Reader<'_>| read.sleb());
-    same_leb(&bytes, leb::read_u32, |read: &mut Reader<'_>| read.uleb32());
-    same_leb(&bytes, leb::read_i32, |read: &mut Reader<'_>| read.sleb32());
-    same_leb(&bytes, leb::skip, |read: &mut Reader<'_>| read.skip_leb());
+#[test]
+fn lebs_read_as_leb_reads_them() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let bytes: Vec<u8> = tape.bytes(0..=15, "bytes");
+        same_leb(&bytes, leb::read_u64, |read: &mut Reader<'_>| read.uleb());
+        same_leb(&bytes, leb::read_i64, |read: &mut Reader<'_>| read.sleb());
+        same_leb(&bytes, leb::read_u32, |read: &mut Reader<'_>| read.uleb32());
+        same_leb(&bytes, leb::read_i32, |read: &mut Reader<'_>| read.sleb32());
+        same_leb(&bytes, leb::skip, |read: &mut Reader<'_>| read.skip_leb());
+    });
 }
 
 #[test]

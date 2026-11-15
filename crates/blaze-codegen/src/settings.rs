@@ -199,8 +199,9 @@ pub struct Spec {
     /// Whether rustc's MIR inliner runs on the bodies of the crates compiled at these
     /// settings (`Inline::is_enabled`): `-Copt-level` 2 or 3, not `s`/`z`, which share
     /// `Llvm { opt: 2 }`, and not in a build that patches, as rustc runs it only outside
-    /// incremental builds ([`crate::plan::Policy::choose`]). The library's MIR is inlined
-    /// whatever this says, as rustc ships it.
+    /// incremental builds ([`crate::plan::Policy::choose`]). The library's MIR is inlined, as
+    /// rustc ships it, only where this says so too: a tier 0 unit inlines nothing at the MIR
+    /// level (`hir-ty-codegen` `Build::options`).
     pub mir_inline: bool,
     /// The sanitizers and coverage the LLVM back end instruments with: a sanitized build's
     /// code is never a plain one's.
@@ -225,6 +226,13 @@ pub struct Spec {
     /// Left out of the serialized form when off, so every spec without it reads as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fuel: bool,
+    /// The function is tier 0 code for blaze's launcher (docs/v2/plan/design/launcher.md,
+    /// "Step 3"): a call of a named function goes through the callee's slot word and a
+    /// function's address is its entry thunk (`blaze_stencil::Target::slots`), so the code
+    /// is placed by the launcher and never linked. It changes the code's bytes, so it is in
+    /// the key. Left out of the serialized form when off, as `fuel` is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub slots: bool,
 }
 
 impl Spec {
@@ -245,6 +253,7 @@ impl Spec {
             heap_to_stack,
             report,
             fuel,
+            slots,
         } = self;
         let Toolchain {
             id,
@@ -307,6 +316,10 @@ impl Spec {
         if *fuel {
             hasher.update(b"fuel");
         }
+        // As the report's: every function built to be linked keeps its key.
+        if *slots {
+            hasher.update(b"slots");
+        }
         Settings(hasher.finish())
     }
 
@@ -350,6 +363,7 @@ mod tests {
             report: false,
             heap_to_stack: false,
             fuel: false,
+            slots: false,
         }
     }
 
@@ -389,6 +403,7 @@ mod tests {
             |it| it.proc_macro_bridge = true,
             |it| it.heap_to_stack = true,
             |it| it.fuel = true,
+            |it| it.slots = true,
         ];
         let mut seen = std::collections::BTreeSet::from([base.settings()]);
         for change in changes {

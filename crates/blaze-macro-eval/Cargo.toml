@@ -25,9 +25,13 @@ blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
+# The kept tables of a macro thread (`wasm/thread.rs`).
+blaze-mem.workspace = true
 blaze-wasi.workspace = true
 blaze-profile.workspace = true
 blaze-usercode.workspace = true
+# `outside::Looks`: an expansion's disk looks go to its build's list.
+blaze-vfs.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true

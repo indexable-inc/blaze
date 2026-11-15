@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+tracing.workspace = true
 blaze-core.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
@@ -40,7 +41,7 @@ syntax.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 triomphe.workspace = true
 

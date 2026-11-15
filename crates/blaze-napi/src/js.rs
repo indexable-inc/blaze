@@ -192,6 +192,10 @@ struct Js {
 
 type Shared = RefCell<Js>;
 
+#[expect(
+    blaze::process_static,
+    reason = "the JS thread's live client handles, each removed by its handle's finalizer: bounded by the handles JS holds"
+)]
 thread_local! {
     /// The clients of this JS thread that JS holds a handle of: for each, the pointer its
     /// handle's external carries, which is its `Rc<Shared>`'s. One is added as its handle is

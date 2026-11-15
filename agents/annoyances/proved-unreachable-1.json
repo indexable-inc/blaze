@@ -1,0 +1,21 @@
+{
+ "id": "proved-unreachable-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane proved-unreachable",
+ "where": "hir-def nameres/facts/collect.rs, a `macro` (2.0) item with `#[rustc_builtin_macro(name)]`",
+ "what": "`#[rustc_builtin_macro(blaze_unreachable)] pub macro unreachable() {}` in core::blaze was taken for the builtin `unreachable` (the macro`s own name): the explicit name in the attribute was read for `macro_rules!` only. The lint that looks for the builtin found 0 sites and its accepting test passed with nothing checked.",
+ "cost": "15 minutes; found only because the refusing test expected 5 findings and got 0",
+ "cause": "two copies of `which builtin is this macro` (one per macro kind), and only one read the attribute`s argument",
+ "whys": [
+  "the lint found no site",
+  "the call resolved to the builtin `unreachable`, not `blaze_unreachable`",
+  "Macro2 collection looked the builtin up by the item`s name only",
+  "the rule lives twice, once per macro kind, and the copies drifted",
+  "a test that expects no findings passes when the check runs on nothing"
+ ],
+ "class": "a rule written once per item kind drifts; and an accept-only test cannot tell `proved` from `not looked at`",
+ "prevention": "fixed for this case: Macro2 reads the explicit name too (this lane). Not built: one function both kinds call. Each accepting test in reach_tests.rs has a refusing twin over the same macro, so a check that finds no site fails a test.",
+ "workaround": "none needed after the fix",
+ "fix": "merge the two `Case 1: builtin macros` blocks of collect.rs into one function",
+ "state": "open"
+}

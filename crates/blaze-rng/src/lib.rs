@@ -120,12 +120,56 @@ impl SplitMix64 {
             items.swap(at, self.index(at + 1));
         }
     }
+
+    /// Which arm [`choose!`] takes: the position in `open` of one of its `true`s, each as
+    /// likely; `None` when there is none.
+    pub fn arm(&mut self, open: &[bool]) -> Option<usize> {
+        let at = self.index(open.iter().filter(|it| **it).count());
+        open.iter().enumerate().filter(|(_, it)| **it).nth(at).map(|(arm, _)| arm)
+    }
+}
+
+/// One of the arms, evaluated, drawn from `rng` (a [`SplitMix64`]): each arm whose condition
+/// holds is as likely as the others. `if cond => arm` gives an arm a condition; an arm without
+/// one always can be taken. An arm that is an `if` expression goes in braces.
+///
+/// The list is all the bookkeeping: no count beside it and no number on an arm, so two
+/// changes that each add an arm merge without renumbering. It panics, naming itself, when no
+/// condition holds.
+#[macro_export]
+macro_rules! choose {
+    // Each arm in turn moves to the lists of conditions and arms; one rule per form, since a
+    // matcher that took an optional `if` before an expression could not tell the two apart.
+    (@arms $rng:expr; [$($open:expr),+]; [$($arm:expr),+];) => {
+        'chosen: {
+            let open = [$($open),+];
+            let Some(chosen) = $rng.arm(&open) else {
+                panic!("choose! with no arm whose condition holds");
+            };
+            let mut arms = 0..;
+            $(
+                if arms.next() == Some(chosen) {
+                    break 'chosen $arm;
+                }
+            )+
+            unreachable!("SplitMix64::arm gives a position in the arms")
+        }
+    };
+    (@arms $rng:expr; [$($open:expr),*]; [$($arm:expr),*];
+        if $can:expr => $next:expr $(, $($rest:tt)*)?) => {
+        $crate::choose!(@arms $rng; [$($open,)* $can]; [$($arm,)* $next]; $($($rest)*)?)
+    };
+    (@arms $rng:expr; [$($open:expr),*]; [$($arm:expr),*]; $next:expr $(, $($rest:tt)*)?) => {
+        $crate::choose!(@arms $rng; [$($open,)* true]; [$($arm,)* $next]; $($($rest)*)?)
+    };
+    ($rng:expr; $($arms:tt)+) => {
+        $crate::choose!(@arms $rng; []; []; $($arms)+)
+    };
 }
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::*;
 
@@ -200,6 +244,22 @@ mod tests {
         assert_eq!(rng.pick(&[9]), Some(&9));
     }
 
+    /// Each open arm about as often as the others, a closed one never, and nothing to take is
+    /// a panic.
+    #[test]
+    fn choose_takes_open_arms_evenly() {
+        let mut rng = SplitMix64::new(11);
+        let mut taken = [0u32; 4];
+        for _ in 0..12_000 {
+            let arm: usize = choose!(rng; 0, if false => 1, 2, 3);
+            taken[arm] += 1;
+        }
+        assert_eq!(taken[1], 0, "{taken:?}");
+        assert!(taken.iter().all(|&n| n == 0 || (3600..4400).contains(&n)), "{taken:?}");
+        let none = std::panic::catch_unwind(|| choose!(SplitMix64::new(0); if false => 0u8));
+        assert!(none.is_err());
+    }
+
     #[test]
     fn shuffle_permutes() {
         let mut items: Vec<u32> = (0..100).collect();
@@ -222,52 +282,56 @@ mod tests {
         });
     }
 
-    #[hegel::test]
-    fn matches_the_reference(tc: TestCase) {
-        let seed: u64 = tc.draw(gs::integers());
-        let n: u64 = tc.draw(gs::integers().min_value(1).max_value(u64::MAX - 1));
-        let len: usize = tc.draw(gs::integers().max_value(39));
-        let mut state = seed;
-        let mut rng = SplitMix64::new(seed);
-        for _ in 0..16 {
-            assert_eq!(rng.next_u64(), reference(&mut state));
-        }
-        assert_eq!(rng.below(n), reference(&mut state) % n);
-        assert_eq!(rng.next_u32(), (reference(&mut state) >> 32) as u32);
-        assert_eq!(rng.state(), state);
-        assert_eq!(mix(seed), reference(&mut seed.wrapping_sub(GAMMA)));
+    #[test]
+    fn matches_the_reference() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let seed: u64 = tape.int("seed");
+            let n: u64 = tape.int_in(1..=u64::MAX - 1, "n");
+            let len: usize = tape.int_in(0..=39, "len");
+            let mut state = seed;
+            let mut rng = SplitMix64::new(seed);
+            for _ in 0..16 {
+                assert_eq!(rng.next_u64(), reference(&mut state));
+            }
+            assert_eq!(rng.below(n), reference(&mut state) % n);
+            assert_eq!(rng.next_u32(), (reference(&mut state) >> 32) as u32);
+            assert_eq!(rng.state(), state);
+            assert_eq!(mix(seed), reference(&mut seed.wrapping_sub(GAMMA)));
 
-        let mut bytes = vec![0u8; len];
-        rng.fill(&mut bytes);
-        let mut expected = Vec::new();
-        while expected.len() < len {
-            expected.extend_from_slice(&reference(&mut state).to_le_bytes());
-        }
-        expected.truncate(len);
-        assert_eq!(bytes, expected);
+            let mut bytes = vec![0u8; len];
+            rng.fill(&mut bytes);
+            let mut expected = Vec::new();
+            while expected.len() < len {
+                expected.extend_from_slice(&reference(&mut state).to_le_bytes());
+            }
+            expected.truncate(len);
+            assert_eq!(bytes, expected);
+        });
     }
 
     /// The simulator's and the model checker's draws, as they call them (`below` of a
     /// nonzero bound, `one_in` of a `u32`, `shuffle`), are the old copy's.
-    #[hegel::test]
-    fn matches_the_kept_copy(tc: TestCase) {
-        let seed: u64 = tc.draw(gs::integers());
-        let bounds: Vec<u64> =
-            tc.draw(gs::vecs(gs::integers().min_value(1).max_value((1 << 40) - 1)).max_size(31));
-        let ones: Vec<u32> = tc.draw(gs::vecs(gs::integers().max_value(7)).max_size(31));
-        let len: usize = tc.draw(gs::integers().max_value(63));
-        let (mut new, mut old) = (SplitMix64::new(seed), Kept(seed));
-        for n in bounds {
-            assert_eq!(new.below(n), old.below(n));
-        }
-        for n in ones {
-            assert_eq!(new.one_in(u64::from(n)), old.one_in(n));
-        }
-        let mut a: Vec<usize> = (0..len).collect();
-        let mut b = a.clone();
-        new.shuffle(&mut a);
-        old.shuffle(&mut b);
-        assert_eq!(a, b);
-        assert_eq!(new.next_u64(), old.next_u64());
+    #[test]
+    fn matches_the_kept_copy() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let seed: u64 = tape.int("seed");
+            let bounds: Vec<u64> =
+                tape.vec(0..=31, "bounds", |tape| tape.int_in(1..=(1 << 40) - 1, "bound"));
+            let ones: Vec<u32> = tape.vec(0..=31, "ones", |tape| tape.int_in(0..=7, "one in"));
+            let len: usize = tape.int_in(0..=63, "len");
+            let (mut new, mut old) = (SplitMix64::new(seed), Kept(seed));
+            for n in bounds {
+                assert_eq!(new.below(n), old.below(n));
+            }
+            for n in ones {
+                assert_eq!(new.one_in(u64::from(n)), old.one_in(n));
+            }
+            let mut a: Vec<usize> = (0..len).collect();
+            let mut b = a.clone();
+            new.shuffle(&mut a);
+            old.shuffle(&mut b);
+            assert_eq!(a, b);
+            assert_eq!(new.next_u64(), old.next_u64());
+        });
     }
 }

@@ -1,0 +1,14 @@
+{
+ "id": "primitive-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane primitive-1112",
+ "where": "crates/hir-ty/src/next_solver/goal_store/slots.rs, body_store/record.rs, blaze-usercode/src/index.rs, blaze-cargo/src/serve/unit/compile/parts.rs, hir-def/src/deps.rs (`slot`, `SLOTS`)",
+ "what": "The form base key -> read-lists -> answer was written at least five times (the design doc counted four; `hir_def::deps::slot` is a fifth, and the domains `serve request certificate slot`, `kernel shape slot`, `crate surface slot` and `test history slot` look like more). Two bounds (4 and 4096), three answer-key rules (by slot, by names and values, by parts), three list encodings, and the four-slot ones never store a fifth list of a base.",
+ "cost": "each new user copied the nearest one and its defect; one lane to make the one type",
+ "cause": "no shared crate below hir-def and blaze-usercode held the form, so each crate that needed it wrote it beside its store adapter",
+ "class": "one concept, many homes (rule 30)",
+ "prevention": "crates/blaze-record is the one home; after the ports, ban a `slot(key, n)` key derivation outside it (a domains.rs check: a domain ending in `slot` or `shape` outside blaze-record fails)",
+ "workaround": "none",
+ "fix": "blaze-record written (uncompiled at the time of this row); ports of goal_store and body_store next",
+ "state": "open"
+}

@@ -176,8 +176,15 @@ pub fn panic_of<'a>(error: &'a ConstEvalError<'_>) -> Option<&'a str> {
 pub fn bound_refusal<'db>(interner: DbInterner<'db>, trait_ref: TraitRef<'db>) -> Option<Failure> {
     let db = interner.db;
     let trait_ = trait_ref.def_id.0;
-    let impls = TraitImpls::for_crate(db, hir_def::HasModule::krate(&trait_, db));
-    impls.blanket_impls(trait_).iter().find_map(|&impl_| impl_refusal(interner, impl_, trait_ref))
+    // The trait's blanket impls alone: of a crate read from impl table pages, one entry.
+    let krate = hir_def::HasModule::krate(&trait_, db);
+    let mut found = None;
+    TraitImpls::each_blanket_in_crate(db, krate, trait_, |impl_| {
+        if found.is_none() {
+            found = impl_refusal(interner, impl_, trait_ref);
+        }
+    });
+    found
 }
 
 fn impl_refusal<'db>(

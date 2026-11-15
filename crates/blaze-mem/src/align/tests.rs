@@ -1,5 +1,4 @@
-use hegel::generators as gs;
-use hegel::{Generator, PrintableGenerator, TestCase};
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -36,39 +35,47 @@ const _: () = {
     assert!(matches!(checked_align_up_u64(u64::MAX, 1), Some(u64::MAX)));
 };
 
-fn power_of_two(bits: u32) -> impl PrintableGenerator<u64> {
-    gs::integers::<u32>().max_value(bits - 1).map(|shift| 1u64 << shift)
+fn power_of_two(tape: &Tape, bits: u32) -> u64 {
+    1u64 << tape.int_in(0..=bits - 1, "align shift")
 }
 
-#[hegel::test]
-fn up_matches_the_copies_and_std(tc: TestCase) {
-    let value: u64 = tc.draw(gs::integers());
-    let align = tc.draw(power_of_two(64));
-    let checked = checked_align_up_u64(value, align);
-    assert_eq!(checked, value.checked_next_multiple_of(align));
-    assert_eq!(checked.map(|it| it as usize), reference::round_up(value as usize, align as usize));
-    if let Some(up) = checked {
-        assert_eq!(align_up_u64(value, align), up);
-        assert_eq!(reference::up(value, align), up);
-        assert_eq!(align_up(value as usize, align as usize), up as usize);
-    }
+#[test]
+fn up_matches_the_copies_and_std() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let value: u64 = tape.int("value");
+        let align = power_of_two(tape, 64);
+        let checked = checked_align_up_u64(value, align);
+        assert_eq!(checked, value.checked_next_multiple_of(align));
+        assert_eq!(checked.map(|it| it as usize), reference::round_up(value as usize, align as usize));
+        if let Some(up) = checked {
+            assert_eq!(align_up_u64(value, align), up);
+            assert_eq!(reference::up(value, align), up);
+            assert_eq!(align_up(value as usize, align as usize), up as usize);
+        }
+    })
 }
 
-#[hegel::test]
-fn up_u32_matches_std(tc: TestCase) {
-    let value: u32 = tc.draw(gs::integers());
-    let align = tc.draw(power_of_two(32));
-    let align = align as u32;
-    assert_eq!(checked_align_up_u32(value, align), value.checked_next_multiple_of(align));
-    if let Some(up) = value.checked_next_multiple_of(align) {
-        assert_eq!(align_up_u32(value, align), up);
-    }
+#[test]
+fn up_u32_matches_std() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let value: u32 = tape.int("value");
+        let align = power_of_two(tape, 32);
+        let align = align as u32;
+        assert_eq!(checked_align_up_u32(value, align), value.checked_next_multiple_of(align));
+        if let Some(up) = value.checked_next_multiple_of(align) {
+            assert_eq!(align_up_u32(value, align), up);
+        }
+    })
 }
 
-#[hegel::test]
-fn down_and_is_aligned_match_division(tc: TestCase) {
-    let value: u64 = tc.draw(gs::integers());
-    let align = tc.draw(power_of_two(64));
+#[test]
+fn down_and_is_aligned_match_division() {
+    blaze_sim::check(Config::DEFAULT, |tape| down_and_is_aligned(tape))
+}
+
+fn down_and_is_aligned(tape: &Tape) {
+    let value: u64 = tape.int("value");
+    let align = power_of_two(tape, 64);
     let down = align_down_u64(value, align);
     assert_eq!(down, reference::down(value, align));
     assert!(down <= value && value - down < align);
@@ -86,10 +93,14 @@ fn down_and_is_aligned_match_division(tc: TestCase) {
     }
 }
 
-#[hegel::test]
-fn padding_reaches_the_next_multiple(tc: TestCase) {
-    let value: u64 = tc.draw(gs::integers());
-    let align = tc.draw(power_of_two(64));
+#[test]
+fn padding_reaches_the_next_multiple() {
+    blaze_sim::check(Config::DEFAULT, |tape| padding_reaches(tape))
+}
+
+fn padding_reaches(tape: &Tape) {
+    let value: u64 = tape.int("value");
+    let align = power_of_two(tape, 64);
     let padding = padding_for_u64(value, align);
     assert_eq!(padding, reference::padding(value, align));
     assert!(padding < align);
@@ -107,11 +118,15 @@ fn padding_reaches_the_next_multiple(tc: TestCase) {
 }
 
 /// Against `blaze-live`'s `pages`, which `align_range_u64` replaced.
-#[hegel::test]
-fn range_covers_the_blocks_touched(tc: TestCase) {
-    let start: u64 = tc.draw(gs::integers().max_value((u64::MAX >> 1) - 1));
-    let len: u64 = tc.draw(gs::integers().max_value((1 << 20) - 1));
-    let align = tc.draw(power_of_two(32));
+#[test]
+fn range_covers_the_blocks_touched() {
+    blaze_sim::check(Config::DEFAULT, |tape| range_covers(tape))
+}
+
+fn range_covers(tape: &Tape) {
+    let start: u64 = tape.int_in(0..=(u64::MAX >> 1) - 1, "start");
+    let len: u64 = tape.int_in(0..=(1 << 20) - 1, "len");
+    let align = power_of_two(tape, 32);
     let range = start..start + len;
     let covered = align_range_u64(range.clone(), align);
     assert_eq!(covered, range.start & !(align - 1)..range.end.next_multiple_of(align));

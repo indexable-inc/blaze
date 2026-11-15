@@ -1,4 +1,4 @@
-//! The comments that keep a cost on a line: `// clone: <why>`, `// alloc: <why>`,
+//! The comments that keep a cost on a line: `// clone: <why>`,
 //! `// dyn: <why>`, `// seqcst: <why>`, `// durable: <why>`, `// wakes: <who>` and
 //! `// identity: <why>`, on a line of the finding or on the line above it, with a reason that isn't
 //! empty. Read from the text of the tree walked, nothing allocated.
@@ -12,7 +12,6 @@ use super::Lint;
 const fn tag(lint: Lint) -> Option<&'static str> {
     match lint {
         Lint::HotClone => Some("clone"),
-        Lint::HotAlloc | Lint::HotAllocCall | Lint::ImplicitAllocator => Some("alloc"),
         Lint::HotDyn => Some("dyn"),
         Lint::SeqcstUnexplained => Some("seqcst"),
         Lint::DurableWrite => Some("durable"),
@@ -20,7 +19,15 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         Lint::CombinedIdentity => Some("identity"),
         // `relaxed_publish` reads it on either side and on the atomic's declaration itself.
         Lint::RelaxedPublish => Some("relaxed"),
-        Lint::Parallelizable
+        // No comment stands in for an allocator (rule bump-allocate): the global heap is named
+        // where it is used (`Vec::new_in(Global)`), or the item says why with `#[expect(..)]`,
+        // which the ratchet counts. `// alloc: <why>` keeps nothing; the lines that still carry
+        // it are what `scripts/src/bin/allocs.rs` counts down to zero.
+        Lint::HotAlloc
+        | Lint::HotAllocCall
+        | Lint::ImplicitAllocator
+        | Lint::UnwrittenAllocator
+        | Lint::Parallelizable
         | Lint::SerialDependence
         | Lint::FiberBoundary
         | Lint::ErrorDebug
@@ -32,6 +39,12 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // Kept with `#[expect(..)]`: where a function reads a thread-local is its own choice.
         | Lint::ThreadLocalInWaitingFn
         | Lint::LockAcrossQuery
+        // Kept with `#[expect(..)]` on the function: what a turn, an answer or a lock order may
+        // reach is the function's choice, not one line's.
+        | Lint::LoopTurnEffects
+        | Lint::SyncOnAnswerPath
+        | Lint::LockOrder
+        | Lint::LockAcrossWait
         | Lint::LockHeldAcrossSlow
         | Lint::BlockingOnPool
         | Lint::UnnamedWait
@@ -50,7 +63,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::ManyBools
         | Lint::DefaultPolicy
         // Kept with `#[expect(..)]`: a core and a key are choices of the item, not of one line
-        // (`key_ignores_field`'s `// not in key: <why>` names one field, through [`commented`]).
+        // (`key_ignores_field`'s `// left out: <why>` names one field, through [`commented`]).
         | Lint::SansIoCore
         | Lint::KeyIgnoresField
         // Kept with `#[expect(blaze::wildcard_arm, reason = ..)]` on the arm, the `match` or
@@ -111,19 +124,22 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::PodSerializedByField
         | Lint::Checkfree
         | Lint::Nopanic
+        | Lint::Unreachable
+        | Lint::Todo
         | Lint::Noalloc
         | Lint::Nonblocking
         | Lint::Pure
         | Lint::Capabilities
         // Kept by the list itself, or with `#[expect(..)]` on the function.
         | Lint::UndeclaredEffect
-        | Lint::UnneededEffect
+        | Lint::UnfulfilledEffect
         | Lint::NegativeEffect
         | Lint::Packable
         | Lint::SoaCandidate
         | Lint::BorrowWorkaround
         | Lint::NllWorkaround
         | Lint::NativeContracts
+        | Lint::ImpliedBoundWritten
         // Kept with `#[expect(..)]` on the item: what a format accepts is the type's choice.
         | Lint::LenientDeserialize
         // Kept with `#[expect(..)]` on the macro's function or the script: a macro and a
@@ -132,13 +148,16 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::ProcMacroAttribute
         | Lint::ProcMacroFnLike
         | Lint::BuildScriptAmbient
+        // About the package: allowed in the workspace's lint table or at the crate root.
+        | Lint::NotLatestEdition
         // Kept with `#[expect(..)]` on the function: what a function reaches is its choice.
         | Lint::StdUse
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
         | Lint::DefaultHasher
         // The edition's lints name a construct the edition removes, not a cost on a line.
-        | Lint::LossyAs
+        | Lint::AsCast
+        | Lint::ImplicitOverflow
         | Lint::GlobalState
         | Lint::AsyncFn
         | Lint::MutRef
@@ -150,7 +169,163 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         // A type's declaration and where it is held: kept with `#[expect(..)]` on the item.
         | Lint::ProgramLifetime
         | Lint::CouldBeProgramLifetime
-        | Lint::CouldBeRef32 => None,
+        | Lint::CouldBeRef32
+        // Suggestions and the refinement gate: advice is taken or left, never kept by a comment.
+        | Lint::CouldBeNarrower
+        | Lint::CouldBeSansIo
+        | Lint::CouldBeLinear
+        | Lint::CouldHaveInvariant
+        | Lint::Refinement
+        // Kept with `#[expect(..)]` on the function: where a setting is read is the item's
+        // choice, and the allowed modules are named in `clippy.toml`.
+        | Lint::EnvRead
+        // Kept with `#[expect(..)]` on the item: a child's owner, a test's bound, a reader of
+        // positions (or `#[blaze::renders_positions]`) and a format's field order are the
+        // item's choice. In a test the code under test is the waker, so `// wakes:` keeps no
+        // `unbounded_test_wait` finding.
+        | Lint::UntiedChild
+        | Lint::UnboundedTestWait
+        | Lint::ReadsPositions
+        | Lint::AbsolutePosition
+        | Lint::CborFieldOrder
+        // Kept with `#[expect(..)]` on the item: a literal's alignment, a count, a silenced
+        // design, a policy path, a bounded length and a bounded static are the item's choice.
+        | Lint::GappedLiteral
+        | Lint::Retry
+        | Lint::Unwired
+        | Lint::TmpPath
+        | Lint::NarrowedLen
+        | Lint::ProcessStatic
+        // A default kept for every implementor says why in its `/// The default:` doc line;
+        // a read one at a time says why with `#[expect(..)]`.
+        | Lint::DefaultRefuses
+        | Lint::OneAtATime
+        // Kept with `#[expect(..)]` on the item: whether wrapping is meant is the code's
+        // choice, said once with its reason.
+        | Lint::TruncatingCast
+        // The std mistakes: each place that is right says why with `#[expect(..)]`.
+        | Lint::PartialWrite
+        | Lint::PartialCmpUnwrap
+        | Lint::UnboundedRead
+        | Lint::LenMinus
+        | Lint::StrByteSlice
+        | Lint::Forget
+        | Lint::PathToStrUnwrap
+        | Lint::DetachedThread
+        | Lint::UnboundedChannel
+        | Lint::Transmute
+        | Lint::CloneToSatisfy
+        | Lint::UncheckedIndexInLoop
+        | Lint::DefaultNumericFallbackLen
+        | Lint::RefcellBorrowAcrossCall
+        | Lint::ProcessExit
+        | Lint::PrintInLib
+        | Lint::LockUnwrap
+        | Lint::SkippedPair
+        | Lint::HalfDone
+        | Lint::HiddenExit
+        | Lint::QuestionMarkConverts
+        | Lint::OptionQuestionMarkHides
+        | Lint::UnseenTarget
+        | Lint::GlobImport
+        | Lint::ShadowChangesMeaning
+        | Lint::VersionedName
+        | Lint::UnusedParameter
+        | Lint::Fallback
+        | Lint::PlaceholderBody
+        | Lint::TestAssertsNothing
+        | Lint::AssertionCannotFail
+        | Lint::TestMissesItsSubject
+        | Lint::IgnoredWithoutReason
+        | Lint::DocNamesNothing
+        | Lint::MagicNumber
+        | Lint::MagicString
+        | Lint::RepeatedFormat
+        | Lint::StringSharedAcrossCrates
+        | Lint::StringNearMissAcrossCrates
+        | Lint::SwappedArguments
+        | Lint::WriteOnlyField
+        | Lint::OnlyUsedInTests
+        | Lint::SingleImplTrait
+        | Lint::ForwardingFn
+        | Lint::ConstantArgument
+        | Lint::AlwaysSameResult
+        | Lint::NeverConstructed
+        | Lint::NeverMatched
+        | Lint::SwappableParameters
+        // Held by the per-item baseline (`baselines/items.tsv`), never by a comment.
+        | Lint::FunctionWeight
+        | Lint::PathCount
+        | Lint::LiveState
+        | Lint::EffectBreadth
+        | Lint::Exits
+        | Lint::LongFunction
+        | Lint::LongFile
+        | Lint::ManyParams
+        | Lint::WideType
+        | Lint::DeepNesting
+        | Lint::FanOut
+        | Lint::ModuleCycle
+        | Lint::ProofForgotten
+        | Lint::UnitMismatch
+        | Lint::PrimitiveMeaning
+        | Lint::SentinelValue
+        | Lint::StateInFlags
+        | Lint::BoolPairState
+        | Lint::OutParameter
+        | Lint::ParallelCollections
+        | Lint::UntypedIndex
+        | Lint::ValidatedButRaw
+        | Lint::ClaimContradictsFacts
+        | Lint::ClaimIsDerivable
+        | Lint::ClaimWithoutEvidence
+        | Lint::EvidenceIsStale
+        | Lint::SafetyWithoutInvariant
+        | Lint::CommentClaims
+        // Held by `#[expect(blaze::<lint>, reason = ..)]` and the ratchet baselines.
+        | Lint::SameFn
+        | Lint::SameImplFn
+        | Lint::SameBlock
+        | Lint::NearDuplicate
+        | Lint::PasteMismatch
+        | Lint::SameType
+        | Lint::SameConst
+        | Lint::ExtractableDuplicate
+        | Lint::TestsDifferByLiteral
+        | Lint::ImplsDifferByType
+        | Lint::DuplicateAcrossCrates
+        // Held by `#[expect(blaze::<lint>, reason = ..)]` on the function or the test.
+        | Lint::ResultPartUnobserved
+        | Lint::WeakAssertion
+        | Lint::MirrorAssertion
+        | Lint::PseudoTested
+        | Lint::UnreachedByTests
+        | Lint::ErrorPathUntested
+        | Lint::PropertyOverExamples
+        // Kept with `#[expect(..)]` on the impl, the enum or the list: a field left out of a
+        // field-wise body says so with `// left out: <why>` on its `field: _`, through
+        // [`commented`], not by a tag.
+        | Lint::HandWrittenDerivable
+        | Lint::ImplMissesField
+        | Lint::HandKeptVariantList
+        | Lint::VariantListDrift
+        | Lint::HandWrittenCodec
+        | Lint::FieldWiseConversion
+        | Lint::ConversionMissesField
+        | Lint::HandWrittenVisitor
+        | Lint::RepeatedFieldList
+        | Lint::RegistrySpread
+        // Held by `#[expect(blaze::same_behaviour, reason = ..)]` and the ratchet baseline.
+        | Lint::SameBehaviour
+        // About a dependency: granted in the root manifest's `[workspace.metadata.blaze.trust]`,
+        // or for a workspace crate's own `unsafe` at its root, never by a comment on a line.
+        | Lint::DependencyCapability
+        | Lint::DependencyUnsafe
+        | Lint::TrustGrantUnused
+        | Lint::DependencyCapabilityUnreached
+        | Lint::WorkspaceUnsafe
+        // Off by default; held by `#[expect(blaze::loop_match_candidate, reason = ..)]`.
+        | Lint::LoopMatchCandidate => None,
     }
 }
 
@@ -219,13 +394,15 @@ mod tests {
 
     #[test]
     fn an_empty_reason_or_another_tag_does_not() {
-        let text = "// clone:\nlet a = x.clone();\n// clone:    \nlet b = y.clone();\n// alloc: why\nlet c = z.clone();\n";
+        let text = "// clone:\nlet a = x.clone();\n// clone:    \nlet b = y.clone();\n// dyn: why\nlet c = z.clone();\n";
         assert!(!exempt(text, at(text, "x.clone()"), Lint::HotClone));
         assert!(!exempt(text, at(text, "y.clone()"), Lint::HotClone));
         assert!(!exempt(text, at(text, "z.clone()"), Lint::HotClone));
-        assert!(exempt(text, at(text, "z.clone()"), Lint::HotAlloc));
+        assert!(exempt(text, at(text, "z.clone()"), Lint::HotDyn));
         assert!(!exempt(text, at(text, "z.clone()"), Lint::DefaultHasher));
-        assert!(!exempt(text, at(text, "z.clone()"), Lint::HotDyn));
+        // No comment stands in for an allocator (rule bump-allocate): `// alloc:` keeps nothing.
+        let text = "// alloc: why\nlet v = Vec::new();\n";
+        assert!(!exempt(text, at(text, "Vec::new()"), Lint::HotAlloc));
     }
 
     #[test]
@@ -238,9 +415,20 @@ mod tests {
 
     #[test]
     fn every_line_of_a_finding_counts() {
-        let text = "let v = vec![\n    1, // alloc: setup\n];\nlet w = 0;\n// alloc: below\n";
-        assert!(exempt(text, at(text, "vec![\n    1, // alloc: setup\n]"), Lint::HotAlloc));
-        assert!(!exempt(text, at(text, "let w = 0;"), Lint::HotAlloc));
-        assert!(!exempt("x", TextRange::empty(TextSize::new(0)), Lint::HotAlloc));
+        let text = "let v = f(\n    1, // dyn: setup\n);\nlet w = 0;\n// dyn: below\n";
+        assert!(exempt(text, at(text, "f(\n    1, // dyn: setup\n)"), Lint::HotDyn));
+        assert!(!exempt(text, at(text, "let w = 0;"), Lint::HotDyn));
+        assert!(!exempt("x", TextRange::empty(TextSize::new(0)), Lint::HotDyn));
+    }
+
+    /// The rule: no comment stands in for an allocator. `// alloc: <why>`, with a reason,
+    /// keeps no finding of `implicit_allocator`, `hot_alloc` or `hot_alloc_call`.
+    #[test]
+    fn an_alloc_comment_keeps_no_allocation_finding() {
+        let text = "// alloc: handed to the caller\nlet v = Vec::new();\nlet w = Vec::new(); // alloc: setup\n";
+        for lint in [Lint::ImplicitAllocator, Lint::HotAlloc, Lint::HotAllocCall] {
+            assert!(!exempt(text, at(text, "Vec::new();\nlet"), lint));
+            assert!(!exempt(text, at(text, "let w = Vec::new();"), lint));
+        }
     }
 }

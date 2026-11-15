@@ -1,0 +1,12 @@
+{
+ "id": "termui-1112-9",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "where": "lanebase-1112, /root/loop.sh",
+ "what": "Twice, after a wait of ten to fifteen minutes in the queue, loop.sh ended at its checkout with `error: Your local changes to the following files would be overwritten by checkout: Cargo.lock`: the lane before left the shared tree with a Cargo.lock cargo had rewritten (its branch's lock was stale), and the script neither restores the tree nor says whose build dirtied it. Nothing of this lane was built or tested after its first report.",
+ "cost": "about thirty minutes of waiting and eleven commits pushed without having been compiled",
+ "cause": "loop.sh checks out over whatever the last build left; cargo rewrites a stale Cargo.lock in place",
+ "workaround": "none within the rules (the shared tree is not edited by hand)",
+ "fix": "loop.sh runs `git checkout -- Cargo.lock` (or builds with --locked and fails the lane whose lock is stale, naming it) before it switches branches",
+ "state": "open"
+}

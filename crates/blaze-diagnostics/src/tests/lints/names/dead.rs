@@ -126,6 +126,9 @@ macro_rules! test_case {
 }
 
 test_case!(lint_dead_code_1, "lint-dead-code-1", core: "copy");
+// tests/ui/lint/rfc-2383-lint-reason/: an `#[expect]` on dead code a dead parent's diagnostic
+// covers is fulfilled (Rust 1.100, rust-lang/rust#161005).
+test_case!(expect_inside_dead_code, "expect_inside_dead_code");
 test_case!(lint_dead_code_2, "lint-dead-code-2");
 test_case!(lint_dead_code_5, "lint-dead-code-5");
 test_case!(multiple_dead_codes_in_the_same_struct, "multiple-dead-codes-in-the-same-struct", core: "fmt");

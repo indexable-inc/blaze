@@ -1,0 +1,16 @@
+about = "A program run by hand with no daemon runs the last build (track 10, task C), over six registry crates (regex, hashbrown, bitflags, itoa, memchr, smallvec, pinned by harness/v2/versus/six's lock): run, then an edit built with `blaze build`, `blaze stop`, and the built file run by hand: it prints the edited output, since the build of another record removed the start file the first run's daemon wrote (blaze-cargo's `built`, H6), so the launcher starts a daemon and joins it. A start file kept past its build (`Plant::KeepsStartFile`) prints the old output, which this catches. The control of each revision is its expected output altered, which fails."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+
+[[revision]]
+steps = ["edit", "build", "stop"]
+action = "run the file"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nxis: 55 8 true\n"
+as_built = true
+starts = 1

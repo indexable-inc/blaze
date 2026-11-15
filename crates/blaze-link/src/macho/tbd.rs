@@ -1911,8 +1911,7 @@ mod tests {
         shared.symbols.iter().map(|it| shared.symbol_name(it)).collect()
     }
 
-    const V4: &str = "\
---- !tapi-tbd
+    const V4: &str = r#"--- !tapi-tbd
 tbd-version:     4
 targets:         [ x86_64-macos, arm64-macos,
                    arm64-ios ]
@@ -1922,7 +1921,7 @@ current-version: 1.2
 reexported-libraries:
   - targets:         [ x86_64-macos, arm64-macos ]
     libraries:       [ '/usr/lib/system/libbar.dylib',
-                       \"/usr/lib/libmissing.dylib\" ]
+                       "/usr/lib/libmissing.dylib" ]
 exports:
   - targets:         [ x86_64-macos, arm64-macos ]   # both
     symbols:         [ _foo, '_quoted$name', 'it''s',
@@ -1951,7 +1950,7 @@ exports:
     objc-eh-types:   [ BarErr ]
     objc-ivars:      [ Bar._x ]
 ...
-";
+"#;
 
     #[test]
     fn v4_arm64_macos() {
@@ -2021,8 +2020,7 @@ exports:
         assert_eq!(names(&shared), vec!["plain"]);
     }
 
-    const V3: &str = "\
---- !tapi-tbd-v3
+    const V3: &str = r#"--- !tapi-tbd-v3
 archs:           [ x86_64, arm64 ]
 uuids:           [ 'x86_64: 00000000-0000-0000-0000-000000000000',
                    'arm64: 11111111-1111-1111-1111-111111111111' ]
@@ -2032,7 +2030,7 @@ current-version: 1
 exports:
   - archs:           [ x86_64, arm64 ]
     re-exports:      [ /usr/lib/libv3sub.dylib ]
-    symbols:         [ _common, \"_double\\x41\" ]
+    symbols:         [ _common, "_double\x41" ]
     objc-classes:    [ V3Class ]
     objc-ivars:      [ V3Class.ivar ]
     weak-def-symbols: [ _weak3 ]
@@ -2048,7 +2046,7 @@ exports:
   - archs:           [ arm64 ]
     symbols:         [ _sub_arm ]
 ...
-";
+"#;
 
     #[test]
     fn v3_arm64_macos() {
@@ -2405,14 +2403,14 @@ e:
         }
         if rng.one_in(3) {
             out.push_str(&format!(
-                "parent-umbrella:{nl}  - targets:         [ {} ]{nl}    umbrella:        System{nl}",
+                r"parent-umbrella:{nl}  - targets:         [ {} ]{nl}    umbrella:        System{nl}",
                 targets.join(", ")
             ));
         }
         if rng.one_in(2) {
             out.push_str(&format!("reexported-libraries:{nl}"));
             out.push_str(&format!(
-                "  - targets:         [ {} ]{nl}",
+                r"  - targets:         [ {} ]{nl}",
                 rng.subset(&targets).join(", ")
             ));
             let libraries = libraries_for(rng, 3, count);
@@ -2425,7 +2423,7 @@ e:
             out.push_str(&format!("{key}:{nl}"));
             for _ in 0..1 + rng.below(3) {
                 out.push_str(&format!(
-                    "  - targets:         [ {} ]{nl}",
+                    r"  - targets:         [ {} ]{nl}",
                     rng.subset(&targets).join(", ")
                 ));
                 for list_key in [
@@ -2451,7 +2449,7 @@ e:
     fn doc_v3(rng: &mut Rng, out: &mut String, nl: &str, index: usize, count: usize) {
         let tag = rng.pick(&["--- !tapi-tbd-v3", "--- !tapi-tbd-v2", "---"]);
         let archs = rng.subset(&ARCHS);
-        out.push_str(&format!("{tag}{nl}archs:           [ {} ]{nl}", archs.join(", ")));
+        out.push_str(&format!(r"{tag}{nl}archs:           [ {} ]{nl}", archs.join(", ")));
         if rng.one_in(2) {
             let uuids: Vec<String> = archs.iter().map(|it| format!("'{it}: 0000-1111'")).collect();
             list(rng, out, nl, 0, "uuids", &uuids);
@@ -2464,7 +2462,7 @@ e:
         out.push_str(&format!("exports:{nl}"));
         for _ in 0..1 + rng.below(3) {
             out.push_str(&format!(
-                "  - archs:           [ {} ]{nl}",
+                r"  - archs:           [ {} ]{nl}",
                 rng.subset(&archs).join(", ")
             ));
             if rng.one_in(2) {

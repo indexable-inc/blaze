@@ -1,5 +1,5 @@
 /**
- * The goals' drawings on the home page (Art in content/schema.flecs; render.rs writes `<div class="art"
+ * The lessons' drawings (Art in content/schema.flecs; render.rs writes `<div class="art"
  * data-piece="..."><canvas>`). Each is a picture of the goal's mechanism, drawn on a coarse grid of square cells, the
  * fire logo's pixels, in the page's inks (styles/art.css), after ix.dev's abstract art (packages/web src/lib/art):
  * monochrome, slow, no words, at most one accent.
@@ -370,7 +370,353 @@ const remote: Piece = {
 	},
 };
 
-const PIECES: Record<string, Piece> = { cache, hermetic, incremental, remote };
+// ---- Labels: a 3 by 5 pixel font, for the few words a lesson's drawing needs (a name, N + M). ----
+
+// Each glyph is 5 rows of 3 cells, top to bottom, `#` on. Only the letters the drawings use.
+const FONT: Record<string, string> = {
+	a: '.#.' + '#.#' + '###' + '#.#' + '#.#',
+	b: '##.' + '#.#' + '##.' + '#.#' + '##.',
+	c: '.##' + '#..' + '#..' + '#..' + '.##',
+	d: '##.' + '#.#' + '#.#' + '#.#' + '##.',
+	e: '###' + '#..' + '##.' + '#..' + '###',
+	f: '###' + '#..' + '##.' + '#..' + '#..',
+	g: '.##' + '#..' + '#.#' + '#.#' + '.##',
+	i: '###' + '.#.' + '.#.' + '.#.' + '###',
+	l: '#..' + '#..' + '#..' + '#..' + '###',
+	m: '#.#' + '###' + '###' + '#.#' + '#.#',
+	n: '##.' + '#.#' + '#.#' + '#.#' + '#.#',
+	o: '.#.' + '#.#' + '#.#' + '#.#' + '.#.',
+	r: '##.' + '#.#' + '##.' + '#.#' + '#.#',
+	z: '###' + '..#' + '.#.' + '#..' + '###',
+	'+': '...' + '.#.' + '###' + '.#.' + '...',
+	'=': '...' + '###' + '...' + '###' + '...',
+	' ': '...' + '...' + '...' + '...' + '...',
+};
+
+function glyphOf(c: string): string {
+	const g = FONT[c] ?? FONT[c.toLowerCase()];
+	if (!g) throw new Error(`client/art.ts: no glyph for ${JSON.stringify(c)}`);
+	return g;
+}
+
+/** Writes `s` with its top left at (x, y); returns its width in cells. */
+function text(g: Grid, s: string, x: number, y: number, colour: string, alpha: number): number {
+	[...s].forEach((c, n) => {
+		const bits = glyphOf(c);
+		for (let v = 0; v < 5; v++) for (let u = 0; u < 3; u++) if (bits[v * 3 + u] === '#') g.cell(x + n * 4 + u, y + v, colour, alpha);
+	});
+	return s.length * 4 - 1;
+}
+const textWidth = (s: string) => s.length * 4 - 1;
+
+/** A filled block of cells. */
+function block(g: Grid, x: number, y: number, w: number, h: number, colour: string, alpha: number) {
+	for (let u = 0; u < w; u++) for (let v = 0; v < h; v++) g.cell(x + u, y + v, colour, alpha);
+}
+/** The outline of a box. */
+function frame(g: Grid, x: number, y: number, w: number, h: number, colour: string, alpha: number) {
+	for (let u = 0; u < w; u++) {
+		g.cell(x + u, y, colour, alpha);
+		g.cell(x + u, y + h - 1, colour, alpha);
+	}
+	for (let v = 1; v < h - 1; v++) {
+		g.cell(x, y + v, colour, alpha);
+		g.cell(x + w - 1, y + v, colour, alpha);
+	}
+}
+
+// 5. The race (lesson 1). Time runs left to right. cargo: a rustc for the crate you edited and one for each crate that
+// uses it (each starts by reloading what it saved, the faint head of its bar), then the whole program linked. blaze:
+// one cell, the function you changed, and it is done; the rest of its lane stays dark.
+const race: Piece = {
+	period: 7,
+	still: 5.6,
+	draw(g, k, t) {
+		const { cols: C, rows: R } = g;
+		const fade = 1 - ramp(t, 6.3, 6.9);
+		const lx = 1;
+		const x0 = lx + textWidth('cargo') + 3;
+		const x1 = C - 2;
+		const span = x1 - x0;
+		const y1 = Math.max(1, Math.floor(R / 2) - 6);
+		const y2 = y1 + 8;
+		text(g, 'cargo', lx, y1, k.mid, 1);
+		text(g, 'blaze', lx, y2, k.ink, 1);
+		for (let x = x0; x < x1; x++) {
+			g.cell(x, y1 + 2, k.faint, 0.35);
+			g.cell(x, y2 + 2, k.faint, 0.35);
+		}
+		// The playhead: 5 seconds for the whole width.
+		const head = x0 + span * ramp(t, 0.3, 5.3);
+		// cargo's bars: three rustc runs, then the link.
+		const parts: [number, number, 'run' | 'link'][] = [
+			[0, 0.17, 'run'],
+			[0.18, 0.4, 'run'],
+			[0.41, 0.62, 'run'],
+			[0.63, 1, 'link'],
+		];
+		for (const [a, b, kind] of parts) {
+			const xa = Math.round(x0 + a * span);
+			const xb = Math.round(x0 + b * span);
+			for (let x = xa; x < Math.min(xb, head); x++) {
+				const reload = kind === 'run' && x - xa < 3;
+				const c = kind === 'link' ? k.mid : reload ? k.faint : k.ink;
+				for (let v = 0; v < 3; v++) g.cell(x, y1 + 1 + v, c, (reload ? 0.9 : 0.85) * fade);
+			}
+		}
+		// blaze: the one function, then done.
+		const fx = x0;
+		const lit = ramp(t, 0.35, 0.5) * fade;
+		block(g, fx, y2 + 1, 3, 3, k.fire, lit);
+		const done = ramp(t, 0.7, 0.8) * fade;
+		text(g, 'done', fx + 5, y2 + 1 - 1, k.ink, done);
+		// The playhead itself, a faint line across both lanes, until cargo is done.
+		if (t < 5.3)
+			for (let y = y1 - 1; y <= y2 + 5; y++) g.cell(head, y, k.faint, 0.5);
+	},
+};
+
+// 6. The daemon. A block of cells is your workspace, held in memory. The first build loads and compiles every cell,
+// one after another. Then each save changes one cell (the accent), which settles at once; nothing else moves.
+const daemon: Piece = {
+	period: 9,
+	still: 6.2,
+	draw(g, k, t) {
+		const { cols: C, rows: R } = g;
+		const W = Math.min(C - 4, 56);
+		const H = Math.min(R - 4, 14);
+		const x0 = Math.floor((C - W) / 2);
+		const y0 = Math.floor((R - H) / 2);
+		frame(g, x0 - 1, y0 - 1, W + 2, H + 2, k.faint, 0.6);
+		const n = W * H;
+		const filled = ramp(t, 0.3, 3.6) * n;
+		const fade = 1 - ramp(t, 8.3, 8.9);
+		let m = 0;
+		for (let v = 0; v < H; v++)
+			for (let u = 0; u < W; u++, m++) {
+				const order = (m * 7919) % n;
+				const on = order < filled;
+				g.cell(x0 + u, y0 + v, on ? k.mid : k.faint, (on ? 0.85 : 0.3) * fade);
+			}
+		// Three saves after the first build, each one cell.
+		for (let s = 0; s < 3; s++) {
+			const at = 4.4 + s * 1.2;
+			const a = ramp(t, at, at + 0.1) * (1 - ramp(t, at + 0.5, at + 0.9));
+			const u = Math.floor(hash(s, 3) * W);
+			const v = Math.floor(hash(s, 5) * H);
+			g.cell(x0 + u, y0 + v, k.fire, a * fade);
+		}
+	},
+};
+
+// 7. Const generic math. A row of N cells and a row of M cells come together into one row of N + M. Each loop picks
+// other lengths.
+const sum: Piece = {
+	period: 5,
+	still: 3.4,
+	draw(g, k, t, loop) {
+		const { cols: C, rows: R } = g;
+		const N = 3 + Math.floor(hash(loop, 1) * 6);
+		const M = 2 + Math.floor(hash(loop, 2) * 6);
+		const fade = 1 - ramp(t, 4.4, 4.9);
+		const cy = Math.floor(R / 2);
+		const join = ramp(t, 1, 2.2);
+		const cx = Math.floor(C / 2);
+		const total = N * 2 + M * 2;
+		// Apart: N on the left, M on the right, a gap between; together: one row centred.
+		const leftApart = Math.max(2, cx - N * 2 - 8);
+		const rightApart = Math.min(C - M * 2 - 2, cx + 8);
+		const start = cx - Math.floor(total / 2);
+		const xn = Math.round(lerp(leftApart, start, join));
+		const xm = Math.round(lerp(rightApart, start + N * 2, join));
+		for (let i = 0; i < N; i++) block(g, xn + i * 2, cy - 1, 1, 2, k.ink, fade);
+		for (let i = 0; i < M; i++) block(g, xm + i * 2, cy - 1, 1, 2, k.mid, fade);
+		const apart = 1 - ramp(t, 0.9, 1.4);
+		text(g, 'N', xn + N - 2, cy - 8, k.ink, apart * fade);
+		text(g, 'M', xm + M - 2, cy - 8, k.mid, apart * fade);
+		const sumA = ramp(t, 2.2, 2.6) * fade;
+		const label = 'N+M';
+		text(g, label, cx - Math.floor(textWidth(label) / 2), cy - 8, k.ink, sumA);
+		// The type checks: the accent under the joined row.
+		for (let i = 0; i < total - 1; i++) g.cell(start + i, cy + 3, k.fire, ramp(t, 2.6 + i * 0.01, 2.8 + i * 0.01) * fade);
+	},
+};
+
+// 8. Effects. A call tree: the function at the top promises a list of effects. Far below, one call blocks (the
+// accent). The effect climbs the wires to the top, and the promise breaks there: the top's box lights up.
+const effects: Piece = {
+	period: 6,
+	still: 3.6,
+	draw(g, k, t, loop) {
+		const { cols: C, rows: R } = g;
+		const fade = 1 - ramp(t, 5.3, 5.9);
+		const cx = Math.floor(C / 2);
+		const levels = 3;
+		const dy = Math.max(4, Math.floor((R - 4) / levels));
+		const y0 = 1;
+		const spread = Math.max(6, Math.floor(C / 5));
+		// Nodes per level: 1, 2, 4.
+		const nodes: Pt[][] = [];
+		for (let l = 0; l < levels; l++) {
+			const count = 2 ** l;
+			const w = spread * (count - 1) * (l === 2 ? 0.55 : 1);
+			nodes.push(Array.from({ length: count }, (_, i) => [Math.round(cx - w / 2 + (count > 1 ? (i * w) / (count - 1) : 0)), y0 + l * dy] as Pt));
+		}
+		const leaf = Math.floor(hash(loop, 9) * 4);
+		const chain = [leaf, leaf >> 1, 0];
+		const wires: { p: Pt[]; on: number }[] = [];
+		for (let l = 1; l < levels; l++)
+			nodes[l].forEach((n, i) => {
+				const parent = nodes[l - 1][i >> 1];
+				const p = path([
+					[n[0], n[1] - 1],
+					[n[0], n[1] - Math.floor(dy / 2)],
+					[parent[0], n[1] - Math.floor(dy / 2)],
+					[parent[0], parent[1] + 2],
+				]);
+				const onChain = chain[levels - 1 - l] === i;
+				wires.push({ p, on: onChain ? l : 0 });
+			});
+		for (const { p, on } of wires) {
+			for (const [i, j] of p) g.cell(i, j, k.faint, 0.7 * fade);
+			if (on) {
+				const a = on === 2 ? 1.1 : 2;
+				const u = ramp(t, a, a + 0.8);
+				if (u > 0) p.forEach(([i, j], n) => n <= u * (p.length - 1) && g.cell(i, j, k.fire, 0.8 * fade));
+			}
+		}
+		nodes.forEach((row, l) =>
+			row.forEach(([x, y], i) => {
+				const isLeaf = l === 2 && i === leaf;
+				block(g, x - 1, y, 3, 2, isLeaf ? k.fire : k.mid, (isLeaf ? ramp(t, 0.5, 0.7) : 0.85) * fade);
+				if (isLeaf) block(g, x - 1, y, 3, 2, k.mid, (1 - ramp(t, 0.5, 0.7)) * 0.85 * fade);
+			}),
+		);
+		// The promise round the top function, which breaks when the effect arrives.
+		const [tx, ty] = nodes[0][0];
+		const broke = ramp(t, 2.8, 3);
+		frame(g, tx - 3, ty - 1, 7, 4, broke > 0 ? k.fire : k.ink, (0.5 + 0.5 * broke) * fade);
+	},
+};
+
+// 9. Capabilities (bstd). main holds the machine's things (the boxes on the right); it hands one of them to a
+// function. The function reaches that box, and only that one: its tries at the others stop at the wall.
+const capability: Piece = {
+	period: 6,
+	still: 3.9,
+	draw(g, k, t) {
+		const { cols: C, rows: R } = g;
+		const fade = 1 - ramp(t, 5.3, 5.9);
+		const n = 3;
+		const bh = Math.max(3, Math.floor((R - 2) / n) - 2);
+		const top = Math.floor((R - (n * (bh + 2) - 2)) / 2);
+		const bx = C - 8;
+		const fx = Math.floor(C * 0.42);
+		const fy = Math.floor(R / 2) - 1;
+		const mx = 3;
+		const given = 1;
+		block(g, mx, fy, 3, 3, k.ink, fade);
+		text(g, 'main', mx - 1, fy - 7, k.mid, fade);
+		block(g, fx, fy, 3, 3, k.mid, fade);
+		text(g, 'fn', fx + 1 - Math.floor(textWidth('fn') / 2), fy - 7, k.mid, fade);
+		// The branch to the boxes and the wall sit right of the label, so neither runs through it.
+		const branch = fx + 1 + Math.ceil(textWidth('fn') / 2) + 1;
+		// The handing over: a key from main to the function.
+		const hand = path([
+			[mx + 3, fy + 1],
+			[fx - 1, fy + 1],
+		]);
+		for (const [i, j] of hand) g.cell(i, j, k.faint, 0.6 * fade);
+		if (t > 0.4 && t < 1.6) packet(g, hand, ramp(t, 0.4, 1.4), k.fire, fade);
+		// The wall the function's other tries stop at.
+		const wall = branch + 3;
+		for (let y = 0; y < R; y++) if (Math.abs(y - (top + given * (bh + 2) + Math.floor(bh / 2))) > Math.floor(bh / 2) + 1) g.cell(wall, y, k.faint, 0.5 * fade);
+		for (let b = 0; b < n; b++) {
+			const y = top + b * (bh + 2);
+			const reach = b === given;
+			const lit = reach ? ramp(t, 2.4, 2.6) : 0;
+			frame(g, bx, y, 6, bh, reach ? k.ink : k.faint, (reach ? 0.6 + 0.4 * lit : 0.6) * fade);
+			if (reach) block(g, bx + 2, y + Math.floor(bh / 2) - 1 + (bh % 2), 2, bh > 3 ? 2 : 1, k.fire, lit * fade);
+			const ty = y + Math.floor(bh / 2);
+			const p = path([
+				[fx + 3, fy + 1],
+				[branch, fy + 1],
+				[branch, ty],
+				[reach ? bx - 1 : wall - 1, ty],
+			]);
+			for (const [i, j] of p) g.cell(i, j, k.faint, 0.35 * fade);
+			const start = 1.5 + (reach ? 0 : 0.5 + b * 0.3);
+			if (t > start && t < start + 1.2) packet(g, p, ramp(t, start, start + (reach ? 0.9 : 0.7)), reach ? k.ink : k.mid, fade);
+			if (!reach) g.cell(wall, ty, k.fire, ramp(t, start + 0.7, start + 0.8) * (1 - ramp(t, start + 1.2, start + 1.6)) * fade);
+		}
+	},
+};
+
+// 10. A pass, proved. On the left a function's blocks before a pass, on the right after it (fewer blocks: the dead
+// one gone, two jumps merged). An equals sign joins them, and once Lean has checked it, the seal lights.
+const proof: Piece = {
+	period: 6.5,
+	still: 4.4,
+	draw(g, k, t) {
+		const { cols: C, rows: R } = g;
+		const fade = 1 - ramp(t, 5.8, 6.4);
+		const cy = Math.floor(R / 2);
+		const lx = Math.floor(C * 0.2) - 3;
+		const rx = Math.floor(C * 0.68);
+		const before: [number, number, boolean][] = [
+			[0, -6, false],
+			[-4, 0, false],
+			[4, 0, true],
+			[0, 6, false],
+		];
+		const wiresB: [number, number][] = [
+			[0, 1],
+			[0, 2],
+			[1, 3],
+			[2, 3],
+		];
+		const pos = (x: number, d: [number, number, boolean]): Pt => [x + d[0], cy + d[1] - 1];
+		for (const [a, b] of wiresB) {
+			const [ax, ay] = pos(lx, before[a]);
+			const [bx2, by] = pos(lx, before[b]);
+			const p = path([
+				[ax + 1, ay + 2],
+				[bx2 + 1, ay + 2],
+				[bx2 + 1, by - 1],
+			]);
+			const dead = before[a][2] || before[b][2];
+			for (const [i, j] of p) g.cell(i, j, dead ? k.fire : k.faint, (dead ? 0.35 : 0.7) * fade);
+		}
+		before.forEach((d) => {
+			const [x, y] = pos(lx, d);
+			block(g, x, y, 3, 2, d[2] ? k.fire : k.mid, (d[2] ? 0.6 : 0.85) * fade);
+		});
+		// After: three blocks in a line.
+		const shown = ramp(t, 0.8, 1.6);
+		const after = [-5, 0, 5];
+		after.forEach((dy, i) => {
+			block(g, rx, cy + dy - 1, 3, 2, k.mid, 0.85 * shown * fade);
+			if (i < 2) for (let y = cy + dy + 1; y < cy + after[i + 1] - 1; y++) g.cell(rx + 1, y, k.faint, 0.7 * shown * fade);
+		});
+		// The proof: an equals sign between them, drawn when checked.
+		const ex = Math.floor((lx + 8 + rx) / 2) - 1;
+		const checked = ramp(t, 2.2, 2.5);
+		text(g, '=', ex - 1, cy - 2, checked > 0 ? k.ink : k.faint, (0.5 + 0.5 * checked) * fade);
+		// The seal: a check mark in the accent, under the sign.
+		const seal: Pt[] = [
+			[0, 2],
+			[1, 3],
+			[2, 4],
+			[3, 3],
+			[4, 2],
+			[5, 1],
+			[6, 0],
+		];
+		seal.forEach(([u, v], n) => g.cell(ex - 2 + u, cy + 4 + v, k.fire, ramp(t, 2.7 + n * 0.06, 2.8 + n * 0.06) * fade));
+	},
+};
+
+const PIECES: Record<string, Piece> = { cache, hermetic, incremental, remote, race, daemon, sum, effects, capability, proof };
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 const dark = matchMedia('(prefers-color-scheme: dark)');
 
@@ -391,9 +737,18 @@ function mount(el: HTMLElement, signal: AbortSignal): () => void {
 	let last = 0;
 	let raf = 0;
 	let seen = false;
+	// A piece in a lesson step that was hidden starts its story over when its step is shown.
+	let hidden = true;
 	const paint = () => {
 		const box = el.getBoundingClientRect();
-		if (box.width === 0 || box.height === 0) return;
+		if (box.width === 0 || box.height === 0) {
+			hidden = true;
+			return;
+		}
+		if (hidden) {
+			hidden = false;
+			clock = 0;
+		}
 		const ratio = Math.min(devicePixelRatio || 1, 3);
 		const w = Math.round(box.width * ratio);
 		const h = Math.round(box.height * ratio);

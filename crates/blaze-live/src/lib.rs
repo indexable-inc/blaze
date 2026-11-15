@@ -25,6 +25,9 @@
 //! [`Live::start`] says so.
 
 #![deny(unsafe_code)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 #[cfg(test)]
 #[global_allocator]

@@ -755,9 +755,7 @@ mod tests {
             return;
         }
         let reads = reads();
-        let base = std::env::temp_dir()
-            .join(format!("blaze-windows-sandbox-reads-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&base);
+        let base = blaze_core::temp::TempDir::for_test("blaze-windows-sandbox-reads-");
         let dir = base.join("d");
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
@@ -793,17 +791,14 @@ mod tests {
         }
         assert!(!is_kept(reads, plain.to_str().unwrap()), "a removal is told");
         assert_eq!(reads.covered(&plain, &readers, &mut buffer).unwrap(), None);
-        _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn a_path_through_a_dot_is_not_kept_and_its_case_is_no_difference() {
-        let base = std::env::temp_dir()
-            .join(format!("blaze-windows-sandbox-named-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("d")).unwrap();
+        let made = blaze_core::temp::TempDir::for_test("blaze-windows-sandbox-named-");
+        std::fs::create_dir_all(made.join("d")).unwrap();
         let base = std::path::PathBuf::from(
-            std::fs::canonicalize(&base).unwrap().to_str().unwrap().trim_start_matches(r"\\?\"),
+            std::fs::canonicalize(made.path()).unwrap().to_str().unwrap().trim_start_matches(r"\\?\"),
         );
         let as_is = base.join("d");
         let file = super::super::open(&as_is, "test").unwrap().unwrap();
@@ -812,7 +807,6 @@ mod tests {
         let dotted = base.join(".").join("d");
         let file = super::super::open(&dotted, "test").unwrap().unwrap();
         assert!(!named_as_it_is(&file, &key(dotted.to_str().unwrap())));
-        _ = std::fs::remove_dir_all(&base);
     }
 
     /// [`Table`] as a sequential open-addressed table: slots of `(hash, unit)` keys, each

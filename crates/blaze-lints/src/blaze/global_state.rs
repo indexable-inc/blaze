@@ -217,7 +217,7 @@ pub(super) fn check_thread_local<'t>(cx: &mut Cx<'_, 't>, call: ast::MacroCall<'
 /// The `const` items `root`, the expansion of a `thread_local!` call, declares at its top
 /// level, through the macro calls there (`std` declares one item per call and calls itself
 /// for the rest), to [`MACRO_DEPTH`] calls deep; in the order written.
-fn keys_in<'t>(
+pub(super) fn keys_in<'t>(
     cx: &Cx<'_, 't>,
     root: ast::Node<'t>,
     depth: u32,

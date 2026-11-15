@@ -1,0 +1,10 @@
+{
+ "id": "bstd-sim-test-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-sim-test",
+ "where": "cargo clippy -p blaze-core --tests",
+ "what": "`cargo +nightly-2026-10-27 clippy -p blaze-core --tests` stops in blaze-ids (lib): `error: it looks like you're manually copying between slices` (clippy::perf is deny). With `--no-deps` blaze-core itself lints.",
+ "cost": "5 minutes",
+ "workaround": "`cargo clippy -p <crate> --no-deps --tests`",
+ "state": "open"
+}

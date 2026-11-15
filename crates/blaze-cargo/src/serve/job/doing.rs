@@ -63,6 +63,9 @@ pub struct Look<'a> {
     /// loop watchdog last named ([`crate::serve::pulse::Pulse::stall`]), the same for every
     /// build's model ([`now::Now::stall`]).
     pub stall: Option<&'a str>,
+    /// The tasks the task watchdog found stuck while builds are under way, each with its build
+    /// (0 for none): a build's model says its own and those of none ([`now::Now::stuck`]).
+    pub stuck: &'a [crate::serve::pulse::StuckSaid],
 }
 
 impl<S: Steps> Jobs<S> {
@@ -227,7 +230,7 @@ impl<'a> Seen<'a> {
             expanders: &expanders,
             expansion_threads: u32::try_from(blaze_macro_eval::expansion_threads()).unwrap_or(u32::MAX),
         };
-        match job.request {
+        let mut now = match job.request {
             Some(request) => folds.look(request, look.now, &model).unwrap_or_else(|| {
                 // The plane makes a request's fold as it opens and drops it only as its job
                 // ends, so a job looked at holds one: one missing is a daemon bug, said, and
@@ -241,7 +244,16 @@ impl<'a> Seen<'a> {
             }),
             // Before its plane request: no task yet, the build is starting.
             None => Fold::new().look(&model),
-        }
+        };
+        // The watchdog's stuck tasks of this build and of none: a stuck task is what a person
+        // watching the build needs before anything it does.
+        now.stuck = look
+            .stuck
+            .iter()
+            .filter(|it| it.build == build || it.build == 0)
+            .map(|it| it.said.clone()) // clone: a stuck task's line, a look while it lasts
+            .collect(); // alloc: a look, empty while nothing is stuck
+        now
     }
 
     /// The job as `blaze status` lists it, `now` its live model.
@@ -330,21 +342,18 @@ pub fn fetching(downloads: &[Shown]) -> Vec<now::Download> {
 }
 
 /// The daemon's memory as every build's live model says it, read once a look: what blaze holds
-/// ([`blaze_graph::arena::own`], what `blaze status` says it holds), its limit (0 for none),
-/// and the subsystem over its share. `held_back` is 0: the plane says how many bytes held back
-/// a task for memory in its last dispatch ([`blaze_graph::Plane::short`]), not how many tasks
-/// it held back. `peak` is the fold's to keep; `releases` is the front ends' releases since the
-/// daemon started ([`crate::serve::unit::release::RELEASES`]), which each fold turns into its
-/// build's own.
+/// ([`blaze_graph::arena::own`], what `blaze status` says it holds). Since the memory
+/// machinery went (2026-11-13) blaze sets no limit of its own (the kernel's is the ceiling),
+/// holds no task back for memory and releases no front end mid-build, so `limit`, `over`,
+/// `held_back` and `releases` are 0 and none. `peak` is the fold's to keep.
 pub fn memory() -> now::Memory {
-    let limit = blaze_graph::admission::limit();
     now::Memory {
         held: blaze_graph::arena::own(),
         peak: 0,
-        limit: if limit == u64::MAX { 0 } else { limit },
-        over: blaze_graph::admission::Pressure::now().over.map(|tag| tag.name().to_owned()), // alloc: a look, once a second
+        limit: 0,
+        over: None,
         held_back: 0,
-        releases: crate::serve::unit::release::RELEASES.load(std::sync::atomic::Ordering::Relaxed),
+        releases: 0,
     }
 }
 

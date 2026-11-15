@@ -22,6 +22,7 @@ fn options(level: MirOptLevel) -> MirOptions {
         inline: level == MirOptLevel::Release,
         heap_to_stack: false,
         world: None,
+        tier: MirOptions::at(level).tier,
     }
 }
 

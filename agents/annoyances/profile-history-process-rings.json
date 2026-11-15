@@ -1,0 +1,14 @@
+{
+ "id": "profile-history-process-rings",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane P1 (profile history keeps the last builds)",
+ "where": "crates/blaze-profile/src/history.rs tests (past_the_cap_the_oldest_files_go_first, past_the_cap_a_build_goes_whole, a_pinned_reader_keeps_retired_files_until_it_lets_go) against the flight recorder's rings",
+ "what": "Three cap tests through a `History` failed one run in a few under `cargo test -p blaze-profile` (`every file of build 31266 is gone`). Each flush drains every ring of the process, so rows other tests recorded, with their build ids, landed in these tests' flushes: a flush is named for the highest build of its rows, so file names and build ranges changed and tied the test's files into units with foreign builds.",
+ "cost": "a reading of the cap and the drain to find; the tests could not be fixed at the History level",
+ "cause": "the flight recorder's rings are process-wide, and a History has no way to drain only its own rows",
+ "whys": "the recorder is a process singleton; tests share the process; a History test hands the core whatever the rings hold; the cap's decisions depend on build ids in rows; so a test's outcome depends on which other tests ran first",
+ "class": "a test of a stateful core through a driver that reads process-wide state is a test of every other test in the process",
+ "prevention": "done: what the cap retires and when a pinned file goes is tested on the sans-IO core under the simulation, handed exactly its rows (files/tests.rs, the_last_builds_stay_whole_through_any_flushes_pins_and_restarts); the History-level cap tests are deleted. Still open: History tests that depend on drained rows (the manifest round trip numbers its build 8_000_005 to dodge others)",
+ "workaround": "for a History test that must read rows, use a build id no other test uses",
+ "state": "fixed for the cap; open for other History tests"
+}

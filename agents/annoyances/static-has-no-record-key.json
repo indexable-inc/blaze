@@ -1,0 +1,14 @@
+{
+ "id": "static-has-no-record-key",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of track 7c task B, int-1112",
+ "where": "crates/hir-ty-codegen/v2/frontend/described.rs HirFrontend::static_key, ask_bytes; crates/blaze-cargo/src/serve/unit/run/launch.rs Names::Static { bind: None }, Held.asks",
+ "what": "A launched program's function whose record named a static was never a bind record (every static was `Names::Static { bind: None }`), and a callee was asked for by a front-end handle (`Held.asks`) that does not survive a daemon start: after `blaze stop` the first run of a hello-world was a whole build, 2,685 ms against the competitor's 27.8 ms.",
+ "cost": "every restart of a launched program is a build; the functions naming std's statics are made again in each process",
+ "cause": "the describe records gave functions a key by content (stage, home's image key, the instance ported) and statics none, and an ask was kept as interned ids of one database instead of the portable form the records already write",
+ "class": "a value keyed by content in one place and by a process's handle beside it, so the handle's lifetime bounds the content's reuse",
+ "prevention": "anything a later process asks for is held in its portable form (item keys, types by content) from the first time it is named; a handle is kept only for what has none, and that is listed by name",
+ "workaround": "none",
+ "fix": "static_key = Key::of(describe schema, producer, Hasher(\"blaze v2 codegen static 1\"): stage, image key of the static's crate, its id), None for a workspace crate's static; static_naming_of for the bind key; ask_bytes/ask_of over put_instance/get_instance; OneStatic.asked. Controls: the image key left out (two contents of one dependency share a key), an ask written with no arguments (a generic callee reads back as another instance). The daemon's use is track 7c task C.",
+ "state": "open until 7c task C lands"
+}

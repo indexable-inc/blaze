@@ -1,0 +1,12 @@
+{
+ "id": "smoke-tree-not-tied-to-binary",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane proof-before-merge tool (rule 68)",
+ "where": "scripts/src/bin/smoke.rs, the quote's `tree` and `binary` lines",
+ "what": "The smoke quote names the tree of the checkout it runs in and the sha256 of the binary it runs, but nothing ties the two: a blaze binary does not carry the commit or tree it was built from (`blaze --version` routes to `Route::Version`, which prints the release version only), so a quote made in a fresh checkout of the head with an older binary would pass `verify`. The fixture sources of harness/v2/versus (hello, six) are also only Python strings in versus.py, so smoke.rs has to hold a second copy of the two programs.",
+ "cost": "a hole in the proof the quote is meant to be, closed only by the loop.sh flow building and running in the same checkout; and two copies of each fixture program to keep alike",
+ "cause": "no build identity is embedded in the binary; the versus fixtures keep their manifests on disk but their sources in versus.py",
+ "workaround": "H-smoke-before-merge: build and run the smoke in one /root/loop.sh call in the checkout of the head",
+ "fix": "embed the source tree hash in the engine at build time and have `blaze --version --json` print it; smoke.rs then refuses a binary whose tree is not the checkout's. Move hello/six's src/main.rs (with the body slot) into harness/v2/versus/<name>/ so versus.py and smoke.rs read one file",
+ "state": "open"
+}

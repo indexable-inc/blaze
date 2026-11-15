@@ -17,6 +17,8 @@
 //!   exactly its heads and sequences.
 
 #![forbid(unsafe_code)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::time::Duration;
 
@@ -124,6 +126,11 @@ impl<'a> Input<'a> {
 
 /// Appends one record with a good checksum: a file's is over its content ID, any other's over
 /// its payload.
+#[expect(
+    blaze::narrowed_len,
+    reason = "the journal's record format holds a u32 payload length, and the fuzz input that \
+              makes a payload is far under 4 GiB"
+)]
 fn frame(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&u32::try_from(payload.len()).expect("a short payload").to_le_bytes());
@@ -308,6 +315,11 @@ fn moved_and_settled(mut vfs: Vfs, mut file: Vec<u8>, data: &[u8]) {
 
 /// Completes every effect the journal asks for, as a disk holding `file` would, until it asks
 /// for none; returns the tickets made durable.
+#[expect(
+    blaze::narrowed_len,
+    reason = "a truncate's u64 length is at most this in-memory file's length, a usize: the \
+              journal only cuts back to bytes it appended"
+)]
 fn settle(vfs: &mut Vfs, file: &mut Vec<u8>) -> Vec<Ticket> {
     let mut effects = Vec::new();
     let mut durable = Vec::new();

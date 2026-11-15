@@ -52,7 +52,7 @@ fn check_(
         &db,
         &arg_tt,
         |_| (),
-        crate::MacroCallStyle::FnLike,
+        crate::MacroCall::FnLike,
         Span {
             range: TextRange::up_to(TextSize::of(arg)),
             anchor: call_anchor,
@@ -576,7 +576,7 @@ fn a_warm_expansion_allocates_the_same_for_any_input() {
         let text = "x ".repeat(trees);
         let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &text).unwrap();
         let expand = || {
-            let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+            let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
             assert!(expanded.err.is_none());
             expanded.value.0.view().token_trees().len()
         };
@@ -605,7 +605,7 @@ fn an_expansion_into_a_frame_allocates_nothing() {
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &"x ".repeat(100))
         .unwrap();
-    let style = crate::MacroCallStyle::FnLike;
+    let style = crate::MacroCall::FnLike;
     let global = mac.expand(&db, &arg, |_| (), style, call_site).value.0;
     assert!(global.keeps_words());
     // The first task warms the thread's two frame levels, the builder's buffers and tt's walk
@@ -642,7 +642,7 @@ fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
     let input = "let x = 1 ; { x }";
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, call, ctx, input).unwrap();
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor: call, ctx };
-    let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+    let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
     assert!(expanded.err.is_none(), "{:?}", expanded.err);
     let tree = expanded.value.0;
 
@@ -689,7 +689,7 @@ fn concat_gives_the_spans_of_the_identifiers_it_made() {
     let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| Edition::CURRENT);
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, "a").unwrap();
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
-    let expanded = mac.expand_making(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+    let expanded = mac.expand_making(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
     assert!(expanded.err.is_none(), "{:?}", expanded.err);
     let (tree, _, made) = expanded.value;
     let idents: Vec<(String, Span)> = tree
@@ -738,7 +738,7 @@ fn a_repetitions_separator_is_one_glued_token_and_its_operator_is_one_character(
     let expand = |arg: &str| {
         let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, arg).unwrap();
         let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
-        let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCallStyle::FnLike, call_site);
+        let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
         assert!(expanded.err.is_none(), "{:?}", expanded.err);
         let leaves: Vec<String> = expanded
             .value
@@ -786,7 +786,7 @@ fn expanded_across(
     let call_anchor = anchor(1, call);
     let arg_tt = syntax_bridge::parse_to_token_tree(edition, call_anchor, ctx, arg).unwrap();
     let call_site = Span { range: TextRange::up_to(TextSize::of(arg)), anchor: call_anchor, ctx };
-    let res = mac.expand(&db, &arg_tt, |_| (), crate::MacroCallStyle::FnLike, call_site);
+    let res = mac.expand(&db, &arg_tt, |_| (), crate::MacroCall::FnLike, call_site);
     let entry = parser::TopEntryPoint::MacroItems;
     let (node, _) =
         syntax_bridge::token_tree_to_syntax_node(res.value.0.view(), entry, &mut |_| edition);
@@ -883,7 +883,7 @@ fn expansion_error(decl: &str, arg: &str) -> Option<String> {
         &db,
         &arg_tt,
         |_| (),
-        crate::MacroCallStyle::FnLike,
+        crate::MacroCall::FnLike,
         Span { range: TextRange::up_to(TextSize::of(arg)), anchor: anchor(1), ctx },
     );
     res.err.map(|err| format!("{err:?}"))
@@ -932,4 +932,111 @@ fn a_doc_attribute_in_a_matcher_is_still_matched() {
         expansion_error(commented, "/// the call's\nf").is_some(),
         "a call's doc comment is its `#[doc]` attribute, which nothing here matches"
     );
+}
+
+/// `m`, defined by `decl`, called in `call` style on `item`, with `args` as an attribute's
+/// arguments: its expansion as text, after its error if it has one.
+fn expand_as(
+    decl: &str,
+    item: &str,
+    call: impl Fn(Option<&tt::TopSubtree>) -> crate::MacroCall<'_>,
+    args: Option<&str>,
+) -> String {
+    let db = base_db::Db::for_tests();
+    let def = SpanAnchor {
+        file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let at =
+        SpanAnchor { file_id: EditionedFileId::new(FileId::from_raw(1), Edition::CURRENT), ..def };
+    let ctx = SyntaxContext::root(Edition::CURRENT);
+    let decl = syntax_bridge::parse_to_token_tree(Edition::CURRENT, def, ctx, decl).unwrap();
+    let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| Edition::CURRENT);
+    assert!(mac.err().is_none(), "{:?}", mac.err());
+    let item = syntax_bridge::parse_to_token_tree(Edition::CURRENT, at, ctx, item).unwrap();
+    let args = args
+        .map(|args| syntax_bridge::parse_to_token_tree(Edition::CURRENT, at, ctx, args).unwrap());
+    let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor: at, ctx };
+    let expanded = mac.expand(&db, &item, |_| (), call(args.as_ref()), call_site);
+    let mut out = String::new();
+    if let Some(err) = expanded.err {
+        format_to!(out, "error: {err}\n");
+        if let crate::ExpandErrorKind::MatchFailure(failure) = &err.inner.1 {
+            format_to!(out, "while trying to match {}\n", failure.remaining);
+        }
+    }
+    format_to!(out, "{}", expanded.value.0);
+    out
+}
+
+const ATTR_WITH_ARGS: &str = r#"
+attr($(without($($fault:ident),+ $(,)?))?) ($(#[$meta:meta])* $vis:vis fn $name:ident($($params:tt)*) $body:block) => {
+    $(#[$meta])*
+    #[test]
+    $vis fn $name() {
+        fn $name($($params)*) $body
+        run(Seeds::DEFAULT $($(.without(Fault::$fault))+)?, $name)
+    }
+};
+($name:ident) => { fn $name() {} };
+"#;
+
+fn attr(args: Option<&tt::TopSubtree>) -> crate::MacroCall<'_> {
+    crate::MacroCall::Attr { args }
+}
+
+/// An `attr(..)` rule's first pattern matches the attribute's arguments and its second the
+/// item, and the template uses the metavariables of both, in repetitions too.
+#[test]
+fn an_attr_rule_matches_the_attributes_arguments() {
+    let item = "#[inline] pub fn opted(x: u32) { x; }";
+    expect!["# [inline] # [test] pub fn opted () {fn opted (x : u32) {x ;} run (Seeds :: DEFAULT . without (Fault ::Crashes) . without (Fault ::Hangs) , opted)}"].assert_eq(&expand_as(
+        ATTR_WITH_ARGS,
+        item,
+        attr,
+        Some("without(Crashes, Hangs,)"),
+    ));
+}
+
+/// `#[m]` and `#[m()]` give an `attr(..)` rule's arguments pattern no tokens.
+#[test]
+fn an_attr_rule_matches_empty_arguments() {
+    let item = "fn plain(x: u32) {}";
+    let none = expand_as(ATTR_WITH_ARGS, item, attr, None);
+    expect!["# [test] fn plain () {fn plain (x : u32) {} run (Seeds :: DEFAULT , plain)}"]
+        .assert_eq(&none);
+    assert_eq!(none, expand_as(ATTR_WITH_ARGS, item, attr, Some("")));
+}
+
+/// Arguments no `attr(..)` rule matches are the error of a call no rule matches, not a match
+/// of the item alone.
+#[test]
+fn arguments_no_attr_rule_matches_are_no_rule_matched() {
+    let item = "fn opted(x: u32) {}";
+    expect![[r#"
+        error: no rules expected `with`
+        while trying to match `)`
+        # [test] $ vis fn $ name () {fn $ name () $ body run (Seeds :: DEFAULT , $ name)}"#]]
+    .assert_eq(&expand_as(ATTR_WITH_ARGS, item, attr, Some("with(Crashes)")));
+    expect![[r#"
+        error: no rules expected `)`
+        while trying to match meta-variable `$fault:ident`
+        # [test] $ vis fn $ name () {fn $ name () $ body run (Seeds :: DEFAULT , $ name)}"#]]
+    .assert_eq(&expand_as(ATTR_WITH_ARGS, item, attr, Some("without()")));
+}
+
+/// A macro with a fn-like rule and an `attr(..)` rule expands a call by the rule of its style.
+#[test]
+fn a_call_takes_the_rule_of_its_style() {
+    expect!["fn f () {}"].assert_eq(&expand_as(
+        ATTR_WITH_ARGS,
+        "f",
+        |_| crate::MacroCall::FnLike,
+        None,
+    ));
+    expect![[r#"
+        error: no rules expected `f`
+        while trying to match keyword `fn`
+        # [test] fn $ name () {fn $ name () $ body run (Seeds :: DEFAULT , $ name)}"#]]
+    .assert_eq(&expand_as(ATTR_WITH_ARGS, "f", attr, None));
 }

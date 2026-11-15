@@ -58,6 +58,14 @@ pub(crate) struct PathBucket {
 #[derive(Clone)]
 pub(crate) struct PathTable(Arc<Table<NamedPath>>);
 
+/// The same table, by its handle: what an input's setter compares to write nothing for an
+/// equal value. What the table holds is not compared (it is in its buckets' content IDs).
+impl PartialEq for PathTable {
+    fn eq(&self, other: &PathTable) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl fmt::Debug for PathTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PathTable").finish_non_exhaustive()

@@ -302,3 +302,54 @@ fn main() { }
         &[error(8, &[]), error(19, &[]), error(25, &[]), error(29, &[])],
     );
 }
+
+/// The `unreachable_code` messages of `fixture`, as the check gives them with no flags.
+fn unreachable_messages(fixture: &str) -> Vec<String> {
+    checked_with(fixture, "", &Options::default())
+        .messages()
+        .into_iter()
+        .filter(|it| it.starts_with("unreachable_code: "))
+        .collect()
+}
+
+/// `#[allow(unreachable_code)]` on a function holds for a finding whose expression is a macro
+/// call in it, a macro of another crate that expands to a second one included: the level at a
+/// node of an expansion is the level at its call. The shape is blake3-servil's
+/// `Platform::detect_unchecked` (a cfg'd `return`, then `unreachable!(..)`), which a build
+/// warned of in spite of its `allow` (2026-11-12). The control is the same body with no
+/// `allow`, which is the one finding.
+#[test]
+fn an_allow_on_a_function_holds_inside_a_macro_call_in_it() {
+    let fixture = r#"//- /m.rs crate:m edition:2021
+#[macro_export]
+macro_rules! halt { ($($t:tt)*) => { $crate::halt_inner!($($t)*) }; }
+#[macro_export]
+macro_rules! halt_inner { ($($t:tt)*) => { loop {} }; }
+//- /main.rs crate:other:main edition:2021 deps:m
+macro_rules! local { () => { loop {} }; }
+pub struct P;
+impl P {
+    #[allow(unreachable_code)]
+    pub fn allowed() -> u8 {
+        #[cfg(all())]
+        {
+            return 1;
+        }
+        m::halt!("never")
+    }
+    #[allow(unreachable_code)]
+    pub fn allowed_local() -> u8 {
+        return 1;
+        local!()
+    }
+    pub fn control() -> u8 {
+        return 1;
+        m::halt!("never")
+    }
+}
+fn main() {}
+"#;
+    let found = unreachable_messages(fixture);
+    assert_eq!(found.len(), 1, "only `control` has no `allow`: {found:?}");
+    assert!(found[0].contains("unreachable expression"), "{found:?}");
+}

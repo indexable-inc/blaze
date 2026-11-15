@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use blaze_manifest::Workspace;
 use blaze_manifest::files::Files;
@@ -194,6 +195,10 @@ pub struct BlazeLock {
     pub index: Option<String>,
     /// Sorted by name.
     pub native: Vec<NativePin>,
+    /// Each git source's tree digest, and the advisory database's (`[git]`, `[advisories]`):
+    /// blaze-audit's tables, which it reads and writes ([`blaze_audit::pins`]). The load
+    /// refuses a git package whose tree is not pinned here (rule `weak_source_pin`).
+    pub sources: blaze_audit::pins::SourcePins,
 }
 
 /// The `version` of the format [`BlazeLock::render`] writes and [`BlazeLock::parse`] reads.
@@ -216,7 +221,7 @@ fn key(text: &str) -> String {
 impl BlazeLock {
     /// Whether it pins nothing, and so is not written.
     pub fn is_empty(&self) -> bool {
-        self.blaze.is_none() && self.index.is_none() && self.native.is_empty()
+        self.blaze.is_none() && self.index.is_none() && self.native.is_empty() && self.sources.is_empty()
     }
 
     /// The text of `blaze.lock`: the header, `version`, then `[blaze]`, `[index]` and each
@@ -246,6 +251,7 @@ impl BlazeLock {
                 let _ = writeln!(out, "{} = {}", key(target), string(sha256));
             }
         }
+        self.sources.render(&mut out);
         out
     }
 
@@ -318,8 +324,12 @@ impl BlazeLock {
                         lock.native.push(NativePin { name: input.clone(), pin, targets });
                     }
                 }
+                "git" => lock.sources.parse_git(value, &bad)?,
+                "advisories" => lock.sources.parse_advisories(value, &bad)?,
                 other => {
-                    return Err(bad(format!("has `{other}`, which is not known (`version`, `blaze`, `index` and `native` are)")));
+                    return Err(bad(format!(
+                        "has `{other}`, which is not known (`version`, `blaze`, `index`, `native`, `git` and `advisories` are)"
+                    )));
                 }
             }
         }
@@ -516,6 +526,7 @@ pub fn pin_moves(old: Option<&BlazeLock>, new: &BlazeLock) -> Vec<String> {
             (None, None) => {}
         }
     }
+    lines.extend(new.sources.moves(&old.sources));
     lines
 }
 
@@ -700,20 +711,7 @@ pub fn after_resolve<F: Files>(
     let mut changes = vec![cargo]; // alloc: the two lock files, once per resolve
     let mut pins = BlazeLock::default();
     if !inputs.foreign {
-        let path = root.join(BLAZE_LOCK);
-        let shown = path.display().to_string();
-        let old_text = match files.read(&path) {
-            Ok(bytes) => Some(String::from_utf8(bytes.into_owned()).map_err(|error| LoadError {
-                what: format!("{shown} is not UTF-8 ({error}); `blaze lock` writes it again"),
-                at: Some(shown.clone()),
-            })?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(LoadError { what: format!("failed to read `{shown}`: {error}"), at: Some(shown) }),
-        };
-        let old_pins = match &old_text {
-            Some(text) => Some(BlazeLock::parse(text, &shown).map_err(|what| LoadError { what, at: Some(shown.clone()) })?),
-            None => None,
-        };
+        let ReadLock { shown, text: old_text, lock: old_pins } = read(files, root)?;
         let pin = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("version")).and_then(toml::Value::as_str);
         let old_blaze = old_pins.as_ref().and_then(|it| it.blaze.as_ref());
         pins = BlazeLock {
@@ -721,6 +719,9 @@ pub fn after_resolve<F: Files>(
                 .map_err(|what| LoadError { what, at: Some(shown.clone()) })?,
             index: newest(whole, old_pins.as_ref()),
             native: crate::load::native::locked_pins(files, metadata, ws.root_manifest(), root)?,
+            // A resolve never pins a tree: `blaze audit pin` does, after a person asked for it,
+            // so the tables are kept as they were read.
+            sources: old_pins.as_ref().map(|it| it.sources.clone()).unwrap_or_default(),
         };
         let same = match &old_pins {
             Some(old) => *old == pins,
@@ -743,6 +744,40 @@ pub fn after_resolve<F: Files>(
         Outcome::Write(write) => Ok(Some(write)),
         Outcome::Refused(what) => Err(LoadError { what, at: Some(cargo_path.display().to_string()) }),
     }
+}
+
+/// `blaze.lock` at a workspace's root, as read: its path as errors show it, its text and what
+/// it pins; text and pins none when there is no file.
+pub struct ReadLock {
+    pub shown: String,
+    pub text: Option<String>,
+    pub lock: Option<BlazeLock>,
+}
+
+/// `blaze.lock` of the workspace at `root`, read through `files`: the one reader of it the
+/// load's two uses share (the pins a resolve locates git packages by, [`source_pins`], and
+/// the file [`after_resolve`] decides to write again).
+pub fn read<F: Files>(files: &F, root: &Path) -> Result<ReadLock, LoadError> {
+    let path = root.join(BLAZE_LOCK);
+    let shown = path.display().to_string();
+    let text = match files.read(&path) {
+        Ok(bytes) => Some(String::from_utf8(bytes.into_owned()).map_err(|error| LoadError {
+            what: format!("{shown} is not UTF-8 ({error}); `blaze lock` writes it again"),
+            at: Some(shown.clone()),
+        })?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(LoadError { what: format!("failed to read `{shown}`: {error}"), at: Some(shown) }),
+    };
+    let lock = match &text {
+        Some(text) => Some(BlazeLock::parse(text, &shown).map_err(|what| LoadError { what, at: Some(shown.clone()) })?),
+        None => None,
+    };
+    Ok(ReadLock { shown, text, lock })
+}
+
+/// What the workspace's `blaze.lock` pins sources' trees by: none when it has no file.
+pub fn source_pins<F: Files>(files: &F, root: &Path) -> Result<blaze_audit::pins::SourcePins, LoadError> {
+    Ok(read(files, root)?.lock.map(|it| it.sources).unwrap_or_default())
 }
 
 /// Which blaze `blaze.lock` records (`[blaze]`), for a workspace whose root manifest `manifest`
@@ -894,6 +929,15 @@ mod tests {
                     ],
                 },
             ],
+            sources: {
+                let tree = |text: &str| blaze_fetch::Digest::of(blaze_fetch::Algo::Blake3, text.as_bytes());
+                let mut sources = blaze_audit::pins::SourcePins::default();
+                for (url, commit) in [("https://example.com/b", "2".repeat(40)), ("https://example.com/a", "1".repeat(40))] {
+                    sources.set_git(blaze_audit::pins::GitPin { url: url.to_owned(), commit, tree: tree(url) });
+                }
+                sources.advisories = Some(blaze_audit::pins::DatabasePin { from: None, tree: tree("db") });
+                sources
+            },
         };
         let text = lock.render();
         let read = BlazeLock::parse(&text, "/w/blaze.lock").unwrap();

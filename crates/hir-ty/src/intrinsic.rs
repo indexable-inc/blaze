@@ -1161,9 +1161,10 @@ mod tests {
 
     #[test]
     fn every_name_is_its_own_intrinsic() {
-        assert_eq!(Intrinsic::COUNT, 384);
-        assert_eq!(BY_INDEX.iter().filter(|intrinsic| !intrinsic.is_legacy()).count(), 284);
-        assert_eq!(BY_INDEX.iter().filter(|intrinsic| intrinsic.is_blaze()).count(), 7);
+        // 385: `blaze_type_name_of` (c716aef755, `core::reflect::name_of`) is blaze's eighth.
+        assert_eq!(Intrinsic::COUNT, 385);
+        assert_eq!(BY_INDEX.iter().filter(|intrinsic| !intrinsic.is_legacy()).count(), 285);
+        assert_eq!(BY_INDEX.iter().filter(|intrinsic| intrinsic.is_blaze()).count(), 8);
         let mut seen = [false; Intrinsic::COUNT];
         for (at, intrinsic) in BY_INDEX.into_iter().enumerate() {
             assert_eq!(usize::from(intrinsic.index()), at, "{intrinsic}");

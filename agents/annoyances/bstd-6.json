@@ -1,0 +1,12 @@
+{
+ "id": "bstd-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+ "where": "blaze check --fix",
+ "what": "`blaze check --fix --lib -p blaze-std` made the suggestions of every crate in the checkout the check reached (blaze-sys, vendor/quinn-proto), not of blaze-std alone, and two of those are wrong as written: `clippy::disallowed_methods` of `std::mem::forget` in blaze-sys (a `no_std` crate) gave E0433 `cannot find module or crate std` at crates/blaze-sys/src/linux/fs.rs, and suggestions in vendor/quinn-proto gave E0432 unresolved imports `crate::connection::Chunks` and five more, E0308 in frame.rs and `bindings_with_variant_name`. Then every effect lint said `into_raw` \"has a body that does not lower to MIR: MissingFunctionDefinition\", which was the unresolved `std` path, not a fault of the effect checks.",
+ "cost": "the 137k-line output read as a compiler bug in MIR lowering until the last twelve lines were read",
+ "cause": "the fixer took every diagnostic whose file is in the checkout; the two lints' fixes were never run on a no_std crate or on quinn-proto",
+ "workaround": "none before the fix",
+ "fix": "fixed for the scope (UnitOf::primary, commit a0a553886 on bstd-builds-1112); the two wrong fixes are still wrong and would show with `--fix -p blaze-sys` and `--fix -p quinn-proto`: a what-if error should name the suggestion that caused it (lint and span), which the fixer can find by bisecting the ops",
+ "state": "fixed for the scope with a0a553886; the wrong fixes open"
+}

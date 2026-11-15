@@ -1,0 +1,19 @@
+{
+ "id": "storegc-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane storegc-1112",
+ "where": "the lane brief of storegc-1112",
+ "what": "The brief said lane disk2-1111 (serve/settle.rs, store format 5) and harness/v2/agents.py were in the integration tree; int-1112 held neither, so the design was read from origin/disk2-1111 with git show and the build could not start.",
+ "cost": "about twenty minutes finding which branch held each file, and one round trip before building",
+ "cause": "the brief was written from what was planned to be merged, not from the tree",
+ "workaround": "git show origin/disk2-1111:<path> into /tmp and designed against that",
+ "fix": "a brief names the commit that holds each file it cites, checked with git ls-tree before it is sent",
+ "whys": [
+  "the brief stated a merge as done",
+  "the merge was queued behind other lanes",
+  "nothing checks a brief paths against the tree it names"
+ ],
+ "class": "brief-states-unverified-fact",
+ "prevention": "integrate.py prints, for a brief, each cited path with whether the integration tip has it",
+ "state": "open"
+}

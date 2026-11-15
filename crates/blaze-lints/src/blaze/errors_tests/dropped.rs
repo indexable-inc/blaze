@@ -52,12 +52,39 @@ pub fn methods() -> Outcome<u32, u32> {
     let _ = read().unwrap_or_default(); //~ dropped_error
     let _ = read().unwrap_or_else(|_| 0); //~ dropped_error
     let _ = read().unwrap_or_else(keep);
-    let _ = read().map_err(|_| 1u32); //~ dropped_error
-    let _ = read().map_err(|_why| 1u32); //~ dropped_error
-    let _ = read().map_err(|error| keep(error));
+    let _kept = read().map_err(|_| 1u32); //~ dropped_error
+    let _kept = read().map_err(|_why| 1u32); //~ dropped_error
+    let _kept = read().map_err(|error| keep(error));
     let _ = quietly!(read()); //~ dropped_error
     read().ok(); //~ dropped_error
     read().map_err(|_| 1u32) //~ dropped_error
+}
+pub struct Reads;
+impl Iterator for Reads {
+    type Item = Outcome<u32, ReadError>;
+    fn next(&mut self) -> Option<Outcome<u32, ReadError>> {
+        None
+    }
+}
+/// A whole `Result` dropped: by `let _`, by an `if let Ok` with no `else`, by
+/// `filter_map(Result::ok)`; an `if let Ok` with an `else` says what happens when it failed.
+pub fn wholes() -> u32 {
+    let _ = read(); //~ dropped_error
+    if let Ok(it) = read() { //~ dropped_error
+        keep(ReadError);
+        let _ = it;
+    }
+    if let Ok(it) = read() {
+        return it;
+    } else {
+        keep(ReadError);
+    }
+    let first = Reads.filter_map(Outcome::ok).next(); //~ dropped_error
+    let kept = Reads.filter_map(|it| it.ok()).next(); //~ dropped_error
+    match (first, kept) {
+        (Some(a), Some(b)) => a + b,
+        _ => 0,
+    }
 }
 #[expect(blaze::dropped_error, reason = "the count is a hint; a failed read is no count")]
 pub fn expected() -> u32 {
@@ -79,8 +106,8 @@ fn dropped_error_leaves_clippys_places_to_clippy() {
     let source = DROPPED
         .replace("    read().ok(); //~ dropped_error", "    read().ok();")
         .replace(
-            "let _ = read().map_err(|_| 1u32); //~ dropped_error",
-            "let _ = read().map_err(|_| 1u32);",
+            "let _kept = read().map_err(|_| 1u32); //~ dropped_error",
+            "let _kept = read().map_err(|_| 1u32);",
         )
         .replace("    read().map_err(|_| 1u32) //~ dropped_error", "    read().map_err(|_| 1u32)");
     let out = check(
