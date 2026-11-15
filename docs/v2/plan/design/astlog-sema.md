@@ -116,6 +116,19 @@ And one over the type behind any references, by the names the std prelude gives:
   unified diff and writes nothing, `--query FILE` prints the rows (one JSON line of
   `Response::Rows` with `--message-format json`) and exits failed when an `error` lint found
   anything.
+- `(include "tools/astlog/rules-sema/lib/calls.astlog")` reads another rules file in place. The
+  daemon's loader resolves it against the view, so an include is versioned with the tree and
+  reads the same for every API client; the request still carries one rules text, and the CLI
+  sends `--query FILE` and `--rules FILE` as they are, flattening nothing. The path is relative
+  to the view's root whichever file includes it, `/`-separated, with no `.` or `..` segment and
+  no leading `/`, and is read through the job's view files (`Files::with_bytes`), never the
+  disk. A file reached by two routes is read once. A path the view does not hold, a cycle
+  (naming the files on it in order) and a path that breaks the rules above are load errors
+  naming the including file and line. A load reads at most 64 files (`MAX_INCLUDED_FILES`) and
+  1 MiB of rules text, the request's own included (`MAX_RULES_BYTES`); the 64-list nesting cap
+  holds each file on its own. Every error from a form in an included file names that file and
+  its line (`tools/astlog/rules-sema/lib/calls.astlog:3:`) where the request's own text says
+  `rules:3:`. A lint finding carries no rules line, so it names none either way.
 
 ## The relations
 
@@ -263,7 +276,7 @@ reference model for a property test only.
 
 | Operation | Floor | This design |
 |---|---|---|
-| Load a rules file | read it once | the same, plus one parse of each pattern |
+| Load a rules file | read it once | the same, plus one parse of each pattern; each included file read once |
 | A code pattern | look at the nodes of the pattern's root kind in files holding its literal tokens | the same: memchr for the pattern's rarest literal token prefilters files, one preorder walk of each survivor |
 | A pattern path | one name resolution per candidate path | the same, memoized per node |
 | `references d` | resolve the names spelled like `d` | memchr for the name, resolve each name with that text |

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use astlog_engine::Line;
 use snafu::Snafu;
 
 /// Every way an astlog run over tree-sitter trees can fail: the engine's errors and this
@@ -27,30 +28,30 @@ pub enum SourceError {
     #[snafu(display("tree-sitter failed to parse {}", path.display()))]
     ParseFile { path: PathBuf },
 
-    #[snafu(display("rules:{line}: unknown language `{name}`"))]
-    UnknownLangName { name: String, line: usize },
+    #[snafu(display("{line}: unknown language `{name}`"))]
+    UnknownLangName { name: String, line: Line },
 
-    #[snafu(display("rules:{line}: invalid tree-sitter query"))]
-    Query { line: usize, source: tree_sitter::QueryError },
+    #[snafu(display("{line}: invalid tree-sitter query"))]
+    Query { line: Line, source: tree_sitter::QueryError },
 
     #[snafu(display(
-        "rules:{line}: `#` predicates are not supported in match queries; \
+        "{line}: `#` predicates are not supported in match queries; \
          constrain with builtin atoms (text/kind/same-text) instead"
     ))]
-    PredicateUnsupported { line: usize },
+    PredicateUnsupported { line: Line },
 
-    #[snafu(display("rules:{line}: capture index {index} out of range for query"))]
-    CaptureIndex { line: usize, index: u32 },
+    #[snafu(display("{line}: capture index {index} out of range for query"))]
+    CaptureIndex { line: Line, index: u32 },
 
     #[snafu(display(
-        "rules:{line}: capture `@{capture}` matched nothing in a match of {} (a `?`, `*` or \
+        "{line}: capture `@{capture}` matched nothing in a match of {} (a `?`, `*` or \
          alternation left it out); give the optional part its own match",
         path.display()
     ))]
-    CaptureAbsent { line: usize, capture: String, path: PathBuf },
+    CaptureAbsent { line: Line, capture: String, path: PathBuf },
 
-    #[snafu(display("rules:{line}: `{name}` needs a node, but `{arg}` is {what}"))]
-    NotNode { line: usize, name: String, arg: String, what: &'static str },
+    #[snafu(display("{line}: `{name}` needs a node, but `{arg}` is {what}"))]
+    NotNode { line: Line, name: String, arg: String, what: &'static str },
 
     #[snafu(display(
         "overlapping rewrites in {}: bytes {first_start}..{first_end} and {second_start}..{second_end}",

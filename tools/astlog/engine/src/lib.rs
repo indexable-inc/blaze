@@ -8,6 +8,8 @@
 
 mod error;
 mod eval;
+mod include;
+mod line;
 mod program;
 mod sexpr;
 
@@ -22,6 +24,8 @@ pub use crate::error::*;
 pub use crate::eval::{
     Binding, Database, Evaluator, Facts, Limits, MAX_ROWS, Relation, Row, Value,
 };
+pub use crate::include::{Base, Includes, MAX_INCLUDED_FILES, MAX_RULES_BYTES};
+pub use crate::line::Line;
 pub use crate::program::{
     Action, AppAtom, BodyAtom, CountAtom, Counted, Language, Lint, Needs, Parsed, Program, Rewrite, Rule,
     Segment, Severity, SourceAction, SourceAtom, Template, TemplateSyntax, Term, TextAction,
@@ -36,7 +40,7 @@ type FError<F> = Error<<<F as Facts>::Lang as Language>::Error>;
 pub struct Planned<'p, N, X> {
     /// The rewrite's name.
     pub rule: &'p str,
-    pub line: usize,
+    pub line: &'p Line,
     pub action: PlannedAction<'p, N, X>,
 }
 
@@ -80,7 +84,7 @@ pub fn run_with<'p, F: Facts>(
     evaluator.fixpoint()?;
     let mut planned = Vec::new();
     for rewrite in &program.rewrites {
-        for binding in evaluator.bindings(&rewrite.body, rewrite.line)? {
+        for binding in evaluator.bindings(&rewrite.body, &rewrite.line)? {
             for action in &rewrite.actions {
                 planned.push(plan(facts, rewrite, action, &binding)?);
             }
@@ -98,7 +102,7 @@ fn plan<'p, F: Facts>(
     let action = match action {
         Action::Text(text) => {
             let target = binding.get(&text.target).ok_or_else(|| {
-                TemplateVarSnafu { var: text.target.clone(), line: text.line }.build()
+                TemplateVarSnafu { var: text.target.clone(), line: &text.line }.build()
             })?;
             let Value::Node(node) = target else {
                 return ReplaceNotNodeSnafu {
@@ -122,7 +126,7 @@ fn plan<'p, F: Facts>(
                 .iter()
                 .map(|term| match term {
                     Term::Var(var) => binding.get(var).cloned().ok_or_else(|| {
-                        TemplateVarSnafu { var: var.clone(), line: source.line }.build()
+                        TemplateVarSnafu { var: var.clone(), line: &source.line }.build()
                     }),
                     Term::Text(text) => Ok(Value::Text(std::sync::Arc::from(text.as_str()))),
                     Term::Int(int) => Ok(Value::Int(*int)),
@@ -131,7 +135,7 @@ fn plan<'p, F: Facts>(
             PlannedAction::Source { name: &source.name, value: &source.value, args }
         }
     };
-    Ok(Planned { rule: &rewrite.name, line: rewrite.line, action })
+    Ok(Planned { rule: &rewrite.name, line: &rewrite.line, action })
 }
 
 /// A template with each variable replaced by its value's text.
@@ -150,7 +154,7 @@ pub fn render<F: Facts>(
             Segment::Lit(lit) => out.push_str(lit),
             Segment::Var(var) => {
                 let value = binding.get(var).ok_or_else(|| {
-                    TemplateVarSnafu { var: var.clone(), line: template.line }.build()
+                    TemplateVarSnafu { var: var.clone(), line: &template.line }.build()
                 })?;
                 out.push_str(&facts.value_text(value));
             }

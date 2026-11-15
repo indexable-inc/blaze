@@ -14,7 +14,7 @@ use std::alloc::{Allocator, Global};
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use astlog_engine::{Facts as _, PlannedAction, Segment, Severity, TextKind, Value, row_binding};
+use astlog_engine::{Base, Facts as _, Includes, Line, PlannedAction, Segment, Severity, TextKind, Value, row_binding};
 use base_db::Db;
 use blaze_api::{Edit, Param};
 use blaze_api::query::{self as api, Cell, Finding, Relation, Rows};
@@ -43,7 +43,7 @@ type Res<T> = Result<T, Error>;
 ///
 /// The rules' load errors, and a relation's failure, each naming its rules line.
 pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Rows> {
-    let program = Program::parse(rules)?;
+    let program = Program::load(rules, &ViewRules(files))?;
     let facts = Sema::new(db, files)?;
     let rewrites = Program { rules: program.rules, rewrites: Vec::new(), lints: program.lints };
     let (database, _) = blaze_query::db::attach(db, || astlog_engine::run(&rewrites, &facts))?;
@@ -90,6 +90,22 @@ pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Rows> {
         by_place(a.at.as_slice(), b.at.as_slice()).then_with(|| a.message.cmp(&b.message))
     });
     Ok(Rows { findings, relations })
+}
+
+/// The view's rules files, for `(include "path")`: a path is relative to the view's root,
+/// whichever file includes it, and is read through the view's files, never the disk, so an
+/// include is versioned with the tree and reads the same for every client.
+struct ViewRules<'f, F>(&'f F);
+
+impl<F: Files> Includes for ViewRules<'_, F> {
+    fn base(&self) -> Base<'_> {
+        Base::Root
+    }
+
+    fn read<R>(&self, key: &str, with: impl FnOnce(&str) -> R) -> std::io::Result<Option<R>> {
+        let read = self.0.with_bytes(key, |bytes| std::str::from_utf8(bytes).map(with));
+        read.transpose().map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
 }
 
 /// Rows in reading order: code by file, then offset, before every other kind of cell.
@@ -139,7 +155,7 @@ pub(crate) fn edit_with<F: Files>(
     edits: &[Edit],
     parens: Parens,
 ) -> Res<Applied> {
-    let program = Program::parse(rules)?;
+    let program = Program::load(rules, &ViewRules(files))?;
     let facts = Sema::new(db, files)?;
     blaze_query::db::attach(db, || {
         let (_, planned) = astlog_engine::run(&program, &facts)?;
@@ -173,12 +189,12 @@ pub(crate) fn edit_with<F: Files>(
 #[derive(Clone, Copy)]
 struct Origin<'p> {
     rule: &'p str,
-    line: usize,
+    line: &'p Line,
 }
 
 impl Origin<'_> {
     fn by(self) -> String {
-        format!("{} (rules:{})", self.rule, self.line)
+        format!("{} ({})", self.rule, self.line)
     }
 }
 
@@ -347,7 +363,7 @@ fn literal_paths<'p, F: Files>(
                 }
                 // An absolute path starts at a crate: one that names nothing is a typo the
                 // rule would write into the code.
-                let defs = facts.items_at(path, text.line)?;
+                let defs = facts.items_at(path, &text.line)?;
                 if let Some(def) = defs.first() {
                     found.push((path.to_owned(), *def));
                 }

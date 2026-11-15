@@ -1,12 +1,15 @@
 //! The rule language: S-expressions lowered into a checked [`Program`] over a fact source's atoms.
 //!
-//! Three top-level forms:
+//! Four top-level forms:
 //!
 //! ```text
 //! (rule (name vars...) body-atom...)
 //! (rewrite name body-atom... action...)
 //! (lint relation-name <error|warning> "message template")
+//! (include "path")
 //! ```
+//!
+//! An include is read in place by [`crate::include`], before the forms are lowered.
 //!
 //! A body atom is a builtin (`text`, `parent`, ...), an atom of the fact source ([`Language`]), a
 //! rule-defined relation, `(not (relation args...))` or `(count c (relation args...))`. Arguments
@@ -26,7 +29,9 @@ use crate::error::{
     RegexSnafu, TemplateVarSnafu, UnboundBuiltinArgSnafu, UnboundHeadVarSnafu,
     UnboundSourceArgSnafu, UnknownRelationSnafu, UnsafeNegationSnafu, UnstratifiableProgramSnafu,
 };
-use crate::sexpr::{self, Sexpr};
+use crate::include::{self, Includes, Nowhere};
+use crate::line::Line;
+use crate::sexpr::Sexpr;
 
 /// What a fact source adds to the language: its atoms, its actions and its template syntax.
 pub trait Language {
@@ -51,7 +56,7 @@ pub trait Language {
     fn parse_atom(
         head: &str,
         args: &[Sexpr],
-        line: usize,
+        line: &Line,
     ) -> Result<Option<Parsed<Self::Atom>>, Error<Self::Error>>;
 
     /// `(head args...)` as one of this source's rewrite actions, or `None`.
@@ -62,7 +67,7 @@ pub trait Language {
     fn parse_action(
         head: &str,
         args: &[Sexpr],
-        line: usize,
+        line: &Line,
     ) -> Result<Option<Parsed<Self::Action>>, Error<Self::Error>>;
 }
 
@@ -132,7 +137,7 @@ pub enum Term {
 pub struct AppAtom {
     pub name: String,
     pub args: Vec<Term>,
-    pub line: usize,
+    pub line: Line,
     /// The compiled pattern of a builtin in [`REGEX_BUILTINS`], compiled once at load.
     pub regex: Option<regex::Regex>,
 }
@@ -159,7 +164,7 @@ pub(crate) const MAX_REGEX_BYTES: usize = 1 << 20;
 fn compile_regex<S: std::error::Error + 'static>(
     name: &str,
     pattern: &str,
-    line: usize,
+    line: &Line,
 ) -> Result<regex::Regex, Error<S>> {
     regex::RegexBuilder::new(pattern)
         .size_limit(MAX_REGEX_BYTES)
@@ -174,7 +179,7 @@ pub struct SourceAtom<A> {
     pub value: A,
     pub args: Vec<Term>,
     pub needs: Needs,
-    pub line: usize,
+    pub line: Line,
 }
 
 /// `(count c (atom args...))`: `c` is the number of distinct rows of the atom that agree with
@@ -185,7 +190,7 @@ pub struct SourceAtom<A> {
 pub struct CountAtom<A> {
     pub result: Term,
     pub inner: Counted<A>,
-    pub line: usize,
+    pub line: Line,
 }
 
 /// What a `(count ...)` counts.
@@ -224,7 +229,7 @@ pub struct Rule<A> {
     pub name: String,
     pub head_vars: Vec<String>,
     pub body: Vec<BodyAtom<A>>,
-    pub line: usize,
+    pub line: Line,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,7 +241,7 @@ pub enum Segment {
 #[derive(Debug)]
 pub struct Template {
     pub segments: Vec<Segment>,
-    pub line: usize,
+    pub line: Line,
 }
 
 /// Which text edit a [`TextAction`] makes at its target node.
@@ -254,7 +259,7 @@ pub struct TextAction {
     pub target: String,
     /// Empty for [`TextKind::Delete`].
     pub template: Template,
-    pub line: usize,
+    pub line: Line,
 }
 
 #[derive(Debug)]
@@ -262,7 +267,7 @@ pub struct SourceAction<X> {
     pub name: String,
     pub value: X,
     pub args: Vec<Term>,
-    pub line: usize,
+    pub line: Line,
 }
 
 #[derive(Debug)]
@@ -276,7 +281,7 @@ pub struct Rewrite<A, X> {
     pub name: String,
     pub body: Vec<BodyAtom<A>>,
     pub actions: Vec<Action<X>>,
-    pub line: usize,
+    pub line: Line,
 }
 
 /// Severity of a lint declaration: errors gate a scan's exit code, warnings report without
@@ -304,7 +309,7 @@ pub struct Lint {
     pub relation: String,
     pub severity: Severity,
     pub message: Template,
-    pub line: usize,
+    pub line: Line,
 }
 
 pub struct Program<L: Language> {
@@ -336,9 +341,21 @@ impl<L: Language> Program<L> {
     /// [`Error::TemplateVar`] when a variable is not bound where it is used;
     /// [`Error::LintSeverity`] / [`Error::LintVar`] for a malformed lint;
     /// [`Error::UnstratifiableProgram`] for negation through recursion; and the source's own
-    /// errors for its atoms.
+    /// errors for its atoms. An `(include ...)` is refused: this text has no place to read one
+    /// from ([`Program::load`] has).
     pub fn parse(src: &str) -> Result<Self, LError<L>> {
-        let forms = sexpr::parse(src)?;
+        Self::load(src, &Nowhere)
+    }
+
+    /// [`Program::parse`], with each `(include "path")` replaced by the forms of the file
+    /// `includes` reads at that path.
+    ///
+    /// # Errors
+    ///
+    /// As [`Program::parse`], for the forms of every file read; and an include that names no
+    /// file, closes a cycle or passes a cap ([`crate::include::forms`]).
+    pub fn load<I: Includes>(src: &str, includes: &I) -> Result<Self, LError<L>> {
+        let forms = include::forms(src, includes)?;
         let mut rules = Vec::new();
         let mut rewrites = Vec::new();
         let mut lints = Vec::new();
@@ -352,7 +369,8 @@ impl<L: Language> Program<L> {
                     return DslSnafu {
                         line: form.line(),
                         message: format!(
-                            "expected (rule ...), (rewrite ...), or (lint ...), got `{other}`"
+                            "expected (rule ...), (rewrite ...), (lint ...) or (include ...), got \
+                             `{other}`"
                         ),
                     }
                     .fail();
@@ -379,7 +397,7 @@ impl<L: Language> Program<L> {
         for rule in &self.rules {
             if builtin(&rule.name).is_some() || L::claims(&rule.name) || is_form(&rule.name) {
                 return DslSnafu {
-                    line: rule.line,
+                    line: &rule.line,
                     message: format!("rule head `{}` shadows a builtin", rule.name),
                 }
                 .fail();
@@ -390,7 +408,7 @@ impl<L: Language> Program<L> {
                     name: rule.name.clone(),
                     expected: expected.unwrap_or(rule.head_vars.len()),
                     got: rule.head_vars.len(),
-                    line: rule.line,
+                    line: &rule.line,
                 }
                 .fail();
             }
@@ -398,7 +416,7 @@ impl<L: Language> Program<L> {
             let bound = check_modes(&rule.body)?;
             for var in &rule.head_vars {
                 if !bound.contains(var.as_str()) {
-                    return UnboundHeadVarSnafu { line: rule.line, var: var.clone() }.fail();
+                    return UnboundHeadVarSnafu { line: &rule.line, var: var.clone() }.fail();
                 }
             }
         }
@@ -445,7 +463,11 @@ impl<L: Language> Program<L> {
             match grew {
                 None => break,
                 Some(name) if pass == passes => {
-                    let line = self.rules.iter().find(|r| r.name == name).map_or(0, |r| r.line);
+                    let line = self
+                        .rules
+                        .iter()
+                        .find(|r| r.name == name)
+                        .map_or(Line::rules(0), |r| r.line.clone()); // clone: the error's
                     let cycle = negative_cycle(&edges).join(", ");
                     return UnstratifiableProgramSnafu { cycle, line }.fail();
                 }
@@ -493,7 +515,7 @@ impl<L: Language> Program<L> {
     /// head variables.
     fn check_lint(&self, lint: &Lint) -> Result<(), LError<L>> {
         let Some(rule) = self.rules.iter().find(|rule| rule.name == lint.relation) else {
-            return UnknownRelationSnafu { name: lint.relation.clone(), line: lint.line }.fail();
+            return UnknownRelationSnafu { name: lint.relation.clone(), line: &lint.line }.fail();
         };
         for segment in &lint.message.segments {
             let Segment::Var(var) = segment else {
@@ -503,7 +525,7 @@ impl<L: Language> Program<L> {
                 return LintVarSnafu {
                     relation: lint.relation.clone(),
                     var: var.clone(),
-                    line: lint.message.line,
+                    line: &lint.message.line,
                 }
                 .fail();
             }
@@ -572,7 +594,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
                     continue;
                 }
                 let expected = *arities.get(app.name.as_str()).ok_or_else(|| {
-                    UnknownRelationSnafu { name: app.name.clone(), line: app.line }.build()
+                    UnknownRelationSnafu { name: app.name.clone(), line: &app.line }.build()
                 })?;
                 check_arity(app, expected, false)?;
                 continue;
@@ -586,7 +608,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
             continue;
         }
         let expected = *arities.get(relation.name.as_str()).ok_or_else(|| {
-            UnknownRelationSnafu { name: relation.name.clone(), line: relation.line }.build()
+            UnknownRelationSnafu { name: relation.name.clone(), line: &relation.line }.build()
         })?;
         check_arity(relation, expected, false)?;
     }
@@ -597,7 +619,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
 /// compiled at load (a variable pattern would make what matches depend on corpus text, which no
 /// rule needs), and `text-capture` binds exactly one variable per capture group.
 fn check_builtin<S: std::error::Error + 'static>(app: &AppAtom, arity: usize) -> Result<(), Error<S>> {
-    let dsl = |message: String| DslSnafu { line: app.line, message }.fail();
+    let dsl = |message: String| DslSnafu { line: &app.line, message }.fail();
     if VARIADIC.contains(&app.name.as_str()) {
         if app.args.len() < arity {
             return dsl(format!(
@@ -709,11 +731,11 @@ fn check_arity<S: std::error::Error + 'static>(
             name: app.name.clone(),
             expected,
             got: app.args.len(),
-            line: app.line,
+            line: &app.line,
         }
         .fail();
     }
-    ArityMismatchSnafu { name: app.name.clone(), expected, got: app.args.len(), line: app.line }
+    ArityMismatchSnafu { name: app.name.clone(), expected, got: app.args.len(), line: &app.line }
         .fail()
 }
 
@@ -743,14 +765,14 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
             BodyAtom::Negation(neg) => {
                 for var in vars(&neg.args) {
                     if !bound.contains(var) {
-                        return UnsafeNegationSnafu { var: var.to_owned(), line: neg.line }.fail();
+                        return UnsafeNegationSnafu { var: var.to_owned(), line: &neg.line }.fail();
                     }
                 }
             }
             BodyAtom::NegatedSource(source) => {
                 for var in vars(&source.args) {
                     if !bound.contains(var) {
-                        return UnsafeNegationSnafu { var: var.to_owned(), line: source.line }
+                        return UnsafeNegationSnafu { var: var.to_owned(), line: &source.line }
                             .fail();
                     }
                 }
@@ -766,7 +788,7 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                 for var in vars(count.inner.args()) {
                     if !bound.contains(var) && mentioned(&body[at + 1..], var) {
                         return DslSnafu {
-                            line: count.line,
+                            line: &count.line,
                             message: format!(
                                 "`{var}` is local to the (count ...) and cannot be used after it"
                             ),
@@ -780,7 +802,7 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                     // result has nothing to equal and the rule derives nothing.
                     if !bound.contains(var.as_str()) && vars(count.inner.args()).any(|it| it == var) {
                         return DslSnafu {
-                            line: count.line,
+                            line: &count.line,
                             message: format!(
                                 "`{var}` is the (count ...)'s result and an argument it counts over; \
                                  name the counted column apart"
@@ -820,7 +842,7 @@ fn builtin_ready<S: std::error::Error + 'static>(
         if let Term::Var(var) = &app.args[need]
             && !bound.contains(var.as_str())
         {
-            return UnboundBuiltinArgSnafu { line: app.line, name: app.name.clone(), arg: var.clone() }
+            return UnboundBuiltinArgSnafu { line: &app.line, name: app.name.clone(), arg: var.clone() }
                 .fail();
         }
     }
@@ -851,7 +873,7 @@ fn source_ready<A, S: std::error::Error + 'static>(
         }
         arg.push_str(&term_display(&source.args[c]));
     }
-    UnboundSourceArgSnafu { line: source.line, name: source.name.clone(), arg }.fail()
+    UnboundSourceArgSnafu { line: &source.line, name: source.name.clone(), arg }.fail()
 }
 
 /// The variable names among `args`.
@@ -874,15 +896,15 @@ fn check_action<X, S: std::error::Error + 'static>(
     action: &Action<X>,
     bound: &HashSet<&str, Global>,
 ) -> Result<(), Error<S>> {
-    let (line, mut used): (usize, Vec<&str>) = match action {
+    let (line, mut used): (&Line, Vec<&str>) = match action {
         Action::Text(text) => {
             let template = text.template.segments.iter().filter_map(|segment| match segment {
                 Segment::Var(var) => Some(var.as_str()),
                 Segment::Lit(_) => None,
             });
-            (text.line, template.collect())
+            (&text.line, template.collect())
         }
-        Action::Source(source) => (source.line, vars(&source.args).collect()),
+        Action::Source(source) => (&source.line, vars(&source.args).collect()),
     };
     if let Action::Text(text) = action {
         used.push(&text.target);
@@ -903,12 +925,12 @@ fn expect_list<'a, S: std::error::Error + 'static>(
         return DslSnafu { line: form.line(), message: format!("{what} must be a list") }.fail();
     };
     let Some((Sexpr::Atom { text, .. }, rest)) = items.split_first() else {
-        return DslSnafu { line: *line, message: format!("{what} must start with an atom") }.fail();
+        return DslSnafu { line, message: format!("{what} must start with an atom") }.fail();
     };
     Ok((text, rest))
 }
 
-fn parse_rule<L: Language>(items: &[Sexpr], line: usize) -> Result<Rule<L::Atom>, LError<L>> {
+fn parse_rule<L: Language>(items: &[Sexpr], line: Line) -> Result<Rule<L::Atom>, LError<L>> {
     let Some((head, body)) = items.split_first() else {
         return DslSnafu { line, message: "(rule ...) needs a head".to_owned() }.fail();
     };
@@ -929,7 +951,7 @@ fn parse_rule<L: Language>(items: &[Sexpr], line: usize) -> Result<Rule<L::Atom>
 
 fn parse_rewrite<L: Language>(
     items: &[Sexpr],
-    line: usize,
+    line: Line,
 ) -> Result<Rewrite<L::Atom, L::Action>, LError<L>> {
     let Some((Sexpr::Atom { text: name, .. }, rest)) = items.split_first() else {
         return DslSnafu { line, message: "(rewrite ...) needs a name".to_owned() }.fail();
@@ -968,7 +990,7 @@ fn parse_action<L: Language>(form: &Sexpr) -> Result<Option<Action<L::Action>>, 
         "insert-before" => TextKind::InsertBefore,
         "insert-after" => TextKind::InsertAfter,
         other => {
-            return Ok(L::parse_action(other, args, form.line())?.map(|parsed| {
+            return Ok(L::parse_action(other, args, &form.line())?.map(|parsed| {
                 Action::Source(SourceAction {
                     name: other.to_owned(),
                     value: parsed.value,
@@ -985,7 +1007,7 @@ fn parse_action<L: Language>(form: &Sexpr) -> Result<Option<Action<L::Action>>, 
         (
             TextKind::Replace | TextKind::InsertBefore | TextKind::InsertAfter,
             [Sexpr::Atom { text: target, .. }, Sexpr::Str { text: template, line }],
-        ) => (target, parse_template::<L::Error>(L::TEMPLATE, template, *line)?),
+        ) => (target, parse_template::<L::Error>(L::TEMPLATE, template, line)?),
         _ => {
             let shape = if kind == TextKind::Delete { "var" } else { "var \"template\"" };
             return DslSnafu {
@@ -998,7 +1020,7 @@ fn parse_action<L: Language>(form: &Sexpr) -> Result<Option<Action<L::Action>>, 
     Ok(Some(Action::Text(TextAction { kind, target: target.clone(), template, line: form.line() })))
 }
 
-fn parse_lint<L: Language>(items: &[Sexpr], line: usize) -> Result<Lint, LError<L>> {
+fn parse_lint<L: Language>(items: &[Sexpr], line: Line) -> Result<Lint, LError<L>> {
     let [
         Sexpr::Atom { text: relation, .. },
         Sexpr::Atom { text: severity, line: severity_line },
@@ -1015,13 +1037,13 @@ fn parse_lint<L: Language>(items: &[Sexpr], line: usize) -> Result<Lint, LError<
         "error" => Severity::Error,
         "warning" => Severity::Warning,
         other => {
-            return LintSeveritySnafu { got: other.to_owned(), line: *severity_line }.fail();
+            return LintSeveritySnafu { got: other.to_owned(), line: severity_line }.fail();
         }
     };
     Ok(Lint {
         relation: relation.clone(),
         severity,
-        message: parse_template(L::TEMPLATE, message, *message_line)?,
+        message: parse_template(L::TEMPLATE, message, message_line)?,
         line,
     })
 }
@@ -1079,7 +1101,7 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
         return Ok(BodyAtom::Count(CountAtom { result, inner, line: form.line() }));
     }
     if builtin(name).is_none()
-        && let Some(parsed) = L::parse_atom(name, args, form.line())?
+        && let Some(parsed) = L::parse_atom(name, args, &form.line())?
     {
         return Ok(BodyAtom::Source(SourceAtom {
             name: name.to_owned(),
@@ -1092,7 +1114,7 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
     let args = terms(args)?;
     let regex = match args.get(1) {
         Some(Term::Text(pattern)) if REGEX_BUILTINS.contains(&name) => {
-            Some(compile_regex(name, pattern, form.line())?)
+            Some(compile_regex(name, pattern, &form.line())?)
         }
         _ => None,
     };
@@ -1113,7 +1135,7 @@ pub fn terms<S: std::error::Error + 'static>(args: &[Sexpr]) -> Result<Vec<Term>
             }
             Sexpr::Str { text, .. } => Ok(Term::Text(text.clone())),
             Sexpr::List { line, .. } => DslSnafu {
-                line: *line,
+                line,
                 message: "atom arguments are variables, numbers or strings".to_owned(),
             }
             .fail(),
@@ -1137,7 +1159,7 @@ fn parse_int(text: &str) -> Option<i64> {
 pub fn parse_template<S: std::error::Error + 'static>(
     syntax: TemplateSyntax,
     template: &str,
-    line: usize,
+    line: &Line,
 ) -> Result<Template, Error<S>> {
     match syntax {
         TemplateSyntax::Braces => parse_braces(template, line),
@@ -1147,7 +1169,7 @@ pub fn parse_template<S: std::error::Error + 'static>(
 
 fn parse_braces<S: std::error::Error + 'static>(
     template: &str,
-    line: usize,
+    line: &Line,
 ) -> Result<Template, Error<S>> {
     let mut segments = Vec::new();
     let mut lit = String::new();
@@ -1195,13 +1217,13 @@ fn parse_braces<S: std::error::Error + 'static>(
     if !lit.is_empty() {
         segments.push(Segment::Lit(lit));
     }
-    Ok(Template { segments, line })
+    Ok(Template { segments, line: line.clone() })
 }
 
 /// `$name`, `${name}` and `$$$name` splice `name`; `$$` is a literal `$`.
 fn parse_dollar<S: std::error::Error + 'static>(
     template: &str,
-    line: usize,
+    line: &Line,
 ) -> Result<Template, Error<S>> {
     // A variable name starts with a letter or `_`, so `$5` is no variable.
     let ident = |rest: &str| {
@@ -1248,5 +1270,5 @@ fn parse_dollar<S: std::error::Error + 'static>(
     if !lit.is_empty() {
         segments.push(Segment::Lit(lit));
     }
-    Ok(Template { segments, line })
+    Ok(Template { segments, line: line.clone() })
 }

@@ -26,6 +26,7 @@ use crate::error::{
     TooManyBindingsSnafu,
     TooManyRowsSnafu, TooManySourceRowsSnafu,
 };
+use crate::line::Line;
 use crate::program::{AppAtom, BodyAtom, CASES, Counted, Language, Program, Term};
 
 /// One value in a relation row.
@@ -71,7 +72,7 @@ pub trait Facts {
     fn solve(
         &self,
         atom: &<Self::Lang as Language>::Atom,
-        line: usize,
+        line: &Line,
         inputs: &[Option<Value<Self::Node>>],
         out: &mut Vec<Row<Self::Node>>,
     ) -> Result<(), FError<Self>>;
@@ -236,15 +237,15 @@ enum Step<'p, A, N> {
     NotBuiltin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>> },
     /// `occurrence` keys the atom's answers in [`Evaluator::asked`]: one per atom in the program
     /// text, so two occurrences never share answers they might not agree on.
-    Source { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
-    NotSource { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
+    Source { atom: &'p A, line: &'p Line, args: Vec<Arg<N>>, occurrence: usize },
+    NotSource { atom: &'p A, line: &'p Line, args: Vec<Arg<N>>, occurrence: usize },
 }
 
 /// What a `(count ...)` step reads its rows from.
 enum Counting<'p, A> {
     Scan { relation: usize, index: Option<usize> },
     Builtin { builtin: Builtin, app: &'p AppAtom },
-    Source { atom: &'p A, line: usize, occurrence: usize },
+    Source { atom: &'p A, line: &'p Line, occurrence: usize },
 }
 
 /// A source atom occurrence and the inputs it was asked with.
@@ -266,7 +267,7 @@ struct CompiledRule<'p, A, N> {
     relation: usize,
     head: Vec<usize>,
     body: Body<'p, A, N>,
-    line: usize,
+    line: &'p Line,
 }
 
 /// The most rows one run holds at once by default ([`Limits::DEFAULT`]). A rule's join can
@@ -355,7 +356,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            this.rules.push(CompiledRule { relation, head, body, line: rule.line });
+            this.rules.push(CompiledRule { relation, head, body, line: &rule.line });
         }
         Ok(this)
     }
@@ -376,13 +377,13 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             let step = match atom {
                 BodyAtom::Source(source) => Step::Source {
                     atom: &source.value,
-                    line: source.line,
+                    line: &source.line,
                     args: args(&mut names, &source.args, true),
                     occurrence: self.occurrence(),
                 },
                 BodyAtom::NegatedSource(source) => Step::NotSource {
                     atom: &source.value,
-                    line: source.line,
+                    line: &source.line,
                     args: args(&mut names, &source.args, false),
                     occurrence: self.occurrence(),
                 },
@@ -421,7 +422,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                         },
                         Counted::Source(source) => Counting::Source {
                             atom: &source.value,
-                            line: source.line,
+                            line: &source.line,
                             occurrence: self.occurrence(),
                         },
                     };
@@ -449,7 +450,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         &self,
         occurrence: usize,
         atom: &<F::Lang as Language>::Atom,
-        line: usize,
+        line: &Line,
         inputs: Vec<Option<Value<F::Node>>>,
     ) -> Result<Rc<Vec<Row<F::Node>>>, FError<F>> {
         let key = (occurrence, inputs);
@@ -738,7 +739,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             match value(at)? {
                 Value::Node(node) => Ok(node),
                 other => BuiltinNotNodeSnafu {
-                    line: app.line,
+                    line: &app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: other.what(),
@@ -750,7 +751,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             let n = node(at)?;
             facts.span(n).ok_or_else(|| {
                 BuiltinNotNodeSnafu {
-                    line: app.line,
+                    line: &app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: "not syntax",
@@ -762,7 +763,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             match value(at)? {
                 Value::Int(int) => Ok(int),
                 other => BuiltinNotNumberSnafu {
-                    line: app.line,
+                    line: &app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: other.what(),
@@ -862,7 +863,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     .fail();
                 };
                 let cased = recase(&text, case).ok_or_else(|| {
-                    CaseNotIdentifierSnafu { line: app.line, text: text.as_ref() }.build()
+                    CaseNotIdentifierSnafu { line: &app.line, text: text.as_ref() }.build()
                 })?;
                 vec![vec![subject, style, Value::Text(Arc::from(cased.as_str()))]]
             }
@@ -888,7 +889,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
     pub fn bindings(
         &mut self,
         atoms: &'p [BodyAtom<<F::Lang as Language>::Atom>],
-        line: usize,
+        line: &Line,
     ) -> Result<Vec<Binding<F::Node>>, FError<F>> {
         let body = self.compile(atoms)?;
         let mut out = Vec::new();

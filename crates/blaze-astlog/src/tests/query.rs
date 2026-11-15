@@ -230,7 +230,7 @@ fn matches_itself_on_a_small_stack(form: crate::pattern::Form, text: String) -> 
     std::thread::Builder::new()
         .stack_size(SMALL_STACK)
         .spawn(move || {
-            let pattern = crate::pattern::Pattern::parse(form, &text, 1).unwrap();
+            let pattern = crate::pattern::Pattern::parse(form, &text, &astlog_engine::Line::rules(1)).unwrap();
             let file = syntax::SourceFile::parse(&code, syntax::Edition::CURRENT);
             let target = file
                 .root()
@@ -258,10 +258,10 @@ fn the_deepest_pattern_the_cap_admits_matches_on_a_small_stack_and_one_deeper_is
     ];
     for (form, shape) in shapes {
         let deepest = (1..1000)
-            .take_while(|n| crate::pattern::Pattern::parse(form, &shape(*n), 1).is_ok())
+            .take_while(|n| crate::pattern::Pattern::parse(form, &shape(*n), &astlog_engine::Line::rules(1)).is_ok())
             .last()
             .expect("one level is admitted");
-        let error = crate::pattern::Pattern::parse(form, &shape(deepest + 1), 1).unwrap_err().to_string();
+        let error = crate::pattern::Pattern::parse(form, &shape(deepest + 1), &astlog_engine::Line::rules(1)).unwrap_err().to_string();
         assert!(error.starts_with("rules:1:") && error.contains("levels deep"), "{error}");
         assert!(matches_itself_on_a_small_stack(form, shape(deepest)), "{}", shape(deepest));
     }

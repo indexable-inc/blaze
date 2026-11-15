@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ops::Range;
 
-use astlog_engine::{Facts, Row, Value};
+use astlog_engine::{Facts, Line, Row, Value};
 use base_db::{Db, FileId};
 use blaze_hash::HashMap;
 use blaze_intent::Files;
@@ -253,7 +253,7 @@ impl<'a, F: Files> Sema<'a, F> {
 
     /// The items a def path names: [`blaze_intent::replace::items_at`], then an associated
     /// item by name of the type or trait the rest of the path names.
-    pub fn items_at(&self, path: &str, line: usize) -> Res<Vec<ModuleDef>> {
+    pub fn items_at(&self, path: &str, line: &Line) -> Res<Vec<ModuleDef>> {
         let path = path.trim().trim_start_matches("::");
         if let Some(seen) = self.paths.borrow().get(path) {
             return Ok(seen.clone()); // clone: a few defs
@@ -362,7 +362,7 @@ impl<'a, F: Files> Sema<'a, F> {
 
     /// The defs a def path names: [`Sema::items_at`]'s, or else the field of that name of the
     /// struct, union or variant the rest of the path names (`lib::S::field`, `lib::P::0`).
-    fn defs_at(&self, path: &str, line: usize) -> Res<Vec<Def>> {
+    fn defs_at(&self, path: &str, line: &Line) -> Res<Vec<Def>> {
         let missed = match self.items_at(path, line) {
             Ok(items) => return Ok(items.into_iter().map(Def::Item).collect()),
             Err(missed) => missed,
@@ -703,7 +703,7 @@ impl<'a, F: Files> Sema<'a, F> {
                 }
             }
             TypeShape::Def(path, args) => {
-                let defs = self.items_at(&pattern.paths[path], pattern.line)?;
+                let defs = self.items_at(&pattern.paths[path], &pattern.line)?;
                 let is = defs.iter().any(|def| match def {
                     ModuleDef::Adt(adt) => ty.as_adt() == Some(*adt),
                     ModuleDef::BuiltinType(it) => ty.as_builtin() == Some(*it),
@@ -813,7 +813,7 @@ impl<'a, F: Files> Sema<'a, F> {
         })
     }
 
-    fn filter(&self, filter: Filter, node: ast::Node<'a>, line: usize) -> Res<bool> {
+    fn filter(&self, filter: Filter, node: ast::Node<'a>, line: &Line) -> Res<bool> {
         let tree = self.tree_at(self.tree(node));
         Ok(match filter {
             // The two split an expansion's nodes: those whose text is the call's input, which
@@ -958,7 +958,7 @@ impl<'a, F: Files> Sema<'a, F> {
         }
     }
 
-    fn need_syn(&self, value: &Option<Value<Node>>, name: &'static str, line: usize) -> Res<ast::Node<'a>> {
+    fn need_syn(&self, value: &Option<Value<Node>>, name: &'static str, line: &Line) -> Res<ast::Node<'a>> {
         match value {
             Some(Value::Node(node)) => self.view_of(*node).ok_or_else(|| {
                 WrongValueSnafu { line, name, needs: "a syntax node", arg: "its first argument", what: "a def or a type" }
@@ -977,7 +977,7 @@ impl<'a, F: Files> Sema<'a, F> {
         }
     }
 
-    fn need_def(&self, value: &Option<Value<Node>>, name: &'static str, line: usize) -> Res<Option<Def>> {
+    fn need_def(&self, value: &Option<Value<Node>>, name: &'static str, line: &Line) -> Res<Option<Def>> {
         match value {
             Some(Value::Node(node @ Node::Def(_))) => Ok(self.def_at(*node)),
             Some(Value::Node(node @ Node::Syn { .. })) => {
@@ -1005,14 +1005,14 @@ impl<'a, F: Files> Sema<'a, F> {
         out: &mut Vec<Row<Node>>,
     ) -> Res<()> {
         let trees = match &inputs[0] {
-            Some(_) => vec![self.tree(self.need_syn(&inputs[0], "a pattern", pattern.line)?)],
+            Some(_) => vec![self.tree(self.need_syn(&inputs[0], "a pattern", &pattern.line)?)],
             None => self.searched(pattern.literal.as_deref()),
         };
         for &tree in &trees {
             let edition = self.tree_at(tree).file.edition(self.db);
             if pattern.reads_otherwise.contains(&edition) {
                 return PatternEditionSnafu {
-                    line: pattern.line,
+                    line: &pattern.line,
                     form: pattern.form.name(),
                     text: &pattern.text,
                     parsed: syntax::Edition::CURRENT.number(),
@@ -1024,7 +1024,7 @@ impl<'a, F: Files> Sema<'a, F> {
             }
         }
         let candidates: Vec<ast::Node<'a>> = match &inputs[0] {
-            Some(_) => vec![self.need_syn(&inputs[0], "a pattern", pattern.line)?],
+            Some(_) => vec![self.need_syn(&inputs[0], "a pattern", &pattern.line)?],
             None => trees
                 .into_iter()
                 .flat_map(|tree| {
@@ -1034,7 +1034,7 @@ impl<'a, F: Files> Sema<'a, F> {
                 .collect(),
         };
         let mut resolves = |path: usize, target: ast::Node<'a>| -> Res<bool> {
-            let defs = self.items_at(&pattern.paths[path], pattern.line)?;
+            let defs = self.items_at(&pattern.paths[path], &pattern.line)?;
             Ok(match self.resolve(target) {
                 Some(Def::Item(def)) => defs.contains(&def),
                 _ => false,
@@ -1067,7 +1067,7 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
     fn solve(
         &self,
         atom: &Atom,
-        line: usize,
+        line: &Line,
         inputs: &[Option<Value<Node>>],
         out: &mut Vec<Row<Node>>,
     ) -> Res<()> {
@@ -1452,7 +1452,7 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
 }
 
 /// The error of a type relation given `what` where its type goes.
-fn not_a_type(line: usize, name: &'static str, what: &'static str) -> Error {
+fn not_a_type(line: &Line, name: &'static str, what: &'static str) -> Error {
     WrongValueSnafu { line, name, needs: "a type", arg: "its first argument", what }.build().into()
 }
 
