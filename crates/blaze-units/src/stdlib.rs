@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cfg;
 pub mod scripts;
 pub mod target;
 #[cfg(test)]

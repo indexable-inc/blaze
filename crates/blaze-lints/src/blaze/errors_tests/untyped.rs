@@ -16,9 +16,10 @@ pub struct Error;
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 "#;
 
-/// A library's signatures: `String`, `Box<dyn Error>` and `anyhow::Error` errors anywhere in a
-/// return or parameter type are findings, renamed or written by a macro; a typed error, a
-/// `String` that is no error and a trait impl's method (found at the trait) are none.
+/// A library's signatures: `String`, `&str` (any lifetime), `Box<dyn Error>` and `anyhow::Error`
+/// errors anywhere in a return or parameter type are findings, renamed, through a local alias
+/// or written by a macro; a typed error (an alias of one too), a `String` or `&str` that is no
+/// error and a trait impl's method (found at the trait) are none.
 #[test]
 fn untyped_error_in_a_library() {
     let crates = format!("{ERROR_CRATES}//- /src/lib.rs crate:main deps:hir_ty,alloc,anyhow\n");
@@ -47,6 +48,21 @@ pub fn nested() -> Option<Result<u32, Text>> { //~ untyped_error
     None
 }
 pub fn typed() -> Result<u32, ParseError> {
+    Ok(0)
+}
+pub fn str_error() -> Result<u32, &'static str> { //~ untyped_error
+    Ok(0)
+}
+pub fn str_borrowed<'a>(_r: Result<u32, &'a str>) {} //~ untyped_error
+pub fn str_value() -> Result<&'static str, ParseError> {
+    Err(ParseError::Empty)
+}
+pub type Res<T> = Result<T, Text>;
+pub fn aliased() -> Res<u32> { //~ untyped_error
+    Ok(0)
+}
+pub type Typed<T> = Result<T, ParseError>;
+pub fn typed_alias() -> Typed<u32> {
     Ok(0)
 }
 pub fn text() -> Text {

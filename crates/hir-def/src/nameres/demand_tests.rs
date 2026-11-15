@@ -207,7 +207,9 @@ fn signatures_lower_no_body() {
         }
         _ = macros_declaring_roots(&db, krate);
     });
-    assert!(executed.iter().any(|it| it.contains("crate_local_def_map")), "{executed:#?}");
+    // The crate's resolution ran here: `crate_resolution`, the per-crate query
+    // (`crate_local_def_map` routes to it and is no query of its own).
+    assert!(executed.iter().any(|it| it.contains("::crate_resolution(")), "{executed:#?}");
     assert_eq!(lowering(&executed), Vec::<&String>::new());
 }
 

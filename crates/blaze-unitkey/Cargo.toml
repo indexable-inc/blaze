@@ -30,6 +30,8 @@ intern.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# std's graph and each std unit's cfg (`stdlib::cfg`), the command's one source, for `std_tests`.
+blaze-units.workspace = true
 
 [lints]
 workspace = true

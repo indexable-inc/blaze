@@ -19,6 +19,8 @@
 //! Spans are never in a record that is hashed: they sit in a side table ([`Spans`]), and a
 //! record names one by [`SpanRef`].
 
+#![feature(allocator_api)]
+
 pub mod cursor;
 pub mod hex;
 pub mod leb;
@@ -28,6 +30,7 @@ mod schema;
 pub mod tiers;
 
 use std::{
+    alloc::{Allocator, Global},
     fmt,
     marker::PhantomData,
     mem::{align_of, offset_of, size_of},
@@ -678,9 +681,9 @@ fn verify(buffer: &[u8], key: ContentId) -> Result<(), FormatError> {
 
 /// Appends records to one buffer, aligned, and gives each a place for the [`Rel`]s of others.
 /// Padding between records is zeros, so equal values written in the same order are equal
-/// bytes.
-pub struct Writer {
-    pub bytes: Vec<u8>,
+/// bytes. The buffer is in `A`, the caller's allocator ([`Writer::new_in`]).
+pub struct Writer<A: Allocator = Global> {
+    pub bytes: Vec<u8, A>,
 }
 
 fn align_up(at: usize, align: usize) -> usize {
@@ -690,13 +693,20 @@ fn align_up(at: usize, align: usize) -> usize {
 
 impl Writer {
     pub fn new(schema: SchemaHash) -> Writer {
-        Writer::with_buffer(schema, Vec::with_capacity(4096))
+        Writer::with_buffer(schema, Vec::with_capacity_in(4096, Global))
+    }
+}
+
+impl<A: Allocator> Writer<A> {
+    /// [`Writer::new`] with its buffer in `alloc`: [`Writer::finish`] hands back a `Vec<u8, A>`.
+    pub fn new_in(schema: SchemaHash, alloc: A) -> Writer<A> {
+        Writer::with_buffer(schema, Vec::with_capacity_in(4096, alloc))
     }
 
     /// [`Writer::new`] over `bytes`, cleared and keeping its capacity: a caller that writes
     /// many values hands each [`Writer::finish`]'s buffer back, and once it has grown a write
     /// allocates nothing.
-    pub fn with_buffer(schema: SchemaHash, mut bytes: Vec<u8>) -> Writer {
+    pub fn with_buffer(schema: SchemaHash, mut bytes: Vec<u8, A>) -> Writer<A> {
         bytes.clear();
         bytes.extend_from_slice(&MAGIC);
         bytes.extend_from_slice(&schema.0.0);
@@ -728,13 +738,22 @@ impl Writer {
         at
     }
 
+    /// Where `bytes` were written, at a multiple of [`ALIGN`]: a buffer of this format held
+    /// inside another (a record's payload) is then opened where it is, with no copy, since
+    /// [`open`] takes only a buffer aligned to [`ALIGN`].
+    pub fn push_buffer(&mut self, bytes: &[u8]) -> u64 {
+        let at = self.pad(ALIGN);
+        self.bytes.extend_from_slice(bytes);
+        at
+    }
+
     /// Where `text` was written, for a [`Str`] of `text.len()` bytes.
     pub fn push_str(&mut self, text: &str) -> u64 {
         self.push_slice(text.as_bytes())
     }
 
     /// The buffer, with `root` as its root record.
-    pub fn finish(mut self, root: u64) -> Vec<u8> {
+    pub fn finish(mut self, root: u64) -> Vec<u8, A> {
         assert!(
             root >= HEADER_LEN as u64 && root < self.bytes.len() as u64,
             "the root is not a record of this buffer"

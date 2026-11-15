@@ -116,7 +116,7 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
         stalls.look(pid, pulse);
         let progress = Progress {
             jobs: pool.ended(),
-            queries: blaze_query::db::completed(),
+            queries: blaze_memo::completed() + blaze_query::db::completed(),
             steps: pulse.moved(),
             working: 0,
         };
@@ -202,7 +202,7 @@ fn watch_turns(
         }
         let progress = Progress {
             jobs: pool.ended(),
-            queries: blaze_query::db::completed(),
+            queries: blaze_memo::completed() + blaze_query::db::completed(),
             steps: turns,
             working: 0,
         };

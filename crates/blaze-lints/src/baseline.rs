@@ -260,9 +260,18 @@ pub const TARGET_FILE: &str = "TARGET";
 /// is no lint's baseline, so [`read`] passes it by.
 pub const ALLOC_SITES_FILE: &str = "alloc-sites.txt";
 
+/// The file of a baselines directory that holds the untyped-error ratchet's count per crate of
+/// the function signatures and type aliases whose error is untyped (`String`, `&str`,
+/// `Box<dyn Error>`, `anyhow`): `scripts/src/bin/untyped.rs` reads and writes it, and it is no
+/// lint's baseline, so [`read`] passes it by.
+pub const UNTYPED_ERRORS_FILE: &str = "untyped-errors.txt";
+
 /// Whether `name`, a file of a baselines directory, is one that is not a lint's baseline.
 fn not_a_baseline(name: &std::ffi::OsStr) -> bool {
-    name == TARGET_FILE || name == ALLOC_SITES_FILE || name == items::FILE
+    name == TARGET_FILE
+        || name == ALLOC_SITES_FILE
+        || name == UNTYPED_ERRORS_FILE
+        || name == items::FILE
 }
 
 /// The target the baselines in `dir` count, from its [`TARGET_FILE`]; none when it has none.
@@ -610,6 +619,11 @@ mod tests {
         assert!(
             check(&dir, &Counts::new()).is_ok(),
             "the allocation ratchet's counts are not a lint's baseline"
+        );
+        std::fs::write(dir.join(UNTYPED_ERRORS_FILE), "blaze-core\t1\t0\t0\t0\t0\n").unwrap();
+        assert!(
+            check(&dir, &Counts::new()).is_ok(),
+            "the untyped-error ratchet's counts are not a lint's baseline"
         );
         std::fs::write(dir.join("alloc-sites.txt.bak"), "").unwrap();
         assert!(

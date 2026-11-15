@@ -83,7 +83,7 @@ fn bounds_checks(body: &hir_ty::mir::MirBody<'_>) -> usize {
 /// used.
 fn run_pass(db: &Db, proved: Option<ProofKey>) -> (usize, usize, Vec<Fact>) {
     let caller = function(db, "caller");
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let owner = MirOwner::Body(InferBodyId::DefWithBodyId(caller.into()));
         let runtime = mir_at(db, owner, MirStage::Runtime).unwrap_or_else(|err| panic!("{err:?}"));
         // clone: the query's body is kept; the pass changes a copy

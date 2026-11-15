@@ -20,6 +20,7 @@ triomphe.workspace = true
 
 base-db.workspace = true
 blaze-ids.workspace = true
+blaze-memo.workspace = true
 blaze-query.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true
@@ -31,9 +32,12 @@ intern.workspace = true
 proc-macro-api.workspace = true
 span.workspace = true
 syntax.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 blaze-core.workspace = true
+# The fact boundaries a build's database is made with (`reads::mark_boundaries`).
+blaze-item-hash.workspace = true
 blaze-items.workspace = true
 blaze-sim.workspace = true
 

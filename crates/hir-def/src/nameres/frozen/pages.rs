@@ -71,7 +71,7 @@ use crate::{
     item_scope::ItemScope,
     nameres::{
         DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, ModuleData, ModuleOrigin,
-        Modules, ModulesMap, ModulesSlot, OwnedRecords, RecordsSlot, ScopeSlot,
+        ModulesMap, ModulesSlot, OwnedRecords, RecordsSlot, ScopeSlot,
     },
     per_ns::{Item, PerNs},
     unstable_features::UnstableFeatures,
@@ -91,10 +91,19 @@ const MAGIC: [u8; 8] = *b"blzdmpg\0";
 /// module's whole scope. Refused by the header like any other.
 /// Layout 2 wrote a module's names twice, in its scope segment and as entries, and had no
 /// runs of entries in its rows.
-pub const LAYOUT: u32 = 3;
+/// Layout 3 named the crates of the closure by their index in the reader's own walk of it
+/// alone: a reader whose dependencies were of another set or order decoded another crate's
+/// items, silently. Layout 4 writes the closure segment ([`closure_of`]).
+pub const LAYOUT: u32 = 4;
 
 /// Bytes of the header.
-const HEADER: usize = 56;
+const HEADER: usize = 64;
+/// Bytes of a crate's key in the closure segment.
+const CRATE_KEY: usize = 32;
+
+/// What a crate whose pages name a crate of their closure that its closure here has not (or
+/// has twice) is refused as ([`closure_of`]).
+pub const CLOSURE: &str = "the crate closure of def map pages";
 /// Bytes of a module's row.
 const ROW: usize = 64;
 /// Bytes of a name table's slot.
@@ -199,7 +208,7 @@ pub(super) fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from(u32_at(bytes, at)) | u64::from(u32_at(bytes, at + 4)) << 32
 }
 
-/// The header: where the rows, the files, the head and the tail are.
+/// The header: where the rows, the files, the head, the tail and the closure are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Header {
     modules: u32,
@@ -208,6 +217,9 @@ struct Header {
     tail: (u32, u32),
     rows_at: u32,
     total: u32,
+    /// The closure segment: the crates every crate index in the record is an index into,
+    /// each by its item key ([`Crate::item_key`]) and name ([`closure_segment`]).
+    closure: (u32, u32),
 }
 
 impl Header {
@@ -225,6 +237,8 @@ impl Header {
             self.tail.1,
             self.rows_at,
             self.total,
+            self.closure.0,
+            self.closure.1,
         ] {
             out.extend_from_slice(&it.to_le_bytes());
         }
@@ -266,8 +280,124 @@ impl Header {
             tail: pair(40),
             rows_at: u32_at(bytes, 48),
             total: u32_at(bytes, 52),
+            closure: pair(56),
         })
     }
+}
+
+/// The closure segment of `closure`, the crates in [`closure`](super::closure)'s order: their
+/// count, then each crate's item key ([`CRATE_KEY`] bytes) and its name (its byte length, then
+/// its bytes; empty for a crate with none). Every number is a little-endian `u32`.
+fn closure_segment(db: &Db, closure: &[Crate]) -> R<Vec<u8>> {
+    let count = u32::try_from(closure.len()).map_err(|_| "a closure of over 2^32 crates")?;
+    // alloc: encoding, once per crate per write of its pages
+    let mut out = Vec::with_capacity(4 + closure.len() * (CRATE_KEY + 16));
+    out.extend_from_slice(&count.to_le_bytes());
+    for &krate in closure {
+        out.extend_from_slice(&krate.item_key(db).0);
+        let name = krate.rust_name(db).map_or("", |it| it.as_str());
+        let len = u32::try_from(name.len()).map_err(|_| "a crate name over 4 GiB")?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+    }
+    Ok(out)
+}
+
+/// The entries of a closure segment ([`closure_segment`]): each crate's item key and name.
+fn closure_entries(bytes: &[u8]) -> R<Vec<(ContentId, &str)>> {
+    let mut at = 0usize;
+    let mut take = |len: usize| -> R<&[u8]> {
+        let part = at.checked_add(len).and_then(|end| bytes.get(at..end));
+        // alloc: error path
+        let part = part.ok_or_else(|| format!("a closure segment of {} bytes read past at {at}", bytes.len()))?;
+        at += len;
+        Ok(part)
+    };
+    let count = u32_at(take(4)?, 0) as usize;
+    // alloc: the entries, once per crate read from pages; never more than the bytes hold
+    let mut entries = Vec::with_capacity(count.min(bytes.len() / (CRATE_KEY + 4)));
+    for _ in 0..count {
+        let key = ContentId(*take(CRATE_KEY)?.first_chunk().ok_or("a crate key")?);
+        let len = u32_at(take(4)?, 0) as usize;
+        let name = std::str::from_utf8(take(len)?).map_err(|_| "a crate name that is not UTF-8")?;
+        entries.push((key, name));
+    }
+    if at != bytes.len() {
+        // alloc: error path
+        return Err(format!("a closure segment with {} bytes after its {count} crates", bytes.len() - at));
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The check a test removed: the crates of a record's closure taken by their index in this
+    /// database's own walk of `krate`'s closure, its keys not read ([`matched_closure`]), as
+    /// layout 3 took them.
+    pub(crate) static POSITIONAL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// The crates of `krate`'s pages in `source`, in the order the record names them by index:
+/// each of its closure segment's crates matched by item key to a crate of `krate`'s closure
+/// here, the first to `krate` itself (the record is given to `krate`: its own key is what it
+/// was given under, and moves with its dependencies' order, which the rest need not).
+///
+/// `Err((kind, why))`: bytes that do not read (kind [`KIND`]), or a crate the pages name that
+/// `krate`'s closure here has not, or has two of (kind [`CLOSURE`]), each named by its name and
+/// key. So a reader whose dependencies are of another set or order resolves the same crates as
+/// the writer, or is refused; never another crate's items.
+///
+/// Floor: one read of the header and of the closure segment, and one item key a crate of the
+/// closure here (memoized), once per crate given ([`closure_of`]); nothing per reference.
+// dyn: the crate's one source
+fn matched_closure(
+    db: &Db,
+    krate: Crate,
+    source: &dyn PageSource,
+) -> Result<Vec<Crate>, (&'static str, String)> {
+    let header = read(source, 0, HEADER as u32, Header::parse).map_err(|why| (KIND, why))?;
+    let mine = super::closure(db, krate);
+    #[cfg(test)]
+    if POSITIONAL.with(core::cell::Cell::get) {
+        return Ok(mine);
+    }
+    read(source, header.closure.0, header.closure.1, |bytes| {
+        let entries = closure_entries(bytes)?;
+        // alloc: once per crate given, a crate of its closure here a key
+        let mut by_key: HashMap<ContentId, Crate, Global> = HashMap::with_capacity_in(mine.len(), Global);
+        for &it in &mine[1..] {
+            if let Some(other) = by_key.insert(it.item_key(db), it) {
+                // alloc: error path
+                return Ok(Err(format!(
+                    "the crates `{}` and `{}` of its closure here share the item key {}",
+                    other.named(db),
+                    it.named(db),
+                    it.item_key(db)
+                )));
+            }
+        }
+        // alloc: once per crate given, a crate of its record's closure
+        let mut matched = Vec::with_capacity(entries.len());
+        matched.push(krate);
+        for &(key, name) in entries.iter().skip(1) {
+            match by_key.get(&key) {
+                Some(&it) => matched.push(it),
+                // alloc: error path
+                None => {
+                    return Ok(Err(format!(
+                        "its pages name the crate `{name}` (item key {key}), which no crate of its \
+                         closure here is (rule keys-cover-every-input)"
+                    )));
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Err("a closure segment of no crate, where the first is the crate itself".to_owned());
+        }
+        Ok(Ok(matched))
+    })
+    .map_err(|why| (KIND, why))?
+    .map_err(|why| (CLOSURE, why))
 }
 
 /// One open-addressed table of a module's: where its slots are, how many (a power of two, or
@@ -425,47 +555,41 @@ impl std::fmt::Debug for Paged {
     }
 }
 
-/// The crates whose `DefMap` is read from pages, set by whoever has the records: read
-/// outside queries alone ([`all`]). A query reads its crate's own ([`PagesSlot`], [`paged`]).
-#[blaze_query::input(singleton, debug)]
-pub struct PagedDefMaps {
-    #[returns(ref)]
-    pub maps: Arc<HashMap<Crate, Paged, Global>>,
+/// The fact a crate's pages slot is read by: the slot's id, of the crate's own stable id, and
+/// the record's key as its digest (equal keys are equal bytes).
+pub fn pages_fact(krate_id: ContentId, paged: &Paged) -> blaze_memo::Fact {
+    blaze_memo::Fact { id: ContentId::of("hir-def def map pages slot", &krate_id.0), digest: paged.key }
 }
 
-/// Has name resolution read each crate of `maps` from its pages.
-pub fn set(db: &mut Db, maps: HashMap<Crate, Paged, Global>) {
-    use blaze_query::db::{Durability, Setter};
-    // clone: the handle of the map set before, to tell which crates' pages move
-    let was = PagedDefMaps::try_get(&*db).map(|it| it.maps(&*db).clone());
-    crate::deps::given::give_changed::<PagesSlot, Paged>(db, was.as_deref(), &maps);
-    // alloc: once per serve that changes which crates are read from pages
-    let maps = Arc::new(maps);
-    match PagedDefMaps::try_get(db) {
-        Some(it) => {
-            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
-        }
-        None => {
-            _ = PagedDefMaps::new(db, Durability::HIGH, maps);
-        }
-    }
+/// Has name resolution read each crate of `entries` from its pages from the commit of `edit`
+/// on: each crate is given its pages in its own slot ([`PagesSlot`]), read by the fact given
+/// with them ([`pages_fact`]). Called by the driver in an edit of the world; how many crates'
+/// slots moved.
+pub fn give(
+    edit: &mut base_db::Edit<'_>,
+    entries: impl IntoIterator<Item = (Crate, blaze_memo::Fact, Paged)>,
+) -> usize {
+    crate::deps::given::give_each::<PagesSlot, Paged>(edit, entries)
 }
 
-/// The crates read from pages, to add to or take from.
-pub fn all(db: &Db) -> HashMap<Crate, Paged, Global> {
-    // clone: what was set before, once per serve that changes it
-    PagedDefMaps::try_get(db).map(|it| (**it.maps(db)).clone()).unwrap_or_default()
+/// A test's [`give`] of `maps` in the next commit of `db`, each slot named by its record's
+/// key.
+#[cfg(test)]
+pub(crate) fn set_for_test(db: &mut Db, maps: HashMap<Crate, Paged, Global>) {
+    let mut edit = db.edit();
+    give(
+        &mut edit,
+        maps.into_iter().map(|(krate, paged)| (krate, pages_fact(paged.key, &paged), paged)),
+    );
+    _ = edit.commit();
 }
 
-/// The pages of `krate`, by value: a [`set`] that leaves them as they were is backdated here,
-/// so it runs none of the queries of `krate` again.
-#[blaze_query::tracked(returns(as_ref))]
-pub(super) fn paged(db: &Db, krate: Crate) -> Option<Paged> {
-    // clone: a count of the source and a key
-    krate.given::<PagesSlot, Paged>(db).cloned()
+/// The pages of `krate`, a read of its own slot (the getter notes the slot's fact).
+pub(super) fn paged(db: &Db, krate: Crate) -> Option<&Paged> {
+    krate.given::<PagesSlot, Paged>(db)
 }
 
-/// The kind of a crate's slot holding its entry of [`PagedDefMaps`].
+/// The kind of a crate's slot holding its def map pages.
 pub struct PagesSlot;
 
 /// Whether `krate` is read from pages.
@@ -473,8 +597,364 @@ pub fn is_paged(db: &Db, krate: Crate) -> bool {
     paged(db, krate).is_some()
 }
 
+/// What a crate's records are refused as when one of its files is asked for its text and is
+/// not there, or not as its pages name it ([`demand_text`]).
+pub const KEYED_FILE: &str = "file given by its address";
+
+/// One file of a crate given by its address ([`crate::deps::give_keyed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedFile {
+    /// The file's name as the crate's files table writes it: its path from the crate's root
+    /// directory, or a marked name (the root, a file of an `OUT_DIR`, a file outside the VFS).
+    pub path: Box<str, Global>,
+    /// The file id this database gave it: the crate's root file for the root, else a file id
+    /// made for it when it was given, with no text until the driver sets one.
+    pub file: FileId,
+    /// The content ID the crate's pages were made from it with.
+    pub content: ContentId,
+}
+
+impl KeyedFile {
+    /// Whether this is the crate's root ([`super::ROOT`]): true for exactly one file of a crate,
+    /// whose `file` is the crate data's `root_file_id`.
+    pub fn is_root(&self) -> bool {
+        &*self.path == super::ROOT
+    }
+}
+
+/// The files a crate given by its address has: every file its own pages name, each with the
+/// file id this database gave it, trusted as read at `address` (the record's address, which
+/// covers what the crate was made from: rule verify-once). Its slot ([`KeyedFilesSlot`]) is
+/// what [`Dec::files`] reads instead of looking a file up.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KeyedFiles {
+    address: ContentId,
+    /// Sorted by path, each once.
+    files: Box<[KeyedFile], Global>,
+    /// Indexes into `files`, sorted by file id: what [`KeyedFiles::of_file`] searches.
+    by_file: Box<[u32], Global>,
+}
+
+impl KeyedFiles {
+    /// `files` of a crate whose record is at `address`: sorted here; a name twice is an error
+    /// naming it.
+    pub(crate) fn new(
+        address: ContentId,
+        given: impl IntoIterator<Item = KeyedFile>,
+    ) -> R<KeyedFiles> {
+        let mut files: Vec<KeyedFile, Global> = Vec::new_in(Global);
+        files.extend(given);
+        files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        if let Some(pair) = files.windows(2).find(|pair| pair[0].path == pair[1].path) {
+            // alloc: error path
+            return Err(format!("its pages name {:?} twice", pair[0].path));
+        }
+        let mut by_file = Vec::with_capacity_in(files.len(), Global);
+        by_file.extend(0..files.len() as u32);
+        by_file.sort_unstable_by_key(|&at| files[at as usize].file);
+        Ok(KeyedFiles { address, files: files.into_boxed_slice(), by_file: by_file.into_boxed_slice() })
+    }
+
+    /// The address of the record the files were given from.
+    pub fn address(&self) -> ContentId {
+        self.address
+    }
+
+    /// Every file, sorted by its name.
+    pub fn files(&self) -> &[KeyedFile] {
+        &self.files
+    }
+
+    /// The file named `path`, by one binary search.
+    pub fn find(&self, path: &str) -> Option<&KeyedFile> {
+        let at = self.files.binary_search_by(|it| (*it.path).cmp(path)).ok()?;
+        Some(&self.files[at])
+    }
+
+    /// The file whose id is `file`, by one binary search.
+    pub fn of_file(&self, file: FileId) -> Option<&KeyedFile> {
+        let at = self.by_file.binary_search_by_key(&file, |&at| self.files[at as usize].file).ok()?;
+        Some(&self.files[self.by_file[at] as usize])
+    }
+}
+
+/// The kind of a crate's slot holding the files it was given by its address with.
+pub struct KeyedFilesSlot;
+
+/// The fact a crate's keyed files slot is read by: the slot's id, of the crate's own stable
+/// id, and the digest of the record's address and each file's name and content. The file ids
+/// are left out: they are this database's, and two databases that give one record make the
+/// same reads of it (rule 25).
+pub fn keyed_files_fact(krate_id: ContentId, keyed: &KeyedFiles) -> blaze_memo::Fact {
+    let mut hasher = blaze_ids::Hasher::new("hir-def keyed files");
+    hasher.id(&keyed.address);
+    for file in keyed.files.iter() {
+        hasher.part(file.path.as_bytes()).id(&file.content);
+    }
+    let id = ContentId::of("hir-def keyed files slot", &krate_id.0);
+    blaze_memo::Fact { id, digest: hasher.finish() }
+}
+
+/// The files `krate` was given by its address with, a read of its own slot; `None` for a
+/// crate not given so.
+pub fn keyed_files(db: &Db, krate: Crate) -> Option<&KeyedFiles> {
+    krate.given::<KeyedFilesSlot, KeyedFiles>(db)
+}
+
+/// One entry of the files table of a crate's pages, as [`named_files`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedFile {
+    /// The index in the crate's closure of the crate the file is of: 0 is the crate itself.
+    pub owner: u32,
+    pub path: Box<str, Global>,
+    pub content: ContentId,
+}
+
+/// The files the pages in `source` name, read from their header and files segment alone, with
+/// no database: what giving a crate by its address reads of its pages
+/// ([`crate::deps::give_keyed`]). The header is checked as [`head`] checks it.
+// dyn: the crate's one source
+pub fn named_files<A: core::alloc::Allocator>(
+    source: &dyn PageSource,
+    alloc: A,
+) -> R<Vec<NamedFile, A>> {
+    let header = read(source, 0, HEADER as u32, Header::parse)?;
+    if u64::from(header.total) != source.size() {
+        // alloc: error path
+        return Err(format!(
+            "a record of {} bytes whose header says {}",
+            source.size(),
+            header.total
+        ));
+    }
+    read(source, header.files.0, header.files.1, |bytes| {
+        let mut r = Reader::new(bytes);
+        let n = r.uleb32()? as usize;
+        let mut named = Vec::with_capacity_in(n.min(bytes.len()), alloc);
+        for _ in 0..n {
+            let (owner, path, content) = super::file_entry(&mut r)?;
+            named.push(NamedFile { owner, path: Box::from(path), content });
+        }
+        r.finish()?;
+        Ok(named)
+    })
+}
+
+/// Makes the files of `krate`, whose pages are `paged` and whose record is at `address`, for
+/// giving it by its address: each file its own pages name, the root as the crate's root file
+/// and every other a new file id in the root's source root, with no text (`edit`'s
+/// [`base_db::Edit::new_file_id`]). Reads the pages' header and files segment alone.
+///
+/// The rule: a crate given by its address has exactly one root, its crate data's
+/// `root_file_id` (which the crate graph names and a driver sets the root's text on), and its
+/// pages name it by the mark [`super::ROOT`] (every crate root is so written, `ENCODING` 24),
+/// never by a path. Pages that name no root of their own crate are refused.
+///
+/// Each file, the root too, is known by the content its pages name ([`base_db::GivenFile`]):
+/// `file_content` answers it while the file has no text, so two files of the crate share an
+/// entry set, a file's index or a macro's tokens only where their contents are equal, and no
+/// file of it is `FileText::no_text`.
+///
+/// # Panics
+///
+/// Where the crate's root file is in no source root (`base_db::Db::file_source_root`): every
+/// crate's root is.
+pub(crate) fn make_keyed_files(
+    edit: &mut base_db::Edit<'_>,
+    krate: Crate,
+    paged: &Paged,
+    address: ContentId,
+) -> R<KeyedFiles> {
+    let named = named_files(&*paged.source, Global)?;
+    let (root, source_root) = {
+        let db = edit.db();
+        let root = krate.data(db).root_file_id;
+        (root, db.file_source_root(root).source_root_id(db))
+    };
+    // Where each file is put in the root's source root: the path its name gives from the
+    // root's directory here, so a path a call of the crate resolves again (an `include!` the
+    // def map's pages name, `hir_expand`'s `relative_file` by `Db::resolve_path`) finds this
+    // file, the one the pages name, and never a file on disk. Without it such a path named no
+    // file of the snapshot, the read fell to `Db::included_source`, which a sealed database
+    // answers with nothing, and the pages' `include!` was refused as "another file than was
+    // written". A name with no path here (a file outside the VFS, `INCLUDED`) is put nowhere:
+    // its call is refused naming it.
+    let (dir, real) = {
+        let (dir, real, _) = super::root_dir(edit.db(), krate)?;
+        (dir, real)
+    };
+    let out = super::out_dir(edit.db(), krate);
+    let mut placed: Vec<(FileId, base_db::VfsPath), Global> = Vec::new_in(Global);
+    let mut files: Vec<KeyedFile, Global> = Vec::with_capacity_in(named.len(), Global);
+    // A file of another crate of the closure is that crate's to give: its own pages name it.
+    for entry in named.into_iter().filter(|it| it.owner == 0) {
+        let file = match &*entry.path == super::ROOT {
+            true => root,
+            false => {
+                // alloc: error path
+                let file = edit.new_file_id().ok_or_else(|| {
+                    format!("no file id is left for {:?}", entry.path)
+                })?;
+                edit.set_file_source_root(file, source_root);
+                let full = match entry.path.strip_prefix(super::OUT) {
+                    Some(rest) => out.as_ref().map(|out| format!("{out}{rest}")),
+                    None if entry.path.starts_with(super::INCLUDED) => None,
+                    None => Some(super::joined(&dir, &entry.path)),
+                };
+                if let Some(full) = full {
+                    placed.push((file, super::vfs_path(real, full)));
+                }
+                file
+            }
+        };
+        // The file's content, while it has no text, is the one its pages name: every set found
+        // by a file's content (`hir_expand::declarative::stored::file_set`) is this file's own.
+        edit.set_file_given(file, Some(entry.content));
+        files.push(KeyedFile { path: entry.path, file, content: entry.content });
+    }
+    if !files.iter().any(KeyedFile::is_root) {
+        // alloc: error path
+        return Err("pages that name no root of their own crate (`\\0ROOT`)".to_owned());
+    }
+    #[cfg(test)]
+    let placed = if UNPLACED.with(core::cell::Cell::get) { Vec::new_in(Global) } else { placed };
+    if !placed.is_empty() {
+        edit.put_in_source_root(source_root, placed);
+    }
+    KeyedFiles::new(address, files)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The cause a test removed: a crate given by its address with its files put in no source
+    /// root ([`make_keyed_files`]'s `placed` left out), as before an `include!` of it was found
+    /// by the name its pages give.
+    pub(crate) static UNPLACED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Refuses, typed, a read of the text of `file`, written in `krate`, where `krate` was given by
+/// its address and `file` has no text in this snapshot: what a demanded body of such a crate
+/// (or anything else read off its syntax) finds before it parses. Text that is here is
+/// today's, whatever its whole content: the key the pages were found by is the proof. Nothing for a crate not given so, nor for a file it was not given
+/// (a file outside its pages: the parse's own answer stands).
+///
+/// Read unrecorded: the answer is either nothing or a stop, and when nothing, the parse that
+/// follows reads the file's text recorded. The stop names the crate and the file by its name
+/// in the crate's pages ([`Unreadable`], kind [`KEYED_FILE`]), never a panic of the text's
+/// reader.
+pub(crate) fn demand_text(db: &Db, krate: Crate, file: hir_expand::HirFileId) {
+    demand_text_of(db, krate, || file.original_file(db).file_id(db));
+}
+
+/// [`demand_text`] as hir-expand asks it (`hir_expand::declarative::stored::Demand`): before
+/// a file's index, a definition's squeeze or a declarative macro's expander is made from a
+/// file's text, whether or not the database keeps entries.
+pub(crate) struct ForExpansion;
+
+impl hir_expand::declarative::stored::Demand for ForExpansion {
+    fn demand_text(&self, db: &Db, krate: Crate, file: base_db::EditionedFileId) {
+        demand_text(db, krate, hir_expand::HirFileId::FileId(file));
+    }
+
+    fn missing_ast_id(&self, db: &Db, file: FileId, id: span::ErasedFileAstId) {
+        missing_ast_id(db, file, id);
+    }
+}
+
+/// Refuses, typed ([`Unreadable`], kind [`KEYED_FILE`]), a lookup of the item `id` in `file`
+/// where `file` is of a crate given by its address and its text here has no such item: the
+/// crate's pages name it, so they were given under a key this text is not of (rule
+/// keys-cover-every-input). What a key that left an input out meets, at the one place it is
+/// met; nothing is checked before (the key is the proof, rule 74). Nothing for a file of no
+/// crate given so: the lookup's own panic stands, a bug of its asker.
+fn missing_ast_id(db: &Db, file: FileId, id: span::ErasedFileAstId) {
+    let memo = blaze_memo::Database::memo(db);
+    let refused = blaze_memo::unrecorded(memo, || {
+        base_db::relevant_crates(db, file).iter().find_map(|&krate| {
+            let keyed = keyed_files(db, krate)?;
+            let named = keyed.of_file(file)?;
+            let name = if named.is_root() { "its root" } else { &*named.path };
+            // alloc: error path
+            Some((
+                krate,
+                format!(
+                    "{name} ({file:?}) has no item {id:?} in its text here, which its pages (given at {:?}) name: \
+                     they were given under a key this text is not of (rule keys-cover-every-input)",
+                    keyed.address
+                ),
+            ))
+        })
+    });
+    if let Some((krate, why)) = refused {
+        Unreadable::of(db, krate, KEYED_FILE, why).throw()
+    }
+}
+
+/// The fact hir-expand's [`ForExpansion`] demand is read by: one value, the same for every
+/// database (it holds nothing), so giving it again marks nothing.
+pub(crate) fn demand_fact() -> blaze_memo::Fact {
+    blaze_memo::Fact {
+        id: ContentId::of("hir-def text demand", &[]),
+        digest: ContentId::of("hir-def pages::demand_text", &[]),
+    }
+}
+
+/// Has the session arena of the snapshot `edit` builds ask [`demand_text`] before hir-expand
+/// reads a file's text: what a crate given by its address needs of every database it is given
+/// in (`deps::give_keyed`).
+pub(crate) fn give_demand(edit: &mut base_db::Edit<'_>) {
+    let fact = demand_fact();
+    edit.set_given(
+        None,
+        fact,
+        Box::new_in(
+            move |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+                hir_expand::declarative::stored::set_demand(
+                    inputs,
+                    fact,
+                    std::sync::Arc::new_in(ForExpansion, Global),
+                );
+            },
+            Global,
+        ),
+    );
+}
+
+/// [`demand_text`] of the root file of `krate`: what reading the crate's blaze edition off its
+/// root's leading attributes needs (`base_db::Crate::blaze_edition`).
+pub(crate) fn demand_root_text(db: &Db, krate: Crate) {
+    demand_text_of(db, krate, || krate.data(db).root_file_id);
+}
+
+/// [`demand_text`] of the file `file` gives, asked only for a crate given by its address.
+fn demand_text_of(db: &Db, krate: Crate, file: impl FnOnce() -> FileId) {
+    let memo = blaze_memo::Database::memo(db);
+    let refused = blaze_memo::unrecorded(memo, || {
+        let keyed = keyed_files(db, krate)?;
+        let file = file();
+        let named = keyed.of_file(file)?;
+        let name = if named.is_root() { "its root" } else { &*named.path };
+        // A file with text here is read as it is: the pages were found by a key that holds
+        // what they are a function of (the unit's text outside bodies, no comment or
+        // whitespace), so they are this text's (rule 74: the key is the proof). Its whole
+        // content is not compared: a body or comment edit moves it and no page, and comparing
+        // it refused every body of a crate after any edit to its file. A key that left an
+        // input out is met where a page names an item the text has not ([`missing_ast_id`]).
+        // alloc: error path
+        (!db.has_file_text(file)).then(|| {
+            format!(
+                "{name} ({file:?}) is not in this snapshot: the crate was given by its address ({:?}), and its text was asked for (a body of it demanded, or something read off its syntax) and never set",
+                keyed.address
+            )
+        })
+    });
+    if let Some(why) = refused {
+        Unreadable::of(db, krate, KEYED_FILE, why).throw()
+    }
+}
+
 /// A module of a crate read from pages: what a `ScopeSlot::Paged` names.
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+#[blaze_memo::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct PagedScope {
     #[returns(copy)]
     pub(crate) krate: Crate,
@@ -524,19 +1004,27 @@ pub(in crate::nameres) fn shadows_primitive(db: &Db, krate: Crate) -> Option<boo
     is_paged(db, krate).then(|| head(db, krate).shadows_primitive)
 }
 
-/// `krate` and the crates it depends on, as [`closure`] lists them: what every segment's
-/// reader names crates by, made once a crate and not once a read.
-#[blaze_query::tracked(returns(ref))]
-fn closure_of(db: &Db, krate: Crate) -> Vec<Crate> {
-    closure(db, krate)
+/// The crates the pages of `krate` name by index, matched by key to this database's
+/// ([`matched_closure`]): what every segment's reader names crates by, checked once a crate
+/// and taken by every read after, never checked per reference (rule 74). Pages that name a
+/// crate its closure here has not are refused, typed ([`Unreadable`], kind [`CLOSURE`]).
+#[blaze_memo::tracked(returns(copy))]
+fn closure_of<'db>(db: &'db Db, krate: Crate) -> &'db [Crate] {
+    let Some(paged) = paged(db, krate) else {
+        // alloc: error path
+        Unreadable::of(db, krate, KIND, "the crate has no pages".to_owned()).throw()
+    };
+    match matched_closure(db, krate, &*paged.source) {
+        Ok(closure) => blaze_memo::keep_slice(blaze_memo::Database::memo(db), &closure),
+        Err((kind, why)) => Unreadable::of(db, krate, kind, why).throw(),
+    }
 }
 
 /// The head of the pages of `krate`. Depends on which pages the crate has and on the files
 /// they name.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn head(db: &Db, krate: Crate) -> Head {
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
+    // The value is the record's: the read of the crate's pages slot (`paged`) notes its fact.
     let Some(paged) = paged(db, krate) else {
         // alloc: error path
         Unreadable::of(db, krate, KIND, "the crate has no pages".to_owned()).throw()
@@ -560,13 +1048,14 @@ pub(super) fn segment<'a>(
         db,
         r: Reader::new(bytes),
         krate,
-        closure: Cow::Borrowed(closure_of(db, krate).as_slice()),
+        closure: Cow::Borrowed(closure_of(db, krate)),
         paths: HashMap::new_in(Global),
         files: Cow::Borrowed(files),
         // alloc: none until the segment names a macro call
         calls: Vec::new(),
         // alloc: none until the segment names a syntax context
         contexts: Vec::new(),
+        ctx_arena: None,
         own: Cow::Borrowed(own),
         in_def_map: true,
         modules: HashMap::new_in(Global),
@@ -594,6 +1083,7 @@ fn read_head(db: &Db, krate: Crate, source: &dyn PageSource) -> R<Head> {
     })?;
     let files = read(source, header.files.0, header.files.1, |bytes| {
         let mut dec = Dec::new(db, krate, bytes);
+        dec.closure = Cow::Borrowed(closure_of(db, krate));
         dec.files()?;
         dec.finish()?;
         // alloc: the head's own files, once per crate read from pages
@@ -633,8 +1123,12 @@ pub fn unreadable(db: &Db, krate: Crate, source: &dyn PageSource) -> Option<Stri
                 header.total
             ));
         }
+        // The closure matched as `closure_of` matches it: pages that name a crate this
+        // database's closure has not are the serve's error, before they are given.
+        let closure = matched_closure(db, krate, source).map_err(|(_, why)| why)?;
         read(source, header.files.0, header.files.1, |bytes| {
             let mut dec = Dec::new(db, krate, bytes);
+            dec.closure = Cow::Owned(closure);
             dec.files()?;
             dec.finish()
         })
@@ -648,12 +1142,11 @@ pub(super) fn served(db: &Db, krate: Crate) -> (DefMap, LocalDefMap) {
     let head = head(db, krate);
     let module = |index: usize| {
         let HeadModule { origin, visibility, parent, children: _ } = &head.modules[index];
-        let paged = PagedScope::new(db, krate, index as u32);
         ModuleData {
             origin: *origin,
             visibility: *visibility,
             parent: *parent,
-            scope: ScopeSlot::Paged(blaze_query::db::AsId::as_id(&paged)),
+            scope: ScopeSlot::Paged(PagedScope::new(db, krate, index as u32)),
         }
     };
     // clone: a count of the crate's data
@@ -667,8 +1160,7 @@ pub(super) fn served(db: &Db, krate: Crate) -> (DefMap, LocalDefMap) {
     for (index, &id) in head.own.iter().enumerate() {
         table.insert(id, module(index));
     }
-    let modules = Modules::new(db, def_map.root, table);
-    def_map.modules = ModulesSlot::Collected(blaze_query::db::AsId::as_id(&modules));
+    def_map.modules = ModulesSlot::Collected(table);
     def_map.prelude = head.prelude;
     // clone: the crate's `#[macro_use]` prelude, once per crate read from pages
     def_map.macro_use_prelude = head.macro_use_prelude.clone();
@@ -678,48 +1170,8 @@ pub(super) fn served(db: &Db, krate: Crate) -> (DefMap, LocalDefMap) {
     (def_map, local)
 }
 
-/// What a read of one of a paged scope's memos was of.
-pub(crate) enum PagedRead {
-    /// One name, in the scope's namespaces or among its textual macros.
-    Name(Name),
-    Traits,
-    /// The whole scope, decoded.
-    Whole,
-}
-
-/// The crate and paged scope a read of one of this file's memos was of, and what of it
-/// (`crate::nameres::name_read`): `name` is the memo's name as the engine has it, `key` its
-/// key. `None` for a row that is no memo of a scope (the head, the tail, the crate's slot).
-pub(crate) fn read_of(
-    db: &Db,
-    name: &str,
-    key: blaze_query::db::Id,
-) -> Option<(Crate, blaze_query::db::Id, PagedRead)> {
-    use blaze_query::db::AsId;
-    let (paged, of) = match name {
-        "name_memo" => {
-            let (paged, name) = name_memo::arguments(db, key)?;
-            (paged, PagedRead::Name(name))
-        }
-        "legacy_macro_memo" => {
-            let (paged, name) = legacy_macro_memo::arguments(db, key)?;
-            (paged, PagedRead::Name(name))
-        }
-        "scope_memo" => (key_of(db, key).0, PagedRead::Whole),
-        "traits_memo" => (key_of(db, key).0, PagedRead::Traits),
-        _ => return None,
-    };
-    Some((paged.krate(db), paged.as_id(), of))
-}
-
-/// The place of the paged scope `paged`'s module in its crate's table of modules.
-pub(crate) fn paged_index(db: &Db, paged: blaze_query::db::Id) -> usize {
-    key_of(db, paged).2
-}
-
-fn key_of(db: &Db, paged: blaze_query::db::Id) -> (PagedScope, Crate, usize) {
-    let paged = <PagedScope as blaze_query::db::FromId>::from_id(paged);
-    (paged, paged.krate(db), paged.module(db) as usize)
+fn key_of(db: &Db, paged: PagedScope) -> (Crate, usize) {
+    (paged.krate(db), paged.module(db) as usize)
 }
 
 /// The source of the pages of `krate`, with its head.
@@ -731,8 +1183,8 @@ fn source_of(db: &Db, krate: Crate) -> R<(&dyn PageSource, &Head)> {
 
 /// What `name` means in the module `paged` names, read now from the page it is on: for the
 /// one memo of a path segment (`Modules::name`), which keeps the answer.
-pub(in crate::nameres) fn name_now(db: &Db, paged: blaze_query::db::Id, name: &Name) -> PerNs {
-    let (_, krate, module) = key_of(db, paged);
+pub(in crate::nameres) fn name_now(db: &Db, paged: PagedScope, name: &Name) -> PerNs {
+    let (krate, module) = key_of(db, paged);
     match look_up(db, krate, module, name) {
         Ok(found) => found,
         Err(why) => {
@@ -874,9 +1326,8 @@ fn trait_of(dec: &mut Dec<'_>) -> R<TraitId> {
     }
 }
 
-/// What the impls maintainer is handed of one module of a crate read from pages: its impls,
-/// its built-in derive impls and the traits it declares, in its scope's order
-/// (`delta::diff::Items::add`'s reads of a scope).
+/// What a reader of the impls of one module of a crate read from pages is handed: its impls,
+/// its built-in derive impls and the traits it declares, in its scope's order.
 pub(in crate::nameres) struct ModuleItems {
     pub(in crate::nameres) impls: Vec<ImplId>,
     pub(in crate::nameres) derive_impls: Vec<BuiltinDeriveImplId>,
@@ -916,24 +1367,22 @@ pub(in crate::nameres) fn module_items(db: &Db, krate: Crate, module: usize) -> 
 
 /// What `name` means in the module `paged` names, kept: for a reader that has the module's
 /// row and not the `DefMap` (`ModuleData::name_in_scope`).
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn name_memo(db: &Db, paged: PagedScope, name: Name) -> PerNs {
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
-    name_now(db, blaze_query::db::AsId::as_id(&paged), &name)
+    // The value is the record's: the read of the crate's pages slot notes its fact.
+    name_now(db, paged, &name)
 }
 
-pub(in crate::nameres) fn name(db: &Db, paged: blaze_query::db::Id, name: Name) -> PerNs {
-    name_memo(db, key_of(db, paged).0, name)
+pub(in crate::nameres) fn name(db: &Db, paged: PagedScope, name: Name) -> PerNs {
+    name_memo(db, paged, name)
 }
 
 /// The whole scope of the module `paged` names, decoded: for a reader of all of it. A name
 /// looked up never asks for this.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn scope_memo(db: &Db, paged: PagedScope) -> ItemScope {
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
-    let (krate, module) = (paged.krate(db), paged.module(db) as usize);
+    // The value is the record's: the read of the crate's pages slot notes its fact.
+    let (krate, module) = key_of(db, paged);
     let scope = source_of(db, krate).and_then(|(source, head)| {
         let row = *head.rows.get(module).ok_or("a module the pages have no row of")?;
         let mut scope = ItemScope::default();
@@ -1033,58 +1482,47 @@ fn run_ends(run: &[u8], at: usize) -> R {
     }
 }
 
-pub(in crate::nameres) fn scope(db: &Db, paged: blaze_query::db::Id) -> &ItemScope {
-    scope_memo(db, key_of(db, paged).0)
+pub(in crate::nameres) fn scope(db: &Db, paged: PagedScope) -> &ItemScope {
+    scope_memo(db, paged)
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn legacy_macro_memo(db: &Db, paged: PagedScope, name: Name) -> Option<Box<[MacroId]>> {
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
-    let (krate, module) = (paged.krate(db), paged.module(db) as usize);
+#[blaze_memo::tracked(returns(copy))]
+fn legacy_macro_memo<'db>(db: &'db Db, paged: PagedScope, name: Name) -> Option<&'db [MacroId]> {
+    // The value is the record's: the read of the crate's pages slot notes its fact.
+    let (krate, module) = key_of(db, paged);
     match look_up_legacy(db, krate, module, &name) {
-        Ok(found) => found,
+        Ok(found) => found.map(|ids| blaze_memo::keep_slice(blaze_memo::Database::memo(db), &ids)),
         Err(why) => {
-            // alloc: error path
             let why = format!("textual macro `{}` in module {module}: {why}", name.as_str());
             Unreadable::of(db, krate, KIND, why).throw()
         }
     }
 }
 
-pub(in crate::nameres) fn legacy_macro(
-    db: &Db,
-    paged: blaze_query::db::Id,
-    name: Name,
-) -> Option<&[MacroId]> {
-    legacy_macro_memo(db, key_of(db, paged).0, name).as_deref()
+pub(in crate::nameres) fn legacy_macro(db: &Db, paged: PagedScope, name: Name) -> Option<&[MacroId]> {
+    legacy_macro_memo(db, paged, name)
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn traits_memo(db: &Db, paged: PagedScope) -> Box<[TraitId]> {
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
-    let (krate, module) = (paged.krate(db), paged.module(db) as usize);
+#[blaze_memo::tracked(returns(copy))]
+fn traits_memo<'db>(db: &'db Db, paged: PagedScope) -> &'db [TraitId] {
+    // The value is the record's: the read of the crate's pages slot notes its fact.
+    let (krate, module) = key_of(db, paged);
     match read_traits(db, krate, module) {
-        Ok(traits) => traits,
+        Ok(traits) => blaze_memo::keep_slice(blaze_memo::Database::memo(db), &traits),
         Err(why) => {
-            // alloc: error path
             let why = format!("the traits in scope in module {module}: {why}");
             Unreadable::of(db, krate, KIND, why).throw()
         }
     }
 }
 
-pub(in crate::nameres) fn traits(db: &Db, paged: blaze_query::db::Id) -> &[TraitId] {
-    traits_memo(db, key_of(db, paged).0)
+pub(in crate::nameres) fn traits(db: &Db, paged: PagedScope) -> &[TraitId] {
+    traits_memo(db, paged)
 }
 
 /// The modules declared in the module `paged` names, by name: the head's.
-pub(in crate::nameres) fn children(
-    db: &Db,
-    paged: blaze_query::db::Id,
-) -> &FxIndexMap<Name, ModuleId> {
-    let (_, krate, module) = key_of(db, paged);
+pub(in crate::nameres) fn children(db: &Db, paged: PagedScope) -> &FxIndexMap<Name, ModuleId> {
+    let (krate, module) = key_of(db, paged);
     match head(db, krate).modules.get(module) {
         Some(it) => &it.children,
         None => {
@@ -1096,10 +1534,9 @@ pub(in crate::nameres) fn children(
 }
 
 /// The records of a crate read from pages: its tail, decoded when first asked for.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn tail(db: &Db, krate: Crate) -> OwnedRecords {
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
+    // The value is the record's: the read of the crate's pages slot notes its fact.
     let records = source_of(db, krate).and_then(|(source, head)| {
         read(source, head.tail.0, head.tail.1, |bytes| {
             let mut dec = segment(db, krate, &head.files, &head.own, bytes);
@@ -1329,13 +1766,17 @@ fn encode_maps(
     enc.contexts.clear();
     let body_len = body.len();
     enc.out = body;
+    // The crates every index in the record names, by key, written after everything else.
+    let closure = closure_segment(db, &enc.closure)?;
     let named = enc.finish()?;
     let files_len = named.len() - body_len;
 
     let rows_at = HEADER;
     let files_at = rows_at + rows.len() * ROW;
     let base = files_at + files_len;
-    let total = u32::try_from(files_at + named.len()).map_err(|_| "pages over 4 GiB")?;
+    let closure_at = u32::try_from(files_at + named.len()).map_err(|_| "pages over 4 GiB")?;
+    let closure_len = u32::try_from(closure.len()).map_err(|_| "a closure segment over 4 GiB")?;
+    let total = closure_at.checked_add(closure_len).ok_or("pages over 4 GiB")?;
     // Every place so far is from the body's start: from the record's.
     let base = base as u32;
     let moved = |(at, len): (u32, u32)| (at + base, len);
@@ -1346,6 +1787,7 @@ fn encode_maps(
         tail: moved(tail),
         rows_at: rows_at as u32,
         total,
+        closure: (closure_at, closure_len),
     };
     // alloc: the record, once per crate per write of its pages
     let mut out = Vec::with_capacity(total as usize);
@@ -1369,6 +1811,7 @@ fn encode_maps(
         }
     }
     out.extend_from_slice(&named);
+    out.extend_from_slice(&closure);
     debug_assert_eq!(out.len(), total as usize);
     Ok(out)
 }

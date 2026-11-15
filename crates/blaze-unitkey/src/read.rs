@@ -25,7 +25,7 @@ use cfg::CfgOptions;
 
 use crate::{
     cfgs,
-    rows::{BODY, ImageTables, ItemRow, LAYOUT, LateRow, ModRow, NONE, PathRow, Span, Tok, section},
+    rows::{BODY, ImageTables, ItemRow, LAYOUT, LateRow, MacroRow, ModRow, NONE, PathRow, Span, Tok, section},
 };
 
 /// The section `id` of a `Sections` record's table, or a refusal naming it.
@@ -48,6 +48,7 @@ pub struct Image<'b> {
     lates: &'b [LateRow],
     mods: &'b [ModRow],
     paths: &'b [PathRow],
+    macros: &'b [MacroRow],
     tree: &'b [u8],
 }
 
@@ -104,6 +105,7 @@ impl<'b> Image<'b> {
             lates: tables.lates.follow(buffer).map_err(format)?,
             mods: tables.mods.follow(buffer).map_err(format)?,
             paths: tables.paths.follow(buffer).map_err(format)?,
+            macros: tables.macros.follow(buffer).map_err(format)?,
             tree: tables.tree.follow(buffer).map_err(format)?,
         })
     }
@@ -123,6 +125,11 @@ impl<'b> Image<'b> {
 
     pub fn mods(&self) -> &'b [ModRow] {
         self.mods
+    }
+
+    /// The macros the file defines and calls where a call can write a `mod`.
+    pub fn macros(&self) -> &'b [MacroRow] {
+        self.macros
     }
 
     /// The parse record, for `syntax::image::read` with the file's text.

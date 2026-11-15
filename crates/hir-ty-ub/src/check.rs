@@ -754,7 +754,7 @@ impl<'db> Machine<'db> for Checker<'db> {
 /// the daemon's test job calls this outside any query, and the evaluator's errors, logs and
 /// outcome's message format the types they name.
 pub fn run_test(db: &Db, test: FunctionId, config: &Config) -> Outcome {
-    blaze_query::db::attach(db, || run_test_attached(db, test, config))
+    blaze_memo::attach(db, || run_test_attached(db, test, config))
 }
 
 fn run_test_attached<'db>(db: &'db Db, test: FunctionId, config: &Config) -> Outcome {

@@ -82,7 +82,15 @@ fn run_in(unit_id: ContentId, text: &[u8], on: bool) -> Run {
     let aligned = Aligned::copy_from(&imaged.record);
     let files = [UnitFile { key: imaged.key, image: &aligned, module: b"" }];
     let options = options(on);
-    let unit = Unit { tool: TOOL, settings: settings(on), unit: unit_id, cfg: &options, files: &files, answers: &[] };
+    let unit = Unit {
+        tool: TOOL,
+        settings: settings(on),
+        unit: unit_id,
+        cfg: &options,
+        files: &files,
+        answers: &[],
+        names: &[ContentId([0; 32])],
+    };
     let keys = unit::key(&unit, Global).expect("the unit keys");
     assert_eq!(keys.files.len(), 1);
     assert_eq!(keys.files[0].image, imaged.key);
@@ -418,6 +426,454 @@ fn an_item_off_by_cfg_has_no_key() {
         assert_ne!(off.manifest, on.manifest);
         assert_eq!(on.moved(&off, &paths), paths, "settings cover the cfg, so every body key moves");
         assert!(off.body(paths[0]).is_some() && on.body(paths[0]).is_some(), "the control");
+    });
+}
+
+// --- stable ids -----------------------------------------------------------------------------------
+
+/// Every row's stable id in file order, of a file at the crate root.
+fn ids(text: &[u8]) -> Vec<StableId, Global> {
+    let imaged = image::image(&TOOL, READING, text, Global).expect("the file images");
+    let aligned = Aligned::copy_from(&imaged.record);
+    let opened = crate::read::Image::open(&aligned, &imaged.key).expect("the image opens");
+    let mut out = Vec::new_in(Global);
+    for row in 0..opened.items().len() as u32 {
+        out.push(opened.stable_id(b"", row).expect("a row's id"));
+    }
+    out
+}
+
+/// A unit of one file at the crate root, keyed with every option of `on` set.
+fn key_with(text: &[u8], on: &[&str]) -> Result<unit::UnitKeys<Global>, crate::KeyError> {
+    let imaged = image::image(&TOOL, READING, text, Global).expect("the file images");
+    let aligned = Aligned::copy_from(&imaged.record);
+    let files = [UnitFile { key: imaged.key, image: &aligned, module: b"" }];
+    let mut options = CfgOptions::default();
+    for atom in on {
+        options.insert_atom(Symbol::intern(atom));
+    }
+    let unit = Unit {
+        tool: TOOL,
+        settings: settings(true),
+        unit: THIS,
+        cfg: &options,
+        files: &files,
+        answers: &[],
+        names: &[ContentId([0; 32])],
+    };
+    unit::key(&unit, Global)
+}
+
+/// What Rust lets one file hold under one (path, kind): three equal functions under three
+/// `#[cfg]`s (all on here: keying decides ids before cfg, and a cfg must move none), a macro
+/// called three times at item level, three equal impls, as core's `fmt/num.rs` and std's
+/// platform modules have them.
+const REPEATS: &str = "struct S;\n\
+    #[cfg(a)] fn f() -> u32 { 1 }\n#[cfg(b)] fn f() -> u32 { 2 }\n#[cfg(c)] fn f() -> u32 { 3 }\n\
+    m! { 1 }\nm! { 2 }\nm! { 3 }\n\
+    #[cfg(a)] impl S { fn x() {} }\n#[cfg(b)] impl S { fn x() {} }\n#[cfg(c)] impl S { fn x() {} }\n";
+
+/// The invariant: every row of a file has its own stable id, however many rows share one name or
+/// header, so a unit of them keys. The controls, each failing by name: with no suffix, and with
+/// the rule this one replaced (each row compared with its predecessor's new name, which gives
+/// the third of three the first's path), keying refuses the unit by `KeyError::TwoItems` naming
+/// two rows of the file.
+#[test]
+fn equal_siblings_have_their_own_ids() {
+    use crate::image::{REPEAT_PLANT, RepeatPlant};
+    let all = ids(REPEATS.as_bytes());
+    let mut sorted = all.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), all.len(), "every row's id is its own");
+    let keys = key_with(REPEATS.as_bytes(), &["a", "b", "c"]).expect("the unit keys");
+    assert_eq!(keys.items.len(), 6, "three `f` and three `x`, each its own body");
+    for plant in [RepeatPlant::NoSuffix, RepeatPlant::AgainstRenamed] {
+        REPEAT_PLANT.set(plant);
+        let refused = key_with(REPEATS.as_bytes(), &["a", "b", "c"]);
+        REPEAT_PLANT.set(RepeatPlant::None);
+        match refused {
+            Err(crate::KeyError::TwoItems { first, second, path, .. }) => {
+                assert_eq!((first.file, second.file), (0, 0), "{plant:?}: both in the one file");
+                assert_ne!(first.row, second.row, "{plant:?}: two rows named");
+                assert!(!path.is_empty(), "{plant:?}: the item's path named");
+            }
+            Err(other) => panic!("{plant:?}: refused by {other}, not by two items of one id"),
+            Ok(_) => panic!("{plant:?}: the planted rule keyed a unit with two items of one id"),
+        }
+    }
+}
+
+/// Modules a macro call writes, as core's `io/io_slice.rs` (`cfg_select!` arms with
+/// `#[path]`s) and libc (`cfg_if!`) write them; an inline module in the tokens; an attribute
+/// whose `#[path]` belongs to no `mod`; `mod $name;`, which spells no file; a call that is off;
+/// beside a plain module.
+const CALL_MODS: &str = "cfg_select! {\n\
+    unix => { #[path = \"io_slice/repr_iovec.rs\"] mod repr; }\n\
+    _ => { #[path = \"io_slice/repr_unknown.rs\"] mod repr; }\n\
+    }\n\
+    cfg_if::cfg_if! {\n\
+    if #[cfg(fast)] { pub(crate) mod fast; } else { mod slow { mod deep; } }\n\
+    }\n\
+    m! { #[path = \"wrong.rs\"] struct S; mod after; mod $name; }\n\
+    #[cfg(off)] cfg_if! { if #[cfg(x)] { mod gone; } }\n\
+    mod plain;\n";
+
+/// Every candidate file of the active modules of `CALL_MODS` at `io/io_slice.rs`, sorted, each
+/// once, with ` (call)` after one spelled in a call's tokens.
+fn call_candidates() -> Vec<String, Global> {
+    let imaged = image::image(&TOOL, READING, CALL_MODS.as_bytes(), Global).expect("the file images");
+    let aligned = Aligned::copy_from(&imaged.record);
+    let opened = crate::read::Image::open(&aligned, &imaged.key).expect("the image opens");
+    let options = CfgOptions::default();
+    let files =
+        crate::mods::mod_files(&opened, b"io/io_slice.rs", crate::mods::FileKind::NonModRs, b"io::io_slice", &options, Global)
+            .expect("the declarations have files");
+    let mut out = Vec::new_in(Global);
+    for file in files.iter() {
+        for candidate in core::iter::once(&file.first).chain(file.second.as_ref()) {
+            let mark = if file.in_call { " (call)" } else { "" };
+            out.push(format!("{}{mark}", String::from_utf8_lossy(&candidate.path)));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The invariant ("Modules a macro call writes" in `crate::mods`): every file a `mod` in an
+/// item-level call's tokens could name is a candidate, whatever cfg the tokens say (both
+/// `repr` arms, both `cfg_if!` branches), its `#[path]` read from the attribute before it and
+/// its inline modules giving their directory; a `#[path]` before another item is no module's,
+/// `mod $name;` names nothing, and a call that is off names nothing. The controls, each failing
+/// by name: with the tokens not read (the image of layout 3), core's `repr_iovec.rs` is
+/// missing; with the `#[path]` in the tokens not read, it is missing too.
+#[test]
+fn modules_a_macro_call_writes_are_candidates() {
+    use crate::image::{CALL_PLANT, CallPlant};
+    let want = [
+        "io/io_slice/after.rs (call)",
+        "io/io_slice/after/mod.rs (call)",
+        "io/io_slice/fast.rs (call)",
+        "io/io_slice/fast/mod.rs (call)",
+        "io/io_slice/plain.rs",
+        "io/io_slice/plain/mod.rs",
+        "io/io_slice/repr.rs (call)",
+        "io/io_slice/repr/mod.rs (call)",
+        "io/io_slice/repr_iovec.rs (call)",
+        "io/io_slice/repr_unknown.rs (call)",
+        "io/io_slice/slow/deep.rs (call)",
+        "io/io_slice/slow/deep/mod.rs (call)",
+    ];
+    assert_eq!(call_candidates(), want, "the candidates of the modules the calls write");
+    for plant in [CallPlant::Off, CallPlant::NoPath] {
+        CALL_PLANT.set(plant);
+        let planted = call_candidates();
+        CALL_PLANT.set(CallPlant::None);
+        assert!(
+            !planted.iter().any(|file| file == "io/io_slice/repr_iovec.rs (call)"),
+            "{plant:?}: the control still found core's `repr_iovec.rs` ({planted:?})"
+        );
+    }
+}
+
+/// std's `sys/pal` shape (`sys/pal/mod.rs`'s `cfg_select!`; `hermit/mod.rs:24`,
+/// `wasi/mod.rs:11`, `teeos/mod.rs:10`): every platform's module is a call's candidate, and two
+/// of them name unix's `time.rs` by `#[path = "../unix/time.rs"]`, so one file is three modules.
+const PAL: [(&str, &str); 5] = [
+    ("/u/src/lib.rs", "cfg_select! {\n unix => { mod unix; }\n target_os = \"hermit\" => { mod hermit; }\n _ => { mod wasi; }\n}\n"),
+    ("/u/src/unix/mod.rs", "mod time;\n"),
+    ("/u/src/hermit/mod.rs", "#[path = \"../unix/time.rs\"]\nmod time;\n"),
+    ("/u/src/wasi/mod.rs", "#[path = \"../unix/time.rs\"]\nmod time;\n"),
+    ("/u/src/unix/time.rs", "pub struct Instant(u64);\npub fn now() -> Instant { Instant(0) }\n"),
+];
+
+/// A source over `(path, text)` rows, for a gather of a few files.
+struct Rows<'r>(&'r [(&'r str, &'r str)]);
+
+impl crate::gather::Source for Rows<'_> {
+    fn read<B: core::alloc::Allocator>(&mut self, path: &str, into: &mut Vec<u8, B>) -> Result<bool, crate::gather::SourceError> {
+        into.clear();
+        match self.0.iter().find(|(there, _)| *there == path) {
+            Some((_, text)) => {
+                into.extend_from_slice(text.as_bytes());
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn exists(&mut self, path: &str) -> Result<bool, crate::gather::SourceError> {
+        Ok(self.0.iter().any(|(there, _)| *there == path))
+    }
+}
+
+/// The digests of the few-file gathers: no unit of theirs reads late.
+struct RowDigests;
+
+impl crate::gather::Digests for RowDigests {
+    fn var(value: Option<&[u8]>) -> ContentId {
+        ContentId::of("blaze-unitkey test variable", value.unwrap_or(b""))
+    }
+
+    fn file(bytes: &[u8]) -> ContentId {
+        ContentId::of("blaze-unitkey test file", bytes)
+    }
+}
+
+fn no_pair(row: &(Vec<u8>, Vec<u8>)) -> (&[u8], &[u8]) {
+    (&row.0, &row.1)
+}
+
+/// The unit at `/u/src/lib.rs` over `rows`, gathered, with the images it filed.
+fn gather_rows(
+    rows: &[(&str, &str)],
+) -> (Result<crate::gather::UnitText<Global>, crate::gather::GatherError<Global>>, crate::gather::ImageList<Global>) {
+    let options = CfgOptions::default();
+    let env: [(Vec<u8>, Vec<u8>); 0] = [];
+    let input = crate::gather::Gather {
+        tool: TOOL,
+        reading: READING,
+        cfg: &options,
+        root: b"/u/src/lib.rs",
+        env: &env,
+        pair: no_pair,
+        member: false,
+        defer: true,
+    };
+    let mut images = crate::gather::ImageList::new_in(Global);
+    let text = crate::gather::gather::<_, _, RowDigests, _, _>(&input, &mut Rows(rows), &mut images, Global);
+    (text, images)
+}
+
+/// `text` keyed, its file `rename`'s module path replaced by `module` when given; each file's
+/// printed name a function of its path alone, as the command's (`program::printed_name_id`).
+fn key_text(
+    text: &crate::gather::UnitText<Global>,
+    images: &crate::gather::ImageList<Global>,
+    rename: Option<(usize, &[u8])>,
+) -> Result<unit::UnitKeys<Global>, crate::KeyError> {
+    use crate::gather::Images;
+    let mut files = Vec::with_capacity_in(text.files.len(), Global);
+    let mut names = Vec::with_capacity_in(text.files.len(), Global);
+    for (at, file) in text.files.iter().enumerate() {
+        let image = images.get(&file.image).expect("the gather filed every image");
+        let module = match rename {
+            Some((renamed, module)) if renamed == at => module,
+            _ => &file.module[..],
+        };
+        files.push(UnitFile { key: file.image, image, module });
+        names.push(ContentId::of("blaze-unitkey test printed name", &file.path));
+    }
+    let options = CfgOptions::default();
+    let unit = Unit { tool: TOOL, settings: settings(true), unit: THIS, cfg: &options, files: &files, answers: &[], names: &names };
+    unit::key(&unit, Global)
+}
+
+/// The invariant: one file named by two `#[path]`s is two modules (legal Rust), so the gather
+/// gives it once per module path, every entry of one path and one image, and the unit keys,
+/// though its printed names repeat. The controls, each failing by name: the same file declared
+/// below itself is a cycle, refused by `gather::CIRCULAR`; and two of the entries given one
+/// module path key to `KeyError::TwoItems`, so the distinct module paths are what keep them
+/// apart.
+#[test]
+fn one_file_under_two_module_paths_gathers_and_keys() {
+    let (text, images) = gather_rows(&PAL);
+    let text = match text {
+        Ok(text) => text,
+        Err(error) => panic!("refused: {}: {} ({})", String::from_utf8_lossy(&error.path), String::from_utf8_lossy(&error.what), error.rule),
+    };
+    let time = b"/u/src/unix/time.rs";
+    let mut modules: Vec<String, Global> = Vec::new_in(Global);
+    let mut images_of = Vec::new_in(Global);
+    let mut at_time = Vec::new_in(Global);
+    for (at, file) in text.files.iter().enumerate() {
+        if file.path[..] == time[..] {
+            modules.push(String::from_utf8_lossy(&file.module).into_owned());
+            images_of.push(file.image);
+            at_time.push(at);
+        }
+    }
+    modules.sort_unstable();
+    assert_eq!(modules, ["hermit::time", "unix::time", "wasi::time"], "unix's `time.rs` once per module path naming it");
+    assert!(images_of.windows(2).all(|pair| pair[0] == pair[1]), "one file, one image");
+    assert_eq!(text.files.len(), 7, "the root, three platform modules, and `time.rs` three times");
+    key_text(&text, &images, None).unwrap_or_else(|error| panic!("one file under three module paths does not key: {error}"));
+
+    // Control 1: `time.rs` declaring itself is below itself.
+    let mut cycle = PAL;
+    cycle[4].1 = "#[path = \"time.rs\"]\nmod again;\n";
+    match gather_rows(&cycle).0 {
+        Err(error) => {
+            assert_eq!(error.rule, crate::gather::CIRCULAR, "the cycle refused by its rule");
+            assert_eq!(&error.path[..], &time[..], "the file below itself named");
+        }
+        Ok(_) => panic!("a file declaring itself was gathered"),
+    }
+
+    // Control 2: two entries under one module path are two items of one stable id.
+    let first = text.files[at_time[0]].module.clone();
+    match key_text(&text, &images, Some((at_time[1], &first))) {
+        Err(crate::KeyError::TwoItems { first: one, second: two, .. }) => {
+            assert!(at_time.contains(&(one.file as usize)) && at_time.contains(&(two.file as usize)), "both in `time.rs`");
+        }
+        Err(other) => panic!("refused by {other}, not by two items of one id"),
+        Ok(_) => panic!("two entries under one module path keyed"),
+    }
+}
+
+/// libc's shape (`src/macros.rs:63-66`, `src/lib.rs:245`): a `macro_rules!` whose body spells
+/// `mod types;`, defined in one file and called in another's `cfg_if!` arm; a definition that
+/// is off, whose call names nothing; a call of an unknown macro.
+const MACRO_DEFS: &str = "macro_rules! prelude { () => { mod types; } }\n\
+    #[cfg(off)] macro_rules! gone { () => { mod gone; } }\n";
+const MACRO_CALLS: &str = "#[macro_use] mod macros;\n\
+    cfg_if! { if #[cfg(x)] { mod fuchsia; prelude!(); } else { crate::prelude!(); } }\n\
+    gone!();\n\
+    unknown! { }\n";
+
+/// Every candidate file the unit of `MACRO_CALLS` (`src/lib.rs`, the root) and `MACRO_DEFS`
+/// (`src/macros.rs`) has through its macros' bodies, sorted, with the sites' count.
+fn macro_candidates() -> (usize, Vec<String, Global>) {
+    let options = CfgOptions::default();
+    let imaged = [MACRO_CALLS, MACRO_DEFS].map(|text| image::image(&TOOL, READING, text.as_bytes(), Global).expect("the file images"));
+    let aligned = [0usize, 1].map(|at| Aligned::copy_from(&imaged[at].record));
+    let images = [0usize, 1].map(|at| crate::read::Image::open(&aligned[at], &imaged[at].key).expect("the image opens"));
+    let files: [(&[u8], crate::mods::FileKind, &[u8]); 2] =
+        [(b"src/lib.rs", crate::mods::FileKind::ModRs, b""), (b"src/macros.rs", crate::mods::FileKind::NonModRs, b"macros")];
+    let mut done = Vec::new_in(Global);
+    let sites = crate::mods::macro_sites(&images, &options, &mut done, Global).expect("the sites");
+    assert!(crate::mods::macro_sites(&images, &options, &mut done, Global).expect("the sites").is_empty(), "a site twice");
+    let mut out = Vec::new_in(Global);
+    for site in sites.iter() {
+        let (path, kind, module) = files[site.call_file as usize];
+        let declared = crate::mods::macro_files(
+            &images[site.def_file as usize],
+            site.defined,
+            &images[site.call_file as usize],
+            site.called,
+            path,
+            kind,
+            module,
+            &options,
+            Global,
+        )
+        .expect("the body's modules have files");
+        for file in declared.iter() {
+            assert!(file.in_call, "a module of a macro's body that is not a candidate");
+            for candidate in core::iter::once(&file.first).chain(file.second.as_ref()) {
+                out.push(format!("{} as {}", String::from_utf8_lossy(&candidate.path), String::from_utf8_lossy(&file.module)));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    (sites.len(), out)
+}
+
+/// The invariant ("A macro the unit defines" in `crate::mods`): a `mod` in a `macro_rules!`
+/// body is a candidate at each call of that name in the unit, the nested one in a `cfg_if!` arm
+/// and the one by a path alike (two sites, one file pair), relative to the calling file; a
+/// definition that is off and an unknown macro name nothing. The control, failing by name:
+/// with definitions' bodies not read (the image of layout 4), libc's `types.rs` is missing.
+#[test]
+fn modules_a_macro_definition_writes_are_candidates() {
+    use crate::image::{CALL_PLANT, CallPlant};
+    let (sites, found) = macro_candidates();
+    assert_eq!(sites, 2, "the calls of `prelude` ({found:?})");
+    assert_eq!(found, ["src/types.rs as types", "src/types/mod.rs as types"], "the candidates of the modules the body writes");
+    CALL_PLANT.set(CallPlant::NoDefinitions);
+    let (_, planted) = macro_candidates();
+    CALL_PLANT.set(CallPlant::None);
+    assert!(
+        !planted.iter().any(|file| file == "src/types.rs as types"),
+        "NoDefinitions: the control still found libc's `types.rs` ({planted:?})"
+    );
+}
+
+/// One generated top-level item: a function of one of two names (a body), a macro call with an
+/// argument, or a unit struct of one of two names. Each is one row, so row `i` is item `i`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Piece {
+    Fn { name: u8, lit: u8 },
+    Call { arg: u8 },
+    Struct { name: u8 },
+}
+
+impl Piece {
+    fn draw(tape: &Tape) -> Piece {
+        match tape.int_in(0..=2u8, "piece") {
+            0 => Piece::Fn { name: tape.int_in(0..=1u8, "fn name"), lit: tape.int_in(0..=9u8, "lit") },
+            1 => Piece::Call { arg: tape.int_in(0..=9u8, "arg") },
+            _ => Piece::Struct { name: tape.int_in(0..=1u8, "struct name") },
+        }
+    }
+
+    /// The group a piece's id is numbered in: equal (path, kind).
+    fn group(self) -> (u8, u8) {
+        match self {
+            Piece::Fn { name, .. } => (0, name),
+            Piece::Call { .. } => (1, 0),
+            Piece::Struct { name } => (2, name),
+        }
+    }
+
+    /// The piece with its body or argument edited: no name or header moves.
+    fn edited(self) -> Piece {
+        match self {
+            Piece::Fn { name, lit } => Piece::Fn { name, lit: lit + 1 },
+            Piece::Call { arg } => Piece::Call { arg: arg + 1 },
+            Piece::Struct { name } => Piece::Struct { name },
+        }
+    }
+}
+
+fn render_pieces(pieces: &[Piece]) -> Vec<u8, Global> {
+    let mut out = Vec::new_in(Global);
+    for (at, piece) in pieces.iter().enumerate() {
+        // Each under a cfg of its own, as equal siblings are in real code.
+        match piece {
+            Piece::Fn { name, lit } => write!(out, "#[cfg(p{at})] fn f{name}() -> u32 {{ {lit} }}\n"),
+            Piece::Call { arg } => write!(out, "m! {{ {arg} }}\n"),
+            Piece::Struct { name } => write!(out, "#[cfg(p{at})] struct T{name};\n"),
+        }
+        .expect("a Vec takes writes");
+    }
+    out
+}
+
+/// The invariant: an edit inside an item (a body, a call's arguments) moves no row's id, its own
+/// included; inserting an item moves exactly the ids of the later members of its group
+/// (equal path and kind), each by one, and no other row's. The control: when its group has a
+/// later member, the insertion does move that member's id (the rule is by order, and says so).
+#[test]
+fn an_edit_moves_no_other_items_id() {
+    blaze_sim::check(Config::cases(100), |tape| {
+        let count = usize::from(tape.int_in(1..=8u8, "items"));
+        let mut pieces = Vec::new_in(Global);
+        for _ in 0..count {
+            pieces.push(Piece::draw(tape));
+        }
+        let before = ids(&render_pieces(&pieces));
+        assert_eq!(before.len(), count, "one row per item");
+
+        let at = usize::from(tape.int_in(0..=count as u8 - 1, "edited"));
+        let mut edited = pieces.clone();
+        edited[at] = edited[at].edited();
+        assert_eq!(ids(&render_pieces(&edited)), before, "an edit inside item {at} moves no id");
+
+        let place = usize::from(tape.int_in(0..=count as u8, "inserted at"));
+        let inserted = Piece::draw(tape);
+        let mut grown = pieces.clone();
+        grown.insert(place, inserted);
+        let after = ids(&render_pieces(&grown));
+        assert_eq!(after.len(), count + 1);
+        for (row, piece) in pieces.iter().enumerate() {
+            let now = if row < place { row } else { row + 1 };
+            // The control is the `true` side: a later member of the inserted item's group moves.
+            let moves = row >= place && piece.group() == inserted.group();
+            assert_eq!(after[now] != before[row], moves, "row {row} ({piece:?}) after inserting {inserted:?} at {place}");
+        }
     });
 }
 

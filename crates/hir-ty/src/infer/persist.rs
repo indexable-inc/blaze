@@ -1,8 +1,10 @@
 //! [`InferenceResult`] in blaze's format (docs/v2/plan/design/data.md). [`InferenceRecord`] is
 //! its `'static` form: the result's columns as they are, in three flat arrays of `u64`, `u32` and
 //! `u8` words, each type an index in a type table of its own (`next_solver::persist`), each
-//! definition its id (the database that wrote a buffer is the one reading it, as
-//! `crates/hir-def/src/hir/persist.rs` writes ids), and what few nodes have (diagnostics, the
+//! definition through `check_cache::id_bits`: inside `check_cache::relocating` (every record
+//! another process reads, the crate's own image among them) its index in the record's table of
+//! portable ids, outside one its memo id's bits, which only the process that wrote them reads
+//! back (a `blaze_memo::Gid` means nothing in another process), and what few nodes have (diagnostics, the
 //! closures' captures) as tagged `u32` words beside them. [`Persist`] writes the arrays and the
 //! table's buffer into one buffer and reads them back in place;
 //! [`InferenceRecordRef::to_result`] makes the result again, every column checked as it is
@@ -3943,7 +3945,7 @@ impl Source<'_> {
 #[cfg(test)]
 mod tests {
     use blaze_format::to_bytes;
-    use blaze_query::db::FromId;
+    use blaze_memo::Id as _;
     use either::Either;
     use hir_def::{
         BuiltinDeriveImplId, ImplId, StaticId, TypeAliasId,
@@ -4022,8 +4024,8 @@ mod tests {
         }
     }
 
-    fn id(index: u32) -> blaze_query::db::Id {
-        blaze_query::db::Id::from_u32(index + (3 << 20))
+    fn id(index: u32) -> blaze_memo::Gid {
+        blaze_memo::Gid::for_test(index + (3 << 20))
     }
 
     fn expr(index: u32) -> ExprId {
@@ -4073,14 +4075,14 @@ mod tests {
         let regions = &default_types().regions;
         let region = |it: crate::next_solver::Region<'static>| GenericArg::from(it).store();
         let ty = |it: Ty<'static>| it.store();
-        let variant: VariantId = StructId::from_id(id(4)).into();
-        let enum_variant: VariantId = EnumVariantId::from_id(id(5)).into();
-        let def: GenericDefId = ImplId::from_id(id(9)).into();
+        let variant: VariantId = StructId::from_gid(id(4)).into();
+        let enum_variant: VariantId = EnumVariantId::from_gid(id(5)).into();
+        let def: GenericDefId = ImplId::from_gid(id(9)).into();
         let causes = cause_codes();
         let param = TypeOrConstParamId { parent: def, local_id: local_of(2) };
         let segment = PathGenericsSource::Segment(1);
         let assoc = PathGenericsSource::AssocType { segment: 2, assoc_type: 3 };
-        let trait_ = TraitId::from_id(id(11));
+        let trait_ = TraitId::from_gid(id(11));
         let args = GenericArgs::new_from_slice(&[
             GenericArg::from(types.u8),
             GenericArg::from(types.bool),
@@ -4131,7 +4133,7 @@ mod tests {
             },
             D::PrivateAssocItem {
                 id: expr(3).into(),
-                item: AssocItemId::TypeAliasId(TypeAliasId::from_id(id(6))),
+                item: AssocItemId::TypeAliasId(TypeAliasId::from_gid(id(6))),
             },
             D::UnresolvedField {
                 expr: expr(4),
@@ -4144,7 +4146,7 @@ mod tests {
                 receiver: ty(types.i32),
                 name: Name::new_root("frobnicate"),
                 field_with_same_name: Some(ty(types.unit)),
-                assoc_func_with_same_name: Some(FunctionId::from_id(id(7))),
+                assoc_func_with_same_name: Some(FunctionId::from_gid(id(7))),
                 numeric_var: Some(crate::infer::NumericVar::Float),
             },
             D::UnresolvedMethodCall {
@@ -4228,7 +4230,7 @@ mod tests {
                 node: expr(9).into(),
                 problem: RecordProblem::MissingDefault {
                     field: Name::new_root("path"),
-                    function: FunctionId::from_id(id(7)),
+                    function: FunctionId::from_gid(id(7)),
                 },
             },
             D::RecordRefused { node: expr(9).into(), problem: RecordProblem::NoCallee },
@@ -4257,7 +4259,7 @@ mod tests {
                 call_expr: expr(12),
                 args: Box::new(CallArguments {
                     callee: Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store(),
-                    method: Some(FunctionId::from_id(id(12))),
+                    method: Some(FunctionId::from_gid(id(12))),
                     is_method: true,
                     c_variadic: false,
                     formal_inputs: Box::default(),
@@ -4323,18 +4325,18 @@ mod tests {
                 provided_count: 3,
                 expected_count: 1,
                 kind: IncorrectGenericsLenKind::Lifetimes,
-                def: AdtId::UnionId(UnionId::from_id(id(10))).into(),
+                def: AdtId::UnionId(UnionId::from_gid(id(10))).into(),
             },
             D::MethodCallIllegalSizedBound {
                 call_expr: expr(18),
-                method: FunctionId::from_id(id(40)),
-                bound: Some(TraitId::from_id(id(41)).into()),
+                method: FunctionId::from_gid(id(40)),
+                bound: Some(TraitId::from_gid(id(41)).into()),
                 needs_mut: true,
-                candidates: Box::new([TraitId::from_id(id(42)), TraitId::from_id(id(43))]),
+                candidates: Box::new([TraitId::from_gid(id(42)), TraitId::from_gid(id(43))]),
             },
             D::MethodCallIllegalSizedBound {
                 call_expr: expr(19),
-                method: FunctionId::from_id(id(40)),
+                method: FunctionId::from_gid(id(40)),
                 bound: None,
                 needs_mut: false,
                 candidates: Box::new([]),
@@ -4343,7 +4345,7 @@ mod tests {
                 call_expr: expr(18),
                 receiver: expr(19),
                 lint: EditionLint::Rust2021PreludeCollisions,
-                method: FunctionId::from_id(id(40)),
+                method: FunctionId::from_gid(id(40)),
                 inherent: false,
                 autoderefs: 0,
                 autoref: None,
@@ -4352,7 +4354,7 @@ mod tests {
                 call_expr: expr(19),
                 receiver: expr(20),
                 lint: EditionLint::Rust2024PreludeCollisions,
-                method: FunctionId::from_id(id(41)),
+                method: FunctionId::from_gid(id(41)),
                 inherent: true,
                 autoderefs: 2,
                 autoref: Some(ReceiverAdjustment::Autoref(Mutability::Mut)),
@@ -4361,7 +4363,7 @@ mod tests {
                 call_expr: expr(20),
                 receiver: expr(21),
                 lint: EditionLint::ArrayIntoIter,
-                method: FunctionId::from_id(id(40)),
+                method: FunctionId::from_gid(id(40)),
                 inherent: true,
                 autoderefs: 1,
                 autoref: Some(ReceiverAdjustment::Autoref(Mutability::Not)),
@@ -4370,19 +4372,19 @@ mod tests {
                 call_expr: expr(21),
                 receiver: expr(18),
                 lint: EditionLint::BoxedSliceIntoIter,
-                method: FunctionId::from_id(id(41)),
+                method: FunctionId::from_gid(id(41)),
                 inherent: false,
                 autoderefs: 0,
                 autoref: Some(ReceiverAdjustment::ToConstPtr),
             },
             D::FullyQualifiedCallFrom2018 {
                 node: expr(18).into(),
-                item: FunctionId::from_id(id(42)).into(),
+                item: FunctionId::from_gid(id(42)).into(),
                 self_ty: ty(types.u8),
             },
             D::FullyQualifiedCallFrom2018 {
                 node: pat(4).into(),
-                item: ConstId::from_id(id(43)).into(),
+                item: ConstId::from_gid(id(43)).into(),
                 self_ty: ty(types.bool),
             },
             D::MethodCallIncorrectGenericsOrder {
@@ -4431,9 +4433,9 @@ mod tests {
                     primary: AmbiguityNote {
                         goal: goals[0].clone(),
                         candidates: vec![
-                            AmbiguityCandidate::Impl(AnyImplId::ImplId(ImplId::from_id(id(13)))),
+                            AmbiguityCandidate::Impl(AnyImplId::ImplId(ImplId::from_gid(id(13)))),
                             AmbiguityCandidate::Impl(AnyImplId::BuiltinDeriveImplId(
-                                BuiltinDeriveImplId::from_id(id(14)),
+                                BuiltinDeriveImplId::from_gid(id(14)),
                             )),
                             AmbiguityCandidate::ParamEnv { trait_, args: args.clone() },
                         ],
@@ -4495,7 +4497,7 @@ mod tests {
                 kind: SolverDiagnosticKind::ProjectionMismatch {
                     goal: goals[2].clone(),
                     normalized: Some(arg_of(types.bool)),
-                    impl_: Some(AnyImplId::ImplId(ImplId::from_id(id(44)))),
+                    impl_: Some(AnyImplId::ImplId(ImplId::from_gid(id(44)))),
                 },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
@@ -4580,8 +4582,8 @@ mod tests {
         all.extend(goals.iter().enumerate().map(|(n, goal)| {
             let non_const_impl = match n % 3 {
                 0 => None,
-                1 => Some(AnyImplId::ImplId(ImplId::from_id(id(42)))),
-                _ => Some(AnyImplId::BuiltinDeriveImplId(BuiltinDeriveImplId::from_id(id(43)))),
+                1 => Some(AnyImplId::ImplId(ImplId::from_gid(id(42)))),
+                _ => Some(AnyImplId::BuiltinDeriveImplId(BuiltinDeriveImplId::from_gid(id(43)))),
             };
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(33)),
@@ -4784,14 +4786,14 @@ mod tests {
         mismatches.insert(pat(3).into());
         InferenceResult {
             method_resolutions: IndexColumn::from_entries([
-                (expr(3), (FunctionId::from_id(id(20)), args(&[types.i32]))),
-                (expr(9), (FunctionId::from_id(id(21)), args(&[]))),
+                (expr(3), (FunctionId::from_gid(id(20)), args(&[types.i32]))),
+                (expr(9), (FunctionId::from_gid(id(21)), args(&[]))),
             ]),
             field_resolutions: FieldColumn::from_entries([
                 (
                     expr(2),
                     Either::Left(FieldId {
-                        parent: StructId::from_id(id(22)).into(),
+                        parent: StructId::from_gid(id(22)).into(),
                         local_id: local_of(1),
                     }),
                 ),
@@ -4799,23 +4801,23 @@ mod tests {
                 (expr(8), Either::Right(TupleFieldId { tuple: TupleId(0), index: 0 })),
             ]),
             variant_resolutions: ExprOrPatColumn {
-                exprs: IndexColumn::from_entries([(expr(4), UnionId::from_id(id(23)).into())]),
-                pats: IndexColumn::from_entries([(pat(1), EnumVariantId::from_id(id(24)).into())]),
+                exprs: IndexColumn::from_entries([(expr(4), UnionId::from_gid(id(23)).into())]),
+                pats: IndexColumn::from_entries([(pat(1), EnumVariantId::from_gid(id(24)).into())]),
             },
             value_resolutions: {
                 let param = TypeOrConstParamId {
-                    parent: FunctionId::from_id(id(33)).into(),
+                    parent: FunctionId::from_gid(id(33)).into(),
                     local_id: local_of(1),
                 };
                 let mut values = ExprOrPatMap::new_in(frame);
-                values.insert(expr(12).into(), ValueNs::ImplSelf(ImplId::from_id(id(34))));
+                values.insert(expr(12).into(), ValueNs::ImplSelf(ImplId::from_gid(id(34))));
                 values.insert(expr(13).into(), ValueNs::LocalBinding(binding(2)));
-                values.insert(expr(14).into(), ValueNs::FunctionId(FunctionId::from_id(id(35))));
-                values.insert(expr(15).into(), ValueNs::ConstId(ConstId::from_id(id(36))));
-                values.insert(expr(16).into(), ValueNs::StaticId(StaticId::from_id(id(37))));
-                values.insert(pat(5).into(), ValueNs::StructId(StructId::from_id(id(38))));
+                values.insert(expr(14).into(), ValueNs::FunctionId(FunctionId::from_gid(id(35))));
+                values.insert(expr(15).into(), ValueNs::ConstId(ConstId::from_gid(id(36))));
+                values.insert(expr(16).into(), ValueNs::StaticId(StaticId::from_gid(id(37))));
+                values.insert(pat(5).into(), ValueNs::StructId(StructId::from_gid(id(38))));
                 values
-                    .insert(pat(6).into(), ValueNs::EnumVariantId(EnumVariantId::from_id(id(39))));
+                    .insert(pat(6).into(), ValueNs::EnumVariantId(EnumVariantId::from_gid(id(39))));
                 values.insert(
                     expr(17).into(),
                     ValueNs::GenericParam(ConstParamId::from_unchecked(param)),
@@ -4824,22 +4826,22 @@ mod tests {
             },
             qualifier_resolutions: {
                 let param = TypeOrConstParamId {
-                    parent: FunctionId::from_id(id(33)).into(),
+                    parent: FunctionId::from_gid(id(33)).into(),
                     local_id: local_of(0),
                 };
-                let enum_ = AdtId::EnumId(hir_def::EnumId::from_id(id(49)));
+                let enum_ = AdtId::EnumId(hir_def::EnumId::from_gid(id(49)));
                 let mut qualifiers = ExprOrPatMap::new_in(frame);
                 qualifiers
-                    .insert(expr(14).into(), (TypeNs::AdtId(StructId::from_id(id(38)).into()), 1));
+                    .insert(expr(14).into(), (TypeNs::AdtId(StructId::from_gid(id(38)).into()), 1));
                 qualifiers.insert(
                     expr(15).into(),
                     (TypeNs::GenericParam(TypeParamId::from_unchecked(param)), 1),
                 );
-                qualifiers.insert(expr(16).into(), (TypeNs::SelfType(ImplId::from_id(id(34))), 1));
+                qualifiers.insert(expr(16).into(), (TypeNs::SelfType(ImplId::from_gid(id(34))), 1));
                 qualifiers.insert(expr(17).into(), (TypeNs::AdtSelfType(enum_), 1));
-                qualifiers.insert(expr(18).into(), (TypeNs::TraitId(TraitId::from_id(id(41))), 2));
+                qualifiers.insert(expr(18).into(), (TypeNs::TraitId(TraitId::from_gid(id(41))), 2));
                 qualifiers
-                    .insert(expr(19).into(), (TypeNs::TypeAliasId(TypeAliasId::from_id(id(6))), 3));
+                    .insert(expr(19).into(), (TypeNs::TypeAliasId(TypeAliasId::from_gid(id(6))), 3));
                 qualifiers.insert(
                     expr(20).into(),
                     (TypeNs::BuiltinType(BuiltinType::Uint(BuiltinUint::U128)), 1),
@@ -4847,7 +4849,7 @@ mod tests {
                 qualifiers.insert(expr(21).into(), (TypeNs::BuiltinType(BuiltinType::Char), 1));
                 qualifiers.insert(
                     pat(6).into(),
-                    (TypeNs::EnumVariantId(EnumVariantId::from_id(id(39))), 0),
+                    (TypeNs::EnumVariantId(EnumVariantId::from_gid(id(39))), 0),
                 );
                 qualifiers.freeze()
             },
@@ -4855,16 +4857,16 @@ mod tests {
                 let mut candidates = ExprOrPatMap::new_in(frame);
                 let call: Box<[(CandidateId, Symbol)]> = Box::new([
                     (
-                        CandidateId::FunctionId(FunctionId::from_id(id(44))),
+                        CandidateId::FunctionId(FunctionId::from_gid(id(44))),
                         Symbol::intern("iter_flatten"),
                     ),
                     (
-                        CandidateId::ConstId(ConstId::from_id(id(45))),
+                        CandidateId::ConstId(ConstId::from_gid(id(45))),
                         Symbol::intern("int_roundings"),
                     ),
                 ]);
                 let path: Box<[(CandidateId, Symbol)]> = Box::new([(
-                    CandidateId::ConstId(ConstId::from_id(id(46))),
+                    CandidateId::ConstId(ConstId::from_gid(id(46))),
                     Symbol::intern("f16"),
                 )]);
                 candidates.insert(expr(12).into(), call);
@@ -4874,11 +4876,11 @@ mod tests {
             assoc_resolutions: ExprOrPatColumn {
                 exprs: IndexColumn::from_entries([(
                     expr(6),
-                    (ConstId::from_id(id(25)).into(), args(&[types.u8])),
+                    (ConstId::from_gid(id(25)).into(), args(&[types.u8])),
                 )]),
                 pats: IndexColumn::from_entries([(
                     pat(0),
-                    (FunctionId::from_id(id(26)).into(), args(&[])),
+                    (FunctionId::from_gid(id(26)).into(), args(&[])),
                 )]),
             },
             tuple_field_access_types: Box::new([
@@ -4894,16 +4896,16 @@ mod tests {
             type_of_binding: TyColumn::from_entries([(binding(0), types.unit.store())]),
             type_of_type_placeholder: TyColumn::from_entries([(local_of(2), types.never.store())]),
             type_of_opaque: SortedMap::from_entries([
-                (InternedOpaqueTyId::from_id(id(30)), types.i32.store()),
-                (InternedOpaqueTyId::from_id(id(27)), types.u8.store()),
+                (InternedOpaqueTyId::from_gid(id(30)), types.i32.store()),
+                (InternedOpaqueTyId::from_gid(id(27)), types.u8.store()),
             ]),
             has_errors: true,
             diagnostics: every_diagnostic().into_boxed_slice(),
             unreachable: every_unreachable().into_boxed_slice(),
             traits_in_scope_used: Box::new([
-                (ExprOrPatId::ExprId(expr(12)), TraitId::from_id(id(47))),
-                (ExprOrPatId::PatId(pat(6)), TraitId::from_id(id(48))),
-                (ExprOrPatId::ExprId(expr(12)), TraitId::from_id(id(48))),
+                (ExprOrPatId::ExprId(expr(12)), TraitId::from_gid(id(47))),
+                (ExprOrPatId::PatId(pat(6)), TraitId::from_gid(id(48))),
+                (ExprOrPatId::ExprId(expr(12)), TraitId::from_gid(id(48))),
             ]),
             // A predicate needs an interner, so the column is only tested empty here.
             coroutine_stalled_predicates: Box::new([]),
@@ -4918,7 +4920,7 @@ mod tests {
                         params: vec![(
                             Span::PatId(pat(3)),
                             TypeParamId::from_unchecked(TypeOrConstParamId {
-                                parent: FunctionId::from_id(id(33)).into(),
+                                parent: FunctionId::from_gid(id(33)).into(),
                                 local_id: local_of(1),
                             })
                             .into(),
@@ -4979,8 +4981,8 @@ mod tests {
                 ),
             ]),
             defined_anon_consts: Box::new([
-                AnonConstId::from_id(id(31)),
-                AnonConstId::from_id(id(32)),
+                AnonConstId::from_gid(id(31)),
+                AnonConstId::from_gid(id(32)),
             ]),
         }
     }
@@ -5137,8 +5139,8 @@ mod tests {
         let causes = cause_codes();
         let impls = [
             None,
-            Some(AnyImplId::ImplId(ImplId::from_id(id(40)))),
-            Some(AnyImplId::BuiltinDeriveImplId(BuiltinDeriveImplId::from_id(id(41)))),
+            Some(AnyImplId::ImplId(ImplId::from_gid(id(40)))),
+            Some(AnyImplId::BuiltinDeriveImplId(BuiltinDeriveImplId::from_gid(id(41)))),
         ];
         let mut sink = Sink::new();
         causes.iter().for_each(|&it| sink.cause_code(it));
@@ -5156,7 +5158,7 @@ mod tests {
     }
 
     fn cause_codes() -> [ObligationCauseCode; 12] {
-        let item: GenericDefId = ImplId::from_id(id(9)).into();
+        let item: GenericDefId = ImplId::from_gid(id(9)).into();
         [
             ObligationCauseCode::Misc,
             ObligationCauseCode::WhereClauseInExpr { item, bound_index: 3, arg_index: None },

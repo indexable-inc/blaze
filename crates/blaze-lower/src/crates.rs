@@ -7,8 +7,8 @@
 use std::borrow::Cow;
 
 use base_db::{
-    BuiltDependency, ConstEvalBudget, Crate, CrateName, CrateOrigin, CrateType, CrateTypes,
-    CrateWorkspaceData, LangCrateOrigin, TargetKind, TrustedCrate, Version,
+    ConstEvalBudget, CrateKey, CrateName, CrateOrigin, CrateType, CrateTypes,
+    CrateWorkspaceData, LangCrateOrigin, TargetKind, TrustedCrate, Version, WorldDependency,
     target::{Arch, TargetData},
 };
 use blaze_units::{
@@ -392,24 +392,20 @@ pub(crate) fn topological(
     Ok(order)
 }
 
-/// `unit`'s dependency on `on` (whose crate is `krate`) by the name its code calls it: in the
-/// extern prelude unless cargo passes it `noprelude` (build-std's standard library crates).
-/// A proc macro's `proc_macro` is in it: cargo passes a proc-macro target `--extern
-/// proc_macro` beside build-std's `noprelude` one, and rustc puts a crate in the extern prelude
-/// when any `--extern` naming it is not `noprelude`.
+/// `unit`'s dependency on `on` (whose crate is `krate`) by the name its code calls it, marked
+/// by the one rule of an edge's marks ([`UnitDep::marks`], blaze-units).
 pub(crate) fn dependency(
     unit: &Unit,
     on: &Unit,
     dep: &UnitDep,
-    krate: Crate,
+    krate: CrateKey,
     what: &str,
-) -> Result<BuiltDependency, LowerError> {
+) -> Result<WorldDependency, LowerError> {
     let name = CrateName::new(&dep.extern_crate_name).map_err(|_| {
         LowerError::at(format!("`{}` is not a crate's name", dep.extern_crate_name), what)
     })?;
-    let prelude = !dep.noprelude.unwrap_or(false)
-        || (unit.target.is_proc_macro() && dep.extern_crate_name == "proc_macro");
-    Ok(BuiltDependency::with_prelude(name, krate, prelude, on.is_std && !unit.is_std))
+    let marks = dep.marks(unit, on);
+    Ok(WorldDependency::with_prelude(name, krate, marks.prelude, marks.sysroot))
 }
 
 /// The Rust edition `unit`'s crate is parsed and resolved in: its target's, or for a target

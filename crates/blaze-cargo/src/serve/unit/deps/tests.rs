@@ -187,7 +187,7 @@ fn values_asked_at_once_from_many_threads_are_each_taken_once_by_key() {
     // The control: other bytes under a key asked since the last take are refused.
     asked.ask(key(0), std::borrow::Cow::Owned(value(0))).unwrap();
     let other = asked.ask(key(0), std::borrow::Cow::Borrowed(b"other")).unwrap_err();
-    assert!(other.contains("two values"), "{other}");
+    assert!(matches!(other, super::Unkept::TwoValues { in_store: false, .. }), "{other}");
 }
 
 /// The invariant: a per-item entry is found by its key alone, under any set, once the loop
@@ -256,7 +256,20 @@ fn blaze_dep_images_is_check_verify_or_unset() {
 
 #[test]
 fn a_build_that_serves_is_never_failed_for_differences() {
-    let kept = Kept { served: Served::default(), mode: Mode::Serve };
+    // A serve that served nothing, of a database of its own: `Served` has no default, as a
+    // serve is always of one database (its `nonce`).
+    let served = Served {
+        nonce: Db::new(|_| {}, blaze_memo::Reads::Off).nonce(),
+        keys: HashMap::new_in(Global),
+        hits: Vec::new(),
+        stale: Vec::new(),
+        build: ContentId::default(),
+        old_layout: Vec::new(),
+        lookups: hir_def::deps::record::Counts::default(),
+        stored: hir_def::deps::StoredOf::default(),
+        withdrawn: Vec::new_in(Global),
+    };
+    let kept = Kept { served, mode: Mode::Serve };
     assert!(differences(&kept).is_ok());
 }
 
@@ -273,7 +286,7 @@ fn a_task_that_would_wait_on_itself_runs_again_and_another_panic_goes_on() {
     let ran: Vec<AtomicU32> = (0..8).map(|_| AtomicU32::new(0)).collect();
     on_pool(ran.len(), &|at| {
         if ran[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
-            std::panic::panic_any(blaze_query::db::Cancelled::WouldWaitOnItself { asked: None });
+            blaze_memo::Cancelled::GaveWay.throw();
         }
     });
     let runs: Vec<u32> = ran.iter().map(|it| it.load(Ordering::Relaxed)).collect();

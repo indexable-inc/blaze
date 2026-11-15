@@ -119,6 +119,16 @@ of the lint outside tests (and, once no `// alloc:` line is left anywhere, no li
 `Global`), and every other crate's row only shrinks
 (`scripts/src/bin/allocs.rs`, [lints.md](lints.md#implicit_allocator)).
 
+A function that can fail returns an error type of its module: an enum or struct naming what
+failed and the thing it failed on, with `Display` (rule `errors-name-the-thing`), never
+`Result<_, String>`, `&str`, `Box<dyn Error>` or `anyhow`, which the caller can't match on and
+which can't take an allocator. The gate holds this by crate, from the text, until blaze checks
+its own crates with `blaze::untyped_error`: each crate's signatures with such an error, and its
+type aliases of such a `Result`, equal its row in
+`crates/blaze-lints/baselines/untyped-errors.txt`, which only shrinks, and a crate with no row is
+held to none; a change over its row is refused with the new sites named
+(`scripts/src/bin/untyped.rs`, [lints.md](lints.md#untyped_error)).
+
 blaze's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
 writing, the linker, the daemon and its socket, the cargo drop-in, the store and the remote,
 the sandbox, and the harnesses. A change there is one ordinary

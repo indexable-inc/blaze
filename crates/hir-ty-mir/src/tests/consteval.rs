@@ -34,7 +34,8 @@ mod const_str;
 mod const_traits;
 mod deps;
 mod intrinsics;
-mod items;
+// Its in-memory store is also `mir::body_store`'s.
+pub(super) mod items;
 mod memo;
 pub(crate) mod reach;
 mod records;
@@ -60,7 +61,7 @@ fn check_fail(
     let fx = fixture::db(ra_fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || match eval_goal(&db, file_id) {
+    blaze_memo::attach(&db, || match eval_goal(&db, file_id) {
         Ok(_) => panic!("Expected fail, but it succeeded"),
         Err(e) => {
             assert!(
@@ -127,7 +128,7 @@ fn check_answer_in(
     file_id: EditionedFileId,
     check: impl FnOnce(&[u8], &MemoryMap<'_>),
 ) {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let r = match eval_goal(db, file_id) {
             Ok(t) => t,
             Err(e) => {
@@ -2750,7 +2751,7 @@ const GOAL: usize = n::<{ S }>() * 10 + of_s([0; 5]);
     let fx = fixture::db(fixture);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def_map = hir_def::nameres::crate_def_map(&db, fixture::test_crate(&db));
         for (_, module) in def_map.modules(&db) {
             for def in module.scope(&db).declarations() {
@@ -2891,7 +2892,7 @@ fn enums() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let r = eval_goal(&db, file_id).unwrap();
         assert_eq!(allocation_as_usize(r), 1);
     })
@@ -3024,7 +3025,7 @@ fn implicit_discriminant_past_the_repr_type_is_an_error() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let table = crate::consteval::discriminants::enum_discriminants(&db, enum_in(&db, file_id));
         assert_eq!(table.overflowed(), [1]);
         assert!(table.discriminant(1).is_err() && table.discriminant(2).is_err());
@@ -3045,7 +3046,7 @@ fn duplicate_discriminants_are_found_in_one_pass() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let table = crate::consteval::discriminants::enum_discriminants(&db, enum_in(&db, file_id));
         assert!(table.has_duplicates());
         let groups: Vec<Vec<u32>> = table.duplicates().iter().map(|it| it.to_vec()).collect();
@@ -3061,23 +3062,30 @@ fn duplicate_discriminants_are_found_in_one_pass() {
 fn every_discriminant_and_the_layout_of_a_big_enum_take_one_pass() {
     use hir_def::HasModule as _;
 
+    use std::alloc::Global;
+
+    use blaze_memo::testing::Ran;
+
     use crate::{
         ParamEnvAndCrate,
+        consteval::discriminants::{enum_discriminants, explicit_discriminant_indices},
+        kinds::{const_eval_discriminant_variant, explicit_discriminant},
         layout::{Layout, RustcEnumVariantIdx},
+        test_db::runs_of,
     };
 
     /// Asks a fresh database every variant's discriminant and layout of an enum of `n`
     /// variants with one explicit discriminant: how long that took, and the queries it ran.
-    fn ask(n: usize) -> (std::time::Duration, Vec<String>) {
+    fn ask(n: usize) -> (std::time::Duration, Vec<Ran, Global>) {
         let variants: String = (1..n).map(|i| format!("V{i}, ")).collect();
         let fx = fixture::db(&format!("enum E {{ V0 = 7, {variants} }}"));
         let file_id = fx.only_file();
         let db = fx.into_db();
         let e = enum_in(&db, file_id);
         let ids: Vec<_> = e.enum_variants(&db).variants.values().map(|it| it.0).collect();
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
             let start = std::time::Instant::now();
-            let executed = db.log_executed(|| {
+            let executed = runs_of(&db, || {
                 for (index, &variant) in ids.iter().enumerate() {
                     assert_eq!(db.const_eval_discriminant(variant), Ok(7 + index as i128));
                 }
@@ -3097,11 +3105,11 @@ fn every_discriminant_and_the_layout_of_a_big_enum_take_one_pass() {
     }
 
     let (_, executed) = ask(20_000);
-    let runs = |name: &str| executed.iter().filter(|it| *it == name).count();
-    assert_eq!(runs("explicit_discriminant"), 1);
-    assert_eq!(runs("explicit_discriminant_indices"), 1);
-    assert_eq!(runs("enum_discriminants"), 1);
-    assert_eq!(runs("const_eval_discriminant_variant"), 20_000);
+    let runs = |kind: &str| executed.iter().filter(|it| it.query == kind).count();
+    assert_eq!(runs(explicit_discriminant::KIND_NAME), 1);
+    assert_eq!(runs(explicit_discriminant_indices::KIND_NAME), 1);
+    assert_eq!(runs(enum_discriminants::KIND_NAME), 1);
+    assert_eq!(runs(const_eval_discriminant_variant::KIND_NAME), 20_000);
     if skip_slow_tests() {
         return;
     }

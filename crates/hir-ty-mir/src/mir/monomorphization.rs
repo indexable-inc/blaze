@@ -110,7 +110,7 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 if self.depth >= limit {
                     // A type's `Debug` reads the attached database. The alias is as deep as
                     // the limit, so only its start is kept.
-                    let mut shown = blaze_query::db::attach(self.infcx.interner.db, || {
+                    let mut shown = blaze_memo::attach(self.infcx.interner.db, || {
                         format!("{:?} {ty:?}", alias.kind) // alloc: error path
                     });
                     if let Some((cut, _)) = shown.char_indices().nth(2000) {
@@ -542,7 +542,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for EraseAndAnonymize<'db> {
 }
 
 /// The constant behind a promoted `&expr` of `owner`, as the instance with `subst` sees it.
-#[blaze_query::tracked(returns(as_ref), lru = 0, mem_tag = Mir)]
+#[blaze_memo::tracked(returns(as_ref), owns, mem_tag = Mir)]
 pub fn monomorphized_promoted_mir_body_query<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,

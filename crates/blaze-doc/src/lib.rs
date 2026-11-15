@@ -33,8 +33,13 @@ pub use crate::places::Documented;
 
 /// Each crate's dependencies only its tests use (a workspace member's dev-dependencies), which
 /// rust-analyzer's crate graph gives the crate itself and `cargo doc` neither documents nor
-/// links: `(crate, dependency)`.
-pub type TestOnly = HashSet<(Crate, Crate), Global>;
+/// links: `(crate, dependency)`, each by its key, as it is held across [`set_cfg_doc`]'s commit.
+pub type TestOnly = HashSet<(base_db::CrateKey, base_db::CrateKey), Global>;
+
+/// Whether `dep` is a dependency of `krate` only its tests use (`test_only`).
+pub(crate) fn only_tests_use(db: &Db, test_only: &TestOnly, krate: Crate, dep: Crate) -> bool {
+    !test_only.is_empty() && test_only.contains(&(krate.base().key(db), dep.base().key(db)))
+}
 
 /// A crate the user asked to document.
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +84,7 @@ pub fn crates_to_document(
             let host = host || is_proc_macro(db, dep);
             if seen.contains(&dep)
                 || is_sysroot(db, dep)
-                || test_only.contains(&(krate, dep))
+                || only_tests_use(db, test_only, krate, dep)
                 || !walked.insert((dep, host))
             {
                 continue;
@@ -113,7 +118,7 @@ pub fn crates_to_document(
             .dependencies(db)
             .into_iter()
             .map(|dep| dep.krate)
-            .filter(|dep| !test_only.contains(&(krate, *dep)))
+            .filter(|dep| !only_tests_use(db, test_only, krate, *dep))
             .collect()
     });
     out.extend(kept.into_iter().filter(|it| linked.contains(&it.krate)).map(|it| Documented {
@@ -200,16 +205,26 @@ fn is_sysroot(db: &Db, krate: Crate) -> bool {
     matches!(krate.origin(db), base_db::CrateOrigin::Lang(_))
 }
 
-/// Sets `cfg(doc)` on the crates documented, as rustdoc does for the crate it documents.
-pub fn set_cfg_doc(db: &mut Db, crates: &[Documented]) {
-    db.batch(base_db::Trigger::named("cfg(doc) set on the crates documented"), |db| {
-        for documented in crates {
-            let krate: base_db::Crate = documented.krate.into();
-            let mut cfg = krate.cfg_options(db).clone();
-            cfg.insert_atom(intern::Symbol::intern("doc"));
-            krate.set_cfg_options(db, cfg);
-        }
-    });
+/// Sets `cfg(doc)` on the crates documented, as rustdoc does for the crate it documents, in
+/// one commit. The commit drops each documented crate's arena, and its id with it, so each of
+/// `crates` is given its crate again, taken by its key in the new snapshot.
+pub fn set_cfg_doc(db: &mut Db, crates: &mut [Documented]) {
+    let mut keys: Vec<base_db::CrateKey, Global> = Vec::with_capacity_in(crates.len(), Global);
+    let mut edit = db.edit();
+    for documented in crates.iter() {
+        // Read from the snapshot before the edit, which the crate's id is of.
+        let krate = documented.krate.base();
+        // clone: a documented crate's cfg, once, to add `doc` to
+        let mut cfg = krate.cfg_options(edit.db()).clone();
+        cfg.insert_atom(intern::Symbol::intern("doc"));
+        let key = krate.key(edit.db());
+        edit.set_crate_cfg_options(key, cfg);
+        keys.push(key);
+    }
+    _ = edit.commit();
+    for (documented, &key) in crates.iter_mut().zip(&keys) {
+        documented.krate = Crate::from(db.krate(key));
+    }
 }
 
 /// The documentation of `crates`, ready to write.

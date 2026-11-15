@@ -226,6 +226,9 @@ fn an_edit_of_a_large_root_hashes_its_path_and_allocates_nothing() {
                 index.remove(file);
                 index.insert(file, key, path17, text(at));
                 RootContent::refresh(contents, &[ROOT], frame);
+                // What the edit's commit does: its undo is let go, its capacity kept for the
+                // next edit's.
+                contents.get_mut(&ROOT).expect("the root").forget();
             };
         cycle(&mut contents, key17.clone(), 2);
         let key = key17.clone();

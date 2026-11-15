@@ -1,7 +1,7 @@
 //! blaze-memo's attributes, with blaze-query's call shapes: `#[tracked]` on free functions and
 //! on the functions of a tracked `impl`, `#[input]`, `#[interned]` and `#[derive(Home)]`.
 //! Generated code names `::blaze_memo::plumbing` only. blaze-query's options and attributes the
-//! memo has no meaning for (`lru`, `weigh`, `no_eq`, `scope`, `settled`, `mem_tag`, `#[set]`,
+//! memo has no meaning for (`lru`, `weigh`, `no_eq`, `scope`, `settled`, `#[set]`,
 //! `#[default]`, tracked structs, `Value`, `Supertype`) are refused with what replaces them.
 
 #![forbid(unsafe_code)]

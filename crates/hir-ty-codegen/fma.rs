@@ -1643,7 +1643,7 @@ fn inline_cost<'db>(
 /// Whether `func`'s body has an fma, or a call rustc may inline that has one, at any depth: a
 /// call of no fma that rustc inlines however deep puts none into its caller. A cycle of calls
 /// starts as having none and is iterated to its fixpoint.
-#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _| false)]
+#[blaze_memo::tracked(returns(copy), cycle_initial = |_, _| false)]
 fn reaches_fma(db: &Db, func: FunctionId) -> bool {
     let Ok((body, _)) = root_body(db, func) else { return false };
     for (_, data) in body.basic_blocks.iter() {

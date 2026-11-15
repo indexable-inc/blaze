@@ -22,7 +22,7 @@ const MINICORE: &str = "//- minicore: sized, copy, clone, drop, option, result, 
 fn work_checked(source: &str) -> Result<Reach, String> {
     let db = fixture::db(source).into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
         // `explain` is not kept, so each is a proof of its own.
         let first = reach::explain(&db, def, &[]);

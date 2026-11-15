@@ -22,6 +22,18 @@ interned_slice!(
 );
 impl_foldable_for_interned_slice!(PredefinedOpaques);
 
+/// A predefined opaque's home: the greatest arena its opaque type's definition, its arguments
+/// and its hidden type name (each handle's own home, not descended into).
+impl<'db> table::Homed for PredefinedOpaque<'db> {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        let (key, hidden) = self;
+        table::Homed::home(&key.def_id)
+            .max(table::Homed::home(&key.args))
+            .max(table::Homed::home(hidden))
+    }
+}
+
 pub type ExternalConstraintsData<'db> =
     rustc_type_ir::solve::ExternalConstraintsData<DbInterner<'db>>;
 
@@ -39,6 +51,35 @@ impl_foldable_for_interned_slice!(SolverDefIds);
 static EXTERNAL_CONSTRAINTS: table::Values<ExternalConstraintsData<'static>> =
     table::Values::new("external constraints");
 table::erase!(ExternalConstraintsData);
+table::holds_by_visit!(ExternalConstraintsData<'static>);
+
+/// The newest arena solver constraints name: of each type, region and constant handle in them
+/// (each row's own home, not descended into; a predicate is walked to its handles) and of each
+/// opaque type's definition.
+impl<'db> table::Homed for ExternalConstraintsData<'db> {
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        /// The greatest home seen so far; `None` while only plain data was.
+        struct Newest(Option<blaze_memo::ArenaId>);
+        impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Newest {
+            type Result = ();
+            fn visit_ty(&mut self, t: Ty<'db>) {
+                self.0 = self.0.max(table::Homed::home(&t));
+            }
+            fn visit_region(&mut self, r: super::Region<'db>) {
+                self.0 = self.0.max(table::Homed::home(&r));
+            }
+            fn visit_const(&mut self, c: super::Const<'db>) {
+                self.0 = self.0.max(table::Homed::home(&c));
+            }
+        }
+        let mut newest = Newest(None);
+        rustc_type_ir::TypeVisitable::visit_with(self, &mut newest);
+        for (key, _) in &self.opaque_types {
+            newest.0 = newest.0.max(table::Homed::home(&key.def_id));
+        }
+        newest.0
+    }
+}
 
 /// Solver constraints: their row in [`EXTERNAL_CONSTRAINTS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

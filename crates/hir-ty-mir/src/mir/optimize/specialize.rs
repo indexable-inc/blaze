@@ -61,7 +61,7 @@
 
 use base_db::Db;
 use blaze_mem::{Frame, Tag, frame};
-use blaze_query::db::AsId;
+use blaze_memo::Id as _;
 use hir_def::{
     AdtId, FunctionId, HasModule, VariantId, attrs::AttrFlags, signatures::FunctionSignature,
     span_names,
@@ -115,18 +115,13 @@ type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 /// A specialized copy of a function, by what it knows ([`Specialization`]): the instance the
 /// code generator compiles for a call [`Inlined::specialized`](crate::mir::Inlined::specialized)
 /// lists. One for every call that knows the same, whichever body it is in.
-#[blaze_query::interned(debug)]
+#[blaze_memo::interned(debug, owns)]
 pub struct CloneId {
     #[returns(ref)]
     pub spec: Specialization,
 }
 
-fn clone_loop<'db>(
-    _: &'db Db,
-    _: blaze_query::db::Id,
-    _: CloneId<'db>,
-    _: MirOptions,
-) -> Result<'db, MirBody<'db>> {
+fn clone_loop<'db>(_: &'db Db, _: CloneId<'db>, _: MirOptions) -> Result<'db, MirBody<'db>> {
     Err(MirLowerError::Loop)
 }
 
@@ -142,7 +137,7 @@ fn clone_loop<'db>(
 /// stored (`hir::evict::drop_mir`). coord-108 (B5): it was a plain
 /// query, kept for the daemon's life and charged to `query`, so the release that dropped 150,000
 /// MIR bodies left every specialized copy.
-#[blaze_query::tracked(returns(as_ref), cycle_result = clone_loop, lru = 0, mem_tag = Mir)]
+#[blaze_memo::tracked(returns(as_ref), owns, cycle_result = clone_loop, mem_tag = Mir)]
 pub fn specialized_mir_body<'db>(
     db: &'db Db,
     clone: CloneId<'db>,
@@ -193,7 +188,7 @@ pub fn specialized_mir_body<'db>(
 }
 
 /// The parameters of a function a copy of it may know, read from its runtime body.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct Plan {
     /// Statements and terminators of the runtime body.
     size: u32,
@@ -201,7 +196,7 @@ pub(super) struct Plan {
     params: Box<[Param]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Param {
     /// In `param_locals`, and among the call's arguments.
     index: u32,
@@ -213,7 +208,7 @@ struct Param {
     compared: Box<[u128]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Kind {
     Bool,
     /// An integer or a `char`.
@@ -345,7 +340,7 @@ fn ineligible(db: &Db, base: FunctionId) -> Option<&'static str> {
 }
 
 /// What a copy of `base` may know: its [`Plan`], or why it has no copies.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(super) fn plan(db: &Db, base: FunctionId) -> std::result::Result<Plan, &'static str> {
     if let Some(why) = ineligible(db, base) {
         return Err(why);
@@ -399,7 +394,7 @@ fn size_of(body: &MirBody<'_>) -> u32 {
 
 /// The work [`fold`] removes from the base of `clone`, weighed as [`MIN_SAVES`] says: 0 where
 /// it decides no branch.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn saves<'db>(db: &'db Db, clone: CloneId<'db>) -> u32 {
     let spec = clone.spec(db);
     let Ok(body) = db.runtime_mir_body(spec.base.into()) else { return 0 };
@@ -1134,9 +1129,9 @@ pub(super) fn specialize<'db>(
     }
     // Each copy once, weighed at its first call: the calls grouped by the copy's interned id,
     // which only groups them, then by block. Nothing below reads the order of the groups.
-    let mut by_copy: Vec<(blaze_query::db::Id, usize), &Frame> = Vec::new_in(frame);
+    let mut by_copy: Vec<(blaze_memo::Gid, usize), &Frame> = Vec::new_in(frame);
     let others = found.iter().enumerate().filter(|(_, it)| !it.own);
-    by_copy.extend(others.map(|(at, it)| (it.id.as_id(), at)));
+    by_copy.extend(others.map(|(at, it)| (it.id.gid(), at)));
     by_copy.sort_unstable();
     let mut weighed: Vec<Weighed, &Frame> = Vec::new_in(frame);
     for calls in by_copy.chunk_by(|a, b| a.0 == b.0) {

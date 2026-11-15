@@ -2,7 +2,7 @@
 //! it changes with each input of it alone (its crate's settings, the front end's build, its
 //! own text, its owner, its module) and with nothing else. What a body resolves (a path's
 //! target, a glob shadowed, a trait in scope, a named item's signature) is not in the key: it
-//! is a fact of the step's shape, and `classify` tests that each such read is one.
+//! is a read in the step's read list (`blaze_memo::record`).
 //!
 //! Each test builds two databases from two fixtures and compares the key of the body of the
 //! one function named `f`.
@@ -18,13 +18,15 @@ use hir_def::{
 };
 use hir_expand::fixture;
 
-use crate::identity::{early_identity, set_build};
+use crate::identity::{early_identity, give_build};
 
 mod properties;
 
 pub(super) fn db(fixture: &str) -> Db {
     let mut db = fixture::db(fixture).into_db();
-    set_build(&mut db, ContentId([7; 32]));
+    let mut edit = db.edit();
+    give_build(&mut edit, ContentId([7; 32]));
+    _ = edit.commit();
     db
 }
 
@@ -112,7 +114,11 @@ fn the_front_end_build_changes_it() {
     let mut db = db(&fixture);
     let def = body(&db, "f");
     let before = early_identity(&db, def).unwrap();
-    set_build(&mut db, ContentId([8; 32]));
+    let mut edit = db.edit();
+    give_build(&mut edit, ContentId([8; 32]));
+    _ = edit.commit();
+    // An id is of the snapshot it was taken in: taken again after the commit.
+    let def = body(&db, "f");
     assert_ne!(early_identity(&db, def).unwrap(), before);
 }
 
@@ -124,7 +130,7 @@ fn the_items_own_signature_changes_it() {
 
 /// What the body resolves is a fact of its steps, not a part of its key: a named item's
 /// hidden type or value, a dependency's item's signature, which item a path or a glob finds.
-/// `classify` holds each such read to a fact, so the step's answer is checked against it.
+/// The recorder lists each such read, so the step's answer is checked against it.
 #[test]
 fn what_the_body_resolves_does_not_change_it() {
     same(
@@ -140,8 +146,12 @@ fn what_the_body_resolves_does_not_change_it() {
             .replace("STRUCT", s)
     };
     same(&dep("pub struct S(pub u8);"), &dep("pub struct S(pub u16);"));
+    // `other` is named in both (by `h`), so both load it: which crates a crate loads is one of
+    // its settings (`crate_inputs`, `hir_ty::method_resolution::loaded_crates`), and naming a
+    // crate for the first time would change that, not what the glob finds.
     let glob = |shadow: &str| {
         let main = "//- /main.rs crate:main deps:dep,other\nuse dep::*;\nSHADOW\npub fn f() -> u8 { g() }\n\
+                    pub fn h() -> u8 { other::g() }\n\
                     //- /other.rs crate:other\npub fn g() -> u8 { 1 }\n";
         format!("{}{DEP}", main.replace("SHADOW", shadow))
     };

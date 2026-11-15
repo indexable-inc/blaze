@@ -1,12 +1,11 @@
 //! One fixture crate of many bodies in many files, one body edited at a time: the time to
 //! ask for the whole crate again after an edit, against its bound
 //! (docs/v2/plan/design/item-hash.md). An edit's pass can do no less than a pass
-//! that changed nothing (every memo validated) plus executing the edited body's queries,
+//! that changed nothing (every entry a hit) plus running the edited body's queries,
 //! which cost a cold pass's share per body; an edit is that twice, once for the undo.
 
 use std::{fmt::Write as _, time::Instant};
 
-use blaze_query::db::{Database as _, Durability};
 use hir_expand::fixture;
 use hir_firewall::Harness;
 
@@ -44,13 +43,13 @@ fn main() {
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
     let setup = started.elapsed();
 
-    db.storage_mut().synthetic_write(Durability::LOW);
+    // Nothing changed: a commit that moves nothing makes no snapshot, so this is the same one.
     let started = Instant::now();
     let executed = harness.ask_all(&db).expect("a pass");
     let warm = started.elapsed();
     if executed != 0 {
         println!(
-            "  a revision that changed nothing executed {executed} keys again: they are volatile"
+            "  asked again with nothing changed, {executed} queries ran again: they are volatile"
         );
     }
 
@@ -72,9 +71,10 @@ fn main() {
         report.edits
     );
     println!(
-        "  per edit: {} keys executed, {} executed or validated",
+        "  per edit: {} queries ran, {} of them the crate's own; {} served from records",
         report.executed / report.edits.max(1),
-        report.touched / report.edits.max(1)
+        report.reran_own / report.edits.max(1),
+        report.served / report.edits.max(1) as u64
     );
     if !report.is_clean() {
         println!("  the edits leaked: {report}");

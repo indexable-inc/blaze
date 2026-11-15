@@ -16,8 +16,8 @@
 //! (`static mut`, thread-locals, foreign statics, statics with interior mutability), bodies
 //! that do not lower, code pointers made of bytes, and instances past [`LONGEST`].
 //!
-//! Proofs are an input of a summary ([`Proofs`], in every key: the sealed tables',
-//! `summary_in`, `summary_within`, `summarized`). Under [`Proofs::None`] no site is
+//! Proofs are an input of a summary ([`Proofs`], in its key: [`summary_in`]'s, and every
+//! callee is asked with its caller's, [`Cx::summary`]). Under [`Proofs::None`] no site is
 //! discharged by the reachability prover and the prover never runs; under [`Proofs::Spent`]
 //! it does ([`proof_of`]). Who asks for which is decided once, `hir_ty::facts::proofs_at` of
 //! the asking body's tier: a tier 0 body and the library's as shipped ask for no summary at
@@ -39,7 +39,7 @@ use std::{cmp::Ordering, sync::Arc};
 
 use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::{Home as _, Id as _};
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup as _,
     ModuleDefId, ModuleIdLt, StaticId,
@@ -88,14 +88,10 @@ use smallvec::SmallVec;
 use std::alloc::Global;
 use syntax::{SyntaxKind, TextRange};
 
-pub(crate) use crate::sealed::{summary, summary_at};
-#[cfg(test)]
-pub(crate) use crate::sealed::summary_in;
 use crate::{
     Abs, Effects, Impure, Proof, Purity, allowed_env, effect_attrs,
     effects::{self, EFFECTS, EffectDef, EffectSet, Rule},
     identity, loops,
-    sealed::{Sealed, summary_within},
     memory::{self, CallKind, MemoryEffects, Origin, SiteFacts},
     models::{Applied, Leaf, Model, Transfer, apply_leaf, effect_row, model_of, tag},
     values::{Flow, Spread, Values, evaluate},
@@ -110,24 +106,23 @@ pub(crate) enum Def {
 
 /// An instance: what it runs and its generic arguments (a closure's or coroutine's are its
 /// parent's; a leaf's are none).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Instance {
     pub(crate) def: Def,
     pub(crate) args: StoredGenericArgs,
 }
 
-/// The body it runs (the function a leaf models) and what its arguments name: whose a query
-/// keyed by it is ([`blaze_query::db::Storage::ids_of`]), as hir-ty-identity's `Instance`
-/// says it, so an edit's firewall tells the instances of the edited body from another's.
-impl blaze_query::db::NamesIds for Instance {
-    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+/// The body it runs (the function a leaf models) and what its arguments name: the arenas a
+/// query keyed by it is homed by, the greatest of them its home (spec rule 2).
+impl blaze_memo::Home for Instance {
+    fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
         match self.def {
-            Def::Body(Body::Fn(it)) | Def::Leaf(it, _) => out.push(it.as_id()),
+            Def::Body(Body::Fn(it)) | Def::Leaf(it, _) => it.home(homes),
             Def::Body(Body::Closure(it) | Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
-                out.push(it)
+                it.home(homes)
             }
         }
-        blaze_query::db::NamesIds::names_ids(&self.args, out);
+        self.args.home(homes);
     }
 }
 
@@ -293,8 +288,8 @@ pub struct ScriptProof {
     pub purity: Purity,
     /// The body instances the walk reaches ([`walk_steps`]), each from the environment that asks
     /// for it: each one a step of the bound its caller puts on the proof
-    /// (`blaze_query::db::with_steps`). It counts the script's code,
-    /// never what was cached or what another task ran, so a cold, warm or busy database gives
+    /// ([`crate::with_steps`]). It counts the script's code,
+    /// never what was cached or what another task ran, so a cold, warm or busy memo gives
     /// the same count, and a proof runs out of steps on all of them or on none.
     pub steps: u32,
 }
@@ -307,7 +302,7 @@ pub fn script_purity(db: &Db, main: FunctionId) -> &Purity {
 
 /// Whether the build script whose `main` is `main` is pure, its proof if it is, and how many
 /// instances its walk takes.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn script_proof(db: &Db, main: FunctionId) -> ScriptProof {
     let stored = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) }.store();
     // A build script's purity is a check: it spends proofs.
@@ -561,9 +556,9 @@ pub(crate) fn home_env(
 pub(crate) fn def_crate(db: &Db, def: Def) -> Crate {
     match def {
         Def::Body(Body::Fn(func)) | Def::Leaf(func, _) => func.krate(db),
-        Def::Body(Body::Closure(id)) => InternedClosureId::from_id(id).loc(db).owner.krate(db),
+        Def::Body(Body::Closure(id)) => InternedClosureId::from_gid(id).loc(db).owner.krate(db),
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
-            InternedCoroutineId::from_id(id).loc(db).owner.krate(db)
+            InternedCoroutineId::from_gid(id).loc(db).owner.krate(db)
         }
     }
 }
@@ -572,22 +567,69 @@ pub(crate) fn def_crate(db: &Db, def: Def) -> Crate {
 /// step is known by.
 pub(crate) fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
     let (kind, id) = match body {
-        Body::Fn(func) => (0u128, func.as_id()),
+        Body::Fn(func) => (0u128, func.gid()),
         Body::Closure(id) => (1, id),
         Body::Coroutine(id) => (2, id),
         Body::CoroutineByMove(id) => (3, id),
     };
-    (kind << 64) | (u128::from(id.as_u32()) << 32) | u128::from(args.as_ref().index())
+    // The arena's index and generation, as one word (20 and 12 bits), then the id in it.
+    let arena = (id.arena().index() << 12) | id.arena().generation();
+    (kind << 96)
+        | (u128::from(arena) << 64)
+        | (u128::from(id.local()) << 32)
+        | u128::from(args.as_ref().index())
 }
 
-/// What the instance does, in `env`: the body of both [`crate::sealed::summary_in`] (a workspace
-/// home's row)
-/// and the task-scoped summary of a sealed home (`crate::sealed`), run under the witnessing frame of
-/// `within`, the [`Sealed`] of the home's crate, which its callees are asked through. Made
-/// with `proofs`, which its callees are asked with too.
+/// What the instance does, asked from `env`: worked out in its home ([`home_env`]), so every
+/// build script that reaches it shares one summary. A body instance is a step of the walk's
+/// bound, if one is set ([`crate::with_steps`]), however often it is asked for, whether its
+/// summary runs or is found in the memo.
+///
+/// This is the checks' summary: proofs spent ([`Proofs::Spent`]), as every effect and role
+/// lint asks, on demand. What a tier asks for code is [`summary_at`].
+pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Arc<Summary> {
+    summary_at(db, Proofs::Spent, env, instance)
+}
+
+/// [`summary`] made with `proofs`: [`Proofs::None`] for the facts a tier 0 body spends. A
+/// summary asks its callees with its own `proofs`, so one made without proofs never reads one
+/// made with them.
+pub(crate) fn summary_at(
+    db: &Db,
+    proofs: Proofs,
+    env: StoredParamEnvAndCrate,
+    instance: Instance,
+) -> Arc<Summary> {
+    if let Def::Body(body) = instance.def {
+        crate::steps::step(|| step_key(body, &instance.args), || name_of(db, &instance));
+    }
+    summary_in(db, home_env(db, &env, &instance), proofs, instance)
+}
+
+/// What the instance does, in `env`, its home, made with `proofs`: a summary of one mode is a
+/// row of its own and never read for the other's. Keyed by the instance, the home and the
+/// mode, so it is homed by the greatest arena they name (spec rule 2): a crate's arena drops
+/// with what it read. A cycle of instances starts from the summary of a recursion
+/// (`Summary::recursive`) and iterates to its fixpoint: each local's value only rises, in a
+/// lattice three high, and the recursion's witness keeps one depth.
+#[blaze_memo::tracked(returns(clone), owns, cycle_initial = |_, _, _, _| Arc::new(Summary::recursive()))]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_memo::tracked` hands the body by value"
+)]
+pub(crate) fn summary_in(
+    db: &Db,
+    env: StoredParamEnvAndCrate,
+    proofs: Proofs,
+    instance: Instance,
+) -> Arc<Summary> {
+    summarized(db, proofs, env, &instance)
+}
+
+/// What the instance does, in `env`: the body of [`summary_in`]. Made with `proofs`, which its
+/// callees are asked with too.
 pub(crate) fn summarized(
     db: &Db,
-    within: Option<&Sealed>,
     proofs: Proofs,
     env: StoredParamEnvAndCrate,
     instance: &Instance,
@@ -595,7 +637,7 @@ pub(crate) fn summarized(
     let Def::Body(of) = instance.def else { return Arc::new(Summary::default()) }; // alloc: a leaf's summary, empty
     #[cfg(test)]
     plant::count_summary();
-    let cx = Cx::within(db, env, proofs, within.cloned()); // clone: two reference counts
+    let cx = Cx::new(db, env, proofs);
     // The body is read here once and only the summary is kept: made for this run and dropped
     // with it ([`dispatch::body_once`]), never the memo `dispatch::body_of` reads, which would keep one
     // monomorphized body an instance the walk reaches until the build lets every MIR go.
@@ -717,12 +759,12 @@ pub(crate) fn trust_mask(db: &Db, func: FunctionId) -> u32 {
 /// counted for every effect, and before it any counted for fewer (a call of a function trusted
 /// for some effects: `except` has a bit per effect of [`EFFECTS`] it does not count for).
 #[derive(Default)]
-struct Own {
+pub(crate) struct Own {
     /// The effects the body's crate is trusted for (`effect_attrs::crate_trust`): every place's
     /// `except` has them, so a place counted for every other effect is full.
     base: u32,
     /// Every kind, trust not applied.
-    kinds: EffectSet,
+    pub(crate) kinds: EffectSet,
     /// The kinds with a place counted for every effect but `base`'s.
     full: EffectSet,
     // alloc: the body's own kinds, few, once per instance
@@ -751,7 +793,7 @@ impl Own {
     }
 
     /// The sets and witnesses of these kinds alone.
-    fn into_sets(self) -> (Sets, Box<[Witness]>) {
+    pub(crate) fn into_sets(self) -> (Sets, Box<[Witness]>) {
         let mut sets = SmallVec::new();
         let mut witnesses = Vec::new(); // alloc: an instance's witnesses, once per instance
         for (index, effect) in EFFECTS.iter().enumerate() {
@@ -799,38 +841,23 @@ pub(crate) struct Cx<'db> {
     pub(crate) env: ParamEnvAndCrate<'db>,
     pub(crate) stored: StoredParamEnvAndCrate,
     lang: &'db LangItems,
-    /// The sealed crate whose covered run this is ([`Cx::within`]): its callees' summaries are
-    /// found through it, never by a read of `crate::sealed::sealed` under the frame.
-    sealed: Option<Sealed>,
     /// Whether the summaries made and asked from here spend proofs: part of every summary's
-    /// key ([`crate::sealed::Key`]), so a callee is asked with the caller's.
+    /// key ([`summary_in`]), so a callee is asked with the caller's.
     pub(crate) proofs: Proofs,
 }
 
 impl<'db> Cx<'db> {
     /// The context of a summary or check asked in `stored`, made with `proofs`.
     pub(crate) fn new(db: &'db Db, stored: StoredParamEnvAndCrate, proofs: Proofs) -> Cx<'db> {
-        Cx::within(db, stored, proofs, None)
-    }
-
-    /// [`Cx::new`] for a run under the witnessing frame of `sealed` (`None`: no such run).
-    pub(crate) fn within(
-        db: &'db Db,
-        stored: StoredParamEnvAndCrate,
-        proofs: Proofs,
-        sealed: Option<Sealed>,
-    ) -> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
-        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), sealed, proofs }
+        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), proofs }
     }
 
-    /// The summary of `instance` asked from this environment, with this context's proofs:
-    /// through the sealed crate this run is under, if it is one.
+    /// The summary of `instance` asked from this environment, with this context's proofs.
     pub(crate) fn summary(&self, instance: Instance) -> Arc<Summary> {
-        // clone: the query's key, reference counts
-        summary_within(self.db, self.sealed.as_ref(), self.proofs, self.stored.clone(), instance)
+        summary_at(self.db, self.proofs, self.stored, instance)
     }
 
     pub(crate) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
@@ -868,23 +895,32 @@ impl std::fmt::Display for Shown<'_> {
 
 /// What a site reaches, and how its parameters take the site's operands.
 #[derive(Clone)]
-enum Reached {
+pub(crate) enum Reached {
     Walk(Instance, Spread),
     Leaf(Instance, Spread),
 }
 
-struct Site {
-    reached: Reached,
+impl Reached {
+    /// The instance the site reaches, and how its parameters take the site's operands.
+    pub(crate) fn instance(&self) -> (&Instance, Spread) {
+        match self {
+            Reached::Walk(instance, spread) | Reached::Leaf(instance, spread) => (instance, *spread),
+        }
+    }
+}
+
+pub(crate) struct Site {
+    pub(crate) reached: Reached,
     /// The block whose call's operands the parameters are taken from; none for a site that
     /// is not a call.
-    call: Option<BasicBlockId>,
+    pub(crate) call: Option<BasicBlockId>,
     /// Where in the body: the statement or terminator it is of.
-    span: Option<MirSpan>,
+    pub(crate) span: Option<MirSpan>,
     /// What the memory pass applies its callee's facts to.
-    origin: Origin,
+    pub(crate) origin: Origin,
     /// A closure or function given to a trusted function: for the effects alone, not a callee
     /// of a build script's graph.
-    given: bool,
+    pub(crate) given: bool,
 }
 
 /// One body's walk: its sites in order, the flow of each block's call and the first thing it
@@ -919,7 +955,46 @@ struct Walk<'a, 'db> {
     owned_dyns: HashMap<Ty<'db>, bool, Global>,
 }
 
-fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
+/// What one body instance gives its summary by itself: everything [`summarize`] works out of
+/// the body before it reads any callee's summary ([`own_part`]). [`fold`] makes the summary
+/// of it, the summaries of its sites' callees and the body, which it reads again for the
+/// three passes this part does not reduce: the locals' values (`Values::solve`), the memory
+/// (`memory::infer`) and the locks (`locks::of`), each a fixpoint over the body's statements
+/// with the callees' parts (returned values, memory facts, lock summaries) as its inputs.
+///
+/// The refinement: `summary_in(i)` is `fold(own_part(i), [summary(c) for each site's callee
+/// c of i])`, a fixpoint where the call graph has a cycle (`Summary::recursive` is its
+/// start). An instance's part reads its own monomorphized body and the signatures, impls
+/// and attributes its calls resolve through; never another body.
+pub(crate) struct OwnPart {
+    /// The sites, in the order the walk meets them: what each reaches, how, and where.
+    pub(crate) sites: Vec<Site>,
+    /// Per block, what its call's destination gets; a walked callee's value by its site.
+    pub(crate) flows: Vec<Flow>,
+    /// The first thing the body does itself that a build script may not.
+    pub(crate) script: Option<String>,
+    /// The kinds the body has itself, each with its first place.
+    pub(crate) kinds: Own,
+    /// Per block, what its call is past its sites.
+    pub(crate) calls: Vec<CallKind>,
+    /// Whether the body is a workspace crate's (`effects::workspace`).
+    pub(crate) workspace: bool,
+    /// The functions trusted for some effect it calls with no site of their own, sorted, each
+    /// once.
+    pub(crate) trusted_calls: SmallVec<[FunctionId; 2]>,
+    /// Its calls of foreign functions that may block the thread.
+    pub(crate) foreign: Vec<crate::locks::ForeignBlock>,
+    /// Per site, whether its call is proved to have no panic here: in a block no path reaches,
+    /// or of a modeled function proved not to panic with these arguments.
+    pub(crate) discharged: Vec<bool>,
+    /// Per local, whether a value of its type holds no pointer.
+    pub(crate) pointerless: SmallVec<[bool; 16]>,
+}
+
+/// The part of `def`'s summary its body `body` gives by itself ([`OwnPart`]), in `cx`'s
+/// environment: one walk of the body's sites, its reach proof and its `unsafe` scan. Asks no
+/// summary.
+pub(crate) fn own_part<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> OwnPart {
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
     // What is proved dead or unable to fail is not a panic of this body
@@ -932,33 +1007,75 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
     if let Def::Body(Body::Fn(func)) = def {
         walk.unsafe_code(func);
     }
-    let mut values = Values::solve(db, cx.env, &cx.infcx, body, &walk.flows);
+    let mut discharged = Vec::with_capacity_in(walk.sites.len(), Global);
+    discharged.extend(walk.sites.iter().map(|site| {
+        !site.given
+            && site.call.is_some_and(|block| reach.is_some_and(|it| it.discharged_block(block)))
+    }));
+    let pointerless: SmallVec<[bool; 16]> =
+        body.locals.iter().map(|(_, local)| walk.pointerless(local.ty.as_ref())).collect(); // alloc: inline up to sixteen locals
+    walk.trusted_calls.sort();
+    OwnPart {
+        sites: walk.sites,
+        flows: walk.flows,
+        script: walk.own,
+        kinds: walk.kinds,
+        calls: walk.calls,
+        workspace: walk.workspace,
+        trusted_calls: walk.trusted_calls,
+        foreign: walk.foreign,
+        discharged,
+        pointerless,
+    }
+}
+
+fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
+    fold(cx, body, own_part(cx, body, def))
+}
+
+/// The summary of the instance whose body is `body` and whose own part is `own`: each site's
+/// callee's summary folded in, in site order ([`OwnPart`] says what it reads).
+pub(crate) fn fold<'db>(cx: &Cx<'db>, body: &MirBody<'db>, own: OwnPart) -> Summary {
+    let db = cx.db;
+    let OwnPart {
+        sites: own_sites,
+        flows,
+        script,
+        kinds: own_kinds,
+        calls,
+        workspace,
+        trusted_calls,
+        foreign,
+        discharged: own_discharged,
+        pointerless,
+    } = own;
+    // What each walked callee returns, from its summary, asked in site order: the order the
+    // walk asked them in before the own part was cut out of it.
+    let mut rets = Vec::with_capacity_in(own_sites.len(), Global);
+    rets.extend(own_sites.iter().map(|site| match &site.reached {
+        Reached::Walk(instance, _) => cx.summary(instance.clone()).ret, // clone: the query's key, reference counts
+        Reached::Leaf(..) => Abs::Unset,
+    }));
+    let mut values = Values::solve(db, cx.env, &cx.infcx, body, &flows, &rets);
     let mut out = Out::default();
-    if let Some(what) = walk.own.take() {
+    if let Some(what) = script {
         out.impure(Impure { what, through: Vec::new() }); // alloc: empty, allocates nothing
     }
     // Memory the walk cannot follow, or state no argument reaches, is any memory.
-    let refused = walk.kinds.kinds.intersect(EffectSet::of(&[
+    let refused = own_kinds.kinds.intersect(EffectSet::of(&[
         Rule::Unchecked,
         Rule::Open,
         Rule::MutableState,
     ]));
-    let mut fold = Fold::new(std::mem::take(&mut walk.kinds), body.owner.krate(db));
-    let mut callees = Vec::with_capacity(walk.sites.len()); // alloc: the summary's callees, once per instance
-    let mut sites = Vec::with_capacity(walk.sites.len()); // alloc: the summary's effect sites, once per instance
-    let mut facts = Vec::with_capacity(walk.sites.len()); // alloc: one site's memory facts each, once per instance
-    for (at, site) in walk.sites.iter().enumerate() {
-        let (instance, spread) = match &site.reached {
-            Reached::Walk(instance, spread) | Reached::Leaf(instance, spread) => {
-                (instance, *spread)
-            }
-        };
+    let mut fold = Fold::new(own_kinds, body.owner.krate(db));
+    let mut callees = Vec::with_capacity(own_sites.len()); // alloc: the summary's callees, once per instance
+    let mut sites = Vec::with_capacity(own_sites.len()); // alloc: the summary's effect sites, once per instance
+    let mut facts = Vec::with_capacity(own_sites.len()); // alloc: one site's memory facts each, once per instance
+    for (at, site) in own_sites.iter().enumerate() {
+        let (instance, spread) = site.reached.instance();
         sites.push(EffectSite { instance: instance.clone(), span: site.span, given: site.given }); // clone: reference counts
+        let discharged = own_discharged[at];
         let at = at as u32;
-        // A call in a block no path reaches, or of a modeled function proved not to panic
-        // with these arguments, has no panic here; its other effects stay.
-        let discharged = !site.given
-            && site.call.is_some_and(|block| reach.is_some_and(|it| it.discharged_block(block)));
         let memory = match instance.def {
             Def::Leaf(func, leaf) => {
                 let (kinds, does) = effects::leaf_kinds(leaf);
@@ -978,7 +1095,7 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
                     def,
                     instance.args.as_ref(),
                     &callee,
-                    walk.workspace,
+                    workspace,
                     at,
                     discharged,
                 );
@@ -1015,22 +1132,17 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
         callees.push(instance.clone()); // clone: reference counts
     }
     let ret = values.local(return_slot());
-    let pointerless: SmallVec<[bool; 16]> =
-        body.locals.iter().map(|(_, local)| walk.pointerless(local.ty.as_ref())).collect(); // alloc: inline up to sixteen locals
-    let memory = memory::infer(body, &pointerless, &walk.calls, &facts, !refused.is_empty());
+    let memory = memory::infer(body, &pointerless, &calls, &facts, !refused.is_empty());
     let (kinds, sets, witnesses) = fold.finish();
-    walk.trusted_calls.sort();
-    let lock_sites: Vec<crate::locks::LockSite<'_>> = walk
-        .sites
+    let lock_sites: Vec<crate::locks::LockSite<'_>> = own_sites
         .iter()
-        .map(|site| {
-            let instance = match &site.reached {
-                Reached::Walk(instance, _) | Reached::Leaf(instance, _) => instance,
-            };
-            crate::locks::LockSite { instance, call: site.call, given: site.given }
+        .map(|site| crate::locks::LockSite {
+            instance: site.reached.instance().0,
+            call: site.call,
+            given: site.given,
         })
         .collect(); // alloc: a view of the body's sites, once per instance
-    let locks = crate::locks::of(cx, body, &lock_sites, &walk.foreign, &|instance| match instance.def {
+    let locks = crate::locks::of(cx, body, &lock_sites, &foreign, &|instance| match instance.def {
         // clone: the query's key, reference counts
         Def::Body(_) => Some(cx.summary(instance.clone())),
         Def::Leaf(..) => None,
@@ -1042,7 +1154,7 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
         sites: sites.into_boxed_slice(),
         locks,
         memory,
-        trusted_calls: walk.trusted_calls.into_iter().collect(), // alloc: once per instance, mostly empty
+        trusted_calls: trusted_calls.into_iter().collect(), // alloc: once per instance, mostly empty
         ..out.finish(ret, callees.into_boxed_slice())
     }
 }
@@ -1467,12 +1579,12 @@ pub(crate) fn name_of(db: &Db, instance: &Instance) -> String {
     match instance.def {
         Def::Body(Body::Fn(func)) | Def::Leaf(func, _) => fn_name(db, func),
         Def::Body(Body::Closure(id)) => {
-            format!("a closure in {}", parent(InternedClosureId::from_id(id).loc(db).owner)) // alloc: an impure script's reason
+            format!("a closure in {}", parent(InternedClosureId::from_gid(id).loc(db).owner)) // alloc: an impure script's reason
         }
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
             format!(
                 "an `async` block in {}",
-                parent(InternedCoroutineId::from_id(id).loc(db).owner)
+                parent(InternedCoroutineId::from_gid(id).loc(db).owner)
             ) // alloc: an impure script's reason
         }
     }
@@ -1510,7 +1622,7 @@ pub(crate) fn fn_item_path(db: &Db, func: FunctionId) -> String {
     };
     let path = path.or_else(|| {
         let args = GenericArgs::identity_for_item(DbInterner::new_no_crate(db), func.into());
-        blaze_query::db::attach(db, || hir_ty_print::rustc_function_name(db, func, args.as_slice()))
+        blaze_memo::attach(db, || hir_ty_print::rustc_function_name(db, func, args.as_slice()))
     });
     path.unwrap_or_else(|| name.to_owned()) // alloc: an impure script's reason
 }
@@ -1594,7 +1706,7 @@ fn open_or_unchecked(args: GenericArgs<'_>) -> Rule {
 /// defined `#[allow_internal_unsafe]`. A file's own text is of no expansion: no span map is read.
 fn allows_unsafe(db: &Db, file: HirFileId, range: TextRange) -> bool {
     file.macro_file().is_some()
-        && file.span_map(db).span_for_range(range).ctx.outer_expn(db).is_some_and(|call| {
+        && file.span_map(db).span_for_range(range).ctx.outer_expn(db, file.context_arena()).is_some_and(|call| {
             hir_expand::MacroCallId::from(call).loc(db).def.allow_internal_unsafe
         })
 }
@@ -1655,7 +1767,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         if !script && self.kinds.full.has(rule) {
             return;
         }
-        let what = blaze_query::db::attach(self.cx.db, what);
+        let what = blaze_memo::attach(self.cx.db, what);
         self.observe_except(EffectSet::one(rule), &what, except);
         if script {
             self.own = Some(what);
@@ -1823,7 +1935,7 @@ impl<'a, 'db> Walk<'a, 'db> {
     fn dyn_drop(&mut self, ty: Ty<'db>) {
         if !self.kinds.full.has(Rule::Dyn) && self.owns_dyn(ty) {
             let ty = self.cx.shown(ty);
-            let what = blaze_query::db::attach(self.cx.db, || {
+            let what = blaze_memo::attach(self.cx.db, || {
                 format!("drops a `{ty}`, which owns a `dyn` whose drop is the object's")
             }); // alloc: a witness's text, once per body
             self.observe(EffectSet::one(Rule::Dyn), &what);
@@ -1914,9 +2026,11 @@ impl<'a, 'db> Walk<'a, 'db> {
             return Flow::Unknown;
         }
         let instance = Instance { def, args: args.store() };
-        let ret = self.cx.summary(instance.clone()).ret; // clone: the query's key, reference counts
+        // What the callee returns is its summary's, which the fold gives `Values::solve` by
+        // this site: the walk of a body asks no callee's summary (`own_part`).
+        let site = u32::try_from(self.sites.len()).expect("a body has fewer than 2^32 sites");
         self.push(Reached::Walk(instance, spread), call);
-        Flow::Ret { ret, spread }
+        Flow::Ret { site, spread }
     }
 
     /// What calling `f` with `args` runs, as the code generator dispatches it.
@@ -2176,7 +2290,7 @@ impl<'a, 'db> Walk<'a, 'db> {
                         self.observe(EffectSet::one(Rule::MutableState), &what);
                     }
                     let parent = GenericArgs::new_from_slice(closure.parent_args());
-                    self.walk(Def::Body(Body::Closure(id.0.as_id())), parent, Spread::Opaque, None);
+                    self.walk(Def::Body(Body::Closure(id.0.gid())), parent, Spread::Opaque, None);
                     self.drop_glue(ty);
                 }
                 TyKind::FnDef(def, fn_args) => {
@@ -2297,7 +2411,7 @@ impl<'a, 'db> Walk<'a, 'db> {
                     Some(TyKind::Closure(id, args)) => {
                         let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
                         self.walk(
-                            Def::Body(Body::Closure(id.0.as_id())),
+                            Def::Body(Body::Closure(id.0.gid())),
                             parent,
                             Spread::Opaque,
                             None,
@@ -2537,7 +2651,7 @@ impl<'a, 'db> Walk<'a, 'db> {
                 }
                 TyKind::Closure(id, args) => {
                     let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                    self.walk(Def::Body(Body::Closure(id.0.as_id())), parent, Spread::Opaque, None);
+                    self.walk(Def::Body(Body::Closure(id.0.gid())), parent, Spread::Opaque, None);
                 }
                 _ => match dyns.as_slice() {
                     &[dyn_ty] => self.vtable(pointee, dyn_ty),

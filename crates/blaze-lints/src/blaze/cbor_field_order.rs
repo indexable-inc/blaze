@@ -755,11 +755,14 @@ pub struct Bug {
         give_derives(&mut fx);
         let file = *fx.files().last().expect("src/lib.rs");
         let mut db = fx.into_db();
-        let krate = blaze_query::db::attach(&db, || {
+        // The crate's key: its id dies at the fix's commits.
+        let key = blaze_memo::attach(&db, || {
             hir::Crate::all(&db)
                 .into_iter()
                 .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
                 .expect("the fixture has `main`")
+                .base()
+                .key(&db)
         });
         let file = file.file_id(&db);
         let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
@@ -768,11 +771,12 @@ pub struct Bug {
             command_line: CommandLine::parse(&flags).expect("the flags read"),
             conf: Conf::default(),
         };
-        fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+        fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
         let text = db.file_text(file).text(&db).to_string();
         let head = CRATES.rsplit("crate:main deps:serde,blaze_serde\n").next().unwrap_or("");
         assert_eq!(text, format!("{head}{}", want.trim_start_matches('\n')));
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
+            let krate = hir::Crate::from(db.krate(key));
             let found = check(&db, krate, &setup, &name_of).expect("the file is named");
             let left: Vec<&str> = found
                 .iter()

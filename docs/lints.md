@@ -3029,6 +3029,21 @@ to it.
 
 **The right form.** Hand the error on with `?`, or keep it as the new error's source.
 
+## `untyped_error`
+
+**What it catches.** A function signature whose return type or a parameter's type holds a
+`Result` whose error is `String`, `&str` (any lifetime), `Box<dyn Error>` (any auto traits
+beside), or `anyhow::Error` (`anyhow::Result<T>`), found through the types, so a renamed import
+or an alias is found at each use. Not checked: a binary's `main` module, test code, build
+scripts, and a trait impl's method (its signature is the trait's, found there).
+
+**The right form.** An error type of the function's module, an enum or struct with a variant per
+way it fails, each naming the thing it failed on and keeping its source, with `Display`
+(`Unreadable` in `crates/hir-def/src/nameres/frozen.rs` is one). No fix. Until blaze checks its
+own crates, the gate holds a count of these per crate from the text, aliases counted where they
+are defined: `scripts/src/bin/untyped.rs`, against
+`crates/blaze-lints/baselines/untyped-errors.txt`, which only shrinks.
+
 ## `wall_clock`
 
 **What it catches.** `Instant::now`, `SystemTime::now`, their `elapsed`, and `thread::sleep`,

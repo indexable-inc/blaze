@@ -40,7 +40,9 @@ fn in_external_macro(db: &Db, krate: hir::Crate, at: InFile<TextRange>) -> bool 
         return false;
     };
     let span = file.expansion_span_map(db).span_at(pound.text_range().start());
-    let Some(expn) = span.ctx.outer_expn(db) else { return false };
+    // The span's context is of the table of the crate that made this expansion: the call's.
+    let arena = span::MacroCallId::from(file).arena();
+    let Some(expn) = span.ctx.outer_expn(db, arena) else { return false };
     let loc = hir_expand::MacroCallId::from(expn).loc(db);
     match loc.kind {
         hir_expand::MacroCallKind::FnLike { .. } => {

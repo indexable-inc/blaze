@@ -14,7 +14,7 @@ use std::{alloc::Global, sync::Arc};
 
 use base_db::{Crate, CrateOrigin, Db, FileId};
 use blaze_hash::HashSet;
-use blaze_query::db::FromId;
+use blaze_memo::Id as _;
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, TraitId,
     attrs::AttrFlags,
@@ -300,7 +300,7 @@ fn unregistered(db: &Db, func: FunctionId, effect: &EffectDef) -> Refusal {
 /// The check of `EFFECTS[effect]`, refusing the kinds `refuses`, of `func<args>` in `env`;
 /// `generic`: the definition's check, where [`Rule::Open`] is left to each instance. Every
 /// summary it reads is made with `proofs`.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 #[expect(
     clippy::too_many_arguments,
     reason = "a tracked query's arguments are its key: each is an input of the check"
@@ -558,10 +558,10 @@ pub(crate) fn instance_path(db: &Db, instance: &Instance) -> Box<str> {
             fn_path(db, func, instance.args.as_ref().as_slice())
         }
         Def::Body(Body::Closure(id)) => {
-            format!("{}::{{closure}}", owner(InternedClosureId::from_id(id).loc(db).owner)).into() // alloc: a refusal's name
+            format!("{}::{{closure}}", owner(InternedClosureId::from_gid(id).loc(db).owner)).into() // alloc: a refusal's name
         }
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
-            format!("{}::{{async block}}", owner(InternedCoroutineId::from_id(id).loc(db).owner))
+            format!("{}::{{async block}}", owner(InternedCoroutineId::from_gid(id).loc(db).owner))
                 .into() // alloc: a refusal's name
         }
     }
@@ -573,7 +573,7 @@ fn fn_path<'db>(
     func: FunctionId,
     args: &[hir_ty::next_solver::GenericArg<'db>],
 ) -> Box<str> {
-    let spelled = blaze_query::db::attach(db, || hir_ty_print::rustc_function_name(db, func, args));
+    let spelled = blaze_memo::attach(db, || hir_ty_print::rustc_function_name(db, func, args));
     match spelled {
         Some(path) => path.into(),
         None => FunctionSignature::of(db, func).name.as_str().into(),
@@ -636,7 +636,7 @@ struct Params<'a, 'db> {
 impl<'db> Params<'_, 'db> {
     fn refuse(&mut self, rule: Rule, what: impl FnOnce() -> String) {
         if self.trouble.is_none() && self.refuses.has(rule) {
-            self.trouble = Some((rule, blaze_query::db::attach(self.cx.db, what)));
+            self.trouble = Some((rule, blaze_memo::attach(self.cx.db, what)));
         }
     }
 
@@ -706,7 +706,7 @@ impl<'db> Params<'_, 'db> {
                     None if self.refuses.has(Rule::Unchecked) => {
                         if self.found.unlisted_dyn.is_none() {
                             let shown = cx.shown(ty);
-                            let text = blaze_query::db::attach(cx.db, || format!("{shown}")); // alloc: a refusal's text, once per check
+                            let text = blaze_memo::attach(cx.db, || format!("{shown}")); // alloc: a refusal's text, once per check
                             self.found.unlisted_dyn = Some(text.into());
                         }
                     }

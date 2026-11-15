@@ -31,6 +31,8 @@
 //! (`blaze_item_hash::reads`: a read no rule names is refused).
 
 use base_db::{Crate, Db};
+use blaze_memo::Database as _;
+use std::alloc::Global;
 use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StructId,
     VariantId,
@@ -63,22 +65,22 @@ pub(crate) const CODE: &str = "VIEW";
 pub(crate) const BOUND: usize = 64;
 
 /// What a method borrows of its receiver.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SelfView {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SelfView<'db> {
     /// The whole receiver, as in Rust, and why.
     Whole(Whole),
     /// Only these fields.
-    Fields(View),
+    Fields(View<'db>),
     /// The view written is refused: the error, naming the method, what is wrong and the rule.
-    Refused(String),
+    Refused(&'db str),
 }
 
 /// A view of fields of `Self`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct View {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct View<'db> {
     pub strukt: StructId,
-    /// The fields, ascending, each once.
-    pub fields: Box<[FieldIndex]>,
+    /// The fields, ascending, each once, kept in the memo's arena.
+    pub fields: &'db [FieldIndex],
     /// `&mut self.{..}`.
     pub mutable: bool,
     /// Inferred from the body, not written.
@@ -112,8 +114,8 @@ pub enum Whole {
 }
 
 /// The view of `func`'s receiver: written, inferred or the whole receiver.
-#[blaze_query::tracked(returns(ref))]
-pub fn self_view(db: &Db, func: FunctionId) -> SelfView {
+#[blaze_memo::tracked(returns(ref))]
+pub fn self_view<'db>(db: &'db Db, func: FunctionId) -> SelfView<'db> {
     let signature = FunctionSignature::of(db, func);
     if !signature.has_self_param() {
         return SelfView::Whole(Whole::NotAMethod);
@@ -129,62 +131,58 @@ pub fn self_view(db: &Db, func: FunctionId) -> SelfView {
 
 /// The view `func` writes, checked: in a crate with the attribute, on a method of an inherent
 /// impl of a struct with named fields, each name a field, once.
-fn written(db: &Db, func: FunctionId) -> SelfView {
+fn written<'db>(db: &'db Db, func: FunctionId) -> SelfView<'db> {
     let Some(written) = written_self_view(db, func) else {
         return SelfView::Whole(Whole::NotAMethod);
     };
     let name = FunctionSignature::of(db, func).name.as_str();
     if !crate_def_map(db, func.krate(db)).views() {
-        return SelfView::Refused(format!(
-            "method `{name}` writes a view of `self`, `&self.{{..}}`, in a crate without \
-             `#![blaze::views]`: add `#![blaze::views]` to the crate root to borrow only those \
-             fields (rule views-gated)"
-        ));
+        return refused(db, &format!("method `{name}` writes a view of `self`, `&self.{{..}}`, in a crate without \
+         `#![blaze::views]`: add `#![blaze::views]` to the crate root to borrow only those \
+         fields (rule views-gated)"));
     }
     let strukt = match self_struct(db, func) {
         Ok(it) => it,
         Err(Whole::Trait) => {
-            return SelfView::Refused(format!(
-                "method `{name}` of a trait or a trait impl writes a view of `self`: views on \
-                 trait methods are refused, since a caller through a bound or `dyn` cannot see \
-                 which fields an impl borrows (rule views-not-on-traits)"
-            ));
+            return refused(db, &format!("method `{name}` of a trait or a trait impl writes a view of `self`: views on \
+             trait methods are refused, since a caller through a bound or `dyn` cannot see \
+             which fields an impl borrows (rule views-not-on-traits)"));
         }
         Err(_) => {
-            return SelfView::Refused(format!(
-                "method `{name}` writes a view of `self`, but `Self` is not a struct with named \
-                 fields: a view names fields of a struct (rule views-of-structs)"
-            ));
+            return refused(db, &format!("method `{name}` writes a view of `self`, but `Self` is not a struct with named \
+             fields: a view names fields of a struct (rule views-of-structs)"));
         }
     };
     let strukt_name = StructSignature::of(db, strukt).name.as_str();
     let variant = VariantFields::of(db, VariantId::StructId(strukt));
-    let mut fields: Vec<FieldIndex> = Vec::with_capacity(written.fields.len()); // alloc: the memo's fields, once per method with a view
+    let mut fields: Vec<FieldIndex, Global> =
+        Vec::with_capacity_in(written.fields.len(), Global);
     for field in written.fields.iter() {
         let Some(id) = variant.field(field) else {
-            return SelfView::Refused(format!(
-                "`{}` is not a field of `{strukt_name}`, in the view of `self` of method \
-                 `{name}` (rule views-name-fields)",
-                field.as_str()
-            ));
+            return refused(db, &format!("`{}` is not a field of `{strukt_name}`, in the view of `self` of method \
+             `{name}` (rule views-name-fields)",
+            field.as_str()));
         };
         let index = FieldIndex::from(id);
         if fields.contains(&index) {
-            return SelfView::Refused(format!(
-                "field `{}` is named twice in the view of `self` of method `{name}` (rule \
-                 views-name-fields)",
-                field.as_str()
-            ));
+            return refused(db, &format!("field `{}` is named twice in the view of `self` of method `{name}` (rule \
+             views-name-fields)",
+            field.as_str()));
         }
         fields.push(index);
     }
     fields.sort_unstable();
     SelfView::Fields(View {
         strukt,
-        fields: fields.into_boxed_slice(),
+        fields: blaze_memo::keep_slice(db.memo(), &fields),
         mutable: written.mutable,
         inferred: false,
     })
+}
+
+/// A refused view, its message kept in the memo's arena.
+fn refused<'db>(db: &'db Db, message: &str) -> SelfView<'db> {
+    SelfView::Refused(blaze_memo::keep_str(db.memo(), message))
 }
 
 /// The struct `Self` is for a method of an inherent impl; `Trait` for a method of a trait or a
@@ -229,7 +227,7 @@ fn inferable(db: &Db, func: FunctionId) -> Result<StructId, Whole> {
 /// The view of a method with none written, from its body and those of the methods it calls on
 /// `self`: a walk over at most [`BOUND`] of them, depth first, which ends in a view or in why
 /// the receiver is whole.
-fn inferred(db: &Db, root: FunctionId) -> Result<View, Whole> {
+fn inferred<'db>(db: &'db Db, root: FunctionId) -> Result<View<'db>, Whole> {
     let strukt = inferable(db, root)?;
     let own = uses(db, root);
     if let Some(why) = own.whole {
@@ -277,8 +275,7 @@ fn inferred(db: &Db, root: FunctionId) -> Result<View, Whole> {
         fields.dedup();
         Ok(View {
             strukt,
-            // alloc: the memo's fields, once per method whose view is inferred
-            fields: fields.iter().copied().collect(),
+            fields: blaze_memo::keep_slice(db.memo(), &fields),
             mutable,
             inferred: true,
         })
@@ -311,25 +308,25 @@ fn enter<'f>(
 }
 
 /// What one method's own body does with `self`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct Uses {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Uses<'db> {
     /// `Some(mutable)` for a receiver that is a reference to `Self`, `&self` or `&mut self`.
     pub(crate) receiver: Option<bool>,
     /// The fields of `Self` the body uses through `self`, ascending, each once.
-    pub(crate) fields: Box<[FieldIndex]>,
+    pub(crate) fields: &'db [FieldIndex],
     /// The methods it calls with `self` as the receiver, in the order of the body, each once.
-    pub(crate) calls: Box<[FunctionId]>,
+    pub(crate) calls: &'db [FunctionId],
     /// Why it uses `self` whole otherwise, if it does.
     pub(crate) whole: Option<Whole>,
 }
 
 /// [`Uses`] of `func`, from its MIR.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn uses(db: &Db, func: FunctionId) -> Uses {
+#[blaze_memo::tracked(returns(ref))]
+pub(crate) fn uses<'db>(db: &'db Db, func: FunctionId) -> Uses<'db> {
     let none = |why| Uses {
         receiver: None,
-        fields: Box::default(),
-        calls: Box::default(),
+        fields: &[],
+        calls: &[],
         whole: Some(why),
     };
     let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func))) else {
@@ -357,9 +354,8 @@ pub(crate) fn uses(db: &Db, func: FunctionId) -> Uses {
         fields.dedup();
         Uses {
             receiver: mutable,
-            // alloc: the memo's fields and calls, once per method inferred through
-            fields: fields.iter().copied().collect(),
-            calls: calls.iter().copied().collect(),
+            fields: blaze_memo::keep_slice(db.memo(), &fields),
+            calls: blaze_memo::keep_slice(db.memo(), &calls),
             whole,
         }
     })
@@ -583,8 +579,8 @@ pub(crate) fn check_method(
     let view = match self_view(db, func) {
         SelfView::Fields(view) => view,
         SelfView::Refused(message) => {
-            // clone: the memo's message into the owned diagnostic, on the error path
-            out.push(BorrowckDiagnostic::new(CODE, MirSpan::SelfParam, message.clone()));
+            // alloc: the memo's message into the owned diagnostic, on the error path
+            out.push(BorrowckDiagnostic::new(CODE, MirSpan::SelfParam, (*message).to_owned()));
             return;
         }
         SelfView::Whole(_) => return,

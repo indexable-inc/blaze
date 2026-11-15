@@ -18,7 +18,7 @@ astlog-engine.workspace = true
 blaze-api.workspace = true
 blaze-hash.workspace = true
 blaze-intent.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 
 either.workspace = true
 memchr.workspace = true

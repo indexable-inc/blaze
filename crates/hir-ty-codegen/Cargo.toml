@@ -22,7 +22,10 @@ either.workspace = true
 hashbrown.workspace = true
 la-arena.workspace = true
 postcard.workspace = true
+# Only the top-level query family's key (`blaze_query::QueryKey`, v2/edits.rs); the front
+# end's engine is blaze-memo.
 blaze-query.workspace = true
+blaze-memo.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 smallvec.workspace = true
@@ -57,6 +60,7 @@ blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
+blaze-item-hash.workspace = true
 blaze-mem.workspace = true
 blaze-stencil.workspace = true
 # The CPUs of `-C target-cpu` and their features (target_features::cpus): the toolchain's CPU.

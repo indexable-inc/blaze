@@ -259,6 +259,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         let db = self.ctx.db;
                         let name = trait_item_name(
                             db,
+                            self.ctx.resolver.ctx_table(),
                             trait_id,
                             *segment.name,
                             self.current_segment_hygiene(),
@@ -558,6 +559,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         let segment = self.current_or_prev_segment;
         let assoc_name = segment.name;
         let hygiene = self.current_segment_hygiene();
+        let table = self.ctx.resolver.ctx_table();
         let inherent = match res {
             Some(TypeNs::SelfType(impl_)) => db.impl_trait(impl_).is_none(),
             Some(TypeNs::AdtId(_) | TypeNs::AdtSelfType(_) | TypeNs::TypeAliasId(_)) => true,
@@ -574,11 +576,12 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         }
         let (assoc_type, trait_args) = match res {
             Some(TypeNs::GenericParam(param)) => {
-                let resolution = super::resolve_type_param_assoc_type_shorthand(
+                let resolution = super::assoc_type_shorthand(
                     db,
                     def,
                     param,
-                    written_name(db, *assoc_name, hygiene),
+                    written_name(db, table, *assoc_name, hygiene),
+                    table,
                 );
                 let assoc_type =
                     match self.resolved_shorthand(AssocTypeQself::Param(param), resolution) {
@@ -596,11 +599,12 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 let impl_trait = impl_trait.instantiate_identity().skip_norm_wip();
                 // Searching for `Self::Assoc` in `impl Trait for Type` is like searching for `Self::Assoc` in `Trait`.
                 let self_param = TypeParamId::trait_self(impl_trait.def_id.0);
-                let resolution = super::resolve_type_param_assoc_type_shorthand(
+                let resolution = super::assoc_type_shorthand(
                     db,
                     impl_trait.def_id.0.into(),
                     self_param,
-                    written_name(db, *assoc_name, hygiene),
+                    written_name(db, table, *assoc_name, hygiene),
+                    table,
                 );
                 let assoc_type =
                     match self.resolved_shorthand(AssocTypeQself::Param(self_param), resolution) {
@@ -613,6 +617,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 if let Some((AdtId::EnumId(enum_), _)) = ty.as_adt()
                     && let Some(variant) = hir_def::signatures::EnumVariants::variant_written(
                         db,
+                        table,
                         enum_,
                         assoc_name,
                         self.path.segment_hygiene(self.current_segment_idx).syntax_context(),
@@ -666,8 +671,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         let (adt, args) = ty.as_adt()?;
         // `name` keyed for each impl's items (rustc's `adjust_ident_and_get_scope` in
         // `probe_inherent_assoc_item`), compared with each alias's binding name.
+        let table = self.ctx.resolver.ctx_table();
         let named = inherent_assoc_types(db, adt).iter().filter(|(it, _, impl_)| {
-            it.unkeyed() == name.unkeyed() && *it == impl_item_name(db, *impl_, *name, hygiene)
+            it.unkeyed() == name.unkeyed()
+                && *it == impl_item_name(db, table, *impl_, *name, hygiene)
         });
         for &(_, alias, impl_) in named {
             let own = GenericArgs::identity_for_item(interner, impl_.into());
@@ -1070,6 +1077,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     self.ctx.db,
                     trait_ref,
                     *binding.name,
+                    self.ctx.resolver.ctx_table(),
                 );
                 let (associated_ty, super_trait_args) = match found {
                     None => return Vec::new_in(frame),
@@ -1681,10 +1689,13 @@ fn type_looks_like_const<'s>(
 /// name ([`assoc_item_binding_name`]), so a `macro`'s alias and its caller's of one text are
 /// two. One read per ADT, so a lowering that looks a name up depends on this list, not on every
 /// module scope of the crate.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub(crate) fn inherent_assoc_types(db: &Db, adt: AdtId) -> Box<[(Name, TypeAliasId, ImplId)]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn inherent_assoc_types<'db>(
+    db: &'db Db,
+    adt: AdtId,
+) -> &'db [(Name, TypeAliasId, ImplId)] {
     let def_map = hir_def::nameres::crate_def_map(db, adt.module(db).krate(db));
-    let mut found = Vec::new(); // alloc: the memo's value, once per ADT
+    let mut found = Vec::new_in(std::alloc::Global);
     for (_, module) in def_map.modules(db) {
         for impl_ in module.scope(db).inherent_impls() {
             let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
@@ -1701,5 +1712,5 @@ pub(crate) fn inherent_assoc_types(db: &Db, adt: AdtId) -> Box<[(Name, TypeAlias
             }
         }
     }
-    found.into_boxed_slice()
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &found)
 }

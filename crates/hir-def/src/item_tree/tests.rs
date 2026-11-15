@@ -7,7 +7,7 @@ use span::Edition;
 
 use crate::{
     item_tree::{ItemTree, ModItemKind, RawVisibility},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
@@ -422,17 +422,17 @@ impl S { fn g(&self) {} }
 #[test]
 fn an_edit_inside_a_body_changes_no_byte_of_the_tree() {
     let fx = fixture::db(EDITED);
-    let file_id = fx.only_file();
+    let mut file_id = fx.only_file();
     let mut db = fx.into_db();
-    let file: HirFileId = file_id.into();
-    let (before, bytes) = owned_tree(&db, file);
+    let (before, bytes) = owned_tree(&db, file_id.into());
     for edited in [
         EDITED.replace("{ s.0 }", "{ let y = s.0 + 1; y * 2 }"),
         EDITED.replace("let x = 1;", "let x = [1, 2, 3].len(); x"),
         EDITED.replace("fn g(&self) {}", "fn g(&self) { loop {} }"),
     ] {
-        db.set_file_text(file_id.file_id(&db), &edited);
-        let (after, after_bytes) = owned_tree(&db, file);
+        // The file's id again in the new snapshot: the one before is dropped with its text.
+        file_id = db.set_text_of(file_id, &edited);
+        let (after, after_bytes) = owned_tree(&db, file_id.into());
         assert_eq!(after, before, "{edited}");
         assert_eq!(after_bytes, bytes, "{edited}");
     }
@@ -443,10 +443,9 @@ fn an_edit_of_one_item_changes_only_its_rows() {
     let fx = fixture::db(EDITED);
     let file_id = fx.only_file();
     let mut db = fx.into_db();
-    let file: HirFileId = file_id.into();
-    let (before, _) = owned_tree(&db, file);
-    db.set_file_text(file_id.file_id(&db), &EDITED.replace("pub fn f(", "pub fn renamed("));
-    let (after, _) = owned_tree(&db, file);
+    let (before, _) = owned_tree(&db, file_id.into());
+    let file_id = db.set_text_of(file_id, &EDITED.replace("pub fn f(", "pub fn renamed("));
+    let (after, _) = owned_tree(&db, file_id.into());
 
     let f = (before.top_level().iter().copied())
         .find(|&item| {

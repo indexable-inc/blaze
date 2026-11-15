@@ -18,7 +18,7 @@ fn a_call_with_no_function_names_its_callee_its_function_and_why() {
     let db =
         fixture::db("pub fn outer() -> i32 {\n    let f = || missing(1);\n    f()\n}\n").into_db();
     let krate = fixture::test_crate(&db);
-    let text = blaze_query::db::attach(&db, || {
+    let text = blaze_memo::attach(&db, || {
         let outer = test_items::function(&db, krate, "outer");
         let owner: InferBodyId<'_> = outer.into();
         let store = ExpressionStore::of(
@@ -54,7 +54,7 @@ fn a_call_with_no_function_names_its_callee_its_function_and_why() {
 fn the_frames_are_named_by_path_innermost_first() {
     let db = fixture::db("pub fn inner() {}\npub fn outer() {\n    inner();\n}\n").into_db();
     let krate = fixture::test_crate(&db);
-    let text = blaze_query::db::attach(&db, || {
+    let text = blaze_memo::attach(&db, || {
         let (inner, outer) =
             (test_items::function(&db, krate, "inner"), test_items::function(&db, krate, "outer"));
         let store = ExpressionStore::of(
@@ -91,7 +91,7 @@ fn a_loop_stops_at_its_steps_naming_them_and_where() {
     )
     .into_db();
     let krate = fixture::test_crate(&db);
-    let text = blaze_query::db::attach(&db, || {
+    let text = blaze_memo::attach(&db, || {
         let spin = test_items::function(&db, krate, "spin");
         let env = hir_ty::ParamEnvAndCrate { param_env: db.trait_environment(spin.into()), krate };
         let mut eval =
@@ -116,7 +116,7 @@ fn memory_past_its_bound_stops_saying_so() {
     )
     .into_db();
     let krate = fixture::test_crate(&db);
-    let text = blaze_query::db::attach(&db, || {
+    let text = blaze_memo::attach(&db, || {
         let deep = test_items::function(&db, krate, "deep");
         let env = hir_ty::ParamEnvAndCrate { param_env: db.trait_environment(deep.into()), krate };
         let mut eval =

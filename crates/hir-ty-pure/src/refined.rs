@@ -443,7 +443,7 @@ fn word_of(db: &Db, krate: base_db::Crate) -> u32 {
     db.target_data_layout(krate).map_or(64, |it| it.pointer_size().bits() as u32)
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn invariant(db: &Db, adt: AdtId) -> Invariant {
     let texts = AttrFlags::blaze_invariants(db, AttrDefId::AdtId(adt));
     let name = adt_name(db, adt);
@@ -559,7 +559,7 @@ pub fn contract_of(db: &Db, func: FunctionId) -> Option<&Contract> {
     contract(db, func)
 }
 
-#[blaze_query::tracked(returns(as_ref))]
+#[blaze_memo::tracked(returns(as_ref), owns)]
 fn contract(db: &Db, func: FunctionId) -> Option<Contract> {
     let krate = func.krate(db);
     if !hir_def::nameres::crate_def_map(db, krate).features().blaze_verify {
@@ -736,14 +736,14 @@ impl Reader<'_> {
 /// has `#![feature(blaze_verify)]` or a struct with `#[blaze::invariant(..)]` (only a crate
 /// that sees one can build, change or call one). Once per crate: the opt-in's whole cost for
 /// a program that states none.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub fn in_play(db: &Db, krate: base_db::Crate) -> bool {
     states_here(db, krate) || krate.data(db).dependencies.iter().any(|dep| in_play(db, dep.crate_id))
 }
 
 /// Whether `krate` itself has `#![feature(blaze_verify)]` or a module-level struct with
 /// `#[blaze::invariant(..)]`.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn states_here(db: &Db, krate: base_db::Crate) -> bool {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
     if def_map.features().blaze_verify {
@@ -769,7 +769,7 @@ pub struct Sites {
 /// what its type's invariant or a contract needs, once per definition. A body with no such
 /// site costs one scan of its MIR. The body's closures are not walked: a closure that builds
 /// a value of a type with an invariant is a next step of the design.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn of_body(db: &Db, def: DefWithBodyId) -> Sites {
     let found = match reach::obligations_of(db, def) {
         Ok(found) => found,

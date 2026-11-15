@@ -389,7 +389,7 @@ fn a_type_and_a_const_of_one_name_are_one_run() {
     let t = item_key(&db, ItemId::Trait(trait_(&db, "T")));
     let at = |name: &str| {
         let key = ScopeIndexKey { scope: t, name: key::name_hash(name) };
-        blaze_query::db::attach(&db, || scope(&db, key)).unwrap()
+        blaze_memo::attach(&db, || scope(&db, key)).unwrap()
     };
     let ScopeEntry::Assoc(items) = at("X") else { panic!("`X` is not an associated item") };
     assert_eq!(items.len(), 2);
@@ -505,12 +505,18 @@ fn a_crate_s_value_tells_apart_why_an_included_file_could_not_be_read() {
     let held = blaze_core::temp::TempDir::for_test("blaze-items-unread-");
     let dir = held.join("included");
     let path = base_db::AbsPathBuf::assert_utf8(dir.clone());
-    let file = db.files().included_file(&db, krate, &path, blaze_query::db::Durability::LOW);
+    let disk = db.files().disk().expect("a test database reads the disk");
+    let file = db.files().included_file(disk, &db, krate.key(&db), &path);
     assert!(file.read(&db).is_err(), "the file is gone");
     let fact = Fact::Crate(key::crate_key(&db, krate));
     let gone = val(&db, fact);
     std::fs::create_dir_all(&dir).expect("the temporary directory");
-    assert!(db.reload_included_file(&path, &base_db::Looks::none()), "a directory is another error");
+    let mut edit = db.edit();
+    assert!(
+        edit.reload_included_file(&path, &base_db::Looks::none()),
+        "a directory is another error"
+    );
+    _ = edit.commit();
     let directory = val(&db, fact);
     assert_ne!(gone, directory, "two errors are two values");
 }

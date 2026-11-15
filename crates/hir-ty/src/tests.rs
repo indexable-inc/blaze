@@ -33,6 +33,7 @@ mod raw_pointer_impls;
 mod records;
 mod ref_mut_bindings;
 mod rpitit_nested;
+mod session_edit;
 mod sizedness;
 mod struct_paths;
 mod trait_item_imports;

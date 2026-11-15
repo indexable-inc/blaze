@@ -748,7 +748,7 @@ pub(crate) mod tests {
     ) {
         let checked = crate::tests::checked(&format!("//- /main.rs crate:main\n{source}"));
         let db = &checked.db;
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
             let cx = Cx::new(db, krate, checked.files(), &frame);

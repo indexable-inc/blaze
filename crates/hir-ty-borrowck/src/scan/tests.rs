@@ -440,7 +440,7 @@ fn the_one_pass_gives_what_each_scan_gave() {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut seen = Seen::default();
         let mut bodies = 0;
         for &krate in all_crates(&db).iter() {

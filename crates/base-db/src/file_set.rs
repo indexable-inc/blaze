@@ -61,6 +61,16 @@ impl FileSet {
         true
     }
 
+    /// The path `file` was put at, never its file's when it is an alias.
+    pub(crate) fn own_path(&self, file: &FileId) -> Option<&VfsPath> {
+        self.paths.get(file)
+    }
+
+    /// The file `alias` is an alias of, if it is one.
+    pub(crate) fn alias_target(&self, alias: &FileId) -> Option<FileId> {
+        self.aliases.get(alias).copied()
+    }
+
     /// Each alias with the file it is an alias of, in no order.
     pub fn aliases(&self) -> impl Iterator<Item = (FileId, FileId)> + '_ {
         self.aliases.iter().map(|(&alias, &of)| (alias, of))

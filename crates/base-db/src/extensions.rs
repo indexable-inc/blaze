@@ -14,7 +14,14 @@
 //! make turns no extension on, so the crate's `&uniq` or `A | B` type is then the syntax error
 //! it is without the extension, never quietly another program (hir-def refuses an extension's
 //! attribute under `cfg_attr`, naming the rule).
+//!
+//! Cost (rule 67): each of the two firewalls lexes the crate root and its attribute files once
+//! per snapshot that changed one of them (the floor: what reads the text must lex it); its
+//! value is plain data, a few bytes, and a refused edition's text kept in the run's arena.
 
+use std::alloc::Global;
+
+use blaze_memo::Database as _;
 use span::{BlazeEdition, Edition, Extensions};
 use syntax::{LexedStr, SyntaxKind, T};
 
@@ -38,7 +45,7 @@ impl Crate {
 
 /// [`Crate::extensions`]: a firewall, so an edit to the root file that keeps the extensions
 /// re-parses none of the crate's files for them.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn crate_extensions(db: &Db, krate: Crate) -> Extensions {
     let data = krate.data(db);
     let edition = data.edition;
@@ -70,8 +77,8 @@ pub(crate) fn leading_extensions(text: &str, edition: Edition) -> Extensions {
 /// `#![<attr>]`), in order, as the text of its tokens between `#![` and its `]`: each
 /// `#![...]` before the first other token, past a shebang, a frontmatter, whitespace and
 /// comments. One never closed ends the walk and is not given.
-fn leading_attrs<'t>(text: &'t str, edition: Edition, mut each: impl FnMut(&[&str])) {
-    // alloc: the text's tokens, once per change of the crate root
+fn leading_attrs<'t>(text: &'t str, edition: Edition, mut each: impl FnMut(&[&'t str])) {
+    // The text's tokens, once per change of the crate root.
     let lexed = LexedStr::new(edition, text);
     let tokens = (0..lexed.len()).filter(|&at| {
         let kind = lexed.kind(at);
@@ -84,11 +91,12 @@ fn leading_attrs<'t>(text: &'t str, edition: Edition, mut each: impl FnMut(&[&st
                 SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER | SyntaxKind::INNER_DOC_COMMENT
             )
     });
-    // alloc: as above, the indices of the non-trivia tokens
-    let tokens: Vec<usize> = tokens.collect();
+    // The indices of the non-trivia tokens; then one attribute's tokens at a time, reused.
+    let mut indices = Vec::new_in(Global);
+    indices.extend(tokens);
+    let tokens = indices;
     let kind = |n: usize| tokens.get(n).map(|&at| lexed.kind(at));
-    // alloc: one attribute's tokens at a time, reused
-    let mut attr: Vec<&str> = Vec::new();
+    let mut attr: Vec<&'t str, Global> = Vec::new_in(Global);
     let mut n = 0;
     while kind(n) == Some(T![#]) && kind(n + 1) == Some(T![!]) && kind(n + 2) == Some(T!['[']) {
         let start = n + 3;
@@ -105,23 +113,25 @@ fn leading_attrs<'t>(text: &'t str, edition: Edition, mut each: impl FnMut(&[&st
         }
         // `end` is past the `]` that closes the attribute.
         attr.clear();
-        attr.extend(tokens[start..end - 1].iter().map(|&at| lexed.text(at)));
+        // Each token's text as a slice of `text` itself, so what `each` keeps lives as it does.
+        attr.extend(tokens[start..end - 1].iter().map(|&at| &text[lexed.text_range(at)]));
         each(&attr);
         n = end;
     }
 }
 
 /// What a crate's leading inner attributes say of its blaze edition
-/// ([`Crate::blaze_edition`]).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SaidBlazeEdition {
+/// ([`Crate::blaze_edition`]). Plain data: the refused text is borrowed (from the file read,
+/// or kept in the query's arena), so the memoized value owns nothing to drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SaidBlazeEdition<'t> {
     /// No `#![blaze::edition = ".."]`: a crate of Rust's own edition.
     None,
     /// The one edition every such attribute names.
     Is(BlazeEdition),
     /// An attribute naming a version that is no blaze edition's, as written (the string
     /// literal's text, quotes included), or one whose value is no string literal.
-    Unknown(Box<str>),
+    Unknown(&'t str),
     /// Two attributes that name two editions: the manifest's and the root file's own.
     Two(BlazeEdition, BlazeEdition),
 }
@@ -136,21 +146,22 @@ impl Crate {
     /// name.
     pub fn blaze_edition(self, db: &Db) -> Option<BlazeEdition> {
         match crate_blaze_edition(db, self) {
-            SaidBlazeEdition::Is(it) => Some(*it),
+            SaidBlazeEdition::Is(it) => Some(it),
             SaidBlazeEdition::None | SaidBlazeEdition::Unknown(_) | SaidBlazeEdition::Two(..) => None,
         }
     }
 
     /// What the crate's attributes say of its blaze edition, a refused one included.
-    pub fn said_blaze_edition(self, db: &Db) -> &SaidBlazeEdition {
+    pub fn said_blaze_edition(self, db: &Db) -> SaidBlazeEdition<'_> {
         crate_blaze_edition(db, self)
     }
 }
 
 /// [`Crate::said_blaze_edition`]: a firewall, as [`crate_extensions`] is, so an edit to the
-/// root file that keeps its edition re-runs nothing that asks for it.
-#[blaze_query::tracked(returns(ref))]
-fn crate_blaze_edition(db: &Db, krate: Crate) -> SaidBlazeEdition {
+/// root file that keeps its edition re-runs nothing that asks for it. A refused value's text
+/// is copied into the run's arena (`keep_str`), never borrowed from another input's.
+#[blaze_memo::tracked(returns(copy))]
+fn crate_blaze_edition<'db>(db: &'db Db, krate: Crate) -> SaidBlazeEdition<'db> {
     let data = krate.data(db);
     let edition = data.edition;
     let root: &str = db.file_text(data.root_file_id).text(db);
@@ -159,13 +170,24 @@ fn crate_blaze_edition(db: &Db, krate: Crate) -> SaidBlazeEdition {
     for &file in krate.crate_attr_files(db) {
         leading_blaze_edition(db.file_text(file).text(db), edition, &mut said);
     }
-    said
+    match said {
+        SaidBlazeEdition::Unknown(written) => {
+            SaidBlazeEdition::Unknown(blaze_memo::keep_str(db.memo(), written))
+        }
+        SaidBlazeEdition::None => SaidBlazeEdition::None,
+        SaidBlazeEdition::Is(it) => SaidBlazeEdition::Is(it),
+        SaidBlazeEdition::Two(first, second) => SaidBlazeEdition::Two(first, second),
+    }
 }
 
 /// `said`, with what the leading inner attributes of `text` add: each
 /// `#![blaze::edition = "<version>"]`, read off its tokens as an extension's attribute is
 /// (written as itself: one a `cfg_attr` or a macro would make says nothing).
-pub(crate) fn leading_blaze_edition(text: &str, edition: Edition, said: &mut SaidBlazeEdition) {
+pub(crate) fn leading_blaze_edition<'t>(
+    text: &'t str,
+    edition: Edition,
+    said: &mut SaidBlazeEdition<'t>,
+) {
     leading_attrs(text, edition, |attr| {
         let path = split(BlazeEdition::ATTR);
         let n = path.clone().count();
@@ -182,8 +204,7 @@ pub(crate) fn leading_blaze_edition(text: &str, edition: Edition, said: &mut Sai
         };
         *said = match (&*said, named) {
             (SaidBlazeEdition::Unknown(_) | SaidBlazeEdition::Two(..), _) => return,
-            // alloc: error path, the refused value
-            (_, Err(written)) => SaidBlazeEdition::Unknown(Box::from(written)),
+            (_, Err(written)) => SaidBlazeEdition::Unknown(written),
             (SaidBlazeEdition::None, Ok(it)) => SaidBlazeEdition::Is(it),
             (SaidBlazeEdition::Is(was), Ok(it)) if *was == it => return,
             (SaidBlazeEdition::Is(was), Ok(it)) => SaidBlazeEdition::Two(*was, it),
@@ -212,8 +233,8 @@ mod tests {
     #[test]
     fn the_blaze_edition_is_read_off_the_leading_inner_attributes() {
         let is = SaidBlazeEdition::Is(BlazeEdition::Blaze2026_11);
-        let unknown = |written: &str| SaidBlazeEdition::Unknown(Box::from(written));
-        let cases: &[(&str, SaidBlazeEdition)] = &[
+        let unknown = SaidBlazeEdition::Unknown;
+        let cases: &[(&str, SaidBlazeEdition<'static>)] = &[
             ("fn main() {}\n", SaidBlazeEdition::None),
             ("#![no_std]\n#![blaze::uniq]\nfn main() {}\n", SaidBlazeEdition::None),
             ("#![blaze::edition = \"2026.11\"]\nfn main() {}\n", is.clone()),

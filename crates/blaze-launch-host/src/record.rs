@@ -11,6 +11,7 @@
 //! | `Data` | the datum of that id among the record's data |
 //! | `Extern`, `Weak` | a function or static place filled by the program's own symbol of that name, when the program defines it ([`Made::symbols`]: the reader resolves the name); else an outside symbol by name |
 //! | `Position` | a datum made here: the `Location` the program observes (`file!()`, `line!()`, a panic's place), with its file name another datum |
+//! | `Text` | a datum made here: the `&str` of a text naming files (`concat!` with `file!()`), its bytes composed from the recipe datum (`blaze_codegen::text::compose`) another datum; the recipe itself is no datum of the record |
 //!
 //! Nothing here reads a whole build: a record is made of one function and what its maker says
 //! of the positions its code names and of which symbols the program itself defines, so a record
@@ -31,6 +32,7 @@ use std::alloc::Global;
 
 use blaze_codegen::{
     Arch, CompiledFunction, Data, Init, InstanceKey, RelocKind, Relocs, StaticId, Target, Unwind,
+    text,
 };
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -98,6 +100,8 @@ pub use blaze_link::position_in;
 
 const FILE_NAME_DOMAIN: &str = "blaze launch file name 1";
 const LOCATION_DOMAIN: &str = "blaze launch location 1";
+const TEXT_DOMAIN: &str = "blaze launch text 1";
+const STR_DOMAIN: &str = "blaze launch str 1";
 
 /// One datum of a record being made.
 struct Owned<'a> {
@@ -134,6 +138,9 @@ struct Maker<'a, P> {
     /// The ids of `data`, in its order.
     ids: Vec<[u8; 32]>,
     anchors: Vec<ContentId>,
+    /// The function's or static's text recipes ([`Target::Text`]): never data of the record,
+    /// only what its texts are composed from.
+    recipes: Vec<&'a Data>,
 }
 
 impl<'a, P: Positions> Maker<'a, P> {
@@ -150,6 +157,7 @@ impl<'a, P: Positions> Maker<'a, P> {
             data: Vec::new(),
             ids: Vec::new(),
             anchors: Vec::new(),
+            recipes: Vec::new(),
         }
     }
 
@@ -239,6 +247,54 @@ impl<'a, P: Positions> Maker<'a, P> {
                 });
                 return Ok(To::Data(location));
             }
+            Target::Text(id) => {
+                let Some(recipe) = self.recipes.iter().copied().find(|it| it.id == *id) else {
+                    return Err(self.refuse(format_args!(
+                        "it names the text of recipe {id:?}, which is not among its data"
+                    )));
+                };
+                // The text: the recipe's bytes, each hole its span's file's name.
+                let positions = self.positions;
+                let mut composed = Vec::with_capacity_in(recipe.bytes.len() + 64, Global);
+                text::compose(&recipe.bytes, recipe.relocs.view(), |span| positions.of(&span).map(|it| it.0), &mut composed)
+                    .map_err(|why| match why {
+                        text::TextError::NoFile(why) => {
+                            self.refuse(format_args!("its text recipe {id:?} names a file: {why}"))
+                        }
+                        other => self.refuse(format_args!("its text recipe {id:?} does not compose: {other:?}")),
+                    })?;
+                for target in recipe.relocs.targets() {
+                    if let Target::Position(span) = target
+                        && let Err(at) = self.anchors.binary_search(&span.anchor)
+                    {
+                        self.anchors.insert(at, span.anchor);
+                    }
+                }
+                let len = composed.len() as u64;
+                let bytes_id = ContentId::of(TEXT_DOMAIN, &composed).0;
+                let bytes = self.datum(Owned {
+                    id: bytes_id,
+                    align: 1,
+                    bytes: composed.into(),
+                    fixups: Vec::new_in(Global),
+                    writable: false,
+                });
+                // The `&str`: a pointer to the bytes, then the length.
+                let mut record = [0u8; 16];
+                record[8..].copy_from_slice(&len.to_le_bytes());
+                let mut keyed = Vec::with_capacity_in(48, Global);
+                keyed.extend_from_slice(&bytes_id);
+                keyed.extend_from_slice(&record);
+                let pointer = Fixup { at: 0, kind: Kind::Abs64, to: To::Data(bytes), addend: 0 };
+                let str_record = self.datum(Owned {
+                    id: ContentId::of(STR_DOMAIN, &keyed).0,
+                    align: 8,
+                    bytes: record.to_vec_in(Global).into(),
+                    fixups: [pointer].to_vec_in(Global),
+                    writable: false,
+                });
+                return Ok(To::Data(str_record));
+            }
             Target::Coverage(_) | Target::Counter(_) | Target::ProfileCounters => {
                 return Err(self.refuse(format_args!(
                     "it counts into {target:?}, which only a linked image has"
@@ -271,9 +327,22 @@ impl<'a, P: Positions> Maker<'a, P> {
         Ok(fixups)
     }
 
-    /// Adds the function's or static's own data, each after what it names.
-    fn own_data(&mut self, data: &'a [Data]) -> Result<(), String> {
+    /// Adds the function's or static's own data, each after what it names; `tables` are all
+    /// its relocations, whose [`Target::Text`]s name the data that are text recipes, which are
+    /// kept aside to compose from and never made data of the record.
+    fn own_data(&mut self, data: &'a [Data], tables: &[&'a Relocs]) -> Result<(), String> {
         for datum in data {
+            let recipe = tables
+                .iter()
+                .any(|relocs| relocs.targets().iter().any(|it| matches!(it, Target::Text(id) if *id == datum.id)));
+            if recipe {
+                self.recipes.push(datum);
+            }
+        }
+        for datum in data {
+            if self.recipes.iter().any(|it| it.id == datum.id) {
+                continue;
+            }
             let fixups = self.fixups(&datum.relocs, true)?;
             self.datum(Owned {
                 id: datum.id.0,
@@ -385,7 +454,10 @@ pub fn function<P: Positions>(
             "it is instrumented (SanitizerCoverage or PGO), which only a linked image runs"
         )));
     }
-    maker.own_data(&function.data)?;
+    let mut tables = Vec::with_capacity_in(1 + function.data.len(), Global);
+    tables.push(&function.relocs);
+    tables.extend(function.data.iter().map(|it| &it.relocs));
+    maker.own_data(&function.data, &tables)?;
     let fixups = maker.fixups(&function.relocs, false)?;
     let unwind = match &function.unwind {
         None => None,
@@ -451,7 +523,12 @@ pub fn of_static<P: Positions>(
     if !of.imports.is_empty() {
         return Err(maker.refuse(format_args!("it has WebAssembly imports")));
     }
-    maker.own_data(&of.data)?;
+    let mut tables = Vec::with_capacity_in(1 + of.data.len(), Global);
+    if let Init::Bytes { relocs, .. } = &of.init {
+        tables.push(relocs);
+    }
+    tables.extend(of.data.iter().map(|it| &it.relocs));
+    maker.own_data(&of.data, &tables)?;
     let what = What::Static { mutable: of.mutable, thread_local: of.thread_local };
     match &of.init {
         Init::Zeroed { size } => maker.finish(arch, what, of.align, *size, &[], &[], None),

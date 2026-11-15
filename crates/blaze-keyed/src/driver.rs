@@ -26,7 +26,49 @@
 //!   one made table; at the end every examined reader is checked against the made table, and one
 //!   that read another digest is redone (an edge found only on a redo, or a run with no shape
 //!   known before it); an item settled more than [`SETTLES_MOST`] times is
-//!   [`Failure::MadeCycle`].
+//!   [`Failure::MadeCycle`]. A run is the last resort, and one rule orders it: a run (an item
+//!   with no shape to try, or whose candidate shapes all missed; a surface, a body or a
+//!   demanded maker) starts only when the request is quiet, nothing out but held runs
+//!   (`Driver::quiet`); the held runs then start together as a wave, each reading the made
+//!   facts as they stood when the wave started. So a maker found by lookup, and a maker any
+//!   unit's reader demanded, is settled before a run that could read it starts, and what a
+//!   run reads, what it files and how often it runs do not depend on the order answers arrive
+//!   in (the store's, or a resident memo's, which answers at once). A wave's records may
+//!   demand makers and move made facts; the readers they make stale are redone in the next
+//!   wave. Why this cannot deadlock is on `Driver::quiet`.
+//! - A record makes only what it may: a body facts of a made kind its own unit owns, a surface
+//!   no made fact; anything else is [`Failure::NotMade`], never dropped.
+//! - A unit whose bodies the request does not ask ([`Bodies::NotAsked`]: std, a registry
+//!   dependency under `check`) is keyed and its surface settled, and none of its bodies is
+//!   examined unless demanded: a fact one of them makes, asked by a reader (a dictionary row
+//!   answered, a shape probed, a record settled), names its subject, so the id of the subject's
+//!   [`record::FactKind::Maker`] row ([`record::maker_row_of`]) is formed from it; that row of
+//!   the unit's surface (read once a request, one binary search) gives the body's text id, the
+//!   unit's keyed items (sorted by text id) its body key, and the maker is found by its key's
+//!   shape trie, or run, as a slot of its unit past the unit's files. A subject with no row has
+//!   no body: `absent`, as a fresh build answers it. The reader waits ([`SlotState::Demanding`]) until the maker settles, then is
+//!   answered from the request's demanded table; a record that read another answer is redone.
+//!   Demanded makers demand further makers; a wait that comes back to its waiter is
+//!   [`Failure::MadeCycle`]. Nothing of a demanded maker is in its unit's manifest or mark: the
+//!   unit was filed before any reader of it was keyed. The reader's own record holds the made
+//!   fact in its shape, and its unit's dictionary lists it as another unit's row. A unit not
+//!   asked has a universe digest of its text, not of a made table (it files none), so a reader
+//!   that read a demanded fact is not settled by its mark past an edit of the maker.
+//! - Silent items. The key task keys items from text (blaze-unitkey), the surface names the
+//!   items the def map reaches (a maker row per body-bearing definition). A keyed item the
+//!   surface does not name is text the def map does not reach: an item only an unused
+//!   `macro_rules!` arm holds, say. It gets no body task, and that silence is no error: an own
+//!   item of an asked unit whose lookups all missed is held to run only once its unit's maker
+//!   rows are known (from the surface record as it settles, or read once a request when the
+//!   surface was kept; [`SlotState::Naming`] meanwhile; its lookups are never delayed), and one
+//!   whose text id no row names settles with no task,
+//!   no record and no read, filed with the [`record::SILENT`] address (cost: one binary search
+//!   per item that would run, and per unit whose surface was kept and an item would run, one read of
+//!   that surface a request). Nothing here compares a
+//!   module path (blaze-unitkey's `{k}`-suffixed paths of a module included twice are its own
+//!   business): items are joined by text id alone. Not yet handled: a flip of the def map that
+//!   names an item whose key and file did not move (or stops naming one) is not re-examined
+//!   until they do; a plan that reads such a body fails by name.
 //! - A unit files only what moved: the records its runs made (at their addresses), the shape
 //!   nodes their walks ended at, the chunks of the files whose entries moved, the manifest root,
 //!   and its mark; a unit whose manifest stands files its mark alone. The certificate is filed
@@ -46,10 +88,44 @@
 //!   [`WALK_MOST`] nodes; past it the work runs ([`Checks::walks_capped`]).
 //! - **Filing**: the moved chunks and the root, rebuilt in one pass over their entries, and one
 //!   mark: `O(e + moved files' entries + r)`.
+//! - **What a record makes**: one route per fact it holds, checked as it settles: at the floor.
+//! - **Demanded makers**: a demanded made fact costs its maker's body once (the floor: the
+//!   value is asked and no table holds it), then one record found per request that asks it
+//!   again: one trie walk per demanded maker per request that re-examines a reader of it or
+//!   answers a dictionary row of it, cached per request (each maker is demanded once a
+//!   request, however many read it). A unit settled by its mark asks nothing. Past the floor:
+//!   one binary search per read routed to a made table, only in a request with a unit not
+//!   asked; per unit demanded of, one read of its surface record a request (its maker rows) and
+//!   on disk one maker row per body-bearing item of every surface; per demanded maker, one
+//!   binary search in those rows and one in the unit's keyed items; a reader run before its
+//!   maker settled (no shape of it known) runs again with the answer, once; per task, the
+//!   unit's made table merged once with the demanded facts each time those grow.
+//! - **Waves**: per event, three emptiness checks (`O(1)`); per wave, a sort of its runs and
+//!   one copy of each of its units' made answer. The time floor of a run is to start once
+//!   every answer it reads is final; a wave starts when every answer it could read is final,
+//!   which on a warm request with a few cold items is after the request's other lookups (reads
+//!   of the store, overlapped): the cost is their latency, never a run. On a fully cold unit
+//!   every item's lookup misses at its first read, so its items start as one wave, at the
+//!   floor. Above the floor: runs of two waves never overlap, so a wave's tail (its longest
+//!   run, with the pool's other workers idle) is paid once per wave, and a unit that becomes
+//!   ready while a wave runs waits for it to end. A cold build of `n` dependency levels pays up
+//!   to two tails per level (its surfaces, then its bodies) plus one per round of demands and
+//!   redos: not measured, said plainly; incremental requests, which run few items, pay it
+//!   rarely.
 //!
-//! Code (instances, programs) is blaze-program's, on the same vocabulary: `check` makes none.
+//! Programs (`program.rs`, [`crate::program`]): a request given programs, once every unit is
+//! complete, finds or makes each program's plans (read-addressed, keyed by the front end's plan
+//! name), their code (keyed by the template identity the walker gives), and gives one link
+//! step per program the rows that moved and the span tables that moved (found by the files
+//! they read, which the driver answers from its key rows). What a program reaches is decided
+//! by its walker, blaze-program's walk; `check` gives none.
+//!
+//! A failed task fails what depends on it and nothing else: a unit's dependents are never
+//! keyed, a program fails alone, and the request ends with every failure.
 
 #![blaze::sans_io]
+
+mod program;
 
 use core::alloc::Allocator;
 use std::{alloc::Global, collections::VecDeque, marker::PhantomData};
@@ -61,11 +137,15 @@ use crate::{
     Plant,
     exec::{Executor, LOCAL_TASKS},
     front::FileItems,
-    kind::{Body, Certificate, Key, Kind, Layout, Mark, MarkInputs, Namespace, Shape, Surface, Tag, UnitChunk, UnitManifest},
+    kind::{
+        Body, Certificate, CodeRecord, Key, Kind, Layout, Mark, MarkInputs, Namespace, PlanRecord, ProgramManifest, Shape, SpanTable, Steps,
+        Surface, Tag, UnitChunk, UnitManifest,
+    },
     memo::{Arena, Memo},
     outside::{self, Filer, Found, Lookup, OutsideError, Want},
     planted,
     pool::Ticket,
+    program::{NoWalk, PlanAt, ProgramPlan, RowChange, SpanRecordAt, Walker},
     proof::{self, AnyHolds, Certified, Checks, Holds, Snapshot},
     record::{self, ChunkParts, ChunkRoot, Entry, Fact, FileChunk, ManifestParts, ManifestRoot, Owner, RecordError, Route, StableId, Traced},
     store::Put,
@@ -78,6 +158,20 @@ pub const WALK_MOST: u32 = 64;
 /// do not agree, [`Failure::MadeCycle`].
 pub const SETTLES_MOST: u32 = 3;
 
+/// The most body records one plan task is given: its own and each another body it read and
+/// asked for ([`TaskFailed::NoBody`]), one run of the plan each. Past it the plan fails by the
+/// body it asked last.
+pub const BODIES_MOST: u32 = 16;
+
+/// A body record a plan task is given: the item by its fact subject (what
+/// [`record::mir_id`] takes) and where its record is filed. The host reads it there and hands it
+/// to the front end as a [`crate::front::GivenBody`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BodyAt {
+    pub item: StableId,
+    pub address: Key<Body>,
+}
+
 /// The item a unit's surface is in [`Driver::proofs`].
 pub const SURFACE_ITEM: StableId = StableId(ContentId([0; 32]));
 
@@ -88,6 +182,9 @@ pub const NO_UNIT: u32 = u32::MAX;
 const SURFACE: u32 = 0;
 
 const ZERO: ContentId = ContentId([0; 32]);
+
+/// A unit's answer table is to be merged again ([`Driver::sync_answer`]).
+const STALE: u64 = u64::MAX;
 
 /// One unit of the request: its dependencies, by index below its own, the manifest root the
 /// last certified build filed for it (the certificate's list), its owner and its namespace.
@@ -101,6 +198,57 @@ pub struct UnitPlan<'p> {
     /// The first eight bytes of the unit's crate key: what the ids of the facts it owns begin
     /// with ([`record::Owner`]).
     pub owner: Owner,
+    /// Whether the request checks the unit's bodies ([`Bodies`]): `check` asks the bodies of
+    /// the workspace's units, never of std's or a registry dependency's.
+    pub bodies: Bodies,
+}
+
+/// Whether a request checks a unit's bodies.
+///
+/// A unit whose bodies are [`Bodies::NotAsked`] is keyed, and its surface found or made, and
+/// nothing else is filed: no body entry, no chunk, an empty made table. Its manifest is filed
+/// under [`manifest_of`] of its text key, so the same text asked with bodies and without is two
+/// manifests and two marks (rule keys-cover-every-input). Its body items are kept by text id:
+/// a reader of a fact one of them makes demands that maker, named by the unit's surface's
+/// [`record::FactKind::Maker`] row, which is found or run for the request alone (the driver's
+/// module doc).
+///
+/// Floor: a unit not asked costs its keying and its surface, the floor of what its dependents
+/// read of it, and each maker demanded of it its body once. Costs past it: the key task still
+/// keys every body (the front's `key` has no way to be told not to), kept here as one sorted
+/// list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bodies {
+    Asked,
+    NotAsked,
+}
+
+/// The key the request's certificate is filed under: the plan's base when every unit's bodies
+/// are asked, else the base and which units' are not. The certificate names manifests, which
+/// differ by [`Bodies`], so its key covers them too (rule keys-cover-every-input) whatever base
+/// the command gave. Floor: one hash over the units when one is not asked, none else.
+pub fn certificate_of(plan: &Plan<'_>) -> Key<Certificate> {
+    if plan.units.iter().all(|unit| unit.bodies == Bodies::Asked) {
+        return plan.certificate;
+    }
+    let mut hasher = blaze_ids::Hasher::new("blaze-keyed certificate, bodies not asked");
+    hasher.id(&plan.certificate.id());
+    for (index, unit) in plan.units.iter().enumerate() {
+        if unit.bodies == Bodies::NotAsked {
+            hasher.update(&(index as u32).to_le_bytes());
+        }
+    }
+    Key::from_id(hasher.finish())
+}
+
+/// The manifest key a unit of text key `text` is filed under when its bodies are `bodies`:
+/// `text` itself when asked, else a key of its own, so a manifest without bodies is never found
+/// where one with them is wanted, or the other way.
+pub fn manifest_of(text: Key<UnitManifest>, bodies: Bodies) -> Key<UnitManifest> {
+    match bodies {
+        Bodies::Asked => text,
+        Bodies::NotAsked => Key::from_id(ContentId::of("blaze-keyed unit manifest, bodies not asked", &text.id().0)),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,7 +265,17 @@ pub enum PlanError {
     DepOrder { unit: u32, dep: u32 },
     /// Unit `unit`'s owner is reserved ([`Owner::ASKER`], [`Owner::OUTSIDE`]) or another unit's.
     Owner { unit: u32 },
+    /// The certificate lookup handed in is not a finished lookup of this request's certificate
+    /// key ([`certificate_with`] of the plan and programs): `what` says which.
+    CertificateLookup { what: &'static str },
 }
+
+/// A request's certificate lookup made before its driver (the command looks it up before it
+/// gathers anything): a finished [`Lookup`] under the key it was made for, which
+/// [`Driver::build`] checks once against the request's own key, so a lookup of another
+/// request's certificate cannot stand in. Its hit keeps the value bytes, so nothing is read
+/// twice.
+pub type CertificateLookup<'s> = Lookup<'s, Certificate>;
 
 /// A task the host runs on the pool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,7 +283,21 @@ pub enum Task {
     /// Key unit `unit`: its text key, its surface's and its bodies' keys, from text.
     Key { unit: u32 },
     Surface { unit: u32, key: Key<Surface> },
-    Body { unit: u32, item: StableId, key: Key<Body> },
+    /// One body's record, running `steps`, under `key` (`steps.key(..)` of its keyed key): the
+    /// body of a unit asked is [`Steps::Checked`], one demanded of a unit not asked
+    /// [`Steps::Mir`].
+    Body { unit: u32, item: StableId, key: Key<Body>, steps: Steps },
+    /// The plan named `key` for program `program`, its task given the front end's ask the
+    /// effect's `bytes` hold: [`crate::front::Front::plan`], given the body records the effect's
+    /// `bodies` name (its own item's, and each another body it read asked for, see
+    /// [`TaskFailed::NoBody`]).
+    Plan { program: u32, key: Key<PlanRecord> },
+    /// The code for `key`, from the plan record the effect's `bytes` hold and the callees' plans
+    /// its `plans` name: [`crate::front::Front::code`].
+    Code { program: u32, key: Key<CodeRecord> },
+    /// The span tables of `owner` (an item of unit `unit`) for program `program`:
+    /// [`crate::front::Front::spans`], over the effect's universe asked as `unit`.
+    Spans { program: u32, unit: u32, owner: StableId },
 }
 
 /// What a task gives back; bytes borrowed from the worker's frame, 16-aligned.
@@ -137,9 +309,15 @@ pub enum Done<'a> {
         surface: Key<Surface>,
         files: &'a [FileItems],
         items: &'a [(StableId, Key<Body>)],
+        names: &'a [ContentId],
     },
     Wrote {
         record: &'a [u8],
+    },
+    /// [`crate::front::SpanTables`]'s fields: the owner's read list and its tables by anchor.
+    Spans {
+        reads: &'a [Fact],
+        tables: &'a [(ContentId, &'a [u8])],
     },
 }
 
@@ -150,6 +328,39 @@ pub enum TaskFailed {
     Panicked { what: &'static str },
     /// The task refused its input, naming what.
     Refused { what: &'static str },
+    /// The task asked a fact no rule gives an id or a value to: the rule that refused it
+    /// (`what`), the front end's query kind of the fact (`kind`) and the subject asked (an item,
+    /// module or crate key), so the refusal names the item it is about.
+    RefusedFact { what: &'static str, kind: u16, subject: ContentId },
+    /// A key task found two items under one key (rule 21): both places, so the refusal names
+    /// each.
+    TwoItems { first: ItemPlace, second: ItemPlace },
+    /// A plan task read the MIR of a body it was not given (`hir_ty::body_store::Unserved`
+    /// of kind `NO_RECORD`), by the body's fact subject. Not a failure of the program: the
+    /// driver finds that body's record as any plan's read of it is answered (a unit asked: its
+    /// checked body; a unit not asked: the body demanded, [`Steps::Mir`]) and runs the plan
+    /// again given it too. A plan that names a body it was given, or one with no record, or more
+    /// than [`BODIES_MOST`] bodies, fails by it.
+    NoBody { item: StableId },
+}
+
+/// Where an item is: its file (the unit's file index) and its row in that file's image.
+/// Item-relative (rule 71): `file:line:col` exists only when printed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ItemPlace {
+    pub file: u32,
+    pub row: u32,
+}
+
+impl TaskFailed {
+    /// The rule that failed the task, whichever variant.
+    pub fn what(&self) -> &'static str {
+        match *self {
+            TaskFailed::Panicked { what } | TaskFailed::Refused { what } | TaskFailed::RefusedFact { what, .. } => what,
+            TaskFailed::TwoItems { .. } => "two items under one key (rule 21)",
+            TaskFailed::NoBody { .. } => "a plan read the MIR of a body it was not given",
+        }
+    }
 }
 
 /// A store failure, by name.
@@ -159,8 +370,9 @@ pub struct StoreFault {
 }
 
 /// One unit's tables as an effect names them: its surface record's address and its manifest
-/// root's address (`None` for the asking unit's own, whose made facts come with the effect, and
-/// for its surface until it is settled). The host reads each in place.
+/// root's address (`None` for the asking unit's own and for a unit whose bodies are not asked,
+/// whose made facts come with the effect, and for its surface until it is settled). The host
+/// reads each in place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TableRef {
     pub unit: u32,
@@ -181,6 +393,13 @@ pub enum Input<'a> {
     /// To [`Effect::Reads`]: the request's outside reads, as a shape (the asks' bytes), their
     /// answers when the request began, and their answers now.
     Reads { ticket: Ticket, shape: &'a [u8], then: &'a [ContentId], now: &'a [ContentId] },
+    /// To [`Effect::Link`]: the linker's new state, or why the link step failed. The patch the
+    /// step returned stays with the host until [`Effect::Image`].
+    Linked { ticket: Ticket, outcome: Result<&'a [u8], TaskFailed> },
+    /// To [`Effect::Image`]: the program's image is made and durable, or why not.
+    Imaged { ticket: Ticket, outcome: Result<(), TaskFailed> },
+    /// To [`Effect::Place`]: the program's path names the image, or why not.
+    Placed { ticket: Ticket, outcome: Result<(), TaskFailed> },
 }
 
 impl Input<'_> {
@@ -190,7 +409,10 @@ impl Input<'_> {
             | Input::Answers { ticket, .. }
             | Input::Ran { ticket, .. }
             | Input::Put { ticket, .. }
-            | Input::Reads { ticket, .. } => ticket,
+            | Input::Reads { ticket, .. }
+            | Input::Linked { ticket, .. }
+            | Input::Imaged { ticket, .. }
+            | Input::Placed { ticket, .. } => ticket,
         }
     }
 }
@@ -210,11 +432,46 @@ pub enum Effect<'d> {
     Answer { ticket: Ticket, unit: u32, asks: &'d [ContentId], universe: &'d [TableRef], made: &'d [Fact] },
     /// Run `task` over `universe` and `made` (as [`Effect::Answer`]'s): on the local pool, or,
     /// when `remote`, through the executor's [`RemoteService`](crate::exec::RemoteService).
-    Run { ticket: Ticket, task: Task, remote: bool, universe: &'d [TableRef], made: &'d [Fact] },
+    /// `bytes`: a plan task's ask, a code task's plan record; empty for the others. `plans`: the
+    /// plan records a code task reads (its callees', sorted by instance), which the host reads
+    /// at their addresses; empty for the others.
+    Run {
+        ticket: Ticket,
+        task: Task,
+        remote: bool,
+        universe: &'d [TableRef],
+        made: &'d [Fact],
+        bytes: &'d [u8],
+        plans: &'d [PlanAt],
+        /// A plan or code task's body records, sorted by item, each once (a code task's are its
+        /// plan's); empty for every other task.
+        bodies: &'d [BodyAt],
+    },
     /// File `bytes` at `tag`, `key` in `namespace` ([`crate::store::Store::put`]).
     Put { ticket: Ticket, tag: Tag, key: ContentId, namespace: Namespace, bytes: &'d [u8] },
     /// Give the request's outside reads: [`Input::Reads`].
     Reads { ticket: Ticket },
+    /// Program `program`'s one link step ([`crate::front::Front::link`]): `changes` are the rows
+    /// that came, went or moved, in instance order (the host reads each `now` code record from
+    /// the store, filed before this effect is asked), `plans` the plan records of the rows that
+    /// came or moved and of their callees (sorted by instance, read at their addresses),
+    /// `spans` the span tables that came or moved against the kept manifest (sorted by anchor,
+    /// read at their addresses, each record's payload handed on), `payload` the kept linker
+    /// state: [`Input::Linked`]. `changes` may be empty when `spans` is not.
+    Link { ticket: Ticket, program: u32, changes: &'d [RowChange], plans: &'d [PlanAt], spans: &'d [SpanRecordAt], payload: &'d [u8] },
+    /// Make program `program`'s image named `to` (the key of the kept manifest about to be put:
+    /// O(1) to name, never a hash of the image) in the store's program files: a clone of the
+    /// image named `from` (`None`: an empty file), with the patch its link step in this request
+    /// returned applied when `patched` (none: the same linker state under a manifest filed
+    /// again). Durable before the answer; an image under `to` already is these bytes by its
+    /// name and is left. Asked before the kept manifest is put (crate::driver::program,
+    /// "Durability"): [`Input::Imaged`].
+    Image { ticket: Ticket, program: u32, from: Option<Key<ProgramManifest>>, to: Key<ProgramManifest>, patched: bool },
+    /// Make program `program`'s path name the image `image`, the kept manifest the answer
+    /// certifies: one look at the path, and an atomic rename only when it names another (a
+    /// request killed before it placed, a deleted file, a user's overwrite). The last effect of
+    /// every answer, a certified one included: [`Input::Placed`].
+    Place { ticket: Ticket, program: u32, image: Key<ProgramManifest> },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -246,6 +503,15 @@ pub struct Ran {
     pub walked: u32,
     /// Items settled again because a fact their unit's bodies make moved after they read it.
     pub redone: u32,
+    /// Plan tasks run, code tasks run, link steps given.
+    pub plans: u32,
+    pub codes: u32,
+    pub links: u32,
+    /// Plans found at their address (none ran).
+    pub plans_found: u32,
+    /// Span tasks run (one per owner), and span tables found at their address.
+    pub spans: u32,
+    pub spans_found: u32,
     pub checks: Checks,
 }
 
@@ -282,8 +548,20 @@ pub enum Failure {
     Raced { at: u32 },
     /// The facts unit `unit`'s bodies make and the bodies that read them did not agree after
     /// [`SETTLES_MOST`] settles of `items`: a cycle through made facts (a const reading a const
-    /// that reads it), which the front end must refuse by name.
+    /// that reads it), which the front end must refuse by name. For makers demanded of a unit
+    /// not asked: `items` are the maker demanded and the demanded maker that waits on it,
+    /// itself waiting (through others, or at once) on the first.
     MadeCycle { unit: u32, items: Vec<StableId, Global> },
+    /// The record of item `item` of unit `unit` ([`SURFACE_ITEM`] for its surface) holds fact
+    /// `id`, of kind byte `kind` (a [`record::FactKind`]'s, or none), which it may not make: a
+    /// body a fact that is no made fact of its own unit, a surface a made fact. No table would
+    /// answer it from this record, so it is refused, never dropped.
+    NotMade { unit: u32, item: StableId, kind: u8, id: ContentId },
+    /// Unit `unit`'s surface names text id `item` as the body that makes a demanded fact (its
+    /// [`record::FactKind::Maker`] row), and the unit's key task gave no item of that text id:
+    /// the surface and the key task disagree on the unit's bodies, so the maker cannot be run
+    /// and the fact cannot be answered.
+    MakerNotKeyed { unit: u32, item: StableId },
     /// Unit `unit`'s records saw two digests of fact `id`: one fact answered at two moments.
     TwoDigests { unit: u32, id: ContentId },
     /// Under [`crate::memo::Audit`]: the record of `tag` found at `address`, made again, is other
@@ -343,6 +621,11 @@ enum Work {
     PutMark(u32),
     /// The planted check after a mark: a read of the unit's surface.
     UnderMark(u32),
+    /// A read of the surface record of a unit not asked, for its maker rows: a maker was
+    /// demanded of it ([`Driver::demand`]).
+    GetMakers(u32),
+    /// A step of a program's phase (`program.rs`).
+    Program(program::Step),
 }
 
 impl Work {
@@ -382,6 +665,9 @@ enum UnitState {
     Items,
     Writing,
     Complete,
+    /// A task of the unit failed, or a unit it depends on did: nothing of it is filed, and
+    /// nothing that depends on it is keyed. Past `Complete`: no state above it is reached.
+    Failed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -392,9 +678,72 @@ enum SlotState {
     Asking,
     Getting,
     Walking,
+    /// To run, held until the request is quiet and then started with every other held run, as
+    /// one wave ([`Driver::start_wave`]).
+    Held,
     Running,
     Putting,
+    /// Waiting for a demanded maker ([`Driver::gate`]): its probe unasked, or its record held
+    /// in `gated` until every fact of it a unit not asked makes is final.
+    Demanding,
+    /// Waiting for its unit's maker rows ([`Work::GetMakers`]), read once a request: whether its
+    /// surface names it, or it is silent ([`record::SILENT`]).
+    Naming,
     Settled,
+    /// Its task failed (or a demanded maker it waited on did): its unit fails at quiesce, and
+    /// every other item of the request goes on.
+    Failed,
+}
+
+/// What waits for a demanded maker: a unit's dictionary rows, a slot's probe, a slot's record,
+/// or instance `i` of program `p` (its plan's body: [`program`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Waiter {
+    Rows(u32),
+    Probe(u32, u32),
+    Settle(u32, u32),
+    Plan(u32, u32),
+    /// A slot of an asked unit waiting for its unit's maker rows ([`SlotState::Naming`]).
+    Naming(u32, u32),
+}
+
+impl Waiter {
+    /// The unit whose progress the waiter is; [`NO_UNIT`] for a plan.
+    fn unit(self) -> u32 {
+        match self {
+            Waiter::Rows(u) | Waiter::Probe(u, _) | Waiter::Settle(u, _) | Waiter::Naming(u, _) => u,
+            Waiter::Plan(..) => NO_UNIT,
+        }
+    }
+
+    /// The slot that waits: a plan is no slot, and no maker waits on one (no cycle runs
+    /// through it); a slot waiting for maker rows waits on no maker.
+    fn slot(self) -> Option<(u32, u32)> {
+        match self {
+            Waiter::Rows(_) | Waiter::Plan(..) | Waiter::Naming(..) => None,
+            Waiter::Probe(u, s) | Waiter::Settle(u, s) => Some((u, s)),
+        }
+    }
+}
+
+/// The maker rows of a unit not asked ([`record::FactKind::Maker`]), as the request has them.
+enum MakerRows<A: Allocator> {
+    /// Not read: nothing was demanded of the unit yet.
+    Unread,
+    /// Its surface record asked ([`Work::GetMakers`]); the waiters in [`Driver::loading`].
+    Asked,
+    /// Sorted by id, each once: subject's maker row id to the body's text id (its digest).
+    Read(Vec<Fact, A>),
+}
+
+/// A maker demanded in this request: item `item` of unit `unit`, whose bodies are not asked,
+/// run (or found) as slot `slot` of that unit because a reader asked a fact it makes. Its slot
+/// lies past the unit's files, so nothing of it is in the unit's manifest or mark.
+struct Demand<A: Allocator> {
+    unit: u32,
+    item: StableId,
+    slot: u32,
+    waiters: Vec<Waiter, A>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -418,7 +767,11 @@ struct OldEntry<A: Allocator> {
 
 struct Slot<'s, A: Allocator> {
     item: StableId,
+    /// Its task's key: `steps.key(..)` of the key its unit's key task gave.
     key: ContentId,
+    /// The steps its body task runs: [`Steps::Checked`] but for a body demanded of a unit not
+    /// asked ([`Driver::demand`]).
+    steps: Steps,
     file: u32,
     old: Option<OldEntry<A>>,
     state: SlotState,
@@ -445,6 +798,12 @@ struct Slot<'s, A: Allocator> {
     /// Under audit: the bytes found, until the work made again is compared with them.
     audit: Option<Aligned>,
     holds: Option<AnyHolds<'s>>,
+    /// [`SlotState::Demanding`] on its record: the record's address and bytes, settled once
+    /// every demanded maker it read is final.
+    gated: Option<(ContentId, Aligned)>,
+    /// Times redone because a demanded fact it read was answered otherwise once its maker
+    /// settled: past [`SETTLES_MOST`], [`Failure::MadeCycle`].
+    redos: u32,
 }
 
 /// The last manifest's root, copied out once.
@@ -523,10 +882,15 @@ struct Unit<'s, A: Allocator> {
     deps: Vec<u32, A>,
     owner: Owner,
     namespace: Namespace,
+    bodies: Bodies,
     plan_last: Option<Key<UnitManifest>>,
     text: Key<UnitManifest>,
     surface_key: Key<Surface>,
     files: Vec<FileItems, A>,
+    /// Its files as span tables read them ([`record::FactKind::SpanFile`]), sorted by id, each
+    /// once: from its key task this request, whether or not its bodies are asked, so the
+    /// driver answers them with no host and no record.
+    span_files: Vec<Fact, A>,
     mark: Key<Mark>,
     audit_mark: Option<Aligned>,
     last: Option<Last<A>>,
@@ -548,6 +912,27 @@ struct Unit<'s, A: Allocator> {
     /// The unit's own made table now, sorted by id, and each row's maker.
     made: Vec<Fact, A>,
     makers: Vec<ContentId, A>,
+    /// For a unit whose bodies are not asked: its body items, sorted by text id, so a demanded
+    /// maker named by its surface's maker row finds its key. Empty for a unit asked.
+    text_items: Vec<(StableId, Key<Body>), A>,
+    /// Its surface's maker rows, read once a request: of a unit not asked once a maker is
+    /// demanded of it, of a unit asked once a body of it is examined or a plan reads one.
+    maker_rows: MakerRows<A>,
+    /// The text ids the maker rows name (their digests), sorted, each once: the items the
+    /// surface names. A keyed item not here is silent ([`record::SILENT`]). Filled with
+    /// `maker_rows`.
+    named: Vec<StableId, A>,
+    /// The made facts the unit's runs of the current wave read, fixed as the wave starts
+    /// ([`Driver::start_wave`]): its surface's the demanded table, its bodies' what `made_for`
+    /// gave then. A run of the wave started late (the pool full) reads what one started first
+    /// does, not what a wave-mate settled since.
+    wave: Vec<Fact, A>,
+    /// What the unit's tasks are answered made facts from while a maker is demanded in the
+    /// request: `made` merged with [`Driver::demanded`], as of `answer_epoch`.
+    answer: Vec<Fact, A>,
+    answer_epoch: u64,
+    /// Its dictionary rows wait for a demanded maker ([`Waiter::Rows`]).
+    rows_gated: bool,
     deps_universe: Vec<TableRef, A>,
     own_universe: Vec<TableRef, A>,
     surface_kept: bool,
@@ -562,6 +947,9 @@ struct Unit<'s, A: Allocator> {
     manifest_out: Option<Aligned>,
     mark_out: Option<Aligned>,
     puts: u32,
+    /// Settled by its mark: nothing of it moved, so no body of it did (a plan's
+    /// [`record::FactKind::Mir`] read of it stands).
+    marked: bool,
 }
 
 enum Phase {
@@ -587,6 +975,10 @@ fn layout_of(tag: Tag) -> Layout {
         t if t == Shape::TAG => Shape::LAYOUT,
         t if t == UnitChunk::TAG => UnitChunk::LAYOUT,
         t if t == Certificate::TAG => Certificate::LAYOUT,
+        t if t == PlanRecord::TAG => PlanRecord::LAYOUT,
+        t if t == CodeRecord::TAG => CodeRecord::LAYOUT,
+        t if t == ProgramManifest::TAG => ProgramManifest::LAYOUT,
+        t if t == SpanTable::TAG => SpanTable::LAYOUT,
         _ => UnitManifest::LAYOUT,
     }
 }
@@ -698,7 +1090,20 @@ fn copy_in<T: Copy, A: Allocator>(from: &[T], alloc: A) -> Vec<T, A> {
 /// - A record is filed before the chunk naming it, chunks before their root, the root before the
 ///   mark, every mark before the certificate.
 /// - Every request ends in an [`Outcome`]: the host's loop is bounded by the effects asked.
-pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> {
+/// - A failed task fails what depends on it and nothing else: every task that does not depend
+///   on it still runs, every unit that does not still files, and the request ends with every
+///   failure ([`Driver::failures`]); no certificate is filed.
+///
+/// Programs (`W`, [`crate::program`]): once every unit is complete, each program's plans and
+/// code are found or made as its walker asks, and one link step is given the rows that moved.
+pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker = NoWalk> {
+    walker: W,
+    progs: program::Progs<A>,
+    /// Every failure, with its place ([`Driver::failures`]); the first in that order is the
+    /// outcome's.
+    failures: Vec<((u32, u32), Failure), A>,
+    /// Units failed or blocked by a failed dependency.
+    failed_units: u32,
     snap: Snapshot<'s>,
     memo: &'m mut M,
     executor: X,
@@ -706,9 +1111,23 @@ pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> {
     running: u32,
     phase: Phase,
     units: Vec<Unit<'s, A>, A>,
+    /// The units whose bodies are not asked, (owner, unit), sorted by owner.
+    unasked: Vec<(Owner, u32), A>,
+    /// The makers demanded in this request, sorted by (unit, item).
+    demands: Vec<Demand<A>, A>,
+    /// Every fact the settled demanded makers made, sorted by id: the made table of the units
+    /// not asked, for this request only (no manifest holds it).
+    demanded: Vec<Fact, A>,
+    /// Bumped each time `demanded` grows.
+    demand_epoch: u64,
+    /// What waits for a unit's maker rows to be read ([`MakerRows::Asked`]): (unit, waiter).
+    loading: Vec<(u32, Waiter), A>,
     dependents: Vec<Vec<u32, A>, A>,
     ready: VecDeque<Work, A>,
     runs: VecDeque<Work, A>,
+    /// Runs waiting for the request to be quiet, (unit, slot) ([`SlotState::Held`]); started
+    /// together, sorted, by [`Driver::start_wave`].
+    held: Vec<(u32, u32), A>,
     pending: Vec<(Ticket, Work), A>,
     next_ticket: u64,
     manifests: Vec<Key<UnitManifest>, A>,
@@ -727,13 +1146,74 @@ pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> {
     cert_value: Option<Aligned>,
     /// Under audit: the certificate value found, compared at filing.
     audit_cert: Option<Aligned>,
-    last_value: Option<Aligned>,
+    /// The answer, once found, while each program's path is placed ([`Effect::Place`]): it is
+    /// given when the last place is answered.
+    placing: Option<Outcome>,
+    places_out: u32,
 }
 
-impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A> {
-    /// A driver of one request in `snap`, over memo `M` and executor `X`, both static policies;
-    /// at most `executor.capacity()` tasks run at once.
-    pub fn new(snap: Snapshot<'s>, memo: &'m mut M, executor: X, plan: Plan<'_>, alloc: A) -> Result<Self, PlanError> {
+impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A, NoWalk> {
+    /// A driver of one request in `snap` that builds no program, over memo `M` and executor
+    /// `X`, both static policies; at most `executor.capacity()` tasks run at once.
+    /// `certificate_lookup`: the certificate's lookup made before the driver, which it takes
+    /// instead of its own (see [`CertificateLookup`]).
+    pub fn new(
+        snap: Snapshot<'s>,
+        memo: &'m mut M,
+        executor: X,
+        plan: Plan<'_>,
+        certificate_lookup: Option<CertificateLookup<'s>>,
+        alloc: A,
+    ) -> Result<Self, PlanError> {
+        Driver::build(snap, memo, executor, plan, &[], NoWalk, certificate_lookup, alloc)
+    }
+}
+
+/// The key a request's certificate is filed under when it builds `programs`: [`certificate_of`]
+/// when it builds none, else that and each program's identity and settings (the certificate's
+/// value names their kept manifests, so its key covers which programs: rule
+/// keys-cover-every-input). Floor: one hash over the programs.
+pub fn certificate_with(plan: &Plan<'_>, programs: &[ProgramPlan]) -> Key<Certificate> {
+    let base = certificate_of(plan);
+    if programs.is_empty() {
+        return base;
+    }
+    let mut hasher = blaze_ids::Hasher::new("blaze-keyed certificate, programs");
+    hasher.id(&base.id());
+    for program in programs {
+        hasher.id(&program.program).id(&program.settings);
+    }
+    Key::from_id(hasher.finish())
+}
+
+impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, 'm, M, X, A, W> {
+    /// A driver of one request in `snap` that builds the units of `plan` and then each of
+    /// `programs`, walked by `walker`. `certificate_lookup`: the certificate's lookup made
+    /// before the driver; it must be finished and of this request's key ([`certificate_with`]),
+    /// checked here once, else [`PlanError::CertificateLookup`]. With it the driver reads
+    /// nothing of the certificate: a no-op is the sweep and that one lookup.
+    #[expect(clippy::too_many_arguments, reason = "the request's parts, each its own borrow or policy; a struct would only rename them")]
+    pub fn build(
+        snap: Snapshot<'s>,
+        memo: &'m mut M,
+        executor: X,
+        plan: Plan<'_>,
+        programs: &[ProgramPlan],
+        walker: W,
+        certificate_lookup: Option<CertificateLookup<'s>>,
+        alloc: A,
+    ) -> Result<Self, PlanError> {
+        let certificate = certificate_with(&plan, programs);
+        let lookup = match certificate_lookup {
+            None => Lookup::new(snap, certificate),
+            Some(early) if early.key() != certificate => {
+                return Err(PlanError::CertificateLookup { what: "a lookup of another key than this request's certificate" });
+            }
+            Some(early) if !matches!(early.want(), Want::Done) || early.found().is_none() => {
+                return Err(PlanError::CertificateLookup { what: "a certificate lookup handed in before it was done" });
+            }
+            Some(early) => early,
+        };
         let count = plan.units.len();
         let mut units = Vec::with_capacity_in(count, alloc.clone());
         let mut dependents = Vec::with_capacity_in(count, alloc.clone());
@@ -758,10 +1238,12 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 deps: copy_in(unit.deps, alloc.clone()),
                 owner: unit.owner,
                 namespace: unit.namespace,
+                bodies: unit.bodies,
                 plan_last: unit.last,
                 text: Key::from_id(ZERO),
                 surface_key: Key::from_id(ZERO),
                 files: Vec::new_in(alloc.clone()),
+                span_files: Vec::new_in(alloc.clone()),
                 mark: Key::from_id(ZERO),
                 audit_mark: None,
                 last: None,
@@ -777,6 +1259,13 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 index: Vec::new_in(alloc.clone()),
                 made: Vec::new_in(alloc.clone()),
                 makers: Vec::new_in(alloc.clone()),
+                text_items: Vec::new_in(alloc.clone()),
+                maker_rows: MakerRows::Unread,
+                named: Vec::new_in(alloc.clone()),
+                wave: Vec::new_in(alloc.clone()),
+                answer: Vec::new_in(alloc.clone()),
+                answer_epoch: STALE,
+                rows_gated: false,
                 deps_universe: Vec::new_in(alloc.clone()),
                 own_universe: Vec::new_in(alloc.clone()),
                 surface_kept: false,
@@ -790,15 +1279,22 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 manifest_out: None,
                 mark_out: None,
                 puts: 0,
+                marked: false,
             });
         }
         owners.sort_unstable();
         if let Some(pair) = owners.windows(2).find(|pair| pair[0].0 == pair[1].0) {
             return Err(PlanError::Owner { unit: pair[1].1.max(pair[0].1) });
         }
+        let mut unasked = Vec::new_in(alloc.clone());
+        unasked.extend(owners.iter().copied().filter(|&(_, index)| plan.units[index as usize].bodies == Bodies::NotAsked));
         let mut manifests = Vec::with_capacity_in(count, alloc.clone());
         manifests.resize(count, Key::from_id(ZERO));
         Ok(Driver {
+            walker,
+            progs: program::Progs::new(programs, alloc.clone()),
+            failures: Vec::new_in(alloc.clone()),
+            failed_units: 0,
             snap,
             memo,
             workers: executor.capacity().max(1),
@@ -806,9 +1302,15 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             running: 0,
             phase: Phase::Start,
             units,
+            unasked,
+            demands: Vec::new_in(alloc.clone()),
+            demanded: Vec::new_in(alloc.clone()),
+            demand_epoch: 0,
+            loading: Vec::new_in(alloc.clone()),
             dependents,
             ready: VecDeque::new_in(alloc.clone()),
             runs: VecDeque::new_in(alloc.clone()),
+            held: Vec::new_in(alloc.clone()),
             pending: Vec::new_in(alloc.clone()),
             next_ticket: 0,
             manifests,
@@ -817,16 +1319,17 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             asks: Asks::default(),
             ended: false,
             alloc,
-            certificate: plan.certificate,
+            certificate,
             namespace: plan.namespace,
-            lookup: Lookup::new(snap, plan.certificate),
+            lookup,
             certified: None,
             filer: None,
             cert_shape: None,
             cert_shape_record: None,
             cert_value: None,
             audit_cert: None,
-            last_value: None,
+            placing: None,
+            places_out: 0,
         })
     }
 
@@ -850,7 +1353,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
     /// The certificate's value record, when it held: the manifest roots it names, 32 bytes each
     /// in plan order, are its payload.
     pub fn certified_value(&self) -> Option<&[u8]> {
-        self.certified.and(self.last_value.as_deref())
+        self.certified.and(self.lookup.hit_bytes())
     }
 
     /// Unit `unit`'s manifest root, once its mark is held or filed: proved by the mark.
@@ -862,6 +1365,22 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
     /// Unit `unit`'s universe digest, once settled.
     pub fn universe(&self, unit: u32) -> Option<ContentId> {
         self.units.get(unit as usize).and_then(|unit| unit.universe)
+    }
+
+    /// Every failure of the request, in the order of what failed (units by index, then their
+    /// items, then programs): the outcome's `why` is the first. Empty unless it failed.
+    pub fn failures(&self) -> impl Iterator<Item = &Failure> + '_ {
+        self.failures.iter().map(|(_, why)| why)
+    }
+
+    /// Program `program`'s kept manifest once built or standing: the next request's
+    /// [`ProgramPlan::last`].
+    pub fn program_manifest(&self, program: u32) -> Option<Key<ProgramManifest>> {
+        self.progs.kept_key(program)
+    }
+
+    pub fn walker(&self) -> &W {
+        &self.walker
     }
 
     /// The records of unit `unit` proved in this request, by item ([`SURFACE_ITEM`] for its
@@ -876,10 +1395,13 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 .is_none_or(|slot| slot.holds.is_none())
                 .then(|| (SURFACE_ITEM, AnyHolds::from(Holds::named_by(&mark, surface))))
         });
+        // A unit not asked proves its surface alone: a demanded maker is this request's, not
+        // the unit's.
         named.into_iter().chain(
             self.units
                 .get(unit as usize)
                 .into_iter()
+                .filter(|unit| unit.bodies == Bodies::Asked)
                 .flat_map(|unit| unit.slots.iter().filter_map(|slot| slot.holds.map(|holds| (slot.item, holds)))),
         )
     }
@@ -938,6 +1460,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             }
             if let Some(work) = self.ready.pop_front() {
                 if self.begin(work) {
+                    self.sync_answer(work);
                     return Some((work, self.ticket(work)));
                 }
                 continue;
@@ -947,6 +1470,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                     self.running += 1;
                     match work {
                         Work::Key(_) => self.ran.keyed += 1,
+                        Work::Program(step) => self.counted(step),
                         Work::Run(_, slot) => {
                             self.ran.checks.records_run += 1;
                             match slot {
@@ -956,16 +1480,78 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                         }
                         _ => {}
                     }
+                    self.sync_answer(work);
                     return Some((work, self.ticket(work)));
                 }
             }
+            if self.quiet() {
+                self.start_wave();
+                continue;
+            }
             break;
         }
+        // Nothing out and nothing to start (a held run is started above once quiet): the bound
+        // that turns a driver that stops making progress into a typed outcome, never a hang.
         if self.pending.is_empty() && !self.done() {
             let ran = self.ran;
             self.finish(Outcome::Stalled { ran });
         }
         None
+    }
+
+    /// The made facts unit `u`'s answers and body tasks see: its own made table, merged with the
+    /// demanded facts once any maker was demanded ([`Driver::sync_answer`] ran for the work
+    /// before its effect is built).
+    fn made_for(&self, u: u32) -> &[Fact] {
+        let unit = &self.units[u as usize];
+        match self.demanded.is_empty() {
+            true => &unit.made[..],
+            false => &unit.answer[..],
+        }
+    }
+
+    /// Merges unit `u`'s made table with the demanded facts, for `work`'s effect, when either
+    /// moved since the last merge. Floor of a task's answers: none while nothing is demanded;
+    /// else one merge per unit each time the demanded table grows or its own made table is
+    /// refreshed, `O(made + demanded)`.
+    fn sync_answer(&mut self, work: Work) {
+        let u = match work {
+            Work::Rows(u) | Work::Probe(u, _) | Work::Run(u, _) => u,
+            _ => return,
+        };
+        if self.demanded.is_empty() {
+            return;
+        }
+        let epoch = self.demand_epoch;
+        let unit = &mut self.units[u as usize];
+        if unit.answer_epoch == epoch {
+            return;
+        }
+        unit.answer.clear();
+        unit.answer.reserve(unit.made.len() + self.demanded.len());
+        let (mut a, mut b) = (0, 0);
+        while a < unit.made.len() || b < self.demanded.len() {
+            let next = match (unit.made.get(a), self.demanded.get(b)) {
+                (Some(x), Some(y)) if x.id <= y.id => {
+                    a += 1;
+                    if x.id == y.id {
+                        b += 1;
+                    }
+                    *x
+                }
+                (_, Some(y)) => {
+                    b += 1;
+                    *y
+                }
+                (Some(x), None) => {
+                    a += 1;
+                    *x
+                }
+                (None, None) => break,
+            };
+            unit.answer.push(next);
+        }
+        unit.answer_epoch = epoch;
     }
 
     /// What a get work reads: its unit, kind and key.
@@ -977,10 +1563,11 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             Work::GetChunk(u, o) => (u, UnitChunk::TAG, unit(u).last.as_ref()?.files.get(o as usize)?.chunk),
             Work::GetAddress(u, s) => (u, slot_tag(s), unit(u).slots[s as usize].asked),
             Work::GetNode(u, s) => (u, Shape::TAG, unit(u).slots[s as usize].node?.id()),
-            Work::UnderMark(u) => {
+            Work::UnderMark(u) | Work::GetMakers(u) => {
                 let surface = unit(u).own_universe.iter().find(|table| table.owner == unit(u).owner)?.surface?;
                 (u, Surface::TAG, surface.id())
             }
+            Work::Program(step) => return self.program_get(step),
             _ => return None,
         })
     }
@@ -1006,8 +1593,10 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             Some(bytes) => {
                 self.asks.memo_hits += 1;
                 self.got(work, Some(&bytes));
-                if !self.done() {
-                    self.progress(unit);
+                match work {
+                    Work::Program(_) => self.program_progress(),
+                    _ if !self.done() => self.progress(unit),
+                    _ => {}
                 }
                 false
             }
@@ -1047,28 +1636,37 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 };
                 Effect::Put { ticket, tag: Certificate::TAG, key: at.id(), namespace: self.namespace, bytes: bytes.unwrap_or(&[]) }
             }
-            Work::Key(unit) => Effect::Run { ticket, task: Task::Key { unit }, remote: false, universe: &[], made: &[] },
+            Work::Key(unit) => {
+                Effect::Run { ticket, task: Task::Key { unit }, remote: false, universe: &[], made: &[], bytes: &[], plans: &[], bodies: &[] }
+            }
+            Work::Program(step) => self.program_effect(step, ticket),
             Work::Rows(u) => {
                 let unit = &self.units[u as usize];
-                Effect::Answer { ticket, unit: u, asks: &unit.asked_ids, universe: &unit.own_universe, made: &unit.made }
+                Effect::Answer { ticket, unit: u, asks: &unit.asked_ids, universe: &unit.own_universe, made: self.made_for(u) }
             }
             Work::Probe(u, s) => {
                 let unit = &self.units[u as usize];
                 let (universe, made): (&[TableRef], &[Fact]) = match s {
-                    SURFACE => (&unit.deps_universe, &[]),
-                    _ => (&unit.own_universe, &unit.made),
+                    SURFACE => (&unit.deps_universe, &self.demanded),
+                    _ => (&unit.own_universe, self.made_for(u)),
                 };
                 Effect::Answer { ticket, unit: u, asks: &unit.slots[s as usize].probe, universe, made }
             }
             Work::Run(u, s) => {
                 let unit = &self.units[u as usize];
                 let slot = &unit.slots[s as usize];
-                let (task, universe, made): (Task, &[TableRef], &[Fact]) = match s {
-                    SURFACE => (Task::Surface { unit: u, key: Key::from_id(slot.key) }, &unit.deps_universe, &[]),
-                    _ => (Task::Body { unit: u, item: slot.item, key: Key::from_id(slot.key) }, &unit.own_universe, &unit.made),
+                let (task, universe, now): (Task, &[TableRef], &[Fact]) = match s {
+                    SURFACE => (Task::Surface { unit: u, key: Key::from_id(slot.key) }, &unit.deps_universe, &self.demanded),
+                    _ => (Task::Body { unit: u, item: slot.item, key: Key::from_id(slot.key), steps: slot.steps }, &unit.own_universe, self.made_for(u)),
+                };
+                // A run reads the made facts its wave started with ([`Unit::wave`]); unheld (the
+                // plant), what is there now.
+                let made = match planted(Plant::RunBeforeLookups) {
+                    true => now,
+                    false => &unit.wave[..],
                 };
                 let queued = self.runs.len() as u32 + self.running;
-                Effect::Run { ticket, task, remote: X::REMOTE && !stays_local(&task, queued), universe, made }
+                Effect::Run { ticket, task, remote: X::REMOTE && !stays_local(&task, queued), universe, made, bytes: &[], plans: &[], bodies: &[] }
             }
             Work::PutRecord(u, s) => {
                 let unit = &self.units[u as usize];
@@ -1124,7 +1722,6 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 Err(why) => self.fail(Failure::Outside(why)),
             },
             (Work::CertValue, Input::Got { record, .. }) => {
-                self.last_value = record.map(Aligned::copy_from);
                 match self.lookup.value(record, &mut self.ran.checks) {
                     Ok(()) => self.cert_step(),
                     Err(why) => self.fail(Failure::Outside(why)),
@@ -1156,13 +1753,20 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             (Work::Key(u), Input::Ran { outcome, .. }) => {
                 self.running -= 1;
                 match outcome {
-                    Ok(Done::Keyed { manifest, surface, files, items }) => self.keyed(u, manifest, surface, files, items),
-                    Ok(Done::Wrote { .. }) => self.fail(Failure::Misused("a key task that wrote a record")),
-                    Err(failed) => self.fail(Failure::Task { tag: UnitManifest::TAG, unit: u, failed }),
+                    Ok(Done::Keyed { manifest, surface, files, items, names }) => self.keyed(u, manifest, surface, files, items, names),
+                    Ok(Done::Wrote { .. } | Done::Spans { .. }) => self.fail(Failure::Misused("a key task that wrote a record")),
+                    Err(failed) => self.unit_failed(u, SURFACE, Failure::Task { tag: UnitManifest::TAG, unit: u, failed }),
                 }
             }
+            (Work::Program(step), input) => self.program_give(step, input),
             (
-                Work::GetMark(_) | Work::GetLast(_) | Work::GetChunk(..) | Work::GetAddress(..) | Work::GetNode(..) | Work::UnderMark(_),
+                Work::GetMark(_)
+                | Work::GetLast(_)
+                | Work::GetChunk(..)
+                | Work::GetAddress(..)
+                | Work::GetNode(..)
+                | Work::UnderMark(_)
+                | Work::GetMakers(_),
                 Input::Got { record, .. },
             ) => self.got(work, record),
             (Work::Rows(u), Input::Answers { now, .. }) => self.rows_answered(u, now),
@@ -1171,8 +1775,8 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 self.running -= 1;
                 match outcome {
                     Ok(Done::Wrote { record }) => self.ran_slot(u, s, record),
-                    Ok(Done::Keyed { .. }) => self.fail(Failure::Misused("a record task that keyed")),
-                    Err(failed) => self.fail(Failure::Task { tag: slot_tag(s), unit: u, failed }),
+                    Ok(Done::Keyed { .. } | Done::Spans { .. }) => self.fail(Failure::Misused("a record task that keyed")),
+                    Err(failed) => self.slot_failed(u, s, Failure::Task { tag: slot_tag(s), unit: u, failed }),
                 }
             }
             (Work::PutRecord(u, s) | Work::PutNode(u, s), Input::Put { put, .. }) => self.slot_put(u, s, work, put),
@@ -1193,6 +1797,8 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             Work::GetChunk(u, o) => self.got_chunk(u, o, record),
             Work::GetAddress(u, s) => self.got_address(u, s, record),
             Work::GetNode(u, s) => self.got_node(u, s, record),
+            Work::GetMakers(u) => self.got_makers(u, record),
+            Work::Program(step) => self.program_got(step, record),
             _ => {}
         }
     }
@@ -1208,7 +1814,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             _ => match self.lookup.found() {
                 Some(Found::Hit(holds)) if M::AUDIT => {
                     self.ran.checks.audits += 1;
-                    self.audit_cert = self.last_value.take();
+                    self.audit_cert = self.lookup.hit_bytes().map(Aligned::copy_from);
                     let _ = holds;
                     self.cert_shape = None;
                     self.start();
@@ -1216,7 +1822,15 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 Some(Found::Hit(holds)) => {
                     self.certified = Some(holds.certified());
                     let checks = self.ran.checks;
-                    self.finish(Outcome::Certified { checks });
+                    if let Err(why) = self.certified_kept() {
+                        return self.fail(why);
+                    }
+                    // The plant: a certified answer places nothing, so a path a killed request
+                    // left unplaced, or one deleted or overwritten, stays so.
+                    match planted(Plant::CertifiedNotPlaced) {
+                        true => self.finish(Outcome::Certified { checks }),
+                        false => self.answer(Outcome::Certified { checks }),
+                    }
                 }
                 _ => {
                     self.cert_shape = None;
@@ -1235,8 +1849,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             }
         }
         if self.units.is_empty() {
-            self.phase = Phase::Filing;
-            self.ready.push_back(Work::Reads);
+            self.units_ended();
         }
     }
 
@@ -1249,11 +1862,16 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         };
         let mut payload = Vec::with_capacity_in(self.manifests.len() * 32, self.alloc.clone());
         self.manifests.iter().for_each(|key| payload.extend_from_slice(&key.id().0));
+        // Then each program's kept manifest, in plan order: the next request's `last`.
+        for p in 0..self.progs.len() {
+            payload.extend_from_slice(&self.progs.kept_key(p).map_or(ZERO, |key| key.id()).0);
+        }
         let value = outside::write_value(&settled.address, &[], &payload);
         if let Some(found) = self.audit_cert.take() {
             let ran = self.ran;
             return match *found == value[..] {
-                true => self.finish(Outcome::Built { ran, filed: Filed::Audited }),
+                // An audited answer is an answer too: its paths are placed.
+                true => self.answer(Outcome::Built { ran, filed: Filed::Audited }),
                 false => self.fail(Failure::Audit { tag: Certificate::TAG, address: settled.address.id(), first: First::Payload }),
             };
         }
@@ -1274,7 +1892,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         match why {
             OutsideError::TooManyShapes { .. } => {
                 let ran = self.ran;
-                self.finish(Outcome::Built { ran, filed: Filed::Full });
+                self.answer(Outcome::Built { ran, filed: Filed::Full });
             }
             why => self.fail(Failure::Outside(why)),
         }
@@ -1292,9 +1910,61 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             Want::PutValue(_) => self.ready.push_back(Work::FilePut),
             _ => {
                 let ran = self.ran;
-                self.finish(Outcome::Built { ran, filed: Filed::Certificate });
+                self.answer(Outcome::Built { ran, filed: Filed::Certificate });
             }
         }
+    }
+
+    /// The request's answer, given once each program's path names the image of the kept
+    /// manifest the answer certifies ([`Effect::Place`], the last effect of every answer).
+    fn answer(&mut self, outcome: Outcome) {
+        let mut places = 0;
+        for p in 0..self.progs.len() {
+            if self.progs.kept_key(p).is_some() {
+                self.ready.push_back(Work::Program(program::Step::Place(p)));
+                places += 1;
+            }
+        }
+        if places == 0 {
+            return self.finish(outcome);
+        }
+        self.places_out = places;
+        self.placing = Some(outcome);
+    }
+
+    /// A program's path is placed: the answer is given after the last.
+    pub(super) fn placed(&mut self) {
+        self.places_out = self.places_out.saturating_sub(1);
+        if self.places_out == 0
+            && let Some(outcome) = self.placing.take()
+        {
+            self.finish(outcome);
+        }
+    }
+
+    /// The kept manifest of each program, as the certificate found names them (after the
+    /// units' manifest roots, 32 bytes each in plan order): what a certified answer places.
+    fn certified_kept(&mut self) -> Result<(), Failure> {
+        let units = self.units.len();
+        let count = self.progs.len() as usize;
+        let key = self.certificate.id();
+        let bad = |what| Failure::Record { tag: Certificate::TAG, key, why: malformed(0, what) };
+        let bytes = self.lookup.hit_bytes().ok_or(bad("a certificate found with no value held"))?;
+        let root = blaze_format::open::<Traced>(bytes).map_err(|_| bad("a certificate's value that does not open"))?;
+        let payload = root.payload.follow(bytes).map_err(|_| bad("a certificate's value whose payload is out of its bounds"))?;
+        if payload.len() != 32 * (units + count) {
+            return Err(bad("a certificate naming another number of manifests than the plan has units and programs"));
+        }
+        let mut keys = Vec::with_capacity_in(count, self.alloc.clone());
+        for chunk in payload[32 * units..].chunks_exact(32) {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(chunk);
+            keys.push((id != ZERO.0).then_some(Key::from_id(ContentId(id))));
+        }
+        for (p, key) in keys.into_iter().enumerate() {
+            self.progs.certified(p as u32, key);
+        }
+        Ok(())
     }
 
     // ---- a unit: key and mark ----
@@ -1306,8 +1976,48 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         surface: Key<Surface>,
         files: &[FileItems],
         items: &[(StableId, Key<Body>)],
+        names: &[ContentId],
     ) {
         let alloc = self.alloc.clone();
+        // Its files as span tables read them, from every file (a span table of an owner of a
+        // unit not asked reads its files too): taken before a unit not asked drops its files.
+        if names.len() != files.len() {
+            return self.fail(Failure::Misused("a key task whose printed names are not one per file"));
+        }
+        let owner = self.units[u as usize].owner;
+        let mut span_files = Vec::with_capacity_in(files.len(), alloc.clone());
+        for (file, name) in files.iter().zip(names) {
+            if *name != ZERO {
+                span_files.push(Fact { id: record::span_file_id(owner, name), digest: record::span_file_digest(&file.image) });
+            }
+        }
+        // One file may be two modules (two `#[path]`s naming it, legal Rust): two entries of one
+        // name and one image are one file, so one fact. One name over two images is two files
+        // printed alike, which the front's key task refuses by name before it gets here.
+        span_files.sort_unstable();
+        span_files.dedup();
+        if span_files.windows(2).any(|pair| pair[0].id == pair[1].id) {
+            return self.fail(Failure::Misused("a key task that gave two files one printed name"));
+        }
+        self.units[u as usize].span_files = span_files;
+        // A unit whose bodies are not asked holds no body slot and files no entry: its items are
+        // kept by text id for demand only, and its manifest is filed under a key that says so.
+        let bodies = self.units[u as usize].bodies;
+        let manifest = manifest_of(manifest, bodies);
+        if bodies == Bodies::NotAsked {
+            let unit = &mut self.units[u as usize];
+            unit.text_items.clear();
+            unit.text_items.extend_from_slice(items);
+            unit.text_items.sort_unstable_by_key(|(item, _)| *item);
+            if unit.text_items.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return self.fail(Failure::Misused("a key task that gave two items of one text id"));
+            }
+        }
+        let (files, items) = match bodies {
+            Bodies::Asked => (files, items),
+            Bodies::NotAsked if planted(Plant::RunsUnaskedBodies) => (files, items),
+            Bodies::NotAsked => (&[][..], &[][..]),
+        };
         // The files' ranges cover the items in order, each once.
         let mut next = 0u32;
         for file in files {
@@ -1382,6 +2092,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         }
         self.ran.marked += 1;
         let unit = &mut self.units[u as usize];
+        unit.marked = true;
         unit.mark_holds = Some(holds);
         unit.manifest = Some(Key::from_id(root.manifest));
         unit.universe = Some(root.universe);
@@ -1465,7 +2176,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             false => {
                 unit.state = UnitState::DepRows;
                 unit.row_ask = RowAsk::Deps;
-                self.ready.push_back(Work::Rows(u));
+                self.ask_rows(u);
             }
         }
     }
@@ -1558,7 +2269,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             false => {
                 unit.state = UnitState::OwnRows;
                 unit.row_ask = RowAsk::Own;
-                self.ready.push_back(Work::Rows(u));
+                self.ask_rows(u);
             }
         }
     }
@@ -1746,7 +2457,9 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
     fn waits_on_maker(&self, u: u32, s: u32, parked: bool) -> bool {
         let unit = &self.units[u as usize];
         let slot = &unit.slots[s as usize];
-        if s == SURFACE || slot.released || planted(Plant::MakerAfterReader) {
+        // A demanded maker of a unit not asked waits on other makers of its unit through the
+        // demand gate ([`Driver::gate`]), not here.
+        if s == SURFACE || slot.released || unit.bodies == Bodies::NotAsked || planted(Plant::MakerAfterReader) {
             return false;
         }
         let shape: &[ContentId] = match (parked, slot.old.as_ref()) {
@@ -1805,6 +2518,49 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         }
     }
 
+    /// Whether unit `u`'s surface names slot `s`'s item (a maker row whose digest is its text
+    /// id); `None` while the unit's maker rows are read, the slot waiting
+    /// ([`SlotState::Naming`]) and run again ([`Driver::run`]) when they come. Floor: one
+    /// binary search.
+    fn named(&mut self, u: u32, s: u32) -> Option<bool> {
+        let unit = &mut self.units[u as usize];
+        if matches!(unit.maker_rows, MakerRows::Unread) {
+            unit.maker_rows = MakerRows::Asked;
+            self.ready.push_back(Work::GetMakers(u));
+        }
+        let unit = &mut self.units[u as usize];
+        if !matches!(unit.maker_rows, MakerRows::Read(_)) {
+            unit.slots[s as usize].state = SlotState::Naming;
+            if !self.loading.contains(&(u, Waiter::Naming(u, s))) {
+                self.loading.push((u, Waiter::Naming(u, s)));
+            }
+            return None;
+        }
+        let item = unit.slots[s as usize].item;
+        Some(unit.named.binary_search(&item).is_ok())
+    }
+
+    /// Slot `s` of unit `u` is silent ([`record::SILENT`]): settled with no task, no record, no
+    /// read and nothing made; its entry is filed with the silent address. Then, as a settle
+    /// does, the items waiting on a maker may start.
+    fn settle_silent(&mut self, u: u32, s: u32) {
+        let slot = &mut self.units[u as usize].slots[s as usize];
+        slot.state = SlotState::Settled;
+        slot.settles += 1;
+        slot.address = record::SILENT;
+        slot.result = record::SILENT;
+        slot.reads.clear();
+        slot.made.clear();
+        slot.holds = None;
+        slot.old = None;
+        self.refresh_made(u);
+        for w in 1..self.units[u as usize].slots.len() as u32 {
+            if self.units[u as usize].slots[w as usize].state == SlotState::Waiting {
+                self.try_start(u, w);
+            }
+        }
+    }
+
     fn walk_from_root(&mut self, u: u32, s: u32) {
         let slot = &mut self.units[u as usize].slots[s as usize];
         slot.depth = 0;
@@ -1829,6 +2585,23 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
     }
 
     fn ask_probe(&mut self, u: u32, s: u32) {
+        // A fact of the shape a unit not asked makes is answered once its maker settled.
+        if !self.unasked.is_empty() && !planted(Plant::DemandAnsweredAbsent) {
+            let reads = self.unasked_reads(u, s, self.units[u as usize].slots[s as usize].probe.iter().copied());
+            if !reads.is_empty() {
+                match self.gate(Waiter::Probe(u, s), &reads) {
+                    Err(why) => return self.fail(why),
+                    Ok(false) => {
+                        self.units[u as usize].slots[s as usize].state = SlotState::Demanding;
+                        return;
+                    }
+                    Ok(true) => {}
+                }
+            }
+        }
+        if self.done() {
+            return;
+        }
         let slot = &mut self.units[u as usize].slots[s as usize];
         match slot.probe.is_empty() {
             true => self.probed(u, s, &[]),
@@ -1929,9 +2702,110 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         self.probe(u, s);
     }
 
+    /// Runs item `s` of unit `u` (its surface, a body, or a demanded maker): every lookup of it
+    /// missed. The run is held ([`SlotState::Held`]) until the request is quiet
+    /// ([`Driver::quiet`]), then started with every other held run as one wave
+    /// ([`Driver::start_wave`]). A lookup still out may settle a maker of a fact this item
+    /// reads, or demand one; a run answered before it would read a provisional row or
+    /// `absent`, and whether it did would depend on the order the store answers in.
+    ///
+    /// An own item of an asked unit runs only if its surface names it; a silent one settles
+    /// with no task (a demanded maker, past the own items, is named by its maker row). The
+    /// question is asked here, where a run would start, and not before its lookups: a lookup
+    /// is never delayed by it, and a record found was made for a named item.
     fn run(&mut self, u: u32, s: u32) {
-        self.units[u as usize].slots[s as usize].state = SlotState::Running;
-        self.runs.push_back(Work::Run(u, s));
+        let own = s != SURFACE && s as usize <= self.units[u as usize].index.len();
+        if own && self.units[u as usize].bodies == Bodies::Asked && !planted(Plant::AsksUnnamedBodies) {
+            match self.named(u, s) {
+                Some(true) => {}
+                Some(false) => return self.settle_silent(u, s),
+                None => return,
+            }
+        }
+        if planted(Plant::RunBeforeLookups) {
+            self.units[u as usize].slots[s as usize].state = SlotState::Running;
+            return self.runs.push_back(Work::Run(u, s));
+        }
+        self.units[u as usize].slots[s as usize].state = SlotState::Held;
+        self.held.push((u, s));
+    }
+
+    /// Whether the request is quiet, so the held runs start: a run is held and nothing else is
+    /// out or to start (no effect answered yet, nothing ready, no run queued for the pool).
+    ///
+    /// The rule: a run starts only when no answer it could read can still change. What can
+    /// change one is any work out: a lookup of its own unit (asking a shape, getting an address,
+    /// walking a trie) may settle a maker without running; a lookup of any unit, a dictionary
+    /// answered, or a record settling may demand a maker of a unit not asked, which joins the
+    /// demanded table every unit reads; a run or a put of the wave before settles makers; a unit
+    /// filed starts its dependents, whose lookups demand. Only a run held itself changes
+    /// nothing until it starts. So the one count is the driver's own count of work out, kept as
+    /// effects start and end (`pending`, `ready`, `runs`), not a count of item lookups: those
+    /// miss every way above but the first. Cost per event: three emptiness checks, `O(1)`.
+    ///
+    /// No deadlock. A held run waits for one thing, quiet; it waits on no item and no item
+    /// waits on it through this rule. What is out when a run is held is effects asked of the
+    /// host (each answered, or the request killed), work ready or queued (started by this loop
+    /// as the pool frees, which it does as runs are answered), and nothing else: an item parked
+    /// (`Waiting`) or `Demanding` has no work out of its own and waits on an item that is held,
+    /// or on work out, or on another parked item (released lowest first by
+    /// [`Driver::progress`], or a demand cycle, [`Failure::MadeCycle`]). So work out drains in
+    /// a bounded number of steps (every walk is bounded by [`WALK_MOST`], every item's settles
+    /// by [`SETTLES_MOST`]), the request goes quiet, and the wave starts at least one run. A
+    /// demanded maker's run is held like any other and starts in the next wave: a demand always
+    /// finishes, since quiet does not wait for demands to settle, only for work out. If the
+    /// request ever has nothing out, nothing to start and nothing held while not done, the
+    /// driver ends with [`Outcome::Stalled`] (`plan_next`): a typed outcome, never a hang.
+    fn quiet(&self) -> bool {
+        !self.held.is_empty()
+            && self.ready.is_empty()
+            && self.runs.is_empty()
+            && (self.pending.is_empty() || planted(Plant::ColdRunBeforeQuiet))
+            && !planted(Plant::WaveNeverStarts)
+    }
+
+    /// Starts every held run as one wave, in (unit, slot) order, each unit's runs reading the
+    /// made facts as they stand now ([`Unit::wave`]), whatever the pool's order of starting
+    /// them. What the wave's records make stale is redone once its units quiesce (held again,
+    /// into the next wave). Cost: a sort of the wave and one copy of each of its units' made
+    /// answer, the size of the merge `made_for` does per demand anyway.
+    fn start_wave(&mut self) {
+        let mut wave = core::mem::replace(&mut self.held, Vec::new_in(self.alloc.clone()));
+        wave.sort_unstable();
+        // The (unit, whether a surface) last frozen: slot 0, the surface, sorts first.
+        let mut frozen = (u32::MAX, false);
+        for &(u, s) in wave.iter() {
+            if frozen != (u, s == SURFACE) {
+                if frozen.0 == u {
+                    return self.fail(Failure::Misused("a unit's surface and its bodies held for one wave"));
+                }
+                self.freeze(u, s);
+                frozen = (u, s == SURFACE);
+            }
+            let slot = &mut self.units[u as usize].slots[s as usize];
+            if slot.state == SlotState::Held {
+                slot.state = SlotState::Running;
+                self.runs.push_back(Work::Run(u, s));
+            }
+        }
+        wave.clear();
+        self.held = wave;
+    }
+
+    /// Fixes what unit `u`'s runs of this wave read: its surface (`s` the surface) the
+    /// demanded table, its bodies its made answer. A unit's surface and its bodies never run in
+    /// one wave (its bodies are examined once its surface settled); `start_wave` refuses it by
+    /// name rather than answer one of them from the other's table.
+    fn freeze(&mut self, u: u32, s: u32) {
+        self.sync_answer(Work::Run(u, s));
+        let mut wave = core::mem::replace(&mut self.units[u as usize].wave, Vec::new_in(self.alloc.clone()));
+        wave.clear();
+        let now: &[Fact] = match s {
+            SURFACE => &self.demanded,
+            _ => self.made_for(u),
+        };
+        wave.extend_from_slice(now);
+        self.units[u as usize].wave = wave;
     }
 
     fn ran_slot(&mut self, u: u32, s: u32, record: &[u8]) {
@@ -2020,8 +2894,50 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             (Ok(reads), Ok(facts), Ok(result)) => (reads, facts, result),
             _ => return self.fail(Failure::Record { tag: slot_tag(s), key: address, why: RecordError::Malformed { at: 0, what: "root" } }),
         };
-        let unit = &mut self.units[u as usize];
+        let unit = &self.units[u as usize];
         let owner = unit.owner;
+        // What a record may make: a body only facts of a made kind its own unit owns (the ids
+        // its readers ask of this unit's made table), a surface only rows that are no made
+        // fact. Anything else is a fact no table would ever answer from this record: refused by
+        // name, never dropped (a dropped row is a reader answered `absent` against what was
+        // made). Floor: one route per fact, which the filter below did anyway.
+        let may_make = |fact: &Fact| match (s, record::route(&fact.id)) {
+            (SURFACE, Ok(Route::Made(_))) | (SURFACE, Err(_)) => false,
+            (SURFACE, Ok(_)) => true,
+            (_, route) => route == Ok(Route::Made(owner)),
+        };
+        if let Some(fact) = facts.iter().find(|fact| !may_make(fact)) {
+            let (item, id) = (unit.slots[s as usize].item, fact.id);
+            return self.fail(Failure::NotMade { unit: u, item, kind: id.0[10], id });
+        }
+        // A read of a fact a unit not asked makes: the record waits for its maker, and is
+        // redone if it read another answer than the maker gave. Floor: one binary search per
+        // read routed to a made table, in the units not asked (none in a request that asks
+        // every unit's bodies).
+        if !self.unasked.is_empty() && !planted(Plant::DemandAnsweredAbsent) {
+            let demanded = self.unasked_reads(u, s, reads.iter().map(|read| read.id));
+            if !demanded.is_empty() {
+                match self.gate(Waiter::Settle(u, s), &demanded) {
+                    Err(why) => return self.fail(why),
+                    Ok(false) => {
+                        let slot = &mut self.units[u as usize].slots[s as usize];
+                        slot.gated = Some((address, Aligned::copy_from(bytes)));
+                        slot.state = SlotState::Demanding;
+                        return;
+                    }
+                    Ok(true) => {
+                        let answered = &self.demanded;
+                        let stale = reads.iter().any(|read| {
+                            demanded.iter().any(|(_, id)| *id == read.id) && read.digest != made_answer(answered, &read.id)
+                        });
+                        if stale {
+                            return self.redo_demanded(u, s, address, reads);
+                        }
+                    }
+                }
+            }
+        }
+        let unit = &mut self.units[u as usize];
         let slot = &mut unit.slots[s as usize];
         slot.state = SlotState::Settled;
         slot.settles += 1;
@@ -2029,12 +2945,22 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         slot.result = result;
         slot.reads = copy_in(reads, alloc.clone());
         if s != SURFACE {
-            let mut made = Vec::with_capacity_in(facts.len(), alloc);
-            made.extend(facts.iter().copied().filter(|fact| record::route(&fact.id) == Ok(Route::Made(owner))));
-            slot.made = made;
+            // Every fact is a made fact of this unit: checked above.
+            slot.made = copy_in(facts, alloc);
         }
         if s == SURFACE {
+            // The surface's maker rows are in hand: its bodies need no read to learn which items
+            // it names. A kept surface's are read when a body would run ([`Driver::named`]). A
+            // unit not asked keeps reading them when a maker is first demanded of it, as before.
+            let unit = &self.units[u as usize];
+            if unit.bodies == Bodies::Asked && matches!(unit.maker_rows, MakerRows::Unread) {
+                self.keep_makers(u, facts);
+            }
             return self.after_surface(u);
+        }
+        // A slot past the unit's own items is a demanded maker ([`Driver::demand`]).
+        if s as usize > self.units[u as usize].index.len() {
+            return self.settled_demand(u, s, facts);
         }
         self.refresh_made(u);
         // Items waiting for this maker may start.
@@ -2045,19 +2971,24 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         }
     }
 
-    /// The unit's own made table now: the last manifest's rows of makers not examined, the
-    /// examined makers' rows as last made (provisionally, until they settle), and the settled
-    /// makers' own.
+    /// The unit's own made table now: the last manifest's rows of makers still in the unit and
+    /// not yet settled (provisionally, until they settle), and the settled makers' own.
+    ///
+    /// A last row whose maker is gone from the unit's index is dropped: an item deleted, or
+    /// every item of a unit whose bodies are not asked (its index is empty). A fresh build files
+    /// no row for a maker it does not hold, so the table must not either; keeping the row is a
+    /// made fact answered by a body that no longer runs (the stale rows of unit 1 after its
+    /// bodies went from asked to not asked).
     fn refresh_made(&mut self, u: u32) {
         let unit = &mut self.units[u as usize];
         let mut rows: Vec<(Fact, ContentId), A> = Vec::new_in(self.alloc.clone());
         if let Some(last) = unit.last.as_ref() {
             for (fact, maker) in last.made.iter().zip(last.makers.iter()) {
-                let settled = unit
-                    .index
-                    .binary_search_by(|(item, _)| item.0.cmp(maker))
-                    .is_ok_and(|at| unit.slots[unit.index[at].1 as usize].settles > 0);
-                if !settled {
+                let pending = match unit.index.binary_search_by(|(item, _)| item.0.cmp(maker)) {
+                    Ok(at) => unit.slots[unit.index[at].1 as usize].settles == 0,
+                    Err(_) => planted(Plant::DemandedRowsFiled),
+                };
+                if pending {
                     rows.push((*fact, *maker));
                 }
             }
@@ -2075,6 +3006,296 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             unit.made.push(fact);
             unit.makers.push(maker);
         }
+        unit.answer_epoch = STALE;
+    }
+
+    // ---- makers demanded of units not asked ----
+
+    /// The facts of `ids`, read by slot `s` of unit `u`, that a unit not asked makes, each with
+    /// that unit. A surface's reads of its own unit's made facts are none of them: its universe
+    /// holds no table of its own unit, so it is answered `GONE` whether the unit is asked or not.
+    fn unasked_reads(&self, u: u32, s: u32, ids: impl Iterator<Item = ContentId>) -> Vec<(u32, ContentId), A> {
+        let mut out = Vec::new_in(self.alloc.clone());
+        for id in ids {
+            if let Ok(Route::Made(owner)) = record::route(&id)
+                && let Ok(at) = self.unasked.binary_search_by_key(&owner, |&(owner, _)| owner)
+                && !(s == SURFACE && self.unasked[at].1 == u)
+            {
+                out.push((self.unasked[at].1, id));
+            }
+        }
+        out
+    }
+
+    /// Demands the maker of each of `reads` (facts units not asked make); whether every one is
+    /// final now. `waiter` is woken by each that is not, and checks again then. All are demanded
+    /// at once, so independent makers run side by side.
+    fn gate(&mut self, waiter: Waiter, reads: &[(u32, ContentId)]) -> Result<bool, Failure> {
+        let mut ready = true;
+        for &(d, id) in reads {
+            ready &= self.demand(d, id, waiter)?;
+            if self.done() {
+                return Ok(false);
+            }
+        }
+        Ok(ready)
+    }
+
+    /// Demands the maker of fact `id` of unit `d`: whether its answer is final (its maker
+    /// settled, or `d`'s surface has no maker row of its subject, so no body makes it and it is
+    /// `absent` as a fresh build answers it). The maker is named by `d`'s surface: the maker
+    /// row of the fact's subject ([`record::maker_row_of`], one binary search) holds the body's
+    /// text id, and `d`'s keyed items its key (one more). Until `d`'s maker rows are read
+    /// ([`Work::GetMakers`], once a request) the waiter waits for them. A maker not demanded
+    /// yet becomes a slot of `d` past its files, examined by its key's shape trie like any
+    /// item; one already demanded is shared.
+    fn demand(&mut self, d: u32, id: ContentId, waiter: Waiter) -> Result<bool, Failure> {
+        let Some(row) = record::maker_row_of(&id) else {
+            return Err(Failure::Misused("a fact routed to a made table whose kind no body makes"));
+        };
+        let unit = &mut self.units[d as usize];
+        if unit.state != UnitState::Complete {
+            return Err(Failure::Misused("a made fact demanded of a unit not filed yet"));
+        }
+        if matches!(unit.maker_rows, MakerRows::Unread) {
+            unit.maker_rows = MakerRows::Asked;
+            self.ready.push_back(Work::GetMakers(d));
+        }
+        let MakerRows::Read(rows) = &unit.maker_rows else {
+            if !self.loading.contains(&(d, waiter)) {
+                self.loading.push((d, waiter));
+            }
+            return Ok(false);
+        };
+        let Ok(at) = rows.binary_search_by(|fact| fact.id.cmp(&row)) else {
+            return Ok(true);
+        };
+        let text = StableId(rows[at].digest);
+        let Ok(at) = unit.text_items.binary_search_by(|(item, _)| item.cmp(&text)) else {
+            return Err(Failure::MakerNotKeyed { unit: d, item: text });
+        };
+        let (item, key) = unit.text_items[at];
+        let by = |demand: &Demand<A>| (demand.unit, demand.item);
+        if let Err(at) = self.demands.binary_search_by_key(&(d, item), by) {
+            let alloc = self.alloc.clone();
+            let unit = &mut self.units[d as usize];
+            let s = unit.slots.len() as u32;
+            // A unit not asked is checked by no request: its body is made for its MIR and the
+            // facts it makes alone, under the key that says so.
+            let mut slot = new_slot(item, Steps::Mir.key(key, item).id(), u32::MAX, alloc.clone());
+            slot.steps = Steps::Mir;
+            slot.examined = true;
+            slot.state = SlotState::Waiting;
+            unit.slots.push(slot);
+            self.demands.insert(at, Demand { unit: d, item, slot: s, waiters: Vec::new_in(alloc) });
+            self.try_start(d, s);
+            if self.done() {
+                return Ok(false);
+            }
+        }
+        let Ok(k) = self.demands.binary_search_by_key(&(d, item), by) else {
+            return Err(Failure::Misused("a demand lost as it was made"));
+        };
+        let slot = self.demands[k].slot;
+        if self.units[d as usize].slots[slot as usize].state == SlotState::Settled {
+            return Ok(true);
+        }
+        if let Some(at) = waiter.slot()
+            && self.reaches(k, at)
+        {
+            let mut items = Vec::with_capacity_in(2, Global);
+            items.push(item);
+            items.push(self.units[at.0 as usize].slots[at.1 as usize].item);
+            return Err(Failure::MadeCycle { unit: d, items });
+        }
+        if !self.demands[k].waiters.contains(&waiter) {
+            self.demands[k].waiters.push(waiter);
+        }
+        Ok(false)
+    }
+
+    /// Whether demand `from`'s maker is slot `to`, or waits, through other demanded makers, on
+    /// slot `to`: a cycle if `to` waited on `from`. Bounded: each demand is visited once.
+    fn reaches(&self, from: usize, to: (u32, u32)) -> bool {
+        let mut seen = Vec::with_capacity_in(self.demands.len(), self.alloc.clone());
+        seen.resize(self.demands.len(), false);
+        let mut stack = Vec::new_in(self.alloc.clone());
+        stack.push(from);
+        while let Some(k) = stack.pop() {
+            if seen[k] {
+                continue;
+            }
+            seen[k] = true;
+            let at = (self.demands[k].unit, self.demands[k].slot);
+            if at == to {
+                return true;
+            }
+            // What `at` waits on: every demand whose waiters name it.
+            for (e, demand) in self.demands.iter().enumerate() {
+                if !seen[e] && demand.waiters.iter().any(|waiter| waiter.slot() == Some(at)) {
+                    stack.push(e);
+                }
+            }
+        }
+        false
+    }
+
+    /// A demanded maker (slot `s` of unit `u`, not asked) settled with `facts`: they join the
+    /// request's demanded table, and what waited on it is resumed.
+    fn settled_demand(&mut self, u: u32, s: u32, facts: &[Fact]) {
+        let item = self.units[u as usize].slots[s as usize].item;
+        let by = |demand: &Demand<A>| (demand.unit, demand.item);
+        let Ok(k) = self.demands.binary_search_by_key(&(u, item), by) else {
+            return self.fail(Failure::Misused("a body of a unit not asked settled with no demand of it"));
+        };
+        if !facts.is_empty() {
+            self.demanded.extend_from_slice(facts);
+            self.demanded.sort_unstable_by_key(|fact| fact.id);
+            self.demanded.dedup_by_key(|fact| fact.id);
+            self.demand_epoch += 1;
+        }
+        let waiters = core::mem::replace(&mut self.demands[k].waiters, Vec::new_in(self.alloc.clone()));
+        self.resume(&waiters);
+    }
+
+    /// Resumes each of `waiters`, which waited for a demanded maker or a unit's maker rows: each
+    /// asks its gate again ([`Driver::gate`]), and waits again for what is still not final. A
+    /// waiter that went on since (its rows asked, its probe asked, its record settled) is
+    /// passed. Then the waiters' units may quiesce: `give` goes on with the answered work's
+    /// unit only.
+    fn resume(&mut self, waiters: &[Waiter]) {
+        for &waiter in waiters.iter() {
+            if self.done() {
+                return;
+            }
+            match waiter {
+                Waiter::Rows(r) => {
+                    if self.units[r as usize].rows_gated {
+                        self.ask_rows(r);
+                    }
+                }
+                Waiter::Probe(r, w) => {
+                    if self.units[r as usize].slots[w as usize].state == SlotState::Demanding
+                        && self.units[r as usize].slots[w as usize].gated.is_none()
+                    {
+                        self.ask_probe(r, w);
+                    }
+                }
+                Waiter::Settle(r, w) => {
+                    if let Some((address, bytes)) = self.units[r as usize].slots[w as usize].gated.take() {
+                        self.settle(r, w, address, &bytes);
+                    }
+                }
+                Waiter::Plan(p, i) => self.plan_resumed(p, i),
+                Waiter::Naming(r, w) => {
+                    if self.units[r as usize].slots[w as usize].state == SlotState::Naming {
+                        self.run(r, w);
+                    }
+                }
+            }
+        }
+        for &waiter in waiters.iter() {
+            if self.done() {
+                return;
+            }
+            match waiter.unit() {
+                NO_UNIT => self.program_progress(),
+                u => self.progress(u),
+            }
+        }
+    }
+
+    /// Keeps unit `d`'s maker rows for the request from its surface's `facts` (sorted by id),
+    /// with the text ids they name. Floor: one pass over the facts, one sort of the makers.
+    fn keep_makers(&mut self, d: u32, facts: &[Fact]) {
+        let alloc = self.alloc.clone();
+        let mut rows = Vec::new_in(alloc.clone());
+        rows.extend(facts.iter().filter(|fact| record::kind_of(&fact.id) == Some(record::FactKind::Maker)).copied());
+        let mut named = Vec::with_capacity_in(rows.len(), alloc);
+        named.extend(rows.iter().map(|row: &Fact| StableId(row.digest)));
+        named.sort_unstable();
+        named.dedup();
+        let unit = &mut self.units[d as usize];
+        unit.maker_rows = MakerRows::Read(rows);
+        unit.named = named;
+    }
+
+    /// The surface record of unit `d` read for its maker rows: they are kept for the request,
+    /// with the text ids they name, and what waited on them is resumed. The record is the one `d`'s table names
+    /// (its address checked); a record the store does not hold, or that does not open, fails
+    /// by name: a demanded fact must not be answered `absent` for want of a read.
+    fn got_makers(&mut self, d: u32, record: Option<&[u8]>) {
+        let alloc = self.alloc.clone();
+        let Some((_, _, address)) = self.get_of(Work::GetMakers(d)) else {
+            return self.fail(Failure::Misused("maker rows read of a unit with no surface"));
+        };
+        let at: Key<Surface> = Key::from_id(address);
+        let Some(bytes) = record else {
+            let what = "the surface record of a unit, which its table names, read for its maker rows: the store does not hold it";
+            return self.fail(Failure::Store(StoreFault { what }));
+        };
+        let facts = match record::open::<Surface>(bytes, &at).and_then(|root| root.facts.follow(bytes).map_err(RecordError::Format)) {
+            Ok(facts) => facts,
+            Err(why) => return self.fail(Failure::Record { tag: Surface::TAG, key: address, why }),
+        };
+        if let Err(why) = record::sorted(facts) {
+            return self.fail(Failure::Record { tag: Surface::TAG, key: address, why });
+        }
+        self.keep_makers(d, facts);
+        let mut waiters = Vec::new_in(alloc);
+        self.loading.retain(|&(unit, waiter)| {
+            if unit == d {
+                waiters.push(waiter);
+            }
+            unit != d
+        });
+        self.resume(&waiters);
+    }
+
+    /// Slot `s` of unit `u` read a demanded fact as another answer than its maker gave (it ran
+    /// before the maker settled): examined again from its shape, answered now.
+    fn redo_demanded(&mut self, u: u32, s: u32, address: ContentId, reads: &[Fact]) {
+        let alloc = self.alloc.clone();
+        let slot = &mut self.units[u as usize].slots[s as usize];
+        if slot.redos >= SETTLES_MOST {
+            let mut items = Vec::with_capacity_in(1, Global);
+            items.push(slot.item);
+            return self.fail(Failure::MadeCycle { unit: u, items });
+        }
+        slot.redos += 1;
+        let mut shape = Vec::with_capacity_in(reads.len(), alloc);
+        shape.extend(reads.iter().map(|read| read.id));
+        slot.old = Some(OldEntry { address, shape });
+        slot.holds = None;
+        slot.examined = true;
+        slot.parked = false;
+        slot.released = false;
+        slot.state = SlotState::Waiting;
+        self.ran.redone += 1;
+        self.try_start(u, s);
+    }
+
+    /// Asks unit `u`'s dictionary rows, once every fact of them a unit not asked makes is final.
+    fn ask_rows(&mut self, u: u32) {
+        if !self.unasked.is_empty() && !planted(Plant::DemandAnsweredAbsent) {
+            // The rows are no slot's: `u32::MAX` is none.
+            let reads = self.unasked_reads(u, u32::MAX, self.units[u as usize].asked_ids.iter().copied());
+            if !reads.is_empty() {
+                match self.gate(Waiter::Rows(u), &reads) {
+                    Err(why) => return self.fail(why),
+                    Ok(false) => {
+                        self.units[u as usize].rows_gated = true;
+                        return;
+                    }
+                    Ok(true) => {}
+                }
+            }
+        }
+        if self.done() {
+            return;
+        }
+        self.units[u as usize].rows_gated = false;
+        self.ready.push_back(Work::Rows(u));
     }
 
     /// After every event of unit `u`: starts what can start, releases a stall on makers, and
@@ -2101,7 +3322,17 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         }
         let unit = &self.units[u as usize];
         let busy = unit.slots.iter().any(|slot| {
-            matches!(slot.state, SlotState::Asking | SlotState::Getting | SlotState::Walking | SlotState::Running | SlotState::Putting)
+            matches!(
+                slot.state,
+                SlotState::Asking
+                    | SlotState::Getting
+                    | SlotState::Walking
+                    | SlotState::Held
+                    | SlotState::Running
+                    | SlotState::Putting
+                    | SlotState::Demanding
+                    | SlotState::Naming
+            )
         });
         if busy {
             return;
@@ -2117,6 +3348,11 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
     /// Nothing of the unit in flight: its made facts are final for what settled. Readers they
     /// moved are examined; when none is, the unit is filed.
     fn quiesce(&mut self, u: u32) {
+        // A body of the unit failed, and nothing of it is out: the unit files nothing, and what
+        // depends on it is blocked; the failure is already recorded.
+        if self.units[u as usize].slots.iter().any(|slot| slot.state == SlotState::Failed) {
+            return self.block(u);
+        }
         self.refresh_made(u);
         let alloc = self.alloc.clone();
         // The rows of the unit's own made facts, now, against the last manifest's.
@@ -2262,6 +3498,15 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 Err(why) => return self.fail(why),
             }
         };
+        // A unit not asked files no made table, yet its bodies' facts are demanded by readers:
+        // its universe covers its text in the made table's place, so a reader's mark moves with
+        // any edit of a maker it may have demanded (rule keys-cover-every-input). Units not
+        // asked are not edited in the edit loop (std, registry dependencies): the coarse key
+        // costs nothing there.
+        let made_digest = match unit.bodies {
+            Bodies::Asked => made_digest,
+            Bodies::NotAsked => ContentId::of("blaze-keyed made table, bodies not asked", &unit.text.id().0),
+        };
         let universe = record::universe(surface_result, made_digest, &deps_uds);
         let mark = unit.mark;
         let mark_bytes = record::write_mark(&mark, manifest.id(), surface, universe);
@@ -2362,7 +3607,13 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             return self.fail(Failure::Misused("a unit complete with no manifest"));
         };
         let surface = unit.own_universe.iter().find(|table| table.owner == unit.owner).and_then(|table| table.surface);
-        let own = TableRef { unit: u, owner: unit.owner, surface, manifest: Some(manifest) };
+        // A unit not asked is read with no manifest: its made facts are the demanded ones each
+        // effect carries ([`Driver::made_for`]), never its manifest's empty table.
+        let manifest_ref = match unit.bodies {
+            Bodies::Asked => Some(manifest),
+            Bodies::NotAsked => None,
+        };
+        let own = TableRef { unit: u, owner: unit.owner, surface, manifest: manifest_ref };
         let mut closure = copy_in(&unit.deps_universe, alloc);
         closure.push(own);
         closure.sort_by_key(|table| table.owner);
@@ -2372,14 +3623,106 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
         for at in 0..self.dependents[u as usize].len() {
             let dependent = self.dependents[u as usize][at] as usize;
             self.units[dependent].waiting -= 1;
-            if self.units[dependent].waiting == 0 {
+            // A dependent blocked by another failed dependency is never keyed.
+            if self.units[dependent].waiting == 0 && self.units[dependent].state == UnitState::Waiting {
                 self.units[dependent].state = UnitState::Keying;
                 self.runs.push_back(Work::Key(dependent as u32));
             }
         }
-        if self.complete as usize == self.units.len() {
-            self.phase = Phase::Filing;
-            self.ready.push_back(Work::Reads);
+        self.units_ended();
+    }
+
+    /// When every unit is complete or failed: the programs, or, with none, the certificate's
+    /// filing; with a failure, the request's end, carrying every failure.
+    fn units_ended(&mut self) {
+        if (self.complete + self.failed_units) as usize != self.units.len() {
+            return;
+        }
+        if !self.failures.is_empty() {
+            return self.end_failed();
+        }
+        if !self.progs.is_empty() {
+            return self.programs_start();
+        }
+        self.phase = Phase::Filing;
+        self.ready.push_back(Work::Reads);
+    }
+
+    /// The request ends with its failures: the first, in the order of what failed, is the
+    /// outcome's; [`Driver::failures`] gives all. Units that completed filed their records and
+    /// marks; nothing certifies the request.
+    fn end_failed(&mut self) {
+        self.failures.sort_by_key(|(at, _)| *at);
+        let why = self.failures[0].1.clone();
+        let ran = self.ran;
+        self.finish(Outcome::Failed { ran, why });
+    }
+
+    /// Records a failure of the task at `at` (unit, item; programs past the units).
+    fn failed_at(&mut self, at: (u32, u32), why: Failure) {
+        if planted(Plant::FailureStopsAll) {
+            return self.fail(why);
+        }
+        self.failures.push((at, why));
+    }
+
+    /// Unit `u` failed (its task at slot `s`, or [`SURFACE`] for its key or surface): nothing of
+    /// it is filed, and every unit that depends on it, at any depth, is blocked (never keyed).
+    fn unit_failed(&mut self, u: u32, s: u32, why: Failure) {
+        self.failed_at((u, s), why);
+        self.block(u);
+    }
+
+    /// Unit `u` and every unit depending on it, at any depth, fail with no failure of their own:
+    /// one of `u`'s tasks already gave it.
+    fn block(&mut self, u: u32) {
+        if self.done() {
+            return;
+        }
+        let mut stack = Vec::new_in(self.alloc.clone());
+        stack.push(u);
+        while let Some(f) = stack.pop() {
+            let unit = &mut self.units[f as usize];
+            if unit.state == UnitState::Failed || unit.state == UnitState::Complete {
+                continue;
+            }
+            unit.state = UnitState::Failed;
+            self.failed_units += 1;
+            stack.extend(self.dependents[f as usize].iter().copied());
+        }
+        self.units_ended();
+    }
+
+    /// Slot `s` of unit `u` failed its task: a surface fails its unit at once; a body fails its
+    /// unit when the unit quiesces, its other items going on; a demanded maker fails what
+    /// waited on it.
+    fn slot_failed(&mut self, u: u32, s: u32, why: Failure) {
+        if s == SURFACE {
+            return self.unit_failed(u, s, why);
+        }
+        self.units[u as usize].slots[s as usize].state = SlotState::Failed;
+        if s as usize <= self.units[u as usize].index.len() {
+            return self.failed_at((u, s), why);
+        }
+        let item = self.units[u as usize].slots[s as usize].item;
+        let by = |demand: &Demand<A>| (demand.unit, demand.item);
+        let Ok(k) = self.demands.binary_search_by_key(&(u, item), by) else {
+            return self.fail(Failure::Misused("a demanded maker failed with no demand of it"));
+        };
+        self.failed_at((u, s), why.clone());
+        let waiters = core::mem::replace(&mut self.demands[k].waiters, Vec::new_in(self.alloc.clone()));
+        for waiter in waiters {
+            if self.done() {
+                return;
+            }
+            match waiter {
+                Waiter::Rows(r) => self.unit_failed(r, SURFACE, why.clone()),
+                Waiter::Probe(r, w) | Waiter::Settle(r, w) | Waiter::Naming(r, w) => {
+                    self.units[r as usize].slots[w as usize].state = SlotState::Failed;
+                    self.progress(r);
+                }
+                Waiter::Plan(p, i) => self.plan_failed(p, i, why.clone()),
+            }
         }
     }
 }
@@ -2388,6 +3731,7 @@ fn new_slot<'s, A: Allocator + Clone>(item: StableId, key: ContentId, file: u32,
     Slot {
         item,
         key,
+        steps: Steps::Checked,
         file,
         old: None,
         state: SlotState::Kept,
@@ -2408,6 +3752,8 @@ fn new_slot<'s, A: Allocator + Clone>(item: StableId, key: ContentId, file: u32,
         node_bytes: None,
         audit: None,
         holds: None,
+        gated: None,
+        redos: 0,
     }
 }
 

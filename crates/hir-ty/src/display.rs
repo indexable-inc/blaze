@@ -1634,14 +1634,14 @@ impl<'db> Ty<'db> {
                         return write!(
                             f,
                             "{{closure#{:?}}}",
-                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)
+                            blaze_memo::Id::gid(id).local()
                         );
                     }
                     ClosureStyle::ClosureWithSubst => {
                         write!(
                             f,
                             "{{closure#{:?}}}",
-                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)
+                            blaze_memo::Id::gid(id).local()
                         )?;
                         return hir_fmt_generics(f, substs.as_slice(), None, None);
                     }
@@ -1697,14 +1697,14 @@ impl<'db> Ty<'db> {
                         return write!(
                             f,
                             "{{{closure_label}#{:?}}}",
-                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)
+                            blaze_memo::Id::gid(id).local()
                         );
                     }
                     ClosureStyle::ClosureWithSubst => {
                         write!(
                             f,
                             "{{{closure_label}#{:?}}}",
-                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)
+                            blaze_memo::Id::gid(id).local()
                         )?;
                         return hir_fmt_generics(f, args.as_slice(), None, None);
                     }

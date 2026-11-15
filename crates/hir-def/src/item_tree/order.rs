@@ -39,13 +39,13 @@ pub struct BodyItem {
 ///
 /// Read from the body's own syntax ([`body_syntax`]) and its unmoved source map, so it is
 /// made again only when the body is, and is equal (no reader reruns) while its items are.
-#[blaze_query::tracked(returns(deref))]
-pub fn body_items(db: &Db, owner: DefWithBodyId) -> Box<[BodyItem]> {
+#[blaze_memo::tracked(returns(copy))]
+pub fn body_items<'db>(db: &'db Db, owner: DefWithBodyId) -> &'db [BodyItem] {
     let _p = tracing::info_span!("body_items", ?owner).entered();
     let body = Body::of(db, owner);
     let blocks = body.store.block_scopes();
     if blocks.is_empty() {
-        return Box::default();
+        return &[];
     }
     let mut by_ast = blaze_hash::HashMap::new_in(Global);
     // alloc: the body's blocks by ast id, once per run of the query, dropped at its end
@@ -60,7 +60,8 @@ pub fn body_items(db: &Db, owner: DefWithBodyId) -> Box<[BodyItem]> {
         map: Body::unmoved_source_map(db, owner),
         cfg: krate.cfg_options(db),
         blocks: &by_ast,
-        out: Vec::new(), // alloc: the query's result, at most once per body edit
+        // The run's list, kept in the arena exactly at the end.
+        out: Vec::new_in(Global),
     };
     match (Body::relative(db, owner), body_syntax(db, owner)) {
         // The unmoved map is the relative one: its pointers are into the body's own tree.
@@ -75,7 +76,7 @@ pub fn body_items(db: &Db, owner: DefWithBodyId) -> Box<[BodyItem]> {
             walk.body(owner, file_id, value, file_id.ast_id_map(db));
         }
     }
-    walk.out.into_boxed_slice()
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &walk.out)
 }
 
 struct Walk<'a> {

@@ -88,8 +88,8 @@ pub(crate) enum Syscall {
 
 /// What `f` is to the walk for stats and opens, by its crate, its module path and its name:
 /// once per function.
-#[blaze_query::tracked(returns(copy))]
-pub(crate) fn syscall(db: &Db, f: FunctionId) -> Syscall {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn syscall<'db>(db: &'db Db, f: FunctionId) -> Syscall {
     let function = hir::Function::from(f);
     let module = function.module(db);
     let krate = module.krate(db);

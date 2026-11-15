@@ -1128,10 +1128,11 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
         Ok(match shape {
             AdtPatternShape::Record { args } => {
                 let mut it = Vec::with_capacity_in(args.len(), self.frame);
+                let table = self.resolver.ctx_table();
                 for x in args {
                     let hygiene = self.store.record_field_hygiene(x.pat);
                     let field_id = variant_data
-                        .field_written(self.db, v, &x.name, hygiene)
+                        .field_written(self.db, table, v, &x.name, hygiene)
                         .ok_or(MirLowerError::UnresolvedField)?;
                     it.push((PlaceElem::Field(field_id.into()), x.pat));
                 }

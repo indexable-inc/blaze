@@ -272,7 +272,9 @@ const _: () = {
 
 #[cfg(target_pointer_width = "64")]
 const _: () = {
-    assert!(size_of::<ModPath>() == 16);
+    // 24, was 16: `PathKind::DollarCrate` holds an 8-byte memo id. Owed back to 16 by its
+    // holding the 4-byte `base_db::CrateKey` (hir-expand's assert says the same).
+    assert!(size_of::<ModPath>() == 24);
     assert!(size_of::<Name>() == 4);
     assert!(size_of::<TypeBound>() == 16);
 };
@@ -1443,7 +1445,7 @@ impl ExpressionStoreBuilder {
 
 #[cfg(test)]
 mod tests {
-    use blaze_query::db::FromId;
+    use blaze_memo::Id as _;
     use intern::Symbol;
     use la_arena::RawIdx;
 
@@ -1463,9 +1465,7 @@ mod tests {
     }
 
     fn lang_item() -> LangItemTarget {
-        LangItemTarget::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_u32(
-            5 + (1 << 20),
-        )))
+        LangItemTarget::FunctionId(FunctionId::from_gid(blaze_memo::Gid::for_test(5 + (1 << 20))))
     }
 
     /// Every shape: bare, lang items with and without a name, `Normal` with a type anchor only,

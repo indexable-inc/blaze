@@ -238,6 +238,65 @@ pub enum Mode {
     RunCustomBuild,
 }
 
+/// An edge's two marks in the front end's crate graph (`base_db::DependencyBuilder::with_prelude`),
+/// the one home of both rules ([`UnitDep::marks`]); every crate graph made of units takes
+/// them from here (blaze-lower's `crates::dependency`, blaze-command's snapshot, hir-def's std
+/// census), never derives them itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EdgeMarks {
+    /// In the dependent's extern prelude: nameable with no `extern crate`.
+    pub prelude: bool,
+    /// Injected by the toolchain (a sysroot crate): hir-def drops a sysroot `core` from a
+    /// `#![no_core]` crate's extern prelude and finds the injected `extern crate std` through it.
+    pub sysroot: bool,
+}
+
+/// The facts an edge's marks are functions of, and nothing else.
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeFacts<'a> {
+    /// The dependent is a toolchain (standard library) unit.
+    pub dependent_is_std: bool,
+    /// The dependent is a proc macro.
+    pub dependent_is_proc_macro: bool,
+    /// The unit depended on is a toolchain unit.
+    pub target_is_std: bool,
+    /// The name the dependent's code gives it.
+    pub name: &'a str,
+    /// cargo's `noprelude` on the edge (build-std's std roots given to a user crate).
+    pub noprelude: bool,
+}
+
+impl EdgeFacts<'_> {
+    /// The marks, as rustc and cargo give them:
+    /// - `prelude`: unless cargo passes the edge `noprelude`; a proc macro's `proc_macro` is
+    ///   in it all the same, since cargo passes a proc-macro target `--extern proc_macro`
+    ///   beside build-std's `noprelude` one, and rustc puts a crate in the extern prelude when
+    ///   any `--extern` naming it is not `noprelude`;
+    /// - `sysroot`: a toolchain crate under a crate that is not one. A toolchain crate's own
+    ///   dependency is declared in its manifest, so `#![no_core]` keeps it: the facade
+    ///   `rustc-std-workspace-core` is `#![no_core]` with `pub use core::*;`.
+    pub fn marks(&self) -> EdgeMarks {
+        EdgeMarks {
+            prelude: !self.noprelude || (self.dependent_is_proc_macro && self.name == "proc_macro"),
+            sysroot: self.target_is_std && !self.dependent_is_std,
+        }
+    }
+}
+
+impl UnitDep {
+    /// This edge's marks, of `unit` on `on` (the unit at [`UnitDep::index`]).
+    pub fn marks(&self, unit: &Unit, on: &Unit) -> EdgeMarks {
+        EdgeFacts {
+            dependent_is_std: unit.is_std,
+            dependent_is_proc_macro: unit.target.is_proc_macro(),
+            target_is_std: on.is_std,
+            name: &self.extern_crate_name,
+            noprelude: self.noprelude.unwrap_or(false),
+        }
+        .marks()
+    }
+}
+
 /// An edge of the graph.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitDep {

@@ -87,7 +87,7 @@ fn message(error: &MirEvalError<'_>) -> String {
 
 /// The `#[panic_handler]` of the crate graph `krate` is the root of: the function core's
 /// `panic_impl` goes to. rustc allows one in a graph.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn panic_handler(db: &Db, krate: Crate) -> Option<FunctionId> {
     let def_map = crate_def_map(db, krate);
     for (_, module) in def_map.modules(db) {

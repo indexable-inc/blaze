@@ -147,7 +147,7 @@ impl Tracker {
                 (Cow::Owned(puncts_descr(&puncts)), span)
             }
             Some(TtElement::Leaf(tt::Leaf::Ident(ident))) => {
-                (Cow::Owned(ident_descr(&ident, ident.span.ctx.edition(db))), ident.span)
+                (Cow::Owned(ident_descr(&ident, ident.span.ctx.edition())), ident.span)
             }
             // alloc: an error's text, when no rule matches.
             Some(TtElement::Leaf(tt::Leaf::Literal(lit))) => {
@@ -285,7 +285,7 @@ fn is_word(db: &Db, leaf: &tt::Leaf) -> bool {
         tt::Leaf::Literal(_) => true,
         tt::Leaf::Ident(ident) => {
             ident.is_raw == tt::IdentIsRaw::Yes
-                || keyword(ident.sym.as_str(), ident.span.ctx.edition(db)).is_none()
+                || keyword(ident.sym.as_str(), ident.span.ctx.edition()).is_none()
         }
         tt::Leaf::Punct(_) => false,
     }
@@ -314,7 +314,7 @@ fn describe(db: &Db, matcher: &Matcher, at: At) -> (Cow<'static, str>, Option<Sp
         }
         Loc::Ident(it) => {
             let ident = &matcher.idents[it as usize];
-            (Cow::Owned(ident_descr(ident, ident.span.ctx.edition(db))), Some(ident.span))
+            (Cow::Owned(ident_descr(ident, ident.span.ctx.edition())), Some(ident.span))
         }
         Loc::Punct(it) => {
             let puncts = &matcher.puncts[it as usize];
@@ -378,7 +378,7 @@ fn separator_descr(db: &Db, separator: &Separator) -> (String, Span) {
     match separator {
         // alloc: an error's text, when no rule matches.
         Separator::Literal(lit) => (format!("`{lit}`"), lit.span),
-        Separator::Ident(ident) => (ident_descr(ident, ident.span.ctx.edition(db)), ident.span),
+        Separator::Ident(ident) => (ident_descr(ident, ident.span.ctx.edition()), ident.span),
         Separator::Puncts(puncts) => {
             (puncts_descr(puncts), puncts[0].span.cover(puncts[puncts.len() - 1].span))
         }

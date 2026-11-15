@@ -230,6 +230,22 @@ pub fn machine_bytes() -> Option<u64> {
     (ok == 0 && bytes != 0).then_some(bytes)
 }
 
+/// Bytes of memory the machine has: its physical pages times the page size.
+#[cfg(target_os = "linux")]
+pub fn machine_bytes() -> Option<u64> {
+    // SAFETY: sysconf reads a constant of the system; no memory of ours.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    u64::try_from(pages).ok()?.checked_mul(page_bytes()?)
+}
+
+/// The machine's page size, in bytes.
+#[cfg(unix)]
+pub fn page_bytes() -> Option<u64> {
+    // SAFETY: sysconf reads a constant of the system; no memory of ours.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page).ok().filter(|it| *it != 0)
+}
+
 // SAFETY: libsystem_kernel's `int memorystatus_control(uint32_t command, int32_t pid, uint32_t
 // flags, void *buffer, size_t buffersize)`, as XNU's bsd/sys/kern_memorystatus.h declares it
 // (apple-oss-distributions/xnu, main at f6217f89, line 333); a declaration that differs would

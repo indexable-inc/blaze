@@ -332,7 +332,9 @@ impl Crate {
     }
 
     pub fn transitive_reverse_dependencies(self, db: &Db) -> impl Iterator<Item = Crate> {
-        self.id.transitive_rev_deps(db).iter().map(|&id| Crate { id })
+        let mut dependents = Vec::new_in(Global);
+        self.id.transitive_rev_deps(db, &mut dependents);
+        dependents.into_iter().map(|id| Crate { id })
     }
 
     pub fn notable_traits_in_deps(self, db: &Db) -> impl Iterator<Item = &TraitId> {
@@ -4078,11 +4080,11 @@ impl Impl {
         }
         // Each crate's trait impls for the type alone: of a crate read from impl table pages,
         // the type's entry and its rows, not the crate's whole table.
+        // Asked once, keyed by `krate`: a query keyed by one loaded crate and the type's (two
+        // unrelated crates) is refused by homing.
         let key = method_resolution::SelfTyKey(simplified_ty);
-        for &seen in method_resolution::loaded_crates(db, krate.id) {
-            let impls = TraitImpls::in_crate_for_self_ty(db, seen, key);
-            result.extend(impls.iter().copied().map(|id| Impl { id }));
-        }
+        let impls = TraitImpls::in_crate_and_deps_for_self_ty(db, krate.id, key);
+        result.extend(impls.iter().copied().map(|id| Impl { id }));
         // An impl in a block is one of its crate as well as of the block.
         let mut seen = HashSet::new_in(Global); // alloc: editor edge, sized by the impls found
         result.retain(|it| seen.insert(*it));
@@ -4776,10 +4778,10 @@ impl<'db> PartialEq for Type<'db> {
         if self.ty != other.ty {
             return false;
         }
-        blaze_query::db::with_attached_db(|db: Option<&Db>| {
+        blaze_memo::with_attached_db(|db: Option<&Db>| {
             let db = db.expect(
                 "two `hir::Type`s of one type and different owners are compared through the database \
-                 `blaze_query::db::attach` lends, and none is attached",
+                 `blaze_memo::attach` lends, and none is attached",
             );
             self.owner.can_rebase_into(db, other.owner, self.ty)
                 || other.owner.can_rebase_into(db, self.owner, other.ty)

@@ -52,6 +52,7 @@ use self::{
     spec::{Observed, Step, Test},
 };
 use super::{Kept, TestDB, build, database, traced, verdict};
+use crate::v2::tests::write_file;
 
 /// The parts of minicore a simulated crate is built over.
 const MINICORE: &str = "sized, copy, clone, drop, transmute, size_of, unsize, coerce_unsized, dispatch_from_dyn, add, option";
@@ -144,13 +145,19 @@ impl State {
     /// A restart: the database and the memo are the process's and are lost; the store stays.
     fn restart(&mut self, text: &str) {
         let (mut db, file) = database(&fixture(text));
-        db.set_file_text(file, text);
+        write_file(&mut db, file, text);
         (self.db, self.file, self.memo) = (db, file, Memo::new());
+    }
+
+    /// Sets the file's text in a new snapshot: one write, one commit (the file's id is the
+    /// same after it, so `self.file` stays; nothing else of the database is held here).
+    fn write(&mut self, text: &str) {
+        write_file(&mut self.db, self.file, text);
     }
 
     /// A state between two writes of a save, built on: what a reader that looks then sees.
     fn torn(&mut self, text: &str, what: &str) {
-        self.db.set_file_text(self.file, text);
+        self.write(text);
         self.log.push(format!("the file {what} ({} bytes), built on", text.len()));
         if let Ok(built) = self.build() {
             self.keep(built);
@@ -191,7 +198,7 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
         first_panic: String::new(),
         made: BTreeSet::new(),
     };
-    state.db.set_file_text(state.file, &text);
+    state.write(&text);
     let mut rows = Vec::new();
     for (index, revision) in test.revisions.iter().enumerate() {
         state.log.push(format!("{}:", revision.label));
@@ -217,7 +224,7 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                                 state.torn(&new[..cut], "cut short");
                             }
                         }
-                        state.db.set_file_text(state.file, &new);
+                        state.write(&new);
                         state.log.push("the edit".to_owned());
                         text = new;
                     }
@@ -225,10 +232,13 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                 Step::EditTwice => {
                     let new = text_at(test, index);
                     if new != text {
-                        // Two saves and no build between: the database is set twice.
+                        // Two saves and no build between: the file is set twice in the one
+                        // edit the driver makes of them, which commits the second.
                         let first = spec::first_save("src/lib.rs", new.as_bytes()).expect("a `.rs` file has two saves");
-                        state.db.set_file_text(state.file, std::str::from_utf8(&first).expect("UTF-8"));
-                        state.db.set_file_text(state.file, &new);
+                        let mut edit = state.db.edit();
+                        edit.set_file_text(state.file, std::str::from_utf8(&first).expect("UTF-8"));
+                        edit.set_file_text(state.file, &new);
+                        _ = edit.commit();
                         state.log.push("the edit, saved twice".to_owned());
                         text = new;
                     }
@@ -243,7 +253,7 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                     // A second checkout: a database and a memo of its own over the one store.
                     state.log.push("a second database of the same text, built over the same store".to_owned());
                     let (mut other, other_file) = database(&fixture(&text));
-                    other.set_file_text(other_file, &text);
+                    write_file(&mut other, other_file, &text);
                     let built = build(&other, &Memo::new(), &state.store, blaze_store_check::Setting::ALL, state.heap_to_stack);
                     if let Ok(built) = built {
                         state.store.0.extend(built.puts.into_iter().map(|it| (it.key, it.bytes)));
@@ -255,7 +265,7 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                 }
                 Step::Touch(_) => {
                     state.log.push("the same text set again".to_owned());
-                    state.db.set_file_text(state.file, &text);
+                    state.write(&text);
                 }
                 Step::Wait(_) => panic!(
                     "{}: the step `wait` is the real driver's: the simulation's database does nothing of its own accord",
@@ -298,7 +308,7 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
         let incremental = state.build();
         let ms = began.elapsed().as_millis();
         let (mut fresh, fresh_file) = database(&fixture(&text));
-        fresh.set_file_text(fresh_file, &text);
+        write_file(&mut fresh, fresh_file, &text);
         let clean = build(&fresh, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, state.heap_to_stack);
         let mut seen = Observed { ok: incremental.is_ok(), ms, panics: state.panics, ..Observed::default() };
         seen.first_panic = std::mem::take(&mut state.first_panic);
@@ -410,7 +420,7 @@ fn the_oracle_catches_a_stale_store_entry() {
         .iter()
         .map(|text| {
             let (mut db, file) = database(&fixture(text));
-            db.set_file_text(file, text);
+            write_file(&mut db, file, text);
             build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the control's text builds")
         })
         .collect();
@@ -425,7 +435,7 @@ fn the_oracle_catches_a_stale_store_entry() {
     let mut store = Kept::default();
     store.0.insert(new, stale);
     let (mut db, file) = database(&fixture(&texts[1]));
-    db.set_file_text(file, &texts[1]);
+    write_file(&mut db, file, &texts[1]);
     let planted = build(&db, &Memo::new(), &store, blaze_store_check::Setting::OFF, false).expect("a build over the planted store");
     let (planted_trace, planted_rows) = traced(&planted, &store);
     let (clean_trace, clean_rows) = traced(&builds[1], &Kept::default());
@@ -444,7 +454,7 @@ fn keys_of(case: &str, name: &str) -> Vec<blaze_cas::Key> {
         .map(|index| {
             let text = text_at(&test, index);
             let (mut db, file) = database(&fixture(&text));
-            db.set_file_text(file, &text);
+            write_file(&mut db, file, &text);
             let built = build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the revision builds");
             let (instance, _) = built.debug_names.iter().find(|(_, it)| it == name).unwrap_or_else(|| panic!("no `{name}` is built"));
             built.kernel.iter().find(|entry| entry.instance == *instance).expect("its kernel entry").key
@@ -468,7 +478,7 @@ fn the_keys_of_the_coercion_site_before_and_after_the_override() {
     for index in 0..2 {
         let text = text_at(&test, index);
         let (mut db, file) = database(&fixture(&text));
-        db.set_file_text(file, &text);
+        write_file(&mut db, file, &text);
         let built = build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the revision builds");
         let (instance, _) = built.debug_names.iter().find(|(_, it)| it == "app::shapes").expect("shapes");
         let function = built.functions.iter().find(|it| it.key == *instance).expect("its code");

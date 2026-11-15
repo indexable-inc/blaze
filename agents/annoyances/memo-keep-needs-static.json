@@ -1,0 +1,14 @@
+{
+ "id": "memo-keep-needs-static",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane L7 (hir-ty-pure, hir-ty-mir) of the blaze-memo port, port-memo-1113",
+ "where": "crates/blaze-memo/src/keep.rs keep, keep_slice (T: Copy + Send + Sync + 'static); every query in crates/hir-ty-mir and crates/hir-ty-pure whose value owns a Vec, Box, Arc, String or map",
+ "what": "A query value must be !needs_drop, so a value that owns memory has to be rebuilt as borrows into the run's arena. But keep and keep_slice need T: 'static, so a query generic in 'db cannot keep a slice of anything that names 'db (a &'db str, an InlinedBody<'db>, a MirBody<'db>), and nested arena values (a kept slice of kept slices) cannot be written at all. And the !needs_drop check is a post-monomorphization assert, so `cargo check` passes on every value still owning memory and only `cargo build` finds them.",
+ "cost": "a lane of ~300 sites could convert only the flat values (location's maps, the inliner's callee lists, an unexpanded call's text); every other owning value is left as it was and listed, and the gate the lane is judged by cannot see any of them",
+ "cause": "keep's bound is on the type's lifetime rather than on the arena the borrow lives in, and the drop check runs where the value is monomorphized, not where the query is declared",
+ "class": "a constraint of the store that the type system is not told, so the checker accepts what the store will refuse",
+ "prevention": "give keep a bound tied to the run's arena lifetime (`fn keep_slice<'db, T: Copy + 'db>(memo: &'db Memo, ..) -> &'db [T]`), and make the tracked macro emit a `const _: () = assert!(!needs_drop::<V>())` on the declared value type, or an `ArenaValue` marker trait bound, so `cargo check` refuses an owning value at its query",
+ "workaround": "values left owning are listed in the L7 report as expected post-mono failures",
+ "fix": "not yet",
+ "state": "open"
+}

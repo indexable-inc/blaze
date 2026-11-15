@@ -1618,6 +1618,66 @@ pub(crate) struct Lists {
     pub totals: Totals,
 }
 
+crate::keep::kept_struct!(Totals { absolute, image, got, functions, function_names, fdes, unwind });
+
+impl<T: crate::keep::Kept> crate::keep::Kept for Owned<T> {
+    fn put<A: std::alloc::Allocator>(&self, out: &mut crate::keep::Out<A>) {
+        use crate::keep::Kept as _;
+        self.items.put(out);
+        self.owners.put(out);
+    }
+
+    fn take(input: &mut crate::keep::In<'_>) -> Result<Owned<T>, crate::keep::Bad> {
+        let items: Arc<Vec<T>> = crate::keep::Kept::take(input)?;
+        let owners: Arc<Vec<PieceId>> = crate::keep::Kept::take(input)?;
+        if items.len() != owners.len() {
+            return Err(crate::keep::Bad::What("a writer's list whose items and owners differ in count"));
+        }
+        Ok(Owned { items, owners })
+    }
+}
+
+/// The lists as a kept state holds them ([`crate::keep`]): a debug section's name, a
+/// `&'static str`, by its text ([`crate::keep::static_name`]).
+impl Lists {
+    pub(crate) fn keep<A: std::alloc::Allocator>(
+        &self,
+        out: &mut crate::keep::Out<A>,
+    ) -> Result<(), crate::keep::Unkept> {
+        use crate::keep::Kept as _;
+        let Lists { rebase, binds, got, functions, debug, totals } = self;
+        rebase.put(out);
+        binds.put(out);
+        got.put(out);
+        functions.put(out);
+        out.len(debug.len());
+        for (name, bytes) in debug.iter() {
+            if crate::keep::static_name(name).is_none() {
+                return Err(crate::keep::Unkept::Debug(*name));
+            }
+            out.text(name);
+            out.bytes(bytes);
+        }
+        totals.put(out);
+        Ok(())
+    }
+
+    pub(crate) fn open(input: &mut crate::keep::In<'_>) -> Result<Lists, crate::keep::Bad> {
+        use crate::keep::Kept;
+        let rebase = Kept::take(input)?;
+        let binds = Kept::take(input)?;
+        let got = Kept::take(input)?;
+        let functions = Kept::take(input)?;
+        let count = input.count(16)?;
+        let mut debug = Vec::with_capacity_in(count, Global);
+        for _ in 0..count {
+            let name: &'static str = Kept::take(input)?;
+            debug.push((name, input.bytes()?.to_vec()));
+        }
+        Ok(Lists { rebase, binds, got, functions, debug: Arc::from(debug), totals: Kept::take(input)? })
+    }
+}
+
 /// Which lists to collect from pieces.
 #[derive(Clone, Copy)]
 struct Want {

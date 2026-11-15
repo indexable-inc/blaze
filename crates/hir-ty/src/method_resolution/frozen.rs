@@ -5,8 +5,8 @@
 //! The record is [`pages`]: a crate's trait impls, inherent impls and its traits' value items
 //! as tables a lookup reads one entry of. This file is what has a crate read from one: the
 //! per-crate input ([`Tables`], [`ImplTablesSlot`]), the key the record is kept under
-//! ([`key`]), the serve and the store ([`serve`], [`store`]), and how a simplified self type is
-//! written. As with a frozen `DefMap`, what is read must equal what finding the impls gives:
+//! ([`key`]), the driver's lookup, slot and store ([`find`], [`give`], [`store`]), and how a
+//! simplified self type is written. As with a frozen `DefMap`, what is read must equal what finding the impls gives:
 //! [`Mode::Check`] finds them and [`check`] records a difference, which is a bug.
 
 use std::sync::Arc as StdArc;
@@ -16,7 +16,7 @@ use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use hir_def::{
     ModuleDefId,
-    deps::{DepImages, ImageStore, PageSource, Paged, Served},
+    deps::{Image, ImageStore, PageSource, Paged},
     nameres::frozen::{Dec, Enc, Mode, record_difference},
 };
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
@@ -74,35 +74,49 @@ impl Tables {
     }
 }
 
-/// The crates whose impls are read from tables, set by whoever has the records: read where
-/// every crate is gone over ([`serve`], [`withdraw_unimaged`]). A crate's own tables are read
-/// from its slot ([`ImplTablesSlot`], `hir_def::deps::given`), so tables given to one crate
-/// are no write a reader of another crate's read.
-#[blaze_query::input(singleton, debug)]
-pub struct FrozenImpls {
-    #[returns(ref)]
-    pub maps: StdArc<HashMap<Crate, Tables, Global>>,
-}
+/// The kind of a crate's slot holding the impl tables it is read from ([`give`],
+/// `hir_def::deps::given`): a crate's own slot, so tables given to one crate are no input a
+/// reader of another crate's reads.
+pub struct ImplTablesSlot;
 
-/// Has finding the impls of a crate use `maps`.
-pub fn set(db: &mut Db, maps: HashMap<Crate, Tables, Global>) {
-    use blaze_query::db::{Durability, Setter};
-    // clone: the handle of the map set before, to tell which crates' tables move
-    let was = FrozenImpls::try_get(&*db).map(|it| it.maps(&*db).clone());
-    hir_def::deps::given::give_changed::<ImplTablesSlot, Tables>(db, was.as_deref(), &maps);
-    let maps = StdArc::new(maps);
-    match FrozenImpls::try_get(db) {
-        Some(it) => {
-            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
-        }
-        None => {
-            _ = FrozenImpls::new(db, Durability::HIGH, maps);
-        }
+/// The fact a crate's impl tables slot is read by: the slot's id, of the crate's own stable id
+/// `krate_id`, and as its digest the record's key and what is done with it (equal keys are
+/// equal bytes; [`served`] reads the mode).
+pub fn tables_fact(krate_id: ContentId, tables: &Tables) -> blaze_memo::Fact {
+    let mut hasher = Hasher::new("hir-ty impl tables slot digest");
+    hasher.id(&tables.pages.key).update(&[tables.mode as u8]);
+    blaze_memo::Fact {
+        id: ContentId::of("hir-ty impl tables slot", &krate_id.0),
+        digest: hasher.finish(),
     }
 }
 
-/// The kind of a crate's slot holding its entry of [`FrozenImpls`].
-pub struct ImplTablesSlot;
+/// Has finding the impls of each crate of `entries` read its tables, from the snapshot `edit`
+/// commits: each crate is given its tables in its own slot ([`ImplTablesSlot`]), read by the
+/// fact given with them ([`tables_fact`]). Called by the driver in the edit that commits the
+/// crates' images (`hir_def::deps::give_image`), so tables are never read against files they
+/// were not made from. A crate given equal tables is not given them again. How many crates
+/// were given.
+pub fn give(
+    edit: &mut base_db::Edit<'_>,
+    entries: impl IntoIterator<Item = (Crate, blaze_memo::Fact, Tables)>,
+) -> usize {
+    hir_def::deps::given::give_each::<ImplTablesSlot, Tables>(edit, entries)
+}
+
+/// A test's [`give`] of `maps`, committed, each slot named by its record's key in place of the
+/// crate's stable id (a test's crates have none). The commit drops each given crate's arena:
+/// the caller takes its crates again by key after it.
+pub fn give_for_test(db: &mut Db, maps: HashMap<Crate, Tables, Global>) {
+    let mut edit = db.edit();
+    give(
+        &mut edit,
+        maps.into_iter().map(|(krate, tables)| {
+            (krate, tables_fact(tables.pages.key, &tables), tables)
+        }),
+    );
+    _ = edit.commit();
+}
 
 /// The tables `krate` was given, from its own slot: the one read of them inside a query.
 fn tables(db: &Db, krate: Crate) -> Option<&Tables> {
@@ -113,9 +127,6 @@ fn tables(db: &Db, krate: Crate) -> Option<&Tables> {
 pub fn served(db: &Db, krate: Crate) -> bool {
     tables(db, krate).is_some_and(|it| it.mode != Mode::Check)
 }
-
-// Name resolution hands the impls maintainer no delta of a crate whose impls are read here.
-inventory::submit! { hir_def::nameres::delta::ImplsServed(served) }
 
 /// The version of how a simplified self type is written ([`write_simplified`]), for the key
 /// the record is stored under ([`key`]) and the record's header: it changes with every change
@@ -142,71 +153,38 @@ pub fn key(filed: ContentId) -> ContentId {
     hasher.finish()
 }
 
-/// Gives `db` the impl tables `images` keeps of each crate `served` keyed that is read from
-/// its image in [`Mode::Serve`], and takes away those of a crate `served` keyed that is not
-/// (its image went, or its tables were never written): called in the write of the serve
-/// (`hir_def::deps::serve`), so the pass of that write finds each crate with tables
-/// served and the impls maintainer never keys an impl of it. A crate `served` did not key is
-/// left as it is. Gives the crates whose tables came or went, sorted; nothing is written for
-/// none. The caller notes a change of the crate graph when one of them was maintained before
-/// (the impls maintainer then drops what it held of it).
+/// The impl tables `images` keeps of `krate`, the crate the driver serves from `image`: the
+/// driver's lookup while it builds a snapshot, whose result it gives ([`give`]). `None` where
+/// the image is not read in [`Mode::Serve`] or no tables were written of it; such a crate's
+/// impls are found from its decoded def map, as before tables were kept, and [`store`] then
+/// writes them. `db` names the crate in an error alone.
 ///
-/// A crate with an image and no tables in the store is maintained from its decoded def map,
-/// as before tables were kept, and [`store`] then writes them. Tables that are found and do
-/// not read stop the query that reads them, naming the crate; nothing is found in their place.
-pub fn serve(
-    db: &mut Db,
-    served: &Served,
-    // dyn: the driver's store, one call per crate per serve
+/// Tables that are found and do not read stop the query that reads them, naming the crate;
+/// nothing is found in their place.
+pub fn find(
+    db: &Db,
+    krate: Crate,
+    image: &Image,
+    // dyn: the driver's store, one call per crate per snapshot
     images: &dyn ImageStore,
     mode: Mode,
-) -> R<Vec<Crate>> {
-    // clone: what was served before, once per serve, to add to
-    let mut maps =
-        FrozenImpls::try_get(&*db).map(|it| (**it.maps(&*db)).clone()).unwrap_or_default();
-    // In the crates' order: the store is asked in the same order by every database.
-    let mut asked: Vec<Crate> = served.keys.keys().copied().collect(); // alloc: once per serve
-    asked.sort_unstable();
-    let mut changed = Vec::new(); // alloc: none until a crate's tables change
-    for krate in asked {
-        // clone: two buffer handles and a few words, once per crate asked
-        let image = DepImages::try_get(&*db).and_then(|it| it.images(&*db).get(&krate).cloned());
-        let found = match image {
-            Some(image) if mode == Mode::Serve && image.mode() == Mode::Serve => {
-                let at = key(image.key());
-                // The record's pages, read a part at a time: nothing of it is held here.
-                let source = images.pages(&at).map_err(|why| {
-                    // alloc: error text
-                    format!("reading the impl tables of crate {} (key {at:?}): {why}", krate.named(&*db))
-                })?;
-                source.map(|source| Tables { pages: Paged { key: at, source }, mode: Mode::Serve })
-            }
-            _ => None,
-        };
-        if maps.get(&krate) == found.as_ref() {
-            continue;
-        }
-        changed.push(krate);
-        match found {
-            Some(it) => {
-                maps.insert(krate, it);
-            }
-            None => {
-                maps.remove(&krate);
-            }
-        }
+) -> R<Option<Tables>> {
+    if mode != Mode::Serve || image.mode() != Mode::Serve {
+        return Ok(None);
     }
-    if !changed.is_empty() {
-        set(db, maps);
-    }
-    Ok(changed)
+    let at = key(image.key());
+    // The record's pages, read a part at a time: nothing of it is held here.
+    let source = images.pages(&at).map_err(|why| {
+        format!("reading the impl tables of crate {} (key {at:?}): {why}", krate.named(db))
+    })?;
+    Ok(source.map(|source| Tables { pages: Paged { key: at, source }, mode: Mode::Serve }))
 }
 
 /// Writes to `images` the impl tables of each of `crates`, a crate with the key its image is
-/// filed under, that is not read from tables already: what the next database's [`serve`]
+/// filed under, that is not read from tables already: what the next snapshot's [`find`]
 /// finds. Called once the crates are resolved and checked, where their images are written.
 /// Gives the crates whose tables do not encode, with why: such a crate has no tables in the
-/// store and is maintained by every database, which the caller says.
+/// store and its impls are found by every snapshot, which the caller says.
 pub fn store(
     db: &Db,
     crates: &[(Crate, ContentId)],
@@ -227,50 +205,6 @@ pub fn store(
         }
     }
     Ok(refused)
-}
-
-inventory::submit! {
-    base_db::Implied { name: "dependency impl tables withdrawn", write: withdraw_unimaged }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// The bug a test planted: a crate that loses its image keeps its impl tables.
-    pub(crate) static KEEPS_TABLES_PAST_IMAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The write implied by a change to the files of crates read from images, after
-/// `hir_def::deps`' own (implied writes run in the order of their names: "dependency images
-/// withdrawn" is before this one): a crate that lost its image in this write loses its impl
-/// tables in it too, so the pass that resolves it again maintains its impls again. The tables'
-/// key is the image's, so tables kept past their image would be read against files they were
-/// not made from.
-fn withdraw_unimaged(db: &mut Db, written: &base_db::Written<'_>) {
-    #[cfg(test)]
-    if KEEPS_TABLES_PAST_IMAGE.get() {
-        return;
-    }
-    if written.set.is_empty()
-        && written.added.is_empty()
-        && written.removed.is_empty()
-        && written.roots.is_empty()
-    {
-        return;
-    }
-    let Some(input) = FrozenImpls::try_get(&*db) else { return };
-    let maps = input.maps(&*db);
-    if maps.is_empty() {
-        return;
-    }
-    let images = DepImages::try_get(&*db).map(|it| it.images(&*db));
-    let imaged = |krate: &Crate| images.is_some_and(|it| it.contains_key(krate));
-    if maps.keys().all(imaged) {
-        return;
-    }
-    // clone: the tables' handles, once per write that withdraws an image
-    let mut kept = (**maps).clone();
-    kept.retain(|krate, _| imaged(krate));
-    set(db, kept);
 }
 
 /// Records a difference between the pages of `krate` and the live impls in [`Mode::Check`],

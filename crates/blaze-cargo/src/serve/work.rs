@@ -871,12 +871,6 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// drops nothing: one record's refusal fails that record (panics-fail-one-job), never
     /// the front end, without which the checkout's next build would lower anew.
     fn kept_refusal(&self, kept: &mut Self::KeptFront) -> Option<String>;
-    /// On a worker, by the task that stores a kept front end and before it stores: what the
-    /// front end's query engine logged of why its queries ran since the last take, each memo
-    /// and input named with the database in hand ([`Writer::run_log`], taken here so naming a
-    /// build's runs is never on the loop before the build's answer); none for a front end
-    /// with no database, and while the run log is off.
-    fn kept_run_log(&self, kept: &Self::KeptFront) -> blaze_query::db::Taken;
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
     /// after the build's answer: what the build's end lets go of its front end (its MIR and
     /// inference no next build reads, by the build's kind), then the storage's end-of-build
@@ -1177,12 +1171,6 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// name, with whether its check outcome and its bodies were served from the store,
     /// checked, or refused ([`blaze_api::Worked::served`]).
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError>;
-    /// On the loop, as the job's build ends and before it is kept: what its front end's query
-    /// engine logged of why its queries ran since the last take, each memo and input named
-    /// with the database in hand ([`blaze_query::db::take_log_in`]); none for a front end
-    /// with no database, and while the run log is off. No default: a front end with a
-    /// database that inherited "none" would hide why its queries ran.
-    fn run_log(&self) -> blaze_query::db::Taken;
     /// On the loop, once every task of a build that made nothing so far has ended and before
     /// it is kept: the Rust sources of the view that every key of the build held by code text
     /// alone, each by its path from the view's root with the edition its crates parse it in,

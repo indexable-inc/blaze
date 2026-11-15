@@ -27,7 +27,7 @@ use hir_expand::{
 };
 use span::ErasedFileAstId;
 
-pub use inputs::{FrontEnd, crate_inputs, set_build};
+pub use inputs::{FrontEnd, build_fact, crate_inputs, give_build, set_build};
 
 /// A body that has no key, and why: its inference, MIR and borrow check are computed and not
 /// filed.
@@ -56,13 +56,13 @@ pub const EARLY_DOMAIN: &str = "blaze v2 item early identity 2";
 /// The identity of `def`'s body made before the body is lowered
 /// (docs/v2/plan/design/restore.md, "The entry's key, made before lowering"): what
 /// [`crate::Bodies`] files a body's steps under. It reads the item's own text and no
-/// `Body::of`, resolution or signature: what a step reads of those is a fact of its shape
-/// ([`crate::reads::classify`]), the owner's signature and attributes among them.
+/// `Body::of`, resolution or signature: what a step reads of those is in the step's read list
+/// (`blaze_memo::record`), the owner's signature and attributes among them.
 pub fn early_identity(db: &Db, def: DefWithBodyId) -> Result<ContentId, Unidentified> {
     early_identity_of(db, def).map_err(|what| Unidentified { def, what })
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn early_identity_of(db: &Db, def: DefWithBodyId) -> Result<ContentId, &'static str> {
     let mut h = Hasher::new(EARLY_DOMAIN);
     for (_, part) in early_parts(db, def)? {

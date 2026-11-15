@@ -126,10 +126,10 @@ impl Drop for Plain {
 /// `test` of what the check finds in crate `x` of the engine with `x` appended, with the
 /// database attached: a failed assertion prints interned types, which read it.
 #[track_caller]
-fn check(x: &str, test: impl FnOnce(&Db, &Found)) {
+fn check(x: &str, test: impl FnOnce(&Db, &Found<'_>)) {
     // alloc: a test's fixture text
     let db = &fixture::db(&format!("{ENGINE}{x}")).into_db();
-    blaze_query::db::attach(db, || test(db, suspend_check(db, crate_named(db, "x"))));
+    blaze_memo::attach(db, || test(db, suspend_check(db, crate_named(db, "x"))));
 }
 
 #[track_caller]
@@ -149,7 +149,7 @@ fn crate_named(db: &Db, name: &str) -> Crate {
 
 /// The one value `found` says is held across a suspend.
 #[track_caller]
-fn one_held(found: &Found) -> &Held {
+fn one_held<'a>(found: &'a Found<'a>) -> &'a Held<'a> {
     assert!(found.broken.is_empty(), "no broken promise: {:?}", found.broken);
     match &*found.held {
         [held] => held,
@@ -158,16 +158,16 @@ fn one_held(found: &Found) -> &Held {
 }
 
 #[track_caller]
-fn nothing(found: &Found) {
+fn nothing(found: &Found<'_>) {
     assert_eq!(found, &Found::default(), "nothing held across a suspend, no promise broken");
 }
 
-fn binding_name(db: &Db, held: &Held) -> String {
+fn binding_name(db: &Db, held: &Held<'_>) -> String {
     let binding = held.binding.expect("the value is a binding's");
     Body::of(db, held.call.owner)[binding].name.as_str().to_owned()
 }
 
-fn owner_name(db: &Db, held: &Held) -> String {
+fn owner_name(db: &Db, held: &Held<'_>) -> String {
     match held.call.owner {
         hir_def::DefWithBodyId::FunctionId(func) => {
             FunctionSignature::of(db, func).name.as_str().to_owned()
@@ -545,7 +545,7 @@ pub fn f() -> u32 {
     )
     .into_db();
     let db = &db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = crate_named(db, "x");
         assert_eq!(
             *roots(db, krate),
@@ -575,7 +575,7 @@ pub fn f() -> u32 {
     )
     .into_db();
     let db = &db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = crate_named(db, "x");
         let found = suspend_check(db, krate);
         let Some(Unchecked::MissingRoot(missing)) = found.unchecked else {
@@ -672,7 +672,7 @@ pub fn counted(db: &Db) -> u32 {
     )
     .into_db();
     let db = &db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = crate_named(db, "x");
         let roots = roots(db, krate);
         assert_eq!(roots.missing, None, "the root is found through the re-export");
@@ -775,20 +775,48 @@ fn ladder(instances: usize) -> String {
     )
 }
 
-/// How many MIR values the database holds once crate `x` of [`ladder`] is checked: every
-/// instance summarized and the instances of `x` checked, each reading its body.
+/// How many MIR bodies the memo holds, over every arena: the entries of every MIR body query
+/// of `hir_ty::providers` (each stage of a function's, closure's and coroutine's), what the
+/// old engine counted as its MIR-tagged values.
+fn mir_entries(memo: &blaze_memo::Memo) -> usize {
+    const STAGES: [&str; 6] = [
+        "mir_body",
+        "monomorphized_mir_body",
+        "runtime_mir_body",
+        "monomorphized_runtime_mir_body",
+        "optimized_mir_body",
+        "monomorphized_optimized_mir_body",
+    ];
+    const OWNERS: [&str; 4] = ["", "_for_closure", "_for_coroutine", "_for_coroutine_by_move"];
+    let mut name = String::new();
+    let mut count = 0;
+    for stage in STAGES {
+        for owner in OWNERS {
+            name.clear();
+            name.push_str("hir_ty::providers::");
+            name.push_str(stage);
+            name.push_str(owner);
+            name.push_str("_query");
+            count += memo.arenas().map(|arena| memo.entries(arena, &name)).sum::<usize>();
+        }
+    }
+    count
+}
+
+/// How many MIR bodies the memo holds ([`mir_entries`]) once crate `x` of [`ladder`] is
+/// checked: every instance summarized and the instances of `x` checked, each reading its body.
 fn held_after_the_check(instances: usize, keeps_bodies: bool) -> usize {
-    use blaze_query::db::Database as _;
+    use blaze_memo::Database as _;
     // alloc: a test's fixture text
     let db = &fixture::db(&format!("{ENGINE}{}", ladder(instances))).into_db();
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let check = || _ = suspend_check(db, crate_named(db, "x"));
         match keeps_bodies {
             true => crate::summary::plant::keeping_bodies(check),
             false => check(),
         }
     });
-    db.storage().values_of(blaze_mem::Tag::Mir)
+    mir_entries(db.memo())
 }
 
 /// The invariant: the check keeps what it worked out of each instance's body (a summary, an

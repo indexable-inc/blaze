@@ -92,14 +92,14 @@ impl ops::Deref for BodySourceMap {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl Body {
     /// Where each part of the body is written. For a body written in a file, this is
     /// [`Body::relative`] moved to where the body is in the file: the map is made once, and an
     /// edit elsewhere in the file only moves it. The body it maps is [`Body::of`]: lowering
     /// again for the map makes the body too, with the same ids, which is checked equal to it
     /// (the map's ids are `Body::of`'s only by that check) and dropped, so that a body is kept once.
-    #[blaze_query::tracked(lru, weigh = source_map_bytes, returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn source_map(db: &Db, def: DefWithBodyId) -> BodySourceMap {
         let _p = crate::body_span!(db, def, "body_source_map_query").entered();
         let Some(source_map) = Self::relative(db, def) else {
@@ -144,7 +144,7 @@ impl Body {
     /// that reads it. The body it maps is [`Body::of`]: lowered again with the map, with the
     /// same blocks, it is checked equal to it (the map's ids are
     /// `Body::of`'s only by that check) and dropped.
-    #[blaze_query::tracked(lru, weigh = relative_bytes, returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn relative(db: &Db, def: DefWithBodyId) -> Option<BodySourceMap> {
         let _p = crate::body_span!(db, def, "body_relative_query").entered();
         body_syntax(db, def).as_ref()?;
@@ -160,7 +160,7 @@ impl Body {
     /// [`Body::source_map`] lower the body again for the map, with this body's blocks, and keep
     /// only the map. The body is the memo's own value, lent by reference: no `Arc` and no count
     /// to write, and the one copy of it the database keeps.
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn of(db: &Db, def: DefWithBodyId) -> Body {
         let _p = crate::body_span!(db, def, "body_query").entered();
         match lower_relative(db, def, BodyLowering::Body) {
@@ -172,23 +172,13 @@ impl Body {
     /// Whether lowering the body found an error: a diagnostic of its source map other than
     /// [`ExpressionStoreDiagnostics::InactiveCode`]. What rustc keeps a body out of borrow
     /// checking for, without the positions the map holds, so that a reader of it reads none.
-    #[blaze_query::tracked(returns(copy))]
+    #[blaze_memo::tracked(returns(copy))]
     pub fn has_lowering_errors(db: &Db, def: DefWithBodyId) -> bool {
         Self::unmoved_source_map(db, def)
             .diagnostics()
             .iter()
             .any(|it| !matches!(it, ExpressionStoreDiagnostics::InactiveCode { .. }))
     }
-}
-
-/// What dropping a [`Body::source_map`] value frees: the map, the whole value.
-fn source_map_bytes(map: &BodySourceMap) -> usize {
-    map.heap_bytes()
-}
-
-/// What dropping a [`Body::relative`] value frees: its map, the whole value.
-fn relative_bytes(value: &Option<BodySourceMap>) -> usize {
-    value.as_ref().map_or(0, BodySourceMap::heap_bytes)
 }
 
 impl Body {
@@ -343,10 +333,14 @@ pub(crate) fn check_relative(db: &Db) -> bool {
 /// at the anchor, and so stay as they are while edits elsewhere move it in the file. A body
 /// lowered from this is lowered again only when this changes, not on every edit of the file.
 ///
+/// Clone: counts of the file's text and of the anchor's maps, for [`item_body_syntax`] to hand
+/// out its own item's from [`file_body_syntax`].
+///
 /// It holds no tree, so that a file's tree is let go of once nothing is parsing or lowering
 /// it: the tree of [`BodySyntax::tree`] is parsed again from the text of the anchor when it
 /// is not among the last few made. It is the same as the one in the file, which it is
 /// compared by ([`tree_hash`]).
+#[derive(Clone)]
 pub struct BodySyntax {
     pub file_id: HirFileId,
     tree: u128,
@@ -619,59 +613,68 @@ mod trees {
 
 /// The [`BodySyntax`] of a body written in a file, `None` for one a macro writes.
 ///
-/// A body outside fn bodies reads only its own [`ItemBodySyntax`], which an edit of the file
-/// rewrites in place and leaves as it was when the edit left its anchor alone, so an edit of one
-/// body reaches no reader of another. A body in a fn body, or one a macro writes, has no ast id
-/// that holds without a walk of the bodies, and is placed by [`placed_body_syntax`].
+/// A body outside fn bodies reads only its own [`item_body_syntax`], which an edit of the file
+/// makes again equal when the edit left its anchor alone, so an edit of one body reaches no
+/// reader of another. A body in a fn body, or one a macro writes, has no ast id that holds
+/// without a walk of the bodies, and is placed by [`placed_body_syntax`].
 pub fn body_syntax(db: &Db, def: DefWithBodyId) -> &Option<BodySyntax> {
     let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
-    let Some(file) = file_id.file_id() else { return placed_body_syntax(db, def) };
-    if ast_id.in_body() {
+    // A body of a crate given by its address whose file has no text here is refused, typed,
+    // naming the crate and the file, before anything parses it.
+    crate::nameres::frozen::pages::demand_text(db, def.krate(db), file_id);
+    if file_id.file_id().is_none() || ast_id.in_body() {
         return placed_body_syntax(db, def);
     }
-    let Some(&id) = file_body_syntax(db, file).get(&ast_id) else {
+    item_body_syntax(db, def)
+}
+
+/// The [`BodySyntax`] of `def`, an item of a file with a body outside fn bodies: its entry of
+/// [`file_body_syntax`], a query of its own so that an edit of the file that leaves this item's
+/// syntax equal stops here (what the engine's tracked struct with a tracked field did).
+#[blaze_memo::tracked(returns(ref), owns)]
+pub fn item_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
+    let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
+    let file = file_id.file_id().expect("an item body syntax of a body written in a file");
+    let Some(syntax) = file_body_syntax(db, file).get(&ast_id) else {
         panic!(
             "{def:?}: {ast_id:?} is outside fn bodies but no item of {file:?} with a body has it"
         )
     };
-    <ItemBodySyntax<'_> as blaze_query::db::FromId>::from_id(id).syntax(db)
+    // clone: counts of the file's text and the anchor's maps
+    syntax.clone()
 }
 
-/// Whether a read of the row named `name` ([`file_body_syntax`], or an [`ItemBodySyntax`]'s
-/// `syntax`) with key `key` is a read of `def`'s own syntax, for whoever records what a body's
-/// lowering read (the item store's lowering step, `blaze_item_hash::reads`): the rows are
-/// private to this module. The file's table is a handle (each item's id there names it for as
-/// long as it is in the file); an item's `syntax` is its own text, which the key the lowering
-/// is filed under hashes. `false` for any other row, another file's table or another item's
-/// syntax, and for a body that is not written in a file outside fn bodies (found by
-/// [`placed_body_syntax`], whose key is the body itself).
-pub fn own_syntax_read(db: &Db, def: DefWithBodyId, name: &str, key: blaze_query::db::Id) -> bool {
-    let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
-    let Some(file) = file_id.file_id() else { return false };
-    match name {
-        "file_body_syntax" => blaze_query::db::AsId::as_id(&file) == key,
-        "syntax" => !ast_id.in_body() && file_body_syntax(db, file).get(&ast_id) == Some(&key),
-        _ => false,
+/// Whether `read`, a row of the list `blaze_memo::record` kept for a body's lowering, is a
+/// read of `def`'s own syntax, for whoever files that list (the item store's lowering step,
+/// `blaze_item_hash::reads`): the [`FileText`](base_db::FileText) input of the file `def` is
+/// written in, which [`item_body_syntax`] and [`file_body_syntax`] read and, being kinds that
+/// are not fact boundaries, flatten into their asker. The key the lowering is filed under
+/// hashes the item's own text, so that row is covered by the key. `false` for any other row,
+/// another file's text, and for a body not written in a file (a macro's).
+///
+/// Provisional (port 2026-11-13): it answers by the whole file's fact, so a body in a file
+/// counts the file's text as its own; L9b gives the signature the item store's filing step
+/// calls, and with it whether a row narrower than the file (the item's own syntax) is listed.
+pub fn own_syntax_read(db: &Db, def: DefWithBodyId, read: &blaze_memo::Read) -> bool {
+    let blaze_memo::Read::Input { kind, fact } = read else { return false };
+    if *kind != blaze_memo::KindId::of(base_db::VfsText::INPUT_KIND) {
+        return false;
     }
+    let InFile { file_id, .. } = def.erased_ast_id(db);
+    let Some(file) = file_id.file_id() else { return false };
+    // A text outside the VFS (`include!`'s) is read as its row's included fact, never as a
+    // `VfsText` input, so no input row of that kind is a read of it.
+    let base_db::FileText::Vfs(text) = db.file_text(file.file_id(db)) else { return false };
+    text.input_fact(blaze_memo::Database::memo(db)) == *fact
 }
 
-/// The [`BodySyntax`] of one item of a file with a body outside fn bodies, set by
-/// [`file_body_syntax`] at each edit of the file.
-#[blaze_query::tracked]
-struct ItemBodySyntax<'db> {
-    ast_id: ErasedFileAstId,
-    #[tracked]
-    #[returns(ref)]
-    syntax: Option<BodySyntax>,
-}
-
-/// The [`ItemBodySyntax`] of each fn, const, static and variant of `file` outside fn bodies, by
-/// its ast id: changed only when such an item comes or goes, not by where an item is.
-#[blaze_query::tracked(returns(ref))]
+/// The [`BodySyntax`] of each fn, const, static and variant of `file` outside fn bodies, by its
+/// ast id: made again at each edit of the file; [`item_body_syntax`] is what a body reads.
+#[blaze_memo::tracked(returns(ref), owns)]
 fn file_body_syntax(
     db: &Db,
     file: EditionedFileId,
-) -> HashMap<ErasedFileAstId, blaze_query::db::Id, Global> {
+) -> HashMap<ErasedFileAstId, Option<BodySyntax>, Global> {
     let file_id = HirFileId::from(file);
     let SpanMap::RealSpanMap(span_map) = file_id.span_map(db) else {
         unreachable!("{file:?} is a real file")
@@ -691,8 +694,7 @@ fn file_body_syntax(
         let ptr = SyntaxNodePtr::from_parts(kind, TextRange::new(start.into(), end.into()));
         let syntax =
             anchored_body_syntax(db, file_id, span_map, ast_id_map, view::to_node(ptr, root));
-        let item = ItemBodySyntax::new(db, ast_id, syntax);
-        items.insert(ast_id, blaze_query::db::AsId::as_id(&item));
+        items.insert(ast_id, syntax);
     }
     items
 }
@@ -701,8 +703,8 @@ fn file_body_syntax(
 /// a body in a fn body or one a macro writes. An item of a block lowered from the syntax of the
 /// body it is in is in that body's anchor, and takes its tree and maps from it, so an edit
 /// elsewhere in the file leaves it the same.
-#[blaze_query::tracked(returns(ref))]
-fn placed_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
+#[blaze_memo::tracked(returns(ref), owns)]
+pub fn placed_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
     if let Some(syntax) = in_owner_body_syntax(db, def) {
         return Some(syntax);
     }

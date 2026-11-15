@@ -77,7 +77,7 @@ fn check(origin: &str) {
     };
     let distance =
         p.trait_items(&db).method_by_name(&Name::new_root("distance")).expect("`P::distance`");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main };
@@ -196,7 +196,7 @@ fn a_lookup_that_finds_no_impl_says_why() {
     };
     let (f, measure, bounded) =
         (function(main, "f"), function(dep, "measure"), function(dep, "bounded"));
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
         let why = |def: FunctionId, self_ty| {
@@ -225,7 +225,7 @@ fn a_provided_method_the_impl_leaves_out_is_the_traits() {
     };
     let provided =
         p.trait_items(&db).method_by_name(&Name::new_root("provided")).expect("`P::provided`");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
         let ptr = Ty::new_ptr(interner, s, Mutability::Not);

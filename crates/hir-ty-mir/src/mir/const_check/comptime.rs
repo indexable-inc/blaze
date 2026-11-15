@@ -27,7 +27,7 @@ use super::{MirBody, MirSpan, TerminatorKind, operand_ty};
 pub const MESSAGE: &str = "comptime functions can only be called at compile time";
 
 /// A call of the compile-time-only `callee` in a body that runs.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComptimeCall {
     pub callee: FunctionId,
     /// The call, in the expression store of the function it is written in (a closure's
@@ -38,7 +38,7 @@ pub struct ComptimeCall {
 /// The calls of compile-time-only functions in the body of `def` and of its closures that are
 /// not at compile time: none unless `def` is a function, and none in a function that is
 /// itself `#[rustc_comptime]`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ComptimeCalls {
     pub calls: Vec<ComptimeCall>,
 }
@@ -50,7 +50,7 @@ pub fn is_comptime(db: &Db, func: FunctionId) -> bool {
 
 /// What rustc refuses as a compile-time-only function called where the call would run. A body
 /// inference refused is not looked at: its calls are not known.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn comptime_calls<'db>(db: &'db Db, def: DefWithBodyId) -> ComptimeCalls {
     let DefWithBodyId::FunctionId(func) = def else { return ComptimeCalls::default() };
     if is_comptime(db, func) {

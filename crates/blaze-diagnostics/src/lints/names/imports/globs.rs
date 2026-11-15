@@ -379,9 +379,12 @@ fn item_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem) -> Option<V
         ast::VisibilityKind::PubSelf => Vis::Module(home),
         ast::VisibilityKind::PubSuper => Vis::Module(home.def_map(db).containing_module(db, home)?),
         ast::VisibilityKind::In(path) => {
-            let span_map = item.node(cx).file_id.span_map(db);
-            let path =
-                ModPath::from_src_view(db, path, &mut |range| span_map.span_for_range(range).ctx)?;
+            let file = item.node(cx).file_id;
+            let span_map = file.span_map(db);
+            let arena = crate::cx::context_arena(file);
+            let path = ModPath::from_src_view(db, arena, path, &mut |range| {
+                span_map.span_for_range(range).ctx
+            })?;
             match entry(&uses.lookup(cx, home, path.kind, path.segments()), Ns::Types)?.def {
                 ModuleDefId::ModuleId(it) => Vis::module(cx, it),
                 _ => return None,

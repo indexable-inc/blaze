@@ -401,7 +401,7 @@ fn write_shape(db: &Db, adt: AdtId, out: &mut Hasher) {
     };
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = fact_cycle)]
+#[blaze_memo::tracked(returns(ref), owns, cycle_result = fact_cycle)]
 fn fact(db: &Db, ty: StoredTy, env: StoredParamEnvAndCrate) -> Result<ContentId, Unshared> {
     let cx = Cx::new(db, env);
     let mut out = Hasher::new(FACT_DOMAIN);
@@ -411,7 +411,6 @@ fn fact(db: &Db, ty: StoredTy, env: StoredParamEnvAndCrate) -> Result<ContentId,
 
 fn fact_cycle(
     _: &Db,
-    _: blaze_query::db::Id,
     _: StoredTy,
     _: StoredParamEnvAndCrate,
 ) -> Result<ContentId, Unshared> {

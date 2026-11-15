@@ -3,10 +3,10 @@
 //! core's, declared in its `kind.rs` with its key rule; nothing here declares a kind, a tag or a
 //! key rule of its own (rule 30).
 //!
-//! - An instance's code is the core's [`Instance`] (an [`Opaque`] root, the payload
-//!   [`InstanceCode`]'s), keyed by [`crate::key::instance_key`], which is the core's
-//!   [`blaze_keyed::kind::InstanceInputs`] key: the plan key, the tier, every inlinee's symbol
-//!   and instance key.
+//! - An instance's code is the core's [`Instance`], keyed by [`crate::key::instance_key`]
+//!   ([`code_key`]), which is the core's [`blaze_keyed::kind::InstanceInputs`] key: the plan
+//!   key, the tier, every inlinee's symbol and instance key. Its payload is codegen's; the walk
+//!   is answered with its head ([`crate::record::CodeHead`]) by the driver that reads it.
 //! - An instance's plan is the core's [`InstancePlan`], keyed by [`crate::key::plan_key`] (the
 //!   core's [`blaze_keyed::kind::PlanInputs`]).
 //! - A test's result is the core's `TestRun`, an outside record whose base key is
@@ -18,6 +18,10 @@
 //! Every reader takes the core's proof that the record is the one of its key ([`Holds`], made by
 //! [`blaze_keyed::proof::hit`], the one check) and reads the payload through the core's one
 //! payload reader ([`proof::payload`]), checking nothing again (decision 18).
+//!
+//! **The floor.** A record is written once and read by one payload slice after the core's
+//! proof: nothing here copies or hashes its bytes again, but a manifest's chunks, which are
+//! copied into one [`Chunks`] to decode (about the manifest's size, once per open).
 //!
 //! Every record here is write-once: a key names exactly one value. A program's manifest
 //! changes with every edit, so it is filed by content ([`head_key`]); which manifest is a
@@ -36,7 +40,7 @@ use blaze_keyed::record::{self, RecordError};
 use crate::codec::{CodecError, Digest, In, Out, Payload};
 use crate::key::{InstanceKey, PlanKey};
 use crate::program::{CHUNK_DOMAIN, Chunks, Program};
-use crate::record::{CodeHead, InstanceCode, Plan};
+use crate::record::Plan;
 
 /// Why a filed record is not the value asked for: the core refused its framing, or the payload
 /// does not decode.
@@ -76,25 +80,6 @@ impl From<CodecError> for FiledError {
 /// rule ([`crate::key::instance_key`]).
 pub fn code_key(key: &InstanceKey) -> Key<Instance> {
     Key::from_id(key.0)
-}
-
-/// The record filing `code` under `key`.
-pub fn write_code(key: &InstanceKey, code: &InstanceCode) -> Vec<u8> {
-    record::write_opaque(&code_key(key), &code.encode())
-}
-
-/// The payload of the code record `bytes` (16-aligned) its proof `holds` is of.
-pub fn code_payload<'b>(holds: &Holds<'_, Instance>, bytes: &'b [u8]) -> Result<&'b [u8], FiledError> {
-    Ok(proof::payload(holds, bytes)?)
-}
-
-pub fn read_code(holds: &Holds<'_, Instance>, bytes: &[u8]) -> Result<InstanceCode, FiledError> {
-    Ok(InstanceCode::decode(code_payload(holds, bytes)?)?)
-}
-
-/// The head of the code record `bytes`, reading nothing of the payload after it.
-pub fn read_code_head(holds: &Holds<'_, Instance>, bytes: &[u8]) -> Result<CodeHead, FiledError> {
-    Ok(CodeHead::decode_prefix(code_payload(holds, bytes)?)?)
 }
 
 /// The core key of the plan keyed `key`: the same id, computed by the core's rule

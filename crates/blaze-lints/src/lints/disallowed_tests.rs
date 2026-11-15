@@ -195,24 +195,20 @@ fn fixed_in(ports: &Ports<'_>, main: &str) -> Result<String, FixError> {
     (ports.give)(&mut fx);
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || {
-        hir::Crate::all(&db)
-            .into_iter()
-            .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
-            .expect("the fixture has `main`")
-    });
+    let key = crate::tests::main_crate_key(&db);
     let file = file.file_id(&db);
     let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
     names.insert(file, "src/lib.rs".to_owned());
     let name_of = |file: FileId| names.get(&file).cloned();
     let setup = setup_of(ports.clippy_toml);
-    let made = fix(&mut db, krate, &setup, &name_of)?;
+    let made = fix(&mut db, key, &setup, &name_of)?;
     let text = db.file_text(file).text(&db).to_string();
     assert!(
         made.files.iter().all(|(it, new)| *it == file && *new == text),
         "the fix names the file it changed"
     );
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
+        let krate = hir::Crate::from(db.krate(key));
         let mut acc = Vec::new();
         for module in krate.modules(&db) {
             module.diagnostics(&db, &mut acc, false);
@@ -461,17 +457,12 @@ pub fn f(m: &Mutex<u8>) -> bool {
     let fx = fixture::db(&format!("{CRATES}{MAIN}{}", main.trim_start_matches('\n')));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || {
-        hir::Crate::all(&db)
-            .into_iter()
-            .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
-            .expect("the fixture has `main`")
-    });
+    let key = crate::tests::main_crate_key(&db);
     let file = file.file_id(&db);
     let names: HashMap<FileId, String, Global> =
         [(file, "src/lib.rs".to_owned())].into_iter().collect();
     let name_of = |file: FileId| names.get(&file).cloned();
-    let error = fix(&mut db, krate, &setup(), &name_of).unwrap_err();
+    let error = fix(&mut db, key, &setup(), &name_of).unwrap_err();
     let FixError::Broke { at, by, .. } = &error else { panic!("{error}") };
     assert_eq!(at, "src/lib.rs:3", "{error}");
     assert!(!by.is_empty(), "{error}");
@@ -621,7 +612,7 @@ fn an_attribute_path_on_a_struct_in_a_body_resolves_in_the_body_s_tree() {
     let fx = fixture::db(&format!("{CRATES}{MAIN}{main}"));
     let file = *fx.files().last().expect("src/lib.rs");
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = hir::Crate::all(&db)
             .into_iter()
             .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))

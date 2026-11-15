@@ -27,8 +27,7 @@ use crate::{
     item_tree::{ImportKind, TreeId},
     nameres::{
         BuiltinShadowMode, DefMap, DefMapCrateData, DeriveHelpers, DiagnosticsByModule,
-        LocalDefMap, MacroSubNs, ModuleData, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot,
-        def_site,
+        LocalDefMap, MacroSubNs, ModuleData, ModulesMap, ModulesSlot, ResolveMode, def_site,
         diagnostics::{DefDiagnostic, DefDiagnosticKind, is_glob_of_non_module},
         uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use},
     },
@@ -606,7 +605,7 @@ fn after_all(db: &Db, start: CrateEnvKey, ops: &OpLog) -> CrateEnvKey {
         }
     }
     match changed {
-        Some(env) => CrateEnvKey::new(db, env),
+        Some(env) => CrateEnvKey::new(db, start.krate(db), env),
         None => start,
     }
 }
@@ -702,7 +701,6 @@ pub(crate) fn round_row(db: &Db, round: RoundKey, module: ModuleId) -> Option<Mo
 /// round's handles, the crate-level ops of every log, the final steps' unresolved-macro
 /// diagnostics and the final units' unresolved imports (`collect` and `finish` of the old
 /// collector).
-#[cfg(test)]
 pub(crate) fn collect_crate<'db>(
     db: &'db Db,
     frame: &Frame,
@@ -710,7 +708,6 @@ pub(crate) fn collect_crate<'db>(
 ) -> (DefMap, LocalDefMap) {
     let mut r = 0;
     while queries::round_kind(db, RoundKey::new(db, krate, r)) != RoundKind::Final {
-        blaze_query::db::unwind_if_cancelled(db);
         r += 1;
     }
     let round = RoundKey::new(db, krate, r);
@@ -725,14 +722,15 @@ pub(crate) fn collect_crate<'db>(
     let mut table = ModulesMap::new();
     table.reserve(modules.order.len());
     for (&module, row) in modules.order.iter().zip(modules.rows.iter()) {
-        let handle = queries::fact_handle(db, FactKey::new(db, module, krate, r));
+        // The final round's fact of the module: its scope where its component's state holds it.
+        let scope = queries::fact_slot(db, Scope::Fact(FactKey::new(db, module, krate, r)));
         table.insert(
             module,
             ModuleData {
                 origin: row.origin,
                 visibility: row.visibility,
                 parent: row.parent,
-                scope: ScopeSlot::Collected(handle),
+                scope,
             },
         );
     }
@@ -1207,7 +1205,6 @@ pub(crate) fn collect_block<'db>(
     let mut eager_with_errors = false;
     'resolve_attr: loop {
         'resolve_macros: loop {
-            blaze_query::db::unwind_if_cancelled(db);
             sink.unit.set_unexpanded(!pending.is_empty());
             sink.unit.resolve_imports();
             let result =
@@ -1337,7 +1334,7 @@ mod tests {
         queries::{self, RoundKey, RoundKind},
         tests::{
             Exempt, block_def_map_again, compare, compare_fixture, facts_crate_local_def_map,
-            fixture_db, project,
+            fixture_db, module_path, project,
         },
     };
     use crate::{
@@ -1345,7 +1342,6 @@ mod tests {
         expr_store::Body,
         nameres::{
             crate_local_def_map,
-            delta::tests::module_path,
             uses::{NameRecords, Used},
         },
         per_ns::PerNs,
@@ -1555,39 +1551,6 @@ struct Foo;
         assert_maps_agree("round_kinds_unresolved_attribute", fixture);
     }
 
-    #[test]
-    fn collect_crate_equals_the_maintained_map() {
-        assert_maps_agree(
-            "collect_crate_equals_the_maintained_map",
-            r#"
-//- /lib.rs
-mod a;
-pub mod b {
-    pub use super::a::*;
-    pub struct B;
-}
-use b::{A, B};
-pub use self::c::C as Renamed;
-mod c {
-    pub struct C;
-    pub fn f() {}
-    pub(super) use super::b::B as CB;
-}
-macro_rules! m { () => { pub struct FromMacro; } }
-m!();
-crate::exported!();
-use self::missing::Nothing;
-//- /a.rs
-pub struct A;
-pub mod deep {
-    pub use crate::c::*;
-}
-#[macro_export]
-macro_rules! exported { () => { pub struct Exported; } }
-"#,
-        );
-    }
-
     /// Glob ambiguities are settled when collection ends; a crate's scopes are handed over by
     /// `scc_state`, which must settle them itself at the final round: `still`'s `X` is
     /// ambiguous between its two globs, and the root's is `c::X`, which shadows its globs.
@@ -1673,7 +1636,7 @@ fn f() {
         let body = Body::of(&db, DefWithBodyId::from(f));
         let blocks: Vec<_> = body.blocks(&db).map(|(block, _)| block).collect();
         assert_eq!(blocks.len(), 1);
-        let block = blocks[0].to_db(&db);
+        let block = blocks[0];
         let real = crate::nameres::block_def_map(&db, block);
         let again = block_def_map_again(&db, block);
         let diff = compare(

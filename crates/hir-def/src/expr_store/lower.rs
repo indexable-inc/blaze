@@ -1495,7 +1495,7 @@ impl<'db> ExprCollector<'db> {
         if has_use {
             return;
         }
-        let edition = self.expander.ctx_for_range(opaque.syntax().text_range()).edition(self.db);
+        let edition = self.expander.ctx_for_range(opaque.syntax().text_range()).edition();
         let store = &mut self.named_lifetime_store;
         store.return_opaque_without_use = true;
         store.return_opaque_2024_without_use |= edition.at_least_2024();
@@ -2647,6 +2647,7 @@ impl<'db> ExprCollector<'db> {
         // declared outside a block with items (`struct S(u8); fn f() { struct L; S(a) = s; }`)
         // is still one.
         let (resolution, unresolved_idx, _) = self.def_map.resolve_path_around(
+            self.def_map.ctx_table(),
             self.local_def_map,
             self.db,
             self.module,
@@ -3650,7 +3651,7 @@ impl<'db> ExprCollector<'db> {
             .filter(|it| !it.is_root());
         let expr_id = f(self, block_id);
         if let Some(written_in) = written_in {
-            self.store.block_editions.insert(expr_id, written_in.edition(self.db));
+            self.store.block_editions.insert(expr_id, written_in.edition());
         }
 
         self.def_map = prev_def_map;
@@ -4274,12 +4275,15 @@ impl<'db> ExprCollector<'db> {
         let Some(lifetime) = lifetime else { return Ok(None) };
         let mut hygiene_id =
             self.expander.hygiene_for_range(self.db, lifetime.syntax().text_range());
+        // The table the label's context is of: its expansion's, the calling crate's, which the
+        // labels of the body's other expansions share.
+        let table = self.expander.current_file_id().context_arena();
         let mut hygiene_info = if hygiene_id.is_root() {
             None
         } else {
-            hygiene_id.syntax_context().outer_expn(self.db).map(|expansion| {
+            hygiene_id.syntax_context().outer_expn(self.db, table).map(|expansion| {
                 let expansion = hir_expand::MacroCallId::from(expansion).loc(self.db);
-                (hygiene_id.syntax_context().parent(self.db), expansion.def)
+                (hygiene_id.syntax_context().parent(self.db, table), expansion.def)
             })
         };
         let name = Name::new_lifetime(lifetime.text());
@@ -4306,10 +4310,10 @@ impl<'db> ExprCollector<'db> {
                         // Therefore, if we got to the rib of its declaration, give up its hygiene
                         // and use its parent expansion.
 
-                        hygiene_id = HygieneId::new(parent_ctx.opaque_and_semiopaque(self.db));
-                        hygiene_info = parent_ctx.outer_expn(self.db).map(|expansion| {
+                        hygiene_id = HygieneId::new(parent_ctx.opaque_and_semiopaque(self.db, table));
+                        hygiene_info = parent_ctx.outer_expn(self.db, table).map(|expansion| {
                             let expansion = hir_expand::MacroCallId::from(expansion).loc(self.db);
-                            (parent_ctx.parent(self.db), expansion.def)
+                            (parent_ctx.parent(self.db, table), expansion.def)
                         });
                     }
                 }
@@ -4738,7 +4742,9 @@ impl<'db> ExprCollector<'db> {
     fn member_hygiene_for(&self, range: TextRange) -> Option<HygieneId> {
         let hygiene = self.hygiene_id_for(range);
         let marked = !hygiene.is_root()
-            && !hygiene.syntax_context().normalize_to_macros_2_0(self.db).is_root();
+            && !(hygiene.syntax_context())
+                .normalize_to_macros_2_0(self.db, self.expander.current_file_id().context_arena())
+                .is_root();
         marked.then_some(hygiene)
     }
 
@@ -4759,6 +4765,7 @@ impl<'db> ExprCollector<'db> {
             SpanMap::RealSpanMap(_) => name,
             SpanMap::ExpansionSpanMap(_) => crate::nameres::written_name(
                 self.db,
+                self.expander.current_file_id().context_arena(),
                 name,
                 HygieneId::new(self.expander.ctx_for_range(range)),
             ),
@@ -4768,9 +4775,12 @@ impl<'db> ExprCollector<'db> {
     pub(in crate::expr_store) fn param_name(&self, name: Name, range: TextRange) -> Name {
         match self.span_map() {
             SpanMap::RealSpanMap(_) => name,
-            SpanMap::ExpansionSpanMap(_) => {
-                crate::nameres::param_name(self.db, name, self.expander.ctx_for_range(range))
-            }
+            SpanMap::ExpansionSpanMap(_) => crate::nameres::param_name(
+                self.db,
+                self.expander.current_file_id().context_arena(),
+                name,
+                self.expander.ctx_for_range(range),
+            ),
         }
     }
 
@@ -4828,22 +4838,27 @@ impl<'db> ExprCollector<'db> {
             .filter_map(|&idx| lifetime_args.get(idx as usize).copied());
         return Some(res);
 
-        #[blaze_query::tracked(returns(deref), cycle_result = get_constrained_lifetimes_cycle_result)]
-        fn get_constrained_lifetimes(db: &Db, type_alias_id: TypeAliasId) -> Box<[u32]> {
+        #[blaze_memo::tracked(returns(copy), cycle_result = get_constrained_lifetimes_cycle_result)]
+        fn get_constrained_lifetimes<'db>(
+            db: &'db Db,
+            type_alias_id: TypeAliasId,
+        ) -> &'db [u32] {
             let TypeAliasSignature { generic_params, store, ty, .. } =
                 TypeAliasSignature::of(db, type_alias_id);
-            let &Some(ty) = ty else { return Default::default() };
+            let &Some(ty) = ty else { return &[] };
 
             let mut visitor = Visitor {
                 store,
                 generic_params,
                 parent: type_alias_id,
-                // alloc: the query's result, once per type alias.
-                constrained_lt_indices: Vec::new(),
+                constrained_lt_indices: Vec::new_in(std::alloc::Global),
             };
             store.visit_type_ref_children(ty, &mut visitor);
 
-            return visitor.constrained_lt_indices.into_boxed_slice();
+            return blaze_memo::keep_slice(
+                blaze_memo::Database::memo(db),
+                &visitor.constrained_lt_indices,
+            );
 
             struct Visitor<'a> {
                 store: &'a ExpressionStore,
@@ -4871,12 +4886,11 @@ impl<'db> ExprCollector<'db> {
             }
         }
 
-        fn get_constrained_lifetimes_cycle_result(
-            _db: &Db,
-            _: blaze_query::db::Id,
+        fn get_constrained_lifetimes_cycle_result<'db>(
+            _db: &'db Db,
             _id: TypeAliasId,
-        ) -> Box<[u32]> {
-            Default::default()
+        ) -> &'db [u32] {
+            &[]
         }
     }
 }

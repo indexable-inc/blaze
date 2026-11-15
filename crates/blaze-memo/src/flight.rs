@@ -1,13 +1,23 @@
 //! Single flight: one run per key at a time, a second asker waiting for it. Injected, so the
 //! memo's core stays sans-IO: [`Scheduled`] parks waiters on the scheduler, [`Alone`] is for one
-//! thread, and the tests' simulation brings its own.
+//! task, and the tests' simulation brings its own.
+//!
+//! Whose key it is: every flight answers "this task holds it already" ([`Flown::Mine`], a
+//! cycle on the asker's own stack) only to the task that holds the key, and a task is the
+//! scheduler's job ([`blaze_graph::sched::job_here`]): a pool's job on its fiber, which keeps
+//! its identity as it moves between workers (as the stack of runs does, `task.rs`), or a thread
+//! on no fiber, one job for its life. It is the one notion `pump::Flights` itself answers
+//! `NotHeld::ByThisTask` by; no flight has a second one. An ask from another task is never
+//! `Mine`: [`Scheduled`] waits for the holder (or gives way where waiting would close a cycle
+//! of tasks), and [`Alone`], which cannot wait, refuses it with a panic naming the key.
 
-use std::alloc::Global;
+use std::{alloc::Global, fmt};
 
 use blaze_core::lock::Lock;
 use blaze_graph::{
     Key,
     pump::{Flights, NotHeld},
+    sched::{self, JobId},
 };
 
 use crate::{ArenaId, Kind};
@@ -69,7 +79,8 @@ pub enum Flown<'f> {
     Kept(Kept<'f>),
     /// Another task held the key; it waited until that run ended (with a value or not).
     Waited,
-    /// This task holds the key already: the ask is a cycle on this task's stack.
+    /// This task (the scheduler's job, see the module doc) holds the key already: the ask is a
+    /// cycle on this task's stack. Never the answer to another task's ask.
     Mine,
     /// Waiting would have closed a cycle across tasks: this task gives way.
     Cancelled,
@@ -86,13 +97,14 @@ pub trait Flight: Send + Sync + 'static {
     fn single<'f>(
         &'f self,
         key: FlightKey,
-        named: &dyn Fn(&mut String),
+        named: &dyn Fn(&mut dyn fmt::Write),
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f>;
 }
 
-/// The scheduler's single flight: a waiter suspends its fiber on the pool, holding no thread;
-/// a wait that would close a cycle across tasks gives way (`pump::give_way`).
+/// The scheduler's single flight: a waiter suspends its fiber on the pool, holding no thread
+/// (a thread on no fiber parks); a wait that would close a cycle across tasks gives way
+/// (`pump::give_way`). `Mine` is `pump::NotHeld::ByThisTask`: the holder is the job.
 pub struct Scheduled {
     flights: Flights<()>,
 }
@@ -113,7 +125,7 @@ impl Flight for Scheduled {
     fn single<'f>(
         &'f self,
         key: FlightKey,
-        named: &dyn Fn(&mut String),
+        named: &dyn Fn(&mut dyn fmt::Write),
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f> {
         let key = Key(key.0);
@@ -142,15 +154,37 @@ impl Flight for Scheduled {
     }
 }
 
-/// Single flight on one thread: nothing waits; a key held is this thread's own.
+/// The single flight of one task: nothing waits, so a database on it is driven by one task at a
+/// time (a test's database, `base_db::Db::for_tests`, whose batches run on the calling thread).
+///
+/// The contract, checked at every ask: each held key records its holder, the task as the
+/// scheduler names it ([`blaze_graph::sched::job_here`], as `pump::Flights` names it). The
+/// holder asking again is [`Flown::Mine`]: a cycle on its own stack. Another task asking a key
+/// held is a database driven by several tasks, which this flight cannot serve: it panics, naming
+/// the key, this flight and what to take instead ([`Scheduled`]), and never answers `Mine` (the
+/// asker would be told it is in a cycle with a run on another task's stack) or waits.
 pub struct Alone {
-    held: Lock<Vec<FlightKey, Global>>,
+    held: Lock<Vec<(FlightKey, JobId), Global>>,
 }
 
 impl Alone {
     pub fn new() -> Alone {
         Alone { held: Lock::new("memo.alone.held", Vec::new_in(Global)) }
     }
+}
+
+/// The ask of a key `holder` holds by another task, `asker`, on [`Alone`]: refused, by name.
+#[cold]
+#[inline(never)]
+fn another_holder(named: &dyn Fn(&mut dyn fmt::Write), asker: JobId, holder: JobId) -> ! {
+    let mut what = String::new();
+    named(&mut what);
+    panic!(
+        "{what} is asked by task {asker:?} while task {holder:?} runs it, on the single flight of \
+         one task (`blaze_memo::Alone`), which cannot wait for another task: a database that \
+         several tasks or threads drive takes the scheduler's flight (`blaze_memo::Scheduled`; \
+         a test's database: `base_db::Db::for_tests_driven`)"
+    )
 }
 
 impl Default for Alone {
@@ -163,21 +197,30 @@ impl Flight for Alone {
     fn single<'f>(
         &'f self,
         key: FlightKey,
-        _: &dyn Fn(&mut String),
+        named: &dyn Fn(&mut dyn fmt::Write),
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f> {
-        {
+        let me = sched::job_here();
+        let holder = {
             let mut held = self.held.lock();
-            if held.contains(&key) {
-                return Flown::Mine;
+            let holder = held.iter().find(|(it, _)| *it == key).map(|(_, holder)| *holder);
+            if holder.is_none() {
+                held.push((key, me));
             }
-            held.push(key);
+            holder
+        };
+        // Decided with the lock let go: the panic and `named` run with no guard held.
+        match holder {
+            None => {}
+            Some(holder) if holder == me => return Flown::Mine,
+            Some(holder) => another_holder(named, me, holder),
         }
         struct Release<'a>(&'a Alone, FlightKey);
         impl Drop for Release<'_> {
             fn drop(&mut self) {
                 let mut held = self.0.held.lock();
-                let at = held.iter().rposition(|it| *it == self.1).expect("held while it ran");
+                let at =
+                    held.iter().position(|(it, _)| *it == self.1).expect("held while it ran");
                 held.swap_remove(at);
             }
         }
@@ -186,5 +229,60 @@ impl Flight for Alone {
             Hold::End => Flown::Ran,
             Hold::Keep => Flown::Kept(Kept::new(release)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::{Alone, Flight, FlightKey, Flown, Hold};
+
+    fn named(out: &mut dyn std::fmt::Write) {
+        out.write_str("the_query(the key)").expect("a name is written");
+    }
+
+    /// The invariant: on [`Alone`] a key's holder asking it again is `Mine`, and another task
+    /// (here another thread, one job of the scheduler for its life) asking it while it is held
+    /// is refused with a panic that names the key, the flight and what to take instead; never
+    /// `Mine`. The control: once the holder let the key go, the other task's ask runs it.
+    #[test]
+    fn alone_refuses_another_holders_ask_by_name() {
+        let alone = Alone::new();
+        let key = FlightKey([7; 32]);
+        let mut inner = None;
+        let mut refused = None;
+        let flown = alone.single(key, &named, &mut || {
+            // The holder again: a cycle on its own stack.
+            inner = Some(matches!(alone.single(key, &named, &mut || Hold::End), Flown::Mine));
+            // Another task, while this one holds the key.
+            refused = Some(std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        catch_unwind(AssertUnwindSafe(|| {
+                            alone.single(key, &named, &mut || Hold::End);
+                        }))
+                        .err()
+                        .and_then(|payload| payload.downcast_ref::<String>().cloned())
+                    })
+                    .join()
+                    .expect("the refusal is caught on its thread")
+            }));
+            Hold::End
+        });
+        assert!(matches!(flown, Flown::Ran), "the holder ran its key: {flown:?}");
+        assert_eq!(inner, Some(true), "the holder's own second ask is `Mine`");
+        let why = refused.flatten().expect("another task's ask of a held key panics");
+        for says in ["the_query(the key)", "`blaze_memo::Alone`", "`blaze_memo::Scheduled`"] {
+            assert!(why.contains(says), "the refusal says {says}: {why}");
+        }
+        // The control: the key let go, another task's ask runs it.
+        let after = std::thread::scope(|scope| {
+            scope
+                .spawn(|| matches!(alone.single(key, &named, &mut || Hold::End), Flown::Ran))
+                .join()
+                .expect("an ask of a free key does not panic")
+        });
+        assert!(after, "another task runs a key nobody holds");
     }
 }

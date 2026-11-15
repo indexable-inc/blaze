@@ -4,8 +4,8 @@
 //! both read them.
 
 use base_db::Db;
-use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::{Database as _, Setter as _};
+use blaze_ids::ContentId;
+use blaze_memo::{Database as _, Fact, Inputs};
 use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId, Lookup,
     attrs::AttrFlags,
@@ -44,63 +44,105 @@ fn calls_location_macros(db: &Db, body: &Body) -> bool {
     })
 }
 
+/// Expressions of one body, each with the expansion it is in: sorted by expression, each once,
+/// kept in the arena of the query that found them and searched in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ByExpr<'db>(&'db [(ExprId, HirFileId)]);
+
+impl<'db> ByExpr<'db> {
+    /// `found` (each expression once, in any order) kept in the running query's arena.
+    fn kept(db: &'db Db, mut found: Vec<(ExprId, HirFileId), Global>) -> ByExpr<'db> {
+        found.sort_unstable_by_key(|it| it.0);
+        ByExpr(blaze_memo::keep_slice(db.memo(), &found))
+    }
+
+    /// The expansion `expr` is in, if it is one of these.
+    pub fn get(&self, expr: &ExprId) -> Option<&'db HirFileId> {
+        let all = self.0;
+        all.binary_search_by_key(expr, |it| it.0).ok().map(|at| &all[at].1)
+    }
+
+    pub fn contains_key(&self, expr: &ExprId) -> bool {
+        self.get(expr).is_some()
+    }
+
+    /// Each expression's expansion, by expression.
+    pub fn values(&self) -> impl Iterator<Item = &'db HirFileId> + 'db {
+        self.0.iter().map(|it| &it.1)
+    }
+}
+
+/// Expressions of one body: sorted, each once, kept in the arena of the query that found them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ExprSet<'db>(&'db [ExprId]);
+
+impl ExprSet<'_> {
+    pub fn contains(&self, expr: &ExprId) -> bool {
+        self.0.binary_search(expr).is_ok()
+    }
+}
+
 /// The literals of a body that `file!()` expanded to, each with its expansion: the path is the
 /// build's rule's ([`name_sources`]), not the expander's. The source map changes with every
 /// edit above the body, and this keeps code without such literals from changing with it.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref))]
 #[expect(
     blaze::reads_positions,
     reason = "which expansion each literal came from is read off the unmoved source map: the lowered body \
               must record the expansion of each literal a location macro made"
 )]
-pub fn location_macros<'db>(
-    db: &'db Db,
-    owner: DefWithBodyId,
-) -> HashMap<ExprId, HirFileId, Global> {
+pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> ByExpr<'db> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
-        return HashMap::new_in(Global);
+        return ByExpr::default();
     }
     let source_map = Body::unmoved_source_map(db, owner);
-    body.exprs()
-        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
-        .filter_map(|(id, _)| {
-            let file_id = source_map.expr_syntax(id).ok()?.file_id;
-            let kind = file_id.macro_file()?.loc(db).def.kind;
-            matches!(kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::File))
-                .then_some((id, file_id))
-        })
-        // alloc: the query's value, of a body that called a location macro
-        .collect()
+    // alloc: the literals found, of a body that called a location macro, freed once kept
+    let mut found = Vec::new_in(Global);
+    found.extend(
+        body.exprs().filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_))).filter_map(
+            |(id, _)| {
+                let file_id = source_map.expr_syntax(id).ok()?.file_id;
+                let kind = file_id.macro_file()?.loc(db).def.kind;
+                matches!(kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::File))
+                    .then_some((id, file_id))
+            },
+        ),
+    );
+    ByExpr::kept(db, found)
 }
 
 /// The literals of a body that `line!()` expanded to. Lowering reads each in code where the
 /// code runs ([`slots_lines`]) from the `Location` of the literal, which the link fills, so a
 /// move above the body changes no MIR of it. `column!()` stays a literal: a `Location`'s column
 /// is rustc's display width, `column!()`'s counts chars, and no move above a body changes it.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref))]
 #[expect(
     blaze::reads_positions,
     reason = "which expansion each literal came from is read off the unmoved source map: the lowered body \
               must record the expansion of each literal `line!()` made"
 )]
-pub fn line_literals<'db>(db: &'db Db, owner: DefWithBodyId) -> HashSet<ExprId, Global> {
+pub fn line_literals<'db>(db: &'db Db, owner: DefWithBodyId) -> ExprSet<'db> {
     let line = |kind| matches!(kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Line));
     let body = Body::of(db, owner);
     if !body.macro_calls().iter().any(|call| line(call.loc(db).def.kind)) {
-        return HashSet::new_in(Global);
+        return ExprSet::default();
     }
     let source_map = Body::unmoved_source_map(db, owner);
-    body.exprs()
-        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
-        .filter(|&(id, _)| {
-            (source_map.expr_syntax(id).ok())
-                .and_then(|source| source.file_id.macro_file())
-                .is_some_and(|call| line(call.loc(db).def.kind))
-        })
-        .map(|(id, _)| id)
-        // alloc: the query's value, of a body that called `line!`
-        .collect()
+    // alloc: the literals found, of a body that called `line!`, freed once kept
+    let mut found = Vec::new_in(Global);
+    found.extend(
+        body.exprs()
+            .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
+            .filter(|&(id, _)| {
+                (source_map.expr_syntax(id).ok())
+                    .and_then(|source| source.file_id.macro_file())
+                    .is_some_and(|call| line(call.loc(db).def.kind))
+            })
+            .map(|(id, _)| id),
+    );
+    found.sort_unstable();
+    ExprSet(blaze_memo::keep_slice(db.memo(), &found))
 }
 
 /// Whether lowering `owner` reads its `line!()` literals where its code runs: in a function
@@ -151,32 +193,32 @@ pub fn mentions_location(db: &Db, owner: DefWithBodyId, expr: ExprId) -> bool {
 
 /// The literals of a body that `concat!` made of arguments with `file!()` among them, each with
 /// the expansion it is in.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref))]
 #[expect(
     blaze::reads_positions,
     reason = "which expansion each literal came from is read off the unmoved source map: the lowered body \
               must record the expansion of each literal a location macro made"
 )]
-pub fn located_concats<'db>(
-    db: &'db Db,
-    owner: DefWithBodyId,
-) -> HashMap<ExprId, HirFileId, Global> {
+pub fn located_concats<'db>(db: &'db Db, owner: DefWithBodyId) -> ByExpr<'db> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
-        return HashMap::new_in(Global);
+        return ByExpr::default();
     }
     let source_map = Body::unmoved_source_map(db, owner);
-    body.exprs()
-        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
-        .filter_map(|(id, _)| {
-            let file_id = source_map.expr_syntax(id).ok()?.file_id;
-            let loc = file_id.macro_file()?.loc(db);
-            let concat =
-                matches!(loc.def.kind, MacroDefKind::BuiltInEager(_, EagerExpander::Concat));
-            (concat && names_location(loc.to_node_view(db).value)).then_some((id, file_id))
-        })
-        // alloc: the query's value, of a body that called a location macro
-        .collect()
+    // alloc: the literals found, of a body that called a location macro, freed once kept
+    let mut found = Vec::new_in(Global);
+    found.extend(
+        body.exprs().filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_))).filter_map(
+            |(id, _)| {
+                let file_id = source_map.expr_syntax(id).ok()?.file_id;
+                let loc = file_id.macro_file()?.loc(db);
+                let concat =
+                    matches!(loc.def.kind, MacroDefKind::BuiltInEager(_, EagerExpander::Concat));
+                (concat && names_location(loc.to_node_view(db).value)).then_some((id, file_id))
+            },
+        ),
+    );
+    ByExpr::kept(db, found)
 }
 
 // dyn: the build's rule, told once a build and called once per crate and file
@@ -211,33 +253,34 @@ impl std::fmt::Debug for NamingRule {
 
 /// What the build calls each file, for a constant with `file!()` in its value: the evaluator
 /// has no build to ask, and a constant's value depends on it, so it is an input.
-#[blaze_query::input(singleton, debug)]
+#[blaze_memo::input(singleton, debug)]
 pub struct SourceNames {
     #[returns(ref)]
     pub rule: NamingRule,
 }
 
+/// The domain of [`source_names_fact`].
+const SOURCE_NAMES: &str = "blaze v2 mir source names 1";
+
+/// The fact the [`SourceNames`] of a rule keyed `key` is: one id for the singleton, and the key
+/// as its digest, so a driver that tells a new key has changed the session arena.
+pub fn source_names_fact(key: &str) -> Fact {
+    Fact { id: ContentId::of(SOURCE_NAMES, b"rule"), digest: ContentId::of(SOURCE_NAMES, key.as_bytes()) }
+}
+
 /// Tells the evaluator of constants what the build calls each file: `Symbols::source_path` in
 /// blaze. `key` names everything `paths` depends on besides the database (the checkout and its
-/// base, say); telling the same key again changes nothing, so no constant is evaluated again.
+/// base, say). Called by the driver while it builds the session arena (`inputs`), once per
+/// making of that arena: a rule of another key is another fact ([`source_names_fact`]), so the
+/// driver drops the session arena for it, and the same key keeps every constant evaluated.
 pub fn name_sources(
-    db: &mut Db,
+    inputs: &Inputs<'_>,
     key: &str,
     paths: impl Fn(&Db, base_db::Crate, base_db::FileId) -> Option<String> + Send + Sync + 'static,
 ) {
     // alloc: once per naming rule a build tells
     let rule = NamingRule { key: key.into(), paths: std::sync::Arc::new(paths) };
-    match SourceNames::try_get(db) {
-        Some(names) if names.rule(db).key == rule.key => {}
-        Some(names) => {
-            names.set_rule(db).with_durability(blaze_query::db::Durability::HIGH).to(rule);
-        }
-        None => {
-            // What read the singleton's absence (`file_source_path`) read its field's node,
-            // which making it changes (blaze-query's `a_singletons_absence_is_a_tracked_read`).
-            _ = SourceNames::new(db, blaze_query::db::Durability::HIGH, rule);
-        }
-    }
+    SourceNames::set(inputs, source_names_fact(key), rule);
 }
 
 /// What the build calls `file` in the code of `krate`, as `file!()` and `Location::file` say:
@@ -247,20 +290,22 @@ pub fn source_path<'db>(
     krate: base_db::Crate,
     file: base_db::FileId,
 ) -> Option<&'db str> {
-    file_source_path(db, krate, db.file_text(file))
+    file_source_path(db, krate, file.index())
 }
 
-#[blaze_query::tracked(returns(as_deref))]
-fn file_source_path<'db>(
-    db: &'db Db,
-    krate: base_db::Crate,
-    file: base_db::FileText,
-) -> Option<String> {
-    // The absence is a tracked read: the row runs again when `name_sources` makes it.
+/// [`source_path`], keyed by the file's stable index (a `FileId` names no arena), so homed at
+/// `krate`, the crate whose code names the file. Not by the file's text: a text is homed at
+/// the arena of the crate whose source root holds the file, which a crate reaching it through
+/// `..` or `#[path]` need not depend on, and a key naming both would name two unrelated arenas.
+#[blaze_memo::tracked(returns(copy))]
+fn file_source_path<'db>(db: &'db Db, krate: base_db::Crate, file: u32) -> Option<&'db str> {
+    // The absence is fixed for the snapshot, as every input is: the driver sets the singleton
+    // while it builds one (`name_sources`), never later.
     let Some(names) = SourceNames::try_get(db) else {
         return None;
     };
-    (names.rule(db).paths)(db, krate, *file.file_id(db))
+    let path = (names.rule(db).paths)(db, krate, base_db::FileId::from_raw(file))?;
+    Some(blaze_memo::keep_str(db.memo(), &path))
 }
 
 /// The text of the literal `expr` of `owner` when it is what `file!()`, or a `concat!` with
@@ -438,17 +483,16 @@ pub fn location_macro_file(db: &Db, file_id: HirFileId) -> Option<base_db::FileI
     macro_location_of(db, file_id.into(), range).map(|(file, _, _)| file)
 }
 
-/// Every file the code of `owner`'s body names by `file!()`, alone or in a `concat!`, in no
-/// order and maybe twice: what the code generator bakes into the body's data as text, so what
-/// a key of its compiled code that leaves out where the body is written must hold
-/// (docs/v2/plan/design/name-free-identity.md). Empty, reading no source map, for a body that
-/// calls neither macro.
+/// Every file the code of `owner`'s body names by `file!()` in a `concat!`, in no order and
+/// maybe twice: what the code generator bakes into the body's data as text, so what a key of
+/// its compiled code that leaves out where the body is written must hold
+/// (docs/v2/plan/design/name-free-identity.md). A `file!()` alone is not among them: the code
+/// generator makes it the `core::panic::Location` record of where it is written, whose file
+/// the link fills from the span side table (hir-ty-codegen's `builtin_location`), so the code
+/// holds no name. Empty, reading no source map, for a body with no such `concat!`.
 pub fn files_read(db: &Db, owner: DefWithBodyId) -> Vec<base_db::FileId> {
-    // alloc: none for a body without `file!()`, which is nearly every one
+    // alloc: none for a body without a `concat!` of `file!()`, which is nearly every one
     let mut files = Vec::new();
-    for &file_id in location_macros(db, owner).values() {
-        files.extend(location_macro_file(db, file_id));
-    }
     for &file_id in located_concats(db, owner).values() {
         let Some(call) = file_id.macro_file().map(|it| it.loc(db).to_node_view(db)) else {
             continue;

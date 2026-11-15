@@ -223,7 +223,7 @@ impl LoopMatchCheck {
 
 /// rustc's checks of the `#[loop_match]` loops and `#[const_continue]` breaks of `def` and
 /// the closures in it, and the arm each accepted break jumps to.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn loop_match_check(db: &Db, def: DefWithBodyId) -> LoopMatchCheck {
     let body = Body::of(db, def);
     if !body.has_loop_match() {

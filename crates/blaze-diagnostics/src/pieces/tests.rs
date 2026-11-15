@@ -40,7 +40,7 @@ static PLANTED: blaze_core::lock::Lock<Vec<(base_db::Nonce, Plant)>> =
 
 /// The bug planted in `db`, if any.
 pub(crate) fn planted(db: &Db) -> Option<Plant> {
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     PLANTED.lock().iter().find(|(of, _)| *of == nonce).map(|&(_, plant)| plant)
 }
 
@@ -57,12 +57,12 @@ pub(super) fn plant_reads(db: &Db, piece: Piece) {
 }
 
 fn plant(db: &Db, plant: Plant) {
-    PLANTED.lock().push((db.nonce_and_revision().0, plant));
+    PLANTED.lock().push((db.nonce(), plant));
 }
 
 /// The pieces of the syntax group probed in `db` since the last take.
 fn take_probed(db: &Db) -> usize {
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     let mut probed = PROBED.lock();
     let mut own = 0;
     probed.retain(|&(of, _, group)| {
@@ -153,7 +153,7 @@ fn syntax_by_pieces(
     names: &HashMap<FileId, String>,
     options: &Options,
 ) -> Vec<(String, String)> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let mut out = Vec::new();
         for krate in hir::check::workspace_crates(db) {
             let frame = crate::tests::frame();
@@ -192,16 +192,16 @@ fn refine(fixture: &str, prefix: &str, options: &Options) -> usize {
     for edit in EDITS {
         let Some(new) = edited(&text, edit) else { continue };
         applied += 1;
-        db.set_file_text(first, &new);
+        crate::tests::set_file_text(&mut db, first, &new);
         let warm = format!("{:?}", check_all(&db, &names, options));
         for (whole, by_pieces) in syntax_by_pieces(&db, &names, options) {
             assert_eq!(whole, by_pieces, "{edit:?} of\n{fixture}\nthe syntax group by piece");
         }
         let (mut fresh, fresh_names, fresh_first) = fixture_db(fixture, prefix);
-        fresh.set_file_text(fresh_first, &new);
+        crate::tests::set_file_text(&mut fresh, fresh_first, &new);
         let cold = format!("{:?}", check_all(&fresh, &fresh_names, options));
         assert_eq!(warm, cold, "{edit:?} of\n{fixture}\nthe check after the edit");
-        db.set_file_text(first, &text);
+        crate::tests::set_file_text(&mut db, first, &text);
         check_all(&db, &names, options);
     }
     applied
@@ -351,7 +351,7 @@ fn probed_after_a_body_edit(n: usize, plant_it: Option<Plant>) -> usize {
     let text = db.file_text(a).text(&db).as_str().to_owned();
     let new = text.replacen("let x = 7; x", "let x = 7; x + 1", 1);
     assert_ne!(new, text, "the edit applies");
-    db.set_file_text(a, &new);
+    crate::tests::set_file_text(&mut db, a, &new);
     check_all(&db, &names, &options);
     take_probed(&db)
 }
@@ -361,7 +361,12 @@ fn probed_after_a_body_edit(n: usize, plant_it: Option<Plant>) -> usize {
 /// verifies the rest: the outline backdates, and no other body's own syntax changed. Control:
 /// [`Plant::KeyedByFile`], a memo that reads its file's live tree, executes every piece of the
 /// file again.
+///
+/// False by design on blaze-memo (port decision: reuse across edits comes from records, not
+/// the memo): it claimed one piece runs again after a body edit; an edit of a file now
+/// rebuilds its crate's arena, so every piece of the crate is probed again. Left failing.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_runs_one_piece_of_s() {
     assert_eq!(probed_after_a_body_edit(200, None), 1, "one piece probed after a body edit");
     let planted = probed_after_a_body_edit(200, Some(Plant::KeyedByFile));

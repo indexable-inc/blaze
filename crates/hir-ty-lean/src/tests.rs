@@ -1183,7 +1183,7 @@ fn validation(db: &Db, krate: &str, name: &str, pass: Pass) -> String {
     let func = function(db, krate, name);
     let (_, pass_name, spec) =
         SPECIFIED.iter().find(|it| it.0 == pass).expect("a pass with a specification");
-    let (before, after) = blaze_query::db::attach(db, || {
+    let (before, after) = blaze_memo::attach(db, || {
         let def = DefWithBodyId::FunctionId(func);
         let before = match db.runtime_mir_body(def.into()) {
             Ok(body) => body.clone(),
@@ -1250,7 +1250,7 @@ fn the_passes_are_their_lean_specifications() {
 /// What blaze's MIR evaluator says of the nullary function `func`, in the fixed form of
 /// `lean/Blaze/Mir/Runner.lean`: `ok <value>`, `panic <kind>`, `undefined`, or `error ..`.
 fn evaluated(db: &Db, func: FunctionId, returns: &str) -> String {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         // The body the evaluator runs: runtime MIR, as `tests/layout/field_order.rs` asks for it.
         let env = hir_ty::traits::ParamEnvAndCrate {
             param_env: db.trait_environment(func.into()),
@@ -2704,7 +2704,20 @@ fn a_derive_at_an_instance_is_the_values_own_recorded_or_expanded() {
     assert_eq!(out.statement.as_deref(), Some("derives.waited_eq_is_the_values.spec.statement"));
     let fixture = fixture_of(DERIVE_FLAGS, "derives", DERIVES);
     let mut expanded = db(&fixture);
-    hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
+    // An input of the session arena, made each time it is, as the driver sets it; a commit
+    // drops the snapshot's ids, so every id below is taken after it.
+    let mut edit = expanded.edit();
+    edit.set_given(
+        None,
+        hir_def::nameres::builtin_derives_fact(true),
+        Box::new_in(
+            |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+                hir_def::nameres::set_expand_builtin_derives(inputs, true);
+            },
+            std::alloc::Global,
+        ),
+    );
+    _ = edit.commit();
     let names = [
         "copy_point", "same_point", "differ", "copy_path", "same_path", "same_points", "copy_label",
         "same_own", "copy_own", "clone_is_equal", "is_ready", "waited_differ", "copy_waited", "ready_or",
@@ -4460,8 +4473,7 @@ pub fn show_hand(h: &Hand, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Deb
 fn golden_expanded(flags: &str, krate: &str, name: &str, source: &str) -> Emitted {
     let fixture = fixture_of(flags, krate, source);
     let once = || {
-        let mut expanded = db(&fixture);
-        hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
+        let expanded = expanded_db(&fixture);
         let func = function(&expanded, krate, name);
         emit(&expanded, func)
     };
@@ -4558,9 +4570,19 @@ fn a_derived_debug_writes_through_a_linear_builder() {
 
 /// The database of `fixture` with its builtin derives expanded, as a build expands them.
 fn expanded_db(fixture: &str) -> Db {
-    let mut expanded = db(fixture);
-    hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
-    expanded
+    // The switch is an input of the session arena, set while a snapshot is built
+    // (`hir_ty_mir`'s `test_db::expand_builtin_derives` does the same for its fixtures).
+    let mut fx = fixture::db(fixture);
+    _ = fx.edit(|edit| {
+        edit.set_given(
+            None,
+            hir_def::nameres::builtin_derives_fact(true),
+            Box::new(|_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+                hir_def::nameres::set_expand_builtin_derives(inputs, true);
+            }),
+        );
+    });
+    fx.into_db()
 }
 
 /// The crate `krate` of `db`.

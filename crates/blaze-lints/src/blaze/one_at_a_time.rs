@@ -59,7 +59,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
 fn refused_entries(cx: &mut Cx<'_, '_>) {
     let resolved = cx.disallowed();
     let root = cx.root();
-    for error in &resolved.one_at_a_time.errors {
+    for error in resolved.one_at_a_time.errors {
         let span = cx.span(syntax::TextRange::empty(syntax::TextSize::new(0)));
         cx.blaze(LINT, root, span, format!("error reading Clippy's configuration file: {error}"))
             .help(format!("for further information visit {}", LINT.docs_url()));

@@ -356,7 +356,7 @@ pub fn share() -> u32 {
     let fx = fixture::db(&fixture_of("crate:main", FIXABLE.trim_start_matches('\n')));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || crate::tests::main_crate(&db));
+    let key = crate::tests::main_crate_key(&db);
     let file = file.file_id(&db);
     let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
     let flags: Vec<String> =
@@ -365,10 +365,11 @@ pub fn share() -> u32 {
         command_line: CommandLine::parse(&flags).expect("the flags read"),
         conf: Conf::default(),
     };
-    fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let text = db.file_text(file).text(&db).to_string();
     assert_eq!(text, want.trim_start_matches('\n'));
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
+        let krate = hir::Crate::from(db.krate(key));
         let found = check(&db, krate, &setup, &name_of).expect("the file is named");
         let left: Vec<&str> = found
             .iter()

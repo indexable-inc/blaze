@@ -4,7 +4,7 @@
 //! life of the process (see [`crate::arena`]): an [`Interned`] is a pointer to it, `Copy`, with
 //! no reference count, and two are equal when they point at the same value. An [`InternedRef`]
 //! is the same pointer with a lifetime, which only marks where a handle is meant to be used
-//! (the query engine refuses to store one, as it is no `blaze_query::db::Value`); [`InternedRef::to_owned`] and
+//! (a query's value holds the lifetime-free [`Interned`]); [`InternedRef::to_owned`] and
 //! [`InternedRef::change_lifetime`] move between the two freely.
 //!
 //! Interned values are never freed: memory is bounded by the database's reachability GC

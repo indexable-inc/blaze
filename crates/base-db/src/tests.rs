@@ -1,11 +1,11 @@
 use std::{
+    alloc::Global,
     cell::Cell,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, Looks, VfsPath};
 use blaze_ids::rng::SplitMix64 as Rng;
-use blaze_query::db::Durability;
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
 use span::{Edition, TextSize};
@@ -13,41 +13,86 @@ use syntax::TextRange;
 use triomphe::Arc;
 
 use crate::{
-    BuiltDependency, ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,
+    ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,
     CrateType, CrateTypes, CrateWorkspaceData, Db, DependencyBuilder, EditionedFileId, Env,
-    FileText, SourceRoot, SourceRootId, TargetKind, Trigger, ViewChange, ViewError, ViewFile,
-    ViewRoot, all_crates_content, cfg_options_content,
+    FileText, SourceRoot, SourceRootId, TargetKind, ViewChange, ViewError, ViewFile, ViewRoot,
+    all_crates_content, cfg_options_content,
+    input::Dependency,
     reparse::{
         REPARSED, TextEdit, assert_whole, common_prefix, common_prefix_scalar, common_suffix,
         common_suffix_scalar,
     },
     target::{Arch, TargetData},
+    db::{Committed, Edit},
+    world::{CrateKey, Plant},
 };
 
-mod durable_roots;
+mod id_space;
 mod memo_properties;
+mod world_model;
 
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-fn revision(db: &Db) -> blaze_query::db::View {
-    db.nonce_and_revision().1
+/// The fact boundaries of base-db's own test databases: none. base-db declares no boundary
+/// kind of its own; a build's database is given `blaze_item_hash::reads::mark_boundaries` by the
+/// crates above, which base-db cannot name.
+pub(crate) fn no_boundaries(_: &mut blaze_memo::Builder) {}
+
+/// A test database ([`Db::for_tests`]) with base-db's boundaries.
+pub(crate) fn test_db() -> Db {
+    Db::for_tests(no_boundaries)
 }
 
-/// Puts `files` (path, text) in source root 0, as file IDs from `first` on.
-fn load(db: &mut Db, first: u32, files: &[(&str, &str)]) -> Vec<FileId> {
+/// One edit of a database, made and committed in one call: [`Edit::commit`] takes the edit by
+/// value, so a setter's `&mut Edit` cannot end a chain.
+pub(crate) trait EditDb {
+    /// `change` made in one edit, committed: what the commit did.
+    fn commit_with(&mut self, change: impl FnOnce(&mut Edit<'_>)) -> Committed;
+
+    /// `change` made in one edit, committed: what it gave back and what the commit did.
+    fn edit_with<R>(&mut self, change: impl FnOnce(&mut Edit<'_>) -> R) -> (R, Committed);
+}
+
+impl EditDb for Db {
+    fn commit_with(&mut self, change: impl FnOnce(&mut Edit<'_>)) -> Committed {
+        self.edit_with(change).1
+    }
+
+    fn edit_with<R>(&mut self, change: impl FnOnce(&mut Edit<'_>) -> R) -> (R, Committed) {
+        let mut edit = self.edit();
+        let out = change(&mut edit);
+        (out, edit.commit())
+    }
+}
+
+/// Puts `files` (path, text) in source root 0, as file IDs from `first` on, and commits.
+pub(crate) fn load(db: &mut Db, first: u32, files: &[(&str, &str)]) -> Vec<FileId> {
     let mut set = FileSet::default();
-    let mut ids = Vec::new();
+    let mut ids = Vec::new_in(Global);
+    let mut edit = db.edit();
     for (n, (path, text)) in files.iter().enumerate() {
         let id = FileId::from_raw(first + n as u32);
-        db.set_file_text_with_durability(id, text, Durability::LOW);
-        db.set_file_source_root_with_durability(id, SourceRootId(0), Durability::MEDIUM);
+        edit.set_file_text(id, text).set_file_source_root(id, SourceRootId(0));
         set.insert(id, VfsPath::new_virtual_path(path.to_string()));
         ids.push(id);
     }
-    let root = Arc::new(SourceRoot::new_local(set));
-    db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
+    edit.set_source_root(SourceRootId(0), Arc::new(SourceRoot::new_local(set)));
+    _ = edit.commit();
     ids
+}
+
+/// Sets `graph` and commits: the keys of its crates.
+pub(crate) fn set_graph(db: &mut Db, graph: CrateGraphBuilder) -> crate::CratesIdMap {
+    db.commit_with(|edit| {
+        edit.set_crate_graph(graph);
+    })
+    .crates
+}
+
+/// A dependency on `crate_id` by `name`, in the prelude or not, a sysroot one or not.
+fn keyed_dep(name: CrateName, crate_id: CrateKey, prelude: bool, sysroot: bool) -> Dependency<CrateKey> {
+    Dependency { crate_id, name, prelude, sysroot, private: false }
 }
 
 fn cfg(atoms: &[CfgAtom]) -> CfgOptions {
@@ -106,18 +151,18 @@ const FILES: &[(&str, &str)] =
 #[test]
 fn equal_content_gives_equal_ids_across_databases() {
     let ids = |first: u32| {
-        let mut db = Db::for_tests();
+        let mut db = test_db();
         let files = load(&mut db, first, FILES);
         let mut graph = CrateGraphBuilder::default();
         let a = add(&mut graph, files[0], cfg(&[flag("unix")]), Env::default());
         let c = add(&mut graph, files[2], cfg(&[flag("unix")]), Env::default());
         depend(&mut graph, a, c, "c");
-        let crates = graph.set_in_db(&mut db);
+        let crates = set_graph(&mut db, graph);
         (
             db.file_text(files[1]).content(&db),
             db.source_root(SourceRootId(0)).content(&db),
-            crates[&a].content(&db),
-            crates[&c].content(&db),
+            db.krate(crates[&a]).content(&db),
+            db.krate(crates[&c]).content(&db),
             all_crates_content(&db),
         )
     };
@@ -127,24 +172,24 @@ fn equal_content_gives_equal_ids_across_databases() {
 
 #[test]
 fn a_file_text_edit_changes_its_id_and_its_source_roots() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let ids =
         |db: &Db| (db.file_text(files[1]).content(db), db.source_root(SourceRootId(0)).content(db));
     let before = ids(&db);
     assert_eq!(before.0, FileText::content_of("pub fn f() {}", None));
 
-    db.set_file_text(files[1], "pub fn g() {}");
+    db.commit_with(|edit| { edit.set_file_text(files[1], "pub fn g() {}"); });
     let edited = ids(&db);
     assert_ne!(edited.0, before.0);
     assert_ne!(edited.1, before.1);
     assert_eq!(db.file_text(files[0]).content(&db), FileText::content_of("pub mod b;", None));
 
-    db.set_file_text(files[1], "pub fn f() {}");
+    db.commit_with(|edit| { edit.set_file_text(files[1], "pub fn f() {}"); });
     assert_eq!(ids(&db), before);
 
     let root = db.source_root(SourceRootId(0)).content(&db);
-    db.set_appended_root_module(files[0], Some("mod __harness {}"), Durability::LOW);
+    db.commit_with(|edit| { edit.set_appended_root_module(files[0], Some("mod __harness {}")); });
     assert_eq!(
         db.file_text(files[0]).content(&db),
         FileText::content_of("pub mod b;", Some("mod __harness {}"))
@@ -154,7 +199,7 @@ fn a_file_text_edit_changes_its_id_and_its_source_roots() {
 
 #[test]
 fn a_files_parse_shares_its_text() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let parse = EditionedFileId::new(&db, files[1], Edition::Edition2021).parse(&db);
     let tree = parse.root().file();
@@ -164,7 +209,7 @@ fn a_files_parse_shares_its_text() {
 /// #1294: a dependency's file is an outline, whose `fn` bodies stay unparsed until reached.
 #[test]
 fn a_library_files_parse_leaves_bodies_unparsed() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, &[("/a/lib.rs", "fn f() { let x = 1 + 1; }")]);
     let body_is_lazy = |db: &Db| {
         let parse = EditionedFileId::new(db, files[0], Edition::Edition2021).parse(db);
@@ -177,7 +222,7 @@ fn a_library_files_parse_leaves_bodies_unparsed() {
     let mut set = FileSet::default();
     set.insert(files[0], VfsPath::new_virtual_path("/a/lib.rs".to_owned()));
     let root = Arc::new(SourceRoot::new_library(set));
-    db.set_source_root_with_durability(SourceRootId(0), root, Durability::HIGH);
+    db.commit_with(|edit| { edit.set_source_root(SourceRootId(0), root); });
     assert!(body_is_lazy(&db));
 }
 
@@ -190,11 +235,12 @@ fn the_order_of_cfg_atoms_does_not_change_a_crates_id() {
     assert_ne!(cfg_options_content(&cfg(&atoms)), cfg_options_content(&cfg(&atoms[1..])));
 
     let crate_id = |atoms: &[CfgAtom]| {
-        let mut db = Db::for_tests();
+        let mut db = test_db();
         let files = load(&mut db, 0, FILES);
         let mut graph = CrateGraphBuilder::default();
         let a = add(&mut graph, files[0], cfg(atoms), Env::default());
-        graph.set_in_db(&mut db)[&a].content(&db)
+        let a = set_graph(&mut db, graph)[&a];
+        db.krate(a).content(&db)
     };
     assert_eq!(crate_id(&atoms), crate_id(&reversed));
     assert_ne!(crate_id(&atoms), crate_id(&atoms[1..]));
@@ -202,45 +248,297 @@ fn the_order_of_cfg_atoms_does_not_change_a_crates_id() {
 
 #[test]
 fn a_dependencys_change_changes_its_dependents_ids() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let b = add(&mut graph, files[2], CfgOptions::default(), Env::default());
     let c = add(&mut graph, files[1], CfgOptions::default(), Env::default());
     depend(&mut graph, a, b, "b");
-    let crates = graph.set_in_db(&mut db);
-    let (a, b, c): (Crate, Crate, Crate) = (crates[&a], crates[&b], crates[&c]);
-    let ids = |db: &Db| (a.content(db), b.content(db), c.content(db), all_crates_content(db));
+    let crates = set_graph(&mut db, graph);
+    let (a, b, c): (CrateKey, CrateKey, CrateKey) = (crates[&a], crates[&b], crates[&c]);
+    let ids = |db: &Db| {
+        let content = |key| db.krate(key).content(db);
+        (content(a), content(b), content(c), all_crates_content(db))
+    };
     let before = ids(&db);
 
     let env: Env = [("KEY".to_owned(), "value".to_owned())].into_iter().collect();
-    b.set_env(&mut db, env.clone());
-    assert_eq!(b.env(&db), &env);
+    db.commit_with(|edit| { edit.set_crate_env(b, env.clone()); });
+    assert_eq!(db.krate(b).env(&db), &env);
     let after = ids(&db);
     assert_ne!(after.1, before.1);
     assert_ne!(after.0, before.0);
     assert_eq!(after.2, before.2);
-    assert_ne!(after.3, before.3);
+    // The list is of each crate's item key, which a crate's variables are not in: the session
+    // arena, which every arena borrows, stays (`world::List`).
+    assert_eq!(after.3, before.3, "a crate's variables moved the crate list");
 
-    b.set_env(&mut db, Env::default());
+    db.commit_with(|edit| { edit.set_crate_env(b, Env::default()); });
     assert_eq!(ids(&db), before);
+
+    // A crate's cfg is in its item key and its dependents', so in the list.
+    db.commit_with(|edit| { edit.set_crate_cfg_options(b, cfg(&[flag("moved")])); });
+    let after = ids(&db);
+    assert_ne!(after.1, before.1);
+    assert_ne!(after.0, before.0);
+    assert_eq!(after.2, before.2);
+    assert_ne!(after.3, before.3, "a crate's cfg left the crate list as it was");
+
+    db.commit_with(|edit| { edit.set_crate_cfg_options(b, CfgOptions::default()); });
+    assert_eq!(ids(&db), before);
+}
+
+/// The world as an edit reads it ([`Edit::written_file_text`] and the rest): what a dropped
+/// edit must leave as it found it.
+#[derive(Debug, PartialEq)]
+struct Written {
+    text: Option<(String, ContentId)>,
+    moved_path: Option<FileId>,
+    cfg: CfgOptions,
+    env: Env,
+    /// How many crates are listed: a crate an edit makes takes a new key each time.
+    listed: usize,
+    primary: Vec<CrateKey, Global>,
+    gift: Option<u32>,
+}
+
+/// The kind of the gifts [`written`] reads.
+struct TestGift;
+
+fn written(edit: &Edit<'_>, file: FileId, krate: CrateKey) -> Written {
+    let moved = VfsPath::new_virtual_path("/a/moved.rs".to_owned());
+    let crate_ = edit.written_crate(krate);
+    let mut primary = Vec::new_in(Global);
+    primary.extend_from_slice(edit.written_primary_crates());
+    Written {
+        text: edit.written_file_text(file).map(|(text, content)| (text.to_string(), content)),
+        moved_path: edit.written_source_root(SourceRootId(0)).and_then(|it| it.file_for_path(&moved).copied()),
+        cfg: crate_.cfg.clone(),
+        env: crate_.env.clone(),
+        listed: edit.written_all_crates().len(),
+        primary,
+        gift: edit.written_given::<TestGift, u32>(krate).copied(),
+    }
+}
+
+/// The writes [`an_edit_reads_its_writes_and_one_dropped_puts_them_back`] and its panicking
+/// twin make: a file's text, a crate's cfg and env, root 0 again with `b.rs` under another
+/// path, the primary crates, a gift, a session maker and a crate made and listed.
+fn write_everything(edit: &mut Edit<'_>, files: &[FileId], a: CrateKey) {
+    edit.set_file_text(files[1], "pub fn g() {}");
+    edit.set_crate_cfg_options(a, cfg(&[flag("now")]));
+    edit.set_crate_env(a, [("NOW".to_owned(), "1".to_owned())].into_iter().collect());
+    let mut moved = FileSet::default();
+    for (file, path) in files.iter().zip(["/a/lib.rs", "/a/moved.rs", "/c/lib.rs"]) {
+        moved.insert(*file, VfsPath::new_virtual_path(path.to_owned()));
+    }
+    edit.set_source_root(SourceRootId(0), Arc::new(SourceRoot::new_local(moved)));
+    let mut primary = Vec::new_in(Global);
+    primary.push(a);
+    edit.set_primary_crates(primary);
+    edit.give::<TestGift>(a, crate::Given::new(5_u32));
+    let (runs, arena) = counters();
+    edit.set_given(None, test_fact("dropped"), held_maker(&runs, &arena, test_fact("dropped"), Some(3)));
+    let like_a = edit.written_crate(a);
+    // clone: a second crate like `a`
+    let (data, extra, workspace) = (like_a.data.clone(), like_a.extra.clone(), Arc::clone(like_a.workspace));
+    let made = edit.create_crate(data, extra, workspace, CfgOptions::default(), Env::default());
+    edit.add_crates(&[made]);
+}
+
+/// The invariant: an edit's world reads (`Edit::written_*`) see its own writes while the
+/// snapshot it reads through (`Edit::db`) is the last commit's; an edit dropped uncommitted
+/// puts every write back (the next edit reads the world as the last commit left it, and the
+/// snapshot and its epoch are the same); and the same writes committed are all there.
+#[test]
+fn an_edit_reads_its_writes_and_one_dropped_puts_them_back() {
+    let mut db = test_db();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let crates = set_graph(&mut db, graph);
+    let a = crates[&a];
+    let (text_before, content_before) = (db.file_text(files[1]).text(&db).to_string(), db.file_content(files[1]));
+    let epoch = db.snapshot_epoch();
+    let before = written(&db.edit(), files[1], a);
+    assert_eq!(before.gift, None);
+
+    let mut edit = db.edit();
+    write_everything(&mut edit, &files, a);
+    let during = written(&edit, files[1], a);
+    let (text, content) = during.text.clone().expect("a file given a text has one");
+    assert_eq!(text, "pub fn g() {}");
+    assert_ne!(content, content_before);
+    assert_eq!(during.cfg, cfg(&[flag("now")]));
+    assert_eq!(during.moved_path, Some(files[1]));
+    assert_eq!(during.listed, 2, "the crate made and listed");
+    assert_eq!(during.primary.as_slice(), &[a]);
+    assert_eq!(during.gift, Some(5));
+    assert!(edit.written_source_root(SourceRootId(9)).is_none(), "a root never set is none");
+    // The snapshot is the last commit's.
+    let read = edit.db();
+    assert_eq!(read.file_text(files[1]).text(read).to_string(), text_before);
+    assert_eq!(read.krate(a).cfg_options(read), &CfgOptions::default());
+    let named = read.source_root(SourceRootId(0)).source_root(read);
+    assert_eq!(named.file_for_path(&VfsPath::new_virtual_path("/a/moved.rs".to_owned())), None);
+    drop(edit);
+
+    assert_eq!(db.snapshot_epoch(), epoch, "a dropped edit makes no snapshot");
+    assert_eq!(db.file_content(files[1]), content_before);
+    assert_eq!(written(&db.edit(), files[1], a), before, "a dropped edit puts every write back");
+    // The control: nothing is left to commit, so an empty commit keeps the snapshot.
+    let committed = db.commit_with(|_| {});
+    assert!(!committed.moved, "a dropped edit left a write behind: {committed:?}");
+    assert_eq!(db.snapshot_epoch(), epoch);
+
+    // The same writes committed are all there.
+    let committed = db.commit_with(|edit| write_everything(edit, &files, a));
+    assert!(committed.moved);
+    assert_ne!(db.snapshot_epoch(), epoch);
+    assert_eq!(written(&db.edit(), files[1], a), during, "the commit has every write");
+    assert_eq!(&**db.file_text(files[1]).text(&db), "pub fn g() {}");
+    assert_eq!(db.krate(a).cfg_options(&db), &cfg(&[flag("now")]));
+    assert_eq!(&*crate::primary_crates(&db), &[db.krate(a)]);
+    assert_eq!(crate::all_crates(&db).len(), 2);
+    assert_eq!(Held::try_get(&db).map(|it| it.value(&db)), Some(3), "the session maker ran");
+}
+
+/// The invariant: an edit unwound by a panic, mid-edit or mid-commit (a maker that panics as
+/// the commit makes its arena), puts every write back, and the database goes on: the old
+/// snapshot answers, and the next commit makes a whole one.
+#[test]
+fn an_edit_unwound_by_a_panic_puts_its_writes_back() {
+    let mut db = test_db();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let a = set_graph(&mut db, graph)[&a];
+    let epoch = db.snapshot_epoch();
+    let before = written(&db.edit(), files[1], a);
+
+    // Mid-edit.
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut edit = db.edit();
+        write_everything(&mut edit, &files, a);
+        panic!("a writer failed mid-edit");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(db.snapshot_epoch(), epoch);
+    assert_eq!(written(&db.edit(), files[1], a), before, "a panic mid-edit puts every write back");
+
+    // Mid-commit: a maker of `a`'s arena panics while the commit makes it.
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut edit = db.edit();
+        write_everything(&mut edit, &files, a);
+        let panics: crate::MakeGiven = Box::new_in(
+            |_: &blaze_memo::Builder, _: &blaze_memo::Inputs<'_>| panic!("a maker failed mid-commit"),
+            Global,
+        );
+        edit.set_given(Some(a), test_fact("panics"), panics);
+        _ = edit.commit();
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(db.snapshot_epoch(), epoch, "a commit that panicked made no snapshot");
+    assert_eq!(&**db.file_text(files[1]).text(&db), FILES[1].1, "the old snapshot answers");
+    assert_eq!(written(&db.edit(), files[1], a), before, "a panic mid-commit puts every write back");
+
+    // The database goes on: the same writes, with no maker that panics, commit whole.
+    let committed = db.commit_with(|edit| write_everything(edit, &files, a));
+    assert!(committed.moved);
+    assert_eq!(&**db.file_text(files[1]).text(&db), "pub fn g() {}");
+    assert_eq!(db.krate(a).cfg_options(&db), &cfg(&[flag("now")]));
+    assert_eq!(db.krate(a).given::<TestGift, u32>(&db), Some(&5));
+}
+
+/// The invariant: a commit that moved nothing (no write, or each a write of the value held)
+/// makes no snapshot: [`Committed::moved`] is false, nothing is dropped, and the epoch stays.
+/// The control: one real write moves it.
+#[test]
+fn a_commit_of_nothing_keeps_the_snapshot() {
+    let mut db = test_db();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let a = set_graph(&mut db, graph)[&a];
+    db.commit_with(|edit| {
+        edit.give::<TestGift>(a, crate::Given::new(1_u32));
+    });
+    let epoch = db.snapshot_epoch();
+    let text = db.file_text(files[1]).text(&db).to_string();
+
+    let committed = db.commit_with(|_| {});
+    assert!(!committed.moved && committed.dropped.is_empty(), "an empty edit: {committed:?}");
+    assert_eq!(db.snapshot_epoch(), epoch, "an empty edit moved the epoch");
+
+    let held_gift = db.krate(a).given::<TestGift, u32>(&db).copied();
+    let committed = db.commit_with(|edit| {
+        let gift = edit.written_given::<TestGift, crate::Given>(a).is_some();
+        assert!(!gift, "a gift is read as its own type, never as a `Given`");
+        edit.set_file_text(files[1], &text)
+            .set_crate_env(a, Env::default())
+            .set_crate_cfg_options(a, CfgOptions::default())
+            .set_library_roots(blaze_hash::HashSet::new_in(Global))
+            .set_primary_crates(Vec::new_in(Global));
+    });
+    assert_eq!(held_gift, Some(1));
+    assert!(!committed.moved && committed.dropped.is_empty(), "writes of the values held: {committed:?}");
+    assert_eq!(db.snapshot_epoch(), epoch, "writes of the values held moved the epoch");
+
+    // The control.
+    let committed = db.commit_with(|edit| {
+        edit.set_file_text(files[1], "pub fn h() {}");
+    });
+    assert!(committed.moved && !committed.dropped.is_empty(), "a write: {committed:?}");
+    assert_ne!(db.snapshot_epoch(), epoch);
+}
+
+/// The invariant: [`Edit::written_given`] reads the gift of a kind as the world has it, with
+/// the edit's own gifts: none before, the value given after, none as another type or kind; a
+/// dropped edit's gift is gone, a committed one's is read by the snapshot.
+#[test]
+fn written_given_reads_the_edits_own_gifts() {
+    struct OtherKind;
+    let mut db = test_db();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let a = set_graph(&mut db, graph)[&a];
+
+    let mut edit = db.edit();
+    assert_eq!(edit.written_given::<TestGift, u32>(a), None);
+    edit.give::<TestGift>(a, crate::Given::new(7_u32));
+    assert_eq!(edit.written_given::<TestGift, u32>(a), Some(&7));
+    assert_eq!(edit.written_given::<TestGift, u64>(a), None, "another type");
+    assert_eq!(edit.written_given::<OtherKind, u32>(a), None, "another kind");
+    assert_eq!(edit.db().krate(a).given::<TestGift, u32>(edit.db()), None, "the snapshot's");
+    drop(edit);
+
+    let mut edit = db.edit();
+    assert_eq!(edit.written_given::<TestGift, u32>(a), None, "a dropped edit's gift is gone");
+    edit.give::<TestGift>(a, crate::Given::new(8_u32));
+    edit.give::<TestGift>(a, crate::Given::new(9_u32));
+    assert_eq!(edit.written_given::<TestGift, u32>(a), Some(&9), "the last gift");
+    _ = edit.commit();
+    assert_eq!(db.krate(a).given::<TestGift, u32>(&db), Some(&9));
+    assert_eq!(db.edit().written_given::<TestGift, u32>(a), Some(&9));
 }
 
 #[test]
 fn a_crates_build_target_changes_its_content_and_its_dependents() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let b = add(&mut graph, files[2], CfgOptions::default(), Env::default());
     depend(&mut graph, a, b, "b");
-    let crates = graph.set_in_db(&mut db);
+    let crates = set_graph(&mut db, graph);
     let (a, b) = (crates[&a], crates[&b]);
-    let ids = |db: &Db| (a.content(db), b.content(db), all_crates_content(db));
+    let ids = |db: &Db| (db.krate(a).content(db), db.krate(b).content(db), all_crates_content(db));
     let before = ids(&db);
-    let original = b.extra_data(&db).clone(); // clone: test restores the original input
-    let mut seen = vec![before.1]; // alloc: the four target identities under test
+    let original = db.krate(b).extra_data(&db).clone(); // clone: test restores the original input
+    let mut seen = Vec::new_in(Global);
+    seen.push(before.1);
     for built_for in [
         crate::BuiltFor { platform: Some(Symbol::intern("x86_64-unknown-linux-gnu")), macro_wasm: false },
         crate::BuiltFor { platform: Some(Symbol::intern("wasm32-wasip1")), macro_wasm: false },
@@ -248,81 +546,96 @@ fn a_crates_build_target_changes_its_content_and_its_dependents() {
     ] {
         let mut extra = original.clone(); // clone: change only what the crate is built for
         extra.built_for = built_for;
-        b.set_extra_data(&mut db, extra);
+        db.commit_with(|edit| { edit.set_crate_extra_data(b, extra); });
         let after = ids(&db);
         assert_ne!(after.0, before.0, "the dependent's content follows its dependency");
         assert_ne!(after.2, before.2, "the graph's content follows its crates");
         assert!(!seen.contains(&after.1), "host, target and proc-macro builds are distinct");
         seen.push(after.1);
     }
-    b.set_extra_data(&mut db, original);
+    db.commit_with(|edit| { edit.set_crate_extra_data(b, original); });
     assert_eq!(ids(&db), before);
 }
 
 #[test]
 fn a_crates_types_read_back_and_are_in_its_id() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
-    let a = graph.set_in_db(&mut db)[&a];
-    assert_eq!(a.data(&db).crate_types, CrateTypes::of(&[CrateType::Lib]));
-    let as_lib = a.content(&db);
+    let a = set_graph(&mut db, graph)[&a];
+    assert_eq!(db.krate(a).data(&db).crate_types, CrateTypes::of(&[CrateType::Lib]));
+    let as_lib = db.krate(a).content(&db);
 
-    let mut data = a.data(&db).clone();
+    let mut data = db.krate(a).data(&db).keyed(&db);
     data.crate_types = CrateTypes::of(&[CrateType::Cdylib, CrateType::Rlib]);
-    a.set_data(&mut db, data);
-    let types = a.data(&db).crate_types;
+    db.commit_with(|edit| { edit.set_crate_data(a, data); });
+    let types = db.krate(a).data(&db).crate_types;
     assert_eq!(types.iter().collect::<Vec<_>>(), [CrateType::Rlib, CrateType::Cdylib]);
     assert!(!types.contains(CrateType::Lib));
-    assert_ne!(a.content(&db), as_lib);
+    assert_ne!(db.krate(a).content(&db), as_lib);
 }
 
 #[test]
 fn a_dependency_added_outside_the_prelude_says_so() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let b = add(&mut graph, files[2], CfgOptions::default(), Env::default());
-    let crates = graph.set_in_db(&mut db);
-    let (a, b): (Crate, Crate) = (crates[&a], crates[&b]);
+    let crates = set_graph(&mut db, graph);
+    let (a, b): (CrateKey, CrateKey) = (crates[&a], crates[&b]);
     let name = CrateName::new("b").unwrap();
-    let depend_on = |db: &mut Db, dependency: BuiltDependency| {
-        let mut data = a.data(&*db).clone();
-        data.dependencies = vec![dependency];
-        a.set_data(db, data);
-        a.content(&*db)
+    let depend_on = |db: &mut Db, dependency: Dependency<CrateKey>| {
+        let mut data = db.krate(a).data(&*db).keyed(&*db);
+        let mut dependencies = Vec::new_in(Global);
+        dependencies.push(dependency);
+        data.dependencies = dependencies;
+        db.commit_with(|edit| { edit.set_crate_data(a, data); });
+        db.krate(a).content(&*db)
     };
 
-    let in_prelude = depend_on(&mut db, BuiltDependency::new(name.clone(), b));
-    let outside = depend_on(&mut db, BuiltDependency::with_prelude(name.clone(), b, false, true));
-    let dependency = &a.data(&db).dependencies[0];
+    let in_prelude = depend_on(&mut db, keyed_dep(name.clone(), b, true, false));
+    let outside = depend_on(&mut db, keyed_dep(name.clone(), b, false, true));
+    let krate = db.krate(a);
+    let dependency = &krate.data(&db).dependencies[0];
     assert!(!dependency.is_prelude());
     assert!(dependency.is_sysroot());
+    assert_eq!(dependency.crate_id, db.krate(b), "the dependency is read back as its crate");
     assert_ne!(outside, in_prelude);
-    assert_eq!(depend_on(&mut db, BuiltDependency::with_prelude(name, b, true, false)), in_prelude);
+    assert_eq!(depend_on(&mut db, keyed_dep(name, b, true, false)), in_prelude);
 }
 
 /// The texts of `krate`'s crate attributes' files, in order.
-fn attr_texts(db: &Db, krate: Crate) -> Vec<String> {
+fn attr_texts(db: &Db, krate: CrateKey) -> Vec<String> {
     let text = |file: &FileId| -> String { (**db.file_text(*file).text(db)).to_owned() };
-    krate.crate_attr_files(db).iter().map(text).collect()
+    db.krate(krate).crate_attr_files(db).iter().map(text).collect()
 }
 
-/// A graph with crate `a` on `FILES`' first file, its crate attributes `attrs`.
-fn set_attrs(db: &mut Db, files: &[FileId], attrs: &[&str]) -> Crate {
+/// The files of `krate`'s crate attributes, in order.
+fn attr_files(db: &Db, krate: CrateKey) -> Vec<FileId, Global> {
+    let mut files = Vec::new_in(Global);
+    files.extend_from_slice(db.krate(krate).crate_attr_files(db));
+    files
+}
+
+/// A graph with crate `a` on `FILES`' first file, its crate attributes `attrs`, committed.
+fn set_attrs(db: &mut Db, files: &[FileId], attrs: &[&str]) -> (CrateKey, Committed) {
     let mut graph = CrateGraphBuilder::default();
     let a = add_with_attrs(&mut graph, files[0], CfgOptions::default(), Env::default(), attrs);
-    graph.set_in_db(db)[&a]
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_graph(graph);
+    });
+    (committed.crates[&a], committed)
 }
 
 #[test]
 fn each_crate_attr_is_a_file_of_its_own_in_the_roots_source_root() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
-    let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
-    assert_eq!(attr_texts(&db, a), ["#![no_std]", "#![feature(x)]"]);
+    let (key, _) = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    assert_eq!(attr_texts(&db, key), ["#![no_std]", "#![feature(x)]"]);
+    let a = db.krate(key);
     let root = db.source_root(SourceRootId(0)).source_root(&db);
     for &file in a.crate_attr_files(&db) {
         assert!(!files.contains(&file), "{file:?} is a file of the VFS");
@@ -335,78 +648,82 @@ fn each_crate_attr_is_a_file_of_its_own_in_the_roots_source_root() {
     assert_eq!(crate::applied_crate_attr_files(&db, a), editioned);
 }
 
+/// An equal graph set again keeps the attribute files and drops nothing: the arena of the crate
+/// that holds them is kept.
 #[test]
-fn an_equal_graph_keeps_the_crate_attr_files_and_writes_nothing() {
-    let mut db = Db::for_tests();
+fn an_equal_graph_keeps_the_crate_attr_files_and_drops_nothing() {
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
-    let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
-    let before = a.crate_attr_files(&db).to_vec();
-    let then = revision(&db);
-    assert_eq!(set_attrs(&mut db, &files, &["no_std", "feature(x)"]), a);
-    assert_eq!(a.crate_attr_files(&db), before);
-    assert_eq!(revision(&db), then);
+    let (a, _) = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    let before = attr_files(&db, a);
+    let (again, committed) = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    assert_eq!(again, a);
+    assert_eq!(attr_files(&db, a), before);
+    assert!(committed.dropped.is_empty(), "an equal graph dropped {:?}", committed.dropped);
 }
 
 #[test]
 fn a_changed_crate_attr_reuses_a_file_and_a_gone_one_is_taken_out() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
-    let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
-    let first = a.crate_attr_files(&db).to_vec();
+    let (a, _) = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    let first = attr_files(&db, a);
 
     // `feature(x)` keeps its file; `feature(y)` gets the one `no_std` left.
-    assert_eq!(set_attrs(&mut db, &files, &["feature(x)", "feature(y)"]), a);
-    assert_eq!(a.crate_attr_files(&db), [first[1], first[0]]);
+    assert_eq!(set_attrs(&mut db, &files, &["feature(x)", "feature(y)"]).0, a);
+    assert_eq!(attr_files(&db, a), [first[1], first[0]]);
     assert_eq!(attr_texts(&db, a), ["#![feature(x)]", "#![feature(y)]"]);
 
-    assert_eq!(set_attrs(&mut db, &files, &["feature(y)"]), a);
-    assert_eq!(a.crate_attr_files(&db), [first[0]]);
+    assert_eq!(set_attrs(&mut db, &files, &["feature(y)"]).0, a);
+    assert_eq!(attr_files(&db, a), [first[0]]);
     assert!(!db.has_file_text(first[1]), "the file of a gone attribute is taken out");
 
     // The ID taken out is the next attribute's.
-    assert_eq!(set_attrs(&mut db, &files, &["feature(y)", "no_core"]), a);
-    assert_eq!(a.crate_attr_files(&db), [first[0], first[1]]);
+    assert_eq!(set_attrs(&mut db, &files, &["feature(y)", "no_core"]).0, a);
+    assert_eq!(attr_files(&db, a), [first[0], first[1]]);
     assert_eq!(attr_texts(&db, a), ["#![feature(y)]", "#![no_core]"]);
 }
 
 #[test]
 fn a_crate_that_goes_takes_its_crate_attr_files_out() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
-    let a = set_attrs(&mut db, &files, &["no_std"]);
-    let attr = a.crate_attr_files(&db)[0];
+    let (a, _) = set_attrs(&mut db, &files, &["no_std"]);
+    let attr = attr_files(&db, a)[0];
     let mut graph = CrateGraphBuilder::default();
-    add(&mut graph, files[2], CfgOptions::default(), Env::default());
-    graph.set_in_db(&mut db);
-    assert!(a.crate_attr_files(&db).is_empty());
+    let c = add(&mut graph, files[2], CfgOptions::default(), Env::default());
+    let crates = set_graph(&mut db, graph);
+    assert_ne!(crates[&c], a, "the crate that goes keeps no key in the new graph");
     assert!(!db.has_file_text(attr));
 }
 
 #[test]
 #[should_panic(expected = "is the file of a crate attribute")]
 fn the_vfs_setters_refuse_a_crate_attr_file() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
-    let a = set_attrs(&mut db, &files, &["no_std"]);
-    let attr = a.crate_attr_files(&db)[0];
-    db.set_file_text(attr, "fn f() {}");
+    let (a, _) = set_attrs(&mut db, &files, &["no_std"]);
+    let attr = attr_files(&db, a)[0];
+    db.commit_with(|edit| { edit.set_file_text(attr, "fn f() {}"); });
 }
 
 #[test]
 fn a_new_file_id_meets_no_vfs_file_nor_crate_attr_file() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
-    let given = db.new_file_id().expect("an unused file ID");
+    let given = new_file_id(&mut db);
     assert!(!files.contains(&given), "{given:?} is a file of the VFS");
-    let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
-    let attrs = a.crate_attr_files(&db).to_vec();
+    // An ID handed out stays taken: the next is another, whatever the commit between.
+    let (a, _) = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    let attrs = attr_files(&db, a);
     assert!(!attrs.contains(&given), "a crate attribute took {given:?}");
-    let after = db.new_file_id().expect("another unused file ID");
+    let after = new_file_id(&mut db);
     assert!(after != given && !attrs.contains(&after) && !files.contains(&after));
 
     // A reload's new files, set after the graph, are not refused as an attribute's.
-    db.set_file_text(given, "fn f() {}");
-    db.set_file_text(after, "fn g() {}");
+    db.commit_with(|edit| {
+        edit.set_file_text(given, "fn f() {}").set_file_text(after, "fn g() {}");
+    });
     assert_eq!(attr_texts(&db, a), ["#![no_std]", "#![feature(x)]"]);
 }
 
@@ -442,12 +759,14 @@ fn a_crate_attr_is_one_attribute_or_rustcs_error() {
         ("a = ", Some(CrateAttrError::Syntax)),
         ("\"a", Some(CrateAttrError::Syntax)),
     ];
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
-    let attrs: Vec<&str> = cases.iter().map(|(attr, _)| *attr).collect();
-    let a = set_attrs(&mut db, &files, &attrs);
+    let mut attrs = Vec::new_in(Global);
+    attrs.extend(cases.iter().map(|(attr, _)| *attr));
+    let (a, _) = set_attrs(&mut db, &files, &attrs);
+    let a = db.krate(a);
     let attr_files = crate::crate_attr_files(&db, a);
-    let mut applied = Vec::new();
+    let mut applied = Vec::new_in(Global);
     for (&(attr, want), &file) in cases.iter().zip(attr_files) {
         assert_eq!(crate::crate_attr_error(&db, file), want, "{attr:?}");
         if want.is_none() {
@@ -463,11 +782,38 @@ fn checkout(db: &mut Db) -> (AbsPathBuf, FileSetConfig) {
     let base = AbsPathBuf::assert_utf8(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("blaze-base-db-view"));
     let mut partition = FileSetConfig::builder();
     partition.add_file_set(vec![VfsPath::from(base.clone())]);
+    let mut edit = db.edit();
     for root in [0, 1] {
         let empty = Arc::new(SourceRoot::new_local(FileSet::default()));
-        db.set_source_root_with_durability(SourceRootId(root), empty, Durability::MEDIUM);
+        edit.set_source_root(SourceRootId(root), empty);
     }
+    _ = edit.commit();
     (base, partition.build())
+}
+
+/// Asserts `committed` dropped no arena: what an edit that changes nothing does.
+#[track_caller]
+pub(crate) fn assert_dropped_nothing(committed: &Committed, what: &str) {
+    assert!(committed.dropped.is_empty(), "{what} dropped arenas {:?}", committed.dropped);
+}
+
+/// An alias of `of`, made and committed.
+fn make_alias(db: &mut Db, of: FileId) -> Result<FileId, crate::AliasError> {
+    db.edit_with(|edit| edit.alias(of)).0
+}
+
+/// [`Edit::set_alias_appended`], committed.
+fn set_alias_appended(
+    db: &mut Db,
+    alias: FileId,
+    appended: Option<(&'static str, &'static str)>,
+) -> (Result<(), crate::AliasError>, Committed) {
+    db.edit_with(|edit| edit.set_alias_appended(alias, appended))
+}
+
+/// A file ID no file has, taken and committed.
+fn new_file_id(db: &mut Db) -> FileId {
+    db.edit_with(|edit| edit.new_file_id()).0.expect("an unused file ID")
 }
 
 /// `bytes` in an allocation of their own, as blaze-vfs holds a heap file.
@@ -485,16 +831,22 @@ fn set_view(
     partition: &FileSetConfig,
     files: &[(&str, &[u8])],
 ) -> Result<ViewChange, ViewError> {
-    let bytes: Vec<blaze_vfs::Bytes> = files.iter().map(|&(_, bytes)| vfs_bytes(bytes)).collect();
-    let files: Vec<ViewFile<'_>> =
-        files.iter().zip(&bytes).map(|(&(path, _), bytes)| view_file(path, bytes)).collect();
-    db.set_view_root(ViewRoot {
-        base,
-        built: &[],
-        partition,
-        other: SourceRootId(1),
-        files: &files,
-    })
+    set_view_committed(db, base, partition, files).0
+}
+
+/// [`set_view`], with what its commit did.
+fn set_view_committed(
+    db: &mut Db,
+    base: &AbsPathBuf,
+    partition: &FileSetConfig,
+    files: &[(&str, &[u8])],
+) -> (Result<ViewChange, ViewError>, Committed) {
+    let mut bytes = Vec::new_in(Global);
+    bytes.extend(files.iter().map(|&(_, bytes)| vfs_bytes(bytes)));
+    let mut views = Vec::new_in(Global);
+    views.extend(files.iter().zip(&bytes).map(|(&(path, _), bytes)| view_file(path, bytes)));
+    let view = ViewRoot { base, built: &[], partition, other: SourceRootId(1), files: &views };
+    db.edit_with(|edit| edit.set_view_root(view))
 }
 
 fn file_at(db: &Db, base: &AbsPathBuf, path: &str) -> Option<FileId> {
@@ -507,20 +859,19 @@ const VIEW: &[(&str, &[u8])] =
 
 #[test]
 fn setting_a_view_twice_writes_nothing() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     let first = set_view(&mut db, &base, &partition, VIEW).unwrap();
     assert_eq!(first.added.len(), 3);
-    assert_eq!(first.roots, vec![SourceRootId(0)]);
+    assert_eq!(first.roots, [SourceRootId(0)]);
     let a = file_at(&db, &base, "src/a.rs").unwrap();
     assert_eq!(&**db.file_text(a).text(&db), "fn f() {}");
     assert_eq!(db.file_source_root(a).source_root_id(&db), SourceRootId(0));
 
-    let then = revision(&db);
     let root = db.source_root(SourceRootId(0)).content(&db);
-    let second = set_view(&mut db, &base, &partition, VIEW).unwrap();
-    assert_eq!(second, ViewChange::default());
-    assert_eq!(revision(&db), then);
+    let (second, committed) = set_view_committed(&mut db, &base, &partition, VIEW);
+    assert_eq!(second.unwrap(), ViewChange::default());
+    assert_dropped_nothing(&committed, "the same view again");
     assert_eq!(db.source_root(SourceRootId(0)).content(&db), root);
 }
 
@@ -529,13 +880,14 @@ fn setting_a_view_twice_writes_nothing() {
 /// Control: the checked entry refuses a lying ID, so the two differ only by the hash.
 #[test]
 fn a_view_from_a_tree_writes_what_a_checked_view_writes() {
-    let mut checked = Db::for_tests();
-    let mut from_tree = Db::for_tests();
+    let mut checked = test_db();
+    let mut from_tree = test_db();
     let (base, partition) = checkout(&mut checked);
     checkout(&mut from_tree);
-    let bytes: Vec<blaze_vfs::Bytes> = VIEW.iter().map(|&(_, bytes)| vfs_bytes(bytes)).collect();
-    let files: Vec<ViewFile<'_>> =
-        VIEW.iter().zip(&bytes).map(|(&(path, _), bytes)| view_file(path, bytes)).collect();
+    let mut bytes = Vec::new_in(Global);
+    bytes.extend(VIEW.iter().map(|&(_, bytes)| vfs_bytes(bytes)));
+    let mut files = Vec::new_in(Global);
+    files.extend(VIEW.iter().zip(&bytes).map(|(&(path, _), bytes)| view_file(path, bytes)));
     let view = ViewRoot {
         base: &base,
         built: &[],
@@ -543,8 +895,8 @@ fn a_view_from_a_tree_writes_what_a_checked_view_writes() {
         other: SourceRootId(1),
         files: &files,
     };
-    let a = checked.set_view_root(view).unwrap();
-    let b = from_tree.set_view_root_from_tree(view).unwrap();
+    let a = checked.edit_with(|edit| edit.set_view_root(view)).0.unwrap();
+    let b = from_tree.edit_with(|edit| edit.set_view_root_from_tree(view)).0.unwrap();
     assert_eq!(a, b);
     for &(path, text) in VIEW {
         let x = file_at(&checked, &base, path).unwrap();
@@ -554,9 +906,9 @@ fn a_view_from_a_tree_writes_what_a_checked_view_writes() {
         assert_eq!(from_tree.file_text(y).text(&from_tree).as_bytes(), text, "{path}");
         assert_eq!(checked.file_content(x), from_tree.file_content(y), "{path}");
     }
-    let then = revision(&from_tree);
-    assert_eq!(from_tree.set_view_root_from_tree(view).unwrap(), ViewChange::default());
-    assert_eq!(revision(&from_tree), then);
+    let (again, committed) = from_tree.edit_with(|edit| edit.set_view_root_from_tree(view));
+    assert_eq!(again.unwrap(), ViewChange::default());
+    assert_dropped_nothing(&committed, "the same view from a tree again");
 
     // Control: an ID that is not its bytes' is refused where IDs are checked (a new ID, so the
     // file is not skipped as unchanged before its bytes are hashed).
@@ -564,12 +916,13 @@ fn a_view_from_a_tree_writes_what_a_checked_view_writes() {
     let other = ContentId::of(blaze_vfs::FILE_DOMAIN, b"fn h() {}");
     let lying = [files[0], ViewFile { path: "src/a.rs", id: other, bytes: &edited }, files[2]];
     let lie = ViewRoot { files: &lying, ..view };
-    assert!(matches!(checked.set_view_root(lie), Err(ViewError::Mismatch { .. })));
+    let refused = checked.edit_with(|edit| edit.set_view_root(lie)).0;
+    assert!(matches!(refused, Err(ViewError::Mismatch { .. })));
 }
 
 #[test]
 fn a_views_text_is_its_bytes() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     let bytes = vfs_bytes(b"fn f() {}");
     let files = [view_file("src/lib.rs", &bytes)];
@@ -580,7 +933,7 @@ fn a_views_text_is_its_bytes() {
         other: SourceRootId(1),
         files: &files,
     };
-    db.set_view_root(view).unwrap();
+    db.edit_with(|edit| edit.set_view_root(view)).0.unwrap();
     let file = file_at(&db, &base, "src/lib.rs").unwrap();
     let text = db.file_text(file).text(&db);
     assert!(std::ptr::eq(text.as_ptr(), bytes.as_ptr()), "a copy of the view's bytes");
@@ -588,7 +941,7 @@ fn a_views_text_is_its_bytes() {
 
 #[test]
 fn a_view_with_one_changed_file_sets_that_one() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     set_view(&mut db, &base, &partition, VIEW).unwrap();
     let a = file_at(&db, &base, "src/a.rs").unwrap();
@@ -605,7 +958,7 @@ fn a_view_with_one_changed_file_sets_that_one() {
 
 #[test]
 fn a_view_without_a_file_takes_it_out_of_its_source_root() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     set_view(&mut db, &base, &partition, VIEW).unwrap();
     let readme = file_at(&db, &base, "README.md").unwrap();
@@ -623,7 +976,7 @@ fn a_view_without_a_file_takes_it_out_of_its_source_root() {
 
 #[test]
 fn bytes_that_are_not_utf8_are_a_file_without_text() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     let binary: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", &[0xff, 0xfe])];
     let change = set_view(&mut db, &base, &partition, binary).unwrap();
@@ -648,50 +1001,47 @@ fn bytes_that_are_not_utf8_are_a_file_without_text() {
 /// has text. The same bytes give the same content, however the file got them.
 #[test]
 fn the_bytes_of_a_file_without_text_are_its_content() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     let root = |db: &Db| db.source_root(SourceRootId(0)).content(db);
     let first: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", &[0xff, 0xfe])];
     set_view(&mut db, &base, &partition, first).unwrap();
     let data = file_at(&db, &base, "data.bin").unwrap();
-    let raw = db.raw_file(data).expect("the loader keeps the bytes of a file without text");
-    assert_eq!(raw.bytes(&db).map(|it| &it[..]), Some(&[0xff, 0xfe][..]));
+    // The handle is the snapshot's: asked for again after each commit.
+    let bytes = |db: &Db| -> Option<Vec<u8, Global>> {
+        let raw = db.raw_file(data)?;
+        let mut out = Vec::new_in(Global);
+        out.extend_from_slice(&raw.bytes(db)?[..]);
+        Some(out)
+    };
+    assert_eq!(bytes(&db).as_deref(), Some(&[0xff, 0xfe][..]), "the loader keeps the bytes");
     let (content, root_was) = (db.file_content(data), root(&db));
     assert_eq!(content, crate::IncludedFile::content_of(Ok(&[0xff, 0xfe][..])));
-    assert_eq!(
-        set_view(&mut db, &base, &partition, first).unwrap(),
-        ViewChange::default(),
-        "the same bytes write nothing"
-    );
+    let (again, committed) = set_view_committed(&mut db, &base, &partition, first);
+    assert_eq!(again.unwrap(), ViewChange::default(), "the same bytes write nothing");
+    assert_dropped_nothing(&committed, "the same bytes again");
 
     let edited: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", &[0xff, 0xfd])];
     let change = set_view(&mut db, &base, &partition, edited).unwrap();
     assert_eq!((change.set, change.no_text), (vec![data], vec![data]));
-    assert_eq!(db.raw_file(data), Some(raw), "one input, set again");
-    assert_eq!(raw.bytes(&db).map(|it| &it[..]), Some(&[0xff, 0xfd][..]));
+    assert_eq!(bytes(&db).as_deref(), Some(&[0xff, 0xfd][..]));
     assert_ne!(db.file_content(data), content);
     assert_ne!(root(&db), root_was, "the source root's content moves with the bytes");
 
     let text: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", b"now text")];
     set_view(&mut db, &base, &partition, text).unwrap();
-    assert_eq!(db.raw_file(data), None);
+    assert_eq!(bytes(&db), None, "a file with text has no bytes input");
     assert_eq!(db.file_content(data), db.file_text(data).content(&db));
-    assert_ne!(
-        raw.bytes(&db).map(|it| &it[..]),
-        Some(&[0xff, 0xfd][..]),
-        "what read the bytes reruns"
-    );
 
     set_view(&mut db, &base, &partition, first).unwrap();
-    assert_eq!(db.raw_file(data), Some(raw), "the input comes back");
+    assert_eq!(bytes(&db).as_deref(), Some(&[0xff, 0xfe][..]), "the input comes back");
     assert_eq!((db.file_content(data), root(&db)), (content, root_was));
 }
 
 #[test]
 fn a_content_id_that_is_not_its_bytes_is_refused() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
-    let then = revision(&db);
     let (lib, main) = (vfs_bytes(b"mod a;"), vfs_bytes(b"fn main() {}"));
     let files = [
         view_file("src/lib.rs", &lib),
@@ -708,9 +1058,10 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
         other: SourceRootId(1),
         files: &files,
     };
-    let error = db.set_view_root(view).unwrap_err();
+    let (refused, committed) = db.edit_with(|edit| edit.set_view_root(view));
+    let error = refused.unwrap_err();
     assert!(matches!(&error, ViewError::Mismatch { path, .. } if path == "src/main.rs"));
-    assert_eq!(revision(&db), then);
+    assert_dropped_nothing(&committed, "a refused view");
     assert_eq!(file_at(&db, &base, "src/lib.rs"), None);
 }
 
@@ -719,19 +1070,19 @@ fn aliased_view(db: &mut Db) -> (AbsPathBuf, FileSetConfig, FileId, FileId) {
     let (base, partition) = checkout(db);
     set_view(db, &base, &partition, VIEW).unwrap();
     let lib = file_at(db, &base, "src/lib.rs").unwrap();
-    let alias = db.alias(lib).unwrap();
+    let alias = make_alias(db, lib).unwrap();
     (base, partition, lib, alias)
 }
 
 #[test]
 fn an_alias_is_found_by_its_file_never_by_its_path() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     set_view(&mut db, &base, &partition, VIEW).unwrap();
     let lib = file_at(&db, &base, "src/lib.rs").unwrap();
     let a = file_at(&db, &base, "src/a.rs").unwrap();
     let content = db.source_root(SourceRootId(0)).content(&db);
-    let alias = db.alias(lib).unwrap();
+    let alias = make_alias(&mut db, lib).unwrap();
     assert_ne!(alias, lib);
 
     let root = db.source_root(SourceRootId(0)).source_root(&db);
@@ -760,7 +1111,7 @@ fn an_alias_is_found_by_its_file_never_by_its_path() {
 
 #[test]
 fn a_view_set_again_keeps_every_alias() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition, lib, alias) = aliased_view(&mut db);
     let path = VfsPath::from(base.join("src/lib.rs"));
     // A view that adds a file rebuilds nothing of the alias, and one the same again writes nothing.
@@ -778,18 +1129,18 @@ fn a_view_set_again_keeps_every_alias() {
         assert_eq!(root.file_for_path(&path), Some(&lib));
         assert_eq!(&**db.file_text(alias).text(&db), "mod a;");
     }
-    let then = revision(&db);
-    assert_eq!(set_view(&mut db, &base, &partition, VIEW).unwrap(), ViewChange::default());
-    assert_eq!(revision(&db), then);
+    let (again, committed) = set_view_committed(&mut db, &base, &partition, VIEW);
+    assert_eq!(again.unwrap(), ViewChange::default());
+    assert_dropped_nothing(&committed, "the same view again");
 }
 
 #[test]
 fn an_edit_of_a_root_reaches_every_alias_of_it() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition, lib, first) = aliased_view(&mut db);
-    let second = db.alias(lib).unwrap();
+    let second = make_alias(&mut db, lib).unwrap();
     assert_eq!(db.files().aliases_of(lib).as_slice(), &[first, second]);
-    db.set_alias_appended(second, Some(("__harness", "\nmod __harness {}"))).unwrap();
+    set_alias_appended(&mut db, second, Some(("__harness", "\nmod __harness {}"))).0.unwrap();
 
     let edited: &[(&str, &[u8])] =
         &[("src/lib.rs", b"mod a; mod b;"), ("src/a.rs", b"fn f() {}"), ("README.md", b"hello")];
@@ -811,7 +1162,9 @@ fn an_edit_of_a_root_reaches_every_alias_of_it() {
     assert_eq!(&**db.file_text(lib).text(&db), "mod a; mod b;");
     assert_eq!(db.file_text(lib).appended_root_module(&db), None);
 
-    db.set_file_text(lib, "mod c;");
+    db.commit_with(|edit| {
+        edit.set_file_text(lib, "mod c;");
+    });
     assert_eq!(&**db.file_text(first).text(&db), "mod c;");
     assert_eq!(&**db.file_text(second).text(&db), "mod c;\nmod __harness {}");
     assert_eq!(db.file_text(second).appended_root_module(&db), Some("__harness"));
@@ -819,7 +1172,7 @@ fn an_edit_of_a_root_reaches_every_alias_of_it() {
 
 #[test]
 fn an_alias_owns_its_suffix() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (_, _, lib, alias) = aliased_view(&mut db);
     let shared = db.file_text(lib).text(&db).as_ptr();
     assert!(
@@ -827,35 +1180,37 @@ fn an_alias_owns_its_suffix() {
         "with no suffix it shares the bytes"
     );
 
-    db.set_alias_appended(alias, Some(("__list", "\nmod __list {}"))).unwrap();
+    set_alias_appended(&mut db, alias, Some(("__list", "\nmod __list {}"))).0.unwrap();
     assert_eq!(&**db.file_text(alias).text(&db), "mod a;\nmod __list {}");
     assert_eq!(db.file_text(alias).appended_root_module(&db), Some("__list"));
     assert_eq!(&**db.file_text(lib).text(&db), "mod a;", "the file is as on disk");
-    let then = revision(&db);
-    db.set_alias_appended(alias, Some(("__list", "\nmod __list {}"))).unwrap();
-    assert_eq!(revision(&db), then, "the same suffix again writes nothing");
+    let (again, committed) = set_alias_appended(&mut db, alias, Some(("__list", "\nmod __list {}")));
+    again.unwrap();
+    assert_dropped_nothing(&committed, "the same suffix again");
 
-    db.set_alias_appended(alias, None).unwrap();
+    set_alias_appended(&mut db, alias, None).0.unwrap();
     assert_eq!(&**db.file_text(alias).text(&db), "mod a;");
     assert_eq!(db.file_text(alias).appended_root_module(&db), None);
     assert_eq!(db.file_text(alias).content(&db), db.file_text(lib).content(&db));
-    assert_eq!(db.set_alias_appended(lib, None), Err(crate::AliasError::NotAnAlias(lib)));
+    assert_eq!(set_alias_appended(&mut db, lib, None).0, Err(crate::AliasError::NotAnAlias(lib)));
 }
 
 #[test]
 #[should_panic = "set_alias_appended"]
 fn an_aliass_module_is_set_with_its_suffix() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (_, _, _, alias) = aliased_view(&mut db);
-    db.set_appended_root_module(alias, Some("__harness"), Durability::LOW);
+    db.commit_with(|edit| {
+        edit.set_appended_root_module(alias, Some("__harness"));
+    });
 }
 
 #[test]
 fn a_file_gone_takes_its_aliases_with_it() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition, lib, alias) = aliased_view(&mut db);
     let change = set_view(&mut db, &base, &partition, &VIEW[1..]).unwrap();
-    let mut removed = vec![lib, alias];
+    let mut removed = [lib, alias];
     removed.sort();
     assert_eq!(change.removed, removed);
     assert!(!db.has_file_text(alias));
@@ -868,7 +1223,7 @@ fn a_file_gone_takes_its_aliases_with_it() {
     set_view(&mut db, &base, &partition, VIEW).unwrap();
     assert_eq!(file_at(&db, &base, "src/lib.rs"), Some(lib));
     assert!(db.files().aliases_of(lib).is_empty());
-    let again = db.alias(lib).unwrap();
+    let again = make_alias(&mut db, lib).unwrap();
     assert_ne!(
         again, alias,
         "a gone alias's ID keeps its parked text, so it is not handed out again"
@@ -877,9 +1232,9 @@ fn a_file_gone_takes_its_aliases_with_it() {
 
 #[test]
 fn a_root_set_whole_keeps_its_aliases() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
-    let alias = db.alias(files[0]).unwrap();
+    let alias = make_alias(&mut db, files[0]).unwrap();
     // `load` again sets source root 0 to a set made from scratch.
     load(&mut db, 0, FILES);
     let root = db.source_root(SourceRootId(0)).source_root(&db);
@@ -890,20 +1245,22 @@ fn a_root_set_whole_keeps_its_aliases() {
 
 #[test]
 fn an_alias_is_of_a_file_with_a_path() {
-    let mut db = Db::for_tests();
-    let (_, _, lib, alias) = aliased_view(&mut db);
-    assert_eq!(db.alias(alias), Err(crate::AliasError::OfAnAlias(alias)));
-    let nowhere = db.new_file_id().unwrap();
-    assert_eq!(db.alias(nowhere), Err(crate::AliasError::NotInASourceRoot(nowhere)));
-    assert_eq!(db.files().aliases_of(lib).as_slice(), &[alias]);
+    let mut db = test_db();
+    let (_, _, lib, of) = aliased_view(&mut db);
+    assert_eq!(make_alias(&mut db, of), Err(crate::AliasError::OfAnAlias(of)));
+    let nowhere = new_file_id(&mut db);
+    assert_eq!(make_alias(&mut db, nowhere), Err(crate::AliasError::NotInASourceRoot(nowhere)));
+    assert_eq!(db.files().aliases_of(lib).as_slice(), &[of]);
 }
 
 #[test]
 #[should_panic = "is an alias of"]
 fn an_aliass_text_is_its_files() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (_, _, _, alias) = aliased_view(&mut db);
-    db.set_file_text(alias, "fn other() {}");
+    db.commit_with(|edit| {
+        edit.set_file_text(alias, "fn other() {}");
+    });
 }
 
 #[test]
@@ -1009,9 +1366,8 @@ fn threads_pushing_to_a_log_each_get_their_own_index() {
 }
 
 #[test]
-fn a_log_and_a_column_give_back_what_was_put() {
-    use crate::table::{Column, Log};
-    use blaze_query::db::Id;
+fn a_log_gives_back_what_was_put() {
+    use crate::table::Log;
 
     let log: Log<u32> = Log::new(1 << 16);
     for value in 0..5_000u32 {
@@ -1022,46 +1378,29 @@ fn a_log_and_a_column_give_back_what_was_put() {
     }
     assert_eq!(log.get(5_000), None);
     assert!(log.iter().copied().eq((0..5_000).map(|it| it * 3)));
-
-    let column: Column<Id> = Column::new();
-    let mut model = std::collections::BTreeMap::new();
-    let mut rng = Rng::new(11);
-    for _ in 0..10_000 {
-        let raw = rng.below(1 << 16) as u32;
-        if rng.below(4) == 0 {
-            column.set(raw, None);
-            model.remove(&raw);
-        } else {
-            let id = Id::from_u32(rng.below(u64::from(Id::MAX_U32)) as u32 + 1);
-            column.set(raw, Some(id));
-            model.insert(raw, id);
-        }
-    }
-    for raw in 0..1 << 16 {
-        assert_eq!(column.get(raw), model.get(&raw).copied(), "{raw}");
-    }
-    assert_eq!(column.get(Column::<Id>::MAX + 1), None);
-    assert!(column.iter().eq(model.iter().map(|(&raw, &id)| (raw, id))));
 }
 
 #[test]
 fn what_queries_note_is_kept_once_and_sorted() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let c = add(&mut graph, files[2], CfgOptions::default(), Env::default());
-    let crates = graph.set_in_db(&mut db);
+    let crates = set_graph(&mut db, graph);
     let (a, c) = (crates[&a], crates[&c]);
-    for (krate, key) in [(c, "B"), (a, "B"), (a, "A"), (c, "B"), (a, "B")] {
-        db.files().env_is_read(krate, key);
+    let (crate_a, crate_c) = (db.krate(a), db.krate(c));
+    for (krate, key) in [(crate_c, "B"), (crate_a, "B"), (crate_a, "A"), (crate_c, "B"), (crate_a, "B")] {
+        db.env_is_read(krate, key);
     }
-    db.files().env_is_unset(a, "X");
-    db.files().env_is_unset(a, "X");
-    let mut expected = vec![(a, "A".to_owned()), (a, "B".to_owned()), (c, "B".to_owned())];
+    db.env_is_unset(crate_a, "X");
+    db.env_is_unset(crate_a, "X");
+    // What was noted is kept by crate key: it outlives the arena of the crate that read it.
+    let mut expected = Vec::new_in(Global);
+    expected.extend([(a, "A".to_owned()), (a, "B".to_owned()), (c, "B".to_owned())]);
     expected.sort();
     assert_eq!(db.files().env_read(), expected);
-    assert_eq!(db.files().env_unset(), vec![(a, "X".to_owned())]);
+    assert_eq!(db.files().env_unset(), [(a, "X".to_owned())]);
 
     let held = blaze_core::temp::TempDir::for_test("blaze-base-db-included-");
     let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
@@ -1071,9 +1410,9 @@ fn what_queries_note_is_kept_once_and_sorted() {
     }
     assert_eq!(
         db.files().included_sources(),
-        vec![(x.clone(), SourceRootId(0)), (y.clone(), SourceRootId(0))]
+        [(x.clone(), SourceRootId(0)), (y.clone(), SourceRootId(0))]
     );
-    let mut named = vec![(a, y.clone()), (c, x.clone()), (c, y.clone())];
+    let mut named = [(a, y.clone()), (c, x.clone()), (c, y.clone())];
     named.sort();
     assert_eq!(db.files().sources_included_by(), named);
 }
@@ -1082,16 +1421,17 @@ fn what_queries_note_is_kept_once_and_sorted() {
 /// (rustc's "couldn't read" message prints them), and a different error is a different input.
 #[test]
 fn an_unreadable_included_file_keeps_its_error() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
-    let a = graph.set_in_db(&mut db)[&a];
+    let a = set_graph(&mut db, graph)[&a];
     let held = blaze_core::temp::TempDir::for_test("blaze-base-db-unreadable-");
     let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let missing = dir.join("blaze-base-db-unreadable-include.rs");
     let read = |path: &AbsPathBuf| {
-        let file = db.files().included_file(&db, a, path, Durability::LOW);
+        let disk = db.files().disk().expect("a test database reads the disk");
+        let file = db.files().included_file(disk, &db, a, path);
         (file.read(&db).clone(), file.content(&db))
     };
     let expected = |path: &AbsPathBuf| std::fs::read(path).unwrap_err().to_string();
@@ -1100,7 +1440,47 @@ fn an_unreadable_included_file_keeps_its_error() {
     assert_eq!(missing_read.unwrap_err().to_string(), expected(&missing));
     assert_eq!(dir_read.unwrap_err().to_string(), expected(&dir));
     assert_ne!(missing_content, dir_content, "a different error is a different input");
-    assert!(db.files().included_is_read(&db, &missing, &Looks::none()), "the same error is what was read");
+    let disk = db.files().disk().expect("a test database reads the disk");
+    assert!(db.files().included_is_read(disk, &db, &missing, &Looks::none()), "the same error is what was read");
+}
+
+/// The invariant: a read of an included file is listed under its own kind
+/// ([`crate::INCLUDED_READ`]), not the wider kind of every read around the inputs, in a
+/// database that keeps read lists ([`Db::for_tests_with_reads`]); one that keeps none
+/// ([`Db::for_tests`]) refuses to record.
+#[test]
+fn an_included_files_read_is_listed_under_its_own_kind() {
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-included-kind-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
+    let path = dir.join("blaze-base-db-included-kind.rs");
+    std::fs::write(&path, "fn included() {}\n").expect("a file in the test's own directory");
+
+    let mut db = Db::for_tests_with_reads(no_boundaries);
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let a = set_graph(&mut db, graph)[&a];
+    let disk = db.files().disk().expect("a test database reads the disk");
+    let file = db.files().included_file(disk, &db, a, &path);
+    let ((), reads) = blaze_memo::record(blaze_memo::Database::memo(&db), || {
+        _ = file.content(&db);
+    })
+    .unwrap_or_else(|off| panic!("a database made to keep read lists: {off}"));
+    let kinds = |kind: blaze_memo::KindId| {
+        reads.iter().filter(|read| matches!(read, blaze_memo::Read::Input { kind: it, .. } if *it == kind)).count()
+    };
+    assert_eq!(kinds(crate::INCLUDED_READ), 1, "{reads:?}");
+    assert_eq!(kinds(blaze_memo::KindId::of(&blaze_memo::AROUND_INPUTS)), 0, "{reads:?}");
+
+    // The control: the same read in a database that keeps no read lists is not recorded.
+    let mut off = test_db();
+    let files = load(&mut off, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let a = set_graph(&mut off, graph)[&a];
+    let disk = off.files().disk().expect("a test database reads the disk");
+    let file = off.files().included_file(disk, &off, a, &path);
+    assert!(blaze_memo::record(blaze_memo::Database::memo(&off), || _ = file.content(&off)).is_err());
 }
 
 /// The view a seed makes at a step: some of a fixed set of paths, each with one of a few
@@ -1145,7 +1525,7 @@ fn view_state(
 #[test]
 fn a_view_set_over_others_is_the_view_set_alone() {
     let mut rng = Rng::new(3);
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     let built = [base.join("target")];
     let mut every_path: Vec<String> = Vec::new();
@@ -1165,7 +1545,7 @@ fn a_view_set_over_others_is_the_view_set_alone() {
             other: SourceRootId(1),
             files: &files,
         };
-        let change = db.set_view_root(root).unwrap();
+        let change = db.edit_with(|edit| edit.set_view_root(root)).0.unwrap();
 
         // What the change says, from the two views alone. A file under `target` is built: one
         // the view lacks stays; one it has is set like any other.
@@ -1226,7 +1606,7 @@ fn a_view_set_over_others_is_the_view_set_alone() {
                 every_path.push(path.clone());
             }
         }
-        let mut fresh = Db::for_tests();
+        let mut fresh = test_db();
         let (fresh_base, fresh_partition) = checkout(&mut fresh);
         let fresh_files: Vec<(&str, &[u8])> =
             whole.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
@@ -1245,26 +1625,26 @@ fn two_workers() -> blaze_graph::pool::Pool {
 }
 
 #[test]
-fn a_task_that_waited_on_itself_runs_again() {
-    let db = Db::new();
+fn a_task_that_gave_way_runs_again() {
+    let db = Db::new(no_boundaries, blaze_memo::Reads::Off);
     let pool = two_workers();
-    let runs: Vec<AtomicUsize> = (0..8).map(|_| AtomicUsize::new(0)).collect();
+    let mut runs = Vec::new_in(Global);
+    runs.extend((0..8).map(|_| AtomicUsize::new(0)));
     pool.install(|| {
         db.run_all(blaze_mem::Tag::Parse, runs.len(), |_: &Db, at: usize| {
             if runs[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
-                std::panic::resume_unwind(Box::new(
-                    blaze_query::db::Cancelled::WouldWaitOnItself { asked: None },
-                ));
+                blaze_memo::Cancelled::GaveWay.throw();
             }
         });
     });
-    let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
-    assert_eq!(runs, [2, 1, 1, 2, 1, 1, 2, 1]);
+    let mut counts = Vec::new_in(Global);
+    counts.extend(runs.iter().map(|it| it.load(Ordering::Relaxed)));
+    assert_eq!(counts, [2, 1, 1, 2, 1, 1, 2, 1]);
 }
 
 #[test]
 fn any_other_panic_of_a_task_reaches_the_caller() {
-    let db = Db::new();
+    let db = Db::new(no_boundaries, blaze_memo::Reads::Off);
     let pool = two_workers();
     let ran = AtomicUsize::new(0);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1284,7 +1664,7 @@ fn any_other_panic_of_a_task_reaches_the_caller() {
 #[test]
 fn a_private_dependency_reads_back_private_and_changes_the_id() {
     let crate_id = |private: bool| {
-        let mut db = Db::for_tests();
+        let mut db = test_db();
         let files = load(&mut db, 0, FILES);
         let mut graph = CrateGraphBuilder::default();
         let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
@@ -1292,7 +1672,8 @@ fn a_private_dependency_reads_back_private_and_changes_the_id() {
         let dependency =
             DependencyBuilder::new(CrateName::new("c").unwrap(), c).with_private(private);
         graph.add_dep(a, dependency).unwrap();
-        let a = graph.set_in_db(&mut db)[&a];
+        let key = set_graph(&mut db, graph)[&a];
+        let a = db.krate(key);
         assert_eq!(a.data(&db).dependencies[0].is_private(), private);
         a.content(&db)
     };
@@ -1300,19 +1681,24 @@ fn a_private_dependency_reads_back_private_and_changes_the_id() {
     assert_ne!(crate_id(true), public);
     assert_eq!(crate_id(false), public);
 
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let c = add(&mut graph, files[2], CfgOptions::default(), Env::default());
-    let crates = graph.set_in_db(&mut db);
-    let (a, c): (Crate, Crate) = (crates[&a], crates[&c]);
+    let crates = set_graph(&mut db, graph);
+    let (a, c): (CrateKey, CrateKey) = (crates[&a], crates[&c]);
     let depend_on = |db: &mut Db, private: bool| {
-        let mut data = a.data(&*db).clone();
+        let mut data = db.krate(a).data(&*db).keyed(&*db);
         let name = CrateName::new("c").unwrap();
-        data.dependencies = vec![BuiltDependency::new(name, c).with_private(private)];
-        a.set_data(db, data);
-        (a.data(&*db).dependencies[0].is_private(), a.content(&*db), all_crates_content(&*db))
+        let mut dependencies = Vec::new_in(Global);
+        dependencies.push(keyed_dep(name, c, true, false).with_private(private));
+        data.dependencies = dependencies;
+        db.commit_with(|edit| {
+            edit.set_crate_data(a, data);
+        });
+        let krate = db.krate(a);
+        (krate.data(&*db).dependencies[0].is_private(), krate.content(&*db), all_crates_content(&*db))
     };
     let (read, public, graph_public) = depend_on(&mut db, false);
     assert!(!read);
@@ -1353,56 +1739,56 @@ fn targets_differing_in_the_tuple_or_thumb_interworking_have_different_ids() {
     assert_ne!(workspace(interworking.clone()), workspace(without.clone()));
 
     let crate_id = |target: TargetData| {
-        let mut db = Db::for_tests();
+        let mut db = test_db();
         let files = load(&mut db, 0, FILES);
         let mut graph = CrateGraphBuilder::default();
         let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
-        let a = graph.set_in_db(&mut db)[&a];
+        let a = set_graph(&mut db, graph)[&a];
         let workspace = CrateWorkspaceData {
             target: Ok(target),
             toolchain: None,
             const_eval: Default::default(),
             trusted: Box::default(),
         };
-        a.set_workspace_data(&mut db, Arc::new(workspace));
-        a.content(&db)
+        db.commit_with(|edit| {
+            edit.set_crate_workspace_data(a, Arc::new(workspace));
+        });
+        db.krate(a).content(&db)
     };
     assert_ne!(crate_id(interworking), crate_id(without));
 }
 
-/// Puts `files` (ID, path, text) in source root `root`.
+/// Puts `files` (ID, path, text) in source root `root`, and commits.
 fn put_root(db: &mut Db, root: u32, files: &[(FileId, &str, &str)]) {
     let mut set = FileSet::default();
+    let mut edit = db.edit();
     for &(id, path, text) in files {
-        db.set_file_text_with_durability(id, text, Durability::LOW);
-        db.set_file_source_root_with_durability(id, SourceRootId(root), Durability::MEDIUM);
+        edit.set_file_text(id, text).set_file_source_root(id, SourceRootId(root));
         set.insert(id, VfsPath::new_virtual_path(path.to_owned()));
     }
-    let set = Arc::new(SourceRoot::new_local(set));
-    db.set_source_root_with_durability(SourceRootId(root), set, Durability::MEDIUM);
+    edit.set_source_root(SourceRootId(root), Arc::new(SourceRoot::new_local(set)));
+    _ = edit.commit();
 }
 
-thread_local! {
-    static SHARED_MODULE_RUNS: Cell<usize> = const { Cell::new(0) };
+/// How many runs of the tracked fn `name` (the last segment of its path) `db`'s run log holds,
+/// emptying it: the runs since the last call.
+pub(crate) fn ran(db: &Db, name: &str) -> usize {
+    let runs = db.runs().expect("a test database keeps a run log").take();
+    runs.iter().filter(|it| it.query.rsplit("::").next() == Some(name)).count()
 }
 
 /// What a `#[path = "../../shared/m.rs"] mod m;` in `anchor` reads: the file and its text's
 /// length, as a def map would.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn shared_module(db: &Db, anchor: EditionedFileId) -> Option<(u32, u32)> {
-    SHARED_MODULE_RUNS.with(|it| it.set(it.get() + 1));
     let (anchor, _) = anchor.unpack(db);
     let file = db.resolve_path(AnchoredPath { anchor, path: "../../shared/m.rs" })?;
     Some((file.index(), db.file_text(file).text(db).len() as u32))
 }
 
-fn shared_module_runs() -> usize {
-    SHARED_MODULE_RUNS.with(Cell::get)
-}
-
 #[test]
 fn a_path_module_outside_its_package_resolves_and_its_edit_reruns_the_reader() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (lib, own, m) = (FileId::from_raw(0), FileId::from_raw(1), FileId::from_raw(2));
     put_root(
         &mut db,
@@ -1413,50 +1799,43 @@ fn a_path_module_outside_its_package_resolves_and_its_edit_reruns_the_reader() {
         ],
     );
     put_root(&mut db, 1, &[(m, "/ws/shared/m.rs", "pub fn f() {}")]);
+    // The file's id is homed with its text: made again in each snapshot.
+    let read = |db: &Db| shared_module(db, EditionedFileId::new(db, lib, Edition::Edition2021));
 
     // The anchor's own source root first, as before.
     assert_eq!(db.resolve_path(AnchoredPath { anchor: lib, path: "a.rs" }), Some(own));
-    let anchor = EditionedFileId::new(&db, lib, Edition::Edition2021);
-    let runs = shared_module_runs();
-    assert_eq!(shared_module(&db, anchor), Some((m.index(), 13)));
-    assert_eq!(shared_module_runs(), runs + 1);
-    assert_eq!(shared_module(&db, anchor), Some((m.index(), 13)));
-    assert_eq!(shared_module_runs(), runs + 1);
+    ran(&db, "shared_module");
+    assert_eq!(read(&db), Some((m.index(), 13)));
+    assert_eq!(read(&db), Some((m.index(), 13)));
+    assert_eq!(ran(&db, "shared_module"), 1);
 
     // An edit of the file in the other source root runs the reader again.
-    db.set_file_text(m, "pub fn f() { 1 }");
-    assert_eq!(shared_module(&db, anchor), Some((m.index(), 16)));
-    assert_eq!(shared_module_runs(), runs + 2);
+    db.commit_with(|edit| {
+        edit.set_file_text(m, "pub fn f() { 1 }");
+    });
+    assert_eq!(read(&db), Some((m.index(), 16)));
+    assert_eq!(ran(&db, "shared_module"), 1);
 
     // Taken out of its source root: found in none, and nothing read from disk.
     put_root(&mut db, 1, &[]);
-    assert_eq!(shared_module(&db, anchor), None);
-    assert_eq!(shared_module_runs(), runs + 3);
+    assert_eq!(read(&db), None);
+    assert_eq!(ran(&db, "shared_module"), 1);
 
     // Named again by another source root, as another file: the miss runs again and finds it.
     let moved = FileId::from_raw(3);
     put_root(&mut db, 2, &[(moved, "/ws/shared/m.rs", "pub fn g() {}")]);
-    assert_eq!(shared_module(&db, anchor), Some((moved.index(), 13)));
-    assert_eq!(shared_module_runs(), runs + 4);
-}
-
-thread_local! {
-    static DISK_MODULE_RUNS: Cell<usize> = const { Cell::new(0) };
+    assert_eq!(read(&db), Some((moved.index(), 13)));
+    assert_eq!(ran(&db, "shared_module"), 1);
 }
 
 /// What a `#[path = "../../shared/m.rs"] mod m;` in the root of `krate` reads when no source
 /// root has that file: the file read from disk and its text's length, as a def map would.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn disk_module(db: &Db, krate: Crate) -> Option<(u32, u32)> {
-    DISK_MODULE_RUNS.with(|it| it.set(it.get() + 1));
     let anchor = krate.data(db).root_file_id;
     let path = AnchoredPath { anchor, path: "../../shared/m.rs" };
     let file = db.resolve_path(path).or_else(|| db.module_source(krate, path))?;
     Some((file.index(), db.file_text(file).text(db).len() as u32))
-}
-
-fn disk_module_runs() -> usize {
-    DISK_MODULE_RUNS.with(Cell::get)
 }
 
 /// A module file outside every source root (crates/blaze-inproc-rt's `#[path]` into
@@ -1474,26 +1853,29 @@ fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns
     std::fs::write(&m, "pub fn f() {}").unwrap();
     std::fs::write(&n, "").unwrap();
 
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let lib = FileId::from_raw(0);
-    db.set_file_text_with_durability(lib, "", Durability::LOW);
-    db.set_file_source_root_with_durability(lib, SourceRootId(0), Durability::MEDIUM);
     let mut set = FileSet::default();
     set.insert(lib, VfsPath::from(src.join("lib.rs")));
-    let root = Arc::new(SourceRoot::new_local(set));
-    db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
+    db.commit_with(|edit| {
+        edit.set_file_text(lib, "")
+            .set_file_source_root(lib, SourceRootId(0))
+            .set_source_root(SourceRootId(0), Arc::new(SourceRoot::new_local(set)));
+    });
     let mut graph = CrateGraphBuilder::default();
     let krate = add(&mut graph, lib, CfgOptions::default(), Env::default());
-    let krate = graph.set_in_db(&mut db)[&krate];
+    let key = set_graph(&mut db, graph)[&krate];
 
     let path = AnchoredPath { anchor: lib, path: "../../shared/m.rs" };
     assert_eq!(db.resolve_path(path), None, "no source root has it");
-    let runs = disk_module_runs();
+    ran(&db, "disk_module");
+    let krate = db.krate(key);
     let (file, len) = disk_module(&db, krate).unwrap();
     assert_eq!(len, 13);
     assert_eq!(disk_module(&db, krate), Some((file, len)));
-    assert_eq!(disk_module_runs(), runs + 1);
-    let read: Vec<_> = db.files().included_by(&db, krate).into_iter().map(|it| it.0).collect();
+    assert_eq!(ran(&db, "disk_module"), 1);
+    let mut read = Vec::new_in(Global);
+    read.extend(db.files().included_by(&db, key).into_iter().map(|it| it.0));
     assert!(read.contains(&m), "the crate's keys cover what it read: {read:?}");
 
     // Its own `mod n;` resolves beside it, from its own one-file source root.
@@ -1503,31 +1885,68 @@ fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns
 
     // An edit on disk, read again: the reader runs again and reads the new text.
     std::fs::write(&m, "pub fn f() { 1 }").unwrap();
-    assert!(db.reload_included_files(Trigger::named("a test's edit"), &Looks::none()).contains(&m));
-    assert_eq!(disk_module(&db, krate), Some((file.index(), 16)));
-    assert_eq!(disk_module_runs(), runs + 2);
+    let (moved, _) = db.edit_with(|edit| edit.reload_included_files(&Looks::none()));
+    assert!(moved.contains(&m));
+    assert_eq!(disk_module(&db, db.krate(key)), Some((file.index(), 16)));
+    assert_eq!(ran(&db, "disk_module"), 1);
 
     // Gone from disk: no module file, never the old text.
     std::fs::remove_file(&m).unwrap();
-    assert!(db.reload_included_files(Trigger::named("a test's removal"), &Looks::none()).contains(&m));
-    assert_eq!(disk_module(&db, krate), None);
-    assert_eq!(disk_module_runs(), runs + 3);
+    let (moved, _) = db.edit_with(|edit| edit.reload_included_files(&Looks::none()));
+    assert!(moved.contains(&m));
+    assert_eq!(disk_module(&db, db.krate(key)), None);
+    assert_eq!(ran(&db, "disk_module"), 1);
+}
+
+/// The invariant (rule 14): a database with no disk ([`Db::sealed`], what a command's snapshot
+/// is) reads no file outside its source roots. The `#[path]` module a database with a disk
+/// reads from disk (the control, the test above, on the same files) is no module file here,
+/// an `include_bytes!` of it finds nothing, and no read is noted.
+#[test]
+fn a_database_with_no_disk_reads_no_module_file_from_disk() {
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-sealed-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
+    let (src, shared) = (dir.join("member/src"), dir.join("shared"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("m.rs"), "pub fn f() {}").unwrap();
+
+    let mut db = Db::for_tests_sealed(no_boundaries);
+    assert!(db.files().disk().is_none(), "a sealed database holds no disk");
+    let lib = FileId::from_raw(0);
+    let mut set = FileSet::default();
+    set.insert(lib, VfsPath::from(src.join("lib.rs")));
+    db.commit_with(|edit| {
+        edit.set_file_text(lib, "")
+            .set_file_source_root(lib, SourceRootId(0))
+            .set_source_root(SourceRootId(0), Arc::new(SourceRoot::new_local(set)));
+    });
+    let mut graph = CrateGraphBuilder::default();
+    let krate = add(&mut graph, lib, CfgOptions::default(), Env::default());
+    let key = set_graph(&mut db, graph)[&krate];
+    let krate = db.krate(key);
+
+    let path = AnchoredPath { anchor: lib, path: "../../shared/m.rs" };
+    assert_eq!(disk_module(&db, krate), None, "no disk: the file on disk is no module file");
+    assert!(db.included_file(krate, path).is_none(), "no disk: nothing an include reads");
+    assert_eq!(db.files().included_paths().count(), 0, "no file outside the VFS was read");
+    assert_eq!(db.files().included_by(&db, key), Vec::new(), "no read is noted as the crate's");
 }
 
 #[test]
 fn a_path_no_source_root_names_is_found_once_one_does() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let lib = FileId::from_raw(0);
     put_root(&mut db, 0, &[(lib, "/ws/member/src/lib.rs", "")]);
-    let anchor = EditionedFileId::new(&db, lib, Edition::Edition2021);
-    assert_eq!(shared_module(&db, anchor), None);
-    let runs = shared_module_runs();
+    let read = |db: &Db| shared_module(db, EditionedFileId::new(db, lib, Edition::Edition2021));
+    assert_eq!(read(&db), None);
+    ran(&db, "shared_module");
 
     // A source root that names the path: the miss runs again.
     let m = FileId::from_raw(1);
     put_root(&mut db, 1, &[(m, "/ws/shared/m.rs", "fn m() {}")]);
-    assert_eq!(shared_module(&db, anchor), Some((m.index(), 9)));
-    assert_eq!(shared_module_runs(), runs + 1);
+    assert_eq!(read(&db), Some((m.index(), 9)));
+    assert_eq!(ran(&db, "shared_module"), 1);
 }
 
 #[test]
@@ -1620,17 +2039,20 @@ fn a_parse_after_random_edits_is_the_whole_parse() {
         (31, include_str!("change.rs"), false),
         (37, include_str!("target.rs"), true),
     ] {
-        let mut db = Db::for_tests();
+        let mut db = test_db();
         let file = FileId::from_raw(0);
         put_root(&mut db, 0, &[(file, "/a/lib.rs", source)]);
         if library {
             let mut set = FileSet::default();
             set.insert(file, VfsPath::new_virtual_path("/a/lib.rs".to_owned()));
             let root = Arc::new(SourceRoot::new_library(set));
-            db.set_source_root_with_durability(SourceRootId(0), root, Durability::HIGH);
+            db.commit_with(|edit| {
+                edit.set_source_root(SourceRootId(0), root);
+            });
         }
-        let id = EditionedFileId::new(&db, file, Edition::Edition2021);
-        assert_eq!(id.parse(&db).is_outline(), library);
+        // Homed with the file's text: made again after each edit.
+        let id = |db: &Db| EditionedFileId::new(db, file, Edition::Edition2021);
+        assert_eq!(id(&db).parse(&db).is_outline(), library);
         let mut rng = Rng::new(seed);
         let mut text = source.to_owned();
         let start = reparsed();
@@ -1640,8 +2062,10 @@ fn a_parse_after_random_edits_is_the_whole_parse() {
             let edited = random_edit(&mut rng, &text);
             changed += usize::from(edited != text);
             text = edited;
-            db.set_file_text(file, &text);
-            let parse = id.parse(&db);
+            db.commit_with(|edit| {
+                edit.set_file_text(file, &text);
+            });
+            let parse = id(&db).parse(&db);
             assert_eq!(parse.root().text(), text, "step {step}");
             assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, library);
         }
@@ -1670,13 +2094,14 @@ fn an_edit_before_an_item_is_the_whole_parse() {
         ("/// a\nfn f() {}\n", "/// ab\nfn f() {}\n"),
     ];
     for (i, &(before, after)) in edits.iter().enumerate() {
-        let mut db = Db::for_tests();
+        let mut db = test_db();
         let file = FileId::from_raw(0);
         put_root(&mut db, 0, &[(file, "/a/lib.rs", before)]);
-        let id = EditionedFileId::new(&db, file, Edition::Edition2021);
-        let _ = id.parse(&db);
-        db.set_file_text(file, after);
-        let parse = id.parse(&db);
+        let _ = EditionedFileId::new(&db, file, Edition::Edition2021).parse(&db);
+        db.commit_with(|edit| {
+            edit.set_file_text(file, after);
+        });
+        let parse = EditionedFileId::new(&db, file, Edition::Edition2021).parse(&db);
         assert_eq!(parse.root().text(), after, "edit {i}");
         assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, false);
     }
@@ -1684,50 +2109,58 @@ fn an_edit_before_an_item_is_the_whole_parse() {
 
 #[test]
 fn a_reparse_is_made_from_the_last_text_that_was_parsed() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let file = FileId::from_raw(0);
     put_root(&mut db, 0, &[(file, "/a/lib.rs", "fn f() { 1 }\nstruct S;\n")]);
-    let id = EditionedFileId::new(&db, file, Edition::Edition2021);
-    let _ = id.parse(&db);
+    let id = |db: &Db, edition| EditionedFileId::new(db, file, edition);
+    let _ = id(&db, Edition::Edition2021).parse(&db);
     let parsed = ContentId::of(blaze_vfs::FILE_DOMAIN, b"fn f() { 1 }\nstruct S;\n");
+    let set_text = |db: &mut Db, file: FileId, text: &str| {
+        db.commit_with(|edit| {
+            edit.set_file_text(file, text);
+        });
+    };
 
     // Two edits with no parse between: the second is one edit from the text last parsed.
-    db.set_file_text(file, "fn f() { 1 + 2 }\nstruct S;\n");
-    db.set_file_text(file, "fn f() { 1 + 2 }\nstruct S { a: u8 }\n");
-    let edit = db.file_text(file).reparse_field(&db).edit().expect("an edit from the parse");
+    set_text(&mut db, file, "fn f() { 1 + 2 }\nstruct S;\n");
+    set_text(&mut db, file, "fn f() { 1 + 2 }\nstruct S { a: u8 }\n");
+    let edit = db.file_text(file).reparse(&db).edit().expect("an edit from the parse");
     assert_eq!(edit.before, parsed);
     assert_eq!(edit.delete, TextRange::new(TextSize::from(11), TextSize::from(22)));
     let start = reparsed();
-    let parse = id.parse(&db);
+    let parse = id(&db, Edition::Edition2021).parse(&db);
     assert_eq!(reparsed(), start + 1);
     assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, false);
 
     // A text never parsed before its edit, with none before it: parsed whole.
     let fresh = FileId::from_raw(1);
     put_root(&mut db, 0, &[(file, "/a/lib.rs", "fn f() {}"), (fresh, "/a/b.rs", "fn b() {}")]);
-    db.set_file_text(fresh, "fn b() { 2 }");
-    assert_eq!(db.file_text(fresh).reparse_field(&db).edit(), None);
+    set_text(&mut db, fresh, "fn b() { 2 }");
+    assert_eq!(db.file_text(fresh).reparse(&db).edit(), None);
     let start = reparsed();
     let fresh_id = EditionedFileId::new(&db, fresh, Edition::Edition2021);
     assert_eq!(fresh_id.parse(&db).root().text(), "fn b() { 2 }");
     assert_eq!(reparsed(), start);
 
     // Another edition's parse is not made from this one's.
-    let other = EditionedFileId::new(&db, file, Edition::Edition2018);
-    db.set_file_text(file, "fn f() { 3 }");
+    let _ = id(&db, Edition::Edition2021).parse(&db);
+    set_text(&mut db, file, "fn f() { 3 }");
     let start = reparsed();
-    let _ = other.parse(&db);
+    let _ = id(&db, Edition::Edition2018).parse(&db);
     assert_eq!(reparsed(), start);
 }
 
 #[test]
 fn a_cache_hit_of_parse_allocates_nothing() {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let file = FileId::from_raw(0);
     put_root(&mut db, 0, &[(file, "/a/lib.rs", include_str!("target.rs"))]);
+    let _ = EditionedFileId::new(&db, file, Edition::Edition2021).parse(&db);
+    let text = [include_str!("target.rs"), "\nfn added() {}\n"].concat();
+    db.commit_with(|edit| {
+        edit.set_file_text(file, &text);
+    });
     let id = EditionedFileId::new(&db, file, Edition::Edition2021);
-    let _ = id.parse(&db);
-    db.set_file_text(file, &[include_str!("target.rs"), "\nfn added() {}\n"].concat());
     let _ = id.parse(&db);
     blaze_alloc_count::assert_at_most(0, "a cache hit of `parse` after a reparse", || {
         id.parse(&db).is_outline()
@@ -1746,7 +2179,7 @@ fn root_files(db: &Db) -> Vec<(FileId, VfsPath)> {
 #[test]
 fn a_view_edits_its_roots_files_in_place_as_making_them_again_does() {
     let mut rng = Rng::new(11);
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let (base, partition) = checkout(&mut db);
     for step in 0..60 {
         let view = seeded_view(&mut rng);
@@ -1845,32 +2278,57 @@ fn root_at(db: &mut Db, files: &[FileId], moved: &[bool]) {
         let path = if moved { format!("/moved/p{at}.rs") } else { format!("/p{at}/lib.rs") };
         set.insert(file, VfsPath::new_virtual_path(path));
     }
-    let root = Arc::new(SourceRoot::new_local(set));
-    db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
+    db.commit_with(|edit| {
+        edit.set_source_root(SourceRootId(0), Arc::new(SourceRoot::new_local(set)));
+    });
 }
 
-/// Every crate of the graph has the content ID hashing its fields gives.
-fn assert_crates_fresh(db: &Db, what: &str) {
-    for &krate in crate::all_crates(db).iter() {
-        assert_eq!(krate.content(db), krate.content_from_fields(db), "{krate:?} after {what}");
-    }
+/// The files of [`a_crate_graph_set_keeps_every_content_id_a_fresh_database_gives`]: `/p{i}/lib.rs`.
+fn graph_files(db: &mut Db, count: usize) -> Vec<FileId> {
+    let mut paths = Vec::new_in(Global);
+    paths.extend((0..count).map(|at| format!("/p{at}/lib.rs")));
+    let mut texts = Vec::new_in(Global);
+    texts.extend(paths.iter().map(|path| (path.as_str(), "pub fn f() {}")));
+    load(db, 0, &texts)
 }
 
-/// The comparison that lets an unchanged crate keep its content ID unhashed gives what
-/// hashing every crate gave, over random sequences of graphs, setters and moved root files.
+/// The content IDs of the listed crates, in order, and the list's: what a graph's crates are.
+fn listed_contents(db: &Db) -> (Vec<ContentId, Global>, ContentId) {
+    let mut contents = Vec::new_in(Global);
+    contents.extend(crate::all_crates(db).iter().map(|krate| krate.content(db)));
+    (contents, all_crates_content(db))
+}
+
+/// The invariant: each listed crate has the content ID a fresh database of the same files,
+/// moves and graph gives, after any sequence of graphs, setters and moved root files.
+fn assert_crates_fresh(db: &Db, files: usize, moved: &[bool], graph: &[DrawnCrate], what: &str) {
+    let mut fresh = test_db();
+    let fresh_files = graph_files(&mut fresh, files);
+    root_at(&mut fresh, &fresh_files, moved);
+    set_graph(&mut fresh, build_graph(graph, &fresh_files));
+    assert_eq!(listed_contents(db), listed_contents(&fresh), "after {what}");
+}
+
+/// A crate's content ID, kept for an unchanged crate and made again for a moved one, is what a
+/// fresh database gives, over random sequences of graphs, setters and moved root files.
 #[test]
-fn a_crate_graph_set_keeps_every_content_id_what_hashing_gives() {
+fn a_crate_graph_set_keeps_every_content_id_a_fresh_database_gives() {
     const FILES: usize = 6;
     for seed in 0..16 {
         let mut rng = Rng::new(seed);
-        let mut db = Db::for_tests();
-        let texts: Vec<(String, &str)> =
-            (0..FILES).map(|at| (format!("/p{at}/lib.rs"), "pub fn f() {}")).collect();
-        let texts: Vec<(&str, &str)> =
-            texts.iter().map(|(path, text)| (path.as_str(), *text)).collect();
-        let files = load(&mut db, 0, &texts);
+        let mut db = test_db();
+        let files = graph_files(&mut db, FILES);
         let mut moved = [false; FILES];
-        let mut graph: Vec<DrawnCrate> = Vec::new();
+        let mut graph: Vec<DrawnCrate> = Vec::new_in(Global);
+        let mut keys: Vec<CrateKey, Global> = Vec::new_in(Global);
+        let set = |db: &mut Db, graph: &[DrawnCrate], keys: &mut Vec<CrateKey, Global>| {
+            let builder = build_graph(graph, &files);
+            let mut ids = Vec::new_in(Global);
+            ids.extend(builder.iter());
+            let crates = set_graph(db, builder);
+            keys.clear();
+            keys.extend(ids.iter().map(|id| crates[id]));
+        };
         for step in 0..60 {
             match rng.below(6) {
                 // A crate's ID follows its root file's path only once the graph is set again,
@@ -1879,62 +2337,79 @@ fn a_crate_graph_set_keeps_every_content_id_what_hashing_gives() {
                     let at = rng.index(FILES);
                     moved[at] = !moved[at];
                     root_at(&mut db, &files, &moved);
-                    build_graph(&graph, &files).set_in_db(&mut db);
-                    assert_crates_fresh(&db, &format!("a move, seed {seed} step {step}"));
+                    set(&mut db, &graph, &mut keys);
+                    let what = format!("a move, seed {seed} step {step}");
+                    assert_crates_fresh(&db, FILES, &moved, &graph, &what);
                 }
                 1 => {
-                    let all = crate::all_crates(&db);
-                    if let Some(&krate) = rng.pick(&all) {
-                        krate.set_env(&mut db, drawn_env(rng.index(3)));
-                        assert_crates_fresh(&db, &format!("a setter, seed {seed} step {step}"));
+                    if !graph.is_empty() {
+                        let at = rng.index(graph.len());
+                        graph[at].env = rng.index(3);
+                        let env = drawn_env(graph[at].env);
+                        db.commit_with(|edit| {
+                            edit.set_crate_env(keys[at], env);
+                        });
+                        let what = format!("a setter, seed {seed} step {step}");
+                        assert_crates_fresh(&db, FILES, &moved, &graph, &what);
                     }
                 }
                 _ => {
                     graph = draw_graph(&mut rng, FILES);
-                    build_graph(&graph, &files).set_in_db(&mut db);
-                    assert_crates_fresh(&db, &format!("{graph:?}, seed {seed} step {step}"));
+                    set(&mut db, &graph, &mut keys);
+                    let what = format!("{graph:?}, seed {seed} step {step}");
+                    assert_crates_fresh(&db, FILES, &moved, &graph, &what);
                 }
             }
         }
     }
 }
 
-#[test]
-fn an_equal_crate_graph_hashes_no_crate() {
-    let mut db = Db::for_tests();
-    let files = load(&mut db, 0, FILES);
-    let drawn = vec![
-        DrawnCrate { root: 2, cfg: 1, env: 0, deps: Vec::new() },
-        DrawnCrate { root: 0, cfg: 0, env: 1, deps: vec![0] },
-    ];
-    build_graph(&drawn, &files).set_in_db(&mut db);
-    let (hashed, before) = (crate::input::crates_hashed(&db), revision(&db));
-    build_graph(&drawn, &files).set_in_db(&mut db);
-    assert_eq!(crate::input::crates_hashed(&db), hashed);
-    assert_eq!(revision(&db), before);
 
-    // The dependency changed: it and its dependent are hashed again, and only they.
+/// An equal graph set again drops nothing; a changed dependency drops its own arena and its
+/// dependent's. A change of its variables leaves its item key, so the crate list
+/// (`world::List`) and the session arena, as they were.
+#[test]
+fn an_equal_crate_graph_drops_nothing() {
+    let mut db = test_db();
+    let files = load(&mut db, 0, FILES);
+    let mut drawn = Vec::new_in(Global);
+    drawn.push(DrawnCrate { root: 2, cfg: 1, env: 0, deps: Vec::new() });
+    drawn.push(DrawnCrate { root: 0, cfg: 0, env: 1, deps: vec![0] });
+    set_graph(&mut db, build_graph(&drawn, &files));
+    let before = listed_contents(&db);
+    let again = db.commit_with(|edit| {
+        edit.set_crate_graph(build_graph(&drawn, &files));
+    });
+    assert_dropped_nothing(&again, "an equal graph");
+    assert_eq!(listed_contents(&db), before);
+
     let mut changed = drawn.clone();
     changed[0].env = 2;
-    build_graph(&changed, &files).set_in_db(&mut db);
-    assert_eq!(crate::input::crates_hashed(&db), hashed + 2);
-    assert_crates_fresh(&db, "a changed dependency");
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_graph(build_graph(&changed, &files));
+    });
+    let mut keys = Vec::new_in(Global);
+    keys.extend(crate::all_crates(&db).iter().map(|krate| krate.key(&db)));
+    for key in keys {
+        let index = arena_of(&db, key);
+        assert!(committed.dropped.contains(&index), "arena {index} of {key:?} kept: {:?}", committed.dropped);
+    }
+    assert!(!committed.dropped.contains(&0), "a crate's variables dropped the session: {:?}", committed.dropped);
 }
 
-/// A crate left out of the graph while its dependency changed is hashed again when it comes
-/// back with the fields it had.
+/// A crate left out of the graph while its dependency changed comes back with the content ID
+/// its fields and its dependency's new one give.
 #[test]
-fn a_crate_back_after_its_dependency_changed_is_hashed_again() {
-    let mut db = Db::for_tests();
-    let files = load(&mut db, 0, FILES);
+fn a_crate_back_after_its_dependency_changed_has_a_fresh_content_id() {
+    let mut db = test_db();
+    let files = graph_files(&mut db, 3);
     let dependency = |env| DrawnCrate { root: 2, cfg: 0, env, deps: Vec::new() };
     let dependent = DrawnCrate { root: 0, cfg: 0, env: 0, deps: vec![0] };
-    build_graph(&[dependency(0), dependent.clone()], &files).set_in_db(&mut db);
-    build_graph(&[dependency(1)], &files).set_in_db(&mut db);
-    let hashed = crate::input::crates_hashed(&db);
-    build_graph(&[dependency(1), dependent], &files).set_in_db(&mut db);
-    assert_eq!(crate::input::crates_hashed(&db), hashed + 1, "the dependent alone");
-    assert_crates_fresh(&db, "the dependent's return");
+    set_graph(&mut db, build_graph(&[dependency(0), dependent.clone()], &files));
+    set_graph(&mut db, build_graph(&[dependency(1)], &files));
+    let back = [dependency(1), dependent];
+    set_graph(&mut db, build_graph(&back, &files));
+    assert_crates_fresh(&db, 3, &[false; 3], &back, "the dependent's return");
 }
 
 /// The copies of a crate origin's hash that `Crate::content_of`, hir-def's dependency key and
@@ -2039,45 +2514,760 @@ fn a_target_kinds_tag_is_the_old_match() {
     }
 }
 
-/// The rows the engine's walk found changed after the process's variables are set to
-/// `after`, a query having read `FOO` when they were `before`.
-fn changed_after_env(before: &[(&str, &str)], after: &[(&str, &str)]) -> (u64, Option<String>) {
-    let vars = |of: &[(&str, &str)]| {
-        crate::Env::from_iter(of.iter().map(|(name, value)| ((*name).into(), (*value).into())))
-    };
-    let mut db = Db::for_tests();
-    crate::set_process_env(&mut db, vars(before));
-    assert_eq!(crate::process_env_var(&db, "FOO"), Some("1".to_owned()));
-    // A walk with nothing written, so the next counts the write below alone.
-    blaze_query::db::plumbing::walk_changed_set(&db);
-    crate::set_process_env(&mut db, vars(after));
-    let work = blaze_query::db::plumbing::walk_changed_set(&db);
-    assert!(work.written >= 1, "the variables were written: {work:?}");
-    assert!(work.visited <= 1, "one row reads the variables: {work:?}");
-    (work.changed, crate::process_env_var(&db, "FOO"))
+/// The process's variables `of`.
+fn process_vars(of: &[(&str, &str)]) -> Env {
+    Env::from_iter(of.iter().map(|(name, value)| ((*name).into(), (*value).into())))
 }
 
-/// The invariant: a change of a process variable nothing reads changes no row. A query that
-/// reads `FOO` reads `FOO`'s own memo; with `UNRELATED` changed, added or removed, the
-/// walk from the variables written verifies that one memo, finds it equal and stops: 0 rows
-/// changed, so nothing that read `FOO` runs again.
+/// `FOO` as read after the process's variables are set to `before` and then to `after`, and
+/// what the second commit dropped.
+fn foo_after_env(before: &[(&str, &str)], after: &[(&str, &str)]) -> (Option<String>, Committed) {
+    let mut db = test_db();
+    db.commit_with(|edit| {
+        edit.set_process_env(process_vars(before));
+    });
+    assert_eq!(crate::process_env_var(&db, "FOO"), Some("1".to_owned()));
+    let committed = db.commit_with(|edit| {
+        edit.set_process_env(process_vars(after));
+    });
+    (crate::process_env_var(&db, "FOO"), committed)
+}
+
+/// The invariant: the process's variables set again equal drop nothing, and any other set is
+/// read back by `process_env_var`, never an older value. A set that moves any variable drops
+/// the session arena, and every arena with it (the floor the design states: every query may
+/// read the process's variables).
 #[test]
-fn a_process_variable_nothing_reads_changes_no_row() {
+fn the_process_variables_set_again_drop_nothing_and_a_change_is_read() {
     let before = [("FOO", "1"), ("UNRELATED", "a")];
+    let (foo, committed) = foo_after_env(&before, &before);
+    assert_eq!(foo, Some("1".to_owned()));
+    assert_dropped_nothing(&committed, "the same variables again");
     for after in [
         &[("FOO", "1"), ("UNRELATED", "b")][..],
         &[("FOO", "1")][..],
         &[("FOO", "1"), ("UNRELATED", "a"), ("MORE", "x")][..],
     ] {
-        assert_eq!(changed_after_env(&before, after), (0, Some("1".to_owned())), "{after:?}");
+        let (foo, committed) = foo_after_env(&before, after);
+        assert_eq!(foo, Some("1".to_owned()), "{after:?}");
+        assert!(committed.dropped.contains(&0), "{after:?} moved the session: {committed:?}");
+    }
+    let (foo, _) = foo_after_env(&before, &[("FOO", "2"), ("UNRELATED", "a")]);
+    assert_eq!(foo, Some("2".to_owned()), "the read variable's new value");
+}
+
+/// Two crates, `a` on source root 0 and `c` on source root 1, neither depending on the other,
+/// committed, and `c`'s file: an edit of that file drops `c`'s arena alone, carrying `a`'s and
+/// the session's.
+fn two_roots(db: &mut Db) -> (CrateKey, CrateKey, FileId) {
+    let (fa, fc) = (FileId::from_raw(0), FileId::from_raw(1));
+    put_root(db, 0, &[(fa, "/a/lib.rs", "pub fn a() {}")]);
+    put_root(db, 1, &[(fc, "/c/lib.rs", "pub fn c() {}")]);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, fa, CfgOptions::default(), Env::default());
+    let c = add(&mut graph, fc, CfgOptions::default(), Env::default());
+    let crates = set_graph(db, graph);
+    (crates[&a], crates[&c], fc)
+}
+
+/// The arena index of `key`'s crate in `db`'s snapshot.
+fn arena_of(db: &Db, key: CrateKey) -> u32 {
+    use blaze_memo::Id as _;
+    db.krate(key).gid().arena().index()
+}
+
+/// A fact of the tests' gifts and makers: one id, its digest of `digest`.
+fn test_fact(digest: &str) -> blaze_memo::Fact {
+    blaze_memo::Fact {
+        id: ContentId::of("base-db test given", &[]),
+        digest: ContentId::of("base-db test given digest", digest.as_bytes()),
     }
 }
 
-/// The control of [`a_process_variable_nothing_reads_changes_no_row`]: the variable that is
-/// read, changed, is a changed row, and its reader gets the new value.
+/// Variables that move a crate's content ID, so its arena is made again.
+fn some_env() -> Env {
+    [("KEY".to_owned(), "moved".to_owned())].into_iter().collect()
+}
+
+/// The kind of [`a_gift_by_fact_is_read_back_and_kept_until_its_fact_moves`]'s gifts.
+struct ByFact;
+
+/// The invariant: a gift by the giver's fact ([`Edit::give_by`]) is read back after its commit,
+/// is kept by a commit that does not touch its crate (its arena carried) and by one that makes
+/// its crate's arena again for another reason (the world keeps it), moves nothing when given
+/// again under the fact the slot holds (the slot keeps its value), and moves its crate when
+/// given under another fact.
 #[test]
-fn the_oracle_catches_a_read_variable_that_changed() {
-    let (changed, value) =
-        changed_after_env(&[("FOO", "1"), ("UNRELATED", "a")], &[("FOO", "2"), ("UNRELATED", "a")]);
-    assert_eq!((changed, value), (1, Some("2".to_owned())));
+fn a_gift_by_fact_is_read_back_and_kept_until_its_fact_moves() {
+    let mut db = test_db();
+    let (a, _, fc) = two_roots(&mut db);
+    let given = |db: &Db| db.krate(a).given::<ByFact, u32>(db).copied();
+    db.commit_with(|edit| {
+        edit.give_by::<ByFact>(a, test_fact("1"), crate::Given::new(1_u32));
+    });
+    assert_eq!(given(&db), Some(1));
+
+    let arena = arena_of(&db, a);
+    let committed = db.commit_with(|edit| {
+        edit.set_file_text(fc, "pub fn c2() {}");
+    });
+    assert!(!committed.dropped.contains(&arena), "another crate's file dropped `a`: {committed:?}");
+    assert_eq!(given(&db), Some(1), "carried with its arena");
+
+    let committed = db.commit_with(|edit| {
+        edit.give_by::<ByFact>(a, test_fact("1"), crate::Given::new(2_u32));
+    });
+    assert_dropped_nothing(&committed, "a gift under the fact the slot holds");
+    assert_eq!(given(&db), Some(1), "the slot keeps the value it has");
+
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_env(a, some_env());
+    });
+    assert!(committed.dropped.contains(&arena), "its variables moved: {committed:?}");
+    assert_eq!(given(&db), Some(1), "made again from the world");
+
+    let arena = arena_of(&db, a);
+    let committed = db.commit_with(|edit| {
+        edit.give_by::<ByFact>(a, test_fact("2"), crate::Given::new(3_u32));
+    });
+    assert!(committed.dropped.contains(&arena), "a gift under another fact: {committed:?}");
+    assert_eq!(given(&db), Some(3));
+}
+
+/// A singleton the tests' makers set in the session arena ([`Edit::set_given`]).
+#[blaze_memo::input(singleton, debug)]
+struct Held {
+    #[returns(copy)]
+    value: u32,
+}
+
+/// A maker of [`Held`] `value` read by `fact`, counting its runs in `runs` and, in `arena`, the
+/// index of the arena it last ran in.
+fn held_maker(
+    runs: &std::sync::Arc<AtomicUsize, Global>,
+    arena: &std::sync::Arc<std::sync::atomic::AtomicU32, Global>,
+    fact: blaze_memo::Fact,
+    value: Option<u32>,
+) -> crate::MakeGiven {
+    let runs = std::sync::Arc::clone(runs);
+    let arena = std::sync::Arc::clone(arena);
+    Box::new_in(
+        move |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            arena.store(inputs.id().index(), Ordering::Relaxed);
+            if let Some(value) = value {
+                Held::set(inputs, fact, value);
+            }
+        },
+        Global,
+    )
+}
+
+/// Counters a [`held_maker`] writes.
+fn counters() -> (std::sync::Arc<AtomicUsize, Global>, std::sync::Arc<std::sync::atomic::AtomicU32, Global>) {
+    (
+        std::sync::Arc::new_in(AtomicUsize::new(0), Global),
+        std::sync::Arc::new_in(std::sync::atomic::AtomicU32::new(u32::MAX), Global),
+    )
+}
+
+/// The invariant: what a maker of the session arena sets ([`Edit::set_given`] of no crate) is
+/// read back after its commit; a commit that carries the session runs it not again and keeps
+/// what it made, one that makes the session again runs it again (the world keeps it); a maker
+/// under the fact held moves nothing and never runs, one under another fact takes its place.
+#[test]
+fn a_session_maker_is_read_back_and_kept_until_its_fact_moves() {
+    let mut db = test_db();
+    let (a, _, fc) = two_roots(&mut db);
+    let held = |db: &Db| Held::try_get(db).map(|it| it.value(db));
+    let (runs, arena) = counters();
+    db.commit_with(|edit| {
+        edit.set_given(None, test_fact("1"), held_maker(&runs, &arena, test_fact("1"), Some(7)));
+    });
+    assert_eq!(held(&db), Some(7));
+    assert_eq!((runs.load(Ordering::Relaxed), arena.load(Ordering::Relaxed)), (1, 0));
+
+    let committed = db.commit_with(|edit| {
+        edit.set_file_text(fc, "pub fn c2() {}");
+    });
+    assert!(!committed.dropped.contains(&0), "a crate's file dropped the session: {committed:?}");
+    assert_eq!(held(&db), Some(7), "carried with the session arena");
+    assert_eq!(runs.load(Ordering::Relaxed), 1, "a carried arena runs no maker");
+
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_env(a, some_env());
+    });
+    let remade = usize::from(committed.dropped.contains(&0));
+    assert_eq!(runs.load(Ordering::Relaxed), 1 + remade, "run once a making: {committed:?}");
+    assert_eq!(held(&db), Some(7));
+
+    let (other, other_arena) = counters();
+    let committed = db.commit_with(|edit| {
+        edit.set_given(None, test_fact("1"), held_maker(&other, &other_arena, test_fact("1"), Some(8)));
+    });
+    assert_dropped_nothing(&committed, "a maker under the fact held");
+    assert_eq!(held(&db), Some(7));
+    assert_eq!(other.load(Ordering::Relaxed), 0, "dropped, never run");
+
+    let committed = db.commit_with(|edit| {
+        edit.set_given(None, test_fact("2"), held_maker(&other, &other_arena, test_fact("2"), Some(9)));
+    });
+    assert!(committed.dropped.contains(&0), "a maker under another fact: {committed:?}");
+    assert_eq!(held(&db), Some(9));
+    assert_eq!(other.load(Ordering::Relaxed), 1);
+}
+
+/// The invariant: a maker of a crate's arena ([`Edit::set_given`] of the crate) runs in that
+/// crate's arena at its commit, not again while the arena is carried, again each time the
+/// arena is made again; one under the fact held moves nothing.
+#[test]
+fn a_crate_maker_runs_in_its_crates_arena_each_time_it_is_made() {
+    let mut db = test_db();
+    let (a, _, fc) = two_roots(&mut db);
+    let (runs, arena) = counters();
+    db.commit_with(|edit| {
+        edit.set_given(Some(a), test_fact("1"), held_maker(&runs, &arena, test_fact("1"), None));
+    });
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert_eq!(arena.load(Ordering::Relaxed), arena_of(&db, a));
+
+    let committed = db.commit_with(|edit| {
+        edit.set_file_text(fc, "pub fn c2() {}");
+    });
+    assert!(!committed.dropped.contains(&arena_of(&db, a)), "{committed:?}");
+    assert_eq!(runs.load(Ordering::Relaxed), 1, "a carried arena runs no maker");
+
+    db.commit_with(|edit| {
+        edit.set_crate_env(a, some_env());
+    });
+    assert_eq!(runs.load(Ordering::Relaxed), 2, "its arena made again");
+    assert_eq!(arena.load(Ordering::Relaxed), arena_of(&db, a));
+
+    let (other, other_arena) = counters();
+    let committed = db.commit_with(|edit| {
+        edit.set_given(Some(a), test_fact("1"), held_maker(&other, &other_arena, test_fact("1"), None));
+    });
+    assert_dropped_nothing(&committed, "a crate maker under the fact held");
+    assert_eq!(other.load(Ordering::Relaxed), 0);
+}
+
+/// A sealed library crate `lib` (source root 1), a workspace crate `top` over it (root 0) and
+/// a workspace crate `other` beside them (root 2), committed: `[lib, top, other]`.
+fn beside_a_sealed_library(db: &mut Db) -> [CrateKey; 3] {
+    let (lib_file, top_file, other_file) = (FileId::from_raw(0), FileId::from_raw(1), FileId::from_raw(2));
+    put_root(db, 0, &[(top_file, "/top/lib.rs", "pub fn caller() {}")]);
+    put_root(db, 1, &[(lib_file, "/lib/lib.rs", "pub fn callee() {}")]);
+    put_root(db, 2, &[(other_file, "/other/lib.rs", "pub fn other() {}")]);
+    let mut graph = CrateGraphBuilder::default();
+    let lib = add(&mut graph, lib_file, CfgOptions::default(), Env::default());
+    graph.seal(lib, ContentId::of("base-db sealed write test pin", b"lib"));
+    let top = add(&mut graph, top_file, CfgOptions::default(), Env::default());
+    depend(&mut graph, top, lib, "lib");
+    let other = add(&mut graph, other_file, CfgOptions::default(), Env::default());
+    let crates = set_graph(db, graph);
+    [crates[&lib], crates[&top], crates[&other]]
+}
+
+/// The oracle of a commit that wrote `lib` alone ([`beside_a_sealed_library`]): it dropped
+/// exactly `lib`'s arena and its dependent `top`'s, never the session's, the roots' or
+/// `other`'s (so it started no new session).
+fn dropped_lib_and_top(before: &[u32; 3], committed: &Committed) -> Result<(), String> {
+    let mut want = Vec::new_in(Global);
+    want.extend_from_slice(&before[..2]);
+    want.sort_unstable();
+    match committed.dropped[..] == want[..] {
+        true => Ok(()),
+        false => Err(format!(
+            "a write for the sealed crate dropped arenas {:?}, not {want:?} (its own and its dependent's; `other` was at {})",
+            committed.dropped, before[2]
+        )),
+    }
+}
+
+/// The arenas of `keys` in `db`'s snapshot.
+fn arenas_of(db: &Db, keys: [CrateKey; 3]) -> [u32; 3] {
+    keys.map(|key| arena_of(db, key))
+}
+
+/// Each write of a sealed crate the driver makes after the crate was first made: a build
+/// script's variables, a gift (a surface, an image, a key of its check results) and a maker
+/// of its arena.
+fn sealed_writes() -> [(&'static str, fn(&mut Edit<'_>, CrateKey)); 3] {
+    fn env(edit: &mut Edit<'_>, lib: CrateKey) {
+        edit.set_crate_env(lib, some_env());
+    }
+    fn gift(edit: &mut Edit<'_>, lib: CrateKey) {
+        edit.give_by::<ByFact>(lib, test_fact("sealed gift"), crate::Given::new(5_u32));
+    }
+    fn maker(edit: &mut Edit<'_>, lib: CrateKey) {
+        let (runs, arena) = counters();
+        edit.set_given(Some(lib), test_fact("sealed maker"), held_maker(&runs, &arena, test_fact("sealed maker"), None));
+    }
+    [("its variables", env), ("a gift", gift), ("a maker", maker)]
+}
+
+/// One sealed write `write` under `plant`, through the oracle [`dropped_lib_and_top`], and
+/// the write read back.
+fn a_sealed_write(plant: Plant, what: &str, write: fn(&mut Edit<'_>, CrateKey)) -> Result<(), String> {
+    let mut db = test_db();
+    let keys = beside_a_sealed_library(&mut db);
+    let [lib, _, _] = keys;
+    db.plant(plant);
+    let before = arenas_of(&db, keys);
+    let committed = db.commit_with(|edit| write(edit, lib));
+    dropped_lib_and_top(&before, &committed).map_err(|why| format!("{what}: {why}"))?;
+    let after = arenas_of(&db, keys);
+    if after[2] != before[2] {
+        return Err(format!("{what}: `other` moved from arena {} to {}", before[2], after[2]));
+    }
+    Ok(())
+}
+
+/// The invariant: a write to a sealed crate (its variables, a gift, a maker: what a build
+/// script's run, a served surface or image and a key of its check results write after the
+/// crate was made) drops that crate's arena and its dependents' (each borrowed it), and
+/// nothing else: not the session, not a source root, not a crate beside it; no new session.
+/// The control: with `Plant::SealedRestartsSession` (a sealed arena marked starts a new
+/// session, as a commit did while `Memo::next` refused one) the oracle names the session.
+#[test]
+fn a_write_to_a_sealed_crate_drops_it_and_its_dependents_alone() {
+    for (what, write) in sealed_writes() {
+        a_sealed_write(Plant::None, what, write).unwrap_or_else(|why| panic!("{why}"));
+        let planted = a_sealed_write(Plant::SealedRestartsSession, what, write)
+            .expect_err("a sealed write that started a new session was not caught");
+        assert!(planted.contains("dropped arenas"), "{planted}");
+    }
+    // Read back: the variables written are the arena's made again.
+    let mut db = test_db();
+    let [lib, top, _] = beside_a_sealed_library(&mut db);
+    let before = db.krate(top).content(&db);
+    db.commit_with(|edit| { edit.set_crate_env(lib, some_env()); });
+    assert_eq!(db.krate(lib).env(&db), &some_env());
+    assert_ne!(db.krate(top).content(&db), before, "the dependent's content follows its dependency");
+}
+
+/// A driver's giver of one value per crate (the key a crate's constants are kept under,
+/// `hir_ty::consteval::deps`), with a session input beside it (the store): given `value` for
+/// `lib`. `in_session`: the value is in the session maker's fact (one session input for
+/// every crate's value, as the constants' were given), not a gift of `lib`'s own.
+fn give_for_lib(edit: &mut Edit<'_>, lib: CrateKey, value: u32, in_session: bool) {
+    let (runs, arena) = counters();
+    match in_session {
+        true => {
+            let fact = test_fact(&format!("store, lib {value}"));
+            edit.set_given(None, fact, held_maker(&runs, &arena, fact, Some(value)));
+        }
+        false => {
+            let fact = test_fact("store");
+            edit.set_given(None, fact, held_maker(&runs, &arena, fact, Some(0)));
+            edit.give_by::<ByFact>(lib, test_fact(&format!("lib {value}")), crate::Given::new(value));
+        }
+    }
+}
+
+/// A value for `lib` given, then another (a crate checked, then its key stored), through the
+/// oracle [`dropped_lib_and_top`], and the value read back.
+fn a_given_for_one_crate(plant: Plant, in_session: bool) -> Result<(), String> {
+    let mut db = test_db();
+    let keys = beside_a_sealed_library(&mut db);
+    let [lib, _, _] = keys;
+    db.commit_with(|edit| give_for_lib(edit, lib, 1, in_session));
+    db.plant(plant);
+    let before = arenas_of(&db, keys);
+    let committed = db.commit_with(|edit| give_for_lib(edit, lib, 2, in_session));
+    dropped_lib_and_top(&before, &committed)?;
+    let read = match in_session {
+        true => Held::try_get(&db).map(|it| it.value(&db)),
+        false => db.krate(lib).given::<ByFact, u32>(&db).copied(),
+    };
+    match read {
+        Some(2) => Ok(()),
+        other => Err(format!("the value read back is {other:?}, not 2")),
+    }
+}
+
+/// The invariant: a value a driver gives for one crate, given as that crate's own gift beside
+/// a session input whose fact does not move, keeps every other arena (the session's, the
+/// roots', a crate beside it) when it moves, and starts no new session, though the crate is
+/// sealed: it drops that crate and its dependents alone. The controls: given in the session
+/// maker's fact (what the constants' kept fact was), the oracle names the session; and with
+/// `Plant::SealedRestartsSession` it names it too.
+#[test]
+fn a_given_for_one_crate_keeps_every_other_crates_arena() {
+    a_given_for_one_crate(Plant::None, false).unwrap_or_else(|why| panic!("{why}"));
+    let in_session = a_given_for_one_crate(Plant::None, true)
+        .expect_err("a value for one crate in the session's fact was not caught");
+    assert!(in_session.contains("dropped arenas"), "{in_session}");
+    let planted = a_given_for_one_crate(Plant::SealedRestartsSession, false)
+        .expect_err("a sealed write that started a new session was not caught");
+    assert!(planted.contains("dropped arenas"), "{planted}");
+}
+
+/// The kind of [`a_crate_added_and_given_in_one_edit_is_one_commit`]'s gift, as a driver's
+/// proc macros are given.
+struct ProcMacrosGift;
+
+/// The invariant: a crate the edit adds has its key before the commit ([`Edit::crate_key`]),
+/// so the graph and a gift to its new crate are one commit; the key is the one the commit
+/// reports.
+#[test]
+fn a_crate_added_and_given_in_one_edit_is_one_commit() {
+    let mut db = test_db();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let (in_edit, committed) = db.edit_with(|edit| {
+        edit.set_crate_graph(graph);
+        let key = edit.crate_key(a);
+        edit.give::<ProcMacrosGift>(key, crate::Given::new(41_u32));
+        key
+    });
+    let key = committed.crates[&a];
+    assert_eq!(in_edit, key, "the key the commit reports");
+    assert_eq!(db.krate(key).given::<ProcMacrosGift, u32>(&db), Some(&41));
+}
+
+#[test]
+#[should_panic(expected = "no crate graph was set in this edit")]
+fn a_crate_key_without_a_graph_set_names_the_builder_id() {
+    let mut db = test_db();
+    let mut graph = CrateGraphBuilder::default();
+    let files = load(&mut db, 0, FILES);
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let edit = db.edit();
+    _ = edit.crate_key(a);
+}
+
+/// The invariant: a crate's data read back keyed ([`crate::BuiltCrateData::keyed`]) is the
+/// world's: given back, it moves nothing, and each dependency's key and flags are as set.
+#[test]
+fn a_crates_keyed_data_round_trips_through_the_world() {
+    let mut db = test_db();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let c = add(&mut graph, files[2], CfgOptions::default(), Env::default());
+    let dependency =
+        DependencyBuilder::with_prelude(CrateName::new("c").unwrap(), c, false, true).with_private(true);
+    graph.add_dep(a, dependency).unwrap();
+    let crates = set_graph(&mut db, graph);
+    let (a, c) = (crates[&a], crates[&c]);
+
+    let data = db.krate(a).data(&db).keyed(&db);
+    let [dep] = &data.dependencies[..] else { panic!("one dependency: {data:?}") };
+    assert_eq!(dep.crate_id, c);
+    assert_eq!((dep.is_prelude(), dep.is_sysroot(), dep.is_private()), (false, true, true));
+    assert_eq!(data.root_file_id, files[0]);
+
+    let content = db.krate(a).content(&db);
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_data(a, data);
+    });
+    assert_dropped_nothing(&committed, "a crate's own data given back");
+    assert_eq!(db.krate(a).content(&db), content);
+}
+
+/// How [`len_while_another_asks`]'s run and its second asker meet.
+struct Meeting {
+    /// The runs of the query begun.
+    runs: u32,
+    /// The second asker has its answer.
+    answered: bool,
+}
+
+static MEETING: blaze_core::lock::Lock<Meeting> =
+    blaze_core::lock::Lock::new("base-db.tests.meeting", Meeting { runs: 0, answered: false });
+static MET: blaze_core::lock::Signal = blaze_core::lock::Signal::new("base-db.tests.met");
+
+/// The length of `file`'s text. Its run lets the second asker go, then gives it a bounded
+/// while to ask: on the scheduler's flight that asker waits for this run, so it has no answer
+/// before the run ends and the while runs out; on a flight that refused it, it ends at once.
+#[blaze_memo::tracked(returns(copy))]
+fn len_while_another_asks(db: &Db, file: EditionedFileId) -> u32 {
+    let (file, _) = file.unpack(db);
+    let len = db.file_text(file).text(db).len() as u32;
+    let mut meeting = MEETING.lock();
+    meeting.runs += 1;
+    MET.notify_all();
+    _ = MET.wait_while_for(&mut meeting, |it| !it.answered, std::time::Duration::from_millis(200));
+    len
+}
+
+/// The invariant: a test database that several threads drive ([`Db::for_tests_driven`]) asked
+/// for one query from two threads at once runs it once, and both get its value: the second
+/// asker waits for the first one's run, never told it is in a cycle with a run on another
+/// thread's stack. The interleavings are proven in blaze-memo's simulation
+/// (`two_tasks_ask_one_key`); this is the database's flight as tests take it.
+#[test]
+fn a_driven_test_database_asked_one_query_from_two_threads_runs_it_once() {
+    let mut db = Db::for_tests_driven(no_boundaries, blaze_memo::Reads::Off);
+    let file = load(&mut db, 0, &[("/lib.rs", "fn f() {}")])[0];
+    let file = EditionedFileId::new(&db, file, Edition::Edition2021);
+    ran(&db, "len_while_another_asks");
+    let (first, second) = std::thread::scope(|scope| {
+        let db = &db;
+        let second = scope.spawn(move || {
+            {
+                let mut meeting = MEETING.lock();
+                let timed_out = MET.wait_while_for(
+                    &mut meeting,
+                    |it| it.runs == 0,
+                    std::time::Duration::from_secs(60),
+                );
+                assert!(!timed_out, "the first asker's run did not begin in 60 s");
+            }
+            let got = len_while_another_asks(db, file);
+            MEETING.lock().answered = true;
+            MET.notify_all();
+            got
+        });
+        let first = len_while_another_asks(db, file);
+        let second = second.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        (first, second)
+    });
+    assert_eq!(first, 9, "the text's length");
+    assert_eq!(second, first, "both askers get the one run's value");
+    assert_eq!(ran(&db, "len_while_another_asks"), 1, "the query ran once");
+    assert_eq!(MEETING.lock().runs, 1, "one run of the query began");
+}
+
+/// Has every crate of `keys` evaluate a query in its own arena ([`crate::crate_root_content`]:
+/// its root's files, its other `OUT_DIR`s), so each arena holds something a drop would lose.
+fn evaluate_in(db: &Db, keys: &[CrateKey]) {
+    for &key in keys {
+        _ = crate::crate_root_content(db, db.krate(key));
+    }
+}
+
+/// [`beside_a_sealed_library`] with each crate's arena holding a query's value, then a located
+/// gift to the sealed `lib` (the image's lang items, a crate's constants' key), under `plant`:
+/// the commit must drop nothing and the gift read back; given again under the fact held, it
+/// moves nothing; withdrawn, it drops `lib` and `top` alone ([`dropped_lib_and_top`]).
+fn a_located_gift(plant: Plant) -> Result<(), String> {
+    let mut db = test_db();
+    let keys = beside_a_sealed_library(&mut db);
+    let [lib, _, _] = keys;
+    evaluate_in(&db, &keys);
+    db.plant(plant);
+    let give = |edit: &mut Edit<'_>, value: u32| {
+        edit.give_located::<crate::LocatedForTests>(lib, test_fact("located"), crate::Given::new(value));
+    };
+    let committed = db.commit_with(|edit| give(edit, 5));
+    if !committed.dropped.is_empty() {
+        return Err(format!("a located gift's first gift dropped arenas {:?}", committed.dropped));
+    }
+    match db.krate(lib).located::<crate::LocatedForTests, u32>(&db) {
+        Some(5) => {}
+        other => return Err(format!("the located gift read back is {other:?}, not 5")),
+    }
+    // A slot of the crate's arena it is not: `given` of the kind finds none.
+    assert_eq!(db.krate(lib).given::<crate::LocatedForTests, u32>(&db), None, "no slot");
+    let committed = db.commit_with(|edit| give(edit, 6));
+    assert_dropped_nothing(&committed, "a located gift under the fact held");
+    let before = arenas_of(&db, keys);
+    let committed = db.commit_with(|edit| {
+        edit.take_located::<crate::LocatedForTests>(lib);
+    });
+    dropped_lib_and_top(&before, &committed).map_err(|why| format!("withdrawn: {why}"))?;
+    assert_eq!(db.krate(lib).located::<crate::LocatedForTests, u32>(&db), None, "withdrawn");
+    Ok(())
+}
+
+/// The invariant: a gift that says where a value can be read ([`crate::Located`]) is no input
+/// of any arena, so its first gift to a sealed crate whose arena holds evaluated queries
+/// drops nothing, and it is read back off the table; a withdrawal drops the crate and its
+/// dependents alone. The control: with `Plant::LocatedMarks` (the first gift marks its crate,
+/// as the lang items' and the constants' key's slots did, 28 and 24 arenas in round 27's
+/// first body edit) the oracle names the drop.
+#[test]
+fn a_located_gift_to_a_sealed_crate_drops_nothing() {
+    a_located_gift(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_located_gift(Plant::LocatedMarks).expect_err("a located gift that marked its crate was not caught");
+    assert!(planted.contains("first gift dropped arenas"), "{planted}");
+}
+
+/// The invariant's control of [`a_located_gift_to_a_sealed_crate_drops_nothing`]'s rule that a
+/// kind is given one way: a slot gift of a kind held located stops, naming the kind.
+#[test]
+#[should_panic(expected = "which holds a gift of that kind given as located")]
+fn a_slot_gift_of_a_located_kind_stops() {
+    let mut db = test_db();
+    let [lib, _, _] = beside_a_sealed_library(&mut db);
+    db.commit_with(|edit| {
+        edit.give_located::<crate::LocatedForTests>(lib, test_fact("located"), crate::Given::new(1_u32));
+    });
+    let mut edit = db.edit();
+    edit.give_by::<crate::LocatedForTests>(lib, test_fact("slot"), crate::Given::new(2_u32));
+}
+
+/// [`beside_a_sealed_library`] with each crate's arena holding a query's value, then `lib`'s
+/// cfg written under `plant` (a build script's `cargo:rustc-cfg`, which moves its item key and
+/// so the crate list): the commit must drop `lib` and its dependent `top`, and nothing of the
+/// session's, the roots' or `other`'s (the crate list's own arena may go: nothing here read
+/// it); the cfg read back.
+fn a_cfg_write(plant: Plant) -> Result<(), String> {
+    let mut db = test_db();
+    let keys = beside_a_sealed_library(&mut db);
+    let [lib, top, other] = keys;
+    evaluate_in(&db, &keys);
+    db.plant(plant);
+    let before = arenas_of(&db, keys);
+    // The arenas themselves (index and generation): a crate made again keeps its index (the
+    // order did not move) under a new generation, so an index alone cannot show a remake.
+    let made = |db: &Db, key: CrateKey| {
+        use blaze_memo::Id as _;
+        db.krate(key).gid().arena()
+    };
+    let (top_was, other_was) = (made(&db, top), made(&db, other));
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_cfg_options(lib, cfg(&[flag("from_build_script")]));
+    });
+    let list = crate::world::LIST_ARENA;
+    let stray: Vec<u32, Global> = {
+        let mut stray = Vec::new_in(Global);
+        stray.extend(committed.dropped.iter().copied().filter(|&it| it != list && it != before[0] && it != before[1]));
+        stray
+    };
+    if !stray.is_empty() || !committed.dropped.contains(&before[0]) || !committed.dropped.contains(&before[1]) {
+        return Err(format!(
+            "a cfg write to `lib` dropped arenas {:?}: not `lib` ({}) and `top` ({}) alone, and `other` was at {}",
+            committed.dropped, before[0], before[1], before[2]
+        ));
+    }
+    assert_eq!(db.krate(lib).cfg_options(&db), &cfg(&[flag("from_build_script")]));
+    assert_eq!(made(&db, other), other_was, "`other` kept its arena");
+    assert_ne!(made(&db, top), top_was, "`top`, its dependent, made again");
+    assert_eq!(made(&db, top).index(), before[1], "`top` made again at its index");
+    Ok(())
+}
+
+/// The invariant: a cfg written for one crate (each of a cold build's build scripts' runs)
+/// drops that crate's arena and its dependents' and keeps every other crate's arena, the
+/// session's and the roots': the crate list it moves has an arena of its own, which only the
+/// runs that read the list borrow. The control: with `Plant::ListMarksSession` (the list a
+/// singleton of the session's, as it was until round 28: four cfg writes, 32 arenas dropped
+/// each) the oracle names the session.
+#[test]
+fn a_cfg_write_drops_its_crate_and_dependents_alone() {
+    a_cfg_write(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_cfg_write(Plant::ListMarksSession).expect_err("a cfg write that dropped the session was not caught");
+    assert!(planted.contains("dropped arenas"), "{planted}");
+}
+
+/// Two source roots committed with no crate, then under `plant` a crate graph whose `lib` is
+/// sealed and rooted in root 1, beside `top` on root 0 depending on it: the root's arena,
+/// carried from the first commit unsealed, must be made again sealed, so the snapshot is
+/// built (a sealed arena borrows only sealed ones) and `lib`'s root's arena is dropped; the
+/// panic's text when the build refuses it.
+fn a_root_sealed_after_it_was_made(plant: Plant) -> Result<(), String> {
+    let mut db = test_db();
+    let (lib_file, top_file) = (FileId::from_raw(0), FileId::from_raw(1));
+    put_root(&mut db, 0, &[(top_file, "/top/lib.rs", "pub fn caller() {}")]);
+    put_root(&mut db, 1, &[(lib_file, "/lib/lib.rs", "pub fn callee() {}")]);
+    db.plant(plant);
+    let mut graph = CrateGraphBuilder::default();
+    let lib = add(&mut graph, lib_file, CfgOptions::default(), Env::default());
+    graph.seal(lib, ContentId::of("base-db root sealed later test pin", b"lib"));
+    let top = add(&mut graph, top_file, CfgOptions::default(), Env::default());
+    depend(&mut graph, top, lib, "lib");
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.commit_with(|edit| {
+            edit.set_crate_graph(graph);
+        })
+    }));
+    let committed = built.map_err(|payload| match payload.downcast_ref::<String>() {
+        Some(text) => text.clone(), // clone: the panic's text, for the oracle
+        None => "a commit panicked with no text".to_owned(),
+    })?;
+    // Roots are at 2 and 3 (session 0, list 1): root 1's, which `lib` is rooted in, is 3.
+    assert!(committed.dropped.contains(&3), "the root sealed now was made again: {:?}", committed.dropped);
+    assert!(!committed.dropped.contains(&0), "sealing a root dropped the session: {:?}", committed.dropped);
+    Ok(())
+}
+
+/// The invariant: an arena whose seal moved since it was made (a source root a sealed crate
+/// came to be rooted in, with no write of the root) is made again with its new seal, so no
+/// sealed arena borrows an unsealed one, and nothing else is dropped for it. While the crate
+/// list was the session's, every crate listed dropped every arena and hid this. The control:
+/// with `Plant::SealCarried` (the seal not compared) the snapshot's build refuses the sealed
+/// `lib` borrowing its unsealed root.
+#[test]
+fn a_root_sealed_after_it_was_made_is_made_again_sealed() {
+    a_root_sealed_after_it_was_made(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_root_sealed_after_it_was_made(Plant::SealCarried).expect_err("a root carried with its old seal was not caught");
+    assert!(planted.contains("is sealed but its dependency"), "{planted}");
+}
+
+/// [`two_roots`] with `a`'s and `c`'s arenas holding a query's value, then a crate `d` added
+/// to the list under `plant`, on `c`'s root file with another cfg (a second crate of one
+/// package: `check` after `run` adds the test crate beside the binary): the commit must keep
+/// the session's arena, the roots', `a`'s and `c`'s (neither depends on `d`).
+fn a_crate_added(plant: Plant) -> Result<(), String> {
+    let mut db = test_db();
+    let (a, c, _) = two_roots(&mut db);
+    evaluate_in(&db, &[a, c]);
+    db.plant(plant);
+    let before = [arena_of(&db, a), arena_of(&db, c)];
+    let (fa, fc) = (FileId::from_raw(0), FileId::from_raw(1));
+    let mut graph = CrateGraphBuilder::default();
+    add(&mut graph, fa, CfgOptions::default(), Env::default());
+    add(&mut graph, fc, CfgOptions::default(), Env::default());
+    let d = add(&mut graph, fc, cfg(&[flag("test")]), Env::default());
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_graph(graph);
+    });
+    let d = committed.crates[&d];
+    let kept = |index: u32| !committed.dropped.contains(&index);
+    if !(kept(0) && kept(before[0]) && kept(before[1])) {
+        return Err(format!(
+            "adding `d` dropped arenas {:?}: the session's (0), `a`'s ({}) or `c`'s ({})",
+            committed.dropped, before[0], before[1]
+        ));
+    }
+    assert_eq!([arena_of(&db, a), arena_of(&db, c)], before, "`a` and `c` kept their arenas");
+    assert!(crate::all_crates(&db).contains(&db.krate(d)), "`d` is listed");
+    Ok(())
+}
+
+/// The invariant: a crate added to the list keeps every arena that does not depend on it (the
+/// session's, the roots', every other crate's); what moves is the list's own arena, and a
+/// crate whose root's other `OUT_DIR`s moved. The control: with `Plant::ListMarksSession` (the
+/// list a singleton of the session's, round 27's `check` after `run`: the second `hi` crate
+/// added at index 32 dropped all 32 arenas) the oracle names the drop.
+#[test]
+fn a_crate_added_to_the_list_keeps_every_arena_not_depending_on_it() {
+    a_crate_added(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_crate_added(Plant::ListMarksSession).expect_err("a crate added that dropped the session was not caught");
+    assert!(planted.contains("dropped arenas"), "{planted}");
+}
+
+/// The invariant: a crate's other `OUT_DIR`s are those of the listed crates of its root, its
+/// own left out, sorted, each once, as the query read them off the list; a crate of its root
+/// given an `OUT_DIR` marks its arena (its field moved) and not the arena of a crate on
+/// another root. The control is the same write read back on `a`, whose root holds no other
+/// crate: its dirs stay empty and its arena is kept.
+#[test]
+fn a_crates_other_out_dirs_are_its_roots_others_and_move_its_arena_alone() {
+    let mut db = test_db();
+    let (a, c, _) = two_roots(&mut db);
+    let fc = FileId::from_raw(1);
+    let out = |dir: &str| -> Env { [("OUT_DIR".to_owned(), dir.to_owned())].into_iter().collect() };
+    let mut graph = CrateGraphBuilder::default();
+    add(&mut graph, FileId::from_raw(0), CfgOptions::default(), Env::default());
+    add(&mut graph, fc, CfgOptions::default(), Env::default());
+    let d = add(&mut graph, fc, cfg(&[flag("test")]), out("/target/out/d/"));
+    let d = set_graph(&mut db, graph)[&d];
+    fn dirs(db: &Db, key: CrateKey) -> &[&str] {
+        crate::other_out_dirs(db, db.krate(key))
+    }
+    assert_eq!(dirs(&db, c), ["/target/out/d"], "`d`'s, its trailing separator gone");
+    assert!(dirs(&db, d).is_empty(), "its own left out");
+    assert!(dirs(&db, a).is_empty(), "another root's");
+    let before = [arena_of(&db, a), arena_of(&db, c)];
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_env(d, out("/target/out/d2"));
+    });
+    assert!(committed.dropped.contains(&before[1]), "`c`'s dirs moved: {committed:?}");
+    assert!(!committed.dropped.contains(&before[0]), "`a` is on another root: {committed:?}");
+    assert_eq!(dirs(&db, c), ["/target/out/d2"]);
 }

@@ -255,9 +255,42 @@ macro_rules! interned_slice {
         }
 
         $crate::next_solver::interner::impl_stored_interned_slice!($name, $stored_name);
+        $crate::next_solver::interner::table::holds_by_visit!($ty_static);
+
+        impl<'db> $crate::next_solver::interner::table::Homed for $name<'db> {
+            /// The greatest of its items' homes, written when the list was added.
+            #[inline]
+            fn home(&self) -> ::core::option::Option<::blaze_memo::ArenaId> {
+                $storage::table().home(self.index)
+            }
+        }
+
+        $crate::next_solver::interner::memo_home!($name<'db>);
     };
 }
 pub(crate) use interned_slice;
+
+/// [`blaze_memo::Home`] for a handle of a solver table (and its `Stored` form): its row's home
+/// ([`table::Homed`]), so a key holding it is homed with the most downstream crate it names. A
+/// row of plain data names no arena (`None`), and names none here: a key of nothing else is
+/// homed at the asking snapshot's own session arena (`blaze_memo`'s `home_of`), at whatever
+/// generation that snapshot holds.
+macro_rules! memo_home {
+    ($($ty:ty),+ $(,)?) => {$(
+        #[allow(unused_lifetimes)]
+        impl<'db> ::blaze_memo::Home for $ty {
+            #[inline]
+            fn home(&self, homes: &mut ::blaze_memo::Homes<'_>) {
+                if let ::core::option::Option::Some(arena) =
+                    $crate::next_solver::interner::table::Homed::home(self)
+                {
+                    homes.arena(arena);
+                }
+            }
+        }
+    )+};
+}
+pub(crate) use memo_home;
 
 /// `$stored_name`, the list `$name` as kept in a query result: its index, which stays valid in
 /// every revision of its database, as an interned value is freed only by a release of the
@@ -276,10 +309,14 @@ macro_rules! impl_stored_interned_slice {
             }
         }
 
-        // SAFETY: `$stored_name` is a row number and borrows nothing, and the row it names is
-        // freed only by a release, which runs once no database is left, so it is valid in every
-        // revision of its database (unlike `$name`, which carries `'db`).
-        unsafe impl blaze_query::db::Value for $stored_name {}
+        impl $crate::next_solver::interner::table::Homed for $stored_name {
+            #[inline]
+            fn home(&self) -> ::core::option::Option<::blaze_memo::ArenaId> {
+                $crate::next_solver::interner::table::Homed::home(&self.as_ref())
+            }
+        }
+
+        $crate::next_solver::interner::memo_home!($stored_name);
 
         impl std::fmt::Debug for $stored_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -363,7 +400,7 @@ pub(crate) use impl_foldable_for_stored_type;
 /// field and an `at(NonZeroU32)` constructor.
 macro_rules! impl_stored_interned {
     ( $name:ident, $stored_name:ident $(,)? ) => {
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $stored_name {
             index: ::std::num::NonZeroU32,
         }
@@ -376,6 +413,15 @@ macro_rules! impl_stored_interned {
                 $name::at(self.index)
             }
         }
+
+        impl $crate::next_solver::interner::table::Homed for $stored_name {
+            #[inline]
+            fn home(&self) -> ::core::option::Option<::blaze_memo::ArenaId> {
+                $crate::next_solver::interner::table::Homed::home(&self.as_ref())
+            }
+        }
+
+        $crate::next_solver::interner::memo_home!($stored_name, $name<'db>);
 
         impl std::fmt::Debug for $stored_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -418,7 +464,7 @@ pub struct DbInterner<'db> {
     features: Option<Features<'db>>,
 }
 
-// The database is `Send + Sync` (`blaze_query::db::Database`), so an interner is, by the auto traits.
+// The database is `Send + Sync` (`blaze_memo::Database`), so an interner is, by the auto traits.
 const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<DbInterner<'static>>();
@@ -630,13 +676,155 @@ interned_slice!(
 #[derive(Debug)]
 pub struct Tracked<T: fmt::Debug + Clone> {
     value: T,
-    reads: Option<blaze_query::db::Reads>,
+    reads: Option<Reads>,
+}
+
+/// What a piece of solving read, as blaze-memo's recorder listed it: sorted, deduplicated and
+/// shared, so a cache that keeps an answer for every query of the snapshot keeps its list once.
+/// Its rows name entries of this snapshot (`Read::Query`'s key), so it is kept only in a cache
+/// a later snapshot starts over or carries with those entries' arenas (`tls_cache`).
+#[derive(Clone, Debug)]
+pub struct Reads(std::sync::Arc<[blaze_memo::Read]>);
+
+impl Reads {
+    /// The rows, sorted and deduplicated, as the recorder listed them.
+    #[inline]
+    pub fn rows(&self) -> &[blaze_memo::Read] {
+        &self.0
+    }
+}
+
+const _: fn() = || {
+    fn shared<T: Send + Sync + 'static>() {}
+    shared::<Reads>();
+};
+
+thread_local! {
+    /// How many times this thread's solving used something a query computed earlier, outside
+    /// the [`recorded`] frames open now, whose reads those frames did not make ([`unshareable`]).
+    /// A frame whose count moved gives no list, as the old engine's `unshareable_reads` made
+    /// every open capture frame give none. A count, not a stack, so every frame open at the
+    /// mark sees it; a frame is closed on the thread it opened on, as blaze-memo's recorder
+    /// frame is.
+    static UNSHAREABLE_MARKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `work` under blaze-memo's recorder and gives what it read; `None` when what it computed
+/// must not be shared with another query: the snapshot keeps no read lists, it made an
+/// untracked read, or it used an answer of its query's own cache ([`unshareable`]), here or in a
+/// frame nested in this one.
+pub(crate) fn recorded<T>(db: &Db, work: impl FnOnce() -> T) -> (T, Option<Reads>) {
+    let memo = blaze_memo::Database::memo(db);
+    let marks = UNSHAREABLE_MARKS.with(std::cell::Cell::get);
+    let mut work = Some(work);
+    match blaze_memo::record(memo, || (work.take().expect("`record` runs its work once"))()) {
+        Ok((value, reads)) => {
+            let shareable = UNSHAREABLE_MARKS.with(std::cell::Cell::get) == marks
+                && !reads.iter().any(|read| read.is_untracked());
+            (value, shareable.then(|| Reads(std::sync::Arc::from(reads))))
+        }
+        Err(blaze_memo::RecorderOff) => {
+            (work.take().expect("`record` refused before running its work")(), None)
+        }
+    }
+}
+
+/// Makes the running work depend on `reads` as if it had made them: the running query's list,
+/// and every [`recorded`] frame open in it, takes them.
+pub(crate) fn replay(db: &Db, reads: &Reads) {
+    let memo = blaze_memo::Database::memo(db);
+    for &read in reads.0.iter() {
+        blaze_memo::read(memo, read);
+    }
+}
+
+/// Makes every [`recorded`] frame open on this thread give no list: the caller used something
+/// its query computed earlier, outside those frames, whose reads they did not make.
+fn unshareable() {
+    UNSHAREABLE_MARKS.with(|marks| marks.set(marks.get() + 1));
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct AllocId;
 
 interned_slice!(VariancesOfStorage, VariancesOf, StoredVariancesOf, variances, Variance, Variance);
+
+/// A variance is plain data. (Its `Holds` comes from [`VariancesOf`]'s `interned_slice!`.)
+impl table::Homed for Variance {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        None
+    }
+}
+
+/// A canonical variable's home: its placeholder's, if it is one; the others are plain data.
+/// By hand, as `CanonicalVarKind` has no codec.
+impl<'db> table::Homed for CanonicalVarKind<'db> {
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        match self {
+            rustc_type_ir::CanonicalVarKind::PlaceholderTy(placeholder) => {
+                table::Homed::home(placeholder)
+            }
+            rustc_type_ir::CanonicalVarKind::PlaceholderRegion(placeholder) => {
+                table::Homed::home(placeholder)
+            }
+            rustc_type_ir::CanonicalVarKind::PlaceholderConst(placeholder) => {
+                table::Homed::home(placeholder)
+            }
+            rustc_type_ir::CanonicalVarKind::Ty { .. }
+            | rustc_type_ir::CanonicalVarKind::Int
+            | rustc_type_ir::CanonicalVarKind::Float
+            | rustc_type_ir::CanonicalVarKind::Region(_)
+            | rustc_type_ir::CanonicalVarKind::Const(_) => None,
+        }
+    }
+}
+
+/// The list of opaque types a typing mode names, if it names one.
+fn typing_mode_opaques<'db>(
+    mode: &rustc_type_ir::TypingMode<DbInterner<'db>, rustc_type_ir::MayBeErased>,
+) -> Option<SolverDefIds<'db>> {
+    match *mode {
+        rustc_type_ir::TypingMode::Typeck { defining_opaque_types_and_generators: ids }
+        | rustc_type_ir::TypingMode::PostTypeckThroughBorrowck { defining_opaque_types: ids }
+        | rustc_type_ir::TypingMode::PostBorrowck { defined_opaque_types: ids } => Some(ids),
+        rustc_type_ir::TypingMode::Coherence
+        | rustc_type_ir::TypingMode::Reflection
+        | rustc_type_ir::TypingMode::PostAnalysis
+        | rustc_type_ir::TypingMode::Codegen
+        | rustc_type_ir::TypingMode::ErasedNotCoherence(_) => None,
+    }
+}
+
+/// The newest arena a canonical goal names: its environment's, predicate's, opaques',
+/// variables' and typing mode's. By hand, as `CanonicalQueryInput` has no codec and no visit.
+impl<'db> table::Homed for CanonicalInputData<'db> {
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        let input = &self.canonical.value;
+        let mut home = table::Homed::home(&input.goal.param_env.clauses)
+            .max(table::Homed::home(&input.goal.predicate))
+            .max(table::Homed::home(&input.predefined_opaques_in_body))
+            .max(table::Homed::home(&self.canonical.var_kinds));
+        if let Some(ids) = typing_mode_opaques(&self.typing_mode.0) {
+            home = home.max(table::Homed::home(&ids));
+        }
+        home
+    }
+}
+
+/// The rows a canonical goal holds: the same fields [`table::Homed`] reads, each a handle.
+impl table::Holds for CanonicalInputData<'static> {
+    fn hold(&self, held: &mut table::Held) {
+        let input = &self.canonical.value;
+        GenericTypeVisitable::generic_visit_with(&input.goal.param_env.clauses, held);
+        GenericTypeVisitable::generic_visit_with(&input.goal.predicate, held);
+        GenericTypeVisitable::generic_visit_with(&input.predefined_opaques_in_body, held);
+        GenericTypeVisitable::generic_visit_with(&self.canonical.var_kinds, held);
+        if let Some(ids) = typing_mode_opaques(&self.typing_mode.0) {
+            GenericTypeVisitable::generic_visit_with(&ids, held);
+        }
+    }
+}
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -664,7 +852,9 @@ enum AdtDefInner {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AdtDef(AdtDefInner);
 
-const _: () = assert!(size_of::<AdtDef>() == 8);
+// 12 bytes: an 8-byte `Gid` id (arena and local; blaze-query's id was 4), its flags and the
+// variant's tag in the padding after them (it was 8). Held in `TyKind::Adt`, within its 48.
+const _: () = assert!(size_of::<AdtDef>() == 12);
 
 impl AdtDef {
     pub fn new<'db>(def_id: AdtId, interner: DbInterner<'db>) -> Self {
@@ -1023,6 +1213,18 @@ const _: () = assert!(size_of::<Option<Pattern<'static>>>() == 4);
 // A row costs `table::ROW_BYTES` hot bytes and its kind, at most 48 cold ones.
 const _: () = assert!(size_of::<PatternKind<'static>>() <= 48);
 
+table::holds_by_visit!(PatternKind<'static>);
+
+impl<'db> table::Homed for Pattern<'db> {
+    /// Its row's home, written when the row was added.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        PATTERNS.home(self.index)
+    }
+}
+
+memo_home!(Pattern<'db>);
+
 impl<'db> Pattern<'db> {
     pub fn new(_interner: DbInterner<'db>, kind: PatternKind<'db>) -> Self {
         Self::intern(kind)
@@ -1032,7 +1234,8 @@ impl<'db> Pattern<'db> {
     pub(super) fn intern(kind: PatternKind<'db>) -> Self {
         Self::at(PATTERNS.intern(kind, || {
             let (flags, binder) = pattern_flags(kind);
-            table::RowInfo { tag: persist::tag(&kind), flags, binder }
+            let (tag, home) = persist::tag_and_home(&kind);
+            table::RowInfo { tag, flags, binder, home }
         }))
     }
 
@@ -1267,7 +1470,7 @@ impl<'db> Interner for DbInterner<'db> {
         ExternalConstraints::new(self, data)
     }
 
-    type DepNodeIndex = Option<blaze_query::db::Reads>;
+    type DepNodeIndex = Option<Reads>;
 
     type Tracked<T: fmt::Debug + Clone> = Tracked<T>;
 
@@ -1336,28 +1539,27 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn get_tracked<T: fmt::Debug + Clone>(self, tracked: &Self::Tracked<T>) -> T {
-        match tracked.reads {
+        match &tracked.reads {
             // From the shared cache: the query taking it reruns when the reads change, and so
-            // does any goal it is solving in a capture of its own, which takes them too.
-            Some(reads) => blaze_query::db::replay_reads(self.db, reads),
+            // does any goal it is solving in a frame of its own, which takes them too.
+            Some(reads) => replay(self.db, reads),
             // From this query's own cache: the query made the reads itself, but a goal being
-            // captured now did not, and so must not be shared either.
-            None => blaze_query::db::unshareable_reads(self.db),
+            // recorded now did not, and so must not be shared either.
+            None => unshareable(),
         }
         tracked.value.clone() // clone: `get_tracked` hands out an owned value; the solver's are handles
     }
 
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex) {
-        // Every goal the solver computes runs in here, a nested goal inside its parent's. A
-        // goal can take minutes of solving that asks the database nothing, so a cancelled one
-        // is noticed here rather than at the next query.
-        blaze_query::db::unwind_if_cancelled(self.db);
-        blaze_query::db::capture_reads(self.db, || super::ensure_sufficient_stack(task))
+        // Every goal the solver computes runs in here, a nested goal inside its parent's. (The
+        // old engine checked for a newer revision's cancellation here; a blaze-memo snapshot is
+        // never cancelled by a newer one, so there is nothing to check.)
+        recorded(self.db, || super::ensure_sufficient_stack(task))
     }
 
     fn cache_scope(self, reads: &Self::DepNodeIndex) -> rustc_type_ir::search_graph::CacheScope {
-        // A goal is shared only with its reads, which `capture_reads` gives only when any
-        // query may replay them.
+        // A goal is shared only with its reads, which `recorded` gives only when any query
+        // may replay them.
         match reads {
             Some(_) => rustc_type_ir::search_graph::CacheScope::Shared,
             None => rustc_type_ir::search_graph::CacheScope::Query,
@@ -3470,10 +3672,10 @@ mod attached_db {
     /// (`stdx::assert::reported`), after the value kind.
     pub const DETACHED: &str = "formatted with no database attached";
 
-    /// Formats `what` with the database `blaze_query::db::attach` lent the task.
+    /// Formats `what` with the database `blaze_memo::attach` lent the task.
     ///
     /// Text a user reads (a diagnostic, an error) is rendered with the database in hand
-    /// (`HirDisplay`, or inside `blaze_query::db::attach` where the text is made), never through
+    /// (`HirDisplay`, or inside `blaze_memo::attach` where the text is made), never through
     /// a `Debug` that reads the task's: a query's text must not depend on which thread ran it
     /// (rule 20, rule 25). Every query's run has its database attached, so this reads none only
     /// outside one, where a driver formats a value it holds: a bug at the caller.
@@ -3492,7 +3694,7 @@ mod attached_db {
         op: impl FnOnce(&Db, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
     ) -> std::fmt::Result {
         let at = std::panic::Location::caller();
-        blaze_query::db::with_attached_db(|db: Option<&Db>| match db {
+        blaze_memo::with_attached_db::<Db, _>(|db: Option<&Db>| match db {
             Some(db) => op(db, f),
             None => detached(f, what, at),
         })
@@ -3510,7 +3712,7 @@ mod attached_db {
         if cfg!(debug_assertions) && !std::thread::panicking() {
             panic!(
                 "a `{what}` was formatted with no database attached: render text a user reads with the \
-                 database in hand (`HirDisplay`), or inside `blaze_query::db::attach` where it is made"
+                 database in hand (`HirDisplay`), or inside `blaze_memo::attach` where it is made"
             );
         }
         stdx::assert::reported::report_at(what, DETACHED, at);
@@ -3528,7 +3730,7 @@ mod attached_db {
         use hir_expand::fixture;
 
         fn attached_here() -> Option<usize> {
-            blaze_query::db::with_attached_db(|it: Option<&base_db::Db>| {
+            blaze_memo::with_attached_db::<base_db::Db, _>(|it: Option<&base_db::Db>| {
                 it.map(|it| std::ptr::from_ref(it).addr())
             })
         }
@@ -3537,7 +3739,7 @@ mod attached_db {
         fn adt_of_s(db: &base_db::Db) -> super::super::AdtDef {
             use hir_def::{AdtId, ModuleDefId, nameres::crate_def_map};
 
-            blaze_query::db::attach(db, || {
+            blaze_memo::attach(db, || {
                 let mut found = None;
                 for &krate in base_db::all_crates(db).iter() {
                     for (_, module) in crate_def_map(db, krate).modules(db) {
@@ -3718,10 +3920,10 @@ mod attached_db {
                                     );
                                 };
                                 if at == 0 {
-                                    blaze_query::db::attach(&*db, wait);
+                                    blaze_memo::attach(&*db, wait);
                                 } else {
-                                    blaze_query::db::attach(&*other, || {
-                                        blaze_query::db::attach(&*db, wait)
+                                    blaze_memo::attach(&*other, || {
+                                        blaze_memo::attach(&*db, wait)
                                     });
                                 }
                                 assert_eq!(
@@ -3838,10 +4040,10 @@ mod attached_db {
                                 );
                             };
                             if mine == 0 {
-                                blaze_query::db::attach(&*db, wait);
+                                blaze_memo::attach(&*db, wait);
                             } else {
-                                blaze_query::db::attach(&*other, || {
-                                    blaze_query::db::attach(&*db, wait)
+                                blaze_memo::attach(&*other, || {
+                                    blaze_memo::attach(&*db, wait)
                                 });
                             }
                             assert_eq!(attached_here(), None, "a job kept a database it detached");
@@ -3927,12 +4129,80 @@ pub(crate) mod table {
         sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
     };
 
+    use std::{alloc::Global, ops::ControlFlow};
+
     use blaze_core::lock::{Lock, LockGuard};
     use blaze_hash::{FixedState, SipKey, adaptive};
+    use blaze_memo::ArenaId;
     use blaze_reclaim::{Grace, Horizon};
 
     use crate::evict::Released;
     use rustc_type_ir::{DebruijnIndex, TypeFlags};
+
+    /// What a value a [`Lists`] or [`Values`] keeps names: its home, the greatest arena of the
+    /// ids in it and of the rows it holds, `None` for plain data (it names no arena). `None`
+    /// orders below every arena, so a whole's home is the `max` of its parts'. Never an arena
+    /// standing for "the session": the session arena is made again at each commit that drops
+    /// it, so a row of plain data names none, lives in every snapshot, and a key of it is homed
+    /// at the asking snapshot's own session ([`super::memo_home`]). Asked once, as the value is
+    /// added (the miss path); a row lives no longer than its home's arena in a release of the
+    /// dead ([`release_dead`]). [`Rows`] are told theirs ([`RowInfo::home`]), computed with
+    /// their tag in one pass of the codec (`persist::tag`).
+    pub(crate) trait Homed {
+        fn home(&self) -> Option<ArenaId>;
+    }
+
+    /// The rows of any table a value a table keeps holds directly: what a release of the dead
+    /// ([`release_dead`]) keeps of a row it keeps, so that no row kept names a freed one.
+    pub(crate) trait Holds {
+        fn hold(&self, held: &mut Held);
+    }
+
+    /// [`Homed`] and [`Holds`] for values that hold no id and no row: homed nowhere (`None`),
+    /// holding nothing.
+    macro_rules! plain_data {
+        ($($ty:ty),+ $(,)?) => {$(
+            impl $crate::next_solver::interner::table::Homed for $ty {
+                #[inline]
+                fn home(&self) -> ::core::option::Option<::blaze_memo::ArenaId> {
+                    ::core::option::Option::None
+                }
+            }
+            impl $crate::next_solver::interner::table::Holds for $ty {
+                #[inline]
+                fn hold(&self, _: &mut $crate::next_solver::interner::table::Held) {}
+            }
+        )+};
+    }
+    pub(crate) use plain_data;
+
+    /// [`Holds`] for values whose rows the walk over interned values
+    /// ([`super::WorldExposer`]) reaches: each handle in them, not what it holds.
+    macro_rules! holds_by_visit {
+        ($($ty:ty),+ $(,)?) => {$(
+            impl $crate::next_solver::interner::table::Holds for $ty {
+                #[inline]
+                fn hold(&self, held: &mut $crate::next_solver::interner::table::Held) {
+                    ::rustc_type_ir::GenericTypeVisitable::generic_visit_with(self, held);
+                }
+            }
+        )+};
+    }
+    pub(crate) use holds_by_visit;
+
+    /// The rows a value holds directly, as [`Holds::hold`] lists them: each handle's table and
+    /// row, not descended into (the walk stops at every row it is told of).
+    pub(crate) struct Held {
+        rows: Vec<(&'static str, u32), Global>,
+    }
+
+    impl super::WorldExposer for Held {
+        #[inline]
+        fn on_interned(&mut self, table: &'static str, index: u32) -> ControlFlow<()> {
+            self.rows.push((table, index));
+            ControlFlow::Break(())
+        }
+    }
 
     /// A count of the slots the indexes look at, kept only under `cfg(test)`: what the test
     /// that bounds a lookup's probes reads. A no-op in every other build.
@@ -4543,6 +4813,29 @@ pub(crate) mod table {
         /// No thread reads or writes the table during the call or holds a reference into it,
         /// and nothing that outlives the call names a row of it but `keep`'s.
         unsafe fn release(&self, keep: &[NonZeroU32]) -> u64;
+
+        /// Every row written whose home `live` accepts, in order, onto `out`.
+        fn homed_in(&self, live: &dyn Fn(Option<ArenaId>) -> bool, out: &mut Vec<NonZeroU32, Global>);
+
+        /// The rows `row` (written) holds directly, of any table, onto `held`.
+        fn hold(&self, row: NonZeroU32, held: &mut Held);
+    }
+
+    /// The rows `next` (one past the last claimed) leaves written whose home `live` accepts:
+    /// what [`Table::homed_in`] lists of a table with a home column and a publish check.
+    fn rows_homed_in(
+        next: u64,
+        written: impl Fn(NonZeroU32) -> bool,
+        home: impl Fn(NonZeroU32) -> Option<ArenaId>,
+        live: &dyn Fn(Option<ArenaId>) -> bool,
+        out: &mut Vec<NonZeroU32, Global>,
+    ) {
+        for at in 1..next.min(u64::from(u32::MAX)) {
+            let row = NonZeroU32::new(at as u32).expect("rows start at 1");
+            if written(row) && live(home(row)) {
+                out.push(row);
+            }
+        }
     }
 
     /// Every table that has added a row, each once, in the order they first did: what
@@ -4583,6 +4876,12 @@ pub(crate) mod table {
     /// stale row read after a release is not a crash but a wrong answer (its number names
     /// another value), so the release refuses rather than trusts its caller.
     pub(crate) fn refuse_unless_quiet() {
+        refuse_unless_quiet_with(0);
+    }
+
+    /// [`refuse_unless_quiet`], with up to `front_ends` front ends kept: a release of the dead
+    /// ([`release_dead`]) runs beside the one front end whose snapshot it is told of.
+    fn refuse_unless_quiet_with(front_ends: u32) {
         let kept = crate::evict::front_ends_kept();
         let here = blaze_reclaim::in_task();
         let grace = Grace::start();
@@ -4591,16 +4890,99 @@ pub(crate) mod table {
         if plant::UNCHECKED.get() {
             return;
         }
-        if kept != 0 || here || running {
+        if kept > front_ends || here || running {
             panic!(
                 "the trait solver's interner tables were asked to be released while their rows \
-                 can still be read: {kept} front ends kept (`hir_ty::evict::FRONT_ENDS`), \
-                 the releasing thread {} a task, and {} task that began before the release \
-                 still running; a release runs with no front end kept and no task running",
+                 can still be read: {kept} front ends kept (`hir_ty::evict::FRONT_ENDS`, at \
+                 most {front_ends} allowed), the releasing thread {} a task, and {} task that \
+                 began before the release still running; a release runs with no other front \
+                 end kept and no task running",
                 if here { "in" } else { "in no" },
                 if running { "a" } else { "no" },
             );
         }
+    }
+
+    /// Releases every row of every table of the process ([`TABLES`]) whose home is an arena
+    /// `memo` no longer holds (dropped, or of an older generation), once nothing can read one:
+    /// what keeps the tables per arena, as blaze-memo keeps entries, so a dropped crate's types
+    /// go with its arena instead of living to the process's end.
+    ///
+    /// Kept: every row of plain data (homed nowhere, `None`), every row homed in an arena of
+    /// `memo` ([`blaze_memo::Memo::arenas`], its session arena's making among them), every row the process's statics name ([`super::rows_held_by_process_statics`]),
+    /// and, to a fixpoint, every row a kept row holds ([`Holds`]), each at its number. A row
+    /// homed live can hold a row homed in a dropped arena (a type naming two unrelated crates
+    /// is homed in the greater, and the lesser may drop alone): that row is kept with it, as
+    /// freeing it would leave a kept row naming a number a later row is given.
+    ///
+    /// The caller, between snapshots: `memo` is the newest snapshot of the one front end the
+    /// process keeps (at most one is counted in `crate::evict::FRONT_ENDS`, as two front ends'
+    /// arenas are numbered apart and one's ids say nothing of the other's), and it has let go
+    /// of every holder of a row outside the memo that a dropped arena's queries filled: each
+    /// dropped crate's shared solver caches (`interner::drop_shared_solver_caches`) and every
+    /// thread's (`interner::clear_tls_solver_cache`). A thread's param-env cache starts over by
+    /// [`releases`], which this moves. Panics, naming what it found, unless no task runs.
+    pub(crate) fn release_dead(memo: &blaze_memo::Memo) -> Released {
+        refuse_unless_quiet_with(1);
+        let mut live: Vec<ArenaId, Global> = Vec::new_in(Global);
+        live.extend(memo.arenas());
+        live.sort_unstable();
+        let live = |home: Option<ArenaId>| home.is_none_or(|home| live.binary_search(&home).is_ok());
+        let tables: Vec<&'static dyn Table, Global> = TABLES.lock().to_vec_in(Global);
+        let keep = reached(&tables, &live, super::rows_held_by_process_statics());
+        // SAFETY: `refuse_unless_quiet_with` found at most the one front end `memo` is of and
+        // no task running, so no thread reads, writes or holds a reference into a table; that
+        // front end's live entries are homed in `live` arenas, and every row they name is homed
+        // there too (a row's home is the greatest of what it names) or held by such a row, all
+        // of which `reached` keeps; the caller let go of every other holder of a row.
+        let released = unsafe { release_tables(&tables, &keep) };
+        RELEASES.fetch_add(1, Ordering::AcqRel);
+        released
+    }
+
+    /// The rows of `tables` homed where `live` accepts, the rows of `roots`, and every row any
+    /// of them holds, to a fixpoint: by table name and row, as [`release_tables`] keeps them.
+    fn reached(
+        tables: &[&'static dyn Table],
+        live: &dyn Fn(Option<ArenaId>) -> bool,
+        roots: Vec<(&'static str, u32)>,
+    ) -> Vec<(&'static str, u32)> {
+        let at = |name: &str| {
+            tables.iter().position(|table| table.name() == name).unwrap_or_else(|| {
+                panic!("a row of the {name} table is held, and no table of the process is named so")
+            })
+        };
+        let mut seen: Vec<blaze_hash::HashSet<u32, Global>, Global> = Vec::new_in(Global);
+        seen.resize_with(tables.len(), || blaze_hash::HashSet::new_in(Global));
+        let mut todo: Vec<(usize, NonZeroU32), Global> = Vec::new_in(Global);
+        let mut homed: Vec<NonZeroU32, Global> = Vec::new_in(Global);
+        for (index, table) in tables.iter().enumerate() {
+            homed.clear();
+            table.homed_in(live, &mut homed);
+            todo.extend(homed.iter().map(|&row| (index, row)));
+        }
+        todo.extend(roots.into_iter().map(|(name, row)| {
+            (at(name), NonZeroU32::new(row).unwrap_or_else(|| panic!("row 0 of the {name} table is held")))
+        }));
+        let mut held = Held { rows: Vec::new_in(Global) };
+        while let Some((index, row)) = todo.pop() {
+            if !seen[index].insert(row.get()) {
+                continue;
+            }
+            held.rows.clear();
+            tables[index].hold(row, &mut held);
+            for &(name, child) in &held.rows {
+                let child = NonZeroU32::new(child)
+                    .unwrap_or_else(|| panic!("row 0 of the {name} table is held"));
+                todo.push((at(name), child));
+            }
+        }
+        let mut keep = Vec::new_in(Global);
+        for (index, rows) in seen.iter().enumerate() {
+            let name = tables[index].name();
+            keep.extend(rows.iter().map(|&row| (name, row)));
+        }
+        keep
     }
 
     /// Releases every table of the process ([`TABLES`]) once nothing can read a row
@@ -5147,12 +5529,14 @@ pub(crate) mod table {
     }
 
     /// What [`Rows::intern`] computes once, when it adds a value: its tag (its codec's first
-    /// word, in `persist.rs`), flags and outer exclusive binder.
+    /// word, in `persist.rs`), flags, outer exclusive binder, and home (the greatest arena of
+    /// the ids and rows it names, from the same pass of the codec as the tag).
     #[derive(Clone, Copy)]
     pub(crate) struct RowInfo {
         pub(crate) tag: u8,
         pub(crate) flags: TypeFlags,
         pub(crate) binder: DebruijnIndex,
+        pub(crate) home: Option<ArenaId>,
     }
 
     /// The rows of one kind with a structure, `K` its kind (`TyKind<'static>`, ...), kept whole
@@ -5162,7 +5546,9 @@ pub(crate) mod table {
     /// - `flags` and `binder`, what every `has_type_flags`/`has_escaping_bound_vars` reads;
     /// - `tag`, the kind's tag plus one (0 for a row not written yet, so storing it publishes
     ///   the row): a scan by kind reads one byte a row;
-    /// - `kinds`, the value, read by `kind()` and by the index's equality check.
+    /// - `kinds`, the value, read by `kind()` and by the index's equality check;
+    /// - `home`, written once with the row: what a release of the dead ([`release_dead`]) and
+    ///   a key holding the row as an argument ([`blaze_memo::Home`]) read.
     ///
     /// Lookup: one hash of the kind (no encoding), one probe of the index (a cache line), one
     /// equality check of the row it names.
@@ -5176,6 +5562,7 @@ pub(crate) mod table {
         flags: Column<u32>,
         binder: Column<u32>,
         kinds: Column<K>,
+        home: Column<Option<ArenaId>>,
         index: Index,
     }
 
@@ -5183,7 +5570,7 @@ pub(crate) mod table {
     pub(crate) const ROW_BYTES: usize = size_of::<AtomicU8>() + size_of::<u32>() + size_of::<u32>();
     const _: () = assert!(ROW_BYTES == 9);
 
-    impl<K: Copy + Hash + Eq + Sync + 'static> Rows<K> {
+    impl<K: Copy + Hash + Eq + Sync + Holds + 'static> Rows<K> {
         /// A table of rows 1 to `last`, named `what` in what it panics with.
         pub(crate) const fn new(what: &'static str, last: u32) -> Rows<K> {
             Rows {
@@ -5195,6 +5582,7 @@ pub(crate) mod table {
                 flags: Column::new(),
                 binder: Column::new(),
                 kinds: Column::new(),
+                home: Column::new(),
                 index: Index::new(),
             }
         }
@@ -5257,6 +5645,8 @@ pub(crate) mod table {
             unsafe { self.flags.write(row, info.flags.bits()) };
             // SAFETY: as above.
             unsafe { self.binder.write(row, info.binder.as_u32()) };
+            // SAFETY: as above.
+            unsafe { self.home.write(row, info.home) };
             // SAFETY: the tag column is zeroed and of atomics, and `row` is below 2^32.
             let tag = unsafe { self.tag.place(row) };
             // Publishes the row to `tag_of`'s acquire load.
@@ -5315,9 +5705,17 @@ pub(crate) mod table {
             // SAFETY: as in `kind`.
             DebruijnIndex::from_u32(unsafe { *self.binder.get(row.get().into()) })
         }
+
+        /// The home of `row`: the greatest arena of what its kind names.
+        #[inline]
+        pub(crate) fn home(&self, row: NonZeroU32) -> Option<ArenaId> {
+            self.tag_of(row);
+            // SAFETY: as in `kind`.
+            unsafe { *self.home.get(row.get().into()) }
+        }
     }
 
-    impl<K: Copy + Hash + Eq + Sync + 'static> Table for Rows<K> {
+    impl<K: Copy + Hash + Eq + Sync + Holds + 'static> Table for Rows<K> {
         fn name(&self) -> &'static str {
             self.what
         }
@@ -5327,23 +5725,45 @@ pub(crate) mod table {
                 + self.flags.bytes()
                 + self.binder.bytes()
                 + self.kinds.bytes()
+                + self.home.bytes()
                 + self.index.bytes()
+        }
+
+        fn homed_in(&self, live: &dyn Fn(Option<ArenaId>) -> bool, out: &mut Vec<NonZeroU32, Global>) {
+            rows_homed_in(
+                self.next.load(Ordering::Acquire),
+                |row| self.published(row),
+                |row| self.home(row),
+                live,
+                out,
+            );
+        }
+
+        fn hold(&self, row: NonZeroU32, held: &mut Held) {
+            self.tag_of(row);
+            // SAFETY: `tag_of` checked the row was written and published.
+            unsafe { *self.kinds.get(row.get().into()) }.hold(held);
         }
 
         unsafe fn release(&self, keep: &[NonZeroU32]) -> u64 {
             let before = self.held_bytes();
-            // alloc: what the kept rows hold while the columns are freed, once a release
-            let kept: Vec<(NonZeroU32, K, u8, u32, u32)> = keep
-                .iter()
-                .map(|&row| {
-                    let tag = self.tag_of(row);
-                    let at = u64::from(row.get());
-                    // SAFETY: `tag_of` checked the row was written and published.
-                    unsafe {
-                        (row, *self.kinds.get(at), tag, *self.flags.get(at), *self.binder.get(at))
-                    }
-                })
-                .collect();
+            let mut kept: Vec<(NonZeroU32, K, u8, u32, u32, Option<ArenaId>), Global> =
+                Vec::with_capacity_in(keep.len(), Global);
+            kept.extend(keep.iter().map(|&row| {
+                let tag = self.tag_of(row);
+                let at = u64::from(row.get());
+                // SAFETY: `tag_of` checked the row was written and published.
+                unsafe {
+                    (
+                        row,
+                        *self.kinds.get(at),
+                        tag,
+                        *self.flags.get(at),
+                        *self.binder.get(at),
+                        *self.home.get(at),
+                    )
+                }
+            }));
             // SAFETY: the caller's precondition; `K` and the hot columns are `Copy`, so nothing
             // in them needs a drop.
             unsafe {
@@ -5352,9 +5772,10 @@ pub(crate) mod table {
                 self.flags.free();
                 self.binder.free();
                 self.kinds.free();
+                self.home.free();
             }
             self.next.store(1, Ordering::Relaxed);
-            for &(row, kind, tag, flags, binder) in &kept {
+            for &(row, kind, tag, flags, binder, home) in &kept {
                 let at = u64::from(row.get());
                 // SAFETY: every position was freed above, so none is written, and the caller's
                 // precondition leaves this thread alone in the table.
@@ -5362,6 +5783,7 @@ pub(crate) mod table {
                     self.kinds.write(at, kind);
                     self.flags.write(at, flags);
                     self.binder.write(at, binder);
+                    self.home.write(at, home);
                 }
                 let vacant =
                     match self.index.lock(&kind, |it| self.indexed(it) == kind, self.rehash()) {
@@ -5398,6 +5820,8 @@ pub(crate) mod table {
         len: Column<AtomicU32>,
         flags: Column<u32>,
         binder: Column<u32>,
+        /// The greatest of its items' homes ([`Homed`]), written once with the row.
+        home: Column<Option<ArenaId>>,
         items: Run<T>,
         index: Index,
     }
@@ -5407,7 +5831,7 @@ pub(crate) mod table {
     pub(crate) const LIST_BYTES: usize = size_of::<u32>() + size_of::<AtomicU32>();
     const _: () = assert!(LIST_BYTES == 8);
 
-    impl<T: Copy + Hash + Eq + Sync + 'static> Lists<T> {
+    impl<T: Copy + Hash + Eq + Sync + Homed + Holds + 'static> Lists<T> {
         /// A table of lists without flags, interned by [`Lists::intern`].
         pub(crate) const fn new(what: &'static str) -> Lists<T> {
             Lists::make(what, false)
@@ -5428,6 +5852,7 @@ pub(crate) mod table {
                 len: Column::zeroed(),
                 flags: Column::new(),
                 binder: Column::new(),
+                home: Column::new(),
                 items: Run::new(),
                 index: Index::new(),
             }
@@ -5494,8 +5919,11 @@ pub(crate) mod table {
                 // yet.
                 unsafe { self.items.column.write(start + i as u64, item) };
             }
+            let home = items.iter().map(Homed::home).max().flatten();
             // SAFETY: `row` is ours alone (claimed above), below 2^32 and not written yet.
             unsafe { self.start.write(row, start as u32) };
+            // SAFETY: as above.
+            unsafe { self.home.write(row, home) };
             if let Some((flags, binder)) = info {
                 // SAFETY: as above.
                 unsafe { self.flags.write(row, flags.bits()) };
@@ -5574,9 +6002,18 @@ pub(crate) mod table {
             assert!(self.flagged, "the lists of {} have no flags", self.what);
             self.written(row);
         }
+
+        /// The home of `row`: the greatest of its items' homes. Panics if it is not a row of
+        /// this table.
+        #[inline]
+        pub(crate) fn home(&self, row: NonZeroU32) -> Option<ArenaId> {
+            self.written(row);
+            // SAFETY: `written` checked the row was written and published, with its home.
+            unsafe { *self.home.get(row.get().into()) }
+        }
     }
 
-    impl<T: Copy + Hash + Eq + Sync + 'static> Table for Lists<T> {
+    impl<T: Copy + Hash + Eq + Sync + Homed + Holds + 'static> Table for Lists<T> {
         fn name(&self) -> &'static str {
             self.what
         }
@@ -5586,27 +6023,41 @@ pub(crate) mod table {
                 + self.len.bytes()
                 + self.flags.bytes()
                 + self.binder.bytes()
+                + self.home.bytes()
                 + self.items.column.bytes()
                 + self.index.bytes()
         }
 
+        fn homed_in(&self, live: &dyn Fn(Option<ArenaId>) -> bool, out: &mut Vec<NonZeroU32, Global>) {
+            rows_homed_in(
+                self.next.load(Ordering::Acquire),
+                |row| self.published(row),
+                |row| self.home(row),
+                live,
+                out,
+            );
+        }
+
+        fn hold(&self, row: NonZeroU32, held: &mut Held) {
+            self.items(row).iter().for_each(|item| item.hold(held));
+        }
+
         unsafe fn release(&self, keep: &[NonZeroU32]) -> u64 {
             let before = self.held_bytes();
-            // alloc: what the kept lists hold while the columns are freed, once a release
-            let kept: Vec<(NonZeroU32, Vec<T>, Option<(u32, u32)>)> = keep
-                .iter()
-                .map(|&row| {
-                    // alloc: a kept list's items, as above
-                    let items = self.items(row).to_vec();
-                    let at = u64::from(row.get());
-                    // SAFETY: `items` checked the row was written and published, with its flags
-                    // when the table has them (`add`'s assertion).
-                    let flags = self
-                        .flagged
-                        .then(|| unsafe { (*self.flags.get(at), *self.binder.get(at)) });
-                    (row, items, flags)
-                })
-                .collect();
+            #[expect(clippy::type_complexity, reason = "a kept list's row, items, flags and home")]
+            let mut kept: Vec<(NonZeroU32, Vec<T, Global>, Option<(u32, u32)>, Option<ArenaId>), Global> =
+                Vec::with_capacity_in(keep.len(), Global);
+            kept.extend(keep.iter().map(|&row| {
+                let items = self.items(row).to_vec_in(Global);
+                let at = u64::from(row.get());
+                // SAFETY: `items` checked the row was written and published, with its flags
+                // when the table has them (`add`'s assertion) and its home.
+                let flags =
+                    self.flagged.then(|| unsafe { (*self.flags.get(at), *self.binder.get(at)) });
+                // SAFETY: as above.
+                let home = unsafe { *self.home.get(at) };
+                (row, items, flags, home)
+            }));
             // SAFETY: the caller's precondition; every column is of `Copy` values, so nothing
             // in them needs a drop.
             unsafe {
@@ -5615,11 +6066,12 @@ pub(crate) mod table {
                 self.len.free();
                 self.flags.free();
                 self.binder.free();
+                self.home.free();
                 self.items.column.free();
             }
             self.items.next.store(0, Ordering::Relaxed);
             self.next.store(1, Ordering::Relaxed);
-            for (row, items, flags) in &kept {
+            for (row, items, flags, home) in &kept {
                 let at = u64::from(row.get());
                 let start = match items.is_empty() {
                     true => 0,
@@ -5633,6 +6085,8 @@ pub(crate) mod table {
                 // SAFETY: freed above, so not written, and the caller's precondition leaves
                 // this thread alone in the table.
                 unsafe { self.start.write(at, start as u32) };
+                // SAFETY: as above.
+                unsafe { self.home.write(at, *home) };
                 if let Some((flags, binder)) = *flags {
                     // SAFETY: as above.
                     unsafe { self.flags.write(at, flags) };
@@ -5666,10 +6120,12 @@ pub(crate) mod table {
         next: AtomicU64,
         marks: Column<AtomicU8>,
         values: Column<T>,
+        /// The value's home ([`Homed`]), written once with the row.
+        home: Column<Option<ArenaId>>,
         index: Index,
     }
 
-    impl<T: Hash + Eq + Send + Sync + 'static> Values<T> {
+    impl<T: Hash + Eq + Send + Sync + Homed + Holds + 'static> Values<T> {
         pub(crate) const fn new(what: &'static str) -> Values<T> {
             Values {
                 what,
@@ -5677,6 +6133,7 @@ pub(crate) mod table {
                 next: AtomicU64::new(1),
                 marks: Column::zeroed(),
                 values: Column::new(),
+                home: Column::new(),
                 index: Index::new(),
             }
         }
@@ -5703,6 +6160,8 @@ pub(crate) mod table {
             let row = self.next.fetch_add(1, Ordering::Relaxed);
             assert!(row <= u64::from(LAST_ROW), "the {} table holds {LAST_ROW} rows", self.what);
             // SAFETY: `row` is ours alone (claimed above), below 2^32 and not written yet.
+            unsafe { self.home.write(row, value.home()) };
+            // SAFETY: as above.
             unsafe { self.values.write(row, value) };
             // SAFETY: the mark column is zeroed and of atomics, and `row` is below 2^32.
             let mark = unsafe { self.marks.place(row) };
@@ -5756,30 +6215,61 @@ pub(crate) mod table {
             let mark = unsafe { self.marks.peek(at) };
             mark.is_some_and(|mark| mark.load(Ordering::Acquire) != 0)
         }
+
+        /// The home of `row`: its value's. Panics if it is not a row of this table.
+        #[inline]
+        pub(crate) fn home(&self, row: NonZeroU32) -> Option<ArenaId> {
+            if !self.marked(row.get().into()) {
+                never_written(self.what, row);
+            }
+            // SAFETY: the row was written, its home with it, before the release store of its
+            // mark that `marked`'s acquire load saw.
+            unsafe { *self.home.get(row.get().into()) }
+        }
     }
 
-    impl<T: Hash + Eq + Send + Sync + 'static> Table for Values<T> {
+    impl<T: Hash + Eq + Send + Sync + Homed + Holds + 'static> Table for Values<T> {
         fn name(&self) -> &'static str {
             self.what
         }
 
         fn held_bytes(&self) -> u64 {
-            self.marks.bytes() + self.values.bytes() + self.index.bytes()
+            self.marks.bytes() + self.values.bytes() + self.home.bytes() + self.index.bytes()
+        }
+
+        fn homed_in(&self, live: &dyn Fn(Option<ArenaId>) -> bool, out: &mut Vec<NonZeroU32, Global>) {
+            rows_homed_in(
+                self.next.load(Ordering::Acquire),
+                |row| self.marked(row.get().into()),
+                |row| self.home(row),
+                live,
+                out,
+            );
+        }
+
+        fn hold(&self, row: NonZeroU32, held: &mut Held) {
+            if !self.marked(row.get().into()) {
+                never_written(self.what, row);
+            }
+            // The row was written: its mark's acquire load above pairs with its publication.
+            self.indexed(row).hold(held);
         }
 
         unsafe fn release(&self, keep: &[NonZeroU32]) -> u64 {
             let before = self.held_bytes();
             let next = self.next.load(Ordering::Relaxed);
-            // alloc: the kept values while the columns are freed, once a release
-            let mut kept: Vec<(NonZeroU32, T)> = Vec::with_capacity(keep.len());
+            let mut kept: Vec<(NonZeroU32, T, Option<ArenaId>), Global> =
+                Vec::with_capacity_in(keep.len(), Global);
             for &row in keep {
                 let at = u64::from(row.get());
                 if !self.marked(at) {
                     never_written(self.what, row);
                 }
+                // SAFETY: the row was written (its mark), its home with it.
+                let home = unsafe { *self.home.get(at) };
                 // SAFETY: the row was written (its mark), and it is moved out once: the columns
                 // are freed below without dropping it.
-                kept.push((row, unsafe { self.values.take(at) }));
+                kept.push((row, unsafe { self.values.take(at) }, home));
             }
             if needs_drop::<T>() {
                 for at in 1..next {
@@ -5797,9 +6287,10 @@ pub(crate) mod table {
                 self.index.free();
                 self.marks.free();
                 self.values.free();
+                self.home.free();
             }
             self.next.store(1, Ordering::Relaxed);
-            for (row, value) in kept {
+            for (row, value, home) in kept {
                 let at = u64::from(row.get());
                 let vacant =
                     match self.index.lock(&value, |it| self.indexed(it) == &value, self.rehash()) {
@@ -5812,6 +6303,8 @@ pub(crate) mod table {
                     };
                 // SAFETY: freed above, so not written, and the caller's precondition leaves this
                 // thread alone in the table.
+                unsafe { self.home.write(at, home) };
+                // SAFETY: as above.
                 unsafe { self.values.write(at, value) };
                 // SAFETY: the mark column is zeroed and of atomics, and `at` is below 2^32.
                 unsafe { self.marks.place(at) }.store(1, Ordering::Release);
@@ -5846,6 +6339,7 @@ pub(crate) mod table {
                 unsafe impl Erase for $ty {
                     type Static = $ty;
                 }
+                super::plain_data!($ty);
             )+};
         }
         erase_static!(u32, u64, (u32, u64), [u32; 3], String);
@@ -5855,7 +6349,12 @@ pub(crate) mod table {
         fn tagged(tag: u32) -> impl FnOnce() -> RowInfo {
             let fits = u8::try_from(tag).ok().filter(|&it| it < u8::MAX);
             let tag = fits.unwrap_or_else(|| panic!("a test tag of {tag}, not a row's (0 to 254)"));
-            move || RowInfo { tag, flags: TypeFlags::empty(), binder: INNERMOST }
+            move || RowInfo {
+                tag,
+                flags: TypeFlags::empty(),
+                binder: INNERMOST,
+                home: None,
+            }
         }
 
         /// The safe reference version of a table: a map from value to row under one lock, rows
@@ -6016,6 +6515,7 @@ pub(crate) mod table {
                 tag: 2,
                 flags: TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR,
                 binder: DebruijnIndex::from_u32(3),
+                home: None,
             });
             assert_eq!(ROWS.flags(row), TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR);
             assert_eq!(ROWS.binder(row), DebruijnIndex::from_u32(3));
@@ -6222,7 +6722,10 @@ pub(crate) mod table {
             let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(release))
                 .expect_err("a release with a front end kept is refused");
             let message = stdx::panic_text(&*refused).unwrap_or("");
-            assert!(message.contains("front ends kept (`hir_ty::evict::FRONT_ENDS`)"), "{message}");
+            assert!(
+                message.contains("front ends kept (`hir_ty::evict::FRONT_ENDS`, at most 0 allowed)"),
+                "{message}"
+            );
             assert!(!message.contains(" 0 front ends kept"), "{message}");
             assert_eq!(ROWS.kind::<u32>(held), 41, "a refused release frees nothing");
 
@@ -6594,7 +7097,7 @@ mod tests {
     use crate::next_solver::{CanonicalVarKinds, Goal, PredicateKind, default_types};
 
     fn function() -> GenericDefId {
-        GenericDefId::FunctionId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)))
+        GenericDefId::FunctionId(blaze_memo::Id::from_gid(blaze_memo::Gid::for_test(1)))
     }
 
     fn early(index: u32) -> Region<'static> {

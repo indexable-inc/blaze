@@ -300,8 +300,6 @@ impl EditionedFileId {
     }
 }
 
-use blaze_query::db as query;
-
 /// Input to the analyzer is a set of files, where each file is identified by
 /// `FileId` and contains source code. However, another source of source code in
 /// Rust are macros: each macro can be thought of as producing a "temporary
@@ -316,13 +314,36 @@ use blaze_query::db as query;
 /// (`MacroCallId` uses the location interning. You can check details here:
 /// <https://en.wikipedia.org/wiki/String_interning>).
 ///
-/// Internally this holds a `blaze_query::db::Id`, but we cannot use this definition here
+/// Internally this holds a `blaze_memo::Gid`, but we cannot use this definition here
 /// as it references things from base-db and hir-expand.
 // FIXME: Give this a better fitting name
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct HirFileId(pub query::Id);
+pub struct HirFileId(pub blaze_memo::Gid);
 
 /// `MacroCallId` identifies a particular macro invocation, like
-/// `println!("Hello, {}", world)`.
+/// `println!("Hello, {}", world)`: the `Gid` of hir-expand's interned `MacroCallId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MacroCallId(pub query::Id);
+pub struct MacroCallId(pub blaze_memo::Gid);
+
+impl MacroCallId {
+    /// The arena the call is interned in: the calling crate's, whose syntax-context table
+    /// holds the contexts its expansion makes.
+    #[inline]
+    pub const fn arena(self) -> blaze_memo::ArenaId {
+        self.0.arena()
+    }
+}
+
+impl blaze_memo::Home for HirFileId {
+    #[inline]
+    fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
+        self.0.home(homes)
+    }
+}
+
+impl blaze_memo::Home for MacroCallId {
+    #[inline]
+    fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
+        self.0.home(homes)
+    }
+}

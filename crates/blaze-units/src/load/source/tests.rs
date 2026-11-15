@@ -89,7 +89,9 @@ fn sources(asked: &Asked) -> Sources {
             });
         }
     }
-    Sources::new(&config, SOURCES, asked.offline.then_some("--offline"), pins).expect("the sources")
+    // The view's configuration: these tests mount the view.
+    Sources::new(&config, &crate::load::config::ConfigOf::View, SOURCES, asked.offline.then_some("--offline"), pins)
+        .expect("the sources")
 }
 
 struct Locate;

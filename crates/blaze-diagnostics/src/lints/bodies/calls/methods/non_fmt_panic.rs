@@ -469,7 +469,7 @@ fn token(db: &Db, token: InFile<ast::Token<'_>>) -> Option<At> {
     let range = token.value.text_range();
     let shown = token.with_value(range);
     let (written, ctxt) = shown.original_node_file_range_opt(db)?;
-    let expn = ctxt.outer_expn(db).map(MacroCallId::from);
+    let expn = ctxt.outer_expn(db, crate::cx::context_arena(token.file_id)).map(MacroCallId::from);
     Some(At { file: written.file_id.file_id(db), range: written.range, expn, shown })
 }
 

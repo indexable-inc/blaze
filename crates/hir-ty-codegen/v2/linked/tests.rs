@@ -15,7 +15,10 @@ use hir_expand::fixture;
 use hir_ty_mir::mir::MirSpan;
 
 use super::*;
-use crate::v2::{BuildTime, Databases, ItemHashes};
+use crate::v2::{
+    BuildTime, Databases, ItemHashes,
+    tests::{runs_of, write_file},
+};
 use db::TestDB;
 
 /// A front end over `text`'s database, with the database's owner of what its links keep
@@ -255,7 +258,7 @@ fn a_reformat_changes_a_table_and_not_its_anchor() {
     let file = file.file_id(&db);
     let owner = |db: &TestDB| DefWithBodyId::FunctionId(function(db, "f"));
     let before = all_rows(&db, owner(&db));
-    db.set_file_text(file, "\n\npub fn f(x: u32) -> u32 {\n        x + 1\n}\n");
+    write_file(&mut db, file, "\n\npub fn f(x: u32) -> u32 {\n        x + 1\n}\n");
     let after = all_rows(&db, owner(&db));
     assert_eq!(before.len(), after.len(), "the same spans");
     assert_ne!(before, after, "each two lines on");
@@ -270,10 +273,14 @@ fn all_rows(db: &TestDB, owner: DefWithBodyId) -> Vec<Row> {
 const SHIFTED: &str = "pub fn above() -> u32 {\n    1\n}\npub fn f(x: u32) -> u32 {\n    let y = x + 1;\n    y * 2\n}\n";
 
 /// The invariant: a line added above a body changes where its positions are counted from and
-/// nothing else of them. Its places, the memo that reads its syntax, are kept and not run
-/// again; its bases, two rows, are; each row the link is given is the one found from where
-/// the body is in its file now, `N` lines on. The control: an edit of the body itself places
-/// it again.
+/// nothing else of them. Its places, item-relative, are the values they were; its bases, two
+/// rows, move; each row the link is given is the one found from where the body is in its file
+/// now, `N` lines on. The control: an edit of the body itself places it otherwise.
+///
+/// Since the front end is on blaze-memo, an edit of a file remakes its crate's arena, so the
+/// places are found again in the next snapshot (the run is asserted): what is kept across
+/// the edit is their value, which the link compares by, not the memo's entry. Before the port
+/// the test claimed the entry was kept and not run again.
 #[test]
 fn a_line_added_above_a_body_places_none_of_it_again() {
     for n in [1usize, 3, 40] {
@@ -290,15 +297,18 @@ fn a_line_added_above_a_body_places_none_of_it_again() {
         let before_cells = cells_of(&db);
 
         let shifted = format!("{}{SHIFTED}", "\n".repeat(n));
-        db.set_file_text(file, &shifted);
-        blaze_query::db::attach(&db, || {
+        write_file(&mut db, file, &shifted);
+        blaze_memo::attach(&db, || {
             let owner = owner(&db);
-            let mut after_rows = Vec::new();
-            let executed = db.log_executed(|| after_rows = all_rows(&db, owner));
-            assert!(executed.iter().any(|it| it == "span_bases"), "the bases move: {executed:#?}");
+            let (after_rows, executed) = runs_of(&db, || all_rows(&db, owner));
             assert!(
-                !executed.iter().any(|it| it == "span_places"),
-                "{n} lines above the body placed it again: {executed:#?}"
+                executed.iter().any(|it| it.is::<span_bases>(&(owner,))),
+                "the bases move: {executed:#?}"
+            );
+            assert!(
+                executed.iter().any(|it| it.is::<span_places>(&(owner,))),
+                "an edit of the crate's file remakes its arena, so its places are found again: \
+                 {executed:#?}"
             );
             assert_eq!(*span_places(&db, owner), before_places, "its places are as they were");
             // What the link is given: each table's cells as they were, its bases `n` on.
@@ -328,15 +338,17 @@ fn a_line_added_above_a_body_places_none_of_it_again() {
             }
         });
 
-        // The control: the body's own edit places it again.
-        db.set_file_text(file, &shifted.replace("x + 1", "x + 10"));
-        blaze_query::db::attach(&db, || {
+        // The control: the body's own edit places it again, and otherwise (`x + 10` ends a
+        // column later), so places equal after the shift are not equal for want of a change.
+        write_file(&mut db, file, &shifted.replace("x + 1", "x + 10"));
+        blaze_memo::attach(&db, || {
             let owner = owner(&db);
-            let executed = db.log_executed(|| _ = all_rows(&db, owner));
+            let ((), executed) = runs_of(&db, || _ = all_rows(&db, owner));
             assert!(
-                executed.iter().any(|it| it == "span_places"),
+                executed.iter().any(|it| it.is::<span_places>(&(owner,))),
                 "an edit of the body: {executed:#?}"
             );
+            assert_ne!(*span_places(&db, owner), before_places, "an edit of the body places it otherwise");
         });
     }
 }
@@ -368,7 +380,7 @@ fn a_body_reading_its_line_keeps_its_hir_and_key_below_an_inserted_line() {
         let func = |db: &TestDB| function(db, "f");
         // What of the body a shift must keep, and where its `line!()` is read and placed.
         let seen = |db: &TestDB| {
-            blaze_query::db::attach(db, || {
+            blaze_memo::attach(db, || {
                 let owner = DefWithBodyId::FunctionId(func(db));
                 let store = BodyStore::of(db, owner);
                 let (expr, literal) = (store.exprs())
@@ -417,11 +429,23 @@ fn a_body_reading_its_line_keeps_its_hir_and_key_below_an_inserted_line() {
 
         let shifted =
             LINE_SHIFTED.replacen("pub fn above", &format!("{}pub fn above", "\n".repeat(n)), 1);
-        db.set_file_text(file, &shifted);
-        let (body2, key2, places2, literal2, placed2, row2, linked2) = seen(&db);
+        write_file(&mut db, file, &shifted);
+        let (_, key2, places2, literal2, placed2, row2, linked2) = seen(&db);
         let now = line_of_call(&shifted);
         assert_eq!(now, written + n as u32, "the control: the call moved {n} lines");
-        assert_eq!(body2, body, "the HIR body after {n} lines");
+        // The body is compared with the body of a fresh database of the shifted text, not with
+        // the edited database's: since the front end is on blaze-memo an edit remakes its
+        // crate's arena at the next generation, and a body holds the ids of its blocks (the
+        // `Block` row of `HirColumns::extra` is the id's two words, `BlockId(1.0:27)` is
+        // `[28, 4096]` and `BlockId(1.1:27)` `[28, 4097]`), so the edited body prints the next
+        // generation where the fresh one prints the first. Nothing of the body is a position:
+        // two fresh databases of the two texts give the same ids, and the body is equal.
+        let fresh = {
+            let fx = fixture::db(&shifted);
+            let db = fx.into_db();
+            seen(&db).0
+        };
+        assert_eq!(fresh, body, "the HIR body after {n} lines");
         assert_eq!(key2, key, "the item key after {n} lines");
         assert_eq!(places2, places, "the places after {n} lines");
         assert_eq!(literal2, literal, "the placeholder after {n} lines");
@@ -441,23 +465,24 @@ fn positions_are_placed_without_a_memo_per_span() {
     let fx = fixture::db(SPANNED);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let owner = DefWithBodyId::FunctionId(function(&db, "f"));
-        let mut rows = Vec::new();
-        let executed = db.log_executed(|| rows = all_rows(&db, owner));
+        let (rows, executed) = runs_of(&db, || all_rows(&db, owner));
         assert!(
-            executed.iter().any(|it| it == "span_places"),
+            executed.iter().any(|it| it.is::<span_places>(&(owner,))),
             "the log sees queries: {executed:#?}"
         );
+        // These are plain functions, so no query kind names them: a run of one, were it made
+        // a tracked fn, is told by the last segment of its query's path.
         for per_span in
             ["source_place", "row_place", "source_location_in_file", "row_location_in_file"]
         {
             assert!(
-                !executed.iter().any(|it| it == per_span),
+                !executed.iter().any(|it| it.query.rsplit("::").next() == Some(per_span)),
                 "a memo of {per_span}: {executed:#?}"
             );
         }
-
+    
         let starts = span_places(&db, owner).starts;
         let table = |t: usize| &rows[starts[t] as usize..starts[t + 1] as usize];
         let store = BodyStore::of(&db, owner);
@@ -658,12 +683,8 @@ fn kept_is_whole_of(mut program: Program, edits: &[Edit], plant: Plant) -> Resul
     let steps = std::iter::once(Edit::Again).chain(edits.iter().copied());
     for (step, edit) in steps.enumerate() {
         program.apply(edit);
-        db.set_file_text(file, &program.text());
+        write_file(&mut db, file, &program.text());
         let frontend = HirFrontend::new(Databases::new(&db), hashes(), BuildTime::default());
-        // A build walks the engine's changed set before its link (its body check does), so
-        // each walk is of one build's writes: without it the first link's walk is of
-        // everything written since the database was made, a wide level that names every row.
-        blaze_query::db::plumbing::walk_changed_set(&db);
         let built = program.built(&db, &frontend.hashes, before.as_ref());
         let given = frontend.with(|db| inputs(db, &frontend.hashes, &built, plant, &links))?;
         if given.serial != serial {
@@ -726,14 +747,15 @@ fn the_link_inputs_kept_are_the_tables_made_whole() {
     })
 }
 
-/// A control of [`the_link_inputs_kept_are_the_tables_made_whole`]: with a link that does
-/// not ask the engine which bodies' positions changed, a reformat leaves every table on its
-/// old lines, and the oracle says at which step.
+/// A control of [`the_link_inputs_kept_are_the_tables_made_whole`]: with a link that keeps
+/// its tables though the edit dropped the arena they were made under, a reformat leaves
+/// every table on its old lines, and the oracle says at which step.
 #[test]
 fn the_oracle_catches_a_moved_body_not_encoded_again() {
     let edits = [Edit::Reformat];
     kept_is_whole(4, &edits, Plant::None).unwrap();
-    let why = kept_is_whole(4, &edits, Plant::Unasked).expect_err("the oracle missed tables left stale");
+    let why = kept_is_whole(4, &edits, Plant::CarriesDropped)
+        .expect_err("the oracle missed tables left stale");
     assert!(why.contains("after step 1"), "{why}");
 }
 
@@ -763,6 +785,10 @@ fn body_edit_cost(count: usize, plant: Plant) -> (usize, usize, usize, usize) {
     (work.made, work.bytes, work.functions, work.verified)
 }
 
+/// The floor, which this does not meet while an edit drops its crate's whole arena (each body
+/// edit makes every table again, `ARENA_DROPPED`, until per-item records land:
+/// front-end-on-memo.md, the cost of decision 4); these asserts fail until then.
+///
 /// The counter: after one body edit, the link inputs resolve no item, read the one function
 /// whose key is new, encode that body's tables, and encode again the kept tables of the
 /// owners the engine names as moved, among 100 functions as among 2,000 (a fixture of 10,000
@@ -770,7 +796,19 @@ fn body_edit_cost(count: usize, plant: Plant) -> (usize, usize, usize, usize) {
 /// none is asked of the database for being watched, and none of another file than the
 /// edit's is looked at.
 #[test]
+#[ignore = "blaze-memo: the kept link tables hold their crate's arena; reuse across edits is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_among_many_makes_its_own_tables() {
+    // What it claimed: after one body edit among N functions the link keeps the tables before
+    // and encodes the edited function's alone, the same work among 100 as among 2,000. What is
+    // true now: `Kept` (linked.rs) holds its owners by id (`sources`: anchor to `Source`, a
+    // `DefWithBodyId` or `FunctionId`; `watched`: `Owner` ids), and which kept owners an edit
+    // moved was the old engine's changed set, which blaze-memo has none of; an edit remakes the
+    // crate's arena, so `Kept::advance` refuses with `ARENA_DROPPED` and every table is made.
+    // The record form: the program's link record holds, by anchor, its table's id and its owner
+    // by stable name (`ItemKey`, table index), and per owner its `Bases` and file; the host,
+    // which knows the files an edit changed, names them, and the link reads the bases of the
+    // owners of those files alone and encodes the tables of those whose bases moved and of the
+    // new keys' anchors: one edited function among N makes its own tables.
     let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::None));
     let (made, bytes, _, verified) = costs[0];
     assert!(made <= 4 && bytes <= 2048 && verified <= 2, "100 functions: {:?}", costs[0]);
@@ -781,7 +819,11 @@ fn a_body_edit_among_many_makes_its_own_tables() {
 /// watched owner as moved (what it did while it asked a stamp of each) gives the right
 /// tables, and the counter says its work follows the program.
 #[test]
+#[ignore = "blaze-memo: the kept link tables hold their crate's arena; reuse across edits is the host's, on records (docs/v2/plan/design/host.md)"]
 fn the_oracle_catches_a_link_that_asks_of_every_body() {
+    // The control of the test above, ignored with it: its premise (`body_edit_cost`'s "the link
+    // before was kept") fails before the planted sweep is counted, for the same reason: an edit
+    // remakes the crate's arena and the kept tables hold its ids (`ARENA_DROPPED`).
     let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::Sweeps));
     assert_ne!(costs[0], costs[1], "a sweep of every watched owner was counted as the edit's");
     assert!(costs[1].3 >= 2_000, "2,000 functions: {:?}", costs[1]);

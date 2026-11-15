@@ -347,29 +347,32 @@ impl Attr {
         }
     }
 
-    /// Parses this attribute as a token tree consisting of comma separated paths.
+    /// Parses this attribute as a token tree consisting of comma separated paths. `arena` is
+    /// the table of the attribute's contexts ([`crate::HirFileId::context_arena`] of its file).
     pub fn parse_path_comma_token_tree<'a>(
         &'a self,
         db: &'a Db,
+        arena: blaze_memo::ArenaId,
     ) -> Option<impl Iterator<Item = (ModPath, Span, tt::TokenTreesView<'a>)> + 'a> {
         let args = self.token_tree_value()?;
 
         if args.top_subtree().delimiter.kind != DelimiterKind::Parenthesis {
             return None;
         }
-        Some(parse_path_comma_token_tree(db, args))
+        Some(parse_path_comma_token_tree(db, arena, args))
     }
 }
 
 fn parse_path_comma_token_tree<'a>(
     db: &'a Db,
+    arena: blaze_memo::ArenaId,
     args: &'a tt::Tree,
 ) -> impl Iterator<Item = (ModPath, Span, tt::TokenTreesView<'a>)> {
     args.token_trees()
         .split(|tt| matches!(tt, tt::TtElement::Leaf(tt::Leaf::Punct(Punct { char: ',', .. }))))
         .filter_map(move |tts| {
             let span = tts.first_span()?;
-            Some((ModPath::from_tt(db, tts)?, span, tts))
+            Some((ModPath::from_tt(db, arena, tts)?, span, tts))
         })
 }
 
@@ -403,7 +406,7 @@ fn unescape(s: &str) -> Option<Cow<'_, str>> {
 ///
 /// Outer attributes are counted first, then inner attributes. This does not support
 /// out-of-line modules, which may have attributes spread across 2 files!
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct AttrId {
     id: u32,
 }
@@ -507,7 +510,10 @@ impl AttrId {
                 frame,
             );
             let Some((_, _, derive_tts)) =
-                parse_path_comma_token_tree(db, &tt).nth(derive_index as usize)
+                // Absolute spans carry root contexts, which read no table: the asking crate's
+                // is named, a live arena, never a constant.
+                parse_path_comma_token_tree(db, blaze_memo::Id::gid(krate).arena(), &tt)
+                    .nth(derive_index as usize)
             else {
                 return derive_attr.syntax().text_range();
             };

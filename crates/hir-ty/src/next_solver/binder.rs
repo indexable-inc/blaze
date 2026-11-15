@@ -18,7 +18,7 @@ use crate::next_solver::{
 /// The value has no rigid aliases: instantiating it needs normalizing again. [`Self::bind`]
 /// makes every alias [`IsRigid::No`](rustc_type_ir::IsRigid::No), as rustc's
 /// [`EarlyBinder::bind`] does; the getters check it in debug builds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct StoredEarlyBinder<T>(T);
 
 impl<T> StoredEarlyBinder<T> {
@@ -107,7 +107,7 @@ impl StoredEarlyBinder<StoredTraitRef> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct StoredPolyFnSig {
     bound_vars: StoredBoundVarKinds,
     sig: StoredFnSig,
@@ -145,10 +145,12 @@ impl<'db> rustc_type_ir::TypeFoldable<DbInterner<'db>> for StoredPolyFnSig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable, blaze_memo::Home)]
 pub struct StoredFnSig {
     inputs_and_output: StoredTys,
+    /// Its abi, safety and variadic bits: plain data.
     #[type_visitable(ignore)]
+    #[home(skip)]
     fn_sig_kind: FnSigKind<'static>,
 }
 
@@ -171,7 +173,7 @@ impl StoredFnSig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable, blaze_memo::Home)]
 pub struct StoredTraitRef {
     #[type_visitable(ignore)]
     def_id: TraitId,

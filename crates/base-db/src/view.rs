@@ -8,7 +8,7 @@
 //! were made with ([`FileSetConfig`]) puts it in.
 //!
 //! The content ID a view gives is blaze-vfs's ([`blaze_vfs::FILE_DOMAIN`], of the bytes
-//! alone). A view read from a [`blaze_query::Tree`] ([`Files::set_view_root_from_tree`]) is
+//! alone). A view read from a blaze-vfs tree ([`Files::set_view_root_from_tree`]) is
 //! not hashed here at all: the tree made each ID from the bytes when it read them (its
 //! contract), and that one hash is the only one a file's bytes get. A view whose IDs a caller
 //! wrote by hand ([`Files::set_view_root`], fixtures and tests) has them checked against the
@@ -20,6 +20,13 @@
 //! names it in its base's [`ViewIndex`], and two lookups by file ID: nothing is allocated, joined
 //! or hashed with BLAKE3 for it. Only a file the source roots gain or lose rebuilds its root's
 //! file set; its content ID is updated in place ([`RootContent::insert`]).
+//!
+//! A view is written to the world alone ([`Writer`]): what it changed is marked, and the next
+//! commit makes the arenas of the marked files and roots again. Cost (rule 67): the floor is a
+//! look at each file's path and ID plus one hash of each new file's bytes; a set is that, plus
+//! a change pending for each file it adds to or removes from a root's file set, put in where
+//! the set is at the commit (`Files::apply_pending`; copied only while a reader holds the old
+//! snapshot through the commit).
 
 use std::{borrow::Cow, cell::RefCell, fmt};
 
@@ -27,13 +34,12 @@ use crate::{AbsPath, AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
 use blaze_hash::{FixedState, HashMap};
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
-use blaze_query::db::{Durability, Setter};
 use std::alloc::Global;
 use triomphe::Arc;
 
 use crate::{
-    Db, FileText, Files, FxIndexMap, IncludedFile, SourceRoot, SourceRootId, content,
-    files::{RootContent, Roots, Writer, index_file},
+    FileText, Files, FxIndexMap, IncludedFile, SourceRoot, SourceRootId, content,
+    files::{RootContent, Roots, SetOp, Writer, index_file},
 };
 
 /// One file of a view, as blaze-vfs reads it.
@@ -73,7 +79,7 @@ pub struct ViewChange {
     /// Files under the view's base taken out of their source root: the view has them no more.
     pub removed: Vec<FileId>,
     /// Of the files set or added, those whose bytes are not UTF-8: they have no text
-    /// ([`Db::has_file_text`] is false), and their bytes are [`Db::raw_file`].
+    /// ([`Files::has_file_text`] is false), and their bytes are [`Files::raw_file`].
     pub no_text: Vec<FileId>,
     /// Source roots whose files were added or removed: a crate root may have come or gone.
     pub roots: Vec<SourceRootId>,
@@ -242,7 +248,7 @@ struct Plan<'f> {
 enum Ids {
     /// Its caller: each is checked against the bytes.
     Given,
-    /// A [`blaze_query::Tree`], from the bytes as it read them: taken as they are.
+    /// A blaze-vfs tree, from the bytes as it read them: taken as they are.
     Tree,
 }
 
@@ -262,31 +268,22 @@ impl Files {
     /// root. Bytes that are not UTF-8 are a file with no text whose bytes are kept as its input
     /// ([`Files::raw_file`]), hashed again only when they change. Every file's ID is checked
     /// against its bytes before anything is written, and a mismatch refuses the whole view.
-    pub fn set_view_root(&self, db: &mut Db, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
-        self.write_view_root(db, view, Ids::Given)
+    pub(crate) fn set_view_root(&self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
+        self.write_view_root(view, Ids::Given)
     }
 
-    /// [`Files::set_view_root`] for a view read from a [`blaze_query::Tree`]: each ID is the
+    /// [`Files::set_view_root`] for a view read from a blaze-vfs tree: each ID is the
     /// one the tree made from the bytes when it read them, so they are not hashed again. The
     /// floor of a view set is one hash of each new file's bytes, and the tree paid it; checking
     /// here was a second pass over every changed byte (all of them, at a start).
-    pub fn set_view_root_from_tree(
-        &self,
-        db: &mut Db,
-        view: ViewRoot<'_>,
-    ) -> Result<ViewChange, ViewError> {
-        self.write_view_root(db, view, Ids::Tree)
+    pub(crate) fn set_view_root_from_tree(&self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
+        self.write_view_root(view, Ids::Tree)
     }
 
     /// [`Files::set_view_root`] and [`Files::set_view_root_from_tree`]: the view written, its
     /// IDs checked against its bytes when `ids` is [`Ids::Given`]. Not [`Files::set_view`],
     /// which says where a path is read from on disk.
-    fn write_view_root(
-        &self,
-        db: &mut Db,
-        view: ViewRoot<'_>,
-        ids: Ids,
-    ) -> Result<ViewChange, ViewError> {
+    fn write_view_root(&self, view: ViewRoot<'_>, ids: Ids) -> Result<ViewChange, ViewError> {
         frame::task(Tag::Parse, |frame| {
             let mut writer = self.lock();
             // The paths a source root names are normalized (`VfsPath::from`), so the base must be.
@@ -311,7 +308,7 @@ impl Files {
                     writer.views.insert(base.to_path_buf(), index);
                 }
             }
-            Ok(self.write_view(&mut writer, db, &view, &plan?, frame))
+            Ok(self.write_view(&mut writer, &view, &plan?, frame))
         })
     }
 
@@ -365,7 +362,7 @@ impl Files {
                         .partition
                         .classify_path(&path)
                         .map_or(view.other, |set| SourceRootId(set as u32));
-                    if !self.has_source_root(root) {
+                    if !Files::has_source_root(writer, root) {
                         // alloc: the refusal's message (an error path).
                         return Err(ViewError::NoSourceRoot { path: file.path.to_owned(), root });
                     }
@@ -418,7 +415,6 @@ impl Files {
     fn write_view(
         &self,
         writer: &mut Writer,
-        db: &mut Db,
         view: &ViewRoot<'_>,
         plan: &Plan<'_>,
         frame: &Frame,
@@ -434,8 +430,7 @@ impl Files {
             if text.is_none() {
                 continue;
             }
-            let appended =
-                self.input_of(writer, write.id).and_then(|it| it.appended_root_module(&*db));
+            let appended = writer.appended.get(write.id).copied();
             let start = bytes.len();
             FileText::content_bytes(&view.files[write.at].id, appended, &mut bytes);
             ranges.push(start..bytes.len());
@@ -459,34 +454,18 @@ impl Files {
                 added.push(write.id);
             }
             let unchanged = match &text {
-                Some(_) => {
-                    self.text_input(write.id).is_some_and(|input| input.content(&*db) == content)
-                }
-                None => self.raw_file(write.id).is_some_and(|input| input.content(&*db) == content),
+                Some(_) => writer.texts.get(write.id).is_some_and(|it| it.content == content),
+                None => writer.raws.get(write.id).is_some_and(|it| it.content == content),
             };
             if unchanged {
                 continue;
             }
-            let is_library = writer
-                .root_contents
-                .get(&write.root)
-                .expect("a source root's content is kept from when it is set")
-                .is_library;
-            let durability = if is_library { Durability::HIGH } else { Durability::LOW };
             let file = view.files[write.at].id;
             let text_of = text.as_ref().map(|text| (text, file));
-            self.write_aliases(writer, db, write.id, text_of, Some(durability), |alias| {
-                set.push(alias)
-            });
+            writer.write_aliases(write.id, text_of, |alias| set.push(alias));
             let content = match text {
-                Some(text) => self.write_text(
-                    writer,
-                    db,
-                    write.id,
-                    Some((text, file, content)),
-                    Some(durability),
-                ),
-                None => self.write_bytes(writer, db, write.id, read, Some(durability)),
+                Some(text) => writer.write_text(write.id, Some((text, file, content))),
+                None => writer.write_bytes(write.id, read),
             };
             index_file(writer, write.id, content, &mut changed_roots);
             if !write.added {
@@ -495,19 +474,20 @@ impl Files {
         }
 
         for &(id, root, _) in &plan.added {
-            let durability = crate::files::root_durability(writer, root);
-            self.set_file_source_root_in(writer, db, id, root, durability);
+            writer.set_file_root(id, root);
         }
         let mut roots: Vec<SourceRootId, &Frame> =
             Vec::with_capacity_in(plan.added.len() + plan.removed.len(), frame);
         roots.extend(plan.added.iter().map(|it| it.1).chain(plan.removed.iter().map(|it| it.0)));
         sort_roots(&mut roots);
         roots.dedup();
-        self.write_root_files(writer, db, plan, &roots, &mut changed_roots, frame);
+        write_root_files(writer, plan, &roots, &mut changed_roots, frame);
         let gone = plan.removed.iter().map(|&(_, id)| id);
-        self.drop_orphan_aliases(writer, db, gone, |alias| removed.push(alias));
-        self.write_root_contents(writer, db, &changed_roots, frame);
-        writer.named.publish(db, frame);
+        self.drop_orphan_aliases(writer, gone, |alias| removed.push(alias));
+        writer.write_root_contents(&changed_roots, frame);
+        if writer.named.publish(frame) {
+            writer.marks.session = true;
+        }
 
         for &(_, id) in &plan.removed {
             writer.view_ids.remove(id);
@@ -529,20 +509,20 @@ impl Files {
             roots: owned(&roots),
         }
     }
+}
 
-    /// Puts the plan's added files in their source roots and takes its removed ones out: each
-    /// of `roots` gets its new file set, and its content is updated for the files it gained
-    /// and lost (the paths of those gained hashed in one batch), not made again from all of
-    /// them. Adds to `changed` the roots whose content IDs are to be written.
-    fn write_root_files(
-        &self,
-        writer: &mut Writer,
-        db: &mut Db,
-        plan: &Plan<'_>,
-        roots: &[SourceRootId],
-        changed: &mut Roots,
-        frame: &Frame,
-    ) {
+/// Puts the plan's added files in their source roots and takes its removed ones out: each
+/// of `roots` gets its new file set (marked), and its content is updated for the files it
+/// gained and lost (the paths of those gained hashed in one batch), not made again from all of
+/// them. Adds to `changed` the roots whose content IDs are to be written.
+fn write_root_files(
+    writer: &mut Writer,
+    plan: &Plan<'_>,
+    roots: &[SourceRootId],
+    changed: &mut Roots,
+    frame: &Frame,
+) {
+    {
         let mut keys = Vec::with_capacity_in(plan.added.len(), frame);
         keys.extend(plan.added.iter().map(|(_, _, path)| content::path_key(path)));
         let key_bytes = frame.alloc_slice_from_iter(keys.iter().map(|key| &**key));
@@ -553,45 +533,62 @@ impl Files {
             placed
         };
 
+        // Each added file's content in its root, read before the roots are borrowed to edit.
+        let mut contents = Vec::with_capacity_in(plan.added.len(), frame);
+        contents.extend(plan.added.iter().map(|&(id, _, _)| writer.content_of(id)));
+
         for &root in roots {
-            let input = self.source_root(root);
             let mut gone: hashbrown::HashSet<FileId, FixedState, &Frame> =
                 hashbrown::HashSet::with_hasher_in(FixedState, frame);
             gone.extend(plan.removed.iter().filter(|it| it.0 == root).map(|it| it.1));
-            // The root's set, taken out of its input to be edited where it is: no reader holds
-            // it by then (they read it by reference), so `make_mut` copies nothing.
-            let root_kind = crate::files::root_durability(writer, root);
-            let spare = writer.spare_root();
-            let mut source_root =
-                input.set_source_root_field(db).with_durability(root_kind).to(spare);
-            let index = writer
-                .root_contents
-                .get_mut(&root)
-                .expect("a source root's content is kept from when it is set");
             let added = plan.added.iter().filter(|it| it.1 == root);
-            index.one_to_one = match index.one_to_one {
+            let was_one_to_one = writer
+                .root_contents
+                .get(&root)
+                .expect("a source root's content is kept from when it is set")
+                .one_to_one;
+            let one_to_one = match was_one_to_one {
                 true => {
-                    // clone: only for a set a reader still holds (copy on write).
-                    let files = Arc::make_mut(&mut source_root);
+                    // The root's set is not written here: each change is pending until the
+                    // commit puts it in where the set is ([`Writer::pend`],
+                    // `Files::apply_pending`), so neither the snapshot that holds the set nor
+                    // the edit's undo makes it copy. Each check reads the changes before it.
                     for &id in &gone {
-                        files.remove_file(id);
+                        writer.pend(root, SetOp::Remove(id));
                     }
                     let mut one_to_one = true;
                     for (id, _, path) in added {
-                        one_to_one &= files.path_for_file(id).is_none()
-                            && files.file_for_path(path).is_none();
-                        // clone: an added file's path in the set.
-                        files.insert_file(*id, path.clone());
+                        let written = writer.written(root).unwrap_or_else(|| {
+                            panic!("the view writes the source root {root:?}, which the world lacks")
+                        });
+                        one_to_one &= written.path_for_file(*id).is_none()
+                            && written.file_for_path(path).is_none();
+                        // clone: an added file's path, the change's (moved into the set at the commit)
+                        writer.pend(root, SetOp::Insert(*id, path.clone()));
                     }
                     one_to_one
                 }
                 false => {
-                    let (files, one_to_one) = rebuilt(&source_root, &gone, added);
-                    // alloc: the set made again, for a set that names a path for two files.
-                    source_root = Arc::new(files);
+                    let written = writer.written(root).unwrap_or_else(|| {
+                        panic!("the view writes the source root {root:?}, which the world lacks")
+                    });
+                    // The set as the edit has it, its pending changes in (a copy only when it
+                    // has some), made again: a set that names a path for two files.
+                    let (files, one_to_one) = match written.has_pending() {
+                        false => rebuilt(written.set(), &gone, added),
+                        true => rebuilt(&written.applied(), &gone, added),
+                    };
+                    // alloc: the set made again, for a set that names a path for two files;
+                    // given whole, so its pending changes go (`Writer::put_root`).
+                    writer.put_root(root, Arc::new(files));
                     one_to_one
                 }
             };
+            let index = writer
+                .root_contents
+                .get_mut(&root)
+                .expect("a source root's content is kept from when it is set");
+            index.set_one_to_one(one_to_one);
             for &id in &gone {
                 index.remove(id);
             }
@@ -600,7 +597,7 @@ impl Files {
                     continue;
                 }
                 let (key, path) = keys[at].take().expect("an added file is put in one root");
-                index.insert(*id, key, path, self.file_content(&*db, *id));
+                index.insert(*id, key, path, contents[at]);
             }
             for &id in &gone {
                 if let Some(roots) = writer.in_roots.get_mut(id) {
@@ -617,7 +614,7 @@ impl Files {
                 }
                 writer.note_path(path, *id);
             }
-            input.set_source_root_field(db).with_durability(root_kind).to(source_root);
+            writer.marks.roots.push(root);
             if !changed.contains(&root) {
                 changed.push(root);
             }

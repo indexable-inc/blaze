@@ -114,7 +114,7 @@ fn two_allocators(db: &Db, a: Crate, b: Crate) -> String {
 
 /// The function of `krate` its `#[alloc_error_handler]`'s expansion exports as `__rg_oom`
 /// (`hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT`), when it declares one.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn alloc_error_handler_export(db: &Db, krate: Crate) -> Option<hir_def::FunctionId> {
     global_allocator_export(db, krate, hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT)
 }
@@ -146,7 +146,7 @@ fn two_alloc_error_handlers(db: &Db, a: Crate, b: Crate) -> String {
 /// With `db` attached, as a query's run is: the codegen driver calls this outside any query,
 /// and why the MIR does not build formats the types it names.
 pub fn allocations_unobserved(db: &Db, krate: Crate) -> Result<bool, String> {
-    blaze_query::db::attach(db, || allocations_unobserved_attached(db, krate))
+    blaze_memo::attach(db, || allocations_unobserved_attached(db, krate))
 }
 
 fn allocations_unobserved_attached(db: &Db, krate: Crate) -> Result<bool, String> {
@@ -227,6 +227,30 @@ fn default_of(symbol: &'static str) -> Result<&'static str, String> {
         // alloc: the error's message
         other => return Err(format!("the allocator entry `{other}`, which std has no default of")),
     })
+}
+
+/// The symbol of the shim's fixed tables spelled `name`: every entry a shim defines and every
+/// symbol one calls ([`shim`]: `ALLOCATOR_ENTRIES`' entries and the `#[global_allocator]`
+/// exports they go to, std's defaults, the error handler's two targets and the marker). What a
+/// plan's ask names an entry by (`described`'s `put_instance`): an entry is read back as its
+/// table's own `&'static str`, so a name no table holds is no entry and is refused. One
+/// comparison per symbol of the tables (a dozen).
+pub(crate) fn known(name: &str) -> Option<&'static str> {
+    const FIXED: [&str; 8] = [
+        "__rdl_alloc",
+        "__rdl_dealloc",
+        "__rdl_realloc",
+        "__rdl_alloc_zeroed",
+        "__rust_alloc_error_handler",
+        hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT,
+        "__rdl_alloc_error_handler",
+        "__rust_no_alloc_shim_is_unstable_v2",
+    ];
+    ALLOCATOR_ENTRIES
+        .iter()
+        .flat_map(|&(symbol, ours, _, _)| [symbol, ours])
+        .chain(FIXED)
+        .find(|it| *it == name)
 }
 
 /// No item: the shim is named by its symbol.

@@ -373,17 +373,22 @@ fn recode(
 pub(crate) fn path_reads(db: &base_db::Db, krate: base_db::Crate, places: &Places) -> Option<String> {
     let rooted = |value: &str| matches!(places.text(value.as_bytes()), Cow::Owned(_));
     // alloc: once per unit stored, a crate of its closure each
-    let closure: blaze_hash::HashSet<base_db::Crate, std::alloc::Global> =
-        krate.transitive_deps(db).iter().copied().collect();
+    // By key, as the log names the crates that read: a key of a crate no longer in this
+    // snapshot is no crate of the closure.
+    let closure: blaze_hash::HashSet<base_db::CrateKey, std::alloc::Global> =
+        krate.transitive_deps(db).iter().map(|it| it.key(db)).collect();
     // A read that gives its value only to an `include!`'s path is none of these: the crate is
     // made from the file, which its key holds by content ([`base_db::Files::env_exposed`]).
     // The least of those that tie, so the reason does not hang on the log's order.
     let tied = db
         .files()
         .env_exposed()
-        .filter(|&(by, name)| closure.contains(&by) && by.env(db).get(name).is_some_and(|value| rooted(&value)))
+        .filter(|&(by, name)| {
+            closure.contains(&by) && db.krate(by).env(db).get(name).is_some_and(|value| rooted(&value))
+        })
         .min();
     if let Some((by, name)) = tied {
+        let by = db.krate(by);
         // alloc: once per record tied
         return Some(format!(
             "crate {} reads its variable `{name}`, which names a directory of the build",

@@ -1419,7 +1419,7 @@ impl<'a> Ctx<'a> {
                     title: format!("evicted: `{}` ran {} times for values evicted earlier in the build", it.query, it.evicted_asked),
                     // clone: a finding's subject
                     subject: it.query.clone(),
-                    owner: Some("blaze_query".to_owned()),
+                    owner: Some("blaze_memo".to_owned()),
                     evidence: vec![
                         format!(
                             "{} runs, {} verified; {} values let go under their tag's budget, {} dropped",
@@ -1443,7 +1443,7 @@ impl<'a> Ctx<'a> {
                     ),
                     // clone: a finding's subject
                     subject: it.query.clone(),
-                    owner: Some("blaze_query".to_owned()),
+                    owner: Some("blaze_memo".to_owned()),
                     evidence: vec![format!("{} runs, {} verified", it.executed, it.verified), per],
                 });
             }
@@ -1461,7 +1461,7 @@ impl<'a> Ctx<'a> {
                     ),
                     // clone: a finding's subject
                     subject: it.query.clone(),
-                    owner: Some("blaze_query".to_owned()),
+                    owner: Some("blaze_memo".to_owned()),
                     evidence: vec![format!(
                         "flagged past {} reads one run or {} reads recorded a read kept (with {} recorded)",
                         QueryCount::MANY_READS,
@@ -2126,8 +2126,9 @@ fn subject_of(model: &Model, mut span: usize) -> Option<&str> {
 /// The first path in a type name that is not the scheduler's or the query engine's plumbing:
 /// `hir_def::nameres::facts::collect::expand_all` out of a pool job's closure type.
 fn code_in(function: &str) -> &str {
-    const PLUMBING: [&str; 8] = [
+    const PLUMBING: [&str; 9] = [
         "blaze_graph::",
+        "blaze_memo::",
         "blaze_query::",
         "base_db::db::",
         "core::",

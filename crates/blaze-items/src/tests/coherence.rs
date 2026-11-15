@@ -24,12 +24,13 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind as _},
 };
 
-use super::db::TestDB;
+use super::{count as runs, db::TestDB, runs_of};
 
-/// How many times `query` is among the ingredient names in `executed`.
-fn runs(executed: &[String], query: &str) -> usize {
-    executed.iter().filter(|it| it.trim_end_matches('_').ends_with(query)).count()
-}
+/// The kinds the tests count, by name: an impl pair's specialization, a body's inference and
+/// a definition's trait environment.
+const SPECIALIZES: &str = hir_ty::kinds::specializes_query::KIND_NAME;
+const INFER: &str = hir_ty::kinds::infer_body_query::KIND_NAME;
+const TRAIT_ENVIRONMENT: &str = hir_ty::kinds::trait_environment_query::KIND_NAME;
 
 fn crate_named(db: &TestDB, name: &str) -> Crate {
     *all_crates(db)
@@ -94,7 +95,7 @@ fn adt_named(db: &TestDB, krate: Crate, name: &str) -> AdtId {
 }
 
 fn has_type_mismatches(db: &TestDB, function: FunctionId) -> bool {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         InferenceResult::of(db, DefWithBodyId::from(function)).has_type_mismatches()
     })
 }
@@ -122,7 +123,7 @@ fn unconstrained_params_are_as_before_in_declaration_order() {
     let _ = fx.only_file();
     let db = fx.into_db();
     let main = crate_named(&db, "main");
-    let found: Vec<Vec<u32>> = blaze_query::db::attach(&db, || {
+    let found: Vec<Vec<u32>> = blaze_memo::attach(&db, || {
         impls(&db, main)
             .into_iter()
             .map(|impl_| {
@@ -165,11 +166,11 @@ fn a_specializing_impl_asks_only_the_impls_its_header_unifies_with() {
     let main = crate_named(&db, "main");
     let good = function_named(&db, main, "good");
     let bad = function_named(&db, main, "bad");
-    let executed = db.log_executed(|| {
+    let executed = runs_of(&db, || {
         assert!(!has_type_mismatches(&db, good), "`<S as Tr>::A` is `u8`");
         assert!(has_type_mismatches(&db, bad), "`<S as Tr>::A` is no `u16`");
     });
-    assert!(runs(&executed, "specializes_query") <= 2, "{executed:#?}");
+    assert!(runs(&executed, SPECIALIZES) <= 2, "{executed:#?}");
 }
 
 /// `define_opaque` is core's built-in attribute macro, declared here as core declares it: the
@@ -196,12 +197,12 @@ fn an_alias_without_impl_trait_infers_no_body() {
     let _ = fx.only_file();
     let db = fx.into_db();
     let plain = type_alias_named(&db, crate_named(&db, "main"), "Plain");
-    let executed = db.log_executed(|| {
-        blaze_query::db::attach(&db, || {
+    let executed = runs_of(&db, || {
+        blaze_memo::attach(&db, || {
             assert_eq!(tait_hidden_types(&db, plain).values().count(), 0)
         })
     });
-    assert_eq!(runs(&executed, "infer_body_query"), 0, "{executed:#?}");
+    assert_eq!(runs(&executed, INFER), 0, "{executed:#?}");
 }
 
 #[test]
@@ -210,15 +211,15 @@ fn an_alias_with_impl_trait_takes_its_hidden_type_from_its_defining_body() {
     let _ = fx.only_file();
     let db = fx.into_db();
     let opaque = type_alias_named(&db, crate_named(&db, "main"), "Opaque");
-    let executed = db.log_executed(|| {
-        blaze_query::db::attach(&db, || {
+    let executed = runs_of(&db, || {
+        blaze_memo::attach(&db, || {
             let hidden: Vec<_> =
                 tait_hidden_types(&db, opaque).values().map(|it| it.get().skip_binder()).collect();
             assert_eq!(hidden.len(), 1, "{hidden:?}");
             assert!(matches!(hidden[0].kind(), TyKind::Uint(UintTy::U32)), "{hidden:?}");
         })
     });
-    assert!(runs(&executed, "infer_body_query") >= 1, "{executed:#?}");
+    assert!(runs(&executed, INFER) >= 1, "{executed:#?}");
 }
 
 const ORPHAN: &str = r#"//- /dep.rs crate:dep
@@ -241,7 +242,7 @@ fn orphan_rules_normalize_only_a_header_with_an_alias() {
     let _ = fx.files().to_vec();
     let db = fx.into_db();
     let impls = impls(&db, crate_named(&db, "main"));
-    let answers: Vec<bool> = blaze_query::db::attach(&db, || {
+    let answers: Vec<bool> = blaze_memo::attach(&db, || {
         impls.iter().map(|&it| check_orphan_rules(&db, it)).collect()
     });
     assert_eq!(answers, [true, true, true, false]);
@@ -250,14 +251,14 @@ fn orphan_rules_normalize_only_a_header_with_an_alias() {
     let _ = fx.files().to_vec();
     let db = fx.into_db();
     let impls = self::impls(&db, crate_named(&db, "main"));
-    let plain = db.log_executed(|| {
-        blaze_query::db::attach(&db, || assert!(check_orphan_rules(&db, impls[2])))
+    let plain = runs_of(&db, || {
+        blaze_memo::attach(&db, || assert!(check_orphan_rules(&db, impls[2])))
     });
-    assert_eq!(runs(&plain, "trait_environment_query"), 0, "{plain:#?}");
-    let alias = db.log_executed(|| {
-        blaze_query::db::attach(&db, || assert!(check_orphan_rules(&db, impls[1])))
+    assert_eq!(runs(&plain, TRAIT_ENVIRONMENT), 0, "{plain:#?}");
+    let alias = runs_of(&db, || {
+        blaze_memo::attach(&db, || assert!(check_orphan_rules(&db, impls[1])))
     });
-    assert!(runs(&alias, "trait_environment_query") >= 1, "{alias:#?}");
+    assert!(runs(&alias, TRAIT_ENVIRONMENT) >= 1, "{alias:#?}");
 }
 
 const FREEZE: &str = r#"
@@ -282,7 +283,7 @@ fn is_freeze_walks_every_variant() {
     let main = crate_named(&db, "main");
     let names = ["UnsafeCell", "Cell", "Plain", "Shared", "Wrap", "U", "Empty", "Never"];
     let adts = names.map(|name| adt_named(&db, main, name));
-    let answers = blaze_query::db::attach(&db, || {
+    let answers = blaze_memo::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         adts.map(|adt| {
@@ -307,7 +308,7 @@ fn is_freeze_walks_each_type_once() {
     let main = crate_named(&db, "main");
     let pair = adt_named(&db, main, "P");
     let leaves = [adt_named(&db, main, "Plain"), adt_named(&db, main, "Cell")];
-    let answers = blaze_query::db::attach(&db, || {
+    let answers = blaze_memo::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         leaves.map(|leaf| {

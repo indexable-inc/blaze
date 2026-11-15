@@ -54,7 +54,7 @@ fn checked(name: &str) -> (Vec<crate::BorrowckResult>, usize, Option<NotChecked>
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = function(&db, name);
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(function.into()));
         let missing = infer

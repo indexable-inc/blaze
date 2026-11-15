@@ -1,0 +1,12 @@
+{
+ "id": "A-port-l1-base-db-world",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane L1 memo+base",
+ "where": "docs/v2/plan/design/front-end-on-memo.md, crates/base-db/src/db.rs",
+ "what": "The port spec maps base-db's inputs to `X::new(&inputs, fact, ..)` but never says what base-db's mutable `Db` (setters taking `&mut Db`, seal groups, reader stop/resume, callers holding `Crate` and file ids across setter calls) becomes when inputs are fixed per snapshot and a rebuilt arena's ids are new. The lane's whole second half (base-db, hir-expand) could not start without that decision.",
+ "cost": "base-db and hir-expand (about 280 sites) left on blaze-query this round",
+ "cause": "the spec was written from the query crates' side; base-db is the driver-facing world, and how ids survive a remade arena was never decided",
+ "workaround": "the decision needed is written in the spec's 'L1 API, as written', 'base-db: not ported'",
+ "fix": "decide the world-plus-snapshot `Db` and how callers name inputs across a remake, then port base-db in one lane",
+ "state": "open"
+}

@@ -127,7 +127,7 @@ pub(super) enum Order {
 /// them, asked in `order`. Also the shift property's (`edits/shift.rs`).
 pub(super) fn identities(text: &str, order: Order) -> BTreeMap<&'static str, Ids> {
     let db = fixture::db(text).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let env: StoredParamEnvAndCrate =
             ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: fixture::test_crate(&db) }
                 .store();

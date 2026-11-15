@@ -3,7 +3,7 @@
 //! reads, settled before its certificate is filed) need, with no daemon. A fact's answer
 //! ([`Effect::Answer`]) is not here: it is a lookup in mapped tables
 //! ([`blaze_keyed::front::Universe::answer`]), and the late reads it answers from are the
-//! request's own ([`crate::Request::late`]).
+//! asking unit's own ([`crate::Request::late`], one table per unit).
 //!
 //! [`Effect::Outside`]: blaze_keyed::driver::Effect::Outside
 //! [`Effect::Answer`]: blaze_keyed::driver::Effect::Answer

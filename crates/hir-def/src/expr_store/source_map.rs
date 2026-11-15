@@ -17,7 +17,7 @@ use std::{
 };
 
 use blaze_ids::radix;
-use blaze_query::db::AsId;
+use blaze_memo::Id as _;
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId, name::Name};
 use la_arena::{Idx, RawIdx};
@@ -120,8 +120,8 @@ impl<N: AstNode> SourceKey for InFile<AstPtr<N>> {
     #[inline]
     fn source_key(&self) -> (u8, u64, u32, u32, u16) {
         let (file_kind, file) = match self.file_id {
-            HirFileId::FileId(file) => (1, u64::from(file.as_id().as_u32())),
-            HirFileId::MacroFile(call) => (2, u64::from(call.as_id().as_u32())),
+            HirFileId::FileId(file) => (1, crate::hir::persist::session_word(file.gid())),
+            HirFileId::MacroFile(call) => (2, crate::hir::persist::session_word(call.gid())),
         };
         let range = self.value.text_range();
         (file_kind, file, range.start().into(), range.end().into(), u16::from(self.value.kind()))
@@ -1311,7 +1311,7 @@ mod view_tests;
 pub(in crate::expr_store) mod tests {
     use blaze_hash::HashMap;
     use blaze_ids::rng::SplitMix64;
-    use blaze_query::db::FromId;
+    use blaze_memo::Id;
     use smallvec::SmallVec;
     use std::alloc::Global;
     use syntax::{SyntaxKind, TextSize};
@@ -1331,10 +1331,11 @@ pub(in crate::expr_store) mod tests {
         start: u32,
         end: u32,
     ) -> InFile<AstPtr<N>> {
-        let id = blaze_query::db::Id::from_u32(file + 1);
+        // An id at `file` in a crate arena (index 1): its bits are never 0.
+        let id = blaze_memo::Gid::for_test(file);
         let file_id = match in_macro {
-            true => HirFileId::MacroFile(FromId::from_id(id)),
-            false => HirFileId::FileId(FromId::from_id(id)),
+            true => HirFileId::MacroFile(Id::from_gid(id)),
+            false => HirFileId::FileId(Id::from_gid(id)),
         };
         let range = TextRange::new(TextSize::from(start), TextSize::from(end));
         let ptr = AstPtr::try_from_raw(SyntaxNodePtr::from_parts(kind, range));

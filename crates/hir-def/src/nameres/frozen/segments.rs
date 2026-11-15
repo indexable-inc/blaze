@@ -102,17 +102,17 @@ pub fn files(db: &Db, krate: Crate, bytes: &[u8]) -> R<Files> {
 
 /// `krate` and the crates it depends on, as [`closure`] lists them: what every segment's
 /// reader names crates by, made once a crate and not once a read.
-#[blaze_query::tracked(returns(ref))]
-fn segment_closure(db: &Db, krate: Crate) -> Vec<Crate> {
-    closure(db, krate)
+#[blaze_memo::tracked(returns(copy))]
+fn segment_closure<'db>(db: &'db Db, krate: Crate) -> &'db [Crate] {
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &closure(db, krate))
 }
 
 /// The modules of `krate` in its `DefMap`'s order: what a segment names the crate's own
 /// modules by, made once a crate and not once a read.
-#[blaze_query::tracked(returns(ref))]
-fn segment_modules(db: &Db, krate: Crate) -> Box<[ModuleId]> {
-    // alloc: the memo's value, once per crate read from a record of segments
-    crate::nameres::crate_def_map(db, krate).table(db).keys().copied().collect()
+#[blaze_memo::tracked(returns(copy))]
+fn segment_modules<'db>(db: &'db Db, krate: Crate) -> &'db [ModuleId] {
+    let modules = crate::nameres::crate_def_map(db, krate).table(db).keys().copied();
+    blaze_memo::keep_iter(blaze_memo::Database::memo(db), modules)
 }
 
 /// A reader of the segment `bytes` of a record of values of `krate` whose files table read
@@ -122,14 +122,15 @@ pub fn reader<'a>(db: &'a Db, krate: Crate, files: &'a Files, bytes: &'a [u8]) -
         db,
         r: Reader::new(bytes),
         krate,
-        closure: Cow::Borrowed(segment_closure(db, krate).as_slice()),
+        closure: Cow::Borrowed(segment_closure(db, krate)),
         paths: HashMap::new_in(Global),
         files: Cow::Borrowed(&files.0),
         // alloc: none until the segment names a macro call
         calls: Vec::new(),
         // alloc: none until the segment names a syntax context
         contexts: Vec::new(),
-        own: Cow::Borrowed(&**segment_modules(db, krate)),
+        ctx_arena: None,
+        own: Cow::Borrowed(segment_modules(db, krate)),
         in_def_map: true,
         modules: HashMap::new_in(Global),
     }

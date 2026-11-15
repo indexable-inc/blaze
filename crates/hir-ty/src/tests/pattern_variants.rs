@@ -138,7 +138,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 /// mismatch, and how many of its paths read a refinement.
 fn infer(fixture: &str, name: &str) -> (Vec<InferenceDiagnostic>, bool, usize) {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, name));
         let body = Body::of(&db, def);
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
@@ -164,7 +164,7 @@ fn peel_ref(ty: Ty<'_>) -> Ty<'_> {
 /// Why each field of the fixture's struct `Refused` did not lower.
 fn refused(fixture: &str) -> Vec<PatternTypeUnsupported> {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let refused = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())

@@ -310,7 +310,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// What the crate root's attributes say that a by-piece pass reads (the features, the
     /// channel, the registered tools, the root): the database's query, so a probe's key
     /// covers it.
-    pub(crate) fn settings(&self) -> &'db crate::checks::settings::CrateSettings {
+    pub(crate) fn settings(&self) -> crate::checks::settings::CrateSettings<'db> {
         crate::checks::settings::crate_settings(self.db, self.krate.base())
     }
 
@@ -903,6 +903,13 @@ fn fast_print_path(path: view::Path<'_>) -> Option<String> {
         out.push_str(segment.name_ref()?.text());
     }
     Some(out)
+}
+
+/// The arena whose syntax-context table the contexts of `file`'s span map index: the one rule,
+/// [`HirFileId::context_arena`] (a macro file's call's; a real file's own id's, as its root
+/// contexts read no table).
+pub(crate) fn context_arena(file: HirFileId) -> blaze_memo::ArenaId {
+    file.context_arena()
 }
 
 /// The paths of a `#[derive(...)]`, in order, with where each is, as text: for a diagnostic

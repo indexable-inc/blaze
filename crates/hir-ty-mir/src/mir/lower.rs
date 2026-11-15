@@ -252,7 +252,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     inline_consts: u32,
     /// The `line!()` literals read where the code runs ([`location::slots_lines`]); `None`
     /// where each is its value.
-    line_slots: Option<&'db blaze_hash::HashSet<ExprId, Global>>,
+    line_slots: Option<&'db location::ExprSet<'db>>,
     /// How many shared borrows rustc may promote the expression being lowered is inside of: a
     /// promoted constant is a value, so a `line!()` in one stays a literal.
     promotable_borrows: u32,
@@ -470,7 +470,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
-        let env = db.trait_environment(owner.generic_def(db));
+        let env = owner.param_env(db);
         let interner = DbInterner::new_with(db, resolver.krate());
         // FIXME(next-solver): Is `non_body_analysis()` correct here? Don't we want to reveal opaque types defined by this body?
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -1780,10 +1780,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         let mut operands = Vec::with_capacity_in(count, self.frame);
                         operands.resize_with(count, || None);
                         let declared = self.declared_locals();
+                        let table = self.resolver.ctx_table();
                         for RecordLitField { name, expr } in fields.iter() {
                             let hygiene = self.store.record_field_hygiene(*expr);
                             let field_id = variant_fields
-                                .field_written(self.db, variant_id, name, hygiene)
+                                .field_written(self.db, table, variant_id, name, hygiene)
                                 .ok_or(MirLowerError::UnresolvedField)?;
                             let Some((op, c)) = self.lower_expr_to_some_operand(*expr, current)?
                             else {
@@ -1854,8 +1855,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             not_supported!("Union record literal with more than one field");
                         };
                         let hygiene = self.store.record_field_hygiene(*expr);
+                        let table = self.resolver.ctx_table();
                         let local_id = variant_fields
-                            .field_written(self.db, variant_id, name, hygiene)
+                            .field_written(self.db, table, variant_id, name, hygiene)
                             .ok_or(MirLowerError::UnresolvedField)?;
                         let place = place.project(PlaceElem::Field(local_id.into()));
                         self.lower_expr_to_place(*expr, place, current)
@@ -2590,7 +2592,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             // Looked up hygienically, as inference does (`variant_written`).
                             let ctxt = offset.field_hygiene(index).syntax_context();
                             let id = hir_def::signatures::EnumVariants::variant_written(
-                                self.db, it, name, ctxt,
+                                self.db,
+                                self.resolver.ctx_table(),
+                                it,
+                                name,
+                                ctxt,
                             )
                             .ok_or(no_field)?;
                             place = place.project(ProjectionElem::Downcast(id.into()));
@@ -2605,7 +2611,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     let hygiene = offset.field_hygiene(index);
                     let field = of
                         .fields(self.db)
-                        .field_written(self.db, of, name, hygiene)
+                        .field_written(self.db, self.resolver.ctx_table(), of, name, hygiene)
                         .ok_or(no_field)?;
                     let field_ty = self.db.field_types(of)[field]
                         .ty()
@@ -5231,20 +5237,21 @@ pub fn has_failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> bool {
 }
 
 /// What keeps a body's macro calls from being lowered.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
-enum UnexpandedCall {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnexpandedCall<'db> {
     /// One failed to expand, an error at the call.
     Failed,
-    /// The first whose expansion is not what rustc parses it as, and why.
-    Misparsed(String),
+    /// The first whose expansion is not what rustc parses it as, and why: kept in the query's
+    /// arena.
+    Misparsed(&'db str),
 }
 
 /// What keeps the body's macro calls from being lowered: one that failed to expand, else the
 /// first, in the order lowering met them, whose expansion is not what rustc parses it as. It
 /// reads the store's macro calls and their sites, not the source map, so lowering a body
 /// never builds its map.
-#[blaze_query::tracked(returns(ref))]
-fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<UnexpandedCall> {
+#[blaze_memo::tracked(returns(ref))]
+fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<UnexpandedCall<'db>> {
     use syntax::view::AstNode;
     let calls = ExpressionStore::of(db, owner.expression_store_owner(db)).macro_calls();
     if calls.is_empty() {
@@ -5322,7 +5329,7 @@ fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<Unexpan
              parses as one expression, whose expansion is {what}"
         ))
     });
-    misparsed.map(UnexpandedCall::Misparsed)
+    misparsed.map(|it| UnexpandedCall::Misparsed(blaze_memo::keep_str(blaze_memo::Database::memo(db), &it)))
 }
 
 /// Whether rustc parses `call` as an expression (`parse_stmt_mac`): in statement position,
@@ -5793,7 +5800,7 @@ pub(crate) fn lower_body<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<'db,
 }
 
 /// The body of the constant behind a promoted `&expr` of `def`, which evaluates `expr` alone.
-#[blaze_query::tracked(returns(as_ref), lru = 0, mem_tag = Mir)]
+#[blaze_memo::tracked(returns(as_ref), owns, mem_tag = Mir)]
 pub fn promoted_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,

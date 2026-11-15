@@ -1,48 +1,46 @@
-//! A program is a manifest: which node is where, and what refers to what. [`Program::place`]
-//! takes what a walk gave (a demand: a whole program; or a delta: an edit's neighbourhood, or a
-//! tier-up) and gives a [`PlacementChange`] of bytes proportional to the edit. Nothing is ever
-//! relinked: the file is patched and the program run again.
+//! A program is a manifest: which nodes have rows, under which keys, and what refers to what.
+//! [`Program::place`] takes what a walk gave (a demand: a whole program; or a delta: an edit's
+//! neighbourhood, or a tier-up) and gives a [`RowChange`]: the rows that came, went or moved.
+//! The linker turns it into its own change (blaze-link's `Change`) and patches the file; where
+//! a row's bytes go is the linker's, never this crate's, and nothing is relinked.
 //!
 //! **The manifest** (each table ordered by its key, so it is a function of the program):
 //!
 //! | table | row |
 //! |---|---|
-//! | functions | symbol → instance key, tier, code place (offset, size, capacity), location block place, the build it was placed in, callees, statics, fields pointing at nodes, instances it took in, items of its locations |
-//! | statics | symbol → value key, place, functions and statics it points at, its fields |
-//! | files | file name → its bytes' place in [`Section::Data`] |
-//! | spans | item → its file and first line, as the placed locations say |
-//! | sites | (target, referrer, relocation) → where the field is: what a move repatches |
-//! | location items | (item, function, location) → line within the item: what a span move rewrites |
+//! | functions | symbol → instance key, tier, the build it came in, callees, statics, plan key, instances it took in |
+//! | statics | symbol → value key, functions and statics it points at |
+//! | referrers | (target, referrer): every edge of the rows, reversed; what the seeds search upward |
 //! | inliners | (inlinee, inliner), at any depth: what an edit of an inlinee reseeds |
-//! | externs | name → import slot |
 //!
-//! It is itself a record ([`Program`] is a [`Payload`], filed by [`crate::keyed`]), keyed by its roots and settings
-//! ([`program_key`]), and is cut into content-defined chunks ([`Program::chunks`]) so a store
-//! keeps an edit's few changed chunks, not a second manifest.
+//! The first two are the record; the last two are derived from them, on place and on decode, and
+//! never stored: rebuilding them is one pass over the rows a decode reads anyway, against bytes
+//! that would double the manifest.
 //!
-//! **The layout policy (file only).** Calls are direct. Each function, location block and static
-//! gets a capacity a quarter over its size (16-aligned). New bytes that fit are written in place;
-//! bytes that do not are appended at the section's tail and every field that pointed at the old
-//! place is repatched from the sites table (4 or 8 bytes a site, with no referrer read or
-//! remade): an outgrown function costs its own bytes plus 4 bytes per call site of it. The
-//! space it left is dead; when the dead bytes of a section exceed its live bytes
-//! ([`Program::compaction_due`]) the file is laid out whole again ([`Program::relayout`]), so the
-//! file stays under twice its live size plus slack and the rewrite's cost is amortized over the
-//! edits that made the dead space. A section's reserve outgrown is [`ProgramError::Outgrown`],
-//! refused before anything changes; the relayout then doubles the reserve. A node no root
-//! reaches any more is retired from the manifest (its bytes are dead); the mark that finds them
-//! runs only when an edit removed an edge.
+//! It is itself a record ([`Program`] is a [`Payload`], filed by [`crate::keyed`]), keyed by its
+//! roots and settings ([`program_key`]), and is cut into content-defined chunks
+//! ([`Program::chunks`]) so a store keeps an edit's few changed chunks, not a second manifest.
+//!
+//! **Retiring.** A node no root reaches any more leaves the manifest (it went); the mark that
+//! finds them runs only when an edit removed an edge or the walk left a held node unreached.
 //!
 //! **Tiers.** A row holds its instance's tier. [`Program::tier_ups`] names the workspace
-//! instances to make again at the top tier: every one still at the fast tier that was placed in
-//! an earlier build and has not changed since. The chosen rule, and why: an instance an edit
-//! just made is likely to be edited again (an agent's edits come in runs), so optimizing it
-//! first is wasted; a measured-hot rule needs counters in fast-tier code and a run to fill them,
-//! which a build that runs nothing has not got; "everything unchanged for one build, at low
-//! priority when the pool is idle" reaches the maximally optimized program with no measurement
-//! and never delays an edit. A tier-up is a [`Delta::tier_up`]: no source changed, the same
-//! body key, a new instance key; tiering never changes behaviour (the tests compare a program's
-//! output at both tiers).
+//! instances to make again at the top tier: every one still at the fast tier that came in an
+//! earlier build and has not changed since. The chosen rule, and why: an instance an edit just
+//! made is likely to be edited again (an agent's edits come in runs), so optimizing it first is
+//! wasted; a measured-hot rule needs counters in fast-tier code and a run to fill them, which a
+//! build that runs nothing has not got; "everything unchanged for one build, at low priority
+//! when the pool is idle" reaches the maximally optimized program with no measurement and never
+//! delays an edit. A tier-up is a [`Delta::tier_up`]: no source changed, the same body key, a new
+//! instance key; tiering never changes behaviour.
+//!
+//! **The floor, and the cost against it.** A placement must at least read what the walk gave
+//! (`W` rows) and write the change (`C` rows): `O(W + C)`. It is `O((W + C) log R)` in a program
+//! of `R` rows (the tables are ordered maps), plus, when an edge was removed, the mark: `O(R)`,
+//! the one step not proportional to the edit (estimate: about 0.1 µs a row, so 10 ms at
+//! `R = 100 000`, against a sub-millisecond floor for a one-function edit; it runs only on an
+//! edit that drops a call). The seeds search upward from each stale node through the referrers
+//! table and stop at the first unstale root path: proportional to the edit's ancestors.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -52,97 +50,34 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::Plant;
-use crate::change::{Import, LineWrite, PlacementChange, Section, Write};
-use crate::key::{InstanceKey, ItemId, Node, PlanKey, Settings, Symbol, Tier};
-use crate::record::{InstanceCode, RelocError, RelocKind, StaticValue, Target, ValueKey};
+use crate::change::{Row, RowChange};
 use crate::codec::{CodecError, Digest, In, Out, Payload};
-use crate::walk::{Front, Prior, Seed, Span, Stale, Walked};
-
-/// The instruction set (hosts: macOS arm64, Linux arm64 and x86_64).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub enum Arch {
-    X86_64,
-    Arm64,
-}
-
-/// The machine a program is laid out for: its instruction set, its page size, and the address
-/// space each section reserves (section `i` starts at `(i + 1) * reserve`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct Machine {
-    pub arch: Arch,
-    pub page: u64,
-    pub reserve: u64,
-}
-
-impl Machine {
-    pub fn base(&self, section: Section) -> u64 {
-        (section.index() as u64 + 1) * self.reserve
-    }
-
-    pub fn doubled(&self) -> Machine {
-        Machine { reserve: self.reserve * 2, ..*self }
-    }
-}
-
-/// A node's bytes in a section.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
-pub struct Place {
-    pub offset: u64,
-    pub size: u64,
-    pub capacity: u64,
-}
+use crate::key::{InstanceKey, ItemId, Node, PlanKey, Settings, Symbol, Tier};
+use crate::record::ValueKey;
+use crate::walk::{Prior, Seed, Stale, Walked};
 
 /// A function's row.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FnRow {
     pub key: InstanceKey,
     pub tier: Tier,
-    /// In [`Section::Text`]: the code, then its unwind rows.
-    pub code: Place,
-    /// Its location records, in [`Section::Locations`].
-    pub locs: Place,
-    /// The build ([`Program::generation`]) its code was placed in.
+    /// The build ([`Program::generation`]) it came in under this key.
     pub since: u64,
     pub calls: Vec<Symbol, Global>,
     pub statics: Vec<Symbol, Global>,
-    /// The fields of its code that point at functions and statics, by relocation index.
-    pub out: Vec<(Node, u32), Global>,
     /// Its plan key: with [`FnRow::inlined`], the tier-free identity of the code a test runs
     /// through this row ([`crate::reach`]).
     pub plan: PlanKey,
     /// Every instance it took in at any depth, sorted by symbol, each once, with its plan key.
     pub inlined: Vec<(Symbol, PlanKey), Global>,
-    /// The item each of its locations is in, in order.
-    pub loc_items: Vec<ItemId, Global>,
 }
 
 /// A static's row.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StaticRow {
     pub key: ValueKey,
-    /// In [`Section::Data`].
-    pub place: Place,
     pub calls: Vec<Symbol, Global>,
     pub statics: Vec<Symbol, Global>,
-    pub out: Vec<(Node, u32), Global>,
-}
-
-/// Where a field pointing at a node is, so a move rewrites it without reading its referrer.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct Site {
-    pub section: Section,
-    pub offset: u64,
-    pub kind: RelocKind,
-    pub addend: i64,
-    /// The field's bytes before relocation (an arm64 branch's opcode is in them).
-    pub template: [u8; 4],
-}
-
-/// An item's span as the placed locations say.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct SpanRow {
-    pub file: Vec<u8, Global>,
-    pub line: u32,
 }
 
 /// What changed since the program was placed, as the front end knows it.
@@ -160,6 +95,24 @@ pub struct Delta {
     /// Workspace instances to make again at the top tier, their bodies unchanged
     /// ([`Program::tier_ups`]).
     pub tier_up: Vec<Symbol, Global>,
+    /// Whether a caller's code can take a callee in, so a callee's edit can move its callers'
+    /// code ([`Program::seeds`]).
+    pub callers: Callers,
+}
+
+/// Whether the code of a program's instances can take a callee in: what decides if an edited
+/// instance's callers are walked again ([`Stale::Revisit`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Callers {
+    /// An edit can change a caller's inline decision or what it took in: its callers are
+    /// walked again, at their tier.
+    #[default]
+    MayTakeIn,
+    /// No code takes a callee in, and a code key reads of a callee's plan only what moves
+    /// with the callee's own name (its place's kind): a caller's code moves only when its own
+    /// plan does, so the callers of an edited instance are not walked again. blaze-keyed's
+    /// walker ([`crate::walker`]), whose code key is never a callee's.
+    NeverTakeIn,
 }
 
 impl Delta {
@@ -176,73 +129,35 @@ impl Delta {
     }
 }
 
-/// The code records a program reads, by instance key.
-pub trait Records {
-    fn code(&self, key: &InstanceKey) -> Option<InstanceCode>;
-}
-
-/// Why a placement was refused. Each names the node, item or section it is about.
+/// Why a placement was refused, before anything changed. Each names the node it is about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProgramError {
     /// The walk gave `node` twice.
     Twice { node: Node },
-    /// No code record under the key the walk gave.
-    NoRecord { symbol: Symbol, key: InstanceKey },
-    /// The front end has no value for a static the walk gave.
-    NoStatic { symbol: Symbol },
-    /// A static's value has another key than the walk gave: the walk is stale.
-    StaleStatic { symbol: Symbol },
-    /// The front end has no span for an item a location is in.
-    NoSpan { item: ItemId },
-    /// `referrer` points at `target`, which the program does not hold.
+    /// `referrer` refers to `target`, which the program would not hold.
     Unplaced { referrer: Node, target: Node },
-    /// A field cannot hold its target.
-    Reloc { node: Node, reloc: u32, error: RelocError },
-    /// `section` would need `need` bytes, over its `reserve`.
-    Outgrown { section: Section, need: u64, reserve: u64 },
 }
 
 impl fmt::Display for ProgramError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProgramError::Twice { node } => write!(f, "the walk gave {node} twice"),
-            ProgramError::NoRecord { symbol, key } => {
-                write!(f, "no code record of function {symbol} under its key {key}")
-            }
-            ProgramError::NoStatic { symbol } => {
-                write!(f, "the front end has no value for static {symbol}")
-            }
-            ProgramError::StaleStatic { symbol } => {
-                write!(f, "static {symbol}'s value is not the one the walk keyed: a stale walk")
-            }
-            ProgramError::NoSpan { item } => write!(
-                f,
-                "the front end has no span for item {}, which a panic location is in",
-                item.0
-            ),
             ProgramError::Unplaced { referrer, target } => {
-                write!(f, "{referrer} points at {target}, which the program does not hold")
+                write!(f, "{referrer} refers to {target}, which the program would not hold")
             }
-            ProgramError::Reloc { node, reloc, error } => {
-                write!(f, "{node}, relocation {reloc}: its field cannot hold its target ({error:?})")
-            }
-            ProgramError::Outgrown { section, need, reserve } => write!(
-                f,
-                "section {section:?} needs {need} bytes, over its reserve of {reserve}: lay the program out again at twice the reserve"
-            ),
         }
     }
 }
 
 /// The domain of a program's key.
-pub const PROGRAM_DOMAIN: &str = "blaze program manifest 1";
+pub const PROGRAM_DOMAIN: &str = "blaze program manifest 2";
 /// The domain of a manifest entry's chunk-boundary hash.
 pub const CHUNK_DOMAIN: &str = "blaze program chunk 1";
 /// An entry whose boundary hash's first byte is under this ends a chunk: about one entry in 16.
 const CHUNK_CUT: u8 = 16;
 
-/// The key of the program of `roots` under `settings`, laid out for `machine`.
-pub fn program_key(roots: &[Node], settings: &Settings, machine: &Machine) -> Digest {
+/// The key of the program of `roots` under `settings`.
+pub fn program_key(roots: &[Node], settings: &Settings) -> Digest {
     let mut sorted = Vec::with_capacity_in(roots.len(), Global);
     sorted.extend_from_slice(roots);
     sorted.sort_unstable();
@@ -253,9 +168,6 @@ pub fn program_key(roots: &[Node], settings: &Settings, machine: &Machine) -> Di
         root.encode(&mut out);
     }
     settings.encode(&mut out);
-    out.u8(machine.arch as u8);
-    out.u64(machine.page);
-    out.u64(machine.reserve);
     let bytes = out.finish();
     Digest::of(PROGRAM_DOMAIN, &bytes)
 }
@@ -280,49 +192,20 @@ impl Chunks {
     }
 }
 
-/// A program: its manifest and the machine that places nodes in it.
+/// A program: its manifest and the machine that changes it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Program {
-    machine: Machine,
     settings: Settings,
     roots: Vec<Node, Global>,
     fns: BTreeMap<Symbol, FnRow, Global>,
     statics: BTreeMap<Symbol, StaticRow, Global>,
-    files: BTreeMap<Vec<u8, Global>, Place, Global>,
-    spans: BTreeMap<ItemId, SpanRow, Global>,
-    sites: BTreeMap<(Node, Node, u32), Site, Global>,
-    /// (item, function, location) → (line within the item, column).
-    loc_items: BTreeMap<(ItemId, Symbol, u32), (u32, u32), Global>,
+    /// Derived: (target, referrer) for every edge of every row.
+    referrers: BTreeSet<(Node, Node), Global>,
+    /// Derived: (inlinee, inliner) for every instance a row took in.
     inliners: BTreeSet<(Symbol, Symbol), Global>,
-    externs: BTreeMap<Vec<u8, Global>, u32, Global>,
-    lengths: [u64; 4],
-    /// Bytes of each section no row holds any more.
-    dead: [u64; 4],
     /// The number of placements made.
     generation: u64,
     plant: Plant,
-}
-
-/// A node's bytes and fields, ready to write.
-enum Loaded<'w> {
-    Function { walked: &'w Walked, symbol: Symbol, code: InstanceCode },
-    Static { walked: &'w Walked, symbol: Symbol, value: StaticValue },
-}
-
-fn align16(value: u64) -> u64 {
-    value.div_ceil(16) * 16
-}
-
-fn capacity(size: u64) -> u64 {
-    align16(size + size / 4).max(16)
-}
-
-fn node_of(target: &Target) -> Option<Node> {
-    match target {
-        Target::Function(symbol) => Some(Node::Function(*symbol)),
-        Target::Static(symbol) => Some(Node::Static(*symbol)),
-        Target::Location(_) | Target::Extern(_) => None,
-    }
 }
 
 const LEAST_NODE: Node = Node::Function(Symbol {
@@ -330,37 +213,54 @@ const LEAST_NODE: Node = Node::Function(Symbol {
     args: crate::key::ArgsKey(Digest([0; 32])),
 });
 
+/// A row taken out of the manifest: its key and what it referred to.
+struct Forgotten {
+    key: Digest,
+    calls: Vec<Symbol, Global>,
+    statics: Vec<Symbol, Global>,
+}
+
+/// What a row or a walked entry refers to: its calls, then its statics.
+fn targets_of<'a>(calls: &'a [Symbol], statics: &'a [Symbol]) -> impl Iterator<Item = Node> + 'a {
+    calls.iter().map(|callee| Node::Function(*callee)).chain(statics.iter().map(|target| Node::Static(*target)))
+}
+
 impl Program {
-    pub fn new(machine: Machine, settings: Settings, roots: &[Node], plant: Plant) -> Program {
+    pub fn new(settings: Settings, roots: &[Node], plant: Plant) -> Program {
         let mut sorted = Vec::with_capacity_in(roots.len(), Global);
         sorted.extend_from_slice(roots);
         sorted.sort_unstable();
         sorted.dedup();
         Program {
-            machine,
             settings,
             roots: sorted,
             fns: BTreeMap::new_in(Global),
             statics: BTreeMap::new_in(Global),
-            files: BTreeMap::new_in(Global),
-            spans: BTreeMap::new_in(Global),
-            sites: BTreeMap::new_in(Global),
-            loc_items: BTreeMap::new_in(Global),
+            referrers: BTreeSet::new_in(Global),
             inliners: BTreeSet::new_in(Global),
-            externs: BTreeMap::new_in(Global),
-            lengths: [0; 4],
-            dead: [0; 4],
             generation: 0,
             plant,
         }
     }
 
-    pub fn key(&self) -> Digest {
-        program_key(&self.roots, &self.settings, &self.machine)
+    /// A program of `roots` holding `rows` (each function's row, by its symbol): a manifest
+    /// kept in another form (blaze-keyed's kept rows, as [`crate::walker`] reads them), its
+    /// derived tables rebuilt. Cost: `O(R log R)`, a decode's.
+    pub fn of_rows(
+        settings: Settings,
+        roots: &[Node],
+        rows: impl IntoIterator<Item = (Symbol, FnRow)>,
+        plant: Plant,
+    ) -> Program {
+        let mut program = Program::new(settings, roots, plant);
+        for (symbol, row) in rows {
+            program.admit_function(symbol, row);
+        }
+        program
     }
 
-    pub fn machine(&self) -> &Machine {
-        &self.machine
+    pub fn key(&self) -> Digest {
+        program_key(&self.roots, &self.settings)
     }
 
     pub fn settings(&self) -> &Settings {
@@ -379,50 +279,20 @@ impl Program {
         &self.statics
     }
 
-    pub fn files(&self) -> &BTreeMap<Vec<u8, Global>, Place, Global> {
-        &self.files
-    }
-
-    pub fn externs(&self) -> &BTreeMap<Vec<u8, Global>, u32, Global> {
-        &self.externs
-    }
-
-    pub fn spans(&self) -> &BTreeMap<ItemId, SpanRow, Global> {
-        &self.spans
-    }
-
-    pub fn lengths(&self) -> [u64; 4] {
-        self.lengths
-    }
-
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// The address a reference to `node` holds: a function's entry, a static's value.
-    pub fn address_of(&self, node: &Node) -> Option<u64> {
+    /// The key `node` is held under, if it has a row.
+    pub fn key_of(&self, node: &Node) -> Option<Digest> {
         match node {
-            Node::Function(symbol) => {
-                Some(self.machine.base(Section::Text) + self.fns.get(symbol)?.code.offset)
-            }
-            Node::Static(symbol) => {
-                Some(self.machine.base(Section::Data) + self.statics.get(symbol)?.place.offset)
-            }
+            Node::Function(symbol) => self.fns.get(symbol).map(|row| row.key.0),
+            Node::Static(symbol) => self.statics.get(symbol).map(|row| row.key.0),
         }
     }
 
-    /// Whether the dead bytes of some section exceed its live bytes (and a page): the file is
-    /// then laid out whole again.
-    pub fn compaction_due(&self) -> bool {
-        Section::ALL.iter().any(|section| {
-            let dead = self.dead[section.index()];
-            let live = self.lengths[section.index()] - dead;
-            dead > live && dead > self.machine.page
-        })
-    }
-
     /// The workspace instances to tier up when the pool is idle: every one at the fast tier
-    /// that was placed in an earlier build and is unchanged since.
+    /// that came in an earlier build and is unchanged since.
     pub fn tier_ups(&self) -> Vec<Symbol, Global> {
         let mut out = Vec::new_in(Global);
         for (symbol, row) in &self.fns {
@@ -434,14 +304,14 @@ impl Program {
     }
 
     /// The stale nodes of a delta, each seeded by the crate's row rule ([`Seed::Walk`] or
-    /// [`Seed::IfReached`]): every placed instance of an edited item ([`Stale::Edited`]); every
-    /// function that calls one or a gone one, and every instance that took any of those in at
+    /// [`Seed::IfReached`]): every held instance of an edited item ([`Stale::Edited`]); every
+    /// function that calls one or a gone one (unless [`Callers::NeverTakeIn`]), and every instance that took any of those in at
     /// any depth ([`Stale::Revisit`]: its inline decisions or inlinees may have changed, its
-    /// tier is kept); every changed static; every root not yet placed; and the tier-ups
+    /// tier is kept); every changed static; every root not yet held; and the tier-ups
     /// ([`Stale::TierUp`]). On an empty program with [`Program::top_tier`] of another as
     /// `delta.tier_up`, a whole build that holds the same rows at the same tiers.
     pub fn seeds(&self, delta: &Delta) -> Vec<(Node, Seed), Global> {
-        // The placed instances of edited items, and of gone ones (whose callers must look).
+        // The held instances of edited items, and of gone ones (whose callers must look).
         let mut edited = BTreeSet::new_in(Global);
         let mut touched = BTreeSet::new_in(Global);
         for (items, live) in [(&delta.edited, true), (&delta.gone, false)] {
@@ -454,11 +324,13 @@ impl Program {
                 }
             }
         }
-        // Their callers: an inline decision of theirs may change.
+        // Their callers: an inline decision of theirs may change (never, when no code takes a
+        // callee in).
         let mut revisit = BTreeSet::new_in(Global);
-        for symbol in &touched {
+        let callers_move = delta.callers == Callers::MayTakeIn;
+        for symbol in touched.iter().filter(|_| callers_move) {
             let target = Node::Function(*symbol);
-            for ((at, referrer, _), _) in self.sites.range((target, LEAST_NODE, 0u32)..) {
+            for (at, referrer) in self.referrers.range((target, LEAST_NODE)..) {
                 if *at != target {
                     break;
                 }
@@ -468,7 +340,7 @@ impl Program {
             }
         }
         // Every instance that took any of them in, at any depth (the table is transitive). An
-        // edited or gone item's instances are looked up by item, not through its placed rows:
+        // edited or gone item's instances are looked up by item, not through its held rows:
         // an instance that is only ever inlined has no row, yet every caller that took it in
         // holds a stale copy of it.
         for items in [&delta.edited, &delta.gone] {
@@ -495,7 +367,7 @@ impl Program {
         }
         // The stale nodes, each with how it is walked. An edit wins over a revisit, and both
         // over a tier-up (a changed body starts again at the fast tier; a revisit keeps its
-        // tier); a root not placed yet is stale as an edit, or as a tier-up when it is one.
+        // tier); a root not held yet is stale as an edit, or as a tier-up when it is one.
         let mut stale = BTreeMap::new_in(Global);
         for symbol in revisit {
             if !touched.contains(&symbol) || edited.contains(&symbol) {
@@ -540,11 +412,11 @@ impl Program {
 
     /// Whether an unstale root reaches `node` through unstale rows only (none of them in
     /// `stale`): nothing on such a path is walked again, so its edges are the new program's
-    /// and `node` has a row whatever the walk does. Searched upward from `node` over the sites
-    /// table, so it reads the edit's ancestors, not the program. When none does, every unstale
-    /// ancestor it saw is added to `gates`: the walk reaches `node` through them, if at all.
-    /// `live` keeps, across the calls of one [`Program::seeds`], unstale nodes known to reach
-    /// such a root (every node on a path found).
+    /// and `node` has a row whatever the walk does. Searched upward from `node` over the
+    /// referrers table, so it reads the edit's ancestors, not the program. When none does,
+    /// every unstale ancestor it saw is added to `gates`: the walk reaches `node` through them,
+    /// if at all. `live` keeps, across the calls of one [`Program::seeds`], unstale nodes known
+    /// to reach such a root (every node on a path found).
     fn kept_reaches(
         &self,
         node: &Node,
@@ -558,7 +430,7 @@ impl Program {
         let mut queue = VecDeque::new_in(Global);
         queue.push_back(*node);
         while let Some(at) = queue.pop_front() {
-            for ((target, referrer, _), _) in self.sites.range((at, LEAST_NODE, 0u32)..) {
+            for (target, referrer) in self.referrers.range((at, LEAST_NODE)..) {
                 if *target != at {
                     break;
                 }
@@ -597,356 +469,105 @@ impl Program {
         out
     }
 
-    /// Places what a walk gave ([`crate::walk::Ended`]: what it walked, and the stale nodes it
-    /// never reached, which have no row now and are retired with every node only they
-    /// reached), and the span moves of `moved`, giving the change to apply.
-    /// Refused before anything changes when a record, a value or a span is missing, a field
-    /// points at a node the program would not hold, or a reserve would be outgrown. A field
-    /// whose distance does not fit ([`ProgramError::Reloc`], only past a reserve of 64 MiB on
-    /// arm64 or 1 GiB on x86_64) is found while writing: the program is then to be laid out
-    /// whole again.
-    pub fn place(
-        &mut self,
-        walked: &[Walked],
-        unreached: &[Node],
-        moved: &[ItemId],
-        front: &impl Front,
-        records: &impl Records,
-    ) -> Result<PlacementChange, ProgramError> {
+    /// Takes in what a walk gave ([`crate::walk::Ended`]: what it walked, and the stale nodes
+    /// it never reached, which have no row now and leave with every node only they reached),
+    /// and the items of `moved`, giving the rows that came, went or moved. Refused before
+    /// anything changes when the walk gave a node twice or a row refers to a node the program
+    /// would not hold.
+    pub fn place(&mut self, walked: &[Walked], unreached: &[Node], moved: &[ItemId]) -> Result<RowChange, ProgramError> {
         let whole = self.fns.is_empty() && self.statics.is_empty();
-        let before = self.lengths;
-        let mut change = PlacementChange { whole, ..PlacementChange::default() };
+        let mut change = RowChange { whole, ..RowChange::default() };
 
-        // The nodes that changed, in symbol order, each once.
+        // The nodes whose row is new or under another key, in node order, each once.
         let mut order = Vec::with_capacity_in(walked.len(), Global);
-        for entry in walked {
-            order.push(entry);
-        }
+        order.extend(walked.iter());
         order.sort_unstable_by(|a, b| a.node.cmp(&b.node));
-        let mut loaded = Vec::new_in(Global);
+        let mut changing = Vec::with_capacity_in(order.len(), Global);
         for (index, entry) in order.iter().enumerate() {
             if index > 0 && order[index - 1].node == entry.node {
                 return Err(ProgramError::Twice { node: entry.node });
             }
-            match entry.node {
-                Node::Function(symbol) => {
-                    if self.fns.get(&symbol).is_some_and(|row| row.key.0 == entry.key) {
-                        continue;
-                    }
-                    let key = InstanceKey(entry.key);
-                    let Some(code) = records.code(&key) else {
-                        return Err(ProgramError::NoRecord { symbol, key });
-                    };
-                    loaded.push(Loaded::Function { walked: entry, symbol, code });
-                }
-                Node::Static(symbol) => {
-                    if self.statics.get(&symbol).is_some_and(|row| row.key.0 == entry.key) {
-                        continue;
-                    }
-                    let Some(value) = front.static_value(&symbol) else {
-                        return Err(ProgramError::NoStatic { symbol });
-                    };
-                    if value.key().0 != entry.key {
-                        return Err(ProgramError::StaleStatic { symbol });
-                    }
-                    loaded.push(Loaded::Static { walked: entry, symbol, value });
-                }
+            if self.key_of(&entry.node) != Some(entry.key) {
+                changing.push(*entry);
             }
         }
-        // Every field's target is held or placed now: refused before anything changes.
+        // Every edge's target is held or comes now: refused before anything changes.
         let mut placing = BTreeSet::new_in(Global);
-        for node in &loaded {
-            placing.insert(match node {
-                Loaded::Function { symbol, .. } => Node::Function(*symbol),
-                Loaded::Static { symbol, .. } => Node::Static(*symbol),
-            });
-        }
-        for node in &loaded {
-            let (referrer, relocs) = match node {
-                Loaded::Function { symbol, code, .. } => (Node::Function(*symbol), code.relocs()),
-                Loaded::Static { symbol, value, .. } => (Node::Static(*symbol), value.relocs()),
-            };
-            for reloc in relocs {
-                if let Some(target) = node_of(&reloc.target) {
-                    if !placing.contains(&target) && !self.holds(&target) {
-                        return Err(ProgramError::Unplaced { referrer, target });
-                    }
+        placing.extend(changing.iter().map(|entry| entry.node));
+        for entry in &changing {
+            for target in targets_of(&entry.calls, &entry.statics) {
+                if !placing.contains(&target) && !self.holds(&target) {
+                    return Err(ProgramError::Unplaced { referrer: entry.node, target });
                 }
             }
         }
-        let mut moved_items = Vec::with_capacity_in(moved.len(), Global);
-        moved_items.extend_from_slice(moved);
-        moved_items.sort_unstable();
-        moved_items.dedup();
-
-        // The spans every changed location and every moved item needs, read first: a missing
-        // one refuses the placement before anything changes.
-        let mut spans = BTreeMap::new_in(Global);
-        for node in &loaded {
-            if let Loaded::Function { code, .. } = node {
-                for row in code.locations() {
-                    if !spans.contains_key(&row.item) {
-                        let Some(span) = front.span(&row.item) else {
-                            return Err(ProgramError::NoSpan { item: row.item });
-                        };
-                        spans.insert(row.item, span);
-                    }
-                }
-            }
-        }
-        for item in &moved_items {
-            if !self.spans.contains_key(item) || spans.contains_key(item) {
-                continue;
-            }
-            let Some(span) = front.span(item) else {
-                return Err(ProgramError::NoSpan { item: *item });
-            };
-            spans.insert(*item, span);
-        }
-        self.check_room(&loaded, &spans)?;
         self.generation += 1;
 
-        // Pass one: every changed node's place and import slots.
-        let mut changed = BTreeSet::new_in(Global);
         // A held node the walk never reached has left the set of rows: the mark runs.
         let mut lost_edge = unreached.iter().any(|node| self.holds(node));
-        let mut moved_targets = Vec::new_in(Global);
-        for node in &loaded {
+        let mut came = BTreeSet::new_in(Global);
+        for entry in &changing {
+            let node = entry.node;
+            if let Some(previous) = self.forget(&node) {
+                lost_edge |= !previous.calls.iter().all(|c| entry.calls.contains(c))
+                    || !previous.statics.iter().all(|s| entry.statics.contains(s));
+                // Planted: a row whose key moved is not said to have gone under its old key.
+                if self.plant != Plant::RekeyedNotGone {
+                    change.went.push(Row { node, key: previous.key });
+                }
+            }
             match node {
-                Loaded::Function { walked, symbol, code } => {
-                    changed.insert(Node::Function(*symbol));
-                    let size = code.placed_len();
-                    let locs_size = 24 * code.locations().len() as u64;
-                    let old = self.fns.get(symbol).map(|row| (row.code, row.locs));
-                    if let Some(row) = self.fns.get(symbol) {
-                        lost_edge |= !row.calls.iter().all(|c| walked.calls.contains(c))
-                            || !row.statics.iter().all(|s| walked.statics.contains(s));
-                    }
-                    let (code_place, locs_place, moved) = match old {
-                        Some((code_place, locs_place)) => {
-                            let (code_place, moved) = if size <= code_place.capacity {
-                                (Place { size, ..code_place }, false)
-                            } else {
-                                self.dead[Section::Text.index()] += code_place.capacity;
-                                (self.append(Section::Text, size, capacity(size))?, true)
-                            };
-                            let locs_place = if locs_size <= locs_place.capacity {
-                                Place { size: locs_size, ..locs_place }
-                            } else {
-                                self.dead[Section::Locations.index()] += locs_place.capacity;
-                                self.append(Section::Locations, locs_size, capacity(locs_size))?
-                            };
-                            (code_place, locs_place, moved)
-                        }
-                        None => (
-                            self.append(Section::Text, size, capacity(size))?,
-                            self.append(Section::Locations, locs_size, capacity(locs_size))?,
-                            false,
-                        ),
-                    };
-                    if moved {
-                        moved_targets.push(Node::Function(*symbol));
-                    }
-                    for name in code.externs() {
-                        if !self.externs.contains_key(name) {
-                            let slot = self.externs.len() as u32;
-                            self.externs.insert(name.clone(), slot);
-                            self.lengths[Section::Imports.index()] = 8 * u64::from(slot + 1);
-                            change.imports.push(Import { slot, name: name.clone() });
-                        }
-                    }
-                    let mut loc_items = Vec::with_capacity_in(code.locations().len(), Global);
-                    for row in code.locations() {
-                        loc_items.push(row.item);
-                    }
-                    let previous = self.fns.insert(
-                        *symbol,
-                        FnRow {
-                            key: InstanceKey(walked.key),
-                            tier: walked.tier,
-                            code: code_place,
-                            locs: locs_place,
-                            since: self.generation,
-                            calls: walked.calls.clone(),
-                            statics: walked.statics.clone(),
-                            out: Vec::new_in(Global),
-                            plan: walked.plan,
-                            inlined: walked.inlined.clone(),
-                            loc_items,
-                        },
-                    );
-                    if let Some(previous) = previous {
-                        self.forget_function(symbol, &previous);
-                    }
-                }
-                Loaded::Static { walked, symbol, value } => {
-                    changed.insert(Node::Static(*symbol));
-                    let size = value.bytes().len() as u64;
-                    let old = self.statics.get(symbol).map(|row| row.place);
-                    if let Some(row) = self.statics.get(symbol) {
-                        lost_edge |= !row.calls.iter().all(|c| walked.calls.contains(c))
-                            || !row.statics.iter().all(|s| walked.statics.contains(s));
-                    }
-                    let (place, moved) = match old {
-                        Some(place) if size <= place.capacity => (Place { size, ..place }, false),
-                        Some(place) => {
-                            self.dead[Section::Data.index()] += place.capacity;
-                            (self.append(Section::Data, size, capacity(size))?, true)
-                        }
-                        None => (self.append(Section::Data, size, capacity(size))?, false),
-                    };
-                    if moved {
-                        moved_targets.push(Node::Static(*symbol));
-                    }
-                    let previous = self.statics.insert(
-                        *symbol,
-                        StaticRow {
-                            key: ValueKey(walked.key),
-                            place,
-                            calls: walked.calls.clone(),
-                            statics: walked.statics.clone(),
-                            out: Vec::new_in(Global),
-                        },
-                    );
-                    if let Some(previous) = previous {
-                        for (target, reloc) in &previous.out {
-                            self.sites.remove(&(*target, Node::Static(*symbol), *reloc));
-                        }
-                    }
-                }
+                Node::Function(symbol) => self.admit_function(
+                    symbol,
+                    FnRow {
+                        key: InstanceKey(entry.key),
+                        tier: entry.tier,
+                        since: self.generation,
+                        calls: entry.calls.clone(),
+                        statics: entry.statics.clone(),
+                        plan: entry.plan,
+                        inlined: entry.inlined.clone(),
+                    },
+                ),
+                Node::Static(symbol) => self.admit_static(
+                    symbol,
+                    StaticRow { key: ValueKey(entry.key), calls: entry.calls.clone(), statics: entry.statics.clone() },
+                ),
             }
-        }
-        // The file names of new spans, written once each.
-        for span in spans.values() {
-            if !self.files.contains_key(&span.file) {
-                let len = span.file.len() as u64;
-                let place = self.append(Section::Data, len, align16(len).max(16))?;
-                self.files.insert(span.file.clone(), place);
-                change.writes.push(Write { section: Section::Data, offset: place.offset, bytes: span.file.clone() });
-            }
-        }
-        // Spans: the changed locations' and the moved items'. A moved item's unchanged
-        // locations are rewritten in place: 4 bytes each (24 when it changed files).
-        for (item, span) in &spans {
-            let row = SpanRow { file: span.file.clone(), line: span.line };
-            let old = self.spans.insert(*item, row.clone());
-            // Any span that moved (listed or not) rewrites the unchanged locations in it.
-            if old.as_ref().is_none_or(|old| *old == row) {
-                continue;
-            }
-            let same_file = old.as_ref().is_some_and(|old| old.file == row.file);
-            let mut rewrites = Vec::new_in(Global);
-            for ((at, function, index), place) in self.loc_items.range((*item, Symbol::default(), 0u32)..) {
-                if at != item {
-                    break;
-                }
-                if !changed.contains(&Node::Function(*function)) {
-                    rewrites.push((*function, *index, *place));
-                }
-            }
-            for (function, index, (line, col)) in rewrites {
-                let Some(fn_row) = self.fns.get(&function) else { continue };
-                let offset = fn_row.locs.offset + 24 * u64::from(index);
-                if same_file {
-                    change.lines.push(LineWrite { offset, line: row.line + line });
-                } else {
-                    let bytes = self.location_record(&row, line, col);
-                    change.writes.push(Write { section: Section::Locations, offset, bytes });
-                }
-            }
-        }
-
-        // Pass two: every changed node's bytes, its fields resolved.
-        for node in &loaded {
-            match node {
-                Loaded::Function { symbol, code, .. } => self.write_function(*symbol, code, &mut change)?,
-                Loaded::Static { symbol, value, .. } => self.write_static(*symbol, value, &mut change)?,
-            }
-        }
-        // Repatch every unchanged referrer of a node that moved.
-        for target in &moved_targets {
-            if self.plant == Plant::SiteNotRepatched {
-                // Planted: a moved node's referrers keep pointing at its old place.
-                break;
-            }
-            let Some(address) = self.address_of(target) else { continue };
-            let mut patches = Vec::new_in(Global);
-            for ((at, referrer, reloc), site) in self.sites.range((*target, LEAST_NODE, 0u32)..) {
-                if at != target {
-                    break;
-                }
-                if !changed.contains(referrer) {
-                    patches.push((*referrer, *reloc, *site));
-                }
-            }
-            for (referrer, reloc, site) in patches {
-                let mut field = [0u8; 8];
-                field[..4].copy_from_slice(&site.template);
-                let width = site.kind.width();
-                let place = self.machine.base(site.section) + site.offset;
-                site.kind
-                    .write(&mut field[..width], 0, place, address, site.addend)
-                    .map_err(|error| ProgramError::Reloc { node: referrer, reloc, error })?;
-                let mut bytes = Vec::with_capacity_in(width, Global);
-                bytes.extend_from_slice(&field[..width]);
-                change.writes.push(Write { section: site.section, offset: site.offset, bytes });
-            }
+            came.insert(Row { node, key: entry.key });
         }
         if lost_edge {
-            change.retired = self.retire();
-        }
-        change.writes.sort_by(|a, b| (a.section, a.offset).cmp(&(b.section, b.offset)));
-        change.lines.sort_unstable();
-        change.imports.sort();
-        change.lengths = self.lengths;
-        change.pages = self.pages(&change, &before);
-        Ok(change)
-    }
-
-    /// The whole program laid out again for `machine`, from its own rows, with `front` at the
-    /// revision the program was placed at (its statics' values are read again): what follows
-    /// [`Program::compaction_due`]. After an [`ProgramError::Outgrown`] the delta is not placed
-    /// yet, so the caller walks the new revision whole into a program at [`Machine::doubled`]
-    /// (every record hits; no make).
-    pub fn relayout(
-        &self,
-        machine: Machine,
-        front: &impl Front,
-        records: &impl Records,
-    ) -> Result<(Program, PlacementChange), ProgramError> {
-        let mut walked = Vec::new_in(Global);
-        for (symbol, row) in &self.fns {
-            walked.push(Walked {
-                node: Node::Function(*symbol),
-                key: row.key.0,
-                tier: row.tier,
-                plan: row.plan,
-                calls: row.calls.clone(),
-                statics: row.statics.clone(),
-                inlined: row.inlined.clone(),
-            });
-        }
-        for (symbol, row) in &self.statics {
-            walked.push(Walked {
-                node: Node::Static(*symbol),
-                key: row.key.0,
-                tier: Tier::Release,
-                plan: PlanKey::default(),
-                calls: row.calls.clone(),
-                statics: row.statics.clone(),
-                inlined: Vec::new_in(Global),
-            });
-        }
-        let mut program = Program::new(machine, self.settings, &self.roots, self.plant);
-        let change = program.place(&walked, &[], &[], front, records)?;
-        // Keep each row's build, so tier-up choices survive a relayout.
-        for (symbol, row) in &self.fns {
-            if let Some(new) = program.fns.get_mut(symbol) {
-                new.since = row.since;
+            for row in self.retire() {
+                // A row that came and leaves in one placement is in neither list.
+                if !came.remove(&row) {
+                    change.went.push(row);
+                }
             }
         }
-        program.generation = self.generation;
-        Ok((program, change))
+        change.came.extend(came.iter().copied());
+
+        // The rows made from a moved item whose key did not move: its own instances and every
+        // instance that took one of them in.
+        let mut moved_rows = BTreeSet::new_in(Global);
+        for item in moved {
+            for (symbol, row) in self.fns.range(Symbol::first_of(*item)..=Symbol::last_of(*item)) {
+                if !came.contains(&Row { node: Node::Function(*symbol), key: row.key.0 }) {
+                    moved_rows.insert((*item, *symbol));
+                }
+            }
+            for (inlinee, inliner) in self.inliners.range((Symbol::first_of(*item), Symbol::default())..) {
+                if inlinee.item != *item {
+                    break;
+                }
+                let held = self.fns.get(inliner).map(|row| row.key.0);
+                if held.is_some_and(|key| !came.contains(&Row { node: Node::Function(*inliner), key })) {
+                    moved_rows.insert((*item, *inliner));
+                }
+            }
+        }
+        change.moved.extend(moved_rows);
+        change.went.sort_unstable();
+        Ok(change)
     }
 
     /// The manifest in content-defined chunks.
@@ -988,192 +609,50 @@ impl Program {
         }
     }
 
-    fn append(&mut self, section: Section, size: u64, capacity: u64) -> Result<Place, ProgramError> {
-        let offset = align16(self.lengths[section.index()]);
-        let need = offset + capacity;
-        if need > self.machine.reserve {
-            return Err(ProgramError::Outgrown { section, need, reserve: self.machine.reserve });
-        }
-        self.lengths[section.index()] = need;
-        Ok(Place { offset, size, capacity })
-    }
-
-    /// Refuses a placement that could outgrow a reserve, before anything changes: each bound
-    /// is at least what pass one appends.
-    fn check_room(&self, loaded: &[Loaded<'_>], spans: &BTreeMap<ItemId, Span, Global>) -> Result<(), ProgramError> {
-        let mut need = [0u64; 4];
-        let mut externs = 0u64;
-        for node in loaded {
-            match node {
-                Loaded::Function { code, .. } => {
-                    need[Section::Text.index()] += capacity(code.placed_len()) + 16;
-                    need[Section::Locations.index()] += capacity(24 * code.locations().len() as u64) + 16;
-                    externs += code.externs().len() as u64;
-                }
-                Loaded::Static { value, .. } => {
-                    need[Section::Data.index()] += capacity(value.bytes().len() as u64) + 16;
-                }
-            }
-        }
-        for span in spans.values() {
-            need[Section::Data.index()] += align16(span.file.len() as u64).max(16) + 16;
-        }
-        need[Section::Imports.index()] += externs * 8;
-        for section in Section::ALL {
-            let total = self.lengths[section.index()] + need[section.index()];
-            if total > self.machine.reserve {
-                return Err(ProgramError::Outgrown { section, need: total, reserve: self.machine.reserve });
-            }
-        }
-        Ok(())
-    }
-
-    /// Drops what the manifest kept of a function's previous code: its fields, its locations'
-    /// items, what it took in.
-    fn forget_function(&mut self, symbol: &Symbol, previous: &FnRow) {
-        for (target, reloc) in &previous.out {
-            self.sites.remove(&(*target, Node::Function(*symbol), *reloc));
-        }
-        for (index, item) in previous.loc_items.iter().enumerate() {
-            self.loc_items.remove(&(*item, *symbol, index as u32));
-        }
-        for (inlinee, _) in &previous.inlined {
-            self.inliners.remove(&(*inlinee, *symbol));
-        }
-    }
-
-    /// A location record: the file name's address and length, the line, the column.
-    fn location_record(&self, span: &SpanRow, line: u32, col: u32) -> Vec<u8, Global> {
-        let place = self.files.get(&span.file).copied().unwrap_or_default();
-        let mut bytes = Vec::with_capacity_in(24, Global);
-        bytes.extend_from_slice(&(self.machine.base(Section::Data) + place.offset).to_le_bytes());
-        bytes.extend_from_slice(&(span.file.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&(span.line + line).to_le_bytes());
-        bytes.extend_from_slice(&col.to_le_bytes());
-        bytes
-    }
-
-    fn write_function(&mut self, symbol: Symbol, code: &InstanceCode, change: &mut PlacementChange) -> Result<(), ProgramError> {
+    /// Puts a function's row in, with its derived edges.
+    fn admit_function(&mut self, symbol: Symbol, row: FnRow) {
         let node = Node::Function(symbol);
-        let Some(row) = self.fns.get(&symbol) else {
-            return Err(ProgramError::Unplaced { referrer: node, target: node });
-        };
-        let (code_place, locs_place) = (row.code, row.locs);
-        let mut inlined = Vec::with_capacity_in(row.inlined.len(), Global);
-        inlined.extend(row.inlined.iter().map(|(inlinee, _)| *inlinee));
-        let base = self.machine.base(Section::Text) + code_place.offset;
-        let mut bytes = Vec::with_capacity_in(code.placed_len() as usize, Global);
-        bytes.extend_from_slice(code.code());
-        bytes.extend_from_slice(code.unwind());
-        let mut out = Vec::new_in(Global);
-        for (index, reloc) in code.relocs().iter().enumerate() {
-            let reloc_index = index as u32;
-            let at = reloc.at as usize;
-            let target = match reloc.target {
-                Target::Function(_) | Target::Static(_) => {
-                    let Some(target) = node_of(&reloc.target) else { continue };
-                    let Some(address) = self.address_of(&target) else {
-                        return Err(ProgramError::Unplaced { referrer: node, target });
-                    };
-                    address
-                }
-                Target::Location(at) => {
-                    self.machine.base(Section::Locations) + locs_place.offset + 24 * u64::from(at)
-                }
-                Target::Extern(at) => {
-                    let slot = code.externs().get(at as usize).and_then(|name| self.externs.get(name));
-                    let Some(slot) = slot else {
-                        return Err(ProgramError::Reloc { node, reloc: reloc_index, error: RelocError::OutOfBounds });
-                    };
-                    self.machine.base(Section::Imports) + 8 * u64::from(*slot)
-                }
-            };
-            let mut template = [0u8; 4];
-            template.copy_from_slice(&code.code()[at..at + 4]);
-            reloc
-                .kind
-                .write(&mut bytes, at, base + u64::from(reloc.at), target, reloc.addend)
-                .map_err(|error| ProgramError::Reloc { node, reloc: reloc_index, error })?;
-            if let Some(target) = node_of(&reloc.target) {
-                out.push((target, reloc_index));
-                self.sites.insert(
-                    (target, node, reloc_index),
-                    Site {
-                        section: Section::Text,
-                        offset: code_place.offset + u64::from(reloc.at),
-                        kind: reloc.kind,
-                        addend: reloc.addend,
-                        template,
-                    },
-                );
-            }
+        for target in targets_of(&row.calls, &row.statics) {
+            self.referrers.insert((target, node));
         }
-        change.writes.push(Write { section: Section::Text, offset: code_place.offset, bytes });
-        // Its location records, each line from the span table.
-        let mut records = Vec::with_capacity_in(24 * code.locations().len(), Global);
-        for (index, loc) in code.locations().iter().enumerate() {
-            let Some(span) = self.spans.get(&loc.item) else {
-                return Err(ProgramError::NoSpan { item: loc.item });
-            };
-            let record = self.location_record(span, loc.line, loc.col);
-            records.extend_from_slice(&record);
-            self.loc_items.insert((loc.item, symbol, index as u32), (loc.line, loc.col));
-        }
-        if !records.is_empty() {
-            change.writes.push(Write { section: Section::Locations, offset: locs_place.offset, bytes: records });
-        }
-        for inlinee in &inlined {
+        for (inlinee, _) in &row.inlined {
             self.inliners.insert((*inlinee, symbol));
         }
-        if let Some(row) = self.fns.get_mut(&symbol) {
-            row.out = out;
-        }
-        Ok(())
+        self.fns.insert(symbol, row);
     }
 
-    fn write_static(&mut self, symbol: Symbol, value: &StaticValue, change: &mut PlacementChange) -> Result<(), ProgramError> {
+    /// Puts a static's row in, with its derived edges.
+    fn admit_static(&mut self, symbol: Symbol, row: StaticRow) {
         let node = Node::Static(symbol);
-        let Some(row) = self.statics.get(&symbol) else {
-            return Err(ProgramError::Unplaced { referrer: node, target: node });
-        };
-        let place = row.place;
-        let base = self.machine.base(Section::Data) + place.offset;
-        let mut bytes = Vec::with_capacity_in(value.bytes().len(), Global);
-        bytes.extend_from_slice(value.bytes());
-        let mut out = Vec::new_in(Global);
-        for (index, reloc) in value.relocs().iter().enumerate() {
-            let Some(target) = node_of(&reloc.target) else { continue };
-            let Some(address) = self.address_of(&target) else {
-                return Err(ProgramError::Unplaced { referrer: node, target });
-            };
-            let at = reloc.at as usize;
-            let mut template = [0u8; 4];
-            template.copy_from_slice(&value.bytes()[at..at + 4]);
-            reloc
-                .kind
-                .write(&mut bytes, at, base + u64::from(reloc.at), address, reloc.addend)
-                .map_err(|error| ProgramError::Reloc { node, reloc: index as u32, error })?;
-            out.push((target, index as u32));
-            self.sites.insert(
-                (target, node, index as u32),
-                Site {
-                    section: Section::Data,
-                    offset: place.offset + u64::from(reloc.at),
-                    kind: reloc.kind,
-                    addend: reloc.addend,
-                    template,
-                },
-            );
+        for target in targets_of(&row.calls, &row.statics) {
+            self.referrers.insert((target, node));
         }
-        change.writes.push(Write { section: Section::Data, offset: place.offset, bytes });
-        if let Some(row) = self.statics.get_mut(&symbol) {
-            row.out = out;
-        }
-        Ok(())
+        self.statics.insert(symbol, row);
     }
 
-    /// Drops every node no root reaches, giving them in order.
-    fn retire(&mut self) -> Vec<Node, Global> {
+    /// Takes `node`'s row out, with its derived edges, giving its key and what it referred to.
+    fn forget(&mut self, node: &Node) -> Option<Forgotten> {
+        let (key, calls, statics) = match node {
+            Node::Function(symbol) => {
+                let row = self.fns.remove(symbol)?;
+                for (inlinee, _) in &row.inlined {
+                    self.inliners.remove(&(*inlinee, *symbol));
+                }
+                (row.key.0, row.calls, row.statics)
+            }
+            Node::Static(symbol) => {
+                let row = self.statics.remove(symbol)?;
+                (row.key.0, row.calls, row.statics)
+            }
+        };
+        for target in targets_of(&calls, &statics) {
+            self.referrers.remove(&(target, *node));
+        }
+        Some(Forgotten { key, calls, statics })
+    }
+
+    /// Drops every node no root reaches, giving their rows in node order.
+    fn retire(&mut self) -> Vec<Row, Global> {
         let mut marked = BTreeSet::new_in(Global);
         let mut stack = Vec::new_in(Global);
         for root in &self.roots {
@@ -1192,215 +671,68 @@ impl Program {
                     None => continue,
                 },
             };
-            for callee in calls {
-                if marked.insert(Node::Function(*callee)) {
-                    stack.push(Node::Function(*callee));
-                }
-            }
-            for target in statics {
-                if marked.insert(Node::Static(*target)) {
-                    stack.push(Node::Static(*target));
+            for target in targets_of(calls, statics) {
+                if marked.insert(target) {
+                    stack.push(target);
                 }
             }
         }
-        let mut retired = Vec::new_in(Global);
-        for symbol in self.fns.keys() {
-            if !marked.contains(&Node::Function(*symbol)) {
-                retired.push(Node::Function(*symbol));
-            }
-        }
-        for symbol in self.statics.keys() {
-            if !marked.contains(&Node::Static(*symbol)) {
-                retired.push(Node::Static(*symbol));
-            }
-        }
-        for node in &retired {
-            match node {
-                Node::Function(symbol) => {
-                    if let Some(row) = self.fns.remove(symbol) {
-                        self.dead[Section::Text.index()] += row.code.capacity;
-                        self.dead[Section::Locations.index()] += row.locs.capacity;
-                        self.forget_function(symbol, &row);
-                    }
-                }
-                Node::Static(symbol) => {
-                    if let Some(row) = self.statics.remove(symbol) {
-                        self.dead[Section::Data.index()] += row.place.capacity;
-                        for (target, reloc) in &row.out {
-                            self.sites.remove(&(*target, *node, *reloc));
-                        }
-                    }
-                }
+        let mut unmarked = Vec::new_in(Global);
+        unmarked.extend(self.fns.keys().map(|symbol| Node::Function(*symbol)).filter(|node| !marked.contains(node)));
+        unmarked.extend(self.statics.keys().map(|symbol| Node::Static(*symbol)).filter(|node| !marked.contains(node)));
+        let mut retired = Vec::with_capacity_in(unmarked.len(), Global);
+        for node in unmarked {
+            if let Some(forgotten) = self.forget(&node) {
+                retired.push(Row { node, key: forgotten.key });
             }
         }
         retired
     }
 
-    /// Every page a change touches, and every page a section grew into.
-    fn pages(&self, change: &PlacementChange, before: &[u64; 4]) -> Vec<(Section, u64), Global> {
-        let page = self.machine.page.max(1);
-        let mut pages = BTreeSet::new_in(Global);
-        let mut span = |section: Section, offset: u64, len: u64| {
-            if len == 0 {
-                return;
-            }
-            for index in offset / page..=(offset + len - 1) / page {
-                pages.insert((section, index));
-            }
-        };
-        for write in &change.writes {
-            span(write.section, write.offset, write.bytes.len() as u64);
-        }
-        for line in &change.lines {
-            span(Section::Locations, line.offset + 16, 4);
-        }
-        for import in &change.imports {
-            span(Section::Imports, u64::from(import.slot) * 8, 8);
-        }
-        for section in Section::ALL {
-            let (old, new) = (before[section.index()], change.lengths[section.index()]);
-            if new > old {
-                span(section, old, new - old);
-            }
-        }
-        let mut out = Vec::new_in(Global);
-        out.extend(pages);
-        out
-    }
-
     fn encode_header(&self, out: &mut Out) {
-        out.u8(self.machine.arch as u8);
-        out.u64(self.machine.page);
-        out.u64(self.machine.reserve);
         self.settings.encode(out);
         out.count(self.roots.len());
         for root in &self.roots {
             root.encode(out);
         }
-        for length in self.lengths {
-            out.u64(length);
-        }
-        for dead in self.dead {
-            out.u64(dead);
-        }
         out.u64(self.generation);
     }
 
     fn decode_header(input: &mut In<'_>) -> Result<Program, CodecError> {
-        let arch = match input.u8()? {
-            0 => Arch::X86_64,
-            1 => Arch::Arm64,
-            _ => return Err(input.error("an instruction set no machine has")),
-        };
-        let machine = Machine { arch, page: input.u64()?, reserve: input.u64()? };
         let settings = Settings::decode(input)?;
         let count = input.count(33)?;
         let mut roots = Vec::with_capacity_in(count, Global);
         for _ in 0..count {
             roots.push(Node::decode(input)?);
         }
-        let mut program = Program::new(machine, settings, &roots, Plant::None);
-        for length in &mut program.lengths {
-            *length = input.u64()?;
-        }
-        for dead in &mut program.dead {
-            *dead = input.u64()?;
-        }
+        let mut program = Program::new(settings, &roots, Plant::None);
         program.generation = input.u64()?;
         Ok(program)
     }
 
-    /// Each manifest entry's bytes, in table order.
+    /// Each manifest entry's bytes, in table order. The derived tables are not written.
     fn for_each_entry(&self, mut each: impl FnMut(&[u8])) {
-        macro_rules! emit {
-            ($fill:expr) => {{
-                let mut entry = Out::new();
-                ($fill)(&mut entry);
-                each(&entry.finish());
-            }};
-        }
         for (symbol, row) in &self.fns {
-            emit!(|out: &mut Out| {
-                out.u8(0);
-                symbol.encode(out);
-                out.digest(&row.key.0);
-                out.u8(row.tier as u8);
-                encode_place(&row.code, out);
-                encode_place(&row.locs, out);
-                out.u64(row.since);
-                encode_symbols(&row.calls, out);
-                encode_symbols(&row.statics, out);
-                encode_out(&row.out, out);
-                out.digest(&row.plan.0);
-                encode_planned(&row.inlined, out);
-                out.count(row.loc_items.len());
-                for item in &row.loc_items {
-                    out.digest(&item.0);
-                }
-            });
+            let mut out = Out::new();
+            out.u8(0);
+            symbol.encode(&mut out);
+            out.digest(&row.key.0);
+            out.u8(row.tier as u8);
+            out.u64(row.since);
+            encode_symbols(&row.calls, &mut out);
+            encode_symbols(&row.statics, &mut out);
+            out.digest(&row.plan.0);
+            encode_planned(&row.inlined, &mut out);
+            each(&out.finish());
         }
         for (symbol, row) in &self.statics {
-            emit!(|out: &mut Out| {
-                out.u8(1);
-                symbol.encode(out);
-                out.digest(&row.key.0);
-                encode_place(&row.place, out);
-                encode_symbols(&row.calls, out);
-                encode_symbols(&row.statics, out);
-                encode_out(&row.out, out);
-            });
-        }
-        for (name, place) in &self.files {
-            emit!(|out: &mut Out| {
-                out.u8(2);
-                out.bytes(name);
-                encode_place(place, out);
-            });
-        }
-        for (item, span) in &self.spans {
-            emit!(|out: &mut Out| {
-                out.u8(3);
-                out.digest(&item.0);
-                out.bytes(&span.file);
-                out.u32(span.line);
-            });
-        }
-        for ((target, referrer, reloc), site) in &self.sites {
-            emit!(|out: &mut Out| {
-                out.u8(4);
-                target.encode(out);
-                referrer.encode(out);
-                out.u32(*reloc);
-                out.u8(site.section as u8);
-                out.u64(site.offset);
-                out.u8(site.kind.tag());
-                out.i64(site.addend);
-                out.raw(&site.template);
-            });
-        }
-        for ((item, symbol, index), (line, col)) in &self.loc_items {
-            emit!(|out: &mut Out| {
-                out.u8(5);
-                out.digest(&item.0);
-                symbol.encode(out);
-                out.u32(*index);
-                out.u32(*line);
-                out.u32(*col);
-            });
-        }
-        for (inlinee, inliner) in &self.inliners {
-            emit!(|out: &mut Out| {
-                out.u8(6);
-                inlinee.encode(out);
-                inliner.encode(out);
-            });
-        }
-        for (name, slot) in &self.externs {
-            emit!(|out: &mut Out| {
-                out.u8(7);
-                out.bytes(name);
-                out.u32(*slot);
-            });
+            let mut out = Out::new();
+            out.u8(1);
+            symbol.encode(&mut out);
+            out.digest(&row.key.0);
+            encode_symbols(&row.calls, &mut out);
+            encode_symbols(&row.statics, &mut out);
+            each(&out.finish());
         }
     }
 
@@ -1410,78 +742,25 @@ impl Program {
                 let symbol = Symbol::decode(input)?;
                 let key = InstanceKey(input.digest()?);
                 let tier = decode_tier(input)?;
-                let code = decode_place(input)?;
-                let locs = decode_place(input)?;
                 let since = input.u64()?;
                 let calls = decode_symbols(input)?;
                 let statics = decode_symbols(input)?;
-                let out = decode_out(input)?;
                 let plan = PlanKey(input.digest()?);
                 let inlined = decode_planned(input)?;
-                let count = input.count(32)?;
-                let mut loc_items = Vec::with_capacity_in(count, Global);
-                for _ in 0..count {
-                    loc_items.push(ItemId(input.digest()?));
+                if self.fns.contains_key(&symbol) {
+                    return Err(input.error("a function's row given twice"));
                 }
-                self.fns.insert(symbol, FnRow { key, tier, code, locs, since, calls, statics, out, plan, inlined, loc_items });
+                self.admit_function(symbol, FnRow { key, tier, since, calls, statics, plan, inlined });
             }
             1 => {
                 let symbol = Symbol::decode(input)?;
                 let key = ValueKey(input.digest()?);
-                let place = decode_place(input)?;
                 let calls = decode_symbols(input)?;
                 let statics = decode_symbols(input)?;
-                let out = decode_out(input)?;
-                self.statics.insert(symbol, StaticRow { key, place, calls, statics, out });
-            }
-            2 => {
-                let name = input.bytes_owned()?;
-                let place = decode_place(input)?;
-                self.files.insert(name, place);
-            }
-            3 => {
-                let item = ItemId(input.digest()?);
-                let file = input.bytes_owned()?;
-                let line = input.u32()?;
-                self.spans.insert(item, SpanRow { file, line });
-            }
-            4 => {
-                let target = Node::decode(input)?;
-                let referrer = Node::decode(input)?;
-                let reloc = input.u32()?;
-                let section = match input.u8()? {
-                    0 => Section::Text,
-                    1 => Section::Data,
-                    2 => Section::Locations,
-                    3 => Section::Imports,
-                    _ => return Err(input.error("a site in a section no program has")),
-                };
-                let offset = input.u64()?;
-                let Some(kind) = RelocKind::from_tag(input.u8()?) else {
-                    return Err(input.error("a site of a relocation kind no kind has"));
-                };
-                let addend = input.i64()?;
-                let mut template = [0u8; 4];
-                template.copy_from_slice(input.take(4)?);
-                self.sites.insert((target, referrer, reloc), Site { section, offset, kind, addend, template });
-            }
-            5 => {
-                let item = ItemId(input.digest()?);
-                let symbol = Symbol::decode(input)?;
-                let index = input.u32()?;
-                let line = input.u32()?;
-                let col = input.u32()?;
-                self.loc_items.insert((item, symbol, index), (line, col));
-            }
-            6 => {
-                let inlinee = Symbol::decode(input)?;
-                let inliner = Symbol::decode(input)?;
-                self.inliners.insert((inlinee, inliner));
-            }
-            7 => {
-                let name = input.bytes_owned()?;
-                let slot = input.u32()?;
-                self.externs.insert(name, slot);
+                if self.statics.contains_key(&symbol) {
+                    return Err(input.error("a static's row given twice"));
+                }
+                self.admit_static(symbol, StaticRow { key, calls, statics });
             }
             _ => return Err(input.error("a manifest entry of a tag no entry has")),
         }
@@ -1535,8 +814,7 @@ impl Prior for Program {
                 None => return out,
             },
         };
-        out.extend(calls.iter().map(|callee| Node::Function(*callee)));
-        out.extend(statics.iter().map(|target| Node::Static(*target)));
+        out.extend(targets_of(calls, statics));
         out
     }
 }
@@ -1547,16 +825,6 @@ fn decode_tier(input: &mut In<'_>) -> Result<Tier, CodecError> {
         1 => Ok(Tier::Release),
         _ => Err(input.error("a tier no tier has")),
     }
-}
-
-fn encode_place(place: &Place, out: &mut Out) {
-    out.u64(place.offset);
-    out.u64(place.size);
-    out.u64(place.capacity);
-}
-
-fn decode_place(input: &mut In<'_>) -> Result<Place, CodecError> {
-    Ok(Place { offset: input.u64()?, size: input.u64()?, capacity: input.u64()? })
 }
 
 fn encode_symbols(symbols: &[Symbol], out: &mut Out) {
@@ -1589,24 +857,6 @@ fn decode_planned(input: &mut In<'_>) -> Result<Vec<(Symbol, PlanKey), Global>, 
     for _ in 0..count {
         let symbol = Symbol::decode(input)?;
         out.push((symbol, PlanKey(input.digest()?)));
-    }
-    Ok(out)
-}
-
-fn encode_out(fields: &[(Node, u32)], out: &mut Out) {
-    out.count(fields.len());
-    for (node, reloc) in fields {
-        node.encode(out);
-        out.u32(*reloc);
-    }
-}
-
-fn decode_out(input: &mut In<'_>) -> Result<Vec<(Node, u32), Global>, CodecError> {
-    let count = input.count(69)?;
-    let mut out = Vec::with_capacity_in(count, Global);
-    for _ in 0..count {
-        let node = Node::decode(input)?;
-        out.push((node, input.u32()?));
     }
     Ok(out)
 }

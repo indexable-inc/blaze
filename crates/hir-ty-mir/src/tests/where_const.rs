@@ -37,7 +37,7 @@ fn diagnostics<'db>(db: &'db base_db::Db, name: &str) -> &'db [InferenceDiagnost
 
 fn with_db(fixture: &str, check: impl FnOnce(&base_db::Db)) {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || check(&db));
+    blaze_memo::attach(&db, || check(&db));
 }
 
 /// The body of `name` type-checks with no error.

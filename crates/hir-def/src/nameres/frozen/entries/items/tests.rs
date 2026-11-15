@@ -15,7 +15,7 @@ use crate::{
         crate_def_map,
         frozen::{
             Unreadable,
-            entries::{Counts, Memory, differ, set},
+            entries::{Counts, Memory, differ, set_for_test as set},
             tests::crate_named,
         },
     },

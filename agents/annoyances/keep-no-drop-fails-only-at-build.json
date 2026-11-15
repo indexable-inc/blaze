@@ -1,0 +1,14 @@
+{
+ "id": "keep-no-drop-fails-only-at-build",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane \"kept values\" of the front-end-on-memo port, port-memo-1113",
+ "where": "crates/blaze-memo/src/keep.rs (`keep`, `keep_iter`); crates/hir-def/src/signatures.rs; crates/blaze-memo/tests/owns.rs",
+ "what": "The port's `cargo check` rounds were clean while 11 hir-def types kept with `blaze_memo::keep` owned memory: the no-drop rule of a generic `keep<T>` is a `const` block, evaluated only at monomorphization, so the first `cargo test --no-run` stopped at hir-def and every crate above it went unreached. Auditing every keep site by reading types took the lane; and the `owns` ratchet scanned only `src/`, so hir-ty-codegen's 17 `owns` (its library is `mod.rs` at the crate's top) were never counted.",
+ "cost": "a whole build round lost to errors check could not show; a read-only audit of 59 generic keep sites and their wrappers",
+ "cause": "a property of the type argument of a generic function (needs_drop) can be asserted in Rust only at monomorphization, which `cargo check` skips; the ratchet assumed every crate's library is under src/",
+ "class": "a rule enforced by post-monomorphization evaluation, invisible to the check loop the lanes iterate on",
+ "prevention": "a trait bound the checker sees (blaze's reflection: `T: NoDrop` derived from the type's fields, or an auto-trait-like bound from compile-time reflection) on `keep`/`keep_iter`, so the rule fails at check like the macros' item-level asserts; the ratchet reads the library path from the manifest (done)",
+ "workaround": "`keep_owned` for real trees, counted; every keep site audited by hand; a port round is `cargo test --no-run`, not `cargo check`",
+ "fix": "partly: `keep_owned` and the manifest-aware ratchet; the check-time bound is not built",
+ "state": "open"
+}

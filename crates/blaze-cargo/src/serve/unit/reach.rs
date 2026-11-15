@@ -125,7 +125,7 @@ pub(crate) fn reach(
         if !package.is_member || unit.is_std {
             continue;
         }
-        let Some(new_krate) = to.crates.krate(at) else { continue };
+        let Some(new_krate) = to.crates.krate(after, at) else { continue };
         // A member crate's unit, by what it is in every view: its package, target and mode.
         let old_krate = from
             .graph
@@ -136,7 +136,7 @@ pub(crate) fn reach(
                 &unit.target.kind,
                 unit.mode,
             )
-            .and_then(|it| from.crates.krate(it as usize));
+            .and_then(|it| from.crates.krate(before, it as usize));
         if to.cancelled() {
             return Err(Failed::Again);
         }
@@ -144,16 +144,16 @@ pub(crate) fn reach(
         // (`Missed::MacroPending`), which a diff would read as unchanged or removed. The job
         // built and applied every view's proc macros before posting this; checked again here.
         answer_macros_built(after, new_krate, &unit.target.name, "reach")?;
-        let new: &HashColumns = blaze_items::crate_hashes(after, new_krate);
-        let empty = HashColumns::default();
-        let old: &HashColumns = match old_krate {
+        // Copies of the columns' slices, which stay in each snapshot's arena.
+        let new: HashColumns<'_> = *blaze_items::crate_hashes(after, new_krate);
+        let old: HashColumns<'_> = match old_krate {
             Some(krate) => {
                 answer_macros_built(before, krate, &unit.target.name, "reach")?;
-                blaze_items::crate_hashes(before, krate)
+                *blaze_items::crate_hashes(before, krate)
             }
-            None => &empty,
+            None => HashColumns::default(),
         };
-        for key in new.changed_since(old) {
+        for key in new.changed_since(&old) {
             if !seen.insert(key) {
                 continue;
             }

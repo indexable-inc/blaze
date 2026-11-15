@@ -5,8 +5,9 @@
 //!
 //! **The reach** ([`reach`]): every function instance whose code a test can run, transitively,
 //! by plan key: each one it can call and each one any of those took in at any depth; every
-//! static it can read, by the key of its initial value; and the span of every item a reached
-//! panic location is in, as panic messages print lines. It is what a test is kept under when its
+//! static it can read, by the key of its initial value; and the span of every item its reached
+//! code is made from (each reached instance's own item and those of every instance it took
+//! in), as panic messages, `line!()` and backtraces print lines. It is what a test is kept under when its
 //! execution record is not whole (the reached basis), and what blaze-mutants' verdicts cover
 //! ([`reach_digest`]).
 //!
@@ -22,6 +23,9 @@
 //! points at (a vtable, a function pointer) are callable. Both are in the reach; a reach that
 //! leaves statics out misses an edit of a static's value
 //! ([`crate::Plant::ReachWithoutStatics`], which the tests catch).
+//!
+//! **The floor.** A reach must visit each row the test reaches once: it is that, plus a log of
+//! the program's size per row (ordered maps) and one span lookup per reached item.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -30,10 +34,11 @@ use std::alloc::Global;
 use std::collections::BTreeSet;
 
 use crate::Plant;
-use crate::key::{ItemId, Node, PlanKey, Symbol};
-use crate::program::{Program, SpanRow};
-use crate::record::{TestKey, ValueKey};
 use crate::codec::{Digest, Hasher};
+use crate::key::{ItemId, Node, PlanKey, Symbol};
+use crate::program::Program;
+use crate::record::{TestKey, ValueKey};
+use crate::walk::{Front, Span};
 
 use blaze_keyed::kind::{Kind, Settings as UnitSettings, TestInputs, TestRun, ToolId};
 
@@ -46,11 +51,14 @@ pub struct Reach {
     /// Every instance whose code the test can run (placed or taken in), by plan key.
     pub functions: Vec<(Symbol, PlanKey), Global>,
     pub statics: Vec<(Symbol, ValueKey), Global>,
-    pub spans: Vec<(ItemId, SpanRow), Global>,
+    /// Every item the reached code is made from, with where it starts. An item the front end
+    /// has no span for (gone from this revision) is not in it.
+    pub spans: Vec<(ItemId, Span), Global>,
 }
 
-/// The reach of `entry` in `program`: from the manifest's rows alone.
-pub fn reach(program: &Program, entry: &Symbol, plant: Plant) -> Reach {
+/// The reach of `entry` in `program`: from the manifest's rows, with each reached item's span
+/// as `front` gives it.
+pub fn reach(program: &Program, entry: &Symbol, front: &impl Front, plant: Plant) -> Reach {
     let mut seen = BTreeSet::new_in(Global);
     let mut stack = Vec::new_in(Global);
     seen.insert(Node::Function(*entry));
@@ -64,9 +72,8 @@ pub fn reach(program: &Program, entry: &Symbol, plant: Plant) -> Reach {
                 let Some(row) = program.functions().get(&symbol) else { continue };
                 out.functions.push((symbol, row.plan));
                 out.functions.extend_from_slice(&row.inlined);
-                for item in &row.loc_items {
-                    items.insert(*item);
-                }
+                items.insert(symbol.item);
+                items.extend(row.inlined.iter().map(|(inlinee, _)| inlinee.item));
                 (&row.calls, &row.statics)
             }
             Node::Static(symbol) => {
@@ -89,8 +96,8 @@ pub fn reach(program: &Program, entry: &Symbol, plant: Plant) -> Reach {
         }
     }
     for item in items {
-        if let Some(span) = program.spans().get(&item) {
-            out.spans.push((item, span.clone()));
+        if let Some(span) = front.span(&item) {
+            out.spans.push((item, span));
         }
     }
     // An instance placed and also taken in elsewhere, or taken in by two reached rows, is

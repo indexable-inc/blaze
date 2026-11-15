@@ -4,8 +4,10 @@
 //! real [`Store`](blaze_keyed::store::Store) and blaze-graph's worker pool, with the front end
 //! given as a [`Front`](blaze_keyed::front::Front).
 //!
-//! - [`run`]: the one entry: a request in, its [`Outcome`](blaze_keyed::driver::Outcome) and the
-//!   records proved per unit out ([`Answered`]).
+//! - [`run`]: a request in, its [`Outcome`](blaze_keyed::driver::Outcome) and the records proved
+//!   per unit out ([`Answered`]); [`run_programs`], the same request also building programs
+//!   (their plans, code and one link step each), walked by a
+//!   [`Walker`](blaze_keyed::program::Walker). `run` is `run_programs` with none.
 //! - [`outside`]: the request's outside reads and their answers now, over an injected
 //!   [`outside::Files`] (sans-IO); [`disk`] is the real one.
 //! - the unit graph is plain data, the plan's: no dependency on blaze-cargo or blaze-units.
@@ -33,4 +35,4 @@ mod workers;
 #[cfg(test)]
 mod tests;
 
-pub use self::host::{Answered, HostError, Request, UnitProved, run};
+pub use self::host::{Answered, HostError, Images, NoImages, Request, UnitProved, run, run_programs};

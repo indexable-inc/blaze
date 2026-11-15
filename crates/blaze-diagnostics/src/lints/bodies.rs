@@ -189,11 +189,12 @@ pub(crate) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// What a body's lints are run with beyond the database: the key of [`body_lints_clean`]
 /// beside the body, so a memo is never read for other passes than it ran
 /// (keys-cover-every-input).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct Gate {
     /// The lints that may fire anywhere in the crate ([`Cx::lint_may_fire`]), made of the lint
     /// flags and the crate's lint attributes: which passes run ([`Runs`], [`Passes`]), and
     /// what a pass that asks of one lint is told.
+    #[home(skip)]
     may_fire: LintSet,
     /// Of the passes before the abort: whether rustc makes code of the crate
     /// ([`before_abort`]). False of the late passes, which do not read it.
@@ -214,10 +215,10 @@ pub(crate) struct Gate {
 /// whatever it found, and leaves the body to the check. A file's name is the one thing a
 /// probe gives otherwise than the build and does not note: a lint may compare two spans'
 /// files, never read a name.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn body_lints_clean(db: &Db, owner: DefWithBodyId, gate: Gate) -> bool {
     #[cfg(test)]
-    tests::LINTED.lock().push((db.nonce_and_revision().0, owner, gate.late));
+    tests::LINTED.lock().push((db.nonce(), owner, gate.late));
     let krate = hir::Crate::from(hir_def::HasModule::krate(&owner, db));
     frame::task(Tag::Diagnostics, |frame| {
         let cx = Cx::probe(db, krate, frame, gate.may_fire);

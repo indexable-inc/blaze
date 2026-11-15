@@ -152,7 +152,7 @@ impl Emitted {
 /// It is computed from memoized queries (`mir_body`, `borrowck`, inference) and is not yet a
 /// memoized query of its own.
 pub fn structured(db: &Db, func: FunctionId) -> Result<body::Body, NotTranslated> {
-    blaze_query::db::attach(db, || lowered(db, Instance::of(db, func))).map(|it| it.body)
+    blaze_memo::attach(db, || lowered(db, Instance::of(db, func))).map(|it| it.body)
 }
 
 fn lowered<'db>(db: &'db Db, instance: Instance<'db>) -> Result<body::Lowered<'db>, NotTranslated> {
@@ -192,7 +192,7 @@ fn accepted(db: &Db, func: FunctionId) -> Result<(), NotTranslated> {
 /// (index 0) and the functions it calls, which `lean/Blaze/Mir` gives a meaning. The semantics'
 /// side of every check that a model, a pass or the evaluator agrees with what blaze compiles.
 pub fn embed_mir(db: &Db, func: FunctionId) -> Result<EmbeddedMir, NotTranslated> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         accepted(db, func)?;
         let term = body::embed::program(db, func, None, None)?;
         Ok(body::embed::module(db, func, term))
@@ -206,7 +206,7 @@ pub fn embed_mir_body<'db>(
     func: FunctionId,
     mir: &hir_ty::mir::MirBody<'db>,
 ) -> Result<String, NotTranslated> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         accepted(db, func)?;
         body::embed::program(db, func, Some(mir), None)
     })
@@ -222,7 +222,7 @@ pub fn embed_mir_body_as<'db>(
     mir: &hir_ty::mir::MirBody<'db>,
     layout: &hir_ty::mir::MirBody<'db>,
 ) -> Result<String, NotTranslated> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         accepted(db, func)?;
         body::embed::program(db, func, Some(mir), Some(layout))
     })
@@ -233,7 +233,7 @@ pub fn embed_mir_body_as<'db>(
 /// at, never alone: asked for alone, it is a [`NotTranslated`] that says so
 /// ([`body::GENERIC_UNASKED`]), and a generic theorem function is refused.
 pub fn emit(db: &Db, func: FunctionId) -> Result<Emitted, NotTranslated> {
-    blaze_query::db::attach(db, || emit_in(db, Instance::of(db, func), &mut Vec::new()))
+    blaze_memo::attach(db, || emit_in(db, Instance::of(db, func), &mut Vec::new()))
 }
 
 fn emit_in<'db>(

@@ -13,7 +13,7 @@ use crate::{
 /// The inference diagnostics of the function `f` of `fixture`.
 fn diagnostics(fixture: &str) -> Vec<InferenceDiagnostic> {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())

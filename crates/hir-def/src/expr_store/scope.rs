@@ -67,8 +67,9 @@ const _: () = assert!(size_of::<ScopeKind>() == 1);
 // 12 bytes an entry: a symbol, a hygiene and a binding id.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ScopeEntry>() == 12);
-// 12 bytes a block scope: an id (4) and an `Option` of an arena id, which has no niche.
-const _: () = assert!(size_of::<(BlockId, Option<LabelId>)>() == 12);
+// 16 bytes a block scope (was 12): a memo id (8) and an `Option` of an arena id, which has no
+// niche.
+const _: () = assert!(size_of::<(BlockId, Option<LabelId>)>() == 16);
 const _: () = assert!(size_of::<ScopeId>() == 4);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -113,21 +114,21 @@ impl ScopeByExpr {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl ExprScopes {
-    #[blaze_query::tracked(returns(ref))]
+    #[blaze_memo::tracked(returns(ref), owns)]
     pub fn body_expr_scopes(db: &Db, def: DefWithBodyId) -> ExprScopes {
         let body = Body::of(db, def);
         build(|scopes| walk_body(scopes, body))
     }
 
-    #[blaze_query::tracked(returns(ref))]
+    #[blaze_memo::tracked(returns(ref), owns)]
     pub fn sig_expr_scopes(db: &Db, def: GenericDefId) -> ExprScopes {
         let (_, store) = GenericParams::with_store(db, def);
         build(|scopes| walk_store(scopes, store, store.expr_roots()))
     }
 
-    #[blaze_query::tracked(returns(ref))]
+    #[blaze_memo::tracked(returns(ref), owns)]
     pub fn variant_scopes(db: &Db, def: VariantId) -> ExprScopes {
         let fields = VariantFields::of(db, def);
         build(|scopes| walk_store(scopes, &fields.store, fields.store.expr_roots()))

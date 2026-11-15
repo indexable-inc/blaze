@@ -82,7 +82,7 @@ fn def_map_at(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
     let db = fx.into_db();
 
     let module = db.module_at_position(position);
-    blaze_query::db::attach(&db, || module.def_map(&db).dump(&db))
+    blaze_memo::attach(&db, || module.def_map(&db).dump(&db))
 }
 
 fn check_block_scopes_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
@@ -91,7 +91,7 @@ fn check_block_scopes_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect
     let db = fx.into_db();
 
     let module = db.module_at_position(position);
-    let actual = blaze_query::db::attach(&db, || format!("{module:#?}"));
+    let actual = blaze_memo::attach(&db, || format!("{module:#?}"));
     expect.assert_eq(&fixture::stable_ids(&actual));
 }
 

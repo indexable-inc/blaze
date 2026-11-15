@@ -18,8 +18,11 @@ fn at(start: u32, end: u32) -> Span {
     }
 }
 
-fn server(_db: &Db) -> Server {
-    Server::new([at(0, 0), at(1, 1), at(2, 2)], Edition::CURRENT, false)
+fn server(db: &Db) -> Server {
+    // The sites' contexts are roots, the same word in every table: `db`'s live session arena
+    // stands for the calling crate's, never a constant of one generation.
+    let contexts = blaze_memo::Database::memo(db).session();
+    Server::new([at(0, 0), at(1, 1), at(2, 2)], contexts, Edition::CURRENT, false)
 }
 
 /// A request as the client writes it: its tag, then its arguments.
@@ -52,7 +55,7 @@ fn handle_of(reply: &[u8]) -> u32 {
 
 #[test]
 fn the_sites_are_the_first_spans_and_the_input_follows() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let mut input = Vec::new();
     server.input(&[Stream::default(), Stream::default()], &mut input);
@@ -64,7 +67,7 @@ fn the_sites_are_the_first_spans_and_the_input_follows() {
 
 #[test]
 fn trees_given_become_a_stream_with_rustcs_spacing_and_come_back_as_given() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let mut reply = Vec::new();
     // `a+=` as three trees, the `+` joint.
@@ -128,7 +131,7 @@ fn read_tokens(server: &Server, reply: &[u8]) -> Vec<(Span, bool)> {
 
 #[test]
 fn glued_trees_come_back_at_the_span_rustcs_glued_token_splits_into() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let mut reply = Vec::new();
     let site = server.span_handle(at(10, 12));
@@ -169,7 +172,7 @@ fn glued_trees_come_back_at_the_span_rustcs_glued_token_splits_into() {
 
 #[test]
 fn a_negative_literal_given_is_a_minus_before_it() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let mut reply = Vec::new();
     let from = request(Method::TsFromTokenTree, |w| {
@@ -194,7 +197,7 @@ fn a_negative_literal_given_is_a_minus_before_it() {
 
 #[test]
 fn streams_are_cloned_by_handle_dropped_once_and_concatenated_in_order() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let mut reply = Vec::new();
     let one = |name: &str| request(Method::TsFromTokenTree, |w| ident_tree(w, name, 2));
@@ -235,7 +238,7 @@ fn streams_are_cloned_by_handle_dropped_once_and_concatenated_in_order() {
 
 #[test]
 fn spans_are_interned_and_answered_without_the_database_where_they_can_be() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let mut reply = Vec::new();
     let handle = server.span_handle(at(10, 20));
@@ -267,7 +270,7 @@ fn spans_are_interned_and_answered_without_the_database_where_they_can_be() {
 
 #[test]
 fn a_diagnostic_is_kept_with_its_children_and_its_level() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let mut reply = Vec::new();
     let emit = request(Method::EmitDiagnostic, |w| {
@@ -289,7 +292,7 @@ fn a_diagnostic_is_kept_with_its_children_and_its_level() {
 
 #[test]
 fn a_request_the_bridge_never_sends_stops_the_expansion() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let mut reply = Vec::new();
     assert!(server.dispatch(&db, &[200], &mut reply).is_err());
@@ -306,7 +309,7 @@ fn a_request_the_bridge_never_sends_stops_the_expansion() {
 
 #[test]
 fn the_output_is_the_stream_or_the_panic_message() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let mut server = server(&db);
     let handle = server.stream_handle(Stream::default());
     let mut ok = Vec::new();
@@ -331,10 +334,10 @@ fn the_output_is_the_stream_or_the_panic_message() {
 #[test]
 fn a_question_no_key_covers_is_the_one_an_expansion_is_said_to_have_asked() {
     use super::Asked;
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     for (asks, said) in [
         (&[Asked::Join][..], Asked::Join),
-        (&[Asked::Join, Asked::Edition], Asked::Join),
+        (&[Asked::Join, Asked::Parent], Asked::Join),
         (&[Asked::Join, Asked::SourceText, Asked::LineColumn], Asked::SourceText),
         (&[Asked::SourceText, Asked::Join], Asked::SourceText),
         (&[Asked::Debug, Asked::ByteRange], Asked::Debug),

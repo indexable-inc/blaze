@@ -11,7 +11,6 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::AsId;
 use hir_def::{
     CallableDefId, FieldId, FunctionId, GenericParamId, ItemContainerId, VariantId,
     attrs::AttrFlags,
@@ -47,7 +46,7 @@ const DERIVE_DEPTH: u32 = 64;
 
 /// An instance: the body it runs and its generic arguments (a closure's or coroutine's are its
 /// parent's).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct Instance {
     pub(crate) def: Body,
     pub(crate) args: StoredGenericArgs,
@@ -147,7 +146,7 @@ impl<'db> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
-        let roots: &[FunctionId] = &crate::root::roots(db, env.krate).found;
+        let roots: &'db [FunctionId] = crate::root::roots(db, env.krate).found;
         Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), roots }
     }
 
@@ -429,7 +428,7 @@ impl<'a, 'db> Scan<'a, 'db> {
                 {
                     let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
                     let mut targets = SmallVec::new();
-                    self.walk(Body::Closure(id.0.as_id()), parent, &mut targets);
+                    self.walk(Body::Closure(blaze_memo::Id::gid(id.0)), parent, &mut targets);
                     self.reified(place, span, targets);
                 }
             }

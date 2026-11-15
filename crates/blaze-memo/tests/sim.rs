@@ -18,7 +18,10 @@
 //! - a recorded read list is exactly the facts the evaluator reads, whether the result was run
 //!   or hit;
 //! - a hit makes no check (decision 18): `Counts::hit_checks` is zero, and the only checks are
-//!   one per arena per `Memo::next`.
+//!   one per arena per `Memo::next`;
+//! - a key held by one task is never taken for another task's own: of two tasks asking one key,
+//!   one runs it, the other gets that run's value, and neither is told it is in a cycle
+//!   (`two_tasks_ask_one_key`).
 //!
 //! Each `the_oracle_catches_*` test plants one bug (`Plant`) and shows the oracle refuses some
 //! case's run; a failing case's tape is printed and replays alone.
@@ -187,17 +190,30 @@ impl Sim {
     }
 }
 
+/// Whose key the simulation's flight says a held key is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whose {
+    /// Its holder's: `Mine` to the holder alone, a wait (or a give-way) to every other task.
+    Holder,
+    /// The planted bug, `Alone` as it was: any key held is the asker's own (`Mine`), whoever
+    /// holds it.
+    AnyHeldIsMine,
+}
+
 /// Single flight on the baton, the scheduler's rules.
-struct SimFlight(Arc<Sim>);
+struct SimFlight {
+    sim: Arc<Sim>,
+    whose: Whose,
+}
 
 impl Flight for SimFlight {
     fn single<'f>(
         &'f self,
         key: FlightKey,
-        _: &dyn Fn(&mut String),
+        _: &dyn Fn(&mut dyn std::fmt::Write),
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f> {
-        let sim = &*self.0;
+        let sim = &*self.sim;
         sim.yield_now();
         let me = ME.with(Cell::get);
         {
@@ -205,6 +221,7 @@ impl Flight for SimFlight {
             let holder = state.held.iter().find(|(k, _)| *k == key).map(|(_, w)| *w);
             match holder {
                 Some(w) if w == me => return Flown::Mine,
+                Some(_) if self.whose == Whose::AnyHeldIsMine => return Flown::Mine,
                 Some(w) => {
                     // Would waiting close a cycle of waits across tasks?
                     let mut at = w;
@@ -320,8 +337,9 @@ fn ask(db: &SimDb<'_>, world: &World, model: &Model<'_>, ask: Ask) -> Result<(),
         Ask::Ring(c, at) => (common::ring(db, world.krate(c), at), model.ring(at)),
         Ask::Reach(c, n) => (common::reach(db, world.krate(c), n), model.reach(c, n)),
         Ask::Record(c, d) => {
-            let (got, reads) = record(db.memo, || common::total(db, world.krate(c), d))
+            let (got, rows) = record(db.memo, || common::total(db, world.krate(c), d))
                 .map_err(|it| it.to_string())?;
+            let reads = common::facts_of(&rows);
             let want = model.total_facts(c, d);
             if reads.as_slice() != want.as_slice() {
                 return Err(format!(
@@ -372,8 +390,121 @@ fn worker(me: usize, sim: &Sim, db: &SimDb<'_>, world: &World, model: &Model<'_>
     Ok(take_counts())
 }
 
+/// One round on snapshot `current`: worker `me` asks `asks[me]` in order, all of them under the
+/// baton, from a fresh schedule drawn on from the case's tape. The workers' counts summed, or
+/// the round's verdict: a worker's panic, whatever the others reported after it (a give-way
+/// bound, a stop, a hang), else the first worker's error.
+fn round(
+    sim: &Sim,
+    current: &Memo,
+    world: &World,
+    model: &Model<'_>,
+    runs: &Runs,
+    asks: &[Vec<Ask>],
+    panic_at: Option<PanicAt>,
+) -> Result<Counts, String> {
+    let results: Vec<Result<Counts, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|me| {
+                let asks = &asks[me];
+                scope.spawn(move || {
+                    let db = SimDb { memo: current, sim, runs, panic_at };
+                    PAUSES.with(|it| it.set(0));
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        worker(me, sim, &db, world, model, asks)
+                    }))
+                    .unwrap_or_else(|payload| {
+                        let why = payload
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| payload.downcast_ref::<&str>().map(|it| (*it).to_owned()))
+                            .unwrap_or_else(|| "a panic with no message".to_owned());
+                        // Set while this worker still holds the baton: no peer runs between
+                        // the panic and its verdict.
+                        sim.panicked(format!("worker {me} panicked: {why}"));
+                        Err(why)
+                    });
+                    sim.finish(me);
+                    result
+                })
+            })
+            .collect();
+        sim.start();
+        handles.into_iter().map(|it| it.join().expect("a worker's panic is caught")).collect()
+    });
+    if let Some(why) = sim.panic_verdict() {
+        return Err(why);
+    }
+    let mut counts = Counts::default();
+    for result in results {
+        counts.add(&result?);
+    }
+    Ok(counts)
+}
+
 fn run(tape: &Tape, plant: Plant) -> Result<(), String> {
     run_with(tape, plant, None)
+}
+
+/// Two tasks ask one key (the case's crate's deepest `total`, which reads every leaf and its
+/// dependencies' totals, so the ask spans many flights and pauses); the other workers ask
+/// nothing. The oracle: both answers are the evaluator's, the key and everything under it ran
+/// to its end once, and neither task was told it is in a cycle (on `Mine` with no run of the
+/// key on its stack, `reenter` panics, and a worker's panic is the verdict). Under the plant
+/// (`Whose::AnyHeldIsMine`, `Alone` as it was) the second asker is told the first one's run is
+/// its own.
+fn two_tasks_ask_one_key(tape: &Tape, whose: Whose) -> Result<(), String> {
+    let values: Vec<Vec<u64>> = (0..=CRATES)
+        .map(|_| (0..LEAVES).map(|_| tape.below(8, "leaf value")).collect())
+        .collect();
+    let mut world = World::new(values);
+    let sim = Arc::new(Sim::new(tape));
+    let config = Config {
+        arenas: CRATES + 1,
+        reads: Reads::Kept,
+        flight: Arc::new(SimFlight { sim: Arc::clone(&sim), whose }),
+        cap_bytes: u64::MAX,
+        plant: Plant::None,
+    };
+    sim.reset();
+    let current = world.first(config);
+    let model = Model { values: &world.values };
+    let runs = new_runs();
+    let c = 1 + tape.below(u64::from(CRATES), "asked crate") as u32;
+    let one = Ask::Total(c, DEPTH);
+    let mut asks: Vec<Vec<Ask>> = (0..WORKERS).map(|_| Vec::new()).collect();
+    asks[0].push(one);
+    asks[1].push(one);
+    round(&sim, &current, &world, &model, &runs, &asks, None)?;
+    let again = twice(&runs);
+    if !again.is_empty() {
+        return Err(format!("{one:?} by two tasks ran twice: {again:?}"));
+    }
+    let gid = blaze_memo::Id::gid(world.krate(c));
+    let ran = runs.lock().get(&(common::TOTAL, gid, DEPTH)).copied().unwrap_or(0);
+    if ran != 1 {
+        return Err(format!("{one:?} by two tasks ran {ran} times, not once"));
+    }
+    Ok(())
+}
+
+/// The invariant of [`two_tasks_ask_one_key`], under every interleaving the cases draw.
+#[test]
+fn two_tasks_ask_one_key_and_it_runs_once() {
+    blaze_sim::check(blaze_sim::Config::cases(64), |tape| two_tasks_ask_one_key(tape, Whose::Holder));
+}
+
+/// The control: a flight that says any held key is the asker's own (`Alone` before it named
+/// its holder) tells the second asker it is in a cycle with the first one's run.
+#[test]
+fn the_oracle_catches_a_held_key_taken_for_the_askers_own() {
+    blaze_sim::control(
+        blaze_sim::Config::cases(64),
+        Whose::Holder,
+        Whose::AnyHeldIsMine,
+        "the flight says this task runs",
+        |tape, whose| two_tasks_ask_one_key(tape, whose).map_err(Broke::Oracle),
+    );
 }
 
 fn run_with(tape: &Tape, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), String> {
@@ -388,7 +519,7 @@ fn run_with(tape: &Tape, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), 
     let config = Config {
         arenas: CRATES + 1,
         reads: Reads::Kept,
-        flight: Arc::new(SimFlight(Arc::clone(&sim))),
+        flight: Arc::new(SimFlight { sim: Arc::clone(&sim), whose: Whose::Holder }),
         cap_bytes: u64::MAX,
         plant,
     };
@@ -430,45 +561,8 @@ fn run_with(tape: &Tape, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), 
         let runs = new_runs();
         let asks: Vec<Vec<Ask>> =
             (0..WORKERS).map(|_| (0..ASKS).map(|_| draw(tape)).collect()).collect();
-        let results: Vec<Result<Counts, String>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..WORKERS)
-                .map(|me| {
-                    let (sim, world, model, runs, current, asks) =
-                        (&*sim, &world, &model, &runs, &current, &asks[me]);
-                    scope.spawn(move || {
-                        let db = SimDb { memo: current, sim, runs, panic_at };
-                        PAUSES.with(|it| it.set(0));
-                        let result = catch_unwind(AssertUnwindSafe(|| {
-                            worker(me, sim, &db, world, model, asks)
-                        }))
-                        .unwrap_or_else(|payload| {
-                            let why = payload
-                                .downcast_ref::<String>()
-                                .cloned()
-                                .or_else(|| payload.downcast_ref::<&str>().map(|it| (*it).to_owned()))
-                                .unwrap_or_else(|| "a panic with no message".to_owned());
-                            // Set while this worker still holds the baton: no peer runs between
-                            // the panic and its verdict.
-                            sim.panicked(format!("worker {me} panicked: {why}"));
-                            Err(why)
-                        });
-                        sim.finish(me);
-                        result
-                    })
-                })
-                .collect();
-            sim.start();
-            handles.into_iter().map(|it| it.join().expect("a worker's panic is caught")).collect()
-        });
-        // A worker's panic is the round's verdict, whatever the others reported after it
-        // (a give-way bound, a stop, a hang).
-        if let Some(why) = sim.panic_verdict() {
-            return Err(format!("snapshot {snapshot}: {why}"));
-        }
-        let mut counts = Counts::default();
-        for result in results {
-            counts.add(&result.map_err(|why| format!("snapshot {snapshot}: {why}"))?);
-        }
+        let counts = round(&sim, &current, &world, &model, &runs, &asks, panic_at)
+            .map_err(|why| format!("snapshot {snapshot}: {why}"))?;
         let again = twice(&runs);
         if !again.is_empty() {
             return Err(format!("snapshot {snapshot}: ran twice: {again:?}"));

@@ -910,7 +910,6 @@ pub fn f() {}
 /// `#![cfg(target_arch = "wasm32")]` still has the harness's `main` (astral-experiments/blaze#35).
 #[test]
 fn cfg_the_entire_crate_keeps_the_appended_module() {
-    use blaze_query::db::Durability;
     let mut db = fixture::db(
         r#"
 //- /main.rs
@@ -930,7 +929,9 @@ mod __blaze_test_harness {
         crate
     "#]]
     .assert_eq(&crate_def_map(&db, krate).dump(&db));
-    db.set_appended_root_module(root, Some("__blaze_test_harness"), Durability::LOW);
+    // The crate by its key, taken again after each write: the write drops its arena.
+    let key = krate.key(&db);
+    _ = db.commit_with(|edit| _ = edit.set_appended_root_module(root, Some("__blaze_test_harness")));
     expect![[r#"
         crate
         - __blaze_test_harness : type
@@ -938,12 +939,12 @@ mod __blaze_test_harness {
         crate::__blaze_test_harness
         - main : value
     "#]]
-    .assert_eq(&crate_def_map(&db, krate).dump(&db));
-    db.set_appended_root_module(root, None, Durability::LOW);
+    .assert_eq(&crate_def_map(&db, db.krate(key)).dump(&db));
+    _ = db.commit_with(|edit| _ = edit.set_appended_root_module(root, None));
     expect![[r#"
         crate
     "#]]
-    .assert_eq(&crate_def_map(&db, krate).dump(&db));
+    .assert_eq(&crate_def_map(&db, db.krate(key)).dump(&db));
 }
 
 #[test]
@@ -1160,6 +1161,8 @@ impl Tr for D {}
 
     let bytes = frozen::pages::encode(&db, krate).unwrap();
     frozen::serve_pages(&mut db, &[(krate, bytes)], Mode::Verify);
+    // The commit that gave the pages dropped the crate's arena: the crate is taken again.
+    let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let scope = def_map.module(&db, def_map.root).scope(&db);
     assert_eq!(scope.trait_impls_without_reservation().count(), 2);

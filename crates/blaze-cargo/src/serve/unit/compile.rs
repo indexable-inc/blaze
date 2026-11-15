@@ -971,7 +971,7 @@ fn check_puts(
     let placed = match diags.is_empty() {
         true => None,
         false => {
-            let krate = crate_of(job, unit, u)?;
+            let krate = crate_of(reader.db(), job, unit, u)?;
             if !in_own_files(job, reader, krate, diags) {
                 return Ok(none);
             }
@@ -996,7 +996,7 @@ fn check_puts(
     // only directories every checkout of the home shares, under its key in this home
     // ([`Places::home`]).
     let places = Places::of(job);
-    let tied = match portable::path_reads(reader.db(), crate_of(job, unit, u)?, &places) {
+    let tied = match portable::path_reads(reader.db(), crate_of(reader.db(), job, unit, u)?, &places) {
         Some(_) => Some(portable::Tied::Here),
         None => places.reach(&bytes),
     };
@@ -1526,7 +1526,12 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
         .map_err(|error| error.what)?;
         // In place of its crate's identity as one part: what that identity is made of, so the
         // file, setting or dependency that changed is the one named.
-        parts.extend(identity_named(job, unit, reader.identity_parts(unit, identity)?)?);
+        parts.extend(identity_named(
+            reader.db(),
+            job,
+            unit,
+            reader.identity_parts(unit, identity)?,
+        )?);
         // And what its narrow key, under which its record is looked up first, holds of each
         // crate of its closure: a part of none of its whole key's hashes, named so that a
         // narrowed identity that moved alone is the part that changed.
@@ -1576,8 +1581,9 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
 /// What unit `unit`'s identity in the front end is `made_of`
 /// ([`blaze_lower::Lowered::identity_parts`]) as parts of its record's key: each file by its
 /// path, and each crate it depends on as the result of that crate's unit, which a chain of
-/// reasons follows.
+/// reasons follows. `db` is the snapshot `made_of` was asked in.
 fn identity_named(
+    db: &base_db::Db,
     job: &Job,
     unit: usize,
     made_of: Vec<blaze_lower::IdentityPart>,
@@ -1586,13 +1592,15 @@ fn identity_named(
     use blaze_lower::IdentityPart;
     let u = job.unit(unit).map_err(|error| error.what)?;
     // The unit whose crate `krate` is: one this unit depends on, else (a crate of the
-    // standard library, which no unit names as a dependency) the first of the job's.
-    let unit_of = |krate| {
+    // standard library, which no unit names as a dependency) the first of the job's. By key,
+    // as the job names its units' crates.
+    let unit_of = |krate: base_db::Crate| {
+        let key = krate.key(db);
         u.dependencies
             .iter()
             .map(|dep| dep.index)
             .chain(0..job.graph.len())
-            .find(|&at| job.crates.krate(at) == Some(krate))
+            .find(|&at| job.crates.key(at) == Some(key))
             .and_then(|at| job.unit(at).ok())
             .map(span_unit)
     };
@@ -3164,8 +3172,8 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     if u.mode == Mode::Doctest {
         return doctest::names(job, unit, slot);
     }
-    let krate = crate_of(job, unit, u)?;
     let db = reader.db();
+    let krate = crate_of(db, job, unit, u)?;
     macros_built(db, krate, u)?;
     options(job, db, unit, u)?;
     {
@@ -3271,8 +3279,8 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> R
     // clone: a refcount, once per unit checked
     let Some(checking) = lock(slot).checking.clone() else { return Ok(()) };
     let u = job.unit(unit)?;
-    let krate = crate_of(job, unit, u)?;
     let db = reader.db();
+    let krate = crate_of(db, job, unit, u)?;
     let (flags, options) = options(job, db, unit, u)?;
     let files = blaze_diagnostics::Files::new(reader.paths(), job.mounted.root());
     // Its unchanged bodies' inference and MIR answered from the store's kernel entries before
@@ -3292,7 +3300,7 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> R
             .err()
             .map(|it| it.to_string());
         // clone: once per dependency crate checked this build
-        job.check_later(krate, flags, diags.clone(), items_broken, refused);
+        job.check_later(krate.key(db), flags, diags.clone(), items_broken, refused);
     }
     let plan = job.plan(unit)?;
     let diags = match &plan.clippy {
@@ -3472,7 +3480,7 @@ fn generate(
     if u.mode == Mode::Doctest {
         return doctest::generate(job, reader, unit, slot);
     }
-    let krate = crate_of(job, unit, u)?;
+    let krate = crate_of(reader.db(), job, unit, u)?;
     // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
     let checks = checking.as_deref().map(|it| it as &dyn BodyChecks);
     let generated = codegen::makes(u, codegen::asked(job, unit)).map(|makes| {
@@ -3663,7 +3671,7 @@ fn store(
     let plan = job.plan(unit)?;
     let package = job.package(u)?;
     // Read before the unit's is taken, so a give-way finds it as it was.
-    let krate = crate_of(job, unit, u)?;
+    let krate = crate_of(reader.db(), job, unit, u)?;
     let sources = {
         let _span = tracing::info_span!(target: "blaze", "unit source files").entered();
         crate_files(reader, krate)
@@ -4321,7 +4329,7 @@ fn macros(
              macros only as wasm32-wasip1 modules, so its unit plan is wrong"
         ));
     }
-    let Some(krate) = job.crates.krate(unit) else {
+    let Some(krate) = job.crates.krate(reader.db(), unit) else {
         return failed(format!("proc macro `{name}` has no crate in the front end"));
     };
     // What its expansions are kept under: the front end's code, whose closure holds the macro
@@ -4450,9 +4458,14 @@ fn macros_built(db: &base_db::Db, krate: base_db::Crate, u: &Unit) -> Result<(),
     })
 }
 
-/// `unit`'s crate in the front end.
-pub(super) fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError> {
-    job.crates.krate(unit).ok_or_else(|| {
+/// `unit`'s crate in the front end, in `db`'s snapshot.
+pub(super) fn crate_of(
+    db: &base_db::Db,
+    job: &Job,
+    unit: usize,
+    u: &Unit,
+) -> Result<base_db::Crate, ApiError> {
+    job.crates.krate(db, unit).ok_or_else(|| {
         // alloc: error path
         ApiError::new(
             format!("unit {unit} (`{}`) has no crate in the front end", u.target.name),
@@ -4590,7 +4603,7 @@ fn assemble(
             // validated by naga and written as MSL, from the front end as it stands. A refusal
             // fails the unit naming each construct, never another way to make it.
             if let Some(path) = msl {
-                let krate = crate_of(job, unit, u)?;
+                let krate = crate_of(reader.db(), job, unit, u)?;
                 let built = {
                     let _span = tracing::info_span!("unit device build").entered();
                     blaze_shader::device::device_msl(reader.db(), krate)
@@ -4719,7 +4732,7 @@ fn assemble(
                 match codegen::link(
                     job,
                     unit,
-                    crate_of(job, unit, u)?,
+                    crate_of(reader.db(), job, unit, u)?,
                     path,
                     makes,
                     &generated,

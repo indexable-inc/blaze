@@ -40,7 +40,7 @@ use super::{
 /// prelude, the `macro_use` prelude and the std prelude. Only the root's collection changes the
 /// first two, so nearly every module of a crate shares one (interned as
 /// [`super::queries::CrateEnvKey`]). Lists keep insertion order, as the old maps did.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct CrateEnv {
     pub(crate) extern_prelude: Box<[(Name, ModuleId, Option<ExternCrateId>)]>,
     pub(crate) macro_use: Box<[(Name, MacroId, Option<ExternCrateId>)]>,
@@ -114,7 +114,7 @@ fn set_or_push<T: Copy>(
 /// of it. Its type-namespace bindings that name a module, and its children so far with their
 /// keys. A path that reads any other name of an ancestor at round 0 is one rustc rejects (a
 /// visibility or macro path through a non-module), see the notes' §8.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct Ancestor {
     pub(crate) module: ModuleId,
     pub(crate) origin: ModuleOrigin,
@@ -128,7 +128,7 @@ pub(crate) struct Ancestor {
 
 /// What a round-0 collection of a module reads besides its own items: the crate env and its
 /// ancestors, nearest first. Interned as [`super::queries::EnvKey`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct CollectEnv {
     pub(crate) krate: super::queries::CrateEnvKey,
     pub(crate) ancestors: Box<[Ancestor]>,

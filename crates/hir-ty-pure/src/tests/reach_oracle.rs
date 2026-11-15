@@ -104,7 +104,7 @@ fn check(program: &Program) -> Result<Verdict, String> {
     let source = program.source();
     let db = fixture::db(&source).into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (probe, run) = (fn_named(&db, krate, "probe"), fn_named(&db, krate, "run"));
         let proved = proved(&db, probe);
         let env = ParamEnvAndCrate { param_env: db.trait_environment(run.into()), krate }.store();
@@ -302,7 +302,7 @@ impl Arith {
 fn fits_everywhere(source: &str) -> (bool, Option<(Db, FunctionId)>) {
     let db = fixture::db(source).into_db();
     let krate = crate_named(&db, "kernel");
-    let (fits, probe) = blaze_query::db::attach(&db, || {
+    let (fits, probe) = blaze_memo::attach(&db, || {
         let probe = fn_named(&db, krate, "probe");
         let found = reach::overflow_of_body(&db, DefWithBodyId::FunctionId(probe));
         (found.refused.is_empty() && found.sites.iter().all(|it| it.2.is_none()), probe)
@@ -323,7 +323,7 @@ fn check_overflow(program: &Arith) -> Result<bool, String> {
     }
     let Some((db, _)) = made else { return Err("no database".to_owned()) };
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let run = fn_named(&db, krate, "run");
         let env = ParamEnvAndCrate { param_env: db.trait_environment(run.into()), krate }.store();
         let body = db

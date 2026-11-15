@@ -175,6 +175,9 @@ pub struct Lookup<'s, K: Kind> {
     stage: Stage,
     address: Option<AddressHasher>,
     found: Option<Found<'s, K>>,
+    /// On a hit, the value record's bytes, owned: what a lookup made before its driver (the
+    /// command's, of the certificate) hands on, so nothing is read twice.
+    hit_bytes: Option<blaze_format::Aligned>,
     /// The digests of the shapes at slots `0..filled`.
     seen: [ContentId; MAX_SHAPES as usize],
     filled: u32,
@@ -188,6 +191,7 @@ impl<'s, K: Kind<Root = Traced>> Lookup<'s, K> {
             stage: Stage::Shape(0),
             address: None,
             found: None,
+            hit_bytes: None,
             seen: [ContentId([0; 32]); MAX_SHAPES as usize],
             filled: 0,
         }
@@ -268,6 +272,7 @@ impl<'s, K: Kind<Root = Traced>> Lookup<'s, K> {
             Some(bytes) => {
                 let hit = proof::hit(self.snap, address, bytes)
                     .map_err(|why| OutsideError::Record { key: address.id(), why })?;
+                self.hit_bytes = Some(blaze_format::Aligned::copy_from(bytes));
                 self.end(Found::Hit(hit.holds()));
             }
             None if slot + 1 == MAX_SHAPES => self.end(Found::Miss),
@@ -288,6 +293,11 @@ impl<'s, K: Kind<Root = Traced>> Lookup<'s, K> {
     /// What it found, once [`Want::Done`].
     pub fn found(&self) -> Option<Found<'s, K>> {
         self.found
+    }
+
+    /// On a hit, the value record's bytes (checked under its address when given).
+    pub fn hit_bytes(&self) -> Option<&[u8]> {
+        self.hit_bytes.as_deref()
     }
 }
 

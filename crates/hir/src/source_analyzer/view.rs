@@ -982,5 +982,5 @@ pub(crate) fn name_hygiene_view(db: &Db, name: InFile<Node<'_>>) -> HygieneId {
     };
     let span_map = macro_file.expansion_span_map(db);
     let ctx = span_map.span_at(name.value.text_range().start()).ctx;
-    HygieneId::new(ctx.opaque_and_semiopaque(db))
+    HygieneId::new(ctx.opaque_and_semiopaque(db, name.file_id.context_arena()))
 }

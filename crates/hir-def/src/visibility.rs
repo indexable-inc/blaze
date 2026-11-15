@@ -20,18 +20,19 @@ use crate::{
 pub use crate::item_tree::{RawVisibility, VisibilityExplicitness};
 
 /// Visibility of an item, with the path resolved.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum Visibility {
     /// Visibility is restricted to a certain module.
-    Module(ModuleId, VisibilityExplicitness),
+    Module(ModuleId, #[home(skip)] VisibilityExplicitness),
     /// Visibility is restricted to the crate.
     PubCrate(Crate),
     /// Visibility is unrestricted.
     Public,
 }
 
-// A module id (4 bytes) and the explicitness, whose spare values tag the other two.
-const _: () = assert!(size_of::<Visibility>() <= 8);
+// A module id (8 bytes, a `Gid`) and the explicitness, whose spare values tag the other two
+// (the crate's id lies in the module id's bytes): 9, so 12 at align 4.
+const _: () = assert!(size_of::<Visibility>() <= 12);
 
 /// Why a `pub(in path)` (or `pub(super)`) gives no visibility: rustc's `VisResolutionError`,
 /// from `rustc_resolve::build_reduced_graph`'s `try_resolve_visibility`.
@@ -72,7 +73,8 @@ pub fn visibility_error_from_ast_view(
     ast_vis: InFile<Option<ast::Visibility<'_>>>,
 ) -> Option<VisibilityError> {
     let mut span_map = None;
-    let raw_vis = crate::item_tree::visibility_from_ast(db, ast_vis.value, &mut |range| {
+    let table = ast_vis.file_id.context_arena();
+    let raw_vis = crate::item_tree::visibility_from_ast(db, table, ast_vis.value, &mut |range| {
         span_map.get_or_insert_with(|| ast_vis.file_id.span_map(db)).span_for_range(range).ctx
     });
     match raw_vis {
@@ -348,10 +350,10 @@ impl Visibility {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl VariantFields {
     /// Resolve visibility of all specific fields of a struct or union variant.
-    #[blaze_query::tracked(returns(ref))]
+    #[blaze_memo::tracked(returns(ref), owns)]
     pub fn field_visibilities(
         db: &Db,
         variant_id: VariantId,
@@ -376,7 +378,8 @@ pub fn visibility_from_ast_view(
     ast_vis: InFile<Option<ast::Visibility<'_>>>,
 ) -> Visibility {
     let mut span_map = None;
-    let raw_vis = crate::item_tree::visibility_from_ast(db, ast_vis.value, &mut |range| {
+    let table = ast_vis.file_id.context_arena();
+    let raw_vis = crate::item_tree::visibility_from_ast(db, table, ast_vis.value, &mut |range| {
         span_map.get_or_insert_with(|| ast_vis.file_id.span_map(db)).span_for_range(range).ctx
     });
     resolve_raw(db, has_resolver, &raw_vis)
@@ -409,25 +412,30 @@ fn resolve_raw(
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl AssocItemId {
     /// Resolve visibility of an assoc item.
-    #[blaze_query::tracked(returns(copy))]
+    #[blaze_memo::tracked(returns(copy))]
     pub fn assoc_visibility(self, db: &Db) -> Visibility {
         match self {
             AssocItemId::FunctionId(function_id) => {
                 let loc = function_id.lookup(db);
                 trait_item_visibility(db, loc.container)
+                    .or_else(|| served_impl_item_visibility(db, function_id, loc.container, self))
                     .unwrap_or_else(|| written_visibility(db, function_id, loc.id))
             }
             AssocItemId::ConstId(const_id) => {
                 let loc = const_id.lookup(db);
                 trait_item_visibility(db, loc.container)
+                    .or_else(|| served_impl_item_visibility(db, const_id, loc.container, self))
                     .unwrap_or_else(|| written_visibility(db, const_id, loc.id))
             }
             AssocItemId::TypeAliasId(type_alias_id) => {
                 let loc = type_alias_id.lookup(db);
                 trait_item_visibility(db, loc.container)
+                    .or_else(|| {
+                        served_impl_item_visibility(db, type_alias_id, loc.container, self)
+                    })
                     .unwrap_or_else(|| written_visibility(db, type_alias_id, loc.id))
             }
         }
@@ -441,7 +449,39 @@ fn trait_item_visibility(db: &Db, container: ItemContainerId) -> Option<Visibili
     }
 }
 
+/// The visibility written on `item`, an item of the impl `container`, resolved for
+/// `has_resolver` (the item), where its crate's image holds it
+/// (`deps::signatures::served_impl_visibilities`): no file of the crate is read. `None` for
+/// an item of a trait, or of a crate read from no image's pages.
+///
+/// # Panics
+///
+/// Where the image holds the impl's visibilities and `item` is not among the impl's items: the
+/// two are one record ([`crate::deps::signatures::AssocRecord`]), so that is a corrupt image.
+fn served_impl_item_visibility(
+    db: &Db,
+    has_resolver: impl HasResolver + HasModule,
+    container: ItemContainerId,
+    item: AssocItemId,
+) -> Option<Visibility> {
+    let ItemContainerId::ImplId(impl_) = container else { return None };
+    let visibilities = crate::deps::signatures::served_impl_visibilities(db, impl_).as_ref()?;
+    let items = &crate::nameres::assoc::ImplItems::of(db, impl_).0.items;
+    let Some(at) = items.iter().position(|&(_, it)| it == item) else {
+        panic!(
+            "the image of crate {} is corrupt: {item:?} is not among the items its record holds \
+             of {impl_:?}, which hold its visibility",
+            impl_.lookup(db).container.krate(db).named(db)
+        )
+    };
+    Some(resolve_raw(db, has_resolver, &visibilities[at]))
+}
+
 fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
+    // Of a crate read from an image's pages, the visibility its record holds.
+    if let Some(raw) = crate::deps::signatures::served_trait_visibility(db, def) {
+        return resolve_raw(db, def, raw);
+    }
     written_visibility(db, def, def.lookup(db).id)
 }
 

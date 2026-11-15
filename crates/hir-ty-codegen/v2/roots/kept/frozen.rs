@@ -10,14 +10,11 @@
 //! `StaticId`) and the owners (each a `DefWithBodyId`), every id written by its location as
 //! `hir-ty/src/method_resolution/frozen.rs` writes an impl's items.
 
-use std::sync::Arc;
-
 use base_db::{Crate, Db};
-use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use hir_def::{
     DefWithBodyId, FunctionId, ModuleDefId, StaticId,
-    deps::{DepImages, ImageBuf, ImageStore, Served, kept_key},
+    deps::{Image, ImageBuf, ImageStore, kept_key},
     nameres::frozen::{Dec, Enc, Mode, Unreadable},
 };
 use std::alloc::Global;
@@ -55,34 +52,27 @@ impl std::fmt::Debug for Record {
     }
 }
 
-/// The crates whose kept roots are read from a record, set by [`serve`]: read where every
-/// crate is gone over. A crate's own record is read from its slot ([`KeptSlot`],
-/// `hir_def::deps::given`), so a record given to one crate is no write a reader of another
-/// crate's reads.
-#[blaze_query::input(singleton, debug)]
-pub struct FrozenKept {
-    #[returns(ref)]
-    pub maps: Arc<HashMap<Crate, Record, Global>>,
-}
-
-/// The kind of a crate's slot holding its entry of [`FrozenKept`].
+/// The kind of a crate's slot holding its kept-roots [`Record`]. A crate's record is read from
+/// its own slot (`hir_def::deps::given`) only: no map of every crate's is held, the driver
+/// keeps what it gave.
 pub struct KeptSlot;
 
-/// Has finding the kept roots of each crate of `maps` read its record.
-pub fn set(db: &mut Db, maps: HashMap<Crate, Record, Global>) {
-    use blaze_query::db::{Durability, Setter};
-    // clone: the handle of the map set before, to tell which crates' records move
-    let was = FrozenKept::try_get(&*db).map(|it| it.maps(&*db).clone());
-    hir_def::deps::given::give_changed::<KeptSlot, Record>(db, was.as_deref(), &maps);
-    let maps = Arc::new(maps);
-    match FrozenKept::try_get(db) {
-        Some(it) => {
-            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
-        }
-        None => {
-            _ = FrozenKept::new(db, Durability::HIGH, maps);
-        }
-    }
+/// The fact a crate's kept-roots slot is read by: the slot's id, of the crate's own stable id,
+/// and the record's key (the store checks a key's bytes, so equal keys are equal records).
+pub fn kept_fact(krate_id: ContentId, record: &Record) -> blaze_memo::Fact {
+    let id = blaze_ids::Hasher::new("hir-ty-codegen kept roots slot").id(&krate_id).finish();
+    blaze_memo::Fact { id, digest: record.key }
+}
+
+/// Has finding the kept roots of each crate of `entries` (crates of `edit`'s last commit) read
+/// its record from the snapshot `edit` commits, given in the crate's own slot ([`KeptSlot`])
+/// with the fact it is read by ([`kept_fact`]). Called by the driver in its edit of the world;
+/// how many crates were given (a record equal to the one held gives nothing).
+pub fn give(
+    edit: &mut base_db::Edit<'_>,
+    entries: impl IntoIterator<Item = (Crate, blaze_memo::Fact, Record)>,
+) -> usize {
+    hir_def::deps::given::give_each::<KeptSlot, Record>(edit, entries)
 }
 
 /// The record `krate` was given, when it is the record of the image the crate is read from
@@ -90,7 +80,7 @@ pub fn set(db: &mut Db, maps: HashMap<Crate, Record, Global>) {
 /// went, or was not read in [`Mode::Serve`], finds its kept roots from source.
 fn record(db: &Db, krate: Crate) -> Option<&Record> {
     let record = krate.given::<KeptSlot, Record>(db)?;
-    let image = hir_def::deps::image_of(db, krate).as_ref()?;
+    let image = hir_def::deps::image_of(db, krate)?;
     (image.mode() == Mode::Serve && kept_key(image.key()) == record.key).then_some(record)
 }
 
@@ -110,8 +100,11 @@ pub struct Listed {
 /// found from source in its place.
 pub(super) fn served(db: &Db, krate: Crate) -> Option<Listed> {
     let record = record(db, krate)?;
-    // The value is the record's, found by content: told to the engine.
-    blaze_query::db::report_stored_read(db);
+    // The value is the record's, found by content: its key is the fact read.
+    blaze_memo::read(
+        blaze_memo::Database::memo(db),
+        blaze_memo::Fact { id: record.key, digest: record.key },
+    );
     match decode(db, krate, record.bytes.bytes()) {
         Ok(listed) => Some(listed),
         Err(why) => {
@@ -218,66 +211,44 @@ pub fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<Listed> {
     Ok(Listed { functions, statics, owners })
 }
 
-/// Gives `db` the kept-roots record `images` keeps of each crate `served` keyed that is read
-/// from its image in [`Mode::Serve`], and takes away that of a crate `served` keyed that is
-/// not (its image went, or its record was never written): called in the write of the serve,
-/// beside the impl tables', so the build that lists a served crate's roots lowers only the
-/// bodies its record names. A crate `served` did not key is left as it is. Gives the crates
-/// whose records came or went, sorted; nothing is written for none.
+/// The kept-roots record `images` keeps of each crate of `given` (a crate and the image the
+/// driver gives it in the snapshot it builds) that is read from its image in [`Mode::Serve`]:
+/// what the driver gives with [`give`] in the same snapshot, beside the impl tables, so the
+/// build that lists a served crate's roots lowers only the bodies its record names. A crate
+/// with no record is left out: its slot is empty in that snapshot. In `given`'s order, which
+/// is the order the store is asked in.
 ///
 /// A crate with an image and no record in the store finds its kept roots from source, by
 /// the bodies whose text can say one, and [`store`] then writes the record. A record that is
-/// found and does not read stops the query that reads it, naming the crate.
-pub fn serve(
-    db: &mut Db,
-    served: &Served,
+/// found and does not read stops the query that reads it, naming the crate. `db` names the
+/// crates in an error.
+pub fn find<'a>(
+    db: &Db,
+    given: impl IntoIterator<Item = (Crate, &'a Image)>,
     // dyn: the driver's store, one call per crate per serve
     images: &dyn ImageStore,
     mode: Mode,
-) -> R<Vec<Crate>> {
-    // clone: what was served before, once per serve, to add to
-    let mut maps =
-        FrozenKept::try_get(&*db).map(|it| (**it.maps(&*db)).clone()).unwrap_or_default();
-    // In the crates' order: the store is asked in the same order by every database.
-    let mut asked: Vec<Crate> = served.keys.keys().copied().collect(); // alloc: once per serve
-    asked.sort_unstable();
-    let mut changed = Vec::new(); // alloc: none until a crate's record changes
-    for krate in asked {
-        // clone: two buffer handles and a few words, once per crate asked
-        let image = DepImages::try_get(&*db).and_then(|it| it.images(&*db).get(&krate).cloned());
-        let found = match image {
-            Some(image) if mode == Mode::Serve && image.mode() == Mode::Serve => {
-                let at = kept_key(image.key());
-                let bytes = images.get(&at).map_err(|why| {
-                    // alloc: error text
-                    format!("reading the kept roots of crate {} (key {at:?}): {why}", krate.named(&*db))
-                })?;
-                bytes.map(|bytes| Record { key: at, bytes })
-            }
-            _ => None,
-        };
-        if maps.get(&krate) == found.as_ref() {
+) -> R<Vec<(Crate, Record)>> {
+    let mut found = Vec::new_in(Global);
+    for (krate, image) in given {
+        if mode != Mode::Serve || image.mode() != Mode::Serve {
             continue;
         }
-        changed.push(krate);
-        match found {
-            Some(it) => {
-                maps.insert(krate, it);
-            }
-            None => {
-                maps.remove(&krate);
-            }
+        let at = kept_key(image.key());
+        let bytes = images.get(&at).map_err(|why| {
+            // alloc: error text
+            format!("reading the kept roots of crate {} (key {at:?}): {why}", krate.named(db))
+        })?;
+        if let Some(bytes) = bytes {
+            found.push((krate, Record { key: at, bytes }));
         }
     }
-    if !changed.is_empty() {
-        set(db, maps);
-    }
-    Ok(changed)
+    Ok(found)
 }
 
 /// Writes to `images` the kept-roots record of each of `crates`, a crate with the key its
 /// image is filed under, that is not read from its record already: what the next database's
-/// [`serve`] finds. Called once the crates are resolved, where their impl tables are written.
+/// [`find`] finds. Called once the crates are resolved, where their impl tables are written.
 /// Gives the crates whose record does not encode, with why: such a crate has none in the
 /// store and finds its kept roots from source in every database, which the caller says.
 pub fn store(

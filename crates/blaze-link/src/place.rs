@@ -311,6 +311,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         LazyEntry(_) => 27,
         StaticList(..) => 28,
         Thunk(..) => 29,
+        Text(_) => 30,
     };
     let seven = |bytes: &[u8]| {
         let mut out = [0u8; 8];
@@ -331,7 +332,8 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         | Position(id, _)
         | Coverage(id, _)
         | CoveragePcs(id)
-        | LazyEntry(id) => seven(&symbols.content(id).0),
+        | LazyEntry(id)
+        | Text(id) => seven(&symbols.content(id).0),
         Local(obj, _) | Section(obj, _) | Frame(obj, ..) => seven(&symbols.content(obj.native).0),
         Name(name) | FileName(name) | IatEnd(name) | Common(name) => {
             seven(symbols.str(name).as_bytes())

@@ -12,14 +12,14 @@
 //! [`tt::TopSubtreeBuilder`] calls that built it, so the encoding inside a [`tt::TopSubtree`],
 //! which its `==` compares, comes out the same.
 
-use std::mem::offset_of;
+use std::{alloc::Global, mem::offset_of};
 
 use blaze_format::{FormatError, Part, Persist, Record, Slice, Writer};
 use hir_expand::{
     ExpandTo,
     attrs::{Attr, AttrInput},
 };
-use span::{ErasedFileAstId, FileAstId, Span};
+use span::{ErasedFileAstId, FileAstId, Span, SyntaxContext};
 
 use super::{
     AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, FieldsShape, Function, IdRange,
@@ -27,12 +27,18 @@ use super::{
     ModItemId, NameId, PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias,
     Union, Use, UseTree, UseTreeId, VisibilityExplicitness,
 };
-use crate::hir::persist::{Code, Column, Read, Words, WordsRec, syntax_context};
+use crate::hir::persist::{Code, Column, Read, Words, WordsRec};
 
 blaze_format::record! {
-    /// A [`MacroCall`] as a record: its context and its expansion kind as words.
+    /// A [`MacroCall`] as a record: its context as a row of the tree's own table of contexts
+    /// (`Root::contexts_at`), and its expansion kind as a word.
+    ///
+    /// Never the context's word: that is crate-local and follows interning order (port
+    /// decision 3). The table holds each context through [`Code`], so a filed tree (written
+    /// in a `relocating` scope) holds each by structure in its record's relocation table, and
+    /// reading it back interns each into the reading crate's arena.
     #[derive(Clone, Copy, Debug)]
-    struct MacroCallRec: 1 {
+    struct MacroCallRec: 2 {
         path: PathId,
         ctxt: u32,
         expand_to: u32,
@@ -42,7 +48,7 @@ blaze_format::record! {
 blaze_format::record! {
     /// An item tree's columns, and where in its words each of its tables starts.
     #[derive(Clone, Copy)]
-    pub(crate) struct Root: 2 {
+    pub(crate) struct Root: 3 {
         top_level: Slice<ModItemId>,
         kinds: Slice<u8>,
         data: Slice<u32>,
@@ -74,6 +80,8 @@ blaze_format::record! {
         vis_at: u32,
         attrs_at: u32,
         cfgs_at: u32,
+        /// The contexts of the macro calls, each once, in the order a call first names it.
+        contexts_at: u32,
     }
 }
 
@@ -160,6 +168,15 @@ impl<'a> ItemTreeRef<'a> {
         let mut vis = words.from(root.vis_at);
         let mut attrs = words.from(root.attrs_at);
         let mut cfgs = words.from(root.cfgs_at);
+        let mut context_rows = words.from(root.contexts_at);
+        let contexts_len = context_rows.len()?;
+        // The thread's scratch: a decode allocates its tree's block and its paths, nothing for
+        // the table it reads the calls' contexts through (warm after the thread's first).
+        let mut contexts = blaze_mem::scratch::lend_u32s();
+        contexts.reserve(contexts_len.min(buffer.len()));
+        for _ in 0..contexts_len {
+            contexts.push(context_rows.get::<SyntaxContext>()?.into_u32());
+        }
         let lens = ItemTreeLens {
             top_level: self.top_level.len(),
             kinds: self.kinds.len(),
@@ -217,8 +234,9 @@ impl<'a> ItemTreeRef<'a> {
             for call in macro_calls {
                 let expand_to = expand_to_of(call.expand_to)
                     .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
-                let ctxt = syntax_context(call.ctxt)
-                    .ok_or_else(|| invalid("a syntax context of u32::MAX"))?;
+                let ctxt = (contexts.get(call.ctxt as usize))
+                    .map(|&it| SyntaxContext::from_u32(it))
+                    .ok_or_else(|| invalid("a macro call's context past the tree's contexts"))?;
                 s.macro_calls.push(MacroCall { path: call.path, ctxt, expand_to });
             }
             s.macro_rules.extend_from_slice(macro_rules);
@@ -386,7 +404,8 @@ impl Persist for ItemTree {
         Part::Str("ItemTree"),
         // 5: a keyed name and a path's segment contexts (`ModPath::contexts`) are written.
         // 6: a `pub(in path)` or `pub(super)` visibility's context (`RawVisibility::Module`).
-        Part::U64(6),
+        // 7: a macro call's context is a row of the tree's own table, never its word.
+        Part::U64(7),
         Part::Schema(<Root as Record>::SCHEMA),
     ]);
     type Ref<'a> = ItemTreeRef<'a>;
@@ -403,18 +422,28 @@ impl Persist for ItemTree {
         w.seq(self.attr_list().iter());
         let cfgs_at = w.at();
         w.seq(self.cfgs().iter());
+        // Each call's context as a row of the tree's own table, each context once.
+        let mut contexts = Vec::new_in(Global);
+        let mut rows = blaze_hash::HashMap::new_in(Global);
+        let mut macro_calls = Vec::with_capacity_in(self.macro_calls().len(), Global);
+        for call in self.macro_calls() {
+            let ctxt = *rows.entry(call.ctxt).or_insert_with(|| {
+                contexts.push(call.ctxt);
+                u32::try_from(contexts.len() - 1).expect("a tree's contexts are fewer than its calls")
+            });
+            macro_calls.push(MacroCallRec {
+                path: call.path,
+                ctxt,
+                expand_to: expand_to_word(call.expand_to),
+            });
+        }
+        let contexts_at = w.at();
+        w.seq(contexts.iter());
 
         // alloc: once a store write, the edge
         let kinds: Vec<u8> = self.kinds().iter().map(|&kind| kind as u8).collect();
         // alloc: once a store write, the edge
         let ast_ids: Vec<u32> = self.ast_ids().iter().map(|id| id.erase().into_raw()).collect();
-        let macro_calls: Vec<MacroCallRec> = (self.macro_calls().iter())
-            .map(|call| MacroCallRec {
-                path: call.path,
-                ctxt: call.ctxt.into_u32(),
-                expand_to: expand_to_word(call.expand_to),
-            })
-            .collect(); // alloc: once a store write, the edge
 
         let placed = w.place(out);
         let top_level = Column::push(out, self.top_level());
@@ -477,6 +506,7 @@ impl Persist for ItemTree {
             vis_at,
             attrs_at,
             cfgs_at,
+            contexts_at,
         };
         let written = out.push(&root);
         debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
@@ -1318,5 +1348,120 @@ use a::{b, c};
             let ctxt = SyntaxContext::root(edition);
             round_trip(&RawVisibility::Module(path, VisibilityExplicitness::Explicit, ctxt));
         }
+    }
+
+    /// `outer!` expands to a call of `inner!` whose context is `outer!`'s mark, not a root;
+    /// `other!` expands to an item, and interns contexts of its own when expanded first.
+    /// `first`, collected before the root's calls, is empty here. `/main.rs` is the same text
+    /// as [`MARKED_AFTER_EXTRA`]'s: a filed table names the files its ids are in (here the
+    /// root, where `outer!()` is) with their content, and is refused by a database where one
+    /// of them has other text (`Dec::new_checked`), so the two crates differ in `/first.rs`
+    /// alone, which no id of `outer!`'s context names.
+    const MARKED: &str = r#"
+//- /main.rs crate:main
+macro_rules! inner { () => {} }
+macro_rules! outer { () => { inner!(); } }
+macro_rules! other { () => { struct Other; } }
+macro_rules! extra { () => { other!(); } }
+mod first;
+other!();
+outer!();
+//- /first.rs
+"#;
+
+    /// [`MARKED`] read by a crate that first expands `extra!` (in `first`, collected before
+    /// the root's calls), whose expansion calls `other!` under `extra!`'s mark: that mark takes
+    /// the arena's first marked slot, so `outer!`'s mark takes another index than in
+    /// [`MARKED`]'s crate. `extra!`'s tree is `first`'s, and calls `other`, never `inner`, so
+    /// exactly one tree of the root module is `outer!`'s.
+    const MARKED_AFTER_EXTRA: &str = r#"
+//- /main.rs crate:main
+macro_rules! inner { () => {} }
+macro_rules! outer { () => { inner!(); } }
+macro_rules! other { () => { struct Other; } }
+macro_rules! extra { () => { other!(); } }
+mod first;
+other!();
+outer!();
+//- /first.rs
+extra!();
+"#;
+
+    /// The calls of the test crate's root module, each with the tree of its expansion.
+    fn expansions(
+        db: &crate::test_db::TestDB,
+    ) -> Vec<(hir_expand::MacroCallId, &ItemTree), Global> {
+        let krate = fixture::test_crate(db);
+        let def_map = crate::nameres::crate_def_map(db, krate);
+        let scope = def_map.module(db, def_map.root_module_id()).scope(db);
+        (scope.iter_macro_invoc())
+            .map(|(_, &call)| (call, crate::file_item_tree(db, call.into(), krate)))
+            .collect()
+    }
+
+    /// The tree of `outer!`'s expansion: the one whose macro call has a context that is no
+    /// root.
+    fn marked(db: &crate::test_db::TestDB) -> &ItemTree {
+        let trees = expansions(db);
+        let mut marked = (trees.into_iter())
+            .map(|(_, tree)| tree)
+            .filter(|tree| tree.macro_calls().iter().any(|call| !call.ctxt.is_root()));
+        let tree = marked.next().expect("`outer!`'s expansion calls `inner!` under its mark");
+        assert!(marked.next().is_none(), "only `outer!` writes a call");
+        tree
+    }
+
+    /// The invariant: a filed tree (written in a `relocating` scope, its table by structure
+    /// through `deps::signatures::table`) holds no context's word, so read into a fresh
+    /// database whose crate interned its contexts in another order it is that database's own
+    /// tree of the same expansion: the call's context equal in structure (its mark and its
+    /// chain), its index another. The control: the two databases' words for that context
+    /// differ, so a raw word written would have named another context.
+    #[test]
+    fn a_marked_call_context_is_read_into_a_fresh_arena_by_structure() {
+        use crate::hir::persist::{Relocation, relocating};
+        use crate::deps::signatures::table;
+
+        let written_db = fixture::db(MARKED).into_db();
+        let krate = fixture::test_crate(&written_db);
+        let tree = marked(&written_db);
+        let mut written_table = Relocation::new();
+        let bytes = relocating(&mut written_table, || blaze_format::to_bytes(tree));
+        assert!(!written_table.is_empty(), "the call's context is named by the table");
+        let table_bytes = table::encode(&written_db, krate, &written_table).expect("encoded");
+
+        // A fresh database that marks `extra!`'s expansion before `outer!`'s: its contexts
+        // take other indices.
+        let read_db = fixture::db(MARKED_AFTER_EXTRA).into_db();
+        let read_krate = fixture::test_crate(&read_db);
+        let trees = expansions(&read_db);
+        let mut read_table = table::decode(&read_db, read_krate, &table_bytes).expect("decoded");
+        let buffer = blaze_format::Aligned::copy_from(&bytes);
+        let read = relocating(&mut read_table, || ItemTree::read(&buffer)?.decode())
+            .expect("a filed tree reads back");
+        // Equal trees hold equal call paths and equal context words: the one live tree equal
+        // to the filed one calls `inner` (so it is `outer!`'s) under this arena's word for
+        // `outer!`'s mark.
+        let equal = trees.iter().filter(|(_, live)| **live == read).count();
+        assert_eq!(equal, 1, "the filed tree is the reading database's own tree of `outer!`");
+
+        let context = |tree: &ItemTree| {
+            let call = tree.macro_calls().iter().find(|it| !it.ctxt.is_root()).unwrap();
+            call.ctxt
+        };
+        let (written, got) = (context(tree), context(&read));
+        let arena = |krate: base_db::Crate| blaze_memo::Id::gid(krate).arena();
+        let (written_arena, read_arena) = (arena(krate), arena(read_krate));
+        assert_eq!(written.edition(), got.edition());
+        assert_eq!(
+            written.outer_transparency(&written_db, written_arena),
+            got.outer_transparency(&read_db, read_arena),
+        );
+        assert_eq!(
+            written.marks_rev(&written_db, written_arena).count(),
+            got.marks_rev(&read_db, read_arena).count(),
+            "the chain has as many marks"
+        );
+        assert_ne!(written.into_u32(), got.into_u32(), "the control: the words differ");
     }
 }

@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 blaze-hash.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 serde_json.workspace = true
 
 rustc_abi.workspace = true

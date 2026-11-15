@@ -19,7 +19,7 @@ use base_db::Db;
 use blaze_codegen::backend::FrontRef;
 use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
-use blaze_query::db::AsId;
+use blaze_memo::Id as _;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
 use hashbrown::{HashTable, hash_table::Entry};
 use hir_def::{
@@ -249,7 +249,7 @@ fn memo<'db>(
     match walked {
         Ok(walked) => Ok(Some(walked)),
         // alloc: the error's message
-        Err(what) => Err(blaze_query::db::attach(db, || {
+        Err(what) => Err(blaze_memo::attach(db, || {
             format!("the references of {}: {what}", super::Named(db, instance))
         })),
     }
@@ -257,7 +257,7 @@ fn memo<'db>(
 
 // Nothing in its arguments is ever collected (the query database frees no interned value),
 // so they stay interned and are never verified.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn code_walk<'db>(
     db: &'db Db,
     instance: Instance,
@@ -271,7 +271,7 @@ fn code_walk<'db>(
 /// `lang_start`'s walk: the library's body, whose `#[inline(always)]` callees of other crates
 /// (`main`'s return type's `Termination::report`) a unit builds in under its own settings, so
 /// it is walked under each of them as any instance is ([`Walking::builds`]).
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn start_walk(db: &Db, main: FunctionId, inlined: bool) -> Result<Walked, String> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
     scratch(db, env, &Walking::plain(inlined).builds(), |walk| walk.start_shim(main))
@@ -837,7 +837,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         for callee in &body.inlined.callees {
             let def = match callee.body {
                 InlinedBody::Fn(func) => InstanceDef::Fn(func),
-                InlinedBody::Closure(closure) => InstanceDef::Closure(closure.as_id()),
+                InlinedBody::Closure(closure) => InstanceDef::Closure(closure.gid()),
             };
             let at = self.call_place(def, callee.args.as_ref())?;
             if !matches!(self.found.listed.refs[at as usize], FrontRef::Function(_)) {
@@ -1842,7 +1842,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     _ => unreachable!(),
                 };
                 let parent_args = GenericArgs::new_from_slice(parent_args);
-                let def = InstanceDef::Closure(id.as_id());
+                let def = InstanceDef::Closure(id.gid());
                 let body = self.fx.body_types(def, parent_args).map_err(told)?;
                 if body.params.len() != arg_tys.len() + 1 {
                     // alloc: the error's message

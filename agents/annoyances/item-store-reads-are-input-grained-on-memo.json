@@ -1,0 +1,14 @@
+{
+ "id": "item-store-reads-are-input-grained-on-memo",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), port lane L6 ty-store, front-end-on-memo",
+ "where": "crates/hir-ty/src/body_store.rs Store::offered; crates/hir-ty/src/body_store/facts.rs BodyFacts::fact_of; crates/blaze-item-hash/src/lib.rs Bodies",
+ "what": "The item store keys a step by item-grained facts (an impl table, a layout, a name's resolution), which the old engine gave by classifying each read by its query's name. blaze-memo's recorder lists only facts: input getters' (a file's whole text, a crate slot) and explicit `blaze_memo::read`s. A tracked query is no fact, so a read of `layout_of`, `infer_body_query` or an impl table leaves nothing named in the list, and a file-text fact changes on every comment. The spec names the source (`record`) but not how a memo fact becomes a `FactRef`; lane item-hash deleted `classify` with no replacement, the goal store assumed `GoalFacts::fact_of`, and the body store's own tests classify by query name.",
+ "cost": "the body store's offer, its test facts (body_store/tests.rs, entries/tests.rs) and lane L7's consteval test impl could not be finished in one pass; the trait was given a required `fact_of` that nobody implements yet",
+ "cause": "the port spec moved the read-list source without deciding the grain of the facts the stores key on",
+ "class": "a consumer of read lists whose keys need a finer grain than the producer's facts",
+ "prevention": "each item-grained fact the stores key on (blaze_items' Fact kinds) is noted by the accessor that reads it, `blaze_memo::read(memo, Fact { id: FactRef's key, digest: its value })`, behind `#[input(parts)]` getters that note none; then `fact_of` is the inverse of that id, one table",
+ "workaround": "none needed after port decision 2",
+ "fix": "port decision 2 (2026-11-13): fact-boundary query kinds (`Builder::mark_boundary`) appear as `Read::Query { kind, key }` rows, every other query flattened; `BodyFacts::fact_of(db, def, step, blaze_memo::Read) -> Classified` maps a boundary row to its FactRef (lane item-hash), and a hit lists its stored answer as a `Read::Input` of the body store's own `STORED_ANSWER` kind",
+ "state": "fixed in design; the boundary table (L9b) and the `Read`/`KindId` re-exports (L1) are owed"
+}

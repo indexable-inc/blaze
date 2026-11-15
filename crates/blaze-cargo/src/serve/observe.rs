@@ -30,7 +30,7 @@ use std::{
 use blaze_api::{ApiError, LiveFrame, Reply, RequestRef, Response};
 use blaze_core::Conn;
 use blaze_profile::{
-    facts::{CrateDepRow, KeyPart, KeyedMiss, LinkRow, ProvenanceRow, QueryCountRow, RunOutcome},
+    facts::{CrateDepRow, KeyPart, KeyedMiss, LinkRow, QueryCountRow},
     history::{self, BuildRow, History, OWNER},
     live::{self, Feed, Frame},
 };
@@ -432,9 +432,6 @@ pub struct Ended {
     pub misses: Vec<blaze_kernel::Miss>,
     /// The tests its runs finished, one row each.
     pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
-    /// Its front end's run log: each memo that ran again and why, each untracked read by name
-    /// ([`provenance_rows`]).
-    pub provenance: Vec<ProvenanceRow>,
 }
 
 /// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends, and
@@ -455,10 +452,6 @@ enum ToHistory {
     /// One that never comes (a daemon that stops first) leaves the rows to the thread's last
     /// flush, which writes them all the same.
     Answered(u64),
-    /// The run log of a build that ended with its front end kept, named after its answer by
-    /// the task that stored the front end ([`super::work::Steps::kept_run_log`]): its
-    /// `provenance` rows, written by the flush this asks for.
-    Ran(Vec<ProvenanceRow>),
     /// The errors builds said ([`super::job::Jobs::errors`]), as the history's `errors` rows:
     /// noted for the next flush, which a build's own is as its answer is told
     /// ([`ToHistory::Answered`], sent after these), never flushed for themselves: a build's
@@ -517,7 +510,6 @@ struct Noted {
     links: Vec<LinkRow>,
     crate_deps: Vec<CrateDepRow>,
     query_counts: Vec<QueryCountRow>,
-    provenance: Vec<ProvenanceRow>,
     keyed: Vec<KeyedMiss>,
     misses: Vec<blaze_profile::facts::MissRow>,
     test_runs: Vec<blaze_profile::facts::TestRunRow>,
@@ -535,7 +527,6 @@ impl Noted {
             links,
             crate_deps,
             query_counts,
-            provenance,
             keyed,
             misses,
             test_runs,
@@ -546,7 +537,6 @@ impl Noted {
         history.linked(links);
         history.crate_graph(crate_deps);
         history.query_counted(query_counts);
-        history.ran(provenance);
         history.keyed(keyed);
         history.missed(misses);
         history.tests_ran(test_runs);
@@ -636,60 +626,6 @@ fn say_account(account: &blaze_profile::account::Account) {
     }
 }
 
-/// A front end's run log, as `build`'s `provenance` rows: each memo that ran again and its
-/// cause, each untracked read by name. Taken with its database: by the task that stores the
-/// build's kept front end, after its answer ([`super::work::Steps::kept_run_log`]), or on the
-/// loop as the build ends when its front end is not kept ([`super::work::Writer::run_log`]);
-/// sorted by the engine, so the rows are the same each time.
-pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<ProvenanceRow> {
-    let blaze_query::db::Taken { rows, dropped, sampled } = taken;
-    if dropped > 0 {
-        // Never silent (rule 3): the counts in `query_counts` still hold every run.
-        tracing::warn!(
-            target: "blaze",
-            build,
-            dropped,
-            sampled,
-            "the query engine's run log kept build {build}'s first {} runs whole and one in {} of the next {sampled} as a sample (`provenance.weight`); {} more are in `query_counts` alone",
-            blaze_query::db::LOG_MOST,
-            blaze_query::db::SAMPLE_EVERY,
-            dropped - sampled,
-        );
-    }
-    // alloc: once a build, a row a memo that ran again
-    rows.into_iter().map(|run| provenance_row(build, run)).collect()
-}
-
-fn provenance_row(build_id: u64, run: blaze_query::db::LoggedRun) -> ProvenanceRow {
-    use blaze_query::db::{Cause, Logged};
-    let blaze_query::db::LoggedRun { query, key, view, why, read, read_kind, weight } = run;
-    let (outcome, cause, what) = match why {
-        Logged::Ran(cause) => {
-            let name = match cause {
-                Cause::Changed(_) => "changed",
-                Cause::New => "new",
-                Cause::Evicted => "evicted",
-                Cause::Untracked => "untracked",
-                Cause::Cycle => "cycle",
-            };
-            (RunOutcome::Ran, Some(name), None)
-        }
-        Logged::UntrackedRead(what) => (RunOutcome::UntrackedRead, None, Some(what)),
-    };
-    ProvenanceRow {
-        build_id,
-        query_key: key,
-        kind: query,
-        outcome,
-        cause,
-        view,
-        cause_key: read,
-        cause_kind: read_kind,
-        what,
-        weight,
-    }
-}
-
 /// The parts of the key of each thing `build` computed again, one record a miss (a `key_parts`
 /// row a part, made only as the history writes them): what two builds' keys are diffed by,
 /// across homes too.
@@ -715,87 +651,47 @@ fn key_parts(build_id: u64, misses: &[blaze_kernel::Miss]) -> Vec<KeyedMiss> {
     misses.iter().map(keyed).collect()
 }
 
-/// What the query engine counted since the last take, as `build`'s `query_counts` rows: the
-/// front end's, by ingredient, and the daemon's own database's (`plan`, `std units`, the
-/// load's queries, by `Query::NAME`). Taken on the loop as the build ends, so the next build's
-/// runs are its own.
+/// What the daemon's own database counted since the last take, as `build`'s `query_counts`
+/// rows (`plan`, `std units`, the load's queries, by `Query::NAME`). Taken on the loop as the
+/// build ends, so the next build's runs are its own. The front end on the memo gives no rows
+/// here: its counts are per thread and not per query ([`blaze_memo::take_counts`]), and
+/// nothing merges the workers' yet.
 fn query_counts(build: u64, plan: Option<&blaze_query::Database>) -> Vec<QueryCountRow> {
     // alloc: once a build, a row a query function that did anything
     let mut rows = Vec::new();
-    blaze_query::db::take_counts(|query, counts| rows.push(query_count_row(build, query, counts)));
     if let Some(plan) = plan {
         plan.take_counts(|query, counts| rows.push(query_count_row(build, query, counts)));
     }
     rows
 }
 
+/// A row of the plan database's counts. The columns the old tracked engine filled and this
+/// one does not count (`reran`, `evicted`, `dropped`, the reads, `written`, the untracked and
+/// cycle runs, the validity census) stay in the schema and are 0.
 fn query_count_row(
     build_id: u64,
     query: &'static str,
-    counts: blaze_query::db::Counts,
+    counts: blaze_query::KindCounts,
 ) -> QueryCountRow {
-    let blaze_query::db::Counts {
-        executed,
-        verified,
-        reran,
-        evicted_asked,
-        evicted,
-        dropped,
-        reads_recorded,
-        reads_kept,
-        reads_most,
-        written,
-        ran_new,
-        ran_changed,
-        ran_untracked,
-        ran_cycle,
-        validity,
-    } = counts;
-    let blaze_query::db::Validity {
-        proved_seal,
-        proved_durability,
-        proved_summary,
-        proved_floor_durability,
-        proved_floor_summary,
-        proved_walk_end,
-        proved_reach,
-        proved_first,
-        edge_walked,
-        edge_gave_up,
-        edge_claimed,
-        edges_compared,
-    } = validity;
+    let blaze_query::KindCounts { executed, verified, evicted_asked, ran_new, ran_changed } = counts;
     QueryCountRow {
         build_id,
         query,
         executed,
         verified,
-        reran,
+        reran: 0,
         evicted_asked,
-        evicted,
-        dropped,
-        reads_recorded,
-        reads_kept,
-        reads_most,
-        written,
+        evicted: 0,
+        dropped: 0,
+        reads_recorded: 0,
+        reads_kept: 0,
+        reads_most: 0,
+        written: 0,
         ran_new,
         ran_changed,
-        ran_untracked,
-        ran_cycle,
-        validity: blaze_profile::facts::Validity {
-            proved_seal,
-            proved_durability,
-            proved_summary,
-            proved_floor_durability,
-            proved_floor_summary,
-            proved_walk_end,
-            proved_reach,
-            proved_first,
-            edge_walked,
-            edge_gave_up,
-            edge_claimed,
-            edges_compared,
-        },
+        ran_untracked: 0,
+        ran_cycle: 0,
+        validity: blaze_profile::facts::Validity::default(),
     }
 }
 
@@ -952,9 +848,6 @@ pub fn keep_history(
         .map_err(|error| {
             format!("starting the profile history's thread (`blaze-history`): {error}")
         })?; // alloc: error path
-    // A daemon that keeps a history logs why each memo ran again, for its `provenance` rows
-    // ([`provenance_rows`]); one that keeps none counts alone.
-    blaze_query::db::log_runs(true);
     Ok((
         Profiling { dir, duckdb, pinned_duckdb, opened: Some(opened), ended, failed, told, doing },
         Keeper(thread),
@@ -1478,11 +1371,6 @@ fn take(
             // disk a flush writes and syncs ([`Held`], [`STARTED_FLUSH_AFTER`]).
             batch.started = true;
         }
-        Ok(ToHistory::Ran(rows)) => {
-            doing.set(Step::Flushing, rows.first().map_or(0, |it| it.build_id));
-            history.ran(rows);
-            batch.flush(None);
-        }
         Ok(ToHistory::Errored(rows)) => history.errored(rows),
         #[cfg(test)]
         Ok(ToHistory::Planted(what)) => panic!("{what}"),
@@ -1509,7 +1397,7 @@ fn take(
             }
         }
         Ok(ToHistory::Ended(Finished {
-            ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
+            ended: Ended { mut row, links, crate_deps, misses, test_runs },
             query_counts,
             slots,
         })) => {
@@ -1585,7 +1473,6 @@ fn take(
                 links,
                 crate_deps,
                 query_counts,
-                provenance,
                 keyed,
                 misses,
                 test_runs,
@@ -1864,17 +1751,6 @@ impl Observe {
         if profiling.ended.send(ToHistory::Errored(rows)).is_err() {
             self.history_error = Some(
                 "the profile history's thread (`blaze-history`) is gone: no build's errors are written"
-                    .to_owned(),
-            ); // alloc: error path
-        }
-    }
-
-    /// (`Jobs::ran`): written by the history's thread; dropped by a daemon that keeps none.
-    pub fn ran(&mut self, rows: Vec<ProvenanceRow>) {
-        let Some(profiling) = &self.profiling else { return };
-        if profiling.ended.send(ToHistory::Ran(rows)).is_err() {
-            self.history_error = Some(
-                "the profile history's thread (`blaze-history`) is gone: no build is written"
                     .to_owned(),
             ); // alloc: error path
         }
@@ -2472,37 +2348,14 @@ mod tests {
         // A ring of the test's own: the process's is a sampler's wherever one runs.
         static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
         let history = History::open(dir.path(), history::CAP_MOST, &UNSAMPLED).unwrap();
-        let counts = blaze_query::db::Counts {
+        let counts = blaze_query::KindCounts {
             executed: 6384,
             verified: 1,
-            reran: 2,
             evicted_asked: 3,
-            evicted: 4,
-            dropped: 5,
-            reads_recorded: 6,
-            reads_kept: 7,
-            reads_most: 8,
-            written: 9,
             ran_new: 10,
             ran_changed: 11,
-            ran_untracked: 12,
-            ran_cycle: 13,
-            validity: blaze_query::db::Validity {
-                proved_seal: 14,
-                proved_durability: 15,
-                proved_summary: 16,
-                proved_floor_durability: 17,
-                proved_floor_summary: 18,
-                proved_walk_end: 19,
-                proved_reach: 20,
-                proved_first: 21,
-                edge_walked: 22,
-                edge_gave_up: 23,
-                edge_claimed: 24,
-                edges_compared: 25,
-            },
         };
-        let row = query_count_row(71, "mir_body_query", counts);
+        let row = query_count_row(71, "plan", counts);
         assert_eq!(
             [
                 row.executed,
@@ -2520,40 +2373,10 @@ mod tests {
                 row.ran_untracked,
                 row.ran_cycle
             ],
-            [6384, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            [6384, 1, 0, 3, 0, 0, 0, 0, 0, 0, 10, 11, 0, 0],
+            "each count under its own name, and the columns nothing counts 0"
         );
-        let blaze_profile::facts::Validity {
-            proved_seal,
-            proved_durability,
-            proved_summary,
-            proved_floor_durability,
-            proved_floor_summary,
-            proved_walk_end,
-            proved_reach,
-            proved_first,
-            edge_walked,
-            edge_gave_up,
-            edge_claimed,
-            edges_compared,
-        } = row.validity;
-        assert_eq!(
-            [
-                proved_seal,
-                proved_durability,
-                proved_summary,
-                proved_floor_durability,
-                proved_floor_summary,
-                proved_walk_end,
-                proved_reach,
-                proved_first,
-                edge_walked,
-                edge_gave_up,
-                edge_claimed,
-                edges_compared,
-            ],
-            [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
-            "each count of the validity census under its own name"
-        );
+        assert_eq!(row.validity, blaze_profile::facts::Validity::default());
         let ended = Ended {
             row: BuildRow {
                 build_id: 71,
@@ -2576,7 +2399,6 @@ mod tests {
             crate_deps: Vec::new(),
             misses: Vec::new(),
             test_runs: Vec::new(),
-            provenance: Vec::new(),
         };
         let (to, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
@@ -2885,7 +2707,6 @@ mod tests {
             crate_deps: Vec::new(),
             misses: Vec::new(),
             test_runs: Vec::new(),
-            provenance: Vec::new(),
         }
     }
 

@@ -1165,6 +1165,9 @@ pub struct Store {
     failures: u32,
     /// What it publishes for readers and writers.
     shared: Arc<Shared>,
+    /// Its packs' mappings, shared by every direct reader of it ([`direct::Maps`]): a pack is
+    /// mapped once a process, not once a reading thread.
+    direct_maps: Arc<direct::Maps>,
     /// Its buffer pool, and which of its files are open in it ([`hot`]).
     hot: hot::Hot,
     /// Its own writer (segment 0): its puts, and the records a settle moves.
@@ -1358,6 +1361,8 @@ pub struct Store {
 #[derive(Clone)]
 pub struct Reader {
     shared: Arc<Shared>,
+    /// The store's packs' mappings, shared by its direct readers ([`direct::Maps`]).
+    maps: Arc<direct::Maps>,
 }
 
 impl Reader {
@@ -2674,6 +2679,8 @@ impl Store {
             broken: None,
             failures: 0,
             shared,
+            // Once a store: the table its direct readers share.
+            direct_maps: Arc::new_in(direct::Maps::default(), Global),
             hot,
             own,
             drains,
@@ -2836,7 +2843,7 @@ impl Store {
     /// A reader of it for any thread: what it reads is valid while the task it reads in runs.
     pub fn reader(&self) -> Reader {
         // clone: one `Arc` per reader made, once per thread that reads; its gets clone nothing
-        Reader { shared: self.shared.clone() }
+        Reader { shared: self.shared.clone(), maps: Arc::clone(&self.direct_maps) }
     }
 
     /// A writer of it for one worker: its puts go into a segment of its own, read at once by
@@ -7984,10 +7991,14 @@ impl Store {
                         .iter()
                         .position(|(it, _)| *it == at)
                         .expect("a pack the commit truncated it writes");
-                    // Written from the pool's pages its append put the bytes into, around the
-                    // page cache: `committed` and the end are block ends (each commit pads its
-                    // packs), and the pages are the write's buffer, pinned by the append until
-                    // the commit ends.
+                    // Written from the pool's pages its append put the bytes into, through the
+                    // page cache: it is the one read cache (store-pool.md, "Superseded for the
+                    // read path"), and the records a build put are the ones its next build and
+                    // the front end's direct reads ask first (`direct`'s docs, "Records beside
+                    // each other"); written around it, each was a device read after the commit.
+                    // `committed` and the end are block ends (each commit pads its packs), and
+                    // the pages are the write's buffer, pinned by the append until the commit
+                    // ends.
                     let parts =
                         commit.appends[n].as_ref().expect("a pack cut by the commit has its append").parts();
                     commit.writes[n] = parts.len() as u32;
@@ -7998,7 +8009,7 @@ impl Store {
                             file: pack.file.clone(),
                             at,
                             from,
-                            cache: Cache::Bypassed,
+                            cache: Cache::Kept,
                             tag,
                         });
                         commit.steps += 1;

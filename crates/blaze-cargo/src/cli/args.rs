@@ -57,6 +57,7 @@ impl Clap for Command {
                 REFUSED,
                 GOAL,
                 PREBUILT,
+                NO_DAEMON,
             ],
             Command::Check => &[
                 GLOBAL,
@@ -80,6 +81,7 @@ impl Clap for Command {
                 REFUSED,
                 GOAL,
                 PREBUILT,
+                NO_DAEMON,
             ],
             Command::Run => &[
                 GLOBAL,
@@ -98,6 +100,7 @@ impl Clap for Command {
                 REFUSED,
                 GOAL,
                 PREBUILT,
+                NO_DAEMON,
             ],
             Command::Test => &[
                 GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, NO_TESTS, FEATURES,
@@ -388,6 +391,12 @@ const GOAL: &[Flag] =
 /// ([`blaze_api::Cargo::prebuilt`]).
 const PREBUILT: &[Flag] = &[Flag::switch("no-prebuilt")];
 
+/// `check --no-daemon` is blaze's: this process resolves the checkout, runs the keyed driver's
+/// host with the front end and files the records under `<home>/v2/keyed`, with no daemon
+/// (`blaze_command`). Asked for, never taken in place of a daemon that is not there; a
+/// checkout it cannot build yet is refused by name.
+const NO_DAEMON: &[Flag] = &[Flag::switch("no-daemon")];
+
 /// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
 /// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
 /// retargets every reference to the item `FROM` to `TO` by name resolution
@@ -448,6 +457,7 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "query"
                 | "dry-run"
                 | "no-prebuilt"
+                | "no-daemon"
         )
     )
 }
@@ -769,6 +779,9 @@ pub struct Flags {
     pub new_baselines: Vec<String>,
     /// `--no-prebuilt`: no record of this request comes from a pack source.
     pub no_prebuilt: bool,
+    /// `check`'s, `build`'s and `run`'s `--no-daemon`: the request runs in this process
+    /// ([`NO_DAEMON`]).
+    pub no_daemon: bool,
     /// `check`'s `--allow`, `--warn`, `--deny` and `--forbid`, each as one flag
     /// (`--deny=blaze::todo`), in the order given, as the daemon's load keeps them
     /// (`Asked::lint_levels` of blaze-units).
@@ -889,6 +902,7 @@ impl Flags {
             "baselines" => self.baselines = owned(),
             "bless-baselines" => self.bless_baselines = true,
             "no-prebuilt" => self.no_prebuilt = true,
+            "no-daemon" => self.no_daemon = true,
             "new-baseline" => {
                 let lints = value.unwrap_or_default().split(',');
                 self.new_baselines.extend(lints.filter(|it| !it.is_empty()).map(str::to_owned));

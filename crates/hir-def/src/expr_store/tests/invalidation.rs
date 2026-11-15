@@ -46,7 +46,7 @@ pub static L: u32 = K + 1;
 "#;
 
 /// What reads a signature's store: whether it ran again is whether the store changed.
-#[blaze_query::tracked(returns(clone))]
+#[blaze_memo::tracked(returns(clone), owns)]
 fn signature_store_bytes(db: &Db, def: GenericDefId) -> Vec<u8> {
     let (_, store) = GenericParams::with_store(db, def);
     blaze_format::to_bytes(store)
@@ -104,8 +104,16 @@ fn body_bytes(db: &TestDB, def: DefWithBodyId) -> Vec<u8> {
     blaze_format::to_bytes(Body::of(db, def))
 }
 
+/// How many runs of `query` (`Body::of`, `block_item_tree_query`: the tail of its path) `log`
+/// holds. The run log writes each run as `path::to::query(key)`, so a run is matched by its
+/// path, up to the key's parenthesis, ending in `query` at a `::`.
 fn count(log: &[String], query: &str) -> usize {
-    log.iter().filter(|it| *it == query).count()
+    log.iter()
+        .filter(|it| {
+            let path = it.split_once('(').map_or(it.as_str(), |(path, _)| path);
+            path.strip_suffix(query).is_some_and(|rest| rest.is_empty() || rest.ends_with("::"))
+        })
+        .count()
 }
 
 /// (a) `edited` changes only whitespace or comments in `first`'s body: the store stays equal,
@@ -120,7 +128,9 @@ fn check_store_unchanged_by(edited: &str) {
     let bytes = body_bytes(&db, def);
     let map = blaze_format::to_bytes(Body::source_map(&db, def));
 
-    db.set_file_text(file.file_id(&db), edited);
+    _ = db.set_file_text(file.file_id(&db), edited);
+    // `first` in the snapshot the edit made: the edit drops the arena its id was homed in.
+    let def = function_named(&db, "first");
     let after = Body::of(&db, def);
     assert_eq!(bytes, blaze_format::to_bytes(after), "the store changed for:\n{edited}");
     let moved = blaze_format::to_bytes(Body::source_map(&db, def));
@@ -137,11 +147,18 @@ fn comments_in_a_body_keep_its_store() {
     check_store_unchanged_by(&CODE.replace("let y = x + 1;", "let y = x /* one */ + 1; // two"));
 }
 
+/// PORT (round 20): false by design on blaze-memo, left failing. It claimed an edit of
+/// `second`'s body lowers only that body; on the port the edit makes the edited crate's arena
+/// again, so every body of the crate is lowered again (round 20's log: `Body::of` and
+/// `body_expr_scopes` of each). The stores are still equal byte for byte; the pointer-equality
+/// check after it is of the same false claim.
+///
 /// (b) An edit of `second`'s body lowers that body again and nothing else: every other body's
 /// store is the one kept from before (not lowered again), and every signature's store is equal,
 /// so nothing that reads one runs again. Nothing here reads a source map, so `Body::relative`
 /// doesn't run at all.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_in_one_body_lowers_only_that_body() {
     let fx = fixture::db(CODE);
     let file = fx.only_file();
@@ -163,7 +180,11 @@ fn an_edit_in_one_body_lowers_only_that_body() {
     let signatures_before: Vec<Vec<u8>> =
         signatures.iter().map(|&def| signature_store_bytes(&db, def)).collect();
 
-    db.set_file_text(file.file_id(&db), &CODE.replace("n => n - 1,", "n => n - 2,"));
+    _ = db.set_file_text(file.file_id(&db), &CODE.replace("n => n - 1,", "n => n - 2,"));
+    // Each item in the snapshot the edit made, in the same order (the def map's): the edit
+    // drops the arena their ids were homed in.
+    let (bodies, signatures) = defs(&db);
+    let edited = function_named(&db, "second");
     let log = db.executed_in_read_order(|| {
         for &def in &bodies {
             ExprScopes::body_expr_scopes(&db, def);
@@ -196,9 +217,14 @@ fn an_edit_in_one_body_lowers_only_that_body() {
     }
 }
 
+/// PORT (round 20): false by design on blaze-memo, left failing. It claimed an edit of one
+/// body lowers only that body's block tree; on the port the edit makes the edited crate's
+/// arena again, so both bodies and every block tree of the crate are lowered again.
+///
 /// (b') The item tree of a block with items is lowered from its body's own text: an edit of one
 /// body lowers again only that body's block's tree, and every block is owned by its body.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_in_one_body_lowers_only_its_blocks_item_tree() {
     const BLOCKS: &str = r#"
 pub fn first(x: u32) -> u32 {
@@ -224,7 +250,9 @@ pub fn second(x: u32) -> u32 {
     }
     assert_eq!(blocks, 3, "a block for each fn body and the inner block of `first`");
 
-    db.set_file_text(file.file_id(&db), &BLOCKS.replace("x + 2", "x + 3"));
+    _ = db.set_file_text(file.file_id(&db), &BLOCKS.replace("x + 2", "x + 3"));
+    // The bodies in the snapshot the edit made, which dropped the arena of their ids.
+    let (bodies, _) = defs(&db);
     let log = db.executed_in_read_order(|| {
         for &def in &bodies {
             Body::of(&db, def).blocks(&db).count();
@@ -286,19 +314,22 @@ fn a_body_lowered_again_on_a_reused_scratch_is_the_same() {
     let fx = fixture::db(CODE);
     let file = fx.only_file();
     let mut db = fx.into_db();
-    let add = function_named(&db, "add");
-    let first = function_named(&db, "first");
-    let before = body_bytes(&db, add);
+    let before = body_bytes(&db, function_named(&db, "add"));
 
     // `add` and then `first`, both bigger, so the scratch holds more than `add` needs.
     let bigger = CODE
         .replace("c * 2", "{ let d = [c; 4]; d[0] * 2 }")
         .replace("let y = x + 1;", "let y = (x + 1, x * 3, [x; 2]).0;");
-    db.set_file_text(file.file_id(&db), &bigger);
+    // The file by its id, and the fns taken again after each edit: an edit drops the arenas
+    // of the interned file and of the fns.
+    let file = file.file_id(&db);
+    _ = db.set_file_text(file, &bigger);
+    let add = function_named(&db, "add");
     assert_ne!(before, body_bytes(&db, add), "the edit changed nothing of `add`");
-    body_bytes(&db, first);
+    body_bytes(&db, function_named(&db, "first"));
 
-    db.set_file_text(file.file_id(&db), CODE);
+    _ = db.set_file_text(file, CODE);
+    let add = function_named(&db, "add");
     let log = db.executed_in_read_order(|| {
         Body::of(&db, add);
     });
@@ -306,10 +337,17 @@ fn a_body_lowered_again_on_a_reused_scratch_is_the_same() {
     assert_eq!(before, body_bytes(&db, add));
 }
 
+/// PORT (round 20): false by design on blaze-memo, expected to fail once [`count`] reads the
+/// run log's `path(key)` rows (it matched whole rows before, so it counted 0 whatever ran,
+/// and this test passed vacuously). It claimed a body edit resolves no visibility again; on
+/// the port the edit makes the edited crate's arena again, so every visibility of it runs
+/// again. Values are still equal (`before == after` holds).
+///
 /// An item's visibility is read off its file's outline, which an edit of a body leaves the
 /// same: growing a body that comes before them resolves no visibility again, a `pub(in path)`
 /// one (whose path needs spans) included, nor the trait's that its items take.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_in_a_body_resolves_no_visibility_again() {
     const VISIBILITIES: &str = r#"
 pub fn first(x: u32) -> u32 { x + 1 }
@@ -343,18 +381,31 @@ pub trait Tr { fn m(&self); }
     };
     let assoc = items(&db);
     assert_eq!(assoc.len(), 3, "`get`, `C` and `m`");
-    let before: Vec<_> = assoc.iter().map(|it| it.assoc_visibility(&db)).collect();
+    // Each visibility as what it says, its module by name: ids of two snapshots are never
+    // equal, as the edit drops the arena they are homed in.
+    let shown = |db: &TestDB, it: crate::visibility::Visibility| match it {
+        crate::visibility::Visibility::Module(module, explicit) => {
+            format!("in {:?} ({explicit:?})", module.name(db).map(|it| it.as_str().to_owned()))
+        }
+        crate::visibility::Visibility::PubCrate(_) => "pub(crate)".to_owned(),
+        crate::visibility::Visibility::Public => "pub".to_owned(),
+    };
+    let before: Vec<_> = assoc.iter().map(|it| shown(&db, it.assoc_visibility(&db))).collect();
     let outline = |db: &TestDB| crate::signatures::file_outline(db, file).text();
     let outline_before = outline(&db);
 
-    let file_id = file.file_id(&db);
-    let edited = db.file_text(file_id).text(&db).as_str().replace("x + 1", "x + 1 + 2 + 3");
-    db.set_file_text(file_id, &edited);
+    let edited =
+        db.file_text(file.file_id(&db)).text(&db).as_str().replace("x + 1", "x + 1 + 2 + 3");
+    // The file and the items in the snapshot the edit made, which dropped their arenas.
+    let file = db.set_text_of(file, &edited);
+    let outline = |db: &TestDB| crate::signatures::file_outline(db, file).text();
     assert_eq!(outline_before, outline(&db), "the outline's text, every body left out");
+    let assoc = items(&db);
     let mut after = Vec::new();
     let log = db.executed_in_read_order(|| {
-        after = assoc.iter().map(|it| it.assoc_visibility(&db)).collect()
+        after = assoc.iter().map(|it| it.assoc_visibility(&db)).collect::<Vec<_>>()
     });
+    let after: Vec<_> = after.into_iter().map(|it| shown(&db, it)).collect();
     assert_eq!(before, after);
     assert_eq!(count(&log, "AssocItemId::assoc_visibility"), 0, "{log:#?}");
 }

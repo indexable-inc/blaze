@@ -36,15 +36,19 @@ use blaze_ids::ContentId;
 use hir_expand::{AstId, MacroCallId, name::Name};
 use syntax::ast;
 use thin_vec::ThinVec;
-use triomphe::Arc;
 
 use self::{codes::Sig, key::Item, table::StoreBytes};
 use crate::{
-    AdtId, AssocItemId, ConstId, EnumId, FunctionId, ImplId, ModuleDefId, StaticId, StructId,
-    TraitId, TypeAliasId, UnionId, VariantId,
+    AdtId, AssocItemId, AttrDefId, ConstId, EnumId, FunctionId, ImplId, ItemContainerId, Lookup,
+    ModuleDefId, ModuleId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
+    attrs::AttrFlags,
     deps::Part,
+    item_tree::RawVisibility,
+    nameres::frozen::entries::items::{decode_flags, flags_bytes},
     expr_store::ExpressionStore,
-    hir::persist::{Column, Read, Relocation, Words, WordsRec, relocating},
+    hir::persist::{
+        Column, Portable, Read, Relocation, SessionBytes, Words, WordsRec, relocating,
+    },
     item_scope::ItemScope,
     item_tree::ItemTree,
     nameres::{
@@ -71,12 +75,13 @@ blaze_format::record! {
 }
 
 blaze_format::record! {
-    /// The part: each item's key, in increasing order, and where its record is, at the same
-    /// index.
+    /// The part: each item's key, in increasing order, where its record is, and the attribute
+    /// flags of the item the record is of ([`flags_of`]), each at the same index.
     #[derive(Clone, Copy)]
     struct PartRoot: 1 {
         keys: Slice<ContentId>,
         places: Slice<Place>,
+        flags: Slice<[u8; 16]>,
     }
 }
 
@@ -94,15 +99,18 @@ blaze_format::record! {
 
 const _: () = {
     assert!(size_of::<Place>() == 8);
-    assert!(size_of::<PartRoot>() == 16);
+    assert!(size_of::<PartRoot>() == 24);
     assert!(size_of::<RecordRoot>() == 36);
 };
 
 /// The schema of the part, and the version of everything its bytes are made with: the words of
 /// each signature, the store's buffer, the item tree's codes (visibilities, shapes), the key and
-/// the frozen encoding of the table.
+/// the frozen encoding of the table. 8: the assoc items of each impl and trait
+/// (`Item::ImplItems`, `Item::TraitItems`) and the flags column (`PartRoot::flags`),
+/// so a crate given by its address answers both with no text of its files; a part of 7 is
+/// refused by this schema, and its key ([`super::key::PRODUCER`] hashes this) is never asked.
 pub(crate) const SCHEMA: SchemaHash = blaze_format::schema_of(&[
-    SchemaPart::Str("blaze v2 dependency signatures 7"),
+    SchemaPart::Str("blaze v2 dependency signatures 8"),
     SchemaPart::Schema(<PartRoot as Record>::SCHEMA),
     SchemaPart::Schema(<RecordRoot as Record>::SCHEMA),
     SchemaPart::Schema(<ExpressionStore as Persist>::SCHEMA),
@@ -111,6 +119,9 @@ pub(crate) const SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Str(frozen::ENCODING),
 ]);
 
+
+/// The domain of the digest of a signature record's bytes: the fact a read of it lists.
+const RECORD_FACT_DOMAIN: &str = "blaze v2 dependency signature record fact";
 
 /// The schema of one record's buffer.
 const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
@@ -121,7 +132,7 @@ const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
 /// The signatures part of the image of `krate`: a record of every signature query of every item
 /// of its modules. An item that cannot be written portably fails the whole part, with why.
 /// Appends to `calls` each macro call a record names.
-pub(crate) fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> R<Vec<u8>> {
+pub(crate) fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> R<Portable> {
     encode_with(db, krate, calls, |item, calls| record_of(db, krate, item, calls))
 }
 
@@ -131,8 +142,8 @@ fn encode_with(
     db: &Db,
     krate: Crate,
     calls: &mut Vec<MacroCallId>,
-    mut record_of: impl FnMut(Item, &mut Vec<MacroCallId>) -> R<Vec<u8>>,
-) -> R<Vec<u8>> {
+    mut record_of: impl FnMut(Item, &mut Vec<MacroCallId>) -> R<Portable>,
+) -> R<Portable> {
     let items = items(db, krate);
     let mut keyed = Vec::with_capacity(items.len());
     for item in items {
@@ -148,6 +159,8 @@ fn encode_with(
     }
     let mut out = Writer::new(SCHEMA);
     let mut places = Vec::with_capacity(keyed.len());
+    // The flags column, 16 bytes a record, written once per crate.
+    let mut flags = Vec::with_capacity_in(keyed.len(), std::alloc::Global);
     // alloc: the error that fails the part.
     let place = |it: usize| u32::try_from(it).map_err(|_| "a part of 4 GiB or more".to_owned());
     for &(_, item) in &keyed {
@@ -156,21 +169,26 @@ fn encode_with(
             .map_err(|why| format!("the signature of {item:?}: {why}"))?;
         let at = out.bytes.len().next_multiple_of(ALIGN);
         out.bytes.resize(at, 0);
-        out.bytes.extend_from_slice(&record);
+        out.bytes.extend_from_slice(record.as_bytes());
         places.push(Place { at: place(at)?, len: place(record.len())? });
+        let of = flags_owner(item).map_or(AttrFlags::empty(), |owner| AttrFlags::query(db, owner));
+        flags.push(flags_bytes(of));
     }
     // alloc: the key column, written once per crate.
     let keys: Vec<ContentId> = keyed.iter().map(|&(key, _)| key).collect();
     let keys = Column::push(&mut out, &keys);
     let places = Column::push(&mut out, &places);
+    let flags = Column::push(&mut out, &flags);
     let at = out.next::<PartRoot>();
     let root = PartRoot {
         keys: keys.slice(at + offset_of!(PartRoot, keys) as u64),
         places: places.slice(at + offset_of!(PartRoot, places) as u64),
+        flags: flags.slice(at + offset_of!(PartRoot, flags) as u64),
     };
     let written = out.push(&root);
     debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
-    Ok(out.finish(at))
+    // Keys, places and the records, each [`Portable`] already.
+    Ok(Portable::written(out.finish(at)))
 }
 
 /// Each signature query of the items of `krate`'s modules: what the front end asks of a
@@ -217,6 +235,11 @@ pub(super) fn scope_items(db: &Db, scope: &ItemScope, items: &mut Vec<Item>) {
     items.extend(scope.unnamed_consts().map(Item::Const));
     for owner in assoc_owners(db, scope) {
         items.push(owner.item);
+        items.push(match owner.item {
+            Item::Trait(it) => Item::TraitItems(it),
+            Item::Impl(it) => Item::ImplItems(it),
+            other => unreachable!("an assoc owner is a trait or an impl, and {other:?} is not"),
+        });
         assoc(items, owner.items);
     }
 }
@@ -274,7 +297,7 @@ pub(super) fn store_of(db: &Db, item: Item) -> Option<&ExpressionStore> {
         Item::Function(id) => &FunctionSignature::of(db, id).store,
         Item::TypeAlias(id) => &TypeAliasSignature::of(db, id).store,
         Item::Fields(id) => &VariantFields::of(db, id).store,
-        Item::Variants(_) => return None,
+        Item::Variants(_) | Item::ImplItems(_) | Item::TraitItems(_) => return None,
     })
 }
 
@@ -287,7 +310,7 @@ fn assoc(items: &mut Vec<Item>, assoc: &[(Name, AssocItemId)]) {
 }
 
 /// The record of `item` of `krate`, from its signature as this database has it.
-fn record_of(db: &Db, krate: Crate, item: Item, calls: &mut Vec<MacroCallId>) -> R<Vec<u8>> {
+fn record_of(db: &Db, krate: Crate, item: Item, calls: &mut Vec<MacroCallId>) -> R<Portable> {
     let what = item.what();
     match item {
         Item::Struct(id) => {
@@ -327,13 +350,168 @@ fn record_of(db: &Db, krate: Crate, item: Item, calls: &mut Vec<MacroCallId>) ->
         Item::Variants(id) => {
             record_naming::<codes::Variants>(db, krate, what, EnumVariants::of(db, id), calls)
         }
+        Item::ImplItems(id) => {
+            let of = assoc_record(db, ItemContainerId::ImplId(id));
+            record_naming::<codes::Assoc>(db, krate, what, &of, calls)
+        }
+        Item::TraitItems(id) => {
+            let of = assoc_record(db, ItemContainerId::TraitId(id));
+            record_naming::<codes::Assoc>(db, krate, what, &of, calls)
+        }
     }
+}
+
+/// The assoc items of an impl or a trait as an image holds them: what `ImplItems::of` and
+/// `TraitItems::query_with_diagnostics` answer of it (their diagnostics left out: a crate read
+/// from an image reports none), and the visibility written on each of an impl's items, or on a
+/// trait (which each of its items has).
+///
+/// Floor (rule 67): one record found by one binary search of the part's keys, its words read in
+/// place and each id made again through its table; nothing of the crate's files. Cost, an
+/// estimate not measured: the record's head and table (about 100 bytes) plus about 16 bytes an
+/// item (its name's index, its kind and table index, its visibility's code) and each item's
+/// location in the table (about 12 bytes), so about 30 bytes an assoc item and 100 an owner.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AssocRecord {
+    pub(crate) is_trait: bool,
+    pub(crate) items: Box<[(Name, AssocItemId)]>,
+    pub(crate) macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
+    /// An impl's: the visibility written on each item, at its index in `items`. A trait's: one,
+    /// the trait's.
+    pub(crate) visibilities: Box<[RawVisibility]>,
+}
+
+/// The [`AssocRecord`] of `container`, an impl or a trait, from its syntax.
+fn assoc_record(db: &Db, container: ItemContainerId) -> AssocRecord {
+    match container {
+        ItemContainerId::ImplId(id) => {
+            let (items, _) = ImplItems::of(db, id);
+            assoc_record_of(db, container, &items.items, &items.macro_calls)
+        }
+        ItemContainerId::TraitId(id) => {
+            let items = TraitItems::query(db, id);
+            assoc_record_of(db, container, &items.items, &items.macro_calls)
+        }
+        ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {
+            unreachable!("assoc items are of an impl or a trait")
+        }
+    }
+}
+
+/// The [`AssocRecord`] of `container` with its items and macro calls as given, its
+/// visibilities read off its syntax: [`assoc_record`]'s, and a test's of items it collected
+/// from syntax itself.
+pub(crate) fn assoc_record_of(
+    db: &Db,
+    container: ItemContainerId,
+    items: &[(Name, AssocItemId)],
+    macro_calls: &ThinVec<(AstId<ast::Item>, MacroCallId)>,
+) -> AssocRecord {
+    match container {
+        ItemContainerId::ImplId(id) => {
+            let module = id.lookup(db).container;
+            let visibilities =
+                items.iter().map(|&(_, item)| assoc_written_visibility(db, item, module));
+            AssocRecord {
+                is_trait: false,
+                // clone: the image's copy, made once a crate at store time
+                items: items.into(),
+                // clone: as above
+                macro_calls: macro_calls.clone(),
+                visibilities: visibilities.collect(),
+            }
+        }
+        ItemContainerId::TraitId(id) => {
+            let loc = id.lookup(db);
+            let visibility = crate::signatures::written_visibility(db, loc.id, loc.container);
+            AssocRecord {
+                is_trait: true,
+                // clone: the image's copy, made once a crate at store time
+                items: items.into(),
+                // clone: as above
+                macro_calls: macro_calls.clone(),
+                visibilities: Box::new([visibility]),
+            }
+        }
+        ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {
+            unreachable!("assoc items are of an impl or a trait")
+        }
+    }
+}
+
+/// The visibility written on `item`, an assoc item of a module `module`'s impl, unresolved.
+fn assoc_written_visibility(db: &Db, item: AssocItemId, module: ModuleId) -> RawVisibility {
+    match item {
+        AssocItemId::FunctionId(it) => {
+            crate::signatures::written_visibility(db, it.lookup(db).id, module)
+        }
+        AssocItemId::ConstId(it) => {
+            crate::signatures::written_visibility(db, it.lookup(db).id, module)
+        }
+        AssocItemId::TypeAliasId(it) => {
+            crate::signatures::written_visibility(db, it.lookup(db).id, module)
+        }
+    }
+}
+
+/// The container `item` was made in.
+fn assoc_container(db: &Db, item: AssocItemId) -> ItemContainerId {
+    match item {
+        AssocItemId::FunctionId(it) => it.lookup(db).container,
+        AssocItemId::ConstId(it) => it.lookup(db).container,
+        AssocItemId::TypeAliasId(it) => it.lookup(db).container,
+    }
+}
+
+/// The owner of the attribute flags the part holds at the record of `item` (its flags column):
+/// the item a signature is of (a variant's fields record is the variant's). `None` for a
+/// record of no attribute owner of its own (a struct's or union's fields, an enum's variants,
+/// an impl's or trait's assoc items), whose column holds no flags.
+fn flags_owner(item: Item) -> Option<AttrDefId> {
+    Some(match item {
+        Item::Struct(it) => AttrDefId::AdtId(AdtId::StructId(it)),
+        Item::Union(it) => AttrDefId::AdtId(AdtId::UnionId(it)),
+        Item::Enum(it) => AttrDefId::AdtId(AdtId::EnumId(it)),
+        Item::Const(it) => AttrDefId::ConstId(it),
+        Item::Static(it) => AttrDefId::StaticId(it),
+        Item::Impl(it) => AttrDefId::ImplId(it),
+        Item::Trait(it) => AttrDefId::TraitId(it),
+        Item::Function(it) => AttrDefId::FunctionId(it),
+        Item::TypeAlias(it) => AttrDefId::TypeAliasId(it),
+        Item::Fields(VariantId::EnumVariantId(it)) => AttrDefId::EnumVariantId(it),
+        Item::Fields(VariantId::StructId(_) | VariantId::UnionId(_))
+        | Item::Variants(_)
+        | Item::ImplItems(_)
+        | Item::TraitItems(_) => return None,
+    })
+}
+
+/// The record whose flags are `owner`'s ([`flags_owner`]'s inverse): `None` for an owner the
+/// part holds no flags of (a module, a macro, an extern block, an `extern crate`, a `use`).
+fn flags_item(owner: AttrDefId) -> Option<Item> {
+    Some(match owner {
+        AttrDefId::AdtId(AdtId::StructId(it)) => Item::Struct(it),
+        AttrDefId::AdtId(AdtId::UnionId(it)) => Item::Union(it),
+        AttrDefId::AdtId(AdtId::EnumId(it)) => Item::Enum(it),
+        AttrDefId::ConstId(it) => Item::Const(it),
+        AttrDefId::StaticId(it) => Item::Static(it),
+        AttrDefId::ImplId(it) => Item::Impl(it),
+        AttrDefId::TraitId(it) => Item::Trait(it),
+        AttrDefId::FunctionId(it) => Item::Function(it),
+        AttrDefId::TypeAliasId(it) => Item::TypeAlias(it),
+        AttrDefId::EnumVariantId(it) => Item::Fields(VariantId::EnumVariantId(it)),
+        AttrDefId::ModuleId(_)
+        | AttrDefId::MacroId(_)
+        | AttrDefId::ExternBlockId(_)
+        | AttrDefId::ExternCrateId(_)
+        | AttrDefId::UseId(_) => return None,
+    })
 }
 
 /// The record of `of`, the value of query `what` of an item of `krate`. The same value is the
 /// same bytes in every process: the table lists the ids in the order they are first written,
 /// the store first.
-fn record<S: Sig>(db: &Db, krate: Crate, what: u8, of: &S::Of) -> R<Vec<u8>> {
+fn record<S: Sig>(db: &Db, krate: Crate, what: u8, of: &S::Of) -> R<Portable> {
     // alloc: none: an empty list, which nothing reads
     record_naming::<S>(db, krate, what, of, &mut Vec::new())
 }
@@ -346,13 +524,12 @@ fn record_naming<S: Sig>(
     what: u8,
     of: &S::Of,
     calls: &mut Vec<MacroCallId>,
-) -> R<Vec<u8>> {
+) -> R<Portable> {
     let mut table = Relocation::new();
-    let mut store =
-        S::store(of).map(|store| relocating(&mut table, || blaze_format::to_bytes(store)));
-    if let Some(store) = &mut store {
-        table::relocate_store(store, &mut table);
-    }
+    let store = S::store(of).map(|store| {
+        let written = relocating(&mut table, || SessionBytes::of(store));
+        table::relocate_store(written, &mut table)
+    });
     let mut words = Words::new();
     relocating(&mut table, || S::put(of, &mut words));
     table::calls(&table, calls);
@@ -365,7 +542,7 @@ fn record_naming<S: Sig>(
         // A store is a buffer of its own, read in place: at an aligned address.
         let at = out.bytes.len().next_multiple_of(ALIGN);
         out.bytes.resize(at, 0);
-        Column::push(&mut out, &store)
+        Column::push(&mut out, store.as_bytes())
     });
     let at = out.next::<RecordRoot>();
     let root = RecordRoot {
@@ -376,7 +553,9 @@ fn record_naming<S: Sig>(
     };
     let written = out.push(&root);
     debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
-    Ok(out.finish(at))
+    // The words were relocated, the table is keyed and the store went through
+    // `relocate_store`: every id in the record is portable.
+    Ok(Portable::written(out.finish(at)))
 }
 
 /// Why bytes do not read, for the panic of a corrupt image.
@@ -399,23 +578,31 @@ pub(crate) fn const_key(db: &Db, id: ConstId) -> Option<ContentId> {
 /// The record of `item` in `part`, the signatures part of its crate's image: two plain columns
 /// checked in place, a key hashed and a binary search, nothing allocated.
 fn find<'a>(db: &Db, part: &'a [u8], item: Item) -> R<&'a [u8]> {
-    let root = open_as::<PartRoot>(part, SCHEMA).map_err(format_error)?;
-    let keys = root.keys.follow(part).map_err(format_error)?;
-    let places = root.places.follow(part).map_err(format_error)?;
-    if keys.len() != places.len() {
-        // alloc: the reason of a panic.
-        return Err("its keys and records are not one each".to_owned());
-    }
     let (_, key) = key::of(db, item).expect("an item outside a block has a key");
-    let Ok(at) = keys.binary_search(&key) else {
-        // alloc: the reason of a panic.
-        return Err("its signatures part has no record of the item".to_owned());
-    };
+    let (at, places, _) = find_at(part, key)?;
     let Place { at, len } = places[at];
     let end = (at as usize).checked_add(len as usize);
     end.and_then(|end| part.get(at as usize..end))
         // alloc: the reason of a panic.
         .ok_or_else(|| "a record past the end of its signatures part".to_owned())
+}
+
+/// The index of the record under `key` in `part`, with the part's places and flags columns:
+/// the part's three plain columns checked in place and one binary search of its keys.
+fn find_at(part: &[u8], key: ContentId) -> R<(usize, &[Place], &[[u8; 16]])> {
+    let root = open_as::<PartRoot>(part, SCHEMA).map_err(format_error)?;
+    let keys = root.keys.follow(part).map_err(format_error)?;
+    let places = root.places.follow(part).map_err(format_error)?;
+    let flags = root.flags.follow(part).map_err(format_error)?;
+    if keys.len() != places.len() || keys.len() != flags.len() {
+        // alloc: the reason of a panic.
+        return Err("its keys, records and flags are not one each".to_owned());
+    }
+    let Ok(at) = keys.binary_search(&key) else {
+        // alloc: the reason of a panic.
+        return Err("its signatures part has no record of the item".to_owned());
+    };
+    Ok((at, places, flags))
 }
 
 /// The value of `bytes`, the record of query `what` of an item of `krate`, with each id it
@@ -473,27 +660,32 @@ fn corrupt(db: &Db, krate: Crate, item: Item, why: &str) -> ! {
 /// An image with no record of the item, or one that does not read, is a corrupt image: a panic
 /// naming the crate, the item and why. Serving only gives a database images whose bytes the
 /// store checked against their key, so lowering the item instead would hide a bug.
-fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Vec<u8>>) -> Option<S::Value> {
+fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Portable>) -> Option<S::Value> {
     let module = item.module(db);
     if module.block(db).is_some() {
         return None;
     }
     let krate = module.krate(db);
-    let image = super::image_of(db, krate).as_ref()?;
+    let image = super::image_of(db, krate)?;
     let what = item.what();
     let part = image.view().part(Part::Signatures);
     let stored = find(db, part, item).unwrap_or_else(|why| corrupt(db, krate, item, &why));
     let value = read::<S>(db, krate, what, image.bytes(), stored)
         .unwrap_or_else(|why| corrupt(db, krate, item, &why));
+    // The value is the record's: the read is of the item's fact (its stable key and the
+    // digest of its record), not of the image ([`super::ImageSlot`]'s fact says only the mode).
+    let note = || {
+        let (_, key) = key::of(db, item).expect("an item outside a block has a key");
+        super::note_item_read(db, RECORD_FACT_DOMAIN, key, stored);
+    };
     match image.mode() {
-        // The value is the record's, found by content: told to the engine (`row::STORED`).
-        Mode::Serve => blaze_query::db::report_stored_read(db),
+        Mode::Serve => note(),
         Mode::Check => {
             let written = live(krate);
             compare(db, krate, item, "the signature lowered from syntax", written, stored);
         }
         Mode::Verify => {
-            blaze_query::db::report_stored_read(db);
+            note();
             let written = record::<S>(db, krate, what, S::of(&value));
             compare(db, krate, item, "what was read of it", written, stored);
         }
@@ -503,13 +695,13 @@ fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Vec<u8>>) -
 
 /// Records a difference between `written`, the record of `what` of `item`, and `record`, the
 /// image's.
-fn compare(db: &Db, krate: Crate, item: Item, what: &str, written: R<Vec<u8>>, record: &[u8]) {
+fn compare(db: &Db, krate: Crate, item: Item, what: &str, written: R<Portable>, record: &[u8]) {
     match written {
-        Ok(written) if written == record => {}
+        Ok(written) if written.as_bytes() == record => {}
         Ok(written) => {
             // alloc: a difference, which is a bug.
             let what = format!("{what}, of {item:?}");
-            frozen::record_difference(db, krate, "signatures", &what, &written, record);
+            frozen::record_difference(db, krate, "signatures", &what, written.as_bytes(), record);
         }
         Err(why) => {
             // alloc: a difference, which is a bug.
@@ -522,11 +714,16 @@ fn compare(db: &Db, krate: Crate, item: Item, what: &str, written: R<Vec<u8>>, r
 macro_rules! served {
     ($($(#[$doc:meta])* $name:ident($id:ty) -> $sig:ident as $code:ident;)*) => {$(
         $(#[$doc])*
-        pub(crate) fn $name(db: &Db, id: $id) -> Option<Arc<$sig>> {
+        ///
+        /// Called inside the `served` query of the signature: the value is kept in that
+        /// query's arena and dropped with it ([`blaze_memo::keep_owned`]: a decoded signature
+        /// owns its expression store).
+        pub(crate) fn $name(db: &Db, id: $id) -> Option<&$sig> {
             let item = Item::$code(id);
-            served::<codes::$code>(db, item, |krate| {
+            let value = served::<codes::$code>(db, item, |krate| {
                 record::<codes::$code>(db, krate, item.what(), &$sig::lower_alone(db, id))
-            })
+            })?;
+            Some(blaze_memo::keep_owned(blaze_memo::Database::memo(db), value))
         }
     )*};
 }
@@ -554,13 +751,210 @@ served! {
     served_variant_fields(VariantId) -> VariantFields as Fields;
 }
 
-/// [`EnumVariants::of`] from the image of its crate, if it has one.
+/// [`EnumVariants::of`] from the image of its crate, if it has one and its crate's def map is
+/// read from the image's pages too.
+///
+/// A crate whose def map is resolved here ([`Mode::Check`], or an image without pages) reads
+/// its enums' variants from syntax: name resolution asks them while the def map is being made
+/// (`use E::*`, a path through a variant), and a record is found by its item's [`key`] and
+/// decoded by the positions of modules in that same def map, so serving them would make the
+/// crate's resolution ask for itself (`crate_resolution -> scc_state -> EnumVariants::of ->
+/// key::module_indexes -> crate_resolution`). The cost: [`Mode::Check`] compares no variants
+/// record, and says so by name ([`frozen::uncompared`]), never as an agreement; the variants'
+/// ids are the same either way (interned by their syntax).
 pub(crate) fn served_enum_variants(
     db: &Db,
     id: EnumId,
 ) -> Option<(EnumVariants, ThinVec<InactiveEnumVariantCode>)> {
     let item = Item::Variants(id);
+    let krate = item.module(db).krate(db);
+    if !crate::nameres::frozen::pages::is_paged(db, krate) {
+        if super::mode(db, krate) == Some(Mode::Check) {
+            frozen::record_uncompared(
+                db,
+                krate,
+                "enum variants",
+                "the crate is resolved from source in Check mode, and a variants record is \
+                 found by module positions in that same def map, so comparing it while \
+                 resolving would make the resolution ask for itself",
+            );
+        }
+        return None;
+    }
     served::<codes::Variants>(db, item, |krate| {
         record::<codes::Variants>(db, krate, item.what(), &EnumVariants::lower(db, id))
     })
+}
+
+/// A test's planted control: the sections it names read as if the image did not hold them, so
+/// the query takes the path of an image written without them (its guarded read of the item's
+/// file). Set and cleared under the deps tests' turn lock; nothing outside tests has it.
+pub(crate) mod left_out {
+    #[cfg(test)]
+    use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+
+    /// The items of traits and impls, and with them their visibilities ([`super::AssocRecord`]).
+    pub(crate) const ITEMS: u8 = 1;
+    /// The flags column ([`super::served_attr_flags`]).
+    pub(crate) const FLAGS: u8 = 2;
+    /// The visibilities of an [`super::AssocRecord`] alone, its items still served.
+    pub(crate) const VISIBILITIES: u8 = 4;
+
+    #[cfg(test)]
+    static LEFT_OUT: AtomicU8 = AtomicU8::new(0);
+
+    /// While held, the sections [`leave_out`] named are left out; dropped, none is.
+    #[cfg(test)]
+    pub(crate) struct Restore(());
+
+    #[cfg(test)]
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LEFT_OUT.store(0, SeqCst);
+        }
+    }
+
+    /// Leaves out `sections` until the guard drops.
+    #[cfg(test)]
+    #[must_use = "the sections are left out only while the guard is held"]
+    pub(crate) fn leave_out(sections: u8) -> Restore {
+        LEFT_OUT.store(sections, SeqCst);
+        Restore(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn is(section: u8) -> bool {
+        LEFT_OUT.load(SeqCst) & section != 0
+    }
+}
+
+/// Whether a test left out `section` ([`left_out`]); never outside tests.
+#[cfg(test)]
+fn left_out(section: u8) -> bool {
+    left_out::is(section)
+}
+
+#[cfg(not(test))]
+fn left_out(_: u8) -> bool {
+    false
+}
+
+/// The domain of the digest of an item's attribute flags: the fact a read of them lists, its id
+/// the item's key under this domain (the item's signature record's own fact has the key itself).
+const FLAGS_FACT_DOMAIN: &str = "blaze v2 dependency attr flags fact";
+
+/// `AttrFlags::query` of `owner` from its crate's image: `None` when its crate is read from no
+/// image's pages, the owner is in a block, or the part holds no flags of its kind
+/// ([`flags_item`]: a module, a macro, an extern block, an `extern crate`, a `use`).
+///
+/// Served only for a crate read from pages, as [`served_enum_variants`] is: a crate resolved
+/// here asks for its items' flags while its def map is being made, and finding a record's key
+/// reads that def map's module positions ([`key::module_indexes`]).
+///
+/// Floor (rule 67): one mapped lookup, a binary search of the part's keys and 16 bytes read in
+/// place; no record decoded and nothing of the crate's files. Cost, an estimate not measured:
+/// 16 bytes a record of the part (a signature's holds its item's flags, any other 16 zero
+/// bytes), so about 16 bytes an item and 16 more a struct, union or enum.
+pub(crate) fn served_attr_flags(db: &Db, owner: AttrDefId) -> Option<AttrFlags> {
+    let item = flags_item(owner)?;
+    if left_out(left_out::FLAGS) {
+        return None;
+    }
+    let module = item.module(db);
+    if module.block(db).is_some() {
+        return None;
+    }
+    let krate = module.krate(db);
+    if !crate::nameres::frozen::pages::is_paged(db, krate) {
+        return None;
+    }
+    let image = super::image_of(db, krate)?;
+    let (_, key) = key::of(db, item)?;
+    let part = image.view().part(Part::Signatures);
+    let (at, _, flags) = find_at(part, key).unwrap_or_else(|why| corrupt(db, krate, item, &why));
+    let bytes = &flags[at];
+    let value = decode_flags(bytes).unwrap_or_else(|why| corrupt(db, krate, item, &why));
+    let id = ContentId::of(FLAGS_FACT_DOMAIN, &key.0);
+    super::note_item_read(db, FLAGS_FACT_DOMAIN, id, bytes);
+    Some(value)
+}
+
+/// The [`AssocRecord`] of `container` (`item` is its [`Item::ImplItems`] or
+/// [`Item::TraitItems`]) from its crate's image: `None` when its crate is read from no image's
+/// pages or the container is in a block. Served only for a crate read from pages, as
+/// [`served_enum_variants`] is (a crate resolved here can ask for a trait's items while its
+/// def map is made: `use Trait::item`).
+///
+/// A record naming an item of another container is a corrupt image (a panic naming the crate,
+/// the container and the item): bytes the store checked against their key, which a key that
+/// misses an input would let be read for the wrong impl.
+fn served_assoc(db: &Db, item: Item, container: ItemContainerId) -> Option<AssocRecord> {
+    if left_out(left_out::ITEMS) {
+        return None;
+    }
+    let module = item.module(db);
+    if module.block(db).is_some() {
+        return None;
+    }
+    let krate = module.krate(db);
+    if !crate::nameres::frozen::pages::is_paged(db, krate) {
+        if super::mode(db, krate) == Some(Mode::Check) {
+            frozen::record_uncompared(
+                db,
+                krate,
+                "assoc items",
+                "the crate is resolved from source in Check mode, and an assoc items record is \
+                 found by module positions in that same def map, so comparing it while \
+                 resolving could make the resolution ask for itself",
+            );
+        }
+        return None;
+    }
+    let value = served::<codes::Assoc>(db, item, |krate| {
+        record::<codes::Assoc>(db, krate, item.what(), &assoc_record(db, container))
+    })?;
+    if value.is_trait != matches!(container, ItemContainerId::TraitId(_)) {
+        corrupt(db, krate, item, "an assoc items record of the other kind of container");
+    }
+    let foreign = value.items.iter().find(|&&(_, it)| assoc_container(db, it) != container);
+    if let Some((name, it)) = foreign {
+        // alloc: the reason of a panic.
+        let why =
+            format!("it names `{}` ({it:?}), an item of another container", name.symbol().as_str());
+        corrupt(db, krate, item, &why);
+    }
+    Some(value)
+}
+
+/// `ImplItems::of` of `id` from its crate's image ([`served_assoc`]), its visibilities with it.
+pub(crate) fn served_impl_items(db: &Db, id: ImplId) -> Option<AssocRecord> {
+    served_assoc(db, Item::ImplItems(id), ItemContainerId::ImplId(id))
+}
+
+/// `TraitItems::query_with_diagnostics` of `id` from its crate's image ([`served_assoc`]), the
+/// trait's visibility with it.
+pub(crate) fn served_trait_items(db: &Db, id: TraitId) -> Option<AssocRecord> {
+    served_assoc(db, Item::TraitItems(id), ItemContainerId::TraitId(id))
+}
+
+/// The visibility written on each item of `id`, at its index in `ImplItems::of(id)`'s items,
+/// from its crate's image: `None` where [`served_impl_items`] is. Read once an impl, by what
+/// asks an item's visibility (`AssocItemId::assoc_visibility`).
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
+pub(crate) fn served_impl_visibilities(db: &Db, id: ImplId) -> Option<Box<[RawVisibility]>> {
+    if left_out(left_out::VISIBILITIES) {
+        return None;
+    }
+    served_impl_items(db, id).map(|it| it.visibilities)
+}
+
+/// The visibility written on the trait `id` (each of its items has it), from its crate's image:
+/// `None` where [`served_trait_items`] is.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
+pub(crate) fn served_trait_visibility(db: &Db, id: TraitId) -> Option<RawVisibility> {
+    if left_out(left_out::VISIBILITIES) {
+        return None;
+    }
+    // A trait's record holds one visibility (`codes::Assoc` checks it).
+    served_trait_items(db, id).and_then(|it| it.visibilities.into_vec().pop())
 }

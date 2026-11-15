@@ -5,13 +5,10 @@ use std::fmt;
 
 use crate::FileId;
 use blaze_hash::HashSet;
-use blaze_query::db::{Durability, Setter as _};
 use std::alloc::Global;
 use triomphe::Arc;
 
-use crate::{
-    CrateGraphBuilder, CratesIdMap, Db, LibraryRoots, LocalRoots, SourceRoot, SourceRootId,
-};
+use crate::{CrateGraphBuilder, CratesIdMap, Db, SourceRoot, SourceRootId};
 
 /// Encapsulate a bunch of raw `.set` calls on the database.
 #[derive(Default)]
@@ -49,8 +46,12 @@ impl FileChange {
     pub fn set_crate_graph(&mut self, graph: CrateGraphBuilder) {
         self.crate_graph = Some(graph);
     }
+    /// Writes the change in one edit of `db` and commits it: the next snapshot has it. The
+    /// keys of the crates of its graph, when it sets one.
     pub fn apply(self, db: &mut Db) -> Option<CratesIdMap> {
         let _p = tracing::info_span!(target: "blaze", "FileChange::apply").entered();
+        let has_graph = self.crate_graph.is_some();
+        let mut edit = db.edit();
         if let Some(roots) = self.roots {
             let mut local_roots = HashSet::new_in(Global);
             let mut library_roots = HashSet::new_in(Global);
@@ -61,45 +62,26 @@ impl FileChange {
                 } else {
                     local_roots.insert(root_id);
                 }
-                let durability = source_root_durability(&root);
                 for file_id in root.iter() {
-                    db.set_file_source_root_with_durability(file_id, root_id, durability);
+                    edit.set_file_source_root(file_id, root_id);
                 }
-
-                // alloc: one per source root a change sets (setup).
-                db.set_source_root_with_durability(root_id, Arc::new(root), durability);
+                // One per source root a change sets (setup).
+                edit.set_source_root(root_id, Arc::new(root));
             }
-            LocalRoots::get(db).set_roots(db).to(local_roots);
-            LibraryRoots::get(db).set_roots(db).to(library_roots);
+            edit.set_local_roots(local_roots);
+            edit.set_library_roots(library_roots);
         }
 
         for (file_id, text) in self.files_changed {
-            let source_root_id = db.file_source_root(file_id);
-            let source_root = db.source_root(source_root_id.source_root_id(db));
-
-            let durability = file_text_durability(source_root.source_root_ref(db));
             // XXX: can't actually remove the file, just reset the text
             let text = text.unwrap_or_default();
-            db.set_file_text_with_durability(file_id, &text, durability)
+            edit.set_file_text(file_id, &text);
         }
 
         if let Some(crate_graph) = self.crate_graph {
-            return Some(crate_graph.set_in_db(db));
+            edit.set_crate_graph(crate_graph);
         }
-        None
+        let committed = edit.commit();
+        has_graph.then_some(committed.crates)
     }
-}
-
-/// The kind of a root's file set and of its files' root map, by the root's kind
-/// ([`crate::files::root_set_durability`]): `HIGH` for a library's, whose set moves only with
-/// a new toolchain or a fetched package, so a read of it under a covered frame is allowed;
-/// `MEDIUM` for a local root. Until 2026-11-12 every root's was `MEDIUM` here.
-fn source_root_durability(root: &SourceRoot) -> Durability {
-    crate::files::root_set_durability(root.is_library)
-}
-
-/// A library file's text is `HIGH`, a local one's `LOW`
-/// ([`crate::files::root_content_durability`], the one rule).
-fn file_text_durability(source_root: &SourceRoot) -> Durability {
-    crate::files::root_content_durability(source_root.is_library)
 }

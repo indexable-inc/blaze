@@ -10,10 +10,11 @@ use blaze_keyed::kind::Late;
 /// no text shows, so it sets the flag ([`crate::rows::CALLS`]) and what it makes is a fact its
 /// body's task makes. Sorted, for the binary search.
 ///
-/// `include` is not here: what it includes is code, whose names no text shows. `env`,
+/// `include` is not here: what it includes is code, whose names no text shows. Nor is
+/// `cfg_select`: its arms are items (`mod`s among them, `core::io::io_slice`), not values. `env`,
 /// `option_env`, `include_str` and `include_bytes` are, with their values late reads
 /// ([`late_of`]).
-pub const QUIET: [&str; 47] = [
+pub const QUIET: [&str; 46] = [
     "addr_of",
     "addr_of_mut",
     "asm",
@@ -22,7 +23,6 @@ pub const QUIET: [&str; 47] = [
     "assert_matches",
     "assert_ne",
     "cfg",
-    "cfg_select",
     "column",
     "compile_error",
     "concat",
