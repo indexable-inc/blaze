@@ -5784,13 +5784,9 @@ fn query_applies(seed: u64) -> (usize, usize, Result<Vec<Vec<usize>>, String>) {
 /// `Jobs::units_applied`'s send of a waiting write removed: seeds 12, 21 and 26 then apply
 /// on the loop, in no frame.
 ///
-/// Seeds 2 and 13 stall, with or without this fix, and are pinned here so the pin fails the
-/// day they stop: the job's reading tasks held while its write waits (`Build::held`) are
-/// Running to the plane, so they hold its threads (2 in these tests), and the write's own task
-/// is admitted by threads like any other, so it never starts (the stall's line `2 tasks held,
-/// applying on node 21`). `a_reach_builds_its_views_proc_macros_and_build_scripts_before_it_reads_them`
-/// fails on the same stall at this commit's base. A stalled seed still applies nothing on the
-/// loop.
+/// No seed stalls: the job's reading tasks held while its write waits (`Build::held`) are
+/// Running to the plane and can take every worker thread (2 in these tests), and the write's
+/// own task is admitted by an IO thread, so it starts whatever they hold.
 #[test]
 fn a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds() {
     let mut stalled = Vec::new(); // alloc: a test's record
@@ -5804,13 +5800,10 @@ fn a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds()
                 vec![vec![3]],
                 "seed {seed}: the query read the build script's run applied"
             ),
-            Err(stall) => {
-                assert!(stall.contains("tasks held"), "seed {seed}: another stall: {stall}");
-                stalled.push(seed);
-            }
+            Err(stall) => stalled.push((seed, stall)),
         }
     }
-    assert_eq!(stalled, vec![2, 13], "the seeds whose held tasks fill every thread");
+    assert!(stalled.is_empty(), "seeds that stalled: {stalled:#?}");
 }
 
 /// A query of the head `/w`, its responses; it ended ok.
@@ -6052,14 +6045,8 @@ fn two_applying_queries_planted(seed: u64) -> Result<((usize, usize), Vec<Vec<us
 /// The invariant: a query whose view's proc macros and build scripts are built and applied
 /// first (`Jobs::units_applied`, its last write on a write's task) still hands its front end
 /// back: the second query lowers into it, and reads the build script's run applied.
-///
-/// The seeds that stall are pinned as in
-/// [`a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds`], so the pin
-/// fails the day they stop. It is the same stall, the job's write waiting on its held reading
-/// tasks, which hold the plane's two threads: seeds 2 and 13 in the first query, as there, and
-/// 1, 3, 24 and 27 in the second. It is not this change's: with the front end dropped
-/// (`job::PLANT_QUERY_DROPS_FRONT`, the code before) the second query stalls the same way, in
-/// seeds 7, 16, 22 and 24 (2026-11-14), a lowering anew giving another schedule.
+/// No seed stalls on its job's write: the write is admitted by an IO thread, as in
+/// [`a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds`].
 #[test]
 fn a_query_that_applies_its_views_units_still_hands_its_front_end_back_over_many_seeds() {
     let mut stalled = Vec::new(); // alloc: a test's record
@@ -6073,13 +6060,10 @@ fn a_query_that_applies_its_views_units_still_hands_its_front_end_back_over_many
                     "seed {seed}: each query read the build script's run applied: {read:?}"
                 );
             }
-            Err(stall) => {
-                assert!(stall.contains("tasks held"), "seed {seed}: another stall: {stall}");
-                stalled.push(seed);
-            }
+            Err(stall) => stalled.push((seed, stall)),
         }
     }
-    assert_eq!(stalled, vec![1, 2, 3, 13, 24, 27], "the seeds whose held tasks fill every thread");
+    assert!(stalled.is_empty(), "seeds that stalled: {stalled:#?}");
     // The control: with the front end dropped, the second query lowers anew.
     let planted = two_applying_queries(0, true).map(|it| it.0);
     assert_eq!(planted, Ok((1, 0)), "the planted bug's second query lowered into a kept front end");

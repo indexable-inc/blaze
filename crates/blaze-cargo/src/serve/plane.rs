@@ -576,6 +576,12 @@ impl<W: Work> Threads<W> {
                 self.on_pool += 1;
                 post_work(task, work, readers, self.done_tx);
             }
+            // A front end's write is admitted by an IO thread so the tasks it holds back cannot
+            // keep it from starting, and runs where every other front-end task runs: on the
+            // worker pool, in a frame, its panic caught.
+            Pool::Io if task.kind == kinds::FRONT_WRITE => {
+                post_work(task, work, readers, self.done_tx);
+            }
             Pool::Io => {
                 let job = IoJob { task, work, readers };
                 // The IO threads hold the receiver for as long as the process lives.

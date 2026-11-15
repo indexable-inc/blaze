@@ -6402,12 +6402,12 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// Job `id`'s write, its readers all gone, posted as a task of a plane request of its own
-    /// holding the writer ([`Does::Write`]), as a kept front end's store is. The plane admits
-    /// it by threads as any task: the job's held tasks (`Build::held`) are Running to the plane
-    /// and hold threads, so when they hold every one the write never starts and the build
-    /// stalls (open, 2026-11-13; `a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds`
-    /// pins the seeds). Its value
-    /// comes back to [`Jobs::wrote`]. A task the plane refuses gives the writer back, and the
+    /// holding the writer ([`Does::Write`]), as a kept front end's store is. It is admitted
+    /// against [`Pool::Io`]'s threads, not the worker pool's: the job's held tasks
+    /// (`Build::held`) are Running to the plane and take worker threads until the write is
+    /// applied, so a write admitted by worker threads never starts once they take every one.
+    /// It still runs on the worker pool, in a frame, as any task that reads a front end
+    /// (the plane's `Threads::post`). Its value comes back to [`Jobs::wrote`]. A task the plane refuses gives the writer back, and the
     /// job fails naming the refusal.
     fn send_write(&mut self, w: &mut World<'_, S>, id: JobId) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -6420,7 +6420,7 @@ impl<S: Steps> Jobs<S> {
         let mut fresh = w.plane.fresh(1, name.len(), 0);
         let write = w.plane.push_free(
             &mut fresh,
-            node(NodeKind::Names, &name, &[], Pool::Work, None),
+            node(NodeKind::Names, &name, &[], Pool::Io, None),
             one(kinds::FRONT_WRITE),
         );
         let asked = build.writer.write_wait();
