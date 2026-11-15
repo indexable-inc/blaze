@@ -4002,6 +4002,25 @@ pub fn roots(x: u32) -> u32 { dep::resize::<K>(x, &|y| y * 3) }
 /// A held body holds both ([`blaze_codegen::backend::Described::held_codes`]). Held by its own
 /// code alone, the build refused hashbrown's `reserve_rehash_inner`, which built in
 /// `resize_inner::<Global>` (sb-tplkey, Input 2).
+/// A library's walk closes no dyn facts, however its origins inline: an edit of it patches
+/// its kept walk. The control: the same policy's front end of a program may close them, so its
+/// walk runs whole.
+#[test]
+fn a_library_walk_closes_no_dyn_facts_where_a_program_walk_may() {
+    use blaze_codegen::backend::Frontend as _;
+    let (db, library) = held_as(fixture::db(DYN_FN_BUILT_IN).into_db(), &policy(OptLevel::O3));
+    let main = fixture::test_crate(db);
+    assert!(library.closes(), "the premise: before its roots, an inlining policy may close them");
+    library.with(|hir| library.devirt.makes(hir, super::RootKind::Library, main)).expect("one unit");
+    assert!(!library.closes(), "a library has no world");
+    let (db, program) = held_as(fixture::db(DYN_FN_BUILT_IN).into_db(), &policy(OptLevel::O3));
+    let main = fixture::test_crate(db);
+    program
+        .with(|hir| program.devirt.makes(hir, super::RootKind::Executable, main))
+        .expect("one program");
+    assert!(program.closes(), "a program of an inlining policy may close them");
+}
+
 #[test]
 fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
     use base_db::{Crate, all_crates};

@@ -2284,6 +2284,39 @@ fn an_epoch_end_lets_go_of_the_values_two_epochs_left_unread() {
     assert_eq!((db.runs_of("Tens", cold.0), db.runs_of("Tens", warm.0)), (2, 1));
 }
 
+/// An epoch's end with more unread values than one thread evicts (`PAR_EVICT`) lets go of each
+/// of them on the pool, keeping each one's hash: written so it is made again equal, none reruns
+/// its reader (were a hash lost, each would). The control is the warm cell, read in every
+/// epoch, whose value stays.
+#[test]
+fn an_epoch_end_lets_go_of_many_unread_values_keeping_their_hashes() {
+    const COLD: usize = 3 * super::function::PAR_EVICT;
+    let mut db = TestDb::new();
+    let cold: Vec<Cell> = (0..COLD as u64).map(|at| Cell::new(&db, 10 * at + 1, 0)).collect();
+    let (warm, other) = (Cell::new(&db, 21, 0), Cell::new(&db, 1, 0));
+    for (at, cell) in cold.iter().enumerate() {
+        assert_eq!(*get::<TensReader>(&db, *cell), at as u64 + 1);
+    }
+    let wrote = |db: &mut TestDb, value: u64| {
+        other.set_a(db, value);
+        assert_eq!(*get::<Tens>(&*db, warm), 2);
+        db.storage_mut().end_epoch().values
+    };
+    assert_eq!(wrote(&mut db, 2), 0, "the cold cells were read in this epoch");
+    assert_eq!(wrote(&mut db, 3), 0, "the cold cells were read in the epoch before");
+    assert_eq!(wrote(&mut db, 4), COLD, "every cold `Tens`, and only those");
+    assert_eq!(db.runs("Tens"), COLD + 1, "nothing ran again yet");
+    for (at, cell) in cold.iter().enumerate() {
+        cell.set_a(&mut db, 10 * at as u64 + 2);
+    }
+    for (at, cell) in cold.iter().enumerate() {
+        assert_eq!(*get::<TensReader>(&db, *cell), at as u64 + 1);
+    }
+    assert_eq!(db.runs("Tens"), 2 * COLD + 1, "each cold `Tens` made again once, equal");
+    assert_eq!(db.runs("TensReader"), COLD, "no reader ran again: each hash was kept");
+    assert_eq!(db.runs_of("Tens", warm.0), 1, "the warm value stayed");
+}
+
 #[test]
 fn an_evicted_value_recomputed_equal_does_not_rerun_its_readers() {
     let mut db = TestDb::new();
