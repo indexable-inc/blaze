@@ -1380,6 +1380,48 @@ fn a_launcher_starts_from_one_message_that_binds_what_the_runs_before_called() {
     assert_eq!(again, sent);
 }
 
+/// After a first run that called `f1`, a second launcher started with one message's room
+/// `room` (`program::ROOM`): whether it started, whether `f1` was bound before it ran, and
+/// whether it is once the launcher called it.
+fn started_within(room: impl Fn(&Sim) -> u64) -> (bool, bool, bool) {
+    let mut sim = Sim::new(Source::new(3), Plant::None).expect("built");
+    let first = sim.connect(4096);
+    sim.settle().expect("started");
+    let f1 = slot(1, 1, Plant::None);
+    sim.call(first, &f1).expect("called");
+    crate::program::ROOM.set(Some(room(&sim)));
+    let second = sim.connect(4096);
+    let settled = sim.settle();
+    crate::program::ROOM.set(None);
+    settled.expect("settled");
+    let bound = |sim: &Sim| {
+        let slot = sim.slot_of(second, &f1).expect("declared");
+        sim.launchers[second].bound[slot as usize].is_some()
+    };
+    let before = bound(&sim);
+    sim.call(second, &f1).expect("called");
+    (sim.launchers[second].started, before, bound(&sim))
+}
+
+/// The invariant: a launcher after runs that called more than one message carries starts,
+/// bound to the start and as many of what they called as fit, and is answered the rest on its
+/// first call of each, as a first run is (ripgrep's dev `rg` searching a tree called 15.5 MB of
+/// code, and every run after it was refused "longer than a message"). Control: with room for
+/// `f1` to the byte it is bound before the launcher runs, as `a_launcher_starts_from_one_message_
+/// that_binds_what_the_runs_before_called` has it at the full room.
+#[test]
+fn a_launcher_after_runs_that_called_more_than_a_message_carries_binds_what_fits() {
+    use crate::program::room_of;
+    let held = |sim: &Sim| {
+        let statics: u64 = sim.built.statics.iter().map(|it| room_of(&it.1).unwrap()).sum();
+        let entry = room_of(sim.built.of(&sim.built.entry.1).unwrap()).unwrap();
+        let f1 = room_of(sim.built.of(&slot(1, 1, Plant::None)).unwrap()).unwrap();
+        statics + entry + f1
+    };
+    assert_eq!(started_within(|sim| held(sim) - 1), (true, false, true), "f1 asked for at its first call");
+    assert_eq!(started_within(held), (true, true, true), "f1 bound before the launcher runs");
+}
+
 /// A program an image cannot hold is not started another way: the launcher's hello is
 /// refused, naming the case, what of the program it is and what to do. Here a launcher in
 /// pages of 4 bytes, past which every static of the program is aligned.

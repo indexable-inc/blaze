@@ -291,3 +291,69 @@ fn a_failed_method_call_uses_every_import_of_its_traits() {
     assert_eq!(typeck(TWO_IMPORTS), ["m::Other", "m::Other as Again"]);
     assert!(typeck(&TWO_IMPORTS.replace("().missing();", "")).is_empty());
 }
+
+/// Traits imported inside `fn`s written inside another, as ripgrep's `is_readable_stdin` and
+/// `PrinterPath::as_path` do: picked by a method call, by a type-relative path to an associated
+/// function, and one never picked.
+const NESTED: &str = r#"
+//- /lib.rs crate:main
+mod m {
+    pub trait Method { fn method(&self) {} }
+    impl Method for u8 {}
+    pub trait Assoc { fn assoc() {} }
+    impl Assoc for u8 {}
+    pub trait Unused { fn other(&self) {} }
+    impl Unused for u8 {}
+}
+fn outer() {
+    fn by_method() {
+        use m::Method;
+        use m::Unused;
+        0u8.method();
+    }
+    fn by_path() {
+        fn deeper() {
+            use m::Assoc;
+            u8::assoc();
+        }
+        deeper();
+    }
+    by_method();
+    by_path();
+}
+"#;
+
+/// The trees' text of the imports of `used` that type checking used, sorted.
+fn typeck_texts(db: &Db, used: &hir_def::nameres::uses::UsedImports) -> Vec<String> {
+    let mut texts: Vec<String> = used
+        .imports()
+        .filter(|&(it, _)| used.typeck_used(it))
+        .filter_map(|(import, _)| match import {
+            ImportOrExternCrate::Import(ImportId { use_, idx }) => {
+                Some(use_tree_to_view(db, use_.lookup(db).id, idx).to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    texts.sort();
+    texts
+}
+
+/// The invariant: a trait a body picks counts as used by type checking wherever the body is,
+/// a `fn` declared in another's block (two deep) included, so the imports lint does not call
+/// `use std::os::unix::fs::FileTypeExt` unused in ripgrep's nested `fn imp` where rustc is
+/// silent; a trait never picked stays unused. Control: the fold over the crate's def map's
+/// bodies alone (the bug: `crate_body_owners`, which holds no `fn` declared in a body) finds
+/// neither pick.
+#[test]
+fn a_trait_picked_in_a_nested_fn_is_used() {
+    let db = fixture::db(NESTED).into_db();
+    let krate = main_crate(&db);
+    assert_eq!(typeck_texts(&db, used_imports_with_traits(&db, krate)), ["m::Assoc", "m::Method"]);
+    let mut uses = Vec::new();
+    for owner in hir_def::nameres::demand::crate_body_owners(&db, krate) {
+        uses.extend_from_slice(super::body_trait_uses(&db, owner));
+    }
+    let planted = hir_def::nameres::uses::used_imports_with(&db, krate, &uses);
+    assert!(typeck_texts(&db, &planted).is_empty(), "the control finds the nested picks");
+}
