@@ -631,6 +631,57 @@ fn the_oracle_catches_an_item_level_call_taken_as_the_files_own() {
     }
 }
 
+/// A rule that writes a field or a type after a `:` and a plain macro's call (`inner: vec![]`,
+/// as nushell's `impl_from_value_for_uint!` does) calls the standard library's: a `:` alone ends
+/// no path. Two of them, spaced or not, do: `other::vec![]` calls another crate's `vec`, which
+/// keeps the crate unplain.
+#[test]
+fn a_rule_that_writes_a_field_before_a_plain_call_is_known() {
+    let known = "macro_rules! from {\n    ($t:ty) => {\n        impl F for $t {\n            fn f() -> S {\n                S { inner: vec![], msg: format!(\"x\") }\n            }\n        }\n    };\n}\nfrom!(u8);\n";
+    assert!(!code(known).unplain, "{known}");
+    for path in ["other::vec![]", "other :: vec![]", "other: :vec![]"] {
+        let text = format!("macro_rules! from {{\n    () => {{ const A: u8 = {path}; }};\n}}\nfrom!();\n");
+        assert!(code(&text).unplain, "{text}");
+    }
+}
+
+/// The control: with no `:` taken as a path's (the planted bug), a rule that calls another
+/// crate's `vec` by its path keeps its crate's surface.
+#[test]
+fn the_oracle_catches_a_path_taken_for_a_field() {
+    let text = "macro_rules! from {\n    () => { const A: u8 = other::vec![]; };\n}\nfrom!();\n";
+    assert!(code(text).unplain);
+    assert!(!planting(Plant::Colon, || code(text)).unplain);
+}
+
+/// A method's own `impl Trait` keeps its own body in the interface, and no other body of its
+/// `impl` (nushell's `impl Value`, whose `-> impl Iterator` method kept every body of 2000
+/// lines); an associated type that hides its type keeps every body of the `impl`.
+#[test]
+fn a_methods_hidden_type_keeps_its_own_body_alone() {
+    let methods = |a: u8, b: u8| {
+        format!("impl X {{\n    fn a() -> impl Sized {{\n        {a}\n    }}\n    fn b() -> u8 {{\n        {b}\n    }}\n}}\n")
+    };
+    let was = code(&methods(1, 2)).interface;
+    assert_eq!(was, code(&methods(1, 3)).interface, "the plain method's body is left out");
+    assert_ne!(was, code(&methods(4, 2)).interface, "the hiding method's body is kept");
+    assert_ne!(code(&associated(1)).interface, code(&associated(2)).interface);
+}
+
+/// An `impl` whose associated type hides its type, given it by `next`'s body returning `n`.
+fn associated(n: u8) -> String {
+    format!("impl Iterator for X {{\n    type Item = impl Sized;\n    fn next(&mut self) -> Option<Self::Item> {{\n        Some({n})\n    }}\n}}\n")
+}
+
+/// The control: with every `impl Trait` of an `impl` taken as a function's own (the planted
+/// bug), the body that gives an associated type its hidden type is left out of the interface.
+#[test]
+fn the_oracle_catches_an_associated_types_body_left_out() {
+    let edit = || code(&associated(1)).interface == code(&associated(2)).interface;
+    assert!(!edit());
+    assert!(planting(Plant::Opaque, edit));
+}
+
 /// What kind of item a generated file holds: what of it another crate's check reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
