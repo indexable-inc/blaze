@@ -191,8 +191,12 @@ What the wiring does not do yet (each a known gap, in the order to close them):
    (a task with no job), run as the daemon starts; the same piece gap 2 needs.
 2. **Outputs are hashed on the loop** where no stamp vouches (`Effect::ReadAll`, then the
    hash, in the span `request certificate: hash an output no stamp vouches for`): every
-   output at a daemon's first check, and each output a build wrote less than two seconds
-   before its stamp was taken. Needed: a pool task, bounded, with a span.
+   output at a daemon's first check. An output the store placed (its look right after its
+   rename is always inside the racy window) is vouched for between requests once the window
+   has passed (`serve/job/vouch.rs`: looked at, read and hashed, looked at again, on the loop
+   while no job or check runs), and the jobs' record and the evidence keep the steady stamp;
+   one a request checks before that is hashed by the check, as before. Needed still: the hash
+   on a pool task, bounded, with a span.
 3. **Closed by certificate6 (uncompiled when written): a build script's reads are its
    record's.** `Writer::read_seen` hands every read of the machine's files a traced step's
    record rests on (`work::Seen`: a file, a listing or a tree hashed whole, by real path,

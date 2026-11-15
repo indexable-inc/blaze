@@ -62,7 +62,7 @@ use crate::{
 pub use blaze_image::Corrupt;
 
 pub use crate::{
-    disk::{COARSE_NS, FINE_NS, MARK_MOST, racy, window_ns},
+    disk::{COARSE_NS, FINE_NS, MARK_MOST, racy, steady_at, window_ns},
     image::{Bytes, DisksUnused, ImageError, ImageFile, ImageMark, ImageUse, tree_layout},
     lent::lent,
     reader::{Pinned, Reader},
