@@ -58,13 +58,19 @@ pub(super) fn compose<'a, 'p, F: Files, A: Allocator, B: Allocator>(
     let mut inner = Vec::new_in(Global);
     let mut captures = Vec::new_in(Global);
     let mut rewritten = Vec::new_in(Global);
+    // Where the file being written starts in `done`: the actions are sorted by file, so an
+    // action looks for the edits it holds among its own file's, not the whole request's.
+    let mut file_from = 0;
     for action in placed {
         rewritten.clear();
+        if done.last().is_some_and(|last: &Done<'_>| last.made.edit.path != action.path) {
+            file_from = done.len();
+        }
         let (node, by) = (action.range, action.by);
         // A delete is a replace whose template writes nothing; an insertion holds no text.
         if matches!(action.kind, TextKind::Replace | TextKind::Delete) {
             inner.clear();
-            inner.extend((0..done.len()).filter(|&at| within(&done[at], &action)));
+            inner.extend((file_from..done.len()).filter(|&at| within(&done[at], &action)));
             inner.sort_by(|&a: &usize, &b: &usize| by_place(&done[a].made.edit, &done[b].made.edit));
             captures_of(facts, &action, &mut captures);
             let loose = inner.iter().find(|&&at| !captures.iter().any(|(_, it)| holds(*it, &done[at])));

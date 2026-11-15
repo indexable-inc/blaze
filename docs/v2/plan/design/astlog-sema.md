@@ -317,6 +317,8 @@ reference model for a property test only.
   so an edit inside it is refused as an overlap. The end state binds a run as a range of
   sibling nodes that carries its text, and composes an edit inside it like one in a `$name`
   capture.
+- A template variable bound to a node outside the replaced range. Its text is copied as the
+  file has it, even when another edit of the request rewrites that node where it stands.
 - Rules across checkouts: the target is the daemon's view of one workspace.
 - Build selection for a rules file. `--query`, `--rules` and `--replace` read the daemon's view
   of the whole checkout and refuse `-p`, `--features`, `--target`, target selection and the
