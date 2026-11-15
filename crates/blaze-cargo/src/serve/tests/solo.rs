@@ -722,7 +722,7 @@ fn caught(plant: Planted) -> Option<String> {
     })
 }
 
-/// The invariant (I1 for both sources): between any two turns of the loop, after any crash, with
+/// The invariant: (I1 for both sources) between any two turns of the loop, after any crash, with
 /// or without a daemon, across edits made while none ran, a collection, and a second client, a
 /// `Solo` driven over the simulation's files answers `Hit(a)` only where a daemon started fresh
 /// on those files answers the request `a` with no job; and the run after a build that passed and

@@ -133,6 +133,8 @@ mod tests {
         assert!(!held("//- minicore: sized\nfn assert_eq(a: u8, b: u8) {}\nfn main() {}"));
     }
 
+    /// The invariant: a fixture's assertion helper is held ([`hold`]) when a call of it that
+    /// fails stops the program, and refused when it returns.
     #[test]
     fn a_helper_that_stops_the_program_is_held() {
         // A typed hole does not lower, so a call of it fails: the helper of most fixtures.

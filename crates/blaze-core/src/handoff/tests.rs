@@ -85,8 +85,8 @@ mod theorems {
         }
     }
 
-    /// The theorem's function holds on drawn schedules, picks and flags, reached with both
-    /// orders of the two swaps.
+    /// The invariant: no hand-back is missed (the theorem's function holds) on drawn
+    /// schedules, picks and flags, reached with both orders of the two swaps.
     #[test]
     fn no_hand_back_is_missed_where_it_is_run() {
         let config = Config {

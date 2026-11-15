@@ -377,7 +377,7 @@ fn oracle(turns: &[generate::Turn]) {
     check::verdict(&test, "sim seed 0", &rows, &note);
 }
 
-/// The oracle (docs/harness.md): after any drawn sequence of edits of the library, saves,
+/// The invariant: (the oracle, docs/harness.md) after any drawn sequence of edits of the library, saves,
 /// restarts, second databases and dropped builds, the incremental build's records are a
 /// clean build's, nothing panics, and a turn makes no function its edit does not reach.
 /// `BLAZE_SIM_SEEDS=<n>` runs it longer.

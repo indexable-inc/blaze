@@ -31,7 +31,8 @@ fn fixture(meta: &str, source: &str) -> String {
     format!("//- {flags}, panic\n{rest}{PRE}{}", source.replace("LOG", LOG))
 }
 
-/// `source`'s `main` returns: every `check` in it held.
+/// The invariant: `source`'s `main` returns, every `check` in it held (each test here is a
+/// program of a stabilized feature run on the evaluator).
 #[track_caller]
 fn runs(meta: &str, source: &str) {
     check_pass_and_stdio(&fixture(meta, source), "", "");

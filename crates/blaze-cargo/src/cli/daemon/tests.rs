@@ -36,8 +36,8 @@ fn a_response_handed_in_place_is_the_one_sent() {
     assert_eq!(got, [(sent[0].clone(), true), (sent[1].clone(), false)]);
 }
 
-/// What `stop` and `status` may say when nothing listens at their socket. The invariant: "no
-/// daemon is running" (`Ok`) only when no daemon holds the state; one that does is the error,
+/// The invariant: when nothing listens at their socket, `stop` and `status` say "no daemon is
+/// running" (`Ok`) only when no daemon holds the state; one that does is the error,
 /// named by its pid, its lock and the socket that was asked (agents.json A37).
 #[test]
 fn no_daemon_is_said_only_when_none_holds_the_state() {

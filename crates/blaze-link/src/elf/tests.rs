@@ -2043,9 +2043,9 @@ fn moved_addresses_cost(n: usize, whole: bool) -> (u32, usize) {
     (last.rela.entries, differ)
 }
 
-/// The counter: a one-function edit's change of the slid addresses (one out, two in
-/// elsewhere) writes the same few entries of `.rela.dyn` in an image of 1,000 functions as
-/// in one of 16,000, and the table differs from the link before's in as few.
+/// The invariant: (a counter) a one-function edit's change of the slid addresses (one out,
+/// two in elsewhere) writes the same few entries of `.rela.dyn` in an image of 1,000
+/// functions as in one of 16,000, and the table differs from the link before's in as few.
 #[test]
 fn an_edit_that_moves_slid_addresses_writes_their_entries_alone() {
     let costs = [1_000, 16_000].map(|n| moved_addresses_cost(n, false));

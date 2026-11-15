@@ -81,6 +81,9 @@ fn case(parts: Parts, turns: &[Turn]) {
     }
 }
 
+/// The invariant: after any drawn sequence of edits, saves, builds, restarts and kills, what an
+/// incremental build gives is what a clean build of the same sources gives (docs/harness.md,
+/// "The oracle").
 #[test]
 #[ignore = "minutes of real builds a case: docs/harness.md, \"The oracle\""]
 fn any_turn_sequence_builds_as_clean() {

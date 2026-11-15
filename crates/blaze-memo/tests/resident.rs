@@ -120,6 +120,9 @@ fn refines<M: Memo>(ops: &[Op], mut mine: M) -> Result<(), String> {
     Ok(())
 }
 
+/// The refinement: (the file's) after every operation of any sequence, blaze-memo's `Resident`
+/// and blaze-keyed's reference give the same answer to every get and hold the same
+/// `resident_bytes`.
 #[test]
 fn resident_refines_the_reference() {
     blaze_sim::check(blaze_sim::Config::cases(300), |tape| {

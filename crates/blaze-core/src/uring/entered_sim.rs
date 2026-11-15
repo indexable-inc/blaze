@@ -453,7 +453,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     world.settle()
 }
 
-/// The invariant, over drawn schedules of submits, polls, kernel workers and signals: no
+/// The invariant: over drawn schedules of submits, polls, kernel workers and signals, no
 /// request is lost or submitted twice, a submit hands the kernel all it wrote and posts what
 /// ended in it, every completion is reaped once, and no wait sleeps with nothing to end it.
 /// `BLAZE_SIM_SEEDS=<n>` runs it longer.

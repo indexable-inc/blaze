@@ -271,7 +271,7 @@ fn runs(ops: &[Op], seed: u64, planted: bool) -> Result<World, String> {
     Ok(world)
 }
 
-/// The invariant, under no pool budget: no reader waits at a bound or is refused whatever
+/// The invariant: under no pool budget, no reader waits at a bound or is refused whatever
 /// the readers running at once pin between them, `tidy` lets the table of pins go once it
 /// holds more than `pins_most`, and a table let go is freed once every reader that ran then
 /// has ended, and not before. `BLAZE_SIM_SEEDS=<n>` runs it longer.

@@ -2859,7 +2859,7 @@ mod tests {
     /// driver and the threads driver, and of a missing file make it
     /// ([`crate::fs::assert_syncs_a_sealed_file`], with its control).
     #[test]
-    fn a_sync_of_a_sealed_file_succeeds_on_each_driver() {
+    fn a_sync_of_a_sealed_file_succeeds_on_kqueue_and_the_threads_driver() {
         let root = dir("sync-sealed");
         crate::fs::assert_syncs_a_sealed_file(&mut Kqueue::new(&root, 1).unwrap(), &root);
         let threads = dir("sync-sealed-threads");

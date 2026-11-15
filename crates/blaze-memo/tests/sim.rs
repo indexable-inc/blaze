@@ -481,7 +481,8 @@ fn run_with(tape: &Tape, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), 
     Ok(())
 }
 
-/// The invariant at the top of this file, over many cases.
+/// The invariant: the one at the top of this file (in every snapshot, under any interleaving),
+/// over many cases.
 #[test]
 fn every_interleaving_answers_as_the_evaluator() {
     blaze_sim::check(blaze_sim::Config::cases(64), |tape| run(tape, Plant::None));
