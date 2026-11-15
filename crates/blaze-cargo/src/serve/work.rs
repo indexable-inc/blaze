@@ -880,6 +880,12 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// bind record answers, made with the front end (`run::needs`), until `wanted` is set,
     /// every launcher has gone, or none attached in time. What it made for the store.
     fn serve_needs(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) -> Vec<KeptPut>;
+    /// On a worker, by the task that stores a kept front end, where it does not reach
+    /// [`Steps::serve_needs`]: the store failed or panicked, or the front end was taken before
+    /// the task ran. The first calls of checkout `checkout`'s launched runs that its build's
+    /// link held the front end for are refused now, naming `why`, as every later one is until a
+    /// link holds one again: none waits for a task that will not come.
+    fn lose_needs(&self, checkout: &str, why: &str);
     /// On the loop, just after a request set a stored front end's `wanted`: wakes the task
     /// serving launched runs' first calls ([`Steps::serve_needs`]), so it lets the front end go.
     fn wake_needs(&self);

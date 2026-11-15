@@ -350,10 +350,6 @@ pub struct Stored {
     /// value made from the crate as this database resolved it is filed by
     /// (`blaze_diagnostics::cache`).
     pub filed: HashMap<Crate, ContentId, Global>,
-    /// The record families ([`super::found::family`]) written of each crate of `written`:
-    /// its image and its def map pages. What a found record
-    /// of the crate says it has; the impl tables are another store's to add.
-    pub families: u32,
 }
 
 /// Reads each of `crates` that is [`eligible`] (and its dependencies) from the image `images`
@@ -903,7 +899,6 @@ pub fn store(
         _ = made[at].set(made_now);
     });
     let mut stored = Stored::default();
-    stored.families = super::found::family::IMAGE | super::found::family::DEF_MAP_PAGES;
     for (&(krate, _), made) in order.iter().zip(made) {
         let made = made.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))

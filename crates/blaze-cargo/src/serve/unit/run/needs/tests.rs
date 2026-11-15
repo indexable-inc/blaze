@@ -10,7 +10,9 @@ use blaze_core::sim::{Faults, Sim};
 use blaze_ids::ContentId;
 use blaze_launch_host::Conn;
 
-use super::{ATTACH, BUILD, Front, FrontPlant, Heard, Need, Plant, Refuse, Serve, Served, Step, Want};
+use blaze_sim::{Broke, Config, Tape};
+
+use super::{ATTACH, BUILD, Front, FrontPlant, Heard, Need, Plant, Refuse, SERVED_WITHIN, Serve, Served, Step, Want};
 
 /// What became of one run of the task.
 struct Ran {
@@ -213,9 +215,11 @@ fn front_run(seed: u64, plant: FrontPlant) -> Option<String> {
                     ended.extend(queued.drain(..));
                 }
             }
-            // The build's link, only of a request under way.
+            // The build's link, only of a request under way, and the task after it at once
+            // (`held_front_run` takes them apart).
             2 if requests > 0 && !front.is_held() => {
-                front.held();
+                front.held(now, !queued.is_empty());
+                front.serving();
                 serving = true;
                 ended.extend(queued.drain(..));
             }
@@ -297,4 +301,192 @@ fn a_need_with_no_front_end_asks_one_build_and_ends_made_or_refused() {
         let caught = (0..2_000).any(|seed| front_run(seed, plant).is_some());
         assert!(caught, "{plant:?} is not caught");
     }
+}
+
+/// What the model of [`held_front_run`] knows of the program's front end, apart from the core.
+struct Model {
+    /// Each need queued and not yet served or refused: its number, and when its wait began
+    /// (its queueing, or the last link or hand-back after it).
+    queued: Vec<(u32, Duration)>,
+    /// Each need served or refused, by number.
+    ended: Vec<u32>,
+    /// A build's link holds the front end for the program, and has not let it go.
+    linked: bool,
+    /// The task after that build serves from it now.
+    serving: bool,
+    /// The front end the last link held was lost (the store after its answer failed).
+    lost: bool,
+    /// Requests the daemon sent itself that have not ended.
+    requests: u32,
+}
+
+impl Model {
+    fn end_all(&mut self) {
+        self.ended.extend(self.queued.drain(..).map(|(need, _)| need));
+    }
+
+    /// The oracle, after every event: once the front end is lost no need waits, and no need
+    /// waits with no task serving past its bound (`SERVED_WITHIN` while a link holds the front
+    /// end, `BUILD` while a build is asked).
+    fn broken(&self, now: Duration) -> Result<(), Broke> {
+        if self.lost && !self.queued.is_empty() {
+            return Err(Broke::Oracle(format!(
+                "{} needs wait after the front end its link held was lost, for a task that will not come",
+                self.queued.len()
+            )));
+        }
+        if self.serving {
+            return Ok(());
+        }
+        let bound = if self.linked { SERVED_WITHIN } else { BUILD };
+        match self.queued.iter().find(|(_, from)| now.saturating_sub(*from) >= bound) {
+            Some((need, from)) => Err(Broke::Oracle(format!(
+                "need {need} waited {} s with no task serving, past its bound of {} s",
+                now.saturating_sub(*from).as_secs(),
+                bound.as_secs()
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// One run of a program's [`Front`] from the tape, with the build's link and the task after
+/// its answer apart, as they are: first calls no record answers, links, the serving task
+/// starting and ending (`Wanted` or `Detached`), the store after an answer failing
+/// ([`Front::lost`], as `launch::lose_needs` drives it), the daemon's own request ending, and
+/// the clock moving with the loop's tick. The driver's half is done as `launch` does it.
+fn held_front_run(tape: &Tape, plant: FrontPlant) -> Result<(), Broke> {
+    let mut front = Front::new();
+    front.plant = plant;
+    let mut now = Duration::ZERO;
+    let mut model =
+        Model { queued: Vec::new(), ended: Vec::new(), linked: false, serving: false, lost: false, requests: 0 };
+    let mut next = 0u32;
+    let events: usize = tape.int_in(1..=40, "events");
+    for _ in 0..events {
+        match tape.int_in(0u8..=7, "event") {
+            // A launcher's first call no record answers.
+            0 | 1 => {
+                let need = next;
+                next += 1;
+                match front.want(now) {
+                    Want::Build => {
+                        model.requests += 1;
+                        model.queued.push((need, now));
+                    }
+                    Want::Queue => model.queued.push((need, now)),
+                    Want::Refuse if model.lost => model.ended.push(need),
+                    Want::Refuse => return Err(Broke::Oracle(format!("need {need} was refused with no loss"))),
+                }
+                if model.serving {
+                    model.end_all();
+                }
+            }
+            // A build's link: the daemon's own or a person's `blaze run`.
+            2 if !model.serving => {
+                front.held(now, !model.queued.is_empty());
+                model.linked = true;
+                model.lost = false;
+                for (_, from) in &mut model.queued {
+                    *from = now;
+                }
+            }
+            // The task after the linked build's answer starts serving, and takes the queue; or,
+            // once lost, the task after a later build of the checkout.
+            3 if (model.linked || model.lost) && !model.serving => {
+                front.serving();
+                model.linked = true;
+                model.lost = false;
+                model.serving = true;
+                model.end_all();
+            }
+            // The task hands the front end to a request that wants it (`Wanted`).
+            4 if model.serving => {
+                model.serving = false;
+                front.handed_back(now, !model.queued.is_empty());
+            }
+            // The task ends with no launcher left (`Detached`): no one holds the front end.
+            5 if model.serving => {
+                model.serving = false;
+                model.linked = false;
+                front.let_go();
+            }
+            // The store after a build's answer failed (or panicked, or found the front end
+            // taken): its task serves no more.
+            6 => {
+                tape.reached("a loss");
+                if front.lost("the store refused a record") {
+                    model.end_all();
+                }
+                if model.linked {
+                    model.lost = true;
+                    model.linked = false;
+                    model.serving = false;
+                }
+            }
+            // The daemon's own request ends, well or not.
+            7 if model.requests > 0 => {
+                model.requests -= 1;
+                if front.built(tape.bool("built well")).is_some() {
+                    model.end_all();
+                }
+            }
+            // The clock moves, and the loop ticks.
+            _ => {
+                now += Duration::from_secs(tape.int_in(0u64..=90, "seconds"));
+                if let Some(refused) = front.tick(now) {
+                    model.end_all();
+                    if refused == Refuse::Unserved {
+                        model.linked = false;
+                    }
+                }
+            }
+        }
+        model.broken(now)?;
+    }
+    // Every request ends, and the clock runs past every bound, with the loop's tick.
+    while model.requests > 0 {
+        model.requests -= 1;
+        if front.built(true).is_some() {
+            model.end_all();
+        }
+    }
+    now += BUILD.max(SERVED_WITHIN) * 2;
+    if front.tick(now).is_some() {
+        model.end_all();
+    }
+    model.broken(now)?;
+    model.ended.sort_unstable();
+    if model.ended.windows(2).any(|it| it[0] == it[1]) {
+        return Err(Broke::Oracle("a need was served or refused twice".to_owned()));
+    }
+    Ok(())
+}
+
+/// The invariant: a run either starts, or ends with a named failure, within its bound of its
+/// build's answer. Over every order of first calls, links, the serving task's start and end,
+/// the store after an answer failing, the daemon's own request ending and the clock, a need
+/// queued while no task serves is refused at once once the front end its link held is lost,
+/// and otherwise served or refused within `SERVED_WITHIN` of its wait's start while a link
+/// holds the front end (within `BUILD` while a build is asked); each need ends once.
+/// Controls: `FrontPlant::LeftOpen` (the held run is left open: a loss is not heard, the
+/// ripgrep hang) and `FrontPlant::Unbounded` (the wait has no bound).
+#[test]
+fn a_need_held_for_a_task_that_never_comes_is_refused_by_name_within_its_bound() {
+    let config = || Config::cases(1_024).must_reach(&["a loss"]);
+    blaze_sim::control(config(), FrontPlant::None, FrontPlant::LeftOpen, "was lost", held_front_run);
+    blaze_sim::control(config(), FrontPlant::None, FrontPlant::Unbounded, "past its bound", held_front_run);
+    // The ripgrep case by hand: link, answer, a first call, the store fails.
+    let mut front = Front::new();
+    front.held(Duration::ZERO, false);
+    assert_eq!(front.want(Duration::from_secs(1)), Want::Queue, "held: queued for the task");
+    assert!(front.lost("the store holds other bytes under 7f98e0838b31"));
+    assert_eq!(front.want(Duration::from_secs(2)), Want::Refuse, "lost: refused at once");
+    assert_eq!(front.lost_why(), Some("the store holds other bytes under 7f98e0838b31"));
+    front.held(Duration::from_secs(3), false);
+    assert_eq!(front.want(Duration::from_secs(3)), Want::Queue, "a link holds one again");
+    // With no loss said, the bound ends it.
+    assert_eq!(front.tick(Duration::from_secs(3) + SERVED_WITHIN - Duration::from_secs(1)), None);
+    assert_eq!(front.due(), Some(blaze_core::wait::Deadline::after(Duration::from_secs(3), SERVED_WITHIN)));
+    assert_eq!(front.tick(Duration::from_secs(3) + SERVED_WITHIN), Some(Refuse::Unserved));
 }
