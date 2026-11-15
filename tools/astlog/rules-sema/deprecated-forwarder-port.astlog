@@ -1,0 +1,50 @@
+;; Ports every call of a `#[deprecated]` function whose whole body forwards its parameters, in
+;; order, to another function: the call names the replacement instead. Then the forwarder has
+;; no callers and is deleted by hand (rule 30: merge duplicates, ban the removed name).
+;;
+;; Rule 13 moves an API by a `.clippy.toml` ban and `blaze check --fix`, which renames a path
+;; one-for-one. This rule does the case a ban cannot know is safe: the forwarder's own body is
+;; the proof that the two calls mean the same, because each parameter is passed on unchanged
+;; and in order. The replacement is written as each call's module names it (`retarget`), and
+;; its def path comes from a variable bound to its text, not from the rules file.
+;;
+;; The body is matched as a block (`{ $callee($a) }`) under the FN node: an `item` pattern
+;; `fn $name(..) { .. }` matches no function that carries an attribute or a doc comment, and
+;; every forwarder carries `#[deprecated]`. One and two parameters; a third needs a third rule,
+;; since a `$$$` run cannot be compared with the parameter list element by element.
+
+(rule (deprecated-fn n d) (syntax n "FN") (defines n d) (attribute d "deprecated"))
+
+;; Parameter `p` of FN `n` binds the name `ip`.
+(rule (param n p ip)
+  (deprecated-fn n d)
+  (child n pl) (kind pl "PARAM_LIST")
+  (child pl p) (kind p "PARAM")
+  (child p ip) (kind ip "IDENT_PAT"))
+(rule (params n c) (deprecated-fn n d) (count c (param n p ip)))
+
+(rule (forwarder d g)
+  (deprecated-fn n d) (params n c) (le c 1)
+  (expr body "{ $callee($a) }") (parent n body)
+  (param n p ip) (same-text ip a)
+  (resolves callee g) (def-kind g "fn"))
+(rule (forwarder d g)
+  (deprecated-fn n d) (params n c) (le 2 c) (le c 2)
+  (expr body "{ $callee($a, $b) }") (parent n body)
+  (param n p ip) (same-text ip a)
+  (param n q iq) (same-text iq b)
+  (precedes p q)
+  (resolves callee g) (def-kind g "fn"))
+
+;; A call of the forwarder: the path expression a call expression calls. A `use` tree naming
+;; the forwarder is left alone; it goes unused once its calls are ported.
+(rule (call-of d p g)
+  (forwarder d g)
+  (references d r)
+  (parent p r) (kind p "PATH_EXPR")
+  (parent call p) (kind call "CALL_EXPR"))
+
+(rewrite deprecated-forwarder-port (call-of d p g)
+  (not (in-macro-expansion p))
+  (text g to)
+  (retarget p to))

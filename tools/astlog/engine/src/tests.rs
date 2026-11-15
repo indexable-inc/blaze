@@ -12,7 +12,7 @@ use crate::eval::{Facts, Row, Value};
 use crate::program::{
     Language, Needs, Parsed, Program, Segment, TemplateSyntax, parse_template, terms,
 };
-use crate::{Error, Sexpr};
+use crate::{Error, Line, Sexpr};
 
 #[derive(Debug)]
 struct Graph;
@@ -40,7 +40,7 @@ impl Language for Graph {
     fn parse_atom(
         head: &str,
         args: &[Sexpr],
-        _line: usize,
+        _line: &Line,
     ) -> Result<Option<Parsed<GraphAtom>>, Error<GraphError>> {
         let (value, needs) = match head {
             "edge" => (GraphAtom::Edge, Needs::Nothing),
@@ -53,7 +53,7 @@ impl Language for Graph {
     fn parse_action(
         _head: &str,
         _args: &[Sexpr],
-        _line: usize,
+        _line: &Line,
     ) -> Result<Option<Parsed<()>>, Error<GraphError>> {
         Ok(None)
     }
@@ -68,7 +68,7 @@ impl Facts for Edges {
     fn solve(
         &self,
         atom: &GraphAtom,
-        _line: usize,
+        _line: &Line,
         inputs: &[Option<Value<u32>>],
         out: &mut Vec<Row<u32>>,
     ) -> Result<(), Error<GraphError>> {
@@ -275,15 +275,16 @@ fn nested(depth: usize) -> String {
 #[test]
 fn a_rules_file_nested_past_the_depth_cap_is_refused_naming_its_line() {
     let max = crate::sexpr::MAX_DEPTH;
-    let at_cap = crate::sexpr::parse::<GraphError>(&nested(max));
+    let at_cap = crate::sexpr::parse::<GraphError>(&nested(max), None);
     assert!(at_cap.is_ok(), "{max} levels read: {at_cap:?}");
     let text = format!("(rule (r a) (edge a b))\n{}", nested(max + 1));
     let past = Program::<Graph>::parse(&text).expect_err("one level past the cap");
-    assert!(matches!(past, Error::TooDeep { line: 2, .. }), "{past}");
+    assert!(matches!(past, Error::TooDeep { ref line, .. } if *line == 2), "{past}");
     assert!(past.to_string().starts_with("rules:2: ") && past.to_string().contains("nested"));
     // Far past the cap is refused the same way, not by the reader overflowing its stack.
-    let far = crate::sexpr::parse::<GraphError>(&nested(1_000_000)).expect_err("far past the cap");
-    assert!(matches!(far, Error::TooDeep { line: 1, .. }), "{far}");
+    let far =
+        crate::sexpr::parse::<GraphError>(&nested(1_000_000), None).expect_err("far past the cap");
+    assert!(matches!(far, Error::TooDeep { ref line, .. } if *line == 1), "{far}");
 }
 
 #[test]
@@ -349,7 +350,7 @@ impl Facts for Counted {
     fn solve(
         &self,
         atom: &GraphAtom,
-        line: usize,
+        line: &Line,
         inputs: &[Option<Value<u32>>],
         out: &mut Vec<Row<u32>>,
     ) -> Result<(), Error<GraphError>> {
@@ -400,7 +401,7 @@ fn a_source_atom_asked_the_same_inputs_twice_is_called_once() -> Result<(), Erro
 #[test]
 fn dollar_templates_splice_and_escape()-> Result<(), Error<GraphError>> {
     let template =
-        parse_template::<GraphError>(TemplateSyntax::Dollar, "$a + ${b}c $$ $$$args", 1)?;
+        parse_template::<GraphError>(TemplateSyntax::Dollar, "$a + ${b}c $$ $$$args", &Line::rules(1))?;
     assert_eq!(
         template.segments,
         [
@@ -411,7 +412,7 @@ fn dollar_templates_splice_and_escape()-> Result<(), Error<GraphError>> {
             Segment::Var("args".to_owned()),
         ]
     );
-    let stray = parse_template::<GraphError>(TemplateSyntax::Dollar, "cost $5", 1);
+    let stray = parse_template::<GraphError>(TemplateSyntax::Dollar, "cost $5", &Line::rules(1));
     assert!(stray.is_err(), "`$5` is no variable");
     Ok(())
 }
@@ -423,7 +424,7 @@ fn a_regex_that_does_not_compile_or_is_past_the_size_cap_is_refused_at_load() {
     )
     .expect_err("an unclosed group is refused when the file is read, before any fact");
     assert!(
-        matches!(unclosed, Error::Regex { line: 2, ref name, .. } if name == "text-match"),
+        matches!(unclosed, Error::Regex { ref line, ref name, .. } if *line == 2 && name == "text-match"),
         "{unclosed}"
     );
     // The `regex` crate's own default takes this pattern; the cap is what refuses it.
@@ -431,7 +432,7 @@ fn a_regex_that_does_not_compile_or_is_past_the_size_cap_is_refused_at_load() {
     assert!(regex::Regex::new(big).is_ok(), "within the crate's default limit");
     let rules = format!("(rule (m a) (edge a b) (text-match a \"{}\"))", big.replace('\\', "\\\\"));
     let past = Program::<Graph>::parse(&rules).expect_err("past MAX_REGEX_BYTES");
-    assert!(matches!(past, Error::Regex { line: 1, .. }), "{past}");
+    assert!(matches!(past, Error::Regex { ref line, .. } if *line == 1), "{past}");
 }
 
 #[test]
@@ -528,7 +529,7 @@ fn case_is_a_builtin_with_a_literal_style_and_refuses_text_that_is_no_identifier
     assert!(style.to_string().contains("`\"Title\"`") || style.to_string().contains("`Title`"), "{style}");
     let spaced = Program::<Graph>::parse("(rule (r y) (edge a b) (case \"a b\" \"snake\" y))")?;
     let error = semi_naive(&spaced, &Edges(vec![(1, 2)])).expect_err("`a b` has a space");
-    assert!(matches!(error, Error::CaseNotIdentifier { line: 1, ref text } if text == "a b"), "{error}");
+    assert!(matches!(error, Error::CaseNotIdentifier { ref line, ref text } if *line == 1 && text == "a b"), "{error}");
     Ok(())
 }
 
@@ -548,14 +549,42 @@ fn a_negated_builtin_holds_when_the_builtin_gives_no_row() -> Result<(), Error<G
 }
 
 #[test]
-fn a_negated_builtin_with_an_unbound_variable_or_a_counted_builtin_is_refused() {
+fn a_negated_builtin_with_an_unbound_variable_or_a_count_of_an_atom_with_an_unbound_input_is_refused() {
     let unbound =
         Program::<Graph>::parse("(rule (r a) (edge a b) (not (text-capture a \"(\\\\d)\" g)))")
             .expect_err("`g` is bound by nothing to the left");
     assert!(matches!(unbound, Error::UnsafeNegation { ref var, .. } if var == "g"), "{unbound}");
-    let counted = Program::<Graph>::parse("(rule (r a n) (edge a b) (count n (text a t)))")
-        .expect_err("a builtin is no finite relation to count");
-    assert!(counted.to_string().contains("(count ...) cannot read the builtin `text`"), "{counted}");
+    let builtin = Program::<Graph>::parse("(rule (r a n) (edge a b) (count n (text x t)))")
+        .expect_err("`text` needs its node, and `x` is bound by nothing before the count");
+    assert!(
+        matches!(builtin, Error::UnboundBuiltinArg { ref name, ref arg, .. } if name == "text" && arg == "x"),
+        "{builtin}"
+    );
+    let source = Program::<Graph>::parse("(rule (r a n) (edge a b) (count n (succ x y)))")
+        .expect_err("`succ` needs its first column, and `x` is bound by nothing before the count");
+    assert!(
+        matches!(source, Error::UnboundSourceArg { ref name, ref arg, .. } if name == "succ" && arg == "x"),
+        "{source}"
+    );
+}
+
+/// A count reads a source atom or a builtin as it reads a relation: the distinct rows that agree
+/// with what is bound, none being a count of 0.
+#[test]
+fn count_counts_the_distinct_rows_of_a_source_atom_or_a_builtin() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (fanout a n) (edge a x) (count n (edge a b)))
+         (rule (next a n) (edge a x) (count n (succ a b)))
+         (rule (busy a m) (fanout a n) (count m (lt 1 n)))
+         (rule (named a n) (edge a x) (count n (text-capture a \"(\\\\d)\" d)))",
+    )?;
+    // `edge` answers (1, 2) twice: one distinct row.
+    let sets = semi_naive(&program, &Edges(vec![(1, 2), (1, 2), (1, 3), (2, 3), (12, 1)]))?;
+    assert_eq!(rows(&sets, "fanout"), [["1", "#2"], ["2", "#1"], ["12", "#1"]]);
+    assert_eq!(rows(&sets, "next"), [["1", "#1"], ["2", "#1"], ["12", "#1"]]);
+    assert_eq!(rows(&sets, "busy"), [["1", "#1"], ["2", "#0"], ["12", "#0"]]);
+    assert_eq!(rows(&sets, "named"), [["1", "#1"], ["2", "#1"], ["12", "#1"]]);
+    Ok(())
 }
 
 #[test]
@@ -571,10 +600,124 @@ fn a_run_past_its_row_cap_stops_naming_the_relation_and_the_rule() -> Result<(),
     assert_eq!(db.relations["path"].rows().len(), 10);
     let error = run(10).err().expect("10 rows hold the edges and the first 6 paths only");
     assert!(
-        matches!(error, Error::TooManyRows { ref relation, line: 2, cap: 10 } if relation == "path"),
+        matches!(error, Error::TooManyRows { ref relation, ref line, cap: 10 } if *line == 2 && relation == "path"),
         "{error}"
     );
     let error = run(3).err().expect("the 4 `edge` answers alone are past 3");
-    assert!(matches!(error, Error::TooManySourceRows { line: 1, cap: 3 }), "{error}");
+    assert!(matches!(error, Error::TooManySourceRows { ref line, cap: 3 } if *line == 1), "{error}");
     Ok(())
+}
+
+/// Rules files by key, read from memory; `base` is what an include's path is relative to.
+struct Library {
+    base: crate::Base<'static>,
+    files: Vec<(String, String)>,
+}
+
+impl crate::Includes for Library {
+    fn base(&self) -> crate::Base<'_> {
+        self.base
+    }
+
+    fn read<R>(&self, key: &str, with: impl FnOnce(&str) -> R) -> std::io::Result<Option<R>> {
+        Ok(self.files.iter().find(|(path, _)| path == key).map(|(_, text)| with(text)))
+    }
+}
+
+fn load(library: &Library, src: &str) -> Result<Program<Graph>, Error<GraphError>> {
+    Program::<Graph>::load(src, library)
+}
+
+#[test]
+fn an_include_beside_its_file_reads_the_path_relative_to_that_files_directory() {
+    let files = vec![
+        ("rules/lib/edges.astlog".to_owned(), "(include \"more/hop.astlog\")\n".to_owned()),
+        ("rules/lib/more/hop.astlog".to_owned(), "(rule (hop a b) (edge a b))\n".to_owned()),
+    ];
+    let beside = Library { base: crate::Base::Beside(Some("rules/main.astlog")), files };
+    let program = load(&beside, "(include \"lib/edges.astlog\")\n(rule (r a) (hop a b))")
+        .expect("each path read beside the file that names it");
+    assert_eq!(program.rules.len(), 2);
+    assert_eq!(program.rules[0].line.to_string(), "rules/lib/more/hop.astlog:1");
+    // The same rules text with no file of its own has nothing to read beside.
+    let nowhere = Library { base: crate::Base::Beside(None), files: beside.files };
+    let error = load(&nowhere, "(include \"lib/edges.astlog\")").err().expect("no base");
+    assert!(matches!(error, Error::IncludeNowhere { .. }), "{error}");
+    let error = Program::<Graph>::parse("(include \"lib/edges.astlog\")").err().expect("no base");
+    assert!(matches!(error, Error::IncludeNowhere { .. }), "{error}");
+}
+
+#[test]
+fn an_include_path_must_be_relative_slash_separated_and_stay_below_its_base() {
+    let library = Library { base: crate::Base::Root, files: Vec::new() };
+    for (path, why) in [
+        ("", "empty"),
+        ("/etc/rules.astlog", "absolute"),
+        ("lib\\a.astlog", "`\\`"),
+        ("lib//a.astlog", "empty segment"),
+        ("lib/../a.astlog", "`..`"),
+        ("./a.astlog", "`.`"),
+    ] {
+        let error = load(&library, &format!("(include \"{}\")", path.replace('\\', "\\\\")))
+            .err()
+            .expect(path);
+        assert!(matches!(error, Error::IncludePath { .. }), "{path}: {error}");
+        assert!(error.to_string().contains(why), "{path}: {error}");
+    }
+    let error = load(&library, "(include lib)").err().expect("an atom is no path");
+    assert!(error.to_string().contains("include form is (include \"path\")"), "{error}");
+}
+
+#[test]
+fn a_load_past_its_include_caps_is_refused_naming_the_include() {
+    let max = crate::MAX_INCLUDED_FILES;
+    // A chain: file i includes file i + 1.
+    let chain = |files: usize| Library {
+        base: crate::Base::Root,
+        files: (0..files)
+            .map(|at| {
+                let next = if at + 1 < files { format!("(include \"f{}\")\n", at + 1) } else { String::new() };
+                (format!("f{at}"), next)
+            })
+            .collect(),
+    };
+    assert!(load(&chain(max), "(include \"f0\")").is_ok(), "{max} files are read");
+    let error = load(&chain(max + 1), "(include \"f0\")").err().expect("one file past the cap");
+    assert!(
+        matches!(error, Error::TooManyIncludes { ref line, ref path, max: m } if m == max && path == &format!("f{max}") && line.file() == Some(&*format!("f{}", max - 1))),
+        "{error}"
+    );
+    let half = crate::MAX_RULES_BYTES / 2;
+    let big = |n: usize| format!("{}\n", ";".repeat(n));
+    let library = Library {
+        base: crate::Base::Root,
+        files: vec![("a".to_owned(), big(half)), ("b".to_owned(), big(half))],
+    };
+    assert!(load(&library, "(include \"a\")").is_ok(), "half the cap and the include");
+    let error = load(&library, "(include \"a\")\n(include \"b\")").err().expect("past the byte cap");
+    assert!(
+        matches!(error, Error::TooMuchRules { ref line, ref path, .. } if *line == 2 && path == "b"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_nesting_cap_holds_each_included_file_on_its_own() {
+    let max = crate::sexpr::MAX_DEPTH;
+    let library = Library {
+        base: crate::Base::Root,
+        files: vec![
+            ("deep".to_owned(), nested(max)),
+            ("deeper".to_owned(), format!("\n{}", nested(max + 1))),
+        ],
+    };
+    // An include sits one list deep in the including file; the included file's forms start
+    // from none, so `deep` reads and is refused only as no rule.
+    let error = load(&library, "(include \"deep\")").err().expect("`((x))` is no form");
+    assert!(error.to_string().starts_with("deep:1: top-level form must start"), "{error}");
+    let error = load(&library, "(include \"deeper\")").err().expect("past the cap in its file");
+    assert_eq!(
+        error.to_string(),
+        format!("deeper:2: this `(` is nested past {max} lists, the deepest a rules file may nest")
+    );
 }

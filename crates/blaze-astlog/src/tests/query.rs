@@ -230,7 +230,7 @@ fn matches_itself_on_a_small_stack(form: crate::pattern::Form, text: String) -> 
     std::thread::Builder::new()
         .stack_size(SMALL_STACK)
         .spawn(move || {
-            let pattern = crate::pattern::Pattern::parse(form, &text, 1).unwrap();
+            let pattern = crate::pattern::Pattern::parse(form, &text, &astlog_engine::Line::rules(1)).unwrap();
             let file = syntax::SourceFile::parse(&code, syntax::Edition::CURRENT);
             let target = file
                 .root()
@@ -258,10 +258,10 @@ fn the_deepest_pattern_the_cap_admits_matches_on_a_small_stack_and_one_deeper_is
     ];
     for (form, shape) in shapes {
         let deepest = (1..1000)
-            .take_while(|n| crate::pattern::Pattern::parse(form, &shape(*n), 1).is_ok())
+            .take_while(|n| crate::pattern::Pattern::parse(form, &shape(*n), &astlog_engine::Line::rules(1)).is_ok())
             .last()
             .expect("one level is admitted");
-        let error = crate::pattern::Pattern::parse(form, &shape(deepest + 1), 1).unwrap_err().to_string();
+        let error = crate::pattern::Pattern::parse(form, &shape(deepest + 1), &astlog_engine::Line::rules(1)).unwrap_err().to_string();
         assert!(error.starts_with("rules:1:") && error.contains("levels deep"), "{error}");
         assert!(matches_itself_on_a_small_stack(form, shape(deepest)), "{}", shape(deepest));
     }
@@ -284,4 +284,36 @@ fn a_pattern_past_the_token_cap_is_refused_naming_its_rule() {
         Err(error) => error.to_string(),
     };
     assert!(error.starts_with("rules:1:") && error.contains("has 2050 tokens"), "{error}");
+}
+
+const DECORATED: &str = r#"
+//- /lib.rs crate:lib edition:2021
+pub fn plain() {}
+#[inline]
+pub fn tagged() {}
+/// Says hi.
+pub fn documented() {}
+/// Other words.
+#[must_use]
+#[inline]
+pub fn both() {}
+"#;
+
+/// An item pattern that writes no attribute or doc comment matches an item with any; one that
+/// writes them matches only the items that have those, as written.
+#[test]
+fn an_item_pattern_ignores_attributes_and_doc_comments_it_does_not_write() {
+    let (db, files) = view(DECORATED, 0, &["lib.rs"]);
+    let rules = r##"
+        (rule (bare n) (item f "pub fn $n() {}"))
+        (rule (inline n) (item f "#[inline] pub fn $n() {}"))
+        (rule (two n) (item f "#[must_use] #[inline] pub fn $n() {}"))
+        (rule (hi n) (item f "/// Says hi.
+pub fn $n() {}"))
+    "##;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "bare"), [["plain"], ["tagged"], ["documented"], ["both"]]);
+    assert_eq!(texts(&outcome, "inline"), [["tagged"]]);
+    assert_eq!(texts(&outcome, "two"), [["both"]]);
+    assert_eq!(texts(&outcome, "hi"), [["documented"]]);
 }

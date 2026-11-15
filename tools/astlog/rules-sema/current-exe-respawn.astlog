@@ -1,0 +1,29 @@
+;; `std::env::current_exe()` read by a function that, itself or through any function it calls,
+;; runs a program: the process reads its own path at the moment it runs itself again.
+;;
+;; agents/annoyances/launch3-4.json: on Linux `current_exe` reads `/proc/self/exe`, which is
+;; `<path> (deleted)` once a build has placed a new file at the path, so the `execv` failed and
+;; the old program kept running. The fix there was to read the path once at start. Two
+;; production sites have the shape (`crates/blaze-engine/src/program.rs:204`, and
+;; `crates/blaze-client/src/driver.rs:112` whose callee `start::daemon` spawns). The call graph
+;; is followed by `callee` through every fn in the view, recursively; tests are left out,
+;; since no build replaces a test binary while it runs.
+;;
+;; Rule 73: a type is the end (a `SelfPath` read once in `main` and passed down); `std_use`
+;; flags every `current_exe` without telling this case from the harmless ones. Rule meanwhile.
+
+(include "tools/astlog/rules-sema/lib/calls.astlog")
+
+(rule (runs f) (expr c "std::process::Command::new($p)") (enclosing-fn c f))
+(rule (runs-below f) (runs f))
+(rule (runs-below f) (reaches f g) (runs g))
+
+(rule (current-exe-respawn c f)
+  (expr c "std::env::current_exe()")
+  (not (in-test c))
+  (file-path c p)
+  (not (text-match p "(^|/)(tests|benches)/"))
+  (enclosing-fn c f)
+  (runs-below f))
+
+(lint current-exe-respawn warning "reads this program's path where `$f` runs a program: read it once at start")

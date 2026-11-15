@@ -1,0 +1,4 @@
+error: this arm makes `fixture_variant_table_disagrees::Request::Status` from 2, and its index arm counts it as 3
+  --> src/lib.rs:41
+error: this arm makes `fixture_variant_table_disagrees::Request::Build` from 3, and its index arm counts it as 2
+  --> src/lib.rs:42

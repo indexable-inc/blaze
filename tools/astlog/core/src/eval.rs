@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use ast_merge_langs::Lang;
-use astlog_engine::{BodyAtom, Facts, InternalSnafu, Row};
+use astlog_engine::{BodyAtom, Facts, InternalSnafu, Line, Row};
 use blaze_hash::HashMap;
 use snafu::ResultExt as _;
 use tree_sitter::StreamingIterator as _;
@@ -54,7 +54,7 @@ impl<'a> TreeFacts<'a> {
             };
             let key = MatchKey { lang: m.lang, query: m.query.clone() };
             if let blaze_hash::hash_map::Entry::Vacant(entry) = matches.entry(key) {
-                entry.insert(materialize(corpus, m, source.line)?);
+                entry.insert(materialize(corpus, m, &source.line)?);
             }
         }
         Ok(Self { corpus, matches })
@@ -121,7 +121,7 @@ impl Facts for TreeFacts<'_> {
     fn solve(
         &self,
         atom: &Atom,
-        line: usize,
+        line: &Line,
         inputs: &[Option<Value>],
         out: &mut Vec<Row<NodeRef>>,
     ) -> Result<(), Error> {
@@ -189,7 +189,7 @@ impl Facts for TreeFacts<'_> {
 
 /// Run one `match` query over every file of its language: one row per match, one column per
 /// capture in [`MatchAtom::captures`] order.
-fn materialize(corpus: &Corpus, m: &MatchAtom, line: usize) -> Result<Vec<Row<NodeRef>>, Error> {
+fn materialize(corpus: &Corpus, m: &MatchAtom, line: &Line) -> Result<Vec<Row<NodeRef>>, Error> {
     if has_predicate(&m.query) {
         return PredicateUnsupportedSnafu { line }.fail().map_err(Into::into);
     }

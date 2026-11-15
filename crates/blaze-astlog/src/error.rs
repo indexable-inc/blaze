@@ -1,6 +1,7 @@
 //! blaze's own failures, carried by the engine's [`astlog_engine::Error::Source`]. Each names
-//! the rules line and what it could not do.
+//! the rules line (`rules:N`, or an included file's path and line) and what it could not do.
 
+use astlog_engine::Line;
 use snafu::Snafu;
 
 /// An error of a blaze rules file or run.
@@ -9,39 +10,39 @@ pub type Error = astlog_engine::Error<SourceError>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum SourceError {
-    #[snafu(display("rules:{line}: the {form} pattern `{text}` does not parse as Rust: {error}"))]
-    PatternParse { line: usize, form: &'static str, text: String, error: String },
+    #[snafu(display("{line}: the {form} pattern `{text}` does not parse as Rust: {error}"))]
+    PatternParse { line: Line, form: &'static str, text: String, error: String },
 
-    #[snafu(display("rules:{line}: the {form} pattern `{text}`: {message}"))]
-    PatternShape { line: usize, form: &'static str, text: String, message: String },
+    #[snafu(display("{line}: the {form} pattern `{text}`: {message}"))]
+    PatternShape { line: Line, form: &'static str, text: String, message: String },
 
     #[snafu(display(
-        "rules:{line}: the {form} pattern `{text}` reads as other Rust in edition {edition}, the edition of \
+        "{line}: the {form} pattern `{text}` reads as other Rust in edition {edition}, the edition of \
          {place}, than in edition {parsed}, the one patterns are parsed in, so it cannot match that file's code"
     ))]
-    PatternEdition { line: usize, form: &'static str, text: String, parsed: usize, edition: usize, place: String },
+    PatternEdition { line: Line, form: &'static str, text: String, parsed: usize, edition: usize, place: String },
 
-    #[snafu(display("rules:{line}: `{kind}` is no syntax kind (they are spelled `METHOD_CALL_EXPR`)"))]
-    UnknownKind { line: usize, kind: String },
+    #[snafu(display("{line}: `{kind}` is no syntax kind (they are spelled `METHOD_CALL_EXPR`)"))]
+    UnknownKind { line: Line, kind: String },
 
-    #[snafu(display("rules:{line}: `{path}`: {message}"))]
-    DefPath { line: usize, path: String, message: String },
-
-    #[snafu(display(
-        "rules:{line}: `cfg-off` reads the `#[cfg]` of an item, a variant or a field, and `{attr}` at {place} is on a {kind}"
-    ))]
-    CfgUnread { line: usize, place: String, attr: String, kind: String },
-
-    #[snafu(display("rules:{line}: `{name}` needs {needs}, but `{arg}` is {what}"))]
-    WrongValue { line: usize, name: &'static str, needs: &'static str, arg: String, what: &'static str },
-
-    #[snafu(display("{place}: rewrite `{rule}` (rules:{line}): {message}"))]
-    Unplaceable { place: String, rule: String, line: usize, message: String },
+    #[snafu(display("{line}: `{path}`: {message}"))]
+    DefPath { line: Line, path: String, message: String },
 
     #[snafu(display(
-        "{place}: rewrites `{first}` (rules:{first_line}) and `{second}` (rules:{second_line}) edit overlapping text"
+        "{line}: `cfg-off` reads the `#[cfg]` of an item, a variant or a field, and `{attr}` at {place} is on a {kind}"
     ))]
-    Overlap { place: String, first: String, first_line: usize, second: String, second_line: usize },
+    CfgUnread { line: Line, place: String, attr: String, kind: String },
+
+    #[snafu(display("{line}: `{name}` needs {needs}, but `{arg}` is {what}"))]
+    WrongValue { line: Line, name: &'static str, needs: &'static str, arg: String, what: &'static str },
+
+    #[snafu(display("{place}: rewrite `{rule}` ({line}): {message}"))]
+    Unplaceable { place: String, rule: String, line: Line, message: String },
+
+    #[snafu(display(
+        "{place}: rewrites `{first}` ({first_line}) and `{second}` ({second_line}) edit overlapping text"
+    ))]
+    Overlap { place: String, first: String, first_line: Line, second: String, second_line: Line },
 
     #[snafu(display("{what}"))]
     Edit { what: String, at: Option<String> },

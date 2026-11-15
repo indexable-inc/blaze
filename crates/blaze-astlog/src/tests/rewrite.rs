@@ -216,6 +216,31 @@ fn rename_goes_through_the_front_ends_references() {
     assert!(text.contains("id!(older(3))"), "{text}");
 }
 
+/// Renaming three fns of one module edits the three and that module's scope, whose names
+/// changed: the fourth item `blaze check --rules` once counted as an item.
+#[test]
+fn renaming_three_fns_of_a_module_edits_the_three_and_the_modules_scope() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub fn legacy_a() {}\n\
+                   pub fn legacy_b() {}\n\
+                   pub fn legacy_c() {}\n\
+                   pub fn kept() {}\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (legacy d new) (syntax n "FN") (defines n d) (def-name d name) (text-capture name "^legacy_(.+)$" new))
+        (rewrite drop-legacy-prefix (legacy d new) (rename d new))
+    "#;
+    let applied = edit(&db, &files, rules, &[]).unwrap();
+    let items: Vec<(&str, &str, blaze_api::How)> =
+        applied.edited.items.iter().map(|it| (it.file.as_str(), it.path.as_str(), it.how)).collect();
+    let renamed = blaze_api::How::Renamed;
+    let want =
+        [("lib.rs", "", blaze_api::How::Scope), ("lib.rs", "legacy_a", renamed), ("lib.rs", "legacy_b", renamed), ("lib.rs", "legacy_c", renamed)];
+    assert_eq!(items, want);
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert_eq!(text, "pub fn a() {}\npub fn b() {}\npub fn c() {}\npub fn kept() {}\n");
+}
+
 #[test]
 fn a_rename_reached_through_several_references_is_one_rename() {
     let (db, files) = view(LIB, 0, &["lib.rs"]);

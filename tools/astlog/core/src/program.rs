@@ -6,7 +6,7 @@
 //! and `}}` escape literal braces.
 
 use ast_merge_langs::Lang;
-use astlog_engine::{BuiltinAritySnafu, DslSnafu, Needs, Parsed, Sexpr, TemplateSyntax, Term};
+use astlog_engine::{BuiltinAritySnafu, DslSnafu, Line, Needs, Parsed, Sexpr, TemplateSyntax, Term};
 
 use crate::error::{Error, SourceError, UnknownLangNameSnafu};
 
@@ -46,7 +46,7 @@ impl astlog_engine::Language for TreeSitter {
         matches!(name, "match" | "no-descendant" | "attached-sibling")
     }
 
-    fn parse_atom(head: &str, args: &[Sexpr], line: usize) -> Result<Option<Parsed<Atom>>, Error> {
+    fn parse_atom(head: &str, args: &[Sexpr], line: &Line) -> Result<Option<Parsed<Atom>>, Error> {
         match head {
             "match" => parse_match(args, line).map(Some),
             "no-descendant" | "attached-sibling" => {
@@ -74,12 +74,12 @@ impl astlog_engine::Language for TreeSitter {
         }
     }
 
-    fn parse_action(_: &str, _: &[Sexpr], _: usize) -> Result<Option<Parsed<Action>>, Error> {
+    fn parse_action(_: &str, _: &[Sexpr], _: &Line) -> Result<Option<Parsed<Action>>, Error> {
         Ok(None)
     }
 }
 
-fn parse_match(args: &[Sexpr], line: usize) -> Result<Parsed<Atom>, Error> {
+fn parse_match(args: &[Sexpr], line: &Line) -> Result<Parsed<Atom>, Error> {
     let [Sexpr::Atom { text: lang_name, line: lang_line }, Sexpr::Str { text: query, .. }] = args
     else {
         return DslSnafu { line, message: "match form is (match <lang> \"<query>\")" }.fail();
@@ -91,7 +91,7 @@ fn parse_match(args: &[Sexpr], line: usize) -> Result<Parsed<Atom>, Error> {
         }
     }
     let atom_args = captures.iter().map(|name| Term::Var(name.clone())).collect();
-    let lang = resolve_lang(lang_name, *lang_line)?;
+    let lang = resolve_lang(lang_name, lang_line)?;
     Ok(Parsed {
         value: Atom::Match(MatchAtom { lang, query: query.clone(), captures }),
         args: atom_args,
@@ -103,7 +103,7 @@ fn parse_match(args: &[Sexpr], line: usize) -> Result<Parsed<Atom>, Error> {
 ///
 /// Accepts the profile name case-insensitively (`rust`, `toml`, `python`) or any registered file
 /// extension (`rs`, `py`).
-fn resolve_lang(name: &str, line: usize) -> Result<Lang, Error> {
+fn resolve_lang(name: &str, line: &Line) -> Result<Lang, Error> {
     let lowered = name.to_lowercase();
     for lang in Lang::all() {
         if lang.profile().name.to_lowercase() == lowered {

@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ops::Range;
 
-use astlog_engine::{Facts, Row, Value};
+use astlog_engine::{Facts, Line, Row, Value};
 use base_db::{Db, FileId};
 use blaze_hash::HashMap;
 use blaze_intent::Files;
@@ -253,7 +253,7 @@ impl<'a, F: Files> Sema<'a, F> {
 
     /// The items a def path names: [`blaze_intent::replace::items_at`], then an associated
     /// item by name of the type or trait the rest of the path names.
-    pub fn items_at(&self, path: &str, line: usize) -> Res<Vec<ModuleDef>> {
+    pub fn items_at(&self, path: &str, line: &Line) -> Res<Vec<ModuleDef>> {
         let path = path.trim().trim_start_matches("::");
         if let Some(seen) = self.paths.borrow().get(path) {
             return Ok(seen.clone()); // clone: a few defs
@@ -270,7 +270,7 @@ impl<'a, F: Files> Sema<'a, F> {
                     let found: Vec<ModuleDef> = owners
                         .into_iter()
                         .flat_map(|owner| self.assoc_items(owner))
-                        .filter(|it| it.name(self.db).is_some_and(|it| it.as_str() == name))
+                        .filter(|it| it.name(self.db).is_some_and(|it| it.as_str() == unraw(name)))
                         .collect();
                     (!found.is_empty()).then_some(found)
                 });
@@ -301,7 +301,7 @@ impl<'a, F: Files> Sema<'a, F> {
         })?;
         let mut module = krate.root_module(db);
         for segment in segments {
-            module = module.children(db).find(|it| it.name(db).is_some_and(|it| it.as_str() == segment))?;
+            module = module.children(db).find(|it| it.name(db).is_some_and(|it| it.as_str() == unraw(segment)))?;
         }
         Some(module)
     }
@@ -362,7 +362,7 @@ impl<'a, F: Files> Sema<'a, F> {
 
     /// The defs a def path names: [`Sema::items_at`]'s, or else the field of that name of the
     /// struct, union or variant the rest of the path names (`lib::S::field`, `lib::P::0`).
-    fn defs_at(&self, path: &str, line: usize) -> Res<Vec<Def>> {
+    fn defs_at(&self, path: &str, line: &Line) -> Res<Vec<Def>> {
         let missed = match self.items_at(path, line) {
             Ok(items) => return Ok(items.into_iter().map(Def::Item).collect()),
             Err(missed) => missed,
@@ -370,22 +370,59 @@ impl<'a, F: Files> Sema<'a, F> {
         let Some((owner, name)) = path.trim().trim_start_matches("::").rsplit_once("::") else {
             return Err(missed);
         };
-        let Ok(owners) = self.items_at(owner, line) else { return Err(missed) };
         let db = self.db;
-        let fields: Vec<Def> = owners
-            .into_iter()
-            .flat_map(|owner| match owner {
+        // An owner path that names nothing has no fields; the body search below reads it.
+        let mut found: Vec<Def> = self
+            .items_at(owner, line)
+            .iter()
+            .flatten()
+            .flat_map(|owner| match *owner {
                 ModuleDef::Adt(hir::Adt::Struct(it)) => it.fields(db),
                 ModuleDef::Adt(hir::Adt::Union(it)) => it.fields(db),
                 ModuleDef::EnumVariant(it) => it.fields(db),
                 _ => Vec::new(),
             })
-            .filter(|it| it.name(db).as_str() == name)
+            .filter(|it| it.name(db).as_str() == unraw(name))
             .map(Def::Field)
             .collect();
-        match fields.is_empty() {
+        if found.is_empty() {
+            self.declared_in_a_body(path.trim().trim_start_matches("::"), &mut found);
+        }
+        match found.is_empty() {
             true => Err(missed),
-            false => Ok(fields),
+            false => Ok(found),
+        }
+    }
+
+    /// Pushes to `declared` the defs whose def path is `path` declared in the body of the fn,
+    /// const or static the longest resolving prefix of `path` names: `lib::outer::inner` for a
+    /// fn written in `outer`'s body, or `lib::outer::Local::x` for a field of a struct written
+    /// there, which no module path reaches. Nothing when that prefix names no such item.
+    fn declared_in_a_body<A: Allocator + Clone>(&self, path: &str, declared: &mut Vec<Def, A>) {
+        let mut prefix = path;
+        let owners = loop {
+            let Some((rest, _)) = prefix.rsplit_once("::") else { return };
+            prefix = rest;
+            if !prefix.contains("::") {
+                return;
+            }
+            if let Ok(found) = blaze_intent::replace::items_at(self.db, &self.view, prefix) {
+                break found;
+            }
+        };
+        for owner in owners {
+            if !matches!(owner, ModuleDef::Function(_) | ModuleDef::Const(_) | ModuleDef::Static(_)) {
+                continue;
+            }
+            let Some(source) = self.source_of(Def::Item(owner)) else { continue };
+            for node in source.descendants() {
+                if let Some(def) = self.defines(node)
+                    && !declared.contains(&def)
+                    && self.def_path(def).as_deref() == Some(path)
+                {
+                    declared.push(def);
+                }
+            }
         }
     }
 
@@ -496,13 +533,43 @@ impl<'a, F: Files> Sema<'a, F> {
         })
     }
 
+    /// The def's own name, as its crate's edition writes it: `r#match` for a keyword, so the
+    /// text spliced into a template is code and agrees with `text` of the name's node.
     fn name_of(&self, def: Def) -> Option<String> {
         let db = self.db;
+        let name = self.bare_name_of(def)?;
+        let module = match def {
+            Def::Item(it) => it.module(db),
+            Def::Field(it) => Some(it.parent_def(db).module(db)),
+            Def::Impl(_) => None,
+        };
+        Some(match module {
+            Some(module) => name.display(db, module.krate(db).edition(db)).to_string(),
+            // A builtin type has no module, and its name is no keyword in any edition.
+            None => name.as_str().to_owned(),
+        })
+    }
+
+    /// The def's own name with no `r#`, as a reference spelled in any edition reads it.
+    fn bare_name_of(&self, def: Def) -> Option<hir::Name> {
+        let db = self.db;
         match def {
-            Def::Item(it) => it.name(db).map(|it| it.as_str().to_owned()),
-            Def::Field(it) => Some(it.name(db).as_str().to_owned()),
+            Def::Item(it) => it.name(db),
+            Def::Field(it) => Some(it.name(db)),
             Def::Impl(_) => None,
         }
+    }
+
+    /// The def whose body declares `def`, for an item written in a fn, const or static body:
+    /// the innermost such item around its syntax, through the macro calls that wrote it.
+    fn body_owner(&self, def: Def) -> Option<Def> {
+        let node = self.source_of(def)?;
+        // `ancestors_out` begins at the node itself.
+        self.ancestors_out(node)
+            .into_iter()
+            .skip(1)
+            .filter(|it| matches!(it.kind(), SyntaxKind::FN | SyntaxKind::CONST | SyntaxKind::STATIC))
+            .find_map(|it| self.defines(it))
     }
 
     /// The def path of `def` from its crate's name: `core::option::Option::unwrap` for an
@@ -515,9 +582,26 @@ impl<'a, F: Files> Sema<'a, F> {
             Def::Field(it) => (it.parent_def(db).module(db), None),
             Def::Impl(it) => (it.module(db), None),
         };
-        let krate = module.krate(db).base().rust_name(db).ok()?.as_str().to_owned();
-        let mut segments = vec![krate];
-        segments.extend(module.path_segments(db).map(|it| it.as_str().to_owned()));
+        let edition = module.krate(db).edition(db);
+        let written = |name: hir::Name| name.display(db, edition).to_string();
+        // An item declared in a body is under the item whose body that is (`lib::outer::inner`,
+        // as rustc's paths have it): the module the body is in has items of its own, and one
+        // of them may be called `inner` too. Two blocks of one body declaring one name give
+        // two defs one path.
+        let chain = module.path_to_root(db);
+        let block = chain.iter().position(|it| it.nearest_non_block_module(db) != *it);
+        let mut segments = match block {
+            Some(at) => {
+                let mut segments = vec![self.def_path(self.body_owner(def)?)?];
+                segments.extend(chain[..at].iter().rev().filter_map(|it| it.name(db)).map(written));
+                segments
+            }
+            None => {
+                let mut segments = vec![module.krate(db).base().rust_name(db).ok()?.as_str().to_owned()];
+                segments.extend(module.path_segments(db).map(written));
+                segments
+            }
+        };
         let owner = match last {
             Some(ModuleDef::Function(it)) => it.as_assoc_item(db).map(|it| it.container(db)),
             Some(ModuleDef::Const(it)) => it.as_assoc_item(db).map(|it| it.container(db)),
@@ -525,11 +609,11 @@ impl<'a, F: Files> Sema<'a, F> {
             _ => None,
         };
         match owner {
-            Some(AssocItemContainer::Trait(it)) => segments.push(it.name(db).as_str().to_owned()),
+            Some(AssocItemContainer::Trait(it)) => segments.push(written(it.name(db))),
             // An impl on a type no path names (`u32`, `&str`, a blanket `T`) is its own
             // segment, so the item has a path a reader can place, as rustc writes one.
             Some(AssocItemContainer::Impl(it)) => segments.push(match it.self_ty(db).as_adt() {
-                Some(adt) => adt.name(db).as_str().to_owned(),
+                Some(adt) => written(adt.name(db)),
                 None => self.impl_segment(it),
             }),
             None => {}
@@ -544,10 +628,10 @@ impl<'a, F: Files> Sema<'a, F> {
             _ => None,
         };
         if let Some(variant) = variant {
-            segments.push(variant.parent_enum(db).name(db).as_str().to_owned());
+            segments.push(written(variant.parent_enum(db).name(db)));
         }
         if let Def::Field(field) = def {
-            segments.push(field.parent_def(db).name(db).as_str().to_owned());
+            segments.push(written(field.parent_def(db).name(db)));
         }
         if let Def::Impl(it) = def {
             segments.push(self.impl_segment(it));
@@ -703,7 +787,7 @@ impl<'a, F: Files> Sema<'a, F> {
                 }
             }
             TypeShape::Def(path, args) => {
-                let defs = self.items_at(&pattern.paths[path], pattern.line)?;
+                let defs = self.items_at(&pattern.paths[path], &pattern.line)?;
                 let is = defs.iter().any(|def| match def {
                     ModuleDef::Adt(adt) => ty.as_adt() == Some(*adt),
                     ModuleDef::BuiltinType(it) => ty.as_builtin() == Some(*it),
@@ -813,7 +897,7 @@ impl<'a, F: Files> Sema<'a, F> {
         })
     }
 
-    fn filter(&self, filter: Filter, node: ast::Node<'a>, line: usize) -> Res<bool> {
+    fn filter(&self, filter: Filter, node: ast::Node<'a>, line: &Line) -> Res<bool> {
         let tree = self.tree_at(self.tree(node));
         Ok(match filter {
             // The two split an expansion's nodes: those whose text is the call's input, which
@@ -926,7 +1010,9 @@ impl<'a, F: Files> Sema<'a, F> {
 
     /// Every name, path and method call of the searched trees that resolves to `def`.
     fn references(&self, def: Def, out: &mut Vec<Node>) {
-        let Some(name) = self.name_of(def) else { return };
+        // The bare name finds `r#match` and a `match` a 2015 crate writes alike.
+        let Some(name) = self.bare_name_of(def) else { return };
+        let name = name.as_str();
         let finder = Finder::new(name.as_bytes());
         for &tree in &self.targets {
             let root = self.tree_at(tree).root;
@@ -935,7 +1021,7 @@ impl<'a, F: Files> Sema<'a, F> {
                 let at = syntax::TextSize::from(u32::try_from(start).expect("a file under 4 GiB"));
                 let Some(token) = root.token_at_offset(at).right_biased() else { continue };
                 // A tuple field's name is a number: `value.0` names field `0` by an INT_NUMBER.
-                if !matches!(token.kind(), SyntaxKind::IDENT | SyntaxKind::INT_NUMBER) || token.text() != name {
+                if !matches!(token.kind(), SyntaxKind::IDENT | SyntaxKind::INT_NUMBER) || unraw(token.text()) != name {
                     continue;
                 }
                 for mapped in self.sema.descend_into_macros_exact(token) {
@@ -958,7 +1044,7 @@ impl<'a, F: Files> Sema<'a, F> {
         }
     }
 
-    fn need_syn(&self, value: &Option<Value<Node>>, name: &'static str, line: usize) -> Res<ast::Node<'a>> {
+    fn need_syn(&self, value: &Option<Value<Node>>, name: &'static str, line: &Line) -> Res<ast::Node<'a>> {
         match value {
             Some(Value::Node(node)) => self.view_of(*node).ok_or_else(|| {
                 WrongValueSnafu { line, name, needs: "a syntax node", arg: "its first argument", what: "a def or a type" }
@@ -977,7 +1063,7 @@ impl<'a, F: Files> Sema<'a, F> {
         }
     }
 
-    fn need_def(&self, value: &Option<Value<Node>>, name: &'static str, line: usize) -> Res<Option<Def>> {
+    fn need_def(&self, value: &Option<Value<Node>>, name: &'static str, line: &Line) -> Res<Option<Def>> {
         match value {
             Some(Value::Node(node @ Node::Def(_))) => Ok(self.def_at(*node)),
             Some(Value::Node(node @ Node::Syn { .. })) => {
@@ -1005,14 +1091,14 @@ impl<'a, F: Files> Sema<'a, F> {
         out: &mut Vec<Row<Node>>,
     ) -> Res<()> {
         let trees = match &inputs[0] {
-            Some(_) => vec![self.tree(self.need_syn(&inputs[0], "a pattern", pattern.line)?)],
+            Some(_) => vec![self.tree(self.need_syn(&inputs[0], "a pattern", &pattern.line)?)],
             None => self.searched(pattern.literal.as_deref()),
         };
         for &tree in &trees {
             let edition = self.tree_at(tree).file.edition(self.db);
             if pattern.reads_otherwise.contains(&edition) {
                 return PatternEditionSnafu {
-                    line: pattern.line,
+                    line: &pattern.line,
                     form: pattern.form.name(),
                     text: &pattern.text,
                     parsed: syntax::Edition::CURRENT.number(),
@@ -1024,7 +1110,7 @@ impl<'a, F: Files> Sema<'a, F> {
             }
         }
         let candidates: Vec<ast::Node<'a>> = match &inputs[0] {
-            Some(_) => vec![self.need_syn(&inputs[0], "a pattern", pattern.line)?],
+            Some(_) => vec![self.need_syn(&inputs[0], "a pattern", &pattern.line)?],
             None => trees
                 .into_iter()
                 .flat_map(|tree| {
@@ -1034,7 +1120,7 @@ impl<'a, F: Files> Sema<'a, F> {
                 .collect(),
         };
         let mut resolves = |path: usize, target: ast::Node<'a>| -> Res<bool> {
-            let defs = self.items_at(&pattern.paths[path], pattern.line)?;
+            let defs = self.items_at(&pattern.paths[path], &pattern.line)?;
             Ok(match self.resolve(target) {
                 Some(Def::Item(def)) => defs.contains(&def),
                 _ => false,
@@ -1067,7 +1153,7 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
     fn solve(
         &self,
         atom: &Atom,
-        line: usize,
+        line: &Line,
         inputs: &[Option<Value<Node>>],
         out: &mut Vec<Row<Node>>,
     ) -> Res<()> {
@@ -1452,8 +1538,13 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
 }
 
 /// The error of a type relation given `what` where its type goes.
-fn not_a_type(line: usize, name: &'static str, what: &'static str) -> Error {
+fn not_a_type(line: &Line, name: &'static str, what: &'static str) -> Error {
     WrongValueSnafu { line, name, needs: "a type", arg: "its first argument", what }.build().into()
+}
+
+/// An identifier or a path segment with no `r#`: the name it writes, which hir's names hold bare.
+fn unraw(written: &str) -> &str {
+    written.strip_prefix("r#").unwrap_or(written)
 }
 
 /// The integer `node` means: an integer literal, or one negated in an expression (`-7`) or a

@@ -1,0 +1,28 @@
+;; Two hand-kept integer tables of one enum that must be inverses and are not.
+;;
+;; The shape: a generator `match` whose arms are `k => E::V ..` and an index `match` whose arms
+;; are `E::V .. => k`. crates/blaze-api/src/frames/identity.rs keeps two pairs of them
+;; (`fn request` / `fn request_index`, `fn response` / `fn response_index`), 87 arms in all,
+;; by hand, and every hand-written codec keeps the same pair as its encoder's `E::V => tag`
+;; and its decoder's `tag => E::V` (crates/hir-ty/src/mir/persist.rs). A variant whose two
+;; numbers differ is decoded as another variant, or, in identity.rs, generated under one number
+;; and counted under another.
+;; The arms are joined by the variant each one's path resolves to, not by its spelling: an
+;; alias or a `use` of the variant still joins.
+;;
+;; Rule 73: the right end is a type (`#[derive]` of the index from the enum, or the generator
+;; drawing from `E::ALL`), so no table is kept by hand. `blaze::variant_list_drift` reads lists
+;; in the enum's own impls, not a pair of tables in another crate's test; this rule is the
+;; stopgap until it does.
+
+(include "tools/astlog/rules-sema/lib/int-arms.astlog")
+
+;; The two tables are one codec only in one file: a variant's tag and its, say, priority in
+;; another file are two facts, not one. The index arm `x` counts `d` as `xi`, never as `gi`.
+(rule (variant-table-disagrees g gi d xi)
+  (generated m g gi d)
+  (indexed n x xi d)
+  (same-file g x)
+  (not (indexed n x gi d)))
+
+(lint variant-table-disagrees error "this arm makes `$d` from $gi, and its index arm counts it as $xi")

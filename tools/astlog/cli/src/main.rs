@@ -149,7 +149,7 @@ fn run(cli: &Cli) -> Result<(), Error> {
 
 fn load(rules: &Path, paths: &[PathBuf]) -> Result<Analysis, Error> {
     let source = std::fs::read_to_string(rules).context(ReadRulesSnafu { path: rules })?;
-    Ok(astlog_core::analyze(&source, paths)?)
+    Ok(astlog_core::analyze_at(&source, rules, paths)?)
 }
 
 /// How many findings gate the exit code: every error, plus every warning when

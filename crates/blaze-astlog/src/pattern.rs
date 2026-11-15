@@ -12,6 +12,7 @@
 
 use std::fmt;
 
+use astlog_engine::Line;
 use blaze_hash::HashMap;
 use std::alloc::Global;
 use syntax::{
@@ -79,7 +80,7 @@ enum Mark {
 pub struct Pattern {
     pub form: Form,
     pub text: String,
-    pub line: usize,
+    pub line: Line,
     parse: Parse<SourceFile>,
     root: NodeId,
     pub root_kind: SyntaxKind,
@@ -137,7 +138,7 @@ fn tokens<'t>(bound: Bound<'t>) -> Vec<&'t str> {
 }
 
 /// Rewrites `$name` and `$$$name` to placeholder identifiers, recording the variables.
-fn placeholders(text: &str, form: Form, line: usize) -> Result<(String, Vec<Var>), Error> {
+fn placeholders(text: &str, form: Form, line: &Line) -> Result<(String, Vec<Var>), Error> {
     let mut out = String::with_capacity(text.len() + 16);
     let mut vars: Vec<Var> = Vec::new();
     let bytes = text.as_bytes();
@@ -289,7 +290,7 @@ impl Pattern {
     ///
     /// A pattern that is not that form of Rust, holds a stray `$`, or is nothing but one
     /// metavariable.
-    pub fn parse(form: Form, text: &str, line: usize) -> Result<Pattern, Error> {
+    pub fn parse(form: Form, text: &str, line: &Line) -> Result<Pattern, Error> {
         let shape = |message: String| -> Error {
             PatternShapeSnafu { line, form: form.name(), text, message }.build().into()
         };
@@ -394,7 +395,7 @@ impl Pattern {
         Ok(Pattern {
             form,
             text: text.to_owned(),
-            line,
+            line: line.clone(),
             root_kind: root.kind(),
             root: root.id(),
             literal: literal.map(str::to_owned),
@@ -458,6 +459,19 @@ fn significant(node: ast::Node<'_>) -> Vec<ast::Element<'_>> {
     node.children_with_tokens().filter(|it| !it.kind().is_trivia()).collect() // alloc: one level of a match
 }
 
+fn is_attr(kind: SyntaxKind) -> bool {
+    kind == SyntaxKind::ATTR
+}
+
+/// A doc comment (`///`, `//!`, `/** */`, `/*! */`), which this tree keeps as its own node
+/// and tokens, not as trivia.
+fn is_doc(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT
+    )
+}
+
 struct Cx<'p, 'r, 't> {
     pattern: &'p Pattern,
     resolves: &'r mut dyn FnMut(usize, ast::Node<'t>) -> Result<bool, Error>,
@@ -501,7 +515,14 @@ impl<'t> Cx<'_, '_, 't> {
             return Ok(false);
         }
         let want = significant(pattern);
-        let have = significant(target);
+        let mut have = significant(target);
+        // A pattern that writes no attribute matches with any, and one that writes no doc
+        // comment matches with any; one that writes them matches only those, in order.
+        for decoration in [is_attr, is_doc] {
+            if !want.iter().any(|it| decoration(it.kind())) {
+                have.retain(|it| !decoration(it.kind()));
+            }
+        }
         self.seq(target, &want, &have, bound)
     }
 
@@ -566,7 +587,7 @@ impl<'t> Cx<'_, '_, 't> {
 /// name matches a type of that name, by text.
 pub struct TypePattern {
     pub text: String,
-    pub line: usize,
+    pub line: Line,
     parse: Parse<SourceFile>,
     root: NodeId,
     pub vars: Vec<String>,
@@ -628,11 +649,11 @@ impl TypePattern {
     /// # Errors
     ///
     /// A pattern that is no type, or a type form the matcher does not read.
-    pub fn parse(text: &str, line: usize) -> Result<TypePattern, Error> {
+    pub fn parse(text: &str, line: &Line) -> Result<TypePattern, Error> {
         let pattern = Pattern::parse(Form::Type, text, line)?;
         let type_pattern = TypePattern {
             text: text.to_owned(),
-            line,
+            line: line.clone(),
             root: pattern.root,
             vars: pattern.vars.iter().map(|it| it.name.clone()).collect(),
             paths: pattern.paths.clone(),

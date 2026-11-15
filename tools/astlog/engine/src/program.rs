@@ -1,12 +1,15 @@
 //! The rule language: S-expressions lowered into a checked [`Program`] over a fact source's atoms.
 //!
-//! Three top-level forms:
+//! Four top-level forms:
 //!
 //! ```text
 //! (rule (name vars...) body-atom...)
 //! (rewrite name body-atom... action...)
 //! (lint relation-name <error|warning> "message template")
+//! (include "path")
 //! ```
+//!
+//! An include is read in place by [`crate::include`], before the forms are lowered.
 //!
 //! A body atom is a builtin (`text`, `parent`, ...), an atom of the fact source ([`Language`]), a
 //! rule-defined relation, `(not (relation args...))` or `(count c (relation args...))`. Arguments
@@ -26,7 +29,9 @@ use crate::error::{
     RegexSnafu, TemplateVarSnafu, UnboundBuiltinArgSnafu, UnboundHeadVarSnafu,
     UnboundSourceArgSnafu, UnknownRelationSnafu, UnsafeNegationSnafu, UnstratifiableProgramSnafu,
 };
-use crate::sexpr::{self, Sexpr};
+use crate::include::{self, Includes, Nowhere};
+use crate::line::Line;
+use crate::sexpr::Sexpr;
 
 /// What a fact source adds to the language: its atoms, its actions and its template syntax.
 pub trait Language {
@@ -51,7 +56,7 @@ pub trait Language {
     fn parse_atom(
         head: &str,
         args: &[Sexpr],
-        line: usize,
+        line: &Line,
     ) -> Result<Option<Parsed<Self::Atom>>, Error<Self::Error>>;
 
     /// `(head args...)` as one of this source's rewrite actions, or `None`.
@@ -62,7 +67,7 @@ pub trait Language {
     fn parse_action(
         head: &str,
         args: &[Sexpr],
-        line: usize,
+        line: &Line,
     ) -> Result<Option<Parsed<Self::Action>>, Error<Self::Error>>;
 }
 
@@ -132,7 +137,7 @@ pub enum Term {
 pub struct AppAtom {
     pub name: String,
     pub args: Vec<Term>,
-    pub line: usize,
+    pub line: Line,
     /// The compiled pattern of a builtin in [`REGEX_BUILTINS`], compiled once at load.
     pub regex: Option<regex::Regex>,
 }
@@ -159,7 +164,7 @@ pub(crate) const MAX_REGEX_BYTES: usize = 1 << 20;
 fn compile_regex<S: std::error::Error + 'static>(
     name: &str,
     pattern: &str,
-    line: usize,
+    line: &Line,
 ) -> Result<regex::Regex, Error<S>> {
     regex::RegexBuilder::new(pattern)
         .size_limit(MAX_REGEX_BYTES)
@@ -174,16 +179,35 @@ pub struct SourceAtom<A> {
     pub value: A,
     pub args: Vec<Term>,
     pub needs: Needs,
-    pub line: usize,
+    pub line: Line,
 }
 
-/// `(count c (relation args...))`: `c` is the number of rows of a lower-stratum relation that
-/// agree with the arguments already bound; the others are local to the count.
+/// `(count c (atom args...))`: `c` is the number of distinct rows of the atom that agree with
+/// the arguments already bound; the others are local to the count. The atom is a lower-stratum
+/// relation, a builtin or a source atom; a builtin's and a source atom's inputs are bound before
+/// the count, as anywhere else.
 #[derive(Debug)]
-pub struct CountAtom {
+pub struct CountAtom<A> {
     pub result: Term,
-    pub inner: AppAtom,
-    pub line: usize,
+    pub inner: Counted<A>,
+    pub line: Line,
+}
+
+/// What a `(count ...)` counts.
+#[derive(Debug)]
+pub enum Counted<A> {
+    /// A relation, or a builtin by its name.
+    App(AppAtom),
+    Source(SourceAtom<A>),
+}
+
+impl<A> Counted<A> {
+    pub fn args(&self) -> &[Term] {
+        match self {
+            Counted::App(app) => &app.args,
+            Counted::Source(source) => &source.args,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -197,7 +221,7 @@ pub enum BodyAtom<A> {
     /// `(not (source-atom args...))`: succeeds for a binding iff the source gives no row for
     /// it. Every argument is bound by then, so it is a filter and needs no stratum.
     NegatedSource(SourceAtom<A>),
-    Count(CountAtom),
+    Count(CountAtom<A>),
 }
 
 #[derive(Debug)]
@@ -205,7 +229,7 @@ pub struct Rule<A> {
     pub name: String,
     pub head_vars: Vec<String>,
     pub body: Vec<BodyAtom<A>>,
-    pub line: usize,
+    pub line: Line,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,7 +241,7 @@ pub enum Segment {
 #[derive(Debug)]
 pub struct Template {
     pub segments: Vec<Segment>,
-    pub line: usize,
+    pub line: Line,
 }
 
 /// Which text edit a [`TextAction`] makes at its target node.
@@ -235,7 +259,7 @@ pub struct TextAction {
     pub target: String,
     /// Empty for [`TextKind::Delete`].
     pub template: Template,
-    pub line: usize,
+    pub line: Line,
 }
 
 #[derive(Debug)]
@@ -243,7 +267,7 @@ pub struct SourceAction<X> {
     pub name: String,
     pub value: X,
     pub args: Vec<Term>,
-    pub line: usize,
+    pub line: Line,
 }
 
 #[derive(Debug)]
@@ -257,7 +281,7 @@ pub struct Rewrite<A, X> {
     pub name: String,
     pub body: Vec<BodyAtom<A>>,
     pub actions: Vec<Action<X>>,
-    pub line: usize,
+    pub line: Line,
 }
 
 /// Severity of a lint declaration: errors gate a scan's exit code, warnings report without
@@ -285,7 +309,7 @@ pub struct Lint {
     pub relation: String,
     pub severity: Severity,
     pub message: Template,
-    pub line: usize,
+    pub line: Line,
 }
 
 pub struct Program<L: Language> {
@@ -317,9 +341,21 @@ impl<L: Language> Program<L> {
     /// [`Error::TemplateVar`] when a variable is not bound where it is used;
     /// [`Error::LintSeverity`] / [`Error::LintVar`] for a malformed lint;
     /// [`Error::UnstratifiableProgram`] for negation through recursion; and the source's own
-    /// errors for its atoms.
+    /// errors for its atoms. An `(include ...)` is refused: this text has no place to read one
+    /// from ([`Program::load`] has).
     pub fn parse(src: &str) -> Result<Self, LError<L>> {
-        let forms = sexpr::parse(src)?;
+        Self::load(src, &Nowhere)
+    }
+
+    /// [`Program::parse`], with each `(include "path")` replaced by the forms of the file
+    /// `includes` reads at that path.
+    ///
+    /// # Errors
+    ///
+    /// As [`Program::parse`], for the forms of every file read; and an include that names no
+    /// file, closes a cycle or passes a cap ([`crate::include::forms`]).
+    pub fn load<I: Includes>(src: &str, includes: &I) -> Result<Self, LError<L>> {
+        let forms = include::forms(src, includes)?;
         let mut rules = Vec::new();
         let mut rewrites = Vec::new();
         let mut lints = Vec::new();
@@ -333,7 +369,8 @@ impl<L: Language> Program<L> {
                     return DslSnafu {
                         line: form.line(),
                         message: format!(
-                            "expected (rule ...), (rewrite ...), or (lint ...), got `{other}`"
+                            "expected (rule ...), (rewrite ...), (lint ...) or (include ...), got \
+                             `{other}`"
                         ),
                     }
                     .fail();
@@ -360,7 +397,7 @@ impl<L: Language> Program<L> {
         for rule in &self.rules {
             if builtin(&rule.name).is_some() || L::claims(&rule.name) || is_form(&rule.name) {
                 return DslSnafu {
-                    line: rule.line,
+                    line: &rule.line,
                     message: format!("rule head `{}` shadows a builtin", rule.name),
                 }
                 .fail();
@@ -371,7 +408,7 @@ impl<L: Language> Program<L> {
                     name: rule.name.clone(),
                     expected: expected.unwrap_or(rule.head_vars.len()),
                     got: rule.head_vars.len(),
-                    line: rule.line,
+                    line: &rule.line,
                 }
                 .fail();
             }
@@ -379,7 +416,7 @@ impl<L: Language> Program<L> {
             let bound = check_modes(&rule.body)?;
             for var in &rule.head_vars {
                 if !bound.contains(var.as_str()) {
-                    return UnboundHeadVarSnafu { line: rule.line, var: var.clone() }.fail();
+                    return UnboundHeadVarSnafu { line: &rule.line, var: var.clone() }.fail();
                 }
             }
         }
@@ -426,7 +463,11 @@ impl<L: Language> Program<L> {
             match grew {
                 None => break,
                 Some(name) if pass == passes => {
-                    let line = self.rules.iter().find(|r| r.name == name).map_or(0, |r| r.line);
+                    let line = self
+                        .rules
+                        .iter()
+                        .find(|r| r.name == name)
+                        .map_or(Line::rules(0), |r| r.line.clone()); // clone: the error's
                     let cycle = negative_cycle(&edges).join(", ");
                     return UnstratifiableProgramSnafu { cycle, line }.fail();
                 }
@@ -454,8 +495,13 @@ impl<L: Language> Program<L> {
                     BodyAtom::Negation(neg) if builtin(&neg.name).is_none() => {
                         edges.push((&rule.name, &neg.name, true));
                     }
-                    BodyAtom::Count(count) => edges.push((&rule.name, &count.inner.name, true)),
+                    BodyAtom::Count(CountAtom { inner: Counted::App(app), .. })
+                        if builtin(&app.name).is_none() =>
+                    {
+                        edges.push((&rule.name, &app.name, true));
+                    }
                     BodyAtom::App(_)
+                    | BodyAtom::Count(_)
                     | BodyAtom::Negation(_)
                     | BodyAtom::Source(_)
                     | BodyAtom::NegatedSource(_) => {}
@@ -469,7 +515,7 @@ impl<L: Language> Program<L> {
     /// head variables.
     fn check_lint(&self, lint: &Lint) -> Result<(), LError<L>> {
         let Some(rule) = self.rules.iter().find(|rule| rule.name == lint.relation) else {
-            return UnknownRelationSnafu { name: lint.relation.clone(), line: lint.line }.fail();
+            return UnknownRelationSnafu { name: lint.relation.clone(), line: &lint.line }.fail();
         };
         for segment in &lint.message.segments {
             let Segment::Var(var) = segment else {
@@ -479,7 +525,7 @@ impl<L: Language> Program<L> {
                 return LintVarSnafu {
                     relation: lint.relation.clone(),
                     var: var.clone(),
-                    line: lint.message.line,
+                    line: &lint.message.line,
                 }
                 .fail();
             }
@@ -536,39 +582,33 @@ fn check_atoms<A, S: std::error::Error + 'static>(
     arities: &HashMap<&str, usize, Global>,
 ) -> Result<(), Error<S>> {
     for atom in atoms {
-        let (relation, filter) = match atom {
-            BodyAtom::Negation(neg) => (neg, "(not ...)"),
-            BodyAtom::Count(count) => (&count.inner, "(count ...)"),
-            BodyAtom::Source(_) | BodyAtom::NegatedSource(_) => continue,
+        let relation = match atom {
+            BodyAtom::Negation(neg) => neg,
+            BodyAtom::Count(CountAtom { inner: Counted::App(app), .. }) => app,
+            BodyAtom::Source(_)
+            | BodyAtom::NegatedSource(_)
+            | BodyAtom::Count(CountAtom { inner: Counted::Source(_), .. }) => continue,
             BodyAtom::App(app) => {
                 if let Some((arity, _)) = builtin(&app.name) {
                     check_builtin(app, arity)?;
                     continue;
                 }
                 let expected = *arities.get(app.name.as_str()).ok_or_else(|| {
-                    UnknownRelationSnafu { name: app.name.clone(), line: app.line }.build()
+                    UnknownRelationSnafu { name: app.name.clone(), line: &app.line }.build()
                 })?;
                 check_arity(app, expected, false)?;
                 continue;
             }
         };
         // A negated builtin is a test of bound values (every variable is bound to its left, as
-        // `check_modes` requires of any negation), so it holds when the builtin gives no row.
-        if let (BodyAtom::Negation(neg), Some((arity, _))) = (atom, builtin(&relation.name)) {
-            check_builtin(neg, arity)?;
+        // `check_modes` requires of any negation), so it holds when the builtin gives no row. A
+        // counted one counts the rows it gives for its bound inputs, which are finite.
+        if let Some((arity, _)) = builtin(&relation.name) {
+            check_builtin(relation, arity)?;
             continue;
         }
-        // A counted atom must name a defined relation (not a builtin: builtins are filters,
-        // not finite relations to scan) with matching arity.
-        if builtin(&relation.name).is_some() {
-            return DslSnafu {
-                line: relation.line,
-                message: format!("{filter} cannot read the builtin `{}`", relation.name),
-            }
-            .fail();
-        }
         let expected = *arities.get(relation.name.as_str()).ok_or_else(|| {
-            UnknownRelationSnafu { name: relation.name.clone(), line: relation.line }.build()
+            UnknownRelationSnafu { name: relation.name.clone(), line: &relation.line }.build()
         })?;
         check_arity(relation, expected, false)?;
     }
@@ -579,7 +619,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
 /// compiled at load (a variable pattern would make what matches depend on corpus text, which no
 /// rule needs), and `text-capture` binds exactly one variable per capture group.
 fn check_builtin<S: std::error::Error + 'static>(app: &AppAtom, arity: usize) -> Result<(), Error<S>> {
-    let dsl = |message: String| DslSnafu { line: app.line, message }.fail();
+    let dsl = |message: String| DslSnafu { line: &app.line, message }.fail();
     if VARIADIC.contains(&app.name.as_str()) {
         if app.args.len() < arity {
             return dsl(format!(
@@ -691,11 +731,11 @@ fn check_arity<S: std::error::Error + 'static>(
             name: app.name.clone(),
             expected,
             got: app.args.len(),
-            line: app.line,
+            line: &app.line,
         }
         .fail();
     }
-    ArityMismatchSnafu { name: app.name.clone(), expected, got: app.args.len(), line: app.line }
+    ArityMismatchSnafu { name: app.name.clone(), expected, got: app.args.len(), line: &app.line }
         .fail()
 }
 
@@ -712,80 +752,43 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
     body: &[BodyAtom<A>],
 ) -> Result<HashSet<&str, Global>, Error<S>> {
     let mut bound: HashSet<&str, Global> = HashSet::new_in(Global);
-    let is_bound = |bound: &HashSet<&str, Global>, term: &Term| match term {
-        Term::Var(var) => bound.contains(var.as_str()),
-        Term::Text(_) | Term::Int(_) => true,
-    };
     for (at, atom) in body.iter().enumerate() {
         match atom {
             BodyAtom::App(app) => {
-                if let Some((_, needs)) = builtin(&app.name) {
-                    for &need in needs {
-                        if let Term::Var(var) = &app.args[need]
-                            && !bound.contains(var.as_str())
-                        {
-                            return UnboundBuiltinArgSnafu {
-                                line: app.line,
-                                name: app.name.clone(),
-                                arg: var.clone(),
-                            }
-                            .fail();
-                        }
-                    }
-                }
+                builtin_ready(app, &bound)?;
                 bound.extend(vars(&app.args));
             }
             BodyAtom::Source(source) => {
-                let ok = match source.needs {
-                    Needs::Nothing => true,
-                    Needs::All(cols) => cols.iter().all(|&c| is_bound(&bound, &source.args[c])),
-                    Needs::Any(cols) => cols.iter().any(|&c| is_bound(&bound, &source.args[c])),
-                };
-                if !ok {
-                    let cols = match source.needs {
-                        Needs::All(cols) | Needs::Any(cols) => cols,
-                        Needs::Nothing => &[],
-                    };
-                    let arg = cols
-                        .iter()
-                        .map(|&c| term_display(&source.args[c]))
-                        .collect::<Vec<_>>()
-                        .join(if matches!(source.needs, Needs::Any(_)) {
-                            "` or `"
-                        } else {
-                            "`, `"
-                        });
-                    return UnboundSourceArgSnafu {
-                        line: source.line,
-                        name: source.name.clone(),
-                        arg,
-                    }
-                    .fail();
-                }
+                source_ready(source, &bound)?;
                 bound.extend(vars(&source.args));
             }
             BodyAtom::Negation(neg) => {
                 for var in vars(&neg.args) {
                     if !bound.contains(var) {
-                        return UnsafeNegationSnafu { var: var.to_owned(), line: neg.line }.fail();
+                        return UnsafeNegationSnafu { var: var.to_owned(), line: &neg.line }.fail();
                     }
                 }
             }
             BodyAtom::NegatedSource(source) => {
                 for var in vars(&source.args) {
                     if !bound.contains(var) {
-                        return UnsafeNegationSnafu { var: var.to_owned(), line: source.line }
+                        return UnsafeNegationSnafu { var: var.to_owned(), line: &source.line }
                             .fail();
                     }
                 }
             }
             BodyAtom::Count(count) => {
+                // A counted builtin or source atom is asked with what is bound before the count.
+                match &count.inner {
+                    Counted::App(app) => builtin_ready(app, &bound)?,
+                    Counted::Source(source) => source_ready(source, &bound)?,
+                }
                 // Unbound inner variables are local to the count; one mentioned again after it
                 // would read as a join with nothing it can join.
-                for var in vars(&count.inner.args) {
+                for var in vars(count.inner.args()) {
                     if !bound.contains(var) && mentioned(&body[at + 1..], var) {
                         return DslSnafu {
-                            line: count.line,
+                            line: &count.line,
                             message: format!(
                                 "`{var}` is local to the (count ...) and cannot be used after it"
                             ),
@@ -797,9 +800,9 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                     // Unbound, it would be both the number and a column counted over. The
                     // column is local to the count and unset once the rows are counted, so the
                     // result has nothing to equal and the rule derives nothing.
-                    if !bound.contains(var.as_str()) && vars(&count.inner.args).any(|it| it == var) {
+                    if !bound.contains(var.as_str()) && vars(count.inner.args()).any(|it| it == var) {
                         return DslSnafu {
-                            line: count.line,
+                            line: &count.line,
                             message: format!(
                                 "`{var}` is the (count ...)'s result and an argument it counts over; \
                                  name the counted column apart"
@@ -821,12 +824,56 @@ fn mentioned<A>(body: &[BodyAtom<A>], var: &str) -> bool {
             BodyAtom::Source(source) | BodyAtom::NegatedSource(source) => &source.args,
             BodyAtom::App(app) | BodyAtom::Negation(app) => &app.args,
             BodyAtom::Count(count) => {
-                return count.result == Term::Var(var.to_owned())
-                    || vars(&count.inner.args).any(|v| v == var);
+                return matches!(&count.result, Term::Var(it) if it == var)
+                    || vars(count.inner.args()).any(|v| v == var);
             }
         };
         vars(args).any(|v| v == var)
     })
+}
+
+/// An error when an input of `app`, if it is a builtin, is unbound.
+fn builtin_ready<S: std::error::Error + 'static>(
+    app: &AppAtom,
+    bound: &HashSet<&str, Global>,
+) -> Result<(), Error<S>> {
+    let Some((_, needs)) = builtin(&app.name) else { return Ok(()) };
+    for &need in needs {
+        if let Term::Var(var) = &app.args[need]
+            && !bound.contains(var.as_str())
+        {
+            return UnboundBuiltinArgSnafu { line: &app.line, name: app.name.clone(), arg: var.clone() }
+                .fail();
+        }
+    }
+    Ok(())
+}
+
+/// An error when the columns a source atom demands are unbound.
+fn source_ready<A, S: std::error::Error + 'static>(
+    source: &SourceAtom<A>,
+    bound: &HashSet<&str, Global>,
+) -> Result<(), Error<S>> {
+    let is_bound = |term: &Term| match term {
+        Term::Var(var) => bound.contains(var.as_str()),
+        Term::Text(_) | Term::Int(_) => true,
+    };
+    let (cols, ok, sep) = match source.needs {
+        Needs::Nothing => return Ok(()),
+        Needs::All(cols) => (cols, cols.iter().all(|&c| is_bound(&source.args[c])), "`, `"),
+        Needs::Any(cols) => (cols, cols.iter().any(|&c| is_bound(&source.args[c])), "` or `"),
+    };
+    if ok {
+        return Ok(());
+    }
+    let mut arg = std::string::String::new();
+    for (at, &c) in cols.iter().enumerate() {
+        if at > 0 {
+            arg.push_str(sep);
+        }
+        arg.push_str(&term_display(&source.args[c]));
+    }
+    UnboundSourceArgSnafu { line: &source.line, name: source.name.clone(), arg }.fail()
 }
 
 /// The variable names among `args`.
@@ -849,15 +896,15 @@ fn check_action<X, S: std::error::Error + 'static>(
     action: &Action<X>,
     bound: &HashSet<&str, Global>,
 ) -> Result<(), Error<S>> {
-    let (line, mut used): (usize, Vec<&str>) = match action {
+    let (line, mut used): (&Line, Vec<&str>) = match action {
         Action::Text(text) => {
             let template = text.template.segments.iter().filter_map(|segment| match segment {
                 Segment::Var(var) => Some(var.as_str()),
                 Segment::Lit(_) => None,
             });
-            (text.line, template.collect())
+            (&text.line, template.collect())
         }
-        Action::Source(source) => (source.line, vars(&source.args).collect()),
+        Action::Source(source) => (&source.line, vars(&source.args).collect()),
     };
     if let Action::Text(text) = action {
         used.push(&text.target);
@@ -878,12 +925,12 @@ fn expect_list<'a, S: std::error::Error + 'static>(
         return DslSnafu { line: form.line(), message: format!("{what} must be a list") }.fail();
     };
     let Some((Sexpr::Atom { text, .. }, rest)) = items.split_first() else {
-        return DslSnafu { line: *line, message: format!("{what} must start with an atom") }.fail();
+        return DslSnafu { line, message: format!("{what} must start with an atom") }.fail();
     };
     Ok((text, rest))
 }
 
-fn parse_rule<L: Language>(items: &[Sexpr], line: usize) -> Result<Rule<L::Atom>, LError<L>> {
+fn parse_rule<L: Language>(items: &[Sexpr], line: Line) -> Result<Rule<L::Atom>, LError<L>> {
     let Some((head, body)) = items.split_first() else {
         return DslSnafu { line, message: "(rule ...) needs a head".to_owned() }.fail();
     };
@@ -904,7 +951,7 @@ fn parse_rule<L: Language>(items: &[Sexpr], line: usize) -> Result<Rule<L::Atom>
 
 fn parse_rewrite<L: Language>(
     items: &[Sexpr],
-    line: usize,
+    line: Line,
 ) -> Result<Rewrite<L::Atom, L::Action>, LError<L>> {
     let Some((Sexpr::Atom { text: name, .. }, rest)) = items.split_first() else {
         return DslSnafu { line, message: "(rewrite ...) needs a name".to_owned() }.fail();
@@ -943,7 +990,7 @@ fn parse_action<L: Language>(form: &Sexpr) -> Result<Option<Action<L::Action>>, 
         "insert-before" => TextKind::InsertBefore,
         "insert-after" => TextKind::InsertAfter,
         other => {
-            return Ok(L::parse_action(other, args, form.line())?.map(|parsed| {
+            return Ok(L::parse_action(other, args, &form.line())?.map(|parsed| {
                 Action::Source(SourceAction {
                     name: other.to_owned(),
                     value: parsed.value,
@@ -960,7 +1007,7 @@ fn parse_action<L: Language>(form: &Sexpr) -> Result<Option<Action<L::Action>>, 
         (
             TextKind::Replace | TextKind::InsertBefore | TextKind::InsertAfter,
             [Sexpr::Atom { text: target, .. }, Sexpr::Str { text: template, line }],
-        ) => (target, parse_template::<L::Error>(L::TEMPLATE, template, *line)?),
+        ) => (target, parse_template::<L::Error>(L::TEMPLATE, template, line)?),
         _ => {
             let shape = if kind == TextKind::Delete { "var" } else { "var \"template\"" };
             return DslSnafu {
@@ -973,7 +1020,7 @@ fn parse_action<L: Language>(form: &Sexpr) -> Result<Option<Action<L::Action>>, 
     Ok(Some(Action::Text(TextAction { kind, target: target.clone(), template, line: form.line() })))
 }
 
-fn parse_lint<L: Language>(items: &[Sexpr], line: usize) -> Result<Lint, LError<L>> {
+fn parse_lint<L: Language>(items: &[Sexpr], line: Line) -> Result<Lint, LError<L>> {
     let [
         Sexpr::Atom { text: relation, .. },
         Sexpr::Atom { text: severity, line: severity_line },
@@ -990,13 +1037,13 @@ fn parse_lint<L: Language>(items: &[Sexpr], line: usize) -> Result<Lint, LError<
         "error" => Severity::Error,
         "warning" => Severity::Warning,
         other => {
-            return LintSeveritySnafu { got: other.to_owned(), line: *severity_line }.fail();
+            return LintSeveritySnafu { got: other.to_owned(), line: severity_line }.fail();
         }
     };
     Ok(Lint {
         relation: relation.clone(),
         severity,
-        message: parse_template(L::TEMPLATE, message, *message_line)?,
+        message: parse_template(L::TEMPLATE, message, message_line)?,
         line,
     })
 }
@@ -1029,16 +1076,21 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
         let [result, inner] = args else {
             return DslSnafu {
                 line: form.line(),
-                message: "count form is (count <var> (<relation> args...))".to_owned(),
+                message: "count form is (count <var> (<atom> args...))".to_owned(),
             }
             .fail();
         };
-        let BodyAtom::App(app) = parse_body_atom::<L>(inner)? else {
-            return DslSnafu {
-                line: form.line(),
-                message: "(count ...) may only count a relation atom".to_owned(),
+        let inner = match parse_body_atom::<L>(inner)? {
+            BodyAtom::App(app) => Counted::App(app),
+            BodyAtom::Source(source) => Counted::Source(source),
+            _ => {
+                return DslSnafu {
+                    line: form.line(),
+                    message: "(count ...) may only count a relation, a builtin or a source atom"
+                        .to_owned(),
+                }
+                .fail();
             }
-            .fail();
         };
         let [result] = terms::<L::Error>(std::slice::from_ref(result))?.try_into().map_err(
             |_: Vec<Term>| {
@@ -1046,10 +1098,10 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
                     .build()
             },
         )?;
-        return Ok(BodyAtom::Count(CountAtom { result, inner: app, line: form.line() }));
+        return Ok(BodyAtom::Count(CountAtom { result, inner, line: form.line() }));
     }
     if builtin(name).is_none()
-        && let Some(parsed) = L::parse_atom(name, args, form.line())?
+        && let Some(parsed) = L::parse_atom(name, args, &form.line())?
     {
         return Ok(BodyAtom::Source(SourceAtom {
             name: name.to_owned(),
@@ -1062,7 +1114,7 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
     let args = terms(args)?;
     let regex = match args.get(1) {
         Some(Term::Text(pattern)) if REGEX_BUILTINS.contains(&name) => {
-            Some(compile_regex(name, pattern, form.line())?)
+            Some(compile_regex(name, pattern, &form.line())?)
         }
         _ => None,
     };
@@ -1083,7 +1135,7 @@ pub fn terms<S: std::error::Error + 'static>(args: &[Sexpr]) -> Result<Vec<Term>
             }
             Sexpr::Str { text, .. } => Ok(Term::Text(text.clone())),
             Sexpr::List { line, .. } => DslSnafu {
-                line: *line,
+                line,
                 message: "atom arguments are variables, numbers or strings".to_owned(),
             }
             .fail(),
@@ -1107,7 +1159,7 @@ fn parse_int(text: &str) -> Option<i64> {
 pub fn parse_template<S: std::error::Error + 'static>(
     syntax: TemplateSyntax,
     template: &str,
-    line: usize,
+    line: &Line,
 ) -> Result<Template, Error<S>> {
     match syntax {
         TemplateSyntax::Braces => parse_braces(template, line),
@@ -1117,7 +1169,7 @@ pub fn parse_template<S: std::error::Error + 'static>(
 
 fn parse_braces<S: std::error::Error + 'static>(
     template: &str,
-    line: usize,
+    line: &Line,
 ) -> Result<Template, Error<S>> {
     let mut segments = Vec::new();
     let mut lit = String::new();
@@ -1165,13 +1217,13 @@ fn parse_braces<S: std::error::Error + 'static>(
     if !lit.is_empty() {
         segments.push(Segment::Lit(lit));
     }
-    Ok(Template { segments, line })
+    Ok(Template { segments, line: line.clone() })
 }
 
 /// `$name`, `${name}` and `$$$name` splice `name`; `$$` is a literal `$`.
 fn parse_dollar<S: std::error::Error + 'static>(
     template: &str,
-    line: usize,
+    line: &Line,
 ) -> Result<Template, Error<S>> {
     // A variable name starts with a letter or `_`, so `$5` is no variable.
     let ident = |rest: &str| {
@@ -1218,5 +1270,5 @@ fn parse_dollar<S: std::error::Error + 'static>(
     if !lit.is_empty() {
         segments.push(Segment::Lit(lit));
     }
-    Ok(Template { segments, line })
+    Ok(Template { segments, line: line.clone() })
 }

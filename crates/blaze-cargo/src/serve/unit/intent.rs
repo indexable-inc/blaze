@@ -182,6 +182,23 @@ impl blaze_intent::Files for ViewFiles<'_> {
     fn path(&self, file: FileId) -> Option<&str> {
         self.by_id.get(&file).map(|&at| &*self.files[at as usize].path)
     }
+
+    /// A front-end file's bytes as [`Self::file`] keeps them; any other file of the view (a
+    /// rules file) read from the VFS each time it is asked, which a load does once a file.
+    fn with_bytes<R>(&self, path: &str, with: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if let Some((_, bytes)) = self.file(path) {
+            return Some(with(bytes));
+        }
+        let absolute = format!("{}/{path}", self.mounted.root());
+        self.mounted.in_view(&absolute)?;
+        match self.mounted.read(&absolute) {
+            Ok(found) => found.map(|(_, _, bytes)| with(&bytes)),
+            Err(corrupt) => {
+                self.corrupt.get_or_init(|| (absolute.clone(), corrupt.to_string()));
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +232,32 @@ mod tests {
         assert_eq!(files.path(FileId::from_raw(1)), None);
         assert_eq!(files.file("src/lib.rs"), Some((FileId::from_raw(0), &b"pub fn a() {}\n"[..])));
         assert_eq!(files.file("/registry/serde/src/lib.rs"), None);
+        assert!(files.corrupt.into_inner().is_none());
+    }
+
+    #[test]
+    fn a_file_the_front_end_does_not_load_is_read_from_the_view_by_its_path_in_it() {
+        let (mut vfs, _) = Vfs::restore(FileName::new("vfs/journal").unwrap(), 0, &[], None);
+        let writes = [
+            Op::Write { mode: Mode::Regular, path: "src/lib.rs".into(), bytes: b"pub fn a() {}\n".to_vec() },
+            Op::Write {
+                mode: Mode::Regular,
+                path: "rules/lib/calls.astlog".into(),
+                bytes: b"(rule (r x) (fn-item x))\n".to_vec(),
+            },
+        ];
+        let root = vfs.apply(vfs.empty(), &writes).unwrap();
+        let mounts = [Mount { at: "/w".into(), origin: Origin::View, under: String::new() }];
+        let mounted = Mounted::new(vfs.reader(), root, &mounts, "/w");
+        let paths: std::collections::HashMap<FileId, String> =
+            [(FileId::from_raw(0), "/w/src/lib.rs".to_owned())].into_iter().collect();
+        let files = ViewFiles::new(&mounted, &paths);
+        assert_eq!(files.file("rules/lib/calls.astlog"), None, "not a front-end file");
+        let read = files.with_bytes("rules/lib/calls.astlog", <[u8]>::to_vec);
+        assert_eq!(read.as_deref(), Some(&b"(rule (r x) (fn-item x))\n"[..]));
+        let front = files.with_bytes("src/lib.rs", <[u8]>::to_vec);
+        assert_eq!(front.as_deref(), Some(&b"pub fn a() {}\n"[..]));
+        assert_eq!(files.with_bytes("rules/missing.astlog", <[u8]>::to_vec), None);
         assert!(files.corrupt.into_inner().is_none());
     }
 }

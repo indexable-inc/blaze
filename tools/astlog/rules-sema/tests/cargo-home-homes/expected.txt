@@ -1,0 +1,6 @@
+warning: derives cargo's home itself, one of 3 functions that do: call the one home
+  --> src/lib.rs:17
+warning: derives cargo's home itself, one of 3 functions that do: call the one home
+  --> src/lib.rs:29
+warning: derives cargo's home itself, one of 3 functions that do: call the one home
+  --> src/lib.rs:65
