@@ -82,7 +82,8 @@ const STATX_MTIME: u32 = 0x0040;
 /// How a kept file is opened: for reading and appending.
 const KEEP: i32 = libc::O_RDWR | libc::O_APPEND;
 /// How a kept file for reads into and writes from memory is opened: for reading and writing at
-/// offsets, never made (its asker makes it first).
+/// offsets, never made (its asker makes it first). One the kernel refuses so that no write asked
+/// for is opened `O_RDONLY` (`Kept::read_only`).
 const POSITIONAL_KEEP: i32 = libc::O_RDWR;
 /// How a directory is opened to be synced.
 const DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
@@ -879,9 +880,13 @@ impl Uring {
                 1
             }
             (Kind::Open, _) => {
+                let positional = match hot.flags & READ_ONLY != 0 {
+                    true => libc::O_RDONLY,
+                    false => POSITIONAL_KEEP,
+                };
                 let flags = match (hot.flags & ops::POSITIONAL != 0, hot.flags & DIRECT != 0) {
-                    (true, true) => POSITIONAL_KEEP | libc::O_DIRECT,
-                    (true, false) => POSITIONAL_KEEP,
+                    (true, true) => positional | libc::O_DIRECT,
+                    (true, false) => positional,
                     // Made where missing is opened to append, a sync's too (`Kept::read_only`).
                     (false, _) => match (hot.flags & MAKE != 0, hot.flags & READ_ONLY != 0) {
                         (true, _) => KEEP | libc::O_CREAT,
@@ -1160,6 +1165,18 @@ impl Uring {
             }
             self.ops.get_mut(id).expect("in flight").phase = INSTALLING;
             return Step::Again;
+        }
+        // A positional file the kernel refuses to open for writing (a placed output, sealed
+        // read-only) is opened again read-only where no write asked for it: reads into memory
+        // need no write access (`Kept::read_only`). One a write asked for fails as refused.
+        if res == -libc::EACCES && hot.flags & ops::POSITIONAL != 0 && hot.flags & READ_ONLY == 0 {
+            let kept = self.kept.get_mut(file).expect("held by its open");
+            if !kept.writes {
+                kept.read_only = true;
+                let open = self.ops.get_mut(id).expect("in flight");
+                open.flags |= READ_ONLY;
+                return Step::Again;
+            }
         }
         let make = self.kept.get(file).expect("held by its open").make;
         if res == -libc::ENOENT && hot.flags & MAKE == 0 && make {
