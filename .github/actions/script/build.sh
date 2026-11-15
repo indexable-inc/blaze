@@ -28,7 +28,10 @@ export CARGO_TARGET_DIR=target/cargo
 said="$dir.build.json"
 mkdir -p "$(dirname "$dir")"
 timeout 600 rustup toolchain install "$tc" --profile minimal >&2 || die "rustup could not install $tc"
-timeout 1800 cargo +"$tc" build --release --locked -p scripts --bins --message-format=json > "$said" ||
+# One core left to the runner's own processes, at a lower priority: the `changes` job runs this on
+# the smallest runner (8 vCPU) on every change of the key. 20 s and 0.75 GB at -j 8 on arm64.
+jobs=$(( $(nproc) > 2 ? $(nproc) - 1 : 1 ))
+timeout 1800 nice -n 10 cargo +"$tc" build -j "$jobs" --release --locked -p scripts --bins --message-format=json > "$said" ||
   die "cargo +$tc build --release --locked -p scripts --bins --message-format=json failed (its JSON lines: $said)"
 
 fresh="$dir.new"
