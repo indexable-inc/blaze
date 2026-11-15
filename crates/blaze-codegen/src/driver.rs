@@ -2083,6 +2083,9 @@ enum Planted {
     /// A launched function's call to a weakly defined callee names its key, not its symbol
     /// ([`Build::resolve`]).
     WeakByKey,
+    /// A patched walk that makes a key of several describes again renames the places of the
+    /// referrers of the first of them alone ([`patch`]).
+    SharedKeyUnrenamed,
 }
 
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
