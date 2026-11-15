@@ -504,7 +504,10 @@ fn a_read_by_path_is_said_whole_or_reaches() {
             .syntax()
             .descendants_with_tokens()
             .filter_map(syntax::NodeOrToken::into_token)
-            .filter_map(|it| said_reach(&it))
+            .filter_map(|it| {
+                let mut path = String::new();
+                said_reach(&it, &mut path).map(|()| path)
+            })
             .collect();
         let code = code(text);
         assert_eq!(paths, said, "{text}");

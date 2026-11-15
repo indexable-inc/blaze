@@ -12,11 +12,12 @@
 //! - `M name macro kind`: a `macro_rules!` (`rules`, `export` with `#[macro_export]`) or a proc
 //!   macro (`proc`, `attr`, `derive`) the package defines.
 
+use std::alloc::Allocator;
 use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use syntax::{Edition, NodeOrToken, SyntaxKind, SyntaxNode};
+use syntax::{Edition, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -84,7 +85,7 @@ fn package(name: &str, dir: &Path, edition: Edition, lib: &str, others: &str) {
     }
     let (mut unplain, mut flags) = (false, [false; 8]);
     for (file, (text, root)) in &parsed {
-        let (code, denials) = blaze_lower::census_of(root, text, edition);
+        let (code, denials) = blaze_lower::census_of(root, text, edition, std::alloc::Global);
         unplain |= code.unplain;
         if std::env::var_os("CENSUS_HASH").is_some() {
             println!("H\t{}\t{:?}\t{:?}\t{:?}\t{:?}", file.display(), code.interface, code.interface_strict, code.surface_strict, code.globbed);
@@ -120,7 +121,7 @@ fn package(name: &str, dir: &Path, edition: Edition, lib: &str, others: &str) {
 }
 
 /// The `.rs` files under `dir`, but those of a package nested in it and of `target`.
-fn rust_files(top: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+fn rust_files<A: Allocator>(top: &Path, dir: &Path, out: &mut Vec<PathBuf, A>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -142,29 +143,23 @@ fn attrs(node: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> + '_ {
     node.children().filter(|it| it.kind() == SyntaxKind::ATTR)
 }
 
-fn tokens(node: &SyntaxNode) -> Vec<String> {
-    node.descendants_with_tokens()
-        .filter_map(NodeOrToken::into_token)
-        .filter(|it| !it.kind().is_trivia())
-        .map(|it| it.text().to_owned())
-        .collect()
+fn tokens(node: &SyntaxNode) -> impl Iterator<Item = SyntaxToken> {
+    node.descendants_with_tokens().filter_map(NodeOrToken::into_token).filter(|it| !it.kind().is_trivia())
 }
 
 /// Whether `attr` is a `cfg` that names `test` (`cfg(test)`, `cfg(all(test, ..))`).
 fn test_cfg(attr: &SyntaxNode) -> bool {
-    let tokens = tokens(attr);
-    tokens.iter().any(|it| it == "cfg")
-        && tokens.iter().any(|it| it == "test")
-        && !tokens.iter().any(|it| it == "not")
+    let has = |word: &str| tokens(attr).any(|it| it.text() == word);
+    has("cfg") && has("test") && !has("not")
 }
 
 /// The out-of-line modules `node`'s items declare, onto `stack`.
-fn modules(
+fn modules<A: Allocator>(
     node: &SyntaxNode,
     file: &Path,
     base: &Path,
     at: Reach,
-    stack: &mut Vec<(PathBuf, bool, Reach)>,
+    stack: &mut Vec<(PathBuf, bool, Reach), A>,
 ) {
     for item in node.children() {
         if item.kind() == SyntaxKind::ITEM_LIST {
@@ -186,10 +181,8 @@ fn modules(
             continue;
         }
         let path = attrs(&item).find_map(|attr| {
-            let tokens = tokens(&attr);
-            let at = tokens.iter().position(|it| it == "path")?;
-            let value = tokens.get(at + 2)?;
-            Some(value.trim_matches('"').to_owned())
+            let value = tokens(&attr).skip_while(|it| it.text() != "path").nth(2)?;
+            Some(value.text().trim_matches('"').to_owned())
         });
         match path {
             Some(path) => stack.push((file.parent().unwrap().join(path), true, at)),
@@ -212,7 +205,7 @@ fn macros(name: &str, root: &SyntaxNode) {
                 let Some(named) = node.children().find(|it| it.kind() == SyntaxKind::NAME) else {
                     continue;
                 };
-                let export = attrs(&node).any(|it| tokens(&it).iter().any(|t| t == "macro_export"));
+                let export = attrs(&node).any(|it| tokens(&it).any(|t| t.text() == "macro_export"));
                 let kind = if export { "export" } else { "rules" };
                 println!("M\t{name}\t{}\t{kind}", named.text());
             }
@@ -221,8 +214,8 @@ fn macros(name: &str, root: &SyntaxNode) {
                     continue;
                 };
                 for attr in attrs(&node) {
-                    let tokens = tokens(&attr);
-                    let kind = match tokens.get(2).map(String::as_str) {
+                    let third = tokens(&attr).nth(2);
+                    let kind = match third.as_ref().map(SyntaxToken::text) {
                         Some("proc_macro") => "proc",
                         Some("proc_macro_attribute") => "attr",
                         Some("proc_macro_derive") => "derive",

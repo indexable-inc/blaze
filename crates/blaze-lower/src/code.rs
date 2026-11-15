@@ -96,7 +96,7 @@
 //!   surface holds whole with their places, and the definition is read to make no macro,
 //!   import none and call none but such macros and the standard library's plain ones.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_ids::{ContentId, Hasher};
@@ -576,7 +576,7 @@ pub(crate) fn own_narrow(db: &Db, krate: Crate) -> OwnNarrow {
         |file| code_text(db, EditionedFileId::new(db, file, data.edition)),
         || reads_root_alone(db, EditionedFileId::new(db, root_file, data.edition)),
         |file| globs_known(db, krate, EditionedFileId::new(db, file, data.edition)),
-        || built_from(db, krate),
+        || built_from(db, krate, Global),
     )
 }
 
@@ -589,7 +589,7 @@ pub(crate) fn own_narrow(db: &Db, krate: Crate) -> OwnNarrow {
 /// `macro_rules!` that writes `mod`, `proc_macro_hygiene`, under which a proc macro may write
 /// an out-of-line module), and where its settings have `test`. A file no root reaches
 /// (`tests/`, `examples/`, a build script) is none of them.
-fn built_from(db: &Db, krate: Crate) -> Option<Vec<base_db::FileId>> {
+fn built_from<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Option<Vec<base_db::FileId, A>> {
     let data = krate.data(db);
     let test = cfg::CfgAtom::Flag(intern::Symbol::intern("test"));
     if krate.cfg_options(db).check_atom(&test) {
@@ -597,8 +597,7 @@ fn built_from(db: &Db, krate: Crate) -> Option<Vec<base_db::FileId>> {
     }
     let root = db.source_root(db.file_source_root(data.root_file_id).source_root_id(db));
     let set = root.source_root_ref(db);
-    // alloc: once per workspace crate a file of which is unplain, a file it is made from each
-    let mut built = Vec::new();
+    let mut built = Vec::new_in(alloc);
     let mut stack = vec![data.root_file_id];
     while let Some(file) = stack.pop() {
         if built.contains(&file) {
@@ -626,7 +625,7 @@ fn built_from(db: &Db, krate: Crate) -> Option<Vec<base_db::FileId>> {
         let stem = set
             .path_for_file(&file)
             .and_then(|it| it.name_and_extension())
-            .map(|(name, _)| name.to_owned()); // alloc: a file's stem, once a file
+            .map(|(name, _)| name.to_owned());
         for module in tree.descendants().filter(|it| it.kind() == SyntaxKind::MODULE) {
             let out_of_line = !module.children().any(|it| it.kind() == SyntaxKind::ITEM_LIST);
             let test_only = |module: &SyntaxNode| {
@@ -657,7 +656,6 @@ fn built_from(db: &Db, krate: Crate) -> Option<Vec<base_db::FileId>> {
             if path_attr {
                 return None;
             }
-            // alloc: as above, a module's directory
             let mut under = String::new();
             for at in inline.iter().rev() {
                 let Some(name) = named(at) else { return None };
@@ -686,7 +684,6 @@ fn built_from(db: &Db, krate: Crate) -> Option<Vec<base_db::FileId>> {
 fn globs_known(db: &Db, krate: Crate, file: EditionedFileId) -> bool {
     let data = krate.data(db);
     let root = EditionedFileId::new(db, data.root_file_id, data.edition).parse(db).syntax_node();
-    // alloc: once a globbed file of a workspace crate keyed, its root's renamed crates
     let renamed: Vec<String> = root
         .children()
         .filter(|it| it.kind() == SyntaxKind::EXTERN_CRATE)
@@ -696,7 +693,7 @@ fn globs_known(db: &Db, krate: Crate, file: EditionedFileId) -> bool {
         .collect();
     let tree = file.parse(db).syntax_node();
     let uses = tree.descendants().filter(|it| it.kind() == SyntaxKind::USE);
-    let mut globs = uses.flat_map(|it| taken_from_outside(&it, true).collect::<Vec<_>>()); // alloc: a use's trees
+    let mut globs = uses.flat_map(|it| taken_from_outside(&it, true).collect::<Vec<_>>());
     globs.all(|taken| {
         !taken.glob
             || (!renamed.contains(&taken.first)
@@ -735,7 +732,6 @@ fn no_plain_macros(db: &Db, krate: Crate) -> bool {
         }
         let mut proc_macro = false;
         for attr in attrs(&item) {
-            // alloc: once a proc-macro crate's root, an attribute's tokens each
             let tokens: Vec<SyntaxToken> =
                 attr.syntax().descendants_with_tokens().filter_map(NodeOrToken::into_token).collect();
             let first = tokens.iter().find(|it| it.kind() == SyntaxKind::IDENT);
@@ -793,7 +789,8 @@ pub(crate) fn reaches_beyond(db: &Db, krate: Crate) -> bool {
         let parse = editioned.parse(db);
         let tokens = parse.syntax_node().descendants_with_tokens().filter_map(NodeOrToken::into_token);
         for token in tokens.filter(|it| matches!(it.text(), "include" | "path")) {
-            let Some(path) = said_reach(&token) else { continue };
+            let mut path = String::new();
+            let Some(()) = said_reach(&token, &mut path) else { continue };
             let read = db.resolve_path(base_db::AnchoredPath { anchor: file, path: &path });
             // A file outside the VFS that a read made a source root of its own is of none.
             let theirs = read.is_some_and(|it| {
@@ -829,7 +826,7 @@ pub(crate) fn library_narrow(db: &Db, krate: Crate) -> OwnNarrow {
         |file| whole_code_text(db, EditionedFileId::new(db, file, edition)),
         || false,
         |_| false,
-        || None,
+        || None::<Vec<base_db::FileId, Global>>,
     )
 }
 
@@ -941,13 +938,13 @@ impl OwnNarrow {
 /// [`crate::Lowered::identity`] holds of it (its root alone when `alone` says it reads no
 /// other, else every file of its source root by path), each Rust file as its code text or its
 /// interface text, any other by its bytes.
-fn narrow_from(
+fn narrow_from<A: Allocator>(
     db: &Db,
     krate: Crate,
     text_of: impl Fn(base_db::FileId) -> Option<CodeText>,
     alone: impl FnOnce() -> bool,
     globs: impl Fn(base_db::FileId) -> bool,
-    built: impl FnOnce() -> Option<Vec<base_db::FileId>>,
+    built: impl FnOnce() -> Option<Vec<base_db::FileId, A>>,
 ) -> OwnNarrow {
     let data = krate.data(db);
     let root_file = data.root_file_id;
@@ -992,7 +989,6 @@ fn narrow_from(
     // not known), whose globs of another crate are not known ([`globs_known`]).
     let denied = |file: base_db::FileId, code: &CodeText| code.unplain && !(code.globbed && globs(file));
     let unplain = denied(root_file, &root_text) || {
-        // alloc: once per workspace crate keyed, its unplain files
         let denied: Vec<base_db::FileId> = files
             .iter()
             .filter(|it| it.2.as_ref().is_some_and(|code| denied(it.1, code)))
@@ -1064,8 +1060,9 @@ pub(crate) fn observed(db: &Db, krate: Crate, file: base_db::FileId) -> Option<C
 /// Where workspace crate `krate` is first made `unplain` ([`CodeText::unplain_line`]), for
 /// `blaze why` to say why it has no interface and no surface: the first of the files its
 /// narrowed identity holds, by path as a portable key writes it, with the line and that
-/// line's text. None for a library source root's crate, and for one no file of which is.
-pub(crate) fn unplain_at(db: &Db, krate: Crate) -> Option<String> {
+/// line's text, written to `out`. None for a library source root's crate, and for one no
+/// file of which is.
+pub(crate) fn unplain_at(db: &Db, krate: Crate, out: &mut impl std::fmt::Write) -> Option<()> {
     let data = krate.data(db);
     let root = db.source_root(db.file_source_root(data.root_file_id).source_root_id(db));
     let set = root.source_root_ref(db);
@@ -1074,7 +1071,7 @@ pub(crate) fn unplain_at(db: &Db, krate: Crate) -> Option<String> {
     }
     let text_of = |file| code_text(db, EditionedFileId::new(db, file, data.edition));
     let alone = reads_root_alone(db, EditionedFileId::new(db, data.root_file_id, data.edition));
-    let built = built_from(db, krate);
+    let built = built_from(db, krate, Global);
     // As [`narrow_from`] judges: a file the crate is built from, unplain by more than globs it
     // knows.
     let judged = |file: base_db::FileId| {
@@ -1086,7 +1083,6 @@ pub(crate) fn unplain_at(db: &Db, krate: Crate) -> Option<String> {
             && (file == data.root_file_id
                 || built.as_ref().is_none_or(|built| built.binary_search(&file).is_ok()))
     };
-    // alloc: once a miss of a unit above an unplain crate, a file of the crate each
     let mut found: Vec<(Vec<u8>, base_db::FileId, u32)> = Vec::new();
     for file in set.iter().filter(|it| (!alone || *it == data.root_file_id) && judged(*it)) {
         let Some(path) = set.path_for_file(&file).and_then(|it| it.as_path()).map(|it| it.as_str())
@@ -1104,8 +1100,7 @@ pub(crate) fn unplain_at(db: &Db, krate: Crate) -> Option<String> {
     let text = text.text(db);
     let index = usize::try_from(line.saturating_sub(1)).unwrap_or(usize::MAX);
     let said = text.lines().nth(index).unwrap_or("").trim();
-    // alloc: as above, a reason
-    Some(format!("{}:{line}: `{said}`", String::from_utf8_lossy(&path)))
+    write!(out, "{}:{line}: `{said}`", String::from_utf8_lossy(&path)).ok()
 }
 
 /// [`code_text`] of a library source root's `file`, whose parse the database keeps as an
@@ -1146,7 +1141,7 @@ fn code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
 /// What of a file of text `text`, parsed as `root` in `edition`, its crate's code can observe
 /// (the module's docs).
 pub fn code_text_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> CodeText {
-    walked(root, text, edition, None).0
+    walked(root, text, edition, None::<Vec<Denial, Global>>).0
 }
 
 /// What makes a file `unplain` ([`CodeText::unplain`]), one construct of the walk that judges
@@ -1183,19 +1178,23 @@ pub struct Denial {
 /// [`code_text_of`], with every construct that makes the file `unplain` rather than the first
 /// alone: the same walk, for the census of what keeps crates from a surface
 /// (`examples/census.rs`).
-pub fn census_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> (CodeText, Vec<Denial>) {
-    // alloc: once per file of a census
-    let (code, found) = walked(root, text, edition, Some(Vec::new()));
-    (code, found.unwrap_or_default())
-}
-
-/// [`code_text_of`]'s walk, every denial gathered into `found` where it is given.
-fn walked(
+pub fn census_of<A: Allocator + Clone>(
     root: &SyntaxNode,
     text: &str,
     edition: span::Edition,
-    found: Option<Vec<Denial>>,
-) -> (CodeText, Option<Vec<Denial>>) {
+    alloc: A,
+) -> (CodeText, Vec<Denial, A>) {
+    let (code, found) = walked(root, text, edition, Some(Vec::new_in(alloc.clone())));
+    (code, found.unwrap_or_else(|| Vec::new_in(alloc)))
+}
+
+/// [`code_text_of`]'s walk, every denial gathered into `found` where it is given.
+fn walked<A: Allocator>(
+    root: &SyntaxNode,
+    text: &str,
+    edition: span::Edition,
+    found: Option<Vec<Denial, A>>,
+) -> (CodeText, Option<Vec<Denial, A>>) {
     let end = match planted(Plant::Bytes) {
         true => text.len(),
         false => code_end(root),
@@ -1499,7 +1498,7 @@ impl Masked {
 
 /// [`code_text_of`]'s walk: for each node entered, whether a macro sees what is in it, with the
 /// prelude's macros taken as inert and not.
-struct Walk<'a> {
+struct Walk<'a, A: Allocator> {
     text: &'a str,
     inert: Masked,
     strict: Masked,
@@ -1534,7 +1533,7 @@ struct Walk<'a> {
     /// `test` and `bench` inert, and not.
     seen: Vec<(bool, bool)>,
     /// Every denial, for a census ([`census_of`]); none for a key.
-    found: Option<Vec<Denial>>,
+    found: Option<Vec<Denial, A>>,
 }
 
 /// A place in a file as the walk counts it: how many lines' ends are before it, and where its
@@ -1708,7 +1707,7 @@ fn called_as_macro(token: &SyntaxToken) -> bool {
         .is_some_and(|it| it.kind() == SyntaxKind::BANG)
 }
 
-impl Walk<'_> {
+impl<A: Allocator> Walk<'_, A> {
     /// Where `node`, just entered, really starts: its first token that is no comment and no
     /// whitespace, and the place of it. The parser hands an item the comments before it (one
     /// on the lines above, and one at the end of the line above: `{ // note` then the item
@@ -1748,7 +1747,7 @@ impl Walk<'_> {
         // A glob is judged by the crate it starts at ([`globs_known`]), with uniform paths.
         self.strong |= construct != Construct::Glob || !self.uniform;
         if let Some(found) = &mut self.found {
-            found.push(Denial { line, construct, name: name.to_owned() }); // alloc: a census's
+            found.push(Denial { line, construct, name: name.to_owned() });
         }
     }
 
@@ -1814,7 +1813,7 @@ impl Walk<'_> {
             SyntaxKind::USE => {
                 self.shadows |= use_shadows(node, self.uniform);
                 let denied = use_denial(node, self.uniform);
-                self.deny(node, denied.as_ref().map(|(it, first)| (*it, first.as_str())));
+                self.deny(node, denied.as_ref().map(|(it, taken)| (*it, taken.first.as_str())));
             }
             SyntaxKind::EXTERN_CRATE => {
                 let taken = macro_use_extern(node);
@@ -1979,7 +1978,7 @@ impl Walk<'_> {
                 // ([`CodeText::reaches`]).
                 "include_str" | "include_bytes" => self.whole |= !reads_other_than_rust(token),
                 "include" | "path" if names_read_by_path(token) => {
-                    match said_reach(token) {
+                    match said_reach(token, &mut String::new()) {
                         Some(_) => self.resolves = true,
                         None => self.reaches = true,
                     }
@@ -2098,13 +2097,13 @@ fn names_path_attr(token: &SyntaxToken) -> bool {
 /// glob) is not told from the standard library's here, as no call of another crate's macro
 /// is: what such a macro reads, by a path from the file that calls it, is a read no token of
 /// this file says, whatever its name.
-fn said_reach(token: &SyntaxToken) -> Option<String> {
+fn said_reach(token: &SyntaxToken, out: &mut impl std::fmt::Write) -> Option<()> {
     let given_to_macro =
         |node: &SyntaxNode| node.ancestors().any(|it| attrs(&it).any(|attr| attr_seen(&attr) != Seen::No));
     let string = |token: Option<SyntaxToken>| {
-        ast::String::cast(token?).and_then(|it| it.value().ok().map(|it| it.into_owned())) // alloc: a path, once per read by path of a workspace file keyed
+        ast::String::cast(token?).and_then(|it| it.value().ok().map(|it| it.into_owned()))
     };
-    match token.text() {
+    let said = match token.text() {
         "include" => {
             let call = token.parent_ancestors().find(|it| it.kind() == SyntaxKind::MACRO_CALL)?;
             let path = call.children().find(|it| it.kind() == SyntaxKind::PATH)?;
@@ -2122,7 +2121,7 @@ fn said_reach(token: &SyntaxToken) -> Option<String> {
             }
             let args = call.children().find(|it| it.kind() == SyntaxKind::TOKEN_TREE)?;
             // Its tokens between the brackets: one string, and a `,` after it at most.
-            let inner: Vec<SyntaxToken> = args // alloc: a call's few tokens, once per `include!` of a workspace file keyed
+            let inner: Vec<SyntaxToken> = args
                 .children_with_tokens()
                 .filter_map(NodeOrToken::into_token)
                 .filter(|it| !it.kind().is_trivia())
@@ -2158,10 +2157,11 @@ fn said_reach(token: &SyntaxToken) -> Option<String> {
                 });
             let value = string(value)?;
             let value = value.strip_prefix("./").unwrap_or(&value);
-            Some(value.replace('\\', "/")) // alloc: as above
+            Some(value.replace('\\', "/"))
         }
         _ => None,
-    }
+    };
+    out.write_str(&said?).ok()
 }
 
 /// Whether `node`, a macro call, is where items are: under nothing but modules, `impl`s and
@@ -2257,19 +2257,18 @@ fn local_call(call: &SyntaxNode, defined: &Defined) -> bool {
     let Some(args) = call.children().find(|it| it.kind() == SyntaxKind::TOKEN_TREE) else {
         return false;
     };
-    // alloc: once per call where items are of a workspace file keyed, a macro's name each
     let mut called: Vec<String> = Vec::new();
-    if !known_tokens(&args, false, &mut called) {
+    if !known_tokens(&args, false, &mut |it: &str| called.push(it.to_owned())) {
         return false;
     }
-    let mut asked: Vec<String> = Vec::new(); // alloc: as above
+    let mut asked: Vec<String> = Vec::new();
     called.push(name);
     while let Some(name) = called.pop() {
         if asked.contains(&name) {
             continue;
         }
         let Some(definition) = in_scope(call, &name, defined) else { return false };
-        if !known_definition(definition, &mut called) {
+        if !known_definition(definition, &mut |it: &str| called.push(it.to_owned())) {
             return false;
         }
         asked.push(name);
@@ -2288,14 +2287,13 @@ struct Defined {
 
 impl Defined {
     fn of(root: &SyntaxNode) -> Defined {
-        // alloc: once per file keyed that calls a macro where items are, a definition each
         let mut defined = Defined { rules: Vec::new(), macro_use: Vec::new() };
         for node in root.descendants() {
             match node.kind() {
                 SyntaxKind::MACRO_RULES => {
                     let name = node.children().find(|it| it.kind() == SyntaxKind::NAME);
                     if let Some(name) = name {
-                        defined.rules.push((name.text().to_string(), node)); // alloc: as above
+                        defined.rules.push((name.text().to_string(), node));
                     }
                 }
                 SyntaxKind::MODULE => {
@@ -2335,8 +2333,8 @@ fn in_scope<'a>(call: &SyntaxNode, name: &str, defined: &'a Defined) -> Option<&
 
 /// Whether the `macro_rules!` `definition` is there wherever it is called and what its rules
 /// write is [`known_tokens`]: no `cfg` on it and no attribute that gives it to a macro. The
-/// names of the macros its rules call that are not plain go into `called`.
-fn known_definition(definition: &SyntaxNode, called: &mut Vec<String>) -> bool {
+/// names of the macros its rules call that are not plain are told to `called`.
+fn known_definition(definition: &SyntaxNode, called: &mut impl FnMut(&str)) -> bool {
     // Nor one the compiler expands itself (`#[rustc_builtin_macro]`, whose rules say nothing
     // of what it makes), nor `local_inner_macros`, which calls the macros its rules name by
     // their path from the crate's root.
@@ -2379,7 +2377,7 @@ fn known_definition(definition: &SyntaxNode, called: &mut Vec<String>) -> bool {
 ///
 /// - `!=`, which no call is;
 /// - written after a name that is neither a metavariable (`$m!`) nor a path's end, which
-///   calls the macro of that name: a plain one, or one whose name goes into `called` and
+///   calls the macro of that name: a plain one, or one whose name is told to `called` and
 ///   that is given a token tree with no `!` in it (a call's input, as below);
 /// - written after a token that ends no name, nor a metavariable or a repetition (an opening
 ///   bracket, `,`, `;`, `=`, `#`, `&`, `|`, `!`, `<`, `>`, a keyword) and not first in a
@@ -2387,7 +2385,7 @@ fn known_definition(definition: &SyntaxNode, called: &mut Vec<String>) -> bool {
 ///
 /// A call's input has no `!` at all: a rule may join its tokens to what it writes, or drop a
 /// separator between a name and a `!`, so no `!` in it can be told from a call.
-fn known_tokens(tree: &SyntaxNode, written: bool, called: &mut Vec<String>) -> bool {
+fn known_tokens(tree: &SyntaxNode, written: bool, called: &mut impl FnMut(&str)) -> bool {
     let solid = |token: Option<SyntaxToken>, next: fn(&SyntaxToken) -> Option<SyntaxToken>| {
         std::iter::successors(token, next).find(|it| !it.kind().is_trivia())
     };
@@ -2427,7 +2425,7 @@ fn known_tokens(tree: &SyntaxNode, written: bool, called: &mut Vec<String>) -> b
                         } else if PLAIN_MACROS.contains(&name.text()) {
                             true
                         } else {
-                            called.push(name.text().to_owned()); // alloc: a macro's name
+                            called(name.text());
                             // What it is given is a call's input, as the first call's is.
                             let input = std::iter::successors(
                                 token.next_sibling_or_token(),
@@ -3010,15 +3008,15 @@ fn taken_from_outside(node: &SyntaxNode, uniform: bool) -> impl Iterator<Item = 
 
 /// What of the `use` item `node` makes its file unplain: an import of a plain macro's name from
 /// outside the standard library and the crate, else a glob from outside them.
-/// With the path's first name, for a census ([`Denial::name`]).
-fn use_denial(node: &SyntaxNode, uniform: bool) -> Option<(Construct, String)> {
+/// With what it takes, whose first name a census keeps ([`Denial::name`]).
+fn use_denial(node: &SyntaxNode, uniform: bool) -> Option<(Construct, Taken)> {
     let mut glob = None;
     for taken in taken_from_outside(node, uniform) {
-        if !taken.glob && taken.name.is_some_and(|it| PLAIN_MACROS.contains(&it.as_str())) {
-            return Some((Construct::PlainNameImport, taken.first));
+        if !taken.glob && taken.name.as_ref().is_some_and(|it| PLAIN_MACROS.contains(&it.as_str())) {
+            return Some((Construct::PlainNameImport, taken));
         }
         if taken.glob && glob.is_none() {
-            glob = Some((Construct::Glob, taken.first));
+            glob = Some((Construct::Glob, taken));
         }
     }
     glob
@@ -3031,7 +3029,6 @@ fn use_denial(node: &SyntaxNode, uniform: bool) -> Option<(Construct, String)> {
 /// `cfg_attr` is, which could add one.
 fn declares_module(node: &SyntaxNode, name: &str) -> bool {
     let Some(list) = node.parent() else { return false };
-    // alloc: once per glob import of a workspace file keyed that names a module beside it
     let used: Vec<String> = attrs(node)
         .filter(|attr| matches!(attr.meta(), Some(ast::Meta::CfgMeta(_))))
         .map(|attr| path_text(attr.syntax()))

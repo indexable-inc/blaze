@@ -2150,10 +2150,15 @@ impl Lowered {
                 // stands in, and its name says which of the two reasons took the surface away.
                 let positioned = self.narrowed.get(&at).is_some_and(|it| it.locates) && own.calls;
                 let none = match (own.interface, own.surface) {
-                    (None, _) => Some(match code::unplain_at(db, at) {
-                        Some(first) => format!("a macro it calls where items are, or an import, could make or bring in a macro of a plain one's name, first at {first}"),
-                        None => "a macro it calls where items are, or an import, could make or bring in a macro of a plain one's name".to_owned(),
-                    }),
+                    (None, _) => {
+                        let mut why = "a macro it calls where items are, or an import, could make or bring in a macro of a plain one's name".to_owned();
+                        let mut first = String::new();
+                        if code::unplain_at(db, at, &mut first).is_some() {
+                            why.push_str(", first at ");
+                            why.push_str(&first);
+                        }
+                        Some(why)
+                    }
                     (Some(_), Some(_)) if positioned => Some("a constant of it could hold a position no token of it says: it calls a function where a constant is evaluated, above a `#[track_caller] const fn` that can read a `Location`".to_owned()),
                     _ => None,
                 };
