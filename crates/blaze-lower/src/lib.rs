@@ -2094,7 +2094,8 @@ impl Lowered {
 
     /// What unit `unit`'s narrowed identity ([`Lowered::narrowed`]) holds of each crate of
     /// its closure, by the crate's name, sorted: what of the crate alone can be observed
-    /// ([`code::OwnNarrow`]), its code text and its interface each an id, and where it is from (a library crate's from the
+    /// ([`code::OwnNarrow`]), its code text and its surface (or what stands in for it) each
+    /// an id, and where it is from (a library crate's from the
     /// store or a full parse, [`Lowered::library_narrows`]; one not given, which is then its
     /// whole text; a workspace crate's code text). For `blaze why`: a unit's record is looked
     /// up under its narrow key first, so a narrowed identity that moved while the whole one
@@ -2126,7 +2127,24 @@ impl Lowered {
                 // interface (a check, and a library's build that stops at the crate boundary:
                 // [`Narrowed::built`]). A body edit moves the first alone, so a library over
                 // it whose record missed is not told that the body is why. A crate with no
-                // code text of its own is one part, its whole text.
+                // code text of its own is one part, its whole text. The second part is the
+                // surface those fold ([`narrow_of`]); where the crate has none, it is what
+                // stands in, and its name says which of the two reasons took the surface away.
+                let positioned = self.narrowed.get(&at).is_some_and(|it| it.locates) && own.calls;
+                let none = match (own.interface, own.surface) {
+                    (None, _) => Some(match code::unplain_at(db, at) {
+                        Some(first) => format!("a macro it calls where items are, or an import, could make or bring in a macro of a plain one's name, first at {first}"),
+                        None => "a macro it calls where items are, or an import, could make or bring in a macro of a plain one's name".to_owned(),
+                    }),
+                    (Some(_), Some(_)) if positioned => Some("a constant of it could hold a position no token of it says: it calls a function where a constant is evaluated, above a `#[track_caller] const fn` that can read a `Location`".to_owned()),
+                    _ => None,
+                };
+                let surface = match none {
+                    Some(_) => None,
+                    None => own.surface,
+                };
+                let none =
+                    none.map_or_else(String::new, |why| format!("; it has no surface: {why}"));
                 // alloc: as above, a part's name each
                 match (own.code, own.interface) {
                     (Some(code), interface) => [
@@ -2135,8 +2153,8 @@ impl Lowered {
                             part(&code.0),
                         )),
                         Some((
-                            format!("the interface its narrow key holds of the crate {named} (a check, and a library's build)"),
-                            part(&interface.unwrap_or(code).0),
+                            format!("the surface its narrow key holds of the crate {named} (a check, and a library's build){none}"),
+                            part(&surface.or(interface).unwrap_or(code).0),
                         )),
                     ],
                     (None, _) => [

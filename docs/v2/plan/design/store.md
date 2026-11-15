@@ -558,7 +558,7 @@ the code generator's span tables, the slot in `compile.rs`.
 with layer 2, every library above is found provided no position kept by the surface lies
 below the edit in that file (a macro's definition, a call of a non-std macro outside a
 left-out body, `line!`); if one does, the libraries above miss and `blaze why` names "the
-interface its narrow key holds of the crate reth_chainspec". Not measured; which of the two
+surface its narrow key holds of the crate reth_chainspec". Not measured; which of the two
 `spec.rs` is, is the run's to say. With layer 3: 0 libraries either way. The units that link
 the crate are made again in both (the edit changes a function's code).
 
@@ -569,8 +569,14 @@ the interface file's bytes are equal, per crate, positions included. Per item an
 what none of them has.
 
 **Not built.** Layer 3's trace and slot. A crate with an item-level call of an unknown macro
-has no surface. Optimized libraries. The walk stopping at the crate boundary (a library that
-misses still walks into its dependencies).
+has no surface: one of a `macro_rules!` macro defined earlier in the same file, in a module
+the call is in, whose rules import nothing, define no macro and call only plain macros and
+other such ones (`code::local_call`), is known, since its expansion is a function of tokens
+the surface holds with their places; a macro defined in another file (`#[macro_use] mod
+macros;`), a dependency's, a proc macro and `$crate::m!` are not yet. `blaze why` says which
+of the two reasons took a crate's surface away (that call or import, at its file and line;
+or a constant that could hold a position). Optimized libraries. The walk stopping at the
+crate boundary (a library that misses still walks into its dependencies).
 
 **Checks.** `blaze-lower`, `code::tests`: `the_surface_text_moves_exactly_with_what_a_front_end_observes`
 (blaze-sim) with controls `the_oracle_catches_a_surface_that_holds_a_bodys_lines` and
