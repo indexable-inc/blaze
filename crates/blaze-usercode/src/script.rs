@@ -229,9 +229,20 @@ pub fn prepare(
         },
         memory: place.memory,
     };
+    // Its own directory around its `OUT_DIR`, the live record made in it as it runs: the
+    // run's product, no input ([`run::Own`]).
+    let own = blaze_build_script::run::own_dir(unit)
+        // alloc: setup, once per run, the three names an earlier run left
+        .map(|dir| run::Own { dir, earlier: blaze_build_script::run::earlier(unit).into() });
     // clone: setup, the run owns its OUT_DIR
-    let spec =
-        run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode, roots };
+    let spec = run::Spec {
+        key,
+        command,
+        out_dir: Some(unit.out_dir.clone()),
+        own,
+        mode: place.mode,
+        roots,
+    };
     Ok(Prepared { spec, env: checked, given: names, made: given })
 }
 
