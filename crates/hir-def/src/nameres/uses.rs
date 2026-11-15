@@ -533,26 +533,39 @@ pub(crate) struct CrateUses {
     rec: Recorded,
 }
 
-/// The crate's def map's records and signatures, then each body's [`body_uses`], each body
-/// before those its blocks declare (the order of [`crate::nameres::demand::walk_bodies`]). Reads
-/// no body itself: a body edit that leaves its [`body_uses`] equal does not run this again,
-/// nor the fold of [`used_imports`] over it.
+/// The crate's def map's records and signatures, then each body's [`body_uses`], in the order
+/// of [`recorded_bodies`]. Reads no body itself: a body edit that leaves its [`body_uses`] equal
+/// does not run this again, nor the fold of [`used_imports`] over it.
 #[blaze_query::tracked(returns(ref))]
 pub(crate) fn crate_uses(db: &Db, krate: Crate) -> CrateUses {
     let def_map = crate_def_map(db, krate);
     let mut walk = Walk::new(db);
     walk.def_map(def_map);
-    let mut queue = crate_body_owners(db, krate);
-    // alloc: once per execution, at the roots' count
-    let mut seen: HashSet<DefWithBodyId, Global> = HashSet::with_capacity_in(queue.len(), Global);
-    seen.extend(queue.iter().copied());
-    queue.reverse();
-    while let Some(owner) = queue.pop() {
-        let body = body_uses(db, owner);
-        walk.extend(&body.rec);
-        queue.extend(body.owners.iter().rev().copied().filter(|&it| seen.insert(it)));
+    for owner in recorded_bodies(db, krate) {
+        walk.extend(&body_uses(db, owner).rec);
     }
     CrateUses { rec: walk.finish() }
+}
+
+/// Every body of `krate`, those its bodies' blocks declare included, each before those its
+/// blocks declare (the order of [`crate::nameres::demand::walk_bodies`]), found through each
+/// body's [`body_uses`] record and never its body: what a fold over the crate's per-body records
+/// walks, so that a body edit that leaves the records equal runs no fold again.
+pub fn recorded_bodies(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
+    let roots = crate_body_owners(db, krate);
+    // alloc: once per call, at the roots' count: bodies declared in bodies are few
+    let mut seen: HashSet<DefWithBodyId, Global> = HashSet::with_capacity_in(roots.len(), Global);
+    seen.extend(roots.iter().copied());
+    // alloc: the result, once per call
+    let mut bodies = Vec::with_capacity(roots.len());
+    let mut queue = roots;
+    queue.reverse();
+    while let Some(owner) = queue.pop() {
+        bodies.push(owner);
+        let declared = &body_uses(db, owner).owners;
+        queue.extend(declared.iter().rev().copied().filter(|&it| seen.insert(it)));
+    }
+    bodies
 }
 
 /// What the paths of one body use, with the records and signatures of its blocks' def maps,

@@ -8,8 +8,7 @@ use hir_def::{
     expr_store::{ExpressionStore, StoreVisitor, scope::ExprScopes},
     hir::{Expr, ExprId, ExprOrPatId, PatId},
     nameres::{
-        demand::crate_body_owners,
-        uses::{Use, UsedImports, every_trait_use, used_imports_with},
+        uses::{Use, UsedImports, every_trait_use, recorded_bodies, used_imports_with},
     },
     resolver::resolver_for_scope,
 };
@@ -23,12 +22,14 @@ mod tests;
 /// [`hir_def::nameres::uses::used_imports`] with the imports of each trait a method call or an
 /// associated item path of a body resolved through ([`body_trait_uses`]). The fold over the
 /// crate: it reads each body's record, never a body, so a body edit that changes none of the
-/// traits it picks leaves every record equal and this does not run again.
+/// traits it picks leaves every record equal and this does not run again. Every body, those
+/// declared in a body's blocks included ([`recorded_bodies`]): a trait imported in a `fn`
+/// written inside another is picked in that inner body.
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
     // alloc: the query's result's input, once per execution.
     let mut uses = Vec::new();
-    for owner in crate_body_owners(db, krate) {
+    for owner in recorded_bodies(db, krate) {
         uses.extend_from_slice(body_trait_uses(db, owner));
     }
     used_imports_with(db, krate, &uses)
