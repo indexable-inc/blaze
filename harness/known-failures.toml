@@ -16,8 +16,9 @@
 #   cause  one line: what fails and why, as far as it is known. `unittests.py` with
 #          `{"record": true}` writes the first line of the failure where the entry is new, and
 #          keeps the cause of an entry that was here;
-#   only   optional, { profile = "dev"|"release", os = "linux"|"macos"|"windows" or a list of them }:
-#          the entry holds only for such a run, and is unchecked by others.
+#   only   optional, { profile = "dev"|"release", os = "linux"|"macos"|"windows" or a list of them,
+#          builder = "blaze"|"cargo" }: the entry holds only for such a run (builder: what
+#          compiled the tests), and is unchecked by others.
 # `[recorded]` is the last run this list was written from: python3 harness/unittests.py '{"record": true}'
 
 [crates.blaze-cargo]
