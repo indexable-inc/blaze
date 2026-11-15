@@ -1,0 +1,14 @@
+{
+ "id": "watch-start-walk-on-loop",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane W2 (watch-1114)",
+ "where": "crates/blaze-core/src/fanotify.rs (Fanotify::new, learn), watch.rs (Tree::reusing, Inotify::new), uring/flight.rs (watch)",
+ "what": "Starting a watch walked the whole tree on the daemon's loop thread: fanotify learned every directory's handle up front (to tell a gone directory's events from outside ones), and the inotify start added a watch per directory inside submit. On ripgrep's target the walk visited 256,216 directories and the loop missed every budget.",
+ "cost": "the daemon path died on ripgrep; a lane to remove the walk",
+ "cause": "the gone-directory rule was implemented as 'know every directory' instead of the invariant that the shortest changed prefix of a delete is an event in a live parent; the inotify start was synchronous in submit because ordering (stat after watch) was kept by running the walk before returning",
+ "whys": "fanotify reports by handle, a gone directory's handle cannot be opened, so the code learned every handle while it still could; nobody stated the invariant that makes that unnecessary; the ring driver had no notion of a start in flight, so the only way to keep ordering was to finish it in submit",
+ "class": "work proportional to a tree's size done on a loop thread to answer a question an invariant answers in constant time, or done inline to keep an ordering a hold would keep",
+ "prevention": "built (not compiled): fanotify starts from W, its ancestors and the submounts in one read of /proc/self/mountinfo; the inotify walk runs on a bounded walker thread under a span and MOST_DIRS, and looks and flushes under a starting watch are held until it is in place; tests plant 'the top deletion is dropped', 'mountinfo is not read', 'walks at start' and 'the confirming stat is answered before the watch is in place'",
+ "workaround": "none",
+ "state": "fixed-unverified"
+}
