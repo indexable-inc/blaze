@@ -10,12 +10,13 @@ description: "How to find out why a blaze build did what it did from its profile
 ## ask-the-profile-first (rule 17)
 
 Every build already records its footprint and live bytes, each task's peak memory, its spans, its
-waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (the daemon writes it
-today). A why question (slow, rerunning, memory-hungry, idle workers, hung) starts with `blaze
-explain footprint_per_build`, `memory` or `worker_states` (and `task_memory` or `admission_waits`
-while admission exists), `blaze why`, or a `blaze debug sql` query on the home that showed it, and
-quotes the rows. A guess or a fresh experiment comes only after the rows can't answer, and then the
-gap gets a span or counter.
+waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (every command writes it,
+with a daemon or without; a path that writes none is unfinished: `slow-is-p0-traced`). A why
+question (slow, rerunning, memory-hungry, idle workers, hung) starts with `blaze explain
+footprint_per_build`, `memory` or `worker_states` (and `task_memory` or `admission_waits` while
+admission exists), `blaze why`, or a `blaze debug sql` query on the home that showed it, and quotes
+the rows. A guess or a fresh experiment comes only after the rows can't answer, and then the gap
+gets a span or counter.
 
 ## claims-from-evidence (rule 61)
 

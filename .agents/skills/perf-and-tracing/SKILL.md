@@ -9,13 +9,18 @@ description: "How a slow thing is found and fixed: a span names every stretch of
 
 ## slow-is-p0-traced (rule 16)
 
-Anything slow is a P0 until a span names it, and the trace comes before the speed fix. Every stretch
-of worker time sits under a `tracing::info_span!(target: "blaze", ...)` that names the work: the
-macro path for a proc-macro expansion, the package, version and target kind for a unit, the query
-and key, the creator of a scope being waited on. Its own CPU time (`self_cpu_ns`) is filled, so a
-DuckDB query over `<BLAZE_HOME>/v2/profile/*.spans.parquet` says which item took the time and
-whether it was busy or waiting. A sampler stack or a guess from a log is a lead. The PR that makes
-something faster quotes the before and after from those spans.
+Anything slow is a P0 until a span names it, and anything large until the profile says what held it
+(bytes by allocator tag, each task's peak, the allocation samples); the trace comes before the fix.
+Every command writes that profile, with a daemon or without, through the one allocator, the one
+schema (`crates/blaze-profile/src/schema.rs`) and the one set of readers: a new command, path or
+task kind that writes none is itself the P0, fixed before its numbers are discussed, and it gets no
+second accounting or summary line computed apart from the profile. Every stretch of worker time sits
+under a `tracing::info_span!(target: "blaze", ...)` that names the work: the macro path for a
+proc-macro expansion, the package, version and target kind for a unit, the query and key, the
+creator of a scope being waited on. Its own CPU time (`self_cpu_ns`) is filled, so a DuckDB query
+over `<BLAZE_HOME>/v2/profile/*.spans.parquet` says which item took the time and whether it was busy
+or waiting. A sampler stack or a guess from a log is a lead. The PR that makes something faster
+quotes the before and after from those spans.
 
 ## incremental-first (rule 60)
 

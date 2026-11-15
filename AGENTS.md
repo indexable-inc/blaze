@@ -114,7 +114,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **64. simulate-first**: Test stateful, incremental, concurrent or durable code in the deterministic simulation first.
 
 ### Speed and tracing (skill `perf-and-tracing`)
-- **16. slow-is-p0-traced**: Anything slow is a P0 until a span names it; the fix quotes before and after from the spans.
+- **16. slow-is-p0-traced**: Anything slow or large is a P0 until the profile names it; the fix quotes before and after.
 - **60. incremental-first**: Judge by the edit loop first; trade in the order incremental, memory, cold, disk cleanup, disk.
 
 ### Evidence and debugging (skill `debugging`)
@@ -154,7 +154,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **48. agents-are-a-cost**: Start each independent large piece now in its own lane; four at most share files; nothing small.
 - **69. every-command-has-a-timeout**: Size a timeout to each command; an expiry is a finding, never waited out or retried.
 - **80. act-on-snapshots**: Work starts when asked, on a snapshot; nothing builds, checks or publishes on save or mid-edit.
-- **82. real-run-first**: A new path runs its real command on a real project the day it compiles, before more is built.
+- **82. real-run-first**: A new path runs its real command, profile on, on a real project the day it compiles.
 
 ### Landing (skill `landing`)
 - **37. land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`; never push to main.
