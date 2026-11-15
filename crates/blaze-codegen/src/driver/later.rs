@@ -33,9 +33,9 @@ use blaze_mem::{Tag, frame};
 use std::alloc::Global;
 
 use super::{
-    Build, Built, By, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
-    StaticOf, Whence, callee, dev_template_key, error, placed, prepare_node, stopped, stored,
-    stored_function, unfit, unkept_inline, unkept_message,
+    Build, Built, By, FnNode, FrontInstance, FrontStatic, How, Lookup, MadeIn, Node, Out, Put,
+    Sorted, StaticId, StaticOf, Whence, callee, dev_template_key, error, flight_key, placed,
+    prepare_node, stopped, stored, stored_function, unfit, unkept_inline, unkept_message,
 };
 use crate::{
     Backend, CodegenError, CompiledFunction, Instance, InstanceKey, Unit,
@@ -187,31 +187,59 @@ fn template_instance<I, S>(node: &FnNode<I, S>, unit: &Unit) -> Instance {
     Instance { code: node.described.template_code, ..unit.instance }
 }
 
-/// The store's value of `template`, kept under `at` (a [`dev_template_key`]).
-fn put_of(at: Key, template: &Template) -> Put {
+/// The store's value of `template`, kept under `at` (a [`dev_template_key`]), with what it is:
+/// `node`'s function at `unit`, compiled at `toolchain`, made by `made` ([`FnNode::put_of`]).
+fn put_of<I, S>(at: Key, template: &Template, (node, unit, toolchain): (&FnNode<I, S>, &Unit, &ContentId), made: MadeIn) -> Put {
     // alloc: the store's value of a template, once a function
-    Put { key: at, kind: Kind::Code, bytes: blob::encode(template) }
+    let bytes = blob::encode(template);
+    // Global: what it is lives as long as the put, which the caller's store takes.
+    Put { key: at, kind: Kind::Code, bytes, of: Some(node.put_of(unit, toolchain, made, Global)) }
 }
 
-/// The function for `key` from the memo's `template` of `shape`, with the template's [`Put`]
-/// under `at`.
+/// Where a compile outside a walk is made ([`MadeIn`]), before how it was made is known.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Making {
+    LazyAhead,
+    FirstCall,
+    TierUp,
+    Alone,
+}
+
+impl Making {
+    fn made(self, how: How) -> MadeIn {
+        match self {
+            Making::LazyAhead => MadeIn::LazyAhead(how),
+            Making::FirstCall => MadeIn::FirstCall(how),
+            Making::TierUp => MadeIn::TierUp(how),
+            Making::Alone => MadeIn::Alone(how),
+        }
+    }
+}
+
+/// The function for `key` (compiled as `unit`, at `spec`) from the memo's `template` of
+/// `shape`, with the template's [`Put`] under `at`, made in `made`.
+#[allow(clippy::too_many_arguments)]
 fn memoized<I, S>(
     node: &FnNode<I, S>,
+    unit: &Unit,
+    spec: &Spec,
     key: InstanceKey,
     at: Key,
     shape: ContentId,
     template: &Template,
+    made: MadeIn,
 ) -> Result<(CompiledFunction, Vec<Put>), CodegenError> {
     let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
     let function =
         template.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
     // alloc: the store's value of a memo hit, once a function
-    Ok((function, vec![put_of(at, template)]))
+    Ok((function, vec![put_of(at, template, (node, unit, &spec.toolchain.id), made)]))
 }
 
 /// `unit`, `node`'s function at its own or another tier, where neither the store nor a
 /// recorded shape has it: its IR built, then the memo's template of its shape, else compiled.
 /// With the shape its template is kept under in the memo.
+#[allow(clippy::too_many_arguments)]
 fn compiled<B: Prepare>(
     backend: &B,
     frontend: &B::Frontend,
@@ -220,6 +248,7 @@ fn compiled<B: Prepare>(
     node: &Node<B>,
     unit: &Unit,
     spec: &Spec,
+    making: Making,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
     let (key, item) = (unit.instance.key(), unit.item);
     let at = dev_template_key(
@@ -232,7 +261,8 @@ fn compiled<B: Prepare>(
     let (compiled, made) = prepare_node(backend, frontend, unit, spec, node)?;
     let shape = compiled.key();
     if let Some(template) = memo.get(&shape) {
-        let (function, puts) = memoized(node, key, at, shape, template)?;
+        let made = making.made(How::Memo { shape });
+        let (function, puts) = memoized(node, unit, spec, key, at, shape, template, made)?;
         return Ok((function, puts, Made::Memo, shape));
     }
     let emitted = backend
@@ -249,7 +279,7 @@ fn compiled<B: Prepare>(
     let mut puts = Vec::with_capacity(2);
     match (emitted.side, emitted.function.side) {
         (Some(bytes), Some(id)) => {
-            puts.push(Put { key: keys::side(&id), kind: Kind::Debug, bytes })
+            puts.push(Put { key: keys::side(&id), kind: Kind::Debug, bytes, of: None })
         }
         (None, None) => {}
         _ => {
@@ -269,7 +299,7 @@ fn compiled<B: Prepare>(
     // alloc: an error
     .map_err(|why| error(key, item, why.to_string()))?;
     let kept = memo.put(compiled, template);
-    puts.push(put_of(at, kept));
+    puts.push(put_of(at, kept, (node, unit, &spec.toolchain.id), making.made(How::Compiled)));
     let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), &why);
     let function =
         kept.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
@@ -291,10 +321,20 @@ fn claimed<B: Prepare>(
     node: &Node<B>,
     unit: &Unit,
     spec: &Spec,
+    making: Making,
     check: impl Fn() -> Result<(), CodegenError>,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
     let key = unit.instance.key();
-    let at = placed(stored(key, &node.built_in), &node.refs, own_place(key, &node.refs));
+    // Its flight key as a walk's is ([`flight_key`]): of its stored key and its form, so a
+    // compile of the other form of one stored key (another origin's describe) never takes
+    // this one's landing under its own template key, which would put the other form's
+    // template under it (rule 21; `tests::later::a_later_compile_never_takes_the_landing_of_
+    // the_other_form`). Not ripgrep's collision after a restart, which was a bind record's
+    // (`blaze_launch_host::bind::bind_key`).
+    let at = flight_key(
+        placed(stored(key, &node.built_in), &node.refs, own_place(key, &node.refs)),
+        node.described.anchors.is_some(),
+    );
     let flights = memo.flights();
     let mut plan = flight::Plan::new(1);
     // alloc: what other builds' waits for this compile name it by, once per later compile
@@ -306,8 +346,9 @@ fn claimed<B: Prepare>(
         match decision {
             flight::Decision::Ask(_) => {
                 let asked = flights.ask(at, &owner, || {
-                    match check()
-                        .and_then(|()| compiled(backend, frontend, memo, nodes, node, unit, spec))
+                    match check().and_then(|()| {
+                        compiled(backend, frontend, memo, nodes, node, unit, spec, making)
+                    })
                     {
                         Ok(made) => (Some(made.3), Ok(made)),
                         Err(why) => (None, Err(why)),
@@ -350,6 +391,8 @@ fn claimed<B: Prepare>(
     match memo.get(&shape) {
         Some(template) => memoized(
             node,
+            unit,
+            spec,
             key,
             dev_template_key(
                 &template_instance(node, unit),
@@ -360,6 +403,7 @@ fn claimed<B: Prepare>(
             ),
             shape,
             template,
+            making.made(How::Landed { shape }),
         )
         .map(|(function, puts)| (function, puts, Made::Flown, shape)),
         // alloc: an error
@@ -463,8 +507,9 @@ impl<I, S> Later<I, S> {
     /// The store's value of [`Later::memo_hit`]'s template, under `key`'s stored key: `None`
     /// where `memo_hit` is.
     pub fn memo_put(&self, memo: &Memo, key: InstanceKey) -> Option<Put> {
-        let (node, template, _) = self.recorded(memo, key)?;
-        Some(put_of(node.template_key(), template))
+        let (node, template, shape) = self.recorded(memo, key)?;
+        let made = Making::FirstCall.made(How::Memo { shape });
+        Some(put_of(node.template_key(), template, (node, &node.unit, &node.spec.toolchain.id), made))
     }
 
     /// One function of the walk, as a lazy run asks for it on its first call: the store's
@@ -492,10 +537,13 @@ impl<I, S> Later<I, S> {
             return Ok((function, Vec::new()));
         }
         if let Some((_, template, shape)) = self.recorded(memo, key) {
-            return memoized(node, key, node.template_key(), shape, template);
+            let made = Making::FirstCall.made(How::Memo { shape });
+            let (unit, spec) = (&node.unit, &node.spec);
+            return memoized(node, unit, spec, key, node.template_key(), shape, template, made);
         }
         let check = || same_code(frontend, node, key);
-        claimed(backend, frontend, memo, &*self.nodes, node, &node.unit, &node.spec, check)
+        let (unit, spec) = (&node.unit, &node.spec);
+        claimed(backend, frontend, memo, &*self.nodes, node, unit, spec, Making::FirstCall, check)
             .map(|it| (it.0, it.1))
     }
 
@@ -535,7 +583,7 @@ impl<I, S> Later<I, S> {
             return Ok((function, Vec::new()));
         }
         let check = || same_code(frontend, node, key);
-        claimed(backend, frontend, memo, &*self.nodes, node, &unit, &spec, check)
+        claimed(backend, frontend, memo, &*self.nodes, node, &unit, &spec, Making::TierUp, check)
             .map(|it| (it.0, it.1))
     }
 }
@@ -556,7 +604,8 @@ pub(super) fn compile_alone<B: Prepare, L: Lookup + ?Sized>(
         // alloc: none, empty
         return Ok((function, Vec::new()));
     }
-    claimed(backend, frontend, memo, nodes, node, &node.unit, &node.spec, || Ok(())).map(|it| (it.0, it.1))
+    let (unit, spec) = (&node.unit, &node.spec);
+    claimed(backend, frontend, memo, nodes, node, unit, spec, Making::Alone, || Ok(())).map(|it| (it.0, it.1))
 }
 
 impl<B: Prepare> Build<'_, B> {
@@ -737,6 +786,7 @@ impl<B: Prepare> Build<'_, B> {
                 node,
                 &node.unit,
                 &node.spec,
+                Making::LazyAhead,
                 || Ok(()),
             );
             (By::node(key, &node.unit), node.unit.instance.code, made)

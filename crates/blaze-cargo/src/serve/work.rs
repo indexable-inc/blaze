@@ -442,6 +442,10 @@ pub struct Compiled {
     /// Finished values only: nothing here waits to be encoded or filed. The answer waits for
     /// these (with `outputs`); the unit's record does not ([`Compiled::record`]).
     pub puts: Vec<Put>,
+    /// What each code value among `puts` codegen made is (`blaze_codegen::driver::Put::of`),
+    /// by its key, sorted: what a refusal of its put names (rule 19). Empty for a unit that
+    /// made none.
+    pub put_of: Vec<(blaze_cas::Key, Arc<blaze_codegen::driver::PutOf>)>,
     /// The unit's record still to encode and file, put after the build's answer by its
     /// after-answer task ([`crate::serve::unit::file_records`]), as one more of the puts the
     /// job's settling waits for, so its request certificate is written only once the record

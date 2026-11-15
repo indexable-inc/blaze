@@ -58,7 +58,10 @@ use std::{fmt, sync::Arc};
 
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
 use blaze_cas::{Key, Kind};
-use blaze_codegen::{driver::ProfileCounts, settings::Pgo};
+use blaze_codegen::{
+    driver::{ProfileCounts, PutOf},
+    settings::Pgo,
+};
 use blaze_core::lock::{Lock, LockGuard};
 use blaze_diagnostics::{Diag, Options, lints::CommandLine};
 use blaze_ids::{ContentId, Hasher};
@@ -2752,6 +2755,8 @@ struct Making {
     files: Vec<(String, Written, bool)>,
     /// What codegen put, the outputs to follow.
     puts: Vec<Put>,
+    /// [`Compiled::put_of`]: what each code value codegen put is, by its key, sorted.
+    put_of: Vec<(Key, Arc<PutOf>)>,
     natives: Vec<(String, ContentId)>,
     links: Vec<(String, Linking, Option<blaze_api::Tiers>)>,
     macros: Option<ProcMacroLoadResult>,
@@ -3027,6 +3032,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
             open: record.open,
             why: record.why,
             puts,
+            put_of: Vec::new(),
             record: None,
             body_sessions: Vec::new(),
             share: Vec::new(),
@@ -3403,11 +3409,13 @@ fn link(
     {
         // Moved, not copied: the store keeps them as they are.
         let built = std::mem::take(&mut parts.built.puts);
-        making.puts.extend(built.into_iter().map(|it| Put {
-            key: it.key,
-            kind: it.kind,
-            bytes: it.bytes,
-        }));
+        for it in built {
+            if let Some(of) = it.of {
+                making.put_of.push((it.key, of));
+            }
+            making.puts.push(Put { key: it.key, kind: it.kind, bytes: it.bytes });
+        }
+        making.put_of.sort_unstable_by_key(|it| it.0);
     }
     if let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
         && !parts.built.misses.is_empty()
@@ -3577,6 +3585,7 @@ fn store(
         nothing,
         files,
         mut puts,
+        put_of,
         natives,
         links,
         macros,
@@ -3847,6 +3856,7 @@ fn store(
         open,
         why,
         puts,
+        put_of,
         record: None,
         body_sessions: Vec::new(),
         share: Vec::new(),
@@ -4401,6 +4411,7 @@ fn assemble(
         nothing: true,
         files: Vec::new(),
         puts: Vec::new(),
+        put_of: Vec::new(),
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,
@@ -4647,6 +4658,7 @@ fn assemble(
         nothing: false,
         files,
         puts: Vec::new(),
+        put_of: Vec::new(),
         natives,
         links,
         macros: None,

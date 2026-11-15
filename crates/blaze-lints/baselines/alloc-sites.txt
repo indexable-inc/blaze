@@ -14,14 +14,14 @@ blaze-audit	0	0	65	25
 blaze-bench	0	0	0	12
 blaze-build-script	67	0	7	26
 blaze-bytes	0	0	0	3
-blaze-cargo	2319	2	209	1465
+blaze-cargo	2319	2	211	1465
 blaze-cas	817	0	158	355
 blaze-certify	83	0	0	51
 blaze-check	47	0	2	34
 blaze-ci	242	0	17	86
 blaze-client	40	0	0	24
 blaze-client-c	0	0	0	1
-blaze-codegen	516	0	62	161
+blaze-codegen	516	0	64	161
 blaze-codegen-code	0	0	0	66
 blaze-core	764	0	174	219
 blaze-dbsp	12	0	12	4

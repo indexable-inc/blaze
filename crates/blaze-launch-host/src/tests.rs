@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 
 use blaze_cas::Key;
+use blaze_codegen::plan::Origin;
 use blaze_codegen::{
     Arch, CompiledFunction, Init, InstanceKey, RelocKind, Relocation, Relocs, Static, StaticId, Target,
 };
@@ -117,7 +118,7 @@ fn static_id(of: u64) -> StaticId {
 }
 
 fn sealed_bind(of: u64) -> Option<Key> {
-    Some(bind::bind_key(&Key(id(6, of, 1)), &naming(), &UNDER))
+    Some(bind::bind_key(&Key(id(6, of, 1)), Some(&Origin::Std), &naming(), &UNDER))
 }
 
 /// A function of `own` whose code reaches each of `targets` through a GOT word, then holds
@@ -1865,6 +1866,69 @@ fn images_that_differ_have_keys_that_differ() {
     assert_eq!(collide(Plant::None), None);
     let caught = collide(Plant::KeyOfIdentityAlone).expect("a key that misses an input");
     assert!(caught.contains("one key"), "{caught}");
+}
+
+/// The bind records of a run that meets one generic function through each of `met`, in that
+/// order, put into one store, keyed by `key_of` (of its describe key and who asked): the
+/// store's records by key, or the refusal of a key under which a later put has other bytes,
+/// naming the function. As in a launched run, the first requester a run meets the function
+/// through makes it: its slot identity's origin is that requester's, as a generic
+/// instance's is (`Described::origin`), while the describe key is one for every requester
+/// whose units give the same (`HirFrontend::record_key`'s `asked_as`).
+fn bind_records_of(
+    met: &[Origin],
+    key_of: &dyn Fn(&Key, &Origin) -> Key,
+    store: &mut std::collections::BTreeMap<Key, Vec<u8>>,
+) -> Result<(), String> {
+    const NAME: &str = "<core::ptr::non_null::NonNull<std::ffi::os_str::OsString> as core::cmp::PartialEq>::eq";
+    let ask = Key(id(16, 1, 0));
+    let (identity, abi) = (id(17, 1, 0), id(18, 1, 0));
+    let made = record::function(&compiled(key(500, 1), &[], 5), NAME, &NONE).expect("a record");
+    for requester in met {
+        let slot = bind::slot_identity(&blaze_codegen::driver::subject(identity, *requester), &abi);
+        // clone: a record's handle, once a requester, in a test
+        let bound = Bound { made: made.clone(), slot, code: CodeHash(id(19, 1, 0)), names: Vec::new() };
+        let (key, bytes) = (key_of(&ask, requester), bind::encode(&bound));
+        match store.get(&key) {
+            Some(kept) if *kept != bytes => {
+                return Err(format!("the bind record of `{NAME}` under {key:?} is other bytes than the store's, met through {requester:?}"));
+            }
+            Some(_) => {}
+            None => {
+                store.insert(key, bytes);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The invariant (rule 25): two runs that meet one generic function through two requesters
+/// of equal units in either order (a cold run, and a run after a restart and an edit, whose
+/// first call reaches it from the other) write equal bind records under each key, so the
+/// store refuses neither, and both leave it the same. The control is the key before the fix,
+/// of the describe key alone, which the slot identity's origin is no input of: the second
+/// run's put is refused, naming the function (ripgrep's collision).
+#[test]
+fn two_runs_that_meet_a_generic_through_two_requesters_in_either_order_write_equal_records() {
+    let (a, b) = (
+        Origin::Dependency(blaze_codegen::plan::Package::new("ignore")),
+        Origin::Dependency(blaze_codegen::plan::Package::new("globset")),
+    );
+    let keyed = |ask: &Key, requester: &Origin| bind::bind_key(ask, Some(requester), &naming(), &UNDER);
+    let (mut one, mut other) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
+    bind_records_of(&[a], &keyed, &mut one).expect("the cold run");
+    bind_records_of(&[b, a], &keyed, &mut one).expect("the run after a restart and an edit");
+    bind_records_of(&[b, a], &keyed, &mut other).expect("the other order, cold");
+    bind_records_of(&[a], &keyed, &mut other).expect("the other order, after");
+    assert_eq!(one, other, "the store is one whichever order the runs met the function in");
+    assert_eq!(one.len(), 2, "a record for each requester");
+
+    // The control: the key of the describe key alone, as `bind_key` was before.
+    let planted = |ask: &Key, _: &Origin| bind::bind_key(ask, None, &naming(), &UNDER);
+    let mut store = std::collections::BTreeMap::new();
+    bind_records_of(&[a], &planted, &mut store).expect("the cold run");
+    let refused = bind_records_of(&[b], &planted, &mut store).expect_err("a key that leaves the requester out");
+    assert!(refused.contains("NonNull<std::ffi::os_str::OsString>"), "{refused}");
 }
 
 /// The invariant (rule 26): a bind record of the layout before asks were in its names

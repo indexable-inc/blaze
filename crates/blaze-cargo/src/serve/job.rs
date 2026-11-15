@@ -827,6 +827,7 @@ impl<S: Steps> plane::Work for Step<S> {
                             open: false,
                             why: Some(panic.to_string()), // alloc: a panic, once
                             puts: Vec::new(),
+                            put_of: Vec::new(),
                             body_sessions: Vec::new(),
                             share: Vec::new(),
                             outputs: Vec::new(),
@@ -875,6 +876,7 @@ impl<S: Steps> plane::Work for Step<S> {
                             open: false,
                             why: Some(what),
                             puts: Vec::new(),
+                            put_of: Vec::new(),
                             body_sessions: Vec::new(),
                             share: Vec::new(),
                             outputs: Vec::new(),
@@ -1145,6 +1147,63 @@ impl<S: Steps> plane::Work for Step<S> {
 /// The reader of a task's own front end, which a task of a batch that reads is posted with.
 fn this<S: Steps>(readers: Readers<S>) -> S::Reader {
     readers.this.expect("a task that reads is posted with its reader")
+}
+
+/// What a refusal of a put says past the key (rule 19): what the value is and the build mode
+/// that made it (`of`, from codegen, its key's parts among it), then both values' lengths, the
+/// first byte that differs and the part of the value's layout that byte is in: a template's
+/// ([`blaze_codegen::driver::CodeDifference`]) or a launched run's bind record's
+/// ([`blaze_launch_host::bind::part_at`]). `kept` is read from `store` as it is printed, once
+/// a refusal: the put's `Mismatch` holds only its content. Made only by a refusal, it borrows
+/// all it names, and nothing is worked out until it is printed.
+struct PutRefused<'a> {
+    store: &'a Store,
+    key: blaze_cas::Key,
+    kind: blaze_cas::Kind,
+    given: &'a [u8],
+    of: Option<&'a blaze_codegen::driver::PutOf>,
+}
+
+impl std::fmt::Display for PutRefused<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use blaze_launch_host::bind;
+        let given = self.given;
+        if let Some(of) = self.of {
+            write!(f, "; it is {of}")?;
+        }
+        let kept = match self.store.get(&self.key) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return f.write_str("; the value kept under it does not read back to compare"),
+            Err(why) => return write!(f, "; the value kept under it is corrupt: {why}"),
+        };
+        if kept.kind != self.kind {
+            write!(f, " (kept as a {:?} value)", kept.kind)?;
+        }
+        let kept = kept.bytes;
+        if self.kind == blaze_cas::Kind::Code && !bind::is_bind_record(given) && !bind::is_bind_record(kept) {
+            return write!(f, "; {}", blaze_codegen::driver::CodeDifference { kept, given });
+        }
+        let at = kept.iter().zip(given).position(|(a, b)| a != b).unwrap_or(kept.len().min(given.len()));
+        write!(f, "; the kept value is {} bytes and the given {}, first differing at byte {at}", kept.len(), given.len())?;
+        let record = [given, kept].into_iter().find(|it| bind::is_bind_record(it));
+        if let Some(part) = record.and_then(|it| bind::part_at(it, at)) {
+            write!(f, ", in {part} of the bind record")?;
+        }
+        // Both bind records' slot identities and code hashes, decoded: which input of the slot
+        // (its identity's origin, its ABI) or of the code moved is the next question.
+        if bind::is_bind_record(kept) && bind::is_bind_record(given) {
+            match (bind::decode(kept), bind::decode(given)) {
+                (Ok(kept), Ok(given)) => write!(
+                    f,
+                    "; the kept record's slot identity is {:x} and code hash {:x}, the given's {:x} and {:x}",
+                    kept.slot, kept.code.0, given.slot, given.code.0
+                )?,
+                (Err(why), _) => write!(f, "; the kept bind record does not read: {why}")?,
+                (_, Err(why)) => write!(f, "; the given bind record does not read: {why}")?,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One thread task of kind `kind`, the batch's only one.
@@ -7917,10 +7976,11 @@ impl<S: Steps> Jobs<S> {
                     tickets.add(ticket);
                 }
                 Err(mismatch) => {
+                    let differ = PutRefused { store: &*store, key, kind, given: &put.bytes, of: None };
                     // alloc: a loss, once
                     failed = Some(format!(
                         "the store holds other bytes under {key:?} than the build of {checkout} made now \
-                         for {what}, a {kind:?} value (kept {:?}, made {:?}): its key misses an input or \
+                         for {what}, a {kind:?} value (kept {:?}, made {:?}){differ}: its key misses an input or \
                          what made it is not deterministic (keys-cover-every-input)",
                         mismatch.kept, mismatch.given
                     ));
@@ -8894,7 +8954,7 @@ impl<S: Steps> Jobs<S> {
             Stage::Units(build) => build.input.units.graph.units.get(unit),
             _ => None,
         };
-        let mismatched = |store: &str, kind: blaze_cas::Kind, mismatch: blaze_cas::Mismatch| {
+        let mismatched = |store: &str, kind: blaze_cas::Kind, mismatch: blaze_cas::Mismatch, differ: PutRefused<'_>| {
             let what = match named {
                 // alloc: an error, once
                 Some(it) => format!("unit {unit} (`{}` of {})", it.target.name, it.pkg_id),
@@ -8903,7 +8963,7 @@ impl<S: Steps> Jobs<S> {
             };
             // alloc: an error, once
             let what = format!(
-                "{store} holds other bytes under {:?} than {what} made now, a {kind:?} value: {mismatch:?}",
+                "{store} holds other bytes under {:?} than {what} made now, a {kind:?} value: {mismatch:?}{differ}",
                 mismatch.key
             );
             // clone: an error, once
@@ -8922,6 +8982,7 @@ impl<S: Steps> Jobs<S> {
         });
         // The unit's own tickets, which a body entries' session it saved waits on to be marked.
         let mut unit_put = blaze_cas::Tickets::default();
+        let put_of = compiled.put_of;
         for put in compiled.puts {
             let kind = put.kind;
             match w.store.put(put.key, put.kind, &put.bytes) {
@@ -8930,7 +8991,9 @@ impl<S: Steps> Jobs<S> {
                     unit_put.add(ticket);
                 }
                 Err(mismatch) => {
-                    let error = mismatched("the store", kind, mismatch);
+                    let of = (put_of.binary_search_by_key(&put.key, |it| it.0).ok()).map(|at| &*put_of[at].1);
+                    let differ = PutRefused { store: &*w.store, key: put.key, kind, given: &put.bytes, of };
+                    let error = mismatched("the store", kind, mismatch, differ);
                     job.over.get_or_insert((false, Some(error)));
                 }
             }
@@ -8967,7 +9030,8 @@ impl<S: Steps> Jobs<S> {
             match w.std.put(put.key, put.kind, &put.bytes) {
                 Ok(ticket) => job.layer.add(ticket),
                 Err(mismatch) => {
-                    let error = mismatched("the machine's sealed layer", kind, mismatch);
+                    let differ = PutRefused { store: &*w.std, key: put.key, kind, given: &put.bytes, of: None };
+                    let error = mismatched("the machine's sealed layer", kind, mismatch, differ);
                     job.over.get_or_insert((false, Some(error)));
                 }
             }
