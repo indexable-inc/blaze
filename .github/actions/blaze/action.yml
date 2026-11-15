@@ -102,6 +102,11 @@ runs:
         echo "BASH_ENV=$env_file" >> "$GITHUB_ENV"
     # The cause, shown: the release's daemon, started from a step whose bash read BASH_ENV, has
     # SIGRTMIN+6 (signal 40, bit 39 of SigIgn) ignored and says its sampler is off.
+    # Every wait here is bounded and ends in a kill. The daemon prints "no CPU samples" before it
+    # listens, and a `blaze stop` that finds no socket says "no daemon is running" and exits 0, so
+    # a stop sent between the two leaves the daemon serving with nothing to end it: that is how
+    # `wait` sat for 2.5 hours on 2026-11-15 (job 132860954801). So the stop waits for the
+    # socket, and a daemon that outlives its stop by 30 s is killed and fails the step.
     - name: the release's daemon has its sampler off
       if: runner.os == 'Linux'
       shell: bash
@@ -109,7 +114,7 @@ runs:
         log="$RUNNER_TEMP/blaze-sigcheck.log"
         blaze serve > "$log" 2>&1 & serve=$!
         for _ in $(seq 120); do
-          grep -q "no CPU samples" "$log" && break
+          grep -q "listening on" "$log" && break
           kill -0 "$serve" 2>/dev/null || break
           sleep 0.5
         done
@@ -117,8 +122,22 @@ runs:
         sigign=$(awk '/^SigIgn:/ { print $2 }' "/proc/$serve/status" 2>/dev/null || true)
         echo "daemon $serve: SigIgn $sigign; SIGRTMIN+6 is $rtmin6 (bit $(( rtmin6 - 1 )))"
         cat "$log"
-        blaze stop >/dev/null 2>&1 || kill "$serve" 2>/dev/null || true
+        # Gone or a zombie (a child not yet waited for answers kill -0).
+        ended() { state=$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/$serve/status" 2>/dev/null); [ -z "$state" ] || [ "$state" = Z ]; }
+        timeout 30 blaze stop || echo "blaze stop: exit $?"
+        for _ in $(seq 60); do ended && break; sleep 0.5; done
+        stuck=
+        if ! ended; then
+          stuck=1
+          echo "::error::the release's daemon (pid $serve) did not stop within 30 s of blaze stop: killed"
+          tail -n 20 "$log"
+          kill -TERM "$serve" 2>/dev/null || true
+          for _ in $(seq 20); do ended && break; sleep 0.5; done
+          kill -KILL "$serve" 2>/dev/null || true
+        fi
         wait "$serve" 2>/dev/null || true
+        [ -z "$stuck" ] || exit 1
+        grep -q "listening on" "$log" || { echo "::error::the release's daemon did not listen within 60 s (its log is above)"; exit 1; }
         [ -n "$sigign" ] && (( (16#$sigign >> (rtmin6 - 1)) & 1 )) || { echo "::error::the release's daemon does not ignore SIGRTMIN+6 (SigIgn ${sigign:-unread}): BASH_ENV's trap did not reach it"; exit 1; }
         grep -q "no CPU samples" "$log" || { echo "::error::the release's daemon did not say its sampler is off"; exit 1; }
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
