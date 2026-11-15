@@ -47,13 +47,21 @@ impl TraitItems {
 
     #[blaze_memo::tracked(returns(ref), owns)]
     pub fn query_with_diagnostics(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
+        // Of a crate read from an image's pages, its record (no file of the crate is read).
+        if let Some(served) = crate::deps::signatures::served_trait_items(db, tr) {
+            let items = TraitItems { items: served.items, macro_calls: served.macro_calls };
+            // A crate read from an image reports nothing of its items' collection.
+            return (items, DefDiagnostics::new(Vec::new()));
+        }
         // The trait's own entry where one is kept (rule 65), else collected and kept.
         crate::nameres::frozen::entries::items::trait_items(db, tr, || Self::collected(db, tr))
     }
 
     /// The trait's items collected from its syntax: the work its entry saves.
-    fn collected(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
+    pub(crate) fn collected(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *tr.lookup(db);
+        // Of a crate given by its address, with no text for its file here: refused, typed.
+        super::frozen::pages::demand_text(db, module_id.krate(db), ast_id.file_id);
         let source = ast_id.to_view(db);
         if source.eq_token().is_some() {
             // FIXME(trait-alias) probably needs special handling here
@@ -133,13 +141,21 @@ impl ImplItems {
     #[blaze_memo::tracked(returns(ref), owns)]
     pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
+        // Of a crate read from an image's pages, its record (no file of the crate is read).
+        if let Some(served) = crate::deps::signatures::served_impl_items(db, id) {
+            let items = ImplItems { items: served.items, macro_calls: served.macro_calls };
+            // A crate read from an image reports nothing of its items' collection.
+            return (items, DefDiagnostics::new(Vec::new()));
+        }
         // The impl's own entry where one is kept (rule 65), else collected and kept.
         crate::nameres::frozen::entries::items::impl_items(db, id, || Self::collected(db, id))
     }
 
     /// The impl's items collected from its syntax: the work its entry saves.
-    fn collected(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
+    pub(crate) fn collected(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *id.lookup(db);
+        // Of a crate given by its address, with no text for its file here: refused, typed.
+        super::frozen::pages::demand_text(db, module_id.krate(db), ast_id.file_id);
 
         let collector =
             AssocItemCollector::new(db, module_id, ItemContainerId::ImplId(id), ast_id.file_id);

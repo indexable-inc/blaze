@@ -48,6 +48,9 @@ pub(crate) mod sealed;
 #[cfg(all(unix, feature = "native"))]
 pub(crate) mod inspect;
 mod job;
+/// cargo's words as a load's config keeps them: the daemon's jobs and `check --no-daemon`
+/// (`cli::no_daemon`) hand the load the same ones.
+pub(crate) use job::undrawn;
 #[cfg(unix)]
 pub(crate) mod log;
 /// Where no daemon is started with its output in `serve.log` (the start is unix's,

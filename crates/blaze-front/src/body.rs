@@ -16,7 +16,9 @@
 //!   value, a `const fn`'s MIR as an evaluation reads it, a function's hidden types, what
 //!   escapes the body, its own effect summary. Each routes to the body's unit's made table.
 //! - `payload`: the body's steps as the item store encodes them (no `Gid`, no position), one
-//!   section a step ([`payload`]).
+//!   section a step ([`payload`]). Its MIR sections are the body's generic MIR, which a plan's
+//!   snapshot reads in place with none of the body's text ([`mir`]); a unit no `check` covers
+//!   makes its records with `blaze_keyed::kind::Steps::Mir`, no borrow check.
 //!
 //! **Reads of another body.** A read of a fact another body makes is an ordinary ask of a made
 //! fact: answered from the maker's unit's made table (or, in the body's own unit, from the
@@ -42,9 +44,12 @@
 
 pub mod exports;
 pub mod front;
+pub mod mir;
 pub mod payload;
 pub mod reads;
 
+#[cfg(test)]
+mod mir_tests;
 #[cfg(test)]
 mod tests;
 
@@ -52,11 +57,19 @@ use blaze_format::Aligned;
 use blaze_keyed::{
     driver::TaskFailed,
     front::Universe,
-    kind::{Body, Key},
+    kind::{Body, Key, Steps},
     record::{self, StableId},
 };
 
 use self::{exports::Exports, payload::Writer, reads::Asks};
+
+// What each of `blaze_keyed::kind::Steps` runs here (its one home says what it is and how it is
+// keyed): `Checked`, inference, the built MIR of each owner and the borrow check's verdict;
+// `Mir`, inference and the built MIR alone, no borrow check and no lint. A `Mir` record holds no
+// verdict, so the item store refuses a borrow check asked of it
+// (`hir_ty::body_store::Unserved::UNCHECKED`, rule 74). Its read list is made as a checked
+// body's is, from the rows of the inference's and each MIR owner's traces ([`front::Front`]), so
+// it is the reads of those steps alone.
 
 /// The front end as the body task sees it: find the body, run its check asking every fact
 /// through [`Asks`], and say what the body makes. Implemented over the ported front end by
@@ -69,10 +82,10 @@ pub trait Check {
     /// none.
     fn def(&self, item: StableId) -> Result<Self::Def, TaskFailed>;
 
-    /// Runs the body's check: each step's answer into `payload`, every fact it reads asked
+    /// Runs the body's `steps`: each step's answer into `payload`, every fact it reads asked
     /// through `asks`, whose answer is the one the check goes on with. A step that refused a
     /// read fails here, by the name of what it read.
-    fn check(&self, def: Self::Def, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed>;
+    fn check(&self, def: Self::Def, steps: Steps, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed>;
 
     /// The facts the body `def` makes, into `out`.
     fn exports(&self, def: Self::Def, out: &mut Exports) -> Result<(), TaskFailed>;
@@ -84,11 +97,24 @@ pub const NO_OWN_TABLE: &str = "a body task: its universe has no table of its ow
 /// `Front::body` (crates/blaze-keyed/src/front.rs) over `check`: the `Body` record of `item`
 /// for `key`, its shape over `universe`, 16-aligned, filed at its address.
 pub fn body<C: Check>(check: &C, item: StableId, key: Key<Body>, universe: Universe<'_>) -> Result<Aligned, TaskFailed> {
+    body_with(check, item, key, universe, Steps::Checked)
+}
+
+/// [`body`] running `steps`: `key` must be the one `blaze_keyed::kind::Steps::key` makes of
+/// `steps`, the item's Checked key and `item`, so the two records of one body never share a key
+/// (rule 21). The driver makes it; this task takes it as given.
+pub fn body_with<C: Check>(
+    check: &C,
+    item: StableId,
+    key: Key<Body>,
+    universe: Universe<'_>,
+    steps: Steps,
+) -> Result<Aligned, TaskFailed> {
     let owner = universe.own().ok_or(TaskFailed::Refused { what: NO_OWN_TABLE })?.owner;
     let def = check.def(item)?;
     let mut payload = Writer::new();
     let mut asks = Asks::new(universe);
-    check.check(def, &mut asks, &mut payload)?;
+    check.check(def, steps, &mut asks, &mut payload)?;
     let shape = asks.finish();
     let mut exports = Exports::new();
     check.exports(def, &mut exports)?;

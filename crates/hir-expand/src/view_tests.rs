@@ -522,7 +522,7 @@ fn an_eager_expansion_replaces_its_nested_calls() {
         let result = expand_eager_macro_input_view(
             db,
             f.krate,
-            call,
+            ExpandTo::of_call_site_view(call),
             ast_id,
             concat,
             ctxt,

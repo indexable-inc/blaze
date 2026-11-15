@@ -34,6 +34,8 @@ pub(crate) mod signatures;
 pub mod given;
 pub mod found;
 #[cfg(test)]
+mod std_census;
+#[cfg(test)]
 mod tests;
 
 use base_db::{Crate, Db};
@@ -56,7 +58,7 @@ pub use crate::deps::{
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
     serve::{
         ImageStore, KEPT_DOMAIN, Lowered, PAGES_DOMAIN, ReadThrough, Refused, Served, StoreError,
-        Stored, StoredOf, Which, filing_keys, front_keys, image_parts, kept_key, pages_key, serve,
+        Stored, StoredOf, Which, ast_site, filing_keys, module_path, front_keys, image_parts, kept_key, pages_key, serve,
         serve_found, serve_keeping, store, withdrawn,
     },
 };
@@ -65,7 +67,7 @@ pub use crate::nameres::frozen::Mode;
 /// [`find_by_reads`], which counts the searches in a [`record::Tally`] it owns and reports
 /// ([`record::Counts`]).
 pub use blaze_record as record;
-pub use crate::nameres::frozen::pages::{PageSource, Paged, is_paged};
+pub use crate::nameres::frozen::pages::{KeyedFile, PageSource, Paged, is_paged};
 
 /// An image a database was given: the buffer, which [`serve`] opened and checked against the
 /// key it is filed under, where its parts are, and what is done with it.
@@ -271,6 +273,128 @@ pub fn give_image(
     krate_id: base_db::ContentId,
     image: Image,
 ) {
+    use crate::nameres::frozen::pages::{KeyedFilesSlot, keyed_files};
+    // A crate given by its address before is given by its files now: the files it was given
+    // with are taken, so its pages' files are looked up and checked again (`Dec::files`).
+    if keyed_files(edit.db(), krate).is_some() {
+        let key = krate.key(edit.db());
+        edit.take_given::<KeyedFilesSlot>(key);
+    }
+    give_image_parts(edit, krate, krate_id, image);
+}
+
+/// The proof a crate's record was read at its address in the request a snapshot is built for:
+/// what [`give_keyed`] alone takes, so a crate's pages are trusted as given (no file of it
+/// looked up or compared) only where the driver checked the record's address
+/// (`blaze_keyed::record::check_read`: the address is the hash of the record's key and the
+/// answers its shape got, so a record at its address is fresh by the key: rule verify-once).
+///
+/// Made by `blaze_front::surface::Opened::give` alone, from a `blaze_front::surface::ReadAt`,
+/// which only a `blaze_keyed::front::Table` the driver handed a task makes; raw bytes from
+/// anywhere else are given by [`give_image`], whose pages check every file. Valid for the
+/// snapshot of the request whose universe held that table, and kept by nothing: it is spent
+/// in the give.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadAtAddress(base_db::ContentId);
+
+impl ReadAtAddress {
+    /// The proof that the record at `address` was read there (see the type). Called by
+    /// `blaze_front::surface::Opened::give`, and by this crate's tests, alone.
+    pub fn vouched(address: base_db::ContentId) -> ReadAtAddress {
+        ReadAtAddress(address)
+    }
+
+    /// The record's address.
+    pub fn address(self) -> base_db::ContentId {
+        self.0
+    }
+}
+
+/// Why a crate could not be given by its address ([`give_keyed`]), naming the crate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyedError {
+    /// The image is not served from pages: a crate given by its address reads its def map
+    /// from its pages, which name its files ([`Image::in_place`] under [`Mode::Serve`]).
+    NotPaged { krate: String },
+    /// The pages' header or files segment does not read, or names a file twice, or no file id
+    /// is left for one of its files.
+    Files { krate: String, why: String },
+}
+
+impl std::fmt::Display for KeyedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyedError::NotPaged { krate } => write!(
+                f,
+                "{krate} is not given by its address: its image is not served from def map pages"
+            ),
+            KeyedError::Files { krate, why } => {
+                write!(f, "{krate} is not given by its address: its pages' files: {why}")
+            }
+        }
+    }
+}
+
+/// Gives `krate`, whose stable id is `krate_id`, what it is read from as [`give_image`] does,
+/// trusting its pages as read at `read`'s address: the keyed way of giving a crate. No file of
+/// the crate is looked up or compared, none needs to be in a source root or to have text, and
+/// nothing of the crate is parsed unless something read off its syntax is asked for.
+///
+/// The files its pages name are made here (`pages::make_keyed_files`): its root as the
+/// crate's root file, every other a new file id with no text in the root's source root, each
+/// with the content the pages were made from; they are given in the crate's slot
+/// `pages::KeyedFilesSlot`, which [`crate::nameres::frozen`]'s readers name files by in place
+/// of looking them up. A file of another crate the pages name is that crate's own, given with
+/// it. What still needs a file's text is refused, typed, where it is asked for and is not there
+/// (`pages::demand_text`, a `frozen::Unreadable` naming the crate and the file): a
+/// demanded body, the items of a trait or an impl. The driver
+/// that has a file's text sets it on the file id it was given ([`keyed_files`]).
+///
+/// Reads the pages' header and files segment (a few hundred bytes a crate) and nothing else.
+///
+/// # Panics
+///
+/// Where the crate's root file is in no source root: every crate's root is.
+pub fn give_keyed(
+    edit: &mut base_db::Edit<'_>,
+    krate: Crate,
+    krate_id: base_db::ContentId,
+    image: Image,
+    read: ReadAtAddress,
+) -> Result<(), KeyedError> {
+    use crate::nameres::frozen::pages::{self, KeyedFiles, KeyedFilesSlot};
+    // alloc: the crate's name, once a crate given, for its error
+    let name = krate.named(edit.db()).to_string();
+    let Some(paged) = image.pages.as_ref().filter(|_| image.mode == Mode::Serve) else {
+        return Err(KeyedError::NotPaged { krate: name });
+    };
+    let keyed = pages::make_keyed_files(edit, krate, paged, read.address())
+        .map_err(|why| KeyedError::Files { krate: name, why })?;
+    let fact = pages::keyed_files_fact(krate_id, &keyed);
+    give_image_parts(edit, krate, krate_id, image);
+    given::give::<KeyedFilesSlot, KeyedFiles>(edit, krate, fact, keyed);
+    // hir-expand's reads of a file's text (a declarative macro's expander, a file's index)
+    // ask `pages::demand_text` first, in a database that keeps no entries too. One fact for
+    // every crate: given again, it marks nothing.
+    pages::give_demand(edit);
+    Ok(())
+}
+
+/// The files `krate` was given by its address with ([`give_keyed`]), each by its name in the
+/// crate's pages, with the file id this database gave it and the content it was made from:
+/// what a driver sets a file's text on where it has it (a body of the crate it will lower).
+/// `None` for a crate not given so.
+pub fn keyed_files(db: &Db, krate: Crate) -> Option<&[KeyedFile]> {
+    crate::nameres::frozen::pages::keyed_files(db, krate).map(|it| it.files())
+}
+
+/// [`give_image`] without taking the files a crate was given by its address with.
+fn give_image_parts(
+    edit: &mut base_db::Edit<'_>,
+    krate: Crate,
+    krate_id: base_db::ContentId,
+    image: Image,
+) {
     use crate::nameres::frozen::{
         self, DefMapSlot, DiagnosticItemsSlot, Frozen, LangItemsSlot, pages,
     };
@@ -321,6 +445,8 @@ pub fn withdraw_image(edit: &mut base_db::Edit<'_>, key: base_db::CrateKey) -> b
         edit.take_located::<DiagnosticItemsSlot>(key),
         edit.take_given::<DefMapSlot>(key),
         edit.take_given::<pages::PagesSlot>(key),
+        // What [`give_keyed`] gives beside: none for a crate given by [`give_image`].
+        edit.take_given::<pages::KeyedFilesSlot>(key),
     ];
     taken.contains(&true)
 }

@@ -422,21 +422,37 @@ fn a_template_that_reads_its_line_is_keyed_by_it() {
 const FILED: &str = r#"
 #[rustc_builtin_macro]
 macro_rules! file {() => {}}
+#[rustc_builtin_macro]
+macro_rules! concat {() => {}}
 pub fn named() -> &'static str { file!() }
+pub fn joined() -> &'static str { concat!(file!(), ":x") }
 pub fn plain() -> u32 { 1 }
 "#;
 
-/// `file!()` bakes the file's name into the code's data: the name the build gives the file is
-/// in the template's key of the code that reads it, and in no other's.
+/// A `file!()` is filled at link from the span side table, alone (the `Location` record of
+/// where it is written) and in a `concat!` (a `Target::Text` whose recipe holds the span,
+/// `blaze_codegen::text`): no code holds a name, so the name the build gives the file is in
+/// no template's key (rule 71). The control: two functions whose code differs do key apart
+/// under one naming, so the equalities are not of a key that holds nothing.
 #[test]
-fn a_template_that_reads_its_file_is_keyed_by_its_name() {
+fn a_template_that_reads_its_file_holds_no_name() {
     let (db, _) = fixture("sized", FILED);
     let lib = ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned())));
     let other = ItemHashes::new(Box::new(|_| Some("src/other.rs".to_owned())));
-    assert_ne!(
+    assert_eq!(
         template_by(&lib, &db, "named"),
         template_by(&other, &db, "named"),
-        "`file!()` says the new name"
+        "a `file!()` alone is filled at link: no name in its code"
+    );
+    assert_eq!(
+        template_by(&lib, &db, "joined"),
+        template_by(&other, &db, "joined"),
+        "a `concat!` with `file!()` is composed at link: no name in its code"
+    );
+    assert_ne!(
+        template_by(&lib, &db, "joined"),
+        template_by(&lib, &db, "named"),
+        "the control: two codes key apart"
     );
     assert_eq!(
         template_by(&lib, &db, "plain"),

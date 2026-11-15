@@ -62,7 +62,8 @@ pub fn anon_const_valtree_error<'db>(db: &'db Db, def: AnonConstId<'db>) -> Opti
         return None;
     }
     let allocation = db.anon_const_eval(def, args, None).ok()?;
-    let env = ParamEnvAndCrate { param_env: db.trait_environment(owner), krate };
+    // The constant's own environment, as it was evaluated in (`InferBodyId::param_env`).
+    let env = ParamEnvAndCrate { param_env: crate::InferBodyId::AnonConstId(def).param_env(db), krate };
     match Const::new_from_allocation(interner, &allocation, env) {
         Ok(_) | Err(ValTreeCreationError::ErrorGuaranteed(_)) => None,
         Err(ValTreeCreationError::NodesOverflow) => Some(ValTreeError::NodesOverflow),

@@ -376,7 +376,7 @@ pub mod kinds {
     pub const TRAITS_NAMED: QueryKind = QueryKind(0x1017);
     pub const SCOPE_TRAITS_NAMED: QueryKind = QueryKind(0x1018);
     pub const BLOCK_IMPLS: QueryKind = QueryKind(0x1019);
-    // 0x1800..0x1810 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
+    // 0x1800..0x1820 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
     // not hash, listed in `blaze_item_hash::values::kinds`. None is defined here.
 }
 

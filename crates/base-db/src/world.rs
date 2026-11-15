@@ -54,7 +54,7 @@ use triomphe::Arc;
 use crate::{
     AllCrates, BuiltCrateData, Crate, CrateBuilderId, CrateGraphBuilder, CrateSlot,
     CrateWorkspaceData, CratesIdMap, Env, ExtraCrateData, Files, Given, LibraryRoots,
-    LocalRoots, ProcessEnv, RawFile, SourceRootId, VfsFileRoot, VfsPath, VfsRoot, VfsText,
+    GivenFile, LocalRoots, ProcessEnv, RawFile, SourceRootId, VfsFileRoot, VfsPath, VfsRoot, VfsText,
     content::InputId,
     input::{CrateData, Dependency},
     settings::FrontSettingsData,
@@ -87,6 +87,7 @@ pub(crate) mod facts {
 
     pub(crate) const TEXT: &str = "blaze v2 file text fact 1";
     pub(crate) const RAW: &str = "blaze v2 raw file fact 1";
+    pub(crate) const GIVEN: &str = "blaze v2 given file fact 1";
     pub(crate) const FILE_ROOT: &str = "blaze v2 file root fact 1";
     pub(crate) const ROOT: &str = "blaze v2 source root fact 1";
     pub(crate) const CRATE: &str = "blaze v2 crate fact 1";
@@ -104,6 +105,10 @@ pub(crate) mod facts {
 
     pub(crate) fn raw(file: FileId, content: ContentId) -> Fact {
         Fact { id: of_file(RAW, file), digest: content }
+    }
+
+    pub(crate) fn given(file: FileId, content: ContentId) -> Fact {
+        Fact { id: of_file(GIVEN, file), digest: content }
     }
 
     pub(crate) fn file_root(file: FileId, root: SourceRootId) -> Fact {
@@ -1390,6 +1395,8 @@ pub(crate) struct Snap {
 pub(crate) struct Table {
     pub(crate) texts: Vec<Option<VfsText>, Global>,
     pub(crate) raws: Vec<Option<RawFile>, Global>,
+    /// Each file known by its content alone ([`GivenFile`]).
+    pub(crate) given: Vec<Option<GivenFile>, Global>,
     pub(crate) file_roots: Vec<Option<VfsFileRoot>, Global>,
     pub(crate) roots: Vec<Option<VfsRoot>, Global>,
     pub(crate) crates: Vec<Option<Crate>, Global>,
@@ -1465,6 +1472,7 @@ impl Table {
                 let row = file.index() as usize;
                 put(&mut self.texts, row, None);
                 put(&mut self.raws, row, None);
+                put(&mut self.given, row, None);
                 put(&mut self.file_roots, row, None);
             }
         }
@@ -1484,12 +1492,16 @@ impl Table {
     /// arenas are cleared: nothing here fails, so a commit applies its rows whole or not at all.
     fn apply(&mut self, rows: Rows) {
         // The list's input is put by `commit`, which knows whether its arena was carried.
-        let Rows { texts, raws, file_roots, roots, crates, arena_files, arena_roots, list: _ } = rows;
+        let Rows { texts, raws, given, file_roots, roots, crates, arena_files, arena_roots, list: _ } =
+            rows;
         for (file, text) in texts {
             put(&mut self.texts, file.index() as usize, Some(text));
         }
         for (file, raw) in raws {
             put(&mut self.raws, file.index() as usize, Some(raw));
+        }
+        for (file, it) in given {
+            put(&mut self.given, file.index() as usize, Some(it));
         }
         for (file, root) in file_roots {
             put(&mut self.file_roots, file.index() as usize, Some(root));
@@ -1526,6 +1538,7 @@ impl Table {
 pub(crate) struct Rows {
     texts: Vec<(FileId, VfsText), Global>,
     raws: Vec<(FileId, RawFile), Global>,
+    given: Vec<(FileId, GivenFile), Global>,
     file_roots: Vec<(FileId, VfsFileRoot), Global>,
     roots: Vec<(SourceRootId, VfsRoot), Global>,
     /// Each crate made, with its arena's index.
@@ -1557,6 +1570,11 @@ impl Placed<'_> {
 
     pub(crate) fn raw(&mut self, file: FileId, raw: RawFile) {
         self.rows.raws.push((file, raw));
+        self.rows.arena_files.push((self.arena, file));
+    }
+
+    pub(crate) fn given(&mut self, file: FileId, given: GivenFile) {
+        self.rows.given.push((file, given));
         self.rows.arena_files.push((self.arena, file));
     }
 

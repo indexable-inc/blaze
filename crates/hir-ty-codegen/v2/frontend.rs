@@ -48,7 +48,7 @@ use crate::{
 };
 
 mod abi;
-mod described;
+pub(crate) mod described;
 
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks.
 pub struct Databases<'db> {
@@ -385,8 +385,7 @@ pub(crate) struct Facing {
 
 impl Facing {
     /// A front end of these facts over `db`: it describes as the one they were read from
-    /// does. Its hashes are asked what the build calls no file: [`described_static_memo`]
-    /// describes through it only a value that names none ([`static_names_files`]).
+    /// does. Its hashes are asked what the build calls no file: no describe reads one.
     fn front<'db>(self, db: &'db Db) -> Result<HirFrontend<'db>, String> {
         let hashes = match self.by_id {
             true => by_id_hashes()?,
@@ -417,53 +416,12 @@ fn by_id_hashes() -> Result<HashSource, String> {
     Err("a describe keyed by the tests' hashes, which no build has".to_owned())
 }
 
-/// What the hashes of [`Facing::front`] call a file: asked of none, as a static's memo
-/// describes no value that names one ([`static_names_files`]). Were one asked, the describe
-/// would be keyed without the name the build gives the file, so it stops.
+/// What the hashes of [`Facing::front`] call a file: asked of none, as no describe reads a
+/// file's name (a `file!()` is a span the link names, alone as a `Location`, in a `concat!` as
+/// a `blaze_codegen::Target::Text`). Were one asked, the describe would be keyed without the
+/// name the build gives the file, so it stops.
 fn unnamed(file: base_db::FileId) -> Option<String> {
-    panic!(
-        "the memo of a static's describe asked what the build calls {file:?}, which \
-         `static_names_files` said its value does not name"
-    )
-}
-
-/// Whether the body of `kind` names a file by `file!()`, alone or in a `concat!`: exactly
-/// when its describe asks what the build calls a file ([`Hashes::names_read`], which reads
-/// the same list of the same body). The name is the build's, given by blaze-cargo to this
-/// front end and not held by the database, so no changed set covers such a describe: it is
-/// asked each build ([`Frontend::each_build`]).
-fn names_files(db: &Db, kind: &Kind) -> bool {
-    let Some(body) = kind_body(kind) else { return false };
-    blaze_memo::attach(db, || {
-        super::hashes::span_owner(db, body)
-            .is_some_and(|owner| !hir_ty_mir::mir::location::files_read(db, owner).is_empty())
-    })
-}
-
-/// Whether the value of `value` holds what the build calls a file: a `file!()` path, alone
-/// or in a text, among the data its initializer asks for. Exactly when placing its requests
-/// asks the hashes for a file's name (`places::place_requests`, which reads the same list).
-/// A static whose value has no source here (its describe gives the error) names none.
-fn static_names_files(db: &Db, value: HirStatic) -> bool {
-    use crate::fragment::{DataRequest, TextPart};
-    let Ok(super::statics::Source::Compiled(compiled)) = super::statics::source(db, value.0)
-    else {
-        return false;
-    };
-    compiled.requests.datas.iter().any(|it| match it {
-        DataRequest::FilePath(_) => true,
-        DataRequest::Text(parts) => parts.iter().any(|it| matches!(it, TextPart::FilePath(_))),
-        _ => false,
-    })
-}
-
-/// What the database keeps of a static's describe.
-#[derive(PartialEq, Eq, Debug)]
-pub(crate) enum MemoedStatic {
-    Described(Result<DescribedStatic<HirInstance, HirStatic>, CodegenError>),
-    /// Its value holds a file's name ([`static_names_files`]): described by the build's own
-    /// front end, each build.
-    NamesFiles,
+    panic!("a describe asked what the build calls {file:?}, and no describe reads a file's name")
 }
 
 /// The describe of the static `value` by a front end of `facing`
@@ -472,18 +430,19 @@ pub(crate) enum MemoedStatic {
 /// static item, against a function's describe, which is no row. `facing`
 /// holds no world: a static's value is built against none.
 #[blaze_memo::tracked(returns(ref), owns)]
-fn described_static_memo(db: &Db, value: HirStatic, facing: Facing) -> MemoedStatic {
-    if static_names_files(db, value) {
-        return MemoedStatic::NamesFiles;
-    }
+fn described_static_memo(
+    db: &Db,
+    value: HirStatic,
+    facing: Facing,
+) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
     let front = match facing.front(db) {
         Ok(front) => front,
         Err(what) => {
             let named = super::StaticNamed(db, value.0);
-            return MemoedStatic::Described(Err(undescribed(db, &named, None, what)));
+            return Err(undescribed(db, &named, None, what));
         }
     };
-    MemoedStatic::Described(front.described_static(db, &value))
+    front.described_static(db, &value)
 }
 
 /// How many [`Walks`] are alive in the process: each names its database's interned ids, so a
@@ -827,18 +786,14 @@ impl<'db> HirFrontend<'db> {
 
     /// The describe of `instance` for `requester`, run now by the task that asks, as a value
     /// read once (docs/v2/plan/design/end-state/memory.md): no row of the database holds it.
-    /// What it reads hits the session memo wherever the arena holding it was carried. Its
-    /// body walked against the program's world where it names a file ([`names_files`]):
-    /// such a describe reads the build's name for the file.
+    /// What it reads hits the session memo wherever the arena holding it was carried.
     fn described_now(
         &self,
         db: &Db,
         instance: &HirInstance,
         requester: &Origin,
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
-        let names = names_files(db, &instance.0);
-        let key_world = self.key_world(db, instance);
-        let world = if names { self.devirt.world() } else { key_world };
+        let world = self.key_world(db, instance);
         self.described(db, instance, requester, world)
     }
 
@@ -869,8 +824,8 @@ impl<'db> HirFrontend<'db> {
 
     /// What `instance` is for `requester`, its body walked against `world` where it takes
     /// the program's dyn facts. It reads the database and, of the front end, what
-    /// [`Facing`] holds; beside those only what the build calls a file its body names
-    /// ([`names_files`]). So two front ends of one [`Facing`] describe alike.
+    /// [`Facing`] holds, never what the build calls a file. So two front ends of one
+    /// [`Facing`] describe alike.
     fn described(
         &self,
         db: &Db,
@@ -908,8 +863,8 @@ impl<'db> HirFrontend<'db> {
         let read = refs::read(db, instance, walking).map_err(fail)?;
         let told =
             self.units_as(db, instance, &origin, |it| (&it.tells, it.tells_any)).map_err(fail)?;
-        // What its compiled function reads of names beside its code (the files its `file!()`
-        // names, its told locals' types) is in every key of it (rule 21), its link code's as
+        // What its compiled function reads of names beside its code (its told locals' types)
+        // is in every key of it (rule 21), its link code's as
         // its template code's: read once, folded into both ([`with_names`]). Folded into its
         // body's own code once: `built_in_code` holds the untold names already, so the code is
         // made from `code_of`, not from it, and equals it where nothing is told and no dyn fact
@@ -1090,8 +1045,9 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// Whose code a crate's is, for its settings: build-time code's in a build-time build
-    /// ([`BuildTime`]), never the standard library.
-    pub(crate) fn origin(&self, db: &Db, krate: Crate) -> Origin {
+    /// ([`BuildTime`]), never the standard library. Public for a program's roots, which are
+    /// asked for by their crate's origin (blaze-command's `program::roots`).
+    pub fn origin(&self, db: &Db, krate: Crate) -> Origin {
         let data = krate.data(db);
         let name = match &data.origin {
             CrateOrigin::Lang(_) => return Origin::Std,
@@ -1258,11 +1214,8 @@ impl Frontend for HirFrontend<'_> {
         &self,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
-        self.with(|db| match described_static_memo(db, *value, self.facing(None)) {
-            // clone: copied out of the database's memo, once per static described
-            MemoedStatic::Described(described) => described.clone(),
-            MemoedStatic::NamesFiles => self.described_static(db, value),
-        })
+        // clone: copied out of the database's memo, once per static described
+        self.with(|db| described_static_memo(db, *value, self.facing(None)).clone())
     }
 
     fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
@@ -1306,20 +1259,14 @@ impl Frontend for HirFrontend<'_> {
     /// Every describe is the build's each time, but one read from a record that holds: no
     /// changed set says which describe may be other.
     fn each_build(&self, instance: &HirInstance, requester: &Origin) -> bool {
-        // One read from its record names no file (such a describe is never a record), and
-        // the record holds while its key does.
+        // One read from its record holds while its key does.
         self.with(|db| !self.found_holds(db, instance, requester))
     }
 
-    /// A static whose value holds a file's name ([`MemoedStatic::NamesFiles`]), as
-    /// [`Self::each_build`].
-    fn static_each_build(&self, value: &HirStatic) -> bool {
-        self.with(|db| {
-            matches!(
-                described_static_memo(db, *value, self.facing(None)),
-                MemoedStatic::NamesFiles
-            )
-        })
+    /// None: a static's describe is the database's memo, which verifies it, and no value
+    /// reads what the build calls a file (a `file!()` in it is a span the link names).
+    fn static_each_build(&self, _: &HirStatic) -> bool {
+        false
     }
 
     /// A walk closes dyn facts only where some body takes the program's world
@@ -1679,8 +1626,8 @@ fn rooted<'db>(db: &'db Db, func: FunctionId, args: GenericArgs<'db>) -> HirInst
 /// compare (`blaze-codegen` `driver`'s `unkept_inline`); its own unit's code may hash the dyn
 /// facts it read beside it ([`super::devirt::code`]).
 ///
-/// A copy bakes in the names of the files its `file!()` reads as its own unit's does, so they
-/// are folded in ([`with_names`], untold: a copy's locals are its caller's to tell).
+/// What a copy reads of names is folded in as its own unit's is ([`with_names`], untold: a
+/// copy's locals are its caller's to tell).
 pub(crate) fn built_in_code(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String> {
     let names = kind_body(kind).map(|body| hashes.names_read(db, body, false)).transpose()?;
     Ok(with_names(code_of(db, hashes, kind)?, names.map(|it| it.0)))
@@ -1974,7 +1921,7 @@ fn kind_body(kind: &Kind) -> Option<Body> {
 }
 
 /// `code` with what its compiled body reads of names beside it ([`Hashes::names_read`]):
-/// the files its `file!()` names and its told locals' types. A body with none of its own (a
+/// its told locals' types. A body with none of its own (a
 /// shim, `main`'s start, the allocator's, `asm!`) keeps `code`.
 fn with_names(code: CodeHash, names: Option<ContentId>) -> CodeHash {
     let Some(names) = names else { return code };

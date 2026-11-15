@@ -21,6 +21,11 @@
 //! - Under [`Mode::Trace`] ([`install_trace`], a body task's store) every step runs, its trace
 //!   is kept for the caller ([`Installed::trace`]), nothing is looked up and nothing is filed:
 //!   the store is given no store of records, so it has none to read.
+//! - Under [`Mode::Given`] ([`install_given`], a plan's snapshot) a body's inference, MIR and
+//!   verdict are its body record's sections ([`GivenBodies`]), decoded in this database: items
+//!   by their keys, types by content, positions as the body's own node ids. A body with no
+//!   record, or no section of the step, is an [`Unserved`] refusal naming it, so the driver
+//!   runs the body task; the body's text is never read in its place, and nothing is filed.
 //!
 //! - Each offer also keeps the run's trace (its facts and answer) per body, step and schema,
 //!   which the kernel entries of the three steps read ([`entries`]): a carry then reaches
@@ -75,8 +80,11 @@ pub(crate) use konst::constant;
 #[cfg(test)]
 use infer::lookup_inference;
 pub(crate) use mir::built as built_mir;
+pub(crate) use mir::given_closure_exprs;
 pub(crate) use mir::{NONE as NO_PLACE, in_body, kind_code};
 pub use mir::{calls_place_macro, is_place, location_literals, place_call, placed_literal};
+#[doc(hidden)]
+pub use mir::testing;
 pub use crate::check_cache::ids::{closure_kind_code, closure_kind_of};
 pub use value::step_value;
 
@@ -102,7 +110,7 @@ pub enum Mode {
     Serve,
     /// A hit runs the step as well; a result that differs from the stored one is an error.
     Verify,
-    /// No hit: every step runs, and its trace (`Kept { facts, answer }` or `Refused`) is kept
+    /// No hit: every step runs, and its trace (`Kept { facts, scans, answer }` or `Refused`) is kept
     /// for the caller ([`Installed::trace`]); no stored answer is looked up, no served one is
     /// posted ([`entries::serve`] refuses) and nothing is filed ([`Installed::flush`]
     /// refuses). Installed by [`install_trace`], which takes no store of records: the store
@@ -115,11 +123,18 @@ pub enum Mode {
     /// with the run's) and hir-ty-borrowck's `trace_tests` (a planted old-cache pass of a body
     /// with an error).
     Trace,
+    /// Every body's inference and MIR is its body record's ([`install_given`], [`given`]): a
+    /// snapshot whose crates were all given from their surfaces, where a body's text may be
+    /// absent. A step with no answer there is a typed refusal ([`Unserved`]) naming the body,
+    /// so the driver runs the body task that makes the record; nothing runs in its place, and
+    /// nothing is offered or filed.
+    Given,
 }
 
 /// Where a store's answers are filed and found: a store of records in [`Mode::Serve`] and
-/// [`Mode::Verify`], none in [`Mode::Trace`]. The records are reached only by matching
-/// [`Backing::Records`], so a trace store cannot read one.
+/// [`Mode::Verify`], none in [`Mode::Trace`], the body records the driver gave in
+/// [`Mode::Given`]. The records are reached only by matching [`Backing::Records`], so a trace
+/// store cannot read one.
 enum Backing {
     Records {
         // dyn: the driver's store over `blaze-cas`, probed once per step of a body, written at a flush
@@ -127,7 +142,116 @@ enum Backing {
         verify: bool,
     },
     Trace,
+    // dyn: the driver's body records, one lookup per body step asked, above hir-ty; erased here
+    // because the registry holds one store type for every mode (`install_given` takes a generic)
+    Given(Box<dyn GivenBodies>),
 }
+
+/// The body records a snapshot is given ([`install_given`]): for a body, a step and the
+/// step's answer schema, the answer's bytes in the body's record (its payload's section of
+/// that step and schema: blaze-front's `body::payload`), or why there are none.
+///
+/// The invariant an implementation keeps: the bytes are those of the record the driver
+/// checked under its key (`blaze_keyed::record::check_read`), and `fact` names that record's
+/// result, so a query that took them lists what it read.
+pub trait GivenBodies: Send + Sync + 'static {
+    /// The answer of `step` of `def` under `schema`.
+    fn answer(&self, db: &Db, def: DefWithBodyId, step: Step, schema: SchemaHash) -> Given;
+}
+
+/// What [`GivenBodies::answer`] found.
+pub enum Given {
+    /// The answer is `held.bytes()[range]`, 16-aligned, read in place; `fact` is what the
+    /// asking query lists for it ([`GIVEN_ANSWER`]): the body's MIR fact
+    /// (`blaze_keyed::record::mir_id`) and its record's result digest. `item` is the body's
+    /// item key, for an error naming it.
+    Answer { held: hir_def::deps::ImageBuf, range: std::ops::Range<usize>, fact: blaze_memo::Fact, item: ContentId },
+    /// The body's record is given and has no section of this step and schema: an owner the
+    /// body task makes no section for, or a step it did not run (the borrow check of a body
+    /// made for its MIR alone).
+    NotInRecord { item: ContentId },
+    /// No record of the body is given: the driver runs its body task. `item` is the body's
+    /// item key where it has one.
+    NoRecord { item: Option<ContentId> },
+    /// The body's record is given and does not open as one: a record the driver did not
+    /// check under its key, or a payload of another format. Names why.
+    Unreadable { item: ContentId, why: &'static str },
+}
+
+/// A step a [`Mode::Given`] store could not answer from the body's record, by the body, the
+/// step, the item and why. Nothing runs in its place (rule 3): it unwinds out of the query that
+/// asked, with this as its payload, as `hir_def::nameres::frozen::Unreadable` does, and the
+/// driver that catches it runs the body task the record comes from ([`Unserved::NO_RECORD`])
+/// or fails that one job with it (rule 20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unserved {
+    pub def: DefWithBodyId,
+    pub step: Step,
+    /// The body's item key (`blaze_item_hash::values::body_key`), where it has one.
+    pub item: Option<ContentId>,
+    /// Which refusal: one of the `Unserved::*` constants.
+    pub kind: &'static str,
+    pub why: String,
+}
+
+impl Unserved {
+    /// No body record of the body is given: the driver runs its body task, then asks again.
+    pub const NO_RECORD: &'static str = "no body record of the body is given (its body task makes it)";
+    /// The record is given and has no section of the step's schema: an owner a body task makes
+    /// no section for (an anonymous constant inside the body, a by-move or `gen` coroutine).
+    pub const NOT_IN_RECORD: &'static str = "the body record has no section of this step and schema";
+    /// The section does not read in this database: a key that misses an input (rule 21).
+    pub const UNREADABLE: &'static str = "the body record's section does not read in this database";
+    /// The record was made for the body's MIR alone (no borrow check ran), and a borrow check's
+    /// verdict was asked: an unchecked body is never taken as checked (rule 74).
+    pub const UNCHECKED: &'static str = "the body record holds no borrow check verdict: its MIR is unchecked";
+    /// The record's borrow check failed.
+    pub const FAILED_CHECK: &'static str = "the body record's borrow check failed";
+    /// The body's MIR holds location literals (`line!`, `file!` and friends), whose values are
+    /// read off the body's text, which a given body does not have.
+    pub const LOCATED: &'static str =
+        "the body's MIR has location literals, which are filled from its text, and the body is given without it";
+
+    fn of(def: DefWithBodyId, step: Step, item: Option<ContentId>, kind: &'static str, why: String) -> Unserved {
+        Unserved { def, step, item, kind, why }
+    }
+
+    /// Unwinds with `self` as the payload, logged first.
+    pub fn throw(self) -> ! {
+        tracing::error!(target: "blaze", "{self}");
+        std::panic::panic_any(self)
+    }
+
+    /// The `Unserved` a caught panic's payload is, if it is one.
+    // dyn: a caught panic's payload, read once
+    pub fn of_payload(payload: &(dyn std::any::Any + Send)) -> Option<&Unserved> {
+        payload.downcast_ref::<Unserved>()
+    }
+}
+
+impl fmt::Display for Unserved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the item store: the {} of {:?}", what(self.step), self.def)?;
+        if let Some(item) = self.item {
+            write!(f, " (item {item:x})")?;
+        }
+        write!(f, " is not served from a given body record: {}", self.kind)?;
+        if !self.why.is_empty() {
+            write!(f, ": {}", self.why)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Unserved {}
+
+/// The kind of the input-like row a query lists for a given body record's answer it took
+/// ([`Mode::Given`]): its fact is the body's MIR fact and the record's result digest, so a plan
+/// that read the body moves when the record does.
+pub const GIVEN_ANSWER: blaze_memo::KindId = blaze_memo::KindId::of(&GIVEN_ANSWER_KIND);
+
+static GIVEN_ANSWER_KIND: blaze_memo::Kind =
+    blaze_memo::Kind::new("hir_ty::body_store::given_answer", blaze_memo::CycleKind::Panic);
 
 /// The domain of the digest of a served answer's bytes, in the fact a hit on it lists
 /// ([`Store::lookup`]).
@@ -241,6 +365,7 @@ enum Answer {
 #[derive(Default)]
 struct Scratch {
     facts: Vec<FactRef>,
+    scans: Vec<(FactRef, &'static str)>,
     values: Vec<ContentId>,
     shape: Vec<u8>,
     answer: Vec<u8>,
@@ -289,7 +414,11 @@ pub enum Traced {
     /// The facts the run read, sorted, each once, and the answer's bytes. The facts name the
     /// body's own item by lane item-hash's tag (`values::OWN`), never by an id; the answer
     /// names no `Gid` and no position.
-    Kept { facts: Box<[FactRef]>, answer: Box<[u8]> },
+    ///
+    /// `scans` are the facts among `facts` read as a whole table ([`Classified::Scan`]), each
+    /// with the name of the query that read it, in read order: what a reader that refuses such
+    /// a fact names (rule 19), as `facts` holds no query.
+    Kept { facts: Box<[FactRef]>, scans: Box<[(FactRef, &'static str)]>, answer: Box<[u8]> },
     /// The store would not keep the run, and why.
     Refused(Refusal),
 }
@@ -335,6 +464,7 @@ impl Store {
                 self.pending.looked_up(step, false);
                 return Lookup::Miss;
             }
+            Backing::Given(records) => return self.given(db, def, step, schema, &**records, decode),
             Backing::Records { images, verify } => (&**images, *verify),
         };
         let Some(identity) = self.facts.identity(db, def) else {
@@ -400,6 +530,68 @@ impl Store {
         };
         self.pending.looked_up(step, matches!(found, Lookup::Hit { .. }));
         found
+    }
+
+    /// [`Store::lookup`] in [`Mode::Given`]: the answer of `step` of `def` is the given body
+    /// record's section, decoded, or a typed refusal ([`Unserved`]); no identity is computed and
+    /// nothing runs in its place. A constant's value and a lowering are not in a body record:
+    /// they run ([`Lookup::Off`]), the value from the given MIR, the lowering from the text,
+    /// which a given body does not have (`hir_def`'s keyed-file refusal names it).
+    ///
+    /// The borrow check (rule 74): an empty section is a pass; a section with bytes is the
+    /// record's failing verdict ([`Unserved::FAILED_CHECK`]); none is a body whose MIR was
+    /// made unchecked ([`Unserved::UNCHECKED`]), never a pass.
+    fn given<T>(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        step: Step,
+        schema: SchemaHash,
+        // dyn: as `Backing::Given`
+        records: &dyn GivenBodies,
+        // dyn: as `Store::lookup`
+        decode: impl FnOnce(&dyn BodyFacts, &[u8], ContentId) -> Result<T, String>,
+    ) -> Lookup<T> {
+        let refuse = |item: Option<ContentId>, kind: &'static str, why: String| -> ! {
+            Unserved::of(def, step, item, kind, why).throw()
+        };
+        if matches!(step, Step::Const | Step::Lower) {
+            self.pending.looked_up(step, false);
+            return Lookup::Off;
+        }
+        let (held, range, fact, item) = match records.answer(db, def, step, schema) {
+            Given::Answer { held, range, fact, item } => (held, range, fact, item),
+            Given::NotInRecord { item } => match step {
+                Step::Borrowck => refuse(Some(item), Unserved::UNCHECKED, String::new()),
+                // alloc: error path
+                _ => refuse(Some(item), Unserved::NOT_IN_RECORD, format!("schema {:x}", schema.0)),
+            },
+            Given::NoRecord { item } => refuse(item, Unserved::NO_RECORD, String::new()),
+            // alloc: error path
+            Given::Unreadable { item, why } => refuse(Some(item), Unserved::UNREADABLE, String::from(why)),
+        };
+        let Some(bytes) = held.bytes().get(range.clone()) else {
+            // clone: a range of two words, for the error
+            refuse(Some(item), Unserved::UNREADABLE, format!("a section at {range:?}, past its record"))
+        };
+        if step == Step::Borrowck && !bytes.is_empty() {
+            refuse(Some(item), Unserved::FAILED_CHECK, String::new());
+        }
+        match decode(&*self.facts, bytes, ContentId::default()) {
+            Ok(value) => {
+                // The running query's value is the record's: its read list holds the record's
+                // fact, so what it made moves with the body record and nothing else. The
+                // decode's own reads (the items it names, by their keys) are noted by the
+                // queries that gave them.
+                blaze_memo::read(
+                    blaze_memo::Database::memo(db),
+                    blaze_memo::Read::Input { kind: GIVEN_ANSWER, fact },
+                );
+                self.pending.looked_up(step, true);
+                Lookup::Hit { value, verify: false }
+            }
+            Err(why) => refuse(Some(item), Unserved::UNREADABLE, why),
+        }
     }
 
     /// The kernel's verified answer of `step` of `def` under `schema` for this database, if
@@ -514,13 +706,19 @@ impl Store {
         // dyn: the store's facts, given to the step's encoder once per offer
         write: impl FnOnce(&dyn BodyFacts, &mut Vec<u8>) -> Result<(), String>,
     ) -> Option<ContentId> {
+        // `Mode::Given` runs no served step, so offers only what ran outside the records (a
+        // constant's value): nothing of it is filed or traced.
+        if let Backing::Given(_) = self.backing {
+            return None;
+        }
         let mut scratch = SCRATCH.take();
         scratch.facts.clear();
+        scratch.scans.clear();
         scratch.values.clear();
         scratch.answer.clear();
         let offered = self.offered(db, def, step, schema, reads, write, &mut scratch);
         let (ran, key) = match offered {
-            Ok(key) => (Ok((&scratch.facts[..], &scratch.answer[..])), key),
+            Ok(key) => (Ok((&scratch.facts[..], &scratch.scans[..], &scratch.answer[..])), key),
             Err(refusal) => {
                 self.pending.refused(step, refusal);
                 (Err(refusal), None)
@@ -555,6 +753,7 @@ impl Store {
                 Classified::Scan(fact, name) => {
                     self.pending.scanned(what(step), name);
                     scratch.facts.push(fact);
+                    scratch.scans.push((fact, name));
                 }
                 Classified::Refused(name) => return Err(Refusal::Read(name)),
             }
@@ -606,11 +805,13 @@ impl Store {
         def: DefWithBodyId,
         step: Step,
         schema: SchemaHash,
-        ran: Result<(&[FactRef], &[u8]), Refusal>,
+        ran: Result<(&[FactRef], &[(FactRef, &'static str)], &[u8]), Refusal>,
     ) {
         let ran = match ran {
             // alloc: one trace a body's step run, replacing the one before
-            Ok((facts, answer)) => Traced::Kept { facts: facts.into(), answer: answer.into() },
+            Ok((facts, scans, answer)) => {
+                Traced::Kept { facts: facts.into(), scans: scans.into(), answer: answer.into() }
+            }
             Err(refusal) => Traced::Refused(refusal),
         };
         // alloc: one trace a body's step, kept while the store is installed
@@ -991,8 +1192,54 @@ pub fn install(
                 "the item store: `Mode::Trace` is installed by `install_trace`, which is given no store of records to read",
             ));
         }
+        // alloc: error text
+        Mode::Given => {
+            return Err(String::from(
+                "the item store: `Mode::Given` is installed by `install_given`, which is given the body records to answer from",
+            ));
+        }
     };
     link(db, Backing::Records { images, verify }, facts, build)
+}
+
+/// Gives `db` an item store in [`Mode::Given`]: a plan's snapshot, every crate given from its
+/// surface. Each body's inference and built MIR is decoded from `records`' section of it,
+/// its ids made in `db` from the items' keys by `facts` (`BodyFacts::def_of`), its types by
+/// content; a body with no section is an [`Unserved`] refusal naming it, never a lowering of
+/// its text. `facts` and `build` as [`install`]'s; `build` is part of no given answer (the
+/// records' keys hold the tool), and is kept for the store's version alone.
+///
+/// The one query a plan step asks of a body: `providers::mir_at(db, MirOwner::Body(
+/// InferBodyId::DefWithBodyId(def)), MirStage::Built)` (`mir_body_query`), and of a closure
+/// of it `MirOwner::Closure(id)`, each answered by `mir::built` from the record.
+///
+/// Floor (an estimate, rule 67): one `GivenBodies::answer` (a binary search over the given
+/// records and one over the record's sections) plus the section's bytes read in place, and the
+/// items it names made once per snapshot (each a `def_of` of its key, memoized by the query
+/// that makes it). Above it: the item table of each answer is decoded on every ask that is
+/// not memoized, which the built-MIR query is, so once per owner per snapshot.
+pub fn install_given<G: GivenBodies>(
+    db: &Db,
+    // dyn: lane item-hash's facts, kept by the item store (see `Store::facts`)
+    facts: Arc<dyn BodyFacts>,
+    build: ContentId,
+    records: G,
+) -> Result<Installed, String> {
+    // Boxed once per installed store, freed with it through the registry's limbo.
+    link(db, Backing::Given(Box::new_in(records, std::alloc::Global)), facts, build)
+}
+
+/// Whether `db`'s item store is in [`Mode::Given`]: a body's inference and MIR come from its
+/// record, and its text may be absent. What a reader that would open a body's store to check
+/// an id asks first (`check_cache::ids`' closure check, the interned closures' debug
+/// assertions). False with no store. A store is installed before any query of its database
+/// runs and stays for its life, so this is no input of a query.
+#[inline]
+pub fn given(db: &Db) -> bool {
+    if REGISTRY.is_empty() {
+        return false;
+    }
+    with_store(db, |store| matches!(store.backing, Backing::Given(_))).unwrap_or(false)
 }
 
 /// Gives `db` an item store in [`Mode::Trace`]: a body task's. Every step of a body runs, its
@@ -1055,6 +1302,7 @@ impl Installed {
             Backing::Records { verify: false, .. } => Mode::Serve,
             Backing::Records { verify: true, .. } => Mode::Verify,
             Backing::Trace => Mode::Trace,
+            Backing::Given(_) => Mode::Given,
         }
     }
 
@@ -1107,11 +1355,20 @@ impl Installed {
     /// A store in [`Mode::Trace`] files nothing, so a flush of one is an error naming why.
     pub fn flush(&self) -> Result<Flushed, String> {
         let store = self.store();
-        let Backing::Records { images, .. } = &store.backing else {
+        let images = match &store.backing {
+            Backing::Records { images, .. } => images,
             // alloc: error text
-            return Err(String::from(
-                "the item store: a store in `Mode::Trace` files nothing, so it has nothing to flush (a body task takes each step's trace, `Installed::trace`)",
-            ));
+            Backing::Trace => {
+                return Err(String::from(
+                    "the item store: a store in `Mode::Trace` files nothing, so it has nothing to flush (a body task takes each step's trace, `Installed::trace`)",
+                ));
+            }
+            // alloc: error text
+            Backing::Given(_) => {
+                return Err(String::from(
+                    "the item store: a store in `Mode::Given` answers from the body records it was given and files nothing",
+                ));
+            }
         };
         let (taken, tallies) = store.pending.take();
         if let Some(why) = store.error.lock().take() {

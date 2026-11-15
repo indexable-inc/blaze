@@ -1,0 +1,14 @@
+{
+ "id": "task-failed-cannot-name-items",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane of the no-op and std keying for `check --no-daemon`",
+ "where": "crates/blaze-keyed/src/driver.rs (TaskFailed) against crates/blaze-command/src/front.rs (Front::key on KeyError::TwoItems)",
+ "what": "A key task that refuses two items of one stable id can only say a `&'static str` through TaskFailed, so the error the person sees names neither item, file nor line (rule 19). The first end-to-end run on hello-world said 'two items of the unit have one stable id' about `core` with nothing to find them by; the cause (core/src/fmt/num.rs, six `radix_integers!` calls) took reading image.rs to find.",
+ "cost": "an hour of reading to find which items of core collided",
+ "cause": "TaskFailed's variants carry static text only (Refused { what: &'static str }); the driver's Failure::Task passes it through",
+ "whys": "TaskFailed is Copy and crosses the worker pool; an owned message was avoided; nothing typed names an item's place",
+ "class": "a refusal type that cannot carry the thing it refuses makes every refusal through it unnamed",
+ "prevention": "not done (blaze-keyed is not this lane's): add `TaskFailed::TwoItems { first: ItemPlace, second: ItemPlace }` with `ItemPlace { file: u32, row: u32 }` (item-relative, rule 71), or a `Refused { what, at: Option<ItemPlace> }`, and print it at file:line from the unit's images",
+ "workaround": "front::Command keeps the whole line (unit, path, both items at file:line) behind a named lock and the summary prints it under `told` (run::Gathers::told)",
+ "state": "open"
+}

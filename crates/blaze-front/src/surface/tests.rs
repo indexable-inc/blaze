@@ -9,19 +9,19 @@ use std::{alloc::Global, collections::BTreeMap, sync::Arc};
 use base_db::{Crate, Db, all_crates};
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
-use blaze_item_hash::values::kinds as own;
+use blaze_item_hash::values::{self, kinds as own};
 use blaze_items::{ItemId, key, kinds as items};
 use blaze_keyed::{
     front::Universe,
     kind::{Key, Surface},
-    record::{self, Fact},
+    record::{self, Fact, StableId},
 };
 use blaze_query::QueryKind;
-use hir_def::{ModuleDefId, deps::ImageBuf, nameres::crate_def_map};
+use hir_def::{DefWithBodyId, ModuleDefId, deps::ImageBuf, nameres::crate_def_map};
 use hir_expand::fixture;
 use hir_ty::next_solver::goal_store::{FactObject, FactRef};
 
-use super::{Opened, exports, finish_rows, surface, view};
+use super::{Opened, TextIds, exports, finish_rows, surface, view};
 use crate::facts;
 
 /// One crate with an item of every kind a surface holds a row of.
@@ -59,6 +59,8 @@ const KINDS: &[QueryKind] = &[
     own::CRATE_ROOT,
     items::TARGET,
     own::CRATE_NAMES,
+    own::CRATE_SETTINGS,
+    own::MODULES,
     own::FIELD_ORDER,
     own::SETTING,
     own::TRAITS_IN_SCOPE,
@@ -113,10 +115,81 @@ fn function_named(db: &Db, krate: Crate, name: &str) -> ItemId {
     panic!("a function named {name}")
 }
 
-fn rows_of(db: &Db, krate: Crate, omit: Option<QueryKind>) -> Vec<Fact, Global> {
+/// The tests' text ids: each body's derived from its item key (the command's come from text),
+/// none for a discriminant, as the command gives none; `skip` is given none either (the
+/// control of [`every_body_has_its_maker_row`]).
+struct Derived<'a> {
+    db: &'a Db,
+    skip: Option<DefWithBodyId>,
+}
+
+impl<'a> Derived<'a> {
+    fn of(db: &'a Db) -> Derived<'a> {
+        Derived { db, skip: None }
+    }
+}
+
+impl TextIds for Derived<'_> {
+    fn text_id(&self, def: DefWithBodyId) -> Option<StableId> {
+        match def {
+            DefWithBodyId::VariantId(_) => None,
+            _ if Some(def) == self.skip => None,
+            _ => Some(StableId(ContentId::of("blaze-front test text id", &values::body_key(self.db, def).0))),
+        }
+    }
+}
+
+fn rows_with(db: &Db, krate: Crate, omit: Option<QueryKind>, text_ids: &Derived<'_>) -> Vec<Fact, Global> {
     let mut rows = Vec::new_in(Global);
-    exports::collect(db, krate, omit, &mut rows).expect("the surface's rows");
+    let mut unvalued = None;
+    if let Err(failed) = exports::collect(db, krate, omit, text_ids, &mut rows, &mut unvalued) {
+        let said = unvalued.map(|fact| facts::unhashed_line(db, krate, &fact)).unwrap_or_default();
+        panic!("the surface's rows: {failed:?} {said}");
+    }
     finish_rows(rows, &key::crate_key(db, krate)).expect("each id one digest").0
+}
+
+fn rows_of(db: &Db, krate: Crate, omit: Option<QueryKind>) -> Vec<Fact, Global> {
+    rows_with(db, krate, omit, &Derived::of(db))
+}
+
+/// The bodies of `rows`' crate with no maker row naming their text id: each body owner the
+/// text ids name, whose maker row (of its item key) is missing or holds another text id.
+fn makers_missing(db: &Db, krate: Crate, rows: &[Fact]) -> Vec<DefWithBodyId, Global> {
+    let named = Derived::of(db);
+    let mut out = Vec::new_in(Global);
+    for &def in hir_def::nameres::demand::crate_body_owners(db, krate).iter() {
+        let Some(text) = named.text_id(def) else { continue };
+        let id = facts::maker_id(&values::body_key(db, def));
+        if rows.iter().find(|row| row.id == id).map(|row| row.digest) != Some(text.0) {
+            out.push(def);
+        }
+    }
+    out
+}
+
+/// The invariant: every body of the crate a text id names has its maker row (the row a made
+/// fact's id forms, `record::maker_row_of`), whose digest is that text id, and a body with no
+/// text id (an enum discriminant) has none. Control: a body the text ids leave out is named
+/// as missing, it alone.
+#[test]
+fn every_body_has_its_maker_row() {
+    let db = db_of(EVERY_KIND);
+    let lib = crate_named(&db, "lib");
+    let rows = rows_of(&db, lib, None);
+    assert_eq!(makers_missing(&db, lib, &rows), Vec::<DefWithBodyId, Global>::new_in(Global));
+    let owners = hir_def::nameres::demand::crate_body_owners(&db, lib);
+    let with_rows = owners.iter().filter(|def| !matches!(def, DefWithBodyId::VariantId(_))).count();
+    let makers = rows.iter().filter(|row| record::kind_of(&row.id) == Some(record::FactKind::Maker)).count();
+    assert_eq!(makers, with_rows, "one maker row per body with a text id, none for a discriminant");
+    // Control: one body left without a text id.
+    let left = function_named(&db, lib, "constant");
+    let ItemId::Function(left) = left else { panic!("a function") };
+    let left = DefWithBodyId::FunctionId(left);
+    let rows = rows_with(&db, lib, None, &Derived { db: &db, skip: Some(left) });
+    let mut want = Vec::new_in(Global);
+    want.push(left);
+    assert_eq!(makers_missing(&db, lib, &rows), want);
 }
 
 /// The kinds of `kinds` no row of `rows` is of.
@@ -159,6 +232,11 @@ fn a_kind_left_out_is_caught() {
     let mut want = Vec::new_in(Global);
     want.push(items::LAYOUT);
     assert_eq!(missing(&rows, KINDS), want);
+    // The same for a crate kind added with the walk of the crate's modules.
+    let rows = rows_of(&db, lib, Some(own::MODULES));
+    let mut want = Vec::new_in(Global);
+    want.push(own::MODULES);
+    assert_eq!(missing(&rows, KINDS), want);
 }
 
 fn key_of() -> Key<Surface> {
@@ -168,7 +246,7 @@ fn key_of() -> Key<Surface> {
 /// The record of `krate` with no dependency, and the address it is filed at.
 fn record_of(db: &Db, krate: Crate) -> (Aligned, Key<Surface>) {
     let universe = Universe { asker: 0, tables: &[], outside: &[] };
-    let bytes = surface(db, krate, key_of(), universe).expect("the surface record");
+    let bytes = surface(db, krate, key_of(), universe, &Derived::of(db)).expect("the surface record");
     let (at, _) = record::check_read::<Surface>(&bytes, key_of()).expect("a read-addressed record");
     (bytes, at)
 }
@@ -258,24 +336,29 @@ pub fn f(_x: A) {}
 pub fn g() {}
 "#;
 
-/// What is observed today: `f(_x: A)` to `f(_x: B)`, where `A` and `B` are two unit structs of
-/// one shape, moves no `Signature` row of `f`, since a reference to a type is filled by the
-/// type's signature hash and an ADT's form holds no name (docs/v2/plan/design/item-hash.md).
+/// The invariant: `f(_x: A)` to `f(_x: B)`, where `A` and `B` are two unit structs of one
+/// shape, moves `f`'s `Signature` row and no other. The row's value is `f`'s signature hash,
+/// which names each type it refers to by the type's key as well as its hash (D46,
+/// `blaze_items::hash`'s keyed refs): a hash alone says what a type is, not which, and two
+/// nominal types of one shape have one hash, so a reader of `f`'s signature (a caller's stored
+/// type check, which accepts `f(A)` only with `f(_x: A)`) would otherwise be served stale.
 ///
-/// Under review as a possible stale-reuse hole: two nominal types of one shape give `f` one
-/// signature, so a reader of `f`'s signature keyed by it would not run again for the edit.
-/// Another lane is deciding it on main. The assertion flips (to the `Signature` row of `f`
-/// moving) if the signature form comes to name a nominal type by its key.
+/// The planted control, the old behaviour (refs by hash alone), has no seam here: it is
+/// `blaze_items::hash`'s private `Names::Free`, which that crate's own test holds the code
+/// and interface hashes to (name-free, rightly: codegen binds names outside a template). The
+/// control kept here is [`the_same_text_moves_nothing`]: what moves is the edit's.
 #[test]
-fn a_parameter_moved_between_two_nominal_types_of_one_shape_moves_no_signature_today() {
+fn a_parameter_moved_between_two_nominal_types_of_one_shape_moves_its_signature() {
     let after = ONE_SHAPE.replace("pub fn f(_x: A)", "pub fn f(_x: B)");
+    assert_ne!(after, ONE_SHAPE, "premise: the edit applies");
     let (before, edited) = (digests(ONE_SHAPE), digests(&after));
     let db = db_of(ONE_SHAPE);
     let lib = crate_named(&db, "lib");
     let f = key::item_key(&db, function_named(&db, lib, "f")).0;
     let signature = facts::id_of(&FactRef { kind: items::SIGNATURE, subject: f, object: FactObject::None }).expect("a signature's id");
-    let moved = moved(&before, &edited);
-    assert!(!moved.contains(&signature), "`f`'s signature moved: {moved:?}");
+    let mut want = Vec::new_in(Global);
+    want.push(signature);
+    assert_eq!(moved(&before, &edited), want, "`f`'s signature, by name, and nothing else");
 }
 
 /// The control of the two edit tests: the same text moves nothing, so what moves above is
@@ -319,7 +402,7 @@ fn a_surface_shape_asks_each_dependency_and_replays() {
     let lib_owner = record::Owner::of_subject(&key::crate_key(&db, lib));
     let tables = [Table::of(1, lib_owner, &lib_bytes, &[]).expect("lib's table")];
     let universe = Universe { asker: 0, tables: &tables, outside: &[] };
-    let bytes = surface(&db, main, key_of(), universe).expect("main's surface");
+    let bytes = surface(&db, main, key_of(), universe, &Derived::of(&db)).expect("main's surface");
     let (_, root) = record::check_read::<Surface>(&bytes, key_of()).expect("a read-addressed record");
     let shape = root.reads.follow(&bytes).expect("the shape");
     let exports = facts::exports_id(&key::crate_key(&db, lib));
@@ -424,7 +507,7 @@ fn late_record(text: &str, outside: &[Fact]) -> Result<(Key<Surface>, Vec<Fact, 
     let db = db_of(text);
     let lib = crate_named(&db, "lib");
     let universe = Universe { asker: 0, tables: &[], outside };
-    let bytes = surface(&db, lib, key_of(), universe)?;
+    let bytes = surface(&db, lib, key_of(), universe, &Derived::of(&db))?;
     let (at, root) = record::check_read::<Surface>(&bytes, key_of()).expect("a read-addressed record");
     let mut shape = Vec::new_in(Global);
     shape.extend_from_slice(root.reads.follow(&bytes).expect("the shape"));

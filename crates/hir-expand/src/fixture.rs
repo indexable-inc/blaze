@@ -677,9 +677,18 @@ fn build(
         );
         let prev = by_name.insert(name.clone(), id);
         assert!(prev.is_none(), "multiple crates with same name: {name}");
+        // `deps:a,b=c`: `a` under its own name, and the crate `c` under the name `b`, as a
+        // manifest's `b = { package = "c" }` renames it (std's crates name the facade
+        // `rustc-std-workspace-core` `core` so).
         for dep in meta.deps {
-            let prelude = meta.extern_prelude.as_ref().is_none_or(|it| it.contains(&dep));
-            deps.push((name.clone(), CrateName::normalize_dashes(&dep), prelude));
+            let (as_name, of) = dep.split_once('=').unwrap_or((dep.as_str(), dep.as_str()));
+            let prelude = meta.extern_prelude.as_ref().is_none_or(|it| it.iter().any(|it| it == as_name));
+            deps.push((
+                name.clone(),
+                CrateName::normalize_dashes(as_name),
+                CrateName::normalize_dashes(of),
+                prelude,
+            ));
         }
     }
 
@@ -734,7 +743,7 @@ fn build(
                 graph.add_dep(krate, core_dep(core)).unwrap();
             }
         }
-        for (from, to, prelude) in deps {
+        for (from, as_name, to, prelude) in deps {
             let from_id = by_name[&from];
             // `deps:core` beside `//- minicore:` names minicore's, a dependency of every crate.
             if core.is_some() && to.as_str() == "core" && !by_name.contains_key(&to) {
@@ -743,9 +752,13 @@ fn build(
             let Some(&to_id) = by_name.get(&to) else {
                 panic!("crate `{from}` depends on `{to}`, which the fixture has no crate of")
             };
-            let sysroot = graph[to_id].basic.origin.is_lang();
+            // A sysroot dependency is one the toolchain injects (`Dependency::is_sysroot`): a
+            // language crate under a crate that is not one. A language crate's own dependency is
+            // declared in its manifest (the facade `rustc-std-workspace-core` names `core`), so
+            // `#![no_core]` keeps it in its extern prelude, as rustc keeps an `--extern`.
+            let sysroot = graph[to_id].basic.origin.is_lang() && !graph[from_id].basic.origin.is_lang();
             graph
-                .add_dep(from_id, DependencyBuilder::with_prelude(to, to_id, prelude, sysroot))
+                .add_dep(from_id, DependencyBuilder::with_prelude(as_name, to_id, prelude, sysroot))
                 .unwrap();
         }
     }
@@ -924,10 +937,12 @@ fn sysroot_attr(
                 line.trim().strip_prefix("#![").and_then(|it| it.strip_suffix(']')) == Some(attr)
             })
     };
-    if meta.deps.iter().any(|it| it == "std") || says("no_std") || says("no_core") {
+    // A dependency by the name it is under (`deps:core=rustc_std_workspace_core` is `core`).
+    let named = |name: &str| meta.deps.iter().any(|it| it.split_once('=').map_or(&**it, |(as_name, _)| as_name) == name);
+    if named("std") || says("no_std") || says("no_core") {
         return None;
     }
-    match has_core || meta.deps.iter().any(|it| it == "core") {
+    match has_core || named("core") {
         true => Some(&["no_std"]),
         false => Some(&["feature(no_core)", "no_core"]),
     }

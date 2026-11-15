@@ -619,6 +619,9 @@ mod trees {
 /// without a walk of the bodies, and is placed by [`placed_body_syntax`].
 pub fn body_syntax(db: &Db, def: DefWithBodyId) -> &Option<BodySyntax> {
     let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
+    // A body of a crate given by its address whose file has no text here is refused, typed,
+    // naming the crate and the file, before anything parses it.
+    crate::nameres::frozen::pages::demand_text(db, def.krate(db), file_id);
     if file_id.file_id().is_none() || ast_id.in_body() {
         return placed_body_syntax(db, def);
     }

@@ -421,6 +421,27 @@ pub fn run_mir(db: &Db, def: DefWithBodyId, place: Place) -> Result<SchemaHash, 
     Ok(mir_schema(db, def, place))
 }
 
+/// The work of `step` of `def` (at `place`, for [`Step::Mir`]) run again outside its query and
+/// its store, for a caller that records who read each row (`blaze_memo::record_readers`, the
+/// told lines of a refused body task): the step's query is a fact boundary, so asking it again
+/// is one row, its run's reads kept behind it; this runs what the query runs, its own reads the
+/// work's and what it asks memo hits whose lists hold what each read. Nothing is offered or
+/// stored. Another step, or a place no owner is at, runs nothing (the caller tells only the
+/// asked query's own row then).
+pub fn rerun_unstored(db: &Db, def: DefWithBodyId, step: Step, place: Place) {
+    match step {
+        Step::Infer => {
+            _ = crate::infer::infer_query_with_inspect(db, def, None, crate::LoweringMode::Analysis);
+        }
+        Step::Mir => {
+            if let Some((_, owner)) = super::mir::owners(db, def).into_iter().find(|(at, _)| *at == place) {
+                blaze_mem::frame::task(crate::db::MIR_TAG, |_| _ = (crate::providers::mir().build)(db, owner));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The schema [`BodyWorld::run`] gives for the borrow check of `def` by the checker named
 /// `checker` (what `hir_ty_borrowck::borrowck` offers its verdict under,
 /// [`super::offer_verdict`]): empty answer bytes for a pass, the encoded refusal otherwise
@@ -484,7 +505,7 @@ fn compute<W: BodyWorld + ?Sized + 'static>(
         )));
     };
     let (facts, answer): (&[FactRef], &[u8]) = match &*ran {
-        Traced::Kept { facts, answer } => (&facts[..], &answer[..]),
+        Traced::Kept { facts, answer, .. } => (&facts[..], &answer[..]),
         Traced::Refused(refusal) => {
             return Err(refused(format!(
                 "{input:?} ({def:?}): the item store refused its {}: {refusal:?}",
@@ -821,6 +842,13 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
         // alloc: error path
         return Err(format!(
             "{key:?}: its {} posted to an item store in `Mode::Trace`, which serves no answer but its run's",
+            super::what(step)
+        ));
+    }
+    if super::given(world.db()) {
+        // alloc: error path
+        return Err(format!(
+            "{key:?}: its {} posted to an item store in `Mode::Given`, which serves no answer but its body record's",
             super::what(step)
         ));
     }

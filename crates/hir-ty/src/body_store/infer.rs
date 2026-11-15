@@ -293,6 +293,12 @@ impl<'a, 'db> Keyed<'a, 'db> {
             seen: HashMap::new_in(Global),
         }
     }
+
+    /// The id bits in the writer's database of the item at `index`: for a planted bug of a
+    /// test alone (`mir::testing`), a scan of what was given.
+    pub(super) fn bits_at(&self, index: u32) -> Option<u64> {
+        self.seen.values().find(|&&(_, _, at)| at == index).map(|&(_, bits, _)| bits)
+    }
 }
 
 impl ItemSink for Keyed<'_, '_> {

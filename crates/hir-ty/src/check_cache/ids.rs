@@ -877,7 +877,7 @@ pub(crate) fn read<'db>(
             let owner = infer_owner_of(&table, owner)?;
             let closure_kind = closure_kind_of(kind)?;
             let id_kind = table.entries[at].0;
-            let expr = closure_expr(db, owner, expr, id_kind)?;
+            let expr = closure_expr(db, owner, expr, id_kind, closure_kind)?;
             let loc = InternedClosure { owner, expr, kind: closure_kind };
             table.entries[at].1 = gid_bits(match id_kind {
                 IdKind::Closure => InternedClosureId::new(db, loc).gid(),
@@ -951,7 +951,27 @@ fn store_owner_of(table: &Table, (tag, index): (u8, u32)) -> R<ExpressionStoreOw
 
 /// The expression `expr` of `owner`'s store, checked to be a closure an id of `kind` may name:
 /// what `InternedClosureId::new` and its siblings assert in debug builds.
-fn closure_expr(db: &Db, owner: InferBodyId<'_>, expr: u32, kind: IdKind) -> R<ExprId> {
+///
+/// Where the body is given from its record (`body_store::given`) its store is not there (its
+/// text is absent): the expression is checked to be one of the closures the record lists
+/// (`db::closure_exprs`), and the closure kind the record wrote (`written`) against `kind`.
+fn closure_expr(db: &Db, owner: InferBodyId<'_>, expr: u32, kind: IdKind, written: ClosureKind) -> R<ExprId> {
+    let fits_kind = |closure_kind: &ClosureKind| match kind {
+        IdKind::Closure => matches!(closure_kind, ClosureKind::Closure | ClosureKind::CoroutineClosure(_)),
+        IdKind::Coroutine => matches!(closure_kind, ClosureKind::OldCoroutine(_) | ClosureKind::Coroutine { .. }),
+        _ => matches!(closure_kind, ClosureKind::CoroutineClosure(_)),
+    };
+    if crate::body_store::given(db) {
+        let at = ExprId::from_raw(RawIdx::from_u32(expr));
+        let listed = crate::db::closure_exprs(db, owner.expression_store_owner(db)).binary_search(&at).is_ok();
+        return match (listed, fits_kind(&written)) {
+            (true, true) => Ok(at),
+            // alloc: the reason of a refusal
+            (false, _) => Err(format!("a closure at expression {expr}, which the body's record lists no closure at")),
+            // alloc: the reason of a refusal
+            (true, false) => Err(format!("a {kind:?} written of a closure kind {written:?}")),
+        };
+    }
     let store = ExpressionStore::of(db, owner.expression_store_owner(db));
     if expr as usize >= store.expr_count() {
         // alloc: the reason of a refusal
@@ -959,15 +979,7 @@ fn closure_expr(db: &Db, owner: InferBodyId<'_>, expr: u32, kind: IdKind) -> R<E
     }
     let expr = ExprId::from_raw(RawIdx::from_u32(expr));
     let fits = match store.expr(expr) {
-        Expr::Closure { closure_kind, .. } => match kind {
-            IdKind::Closure => {
-                matches!(closure_kind, ClosureKind::Closure | ClosureKind::CoroutineClosure(_))
-            }
-            IdKind::Coroutine => {
-                matches!(closure_kind, ClosureKind::OldCoroutine(_) | ClosureKind::Coroutine { .. })
-            }
-            _ => matches!(closure_kind, ClosureKind::CoroutineClosure(_)),
-        },
+        Expr::Closure { closure_kind, .. } => fits_kind(&closure_kind),
         _ => false,
     };
     match fits {

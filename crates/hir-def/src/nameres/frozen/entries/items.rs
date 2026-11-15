@@ -120,6 +120,11 @@ fn place<N: AstIdNode>(
     let file = id.file_id;
     let krate = loc.krate(db);
     let ast = id.value.erase();
+    // The file's index and its set are read off its text, or found by its content where it has
+    // none (a file of a crate given by its address, its content as its record names it): an
+    // entry found reads no text. A miss demands the text before `make` reads the syntax
+    // ([`attr_flags`], [`assoc`]); with no place, the parse itself refuses a textless file,
+    // typed (`base_db::NoText`).
     let source = stored::index::source(db, file, ast, krate)?;
     let (set, read_as) = stored::set_of(db, file)?;
     Some(Place { file, ast, set, read_as, krate, source })
@@ -291,14 +296,24 @@ pub(crate) fn attr_flags(db: &Db, owner: AttrDefId, make: impl FnOnce() -> AttrF
         Err(why) => refuse(db, &place, FLAGS, why),
     }
     ran();
+    // Not kept: made off the item's syntax, which a file with no text here refuses first.
+    crate::nameres::frozen::pages::demand_text(db, place.krate, place.file);
     let flags = make();
-    if let Err(why) = keep(db, FLAGS, &place.set, key, &flags.bits().to_le_bytes()) {
+    if let Err(why) = keep(db, FLAGS, &place.set, key, &flags_bytes(flags)) {
         refuse(db, &place, FLAGS, why)
     }
     flags
 }
 
-fn decode_flags(bytes: &[u8]) -> R<AttrFlags> {
+/// The bytes of `flags`, as a [`FLAGS`] entry holds them and as a crate's image holds the
+/// flags of each of its items (`deps::signatures`): one encoding of an item's flags, read by
+/// [`decode_flags`].
+pub(crate) fn flags_bytes(flags: AttrFlags) -> [u8; 16] {
+    flags.bits().to_le_bytes()
+}
+
+/// The flags [`flags_bytes`] wrote; `Err` for bytes of another length.
+pub(crate) fn decode_flags(bytes: &[u8]) -> R<AttrFlags> {
     let bytes: [u8; 16] =
         // alloc: error path
         bytes.try_into().map_err(|_| format!("{} bytes, and flags are 16", bytes.len()))?;
@@ -365,6 +380,8 @@ fn assoc(
         Err(why) => refuse(db, &place, ASSOC, why),
     }
     ran();
+    // Not kept: made off the item's syntax, which a file with no text here refuses first.
+    crate::nameres::frozen::pages::demand_text(db, place.krate, place.file);
     let made = make();
     // A plain impl's collection reports nothing and expands nothing but an item its cfg
     // leaves out (a diagnostic naming its module): that one is not kept, and is made again.

@@ -413,6 +413,128 @@ fn with_facts_read_live_the_same_asks_make_syntax() {
     assert!(!made_syntax(&ran).is_empty(), "nothing made syntax: {ran:?}");
 }
 
+/// A staged dependency with what a dependent's check of `std` reads off attributes beside the
+/// signatures: stability and deprecation (an item's own, one a module gives the items in it, a
+/// field's), a layout input, a module's flags (of a crate root, an inline module, a `mod m;`
+/// whose attributes are its declaration's and its file's), a doc alias and the crate's blaze
+/// edition.
+const STAGED: &str = r#"
+//- /main.rs crate:main deps:lib new_source_root:local
+fn main() {}
+//- /lib.rs crate:lib new_source_root:library
+#![feature(staged_api)]
+#![stable(feature = "lib", since = "1.0.0")]
+#[unstable(feature = "inner_mod", issue = "none")]
+pub mod inner {
+    pub fn plain() {}
+}
+#[stable(feature = "files", since = "1.0.0")]
+pub mod files;
+#[stable(feature = "fields", since = "1.0.0")]
+pub struct Fields {
+    #[unstable(feature = "field", issue = "none")]
+    pub f: u8,
+}
+#[rustc_layout_scalar_valid_range_start(1)]
+#[stable(feature = "nz", since = "1.0.0")]
+pub struct NonZeroish(u32);
+#[doc(alias = "other")]
+#[deprecated(since = "1.2.0", note = "use another")]
+#[stable(feature = "old", since = "1.1.0")]
+pub fn old() {}
+//- /files.rs
+#![doc(hidden)]
+pub fn in_file() {}
+"#;
+
+/// What a dependent's check asks of [`STAGED`]'s `lib` off its attributes, as text: every
+/// module's flags and stability, every function's and struct's stability, deprecation and
+/// aliases, each struct field's stability, each struct's layout range and the crate's blaze
+/// edition.
+fn ask_staged(db: &Db) -> Vec<String> {
+    use crate::attrs::stability::{deprecation_entry, stability};
+
+    let lib = crate_named(db, "lib");
+    let mut said = Vec::new();
+    for (module, data) in crate_def_map(db, lib).modules(db) {
+        let owner = AttrDefId::ModuleId(module);
+        said.push(format!("module flags {:?}", AttrFlags::query(db, owner)));
+        said.push(format!("module stability {:?}", stability(db, owner.into())));
+        for def in data.scope(db).declarations() {
+            let owner = match def {
+                ModuleDefId::FunctionId(it) => AttrDefId::FunctionId(it),
+                ModuleDefId::AdtId(it) => {
+                    let range = AttrFlags::rustc_layout_scalar_valid_range(db, it);
+                    said.push(format!("layout {range:?}"));
+                    if let AdtId::StructId(it) = it {
+                        let parent = crate::VariantId::StructId(it);
+                        let fields = crate::signatures::VariantFields::of(db, parent);
+                        for (local_id, _) in fields.fields().iter() {
+                            let field = crate::FieldId { parent, local_id };
+                            said.push(format!("field stability {:?}", stability(db, field.into())));
+                        }
+                    }
+                    AttrDefId::AdtId(it)
+                }
+                _ => continue,
+            };
+            let flags = AttrFlags::query(db, owner);
+            said.push(format!("stability {:?}", stability(db, owner.into())));
+            let deprecation = deprecation_entry(db, owner.into()).map(|it| it.deprecation);
+            said.push(format!("deprecation {deprecation:?}"));
+            said.push(format!("aliases {:?}", flags.doc_aliases(db, Either::Left(owner))));
+        }
+    }
+    said.push(format!("blaze edition {:?}", crate::nameres::boundary::blaze_edition(db, lib)));
+    said.sort_unstable();
+    said
+}
+
+/// The bar for what a check of `std` reads off attributes: a served dependency whose facts its
+/// store kept (`facts::keep_all`, when its image was written) answers each of [`ask_staged`]
+/// as the crate built from source does, with every fact found (none made) and no file of it
+/// parsed, outlined or expanded: a module's flags by its rows (`facts::module_place`), its
+/// own stability and deprecation (named with the parse's context), a field's, the layout
+/// range and the blaze edition (the root module's fact).
+///
+/// The planted control, the cause removed: the same asks of the same served crate with every
+/// fact read live make syntax, and the count catches it.
+#[test]
+fn a_served_crate_answers_its_stability_layout_and_edition_with_no_syntax() {
+    let _turn = TURN.lock();
+    let want = ask_staged(&fixture::db(STAGED).into_db());
+    // Premises: each fact asked holds something, so an empty answer cannot pass for it.
+    for (premise, what) in [
+        ("layout RustcLayoutScalarValidRange { start: Some(1)", "`NonZeroish`'s range"),
+        ("inner_mod", "`inner`'s `#[unstable]`, inherited by `plain`"),
+        ("use another", "`old`'s deprecation note"),
+        ("IS_DOC_HIDDEN", "`files`' inner `#![doc(hidden)]`"),
+        ("\"field\"", "the field's `#[unstable]`"),
+        ("aliases [\"other\"]", "`old`'s alias"),
+    ] {
+        assert!(want.iter().any(|it| it.contains(premise)), "premise: {what}: {want:?}");
+    }
+
+    let store = Memory::new();
+    let db = served(STAGED, &store);
+    RAN.set(0);
+    let mut got = Vec::new();
+    let ran = db.executed_in_read_order(|| got = ask_staged(&db));
+    assert_eq!(got, want);
+    assert_eq!(made_syntax(&ran), Vec::<&String>::new(), "all that ran: {ran:?}");
+    assert_eq!(RAN.get(), 0, "every fact found");
+
+    // The planted control: every fact read live.
+    let control = Memory::new();
+    let db = served(STAGED, &control);
+    LIVE.set(true);
+    let mut got = Vec::new();
+    let ran = db.executed_in_read_order(|| got = ask_staged(&db));
+    LIVE.set(false);
+    assert_eq!(got, want);
+    assert!(!made_syntax(&ran).is_empty(), "nothing made syntax with every fact live: {ran:?}");
+}
+
 /// A crate `lib` of `count` structs, each `#[must_use]` with a message, the one at `edited`
 /// with another.
 fn sized(count: usize, edited: Option<usize>) -> String {

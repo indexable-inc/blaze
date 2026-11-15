@@ -231,6 +231,35 @@ fn assert_served(db: &TestDB, krate: Crate, item: Item, values: bool) {
         Item::Function(id) => same!(Function, FunctionSignature, id),
         Item::TypeAlias(id) => same!(TypeAlias, TypeAliasSignature, id),
         Item::Fields(id) => same!(Fields, VariantFields, id),
+        // The from-syntax value is collected in this same database (which has the text), by
+        // the collection `ImplItems::of` and `TraitItems::query_with_diagnostics` run when no
+        // record serves them (`ImplItems::collected`, `TraitItems::collected`): those queries
+        // read the record first, so asking them would compare the record with itself. The
+        // ids it makes are the record's, interned from the same locations.
+        Item::ImplItems(id) => {
+            let container = ItemContainerId::ImplId(id);
+            let served = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |_| match values {
+                true => served_impl_items(db, id).expect("an impl of a crate with an image"),
+                false => assoc_record(db, container),
+            });
+            let collected = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |_| {
+                crate::nameres::assoc::ImplItems::collected(db, id).0
+            });
+            let lowered = assoc_record_of(db, container, &collected.items, &collected.macro_calls);
+            same_assoc(db, krate, item, &served, &lowered, values);
+        }
+        Item::TraitItems(id) => {
+            let container = ItemContainerId::TraitId(id);
+            let served = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |_| match values {
+                true => served_trait_items(db, id).expect("a trait of a crate with an image"),
+                false => assoc_record(db, container),
+            });
+            let collected = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |_| {
+                crate::nameres::assoc::TraitItems::collected(db, id).0
+            });
+            let lowered = assoc_record_of(db, container, &collected.items, &collected.macro_calls);
+            same_assoc(db, krate, item, &served, &lowered, values);
+        }
         Item::Variants(id) => {
             // Outside the query, which runs in a frame of its `mem_tag`, the lowering needs one.
             let in_frame = |f: &dyn Fn() -> (EnumVariants, ThinVec<InactiveEnumVariantCode>)| {
@@ -257,6 +286,26 @@ fn assert_served(db: &TestDB, krate: Crate, item: Item, values: bool) {
     }
 }
 
+/// [`assert_served`] of an assoc items record: the served one's record and the one collected
+/// from syntax are the same bytes, and with `values` the same value.
+fn same_assoc(
+    db: &TestDB,
+    krate: Crate,
+    item: Item,
+    served: &AssocRecord,
+    lowered: &AssocRecord,
+    values: bool,
+) {
+    let what = item.what();
+    let records =
+        (record::<codes::Assoc>(db, krate, what, served), record::<codes::Assoc>(db, krate, what, lowered));
+    assert!(records.0.is_ok(), "{item:?}: {records:?}");
+    assert_eq!(records.0, records.1, "{item:?}");
+    if values {
+        assert_eq!(served, lowered, "{item:?}");
+    }
+}
+
 #[test]
 fn every_served_signature_is_the_lowered_one() {
     let _turn = turn();
@@ -267,7 +316,9 @@ fn every_served_signature_is_the_lowered_one() {
         let items = items(&db, krate);
         if name == "lib" {
             let kinds: HashSet<u8, Global> = items.iter().map(|it| it.what()).collect();
-            assert_eq!(kinds.len(), 11, "the fixture asks every query: {kinds:?}");
+            // Each kind of `Item`, the assoc items of impls and traits (`ImplItems`,
+            // `TraitItems`) among them, each compared below.
+            assert_eq!(kinds.len(), 13, "the fixture asks every query: {kinds:?}");
         }
         for item in items {
             assert_served(&db, krate, item, true);
@@ -357,6 +408,8 @@ fn serve_one(db: &TestDB, item: Item) -> bool {
         Item::Function(id) => FunctionSignature::served(db, id).is_some(),
         Item::TypeAlias(id) => TypeAliasSignature::served(db, id).is_some(),
         Item::Fields(id) => VariantFields::served(db, id).is_some(),
+        Item::ImplItems(id) => served_impl_items(db, id).is_some(),
+        Item::TraitItems(id) => served_trait_items(db, id).is_some(),
         Item::Variants(id) => blaze_mem::frame::task(blaze_mem::Tag::Nameres, |_| {
             served_enum_variants(db, id).is_some()
         }),
@@ -699,7 +752,7 @@ fn an_image_without_the_item_is_corrupt() {
     let memory = stored(FIXTURE);
     let mut out = Writer::new(SCHEMA);
     let at = out.next::<PartRoot>();
-    out.push(&PartRoot { keys: Slice::EMPTY, places: Slice::EMPTY });
+    out.push(&PartRoot { keys: Slice::EMPTY, places: Slice::EMPTY, flags: Slice::EMPTY });
     with_signatures(FIXTURE, &memory, &out.finish(at));
     let db = served_db(FIXTURE, &memory, Mode::Serve);
     served_function(&db, function_f(&db));

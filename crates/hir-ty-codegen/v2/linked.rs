@@ -946,6 +946,44 @@ pub fn span_tables_of(
     Ok(tables.into_iter().map(|it| (it.anchor, it.bytes)).collect())
 }
 
+/// One owner's span tables as a span record holds them (blaze-command's `program::spans`):
+/// each table of its body by its anchor, and for a function its declaration table, sorted by
+/// anchor, each encoded as the link reads it (`blaze_link::SpanTable::encode`: cells
+/// item-relative, the bases last and absolute); and the files they name, each once, sorted.
+/// What the record's key must cover beyond the anchors (rule 21) is exactly those files' text
+/// and names: a cell counted from a base moves with the base, a base and an absolute cell with
+/// their file's lines.
+pub struct OwnerSpans {
+    pub tables: Vec<(ContentId, Vec<u8>)>,
+    pub files: Vec<base_db::FileId>,
+}
+
+/// The span tables of `owner` ([`OwnerSpans`]): the one place a table is made outside a kept
+/// link. Each file's name is asked of `hashes` once.
+///
+/// Cost against the floor (one pass over the owner's spans, plus its bases): the places are
+/// memoized ([`span_places`]), so a table made again after a line added above the body is one
+/// addition a cell ([`table_cells`]). The anchors and the declaration's come from `hashes`, so
+/// they are the ones the owner's code records name.
+#[blaze::renders_positions]
+pub fn owner_span_tables(db: &Db, hashes: &HashSource, owner: DefWithBodyId) -> Result<OwnerSpans, String> {
+    let mut names = HashMap::new_in(Global);
+    let anchors = hashes.anchors(db, owner)?;
+    let mut tables = Vec::with_capacity_in(TABLES + 1, Global);
+    for (table, anchor) in anchors.into_iter().enumerate() {
+        tables.push((anchor, encoded(db, hashes, &mut names, Source::Body(owner, table as u8))?));
+    }
+    if let DefWithBodyId::FunctionId(func) = owner {
+        let anchor = hashes.declaration(db, func)?.anchor;
+        tables.push((anchor, encoded(db, hashes, &mut names, Source::Declared(func))?));
+    }
+    tables.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut files = Vec::with_capacity_in(names.len(), Global);
+    files.extend(names.keys().copied());
+    files.sort_unstable_by_key(|it: &base_db::FileId| it.index());
+    Ok(OwnerSpans { tables, files })
+}
+
 /// A position: the file, its 1-based line and column, as `core::panic::Location` has them.
 pub(super) type Row = (base_db::FileId, u32, u32);
 

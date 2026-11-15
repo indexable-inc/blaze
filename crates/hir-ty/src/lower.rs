@@ -15,7 +15,7 @@ pub mod persist;
 
 use std::{alloc::Allocator, iter, mem, ops::ControlFlow};
 
-use base_db::Db;
+use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
@@ -2800,12 +2800,47 @@ pub(crate) fn impl_trait_with_diagnostics<'db>(
     db: &'db Db,
     impl_id: ImplId,
 ) -> Option<Lowered<'db, StoredEarlyBinder<StoredTraitRef>>> {
-    if let Some(krate) = batch::batched_crate(db, impl_id.module(db)) {
-        return batch::CrateImplTraits::of(db, krate).get(impl_id).unwrap_or_else(|| {
-            panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
-        });
-    }
-    impl_trait_of_impl(db, impl_id).as_ref().map(TyLoweringResult::as_lowered)
+    let row = match batch::batched_crate(db, impl_id.module(db)) {
+        Some(_) => batched_impl_trait(db, impl_id),
+        None => impl_trait_of_impl(db, impl_id),
+    };
+    row.as_ref().map(TyLoweringResult::as_lowered)
+}
+
+/// A dependency's module-level impl's trait, its row of its crate's batch copied out: a query
+/// of the impl, so a reader reads the impl and not the batch, as `batched_field_types` is for a
+/// variant. A body's step that read `crate_impl_traits` itself named all of the crate's impls
+/// (a read of the batch names no row of it), the crate's whole-crate fact, which no record can
+/// hold; a read of this is a fact boundary, the impl's `Signature` fact
+/// (`blaze_item_hash::reads::BOUNDARIES`), which moves when the impl's trait reference can and
+/// not when another impl of the crate is added or edited.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn batched_impl_trait<'db>(
+    db: &'db Db,
+    impl_id: ImplId,
+) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
+    let krate = batched_impl_crate(db, impl_id);
+    let row = batch::CrateImplTraits::of(db, krate).get(impl_id).unwrap_or_else(|| {
+        panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
+    });
+    row.map(copied_row)
+}
+
+/// The crate whose batch holds `impl_id`'s signature rows; a panic naming the impl when it has
+/// none, as only a batched impl's read-through query asks.
+fn batched_impl_crate(db: &Db, impl_id: ImplId) -> Crate {
+    batch::batched_crate(db, impl_id.module(db)).unwrap_or_else(|| {
+        panic!("{impl_id:?} is no module-level impl of a dependency crate, so in no batch")
+    })
+}
+
+/// A row of a batch as a query of its own item's result: its value and what lowering it found.
+fn copied_row<'db, T: Clone>(row: Lowered<'db, T>) -> TyLoweringResult<'db, T> {
+    TyLoweringResult::new(
+        row.value.clone(),
+        row.diagnostics().iter().cloned(),
+        row.defined_anon_consts().iter().copied(),
+    )
 }
 
 #[blaze_memo::tracked(returns(ref), cycle_result = impl_trait_with_diagnostics_cycle_result, owns, mem_tag = Infer)]
@@ -3194,12 +3229,25 @@ pub(crate) fn impl_self_ty_with_diagnostics<'db>(
     db: &'db Db,
     impl_id: ImplId,
 ) -> Lowered<'db, StoredEarlyBinder<StoredTy>> {
-    if let Some(krate) = batch::batched_crate(db, impl_id.module(db)) {
-        return batch::CrateImplSelfTys::of(db, krate).get(impl_id).unwrap_or_else(|| {
-            panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
-        });
+    match batch::batched_crate(db, impl_id.module(db)) {
+        Some(_) => batched_impl_self_ty(db, impl_id).as_lowered(),
+        None => impl_self_ty_of_impl(db, impl_id).as_lowered(),
     }
-    impl_self_ty_of_impl(db, impl_id).as_lowered()
+}
+
+/// A dependency's module-level impl's self type, its row of its crate's batch copied out, as
+/// [`batched_impl_trait`] is its trait: a reader reads the impl's `Signature` fact, never all
+/// of the crate's impls.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn batched_impl_self_ty<'db>(
+    db: &'db Db,
+    impl_id: ImplId,
+) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
+    let krate = batched_impl_crate(db, impl_id);
+    let row = batch::CrateImplSelfTys::of(db, krate).get(impl_id).unwrap_or_else(|| {
+        panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
+    });
+    copied_row(row)
 }
 
 #[blaze_memo::tracked(returns(ref), cycle_result = impl_self_ty_with_diagnostics_cycle_result, owns, mem_tag = Infer)]
@@ -4408,21 +4456,34 @@ impl GenericPredicates {
     /// Resolve the where clause(s) of an item with generics.
     ///
     /// Diagnostics are computed only for this item's predicates, not for parents. The impls of a
-    /// dependency crate's modules are read from its batch (`lower::batch::batched_crate`), which
-    /// coherence and method resolution read whole.
+    /// dependency crate's modules are read from its batch (`lower::batch::batched_crate`), each
+    /// through its own row's query ([`batched_impl_predicates`]).
     pub fn query_with_diagnostics<'db>(
         db: &'db Db,
         def: GenericDefId,
     ) -> Lowered<'db, GenericPredicates> {
         if let GenericDefId::ImplId(impl_id) = def
-            && let Some(krate) = batch::batched_crate(db, impl_id.module(db))
+            && batch::batched_crate(db, impl_id.module(db)).is_some()
         {
-            return batch::CrateImplPredicates::of(db, krate).get(impl_id).unwrap_or_else(|| {
-                panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
-            });
+            return batched_impl_predicates(db, impl_id).as_lowered();
         }
         generic_predicates_of(db, def).as_lowered()
     }
+}
+
+/// A dependency's module-level impl's where clauses, its row of its crate's batch copied out,
+/// as [`batched_impl_trait`] is its trait: a reader reads the impl's `Signature` fact, never
+/// all of the crate's impls.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn batched_impl_predicates<'db>(
+    db: &'db Db,
+    impl_id: ImplId,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    let krate = batched_impl_crate(db, impl_id);
+    let row = batch::CrateImplPredicates::of(db, krate).get(impl_id).unwrap_or_else(|| {
+        panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
+    });
+    copied_row(row)
 }
 
 #[blaze_memo::tracked(returns(ref), cycle_result = generic_predicates_cycle_result, owns, mem_tag = Infer)]
@@ -5145,39 +5206,42 @@ enum Implied {
 /// A trait's predicates without the bounds its supertraits imply, for a trait of a crate with
 /// `blaze_implied_bounds` (`implied::declared_trait_predicates`, which reads this only there).
 fn declared_trait_predicates(db: &Db, trait_: TraitId) -> &GenericPredicates {
-    return &declared_trait_predicates_of(db, trait_).value;
+    &declared_trait_predicates_of(db, trait_).value
+}
 
-    #[blaze_memo::tracked(
-        returns(ref),
-        cycle_result = declared_trait_predicates_cycle_result,
-        owns,
-        mem_tag = Infer
-    )]
-    fn declared_trait_predicates_of<'db>(
-        db: &'db Db,
-        trait_: TraitId,
-    ) -> TyLoweringResult<'db, GenericPredicates> {
-        // Every diagnostic of these clauses is the one `GenericPredicates::query_with_diagnostics`
-        // reports.
-        blaze_mem::frame::current(|frame| {
-            let lowered = lower_generic_predicates_with(
-                db,
-                trait_.into(),
-                frame,
-                None,
-                PredicateFilter::All,
-                Implied::Left,
-            );
-            TyLoweringResult::empty(lowered.value)
-        })
-    }
+/// [`declared_trait_predicates`], stored. At module level, `pub`, so its kind is named outside
+/// the crate ([`crate::kinds`]); read it through [`declared_trait_predicates`]. Its kind name
+/// is the one it had nested there (`hir_ty::lower::declared_trait_predicates_of`).
+#[blaze_memo::tracked(
+    returns(ref),
+    cycle_result = declared_trait_predicates_cycle_result,
+    owns,
+    mem_tag = Infer
+)]
+pub fn declared_trait_predicates_of<'db>(
+    db: &'db Db,
+    trait_: TraitId,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    // Every diagnostic of these clauses is the one `GenericPredicates::query_with_diagnostics`
+    // reports.
+    blaze_mem::frame::current(|frame| {
+        let lowered = lower_generic_predicates_with(
+            db,
+            trait_.into(),
+            frame,
+            None,
+            PredicateFilter::All,
+            Implied::Left,
+        );
+        TyLoweringResult::empty(lowered.value)
+    })
+}
 
-    fn declared_trait_predicates_cycle_result<'db>(
-        db: &'db Db,
-        trait_: TraitId,
-    ) -> TyLoweringResult<'db, GenericPredicates> {
-        cycle_predicates(db, trait_.into(), CycleQuery::Predicates)
-    }
+fn declared_trait_predicates_cycle_result<'db>(
+    db: &'db Db,
+    trait_: TraitId,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    cycle_predicates(db, trait_.into(), CycleQuery::Predicates)
 }
 
 /// The where clauses of `def` that `filter` keeps, with the implicit `MetaSized` of a trait's

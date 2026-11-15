@@ -509,6 +509,7 @@ pub(crate) fn place_kind(target: &Target) -> u8 {
         Target::Coverage(_) => 7,
         Target::Counter(_) => 8,
         Target::ProfileCounters => 9,
+        Target::Text(_) => 10,
     }
 }
 
@@ -877,8 +878,9 @@ pub(crate) mod plant {
 }
 
 /// [`Prepare::prepare`] of `node` as `unit`, its shape [`Shape::relative`] when its template
-/// is relative to its own anchors ([`Described::anchors`]). Every prepare of a function goes
-/// through here, so the memo, its flights and a lazy build's recorded shapes all key one form.
+/// is relative to its own anchors ([`Described::anchors`]): [`prepare_one`], which every
+/// prepare of a function goes through, so the memo, its flights, a lazy build's recorded
+/// shapes and the no-daemon command's code task all key one form.
 fn prepare_node<B: Prepare>(
     backend: &B,
     frontend: &B::Frontend,
@@ -886,9 +888,8 @@ fn prepare_node<B: Prepare>(
     spec: &Spec,
     node: &Node<B>,
 ) -> Result<(Shape, B::Prepared), CodegenError> {
-    let (shape, made) = backend.prepare(frontend, unit, spec, &node.instance, &node.refs)?;
-    let own = own_place(unit.instance.key(), &node.refs);
-    Ok((shape.relative(node.described.anchors.is_some()).own_place(own), made))
+    let anchored = node.described.anchors.is_some();
+    prepare_one(backend, frontend, unit, spec, &node.instance, &node.refs, anchored)
 }
 
 /// `why`, the refusal of the function called `name`, with its message naming it where it does
@@ -4152,20 +4153,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                 if self.memo.get(&shape).is_some() {
                     return;
                 }
-                let mut emitted =
-                    match self.backend.emit(&node.unit, &node.spec, made, &node.refs, None) {
-                        Ok(it) if it.function.key == key => it,
-                        Ok(it) => {
-                            // alloc: an error
-                            out.errors.push(error(
-                                key,
-                                node.unit.item,
-                                format!("compiled as {:?}", it.function.key),
-                            ));
-                            return;
-                        }
+                let name = &node.described.name;
+                let emitted =
+                    match emit_one(self.backend, &node.unit, &node.spec, made, &node.refs, name) {
+                        Ok(it) => it,
                         Err(why) => {
-                            out.errors.push(naming(why, &node.described.name));
+                            out.errors.push(why);
                             return;
                         }
                     };
@@ -4179,15 +4172,18 @@ impl<'a, B: Prepare> Build<'a, B> {
                     return;
                 }
                 out.stats.compiled += 1;
-                out.side(By::node(key, &node.unit), &mut emitted);
-                let Some(template) = out.template_of(
-                    &node.unit,
-                    emitted,
-                    &node.refs,
-                    node.described.anchors.as_ref(),
-                ) else {
-                    return;
-                };
+                let anchors = node.described.anchors.as_ref();
+                let DevCompiled { template, side } =
+                    match dev_template_of(&node.unit, emitted, &node.refs, anchors) {
+                        Ok(it) => it,
+                        Err(why) => {
+                            out.errors.push(why);
+                            return;
+                        }
+                    };
+                if let Some((at, bytes)) = side {
+                    out.put(By::node(key, &node.unit), at, Kind::Debug, bytes);
+                }
                 let kept = self.memo.put(compiled, template);
                 out.dev_template(key, &node.unit, node.template_key(), kept);
                 out.instantiate(
@@ -5139,8 +5135,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             Some(only) => only.iter().filter_map(|id| Some((id, statics.get(id)?))).collect(),
         };
         for (id, node) in made {
-            let key =
-                keys::static_value(&definition(&node.described, &node.refs), &node.spec.settings());
+            let key = static_template_key(&node.described, &node.refs, &node.spec.settings());
             let unit = unit_of(node);
             // alloc: an error
             match out
@@ -5224,6 +5219,45 @@ impl<'a, B: Prepare> Build<'a, B> {
 
 pub const STATIC_DEFINITION_DOMAIN: &str = "blaze v2 static definition 2";
 
+/// The store key of a static's template ([`StaticTemplate`]) described as `described` at
+/// `refs` under `settings`: its [`definition`] by content, never which static it is, so two
+/// statics of one value share it. The one rule, which the driver's build and the no-daemon
+/// command's static code task (`blaze_command::code::code_static`) both key by.
+pub fn static_template_key<I, S>(
+    described: &DescribedStatic<I, S>,
+    refs: &[Target],
+    settings: &crate::Settings,
+) -> Key {
+    static_shape_key(StaticShape::of(described), refs, settings)
+}
+
+/// [`static_template_key`] of a static's shape alone, as a reader with no describe (a static
+/// plan read in place) holds it.
+pub fn static_shape_key(shape: StaticShape<'_>, refs: &[Target], settings: &crate::Settings) -> Key {
+    keys::static_value(&definition_of(shape, refs), settings)
+}
+
+/// What of a static's describe its template's key holds besides its references: the fields
+/// [`definition`] hashes, borrowed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StaticShape<'a> {
+    pub value: ContentId,
+    pub mutable: bool,
+    pub thread_local: bool,
+    pub section: Option<&'a str>,
+}
+
+impl<'a> StaticShape<'a> {
+    pub fn of<I, S>(described: &'a DescribedStatic<I, S>) -> StaticShape<'a> {
+        StaticShape {
+            value: described.value,
+            mutable: described.mutable,
+            thread_local: described.thread_local,
+            section: described.section.as_deref(),
+        }
+    }
+}
+
 /// Everything a static's compiled definition is made of besides which static it is: what
 /// its template ([`StaticTemplate`]) is kept under, so it covers each field the template
 /// keeps.
@@ -5234,9 +5268,14 @@ pub const STATIC_DEFINITION_DOMAIN: &str = "blaze v2 static definition 2";
 ///   ([`place_kind`]), as [`placed`] covers a function's. Which target is at a place is not
 ///   covered, as a template takes any.
 fn definition<I, S>(described: &DescribedStatic<I, S>, refs: &[Target]) -> ContentId {
+    definition_of(StaticShape::of(described), refs)
+}
+
+/// [`definition`] of a static's shape.
+fn definition_of(shape: StaticShape<'_>, refs: &[Target]) -> ContentId {
     let mut hasher = Hasher::new(STATIC_DEFINITION_DOMAIN);
-    hasher.id(&described.value).update(&[described.mutable as u8, described.thread_local as u8]);
-    match &described.section {
+    hasher.id(&shape.value).update(&[shape.mutable as u8, shape.thread_local as u8]);
+    match shape.section {
         Some(section) => hasher.update(&[1]).part(section.as_bytes()),
         None => hasher.update(&[0]),
     };
@@ -5319,6 +5358,8 @@ pub use records::Records;
 mod later;
 mod lists;
 mod near;
+mod one;
+pub use one::{DevCompiled, dev_template_of, emit_one, prepare_one};
 pub use near::{Callee, Near};
 mod start;
 pub use start::{One, OneStatic, Start};

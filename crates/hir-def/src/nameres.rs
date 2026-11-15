@@ -50,6 +50,7 @@
 pub mod assoc;
 pub mod attr_resolution;
 mod batch;
+pub mod boundary;
 pub(crate) mod def_site;
 pub use def_site::{
     assoc_item_binding_name, for_each_hygienic_trait_in_scope, implemented_name, implements,
@@ -585,15 +586,22 @@ enum ScopeSlot {
     /// The module's scope in its crate's pages (a `frozen::pages::PagedScope`): a name is read
     /// from the page it is on, the whole scope decoded only for a reader of all of it.
     Paged(frozen::pages::PagedScope),
+    /// The scope of a module of a crate's finished def map (what `crate_resolution` holds):
+    /// the final round's fact, as `Fact`, read only through name resolution's fact boundaries
+    /// ([`boundary`]), so a reader's list holds one row per name it looked up there and never
+    /// the crate's files. Made by [`DefMap::hand_over_scopes`] from the final table's `Fact`
+    /// slots; the views collection reads keep `Fact`, read directly.
+    Final(facts::queries::ScopeRef),
 }
 
 impl ScopeSlot {
-    /// The scope and children of a slot that holds them, or that a fact names.
+    /// The scope and children of a slot that holds them, or that a fact names. Never a
+    /// `Final` slot's, which is read through its boundaries alone.
     fn held<'a>(&'a self, db: &'a Db) -> Option<&'a BuildingScope> {
         match self {
             ScopeSlot::Building(it) | ScopeSlot::Collected(it) => Some(it),
             ScopeSlot::Fact(fact) => Some(facts::fact_scope(db, *fact)),
-            ScopeSlot::Paged(_) => None,
+            ScopeSlot::Paged(_) | ScopeSlot::Final(_) => None,
         }
     }
 }
@@ -760,11 +768,15 @@ impl std::fmt::Display for FixpointLimit {
 impl std::error::Error for FixpointLimit {}
 
 /// The error a caught panic's payload is, when it is one of name resolution's typed stops
-/// ([`FixpointLimit`], [`frozen::Unreadable`]): what a driver fails the one job that asked with
-/// (rule 20). `None` for any other payload.
+/// ([`FixpointLimit`], [`frozen::Unreadable`]) or base-db's refused parse of a file with no
+/// text ([`base_db::NoText`]): what a driver fails the one job that asked with (rule 20).
+/// `None` for any other payload.
 // dyn: a caught panic's payload, read once
 pub fn stopped(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     if let Some(it) = FixpointLimit::of_payload(payload) {
+        return Some(it.to_string());
+    }
+    if let Some(it) = base_db::NoText::of_payload(payload) {
         return Some(it.to_string());
     }
     frozen::Unreadable::of_payload(payload).map(|it| it.to_string())
@@ -893,12 +905,24 @@ impl DefMap {
 
     /// Seals the `DefMap` once collection is done: every module and scope becomes read-only and
     /// the diagnostics are grouped by module. Called once.
+    ///
+    /// A crate's own def map (no block) has every scope a fact of the final round: each
+    /// becomes `ScopeSlot::Final`, read through name resolution's fact boundaries
+    /// ([`boundary`]) from then on.
     fn hand_over_scopes(&mut self, _db: &Db) {
         let ModulesSlot::Building(modules) = &mut self.modules else { return };
         self.diagnostics_by_module = DiagnosticsByModule::of(&self.diagnostics);
+        let finished = self.block.is_none();
         for (_, module) in modules.iter_mut() {
-            if let ScopeSlot::Building(building) = &mut module.scope {
-                module.scope = ScopeSlot::Collected(std::mem::take(building));
+            match &mut module.scope {
+                ScopeSlot::Building(building) => {
+                    module.scope = ScopeSlot::Collected(std::mem::take(building));
+                }
+                ScopeSlot::Fact(fact) if finished => module.scope = ScopeSlot::Final(*fact),
+                ScopeSlot::Fact(_)
+                | ScopeSlot::Collected(_)
+                | ScopeSlot::Paged(_)
+                | ScopeSlot::Final(_) => {}
             }
         }
         self.modules = ModulesSlot::Collected(std::mem::replace(modules, ModulesMap::new()));
@@ -923,10 +947,21 @@ impl DefMap {
             .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap {:#?}: {id:#?}", self.root))
     }
 
-    /// Every module of the `DefMap`.
-    fn table<'a>(&'a self, _db: &'a Db) -> &'a ModulesMap {
+    /// Every module of the `DefMap`. A crate's finished def map lists the read of all of its
+    /// modules ([`boundary::all_modules`]): what it gives changes with any module added,
+    /// removed or moved, which no name's row stands for. A block's table is its one module,
+    /// made from the text of the body that holds the block (its key covers it) and the rows of
+    /// what the block's resolution looked up outside it, which its reader lists
+    /// (`block_def_map` is no boundary, [`boundary`]).
+    fn table<'a>(&'a self, db: &'a Db) -> &'a ModulesMap {
         match &self.modules {
-            ModulesSlot::Building(modules) | ModulesSlot::Collected(modules) => modules,
+            ModulesSlot::Building(modules) => modules,
+            ModulesSlot::Collected(modules) => {
+                if self.block.is_none() {
+                    boundary::all_modules(db, self.krate);
+                }
+                modules
+            }
             ModulesSlot::Unit { .. } => panic!("the modules of a resolver view are not listed"),
         }
     }
@@ -1418,17 +1453,22 @@ impl ModuleData {
         }
     }
 
+    /// The whole of this module's scope. Of a crate's finished def map or its pages, read
+    /// through a boundary whose row stands for every name of the scope (a scan of it).
     pub fn scope<'a>(&'a self, db: &'a Db) -> &'a ItemScope {
         match &self.scope {
-            ScopeSlot::Paged(paged) => frozen::pages::scope(db, *paged),
+            ScopeSlot::Paged(paged) => boundary::paged_scope(db, *paged),
+            ScopeSlot::Final(scope) => boundary::final_scope(db, *scope),
             slot => &slot.held(db).expect("a slot that holds its scope").scope,
         }
     }
 
-    /// What `name` means in this module.
+    /// What `name` means in this module. Of a crate's finished def map or its pages, read
+    /// through a boundary keyed by the scope and the name: one row for this name alone.
     pub fn name_in_scope(&self, db: &Db, name: &Name) -> PerNs {
         match &self.scope {
-            ScopeSlot::Paged(paged) => frozen::pages::name(db, *paged, *name),
+            ScopeSlot::Paged(paged) => boundary::paged_name(db, *paged, *name),
+            ScopeSlot::Final(scope) => boundary::final_name(db, *scope, *name),
             slot => slot.held(db).expect("a slot that holds its scope").scope.get(name),
         }
     }
@@ -1439,26 +1479,27 @@ impl ModuleData {
         name: &Name,
     ) -> Option<&'a [MacroId]> {
         match &self.scope {
-            ScopeSlot::Paged(paged) => frozen::pages::legacy_macro(db, *paged, *name),
+            ScopeSlot::Paged(paged) => boundary::paged_legacy_macro(db, *paged, *name),
+            ScopeSlot::Final(scope) => boundary::final_legacy_macro(db, *scope, *name),
             slot => slot.held(db).expect("a slot that holds its scope").scope.get_legacy_macro(name),
         }
     }
 
     /// The traits in scope in this module.
     pub fn traits_in_scope<'a>(&'a self, db: &'a Db) -> impl Iterator<Item = crate::TraitId> + 'a {
-        let (held, paged) = match &self.scope {
-            ScopeSlot::Paged(paged) => {
-                (None, Some(frozen::pages::traits(db, *paged).iter().copied()))
-            }
+        let (held, listed) = match &self.scope {
+            ScopeSlot::Paged(paged) => (None, Some(boundary::paged_traits(db, *paged).iter().copied())),
+            ScopeSlot::Final(scope) => (Some(boundary::final_traits(db, *scope).traits()), None),
             slot => (Some(slot.held(db).expect("a slot that holds its scope").scope.traits()), None),
         };
-        held.into_iter().flatten().chain(paged.into_iter().flatten())
+        held.into_iter().flatten().chain(listed.into_iter().flatten())
     }
 
     /// The modules declared in this one, by name.
     pub fn children<'a>(&'a self, db: &'a Db) -> &'a FxIndexMap<Name, ModuleId> {
         match &self.scope {
-            ScopeSlot::Paged(paged) => frozen::pages::children(db, *paged),
+            ScopeSlot::Paged(paged) => boundary::paged_children(db, *paged),
+            ScopeSlot::Final(scope) => boundary::final_children(db, *scope),
             slot => &slot.held(db).expect("a slot that holds its scope").children,
         }
     }
@@ -1466,7 +1507,10 @@ impl ModuleData {
     pub(crate) fn children_mut(&mut self) -> &mut FxIndexMap<Name, ModuleId> {
         match &mut self.scope {
             ScopeSlot::Building(building) => &mut building.children,
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) | ScopeSlot::Paged(_) => {
+            ScopeSlot::Collected(_)
+            | ScopeSlot::Fact(_)
+            | ScopeSlot::Paged(_)
+            | ScopeSlot::Final(_) => {
                 panic!("the children of a collected module are read-only")
             }
         }
@@ -1476,7 +1520,10 @@ impl ModuleData {
     pub(crate) fn scope_mut(&mut self) -> &mut ItemScope {
         match &mut self.scope {
             ScopeSlot::Building(building) => &mut building.scope,
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) | ScopeSlot::Paged(_) => {
+            ScopeSlot::Collected(_)
+            | ScopeSlot::Fact(_)
+            | ScopeSlot::Paged(_)
+            | ScopeSlot::Final(_) => {
                 panic!("the scope of a collected module is read-only")
             }
         }
@@ -1726,6 +1773,25 @@ pub fn crate_names(db: &Db, krate: Crate, each: &mut dyn FnMut(CrateName<'_>)) {
         crate_shadows_primitive_type(db, krate),
     ];
     each(CrateName::Flags(&flags, data.edition));
+    // The crate's features, sorted for an order no set decides: once per change of a crate's
+    // def map, a few names.
+    let mut features: Vec<Symbol, Global> = Vec::new_in(Global);
+    features.extend(data.unstable_features.iter());
+    features.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    for feature in &features {
+        each(CrateName::Feature(feature.as_str()));
+    }
+    each(CrateName::Limit(def_map.recursion_limit()));
+    // In the maps' order: the reader sorts them by key, which no map here can.
+    for (&it, helpers) in &data.exported_derives {
+        each(CrateName::Derive(it, helpers));
+    }
+    for (&function, &it) in &data.fn_proc_macro_mapping {
+        each(CrateName::ProcMacro(function, it));
+    }
+    // Read through its boundary, as a block's collection reads it: the reader of this crate's
+    // names is the one row of it, never the root file the edition is said in.
+    each(CrateName::BlazeEdition(boundary::blaze_edition(db, krate)));
 }
 
 /// One row of [`crate_names`].
@@ -1742,4 +1808,16 @@ pub enum CrateName<'a> {
     /// What the root's attributes and the crate's names decide for every module, and the
     /// edition.
     Flags(&'a [bool], Edition),
+    /// A `#![feature]` of the crate, in name order.
+    Feature(&'a str),
+    /// The crate's recursion limit.
+    Limit(u32),
+    /// A derive macro the crate exports and its helper attributes, in no set order.
+    Derive(MacroId, &'a [Name]),
+    /// A proc macro function of the crate and the macro it defines, in no set order.
+    ProcMacro(FunctionId, ProcMacroId),
+    /// The crate's blaze edition (`#![blaze::edition]`), `None` for a crate of Rust's own: it
+    /// decides which dependency is the crate's `std` and which prelude its modules and blocks
+    /// see.
+    BlazeEdition(Option<span::BlazeEdition>),
 }

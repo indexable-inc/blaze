@@ -977,6 +977,9 @@ fn written_visibility_made<N: AstIdNode>(
     id: AstId<N>,
     module: ModuleId,
 ) -> RawVisibility {
+    // Of a crate given by its address whose file has no text here: refused, typed, naming the
+    // crate and the file, before any parse.
+    crate::nameres::frozen::pages::demand_text(db, module.krate(db), id.file_id);
     if let HirFileId::FileId(file) = id.file_id {
         let outline = file_outline(db, file);
         if let Some(ptr) = outline.ast_id_map.try_get_erased(id.value.erase()) {

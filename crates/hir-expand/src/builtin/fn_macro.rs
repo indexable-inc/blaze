@@ -132,7 +132,7 @@ impl EagerExpander {
                 args::string(&var, "expected string literal").ok()
             }
             EagerExpander::OptionEnv => {
-                let call = call_span(db, arg_id, tt.top_subtree().delimiter.open);
+                let call = || call_span(db, arg_id, tt.top_subtree().delimiter.open);
                 args::single_string(db, tt, "option_env!", call).value.map(|(key, _)| key)
             }
             _ => None,
@@ -1327,7 +1327,9 @@ fn include_path(
     tt: &tt::TopSubtree,
     name: &str,
 ) -> ExpandResult<Option<(Symbol, Span)>> {
-    let call = call_span(db, id, tt.top_subtree().delimiter.open);
+    // The call's span reads its file's syntax: asked only for an error, so a crate given by its
+    // pages resolves a well-formed `include!` from its tokens without parsing the calling file.
+    let call = || call_span(db, id, tt.top_subtree().delimiter.open);
     args::single_string(db, tt, name, call)
 }
 
@@ -1647,7 +1649,7 @@ fn option_env_expand<'f>(
     tt: &tt::TopSubtree,
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    let call = call_span(db, arg_id, call_site);
+    let call = || call_span(db, arg_id, call_site);
     let ExpandResult { value, err } = args::single_string(db, tt, "option_env!", call);
     let Some((key, span)) = value else {
         let empty =

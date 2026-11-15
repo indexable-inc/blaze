@@ -456,6 +456,29 @@ fn set_innermost(run: *const Run) {
     INNERMOST.with(|cell| cell.set(run));
 }
 
+/// The runs of this task from its root down to `run`, each by kind and key as a cycle's path
+/// names them ([`reenter`]), joined by " -> ": who asked the run a refusal is about. A
+/// recorder's frame runs nothing and is left out; "(the task's root)" where none is below.
+/// For a panic's message alone: it allocates on the global heap.
+#[cold]
+fn asked_through(run: &Run) -> String {
+    let mut names: Vec<String, Global> = Vec::new_in(Global);
+    // SAFETY: an outer run is below on the same stack.
+    let mut at = unsafe { run.outer.as_ref() };
+    while let Some(outer) = at {
+        if !outer.is_recorder() {
+            names.push(outer.name());
+        }
+        // SAFETY: as above.
+        at = unsafe { outer.outer.as_ref() };
+    }
+    if names.is_empty() {
+        return "(the task's root)".to_owned();
+    }
+    names.reverse();
+    names.join(" -> ")
+}
+
 fn innermost<'a>() -> Option<&'a Run> {
     // SAFETY: the innermost run is on this task's stack and outlives this call's use.
     unsafe { innermost_ptr().as_ref() }
@@ -479,9 +502,10 @@ pub(crate) fn note_read_of(memo: &Memo, slot: &Slot) {
     if home.id.is_session() && !slot.id.is_session() {
         panic!(
             "{} is homed at the session arena (its key names no arena) but reads {:?}: give it \
-             a key that names the crate",
+             a key that names the crate; asked through {}",
             run.name(),
-            slot.id
+            slot.id,
+            asked_through(run)
         );
     }
     // The same mistake one level down: an open arena's entries are keyed by inputs no crate
@@ -490,10 +514,11 @@ pub(crate) fn note_read_of(memo: &Memo, slot: &Slot) {
     if home.is_open() && !home.reaches(slot.id) && !slot.is_open() {
         panic!(
             "{} is homed at the open arena {:?} (its key names only inputs no crate owns) but \
-             reads {:?}: give it a key that names the crate",
+             reads {:?}: give it a key that names the crate; asked through {}",
             run.name(),
             home.id,
-            slot.id
+            slot.id,
+            asked_through(run)
         );
     }
     if run.imaged && !home.reaches(slot.id) {

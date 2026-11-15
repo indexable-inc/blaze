@@ -63,6 +63,8 @@ pub fn bound(
             Target::Data(id) => hasher.update(&[2]).id(id),
             Target::Extern(name) => hasher.update(&[3]).part(name.as_bytes()),
             Target::Weak(name) => hasher.update(&[4]).part(name.as_bytes()),
+            // A recipe by its content, whose positions are its datum's relocations.
+            Target::Text(id) => hasher.update(&[6]).id(id),
             Target::Position(_)
             | Target::Coverage(_)
             | Target::Counter(_)
@@ -314,6 +316,7 @@ impl StaticBounds {
                     Target::Data(id) => hasher.update(&[2]).id(id),
                     Target::Extern(name) => hasher.update(&[3]).part(name.as_bytes()),
                     Target::Weak(name) => hasher.update(&[4]).part(name.as_bytes()),
+                    Target::Text(id) => hasher.update(&[8]).id(id),
                     Target::Position(span) => {
                         self.anchors.push(span.anchor);
                         hasher.update(&[5]).id(&span.anchor).update(&span.index.to_le_bytes())

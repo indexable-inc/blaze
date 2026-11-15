@@ -685,3 +685,78 @@ fn a_whole_scope_asked_for_is_seen_by_the_check() {
     let ran = db.executed_in_read_order(|| _ = root.scope(&db).legacy_macros().count());
     assert!(ran.iter().any(|it| it.contains("scope_memo")), "{ran:?}");
 }
+
+/// `lib` re-exports one item of each of its two dependencies, written with them in the order
+/// `deps` names. The dependencies' texts are equal, so nothing but the crate a reference names
+/// tells their items apart (no file content check can catch a swap).
+fn closure_text(deps: &str) -> String {
+    format!(
+        "//- /a/lib.rs crate:a new_source_root:library\npub struct S;\n\
+         //- /b/lib.rs crate:b new_source_root:library\npub struct S;\n\
+         //- /c/lib.rs crate:c new_source_root:library\npub struct S;\n\
+         //- /lib/lib.rs crate:lib deps:{deps} new_source_root:library\n\
+         pub use a::S as First;\npub use b::S as Second;\n"
+    )
+}
+
+/// The crate `lib`'s root's `name` names, in the type namespace, and the crate it is of.
+fn reexported(db: &Db, name: &str) -> (Option<crate::ModuleDefId>, Option<Crate>) {
+    use crate::HasModule;
+    let def_map = crate_def_map(db, crate_named(db, "lib"));
+    let found = def_map.name_in_module(db, def_map.root, &plain(name)).take_types();
+    let krate = match found {
+        Some(crate::ModuleDefId::AdtId(it)) => Some(it.krate(db)),
+        _ => None,
+    };
+    (found, krate)
+}
+
+/// The invariant (rule 21): pages name every crate of their closure by its item key
+/// (`Crate::item_key`), so a database whose dependencies are of another order reads the same
+/// crates from them: `lib`'s pages written with `deps:a,b` and read where `lib` has
+/// `deps:b,a` re-export `a::A` and `b::B`, as the crate resolved there from source does. One
+/// whose closure lacks a crate the pages name (`deps:a,c`, no `b`) is the typed refusal
+/// (`Unreadable`, kind [`super::CLOSURE`]) naming `b`, never another crate's item.
+///
+/// The planted control: with the keys not read (`POSITIONAL`, crates taken by their index in
+/// this database's walk, as layout 3 took them), the reordered read decodes `First` as an item
+/// of `b`, so the check is known to bite.
+#[test]
+fn pages_name_their_closure_by_key_so_a_reordered_closure_reads_the_same_crates() {
+    let pages = written(&closure_text("a,b"), &["lib"]).remove(0).1;
+    let reordered = closure_text("b,a");
+    let fresh = fixture::db(&reordered).into_db();
+    let (want_first, want_second) = (reexported(&fresh, "First"), reexported(&fresh, "Second"));
+    assert_eq!(want_first.1, Some(crate_named(&fresh, "a")), "premise: `First` is `a`'s from source");
+
+    let db = paged(&reordered, &[("lib", Counting::new(pages.clone()))]);
+    let (first, second) = (reexported(&db, "First"), reexported(&db, "Second"));
+    assert_eq!(first.1, Some(crate_named(&db, "a")), "`First`, read from pages written with `deps:a,b`");
+    assert_eq!(second.1, Some(crate_named(&db, "b")), "`Second`, read so");
+    assert_eq!((first.0.is_some(), second.0.is_some()), (want_first.0.is_some(), want_second.0.is_some()));
+
+    // A closure without `b`: refused, typed, naming it.
+    let lacking = paged(&closure_text("a,c"), &[("lib", Counting::new(pages.clone()))]);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| _ = reexported(&lacking, "First")));
+    let Err(payload) = caught else {
+        panic!("pages naming `b` read in a database whose `lib` has no `b`")
+    };
+    let Some(stop) = super::super::Unreadable::of_payload(&*payload) else {
+        panic!("the refusal unwound with another payload than `Unreadable`")
+    };
+    assert_eq!((stop.krate, stop.kind), (crate_named(&lacking, "lib"), super::CLOSURE));
+    assert!(stop.why.contains("`b`"), "{}", stop.why);
+
+    // The planted control: crates by index, keys unread.
+    super::POSITIONAL.with(|it| it.set(true));
+    let planted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let db = paged(&reordered, &[("lib", Counting::new(pages))]);
+        let first = reexported(&db, "First");
+        (first.1, crate_named(&db, "b"))
+    }));
+    super::POSITIONAL.with(|it| it.set(false));
+    let Ok((krate, b)) = planted else {
+        panic!("planted: the read by index failed outright, so it shows no silent swap")
+    };
+    assert_eq!(krate, Some(b), "planted: `First` read by index is not `b`'s, so the test does not bite");
+}

@@ -498,6 +498,47 @@ impl Elf {
         self.last.as_ref().map(reset::lock)
     }
 
+    /// The kept tables' part of a kept state: the tables whose bytes a patch makes otherwise
+    /// than a build whole would, so history: `.rela.dyn`'s slots ([`dynamic::KeptRela::keep`])
+    /// and the symbol table's places ([`image::KeptSymtab::keep`]). The others are made whole
+    /// by the first link after an open, as a patch would make them.
+    pub(crate) fn keep_tables<A: std::alloc::Allocator>(&self, of: u64, out: &mut crate::keep::Out<A>) {
+        match self.last() {
+            Some(last) => {
+                last.rela.keep(of, out);
+                last.symtab.keep(of, out);
+            }
+            None => {
+                out.bool(false);
+                out.bool(false);
+            }
+        }
+    }
+
+    /// Puts back what [`Elf::keep_tables`] kept, as of synthesis `synthesis`, over the opened
+    /// `state`'s `.rela.dyn` region and its file's tail part (the tables' bytes, not kept
+    /// twice); a table kept for an output that keeps none is refused. Whether any was kept.
+    pub(crate) fn open_tables(
+        &self,
+        input: &mut crate::keep::In<'_>,
+        synthesis: u64,
+        state: &crate::state::State,
+    ) -> Result<bool, crate::keep::Bad> {
+        let region = state.space_of(&crate::model::Class::Synthetic(RELA_DYN)).map(|at| &state.spaces[at].bytes);
+        let rela = dynamic::KeptRela::open(input, synthesis, region)?;
+        let symtab = image::KeptSymtab::open(input, synthesis, &state.parts)?;
+        let held = !rela.is_empty() || !symtab.is_empty();
+        match self.last() {
+            Some(mut last) => {
+                last.rela = rela;
+                last.symtab = symtab;
+                Ok(held)
+            }
+            None if !held => Ok(false),
+            None => Err(crate::keep::Bad::What("a `.rela.dyn` table or symbol table kept for an output that keeps none")),
+        }
+    }
+
     /// The program headers the headers have room for: a dev executable's reservations add
     /// theirs, so every other image keeps the layout it had.
     pub(crate) fn phdrs(&self) -> u64 {

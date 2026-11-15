@@ -7,7 +7,8 @@
 //! - **Steps.** Inference (`entries::run_infer`), the built MIR of each owner the body's
 //!   lowering lists (`entries::places`, `entries::run_mir`), the borrow check's verdict
 //!   (`hir_ty_borrowck::borrowck`, under the checker `hir_ty_borrowck::checker_name`). Each
-//!   step's trace (`Installed::trace`) is `Kept { facts, answer }` or `Refused(refusal)`; a
+//!   step's trace (`Installed::trace`) is `Kept { facts, scans, answer }` or `Refused(refusal)`
+//!   (`scans` names the query of each whole-table read, told when its fact is refused); a
 //!   refused one fails the task by `Refusal::name` (for a read `fact_of` refused, its query
 //!   kind, `blaze_item_hash::reads::GENERIC_CONST_EVAL` and friends), and a step with no trace
 //!   by `Untraced::what`. The verdict's answer is `gate::encode_verdict`'s bytes, a pass none:
@@ -84,10 +85,10 @@ use base_db::Db;
 use blaze_ids::ContentId;
 use blaze_item_hash::values;
 use blaze_items::{ItemId, ItemKey, Resolved, key, kinds as items};
-use blaze_keyed::{driver::TaskFailed, record::StableId};
+use blaze_keyed::{driver::TaskFailed, kind::Steps, record::StableId};
 use hir_def::{DefWithBodyId, HasModule};
 use hir_ty::{
-    body_store::{Installed, Step, Traced, entries, step_value},
+    body_store::{Classified, Installed, Refusal, Step, Traced, entries, step_value},
     next_solver::goal_store::{FactObject, FactRef},
 };
 
@@ -110,6 +111,10 @@ pub struct Front<'u> {
     /// The body the driver's item id names in `db`: the command's lookup by blaze-unitkey's id.
     // dyn: one lookup per task, supplied by the command, which alone holds both id schemes.
     pub find: &'u (dyn Fn(StableId) -> Option<DefWithBodyId> + Sync),
+    /// Where a refused task tells its lines (rule 19): the command keeps them under the unit
+    /// (`Command::tell`), as `crate::surface::surface_telling`'s. Called on a refusal alone.
+    // dyn: the command's sink, called only where a task fails
+    pub told: &'u (dyn Fn(&str) + Sync),
 }
 
 /// What a body the opened surfaces do not have is refused as.
@@ -148,7 +153,8 @@ fn body_result(kind: blaze_query::QueryKind) -> Option<&'static str> {
 
 impl Front<'_> {
     /// Takes the trace of `step` of `def` under `schema`: its answer as a section, each of its
-    /// facts classified and asked.
+    /// facts classified and asked. `run` is the step's own query, asked again only where a
+    /// read of it was refused ([`Front::tell_readers`]).
     fn take(
         &self,
         def: DefWithBodyId,
@@ -156,13 +162,35 @@ impl Front<'_> {
         schema: blaze_format::SchemaHash,
         asks: &mut Asks<'_>,
         payload: &mut Writer,
+        run: impl FnOnce(),
     ) -> Result<(), TaskFailed> {
         match self.traces.trace(def, step, schema).as_deref() {
             Err(untraced) => Err(TaskFailed::Refused { what: untraced.what() }),
-            Ok(Traced::Refused(refusal)) => Err(TaskFailed::Refused { what: refusal.name() }),
-            Ok(Traced::Kept { facts, answer }) => {
+            Ok(Traced::Refused(refusal)) => {
+                if let Refusal::Read(_) = refusal {
+                    self.tell_readers(def, step, run);
+                }
+                Err(TaskFailed::Refused { what: refusal.name() })
+            }
+            Ok(Traced::Kept { facts, scans, answer }) => {
                 for &fact in facts.iter() {
-                    asks.offer(self.row(def, fact))?;
+                    let row = self.row(def, fact);
+                    // A refused whole-table read names the query that made it (rule 19):
+                    // `TaskFailed::RefusedFact` has no field for it, so the told line carries it.
+                    if let Row::RefusedFact { what, kind, subject } = &row
+                        && let Some((_, query)) = scans.iter().find(|(scan, _)| *scan == fact)
+                    {
+                        tracing::error!(
+                            target: "blaze",
+                            query = *query,
+                            step = ?step,
+                            rule = *what,
+                            kind = *kind,
+                            subject = ?subject,
+                            "body task: the query `{query}` read a whole table, refused by `{what}`"
+                        );
+                    }
+                    asks.offer(row)?;
                 }
                 payload.push(step as u8, schema.0, answer);
                 Ok(())
@@ -186,16 +214,69 @@ impl Front<'_> {
             if absolute.kind == values::kinds::STEP_MIR && self.is_const_fn(&absolute.subject) {
                 return Row::Fact(Export::ConstValue.id(&absolute.subject));
             }
-            return Row::Refused(what);
+            return refused(what, &absolute);
         }
         if absolute.kind == items::HIDDEN_TYPES
             && matches!(key::resolve(db, ItemKey(absolute.subject)), Some(Resolved::Item(ItemId::Alias(_))))
         {
-            return Row::Refused(ALIAS_HIDDEN);
+            return refused(ALIAS_HIDDEN, &absolute);
         }
         match crate::facts::id_of(&absolute) {
             Ok(id) => Row::Fact(id),
-            Err(error) => Row::Refused(error.what),
+            Err(error) => {
+                Row::RefusedFact { what: error.what, kind: error.kind, subject: error.subject }
+            }
+        }
+    }
+
+}
+
+/// `fact` refused by the rule `what`, naming the fact's kind and subject.
+fn refused(what: &'static str, fact: &FactRef) -> Row {
+    Row::RefusedFact { what, kind: fact.kind.0, subject: fact.subject }
+}
+
+impl Front<'_> {
+    /// Tells one line per row of `step` of `def` the classifier refuses (rule 19): the body's
+    /// item by kind and path, the row's kind, the rule, the innermost query that read it and
+    /// its path of asks up to the step's work, and for a row of a file's text or root which
+    /// file (`reads::file_of_row`). `run` is the step's work run again outside its query
+    /// (`entries::rerun_unstored`) under `blaze_memo::record_readers`: the step's query is a
+    /// fact boundary, so asking it again would list that one row and keep its run's rows behind
+    /// it; the work's own reads are named by the work, the rest by the memo hits it asks, whose
+    /// lists still hold what each run read. Only a failing task pays for it (one step run again).
+    fn tell_readers(&self, def: DefWithBodyId, step: Step, run: impl FnOnce()) {
+        use core::fmt::Write as _;
+        let db = self.db;
+        let item = ItemId::of_body(db, def);
+        let Ok(((), readers)) = blaze_memo::record_readers(blaze_memo::Database::memo(db), run) else {
+            // alloc: one line of error text, once per refused task
+            (self.told)(&format!(
+                "{:?} `{}`: its {step:?} step read a row no fact stands for; its readers were not recorded (the snapshot keeps no read lists)",
+                item.kind(),
+                key::path(db, item),
+            ));
+            return;
+        };
+        for (read, reader) in readers.rows.iter() {
+            let Classified::Refused(rule) = blaze_item_hash::reads::fact_of(db, def, step, *read) else { continue };
+            // alloc: one line of error text per refused row, once per refused task
+            let mut line = String::new();
+            _ = write!(
+                line,
+                "{:?} `{}`: its {step:?} step read `{}` ({rule}), read by {reader}",
+                item.kind(),
+                key::path(db, item),
+                read.kind().name(),
+            );
+            if let Some(file) = blaze_item_hash::reads::file_of_row(db, *read) {
+                _ = write!(line, " of `{file}`");
+            }
+            for kind in readers.chain(*reader).skip(1) {
+                _ = write!(line, " <- {}", kind.name());
+            }
+            line.push_str(" <- (the step)");
+            (self.told)(&line);
         }
     }
 
@@ -219,13 +300,19 @@ impl Check for Front<'_> {
         (self.find)(item).ok_or(TaskFailed::Refused { what: NO_BODY })
     }
 
-    fn check(&self, def: DefWithBodyId, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed> {
+    fn check(&self, def: DefWithBodyId, steps: Steps, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed> {
         let db = self.db;
         let schema = entries::run_infer(db, def);
-        self.take(def, Step::Infer, schema, asks, payload)?;
+        self.take(def, Step::Infer, schema, asks, payload, || entries::rerun_unstored(db, def, Step::Infer, entries::Place::BODY))?;
         for place in entries::places(db, def) {
             let schema = entries::run_mir(db, def, place).map_err(|_| TaskFailed::Refused { what: MIR_OWNERS })?;
-            self.take(def, Step::Mir, schema, asks, payload)?;
+            self.take(def, Step::Mir, schema, asks, payload, || entries::rerun_unstored(db, def, Step::Mir, place))?;
+        }
+        // A body made for its MIR alone (a unit no `check` covers): no verdict, so its record
+        // is never taken as checked (`Unserved::UNCHECKED`), and none of the borrow check's
+        // reads is in its shape.
+        if steps == Steps::Mir {
+            return Ok(());
         }
         // `checker_name(db)` is `checker(mode(db))`, the name `borrowck` offers its verdict
         // under: the schema below must be the one the trace was kept at.
@@ -235,7 +322,7 @@ impl Check for Front<'_> {
         // too, its errors in its payload; the gate's refusal is not this task's to raise.
         let _ = hir_ty_borrowck::borrowck(db, def);
         let schema = entries::borrowck_schema(db, def, checker);
-        self.take(def, Step::Borrowck, schema, asks, payload)
+        self.take(def, Step::Borrowck, schema, asks, payload, || _ = hir_ty_borrowck::borrowck(db, def))
     }
 
     fn exports(&self, def: DefWithBodyId, out: &mut Exports) -> Result<(), TaskFailed> {

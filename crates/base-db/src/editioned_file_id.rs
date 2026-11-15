@@ -26,6 +26,49 @@ pub struct EditionedFileId {
     home: Option<FileText>,
 }
 
+/// Why a file's parse was refused: the file has no text in this snapshot (a file of a crate
+/// given by its address whose text was never set). The one place every parse passes refuses
+/// it, typed, naming the file, before anything is asked of it: its id has no home
+/// ([`EditionedFileId`]'s `home`), so a query keyed by it (its parse, whether it is a library
+/// file) would be homed at the session arena and read a crate's arena, an engine panic. hir-def
+/// refuses the same read earlier, naming the crate too (`pages::demand_text`); this is the
+/// backstop for a caller that asks a parse without going through it. A driver fails the one
+/// job that asked with it (rule 20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoText {
+    pub file: FileId,
+    /// The file's path, where its source root names one.
+    pub path: Option<String>,
+}
+
+impl NoText {
+    /// Unwinds with `self` as the payload, logged first.
+    pub fn throw(self) -> ! {
+        tracing::error!(target: "blaze", "{self}");
+        std::panic::panic_any(self)
+    }
+
+    /// The `NoText` a caught panic's payload is, if it is one.
+    // dyn: a caught panic's payload, read once
+    pub fn of_payload(payload: &(dyn std::any::Any + Send)) -> Option<&NoText> {
+        payload.downcast_ref::<NoText>()
+    }
+}
+
+impl std::fmt::Display for NoText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = self.path.as_deref().unwrap_or("a file with no path");
+        write!(
+            f,
+            "base-db: the parse of {path} ({:?}) was asked, and the file has no text in this snapshot \
+             (a file of a crate given by its address whose text was never set)",
+            self.file
+        )
+    }
+}
+
+impl std::error::Error for NoText {}
+
 /// [`EditionedFileId::parse`]: the tree, kept with the arena of the file's text.
 #[blaze_memo::tracked(self_ty = EditionedFileId, returns(ref), owns, mem_tag = Parse)]
 fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
@@ -33,6 +76,11 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     // edition (`span::EditionedFileId::extensions`): a file of a crate that turns one on is
     // another key, and another parse.
     let (file_id, edition) = file.unpack(db);
+    // First, before any query keyed by the file: a file with no text has no home.
+    if file.home(db).is_none() {
+        // alloc: error path
+        NoText { file: file_id, path: db.path_for_file(file_id).map(|it| it.to_string()) }.throw()
+    }
     let (extensions, outline) = (file.extensions(db), file.is_library(db));
     let span = tracing::info_span!("parse_query", function = tracing::field::Empty);
     if !span.is_disabled() {

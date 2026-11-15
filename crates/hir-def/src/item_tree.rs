@@ -238,6 +238,10 @@ fn file_item_tree_query(db: &Db, file_id: HirFileId, krate: Crate) -> Arc<ItemTr
         ),
     )
     .entered();
+    // A file of a crate given by its address with no text here (or another than its pages were
+    // made from): refused, typed, naming the crate and the file, before anything parses it. An
+    // expansion's tree reads its call's file, which the expansion's own lowering demands.
+    crate::nameres::frozen::pages::demand_text(db, krate, file_id);
     match file_id {
         HirFileId::FileId(file) => items::file_item_tree(db, file, krate),
         // alloc: the tree's handle, once an expansion's tree
@@ -393,6 +397,7 @@ pub(crate) fn block_item_tree_query(db: &Db, block: BlockId, krate: Crate) -> It
         .and_then(|owner| body_syntax(db, owner).as_ref())
         .filter(|syntax| syntax.file_id == ast_id.file_id);
     let Some(syntax) = syntax else {
+        crate::nameres::frozen::pages::demand_text(db, krate, ast_id.file_id);
         return lower::Ctx::new(db, ast_id.file_id, krate).lower_block(ast_id.to_view(db));
     };
     let tree = syntax.tree(db);

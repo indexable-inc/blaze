@@ -1035,7 +1035,10 @@ pub fn loaded_crates<'db>(db: &'db Db, krate: Crate) -> &'db [Crate] {
         // rustc loads the injected `std`: its paths say `std`, never the dependency's own
         // name (docs/v2/plan/design/std.md, "The blaze edition: opting in";
         // `hir_def::nameres::named` has the same rule for what a program links).
-        let edition_std = krate.blaze_edition(db).map(|_| span::BlazeEdition::STD);
+        // Through name resolution's boundary: one row of the crate, never its root's text, and a
+        // typed refusal for a crate given by its address whose root has no text here.
+        let edition_std = hir_def::nameres::boundary::blaze_edition(db, krate)
+            .map(|_| span::BlazeEdition::STD);
         let mut unnamed = Vec::new_in(frame);
         unnamed.extend(data.dependencies.iter().filter(|dep| {
             let data = dep.crate_id.data(db);

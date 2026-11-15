@@ -35,6 +35,11 @@ blaze-query.workspace = true
 # What a late read answers (`outside::var_answer`, `outside::file_answer`): the one rule the
 # host's outside table and a task's check of what its expansions saw share.
 blaze-host.workspace = true
+# The spans of the surface task (`surface: ...`): where a unit's surface spends its time.
+tracing.workspace = true
+# Who read a row a body task refused (`record_readers`), told on that failure alone; and
+# `Reads::Kept`, the body tests' database marking item boundaries as the command's does.
+blaze-memo.workspace = true
 
 [dev-dependencies]
 # The seeds of the body task's model tests.

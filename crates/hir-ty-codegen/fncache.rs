@@ -833,7 +833,6 @@ impl<'db> Walk<'db> {
                 | DataRequest::Vtable { .. }
                 | DataRequest::Location(_)
                 | DataRequest::Declaration(_)
-                | DataRequest::FilePath(_)
                 | DataRequest::Text(_) => {}
             }
         }

@@ -19,7 +19,12 @@
 //!   other item row) and its seen row (`record::seen_id`: the digest of its exports and of
 //!   every surface it read), which answers a listing across crates its unit's bodies ask. The
 //!   facts a body makes (a const's value, a hidden type) are no rows here: their makers' records
-//!   hold them.
+//!   hold them. What is here is which body makes them: one maker row per body-bearing
+//!   definition the command names a text id for ([`TextIds`]), its id
+//!   `record::maker_row` of the definition's item key (the subject the made facts about it
+//!   name), its digest that text id. A driver that does not check the crate's bodies finds a
+//!   demanded maker by it (blaze-keyed's `Driver::demand`); no task reads it. Cost: one row
+//!   per body-bearing item on disk, and one pass over the crate's body owners.
 //! - `payload`: a blaze-format buffer of its own, of root [`Sections`], so every section is
 //!   16-aligned in place: [`META`] (the crate's key), [`IMAGE`] (the sealed image as
 //!   `hir_def::deps::write_image` writes it, under the record's address: its lang items and its
@@ -69,7 +74,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::key;
 use blaze_keyed::{
     driver::TaskFailed,
-    front::Universe,
+    front::{Table, Universe},
     kind::{Key, Kind as _, Late, Surface},
     record::{self, Fact, Owner, RecordHead, Section, Sections, Traced},
 };
@@ -137,9 +142,28 @@ pub const UNALIGNED: &str = "a surface task: its own record does not open as a s
 /// crate's own): the host's `outside` table in the universe it hands this unit's task must be
 /// this unit's environment, so the same id answers per asker.
 ///
+/// `text_ids` names each body-bearing definition's text id, for its maker row
+/// ([`exports::collect`]).
+///
 /// Floor: see the module doc. Costs past the floor: the rows sorted once (`r log r`), the
 /// record written once and copied once into aligned memory, and opened once to check it.
-pub fn surface(db: &Db, krate: Crate, key: Key<Surface>, universe: Universe<'_>) -> Result<Aligned, TaskFailed> {
+pub fn surface<T: TextIds>(db: &Db, krate: Crate, key: Key<Surface>, universe: Universe<'_>, text_ids: &T) -> Result<Aligned, TaskFailed> {
+    surface_telling(db, krate, key, universe, text_ids, |_| {})
+}
+
+/// [`surface`], telling `told` one line where the crate's image parts are refused: the
+/// refusal's own text (`hir_def::deps::Refused`'s `Display`, which names the file and the
+/// declaration or call it is about, with its file and line) and, in parentheses, the rule the
+/// task fails by ([`image_refused`]). Nothing is told otherwise. The line is borrowed for the
+/// call alone: a caller that keeps it copies it, as blaze-command's `told` does.
+pub fn surface_telling<T: TextIds>(
+    db: &Db,
+    krate: Crate,
+    key: Key<Surface>,
+    universe: Universe<'_>,
+    text_ids: &T,
+    mut told: impl FnMut(&str),
+) -> Result<Aligned, TaskFailed> {
     let refused = |what| TaskFailed::Refused { what };
     let crate_key = key::crate_key(db, krate);
     let owner = Owner::of_subject(&crate_key);
@@ -147,13 +171,39 @@ pub fn surface(db: &Db, krate: Crate, key: Key<Surface>, universe: Universe<'_>)
         return Err(refused(RESERVED_PREFIX));
     }
 
-    let mut rows = Vec::new_in(Global);
-    exports::collect(db, krate, None, &mut rows)?;
-    let (mut rows, exports) = finish_rows(rows, &crate_key)?;
-
     // The image's parts first: running them runs the expansions whose late reads the shape
-    // asks, and the address is made from the shape.
-    let parts = hir_def::deps::image_parts(db, krate).map_err(|why| refused(image_refused(&why)))?;
+    // asks, and the address is made from the shape. Before the exports, too: a crate refused
+    // an image is refused before its impls, signatures and layouts are collected for rows no
+    // record will hold.
+    // One span each for the image's parts, the rows and their sort, so a profile says which
+    // of the three a slow surface spent its time in (rules 15, 16); `exports::collect` names
+    // its phases inside its own.
+    let parts = {
+        let _span = tracing::info_span!(target: "blaze", "surface: image parts of the crate").entered();
+        hir_def::deps::image_parts(db, krate).map_err(|why| {
+            let rule = image_refused(&why);
+            // alloc: one line of error text, once per refused task
+            told(&format!("{why} ({rule})"));
+            refused(rule)
+        })?
+    };
+
+    let mut rows = Vec::new_in(Global);
+    {
+        let _span = tracing::info_span!(target: "blaze", "surface: rows collected").entered();
+        let mut unvalued = None;
+        let collected = exports::collect(db, krate, None, text_ids, &mut rows, &mut unvalued);
+        if let (Err(_), Some(fact)) = (&collected, unvalued) {
+            told(&facts::unhashed_line(db, krate, &fact));
+        }
+        collected?;
+    }
+    let (mut rows, exports) = {
+        let span = tracing::info_span!(target: "blaze", "surface: rows sorted", rows = rows.len() as u64).entered();
+        let finished = finish_rows(rows, &crate_key)?;
+        span.record("rows", finished.0.len() as u64);
+        finished
+    };
 
     let mut shape = Vec::with_capacity_in(universe.tables.len() + parts.late.len(), Global);
     late_asks(&parts.late, &universe, &mut shape)?;
@@ -189,6 +239,19 @@ pub fn surface(db: &Db, krate: Crate, key: Key<Surface>, universe: Universe<'_>)
     let out = Aligned::copy_from(&bytes);
     view(&out, &filed).map_err(|_| refused(UNALIGNED))?;
     Ok(out)
+}
+
+/// What the surface task asks of the command: the text id (blaze-unitkey's stable id) of a
+/// body-bearing definition of the unit whose surface is being built, or `None` for a body
+/// with no row of its own in the unit's file images (an enum discriminant, a body a macro
+/// expansion made).
+///
+/// A definition with `None` gets no maker row, so a fact its body makes (a discriminant's
+/// value, a macro-made function's hidden type or effects), asked of a unit whose bodies are not
+/// checked, is answered `absent` by the driver, as a fresh build that checks no body of the
+/// unit answers it: such facts are unanswerable there until those bodies get text ids.
+pub trait TextIds {
+    fn text_id(&self, def: hir_def::DefWithBodyId) -> Option<blaze_keyed::record::StableId>;
 }
 
 /// Inserts `row` into `rows` (sorted by id, each once) at its place; an id already there is
@@ -352,6 +415,10 @@ pub enum SurfaceError {
     NoCrate(ContentId),
     /// The image section does not open as an image (`hir_def::deps::ImageError`).
     Image(hir_def::deps::ImageError),
+    /// A table's surface record is of another crate than the table's owner.
+    NotOwner { table: Owner, record: Owner },
+    /// A crate given by its address was refused (`hir_def::deps::give_keyed`).
+    Keyed(hir_def::deps::KeyedError),
 }
 
 impl fmt::Display for SurfaceError {
@@ -363,6 +430,10 @@ impl fmt::Display for SurfaceError {
             SurfaceError::TwoOfOnePrefix(owner) => write!(f, "two surfaces of the crate prefix {:02x?}", owner.0),
             SurfaceError::NoCrate(key) => write!(f, "the surface of crate key {key:?}, which the snapshot has no crate of"),
             SurfaceError::Image(error) => write!(f, "a surface record's image: {error}"),
+            SurfaceError::NotOwner { table, record } => {
+                write!(f, "a table of the crate prefix {:02x?} whose surface record is of the crate prefix {:02x?}", table.0, record.0)
+            }
+            SurfaceError::Keyed(error) => write!(f, "a surface given by its address: {error}"),
         }
     }
 }
@@ -462,6 +533,47 @@ impl PageSource for Part {
     }
 }
 
+/// The proof that a surface record was read at its address in this request: made only from a
+/// [`Table`], which the driver hands a task after `record::check_read` checked the record's
+/// head against the address its key and its shape's answers make (rule verify-once: a record
+/// at its address is fresh by that address). What [`Opened::open_read`] takes, so a crate is
+/// given by its address (its pages trusted as given, no file of it looked up or compared:
+/// `hir_def::deps::give_keyed`) only from such a table; bytes from anywhere else are opened by
+/// [`Opened::open`] and keep the checking give.
+///
+/// Valid for the request whose universe held the table, and no longer: it borrows the table
+/// (`'t`), so neither it nor what is opened with it outlives that universe, and a snapshot it
+/// gave is kept only for tasks of the same universe (`blaze-command`'s pool, by the universe's
+/// digest, which holds every address).
+#[derive(Clone, Copy, Debug)]
+pub struct ReadAt<'t> {
+    at: Key<Surface>,
+    owner: Owner,
+    _table: core::marker::PhantomData<&'t [u8]>,
+}
+
+impl<'t> ReadAt<'t> {
+    /// The proof for `table`'s surface record: its address, read off its head, and its owner.
+    /// Refused where the bytes are not a surface record of this layout, or where the crate
+    /// the record is of is not the table's owner.
+    pub fn of(table: &Table<'t>) -> Result<ReadAt<'t>, SurfaceError> {
+        // The kind and the version checked by `view_unkeyed`; the head, as the driver checked
+        // it, is the address.
+        let view = view_unkeyed(table.surface)?;
+        let owner = Owner::of_subject(&view.meta.crate_key);
+        if owner != table.owner {
+            return Err(SurfaceError::NotOwner { table: table.owner, record: owner });
+        }
+        let root = blaze_format::open::<Traced>(table.surface).map_err(SurfaceError::Format)?;
+        Ok(ReadAt { at: Key::from_id(root.head.key), owner, _table: core::marker::PhantomData })
+    }
+
+    /// The record's address.
+    pub fn at(&self) -> Key<Surface> {
+        self.at
+    }
+}
+
 /// One crate opened from its surface record.
 struct OpenedCrate {
     owner: Owner,
@@ -473,20 +585,53 @@ struct OpenedCrate {
 }
 
 /// The surfaces of a task's universe, opened: what a snapshot's crates are read from.
-pub struct Opened {
+///
+/// Opened by [`Opened::open_read`] (each surface with its [`ReadAt`]) it is keyed: [`Opened::give`]
+/// gives each crate by its address, and `'t` is the request whose tables proved them, so it is
+/// not kept past that request. Opened by [`Opened::open`] (bytes and an address from anywhere)
+/// it is `Opened<'static>` and gives each crate to be checked against its files.
+pub struct Opened<'t> {
     /// Sorted by owner, each once.
     crates: Vec<OpenedCrate, Global>,
+    /// Whether each surface came with its [`ReadAt`].
+    keyed: bool,
+    _read: core::marker::PhantomData<ReadAt<'t>>,
 }
 
-impl Opened {
+impl Opened<'static> {
     /// Opens each surface of `surfaces` (its bytes held where the store keeps them, and the
-    /// address it is filed at). One [`view`] each: O(1) in the records' sizes.
-    pub fn open(surfaces: &[(ImageBuf, Key<Surface>)]) -> Result<Opened, SurfaceError> {
+    /// address it is filed at). One [`view`] each: O(1) in the records' sizes. Its crates are
+    /// given to be checked: [`Opened::open_read`] opens them to be given by their address.
+    pub fn open(surfaces: &[(ImageBuf, Key<Surface>)]) -> Result<Opened<'static>, SurfaceError> {
+        Opened::open_each(surfaces.iter().map(|(holder, at)| (holder, *at, None)), false)
+    }
+}
+
+impl<'t> Opened<'t> {
+    /// Opens each surface of `surfaces` (its bytes held where the store keeps them, and the
+    /// proof it was read at its address in this request), to be given by that address: its
+    /// pages trusted as given, no file of it looked up or compared (`hir_def::deps::give_keyed`).
+    /// One [`view`] each, which checks the bytes' head is that address; refused where the
+    /// crate a record is of is not the one its proof names.
+    pub fn open_read(surfaces: &[(ImageBuf, ReadAt<'t>)]) -> Result<Opened<'t>, SurfaceError> {
+        Opened::open_each(surfaces.iter().map(|(holder, read)| (holder, read.at, Some(read.owner))), true)
+    }
+
+    /// Opens each of `surfaces` (its holder, its address, and the owner its proof names where
+    /// it came with one).
+    fn open_each<'h>(
+        surfaces: impl ExactSizeIterator<Item = (&'h ImageBuf, Key<Surface>, Option<Owner>)>,
+        keyed: bool,
+    ) -> Result<Opened<'t>, SurfaceError> {
         let mut crates = Vec::with_capacity_in(surfaces.len(), Global);
-        for (holder, at) in surfaces {
-            let view = view(holder.bytes(), at)?;
+        for (holder, at, proved) in surfaces {
+            let view = view(holder.bytes(), &at)?;
+            let owner = Owner::of_subject(&view.meta.crate_key);
+            if let Some(table) = proved.filter(|it| *it != owner) {
+                return Err(SurfaceError::NotOwner { table, record: owner });
+            }
             crates.push(OpenedCrate {
-                owner: Owner::of_subject(&view.meta.crate_key),
+                owner,
                 at: at.id(),
                 meta: view.meta,
                 holder: Arc::clone(holder),
@@ -497,15 +642,22 @@ impl Opened {
         if let Some(pair) = crates.windows(2).find(|pair| pair[0].owner == pair[1].owner) {
             return Err(SurfaceError::TwoOfOnePrefix(pair[0].owner));
         }
-        Ok(Opened { crates })
+        Ok(Opened { crates, keyed, _read: core::marker::PhantomData })
     }
 
     /// Gives each opened crate what it is read from, in `edit` (the edit that commits the
-    /// snapshot a task runs in): its image (lang items, signatures, def map pages:
-    /// `hir_def::deps::give_image`) and its impl tables (`hir_ty::method_resolution::frozen::give`),
-    /// each a range of the record in place. `crate_of` names the snapshot's crate of a crate key.
+    /// snapshot a task runs in): its image (lang items, signatures, def map pages) and its impl
+    /// tables (`hir_ty::method_resolution::frozen::give`), each a range of the record in place.
+    /// `crate_of` names the snapshot's crate of a crate key.
     ///
-    /// Floor: three slots a crate, no byte of a section read.
+    /// Opened with [`Opened::open_read`], each crate is given by its address
+    /// (`hir_def::deps::give_keyed`): no file of it needs to be in the snapshot, and a body of it
+    /// demanded with its file absent is a typed refusal naming the crate and the file. Opened
+    /// with [`Opened::open`], each is given to be checked against its files
+    /// (`hir_def::deps::give_image`).
+    ///
+    /// Floor: three slots a crate, no byte of a section read (keyed: the pages' files segment
+    /// read once a crate, to name its files).
     pub fn give(&self, edit: &mut base_db::Edit<'_>, crate_of: impl Fn(&ContentId) -> Option<Crate>) -> Result<(), SurfaceError> {
         use hir_ty::method_resolution::frozen::{self as tables, Tables};
         for opened in &self.crates {
@@ -531,7 +683,14 @@ impl Opened {
                 Some(paged(2, PAGES)),
             )
             .map_err(SurfaceError::Image)?;
-            hir_def::deps::give_image(edit, krate, krate_id, image);
+            if self.keyed {
+                // The proof is spent here: `opened.at` came with a `ReadAt` of this request.
+                #[expect(clippy::disallowed_methods, reason = "the one maker of the keyed give's proof: `opened.at` came with a `ReadAt`, made of a driver-checked `Table`")]
+                let read = hir_def::deps::ReadAtAddress::vouched(opened.at);
+                hir_def::deps::give_keyed(edit, krate, krate_id, image, read).map_err(SurfaceError::Keyed)?;
+            } else {
+                hir_def::deps::give_image(edit, krate, krate_id, image);
+            }
             let tables = Tables { pages: paged(3, TABLES), mode: Mode::Serve };
             let fact = tables::tables_fact(krate_id, &tables);
             tables::give(edit, [(krate, fact, tables)]);

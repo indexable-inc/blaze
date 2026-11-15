@@ -338,6 +338,95 @@ impl std::fmt::Display for Refused {
     }
 }
 
+/// What ends the image of a crate at `why`: `Some(why)`, which the caller returns. Under a
+/// [`census`] (this crate's tests alone) `why` is recorded and `None` comes back, so the walk
+/// goes on to the next refusal: a module it would refuse is read as it was resolved, an
+/// include as no late read. Every refusal of [`image_parts`] and [`store`] goes through here.
+pub(super) fn ends(why: Refused) -> Option<Refused> {
+    #[cfg(test)]
+    let why = census::record(why)?;
+    Some(why)
+}
+
+/// [`ends`] as a walk's step: `Err(why)` ends it, `Ok(())` goes on (under a [`census`]).
+pub(super) fn end(why: Refused) -> Result<(), Refused> {
+    match ends(why) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
+/// Whether a [`census`] is taken on this thread.
+#[cfg(test)]
+pub(super) fn census_taken() -> bool {
+    census::taken()
+}
+
+/// Whether a census is taken on this thread: never, outside this crate's tests.
+#[cfg(not(test))]
+pub(super) fn census_taken() -> bool {
+    false
+}
+
+/// The census of refusals (rule 82): one run of [`image_parts`] over a crate that lists every
+/// refusal in it, where a build stops at the first and a release build finds one a run.
+///
+/// A census, never a way to build: it exists in this crate's test build alone (`cfg(test)`,
+/// so no other crate and no build of blaze can turn it on), and what a run under it makes is
+/// not an image to keep: a refused module is read as it was resolved and a refused include is
+/// left out of the late reads, so the parts it makes are of a crate no key covers.
+#[cfg(test)]
+pub(crate) mod census {
+    use std::{alloc::Global, cell::RefCell};
+
+    use super::Refused;
+
+    std::thread_local! {
+        /// The refusals of the census this thread takes, in the order they were met; `None`
+        /// when it takes none.
+        static TAKEN: RefCell<Option<Vec<Refused, Global>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `run` with the census taken on this thread: what it returns, and every refusal it
+    /// met. A census in a census is refused (a panic: a test's mistake).
+    pub(crate) fn take<T>(run: impl FnOnce() -> T) -> (T, Vec<Refused, Global>) {
+        TAKEN.with(|it| {
+            let mut taken = it.borrow_mut();
+            assert!(taken.is_none(), "a census taken inside another");
+            *taken = Some(Vec::new_in(Global));
+        });
+        // Ends the census however `run` ends, so a panic in one crate's run leaves the next
+        // test's thread with none taken.
+        struct Ends;
+        impl Drop for Ends {
+            fn drop(&mut self) {
+                TAKEN.with(|it| _ = it.borrow_mut().take());
+            }
+        }
+        let ends = Ends;
+        let out = run();
+        let met = TAKEN.with(|it| it.borrow_mut().take()).expect("the census `take` began is still taken");
+        drop(ends);
+        (out, met)
+    }
+
+    /// Records `why` in the census taken on this thread (`None` back), or gives it back where
+    /// none is taken.
+    pub(in crate::deps) fn record(why: Refused) -> Option<Refused> {
+        TAKEN.with(|it| match it.borrow_mut().as_mut() {
+            Some(met) => {
+                met.push(why);
+                None
+            }
+            None => Some(why),
+        })
+    }
+
+    pub(in crate::deps) fn taken() -> bool {
+        TAKEN.with(|it| it.borrow().is_some())
+    }
+}
+
 /// Which crates [`store`] writes of those [`serve`] found no image of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Which {
@@ -964,10 +1053,15 @@ pub fn store(
     // alloc: setup: once per session
     let mut order: Vec<(Crate, ContentId)> = Vec::with_capacity(served.keys.len());
     // Every key is looked up, a hit's too: a serve that names a crate gone is stale whole.
-    // The least such key is the one named, so the error is the same in every run.
+    // The least such key is the one named, so the error is the same in every run. A crate is
+    // gone when the graph no longer lists it: the world keeps a crate's key and slot for its
+    // life (`Crates::set_graph` takes one the graph lacks off the list), so `crate_at` still
+    // finds it, and only the list says a write removed it.
+    // alloc: setup: once per store, one entry a listed crate
+    let listed: HashSet<Crate, Global> = base_db::all_crates(db).iter().copied().collect();
     let mut gone: Option<CrateKey> = None;
     for (&world, &key) in &served.keys {
-        let Some(krate) = db.crate_at(world) else {
+        let Some(krate) = db.crate_at(world).filter(|krate| listed.contains(krate)) else {
             gone = Some(gone.map_or(world, |it| it.min(world)));
             continue;
         };
@@ -1136,9 +1230,10 @@ pub(super) fn image_parts_walking(
     let (parts, walked) = checked_parts(db, krate, &mut calls, nested)?;
     let held: [(Part, &[u8]); Part::ALL.len()] =
         std::array::from_fn(|at| (Part::ALL[at], parts[at].as_bytes()));
-    if let Some(why) = Base::of(db, krate).held_by(&held) {
+    if let Some(why) = Base::of(db, krate).held_by(&held).and_then(ends) {
         return Err(why);
     }
+    // Under a census every one was recorded as it was met (`late::walk`), and this is none.
     if let Some(why) = walked.unasked {
         return Err(why);
     }
@@ -1159,6 +1254,7 @@ fn checked_parts(
     if let Some(why) = refusal(db, krate) {
         return Err(why);
     }
+    // An encoding refused ends the census too: there are no parts to go on with.
     let parts = encode(db, krate, calls)?;
     let walked = super::late::walk(db, krate, calls, nested)?;
     Ok((parts, walked))
@@ -1199,32 +1295,56 @@ fn encode(
 /// (`super::late::walk`).
 pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
     let def_map = crate_def_map(db, krate);
-    if def_map.session_macros {
-        return Some(Refused::SessionMacros);
+    if def_map.session_macros
+        && let Some(why) = ends(Refused::SessionMacros)
+    {
+        return Some(why);
     }
     let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
     for (id, module) in def_map.modules(db) {
         if let Some(file) = module.origin.file_id() {
             let file = file.file_id(db);
             if db.file_source_root(file).source_root_id(db) != root {
+                // Where the module is declared, as a person finds it (rule 19): the file and
+                // line of its `mod`, or of the macro call whose expansion wrote it.
+                let declared = match module.origin.declaration() {
+                    Some(ast) => site(
+                        db,
+                        InFile::new(ast.file_id, ast.to_range(db)).original_node_file_range_rooted(db),
+                    ),
+                    None => "the crate root".to_owned(), // alloc: error text
+                };
+                // A file no source root has was read from disk by its declaration
+                // (`Db::module_source`): the files the crate was given with, which its key
+                // covers, did not reach that declaration.
+                let (path, how) = match db.files().included_source_path(file) {
+                    Some(path) => (
+                        path.to_string(), // alloc: error text
+                        ", read from disk: no file of the crate's source root is there, so the \
+                         declaration is one the files its key covers do not reach (a `mod` a \
+                         macro call wrote, as `cfg_select!` does)",
+                    ),
+                    None => (shown_path(db, file), ", a file of another source root"),
+                };
                 // alloc: why a crate is refused, once per refused crate
                 let what = format!(
-                    "module `{}` of crate {} is the file {}",
+                    "module `{}` of crate {}, declared at {declared}, is the file {path}{how}",
                     module_path(db, id),
                     krate.named(db),
-                    shown_path(db, file),
                 );
-                return Some(Refused::OutsideSourceRoot { what });
+                if let Some(why) = ends(Refused::OutsideSourceRoot { what }) {
+                    return Some(why);
+                }
             }
         }
     }
-    let missing = def_map.diagnostics(db).iter().find_map(|it| match &it.kind {
+    let missing = def_map.diagnostics(db).iter().filter_map(|it| match &it.kind {
         DefDiagnosticKind::UnresolvedModule { ast, candidates } => {
             Some((it.in_module, ast, candidates))
         }
         _ => None,
     });
-    if let Some((parent, ast, candidates)) = missing {
+    for (parent, ast, candidates) in missing {
         let name = match ast.to_node(db).name() {
             Some(name) => name.text().to_string(), // alloc: error text
             None => "_".to_owned(),                // alloc: error text
@@ -1233,16 +1353,22 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
             InFile::new(ast.file_id, ast.to_range(db)).original_node_file_range_rooted(db);
         let anchor = ast.file_id.original_file_respecting_includes(db).file_id(db);
         // alloc: why a crate is refused, once per refused crate
+        // In a snapshot ([`base_db::Db::sealed`]) the crate's files are those its key task
+        // gathered and nothing is read from disk, so a file that is on disk but was not
+        // gathered is missing here too: the gather did not spell it.
         let what = format!(
             "module `{}::{name}` of crate {}, declared at {}, has no file: none of {} (from the \
-             directory of {}) is there",
+             directory of {}) is among the crate's files (the key task's tokens did not spell \
+             this module's file, or it is not there)",
             module_path(db, parent),
             krate.named(db),
             site(db, declared),
             candidates.join(", "),
             shown_path(db, anchor),
         );
-        return Some(Refused::ModuleFileMissing { what });
+        if let Some(why) = ends(Refused::ModuleFileMissing { what }) {
+            return Some(why);
+        }
     }
     None
 }
@@ -1260,6 +1386,15 @@ pub(super) fn call_site(db: &Db, loc: &hir_expand::MacroCallLoc) -> String {
     site(db, loc.kind.original_call_range_with_input(db))
 }
 
+/// Where the item or node `ast` is written: the path of the file it is in (the file of the
+/// macro call that wrote it, where it came from an expansion) and the line it starts on, from
+/// 1, as the image refusals print a place. For a refusal's text, said once at the edge.
+#[blaze::renders_positions]
+pub fn ast_site(db: &Db, ast: hir_expand::ErasedAstId) -> String {
+    let range = hir_expand::InFile::new(ast.file_id, ast.to_range(db));
+    site(db, range.original_node_file_range_rooted(db))
+}
+
 /// Where `range` is: its file's path and the line it starts on, from 1.
 fn site(db: &Db, range: hir_expand::FileRange) -> String {
     let file = range.file_id.file_id(db);
@@ -1270,8 +1405,8 @@ fn site(db: &Db, range: hir_expand::FileRange) -> String {
     format!("{}:{line}", shown_path(db, file))
 }
 
-/// The path of `module` in its crate, as `crate::a::b`.
-fn module_path(db: &Db, module: crate::ModuleId) -> String {
+/// The path of `module` in its crate, as `crate::a::b`: for a refusal's text.
+pub fn module_path(db: &Db, module: crate::ModuleId) -> String {
     // alloc: error text
     let mut names = Vec::new();
     let mut at = Some(module);

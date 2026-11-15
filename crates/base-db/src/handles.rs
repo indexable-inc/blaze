@@ -59,6 +59,18 @@ pub struct RawFile {
     pub(crate) content: InputId,
 }
 
+/// A file of the VFS known by its content alone, with neither text nor bytes in this snapshot:
+/// a file of a crate given by its address (hir-def's `deps::give_keyed`), whose content is the
+/// one the crate's record names it with ([`crate::Edit::set_file_given`]). What
+/// [`crate::Files::file_content`] answers for it, so every reader that finds something by a
+/// file's content (an entry set, a file's index) finds this file's and no other's; its text
+/// is still asked for with [`crate::Files::file_text`], which it has not.
+#[blaze_memo::input(debug)]
+pub struct GivenFile {
+    #[returns(copy)]
+    pub(crate) content: InputId,
+}
+
 /// The source root a file of the VFS is in.
 #[blaze_memo::input(debug)]
 pub struct VfsFileRoot {

@@ -1267,6 +1267,33 @@ impl InferBodyId<'_> {
         }
     }
 
+    /// The environment the body is checked and evaluated in: its generic def's where clauses,
+    /// but for an anonymous constant that may not name its owner's generic parameters (any
+    /// but an array repeat's count), none.
+    ///
+    /// rustc's rule (`generics_of` of an `AnonConst`): a constant of a type, a const argument
+    /// or a where clause under `min_const_generics` (`AnonConstKind::MCG`) has no parent, so
+    /// its `predicates_of` and its `param_env` are empty; only a repeat count
+    /// (`RepeatExprCount`) has its owner's. The solver's view of such a constant has said so
+    /// already (`next_solver::generics::generics_of` gives it no generics,
+    /// `interner::generic_predicates_of` no predicates); this is the same rule for the
+    /// environment. Taking the owner's where clauses instead was a cycle where the constant
+    /// is in one of them: alloc's `impl<From, To> Recyclable<From> for To where &MaybeUninit<To>:
+    /// TransmuteFrom<&MaybeUninit<From>, { Assume::SAFETY }>` normalizes `{ Assume::SAFETY }`
+    /// while building the impl's environment (`lower::trait_environment_query`), whose
+    /// inference (`infer::infer_anon_const_body_query`) asked that environment again. What a
+    /// program sees is rustc's: such a constant names no generic parameter (a use is refused,
+    /// `InferenceContext::allow_using_generic_params`), and a global where clause of its owner
+    /// (`where u32: Copy`, under `trivial_bounds`) is not assumed in its body, as in rustc.
+    pub fn param_env<'db>(self, db: &'db Db) -> next_solver::ParamEnv<'db> {
+        match self {
+            InferBodyId::AnonConstId(id) if !id.loc(db).allow_using_generic_params => {
+                next_solver::ParamEnv::empty()
+            }
+            _ => db.trait_environment(self.generic_def(db)),
+        }
+    }
+
     #[inline]
     pub fn as_function(self) -> Option<FunctionId> {
         match self {

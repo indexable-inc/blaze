@@ -2443,7 +2443,8 @@ fn a_refresh_reads_again_an_included_file_that_moved_on_disk_and_only_it() {
     // The bin's crate of each snapshot: a commit that reads a file again makes its arena again.
     let read = |built: &Built, path: &AbsPathBuf| {
         let db = built.lowered.db();
-        let file = db.files().included_file(db, krate(built, BIN).key(db), path);
+        let disk = db.files().disk().expect("a test database reads the disk");
+        let file = db.files().included_file(disk, db, krate(built, BIN).key(db), path);
         (file.read(db).clone().map(|it| it.to_vec()), file.content(db))
     };
     let (_, still_content) = read(&built, &still);

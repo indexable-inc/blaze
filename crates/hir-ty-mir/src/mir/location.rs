@@ -483,17 +483,16 @@ pub fn location_macro_file(db: &Db, file_id: HirFileId) -> Option<base_db::FileI
     macro_location_of(db, file_id.into(), range).map(|(file, _, _)| file)
 }
 
-/// Every file the code of `owner`'s body names by `file!()`, alone or in a `concat!`, in no
-/// order and maybe twice: what the code generator bakes into the body's data as text, so what
-/// a key of its compiled code that leaves out where the body is written must hold
-/// (docs/v2/plan/design/name-free-identity.md). Empty, reading no source map, for a body that
-/// calls neither macro.
+/// Every file the code of `owner`'s body names by `file!()` in a `concat!`, in no order and
+/// maybe twice: what the code generator bakes into the body's data as text, so what a key of
+/// its compiled code that leaves out where the body is written must hold
+/// (docs/v2/plan/design/name-free-identity.md). A `file!()` alone is not among them: the code
+/// generator makes it the `core::panic::Location` record of where it is written, whose file
+/// the link fills from the span side table (hir-ty-codegen's `builtin_location`), so the code
+/// holds no name. Empty, reading no source map, for a body with no such `concat!`.
 pub fn files_read(db: &Db, owner: DefWithBodyId) -> Vec<base_db::FileId> {
-    // alloc: none for a body without `file!()`, which is nearly every one
+    // alloc: none for a body without a `concat!` of `file!()`, which is nearly every one
     let mut files = Vec::new();
-    for &file_id in location_macros(db, owner).values() {
-        files.extend(location_macro_file(db, file_id));
-    }
     for &file_id in located_concats(db, owner).values() {
         let Some(call) = file_id.macro_file().map(|it| it.loc(db).to_node_view(db)) else {
             continue;

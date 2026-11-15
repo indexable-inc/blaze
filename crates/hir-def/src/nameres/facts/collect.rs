@@ -41,7 +41,8 @@ use crate::{
     macro_call_as_call_id,
     nameres::{
         BuiltinShadowMode, DefMap, DefMapCrateData, DiagnosticsByModule, Hygienic, LocalDefMap,
-        MacroSubNs, ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, crate_def_map,
+        MacroSubNs, ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, boundary,
+        crate_def_map,
         diagnostics::{DefDiagnostic, PreludeError},
         enable_builtin_derive_fast_path,
         mod_resolution::ModDir,
@@ -78,7 +79,9 @@ fn deps<'db, 'f>(
     // own `std` has no name in the crate. Everything after this table (the extern prelude,
     // the injected `extern crate std`, the prelude's path) then reads bstd as the crate's
     // std with no rule of its own. A crate of no blaze edition takes neither branch.
-    let blaze_edition = krate.blaze_edition(db);
+    // Through its boundary: a block's collection runs in its reader's list, which must hold a
+    // row of the crate, never the root file the edition is said in.
+    let blaze_edition = boundary::blaze_edition(db, krate);
     let mut deps = Vec::with_capacity_in(data.dependencies.len(), frame);
     for dep in &data.dependencies {
         tracing::debug!("crate dep {:?} -> {:?}", dep.name, dep.crate_id);
@@ -157,7 +160,7 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
     // (`Vec::new_in(cx.frame())`; docs/v2/plan/design/std.md, "Memory is explicit"), so the
     // allocator API needs no `#![feature]` in it: entered as if written, as
     // `#![blaze::simd]` enters its two, and nothing else of the crate changes.
-    if krate.blaze_edition(db).is_some() {
+    if boundary::blaze_edition(db, krate).is_some() {
         for feature in ["allocator_api", "allocator_ext"] {
             crate_data.unstable_features.enable(Symbol::intern(feature));
         }
@@ -1021,7 +1024,7 @@ fn inject_prelude<'db, S: Sink<'db>>(sink: &mut S) {
 
     // blaze: a crate of a blaze edition has its std's prelude of that edition
     // (`bstd::prelude::blaze_2026_11`), by the absolute path, as Rust 2018 on has its own.
-    if let Some(blaze) = def_map.krate().blaze_edition(db)
+    if let Some(blaze) = boundary::blaze_edition(db, def_map.krate())
         && !def_map.data.no_std
     {
         let path = ModPath::from_segments(

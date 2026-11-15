@@ -266,6 +266,7 @@ impl Reach {
                 Some((self.functions.len() + at) as u32)
             }
             Target::Data(_)
+            | Target::Text(_)
             | Target::Extern(_)
             | Target::Weak(_)
             | Target::Position(_)

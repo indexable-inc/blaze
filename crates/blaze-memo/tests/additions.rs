@@ -1395,6 +1395,50 @@ fn a_plain_key_answers_at_the_live_session_across_commits() {
     assert!(why.contains("is dead") && why.contains(&format!("{generation_0:?}")), "{why}");
 }
 
+// A session-homed run that reads a crate's arena names who asked it (2026-11-15).
+
+thread_local! {
+    /// The input in a crate's arena [`session_reader`] reads: planted out of its key, so the
+    /// key names no arena and the run is homed at the session.
+    static PLANTED: Cell<Option<Doc>> = const { Cell::new(None) };
+}
+
+/// Homed at the session (its key is a `u32`) and reads the planted input of a crate's arena:
+/// the mistake the engine refuses.
+#[blaze_memo::tracked(returns(copy))]
+fn session_reader(db: &dyn Db, n: u32) -> u64 {
+    let doc = PLANTED.with(Cell::get).expect("a planted input");
+    doc.text(db).len() as u64 + u64::from(n)
+}
+
+/// The query that asks [`session_reader`]: the refusal must name it.
+#[blaze_memo::tracked(returns(copy))]
+fn session_asker(db: &dyn Db, n: u32) -> u64 {
+    session_reader(db, n + 1)
+}
+
+/// The refusal of a session-homed run reading a crate's arena names the runs that asked it,
+/// root first, by kind and key: the outer query's kind is in the message, after "asked
+/// through". The invariant and the panic are unchanged; this is their message.
+#[test]
+fn a_session_run_reading_a_crate_arena_names_who_asked() {
+    let mut builder = Memo::builder(config(Plant::None));
+    builder.arena(0, Tag::Query);
+    let inputs = builder.arena(1, Tag::Query);
+    let fact = Fact { id: ContentId::of("additions planted", b"id"), digest: ContentId::of("additions planted", b"1") };
+    let doc = Doc::new(&inputs, fact, "planted".to_owned());
+    let db = db(builder.build());
+    PLANTED.with(|it| it.set(Some(doc)));
+    let refused = catch_unwind(AssertUnwindSafe(|| session_asker(&db, 1))).map_err(panic_text);
+    PLANTED.with(|it| it.set(None));
+    let why = refused.expect_err("a session-homed run read a crate's arena unrefused");
+    assert!(why.contains("is homed at the session arena"), "{why}");
+    let (reader, path) = why.split_once("asked through ").unwrap_or_else(|| panic!("no path: {why}"));
+    assert!(reader.contains("session_reader"), "{why}");
+    assert!(path.contains("session_asker"), "the outer query is not named: {why}");
+    assert!(!path.contains("session_reader"), "the path names the reader as its own asker: {why}");
+}
+
 // The run log renders a key only when read (2026-11-14).
 
 /// A key whose `Debug` prints only with a database attached, as hir-ty's solver ids do

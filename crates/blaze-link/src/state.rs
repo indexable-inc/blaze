@@ -13,6 +13,10 @@
 
 #![forbid(unsafe_code)]
 
+mod kept;
+
+pub(crate) use kept::Opening;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -488,6 +492,23 @@ pub(crate) struct RustName {
     pub weak: bool,
 }
 
+/// A composed text's recipe ([`blaze_codegen::text`]) as a later stage reads it again: its
+/// bytes, and each hole's place and the span whose file names it. Kept, so a span table that
+/// renames a file composes the text again with nothing recompiled ([`crate::stage`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Recipe {
+    pub bytes: Vec<u8, Global>,
+    /// In order, each [`blaze_codegen::text::HOLE`] bytes, none overlapping.
+    pub holes: Vec<Hole, Global>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Hole {
+    pub at: u32,
+    pub anchor: IdNo,
+    pub index: u32,
+}
+
 /// Every field is `Copy`, an `Arc`, or a copy-on-write container whose clone is a reference
 /// count.
 #[derive(Clone)] // clone: once per stage, no allocation: `a_clone_allocates_nothing`
@@ -556,6 +577,12 @@ pub(crate) struct State {
     /// [`FunctionInfo::made`] indexes. A few hundred at most (crates by backends); a stage
     /// adds with `Arc::make_mut` only the new ones.
     pub makes: Arc<Vec<Made>>,
+    /// The recipe of every composed text a live [`crate::symbols::SymKey::Text`] record is of,
+    /// by the recipe's id: what a stage composes again when a span table it names changes. An
+    /// entry goes with its record ([`crate::stage::Stage::unmake`]). Few: one per `concat!`
+    /// naming `file!()`, so a stage that changes a span table reads them all.
+    // BTreeMap: walked in order by a span table's change and by `keep`.
+    pub texts: Arc<BTreeMap<IdNo, Recipe>>,
 
     hot: CowVec<Hot>,
     what: CowVec<What>,
@@ -620,6 +647,7 @@ impl State {
             laid_out: false,
             islands: 0,
             makes: Arc::default(),
+            texts: Arc::default(),
             hot: CowVec::default(),
             what: CowVec::default(),
             sort: CowVec::default(),

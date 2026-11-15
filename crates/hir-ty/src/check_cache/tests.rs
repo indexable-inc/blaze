@@ -309,10 +309,12 @@ fn a_body_neither_recorded_nor_left_out_is_an_error() {
         let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
         assert!(message.contains("neither recorded nor left out"), "{message}");
     }
-    // No body of the part is served beside it: the part's item table names `/dep.rs` by the
-    // content it was made from (`served_items`, through hir-def's `frozen` reader), and the
-    // file here has `unwritten` added, so the table refuses the crate whole, naming the file,
-    // where this test once read `area` from it. A body the part has is served over the same
+    // No body of the part is served beside it: the part's item table names `/dep.rs`, dep's
+    // root, by the content it was made from (`served_items`, through hir-def's `frozen`
+    // reader), and the file here has `unwritten` added, so the table refuses the crate whole,
+    // naming the file, where this test once read `area` from it. A files table names a crate's
+    // root by the mark `ROOT`, not its path (a crate given by its address has a root with no
+    // path), so the refusal names it "its root of dep" (`frozen::Dec::checked`). A body the part has is served over the same
     // files in `a_left_out_body_is_listed_with_why_and_not_served` and the tests above.
     let area = DefWithBodyId::FunctionId(function(&db, dep, "area"));
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -320,7 +322,7 @@ fn a_body_neither_recorded_nor_left_out_is_an_error() {
     }))
     .unwrap_err();
     let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
-    assert!(message.contains("/dep.rs") && message.contains("the image was made from"), "{message}");
+    assert!(message.contains("its root of dep") && message.contains("the image was made from"), "{message}");
 }
 
 /// A body the writer left out is listed with why, and reads as not served, not as an error.

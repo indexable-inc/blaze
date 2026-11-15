@@ -60,6 +60,7 @@ blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
+blaze-item-hash.workspace = true
 blaze-mem.workspace = true
 blaze-stencil.workspace = true
 # The CPUs of `-C target-cpu` and their features (target_features::cpus): the toolchain's CPU.

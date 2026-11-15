@@ -1802,10 +1802,13 @@ pub fn macro_call_as_call_id(
     let def = resolver(path, call_site).ok_or(UnresolvedMacro { path: *path })?;
 
     let res = match def.kind {
+        // What the call expands to is the caller's, which read it off the call's node; never
+        // the node again by `ast_id`, which reads the whole file's tree (a call in a body would
+        // list its file's text).
         MacroDefKind::BuiltInEager(..) => expand_eager_macro_input_view(
             db,
             krate,
-            ast_id.to_view(db),
+            Ok(expand_to),
             ast_id,
             def,
             call_site,

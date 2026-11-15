@@ -158,7 +158,7 @@ pub(super) fn kept_by_the_kernel(first: &Session, memory: &Memory) {
     })
     .expect("the first database's item store");
     for ((def, step, schema), ran) in traces {
-        let (DefWithBodyId::FunctionId(f), super::Traced::Kept { facts, answer }) = (def, &*ran) else {
+        let (DefWithBodyId::FunctionId(f), super::Traced::Kept { facts, answer, .. }) = (def, &*ran) else {
             continue;
         };
         if !step.served() {

@@ -115,6 +115,10 @@ fn item_node<'db, N: AstIdNode + Typed>(
     module: ModuleId,
     tree: Tree,
 ) -> N::Of<'db> {
+    // An item of a crate given by its address whose file has no text here is refused, typed,
+    // naming the crate and the file, before any tree of the file is read; one whose text has
+    // no such item is refused where its id is looked up (`hir_expand::files::ptr_in`).
+    demand_text(db, module.krate(db), id.file_id);
     if tree == Tree::Outline
         && let Some(node) = crate::signatures::outline_item(db, id)
             .or_else(|| crate::signatures::body_item(db, id, module))
@@ -124,8 +128,20 @@ fn item_node<'db, N: AstIdNode + Typed>(
     id.to_view(db)
 }
 
-/// The root of `file`, off the tree `tree` says.
-fn file_root(db: &Db, file: EditionedFileId, tree: Tree) -> ast::SourceFile<'_> {
+/// The guard every read of a file's syntax here goes through first
+/// (`nameres::frozen::pages::demand_text`): nothing for a crate built from its files; for a
+/// crate given by its address, a typed refusal ([`crate::nameres::frozen::Unreadable`], naming
+/// the crate and the file) where the file's text is not in this snapshot or is not what the
+/// crate's pages were made from, never a base-db `file_text` panic and never a read of other
+/// text.
+#[inline]
+fn demand_text(db: &Db, krate: Crate, file: HirFileId) {
+    crate::nameres::frozen::pages::demand_text(db, krate, file);
+}
+
+/// The root of `file`, a file of `krate`, off the tree `tree` says.
+fn file_root(db: &Db, krate: Crate, file: EditionedFileId, tree: Tree) -> ast::SourceFile<'_> {
+    demand_text(db, krate, file.into());
     match tree {
         Tree::Outline => crate::signatures::outline_root(db, file),
         Tree::Live => file.parse(db).view(),
@@ -167,6 +183,7 @@ impl FileAttrFlags {
 /// The [`FileAttrFlags`] of `file` for `krate`'s cfg.
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn file_attr_flags(db: &Db, file: EditionedFileId, krate: Crate) -> FileAttrFlags {
+    demand_text(db, krate, file.into());
     blaze_mem::frame::current(|frame| {
         let (root, ast_id_map) = crate::signatures::outline_with_ids(db, file);
         let mut cfg_options = None;
@@ -1448,6 +1465,7 @@ pub(crate) fn crate_supports_no_std(db: &Db, krate: Crate) -> bool {
         }
     }
 
+    crate::nameres::frozen::pages::demand_root_text(db, krate);
     let root_file = krate.root_file_id(db).parse(db).view();
     root_file
         .attrs()
@@ -1470,12 +1488,12 @@ fn attrs_source(
             let krate = def_map.krate();
             let (definition, declaration, crate_attrs) = match def_map.module(db, id).origin {
                 ModuleOrigin::CrateRoot { definition } => {
-                    let definition_source = file_root(db, definition, tree);
+                    let definition_source = file_root(db, krate, definition, tree);
                     let definition = InFile::new(definition.into(), definition_source.into());
                     (definition, None, base_db::applied_crate_attr_files(db, krate))
                 }
                 ModuleOrigin::File { declaration, declaration_tree_id, definition, .. } => {
-                    let definition_source = file_root(db, definition, tree);
+                    let definition_source = file_root(db, krate, definition, tree);
                     let definition = InFile::new(definition.into(), definition_source.into());
                     let declaration = InFile::new(declaration_tree_id.file_id(), declaration);
                     let declaration = declaration.with_value(item_node(db, declaration, id, tree));
@@ -1488,6 +1506,7 @@ fn attrs_source(
                     (definition, None, &[][..])
                 }
                 ModuleOrigin::BlockExpr { block, .. } => {
+                    demand_text(db, krate, block.file_id);
                     let definition = block.to_view(db);
                     (block.with_value(definition.into()), None, &[][..])
                 }
@@ -1735,6 +1754,45 @@ fn for_each_field<'db>(
 pub struct RustcLayoutScalarValidRange {
     pub start: Option<u128>,
     pub end: Option<u128>,
+}
+
+/// As a fact's entry holds it: each bound a tag, then its four 32-bit words, low first.
+impl crate::deps::facts::Value for RustcLayoutScalarValidRange {
+    fn put(&self, _: crate::deps::facts::Ctx, out: &mut crate::deps::facts::Out) -> bool {
+        for bound in [self.start, self.end] {
+            match bound {
+                None => out.u8(0),
+                Some(it) => {
+                    out.u8(1);
+                    for word in 0..4 {
+                        out.u32((it >> (32 * word)) as u32);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn take(
+        _: crate::deps::facts::Ctx,
+        input: &mut crate::deps::facts::In<'_>,
+    ) -> Result<RustcLayoutScalarValidRange, String> {
+        let mut bound = || -> Result<Option<u128>, String> {
+            match input.u8()? {
+                0 => Ok(None),
+                1 => {
+                    let mut it = 0u128;
+                    for word in 0..4 {
+                        it |= u128::from(input.u32()?) << (32 * word);
+                    }
+                    Ok(Some(it))
+                }
+                // alloc: error path
+                tag => Err(format!("a layout scalar bound of tag {tag}")),
+            }
+        };
+        Ok(RustcLayoutScalarValidRange { start: bound()?, end: bound()? })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -2257,12 +2315,59 @@ fn extract_cfgs(result: &mut Vec<CfgExpr, &Frame>, attr: ast::Meta<'_>) -> Contr
 /// (`crate::kinds::generic_params_attr_flags`): the borrow check reads it for a `Drop` impl's
 /// `#[may_dangle]`, and blaze-item-hash answers a row of it by the item's `Attrs` fact, which
 /// hashes these flags (`values::attrs_of`); the signature form does not.
+///
+/// The header fact `generic param flags` of `def` (its header holds every parameter and its
+/// attributes, and a trait's own attributes, which its `Self` takes): of a crate given by its
+/// address (`unsafe impl<#[may_dangle] T> Drop for Vec<T>`, which a dependent's drop check
+/// reads) it is read from its entry, with no text. Its value is each flagged parameter's index
+/// and flags, so a definition whose parameters have no attribute keeps two empty lists.
+/// Floor and cost: `deps::facts`'s, one entry a definition with parameters whose flags are
+/// asked.
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn generic_params_attr_flags(
     db: &Db,
     def: GenericDefId,
 ) -> (ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>) {
+    use crate::deps::facts::{Part, at, fact};
+
+    /// Each flagged parameter's index and flags, in order.
+    type Flagged = Box<[(u32, AttrFlags)]>;
+
+    let (kind, place) = match def {
+        GenericDefId::AdtId(AdtId::StructId(it)) => (1, at(db, it)),
+        GenericDefId::AdtId(AdtId::UnionId(it)) => (2, at(db, it)),
+        GenericDefId::AdtId(AdtId::EnumId(it)) => (3, at(db, it)),
+        GenericDefId::FunctionId(it) => (4, at(db, it)),
+        GenericDefId::StaticId(it) => (6, at(db, it)),
+        GenericDefId::ConstId(it) => (7, at(db, it)),
+        GenericDefId::TraitId(it) => (8, at(db, it)),
+        GenericDefId::TypeAliasId(it) => (9, at(db, it)),
+        GenericDefId::ImplId(it) => (13, at(db, it)),
+    };
+    let (lifetimes, type_and_consts): (Flagged, Flagged) =
+        fact(db, "generic param flags", "", kind, Some(place), Part::Header, || {
+            let (lifetimes, type_and_consts) = generic_params_attr_flags_made(db, def);
+            let flagged = |map: Vec<(u32, AttrFlags)>| map.into_boxed_slice();
+            ((flagged(lifetimes), flagged(type_and_consts)), true)
+        });
+    fn index<T>(raw: u32) -> la_arena::Idx<T> {
+        la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(raw))
+    }
     blaze_mem::frame::current(|frame| {
+        let mut lifetime_ids = Vec::new_in(frame);
+        lifetime_ids.extend(lifetimes.iter().map(|&(at, flags)| (index(at), flags)));
+        let mut type_or_const_ids = Vec::new_in(frame);
+        type_or_const_ids.extend(type_and_consts.iter().map(|&(at, flags)| (index(at), flags)));
+        (exact_arena_map(&lifetime_ids), exact_arena_map(&type_or_const_ids))
+    })
+}
+
+/// [`generic_params_attr_flags`] off `def`'s outline: each flagged parameter's index and flags.
+fn generic_params_attr_flags_made(
+    db: &Db,
+    def: GenericDefId,
+) -> (Vec<(u32, AttrFlags), Global>, Vec<(u32, AttrFlags), Global>) {
+    {
         let mut cfg_options = None;
         let mut cfg_options = || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
 
@@ -2289,16 +2394,19 @@ pub fn generic_params_attr_flags(
             GenericDefId::ConstId(_) | GenericDefId::StaticId(_) => None,
         };
 
-        let mut lifetimes = Vec::new_in(frame);
+        let raw = |id: la_arena::RawIdx| u32::from(id);
+        // alloc: the fact's lists, a pair a flagged parameter; most definitions have none
+        let mut lifetimes = Vec::new_in(Global);
         let lifetime_params = list.into_iter().flat_map(|it| it.lifetime_params());
         for ((lifetime_id, _), lifetime) in generic_params.iter_lt().zip(lifetime_params) {
             let attr_flags = flags_of(lifetime.attrs());
             if !attr_flags.is_empty() {
-                lifetimes.push((lifetime_id, attr_flags));
+                lifetimes.push((raw(lifetime_id.into_raw()), attr_flags));
             }
         }
 
-        let mut type_and_consts = Vec::new_in(frame);
+        // alloc: as above
+        let mut type_and_consts = Vec::new_in(Global);
         let mut ids = generic_params.iter_type_or_consts().map(|(id, _)| id);
         // For traits the first type index is `Self`, the trait itself.
         if let GenericDefId::TraitId(id) = def
@@ -2308,25 +2416,38 @@ pub fn generic_params_attr_flags(
             let node = item_node(db, loc.ast_id(), loc.module(db), Tree::Outline);
             let attr_flags = flags_of(node.attrs());
             if !attr_flags.is_empty() {
-                type_and_consts.push((self_id, attr_flags));
+                type_and_consts.push((raw(self_id.into_raw()), attr_flags));
             }
         }
         let type_or_const_params = list.into_iter().flat_map(|it| it.type_or_const_params());
         for (type_or_const_id, type_or_const) in ids.zip(type_or_const_params) {
             let attr_flags = flags_of(type_or_const.attrs());
             if !attr_flags.is_empty() {
-                type_and_consts.push((type_or_const_id, attr_flags));
+                type_and_consts.push((raw(type_or_const_id.into_raw()), attr_flags));
             }
         }
 
-        (exact_arena_map(&lifetimes), exact_arena_map(&type_and_consts))
-    })
+        (lifetimes, type_and_consts)
+    }
 }
 
 #[blaze_memo::tracked]
 impl AttrFlags {
     #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
     pub fn query(db: &Db, owner: AttrDefId) -> AttrFlags {
+        // Of a crate read from an image's pages, the flags its image holds of the item (no
+        // file of the crate is read).
+        if let Some(flags) = crate::deps::signatures::served_attr_flags(db, owner) {
+            return flags;
+        }
+        // A module's attributes are not one row, so no item entry holds them: its fact, keyed
+        // by its rows (`deps::facts::module_place`), which stability's inheritance reads of each
+        // module above an item with no `#[stable]` of its own.
+        if let AttrDefId::ModuleId(_) = owner {
+            return crate::deps::facts::of_attrs(db, "flags", owner, || {
+                (walked_flags(db, owner), true)
+            });
+        }
         // The item's own entry where one is kept (rule 65), else walked off its syntax and kept.
         crate::nameres::frozen::entries::items::attr_flags(db, owner, || {
             let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
@@ -2913,6 +3034,7 @@ impl AttrFlags {
     #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn doc_html_root_url(db: &Db, krate: Crate) -> Option<SmolStr> {
         let root_file_id = krate.root_file_id(db);
+        crate::nameres::frozen::pages::demand_root_text(db, krate);
         let syntax = root_file_id.parse(db).view();
         let crate_attrs = cli_crate_attrs(db, krate).map(|attr| attr.value);
 
@@ -3077,8 +3199,16 @@ impl AttrFlags {
 
         return rustc_layout_scalar_valid_range(db, owner);
 
+        /// A layout input: the attribute fact `rustc_layout_scalar_valid_range`, so of a crate
+        /// given by its address (`NonNull`, `NonZero` of `core`) it is read from its entry with
+        /// no text. Its value is two integers of the attributes' own tokens, kept always.
         #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
         fn rustc_layout_scalar_valid_range(db: &Db, owner: AdtId) -> RustcLayoutScalarValidRange {
+            let what = "rustc_layout_scalar_valid_range";
+            crate::deps::facts::of_attrs(db, what, owner.into(), || (made(db, owner), true))
+        }
+
+        fn made(db: &Db, owner: AdtId) -> RustcLayoutScalarValidRange {
             let mut result = RustcLayoutScalarValidRange::default();
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -3116,8 +3246,15 @@ impl AttrFlags {
                 .unwrap_or_default(),
         };
 
+        /// The attribute fact `doc alias`: of a crate given by its address, read from its entry
+        /// with no text. Aliases are the attributes' own literals, kept always.
         #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
         fn doc_aliases(db: &Db, owner: AttrDefId) -> Box<[Symbol]> {
+            let made = || (doc_aliases_made(db, owner), true);
+            crate::deps::facts::of_attrs(db, "doc alias", owner, made)
+        }
+
+        fn doc_aliases_made(db: &Db, owner: AttrDefId) -> Box<[Symbol]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
                 collect_attrs::<Infallible>(db, owner, |attr| {
@@ -3644,7 +3781,10 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
             (ast::to_node(ptr, ast::Node::root(tree)).parent(), stop)
         }
         _ => (
-            ast_id.to_view(db).syntax().parent(),
+            {
+                demand_text(db, krate, file_id);
+                ast_id.to_view(db).syntax().parent()
+            },
             outer_block.map(|it| (it.file_id, it.to_range(db))),
         ),
     };

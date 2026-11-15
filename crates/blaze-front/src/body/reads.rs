@@ -39,6 +39,10 @@ pub enum Row {
     Fact(ContentId),
     /// Something no fact stands for, named.
     Refused(&'static str),
+    /// A fact refused: the rule that refused it (`what`), the front end's query kind of the
+    /// fact and the subject (an item, module or crate key), so the failure names the item and
+    /// the kind it is about (`TaskFailed::RefusedFact`), not the rule alone.
+    RefusedFact { what: &'static str, kind: u16, subject: ContentId },
 }
 
 /// The one reader of facts of a body task: answers each ask and keeps it for the shape.
@@ -67,6 +71,9 @@ impl<'u> Asks<'u> {
             Row::Covered => Ok(()),
             Row::Fact(id) => self.ask(&id).map(|_| ()),
             Row::Refused(what) => Err(TaskFailed::Refused { what }),
+            Row::RefusedFact { what, kind, subject } => {
+                Err(TaskFailed::RefusedFact { what, kind, subject })
+            }
         }
     }
 

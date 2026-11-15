@@ -505,7 +505,8 @@ fn a_crate_s_value_tells_apart_why_an_included_file_could_not_be_read() {
     let held = blaze_core::temp::TempDir::for_test("blaze-items-unread-");
     let dir = held.join("included");
     let path = base_db::AbsPathBuf::assert_utf8(dir.clone());
-    let file = db.files().included_file(&db, krate.key(&db), &path);
+    let disk = db.files().disk().expect("a test database reads the disk");
+    let file = db.files().included_file(disk, &db, krate.key(&db), &path);
     assert!(file.read(&db).is_err(), "the file is gone");
     let fact = Fact::Crate(key::crate_key(&db, krate));
     let gone = val(&db, fact);

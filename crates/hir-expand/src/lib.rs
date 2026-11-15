@@ -672,8 +672,137 @@ impl MacroCallId {
     }
 }
 
+/// The argument of the fn-like, not eager, call `loc` at `ast_id`: its token tree off the
+/// call's node and the span map of the file it is written in. What both
+/// [`MacroCallId::call_input`] (a call written in a file) and [`MacroCallId::macro_arg`] (a call
+/// in a macro's expansion) make, so the two cannot differ.
+fn fn_like_arg(db: &Db, loc: &MacroCallLoc, ast_id: AstId<ast::MacroCall>) -> MacroArgResult {
+    use syntax::view::AstNode as _;
+
+    let map = ast_id.file_id.span_map(db);
+    let node = ast_id.to_view(db);
+    let path_range =
+        node.path().map_or_else(|| node.syntax().text_range(), |path| path.syntax().text_range());
+    let span = map.span_for_range(path_range);
+
+    // A refused call's tree is also its expansion: no tokens, not even delimiters.
+    let refused = |why: &str| {
+        (
+            tt::TopSubtree::from_token_trees(
+                tt::Delimiter { open: span, close: span, kind: tt::DelimiterKind::Invisible },
+                tt::TokenTreesView::empty(),
+            ),
+            SyntaxFixupUndoInfo::default(),
+            span,
+            Some(ExpandError::other(span, why)),
+        )
+    };
+
+    let Some(tt) = node.token_tree() else {
+        return refused(
+            "this macro call has no `(..)`, `[..]` or `{..}` argument, so it is not expanded",
+        );
+    };
+    let first = tt.left_delimiter_token().map(|it| it.kind()).unwrap_or(T!['(']);
+    let last = tt.right_delimiter_token().map(|it| it.kind()).unwrap_or(T![.]);
+
+    let mismatched_delimiters =
+        !matches!((first, last), (T!['('], T![')']) | (T!['['], T![']']) | (T!['{'], T!['}']));
+    if mismatched_delimiters {
+        // An unbalanced call is not expanded: matching its tokens can make pathological,
+        // deeply nested code. The expansion is refused, with why.
+        cov_mark::hit!(issue9358_bad_macro_stack_overflow);
+
+        // alloc: an error's message, on the error path
+        let why = match tt.right_delimiter_token() {
+            None => {
+                format!("this macro call's `{}` is never closed, so it is not expanded", first.text())
+            }
+            Some(_) => format!(
+                "this macro call opens with `{}` and closes with `{}`, so it is not expanded",
+                first.text(),
+                last.text()
+            ),
+        };
+        return refused(&why);
+    }
+
+    let mode =
+        if loc.def.is_proc_macro() { DocCommentDesugarMode::ProcMacro } else { DocCommentDesugarMode::Mbe };
+    // A procedural macro is handed a fragment as one group without delimiters, as a
+    // `macro_rules` macro matches it as one token tree (rustc's transcriber wraps it in
+    // `Delimiter::Invisible`, `transcribe_pnr` in `compiler/rustc_expand/src/mbe/transcribe.rs`).
+    let mut tt = match loc.def.kind {
+        MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => {
+            syntax_bridge::call_input(tt.syntax(), MacroRulesArgs(InOrder::new(map)), span, mode)
+        }
+        _ => syntax_bridge::call_input(tt.syntax(), InOrder::new(map), span, mode),
+    };
+    if loc.def.is_proc_macro() {
+        // proc macros expect their inputs without parentheses, MBEs expect it with them included
+        tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
+    }
+    (tt, SyntaxFixupUndoInfo::NONE, span, None)
+}
+
+std::thread_local! {
+    /// The plant of [`planted_file_call_args`]: set, [`MacroCallId::arg`] reads a call written
+    /// in a file through [`MacroCallId::macro_arg`], as before [`MacroCallId::call_input`].
+    static FILE_CALL_ARGS_PLANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test plant, for the tests of other crates that hold a body task to its reads (blaze-front's
+/// body tests): runs `work` with the argument of a call written in a file read as it was before
+/// [`MacroCallId::call_input`] stood in front of it, through [`MacroCallId::macro_arg`], which
+/// is no boundary, so the file's text is a row of whatever asked (rule 23: the control that
+/// the row is gone because of the boundary). Off again when `work` returns or unwinds; this
+/// thread only. Ask it of a fresh database: entries made under it keep what they read.
+pub fn planted_file_call_args<T>(work: impl FnOnce() -> T) -> T {
+    struct Off;
+    impl Drop for Off {
+        fn drop(&mut self) {
+            FILE_CALL_ARGS_PLANT.set(false);
+        }
+    }
+    FILE_CALL_ARGS_PLANT.set(true);
+    let _off = Off;
+    work()
+}
+
 #[blaze_memo::tracked]
 impl MacroCallId {
+    /// The argument of a fn-like, not eager, call written in a file (not in a macro's
+    /// expansion): [`fn_like_arg`]. A fact boundary (`blaze_item_hash::reads` marks it), so the
+    /// file's tree and span map it reads stay behind this one row: a body task's list holds
+    /// the row, covered by the body's key where the call is in the body's own syntax (its key
+    /// hashes the call's tokens, and the spans are relative to the body's anchor), and never a
+    /// row of the file's text, which any edit of the file would move. A call in an expansion
+    /// reads its parent expansion, not a file: [`MacroCallId::macro_arg`]'s.
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
+    pub fn call_input(self, db: &Db) -> MacroArgResult {
+        let loc = self.loc(db);
+        let MacroCallKind::FnLike { ast_id, eager: None, .. } = &loc.kind else {
+            unreachable!("`call_input` is asked of a fn-like call that is not eager alone (`MacroCallId::arg`)");
+        };
+        debug_assert!(!ast_id.file_id.is_macro(), "`call_input` is asked of a call written in a file");
+        fn_like_arg(db, loc, *ast_id)
+    }
+
+    /// The argument of this call as the query that holds it: [`MacroCallId::call_input`] for a
+    /// fn-like, not eager, call written in a file, else [`MacroCallId::macro_arg`]. The one
+    /// router; nothing else asks either.
+    #[expect(deprecated, reason = "the one router of `macro_arg`")]
+    fn arg(self, db: &Db) -> &MacroArgResult {
+        match &self.loc(db).kind {
+            MacroCallKind::FnLike { ast_id, eager: None, .. }
+                if !ast_id.file_id.is_macro() && !FILE_CALL_ARGS_PLANT.get() =>
+            {
+                self.call_input(db)
+            }
+            _ => self.macro_arg(db),
+        }
+    }
+
     /// Implementation of [`HirFileId::parse_or_expand`] for the macro case.
     // FIXME: We should verify that the parsed node is one of the many macro node variants we expect
     // instead of having it be untyped
@@ -733,7 +862,6 @@ impl MacroCallId {
     /// This is not connected to the database so it does not cache the result. However, the inner [macro_arg] query is
     ///
     /// [macro_arg]: Self::macro_arg
-    #[expect(deprecated, reason = "we are `macro_arg_considering_derives`")]
     pub fn macro_arg_considering_derives<'db>(
         self,
         db: &'db Db,
@@ -741,26 +869,31 @@ impl MacroCallId {
     ) -> MacroArg<'db> {
         let (tt, undo_info, span, _) = match kind {
             // Get the macro arg for the derive macro
-            MacroCallKind::Derive { derive_macro_id, .. } => derive_macro_id.macro_arg(db),
+            MacroCallKind::Derive { derive_macro_id, .. } => derive_macro_id.arg(db),
             MacroCallKind::FnLike { eager: Some(_), .. } => {
                 let MacroCallKind::FnLike { eager: Some(eager), .. } = &self.loc(db).kind else {
                     unreachable!("`kind` is this call's own");
                 };
                 return (&eager.arg, &NO_FIXUPS, eager.span);
             }
-            _ => self.macro_arg(db),
+            _ => self.arg(db),
         };
         (tt, undo_info, *span)
     }
 
+    /// The span of the path of a call that is not eager: its argument's (`MacroCallId::arg`).
+    /// What an eager call's input is expanded under (`eager::expand_eager_macro_input_view`).
+    pub fn arg_span(self, db: &Db) -> Span {
+        self.arg(db).2
+    }
+
     /// Why the call is not expanded at all: its argument's delimiters do not pair or it has
     /// none, so [`MacroCallId::macro_arg`] holds an empty tree where the argument would be.
-    #[expect(deprecated, reason = "we are `macro_arg_considering_derives`'s companion")]
     fn arg_refusal(self, db: &Db, kind: &MacroCallKind) -> Option<ExpandError> {
         let refusal = match kind {
-            MacroCallKind::Derive { derive_macro_id, .. } => &derive_macro_id.macro_arg(db).3,
+            MacroCallKind::Derive { derive_macro_id, .. } => &derive_macro_id.arg(db).3,
             MacroCallKind::FnLike { eager: Some(_), .. } => return None,
-            _ => &self.macro_arg(db).3,
+            _ => &self.arg(db).3,
         };
         refusal.clone() // clone: an `Option<ExpandError>`: an `Arc` count, only when refused
     }
@@ -780,92 +913,16 @@ impl MacroCallId {
                 "an eager call's argument is its location's, read by `macro_arg_considering_derives`"
             );
         }
+        // A fn-like call: [`fn_like_arg`], here for a call in a macro's expansion; one written
+        // in a file is [`MacroCallId::call_input`]'s ([`MacroCallId::arg`] routes it).
+        if let MacroCallKind::FnLike { ast_id, .. } = &loc.kind {
+            return fn_like_arg(db, loc, *ast_id);
+        }
 
         let map = loc.kind.file_id().span_map(db);
 
         let (is_derive, censor_item_tree_attr_ids, item_node, span) = match &loc.kind {
-            MacroCallKind::FnLike { ast_id, .. } => {
-                let node = ast_id.to_view(db);
-                let path_range = node
-                    .path()
-                    .map_or_else(|| node.syntax().text_range(), |path| path.syntax().text_range());
-                let span = map.span_for_range(path_range);
-
-                // A refused call's tree is also its expansion: no tokens, not even delimiters.
-                let refused = |why: &str| {
-                    (
-                        tt::TopSubtree::from_token_trees(
-                            tt::Delimiter {
-                                open: span,
-                                close: span,
-                                kind: tt::DelimiterKind::Invisible,
-                            },
-                            tt::TokenTreesView::empty(),
-                        ),
-                        SyntaxFixupUndoInfo::default(),
-                        span,
-                        Some(ExpandError::other(span, why)),
-                    )
-                };
-
-                let Some(tt) = node.token_tree() else {
-                    return refused(
-                        "this macro call has no `(..)`, `[..]` or `{..}` argument, so it is not expanded",
-                    );
-                };
-                let first = tt.left_delimiter_token().map(|it| it.kind()).unwrap_or(T!['(']);
-                let last = tt.right_delimiter_token().map(|it| it.kind()).unwrap_or(T![.]);
-
-                let mismatched_delimiters = !matches!(
-                    (first, last),
-                    (T!['('], T![')']) | (T!['['], T![']']) | (T!['{'], T!['}'])
-                );
-                if mismatched_delimiters {
-                    // An unbalanced call is not expanded: matching its tokens can make
-                    // pathological, deeply nested code. The expansion is refused, with why.
-                    cov_mark::hit!(issue9358_bad_macro_stack_overflow);
-
-                    // alloc: an error's message, on the error path
-                    let why = match tt.right_delimiter_token() {
-                        None => format!(
-                            "this macro call's `{}` is never closed, so it is not expanded",
-                            first.text()
-                        ),
-                        Some(_) => format!(
-                            "this macro call opens with `{}` and closes with `{}`, so it is not expanded",
-                            first.text(),
-                            last.text()
-                        ),
-                    };
-                    return refused(&why);
-                }
-
-                let mode = if loc.def.is_proc_macro() {
-                    DocCommentDesugarMode::ProcMacro
-                } else {
-                    DocCommentDesugarMode::Mbe
-                };
-                // A procedural macro is handed a fragment as one group without delimiters, as a
-                // `macro_rules` macro matches it as one token tree (rustc's transcriber wraps
-                // it in `Delimiter::Invisible`, `transcribe_pnr` in
-                // `compiler/rustc_expand/src/mbe/transcribe.rs`).
-                let mut tt = match loc.def.kind {
-                    MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => {
-                        syntax_bridge::call_input(
-                            tt.syntax(),
-                            MacroRulesArgs(InOrder::new(map)),
-                            span,
-                            mode,
-                        )
-                    }
-                    _ => syntax_bridge::call_input(tt.syntax(), InOrder::new(map), span, mode),
-                };
-                if loc.def.is_proc_macro() {
-                    // proc macros expect their inputs without parentheses, MBEs expect it with them included
-                    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
-                }
-                return (tt, SyntaxFixupUndoInfo::NONE, span, None);
-            }
+            MacroCallKind::FnLike { .. } => unreachable!("a fn-like call returned above"),
             // MacroCallKind::Derive should not be here. As we are getting the argument for the derive macro
             MacroCallKind::Derive { .. } => {
                 unreachable!("`MacroCallId::macro_arg` called with `MacroCallKind::Derive`")

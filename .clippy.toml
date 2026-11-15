@@ -329,4 +329,6 @@ disallowed-methods = [
     { path = "blaze_item_hash::identity::covered_queries", reason = "no read is covered by an identity of the resolved body (end-state/engine.md 4.5): `blaze_item_hash::reads::RULES` says what each read stands for", allow-invalid = true },
     { path = "blaze_item_hash::reads::classify_with", replacement = "blaze_item_hash::reads::classify", reason = "one way a read is stood for: the switch between two is gone (end-state/engine.md 4.5)", allow-invalid = true },
     { path = "hir_def::item_hash::portable_body", reason = "a body is keyed by its item's position-free text before it is lowered (end-state/engine.md 4.5), never by its lowered HIR written anonymously", allow-invalid = true },
+    # The keyed give's proof: a crate's pages are trusted as given (no file looked up or compared) only for a record the driver read at its address in this request.
+    { path = "hir_def::deps::ReadAtAddress::vouched", replacement = "blaze_front::surface::Opened::open_read", reason = "the proof a record was read at its address is made only by `blaze_front::surface::Opened::give` from a `ReadAt`, which only a `blaze_keyed::front::Table` the driver checked makes (and by hir-def's own tests); bytes from anywhere else are given by `hir_def::deps::give_image`, which checks every file", allow-invalid = true },
 ]

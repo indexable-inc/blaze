@@ -3,13 +3,16 @@
 //! step, each the step's answer bytes in the item store's own encoding, which names items by
 //! `BodyFacts::def_key` and holds no `Gid` and no position.
 //!
-//! Layout, little-endian, read in place: a header of [`FORMAT`] (u32) and the section count
-//! (u32); then per section its step (u8), three zero bytes, its length (u32), its schema (32
-//! bytes: the step's answer schema, which for MIR names the owner's place in the body), its
-//! bytes, and zeros to the next multiple of 8. Sections are sorted by (step, schema), so the
-//! bytes depend only on what the steps answered (rule 25).
+//! Layout, little-endian, read in place: a header of [`FORMAT`] (u32), the section count (u32)
+//! and eight zero bytes; then per section its step (u8), three zero bytes, its length (u32),
+//! eight zero bytes, its schema (32 bytes: the step's answer schema, which for MIR names the
+//! owner's place in the body), its bytes, and zeros to the next multiple of 16. Every
+//! section's bytes so start 16-aligned from the payload's start, which the record places
+//! 16-aligned (`blaze_format::Writer::push_buffer`): each answer is a blaze-format buffer a
+//! reader opens where the record is mapped, with no copy ([`crate::body::mir`]). Sections are
+//! sorted by (step, schema), so the bytes depend only on what the steps answered (rule 25).
 //!
-//! Floor: one copy of each step's answer.
+//! Floor: one copy of each step's answer at the write; none at a read.
 
 #![blaze::sans_io]
 
@@ -18,11 +21,17 @@ use std::alloc::Global;
 use blaze_ids::ContentId;
 
 /// The payload's format: a change to the layout or to what a section holds bumps it, and with
-/// it `blaze_keyed::kind::Body`'s version.
-pub const FORMAT: u32 = 1;
+/// it `blaze_keyed::kind::Body`'s version. 2: sections 16-aligned, so read in place; the MIR
+/// answer keeps its body's node counts (`hir_ty::body_store`'s MIR schema 2).
+pub const FORMAT: u32 = 2;
 
-const HEADER: usize = 8;
-const SECTION: usize = 8 + 32;
+/// Where a section's bytes are aligned to, from the payload's start: `blaze_format::ALIGN`.
+pub const ALIGN: usize = blaze_format::ALIGN;
+
+const HEADER: usize = 16;
+const SECTION: usize = 16 + 32;
+
+const _: () = assert!(HEADER.is_multiple_of(ALIGN) && SECTION.is_multiple_of(ALIGN));
 
 /// Writes a payload.
 pub struct Writer {
@@ -54,16 +63,18 @@ impl Writer {
     pub fn finish(mut self) -> Vec<u8, Global> {
         self.sections.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         let len = HEADER
-            + self.sections.iter().map(|(_, _, bytes)| SECTION + bytes.len().next_multiple_of(8)).sum::<usize>();
+            + self.sections.iter().map(|(_, _, bytes)| SECTION + bytes.len().next_multiple_of(ALIGN)).sum::<usize>();
         let mut out = Vec::with_capacity_in(len, Global);
         out.extend_from_slice(&FORMAT.to_le_bytes());
         out.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
         for (step, schema, bytes) in &self.sections {
             out.extend_from_slice(&[*step, 0, 0, 0]);
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&[0; 8]);
             out.extend_from_slice(&schema.0);
             out.extend_from_slice(bytes);
-            out.resize(out.len().next_multiple_of(8), 0);
+            out.resize(out.len().next_multiple_of(ALIGN), 0);
         }
         out
     }
@@ -86,6 +97,40 @@ pub enum PayloadError {
     Unsorted { at: usize },
 }
 
+/// Where the bytes of the section of `step` and `schema` are in `bytes`, a payload: `None` when
+/// it has none. A walk of the section heads alone, no allocation; each head read is checked as
+/// [`sections`] checks it, and the walk stops past `(step, schema)`, as sections are sorted.
+/// Floor: one read of each head before the one found (a body has a handful).
+pub fn find(bytes: &[u8], step: u8, schema: ContentId) -> Result<Option<core::ops::Range<usize>>, PayloadError> {
+    let word = |at: usize| -> Result<u32, PayloadError> {
+        let slice = bytes.get(at..at + 4).ok_or(PayloadError::Short { at })?;
+        Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    };
+    let format = word(0)?;
+    if format != FORMAT {
+        return Err(PayloadError::Format { found: format });
+    }
+    let count = word(4)? as usize;
+    let mut at = HEADER;
+    for _ in 0..count {
+        let head = bytes.get(at..at + SECTION).ok_or(PayloadError::Short { at })?;
+        if head[1..4] != [0, 0, 0] || head[8..16] != [0; 8] {
+            return Err(PayloadError::Padding { at });
+        }
+        let len = word(at + 4)? as usize;
+        let from = at + SECTION;
+        if bytes.len() < from + len {
+            return Err(PayloadError::Short { at: from });
+        }
+        match (head[0], &head[16..48]).cmp(&(step, &schema.0[..])) {
+            core::cmp::Ordering::Less => at = from + len.next_multiple_of(ALIGN),
+            core::cmp::Ordering::Equal => return Ok(Some(from..from + len)),
+            core::cmp::Ordering::Greater => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 /// Every section of `bytes`, checked once: the format, each length, the padding, the order.
 pub fn sections(bytes: &[u8]) -> Result<Vec<Section<'_>, Global>, PayloadError> {
     let word = |at: usize| -> Result<u32, PayloadError> {
@@ -97,19 +142,22 @@ pub fn sections(bytes: &[u8]) -> Result<Vec<Section<'_>, Global>, PayloadError> 
         return Err(PayloadError::Format { found: format });
     }
     let count = word(4)? as usize;
+    if word(8)? != 0 || word(12)? != 0 {
+        return Err(PayloadError::Padding { at: 8 });
+    }
     let mut out: Vec<Section<'_>, Global> = Vec::with_capacity_in(count.min(bytes.len() / SECTION), Global);
     let mut at = HEADER;
     for _ in 0..count {
         let head = bytes.get(at..at + SECTION).ok_or(PayloadError::Short { at })?;
-        if head[1..4] != [0, 0, 0] {
+        if head[1..4] != [0, 0, 0] || head[8..16] != [0; 8] {
             return Err(PayloadError::Padding { at });
         }
         let len = word(at + 4)? as usize;
         let mut schema = [0u8; 32];
-        schema.copy_from_slice(&head[8..40]);
+        schema.copy_from_slice(&head[16..48]);
         let from = at + SECTION;
         let body = bytes.get(from..from + len).ok_or(PayloadError::Short { at: from })?;
-        let end = from + len.next_multiple_of(8);
+        let end = from + len.next_multiple_of(ALIGN);
         let pad = bytes.get(from + len..end).ok_or(PayloadError::Short { at: from + len })?;
         if pad.iter().any(|&b| b != 0) {
             return Err(PayloadError::Padding { at: from + len });

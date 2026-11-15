@@ -31,7 +31,7 @@
 //!     }
 //!     fn surface(&self, unit: u32, key: Key<Surface>, universe: Universe<'_>) -> Result<Aligned, TaskFailed> {
 //!         let at = self.snapshot(unit, universe)?; // `db`, `krate`: deps opened from their surfaces
-//!         blaze_front::surface::surface(at.db(), at.krate(), key, universe)
+//!         blaze_front::surface::surface(at.db(), at.krate(), key, universe, at.text_ids())
 //!     }
 //!     fn body(&self, unit: u32, item: StableId, key: Key<Body>, universe: Universe<'_>) -> Result<Aligned, TaskFailed> {
 //!         let at = self.snapshot(unit, universe)?; // every crate, the unit's own too, opened

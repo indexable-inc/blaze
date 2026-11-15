@@ -11,6 +11,43 @@
 //! literal's text is fed whole. Plain comments and whitespace are in no digest but the file
 //! image's own key, which is its bytes.
 //!
+//! # Stable ids
+//!
+//! A row's stable id is `StableId::of(module::path, kind)` ([`crate::read::stable_of`]): its
+//! file's module path, its in-file path and its kind. The in-file path is the item's name under
+//! the inline modules and containers around it (`a::b`, `{impl ...}::f`), or, for an item with
+//! no name of its own (an impl, a `use`, an extern block, a macro call, a global `asm!`), its
+//! header's tokens in braces (`{impl Clone for S}`, `{call m !}`).
+//!
+//! Rust lets two rows of one file have one (path, kind): siblings of one name or header under
+//! different `#[cfg]`s, one macro called at item level many times (core's `fmt/num.rs` calls
+//! `radix_integers!` six times), equal impls in sibling `#[cfg]` modules. Such rows are told
+//! apart by their order in the file ([`Walk::dedup_paths`]): in each group of equal
+//! (path, kind), the first keeps its path and the `k`-th after it gets `#k`. It is decided on
+//! every row, active or not, before any cfg is applied, so a cfg moves no id.
+//!
+//! Unique by construction: within a group the suffixes differ; a suffixed path ends in `#` and
+//! digits, which no path as written does (a name is an identifier, which never starts with a
+//! digit, and a braced path ends in `}`), so cutting the last `#digits` off a suffixed path
+//! gives back its group's path, and two rows of two groups never meet. (The rule before this
+//! one compared each row with its predecessor after renaming it, so the third of three equal
+//! rows kept the first one's path: `KeyError::TwoItems` on core.)
+//!
+//! What an edit moves: an edit inside an item (its body, its attributes, a macro call's
+//! arguments) moves no id, its own included. An edit to an item's name or header moves its own
+//! id and its associated rows' (they are under its path), and no other row's, except where it
+//! makes the item join or leave a group of equal (path, kind): then the later members of that
+//! group (and theirs) move by one, as does inserting or deleting a member. Every other row of
+//! the file keeps its id, so a body key and a record filed under it stand. Rust's own def
+//! paths number equal siblings the same way (`{impl#3}`).
+//!
+//! # Modules a macro call writes
+//!
+//! An item-level macro call's tokens are read for the `mod`s they spell ([`Walk::call_mods`]):
+//! each is a [`rows::IN_CALL`] mod row at the call's row. The rule, why it is sound and what it
+//! costs are `crate::mods`'s ("Modules a macro call writes"). Only the tokens are read; the
+//! call is neither parsed nor expanded, whatever macro it names.
+//!
 //! Cost: one parse, one walk over the tree's items, and each token hashed at most three times
 //! (in its node's header or an escape's, in its item's own text, scanned once in its body).
 //! Floor: the file's one reparse; [`key`] is all an unchanged file costs.
@@ -38,7 +75,7 @@ use syntax::{
 use crate::{
     ImageError, cfgs, quiet,
     rows::{
-        self, BODY, CALLS, IN_DEFINITION, ImageTables, ItemRow, JOINT, LAYOUT, LateRow, ModRow, NODE, NONE, PathRow,
+        self, BODY, CALLS, IN_DEFINITION, ImageTables, ItemRow, JOINT, LAYOUT, LateRow, MacroRow, ModRow, NODE, NONE, PathRow,
         Span, Tok, kind, section,
     },
 };
@@ -157,6 +194,7 @@ struct Walk<'t, A: Allocator + Clone> {
     lates: Vec<LateRow, A>,
     mods: Vec<ModRow, A>,
     paths: Vec<PathRow, A>,
+    macros: Vec<MacroRow, A>,
     /// Scratch: the late reads of the row being made, cleared by each row.
     late_rows: Vec<LateRow, A>,
     cfg_tmp: Vec<u8, A>,
@@ -240,6 +278,17 @@ fn name_text<'t>(item: view::Node<'t>) -> Option<&'t str> {
     name.first_token().map(|token| strip_raw(token.text()))
 }
 
+/// The name a macro call calls: its path's last segment, `r#` cut.
+fn call_name<'t>(item: view::Node<'t>) -> Option<&'t str> {
+    let path = item.children().find(|child| child.kind() == SyntaxKind::PATH)?;
+    let last = path
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| token.kind() == SyntaxKind::IDENT)
+        .last()?;
+    Some(strip_raw(last.text()))
+}
+
 /// An attribute's path: its first segment and whether that is all of it.
 fn path_head<'t>(path: view::Path<'t>) -> (&'t str, bool) {
     let (mut first, mut whole, mut seen) = ("", true, false);
@@ -270,6 +319,7 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
             lates: Vec::new_in(frame.clone()),
             mods: Vec::new_in(frame.clone()),
             paths: Vec::new_in(frame.clone()),
+            macros: Vec::new_in(frame.clone()),
             late_rows: Vec::new_in(frame.clone()),
             cfg_tmp: Vec::new_in(frame.clone()),
             frame,
@@ -494,6 +544,20 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
         match kind {
             kind::IMPL | kind::TRAIT => self.assoc(item, at, path)?,
             kind::MODULE => self.module(item, at, path, attrs.paths, mod_parent)?,
+            kind::MACRO_CALL => {
+                if let Some(name) = call_name(item) {
+                    let name = self.push_str(name.as_bytes());
+                    self.macros.push(MacroRow { name, row: at, parent: mod_parent, flags: rows::CALLED, pad: 0 });
+                }
+                self.call_mods(item, at, mod_parent, rows::IN_CALL);
+            }
+            kind::MACRO_RULES | kind::MACRO_DEF => {
+                if let Some(name) = name_text(item) {
+                    let name = self.push_str(name.as_bytes());
+                    self.macros.push(MacroRow { name, row: at, parent: NONE, flags: rows::DEFINES, pad: 0 });
+                }
+                self.call_mods(item, at, NONE, rows::IN_MACRO);
+            }
             _ => {}
         }
         Ok(())
@@ -563,6 +627,164 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
             self.items(list, row, path, at)?;
         }
         Ok(())
+    }
+
+    /// The modules an item-level macro call at item row `row` spells in its tokens
+    /// (`crate::mods`, "Modules a macro call writes"): for each `mod <name>;` and
+    /// `mod <name> { .. }` in the call's token tree (nested calls' trees too, being tokens of
+    /// it), a [`rows::IN_CALL`] mod row under the inline modules the tokens open around it, its
+    /// `#[path]`s every `path = "<literal>"` in the attributes right before it (a `cfg_attr`'s
+    /// too), each unconditional. A `mod` followed by anything but a plain name (`mod $name;`, a
+    /// name a macro makes) spells no file and makes no row. No item row is made: the call's own
+    /// row holds all its tokens.
+    ///
+    ///
+    /// With `flag` [`rows::IN_MACRO`], `item` is a `macro_rules!` or `macro` definition at item
+    /// row `row` and `mod_parent` is [`NONE`]: the same rows for its body, each declared where
+    /// the macro is called (`crate::mods::macro_files`), and no nested call is recorded.
+    ///
+    /// Cost: one pass over the call's tokens, which the walk has already lexed; no reparse.
+    fn call_mods(&mut self, item: view::Node<'t>, row: u32, mod_parent: u32, flag: u32) {
+        let plant = call_plant();
+        if plant == CallPlant::Off || (flag == rows::IN_MACRO && plant == CallPlant::NoDefinitions) {
+            return;
+        }
+        let span = self.span(item);
+        let end = (span.at + span.len) as usize;
+        // The `path = ".."` values of the attributes since the last token that was neither an
+        // attribute nor a visibility, as path rows not yet given to a mod row.
+        let mut pending_from = self.paths.len();
+        // The inline modules the tokens opened and have not closed: (bracket depth inside, row).
+        let mut open: Vec<(u32, u32), A> = Vec::new_in(self.frame.clone());
+        let mut depth = 0u32;
+        let mut at = span.at as usize;
+        while at < end {
+            let kind = self.kind_at(at);
+            // An attribute, `#[..]` or `#![..]`: its `path = ".."`s wait for the next `mod`.
+            if kind == SyntaxKind::POUND {
+                let bracket = match self.kind_at_within(at + 1, end) {
+                    Some(SyntaxKind::BANG) => at + 2,
+                    _ => at + 1,
+                };
+                if self.kind_at_within(bracket, end) == Some(SyntaxKind::L_BRACK) {
+                    let close = self.closing(bracket, end);
+                    if plant != CallPlant::NoPath {
+                        self.attr_paths(bracket + 1, close);
+                    }
+                    at = close + 1;
+                    continue;
+                }
+            }
+            // A doc comment is an attribute: it keeps the `#[path]`s before it.
+            if matches!(kind, SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::DOC_COMMENT) {
+                at += 1;
+                continue;
+            }
+            // A visibility before a `mod`: `pub`, `pub(crate)`, `pub(in a::b)`.
+            if kind == SyntaxKind::PUB_KW {
+                at += 1;
+                if self.kind_at_within(at, end) == Some(SyntaxKind::L_PAREN) {
+                    at = self.closing(at, end) + 1;
+                }
+                continue;
+            }
+            let is_mod = kind == SyntaxKind::MOD_KW || (kind == SyntaxKind::IDENT && self.token_text(at) == "mod");
+            if is_mod && self.kind_at_within(at + 1, end) == Some(SyntaxKind::IDENT) {
+                let after = self.kind_at_within(at + 2, end);
+                if matches!(after, Some(SyntaxKind::SEMICOLON | SyntaxKind::L_CURLY)) {
+                    let name = strip_raw(self.token_text(at + 1));
+                    let name = self.push_str(name.as_bytes());
+                    let paths = Span { at: pending_from as u32, len: (self.paths.len() - pending_from) as u32 };
+                    let inline = after == Some(SyntaxKind::L_CURLY);
+                    let decl = self.mods.len() as u32;
+                    self.mods.push(ModRow {
+                        name,
+                        paths,
+                        row,
+                        parent: open.last().map_or(mod_parent, |&(_, decl)| decl),
+                        flags: match inline {
+                            true => flag | rows::INLINE,
+                            false => flag,
+                        },
+                        pad: 0,
+                    });
+                    pending_from = self.paths.len();
+                    at += 3;
+                    if inline {
+                        depth += 1;
+                        open.push((depth, decl));
+                    }
+                    continue;
+                }
+            }
+            // A call nested in a call's tree (`prelude!();` in a `cfg_if!` arm): a call at the
+            // outer call's row, in the inline module the tokens are in. Not in a definition's
+            // body: a call there is made where the definition is called, which the key task does
+            // not follow (the module doc of `crate::mods` says so).
+            let nested_call = flag == rows::IN_CALL
+                && depth > 0
+                && kind == SyntaxKind::IDENT
+                && self.token_text(at) != "macro_rules"
+                && !(at > 0 && self.kind_at(at - 1) == SyntaxKind::DOLLAR)
+                && self.kind_at_within(at + 1, end) == Some(SyntaxKind::BANG)
+                && self.kind_at_within(at + 2, end).is_some_and(is_open);
+            if nested_call {
+                let name = self.push_str(strip_raw(self.token_text(at)).as_bytes());
+                let parent = open.last().map_or(mod_parent, |&(_, decl)| decl);
+                self.macros.push(MacroRow { name, row, parent, flags: rows::CALLED, pad: 0 });
+            }
+            // Any other token ends what the attributes before it were for.
+            self.paths.truncate(pending_from);
+            if is_open(kind) {
+                depth += 1;
+            } else if is_close(kind) {
+                if open.last().is_some_and(|&(inside, _)| inside == depth) {
+                    open.pop();
+                }
+                depth = depth.saturating_sub(1);
+            }
+            at += 1;
+        }
+        self.paths.truncate(pending_from);
+    }
+
+    /// The kind of token `at`, if it is before `end`.
+    fn kind_at_within(&self, at: usize, end: usize) -> Option<SyntaxKind> {
+        (at < end).then(|| self.kind_at(at))
+    }
+
+    /// The index of the token closing the bracket opened at `open`, or the last token before
+    /// `end` when it is not closed there (a parse error: the rest is the attribute's).
+    fn closing(&self, open: usize, end: usize) -> usize {
+        let mut depth = 0u32;
+        for at in open..end {
+            let kind = self.kind_at(at);
+            if is_open(kind) {
+                depth += 1;
+            } else if is_close(kind) {
+                depth -= 1;
+                if depth == 0 {
+                    return at;
+                }
+            }
+        }
+        end - 1
+    }
+
+    /// Every `path = "<literal>"` among the tokens `from..to` (an attribute's inside, at any
+    /// depth: `cfg_attr(unix, path = "a.rs")` too), each a path row with no condition.
+    fn attr_paths(&mut self, from: usize, to: usize) {
+        for at in from..to.saturating_sub(2) {
+            let named = self.kind_at(at) == SyntaxKind::IDENT && self.token_text(at) == "path";
+            if !named || self.kind_at(at + 1) != SyntaxKind::EQ || self.kind_at(at + 2) != SyntaxKind::STRING {
+                continue;
+            }
+            let Some(value) = view::String::cast(self.views[at + 2]).and_then(|string| string.value().ok()) else {
+                continue;
+            };
+            let path = self.push_str(value.as_bytes());
+            self.paths.push(PathRow { path, cond: Span::EMPTY });
+        }
     }
 
     /// The header digest of `item`: its tokens with its bodies cut (its own, and its associated
@@ -770,12 +992,14 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
 
     /// The item's attributes: their flags, its `#[cfg]` into the cfg pool, its `#[path]`s into
     /// the path table. `item_path` names the item in an error.
-    fn attrs(&mut self, item: view::Node<'t>, item_path: Span) -> Result<Attrs, ImageError> {
+    /// Generic in the tree's lifetime: a selecting call's branch is a tree of its own
+    /// ([`Walk::select`]), and everything kept is copied into the pools.
+    fn attrs<'u>(&mut self, item: view::Node<'u>, item_path: Span) -> Result<Attrs, ImageError> {
         let mut flags = 0;
         let mut count = 0u32;
         self.cfg_tmp.clear();
         let paths_at = self.paths.len() as u32;
-        let mut conds: Vec<view::CfgPredicate<'t>, A> = Vec::new_in(self.frame.clone());
+        let mut conds: Vec<view::CfgPredicate<'u>, A> = Vec::new_in(self.frame.clone());
         for child in item.children() {
             if child.kind() != SyntaxKind::ATTR {
                 continue;
@@ -806,10 +1030,10 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
     }
 
     /// One meta of an attribute, under the `cfg_attr` conditions `conds`.
-    fn meta(
+    fn meta<'u>(
         &mut self,
-        meta: view::Meta<'t>,
-        conds: &mut Vec<view::CfgPredicate<'t>, A>,
+        meta: view::Meta<'u>,
+        conds: &mut Vec<view::CfgPredicate<'u>, A>,
         flags: &mut u32,
         count: &mut u32,
         item_path: Span,
@@ -878,7 +1102,7 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
     }
 
     /// The conjunction of `conds` into the cfg pool; empty for none.
-    fn conds(&mut self, conds: &[view::CfgPredicate<'t>]) -> Result<Span, cfgs::CfgRefused> {
+    fn conds<'u>(&mut self, conds: &[view::CfgPredicate<'u>]) -> Result<Span, cfgs::CfgRefused> {
         if conds.is_empty() {
             return Ok(Span::EMPTY);
         }
@@ -892,8 +1116,15 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
         Ok(Span { at, len: self.cfgs.len() as u32 - at })
     }
 
-    /// Gives each repeated (path, kind) a `#n` suffix in file order, so every row's stable id is
-    /// its own.
+    /// Gives the `k`-th row after the first of each group of equal (path, kind) the suffix `#k`,
+    /// in file order, so every row's stable id is its own (the module doc's "Stable ids").
+    ///
+    /// Two passes: the first numbers each row in its group comparing paths as written, the
+    /// second renames. Renaming while comparing compared a row with its predecessor's new name,
+    /// so a group of three gave the third the first's path.
+    ///
+    /// Cost: one sort of the rows by (path, kind, row), O(rows log rows) path comparisons, and
+    /// one copy of each renamed path. Floor: the same; a file without repeats renames nothing.
     fn dedup_paths(&mut self) {
         let mut order: Vec<u32, A> = Vec::with_capacity_in(self.rows.len(), self.frame.clone());
         order.extend(0..self.rows.len() as u32);
@@ -906,6 +1137,13 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
                 .then(a_row.kind.cmp(&b_row.kind))
                 .then(a.cmp(b))
         });
+        let plant = repeat_plant();
+        if plant == RepeatPlant::NoSuffix {
+            return;
+        }
+        // Each row's number in its group, by the paths as written (the plant compares with the
+        // predecessor's new name, the rule this one replaced).
+        let mut number: Vec<u32, A> = Vec::with_capacity_in(order.len(), self.frame.clone());
         let mut run = 0u32;
         for at in 0..order.len() {
             let row = order[at] as usize;
@@ -918,15 +1156,29 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
                 true => run + 1,
                 false => 0,
             };
-            if run > 0 {
-                let old = self.rows[row].path;
-                let start = self.strs.len() as u32;
-                self.strs.extend_from_within(old.range());
-                self.strs.push(b'#');
-                push_decimal(&mut self.strs, run);
-                self.rows[row].path = Span { at: start, len: self.strs.len() as u32 - start };
+            match plant {
+                RepeatPlant::AgainstRenamed if run > 0 => self.rename(row, run),
+                _ => number.push(run),
             }
         }
+        if plant == RepeatPlant::AgainstRenamed {
+            return;
+        }
+        for (at, &run) in number.iter().enumerate() {
+            if run > 0 {
+                self.rename(order[at] as usize, run);
+            }
+        }
+    }
+
+    /// Row `row`'s path, with `#run` after it, as a new run of the string pool.
+    fn rename(&mut self, row: usize, run: u32) {
+        let old = self.rows[row].path;
+        let start = self.strs.len() as u32;
+        self.strs.extend_from_within(old.range());
+        self.strs.push(b'#');
+        push_decimal(&mut self.strs, run);
+        self.rows[row].path = Span { at: start, len: self.strs.len() as u32 - start };
     }
 
     /// The record: every table, the tables' root, the sections, the head.
@@ -941,6 +1193,7 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
         let lates_at = out.push_slice(&self.lates);
         let mods_at = out.push_slice(&self.mods);
         let paths_at = out.push_slice(&self.paths);
+        let macros_at = out.push_slice(&self.macros);
         // The parse record at a multiple of 16, as `syntax::image::read` asks of its bytes.
         out.push_slice::<u128>(&[]);
         let tree_at = out.push_slice(tree);
@@ -956,6 +1209,7 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
             lates: Slice::between(field(offset_of!(ImageTables, lates)), lates_at, self.lates.len()),
             mods: Slice::between(field(offset_of!(ImageTables, mods)), mods_at, self.mods.len()),
             paths: Slice::between(field(offset_of!(ImageTables, paths)), paths_at, self.paths.len()),
+            macros: Slice::between(field(offset_of!(ImageTables, macros)), macros_at, self.macros.len()),
             tree: Slice::between(field(offset_of!(ImageTables, tree)), tree_at, tree.len()),
             file_cfg,
             reading: u32::from(reading),
@@ -975,6 +1229,7 @@ impl<'t, A: Allocator + Clone> Walk<'t, A> {
             section_of::<ModRow>(section::MODS, mods_at, self.mods.len()),
             section_of::<PathRow>(section::PATHS, paths_at, self.paths.len()),
             section_of::<u8>(section::TREE, tree_at, tree.len()),
+            section_of::<MacroRow>(section::MACROS, macros_at, self.macros.len()),
         ];
         let sections_at = out.push_slice(&sections);
         write_root::<FileImage>(out, key, sections_at, sections.len())
@@ -1010,6 +1265,62 @@ fn write_root<K: Kind>(mut out: Writer, key: &Key<K>, sections_at: u64, count: u
     let pushed = out.push(&root);
     debug_assert_eq!(pushed, root_at);
     out.finish(pushed)
+}
+
+/// A bug planted in [`Walk::dedup_paths`] for a test's control: with it two rows of a file get
+/// one stable id, and keying refuses the unit by `KeyError::TwoItems`. Never planted outside a
+/// test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RepeatPlant {
+    None,
+    /// No suffix at all: every repeat keeps its path.
+    NoSuffix,
+    /// Each row compared with its predecessor's new name (the rule before this one).
+    AgainstRenamed,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static REPEAT_PLANT: core::cell::Cell<RepeatPlant> = const { core::cell::Cell::new(RepeatPlant::None) };
+}
+
+#[cfg(test)]
+fn repeat_plant() -> RepeatPlant {
+    REPEAT_PLANT.get()
+}
+
+#[cfg(not(test))]
+fn repeat_plant() -> RepeatPlant {
+    let _ = (RepeatPlant::NoSuffix, RepeatPlant::AgainstRenamed);
+    RepeatPlant::None
+}
+
+/// A planted bug in reading a macro call's modules ([`Walk::call_mods`]), for its test.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CallPlant {
+    None,
+    /// No call's tokens are read: the image of layout 3.
+    Off,
+    /// A `#[path]` in the tokens is not read: the module's file is looked for by its name.
+    NoPath,
+    /// A macro definition's body is not read: a `mod` a `macro_rules!` writes is not found.
+    NoDefinitions,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static CALL_PLANT: core::cell::Cell<CallPlant> = const { core::cell::Cell::new(CallPlant::None) };
+}
+
+#[cfg(test)]
+fn call_plant() -> CallPlant {
+    CALL_PLANT.get()
+}
+
+#[cfg(not(test))]
+fn call_plant() -> CallPlant {
+    let _ = (CallPlant::Off, CallPlant::NoPath, CallPlant::NoDefinitions);
+    CallPlant::None
 }
 
 fn push_decimal<A: Allocator>(out: &mut Vec<u8, A>, value: u32) {

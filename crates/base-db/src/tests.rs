@@ -1430,7 +1430,8 @@ fn an_unreadable_included_file_keeps_its_error() {
     let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
     let missing = dir.join("blaze-base-db-unreadable-include.rs");
     let read = |path: &AbsPathBuf| {
-        let file = db.files().included_file(&db, a, path);
+        let disk = db.files().disk().expect("a test database reads the disk");
+        let file = db.files().included_file(disk, &db, a, path);
         (file.read(&db).clone(), file.content(&db))
     };
     let expected = |path: &AbsPathBuf| std::fs::read(path).unwrap_err().to_string();
@@ -1439,7 +1440,8 @@ fn an_unreadable_included_file_keeps_its_error() {
     assert_eq!(missing_read.unwrap_err().to_string(), expected(&missing));
     assert_eq!(dir_read.unwrap_err().to_string(), expected(&dir));
     assert_ne!(missing_content, dir_content, "a different error is a different input");
-    assert!(db.files().included_is_read(&db, &missing, &Looks::none()), "the same error is what was read");
+    let disk = db.files().disk().expect("a test database reads the disk");
+    assert!(db.files().included_is_read(disk, &db, &missing, &Looks::none()), "the same error is what was read");
 }
 
 /// The invariant: a read of an included file is listed under its own kind
@@ -1458,7 +1460,8 @@ fn an_included_files_read_is_listed_under_its_own_kind() {
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let a = set_graph(&mut db, graph)[&a];
-    let file = db.files().included_file(&db, a, &path);
+    let disk = db.files().disk().expect("a test database reads the disk");
+    let file = db.files().included_file(disk, &db, a, &path);
     let ((), reads) = blaze_memo::record(blaze_memo::Database::memo(&db), || {
         _ = file.content(&db);
     })
@@ -1475,7 +1478,8 @@ fn an_included_files_read_is_listed_under_its_own_kind() {
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
     let a = set_graph(&mut off, graph)[&a];
-    let file = off.files().included_file(&off, a, &path);
+    let disk = off.files().disk().expect("a test database reads the disk");
+    let file = off.files().included_file(disk, &off, a, &path);
     assert!(blaze_memo::record(blaze_memo::Database::memo(&off), || _ = file.content(&off)).is_err());
 }
 
@@ -1892,6 +1896,41 @@ fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns
     assert!(moved.contains(&m));
     assert_eq!(disk_module(&db, db.krate(key)), None);
     assert_eq!(ran(&db, "disk_module"), 1);
+}
+
+/// The invariant (rule 14): a database with no disk ([`Db::sealed`], what a command's snapshot
+/// is) reads no file outside its source roots. The `#[path]` module a database with a disk
+/// reads from disk (the control, the test above, on the same files) is no module file here,
+/// an `include_bytes!` of it finds nothing, and no read is noted.
+#[test]
+fn a_database_with_no_disk_reads_no_module_file_from_disk() {
+    let held = blaze_core::temp::TempDir::for_test("blaze-base-db-sealed-");
+    let dir = AbsPathBuf::assert_utf8(held.path().to_path_buf());
+    let (src, shared) = (dir.join("member/src"), dir.join("shared"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("m.rs"), "pub fn f() {}").unwrap();
+
+    let mut db = Db::for_tests_sealed(no_boundaries);
+    assert!(db.files().disk().is_none(), "a sealed database holds no disk");
+    let lib = FileId::from_raw(0);
+    let mut set = FileSet::default();
+    set.insert(lib, VfsPath::from(src.join("lib.rs")));
+    db.commit_with(|edit| {
+        edit.set_file_text(lib, "")
+            .set_file_source_root(lib, SourceRootId(0))
+            .set_source_root(SourceRootId(0), Arc::new(SourceRoot::new_local(set)));
+    });
+    let mut graph = CrateGraphBuilder::default();
+    let krate = add(&mut graph, lib, CfgOptions::default(), Env::default());
+    let key = set_graph(&mut db, graph)[&krate];
+    let krate = db.krate(key);
+
+    let path = AnchoredPath { anchor: lib, path: "../../shared/m.rs" };
+    assert_eq!(disk_module(&db, krate), None, "no disk: the file on disk is no module file");
+    assert!(db.included_file(krate, path).is_none(), "no disk: nothing an include reads");
+    assert_eq!(db.files().included_paths().count(), 0, "no file outside the VFS was read");
+    assert_eq!(db.files().included_by(&db, key), Vec::new(), "no read is noted as the crate's");
 }
 
 #[test]

@@ -2656,7 +2656,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         lowering_mode: LoweringMode,
         frame: &'f Frame,
     ) -> Self {
-        let trait_env = db.trait_environment(generic_def);
+        // The owner's where clauses, or none for an anonymous constant that may not name its
+        // generic parameters (`InferBodyId::param_env` says why).
+        let trait_env = owner.param_env(db);
         let table = unify::InferenceTable::new(db, trait_env, resolver.krate(), owner);
         let types = crate::next_solver::default_types();
         let target_features = match store_owner {

@@ -6,6 +6,7 @@
 #![feature(allocator_api)]
 
 mod alloc_budget;
+mod anon_const_env;
 mod comptime_calls;
 mod const_check;
 mod const_check_drops;

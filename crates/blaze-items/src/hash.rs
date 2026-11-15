@@ -421,11 +421,16 @@ fn missed(db: &Db, sub: form::SubRef<'_>, item: ItemId) -> Result<(), Unhashable
     }
 }
 
+/// No boundary of the read classifier (`blaze_item_hash::reads`), on purpose: it folds in the
+/// interface hash of every item it names, so no one fact stands for a read of it; what it
+/// reads is classified one level down, fact by fact.
 #[blaze_memo::tracked(returns(copy))]
 fn interface_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Interface, id)
 }
 
+/// No boundary of the read classifier either, for the same reason: the layout hash folds in
+/// the const values it refers to, which the surface's `Layout` row does not cover.
 #[blaze_memo::tracked(returns(copy))]
 fn layout_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Layout, id)

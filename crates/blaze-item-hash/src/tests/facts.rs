@@ -487,8 +487,18 @@ fn items_facts_change_through_value() {
 #[test]
 fn a_fact_of_this_crates_kind_that_names_nothing_has_no_value() {
     let db = db_of("pub struct S;");
+    // A kind of this crate's range that no constant names, found rather than written down: a
+    // literal one is taken the day a kind is added (as `0x180f` was, by `MODULES`), and the
+    // test would then ask a real kind about a missing subject, which is `absent`, not `None`.
+    for kind in kinds::ALL {
+        assert!(kinds::RANGE.contains(&kind.0), "{kind:?} is outside this crate's range");
+    }
+    let free = kinds::RANGE
+        .clone()
+        .find(|code| !kinds::ALL.iter().any(|kind| kind.0 == *code))
+        .expect("this crate's range has a kind no constant names");
     let unused = FactRef {
-        kind: blaze_query::QueryKind(0x180f),
+        kind: blaze_query::QueryKind(free),
         subject: ContentId([1; 32]),
         object: FactObject::None,
     };

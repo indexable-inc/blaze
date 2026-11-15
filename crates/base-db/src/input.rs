@@ -1393,6 +1393,18 @@ impl Crate {
     pub fn transitive_loaded_deps(self, db: &Db) -> &[Crate] {
         transitive_loaded_deps(db, self)
     }
+
+    /// The crate's item key ([`crate_item_key`], each dependency by its own): what names this
+    /// crate in bytes another database reads, the same in every database of the same crate.
+    /// blaze-items' `crate_key` is this.
+    pub fn item_key(self, db: &Db) -> ContentId {
+        item_key(db, self)
+    }
+}
+
+#[blaze_memo::tracked(returns(copy))]
+fn item_key(db: &Db, krate: Crate) -> ContentId {
+    crate_item_key(krate.data(db), krate.extra_data(db), krate.cfg_options(db), &|dep: Crate| item_key(db, dep))
 }
 
 #[blaze_memo::tracked(returns(copy))]

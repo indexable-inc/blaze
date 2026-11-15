@@ -126,12 +126,18 @@ impl AstId<ast::Macro> {
         {
             return def.compile(def_crate.data(db).edition, id.file_id.context_arena());
         }
+        // Made from its file's syntax below, kept or not: a file of a crate given by its
+        // address with no text here is refused first, typed and naming it (`stored::demand_text`).
+        if let HirFileId::FileId(file) = id.file_id {
+            stored::demand_text(db, def_crate, file);
+        }
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let map = id.file_id.span_map(db);
             // What is kept of the definition, written as its trees are made: none of one with
             // no row, whose text its spans could not be read back to (`stored::Place::of`).
-            let mut written = kept.and_then(|(_, file, _)| {
-                stored::Place::of(db, file, id.value.erase(), def_crate).map(stored::Writer::new)
+            let mut written = kept.and_then(|(kept, file, _)| {
+                stored::Place::of(db, kept, file, id.value.erase(), def_crate)
+                    .map(stored::Writer::new)
             });
             let read_cfg = std::cell::Cell::new(false);
 

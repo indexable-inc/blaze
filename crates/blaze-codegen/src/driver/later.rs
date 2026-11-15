@@ -33,9 +33,10 @@ use blaze_mem::{Tag, frame};
 use std::alloc::Global;
 
 use super::{
-    Build, Built, By, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
-    StaticOf, Whence, callee, dev_template_key, error, placed, prepare_node, stopped, stored,
-    stored_function, unfit, unkept_inline, unkept_message,
+    Build, Built, By, DevCompiled, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put,
+    Sorted, StaticId, StaticOf, Whence, callee, dev_template_key, dev_template_of, emit_one,
+    error, placed, prepare_node, stopped, stored, stored_function, unfit, unkept_inline,
+    unkept_message,
 };
 use crate::{
     Backend, CodegenError, CompiledFunction, Instance, InstanceKey, Unit,
@@ -44,7 +45,6 @@ use crate::{
     flight::{self, Asked},
     memo::Memo,
     plan::{Mode, Origin},
-    query::keys,
     settings::Spec,
     template::{Template, own_place},
 };
@@ -235,39 +235,17 @@ fn compiled<B: Prepare>(
         let (function, puts) = memoized(node, key, at, shape, template)?;
         return Ok((function, puts, Made::Memo, shape));
     }
-    let emitted = backend
-        .emit(unit, spec, made, &node.refs, None)
-        .map_err(|why| super::naming(why, &node.described.name))?;
-    if emitted.function.key != key {
-        // alloc: an error
-        return Err(error(key, item, format!("compiled as {:?}", emitted.function.key)));
-    }
+    let emitted = emit_one(backend, unit, spec, made, &node.refs, &node.described.name)?;
     if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied()) {
         return Err(error(key, item, unkept_message(nodes, node, it, &node.built_in, &at)));
     }
+    let DevCompiled { template, side } =
+        dev_template_of(unit, emitted, &node.refs, node.described.anchors.as_ref())?;
     // alloc: the store's values of a compile: its template and its side table
     let mut puts = Vec::with_capacity(2);
-    match (emitted.side, emitted.function.side) {
-        (Some(bytes), Some(id)) => {
-            puts.push(Put { key: keys::side(&id), kind: Kind::Debug, bytes })
-        }
-        (None, None) => {}
-        _ => {
-            return Err(error(
-                key,
-                item,
-                "the compile's side table and the function's record of it disagree",
-            ));
-        }
+    if let Some((side_at, bytes)) = side {
+        puts.push(Put { key: side_at, kind: Kind::Debug, bytes });
     }
-    let template = Template::of_owned_at(
-        emitted.function,
-        &node.refs,
-        &emitted.extra,
-        node.described.anchors.as_ref(),
-    )
-    // alloc: an error
-    .map_err(|why| error(key, item, why.to_string()))?;
     let kept = memo.put(compiled, template);
     puts.push(put_of(at, kept));
     let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), &why);

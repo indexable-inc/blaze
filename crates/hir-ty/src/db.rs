@@ -999,6 +999,13 @@ impl<'db> ClosureKey<'db> {
 /// The closures, `async` blocks and coroutines of a body, in the order of their expressions.
 #[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn closure_exprs<'db>(db: &'db Db, owner: ExpressionStoreOwnerId) -> &'db [ExprId] {
+    // A body given from its record (`body_store::given`) has no store here: its closures are
+    // the list its record keeps, so a closure's key is the one its writer gave it.
+    if let ExpressionStoreOwnerId::Body(def) = owner
+        && crate::body_store::given(db)
+    {
+        return crate::body_store::given_closure_exprs(db, def);
+    }
     blaze_memo::keep_iter(
         blaze_memo::Database::memo(db),
         ExpressionStore::of(db, owner)
@@ -1021,7 +1028,9 @@ impl<'db> InternedClosureId<'db> {
 
     #[inline]
     pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
-        if cfg!(debug_assertions) {
+        // Not where the body is given from its record (`body_store::given`): its text, which
+        // the store is lowered from, is not there; the record's kind code is the check.
+        if cfg!(debug_assertions) && !crate::body_store::given(db) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
             assert!(
@@ -1054,7 +1063,8 @@ impl<'db> InternedCoroutineId<'db> {
 
     #[inline]
     pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
-        if cfg!(debug_assertions) {
+        // As `InternedClosureId::new`'s.
+        if cfg!(debug_assertions) && !crate::body_store::given(db) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
             assert!(
@@ -1087,7 +1097,8 @@ impl<'db> InternedCoroutineClosureId<'db> {
 
     #[inline]
     pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
-        if cfg!(debug_assertions) {
+        // As `InternedClosureId::new`'s.
+        if cfg!(debug_assertions) && !crate::body_store::given(db) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
             assert!(
@@ -1499,6 +1510,12 @@ pub mod kinds {
         RECORD_PARAM_DEFAULT = 0x2514, "record_param_default";
         // A dependency's variant's row of its crate's field types batch.
         BATCHED_FIELD_TYPES = 0x2515, "batched_field_types";
+        // A dependency's impl's rows of its crate's impl batches.
+        BATCHED_IMPL_SELF_TY = 0x2516, "batched_impl_self_ty";
+        BATCHED_IMPL_TRAIT = 0x2517, "batched_impl_trait";
+        BATCHED_IMPL_PREDICATES = 0x2518, "batched_impl_predicates";
+        // A trait's predicates as declared, without the bounds its header implies.
+        DECLARED_TRAIT_PREDICATES = 0x2519, "declared_trait_predicates_of";
 
         // Inputs.
         // 0x25e0..=0x25e4, 0x25e6, 0x25e7 and 0x25e9 were the inputs `FrozenImpls`,

@@ -64,7 +64,7 @@ use std::alloc::Global;
 use triomphe::Arc;
 
 use crate::{
-    Db, FileSourceRootInput, FileText, IncludedFile, InputId, Looks, RawFile, ReadError,
+    Db, FileSourceRootInput, FileText, GivenFile, IncludedFile, InputId, Looks, RawFile, ReadError,
     SourceRoot, SourceRootId, SourceRootInput, VfsFileRoot, VfsRoot, VfsText, content,
     handles::{included_id, note_included},
     named::Named,
@@ -166,6 +166,33 @@ pub struct Files {
     /// How a key that must not say where this database's checkout is writes a path
     /// ([`Port`]): told once a database ([`Files::set_port`]), before any key is asked.
     port: OnceLock<std::sync::Arc<dyn Port>>,
+    /// The one way to the disk for a file outside the VFS ([`Disk`]): `None` in a database
+    /// opened as a snapshot ([`crate::Db::sealed`]), which therefore reads no file from disk.
+    disk: Option<Disk>,
+}
+
+/// Leave to read a file outside the VFS from disk: a module's file no source root has, an
+/// `include!`'s or `include_bytes!`'s file, read again by whoever watches the disk. Every read
+/// of the disk here takes one ([`Files::included_file`], [`Files::included_source`], the
+/// reloads), and only [`Files`] holds one, made with its database: a database made with none
+/// ([`crate::Db::sealed`], what a command's snapshot is) reads nothing from disk, by
+/// construction, and a `mod` or an `include!` whose file is not among its files is the
+/// unresolved module or the include error that names it (rule 14: a snapshot is sans-IO).
+#[derive(Debug)]
+pub struct Disk {
+    _made_by_files: (),
+}
+
+impl Files {
+    /// The files of a database with no [`Disk`]: a snapshot's ([`crate::Db::sealed`]).
+    pub(crate) fn sealed() -> Files {
+        Files { disk: None, ..Files::default() }
+    }
+
+    /// This database's leave to read the disk: `None` in a snapshot ([`crate::Db::sealed`]).
+    pub fn disk(&self) -> Option<&Disk> {
+        self.disk.as_ref()
+    }
 }
 
 /// How a path is written in a key that must not say where a checkout, its build directory or
@@ -491,6 +518,9 @@ pub(crate) struct Writer {
     pub(crate) texts: ByFile<TextEntry>,
     /// Each file of the VFS whose bytes are not UTF-8, while it has no text.
     pub(crate) raws: ByFile<RawEntry>,
+    /// The content each file known by its content alone was given ([`Files::set_file_given`]):
+    /// what [`Files::file_content`] answers while it has neither text nor bytes.
+    pub(crate) given: ByFile<ContentId>,
     /// The module the compiler appends to each crate root that has one
     /// ([`FileText::appended_root_module`]): kept while the file has no text.
     pub(crate) appended: ByFile<&'static str>,
@@ -593,10 +623,11 @@ impl Writer {
 
     /// The content ID `file` has in its source root ([`Files::file_content`]).
     pub(crate) fn content_of(&self, file: FileId) -> ContentId {
-        match (self.texts.get(file), self.raws.get(file)) {
-            (Some(text), _) => text.content,
-            (None, Some(raw)) => raw.content,
-            (None, None) => no_text(),
+        match (self.texts.get(file), self.raws.get(file), self.given.get(file)) {
+            (Some(text), _, _) => text.content,
+            (None, Some(raw), _) => raw.content,
+            (None, None, Some(&given)) => given,
+            (None, None, None) => no_text(),
         }
     }
 
@@ -659,10 +690,11 @@ impl Writer {
     }
 
     /// Each column, for [`Writer::forget`] and [`Writer::rollback`] to go over its undo.
-    fn columns(&mut self) -> [&mut dyn Column; 10] {
+    fn columns(&mut self) -> [&mut dyn Column; 11] {
         [
             &mut self.texts,
             &mut self.raws,
+            &mut self.given,
             &mut self.appended,
             &mut self.file_roots,
             &mut self.in_roots,
@@ -971,6 +1003,9 @@ impl Writer {
                 InputId(raw.content),
             );
             placed.raw(file, input);
+        } else if let Some(&given) = self.given.get(file) {
+            let input = GivenFile::new(inputs, facts::given(file, given), InputId(given));
+            placed.given(file, input);
         }
         if let Some(&root) = self.file_roots.get(file) {
             let input = VfsFileRoot::new(inputs, facts::file_root(file, root), root);
@@ -1104,6 +1139,7 @@ impl Default for Files {
             views: Log::new(1 << 16),
             view: AtomicU32::new(0),
             port: OnceLock::new(),
+            disk: Some(Disk { _made_by_files: () }),
         }
     }
 }
@@ -1146,11 +1182,15 @@ impl Files {
     #[cold]
     #[inline(never)]
     fn no_text(&self, db: &Db, file_id: FileId) -> ! {
-        let why = match row(&db.snap().table.raws, file_id.index()) {
-            Some(_) => {
+        let table = &db.snap().table;
+        let why = match (row(&table.raws, file_id.index()), row(&table.given, file_id.index())) {
+            (Some(_), _) => {
                 "its bytes are not UTF-8, so it has no text (read its content with `file_content`, its bytes with `raw_file`)"
             }
-            None => {
+            (None, Some(_)) => {
+                "it is known by its content alone (a file of a crate given by its address), and its text was never set"
+            }
+            (None, None) => {
                 "it has neither text nor bytes in this snapshot: it was never set, its text was taken away, or it was set after the snapshot's commit"
             }
         };
@@ -1185,8 +1225,14 @@ impl Files {
 
     /// The content ID `file` has in its source root, the one every reader that hashes a file
     /// takes: its text's ([`FileText::content`]); for a file with no text, its bytes'
-    /// ([`IncludedFile::content`] of [`Files::raw_file`]); for one with neither,
-    /// [`FileText::no_text`].
+    /// ([`IncludedFile::content`] of [`Files::raw_file`]); for one known by its content alone,
+    /// the content it was given ([`GivenFile`], [`Files::set_file_given`]); for one with none of
+    /// these, [`FileText::no_text`].
+    ///
+    /// The invariant: two files of a crate given by its address share a content here only where
+    /// the record names them with equal content (or their texts are equal), and none of them is
+    /// [`FileText::no_text`]; so no reader that finds something by a file's content (an entry
+    /// set, a file's index, a macro's tokens) finds one file's under another's.
     pub fn file_content(&self, db: &Db, file: FileId) -> ContentId {
         let table = &db.snap().table;
         if let Some(text) = row(&table.texts, file.index()) {
@@ -1194,6 +1240,9 @@ impl Files {
         }
         if let Some(raw) = row(&table.raws, file.index()) {
             return raw.content(db).id();
+        }
+        if let Some(given) = row(&table.given, file.index()) {
+            return given.content(db).id();
         }
         match self.source_row(file.index()) {
             Some(at) => FileText::Included(at).content(db),
@@ -1514,11 +1563,17 @@ impl Files {
         placed: &mut Placed<'_>,
     ) {
         let writer = self.lock();
-        let len = writer.texts.len().max(writer.raws.len()).max(writer.file_roots.len());
+        let len = writer
+            .texts
+            .len()
+            .max(writer.raws.len())
+            .max(writer.given.len())
+            .max(writer.file_roots.len());
         for at in 0..len as u32 {
             let file = FileId::from_raw(at);
             let has = writer.texts.contains_key(file)
                 || writer.raws.contains_key(file)
+                || writer.given.contains_key(file)
                 || writer.file_roots.contains_key(file);
             if !has || is_attr(file) || writer.crate_attrs.contains_key(file) {
                 continue;
@@ -1743,10 +1798,33 @@ impl Files {
         writer.set_file_root(id, source_root_id);
     }
 
+    /// Has `id` known by `content` alone ([`GivenFile`]): what [`Files::file_content`] answers
+    /// for it while it has neither text nor bytes, which a write of either takes precedence over
+    /// (and a removal of them falls back to). `None` takes it away. Marks the file when it moved.
+    pub(crate) fn set_file_given(&self, id: FileId, content: Option<ContentId>) {
+        frame::task(Tag::Parse, |frame| {
+            let mut writer = self.lock();
+            self.refuse_crate_attr(&writer, id);
+            if writer.given.get(id).copied() == content {
+                return;
+            }
+            match content {
+                Some(content) => writer.given.insert(id, content),
+                None => _ = writer.given.remove(id),
+            }
+            writer.mark(id);
+            let now = writer.content_of(id);
+            let mut changed = Roots::new();
+            index_file(&mut writer, id, now, &mut changed);
+            writer.write_root_contents(&changed, frame);
+        })
+    }
+
     /// Whether anything has `id`: a file ID [`Files::set_view_root`] may not give a new path.
     pub(crate) fn is_used(&self, writer: &Writer, id: FileId) -> bool {
         writer.texts.contains_key(id)
             || writer.raws.contains_key(id)
+            || writer.given.contains_key(id)
             || writer.file_roots.contains_key(id)
             || writer.in_roots.contains_key(id)
             || writer.view_ids.contains_key(id)
@@ -1890,13 +1968,13 @@ impl Files {
     /// from disk the first time it is asked for, its read stamped with `db`'s commit. Whoever
     /// watches the disk keeps it current with [`Files::reload_included_file`]. Two readers that
     /// ask for it first at once each read it, with no lock held; the first to finish is kept.
-    pub fn included_file(&self, db: &Db, krate: CrateKey, path: &AbsPath) -> IncludedFile {
-        IncludedFile::Read(self.included_at(db, krate, path))
+    pub fn included_file(&self, disk: &Disk, db: &Db, krate: CrateKey, path: &AbsPath) -> IncludedFile {
+        IncludedFile::Read(self.included_at(disk, db, krate, path))
     }
 
     /// The row in [`Files::included`] of [`Files::included_file`]'s file, noted as read by
     /// `krate`.
-    fn included_at(&self, db: &Db, krate: CrateKey, path: &AbsPath) -> u32 {
+    fn included_at(&self, disk: &Disk, db: &Db, krate: CrateKey, path: &AbsPath) -> u32 {
         let hash = self.included.hash(path);
         let at = match self.included.find(hash, |it| it.path.as_path() == path) {
             Some(at) => at,
@@ -1905,7 +1983,7 @@ impl Files {
                 // no one build owns: its look is kept by none. Each build asks of every
                 // path read here again with its own looks ([`crate::Edit::reload_included_files`],
                 // [`IncludedFile::content_now`]).
-                let read = self.read_included(path, &Looks::none());
+                let read = self.read_included(disk, path, &Looks::none());
                 let content = IncludedFile::content_of(read.as_deref());
                 let seq = db.seq();
                 let make = || {
@@ -1940,12 +2018,13 @@ impl Files {
     /// more files than there are IDs left above them.
     pub fn included_source(
         &self,
+        disk: &Disk,
         db: &Db,
         krate: CrateKey,
         path: &AbsPath,
         is_library: bool,
     ) -> (IncludedFile, Result<FileId, FileId>) {
-        let at = self.included_at(db, krate, path);
+        let at = self.included_at(disk, db, krate, path);
         let file = IncludedFile::Read(at);
         let raw = included_id(at);
         let id = FileId::from_raw(raw);
@@ -1956,6 +2035,7 @@ impl Files {
         let table = &db.snap().table;
         let taken = row(&table.texts, raw).is_some()
             || row(&table.raws, raw).is_some()
+            || row(&table.given, raw).is_some()
             || row(&table.file_roots, raw).is_some()
             || row(&table.roots, raw).is_some();
         if taken {
@@ -2035,8 +2115,11 @@ impl Files {
         self.included_by.iter().any(|&(by, at)| by == krate && at == row)
     }
 
+    /// The one read of the disk for a file outside the VFS: it takes the database's [`Disk`],
+    /// which a snapshot has none of.
     fn read_included(
         &self,
+        _disk: &Disk,
         path: &AbsPath,
         looks: &Looks,
     ) -> Result<std::sync::Arc<[u8]>, ReadError> {
@@ -2193,7 +2276,7 @@ impl Files {
     /// Whether the file on disk is what the world last read of it (its newest read; `db` is
     /// the edit's). Asked through [`IncludedFile::content_now`]: no look at the disk while a
     /// watch vouches for what was last read of it; a look made is pushed to `looks`.
-    pub fn included_is_read(&self, _db: &Db, path: &AbsPath, looks: &Looks) -> bool {
+    pub fn included_is_read(&self, _disk: &Disk, _db: &Db, path: &AbsPath, looks: &Looks) -> bool {
         let Some(at) = self.find_row(path) else { return false };
         self.newest(at).content == IncludedFile::content_now(&self.on_disk(path.as_ref()), looks)
     }
@@ -2202,9 +2285,9 @@ impl Files {
     /// stamped `seq` (the commit the edit makes), and its row is marked, so its readers' arenas
     /// are made again; the text `include!` parses of it changes with it. The read's look at the
     /// disk is pushed to `looks`.
-    pub(crate) fn reload_included_file(&self, seq: u64, path: &AbsPath, looks: &Looks) -> bool {
+    pub(crate) fn reload_included_file(&self, disk: &Disk, seq: u64, path: &AbsPath, looks: &Looks) -> bool {
         let Some(at) = self.find_row(path) else { return false };
-        let read = self.read_included(path, looks);
+        let read = self.read_included(disk, path, looks);
         self.set_included_read(seq, at, read)
     }
 

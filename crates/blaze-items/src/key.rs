@@ -62,7 +62,6 @@ use hir_ty::{
     next_solver::{Ctor, SolverDefId},
 };
 use span::ErasedFileAstId;
-use syntax::view::HasName;
 
 use crate::{ItemId, ItemKey, NAME_DOMAIN, NameHash, SimplifiedType};
 
@@ -105,9 +104,9 @@ pub enum Resolved {
 /// prefix index of the listed crates ([`base_db::listed_by_prefix`]) is made with too.
 #[blaze_memo::tracked(returns(copy))]
 pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
-    base_db::crate_item_key(krate.data(db), krate.extra_data(db), krate.cfg_options(db), &|dep: Crate| {
-        crate_key(db, dep)
-    })
+    // `Crate::item_key` is the same hash, asked by base-db's own readers (a page's closure
+    // names its crates by it): one computation, so the two can never disagree.
+    krate.item_key(db)
 }
 
 /// A key's preimage: the bytes a [`Hasher`] would be given (`part` is length-prefixed, `id`
@@ -434,11 +433,6 @@ fn assoc_item_keys<'db>(
 
 /// Appends the bytes an item's key is the hash of to `b`: its parent's key, its kind, its name
 /// (the interned symbol's bytes, read in place) and where it is written. Gives the parent.
-#[expect(
-    blaze::reads_positions,
-    reason = "a macro's name is read off the live tree (`AstId::to_view`): hir-def must keep the name as \
-              written, raw prefix included, in the macro's item-tree entry, read here in its place"
-)]
 fn item_preimage(db: &Db, id: ItemId, b: &mut Bytes) -> ItemKey {
     fn head(b: &mut Bytes, parent: ItemKey, prefix: &[u8], tag: &[u8], name: Option<&str>) {
         b.id(&parent.0).part(prefix).part(tag).opt(name);
@@ -499,26 +493,30 @@ fn item_preimage(db: &Db, id: ItemId, b: &mut Bytes) -> ItemKey {
             head(b, parent, prefix, b"type", Some(TypeAliasSignature::of(db, it).name.as_str()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
-        // hir-def keeps no macro's name but in its syntax.
+        // A macro's name is its kept entry ([`MacroId::name`]), never its syntax: of a crate
+        // given by its pages the file is not parsed. Two `macro_rules!` of one name in one
+        // module are told apart by where they are written: the raw AST id hashed below holds
+        // their order among the file's items of that kind and name, and the page holds it.
         ItemId::Macro(MacroId::MacroRulesId(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_view(db).name();
-            head(b, parent, b"", b"macro_rules", name.map(|it| it.text()));
+            let name = MacroId::MacroRulesId(it).name(db);
+            head(b, parent, b"", b"macro_rules", Some(name.as_str()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Macro(MacroId::Macro2Id(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_view(db).name();
-            head(b, parent, b"", b"macro", name.map(|it| it.text()));
+            let name = MacroId::Macro2Id(it).name(db);
+            head(b, parent, b"", b"macro", Some(name.as_str()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Macro(MacroId::ProcMacroId(it)) => {
             let loc = it.lookup(db);
             let parent = module_key(db, loc.container);
-            let name = loc.id.to_view(db).name();
-            head(b, parent, b"", b"proc_macro", name.map(|it| it.text()));
+            // A derive's is the trait it derives; the function's own name is in its AST id.
+            let name = MacroId::ProcMacroId(it).name(db);
+            head(b, parent, b"", b"proc_macro", Some(name.as_str()));
             (parent, loc.id.file_id, loc.id.value.erase())
         }
     };
@@ -869,16 +867,9 @@ fn module_path<'db>(db: &'db Db, module: ModuleIdLt<'db>, write: &mut impl FnMut
     }
 }
 
-/// Writes an item's name, `_` for one without.
-#[expect(
-    blaze::reads_positions,
-    reason = "a macro's name is read off the live tree (`AstId::to_view`): hir-def must keep the name as \
-              written in the macro's item-tree entry, read here in its place"
-)]
+/// Writes an item's name, `_` for one without. A macro's is its kept entry ([`MacroId::name`]),
+/// never its syntax (a derive's is the trait it derives, the name it is used by).
 fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
-    fn macro_name(name: Option<syntax::view::Name<'_>>, write: &mut impl FnMut(&str)) {
-        write(name.map_or("_", |it| it.text()))
-    }
     match id {
         ItemId::Function(it) => write(FunctionSignature::of(db, it).name.as_str()),
         ItemId::Adt(AdtId::StructId(it)) => write(StructSignature::of(db, it).name.as_str()),
@@ -891,16 +882,7 @@ fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
         }
         ItemId::Static(it) => write(StaticSignature::of(db, it).name.as_str()),
         ItemId::Alias(it) => write(TypeAliasSignature::of(db, it).name.as_str()),
-        // hir-def keeps no macro's name but in its syntax.
-        ItemId::Macro(MacroId::MacroRulesId(it)) => {
-            macro_name(it.lookup(db).id.to_view(db).name(), write)
-        }
-        ItemId::Macro(MacroId::Macro2Id(it)) => {
-            macro_name(it.lookup(db).id.to_view(db).name(), write)
-        }
-        ItemId::Macro(MacroId::ProcMacroId(it)) => {
-            macro_name(it.lookup(db).id.to_view(db).name(), write)
-        }
+        ItemId::Macro(it) => write(it.name(db).as_str()),
     }
 }
 

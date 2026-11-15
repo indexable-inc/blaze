@@ -18,7 +18,7 @@ use std::{
 use blaze_ids::ContentId;
 use blaze_mem::Tag;
 use blaze_memo::{
-    Alone, Config, Database, Fact, Gid, Memo, Plant, Read, Reads, record, take_counts,
+    Alone, Config, Database, Fact, Gid, Memo, Plant, Read, Reader, Reads, record, record_readers, take_counts,
     testing::flat_reads_behind,
 };
 use blaze_sim::{Broke, Tape};
@@ -382,6 +382,131 @@ fn members_flatten_alike(plant: Plant) -> Result<(), String> {
 #[test]
 fn a_fixpoints_members_flatten_to_one_set() {
     members_flatten_alike(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+}
+
+// (d) Each row names its reader.
+
+/// A query that reads a fact of its own ([`OUTER_FACT`]) and asks `inner(id)`: the outer of a
+/// planted nested read, whose rows below must name `inner`, not this.
+#[blaze_memo::tracked(returns(copy))]
+fn outer(db: &dyn Graphed, id: u32) -> u64 {
+    blaze_memo::read(db.memo(), fact(OUTER_FACT));
+    inner(db, id)
+}
+
+/// The fact only [`outer`] reads: above every fact the graph draws.
+const OUTER_FACT: u32 = 2000;
+/// The fact only the recorded work reads, outside any query.
+const WORK_FACT: u32 = 3000;
+
+/// Over drawn DAGs after drawn asks (hits and runs), one run of `outer(id)` under both
+/// recorders at once (`record_readers` inside `record`): the rows with readers dropped are
+/// `record`'s; the work's own read names the work, `outer`'s own read names `outer`, and every
+/// other input row names `inner`, once for each node the model says reads that fact directly
+/// (reached from `id` through ordinary asks: a boundary's rows stay behind its one row).
+fn readers_are_the_innermost(tape: &Tape) -> Result<(), String> {
+    let graph = draw_graph(tape);
+    let n = graph.0.len() as u32;
+    let asks = tape.vec(0..=6, "asks first", |t| (t.int_in(0..=n - 1, "asked"), t.coin("the boundary kind")));
+    let db = GraphDb { memo: graph_memo(Plant::None), graph };
+    for &(id, boundary) in &asks {
+        if boundary {
+            wall(&db, id);
+        } else {
+            inner(&db, id);
+        }
+    }
+    for id in 0..n {
+        let (named, rows) = record(&db.memo, || {
+            record_readers(&db.memo, || {
+                blaze_memo::read(&db.memo, fact(WORK_FACT));
+                outer(&db, id)
+            })
+        })
+        .map_err(|it| it.to_string())?;
+        let (got, readers) = named.map_err(|it| it.to_string())?;
+        if got != value(&db.graph, id) {
+            return Err(format!("outer({id}) answered {got}, the model {}", value(&db.graph, id)));
+        }
+        let mut bare: Vec<Read> = readers.rows.iter().map(|(read, _)| *read).collect();
+        bare.dedup();
+        if bare != rows {
+            return Err(format!("outer({id}): the readers' rows {bare:?} are not `record`'s {rows:?}"));
+        }
+        // The model: for each fact, the nodes reached from `id` through ordinary asks that read it.
+        let mut reached = BTreeSet::new();
+        let mut todo = vec![id];
+        while let Some(at) = todo.pop() {
+            if reached.insert(at) {
+                todo.extend(db.graph.0[at as usize].calls.iter().filter(|(_, wall)| !wall).map(|(callee, _)| *callee));
+            }
+        }
+        let mut want: BTreeMap<Fact, usize> = BTreeMap::new();
+        for at in &reached {
+            for f in BTreeSet::from_iter(db.graph.0[*at as usize].facts.iter().copied()) {
+                *want.entry(fact(f)).or_default() += 1;
+            }
+        }
+        let mut got_by_inner: BTreeMap<Fact, usize> = BTreeMap::new();
+        for (read, reader) in &readers.rows {
+            let kind = match reader {
+                Reader::Work => None,
+                Reader::Query { kind, .. } => Some(kind.name()),
+            };
+            // The path of asks, outermost first: none for the work's own read, `outer` for its
+            // own, and `outer` then `inner` (then only `inner`, down the drawn graph) below.
+            let mut chain: Vec<&str> = readers.chain(*reader).map(|it| it.name()).collect();
+            chain.reverse();
+            let shaped = match kind {
+                None => chain.is_empty(),
+                Some(name) if name == outer::KIND_NAME => chain == [outer::KIND_NAME],
+                Some(_) => {
+                    chain.len() >= 2
+                        && chain[0] == outer::KIND_NAME
+                        && chain[1..].iter().all(|it| *it == inner::KIND_NAME)
+                        && chain.last() == kind.as_ref()
+                }
+            };
+            if !shaped {
+                return Err(format!("outer({id}): {read:?} read by {reader} has the path {chain:?}"));
+            }
+            match *read {
+                Read::Input { fact: f, .. } if f == fact(WORK_FACT) => {
+                    if kind.is_some() {
+                        return Err(format!("outer({id}): the work's own read names {reader}"));
+                    }
+                }
+                Read::Input { fact: f, .. } if f == fact(OUTER_FACT) => {
+                    if kind != Some(outer::KIND_NAME) {
+                        return Err(format!("outer({id}): outer's own read names {reader}"));
+                    }
+                }
+                Read::Input { fact: f, .. } => {
+                    if kind != Some(inner::KIND_NAME) {
+                        return Err(format!("outer({id}): {f:?}, read inside inner, names {reader}, not inner"));
+                    }
+                    *got_by_inner.entry(f).or_default() += 1;
+                }
+                Read::Query { .. } => {
+                    if kind != Some(inner::KIND_NAME) {
+                        return Err(format!("outer({id}): a boundary ask {read:?} names {reader}, not inner"));
+                    }
+                }
+            }
+        }
+        if got_by_inner != want {
+            return Err(format!("outer({id}): readers per fact {got_by_inner:?}, the model {want:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: `record_readers` gives `record`'s rows for the same run, each named by the
+/// innermost query whose run read it, never by an asker above it, with its path of asks from
+/// the work (work, `outer`, `inner`, ...).
+#[test]
+fn each_row_names_its_innermost_reader() {
+    blaze_sim::check(blaze_sim::Config::cases(200), readers_are_the_innermost);
 }
 
 /// The control: members published with no lists flatten to nothing.

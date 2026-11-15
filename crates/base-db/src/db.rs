@@ -214,7 +214,30 @@ impl Db {
     /// ([`blaze_memo::record`] answers only under [`blaze_memo::Reads::Kept`]): a build that
     /// files body records keeps them, every other build passes [`blaze_memo::Reads::Off`].
     pub fn new(boundaries: fn(&mut blaze_memo::Builder), reads: blaze_memo::Reads) -> Db {
-        Db::with(Run::Pool, scheduled(), None, boundaries, reads)
+        Db::with(Run::Pool, scheduled(), None, boundaries, reads, Files::default())
+    }
+
+    /// A build's database ([`Db::new`]) opened as a snapshot: one with no [`crate::Disk`], so
+    /// nothing it runs reads a file from disk (rule 14). Its files are those an edit gives it;
+    /// a `mod` whose file is not among them is an unresolved module and an `include!` of one
+    /// the include's error, each naming the path, never a read. What a command's snapshot of a
+    /// unit is (blaze-command `snapshot::open`). `reads` as for [`Db::new`].
+    pub fn sealed(boundaries: fn(&mut blaze_memo::Builder), reads: blaze_memo::Reads) -> Db {
+        Db::with(Run::Pool, scheduled(), None, boundaries, reads, Files::sealed())
+    }
+
+    /// [`Db::sealed`] that keeps a run log, as [`Db::logged`] is to [`Db::new`]: a command's
+    /// snapshot under its tests.
+    pub fn sealed_logged(boundaries: fn(&mut blaze_memo::Builder), reads: blaze_memo::Reads) -> Db {
+        let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
+        Db::with(Run::Pool, scheduled(), Some(log), boundaries, reads, Files::sealed())
+    }
+
+    /// A database for tests ([`Db::for_tests`]) with no [`crate::Disk`], as [`Db::sealed`]: a
+    /// test of what a snapshot does where a file is not among its files.
+    pub fn for_tests_sealed(boundaries: fn(&mut blaze_memo::Builder)) -> Db {
+        let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
+        Db::with(Run::Here, alone(), Some(log), boundaries, blaze_memo::Reads::Off, Files::sealed())
     }
 
     /// A build's database ([`Db::new`]) that keeps a [`blaze_memo::testing::RunLog`] of the
@@ -222,7 +245,7 @@ impl Db {
     /// runs (`crates/hir-firewall`). `reads` as for [`Db::new`].
     pub fn logged(boundaries: fn(&mut blaze_memo::Builder), reads: blaze_memo::Reads) -> Db {
         let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
-        Db::with(Run::Pool, scheduled(), Some(log), boundaries, reads)
+        Db::with(Run::Pool, scheduled(), Some(log), boundaries, reads, Files::default())
     }
 
     /// A database for tests: its batches run on the calling thread in this thread's
@@ -237,7 +260,7 @@ impl Db {
     /// [`Db::for_tests_driven`].
     pub fn for_tests(boundaries: fn(&mut blaze_memo::Builder)) -> Db {
         let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
-        Db::with(Run::Here, alone(), Some(log), boundaries, blaze_memo::Reads::Off)
+        Db::with(Run::Here, alone(), Some(log), boundaries, blaze_memo::Reads::Off, Files::default())
     }
 
     /// A database for tests ([`Db::for_tests`]) whose queries keep read lists
@@ -245,7 +268,7 @@ impl Db {
     /// checks what a query read.
     pub fn for_tests_with_reads(boundaries: fn(&mut blaze_memo::Builder)) -> Db {
         let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
-        Db::with(Run::Here, alone(), Some(log), boundaries, blaze_memo::Reads::Kept)
+        Db::with(Run::Here, alone(), Some(log), boundaries, blaze_memo::Reads::Kept, Files::default())
     }
 
     /// A database for tests ([`Db::for_tests`]: its batches in this thread's [`RunOrder`], a
@@ -258,18 +281,20 @@ impl Db {
         reads: blaze_memo::Reads,
     ) -> Db {
         let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
-        Db::with(Run::Here, scheduled(), Some(log), boundaries, reads)
+        Db::with(Run::Here, scheduled(), Some(log), boundaries, reads, Files::default())
     }
 
+    /// `files`: the database's files, with a [`crate::Disk`] or with none ([`Db::sealed`]).
     fn with(
         run: Run,
         flight: std::sync::Arc<dyn blaze_memo::Flight, Global>,
         log: Option<std::sync::Arc<blaze_memo::testing::RunLog, Global>>,
         boundaries: fn(&mut blaze_memo::Builder),
         reads: blaze_memo::Reads,
+        files: Files,
     ) -> Db {
         let mut world = World::new(boundaries, log, flight, reads);
-        let files: Arc<Files> = Arc::default();
+        let files: Arc<Files> = Arc::new(files);
         // Empty roots and an empty graph: what a fixture expects to find, and a build's first
         // snapshot holds the same.
         world::settle(&mut world, &files);
@@ -453,30 +478,33 @@ impl Db {
 
     /// The file `path` names relative to its anchor, when it is not one of the files of the
     /// VFS, as `krate` reads it (`include_bytes!`, `include_str!`): `None` when the anchor has
-    /// no path on disk to be relative to.
+    /// no path on disk to be relative to, or the database has no disk ([`Db::sealed`]).
     pub fn included_file(&self, krate: Crate, path: AnchoredPath<'_>) -> Option<IncludedFile> {
+        let disk = self.files.disk()?;
         let root = self.source_root(self.file_source_root(path.anchor).source_root_id(self));
         let root = root.source_root_ref(self);
         let anchor = root.path_for_file(&path.anchor)?.as_path()?;
         let path = anchor.parent()?.absolutize(path.path);
-        Some(self.files.included_file(self, krate.key(self), &path))
+        Some(self.files.included_file(disk, self, krate.key(self), &path))
     }
 
     /// The file outside the VFS that `path` names relative to its anchor, as `include!` in
     /// `krate` parses it ([`Files::included_source`]), with the read it is made from: `None`
-    /// when the anchor has no path on disk to be relative to. rustc's `resolve_path`: a
-    /// relative path is joined to the directory of the file the call is in, an absolute one is
-    /// taken as it is; blaze names the file by that path normalized, as the VFS names its own.
+    /// when the anchor has no path on disk to be relative to, or the database has no disk
+    /// ([`Db::sealed`]). rustc's `resolve_path`: a relative path is joined to the directory of
+    /// the file the call is in, an absolute one is taken as it is; blaze names the file by that
+    /// path normalized, as the VFS names its own.
     pub fn included_source(
         &self,
         krate: Crate,
         path: AnchoredPath<'_>,
     ) -> Option<(IncludedFile, Result<FileId, FileId>)> {
+        let disk = self.files.disk()?;
         let root = self.source_root(self.file_source_root(path.anchor).source_root_id(self));
         let root = root.source_root_ref(self);
         let anchor = root.path_for_file(&path.anchor)?.as_path()?;
         let path = anchor.parent()?.absolutize(path.path);
-        Some(self.files.included_source(self, krate.key(self), &path, root.is_library))
+        Some(self.files.included_source(disk, self, krate.key(self), &path, root.is_library))
     }
 
     /// The file outside the VFS that a module declaration (`mod m;`) in `krate` names at `path`
@@ -487,8 +515,9 @@ impl Db {
     /// that appears, goes or is edited reruns it once whoever owns the database reads the disk
     /// again ([`Edit::reload_included_files`]). `None` when there is no module file to parse
     /// there: the anchor has no path on disk, the read fails (no file there), the bytes are not
-    /// UTF-8, or the file ID it would have is taken by a file of the view; the declaration is
-    /// then an unresolved module, an error naming the paths looked for.
+    /// UTF-8, the file ID it would have is taken by a file of the view, or the database has no
+    /// disk ([`Db::sealed`]: a snapshot's module files are the unit's files and no other); the
+    /// declaration is then an unresolved module, an error naming the paths looked for.
     pub fn module_source(&self, krate: Crate, path: AnchoredPath<'_>) -> Option<FileId> {
         let (file, source) = self.included_source(krate, path)?;
         std::str::from_utf8(file.bytes(self)?).ok()?;
@@ -889,9 +918,36 @@ impl Edit<'_> {
         self
     }
 
+    /// See [`Files::set_file_given`]: `file` known by `content` alone (a file of a crate given
+    /// by its address), or no longer (`None`).
+    pub fn set_file_given(&mut self, file: FileId, content: Option<ContentId>) -> &mut Self {
+        self.db.files.set_file_given(file, content);
+        self
+    }
+
     pub fn set_source_root(&mut self, id: SourceRootId, root: Arc<SourceRoot>) -> &mut Self {
         self.db.files.set_source_root(id, root);
         self
+    }
+
+    /// Puts each of `files` in the source root `id` at its path, the root's other files kept:
+    /// the set as this edit has it, copied once, each file inserted ([`SourceRoot::insert_file`]'s
+    /// rules: a path names the last file put at it), set again. What a crate given by its
+    /// address names its files by (`hir_def::deps::give_keyed`), so a path resolved from one of
+    /// them (an `include!`, a `#[path]`) finds the file its pages name, never a file on disk.
+    /// Cost: one copy of the root's set an edit, O(its files + `files`).
+    ///
+    /// # Panics
+    ///
+    /// Where the world has no source root `id`.
+    pub fn put_in_source_root(&mut self, id: SourceRootId, files: impl IntoIterator<Item = (FileId, VfsPath)>) -> &mut Self {
+        let written = self.db.files.written_root(id).unwrap_or_else(|| panic!("no source root {id:?} to put files in"));
+        // clone: the root's set, once an edit that puts files in it
+        let mut root: SourceRoot = (*written).clone();
+        for (file, path) in files {
+            root.insert_file(file, path);
+        }
+        self.set_source_root(id, Arc::new(root))
     }
 
     /// See [`Files::set_appended_root_module`].
@@ -934,10 +990,12 @@ impl Edit<'_> {
     }
 
     /// See [`Files::reload_included_file`]; `looks` is the list of the build it is read for.
-    /// Whether the read moved.
+    /// Whether the read moved: never in a database with no [`crate::Disk`] ([`Db::sealed`]),
+    /// whose files outside the VFS are only those it was handed, with no disk to move under them.
     pub fn reload_included_file(&mut self, path: &AbsPath, looks: &Looks) -> bool {
         let seq = self.seq();
-        self.db.files.reload_included_file(seq, path, looks)
+        let files = &self.db.files;
+        files.disk().is_some_and(|disk| files.reload_included_file(disk, seq, path, looks))
     }
 
     /// See [`Files::set_included_file`]. Whether the read moved.
@@ -982,15 +1040,18 @@ impl Edit<'_> {
         .entered();
         let mut read = 0_u64;
         let db: &Db = self.db;
-        // Empty unless a file moved: the paths are the result.
+        // Empty unless a file moved: the paths are the result. A database with no disk
+        // ([`Db::sealed`]) has nothing on it to move.
         let mut moved: Vec<AbsPathBuf, Global> = Vec::new_in(Global);
-        moved.extend(
-            files
-                .included_paths()
-                .inspect(|_| read += 1)
-                .filter(|path| !files.included_is_read(db, path, looks))
-                .map(|path| path.to_path_buf()),
-        );
+        if let Some(disk) = files.disk() {
+            moved.extend(
+                files
+                    .included_paths()
+                    .inspect(|_| read += 1)
+                    .filter(|path| !files.included_is_read(disk, db, path, looks))
+                    .map(|path| path.to_path_buf()),
+            );
+        }
         span.record("files", read);
         moved.sort();
         for path in moved.iter().take(MOVED_NAMED) {

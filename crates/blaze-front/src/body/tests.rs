@@ -17,7 +17,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_keyed::{
     driver::TaskFailed,
     front::{Table, Universe},
-    kind::{Body, BodyInputs, Key, Kind, Namespace, Settings, ToolId},
+    kind::{Body, BodyInputs, Key, Kind, Namespace, Settings, Steps, ToolId},
     record::{self, Fact, FactKind, Owner, StableId, Traced, digest},
 };
 use blaze_rng::SplitMix64;
@@ -169,7 +169,7 @@ impl Check for Model<'_, '_> {
         }
     }
 
-    fn check(&self, def: StableId, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed> {
+    fn check(&self, def: StableId, _steps: Steps, asks: &mut Asks<'_>, payload: &mut Writer) -> Result<(), TaskFailed> {
         let body = &self.world.bodies[&def];
         let mut reads = Vec::new_in(Global);
         reads.extend_from_slice(&body.reads);

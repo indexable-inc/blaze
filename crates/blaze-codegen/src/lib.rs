@@ -47,6 +47,7 @@ pub mod settings;
 pub mod slot;
 pub mod summary;
 pub mod template;
+pub mod text;
 pub mod unwind;
 pub mod wasm;
 
@@ -451,6 +452,14 @@ pub enum Target {
     /// A position the program observes (`line!()`, `#[track_caller]`'s `Location`): the
     /// span side table's entry, filled at link time, so a reformat compiles nothing.
     Position(SpanRef),
+    /// A `&str` whose text names files (`concat!` with `file!()`), composed by the link: the
+    /// address of a record of the `&str` (pointer, then length, as [`Target::Position`]'s
+    /// `Location` begins) over bytes the link writes, made from the function's own datum of
+    /// this ID, a text recipe ([`text::recipe`]: its literal bytes, and a hole per file whose
+    /// relocation is the [`Target::Position`] of the span whose file it names). What the
+    /// program's text holds of the machine (a file's name) is then the link's, from the span
+    /// side table, and no key or record holds it (rules 25, 71).
+    Text(ContentId),
     /// The function's own SanitizerCoverage array ([`CompiledFunction::coverage`]): 0 its
     /// counters, 1 its flags, 2 its guards; the relocation's addend is into it. A function
     /// names no other's, and nothing else names one.

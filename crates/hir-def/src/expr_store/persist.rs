@@ -46,7 +46,7 @@ use span::Edition;
 use std::alloc::Global;
 
 use crate::{
-    AdtId, BlockId, ConstId, EnumId, EnumVariantId, FunctionId, GenericDefId, ImplId,
+    AdtId, AssocItemId, BlockId, ConstId, EnumId, EnumVariantId, FunctionId, GenericDefId, ImplId,
     LifetimeParamId, Macro2Id, MacroId, MacroRulesId, ProcMacroId, StaticId, StructId, TraitId,
     TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
@@ -1974,6 +1974,7 @@ sum_codes! {
         6 => TypeAliasId,
     }
     MacroId { 0 => Macro2Id, 1 => MacroRulesId, 2 => ProcMacroId }
+    AssocItemId { 0 => FunctionId, 1 => ConstId, 2 => TypeAliasId }
     LangItemTarget {
         0 => EnumId,
         1 => FunctionId,

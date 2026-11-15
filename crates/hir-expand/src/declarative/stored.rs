@@ -91,6 +91,76 @@ pub trait Kept: Send + Sync + 'static {
     );
 }
 
+/// What a read here of a file's text asks first ([`demand_text`]), set apart from [`Kept`]:
+/// a database whose crates are given by their addresses reads definitions from files with no
+/// text whether or not it keeps entries, so the demand cannot ride on the entry store.
+pub trait Demand: Send + Sync + 'static {
+    /// Stops, with the implementor's typed error naming `krate` and `file`, before the text of
+    /// `file` (written in `krate`) is read, where `krate` was given by its address and `file`
+    /// has no text in this snapshot (hir-def's `pages::demand_text`); returns otherwise. A text
+    /// that is here is read as it is: the key the crate was given under is the proof.
+    fn demand_text(&self, db: &Db, krate: Crate, file: EditionedFileId);
+
+    /// Stops, with the implementor's typed error naming the crate, `file` and `id`, where
+    /// `file` is of a crate given by its address and its text here has no item `id`: the
+    /// crate's records name an item this text has not, so they were given under a key this
+    /// text is not of (hir-def's `pages::missing_ast_id`); returns otherwise.
+    fn missing_ast_id(&self, db: &Db, file: base_db::FileId, id: span::ErasedFileAstId);
+}
+
+/// [`Demand::missing_ast_id`] of this database's demand, if one was set: what a lookup of an
+/// item's id that the file's text has not asks before it panics (`files::ptr_in`).
+pub fn missing_ast_id(db: &Db, file: base_db::FileId, id: span::ErasedFileAstId) {
+    if let Some(demand) = TextDemand::try_get(db) {
+        demand.held(db).0.missing_ast_id(db, file, id);
+    }
+}
+
+/// The [`Demand`] of this database, set by hir-def where it gives a crate by its address
+/// (`deps::give_keyed`), in the session arena. One value a database.
+#[blaze_memo::input(singleton, debug)]
+pub struct TextDemand {
+    #[returns(ref)]
+    pub held: DemandHolder,
+}
+
+/// A [`Demand`] as an input's value: equal only to itself.
+#[derive(Clone)]
+// dyn: the one demand
+pub struct DemandHolder(pub Arc<dyn Demand>);
+
+impl PartialEq for DemandHolder {
+    fn eq(&self, other: &DemandHolder) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for DemandHolder {}
+
+impl std::fmt::Debug for DemandHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Demand")
+    }
+}
+
+/// Has the snapshot `inputs` builds (its session arena's) ask `demand` before a read of a
+/// file's text here, read by `fact`.
+// dyn: the one demand
+pub fn set_demand(inputs: &blaze_memo::Inputs<'_>, fact: blaze_memo::Fact, demand: Arc<dyn Demand>) {
+    TextDemand::set(inputs, fact, DemandHolder(demand));
+}
+
+/// Stops, typed and naming `krate` and `file`, before the text of `file` is read where the
+/// database's [`Demand`] refuses it; nothing where none is set (every crate built from its
+/// files, whose texts are there). What every read of a file's text here asks first (a parse
+/// for a file's index, a definition's text for its squeeze or its expander), so a file known
+/// by its content alone is refused by name, never read as a base-db panic.
+pub fn demand_text(db: &Db, krate: Crate, file: EditionedFileId) {
+    if let Some(demand) = TextDemand::try_get(db) {
+        demand.held(db).0.demand_text(db, krate, file);
+    }
+}
+
 /// Where this database's macro definitions are kept, set by `entries::set` with the entry
 /// store, in the session arena while the driver builds a snapshot. One value a database.
 #[blaze_memo::input(singleton, debug)]
@@ -222,7 +292,7 @@ pub(super) fn find(
 ) -> Option<Def> {
     // A definition with no row has no text to read its spans back to: none is kept of it
     // ([`Writer::new`]).
-    let place = Place::of(db, file, ast, def_crate)?;
+    let place = Place::of(db, kept, file, ast, def_crate)?;
     let set = file_set(db, file);
     let def_edition = def_crate.data(db).edition;
     let cfg = cfg_part(db, file, ast, def_crate);
@@ -266,24 +336,63 @@ pub(super) struct Place {
 
 impl Place {
     /// The place of the definition `ast` of `file`: its text is where its file's index places
-    /// it (its node's range, where its anchor begins, so a span's offsets are in that text),
-    /// read from the file's text with no parse. `None` for a definition with no row (one in a
-    /// body, whose spans have another anchor and are not kept).
+    /// it (its node's range, where its anchor begins, so a span's offsets are in that text).
+    /// `None` for a definition with no row (one in a body, whose spans have another anchor and
+    /// are not kept).
+    ///
+    /// The squeeze is an entry of the file ([`SQUEEZE`], under the file's content and the
+    /// definition's ast id, both of which it is a function of), so a kept definition of a file
+    /// whose content is known and whose text is not here (a crate given by its address) is read
+    /// with no text. Not kept, it is made from the file's text with no parse, refused first
+    /// (typed, naming the crate and the file: [`demand_text`]) where the file has no text here
+    /// or another than it was given with; then kept.
+    ///
+    /// Floor (rule 67): one entry read, 12 bytes a token of the definition. Cost: the same,
+    /// once a definition's file content.
     pub(super) fn of(
         db: &Db,
+        kept: &dyn Kept,
         file: EditionedFileId,
         ast: ErasedFileAstId,
         def_crate: Crate,
     ) -> Option<Place> {
         let range = index::of(db, file, def_crate).range(ast)?;
-        let text: &str = db.file_text(file.file_id(db)).text(db);
-        let text = text.get(std::ops::Range::<usize>::from(range))?;
+        let set = file_set(db, file);
+        let key = squeeze_key(&set, ast);
+        let mut found = None;
+        kept.get(db, def_crate, SQUEEZE, &set, key, &mut |bytes| {
+            found = Some(Squeeze::decode(bytes)?);
+            Ok(())
+        });
+        let squeeze = match found {
+            Some(it) => it,
+            None => {
+                demand_text(db, def_crate, file);
+                let text: &str = db.file_text(file.file_id(db)).text(db);
+                let squeeze = Squeeze::of(text.get(std::ops::Range::<usize>::from(range))?);
+                kept.put(db, def_crate, SQUEEZE, &set, key, &squeeze.encode());
+                squeeze
+            }
+        };
         Some(Place {
             anchor: SpanAnchor { file_id: file.span_file_id(db), ast_id: ast },
             ctx: SyntaxContext::root(file.edition(db)),
-            squeeze: Squeeze::of(text),
+            squeeze,
         })
     }
+}
+
+/// The family of a definition's [`Squeeze`].
+pub const SQUEEZE: &str = "macro def squeeze";
+
+const SQUEEZE_DOMAIN: &str = "blaze v2 macro def squeeze";
+
+/// The key of the squeeze of the definition `ast` of the file whose set is `set`: the file's
+/// content and how it is read (which place the definition and give its text), and its id.
+fn squeeze_key(set: &ContentId, ast: ErasedFileAstId) -> ContentId {
+    let mut hasher = Hasher::new(SQUEEZE_DOMAIN);
+    hasher.update(&LAYOUT.to_le_bytes()).id(set).update(&ast.into_raw().to_le_bytes());
+    hasher.finish()
 }
 
 /// Where the tokens of a definition's text are: each token's start in the text, its start in
@@ -311,6 +420,47 @@ impl Squeeze {
             squeezed += len;
         });
         Squeeze { tokens }
+    }
+
+    /// The squeeze as its [`SQUEEZE`] entry holds it: each token's three numbers, little
+    /// endian, in order.
+    fn encode(&self) -> Vec<u8, Global> {
+        // alloc: one entry's bytes, while it is kept
+        let mut out = Vec::with_capacity_in(self.tokens.len() * 12, Global);
+        for token in &self.tokens {
+            for it in token {
+                out.extend_from_slice(&it.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// The squeeze [`Self::encode`] wrote: refused where the bytes are not whole tokens, or
+    /// the tokens are not in order, each after the last on both sides.
+    fn decode(bytes: &[u8]) -> R<Squeeze> {
+        if bytes.len() % 12 != 0 {
+            // alloc: error path
+            return Err(format!("a squeeze of {} bytes, not 12 a token", bytes.len()));
+        }
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+        // alloc: the place's tokens, as `Squeeze::of` holds them
+        let mut tokens = Vec::with_capacity_in(bytes.len() / 12, Global);
+        let mut past = [0u32; 2];
+        for at in (0..bytes.len()).step_by(12) {
+            let token = [word(at), word(at + 4), word(at + 8)];
+            let end = [token[0].checked_add(token[2]), token[1].checked_add(token[2])];
+            let (Some(text_end), Some(squeezed_end)) = (end[0], end[1]) else {
+                // alloc: error path
+                return Err("a squeezed token past 4 GiB".to_owned());
+            };
+            if token[0] < past[0] || token[1] != past[1] {
+                // alloc: error path
+                return Err(format!("a squeezed token out of order at byte {at}"));
+            }
+            past = [text_end, squeezed_end];
+            tokens.push(token);
+        }
+        Ok(Squeeze { tokens })
     }
 
     /// `at`, an offset on side `from` (0 the text, 1 the squeezed text), on the other side: as

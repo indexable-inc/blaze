@@ -1,14 +1,13 @@
-//! Properties of the key rules and the record layouts, each a function of one tape.
+//! Properties of the key rules, each a function of one tape.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_sim::{Config, Tape};
 
 use crate::Plant;
+use crate::codec::Digest;
 use crate::inline::{InlineAttr, Keys, OwnFacts, PlanRef, PlanView, Resolution, SizeClass, inlines};
 use crate::key::{ArgsKey, InstanceKey, ItemId, PlanKey, Symbol, Tier};
-use crate::record::{CallerFacts, CodeHead, CodeParts, InstanceCode, LineRow, LocRow, Reloc, RelocKind, Target};
-use crate::codec::{Digest, Payload};
 
 const ATTRS: [InlineAttr; 4] = [InlineAttr::None, InlineAttr::Hint, InlineAttr::Always, InlineAttr::Never];
 const COSTS: [u32; 5] = [5, 30, 45, 90, 400];
@@ -139,85 +138,5 @@ fn the_tier_is_in_the_key() {
         for symbol in &order {
             assert_ne!(edit[symbol], release[symbol]);
         }
-    });
-}
-
-/// A field written at a place reads back as its target, for every kind, within its range.
-#[test]
-fn a_relocation_reads_back_what_was_written() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
-        let place: u64 = tape.int_in((1u64 << 28)..=(1u64 << 40), "place") & !3;
-        let kind = *tape.one_of(&[RelocKind::Abs64, RelocKind::Rel32, RelocKind::Arm64Branch26], "kind");
-        let words: i64 = tape.int_in(-(1i64 << 24)..=(1i64 << 24), "words");
-        let addend = match kind {
-            RelocKind::Rel32 => -4,
-            _ => 0,
-        };
-        let target = (place as i64 + 4 * words) as u64;
-        let mut bytes = vec![0u8; 16];
-        if kind == RelocKind::Arm64Branch26 {
-            bytes[4..8].copy_from_slice(&0x9400_0000u32.to_le_bytes());
-        }
-        let written = kind.write(&mut bytes, 4, place, target, addend);
-        assert_eq!(written, Ok(()));
-        assert_eq!(kind.read(&bytes, 4, place, addend), Some(target));
-        if kind == RelocKind::Arm64Branch26 {
-            assert_eq!(bytes[7] & 0xfc, 0x94, "the branch's opcode is kept");
-        }
-    });
-}
-
-/// A code record round-trips, and its head is readable from the record's first bytes alone.
-#[test]
-fn a_code_record_round_trips() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
-        let words: usize = tape.int_in(1..=12, "words");
-        let mut code = Vec::new();
-        for _ in 0..words {
-            code.extend_from_slice(&tape.int::<u64>("code word").to_le_bytes());
-        }
-        let panics: u8 = tape.int_in(0..=2, "panics");
-        let mut locations = Vec::new();
-        for index in 0..panics {
-            locations.push(LocRow { item: ItemId(Digest::of("blaze program prop loc 1", &[index])), line: u32::from(index), col: 3 });
-        }
-        let mut relocs = Vec::new();
-        for word in 0..words {
-            let pick: u8 = tape.int_in(0..=4, "field");
-            let target = match pick {
-                0 => continue,
-                1 => Target::Function(symbol(tape.int_in(0..=5, "callee"))),
-                2 => Target::Static(symbol(100 + tape.int_in(0..=2, "static"))),
-                3 if panics > 0 => Target::Location(0),
-                _ => Target::Extern(0),
-            };
-            relocs.push(Reloc { at: 8 * word as u32, kind: RelocKind::Abs64, target, addend: 0 });
-        }
-        let parts = CodeParts {
-            symbol: symbol(0),
-            facts: CallerFacts { noreturn: tape.bool("noreturn"), nounwind: tape.bool("nounwind"), size: code.len() as u32 },
-            code,
-            unwind: tape.vec(0..=8, "unwind", |tape| tape.int::<u8>("unwind byte")),
-            relocs,
-            locations,
-            lines: vec![LineRow { offset: 0, item: ItemId(Digest::of("blaze program prop loc 1", &[9])), line: 1 }],
-            externs: vec![b"blaze_panic".to_vec()],
-        };
-        let record = match InstanceCode::new(parts) {
-            Ok(record) => record,
-            Err(error) => panic!("a well-formed code record was refused: {error}"),
-        };
-        let bytes = record.encode();
-        assert_eq!(InstanceCode::decode(&bytes), Ok(record.clone()));
-        assert_eq!(CodeHead::decode_prefix(&bytes), Ok(record.head()));
-        let mut calls = Vec::new();
-        for reloc in record.relocs() {
-            if let Target::Function(callee) = reloc.target {
-                if !calls.contains(&callee) {
-                    calls.push(callee);
-                }
-            }
-        }
-        assert_eq!(record.calls(), &calls[..], "calls are the function fields in first-occurrence order");
     });
 }

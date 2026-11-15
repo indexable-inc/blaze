@@ -199,7 +199,8 @@ fn view(db: &Db, krate: Crate) -> Option<PartRef<'_>> {
 /// comes from anywhere but its own run, so neither [`served_inference`] nor [`served_passed`]
 /// reads a part, whatever parts the database was given. The one door to both, so neither can.
 fn served_body(db: &Db, def: DefWithBodyId) -> Option<(Crate, BodyRef<'_>)> {
-    if crate::body_store::tracing(db) {
+    // Nor under `Mode::Given`, where a body's answers are its body record's alone.
+    if crate::body_store::tracing(db) || crate::body_store::given(db) {
         return None;
     }
     let krate = def.krate(db);

@@ -113,8 +113,8 @@ pub use intern::{Interned, intern, interned};
 pub use keep::{keep, keep_iter, keep_owned, keep_slice, keep_str};
 pub use memo::{Builder, Config, Epoch, Inputs, Memo, Next, NextRefused, Plant, Reads};
 pub use record::{
-    AROUND_INPUTS, IMAGE_FACT, KindId, Read, RecorderOff, UNTRACKED, read, read_untracked, record,
-    record_in, unrecorded,
+    AROUND_INPUTS, IMAGE_FACT, KindId, Read, Reader, Readers, RecorderOff, UNTRACKED, read, read_untracked,
+    record, record_in, record_readers, unrecorded,
 };
 pub use resident::Resident;
 pub use task::register;

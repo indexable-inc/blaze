@@ -9,9 +9,11 @@ use la_arena::Arena;
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
+use super::AssocRecord;
 use crate::{
-    FxIndexMap,
+    AssocItemId, FxIndexMap,
     expr_store::ExpressionStore,
+    item_tree::RawVisibility,
     hir::{
         columns::{Checked, below, raw},
         generics::{
@@ -379,6 +381,9 @@ pub(super) struct TypeAlias;
 pub(super) struct Fields;
 /// [`EnumVariants::of`].
 pub(super) struct Variants;
+/// `ImplItems::of` and `TraitItems::query_with_diagnostics`, with the written visibilities
+/// ([`AssocRecord`]).
+pub(super) struct Assoc;
 
 impl Sig for Struct {
     type Of = StructSignature;
@@ -797,6 +802,49 @@ impl Sig for Variants {
             inactive.push(InactiveEnumVariantCode { cfg: cfg_expr, opts: cfg.clone(), ast_id });
         }
         Ok((EnumVariants::from_parts(variants, &explicit), inactive))
+    }
+}
+
+/// The words: whose (an impl's, a trait's), the items in their order (each its name and id,
+/// relocated through the table, so an item of an expansion names its call), the macro calls
+/// at assoc position, and the visibilities: of an impl one an item at its index, of a trait
+/// one, the trait's.
+impl Sig for Assoc {
+    type Of = AssocRecord;
+    type Value = AssocRecord;
+
+    fn of(value: &Self::Value) -> &Self::Of {
+        value
+    }
+
+    fn store(_: &Self::Of) -> Option<&ExpressionStore> {
+        None
+    }
+
+    fn put(of: &Self::Of, w: &mut Words) {
+        w.bool(of.is_trait);
+        w.put(&of.items);
+        w.put(&of.macro_calls);
+        w.put(&of.visibilities);
+    }
+
+    fn get(
+        r: &mut Read<'_>,
+        store: Option<ExpressionStore>,
+        _: &CfgOptions,
+    ) -> Result<Self::Value, FormatError> {
+        if store.is_some() {
+            return Err(r.invalid("assoc items with a store"));
+        }
+        let is_trait = r.bool()?;
+        let items: Box<[(Name, AssocItemId)]> = r.get()?;
+        let macro_calls = r.get()?;
+        let visibilities: Box<[RawVisibility]> = r.get()?;
+        let wanted = if is_trait { 1 } else { items.len() };
+        if visibilities.len() != wanted {
+            return Err(r.invalid("assoc items whose visibilities are not one an item (an impl's) or one (a trait's)"));
+        }
+        Ok(AssocRecord { is_trait, items, macro_calls, visibilities })
     }
 }
 

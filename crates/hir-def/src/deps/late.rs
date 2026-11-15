@@ -150,20 +150,24 @@ pub(super) fn walk(
                 return match call.expansion_reads(db) {
                     ExpansionReads::Nothing => Ok(()),
                     ExpansionReads::Traced { .. } => {
-                        if unasked.is_none() {
-                            unasked = Some(Refused::Unasked {
+                        if unasked.is_none() || super::serve::census_taken() {
+                            let why = Refused::Unasked {
                                 // alloc: why a crate is refused, once per refused crate
                                 what: format!(
                                     "procedural macro {} traced reading names its call does not",
                                     super::reads::named_call(db, call, loc)
                                 ),
-                            });
+                            };
+                            if let Some(why) = super::serve::ends(why) {
+                                unasked.get_or_insert(why);
+                            }
                         }
                         Ok(())
                     }
-                    &ExpansionReads::Unknown(why) => {
-                        Err(Refused::ProcMacro { call: super::reads::named_call(db, call, loc), why })
-                    }
+                    &ExpansionReads::Unknown(why) => super::serve::end(Refused::ProcMacro {
+                        call: super::reads::named_call(db, call, loc),
+                        why,
+                    }),
                 };
             }
             MacroDefKind::BuiltInEager(_, expander) => *expander,
@@ -197,7 +201,8 @@ pub(super) fn walk(
                     call_site(db, loc),
                     why.kind().render_to_string(db).message
                 );
-                return Err(Refused::OutsideSourceRoot { what });
+                // Under a census, read as no late read: the include as empty.
+                return super::serve::end(Refused::OutsideSourceRoot { what });
             }
         };
         if db.file_source_root(file).source_root_id(db) != root {
@@ -211,24 +216,27 @@ pub(super) fn walk(
             if db.files().included_source_path(file).is_some() {
                 // A file outside the VFS: a store files the crate by its content; no fact a
                 // surface's shape asks names it.
-                if unasked.is_none() {
+                if unasked.is_none() || super::serve::census_taken() {
                     // alloc: as above
-                    unasked = Some(Refused::Unasked { what: format!("{what}, outside the VFS") });
+                    let why = Refused::Unasked { what: format!("{what}, outside the VFS") };
+                    if let Some(why) = super::serve::ends(why) {
+                        unasked.get_or_insert(why);
+                    }
                 }
                 return Ok(());
             }
-            return Err(Refused::OutsideSourceRoot { what });
+            return super::serve::end(Refused::OutsideSourceRoot { what });
         }
         let dir = dir.get_or_insert_with(|| crate_dir(db, krate));
-        let name = file_name(db, root, file, dir.as_deref()).ok_or_else(|| {
+        let Some(name) = file_name(db, root, file, dir.as_deref()) else {
             // alloc: as above
             let what = format!(
                 "`{macro_name}` of crate {} at {} reads a file of its source root with no path",
                 krate.named(db),
                 call_site(db, loc)
             );
-            Refused::OutsideSourceRoot { what }
-        })?;
+            return super::serve::end(Refused::OutsideSourceRoot { what });
+        };
         let Some(content) = vfs_content(db, file) else {
             // alloc: as above
             let what = format!(
@@ -237,7 +245,7 @@ pub(super) fn walk(
                 call_site(db, loc),
                 shown_path(db, file)
             );
-            return Err(Refused::OutsideSourceRoot { what });
+            return super::serve::end(Refused::OutsideSourceRoot { what });
         };
         late.push(LateSeen { which, name, value: LateValue::File(content) });
         Ok(())
@@ -278,7 +286,8 @@ fn settle(late: &mut Vec<LateSeen, Global>, db: &Db, krate: Crate) -> Result<(),
         pair[0].value,
         pair[1].value
     );
-    Err(Refused::LateTwice { what })
+    // Under a census the two values stay: the census reports, it never builds.
+    super::serve::end(Refused::LateTwice { what })
 }
 
 /// The directory of `krate`'s root file in its source root, which an included file's name is

@@ -86,7 +86,9 @@ const KEYED_NAME: &str = "\0";
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 23";
+///
+/// 24: every crate root of the closure is named [`ROOT`] in a files table, not only an alias.
+pub const ENCODING: &str = "blaze frozen def map 24";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -655,11 +657,16 @@ fn vfs_path(real: bool, text: String) -> VfsPath {
 /// the same in every checkout. No path or literal holds a NUL.
 const OUT: &str = "\0OUT_DIR";
 
-/// What stands for a crate root that is an alias ([`base_db::Files::alias_of`]: its file's path
-/// and text with a module appended, as `Lowered::append_roots` makes for a test harness or a
-/// proc macro's wasm glue) in the name of a file, after the index of the crate it is the root
-/// of. Its path is its file's and reads back as that file, whose syntax lacks the appended
-/// module's items. No path holds a NUL.
+/// What stands for the root file of a crate of the closure in the name of a file, after the
+/// index of the first crate of the closure it is the root of: every crate root, an ordinary one
+/// and an alias ([`base_db::Files::alias_of`]: its file's path and text with a module appended,
+/// as `Lowered::append_roots` makes for a test harness or a proc macro's wasm glue, whose path
+/// reads back as that file, lacking the appended module's items). Read back, it is that
+/// crate's root file id (`root_file_id` of its crate data), which the crate graph names: by
+/// [`Dec::files`] looked up nowhere and compared, and given by its address
+/// (`pages::make_keyed_files`) as the crate's own root file, with no path to match. No path
+/// holds a NUL. Until `ENCODING` 24 only an alias root was so marked, an ordinary root
+/// written by its path, so a crate given by its address made its root a new file id.
 const ROOT: &str = "\0ROOT";
 
 /// What starts the name of a file outside the VFS (`base_db::Files::included_source`: the
@@ -673,6 +680,18 @@ const ROOT: &str = "\0ROOT";
 /// holds a NUL, and no mark of the port is this text (a mark is a NUL and a lower-case
 /// letter).
 const INCLUDED: &str = "\0INCLUDED";
+
+/// One entry of a files table as [`Enc::finish`] writes it: the index in the closure of the
+/// crate the file is of, its name ([`ROOT`], [`OUT`] or [`INCLUDED`] marked, or its path from
+/// that crate's root directory) and the content ID the bytes were made from. The one reader of
+/// the entry's layout: [`Dec::files`] and `pages::named_files` both read through it.
+fn file_entry<'b>(r: &mut Reader<'b>) -> R<(u32, &'b str, blaze_ids::ContentId)> {
+    let owner = r.uleb32()?;
+    let len = r.uleb32()? as usize;
+    let path = std::str::from_utf8(r.take(len)?).map_err(|_| "a string that is not UTF-8")?;
+    let content = blaze_ids::ContentId(r.take(32)?.try_into().map_err(|_| "a content ID")?);
+    Ok((owner, path, content))
+}
 
 fn out_dir(db: &Db, krate: Crate) -> Option<String> {
     let out = krate.env(db).get("OUT_DIR")?;
@@ -1057,8 +1076,10 @@ impl Enc<'_> {
                 self.dirs.insert(index as u32, dir);
             }
         }
-        if db.files().alias_of(file).is_some() {
-            let root = self.closure.iter().position(|&it| it.data(db).root_file_id == file);
+        // Every crate root of the closure by its mark ([`ROOT`]), never by its path: read back
+        // it is its crate's root file id, the one the crate graph names.
+        let root = self.closure.iter().position(|&it| it.data(db).root_file_id == file);
+        if root.is_some() || db.files().alias_of(file).is_some() {
             let owner = root.ok_or_else(|| {
                 let krate = self.closure[0].named(db);
                 // alloc: error path
@@ -2785,25 +2806,31 @@ impl Dec<'_> {
     /// covers every file's text, so that is a key that left an input out, and the image is
     /// refused rather than read against syntax it was not made from. Each that is not loaded
     /// is noted as an `include!` that found nothing is, for whoever owns the VFS to load.
+    ///
+    /// A crate given by its address (`deps::give_keyed`: its pages trusted as read at the
+    /// address that made them) reads its files from what it was given instead
+    /// ([`pages::keyed_files`]): each file by its owner's own list, looked up nowhere and
+    /// compared with no file. What is compared is two records: the content this one names a
+    /// file with and the content its owner's own pages name it with, which differ only where
+    /// two records of one snapshot disagree. A file of a crate not given by its address is an
+    /// error naming it: every crate below a crate given so is given so.
     fn files(&mut self) -> R {
+        let keyed = pages::keyed_files(self.db, self.krate).is_some();
         let n = self.len()?;
         let mut not_loaded = None;
         for _ in 0..n {
-            let owner = self.u32()?;
-            // alloc: the decoded map's own storage, once per crate served
-            let path = self.str()?.to_owned();
-            let content =
-                blaze_ids::ContentId(self.r.take(32)?.try_into().map_err(|_| "a content ID")?);
+            let (owner, path, content) = file_entry(&mut self.r)?;
             let krate = *self.closure.get(owner as usize).ok_or("a file's crate")?;
+            if keyed {
+                let found = self.keyed_file(krate, path, content)?;
+                self.files.to_mut().push(found);
+                continue;
+            }
+            // alloc: the decoded map's own storage, once per crate served
+            let path = path.to_owned();
             if path == ROOT {
+                // The crate's root file, alias or not ([`ROOT`]): compared by its content.
                 let root = krate.data(self.db).root_file_id;
-                if self.db.files().alias_of(root).is_none() {
-                    // alloc: error path
-                    return Err(format!(
-                        "the root of {} is no alias, as the image's was",
-                        krate.named(self.db)
-                    ));
-                }
                 self.checked(krate, root, &path, content)?;
                 self.files.to_mut().push(root);
                 continue;
@@ -2898,6 +2925,38 @@ impl Dec<'_> {
         Err(format!("{name} of {krate} has content {now:?}, the image was made from {made:?}"))
     }
 
+    /// The file `krate`, given by its address, has at `path` (as a files table names it), from
+    /// the files its own pages name ([`pages::keyed_files`]): no file looked up, no file's
+    /// content read. `made` is the content these bytes name it with, which must be the one its
+    /// owner's pages name it with: two records of one snapshot that disagree on a file are an
+    /// error naming it, never read against each other.
+    fn keyed_file(&self, krate: Crate, path: &str, made: blaze_ids::ContentId) -> R<FileId> {
+        let shown = || if path == ROOT { "its root" } else { path };
+        let Some(keyed) = pages::keyed_files(self.db, krate) else {
+            // alloc: error path
+            return Err(format!(
+                "{} of {}, a crate not given by its address, named by bytes of a crate that was: every crate below one given so is given so",
+                shown(),
+                krate.named(self.db)
+            ));
+        };
+        let Some(found) = keyed.find(path) else {
+            // alloc: error path
+            return Err(format!(
+                "{} of {}, which its own pages (given at {:?}) do not name",
+                shown(),
+                krate.named(self.db),
+                keyed.address()
+            ));
+        };
+        // The file is its owner's by name: its owner's own pages say what it was given with.
+        // The content these bytes name is not compared: a body or comment edit moves it and
+        // neither crate's key, so two records found by their keys may name two contents of
+        // one file (the key is the proof, rule 74).
+        _ = made;
+        Ok(found.file)
+    }
+
     pub(crate) fn file(&mut self) -> R<base_db::EditionedFileId> {
         let byte = self.u8()?;
         // alloc: error path
@@ -2952,9 +3011,30 @@ impl Dec<'_> {
                 }
                 if include {
                     let written = self.file()?;
-                    if call.loc(self.db).include_file_id(self.db, call) != Some(written) {
+                    let found = call.loc(self.db).include_file_id(self.db, call);
+                    if found != Some(written) {
+                        // Both files by their names here: the one the bytes name, and the one
+                        // the call resolves to in this database (or that it resolves to none).
+                        let named = |file: base_db::EditionedFileId| {
+                            let file = file.file_id(self.db);
+                            let source_root = self.db.file_source_root(file).source_root_id(self.db);
+                            let path = self.db.source_root(source_root).source_root_ref(self.db).path_for_file(&file).cloned();
+                            // alloc: error path
+                            match path {
+                                Some(path) => format!("{path} ({file:?})"),
+                                None => format!("{file:?}, which has no path in its source root"),
+                            }
+                        };
+                        let found = match found {
+                            Some(found) => named(found),
+                            // alloc: error path
+                            None => "no file (the path names no file of the snapshot, and none was read from disk)".to_owned(),
+                        };
                         // alloc: error path
-                        return Err("an include! of another file than was written".to_owned());
+                        return Err(format!(
+                            "an include! of another file than was written: the bytes name {}, and the call resolves to {found}",
+                            named(written)
+                        ));
                     }
                 }
                 self.calls.push(call);
@@ -4149,21 +4229,36 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
         assert_eq!(frozen(), frozen());
     }
 
-    /// The names `script`'s encoder gives its own root and its dependency's, two crates of one
-    /// source root, with `script` at `at`.
-    fn names_with_script_at(at: &str) -> [(u32, String); 2] {
-        let text =
-            format!("//- {at} crate:script deps:dep\n//- /dep.rs crate:dep\npub fn f() {{}}\n");
-        let db = fixture::db(&text).into_db();
+    /// The names `script`'s encoder gives its own root, its dependency's root and its
+    /// dependency's module file `/dep/inner.rs`, two crates of one source root, with `script`
+    /// at `at`.
+    fn names_with_script_at(at: &str) -> [(u32, String); 3] {
+        let text = format!(
+            "//- {at} crate:script deps:dep\n//- /dep/lib.rs crate:dep\npub mod inner;\n\
+             //- /dep/inner.rs\npub fn f() {{}}\n"
+        );
+        let fixture = fixture::db(&text);
+        let inner = fixture.file_at("/dep/inner.rs").file_id(fixture.db());
+        let db = fixture.into_db();
         let (script, dep) = (crate_named(&db, "script"), crate_named(&db, "dep"));
         let mut enc = Enc::new(&db, script);
-        [script, dep].map(|it| enc.file_name(it.data(&db).root_file_id).unwrap())
+        let mut name = |file| enc.file_name(file).unwrap();
+        [name(script.data(&db).root_file_id), name(dep.data(&db).root_file_id), name(inner)]
     }
 
+    /// A crate root is named by its mark ([`ROOT`]) and its crate's place in the closure,
+    /// whatever its path (read back, it is its crate's root file id); any other file from the
+    /// crate whose root's directory is the deepest above it: `/dep/inner.rs` is `dep`'s even
+    /// with `script`'s root at `/build.rs`, whose directory is above it too. Moving `script`
+    /// renames none. Roots short-cut the nearest-crate choice, so the module file is what
+    /// tests it.
     #[test]
     fn a_file_is_named_from_the_nearest_crate_of_its_source_root() {
         let names = names_with_script_at("/build.rs");
-        assert_eq!(names, [(0, "build.rs".to_owned()), (1, "dep.rs".to_owned())]);
+        assert_eq!(
+            names,
+            [(0, ROOT.to_owned()), (1, ROOT.to_owned()), (1, "inner.rs".to_owned())]
+        );
         assert_eq!(
             names_with_script_at("/tools/gen/build.rs"),
             names,

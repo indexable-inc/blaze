@@ -93,6 +93,10 @@ fn put_relocs(out: &mut Vec<u8>, relocs: &Relocs<Ref>) {
             Ref::Counter => out.put_u8(5),
             Ref::ProfileCounters => out.put_u8(6),
             Ref::Own => out.put_u8(7),
+            Ref::Text(at) => {
+                out.put_u8(8);
+                out.put_u32(at);
+            }
         }
     }
     put_len(out, relocs.wide().len());
@@ -273,6 +277,7 @@ impl<'a> In<'a> {
             5 => Ref::Counter,
             6 => Ref::ProfileCounters,
             7 => Ref::Own,
+            8 => Ref::Text(self.0.u32()?),
             _ => return self.fail("no such reference"),
         })
     }
@@ -486,7 +491,9 @@ fn encoded_len(template: &Template) -> usize {
     let relocs = |relocs: &Relocs<Ref>| {
         let targets = relocs.targets().iter().map(|it| match it {
             Ref::Position(_) => 1 + 32 + 4,
-            Ref::Place(_) | Ref::Data(_) | Ref::Extern(_) | Ref::Coverage(_) => 1 + 4,
+            Ref::Place(_) | Ref::Data(_) | Ref::Text(_) | Ref::Extern(_) | Ref::Coverage(_) => {
+                1 + 4
+            }
             Ref::Counter | Ref::ProfileCounters | Ref::Own => 1,
         });
         4 + RELOC_BYTES * relocs.len()

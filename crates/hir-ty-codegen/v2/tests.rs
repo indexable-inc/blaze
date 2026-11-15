@@ -93,7 +93,7 @@ fn stencils() -> Option<String> {
 }
 
 /// A build at `level` of members and dependencies, whose units are as [`spec`]'s.
-fn policy(level: OptLevel) -> Policy {
+pub(crate) fn policy(level: OptLevel) -> Policy {
     let toolchain =
         Toolchain { llvm: Some("test".to_owned()), stencils: stencils(), ..spec().toolchain };
     Policy {

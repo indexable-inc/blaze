@@ -704,6 +704,13 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     if let Some(what) = args::refused(asked) {
         return refused(&what, color);
     }
+    // Asked for by name, never taken because no daemon answers.
+    if asked.flags.no_daemon {
+        return match no_daemon(asked, color) {
+            Ok(code) => code,
+            Err(what) => refused(&what, color),
+        };
+    }
     // Each stretch of the client's own time is a span (slow-is-p0-traced): they reach the
     // history with the client's rows (`client_rows`), under the build the daemon names.
     let preparing = tracing::info_span!(
@@ -905,6 +912,132 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
         // stdout or stderr closed under it: nothing more can be said.
         Err(_) => Exit::Failed.code(),
     }
+}
+
+/// `check`, `build` and `run` with `--no-daemon` (`blaze_command`): this process resolves the
+/// checkout into its unit graph, runs the keyed driver's host with the front end, files the
+/// records under `<home>/v2/keyed` and prints what it did; its exit code. `build` and `run`
+/// link the one program into the workspace's build dir (`<builds>/<workspace>/debug`), and
+/// `run` then becomes it (exec). Every step that cannot be done is an error naming it: no
+/// daemon is started or asked, and nothing is done another way.
+fn no_daemon(asked: &Invocation, color: bool) -> Result<i32, String> {
+    use std::alloc::Global;
+
+    use blaze_command::{front, graph, print as said, run as keyed};
+
+    let command = match asked.command() {
+        Command::Check => blaze_units::query::Command::Check,
+        Command::Build => blaze_units::query::Command::Build,
+        Command::Run => blaze_units::query::Command::Run,
+        other => {
+            return Err(format!(
+                "`--no-daemon` is `check`'s, `build`'s and `run`'s: `{}` with no daemon is not built yet",
+                other.name()
+            ));
+        }
+    };
+    if asked.flags.goal == Some(blaze_api::Goal::Max) {
+        return Err("`--goal max` with `--no-daemon`: the release tier is not made yet (rule: blaze_command::program::NO_RELEASE_TIER)".to_owned());
+    }
+    if command != blaze_units::query::Command::Check && std::env::var_os("CARGO_TARGET_DIR").is_some() {
+        return Err("`--no-daemon` builds into blaze's build dir for the workspace; `CARGO_TARGET_DIR` is not read by it yet".to_owned());
+    }
+    let began = Instant::now();
+    let (place, cargo) = prepared_cargo(asked, color)?;
+    // The workspace's directory, as the build dir is named by it (`blaze_manifest::home::build_dir`).
+    let workspace_root = place.manifest.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| place.root.clone());
+    crate::toolchain::ensure()?;
+    let library = crate::toolchain::library::fetch()?;
+    let home = crate::serve::root().map_err(|error| format!("{error:#}"))?;
+    let state = crate::serve::state().map_err(|error| format!("{error:#}"))?;
+    let builds = crate::serve::builds().map_err(|error| format!("{error:#}"))?;
+    let builds_dir = builds.clone();
+    let sources = crate::serve::sources().map_err(|error| format!("{error:#}"))?;
+    let makers = crate::serve::record_makers()?;
+    let std_dir = crate::serve::machine().map_err(|error| format!("{error:#}"))?.join("std").join(format!("{:x}", makers.id()));
+    let front_end = crate::serve::front_end_code()?.0;
+    let host = crate::toolchain::host().ok_or("blaze has no target triple for this machine's architecture and system")?;
+    let utf8 = |path: &std::path::Path| path.to_str().map(str::to_owned).ok_or_else(|| format!("{} is not named in UTF-8", path.display()));
+    let (std_dir, builds, sources) = (utf8(&std_dir)?, utf8(&builds)?, utf8(&sources)?);
+    let store = keyed::store_settings(&home.join("v2").join("keyed")).map_err(|error| error.to_string())?;
+    let tools = state.join("tools");
+    let inputs = graph::Inputs {
+        invocation: blaze_units::query::Invocation {
+            command,
+            args: crate::serve::undrawn(&cargo.args),
+            root: cargo.root,
+            cwd: cargo.cwd,
+            env: cargo.env,
+            files: cargo.files,
+        },
+        host,
+        library: graph::Library { dir: &library.dir, digest: &library.digest, commit: &library.commit },
+        std: &std_dir,
+        builds: &builds,
+        sources: &sources,
+        blaze: crate::release::get().version,
+        front_end,
+        tools: &tools,
+        org: store.org.as_deref().map(blaze_keyed::kind::Namespace::named),
+        trusted_writer: store.trusted_writer,
+    };
+    let prepare = began.elapsed();
+
+    let began = Instant::now();
+    let graph = graph::load(&inputs, Global).map_err(|error| error.to_string())?;
+    let load = began.elapsed();
+    let began = Instant::now();
+    let shown = |error: &blaze_command::CommandError| {
+        let mut text = String::new();
+        let _ = said::error(&graph, error, &mut text);
+        text.trim_end().to_owned()
+    };
+    let mut command_front = front::Command::new(&graph, Global).map_err(|error| shown(&error))?;
+    let made = began.elapsed();
+    let cores = blaze_core::cores::get().map_err(|error| format!("the cores this process may use: {error}"))?.budget.get();
+    let topology = blaze_graph::topology::Topology::detect().map_err(|error| format!("this machine's cores: {error}"))?;
+    let fast = topology.cpus.iter().filter(|cpu| cpu.fast).count();
+    let machine = blaze_keyed::machine::Machine {
+        cores: u32::try_from(cores).unwrap_or(u32::MAX),
+        fast_cores: u32::try_from(fast.clamp(1, cores)).unwrap_or(u32::MAX),
+        page_bytes: crate::raw::memory::page_bytes()
+            .and_then(|it| u32::try_from(it).ok())
+            .ok_or("this machine's page size: sysconf(_SC_PAGESIZE) said none")?,
+        memory_bytes: crate::raw::memory::machine_bytes().ok_or("the memory this machine has: the kernel said none")?,
+        qos: cfg!(target_os = "macos"),
+        huge_pages: false,
+    };
+    let summary = match command {
+        blaze_units::query::Command::Check => keyed::check(&graph, &mut command_front, &home, machine, Global).map_err(|error| shown(&error))?,
+        _ => {
+            let out_dir = blaze_manifest::home::build_dir(&builds_dir, &workspace_root).join("debug");
+            let built = keyed::build(&graph, &mut command_front, &home, &out_dir, machine, Global).map_err(|error| shown(&error))?;
+            for note in built.notes.iter() {
+                blaze_report::err!("{note}");
+            }
+            if asked.command() == Command::Run && said::succeeded(&built.summary.outcome) {
+                let Some(path) = built.program else {
+                    return Err("`run`: the build placed no program".to_owned());
+                };
+                let mut text = String::new();
+                let _ = said::summary(&graph, &built.summary, &[("prepare", prepare), ("load", load), ("front", made)], &mut text);
+                blaze_report::err!("{}", text.trim_end());
+                command_front.exit();
+                // Returns only when the exec failed.
+                return Err(shown(&keyed::start(&path, &asked.program)));
+            }
+            built.summary
+        }
+    };
+    let mut text = String::new();
+    let _ = said::summary(&graph, &summary, &[("prepare", prepare), ("load", load), ("front", made)], &mut text);
+    blaze_report::err!("{}", text.trim_end());
+    let code = match said::succeeded(&summary.outcome) {
+        true => 0,
+        false => Exit::Failed.code(),
+    };
+    command_front.exit();
+    Ok(code)
 }
 
 /// `check --replace`'s edits made in the checkout: its exit code.

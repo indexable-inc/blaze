@@ -40,6 +40,9 @@ pub enum Ref {
     Place(u32),
     /// The `n`th of the template's own data.
     Data(u32),
+    /// The text composed from the `n`th of the template's own data, its recipe
+    /// ([`Target::Text`]).
+    Text(u32),
     Position(SpanRef),
     /// The `n`th of the template's own [`Template::externs`].
     Extern(u32),
@@ -506,6 +509,7 @@ fn check_refs(refs: &Refs) -> Result<(), TemplateError> {
         matches!(
             it,
             Target::Data(_)
+                | Target::Text(_)
                 | Target::Position(_)
                 | Target::Coverage(_)
                 | Target::Counter(_)
@@ -588,18 +592,8 @@ fn template_relocs(
 ) -> Result<Relocs<Ref>, TemplateError> {
     relocs.try_map_in(frame, |target| {
         Ok(match target {
-            Target::Data(id) => {
-                let Some(at) = data.iter().position(|it| it.id == *id) else {
-                    return Err(TemplateError::ForeignData(*id));
-                };
-                let at = at as u32;
-                if let Some(data) = before
-                    && at >= data
-                {
-                    return Err(TemplateError::DataOrder { data, points_at: at });
-                }
-                Ref::Data(at)
-            }
+            Target::Data(id) => Ref::Data(own_datum(data, before, id)?),
+            Target::Text(id) => Ref::Text(own_datum(data, before, id)?),
             Target::Position(span) => Ref::Position(relative(*span, anchors)),
             Target::Coverage(array) if *array < Covered::ARRAYS => Ref::Coverage(*array),
             Target::Coverage(array) => return Err(TemplateError::Coverage(*array)),
@@ -613,6 +607,21 @@ fn template_relocs(
             other => reference(refs, externs, other)?,
         })
     })
+}
+
+/// The place among `data` of the datum `id` a relocation names ([`Target::Data`], or the
+/// recipe of a [`Target::Text`]), which is before `before` where that is a datum's own.
+fn own_datum(data: &[Data], before: Option<u32>, id: &ContentId) -> Result<u32, TemplateError> {
+    let Some(at) = data.iter().position(|it| it.id == *id) else {
+        return Err(TemplateError::ForeignData(*id));
+    };
+    let at = at as u32;
+    if let Some(data) = before
+        && at >= data
+    {
+        return Err(TemplateError::DataOrder { data, points_at: at });
+    }
+    Ok(at)
 }
 
 fn template_data(
@@ -698,14 +707,8 @@ fn instantiate_relocs<E: AsRef<str>>(
                 // alloc: the instance's own target, kept by the build
                 Target::Extern(name.as_ref().to_owned())
             }
-            Ref::Data(at) => {
-                if let Some(data) = before
-                    && at >= data
-                {
-                    return Err(TemplateError::DataOrder { data, points_at: at });
-                }
-                Target::Data(data.get(at as usize).ok_or(TemplateError::Place(at))?.id)
-            }
+            Ref::Data(at) => Target::Data(instance_datum(data, before, at)?),
+            Ref::Text(at) => Target::Text(instance_datum(data, before, at)?),
             Ref::Position(span) => Target::Position(absolute(span, anchors)?),
             Ref::Coverage(array) if array < Covered::ARRAYS => Target::Coverage(array),
             Ref::Coverage(array) => return Err(TemplateError::Coverage(array)),
@@ -715,6 +718,17 @@ fn instantiate_relocs<E: AsRef<str>>(
             Ref::Own => Target::Direct(own.ok_or(TemplateError::Own)?),
         })
     })
+}
+
+/// The ID of the `at`th of an instance's `data` a [`Ref::Data`] or [`Ref::Text`] names,
+/// which is before `before` where that is a datum's own.
+fn instance_datum(data: &[Data], before: Option<u32>, at: u32) -> Result<ContentId, TemplateError> {
+    if let Some(data) = before
+        && at >= data
+    {
+        return Err(TemplateError::DataOrder { data, points_at: at });
+    }
+    Ok(data.get(at as usize).ok_or(TemplateError::Place(at))?.id)
 }
 
 /// A function's code names PGO counters only when it is instrumented: they are its record's.
@@ -1134,6 +1148,7 @@ fn ref_into(hasher: &mut Hasher, target: &Ref) {
         Ref::Counter => hasher.update(&[5]),
         Ref::ProfileCounters => hasher.update(&[6]),
         Ref::Own => hasher.update(&[7]),
+        Ref::Text(at) => hasher.update(&[8]).update(&at.to_le_bytes()),
     };
 }
 

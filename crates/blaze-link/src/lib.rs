@@ -15,7 +15,8 @@
 //! The one `unsafe` block is `intern::name_at`'s `from_utf8_unchecked` of names it appended as
 //! `&str`s.
 
-#![feature(allocator_api, allocator_ext, variant_count)]
+// `btreemap_alloc`: a B-tree set over a named allocator (`elf::dynamic::KeptRela::open`'s empty slots).
+#![feature(allocator_api, allocator_ext, btreemap_alloc, variant_count)]
 #![feature(register_tool)]
 #![register_tool(blaze)]
 #![deny(unsafe_code)]
@@ -31,6 +32,7 @@ mod dwarf;
 mod elf;
 mod file;
 mod intern;
+mod keep;
 mod layout;
 mod lazy;
 mod live;
@@ -49,6 +51,7 @@ mod sanitize;
 mod shape;
 mod stage;
 mod state;
+mod step;
 mod symbols;
 mod table;
 pub mod target;
@@ -76,10 +79,11 @@ use blaze_items::ItemKey;
 use blaze_mem::Frame;
 use std::alloc::Global;
 
+pub use keep::{KeepError, KeepRefusal, LAYOUT, Verified, verify};
 pub use layout::Heat;
 pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};
-pub use patch::Patch;
+pub use patch::{FileEdit, Patch, PatchBase};
 pub use beside::{DebugWrite, crc32 as debuglink_crc32, id_of as debug_file_id};
 pub use output::{
     Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
@@ -91,6 +95,7 @@ pub use position::{
 };
 pub use premap::{NoOutside, Outside};
 pub use shape::RegionShape;
+pub use step::{StepError, Stepped, step};
 
 use commit::{Pending, Undo, Writes};
 use model::{Formats, NativeFile, Plan, Writer};
@@ -383,6 +388,10 @@ pub struct Image {
     /// The debug side file as last given ([`Image::debug_file`]), of an image whose debug
     /// info is beside it ([`Debug::Beside`]); empty for every other.
     beside: beside::Kept,
+    /// The planted bug of `a_column_left_out_of_keep_is_named`: [`Image::keep`] writes this
+    /// section of the state as an empty state's.
+    #[cfg(test)]
+    plant_keep_empty: Option<&'static str>,
 }
 
 impl Image {
@@ -500,6 +509,8 @@ impl Image {
             placed_pairs: Vec::new(),
             filed: patch::Filed::new(),
             beside: beside::Kept::new(),
+            #[cfg(test)]
+            plant_keep_empty: None,
         })
     }
 

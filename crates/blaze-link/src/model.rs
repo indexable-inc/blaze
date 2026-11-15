@@ -938,6 +938,38 @@ pub(crate) struct Exported {
     pub own: Option<(SymbolKind, u64)>,
 }
 
+/// The key of [`local_order`]'s hash: fixed, so the order is the same on every machine and in
+/// every process (rule 25).
+const LOCAL_ORDER: blaze_hash::SipKey = blaze_hash::SipKey::new(0x626c_617a_652d_7379, 0x6d74_6162_2d6c_6f63);
+
+/// The indexes in `functions` of those with a name `local` takes, in the order a symbol table
+/// lists their local symbols: by [`LOCAL_ORDER`]'s hash of the name, ties by index. Never by
+/// address: a body edit puts the new body in the patch region, so in address order its
+/// function moved to the end and every local after its old place shifted by one entry and
+/// its name by one name, about 30 bytes a function written per edit
+/// (`a_body_edits_patch_does_not_grow_with_the_image`). By name, an edited function keeps
+/// its index and its name's place. The order is a function of the names alone, never of
+/// history: the canonical form of a table made whole. In it a function added or removed
+/// shifts the locals after it (half the table on average) where its floor is one entry and
+/// one name, so an incremental ELF output keeps each local's place once placed and patches by
+/// place (`elf/image.rs`'s `KeptSymtab`, kept with the state: a patched table is history and
+/// is a whole one's by name only); there this order gives only the canonical form, which any
+/// fixed order would. Mach-O's symbol table, not yet kept by place, still relies on it to keep
+/// a body edit at one entry. ELF's `.symtab` and Mach-O's `LC_SYMTAB` both list locals in any
+/// order (no loader reads them; debuggers sort them). One hash a name and one radix sort,
+/// `O(functions)`.
+pub(crate) fn local_order(functions: &[Function], local: impl Fn(&str) -> bool) -> Vec<u32, std::alloc::Global> {
+    let mut keyed: Vec<(u128, u32), std::alloc::Global> = Vec::with_capacity_in(functions.len(), std::alloc::Global);
+    keyed.extend(functions.iter().enumerate().filter_map(|(at, function)| {
+        let name = function.name.as_deref().filter(|it| local(it))?;
+        Some((blaze_ids::radix::pack_64(LOCAL_ORDER.hash(name.as_bytes()), at as u64), at as u32))
+    }));
+    blaze_ids::radix::sort_copy_by_key(&mut keyed, |it| it.0);
+    let mut order = Vec::with_capacity_in(keyed.len(), std::alloc::Global);
+    order.extend(keyed.iter().map(|it| it.1));
+    order
+}
+
 /// A placed function, for the unwind tables and the debug info.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Function {

@@ -1082,7 +1082,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             owner,
             random_state: blaze_rng::SplitMix64::new(0),
             param_env: trait_env.unwrap_or_else(|| ParamEnvAndCrate {
-                param_env: db.trait_environment(owner.generic_def(db)),
+                param_env: owner.param_env(db),
                 krate: crate_id,
             }),
             crate_id,

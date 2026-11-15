@@ -32,7 +32,7 @@ use hir_ty::{
 use rustc_type_ir::{TypeFoldable, TypeVisitableExt};
 
 use super::{
-    DataPlace, HashSource, Hashes, HirInstance, HirStatic, Kind, Places,
+    DataPlace, HashSource, Hashes, HirInstance, HirStatic, Kind, Places, TextSlot,
     convert::{DataTarget, Resolver},
 };
 use crate::{
@@ -379,17 +379,17 @@ pub(crate) fn place_requests<A: Allocator>(
             }
             DataRequest::Location(None) => DataPlace::Nowhere,
             DataRequest::Declaration(func) => DataPlace::Position(hashes.declaration(db, *func)?),
-            DataRequest::FilePath(file) => DataPlace::Text(hashes.file_name(db, *file)?),
             DataRequest::Text(parts) => {
-                // alloc: the text its data place keeps, one per `file!()` text of the function
-                let mut text = String::new();
+                // Each file by its span, item-relative: its name is the link's to write.
+                let mut slots = Vec::with_capacity_in(parts.len(), Global);
                 for part in parts.iter() {
-                    match part {
-                        TextPart::Text(it) => text.push_str(it),
-                        TextPart::FilePath(file) => text.push_str(&hashes.file_name(db, *file)?),
-                    }
+                    slots.push(match part {
+                        // clone: the literal, which the place keeps; one per `concat!` with `file!()`
+                        TextPart::Text(it) => TextSlot::Bytes(it.clone()),
+                        TextPart::FileOf(owner, span) => TextSlot::File(hashes.span(db, *owner, *span)?),
+                    });
                 }
-                DataPlace::Text(text)
+                DataPlace::Text(slots)
             }
         };
         datas.push(place);
@@ -523,8 +523,8 @@ impl Resolver for Placed<'_> {
             Some(DataPlace::Place(place)) => self.target(*place).map(DataTarget::Target),
             Some(DataPlace::Position(span)) => Ok(DataTarget::Target(Target::Position(*span))),
             Some(DataPlace::Own) => Ok(DataTarget::Own),
-            // clone: only a `file!()` text; `Resolver::data` returns an owned `DataTarget`
-            Some(DataPlace::Text(text)) => Ok(DataTarget::Text(text.clone())),
+            // clone: only a `concat!` with `file!()`; `Resolver::data` returns an owned `DataTarget`
+            Some(DataPlace::Text(slots)) => Ok(DataTarget::Text(slots.clone())),
             Some(DataPlace::Nowhere) => Ok(DataTarget::Nowhere),
             None => Err(format!("data {index} has no place")), // alloc: the error's message
         }

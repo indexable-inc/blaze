@@ -221,6 +221,118 @@ pub fn record_in<T, A: Allocator>(
     Ok((value, rows))
 }
 
+/// Who made a row of [`record_readers`]: the innermost tracked query whose run read it, or the
+/// recorded work itself when no tracked query was running.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Reader {
+    /// The work given to [`record_readers`], outside any query it asked.
+    Work,
+    /// The entry of a tracked query: its kind and its key's hash (the entry's trie hash; the
+    /// key itself is behind the kind's typed table, which a type-erased entry cannot print).
+    /// A fixpoint member reads through its head's lists, so its rows name the member asked.
+    /// `at` is the entry's place in its [`Readers`]' walk: [`Readers::chain`] gives the asks
+    /// from the work down to it.
+    Query { kind: KindId, key_hash: u64, at: u32 },
+}
+
+/// What [`record_readers`] gives: each row with its [`Reader`], and the walk's one buffer of
+/// entries, each with the entry that asked it, from which [`Readers::chain`] reads a reader's
+/// path of asks.
+pub struct Readers {
+    /// Sorted and deduplicated by row then reader.
+    pub rows: Vec<(Read, Reader), Global>,
+    /// Each entry the walk reached, once: its kind and the index of the entry it was first
+    /// reached from ([`ASKED_BY_WORK`] for one the work asked).
+    asked: Vec<(KindId, u32), Global>,
+}
+
+/// The asker index of an entry the recorded work asked itself.
+const ASKED_BY_WORK: u32 = u32::MAX;
+
+impl Readers {
+    /// The kinds on `reader`'s path of asks, innermost (the reader) first, up to the query the
+    /// work asked; empty for [`Reader::Work`]. One path where several reach the entry: the one
+    /// the walk met first, each step a real ask. Bounded by the walk's entries (each reached
+    /// once, its asker reached before it).
+    pub fn chain(&self, reader: Reader) -> impl Iterator<Item = KindId> + '_ {
+        let mut at = match reader {
+            Reader::Work => ASKED_BY_WORK,
+            Reader::Query { at, .. } => at,
+        };
+        std::iter::from_fn(move || {
+            let (kind, asker) = *self.asked.get(usize::try_from(at).ok()?)?;
+            at = asker;
+            Some(kind)
+        })
+    }
+}
+
+impl fmt::Display for Reader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Reader::Work => f.write_str("the recorded work"),
+            Reader::Query { kind, key_hash, .. } => write!(f, "{}(key hash {key_hash:#018x})", kind.name()),
+        }
+    }
+}
+
+/// [`record`], each row with its [`Reader`]: the innermost tracked query whose run read it
+/// (a row merged from a callee keeps the callee, not its asker). Sorted and deduplicated by
+/// row then reader, so a row two entries read appears once for each. Its rows, readers
+/// dropped and deduplicated, are [`record`]'s for the same run (`tests/reads.rs`).
+///
+/// A debugging and test surface: [`record`] pays nothing for it. The readers are not kept at
+/// each read: every entry's lists already hold the rows its own run read (its direct list),
+/// so this walks the callee graph as the flat list's walk does but never takes a made flat list
+/// whole (that would lose who read its rows), naming each entry's direct rows by the entry.
+/// Cost: a walk of the recorded work's whole closure, each entry once, keeping one
+/// `(kind, asker)` pair per entry for [`Readers::chain`].
+///
+/// # Errors
+///
+/// [`RecorderOff`] when the snapshot keeps no read lists.
+///
+/// # Panics
+///
+/// When the walk reaches `u32::MAX - 1` entries.
+pub fn record_readers<T>(memo: &Memo, work: impl FnOnce() -> T) -> Result<(T, Readers), RecorderOff> {
+    if memo.reads() != Reads::Kept {
+        return Err(RecorderOff);
+    }
+    let frame = task::Run::recorder(memo);
+    let pushed = task::push(&frame);
+    let value = work();
+    let taken = frame.take_reads();
+    drop(pushed);
+    // As in `record_in`: an outer run read what this work read.
+    task::replay_taken(&taken);
+    let mut rows: Vec<(Read, Reader), Global> = Vec::new_in(Global);
+    rows.extend(taken.reads.iter().map(|read| (*read, Reader::Work)));
+    let mut asked: Vec<(KindId, u32), Global> = Vec::new_in(Global);
+    let mut seen: blaze_hash::HashSet<*const Head, Global> = blaze_hash::HashSet::new_in(Global);
+    let mut todo: Vec<(*const Head, u32), Global> = Vec::new_in(Global);
+    todo.extend(taken.callees.iter().map(|callee| (*callee, ASKED_BY_WORK)));
+    while let Some((entry, asker)) = todo.pop() {
+        if !seen.insert(entry) {
+            continue;
+        }
+        // SAFETY: a callee outlives every entry and run that names it ([`Lists`]).
+        let head = unsafe { &*entry };
+        let at = u32::try_from(asked.len())
+            .ok()
+            .filter(|it| *it != ASKED_BY_WORK)
+            .expect("record_readers: more entries than a u32 index names");
+        asked.push((KindId(head.kind), asker));
+        let Some(lists) = head.lists() else { continue };
+        let reader = Reader::Query { kind: KindId(head.kind), key_hash: head.hash, at };
+        rows.extend(lists.direct().iter().map(|read| (*read, reader)));
+        todo.extend(lists.callees().iter().map(|callee| (*callee, at)));
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    Ok((value, Readers { rows, asked }))
+}
+
 /// What one entry read, under [`Reads::Kept`]: its direct rows and the entries it asked, made
 /// once with the entry in its arena (`slot`), and its flat list, made at most once, on demand
 /// ([`Lists::flat`]). Never written after it is made but for `flat`, set once.

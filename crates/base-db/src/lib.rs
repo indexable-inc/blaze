@@ -53,10 +53,10 @@ pub use crate::{
         Committed, Db, Edit, MakeGiven, Reader, RunOrder, Shared, par_for_each, par_for_each_small, par_map,
         set_run_order, WrittenCrate,
     },
-    editioned_file_id::EditionedFileId,
-    files::{AliasError, ExpansionRead, Files, Port, ReadBy},
+    editioned_file_id::{EditionedFileId, NoText},
+    files::{AliasError, Disk, ExpansionRead, Files, Port, ReadBy},
     handles::{
-        FileSourceRootInput, FileText, INCLUDED_READ, IncludedFile, LOOKS_EVERY_TIME, RawFile, ReadError,
+        FileSourceRootInput, FileText, GivenFile, INCLUDED_READ, IncludedFile, LOOKS_EVERY_TIME, RawFile, ReadError,
         SourceRootInput, VfsFileRoot, VfsRoot, VfsText, line_index,
     },
     input::{
@@ -69,7 +69,7 @@ pub use crate::{
     },
     named::NAMED_PATHS_DOMAIN,
     reparse::Reparse,
-    settings::{BorrowckMode, FrontSettings, FrontSettingsData},
+    settings::{BorrowckMode, FrontSettings, FrontSettingsData, SettingField},
     view::{ViewChange, ViewError, ViewFile, ViewRoot},
     world::{CrateKey, Plant, WorldCrateData},
 };

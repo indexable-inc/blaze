@@ -421,16 +421,21 @@ impl AssocItemId {
             AssocItemId::FunctionId(function_id) => {
                 let loc = function_id.lookup(db);
                 trait_item_visibility(db, loc.container)
+                    .or_else(|| served_impl_item_visibility(db, function_id, loc.container, self))
                     .unwrap_or_else(|| written_visibility(db, function_id, loc.id))
             }
             AssocItemId::ConstId(const_id) => {
                 let loc = const_id.lookup(db);
                 trait_item_visibility(db, loc.container)
+                    .or_else(|| served_impl_item_visibility(db, const_id, loc.container, self))
                     .unwrap_or_else(|| written_visibility(db, const_id, loc.id))
             }
             AssocItemId::TypeAliasId(type_alias_id) => {
                 let loc = type_alias_id.lookup(db);
                 trait_item_visibility(db, loc.container)
+                    .or_else(|| {
+                        served_impl_item_visibility(db, type_alias_id, loc.container, self)
+                    })
                     .unwrap_or_else(|| written_visibility(db, type_alias_id, loc.id))
             }
         }
@@ -444,7 +449,39 @@ fn trait_item_visibility(db: &Db, container: ItemContainerId) -> Option<Visibili
     }
 }
 
+/// The visibility written on `item`, an item of the impl `container`, resolved for
+/// `has_resolver` (the item), where its crate's image holds it
+/// (`deps::signatures::served_impl_visibilities`): no file of the crate is read. `None` for
+/// an item of a trait, or of a crate read from no image's pages.
+///
+/// # Panics
+///
+/// Where the image holds the impl's visibilities and `item` is not among the impl's items: the
+/// two are one record ([`crate::deps::signatures::AssocRecord`]), so that is a corrupt image.
+fn served_impl_item_visibility(
+    db: &Db,
+    has_resolver: impl HasResolver + HasModule,
+    container: ItemContainerId,
+    item: AssocItemId,
+) -> Option<Visibility> {
+    let ItemContainerId::ImplId(impl_) = container else { return None };
+    let visibilities = crate::deps::signatures::served_impl_visibilities(db, impl_).as_ref()?;
+    let items = &crate::nameres::assoc::ImplItems::of(db, impl_).0.items;
+    let Some(at) = items.iter().position(|&(_, it)| it == item) else {
+        panic!(
+            "the image of crate {} is corrupt: {item:?} is not among the items its record holds \
+             of {impl_:?}, which hold its visibility",
+            impl_.lookup(db).container.krate(db).named(db)
+        )
+    };
+    Some(resolve_raw(db, has_resolver, &visibilities[at]))
+}
+
 fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
+    // Of a crate read from an image's pages, the visibility its record holds.
+    if let Some(raw) = crate::deps::signatures::served_trait_visibility(db, def) {
+        return resolve_raw(db, def, raw);
+    }
     written_visibility(db, def, def.lookup(db).id)
 }
 

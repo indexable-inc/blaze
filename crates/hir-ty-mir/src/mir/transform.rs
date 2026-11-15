@@ -73,7 +73,7 @@ pub(super) struct Ctx<'f, 'db> {
 impl<'f, 'db> Ctx<'f, 'db> {
     pub(super) fn new(db: &'db Db, owner: InferBodyId<'db>, frame: &'f Frame) -> Self {
         let krate = owner.krate(db);
-        let env = db.trait_environment(owner.generic_def(db));
+        let env = owner.param_env(db);
         let interner = DbInterner::new_with(db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         // `for const` binders (`#![feature(blaze_comptime)]`): the passes solve what inference

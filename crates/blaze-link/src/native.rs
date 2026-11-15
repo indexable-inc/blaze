@@ -4207,6 +4207,10 @@ fn keep<T: PartialEq>(was: &Arc<Vec<T>>, now: Vec<T>) -> Arc<Vec<T>> {
     }
 }
 
+mod kept;
+
+pub(crate) use kept::open_input;
+
 #[cfg(test)]
 mod ties_tests;
 

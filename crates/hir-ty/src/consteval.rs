@@ -642,7 +642,7 @@ pub fn evaluate_by_mir<'db>(
         // The crate the constant is evaluated for, not the one it is in: the impls its
         // generic arguments select can be in crates its own doesn't depend on.
         ParamEnvAndCrate {
-            param_env: db.trait_environment(owner.generic_def(db)),
+            param_env: owner.param_env(db),
             krate: trait_env.map_or_else(|| owner.krate(db), |env| env.krate),
         }
         .store(),

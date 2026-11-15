@@ -1157,14 +1157,13 @@ impl<'a> Emitted<'a> {
                     blaze_items::key::path(self.db, blaze_items::ItemId::Function(*f))
                 );
             }
-            DataRequest::FilePath(_) => self.out.push_str("a file's path\n"),
             DataRequest::Text(parts) => {
                 for part in parts {
                     match part {
                         crate::fragment::TextPart::Text(it) => {
                             let _ = write!(self.out, "{it:?} ");
                         }
-                        crate::fragment::TextPart::FilePath(_) => self.out.push_str("<file> "),
+                        crate::fragment::TextPart::FileOf(..) => self.out.push_str("<file> "),
                     }
                 }
                 self.out.push('\n');

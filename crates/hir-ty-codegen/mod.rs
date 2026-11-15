@@ -9493,7 +9493,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             text.push(match part {
                 ConcatPart::Text(text) => TextPart::Text(text),
                 ConcatPart::Location(expander, range) => {
-                    let Some((file, line, col)) = macro_location_of(db, call.file_id, range) else {
+                    let Some((_, line, col)) = macro_location_of(db, call.file_id, range) else {
                         unsupported!("`concat!` of a place that is not in a file");
                     };
                     // alloc: the text of the data object, which a `TextPart` owns; once per
@@ -9503,7 +9503,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         BuiltinFnLikeExpander::Line => TextPart::Text(line.to_string()),
                         // alloc: as above
                         BuiltinFnLikeExpander::Column => TextPart::Text(col.to_string()),
-                        _ => TextPart::FilePath(file),
+                        // The file is the one the literal is written in, as the `Location` of
+                        // the literal's expression names it: the link writes its name.
+                        _ => TextPart::FileOf(owner, MirSpan::ExprId(expr)),
                     }
                 }
             });
@@ -9514,9 +9516,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// The `&str` of a literal that `file!()`, or a `concat!` with it, expanded to, in the body
-    /// of `owner`: the address of read-only data, which a `'static` borrow of a promoted one
-    /// may outlive the call with. The expansion has a placeholder for the path, which is the
-    /// build's rule's; `line!()` and `column!()` expand to their values.
+    /// of `owner`: the address of read-only data holding the `&'static str`, which a `'static`
+    /// borrow of a promoted one may outlive the call with. The expansion has a placeholder for
+    /// the path, which is the build's rule's; `line!()` and `column!()` expand to their values.
+    ///
+    /// A `file!()` alone is the `core::panic::Location` record of where it is written
+    /// (`DataRequest::Location`, a [`blaze_codegen::Target::Position`] the link fills from the
+    /// span side table): the record's first field is the file's `&'static str`, its pointer and
+    /// length at offset 0 on every target (`blaze_link::position::location`,
+    /// `wasm32_location`), so its address is the `&str`'s. The code and its key hold the span,
+    /// item-relative, and never the name (rule 71): a checkout under another path compiles
+    /// nothing again. A `concat!` with `file!()` still bakes the name into its text
+    /// ([`Self::located_concat`]): its bytes are the link's to compose once it can.
     fn builtin_location(&mut self, owner: InferBodyId<'db>, expr: ExprId) -> Result<Option<Value>> {
         let db = self.cg.db;
         if let Some(text) = self.located_concat(owner, expr)? {
@@ -9525,12 +9536,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(file_id) = self.location_macro(owner, expr) else {
             return Ok(None);
         };
-        let Some(file) = hir_ty_mir::mir::location::location_macro_file(db, file_id) else {
+        let InferBodyId::DefWithBodyId(def) = owner else { return Ok(None) };
+        if hir_ty_mir::mir::location::location_macro_file(db, file_id).is_none() {
             return Ok(None);
-        };
-        let path = self.cg.file_path(file);
-        let path = self.cg.declare_data_in_func(path, self.builder.func);
-        Ok(Some(self.builder.ins().symbol_value(self.cg.target.pointer(), path)))
+        }
+        let location = self.cg.location(Some((def, MirSpan::ExprId(expr))));
+        let location = self.cg.declare_data_in_func(location, self.builder.func);
+        Ok(Some(self.builder.ins().symbol_value(self.cg.target.pointer(), location)))
     }
 
     /// Tells `overlap` which of the slots of `shareable` and of the locals kept in registers

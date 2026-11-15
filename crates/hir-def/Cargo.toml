@@ -73,6 +73,12 @@ blaze-sim.workspace = true
 crossbeam-channel.workspace = true
 expect-test.workspace = true
 fst.workspace = true
+# The census of std's surfaces (`deps::std_census`): the one gather (`gather::gather`), the
+# tool id it is keyed under, and std's graph, cfg and target data from the one source the
+# command takes them from (`stdlib::cfg`, `stdlib::target`).
+blaze-unitkey.workspace = true
+blaze-keyed.workspace = true
+blaze-units.workspace = true
 
 # local deps
 test-utils.workspace = true
