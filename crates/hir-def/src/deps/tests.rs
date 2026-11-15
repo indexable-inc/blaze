@@ -2736,3 +2736,42 @@ fn diagnostic_items_are_the_same_bytes_and_an_image_without_them_is_refused() {
     };
     assert_eq!((stop.krate, stop.kind), (lib, "diagnostic items"));
 }
+
+/// An `env!` whose value goes only to the path an `include!`, `include_str!` or
+/// `include_bytes!` reads (directly or through `concat!`) is in the `env!` log as any read, and
+/// not among the reads a crate's code may be made from by value (`Files::env_exposed`): a unit
+/// whose closure reads `OUT_DIR` that way is not tied to where the build directory is. One read
+/// as a value (a `concat!` that is the value, `.len()`) is. The oracle, run on the whole log
+/// (every read taken as exposed, as before), has to refuse it: the control that it tells the
+/// two apart.
+#[test]
+fn an_env_read_for_an_include_path_alone_is_not_exposed() {
+    let source = "//- /lib.rs crate:lib new_source_root:library\n\
+                  #[rustc_builtin_macro]\n\
+                  macro_rules! env {() => {}}\n\
+                  #[rustc_builtin_macro]\n\
+                  macro_rules! concat {() => {}}\n\
+                  #[rustc_builtin_macro]\n\
+                  macro_rules! include_str {() => {}}\n\
+                  pub fn a() -> &'static str { include_str!(concat!(env!(\"BLAZE_T_PATH\"), \"/a.txt\")) }\n\
+                  pub fn b() -> &'static str { include_str!(env!(\"BLAZE_T_DIRECT\")) }\n\
+                  pub fn c() -> &'static str { concat!(env!(\"BLAZE_T_VALUE\"), \"/b\") }\n\
+                  pub fn d() -> usize { env!(\"BLAZE_T_LEN\").len() }\n";
+    let mut db = fixture::db(source).into_db();
+    let vars = Env::from_iter(
+        ["BLAZE_T_PATH", "BLAZE_T_DIRECT", "BLAZE_T_VALUE", "BLAZE_T_LEN"].map(|it| (it.into(), "/nowhere".into())),
+    );
+    base_db::set_process_env(&mut db, vars);
+    let lib = crate_named(&db, "lib");
+    let _ = checked_reads(&db, lib);
+    let names = |log: Vec<(Crate, String)>| {
+        let mut names: Vec<String> = log.into_iter().filter(|it| it.0 == lib).map(|it| it.1).collect();
+        names.sort();
+        names
+    };
+    let all = names(db.files().env_read());
+    assert_eq!(all, ["BLAZE_T_DIRECT", "BLAZE_T_LEN", "BLAZE_T_PATH", "BLAZE_T_VALUE"], "every read is logged");
+    let oracle = |exposed: &[String]| exposed == ["BLAZE_T_LEN", "BLAZE_T_VALUE"];
+    assert!(oracle(&names(db.files().env_exposed())), "{:?}", names(db.files().env_exposed()));
+    assert!(!oracle(&all), "control: the whole log, every read taken as exposed, is refused");
+}

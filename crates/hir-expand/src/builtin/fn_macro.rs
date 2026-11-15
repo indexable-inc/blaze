@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use self::args::{Arg, Array, IntSuffix, Lit, lit_value};
 use crate::{
     BuiltinError, EditionedFileId, ExpandError, ExpandResult, FileRange, HirFileId, InFile,
-    MacroCallId,
+    MacroCallId, MacroCallKind, MacroDefKind,
     builtin::quote::{WithDelimiter, dollar_crate, emit, group, str_literal},
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt},
     name,
@@ -1471,8 +1471,39 @@ fn include_str_expand<'f>(
 
 fn get_env_inner(db: &Db, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
-    db.env_is_read(krate, key.as_str());
+    match read_for_include_path(db, arg_id) {
+        true => db.env_is_read_for_path(krate, key.as_str()),
+        false => db.env_is_read(krate, key.as_str()),
+    }
     base_db::env_var(db, krate, key.as_str())
+}
+
+/// How many `concat!`s [`read_for_include_path`] looks through: past it, a read is taken as
+/// any other.
+const INCLUDE_PATH_DEPTH: usize = 16;
+
+/// Whether the `env!` or `option_env!` call `call` gives its value only to the path an
+/// `include!`, `include_str!` or `include_bytes!` reads: written as that macro's argument
+/// (`include!(env!("F"))`) or in a `concat!` that is, at any depth
+/// (`include!(concat!(env!("OUT_DIR"), "/x.rs"))`). Then the expansion is the file's text or
+/// bytes, keyed by its content, and nothing of the crate holds the value or a function of it
+/// (its length, a hash). Each eager argument is a call of its own whose definition is the
+/// macro it is the argument of (`eager::expand_eager_macro_input_view`), and a call is
+/// written in the file of the call whose argument holds it: so each step out reads one
+/// location. A call written anywhere else (a `concat!` that is a value, a `macro_rules!`
+/// expansion, a file) is not.
+fn read_for_include_path(db: &Db, call: MacroCallId) -> bool {
+    let mut at = call;
+    for _ in 0..INCLUDE_PATH_DEPTH {
+        let MacroCallKind::FnLike { ast_id, .. } = &at.loc(db).kind else { return false };
+        let HirFileId::MacroFile(argument) = ast_id.file_id else { return false };
+        match argument.loc(db).def.kind {
+            MacroDefKind::BuiltInEager(_, it) if it.is_include_like() => return true,
+            MacroDefKind::BuiltInEager(_, EagerExpander::Concat) => at = argument,
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn env_expand<'f>(
