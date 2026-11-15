@@ -258,6 +258,87 @@ fn def_name_is_the_last_segment_and_an_impl_has_none() {
     assert!(texts(&outcome, "impls").is_empty());
 }
 
+/// A keyword declared as a raw identifier keeps its `r#` in `def-name` and in each segment of
+/// its def path, so a template that splices the name writes code, the name agrees with the
+/// declaration's text, the path reads the def back, and `r#match()` is one of its references.
+#[test]
+fn a_raw_identifiers_def_name_and_def_path_keep_the_r_hash_and_read_it_back() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub fn r#match() {}\n\
+                   pub struct Thing { pub r#type: u8 }\n\
+                   pub fn calls(t: Thing) -> u8 { r#match(); t.r#type }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (named d t p) (syntax n "FN") (defines n d) (def-name d t) (def-path d p))
+        (rule (named d t p) (syntax n "STRUCT") (defines n d) (def-name d t) (def-path d p))
+        (rule (named d t p) (syntax n "RECORD_FIELD") (defines n d) (def-name d t) (def-path d p))
+        (rule (as-written d) (syntax n "NAME") (parent f n) (defines f d) (def-name d t) (same-text n t))
+        (rule (back p) (def-path d "lib::r#match") (def-path d p))
+        (rule (back p) (def-path d "lib::Thing::r#type") (def-path d p))
+        (rule (refs n) (def-path d "lib::r#match") (references d n))
+        (rule (refs n) (def-path d "lib::Thing::r#type") (references d n))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut named = texts(&outcome, "named");
+    named.sort();
+    let want = [
+        ["lib::Thing", "Thing", "lib::Thing"],
+        ["lib::Thing::r#type", "r#type", "lib::Thing::r#type"],
+        ["lib::calls", "calls", "lib::calls"],
+        ["lib::r#match", "r#match", "lib::r#match"],
+    ];
+    assert_eq!(named, want);
+    assert_eq!(texts(&outcome, "as-written").len(), 4, "{:?}", texts(&outcome, "as-written"));
+    let mut back = texts(&outcome, "back");
+    back.sort();
+    assert_eq!(back, [["lib::Thing::r#type"], ["lib::r#match"]]);
+    assert_eq!(texts(&outcome, "refs"), [["r#match"], ["r#type"]]);
+}
+
+/// An item declared in a fn body is under that fn, as rustc's paths have it, so it never
+/// shares a path with the module's own item of its name; the path reads it back, a field and
+/// a method of a struct declared there and a fn in a fn in a fn too.
+#[test]
+fn an_item_declared_in_a_fn_body_has_a_def_path_under_that_fn_that_reads_it_back() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub fn inner() -> u8 { 2 }\n\
+                   pub fn outer() -> u8 {\n\
+                       fn inner() -> u8 { fn deep() -> u8 { 1 } deep() }\n\
+                       struct Local { x: u8 }\n\
+                       impl Local { fn get(&self) -> u8 { self.x } }\n\
+                       mod m { pub fn f() {} }\n\
+                       inner() + Local { x: 3 }.get()\n\
+                   }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (paths p) (syntax n "FN") (defines n d) (def-path d p))
+        (rule (paths p) (syntax n "STRUCT") (defines n d) (def-path d p))
+        (rule (paths p) (syntax n "RECORD_FIELD") (defines n d) (def-path d p))
+        (rule (paths p) (syntax n "MODULE") (defines n d) (def-path d p))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut paths: Vec<String> = texts(&outcome, "paths").into_iter().map(|it| it[0].clone()).collect();
+    paths.sort();
+    let want = [
+        "lib::inner",
+        "lib::outer",
+        "lib::outer::Local",
+        "lib::outer::Local::get",
+        "lib::outer::Local::x",
+        "lib::outer::inner",
+        "lib::outer::inner::deep",
+        "lib::outer::m",
+        "lib::outer::m::f",
+    ];
+    assert_eq!(paths, want);
+    // Each path, read back, names the one def that gave it.
+    for path in want {
+        let rules = format!(r#"(rule (back d) (def-path d "{path}")) (rule (found p) (back d) (def-path d p))"#);
+        let outcome = query(&db, &files, &rules).unwrap_or_else(|error| panic!("{path}: {error}"));
+        assert_eq!(texts(&outcome, "found"), [[path]], "{path}");
+    }
+}
+
 #[test]
 fn each_impl_has_a_path_of_its_own_that_names_no_def_back() {
     let fixture = "//- /lib.rs crate:lib edition:2021\n\
