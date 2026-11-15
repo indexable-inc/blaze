@@ -48,7 +48,7 @@ Negation and counting are stratified:
 (rule (hot f) (fn-item f) (count n (caller g f)) (lt 9 n))
 ```
 
-A program whose negation or count sits on a recursive cycle is a load error naming the relations on the cycle. A variable used inside `(count ...)` and not bound before it is local to the count and may not appear outside it, so `(count x (r a x))` with `x` unbound is a load error too.
+`(not ...)` also takes a builtin, `(not (text-match n "^test_"))`, and holds when the builtin gives no row for the bound arguments; `(count ...)` takes relations only. A program whose negation or count sits on a recursive cycle is a load error naming the relations on the cycle. A variable used inside `(count ...)` and not bound before it is local to the count and may not appear outside it, so `(count x (r a x))` with `x` unbound is a load error too.
 
 A rules file nested past 64 lists is a load error naming the line. A run holds at most 10,000,000 rows at once (`MAX_ROWS`, or another cap through `run_with`) and stops past it, naming the relation and rule, the source atom or the rewrite. Two insertions at one offset are written in the rules file's rewrite order, then each rewrite's action order, whatever their text.
 
@@ -59,7 +59,10 @@ Builtins:
 - `ancestor`, `parent`. The lower argument must be bound by an atom to its left, and the error says so when it is not.
 - `text`, `kind`, `same-text`, `same-file`, and `lt`, `le` over integers.
 - `(file-path <node> <path>)` binds the path the file was loaded under, to scope a rule to `tests/`.
-- `(text-match <node-or-text> "<regex>")`. The pattern must be a string literal.
+- `(text-match <node-or-text> "<regex>")`. The pattern must be a string literal. It is compiled when the file is read, so a pattern that does not compile, or whose compiled program is past 1 MiB, is a load error naming the line.
+- `(text-capture <node-or-text> "<regex>" g1 g2 ...)` holds when the regex matches and binds each capture group of the first match as text, one variable per group (checked at load). A group that took no part binds empty text.
+- `(text-replace <node-or-text> "<regex>" "<replacement>" <out>)` binds the text with every match replaced. `$1`, `${1}` and `${name}` write a group and `$$` writes a `$`; a `$` that names no group of the pattern is a load error (`$1_new` reads a group named `1_new`: write `${1}_new`).
+- `(case <node-or-text> "<style>" <out>)` rewrites an identifier as `snake`, `camel`, `pascal`, `upper-snake` or `kebab`, keeping leading and trailing `_`. Text that is no identifier is an error naming it.
 - `(misgrouped-digits <node-or-text> <fixed>)` holds when a numeric literal's underscore grouping is not canonical threes, and binds the regrouped text, for a digit-grouping lint and its fix.
 - `(no-descendant <node> "<kind>" "<text>")` holds when no strict descendant has that kind and exact text, and `(attached-sibling <node> "<kind>" "<text>")` when an attribute-like sibling directly above the node has such a descendant. Both are tree-sitter atoms, not engine builtins.
 
@@ -72,7 +75,7 @@ The engine checks modes at load: an argument a builtin or source atom needs boun
 - `astlog suppressions rules.astlog [paths...] [--json]` lists every finding an `astlog-ignore` comment hid, with that comment. `--json` adds `commentLine` and `commentText`.
 - `astlog fix rules.astlog src/ [--write]` applies rewrites.
 
-blaze's front end has no binary of its own; the daemon runs it. `blaze check --query rules.astlog` prints what the rules derive and find over the checkout as saved (`--message-format json` for one line of `Response::Rows`), `blaze check --rules rules.astlog` applies their rewrites through the front end, and `--dry-run` prints that diff instead of writing it. A blaze rules file uses `(expr n "...")` and the other Rust pattern forms, not `match`; `(not (in-macro-expansion n))` keeps a rewrite off code a macro made. A pattern of more than 2048 tokens or nested more than 128 levels deep is a load error, and a template of more than 2048 tokens is an error naming its rule. `--query`, `--rules` and `--replace` refuse `-p`, `--features`, `--target` and the other build selection flags by name.
+blaze's front end has no binary of its own; the daemon runs it. `blaze check --query rules.astlog` prints what the rules derive and find over the checkout as saved (`--message-format json` for one line of `Response::Rows`), `blaze check --rules rules.astlog` applies their rewrites through the front end, and `--dry-run` prints that diff instead of writing it. A blaze rules file uses `(expr n "...")` and the other Rust pattern forms, not `match`; `(not (in-macro-expansion n))` keeps a rewrite off code a macro made. A pattern of more than 2048 tokens or nested more than 128 levels deep is a load error, and a template of more than 2048 tokens is an error naming its rule. `--query`, `--rules` and `--replace` refuse `-p`, `--features`, `--target` and the other build selection flags by name. They also refuse `-j`, `--keep-going`, `--fail-fast`, `--locked`, `--frozen`, `--offline`, `--no-locked`, `--config` and every `-Z` but `-Z unstable-options` (which allows `-C`), since none of them runs a build, reads a lock file, fetches or sends cargo config. They honour `-C`, `--manifest-path` and `--color`; `--message-format json` is honoured by `--query` and refused by `--rules` and `--replace`, which print a diff or a status line.
 
 ## Suppression
 

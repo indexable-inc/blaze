@@ -1262,7 +1262,6 @@ pub(crate) fn engine(
         color: false,
         build,
         settings,
-        outside: blaze_vfs::outside::dirs(),
         stall: serving.stall.unwrap_or(blaze_profile::Watchdog::BOUND),
         #[cfg(unix)]
         activated: serving.activated,

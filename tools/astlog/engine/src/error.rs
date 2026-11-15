@@ -18,8 +18,8 @@ pub enum Error<S: std::error::Error + 'static> {
     ))]
     TooDeep { line: usize, max: usize },
 
-    #[snafu(display("rules:{line}: invalid regex `{pattern}` in text-match"))]
-    Regex { line: usize, pattern: String, source: regex::Error },
+    #[snafu(display("rules:{line}: invalid regex `{pattern}` in {name}"))]
+    Regex { line: usize, name: String, pattern: String, source: regex::Error },
 
     #[snafu(display("rules:{line}: head variable `{var}` is not bound by the body"))]
     UnboundHeadVar { line: usize, var: String },
@@ -41,6 +41,12 @@ pub enum Error<S: std::error::Error + 'static> {
 
     #[snafu(display("rules:{line}: builtin `{name}` needs a number, but `{arg}` is {what}"))]
     BuiltinNotNumber { line: usize, name: String, arg: String, what: &'static str },
+
+    #[snafu(display(
+        "rules:{line}: `case` reads an identifier's words, but `{text}` is not an identifier \
+         (letters, digits, `_` and `-` only)"
+    ))]
+    CaseNotIdentifier { line: usize, text: String },
 
     #[snafu(display("rules:{line}: relation `{name}` is not defined by any rule"))]
     UnknownRelation { name: String, line: usize },

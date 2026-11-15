@@ -70,6 +70,10 @@ thread_local! {
     /// The planted bug of `serve::tests`' write-on-a-task control: [`Jobs::apply_writes`]
     /// applies a job's write on the loop, in its turn, as before 2026-11-13.
     pub(super) static PLANT_WRITE_ON_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of `serve::tests`' query controls: a query drops the front end it
+    /// lowered as it answers ([`Jobs::keep_queried`] does nothing), as before 2026-11-14, so
+    /// every query of a root lowers it anew.
+    pub(super) static PLANT_QUERY_DROPS_FRONT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The command line of each build a row of the history was made for ([`Job::ended`]), on
     /// the loop's thread: one a job's plane request, as a test counts them.
     pub(super) static ENDED_ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -187,14 +191,14 @@ use std::alloc::Global;
 use blaze_mem::{Handle, MemError, Tag as MemTag};
 
 use self::noop::{
-    Answers, Asked as NoopAsked, Edited, FileEdit, Inputs, Last, Recording, StillFile, Unkept,
-    Vouches, Walk,
+    Answers, Asked as NoopAsked, Edited, FileEdit, Inputs, Last, Recording, Stamped, Stamps,
+    StillFile, Unkept, Walk,
 };
 use self::slab::{Table, Tagged};
 use super::{
     heads::Heads,
     image::{Images, Parts},
-    mounts::Mounts,
+    mounts::{Mounts, Stale, Sweep},
     observe::Ended,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
@@ -421,7 +425,7 @@ fn native_key(sha256: &str) -> Key {
 
 /// The layout at `dir` its task found or made, as that task leaves it for every job of its
 /// digest ([`Shared`]): with the task's one look at the layout, the entry there (a directory,
-/// a link not followed), which no record of a unit names and no watch vouches for. Each job
+/// a link not followed), which no record of a unit names, with its stamp. Each job
 /// takes the look into its own build's at [`Stage::Native`], so a build that joined another's
 /// layout is checked again by it as the build that ran it is. Made on the task's IO thread,
 /// once a layout; `posted_by` (the looks of the build whose job posted the task) is kept by
@@ -433,18 +437,31 @@ fn native_shared(
 ) -> Result<Shared<std::path::PathBuf>, String> {
     use blaze_usercode::trace::Inputs as _;
     let own = blaze_vfs::outside::Looks::new();
-    // Asked of the process's table, whose answer is the same whether a watch vouched for it or
-    // the disk was looked at; the look is the task's own either way, pushed here.
+    // The look is the task's own, pushed here with the stamp it rests on: taken before the
+    // entry is read and again after, so a change between the two keeps no stamp (unknown,
+    // which never holds) rather than one newer than the answer.
+    let looked_ns = blaze_core::system_wall_ns();
+    let before = blaze_vfs::outside::lstat(&dir);
     let mut disk = blaze_usercode::inputs::Disk::new(Vec::new(), &blaze_vfs::outside::Looks::none()); // alloc: none, no variables
     let entry = disk
         .entry(&dir)
         // alloc: an error, once
         .map_err(|it| format!("its layout at {} can't be looked at: {}", it.path.display(), it.error))?;
+    let stamp = match blaze_vfs::outside::lstat(&dir) {
+        after if after == before => before,
+        _ => blaze_core::Stamp::UNKNOWN,
+    };
     let looked = match request::planted(request::Plant::LooksToRunner) {
         true => posted_by,
         false => &own,
     };
-    looked.push(&dir, blaze_vfs::outside::LookKind::Entry, blaze_usercode::trace::entry_digest(&entry));
+    looked.push_stamped(
+        &dir,
+        blaze_vfs::outside::LookKind::Entry,
+        blaze_usercode::trace::entry_digest(&entry),
+        stamp,
+        looked_ns,
+    );
     Ok(Shared::new(dir, &own))
 }
 
@@ -476,7 +493,7 @@ pub(super) enum Does<S: Steps> {
     /// Task `at` fetches `fetches[at]`, or reads it where it is on the disk.
     Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
     /// The local mounts at `ats` read again, what is under them maybe changed.
-    Locals { steps: Arc<S>, ats: Vec<String> },
+    Locals { steps: Arc<S>, ats: Box<[String]> },
     /// The units' pinned native inputs laid out, before the lowering ([`Steps::native`]).
     /// One digest's layout, for every input of it: `input` is one of them.
     Native {
@@ -1634,35 +1651,13 @@ pub(super) fn output_dirs_of<'a>(
     Ok(dirs)
 }
 
-/// The process's watches of directories outside every view ([`blaze_vfs::outside`]).
-struct Watched;
+/// The disk as the no-op lane's sweep asks it ([`noop::Stamps`]): one `lstat` a path (a
+/// `stat` for a file looked at through its links), and nothing read.
+struct Disk;
 
-impl Vouches for Watched {
-    fn quiet_since(&self, generation: u64) -> bool {
-        blaze_vfs::outside::quiet_since(generation)
-    }
-
-    fn unchanged_since(&self, dir: &std::path::Path, generation: u64) -> bool {
-        blaze_vfs::outside::unchanged_since(dir, generation)
-    }
-
-    fn absent(&self, path: &std::path::Path) -> bool {
-        matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-    }
-
-    fn only_since(&self, generation: u64, aside: &dyn Fn(&std::path::Path) -> bool) -> bool {
-        blaze_vfs::outside::only_since(generation, |path| aside(path))
-    }
-
-    fn watched_since(&self, dir: &std::path::Path, generation: u64) -> bool {
-        blaze_vfs::outside::watched_since(dir, generation)
-    }
-
-    fn same_file(&self, path: &std::path::Path, was: Option<[u8; 32]>) -> bool {
-        use blaze_usercode::trace::Inputs as _;
-        // A check of a kept answer, which no build owns: its look is kept by none.
-        let mut disk = blaze_usercode::inputs::Disk::new(Vec::new(), &blaze_vfs::outside::Looks::none()); // alloc: none, no variables
-        disk.file(path).is_ok_and(|now| now == was)
+impl Stamps for Disk {
+    fn stamp(&self, path: &std::path::Path, kind: blaze_vfs::outside::LookKind) -> blaze_core::Stamp {
+        kind.stamp_now(path)
     }
 }
 
@@ -1767,71 +1762,71 @@ fn read_unasked(name: &str) -> bool {
         || blaze_usercode::confine::walk_sees(std::ffi::OsStr::new(name))
 }
 
-/// Whether the watch of `dir`, a path dependency's directory outside the view, vouches that
-/// nothing under it changed since `generation` was read ([`Mounts::stale_locals`]).
-fn vouched_local(dir: &str, generation: u64) -> bool {
-    let dir = std::path::Path::new(dir);
-    let vouched = blaze_vfs::outside::unchanged_since(dir, generation);
-    if !vouched {
-        // Said: a local no watch vouches for is read again by the job and keeps every
-        // build from being answered again; the watch's own state says why (rule 19).
-        tracing::info!(
-            target: "blaze",
-            dir = %dir.display(),
-            why = %blaze_vfs::outside::why_changed(dir, generation),
-            "a path outside the view that is mounted where it is has no watch vouching for it"
-        );
-    }
-    vouched
-}
-
 /// The directory of a build's layout profiles under its target directory
 /// (`unit::layout::DIR`, which every unit that links reads off the disk).
 const LAYOUT: &str = "layout";
 
-/// What a walk of `units` rests on that only a watch or a look can vouch for, found before
-/// the walk looks at anything: the directories to ask the watches of (each one its outputs
-/// are in, canonical, and its layout profiles' when there is one, watched from the next
-/// round), and the paths that are not there and must stay so (its layout profiles' when
-/// there is none: no watch is confirmed of a directory that is not there). Else why no
-/// answer of such a walk is kept.
+/// What a walk of `units` rests on beside its view, found and stamped before the walk looks
+/// at anything (`looked_ns` is the instant before the first stamp): the directories its
+/// outputs are in, canonical (a file a step reads under one is swept too,
+/// [`Recording::vouch_reads`]); and each output file and the layout profiles' directory with
+/// each file in it ([`blaze_core::Stamp::GONE`] where it is not there), each with its `lstat` stamp
+/// ([`noop::LastAnswer::outputs`]). Else why no answer of such a walk is kept.
+///
+/// Its cost is one `lstat` an output and a layout file, and a resolve an output directory, on
+/// the loop once a build that walks its checkout's last plan; in the span `no-op answer:
+/// stamp the outputs`.
 fn recorded_dirs(
     units: &Units,
     std: &str,
-) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), Unkept> {
-    use std::path::Path;
+    looked_ns: u64,
+) -> Result<(Vec<std::path::PathBuf>, Box<[Stamped]>), Unkept> {
+    use blaze_vfs::outside::{LookKind, lstat};
+    use std::path::{Path, PathBuf};
     // A profile to use is read off the disk by each build (`unit::codegen::read_profile`),
-    // wherever its flag names it: no watch is asked of it.
+    // wherever its flag names it: no stamp is kept of it.
     let profiled = |flag: &String| flag.contains("profile-use") || flag.contains("profile_use");
     if units.plans.iter().any(|plan| plan.rustflags.iter().any(profiled)) {
         return Err(Unkept::Uncounted("a `-C profile-use` profile"));
     }
-    let mut dirs = output_dirs(units, std).map_err(Unkept::Outputs)?;
-    // A watch hears nothing of a symlink above its directory being pointed elsewhere
-    // ([`blaze_vfs::outside::unchanged_since`]): a directory named through one is not
-    // vouched for. A resolve of each, once a build that walks.
-    let _span = tracing::info_span!(
+    let dirs = output_dirs(units, std).map_err(Unkept::Outputs)?;
+    let span = tracing::info_span!(
         target: "blaze",
-        "no-op answer: resolve the output directories",
+        "no-op answer: stamp the outputs",
         dirs = dirs.len(),
+        outputs = tracing::field::Empty,
     )
     .entered();
+    // A link above a directory pointed elsewhere moves no stamp under it: a directory named
+    // through one is not vouched for. A resolve of each, once a build that walks.
     let canonical = |dir: &Path| std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
     if let Some(dir) = dirs.iter().find(|dir| !canonical(dir.as_path())) {
         // clone: a reason, once a build whose answer is not kept
         return Err(Unkept::Outputs(dir.clone()));
     }
+    let stamped = |path: PathBuf, kind: LookKind| Stamped { stamp: lstat(&path), path, kind, looked_ns };
+    let mut outputs = Vec::new_in(Global);
+    let planned = units.plans.iter().flat_map(|plan| plan.outputs.iter());
+    outputs.extend(planned.map(|output| stamped(PathBuf::from(output), LookKind::Entry)));
     let layout = Path::new(&units.target_dir).join(LAYOUT);
-    let mut absent = Vec::new(); // alloc: once a build that walks, a path
-    match std::fs::symlink_metadata(&layout) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent.push(layout),
-        Ok(meta) if meta.is_dir() && canonical(layout.as_path()) => {
-            blaze_vfs::outside::want(&layout);
-            dirs.push(layout);
+    let there = stamped(layout.clone(), LookKind::Listing); // clone: a path, once a build that walks
+    if there.stamp.is_dir() && canonical(layout.as_path()) {
+        let listed = std::fs::read_dir(&layout).map_err(|_| Unkept::Looked(layout.clone()))?; // clone: a reason, once
+        for entry in listed {
+            let path = entry.map_err(|_| Unkept::Looked(layout.clone()))?.path(); // clone: a reason, once
+            let file = stamped(path, LookKind::Entry);
+            // Only files are read there: a directory in it would hide a write under it.
+            if !file.stamp.is_file() {
+                return Err(Unkept::Looked(file.path));
+            }
+            outputs.push(file);
         }
-        _ => return Err(Unkept::Looked(layout)),
+    } else if !there.stamp.is_gone() {
+        return Err(Unkept::Looked(layout));
     }
-    Ok((dirs, absent))
+    outputs.push(there);
+    span.record("outputs", outputs.len());
+    Ok((dirs, outputs.into_boxed_slice()))
 }
 
 /// A build under way that may become its checkout's kept answer ([`Jobs::record_answer`]).
@@ -2871,7 +2866,11 @@ struct Ready<S: Steps> {
 
 enum Stage<S: Steps> {
     Library(NodeId),
-    /// The local mounts no watch vouches for being read again, the view to open once they are.
+    /// The stamps of the local mounts' leaves asked of the driver ([`Own::Sweep`]), the view
+    /// to make ready once they are in.
+    Sweep(Box<SweepWait>),
+    /// The local mounts whose leaves' stamps no longer hold being read again, the view to
+    /// open once they are.
     Locals(NodeId, Opened),
     Plan(NodeId, Prep),
     Fetch(Fetching),
@@ -3472,6 +3471,11 @@ struct Job<S: Steps> {
     /// ([`Jobs::certify_building`]): handed to each task in its [`JobInput`]. A job no
     /// certificate is written of keeps none ([`blaze_vfs::outside::Looks::none`]).
     looks: blaze_vfs::outside::Looks,
+    /// The local mounts its start's sweep found stale ([`Jobs::begin`], [`Sweep::stale`]),
+    /// until its first view is made ready, which reads them again ([`Jobs::prepare`]): one
+    /// sweep serves the certificate's check and the build. `None`: no sweep at the start (a
+    /// job that began after its check missed), so `prepare` asks one.
+    swept: Option<Stale>,
     stage: Stage<S>,
     /// The value of the node its stage waits on, given before the node settles.
     value: Option<(NodeId, Value<S>)>,
@@ -3909,6 +3913,9 @@ impl<S: Steps> std::fmt::Display for StageSaid<'_, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
             Stage::Library(node) => write!(f, "waits for the toolchain's library, node {}", node.0),
+            Stage::Sweep(wait) => {
+                write!(f, "waits for the stamps of {} leaves of its paths outside the view", wait.sweep.leaves())
+            }
             Stage::Locals(node, _) => {
                 write!(f, "waits for its paths outside the view to be read again, node {}", node.0)
             }
@@ -4233,6 +4240,7 @@ impl<S: Steps> Job<S> {
             finished,
             cancelled: Arc::new(AtomicBool::new(false)), // alloc: once per job, shared with its tasks
             looks: blaze_vfs::outside::Looks::none(),
+            swept: None,
             stage: Stage::Over,
             value: None,
             updating: HashSet::new_in(Global),
@@ -4580,6 +4588,30 @@ enum Own {
     /// A file placed, looked at for its [`Placement`] before its job is done: a file changed
     /// after the job's `Done` must not be recorded as the one placed.
     Record { job: JobId, path: u32, key: blaze_cas::Key },
+    /// The stamps of the local mounts' leaves, asked for job `job`'s start ([`Sweeping`]) or
+    /// for its view ([`Stage::Sweep`]) ([`Jobs::swept`]).
+    Sweep { job: JobId },
+}
+
+/// A start held while its sweep of the local mounts' leaves is with the driver
+/// ([`Jobs::begin`]): what it began with, the sweep its answer is checked by, and the span of
+/// the wait (every-wait-says-what).
+struct Sweeping {
+    id: JobId,
+    view: Option<Opened>,
+    work: Work,
+    idle: bool,
+    sweep: Sweep,
+    /// `a start waits for the stamps of the paths outside the view`, open while it waits.
+    _waits: tracing::Span,
+}
+
+/// The wait of a job's view for its sweep of the local mounts' leaves ([`Stage::Sweep`]).
+struct SweepWait {
+    opened: Opened,
+    sweep: Sweep,
+    /// `a view waits for the stamps of the paths outside the view`, open while it waits.
+    _waits: tracing::Span,
 }
 
 /// A job's effects in flight at one path ([`Job::busy`]).
@@ -4805,6 +4837,9 @@ pub struct Jobs<S: Steps> {
     /// shape's last build was, in words: taken by [`Jobs::begin`] and said in a span once
     /// the request has its build, so the build's own profile names why it walked.
     refused: Option<String>,
+    /// The starts held while their sweep of the local mounts' leaves is with the driver
+    /// ([`Jobs::begin`], [`Own::Sweep`]): none unless a path outside the view is mounted.
+    sweeping: Vec<Sweeping>,
     /// The request machines' driver: the checks under way before their requests are jobs,
     /// what one machine knows beside the records, and the builds whose certificates are to
     /// be written at the next step ([`certify`]).
@@ -4936,6 +4971,7 @@ impl<S: Steps> Jobs<S> {
             retired: Vec::new(), // alloc: none until a plan is replaced
             unheld: Vec::new(),  // alloc: none until a no-op answer goes
             refused: None,
+            sweeping: Vec::new(), // alloc: none until a start sweeps a local mount's leaves
             certify: certify::Certify::new(),
             planned: false,
             out: Vec::new(),     // alloc: none until user code says something, then reused
@@ -5081,6 +5117,7 @@ impl<S: Steps> Jobs<S> {
     /// stall the watchdog says, never a hang.
     pub fn under_way(&self) -> usize {
         self.asked.len()
+            + self.sweeping.len()
             + self.jobs.values().filter(|job| !job.idle && job.durable_since.is_none()).count()
     }
 
@@ -5138,6 +5175,12 @@ impl<S: Steps> Jobs<S> {
                 match it {
                     Asked::Start { id, view, work, idle } => self.begin(w, id, view, work, idle),
                     Asked::Cancel(id) => {
+                        // A start still waiting for its sweep is no job yet: it ends here, and
+                        // its stamps, when they come, find nothing ([`Jobs::swept`]).
+                        if let Some(at) = self.sweeping.iter().position(|it| it.id == id) {
+                            self.sweeping.swap_remove(at);
+                            w.said.push(Said::Finish(id, false, None, None));
+                        }
                         self.certify_cancel(w, id);
                         self.cancel_job(w, id)
                     }
@@ -5159,16 +5202,87 @@ impl<S: Steps> Jobs<S> {
         work: Work,
         idle: bool,
     ) {
+        // Where a path outside the view is mounted where it is on the disk, its leaves are
+        // stamped first, off the loop ([`Effect::Stamp`]), and the start goes on when the
+        // stamps are in ([`Jobs::swept`]): the certificate's check is keyed by the locals'
+        // contents, and the build reads them, so both wait for what is on the disk now.
+        let Some(sweep) = w.mounts.sweep() else {
+            return self.begin_swept(w, id, view, work, idle, Stale::default());
+        };
+        match self.own_tag(Own::Sweep { job: id }) {
+            Ok(tag) => {
+                let _waits = tracing::info_span!(
+                    target: "blaze",
+                    "a start waits for the stamps of the paths outside the view",
+                    leaves = sweep.leaves(),
+                );
+                w.effects.push(sweep.effect(tag));
+                // alloc: none unless a local is mounted, then one a start in flight
+                self.sweeping.push(Sweeping { id, view, work, idle, sweep, _waits });
+            }
+            Err(error) => w.said.push(Said::Finish(id, false, Some(error), None)),
+        }
+    }
+
+    /// The start of `id` with its sweep in: `stale`, the local mounts to read again.
+    fn begin_swept(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        view: Option<Opened>,
+        work: Work,
+        idle: bool,
+        stale: Stale,
+    ) {
         // A build or a check is checked against its certificate here, before it is a job
         // ([`Jobs::certify_begin`]): answered, or waiting for looks at its outputs, it is
         // none yet.
-        if let Some((view, work, walks)) = self.certify_begin(w, id, view, work, idle) {
-            self.begin_job(w, id, view, work, idle, walks);
+        if let Some((view, work, walks)) = self.certify_begin(w, id, view, work, idle, &stale) {
+            self.begin_job(w, id, view, work, idle, walks, Some(stale));
+        }
+    }
+
+    /// The stamps of the local mounts' leaves asked for job `id` ([`Own::Sweep`]) are in:
+    /// its start goes on ([`Jobs::begin_swept`]), or its view is made ready
+    /// ([`Jobs::prepare_swept`]). A sweep the driver failed, or answered with stamps of
+    /// another count, fails the request naming the sweep; one of a start or a job that is
+    /// gone (cancelled) is let be.
+    fn swept(&mut self, w: &mut World<'_, S>, id: JobId, done: Done) {
+        let judged = |sweep: &Sweep| match &done {
+            Done::Stamped(stamps) => sweep.stale(stamps).map_err(|it| it.to_string()),
+            // alloc: an error, once a sweep
+            Done::Failed(error) => Err(format!("stamping the {} leaves of the paths outside the view: {error}", sweep.leaves())),
+            // alloc: as above
+            other => Err(format!("the stamps of the paths outside the view were answered with {other:?}")),
+        };
+        if let Some(at) = self.sweeping.iter().position(|it| it.id == id) {
+            // The wait's span ends with this statement.
+            let Sweeping { id, view, work, idle, sweep, .. } = self.sweeping.swap_remove(at);
+            match judged(&sweep) {
+                Ok(stale) => self.begin_swept(w, id, view, work, idle, stale),
+                Err(why) => w.said.push(Said::Finish(id, false, Some(ApiError::new(why, None)), None)),
+            }
+            return;
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        // Not waiting for a sweep (cancelled and over): its stage is let be.
+        if !matches!(job.stage, Stage::Sweep(_)) {
+            return;
+        }
+        let Stage::Sweep(wait) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
+        let SweepWait { opened, sweep, _waits: waits } = *wait;
+        // The wait is over: its span ends here.
+        drop(waits);
+        match judged(&sweep) {
+            Ok(stale) => self.prepare_swept(w, id, opened, stale),
+            Err(why) => self.end(w, id, false, Some(ApiError::new(why, None))),
         }
     }
 
     /// Job `id` becomes a job: its request was not certified (`walks`: why, as the input
-    /// `blaze why` names, with the certificate's base), or is no build or check.
+    /// `blaze why` names, with the certificate's base), or is no build or check. `swept`: the
+    /// local mounts its start's sweep found stale, or `None` where it had none.
+    #[expect(clippy::too_many_arguments, reason = "a start's parts, each of another type")]
     fn begin_job(
         &mut self,
         w: &mut World<'_, S>,
@@ -5177,6 +5291,7 @@ impl<S: Steps> Jobs<S> {
         work: Work,
         idle: bool,
         walks: Option<(String, ContentId)>,
+        swept: Option<Stale>,
     ) {
         let refused = self.refused.take();
         #[cfg(test)]
@@ -5191,7 +5306,8 @@ impl<S: Steps> Jobs<S> {
         };
         let keep_going = keeps_going(&work);
         let snapshot = matches!(work, Work::Snapshot);
-        let job = Job::fresh(work, views, idle, walks, w.now);
+        let mut job = Job::fresh(work, views, idle, walks, w.now);
+        job.swept = swept;
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
             let error = ApiError::new(
@@ -5284,17 +5400,43 @@ impl<S: Steps> Jobs<S> {
             return;
         };
         // Paths outside the view read where they are on the disk ([`Mounts::mount_local`]):
-        // each the watch can't vouch for is read again before the view's configuration takes
-        // its mount, so the build reads what is on the disk now, never a stale copy.
-        let ats = w.mounts.stale_locals(vouched_local, super::fetch::local::vouched_file, super::fetch::local::absent);
-        if !ats.is_empty() {
-            let work = Step::of(&job.cancelled, Does::Locals { steps: w.steps.clone(), ats }); // clone: a refcount, once
-            let fresh = lone(w.plane, NodeKind::Fetch, "paths outside the view, read again", Pool::Io, None, kinds::FETCH);
-            job.stage = Stage::Locals(fresh.first(), opened);
-            self.add(w, id, fresh, Some(work), false);
-            return;
+        // each whose leaves' stamps no longer hold is read again before the view's
+        // configuration takes its mount, so the build reads what is on the disk now, never a
+        // stale copy. The stamps are the start's sweep for the first view; for any other, a
+        // sweep of their own, asked of the driver ([`Effect::Stamp`], off the loop).
+        if let Some(stale) = job.swept.take() {
+            return self.prepare_swept(w, id, opened, stale);
         }
-        self.open(w, id, opened, HashSet::new_in(Global));
+        let Some(sweep) = w.mounts.sweep() else {
+            return self.open(w, id, opened, HashSet::new_in(Global));
+        };
+        match self.own_tag(Own::Sweep { job: id }) {
+            Ok(tag) => {
+                let _waits = tracing::info_span!(
+                    target: "blaze",
+                    "a view waits for the stamps of the paths outside the view",
+                    leaves = sweep.leaves(),
+                );
+                w.effects.push(sweep.effect(tag));
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.stage = Stage::Sweep(Box::new(SweepWait { opened, sweep, _waits }));
+                }
+            }
+            Err(error) => self.end(w, id, false, Some(error)),
+        }
+    }
+
+    /// Job `id`'s view `opened` made ready with its sweep in: `stale`, the local mounts to
+    /// read again first (off the loop, [`Does::Locals`]), or none, and the view is opened.
+    fn prepare_swept(&mut self, w: &mut World<'_, S>, id: JobId, opened: Opened, stale: Stale) {
+        if stale.ats.is_empty() {
+            return self.open(w, id, opened, HashSet::new_in(Global));
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let work = Step::of(&job.cancelled, Does::Locals { steps: w.steps.clone(), ats: stale.ats }); // clone: a refcount, once
+        let fresh = lone(w.plane, NodeKind::Fetch, "paths outside the view, read again", Pool::Io, None, kinds::FETCH);
+        job.stage = Stage::Locals(fresh.first(), opened);
+        self.add(w, id, fresh, Some(work), false);
     }
 
     /// What job work `work` on the view `opened` is built with, as the mounts are now: where
@@ -5523,6 +5665,7 @@ impl<S: Steps> Jobs<S> {
         id: JobId,
         view: Option<&Opened>,
         work: &Work,
+        stale: &[String],
     ) -> Result<(), Option<(String, ContentId)>> {
         self.refused = None;
         let (Some(opened), Some(request)) = (view, request_id(work)) else { return Err(None) };
@@ -5568,21 +5711,11 @@ impl<S: Steps> Jobs<S> {
         // What answered jobs left to settle is no job: the kept answer is of a build that
         // made nothing, and stands while that settles.
         let alone = self.order.is_empty();
-        let stale = w.mounts.stale_locals(vouched_local, super::fetch::local::vouched_file, super::fetch::local::absent);
+        // The start's sweep ([`Jobs::begin`]): no stamp is taken here, on the loop.
         let locals_vouched = stale.is_empty();
         let edited = match &read {
             Ok(edits) => Edited::Files(edits),
             Err(why) => Edited::Unread(*why),
-        };
-        // Another request's output: a path the daemon planned an output at (every one is
-        // interned as its plan is built, [`Paths`]) that is no output of the units of this
-        // request's own plan. With no plan kept of the shape, none is known to be.
-        let (plans, planned) = (&self.roots.plans[root as usize], &self.paths.ids);
-        let mine = plans.iter().find(|it| it.shape == shape).map(|it| &it.units);
-        let other_output = |path: &std::path::Path| {
-            let (Some(mine), Some(path)) = (mine, path.to_str()) else { return false };
-            planned.contains_key(path)
-                && !mine.plans.iter().any(|plan| plan.outputs.iter().any(|it| it.as_str() == path))
         };
         let asked = NoopAsked {
             inputs: &inputs,
@@ -5591,11 +5724,10 @@ impl<S: Steps> Jobs<S> {
             alone,
             locals_vouched,
             unasked: &read_unasked,
-            other_output: &other_output,
         };
         // Asked of this shape's answer alone: no other request's walk dropped it, and of the
         // request's environment only what its walk read is compared.
-        let found = self.roots.answers[root as usize].ask(&shape, &asked, &Watched);
+        let found = self.roots.answers[root as usize].ask(&shape, &asked, &Disk);
         drop(comparing);
         let (responses, worked) = match found {
             Ok(found) => found,
@@ -5607,15 +5739,12 @@ impl<S: Steps> Jobs<S> {
                     why = %why,
                 )
                 .in_scope(|| {});
-                // alloc: a reason, once a build that walks. A path dependency no watch
-                // vouches for is named, with its watch's state as the watches say it
-                // ([`blaze_vfs::outside::why_looked`]): which path, and why not.
+                // alloc: a reason, once a build that walks. A path dependency whose stamps
+                // moved is named: which path, and how many such.
                 self.refused = Some(match (&why, stale.first()) {
-                    (noop::NotReplayed::Locals, Some(at)) => format!(
-                        "{why}: {at} ({}); {} such in all",
-                        blaze_vfs::outside::why_looked(std::path::Path::new(at)),
-                        stale.len()
-                    ),
+                    (noop::NotReplayed::Locals, Some(at)) => {
+                        format!("{why}: {at}; {} such in all", stale.len())
+                    }
                     _ => why.to_string(),
                 });
                 return Err(why.input().map(|input| (input, inputs.id())));
@@ -5721,9 +5850,9 @@ impl<S: Steps> Jobs<S> {
 
     /// Job `id` noted as one that may become checkout `root`'s kept answer of `shape`: when it is about
     /// to walk the checkout's plan of that shape (of `key`, writing no lock file) and each directory
-    /// its outputs are in is named canonically, as the watches are asked. The watches'
-    /// generation and the count of looks at the disk are read here, before the job looks at
-    /// anything. Else the checkout's answer says why none is kept ([`Unkept`]).
+    /// its outputs are in is named canonically. Its outputs are stamped here, before the job
+    /// looks at anything ([`recorded_dirs`]). Else the checkout's answer says why none is kept
+    /// ([`Unkept`]).
     #[allow(dead_code)]
     fn record_answer(
         &mut self,
@@ -5739,7 +5868,9 @@ impl<S: Steps> Jobs<S> {
             let recorded = self.recordings.swap_remove(at);
             self.unheld.extend(recorded.view);
         }
-        let generation = blaze_vfs::outside::generation();
+        // The instant before the outputs are stamped and the job looks at anything: every
+        // stamp the answer keeps is held to it or a later one by the racy rule.
+        let looked_ns = blaze_core::system_wall_ns();
         // The build's own looks ([`Job::looks`], made as its `Building` starts): a job whose
         // build keeps none has no looks to be answered again by, so no answer is kept of it.
         // clone: the same list, shared with the job's tasks
@@ -5748,16 +5879,16 @@ impl<S: Steps> Jobs<S> {
         let found = match (planned, looks) {
             (_, None) => Err(Unkept::Unlooked),
             (Some(last), Some(looks)) if last.lock.is_none() => {
-                recorded_dirs(&last.units, &self.setup.std).map(|found| (found, looks))
+                recorded_dirs(&last.units, &self.setup.std, looked_ns).map(|found| (found, looks))
             }
             _ => Err(Unkept::Planned),
         };
         match found {
-            Ok(((dirs, absent), looks)) => self.recordings.push(Recorded {
+            Ok(((dirs, outputs), looks)) => self.recordings.push(Recorded {
                 job: id,
                 root,
                 shape,
-                recording: Recording::new(inputs, generation, dirs, absent),
+                recording: Recording::new(inputs, looked_ns, dirs, outputs),
                 view: None,
                 walked: None,
                 looks,
@@ -5927,34 +6058,23 @@ impl<S: Steps> Jobs<S> {
 
     /// `recorded`'s job ended, `ok` or not: its answer kept as its checkout's of its request's shape when it passed,
     /// made nothing (no unit compiled, no miss, no output placed, nothing shared), said only
-    /// what such a build says, and looked at no path outside every view on the disk while it
-    /// ran ([`Recording::end`]). Else the checkout's answer says why none is kept; either
+    /// what such a build says, and each look it made at the disk outside every view kept a
+    /// stamp ([`Recording::end`]). Else the checkout's answer says why none is kept; either
     /// way in a span.
     fn keep_answer(&mut self, recorded: Recorded, ok: bool) {
         let Recorded { root, shape, recording, view, walked, looks, .. } = recorded;
         let (made_nothing, worked) = walked.unwrap_or((false, None));
-        // Each look the build made at the disk, of its own list ([`Job::looks`]): a look of
-        // other than a file keeps the next build from being answered again, and is named.
+        // Each look the build made at the disk, of its own list ([`Job::looks`]): a look that
+        // kept no stamp keeps the next build from being answered again, and is named.
         let looks = looks.all();
-        if !looks.is_empty() {
-            // alloc: once a build that looked, the paths as text
-            let paths: Vec<String> = looks
-                .iter()
-                .map(|look| {
-                    format!(
-                        "{} {} (by {}: {})",
-                        look.kind,
-                        look.path.display(),
-                        look.by,
-                        blaze_vfs::outside::why_looked(&look.path)
-                    )
-                })
-                .collect();
+        if let Some(look) = looks.iter().find(|look| look.stamp.is_unknown()) {
             tracing::info!(
                 target: "blaze",
                 root = %root,
-                paths = %paths.join(", "),
-                "the build looked at paths outside every view on the disk, which no watch covers"
+                path = %look.path.display(),
+                kind = %look.kind,
+                by = %look.by,
+                "the build looked at a path outside every view on the disk and kept no stamp of it"
             );
         }
         let last = recording.end(Walk {
@@ -5969,7 +6089,8 @@ impl<S: Steps> Jobs<S> {
                 "no-op answer: the build's answer is kept",
                 root,
                 responses = answer.responses.len(),
-                dirs = answer.dirs.len(),
+                outputs = answer.outputs.len(),
+                leaves = answer.leaves.len(),
                 // What keeping it holds of the heap, about ([`noop::LastAnswer::held_bytes`]),
                 // and whether the variables its steps read are named (else every variable
                 // of a later request is compared).
@@ -6222,8 +6343,11 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// Job `id`'s write, its readers all gone, posted as a task of a plane request of its own
-    /// holding the writer ([`Does::Write`]), as a kept front end's store is;
-    /// pushed free of admission, since every reading task of the job waits for it. Its value
+    /// holding the writer ([`Does::Write`]), as a kept front end's store is. The plane admits
+    /// it by threads as any task: the job's held tasks (`Build::held`) are Running to the plane
+    /// and hold threads, so when they hold every one the write never starts and the build
+    /// stalls (open, 2026-11-13; `a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds`
+    /// pins the seeds). Its value
     /// comes back to [`Jobs::wrote`]. A task the plane refuses gives the writer back, and the
     /// job fails naming the refusal.
     fn send_write(&mut self, w: &mut World<'_, S>, id: JobId) {
@@ -6906,6 +7030,7 @@ impl<S: Steps> Jobs<S> {
             Stage::Answer(at) if at == node => match job.take_value(node) {
                 Some(Value::Answer(Ok(response))) => {
                     w.said.push(Said::Report(id, response));
+                    self.keep_queried(w, id);
                     self.end(w, id, true, None);
                 }
                 Some(Value::Answer(Err(error))) => self.end(w, id, false, Some(error)),
@@ -7378,25 +7503,15 @@ impl<S: Steps> Jobs<S> {
         if self.jobs.get(key_of(id)).is_none() {
             return;
         }
-        // On the loop once a view: the output directories asked of the watches, the lock
-        // files written, the lowering posted (or held for the kept front end's store).
+        // On the loop once a view: the lock files written, the lowering posted (or held for
+        // the kept front end's store). No directory of outputs is watched: a kept answer
+        // rests on its outputs' stamps ([`noop::LastAnswer::sweep`]).
         let _span = tracing::info_span!(
             target: "blaze",
             "loop: a job's plan taken, to its lowering posted",
             units = units.graph.units.len(),
         )
         .entered();
-        // A build or a check of a checkout has the directories its outputs are in watched
-        // from the watches' next round, so a later walk's answer can rest on them
-        // ([`noop::LastAnswer::replayable`]). Once a directory a process.
-        if prep.root.is_some()
-            && self.jobs.get(key_of(id)).is_some_and(|job| request_id(&job.work).is_some())
-            && let Ok(dirs) = output_dirs(&units, &self.setup.std)
-        {
-            for dir in &dirs {
-                blaze_vfs::outside::want(dir);
-            }
-        }
         // The lock files of a plan that are no files of its view (a workspace whose root is
         // above the checkout's), written where they are: one of the view was written into it
         // before the plan was kept ([`Jobs::lock_into_view`]).
@@ -7709,6 +7824,58 @@ impl<S: Steps> Jobs<S> {
         // store is a loss said beside it, never its error.
         if let Some((command, checkout, what)) = refused {
             self.lose(id, &command, Some(&checkout), what);
+        }
+    }
+
+    /// Query `id`'s front end handed back to its root as its answer is said, the way a build's
+    /// end hands back its own ([`Jobs::plane_finished`]): kept ([`Writer::keep`]) and stored by
+    /// an idle request ([`Jobs::store_kept`]), so it is the root's again once stored
+    /// ([`Jobs::stored_kept`]) and the root's next job lowers into it. Until 2026-11-14 a query
+    /// dropped it, so every query of a root lowered the root anew (ripgrep: 2.1 million rows a
+    /// query, 36.6 s).
+    ///
+    /// It goes back only through the store. A front end kept is not stored yet
+    /// (`unit::Stored::No`), whether the query lowered it anew or into the root's last one,
+    /// and [`Steps::lower`] refuses one that is not: a query's lowering and the proc macros and
+    /// build scripts it applied may have served dependencies and checked crates whose records
+    /// only the store writes. The view it is of is the query's: the next job's lowering moves
+    /// it to that job's view as it moves a build's, reading again what changed.
+    ///
+    /// A front end that can't be kept is a loss ([`Jobs::lose`]), never the query's error: the
+    /// answer is said already, and the root's next job lowers anew. A cancelled query, one
+    /// that failed, and one of a view of no root keep nothing, as such a build does not.
+    fn keep_queried(&mut self, w: &mut World<'_, S>, id: JobId) {
+        #[cfg(test)]
+        if PLANT_QUERY_DROPS_FRONT.get() {
+            return;
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if !matches!(job.work, Work::Query(_)) || job.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(request) = job.request else { return };
+        let Some(Ready { input, root: Some(root), writer: Some(writer), .. }) = job.ready.pop()
+        else {
+            return;
+        };
+        let command = command_line(&job.work);
+        let kept = tracing::info_span!(target: "blaze", "loop: the query's front end kept")
+            .in_scope(|| writer.keep());
+        // clone: the checkout's path, once per query
+        let checkout = input.config.invocation.root.clone();
+        match kept {
+            // The run log is named by the store's task, after the answer, as a build's is: a
+            // query's end names none ([`Job::ended`] names a build's units alone).
+            Ok(kept) => {
+                self.store_kept(w, id, root, checkout, kept, u64::from(request.0), true, &input);
+            }
+            Err(error) => {
+                let what = format!(
+                    "the query's front end is not kept, and the checkout's next job lowers anew: {}",
+                    error.what
+                );
+                self.lose(id, &command, Some(&checkout), what);
+            }
         }
     }
 
@@ -9488,6 +9655,7 @@ impl<S: Steps> Jobs<S> {
                     self.placing_failed(id, path, error);
                 }
             }
+            Own::Sweep { job } => self.swept(w, job, done),
         }
     }
 
@@ -9765,13 +9933,19 @@ impl<S: Steps> Jobs<S> {
             }
             recorded.recording.vouch_env(read);
             // And the paths its steps read under its directories of outputs, beside its
-            // units' own: no change heard at one is set aside ([`noop::LastAnswer::read`]).
-            let read = tracing::info_span!(
+            // units' own, each stamped ([`noop::Recording::vouch_reads`]).
+            tracing::info_span!(
                 target: "blaze",
                 "no-op answer: the paths the build's steps read under its outputs",
             )
-            .in_scope(|| writer.read_outside());
-            recorded.recording.vouch_reads(read);
+            .in_scope(|| {
+                let read = writer.read_outside();
+                let read = match &read {
+                    Ok((files, listed)) => Ok((files.as_slice(), listed.as_slice())),
+                    Err(why) => Err(why.as_str()),
+                };
+                recorded.recording.vouch_reads(read, &Disk)
+            });
         }
         // The documentation's front end is not kept: it sets `cfg(doc)`.
         let documenting = match documents {
@@ -9983,8 +10157,22 @@ impl<S: Steps> Jobs<S> {
             build.after_write = Some(AfterWrite::Applied { ok });
             return;
         }
+        // A write still waits (the last unit's run or load asked it in this very turn): it is
+        // sent to a write's task, as [`Jobs::apply_writes`] sends every other, and the build
+        // ends as the writer comes back. The loop applies no write itself: an apply serves
+        // dependencies from the store, which reads in the running task's frame, and on the
+        // loop there is none (`frame::current outside any frame::task`, 2026-11-13). Sent
+        // whether or not a reader is alive, so a reader that outlived the build fails the job
+        // through [`Jobs::wrote`] rather than leaving it waiting for an idle writer.
+        if let Stage::Units(build) = &mut job.stage
+            && build.writer.here().is_some_and(|it| it.waiting())
+        {
+            build.after_write = Some(AfterWrite::Applied { ok });
+            self.send_write(w, id);
+            return;
+        }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, writer, root, units, applying, .. } = *build;
+        let Build { input, front, writer, root, units, refused, applying, .. } = *build;
         let unbuilt = applying.and_then(|it| it.first);
         let Some(mut writer) = writer.into_here() else {
             let error = ApiError::new(
@@ -10005,22 +10193,27 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         }
-        self.applied(w, id, ok, unbuilt, Ready { input, root, front: Some(front), writer: Some(writer) });
+        // A write that broke on its task ([`Jobs::after_write`]) refused the units after it:
+        // the view did not get everything its front end applies.
+        let broke = refused.and_then(|it| it.whys.into_iter().next());
+        let ready = Ready { input, root, front: Some(front), writer: Some(writer) };
+        self.applied(w, id, ok, unbuilt, broke, ready);
     }
 
     /// A view `ready` with the units its front end applies built ([`Jobs::next`]), `ok` whether
     /// all of them did: the wait's span closed, every write they asked for applied, and the view
     /// ready again, the job going on, in the same plane request, to its next view or its answer.
     /// A unit that did not build, or a write of one that did not apply, fails the job naming the
-    /// view and the unit (`unbuilt`: the first that did not build, and why where its end said):
-    /// its answer would read what a macro that never ran left out, or a crate without its build
-    /// script's output.
+    /// view and the unit (`unbuilt`: the first that did not build, and why where its end said;
+    /// `broke`: a write that broke on its task): its answer would read what a macro that never
+    /// ran left out, or a crate without its build script's output.
     fn applied(
         &mut self,
         w: &mut World<'_, S>,
         id: JobId,
         ok: bool,
         unbuilt: Option<(usize, Option<String>)>,
+        broke: Option<String>,
         mut ready: Ready<S>,
     ) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -10056,6 +10249,7 @@ impl<S: Steps> Jobs<S> {
                 }
                 None => "did not all build".to_owned(),
             })), // alloc: an error, once
+            _ if let Some(broke) = broke.as_deref() => Some(refused(format!("did not apply: {broke}"))),
             None => Some(refused("were built with no writer of it".to_owned())), // alloc: an error, once
             Some(writer) => match writer.apply() {
                 Err(error) => Some(refused(format!("did not apply: {}", error.what))),
@@ -11186,6 +11380,7 @@ fn keeps_going(work: &Work) -> bool {
 fn stage_name<S: Steps>(stage: &Stage<S>) -> &'static str {
     match stage {
         Stage::Library(_) => "reading the standard library",
+        Stage::Sweep(_) => "stamping its paths outside the view",
         Stage::Locals(..) => "reading its paths outside the view again",
         Stage::Plan(..) => "planning",
         Stage::Fetch(_) => "fetching",

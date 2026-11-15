@@ -61,7 +61,7 @@ pub use borrowed::{
 };
 pub use diagnostics::{Base, Found, Seen};
 pub use goal::{Goal, Tiers};
-pub use intent::{Edit, Edited, EditedItem, How, Target};
+pub use intent::{Edit, Edited, EditedItem, How, Param, Target};
 
 use blaze_core::Conn;
 use blaze_ids::{ContentId, Fingerprint};
@@ -136,7 +136,9 @@ use serde::{Deserialize, Serialize};
 /// answered as blaze's bug with Lean's first error, proof file or none, never `Open`.
 /// 62: [`Edit::Rules`], an astlog rules file's rewrites as one edit, and [`Request::Query`] and
 /// [`Response::Rows`] ([`query::Rows`]): its relations and findings, as data, nothing written.
-pub const SCHEMA: u32 = 62;
+/// 63: [`Edit::Params`] ([`Param`]): a fn's parameters added, removed or reordered, with every
+/// call.
+pub const SCHEMA: u32 = 63;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.

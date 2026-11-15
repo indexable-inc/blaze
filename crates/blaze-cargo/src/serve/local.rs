@@ -390,24 +390,15 @@ impl LibraryMark {
     /// `DIGEST` file's stamp `now` is the one marked, that was steady when marked, and the
     /// mount it names is among `mounted` (`Mounts::libraries`: fingerprint, place) at `at`.
     pub(crate) fn vouches(&self, now: &Stamp, mounted: &[(String, String)], at: &str) -> bool {
-        vouches(&self.digest_file, self.looked_ns, now, steady)
+        blaze_vfs::outside::holds_bytes(&self.digest_file, self.looked_ns, now)
             && self.at == at
             && mounted.iter().any(|(fingerprint, place)| *fingerprint == self.fingerprint && *place == self.at)
     }
 }
 
-/// Whether `stamp`, looked at at `looked_ns`, was steady: not [`blaze_vfs::racy`], its file's
-/// change (the later of its mtime and ctime) at least its window ([`blaze_vfs::window_ns`], by
-/// the file system's clock) before. A racy stamp vouches for nothing: a second write in the
-/// same tick of the file system's clock could leave it over other bytes.
-pub(crate) fn steady(stamp: &Stamp, looked_ns: u64) -> bool {
-    !blaze_vfs::racy(stamp, looked_ns)
-}
-
-/// Whether a fact taken under `saved` at `looked_ns` vouches for the file whose stamp is `now`.
-fn vouches(saved: &Stamp, looked_ns: u64, now: &Stamp, steady: fn(&Stamp, u64) -> bool) -> bool {
-    !now.is_unknown() && !now.is_gone() && saved == now && steady(saved, looked_ns)
-}
+/// The rule a fact tied to a file is checked by: [`blaze_vfs::outside::holds_bytes`], or a
+/// test's control in its place.
+type Rule = fn(&Stamp, u64, &Stamp) -> bool;
 
 /// The stamp of the file at `path` now, through links: its inode, size, modified and change
 /// times in nanoseconds, and mode. One look; the error names the path.
@@ -433,25 +424,25 @@ pub(crate) fn stamp_now(path: &std::path::Path) -> Result<Stamp, String> {
 /// crash record's, the certificate's tool, the build id a client compares.
 ///
 /// Read from `cache` (`<state>/tool`, a [`Tool`]) where its stamp is the executable's now,
-/// whole, and was steady when written ([`steady`]): no byte of the executable is read. Else
+/// whole, and was steady when written ([`blaze_vfs::outside::holds_bytes`]): no byte of the executable is read. Else
 /// hashed ([`blaze_profile::identity::binary_hash`]) between two looks, and where both are
 /// equal the cache is written over (`<cache>.part`, renamed over it; not synced: a cache lost
 /// to a crash is hashed again). A cache that does not decode (another layout, cut short) is
 /// its miss, said at info, and is written over; one that cannot be written is said, and the
 /// hash is the answer still.
 pub(crate) fn tool_hash(cache: &std::path::Path, exe: &std::path::Path) -> Result<[u8; 32], String> {
-    let (hash, _) = tool_hash_by(cache, exe, steady, blaze_profile::identity::binary_hash)?;
+    let (hash, _) = tool_hash_by(cache, exe, blaze_vfs::outside::holds_bytes, blaze_profile::identity::binary_hash)?;
     // Seeded here and only here: the one home of the process's hash.
     blaze_profile::identity::seed(hash);
     Ok(hash)
 }
 
-/// [`tool_hash`] with `steady` and `hash` (what hashes the executable) given, seeding nothing;
-/// whether the cache gave it. For the tests and their controls.
+/// [`tool_hash`] with `holds` (the [`Rule`]) and `hash` (what hashes the executable) given,
+/// seeding nothing; whether the cache gave it. For the tests and their controls.
 fn tool_hash_by(
     cache: &std::path::Path,
     exe: &std::path::Path,
-    steady: fn(&Stamp, u64) -> bool,
+    holds: Rule,
     hash: impl FnOnce() -> std::io::Result<[u8; 32]>,
 ) -> Result<([u8; 32], bool), String> {
     let _span = tracing::info_span!(target: "blaze", "the hash of this blaze's executable, by its stamp", cache = %cache.display()).entered();
@@ -461,7 +452,7 @@ fn tool_hash_by(
     // alloc: the cache's name, for what it says
     let name = cache.display().to_string();
     let kept = match std::fs::read(cache) {
-        Ok(bytes) => match tool_by(&name, Some(&bytes), before, steady) {
+        Ok(bytes) => match tool_by(&name, Some(&bytes), before, holds) {
             Ok(kept) => kept,
             Err(why) => {
                 tracing::info!(target: "blaze", "{why}: the executable is hashed again and the cache written over");
@@ -494,37 +485,27 @@ fn tool_hash_by(
     Ok((hash, false))
 }
 
-/// The tool's hash from the cache's bytes `kept` (named `name`), if its stamp is `now` and was
-/// `steady`.
-fn tool_by(
-    name: &str,
-    kept: Option<&[u8]>,
-    now: Stamp,
-    steady: fn(&Stamp, u64) -> bool,
-) -> Result<Option<[u8; 32]>, Undecoded> {
+/// The tool's hash from the cache's bytes `kept` (named `name`), if its stamp `now` `holds`.
+fn tool_by(name: &str, kept: Option<&[u8]>, now: Stamp, holds: Rule) -> Result<Option<[u8; 32]>, Undecoded> {
     let Some(kept) = kept else { return Ok(None) };
     let tool = Tool::decode(name, kept)?;
-    Ok(vouches(&tool.exe, tool.looked_ns, &now, steady).then_some(tool.hash))
+    Ok(holds(&tool.exe, tool.looked_ns, &now).then_some(tool.hash))
 }
 
-/// A placed output's content from its mark `name`, if the mark's stamp is `now` and was steady.
+/// A placed output's content from its mark `name`, if the mark's stamp holds against `now`
+/// ([`blaze_vfs::outside::holds_bytes`]).
 pub(crate) fn placed(
     name: &str,
     mark: Option<&[u8]>,
     now: Stamp,
 ) -> Result<Option<ContentId>, Undecoded> {
-    placed_by(name, mark, now, steady)
+    placed_by(name, mark, now, blaze_vfs::outside::holds_bytes)
 }
 
-fn placed_by(
-    name: &str,
-    mark: Option<&[u8]>,
-    now: Stamp,
-    steady: fn(&Stamp, u64) -> bool,
-) -> Result<Option<ContentId>, Undecoded> {
+fn placed_by(name: &str, mark: Option<&[u8]>, now: Stamp, holds: Rule) -> Result<Option<ContentId>, Undecoded> {
     let Some(mark) = mark else { return Ok(None) };
     let placed = Placed::decode(name, mark)?;
-    Ok(vouches(&placed.stamp, placed.looked_ns, &now, steady).then_some(placed.content))
+    Ok(holds(&placed.stamp, placed.looked_ns, &now).then_some(placed.content))
 }
 
 #[cfg(test)]
@@ -533,6 +514,15 @@ mod tests {
     use blaze_sim::{Config, Tape};
 
     use super::*;
+
+    /// The rule as the daemon checks by it.
+    const HOLDS: Rule = blaze_vfs::outside::holds_bytes;
+
+    /// The control: [`HOLDS`] with the racy rule skipped, a stamp taken in its write's tick
+    /// trusted.
+    fn racy_trusted(was: &Stamp, _: u64, now: &Stamp) -> bool {
+        !now.is_unknown() && !now.is_gone() && was == now
+    }
 
     fn draw_stamp(tape: &Tape) -> Stamp {
         Stamp {
@@ -691,7 +681,7 @@ mod tests {
         let refused = Tool::decode("tool", &one[..10]).unwrap_err();
         assert_eq!(refused, Undecoded::Length { name: "tool".into(), len: 10 });
         assert_eq!(Tool::decode("tool", &[]), Err(Undecoded::Length { name: "tool".into(), len: 0 }));
-        assert_eq!(tool_by("tool", Some(&one[..10]), Stamp::GONE, steady).map(|_| ()), Err(refused));
+        assert_eq!(tool_by("tool", Some(&one[..10]), Stamp::GONE, HOLDS).map(|_| ()), Err(refused));
     }
 
     /// The invariant (rule 26): a launched program's mark decodes from its bytes to itself and
@@ -777,7 +767,7 @@ mod tests {
 
     /// Every case of the window: a stamp changed at `CHANGED` (a whole second: the coarse
     /// window), looked at `after` it, asked of with `now`; the content given or not.
-    fn given(steady: fn(&Stamp, u64) -> bool) -> Vec<(u64, bool, bool, bool)> {
+    fn given(rule: Rule) -> Vec<(u64, bool, bool, bool)> {
         const CHANGED: u64 = 1_000 * 1_000_000_000;
         let mode = S_IFREG | 0o644;
         let stamp = Stamp { ino: 9, size: 4, mtime_ns: CHANGED, ctime_ns: CHANGED, mode };
@@ -789,9 +779,9 @@ mod tests {
             let looked_ns = CHANGED + after;
             for now in [stamp, moved] {
                 let mark = Tool { exe: stamp, looked_ns, hash: [3; 32] }.encode();
-                let hash = tool_by("tool", Some(&mark), now, steady).unwrap();
+                let hash = tool_by("tool", Some(&mark), now, rule).unwrap();
                 let placed = Placed { stamp, looked_ns, content: ContentId([4; 32]) }.encode();
-                let content = placed_by("placed\0/a", Some(&placed), now, steady).unwrap();
+                let content = placed_by("placed\0/a", Some(&placed), now, rule).unwrap();
                 assert_eq!(hash.is_some(), content.is_some(), "one rule for both");
                 out.push((after, now == stamp, hash.is_some(), after >= window));
             }
@@ -804,23 +794,26 @@ mod tests {
         cases.iter().all(|&(_, equal, given, steady)| given == (equal && steady))
     }
 
-    /// Control: with `steady` always true, a stamp inside the racy window vouches, and the
-    /// invariant breaks.
+    /// Control: with the racy rule skipped, a stamp inside the racy window vouches, and the
+    /// invariant breaks. A gone file vouches for no bytes, even under the `GONE` it was
+    /// stamped with (the case `holds_bytes` adds to `holds`).
     #[test]
     fn a_stamp_inside_the_racy_window_vouches_for_nothing() {
-        assert!(holds(&given(steady)), "{:?}", given(steady));
-        assert!(!holds(&given(|_, _| true)), "the control: racy stamps trusted");
-        assert_eq!(tool_by("tool", None, Stamp::GONE, steady), Ok(None), "no cache, no hash");
+        assert!(holds(&given(HOLDS)), "{:?}", given(HOLDS));
+        assert!(!holds(&given(racy_trusted)), "the control: racy stamps trusted");
+        assert_eq!(tool_by("tool", None, Stamp::GONE, HOLDS), Ok(None), "no cache, no hash");
         let mark = Tool { exe: Stamp::UNKNOWN, looked_ns: u64::MAX, hash: [5; 32] }.encode();
-        let unknown = tool_by("tool", Some(&mark), Stamp::UNKNOWN, steady);
+        let unknown = tool_by("tool", Some(&mark), Stamp::UNKNOWN, HOLDS);
         assert_eq!(unknown, Ok(None), "an unknown stamp vouches for nothing");
+        let gone = Tool { exe: Stamp::GONE, looked_ns: u64::MAX, hash: [6; 32] }.encode();
+        assert_eq!(tool_by("tool", Some(&gone), Stamp::GONE, HOLDS), Ok(None), "a gone file vouches for no bytes");
     }
 
     /// The invariant (rule 26): `<state>/tool` gives the executable's hash only under the
     /// executable's stamp now, equal whole, and steady when written; a cache of another layout
     /// (byte 0 or 2) or cut short is hashed again and written over, never read as this one; a
-    /// cache written inside the racy window is hashed again. Control: with `steady` always
-    /// true, the cache written inside the window serves its hash, and the oracle says so.
+    /// cache written inside the racy window is hashed again. Control: with the racy rule
+    /// skipped, the cache written inside the window serves its hash, and the oracle says so.
     #[test]
     fn a_tool_hash_is_read_from_its_cache_only_under_the_equal_steady_stamp() {
         let dir = tempfile::tempdir().unwrap();
@@ -835,16 +828,16 @@ mod tests {
             }
         };
         // No cache: hashed, and the cache written under the stamp.
-        assert_eq!(tool_hash_by(&cache, &exe, steady, hash(1)).unwrap(), ([1; 32], false));
+        assert_eq!(tool_hash_by(&cache, &exe, HOLDS, hash(1)).unwrap(), ([1; 32], false));
         assert_eq!(hashed.get(), 1);
         let written = Tool::decode("tool", &std::fs::read(&cache).unwrap()).unwrap();
         assert_eq!((written.exe, written.hash), (stamp_now(&exe).unwrap(), [1; 32]));
         // Written within its window of the file's change (it was just written): racy, so it
         // is hashed again. The control: trusted as steady, it serves the hash kept.
-        assert_eq!(tool_hash_by(&cache, &exe, steady, hash(2)).unwrap(), ([2; 32], false));
+        assert_eq!(tool_hash_by(&cache, &exe, HOLDS, hash(2)).unwrap(), ([2; 32], false));
         assert_eq!(hashed.get(), 2);
         assert_eq!(
-            tool_hash_by(&cache, &exe, |_, _| true, hash(3)).unwrap(),
+            tool_hash_by(&cache, &exe, racy_trusted, hash(3)).unwrap(),
             ([2; 32], true),
             "the control: a racy cache trusted serves its hash"
         );
@@ -854,7 +847,7 @@ mod tests {
         let now = stamp_now(&exe).unwrap();
         let far = Tool { exe: now, looked_ns: blaze_vfs::window_ns(&now) * 4 + now.mtime_ns.max(now.ctime_ns), hash: [4; 32] };
         std::fs::write(&cache, far.encode()).unwrap();
-        assert_eq!(tool_hash_by(&cache, &exe, steady, hash(5)).unwrap(), ([4; 32], true));
+        assert_eq!(tool_hash_by(&cache, &exe, HOLDS, hash(5)).unwrap(), ([4; 32], true));
         assert_eq!(hashed.get(), 2, "a steady cache under the equal stamp reads no byte of the executable");
 
         // Another layout, cut short or empty: hashed again and written over.
@@ -866,7 +859,7 @@ mod tests {
         for (at, bad) in [zero, two, good[..good.len() - 1].to_vec(), Vec::new()].into_iter().enumerate() {
             std::fs::write(&cache, &bad).unwrap();
             let before = hashed.get();
-            assert_eq!(tool_hash_by(&cache, &exe, steady, hash(6)).unwrap(), ([6; 32], false), "case {at}");
+            assert_eq!(tool_hash_by(&cache, &exe, HOLDS, hash(6)).unwrap(), ([6; 32], false), "case {at}");
             assert_eq!(hashed.get(), before + 1, "case {at}: hashed again");
             let over = Tool::decode("tool", &std::fs::read(&cache).unwrap()).unwrap();
             assert_eq!(over.hash, [6; 32], "case {at}: written over");
@@ -875,6 +868,6 @@ mod tests {
         // The executable replaced: its stamp is another, the cache vouches for nothing.
         std::fs::write(&cache, far.encode()).unwrap();
         std::fs::write(&exe, b"blaze, built again").unwrap();
-        assert_eq!(tool_hash_by(&cache, &exe, steady, hash(7)).unwrap(), ([7; 32], false));
+        assert_eq!(tool_hash_by(&cache, &exe, HOLDS, hash(7)).unwrap(), ([7; 32], false));
     }
 }

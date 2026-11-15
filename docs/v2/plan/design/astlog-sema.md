@@ -76,7 +76,13 @@ And one over the type behind any references, by the names the std prelude gives:
 - **Rewrites.** `(replace n "tmpl")`, `(delete n)`, `(insert-before n "tmpl")`,
   `(insert-after n "tmpl")`, `(rename n "new_name")` (n a def; every reference moves, through
   blaze-intent), `(retarget n "krate::path")` (n a path node; written as the file sees the new
-  item, imported when needed) and `(add-use n "krate::path")` (n any node of the file). Templates
+  item. A bare name is written as the new item's name and the item is imported: beside the
+  private `use` that brought the old item, which goes once no read the request leaves remains,
+  or else at the end of the module's `use`s. A retargeted `use` leaf is that import, moved the
+  same way. Refused, naming it: a new name that already means something else there, a
+  retargeted `use` a read still needs, a `pub use`, a use-tree prefix or glob), `(add-use n "krate::path")` (n any node of the file), and
+  `add-param`, `remove-param` and `reorder-params` (d a fn; every call changes with it; see
+  "Changing a fn's parameters"). Templates
   splice `$var`; `$$` is a literal `$`. A template is parsed with each metavariable as a hole,
   as the form of what it edits (an expression it replaces, or statements it replaces or sits
   beside in a body), and a bound expression is parenthesized only where its hole's precedence
@@ -95,7 +101,7 @@ And one over the type behind any references, by the names the std prelude gives:
   `(not (in-macro-expansion n))`. A rewritten file that no longer parses (the file, the first
   syntax error), and a file that had a syntax error before the rewrite (the file, the line, the
   error); the whole request fails, nothing is written.
-- **Surfaces.** The API first, schema 62: `Edit::Rules { rules }` rides the existing
+- **Surfaces.** The API first, schema 62 (63 adds `Edit::Params`): `Edit::Rules { rules }` rides the existing
   `Request::Edit`, so the answer is the usual `Edited` (VFS ops and seeds, the way
   `blaze_intent::apply` sends them); one per request, after the request's other edits.
   `Request::Edit`'s `head` is optional: with none, the edits are made and answered and nothing is
@@ -120,8 +126,17 @@ argument.
 |---|---|---|
 | `(expr n "pat")` and the other pattern forms | nothing | every matching node and its metavariables |
 | `(syntax n "KIND")` | nothing | every node of that `SyntaxKind` |
+| `(match-arm m a p b)` | nothing | a `match`, each of its arms, the arm's pattern and its expression; from `m`, from `a`, or every arm of the view. A guard is no part of `p` |
+| `(child p c)`, `(descendant p c)` | `p` | each child node of `p`, or each node below it (never `p`), in order; `parent` and `ancestor` are their inverses |
+| `(int-value n i)` | `n` | the integer an integer literal means, in any radix, with `_`s and a suffix (`0x1F` is 31), or a negated one in an expression or a pattern (`-2`); a value past `i64` has no row |
+| `(str-value n s)` | `n` | the text a string literal means, escapes and raw strings read (`"a\tb"` is `a`, a tab, `b`); a byte or C string has no row |
 | `(resolves n d)` | `n` | the def a path, name, method call or field names |
-| `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included. A variant is under its enum (`lib::E::V`), a field under its struct, union or variant (`lib::S::field`, `lib::E::V::inner`, `lib::P::0`). An impl's path ends in `<impl Type>` or `<impl Trait<Args> for Type>`; it names the impl and resolves to nothing, so a `p` naming one is refused |
+| `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included. A variant is under its enum (`lib::E::V`), a field under its struct, union or variant (`lib::S::field`, `lib::E::V::inner`, `lib::P::0`). An impl's path ends in `<impl Type>` or `<impl Trait<Args> for Type>`; it names the impl and resolves to nothing, so a `p` naming one is refused. An associated item is under its impl's ADT, or under the impl segment when the self type is no ADT (`lib::<impl Go for &'_ str>::go`) |
+| `(def-parent d p)` | `d` or `p` | the def that owns `d`: a variant's enum, a field's struct, union or variant, an associated item's impl or trait, an item's or an impl's module, a module's parent (a crate's root has none); or each def `p` owns |
+| `(variant-count e n)` | `e` | how many variants the enum has; any other def has no row |
+| `(type-kind t k)` | `t` | the type's shape as text: `struct`, `enum`, `union`, `ref`, `ptr`, `slice`, `array`, `tuple`, `str`, `bool`, `char`, `int` (signed), `uint`, `float`, `dyn`, `param`, `closure`, `fn`, `impl`, `never`, `unknown`, else `other` |
+| `(type-def t d)` | `t` | the ADT the type is, or the trait of a `dyn Trait`; a reference is not peeled, so `(peel-refs t u)` first |
+| `(def-name d t)` | `d` | the def's own name as text, the last segment of its path (`0` for a tuple field); an impl has none, so no row |
 | `(type-of n t)` | `n` | the type of an expression or a pattern |
 | `(type-matches t "pat")` | `t` | holds when the type matches; `$name` in the pattern binds a type argument |
 | `(peel-refs t u)` | `t` | `t` with every leading `&` and `&mut` stripped, or `t` itself |
@@ -140,8 +155,21 @@ Kept from astlog: `ancestor`, `parent`, `precedes`, `text`, `kind`, `text-match`
 `same-file`, `file-path`, `misgrouped-digits`. New in the engine for every source: `(count c (rel
 args...))` binds `c` to the number of distinct rows of a lower-stratum relation that agree with the
 bound arguments, and `(lt a b)`, `(le a b)` compare integers; integer literals are bare numbers.
-`(not (atom ...))` negates a source atom as well as a relation: every variable bound to its left,
-it needs no stratum, and it is how a rule excludes macro-made matches.
+`(not (atom ...))` negates a source atom or a builtin as well as a relation: every variable bound to its left,
+it needs no stratum, and it is how a rule excludes macro-made matches. `(not (text-match x "re"))`
+holds when the regex finds nothing in `x`. `(count ...)` over a builtin is refused; a builtin is
+no finite relation.
+
+Text builtins take a node or text first and need it bound. A regex is a string literal,
+compiled when the file is read; one that does not compile, or whose compiled program is past
+1 MiB (`MAX_REGEX_BYTES`), is a load error naming the line and the pattern.
+
+| Builtin | Needs | Gives |
+|---|---|---|
+| `(text-match x "re")` | `x` | holds when the regex matches somewhere in `x`'s text |
+| `(text-capture x "re" g1 g2 ...)` | `x` | holds when the regex matches; binds each capture group of the first match, in order, as text (a group that took no part binds empty text). The variables must be one per group, checked at load |
+| `(text-replace x "re" "with" y)` | `x` | always holds; `y` is `x`'s text with every match replaced. `$1`, `${1}` and `${name}` write a group, `$$` a literal `$`. `$name` takes the longest run of letters, digits and `_`, so `$1_new` would read a group `1_new`: a `$` that names no group of the pattern, or names nothing, is a load error that gives the `${1}` spelling |
+| `(case x "style" y)` | `x` | `x`'s text as `snake`, `camel`, `pascal`, `upper-snake` or `kebab` (the style a literal). Words split at `_`, `-` and case changes (`HTTPServer` is `HTTP` `Server`, digits stay with the word before them); leading and trailing `_` are kept. Text with any other character, `r#` included, is an error naming it |
 
 ## Type patterns
 
@@ -161,6 +189,58 @@ single name matches an ADT of that name by text, with its arguments. A form the 
 not read is a load error that says what to write instead: `impl Trait` and `dyn Trait` point
 at `(implements t ...)`, a raw or fn pointer at `$t`, a path from `crate::` at the crate's
 name.
+
+## Changing a fn's parameters
+
+```lisp
+;; `lib::connect` takes a timeout; every call passes the old one
+(rule (connect d) (def-path d "lib::connect"))
+(rewrite connect-timeout (connect d)
+  (add-param d "timeout_secs: u64" "30"))
+```
+
+`(add-param d "name: Type" "default")` appends a parameter to the fn `d`, or puts it before
+the parameter of an index given last (`self` not counted), and passes `default` at every call.
+`(remove-param d "name")` drops a parameter and its argument. `(reorder-params d "b" "a")`
+names every parameter once, in the new order. Each is one `Edit::Params { item, params }`
+(schema 63): the new list, each entry a kept parameter by its pattern text
+(`Param::Kept { name }`) or a new one (`Param::Added { param, default }`). blaze-intent makes
+it with the renames, before any other kind of edit, so it resolves in the view as it is.
+
+Every name spelled like the fn, or like a `use ... as` alias of it, is resolved. A path call,
+a method call, a UFCS call (`Trait::f(x)`, `<T as Trait>::f(x)`), a call through an alias or a
+re-export, and a call in a macro's input whose expansion resolves to the fn get the change. A
+trait's method changes in the trait, in every impl and at every call; asked of an impl's fn,
+the change is refused, pointing at the trait. An added argument is inserted where it goes and
+needs no parentheses: an argument is a whole expression, and the default must parse as exactly
+one. A removal or reorder rewrites the argument list. A dropped or moved argument must be plain
+(a literal, a path, or a reference to one), so no side effect is lost or reordered; in a
+macro's input only additions are written.
+
+Refused, each naming the file and line: the fn used as a value (`let g = f;`, `map(f)`), whose
+callers it cannot see; a call a macro made, which has no input to write an argument in; a call
+with an argument count other than the fn's (a macro that drops or adds arguments); a field
+shorthand that is the fn's name; an `extern` ABI, `#[no_mangle]` or `#[export_name]` fn and a
+C-variadic one, whose callers are outside Rust; a removed parameter the body still reads, or a
+removed pattern parameter (`(a, b): (u8, u8)`); an index past the list, a name the fn has not,
+and a reorder that does not name every parameter once.
+
+## Computed renames
+
+```lisp
+;; every fn named `legacy_*` loses the prefix, and every reference with it
+(rule (legacy d new)
+  (syntax n "FN")
+  (defines n d)
+  (def-name d name)
+  (text-capture name "^legacy_(.+)$" new))
+(rewrite drop-legacy-prefix (legacy d new)
+  (rename d new))
+```
+
+An action's text argument is taken as written: `(rename d "$new")` would name the text `$new`,
+so a `$name` in one is a load error that says to pass the variable bare. The text builtins
+compute it instead: `(text-replace name "^legacy_" "" short)` then `(case short "pascal" t)`.
 
 ## The evaluator
 
@@ -202,6 +282,15 @@ reference model for a property test only.
   of the whole checkout and refuse `-p`, `--features`, `--target`, target selection and the
   other selection flags by name. The end state is a query that carries `Targets`, as
   `Request::Trace` does, so the view is the selected build's.
+- Queries and rewrites in test configuration. A rules file runs over the view's one cfg set
+  per crate, so code only a test build compiles (`#[cfg(test)]` items, `tests/` targets,
+  dev-dependencies) is matched as syntax but, where that cfg is off, has no types or
+  resolution, and a rename or a parameter change can miss its uses. The end state:
+  `Request::Query` and `Edit::Rules` carry `Targets`, as `Request::Trace` does. The daemon
+  lowers them to the units a build would compile, each with its cfg (`test` for a test target,
+  the features, the target) and its dev-dependencies, opens one view per distinct cfg, and
+  runs the rules over each. Rows are merged; the edits two views make must agree byte for
+  byte, and a disagreement is refused, naming both units.
 - Prelude resolution of single-segment names in code patterns; they match by text. Type
   patterns resolve them (see Type patterns).
 - A `use` added for a template path `find_path` can only spell through an import; it is written

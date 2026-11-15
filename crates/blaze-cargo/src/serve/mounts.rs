@@ -14,7 +14,7 @@ use std::alloc::Global;
 
 use crate::serve::{
     fetch::on_disk_id,
-    work::{LocalRead, Source},
+    work::{LocalLeaf, LocalRead, Source},
 };
 
 /// What every mount's head is named by: `mount:<at>`, a NUL, then what `at` is under the root.
@@ -39,19 +39,115 @@ fn parse(head: &str) -> Option<(String, String)> {
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Mounts {
     by_at: HashMap<String, Mount, Global>,
-    /// Each path read where it is on the disk, by `at`: its mount, the canonical directory
-    /// whose watch vouches for it ([`LocalRead::watched`]) and the watch's generation as read
-    /// before its files were. Never in the journal.
+    /// Each path read where it is on the disk, by `at`: its mount, and the leaves it was read
+    /// from with their stamps ([`LocalRead::leaves`]) and the instant of those looks. Never in
+    /// the journal.
     locals: HashMap<String, Local, Global>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Local {
     mount: Mount,
-    watched: Option<String>,
-    generation: u64,
-    /// Nothing was at its path when it was read ([`LocalRead::source`] has no file).
-    absent: bool,
+    leaves: Option<std::sync::Arc<[LocalLeaf]>>,
+    looked_ns: u64,
+}
+
+/// One local mount as a [`Sweep`] holds it: its place, its leaves (none: it is read again
+/// whatever the stamps say) and the instant they were looked at.
+#[derive(Debug)]
+struct SweptLocal {
+    at: String,
+    leaves: Option<std::sync::Arc<[LocalLeaf]>>,
+    looked_ns: u64,
+}
+
+/// The local mounts' leaves asked of the driver in one [`blaze_core::Effect::Stamp`]
+/// ([`Mounts::sweep`]), and the answer's check ([`Sweep::stale`]).
+///
+/// The floor of the sweep: one `lstat` per leaf, nothing read, off the loop; it costs that
+/// (ratio 1.0). On the loop it costs building the names (one copy of each leaf's path) and
+/// one comparison per stamp.
+#[derive(Debug)]
+pub struct Sweep {
+    names: std::sync::Arc<blaze_core::Names>,
+    /// Sorted by place; the names are the leaves of those with leaves, in this order.
+    locals: Vec<SweptLocal>,
+}
+
+/// The local mounts a [`Sweep`] found must be read again before a job reads them, sorted by
+/// place ([`Sweep::stale`]): each with no leaves, and each with a leaf whose stamp no longer
+/// holds. Empty (its `Default`): none is.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Stale {
+    /// Where each is mounted.
+    pub ats: Box<[String]>,
+}
+
+/// A sweep's answer refused ([`Sweep::stale`]): the driver answered `answered` stamps for the
+/// `asked` leaves named, so no stamp can be matched to its leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepError {
+    pub asked: usize,
+    pub answered: usize,
+}
+
+impl std::fmt::Display for SweepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the sweep of the paths outside the view asked {} stamps of the driver and was answered {}",
+            self.asked, self.answered
+        )
+    }
+}
+
+impl Sweep {
+    /// The effect that asks the driver for the stamps of the sweep's names, tagged `tag`; the
+    /// effect and the sweep share the names (a refcount).
+    pub fn effect(&self, tag: blaze_core::Tag) -> blaze_core::Effect {
+        blaze_core::Effect::Stamp { files: std::sync::Arc::clone(&self.names), tag }
+    }
+
+    /// How many leaves are asked.
+    pub fn leaves(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Where each local mount is that must be read again before a job reads it, sorted by
+    /// place, by `stamps`, the driver's answer for [`Sweep::effect`]'s names in order: one with
+    /// no leaves, and one any of whose leaves' stamp no longer holds
+    /// ([`blaze_vfs::outside::holds`]). An answer of another length is refused, naming both
+    /// lengths. A span with the counts: locals, leaves, stale.
+    pub fn stale(&self, stamps: &[blaze_core::Stamp]) -> Result<Stale, SweepError> {
+        let span = tracing::info_span!(
+            target: "blaze",
+            "sweep the stamps of the paths outside the view mounted where they are",
+            locals = self.locals.len(),
+            leaves = self.names.len(),
+            stale = tracing::field::Empty,
+        )
+        .entered();
+        if stamps.len() != self.names.len() {
+            return Err(SweepError { asked: self.names.len(), answered: stamps.len() });
+        }
+        let mut stale = Vec::new_in(Global);
+        let mut at = 0;
+        for local in &self.locals {
+            let held = match &local.leaves {
+                None => false,
+                Some(leaves) => {
+                    let now = &stamps[at..at + leaves.len()];
+                    at += leaves.len();
+                    leaves.iter().zip(now).all(|(leaf, now)| blaze_vfs::outside::holds(&leaf.stamp, local.looked_ns, now))
+                }
+            };
+            if !held {
+                stale.push(local.at.clone()); // clone: once per local read again
+            }
+        }
+        span.record("stale", stale.len());
+        Ok(Stale { ats: stale.into_boxed_slice() })
+    }
 }
 
 impl Mounts {
@@ -130,46 +226,79 @@ impl Mounts {
     /// only. A local mounted there before is replaced in place, so a job that opened its view
     /// before reads the old root and one after the new, and none sees the path unmounted.
     pub fn mount_local(&mut self, vfs: &mut Vfs, read: LocalRead) -> Result<Mount, String> {
-        let LocalRead { at, source: Source { files, under }, watched, generation } = read;
+        let LocalRead { at, source: Source { files, under }, leaves, looked_ns } = read;
         if self.by_at.contains_key(&at) {
             return Err(format!("`{at}` is read where it is on the disk, but a fetched source is mounted there"));
         }
-        let absent = watched.is_none() && files.is_empty();
+        let leaves = leaves.map(std::sync::Arc::from);
         let files = files.into_iter().map(|file| (file.path, file.bytes, file.mode));
         let root = vfs
             .apply_files(vfs.empty(), files)
             .map_err(|error| format!("the files read at {at} don't make a tree: {}", op_error(&error)))?;
         let mount = Mount { at: at.clone(), origin: Origin::Root(root), under }; // clone: once per path read
-        self.locals.insert(at, Local { mount: mount.clone(), watched, generation, absent }); // clone: as above
+        self.locals.insert(at, Local { mount: mount.clone(), leaves, looked_ns }); // clone: as above
         Ok(mount)
     }
 
-    /// Where each local mount is that must be read again before a job reads it, sorted: one
-    /// file unless `same_file(at, generation)` says the watches heard nothing of its name
-    /// since it was read (a directory named through a link too, of which that never says
-    /// so), a directory unless `unchanged(watched,
-    /// generation)` says nothing under it changed since it was read, and a path read as
-    /// absent unless `absent(at)` says nothing is there now (a look at the disk at each ask,
-    /// which is the whole of what an absent path is).
-    pub fn stale_locals(
-        &self,
-        unchanged: impl Fn(&str, u64) -> bool,
-        same_file: impl Fn(&str, u64) -> bool,
-        absent: impl Fn(&str) -> bool,
-    ) -> Vec<String> {
-        // alloc: once per job, the locals to read again
-        let mut stale: Vec<String> = self
-            .locals
-            .iter()
-            .filter(|(at, it)| match (it.watched.as_deref(), it.absent) {
-                (Some(dir), _) => !unchanged(dir, it.generation),
-                (None, true) => !absent(at.as_str()),
-                (None, false) => !same_file(at.as_str(), it.generation),
-            })
-            .map(|(at, _)| at.clone()) // clone: once per local read again
-            .collect();
-        stale.sort_unstable();
-        stale
+    /// The sweep of every local mount's leaves as they are now: the names to ask the driver's
+    /// [`blaze_core::Effect::Stamp`] for (one `lstat` each, off the loop, as the stampers do
+    /// it), and what each answer is checked against ([`Sweep::stale`]). `None` where no path
+    /// outside the view is mounted: nothing to ask. A local with no leaves (named through a
+    /// link), or with a leaf the driver cannot name (the root `/`, a name with a NUL), asks
+    /// nothing and is read again by every job, as one whose leaf moved.
+    ///
+    /// The snapshot is of the mounts as the sweep is asked: a local mounted again before the
+    /// answer comes is judged by the leaves it had, so the job reads it again at most once
+    /// more than it needed; one mounted first after the ask is not in the sweep, and was read
+    /// after it.
+    pub fn sweep(&self) -> Option<Sweep> {
+        if self.locals.is_empty() {
+            return None;
+        }
+        let mut locals: Vec<SweptLocal> = Vec::with_capacity_in(self.locals.len(), Global);
+        let (mut count, mut bytes) = (0usize, 0usize);
+        for (at, local) in &self.locals {
+            let leaves = local.leaves.as_ref().filter(|leaves| {
+                leaves.iter().all(|leaf| leaf.path.len() > 1 && leaf.path.starts_with('/') && !leaf.path.contains('\0'))
+            });
+            if let Some(leaves) = leaves {
+                count += leaves.len();
+                bytes += leaves.iter().map(|it| it.path.len()).sum::<usize>();
+            }
+            // clone: the place and a refcount, once per local a sweep
+            locals.push(SweptLocal { at: at.clone(), leaves: leaves.cloned(), looked_ns: local.looked_ns });
+        }
+        locals.sort_unstable_by(|a, b| a.at.cmp(&b.at));
+        let mut names = blaze_core::Names::with_capacity(count, bytes);
+        for local in &mut locals {
+            let Some(leaves) = &local.leaves else { continue };
+            // The driver's root is `/`: a leaf's path less its leading `/` is its name there.
+            let named = leaves.iter().all(|leaf| names.push_str(&leaf.path[1..]));
+            if !named {
+                // A path `FileName` refuses (a `.` or `..` part, an empty part): the local asks
+                // nothing and is read again. Its names pushed so far are dropped with the rest.
+                local.leaves = None;
+            }
+        }
+        // Pushed again where a local was dropped midway, so the names line up with the leaves.
+        #[cfg(test)]
+        let planted = tests::KEEPS_DROPPED_NAMES.get();
+        #[cfg(not(test))]
+        let planted = false;
+        if !planted && locals.iter().any(|it| it.leaves.is_none()) {
+            names = blaze_core::Names::with_capacity(count, bytes);
+            for leaves in locals.iter().filter_map(|it| it.leaves.as_ref()) {
+                for leaf in leaves.iter() {
+                    names.push_checked(&leaf.path[1..]);
+                }
+            }
+        }
+        Some(Sweep { names: std::sync::Arc::new(names), locals })
+    }
+
+    /// Where any path outside the view is mounted where it is on the disk, the first by place.
+    pub fn first_local(&self) -> Option<&str> {
+        self.locals.keys().map(String::as_str).min()
     }
 
     /// The roots the mounts hold, sorted by `at`, for a collection to keep: the collection
@@ -383,6 +512,85 @@ mod tests {
             .mount(&mut vfs, at, source(&[("core/src/lib.rs", b"#![no_core] // edited\n")], ""))
             .unwrap();
         assert!(mounts.libraries(&vfs).is_empty(), "the mount is no longer what that library read");
+    }
+
+    std::thread_local! {
+        /// The planted bug of the sweep's control: the names of a local dropped midway (a leaf
+        /// the driver cannot name) are left in the batch, so the stamps after it are checked
+        /// against the wrong leaves.
+        pub(super) static KEEPS_DROPPED_NAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    const CHANGED: u64 = 1_000_000_007;
+
+    fn leaf(path: &str, ino: u64) -> LocalLeaf {
+        let stamp = blaze_core::Stamp { ino, size: 1, mtime_ns: CHANGED, ctime_ns: CHANGED, mode: 0o100644 };
+        LocalLeaf { path: path.to_owned(), stamp }
+    }
+
+    /// Three locals: `/a` with two leaves, `/b` with a leaf the driver cannot name after one
+    /// it can (so `/b` asks nothing), `/c` with one leaf, looked at long after every change.
+    fn three(vfs: &mut Vfs) -> Mounts {
+        let mut mounts = Mounts::default();
+        let looked_ns = CHANGED + 10 * blaze_vfs::COARSE_NS;
+        for (at, leaves) in [
+            ("/a", vec![leaf("/a", 1), leaf("/a/lib.rs", 2)]),
+            ("/b", vec![leaf("/b", 3), leaf("/b/../x", 4)]),
+            ("/c", vec![leaf("/c", 5)]),
+        ] {
+            let read = LocalRead {
+                at: at.to_owned(),
+                source: source(&[("lib.rs", at.as_bytes())], ""),
+                leaves: Some(leaves.into_boxed_slice()),
+                looked_ns,
+            };
+            mounts.mount_local(vfs, read).unwrap();
+        }
+        mounts
+    }
+
+    /// The oracle: the sweep asks exactly the nameable locals' leaves, in place order, and
+    /// names stale exactly the local with a leaf the driver cannot name and the one whose
+    /// leaf's stamp moved.
+    fn sweep_wrong(mounts: &Mounts) -> Result<(), String> {
+        let sweep = mounts.sweep().ok_or("no sweep of three locals")?;
+        let asked: Vec<&str> = (0..sweep.names.len()).map(|at| sweep.names.get(at)).collect();
+        if asked != ["a", "a/lib.rs", "c"] {
+            return Err(format!("the sweep asked {asked:?}"));
+        }
+        let mut stamps: Vec<blaze_core::Stamp> = [1, 2, 5].map(|ino| leaf("/", ino).stamp).to_vec();
+        let stale = |stamps: &[blaze_core::Stamp]| sweep.stale(stamps).map_err(|it| it.to_string());
+        if *stale(&stamps)?.ats != ["/b"] {
+            return Err("with nothing moved, other than `/b` stale".to_owned());
+        }
+        stamps[2].mtime_ns += 1;
+        if *stale(&stamps)?.ats != ["/b", "/c"] {
+            return Err("with `/c` moved, other than `/b` and `/c` stale".to_owned());
+        }
+        if sweep.stale(&stamps[..2]) != Err(SweepError { asked: 3, answered: 2 }) {
+            return Err("an answer of another length was taken".to_owned());
+        }
+        Ok(())
+    }
+
+    /// The invariant: a sweep's names line up with its locals' leaves, whatever local was
+    /// dropped from it, and its check names stale exactly the locals that are.
+    #[test]
+    fn a_sweep_asks_each_nameable_leaf_once_and_names_the_stale_locals() {
+        let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]);
+        let mounts = three(&mut vfs);
+        sweep_wrong(&mounts).unwrap();
+        assert_eq!(mounts.first_local(), Some("/a"));
+    }
+
+    #[test]
+    fn the_oracle_catches_a_sweep_that_keeps_a_dropped_locals_names() {
+        let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]);
+        let mounts = three(&mut vfs);
+        KEEPS_DROPPED_NAMES.set(true);
+        let caught = sweep_wrong(&mounts);
+        KEEPS_DROPPED_NAMES.set(false);
+        assert!(caught.is_err_and(|why| why.starts_with("the sweep asked")));
     }
 
     #[test]

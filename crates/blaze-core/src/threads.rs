@@ -32,6 +32,9 @@ use std::{
 
 use crate::lock::{Lock, LockGuard, Signal};
 
+#[cfg(target_os = "linux")]
+use std::alloc::Global;
+
 #[cfg(unix)]
 use blaze_mem::{Slab, Tag as MemTag};
 
@@ -349,6 +352,9 @@ enum Told {
     /// What the watch `watch` heard, or its end.
     #[cfg(target_os = "linux")]
     Watch { watch: Id<Watching>, completion: Completion },
+    /// How the watch `watch` started: in place, or failed. Told before anything it hears.
+    #[cfg(target_os = "linux")]
+    Started { watch: Id<Watching>, started: io::Result<()> },
     /// The spawn `spawn` ended.
     #[cfg(unix)]
     Exited { spawn: Id<Arc<Life>>, completion: Completion },
@@ -434,6 +440,18 @@ pub struct Threads {
     /// Stopped watches kept for the next.
     #[cfg(target_os = "linux")]
     spare: Vec<Arc<linux::Control>>,
+    /// Watches whose errand has not yet told how they started ([`Told::Started`]): a start
+    /// is a walk of the tree under inotify, run on the errand, never on the submitting thread.
+    #[cfg(target_os = "linux")]
+    starting: Vec<Starting>,
+    /// Effects that wait for a start ([`Threads::holds`]), in the order they were submitted:
+    /// counted in flight, and submitted again as a start is told.
+    #[cfg(target_os = "linux")]
+    held: Vec<Effect>,
+    /// A test's hold on the walks of watches' starts ([`crate::watch::Gate`]), each errand
+    /// given a handle of it.
+    #[cfg(all(test, target_os = "linux"))]
+    walk_gate: crate::watch::Gate,
     #[cfg(target_os = "macos")]
     spare: Vec<crate::fsevents::Watch<Sink>>,
     /// Flushes a watch being stopped had not told.
@@ -533,6 +551,12 @@ impl Threads {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             // alloc: once per driver.
             spare: Vec::with_capacity(SPARE),
+            #[cfg(target_os = "linux")]
+            starting: Vec::with_capacity_in(SPARE, Global),
+            #[cfg(target_os = "linux")]
+            held: Vec::new_in(Global),
+            #[cfg(all(test, target_os = "linux"))]
+            walk_gate: None,
             #[cfg(target_os = "macos")]
             // alloc: once per driver.
             untold: Vec::with_capacity(4),
@@ -654,6 +678,8 @@ impl Threads {
                 _ => self.ready.push(completion),
             },
             #[cfg(target_os = "linux")]
+            Told::Started { watch, started } => self.started(watch, started),
+            #[cfg(target_os = "linux")]
             Told::Watch { watch, completion } => {
                 // A watch replaced by another of its tag tells nothing more.
                 if self.watches.by_id(watch).is_none() {
@@ -723,8 +749,11 @@ impl Threads {
     }
 
     /// Watches `dir` as `tag`, a journal of it from `since`. A watch of `tag` already ends
-    /// first, telling nothing more. Returns once the system watches the tree, so a change made
-    /// after is heard.
+    /// first, telling nothing more. Returns at once, whatever the tree's size: the start (under
+    /// inotify a walk of the whole tree) runs on the watch's errand, which tells it
+    /// ([`Told::Started`]); until then a look under `dir` waits ([`Threads::holds`]) and so
+    /// does a flush of the watch (its errand answers flushes only once it reads), so a change
+    /// made after either is answered is heard.
     #[cfg(target_os = "linux")]
     fn watch(
         &mut self,
@@ -735,6 +764,8 @@ impl Threads {
         if let Some(old) = self.watches.remove(tag) {
             old.control.stop();
             self.in_flight -= 1;
+            // Its errand's word of its start names a watch no longer kept, and is dropped.
+            self.starting.retain(|it| it.tag != tag);
         }
         let control = match self.spare.pop() {
             Some(control) => control,
@@ -744,25 +775,82 @@ impl Threads {
         let first = since.as_ref().map(|since| crate::journal::first_on_linux(&dir, since));
         // clone: the watch's control, kept by the driver.
         let (watch, _) = self.watches.insert(tag, Watching { control: control.clone() });
-        // clone: the watch's control, for its errand.
-        let errand =
-            Errand::Watch { dir, journal: since.is_some(), control: control.clone(), tag, watch };
+        #[cfg(test)]
+        // clone: a test's gate, a handle of it for the errand.
+        let gate = self.walk_gate.clone();
+        #[cfg(not(test))]
+        let gate = ();
+        let errand = Errand::Watch {
+            // clone: the watched directory, kept while the watch starts.
+            dir: dir.clone(),
+            journal: since.is_some(),
+            control,
+            tag,
+            watch,
+            gate,
+        };
+        self.starting.push(Starting { tag, watch, dir, first });
+        self.in_flight += 1;
         self.dispatch(errand);
-        match control.started() {
+        Ok(())
+    }
+
+    /// Whether `effect` waits for a watch's start: a look at the disk at or under the directory
+    /// of a watch whose errand has not yet told its start.
+    ///
+    /// The invariant: a look under a watched directory asked after its watch is answered only
+    /// once the watch is in place, so a change made after the look was answered is heard
+    /// ([`Effect::Watch`]'s guarantee). Tested by
+    /// `the_threads_driver_holds_a_look_under_a_starting_watch`, whose control holds nothing.
+    #[cfg(target_os = "linux")]
+    fn holds(&self, effect: &Effect) -> bool {
+        !self.starting.is_empty()
+            && crate::watch::looks_under(effect, |name| {
+                self.starting.iter().any(|it| crate::watch::is_under(name, it.dir.as_str()))
+            })
+    }
+
+    /// The watch `watch` started as `started` says: in place (a journal's first batch told), or
+    /// failed naming its directory. Then what was held for a start goes, in the order it was
+    /// asked; what waits for a start still out is held again.
+    #[cfg(target_os = "linux")]
+    fn started(&mut self, watch: Id<Watching>, started: io::Result<()>) {
+        let at = self.starting.iter().position(|it| it.watch.to_bits() == watch.to_bits());
+        // Of a watch replaced by another of its tag meanwhile: nothing to tell.
+        let Some(at) = at else { return };
+        let Starting { tag, dir, first, .. } = self.starting.remove(at);
+        match started {
             Ok(()) => {
-                self.in_flight += 1;
                 if let Some(first) = first {
                     self.ready.push(Completion { tag, done: first });
                 }
-                Ok(())
             }
             Err(error) => {
-                drop(control);
                 if let Some((_, watching)) = self.watches.remove_id(watch) {
+                    let ready = &mut self.ready;
+                    let ends = &mut self.ready_ends;
+                    watching.control.unanswered(|flush| {
+                        // alloc: an error path, a flush of a watch that never started.
+                        let why = IoError(format!("watching {dir} failed before the flush"));
+                        ready.push(Completion { tag: flush, done: Done::Failed(why) });
+                        *ends += 1;
+                    });
                     self.keep(watching.control);
                 }
-                Err(error)
+                // alloc: an error path.
+                let why = IoError(format!("watching {dir}: {error}"));
+                self.end(Completion { tag, done: Done::Failed(why) });
             }
+        }
+        if self.held.is_empty() {
+            return;
+        }
+        let mut held = std::mem::take(&mut self.held);
+        // Counted in flight as they were held; `submit` counts each again.
+        self.in_flight -= held.len();
+        self.submit(&mut held);
+        if self.held.is_empty() {
+            self.held = held;
         }
     }
 
@@ -1542,6 +1630,8 @@ enum Errand {
         control: Arc<linux::Control>,
         watch: Id<Watching>,
         tag: Tag,
+        /// A test's hold on the start's walk.
+        gate: crate::watch::Gate,
     },
 }
 
@@ -1661,9 +1751,9 @@ impl Errand {
                 Some(Told::Listened { listen, completion: Completion { tag, done } })
             }
             #[cfg(target_os = "linux")]
-            Errand::Watch { control, .. } => {
-                control.start(Err(why));
-                None
+            Errand::Watch { control, watch, .. } => {
+                control.close();
+                Some(Told::Started { watch, started: Err(why) })
             }
         }
     }
@@ -1712,7 +1802,8 @@ impl Errand {
                 Some(Told::Listened { listen, completion: Completion { tag, done } })
             }
             #[cfg(target_os = "linux")]
-            Errand::Watch { dir, journal, control, watch, tag } => {
+            Errand::Watch { dir, journal, control, watch, tag, gate } => {
+                crate::watch::pass(&gate);
                 linux::watch(shared, room, &dir, journal, control, watch, tag)
             }
         }
@@ -1809,6 +1900,35 @@ struct Watching {
     control: Arc<linux::Control>,
 }
 
+/// What the tests of a watch's start look at.
+#[cfg(all(test, target_os = "linux"))]
+impl Threads {
+    /// Each watch's start from here waits at `gate` ([`crate::watch::Gate`]).
+    pub(crate) fn gate_walks(&mut self, gate: crossbeam_channel::Receiver<()>) {
+        self.walk_gate = Some(gate);
+    }
+
+    /// Whether the watch `tag`'s errand has not yet told how it started.
+    pub(crate) fn is_starting(&self, tag: Tag) -> bool {
+        self.starting.iter().any(|it| it.tag == tag)
+    }
+
+    /// Whether the effect `tag` is held for a watch's start.
+    pub(crate) fn is_held(&self, tag: Tag) -> bool {
+        self.held.iter().any(|it| it.tag() == tag)
+    }
+}
+
+/// A watch whose errand has not yet told how it started ([`Threads::starting`]).
+#[cfg(target_os = "linux")]
+struct Starting {
+    tag: Tag,
+    watch: Id<Watching>,
+    dir: crate::FileName,
+    /// An [`Effect::Journal`]'s first batch, told once the watch is in place.
+    first: Option<Done>,
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::{
@@ -1817,29 +1937,28 @@ mod linux {
         sync::Arc,
     };
 
-    use crate::lock::{Lock, Signal};
+    use crate::lock::Lock;
 
     use super::{Id, Room, Shared, Told, Watching, lock};
     use crate::{Completion, Done, FileName, IoError, Tag};
 
     /// How the driver stops a watch's errand and asks it for flushes: made once, and kept
-    /// for the next watch once the errand has let go of it.
+    /// for the next watch once the errand has let go of it. How the watch started is told
+    /// through the driver's mailbox ([`Told::Started`]), never waited for.
     pub(super) struct Control {
         stop: OwnedFd,
         /// Written once flushes are added.
         wake: OwnedFd,
         state: Lock<State>,
-        started: Signal,
     }
 
     struct State {
-        /// Asked for and not yet taken by the errand.
+        /// Asked for and not yet taken by the errand: a flush asked while the watch starts
+        /// waits here until the errand reads, so it is answered by the watch in place.
         flushes: Vec<Tag>,
         /// Whether the errand takes flushes: a flush asked after it ends fails rather than
         /// waiting for nothing.
         open: bool,
-        /// How the watch started, once it has.
-        started: Option<io::Result<()>>,
         /// What the last tree watched with it left for the next.
         spare: Option<crate::watch::Spare>,
     }
@@ -1861,9 +1980,9 @@ mod linux {
             let (stop, wake) = (crate::raw::eventfd()?, crate::raw::eventfd()?);
             // alloc: once per watch at once, kept for the next: room for a few flushes at once.
             let flushes = Vec::with_capacity(4);
-            let state = State { flushes, open: false, started: None, spare: None };
+            let state = State { flushes, open: false, spare: None };
             // alloc: as above.
-            Ok(Arc::new(Control { stop, wake, state: Lock::new("core.test.threads.control", state), started: Signal::new("core.test.threads.started") }))
+            Ok(Arc::new(Control { stop, wake, state: Lock::new("core.test.threads.control", state) }))
         }
 
         /// Ready for a watch: nothing signalled, nothing asked for.
@@ -1873,7 +1992,6 @@ mod linux {
             let mut state = lock(&self.state);
             state.flushes.clear();
             state.open = true;
-            state.started = None;
         }
 
         pub(super) fn stop(&self) {
@@ -1891,32 +2009,28 @@ mod linux {
             true
         }
 
-        /// The errand says how the watch started.
-        pub(super) fn start(&self, started: io::Result<()>) {
-            let mut state = lock(&self.state);
-            if started.is_err() {
-                state.open = false;
-            }
-            state.started = Some(started);
-            self.started.notify_all();
+        /// The watch did not start: a flush asked from here fails at once. One asked before,
+        /// which no errand will answer, the driver fails as it hears the start failed
+        /// ([`Control::unanswered`]).
+        pub(super) fn close(&self) {
+            lock(&self.state).open = false;
         }
 
-        /// How the watch started, waiting until it has.
-        pub(super) fn started(&self) -> io::Result<()> {
+        /// Each flush asked and not taken by an errand, handed to `each` and forgotten.
+        pub(super) fn unanswered(&self, mut each: impl FnMut(Tag)) {
             let mut state = lock(&self.state);
-            loop {
-                if let Some(started) = state.started.take() {
-                    return started;
-                }
-                // wakes: the watcher thread, which sets `started` and notifies whether the watch began or failed
-                self.started.wait(&mut state);
+            state.open = false;
+            for tag in state.flushes.drain(..) {
+                each(tag);
             }
         }
     }
 
-    /// A watch's errand: watches `dir`, then reads its events until it is stopped, answering
-    /// each flush once it has read every event queued when the flush was taken. What ends the
-    /// watch, `None` when it did not start (told through `control`) or the driver is gone.
+    /// A watch's errand: watches `dir` (under inotify a walk of the whole tree, here, off the
+    /// driver's thread), tells how it started ([`Told::Started`]), then reads its events until
+    /// it is stopped, answering each flush once it has read every event queued when the flush
+    /// was taken. What ends the watch: its start's failure, its end, or `None` where the
+    /// driver is gone.
     pub(super) fn watch(
         shared: &Shared,
         room: &mut Room,
@@ -1930,11 +2044,13 @@ mod linux {
         let mut tree = match crate::watch::Tree::reusing(spare, &shared.root, dir, false) {
             Ok(tree) => tree,
             Err(error) => {
-                control.start(Err(error));
-                return None;
+                control.close();
+                return Some(Told::Started { watch, started: Err(error) });
             }
         };
-        control.start(Ok(()));
+        if shared.done.push(Told::Started { watch, started: Ok(()) }).is_err() {
+            return None;
+        }
         if room.buffer.is_empty() {
             // alloc: once per errand thread that reads a watch, kept for the next.
             room.buffer = vec![0; crate::watch::BUFFER];
@@ -1989,9 +2105,13 @@ mod linux {
                 // Drained, not taken: both lists keep their room, so a flush allocates nothing.
                 room.taken.extend(lock(&control.state).flushes.drain(..));
                 let mut gone = false;
-                // What a drain allocates is the batches it reads; `tell` allocates nothing.
-                let drained = shared
-                    .payload(|| tree.drain(&mut room.buffer, |done| gone |= !tell(heard(done))));
+                // What a drain allocates is the batches it reads; `tell` allocates nothing. The
+                // directories it heard made are watched before the flushes are answered, so what
+                // was made in them first is told before them (`crate::watch`'s invariant).
+                let drained = shared.payload(|| {
+                    tree.drain(&mut room.buffer, |done| gone |= !tell(heard(done)))?;
+                    tree.grow_here(|done| gone |= !tell(heard(done)))
+                });
                 if gone {
                     return None;
                 }
@@ -2016,6 +2136,16 @@ mod linux {
                 if let Ok(n @ 1..) = tree.read(buffer) {
                     let done = shared.payload(|| heard(tree.take(&buffer[..n])));
                     if !tell(done) {
+                        return None;
+                    }
+                    // The directories it heard made, watched here: this is the errand's thread,
+                    // not the driver's.
+                    let mut gone = false;
+                    let grown = shared.payload(|| tree.grow_here(|done| gone |= !tell(heard(done))));
+                    if gone {
+                        return None;
+                    }
+                    if grown.is_err() && !tell(heard(crate::watch::lost())) {
                         return None;
                     }
                 }
@@ -2060,13 +2190,21 @@ fn no_watch(watch: Tag) -> String {
 
 impl Driver for Threads {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
+        // The one now of every timer in this submit, as the ring driver's: timers asked
+        // together fire in the order of their `after`s however long the thread is kept from
+        // running between two of them.
+        let now = wheel::ticks(self.start.elapsed());
         for effect in effects.drain(..) {
+            #[cfg(target_os = "linux")]
+            if self.holds(&effect) {
+                self.in_flight += 1;
+                self.held.push(effect);
+                continue;
+            }
             match effect {
                 Effect::Timer { after, tag } => {
                     self.in_flight += 1;
-                    let due =
-                        wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
-                    self.timers.insert(due, tag);
+                    self.timers.insert(now.saturating_add(wheel::ticks(after)), tag);
                 }
                 Effect::Watch { dir, tag } => {
                     if let Err(error) = self.watch(dir, None, tag) {

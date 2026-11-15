@@ -39,7 +39,8 @@ pub fn file_of(edit: &Edit) -> Option<&str> {
         | Edit::ReplaceSignature { item, .. }
         | Edit::ReplaceItem { item, .. }
         | Edit::RemoveItem { item }
-        | Edit::Rename { item, .. } => Some(&item.file),
+        | Edit::Rename { item, .. }
+        | Edit::Params { item, .. } => Some(&item.file),
         Edit::AddField { strukt, .. } | Edit::RemoveField { strukt, .. } => Some(&strukt.file),
         Edit::AddItem { file, .. } | Edit::AddUse { file, .. } => Some(file),
         Edit::Replace { .. } | Edit::Rules { .. } => None,
@@ -196,6 +197,7 @@ fn splice_of(
             add_use(file.text(), file.end, scope, used)
         }
         Edit::Rename { .. } => unreachable!("a rename is made by `crate::rename`"),
+        Edit::Params { .. } => unreachable!("a change of parameters is made by `crate::params`"),
         Edit::Replace { .. } => unreachable!("a replace is made by `crate::replace`"),
         Edit::Rules { .. } => unreachable!("rules are refused by `crate::apply_with_text`"),
     }

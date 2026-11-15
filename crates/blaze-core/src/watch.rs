@@ -4,6 +4,29 @@
 //! way the events are read off one descriptor, which the threads driver reads on a thread of
 //! its own and the ring driver through the ring.
 //!
+//! Starting one ([`Tree::begin`]) costs what fanotify's start costs (a constant number of
+//! system calls and one read of `/proc/self/mountinfo`, `crate::fanotify`'s floor) where
+//! fanotify can be had. inotify watches one directory each, so its start is a walk of the
+//! whole tree, one `inotify_add_watch`, open, listing and close per directory: O(directories
+//! under it), the floor of any inotify watch. That walk is a [`Walk`] the caller runs where it
+//! may take long (the ring driver on a thread of its own, never its loop), under a span naming
+//! the directory, and bounded by [`MOST_DIRS`]: past it the start fails naming the directory and
+//! the count, never a watch of part of the tree.
+//!
+//! A directory made in (or moved into) a watched tree needs watches of its own under inotify,
+//! one per directory in it: a walk again, O(directories under it). [`Tree::take`] does not walk
+//! it; it tells the directory's name at once and keeps it as fresh, and the caller hands the
+//! fresh directories to whoever may take long as a [`Grow`] ([`Tree::grow`]), merging what it
+//! found back with [`Tree::grown`]. The invariant: a file made under a new directory before its
+//! watch exists is found by the grow's own listing, which runs after the watch is added (add,
+//! then list, as the start's walk does), so every file in it is either listed or has an event
+//! on the new watch; such an event, read before the grow is merged, names a watch the tables do
+//! not know yet and is kept ([`PARKED`]) and taken again once it is. A flush is answered only
+//! once no grow is out or fresh ([`Tree::pending`]), so it comes after what the grow finds.
+//! Tested by `a_file_made_in_a_new_directory_before_its_watch_is_heard`, whose control
+//! ([`GROW_DROPS_FOUND`]) drops what the walk finds. Cost on the loop: one `dup` per grow, and
+//! a hash insert per directory merged.
+//!
 //! A watch allocates its completions' payload and nothing else once warm: directories are
 //! listed with `getdents64` into a buffer kept for the next listing, the names a watch keeps are
 //! spans of a column of reserved memory ([`Strings`]), the names one read of events tells are
@@ -57,6 +80,88 @@ const DIRENTS: usize = 32 << 10;
 /// Holes a [`Strings`] keeps before it is squeezed, at the least.
 const HOLES: usize = 4 << 10;
 
+/// The most directories one inotify watch walks and watches: past it the watch fails, naming
+/// its directory and the count. A million inotify watches are about a gigabyte of the kernel's
+/// memory (a watch is about 1 KiB on 64-bit Linux), more than any tree blaze is asked to watch
+/// should need; a tree this large wants fanotify, whose start is constant.
+pub(crate) const MOST_DIRS: usize = 1 << 20;
+
+/// The most bytes of events an inotify watch keeps while a [`Grow`] of it is out: events of a
+/// directory the grow watched, read before the grow is merged, which name a watch the tables
+/// do not know yet. Past it the watch's changes are told lost (its directory, `lost: true`), so
+/// whoever watches looks at the whole directory again; four reads' worth.
+const PARKED: usize = 4 * BUFFER;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's: this thread's starts take fanotify as refused (`EPERM`), so a privileged run
+    /// tests the inotify path too.
+    pub(crate) static FANOTIFY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's planted bug: nothing waits for a watch's start ([`looks_under`]'s callers), so
+    /// a look asked after a watch may be answered before it is in place.
+    pub(crate) static HOLDS_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's planted bug: a [`Grow`] made on this thread tells none of the files its walk
+    /// finds, so a file made in a new directory before its watch is in place is never told.
+    pub(crate) static GROW_DROPS_FOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Where a test holds the thread that walks a tree to watch it: each walk waits at the gate
+/// until the test lets one through, so a test can ask while a watch is provably not in place.
+/// Nothing outside tests.
+#[cfg(test)]
+pub(crate) type Gate = Option<crossbeam_channel::Receiver<()>>;
+#[cfg(not(test))]
+pub(crate) type Gate = ();
+
+/// Waits at `gate` for the test that holds it to let one walk through; a gate whose test let
+/// go of it (dropped its end) lets every walk through. Not a wait of blaze's own: there is no
+/// gate outside tests.
+pub(crate) fn pass(gate: &Gate) {
+    #[cfg(test)]
+    if let Some(gate) = gate {
+        _ = gate.recv();
+    }
+    #[cfg(not(test))]
+    let () = *gate;
+}
+
+/// Whether `effect` looks at the disk at a name `under` says is in a directory whose watch is
+/// still starting: a stat, a read, a listing or stamps. A driver whose start runs off its loop
+/// holds such a look until the watch is in place ([`crate::Effect::Watch`]'s guarantee).
+pub(crate) fn looks_under(effect: &crate::Effect, mut under: impl FnMut(&str) -> bool) -> bool {
+    use crate::Effect;
+    #[cfg(test)]
+    if HOLDS_NOTHING.get() {
+        return false;
+    }
+    match effect {
+        Effect::Stat { file, .. }
+        | Effect::Lstat { file, .. }
+        | Effect::ReadAll { file, .. }
+        | Effect::Read { file, .. }
+        | Effect::ReadLink { file, .. } => under(file.as_str()),
+        Effect::Entries { dir, .. } | Effect::List { dir, .. } => under(dir.as_str()),
+        Effect::Stamp { files, .. } => files.iter().any(&mut under),
+        _ => false,
+    }
+}
+
+/// Runs `walk`, which watches directories and says how many, under a span `op` naming `dir`,
+/// and says the count as a span of its own at the walk's end, inside it, named
+/// `{dir}: {n} directories watched`: the probe's spans carry a name and no number
+/// ([`crate::lock::Probe::io_begin`]), so a slow start names its directory and its size in the
+/// profile this way. The name is made only where a probe is installed.
+fn walk_span<R>(op: &'static str, dir: &str, walk: impl FnOnce() -> (R, usize)) -> R {
+    crate::lock::io_wait(op, dir, || {
+        let (result, watched) = walk();
+        if crate::lock::installed().is_some() {
+            let said = format!("{dir}: {watched} directories watched");
+            crate::lock::io_wait("walked to watch with inotify", &said, || ());
+        }
+        result
+    })
+}
+
 /// A tree watched, with fanotify or inotify.
 pub(crate) struct Tree(Kind);
 
@@ -72,28 +177,249 @@ pub(crate) enum Spare {
     Inotify(Room),
 }
 
+/// How a watch's start went ([`Tree::begin`]).
+pub(crate) enum Begun {
+    /// Watching already: fanotify's start, a constant number of system calls.
+    Watching(Tree),
+    /// inotify's: the walk that watches each directory is still to run ([`Walk::run`]).
+    Walk(Walk),
+}
+
+/// An inotify watch's start still to run: the walk of its tree, which the caller runs where a
+/// walk may take long. It holds the watch's tables, the directory's name among them.
+pub(crate) struct Walk {
+    room: Room,
+    nonblocking: bool,
+}
+
+impl Walk {
+    /// The watched directory, relative to the root.
+    pub(crate) fn dir(&self) -> &str {
+        &self.room.top
+    }
+
+    /// Watches the directory under `root` and every directory under it: a watch of the whole
+    /// tree, or an error naming the directory (past [`MOST_DIRS`], or past the system's limit
+    /// of inotify watches), never a watch of part of it.
+    pub(crate) fn run(self, root: &Path) -> io::Result<Tree> {
+        let Walk { room, nonblocking } = self;
+        Ok(Tree(Kind::Inotify(Inotify::new(root, nonblocking, room)?)))
+    }
+}
+
+/// Names one after another in one string, each by where it ends: a list that keeps its room.
+#[derive(Default)]
+pub(crate) struct Names {
+    text: String,
+    ends: Vec<u32>,
+}
+
+impl Names {
+    fn push(&mut self, name: &str) {
+        self.text.push_str(name);
+        self.ends.push(self.text.len() as u32);
+    }
+
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    fn get(&self, at: usize) -> &str {
+        let start = if at == 0 { 0 } else { self.ends[at - 1] as usize };
+        &self.text[start..self.ends[at] as usize]
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.ends.clear();
+    }
+}
+
+/// Directories an inotify watch heard made, still to be watched: a walk of each, handed to
+/// whoever may take long ([`Grow::run`]), as a start's [`Walk`] is. See the module doc for the
+/// invariant that loses nothing made in them meanwhile.
+pub(crate) struct Grow {
+    /// The watch's inotify instance, through a descriptor of its own (`F_DUPFD_CLOEXEC`): the
+    /// walk adds its watches to the instance, which stays open while it does even where the
+    /// watch ends meanwhile (the instance is closed with its last descriptor).
+    fd: OwnedFd,
+    /// The most directories the walk may watch: [`MOST_DIRS`] less those watched already.
+    most: usize,
+    /// What the walk fills: the watch's kept buffers, the fresh directories among them.
+    into: Grown,
+    #[cfg(test)]
+    drops_found: bool,
+}
+
+/// What a [`Grow`] found, to merge with [`Tree::grown`]: each directory it watched with its
+/// watch, and each file under them.
+pub(crate) struct Grown {
+    /// The directories walked, relative to the root.
+    tops: Names,
+    /// Each directory watched, relative to the root, and its watch, by the same index.
+    dirs: Names,
+    wds: Vec<i32>,
+    /// The files found: made before their directory's watch, so with no event of their own.
+    files: Batch,
+    /// Why the walk stopped short: past [`MOST_DIRS`] or the system's limit of watches.
+    error: Option<io::Error>,
+}
+
+impl Grown {
+    fn new() -> Grown {
+        Grown {
+            tops: Names::default(),
+            dirs: Names::default(),
+            wds: Vec::new_in(Global),
+            files: Batch::default(),
+            error: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.tops.clear();
+        self.dirs.clear();
+        self.wds.clear();
+        self.files.clear();
+        self.error = None;
+    }
+}
+
+impl Grow {
+    /// The grow not run, `why`: merged, it tells the watch's changes lost, so whoever watches
+    /// looks again, and lets the watch's flushes go.
+    pub(crate) fn refused(self, why: io::Error) -> Grown {
+        let mut into = self.into;
+        into.error = Some(why);
+        into
+    }
+
+    /// Watches each fresh directory and every directory under it, with `walker`'s buffers,
+    /// under `root` (its bytes): each directory added to the instance, then listed, so what is
+    /// made in it before the add is listed and what is made after has an event. A directory
+    /// gone before it is watched is passed over: its removal is an event of its parent's, which
+    /// is watched. Past [`Grow::most`] or the system's limit the walk stops, saying why in
+    /// [`Grown::error`]. Under a span naming the first directory and saying the count.
+    pub(crate) fn run(self, root: &[u8], walker: &mut Walker) -> Grown {
+        #[cfg(test)]
+        let drops_found = self.drops_found;
+        #[cfg(not(test))]
+        let drops_found = false;
+        let Grow { fd, most, mut into, .. } = self;
+        let Grown { tops, dirs, wds, files, error } = &mut into;
+        let first = if tops.is_empty() { "" } else { tops.get(0) };
+        walk_span("walk a new directory to watch with inotify", first, || {
+            let fd = fd.as_raw_fd();
+            for at in 0..tops.len() {
+                let top = tops.get(at);
+                let walked = walker.walk(
+                    root,
+                    top,
+                    |path, rel, _| {
+                        if wds.len() >= most {
+                            return Err(io::Error::other(format!(
+                                "watching {top} with inotify: {MOST_DIRS} directories watched, \
+                                 the most one watch walks (MOST_DIRS); a tree this large wants \
+                                 fanotify (CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH)"
+                            )));
+                        }
+                        // SAFETY: an inotify descriptor and a NUL-terminated path.
+                        let wd = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), MASK) };
+                        if wd < 0 {
+                            let error = io::Error::last_os_error();
+                            if error.raw_os_error() == Some(libc::ENOENT) {
+                                return Ok(Visit::Skip);
+                            }
+                            return Err(io::Error::other(format!(
+                                "watching {} with inotify, {} directories into {top}: {error}{}",
+                                path.to_string_lossy(),
+                                wds.len(),
+                                if error.raw_os_error() == Some(libc::ENOSPC) {
+                                    " (the most the system lets a user watch: \
+                                     fs.inotify.max_user_watches)"
+                                } else {
+                                    ""
+                                }
+                            )));
+                        }
+                        dirs.push(rel);
+                        wds.push(wd);
+                        Ok(Visit::List(None))
+                    },
+                    |file| {
+                        if !drops_found {
+                            files.push(file);
+                        }
+                    },
+                );
+                if let Err(why) = walked {
+                    *error = Some(why);
+                    break;
+                }
+            }
+            ((), wds.len())
+        });
+        // The walk's descriptor of the instance, closed: the watch's own stays open.
+        drop(fd);
+        into
+    }
+}
+
 impl Tree {
-    /// Watches `dir` under `root` and everything under it, into the tables `spare` kept when
-    /// there are any: with fanotify unless the process lacks `CAP_SYS_ADMIN` or
-    /// `CAP_DAC_READ_SEARCH` (the call fails with `EPERM`), with inotify then. Any other
+    /// Starts watching `dir` under `root` and everything under it, into the tables `spare`
+    /// kept when there are any: with fanotify unless the process lacks `CAP_SYS_ADMIN` or
+    /// `CAP_DAC_READ_SEARCH` (the call fails with `EPERM`), whose start is a constant number of
+    /// system calls; with inotify then, whose start is a [`Walk`] left to the caller. Any other
     /// failure of fanotify's is the watch's.
+    pub(crate) fn begin(
+        spare: Option<Spare>,
+        root: &Path,
+        dir: &FileName,
+        nonblocking: bool,
+    ) -> io::Result<Begun> {
+        let (fanotify, inotify) = match spare {
+            Some(Spare::Fanotify(room)) => (Some(room), None),
+            Some(Spare::Inotify(room)) => (None, Some(room)),
+            None => (None, None),
+        };
+        #[cfg(test)]
+        let fanotify_refused = FANOTIFY_REFUSED.get();
+        #[cfg(not(test))]
+        let fanotify_refused = false;
+        let started = match fanotify_refused {
+            true => Err(io::Error::from_raw_os_error(libc::EPERM)),
+            false => crate::fanotify::Fanotify::new(root, dir, nonblocking, fanotify),
+        };
+        match started {
+            Ok(it) => Ok(Begun::Watching(Tree(Kind::Fanotify(it)))),
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                let mut room = match inotify {
+                    Some(room) => room,
+                    None => Room::new()?,
+                };
+                room.top.clear();
+                room.top.push_str(dir.as_str());
+                Ok(Begun::Walk(Walk { room, nonblocking }))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`Tree::begin`] with its walk, if it has one, run here: for a caller on a thread of its
+    /// own (the threads driver's errand).
     pub(crate) fn reusing(
         spare: Option<Spare>,
         root: &Path,
         dir: &FileName,
         nonblocking: bool,
     ) -> io::Result<Tree> {
-        let (fanotify, inotify) = match spare {
-            Some(Spare::Fanotify(room)) => (Some(room), None),
-            Some(Spare::Inotify(room)) => (None, Some(room)),
-            None => (None, None),
-        };
-        match crate::fanotify::Fanotify::new(root, dir, nonblocking, fanotify) {
-            Ok(it) => Ok(Tree(Kind::Fanotify(it))),
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                Ok(Tree(Kind::Inotify(Inotify::new(root, dir, nonblocking, inotify)?)))
-            }
-            Err(error) => Err(error),
+        match Tree::begin(spare, root, dir, nonblocking)? {
+            Begun::Watching(tree) => Ok(tree),
+            Begun::Walk(walk) => walk.run(root),
         }
     }
 
@@ -119,6 +445,53 @@ impl Tree {
             Kind::Fanotify(it) => it.take(bytes),
             Kind::Inotify(it) => it.take(bytes),
         }
+    }
+
+    /// The directories [`Tree::take`] heard made, as a [`Grow`] to run where a walk may take
+    /// long; `None` where there are none, or one of this watch's grows is out already (the
+    /// next goes once it is merged, so at most one is out per watch). fanotify marks the whole
+    /// file system and never grows. Fails only where the instance's descriptor cannot be
+    /// duplicated, naming the watch; the fresh directories are dropped, and the caller tells
+    /// the watch's changes lost ([`lost`]), so whoever watches looks again.
+    pub(crate) fn grow(&mut self) -> io::Result<Option<Grow>> {
+        match &mut self.0 {
+            Kind::Fanotify(_) => Ok(None),
+            Kind::Inotify(it) => it.grow(),
+        }
+    }
+
+    /// What `grown` found, merged: its directories' watches known from here, and what it found
+    /// and what was kept meanwhile told, as a [`Done::Changed`].
+    pub(crate) fn grown(&mut self, grown: Grown) -> Done {
+        match &mut self.0 {
+            Kind::Fanotify(_) => unreachable!("a fanotify watch marks the file system, never grows"),
+            Kind::Inotify(it) => it.grown(grown),
+        }
+    }
+
+    /// Whether a grow of this watch is out or fresh directories wait for one: a flush waits
+    /// until neither, so it is answered after what the grow finds.
+    pub(crate) fn pending(&self) -> bool {
+        match &self.0 {
+            Kind::Fanotify(_) => false,
+            Kind::Inotify(it) => it.room.growing || !it.room.fresh.is_empty(),
+        }
+    }
+
+    /// Runs here each [`Grow`] the watch has, merged, telling each [`Tree::grown`] to `each`:
+    /// for a caller on a thread of its own (the threads driver's errand), after each take and
+    /// before a flush is answered.
+    pub(crate) fn grow_here(&mut self, mut each: impl FnMut(Done)) -> io::Result<()> {
+        let Kind::Inotify(it) = &mut self.0 else { return Ok(()) };
+        while let Some(grow) = it.grow()? {
+            let mut walker = std::mem::take(&mut it.room.walker);
+            let root = std::mem::take(&mut it.room.root);
+            let grown = grow.run(&root, &mut walker);
+            it.room.root = root;
+            it.room.walker = walker;
+            each(it.grown(grown));
+        }
+        Ok(())
     }
 
     /// Reads every event queued on the descriptor until it has none, handing what each read
@@ -286,6 +659,18 @@ impl Batch {
         self.spans.push((start, name.len() as u32));
     }
 
+    /// Adds each name of `other`.
+    fn extend(&mut self, other: &Batch) {
+        for span in &other.spans {
+            self.push(at(&other.names, span));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.names.clear();
+        self.spans.clear();
+    }
+
     /// The batch as a [`Done::Changed`], each name once and sorted, emptied for the next.
     pub(crate) fn changed(&mut self, lost: bool) -> Done {
         let Batch { names, spans } = self;
@@ -300,6 +685,12 @@ impl Batch {
         self.spans.clear();
         Done::Changed { files, lost }
     }
+}
+
+/// A watch's changes told lost, with no names: whoever watches looks at the whole directory
+/// again ([`Tree::grow`]'s failure).
+pub(crate) fn lost() -> Done {
+    Done::Changed { files: Vec::new_in(Global), lost: true }
 }
 
 fn at<'a>(names: &'a str, &(start, len): &(u32, u32)) -> &'a str {
@@ -487,6 +878,15 @@ pub(crate) struct Room {
     rel: String,
     batch: Batch,
     walker: Walker,
+    /// Directories heard made and not yet handed to a [`Grow`].
+    fresh: Names,
+    /// Whether a [`Grow`] of this watch is out.
+    growing: bool,
+    /// The buffers a grow fills, kept from the last; `None` while one is out.
+    spare: Option<Grown>,
+    /// Events read while a grow is out that name a watch not known yet, up to [`PARKED`]
+    /// bytes, taken again as the grow is merged.
+    parked: Vec<u8>,
 }
 
 impl Room {
@@ -494,23 +894,23 @@ impl Room {
         Ok(Room {
             dirs: HashMap::new_in(Global),
             names: Strings::new()?,
-            root: Vec::new(), // alloc: none, an empty vector, filled once and reused.
-            top: String::new(), // alloc: none, filled once and reused.
-            rel: String::new(), // alloc: none, filled once and reused.
+            root: Vec::new_in(Global),
+            top: String::new(),
+            rel: String::new(),
             batch: Batch::default(),
             walker: Walker::default(),
+            fresh: Names::default(),
+            growing: false,
+            spare: None,
+            parked: Vec::new_in(Global),
         })
     }
 }
 
 impl Inotify {
-    /// Watches `dir` under `root` and every directory under it, into `room`'s tables.
-    fn new(
-        root: &Path,
-        dir: &FileName,
-        nonblocking: bool,
-        room: Option<Room>,
-    ) -> io::Result<Inotify> {
+    /// Watches `room.top` under `root` and every directory under it, into `room`'s tables: a
+    /// walk of the whole tree, under a span naming the directory.
+    fn new(root: &Path, nonblocking: bool, room: Room) -> io::Result<Inotify> {
         let flags = libc::IN_CLOEXEC | if nonblocking { libc::IN_NONBLOCK } else { 0 };
         // SAFETY: no pointers; a descriptor of its own or -1.
         let fd = unsafe { libc::inotify_init1(flags) };
@@ -519,16 +919,20 @@ impl Inotify {
         }
         // SAFETY: the call returned a descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut room = match room {
-            Some(room) => room,
-            None => Room::new()?,
-        };
+        let mut room = room;
         room.root.clear();
         room.root.extend_from_slice(root.as_os_str().as_bytes());
-        room.top.clear();
-        room.top.push_str(dir.as_str());
+        // Taken out for the walk, which writes the tables beside it, and put back after.
+        let top = std::mem::take(&mut room.top);
         let mut watch = Inotify { fd, room };
-        watch.add_tree(dir.as_str(), false)?;
+        // The wait of whoever waits for this start is this walk (rule every-wait-says-what):
+        // 128 s of one, on the loop thread and in no span, ended a daemon on 2026-11-14.
+        let walked = walk_span("walk to watch with inotify", &top, || {
+            let walked = watch.add_tree(&top);
+            (walked, watch.room.dirs.len())
+        });
+        watch.room.top = top;
+        walked?;
         Ok(watch)
     }
 
@@ -537,22 +941,107 @@ impl Inotify {
         drop(fd);
         room.dirs.clear();
         room.names.clear();
+        // A grow still out keeps its own descriptor of the instance and its buffers; what it
+        // finds is of a watch that ended, and its driver drops it.
+        room.fresh.clear();
+        room.growing = false;
+        room.parked.clear();
         room
+    }
+
+    /// The fresh directories as a [`Grow`]: see [`Tree::grow`].
+    fn grow(&mut self) -> io::Result<Option<Grow>> {
+        let room = &mut self.room;
+        if room.growing || room.fresh.is_empty() {
+            return Ok(None);
+        }
+        let fd = match self.fd.try_clone() {
+            Ok(fd) => fd,
+            Err(error) => {
+                room.fresh.clear();
+                return Err(io::Error::other(format!(
+                    "watching {} with inotify: its new directories cannot be walked, the \
+                     descriptor to walk them with not made: {error}",
+                    room.top
+                )));
+            }
+        };
+        let mut into = match room.spare.take() {
+            Some(it) => it,
+            None => Grown::new(),
+        };
+        into.clear();
+        std::mem::swap(&mut into.tops, &mut room.fresh);
+        room.growing = true;
+        Ok(Some(Grow {
+            fd,
+            most: MOST_DIRS.saturating_sub(room.dirs.len()),
+            into,
+            #[cfg(test)]
+            drops_found: GROW_DROPS_FOUND.get(),
+        }))
+    }
+
+    /// `grown` merged: see [`Tree::grown`]. The events kept while it was out are taken again
+    /// now that the watches they name are known; one that still names none is of a directory
+    /// gone since, and is passed over as any such event is.
+    fn grown(&mut self, mut grown: Grown) -> Done {
+        let mut lost = false;
+        {
+            let Room { dirs, names, batch, top, growing, .. } = &mut self.room;
+            *growing = false;
+            for at in 0..grown.dirs.len() {
+                let span = names.push(grown.dirs.get(at).as_bytes());
+                if let Some(was) = dirs.insert(grown.wds[at], span) {
+                    names.free(was);
+                }
+            }
+            batch.extend(&grown.files);
+            // Past the bound or the system's limit, part of the new tree has no watch: told
+            // as lost, so whoever watches looks at it again, and, as a watch whose start stops
+            // there, it hears nothing more of that part.
+            if grown.error.is_some() {
+                batch.push(top);
+                lost = true;
+            }
+        }
+        // Its buffers, the room of the directories it walked among them, are the next grow's.
+        grown.clear();
+        self.room.spare = Some(grown);
+        let mut rel = std::mem::take(&mut self.room.rel);
+        let parked = std::mem::take(&mut self.room.parked);
+        self.events(&parked, &mut rel, &mut lost);
+        self.room.parked = parked;
+        self.room.parked.clear();
+        if self.room.names.wasteful() {
+            self.squeeze();
+        }
+        self.room.rel = rel;
+        self.room.batch.changed(lost)
     }
 
     fn raw(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 
-    /// Watches `rel` and the directories under it, adding each file in them to the batch with
-    /// `found`: a file made in a directory before its watch was added has no event of its own.
-    fn add_tree(&mut self, rel: &str, found: bool) -> io::Result<()> {
+    /// Watches `rel` and the directories under it: a start's walk. A directory made after it is
+    /// a [`Grow`]'s.
+    fn add_tree(&mut self, rel: &str) -> io::Result<()> {
         let fd = self.fd.as_raw_fd();
-        let Room { dirs, names, root, batch, walker, .. } = &mut self.room;
+        let Room { dirs, names, root, walker, .. } = &mut self.room;
+        let tree = rel;
         walker.walk(
             root,
             rel,
             |path, rel, _| {
+                if dirs.len() >= MOST_DIRS {
+                    return Err(io::Error::other(format!(
+                        "watching {tree} with inotify: {} directories watched, the most one \
+                         watch walks (MOST_DIRS); a tree this large wants fanotify \
+                         (CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH), whose start is constant",
+                        dirs.len()
+                    )));
+                }
                 // SAFETY: an inotify descriptor and a NUL-terminated path.
                 let wd = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), MASK) };
                 if wd < 0 {
@@ -560,6 +1049,14 @@ impl Inotify {
                     // Gone before it was watched: its removal is an event of its parent's.
                     if error.raw_os_error() == Some(libc::ENOENT) && !dirs.is_empty() {
                         return Ok(Visit::Skip);
+                    }
+                    if error.raw_os_error() == Some(libc::ENOSPC) {
+                        return Err(io::Error::other(format!(
+                            "watching {} with inotify: {} directories watched, the most the \
+                             system lets a user watch (fs.inotify.max_user_watches): {error}",
+                            path.to_string_lossy(),
+                            dirs.len()
+                        )));
                     }
                     return Err(error);
                 }
@@ -569,30 +1066,49 @@ impl Inotify {
                 }
                 Ok(Visit::List(None))
             },
-            |file| {
-                if found {
-                    batch.push(file);
-                }
-            },
+            |_| {},
         )
     }
 
-    /// What the events in `bytes` say, watching each directory they say was made.
+    /// What the events in `bytes` say. A directory they say was made is told at once and kept
+    /// as fresh, for a [`Grow`]: never walked here, which is the loop's thread on the ring.
     fn take(&mut self, bytes: &[u8]) -> Done {
         let mut rel = std::mem::take(&mut self.room.rel);
         let mut lost = false;
+        self.events(bytes, &mut rel, &mut lost);
+        if self.room.names.wasteful() {
+            self.squeeze();
+        }
+        self.room.rel = rel;
+        self.room.batch.changed(lost)
+    }
+
+    /// Each event in `bytes` into the batch, `rel` the room a name is made in.
+    fn events(&mut self, bytes: &[u8], rel: &mut String, lost: &mut bool) {
         let mut at = 0;
         while at + HEAD <= bytes.len() {
             let word = |n: usize| {
                 u32::from_ne_bytes(bytes[at + n..at + n + 4].try_into().expect("four bytes"))
             };
             let (wd, mask, len) = (word(0) as i32, word(4), word(12) as usize);
-            let name_bytes = &bytes[at + HEAD..(at + HEAD + len).min(bytes.len())];
+            let event = &bytes[at..(at + HEAD + len).min(bytes.len())];
+            let name_bytes = &event[HEAD..];
             at += HEAD + len;
             if mask & libc::IN_Q_OVERFLOW != 0 {
                 // What was dropped may be the watched directory's own end.
                 self.room.batch.push(&self.room.top);
-                lost = true;
+                *lost = true;
+                continue;
+            }
+            let known = self.room.dirs.contains_key(&wd);
+            // Of a directory a grow out watched: kept until the grow is merged.
+            if !known && self.room.growing {
+                if self.room.parked.len() + event.len() > PARKED {
+                    self.room.batch.push(&self.room.top);
+                    *lost = true;
+                } else {
+                    self.room.parked.extend_from_slice(event);
+                }
                 continue;
             }
             if mask & libc::IN_IGNORED != 0 {
@@ -601,7 +1117,7 @@ impl Inotify {
                     self.room.names.free(span);
                     if top {
                         self.room.batch.push(&self.room.top);
-                        lost = true;
+                        *lost = true;
                     }
                 }
                 continue;
@@ -609,7 +1125,7 @@ impl Inotify {
             let Some(&span) = self.room.dirs.get(&wd) else { continue };
             let dir = self.room.names.str(span);
             if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 && dir == self.room.top {
-                lost = true;
+                *lost = true;
             }
             rel.clear();
             rel.push_str(dir);
@@ -618,21 +1134,13 @@ impl Inotify {
                 if !rel.is_empty() {
                     rel.push('/');
                 }
-                push_lossy(&mut rel, &name_bytes[..end]);
+                push_lossy(rel, &name_bytes[..end]);
             }
-            if mask & libc::IN_ISDIR != 0
-                && mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0
-                && self.add_tree(&rel, true).is_err()
-            {
-                lost = true;
+            if mask & libc::IN_ISDIR != 0 && mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
+                self.room.fresh.push(rel);
             }
-            self.room.batch.push(&rel);
+            self.room.batch.push(rel);
         }
-        if self.room.names.wasteful() {
-            self.squeeze();
-        }
-        self.room.rel = rel;
-        self.room.batch.changed(lost)
     }
 
     /// The directories' names moved down over those of directories no longer watched.

@@ -22,6 +22,7 @@
 pub mod ahead;
 pub mod edit;
 pub mod file;
+mod params;
 pub mod path;
 pub mod rename;
 pub mod replace;
@@ -166,6 +167,7 @@ pub fn apply_with_text<F: Files>(
     };
     let mut others_made = false;
     let mut replaced = false;
+    let mut changed: Vec<&blaze_api::Target> = Vec::new();
     for edit in edits {
         match edit {
             Edit::Rename { to, item } => {
@@ -180,6 +182,26 @@ pub fn apply_with_text<F: Files>(
                     ));
                 }
                 rename::rename(&mut cx, item, to)?;
+            }
+            Edit::Params { item, params } => {
+                if others_made {
+                    return Err(ApiError::new(
+                        format!(
+                            "the change of `{}`'s parameters comes after another kind of edit: it \
+                             resolves in the view as it is, so it comes first, with the renames",
+                            item.item
+                        ),
+                        Some(item.file.clone()),
+                    ));
+                }
+                if changed.contains(&item) {
+                    return Err(ApiError::new(
+                        format!("two changes of `{}`'s parameters in one request", item.item),
+                        Some(item.file.clone()),
+                    ));
+                }
+                changed.push(item);
+                params::params(&mut cx, item, params)?;
             }
             Edit::Replace { .. } if replaced => {}
             Edit::Replace { .. } => {

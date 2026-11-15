@@ -729,6 +729,91 @@ fn every_driver_fires_timers_in_their_order() {
     assert_eq!(run(&mut crate::uring::Uring::new(dir("timers-uring").path()).unwrap()), want);
 }
 
+/// Polls until a flush of `watch` asked now is answered, handing every other completion to
+/// `other`. A watch is in place once a flush of it (or a look under it) asked after it is
+/// answered; before that, a change may go unheard, as the ring driver's inotify start walks the
+/// tree off its loop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn in_place(driver: &mut impl Driver, watch: Tag, tag: Tag, mut other: impl FnMut(Completion)) {
+    driver.submit(&mut vec![Effect::Flush { watch, tag }]);
+    let mut done = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < deadline, "the watch {watch:?} was never in place");
+        driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
+        let mut flushed = false;
+        for it in done.drain(..) {
+            match it.done {
+                Done::Flushed if it.tag == tag => flushed = true,
+                Done::Failed(why) if it.tag == tag => panic!("confirming {watch:?}: {why}"),
+                _ => other(it),
+            }
+        }
+        if flushed {
+            return;
+        }
+    }
+}
+
+/// The invariant (`Threads::holds`): the threads driver's submit of a watch returns at once,
+/// its start (a walk of the tree under inotify) on the watch's errand, and a stat of the
+/// watched directory asked right after it is answered only once the watch is in place. The
+/// errand waits at a gate the test holds, so the stat is asked while the watch is provably not
+/// in place (were the submit to wait for the start, it would never return): the driver holds
+/// it until the test lets the walk through, and the control, nothing held, answers it before.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_threads_driver_holds_a_look_under_a_starting_watch() {
+    fn in_place_at_stat(holds_nothing: bool) -> bool {
+        let root = dir(&format!("threads-starting-{holds_nothing}"));
+        let root = root.path();
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        let mut driver = Threads::new(root, 2);
+        let (open, gate) = crossbeam_channel::unbounded();
+        driver.gate_walks(gate);
+        crate::watch::HOLDS_NOTHING.set(holds_nothing);
+        driver.submit(&mut vec![
+            Effect::Watch { dir: name("src"), tag: Tag(1) },
+            Effect::Stat { file: name("src"), tag: Tag(2) },
+        ]);
+        assert!(driver.is_starting(Tag(1)), "the submit waited for the start");
+        // A held stat is answered only after the start, which waits at the gate: let it
+        // through. A stat not held is answered with the gate shut, so before the start.
+        let held = driver.is_held(Tag(2));
+        if held {
+            open.send(()).unwrap();
+        }
+        let (mut out, mut at_stat) = (Vec::new(), None);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while at_stat.is_none() {
+            assert!(Instant::now() < deadline, "the stat never came (held: {held})");
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+            for it in out.drain(..) {
+                match (it.tag.0, it.done) {
+                    (2, Done::Stat(Some(_))) => at_stat = Some(!driver.is_starting(Tag(1))),
+                    (1, Done::Changed { .. }) => {}
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        drop(open);
+        crate::watch::HOLDS_NOTHING.set(false);
+        let mut ended = false;
+        run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(1) }], |it, _| {
+            match (it.tag.0, it.done) {
+                (1, Done::Unwatched) => ended = true,
+                (1, Done::Changed { .. }) => {}
+                other => panic!("{other:?}"),
+            }
+        })
+        .expect("the effects end");
+        assert!(ended && driver.in_flight() == 0);
+        at_stat.expect("polled until the stat came")
+    }
+    assert!(in_place_at_stat(false), "the stat was answered before the watch was in place");
+    assert!(!in_place_at_stat(true), "the control was not caught");
+}
+
 /// A file written under a watched directory is heard of, on the drivers that watch.
 #[cfg(target_os = "linux")]
 #[test]
@@ -738,14 +823,18 @@ fn watches_hear_a_file_written_under_them() {
             vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
         run_until_idle(driver, &mut effects, |_, _| {}).expect("the effects end");
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
+        let mut heard = Vec::new();
+        let mut ended = false;
+        in_place(driver, Tag(7), Tag(6), |it| match it.done {
+            Done::Changed { files, .. } => heard.extend(files),
+            other => panic!("before the watch was in place: {other:?}"),
+        });
         let mut effects = vec![Effect::Write {
             file: name("src/deep/lib.rs"),
             bytes: b"fn f() {}".to_vec(),
             tag: Tag(2),
         }];
-        let mut heard = Vec::new();
         let mut asked_end = false;
-        let mut ended = false;
         // A write by someone else, as an editor's.
         if let Some(root) = root {
             std::fs::write(root.join("src/keep"), b"edited").unwrap();
@@ -790,6 +879,10 @@ fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::
         vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
     run_until_idle(driver, &mut effects, |_, _| {}).expect("the effects end");
     driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
+    in_place(driver, Tag(7), Tag(6), |it| match it.done {
+        Done::Changed { .. } => {}
+        other => panic!("before the watch was in place: {other:?}"),
+    });
     let mut done = Vec::new();
     for round in 0..50u64 {
         let file = format!("src/deep/edit-{round}");
