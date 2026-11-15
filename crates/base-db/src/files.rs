@@ -1225,9 +1225,10 @@ impl Files {
     }
 
     /// The reads of [`Files::env_read`] whose value a crate's code may have been made from
-    /// ([`Files::env_is_read_for_path`] says which are not). Sorted.
-    pub fn env_exposed(&self) -> Vec<(Crate, String)> {
-        env_list(&self.env_exposed)
+    /// ([`Files::env_is_read_for_path`] says which are not), borrowed, in no order: a caller
+    /// that picks one picks by value.
+    pub fn env_exposed(&self) -> impl Iterator<Item = (Crate, &str)> + '_ {
+        self.env_exposed.iter().map(|(krate, key)| (*krate, &**key))
     }
 
     /// Tells the database how its portable keys write paths ([`Port`]): once, before any is

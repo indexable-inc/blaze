@@ -2772,6 +2772,7 @@ fn an_env_read_for_an_include_path_alone_is_not_exposed() {
     let all = names(db.files().env_read());
     assert_eq!(all, ["BLAZE_T_DIRECT", "BLAZE_T_LEN", "BLAZE_T_PATH", "BLAZE_T_VALUE"], "every read is logged");
     let oracle = |exposed: &[String]| exposed == ["BLAZE_T_LEN", "BLAZE_T_VALUE"];
-    assert!(oracle(&names(db.files().env_exposed())), "{:?}", names(db.files().env_exposed()));
+    let exposed = names(db.files().env_exposed().map(|(by, name)| (by, name.to_owned())).collect());
+    assert!(oracle(&exposed), "{exposed:?}");
     assert!(!oracle(&all), "control: the whole log, every read taken as exposed, is refused");
 }

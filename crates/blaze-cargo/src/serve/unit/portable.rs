@@ -377,14 +377,18 @@ pub(crate) fn path_reads(db: &base_db::Db, krate: base_db::Crate, places: &Place
         krate.transitive_deps(db).iter().copied().collect();
     // A read that gives its value only to an `include!`'s path is none of these: the crate is
     // made from the file, which its key holds by content ([`base_db::Files::env_exposed`]).
-    for (by, name) in db.files().env_exposed() {
-        if closure.contains(&by) && by.env(db).get(&name).is_some_and(|value| rooted(&value)) {
-            // alloc: once per record tied
-            return Some(format!(
-                "crate {} reads its variable `{name}`, which names a directory of the build",
-                by.named(db)
-            ));
-        }
+    // The least of those that tie, so the reason does not hang on the log's order.
+    let tied = db
+        .files()
+        .env_exposed()
+        .filter(|&(by, name)| closure.contains(&by) && by.env(db).get(name).is_some_and(|value| rooted(&value)))
+        .min();
+    if let Some((by, name)) = tied {
+        // alloc: once per record tied
+        return Some(format!(
+            "crate {} reads its variable `{name}`, which names a directory of the build",
+            by.named(db)
+        ));
     }
     for &by in krate.transitive_deps(db) {
         let macros = by.data(db).dependencies.iter().any(|dep| {
