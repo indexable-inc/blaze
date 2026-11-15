@@ -2773,6 +2773,120 @@ fn the_oracle_catches_a_library_built_under_its_dependencies_code() {
     );
 }
 
+/// The lib's root reading its other files (`pub mod more;`), so they are in its texts, and
+/// the same with its plain body edited; its module `more` with a body, and edited.
+const LIB_MORE: &[u8] = b"pub mod more;\npub fn gen() -> u8 {\n    1\n}\n";
+const LIB_MORE_BODY: &[u8] = b"pub mod more;\npub fn gen() -> u8 {\n    2\n}\n";
+const MORE: &[u8] = b"pub fn more() -> u8 {\n    1\n}\n";
+const MORE_BODY: &[u8] = b"pub fn more() -> u8 {\n    2\n}\n";
+
+/// The identity a library's build of the bin is under ([`super::Narrowed::built`]), over the
+/// view with the lib's root [`LIB_MORE`], `a/src/more.rs` [`MORE`], a file `a/data.txt`
+/// that is not Rust, and each of `changes` made after those.
+fn bin_built(changes: &[(&'static str, Option<&'static [u8]>)]) -> ContentId {
+    let mut all: Vec<(&'static str, Option<&'static [u8]>)> = vec![
+        ("a/src/lib.rs", Some(LIB_MORE)),
+        ("a/src/more.rs", Some(MORE)),
+        ("a/data.txt", Some(&b"data 1\n"[..])),
+    ];
+    all.extend_from_slice(changes);
+    let mut front = front_over(&all);
+    front.narrowed(BIN).expect("the bin, a workspace crate's, has a narrowed identity").built
+}
+
+/// How the bin reads a file by a path, what is beside it, an edit, and whether the key of a
+/// library's build of the bin must move with it: the oracle of the reads by path. The bin's
+/// own files are in its own code text; a read of another crate's Rust holds that crate's code
+/// (its bodies); a read of the bytes of another crate's file that is not Rust holds them, as
+/// that crate's surface does; nothing else of the lib moves the key.
+const READS: &[(&str, &[(&str, &[u8])], (&str, &[u8]), bool)] = &[
+    (
+        "const NOTE: &str = include_str!(\"note.txt\");\nfn main() {}\n",
+        &[("b/src/note.txt", b"note 1\n")],
+        ("a/src/lib.rs", LIB_MORE_BODY),
+        false,
+    ),
+    (
+        "const NOTE: &str = include_str!(\"note.txt\");\nfn main() {}\n",
+        &[("b/src/note.txt", b"note 1\n")],
+        ("b/src/note.txt", b"note 2\n"),
+        true,
+    ),
+    (
+        "const DATA: &str = include_str!(\"../../a/data.txt\");\nfn main() {}\n",
+        &[],
+        ("a/src/lib.rs", LIB_MORE_BODY),
+        false,
+    ),
+    (
+        "const DATA: &str = include_str!(\"../../a/data.txt\");\nfn main() {}\n",
+        &[],
+        ("a/data.txt", b"data 2\n"),
+        true,
+    ),
+    (
+        "#[path = \"x.rs\"]\nmod x;\nfn main() {}\n",
+        &[("b/src/x.rs", b"pub fn x() -> u8 {\n    1\n}\n")],
+        ("a/src/lib.rs", LIB_MORE_BODY),
+        false,
+    ),
+    (
+        "#[path = \"x.rs\"]\nmod x;\nfn main() {}\n",
+        &[("b/src/x.rs", b"pub fn x() -> u8 {\n    1\n}\n")],
+        ("b/src/x.rs", b"pub fn x() -> u8 {\n    2\n}\n"),
+        true,
+    ),
+    (
+        "fn main() {}\ninclude!(\"gen.rs\");\n",
+        &[("b/src/gen.rs", b"pub fn g() -> u8 {\n    1\n}\n")],
+        ("a/src/lib.rs", LIB_MORE_BODY),
+        false,
+    ),
+    (
+        "#[path = \"../../a/src/more.rs\"]\nmod more;\nfn main() {}\n",
+        &[],
+        ("a/src/more.rs", MORE_BODY),
+        true,
+    ),
+    ("fn main() {}\ninclude!(\"../../a/src/more.rs\");\n", &[], ("a/src/more.rs", MORE_BODY), true),
+];
+
+/// [`READS`] case by case: the first whose key does not move as it must, said.
+fn check_reads() -> Result<(), String> {
+    for &(main, beside, (path, bytes), moves) in READS {
+        let mut view: Vec<(&'static str, Option<&'static [u8]>)> =
+            vec![("b/src/main.rs", Some(main.as_bytes()))];
+        view.extend(beside.iter().map(|&(path, bytes)| (path, Some(bytes))));
+        let before = bin_built(&view);
+        view.push((path, Some(bytes)));
+        if (before != bin_built(&view)) != moves {
+            return Err(format!("{main}with {path} edited: the key moved: {}", !moves));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant of reads by path: a library built over a crate that reads the bytes of a
+/// file that is not Rust, or Rust of its own files, is keyed by what it reads of them and by
+/// the surface of the crates below; one that makes Rust of another crate's file is keyed by
+/// that crate's code. A body edit of the lib moves none of the first kind.
+#[test]
+fn a_read_by_path_keys_a_library_by_the_file_it_reads() {
+    assert_eq!(check_reads(), Ok(()));
+}
+
+/// The controls: a read of another crate's Rust taken as a read of the bin's own
+/// ([`crate::code::Plant::Beyond`]), and a surface that leaves a file that is not Rust out
+/// ([`crate::code::Plant::Unread`]), each leave the key as it was where the file read moved:
+/// the oracle names the case.
+#[test]
+fn the_oracle_catches_a_read_by_path_left_out_of_a_key() {
+    let beyond = crate::code::planting(crate::code::Plant::Beyond, check_reads).unwrap_err();
+    assert!(beyond.contains("../../a/src/more.rs") && beyond.contains("moved: false"), "{beyond}");
+    let unread = crate::code::planting(crate::code::Plant::Unread, check_reads).unwrap_err();
+    assert!(unread.contains("a/data.txt edited: the key moved: false"), "{unread}");
+}
+
 /// The invariant: what a library's build up to the crate boundary is keyed by moves with
 /// what its front end reads of a crate below it (a signature, a `const fn`'s body, a
 /// constant's value, a macro's tokens) and with an `#[inline(always)]` body, which is built

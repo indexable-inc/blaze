@@ -176,9 +176,21 @@ pub struct CodeText {
     /// of its code (an effect, a contract, a function's code identity) may read the bodies of
     /// the crates its crate depends on.
     pub extends: bool,
-    /// Whether it may read a file by path (`#[path]`, `include!` and its kin): its crate may be
-    /// made from another crate's file.
+    /// Whether it may make Rust of a file it names by a path its text does not say whole
+    /// (`#[path]`, `include!`, outside the one shape [`said_reach`] takes): its crate may be
+    /// made from another crate's Rust, whose bodies that crate's surface leaves out, so what
+    /// is built of it is keyed by the code of every crate below it ([`crate::Lowered::narrowed`]).
+    /// Not `include_str!` and `include_bytes!`: one that reads Rust keeps its crate's whole
+    /// text (`whole`); any other reads bytes of a file that is not Rust, which every text of
+    /// the crate whose source root holds it holds by its bytes (its surface too,
+    /// [`narrow_from`]), and which no crate's source root holds is a read its unit's record
+    /// is filed by (blaze-cargo's `reads`).
     pub reaches: bool,
+    /// Whether it makes Rust of a file it names by a path its text says whole: `include!("x.rs")`
+    /// or a `#[path = "x.rs"]` on a `mod x;` where items of the file are ([`said_reach`]).
+    /// Which file that is, is the path's from this file in the view: its crate's own, one
+    /// outside every source root, or another crate's ([`reaches_beyond`]).
+    pub resolves: bool,
     /// What another crate's front end can observe of it, with no position in it but the ones
     /// a constant can hold (the module's docs, "The surface text"): its tokens, each with
     /// whether whitespace parts it from the one before, every body no other crate's front end
@@ -523,7 +535,9 @@ pub(crate) struct OwnNarrow {
     pub(crate) interface: Option<ContentId>,
     /// [`CodeText::extends`] of any of its files.
     pub(crate) extends: bool,
-    /// [`CodeText::reaches`] of any of its files.
+    /// [`CodeText::reaches`] or [`CodeText::resolves`] of any of its files: it may be made
+    /// from Rust of another crate's source root. Exact for a workspace crate in
+    /// [`reaches_beyond`].
     pub(crate) reaches: bool,
     /// What another crate's front end can observe of it, positions left out
     /// ([`CodeText::surface`] of each file): none where `interface` is none.
@@ -556,6 +570,57 @@ pub(crate) fn own_narrow(db: &Db, krate: Crate) -> OwnNarrow {
         |file| code_text(db, EditionedFileId::new(db, file, data.edition)),
         || reads_root_alone(db, EditionedFileId::new(db, root_file, data.edition)),
     )
+}
+
+/// Whether workspace crate `krate` may be made from Rust of another crate's source root
+/// ([`OwnNarrow::reaches`] made exact): a file of its source root reads by a path its text
+/// does not say whole ([`CodeText::reaches`]), or one it says ([`said_reach`]) is a file of
+/// another source root, as the front end resolves it ([`Db::resolve_path`] from the file).
+/// Where each such path is a file of its own source root, or of none, what the crate is made
+/// from is in its own key: its code text holds every file of its source root
+/// ([`own_narrow`]), and a file of none is one the front end reads off the disk
+/// (`Db::included_source`, `Db::module_source`), noted as read by the crate, which its unit's
+/// record is filed by with the file's content (blaze-cargo's `reads`). Asked of a crate whose
+/// [`OwnNarrow::reaches`] is set; true for a library source root's, whose given identity was
+/// worked out with no view to resolve in ([`library_narrow`]).
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn reaches_beyond(db: &Db, krate: Crate) -> bool {
+    let data = krate.data(db);
+    let own = db.file_source_root(data.root_file_id).source_root_id(db);
+    let root = db.source_root(own);
+    let set = root.source_root_ref(db);
+    if set.is_library {
+        return true;
+    }
+    for file in set.iter() {
+        let rust = set
+            .path_for_file(&file)
+            .and_then(|it| it.as_path())
+            .is_some_and(|it| it.as_str().ends_with(".rs"));
+        let editioned = EditionedFileId::new(db, file, data.edition);
+        let Some(code) = rust.then(|| code_text(db, editioned)).flatten() else { continue };
+        if code.reaches {
+            return true;
+        }
+        if !code.resolves {
+            continue;
+        }
+        let parse = editioned.parse(db);
+        let tokens = parse.syntax_node().descendants_with_tokens().filter_map(NodeOrToken::into_token);
+        for token in tokens.filter(|it| matches!(it.text(), "include" | "path")) {
+            let Some(path) = said_reach(&token) else { continue };
+            let read = db.resolve_path(base_db::AnchoredPath { anchor: file, path: &path });
+            // A file outside the VFS that a read made a source root of its own is of none.
+            let theirs = read.is_some_and(|it| {
+                db.file_source_root(it).source_root_id(db) != own
+                    && db.files().included_source_path(it).is_none()
+            });
+            if theirs && !planted(Plant::Beyond) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether `krate` is a library source root's crate that is narrowed through the store
@@ -726,7 +791,7 @@ fn narrow_from(
     }
     let texts = || std::iter::once(root_text).chain(files.iter().filter_map(|it| it.2));
     let extends = texts().any(|it| it.extends);
-    let reaches = texts().any(|it| it.reaches);
+    let reaches = texts().any(|it| it.reaches || it.resolves);
     let tracks = texts().any(|it| it.tracks);
     let names_location = texts().any(|it| it.names_location);
     let calls = texts().any(|it| it.calls);
@@ -758,8 +823,12 @@ fn narrow_from(
                 false => None,
             };
             hasher.part(path).opt_part(appended);
+            // A file that is not Rust by its bytes in every text, the surface too: a crate
+            // above may read them (`include_str!`), which keeps it no deeper key
+            // ([`CodeText::reaches`]).
             match code {
                 Some(code) => hasher.update(&[1]).id(&pick(code)),
+                None if which == 2 && planted(Plant::Unread) => hasher.update(&[0]),
                 None => hasher.update(&[0]).id(&db.file_content(*file)),
             };
         }
@@ -879,6 +948,7 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
         defined: None,
         extends: false,
         reaches: false,
+        resolves: false,
         surface: Surface::new(),
         surface_strict: Surface::new(),
         place: Place { line: 0, line_start: 0 },
@@ -907,6 +977,7 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
         unplain_line: walk.unplain_line,
         extends: walk.extends,
         reaches: walk.reaches,
+        resolves: walk.resolves,
         surface: walk.surface.finish(),
         surface_strict: walk.surface_strict.finish(),
         tracks: walk.tracks,
@@ -1175,6 +1246,7 @@ struct Walk<'a> {
     defined: Option<Defined>,
     extends: bool,
     reaches: bool,
+    resolves: bool,
     /// [`CodeText::surface`] and [`CodeText::surface_strict`].
     surface: Surface,
     surface_strict: Surface,
@@ -1603,12 +1675,16 @@ impl Walk<'_> {
                 }
             }
             SyntaxKind::IDENT => match token.text() {
-                "include_str" | "include_bytes" => {
-                    self.whole |= !reads_other_than_rust(token);
-                    self.reaches = true;
+                // Bytes of a file: of Rust, or by a path it does not say, the crate keeps its
+                // whole text; of any other file, they are where its key holds them already
+                // ([`CodeText::reaches`]).
+                "include_str" | "include_bytes" => self.whole |= !reads_other_than_rust(token),
+                "include" | "path" if token.text() == "include" || names_path_attr(token) => {
+                    match said_reach(token) {
+                        Some(_) => self.resolves = true,
+                        None => self.reaches = true,
+                    }
                 }
-                "include" => self.reaches = true,
-                "path" => self.reaches |= names_path_attr(token),
                 "blaze" | "fn_info" | "type_info" => self.extends = true,
                 _ => {}
             },
@@ -1643,6 +1719,88 @@ fn names_path_attr(token: &SyntaxToken) -> bool {
     given
         && (before.is_some_and(|it| it.kind() == SyntaxKind::L_BRACK)
             || after.is_some_and(|it| it.kind() == SyntaxKind::EQ))
+}
+
+/// The path the `include` or `path` at `token` reads a file of Rust by, where the file's text
+/// says it whole and the file is the path's from this file's directory, as the front end
+/// resolves it (`relative_file` of `include!`, `resolve_declaration` of a module): one of
+///
+/// - `include!("x.rs")`: a call by the name alone, of one string literal (and a `,`), in no
+///   macro's input or definition and in no item an attribute gives to a macro (which could
+///   write another path);
+/// - `#[path = "x.rs"]` on a `mod x;` where the file's items are (not in an inline module,
+///   whose name the path is joined to), with no attribute that gives it to a macro, and not
+///   in a `cfg_attr`. As `ModDir::join_attr` reads it: a leading `./` and a `\` as a `/`.
+///
+/// None for any other read by path, which [`CodeText::reaches`] then says: the crate may be
+/// made from any file. A macro of another crate called `include` (imported, or brought in by a
+/// glob) is not told from the standard library's here, as no call of another crate's macro
+/// is: what such a macro reads, by a path from the file that calls it, is a read no token of
+/// this file says, whatever its name.
+fn said_reach(token: &SyntaxToken) -> Option<String> {
+    let given_to_macro =
+        |node: &SyntaxNode| node.ancestors().any(|it| attrs(&it).any(|attr| attr_seen(&attr) != Seen::No));
+    let string = |token: Option<SyntaxToken>| {
+        ast::String::cast(token?).and_then(|it| it.value().ok().map(|it| it.into_owned())) // alloc: a path, once per read by path of a workspace file keyed
+    };
+    match token.text() {
+        "include" => {
+            let call = token.parent_ancestors().find(|it| it.kind() == SyntaxKind::MACRO_CALL)?;
+            let path = call.children().find(|it| it.kind() == SyntaxKind::PATH)?;
+            if path_text(&path) != "include"
+                || !path.text_range().contains_range(token.text_range())
+                || call.ancestors().any(|it| {
+                    matches!(
+                        it.kind(),
+                        SyntaxKind::TOKEN_TREE | SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF
+                    )
+                })
+                || given_to_macro(&call)
+            {
+                return None;
+            }
+            let args = call.children().find(|it| it.kind() == SyntaxKind::TOKEN_TREE)?;
+            // Its tokens between the brackets: one string, and a `,` after it at most.
+            let inner: Vec<SyntaxToken> = args // alloc: a call's few tokens, once per `include!` of a workspace file keyed
+                .children_with_tokens()
+                .filter_map(NodeOrToken::into_token)
+                .filter(|it| !it.kind().is_trivia())
+                .collect();
+            let [_open, middle @ .., _close] = inner.as_slice() else { return None };
+            let nested = args.children().next().is_some();
+            match middle {
+                [literal] | [literal, _] if !nested => {
+                    let comma = middle.get(1).is_none_or(|it| it.kind() == SyntaxKind::COMMA);
+                    comma.then(|| string(Some(literal.clone()))).flatten()
+                }
+                _ => None,
+            }
+        }
+        "path" => {
+            let attr = token.parent_ancestors().find_map(ast::Attr::cast)?;
+            let Some(ast::Meta::KeyValueMeta(meta)) = attr.meta() else { return None };
+            let named = meta.path().is_some_and(|it| path_text(it.syntax()) == "path");
+            let module = attr.syntax().parent().filter(|it| it.kind() == SyntaxKind::MODULE)?;
+            let at_items = module.parent().is_some_and(|it| it.kind() == SyntaxKind::SOURCE_FILE);
+            let out_of_line = !module.children().any(|it| it.kind() == SyntaxKind::ITEM_LIST);
+            if !named || !at_items || !out_of_line || given_to_macro(&module) {
+                return None;
+            }
+            let value = meta
+                .syntax()
+                .children_with_tokens()
+                .filter_map(NodeOrToken::into_token)
+                .find(|it| it.kind() == SyntaxKind::STRING)
+                .or_else(|| {
+                    let expr = meta.syntax().children().find(|it| it.kind() == SyntaxKind::LITERAL)?;
+                    expr.first_token().filter(|it| it.kind() == SyntaxKind::STRING)
+                });
+            let value = string(value)?;
+            let value = value.strip_prefix("./").unwrap_or(&value);
+            Some(value.replace('\\', "/")) // alloc: as above
+        }
+        _ => None,
+    }
 }
 
 /// Whether `node`, a macro call, is where items are: under nothing but modules, `impl`s and
@@ -2001,6 +2159,14 @@ pub(crate) enum Plant {
     /// whose call may make a macro of a plain one's name keeps a surface that leaves out
     /// bodies that call it.
     Unresolved,
+    /// A file of another crate's source root that a crate reads Rust of, by a path its text
+    /// says, is taken as one of its own ([`reaches_beyond`]): what is built over it is keyed
+    /// by that crate's surface, which leaves the file's bodies out, a stale unit.
+    Beyond,
+    /// A file of a crate's source root that is not Rust is in no surface of the crate: a crate
+    /// above that reads its bytes (`include_str!`) is built under a key that does not move
+    /// when they do, a stale unit.
+    Unread,
 }
 
 #[cfg(test)]

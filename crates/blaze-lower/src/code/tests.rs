@@ -5,7 +5,7 @@ use blaze_sim::Config;
 use span::Edition;
 use syntax::{AstNode, SourceFile};
 
-use super::{CodeText, Plant, code_text_of, planting, root_alone_of, still_text};
+use super::{CodeText, Plant, code_text_of, planting, root_alone_of, said_reach, still_text};
 
 fn code(text: &str) -> CodeText {
     let parse = SourceFile::parse(text, Edition::CURRENT);
@@ -396,13 +396,56 @@ fn what_keeps_a_crate_from_an_interface_is_caught() {
     assert!(code("#[blaze::pure]\nfn f() {}\n").extends);
     assert!(code("const ID: u64 = fn_info(&f).code_id;\n").extends);
     for reaches in [
-        "#[path = \"../other/src/a.rs\"]\nmod a;\n",
         "#[cfg_attr(unix, path = \"unix.rs\")]\nmod sys;\n",
-        "include!(\"gen.rs\");\n",
-        "const A: &str = include_str!(\"a.txt\");\n",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n",
         "make! { #[path = \"a.rs\"] mod a; }\n",
     ] {
         assert!(code(reaches).reaches, "{reaches}");
+    }
+}
+
+/// How a file reads another by a path: Rust by a path its text says whole is a read the view
+/// resolves (`resolves`, and the path [`said_reach`] gives, as the front end joins it); Rust
+/// by any other is a read of any file (`reaches`); the bytes of a file that is not Rust by a
+/// literal are neither, as every text of the crate whose file it is holds them (and Rust's
+/// bytes keep the crate's whole text).
+#[test]
+fn a_read_by_path_is_said_whole_or_reaches() {
+    // (text, the paths said, reaches, whole)
+    let cases: &[(&str, &[&str], bool, bool)] = &[
+        ("#[path = \"../other/src/a.rs\"]\nmod a;\n", &["../other/src/a.rs"], false, false),
+        ("#[cfg(unix)]\n#[path = \"./sys\\\\unix.rs\"]\npub mod sys;\n", &["sys/unix.rs"], false, false),
+        ("include!(\"gen.rs\");\n", &["gen.rs"], false, false),
+        ("fn f() -> u8 {\n    include!(\"gen.rs\",)\n}\n", &["gen.rs"], false, false),
+        ("const A: &str = include_str!(\"a.txt\");\n", &[], false, false),
+        ("#![doc = include_str!(\"../README.md\")]\n", &[], false, false),
+        ("const A: &[u8] = include_bytes!(\"a.rs\");\n", &[], false, true),
+        ("const A: &str = include_str!(concat!(\"a\", \".txt\"));\n", &[], false, true),
+        // A path its text does not say whole, or one another macro may write anew.
+        ("#[cfg_attr(unix, path = \"unix.rs\")]\nmod sys;\n", &[], true, false),
+        ("mod outer {\n    #[path = \"a.rs\"]\n    mod a;\n}\n", &[], true, false),
+        ("#[path = \"a.rs\"]\nmod a {}\n", &[], true, false),
+        ("include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n", &[], true, false),
+        ("std::include!(\"gen.rs\");\n", &[], true, false),
+        ("include!(\"gen.rs\", \"more\");\n", &[], true, false),
+        ("macro_rules! m {\n    () => { include!(\"gen.rs\"); };\n}\n", &[], true, false),
+        ("#[other::rewrite]\nmod m {\n    include!(\"gen.rs\");\n}\n", &[], true, false),
+        ("make! { #[path = \"a.rs\"] mod a; }\n", &[], true, false),
+        // An out-of-line module given to a macro keeps its crate's whole text, besides.
+        ("#[other::rewrite]\n#[path = \"a.rs\"]\nmod a;\n", &[], true, true),
+    ];
+    for &(text, said, reaches, whole) in cases {
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let paths: Vec<String> = parse
+            .tree()
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(syntax::NodeOrToken::into_token)
+            .filter_map(|it| said_reach(&it))
+            .collect();
+        let code = code(text);
+        assert_eq!(paths, said, "{text}");
+        assert_eq!((code.reaches, code.resolves, code.whole), (reaches, !said.is_empty(), whole), "{text}");
     }
 }
 
@@ -1416,3 +1459,5 @@ fn what_could_give_a_constant_its_callers_position_is_flagged() {
     assert_eq!(flags("pub static C: Lazy<u32> = Lazy(|| g());\n"), (false, false, true));
     assert_eq!(flags("pub fn f() -> impl Copy {\n    g()\n}\n"), (false, false, false));
 }
+
+
