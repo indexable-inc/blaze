@@ -9,7 +9,7 @@ use super::{CodeText, Plant, code_text_of, planting, root_alone_of, said_reach, 
 
 fn code(text: &str) -> CodeText {
     let parse = SourceFile::parse(text, Edition::CURRENT);
-    code_text_of(parse.tree().syntax(), text)
+    code_text_of(parse.tree().syntax(), text, Edition::CURRENT)
 }
 
 /// An edit of a doc comment's text no macro sees (one doctest example of a library) leaves its
@@ -120,6 +120,36 @@ fn a_shadowing_file_is_caught() {
         "#[macro_use]\nextern crate alloc;\n",
     ] {
         assert!(!code(text).shadows, "{text}");
+    }
+}
+
+/// A glob of a module declared beside it (`mod attribute; pub use attribute::*;`) is of the
+/// crate's own names in edition 2018 and later, where a first name both a module and a crate
+/// is an error: it neither shadows nor takes a plain macro's name. Not where the module may be
+/// taken away by a `cfg`, not one written `::attribute` (a crate), not a module elsewhere, and
+/// not in edition 2015, where the path starts at the root.
+#[test]
+fn a_glob_of_a_module_beside_it_is_the_crates_own() {
+    let at = |text: &str, edition: Edition| {
+        let parse = SourceFile::parse(text, edition);
+        let code = code_text_of(parse.tree().syntax(), text, edition);
+        (code.shadows, code.unplain)
+    };
+    for text in [
+        "mod attribute;\npub use attribute::*;\n",
+        "pub mod attribute {\n    pub struct A;\n}\npub use attribute::{*};\n",
+        "#[doc(hidden)]\nmod attribute;\npub use attribute::*;\n",
+    ] {
+        assert_eq!(at(text, Edition::Edition2021), (false, false), "{text}");
+        assert_eq!(at(text, Edition::Edition2015), (true, true), "2015: {text}");
+    }
+    for text in [
+        "#[cfg(feature = \"a\")]\nmod attribute;\npub use attribute::*;\n",
+        "mod attribute;\npub use ::attribute::*;\n",
+        "mod other {\n    mod attribute;\n}\npub use attribute::*;\n",
+        "mod attributes;\npub use attribute::*;\n",
+    ] {
+        assert_eq!(at(text, Edition::Edition2021), (true, true), "{text}");
     }
 }
 

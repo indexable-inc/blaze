@@ -905,7 +905,7 @@ fn whole_code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
     let text = db.file_text(id);
     let text: &str = &**text.text(db);
     let parse = syntax::SourceFile::parse(text, edition);
-    Some(code_text_of(parse.tree().syntax(), text))
+    Some(code_text_of(parse.tree().syntax(), text, edition))
 }
 
 /// [`code_text_of`] of `file`'s parse; none for a file with no text (bytes that are not
@@ -924,12 +924,12 @@ fn code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
     let text = db.file_text(id);
     let text = text.text(db);
     let parse = file.parse(db);
-    Some(code_text_of(&parse.syntax_node(), text))
+    Some(code_text_of(&parse.syntax_node(), text, file.edition(db)))
 }
 
-/// What of a file of text `text`, parsed as `root`, its crate's code can observe (the module's
-/// docs).
-pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
+/// What of a file of text `text`, parsed as `root` in `edition`, its crate's code can observe
+/// (the module's docs).
+pub fn code_text_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> CodeText {
     let end = match planted(Plant::Bytes) {
         true => text.len(),
         false => code_end(root),
@@ -949,6 +949,7 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
         extends: false,
         reaches: false,
         resolves: false,
+        uniform: edition >= span::Edition::Edition2018,
         surface: Surface::new(),
         surface_strict: Surface::new(),
         place: Place { line: 0, line_start: 0 },
@@ -1247,6 +1248,8 @@ struct Walk<'a> {
     extends: bool,
     reaches: bool,
     resolves: bool,
+    /// Whether the file's paths are uniform (edition 2018 and later: [`use_takes`]).
+    uniform: bool,
     /// [`CodeText::surface`] and [`CodeText::surface_strict`].
     surface: Surface,
     surface_strict: Surface,
@@ -1529,8 +1532,8 @@ impl Walk<'_> {
         }
         match kind {
             SyntaxKind::USE => {
-                self.shadows |= use_shadows(node);
-                self.deny(node, use_takes(node, |it| PLAIN_MACROS.contains(&it)));
+                self.shadows |= use_shadows(node, self.uniform);
+                self.deny(node, use_takes(node, self.uniform, |it| PLAIN_MACROS.contains(&it)));
             }
             SyntaxKind::EXTERN_CRATE => {
                 let taken = macro_use_extern(node);
@@ -2532,13 +2535,20 @@ fn own_or_std(first: &str) -> bool {
 
 /// Whether the `use` item `node` could shadow a prelude macro: a name of one imported, or a
 /// glob, from a path that starts outside the standard library and the crate.
-fn use_shadows(node: &SyntaxNode) -> bool {
-    use_takes(node, |it| SHADOWABLE.contains(&it))
+fn use_shadows(node: &SyntaxNode, uniform: bool) -> bool {
+    use_takes(node, uniform, |it| SHADOWABLE.contains(&it))
 }
 
 /// Whether the `use` item `node` brings in a name `named` takes, or a glob, from a path that
-/// starts outside the standard library and the crate.
-fn use_takes(node: &SyntaxNode, named: impl Fn(&str) -> bool) -> bool {
+/// starts outside the standard library and the crate. With `uniform` paths (edition 2018 and
+/// later), a path that starts with a module declared beside the `use` (`mod attribute;` then
+/// `pub use attribute::*;`), with no `cfg` that could take it away, starts in the crate: a
+/// path's first name that is both such a module and a crate of the extern prelude is an
+/// error (E0659), so where the crate builds it is the module, whose own imports of another
+/// crate's names are caught where they are, as `self::attribute::*`'s would be. Not in
+/// edition 2015, where it starts at the crate's root, which may hold an `extern crate` of the
+/// name; never one written `::attribute`, which names a crate.
+fn use_takes(node: &SyntaxNode, uniform: bool, named: impl Fn(&str) -> bool) -> bool {
     node.descendants().filter(|it| it.kind() == SyntaxKind::USE_TREE).any(|tree| {
         let glob = tree.children_with_tokens().any(|it| it.kind() == SyntaxKind::STAR);
         let list = tree.children().any(|it| it.kind() == SyntaxKind::USE_TREE_LIST);
@@ -2548,6 +2558,7 @@ fn use_takes(node: &SyntaxNode, named: impl Fn(&str) -> bool) -> bool {
         // The path from the outermost tree in: its first segment is where the names come from.
         let mut first = None;
         let mut last = None;
+        let mut rooted = false;
         for at in std::iter::once(tree.clone())
             .chain(tree.ancestors().skip(1))
             .take_while(|it| it.kind() != SyntaxKind::USE)
@@ -2560,10 +2571,12 @@ fn use_takes(node: &SyntaxNode, named: impl Fn(&str) -> bool) -> bool {
                 if last.is_none() {
                     last = text.rsplit("::").next().map(str::to_owned); // alloc: as `path_text`
                 }
+                rooted = text.starts_with("::");
                 first = text.trim_start_matches("::").split("::").next().map(str::to_owned); // alloc: as above
             }
         }
-        let from_outside = !first.as_deref().is_some_and(own_or_std);
+        let beside = |name: &str| uniform && !rooted && declares_module(node, name);
+        let from_outside = !first.as_deref().is_some_and(|it| own_or_std(it) || beside(it));
         let renamed =
             tree.children().find(|it| it.kind() == SyntaxKind::RENAME).map(|it| path_text(&it));
         let name = match &renamed {
@@ -2571,6 +2584,22 @@ fn use_takes(node: &SyntaxNode, named: impl Fn(&str) -> bool) -> bool {
             None => last,
         };
         from_outside && (glob || name.is_some_and(|it| named(it.as_str())))
+    })
+}
+
+/// Whether the list of items the `use` item `node` is in declares a module `name` that no
+/// `cfg` can take away ([`use_takes`]).
+fn declares_module(node: &SyntaxNode, name: &str) -> bool {
+    let Some(list) = node.parent() else { return false };
+    list.children().filter(|it| it.kind() == SyntaxKind::MODULE).any(|module| {
+        let named = module
+            .children()
+            .find(|it| it.kind() == SyntaxKind::NAME)
+            .is_some_and(|it| it.text() == name);
+        let gated = attrs(&module).any(|attr| {
+            matches!(attr.meta(), Some(ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_)) | None)
+        });
+        named && !gated
     })
 }
 
