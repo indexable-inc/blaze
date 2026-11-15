@@ -205,11 +205,16 @@ jobs:
       # What is left of the global heap only goes down (AGENTS.md bump-allocate): per crate,
       # outside tests, the `// alloc:` lines left to convert, the `expect`s of
       # `blaze::implicit_allocator`, the lines naming `Global` and the function signatures that
-      # fix the caller's allocator (`blaze::unwritten_allocator`'s rule, read from the text) equal their crate's row of
-      # crates/blaze-lints/baselines/alloc-sites.txt, a crate with no row is held to 0, and no
-      # row is above the base's (`global` may rise while `// alloc:` lines are left); a crate
-      # over its row has its new sites named from the base's diff (scripts/src/bin/allocs.rs). It needs no compiler, where the lints need a blaze that
-      # checks the workspace. Against the base itself: the checkout is shallow.
+      # fix the caller's allocator (`blaze::unwritten_allocator`'s rule, read from the text), and
+      # in the code the crate's own tests compile, the same signatures (`test_signatures`; test
+      # data and fixture crates under `tests/` count nowhere), equal their crate's row of
+      # crates/blaze-lints/baselines/alloc-sites.txt, and a crate with no row is held to 0. No
+      # column of a row is above the base's, except `global`, which may rise only by the crate's
+      # `// alloc:` lines converted and its added lines naming `Global` where no allocator can be
+      # taken (`fn main`, a trait impl's method, outside every function); a crate over its row
+      # has its new sites named from the base's diff (scripts/src/bin/allocs.rs). It needs no
+      # compiler, where the lints need a blaze that checks the workspace. Against the base
+      # itself: the checkout is shallow.
       - name: global-heap allocations only go down
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}

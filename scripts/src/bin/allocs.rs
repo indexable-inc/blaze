@@ -72,8 +72,10 @@ read); the first four outside test code, the last in it:
             a closure is its function's, and a `fn` nested in `fn main` can take one. Every
             other place cannot: `fn main`, a trait impl's method (its signature is the
             trait's), and code outside every function (a static, a field's type, an impl
-            header). A line with any `Global` in a place that can take an allocator is a line
-            of such a place
+            header). A `Global` in a function's own signature is in that function's place:
+            `fn f(v: Vec<u8, Global>)` can take an allocator, the same in `fn main` or a trait
+            impl's method cannot. A line with any `Global` in a place that can take an
+            allocator is a line of such a place
   signatures
             a function signature, from the word `fn` and its name to the `{` or `;` that ends
             it, over as many lines as it spans (comments, strings and characters skipped),
@@ -104,8 +106,10 @@ count the gate can hold before blaze checks blaze's own crates, and it goes when
 baseline joins the gate.
 
 A site in test code counts in `test_signatures` when it is a signature, and in no column
-otherwise. Test code is, and nothing else is:
-  - a file under a directory named `tests` or `benches`, or named `tests.rs` or `test.rs`;
+otherwise. Test code is the code a crate's own tests compile, and nothing else is:
+  - a test root: `tests/<name>.rs` or `tests/<name>/main.rs` in the crate's directory
+    (`benches` alike), a crate root for module declarations;
+  - a file named `tests.rs` or `test.rs`;
   - a file that says `#![cfg(test)]`;
   - the item after `#[cfg(test)]` or `#[cfg(all(test, ...))]`, from the attribute's line to
     the line of the `}` or `;` that ends the item (strings, characters and comments read as
@@ -114,8 +118,14 @@ otherwise. Test code is, and nothing else is:
   - the file of a module declared out of line in test code (`#[cfg(test)] mod t;`, or any
     `mod m;` in a test file): `m.rs` or `m/mod.rs` beside a crate root (`lib.rs`, `main.rs`,
     `mod.rs`, `build.rs`, a file of a `bin` directory), else in the directory named for the
-    declaring file. A `#[path]` is not followed, so such a module counts.
-Everything else counts, `*_tests.rs` files a test module does not declare included.
+    declaring file, and so on down (a test root's `mod common;` is `tests/common.rs` or
+    `tests/common/mod.rs`). A `#[path = "<file>"]` on the `mod`'s line, or on an attribute
+    line before it, names its file instead, relative to the declaring file's directory.
+Test data counts in no column: a file under a directory named `tests` or `benches` that no
+test root or test module reaches (`tests/data/x.rs`, a UI test's input), and every file of a
+crate whose directory is under one (a fixture project blaze builds, with its own Cargo.toml),
+which has no row. Everything else counts, `*_tests.rs` files a test module does not declare
+included.
 
 A crate is the nearest directory above the file, under crates/, that holds a Cargo.toml, named
 by its path under crates/ (`blaze-cargo`, `harness/harness-native`).
@@ -298,6 +308,9 @@ struct Patterns {
     inner_cfg_test: Regex,
     /// `mod <name>;`, attributes before it on the line allowed.
     module: Regex,
+    /// `#[path = "<file>"]` at the line's start: the file of the `mod <name>;` it is on or
+    /// before.
+    path: Regex,
     /// An `allow` or `expect` of `blaze::implicit_allocator`, at the line's start.
     allowed: Regex,
 }
@@ -309,6 +322,7 @@ impl Patterns {
             cfg_test: re(r"\A\s*#\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
             inner_cfg_test: re(r"\A\s*#!\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
             module: re(r"\A\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?(\w+)\s*;"),
+            path: re(r#"\A\s*#\[path\s*=\s*"([^"\\]*)"\s*\]"#),
             allowed: re(r"\A\s*#!?\[[^\]]*\b(?:allow|expect)\([^\]]*\bblaze::implicit_allocator\b"),
         }
     }
@@ -333,10 +347,21 @@ struct Scanned {
     /// The lines (from 1) that are sites, each with what it is, by line and then by kind (a line
     /// can be more than one): outside its test code any kind, in it [`Kind::TestSignature`].
     sites: Vec<(usize, Kind)>,
-    /// Each `mod <name>;` it declares, and whether test code declares it.
-    mods: Vec<(String, bool)>,
+    /// Each `mod <name>;` it declares.
+    mods: Vec<Declared>,
     /// `#![cfg(test)]`: the whole file is test code.
     test: bool,
+}
+
+/// A module a file declares out of line, `mod <name>;`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Declared {
+    name: String,
+    /// Whether test code declares it.
+    test: bool,
+    /// Its `#[path = ".."]`, on its line or an attribute line before it: relative to the
+    /// declaring file's directory.
+    path: Option<String>,
 }
 
 /// The sites of one file's text and the modules it declares out of line.
@@ -349,6 +374,8 @@ fn scan_file(p: &Patterns, text: &str) -> Scanned {
     let mut signatures = code.signatures.iter().peekable();
     // The byte where line `at` starts.
     let mut start = 0;
+    // A `#[path = ".."]` on an attribute line, waiting for the `mod` its attributes are on.
+    let mut path: Option<String> = None;
     for (at, line) in lines.iter().enumerate() {
         if p.inner_cfg_test.is_match(line) {
             out.test = true;
@@ -363,8 +390,14 @@ fn scan_file(p: &Patterns, text: &str) -> Scanned {
                 *it = true;
             }
         }
+        let path_here = p.path.captures(line).map(|it| it[1].to_owned());
         if let Some(found) = p.module.captures(line) {
-            out.mods.push((found[1].to_owned(), test[at]));
+            out.mods.push(Declared { name: found[1].to_owned(), test: test[at], path: path_here.or(path.take()) });
+        } else if path_here.is_some() {
+            path = path_here;
+        } else if !matches!(line.trim_start().get(..2), None | Some("#[" | "//")) {
+            // A line of code between: the attribute was another item's.
+            path = None;
         }
         // `global` is in line order: take this line's entry, if it has one, test code or not.
         let named = global.next_if(|(line, _)| *line == at + 1).map(|(_, place)| match place {
@@ -389,7 +422,7 @@ fn scan_file(p: &Patterns, text: &str) -> Scanned {
     if out.test {
         as_test_code(&mut out.sites);
         for it in &mut out.mods {
-            it.1 = true;
+            it.test = true;
         }
     }
     out
@@ -787,21 +820,68 @@ fn raw_end(bytes: &[u8], from: usize) -> usize {
     bytes.len()
 }
 
-fn test_path(parts: &[String]) -> bool {
-    let (name, dirs) = parts.split_last().map_or(("", &[][..]), |(name, dirs)| (name.as_str(), dirs));
-    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str())) || TEST_FILES.contains(&name)
+/// What a file's path says it is, given its crate (by its path under crates/).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathRole {
+    /// The crate's code: test code only by what declares it or what it says.
+    Source,
+    /// Named `tests.rs` or `test.rs`: test code.
+    TestFile,
+    /// A crate root of the crate's own tests or benches: `tests/<name>.rs` or
+    /// `tests/<name>/main.rs` in the crate's directory (`benches` alike). Test code.
+    TestRoot,
+    /// Any other file under a directory named `tests` or `benches`: data that blaze reads or
+    /// builds, counted nowhere, unless a test root's module declarations reach it.
+    UnderTestDir,
+    /// A file of a crate whose directory is under a `tests` or `benches` directory: a fixture
+    /// project blaze builds as input. Counted nowhere, and no row.
+    Fixture,
 }
 
-/// The two files the module `name`, declared out of line in the file `parts`, can be.
-fn module_files(parts: &[String], name: &str) -> [String; 2] {
+fn path_role(parts: &[String], krate: &str) -> PathRole {
+    let test_dir = |part: &str| TEST_DIRS.contains(&part);
+    if krate.split('/').any(test_dir) {
+        return PathRole::Fixture;
+    }
+    let (name, dirs) = parts.split_last().map_or(("", &[][..]), |(name, dirs)| (name.as_str(), dirs));
+    // The parts after the crate's directory, `crates/<krate>`.
+    let inside = parts.get(1 + krate.split('/').count()..).unwrap_or(&[]);
+    match inside {
+        [dir, _] if test_dir(dir) => PathRole::TestRoot,
+        [dir, _, main] if test_dir(dir) && main == "main.rs" => PathRole::TestRoot,
+        _ if dirs.iter().any(|it| test_dir(it)) => PathRole::UnderTestDir,
+        _ if TEST_FILES.contains(&name) => PathRole::TestFile,
+        _ => PathRole::Source,
+    }
+}
+
+/// The two files the module `name`, declared out of line in the file `parts`, can be; `root`
+/// says the file is a crate root whatever its name (a test root).
+fn module_files(parts: &[String], name: &str, root: bool) -> [String; 2] {
     let Some((file, dirs)) = parts.split_last() else { return [String::new(), String::new()] };
     let mut base: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    let root = ROOT_FILES.contains(&file.as_str()) || dirs.last().is_some_and(|it| it == "bin");
+    let root = root || ROOT_FILES.contains(&file.as_str()) || dirs.last().is_some_and(|it| it == "bin");
     if !root {
         base.push(file.strip_suffix(".rs").unwrap_or(file));
     }
     let base = base.join("/");
     [format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")]
+}
+
+/// The file a `#[path = "<file>"]` names, declared in the file `parts`: relative to its
+/// directory, `.` and `..` resolved (a module out of line, not in an inline module's block).
+fn path_file(parts: &[String], file: &str) -> String {
+    let mut out: Vec<&str> = parts.split_last().map_or(Vec::new(), |(_, dirs)| dirs.iter().map(String::as_str).collect());
+    for part in file.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            _ => out.push(part),
+        }
+    }
+    out.join("/")
 }
 
 /// `(root / "crates").rglob("*.rs")`, sorted part by part, each as its parts from the root, none
@@ -847,36 +927,57 @@ fn crate_of(root: &Path, parts: &[String], manifests: &mut BTreeMap<Vec<String>,
     }
 }
 
-/// Each crate's sites, in file and line order (a test file's are [`as_test_code`]'s); a crate
-/// with none is absent.
+/// Each crate's sites, in file and line order (a test file's are [`as_test_code`]'s; a file
+/// under a `tests` or `benches` directory that no test root reaches, and a fixture crate's, have
+/// none); a crate with none is absent.
 fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
     let files = rust_files(root);
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
-    let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
+    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
+    let mut scanned: Vec<(Vec<String>, String, Scanned)> = Vec::new();
     let mut test: BTreeSet<String> = BTreeSet::new();
+    let mut data: BTreeSet<String> = BTreeSet::new();
     let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for parts in files {
         let path = parts.join("/");
+        let krate = crate_of(root, &parts, &mut manifests);
+        let role = path_role(&parts, &krate);
+        if role == PathRole::Fixture {
+            continue;
+        }
         let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
         // `read_text(errors="replace")`: what is not UTF-8 becomes U+FFFD.
         let Ok(bytes) = std::fs::read(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
         let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
         let found = scan_file(p, &text);
-        if test_path(&parts) || found.test {
+        match role {
+            PathRole::UnderTestDir => {
+                data.insert(path.clone());
+            }
+            PathRole::TestRoot | PathRole::TestFile => {
+                test.insert(path.clone());
+            }
+            PathRole::Source | PathRole::Fixture => {}
+        }
+        if found.test {
             test.insert(path.clone());
         }
-        for (name, in_test) in &found.mods {
-            for file in module_files(&parts, name) {
+        for declared in &found.mods {
+            let files = match &declared.path {
+                Some(file) => vec![path_file(&parts, file)],
+                None => module_files(&parts, &declared.name, role == PathRole::TestRoot).to_vec(),
+            };
+            for file in files {
                 if !known.contains(&file) {
                     continue;
                 }
-                if *in_test {
+                if declared.test {
                     test.insert(file.clone());
                 }
                 children.entry(path.clone()).or_default().push(file);
             }
         }
-        scanned.push((parts, found));
+        scanned.push((parts, krate, found));
     }
     // A module that test code declares is test code, and so is every module it declares.
     let mut todo: Vec<String> = test.iter().cloned().collect();
@@ -888,17 +989,17 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
             }
         }
     }
-    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
     let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
-    for (parts, mut found) in scanned {
+    for (parts, krate, mut found) in scanned {
         let path = parts.join("/");
         if test.contains(&path) {
             as_test_code(&mut found.sites);
+        } else if data.contains(&path) {
+            continue;
         }
         if found.sites.is_empty() {
             continue;
         }
-        let krate = crate_of(root, &parts, &mut manifests);
         out.entry(krate)
             .or_default()
             .extend(found.sites.iter().map(|(line, kind)| Site { path: path.clone(), line: *line, kind: *kind }));
@@ -1283,11 +1384,25 @@ fn selftest(p: &Patterns) {
     ];
     expect(found.sites == want, &format!("the sites outside test code (line 18 is a test's): {:?}", found.sites));
     expect(
-        found.mods == [("t".to_owned(), true), ("live".to_owned(), false)],
+        found.mods
+            == [
+                Declared { name: "t".to_owned(), test: true, path: None },
+                Declared { name: "live".to_owned(), test: false, path: None },
+            ],
         &format!("the modules declared out of line: {:?}", found.mods),
     );
     let inner = scan_file(p, "#![cfg(test)]\nmod deep;\nfn x() { Vec::new_in(Global) } // alloc: a test file's\n");
-    expect(inner.test && inner.sites.is_empty() && inner.mods == [("deep".to_owned(), true)], &format!("{inner:?}"));
+    expect(
+        inner.test && inner.sites.is_empty() && inner.mods == [Declared { name: "deep".to_owned(), test: true, path: None }],
+        &format!("{inner:?}"),
+    );
+    // A `#[path]` on the `mod`'s line or an attribute line before it is the module's file; one
+    // that an item's code line separates from the `mod` is not.
+    let pathed = scan_file(p, "#[cfg(test)]\n#[path = \"a/b.rs\"]\nmod b;\n#[path = \"x.rs\"] mod x;\n#[path = \"no.rs\"]\nfn f() {}\nmod c;\n");
+    let paths: Vec<Option<&str>> = pathed.mods.iter().map(|it| it.path.as_deref()).collect();
+    expect(paths == [Some("a/b.rs"), Some("x.rs"), None], &format!("the modules' `#[path]`s: {paths:?}"));
+    let it: Vec<String> = "crates/a/tests/it.rs".split('/').map(str::to_owned).collect();
+    expect(path_file(&it, "../tests/it/./x.rs") == "crates/a/tests/it/x.rs", "a `#[path]` is relative to its file's directory");
     // A field's attribute: the item ends with its struct, so the attribute's line alone is test.
     // A field's type is outside every function: no allocator can be taken there.
     let field = scan_file(p, "struct S {\n    #[cfg(test)]\n    a: Vec<u8, Global>, // alloc: counted\n}\n");
@@ -1300,15 +1415,16 @@ fn selftest(p: &Patterns) {
 
     let parts = |path: &str| -> Vec<String> { path.split('/').map(str::to_owned).collect() };
     expect(
-        module_files(&parts("crates/a/src/lib.rs"), "t") == ["crates/a/src/t.rs".to_owned(), "crates/a/src/t/mod.rs".to_owned()],
+        module_files(&parts("crates/a/src/lib.rs"), "t", false) == ["crates/a/src/t.rs".to_owned(), "crates/a/src/t/mod.rs".to_owned()],
         "a crate root's module is beside it",
     );
     expect(
-        module_files(&parts("crates/a/src/t.rs"), "deep")
+        module_files(&parts("crates/a/src/t.rs"), "deep", false)
             == ["crates/a/src/t/deep.rs".to_owned(), "crates/a/src/t/deep/mod.rs".to_owned()],
         "another file's module is in the directory named for it",
     );
-    expect(module_files(&parts("crates/a/src/bin/x.rs"), "m")[0] == "crates/a/src/bin/m.rs", "a bin's module");
+    expect(module_files(&parts("crates/a/src/bin/x.rs"), "m", false)[0] == "crates/a/src/bin/m.rs", "a bin's module");
+    expect(module_files(&parts("crates/a/tests/it.rs"), "common", true)[1] == "crates/a/tests/common/mod.rs", "a test root's module");
 
     // A tree: crates, test files by path and by declaration (transitively), a nested crate.
     let tmp = TempDir::new("allocs-selftest-").unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
@@ -1634,7 +1750,25 @@ fn test_signatures_selftest(p: &Patterns) {
     put("crates/t/src/generic.rs", ONE_COPY_GENERIC);
     put("crates/t/src/live.rs", ONE_COPY_GENERIC);
     put("crates/t/src/whole.rs", "#![cfg(test)]\nfn made() -> Box<u8> { loop {} }\n");
-    put("crates/t/tests/it.rs", "fn fixture() -> String { loop {} }\n#[test]\nfn it() {}\n");
+    // The crate's own tests: a test root (line 4), the module files it declares
+    // (`tests/common/mod.rs` and, by `#[path]`, `tests/support/walk.rs`, line 1 each), and a
+    // test root in its own directory (`tests/suite/main.rs`, line 1).
+    put(
+        "crates/t/tests/it.rs",
+        "mod common;\n#[path = \"support/walk.rs\"]\nmod walk;\nfn fixture() -> String { loop {} }\n#[test]\nfn it() {}\n",
+    );
+    put("crates/t/tests/common/mod.rs", "pub fn shared() -> Vec<u8> { loop {} }\n");
+    put("crates/t/tests/support/walk.rs", "pub fn walked() -> Vec<u8> { loop {} }\n");
+    put("crates/t/tests/suite/main.rs", "fn made() -> Box<u8> { loop {} }\n");
+    // Test data, counted in no column: a file under `tests/` no test root reaches, and a fixture
+    // crate under `tests/` with its own tests and `#[cfg(test)]` module.
+    put("crates/t/tests/data/f.rs", "fn f() -> Vec<u8> { loop {} } // alloc: data\nfn g() { Vec::new_in(Global); }\n");
+    put("crates/t/tests/fixture/Cargo.toml", "[package]\nname = \"fixture\"\n");
+    put(
+        "crates/t/tests/fixture/src/lib.rs",
+        "pub fn g() -> Vec<u8> { loop {} } // alloc: a fixture's\n#[cfg(test)]\nmod tests {\n    fn h() -> Vec<u8> { loop {} }\n}\n",
+    );
+    put("crates/t/tests/fixture/tests/it.rs", "fn helper() -> Vec<u8> { loop {} }\n");
     let counts = count(p, tmp.path());
     let want = BTreeMap::from([(
         "t".to_owned(),
@@ -1642,22 +1776,28 @@ fn test_signatures_selftest(p: &Patterns) {
             ("crates/t/src/lib.rs", 9, Kind::TestSignature),
             ("crates/t/src/one_copy.rs", 3, Kind::TestSignature),
             ("crates/t/src/whole.rs", 2, Kind::TestSignature),
-            ("crates/t/tests/it.rs", 1, Kind::TestSignature),
+            ("crates/t/tests/common/mod.rs", 1, Kind::TestSignature),
+            ("crates/t/tests/it.rs", 4, Kind::TestSignature),
+            ("crates/t/tests/suite/main.rs", 1, Kind::TestSignature),
+            ("crates/t/tests/support/walk.rs", 1, Kind::TestSignature),
         ]),
     )]);
-    expect(counts == want, &format!("a test helper's signature in each kind of test code: {}", shown(&counts)));
+    expect(
+        counts == want,
+        &format!("a test helper's signature in each kind of test code, and none in test data: {}", shown(&counts)),
+    );
     let rows = parse_rows(&render(&counts)).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e));
-    expect(rows == BTreeMap::from([("t".to_owned(), [0, 0, 0, 0, 4])]), &format!("crate `t`'s row: {rows:?}"));
+    expect(rows == BTreeMap::from([("t".to_owned(), [0, 0, 0, 0, 7])]), &format!("crate `t`'s row: {rows:?}"));
 
     // Over its row: refused, naming the new helper; the message is about test code, and the
     // `#[test]` function is who names `Global`.
-    let under = BTreeMap::from([("t".to_owned(), [0, 0, 0, 0, 3])]);
+    let under = BTreeMap::from([("t".to_owned(), [0, 0, 0, 0, 6])]);
     let added = BTreeMap::from([("crates/t/src/one_copy.rs".to_owned(), BTreeSet::from([3, 4, 5, 6, 7]))]);
     let said = problems(&counts, &under, None, Some(&added));
     expect(
         said.len() == 1
-            && said[0].contains("`t` has 4 function signatures that fix the caller's allocator in test code")
-            && said[0].contains("over its row's `test_signatures` 3")
+            && said[0].contains("`t` has 7 function signatures that fix the caller's allocator in test code")
+            && said[0].contains("over its row's `test_signatures` 6")
             && said[0].contains("new: crates/t/src/one_copy.rs:3)")
             && said[0].contains("the `#[test]` function names `Global`")
             && !said[0].contains("outside tests"),
@@ -1665,10 +1805,10 @@ fn test_signatures_selftest(p: &Patterns) {
     );
     // A crate with no row is held to 0; a row above the base's is refused.
     let said = problems(&counts, &BTreeMap::new(), None, None);
-    expect(said.len() == 1 && said[0].contains("`t` has 4") && said[0].contains("held"), &format!("no row: {said:?}"));
+    expect(said.len() == 1 && said[0].contains("`t` has 7") && said[0].contains("held"), &format!("no row: {said:?}"));
     let said = problems(&counts, &rows, Some(&under), None);
     expect(
-        said.len() == 1 && said[0].contains("the row `t`'s `test_signatures` is 4 and was 3 at the base"),
+        said.len() == 1 && said[0].contains("the row `t`'s `test_signatures` is 7 and was 6 at the base"),
         &format!("a row raised over the base's: {said:?}"),
     );
 }
