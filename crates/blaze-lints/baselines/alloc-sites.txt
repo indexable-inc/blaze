@@ -79,7 +79,7 @@ blaze-mutants	0	0	113	15
 blaze-napi	4	0	0	10
 blaze-new	0	0	0	6
 blaze-pack	41	0	0	36
-blaze-profile	1088	6	102	402
+blaze-profile	1084	6	108	398
 blaze-program	0	0	226	31
 blaze-protocol	69	0	2	26
 blaze-query	301	0	3	73

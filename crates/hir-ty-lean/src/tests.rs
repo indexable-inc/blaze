@@ -3668,6 +3668,7 @@ pub mod world {
         pub enum Ended<T> { Done(T), Running, Asleep }
         pub enum Woke { Woken, Changed, Spurious, TimedOut }
         pub fn two<A, B>(schedule: &[Step], first: impl FnOnce() -> A, second: impl FnOnce() -> B) -> (Ended<A>, Ended<B>) { loop {} }
+        pub fn two_weak<A, B>(schedule: &[Step], first: impl FnOnce() -> A, second: impl FnOnce() -> B) -> (Ended<A>, Ended<B>) { loop {} }
         pub fn wait(word: &AtomicU32, expected: u32, timed: bool) -> Woke { Woke::Spurious }
         pub fn wake(word: &AtomicU32) -> bool { false }
         pub fn yield_now() {}
@@ -4025,6 +4026,38 @@ pub fn parks_once(schedule: Vec<Step>, timed: bool) -> bool {
         Ended::Done(false) => timed && (!both || last == NOTIFIED),
     }
 }
+#[blaze::theorem]
+pub fn weak_message_is_passed(schedule: Vec<Step>) -> bool {
+    let data = AtomicU32::new(0);
+    let flag = AtomicU32::new(0);
+    let (_, read) = threads::two_weak(
+        &schedule,
+        || {
+            data.store(42, Ordering::Relaxed);
+            flag.store(1, Ordering::Release);
+        },
+        || if flag.load(Ordering::Acquire) == 1 { data.load(Ordering::Relaxed) } else { 42 },
+    );
+    match read {
+        Ended::Done(seen) => seen == 42,
+        _ => true,
+    }
+}
+pub fn weak_bumps(schedule: &[Step], n: &AtomicU32) -> bool {
+    match threads::two_weak(schedule, || bump(n), || bump(n)) {
+        (Ended::Done(a), Ended::Done(b)) => a != b,
+        _ => true,
+    }
+}
+#[blaze::theorem]
+pub fn both_worlds(schedule: Vec<Step>) -> bool {
+    let n = AtomicU32::new(0);
+    let strong = match threads::two(&schedule, || bump(&n), || bump(&n)) {
+        (Ended::Done(a), Ended::Done(b)) => a != b,
+        _ => true,
+    };
+    strong && weak_bumps(&schedule, &n)
+}
 ";
 
 /// A function that touches the memory threads share is shared: its model is a
@@ -4032,11 +4065,14 @@ pub fn parks_once(schedule: Vec<Step>, timed: bool) -> bool {
 /// a `Result` bound in it lifted and an end made a program by `Threads.Prog.done`; a function
 /// that calls a shared one (through a closure, `Option::map`'s instance or a loop) is shared
 /// too, and pure and `Result` functions it calls stay as they are. `two`, `wait` and `wake` of
-/// `blaze_core::world::threads` are `Threads.two_of`, `Threads.wait` and `Threads.wake`.
+/// `blaze_core::world::threads` are `Threads.two_of`, `Threads.wait` and `Threads.wake`, and
+/// `two_weak` is `Threads.two_of` too: a theorem that reaches it is stated over
+/// `Threads.Prog.valueWeak`, one that reaches `two` or neither over `Threads.Prog.value`, and
+/// one that reaches both is refused (decision D46).
 #[test]
 fn atomics_are_programs_over_shared_memory() {
     let fixture = atomics_fixture("atomics", ATOMICS);
-    let cases: [(&str, &[&str]); 26] = [
+    let cases: [(&str, &[&str]); 27] = [
         // A trait's provided bodies at the implementor `Real`, the required `kind` they call
         // resolved to `Real`'s.
         ("poke_twice", &["atomics.Real.Kernel.poke k word"]),
@@ -4069,6 +4105,11 @@ fn atomics_are_programs_over_shared_memory() {
         // stand-ins allow: early returns from the loop's nested matches.
         ("parks_real", &["Threads.two_of schedule"]),
         ("parks_once", &["Threads.two_of"]),
+        // `two_weak` is `two`'s program; its theorem is stated in the weak world.
+        (
+            "weak_message_is_passed",
+            &["Threads.two_of schedule", "(atomics.weak_message_is_passed schedule).valueWeak = Result.ok true"],
+        ),
         // A tail two arms share reads the binding of the arm around them: the binding stays,
         // though only the tail reads it.
         ("tail_reads_binding", &["let old := v0", "atomics.tail_reads_binding.loop_0.at_2 n old"]),
@@ -4111,9 +4152,28 @@ fn atomics_are_programs_over_shared_memory() {
     assert!(!out.text.contains("let _ ←"), "the arm's second test is left in the model:\n{}", out.text);
     golden_from(&fixture, "atomics", "or_pattern_tail");
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    for name in ["two_adds_make_two", "adds_until_done", "pokes_count", "parks_once"] {
+    for name in ["two_adds_make_two", "adds_until_done", "pokes_count", "parks_once", "weak_message_is_passed"] {
         let theorem = emitted_from(&fixture, "atomics", name);
         assert_eq!(theorem.statement, Some(format!("atomics.{name}.spec.statement")));
+    }
+    // A theorem that reaches `two`, or no runner, is stated in the sequentially consistent
+    // world; neither says `valueWeak`.
+    for name in ["parks_once", "two_adds_make_two"] {
+        let theorem = emitted_from(&fixture, "atomics", name);
+        assert!(theorem.text.contains(".value = Result.ok true"), "{}", theorem.text);
+        assert!(!theorem.text.contains("valueWeak"), "{}", theorem.text);
+    }
+    // A theorem that reaches `two` itself and `two_weak` through a callee is refused, by name.
+    let db = db(&fixture);
+    match emit(&db, function(&db, "atomics", "both_worlds")) {
+        Err(err) => assert!(
+            err.what.contains(
+                "the `#[blaze::theorem]` `atomics::both_worlds`: it reaches both `threads::two` and \
+                 `threads::two_weak`: a theorem is stated in one memory (decision D46)"
+            ),
+            "{err}"
+        ),
+        Ok(it) => panic!("a theorem in two memories is not refused:\n{}", it.text),
     }
     // The `Ok` arm's binding is what the loop returns: no second test of the `Result` after the
     // loop, and no arm that cannot be reached.
@@ -4200,6 +4260,10 @@ fn what_shared_memory_does_not_model_is_refused_by_name() {
         (
             "pub fn f(s: &[Step]) -> u32 { let mut k = 0u32; threads::two(s, || { k += 1; }, || {}); k }\n",
             "captures by unique borrow",
+        ),
+        (
+            "pub fn f(s: &[Step]) -> u32 { let mut k = 0u32; threads::two_weak(s, || { k += 1; }, || {}); k }\n",
+            "a closure given to `blaze_core::world::threads::two_weak` that captures by unique borrow",
         ),
     ];
     let mut wrong = Vec::new();

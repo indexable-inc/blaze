@@ -490,8 +490,12 @@ impl Input {
 
 #[derive(Debug)]
 pub enum TimeError {
-    /// The history has no build that ended or whose daemon died.
-    NoBuild,
+    /// The history has no build that ended or whose daemon died; `capped`, what its manifest
+    /// says the cap retired ([`crate::history::manifest::CappedBuilds`]), so the message says
+    /// why: retired by the cap, or none ran. Never an empty answer about "the last build".
+    NoBuild {
+        capped: Option<crate::history::manifest::CappedBuilds>,
+    },
     /// The build has no switch and no span.
     Empty {
         build: u64,
@@ -558,8 +562,20 @@ pub struct OfProcess {
 impl fmt::Display for TimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TimeError::NoBuild => f.write_str(
-                "the history has no build that ended or whose daemon died: name one with --build",
+            TimeError::NoBuild { capped: Some(capped) } => write!(
+                f,
+                "the history holds no build that ended or whose daemon died: its cap retired \
+                 builds through build {} (at flush {}) and the builds it keeps (every running \
+                 one and the last {} finished) hold none that ended; name a running build with \
+                 --build, or set {} higher to keep more",
+                capped.through,
+                capped.flush,
+                crate::history::KEEP_BUILDS,
+                crate::history::CAP_VAR,
+            ),
+            TimeError::NoBuild { capped: None } => f.write_str(
+                "the history holds no build that ended or whose daemon died, and its cap retired \
+                 none: no build has finished here yet; name a running build with --build",
             ),
             TimeError::Empty { build } => {
                 write!(f, "build {build} has no switch and no span in the history")
