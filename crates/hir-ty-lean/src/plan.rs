@@ -804,6 +804,30 @@ fn conclude_with(plan: &Plan, ran: &[Ran], #[cfg(test)] plant: Plant) -> Result<
     let models = plant != Plant::NoModelCompile;
     #[cfg(not(test))]
     let models = true;
+    // A module of blaze's own library that Lean did not accept is blaze's bug, whatever needed
+    // it and whatever else went wrong: it is said before any theorem's verdict, by the first
+    // such module in the plan's order. A theorem whose model is broken would otherwise hide
+    // the library module its proof file alone imports, and the next crate of the check would
+    // give that module to Lean again.
+    for (step, ran) in plan.steps.iter().zip(ran) {
+        if step.kind != Kind::Library {
+            continue;
+        }
+        match ran {
+            Ran::Accepted(_) | Ran::NotRun => {}
+            // clone: error path, once
+            Ran::Rejected(output) => {
+                return Err(PlanError::Library { module: step.module.clone(), output: output.clone() });
+            }
+            Ran::TimedOut => {
+                // clone: error path, once
+                return Err(PlanError::Library {
+                    module: step.module.clone(),
+                    output: "Lean did not finish it by its deadline".to_owned(),
+                });
+            }
+        }
+    }
     let mut verdicts = Vec::with_capacity(plan.theorems.len());
     'theorems: for theorem in &plan.theorems {
         let open = |why: Why| Verdict::Open {
@@ -820,16 +844,6 @@ fn conclude_with(plan: &Plan, ran: &[Ran], #[cfg(test)] plant: Plant) -> Result<
                 let step = &plan.steps[at];
                 match &ran[at] {
                     Ran::Accepted(_) => {}
-                    // clone: error path, once
-                    Ran::Rejected(output) if step.kind == Kind::Library => {
-                        return Err(PlanError::Library { module: step.module.clone(), output: output.clone() });
-                    }
-                    Ran::TimedOut if step.kind == Kind::Library => {
-                        return Err(PlanError::Library {
-                            module: step.module.clone(),
-                            output: "Lean did not finish it by its deadline".to_owned(),
-                        });
-                    }
                     Ran::Rejected(output) => {
                         let (at, error) = first_error(output)
                             .unwrap_or_else(|| (step.file(), output.trim_end().to_owned()));
@@ -872,18 +886,6 @@ fn conclude_with(plan: &Plan, ran: &[Ran], #[cfg(test)] plant: Plant) -> Result<
                 Ran::Accepted(_) => continue,
                 Ran::NotRun => continue,
                 // clone: Lean's words, given to each theorem the module holds up
-                Ran::Rejected(output) if step.kind == Kind::Library => {
-                    return Err(PlanError::Library {
-                        module: step.module.clone(),
-                        output: output.clone(),
-                    });
-                }
-                Ran::TimedOut if step.kind == Kind::Library => {
-                    return Err(PlanError::Library {
-                        module: step.module.clone(),
-                        output: "Lean did not finish it by its deadline".to_owned(),
-                    });
-                }
                 Ran::Rejected(output) => Why::Rejected {
                     kind: step.kind,
                     module: step.module.clone(),
@@ -931,7 +933,7 @@ fn conclude_with(plan: &Plan, ran: &[Ran], #[cfg(test)] plant: Plant) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::Shape;
+    use crate::translate::{Shape, Worlds};
 
     fn module(function: &str, statement: bool, imports: Vec<Emitted>, body: &str) -> Emitted {
         let name = function.replace("::", ".");
@@ -947,7 +949,7 @@ mod tests {
             name,
             text,
             clauses: Vec::new(),
-            shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+            shape: Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false },
             imports,
         }
     }
@@ -1176,6 +1178,23 @@ mod tests {
         assert!(matches!(&verdicts[0], Verdict::Open { why: Why::TimedOut { kind: Kind::Model, .. }, .. }));
         ran[0] = Ran::Rejected("Blaze/Result.lean:1:0: error".to_owned());
         assert!(matches!(conclude(&plan, &ran), Err(PlanError::Library { module, .. }) if module == LIBRARY[0].0));
+    }
+
+    /// A library module Lean refuses stops the check whatever needed it: here a broken model
+    /// is the first thing wrong with the one theorem, and the refused module is one no step
+    /// of that theorem's model needs (the last of the library). Before, the theorem was said
+    /// `ModelBroken`, the library module's refusal was lost, and a second crate of the same
+    /// check gave the module to Lean again.
+    #[test]
+    fn a_refused_library_module_stops_the_check_beside_a_broken_model() {
+        let (theorems, proofs) = two("def k.m.a := true\n");
+        let plan = planned(&theorems, &proofs, Plant::None);
+        let mut ran = vec![Ran::Accepted(String::new()); plan.steps.len()];
+        let (model, _) = step(&plan, "BlazeModel.k.m.a");
+        ran[model] = Ran::Rejected("BlazeModel/k/m/a.lean:3:0: error".to_owned());
+        let last = LIBRARY[LIBRARY.len() - 1].0;
+        ran[step(&plan, last).0] = Ran::Rejected("its own error".to_owned());
+        assert!(matches!(conclude(&plan, &ran), Err(PlanError::Library { module, .. }) if module == last));
     }
     /// A stand-in for Lean over `wanted`, in order: a step whose needs were not all accepted
     /// is not run; `refused` is refused with `output`; a check prints its theorem's axioms.

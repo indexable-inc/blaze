@@ -225,6 +225,18 @@ impl ImageStore for Memory {
             }
         }
     }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn crate::deps::PageSource>>, String> {
+        // A test's store holds each value whole: no part of one is read alone.
+        Ok(crate::deps::whole_pages(self.get(key)?, std::alloc::Global))
+    }
+
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        // A test's store runs a batch in order on its own thread: the same result.
+        (0..count).for_each(task);
+    }
 }
 
 pub(super) fn all(db: &TestDB) -> Vec<Crate> {
@@ -1810,6 +1822,11 @@ impl ImageStore for Threads {
 
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
         self.0.put(key, image)
+    }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn crate::deps::PageSource>>, String> {
+        self.0.pages(key)
     }
 
     // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
@@ -4624,7 +4641,7 @@ fn no_field_of_served_stored_or_key_walk_is_a_crate_id() {
         keys.len() + lists.iter().map(|it| it.len()).sum::<usize>() + withdrawn.len() + stored.lock().len()
     }
     fn stored_of(it: &Stored) -> usize {
-        let Stored { written, refused, filed, families: _ } = it;
+        let Stored { written, refused, filed } = it;
         let written: &Vec<Key> = written;
         let refused: &Vec<(Key, Refused)> = refused;
         let filed: &HashMap<Key, ContentId, Global> = filed;

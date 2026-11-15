@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-120 theorems: 107 in `lean`, 13 in `lean/analysis`.
+135 theorems: 122 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1036,6 +1036,45 @@ theorem queue.offer_keeps_wf.spec.proof : queue.offer_keeps_wf.spec.statement
 theorem queue.take_keeps_wf.spec.proof : queue.take_keeps_wf.spec.statement
 ```
 
+**`derives.tagged_eq_is_its_id.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function tagged_eq_is_its_id holds of its model: a struct with a PhantomData field is equal, copied and cloned by its other fields; the marker is one value.
+
+```lean
+theorem derives.tagged_eq_is_its_id.spec.proof : derives.tagged_eq_is_its_id.spec.statement
+```
+
+**`derives.point_and_tag_eq.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function point_and_tag_eq holds of its model: two types whose names end alike have each their own derived equality (their instances are named apart) and one model uses both.
+
+```lean
+theorem derives.point_and_tag_eq.spec.proof : derives.point_and_tag_eq.spec.statement
+```
+
+**`orders.pair_order_is_lexicographic.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function pair_order_is_lexicographic holds of its model: the derived order of a struct of two fields compares the first field, then the second.
+
+```lean
+theorem orders.pair_order_is_lexicographic.spec.proof :
+    orders.pair_order_is_lexicographic.spec.statement
+```
+
+**`orders.key_order_is_by_variant_then_fields.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function key_order_is_by_variant_then_fields holds of its model: the derived order of an enum compares discriminants (a signed repr's too), then the fields of one variant in order.
+
+```lean
+theorem orders.key_order_is_by_variant_then_fields.spec.proof :
+    orders.key_order_is_by_variant_then_fields.spec.statement
+```
+
+**`orders.id_order_is_by_bytes.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function id_order_is_by_bytes holds of its model: the derived order of a struct over an array is the array's lexicographic order.
+
+```lean
+theorem orders.id_order_is_by_bytes.spec.proof : orders.id_order_is_by_bytes.spec.statement
+```
+
+**`consts.constants_are_their_values.spec.proof`** (`BlazeModel.consts.proved`, `lean`): The statement blaze generates from the fixture's theorem function constants_are_their_values holds of its model: a trait's associated constant at its implementor (its own value or the trait's default), an inherent constant, an anonymous constant and an array length given by an expression are the values blaze's evaluator gives.
+
+```lean
+theorem consts.constants_are_their_values.spec.proof :
+    consts.constants_are_their_values.spec.statement
+```
+
 **`derives.waited_eq_is_the_values.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function waited_eq_is_the_values holds of its model: the derived ==, != and clone of a generic enum at its instances (Waited<()>, Waited<u32>, Waited<Point>) are the values' own.
 
 ```lean
@@ -1053,6 +1092,25 @@ theorem blaze_shapes.hunts_find_the_hit.spec.proof : blaze_shapes.hunts_find_the
 
 ```lean
 theorem traits.provided_agree.spec.proof : traits.provided_agree.spec.statement
+```
+
+**`ranges.contains_at_the_ends.spec.proof`** (`BlazeModel.ranges.proved`, `lean`): The statement blaze generates from the fixture's theorem function contains_at_the_ends holds of its model: a..b holds a exactly when a < b and never holds b; a..=b holds a and b exactly when a <= b; start and end read back what the range was made of.
+
+```lean
+theorem ranges.contains_at_the_ends.spec.proof : ranges.contains_at_the_ends.spec.statement
+```
+
+**`ranges.a_subslice_is_its_part.spec.proof`** (`BlazeModel.ranges.proved`, `lean`): The statement blaze generates from the fixture's theorem function a_subslice_is_its_part holds of its model: for every Vec and a < b <= len, &v[a..b] does not panic, has b - a elements, and its first is v[a].
+
+```lean
+theorem ranges.a_subslice_is_its_part.spec.proof : ranges.a_subslice_is_its_part.spec.statement
+```
+
+**`defaults.derived_default_is_each_fields.spec.proof`** (`BlazeModel.defaults.proved`, `lean`): The statement blaze generates from the fixture's theorem function derived_default_is_each_fields holds of its model: a derived Default of a struct is each field's default (a hand-written one's own value among them), an enum's is its #[default] variant, and an array's holds its element's default in each place.
+
+```lean
+theorem defaults.derived_default_is_each_fields.spec.proof :
+    defaults.derived_default_is_each_fields.spec.statement
 ```
 
 ## V16
@@ -1129,6 +1187,12 @@ theorem blaze_core.wait.parking.no_unpark_is_lost.spec.proof :
 theorem atomics.two_adds_make_two.spec.proof : atomics.two_adds_make_two.spec.statement
 ```
 
+**`atomics.parks_once.spec.proof`** (`BlazeModel.atomics.parks`, `lean`): The statement blaze generates from the fixture's theorem function parks_once holds of the park and unpark it translates (an AtomicU32 token word: two compare-exchanges, a futex wait loop, a swap and a wake): for every schedule of the two threads and every pick of the world's, no run ends with the unpark returned and the park asleep; where both returned the token was taken and the word is empty, or a timed park left first and the token is still there; and an untimed park returns only with a token. Proved over the program points the translator names (park.at_n, park_loop.loop_0.at_n, unpark.at_1), with no model text copied.
+
+```lean
+theorem atomics.parks_once.spec.proof : atomics.parks_once.spec.statement
+```
+
 **`atomics.adds_until_done.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function adds_until_done holds of its model, a program over shared cells: a compare-exchange loop that returns its Ok value returns what the cell held and leaves the sum.
 
 ```lean
@@ -1139,4 +1203,39 @@ theorem atomics.adds_until_done.spec.proof : atomics.adds_until_done.spec.statem
 
 ```lean
 theorem atomics.pokes_count.spec.proof : atomics.pokes_count.spec.statement
+```
+
+**`blaze_core.wait.parking.a_park_left_alone_returns_or_sleeps.spec.proof`** (`BlazeCore.Wait.ParkingTime`, `lean`): The statement blaze generates from the theorem function a_park_left_alone_returns_or_sleeps holds of the models of the real park and unpark on the kernel whose wait has a deadline and the world's clock: after every schedule of the two over one word (empty or holding a token), every script of clock readings, every choice of the kernel's and every deadline or none, eight more steps of the park alone with the kernel quiet leave it returned or asleep, never running (31 reachable states; the longest run alone is six steps).
+
+```lean
+theorem blaze_core.wait.parking.a_park_left_alone_returns_or_sleeps.spec.proof :
+    blaze_core.wait.parking.a_park_left_alone_returns_or_sleeps.spec.statement
+```
+
+**`blaze_core.wait.parking.a_park_keeps_its_deadline.spec.proof`** (`BlazeCore.Wait.ParkingDeadline`, `lean`): The statement blaze generates from the theorem function a_park_keeps_its_deadline holds of the models of the real park and unpark on the kernel whose wait has a deadline and the world's clock: for every schedule, every script of clock readings, every choice of the kernel's and every deadline or none, a park that says its deadline passed has one and the clock when the schedule ends is at or past it, and a park asleep when the schedule ends has a deadline the clock has not reached.
+
+```lean
+theorem blaze_core.wait.parking.a_park_keeps_its_deadline.spec.proof :
+    blaze_core.wait.parking.a_park_keeps_its_deadline.spec.statement
+```
+
+**`blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.proof`** (`BlazeCore.Wait.ParkingToken`, `lean`): The statement blaze generates from the theorem function a_park_is_ready_exactly_for_a_token holds of the models of the real park and unpark on the timed kernel and the world's clock: for every schedule, script of clock readings, choice of the kernel's and deadline, a token waiting as the park begins is taken (the park is never asleep, and where it returned it said Ready), and a park with no token and no step of the unpark's never says Ready.
+
+```lean
+theorem blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.proof :
+    blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.statement
+```
+
+**`blaze_core.handoff.no_hand_back_is_missed.spec.proof`** (`BlazeCore.Handoff`, `lean`): The statement blaze generates from the theorem function no_hand_back_is_missed holds of the models of the real Wake::wake and Wake::drain in the weak-memory world (Prog.valueWeak): a sender's relaxed store of its slot and its wake, the driver's drain and its relaxed read of the slot, as two threads on every schedule and with every value each read may see under its ordering: where both returned, the driver saw the slot or the sender was told to wake it. The first theorem of blaze's code against weak memory.
+
+```lean
+theorem blaze_core.handoff.no_hand_back_is_missed.spec.proof :
+    blaze_core.handoff.no_hand_back_is_missed.spec.statement
+```
+
+**`BlazeCore.HandoffModel.no_hand_back_is_missed`** (`BlazeCore.HandoffModel`, `lean`): The same of a hand-written model of the two threads whose swaps' ordering is a parameter, at AcqRel; with Relaxed the file has the run, by evaluation, in which a hand-back is missed (the control).
+
+```lean
+theorem no_hand_back_is_missed (schedule : List Step) (flagged : Bool) :
+    (hands .AcqRel schedule flagged).valueWeak = .ok true
 ```

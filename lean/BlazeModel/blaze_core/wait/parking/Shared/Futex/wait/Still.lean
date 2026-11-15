@@ -11,10 +11,9 @@ import BlazeModel.blaze_core.wait.parking.Still.type
 open Blaze
 set_option linter.unusedVariables false
 
-def blaze_core.wait.parking.Shared.Futex.wait.Still (self : blaze_core.wait.parking.Shared) (t0 : Str) (word : core.sync.atomic.Atomic .U32) (expected : U32) (deadline : Option blaze_core.wait.retry.Deadline) (t1 : blaze_core.wait.parking.Still) : Threads.Prog (core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError) := do
-  let t2 ← Threads.wait word expected (core.option.Option.is_some deadline)
-  let t3 :=
-    match t2 with
+def blaze_core.wait.parking.Shared.Futex.wait.Still.at_1 (t0 : Threads.Woke) : Threads.Prog (core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError) :=
+  let t1 :=
+    match t0 with
     | Threads.Woke.Woken =>
       (blaze_core.wait.retry.Waited.unit.Ready () : blaze_core.wait.retry.Waited.unit)
     | Threads.Woke.Changed =>
@@ -23,4 +22,8 @@ def blaze_core.wait.parking.Shared.Futex.wait.Still (self : blaze_core.wait.park
       (blaze_core.wait.retry.Waited.unit.Ready () : blaze_core.wait.retry.Waited.unit)
     | Threads.Woke.TimedOut =>
       (blaze_core.wait.retry.Waited.unit.Deadline : blaze_core.wait.retry.Waited.unit)
-  Threads.Prog.done (Result.ok (core.result.Result.Ok t3 : core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError))
+  Threads.Prog.done (Result.ok (core.result.Result.Ok t1 : core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError))
+
+def blaze_core.wait.parking.Shared.Futex.wait.Still (self : blaze_core.wait.parking.Shared) (t2 : Str) (word : core.sync.atomic.Atomic .U32) (expected : U32) (deadline : Option blaze_core.wait.retry.Deadline) (t3 : blaze_core.wait.parking.Still) : Threads.Prog (core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError) := do
+  let t0 ← Threads.wait word expected (core.option.Option.is_some deadline)
+  blaze_core.wait.parking.Shared.Futex.wait.Still.at_1 t0

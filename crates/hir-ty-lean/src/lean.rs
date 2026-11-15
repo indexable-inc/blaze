@@ -150,8 +150,12 @@ pub enum Decl {
     Theorem { name: String, statement: String, proof: String },
     /// `#print axioms name`.
     PrintAxioms(String),
-    /// `deriving instance DecidableEq for name`: Lean's `=` of the type decided, the model of
-    /// its derived `==`.
+    /// `deriving instance DecidableEq for name` inside `namespace name`: Lean's `=` of the
+    /// type decided, the model of its derived `==`. In the type's own namespace the instance
+    /// and its auxiliary definitions are named by the whole type (`name.instDecidableEq..`):
+    /// at the top level Lean names them by the last segment alone, and two impl modules of
+    /// types alike in it (`derives.Point`, `derives.Tagged.Point`) that do not import each
+    /// other then declare one name twice, so no module can import both.
     DeriveDecidableEq(String),
     /// `opaque name (params) : ty`: a constant of that type with no definition the kernel
     /// unfolds ([`crate::opaque_module`]).
@@ -185,18 +189,20 @@ pub fn infix(op: Infix, left: Term, right: Term) -> Term {
     Term::Infix(op, Box::new(left), Box::new(right))
 }
 
-/// Lean's keywords and the command and term words a name must not be read as.
-const KEYWORDS: &[&str] = &[
-    "abbrev", "at", "attribute", "axiom", "break", "by", "calc", "catch", "class", "continue",
-    "deriving", "def", "do", "else", "end", "example", "export", "extends", "finally", "for",
-    "forall", "from", "fun", "have", "if", "import", "in", "include", "inductive", "infix",
-    "infixl", "infixr", "instance", "let", "local", "macro", "match", "mut", "mutual",
-    "namespace", "nomatch", "nofun", "noncomputable", "notation", "omit", "opaque", "open",
-    "partial", "postfix", "prefix", "private", "protected", "public", "rec", "return", "scoped",
-    "section", "set_option", "show", "structure", "suffices", "syntax", "then", "theorem",
-    "try", "unless", "universe", "unsafe", "using", "variable", "where", "while", "with",
-    "Prop", "Sort", "Type",
-];
+/// Lean's tokens that read as identifiers, one a line: Lean's own list, of the environment the
+/// models are compiled in. `lean/Blaze/Tests/Keywords.lean` reads the same file and fails where
+/// it is not what Lean says, so a keyword of a new Lean release or of a library module's syntax
+/// is added there and never found in a model.
+const KEYWORDS: &str = include_str!("../../../lean/Blaze/Tests/keywords.txt");
+
+/// Words that are no token of Lean's and still no name where the translator writes one: `let
+/// rec` begins a recursive definition, so a local named `rec` is escaped.
+const CONTEXTUAL: &[&str] = &["rec"];
+
+/// Whether Lean reads `text` as a keyword where a name is written.
+fn keyword(text: &str) -> bool {
+    CONTEXTUAL.contains(&text) || KEYWORDS.lines().any(|it| it == text)
+}
 
 /// `text` as one component of a Lean name.
 fn component(text: &str) -> String {
@@ -209,7 +215,7 @@ fn component(text: &str) -> String {
         }
         None => false,
     };
-    if plain && !KEYWORDS.contains(&text) {
+    if plain && !keyword(text) {
         return text.to_owned();
     }
     // `»` cannot be written inside `«»`; a Rust name never has one.
@@ -480,7 +486,9 @@ impl Printer {
             ),
             Decl::PrintAxioms(name) => self.line(0, &format!("#print axioms {}", ident(name))),
             Decl::DeriveDecidableEq(name) => {
-                self.line(0, &format!("deriving instance DecidableEq for {}", ident(name)))
+                self.line(0, &format!("namespace {}", ident(name)));
+                self.line(0, &format!("deriving instance DecidableEq for {}", ident(name)));
+                self.line(0, &format!("end {}", ident(name)))
             }
             Decl::Opaque { name, params, ty } => {
                 let params = binders(params);
@@ -529,4 +537,23 @@ pub(crate) fn lines(term: &Term) -> String {
     let mut printer = Printer { out: Vec::new() };
     printer.term(0, term);
     printer.out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ident;
+
+    /// A Rust name Lean reads as a keyword is escaped, and a name it does not is left alone:
+    /// `until`, `exists` and `meta` are tokens of Lean's, `rec` begins `let rec`, and a tactic's
+    /// name (`exact`) is no token.
+    #[test]
+    fn a_name_lean_reads_as_a_keyword_is_escaped() {
+        for word in ["until", "exists", "meta", "repeat", "at", "rec", "Type"] {
+            assert_eq!(ident(word), format!("«{word}»"));
+        }
+        for word in ["exact", "rfl", "word", "untilled", "x'"] {
+            assert_eq!(ident(word), word);
+        }
+        assert_eq!(ident("retry.at.until"), "retry.«at».«until»");
+    }
 }

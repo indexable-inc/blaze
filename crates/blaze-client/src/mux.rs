@@ -422,6 +422,7 @@ pub fn named(request: &Request) -> &'static str {
         Request::ClientRows { .. } => "ClientRows",
         Request::Diagnostics { .. } => "Diagnostics",
         Request::Prove { .. } => "Prove",
+        Request::Query { .. } => "Query",
     }
 }
 

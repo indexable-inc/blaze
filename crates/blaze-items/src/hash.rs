@@ -19,7 +19,7 @@
 //! strongly connected component of the graph of refs are ordered by their content, each ref
 //! inside it is the position of its target, and each member's hash is the unit's and its
 //! position. Unlike Unison, what validates a type-check result names each ref by its target's
-//! key as well (D46): the signature hash ([`Graph::keyed`]: from outside a component by key and
+//! key as well (D51): the signature hash ([`Graph::keyed`]: from outside a component by key and
 //! hash, inside it by position and key) and a fact's form ([`named_filled`]). Rust's types are
 //! nominal: `struct Meters(u32)` and `struct Feet(u32)` have one hash and are two types, so
 //! `f(Meters(1))` type-checks against `fn f(_: Meters)` and not against `fn f(_: Feet)`. The
@@ -58,7 +58,7 @@ use crate::{
     form, key,
 };
 
-// Version 2 of the signature hash: a ref names its target by key as well as by hash (D46), so
+// Version 2 of the signature hash: a ref names its target by key as well as by hash (D51), so
 // no row kept under a name-free signature hash is found by one. The interface, layout, code and
 // deep hashes are name-free, as in version 1.
 pub const INTERFACE_DOMAIN: &str = "blaze v2 interface hash 1";
@@ -375,7 +375,7 @@ impl Graph {
     }
 
     /// Whether a ref in this graph names its target by key as well as by hash: the signature
-    /// graph, what a body's identity names an item by (D46), so that two items alike but for
+    /// graph, what a body's identity names an item by (D51), so that two items alike but for
     /// their names (`struct Meters(u32)` and `struct Feet(u32)`) are two targets to whatever
     /// type-checks against one of them. The interface graph is what codegen reads beside an
     /// item's key (a callee's instance, an ADT's identity, a template's code), where a shape is
@@ -460,7 +460,7 @@ fn code_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
 enum Names {
     /// By hash alone: a code hash, what a template is kept under (what it does).
     Free,
-    /// By key and hash (D46): a fact's value, which a body's stored type check is checked by.
+    /// By key and hash (D51): a fact's value, which a body's stored type check is checked by.
     Keyed,
 }
 
@@ -478,7 +478,7 @@ pub(crate) fn filled(
 /// A form's digest with each ref filled by its key and interface hash: what a fact that spells
 /// a form (a closure's captures, a field's type, a constant's type) stands for. A body that read
 /// the fact type-checked against the items it names, so another item of the same shape in one's
-/// place is another value (D46); what the body reads inside one of them is a fact of its own.
+/// place is another value (D51); what the body reads inside one of them is a fact of its own.
 pub(crate) fn named_filled(
     db: &Db,
     domain: &'static str,
@@ -510,7 +510,7 @@ fn filled_into(
     Ok(h.finish())
 }
 
-/// A ref to `to` whose hash is `hash`, named by `to`'s key as well (D46): a hash alone says
+/// A ref to `to` whose hash is `hash`, named by `to`'s key as well (D51): a hash alone says
 /// what the target is, not which item it is, and two nominal types of one shape have one
 /// hash. A renamed or moved item keeps its own hashes; every hash that names it moves.
 fn keyed(db: &Db, to: ItemId, hash: ContentId) -> ContentId {

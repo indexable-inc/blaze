@@ -4802,6 +4802,10 @@ pub struct OpenSpan {
     pub build: u32,
     /// A daemon `task` span's plane node ([`crate::span::col::Node`]); `None` for any other.
     pub node: Option<u64>,
+    /// Its fields that fill no column, as `name=value` text ([`crate::span::col::Fields`]):
+    /// the loop's `piece` and `completion`, which a stuck line names.
+    /// Shared with the span's own record, which holds it on the global heap.
+    pub fields: Option<std::sync::Arc<str, std::alloc::Global>>,
 }
 
 /// A live thread and the spans it is inside now, outermost first.
@@ -4851,6 +4855,7 @@ pub fn threads_now() -> Vec<ThreadNow> {
                     owner: opened.said().value::<span::col::Owner>(),
                     build: opened.build,
                     node: opened.said().value::<span::col::Node>(),
+                    fields: opened.said().value::<span::col::Fields>().and_then(span::Name::text),
                 })
             })
             // alloc: a dump, on demand

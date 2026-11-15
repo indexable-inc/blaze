@@ -77,7 +77,7 @@ fn g(s: &T) -> u32 { h(s) }
     );
     // A renamed item keeps its own hashes, and every name-free hash naming it (interface, code,
     // deep: what codegen keys a template by and what inlines) stays; every signature hash that
-    // names it moves (D46), as that is what a body's stored type check is checked by: `h` and
+    // names it moves (D51), as that is what a body's stored type check is checked by: `h` and
     // `g` name `T` in place of `S`, and `g` calls `h`.
     assert_eq!(of(&db, "T"), s);
     assert_eq!(of(&db, "h"), f);

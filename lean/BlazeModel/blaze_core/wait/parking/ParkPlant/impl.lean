@@ -6,4 +6,6 @@ import BlazeModel.blaze_core.wait.parking.ParkPlant.type
 open Blaze
 set_option linter.unusedVariables false
 
+namespace blaze_core.wait.parking.ParkPlant
 deriving instance DecidableEq for blaze_core.wait.parking.ParkPlant
+end blaze_core.wait.parking.ParkPlant

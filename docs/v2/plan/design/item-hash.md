@@ -27,7 +27,7 @@ Prior art, and what is taken from each:
 
 | prior art | taken |
 |---|---|
-| Unison: a definition is the hash of its AST, names are metadata | the identity hashes content with no name of the item itself and no positions; a reference is by its target's key and hash (D46), not by hash alone, since Rust's types are nominal |
+| Unison: a definition is the hash of its AST, names are metadata | the identity hashes content with no name of the item itself and no positions; a reference is by its target's key and hash (D51), not by hash alone, since Rust's types are nominal |
 | Build Systems à la Carte: constructive traces (Shake's cloud, Bazel's action cache) | dynamic dependencies (which impls a solve read) are a trace stored beside the key: a shape lists the facts read, the answer is filed under their values |
 | Bazel, Nix: actions keyed by declared inputs, outputs by content | the a-priori part of the key is everything a body can read that is known before running it |
 | rustc: `DefPathHash`, `hir_owner` hashes, the SVH | `ItemKey` is our `DefPathHash`; the identity is a `hir_owner` hash with resolved references in place of `DefPathHash`es, so it is stable across sessions as rustc's is not across crate edits |
@@ -43,7 +43,7 @@ Prior art, and what is taken from each:
   visibility, a trait's items, layout-affecting attributes (`repr`, `align`, `packed`,
   `transparent`, `non_exhaustive`), visibility as "public, crate, or the module n levels up",
   plus what a body leaks (section 4). Computed by `blaze_items::hash::interface_hash`.
-  What validates a type-check result names each target by key as well as by hash (D46): the
+  What validates a type-check result names each target by key as well as by hash (D51): the
   signature hash, and a fact's value that spells a form (a field's type, a closure's captures, a
   constant's type). `struct Meters(u32)` and `struct Feet(u32)` have one hash, so a hash alone
   made `fn f(m: Meters)` and `fn f(f: Feet)` one signature, and a caller's stored inference and

@@ -868,8 +868,15 @@ pub(crate) fn store(
     // image: the next front end reads the crate's impls from them and keys none. A crate
     // read from tables already writes nothing. One whose tables do not encode has none kept,
     // and every front end maintains its impls from its def map: said here, naming it.
-    let untabled = hir_ty::method_resolution::frozen::store(db, &imaged, images)
-        .map_err(|why| ApiError::new(why, Some(root.to_owned())))?; // alloc: error path
+    let untabled = hir_ty::method_resolution::frozen::store(db, &imaged, images).map_err(|why| {
+        ApiError::new(
+            format!(
+                "the impl tables (`hir_ty::method_resolution::frozen`) of the dependency crates \
+                 imaged, written for the build of {root}: {why}"
+            ),
+            Some(root.to_owned()),
+        )
+    })?;
     for (krate, why) in &untabled {
         tracing::warn!(
             target: "blaze",
@@ -884,8 +891,15 @@ pub(crate) fn store(
     // whose blocks declare one. One read from its record already writes nothing. One whose
     // record does not encode has none kept, and every build finds its kept roots from the
     // bodies whose text can say one: said here, naming it.
-    let unrecorded = hir_ty_codegen::v2::kept_record::store(db, &imaged, images)
-        .map_err(|why| ApiError::new(why, Some(root.to_owned())))?; // alloc: error path
+    let unrecorded = hir_ty_codegen::v2::kept_record::store(db, &imaged, images).map_err(|why| {
+        ApiError::new(
+            format!(
+                "the kept roots (`hir_ty_codegen::v2::kept_record`) of the dependency crates \
+                 imaged, written for the build of {root}: {why}"
+            ),
+            Some(root.to_owned()),
+        )
+    })?;
     for (krate, why) in &unrecorded {
         tracing::warn!(
             target: "blaze",
@@ -895,48 +909,35 @@ pub(crate) fn store(
         );
     }
     stage("the kept roots of a dependency crate");
-    // Each found record, now that what was put under the filed key is known: the image's
-    // families as `hir_def::deps::store` wrote them, and the impl tables unless they did not
-    // encode. A record that will not encode is a bug of the lowering's (a path not under the
-    // package): said, naming the crate, and the build's store stops (no record half-said).
-    if let Some(stored) = &stored {
-        use hir_def::deps::found::{Found, family};
+    // Each found record: of what its plan key covers alone (`hir_def::deps::found`), so every
+    // home that writes it writes the same bytes; the surface is left out of a crate a build
+    // script's run applies to ([`Lowered::found_surface`]). A record that will not encode is a
+    // bug of the lowering's (a path not under the package), and one the store refuses is a
+    // key that misses an input (rule keys-cover-every-input): each said naming the record's
+    // kind, its crate and its writer, and the build's store stops (no record half-said).
+    if !found_keys.is_empty() {
+        use hir_def::deps::found::{Found, LAYOUT};
+        let front = front_end()?;
         for &(krate, key) in &found_keys {
-            let Some(&filed) = stored.filed.get(&krate.key(db)) else { continue };
-            let tables = match untabled.iter().any(|(it, _)| *it == krate) {
-                true => 0,
-                false => family::IMPL_TABLES,
+            // Said only when the record is refused: the crate, its kind and its writer.
+            let named = || {
+                format!(
+                    "the found record (`hir_def::deps::found`, layout {LAYOUT}) of dependency crate {}, \
+                     under {key:?}, written by front end {front:?} for the build of {root}",
+                    krate.named(db)
+                )
             };
-            let named = || format!("{}", krate.named(db)); // alloc: error path
             let files = lowered.found_files(krate).ok_or_else(|| {
                 ApiError::new(
-                    format!("the crate {} has a plan key and no files the lowering planned", named()),
+                    format!("{}: the crate has a plan key and no files the lowering planned", named()),
                     Some(root.to_owned()),
                 )
             })?;
-            // The crate's key the serve walked, which its image was stored under: a start
-            // gives the image back under it before any query runs ([`find`]), and the first
-            // serve keeps it only while its own walk says the same key. A stored crate the
-            // serve walked no key of is a bug of the serve's: said, naming the crate.
-            let base = kept
-                .and_then(|kept| kept.served.keys.get(&krate.key(db)))
-                .copied()
-                .ok_or_else(|| {
-                    ApiError::new(
-                        format!("the crate {} was stored and the serve walked no key of it", named()),
-                        Some(root.to_owned()),
-                    )
-                })?;
-            let bytes = Found::new(base, filed, stored.families | tables, lowered.own_surface(krate), files)
+            let bytes = Found::new(lowered.found_surface(krate, Global), files)
                 .and_then(|found| found.encode())
-                .map_err(|why| {
-                    ApiError::new(
-                        format!("the found record of the crate {}: {why}", named()),
-                        Some(root.to_owned()),
-                    )
-                })?;
+                .map_err(|why| ApiError::new(format!("{}: {why}", named()), Some(root.to_owned())))?;
             ImageStore::put(images, key, bytes)
-                .map_err(|why| ApiError::new(why, Some(root.to_owned())))?;
+                .map_err(|why| ApiError::new(format!("{}: {why}", named()), Some(root.to_owned())))?;
         }
     }
     stage("the found record of a dependency crate");
@@ -1077,7 +1078,7 @@ pub(crate) fn find(lowered: &mut Lowered, store: &blaze_cas::Reader) -> Result<(
             )
         })?;
         lowered
-            .take_found(krate, found.filed(), found.base(), found.own_surface())
+            .take_found(krate, found.own_surface())
             .map_err(super::lower_error)?;
         hits += 1;
     }
@@ -1784,12 +1785,10 @@ impl hir_def::nameres::frozen::entries::Entries for Images {
 /// hold nothing. Each is a fact of the build or the mode alone, so a later serve that gave one
 /// again would move nothing; none does.
 ///
-/// And in the same commit, the image (with its impl tables and kept roots) of each crate
-/// whose found record [`find`] took, filed under the crate's key alone
-/// ([`Lowered::found_images`]): a start that will serve a crate gives its image before any
-/// query of the crate runs, where until 2026-11-14 the first serve gave it after the key walk
-/// had filled the crate's arena, and the gift's commit dropped that arena and every one above
-/// it (the restart's 3.1 s `db commit`, a guess at its share). Call [`find`] first.
+/// No crate's image is given here: a found record holds no key the image is filed under
+/// (`hir_def::deps::found`, layout 2: such a key is no function of the record's own key), so
+/// the first serve gives each image after its key walk, as before 2026-11-14
+/// (`hir_def::deps::serve_found` is the gift a start would make, given the keys).
 pub(crate) fn makers(
     lowered: &mut Lowered,
     session: &mut Session,
@@ -1808,25 +1807,7 @@ pub(crate) fn makers(
     // same fact, and nothing evaluated is dropped for it.
     let held_fact = entries::store_fact(ContentId::of("blaze-cargo entry holder", b"session images"));
     let consts_fact = consts::session_fact(mode);
-    // The images the found records name ([`find`], which runs first), each with its impl
-    // tables and kept roots ([`give_slots`]), in this same commit: before any query of the
-    // crate runs, so the first serve, whose walk keys the crate under the record's base, keeps
-    // it (`hir_def::deps::serve_found`) and makes its arena again for nothing. A crate whose
-    // image is filed by its reads is left to that serve.
-    let images = &*session.images;
-    let found = lowered.found_images(images, mode).map_err(super::lower_error)?;
     let mut edit = lowered.served_db().edit();
-    for given in &found {
-        // clone: an image's handle, once per crate given one
-        hir_def::deps::give_image(&mut edit, given.krate, given.krate_id, given.image.clone());
-    }
-    give_slots(&mut edit, &found, images, mode).map_err(|why| {
-        // alloc: error path
-        ApiError::new(
-            format!("giving the images {} found records named: {why}", found.len()),
-            None,
-        )
-    })?;
     blaze_item_hash::identity::give_build(&mut edit, build);
     edit.set_given(
         None,

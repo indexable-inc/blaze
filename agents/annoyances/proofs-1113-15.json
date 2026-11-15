@@ -1,0 +1,21 @@
+{
+ "id": "proofs-1113-15",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "hir-ty-lean, the names a model is written with (crates/hir-ty-lean/src/lean.rs)",
+ "what": "`blaze prove -p blaze-core` on tree 474bbf5f12 answered ModelBroken for `a_park_keeps_its_deadline`: `Shown.lean:34:5: error: unexpected token `until`; expected ...`. The Rust local `let until = ..` (wait/parking.rs, `Timed::wait`) was written into the model as it is, and `until` is a keyword of Lean`s. The translator escaped names by a list of 68 words typed by hand; Lean 4.35.0 with `import Blaze` has 207 tokens that read as identifiers, among them `exists`, `meta`, `repeat`, `matches`, `seal`, `recall`, `initialize`.",
+ "cost": "one round of blaze prove; and any crate with a function or local named one of the 139 missing words would have met it",
+ "cause": "the list of keywords was a copy made from memory of something Lean itself knows",
+ "whys": [
+  "a model did not compile: a local`s name was a Lean keyword",
+  "the translator`s list of keywords did not have it",
+  "the list was typed by hand, once, from memory",
+  "nothing compared the list with Lean`s own token table",
+  "a fact one tool owns was kept as a second copy in another"
+ ],
+ "class": "a hand-kept copy of a list another tool owns: it is right until the day the owner has an entry the copy lacks",
+ "prevention": "built: the list is `lean/Blaze/Tests/keywords.txt`, the translator reads it (`include_str!`), and `lean/Blaze/Tests/Keywords.lean` computes Lean`s tokens that read as identifiers from the token table of `import Blaze` and fails, printing the right list, where the file differs: a new Lean release or a library module with new syntax fails there, in the Lean gate, not in a model. `rec` (no token, but `let rec`) is the one contextual word, named in lean.rs.",
+ "workaround": "",
+ "fix": "this commit",
+ "state": "fixed"
+}

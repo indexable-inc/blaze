@@ -75,9 +75,8 @@ theorem find_two (n : Nat) (w : World) (t : U64) (x y : Asked) (hw : w.asked.val
   obtain ⟨j, hj, hjv⟩ := add_one (0 : Usize) (by rw [usize_zero]; omega)
   rw [usize_zero] at hjv
   refine ⟨j, ?_, by omega⟩
-  have hj1 : j.val.toNat = 1 := by omega
   simp [World.find, World.find.loop_0, Scalar.lt, Slice.len_val, usize_zero, Slice.index,
-    Scalar.eq, hx, hj, hjv, hj1, hy]
+    Scalar.eq, hx, hj, hjv, hy]
 
 /-! ## 3. `World::ask` of a tag not asked -/
 
@@ -138,7 +137,7 @@ theorem loop1_one (n : Nat) (w : World) (file : U64) (o : Usize) (kept : Vec Usi
 
 theorem loop0_one (n : Nat) (w : World) (file : U64) (o : Usize) (told : Told) (x : Asked)
     (u a t : Usize) (w2 w3 : World) (hw : w.asked.val = [S1 file o])
-    (hd : done told = false ∨ renames x.ask file = Result.ok false)
+    (hd : done told = false ∨ renames x.ask file = false)
     (hthere : there (n + 1) w.disk file = Result.ok true)
     (hu : unsynced (n + 1) w.disk file = Result.ok u)
     (hadd : added (n + 1) x.ask told file true = Result.ok a)
@@ -157,7 +156,7 @@ theorem loop0_one (n : Nat) (w : World) (file : U64) (o : Usize) (told : Told) (
   cases hdt : done told
   · simp [World.tell.loop_0, Scalar.lt, Slice.len_val, usize_zero, Slice.index, S1, synced_name,
       hdt, hthere, hu, hadd, hsum, hj, hjv, hc, hp, hk]
-  · have hr : renames x.ask file = Result.ok false := hd.resolve_left (by simp [hdt])
+  · have hr : renames x.ask file = false := hd.resolve_left (by simp [hdt])
     simp [World.tell.loop_0, Scalar.lt, Slice.len_val, usize_zero, Slice.index, S1, synced_name,
       hdt, hr, hthere, hu, hadd, hsum, hj, hjv, hc, hp, hk]
 
@@ -262,8 +261,7 @@ theorem allows_append (n : Nat) (w : World) (file : U64) (o : Usize) (b : Vec U8
   obtain ⟨j, hf, hj⟩ := find_two n w 2 _ _ hw (by simp [S1, u64_one, u64_two]) rfl
   obtain ⟨D, ⟨L, hl⟩⟩ := w
   simp only at hw hf; subst hw
-  have hj1 : j.val.toNat = 1 := by omega
-  cases told <;> simp [World.allows, hf, Slice.index, hj1, hj]
+  cases told <;> simp [World.allows, hf, Slice.index, hj]
 
 theorem allows_sync2 (n : Nat) (w : World) (file : U64) (o u c u' : Usize)
     (hw : w.asked.val = [S1 file o, ⟨2, Ask.Sync file, u⟩])
@@ -273,14 +271,13 @@ theorem allows_sync2 (n : Nat) (w : World) (file : U64) (o u c u' : Usize)
   obtain ⟨j, hf, hj⟩ := find_two n w 2 _ _ hw (by simp [S1, u64_one, u64_two]) rfl
   obtain ⟨D, ⟨L, hl⟩⟩ := w
   simp only at hw hf hu; subst hw
-  have hj1 : j.val.toNat = 1 := by omega
   by_cases h1 : u.val ≤ c.val
   · by_cases h2 : c.val ≤ u'.val
-    · exact ⟨true, by simp [World.allows, hf, Slice.index, hj1, hj, Scalar.le, h1, h2, hu],
+    · exact ⟨true, by simp [World.allows, hf, Slice.index, hj, Scalar.le, h1, h2, hu],
         fun _ => ⟨h1, h2⟩⟩
-    · exact ⟨false, by simp [World.allows, hf, Slice.index, hj1, hj, Scalar.le, h1, h2, hu],
+    · exact ⟨false, by simp [World.allows, hf, Slice.index, hj, Scalar.le, h1, h2, hu],
         by simp⟩
-  · exact ⟨false, by simp [World.allows, hf, Slice.index, hj1, hj, Scalar.le, h1], by simp⟩
+  · exact ⟨false, by simp [World.allows, hf, Slice.index, hj, Scalar.le, h1], by simp⟩
 
 theorem allows_final (n : Nat) (w : World) (file : U64) (o c u' : Usize)
     (hw : w.asked.val = [S1 file o]) (hu : unsynced (n + 1) w.disk file = Result.ok u') :
@@ -340,7 +337,6 @@ theorem tell_append_core (n : Nat) (w : World) (file : U64) (o : Usize) (b b' : 
     (hw : w.asked.val = [S1 file o, ⟨2, Ask.Append file b, 0⟩])
     (hI : DInv file before o.val.toNat w.disk) (hS : SmallD w.disk) (hfuel : 65536 < n)
     (hallow : World.allows (n + 8) w 2 told = Result.ok true)
-    (hdone : done told = false ∨ renames (Ask.Append file b) file = Result.ok false)
     (hadd : added (n + 7) (Ask.Append file b) told file true = Result.ok 1)
     (hcomp : ∀ W1 : World, W1.disk = w.disk →
       World.complete (n + 6) W1 (Ask.Append file b) told =
@@ -374,7 +370,7 @@ theorem tell_append_core (n : Nat) (w : World) (file : U64) (o : Usize) (b b' : 
   · have hx : w.asked.val[j.val.toNat]'hjl = ⟨2, Ask.Append file b, 0⟩ := by simp [hw, hj1]
     rw [hx]
     have hw1 : w1.asked.val = [S1 file o] := by rw [hw1a, hw, hj1]; simp
-    refine loop0_one (n + 6) w1 file o told _ u 1 t { w1 with disk := D' } w3 hw1 hdone
+    refine loop0_one (n + 6) w1 file o told _ u 1 t { w1 with disk := D' } w3 hw1 (Or.inr rfl)
       (by rw [hw1d]; exact there_at _ _ _ p hp hs hpn (by omega)) (by rw [hw1d]; exact hu) hadd ht
       (by show World.complete (n + 6) w1 (Ask.Append file b) told = _
           rw [hcomp w1 hw1d, happ]; rfl) (fun kept hk => ?_)
@@ -408,7 +404,7 @@ theorem tell_append_done (n : Nat) (w : World) (file : U64) (o : Usize) (b : Vec
   obtain ⟨c, hc, hct⟩ := allows_append (n + 6) w file o b Told.Done hw
   rw [hct rfl] at hc
   exact tell_append_core n w file o b b Told.Done before hw hI hS hfuel hc
-    (Or.inr (by simp [renames])) (by simp [added, Scalar.eq])
+    (by simp [added, Scalar.eq])
     (fun W1 h => by rw [← h]; rfl)
 
 theorem tell_append_failed (n : Nat) (w : World) (file : U64) (o : Usize) (b : Vec U8)
@@ -425,7 +421,7 @@ theorem tell_append_failed (n : Nat) (w : World) (file : U64) (o : Usize) (b : V
     obtain ⟨v, hv, -⟩ := prefix_loop b m (n + 6) Vec.new 0 (by rw [usize_zero]; omega)
       (by rw [usize_zero]; simp) (by rw [usize_zero]; omega)
     obtain ⟨w', h1, h2⟩ := tell_append_core n w file o b v (Told.FailedAfter m) before hw hI hS
-      (by omega) hc (Or.inl rfl) (by simp [added, Scalar.eq])
+      (by omega) hc (by simp [added, Scalar.eq])
       (fun W1 h => by
         rw [← h]
         show (do let t1 ← «prefix» (n + 6) b m; let x1 ← Disk.append (n + 6) W1.disk file t1
@@ -545,8 +541,8 @@ theorem tell_final (n : Nat) (w : World) (file : U64) (o c : Usize) (before : Li
 
 /-! ## 9. The crash -/
 
-theorem lands_nil (n : Nat) (w : World) (landings : Slice Landing) (hw : w.asked.val = [])
-    (hl : landings.val = []) : World.lands (n + 1) w landings = Result.ok true := by
+theorem lands_nil (n : Nat) (w : World) (landings : Slice Landing) (hl : landings.val = []) :
+    World.lands (n + 1) w landings = Result.ok true := by
   obtain ⟨L, hL⟩ := landings
   simp only at hl; subst hl
   simp [World.lands, World.lands.loop_0, Scalar.lt, Slice.len_val, usize_zero]
@@ -564,10 +560,10 @@ theorem lands_cons (n : Nat) (w : World) (landings : Slice Landing) (hw : w.aske
     simp [World.lands, World.lands.loop_0, Scalar.lt, Slice.len_val, usize_zero, Slice.index,
       Scalar.ge, this]
 
-theorem landed_nil (n : Nat) (w : World) (landings : Slice Landing) (hw : w.asked.val = [])
-    (hl : landings.val = []) (hn : 147573952589676412928 ≤ n) :
+theorem landed_nil (n : Nat) (w : World) (landings : Slice Landing) (hl : landings.val = [])
+    (hn : 147573952589676412928 ≤ n) :
     World.landed (n + 1) w landings = Result.ok (some w.disk) := by
-  have h1 := lands_nil n w landings hw hl
+  have h1 := lands_nil n w landings hl
   have h2 := copy_disk_id (n + 1) w.disk (by omega)
   obtain ⟨L, hL⟩ := landings
   simp only at hl h1; subst hl
@@ -589,7 +585,7 @@ theorem tail (n : Nat) (w : World) (file : U64) (before : Vec U8) (landings : Sl
   by_cases hl : landings.val = []
   case neg =>
     left; simp [World.allows_crash, landed_cons n w landings hw hl]
-  have hld := landed_nil n w landings hw hl hfuel
+  have hld := landed_nil n w landings hl hfuel
   obtain ⟨b, hb⟩ := allows_total (n + 1) w.disk cut (by omega)
   cases b with
   | false => left; simp [World.allows_crash, hld, hb]
@@ -827,8 +823,8 @@ theorem run (F : Nat) (hF : 295147905179352825856 ≤ F) (disk : Disk) (file : U
     exact List.prefix_refl _
   rcases loop_spec file between covers landings cut v (n + 8) W3 0 hI3
       (by rw [usize_zero]; omega) (by rw [usize_zero]; have := between.hlen; omega) with h | h
-  · exact ⟨none, by simp [synced_append, hwf, hsm, hask0, htell0, hsb, hfind, hix, hba, hu,
-      hcont, hask1, h], Or.inl rfl⟩
+  · exact ⟨none, by simp [synced_append, hwf, hsm, hask0, htell0, hsb, hfind, hix, hba, hcont,
+      hask1, h], Or.inl rfl⟩
   · exact ⟨some true, by simp [synced_append, hwf, hsm, hask0, htell0, hsb, hfind, hix, hba, hu,
       hcont, hask1, h], Or.inr rfl⟩
 

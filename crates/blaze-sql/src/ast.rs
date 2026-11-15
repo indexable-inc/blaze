@@ -10,12 +10,48 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::Allocator;
+use core::ops::Range;
+
+use crate::desc::Storage;
 
 /// Bytes `start..end` of the source text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
+}
+
+impl Span {
+    /// Byte offsets `range` of a text the parser reads as a span. [`crate::parse::parse`]
+    /// refuses a text longer than [`crate::parse::TEXT_MOST`] bytes, far below `u32::MAX`,
+    /// before any span of it is made, so every offset fits a `u32`. The one place an offset
+    /// narrows.
+    #[expect(
+        blaze::as_cast,
+        reason = "an offset into a text of at most `parse::TEXT_MOST` bytes, which `parse` \
+                  checks before any span is made, fits a `u32`"
+    )]
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn of(range: Range<usize>) -> Span {
+        Span { start: range.start as u32, end: range.end as u32 }
+    }
+
+    /// The span as byte offsets into its text. The one place an offset widens.
+    #[expect(
+        blaze::as_cast,
+        reason = "a `u32` widens to the `usize` of every target blaze builds for, which is at \
+                  least 32 bits"
+    )]
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn range(self) -> Range<usize> {
+        self.start as usize..self.end as usize
+    }
 }
 
 /// An identifier: a table, a column, an alias, a function or a parameter.
@@ -215,7 +251,7 @@ pub enum ExprKind<'s, A: Allocator> {
     /// `cast(operand as type)`
     Cast {
         operand: Box<Expr<'s, A>, A>,
-        to: SqlType,
+        to: Storage,
     },
     /// `function(args)`
     Call {
@@ -269,14 +305,29 @@ pub enum ChainOp {
 }
 
 impl ChainOp {
+    /// The level of `or`, the loosest: first in the order of [`ChainOp`]'s doc.
+    pub const OR_LEVEL: u8 = 0;
+    /// The level of `and`: second in that order.
+    pub const AND_LEVEL: u8 = 1;
+    /// The level of `+ -`: third in that order.
+    pub const ADD_LEVEL: u8 = 2;
+    /// The level of `* / %`: fourth in that order.
+    pub const MUL_LEVEL: u8 = 3;
+    /// The level of `||`, the tightest: fifth in that order.
+    pub const CONCAT_LEVEL: u8 = 4;
+
     /// The operator's precedence level, 0 the loosest. One chain holds one level.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn level(self) -> u8 {
         match self {
-            ChainOp::Or => 0,
-            ChainOp::And => 1,
-            ChainOp::Add | ChainOp::Sub => 2,
-            ChainOp::Mul | ChainOp::Div | ChainOp::Rem => 3,
-            ChainOp::Concat => 4,
+            ChainOp::Or => ChainOp::OR_LEVEL,
+            ChainOp::And => ChainOp::AND_LEVEL,
+            ChainOp::Add | ChainOp::Sub => ChainOp::ADD_LEVEL,
+            ChainOp::Mul | ChainOp::Div | ChainOp::Rem => ChainOp::MUL_LEVEL,
+            ChainOp::Concat => ChainOp::CONCAT_LEVEL,
         }
     }
 }
@@ -296,14 +347,4 @@ pub enum CompareOp {
     Is,
     /// `a is not b`
     IsNot,
-}
-
-/// The types `cast` names: `boolean`, `integer`, `real`, `text`, `blob`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SqlType {
-    Boolean,
-    Integer,
-    Real,
-    Text,
-    Blob,
 }

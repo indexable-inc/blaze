@@ -21,7 +21,7 @@ use hir_expand::proc_macro::ProcMacroKind;
 use crate::run;
 
 /// The module's name in the crate's root.
-pub const MODULE: &str = "__blaze_proc_macros";
+pub const MODULE: &str = hir_expand::proc_macro::GLUE_MODULE;
 
 /// The bridge's glue, put in [`MODULE`] after the list.
 const ENTRY: &str = include_str!("../../guest/entry.rs");

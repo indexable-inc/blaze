@@ -400,11 +400,17 @@ const NO_DAEMON: &[Flag] = &[Flag::switch("no-daemon")];
 /// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
 /// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
 /// retargets every reference to the item `FROM` to `TO` by name resolution
-/// ([`super::replace`]), and checks nothing.
+/// ([`super::replace`]), and checks nothing; `--rules FILE` makes every rewrite of an astlog
+/// rules file the same way, after the replaces; `--dry-run` prints the diff either would write
+/// and writes nothing; `--query FILE` prints what a rules file derives and finds, and writes
+/// nothing (docs/v2/plan/design/astlog-sema.md).
 const CHECK_ONLY: &[Flag] = &[
     Flag::switch("fix"),
     Flag::new("lint", None, Takes::Value, "NAME").many(),
     Flag::new("replace", None, Takes::Value, "FROM=TO").many(),
+    Flag::new("rules", None, Takes::Value, "FILE"),
+    Flag::new("query", None, Takes::Value, "FILE"),
+    Flag::switch("dry-run"),
 ];
 
 /// `check`'s baselines, blaze's (`blaze_lints::baseline`): `--baselines DIR` checks the run's
@@ -447,6 +453,9 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "fix"
                 | "lint"
                 | "replace"
+                | "rules"
+                | "query"
+                | "dry-run"
                 | "no-prebuilt"
                 | "no-daemon"
         )
@@ -611,6 +620,57 @@ pub fn refused(asked: &Invocation) -> Option<String> {
                 format!("`blaze doc` writes no JSON messages for the pages yet (`--message-format {it}`)")
             })
         }
+        Command::Check if flags.query.is_some() && (flags.rules.is_some() || !flags.replace.is_empty() || flags.dry_run) => {
+            Some("`--query` writes nothing: run `--rules`, `--replace` and `--dry-run` apart".to_owned())
+        }
+        Command::Check if flags.dry_run && flags.rules.is_none() && flags.replace.is_empty() => {
+            Some("`--dry-run` shows the edits `--rules` or `--replace` would make: give one of them".to_owned())
+        }
+        // The view a rules file runs over is the daemon's of the whole checkout; nothing yet
+        // narrows it, so a selection would be accepted and change nothing.
+        Command::Check
+            if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
+                && !flags.selection.is_empty() =>
+        {
+            let given: Vec<String> = flags.selection.iter().map(|it| format!("`--{it}`")).collect(); // alloc: a refusal's few flags
+            Some(format!(
+                "{} reads the daemon's view of the whole checkout, which no build selection narrows yet, \
+                 so {} would change nothing: run it without",
+                rules_mode(flags),
+                given.join(", ")
+            ))
+        }
+        // `replaced` writes a diff or a status line, never JSON.
+        Command::Check
+            if flags.query.is_none()
+                && (flags.rules.is_some() || !flags.replace.is_empty())
+                && flags.message_format.iter().flat_map(|it| it.split(',')).any(|it| it.to_ascii_lowercase().starts_with("json")) =>
+        {
+            Some(format!(
+                "{} writes a diff or a status line and no JSON messages yet, so `--message-format` json \
+                 would change nothing: run it without",
+                rules_mode(flags)
+            ))
+        }
+        // No build runs, no lock file is read and nothing is fetched or configured: these
+        // would be accepted and change nothing.
+        Command::Check
+            if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
+                && !flags.build_only.is_empty() =>
+        {
+            Some(format!(
+                "{} runs no build, reads no lock file, fetches nothing and sends no cargo config, \
+                 so `{}` would change nothing: run it without",
+                rules_mode(flags),
+                flags.build_only.join("`, `")
+            ))
+        }
+        Command::Check
+            if (flags.rules.is_some() || flags.query.is_some())
+                && (flags.fix || flags.baselines.is_some() || !flags.lint_levels.is_empty()) =>
+        {
+            Some("`--rules` and `--query` check nothing: run `--fix`, `--baselines` and lint levels apart".to_owned())
+        }
         Command::Check if !flags.replace.is_empty() && (flags.fix || flags.baselines.is_some()) => {
             Some("`--replace` makes its edits and checks nothing: run `--fix` and `--baselines` apart".to_owned())
         }
@@ -640,6 +700,15 @@ pub fn refused(asked: &Invocation) -> Option<String> {
             )
         }
         _ => None,
+    }
+}
+
+/// Which of `--query`, `--rules` and `--replace` a refusal names, the first given.
+fn rules_mode(flags: &Flags) -> &'static str {
+    match (&flags.query, &flags.rules) {
+        (Some(_), _) => "`--query`",
+        (None, Some(_)) => "`--rules`",
+        (None, None) => "`--replace`",
     }
 }
 
@@ -700,6 +769,10 @@ pub struct Flags {
     pub lints: Vec<String>,
     /// `check`'s `--replace`, each `FROM=TO` as given.
     pub replace: Vec<String>,
+    /// `check`'s `--rules` and `--query`, each a rules file's path as given, and `--dry-run`.
+    pub rules: Option<String>,
+    pub query: Option<String>,
+    pub dry_run: bool,
     /// `check`'s `--baselines`, `--bless-baselines` and each `--new-baseline`.
     pub baselines: Option<String>,
     pub bless_baselines: bool,
@@ -713,10 +786,59 @@ pub struct Flags {
     /// (`--deny=blaze::todo`), in the order given, as the daemon's load keeps them
     /// (`Asked::lint_levels` of blaze-units).
     pub lint_levels: Vec<String>,
+    /// Each flag of [`SELECTS_A_BUILD`] given, by its long name, in order.
+    pub selection: Vec<&'static str>,
+    /// Each flag of [`STEERS_A_BUILD`] given, and each `-Z` but `unstable-options`, as typed
+    /// in short: what a build reads and `--query`, `--rules` and `--replace` would not.
+    pub build_only: Vec<String>,
 }
+
+/// The flags that steer how a build runs: its jobs, what it does past a failure, the lock
+/// file and the network, cargo's config. `--query`, `--rules` and `--replace` run no build,
+/// read no lock file, fetch nothing, and send none of the config, so they refuse each by name
+/// ([`refused`]). `-Z unstable-options` is read: it allows `-C`, which they honour.
+const STEERS_A_BUILD: &[&str] =
+    &["jobs", "keep-going", "fail-fast", "no-fail-fast", "locked", "frozen", "offline", "no-locked", "config"];
+
+/// The flags that choose what a build compiles and reports: packages, features, profile,
+/// target and targets. `--query`, `--rules` and `--replace` read the checkout as the daemon's
+/// view opens it, so they refuse each of these by name ([`refused`]).
+const SELECTS_A_BUILD: &[&str] = &[
+    "package",
+    "workspace",
+    "all",
+    "exclude",
+    "features",
+    "all-features",
+    "no-default-features",
+    "release",
+    "profile",
+    "target",
+    "lib",
+    "bin",
+    "bins",
+    "example",
+    "examples",
+    "test",
+    "tests",
+    "bench",
+    "benches",
+    "all-targets",
+    "unit-graph",
+    "timings",
+];
 
 impl Flags {
     fn read(&mut self, flag: &Flag, value: Option<&str>) {
+        if let Some(name) = flag.long.filter(|it| SELECTS_A_BUILD.contains(it)) {
+            self.selection.push(name);
+        }
+        if let Some(name) = flag.long.filter(|it| STEERS_A_BUILD.contains(it)) {
+            self.build_only.push(format!("--{name}"));
+        }
+        if flag.long.is_none() && flag.short == Some('Z') && value != Some("unstable-options") {
+            self.build_only.push(format!("-Z {}", value.unwrap_or_default()));
+        }
         let owned = || value.map(str::to_owned);
         match flag.long.unwrap_or("") {
             "manifest-path" => self.manifest_path = owned(),
@@ -774,6 +896,9 @@ impl Flags {
             "fix" => self.fix = true,
             "lint" => self.lints.extend(owned()),
             "replace" => self.replace.extend(owned()),
+            "rules" => self.rules = owned(),
+            "query" => self.query = owned(),
+            "dry-run" => self.dry_run = true,
             "baselines" => self.baselines = owned(),
             "bless-baselines" => self.bless_baselines = true,
             "no-prebuilt" => self.no_prebuilt = true,

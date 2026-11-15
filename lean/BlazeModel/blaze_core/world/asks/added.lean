@@ -52,27 +52,4 @@ def blaze_core.world.asks.added (fuel : Nat) (ask : blaze_core.world.asks.Ask) (
       let t3 := if t2 then had else t2
       if t3 then blaze_core.world.asks.count fuel landed else Result.ok (0 : Usize)
     | _ => Result.ok (0 : Usize)
-  | _ => do
-    let _ ←
-      match ask with
-      | blaze_core.world.asks.Ask.Sync v14 => Result.ok ()
-      | blaze_core.world.asks.Ask.Barrier v15 => Result.ok ()
-      | blaze_core.world.asks.Ask.SyncDir => Result.ok ()
-      | blaze_core.world.asks.Ask.Write v16 v17 => Result.ok ()
-      | blaze_core.world.asks.Ask.WriteUnsynced v18 v19 => Result.ok ()
-      | blaze_core.world.asks.Ask.Rename v20 v21 => Result.ok ()
-      | blaze_core.world.asks.Ask.RenameUnsynced v22 v23 => Result.ok ()
-      | blaze_core.world.asks.Ask.Remove v24 => Result.ok ()
-      | _ => Result.fail Error.unreachable
-    let _ ←
-      match ask with
-      | blaze_core.world.asks.Ask.Sync v25 => Result.ok ()
-      | blaze_core.world.asks.Ask.Barrier v26 => Result.ok ()
-      | blaze_core.world.asks.Ask.SyncDir => Result.ok ()
-      | blaze_core.world.asks.Ask.Write v27 v28 => Result.ok ()
-      | blaze_core.world.asks.Ask.WriteUnsynced v29 v30 => Result.ok ()
-      | blaze_core.world.asks.Ask.Rename v31 v32 => Result.ok ()
-      | blaze_core.world.asks.Ask.RenameUnsynced v33 v34 => Result.ok ()
-      | blaze_core.world.asks.Ask.Remove v35 => Result.ok ()
-      | _ => Result.fail Error.unreachable
-    Result.ok (0 : Usize)
+  | _ => Result.ok (0 : Usize)

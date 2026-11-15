@@ -1,6 +1,7 @@
 import Blaze.Threads
 import Blaze.Std
 import Blaze.Slice
+import Blaze.Duration
 
 /-!
 `core::sync::atomic`: the atomic integers and `AtomicBool`, each a cell of the world threads
@@ -15,7 +16,8 @@ operation wrote, so the wrap changes nothing).
 An ordering an operation does not take is the panic Rust gives (sync/atomic.rs:4306, 4322,
 4443): no acquire store, no release load, no release ordering for a failed compare.
 
-Also here: the futex wait and wake of `blaze_core::world::threads`, and its `two`.
+Also here: the futex wait and wake of `blaze_core::world::threads`, its clock (`clock`, `now`,
+`time`, `wait_until`) and its `two`.
 -/
 
 namespace Blaze.core.sync.atomic
@@ -220,6 +222,35 @@ there was one. -/
 def wake (word : Atomic .U32) : Prog Bool := do
   let got ← Prog.ask (.wake word.cell false)
   pure got.flag
+
+/-- `blaze_core::world::threads::clock`: installs the clock's script, each reading in
+nanoseconds; the clock does not move. -/
+def clock (readings : Slice core.time.Duration) : Prog Unit := do
+  let _ ← Prog.ask (.clock (readings.val.map core.time.Duration.toNanos))
+  pure ()
+
+/-- `blaze_core::world::threads::now`: the clock moves to the later of itself and the script's
+next reading, and is the answer. -/
+def now : Prog core.time.Duration := do
+  let got ← Prog.ask (.now true)
+  pure (core.time.Duration.ofNanosSat got.value)
+
+/-- `blaze_core::world::threads::time`: the clock, which does not move. -/
+def time : Prog core.time.Duration := do
+  let got ← Prog.ask (.now false)
+  pure (core.time.Duration.ofNanosSat got.value)
+
+/-- `blaze_core::world::threads::wait_until`: `wait` with a deadline on the world's clock
+(`none`: none). A sleeper whose deadline the clock has reached returns `TimedOut`; the kernel
+may say the time ran out only where there is a deadline, and then the clock is at it. -/
+def wait_until (word : Atomic .U32) (expected : U32) (deadline : Option core.time.Duration) :
+    Prog Woke := do
+  let got ← Prog.ask (.wait_until word.cell expected.val (deadline.map core.time.Duration.toNanos))
+  pure
+    (if got.value = World.changed_code then .Changed
+     else if got.value = World.spurious_code then .Spurious
+     else if got.value = World.timed_out_code then .TimedOut
+     else .Woken)
 
 /-- `blaze_core::world::threads::two`, its schedule a slice. -/
 def two_of {α β : Type} (schedule : Slice Step) (first : Prog α) (second : Prog β) :

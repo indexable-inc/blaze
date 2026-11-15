@@ -338,7 +338,7 @@ pub fn g() {}
 
 /// The invariant: `f(_x: A)` to `f(_x: B)`, where `A` and `B` are two unit structs of one
 /// shape, moves `f`'s `Signature` row and no other. The row's value is `f`'s signature hash,
-/// which names each type it refers to by the type's key as well as its hash (D46,
+/// which names each type it refers to by the type's key as well as its hash (D51,
 /// `blaze_items::hash`'s keyed refs): a hash alone says what a type is, not which, and two
 /// nominal types of one shape have one hash, so a reader of `f`'s signature (a caller's stored
 /// type check, which accepts `f(A)` only with `f(_x: A)`) would otherwise be served stale.

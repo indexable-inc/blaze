@@ -6,4 +6,6 @@ import BlazeModel.blaze_core.wait.reaping.ReapPlant.type
 open Blaze
 set_option linter.unusedVariables false
 
+namespace blaze_core.wait.reaping.ReapPlant
 deriving instance DecidableEq for blaze_core.wait.reaping.ReapPlant
+end blaze_core.wait.reaping.ReapPlant

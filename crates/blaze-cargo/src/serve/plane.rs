@@ -74,11 +74,8 @@ pub trait Work: Send + Sync + 'static {
     fn run(&self, arg: u32, readers: Self::Readers) -> Option<Did<Self::Value>>;
 
     /// Task `arg`'s crate and unit, for its `task` span: a unit phase's, `None` for a task of
-    /// no unit.
-    fn subject(&self, arg: u32) -> Option<(String, String)> {
-        let _ = arg;
-        None
-    }
+    /// no unit, said by the batch: no default, so a batch of units never inherits "no unit".
+    fn subject(&self, arg: u32) -> Option<(String, String)>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1634,6 +1631,11 @@ mod tests {
 
         fn run(&self, arg: u32, (): ()) -> Option<Did<u32>> {
             (self.0)(arg)
+        }
+
+        /// A test's tasks are of no unit.
+        fn subject(&self, _: u32) -> Option<(String, String)> {
+            None
         }
     }
 

@@ -365,11 +365,20 @@ impl Steps for Real {
         run::launch::serve_needs(kept, &self.shared.launches, wanted)
             .into_iter()
             .map(|it| KeptPut {
+                // What a refusal of the put names (rule 19): a first call makes a handful of
+                // values, each named once.
+                what: match &it.of {
+                    Some(of) => Arc::from(format!("a launched run's first call: {of}")),
+                    None => Arc::from("a launched run's first call"),
+                },
                 put: Put { key: it.key, kind: it.kind, bytes: it.bytes },
-                what: Arc::from("a launched run's first call"),
                 into: super::work::PutInto::Home,
             })
             .collect()
+    }
+
+    fn lose_needs(&self, checkout: &str, why: &str) {
+        run::launch::lose_needs(&self.shared.launches, checkout, why);
     }
 
     fn wake_needs(&self) {
@@ -2682,6 +2691,13 @@ impl Front<Real> for JobFront {
             return Err(Failed::Again);
         }
         cancellable(|| intent::edit(&self.0, &reader, edits))?
+    }
+
+    fn query(&self, reader: UnitReader, rules: &str) -> Result<blaze_api::query::Rows, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        cancellable(|| intent::query(&self.0, &reader, rules))?
     }
 
     fn ahead(&self, reader: UnitReader, filter: &[String]) -> Result<Vec<u32>, Failed> {

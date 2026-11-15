@@ -30,15 +30,12 @@
 //!   (replace call "{e}?"))
 //! ```
 
-#![feature(allocator_api)]
-
 mod corpus;
 mod error;
 mod eval;
 mod program;
 mod rewrite;
 mod scan;
-mod sexpr;
 
 #[cfg(test)]
 mod tests;
@@ -46,13 +43,18 @@ mod tests;
 use std::path::PathBuf;
 
 pub use ast_merge_langs::Lang;
+pub use astlog_engine::{Lint, Severity};
 
 pub use crate::corpus::{Corpus, LineCol, NodeInfo, NodeRef, SourceFile, Value};
-pub use crate::error::Error;
-pub use crate::eval::{Database, Relation, Row};
-pub use crate::program::{Lint, Program, Severity};
+pub use crate::error::{Error, SourceError};
+pub use crate::program::{Atom, MatchAtom, Program, TreeSitter};
 pub use crate::rewrite::{Edit, FileRewrite};
 pub use crate::scan::{Finding, SuppressedFinding, one_line};
+
+/// Every relation the program derived over the corpus.
+pub type Database = astlog_engine::Database<NodeRef>;
+pub type Relation = astlog_engine::Relation<NodeRef>;
+pub type Row = astlog_engine::Row<NodeRef>;
 
 /// A finished run: the checked program, the loaded corpus, every derived
 /// relation, and the edits every `(rewrite ...)` produced.
@@ -111,9 +113,10 @@ impl Analysis {
 pub fn analyze(rules: &str, paths: &[PathBuf]) -> Result<Analysis, Error> {
     let program = Program::parse(rules)?;
     let corpus = Corpus::load(paths)?;
-    let evaluator = eval::Evaluator::new(&program, &corpus)?;
-    let database = evaluator.fixpoint()?;
-    let edits = rewrite::collect(&program, &corpus, &evaluator, &database)?;
-    drop(evaluator);
+    let facts = eval::TreeFacts::new(&program, &corpus)?;
+    let (database, planned) = astlog_engine::run(&program, &facts)?;
+    let edits = rewrite::collect(&corpus, &planned)?;
+    drop(planned);
+    drop(facts);
     Ok(Analysis { program, corpus, database, edits })
 }

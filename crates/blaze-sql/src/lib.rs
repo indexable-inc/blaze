@@ -53,16 +53,25 @@ pub struct Checked<'s, A: Allocator> {
 
 impl<'s, A: Allocator> Checked<'s, A> {
     /// The schema it was checked against.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn schema(&self) -> &schema::Schema<'s> {
         &self.schema
     }
 
     /// The statement as parsed.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn statement(&self) -> &ast::Statement<'s, A> {
         &self.statement
     }
 
     /// Its parameters and what it returns.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn description(&self) -> &desc::Description<'s, A> {
         &self.description
     }
@@ -72,6 +81,8 @@ impl<'s, A: Allocator> Checked<'s, A> {
 ///
 /// `text` is a constant of the program: the typed surface passes a const generic argument, and
 /// `blaze::sql_text_at_run_time` refuses any other caller's text that is not one.
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn check<'s, A: Allocator + Copy>(
     schema: &schema::Schema<'s>,
     text: &'s str,
@@ -85,6 +96,8 @@ pub fn check<'s, A: Allocator + Copy>(
 /// [`check`] with a planted bug in inference, for the controls of tests that hold inference to
 /// an engine (`the_oracle_catches_..`). Never called by shipping code.
 #[cfg(feature = "plant")]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn check_planted<'s, A: Allocator + Copy>(
     schema: &schema::Schema<'s>,
     text: &'s str,

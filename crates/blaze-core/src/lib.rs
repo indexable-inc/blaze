@@ -663,6 +663,13 @@ pub enum Effect {
     /// completion of its own but the watch's end. A change that names `dir` itself says the
     /// directory may have been replaced or moved (inotify, which watches an inode, says so of
     /// an overflow too): a watcher that must hear of every later change watches again.
+    ///
+    /// The submit returns at once, whatever the tree's size: under inotify the start is a walk
+    /// of every directory under `dir`, which the drivers run off the thread that submits. A
+    /// watch is in place once a look under `dir` (a stat, a read, a listing, stamps), or an
+    /// [`Effect::Flush`] of it, asked after it is answered: such a look is held until the start
+    /// is done, so a change made after it is answered is heard. A change made before that may
+    /// go unheard; a watcher confirms its watch with a look or a flush before it relies on it.
     Watch {
         dir: FileName,
         tag: Tag,

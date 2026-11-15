@@ -407,7 +407,7 @@ pub const UNCOVERED_ANSWER: &str =
 ///
 /// - a name looked up in a module, found or not: lane items' `Resolves` fact of the module and
 ///   the name, which names what the name is in each namespace and in textual macro scope (each
-///   target by its key: what the target is, its signature, is a row of its own, D46); a new
+///   target by its key: what the target is, its signature, is a row of its own, D51); a new
 ///   item that binds or shadows the name there moves it, an edit of a body's text does not;
 /// - the traits in scope in a module: its `TraitsInScope` fact;
 /// - a module's whole scope or the modules declared in it: its `WholeScope` fact, a scan;

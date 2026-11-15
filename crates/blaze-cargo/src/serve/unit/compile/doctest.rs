@@ -563,6 +563,7 @@ pub(super) fn link(
         nothing: false,
         files: Vec::new(),
         puts: Vec::new(),
+        put_of: Vec::new(),
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,

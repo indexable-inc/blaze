@@ -77,6 +77,85 @@ pub(crate) struct Resolved<'db> {
     /// that resolves to nothing, or to an item of another kind than its list's. Interned for
     /// the process, as a value owns nothing to drop.
     pub(crate) errors: &'db [Symbol],
+    /// The `one-at-a-time` entries, resolved here with the rest of the crate's configured
+    /// paths, once per crate and configuration.
+    pub(crate) one_at_a_time: OneAtATime<'db>,
+}
+
+intern::impl_internable!(crate::conf::OneAtATime);
+
+/// `one-at-a-time`'s entries ([`crate::conf::OneAtATime`]) as the crate resolves them, for
+/// `blaze::one_at_a_time`. Kept in the query's arena like [`Resolved`]: each entry interned for
+/// the process ([`Interned`]) and each error a [`Symbol`], as a value owns nothing to drop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OneAtATime<'db> {
+    pub(crate) entries: &'db [Interned<crate::conf::OneAtATime>],
+    /// Each function an entry names, with the entry's index: a trait's method as the trait
+    /// declares it (an implementation's call is matched through it).
+    pub(crate) by_fn: kept::Map<'db, hir::Function, u32>,
+    /// An entry whose first segment names a crate this one reaches, and whose path names no
+    /// function there. An entry of a crate this one does not depend on is no error: nothing
+    /// here can call it.
+    pub(crate) errors: &'db [Symbol],
+}
+
+impl<'db> OneAtATime<'db> {
+    /// The entry naming `f`, or the trait method `f` implements.
+    pub(crate) fn of(
+        &self,
+        db: &base_db::Db,
+        f: hir::Function,
+    ) -> Option<&'db crate::conf::OneAtATime> {
+        use hir::AsAssocItem as _;
+        let at = self.by_fn.get(&f).copied().or_else(|| {
+            let trait_ = f.as_assoc_item(db)?.implemented_trait(db)?;
+            let name = f.name(db);
+            let declared = trait_.items(db).into_iter().find_map(|it| match it {
+                hir::AssocItem::Function(it) if it.name(db) == name => Some(it),
+                _ => None,
+            })?;
+            self.by_fn.get(&declared).copied()
+        })?;
+        let entries = self.entries;
+        Some(&*entries[at as usize])
+    }
+
+    /// The entries of `conf` as `krate` names their paths, kept in the current run's arena.
+    fn of_conf(db: &'db base_db::Db, krate: hir::Crate, conf: &Conf) -> OneAtATime<'db> {
+        let mut errors: Vec<String, Global> = Vec::new_in(Global);
+        let entries = match conf.one_at_a_time(Global) {
+            Ok(entries) => entries,
+            Err(error) => {
+                errors.push(error);
+                Vec::new_in(Global)
+            }
+        };
+        let mut by_fn: HashMap<hir::Function, u32, Global> = HashMap::new_in(Global);
+        for (at, entry) in entries.iter().enumerate() {
+            let mut fns: Vec<hir::Function, Global> = Vec::new_in(Global);
+            fns.extend(resolve(db, krate, &entry.path).into_iter().filter_map(|it| match it {
+                ModuleDef::Function(it) => Some(it),
+                _ => None,
+            }));
+            let first = entry.path.split("::").next().unwrap_or_default();
+            if fns.is_empty() && root_of(db, krate, first).is_some() {
+                errors.push(format!(
+                    "`{}` of `{}` names no function `{}` can call",
+                    entry.path,
+                    crate::conf::ONE_AT_A_TIME_KEY,
+                    krate.base().named(db)
+                ));
+            }
+            for f in fns {
+                by_fn.entry(f).or_insert(at as u32);
+            }
+        }
+        OneAtATime {
+            entries: kept::slice(db, entries.into_iter().map(Interned::new)),
+            by_fn: kept::Map::keep(db, by_fn),
+            errors: kept::slice(db, errors.iter().map(|it| Symbol::intern(it))),
+        }
+    }
 }
 
 impl<'db> Resolved<'db> {
@@ -209,6 +288,7 @@ pub(crate) fn disallowed_defs<'db>(
         entries: kept::slice(db, entries),
         by_def: kept::Map::keep(db, by_def),
         errors: kept::slice(db, errors.iter().map(|it| Symbol::intern(it))),
+        one_at_a_time: OneAtATime::of_conf(db, krate, conf),
     }
 }
 
@@ -250,14 +330,7 @@ fn is_path(text: &str) -> bool {
 fn resolve(db: &base_db::Db, krate: hir::Crate, path: &str) -> Vec<ModuleDef> {
     let mut segments = path.split("::");
     let Some(first) = segments.next() else { return Vec::new() };
-    let root = if first == "crate"
-        || krate.display_name(db).is_some_and(|it| it.crate_name().as_str() == first)
-    {
-        Some(krate)
-    } else {
-        krate.dependencies_iter(db).find(|it| it.name.as_str() == first).map(|it| it.krate)
-    };
-    let Some(root) = root else { return Vec::new() };
+    let Some(root) = root_of(db, krate, first) else { return Vec::new() };
     let mut current = vec![ModuleDef::Module(root.root_module(db))];
     for segment in segments {
         let mut next = Vec::new();
@@ -288,6 +361,15 @@ fn resolve(db: &base_db::Db, krate: hir::Crate, path: &str) -> Vec<ModuleDef> {
         current = next;
     }
     current
+}
+
+/// The crate a path's first segment `first` names from `krate`: `crate` or its own name, else
+/// a dependency of that name.
+fn root_of(db: &base_db::Db, krate: hir::Crate, first: &str) -> Option<hir::Crate> {
+    if first == "crate" || krate.display_name(db).is_some_and(|it| it.crate_name().as_str() == first) {
+        return Some(krate);
+    }
+    krate.dependencies_iter(db).find(|it| it.name.as_str() == first).map(|it| it.krate)
 }
 
 fn assoc_named(

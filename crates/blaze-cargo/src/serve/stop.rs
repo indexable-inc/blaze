@@ -384,7 +384,7 @@ fn unread(error: &std::io::Error) -> bool {
 }
 
 /// The report of a turn that has lasted `for_ns`, the loop having finished `turns` turns.
-fn stuck(pid: u32, for_ns: u64, turns: u64) -> String {
+pub(super) fn stuck(pid: u32, for_ns: u64, turns: u64) -> String {
     // alloc: once a stuck turn
     let why = format!(
         "the loop has not finished a turn for {} s (after {turns} turns), so nothing reaps its children or hands on what completed",

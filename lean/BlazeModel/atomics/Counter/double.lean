@@ -6,11 +6,14 @@ import BlazeModel.atomics.Counter.type
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.Counter.double (self : atomics.Counter) : Threads.Prog U32 := do
-  let now ←
-    core.sync.atomic.Atomic.load self.hits (core.sync.atomic.Ordering.Acquire : core.sync.atomic.Ordering)
+def atomics.Counter.double.at_1 (self : atomics.Counter) (now : U32) : Threads.Prog U32 := do
   let t0 := self.hits
   let t1 ← Scalar.mul now (2 : U32)
   let t2 ←
     core.sync.atomic.Atomic.store t0 t1 (core.sync.atomic.Ordering.Release : core.sync.atomic.Ordering)
   Threads.Prog.done (Result.ok now)
+
+def atomics.Counter.double (self : atomics.Counter) : Threads.Prog U32 := do
+  let now ←
+    core.sync.atomic.Atomic.load self.hits (core.sync.atomic.Ordering.Acquire : core.sync.atomic.Ordering)
+  atomics.Counter.double.at_1 self now

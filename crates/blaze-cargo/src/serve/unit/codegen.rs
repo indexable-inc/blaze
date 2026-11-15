@@ -712,7 +712,7 @@ fn profile_put(job: &Job, pgo: Pgo) -> Result<Option<blaze_codegen::driver::Put>
         return Ok(None);
     }
     let bytes = read.unstored.lock().take();
-    Ok(bytes.map(|bytes| blaze_codegen::driver::Put { key, kind: blaze_cas::Kind::Output, bytes }))
+    Ok(bytes.map(|bytes| blaze_codegen::driver::Put { key, kind: blaze_cas::Kind::Output, bytes, of: None }))
 }
 
 /// Gives back the bytes of a profile put that a failed build will not hand to the store.

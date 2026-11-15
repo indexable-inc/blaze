@@ -238,6 +238,18 @@ impl ImageStore for Memory {
     fn reads_now(&self, _: &base_db::Env, _: &[u8]) -> Result<ContentId, String> {
         Err(String::from("an item store reads no expansion"))
     }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<std::sync::Arc<dyn hir_def::deps::PageSource>>, String> {
+        // A test's store holds each value whole: no part of one is read alone.
+        Ok(hir_def::deps::whole_pages(self.get(key)?, std::alloc::Global))
+    }
+
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        // A test's store runs a batch in order on its own thread: the same result.
+        (0..count).for_each(task);
+    }
 }
 
 /// The items every test database's keys name: a key is the hash of an item's portable form in
@@ -1035,6 +1047,16 @@ impl ImageStore for Buffered {
 
     fn reads_now(&self, _: &base_db::Env, _: &[u8]) -> Result<ContentId, String> {
         Err(String::from("an item store reads no expansion"))
+    }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<std::sync::Arc<dyn hir_def::deps::PageSource>>, String> {
+        self.kept.pages(key)
+    }
+
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        self.kept.for_each(count, task);
     }
 }
 

@@ -300,20 +300,26 @@ fn not_there(error: &std::io::Error) -> bool {
         || error.raw_os_error() == Some(NOT_A_DIRECTORY)
 }
 
-/// What [`IncludedFile::content_now`] last read of each path, with the generation of the
-/// watches outside every view ([`blaze_vfs::outside::generation`]) read before it looked.
+/// What [`IncludedFile::content_now`] last said of each path: one blaze holds the bytes of
+/// ([`IncludedFile::hold`]), or one read from the disk under a stamp.
+#[derive(Clone, Copy)]
+enum Kept {
+    Held(ContentId),
+    /// Read under `stamp` (a `stat`, links followed) by a look at `looked_ns`, its content
+    /// `id`, and the look's answer as [`IncludedFile::read_now`] pushes it (`None`: a read
+    /// that pushes nothing).
+    Stamped { stamp: blaze_core::Stamp, looked_ns: u64, id: ContentId, answer: Option<Option<[u8; 32]>> },
+}
+
+/// [`Kept`] of each path, a stamp memory: an entry is the answer while its stamp holds
+/// ([`blaze_vfs::outside::holds`]), so a file is read again only when its stamp moved or was
+/// racy.
 #[expect(
     blaze::process_static,
     reason = "one row per included path ever read, never pruned: the database that reads the files should own it"
 )]
-static VOUCHED: std::sync::LazyLock<
-    blaze_core::lock::Lock<blaze_hash::HashMap<std::path::PathBuf, (u64, ContentId), Global>>,
-> = std::sync::LazyLock::new(|| {
-    blaze_core::lock::Lock::new("db.included.vouched", blaze_hash::HashMap::new_in(Global))
-});
-
-/// The generation of an answer blaze holds itself ([`IncludedFile::hold`]): no watch's.
-const HELD: u64 = u64::MAX;
+static KEPT: std::sync::LazyLock<blaze_core::lock::Lock<blaze_hash::HashMap<std::path::PathBuf, Kept, Global>>> =
+    std::sync::LazyLock::new(|| blaze_core::lock::Lock::new("db.included.kept", blaze_hash::HashMap::new_in(Global)));
 
 thread_local! {
     /// A planted bug, for a test's control: [`IncludedFile::content_now`] looks at the disk
@@ -350,59 +356,71 @@ impl IncludedFile {
         path: &std::path::Path,
         looks: &Looks,
     ) -> Result<std::sync::Arc<[u8]>, ReadError> {
+        let looked_ns = blaze_core::system_wall_ns();
+        let stamp = blaze_vfs::outside::stat(path);
         let read = std::fs::read(path);
-        if looks.keeps() {
-            match &read {
-                // A regular file alone hashes as its bytes; a pipe or a device read here does not.
-                Ok(bytes) if std::fs::metadata(path).is_ok_and(|it| it.is_file()) => {
-                    looks.push(path, LookKind::File, Some(blaze_ids::b3::hash(bytes)));
-                }
-                Err(error) if not_there(error) => looks.push(path, LookKind::File, None),
-                Ok(_) | Err(_) => {}
-            }
+        if let Some(answer) = IncludedFile::answer_of(read.as_deref(), &stamp) {
+            looks.push_stamped(path, LookKind::File, answer, stamp, looked_ns);
         }
         read.map(Into::into).map_err(|it| ReadError::of(&it))
+    }
+
+    /// The answer the look of a read says, the file's stamp before the read being `stamp`
+    /// ([`IncludedFile::read_now`]; `None`: a read whose answer this crate does not make,
+    /// pushed nowhere).
+    fn answer_of(read: Result<&[u8], &std::io::Error>, stamp: &blaze_core::Stamp) -> Option<Option<[u8; 32]>> {
+        match read {
+            // A regular file alone hashes as its bytes; a pipe or a device read here does not.
+            Ok(bytes) if stamp.is_file() => Some(Some(blaze_ids::b3::hash(bytes))),
+            Err(error) if not_there(error) => Some(None),
+            Ok(_) | Err(_) => None,
+        }
     }
 
     /// [`IncludedFile::content`] of the file at `path` as it is on disk now
     /// ([`IncludedFile::read_now`]): what a unit record that read it is filed by, and what a
     /// build compares with what it read of the file ([`crate::Files::included_is_read`]).
     ///
-    /// The invariant: the disk is looked at only while no watch vouches for the answer kept.
-    /// The file's directory is wanted watched ([`blaze_vfs::outside::want`]) the first time it
-    /// is asked, and the answer of a look is kept with the generation read before the look;
-    /// once a directory at or above the file has been watched without a break since, and
-    /// heard nothing, the answer kept is the answer (a file that is not there too: its
-    /// directory hears it made). Until 2026-11-12 every ask read the file: each unit of a
-    /// build asked of each file its closure includes, and a build that looked at any path no
-    /// watch covers is never answered again without a walk (the no-op lane), so reth's build
-    /// with nothing changed walked 5,305 units for one path a registry crate's `#[path]`
-    /// names that is not there. A look made is pushed to `looks` ([`IncludedFile::read_now`]).
+    /// The invariant: the file is read only when its stamp moved or was racy. Each ask is one
+    /// `stat` (the floor: a file whose bytes may have changed is told so only by a look);
+    /// the answer kept under a stamp that holds ([`blaze_vfs::outside::holds`]) is the answer,
+    /// a path that is not there too ([`blaze_core::Stamp::GONE`], asked of the whole path).
+    /// Until 2026-11-12 every ask read the file; from then to 2026-11-14 a watch of the file's
+    /// directory vouched for it with no syscall, and setting one up walked the tree under it
+    /// on the daemon's loop (256,216 directories under `/root`), which killed the daemon on
+    /// every real project. Every ask pushes its look to `looks` with the stamp, answered from
+    /// memory or not, so a build's list is the same whatever was remembered.
     pub fn content_now(path: &std::path::Path, looks: &Looks) -> ContentId {
-        let kept = VOUCHED.lock().get(path).copied();
-        if let Some((generation, id)) = kept
-            && (generation == HELD || blaze_vfs::outside::name_unchanged_since(path, generation))
+        let kept = KEPT.lock().get(path).copied();
+        if let Some(Kept::Held(id)) = kept
             && !LOOKS_EVERY_TIME.get()
         {
             return id;
         }
-        let generation = blaze_vfs::outside::generation();
-        // A watch is asked by a path's own bytes and hears nothing of where a link leads:
-        // only a file whose name has no link in it (the file itself, when it is there, and
-        // its directory) is kept; any other is looked at each time.
-        let plain = match std::fs::canonicalize(path) {
-            Ok(it) => it == path,
-            Err(_) => path
-                .parent()
-                .is_some_and(|dir| std::fs::canonicalize(dir).is_ok_and(|it| it == dir)),
-        };
-        if plain && kept.is_none() {
-            blaze_vfs::outside::watch_name(path);
+        let looked_ns = blaze_core::system_wall_ns();
+        let stamp = blaze_vfs::outside::stat(path);
+        if let Some(Kept::Stamped { stamp: was, looked_ns: at, id, answer }) = kept
+            && blaze_vfs::outside::holds(&was, at, &stamp)
+            && !LOOKS_EVERY_TIME.get()
+        {
+            if let Some(answer) = answer {
+                looks.push_stamped(path, LookKind::File, answer, was, at);
+            }
+            return id;
         }
-        let id = IncludedFile::content_of(IncludedFile::read_now(path, looks).as_deref());
-        if plain {
-            // alloc: once per included file, its path as the key of what was read of it
-            VOUCHED.lock().insert(path.to_path_buf(), (generation, id));
+        let read = std::fs::read(path);
+        let answer = IncludedFile::answer_of(read.as_deref(), &stamp);
+        if let Some(answer) = answer {
+            looks.push_stamped(path, LookKind::File, answer, stamp, looked_ns);
+        }
+        let id = match &read {
+            Ok(bytes) => IncludedFile::content_of(Ok(bytes)),
+            Err(error) => IncludedFile::content_of(Err(&ReadError::of(error))),
+        };
+        // Kept under the stamp from before the read: a write during the read moves it, so the
+        // next ask reads again. A stamp that can't be asked is never kept.
+        if !stamp.is_unknown() {
+            KEPT.lock().insert(path.to_path_buf(), Kept::Stamped { stamp, looked_ns, id, answer });
         }
         id
     }
@@ -415,8 +433,7 @@ impl IncludedFile {
     /// of reth), their directory hearing blaze's own restore of them, so no watch vouched and
     /// the build was never answered again without a walk.
     pub fn hold(path: &std::path::Path, content: ContentId) {
-        // alloc: once per held file, its path as the key
-        VOUCHED.lock().insert(path.to_path_buf(), (HELD, content));
+        KEPT.lock().insert(path.to_path_buf(), Kept::Held(content));
     }
 
     /// The bytes, or why they could not be read. Takes the [`Db`]: a read outside the VFS is

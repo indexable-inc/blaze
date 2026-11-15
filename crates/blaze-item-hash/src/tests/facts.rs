@@ -201,7 +201,7 @@ fn fields_changes_with_a_member_name_and_only_then() {
 
 /// A renamed trait item moves both the trait's signature and its `Fields`. The trait's form
 /// names its items by place (`blaze_items::form`'s `trait_`) and the signature hash fills each
-/// by its key as well (D46), so a renamed item, which is another key, moves it; `Fields` holds
+/// by its key as well (D51), so a renamed item, which is another key, moves it; `Fields` holds
 /// the names a lookup by name compares, and moves on its own account (a name a macro's context
 /// keys, which no item key spells, is `Fields`' alone). A type's fields and variants that hash
 /// names itself (`for const` over them reads `Field::NAME` and `Variant::NAME`: `form`'s
@@ -529,6 +529,18 @@ impl ImageStore for Memory {
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
         self.images.lock().entry(key).or_insert_with(|| Arc::new(Aligned::copy_from(&value)));
         Ok(())
+    }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn hir_def::deps::PageSource>>, String> {
+        // A test's store holds each value whole: no part of one is read alone.
+        Ok(hir_def::deps::whole_pages(self.get(key)?, std::alloc::Global))
+    }
+
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        // A test's store runs a batch in order on its own thread: the same result.
+        (0..count).for_each(task);
     }
 
     fn reads_now(&self, _: &base_db::Env, _: &[u8]) -> Result<ContentId, String> {

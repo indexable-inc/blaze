@@ -1594,7 +1594,14 @@ fn golden(flags: &str, krate: &str, name: &str, source: &str) -> Emitted {
 #[track_caller]
 fn golden_from(fixture: &str, krate: &str, name: &str) -> Emitted {
     let out = emitted_from(fixture, krate, name);
-    for module in out.imports.iter().chain([&out]) {
+    assert_goldens(&out);
+    out
+}
+
+/// `out` and the modules it imports, each against its golden under `lean/`.
+#[track_caller]
+fn assert_goldens(out: &Emitted) {
+    for module in out.imports.iter().chain([out]) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean").join(module.path());
         // `UPDATE_EXPECT` writes a new golden only where its directory is.
         if std::env::var_os("UPDATE_EXPECT").is_some()
@@ -1604,7 +1611,6 @@ fn golden_from(fixture: &str, krate: &str, name: &str) -> Emitted {
         }
         expect_file![path].assert_eq(&module.text);
     }
-    out
 }
 
 /// Each integer method becomes its `ScalarOps` model: the total ones pure, `pow`, `abs`,
@@ -1911,22 +1917,15 @@ fn vec_operations_become_their_models() {
     }
 }
 
-/// What the `Vec` subset leaves out is refused by name: its capacity, a closure, a range
-/// `get`, a `Vec` in another allocator, a generic `Vec` function, `mem::take` of a type with
-/// no modelled default, and a `&mut` into a `Vec` chosen at run time.
+/// What the `Vec` subset leaves out is refused by name: its capacity, a closure, `get` by an
+/// inclusive range, a generic `Vec` function, and a `&mut` into a `Vec` chosen at run time.
 #[test]
 fn what_the_vec_subset_leaves_out_is_refused_by_name() {
     let cases = [
         ("pub fn f(v: &Vec<u32>) -> usize { v.capacity() }\n", "Vec::capacity"),
         ("pub fn f(v: &mut Vec<u32>) { v.retain(|x| *x > 0) }\n", "closure"),
-        ("pub fn f(v: &Vec<u32>) -> usize { match v.get(0..1) { Some(s) => s.len(), None => 0 } }\n", "`Range`"),
+        ("pub fn f(v: &Vec<u32>) -> usize { match v.get(0..=1) { Some(s) => s.len(), None => 0 } }\n", "`get` by a range other than `a..b`"),
         ("pub fn f<T>(v: Vec<T>) -> usize { v.len() }\n", "generic function"),
-        (
-            "pub struct P { pub x: u32 }\n\
-             impl Default for P { fn default() -> P { P { x: 0 } } }\n\
-             pub fn f(p: &mut P) -> u32 { let q = core::mem::take(p); q.x }\n",
-            "mem::take",
-        ),
         (
             "pub fn f(v: &mut Vec<u32>, i: usize, c: bool) { let r = if c { &mut v[i] } else { &mut v[0] }; *r = 1; }\n",
             "`&mut`",
@@ -2580,11 +2579,12 @@ fn what_ordering_has_beyond_the_model_is_refused_by_name() {
 /// What the `derives` fixture enables: derived `Clone` and `PartialEq`, and `Vec`'s and
 /// `Option`'s.
 const DERIVE_FLAGS: &str =
-    "sized, copy, add, ord, eq, fn, builtin_impls, derive, clone, vec, vec_eq, option_clone, ord_ops";
+    "sized, copy, add, ord, eq, fn, builtin_impls, derive, clone, vec, vec_eq, option_clone, ord_ops, phantom_data, discriminant";
 
 /// A struct, an enum and a struct of a `Vec` and an `Option` of them, each deriving `Clone`
 /// and `PartialEq`, a struct with its own impls, and a theorem function.
-const DERIVES: &str = "#[derive(Clone, Copy, PartialEq)]
+const DERIVES: &str = "use core::marker::PhantomData;
+#[derive(Clone, Copy, PartialEq)]
 pub struct Point { pub x: u32, pub y: u32 }
 #[derive(Clone, PartialEq)]
 pub enum Shape { Dot(Point), Line(Point, Point), Empty }
@@ -2620,6 +2620,27 @@ pub fn waited_eq_is_the_values(x: u32) -> bool {
         && !waited_differ(&Waited::Ready(x), &Waited::Ready(x))
         && copy_waited(&Waited::Ready(Point { x, y: 1 })) == Waited::Ready(Point { x, y: 1 })
         && ready_or(Waited::Deadline, x) == 0
+}
+#[derive(Clone, Copy, PartialEq)]
+pub struct Tagged<K> { pub id: u32, pub of: PhantomData<fn() -> K> }
+pub fn tag(id: u32) -> Tagged<Point> { Tagged { id, of: PhantomData } }
+pub fn copy_tagged(t: &Tagged<Point>) -> Tagged<Point> { *t }
+pub fn clone_tagged(t: &Tagged<Point>) -> Tagged<Point> { t.clone() }
+pub fn same_tagged(a: &Tagged<Point>, b: &Tagged<Point>) -> bool { a == b }
+pub fn marker_of(t: Tagged<Point>) -> PhantomData<fn() -> Point> { t.of }
+pub fn marker() -> PhantomData<&'static u32> { PhantomData }
+#[blaze::theorem]
+pub fn tagged_eq_is_its_id(a: u32, b: u32) -> bool {
+    same_tagged(&tag(a), &tag(b)) == (a == b)
+        && same_tagged(&clone_tagged(&tag(a)), &copy_tagged(&tag(a)))
+        && same_tagged(&Tagged { id: a, of: marker_of(tag(b)) }, &tag(a))
+}
+pub fn same_point_and_tag(p: &Point, q: &Point, a: &Tagged<Point>, b: &Tagged<Point>) -> bool {
+    p == q && a == b
+}
+#[blaze::theorem]
+pub fn point_and_tag_eq(x: u32, y: u32, a: u32) -> bool {
+    same_point_and_tag(&Point { x, y }, &Point { x, y }, &tag(a), &tag(a))
 }
 ";
 
@@ -2716,8 +2737,46 @@ fn a_derive_at_an_instance_is_the_values_own_recorded_or_expanded() {
     }
 }
 
-/// A `clone` or `==` that is not the value's own is refused by name: a derive over a field
-/// with a hand-written impl, a `Vec` of such a type, and a derived order. (A float is refused
+/// `PhantomData<T>` is `core.marker.PhantomData`, one Lean type for every `T` (its `T`, here
+/// `fn() -> Point` and `&'static u32`, is never translated): built as `PhantomData.mk`, held
+/// in a struct's field, copied, cloned and compared as part of a derive, where it is always
+/// equal.
+#[test]
+fn phantom_data_is_a_marker_with_one_value() {
+    let cases: [(&str, &[&str]); 6] = [
+        ("tag", &["core.marker.PhantomData.mk"]),
+        ("copy_tagged", &["(t : derives.Tagged.Point) : derives.Tagged.Point := t"]),
+        ("clone_tagged", &["(t : derives.Tagged.Point) : derives.Tagged.Point := t"]),
+        ("same_tagged", &["core.cmp.PartialEq.eq a b"]),
+        ("marker_of", &["core.marker.PhantomData", "t.of"]),
+        ("marker", &["core.marker.PhantomData.mk"]),
+    ];
+    for (name, says) in cases {
+        let out = golden(DERIVE_FLAGS, "derives", name, DERIVES);
+        for it in says {
+            assert!(out.text.contains(it), "`{name}` says `{it}`:\n{}", out.text);
+        }
+    }
+    let out = golden(DERIVE_FLAGS, "derives", "same_tagged", DERIVES);
+    let modules: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+    assert!(modules.contains(&"BlazeModel.derives.Tagged.Point.impl"), "{modules:?}");
+    let out = golden(DERIVE_FLAGS, "derives", "tagged_eq_is_its_id", DERIVES);
+    assert_eq!(out.statement.as_deref(), Some("derives.tagged_eq_is_its_id.spec.statement"));
+    // `derives.Point` and `derives.Tagged.Point`, alike in their last segment, compared in
+    // one model: both impl modules imported together, each instance in its type's namespace.
+    let out = golden(DERIVE_FLAGS, "derives", "same_point_and_tag", DERIVES);
+    let modules: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+    for it in ["BlazeModel.derives.Point.impl", "BlazeModel.derives.Tagged.Point.impl"] {
+        assert!(modules.contains(&it), "{modules:?}");
+        let module = out.imports.iter().find(|m| m.module == it).expect("imported");
+        assert!(module.text.contains("namespace "), "{}", module.text);
+    }
+    let out = golden(DERIVE_FLAGS, "derives", "point_and_tag_eq", DERIVES);
+    assert_eq!(out.statement.as_deref(), Some("derives.point_and_tag_eq.spec.statement"));
+}
+
+/// A `clone`, `==` or order that is not the value's own is refused by name: a derive over a
+/// field with a hand-written impl, a `Vec` of such a type. (A float is refused
 /// as a type before its `==` is reached.)
 #[test]
 fn a_clone_or_eq_that_is_not_the_values_is_refused_by_name() {
@@ -2733,8 +2792,11 @@ fn a_clone_or_eq_that_is_not_the_values_is_refused_by_name() {
             "`Clone::clone` of `main::Own`, whose `Clone` is not derived",
         ),
         (
-            "#[derive(PartialEq, PartialOrd)]\npub struct P { pub x: u32 }\npub fn f(a: &P, b: &P) -> bool { a < b }\n".to_owned(),
-            "`PartialOrd::lt` on `main::P`, whose order is derived",
+            format!(
+                "{own}impl PartialOrd for Own {{ fn partial_cmp(&self, o: &Own) -> Option<core::cmp::Ordering> {{ None }} }}\n\
+                 #[derive(PartialEq, PartialOrd)]\npub struct P {{ pub o: Own }}\npub fn f(a: &P, b: &P) -> bool {{ a < b }}\n"
+            ),
+            "the order of `main::Own`, whose `PartialOrd` is not derived",
         ),
     ];
     for (source, what) in cases {
@@ -3354,9 +3416,9 @@ fn what_opaque_items_leave_out_is_refused_by_name() {
         ),
         (
             "",
-            "pub fn f(fm: &mut fmt::Formatter<'_>) -> u32 { fm.debug_struct(\"x\"); 0 }\n",
-            "a call of `core::fmt::Formatter::debug_struct`, a method of an opaque type that is not in \
-             the list of opaque functions",
+            "pub fn f(d: &mut fmt::DebugStruct) -> fmt::Result { d.finish() }\n",
+            "a call of `core::fmt::builders::DebugStruct::finish` on a builder this function did not \
+             make (the formatter it writes to is not known here, and a builder is used linearly)",
         ),
         (
             "",
@@ -3365,9 +3427,9 @@ fn what_opaque_items_leave_out_is_refused_by_name() {
              structure in the model; rule NoModel)",
         ),
         (
-            "",
-            "pub fn f(d: fmt::DebugStruct) -> u32 { 0 }\n",
-            "the standard library's type `DebugStruct`, which has no model and is not in the list of \
+            ", cell",
+            "pub fn f(d: core::cell::Cell<u32>) -> u32 { 0 }\n",
+            "the standard library's type `Cell`, which has no model and is not in the list of \
              opaque types (rule NoModel)",
         ),
         (
@@ -3388,8 +3450,9 @@ fn what_opaque_items_leave_out_is_refused_by_name() {
         (
             "",
             "pub fn f(fm: &mut fmt::Formatter<'_>, x: u32) -> fmt::Result { write!(fm, \"{}\", x) }\n",
-            "a call of the standard library's `new_display`, which has no model and is not in the list \
-             of opaque functions (rule NoModel)",
+            // `new_display` is an opaque function; `Arguments::new`'s template, a byte array, is not
+            // translated.
+            "a constant of type `Ref(Array(Int(U8), 2))`",
         ),
     ];
     let mut wrong = Vec::new();
@@ -3593,6 +3656,7 @@ pub mod sync {
             pub fn load(&self, order: Ordering) -> u32 { self.v }
             pub fn store(&self, v: u32, order: Ordering) {}
             pub fn fetch_add(&self, v: u32, order: Ordering) -> u32 { self.v }
+            pub fn swap(&self, v: u32, order: Ordering) -> u32 { self.v }
             pub fn compare_exchange(&self, current: u32, new: u32, success: Ordering, failure: Ordering) -> Result<u32, u32> { Ok(self.v) }
             pub fn compare_exchange_weak(&self, current: u32, new: u32, success: Ordering, failure: Ordering) -> Result<u32, u32> { Ok(self.v) }
             pub fn compare_and_swap(&self, current: u32, new: u32, order: Ordering) -> u32 { self.v }
@@ -3617,6 +3681,7 @@ pub mod world {
         pub enum Ended<T> { Done(T), Running, Asleep }
         pub enum Woke { Woken, Changed, Spurious, TimedOut }
         pub fn two<A, B>(schedule: &[Step], first: impl FnOnce() -> A, second: impl FnOnce() -> B) -> (Ended<A>, Ended<B>) { loop {} }
+        pub fn two_weak<A, B>(schedule: &[Step], first: impl FnOnce() -> A, second: impl FnOnce() -> B) -> (Ended<A>, Ended<B>) { loop {} }
         pub fn wait(word: &AtomicU32, expected: u32, timed: bool) -> Woke { Woke::Spurious }
         pub fn wake(word: &AtomicU32) -> bool { false }
         pub fn yield_now() {}
@@ -3627,7 +3692,7 @@ pub mod world {
 /// The crate `krate`, whose source is `source`, over [`ATOMICS_STD`].
 fn atomics_fixture(krate: &str, source: &str) -> String {
     format!(
-        "//- minicore: {CLOSURE_FLAGS}\n//- /lib.rs crate:{krate} deps:sync_std,blaze_core cfg:overflow_checks\n{source}{ATOMICS_STD}"
+        "//- minicore: {CLOSURE_FLAGS}, vec, drop, reach, option_methods\n//- /lib.rs crate:{krate} deps:sync_std,blaze_core cfg:overflow_checks\n{source}{ATOMICS_STD}"
     )
 }
 
@@ -3730,6 +3795,282 @@ pub fn bump_and_wake(word: &AtomicU32) -> bool {
     word.fetch_add(1, Ordering::Release);
     threads::wake(word)
 }
+const EMPTY: u32 = 0;
+const NOTIFIED: u32 = 1;
+const PARKED: u32 = 0xffff_ffff;
+pub fn park_loop(word: &AtomicU32, timed: bool) -> bool {
+    loop {
+        let woke = threads::wait(word, PARKED, timed);
+        match word.compare_exchange(NOTIFIED, EMPTY, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(_) => {}
+        }
+        match woke {
+            Woke::TimedOut => return word.swap(EMPTY, Ordering::Acquire) == NOTIFIED,
+            _ => {}
+        }
+    }
+}
+pub fn park(word: &AtomicU32, timed: bool) -> bool {
+    match word.compare_exchange(NOTIFIED, EMPTY, Ordering::Acquire, Ordering::Relaxed) {
+        Ok(_) => return true,
+        Err(_) => {}
+    }
+    match word.compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire) {
+        Err(_) => {
+            word.store(EMPTY, Ordering::Relaxed);
+            true
+        }
+        Ok(_) => park_loop(word, timed),
+    }
+}
+pub fn plant_then_wait(word: &AtomicU32, timed: bool, plant: bool) -> bool {
+    if plant {
+        word.store(PARKED, Ordering::Release);
+    } else {
+        match word.compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire) {
+            Err(_) => return true,
+            Ok(_) => {}
+        }
+    }
+    loop {
+        let woke = threads::wait(word, PARKED, timed);
+        if word.load(Ordering::Acquire) == NOTIFIED {
+            return true;
+        }
+        match woke {
+            Woke::TimedOut => return false,
+            _ => {}
+        }
+    }
+}
+pub fn two_ways(word: &AtomicU32, how: u32) -> u32 {
+    match how {
+        0 => return 0,
+        1 => word.store(1, Ordering::Relaxed),
+        _ => word.store(2, Ordering::Relaxed),
+    }
+    word.fetch_add(1, Ordering::SeqCst);
+    word.load(Ordering::SeqCst)
+}
+pub fn tail_reads_binding(n: &AtomicU32, how: u32) -> u32 {
+    loop {
+        match n.compare_exchange_weak(0, 1, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(old) => {
+                match how {
+                    0 => return 0,
+                    1 => n.store(1, Ordering::Relaxed),
+                    _ => n.store(2, Ordering::Relaxed),
+                }
+                n.fetch_add(old, Ordering::SeqCst);
+                return n.load(Ordering::SeqCst);
+            }
+            Err(_) => {}
+        }
+    }
+}
+pub fn copied_tail(n: &AtomicU32, how: u32) -> u32 {
+    let mut seen = n.load(Ordering::Relaxed);
+    loop {
+        match n.compare_exchange_weak(seen, seen + 1, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(old) => return old,
+            Err(now) => {
+                match how {
+                    0 => return now,
+                    1 => n.store(1, Ordering::Relaxed),
+                    _ => n.store(2, Ordering::Relaxed),
+                }
+                n.fetch_add(now, Ordering::SeqCst);
+                seen = n.load(Ordering::SeqCst);
+            }
+        }
+    }
+}
+pub enum Waited { Ready(()), Deadline }
+pub struct WaitError { pub still: u32 }
+pub enum Next { Deadline, Again }
+pub struct Retry { pub still: u32, pub deadline: Option<u32> }
+impl Retry {
+    pub fn new(deadline: Option<u32>, now: u32) -> Retry { Retry { still: now, deadline } }
+    pub fn after(&mut self, now: u32) -> Result<Next, WaitError> {
+        if self.still >= 3 {
+            return Err(WaitError { still: self.still });
+        }
+        self.still += 1;
+        match self.deadline {
+            Some(at) => if now >= at { Ok(Next::Deadline) } else { Ok(Next::Again) },
+            None => Ok(Next::Again),
+        }
+    }
+}
+pub trait Futex {
+    fn prepare(&self, word: &AtomicU32) { _ = word; }
+    fn wait(&self, word: &AtomicU32, expected: u32, deadline: Option<u32>) -> Result<Waited, WaitError>;
+    fn wake(&self, word: &AtomicU32);
+    fn switch(&self) {}
+}
+pub struct Shared;
+impl Futex for Shared {
+    fn wait(&self, word: &AtomicU32, expected: u32, deadline: Option<u32>) -> Result<Waited, WaitError> {
+        Ok(match threads::wait(word, expected, deadline.is_some()) {
+            Woke::TimedOut => Waited::Deadline,
+            _ => Waited::Ready(()),
+        })
+    }
+    fn wake(&self, word: &AtomicU32) { _ = threads::wake(word); }
+}
+pub enum ParkPlant { None, CheckThenStore }
+pub fn park_real<K: Futex>(word: &AtomicU32, kernel: &K, deadline: Option<u32>, now: u32, plant: ParkPlant) -> Result<Waited, WaitError> {
+    kernel.switch();
+    if word.compare_exchange(NOTIFIED, EMPTY, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        return Ok(Waited::Ready(()));
+    }
+    kernel.prepare(word);
+    kernel.switch();
+    if let ParkPlant::None = plant {
+        if word.compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            kernel.switch();
+            word.store(EMPTY, Ordering::Relaxed);
+            return Ok(Waited::Ready(()));
+        }
+    } else {
+        if word.load(Ordering::Acquire) == NOTIFIED {
+            word.store(EMPTY, Ordering::Relaxed);
+            return Ok(Waited::Ready(()));
+        }
+        kernel.switch();
+        word.store(PARKED, Ordering::Release);
+    }
+    let mut retry = Retry::new(deadline, now);
+    loop {
+        kernel.switch();
+        let waited = match kernel.wait(word, PARKED, deadline) {
+            Ok(waited) => waited,
+            Err(error) => {
+                return match word.swap(EMPTY, Ordering::Acquire) {
+                    NOTIFIED => Ok(Waited::Ready(())),
+                    _ => Err(error),
+                };
+            }
+        };
+        kernel.switch();
+        if word.compare_exchange(NOTIFIED, EMPTY, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return Ok(Waited::Ready(()));
+        }
+        let passed = match waited {
+            Waited::Deadline => true,
+            Waited::Ready(()) => match retry.after(now) {
+                Ok(Next::Deadline) => true,
+                Ok(Next::Again) => false,
+                Err(error) => {
+                    return match word.swap(EMPTY, Ordering::Acquire) {
+                        NOTIFIED => Ok(Waited::Ready(())),
+                        _ => Err(error),
+                    };
+                }
+            },
+        };
+        if passed {
+            kernel.switch();
+            return Ok(match word.swap(EMPTY, Ordering::Acquire) {
+                NOTIFIED => Waited::Ready(()),
+                _ => Waited::Deadline,
+            });
+        }
+    }
+}
+pub fn unpark_real<K: Futex>(word: &AtomicU32, kernel: &K) {
+    kernel.switch();
+    if word.swap(NOTIFIED, Ordering::Release) == PARKED {
+        kernel.switch();
+        kernel.wake(word);
+    }
+}
+pub fn parks_real(schedule: &[Step], deadline: Option<u32>) -> bool {
+    let word = AtomicU32::new(EMPTY);
+    let (parked, unparked) = threads::two(
+        schedule,
+        || park_real(&word, &Shared, deadline, 0, ParkPlant::None),
+        || unpark_real(&word, &Shared),
+    );
+    let last = word.load(Ordering::SeqCst);
+    let both = match unparked {
+        Ended::Done(()) => true,
+        _ => false,
+    };
+    match parked {
+        Ended::Asleep => !both,
+        Ended::Running => true,
+        Ended::Done(Ok(Waited::Ready(()))) => !both || last == EMPTY,
+        Ended::Done(Ok(Waited::Deadline)) => deadline.is_some() && (!both || last == NOTIFIED),
+        Ended::Done(Err(_)) => !both || last == NOTIFIED,
+    }
+}
+pub fn or_pattern_tail(word: &AtomicU32, parked: Ended<Result<Waited, WaitError>>, deadline: Option<u32>) -> bool {
+    let end = word.load(Ordering::SeqCst);
+    let passed = match deadline {
+        Some(at) => end >= at,
+        None => false,
+    };
+    match parked {
+        Ended::Asleep => !passed,
+        Ended::Done(Ok(Waited::Deadline)) => passed,
+        Ended::Done(Ok(Waited::Ready(()))) | Ended::Done(Err(_)) | Ended::Running => true,
+    }
+}
+pub fn unpark(word: &AtomicU32) {
+    if word.swap(NOTIFIED, Ordering::Release) == PARKED {
+        _ = threads::wake(word);
+    }
+}
+#[blaze::theorem]
+pub fn parks_once(schedule: Vec<Step>, timed: bool) -> bool {
+    let word = AtomicU32::new(EMPTY);
+    let (parked, unparked) = threads::two(&schedule, || park(&word, timed), || unpark(&word));
+    let last = word.load(Ordering::SeqCst);
+    let both = match unparked {
+        Ended::Done(()) => true,
+        _ => false,
+    };
+    match parked {
+        Ended::Asleep => !both,
+        Ended::Running => true,
+        Ended::Done(true) => !both || last == EMPTY,
+        Ended::Done(false) => timed && (!both || last == NOTIFIED),
+    }
+}
+#[blaze::theorem]
+pub fn weak_message_is_passed(schedule: Vec<Step>) -> bool {
+    let data = AtomicU32::new(0);
+    let flag = AtomicU32::new(0);
+    let (_, read) = threads::two_weak(
+        &schedule,
+        || {
+            data.store(42, Ordering::Relaxed);
+            flag.store(1, Ordering::Release);
+        },
+        || if flag.load(Ordering::Acquire) == 1 { data.load(Ordering::Relaxed) } else { 42 },
+    );
+    match read {
+        Ended::Done(seen) => seen == 42,
+        _ => true,
+    }
+}
+pub fn weak_bumps(schedule: &[Step], n: &AtomicU32) -> bool {
+    match threads::two_weak(schedule, || bump(n), || bump(n)) {
+        (Ended::Done(a), Ended::Done(b)) => a != b,
+        _ => true,
+    }
+}
+#[blaze::theorem]
+pub fn both_worlds(schedule: Vec<Step>) -> bool {
+    let n = AtomicU32::new(0);
+    let strong = match threads::two(&schedule, || bump(&n), || bump(&n)) {
+        (Ended::Done(a), Ended::Done(b)) => a != b,
+        _ => true,
+    };
+    strong && weak_bumps(&schedule, &n)
+}
 ";
 
 /// A function that touches the memory threads share is shared: its model is a
@@ -3737,11 +4078,14 @@ pub fn bump_and_wake(word: &AtomicU32) -> bool {
 /// a `Result` bound in it lifted and an end made a program by `Threads.Prog.done`; a function
 /// that calls a shared one (through a closure, `Option::map`'s instance or a loop) is shared
 /// too, and pure and `Result` functions it calls stay as they are. `two`, `wait` and `wake` of
-/// `blaze_core::world::threads` are `Threads.two_of`, `Threads.wait` and `Threads.wake`.
+/// `blaze_core::world::threads` are `Threads.two_of`, `Threads.wait` and `Threads.wake`, and
+/// `two_weak` is `Threads.two_of` too: a theorem that reaches it is stated over
+/// `Threads.Prog.valueWeak`, one that reaches `two` or neither over `Threads.Prog.value`, and
+/// one that reaches both is refused (decision D46).
 #[test]
 fn atomics_are_programs_over_shared_memory() {
     let fixture = atomics_fixture("atomics", ATOMICS);
-    let cases: [(&str, &[&str]); 17] = [
+    let cases: [(&str, &[&str]); 27] = [
         // A trait's provided bodies at the implementor `Real`, the required `kind` they call
         // resolved to `Real`'s.
         ("poke_twice", &["atomics.Real.Kernel.poke k word"]),
@@ -3761,6 +4105,30 @@ fn atomics_are_programs_over_shared_memory() {
         ("race", &["Threads.two_of schedule"]),
         ("mixed_threads", &["Threads.Prog.done (Result.ok", "Threads.Prog.done (atomics.mixed_threads.closure1.call"]),
         ("sleep_unless_changed", &["Threads.wait word seen false", "Threads.Woke.Changed"]),
+        // Program points: the code after each shared call is a definition of its own.
+        ("park", &["def atomics.park.at_1 ", "def atomics.park.at_2 "]),
+        ("park_loop", &["def atomics.park_loop.loop_0.at_1 (loop_0 : core.sync.atomic.Atomic .U32 → Bool → Threads.Prog Bool)"]),
+        ("unpark", &["def atomics.unpark.at_1 "]),
+        // The loop after a branch one arm returns from is written once, and both other arms
+        // go on to it.
+        ("plant_then_wait", &["def atomics.plant_then_wait.loop_0 "]),
+        // The code two arms go on to after their stores is one point both call.
+        ("two_ways", &["atomics.two_ways.at_1 word"]),
+        // blaze-core's park and unpark (crates/blaze-core/src/wait/parking.rs), as the
+        // stand-ins allow: early returns from the loop's nested matches.
+        ("parks_real", &["Threads.two_of schedule"]),
+        ("parks_once", &["Threads.two_of"]),
+        // `two_weak` is `two`'s program; its theorem is stated in the weak world.
+        (
+            "weak_message_is_passed",
+            &["Threads.two_of schedule", "(atomics.weak_message_is_passed schedule).valueWeak = Result.ok true"],
+        ),
+        // A tail two arms share reads the binding of the arm around them: the binding stays,
+        // though only the tail reads it.
+        ("tail_reads_binding", &["let old := v0", "atomics.tail_reads_binding.loop_0.at_2 n old"]),
+        // The code after the loop reads the `Ok` arm's field, which no `match` binds there: it
+        // cannot be a tail the arms share, and is written in the arm that goes on to it.
+        ("copied_tail", &["| core.result.Result.Ok v0 => Threads.Prog.done (Result.ok v0)"]),
     ];
     let mut wrong = Vec::new();
     for (name, says) in cases {
@@ -3776,12 +4144,49 @@ fn atomics_are_programs_over_shared_memory() {
         counted.imports.iter().any(|it| it.text.contains("core.sync.atomic.Atomic.store")),
         "`Counter::double` stores through `&self`"
     );
+    let out = emitted_from(&fixture, "atomics", "plant_then_wait");
+    assert!(!out.text.contains("loop_1"), "the loop after the branch is written once:\n{}", out.text);
+    let out = emitted_from(&fixture, "atomics", "two_ways");
+    assert_eq!(out.text.matches("fetch_add").count(), 1, "the arms' tail is written once:\n{}", out.text);
+    let out = emitted_from(&fixture, "atomics", "copied_tail");
+    assert!(
+        !out.text.contains("atomics.copied_tail.at_"),
+        "nothing is written after the loop:\n{}",
+        out.text
+    );
     let out = golden_from(&fixture, "atomics", "bump_and_wake");
     assert!(out.text.contains("Threads.wake word"), "{}", out.text);
+    // An or-pattern's three alternatives, tested at three depths, go on to one arm, and MIR
+    // tests them again at the start of that arm, to bind. The `match` touches no shared memory:
+    // it is a plain value, each alternative goes on to the arm in place, and there what the
+    // tests before it narrowed `parked` to decides the second test, which leaves nothing.
+    let out = emitted_from(&fixture, "atomics", "or_pattern_tail");
+    assert!(!out.text.contains('\u{0}'), "a placeholder is left in the model:\n{}", out.text);
+    assert!(!out.text.contains("let _ ←"), "the arm's second test is left in the model:\n{}", out.text);
+    golden_from(&fixture, "atomics", "or_pattern_tail");
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    for name in ["two_adds_make_two", "adds_until_done", "pokes_count"] {
+    for name in ["two_adds_make_two", "adds_until_done", "pokes_count", "parks_once", "weak_message_is_passed"] {
         let theorem = emitted_from(&fixture, "atomics", name);
         assert_eq!(theorem.statement, Some(format!("atomics.{name}.spec.statement")));
+    }
+    // A theorem that reaches `two`, or no runner, is stated in the sequentially consistent
+    // world; neither says `valueWeak`.
+    for name in ["parks_once", "two_adds_make_two"] {
+        let theorem = emitted_from(&fixture, "atomics", name);
+        assert!(theorem.text.contains(".value = Result.ok true"), "{}", theorem.text);
+        assert!(!theorem.text.contains("valueWeak"), "{}", theorem.text);
+    }
+    // A theorem that reaches `two` itself and `two_weak` through a callee is refused, by name.
+    let db = db(&fixture);
+    match emit(&db, function(&db, "atomics", "both_worlds")) {
+        Err(err) => assert!(
+            err.what.contains(
+                "the `#[blaze::theorem]` `atomics::both_worlds`: it reaches both `threads::two` and \
+                 `threads::two_weak`: a theorem is stated in one memory (decision D46)"
+            ),
+            "{err}"
+        ),
+        Ok(it) => panic!("a theorem in two memories is not refused:\n{}", it.text),
     }
     // The `Ok` arm's binding is what the loop returns: no second test of the `Result` after the
     // loop, and no arm that cannot be reached.
@@ -3792,6 +4197,59 @@ fn atomics_are_programs_over_shared_memory() {
     for module in ["BlazeModel.atomics.Real.Kernel.prepare", "BlazeModel.atomics.Real.Kernel.poke", "BlazeModel.atomics.Real.Kernel.kind"] {
         assert!(modules.contains(&module), "`poke_twice` imports {module}: {modules:?}");
     }
+}
+
+/// The check that ends every translation finds a placeholder of the translator's own (a tail's
+/// call, `\0join<n>`; a program point's, `\0point<n>`) wherever a model still holds one, and
+/// names it; a model with none passes. No body reaches the refusal it guards (every
+/// placeholder is replaced), so the check is tested on models built here.
+#[test]
+fn a_placeholder_left_in_a_model_is_found() {
+    let def = |body: lean::Term| lean::Decl::Def {
+        name: "f".to_owned(),
+        params: Vec::new(),
+        ty: lean::Term::Name("Bool".to_owned()),
+        body,
+    };
+    let call = |head: &str| {
+        lean::Term::App(Box::new(lean::Term::Name(head.to_owned())), vec![lean::Term::Name("x".to_owned())])
+    };
+    let mut joined = [def(lean::Term::Name("x".to_owned())), def(call("\u{0}join3"))];
+    assert_eq!(crate::translate::placeholder_left(&mut joined), Some("join3".to_owned()));
+    let mut pointed = [lean::Decl::Mutual(vec![def(call("\u{0}point0"))])];
+    assert_eq!(crate::translate::placeholder_left(&mut pointed), Some("point0".to_owned()));
+    let mut clean = [def(call("f.at_1"))];
+    assert_eq!(crate::translate::placeholder_left(&mut clean), None);
+}
+
+/// A `Step` built from its fields, `Step { second: false, pick: 0 }`, is a value of the Lean
+/// structure `Threads.Step`, its fields in order, and can be pushed on a `Vec<Step>` (as
+/// `blaze_core::wait::parking::settles` builds its schedule).
+#[test]
+fn a_step_is_built_from_its_fields() {
+    let fixture = atomics_fixture(
+        "steps",
+        "use blaze_core::world::threads::Step;\n\
+         pub fn first_step(steps: &mut Vec<Step>) { steps.push(Step { second: false, pick: 0 }); }\n",
+    );
+    let out = emitted_from(&fixture, "steps", "first_step");
+    assert!(out.text.contains("Threads.Step.mk false (0 : U8)"), "{}", out.text);
+}
+
+/// A `Step`'s fields are read as the Lean structure's: `step.second` and `step.pick` (as
+/// `blaze_core::wait::parking::answers` reads whose step each of a schedule's is).
+#[test]
+fn a_steps_fields_are_read() {
+    let fixture = atomics_fixture(
+        "steps",
+        "use blaze_core::world::threads::Step;\n\
+         pub fn is_second(steps: &[Step], at: usize) -> bool { steps[at].second }\n\
+         pub fn pick_of(step: Step) -> u8 { step.pick }\n",
+    );
+    let out = emitted_from(&fixture, "steps", "is_second");
+    assert!(out.text.contains(".second"), "{}", out.text);
+    let out = emitted_from(&fixture, "steps", "pick_of");
+    assert!(out.text.contains("step.pick"), "{}", out.text);
 }
 
 /// What the model of shared memory does not have is refused by name: `AtomicPtr`, an access
@@ -3816,6 +4274,10 @@ fn what_shared_memory_does_not_model_is_refused_by_name() {
             "pub fn f(s: &[Step]) -> u32 { let mut k = 0u32; threads::two(s, || { k += 1; }, || {}); k }\n",
             "captures by unique borrow",
         ),
+        (
+            "pub fn f(s: &[Step]) -> u32 { let mut k = 0u32; threads::two_weak(s, || { k += 1; }, || {}); k }\n",
+            "a closure given to `blaze_core::world::threads::two_weak` that captures by unique borrow",
+        ),
     ];
     let mut wrong = Vec::new();
     for (source, what) in cases {
@@ -3828,4 +4290,670 @@ fn what_shared_memory_does_not_model_is_refused_by_name() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// ---- Constants read by name: a trait's, an inherent one and an anonymous one. ----
+
+/// A trait's constant read at concrete implementors (the impl's own and the trait's default,
+/// by path, by `Self::` and through a generic call's instance), an inherent constant, a
+/// `const { .. }` block and array lengths given by a constant expression.
+const CONSTS: &str = "pub trait Width { const BITS: u32; const BYTES: u32 = Self::BITS / 8; }
+pub struct Narrow;
+pub struct Wide;
+impl Width for Narrow { const BITS: u32 = 8; }
+impl Width for Wide { const BITS: u32 = 64; const BYTES: u32 = 4; }
+pub struct Page;
+impl Page { pub const SIZE: u32 = 4096; }
+pub const fn twice(x: u32) -> u32 { x * 2 }
+pub fn narrow_bits() -> u32 { <Narrow as Width>::BITS }
+pub fn narrow_bytes() -> u32 { Narrow::BYTES }
+pub fn wide_bytes() -> u32 { <Wide as Width>::BYTES }
+impl Wide { pub fn bits(&self) -> u32 { Self::BITS } }
+pub fn wide_bits() -> u32 { Wide.bits() }
+pub fn bits_of<T: Width>() -> u32 { T::BITS }
+pub fn wide_by_instance() -> u32 { bits_of::<Wide>() }
+pub fn page() -> u32 { Page::SIZE }
+pub fn inline() -> u32 { const { twice(21) } }
+pub fn blocks() -> [u8; twice(2) as usize] { [7; Page::SIZE as usize / 1024] }
+#[blaze::theorem]
+pub fn constants_are_their_values() -> bool {
+    narrow_bits() == 8 && narrow_bytes() == 1 && wide_bytes() == 4 && wide_bits() == 64
+        && wide_by_instance() == 64 && page() == 4096 && inline() == 42
+}
+";
+
+/// A constant read by name is its value by const evaluation at the instance, the value the
+/// compiled program reads: a trait's resolved to the implementor's own or the trait's default,
+/// an inherent one, a `const { .. }` block, an array's length.
+#[test]
+fn a_named_constant_is_its_evaluated_value() {
+    let cases: [(&str, &str); 8] = [
+        ("narrow_bits", "(8 : U32)"),
+        ("narrow_bytes", "(1 : U32)"),
+        ("wide_bytes", "(4 : U32)"),
+        ("wide_bits", "consts.Wide.bits"),
+        ("wide_by_instance", "bits_of"),
+        ("page", "(4096 : U32)"),
+        ("inline", "(42 : U32)"),
+        ("blocks", "(7 : U8)"),
+    ];
+    for (name, says) in cases {
+        let out = golden(FLAGS, "consts", name, CONSTS);
+        assert!(out.text.contains(says), "`{name}` says `{says}`:\n{}", out.text);
+    }
+    // `Self::BITS` in a method of `Wide`: the method's own model, which `wide_bits` imports.
+    let out = golden(FLAGS, "consts", "wide_bits", CONSTS);
+    let method = out.imports.iter().find(|it| it.name == "consts.Wide.bits").expect("the method's model");
+    assert!(method.text.contains("(64 : U32)"), "{}", method.text);
+    let out = golden(FLAGS, "consts", "constants_are_their_values", CONSTS);
+    assert_eq!(out.statement.as_deref(), Some("consts.constants_are_their_values.spec.statement"));
+}
+
+
+// ---- Derived orders. ----
+
+const ORDER_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, derive, clone, option, option_clone, ord_ops, ord_methods, discriminant";
+
+/// A struct and enums deriving `PartialOrd` and `Ord`: one of the struct inside the enum, an
+/// enum whose discriminants are not in declaration order, and the trait's methods and
+/// operators called on them.
+const ORDERS: &str = "use core::cmp::Ordering;
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pair { pub hi: u32, pub lo: u32 }
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Key { Small(u8), Named(u32, Pair), Missing }
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(i8)]
+pub enum Signed { Low = -1, Zero = 0, High = -5 }
+pub fn pair_cmp(a: &Pair, b: &Pair) -> Ordering { a.cmp(b) }
+pub fn pair_lt(a: &Pair, b: &Pair) -> bool { a < b }
+pub fn key_cmp(a: &Key, b: &Key) -> Ordering { a.cmp(b) }
+pub fn key_partial(a: &Key, b: &Key) -> Option<Ordering> { a.partial_cmp(b) }
+pub fn key_ge(a: &Key, b: &Key) -> bool { a >= b }
+pub fn key_max(a: Key, b: Key) -> Key { a.max(b) }
+pub fn key_min(a: Key, b: Key) -> Key { a.min(b) }
+pub fn signed_lt(a: Signed, b: Signed) -> bool { a < b }
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Id(pub [u8; 4]);
+pub fn id_cmp(a: &Id, b: &Id) -> Ordering { a.cmp(b) }
+pub fn id_lt(a: &Id, b: &Id) -> bool { a < b }
+#[blaze::theorem]
+pub fn id_order_is_by_bytes() -> bool {
+    id_lt(&Id([0, 0, 0, 9]), &Id([0, 1, 0, 0])) && !id_lt(&Id([1, 0, 0, 0]), &Id([0, 9, 9, 9]))
+}
+#[blaze::theorem]
+pub fn pair_order_is_lexicographic(a: u32, b: u32, c: u32, d: u32) -> bool {
+    pair_lt(&Pair { hi: a, lo: b }, &Pair { hi: c, lo: d }) == (a < c || (a == c && b < d))
+        && pair_cmp(&Pair { hi: a, lo: b }, &Pair { hi: a, lo: b }) == Ordering::Equal
+}
+#[blaze::theorem]
+pub fn key_order_is_by_variant_then_fields(x: u8, n: u32, m: u32, p: Pair, q: Pair) -> bool {
+    key_cmp(&Key::Small(x), &Key::Named(n, p)) == Ordering::Less
+        && key_cmp(&Key::Missing, &Key::Named(n, p)) == Ordering::Greater
+        && key_ge(&Key::Named(n, p), &Key::Named(m, q)) == (n > m || (n == m && !pair_lt(&p, &q)))
+        && key_max(Key::Missing, Key::Small(x)) == Key::Missing
+        && key_min(Key::Missing, Key::Small(x)) == Key::Small(x)
+        && signed_lt(Signed::High, Signed::Low)
+        && signed_lt(Signed::Low, Signed::Zero)
+}
+";
+
+/// A derived order is its type's `cmp` in the type's order module, lexicographic over the
+/// fields and, for an enum, over the discriminants first; `partial_cmp`, `<`.. and `max`,
+/// `min` are by it.
+#[test]
+fn a_derived_order_is_lexicographic_over_the_fields() {
+    let cases: [(&str, &str); 10] = [
+        ("pair_cmp", "orders.Pair.impl.cmp a b"),
+        ("pair_lt", "orders.Pair.impl.lt a b"),
+        ("key_cmp", "orders.Key.impl.cmp a b"),
+        ("key_partial", "orders.Key.impl.partial_cmp a b"),
+        ("key_ge", "orders.Key.impl.ge a b"),
+        ("key_max", "orders.Key.impl.max a b"),
+        ("key_min", "orders.Key.impl.min a b"),
+        ("signed_lt", "orders.Signed.impl.lt a b"),
+        ("id_cmp", "orders.Id.impl.cmp a b"),
+        ("id_lt", "orders.Id.impl.lt a b"),
+    ];
+    for (name, says) in cases {
+        let out = golden(ORDER_FLAGS, "orders", name, ORDERS);
+        assert!(out.text.contains(says), "`{name}` says `{says}`:\n{}", out.text);
+    }
+    // `Key`'s order compares a `Pair` by `Pair`'s, whose module it imports.
+    let out = golden(ORDER_FLAGS, "orders", "key_cmp", ORDERS);
+    let key = out.imports.iter().find(|it| it.module == "BlazeModel.orders.Key.ord").expect("Key's order");
+    assert!(key.text.contains("import BlazeModel.orders.Pair.ord"), "{}", key.text);
+    assert!(key.text.contains("orders.Pair.impl.cmp"), "{}", key.text);
+    let signed = golden(ORDER_FLAGS, "orders", "signed_lt", ORDERS);
+    let signed = signed.imports.iter().find(|it| it.module == "BlazeModel.orders.Signed.ord").expect("Signed's order");
+    assert!(signed.text.contains("(-5 : Int)"), "{}", signed.text);
+    // `Id`'s order is its array's: the bytes in turn.
+    let id = golden(ORDER_FLAGS, "orders", "id_cmp", ORDERS);
+    let id = id.imports.iter().find(|it| it.module == "BlazeModel.orders.Id.ord").expect("Id's order");
+    assert!(id.text.contains("core.cmp.Order.array Scalar.cmp"), "{}", id.text);
+    for theorem in ["pair_order_is_lexicographic", "key_order_is_by_variant_then_fields", "id_order_is_by_bytes"] {
+        let out = golden(ORDER_FLAGS, "orders", theorem, ORDERS);
+        assert_eq!(out.statement, Some(format!("orders.{theorem}.spec.statement")));
+    }
+}
+
+// ---- Formatting: derived `Debug` over opaque builders (lean/Blaze/Opaque.lean, what is
+// trusted). ----
+
+/// What the `fmts` fixture enables: the formatter, its builders and `Debug`, and derives.
+const FMT_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, option, result, fmt, str, derive, unsize, coerce_unsized, dispatch_from_dyn";
+
+/// A struct, a tuple struct and an enum of all three kinds of variant deriving `Debug`, a
+/// hand-written `Debug` chaining a builder's calls, and functions that format each.
+const FMTS: &str = "use core::fmt;
+#[derive(Debug)]
+pub struct Point { pub x: i32, pub y: i32 }
+#[derive(Debug)]
+pub struct Meters(pub u32);
+#[derive(Debug)]
+pub enum Shape { Dot, Line(Point, Point), Square { corner: Point, side: u32 } }
+pub struct Hand { pub n: u8 }
+impl fmt::Debug for Hand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(\"Hand\").field(\"n\", &self.n).finish()
+    }
+}
+pub fn show_point(p: &Point, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(p, f) }
+pub fn show_meters(m: &Meters, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(m, f) }
+pub fn show_shape(s: &Shape, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(s, f) }
+pub fn show_hand(h: &Hand, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(h, f) }
+";
+
+/// `name` of `krate` from `source` with its builtin derives expanded, as a build expands them
+/// (`hir_def::nameres::set_expand_builtin_derives`), emitted twice the same and against its
+/// goldens.
+#[track_caller]
+fn golden_expanded(flags: &str, krate: &str, name: &str, source: &str) -> Emitted {
+    let fixture = fixture_of(flags, krate, source);
+    let once = || {
+        let expanded = expanded_db(&fixture);
+        let func = function(&expanded, krate, name);
+        emit(&expanded, func)
+    };
+    let out = once().unwrap_or_else(|err| panic!("`{name}` with its derives expanded: {err}"));
+    assert_eq!(once().map(|it| it.text).ok().as_ref(), Some(&out.text));
+    assert_goldens(&out);
+    out
+}
+
+/// A derived `Debug` is its expansion over the opaque builders: `debug_struct` or
+/// `debug_tuple`, `field` with each field as a `&dyn Debug` (one opaque function per type),
+/// `finish`; a unit variant `write_str`. The builder is used linearly: after each call of it the
+/// formatter is `<builder>.formatter` of it. A hand-written `Debug` is ordinary code over the
+/// same functions.
+#[test]
+fn a_derived_debug_writes_through_a_linear_builder() {
+    let cases: [(&str, &str, &[&str]); 4] = [
+        ("show_point", "fmts.Point.Debug.fmt", &[
+            "core.fmt.Formatter.debug_struct",
+            "core.fmt.DebugStruct.field",
+            "core.fmt.builders.DebugStruct.formatter",
+            "core.fmt.Debug.dyn.ref_i32",
+            "core.fmt.DebugStruct.finish",
+        ]),
+        ("show_meters", "fmts.Meters.Debug.fmt", &[
+            "core.fmt.Formatter.debug_tuple",
+            "core.fmt.DebugTuple.field",
+            "core.fmt.builders.DebugTuple.formatter",
+            "core.fmt.Debug.dyn.ref_u32",
+            "core.fmt.DebugTuple.finish",
+        ]),
+        ("show_shape", "fmts.Shape.Debug.fmt", &[
+            "core.fmt.Formatter.write_str",
+            "core.fmt.Formatter.debug_tuple",
+            "core.fmt.Formatter.debug_struct",
+            "core.fmt.Debug.dyn.ref_Point",
+            "core.fmt.Debug.dyn.ref_u32",
+        ]),
+        ("show_hand", "fmts.Hand.Debug.fmt", &[
+            "core.fmt.Formatter.debug_struct",
+            "core.fmt.DebugStruct.field",
+            "core.fmt.builders.DebugStruct.formatter",
+            "core.fmt.Debug.dyn.u8",
+            "core.fmt.DebugStruct.finish",
+        ]),
+    ];
+    for (name, fmt, calls) in cases {
+        let out = golden_expanded(FMT_FLAGS, "fmts", name, FMTS);
+        assert!(out.text.contains(fmt), "`{name}` calls `{fmt}`:\n{}", out.text);
+        let module = format!("BlazeModel.{fmt}");
+        let body = out.imports.iter().find(|it| it.module == module).unwrap_or_else(|| panic!("`{name}` imports `{module}`"));
+        for call in calls.iter() {
+            assert!(body.text.contains(call), "`{fmt}` calls `{call}`:\n{}", body.text);
+        }
+    }
+    // The test library's builders are in `fmt` itself (the pinned nightly's in `fmt::builders`),
+    // so their methods are named there; the type and the formatter step are the list's.
+    // `field` is lent the builder and gives it back, and nothing of its own (the `&mut Self`
+    // it returns is the builder); the formatter after it is a function of the builder.
+    let out = golden_expanded(FMT_FLAGS, "fmts", "show_point", FMTS);
+    let field = out.imports.iter().find(|it| it.module == "BlazeModel.core.fmt.DebugStruct.field").expect("imported");
+    assert!(
+        field.text.contains(
+            "\nopaque core.fmt.DebugStruct.field (a0 : core.fmt.builders.DebugStruct) (a1 : Str) \
+             (a2 : core.fmt.DynDebug) : Result core.fmt.builders.DebugStruct\n"
+        ),
+        "{}",
+        field.text
+    );
+    assert_eq!(field.shape.mut_params, [0]);
+    assert!(field.shape.returns_unit);
+    let formatter =
+        out.imports.iter().find(|it| it.module == "BlazeModel.core.fmt.builders.DebugStruct.formatter").expect("imported");
+    assert!(
+        formatter.text.contains(
+            "\nopaque core.fmt.builders.DebugStruct.formatter (a0 : core.fmt.builders.DebugStruct) : \
+             Result core.fmt.Formatter\n"
+        ),
+        "{}",
+        formatter.text
+    );
+    // Every call of the builder is followed by the formatter set from it: as many `formatter`
+    // calls as calls of the builder and of `debug_struct`.
+    let point = out.imports.iter().find(|it| it.module == "BlazeModel.fmts.Point.Debug.fmt").expect("imported");
+    assert_eq!(point.text.matches("core.fmt.builders.DebugStruct.formatter ").count(), 4, "{}", point.text);
+    // Each step the model adds is listed with why it is a function of its arguments.
+    for step in ["core.fmt.builders.DebugStruct.formatter", "core.fmt.builders.DebugTuple.formatter", "core.fmt.Debug.dyn"] {
+        let (_, why) = crate::body::OPAQUE_STEPS.iter().find(|it| it.0 == step).expect("listed");
+        assert!(why.contains("assumption of formatting"), "{why}");
+    }
+}
+
+// ---- A derive's own method asked for alone (V15, piece 1). ----
+
+/// The database of `fixture` with its builtin derives expanded, as a build expands them.
+fn expanded_db(fixture: &str) -> Db {
+    // The switch is an input of the session arena, set while a snapshot is built
+    // (`hir_ty_mir`'s `test_db::expand_builtin_derives` does the same for its fixtures).
+    let mut fx = fixture::db(fixture);
+    _ = fx.edit(|edit| {
+        edit.set_given(
+            None,
+            hir_def::nameres::builtin_derives_fact(true),
+            Box::new(|_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+                hir_def::nameres::set_expand_builtin_derives(inputs, true);
+            }),
+        );
+    });
+    fx.into_db()
+}
+
+/// The crate `krate` of `db`.
+#[track_caller]
+fn krate_of(db: &Db, krate: &str) -> Crate {
+    all_crates(db)
+        .iter()
+        .copied()
+        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|name| name.crate_name().as_str() == krate))
+        .expect("the fixture has the crate")
+}
+
+/// The method of an impl in `krate` whose path, as the translator names it in a model or a
+/// refusal, is `path` (`main::W::PartialEq::eq`).
+#[track_caller]
+fn method(db: &Db, krate: &str, path: &str) -> FunctionId {
+    for func in methods(db, krate) {
+        let named = match emit(db, func) {
+            Ok(out) => out.function,
+            Err(err) => err.function,
+        };
+        if named == path {
+            return func;
+        }
+    }
+    panic!("no method `{path}` in `{krate}`")
+}
+
+/// Every method of every impl in `krate`, in the def map's order.
+fn methods(db: &Db, krate: &str) -> Vec<FunctionId> {
+    let mut out = Vec::new_in(std::alloc::Global);
+    for (_, data) in crate_def_map(db, krate_of(db, krate)).modules(db) {
+        for imp in data.scope(db).impls() {
+            for (_, item) in imp.impl_items(db).items.iter() {
+                if let hir_def::AssocItemId::FunctionId(it) = item {
+                    out.push(*it);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What `blaze prove`'s subset counts of each impl method of `krate` in `source`, its derives
+/// expanded: for each, by its path, `translated` (`emit` gives a model), `generic`
+/// (`GENERIC_UNASKED`) or why it is refused.
+fn subset_of_methods(flags: &str, krate: &str, source: &str) -> Vec<(String, String)> {
+    let db = expanded_db(&fixture_of(flags, krate, source));
+    let mut outcomes = Vec::new_in(std::alloc::Global);
+    for func in methods(&db, krate) {
+        let outcome = match emit(&db, func) {
+            Ok(out) => {
+                // The same bytes again (`deterministic-output`).
+                assert_eq!(emit(&db, func).map(|it| it.text).ok(), Some(out.text.clone()));
+                (out.function, "translated".to_owned())
+            }
+            Err(err) if err.what == crate::body::GENERIC_UNASKED => (err.function, "generic".to_owned()),
+            Err(err) => (err.function, err.what),
+        };
+        outcomes.push(outcome);
+    }
+    outcomes.sort();
+    outcomes
+}
+
+/// A derive's own method, asked for alone as `blaze prove`'s subset asks for every function, is
+/// the model a call of it gets: `clone` the value, `eq` `core.cmp.PartialEq.eq`, `cmp` and
+/// `partial_cmp` the type's order module's; a derived `Debug::fmt` is its expansion over the
+/// builders. Every method of the `derives`, `orders` and `fmts` fixtures is translated, an
+/// enum's too (its expansion reads `core::intrinsics::discriminant_value`, which the model never
+/// looks at: the method is its call's model), but those of a generic impl (`Waited<T>`'s and
+/// `Tagged<K>`'s, printed `derives::clone` and `derives::eq`), translated at each instance a
+/// theorem reaches.
+#[test]
+fn a_derived_method_alone_is_the_model_its_call_gets() {
+    const T: &str = "translated";
+    const G: &str = "generic";
+    let fixtures: [(&str, &str, &str, &[(&str, &str)]); 3] = [
+        ("derives", DERIVE_FLAGS, DERIVES, &[
+            ("derives::Own::Clone::clone", T),
+            ("derives::Own::PartialEq::eq", T),
+            ("derives::Path::Clone::clone", T),
+            ("derives::Path::PartialEq::eq", T),
+            ("derives::Point::Clone::clone", T),
+            ("derives::Point::PartialEq::eq", T),
+            ("derives::Shape::Clone::clone", T),
+            ("derives::Shape::PartialEq::eq", T),
+            ("derives::clone", G),
+            ("derives::clone", G),
+            ("derives::eq", G),
+            ("derives::eq", G),
+        ]),
+        ("orders", ORDER_FLAGS, ORDERS, &[
+            ("orders::Id::Clone::clone", T),
+            ("orders::Id::Ord::cmp", T),
+            ("orders::Id::PartialEq::eq", T),
+            ("orders::Id::PartialOrd::partial_cmp", T),
+            ("orders::Key::Clone::clone", T),
+            ("orders::Key::Ord::cmp", T),
+            ("orders::Key::PartialEq::eq", T),
+            ("orders::Key::PartialOrd::partial_cmp", T),
+            ("orders::Pair::Clone::clone", T),
+            ("orders::Pair::Ord::cmp", T),
+            ("orders::Pair::PartialEq::eq", T),
+            ("orders::Pair::PartialOrd::partial_cmp", T),
+            ("orders::Signed::Clone::clone", T),
+            ("orders::Signed::Ord::cmp", T),
+            ("orders::Signed::PartialEq::eq", T),
+            ("orders::Signed::PartialOrd::partial_cmp", T),
+        ]),
+        ("fmts", FMT_FLAGS, FMTS, &[
+            ("fmts::Hand::Debug::fmt", T),
+            ("fmts::Meters::Debug::fmt", T),
+            ("fmts::Point::Debug::fmt", T),
+            ("fmts::Shape::Debug::fmt", T),
+        ]),
+    ];
+    let mut wrong = String::new();
+    for (krate, flags, source, expected) in fixtures {
+        let got = subset_of_methods(flags, krate, source);
+        let expected: Vec<(String, String)> = expected.iter().map(|(a, b)| ((*a).to_owned(), (*b).to_owned())).collect();
+        if got != expected {
+            wrong.push_str(&format!("`{krate}`: {got:?}\n"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong}");
+    // The models, against their goldens.
+    let cases = [
+        ("derives", DERIVE_FLAGS, DERIVES, "derives::Point::PartialEq::eq", "core.cmp.PartialEq.eq"),
+        ("derives", DERIVE_FLAGS, DERIVES, "derives::Shape::Clone::clone", ":= self"),
+        ("orders", ORDER_FLAGS, ORDERS, "orders::Pair::Ord::cmp", "orders.Pair.impl.cmp"),
+        ("orders", ORDER_FLAGS, ORDERS, "orders::Pair::PartialOrd::partial_cmp", "orders.Pair.impl.partial_cmp"),
+    ];
+    for (krate, flags, source, path, says) in cases {
+        let db = expanded_db(&fixture_of(flags, krate, source));
+        let out = emit(&db, method(&db, krate, path)).unwrap_or_else(|err| panic!("{err}"));
+        assert!(out.text.contains(says), "`{path}` says `{says}`:\n{}", out.text);
+        assert_goldens(&out);
+    }
+}
+
+/// Where a call of a derived method is refused, the method asked for alone is refused with the
+/// call's reason: `==` of a struct whose field's `PartialEq` is hand-written.
+#[test]
+fn a_derived_method_alone_is_refused_where_its_call_is() {
+    let source = "#[derive(PartialEq)]\npub struct W { pub o: Own }\npub struct Own { pub v: u32 }\n\
+                  impl PartialEq for Own { fn eq(&self, other: &Own) -> bool { self.v == other.v } }\n\
+                  pub fn same(a: &W, b: &W) -> bool { a == b }\n";
+    let db = expanded_db(&fixture_of(DERIVE_FLAGS, "main", source));
+    let alone = emit(&db, method(&db, "main", "main::W::PartialEq::eq")).expect_err("`W`'s `eq` is refused");
+    let call = emit(&db, function(&db, "main", "same")).expect_err("`a == b` of `W` is refused");
+    assert!(alone.what.contains("`==` of `main::Own`"), "{alone}");
+    assert_eq!(alone.what, call.what);
+}
+
+// ---- `Range` and `RangeInclusive` as values, and a slice by a range (V15, piece 2). ----
+
+/// What the `ranges` fixture enables: the ranges with their `contains`, `Clone` and `==`,
+/// slices and `Vec`s indexed by them.
+const RANGE_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, range, clone, vec, index, slice, option";
+
+/// Ranges made, read, compared and asked whether they hold a value, and a `Vec` and a slice
+/// cut by one, with the theorems of their ends and of a subslice.
+const RANGES: &str = "use core::ops::{Range, RangeInclusive};
+pub fn span(a: u32, b: u32) -> Range<u32> { a..b }
+pub fn closed(a: u32, b: u32) -> RangeInclusive<u32> { a..=b }
+pub fn span_start(r: &Range<u32>) -> u32 { r.start }
+pub fn span_end(r: Range<u32>) -> u32 { r.end }
+pub fn closed_start(r: &RangeInclusive<u32>) -> u32 { *r.start() }
+pub fn closed_end(r: &RangeInclusive<u32>) -> u32 { *r.end() }
+pub fn in_span(r: &Range<u32>, x: u32) -> bool { r.contains(&x) }
+pub fn in_closed(r: &RangeInclusive<u32>, x: u32) -> bool { r.contains(&x) }
+pub fn span_empty(r: &Range<u32>) -> bool { r.is_empty() }
+pub fn closed_empty(r: &RangeInclusive<u32>) -> bool { r.is_empty() }
+pub fn copy_span(r: &Range<u32>) -> Range<u32> { r.clone() }
+pub fn same_span(a: &Range<u32>, b: &Range<u32>) -> bool { a == b }
+pub fn same_closed(a: &RangeInclusive<u32>, b: &RangeInclusive<u32>) -> bool { a == b }
+pub fn cut_len(v: &Vec<u32>, a: usize, b: usize) -> usize { v[a..b].len() }
+pub fn part(s: &[u32], a: usize, b: usize) -> &[u32] { &s[a..b] }
+pub fn part_of(v: &Vec<u32>, r: Range<usize>) -> Option<&[u32]> { v.get(r) }
+#[blaze::theorem]
+pub fn contains_at_the_ends(a: u32, b: u32) -> bool {
+    in_span(&span(a, b), a) == (a < b)
+        && !in_span(&span(a, b), b)
+        && in_closed(&closed(a, b), a) == (a <= b)
+        && in_closed(&closed(a, b), b) == (a <= b)
+        && span_start(&span(a, b)) == a
+        && closed_end(&closed(a, b)) == b
+}
+#[blaze::theorem]
+pub fn a_subslice_is_its_part(v: Vec<u32>, a: usize, b: usize) -> bool {
+    if a < b && b <= v.len() {
+        let s = part(&v, a, b);
+        s.len() == b - a && s[0] == v[a]
+    } else {
+        true
+    }
+}
+";
+
+/// `a..b` and `a..=b` are values of `core.ops.Range` and `core.ops.RangeInclusive`, their
+/// fields and `start()`, `end()` projections, `contains` and `is_empty` of integers the
+/// nightly's tests, `clone` the value and `==` Lean's; `&v[a..b]` is `Slice.index_range`, and
+/// `v.get(r)` `Slice.get_range`.
+#[test]
+fn ranges_are_values_and_cut_slices() {
+    let cases: [(&str, &str); 17] = [
+        ("span", "core.ops.Range.new a b"),
+        ("closed", "core.ops.RangeInclusive.new a b"),
+        ("span_start", "r.start"),
+        ("span_end", "r.«end»"),
+        ("closed_start", "core.ops.RangeInclusive.start r"),
+        ("closed_end", "core.ops.RangeInclusive.«end» r"),
+        ("in_span", "core.ops.Range.contains r x"),
+        ("in_closed", "core.ops.RangeInclusive.contains r x"),
+        ("span_empty", "core.ops.Range.is_empty r"),
+        ("closed_empty", "core.ops.RangeInclusive.is_empty r"),
+        ("copy_span", ":= r"),
+        ("same_span", "core.cmp.PartialEq.eq a b"),
+        ("same_closed", "core.cmp.PartialEq.eq a b"),
+        ("cut_len", "Slice.index_range"),
+        ("part", "Slice.index_range s"),
+        ("part_of", "Slice.get_range v r"),
+        ("contains_at_the_ends", "ranges.in_closed"),
+    ];
+    for (name, says) in cases {
+        let out = golden(RANGE_FLAGS, "ranges", name, RANGES);
+        assert!(out.text.contains(says), "`{name}` says `{says}`:\n{}", out.text);
+    }
+    for theorem in ["contains_at_the_ends", "a_subslice_is_its_part"] {
+        let out = golden(RANGE_FLAGS, "ranges", theorem, RANGES);
+        assert_eq!(out.statement, Some(format!("ranges.{theorem}.spec.statement")));
+    }
+}
+
+/// What the range model leaves out is refused by name: iterating one (`for i in a..b` stops
+/// at `IntoIterator::into_iter`), its `len`, a range of a type that is not an integer, a slice
+/// by an inclusive range, and `get` by one.
+#[test]
+fn what_the_range_model_leaves_out_is_refused_by_name() {
+    let flags = "sized, copy, add, ord, eq, fn, builtin_impls, range, clone, vec, index, slice, option, iterators";
+    let cases = [
+        (
+            "pub fn f(n: u32) -> u32 { let mut s = 0u32; for i in 0..n { s = s + i; } s }\n",
+            "a call of the standard library's `into_iter`",
+        ),
+        ("pub fn f(s: &[u32]) -> usize { s[0..=1].len() }\n", "`index`"),
+        ("pub fn f(v: &Vec<u32>) -> usize { match v.get(0..=1) { Some(s) => s.len(), None => 0 } }\n", "`get` by a range other than `a..b`"),
+        ("pub fn f(r: &core::ops::Range<u32>) -> Option<u32> { let mut r = r.clone(); r.next() }\n", "`next`"),
+    ];
+    for (source, what) in cases {
+        let err = refused(flags, "f", source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+        assert_eq!(err.function, "main::f");
+    }
+}
+
+// ---- `Default::default` (V15, piece 3). ----
+
+/// What the `defaults` fixture enables: `Default` and its derive, and the types whose default
+/// the standard library gives.
+const DEFAULT_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, default, derive, clone, option, vec, phantom_data, time, record, string, mem_take, option_methods";
+
+/// Defaults of the standard library's types, a derived `Default` of a struct of them and of
+/// an enum with a `#[default]` variant, a hand-written one, and the theorems of their fields.
+const DEFAULTS: &str = "use core::marker::PhantomData;
+use core::time::Duration;
+pub struct Clock { pub ticks: u64 }
+impl Default for Clock { fn default() -> Clock { Clock { ticks: 7 } } }
+#[derive(Default)]
+pub struct Settings {
+    pub count: u32,
+    pub on: bool,
+    pub limit: Option<u8>,
+    pub items: Vec<u32>,
+    pub pair: (u8, bool),
+    pub clock: Clock,
+    pub marker: PhantomData<u8>,
+}
+#[derive(Default)]
+pub enum Mode { Busy(u32), #[default] Idle, Off }
+pub fn zero() -> i64 { Default::default() }
+pub fn no() -> bool { Default::default() }
+pub fn unit() -> () { Default::default() }
+pub fn nothing() -> Option<u32> { Default::default() }
+pub fn empty() -> Vec<u8> { Default::default() }
+pub fn pair() -> (u8, bool) { Default::default() }
+pub fn marker() -> PhantomData<u32> { Default::default() }
+pub fn no_wait() -> Duration { Default::default() }
+pub fn zeros() -> [u16; 3] { Default::default() }
+pub fn none() -> [Clock; 0] { Default::default() }
+pub fn clocks() -> [Clock; 3] { Default::default() }
+pub fn clock() -> Clock { Default::default() }
+pub fn clock_and(n: u8) -> (Clock, u8) { let (c, _) = <(Clock, u8)>::default(); (c, n) }
+pub fn settings() -> Settings { Settings::default() }
+pub fn mode() -> Mode { Mode::default() }
+pub fn text() -> core::string::String { Default::default() }
+pub fn taken(s: &mut Settings) -> Settings { core::mem::take(s) }
+pub fn or_zero(x: Option<u32>) -> u32 { x.unwrap_or_default() }
+#[blaze::theorem]
+pub fn derived_default_is_each_fields() -> bool {
+    let s = settings();
+    s.count == 0
+        && !s.on
+        && match s.limit { None => true, Some(_) => false }
+        && s.items.len() == 0
+        && s.pair.0 == 0
+        && !s.pair.1
+        && s.clock.ticks == 7
+        && match mode() { Mode::Idle => true, _ => false }
+        && clocks()[2].ticks == 7
+}
+";
+
+/// `Default::default()` of the standard library's types is the value its impl's body gives,
+/// written in place; of the crate's type it is that type's own `default`, a derived one being
+/// its expansion; `String`'s is core's body, `String::new()`, an opaque function.
+#[test]
+fn a_default_is_its_impls_value() {
+    let cases: [(&str, &str); 19] = [
+        ("zero", ":= (0 : I64)"),
+        ("no", ":= false"),
+        ("unit", ":= ()"),
+        ("nothing", ":= (Option.none : Option U32)"),
+        ("empty", "(Vec.new : Vec U8)"),
+        ("pair", "((0 : U8), false)"),
+        ("marker", "core.marker.PhantomData"),
+        ("no_wait", "core.time.Duration"),
+        ("zeros", "Arr.replicate 3 (0 : U16)"),
+        ("none", "Arr"),
+        ("clocks", "defaults.Clock.Default.default"),
+        ("clock", "defaults.Clock.Default.default"),
+        ("clock_and", "defaults.Clock.Default.default"),
+        ("settings", "defaults.Settings.Default.default"),
+        ("mode", "defaults.Mode.Default.default"),
+        ("text", "string.String.Default.default"),
+        ("taken", "defaults.Settings.Default.default"),
+        ("or_zero", "(0 : U32)"),
+        ("derived_default_is_each_fields", "defaults.settings"),
+    ];
+    let mut wrong = String::new();
+    for (name, says) in cases {
+        match std::panic::catch_unwind(|| golden_expanded(DEFAULT_FLAGS, "defaults", name, DEFAULTS)) {
+            Ok(out) if out.text.contains(says) => {}
+            Ok(out) => wrong.push_str(&format!("`{name}` says `{says}`:\n{}\n", out.text)),
+            Err(_) => wrong.push_str(&format!("`{name}` is not translated (above)\n")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong}");
+    // The derived impls' bodies: each field's default, the `#[default]` variant.
+    let out = golden_expanded(DEFAULT_FLAGS, "defaults", "settings", DEFAULTS);
+    let derived = out.imports.iter().find(|it| it.module == "BlazeModel.defaults.Settings.Default.default").expect("imported");
+    assert!(derived.text.contains("defaults.Clock.Default.default"), "{}", derived.text);
+    let out = golden_expanded(DEFAULT_FLAGS, "defaults", "text", DEFAULTS);
+    assert!(out.imports.iter().any(|it| it.text.contains("\nopaque core.string.String.new : Result alloc.string.String\n")), "String::new is opaque");
+    let out = golden_expanded(DEFAULT_FLAGS, "defaults", "derived_default_is_each_fields", DEFAULTS);
+    assert_eq!(out.statement.as_deref(), Some("defaults.derived_default_is_each_fields.spec.statement"));
+}
+
+/// A default with no model is refused by name: of a recorded (unexpanded) derive, of a float.
+#[test]
+fn a_default_with_no_model_is_refused_by_name() {
+    let cases = [
+        ("#[derive(Default)]\npub struct P { pub x: u32 }\npub fn f(p: &mut P) -> P { core::mem::take(p) }\n", "`mem::take` of `main::P`"),
+        ("#[derive(Default)]\npub struct P { pub x: u32 }\npub fn f() -> (P, u8) { Default::default() }\n", "`Default::default` of `main::P`"),
+    ];
+    for (source, what) in cases {
+        let err = refused(DEFAULT_FLAGS, "f", source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+        assert_eq!(err.function, "main::f");
+    }
 }

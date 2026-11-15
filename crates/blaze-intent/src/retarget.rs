@@ -20,7 +20,13 @@
 //! an expanded path, at the range it maps to). What the rewrite can't place is an error naming
 //! where it is: a comment inside a use tree it rewrites.
 
+use blaze_mem::text;
 use hir::{Module, ModuleDef, PathResolution, ScopeDef, view::Semantics};
+use snafu::Snafu;
+use std::{
+    alloc::{Allocator, Global},
+    ops::Deref,
+};
 use syntax::{
     SyntaxKind, TextRange, WalkEvent,
     view::{self as ast, AstNode as _},
@@ -146,14 +152,7 @@ impl<'t> Retarget<'_, 't> {
             for child in list.use_trees() {
                 kept.extend(self.keep(child, root, moved)?);
             }
-            return Ok(match (prefix, kept.as_slice()) {
-                (_, []) => None,
-                (Some(prefix), [one]) if one != "self" && !one.starts_with('{') => {
-                    Some(format!("{prefix}::{one}"))
-                }
-                (Some(prefix), _) => Some(format!("{prefix}::{{{}}}", kept.join(", "))),
-                (None, _) => Some(format!("{{{}}}", kept.join(", "))),
-            });
+            return Ok(joined(prefix, &kept, Global).map(|it| it.as_str().to_owned()));
         }
         let written = tree.syntax().text().to_owned();
         if tree.star_token().is_some() {
@@ -228,6 +227,128 @@ impl<'t> Retarget<'_, 't> {
             }
         }
         false
+    }
+}
+
+/// A use tree with the prefix `prefix` and the leaves `kept`, as written, in `alloc`: `None` when
+/// none stays.
+fn joined<A: Allocator, S: Deref<Target = str>>(
+    prefix: Option<&str>,
+    kept: &[S],
+    alloc: A,
+) -> Option<text::String<A>> {
+    let mut out = text::String::new_in(alloc);
+    let braced = match (prefix, kept) {
+        (_, []) => return None,
+        (Some(_), [one]) => &**one == "self" || one.starts_with('{'),
+        (Some(_) | None, _) => true,
+    };
+    if let Some(prefix) = prefix {
+        out.push_str(prefix);
+        out.push_str("::");
+    }
+    if braced {
+        out.push_str("{");
+    }
+    for (at, leaf) in kept.iter().enumerate() {
+        if at > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(leaf);
+    }
+    if braced {
+        out.push_str("}");
+    }
+    Some(out)
+}
+
+/// `tree` as written without `leaf`, one of its leaves, in `alloc`; `None` when nothing of it
+/// stays.
+fn without<A: Allocator + Clone>(
+    tree: ast::UseTree<'_>,
+    leaf: ast::UseTree<'_>,
+    alloc: A,
+) -> Option<text::String<A>> {
+    if tree == leaf {
+        return None;
+    }
+    let Some(list) = tree.use_tree_list() else {
+        return Some(text::String::from_str_in(tree.syntax().text(), alloc));
+    };
+    let mut kept = Vec::new_in(alloc.clone());
+    kept.extend(list.use_trees().filter_map(|child| without(child, leaf, alloc.clone())));
+    joined(tree.path().map(|it| it.syntax().text()), &kept, alloc)
+}
+
+/// Why [`reimport`] can't rewrite a `use` item.
+#[derive(Debug, Snafu)]
+pub enum Reimport<'t> {
+    #[snafu(display("a `use` item without a tree"))]
+    NoTree,
+    #[snafu(display("a `use` item without `use`"))]
+    NoUse,
+    /// A comment inside the tree, which taking a leaf out would drop.
+    #[snafu(display(
+        "`{item}` has a comment inside its tree, which taking an import out would drop: move it \
+         out of the braces"
+    ))]
+    Comment { item: &'t str },
+}
+
+/// `item`, a `use` of the file `root`, with `dropped`, one leaf of its tree, taken out and a
+/// `use` of each of `imports` after it, each with the item's attributes and visibility. An
+/// item with nothing left and nothing imported goes with its line.
+///
+/// # Errors
+///
+/// [`Reimport`]: a `use` item with no tree, or a comment inside the tree.
+pub fn reimport<'t, S: Deref<Target = str>>(
+    item: ast::Use<'t>,
+    root: ast::Node<'t>,
+    dropped: Option<ast::UseTree<'t>>,
+    imports: &[S],
+) -> Result<Rewrite, Reimport<'t>> {
+    let Some(tree) = item.use_tree() else { return Err(Reimport::NoTree) };
+    if dropped.is_some()
+        && tree.syntax().descendants_with_tokens().any(|it| it.kind() == SyntaxKind::COMMENT)
+    {
+        return Err(Reimport::Comment { item: item.syntax().text() });
+    }
+    let use_token = item.use_token().ok_or(Reimport::NoUse)?;
+    let range = item.syntax().text_range();
+    let head = &item.syntax().text()[..usize::from(use_token.text_range().start() - range.start())];
+    let mut lines = Vec::new_in(Global);
+    match dropped {
+        None => lines.push(item.syntax().text().to_owned()),
+        Some(leaf) => {
+            lines.extend(without(tree, leaf, Global).map(|kept| format!("{head}use {kept};")));
+        }
+    }
+    lines.extend(imports.iter().map(|path| format!("{head}use {};", &**path)));
+    if lines.is_empty() {
+        return Ok(Rewrite { range: with_line(root, range), text: String::new() });
+    }
+    let indent = indent_of(root, range.start());
+    Ok(Rewrite { range, text: lines.join(&format!("\n{indent}")) })
+}
+
+/// `range` with the line break before it and its indent, when nothing else is on its line
+/// before it; else with the line break after it, for an item on the file's first line.
+fn with_line(root: ast::Node<'_>, range: TextRange) -> TextRange {
+    let text = root.file().text();
+    let start = usize::from(range.start());
+    let lead = text[..start].rfind('\n');
+    let line = lead.map_or(0, |it| it + 1);
+    if !text[line..start].trim_start_matches([' ', '\t']).is_empty() {
+        return range;
+    }
+    match lead {
+        Some(at) => TextRange::new(syntax::TextSize::of(&text[..at]), range.end()),
+        None => {
+            let end = usize::from(range.end());
+            let after = text[end..].strip_prefix('\n').map_or(end, |_| end + 1);
+            TextRange::new(range.start(), syntax::TextSize::of(&text[..after]))
+        }
     }
 }
 

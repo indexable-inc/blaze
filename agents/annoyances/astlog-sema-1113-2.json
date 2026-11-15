@@ -1,0 +1,14 @@
+{
+ "id": "astlog-sema-1113-2",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, lane astlog-sema-1113",
+ "where": "crates/blaze-cargo/src/serve/job.rs Jobs::lower (takes roots.fronts[root]), stored_kept (the only give-back, after a build)",
+ "what": "A job that lowers a view and builds nothing (Request::Query; Edit and Reach the same way) takes the root kept front end and never gives it back, so each one lowers the view again. Release blaze of 24b499d29c on blaze-vm, a three-file crate: a query repeated before any check takes 4.2 s each time, the same query right after a `blaze check` 0.9 s, and the next one 4.2 s again by the same reasoning (measured on the Mac debug build: 0.59 s then 19 s).",
+ "cost": "about 3.3 s of every query on a tiny crate, more on a large view; the first whole-workspace query on a cold debug daemon did not answer in 46 minutes",
+ "cause": "only a build ends by writer.keep() and store_kept; a read-only job drops the front end it took",
+ "class": "a read-only job that consumes kept state it did not change",
+ "prevention": "a read-only job hands the front end back to its root when it ends, and a serve test counts lowerings across two queries of one unchanged view",
+ "workaround": "none short of running `blaze check` before each query",
+ "fix": "8ffb56fafb: a Query that answers ends as a build does: Jobs::keep_queried runs writer.keep() then Jobs::store_kept on an idle plane request, so the front end goes back to roots.fronts only through stored_kept at Stored::Sealed, and the next lowering refreshes it to the new view. A failed keep is a loss, never a silent drop. Serve sim tests, each with a planted control: two queries of one view lower once (second (0 anew, 1 into kept)); query, edit, query reads the edited view (a planted stale refresh is caught); check, query, check lowers as four checks do; the units_applied path over 32 seeds (stalls at seeds 1,2,3,13,24,27 are the known held-readers stall, which the old code meets too); a restart between queries lowers anew and reads what the last query stored. Lib suite 33 failing names before and after, identical. Request::Edit (dry run or not) and Reach are unchanged: Work::Edit carries no head at the job layer, so a dry run cannot be told apart there without touching committing edits. Real run on the demo (Mac debug): q1 39.7 s, q2 42.3 s, q3 0.53 s, check 21.6 s, q4 0.47 s. serve.log shows q1's front end kept and stored (503.9 MiB idle line), yet `blaze slow` for q2 reports 289099 rows run, all first: why q2 did not reuse q1's front end is not explained.",
+ "state": "partly fixed: repeated queries after the second are fast (0.5 s); the second query of a fresh daemon still recomputes, cause unknown"
+}

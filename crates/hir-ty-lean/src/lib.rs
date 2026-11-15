@@ -55,7 +55,7 @@ pub use spec::Spec;
 
 use lean::{Binder, Decl, Infix, Module, Pat, Term, app, atom, infix, name};
 use body::Instance;
-use translate::{Model, Shape};
+use translate::{Model, Shape, Worlds};
 
 /// The translator's version: part of every proof key. Raised with any change to what is
 /// emitted.
@@ -69,15 +69,22 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Slice", include_str!("../../../lean/Blaze/Slice.lean")),
     ("Blaze.Std", include_str!("../../../lean/Blaze/Std.lean")),
     ("Blaze.Vec", include_str!("../../../lean/Blaze/Vec.lean")),
+    // `Range` and `RangeInclusive` as values, and a slice indexed by a range.
+    ("Blaze.Range", include_str!("../../../lean/Blaze/Range.lean")),
     ("Blaze.ScalarOps", include_str!("../../../lean/Blaze/ScalarOps.lean")),
     ("Blaze.Ordering", include_str!("../../../lean/Blaze/Ordering.lean")),
     ("Blaze.Duration", include_str!("../../../lean/Blaze/Duration.lean")),
+    // The order a derive of `PartialOrd` or `Ord` gives, and those it compares fields by.
+    ("Blaze.Order", include_str!("../../../lean/Blaze/Order.lean")),
     ("Blaze.Str", include_str!("../../../lean/Blaze/Str.lean")),
     ("Blaze.Machine", include_str!("../../../lean/Blaze/Machine.lean")),
     ("Blaze.Opaque", include_str!("../../../lean/Blaze/Opaque.lean")),
     // Threads that share atomic words, and `core::sync::atomic` over them.
     ("Blaze.Threads", include_str!("../../../lean/Blaze/Threads.lean")),
     ("Blaze.Atomic", include_str!("../../../lean/Blaze/Atomic.lean")),
+    // The weak world, which a theorem that reaches `threads::two_weak` is stated in.
+    ("Blaze.ThreadsWeak", include_str!("../../../lean/Blaze/ThreadsWeak.lean")),
+    ("Blaze.ThreadsWeakAuto", include_str!("../../../lean/Blaze/ThreadsWeakAuto.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
     // What a proof file imports and no model does: the tactic a statement is tried with first.
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
@@ -260,6 +267,15 @@ fn emit_in<'db>(
     let mut imports: Vec<Emitted> = body.adts.iter().map(type_module).collect();
     imports.extend(body.adts.iter().filter(|it| lowered.derives.contains(&it.name)).map(eq_module));
     let mut shapes = BTreeMap::new();
+    // Then the order of each whose derived `PartialOrd` or `Ord` it calls, each after those its
+    // fields' orders are; its functions are pure.
+    for adt in body.adts.iter().filter(|it| lowered.orders.contains(&it.name)) {
+        imports.push(ord_module(adt).map_err(|what| refuse(what))?);
+        for function in ORDER_FUNCTIONS {
+            let pure = Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false };
+            shapes.insert(format!("{}.impl.{function}", adt.name), pure);
+        }
+    }
     // What a callee imports comes first; a module two callees share is listed once.
     let admit = |imports: &mut Vec<Emitted>, import: &Emitted| -> Result<(), NotTranslated> {
         match imports.iter().find(|it| it.module == import.module) {
@@ -384,6 +400,15 @@ fn theorem_shape(body: &body::Body, model: &Model) -> Result<(), NotTranslated> 
              speaks of by value or by shared reference)",
         ));
     }
+    // Its statement is over one memory, the one the runner it reaches runs in
+    // ([`theorem_statement`]): a schedule's picks mean different things in the two.
+    if model.shape.worlds.two && model.shape.worlds.two_weak {
+        return Err(refuse(&format!(
+            "the `#[blaze::theorem]` `{}`: it reaches both `threads::two` and \
+             `threads::two_weak`: a theorem is stated in one memory (decision D46)",
+            body.display
+        )));
+    }
     Ok(())
 }
 
@@ -406,8 +431,11 @@ pub(crate) fn rust_ty(ty: &body::Ty) -> String {
         Ty::Vec(inner) => format!("Vec<{}>", rust_ty(inner)),
         Ty::Array(inner, len) => format!("[{}; {len}]", rust_ty(inner)),
         Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
+        Ty::PhantomData => "core::marker::PhantomData".to_owned(),
         Ty::Duration => "core::time::Duration".to_owned(),
         Ty::Ordering => "core::cmp::Ordering".to_owned(),
+        Ty::Range { elem, inclusive: false } => format!("core::ops::Range<{}>", rust_ty(elem)),
+        Ty::Range { elem, inclusive: true } => format!("core::ops::RangeInclusive<{}>", rust_ty(elem)),
         Ty::Str => "str".to_owned(),
         Ty::Opaque(opaque) => opaque.rust().to_owned(),
         Ty::Shared(shared) => shared.rust(),
@@ -426,9 +454,17 @@ fn theorem_statement(function: &str, model: &Model, statement: &str) -> Decl {
     args.extend(model.params.iter().map(|it| name(it.name.clone())));
     let call = app(function, args);
     // A shared function's model is a program of operations on the memory threads share: it is
-    // run alone, from an empty memory (`Threads.Prog.value`), and gives `true`.
+    // run alone, from an empty memory, and gives `true`. The memory is the one the runner it
+    // reaches runs in (decision D46): the weak world (`Threads.Prog.valueWeak`) where it reaches
+    // `threads::two_weak`, else the sequentially consistent one (`Threads.Prog.value`), which a
+    // function that reaches no runner (atomics on one thread) is also stated in.
+    // [`theorem_shape`] refuses a theorem that reaches both.
+    let run = match model.shape.worlds.two_weak {
+        true => "valueWeak",
+        false => "value",
+    };
     let holds = match (model.shape.shared, model.shape.monadic) {
-        (true, _) => infix(Infix::Eq, Term::Proj(Box::new(call), "value".to_owned()), app("Result.ok", vec![atom("true")])),
+        (true, _) => infix(Infix::Eq, Term::Proj(Box::new(call), run.to_owned()), app("Result.ok", vec![atom("true")])),
         (false, true) => infix(Infix::Eq, call, app("Result.ok", vec![atom("true")])),
         (false, false) => infix(Infix::Eq, call, atom("true")),
     };
@@ -467,7 +503,7 @@ pub fn type_module(adt: &body::AdtDecl) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false },
         imports: Vec::new(),
     }
 }
@@ -506,9 +542,179 @@ pub fn eq_module(adt: &body::AdtDecl) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false },
         imports: Vec::new(),
     }
+}
+
+/// The functions of a derived order's module ([`ord_module`]), each `<type>.impl.<it>`, named
+/// as the trait methods they model.
+const ORDER_FUNCTIONS: [&str; 8] = ["cmp", "partial_cmp", "lt", "le", "gt", "ge", "max", "min"];
+
+/// The module of the struct or enum `adt`'s derived `PartialOrd` and `Ord`,
+/// `BlazeModel.<its path>.ord`: `<type>.impl.cmp`, its order, and the trait methods by it
+/// ([`ORDER_FUNCTIONS`]). `impl` is a Rust keyword, so no method or trait of the crate has
+/// that name. The rule is the derive's (crates/hir-expand/src/builtin/derive_macro.rs,
+/// `write_ordering`, as rustc's): the fields in declaration order, the first not `Equal`
+/// deciding (`Ordering.then`); of an enum of several variants, the variants' discriminants
+/// first, by their type's order, so two values of different variants are ordered by them and
+/// two of one variant by its fields. Each field is compared by its type's order in
+/// `lean/Blaze/Order.lean` or by the derived one of the crate's type it is, whose module this
+/// imports: the translator gives a call this model only for such fields ([`body`]'s
+/// `orderable`). Every such order is total, so `partial_cmp` is `Some` of `cmp`, and `lt`..
+/// are the trait's defaults on it (cmp.rs:1502-1556), `max` and `min` `Ord`'s (cmp.rs:1101,
+/// 1140).
+pub fn ord_module(adt: &body::AdtDecl) -> Result<Emitted, String> {
+    let module = format!("BlazeModel.{}.ord", adt.name);
+    let display = adt.display.clone();
+    let about = vec![
+        format!("Generated by blaze ({TRANSLATOR}) from `{display}`: its derived `PartialOrd` and `Ord`."),
+        "Do not edit: the functions that compare it import this module.".to_owned(),
+    ];
+    let mut imports = vec!["Blaze".to_owned(), lean::ident(&type_module_name(&adt.name))];
+    imports.extend(
+        adt.uses()
+            .iter()
+            .filter(|it| **it != adt.name)
+            .map(|it| lean::ident(&format!("BlazeModel.{it}.ord"))),
+    );
+    // Variables named apart from every root of a global name the module uses (the library's
+    // roots are capitalized or `core`, none of these).
+    let mut roots: std::collections::BTreeSet<String> = adt.uses();
+    roots.insert(adt.name.clone());
+    let roots: std::collections::BTreeSet<String> =
+        roots.iter().filter_map(|it| it.split('.').next().map(str::to_owned)).collect();
+    let var = |base: String| -> String {
+        let mut it = base;
+        while roots.contains(&it) {
+            it.push('_');
+        }
+        it
+    };
+    let (l, r) = (var("l".to_owned()), var("r".to_owned()));
+    let own = |function: &str| format!("{}.impl.{function}", adt.name);
+    let then = |orders: Vec<Term>| -> Term {
+        let mut orders = orders.into_iter().rev();
+        let Some(last) = orders.next() else { return name("core.cmp.Ordering.Equal") };
+        orders.fold(last, |rest, first| app("core.cmp.Ordering.then", vec![first, rest]))
+    };
+    let ty = name(adt.name.clone());
+    let pair = |l: &str, r: &str| vec![Binder { name: l.to_owned(), ty: ty.clone() }, Binder { name: r.to_owned(), ty: ty.clone() }];
+    let mut decls = Vec::new();
+    let cmp = match &adt.kind {
+        body::AdtKind::Struct(fields) => {
+            let mut orders = Vec::with_capacity(fields.len());
+            for field in fields {
+                let by = order_of(&field.ty)?;
+                let at = |of: &str| Term::Proj(Box::new(name(of.to_owned())), field.name.clone());
+                orders.push(Term::App(Box::new(by), vec![at(&l), at(&r)]));
+            }
+            then(orders)
+        }
+        body::AdtKind::Enum(variants) => {
+            if variants.is_empty() {
+                return Err(format!("the derived order of `{display}`, an enum of no variant"));
+            }
+            let ctor = |variant: &body::Variant| format!("{}.{}", adt.name, variant.name);
+            let mut arms = Vec::with_capacity(variants.len() + 1);
+            for variant in variants {
+                let ls: Vec<String> = (0..variant.fields.len()).map(|i| var(format!("{l}{i}"))).collect();
+                let rs: Vec<String> = (0..variant.fields.len()).map(|i| var(format!("{r}{i}"))).collect();
+                let mut orders = Vec::with_capacity(variant.fields.len());
+                for (i, field) in variant.fields.iter().enumerate() {
+                    let by = order_of(&field.ty)?;
+                    orders.push(Term::App(Box::new(by), vec![name(ls[i].clone()), name(rs[i].clone())]));
+                }
+                let pat = |names: &[String]| Pat::Ctor(ctor(variant), names.iter().map(|it| Pat::Name(it.clone())).collect());
+                arms.push((Pat::Tuple(vec![pat(&ls), pat(&rs)]), then(orders)));
+            }
+            if variants.len() > 1 {
+                // The discriminant of each variant, as an `Int`: `discriminant_value`'s, as its
+                // type's value (an unsigned one above `i128::MAX` is refused before this).
+                let x = var("v".to_owned());
+                let discriminants = variants
+                    .iter()
+                    .map(|variant| {
+                        let wild = variant.fields.iter().map(|_| Pat::Wild).collect();
+                        (Pat::Ctor(ctor(variant), wild), atom(format!("({} : Int)", variant.discriminant as i128)))
+                    })
+                    .collect();
+                decls.push(Decl::Def {
+                    name: own("discriminant"),
+                    params: vec![Binder { name: x.clone(), ty: ty.clone() }],
+                    ty: name("Int"),
+                    body: Term::Match(Box::new(name(x)), discriminants),
+                });
+                let of = |v: &str| app(&own("discriminant"), vec![name(v.to_owned())]);
+                arms.push((Pat::Wild, app("core.cmp.Order.int", vec![of(&l), of(&r)])));
+            }
+            Term::Match(Box::new(Term::Tuple(vec![name(l.clone()), name(r.clone())])), arms)
+        }
+    };
+    let ordering = name("core.cmp.Ordering");
+    let by_cmp = |l: &str, r: &str| app(&own("cmp"), vec![name(l.to_owned()), name(r.to_owned())]);
+    decls.push(Decl::Def { name: own("cmp"), params: pair(&l, &r), ty: ordering.clone(), body: cmp });
+    decls.push(Decl::Def {
+        name: own("partial_cmp"),
+        params: pair(&l, &r),
+        ty: app("Option", vec![ordering]),
+        body: app("Option.some", vec![by_cmp(&l, &r)]),
+    });
+    for (function, test) in [("lt", "is_lt"), ("le", "is_le"), ("gt", "is_gt"), ("ge", "is_ge")] {
+        decls.push(Decl::Def {
+            name: own(function),
+            params: pair(&l, &r),
+            ty: name("Bool"),
+            body: app(&format!("core.cmp.Ordering.{test}"), vec![by_cmp(&l, &r)]),
+        });
+    }
+    // `max`: `if other < self { self } else { other }`; `min`: `if other < self { other } else
+    // { self }` (cmp.rs:1101, 1140).
+    let lt = |a: &str, b: &str| app(&own("lt"), vec![name(a.to_owned()), name(b.to_owned())]);
+    for (function, (first, second)) in [("max", (&l, &r)), ("min", (&r, &l))] {
+        decls.push(Decl::Def {
+            name: own(function),
+            params: pair(&l, &r),
+            ty: ty.clone(),
+            body: Term::If(Box::new(lt(&r, &l)), Box::new(name(first.clone())), Box::new(name(second.clone()))),
+        });
+    }
+    let text = Module { about, imports, decls }.print();
+    Ok(Emitted {
+        function: display,
+        name: adt.name.clone(),
+        module,
+        text,
+        statement: None,
+        clauses: Vec::new(),
+        shape: Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false },
+        imports: Vec::new(),
+    })
+}
+
+/// The order of a field of type `ty` as a Lean function of two values
+/// (`lean/Blaze/Order.lean`, or a derived order's `<type>.impl.cmp`).
+fn order_of(ty: &body::Ty) -> Result<Term, String> {
+    use body::Ty;
+    Ok(match ty {
+        Ty::Int(_) => name("Scalar.cmp"),
+        Ty::Bool => name("core.cmp.Order.bool"),
+        Ty::Unit => name("core.cmp.Order.unit"),
+        Ty::PhantomData => name("core.cmp.Order.phantom"),
+        Ty::Duration => name("core.time.Duration.cmp"),
+        Ty::Ordering => name("core.cmp.Order.ordering"),
+        Ty::Ref(inner) => order_of(inner)?,
+        Ty::Option(inner) => app("core.cmp.Order.option", vec![order_of(inner)?]),
+        Ty::Array(inner, _) => app("core.cmp.Order.array", vec![order_of(inner)?]),
+        Ty::Tuple(fields) if fields.is_empty() => name("core.cmp.Order.unit"),
+        Ty::Tuple(fields) => {
+            let mut orders: Vec<Term> = fields.iter().map(order_of).collect::<Result<_, _>>()?;
+            let last = orders.pop().expect("a tuple of at least one field");
+            orders.into_iter().rev().fold(last, |rest, first| app("core.cmp.Order.pair", vec![first, rest]))
+        }
+        Ty::Adt(adt) => name(format!("{adt}.impl.cmp")),
+        other => return Err(format!("the order of `{}`, a field of a derived order, which has no model (rule NoModel)", rust_ty(other))),
+    })
 }
 
 /// The module of the opaque function `opaque` ([`body::OPAQUE_FUNCTIONS`]) at its instance,
@@ -568,7 +774,7 @@ pub fn opaque_module(opaque: &body::OpaqueFn) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: true, shared: false, mut_params, returns_unit },
+        shape: Shape { fuel: false, monadic: true, shared: false, worlds: Worlds::default(), mut_params, returns_unit },
         imports: Vec::new(),
     }
 }

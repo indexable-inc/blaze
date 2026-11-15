@@ -52,6 +52,14 @@ impl Witness {
         text
     }
 
+    /// The ID a key [`witnessed`] gave is of: its row's key, or the input or tracked struct
+    /// whose field it is. A caller that knows the type reads it back
+    /// ([`super::FromIdIn::from_id_in`]) to say more of the read than [`Witness::read_text`]
+    /// can: which crate, not only which number.
+    pub fn read_id(key: u64) -> super::Id {
+        super::storage::key_parts(key).1
+    }
+
     /// The chain of reads that put `key`, a key [`witnessed`] gave, below `Durability::HIGH`:
     /// from `key`'s row its first edge below `HIGH`, from that one's row the same, down to an
     /// input or tracked field (or a row that read nothing below `HIGH`, low for an untracked

@@ -348,7 +348,7 @@ fn script(
     // Writing to a `String` does not fail.
     _ = writeln!(out, "SET threads = {THREADS};\nSET memory_limit = '{MEMORY_LIMIT}';");
     out.push_str("SET temp_directory = ");
-    views::quote(spill, &mut out);
+    _ = views::quote(spill, &mut out);
     out.push_str(";\n");
     // A query that reads a file another read already reads its footer from memory.
     out.push_str("SET parquet_metadata_cache = true;\n");
@@ -365,7 +365,8 @@ fn script(
         out.push_str("\nCOPY (\n");
         out.push_str(sql);
         out.push_str("\n) TO ");
-        views::quote(answer, &mut out);
+        // Writing to a `String` does not fail.
+        _ = views::quote(answer, &mut out);
         out.push_str(" (FORMAT parquet, COMPRESSION zstd);\n");
     }
     Ok(out)

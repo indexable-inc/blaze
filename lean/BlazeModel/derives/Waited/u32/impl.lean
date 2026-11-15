@@ -6,4 +6,6 @@ import BlazeModel.derives.Waited.u32.type
 open Blaze
 set_option linter.unusedVariables false
 
+namespace derives.Waited.u32
 deriving instance DecidableEq for derives.Waited.u32
+end derives.Waited.u32

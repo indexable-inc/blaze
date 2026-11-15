@@ -105,22 +105,34 @@ pub trait ImageStore: Sync {
 
     /// The record kept under `key`, read a part at a time: the driver's maps it once
     /// (`blaze_cas::direct`), so a part is a slice of the kernel's page cache and only the
-    /// pages a read touches are ever loaded. As given here, the whole value held: what a store
-    /// with no way to read a part gives (a test's, a value just fetched from the global cache).
+    /// pages a read touches are ever loaded. A store with no way to read a part (a test's, a
+    /// value just fetched from the global cache) says so with [`whole_pages`].
+    ///
+    /// No default, nor for [`ImageStore::for_each`]: each had one that gave the same answer
+    /// the slow way (the whole value read, the tasks run on one thread), so a store that can
+    /// do better and forgot to say kept working, slower, and nothing said so. Each store says
+    /// how it reads a part and how it runs a batch.
     // dyn: the driver's holder of one record, once per crate per session
-    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn PageSource>>, String> {
-        // dyn: as above; alloc: one holder per crate read from pages
-        Ok(self.get(key)?.map(|bytes| Arc::new(pages::Whole(bytes)) as Arc<dyn PageSource>))
-    }
+    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn PageSource>>, String>;
 
     /// Runs `task(at)` for each `at` in `0..count`, on every core the driver has: a crate's
     /// image is checked and encoded by one task, so [`serve`] and [`store`] take the larger of
     /// the work over the cores and the largest crate's. Running them in order on one thread
-    /// gives the same result.
+    /// gives the same result, which a test's store says it does.
     // dyn: one call per batch of crates, its task called once per crate
-    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
-        (0..count).for_each(task);
-    }
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync));
+}
+
+/// [`ImageStore::pages`] of a store with no way to read a part of a record: `found`, the value
+/// [`ImageStore::get`] read, held whole. The holder is in `alloc`, the caller's: a store's
+/// `pages` hands `Global`, since the holder is shared with the driver past any frame.
+// dyn: the holder of one record, once per crate per session
+pub fn whole_pages<A: std::alloc::Allocator + Clone>(
+    found: Option<ImageBuf>,
+    alloc: A,
+) -> Option<Arc<dyn PageSource, A>> {
+    // dyn: as above
+    found.map(|bytes| Arc::new_in(pages::Whole(bytes), alloc) as Arc<dyn PageSource, A>)
 }
 
 /// The local store over the global cache: a value the local store lacks is asked of the
@@ -161,8 +173,7 @@ impl ImageStore for ReadThrough<'_> {
         // From the global cache, kept in the local store by `get`: held whole this session
         // (the local store's put is written after the build), mapped from the local store
         // from the next.
-        // dyn: as above; alloc: one holder per crate read from pages
-        Ok(self.get(key)?.map(|bytes| Arc::new(pages::Whole(bytes)) as Arc<dyn PageSource>))
+        Ok(whole_pages(self.get(key)?, std::alloc::Global))
     }
 
     // dyn: as `ImageStore::for_each`
@@ -461,10 +472,6 @@ pub struct Stored {
     /// value made from the crate as this database resolved it is filed by
     /// (`blaze_diagnostics::cache`).
     pub filed: HashMap<CrateKey, ContentId, Global>,
-    /// The record families ([`super::found::family`]) written of each crate of `written`:
-    /// its image and its def map pages. What a found record
-    /// of the crate says it has; the impl tables are another store's to add.
-    pub families: u32,
 }
 
 /// Why [`store`] wrote nothing: an error of the store's caller or of the store, never of one
@@ -773,8 +780,9 @@ impl Hit {
     }
 }
 
-/// The image of each of `found`, a crate and the key a found record says its image was
-/// stored under (`super::found::Found::base`), for a start to give before any query of the
+/// The image of each of `found`, a crate and the crate's key a serve walked and stored its
+/// image under (no found record holds that key since layout 2, which its own key does not
+/// cover: [`super::found`]; no driver passes one now), for a start to give before any query of the
 /// crate runs (docs/v2/plan/design/front-end-on-memo.md, "A start gives what it found"): so the
 /// first [`serve_keeping`], whose walk keys the crate under that same key, finds it kept
 /// (`image_of(..).base` is its key, the mode is its mode), asks the store nothing and gives
@@ -1094,7 +1102,6 @@ pub fn store(
         _ = made[at].set(made_now);
     });
     let mut stored = Stored::default();
-    stored.families = super::found::family::IMAGE | super::found::family::DEF_MAP_PAGES;
     for (&(krate, _), made) in order.iter().zip(made) {
         let made = made.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))

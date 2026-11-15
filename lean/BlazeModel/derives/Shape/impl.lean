@@ -7,4 +7,6 @@ import BlazeModel.derives.Point.impl
 open Blaze
 set_option linter.unusedVariables false
 
+namespace derives.Shape
 deriving instance DecidableEq for derives.Shape
+end derives.Shape

@@ -330,8 +330,8 @@ read joins it, so what was written before a release is seen after the acquire th
 An update is glued to the message it read (nothing goes between) and continues its release
 sequence. A futex look sees at least what the caller of every completed wake had seen. A
 spawn gives a thread its parent's view and a join gives the parent its children's.
-`Prog.valueAny` runs a program in the sequentially consistent world where that world is its
-meaning and in this one where it refuses.
+A program's value in this world is `Prog.valueWeak`, and a theorem says which world it is
+stated in by the runner it calls (decision D46, below).
 
 - It has no promises, so it cannot show load buffering, which ARM allows of plain loads and
   stores. A run that could show it is refused (rule R1: a write that does not release, after
@@ -343,8 +343,40 @@ meaning and in this one where it refuses.
   release and an acquire and lost without them; coherence; a weak compare-and-swap that fails
   on a stale read.
 - The Rust `two` takes turns and makes the real operation, so it runs the sequentially
-  consistent world only and refuses the runs that world refuses; the weak world has no Rust
-  runner yet.
+  consistent world only and refuses the runs that world refuses.
+- Which world a theorem is stated in is said by its code (decision D46): `threads::two` is
+  the sequentially consistent world, `threads::two_weak` the weak one, and a theorem that
+  reaches `two_weak` has its statement over `Prog.valueWeak`.
+- The Rust `two_weak` (built 2026-11-14) is the weak world's step run:
+  `crates/blaze-core/src/world/weak.rs` is the weak world as a pure reference model
+  (messages, views, glued updates, the futex view, rule R1), and `two_weak` runs two closures
+  against it behind `two`'s scheduler, each scheduled atomic a list of messages in the run's
+  world, a read's message and a store's place chosen by the step's pick, a refused run a
+  panic that names the rule; each word holds its newest message's value after every step.
+  It is held to the Lean world by that world's 48 litmus runs restated in Rust with the same
+  schedules and the same answers.
+- The translator (built 2026-11-14): a call of `two_weak` is `Threads.two_of`, as `two`'s
+  is; each function carries whether it reaches `two` and whether it reaches `two_weak`,
+  through its callees and closures; a theorem that reaches `two_weak` has its statement over
+  `.valueWeak`, and one that reaches both is refused by name. `Prog.valueAny` is gone.
+- The first theorem in the weak world (proved 2026-11-14):
+  `handoff::no_hand_back_is_missed`, of the real `Wake`: a sender's relaxed store of its slot
+  and its `wake`, the driver's `drain` and its relaxed read of the slot, for every schedule
+  and every stale read: the driver saw the slot or the sender was told to wake it
+  (`BlazeCore/Handoff.lean`, eleven reachable states). Its control is the same two threads
+  with the flag's swaps `Relaxed`: in Rust on the one schedule that shows it, and in Lean a
+  run by evaluation that misses a hand-back (`BlazeCore/HandoffModel.lean`).
+- The method for the weak world (`lean/Blaze/ThreadsWeakAuto.lean`) is the sequentially
+  consistent one's with `execWeak`: `AdvanceWeak`, `two_exec_weak`, `two_ends_weak`, and step
+  lemmas that hold for every pick. A proof does not follow message ids: it states where a
+  thread's view of a cell stands among the cell's messages (`World.place`) and what an
+  update glues, which is enough to say "the later swap read the earlier one's message and
+  acquired its view".
+- Not reached: a relaxed read followed by a non-releasing write of another cell (rule R1),
+  which needs promises; `handoff::Claims` has that shape and keeps its model-checked test.
+  What the first proof asked of the world's presentation, for the next: a stated
+  well-formedness of a world (message ids unique and below the next, a cell's newest message
+  not glued) in place of hypotheses on each step lemma; `AtomicBool`'s conversions public.
 
 **Trusted.** That the kernel's wait is atomic with its comparison and a wake finds every
 sleeper, and that what a waker wrote before a wake that found no sleeper is seen by a wait
@@ -374,10 +406,55 @@ atomics and so never tried a park's step between the unpark's swap and its wake;
 for what the theorem does not state, that a park ends by its deadline and promptly after its
 wake on a clock that moves.
 
-Next: a clock in the threads world and that promptness theorem; models that name a thread's
-program points, so a proof does not copy the model's continuations
-(agents/annoyances/proofs-1113-11.json); a multi-cell structure against the weak world.
-How-to: `agents/howto/H-prove-two-threads.json`.
+A model names its thread's program points (built 2026-11-14): the code after the n-th
+operation of `f` is the definition `f.at_n`, and inside its k-th loop `f.loop_k.at_n`, with
+the loop itself a parameter; a tail two branches share is one definition, and a loop is
+written once. A proof states its points as these names and does not copy the model's
+continuations (the park's proof was ported to them; agents/annoyances/proofs-1113-11.json).
+
+Next: a multi-cell structure against the weak world (above). How-to:
+`agents/howto/H-prove-two-threads.json`.
+
+**A clock for the threads world** (built and its theorems proved 2026-11-14; it is what the
+park's simulation test stated and `no_unpark_is_lost` does not: that a park ends by its
+deadline, and promptly after its wake).
+
+- The world gets a clock and a script of readings. `threads::clock(&readings)` installs the
+  script before a run; `threads::now()` is one operation: the clock becomes the later of
+  itself and the script's next reading, and that is the answer; `threads::time()` reads the
+  clock without moving it (for a theorem's function to ask after a run). Time moves only
+  where someone looks, which loses nothing: a run's observations are its readings, in order,
+  and any nondecreasing sequence of them is a script.
+- `threads::wait_until(word, expected, deadline)` is the wait with a deadline on that clock:
+  the kernel may say the time ran out only where there is a deadline, and saying so moves
+  the clock to at least the deadline (it said so at or after it); a thread asleep in such a
+  wait whose deadline the clock has reached does not stay asleep (its next look returns
+  timed out, whatever the pick), and is not `Asleep` when a schedule ends.
+- The theorems, of the real `park` on a kernel whose wait is `wait_until` and whose clock is
+  `now`: (1) a park that says its deadline passed says so only with the clock at or past it;
+  (2) with the clock at or past its deadline, no schedule ends with the park asleep; (3)
+  left alone for eight of its own steps with the kernel quiet (pick 0), a park has returned
+  or sleeps, from every state a schedule reaches. With `no_unpark_is_lost`, (2) and (3) say
+  what the simulation test's "promptly" and "by its deadline" say, in steps, and (1) its
+  "never before". The test's simulated latencies have no counterpart: a step is a step.
+- Built as the first slice was: the Lean world (`Op.clock`, `Op.now`, `Op.wait_until` in
+  `lean/Blaze/Threads.lean`) and its examples by evaluation (`lean/Blaze/Tests/ThreadsClock.lean`);
+  the Rust `two` to match (`threads::{clock, now, time, wait_until}`, a reading in whole
+  nanoseconds, exact); their entries in the translator's table; the statements
+  (`a_park_keeps_its_deadline` for (1) and (2), `a_park_left_alone_returns_or_sleeps` for (3),
+  in `wait/parking.rs`), run on drawn schedules and readings with a planted kernel for each
+  (one that says a deadline early, one whose wait has no deadline, one that never sleeps).
+  Both are proved (`BlazeCore/Wait/ParkingDeadline.lean`, `ParkingTime.lean`): a port of the
+  park's proof to a kernel and a clock that are operations of the run, ten park points,
+  three unpark points and 31 reachable states; the longest run of the park alone is six
+  steps. What the method needed beyond `two_ends`: a schedule in two parts
+  (`two_exec_append`), one thread alone (`two_exec_alone`, `two_exec_first`), and a step
+  lemma for `now` whatever the script holds.
+- One clause of the simulation test was in no theorem: that a token waiting as the park
+  begins is taken, and that a park with no token and no unpark never says `Ready`. It is
+  `a_park_is_ready_exactly_for_a_token` (`BlazeCore/Wait/ParkingToken.lean`). With it the
+  park's simulation test through the core is deleted; the direct driver's test of the same
+  plans stays, as that driver's test.
 
 ## Costs
 

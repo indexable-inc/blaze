@@ -777,6 +777,11 @@ pub fn keep_history(
     blaze_profile::sampler::sample_between_builds(blaze_profile::sampler::detail_of(detail)?);
     // Unset, the cap follows what the home's own store holds as the daemon starts
     // ([`history::cap_for`]); a layer read behind it is another writer's and not counted.
+    // Taken once a daemon, not again as the store grows: the history keeps the last
+    // `history::KEEP_BUILDS` finished builds and every running one whole whatever the cap, so
+    // the cap only bounds what is kept beyond them, and measuring the store again means a walk
+    // of it at a build's end. `History::set_cap` takes a new one once the store counts its own
+    // bytes.
     let cap = match std::env::var(history::CAP_VAR) {
         Ok(value) => history::cap_of(Some(&value), 0)?,
         Err(std::env::VarError::NotPresent) => {

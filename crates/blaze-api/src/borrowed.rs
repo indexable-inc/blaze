@@ -136,6 +136,7 @@ pub enum ResponseRef<'a> {
     Proven(Proven),
     /// Once a test executable a test run: read owned.
     TestsOf(TestsOf),
+    Rows(crate::query::Rows),
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -411,6 +412,7 @@ impl ResponseRef<'_> {
             ResponseRef::Diagnostics(it) => Response::Diagnostics(it),
             ResponseRef::Proven(it) => Response::Proven(it),
             ResponseRef::TestsOf(it) => Response::TestsOf(it),
+            ResponseRef::Rows(it) => Response::Rows(it),
         }
     }
 }

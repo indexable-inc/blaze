@@ -13,18 +13,19 @@
 
 #![blaze::sans_io]
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
 
 use crate::Checked;
 use crate::ast::{
-    self, CallArgs, CompareOp, Expr, ExprKind, JoinKind, Name, ResultColumn, Span, SqlType,
-    Statement, TableRef, UnaryOp,
+    self, CallArgs, CompareOp, Expr, ExprKind, JoinKind, Name, ResultColumn, Span, Statement,
+    TableRef, UnaryOp,
 };
 use crate::desc::{Backend, Param, Rendered, Slot, Storage};
 use crate::funcs::{self, Postgres};
-use crate::infer::{self, Cx, Entry, TypeError};
+use crate::infer::{self, Cx, Entry, TypeError, keyword};
 // The one bound on nesting, the parser's: rendering recurses once per level, and the checker
 // refused anything deeper already.
 use crate::parse::MAX_DEPTH;
@@ -38,12 +39,43 @@ pub const POSTGRES_MAX_PLACEHOLDERS: u32 = 65535;
 /// How many bytes of a parameter's name an error keeps.
 const PARAM_NAME_BYTES: usize = 47;
 
+/// The engines' names of the types a `cast` writes, each written once.
+mod engine_type {
+    /// Postgres's boolean.
+    pub(super) const BOOLEAN: &str = "boolean";
+    /// Postgres's 64-bit integer, the Integer storage.
+    pub(super) const BIGINT: &str = "bigint";
+    /// Postgres's byte string, the Blob storage.
+    pub(super) const BYTEA: &str = "bytea";
+    /// Text, on both engines.
+    pub(super) const TEXT: &str = "text";
+    /// SQLite's integer, which also holds a Boolean as 0 or 1.
+    pub(super) const INTEGER: &str = "integer";
+    /// SQLite's 64-bit float.
+    pub(super) const REAL: &str = "real";
+    /// SQLite's byte string.
+    pub(super) const BLOB: &str = "blob";
+}
+
+/// What a `cast` opens with, before its operand.
+const CAST_OPEN: &str = "cast(";
+
+/// What a SQLite blob literal opens with, before its hex digits.
+const SQLITE_BLOB_OPEN: &str = "x'";
+
+/// SQLite's name for itself, which its variant's name (`Sqlite`) does not spell.
+const SQLITE_NAME: &str = "SQLite";
+
+/// Postgres's name for itself.
+const POSTGRES_NAME: &str = "Postgres";
+
 /// A parameter's name kept in an error, which borrows nothing: its first
 /// [`PARAM_NAME_BYTES`] bytes, cut at a character boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParamName {
     bytes: [u8; PARAM_NAME_BYTES],
-    len: u8,
+    /// How many of `bytes` are the name, at most [`PARAM_NAME_BYTES`].
+    len: usize,
     cut: bool,
 }
 
@@ -57,16 +89,19 @@ impl ParamName {
         if let (Some(to), Some(from)) = (bytes.get_mut(..len), name.as_bytes().get(..len)) {
             to.copy_from_slice(from);
         }
-        // `len` is at most PARAM_NAME_BYTES, which fits a u8.
-        ParamName { bytes, len: len as u8, cut: len < name.len() }
+        ParamName { bytes, len, cut: len < name.len() }
     }
 
-    /// The name kept, without its `$`.
+    /// The name kept, without its `$`. The bytes kept end at a character boundary, so their
+    /// first run of valid UTF-8 is all of them.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn as_str(&self) -> &str {
         self.bytes
-            .get(..usize::from(self.len))
-            .and_then(|bytes| core::str::from_utf8(bytes).ok())
-            .unwrap_or("")
+            .get(..self.len)
+            .and_then(|bytes| bytes.utf8_chunks().next())
+            .map_or("", |chunk| chunk.valid())
     }
 }
 
@@ -80,7 +115,7 @@ impl fmt::Display for ParamName {
 #[derive(Debug)]
 pub enum RenderError {
     /// `list_lens` has a length for each list parameter, and it had another count.
-    ListLens { expected: u32, found: u32 },
+    ListLens { expected: usize, found: usize },
     /// A list parameter used twice on SQLite, which writes one placeholder per entry.
     ListUsedTwice { param: ParamName, span: Span },
     /// The parameter whose placeholder would cross the engine's most.
@@ -95,13 +130,13 @@ pub enum RenderError {
     /// An `offset` with no `limit`, which the parser refuses: a tree built by hand.
     OffsetWithoutLimit { span: Span },
     /// Writing a number into the text failed.
-    Format,
+    Format(fmt::Error),
 }
 
 fn backend_name(backend: Backend) -> &'static str {
     match backend {
-        Backend::Sqlite => "SQLite",
-        Backend::Postgres => "Postgres",
+        Backend::Sqlite => SQLITE_NAME,
+        Backend::Postgres => POSTGRES_NAME,
     }
 }
 
@@ -117,7 +152,12 @@ impl fmt::Display for RenderError {
                 "list parameter {param} is used twice; on SQLite a list is one placeholder per entry, so a list parameter may be used once (at bytes {}..{})",
                 span.start, span.end
             ),
-            RenderError::TooManyPlaceholders { backend, limit, param, span } => write!(
+            RenderError::TooManyPlaceholders {
+                backend: backend @ (Backend::Sqlite | Backend::Postgres),
+                limit,
+                param,
+                span,
+            } => write!(
                 f,
                 "parameter {param} needs a placeholder past {}'s most of {limit} in one statement (at bytes {}..{})",
                 backend_name(*backend),
@@ -144,13 +184,17 @@ impl fmt::Display for RenderError {
                 "`offset` at bytes {}..{} has no `limit` before it, which no parsed statement has; write `limit .. offset ..`",
                 span.start, span.end
             ),
-            RenderError::Format => f.write_str("writing a number into the statement's text failed"),
+            RenderError::Format(error) => {
+                write!(f, "writing a number into the statement's text failed: {error}")
+            }
         }
     }
 }
 
 /// Writes `checked` as `backend`'s text. `list_lens` holds the length of each list parameter,
 /// in the order the list parameters stand in the description.
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn render<A: Allocator + Copy, B: Allocator + Copy>(
     checked: &Checked<'_, A>,
     backend: Backend,
@@ -159,20 +203,17 @@ pub fn render<A: Allocator + Copy, B: Allocator + Copy>(
 ) -> Result<Rendered<B>, RenderError> {
     let params = &checked.description.params[..];
     let mut list_of = Vec::with_capacity_in(params.len(), alloc);
-    let mut lists: u32 = 0;
+    let mut lists: usize = 0;
     for param in params {
         if param.list {
-            list_of.push(lists);
+            list_of.push(Some(lists));
             lists = lists.saturating_add(1);
         } else {
-            list_of.push(NOT_A_LIST);
+            list_of.push(None);
         }
     }
-    if usize::try_from(lists).ok() != Some(list_lens.len()) {
-        return Err(RenderError::ListLens {
-            expected: lists,
-            found: u32::try_from(list_lens.len()).unwrap_or(u32::MAX),
-        });
+    if lists != list_lens.len() {
+        return Err(RenderError::ListLens { expected: lists, found: list_lens.len() });
     }
     let mut numbers = Vec::with_capacity_in(params.len(), alloc);
     numbers.resize(params.len(), UNNUMBERED);
@@ -180,10 +221,11 @@ pub fn render<A: Allocator + Copy, B: Allocator + Copy>(
         backend,
         params,
         list_lens,
-        list_of,
+        list_of: list_of.into_boxed_slice(),
         numbers,
         text: Vec::new_in(alloc),
         slots: Vec::new_in(alloc),
+        placeholders: 0,
         cx: Cx::new(&checked.schema, None, alloc),
         depth: 0,
     };
@@ -191,21 +233,46 @@ pub fn render<A: Allocator + Copy, B: Allocator + Copy>(
     Ok(Rendered { text: writer.text, slots: writer.slots })
 }
 
-/// In `list_of`: the parameter is a scalar.
-const NOT_A_LIST: u32 = u32::MAX;
 /// In `numbers`: the parameter has no placeholder yet.
 const UNNUMBERED: u32 = 0;
 /// In `numbers`: a SQLite list parameter, written once.
 const LIST_WRITTEN: u32 = u32::MAX;
 
-fn inconsistent(error: TypeError<'_>) -> RenderError {
-    RenderError::Inconsistent { span: error.span }
+/// The base numbers are written in.
+const RADIX: u64 = 10;
+
+/// The most decimal digits a `u64` has: `u64::MAX` is 18446744073709551615, 20 digits.
+const U64_DIGITS: usize = 20;
+
+/// Whether a list parameter is `in $list` or `not in $list`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Membership {
+    In,
+    NotIn,
+}
+
+/// A parameter of the description: its index there, and that index as a [`Slot`] names it.
+#[derive(Clone, Copy, Debug)]
+struct ParamAt {
+    index: usize,
+    slot: u32,
+}
+
+/// A statement that does not type against its own schema while it is rendered: the checker
+/// typed it, so this is a bug in the checker, at the error's span.
+impl From<TypeError<'_>> for RenderError {
+    fn from(error: TypeError<'_>) -> RenderError {
+        RenderError::Inconsistent { span: error.span }
+    }
 }
 
 /// A `fmt::Write` into the text, for a real's digits.
 struct Bytes<'a, B: Allocator>(&'a mut Vec<u8, B>);
 
 impl<B: Allocator> fmt::Write for Bytes<'_, B> {
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.0.extend_from_slice(s.as_bytes());
         Ok(())
@@ -216,12 +283,14 @@ struct Writer<'c, 's, B: Allocator + Copy> {
     backend: Backend,
     params: &'c [Param<'s>],
     list_lens: &'c [u32],
-    /// Per parameter: its index in `list_lens`, or [`NOT_A_LIST`].
-    list_of: Vec<u32, B>,
+    /// Per parameter: its index in `list_lens`, or `None` for a scalar.
+    list_of: Box<[Option<usize>], B>,
     /// Per parameter: its placeholder number, [`UNNUMBERED`] or [`LIST_WRITTEN`].
     numbers: Vec<u32, B>,
     text: Vec<u8, B>,
     slots: Vec<Slot, B>,
+    /// How many placeholders `slots` holds, as their numbers count.
+    placeholders: u32,
     /// The typer, run again for the scope and a `sum`'s argument.
     cx: Cx<'s, B>,
     depth: u32,
@@ -232,16 +301,24 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
         self.text.extend_from_slice(s.as_bytes());
     }
 
+    /// `word` with a space on each side: a keyword between two parts of the text.
+    fn spaced(&mut self, word: &str) {
+        self.put(" ");
+        self.put(word);
+        self.put(" ");
+    }
+
     fn put_u64(&mut self, mut value: u64) {
-        let mut digits = [0u8; 20];
+        let mut digits = [0u8; U64_DIGITS];
         let mut at = digits.len();
         loop {
             at -= 1;
             if let Some(digit) = digits.get_mut(at) {
-                // `value % 10` is below 10.
-                *digit = b'0' + (value % 10) as u8;
+                // `value % RADIX` is below 10, so its lowest byte is all of it.
+                let [low, ..] = (value % RADIX).to_le_bytes();
+                *digit = b'0' + low;
             }
-            value /= 10;
+            value /= RADIX;
             if value == 0 || at == 0 {
                 break;
             }
@@ -255,7 +332,7 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
     /// exponent, so neither engine reads it as an integer.
     fn put_real(&mut self, value: f64) -> Result<(), RenderError> {
         fmt::write(&mut Bytes(&mut self.text), format_args!("{value:?}"))
-            .map_err(|_| RenderError::Format)
+            .map_err(RenderError::Format)
     }
 
     /// A name of the schema, quoted.
@@ -281,7 +358,7 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
     /// What a qualified column names its table by: its alias, or the table's schema name.
     fn entry_name(&mut self, entry: Entry<'s>) {
         if entry.alias {
-            self.source_name(entry.name);
+            self.source_name(entry.name.text);
         } else {
             self.schema_name(entry.table.name);
         }
@@ -305,7 +382,7 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
     /// Adds a placeholder binding `slot`, and gives its number.
     fn push_slot(&mut self, slot: Slot, name: &Name<'_>) -> Result<u32, RenderError> {
         let limit = self.limit();
-        if u32::try_from(self.slots.len()).map_or(true, |count| count >= limit) {
+        if self.placeholders >= limit {
             return Err(RenderError::TooManyPlaceholders {
                 backend: self.backend,
                 limit,
@@ -314,25 +391,32 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             });
         }
         self.slots.push(slot);
-        // At most `limit`, which fits a u32.
-        Ok(self.slots.len() as u32)
+        // Below `limit`, so one more fits a u32.
+        self.placeholders += 1;
+        Ok(self.placeholders)
     }
 
-    fn param_index(&self, name: &Name<'_>) -> Result<usize, RenderError> {
-        self.params.iter().position(|param| param.name == name.text).ok_or(
-            RenderError::NotInDescription { param: ParamName::new(name.text), span: name.span },
-        )
+    fn param_index(&self, name: &Name<'_>) -> Result<ParamAt, RenderError> {
+        self.params
+            .iter()
+            .enumerate()
+            .zip(0u32..)
+            .find(|((_, param), _)| param.name == name.text)
+            .map(|((index, _), slot)| ParamAt { index, slot })
+            .ok_or(RenderError::NotInDescription {
+                param: ParamName::new(name.text),
+                span: name.span,
+            })
     }
 
     fn param(&mut self, name: &Name<'_>) -> Result<(), RenderError> {
-        let index = self.param_index(name)?;
-        if self.list_of.get(index) != Some(&NOT_A_LIST) {
+        let ParamAt { index, slot } = self.param_index(name)?;
+        if self.list_of.get(index) != Some(&None) {
             return Err(RenderError::Inconsistent { span: name.span });
         }
         let mut number = self.numbers.get(index).copied().unwrap_or(UNNUMBERED);
         if number == UNNUMBERED {
-            // An index into the description, which has fewer parameters than the text has bytes.
-            number = self.push_slot(Slot::Scalar { param: index as u32 }, name)?;
+            number = self.push_slot(Slot::Scalar { param: slot }, name)?;
             if let Some(entry) = self.numbers.get_mut(index) {
                 *entry = number;
             }
@@ -342,13 +426,11 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
     }
 
     /// ` in $list` after its operand.
-    fn list_param(&mut self, name: &Name<'_>, negated: bool) -> Result<(), RenderError> {
-        let index = self.param_index(name)?;
-        let ord = match self.list_of.get(index) {
-            Some(&ord) if ord != NOT_A_LIST => ord,
-            _ => return Err(RenderError::Inconsistent { span: name.span }),
+    fn list_param(&mut self, name: &Name<'_>, membership: Membership) -> Result<(), RenderError> {
+        let ParamAt { index, slot: param } = self.param_index(name)?;
+        let Some(&Some(ord)) = self.list_of.get(index) else {
+            return Err(RenderError::Inconsistent { span: name.span });
         };
-        let param = index as u32;
         let number = self.numbers.get(index).copied().unwrap_or(UNNUMBERED);
         match self.backend {
             Backend::Sqlite => {
@@ -361,11 +443,13 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                 if let Some(entry) = self.numbers.get_mut(index) {
                     *entry = LIST_WRITTEN;
                 }
-                let Some(&len) = usize::try_from(ord).ok().and_then(|ord| self.list_lens.get(ord))
-                else {
+                let Some(&len) = self.list_lens.get(ord) else {
                     return Err(RenderError::Inconsistent { span: name.span });
                 };
-                self.put(if negated { " not in (" } else { " in (" });
+                self.put(match membership {
+                    Membership::In => " in (",
+                    Membership::NotIn => " not in (",
+                });
                 for item in 0..len {
                     if item > 0 {
                         self.put(", ");
@@ -376,7 +460,10 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                 self.put(")");
             }
             Backend::Postgres => {
-                self.put(if negated { " <> all(" } else { " = any(" });
+                self.put(match membership {
+                    Membership::In => " = any(",
+                    Membership::NotIn => " <> all(",
+                });
                 let number = if number == UNNUMBERED {
                     let number = self.push_slot(Slot::Array { param }, name)?;
                     if let Some(entry) = self.numbers.get_mut(index) {
@@ -403,29 +490,31 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
     }
 
     fn select<X: Allocator>(&mut self, select: &ast::Select<'s, X>) -> Result<(), RenderError> {
-        self.put("select ");
+        self.put(keyword::SELECT);
+        self.put(" ");
         if select.distinct {
-            self.put("distinct ");
+            self.put(keyword::DISTINCT);
+            self.put(" ");
         }
         if let Some(from) = &select.from {
-            self.cx.enter_from(from).map_err(inconsistent)?;
+            self.cx.enter_from(from)?;
         }
         self.results(&select.columns)?;
         if let Some(from) = &select.from {
-            self.put(" from ");
+            self.spaced(keyword::FROM);
             self.table_ref(&from.first)?;
             for join in from.joins.iter() {
-                self.put(match join.kind {
-                    JoinKind::Inner => " join ",
-                    JoinKind::Left => " left join ",
-                });
+                match join.kind {
+                    JoinKind::Inner => self.spaced(keyword::JOIN),
+                    JoinKind::Left => self.put(" left join "),
+                }
                 self.table_ref(&join.table)?;
-                self.put(" on ");
+                self.spaced(keyword::ON);
                 self.expr(&join.on)?;
             }
         }
         if let Some(filter) = &select.filter {
-            self.put(" where ");
+            self.spaced(keyword::WHERE);
             self.expr(filter)?;
         }
         for (index, group) in select.group_by.iter().enumerate() {
@@ -433,7 +522,7 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             self.expr(group)?;
         }
         if let Some(having) = &select.having {
-            self.put(" having ");
+            self.spaced(keyword::HAVING);
             self.expr(having)?;
         }
         for (index, term) in select.order_by.iter().enumerate() {
@@ -443,7 +532,8 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                 None => self.expr(&term.expr)?,
             }
             if term.descending {
-                self.put(" desc");
+                self.put(" ");
+                self.put(keyword::DESC);
             }
             // SQLite puts nulls first in ascending order and last in descending; Postgres
             // the other way unless told.
@@ -453,10 +543,10 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
         }
         match (&select.limit, &select.offset) {
             (Some(limit), offset) => {
-                self.put(" limit ");
+                self.spaced(keyword::LIMIT);
                 self.expr(limit)?;
                 if let Some(offset) = offset {
-                    self.put(" offset ");
+                    self.spaced(keyword::OFFSET);
                     self.expr(offset)?;
                 }
             }
@@ -470,10 +560,10 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
     }
 
     fn table_ref(&mut self, table_ref: &TableRef<'s>) -> Result<(), RenderError> {
-        let table = self.cx.table(&table_ref.table).map_err(inconsistent)?;
+        let table = self.cx.table(&table_ref.table)?;
         self.schema_name(table.name);
         if let Some(alias) = &table_ref.alias {
-            self.put(" as ");
+            self.spaced(keyword::AS);
             self.source_name(alias.text);
         }
         Ok(())
@@ -495,7 +585,7 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                     }
                 }
                 ResultColumn::TableStar { table } => {
-                    let index = self.cx.find_entry(table).map_err(inconsistent)?;
+                    let index = self.cx.find_entry(table)?;
                     let Some(entry) = self.cx.entry(index).copied() else {
                         return Err(RenderError::Inconsistent { span: table.span });
                     };
@@ -507,15 +597,35 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                     }
                     first = false;
                     self.expr(expr)?;
-                    self.put(" as ");
-                    match (alias, &expr.kind) {
-                        (Some(alias), _) => self.source_name(alias.text),
-                        (None, ExprKind::Column { table, column }) => {
-                            let resolved =
-                                self.cx.resolve(table.as_ref(), column).map_err(inconsistent)?;
-                            self.schema_name(resolved.column.name);
-                        }
-                        (None, _) => return Err(RenderError::Inconsistent { span: expr.span }),
+                    self.spaced(keyword::AS);
+                    match alias {
+                        Some(alias) => self.source_name(alias.text),
+                        None => match &expr.kind {
+                            ExprKind::Column { table, column } => {
+                                let resolved = self.cx.resolve(table.as_ref(), column)?;
+                                self.schema_name(resolved.column.name);
+                            }
+                            ExprKind::Null
+                            | ExprKind::Boolean(_)
+                            | ExprKind::Integer(_)
+                            | ExprKind::Real(_)
+                            | ExprKind::Text(_)
+                            | ExprKind::Blob(_)
+                            | ExprKind::Param(_)
+                            | ExprKind::Unary { .. }
+                            | ExprKind::Chain { .. }
+                            | ExprKind::Compare { .. }
+                            | ExprKind::IsNull { .. }
+                            | ExprKind::InList { .. }
+                            | ExprKind::InParam { .. }
+                            | ExprKind::Between { .. }
+                            | ExprKind::Like { .. }
+                            | ExprKind::Case { .. }
+                            | ExprKind::Cast { .. }
+                            | ExprKind::Call { .. } => {
+                                return Err(RenderError::Inconsistent { span: expr.span });
+                            }
+                        },
                     }
                 }
             }
@@ -532,7 +642,7 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             self.entry_name(entry);
             self.put(".");
             self.schema_name(column.name);
-            self.put(" as ");
+            self.spaced(keyword::AS);
             self.schema_name(column.name);
         }
     }
@@ -544,12 +654,12 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
         if columns.is_empty() {
             return Ok(());
         }
-        self.put(" returning ");
+        self.spaced(keyword::RETURNING);
         self.results(columns)
     }
 
     fn insert<X: Allocator>(&mut self, insert: &ast::Insert<'s, X>) -> Result<(), RenderError> {
-        let table = self.cx.table(&insert.table).map_err(inconsistent)?;
+        let table = self.cx.table(&insert.table)?;
         self.put("insert into ");
         self.schema_name(table.name);
         self.put(" (");
@@ -574,17 +684,22 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             self.put(")");
         }
         if !insert.returning.is_empty() {
-            self.cx.enter_table(&insert.table).map_err(inconsistent)?;
+            self.cx.enter_table(&insert.table)?;
         }
         self.returning(&insert.returning)
     }
 
     fn update<X: Allocator>(&mut self, update: &ast::Update<'s, X>) -> Result<(), RenderError> {
-        let table = self.cx.enter_table(&update.table).map_err(inconsistent)?;
-        self.put("update ");
+        let table = self.cx.enter_table(&update.table)?;
+        self.put(keyword::UPDATE);
+        self.put(" ");
         self.schema_name(table.name);
         for (index, assignment) in update.sets.iter().enumerate() {
-            self.put(if index == 0 { " set " } else { ", " });
+            if index == 0 {
+                self.spaced(keyword::SET);
+            } else {
+                self.put(", ");
+            }
             let Some(column) = infer::column_of(table, &assignment.column) else {
                 return Err(RenderError::Inconsistent { span: assignment.column.span });
             };
@@ -593,18 +708,18 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             self.expr(&assignment.value)?;
         }
         if let Some(filter) = &update.filter {
-            self.put(" where ");
+            self.spaced(keyword::WHERE);
             self.expr(filter)?;
         }
         self.returning(&update.returning)
     }
 
     fn delete<X: Allocator>(&mut self, delete: &ast::Delete<'s, X>) -> Result<(), RenderError> {
-        let table = self.cx.enter_table(&delete.table).map_err(inconsistent)?;
+        let table = self.cx.enter_table(&delete.table)?;
         self.put("delete from ");
         self.schema_name(table.name);
         if let Some(filter) = &delete.filter {
-            self.put(" where ");
+            self.spaced(keyword::WHERE);
             self.expr(filter)?;
         }
         self.returning(&delete.returning)
@@ -662,8 +777,10 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
         crate::tests::stack::touch();
         let postgres = self.backend == Backend::Postgres;
         match &e.kind {
-            ExprKind::Null => self.put("null"),
-            ExprKind::Boolean(value) => self.put(if *value { "true" } else { "false" }),
+            ExprKind::Null => self.put(keyword::NULL),
+            ExprKind::Boolean(value) => {
+                self.put(if *value { keyword::TRUE } else { keyword::FALSE });
+            }
             ExprKind::Integer(value) => {
                 self.put_u64(*value);
                 if postgres {
@@ -690,13 +807,13 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                     self.put(hex);
                     self.put("'::bytea");
                 } else {
-                    self.put("x'");
+                    self.put(SQLITE_BLOB_OPEN);
                     self.put(hex);
                     self.put("'");
                 }
             }
             ExprKind::Column { table, column } => {
-                let resolved = self.cx.resolve(table.as_ref(), column).map_err(inconsistent)?;
+                let resolved = self.cx.resolve(table.as_ref(), column)?;
                 if table.is_some() {
                     let Some(entry) = self.cx.entry(resolved.entry).copied() else {
                         return Err(RenderError::Inconsistent { span: e.span });
@@ -724,7 +841,8 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                 }
             }
             ExprKind::Unary { op: UnaryOp::Not, operand } => {
-                self.put("not ");
+                self.put(keyword::NOT);
+                self.put(" ");
                 self.operand(operand)?;
             }
             // A chain is written flat, in a loop: the engines read `a op b op c` of one level
@@ -738,20 +856,36 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                     self.operand(&link.operand)?;
                 }
             }
-            ExprKind::Compare { op, left, right } => {
+            ExprKind::Compare {
+                op:
+                    op @ (CompareOp::Eq
+                    | CompareOp::Ne
+                    | CompareOp::Lt
+                    | CompareOp::Le
+                    | CompareOp::Gt
+                    | CompareOp::Ge
+                    | CompareOp::Is
+                    | CompareOp::IsNot),
+                left,
+                right,
+            } => {
                 self.operand(left)?;
-                self.put(match (op, postgres) {
-                    (CompareOp::Is, true) => " is not distinct from ",
-                    (CompareOp::IsNot, true) => " is distinct from ",
-                    (CompareOp::Is, false) => " is ",
-                    (CompareOp::IsNot, false) => " is not ",
-                    (CompareOp::Eq, _) => " = ",
-                    (CompareOp::Ne, _) => " <> ",
-                    (CompareOp::Lt, _) => " < ",
-                    (CompareOp::Le, _) => " <= ",
-                    (CompareOp::Gt, _) => " > ",
-                    (CompareOp::Ge, _) => " >= ",
-                });
+                match (op, postgres) {
+                    // Postgres's `is` takes only `null`, `true` and `false`; its `is not
+                    // distinct from` is SQLite's `is`.
+                    (CompareOp::Is, true) => self.put(" is not distinct from "),
+                    (CompareOp::IsNot, true) => self.put(" is distinct from "),
+                    (CompareOp::Is | CompareOp::IsNot, false)
+                    | (
+                        CompareOp::Eq
+                        | CompareOp::Ne
+                        | CompareOp::Lt
+                        | CompareOp::Le
+                        | CompareOp::Gt
+                        | CompareOp::Ge,
+                        true | false,
+                    ) => self.spaced(infer::compare_text(*op)),
+                }
                 self.operand(right)?;
             }
             ExprKind::IsNull { operand, negated } => {
@@ -771,18 +905,27 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             }
             ExprKind::InParam { operand, list, negated } => {
                 self.operand(operand)?;
-                self.list_param(list, *negated)?;
+                let membership = if *negated { Membership::NotIn } else { Membership::In };
+                self.list_param(list, membership)?;
             }
             ExprKind::Between { operand, low, high, negated } => {
                 self.operand(operand)?;
-                self.put(if *negated { " not between " } else { " between " });
+                if *negated {
+                    self.put(" ");
+                    self.put(keyword::NOT);
+                }
+                self.spaced(keyword::BETWEEN);
                 self.operand(low)?;
-                self.put(" and ");
+                self.spaced(keyword::AND);
                 self.operand(high)?;
             }
             ExprKind::Like { operand, pattern, negated } => {
                 self.operand(operand)?;
-                self.put(if *negated { " not like " } else { " like " });
+                if *negated {
+                    self.put(" ");
+                    self.put(keyword::NOT);
+                }
+                self.spaced(keyword::LIKE);
                 self.operand(pattern)?;
                 // Postgres's `like` takes `\` as an escape by default; SQLite has none.
                 if postgres {
@@ -790,41 +933,52 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                 }
             }
             ExprKind::Case { operand, arms, otherwise } => {
-                self.put("case");
+                self.put(keyword::CASE);
                 if let Some(operand) = operand {
                     self.put(" ");
                     self.expr(operand)?;
                 }
                 for arm in arms.iter() {
-                    self.put(" when ");
+                    self.spaced(keyword::WHEN);
                     self.expr(&arm.when)?;
-                    self.put(" then ");
+                    self.spaced(keyword::THEN);
                     self.expr(&arm.then)?;
                 }
                 if let Some(otherwise) = otherwise {
-                    self.put(" else ");
+                    self.spaced(keyword::ELSE);
                     self.expr(otherwise)?;
                 }
-                self.put(" end");
+                self.put(" ");
+                self.put(keyword::END);
             }
-            ExprKind::Cast { operand, to } => {
-                self.put("cast(");
+            ExprKind::Cast {
+                operand,
+                to:
+                    to @ (Storage::Boolean
+                    | Storage::Integer
+                    | Storage::Real
+                    | Storage::Text
+                    | Storage::Blob),
+            } => {
+                self.put(CAST_OPEN);
                 self.expr(operand)?;
-                self.put(" as ");
+                self.spaced(keyword::AS);
                 self.put(match (to, postgres) {
-                    (SqlType::Boolean, true) => "boolean",
-                    (SqlType::Integer, true) => "bigint",
-                    (SqlType::Real, true) => "double precision",
-                    (SqlType::Text, true) => "text",
-                    (SqlType::Blob, true) => "bytea",
-                    (SqlType::Boolean | SqlType::Integer, false) => "integer",
-                    (SqlType::Real, false) => "real",
-                    (SqlType::Text, false) => "text",
-                    (SqlType::Blob, false) => "blob",
+                    (Storage::Boolean, true) => engine_type::BOOLEAN,
+                    (Storage::Integer, true) => engine_type::BIGINT,
+                    (Storage::Real, true) => "double precision",
+                    (Storage::Text, true) => engine_type::TEXT,
+                    (Storage::Blob, true) => engine_type::BYTEA,
+                    (Storage::Boolean | Storage::Integer, false) => engine_type::INTEGER,
+                    (Storage::Real, false) => engine_type::REAL,
+                    (Storage::Text, false) => engine_type::TEXT,
+                    (Storage::Blob, false) => engine_type::BLOB,
                 });
                 self.put(")");
             }
-            ExprKind::Call { function, args } => self.call(function, args, e.span)?,
+            ExprKind::Call { function, args: args @ (CallArgs::Star | CallArgs::List { .. }) } => {
+                self.call(function, args, e.span)?
+            }
         }
         Ok(())
     }
@@ -837,11 +991,18 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
     ) -> Result<(), RenderError> {
         #[cfg(test)]
         crate::tests::stack::touch();
-        let Some(function) = funcs::lookup(name.text, name.quoted) else {
+        let Some(function) = funcs::lookup(name) else {
             return Err(RenderError::Inconsistent { span: at });
         };
         let cast = match (self.backend, function.postgres) {
-            (Backend::Sqlite, _) | (Backend::Postgres, Postgres::AsIs) => None,
+            (
+                Backend::Sqlite,
+                Postgres::AsIs
+                | Postgres::Bigint
+                | Postgres::DoublePrecision
+                | Postgres::BigintOfInteger,
+            )
+            | (Backend::Postgres, Postgres::AsIs) => None,
             (Backend::Postgres, Postgres::Bigint) => Some(" as bigint)"),
             (Backend::Postgres, Postgres::DoublePrecision) => Some(" as double precision)"),
             (Backend::Postgres, Postgres::BigintOfInteger) => match args {
@@ -849,16 +1010,16 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                     let Some(first) = args.first() else {
                         return Err(RenderError::Inconsistent { span: at });
                     };
-                    match self.cx.storage_of(first).map_err(inconsistent)? {
+                    match self.cx.storage_of(first)? {
                         Storage::Integer => Some(" as bigint)"),
-                        _ => None,
+                        Storage::Boolean | Storage::Real | Storage::Text | Storage::Blob => None,
                     }
                 }
                 CallArgs::Star => None,
             },
         };
         if cast.is_some() {
-            self.put("cast(");
+            self.put(CAST_OPEN);
         }
         self.put(function.name);
         self.put("(");
@@ -866,7 +1027,8 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             CallArgs::Star => self.put("*"),
             CallArgs::List { distinct, args } => {
                 if *distinct {
-                    self.put("distinct ");
+                    self.put(keyword::DISTINCT);
+                    self.put(" ");
                 }
                 for (index, arg) in args.iter().enumerate() {
                     if index > 0 {

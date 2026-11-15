@@ -166,8 +166,11 @@ impl<'db> Writer<'_, 'db> {
             Ty::Vec(elem) => format!("Vec<{}>", Self::key(elem)),
             Ty::Array(elem, len) => format!("[{}; {len}]", Self::key(elem)),
             Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
+            Ty::PhantomData => "core::marker::PhantomData".to_owned(),
             Ty::Duration => "core::time::Duration".to_owned(),
             Ty::Ordering => "core::cmp::Ordering".to_owned(),
+            Ty::Range { elem, inclusive: false } => format!("core::ops::Range<{}>", Self::key(elem)),
+            Ty::Range { elem, inclusive: true } => format!("core::ops::RangeInclusive<{}>", Self::key(elem)),
             Ty::Str => "str".to_owned(),
             Ty::Opaque(opaque) => opaque.rust().to_owned(),
             Ty::Shared(shared) => shared.rust(),
@@ -243,7 +246,13 @@ impl<'db> Writer<'_, 'db> {
             Ty::TryFromIntError => {
                 return Err(self.cx.refuse("the type `TryFromIntError`, which the MIR model has no declaration of", at));
             }
-            Ty::Duration | Ty::Ordering | Ty::Str | Ty::Opaque(_) | Ty::Shared(_) => {
+            Ty::PhantomData
+            | Ty::Duration
+            | Ty::Ordering
+            | Ty::Range { .. }
+            | Ty::Str
+            | Ty::Opaque(_)
+            | Ty::Shared(_) => {
                 let key = Self::key(ty);
                 return Err(self.cx.refuse(format!("the type `{key}`, which the MIR model has no declaration of"), at));
             }
@@ -296,6 +305,7 @@ impl<'db> Writer<'_, 'db> {
                         return Err(self.cx.refuse("a constant that is a place", at));
                     }
                     Operand::Str(_)
+                    | Operand::PhantomData
                     | Operand::Duration { .. }
                     | Operand::Ordering(_)
                     | Operand::Variant { .. } => {
@@ -703,9 +713,11 @@ fn body<'db>(
         unusable: BTreeMap::new(),
         duration: None,
         derives: BTreeSet::new(),
+        orders: BTreeSet::new(),
         envs: BTreeMap::new(),
         lent: BTreeMap::new(),
         opaques: Vec::new(),
+        builders: BTreeMap::new(),
     };
     let mut writer = Writer { cx, program, built: mir.phase == m::MirPhase::Built };
     let mut locals = Vec::with_capacity(mir.locals.len());

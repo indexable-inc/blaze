@@ -103,6 +103,40 @@ fn example_as_json() {
 }
 
 #[test]
+fn wraps_words_and_spans_of_multi_byte_characters_by_columns() {
+    // Words with `é`, `ï` and an emoji (two columns), runs of spaces kept, a code span of them
+    // wrapped whole, the space at the end of one span carried to the next.
+    let text = Text::new()
+        .words("caf\u{e9}  na\u{ef}ve \u{1f980} crab ")
+        .code("\u{e9}\u{1f980}")
+        .words(" fin");
+    let report = Report::error(Text::plain("x")).at(text);
+    let caps = Caps { color: false, links: false, width: Some(24) };
+    let expected = "error: x\n  ─ caf\u{e9}  na\u{ef}ve \u{1f980} crab\n    `\u{e9}\u{1f980}` fin\n";
+    assert_eq!(render(&report, caps, &ROOTS), expected);
+}
+
+#[test]
+fn a_linked_path_of_multi_byte_characters_is_measured_without_its_escapes() {
+    // The path shows as 8 columns (`ré/🦀.rs`) and fits the 20 to the column; the word after
+    // it wraps.
+    let text = Text::new()
+        .words("v\u{e9}rifi\u{e9} \u{1f980}\u{e9} ")
+        .path("/w/r\u{e9}/\u{1f980}.rs")
+        .words(" \u{fc}");
+    let report = Report::error(Text::plain("x")).at(text);
+    let caps = Caps { color: true, links: true, width: Some(24) };
+    let expected = concat!(
+        "\x1b[1m\x1b[91merror\x1b[0m: x\n",
+        "  \x1b[2m─\x1b[0m v\u{e9}rifi\u{e9} \u{1f980}\u{e9} ",
+        "\x1b]8;;file:///w/r%C3%A9/%F0%9F%A6%80.rs\x1b\\",
+        "\x1b[2mr\u{e9}/\u{1f980}.rs\x1b[0m\x1b]8;;\x1b\\\n",
+        "    \u{fc}\n",
+    );
+    assert_eq!(render(&report, caps, &ROOTS), expected);
+}
+
+#[test]
 fn renders_the_same_twice() {
     let caps = Caps { color: true, links: true, width: Some(60) };
     assert_eq!(render(&example(), caps, &ROOTS), render(&example(), caps, &ROOTS));
