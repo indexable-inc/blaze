@@ -27,7 +27,7 @@ pub(crate) fn edit<F: Files>(
     rules: &str,
     edits: &[blaze_api::Edit],
 ) -> Result<blaze_intent::Applied, crate::Error> {
-    crate::edit(db, files, &hir::Crate::all(db), rules, edits)
+    crate::edit(db, files, &hir::Crate::all(db), rules, edits, std::alloc::Global)
 }
 
 /// The view: its files by path, with their text.

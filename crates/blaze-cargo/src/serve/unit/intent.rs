@@ -14,7 +14,7 @@ use blaze_hash::HashMap;
 use blaze_intent::ahead;
 use blaze_units::schema::Mode;
 use blaze_vfs::Bytes;
-use std::alloc::{Allocator, Global};
+use std::alloc::Allocator;
 
 use super::{Job, UnitReader, answer_macros_built, files::Mounted, graph::flag};
 use crate::serve::work::Failed;
@@ -22,8 +22,13 @@ use crate::serve::work::Failed;
 /// `edits` made in the job's view ([`blaze_intent::apply`]): what they change, for the session
 /// to commit. Bytes of the view that fail their check end it with an error naming the file.
 /// A request's [`Edit::Rules`] runs every rewrite of its rules file after the request's other
-/// edits ([`blaze_astlog::edit`]); one such edit a request.
-pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edited, Failed> {
+/// edits ([`blaze_astlog::edit`]); one such edit a request. The request's tables are in `alloc`.
+pub(crate) fn edit<A: Allocator + Clone>(
+    job: &Job,
+    reader: &UnitReader,
+    edits: &[Edit],
+    alloc: A,
+) -> Result<Edited, Failed> {
     macros_built(job, reader, "edit")?;
     let mut rules = edits.iter().filter_map(|it| match it {
         Edit::Rules { rules } => Some(rules.as_str()),
@@ -34,17 +39,16 @@ pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edi
         let what = "an edit request carries two astlog rules edits: put every rule in one file";
         return Err(ApiError::new(what, None).into());
     }
-    let files = ViewFiles::of(job, reader);
-    let crates = read_crates(job, Global)?;
+    let files = ViewFiles::of(job, reader, alloc.clone()); // clone: the caller's allocator handle
+    let crates = read_crates(job, alloc.clone())?; // clone: the caller's allocator handle
     let applied = match first {
         Some(rules) => {
-            // alloc: the request's other edits, once a request
-            let others: Vec<Edit> =
-                edits.iter().filter(|it| !matches!(it, Edit::Rules { .. })).cloned().collect();
-            blaze_astlog::edit(reader.db(), &files, &crates, rules, &others)
+            let mut others = Vec::new_in(alloc.clone()); // clone: the caller's allocator handle
+            others.extend(edits.iter().filter(|it| !matches!(it, Edit::Rules { .. })).cloned());
+            blaze_astlog::edit(reader.db(), &files, &crates, rules, &others, alloc)
                 .map_err(|error| blaze_astlog::api_error(&error))
         }
-        None => blaze_intent::apply(reader.db(), &files, &crates, edits),
+        None => blaze_intent::apply(reader.db(), &files, &crates, edits, alloc),
     };
     if let Some((path, why)) = files.corrupt.into_inner() {
         return Err(ApiError::new(why, Some(path)).into());
@@ -56,11 +60,17 @@ pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edi
 }
 
 /// `rules` run over the job's view ([`blaze_astlog::query`]): every relation they derive and
-/// every lint's finding. Writes nothing and builds nothing past the view's proc macros.
-pub(crate) fn query(job: &Job, reader: &UnitReader, rules: &str) -> Result<Rows, Failed> {
+/// every lint's finding. Writes nothing and builds nothing past the view's proc macros. The
+/// request's tables are in `alloc`.
+pub(crate) fn query<A: Allocator + Clone>(
+    job: &Job,
+    reader: &UnitReader,
+    rules: &str,
+    alloc: A,
+) -> Result<Rows, Failed> {
     macros_built(job, reader, "query")?;
-    let files = ViewFiles::of(job, reader);
-    let crates = read_crates(job, Global)?;
+    let files = ViewFiles::of(job, reader, alloc.clone()); // clone: the caller's allocator handle
+    let crates = read_crates(job, alloc)?;
     let rows = blaze_astlog::query(reader.db(), &files, &crates, rules)
         .map_err(|error| blaze_astlog::api_error(&error));
     if let Some((path, why)) = files.corrupt.into_inner() {
@@ -155,11 +165,11 @@ pub(crate) fn ahead(job: &Job, reader: &UnitReader, filter: &[String]) -> Result
     clippy::disallowed_types,
     reason = "each read once, the first time an edit asks: per edit, not global"
 )]
-struct ViewFiles<'a> {
+struct ViewFiles<'a, A: Allocator> {
     mounted: &'a Mounted,
-    files: Vec<ViewFile<'a>>,
-    by_path: HashMap<Box<str>, u32, Global>,
-    by_id: HashMap<FileId, u32, Global>,
+    files: Vec<ViewFile<'a>, A>,
+    by_path: HashMap<Box<str>, u32, A>,
+    by_id: HashMap<FileId, u32, A>,
     /// The first file whose bytes failed their check, and why.
     corrupt: OnceCell<(String, String)>,
 }
@@ -175,11 +185,11 @@ struct ViewFile<'a> {
     bytes: OnceCell<Option<Bytes>>,
 }
 
-impl<'a> ViewFiles<'a> {
-    /// The job's view over the reader's front end.
-    fn of(job: &'a Job, reader: &'a UnitReader) -> ViewFiles<'a> {
+impl<'a, A: Allocator + Clone> ViewFiles<'a, A> {
+    /// The job's view over the reader's front end, its tables in `alloc`.
+    fn of(job: &'a Job, reader: &'a UnitReader, alloc: A) -> ViewFiles<'a, A> {
         let files = reader.db().files();
-        ViewFiles::new(&job.mounted, reader.paths(), |id| files.alias_of(id).is_some())
+        ViewFiles::new(&job.mounted, reader.paths(), |id| files.alias_of(id).is_some(), alloc)
     }
 
     /// `paths`' files in the view. A path names the file on disk, never an alias of it
@@ -193,9 +203,11 @@ impl<'a> ViewFiles<'a> {
         mounted: &'a Mounted,
         paths: &'a std::collections::HashMap<FileId, String>,
         is_alias: impl Fn(FileId) -> bool,
-    ) -> ViewFiles<'a> {
-        let mut files = Vec::new();
-        let (mut by_path, mut by_id) = (HashMap::new_in(Global), HashMap::new_in(Global));
+        alloc: A,
+    ) -> ViewFiles<'a, A> {
+        let mut files = Vec::new_in(alloc.clone()); // clone: the caller's allocator handle
+        let mut by_path = HashMap::new_in(alloc.clone()); // clone: the caller's allocator handle
+        let mut by_id = HashMap::new_in(alloc);
         for (&id, absolute) in paths {
             let Some(path) = mounted.in_view(absolute) else { continue };
             let at = u32::try_from(files.len()).expect("under 2^32 files");
@@ -210,7 +222,7 @@ impl<'a> ViewFiles<'a> {
     }
 }
 
-impl blaze_intent::Files for ViewFiles<'_> {
+impl<A: Allocator> blaze_intent::Files for ViewFiles<'_, A> {
     fn file(&self, path: &str) -> Option<(FileId, &[u8])> {
         let file = &self.files[*self.by_path.get(path)? as usize];
         let bytes = file.bytes.get_or_init(|| match self.mounted.read(file.absolute) {
@@ -274,7 +286,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let files = ViewFiles::new(&mounted, &paths, |_| false);
+        let files = ViewFiles::new(&mounted, &paths, |_| false, std::alloc::Global);
         assert_eq!(files.path(FileId::from_raw(0)), Some("src/lib.rs"));
         assert_eq!(files.path(FileId::from_raw(1)), None);
         assert_eq!(files.file("src/lib.rs"), Some((FileId::from_raw(0), &b"pub fn a() {}\n"[..])));
@@ -298,7 +310,7 @@ mod tests {
         let mounted = Mounted::new(vfs.reader(), root, &mounts, "/w");
         let paths: std::collections::HashMap<FileId, String> =
             [(FileId::from_raw(0), "/w/src/lib.rs".to_owned())].into_iter().collect();
-        let files = ViewFiles::new(&mounted, &paths, |_| false);
+        let files = ViewFiles::new(&mounted, &paths, |_| false, std::alloc::Global);
         assert_eq!(files.file("rules/lib/calls.astlog"), None, "not a front-end file");
         let read = files.with_bytes("rules/lib/calls.astlog", <[u8]>::to_vec);
         assert_eq!(read.as_deref(), Some(&b"(rule (r x) (fn-item x))\n"[..]));

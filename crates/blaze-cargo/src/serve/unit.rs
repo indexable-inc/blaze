@@ -2670,14 +2670,14 @@ impl Front<Real> for JobFront {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
-        cancellable(|| intent::edit(&self.0, &reader, edits))?
+        cancellable(|| intent::edit(&self.0, &reader, edits, std::alloc::Global))?
     }
 
     fn query(&self, reader: UnitReader, rules: &str) -> Result<blaze_api::query::Rows, Failed> {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
-        cancellable(|| intent::query(&self.0, &reader, rules))?
+        cancellable(|| intent::query(&self.0, &reader, rules, std::alloc::Global))?
     }
 
     fn ahead(&self, reader: UnitReader, filter: &[String]) -> Result<Vec<u32>, Failed> {

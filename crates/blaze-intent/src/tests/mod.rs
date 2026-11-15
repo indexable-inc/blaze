@@ -23,7 +23,7 @@ pub(crate) fn apply<F: crate::Files>(
     files: &F,
     edits: &[blaze_api::Edit],
 ) -> Result<crate::Applied, blaze_api::ApiError> {
-    crate::apply(db, files, &hir::Crate::all(db), edits)
+    crate::apply(db, files, &hir::Crate::all(db), edits, std::alloc::Global)
 }
 
 /// Every node and token of a tree, by kind and range, bodies parsed.

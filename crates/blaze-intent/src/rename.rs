@@ -99,7 +99,7 @@ pub(crate) fn rename(
     let mut hits = Vec::new();
     let finder = memchr::memmem::Finder::new(bare.as_bytes());
     let files = cx.files;
-    for file in files_of(cx.db, &cx.view, files, def, Global) {
+    for file in files_of(cx.db, cx.view, files, def, Global) {
         let path = files.path(file).ok_or_else(|| {
             fail(format!("a file of a crate that can see `{}` is outside the view", target.item))
         })?;

@@ -233,7 +233,7 @@ pub(crate) fn params(
     while let Some(name) = names.get(searched).cloned() {
         searched += 1;
         let finder = memchr::memmem::Finder::new(name.as_bytes());
-        for file in rename::files_of(db, &cx.view, files, Def::Item(item), Global) {
+        for file in rename::files_of(db, cx.view, files, Def::Item(item), Global) {
             let path = files.path(file).ok_or_else(|| {
                 fail(format!("a file of a crate that can see `{}` is outside the view", target.item))
             })?;

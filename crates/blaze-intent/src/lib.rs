@@ -41,7 +41,7 @@ use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_vfs::Op;
 use hir::{Crate, view::Semantics};
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use syntax::{
     Edition, Parse, SourceFile, SyntaxKind,
     view::{self as ast, AstNode as _},
@@ -121,7 +121,7 @@ pub(crate) struct Edits<'a, F: Files> {
     pub files: &'a F,
     /// The crates the request reads, those of the caller's whose root is a file of the view,
     /// in its order: the first that has a file as a module answers for it ([`apply`]).
-    pub view: Vec<Crate>,
+    pub view: &'a [Crate],
     pub working: Vec<Working>,
     pub ids: Vec<FileId>,
     /// Each working copy's tree before any splice, as the front end has it: the views `sema`
@@ -153,34 +153,35 @@ pub struct TextEdit {
 /// The view is read through those of `crates` whose root is a file of it, and no other crate
 /// of the database: a file is opened once, by its path, and the first of them that has it as
 /// a module answers what its names resolve to (docs/v2/plan/design/astlog-sema.md, "One crate
-/// a file").
-pub fn apply<F: Files>(
+/// a file"). The request's tables are in `alloc`.
+pub fn apply<F: Files, A: Allocator + Clone>(
     db: &Db,
     files: &F,
     crates: &[Crate],
     edits: &[Edit],
+    alloc: A,
 ) -> Result<Applied, ApiError> {
-    apply_with_text(db, files, crates, edits, &[])
+    apply_with_text(db, files, crates, edits, &[], alloc)
 }
 
 /// [`apply`]'s `edits`, then `text`, each moved past the edits before it. A text edit whose
 /// range an earlier edit replaced any of is an error naming both, and so is a file the text
 /// edits leave with a syntax error the view's file did not have: nothing is made.
-pub fn apply_with_text<F: Files>(
+pub fn apply_with_text<F: Files, A: Allocator + Clone>(
     db: &Db,
     files: &F,
     crates: &[Crate],
     edits: &[Edit],
     text: &[TextEdit],
+    alloc: A,
 ) -> Result<Applied, ApiError> {
-    // alloc: one entry a crate of the view, once a request
-    let view: Vec<Crate> =
-        crates.iter().copied().filter(|it| files.path(it.root_file(db)).is_some()).collect();
+    let mut view = Vec::new_in(alloc.clone()); // clone: the caller's allocator handle
+    view.extend(crates.iter().copied().filter(|it| files.path(it.root_file(db)).is_some()));
     let mut cx = Edits {
         db,
         sema: Semantics::new_within(db, view.iter().map(|it| it.base()).collect()),
         files,
-        view,
+        view: &view,
         working: Vec::new(),
         ids: Vec::new(),
         roots: Vec::new(), // alloc: one view per file the request opens, beside `ids`
@@ -253,7 +254,7 @@ pub fn apply_with_text<F: Files>(
                         _ => None,
                     })
                     .collect();
-                replace::replace(&mut cx, &asked)?;
+                replace::replace(&mut cx, &asked, alloc.clone())?; // clone: the caller's allocator handle
                 replaced = true;
             }
             Edit::Rules { .. } => {

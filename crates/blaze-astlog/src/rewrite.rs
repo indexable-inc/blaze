@@ -138,30 +138,33 @@ fn place_key(cell: &Cell) -> (u8, &str, u32, u32, &str, i64) {
 }
 
 /// Run `rules` over the view and apply every rewrite's actions, with `edits` before them, as
-/// one request, read through `crates` as [`query`] reads them.
+/// one request, read through `crates` as [`query`] reads them. The edits' tables are in
+/// `alloc` ([`blaze_intent::apply`]).
 ///
 /// # Errors
 ///
 /// A query's errors; an action that can't be placed or that overlaps another rule's, naming
 /// both and the place; the edits' own failure, a file left unparsable among them.
-pub fn edit<F: Files>(
+pub fn edit<F: Files, A: Allocator + Clone>(
     db: &Db,
     files: &F,
     crates: &[Crate],
     rules: &str,
     edits: &[Edit],
+    alloc: A,
 ) -> Res<Applied> {
-    edit_with(db, files, crates, rules, edits, Parens::ByPrecedence)
+    edit_with(db, files, crates, rules, edits, Parens::ByPrecedence, alloc)
 }
 
 /// [`edit`], with templates parenthesized by precedence or, for a test's control, not.
-pub(crate) fn edit_with<F: Files>(
+pub(crate) fn edit_with<F: Files, A: Allocator + Clone>(
     db: &Db,
     files: &F,
     crates: &[Crate],
     rules: &str,
     edits: &[Edit],
     parens: Parens,
+    alloc: A,
 ) -> Res<Applied> {
     let program = Program::load(rules, &ViewRules(files))?;
     let facts = Sema::new(db, files, crates)?;
@@ -188,7 +191,7 @@ pub(crate) fn edit_with<F: Files>(
         }
         imports::finish(&facts, moved, &mut text, &mut more)?;
         let text = without_overlap(files, text)?;
-        blaze_intent::apply_with_text(db, files, &facts.view, &more, &text).map_err(|error| {
+        blaze_intent::apply_with_text(db, files, &facts.view, &more, &text, alloc).map_err(|error| {
             SourceError::Edit { what: error.what.clone(), at: error.at.clone() }.into()
         })
     })

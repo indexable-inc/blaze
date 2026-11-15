@@ -113,15 +113,16 @@ enum Via {
 }
 
 /// Retargets every reference to the item each `from` names to the item its `to` names, every
-/// pair of `asked` in one pass.
-pub(crate) fn replace(
+/// pair of `asked` in one pass. The files it scans are listed in `alloc`.
+pub(crate) fn replace<A: Allocator + Clone>(
     cx: &mut Edits<'_, impl Files>,
     asked: &[(&str, &str)],
+    alloc: A,
 ) -> Result<(), ApiError> {
     let fail = |what: String| ApiError::new(what, None);
     let db = cx.db;
     let files = cx.files;
-    let view = cx.view.clone(); // clone: the view's crates, once a replace, beside `cx`'s edits
+    let view = cx.view;
     if view.is_empty() {
         return Err(fail("the view has no crate the front end lowered".to_owned()));
     }
@@ -172,7 +173,7 @@ pub(crate) fn replace(
     let mut hits = Vec::new();
     let mut adds: Vec<(usize, Add)> = Vec::new();
     let mut direct = HashSet::new_in(Global);
-    for (krate, file) in files_of(db, files, &scanned, Global) {
+    for (krate, file) in files_of(db, files, &scanned, alloc) {
         let holds = |at: usize, bytes: &[u8]| {
             if !reach[at].contains(&krate) {
                 return None;

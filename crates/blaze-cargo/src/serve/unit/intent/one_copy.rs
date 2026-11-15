@@ -19,6 +19,7 @@ use blaze_units::{
     schema::{Mode, Profile, Strip, Stripped, Target as UnitTarget, Unit, UnitDep, UnitGraph},
 };
 use blaze_vfs::{Mode as FileMode, Op, Vfs};
+use std::alloc::{Allocator, Global};
 
 use super::{ViewFiles, read_order};
 use crate::serve::unit::files::Mounted;
@@ -210,41 +211,65 @@ fn mounted(vfs: &mut Vfs) -> Mounted {
     Mounted::new(vfs.reader(), root, &mounts, "/w")
 }
 
-/// The crates a job of `units` reads, as [`super::read_crates`] orders them.
-fn job(lowered: &Lowered, units: &[usize]) -> Vec<hir::Crate> {
-    let units: Vec<(bool, Option<base_db::Crate>)> =
-        units.iter().map(|&at| (at == TESTED, lowered.krate(at))).collect();
-    read_order(&units, std::alloc::Global)
+/// The crates a job of `units` reads, as [`super::read_crates`] orders them, in `alloc`.
+fn job<A: Allocator + Clone>(lowered: &Lowered, units: &[usize], alloc: A) -> Vec<hir::Crate, A> {
+    let mut read = Vec::new_in(alloc.clone()); // clone: the caller's allocator handle
+    read.extend(units.iter().map(|&at| (at == TESTED, lowered.krate(at))));
+    read_order(&read, alloc)
 }
 
-/// Each `unwrap-call` row's place, `path:start`, in reading order.
-fn unwraps(lowered: &Lowered, crates: &[hir::Crate]) -> Vec<String> {
+/// A file of the view a row can be in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum In {
+    Lib,
+    Main,
+}
+
+/// Each `unwrap-call` row's place, its file and start, in reading order, in `alloc`.
+fn unwraps<A: Allocator + Clone>(lowered: &Lowered, crates: &[hir::Crate], alloc: A) -> Vec<(In, u32), A> {
     let (mut vfs, _) = Vfs::restore(FileName::new("vfs/journal").unwrap(), 0, &[], None);
     let mounted = mounted(&mut vfs);
     let db = lowered.db();
-    let files = ViewFiles::new(&mounted, lowered.paths(), |id: FileId| db.files().alias_of(id).is_some());
+    let alias = |id: FileId| db.files().alias_of(id).is_some();
+    let files = ViewFiles::new(&mounted, lowered.paths(), alias, alloc.clone()); // clone: the caller's allocator handle
     let rows = blaze_astlog::query(db, &files, crates, RULES).unwrap();
     let relation = rows.relations.iter().find(|it| it.name == "unwrap-call").unwrap();
-    relation
-        .rows
-        .iter()
-        .map(|row| match &row[0] {
-            Cell::Code { path, start, .. } => format!("{path}:{start}"),
-            other => panic!("not code: {other:?}"),
-        })
-        .collect()
+    let mut out = Vec::new_in(alloc);
+    out.extend(relation.rows.iter().map(|row| match &row[0] {
+        Cell::Code { path, start, .. } => match path.as_str() {
+            "src/lib.rs" => (In::Lib, *start),
+            "src/main.rs" => (In::Main, *start),
+            other => panic!("a row in {other}"),
+        },
+        other => panic!("not code: {other:?}"),
+    }));
+    out
 }
 
-/// `edits` made through `crates`: `src/lib.rs` and `src/main.rs` after them.
-fn edited(lowered: &Lowered, crates: &[hir::Crate], edits: &[Edit]) -> (String, String) {
+/// `bytes`, a file's text after edits, as text.
+fn text(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes).unwrap()
+}
+
+/// `edits` made through `crates`: `src/lib.rs` and `src/main.rs` after them, in `alloc`.
+fn edited<A: Allocator + Clone>(
+    lowered: &Lowered,
+    crates: &[hir::Crate],
+    edits: &[Edit],
+    alloc: A,
+) -> (Vec<u8, A>, Vec<u8, A>) {
     let (mut vfs, _) = Vfs::restore(FileName::new("vfs/journal").unwrap(), 0, &[], None);
     let mounted = mounted(&mut vfs);
     let db = lowered.db();
-    let files = ViewFiles::new(&mounted, lowered.paths(), |id: FileId| db.files().alias_of(id).is_some());
-    let applied = blaze_intent::apply(db, &files, crates, edits).unwrap();
+    let alias = |id: FileId| db.files().alias_of(id).is_some();
+    let files = ViewFiles::new(&mounted, lowered.paths(), alias, alloc.clone()); // clone: the caller's allocator handle
+    let applied = blaze_intent::apply(db, &files, crates, edits, alloc.clone()).unwrap(); // clone: the caller's allocator handle
     assert!(files.corrupt.into_inner().is_none());
-    let mut texts = (LIB.as_bytes().to_vec(), MAIN.as_bytes().to_vec());
-    let mut ops: Vec<&Op> = applied.edited.ops.iter().collect();
+    let mut texts = (Vec::new_in(alloc.clone()), Vec::new_in(alloc.clone())); // clone: the caller's allocator handle
+    texts.0.extend_from_slice(LIB.as_bytes());
+    texts.1.extend_from_slice(MAIN.as_bytes());
+    let mut ops = Vec::new_in(alloc);
+    ops.extend(applied.edited.ops.iter());
     ops.sort_by_key(|it| match it {
         Op::Edit { at, .. } => std::cmp::Reverse(*at),
         other => panic!("not a text edit: {other:?}"),
@@ -257,15 +282,18 @@ fn edited(lowered: &Lowered, crates: &[hir::Crate], edits: &[Edit]) -> (String, 
             other => panic!("an edit of {other}"),
         };
         let (at, len) = (*at as usize, *len as usize);
-        text.splice(at..at + len, bytes.iter().copied());
+        let tail = text.split_off(at + len);
+        text.truncate(at);
+        text.extend_from_slice(bytes);
+        text.extend_from_slice(&tail);
     }
-    (String::from_utf8(texts.0).unwrap(), String::from_utf8(texts.1).unwrap())
+    texts
 }
 
 /// The places of `S.unwrap()` in `live` and `crate::S.unwrap()` in the test, each once.
-fn the_two() -> Vec<String> {
-    let at = |code: &str| format!("src/lib.rs:{}", LIB.find(code).unwrap());
-    vec![at("S.unwrap() }"), at("crate::S.unwrap()")]
+fn the_two() -> [(In, u32); 2] {
+    let at = |code: &str| (In::Lib, u32::try_from(LIB.find(code).unwrap()).unwrap());
+    [at("S.unwrap() }"), at("crate::S.unwrap()")]
 }
 
 /// The invariant: a match is one row whatever copies of its file the front end holds. A default
@@ -276,9 +304,10 @@ fn the_two() -> Vec<String> {
 fn a_query_is_one_row_a_match_through_the_jobs_crates_alone() {
     let lowered = lowered();
     assert!(lowered.db().files().alias_of(lowered.krate(TESTED).unwrap().data(lowered.db()).root_file_id).is_some());
-    assert_eq!(unwraps(&lowered, &job(&lowered, &[CORE, PLAIN])), the_two(), "the default job");
-    assert_eq!(unwraps(&lowered, &job(&lowered, &[CORE, PLAIN, TESTED])), the_two(), "the job of tests");
-    assert_eq!(unwraps(&lowered, &job(&lowered, &[CORE, TESTED])), the_two(), "the test unit alone");
+    let rows = |units: &[usize]| unwraps(&lowered, &job(&lowered, units, Global), Global);
+    assert_eq!(rows(&[CORE, PLAIN]), the_two(), "the default job");
+    assert_eq!(rows(&[CORE, PLAIN, TESTED]), the_two(), "the job of tests");
+    assert_eq!(rows(&[CORE, TESTED]), the_two(), "the test unit alone");
 }
 
 /// The control: every crate of the database read (the planted bug) reads `src/lib.rs` through
@@ -287,9 +316,9 @@ fn a_query_is_one_row_a_match_through_the_jobs_crates_alone() {
 fn the_oracle_catches_a_query_that_reads_every_crate() {
     let lowered = lowered();
     let every = hir::Crate::all(lowered.db());
-    let rows = unwraps(&lowered, &every);
+    let rows = unwraps(&lowered, &every, Global);
     assert_ne!(rows, the_two(), "the planted bug's rows went unseen");
-    assert!(rows.iter().any(|it| it.starts_with("src/main.rs")), "{rows:?}");
+    assert!(rows.iter().any(|it| it.0 == In::Main), "{rows:?}");
 }
 
 /// A rename and a replace through a job of tests edit each reference in `src/lib.rs` once, and
@@ -298,25 +327,25 @@ fn the_oracle_catches_a_query_that_reads_every_crate() {
 #[test]
 fn an_edit_by_meaning_is_one_edit_a_reference_through_the_jobs_crates_alone() {
     let lowered = lowered();
-    let tests = job(&lowered, &[CORE, PLAIN, TESTED]);
+    let tests = job(&lowered, &[CORE, PLAIN, TESTED], Global);
     let rename = |item: &str, to: &str| Edit::Rename {
         to: to.to_owned(),
         item: Target { file: "src/lib.rs".to_owned(), item: item.to_owned() },
     };
-    let (lib, main) = edited(&lowered, &tests, &[rename("live", "alive")]);
-    assert_eq!(lib, LIB.replace("live()", "alive()"), "the rename of a fn the test calls");
-    assert_eq!(main, MAIN, "the bin is another job's");
-    let (lib, _) = edited(&lowered, &tests, &[rename("tests::t", "t2")]);
-    assert_eq!(lib, LIB.replace("fn t()", "fn t2()"), "the rename of the test the harness names");
+    let (lib, main) = edited(&lowered, &tests, &[rename("live", "alive")], Global);
+    assert_eq!(text(&lib), LIB.replace("live()", "alive()"), "the rename of a fn the test calls");
+    assert_eq!(text(&main), MAIN, "the bin is another job's");
+    let (lib, _) = edited(&lowered, &tests, &[rename("tests::t", "t2")], Global);
+    assert_eq!(text(&lib), LIB.replace("fn t()", "fn t2()"), "the rename of the test the harness names");
     let replace = Edit::Replace { from: "p::S".to_owned(), to: "p::T".to_owned() };
-    let (lib, main) = edited(&lowered, &tests, &[replace]);
+    let (lib, main) = edited(&lowered, &tests, &[replace], Global);
     // A replace spells its target from `crate` in its own crate.
     let want = LIB
         .replace("impl S {", "impl crate::T {")
         .replace("{ S.unwrap()", "{ crate::T.unwrap()")
         .replace("crate::S.unwrap()", "crate::T.unwrap()");
-    assert_eq!(lib, want, "each reference to `S` retargeted once");
-    assert_eq!(main, MAIN, "the bin is another job's");
+    assert_eq!(text(&lib), want, "each reference to `S` retargeted once");
+    assert_eq!(text(&main), MAIN, "the bin is another job's");
 }
 
 /// What the spec's "Not built" says: with the bin in the job of tests, a rename of the lib's
@@ -325,12 +354,12 @@ fn an_edit_by_meaning_is_one_edit_a_reference_through_the_jobs_crates_alone() {
 #[test]
 fn a_rename_through_a_job_of_tests_leaves_a_dependent_of_the_libs_own_copy() {
     let lowered = lowered();
-    let all = job(&lowered, &[CORE, PLAIN, TESTED, STRANGER]);
+    let all = job(&lowered, &[CORE, PLAIN, TESTED, STRANGER], Global);
     let rename = Edit::Rename {
         to: "alive".to_owned(),
         item: Target { file: "src/lib.rs".to_owned(), item: "live".to_owned() },
     };
-    let (lib, main) = edited(&lowered, &all, &[rename]);
-    assert_eq!(lib, LIB.replace("live()", "alive()"));
-    assert_eq!(main, MAIN, "the bin's call of the lib's own `live`");
+    let (lib, main) = edited(&lowered, &all, &[rename], Global);
+    assert_eq!(text(&lib), LIB.replace("live()", "alive()"));
+    assert_eq!(text(&main), MAIN, "the bin's call of the lib's own `live`");
 }
