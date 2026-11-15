@@ -1,13 +1,17 @@
 //! `untyped_error`: a function's signature whose error is a type that can't name what failed for
-//! the caller to match on (AGENTS.md rule 19): `Result<_, String>`, `Result<_, Box<dyn Error>>`
-//! (any auto traits beside), and `anyhow::Error` (`anyhow::Result<T>` is `Result<T,
-//! anyhow::Error>`), anywhere in the return type or a parameter's type.
+//! the caller to match on (AGENTS.md rule 19): `Result<_, String>`, `Result<_, &str>` (any
+//! lifetime), `Result<_, Box<dyn Error>>` (any auto traits beside), and `anyhow::Error`
+//! (`anyhow::Result<T>` is `Result<T, anyhow::Error>`), anywhere in the return type or a
+//! parameter's type.
 //!
 //! Checked in a library target's functions and in a binary's or example's outside its crate
 //! root, the `main` module, which may report to a person and exit. A test, bench or build
 //! script target, code under `#[cfg(test)]` or `#[test]`, and a method of a trait impl (whose
 //! signature is the trait's, found at the trait) are not checked. Types are resolved, so a
-//! renamed import or an alias of one of them is found.
+//! renamed import or an alias of one of them (`type Result<T> = std::result::Result<T,
+//! String>`) is found at each signature that uses it; the alias's own definition is no
+//! signature, and the gate's text count (scripts/src/bin/untyped.rs, its `aliases` column)
+//! counts it there.
 
 use hir::{AsAssocItem as _, HirDisplay as _};
 use hir_def::lang_item::lang_items;
@@ -115,6 +119,8 @@ impl Kinds {
                 && self.error.is_some_and(|it| inner.as_dyn_trait() == Some(it))
             {
                 found = Some("a `Box<dyn Error>`");
+            } else if error.as_reference().is_some_and(|(inner, _)| inner.is_str()) {
+                found = Some("a `&str`");
             }
         });
         found

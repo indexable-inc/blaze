@@ -8,7 +8,7 @@
  "cause": "the directory has one reader that assumes it holds only per-lint count files, and the names it may also hold (TARGET) are special-cased in that reader",
  "class": "a directory shared by several ratchets whose reader knows only one of them",
  "prevention": "name every file the directory may hold in one place (TARGET, the lint baselines by pattern, alloc-sites.txt), read by both baseline::read and the scripts",
- "workaround": "baseline::read skips `alloc-sites.txt` as it skips TARGET (a const beside TARGET_FILE)",
+ "workaround": "baseline::read skips `alloc-sites.txt` as it skips TARGET (a const beside TARGET_FILE); met again 2026-11-15 by the untyped-errors ratchet (claude-opus-5-5), whose `untyped-errors.txt` got a third such const, UNTYPED_ERRORS_FILE",
  "fix": "not yet",
  "state": "open"
 }
