@@ -292,16 +292,19 @@ fn script_memory() -> crate::Memory {
 /// Reads into memory of the asker's and writes from it, each step run to its end before the
 /// next, what each ended with and what the memory and the file held then: a read of whole
 /// blocks, one cut at the file's end, one at an odd offset, a write from memory into the middle
-/// and one past the end, and the refusals every driver makes alike (a missing file, a span past
-/// its region, a misaligned read around the cache). What a read leaves of its span past what it
-/// read, or of all of it where it failed, is anything (the simulation scribbles it, a read
-/// around the cache writes whole blocks), so the script zeroes it, as the store's pool does.
+/// and one past the end (the file kept by the reads before them), the refusals every driver
+/// makes alike (a missing file, a span past its region, a misaligned read around the cache),
+/// and a read of a file sealed read-only (mode 0444) that nothing read before, which no
+/// driver opens for writing to read. What a read leaves of its span past what it read, or of
+/// all of it where it failed, is anything (the simulation scribbles it, a read around the
+/// cache writes whole blocks), so the script zeroes it, as the store's pool does.
 fn memory_script(driver: &mut impl Driver) -> Vec<String> {
     use crate::{Cache, Priority};
     let block = crate::DIRECT_ALIGN;
     let mut memory = script_memory();
     let pack = name("pool/pack-1");
     let missing = name("pool/missing");
+    let placed = name("placed/sealed");
     let read = |file: &FileName, at, into, cache| Effect::ReadInto {
         file: file.clone(),
         at,
@@ -332,6 +335,12 @@ fn memory_script(driver: &mut impl Driver) -> Vec<String> {
         read(&pack, 0, memory.span(8 * block - 10, 100), Cache::Kept),
         read(&pack, 1, memory.span(0, block as u32), Cache::Bypassed),
         read(&pack, 0, memory.span(1, block as u32), Cache::Bypassed),
+        // A file sealed read-only before anything read it, as a store opened after the place
+        // reads a placed file: read, made writable again so the directory can go.
+        Effect::Write { file: placed.clone(), bytes: pack_bytes(), tag: Tag(5) },
+        Effect::Seal { file: placed.clone(), mode: 0o444, tag: Tag(6) },
+        read(&placed, block, memory.span(0, block as u32), Cache::Kept),
+        Effect::Mode { file: placed.clone(), mode: 0o644, tag: Tag(7) },
     ];
     let mut seen = Vec::new();
     for (n, effect) in steps.into_iter().enumerate() {
@@ -378,7 +387,11 @@ fn digest(bytes: &[u8]) -> (usize, u32) {
 }
 
 /// A read into memory and a write from it end the same on every driver, the simulation's
-/// scribble included: each read here completes before its span is looked at.
+/// scribble included: each read here completes before its span is looked at. The sealed
+/// file's read is the control of the ring's positional keep: opened `O_RDWR` for a read, as
+/// before 2026-11-15, it fails with permission denied where the simulation reads (unless the
+/// test runs as root, whom the kernel lets open any file for writing); its writes after reads
+/// are the control of the keep opened read-only and never reopened to write (`EBADF`).
 #[test]
 fn every_driver_reads_into_and_writes_from_memory_the_same() {
     let simulated = memory_script(&mut Sim::new(5, Faults::default()));
@@ -396,6 +409,8 @@ fn every_driver_reads_into_and_writes_from_memory_the_same() {
     assert!(simulated[10].starts_with("refused: past the region"), "{simulated:?}");
     assert!(simulated[11].starts_with("refused: alignment"), "{simulated:?}");
     assert!(simulated[12].starts_with("refused: alignment"), "{simulated:?}");
+    let sealed = format!("{:?}", Done::ReadInto { len: crate::DIRECT_ALIGN as u32 });
+    assert!(simulated[15].starts_with(&sealed), "{simulated:?}");
 }
 
 /// Around the page cache, an aligned read into memory reads what the file holds, and one cut

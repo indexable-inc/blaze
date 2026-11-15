@@ -1233,17 +1233,19 @@ struct Kept {
     /// A positional file opened `O_DIRECT`, around the page cache.
     direct: bool,
     /// Opened `O_RDONLY`: kept by a sync or a barrier of a name no request kept
-    /// ([`Wants::Flush`]), of a file that is there. A sync needs no write access, and a file
-    /// sealed read-only (a placed output, mode 0444) refuses an open for writing with `EACCES`.
-    /// Cleared where its open found the file missing and made it, as an append's open does
-    /// (`O_RDWR | O_APPEND | O_CREAT`).
+    /// ([`Wants::Flush`]), of a file that is there, or, positional, by a read into memory. A
+    /// sync and a read need no write access, and a file sealed read-only (a placed output,
+    /// mode 0444) refuses an open for writing with `EACCES`. Cleared where its open found the
+    /// file missing and made it, as an append's open does (`O_RDWR | O_APPEND | O_CREAT`).
     ///
     /// The invariant: nothing is written through a kept file while it is `read_only`.
-    /// Upheld by [`Uring::file`], the one way a request reaches a kept file by name: one that
+    /// Upheld by [`Uring::file`], the one way a request reaches a file kept to append: one that
     /// writes ([`Wants::Append`]) and finds the name kept read-only lets that file go (its
     /// requests in flight keep it until they end) and keeps the name opened to append; reads
-    /// and syncs take it as it is. A positional file is kept apart ([`Uring::positional`])
-    /// and is never read-only.
+    /// and syncs take it as it is. A positional file is kept apart ([`Uring::positional`]):
+    /// read-only where a read into memory kept it, as a placed file is read by a store opened
+    /// after it was sealed, and let go the same way by the first write from memory to it
+    /// ([`Uring::positional_file`]).
     read_only: bool,
 }
 
@@ -2087,12 +2089,21 @@ impl Uring {
     }
 
     /// The file kept under `name` for reads into and writes from memory at offsets, around the
-    /// page cache where `direct`; its open through the ring started where none is, or where the
-    /// one kept goes through the cache the other way (that one is let go once its requests end).
-    /// Never made: a missing file fails every request waiting for it, naming it.
-    fn positional_file(&mut self, name: &FileName, direct: bool) -> io::Result<Handle<Kept>> {
+    /// page cache where `direct`, for a request that `writes` or only reads; its open through
+    /// the ring started where none is, where the one kept goes through the cache the other way,
+    /// or where it was kept read-only and this request writes (that one is let go once its
+    /// requests end). Kept by a read, it is opened read-only (`Kept::read_only`). Never made: a
+    /// missing file fails every request waiting for it, naming it.
+    fn positional_file(
+        &mut self,
+        name: &FileName,
+        direct: bool,
+        writes: bool,
+    ) -> io::Result<Handle<Kept>> {
         if let Some(&file) = self.positional.get(name) {
-            if self.kept.get(file).is_some_and(|it| it.direct == direct) {
+            // `Kept::read_only`'s invariant: a write never goes through a read-only file.
+            let kept = self.kept.get(file);
+            if kept.is_some_and(|it| it.direct == direct && !(writes && it.read_only)) {
                 return Ok(file);
             }
             forget(&mut self.positional, &mut self.kept, name);
@@ -2107,7 +2118,7 @@ impl Uring {
             make: false,
             positional: true,
             direct,
-            read_only: false,
+            read_only: !writes,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.positional.insert(name.clone(), file);
@@ -2145,7 +2156,7 @@ impl Uring {
             // alloc: an error path.
             .map_err(|why| io::Error::other(why.0))?;
         let direct = cache == crate::Cache::Bypassed;
-        let file = self.positional_file(name, direct)?;
+        let file = self.positional_file(name, direct, kind == Kind::WriteFrom)?;
         let file = self.hold(file);
         let mut hot = Hot::new(tag, kind, file.to_bits());
         if direct {
