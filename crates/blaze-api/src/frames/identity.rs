@@ -16,7 +16,7 @@ use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
     FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
-    NodeKind, NotKept, OpenFailure, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
+    NodeKind, NotKept, OpenFailure, Param, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Tiers, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted,
     UnitTarget, Verb, ViewRef, Worked,
@@ -391,6 +391,15 @@ impl Gen {
             AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
             Rename { to: self.text(), item: self.target() },
             Rules { rules: self.text() },
+            Params {
+                item: self.target(),
+                params: (0..self.below(3))
+                    .map(|_| match self.yes() {
+                        true => Param::Kept { name: self.text() },
+                        false => Param::Added { param: self.text(), default: self.text() },
+                    })
+                    .collect(),
+            },
             Replace { to: self.text(), from: self.text() },
         })
     }

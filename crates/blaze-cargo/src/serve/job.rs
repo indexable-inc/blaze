@@ -70,6 +70,10 @@ thread_local! {
     /// The planted bug of `serve::tests`' write-on-a-task control: [`Jobs::apply_writes`]
     /// applies a job's write on the loop, in its turn, as before 2026-11-13.
     pub(super) static PLANT_WRITE_ON_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of `serve::tests`' query controls: a query drops the front end it
+    /// lowered as it answers ([`Jobs::keep_queried`] does nothing), as before 2026-11-14, so
+    /// every query of a root lowers it anew.
+    pub(super) static PLANT_QUERY_DROPS_FRONT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The command line of each build a row of the history was made for ([`Job::ended`]), on
     /// the loop's thread: one a job's plane request, as a test counts them.
     pub(super) static ENDED_ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -6213,8 +6217,11 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// Job `id`'s write, its readers all gone, posted as a task of a plane request of its own
-    /// holding the writer ([`Does::Write`]), as a kept front end's store is;
-    /// pushed free of admission, since every reading task of the job waits for it. Its value
+    /// holding the writer ([`Does::Write`]), as a kept front end's store is. The plane admits
+    /// it by threads as any task: the job's held tasks (`Build::held`) are Running to the plane
+    /// and hold threads, so when they hold every one the write never starts and the build
+    /// stalls (open, 2026-11-13; `a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds`
+    /// pins the seeds). Its value
     /// comes back to [`Jobs::wrote`]. A task the plane refuses gives the writer back, and the
     /// job fails naming the refusal.
     fn send_write(&mut self, w: &mut World<'_, S>, id: JobId) {
@@ -6897,6 +6904,7 @@ impl<S: Steps> Jobs<S> {
             Stage::Answer(at) if at == node => match job.take_value(node) {
                 Some(Value::Answer(Ok(response))) => {
                     w.said.push(Said::Report(id, response));
+                    self.keep_queried(w, id);
                     self.end(w, id, true, None);
                 }
                 Some(Value::Answer(Err(error))) => self.end(w, id, false, Some(error)),
@@ -7698,6 +7706,58 @@ impl<S: Steps> Jobs<S> {
         // store is a loss said beside it, never its error.
         if let Some((command, checkout, what)) = refused {
             self.lose(id, &command, Some(&checkout), what);
+        }
+    }
+
+    /// Query `id`'s front end handed back to its root as its answer is said, the way a build's
+    /// end hands back its own ([`Jobs::plane_finished`]): kept ([`Writer::keep`]) and stored by
+    /// an idle request ([`Jobs::store_kept`]), so it is the root's again once stored
+    /// ([`Jobs::stored_kept`]) and the root's next job lowers into it. Until 2026-11-14 a query
+    /// dropped it, so every query of a root lowered the root anew (ripgrep: 2.1 million rows a
+    /// query, 36.6 s).
+    ///
+    /// It goes back only through the store. A front end kept is not stored yet
+    /// (`unit::Stored::No`), whether the query lowered it anew or into the root's last one,
+    /// and [`Steps::lower`] refuses one that is not: a query's lowering and the proc macros and
+    /// build scripts it applied may have served dependencies and checked crates whose records
+    /// only the store writes. The view it is of is the query's: the next job's lowering moves
+    /// it to that job's view as it moves a build's, reading again what changed.
+    ///
+    /// A front end that can't be kept is a loss ([`Jobs::lose`]), never the query's error: the
+    /// answer is said already, and the root's next job lowers anew. A cancelled query, one
+    /// that failed, and one of a view of no root keep nothing, as such a build does not.
+    fn keep_queried(&mut self, w: &mut World<'_, S>, id: JobId) {
+        #[cfg(test)]
+        if PLANT_QUERY_DROPS_FRONT.get() {
+            return;
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if !matches!(job.work, Work::Query(_)) || job.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(request) = job.request else { return };
+        let Some(Ready { input, root: Some(root), writer: Some(writer), .. }) = job.ready.pop()
+        else {
+            return;
+        };
+        let command = command_line(&job.work);
+        let kept = tracing::info_span!(target: "blaze", "loop: the query's front end kept")
+            .in_scope(|| writer.keep());
+        // clone: the checkout's path, once per query
+        let checkout = input.config.invocation.root.clone();
+        match kept {
+            // The run log is named by the store's task, after the answer, as a build's is: a
+            // query's end names none ([`Job::ended`] names a build's units alone).
+            Ok(kept) => {
+                self.store_kept(w, id, root, checkout, kept, u64::from(request.0), true, &input);
+            }
+            Err(error) => {
+                let what = format!(
+                    "the query's front end is not kept, and the checkout's next job lowers anew: {}",
+                    error.what
+                );
+                self.lose(id, &command, Some(&checkout), what);
+            }
         }
     }
 
@@ -9972,8 +10032,22 @@ impl<S: Steps> Jobs<S> {
             build.after_write = Some(AfterWrite::Applied { ok });
             return;
         }
+        // A write still waits (the last unit's run or load asked it in this very turn): it is
+        // sent to a write's task, as [`Jobs::apply_writes`] sends every other, and the build
+        // ends as the writer comes back. The loop applies no write itself: an apply serves
+        // dependencies from the store, which reads in the running task's frame, and on the
+        // loop there is none (`frame::current outside any frame::task`, 2026-11-13). Sent
+        // whether or not a reader is alive, so a reader that outlived the build fails the job
+        // through [`Jobs::wrote`] rather than leaving it waiting for an idle writer.
+        if let Stage::Units(build) = &mut job.stage
+            && build.writer.here().is_some_and(|it| it.waiting())
+        {
+            build.after_write = Some(AfterWrite::Applied { ok });
+            self.send_write(w, id);
+            return;
+        }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, writer, root, units, applying, .. } = *build;
+        let Build { input, front, writer, root, units, refused, applying, .. } = *build;
         let unbuilt = applying.and_then(|it| it.first);
         let Some(mut writer) = writer.into_here() else {
             let error = ApiError::new(
@@ -9994,22 +10068,27 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         }
-        self.applied(w, id, ok, unbuilt, Ready { input, root, front: Some(front), writer: Some(writer) });
+        // A write that broke on its task ([`Jobs::after_write`]) refused the units after it:
+        // the view did not get everything its front end applies.
+        let broke = refused.and_then(|it| it.whys.into_iter().next());
+        let ready = Ready { input, root, front: Some(front), writer: Some(writer) };
+        self.applied(w, id, ok, unbuilt, broke, ready);
     }
 
     /// A view `ready` with the units its front end applies built ([`Jobs::next`]), `ok` whether
     /// all of them did: the wait's span closed, every write they asked for applied, and the view
     /// ready again, the job going on, in the same plane request, to its next view or its answer.
     /// A unit that did not build, or a write of one that did not apply, fails the job naming the
-    /// view and the unit (`unbuilt`: the first that did not build, and why where its end said):
-    /// its answer would read what a macro that never ran left out, or a crate without its build
-    /// script's output.
+    /// view and the unit (`unbuilt`: the first that did not build, and why where its end said;
+    /// `broke`: a write that broke on its task): its answer would read what a macro that never
+    /// ran left out, or a crate without its build script's output.
     fn applied(
         &mut self,
         w: &mut World<'_, S>,
         id: JobId,
         ok: bool,
         unbuilt: Option<(usize, Option<String>)>,
+        broke: Option<String>,
         mut ready: Ready<S>,
     ) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -10045,6 +10124,7 @@ impl<S: Steps> Jobs<S> {
                 }
                 None => "did not all build".to_owned(),
             })), // alloc: an error, once
+            _ if let Some(broke) = broke.as_deref() => Some(refused(format!("did not apply: {broke}"))),
             None => Some(refused("were built with no writer of it".to_owned())), // alloc: an error, once
             Some(writer) => match writer.apply() {
                 Err(error) => Some(refused(format!("did not apply: {}", error.what))),
