@@ -5,8 +5,7 @@
 ;; in step by hand. Fewer arms than `N` hand the missing integers to `_`, which then comes up
 ;; twice as often and hides the variant whose integer was skipped; more arms are dead. The
 ;; const is found by resolution, so a `use`d or re-exported const is the same const, and its
-;; value is compared as text with the arms' count (`same-text`: there is no integer value of a
-;; literal yet, so `39usize` or `0x27` is never equal).
+;; value is the integer its literal means (`int-value`), so `39usize` and `0x27` are 39.
 ;;
 ;; Rule 73: a type ends it (the bound derived from the enum, `E::ALL.len()`); `magic_number`
 ;; leaves `const` initializers alone. A rule is right until then.
@@ -14,22 +13,21 @@
 (rule (bound s b) (expr s "$r.below($b)"))
 (rule (bound s b) (expr s "$x % $b"))
 
-;; The const a match's bound names, and the literal it is.
-(rule (bounded m d lit)
+;; The const a match's bound names, and the integer it is.
+(rule (bounded m d i)
   (bound s b)
   (parent m s)
   (kind m "MATCH_EXPR")
-  (syntax cp "PATH")
-  (ancestor b cp)
+  (descendant b cp)
+  (kind cp "PATH")
   (resolves cp d)
   (def-kind d "const")
   (defines cn d)
-  (syntax lit "LITERAL")
-  (parent cn lit))
+  (child cn lit)
+  (int-value lit i))
 
-(rule (arm-of m a) (bounded m d lit) (syntax a "MATCH_ARM") (parent l a) (parent m l))
-(rule (arms m d lit n) (bounded m d lit) (count n (arm-of m x)))
-(rule (agrees m) (arms m d lit n) (same-text n lit))
-(rule (picker-count-const m d lit n) (arms m d lit n) (not (agrees m)))
+(rule (arms m d i n) (bounded m d i) (count n (match-arm m a p e)))
+(rule (picker-count-const m d i n) (arms m d i n) (lt n i))
+(rule (picker-count-const m d i n) (arms m d i n) (lt i n))
 
-(lint picker-count-const error "this match is bounded by `$d` = $lit but has $n arms")
+(lint picker-count-const error "this match is bounded by `$d` = $i but has $n arms")

@@ -10,24 +10,10 @@
 ;; `blaze::hand_kept_variant_list` reads lists in the enum's own impls only. This is the
 ;; advice until that lint reads integer pickers too.
 
-(rule (int-arm a k)
-  (syntax k "LITERAL_PAT")
-  (text-match k "^[0-9]+$")
-  (parent a k)
-  (kind a "MATCH_ARM"))
+(include "tools/astlog/rules-sema/lib/int-arms.astlog")
 
-(rule (made a k p d)
-  (syntax p "PATH")
-  (resolves p d)
-  (def-kind d "variant")
-  (ancestor a p)
-  (int-arm a k)
-  (precedes k p))
-(rule (made-earlier a p) (made a k p d) (made a k q e) (precedes q p))
-(rule (generated a d) (made a k p d) (not (made-earlier a p)))
+;; Counted per enum: a `match` that makes variants of two enums is two pickers.
+(rule (picks m a e) (generated m a i d) (def-parent d e))
+(rule (int-arm-variant-picker m n e v) (picks m a e) (count n (picks m x e)) (le 4 n) (variant-count e v))
 
-;; The match an arm belongs to: arm, MATCH_ARM_LIST, MATCH_EXPR.
-(rule (picks m a) (generated a d) (parent l a) (parent m l))
-(rule (int-arm-variant-picker m n) (picks m a) (count n (picks m x)) (le 4 n))
-
-(lint int-arm-variant-picker warning "$n arms pick a variant by a hand-kept integer: draw from the enum's own list")
+(lint int-arm-variant-picker warning "$n arms pick from the $v variants of `$e` by a hand-kept integer: draw from the enum's own list")

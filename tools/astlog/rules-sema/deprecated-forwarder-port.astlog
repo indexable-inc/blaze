@@ -18,9 +18,9 @@
 ;; Parameter `p` of FN `n` binds the name `ip`.
 (rule (param n p ip)
   (deprecated-fn n d)
-  (syntax pl "PARAM_LIST") (parent n pl)
-  (syntax p "PARAM") (parent pl p)
-  (syntax ip "IDENT_PAT") (parent p ip))
+  (child n pl) (kind pl "PARAM_LIST")
+  (child pl p) (kind p "PARAM")
+  (child p ip) (kind ip "IDENT_PAT"))
 (rule (params n c) (deprecated-fn n d) (count c (param n p ip)))
 
 (rule (forwarder d g)

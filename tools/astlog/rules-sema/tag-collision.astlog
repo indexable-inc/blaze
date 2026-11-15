@@ -11,27 +11,13 @@
 ;; Rule 73: a type ends it (tags derived from the declaration, or `#[repr(u8)]` discriminants,
 ;; which rustc keeps unique); `hand_written_codec` reads fields, not tags. Rule meanwhile.
 
-;; `E::V .. => k`: an arm whose expression is an integer literal, and the first variant its
-;; pattern names.
-(rule (counted a k p d)
-  (syntax k "LITERAL")
-  (text-match k "^[0-9]+$")
-  (parent a k)
-  (kind a "MATCH_ARM")
-  (syntax p "PATH")
-  (resolves p d)
-  (def-kind d "variant")
-  (ancestor a p)
-  (precedes p k))
-(rule (counted-earlier a p) (counted a k p d) (counted a k q e) (precedes q p))
-(rule (indexed m a k d) (counted a k p d) (not (counted-earlier a p)) (parent l a) (parent m l))
+(include "tools/astlog/rules-sema/lib/int-arms.astlog")
 
-(rule (same-variant a b) (indexed m a k d) (indexed m b j d))
-(rule (tag-collision b k a)
-  (indexed m a k d)
-  (indexed m b j e)
+;; A later arm `b` of the same match counts another variant as the same integer.
+(rule (tag-collision b i a)
+  (indexed m a i d)
+  (indexed m b i e)
   (precedes a b)
-  (same-text k j)
-  (not (same-variant a b)))
+  (not (indexed m b i d)))
 
-(lint tag-collision error "this arm's tag $k is already an earlier arm's, for another variant")
+(lint tag-collision error "this arm's tag $i is already an earlier arm's, for another variant")

@@ -55,4 +55,14 @@ impl Gen {
             _ => 2,
         }
     }
+
+    // Not found: two arms under a bound of `0x2`, which is 2.
+    pub fn stop(&mut self) -> Request {
+        match self.below(STOPS as u64) {
+            0 => Request::Stop,
+            _ => Request::Commit,
+        }
+    }
 }
+
+pub const STOPS: usize = 0x2;

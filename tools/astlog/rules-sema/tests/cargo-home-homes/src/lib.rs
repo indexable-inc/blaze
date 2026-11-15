@@ -61,3 +61,11 @@ mod tests {
         assert_eq!(Path::new("/u").join(".cargo"), PathBuf::from("/u/.cargo"));
     }
 }
+
+// Found: raw strings name the same variable and directory.
+pub fn raw_home(env: &Env) -> Option<PathBuf> {
+    match env.get(r"CARGO_HOME") {
+        Some(home) => Some(PathBuf::from(home)),
+        None => env.get("HOME").map(|home| Path::new(home).join(r".cargo")),
+    }
+}

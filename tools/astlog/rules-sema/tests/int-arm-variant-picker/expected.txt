@@ -1,2 +1,2 @@
-warning: 4 arms pick a variant by a hand-kept integer: draw from the enum's own list
+warning: 4 arms pick from the 5 variants of `fixture_int_arm_variant_picker::Kind` by a hand-kept integer: draw from the enum's own list
   --> src/lib.rs:19

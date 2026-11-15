@@ -10,25 +10,22 @@
 ;; Rule 73: the type is the end (one `Out` owned by the command's thread, handed to nothing
 ;; that is `Send`); the rule finds the threads to change before that type lands.
 
-(rule (calls f g) (syntax c "CALL_EXPR") (callee c g) (enclosing-fn c f))
-(rule (calls f g) (syntax c "METHOD_CALL_EXPR") (callee c g) (enclosing-fn c f))
-(rule (reaches f g) (calls f g))
-(rule (reaches f g) (calls f h) (reaches h g))
+(include "tools/astlog/rules-sema/lib/calls.astlog")
 
 (rule (writes f) (expr c "std::io::stdout()") (enclosing-fn c f))
 (rule (writes-below f) (writes f))
 (rule (writes-below f) (reaches f g) (writes g))
 
-;; The closure's own body: a `stdout()` written in it, or a call in it that reaches one.
+;; The closure's own body: a `stdout()` written in it, or a call or method call in it that
+;; reaches one.
 (rule (stdout-in-spawned-thread s via)
   (expr s "std::thread::spawn($body)")
-  (expr via "std::io::stdout()")
-  (ancestor body via))
+  (descendant body via)
+  (expr via "std::io::stdout()"))
 (rule (stdout-in-spawned-thread s via)
   (expr s "std::thread::spawn($body)")
-  (syntax via "CALL_EXPR")
-  (ancestor body via)
-  (callee via g)
+  (descendant body via)
+  (call via g)
   (writes-below g))
 
 (lint stdout-in-spawned-thread warning "this thread writes standard output (through `$via`) while the command may hold its lock")

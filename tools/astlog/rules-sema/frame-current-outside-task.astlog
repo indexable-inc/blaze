@@ -12,18 +12,17 @@
 ;; `frame::current` exists for code that cannot be handed one, so this rule finds where the
 ;; handing stops.
 
-(rule (in-task c) (syntax c "CALL_EXPR") (expr t "blaze_mem::frame::task($tag, $body)") (ancestor body c))
-(rule (in-task c) (syntax c "METHOD_CALL_EXPR") (expr t "blaze_mem::frame::task($tag, $body)") (ancestor body c))
+(include "tools/astlog/rules-sema/lib/calls.astlog")
+
+(rule (in-task c) (expr t "blaze_mem::frame::task($tag, $body)") (descendant body c))
 
 (rule (needs f c)
   (expr c "blaze_mem::frame::current($g)")
   (not (in-task c))
   (enclosing-fn c f))
-(rule (needs f c) (syntax c "CALL_EXPR") (callee c g) (needs g x) (not (in-task c)) (enclosing-fn c f))
-(rule (needs f c) (syntax c "METHOD_CALL_EXPR") (callee c g) (needs g x) (not (in-task c)) (enclosing-fn c f))
+(rule (needs f c) (call c g) (needs g x) (not (in-task c)) (enclosing-fn c f))
 
-(rule (called g) (syntax c "CALL_EXPR") (callee c g))
-(rule (called g) (syntax c "METHOD_CALL_EXPR") (callee c g))
+(rule (called g) (call c g))
 (rule (frame-current-outside-task c f) (needs f c) (not (called f)))
 
 (lint frame-current-outside-task warning "`$f` is called by nothing here and reaches `frame::current` through this call in no `frame::task`")

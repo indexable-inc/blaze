@@ -12,8 +12,8 @@
 ;; `const X: T = ..`: its def, the def of `T`, its module.
 (rule (entry n d t m)
   (syntax n "CONST")
-  (syntax ty "PATH_TYPE")
-  (parent n ty)
+  (child n ty)
+  (kind ty "PATH_TYPE")
   (resolves ty t)
   (defines n d)
   (enclosing-module n m))
@@ -21,14 +21,14 @@
 ;; `const R: [&T; N] = [..]` in the same module.
 (rule (registry r t m)
   (syntax r "CONST")
-  (syntax at "ARRAY_TYPE")
-  (parent r at)
-  (syntax pt "PATH_TYPE")
-  (ancestor at pt)
+  (child r at)
+  (kind at "ARRAY_TYPE")
+  (descendant at pt)
+  (kind pt "PATH_TYPE")
   (resolves pt t)
   (enclosing-module r m))
 
-(rule (listed d) (entry n d t m) (registry r t m) (references d x) (ancestor r x))
+(rule (listed d) (entry n d t m) (registry r t m) (descendant r x) (references d x))
 (rule (registry-misses-const n d) (entry n d t m) (registry r t m) (not (listed d)))
 
 (lint registry-misses-const error "`$d` is in no registry array of its module")

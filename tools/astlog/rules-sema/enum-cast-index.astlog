@@ -7,33 +7,12 @@
 ;; meaning is a type: a typed index). `as_cast` reports every `as` and `untyped_index` integer
 ;; fields; neither says the cast's source is an enum.
 ;;
-;; There is no "this type is an enum" relation, so the rule says what the type is not, one
-;; primitive at a time; a `type-def` relation would make it one atom.
+;; The type is read by its shape (`type-kind`), so only an enum is found; a raw pointer or a
+;; fn item cast to `usize` is an address, not a position, and is left alone.
 ;;
 ;; Rule 73: the type is the end (an array keyed by the enum, `[T; N]` behind `Index<Part>`);
 ;; this lint finds where.
 
-(rule (cast-index i e t)
-  (expr i "$a[$e as usize]")
-  (type-of e t))
-
-(rule (primitive t) (cast-index i e t) (type-matches t "u8"))
-(rule (primitive t) (cast-index i e t) (type-matches t "u16"))
-(rule (primitive t) (cast-index i e t) (type-matches t "u32"))
-(rule (primitive t) (cast-index i e t) (type-matches t "u64"))
-(rule (primitive t) (cast-index i e t) (type-matches t "u128"))
-(rule (primitive t) (cast-index i e t) (type-matches t "usize"))
-(rule (primitive t) (cast-index i e t) (type-matches t "i8"))
-(rule (primitive t) (cast-index i e t) (type-matches t "i16"))
-(rule (primitive t) (cast-index i e t) (type-matches t "i32"))
-(rule (primitive t) (cast-index i e t) (type-matches t "i64"))
-(rule (primitive t) (cast-index i e t) (type-matches t "i128"))
-(rule (primitive t) (cast-index i e t) (type-matches t "isize"))
-(rule (primitive t) (cast-index i e t) (type-matches t "bool"))
-(rule (primitive t) (cast-index i e t) (type-matches t "char"))
-(rule (primitive t) (cast-index i e t) (type-matches t "f32"))
-(rule (primitive t) (cast-index i e t) (type-matches t "f64"))
-
-(rule (enum-cast-index i e t) (cast-index i e t) (not (primitive t)))
+(rule (enum-cast-index i e t) (expr i "$a[$e as usize]") (type-of e t) (type-kind t "enum"))
 
 (lint enum-cast-index warning "indexes by `$e` of type `$t` cast to `usize`: key the array by the type")

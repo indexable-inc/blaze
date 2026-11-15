@@ -46,3 +46,16 @@ pub fn warn() -> std::thread::JoinHandle<()> {
         let _ = std::io::stderr().write_all(b"careful\n");
     })
 }
+
+pub struct Log;
+
+impl Log {
+    fn line(&self, text: &str) {
+        report(text);
+    }
+}
+
+// Found: the closure reaches `stdout` through a method call.
+pub fn logged(log: Log) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || log.line("started"))
+}

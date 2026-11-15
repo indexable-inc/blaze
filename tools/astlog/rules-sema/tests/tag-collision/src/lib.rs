@@ -43,3 +43,12 @@ pub fn weight(op: &BinOp) -> u8 {
         BinOp::Div => 3,
     }
 }
+
+// Found: `0x1` and `1u8` are one tag, 1.
+pub fn part_code(part: &Part) -> u8 {
+    match part {
+        Part::LangItems => 0x1,
+        Part::Signatures => 1u8,
+        Part::DefMap => 2,
+    }
+}

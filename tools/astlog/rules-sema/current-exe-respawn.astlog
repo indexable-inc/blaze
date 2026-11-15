@@ -12,23 +12,17 @@
 ;; Rule 73: a type is the end (a `SelfPath` read once in `main` and passed down); `std_use`
 ;; flags every `current_exe` without telling this case from the harmless ones. Rule meanwhile.
 
-(rule (calls f g) (syntax c "CALL_EXPR") (callee c g) (enclosing-fn c f))
-(rule (calls f g) (syntax c "METHOD_CALL_EXPR") (callee c g) (enclosing-fn c f))
-(rule (reaches f g) (calls f g))
-(rule (reaches f g) (calls f h) (reaches h g))
+(include "tools/astlog/rules-sema/lib/calls.astlog")
 
 (rule (runs f) (expr c "std::process::Command::new($p)") (enclosing-fn c f))
 (rule (runs-below f) (runs f))
 (rule (runs-below f) (reaches f g) (runs g))
 
-(rule (under-tests c)
-  (expr c "std::env::current_exe()")
-  (file-path c p)
-  (text-match p "(^|/)(tests|benches)/"))
 (rule (current-exe-respawn c f)
   (expr c "std::env::current_exe()")
   (not (in-test c))
-  (not (under-tests c))
+  (file-path c p)
+  (not (text-match p "(^|/)(tests|benches)/"))
   (enclosing-fn c f)
   (runs-below f))
 

@@ -37,4 +37,9 @@ impl<'a> ImageRef<'a> {
     pub fn others(&self, b: u8, yes: bool, c: char) -> usize {
         self.sizes[b as usize] + self.sizes[yes as usize] + self.sizes[c as usize]
     }
+
+    // Not found: a raw pointer cast to `usize` is an address, no enum.
+    pub fn at(&self, p: *const u8) -> usize {
+        self.sizes[p as usize]
+    }
 }

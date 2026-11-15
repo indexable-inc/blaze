@@ -160,16 +160,14 @@ fn crates(root: &Path) -> Vec<Krate> {
 /// The pack's shared rules files, each as its path in blaze's checkout and its text.
 fn library() -> Vec<(String, String)> {
     let dir = Path::new(PACK).join("lib");
-    let mut out: Vec<(String, String)> = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .map(|it| it.unwrap().path())
-            .map(|it| {
-                let name = it.file_name().unwrap().to_str().unwrap().to_owned();
-                (format!("{PACK_IN_CHECKOUT}/lib/{name}"), std::fs::read_to_string(&it).unwrap())
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|it| it.unwrap().path())
+        .map(|it| {
+            let name = it.file_name().unwrap().to_str().unwrap().to_owned();
+            (format!("{PACK_IN_CHECKOUT}/lib/{name}"), std::fs::read_to_string(&it).unwrap())
+        })
+        .collect();
     out.sort();
     out
 }

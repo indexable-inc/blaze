@@ -9,17 +9,9 @@
 ;; Rule 73: the one home is a function (`blaze_client::place::cargo_home`) and a `.clippy.toml`
 ;; ban on the others is the lint; this rule finds the copies to delete first.
 
-(rule (names-var f)
-  (syntax l "LITERAL")
-  (text-match l "^\"CARGO_HOME\"$")
-  (not (in-test l))
-  (enclosing-fn l f))
-(rule (names-dir f)
-  (syntax l "LITERAL")
-  (text-match l "^\"\\.cargo\"$")
-  (not (in-test l))
-  (enclosing-fn l f))
-(rule (derives f) (names-var f) (names-dir f))
+;; The string a literal means (`str-value`), so `r"CARGO_HOME"` names the variable too.
+(rule (names f s) (syntax l "LITERAL") (str-value l s) (not (in-test l)) (enclosing-fn l f))
+(rule (derives f) (names f "CARGO_HOME") (names f ".cargo"))
 (rule (cargo-home-homes n f c) (derives f) (count c (derives g)) (le 2 c) (defines n f))
 
 (lint cargo-home-homes warning "derives cargo's home itself, one of $c functions that do: call the one home")
