@@ -609,6 +609,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut fresh: Vec<(u32, Fresh<FrontInstance<B>, FrontStatic<B>>)> = Vec::new();
         // Each changed function with its old key and its node made again.
         let mut remade: Vec<(u32, InstanceKey, Node<B>)> = Vec::new();
+        // The changed describes of each key of several, with the key each gives now.
+        // BTreeMap: checked in one order every build.
+        let mut shared: BTreeMap<InstanceKey, Vec<(InstanceKey, Arc<Described<_, _>>)>> = BTreeMap::new();
         // The items whose own node is made: changed, or new to the build.
         let mut own: BTreeSet<u32> = BTreeSet::new();
         // Items whose node is to be made again or resolved again.
@@ -650,17 +653,23 @@ impl<'a, B: Prepare> Build<'a, B> {
                 return Err("a changed function has no unit under the policy");
             };
             let new = made.unit.instance.key();
-            if keep.askers.get(&old) != Some(&1) {
-                return Err("a key of two describes changed");
-            }
             if keep.built_into.contains(&old) {
                 return Err("a changed function is built into another");
             }
-            if new != old && keep.askers.contains_key(&new) {
-                return Err("a changed function took a key the walk holds");
+            match keep.askers.get(&old) {
+                Some(&1) => {
+                    if new != old && keep.askers.contains_key(&new) {
+                        return Err("a changed function took a key the walk holds");
+                    }
+                    keep.askers.remove(&old);
+                    keep.askers.insert(new, 1);
+                }
+                // A key of several describes: one function asked by several crates (whose
+                // code is its own crate's), or functions of one code. Its count moves below,
+                // once every describe of it is in.
+                Some(_) => shared.entry(old).or_default().push((new, now.clone())), // clone: a count
+                None => return Err("a changed function's key is of no describe"),
             }
-            keep.askers.remove(&old);
-            keep.askers.insert(new, 1);
             if was.owner != now.owner {
                 owner_changed.push(item);
             }
@@ -677,6 +686,22 @@ impl<'a, B: Prepare> Build<'a, B> {
             remade.push((item, old, made));
             dirty.insert(item);
             own.insert(item);
+        }
+        // A key of several describes is patched only when every describe of it changed to one
+        // and the same describe: the whole walk then keys them all to one node made of it, as
+        // the patch does (the remade nodes below take the first of them that is built). A
+        // key whose describes part, or that some keep, is the whole walk's to say.
+        for (old, now) in &shared {
+            let (new, first) = &now[0];
+            let all = keep.askers.get(old).is_some_and(|&it| it as usize == now.len());
+            if !all || now.iter().any(|(key, it)| key != new || **it != **first) {
+                return Err("a key of two describes changed apart");
+            }
+            if new != old && keep.askers.contains_key(new) {
+                return Err("a changed function took a key the walk holds");
+            }
+            let count = keep.askers.remove(old).unwrap_or(0);
+            keep.askers.insert(*new, count);
         }
         for (item, now) in changed_statics {
             let Some(Some(Item::Static(it))) = keep.items.get(item as usize) else {
@@ -864,10 +889,23 @@ impl<'a, B: Prepare> Build<'a, B> {
                 None => {}
             }
         }
+        // The old keys whose node was made again: a key of several describes is made once.
+        let mut remade_keys: BTreeSet<InstanceKey> = BTreeSet::new();
         for (item, old, made) in remade {
             // Described for the recursion limit's check alone, or no longer built: no node.
             if !keep.graph.is_member(BUILT, item) || settled.entered[BUILT].contains(&item) {
                 made_new.insert(item, made);
+                continue;
+            }
+            // Another describe of a key made again: its node is made, and the places of its
+            // own referrers name the new key too.
+            if !remade_keys.insert(old) {
+                if made.unit.instance.key() != old
+                    && self.renames
+                    && self.planted != Some(Planted::SharedKeyUnrenamed)
+                {
+                    dirty.extend(keep.graph.ins(item).iter().copied());
+                }
                 continue;
             }
             let Some(was) = nodes.remove(&old) else {

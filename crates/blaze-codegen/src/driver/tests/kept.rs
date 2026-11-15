@@ -708,6 +708,55 @@ fn the_oracle_catches_a_dyn_fact_change_that_invalidates_nothing() {
     assert!(found.starts_with("build 1: "), "{found}");
 }
 
+/// `main` calls 2, a dependency's function, and 3, a member's; 2 calls 3 too. So 3 is asked
+/// by two crates, whose code it is not: one key of two describes, of 3's own code.
+fn asked_twice() -> Program {
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2, 3]);
+    program.function(2, 0x12, &[3]);
+    program.function(3, 0x13, &[]);
+    program.functions.get_mut(&1).expect("made").symbol = Some("main".to_owned());
+    program.functions.get_mut(&2).expect("made").origin = Origin::Dependency(Package::new("dep"));
+    program.engine.durable.insert(2);
+    program
+}
+
+/// A body edit of a function two crates ask for changes both its describes to one, which
+/// the whole walk keys to one node: the walk is patched, not walked whole, and builds what a
+/// fresh walk builds. Until 2026-11-15 any key of two describes that changed was walked whole:
+/// nushell's `Value::span`, asked by up to nine crates, made each body edit of it a whole walk
+/// of 625,000 describes (65 s).
+#[test]
+fn a_function_two_crates_ask_for_is_patched_after_its_body_changes() {
+    // `Edit::Body` of the third function.
+    let edits = [(Edit::Body, (2, 0))];
+    assert_eq!(first_difference(asked_twice(), WHOLE, &edits, None), None);
+    let mut program = asked_twice();
+    let kept = Kept::new();
+    let walk = |program: &Program| {
+        program.begin_build();
+        built(program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}")).walk
+    };
+    assert!(walk(&program).whole.is_some(), "nothing was kept to patch");
+    program.functions.get_mut(&3).expect("made").body = 0x14;
+    program.touch(3);
+    let edited = walk(&program);
+    assert_eq!((edited.fresh, edited.whole), (None, None), "patched");
+    assert_eq!(edited.described, 2, "3's two describes");
+}
+
+/// The control of [`a_function_two_crates_ask_for_is_patched_after_its_body_changes`]: a
+/// patch that renames the places of the first describe's referrers alone
+/// ([`Planted::SharedKeyUnrenamed`]) leaves `main`'s call of 3 naming its old key, and the
+/// oracle says so.
+#[test]
+fn the_oracle_catches_a_key_of_two_describes_whose_second_referrers_keep_its_old_key() {
+    let edits = [(Edit::Body, (2, 0))];
+    let found = first_difference(asked_twice(), WHOLE, &edits, Some(Plant::Patch(Planted::SharedKeyUnrenamed)))
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
+
 /// A tree of `count` functions: `i` calls `2i` and `2i + 1`.
 fn tree(count: u32) -> Program {
     let mut program = Program::default();

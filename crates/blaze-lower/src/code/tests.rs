@@ -438,6 +438,35 @@ fn what_keeps_a_crate_from_an_interface_is_caught() {
     }
 }
 
+/// A name `include` or `path` is a read by path only where it may be the macro or the
+/// attribute: a binding, a field or a value of that name reads no file (nushell's nu-command
+/// binds `let include = …` and nu-protocol writes `vec![path]`, and each was keyed by every
+/// crate below it). Where a macro is given it, or imports or calls it, it still reaches; the
+/// control takes the macro's tokens as a binding's and is caught.
+#[test]
+fn a_binding_named_include_or_path_reads_no_file() {
+    for plain in [
+        "fn f(e: bool) -> bool {\n    let include = !e;\n    if include { include } else { false }\n}\n",
+        "struct S { include: bool }\nfn f(s: S) -> bool { s.include }\nfn g(include: bool) -> S { S { include } }\n",
+        "fn f(path: u8) -> Vec<u8> {\n    vec![path]\n}\n",
+        "fn f(path: u8) -> String {\n    format!(\"{path}\")\n}\n",
+    ] {
+        assert!(!code(plain).reaches, "{plain}");
+    }
+    let given = [
+        "make!(include, \"gen.rs\");\n",
+        "use std::include as inc;\ninc!(\"gen.rs\");\n",
+        "fn f() -> u8 {\n    std::include!(\"gen.rs\")\n}\n",
+        "make! { #![path = \"a.rs\"] }\n",
+        "make! { #[path = \"a.rs\"] mod a; }\n",
+        "make! { #[cfg_attr(unix, path = \"a.rs\")] mod a; }\n",
+    ];
+    for text in given {
+        assert!(code(text).reaches, "{text}");
+    }
+    assert!(!planting(Plant::Bound, || code(given[0])).reaches, "the control");
+}
+
 /// How a file reads another by a path: Rust by a path its text says whole is a read the view
 /// resolves (`resolves`, and the path [`said_reach`] gives, as the front end joins it); Rust
 /// by any other is a read of any file (`reaches`); the bytes of a file that is not Rust by a

@@ -1978,7 +1978,7 @@ impl Walk<'_> {
                 // whole text; of any other file, they are where its key holds them already
                 // ([`CodeText::reaches`]).
                 "include_str" | "include_bytes" => self.whole |= !reads_other_than_rust(token),
-                "include" | "path" if token.text() == "include" || names_path_attr(token) => {
+                "include" | "path" if names_read_by_path(token) => {
                     match said_reach(token) {
                         Some(_) => self.resolves = true,
                         None => self.reaches = true,
@@ -1999,8 +1999,67 @@ const READ_IN_COMMENTS: &[char] = &[
     '\u{2068}', '\u{2069}',
 ];
 
+/// Whether `token`, the name `include` or `path`, may name a read of a file by path
+/// ([`names_include`], [`names_path_attr`]).
+fn names_read_by_path(token: &SyntaxToken) -> bool {
+    match token.text() {
+        "include" => names_include(token),
+        _ => names_path_attr(token),
+    }
+}
+
+/// The non-trivia token before `token`.
+fn before(token: &SyntaxToken) -> Option<SyntaxToken> {
+    std::iter::successors(token.prev_token(), SyntaxToken::prev_token).find(|it| !it.kind().is_trivia())
+}
+
+/// The non-trivia token after `token`.
+fn after(token: &SyntaxToken) -> Option<SyntaxToken> {
+    std::iter::successors(token.next_token(), SyntaxToken::next_token).find(|it| !it.kind().is_trivia())
+}
+
+/// Whether `token`, the name `include`, may be the macro `include!`: any among the tokens a
+/// macro is given or defines (which may call it by a name passed in), a name a path to a
+/// macro or an import reads, or one before a `!`. Not a name that is defined or bound
+/// (`let include = …`, a field, a parameter), nor one an expression, a pattern or a type
+/// reads: none of those calls a macro, and a macro imported under another name is read by
+/// its import.
+fn names_include(token: &SyntaxToken) -> bool {
+    let Some(parent) = token.parent() else { return true };
+    if parent.ancestors().any(|it| it.kind() == SyntaxKind::TOKEN_TREE) {
+        return !planted(Plant::Bound);
+    }
+    if after(token).is_some_and(|it| it.kind() == SyntaxKind::BANG) {
+        return true;
+    }
+    match parent.kind() {
+        SyntaxKind::NAME => false,
+        SyntaxKind::NAME_REF => {
+            // The node above the path the name is in: a macro call's, an import's, or what
+            // an expression, a pattern or a type reads.
+            let above = parent.ancestors().find(|it| {
+                !matches!(it.kind(), SyntaxKind::NAME_REF | SyntaxKind::PATH_SEGMENT | SyntaxKind::PATH)
+            });
+            !above.is_some_and(|it| {
+                matches!(
+                    it.kind(),
+                    SyntaxKind::PATH_EXPR
+                        | SyntaxKind::FIELD_EXPR
+                        | SyntaxKind::METHOD_CALL_EXPR
+                        | SyntaxKind::RECORD_EXPR_FIELD
+                        | SyntaxKind::RECORD_PAT_FIELD
+                        | SyntaxKind::PATH_PAT
+                        | SyntaxKind::PATH_TYPE
+                )
+            })
+        }
+        _ => true,
+    }
+}
+
 /// Whether `token`, the name `path`, may be the `path` attribute: in an attribute, or, among
-/// the tokens a macro is given, after a `[` or before a `=`.
+/// the tokens a macro is given, before a `=` or first in a bracket after a `#` (`#[path`,
+/// `#![path`): the shapes an attribute has. Not first in another bracket (`vec![path]`).
 fn names_path_attr(token: &SyntaxToken) -> bool {
     let Some(parent) = token.parent() else { return true };
     let mut given = false;
@@ -2011,13 +2070,16 @@ fn names_path_attr(token: &SyntaxToken) -> bool {
             _ => {}
         }
     }
-    let before = std::iter::successors(token.prev_token(), SyntaxToken::prev_token)
-        .find(|it| !it.kind().is_trivia());
-    let after = std::iter::successors(token.next_token(), SyntaxToken::next_token)
-        .find(|it| !it.kind().is_trivia());
-    given
-        && (before.is_some_and(|it| it.kind() == SyntaxKind::L_BRACK)
-            || after.is_some_and(|it| it.kind() == SyntaxKind::EQ))
+    let attr_bracket = before(token).filter(|it| it.kind() == SyntaxKind::L_BRACK).is_some_and(|open| {
+        match before(&open) {
+            Some(it) if it.kind() == SyntaxKind::POUND => true,
+            Some(it) if it.kind() == SyntaxKind::BANG => {
+                before(&it).is_some_and(|it| it.kind() == SyntaxKind::POUND)
+            }
+            _ => false,
+        }
+    });
+    given && (attr_bracket || after(token).is_some_and(|it| it.kind() == SyntaxKind::EQ))
 }
 
 /// The path the `include` or `path` at `token` reads a file of Rust by, where the file's text
@@ -2458,6 +2520,9 @@ pub(crate) enum Plant {
     /// A file's texts hold its bytes, comments and whitespace as they are: a unit keyed by
     /// them is made again by an edit that moves no token and no position, no cutoff.
     Bytes,
+    /// An `include` among the tokens a macro is given or defines is taken as a binding's,
+    /// not as a call it may make: a crate that reads a file through it keeps no deep key.
+    Bound,
     /// A number's digits are in no code text: a unit keyed by it is not made again when one
     /// changes, a stale unit.
     Stale,
