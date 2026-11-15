@@ -8,7 +8,11 @@
 //! **The driver a read runs on.** A [`Direct`] drives its reads on the caller's driver. A task
 //! runs on a worker, which has none of the loop's, so each thread keeps one of its own
 //! ([`Reads::Native`]: a native driver over the daemon's root, made on the thread's first read
-//! and kept for its life). Where the loop runs its tasks in line (the simulation's runner,
+//! and kept for its life). It is [`blaze_core::ThreadNative`], not the daemon's
+//! [`blaze_core::Native`]: on Linux a ring with no kernel thread, so a read the page cache
+//! answers is submitted and ended by the reading thread's one `io_uring_enter`, where a ring
+//! with a kernel thread of its own (SQPOLL) handed it to that thread and slept until woken,
+//! ~0.7 ms a read (issue #2174). Where the loop runs its tasks in line (the simulation's runner,
 //! [`Reads::Lent`]) the loop lends its own driver to them while it runs them ([`lend`]): the
 //! simulation's files are in no file system a driver of a thread's own could read. A read on
 //! the lent driver may be handed completions of the loop's own effects: they are kept and
@@ -25,9 +29,10 @@
 //!
 //! **Floors.** A record read costs one positional read of its bytes (or one run of neighbours,
 //! [`read_many`]), plus a lookup in the index, which is memory: the floor (`direct`'s module
-//! docs: 593 ns a cached record on the Mac). What this layer adds is one thread-local borrow
-//! and, on the first read of a thread, its driver's making (a kqueue and a thread on macOS):
-//! once a thread, not a read. The number to move: `direct::counts` (`records`, `reads`, `runs`)
+//! docs: 593 ns a cached record on the Mac; on Linux one `io_uring_enter` that submits and
+//! ends it). What this layer adds is one thread-local borrow and, on the first read of a
+//! thread, its driver's making (a kqueue and a thread on macOS, a ring on Linux): once a
+//! thread, not a read. The number to move: `direct::counts` (`records`, `reads`, `runs`)
 //! grows and the pool's counters stay 0 (`blaze explain memory`'s `pool resident bytes`, gone
 //! with the pool); a warm daemon's footprint loses the pool's resident pages (up to its budget).
 
@@ -185,8 +190,9 @@ impl Driver for Driving<'_> {
 
 /// What a thread keeps for its reads (see the module's docs).
 struct Thread {
-    /// Its own native driver, and the root it is over.
-    native: Option<(Arc<Path>, blaze_core::Native)>,
+    /// Its own native driver, and the root it is over: [`blaze_core::ThreadNative`], whose
+    /// reads the thread submits and, where the page cache answers, ends in one system call.
+    native: Option<(Arc<Path>, blaze_core::ThreadNative)>,
     /// The loop's driver while it lends it ([`lend`]); its lifetime is the lend's, which
     /// clears it before it returns or unwinds.
     // dyn: the loop's driver, lent
@@ -329,7 +335,7 @@ fn with<R>(stores: &Stores, which: Which, f: impl FnOnce(&mut Direct, &mut Drivi
             (Reads::Native { root }, None) => {
                 let fresh = native.as_ref().is_none_or(|(had, _)| **had != **root);
                 if fresh {
-                    let made = blaze_core::native(root, 1).unwrap_or_else(|why| {
+                    let made = blaze_core::thread_native(root, 1).unwrap_or_else(|why| {
                         panic!(
                             "a store read on this thread needs a native driver over {} of its own (serve::direct, Reads::Native): {why}",
                             root.display()

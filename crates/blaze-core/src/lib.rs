@@ -1700,6 +1700,28 @@ pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native>
     Ok(threads::Threads::new(root, threads))
 }
 
+/// This target's native driver for one thread's own requests, asked and waited for one at a
+/// time on the thread that made it: a task's store reads (blaze-cargo's `serve::direct`). On
+/// Linux a ring with no kernel thread ([`uring::Entered`]): the thread's own `io_uring_enter`
+/// submits each request and ends a read the page cache answers in the same call, where
+/// [`Native`]'s ring hands it to a kernel thread of the ring's own and sleeps until that thread
+/// wakes it (issue #2174: ~0.7 ms a 234-byte read, 136,565 of them in a restarted daemon's
+/// first build). Elsewhere [`Native`].
+#[cfg(target_os = "linux")]
+pub type ThreadNative = uring::Uring<uring::Entered>;
+#[cfg(not(target_os = "linux"))]
+pub type ThreadNative = Native;
+
+/// This target's [`ThreadNative`] driver over `root`, used on the calling thread alone.
+#[cfg(target_os = "linux")]
+pub fn thread_native(root: &std::path::Path, _threads: usize) -> std::io::Result<ThreadNative> {
+    uring::Uring::entered(root)
+}
+#[cfg(not(target_os = "linux"))]
+pub fn thread_native(root: &std::path::Path, threads: usize) -> std::io::Result<ThreadNative> {
+    native(root, threads)
+}
+
 #[cfg(test)]
 mod tests;
 

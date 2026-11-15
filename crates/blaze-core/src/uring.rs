@@ -1,7 +1,9 @@
 //! A [`Driver`] on Linux's io_uring: one ring, shared with the kernel through memory, that the
-//! thread which polls fills with requests and reaps completions from. The kernel takes the
-//! requests on a thread of its own (`IORING_SETUP_SQPOLL`), so a busy driver submits with no
-//! system call; an idle one lets that thread sleep and wakes it when it writes again.
+//! thread which polls fills with requests and reaps completions from. The daemon's driver
+//! ([`Polled`]) has the kernel take the requests on a thread of its own (`IORING_SETUP_SQPOLL`),
+//! so a busy driver submits with no system call; an idle one lets that thread sleep and wakes it
+//! when it writes again. A thread's own driver for one request at a time ([`Entered`]) submits
+//! with its own `io_uring_enter`, which ends a read the page cache answers in the same call.
 //!
 //! Reads, appends, syncs, writes at an offset, whole-file writes and renames are the ring's;
 //! timers are a [`Wheel`] whose next deadline ends the ring's wait. A file is opened once,
@@ -112,12 +114,16 @@ const SETUP_SQPOLL: u32 = 1 << 1;
 const SETUP_CQSIZE: u32 = 1 << 3;
 const SETUP_SUBMIT_ALL: u32 = 1 << 7;
 const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
+const SETUP_DEFER_TASKRUN: u32 = 1 << 13;
 const FEAT_SINGLE_MMAP: u32 = 1 << 0;
 const FEAT_NODROP: u32 = 1 << 1;
 const FEAT_SQPOLL_NONFIXED: u32 = 1 << 7;
 const FEAT_EXT_ARG: u32 = 1 << 8;
 /// `IORING_ENTER_SQ_WAKEUP`; the waiting flags are `wait::uring_enter`'s.
 const ENTER_SQ_WAKEUP: u32 = 1 << 1;
+/// `IORING_ENTER_GETEVENTS`, on an [`Entered`] ring's submission with no wait (`min_complete`
+/// 0): runs the completions' deferred work and posts their entries, sleeping for none.
+const ENTER_GETEVENTS: u32 = 1 << 0;
 /// In the submission ring's flags: the kernel's thread sleeps, to be woken by an enter.
 const SQ_NEED_WAKEUP: u32 = 1 << 0;
 /// In the submission ring's flags: completions wait in the kernel for room, flushed by an
@@ -878,8 +884,51 @@ impl Drop for Map {
     }
 }
 
+/// Who takes a [`Uring`]'s requests off its ring, a type parameter (rule 78): the driver's code
+/// on either side of `Ring::enter` does not know which, and neither costs a branch. Each is
+/// tested to end the drivers' shared scripts as the other does (`crate::tests`).
+pub trait Submission: 'static {
+    /// `io_uring_setup`'s flags past `CQSIZE | SUBMIT_ALL | SINGLE_ISSUER`.
+    const SETUP: u32;
+    /// Those flags by name, and the Linux that has them all: what a refused setup names.
+    const NAMED: (&'static str, &'static str);
+    /// Whether a kernel thread of the ring's own takes its requests (`IORING_SETUP_SQPOLL`);
+    /// where not, the issuing thread's own `io_uring_enter` does.
+    const POLLED: bool;
+}
+
+/// Taken by a kernel thread of the ring's own (`IORING_SETUP_SQPOLL`) as they are written,
+/// with no system call; the thread sleeps after `SQ_THREAD_IDLE_MS` (50) of nothing to do. For a
+/// loop that keeps many requests in flight: the daemon's, [`crate::Native`].
+pub struct Polled;
+
+impl Submission for Polled {
+    const SETUP: u32 = SETUP_SQPOLL;
+    const NAMED: (&'static str, &'static str) =
+        ("IORING_SETUP_SQPOLL with IORING_SETUP_SINGLE_ISSUER", "6.0");
+    const POLLED: bool = true;
+}
+
+/// Taken by the issuing thread's own `io_uring_enter`, which hands the kernel every request
+/// written since and, for one that can end at once (a read the page cache answers), ends it in
+/// the same call: no kernel thread, and no wakeup of one thread by another for each request.
+/// For a thread that waits on one request at a time: a task's store reads,
+/// [`crate::ThreadNative`]. A completion's work runs, and its entry is posted, only in an enter
+/// of the thread's that gets events (`IORING_SETUP_DEFER_TASKRUN`): each submission is one,
+/// asking for none (as liburing's `io_uring_submit_and_get_events`), and so is each wait of
+/// [`Driver::poll`], all on the thread that made the ring (`SINGLE_ISSUER`). So a cached read
+/// is one system call, its completion on the ring as the submit returns.
+pub struct Entered;
+
+impl Submission for Entered {
+    const SETUP: u32 = SETUP_DEFER_TASKRUN;
+    const NAMED: (&'static str, &'static str) =
+        ("IORING_SETUP_DEFER_TASKRUN with IORING_SETUP_SINGLE_ISSUER", "6.1");
+    const POLLED: bool = false;
+}
+
 /// The ring: its file, the mappings and where in them the kernel's counters are.
-struct Ring {
+struct Ring<S: Submission> {
     sq_head: *const AtomicU32,
     sq_tail: *const AtomicU32,
     sq_flags: *const AtomicU32,
@@ -899,26 +948,29 @@ struct Ring {
     /// The kernel's head as last read: room is counted from it, read again only where the ring
     /// looks full.
     sq_seen: u32,
-    /// Requests written to the ring since the kernel's thread was last told of them.
+    /// Requests written to the ring since the kernel was last told of them.
     unsubmitted: u32,
     // Dropped after the pointers into them are no longer used.
     _maps: Vec<Map>,
     /// Shared with the [`Table`], whose slots are emptied through it until the last goes.
     fd: Rc<OwnedFd>,
+    _submission: std::marker::PhantomData<S>,
+    /// The `io_uring_enter`s made, for the tests that count them.
+    #[cfg(test)]
+    enters: u64,
 }
 
-impl Ring {
-    /// Submitted by a kernel thread of its own (`IORING_SETUP_SQPOLL`), which takes requests
-    /// from the ring as they are written, with no system call, and sleeps after
-    /// [`SQ_THREAD_IDLE_MS`] of nothing to do. For one issuing thread (a [`Uring`] is not
-    /// `Send`; `IORING_SETUP_SINGLE_ISSUER`). With a thread of its own the kernel runs every
-    /// completion's work there, so `IORING_SETUP_DEFER_TASKRUN`, `COOP_TASKRUN` and
-    /// `TASKRUN_FLAG`, which say when the issuing thread runs it, mean nothing with SQPOLL, and
-    /// the kernel refuses them with it.
-    fn new(entries: u32, completions: u32) -> io::Result<Ring> {
+impl<S: Submission> Ring<S> {
+    /// Its requests taken as `S` says ([`Polled`], [`Entered`]). For one issuing thread (a
+    /// [`Uring`] is not `Send`; `IORING_SETUP_SINGLE_ISSUER`). With a thread of its own
+    /// (SQPOLL) the kernel runs every completion's work there, so `IORING_SETUP_DEFER_TASKRUN`,
+    /// `COOP_TASKRUN` and `TASKRUN_FLAG`, which say when the issuing thread runs it, mean
+    /// nothing with SQPOLL, and the kernel refuses them with it; without one, DEFER_TASKRUN
+    /// runs that work only in the issuing thread's waits, never by interrupting it.
+    fn new(entries: u32, completions: u32) -> io::Result<Ring<S>> {
         let mut params = Params {
-            flags: SETUP_SQPOLL | SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER,
-            sq_thread_idle: SQ_THREAD_IDLE_MS,
+            flags: S::SETUP | SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER,
+            sq_thread_idle: if S::POLLED { SQ_THREAD_IDLE_MS } else { 0 },
             cq_entries: completions,
             ..Params::default()
         };
@@ -936,7 +988,7 @@ impl Ring {
                 libc::ENOSYS | libc::EINVAL => io::ErrorKind::Unsupported,
                 _ => error.kind(),
             };
-            let why = setup_refused(errno, &error, disabled, &crate::cgroup::kernel());
+            let why = setup_refused(errno, &error, disabled, &crate::cgroup::kernel(), S::NAMED);
             return Err(io::Error::new(kind, why));
         }
         // SAFETY: the call returned a file descriptor of its own.
@@ -994,6 +1046,9 @@ impl Ring {
             unsubmitted: 0,
             _maps: vec![rings, sqes], // alloc: setup, once per driver.
             fd,
+            _submission: std::marker::PhantomData,
+            #[cfg(test)]
+            enters: 0,
         })
     }
 
@@ -1044,10 +1099,13 @@ impl Ring {
         unsafe { (*self.sq_flags).load(Ordering::Relaxed) }
     }
 
-    /// Wakes the kernel's thread where it sleeps with requests written since, and, with
-    /// `until`, waits until that deadline on `clock` for one completion, through
+    /// Hands the kernel the requests written since: with [`Polled`], wakes its thread where it
+    /// sleeps; with [`Entered`], submits every one it has not taken, in this call, and posts
+    /// the entries of those that ended in it (a read the page cache answers). With `until`,
+    /// then waits until that deadline on `clock` for one completion, through
     /// [`wait::uring_enter`] (the time left recomputed on every entry, asynchronous signals
-    /// masked). Completions the kernel held for want of room are flushed to the ring by any
+    /// masked); a request the submission ended is that completion, so the call returns with no
+    /// sleep. Completions the kernel held for want of room are flushed to the ring by any
     /// enter that gets events.
     fn enter(&mut self, until: Option<Deadline>, clock: &impl Clock) -> io::Result<()> {
         self.publish();
@@ -1056,19 +1114,30 @@ impl Ring {
         // lives; the kernel moves it, so only atomic loads.
         let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
         self.sq_seen = head;
-        let queued = head != self.sq_local;
-        let wake = queued && flags & SQ_NEED_WAKEUP != 0;
+        // Written and shown, not yet taken by the kernel. With no kernel thread only an enter
+        // takes them, so this is exactly what is left to submit.
+        let queued = self.sq_local.wrapping_sub(head);
         self.unsubmitted = 0;
         let until = until.or((flags & SQ_CQ_OVERFLOW != 0).then_some(Deadline::PASSED));
-        if until.is_none() && !wake {
+        // With no kernel thread, a submission also gets events: under DEFER_TASKRUN the kernel
+        // posts a completion's entry only from such an enter (a submit alone left a read the
+        // page cache had answered unposted, so a second enter was needed to see it), and with
+        // no `until` it asks for none (`min_complete` 0), so it never sleeps.
+        let (to_submit, flags) = match S::POLLED {
+            true if queued > 0 && flags & SQ_NEED_WAKEUP != 0 => (0, ENTER_SQ_WAKEUP),
+            true => (0, 0),
+            false if queued > 0 => (queued, ENTER_GETEVENTS),
+            false => (0, 0),
+        };
+        if until.is_none() && to_submit == 0 && flags == 0 {
             return Ok(());
         }
-        let flags = match wake {
-            true => ENTER_SQ_WAKEUP,
-            false => 0,
-        };
+        #[cfg(test)]
+        {
+            self.enters += 1;
+        }
         let what = "a completion of the io_uring driver";
-        wait::uring_enter(what, self.fd.as_raw_fd(), flags, until, clock)?;
+        wait::uring_enter(what, self.fd.as_raw_fd(), to_submit, flags, until, clock)?;
         Ok(())
     }
 
@@ -1121,9 +1190,17 @@ impl Ring {
 
 /// What blaze says when `io_uring_setup` fails with `errno`: what failed, the likely cause and
 /// the fix. `disabled` is `/proc/sys/kernel/io_uring_disabled` (absent before Linux 6.6),
-/// `kernel` the running kernel's release. On Linux the build runs on io_uring and on nothing
-/// else, so this is where it stops.
-fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &str) -> String {
+/// `kernel` the running kernel's release, `setup` the flags asked by name and the Linux that has
+/// them ([`Submission::NAMED`]). On Linux the build runs on io_uring and on nothing else, so
+/// this is where it stops.
+fn setup_refused(
+    errno: i32,
+    error: &io::Error,
+    disabled: Option<u8>,
+    kernel: &str,
+    setup: (&str, &str),
+) -> String {
+    let (flags, since) = setup;
     let name = match errno {
         libc::ENOSYS => "ENOSYS",
         libc::EPERM => "EPERM",
@@ -1167,9 +1244,8 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
         ),
         (libc::EINVAL, _) => write!(
             out,
-            "this kernel (Linux {kernel}) lacks IORING_SETUP_SQPOLL with \
-             IORING_SETUP_SINGLE_ISSUER, which Linux 6.0 and later have. \
-             Fix: run on Linux 6.0 or later"
+            "this kernel (Linux {kernel}) lacks {flags}, which Linux {since} and later have. \
+             Fix: run on Linux {since} or later"
         ),
         (libc::ENOMEM, _) => write!(
             out,
@@ -1812,11 +1888,13 @@ fn wake_ring(wake: &Wake) {
     unsafe { libc::write(wake.fd.as_raw_fd(), one.as_ptr().cast(), one.len()) };
 }
 
-pub struct Uring {
+/// The driver, its requests taken off the ring as `S` says: by a kernel thread of its own
+/// ([`Polled`], the daemon's) or by its own thread's `io_uring_enter` ([`Entered`]).
+pub struct Uring<S: Submission = Polled> {
     start: Instant,
     /// Shared with the work done off the ring, so handing it out is a count, not a copy.
     root: Arc<Path>,
-    ring: Ring,
+    ring: Ring<S>,
     table: Rc<Table>,
     /// Not freed while the kernel may still write into it (see `Drop`).
     provided: ManuallyDrop<Provided>,
@@ -1943,9 +2021,25 @@ impl crate::host::Sink for HostSink {
 static TEMPORARY: AtomicU64 = AtomicU64::new(1 << 63);
 
 impl Uring {
-    /// A driver whose files are under `root`, or why this kernel has no ring for it.
+    /// A driver whose files are under `root`, its requests taken by a kernel thread of its
+    /// own ([`Polled`]), or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
-        let ring = Ring::new(ENTRIES, COMPLETIONS)?;
+        Uring::set_up(root)
+    }
+}
+
+impl Uring<Entered> {
+    /// A driver whose files are under `root`, its requests taken by its thread's own
+    /// `io_uring_enter` ([`Entered`]), or why this kernel has no ring for it. Used on the
+    /// thread that made it alone.
+    pub fn entered(root: impl Into<PathBuf>) -> io::Result<Uring<Entered>> {
+        Uring::set_up(root)
+    }
+}
+
+impl<S: Submission> Uring<S> {
+    fn set_up(root: impl Into<PathBuf>) -> io::Result<Uring<S>> {
+        let ring = Ring::<S>::new(ENTRIES, COMPLETIONS)?;
         let offload = Offload::new()?;
         let table = Table::new(&ring.fd)?;
         let provided = ManuallyDrop::new(Provided::new(ring.fd.as_raw_fd())?);
@@ -2020,13 +2114,13 @@ impl Uring {
     /// The driver, making the sandbox of each spawn whose [`crate::Sandbox`] is on with
     /// `confine`.
     // dyn: the embedder's sandbox, set once.
-    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Uring {
+    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Uring<S> {
         self.confine = Some(confine);
         self
     }
 
     /// The driver, making each sandboxed spawn's own directory under `dir`, made here.
-    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Uring> {
+    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Uring<S>> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
         self.spawn_dirs = dir;
@@ -2746,7 +2840,7 @@ fn connect_socket(table: &Rc<Table>, domain: libc::c_int) -> io::Result<Fixed> {
     table.install(fd)
 }
 
-impl Driver for Uring {
+impl<S: Submission> Driver for Uring<S> {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         // The one now of every timer in this submit: each one's `after` counts from when it was
         // asked, which is this call, so timers asked together fire in the order of their
@@ -3901,6 +3995,113 @@ mod tests {
         }
         assert_eq!(std::fs::read(root.join("log")).unwrap(), [0, 1, 2]);
         drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// What [`Entered`] is for (issue #2174), in what the kernel guarantees: the ring has no
+    /// kernel thread of its own (the control, a polled ring made on the same thread, has one,
+    /// `iou-sqp-<tid>`), and each small read of a file the driver keeps open is one
+    /// `io_uring_enter` to submit, plus at most one to wait where the kernel did not end it in
+    /// that call. Where the file system reads its cache without blocking (`FMODE_NOWAIT`; ext4,
+    /// xfs and btrfs, by `statfs`), every read ends in its submit's one enter (`GETEVENTS`
+    /// asking for none posts it), so its completion is on the ring as `submit` returns. On
+    /// another (the VM's test directory, 2026-11-15) the kernel hands each read to its workers
+    /// and the second enter waits for it: that file system is named and the one-enter claim
+    /// not checked there. The reads are a store's: one open, then small reads one at a time.
+    #[test]
+    fn an_entered_ring_has_no_kernel_thread_and_ends_cached_reads_in_its_submit() {
+        const READS: u64 = 16;
+        const LEN: u32 = 234;
+        let root = dir("uring-entered");
+        std::fs::create_dir_all(&root).unwrap();
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(8192).collect();
+        std::fs::write(root.join("pack"), &bytes).unwrap();
+        let ours = root.clone();
+        // On a thread of its own, so the kernel threads named for it are this test's alone.
+        std::thread::spawn(move || {
+            use std::os::unix::ffi::OsStrExt as _;
+            let me = std::fs::read_link("/proc/thread-self").unwrap();
+            let tid = me.file_name().unwrap().to_str().unwrap().to_owned();
+            let named = format!("iou-sqp-{tid}");
+            let sqpoll = || {
+                std::fs::read_dir("/proc/self/task")
+                    .unwrap()
+                    .filter_map(|it| std::fs::read_to_string(it.ok()?.path().join("comm")).ok())
+                    .filter(|comm| comm.trim_end() == named)
+                    .count()
+            };
+            let path = std::ffi::CString::new(ours.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `statfs` is plain integers, for which all zeroes is a value.
+            let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path, and a `statfs` the call fills and keeps no pointer to.
+            assert_eq!(unsafe { libc::statfs(path.as_ptr(), &raw mut fs) }, 0);
+            #[allow(clippy::unnecessary_cast, reason = "`f_type`'s type is the C library's")]
+            let magic = fs.f_type as u64;
+            // ext4, xfs, btrfs: `FMODE_NOWAIT`, so a cached read ends in its submit.
+            let nowait = [0xEF53, 0x5846_5342, 0x9123_683E].contains(&magic);
+            let mut driver = Uring::entered(&ours).unwrap();
+            // SAFETY: read only once every effect on it has ended.
+            let mut memory =
+                unsafe { crate::Memory::new("an entered ring's reads", bytes.len()) }.unwrap();
+            memory.fill(0, memory.len(), 0);
+            let file = FileName::new("pack").unwrap();
+            let read = |at: u64, len: u32, tag: u64| Effect::ReadInto {
+                file: file.clone(),
+                at,
+                into: memory.span(at, len),
+                cache: crate::Cache::Kept,
+                priority: crate::Priority::Demand,
+                tag: Tag(tag),
+            };
+            // The first opens the file through the ring, which may end on the kernel's workers;
+            // the driver keeps it open (`Uring::positional_file`), so each read after is one
+            // request on its slot.
+            let mut first = Vec::new();
+            run_until_idle(&mut driver, &mut vec![read(0, 100, 0)], |it, _| first.push(it.done))
+                .expect("the effects end");
+            assert_eq!(first, [Done::ReadInto { len: 100 }]);
+            let mut out = Vec::new();
+            let mut ended_in_submit = 0;
+            for n in 0..READS {
+                let enters = driver.ring.enters;
+                driver.submit(&mut vec![read(100 + u64::from(LEN) * n, LEN, 1 + n)]);
+                assert_eq!(driver.ring.enters - enters, 1, "read {n}: its submit's enters");
+                let (head, tail) = driver.ring.completions();
+                let ended = head != tail;
+                ended_in_submit += u64::from(ended);
+                out.clear();
+                let until = Deadline::after(driver.now(), Duration::from_secs(5));
+                assert_eq!(driver.poll(&mut out, until), 1, "read {n}: {out:?}");
+                assert_eq!(out[0].done, Done::ReadInto { len: LEN }, "read {n}");
+                let took = driver.ring.enters - enters;
+                let want = if ended { 1 } else { 2 };
+                assert_eq!(took, want, "read {n}: its enters (ended in its submit: {ended})");
+            }
+            if nowait {
+                assert_eq!(ended_in_submit, READS, "reads ended in their submit, on {magic:#x}");
+            } else {
+                eprintln!(
+                    "not checked: whether a cached read ends in its submit, on file system \
+                     {magic:#x} under {} ({ended_in_submit} of {READS} did)",
+                    ours.display()
+                );
+            }
+            assert_eq!(driver.in_flight(), 0);
+            let mut held = vec![0; 100 + (LEN as usize) * READS as usize];
+            memory.read(0, &mut held);
+            assert_eq!(held, bytes[..held.len()]);
+            assert_eq!(sqpoll(), 0, "an entered ring has a kernel thread of its own");
+            let polled = Uring::new(&ours).unwrap();
+            blaze_spin::SpinWait::within(
+                "the control: a polled ring's kernel thread, named for the thread that made it",
+                Duration::from_secs(5),
+                || sqpoll() == 1,
+            );
+            drop(polled);
+            drop(driver);
+        })
+        .join()
+        .unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5538,7 +5739,7 @@ mod tests {
     /// and a set word on any other.
     #[test]
     fn the_reserved_check_is_the_kernels() {
-        let ring = Ring::new(ENTRIES, COMPLETIONS).unwrap();
+        let ring = Ring::<Polled>::new(ENTRIES, COMPLETIONS).unwrap();
         let fd = ring.fd.as_raw_fd();
         let check = ReservedCheck::of(fd).unwrap();
         let other = match check {
@@ -5708,7 +5909,7 @@ mod tests {
     fn a_ring_refused_by_seccomp_says_what_failed_why_and_the_fix() {
         let error = io::Error::from_raw_os_error(libc::EPERM);
         assert_eq!(
-            super::setup_refused(libc::EPERM, &error, Some(0), "6.8.0"),
+            super::setup_refused(libc::EPERM, &error, Some(0), "6.8.0", Polled::NAMED),
             "blaze runs its build on io_uring on Linux and cannot start without it: \
              io_uring_setup failed with EPERM (Operation not permitted (os error 1)). \
              Likely cause: a seccomp policy that refuses io_uring_setup, such as Docker's \
@@ -5721,8 +5922,22 @@ mod tests {
     #[test]
     fn each_refusal_names_its_errno_cause_and_fix() {
         let says = |errno: i32, disabled: Option<u8>| {
-            super::setup_refused(errno, &io::Error::from_raw_os_error(errno), disabled, "5.0.0")
+            let error = io::Error::from_raw_os_error(errno);
+            super::setup_refused(errno, &error, disabled, "5.0.0", Polled::NAMED)
         };
+        // A ring with no kernel thread names the flags it asked for, and the Linux that has them.
+        let entered = super::setup_refused(
+            libc::EINVAL,
+            &io::Error::from_raw_os_error(libc::EINVAL),
+            None,
+            "5.0.0",
+            Entered::NAMED,
+        );
+        assert!(
+            entered.contains("lacks IORING_SETUP_DEFER_TASKRUN with IORING_SETUP_SINGLE_ISSUER"),
+            "{entered}"
+        );
+        assert!(entered.ends_with("Fix: run on Linux 6.1 or later."), "{entered}");
         let cases: [(i32, Option<u8>, &str, &str, &str); 7] = [
             (
                 libc::EPERM,

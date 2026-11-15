@@ -51,15 +51,20 @@ pub(super) const WAITING_MASK: u64 = !(bit(libc::SIGINT)
     | bit(libc::SIGTRAP)
     | bit(libc::SIGSYS));
 
-/// One `io_uring_enter` on `ring` with `flags` (`IORING_ENTER_SQ_WAKEUP` or none), no
-/// submissions (the ring's submission thread takes them). With `wait`, it also waits for one
+/// One `io_uring_enter` on `ring` with `flags` (`IORING_ENTER_SQ_WAKEUP`, `GETEVENTS` on a
+/// submission that posts what ended in it while waiting for none, or none), handing the
+/// kernel `to_submit` requests: none on a ring whose own kernel thread takes them (SQPOLL),
+/// every one written and not yet taken on one without. With `wait`, it also waits for one
 /// completion until that deadline on `clock` ([`Deadline::NEVER`]: no limit), the timeout
 /// recomputed on every entry and the asynchronous signals masked ([`WAITING_MASK`]); without,
-/// it only wakes the kernel's thread. `Ready` when a completion may be reaped (one posted, or
-/// the kernel held some back, EBUSY), `Deadline` when none came by then.
+/// it only submits or wakes the kernel's thread. `Ready` when a completion may be reaped (one
+/// posted, or the kernel held some back, EBUSY), and whenever it submitted any: the kernel then
+/// answers how many it took and not how its wait ended, so the caller looks and enters again
+/// (with none left to submit) if nothing came. `Deadline` when none came by then.
 pub(crate) fn uring_enter(
     what: &'static str,
     ring: RawFd,
+    to_submit: libc::c_uint,
     flags: u32,
     wait: Option<Deadline>,
     clock: &impl Clock,
@@ -81,13 +86,16 @@ pub(crate) fn uring_enter(
             ts: ts.as_ref().map_or(0, |it| ptr::from_ref(it) as u64),
         };
         // SAFETY: `arg`, the mask and the timespec it points at outlive the call, which reads
-        // them and keeps no pointer. With SQPOLL the kernel's thread submits; the call only
-        // wakes it and waits.
+        // them and keeps no pointer. With SQPOLL the kernel's thread submits and `to_submit` is
+        // 0: the call only wakes it and waits. Without, the call takes `to_submit` requests the
+        // caller wrote and showed. An interruption or a timeout comes back as an error only
+        // where there was nothing to submit (a call that submits answers its count), so a retry
+        // below is always a wait alone.
         let entered = unsafe {
             libc::syscall(
                 libc::SYS_io_uring_enter,
                 ring,
-                libc::c_uint::MIN,
+                to_submit,
                 min_complete,
                 flags,
                 &raw const arg,

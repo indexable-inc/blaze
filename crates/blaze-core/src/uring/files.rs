@@ -255,7 +255,7 @@ fn push_dir_of(into: &mut RegionVec<u8>, path: &Path) -> io::Result<u32> {
     }
 }
 
-impl Uring {
+impl<S: Submission> Uring<S> {
     /// The request `hot`, whose names `push` puts in an arena, lending the kernel `buf`, its
     /// `cold` record given its names' starts; an error, and nothing started, where they do
     /// not fit.
