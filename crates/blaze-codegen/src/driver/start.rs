@@ -74,6 +74,9 @@ pub struct One<I, S> {
     pub symbol: Option<(String, Linkage)>,
     /// The content key of its describe ([`Frontend::record_key`]), where the front end has one.
     pub ask: Option<blaze_cas::Key>,
+    /// Who asked for it as it was made: with its instance, the origin in `identity`, which
+    /// `ask` does not hold (`blaze_launch_host::bind::bind_key` covers it).
+    pub requester: Origin,
     pub function: Arc<CompiledFunction>,
     /// Every function its code refers to, each once, in the order it refers to them: what its
     /// first calls ask for next.
@@ -406,7 +409,7 @@ impl<B: Prepare> Build<'_, B> {
     ) -> Result<One<FrontInstance<B>, FrontStatic<B>>, CodegenError> {
         let (function, puts) = self.compile_near(&near, store)?;
         let node = near.node();
-        let it = &node.described;
+        let (it, requester) = (&node.described, node.requester);
         let made = (
             subject(it.identity, it.origin),
             it.abi,
@@ -430,6 +433,7 @@ impl<B: Prepare> Build<'_, B> {
             name,
             symbol,
             ask,
+            requester,
             // alloc: once a function made, shared with whoever holds its code
             function: Arc::new(function),
             callees: near.callees,

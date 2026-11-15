@@ -1718,6 +1718,7 @@ impl Front<Fake> for FakeFront {
             open: false,
             why: None,
             puts,
+            put_of: Vec::new(),
             record: None,
             body_sessions,
             share,

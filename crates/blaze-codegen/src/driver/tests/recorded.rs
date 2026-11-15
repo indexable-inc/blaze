@@ -217,6 +217,7 @@ fn a_record_that_does_not_read_refuses_the_build() {
 #[test]
 fn two_records_of_one_key_are_one_put_or_a_refusal() {
     let put = |key: u8, bytes: &[u8]| Put {
+        of: None,
         key: Key(ContentId([key; 32])),
         kind: records::KIND,
         bytes: bytes.to_vec(),

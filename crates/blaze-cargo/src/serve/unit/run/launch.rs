@@ -49,10 +49,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use blaze_api::ApiError;
 use blaze_codegen::backend::{Changed, Frontend as _};
-use blaze_codegen::driver::{Build, Callee, Lookup, One, OneStatic, Put, Start, runs_at_start};
+use blaze_codegen::driver::{Build, Callee, Lookup, MadeIn, One, OneStatic, Put, PutOf, Start, runs_at_start};
 use blaze_codegen::memo::Memo;
 use blaze_codegen::plan::{Origin, Policy};
-use blaze_codegen::{Arch, CodegenError, StaticId, Target};
+use blaze_codegen::{Arch, CodegenError, InstanceKey, StaticId, Target};
 use blaze_core::Waker;
 use blaze_core::lock::Lock;
 use blaze_core::wait::{Clock as _, Monotonic, Parker};
@@ -1327,9 +1327,9 @@ impl Reads<'_, '_> {
     }
 
     /// The bind key of the function `asked` whose describe record is under `ask`.
-    fn bind(&self, asked: &HirInstance, ask: Option<blaze_cas::Key>) -> Option<blaze_cas::Key> {
+    fn bind(&self, (asked, requester): (&HirInstance, &Origin), ask: Option<blaze_cas::Key>) -> Option<blaze_cas::Key> {
         let naming = self.frontend.naming_of(asked)?;
-        Some(bind::bind_key(&ask?, &naming, self.under))
+        Some(bind::bind_key(&ask?, Some(requester), &naming, self.under))
     }
 
     /// The bind key of the static `value`, of id `id` in this build: by its own key and
@@ -1338,7 +1338,7 @@ impl Reads<'_, '_> {
     fn bind_static(&self, value: &HirStatic, id: &StaticId) -> Option<blaze_cas::Key> {
         let key = self.frontend.static_key(value, id)?;
         let naming = self.frontend.static_naming_of(value)?;
-        Some(bind::bind_key(&key, &naming, self.under))
+        Some(bind::bind_key(&key, None, &naming, self.under))
     }
 
     /// The portable ask of `asked` (`HirFrontend::ask_bytes`): empty where it has none, and
@@ -1392,7 +1392,7 @@ fn names_of(
                 Names::Function {
                     key: *key,
                     slot,
-                    bind: reads.bind(&callee.asked.0, callee.ask),
+                    bind: reads.bind((&callee.asked.0, &callee.asked.1), callee.ask),
                     ask: reads.ask(slot, &callee.asked, unported),
                 }
             }
@@ -1461,12 +1461,14 @@ fn piece_of(
         let names = names_of(&made, (&one.callees, &one.statics), reads, &mut pieced.making.unported, &one.name)?;
         let slot = bind::slot_identity(&one.identity, &one.abi);
         let bound = Bound { made, slot, code: one.code, names };
-        let own = asked.as_ref().and_then(|it| reads.bind(it, one.ask));
+        // Under the key of who asked for it as it was made: its slot identity's origin.
+        let own = asked.as_ref().and_then(|it| reads.bind((it, &one.requester), one.ask));
         match own {
             Some(key) if bound_all(&bound) => pieced.puts.push(Put {
                 key,
                 kind: blaze_cas::Kind::Code,
                 bytes: bind::encode(&bound),
+                of: Some(bind_of(Some(one.name.clone()), one.key, one.item)),
             }),
             _ => {
                 let ids = tables.iter().map(|it| (it.0, hir_ty_codegen::v2::span_table_id(&it.1))).collect();
@@ -1498,13 +1500,19 @@ fn piece_of(
         if bound_all(&bound)
             && let Some(key) = reads.bind_static(&one.asked, &one.id)
         {
-            pieced.puts.push(Put { key, kind: blaze_cas::Kind::Code, bytes: bind::encode(&bound) });
+            let of = bind_of(Some(name), InstanceKey(one.id.1), one.id.0);
+            pieced.puts.push(Put { key, kind: blaze_cas::Kind::Code, bytes: bind::encode(&bound), of: Some(of) });
         }
         pieced.puts.extend(one.puts);
         pieced.making.statics.push(one.id);
         pieced.piece.statics.push((one.id, bound));
     }
     Ok(pieced)
+}
+
+/// What a bind record put under its key is, for a refusal of the put that names it (rule 19).
+fn bind_of(name: Option<String>, instance: InstanceKey, item: ItemKey) -> Arc<PutOf> {
+    Arc::new(PutOf { name, instance, item, made: MadeIn::BindRecord, origin: None, relative: None, parts: None })
 }
 
 /// Each of `named` the program was not given yet, and each static those name, made alone.
@@ -1624,7 +1632,7 @@ pub(crate) fn prepare<L: Lookup + ?Sized>(
     for (_, names) in &mut symbols {
         if let Names::Function { key, bind, .. } = names {
             let root = start.declared.iter().find(|it| it.key == *key);
-            *bind = root.and_then(|it| reads.bind(&it.asked.0, it.ask));
+            *bind = root.and_then(|it| reads.bind((&it.asked.0, &it.asked.1), it.ask));
         }
     }
     let mut inits = Vec::new();
