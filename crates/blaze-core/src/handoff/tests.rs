@@ -40,6 +40,105 @@ mod threads {
     }
 }
 
+/// [`Wake`](super::Wake)'s theorem where it is stated: drawn schedules in the weak memory, and
+/// its control.
+#[cfg(not(blaze_check))]
+mod theorems {
+    use std::alloc::Global;
+
+    use blaze_sim::{Broke, Config, Tape, check};
+
+    use super::super::{hands, no_hand_back_is_missed};
+    use crate::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        world::threads::{self, Ended, Step},
+    };
+
+    /// A schedule drawn: up to eight steps (each thread has two operations), picks 0 to 3:
+    /// in the weak memory a pick says how far back a read reads.
+    fn drawn(tape: &Tape) -> Vec<Step> {
+        let mut schedule = Vec::new_in(Global);
+        for _ in 0..tape.int_in(0..=8u64, "steps") {
+            schedule.push(Step { second: tape.coin("the driver goes"), pick: tape.int_in(0..=3u8, "pick") });
+        }
+        schedule
+    }
+
+    /// The same two threads with the flag's swaps `Relaxed`: the planted weakening.
+    fn hands_relaxed(schedule: &[Step], flagged: bool) -> bool {
+        let woken = AtomicBool::new(flagged);
+        let slot = AtomicU32::new(0);
+        let (sent, drained) = threads::two_weak(
+            schedule,
+            || {
+                slot.store(1, Ordering::Relaxed);
+                !woken.swap(true, Ordering::Relaxed)
+            },
+            || {
+                woken.swap(false, Ordering::Relaxed);
+                slot.load(Ordering::Relaxed)
+            },
+        );
+        match (sent, drained) {
+            (Ended::Done(must), Ended::Done(seen)) => seen == 1 || must,
+            _ => true,
+        }
+    }
+
+    /// The theorem's function holds on drawn schedules, picks and flags, reached with both
+    /// orders of the two swaps.
+    #[test]
+    fn no_hand_back_is_missed_where_it_is_run() {
+        let config = Config {
+            must_reach: &["the sender swapped first", "the driver swapped first"],
+            ..Config::cases(2_000)
+        };
+        check(config, |tape| {
+            let schedule = drawn(tape);
+            let flagged = tape.coin("the flag is set");
+            // Which swap came first: each thread's second step for the sender, first for the
+            // driver.
+            let (mut sent, mut order) = (0, None);
+            for step in &schedule {
+                match step.second {
+                    false => {
+                        sent += 1;
+                        if sent == 2 && order.is_none() {
+                            order = Some("the sender swapped first");
+                        }
+                    }
+                    true => {
+                        if order.is_none() {
+                            order = Some("the driver swapped first");
+                        }
+                    }
+                }
+            }
+            if let Some(order) = order {
+                tape.reached(order);
+            }
+            match no_hand_back_is_missed(&schedule, flagged) {
+                true => Ok(()),
+                false => Err(Broke::Oracle(format!(
+                    "a hand-back was missed: schedule {schedule:?}, the flag set {flagged}"
+                ))),
+            }
+        });
+    }
+
+    /// The planted weakening on the run that shows it: the flag is set, the sender stores and
+    /// swaps (told not to wake: the flag was set), the driver swaps without acquiring and its
+    /// read of the slot, one back, sees the slot before the hand-back.
+    #[test]
+    fn the_oracle_catches_a_flag_swapped_relaxed() {
+        let s = |pick| Step { second: false, pick };
+        let d = |pick| Step { second: true, pick };
+        let schedule = [s(0), s(0), d(0), d(1)];
+        assert!(!hands_relaxed(&schedule, true));
+        assert!(hands(&schedule, true));
+    }
+}
+
 /// Under `RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-core --release model_`.
 #[cfg(blaze_check)]
 mod checked {
