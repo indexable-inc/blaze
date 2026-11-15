@@ -2638,9 +2638,31 @@ fn unported(
 
 /// What sealed unit `unit` made, for the machine's layer: every output its record names, taken
 /// out of `compiled`'s puts (the home keeps none of it) or, made by an earlier build of this
-/// home, read from the store.
+/// home, read from the store; and the chain of bases of each output that is a recipe
+/// (`blaze_cas::Kind::Derived`: a linked image's runs over the base of holes, [`holes_key`], or
+/// its patch of the image before), each copied out of `compiled`'s puts (the home keeps it too:
+/// its own recipes are made from it) or read from the store. What the layer holds is whole
+/// without any home's records: a home that finds the unit's record there places the image from
+/// the layer alone, as one that made none of it does (the base of holes left in the home that
+/// built the unit made a release build's first build script unplaceable in every other home).
 fn share(job: &Job, unit: usize, compiled: &mut Compiled) -> Result<Vec<Put>, ApiError> {
     let mut share = Vec::with_capacity(compiled.outputs.len() + 2); // alloc: once per sealed unit made
+    let read = |key: &Key, what: &dyn std::fmt::Display| -> Result<Put, ApiError> {
+        // Lane M3: still the pooled read. The put needs the value's kind (an output is
+        // `Kind::Output` or, a linked image's recipe, `Kind::Derived`), which a direct read
+        // does not say: it moves once `blaze_cas::direct` answers with the header's kind.
+        match job.input.store.get(&blaze_cas::enter(), key) {
+            // alloc: a copy for the layer, once per value of a sealed unit an earlier build made
+            Ok(Some(it)) => Ok(Put { key: *key, kind: it.kind, bytes: it.bytes.to_vec() }),
+            // alloc: an error, once
+            Ok(None) => Err(ApiError::new(
+                format!("unit {unit}'s {what} is neither made now nor in the store"),
+                None,
+            )),
+            // alloc: an error, once
+            Err(corrupt) => Err(ApiError::new(format!("unit {unit}'s {what}: {corrupt}"), None)),
+        }
+    };
     for output in &compiled.outputs {
         // Two outputs of the same bytes are one put.
         if share.iter().any(|it: &Put| it.key == output.key) {
@@ -2648,31 +2670,56 @@ fn share(job: &Job, unit: usize, compiled: &mut Compiled) -> Result<Vec<Put>, Ap
         }
         let put = match compiled.puts.iter().position(|it| it.key == output.key) {
             Some(at) => compiled.puts.remove(at),
-            // Lane M3: still the pooled read. The put needs the value's kind (an output is
-            // `Kind::Output` or, a linked image's recipe, `Kind::Derived`), which a direct read
-            // does not say: it moves once `blaze_cas::direct` answers with the header's kind.
-            None => match job.input.store.get(&blaze_cas::enter(), &output.key) {
-                // alloc: a copy for the layer, once per output of a sealed unit an earlier build made
-                Ok(Some(it)) => Put { key: output.key, kind: it.kind, bytes: it.bytes.to_vec() },
-                Ok(None) => {
-                    // alloc: an error, once
-                    let what = format!(
-                        "unit {unit}'s output {} is neither made now nor in the store",
-                        output.path
-                    );
-                    return Err(ApiError::new(what, None));
-                }
-                Err(corrupt) => {
-                    return Err(ApiError::new(
-                        format!("unit {unit}'s output {}: {corrupt}", output.path),
-                        None,
-                    ));
-                }
-            },
+            // alloc: the error's text, once
+            None => read(&output.key, &format_args!("output {}", output.path))?,
         };
         share.push(put);
     }
+    with_bases(&mut share, |base| match compiled.puts.iter().find(|it| it.key == *base) {
+        // clone: the base's bytes, for the layer as well as the home; once per sealed image
+        Some(it) => Ok(Put { key: *base, kind: it.kind, bytes: it.bytes.clone() }),
+        None => read(base, &format_args!("recipe's base {base:?}")),
+    })?;
     Ok(share)
+}
+
+/// Adds to `share` the chain of bases of each recipe in it (`blaze_cas::Kind::Derived`), each
+/// once, as `base_of` gives the value of a key: what makes the values a sealed unit puts into
+/// the machine's layer whole without any home's records ([`share`]). Bounded as the store
+/// bounds a chain ([`blaze_cas::derived::CHAIN_MOST`]), a chain a value; a recipe that does
+/// not read, or a chain past the bound, is the error naming it.
+pub(super) fn with_bases(
+    share: &mut Vec<Put>,
+    mut base_of: impl FnMut(&Key) -> Result<Put, ApiError>,
+) -> Result<(), ApiError> {
+    let most = blaze_cas::derived::CHAIN_MOST as usize * share.len();
+    let mut at = 0;
+    while at < share.len() {
+        let put = &share[at];
+        at += 1;
+        if put.kind != Kind::Derived {
+            continue;
+        }
+        let base = blaze_cas::derived::decode(&put.bytes).map(|recipe| recipe.base).map_err(|why| {
+            // alloc: an error, once
+            ApiError::new(format!("the recipe {:?} of a sealed unit: {why}", put.key), None)
+        })?;
+        if share.iter().any(|it| it.key == base) {
+            continue;
+        }
+        if share.len() >= most {
+            // alloc: an error, once
+            let what = format!(
+                "the recipe {:?} of a sealed unit is made from a chain of more than {} bases",
+                share[at - 1].key,
+                blaze_cas::derived::CHAIN_MOST
+            );
+            return Err(ApiError::new(what, None));
+        }
+        let made = base_of(&base)?;
+        share.push(made);
+    }
+    Ok(())
 }
 
 /// What a unit's phases made so far, for the phases after them ([`Phase`]), under the unit's

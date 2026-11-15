@@ -3275,6 +3275,66 @@ fn store_driven(
     .expect("the effects end");
 }
 
+/// What a store that holds only `puts` (the machine's layer, as a home that built none of a
+/// sealed unit reads it) answers to a place of `key`.
+fn placed_from(puts: &[crate::serve::work::Put], key: &blaze_cas::Key) -> Result<(), String> {
+    let mut sim = blaze_core::sim::Sim::new(11, blaze_core::sim::Faults::default());
+    let mut store = super::deps::tests::opened(&mut sim);
+    let mut effects = Vec::new();
+    for put in puts {
+        store.put(put.key, put.kind, &put.bytes).unwrap();
+    }
+    store.flush(&mut effects);
+    store_driven(&mut sim, &mut store, &mut effects);
+    let to = blaze_core::FileName::new("out/release/build/dep/out/build_script_build").unwrap();
+    store.place(key, to, &mut effects).unwrap();
+    store_driven(&mut sim, &mut store, &mut effects);
+    store.placed()[0].result.clone()
+}
+
+/// The invariant: what a sealed unit puts into the machine's layer is whole without the home
+/// that built it: each recipe it puts (a linked image's runs over the base of holes, a patch of
+/// one image over another) comes with its chain of bases, each once, so a store that holds only
+/// the share places the image (ripgrep's `blaze build --release` as a fresh home's first build
+/// found crossbeam-utils's build script's record in the layer and failed placing it: "the
+/// derived value .. is made from ..: the store has no value under its key"). A recipe that does
+/// not read is the error naming it. Control: the share of the outputs alone (the bug, the base of
+/// holes left in the home's puts) gives that error.
+#[test]
+fn a_sealed_units_share_holds_each_recipes_bases() {
+    use blaze_cas::Kind;
+    use crate::serve::work::Put;
+    let holes = Put { key: compile::holes_key(), kind: Kind::Output, bytes: blaze_cas::derived::holes() };
+    let runs = blaze_cas::derived::encode(&holes.key, 1 << 20, &[(4096, vec![7; 300])]).unwrap();
+    let first = Put { key: compile::linked_key(&[1; 32]), kind: Kind::Derived, bytes: runs };
+    let patch = blaze_cas::derived::encode(&first.key, 1 << 20, &[(8192, vec![8; 20])]).unwrap();
+    let second = Put { key: compile::linked_key(&[2; 32]), kind: Kind::Derived, bytes: patch };
+    let home = [&holes, &first];
+    let base_of = |key: &blaze_cas::Key| {
+        let it = home.iter().find(|it| it.key == *key).expect("the home holds each base");
+        Ok(Put { key: it.key, kind: it.kind, bytes: it.bytes.clone() })
+    };
+    let copy = |it: &Put| Put { key: it.key, kind: it.kind, bytes: it.bytes.clone() };
+
+    let mut share = vec![copy(&second)];
+    compile::with_bases(&mut share, base_of).unwrap();
+    let keys: Vec<_> = share.iter().map(|it| it.key).collect();
+    assert_eq!(keys, [second.key, first.key, holes.key], "the chain, each once");
+    assert_eq!(placed_from(&share, &second.key), Ok(()));
+
+    let mut share = vec![copy(&first), copy(&holes)];
+    compile::with_bases(&mut share, base_of).unwrap();
+    assert_eq!(share.len(), 2, "a base the share holds is not put again");
+
+    let bad = Put { key: compile::linked_key(&[3; 32]), kind: Kind::Derived, bytes: vec![0; 8] };
+    let error = compile::with_bases(&mut vec![bad], base_of).unwrap_err();
+    assert!(error.what.contains("of a sealed unit"), "{}", error.what);
+
+    // The control: the outputs alone.
+    let refused = placed_from(&[copy(&first)], &first.key).unwrap_err();
+    assert!(refused.contains("the store has no value under its key"), "{refused}");
+}
+
 /// What the loop is handed to put for an edit of a linked image is the edit, not the image:
 /// where the link is a patch of the image before it and the store can derive from that image's
 /// file, the unit's put for it is the recipe (the ranges and a row each), the whole file is
