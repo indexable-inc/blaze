@@ -612,13 +612,15 @@ pub(super) enum Does<S: Steps> {
         asked: WriteWait,
     },
     /// One pass of checkout `checkout`'s front-end carry ([`super::front_carry::Carry::run`]):
-    /// the pass and the session taken from `hand`, the tree read through `files`, the store
-    /// through `store` under the task's guard, every write kept for the loop to put.
+    /// the pass and the session taken from `hand`, the tree read through `files`, the home
+    /// store through `stores` by direct reads into the task's frame (the task holds no guard
+    /// and pins no page for its whole run, however long the pass), every write kept for the
+    /// loop to put.
     FrontCarry {
         hand: Arc<Lock<CarryHand>>,
         checkout: String,
         files: blaze_vfs::Reader,
-        store: blaze_cas::Reader,
+        stores: Arc<super::direct::Stores>,
     },
 }
 
@@ -1085,7 +1087,7 @@ impl<S: Steps> plane::Work for Step<S> {
                     }
                 }
             }
-            Does::FrontCarry { hand, files, store, .. } => {
+            Does::FrontCarry { hand, files, stores, .. } => {
                 let (state, pass, crates) = {
                     let mut held = hand.lock();
                     (held.state.take(), held.pass.take(), std::mem::take(&mut held.crates))
@@ -1095,17 +1097,17 @@ impl<S: Steps> plane::Work for Step<S> {
                     return self.settle(Err::<(), _>(Failed::Error(error)), |_| Value::FrontCarried);
                 };
                 let start = blaze_profile::clock::mono_ns();
-                let guard = blaze_cas::enter();
-                let reading = blaze_kernel::Reading { reader: store, guard: &guard };
                 let run = || {
-                    let mut overlay = super::front_carry::Overlay::new(&reading);
-                    let ran = super::front_carry::Carry::run(state, pass, files, &mut overlay, &crates);
-                    ran.map(|(carry, built, saved)| CarryOut { carry, built, saved, puts: overlay.into_puts(), ns: 0 })
+                    blaze_mem::frame::current(|frame| {
+                        let reading = super::direct::DirectReading::new(stores, super::direct::Which::Home, frame);
+                        let mut overlay = super::front_carry::Overlay::new(&reading);
+                        let ran = super::front_carry::Carry::run(state, pass, files, &mut overlay, &crates);
+                        ran.map(|(carry, built, saved)| CarryOut { carry, built, saved, puts: overlay.into_puts(), ns: 0 })
+                    })
                 };
                 #[cfg(test)]
                 let run = || super::front_carry::sim::in_task(run);
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
-                drop(guard);
                 // A monotonic clock: the difference is never negative.
                 let ns = blaze_profile::clock::mono_ns().saturating_sub(start).max(0).cast_unsigned();
                 let out = match caught {
@@ -2569,7 +2571,7 @@ impl<S: Steps> Jobs<S> {
             hand: Arc::clone(&hand), // clone: a refcount, once a pass
             checkout: of.checkout.clone(), // alloc: the task's span's name, once a pass
             files: w.vfs.reader(),
-            store: w.store.reader(),
+            stores: Arc::clone(&self.setup.stores), // clone: a refcount, once a pass
         };
         // The task is no job's: nothing cancels it but its own end.
         let never = Arc::new(AtomicBool::new(false)); // alloc: once a pass

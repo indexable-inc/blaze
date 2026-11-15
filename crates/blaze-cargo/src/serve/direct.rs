@@ -104,6 +104,14 @@ impl Stores {
     pub(crate) fn home(&self) -> &Reader {
         &self.home
     }
+
+    /// The reader of `which` store, for what reads no value ([`DirectReading::has`]).
+    fn reader(&self, which: Which) -> &Reader {
+        match which {
+            Which::Home => &self.home,
+            Which::Std => &self.std,
+        }
+    }
 }
 
 /// A value read: its bytes in the reading task's frame, or, for one the store keeps as a file
@@ -471,6 +479,64 @@ impl<'f> Slots<'f> {
     /// The first slot whose read failed, with its key.
     pub(crate) fn failed(&self) -> Option<(Key, &Failed)> {
         self.keys.iter().zip(&self.values).find_map(|(key, value)| value.as_ref().err().map(|it| (*key, it)))
+    }
+}
+
+/// A store as a long task reads it: every value one direct read into the task's frame
+/// ([`value`]), so the task pins no page of the store's pool and holds no [`blaze_cas::Guard`]:
+/// a task that holds a guard blocks the grace period of every table retired while it runs, and
+/// the pages those tables pinned stay pinned until it ends.
+///
+/// The bytes a `get` or `read` returns live in `frame` until it is reset or its task ends, so a
+/// key read twice is held twice for the task's life, and the frame is the task's own
+/// ([`blaze_mem::frame::current`]), never one that outlives it. A value the store keeps as a
+/// file of its own is copied once out of its mapping into the frame, so the mapping is not held
+/// past the read.
+///
+/// Every read runs on this thread's driver ([`Reads`]); reads do not nest ([`with`]).
+pub(crate) struct DirectReading<'f> {
+    stores: &'f Stores,
+    which: Which,
+    frame: &'f Frame,
+}
+
+impl<'f> DirectReading<'f> {
+    pub(crate) fn new(stores: &'f Stores, which: Which, frame: &'f Frame) -> DirectReading<'f> {
+        DirectReading { stores, which, frame }
+    }
+
+    /// The verified bytes under `key`, in the frame; `Err` names why what is there can't be
+    /// read.
+    fn bytes(&self, key: &Key) -> Result<Option<&'f [u8]>, String> {
+        match value(self.stores, self.which, key, self.frame) {
+            Ok(Some(Value::Read(bytes))) => Ok(Some(bytes)),
+            Ok(Some(Value::Mapped(mapped))) => {
+                let mut copy = Vec::new_in(self.frame);
+                copy.extend_from_slice(&mapped);
+                Ok(Some(copy.leak()))
+            }
+            Ok(None) => Ok(None),
+            Err(failed) => Err(failed.to_string()), // alloc: an error
+        }
+    }
+}
+
+impl blaze_kernel::Get for DirectReading<'_> {
+    fn get(&self, key: &Key) -> Result<Option<&[u8]>, String> {
+        self.bytes(key)
+    }
+
+    /// An index lookup, unverified, reading no value: under a guard of this one call, which
+    /// holds no table past it and so blocks no grace period meaningfully.
+    fn has(&self, key: &Key) -> Result<bool, String> {
+        let guard = blaze_cas::enter();
+        Ok(self.stores.reader(self.which).has(&guard, key))
+    }
+}
+
+impl blaze_codegen::driver::Lookup for DirectReading<'_> {
+    fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
+        self.bytes(key)
     }
 }
 

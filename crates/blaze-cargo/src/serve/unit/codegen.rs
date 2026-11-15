@@ -29,7 +29,10 @@ use hir_ty_codegen::v2::{
 };
 
 use super::{Job, Real, UnitReader, compile::Written, files::Mounted, graph::flag, script};
-use crate::serve::work::{Full, Linking, Made, OutputFields};
+use crate::serve::{
+    direct::{DirectReading, Which},
+    work::{Full, Linking, Made, OutputFields},
+};
 
 type KeptImage = crate::serve::work::Image<Real>;
 
@@ -987,7 +990,7 @@ impl Generated<'_> {
         store: &crate::serve::direct::Stores,
         frame: &blaze_mem::frame::Frame,
     ) -> Result<Vec<hir_ty_codegen::v2::report::Reported>, String> {
-        use crate::serve::direct::{self, Which};
+        use crate::serve::direct;
         let workspace = &self.built.editable;
         // alloc: once per unit reported, a function each
         let mut reports = Vec::new();
@@ -1113,21 +1116,6 @@ pub(crate) fn test_roots(job: &Job, reader: &UnitReader, unit: usize) -> Result<
         .map_err(|it| it.what)
 }
 
-/// The store as a build reads it: with no lock, under the build's guard.
-struct Reading<'a> {
-    store: &'a blaze_cas::Reader,
-    guard: &'a blaze_cas::Guard,
-}
-
-impl blaze_codegen::driver::Lookup for Reading<'_> {
-    fn read(&self, key: &blaze_cas::Key) -> Result<Option<&[u8]>, String> {
-        match self.store.get(self.guard, key) {
-            Ok(entry) => Ok(entry.map(|it| it.bytes)),
-            Err(corrupt) => Err(corrupt.to_string()),
-        }
-    }
-}
-
 /// Whether a unit's link maps the dependency image: a dev executable, which runs on the
 /// daemon's code memory and takes edits. [`policy`] makes a unit live only when it
 /// [`runs_in_process`] (a binary's build or a test binary for the host that links the dev
@@ -1216,43 +1204,48 @@ pub(crate) fn generate<'db>(
     if policy.mode == BuildMode::Launched {
         // The view the start reads: what the next build asks what changed since.
         let view = blaze_codegen::backend::Frontend::view(&frontend);
-        let guard = blaze_cas::enter();
-        let store = Reading { store: &job.input.store, guard: &guard };
-        let build = Build::new(&backends, &frontend, &policy, &job.memo)
-            .owned_by(&u.target.name)
-            .keeping(&kept)
-            .recording(&job.input.store);
-        let start = match build.start(&asked, &roots.statics, "main", &store) {
-            Ok(start) => start,
-            Err(errors) => {
-                if let Some(put) = profile {
-                    unput_profile(job, put);
+        // The start's reads are direct reads into the task's frame: the build holds no guard and
+        // pins no page of the store's pool while it runs.
+        return blaze_mem::frame::current(|frame| {
+            let store = DirectReading::new(&job.input.reads, Which::Home, frame);
+            let build = Build::new(&backends, &frontend, &policy, &job.memo)
+                .owned_by(&u.target.name)
+                .keeping(&kept)
+                .recording(&job.input.store);
+            let start = match build.start(&asked, &roots.statics, "main", &store) {
+                Ok(start) => start,
+                Err(errors) => {
+                    if let Some(put) = profile {
+                        unput_profile(job, put);
+                    }
+                    return Ok(Err(refused(reader, mounted.root(), errors)));
                 }
-                return Ok(Err(refused(reader, mounted.root(), errors)));
-            }
-        };
-        let (prepared, puts) = super::run::launch::prepare(
-            job,
-            unit,
-            reader,
-            mounted,
-            build_time,
-            (&frontend, &build, &policy),
-            view,
-            start,
-            &store,
-        )?;
-        // The start's records join the unit's puts as a walked build's do (`compile` moves
-        // `built.puts` into them).
-        let mut built = Built::default();
-        built.puts = puts;
-        built.puts.extend(profile);
-        let launch = Some(blaze_core::lock::Lock::new("serve.unit.codegen.launch", Some(prepared)));
-        return Ok(Ok(Parts { built, roots, policy, image, build_time, kept, launch }));
+            };
+            let (prepared, puts) = super::run::launch::prepare(
+                job,
+                unit,
+                reader,
+                mounted,
+                build_time,
+                (&frontend, &build, &policy),
+                view,
+                start,
+                &store,
+            )?;
+            // The start's records join the unit's puts as a walked build's do (`compile` moves
+            // `built.puts` into them).
+            let mut built = Built::default();
+            built.puts = puts;
+            built.puts.extend(profile);
+            let launch = Some(blaze_core::lock::Lock::new("serve.unit.codegen.launch", Some(prepared)));
+            Ok(Ok(Parts { built, roots, policy, image, build_time, kept, launch }))
+        });
     }
-    let built = {
-        let guard = blaze_cas::enter();
-        let store = Reading { store: &job.input.store, guard: &guard };
+    // The walk's reads are direct reads into the task's frame: the build holds no guard and pins
+    // no page of the store's pool however long it runs. The describe records stay on the pool
+    // (`Records for Reader`): each is one lookup under a guard of its own call.
+    let built = blaze_mem::frame::current(|frame| {
+        let store = DirectReading::new(&job.input.reads, Which::Home, frame);
         Build::new(&backends, &frontend, &policy, &job.memo)
             .owned_by(&u.target.name)
             .verify_store(verify)
@@ -1263,7 +1256,7 @@ pub(crate) fn generate<'db>(
             // each describe made is among the build's puts.
             .recording(&job.input.store)
             .run_with_statics(&asked, &roots.statics, &roots.check_roots(origin), &store)
-    };
+    });
     match built {
         Ok(mut built) => {
             built.puts.extend(profile);

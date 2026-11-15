@@ -3480,7 +3480,7 @@ fn built_and_kept_of(
     let session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     ask_bodies_steps(&first);
     let _ = crate::serve::front_carry::bodies::take_refused();
-    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new())
+    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &stores_of(&reader), Vec::new())
         .unwrap_or_else(|error| panic!("the first build's keep: {}", error.what));
     let refused = crate::serve::front_carry::bodies::take_refused();
     assert!(
@@ -3533,7 +3533,7 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     // its entry.
     assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{ran:?}");
     let ran_steps: u64 = BODY_STEPS.iter().map(|&step| ran[step].ran).sum();
-    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new()).unwrap();
+    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &stores_of(&reader), Vec::new()).unwrap();
     assert_eq!(did.kept as u64, ran_steps, "every step run is kept: {did:?}");
     assert_eq!((did.refused, did.unkeyed), (0, 0), "{did:?}");
     assert_eq!((did.outside, did.in_macros, did.unmapped), (0, 0, 0), "{did:?}");
@@ -3558,7 +3558,7 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     let next = std::sync::Arc::new(alike_front(&ALIKE.replace("{ 3 }", "{ 4 }")));
     let session = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
-    let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader).unwrap();
+    let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &stores_of(&reader)).unwrap();
     assert_eq!((served.skipped, served.no_store), (false, false), "{served:?}");
     // Missed: `three`'s inference, its one owner's MIR and its borrow check. Served: every
     // other step the first build kept.
@@ -3593,10 +3593,10 @@ fn a_crate_is_served_and_a_run_kept_once_per_build() {
     assert_eq!(ask_bodies_steps(&first), 5);
     let ran = session.item_steps().unwrap();
     let ran_steps: u64 = BODY_STEPS.iter().map(|&step| ran[step].ran).sum();
-    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new()).unwrap();
+    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &stores_of(&reader), Vec::new()).unwrap();
     assert_eq!(did.kept as u64, ran_steps, "the MIR that reads a layout keeps its entry too: {did:?}");
     assert_eq!((did.refused, did.unkeyed), (0, 0), "{did:?}");
-    let (again, twice) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new()).unwrap();
+    let (again, twice) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &stores_of(&reader), Vec::new()).unwrap();
     assert_eq!((twice.kept, again.puts.len()), (0, 0), "a run is kept once: {twice:?}");
     for it in kept.puts {
         store.put(it.key, it.kind, &it.bytes).unwrap();
@@ -3606,9 +3606,9 @@ fn a_crate_is_served_and_a_run_kept_once_per_build() {
     let next = std::sync::Arc::new(alike_front(ALIKE));
     let _session = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
-    let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader).unwrap();
+    let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &stores_of(&reader)).unwrap();
     assert_eq!((served.skipped, served.served, served.missed), (false, did.kept, 0), "the control, the first serve: {served:?}");
-    let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader).unwrap();
+    let (_, served) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &stores_of(&reader)).unwrap();
     assert_eq!((served.skipped, served.served), (true, 0), "a crate is served once a revision: {served:?}");
     });
 }
@@ -3633,7 +3633,7 @@ fn owners_served_whole(seed: u64) -> Result<(), String> {
     let next = std::sync::Arc::new(core_front(OWNERS));
     let session = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
-    let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader)
+    let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &stores_of(&reader))
         .map_err(|error| format!("the serve: {}", error.what))?;
     ask_bodies_steps(&next);
     let read = session.item_steps().unwrap();
@@ -3747,7 +3747,7 @@ fn leaks_never_stale(seed: u64) -> Result<(), String> {
     let next = std::sync::Arc::new(core_front(&edited));
     let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
-    super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &reader)
+    super::deps::serve_bodies_of(&next, krate, &all_in_view, &BodySessions::default(), &no_marks(), &stores_of(&reader))
         .map_err(|error| format!("the serve: {}", error.what))?;
     ask_bodies_steps(&next);
     let fresh = std::sync::Arc::new(core_front(&edited));
@@ -3807,7 +3807,7 @@ fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
     let mut next = std::sync::Arc::new(core_front(OWNERS));
     let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
-    let (puts, first) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+    let (puts, first) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &stores_of(&reader))
         .map_err(|error| format!("the first serve: {}", error.what))?;
     if first.session != Opened::New {
         return Err(format!("the first serve had a session already: {first:?}"));
@@ -3846,7 +3846,7 @@ fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
     }
     // The commit took the crate's id of the first snapshot: taken again in the new one.
     let krate = next.krate(0).unwrap();
-    let (_, second) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+    let (_, second) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &stores_of(&reader))
         .map_err(|error| format!("the second serve: {}", error.what))?;
     ask_bodies_steps(&next);
     super::deps::item_errors(&served).map_err(|error| format!("the served database's item store: {}", error.what))?;
@@ -3920,7 +3920,7 @@ fn served_past_lost_puts(seed: u64) -> Result<bodies::Did, String> {
         // Its puts are dropped: the loop never puts them. The crate taken in this snapshot: an
         // edit's commit took the last one's id.
         let krate = next.krate(0).unwrap();
-        let (_lost, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+        let (_lost, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &stores_of(&reader))
             .map_err(|error| format!("serve {at}: {}", error.what))?;
         if at > 0 && did.session != Opened::Kept {
             return Err(format!("serve {at} did not serve from the kept session: {did:?}"));
@@ -4055,7 +4055,7 @@ fn renominal_never_stale(seed: u64, case: &Renominal, carried: bool) -> Result<(
         let mut next = std::sync::Arc::new(core_front(first_text));
         let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
         let krate = next.krate(0).unwrap();
-        let (puts, _) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+        let (puts, _) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &stores_of(&reader))
             .map_err(|error| format!("the serve: {}", error.what))?;
         ask_bodies_steps(&next);
         let read = served.item_steps().unwrap();
@@ -4077,7 +4077,7 @@ fn renominal_never_stale(seed: u64, case: &Renominal, carried: bool) -> Result<(
             });
             // The commit took the crate's id of the first snapshot: taken again in the new one.
             let krate = next.krate(0).unwrap();
-            super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+            super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &stores_of(&reader))
                 .map_err(|error| format!("the second serve: {}", error.what))?;
             ask_bodies_steps(&next);
         }
@@ -4220,7 +4220,7 @@ fn dep_renominal(seed: u64, case: &DepRenominal, carried: bool, renamed: bool) -
         let mut next = std::sync::Arc::new(two_crate_front(case.app, if carried { &dep_before } else { &dep_after }));
         let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
         let krate = next.krate(0).unwrap();
-        let (puts, _) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+        let (puts, _) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &stores_of(&reader))
             .map_err(|error| format!("the serve: {}", error.what))?;
         let bodies = ask_bodies_steps(&next);
         let [infer, _, _] = BODY_STEPS;
@@ -4257,7 +4257,7 @@ fn dep_renominal(seed: u64, case: &DepRenominal, carried: bool, renamed: bool) -
             });
             // The commit took `app`'s crate id of the first snapshot: taken again in the new one.
             let krate = next.krate(0).unwrap();
-            super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+            super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &stores_of(&reader))
                 .map_err(|error| format!("the second serve: {}", error.what))?;
             ask_bodies_steps(&next);
         }

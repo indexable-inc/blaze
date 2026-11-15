@@ -237,6 +237,98 @@ fn an_entry_is_kept_apart_from_the_images_and_found_by_its_key_under_any_set() {
     assert!(other.contains("other bytes") && other.contains("first differ at byte 0"), "{other}");
 }
 
+/// The invariant: a task that reads the store through [`DirectReading`] pins no page of the
+/// store's pool and loads none, however many records it reads, and holds no guard; the same
+/// reads through [`blaze_kernel::Reading`] under a guard load and pin the pages their records are
+/// on until the guard's task ends (every table retired meanwhile waits on it). The values are
+/// the same either way, and `has` is an index lookup that leaves no pin.
+///
+/// The control is the `Reading`: its pinned bytes rise by the pages of the records it read, so a
+/// census that did not move under `DirectReading` is a read that pinned nothing, not a census
+/// that cannot move. The store is the test's own, on a real file system with a loader of its own
+/// (a daemon's), so the census (`Store::pool_census`) counts no other test's reads and the
+/// reads are the daemon's (`Reads::Native`).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_task_reading_directly_pins_no_page_where_one_reading_by_guard_does() {
+    use crate::serve::direct::{DirectReading, Reads, Stores, Which};
+    use blaze_codegen::driver::Lookup;
+    use blaze_kernel::Get;
+
+    const PAGE: u64 = 64 << 10;
+    let value = |n: u64| -> Vec<u8> {
+        // Noise a store cannot shrink, so each value takes whole pages of a pack.
+        let mut state = n.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..40_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[3]
+            })
+            .collect()
+    };
+    let held = blaze_core::temp::TempDir::for_test("blaze-direct-reading-");
+    let root = held.path().to_path_buf();
+    let loader = || crate::serve::direct::pool::thread(&root);
+    {
+        let mut driven = blaze_cas::Driven::open_with(&root, loader()).unwrap();
+        for n in 0..5 {
+            driven.store().put(Key(key(n as u8)), Kind::Code, &value(n)).unwrap();
+        }
+        driven.flush().unwrap();
+    }
+    // Reopened: the pool holds only what the opening loaded.
+    let mut driven = blaze_cas::Driven::open_with(&root, loader()).unwrap();
+    let reader = driven.store().reader();
+    let stores = Stores::new(reader.clone(), reader.clone(), Reads::Native { root: root.as_path().into() });
+    let absent = Key(key(200));
+    let census = |driven: &mut blaze_cas::Driven| driven.store().pool_census().expect("the store has a pool");
+    // The opening's scan loaded and pinned the pack's pages; its pins go once their grace has
+    // passed (other tests of this process hold guards of their own meanwhile, so the sweep is
+    // asked until it has).
+    let opened = census(&mut driven);
+    let mut freed = 0;
+    for _ in 0..10_000 {
+        freed += driven.store().evict_pool(u64::MAX);
+        if freed >= opened.loaded {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let before = census(&mut driven);
+    assert_eq!((before.loaded, before.pinned), (0, 0), "the pool is emptied to begin with: {before:?}");
+
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+        let reading = DirectReading::new(&stores, Which::Home, frame);
+        for n in 0..5 {
+            let key = Key(key(n as u8));
+            assert_eq!(reading.has(&key), Ok(true), "record {n}");
+            assert_eq!(reading.get(&key), Ok(Some(&value(n)[..])), "record {n}");
+            assert_eq!(Lookup::read(&reading, &key), Ok(Some(&value(n)[..])), "record {n}");
+        }
+        assert_eq!(reading.has(&absent), Ok(false));
+        assert_eq!(reading.get(&absent), Ok(None));
+        let during = census(&mut driven);
+        assert_eq!((during.loaded, during.pinned), (0, 0), "a task's direct reads used the pool: {during:?}");
+    });
+    let after = census(&mut driven);
+    assert_eq!((after.loaded, after.pinned), (0, 0), "the reads left pages in the pool: {after:?}");
+
+    // The control: the same reads under a guard load their pages and pin them while it is held.
+    let guard = blaze_cas::enter();
+    let reading = blaze_kernel::Reading { reader: &reader, guard: &guard };
+    for n in 0..5 {
+        assert_eq!(reading.get(&Key(key(n as u8))), Ok(Some(&value(n)[..])), "record {n}");
+    }
+    let pinned = census(&mut driven).pinned;
+    assert!(
+        pinned >= PAGE,
+        "the control's reads pinned no page ({pinned} bytes): the census cannot tell the two apart"
+    );
+    drop(guard);
+}
+
 #[test]
 fn blaze_dep_images_is_check_verify_or_unset() {
     let env = |value: &str| {
