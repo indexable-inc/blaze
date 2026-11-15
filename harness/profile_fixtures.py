@@ -17,6 +17,7 @@ again after changing a fixture or the history's schema, and commit what it write
 """
 
 import asyncio
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -40,10 +41,24 @@ class Config:
     out: str
 
 
+# The profile's schema version, read from its one home (crates/blaze-profile/src/schema.rs,
+# `VERSION`): every file of a history says it in its footer's `blaze.schema` key, and the history
+# refuses a file that says none ("its footer says no `blaze.schema` version: no blaze writer wrote
+# it").
+def schema_version() -> int:
+    """`VERSION` of crates/blaze-profile/src/schema.rs."""
+    path = Path(__file__).resolve().parent.parent / "crates/blaze-profile/src/schema.rs"
+    found = re.search(r"^pub const VERSION: u32 = (\d+);", path.read_text(), re.M)
+    if found is None:
+        sys.exit(f"{SCRIPT}: {path} has no `pub const VERSION: u32 = N;`")
+    return int(found.group(1))
+
+
 def copy(select: str, file: str, metadata: str = "") -> str:
-    """`COPY` of `select` to the fixture's `file`; `metadata`: its KV_METADATA's struct."""
-    kv = f", KV_METADATA {metadata}" if metadata else ""
-    return f"COPY ({select}) TO '{file}' (FORMAT parquet{kv});"
+    """`COPY` of `select` to the fixture's `file`, its footer saying `blaze.schema`; `metadata`:
+    more of its KV_METADATA's struct, as `'key': 'value'` pairs in braces."""
+    pairs = ", ".join(it for it in (f"'blaze.schema': '{schema_version()}'", metadata.strip().removeprefix("{").removesuffix("}").strip()) if it)
+    return f"COPY ({select}) TO '{file}' (FORMAT parquet, KV_METADATA {{{pairs}}});"
 
 
 def builds(daemon_cpu: tuple[int, int] | None = None) -> str:
