@@ -1123,6 +1123,21 @@ impl Crate {
     ) -> Crate {
         db.write(write, |db| {
             let root = root_path(&*db, data.root_file_id);
+            // A library crate's fields are `HIGH` (`graph_durability`, `crate_durability`):
+            // what a sealed crate's cover reads may read nothing below it. A caller that
+            // makes one with less is named here, where the crate is made, since the cost
+            // shows far away (every summary of the crate's functions is made a row:
+            // agents/annoyances/proofs-1113-17.json).
+            if !matches!(data.origin, CrateOrigin::Local { .. }) && durability != Durability::HIGH {
+                tracing::warn!(
+                    target: "blaze",
+                    write,
+                    origin = ?data.origin,
+                    durability = ?durability,
+                    root = %root,
+                    "a library crate is made below HIGH"
+                );
+            }
             let lints = LintOptions::default();
             let content =
                 Crate::content_of(&*db, root, &data, &extra, &workspace, &cfg, &env, &lints);

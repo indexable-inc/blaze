@@ -1,0 +1,19 @@
+{
+ "id": "proofs-1113-21",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "my own shell command to blaze-vm",
+ "what": "To send a changed Rust file to the VM with a script I wrote `ix shell blaze-vm -- bash -s < <(cat prove.rs)`: that gives the Rust file to bash as its program. It ran as root in /root; I looked at once for files made there in the last minutes and found none of mine (the `head -2` after it closed the pipe early).",
+ "cost": "a minute, and a root shell fed a file that was not a script",
+ "cause": "two things wanted stdin in one command (the script and the file), and I gave stdin to the wrong one",
+ "whys": [
+  "a source file was run as a shell script",
+  "the command had one stdin and two inputs",
+  "my helper scripts take a tree or a git commit, and none takes one changed file with a command"
+ ],
+ "class": "an ad hoc remote command built by hand where a helper should exist",
+ "prevention": "send a changed file as `cat file | ix shell .. bash -c \"<script that first reads stdin into the file>\"` (what I did next), or commit and use tipvm2.sh; a helper `filevm.sh <path> <command>` if it recurs. Not built.",
+ "workaround": "",
+ "fix": "",
+ "state": "accepted"
+}
