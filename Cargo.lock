@@ -1298,6 +1298,8 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-sim",
+ "corosensei",
+ "crossbeam-channel",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
  "indexmap",
