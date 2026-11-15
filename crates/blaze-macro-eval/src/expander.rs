@@ -59,7 +59,7 @@ use std::{
     },
 };
 
-use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
+use base_db::{Crate, CrateKey, Db, Nonce, ProcMacroLoadingError};
 use blaze_graph::Key;
 use blaze_hash::SharedMap;
 use blaze_ids::ContentId;
@@ -178,7 +178,9 @@ impl fmt::Debug for Macros {
 struct Library {
     /// The daemon's, which says where this crate's expansions are kept.
     macros: Arc<Macros>,
-    krate: Crate,
+    /// The crate, by its key: an id of it would die with its arena, which a write to the crate
+    /// (its expanders given among them) drops, while the library is kept across snapshots.
+    krate: CrateKey,
     /// The crate's name, as an error about one of its macros says it.
     name: Box<str>,
     toolchain: ContentId,
@@ -195,12 +197,12 @@ struct Library {
     seen: verdicts::Seen,
     /// Each calling crate's session: its calls run in order, each that runs from its state or
     /// changes it holding its turn in [`Library::turns`].
-    sessions: SharedMap<Crate, Arc<SessionOf>>,
+    sessions: SharedMap<CrateKey, Arc<SessionOf>>,
     /// The turns of its sessions ([`crate::turn`]): scheduler holds, so a call waiting for one
     /// holds no thread while the call holding it runs its macro.
     turns: Turns,
     /// Each calling crate's roots as its expansions are kept against them ([`Library::kept_roots`]).
-    kept_roots: SharedMap<Crate, Arc<KeptRoots>>,
+    kept_roots: SharedMap<CrateKey, Arc<KeptRoots>>,
     /// For a crate that settles, the settled state its sessions' first calls left, the first
     /// seen since it loaded ([`Evaluated::same_from_either_state`]): another first call that
     /// leaves another state shows the state depends on which call ran first.
@@ -426,7 +428,7 @@ impl Library {
     fn session(&self, db: &Db, calling: Crate) -> Arc<SessionOf> {
         let now = blaze_memo::Database::memo(db).snapshot_epoch();
         // clone: the session's handle, held for one call
-        let session = Arc::clone(self.sessions.pin().get_or_insert_with(calling, SessionOf::new));
+        let session = Arc::clone(self.sessions.pin().get_or_insert_with(calling.key(db), SessionOf::new));
         {
             let mut held = session.lock();
             if held.at != Some(now) {
@@ -468,7 +470,7 @@ impl Library {
             kept.at == at && kept.made_of.iter().map(Option::as_deref).eq(made_of.iter().copied())
         };
         let pinned = self.kept_roots.pin();
-        if let Some(kept) = pinned.get(&calling).filter(|it| same(it)) {
+        if let Some(kept) = pinned.get(&calling.key(db)).filter(|it| same(it)) {
             return Arc::clone(kept); // clone: the roots' handle, held for one expansion
         }
         let kept = Arc::new(KeptRoots {
@@ -486,7 +488,7 @@ impl Library {
                 &blaze_vfs::outside::Looks::none(),
             ),
         });
-        pinned.insert(calling, Arc::clone(&kept)); // clone: as above
+        pinned.insert(calling.key(db), Arc::clone(&kept)); // clone: as above
         kept
     }
 }
@@ -787,7 +789,7 @@ fn load_on(
     let library = Arc::new(Library {
         // alloc: once a proc-macro crate loaded
         macros: Arc::clone(macros), // clone: a refcount, once a proc-macro crate loaded
-        krate,
+        krate: krate.key(db),
         name,
         toolchain,
         engine,
@@ -1488,7 +1490,7 @@ impl Evaluated {
         if shown {
             given.part("same from either state", &[1]);
         }
-        let key = RunKey { code: library.code.get(db, library.krate), given: given.finish() };
+        let key = RunKey { code: library.code.get(db, db.krate(library.krate)), given: given.finish() };
         let mut inputs = Calling::new(call.env);
         // What its key, reads and shape are written against: the calling crate's package and
         // `OUT_DIR` (`proc_macro_api::kept::roots`).
@@ -1673,7 +1675,7 @@ impl Evaluated {
         let mut tracked = Vec::new();
         // alloc: as above, the files the macro's code included
         let mut included = Vec::new();
-        code::included(db, library.krate, &mut included);
+        code::included(db, db.krate(library.krate), &mut included);
         let traced = assemble_seen(
             Self::lines(&ran, call.current_dir, &included, &mut tracked),
             &mut inputs,
@@ -1694,7 +1696,7 @@ impl Evaluated {
         let marked =
             view.kept_bytes(&traced, bytes.as_deref(), proc_macro_api::kept::left(&keyed, &view));
         if marked.relinked {
-            library.kept_roots.pin().remove(&calling);
+            library.kept_roots.pin().remove(&calling.key(db));
         }
         // Whether what it read fixes what it gave: always for a crate with no state; for one
         // that settles, once it gave the same from either state; never for another with a
@@ -1864,7 +1866,7 @@ impl ProcMacroExpander for Evaluated {
         db: &Db,
         call: ProcMacroCall<'_>,
     ) -> Result<Expanded, ProcMacroExpansionError> {
-        let calling = self.library.krate;
+        let calling = db.krate(self.library.krate);
         self.expand_keyed(db, calling, call)
     }
 
