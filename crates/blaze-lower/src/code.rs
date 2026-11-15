@@ -2170,6 +2170,9 @@ pub(crate) enum Plant {
     /// above that reads its bytes (`include_str!`) is built under a key that does not move
     /// when they do, a stale unit.
     Unread,
+    /// A function with a `///` comment keeps its body in its crate's interface and surface,
+    /// as it did until 2026-11-15: a body edit there makes every crate above again.
+    Documented,
 }
 
 #[cfg(test)]
@@ -2269,6 +2272,10 @@ pub(crate) fn left_out(body: &SyntaxNode, by: Reader) -> bool {
                         .filter_map(NodeOrToken::into_token)
                         .any(|it| it.kind() == SyntaxKind::IDENT && it.text() == "inline")
             }
+            // A `///` comment, which the parser gives the item as a node of its own: the
+            // attribute `doc`, inert, as `#[doc = "..."]` is (an `ATTR` above), and no
+            // reader of the body's.
+            SyntaxKind::DOC_COMMENT => !planted(Plant::Documented),
             SyntaxKind::VISIBILITY | SyntaxKind::ABI | SyntaxKind::NAME => true,
             SyntaxKind::GENERIC_PARAM_LIST => {
                 front || lifetimes_only(&node) || planted(Plant::Generic)

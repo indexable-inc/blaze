@@ -1491,3 +1491,27 @@ fn what_could_give_a_constant_its_callers_position_is_flagged() {
 }
 
 
+/// A `///` comment on a function (a `DOC_COMMENT` node of its item) is the inert attribute
+/// `doc`: a plain body under one is left out of the interface and the surface as one under
+/// `#[doc = "..."]` or none is, so its edit moves neither; an `#[inline]` body under one stays
+/// in the interface (a build above compiles a copy) and leaves the surface, and a `const fn`'s
+/// stays in both. With the planted bug (the comment taken as no inert attribute) the plain
+/// body's edit moves both: the control.
+#[test]
+fn a_documented_body_is_left_out_as_an_undocumented_one_is() {
+    // (what is above `pub`, the edit, whether the interface moves, whether the surface does)
+    let moves = |head: &str, before: &str, after: &str| {
+        let text = |body: &str| format!("/// Made up: `x`.\n/// More.\n{head}pub fn f(x: u64) -> u64 {{\n    x ^ {body}\n}}\n");
+        let (was, now) = (code(&text(before)), code(&text(after)));
+        (was.interface != now.interface, was.surface != now.surface)
+    };
+    assert_eq!(moves("", "0", "1"), (false, false), "a plain body");
+    assert_eq!(moves("#[inline]\n", "0", "1"), (true, false), "an #[inline] body");
+    let constant = |body: &str| code(&format!("/// Made up.\npub const fn f(x: u64) -> u64 {{\n    x ^ {body}\n}}\n"));
+    assert_ne!(constant("0").surface, constant("1").surface, "a const fn's body");
+    assert_eq!(
+        planting(Plant::Documented, || moves("", "0", "1")),
+        (true, true),
+        "the control: a plain body under `///` kept"
+    );
+}
