@@ -51,6 +51,8 @@ mod said;
 mod slab;
 #[blaze::sans_io]
 pub(super) mod standing;
+#[blaze::sans_io]
+mod vouch;
 mod written;
 #[cfg(test)]
 mod tests;
@@ -64,6 +66,12 @@ thread_local! {
     /// The planted bug of `serve::tests`' certificate control: a build's certificate is written
     /// as it ends ([`Jobs::heard`]), before what it left to settle after its answer is durable.
     pub(super) static CERTIFY_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of `serve::tests`' vouch control: no placed output is vouched for
+    /// ([`Jobs::vouch_later`]), so the next request's check hashes each.
+    pub(super) static PLANT_NO_VOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many outputs a request's check hashed (`Jobs::certify_told`): what `serve::tests`'
+    /// vouch oracle counts.
+    pub(super) static HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Set while a front-end write's task runs [`Writer::apply`] ([`Does::Write`]) on this
     /// thread: what a test's writer reads to tell an apply on a task from one on the loop.
     pub(super) static IN_WRITE_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -4655,6 +4663,25 @@ enum Own {
     /// The stamps of the local mounts' leaves, asked for job `job`'s start ([`Sweeping`]) or
     /// for its view ([`Stage::Sweep`]) ([`Jobs::swept`]).
     Sweep { job: JobId },
+    /// A placed output's vouch ([`Vouching`]), by its serial: its timer, a look at the file or
+    /// its read.
+    Vouch { serial: u32 },
+}
+
+/// A placed output whose store's look was inside its racy window, vouched for once that has
+/// passed and nothing runs ([`vouch`], [`Jobs::vouch_due`]).
+
+/// How long a vouch due while a request's check runs waits before it looks again.
+const VOUCH_IDLE: Duration = Duration::from_millis(50);
+
+struct Vouching {
+    serial: u32,
+    vouch: vouch::Vouch,
+    /// Due while a job ran: no timer is in flight, and the job's winding up begins it once
+    /// none runs ([`Jobs::vouch_parked`]).
+    parked: bool,
+    /// `a placed output is vouched for`, open from its first look to its end.
+    span: Option<tracing::Span>,
 }
 
 /// A start held while its sweep of the local mounts' leaves is with the driver
@@ -4952,6 +4979,10 @@ pub struct Jobs<S: Steps> {
     commit_steps: u64,
     /// When a wait whose puts no commit is taking looks again ([`RECHECK`]), if one is.
     recheck: Option<Duration>,
+    /// The placed outputs to vouch for, at most one a path ([`Jobs::vouch_due`]).
+    vouching: Vec<Vouching>,
+    /// The next vouch's serial: a completion of one replaced is told to none.
+    next_vouch: u32,
 }
 
 impl<S: Steps> Builder for Jobs<S> {
@@ -5053,6 +5084,8 @@ impl<S: Steps> Jobs<S> {
             store_heard: Duration::ZERO,
             commit_steps: 0,
             recheck: None,
+            vouching: Vec::new(), // alloc: none until an output is placed inside its racy window
+            next_vouch: 0,
         })
     }
 
@@ -9545,6 +9578,8 @@ impl<S: Steps> Jobs<S> {
     ) {
         // clone: the driver's effect owns the file's name, once per placement
         let Some(file) = self.paths.files[path as usize].clone() else { return };
+        // A vouch of what was placed there before is of another file.
+        self.vouching.retain(|it| it.vouch.path != path);
         match self.own_tag(Own::Record { job: id, path, key }) {
             Ok(tag) => {
                 self.begin_placing(id, path);
@@ -9554,6 +9589,184 @@ impl<S: Steps> Jobs<S> {
             }
             Err(error) => self.placing_failed(id, path, error),
         }
+    }
+
+    /// The placement at path id `path` of the bytes of `key`, recorded with the store's look
+    /// `stamp`: where that look was inside its racy window, as every look right after a
+    /// rename is, it is vouched for once the window has passed ([`vouch`], [`Jobs::vouch_due`]),
+    /// so the next request's check stats the output and hashes nothing.
+    fn vouch_later(&mut self, w: &mut World<'_, S>, path: u32, key: blaze_cas::Key, stamp: Option<blaze_cas::PlacedStamp>) {
+        self.vouching.retain(|it| it.vouch.path != path);
+        #[cfg(test)]
+        if PLANT_NO_VOUCH.get() {
+            return;
+        }
+        let Some(placed) = stamp else { return };
+        let Some(vouch) = vouch::Vouch::of(path, key.0, placed.stamp, placed.looked_ns) else { return };
+        let serial = self.next_vouch;
+        self.next_vouch = self.next_vouch.wrapping_add(1);
+        // alloc: one entry a path placed inside its window, until vouched for
+        self.vouching.push(Vouching { serial, vouch, parked: false, span: None });
+        self.vouch_wait(w, serial);
+    }
+
+    /// Vouch `serial` waits, on a timer of the driver's, for its instant by the file system's
+    /// clock; and while a request's check runs, which its read and hash on the loop would hold
+    /// up, for [`VOUCH_IDLE`] at a time.
+    fn vouch_wait(&mut self, w: &mut World<'_, S>, serial: u32) {
+        let Some(at) = self.vouching.iter().position(|it| it.serial == serial) else { return };
+        let left = self.vouching[at].vouch.due_ns().map_or(0, |due| due.saturating_sub(w.wall_ns));
+        let after = match left {
+            0 => VOUCH_IDLE,
+            left => Duration::from_nanos(left),
+        };
+        match self.own_tag(Own::Vouch { serial }) {
+            Ok(tag) => w.effects.push(Effect::Timer { after, tag }),
+            Err(_) => drop(self.vouching.swap_remove(at)),
+        }
+    }
+
+    /// How many placed outputs wait to be vouched for or are being vouched for.
+    #[cfg(test)]
+    pub(super) fn vouching(&self) -> usize {
+        self.vouching.len()
+    }
+
+    /// Vouch `serial`'s timer is done: it begins, its first look asked of the driver, if
+    /// nothing runs and its instant has come. While a job runs it is parked, begun as the
+    /// jobs wind up with none left ([`Jobs::vouch_parked`]); else it waits again.
+    fn vouch_due(&mut self, w: &mut World<'_, S>, serial: u32) {
+        let Some(at) = self.vouching.iter().position(|it| it.serial == serial) else { return };
+        if !self.idle() {
+            self.vouching[at].parked = true;
+            return;
+        }
+        let begun = match self.certify.checks() {
+            true => None,
+            false => self.vouching[at].vouch.begin(w.wall_ns),
+        };
+        match begun {
+            Some(next) => self.vouch_next(w, serial, next),
+            None => self.vouch_wait(w, serial),
+        }
+    }
+
+    /// Each vouch parked while a job ran ([`Jobs::vouch_due`]), begun once no job runs.
+    fn vouch_parked(&mut self, w: &mut World<'_, S>) {
+        if !self.idle() || !self.vouching.iter().any(|it| it.parked) {
+            return;
+        }
+        // alloc: the serials parked, once a winding up with one
+        let parked: Vec<u32> = self.vouching.iter_mut().filter(|it| it.parked).map(|it| {
+            it.parked = false;
+            it.serial
+        }).collect();
+        for serial in parked {
+            self.vouch_due(w, serial);
+        }
+    }
+
+    /// What vouch `serial` does next: a look or the read asked of the driver, or its end.
+    fn vouch_next(&mut self, w: &mut World<'_, S>, serial: u32, next: vouch::Next) {
+        let Some(at) = self.vouching.iter().position(|it| it.serial == serial) else { return };
+        let path = self.vouching[at].vouch.path;
+        // clone: the driver's effect owns the file's name, once a step
+        let file = self.paths.files[path as usize].clone();
+        let names = &self.paths.names;
+        // clone: a span's handle, once a step
+        let span = self.vouching[at]
+            .span
+            .get_or_insert_with(|| {
+                tracing::info_span!(target: "blaze", "a placed output is vouched for once its racy window passed", function = &*names[path as usize])
+            })
+            .clone();
+        let _entered = span.enter();
+        let effect = match (next, file) {
+            (vouch::Next::Look | vouch::Next::Read, None) => Err("the output names no file under the driver's root"),
+            (vouch::Next::Look | vouch::Next::Read, Some(file)) => match self.own_tag(Own::Vouch { serial }) {
+                Ok(tag) if next == vouch::Next::Look => {
+                    let mut files = blaze_core::Names::with_capacity(1, file.as_str().len() + 1);
+                    files.push(&file);
+                    // alloc: the effect's batch of one name, once a look
+                    Ok(Effect::Stamp { files: Arc::new(files), tag })
+                }
+                Ok(tag) => Ok(Effect::ReadAll { file, tag }),
+                Err(_) => Err("the loop has no tag left for a look"),
+            },
+            (vouch::Next::Vouched { stamp, looked_ns }, _) => {
+                drop(_entered);
+                let it = self.vouching.swap_remove(at);
+                self.vouched(w, it.vouch, stamp, looked_ns);
+                return;
+            }
+            (vouch::Next::Dropped(why), _) => Err(why),
+        };
+        match effect {
+            Ok(effect) => w.effects.push(effect),
+            Err(why) => {
+                tracing::info_span!(target: "blaze", "a placed output is not vouched for", why).in_scope(|| {});
+                drop(_entered);
+                self.vouching.swap_remove(at);
+            }
+        }
+    }
+
+    /// A look or the read of vouch `serial` is done.
+    fn vouch_told(&mut self, w: &mut World<'_, S>, serial: u32, done: Done) {
+        let Some(at) = self.vouching.iter().position(|it| it.serial == serial) else { return };
+        if self.vouching[at].vouch.due_ns().is_some() {
+            // Its timer: nothing else is asked of the driver before it begins.
+            return self.vouch_due(w, serial);
+        }
+        let busy = !self.idle() || self.certify.checks();
+        let vouching = &mut self.vouching[at];
+        let next = match done {
+            Done::Stamped(stamps) => {
+                let stamp = match stamps.as_slice() {
+                    [stamp] if !stamp.is_gone() && !stamp.is_unknown() && stamp.mode & blaze_core::S_IFMT == blaze_core::S_IFREG => {
+                        Some(*stamp)
+                    }
+                    _ => None,
+                };
+                vouching.vouch.looked(stamp)
+            }
+            // A request began since the read was asked: its bytes are let go unhashed, and the
+            // vouch begins again once nothing runs.
+            Done::Read(_) if busy => {
+                vouching.vouch.rewind();
+                vouching.span = None;
+                return self.vouch_due(w, serial);
+            }
+            Done::Read(bytes) => {
+                let _hash = vouching.span.as_ref().map(|it| {
+                    it.in_scope(|| tracing::info_span!(target: "blaze", "hash the placed output", bytes = bytes.len()).entered())
+                });
+                let content = certify::content_of(&bytes, Some(vouching.vouch.content));
+                vouching.vouch.read(Some(content))
+            }
+            Done::Failed(_) => vouch::Next::Dropped("a look at the output or its read failed"),
+            _ => vouch::Next::Dropped("the driver answered a look or a read with something else"),
+        };
+        self.vouch_next(w, serial, next);
+    }
+
+    /// Vouch `vouch` ended with the output holding the bytes placed under `stamp`, steady as
+    /// looked at at `looked_ns`: the jobs' record keeps that look in place of the store's
+    /// racy one, where the path still holds that placement and nothing is placed there now,
+    /// and each evidence whose request's plan names the path keeps it too. What the next
+    /// certificate's write and the next check read: no output hashed.
+    fn vouched(&mut self, w: &mut World<'_, S>, vouch: vouch::Vouch, stamp: blaze_core::Stamp, looked_ns: u64) {
+        let path = vouch.path;
+        if self.flying.contains_key(&path) {
+            return;
+        }
+        let Some(placement) = self.paths.placed[path as usize].as_mut() else { return };
+        let as_placed = placement.key.0 == vouch.content && placement.stamp.is_some_and(|it| it.stamp == vouch.placed);
+        if !as_placed || placement.meta.is_none() {
+            return;
+        }
+        placement.stamp = Some(blaze_cas::PlacedStamp { stamp, looked_ns });
+        self.certify_vouched(w, path, stamp, looked_ns, vouch.content);
     }
 
     /// What the store placed.
@@ -9684,11 +9897,14 @@ impl<S: Steps> Jobs<S> {
                 self.end_placing(id, path);
                 match (done, &mut self.paths.placed[path as usize]) {
                     (Done::Stat(Some(meta)), Some(placement)) if placement.key == key => {
-                        placement.meta = Some(meta)
+                        placement.meta = Some(meta);
+                        let stamp = placement.stamp;
+                        self.vouch_later(w, path, key, stamp);
                     }
                     (_, placement) => *placement = None,
                 }
             }
+            Own::Vouch { serial } => self.vouch_told(w, serial, done),
             Own::Look { job: id, path, key, executable } => {
                 let unchanged = matches!(
                     (&done, &self.paths.placed[path as usize]),
@@ -10831,6 +11047,8 @@ impl<S: Steps> Jobs<S> {
     fn wind_up_judging(&mut self, w: &mut World<'_, S>, judge: bool) {
         let began = blaze_profile::clock::mono_ns();
         self.wind_up_timed(w, judge);
+        // The jobs that finished in it may leave none running: what waited for that begins.
+        self.vouch_parked(w);
         let took = blaze_profile::clock::mono_ns() - began;
         for job in self.jobs.values_mut() {
             job.wind_ups += 1;

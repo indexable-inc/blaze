@@ -3247,6 +3247,53 @@ fn the_oracle_catches_a_start_that_drops_the_marks() {
     assert!(kept < dropped, "the planted start read {dropped} bytes, the real one {kept}");
 }
 
+/// The second build of `/w` on seed `seed`, asked once the first answered, settled and had
+/// each output it placed vouched for (`job::vouch`: the store's look right after its rename is
+/// inside the racy window): how many plan loads it ran (0: no job, the certificate answered)
+/// and how many outputs its check hashed. `vouches: false` plants the bug the control
+/// catches: nothing is vouched for.
+fn after_the_window(seed: u64, vouches: bool) -> (usize, usize, Option<Response>) {
+    OUTPUT.set(true);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    super::job::PLANT_NO_VOUCH.set(!vouches);
+    let first = build_settled(&mut daemon);
+    super::job::PLANT_NO_VOUCH.set(false);
+    assert_eq!(first.last(), Some(&Response::Done { ok: true }), "seed {seed}");
+    turn_until(&mut daemon, |it| it.vouching() == 0);
+    PLANS.with(|it| it.set(0));
+    super::job::HASHED.set(0);
+    let got = build_settled(&mut daemon);
+    OUTPUT.set(false);
+    (PLANS.with(Cell::get), super::job::HASHED.get(), got.last().cloned())
+}
+
+/// The invariant: a request asked again after its build placed its outputs, with nothing
+/// changed and the racy window past, is answered by its certificate and hashes no output:
+/// each was vouched for between the requests, not on this one's path (the gauntlet's second
+/// no-op after a cold build hashed five programs, 365 ms, 2026-11-15).
+#[test]
+fn a_request_after_the_racy_window_hashes_no_output_its_build_placed() {
+    for seed in [21, 22, 23] {
+        let (loads, hashed, done) = after_the_window(seed, true);
+        assert_eq!(done, Some(Response::Done { ok: true }), "seed {seed}");
+        assert_eq!(loads, 0, "seed {seed}: the request nothing changed ran a job");
+        assert_eq!(hashed, 0, "seed {seed}: the request's check hashed {hashed} outputs");
+    }
+}
+
+/// The control: with nothing vouched for, the same request's check hashes the program's
+/// output, which the oracle above counts.
+#[test]
+fn the_oracle_catches_outputs_left_unvouched() {
+    let (loads, hashed, done) = after_the_window(21, false);
+    assert_eq!(done, Some(Response::Done { ok: true }));
+    assert_eq!(loads, 0);
+    assert!(hashed > 0, "unvouched, the request's check hashed nothing");
+}
+
 /// Rule 26, the edit after a start: a build after a stop, a start (database empty, nothing
 /// restored) and an edit gives byte for byte what a daemon that never stopped gives for the
 /// same edit, and what a fresh home gives for the edited checkout.

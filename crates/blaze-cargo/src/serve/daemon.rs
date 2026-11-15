@@ -2281,6 +2281,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.jobs.next_deadline()
     }
 
+    /// How many placed outputs wait to be vouched for (`job::vouch`).
+    #[cfg(test)]
+    pub(super) fn vouching(&self) -> usize {
+        self.jobs.vouching()
+    }
+
     /// The key the jobs' record holds for the output at `path` ([`super::job::Jobs::placed_key`]).
     #[cfg(test)]
     pub(super) fn placed_key(&self, path: &str) -> Option<[u8; 32]> {

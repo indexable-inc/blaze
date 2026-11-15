@@ -291,6 +291,11 @@ impl Certify {
         }
     }
 
+    /// Whether a request's check is under way.
+    pub(super) fn checks(&self) -> bool {
+        !self.checking.is_empty()
+    }
+
     /// Whether a slot is being written: what the daemon's exit waits for (H8).
     pub(in crate::serve) fn slots_writing(&self) -> bool {
         !self.slots.is_empty()
@@ -529,8 +534,16 @@ fn looked_as(kind: LookKind) -> Looked {
 /// The identity of an output's `bytes` in the form the record names it by (`wanted`): the
 /// file hashed whole (`output_key`), or, for a file blaze's linker made, the root of the
 /// linker's digest (`linked_key`). Both are functions of the bytes alone.
-fn content_of(bytes: &[u8], wanted: Option<ContentId>) -> ContentId {
+pub(super) fn content_of(bytes: &[u8], wanted: Option<ContentId>) -> ContentId {
     use super::super::unit::{linked_key, output_key};
+    // An image is wanted by its linked key: that hash first, so the whole one is made only
+    // where it is not the one wanted (each is a pass over the file: 40 ms of a 158 MB one).
+    if wanted.is_some() && bytes.starts_with(b"\x7fELF") {
+        let linked = linked_key(&blaze_link::digest::Digest::of(bytes).root()).0;
+        if wanted == Some(linked) {
+            return linked;
+        }
+    }
     let whole = output_key(bytes).0;
     if wanted == Some(whole) || wanted.is_none() {
         return whole;
@@ -1102,6 +1115,8 @@ impl<S: Steps> Jobs<S> {
                 stamps => Err(format!("the request certificate: looking at the output {path}: {} stamps came back for one name", stamps.len())),
             },
             (Ask::Content { base, path }, Done::Read(bytes)) => {
+                #[cfg(test)]
+                super::HASHED.set(super::HASHED.get() + 1);
                 let _hash = checking.span.in_scope(|| {
                     tracing::info_span!(
                         target: "blaze",
@@ -1207,6 +1222,24 @@ impl<S: Steps> Jobs<S> {
                 asked_ns: verified.looked_ns,
                 stamp: Some(blaze_cas::PlacedStamp { stamp, looked_ns: verified.looked_ns }),
             });
+        }
+    }
+
+    /// The output at path id `path` was vouched for ([`super::vouch`]): it holds `content`
+    /// under `stamp`, steady as looked at at `looked_ns`. Each evidence of a request whose
+    /// plan names the path keeps that, as a hit's check that hashed it would
+    /// ([`blaze_certify::certificate::Evidence::keep`]), and its mark is written: a
+    /// certificate written before the vouch ended kept nothing of the store's racy look.
+    pub(super) fn certify_vouched(&mut self, w: &mut World<'_, S>, path: u32, stamp: Stamp, looked_ns: u64, content: ContentId) {
+        let name = &*self.paths.names[path as usize];
+        for at in 0..self.certify.evidence.len() {
+            let (root, shape, _) = &self.certify.evidence[at];
+            let Some(plan) = self.roots.plans[*root as usize].iter().find(|it| it.shape == *shape) else { continue };
+            if !plan.units.plans.iter().any(|it| it.outputs.iter().any(|output| output == name)) {
+                continue;
+            }
+            self.certify.evidence[at].2.keep(ABSOLUTE, name, stamp, content, looked_ns);
+            mark_changed(&mut self.certify.evidence, at, w.vfs);
         }
     }
 

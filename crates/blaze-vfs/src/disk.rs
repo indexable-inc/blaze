@@ -94,7 +94,7 @@ pub(crate) fn changed_ns(stamp: &Stamp) -> u64 {
 }
 
 /// The first instant by the file system's clock at which a look finds `stamp` steady.
-pub(crate) fn steady_at(stamp: &Stamp) -> u64 {
+pub fn steady_at(stamp: &Stamp) -> u64 {
     changed_ns(stamp).saturating_add(window_ns(stamp))
 }
 
