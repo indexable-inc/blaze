@@ -584,7 +584,7 @@ pub fn below_any(path: &str, dirs: &[&str]) -> bool {
 /// run left: its unit identity and its image key moved once it had run, and the first build
 /// after a cold one compiled each such script again, asked the store for its image and its
 /// dependencies', and so read the standard library from images it had resolved a build
-/// before (docs/v2/plan/design/first-edit.md).
+/// before.
 ///
 /// Why leaving them out covers every input (rule 21). A crate reads a file of its source
 /// root by a path its source or its env gives it. `OUT_DIR` is a directory of the build
