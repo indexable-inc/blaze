@@ -2094,7 +2094,8 @@ impl Lowered {
 
     /// What unit `unit`'s narrowed identity ([`Lowered::narrowed`]) holds of each crate of
     /// its closure, by the crate's name, sorted: what of the crate alone can be observed
-    /// ([`code::OwnNarrow`]), its code text and its interface each an id, and where it is from (a library crate's from the
+    /// ([`code::OwnNarrow`]), its code text and its surface (or what stands in for it) each
+    /// an id, and where it is from (a library crate's from the
     /// store or a full parse, [`Lowered::library_narrows`]; one not given, which is then its
     /// whole text; a workspace crate's code text). For `blaze why`: a unit's record is looked
     /// up under its narrow key first, so a narrowed identity that moved while the whole one
@@ -2103,6 +2104,22 @@ impl Lowered {
     pub fn narrow_parts(&self, unit: usize) -> Vec<(String, ContentId)> {
         let db = &self.db;
         let Some(krate) = self.crates.krate(unit) else { return Vec::new() }; // alloc: none
+        // Why a library's build of this crate holds the code of the crates below it, not
+        // their surfaces ([`narrow_of`]): said with each crate's code text, which is then
+        // what a body edit below moves.
+        let deep = {
+            let own = match self.library.get(&krate) {
+                Some((_, own)) => *own,
+                None => code::own_narrow(db, krate),
+            };
+            let reaches = own.reaches
+                && (self.library.contains_key(&krate) || code::reaches_beyond(db, krate));
+            match (own.extends, reaches) {
+                (true, _) => "; its own crate names blaze's extensions, so its build holds the code below it",
+                (false, true) => "; its own crate makes Rust of a file by a path that is another crate's or that its text does not say whole (`include!`, `#[path]`), so its build holds the code below it",
+                (false, false) => "",
+            }
+        };
         // alloc: once a miss, a crate of its closure each
         let mut parts: Vec<(String, ContentId)> = krate
             .transitive_deps(db)
@@ -2126,17 +2143,34 @@ impl Lowered {
                 // interface (a check, and a library's build that stops at the crate boundary:
                 // [`Narrowed::built`]). A body edit moves the first alone, so a library over
                 // it whose record missed is not told that the body is why. A crate with no
-                // code text of its own is one part, its whole text.
+                // code text of its own is one part, its whole text. The second part is the
+                // surface those fold ([`narrow_of`]); where the crate has none, it is what
+                // stands in, and its name says which of the two reasons took the surface away.
+                let positioned = self.narrowed.get(&at).is_some_and(|it| it.locates) && own.calls;
+                let none = match (own.interface, own.surface) {
+                    (None, _) => Some(match code::unplain_at(db, at) {
+                        Some(first) => format!("a macro it calls where items are, or an import, could make or bring in a macro of a plain one's name, first at {first}"),
+                        None => "a macro it calls where items are, or an import, could make or bring in a macro of a plain one's name".to_owned(),
+                    }),
+                    (Some(_), Some(_)) if positioned => Some("a constant of it could hold a position no token of it says: it calls a function where a constant is evaluated, above a `#[track_caller] const fn` that can read a `Location`".to_owned()),
+                    _ => None,
+                };
+                let surface = match none {
+                    Some(_) => None,
+                    None => own.surface,
+                };
+                let none =
+                    none.map_or_else(String::new, |why| format!("; it has no surface: {why}"));
                 // alloc: as above, a part's name each
                 match (own.code, own.interface) {
                     (Some(code), interface) => [
                         Some((
-                            format!("the code text its narrow key holds of the crate {named} (a program's build, and the crate's own units)"),
+                            format!("the code text its narrow key holds of the crate {named} (a program's build, and the crate's own units{deep})"),
                             part(&code.0),
                         )),
                         Some((
-                            format!("the interface its narrow key holds of the crate {named} (a check, and a library's build)"),
-                            part(&interface.unwrap_or(code).0),
+                            format!("the surface its narrow key holds of the crate {named} (a check, and a library's build){none}"),
+                            part(&surface.or(interface).unwrap_or(code).0),
                         )),
                     ],
                     (None, _) => [
@@ -2892,7 +2926,8 @@ pub struct Narrowed {
     /// on only its surface ([`code::CodeText::surface`]: each body no other crate's front end
     /// reads as a mark, and no position a line alone moves).
     /// For a unit that only checks. Equal to `code` wherever a check may read more: a crate
-    /// that names blaze's extensions or reads files by path.
+    /// that names blaze's extensions or makes Rust of another crate's file by a path
+    /// ([`code::reaches_beyond`]).
     pub checked: ContentId,
     /// What a library's build that stops at the crate boundary can observe (store.md, "Early
     /// cutoff between crates"): its own code text, and of each crate it depends on only its
@@ -3050,7 +3085,11 @@ fn narrow_of(
             }
             _ => interface,
         };
-        let checked = match extends || own.reaches || code::planted(code::Plant::Deep) {
+        // A crate made from Rust of another crate's source root holds that file's bodies, which
+        // the other's surface leaves out: it is keyed by the code below it. Exact for a
+        // workspace crate, by where each path it reads resolves ([`code::reaches_beyond`]).
+        let reaches = own.reaches && (given.contains_key(&at) || code::reaches_beyond(db, at));
+        let checked = match extends || reaches || code::planted(code::Plant::Deep) {
             true => code,
             false => folded(NARROW_CHECKED, own_code, |it| it.surface),
         };
@@ -3058,7 +3097,7 @@ fn narrow_of(
         // and compiles of it only the bodies its interface holds whole: the same fold as
         // `checked`, under its own domain, as the two are keys of two things. With the cutoff
         // taken away (the planted control) it is the deep code identity again.
-        let built = match extends || own.reaches || code::planted(code::Plant::Uncut) {
+        let built = match extends || reaches || code::planted(code::Plant::Uncut) {
             true => code,
             false => folded(NARROW_BUILT, own_code, |it| it.surface),
         };

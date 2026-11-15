@@ -5,11 +5,11 @@ use blaze_sim::Config;
 use span::Edition;
 use syntax::{AstNode, SourceFile};
 
-use super::{CodeText, Plant, code_text_of, planting, root_alone_of, still_text};
+use super::{CodeText, Plant, code_text_of, planting, root_alone_of, said_reach, still_text};
 
 fn code(text: &str) -> CodeText {
     let parse = SourceFile::parse(text, Edition::CURRENT);
-    code_text_of(parse.tree().syntax(), text)
+    code_text_of(parse.tree().syntax(), text, Edition::CURRENT)
 }
 
 /// An edit of a doc comment's text no macro sees (one doctest example of a library) leaves its
@@ -120,6 +120,40 @@ fn a_shadowing_file_is_caught() {
         "#[macro_use]\nextern crate alloc;\n",
     ] {
         assert!(!code(text).shadows, "{text}");
+    }
+}
+
+/// A glob of a module declared beside it (`mod attribute; pub use attribute::*;`) is of the
+/// crate's own names in edition 2018 and later, where a first name both a module and a crate
+/// is an error: it neither shadows nor takes a plain macro's name. Not where the module may be
+/// taken away by a `cfg` the `use` lacks, not one written `::attribute` (a crate), not a module
+/// elsewhere, and
+/// not in edition 2015, where the path starts at the root.
+#[test]
+fn a_glob_of_a_module_beside_it_is_the_crates_own() {
+    let at = |text: &str, edition: Edition| {
+        let parse = SourceFile::parse(text, edition);
+        let code = code_text_of(parse.tree().syntax(), text, edition);
+        (code.shadows, code.unplain)
+    };
+    for text in [
+        "mod attribute;\npub use attribute::*;\n",
+        "pub mod attribute {\n    pub struct A;\n}\npub use attribute::{*};\n",
+        "#[doc(hidden)]\nmod attribute;\npub use attribute::*;\n",
+        "#[cfg(feature = \"a\")]\nmod attribute;\n#[cfg(feature = \"a\")]\npub use attribute::*;\n",
+    ] {
+        assert_eq!(at(text, Edition::Edition2021), (false, false), "{text}");
+        assert_eq!(at(text, Edition::Edition2015), (true, true), "2015: {text}");
+    }
+    for text in [
+        "#[cfg(feature = \"a\")]\nmod attribute;\npub use attribute::*;\n",
+        "#[cfg(feature = \"a\")]\nmod attribute;\n#[cfg(feature = \"b\")]\npub use attribute::*;\n",
+        "#[cfg_attr(feature = \"a\", cfg(x))]\nmod attribute;\npub use attribute::*;\n",
+        "mod attribute;\npub use ::attribute::*;\n",
+        "mod other {\n    mod attribute;\n}\npub use attribute::*;\n",
+        "mod attributes;\npub use attribute::*;\n",
+    ] {
+        assert_eq!(at(text, Edition::Edition2021), (true, true), "{text}");
     }
 }
 
@@ -389,18 +423,211 @@ fn what_keeps_a_crate_from_an_interface_is_caught() {
         assert!(code(unplain).unplain, "{unplain}");
     }
     for kept in ["use std::fmt::*;\n", "use crate::a::*;\n", "macro_rules! mine { () => { 1 }; }\n"] {
-        assert!(!code(kept).unplain, "{kept}");
+        assert_eq!((code(kept).unplain, code(kept).unplain_line), (false, None), "{kept}");
     }
+    let first = code("fn f() {}\nother::make!();\n");
+    assert_eq!(first.unplain_line, Some(2), "where, for `blaze why`");
     assert!(code("#[blaze::pure]\nfn f() {}\n").extends);
     assert!(code("const ID: u64 = fn_info(&f).code_id;\n").extends);
     for reaches in [
-        "#[path = \"../other/src/a.rs\"]\nmod a;\n",
         "#[cfg_attr(unix, path = \"unix.rs\")]\nmod sys;\n",
-        "include!(\"gen.rs\");\n",
-        "const A: &str = include_str!(\"a.txt\");\n",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n",
         "make! { #[path = \"a.rs\"] mod a; }\n",
     ] {
         assert!(code(reaches).reaches, "{reaches}");
+    }
+}
+
+/// How a file reads another by a path: Rust by a path its text says whole is a read the view
+/// resolves (`resolves`, and the path [`said_reach`] gives, as the front end joins it); Rust
+/// by any other is a read of any file (`reaches`); the bytes of a file that is not Rust by a
+/// literal are neither, as every text of the crate whose file it is holds them (and Rust's
+/// bytes keep the crate's whole text).
+#[test]
+fn a_read_by_path_is_said_whole_or_reaches() {
+    // (text, the paths said, reaches, whole)
+    let cases: &[(&str, &[&str], bool, bool)] = &[
+        ("#[path = \"../other/src/a.rs\"]\nmod a;\n", &["../other/src/a.rs"], false, false),
+        ("#[cfg(unix)]\n#[path = \"./sys\\\\unix.rs\"]\npub mod sys;\n", &["sys/unix.rs"], false, false),
+        ("include!(\"gen.rs\");\n", &["gen.rs"], false, false),
+        ("fn f() -> u8 {\n    include!(\"gen.rs\",)\n}\n", &["gen.rs"], false, false),
+        ("const A: &str = include_str!(\"a.txt\");\n", &[], false, false),
+        ("#![doc = include_str!(\"../README.md\")]\n", &[], false, false),
+        ("const A: &[u8] = include_bytes!(\"a.rs\");\n", &[], false, true),
+        ("const A: &str = include_str!(concat!(\"a\", \".txt\"));\n", &[], false, true),
+        // A path its text does not say whole, or one another macro may write anew.
+        ("#[cfg_attr(unix, path = \"unix.rs\")]\nmod sys;\n", &[], true, false),
+        ("mod outer {\n    #[path = \"a.rs\"]\n    mod a;\n}\n", &[], true, false),
+        ("#[path = \"a.rs\"]\nmod a {}\n", &[], true, false),
+        ("include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n", &[], true, false),
+        ("std::include!(\"gen.rs\");\n", &[], true, false),
+        ("include!(\"gen.rs\", \"more\");\n", &[], true, false),
+        ("macro_rules! m {\n    () => { include!(\"gen.rs\"); };\n}\n", &[], true, false),
+        ("#[other::rewrite]\nmod m {\n    include!(\"gen.rs\");\n}\n", &[], true, false),
+        ("make! { #[path = \"a.rs\"] mod a; }\n", &[], true, false),
+        // An out-of-line module given to a macro keeps its crate's whole text, besides.
+        ("#[other::rewrite]\n#[path = \"a.rs\"]\nmod a;\n", &[], true, true),
+    ];
+    for &(text, said, reaches, whole) in cases {
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let paths: Vec<String> = parse
+            .tree()
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(syntax::NodeOrToken::into_token)
+            .filter_map(|it| said_reach(&it))
+            .collect();
+        let code = code(text);
+        assert_eq!(paths, said, "{text}");
+        assert_eq!((code.reaches, code.resolves, code.whole), (reaches, !said.is_empty(), whole), "{text}");
+    }
+}
+
+/// A macro this file defines with `macro_rules!`, called where items are, keeps its crate's
+/// interface and surface: a plain body's edit moves neither, and an edit of the definition's
+/// rules or of the call's input moves both, as what the call makes moves with them. So does a
+/// line added above a call whose expansion reads its own line: the call is held with its place.
+#[test]
+fn an_item_level_call_of_a_macro_this_file_defines_keeps_a_surface() {
+    let text = |rule: &str, input: &str, value: u8| {
+        format!(
+            "macro_rules! from {{\n    ($($t:ty),*) => {{ $(impl From<$t> for V {{ fn from(v: $t) -> V {{ V(v as {rule}) }} }})* }};\n}}\nfrom!({input});\npub fn f() -> u32 {{\n    {value}\n}}\n"
+        )
+    };
+    let was = code(&text("i64", "u8, i8", 1));
+    assert!(!was.unplain, "{}", text("i64", "u8, i8", 1));
+    let body = code(&text("i64", "u8, i8", 2));
+    assert_eq!((was.interface, was.surface), (body.interface, body.surface), "a plain body");
+    assert_ne!(was.inert, body.inert, "which the crate's own code reads");
+    for (rule, input) in [("i32", "u8, i8"), ("i64", "u8, i16")] {
+        let now = code(&text(rule, input, 1));
+        assert!(!now.unplain, "{rule} {input}");
+        assert_ne!(was.surface, now.surface, "{rule} {input}");
+        assert_ne!(was.interface, now.interface, "{rule} {input}");
+    }
+    // One that calls another of the file's, which is in scope where the first is called.
+    let nested = "macro_rules! one {\n    ($t:ty) => { impl Marker for $t {} };\n}\nmacro_rules! all {\n    ($($t:ty),*) => { $(one!($t);)* };\n}\nall!(u8, i8);\n";
+    assert!(!code(nested).unplain);
+    let at = |above: &str| {
+        code(&format!(
+            "pub fn f() -> u32 {{\n{above}    1\n}}\nmacro_rules! at {{\n    () => {{ pub const AT: u32 = line!(); }};\n}}\nat!();\n"
+        ))
+    };
+    assert!(!at("").unplain);
+    assert_ne!(at("").surface, at("    let _more = 0;\n").surface, "a line added above the call");
+}
+
+/// A comment the parser hands to the item after it (one at the end of the line above, as in
+/// `pub mod e { // note`) moves no token of a macro's definition or call, so every text is as
+/// it was, the surface too, which holds those tokens with their places. One on a line of its
+/// own above them moves their lines, and the surface with them (in a body above them too:
+/// their places are the file's lines, not their items'); one below the last of them, in a
+/// body or after it, moves nothing the surface holds.
+#[test]
+fn a_comment_moves_a_macros_place_only_where_it_moves_its_tokens() {
+    let text = |at: usize, comment: &str| {
+        let mut slots = ["", "", "", "", "", ""];
+        slots[at] = comment;
+        let [above, end_of_line, own_line, call, below, after] = slots;
+        format!(
+            "pub fn above() -> u32 {{\n{above}    1\n}}\npub mod e {{{end_of_line}\n{own_line}    macro_rules! g {{\n        ($v:expr) => {{ pub const G: u32 = $v; }};\n    }}{call}\n    g!(1);\n}}\npub fn below() -> u32 {{\n{below}    2\n}}\n{after}"
+        )
+    };
+    let bare = code(&text(0, ""));
+    assert!(!bare.unplain);
+    // Whether the surface moves, and whether the comment moves no line at all (one still
+    // text: then every text and flag is as it was).
+    for (at, comment, moves, still, what) in [
+        (1, " // note", false, true, "at the end of the line above the definition"),
+        (3, " // note", false, true, "at the end of the line above the call"),
+        (5, "// note\n", false, true, "after the last item"),
+        (4, "    // note\n", false, false, "on a line of its own in a body below"),
+        (2, "    // note\n", true, false, "on a line of its own above the definition"),
+        (0, "    // note\n", true, false, "on a line of its own in a body above"),
+    ] {
+        let now = code(&text(at, comment));
+        assert_eq!(bare.surface != now.surface, moves, "{what}");
+        if still {
+            assert_eq!(bare, now, "{what}: every text, each flag");
+        }
+    }
+}
+
+/// Calls where items are that are not taken as the file's own macro's: what each makes is not
+/// known from the file's text, or could make or bring in a macro of a plain one's name. Each
+/// is by the name alone, so the planted bug takes each as known.
+const NOT_KNOWN: &[(&str, &str)] = &[
+    ("from!(u8);\nmacro_rules! from {\n    ($t:ty) => {};\n}\n", "defined after the call"),
+    (
+        "mod m {\n    macro_rules! from {\n        ($t:ty) => {};\n    }\n}\nfrom!(u8);\n",
+        "defined in a module the call is not in",
+    ),
+    (
+        "#[cfg(feature = \"x\")]\nmacro_rules! from {\n    ($t:ty) => {};\n}\nfrom!(u8);\n",
+        "a definition a cfg may take away",
+    ),
+    (
+        "#[rustc_builtin_macro]\nmacro_rules! from {\n    ($t:ty) => {};\n}\nfrom!(u8);\n",
+        "a macro the compiler expands",
+    ),
+    (
+        "#[macro_export(local_inner_macros)]\nmacro_rules! from {\n    () => { one!(); };\n}\nmacro_rules! one {\n    () => {};\n}\nfrom!();\n",
+        "a macro whose rules call others by their path",
+    ),
+    (
+        "macro_rules! from {\n    () => {};\n}\n#[macro_use]\nmod more;\nfrom!();\n",
+        "a module given #[macro_use] between the two",
+    ),
+    ("macro_rules! from {\n    () => { use other::vec; };\n}\nfrom!();\n", "an import"),
+    (
+        "macro_rules! from {\n    () => { #[macro_use] extern crate other; };\n}\nfrom!();\n",
+        "another crate's macros",
+    ),
+    ("macro_rules! from {\n    () => { other!(); };\n}\nfrom!();\n", "an unknown macro called"),
+    ("macro_rules! from {\n    () => { include!(\"gen.rs\"); };\n}\nfrom!();\n", "include!"),
+    (
+        "macro_rules! from {\n    () => { $crate::other!(); };\n}\nfrom!();\n",
+        "a callee by its path",
+    ),
+    (
+        "macro_rules! from {\n    ($m:ident) => { $m!(); };\n}\nfrom!(other);\n",
+        "a callee a metavariable names",
+    ),
+    (
+        "macro_rules! from {\n    ($($t:tt)*) => { $($t)* };\n}\nfrom!(other!());\n",
+        "a `!` in the call's input",
+    ),
+    (
+        "macro_rules! one {\n    ($($t:tt)*) => { $($t)* };\n}\nmacro_rules! from {\n    () => { one!(other, !()); };\n}\nfrom!();\n",
+        "a `!` in what it gives another of the file's",
+    ),
+];
+
+/// The line (from 1) of the call in a case of [`NOT_KNOWN`]: its last `from!(`.
+fn call_line(text: &str) -> u32 {
+    let at = text.rfind("from!(").expect("each case calls `from!`");
+    u32::try_from(text[..at].matches('\n').count() + 1).unwrap()
+}
+
+/// Each call of [`NOT_KNOWN`] keeps its crate from an interface and a surface, and says where.
+#[test]
+fn an_item_level_call_its_files_text_does_not_say_is_unplain() {
+    for &(text, what) in NOT_KNOWN {
+        let code = code(text);
+        assert!(code.unplain, "{what}: {text}");
+        assert_eq!(code.unplain_line, Some(call_line(text)), "{what}: {text}");
+    }
+    assert!(code("other::from!(u8);\n").unplain, "another crate's, by its path");
+}
+
+/// The control: with every call by its name alone taken as the file's own macro's (the planted
+/// bug), each of [`NOT_KNOWN`] keeps a surface, and a body that calls `vec!` there could call
+/// a macro the call made or brought in.
+#[test]
+fn the_oracle_catches_an_item_level_call_taken_as_the_files_own() {
+    for &(text, what) in NOT_KNOWN {
+        assert!(code(text).unplain, "{what}");
+        assert!(!planting(Plant::Unresolved, || code(text)).unplain, "{what}: {text}");
     }
 }
 
@@ -429,9 +656,11 @@ enum Kind {
     Value,
     /// An exported macro's tokens.
     Macro,
+    /// A constant a macro the module defines makes, called where items are.
+    Expands,
 }
 
-const KINDS: [Kind; 11] = [
+const KINDS: [Kind; 12] = [
     Kind::Plain,
     Kind::Method,
     Kind::Generic,
@@ -443,6 +672,7 @@ const KINDS: [Kind; 11] = [
     Kind::Calls,
     Kind::Value,
     Kind::Macro,
+    Kind::Expands,
 ];
 
 /// One item of a generated file: its kind, which parameter type its signature has, the digit
@@ -590,6 +820,10 @@ impl Item {
             Kind::Macro => format!(
                 "#[macro_export]\nmacro_rules! m{at} {{{note}\n    () => {{\n        {value}{ty}\n    }};\n}}\n"
             ),
+            // In a module of its own, so a `cfg` takes the definition and the call together.
+            Kind::Expands => format!(
+                "pub mod e{at} {{{note}\n    macro_rules! g {{\n        ($v:expr) => {{\n            pub const G: {ty} = $v;\n        }};\n    }}\n    g!({value});\n}}\n"
+            ),
         };
         format!("{gate}{item}")
     }
@@ -600,7 +834,7 @@ impl Item {
     }
 
     fn has_body(&self) -> bool {
-        !matches!(self.kind, Kind::Value | Kind::Macro)
+        !matches!(self.kind, Kind::Value | Kind::Macro | Kind::Expands)
     }
 }
 
@@ -723,7 +957,7 @@ fn the_interface_text_moves_exactly_with_what_a_dependent_observes() {
     blaze_sim::check(Config::DEFAULT, |tape| {
         let drawn: Vec<(u8, u8, u8, bool)> = tape.vec(1..=5, "items", |tape| {
             (
-                tape.int_in(0u8..=10, "kind"),
+                tape.int_in(0u8..=11, "kind"),
                 tape.int_in(0u8..=2, "sig"),
                 tape.int_in(0u8..=9, "value"),
                 tape.bool("long"),
@@ -763,7 +997,7 @@ fn a_units_own_key_moves_exactly_with_what_its_results_depend_on() {
         // line (2).
         let drawn: Vec<(u8, u8, u8, u8)> = tape.vec(1..=5, "items", |tape| {
             (
-                tape.int_in(0u8..=10, "kind"),
+                tape.int_in(0u8..=11, "kind"),
                 tape.int_in(0u8..=2, "sig"),
                 tape.int_in(0u8..=9, "value"),
                 tape.int_in(0u8..=3, "laid"),
@@ -961,7 +1195,7 @@ fn a_files_still_text_moves_with_every_edit_but_what_no_code_text_holds() {
     blaze_sim::check(Config::DEFAULT, |tape| {
         let drawn: Vec<(u8, u8, u8, u8)> = tape.vec(1..=5, "items", |tape| {
             (
-                tape.int_in(0u8..=10, "kind"),
+                tape.int_in(0u8..=11, "kind"),
                 tape.int_in(0u8..=2, "sig"),
                 tape.int_in(0u8..=9, "value"),
                 tape.int_in(0u8..=3, "laid"),
@@ -1066,13 +1300,22 @@ fn surfaced(text: &str) -> ContentId {
 /// evaluates it, infers a type through it, or finds an item or a macro's tokens in it. A
 /// generic, `#[inline]` or default-method body is checked against by its signature.
 fn front_reads(kind: Kind) -> bool {
-    matches!(kind, Kind::Const | Kind::Hidden | Kind::Holds | Kind::Calls | Kind::Value | Kind::Macro)
+    matches!(
+        kind,
+        Kind::Const
+            | Kind::Hidden
+            | Kind::Holds
+            | Kind::Calls
+            | Kind::Value
+            | Kind::Macro
+            | Kind::Expands
+    )
 }
 
 /// Whether an item of `kind` is in the surface with where it is: a macro's definition, and a
 /// call of a macro that is not the standard library's.
 fn placed(kind: Kind) -> bool {
-    matches!(kind, Kind::Macro | Kind::Calls)
+    matches!(kind, Kind::Macro | Kind::Calls | Kind::Expands)
 }
 
 /// The oracle of the surface text: the surface of `items` and of `items` after `edit` of
@@ -1086,8 +1329,9 @@ fn check_surface(items: &[Item], at: usize, edit: Edit) -> Result<(), String> {
         Edit::Body => front_reads(item.kind),
         Edit::Lines if item.has_body() => front_reads(item.kind) || later_placed,
         Edit::Lines | Edit::Signature | Edit::Removed | Edit::Added | Edit::Cfg => true,
-        // A macro's definition is held as its bytes, a comment among them too.
-        Edit::Comment => item.kind == Kind::Macro,
+        // A macro's definition is held as its tokens with their places (SURFACE_TEXT 2): a
+        // `//` comment at a line's end is no token and moves none, among them too.
+        Edit::Comment => false,
     };
     let (after, _) = edited(items, at, edit);
     let (before, after) = (file(items), file(&after));
@@ -1117,7 +1361,7 @@ fn the_surface_text_moves_exactly_with_what_a_front_end_observes() {
     blaze_sim::check(Config::DEFAULT, |tape| {
         let drawn: Vec<(u8, u8, u8, bool)> = tape.vec(1..=5, "items", |tape| {
             (
-                tape.int_in(0u8..=10, "kind"),
+                tape.int_in(0u8..=11, "kind"),
                 tape.int_in(0u8..=2, "sig"),
                 tape.int_in(0u8..=9, "value"),
                 tape.bool("long"),
@@ -1249,3 +1493,30 @@ fn what_could_give_a_constant_its_callers_position_is_flagged() {
     assert_eq!(flags("pub static C: Lazy<u32> = Lazy(|| g());\n"), (false, false, true));
     assert_eq!(flags("pub fn f() -> impl Copy {\n    g()\n}\n"), (false, false, false));
 }
+
+
+/// A `///` comment on a function (a `DOC_COMMENT` node of its item) is the inert attribute
+/// `doc`: a plain body under one is left out of the interface and the surface as one under
+/// `#[doc = "..."]` or none is, so its edit moves neither; an `#[inline]` body under one stays
+/// in the interface (a build above compiles a copy) and leaves the surface, and a `const fn`'s
+/// stays in both. With the planted bug (the comment taken as no inert attribute) the plain
+/// body's edit moves both: the control.
+#[test]
+fn a_documented_body_is_left_out_as_an_undocumented_one_is() {
+    // (what is above `pub`, the edit, whether the interface moves, whether the surface does)
+    let moves = |head: &str, before: &str, after: &str| {
+        let text = |body: &str| format!("/// Made up: `x`.\n/// More.\n{head}pub fn f(x: u64) -> u64 {{\n    x ^ {body}\n}}\n");
+        let (was, now) = (code(&text(before)), code(&text(after)));
+        (was.interface != now.interface, was.surface != now.surface)
+    };
+    assert_eq!(moves("", "0", "1"), (false, false), "a plain body");
+    assert_eq!(moves("#[inline]\n", "0", "1"), (true, false), "an #[inline] body");
+    let constant = |body: &str| code(&format!("/// Made up.\npub const fn f(x: u64) -> u64 {{\n    x ^ {body}\n}}\n"));
+    assert_ne!(constant("0").surface, constant("1").surface, "a const fn's body");
+    assert_eq!(
+        planting(Plant::Documented, || moves("", "0", "1")),
+        (true, true),
+        "the control: a plain body under `///` kept"
+    );
+}
+

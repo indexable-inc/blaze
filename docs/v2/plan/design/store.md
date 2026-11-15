@@ -532,6 +532,20 @@ does), in no library's record. A diagnostic that points into another crate's fil
 what it quotes, never as places (`in_own_files`). A program, a test, a proc macro, a build
 script and an optimized library hold the code of every crate below (`Narrowed::code`).
 
+A crate that reads a file by a path keeps the surfaces below unless what it reads could be a
+body a surface leaves out (2026-11-15, `code::reaches_beyond`). `include_str!`/`include_bytes!`
+of a literal that names no `.rs` file reads bytes, and every text of the crate whose source
+root holds the file (its surface too) holds it by its bytes; a file of no source root is a read
+the record is filed by (`reads`); one naming Rust keeps the crate's whole text. Rust read by a
+path its text says whole (`include!("x.rs")`, `#[path = "x.rs"] mod x;` where a file's items
+are) is resolved from the file as the front end resolves it: a file of the crate's own source
+root is in its own code text, one of none is a filed read, and one of another crate's source
+root keeps the code of every crate below in the key. Any other read by path does too. Not
+covered, by this or by the whole identity: a file of a crate that is not below it, and a file
+of a crate below whose root reads no other file (`root_alone`, whose identity leaves its
+other files out); and a read a macro of another crate makes from the caller's file, which
+no token of the caller says.
+
 This is a superset of what was read, so it is sound, and it is not yet the rule: a signature
 changed in `a` still makes every unit above `a` again, read or not. That is layer 3.
 
@@ -558,7 +572,7 @@ the code generator's span tables, the slot in `compile.rs`.
 with layer 2, every library above is found provided no position kept by the surface lies
 below the edit in that file (a macro's definition, a call of a non-std macro outside a
 left-out body, `line!`); if one does, the libraries above miss and `blaze why` names "the
-interface its narrow key holds of the crate reth_chainspec". Not measured; which of the two
+surface its narrow key holds of the crate reth_chainspec". Not measured; which of the two
 `spec.rs` is, is the run's to say. With layer 3: 0 libraries either way. The units that link
 the crate are made again in both (the edit changes a function's code).
 
@@ -569,8 +583,14 @@ the interface file's bytes are equal, per crate, positions included. Per item an
 what none of them has.
 
 **Not built.** Layer 3's trace and slot. A crate with an item-level call of an unknown macro
-has no surface. Optimized libraries. The walk stopping at the crate boundary (a library that
-misses still walks into its dependencies).
+has no surface: one of a `macro_rules!` macro defined earlier in the same file, in a module
+the call is in, whose rules import nothing, define no macro and call only plain macros and
+other such ones (`code::local_call`), is known, since its expansion is a function of tokens
+the surface holds with their places; a macro defined in another file (`#[macro_use] mod
+macros;`), a dependency's, a proc macro and `$crate::m!` are not yet. `blaze why` says which
+of the two reasons took a crate's surface away (that call or import, at its file and line;
+or a constant that could hold a position). Optimized libraries. The walk stopping at the
+crate boundary (a library that misses still walks into its dependencies).
 
 **Checks.** `blaze-lower`, `code::tests`: `the_surface_text_moves_exactly_with_what_a_front_end_observes`
 (blaze-sim) with controls `the_oracle_catches_a_surface_that_holds_a_bodys_lines` and
@@ -578,7 +598,10 @@ misses still walks into its dependencies).
 `a_dependents_key_moves_only_with_what_it_observes_of_a_dependency`,
 `a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it`, controls
 `the_oracle_catches_a_library_built_under_its_dependencies_code` and
-`the_oracle_catches_a_dependents_key_that_holds_a_bodys_lines`. `blaze-cargo`,
+`the_oracle_catches_a_dependents_key_that_holds_a_bodys_lines`;
+`a_read_by_path_keys_a_library_by_the_file_it_reads`, control
+`the_oracle_catches_a_read_by_path_left_out_of_a_key` (`Plant::Beyond`, `Plant::Unread`);
+`code::tests::a_read_by_path_is_said_whole_or_reaches`. `blaze-cargo`,
 `compile::parts::tests`: a model crate, units and edits under blaze-sim
 (`no_unit_is_found_stale_after_any_edit_of_the_crate_below`), the directed cases (a line or a
 body below, a signature one unit reads, an item that shadows, an impl that changes
