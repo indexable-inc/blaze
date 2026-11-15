@@ -22,7 +22,7 @@ use blaze_sim::Tape;
 use super::{
     AsId, Cancelled, Cause, Counts, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn,
     Hook, Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, Unread, attach,
-    capture_reads,
+    capture_reads, for_span_text,
     input::field_node,
     owner_is,
     plumbing::{
@@ -1989,6 +1989,58 @@ query!(Replay, u64, |db, key| {
     replay_reads(db, reads);
     value + 1
 });
+/// Cells [`CaptureWide`] reads in one capture, and how often [`ReplaysAgain`] replays it.
+const CAPTURED: usize = 1 << 10;
+const REPLAYS: u64 = 1 << 10;
+
+query!(CaptureWide, u64, |db, key| {
+    let cells = db.cells.lock().clone();
+    let (value, reads) = capture_reads(db, || cells.iter().map(|it| Cell(*it).a(db)).sum::<u64>());
+    db.shared.lock().insert(key.0.as_u32(), (value, reads.expect("plain reads are shareable")));
+    value
+});
+query!(ReplaysForever, u64, |db, key| {
+    let (value, reads) = db.shared.lock()[&key.0.as_u32()];
+    for _ in 0..ENDLESS {
+        replay_reads(db, reads);
+    }
+    value
+});
+query!(ReplaysAgain, u64, |db, key| {
+    let (value, reads) = db.shared.lock()[&key.0.as_u32()];
+    for _ in 0..REPLAYS {
+        replay_reads(db, reads);
+    }
+    value + 1
+});
+
+/// The key [`ReplayThenCapture`] shares its inner capture under.
+fn inner_key(key: Cell) -> u32 {
+    u32::MAX - key.0.as_u32()
+}
+
+query!(ReplayThenCapture, u64, |db, key| {
+    let (value, reads) = db.shared.lock()[&key.0.as_u32()];
+    replay_reads(db, reads);
+    let ((), inner) = capture_reads(db, || replay_reads(db, reads));
+    db.shared.lock().insert(inner_key(key), (value, inner.expect("a replay is shareable")));
+    value
+});
+query!(ReplayInner, u64, |db, key| {
+    let (value, reads) = db.shared.lock()[&inner_key(key)];
+    replay_reads(db, reads);
+    value + 1
+});
+query!(ReplayCutThenAgain, u64, |db, key| {
+    let (value, reads) = db.shared.lock()[&key.0.as_u32()];
+    let mut text = String::new();
+    // The replay in the untracked stretch is cut from the run when the stretch ends.
+    #[allow(clippy::disallowed_methods)]
+    for_span_text(db, &mut text, |db, _| replay_reads(db, reads));
+    replay_reads(db, reads);
+    value + 1
+});
+
 query!(Unshare, bool, |db, key| {
     let ((), reads) = capture_reads(db, || {
         key.a(db);
@@ -3065,6 +3117,83 @@ fn nested_captures_hold_each_read_once_not_once_per_level() {
         "the innermost read reaches the replaying query"
     );
     assert_eq!(db.runs("Replay"), 2);
+}
+
+/// A run that replays one capture again and again records its reads once: the replays after
+/// the first push nothing, so a bound the reads of every replay would pass is not met. An edit
+/// of the last cell the capture read still reruns it.
+#[test]
+fn a_capture_replayed_again_in_one_run_records_its_reads_once() {
+    let mut db = TestDb::new();
+    let cells: Vec<Cell> = (0..CAPTURED as u64).map(|at| Cell::new(&db, at, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    let key = cells[0];
+    let sum: u64 = (0..CAPTURED as u64).sum();
+    assert_eq!(*get::<CaptureWide>(&db, key), sum);
+    counts_of("ReplaysAgain");
+    // Every replay's reads, 2^20, are past it; one replay's, 2^10, are not.
+    let bound = 1 << 14;
+    assert_eq!(with_run_reads(bound, || *get::<ReplaysAgain>(&db, key)), sum + 1);
+    let counts = counts_of("ReplaysAgain");
+    let captured = CAPTURED as u64;
+    // The first replay's reads, and one for each replay after it.
+    let recorded = captured + REPLAYS - 1;
+    assert_eq!((counts.reads_recorded, counts.reads_kept), (recorded, captured), "{counts:?}");
+    let last = captured - 1;
+    cells[CAPTURED - 1].set_a(&mut db, 1000);
+    assert_eq!(*get::<CaptureWide>(&db, key), sum - last + 1000);
+    assert_eq!(
+        *get::<ReplaysAgain>(&db, key),
+        sum - last + 1001,
+        "the last cell's edit reaches it"
+    );
+    assert_eq!(db.runs("ReplaysAgain"), 2);
+}
+
+/// A run that only replays one capture again and again, pushing nothing after the first, still
+/// fails at its bound, naming itself: each replay counts as a read.
+#[test]
+fn a_run_that_keeps_replaying_one_capture_fails_naming_itself() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<Capture>(&db, cell), 3);
+    let bound = 1 << 12;
+    let out = with_run_reads(bound, || runaway_of(|| _ = get::<ReplaysForever>(&db, cell)));
+    assert_eq!((out.over, out.query, out.bound), (super::Over::Reads, "ReplaysForever", bound));
+}
+
+/// A capture frame opened after a replay holds that replay's reads when it replays the same
+/// capture again: it pushes them, as a frame's reads are the stack above where it opened. A
+/// query replaying that frame's capture reruns when the read changes.
+#[test]
+fn a_capture_opened_after_a_replay_holds_the_reads_it_replays_again() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<Capture>(&db, cell), 3);
+    assert_eq!(*get::<ReplayThenCapture>(&db, cell), 3);
+    let (_, inner) = db.shared.lock()[&inner_key(cell)];
+    assert_eq!(inner.len(), 1, "the inner capture holds the replayed read");
+    let read = inner.for_each_read(db.storage(), |it| ControlFlow::Break(it)).expect("one read");
+    assert_eq!((read.kind, read.key.key_index()), (ReadKind::InputField(0), cell.0));
+    assert_eq!(*get::<ReplayInner>(&db, cell), 4);
+    cell.set_a(&mut db, 5);
+    assert_eq!(*get::<Capture>(&db, cell), 5);
+    assert_eq!(*get::<ReplayThenCapture>(&db, cell), 5);
+    assert_eq!(*get::<ReplayInner>(&db, cell), 6, "the inner capture's read reaches its replayer");
+}
+
+/// A replay cut from its run (an untracked stretch's reads are dropped when it ends) is made
+/// again in full: the run keeps the edge, and reruns when the read changes.
+#[test]
+fn a_replay_cut_from_its_run_is_replayed_again_in_full() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<Capture>(&db, cell), 3);
+    assert_eq!(*get::<ReplayCutThenAgain>(&db, cell), 4);
+    cell.set_a(&mut db, 5);
+    assert_eq!(*get::<Capture>(&db, cell), 5);
+    assert_eq!(*get::<ReplayCutThenAgain>(&db, cell), 6, "the replay after the cut is its edge");
+    assert_eq!(db.runs("ReplayCutThenAgain"), 2);
 }
 
 /// A view's captures are freed when the next view opens: a [`Reads`] is read only in its own
