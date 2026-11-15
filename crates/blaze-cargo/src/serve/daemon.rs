@@ -3222,7 +3222,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let working = self.jobs.build_under_way() != 0 || self.plane.running() != 0;
         if self.idle.look(now, working) {
             tracing::info!(target: "blaze", "idle: the daemon gives its warm memory back");
-            blaze_mem::frame::ask_spare_trim();
+            // The workers are woken: one parked before the ask would answer it only at its next
+            // job, keeping its warm frames (`blaze_mem::frame::WARM` at most) and its idle
+            // fibers' stacks through the whole idle stretch.
+            blaze_graph::exec::shared().give_back_spare();
             crate::raw::memory::purger().ask();
             self.jobs.say_what_the_kept_front_ends_hold();
             // The stores' pools (kept for the stores' own commits and the reads not yet on

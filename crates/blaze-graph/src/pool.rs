@@ -1297,6 +1297,17 @@ impl Pool {
         self.shared.slots.iter().filter(|slot| slot.inside.load(Ordering::Relaxed)).count()
     }
 
+    /// Asks every thread to give its warm frame memory back ([`blaze_mem::frame::ask_spare_trim`])
+    /// and wakes each of this pool's workers, so one that parked before the ask answers it now
+    /// and not only at its next job: a worker settles the ask as it parks again, outside any job
+    /// ([`blaze_mem::frame::settle_spare`]), and with it lets go of its idle fibers' stacks. What
+    /// an idle daemon asks once a stretch. A woken worker with nothing queued parks again, so
+    /// the cost is a park a worker. Waits for nobody.
+    pub fn give_back_spare(&self) {
+        blaze_mem::frame::ask_spare_trim();
+        self.shared.unpark_workers();
+    }
+
     /// Runs `run` on a worker near `group` (a group this pool does not have is no group), then
     /// `done` on the same thread with what came of it: its value, or its panic, caught. The
     /// pool goes on after a panic; a panic of `done` is kept and raised when the pool is
