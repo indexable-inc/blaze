@@ -161,8 +161,8 @@ pub enum MovedWhy {
     /// What a link on the way to the path read leads to, or a directory above that.
     Through,
     /// The names the read's answer rests on can't be told (a path that is not absolute,
-    /// has `..` in it, more than [`MOST_LINKS`] links or a part that can't be read): it is
-    /// taken as changed.
+    /// has a `..` below a name that is not a directory, more than [`MOST_LINKS`] links or a
+    /// part that can't be read): it is taken as changed.
     Untold,
 }
 
@@ -278,8 +278,12 @@ pub(crate) const MOST_LINKS: usize = 40;
 /// A link pointed elsewhere is a change in the link's own directory, and the file changed is
 /// one in its own: with a watch over each, nothing the answer depends on moves unheard. A
 /// missing path's name is the first part of it that is not there: the name that would be made.
-/// `None` for a path that is not absolute, has `..` in it, has more than [`MOST_LINKS`]
-/// links, or of which a part before the last is unreadable. Cold: on a miss only, and once
+/// A `..`, in the path or in a link's target, is the parent of the name resolved so far, as
+/// the kernel resolves it: `/lib/../lib`, with `/lib` a link to `usr/lib`, is `/usr/lib`, and
+/// rests on `/lib` and `/usr/lib` (gcc names its library directories so).
+/// `None` for a path that is not absolute, has a `..` below a name that is not a directory
+/// (the kernel's `ENOTDIR`), has more than [`MOST_LINKS`] links, or of which a part before the
+/// last is unreadable. Cold: on a miss only, and once
 /// per path a kept test pass read ([`Began::moved`]).
 fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     use std::path::Component;
@@ -292,17 +296,24 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     for part in parts {
         match part {
             Component::Normal(name) => left.push(name.to_owned()),
+            Component::ParentDir => left.push("..".into()),
             _ => return None,
         }
     }
     left.reverse();
     let mut names = Vec::new(); // alloc: cold, as above
     let mut at = PathBuf::from("/"); // alloc: cold, as above
+    // Whether `at` is a directory: a `..` below a name that is not one is the kernel's
+    // `ENOTDIR`, whose answer no name here vouches for.
+    let mut at_dir = true;
     // Bounded: each turn takes one part, and only a link, of which there are at most
     // `MOST_LINKS`, adds any.
     while let Some(part) = left.pop() {
         if part == ".." {
-            // Of a link's target: `at` has no link in it, so its parent is the name's.
+            // `at` has no link in it, so its parent is the name's.
+            if !at_dir {
+                return None;
+            }
             at.pop();
             continue;
         }
@@ -316,7 +327,7 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
                 names.push(name);
                 for part in target.components().rev() {
                     match part {
-                        Component::RootDir => at = PathBuf::from("/"),
+                        Component::RootDir => (at, at_dir) = (PathBuf::from("/"), true),
                         Component::CurDir => {}
                         Component::ParentDir => left.push("..".into()),
                         Component::Normal(name) => left.push(name.to_owned()),
@@ -324,7 +335,7 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
                     }
                 }
             }
-            Ok(_) => at = name,
+            Ok(meta) => (at, at_dir) = (name, meta.is_dir()),
             // The name that would be made, for a path that is not there: its last part, or
             // the first part of it that is missing (nothing below a name that is not there
             // is, until that name is made, which its directory hears). Until 2026-11-12 a
@@ -1228,10 +1239,26 @@ mod tests {
         MISSING_PARENT_IS_UNVOUCHED.set(true);
         assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "planted");
         MISSING_PARENT_IS_UNVOUCHED.set(false);
-        // A `.` names nothing (`Path::components` drops it); a `..` may cross a link, and is
-        // not resolved here.
+        // A `.` names nothing (`Path::components` drops it).
         assert_eq!(names(&dir.join("sdks/./real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
-        assert_eq!(names(&dir.join("sdks/named/../real/lib/system"), hash), None);
+        // The invariant: a `..` is the parent of the name it follows once that name's links
+        // are resolved, as the kernel resolves it: `sdks/named` is `sdks/real`, whose parent
+        // is `sdks`. gcc reads `/lib/../lib` so, with `/lib` a link to `usr/lib`.
+        assert_eq!(
+            names(&dir.join("sdks/named/../real/lib/system"), hash),
+            Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/system")])
+        );
+        assert_eq!(
+            names(&dir.join("other/lib/../lib/m"), hash),
+            Some(vec![
+                dir.join("other/lib"),
+                dir.join("sdks/named"),
+                dir.join("sdks/real/lib/m"),
+                dir.join("sdks/real/lib/system"),
+            ])
+        );
+        // A `..` below a file is the kernel's `ENOTDIR`: vouched for by nothing.
+        assert_eq!(names(&dir.join("sdks/real/lib/system/../system"), hash), None);
         assert_eq!(names(Path::new("relative/a"), hash), None);
         std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
         assert_eq!(names(&dir.join("loop"), hash), None, "a link to itself ends at the bound");
