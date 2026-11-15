@@ -446,6 +446,12 @@ pub struct Compiled {
     /// by its key, sorted: what a refusal of its put names (rule 19). Empty for a unit that
     /// made none.
     pub put_of: Vec<(blaze_cas::Key, Arc<blaze_codegen::driver::PutOf>)>,
+    /// Its crate's identity moved between its record's lookup and its store (a build script's
+    /// run applied, or a proc macro's expanders given, to it or a crate it depends on): its
+    /// record is filed under the key it was looked up under, which a build of the front end
+    /// as it is now does not ask, so it does not stand in the next build
+    /// (`serve::job::standing`). False for a unit replayed from its record.
+    pub moved: bool,
     /// The unit's record still to encode and file, put after the build's answer by its
     /// after-answer task ([`crate::serve::unit::file_records`]), as one more of the puts the
     /// job's settling waits for, so its request certificate is written only once the record
