@@ -277,8 +277,8 @@ pub struct Library {
 /// A path outside the view and every source, read from the disk where it is
 /// ([`blaze_units::query::FetchKind::Local`]): a `path` dependency outside the checkout, or a
 /// manifest its workspace search looks for above it. Mounted as a root of its own, keyed by its
-/// bytes as a fetched source is, and kept for later jobs only while the watch of directories
-/// outside views vouches that nothing under it changed ([`LocalRead::watched`]).
+/// bytes as a fetched source is, and kept for later jobs only while every one of its leaves'
+/// stamps holds ([`LocalRead::leaves`], [`blaze_vfs::outside::holds`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LocalRead {
     /// Where it is mounted, as the load names it: the package directory around the path the
@@ -287,12 +287,19 @@ pub struct LocalRead {
     /// Its files: a directory's whole tree (`under` ""), or one file, or none for a path that
     /// is not there (`under` the file's name, so it reads as absent).
     pub source: Source,
-    /// For a directory, the canonical path it was read from (every symlink resolved), whose
-    /// watch outside views says when to read it again; `None` for one file or an absent
-    /// path, read again by every job.
-    pub watched: Option<String>,
-    /// [`blaze_vfs::outside::generation`] as read before its files were.
-    pub generation: u64,
+    /// Every directory and file it was read from, with its `lstat` stamp taken before the
+    /// read; `None` for a path named through a link, read again by every job.
+    pub leaves: Option<Box<[LocalLeaf]>>,
+    /// The wall clock before the first stamp ([`blaze_core::system_wall_ns`]).
+    pub looked_ns: u64,
+}
+
+/// One path a local mount was read from, absolute, and its `lstat` stamp
+/// ([`blaze_core::Stamp::GONE`] for a path read as absent).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LocalLeaf {
+    pub path: String,
+    pub stamp: blaze_core::Stamp,
 }
 
 /// A value for the store, put by the loop.

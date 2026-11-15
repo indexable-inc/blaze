@@ -41,7 +41,7 @@ use blaze_ids::ContentId;
 use blaze_image::{Corrupt, Image, OpenError, Refused};
 use blaze_profile::{Plot, Watchdog, watchdog::Progress};
 use blaze_query::Database;
-use blaze_vfs::{DisksUnused, ImageUse, Outside, Ticket, Vfs};
+use blaze_vfs::{DisksUnused, ImageUse, Ticket, Vfs};
 
 use super::{
     heads::{Heads, Out},
@@ -68,9 +68,6 @@ const STORE: u64 = 4 << 32;
 const FLUSHES: u64 = 5 << 32;
 const JOBS: u64 = 6 << 32;
 const JOBS_END: u64 = 7 << 32;
-/// The watches of directories outside views ([`blaze_vfs::Outside`]).
-const OUTSIDE: u64 = 7 << 32;
-const OUTSIDE_END: u64 = OUTSIDE + blaze_vfs::outside::TAGS;
 /// The shared standard library's store ([`Options::std`]).
 const STD_STORE: u64 = 8 << 32;
 const STD_STORE_END: u64 = 9 << 32;
@@ -585,9 +582,6 @@ pub struct Options {
     /// What it was started with and keeps for its life ([`super::settings`]), which a client
     /// compares with its own environment before it sends a request.
     pub settings: Vec<blaze_api::Setting>,
-    /// The table of directories outside views that user code's checks read
-    /// ([`blaze_vfs::outside::dirs`]); the daemon drives its watches for its whole life.
-    pub outside: &'static blaze_vfs::outside::Dirs,
     /// How long no span may close, no query complete and no task or unit's step end while the
     /// plane's tasks run before the build fails with the stall ([`Daemon::watch`]):
     /// [`Watchdog::BOUND`] unless `blaze serve --stall-bound SECS` says.
@@ -2024,7 +2018,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             std,
             plane,
             mounts,
-            heads: Heads::new(FLUSHES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
+            heads: Heads::new(FLUSHES, WATCHERS, RUNS),
             images: Images::new(image, IMAGE, on_disk, texts, text_pin),
             jobs,
             steps,
@@ -3365,7 +3359,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             PEERS..PEERS_END => Handler::Peers,
             STORE..FLUSHES | LOADS..STD_LOADS => Handler::Store,
             STD_STORE..STD_STORE_END | STD_LOADS..STD_LOADS_END => Handler::Std,
-            FLUSHES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => Handler::Heads,
+            FLUSHES..JOBS | WATCHERS..RUNS => Handler::Heads,
             JOBS..JOBS_END | RUNS..RUNS_END => Handler::Jobs,
             super::direct::HOME_TAGS.. => Handler::LateRead,
             _ => Handler::Unowned,
