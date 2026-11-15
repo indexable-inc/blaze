@@ -2,8 +2,7 @@
 //! generic arguments bind and nest, a single name means what the std prelude names by it, and
 //! a refusal says what to write instead.
 
-use super::{texts, view};
-use crate::query;
+use super::{query, texts, view};
 
 const OWN: &str = r#"
 //- /lib.rs crate:lib edition:2021

@@ -92,7 +92,7 @@ use blaze_hash::hash_map::Entry;
 use std::sync::Arc;
 
 use base_db::{Crate, Db, relevant_crates};
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::HashMap;
 use hir_def::{
     AdtId, DefWithBodyId, EnumId, ExpressionStoreOwnerId, GenericDefId, ImplId, Lookup, ModuleId,
     TraitId, VariantId, dyn_map::DynMap, nameres::crate_def_map,
@@ -113,26 +113,26 @@ pub(super) struct SourceToDefCache<'db> {
     expansions: Vec<ExpansionInfo<'db>>,
     pub(super) file_to_def_cache: HashMap<FileId, SmallVec<[ModuleId; 1]>, Global>,
     pub(super) included_file_cache: HashMap<EditionedFileId, Option<MacroCallId>, Global>,
-    /// The crates a file is taken to be a module of, of those it may be, when any is.
-    pub(super) within: Option<Arc<HashSet<Crate, Global>>>,
+    /// The crates a file is taken to be a module of, of those it may be, when any is, in the
+    /// order the caller gave: the first that holds a file answers for its syntax.
+    pub(super) within: Option<Arc<[Crate]>>,
 }
 
 /// The crates `file` may be a module of, asked in two rounds. `first`: each crate `within`, in
-/// the order of their IDs, whether or not the file is in its source root, as a `#[path]`
+/// the caller's order, whether or not the file is in its source root, as a `#[path]`
 /// module may be a file of another package's source root (`#[path = "../../b/tests/m.rs"]
 /// mod m;`), which [`relevant_crates`] (the crates of the file's own source root) leaves out.
 /// Then the crates of the file's source root not `within`: the file of a package is in the
 /// source root of each of its targets, and each would otherwise have its module tree built.
 fn crates_of<'a>(
     db: &'a Db,
-    within: Option<&'a HashSet<Crate, Global>>,
+    within: Option<&'a [Crate]>,
     file: FileId,
     first: bool,
 ) -> impl Iterator<Item = Crate> + 'a {
     let mut chosen: SmallVec<[Crate; 2]> = SmallVec::new();
     if first && let Some(within) = within {
         chosen.extend(within.iter().copied());
-        chosen.sort_unstable();
     }
     let others = match first {
         true => &[][..],

@@ -36,7 +36,7 @@ use hir_def::{
     resolver::HasResolver as _,
 };
 use memchr::memmem::Finder;
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use syntax::{
     SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -121,9 +121,7 @@ pub(crate) fn replace(
     let fail = |what: String| ApiError::new(what, None);
     let db = cx.db;
     let files = cx.files;
-    // alloc: one entry a crate of the view, once a replace
-    let view: Vec<Crate> =
-        Crate::all(db).into_iter().filter(|it| files.path(it.root_file(db)).is_some()).collect();
+    let view = cx.view.clone(); // clone: the view's crates, once a replace, beside `cx`'s edits
     if view.is_empty() {
         return Err(fail("the view has no crate the front end lowered".to_owned()));
     }
@@ -174,7 +172,7 @@ pub(crate) fn replace(
     let mut hits = Vec::new();
     let mut adds: Vec<(usize, Add)> = Vec::new();
     let mut direct = HashSet::new_in(Global);
-    for (krate, file) in files_of(db, &scanned) {
+    for (krate, file) in files_of(db, files, &scanned, Global) {
         let holds = |at: usize, bytes: &[u8]| {
             if !reach[at].contains(&krate) {
                 return None;
@@ -263,6 +261,11 @@ pub(crate) fn replace(
             }
         }
         for rewrite in rewrites {
+            // Past the file's bytes is the module blaze appended to a crate root (a test's
+            // harness): the compiler's code, which no edit reaches.
+            if usize::from(rewrite.range.end()) > end {
+                continue;
+            }
             let token = root
                 .token_at_offset(rewrite.range.start())
                 .right_biased()
@@ -359,38 +362,28 @@ fn def_of(db: &Db, view: &[Crate], path: &str) -> Result<Def, String> {
              depending on it would"
         ));
     }
-    let named: Vec<Crate> = Crate::all(db)
-        .into_iter()
-        .filter(|it| it.base().rust_name(db).is_ok_and(|it| it.as_str() == first))
-        .collect(); // alloc: the crates by one name, once a replace
-    let depended = |krate: Crate| {
-        view.contains(&krate)
-            || view.iter().any(|it| it.dependencies_iter(db).any(|dep| dep.krate == krate))
-    };
-    let krate = match named.as_slice() {
-        [] => {
+    let named = |krate: &Crate| krate.base().rust_name(db).is_ok_and(|it| it.as_str() == first);
+    // The view's own copies of one crate (a lib and its test unit) are one crate by the view's
+    // order: the first answers, as it answers for the files they share.
+    let own = view.iter().copied().find(named);
+    let mut deps: Vec<Crate> = Vec::new(); // alloc: the crates by one name, once a replace
+    for dep in view.iter().flat_map(|it| it.dependencies_iter(db)).map(|it| it.krate) {
+        if named(&dep) && !deps.contains(&dep) {
+            deps.push(dep);
+        }
+    }
+    let krate = match (own, deps.as_slice()) {
+        (Some(own), _) => own,
+        (None, [one]) => *one,
+        (None, []) => {
             return Err(format!(
-                "no crate of the build is named `{first}`, which `{path}` starts at"
+                "no crate of the view or its dependencies is named `{first}`, which `{path}` starts at"
             ));
         }
-        [one] => *one,
-        many => {
-            let mut seen = many.iter().copied().filter(|it| depended(*it));
-            match (seen.next(), seen.next()) {
-                (Some(one), None) => one,
-                (None, _) => {
-                    return Err(format!(
-                        "{} crates are named `{first}`, and none is the view's or a dependency of it",
-                        many.len()
-                    ));
-                }
-                (Some(_), Some(_)) => {
-                    return Err(format!(
-                        "more than one crate named `{first}` is the view's or a dependency of it, so `{path}` \
-                         names no one item"
-                    ));
-                }
-            }
+        (None, _) => {
+            return Err(format!(
+                "more than one dependency of the view is named `{first}`, so `{path}` names no one item"
+            ));
         }
     };
     let root = krate.root_module(db);
@@ -477,15 +470,23 @@ fn crates_of(db: &Db, view: &[Crate], old: &Def) -> Vec<Crate> {
     view.iter().copied().filter(|it| reach.contains(it)).collect()
 }
 
-/// The files of `crates`' modules, each once, with the crate it is first a module of.
-fn files_of(db: &Db, crates: &[Crate]) -> Vec<(Crate, FileId)> {
-    let mut seen = HashSet::new_in(Global);
-    let mut files = Vec::new();
+/// The files of `crates`' modules, each once, with the crate it is first a module of. A file
+/// of the view is once by its path: a test unit's root is an alias of the file on disk.
+fn files_of<A: Allocator + Clone>(
+    db: &Db,
+    view: &impl Files,
+    crates: &[Crate],
+    alloc: A,
+) -> Vec<(Crate, FileId), A> {
+    let mut seen = HashSet::new_in(alloc.clone()); // clone: the caller's allocator handle
+    let mut paths = HashSet::new_in(alloc.clone()); // clone: the caller's allocator handle
+    let mut files = Vec::new_in(alloc);
     for krate in crates {
         for module in krate.modules(db) {
             if let Some(file) = module.as_source_file_id(db) {
                 let file = file.file_id(db);
-                if seen.insert(file) {
+                let new_path = view.path(file).is_none_or(|it| paths.insert(it));
+                if seen.insert(file) && new_path {
                     files.push((*krate, file));
                 }
             }

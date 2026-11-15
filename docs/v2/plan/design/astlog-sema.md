@@ -75,6 +75,19 @@ And one over the type behind any references, by the names the std prelude gives:
   names included (it is a local, a field or a method name, whose meaning `resolves` and `callee`
   give); write the def path to match by resolution. A pattern path that names nothing is a load
   error.
+- **One crate a file.** A query or an edit reads the crates of its job's plan whose root is a
+  file of the view, and no other crate the front end holds: a front end kept across jobs holds
+  a default check's crates beside a check of tests', and reading them all made every match of
+  a lib's root two rows. The job's test units come first, then the rest, each in plan order
+  (`serve/unit/intent.rs`, `read_order`). A file is one tree, the one of the first of those
+  crates that has it as a module, and that crate answers every semantic question about its
+  nodes: resolution, types, `cfg-off`. A lib's test unit has the lib's root as an alias of the
+  file on disk with its harness appended, and shares the lib's other files, so a check of tests
+  reads all of them through the test unit. The module blaze appends to a crate root (a test's
+  harness, a wasm proc macro's glue) is the compiler's code: no pattern matches in it and no
+  edit reaches it. blaze-intent's edits (`rename`, `--replace`, a change of parameters) read the
+  same crates in the same order, a file opened once by its path; a replace's def path starts
+  at the first of the job's crates by that name, else at the one dependency of them by it.
 - **Rewrites.** `(replace n "tmpl")`, `(delete n)`, `(insert-before n "tmpl")`,
   `(insert-after n "tmpl")`, `(rename n "new_name")` (n a def; every reference moves, through
   blaze-intent), `(retarget n "krate::path")` (n a path node; written as the file sees the new
@@ -285,6 +298,10 @@ reference model for a property test only.
 | Apply rewrites | splice each changed file once, reparse it | the same, plus blaze-intent's own reparse for semantic actions |
 
 ## Not built
+
+- A rename of a lib's public item through a job of tests. The test unit answers for the lib's
+  files, so the item renamed is the test unit's, which no crate depends on: a bin or an
+  integration test of the same job that calls the lib's own copy is not edited.
 
 - Magic sets. Demand comes from the rule binding the argument on its left; a relation is never
   enumerated over the whole crate graph.

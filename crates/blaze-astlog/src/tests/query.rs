@@ -2,8 +2,7 @@
 //! it pins: paths match by what they resolve to, types and traits select by type, recursion
 //! and negation reach their fixpoint.
 
-use super::{lines, texts, view};
-use crate::query;
+use super::{lines, query, texts, view};
 
 const OUTSIDE: &str = r#"
 //- /std.rs crate:std edition:2021

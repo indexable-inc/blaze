@@ -16,8 +16,7 @@ use std::path::{Path, PathBuf};
 use blaze_api::query::{Cell, Rows, Severity};
 
 use super::rewrite::after;
-use super::view;
-use crate::{edit, query};
+use super::{edit, query, view};
 
 /// The pack, from this crate's directory.
 const PACK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/astlog/rules-sema");

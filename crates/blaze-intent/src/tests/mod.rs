@@ -17,6 +17,15 @@ use blaze_ids::ContentId;
 use blaze_vfs::{Mode, Op, Vfs};
 use syntax::{Edition, SourceFile, SyntaxKind, TextRange, WalkEvent, view::Node};
 
+/// [`crate::apply`] through every crate of the fixture, which is one job's.
+pub(crate) fn apply<F: crate::Files>(
+    db: &base_db::Db,
+    files: &F,
+    edits: &[blaze_api::Edit],
+) -> Result<crate::Applied, blaze_api::ApiError> {
+    crate::apply(db, files, &hir::Crate::all(db), edits)
+}
+
 /// Every node and token of a tree, by kind and range, bodies parsed.
 pub(crate) fn shape(node: Node<'_>) -> Vec<(SyntaxKind, TextRange)> {
     node.preorder_with_tokens()

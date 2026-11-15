@@ -3,8 +3,7 @@
 
 use blaze_vfs::Op;
 
-use super::{View, view};
-use crate::edit;
+use super::{View, edit, view};
 
 const LIB: &str = r#"
 //- /lib.rs crate:lib edition:2021
@@ -341,7 +340,9 @@ fn a_bound_expression_in_an_inserted_statement_keeps_its_meaning() {
 #[test]
 fn without_precedence_the_same_rewrites_parse_as_other_code() {
     let (db, files) = view(PREC, 0, &["lib.rs"]);
-    let applied = crate::rewrite::edit_with(&db, &files, INLINE, &[], crate::splice::Parens::Off).unwrap();
+    let crates = hir::Crate::all(&db);
+    let applied =
+        crate::rewrite::edit_with(&db, &files, &crates, INLINE, &[], crate::splice::Parens::Off).unwrap();
     let text = &after(&files, &applied.edited.ops)[0].1;
     assert!(text.contains("{ x + y * b }") && text.contains("{ a + b.len() }"), "{text}");
     assert_ne!(tail(text, "product").1, mul_op(), "the sum is now the outer operator: {text}");

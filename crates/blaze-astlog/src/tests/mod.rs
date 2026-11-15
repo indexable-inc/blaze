@@ -15,6 +15,21 @@ use hir_expand::fixture;
 
 use blaze_api::query::{Cell, Rows as Outcome};
 
+/// [`crate::query`] through every crate of the fixture, which is one job's.
+pub(crate) fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Result<Outcome, crate::Error> {
+    crate::query(db, files, &hir::Crate::all(db), rules)
+}
+
+/// [`crate::edit`] through every crate of the fixture, which is one job's.
+pub(crate) fn edit<F: Files>(
+    db: &Db,
+    files: &F,
+    rules: &str,
+    edits: &[blaze_api::Edit],
+) -> Result<blaze_intent::Applied, crate::Error> {
+    crate::edit(db, files, &hir::Crate::all(db), rules, edits)
+}
+
 /// The view: its files by path, with their text.
 pub(crate) struct View {
     pub files: Vec<(FileId, String, String)>,

@@ -14,7 +14,7 @@ blaze-audit	0	0	65	25
 blaze-bench	0	0	0	12
 blaze-build-script	67	0	7	26
 blaze-bytes	0	0	0	3
-blaze-cargo	2319	2	209	1465
+blaze-cargo	2319	2	211	1465
 blaze-cas	817	0	158	355
 blaze-certify	83	0	0	51
 blaze-check	47	0	2	34
@@ -25,7 +25,7 @@ blaze-codegen	516	0	62	161
 blaze-codegen-code	0	0	0	66
 blaze-core	764	0	174	219
 blaze-dbsp	12	0	12	4
-blaze-diagnostics	3940	0	273	895
+blaze-diagnostics	3939	0	271	895
 blaze-diff	27	0	4	24
 blaze-diff-mir	27	0	1	5
 blaze-doc	17	0	44	112
@@ -53,7 +53,7 @@ blaze-hub	59	0	0	17
 blaze-ids	24	0	2	18
 blaze-image	11	0	0	13
 blaze-inproc	6	0	0	7
-blaze-intent	40	0	30	52
+blaze-intent	40	0	28	51
 blaze-item-hash	11	0	0	1
 blaze-items	61	0	11	42
 blaze-kernel	246	0	22	80
@@ -144,7 +144,7 @@ harness/harness-video	0	0	0	20
 harness/harness-vt	0	0	0	10
 harness/vendor/hyperion-ecs	0	0	0	13
 harness/vendor/hyperion-manifest-types	0	0	0	3
-hir	243	0	45	122
+hir	243	0	41	122
 hir-def	844	0	268	337
 hir-expand	157	0	9	47
 hir-firewall	22	0	6	12

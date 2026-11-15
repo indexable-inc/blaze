@@ -104,8 +104,8 @@ impl<'db> Semantics<'db> {
     }
 
     /// Like `new`, with a file taken as a module of only those of `crates` it is in, when it
-    /// is in any.
-    pub fn new_within(db: &'db Db, crates: Arc<HashSet<base_db::Crate, Global>>) -> Semantics<'db> {
+    /// is in any: of several, the first in `crates`' order answers for its syntax.
+    pub fn new_within(db: &'db Db, crates: Arc<[base_db::Crate]>) -> Semantics<'db> {
         let mut imp = SemanticsImpl::new(db);
         imp.s2d_cache.get_mut().within = Some(crates);
         Semantics {
@@ -120,7 +120,7 @@ impl<'db> Semantics<'db> {
     /// [`Semantics::new_within`] for a probe: the first thing asked of it, a tree handed out
     /// ([`Semantics::cache`]), a node put in its file ([`Semantics::find_file`]) or a
     /// source-to-def lookup (`with_ctx`), sets [`Semantics::asked`] and unwinds with [`Asked`].
-    pub fn new_probe(db: &'db Db, crates: Arc<HashSet<base_db::Crate, Global>>) -> Semantics<'db> {
+    pub fn new_probe(db: &'db Db, crates: Arc<[base_db::Crate]>) -> Semantics<'db> {
         let mut imp = SemanticsImpl::new(db);
         imp.s2d_cache.get_mut().within = Some(crates);
         Semantics {

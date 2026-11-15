@@ -20,7 +20,7 @@ use blaze_api::{Edit, Param};
 use blaze_api::query::{self as api, Cell, Finding, Relation, Rows};
 use blaze_hash::HashMap;
 use blaze_intent::{Applied, Files, TextEdit};
-use hir::{FindPathConfig, ModuleDef};
+use hir::{Crate, FindPathConfig, ModuleDef};
 use syntax::{
     SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _},
@@ -37,14 +37,15 @@ type Res<T> = Result<T, Error>;
 
 /// Run `rules` over the view and return what it derives, as the API's
 /// [`blaze_api::Response::Rows`] carries it: relations by name, each's rows by place, then the
-/// findings by place. Rewrites are not planned.
+/// findings by place. Rewrites are not planned. The view is read through `crates` alone, in
+/// their order ([`Sema::new`]).
 ///
 /// # Errors
 ///
 /// The rules' load errors, and a relation's failure, each naming its rules line.
-pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Rows> {
+pub fn query<F: Files>(db: &Db, files: &F, crates: &[Crate], rules: &str) -> Res<Rows> {
     let program = Program::load(rules, &ViewRules(files))?;
-    let facts = Sema::new(db, files)?;
+    let facts = Sema::new(db, files, crates)?;
     let rewrites = Program { rules: program.rules, rewrites: Vec::new(), lints: program.lints };
     let (database, _) = blaze_query::db::attach(db, || astlog_engine::run(&rewrites, &facts))?;
     let mut relations = Vec::new(); // alloc: one per relation, the answer's own
@@ -137,26 +138,33 @@ fn place_key(cell: &Cell) -> (u8, &str, u32, u32, &str, i64) {
 }
 
 /// Run `rules` over the view and apply every rewrite's actions, with `edits` before them, as
-/// one request.
+/// one request, read through `crates` as [`query`] reads them.
 ///
 /// # Errors
 ///
 /// A query's errors; an action that can't be placed or that overlaps another rule's, naming
 /// both and the place; the edits' own failure, a file left unparsable among them.
-pub fn edit<F: Files>(db: &Db, files: &F, rules: &str, edits: &[Edit]) -> Res<Applied> {
-    edit_with(db, files, rules, edits, Parens::ByPrecedence)
+pub fn edit<F: Files>(
+    db: &Db,
+    files: &F,
+    crates: &[Crate],
+    rules: &str,
+    edits: &[Edit],
+) -> Res<Applied> {
+    edit_with(db, files, crates, rules, edits, Parens::ByPrecedence)
 }
 
 /// [`edit`], with templates parenthesized by precedence or, for a test's control, not.
 pub(crate) fn edit_with<F: Files>(
     db: &Db,
     files: &F,
+    crates: &[Crate],
     rules: &str,
     edits: &[Edit],
     parens: Parens,
 ) -> Res<Applied> {
     let program = Program::load(rules, &ViewRules(files))?;
-    let facts = Sema::new(db, files)?;
+    let facts = Sema::new(db, files, crates)?;
     blaze_query::db::attach(db, || {
         let (_, planned) = astlog_engine::run(&program, &facts)?;
         let literal = literal_paths(&facts, &program)?;
@@ -180,7 +188,7 @@ pub(crate) fn edit_with<F: Files>(
         }
         imports::finish(&facts, moved, &mut text, &mut more)?;
         let text = without_overlap(files, text)?;
-        blaze_intent::apply_with_text(db, files, &more, &text).map_err(|error| {
+        blaze_intent::apply_with_text(db, files, &facts.view, &more, &text).map_err(|error| {
             SourceError::Edit { what: error.what.clone(), at: error.at.clone() }.into()
         })
     })

@@ -12,8 +12,9 @@ use base_db::FileId;
 use blaze_api::{ApiError, Edit, Edited, query::Rows};
 use blaze_hash::HashMap;
 use blaze_intent::ahead;
+use blaze_units::schema::Mode;
 use blaze_vfs::Bytes;
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use super::{Job, UnitReader, answer_macros_built, files::Mounted, graph::flag};
 use crate::serve::work::Failed;
@@ -33,16 +34,17 @@ pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edi
         let what = "an edit request carries two astlog rules edits: put every rule in one file";
         return Err(ApiError::new(what, None).into());
     }
-    let files = ViewFiles::new(&job.mounted, reader.paths());
+    let files = ViewFiles::of(job, reader);
+    let crates = read_crates(job, Global)?;
     let applied = match first {
         Some(rules) => {
             // alloc: the request's other edits, once a request
             let others: Vec<Edit> =
                 edits.iter().filter(|it| !matches!(it, Edit::Rules { .. })).cloned().collect();
-            blaze_astlog::edit(reader.db(), &files, rules, &others)
+            blaze_astlog::edit(reader.db(), &files, &crates, rules, &others)
                 .map_err(|error| blaze_astlog::api_error(&error))
         }
-        None => blaze_intent::apply(reader.db(), &files, edits),
+        None => blaze_intent::apply(reader.db(), &files, &crates, edits),
     };
     if let Some((path, why)) = files.corrupt.into_inner() {
         return Err(ApiError::new(why, Some(path)).into());
@@ -57,13 +59,44 @@ pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edi
 /// every lint's finding. Writes nothing and builds nothing past the view's proc macros.
 pub(crate) fn query(job: &Job, reader: &UnitReader, rules: &str) -> Result<Rows, Failed> {
     macros_built(job, reader, "query")?;
-    let files = ViewFiles::new(&job.mounted, reader.paths());
-    let rows = blaze_astlog::query(reader.db(), &files, rules)
+    let files = ViewFiles::of(job, reader);
+    let crates = read_crates(job, Global)?;
+    let rows = blaze_astlog::query(reader.db(), &files, &crates, rules)
         .map_err(|error| blaze_astlog::api_error(&error));
     if let Some((path, why)) = files.corrupt.into_inner() {
         return Err(ApiError::new(why, Some(path)).into());
     }
     Ok(rows?)
+}
+
+/// The crates an edit or a query reads: the job's plan's, never another job's the front end
+/// still has (a test build's beside a default check's), in [`read_order`].
+fn read_crates<A: Allocator + Clone>(job: &Job, alloc: A) -> Result<Vec<hir::Crate, A>, Failed> {
+    let mut units = Vec::with_capacity_in(job.graph.len(), alloc.clone()); // clone: the caller's allocator handle
+    for at in 0..job.graph.len() {
+        let unit = job.unit(at)?;
+        units.push((unit.mode == Mode::Test || unit.checked_as_test, job.crates.krate(at)));
+    }
+    Ok(read_order(&units, alloc))
+}
+
+/// The crates of a plan's `units` (each whether it is built with `cfg(test)`, and its crate),
+/// each once: the test units' first, then the rest, each in plan order. Of two that have one
+/// file (a lib and its test unit), the test unit's answers for it
+/// (docs/v2/plan/design/astlog-sema.md, "One crate a file").
+pub(super) fn read_order<A: Allocator>(units: &[(bool, Option<base_db::Crate>)], alloc: A) -> Vec<hir::Crate, A> {
+    let mut crates = Vec::new_in(alloc);
+    for test in [true, false] {
+        for &(tested, krate) in units {
+            let Some(krate) = krate.filter(|_| tested == test).map(hir::Crate::from) else {
+                continue;
+            };
+            if !crates.contains(&krate) {
+                crates.push(krate);
+            }
+        }
+    }
+    crates
 }
 
 /// Every crate of the view has its proc macros built and applied: an edit or a query resolves
@@ -143,6 +176,14 @@ struct ViewFile<'a> {
 }
 
 impl<'a> ViewFiles<'a> {
+    /// The job's view over the reader's front end.
+    fn of(job: &'a Job, reader: &'a UnitReader) -> ViewFiles<'a> {
+        let files = reader.db().files();
+        ViewFiles::new(&job.mounted, reader.paths(), |id| files.alias_of(id).is_some())
+    }
+
+    /// `paths`' files in the view. A path names the file on disk, never an alias of it
+    /// (`is_alias`: a crate root blaze appended a module to), whatever order `paths` is in.
     #[expect(
         blaze::narrowed_len,
         reason = "view files are u32 indices: a view of 2^32 files needs a typed refusal from \
@@ -151,6 +192,7 @@ impl<'a> ViewFiles<'a> {
     fn new(
         mounted: &'a Mounted,
         paths: &'a std::collections::HashMap<FileId, String>,
+        is_alias: impl Fn(FileId) -> bool,
     ) -> ViewFiles<'a> {
         let mut files = Vec::new();
         let (mut by_path, mut by_id) = (HashMap::new_in(Global), HashMap::new_in(Global));
@@ -158,7 +200,9 @@ impl<'a> ViewFiles<'a> {
             let Some(path) = mounted.in_view(absolute) else { continue };
             let at = u32::try_from(files.len()).expect("under 2^32 files");
             let path: Box<str> = path.into();
-            by_path.insert(path.clone(), at);
+            if !is_alias(id) || !by_path.contains_key(&path) {
+                by_path.insert(path.clone(), at);
+            }
             by_id.insert(id, at);
             files.push(ViewFile { id, absolute, path, bytes: Default::default() });
         }
@@ -202,6 +246,9 @@ impl blaze_intent::Files for ViewFiles<'_> {
 }
 
 #[cfg(test)]
+mod one_copy;
+
+#[cfg(test)]
 mod tests {
     use blaze_core::FileName;
     use blaze_intent::Files as _;
@@ -227,7 +274,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let files = ViewFiles::new(&mounted, &paths);
+        let files = ViewFiles::new(&mounted, &paths, |_| false);
         assert_eq!(files.path(FileId::from_raw(0)), Some("src/lib.rs"));
         assert_eq!(files.path(FileId::from_raw(1)), None);
         assert_eq!(files.file("src/lib.rs"), Some((FileId::from_raw(0), &b"pub fn a() {}\n"[..])));
@@ -251,7 +298,7 @@ mod tests {
         let mounted = Mounted::new(vfs.reader(), root, &mounts, "/w");
         let paths: std::collections::HashMap<FileId, String> =
             [(FileId::from_raw(0), "/w/src/lib.rs".to_owned())].into_iter().collect();
-        let files = ViewFiles::new(&mounted, &paths);
+        let files = ViewFiles::new(&mounted, &paths, |_| false);
         assert_eq!(files.file("rules/lib/calls.astlog"), None, "not a front-end file");
         let read = files.with_bytes("rules/lib/calls.astlog", <[u8]>::to_vec);
         assert_eq!(read.as_deref(), Some(&b"(rule (r x) (fn-item x))\n"[..]));

@@ -18,8 +18,8 @@ use syntax::{
     view::{self as ast, AstNode as _, HasName as _},
 };
 
-use super::{applied, assert_fresh, db::TestDB, roots};
-use crate::{Files, apply, retarget::names_in};
+use super::{applied, apply, assert_fresh, db::TestDB, roots};
+use crate::{Files, retarget::names_in};
 
 const OUTSIDE: &str = r#"
 //- /std.rs crate:std edition:2021
@@ -401,7 +401,7 @@ fn a_def_path_that_names_nothing_or_a_module_is_an_error() {
     for (from, to, wanted) in [
         ("std::sync::Nothing", "parking_lot::Mutex", "names nothing in crate `std`"),
         ("std::sync", "parking_lot::Mutex", "names a module"),
-        ("nowhere::Mutex", "parking_lot::Mutex", "no crate of the build is named `nowhere`"),
+        ("nowhere::Mutex", "parking_lot::Mutex", "no crate of the view or its dependencies is named `nowhere`"),
         ("std::sync::Mutex", "std::sync::Mutex", "name the same item"),
         ("crate::locks::Mutex", "parking_lot::Mutex", "starts at `crate`"),
     ] {

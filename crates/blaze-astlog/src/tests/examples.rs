@@ -3,8 +3,7 @@
 
 use super::rewrite::after;
 use super::types::STD;
-use super::view;
-use crate::edit;
+use super::{edit, view};
 
 const SPEC: &str = include_str!("../../../../docs/v2/plan/design/astlog-sema.md");
 

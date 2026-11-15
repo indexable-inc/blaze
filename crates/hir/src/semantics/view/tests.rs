@@ -431,8 +431,7 @@ pub fn inner() {
             .file_to_module_def(main.file_id(&db))
             .expect("main.rs is `a`'s root")
             .krate(&db);
-        let within =
-            std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([a.base()], std::alloc::Global));
+        let within = std::sync::Arc::new([a.base()]);
         let vsema = Semantics::new_within(&db, within);
         let module =
             vsema.file_to_module_def(m.file_id(&db)).expect("m.rs is the module `m` of `a`");

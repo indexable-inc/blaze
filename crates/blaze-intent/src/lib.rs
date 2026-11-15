@@ -40,7 +40,7 @@ use blaze_api::{ApiError, Edit, Edited, EditedItem};
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_vfs::Op;
-use hir::view::Semantics;
+use hir::{Crate, view::Semantics};
 use std::alloc::Global;
 use syntax::{
     Edition, Parse, SourceFile, SyntaxKind,
@@ -119,6 +119,9 @@ pub(crate) struct Edits<'a, F: Files> {
     pub db: &'a Db,
     pub sema: Semantics<'a>,
     pub files: &'a F,
+    /// The crates the request reads, those of the caller's whose root is a file of the view,
+    /// in its order: the first that has a file as a module answers for it ([`apply`]).
+    pub view: Vec<Crate>,
     pub working: Vec<Working>,
     pub ids: Vec<FileId>,
     /// Each working copy's tree before any splice, as the front end has it: the views `sema`
@@ -146,8 +149,18 @@ pub struct TextEdit {
 /// Makes `edits`, in order, in the view whose front end is `db` and whose files are `files`.
 /// A rename or a replace resolves in the view as it is, so each comes before the request's
 /// other edits. The request's replaces are made together, in one pass at the first of them.
-pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, ApiError> {
-    apply_with_text(db, files, edits, &[])
+///
+/// The view is read through those of `crates` whose root is a file of it, and no other crate
+/// of the database: a file is opened once, by its path, and the first of them that has it as
+/// a module answers what its names resolve to (docs/v2/plan/design/astlog-sema.md, "One crate
+/// a file").
+pub fn apply<F: Files>(
+    db: &Db,
+    files: &F,
+    crates: &[Crate],
+    edits: &[Edit],
+) -> Result<Applied, ApiError> {
+    apply_with_text(db, files, crates, edits, &[])
 }
 
 /// [`apply`]'s `edits`, then `text`, each moved past the edits before it. A text edit whose
@@ -156,13 +169,18 @@ pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, Ap
 pub fn apply_with_text<F: Files>(
     db: &Db,
     files: &F,
+    crates: &[Crate],
     edits: &[Edit],
     text: &[TextEdit],
 ) -> Result<Applied, ApiError> {
+    // alloc: one entry a crate of the view, once a request
+    let view: Vec<Crate> =
+        crates.iter().copied().filter(|it| files.path(it.root_file(db)).is_some()).collect();
     let mut cx = Edits {
         db,
-        sema: Semantics::new(db),
+        sema: Semantics::new_within(db, view.iter().map(|it| it.base()).collect()),
         files,
+        view,
         working: Vec::new(),
         ids: Vec::new(),
         roots: Vec::new(), // alloc: one view per file the request opens, beside `ids`
@@ -336,11 +354,28 @@ impl<F: Files> Edits<'_, F> {
         if let Some(&at) = self.by_path.get(path) {
             return Ok(at);
         }
-        let (file, _) = self
-            .files
-            .file(path)
-            .ok_or_else(|| format!("{path} is no file of the view the front end has"))?;
+        let file = match self.module_at(path) {
+            Some(file) => file,
+            // A file no crate of the view has as a module (one `include!` reads).
+            None => {
+                let (file, _) = self
+                    .files
+                    .file(path)
+                    .ok_or_else(|| format!("{path} is no file of the view the front end has"))?;
+                file
+            }
+        };
         self.load(file, path)
+    }
+
+    /// The file at `path` of the first crate of the view that has it as a module: a test
+    /// unit's root is an alias of the file on disk, so the path alone names two files.
+    fn module_at(&self, path: &str) -> Option<FileId> {
+        let db = self.db;
+        self.view.iter().flat_map(|krate| krate.modules(db)).find_map(|module| {
+            let file = module.as_source_file_id(db)?.file_id(db);
+            (self.files.path(file) == Some(path)).then_some(file)
+        })
     }
 
     /// The working copy of the front end's `file`, opened on first use.

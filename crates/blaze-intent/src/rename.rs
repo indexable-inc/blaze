@@ -99,7 +99,7 @@ pub(crate) fn rename(
     let mut hits = Vec::new();
     let finder = memchr::memmem::Finder::new(bare.as_bytes());
     let files = cx.files;
-    for file in files_of(cx.db, def, Global) {
+    for file in files_of(cx.db, &cx.view, files, def, Global) {
         let path = files.path(file).ok_or_else(|| {
             fail(format!("a file of a crate that can see `{}` is outside the view", target.item))
         })?;
@@ -108,11 +108,16 @@ pub(crate) fn rename(
         if finder.find(bytes).is_none() {
             continue;
         }
+        let end = bytes.len();
         let index = cx.open_id(file).map_err(fail)?;
         let root = cx.roots[index as usize];
         // Each match of the name goes straight to its token (a binary search a level), so the
-        // cost is the matches', not the file's nodes'.
-        for at in finder.find_iter(root.file().text().as_bytes()) {
+        // cost is the matches', not the file's nodes'. The file's bytes alone: a crate root
+        // blaze appended a module to (a test's harness) has the compiler's code after them.
+        let Some(text) = root.file().text().as_bytes().get(..end) else {
+            return Err(fail(format!("the front end's text of {path} is shorter than the view's bytes")));
+        };
+        for at in finder.find_iter(text) {
             let Some(token) = ident_at(root, at, bare.len()) else { continue };
             let class = classify(cx, token, def, node).map_err(|what| {
                 let text = cx.working[index as usize].text();
@@ -217,9 +222,16 @@ pub(crate) fn is(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
     found == item || implements(db, found, item)
 }
 
-/// The files of the crates that can name `def`: its own, and those depending on it when it is
-/// public.
-pub(crate) fn files_of<A: Allocator>(db: &Db, def: Def, alloc: A) -> Vec<FileId, A> {
+/// The files of the crates that can name `def`: its own, and those of `view` depending on it
+/// when it is public. A file of the view is once by its path, the first crate's: a test unit's
+/// root is an alias of the file on disk.
+pub(crate) fn files_of<A: Allocator + Clone>(
+    db: &Db,
+    view: &[Crate],
+    files: &impl Files,
+    def: Def,
+    alloc: A,
+) -> Vec<FileId, A> {
     let (krate, public) = match def {
         Def::Item(item) => {
             let module = match item {
@@ -234,11 +246,12 @@ pub(crate) fn files_of<A: Allocator>(db: &Db, def: Def, alloc: A) -> Vec<FileId,
     };
     let mut crates: Vec<Crate> = vec![krate];
     if public {
-        crates.extend(krate.transitive_reverse_dependencies(db));
+        crates.extend(krate.transitive_reverse_dependencies(db).filter(|it| view.contains(it)));
     }
-    let mut seen_crates = HashSet::new_in(Global);
-    let mut seen = HashSet::new_in(Global);
-    let mut files = Vec::new_in(alloc);
+    let mut seen_crates = HashSet::new_in(alloc.clone()); // clone: the caller's allocator handle
+    let mut seen = HashSet::new_in(alloc.clone()); // clone: the caller's allocator handle
+    let mut paths = HashSet::new_in(alloc.clone()); // clone: the caller's allocator handle
+    let mut out = Vec::new_in(alloc);
     for krate in crates {
         if !seen_crates.insert(krate) {
             continue;
@@ -246,13 +259,14 @@ pub(crate) fn files_of<A: Allocator>(db: &Db, def: Def, alloc: A) -> Vec<FileId,
         for module in krate.modules(db) {
             if let Some(file) = module.as_source_file_id(db) {
                 let file = file.file_id(db);
-                if seen.insert(file) {
-                    files.push(file);
+                let new_path = files.path(file).is_none_or(|it| paths.insert(it));
+                if seen.insert(file) && new_path {
+                    out.push(file);
                 }
             }
         }
     }
-    files
+    out
 }
 
 /// What `token`, the old name, is to `def`, across every macro expansion it is in.

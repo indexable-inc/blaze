@@ -2,8 +2,7 @@
 //! must not.
 
 use super::rewrite::after;
-use super::{lines, texts, view};
-use crate::{edit, query};
+use super::{edit, lines, query, texts, view};
 
 const DEP: &str = r#"
 //- /dep.rs crate:dep edition:2021

@@ -233,7 +233,7 @@ pub(crate) fn params(
     while let Some(name) = names.get(searched).cloned() {
         searched += 1;
         let finder = memchr::memmem::Finder::new(name.as_bytes());
-        for file in rename::files_of(db, Def::Item(item), Global) {
+        for file in rename::files_of(db, &cx.view, files, Def::Item(item), Global) {
             let path = files.path(file).ok_or_else(|| {
                 fail(format!("a file of a crate that can see `{}` is outside the view", target.item))
             })?;
@@ -242,9 +242,15 @@ pub(crate) fn params(
             if finder.find(bytes).is_none() {
                 continue;
             }
+            let end = bytes.len();
             let index = cx.open_id(file).map_err(fail)?;
             let root = cx.roots[index as usize];
-            for at in finder.find_iter(root.file().text().as_bytes()) {
+            // The file's bytes alone: a crate root blaze appended a module to (a test's harness)
+            // has the compiler's code after them.
+            let Some(text) = root.file().text().as_bytes().get(..end) else {
+                return Err(fail(format!("the front end's text of {path} is shorter than the view's bytes")));
+            };
+            for at in finder.find_iter(text) {
                 let Some(token) = rename::ident_at(root, at, name.len()) else { continue };
                 let place = || {
                     let text = root.file().text();

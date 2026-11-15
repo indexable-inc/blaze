@@ -11,8 +11,8 @@ use blaze_vfs::Op;
 use hir_expand::fixture;
 use syntax::{Edition, NodeOrToken, SourceFile, SyntaxKind};
 
-use super::{applied, assert_fresh, db::TestDB, roots};
-use crate::{Applied, Files, apply};
+use super::{applied, apply, assert_fresh, db::TestDB, roots};
+use crate::{Applied, Files};
 
 const GRAPH: &str = r#"
 //- /main.rs crate:main deps:lib

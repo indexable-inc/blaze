@@ -2,8 +2,7 @@
 //! read from the view's files, each file once; a missing file, a cycle, and an error inside an
 //! included file each name the file and its line.
 
-use super::{texts, view};
-use crate::query;
+use super::{query, texts, view};
 
 const LIB: &str = r#"
 pub fn old(x: u32) -> u32 { x }

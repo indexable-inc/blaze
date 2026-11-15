@@ -56,6 +56,20 @@ pub struct Tree<'a> {
     pub path: Option<String>,
     /// The macro call this tree is the expansion of, in the tree it is in.
     pub call: Option<Node>,
+    /// Of a crate root blaze appended a module to (a test's harness, a wasm proc macro's
+    /// glue), that module: the compiler's code, which the file on disk does not have, so no
+    /// pattern matches in it.
+    pub compiler: Option<syntax::TextRange>,
+}
+
+/// The module blaze appended to `file`'s text, the root's last item by its name, in `root`.
+fn appended(db: &Db, file: FileId, root: ast::Node<'_>) -> Option<syntax::TextRange> {
+    use syntax::view::{HasModuleItem as _, HasName as _};
+    let name = db.file_text(file).appended_root_module(db)?;
+    let Some(ast::Item::Module(module)) = ast::SourceFile::cast(root)?.items().last() else {
+        return None;
+    };
+    module.name().is_some_and(|it| it.text() == name).then(|| module.syntax().text_range())
 }
 
 /// blaze's facts over one view.
@@ -81,16 +95,20 @@ pub struct Sema<'a, F: Files> {
 type Res<T> = Result<T, Error>;
 
 impl<'a, F: Files> Sema<'a, F> {
-    /// The facts of the view whose front end is `db` and whose files are `files`.
+    /// The facts of the view whose front end is `db` and whose files are `files`, read through
+    /// those of `crates` whose root is a file of the view, in `crates`' order: a file is one
+    /// tree, the one of the first of them that has it as a module, and that crate answers
+    /// every semantic question about its nodes (docs/v2/plan/design/astlog-sema.md, "One
+    /// crate a file"). No other crate of the database is read.
     ///
     /// # Errors
     ///
-    /// A view with no crate the front end lowered.
-    pub fn new(db: &'a Db, files: &'a F) -> Res<Sema<'a, F>> {
-        let sema = Semantics::new(db);
+    /// None of `crates` has its root in the view.
+    pub fn new(db: &'a Db, files: &'a F, crates: &[Crate]) -> Res<Sema<'a, F>> {
         // alloc: the view's crates, once a run
         let view: Vec<Crate> =
-            Crate::all(db).into_iter().filter(|it| files.path(it.root_file(db)).is_some()).collect();
+            crates.iter().copied().filter(|it| files.path(it.root_file(db)).is_some()).collect();
+        let sema = Semantics::new_within(db, view.iter().map(|it| it.base()).collect());
         let Some(first) = view.first() else {
             return Err(crate::error::SourceError::Edit {
                 what: "the view has no crate the front end lowered".to_owned(),
@@ -115,21 +133,34 @@ impl<'a, F: Files> Sema<'a, F> {
             prelude: RefCell::new(HashMap::new_in(Global)),
             view,
         };
-        let mut seen: Vec<FileId> = Vec::new(); // alloc: the view's files, once a run
+        // A test unit's root is an alias of the file on disk, another file ID at the same path:
+        // one tree a path, so a match is one row.
+        let mut seen: Vec<&str> = Vec::new(); // alloc: the view's files, once a run
         let mut targets = Vec::new();
         for krate in &facts.view {
             for module in krate.modules(db) {
                 let Some(file) = module.as_source_file_id(db) else { continue };
                 let file = file.file_id(db);
-                if seen.contains(&file) || files.path(file).is_none() {
+                let Some(path) = files.path(file) else { continue };
+                if seen.contains(&path) {
                     continue;
                 }
-                seen.push(file);
+                seen.push(path);
                 let root = facts.sema.parse(facts.sema.attach_first_edition(file)).syntax();
-                targets.push(facts.tree(root));
+                let tree = facts.tree(root);
+                facts.trees.borrow_mut()[tree as usize].compiler = appended(db, file, root);
+                targets.push(tree);
             }
         }
         Ok(Sema { targets, ..facts })
+    }
+
+    /// The nodes of `tree` its file's text has: none of the module the compiler appends to a
+    /// crate's root ([`Tree::compiler`]).
+    fn written(&self, tree: u32) -> impl Iterator<Item = ast::Node<'a>> {
+        let Tree { root, compiler, .. } = self.tree_at(tree);
+        root.descendants()
+            .filter(move |node| compiler.is_none_or(|module| !module.contains_range(node.text_range())))
     }
 
     /// The tree a node of `root`'s tree is in, interned.
@@ -144,7 +175,7 @@ impl<'a, F: Files> Sema<'a, F> {
             .map(str::to_owned);
         let mut trees = self.trees.borrow_mut();
         let at = u32::try_from(trees.len()).expect("fewer than 2^32 trees");
-        trees.push(Tree { root: node.tree_top(), file, path, call: None });
+        trees.push(Tree { root: node.tree_top(), file, path, call: None, compiler: None });
         self.tree_of.borrow_mut().insert(file, at);
         at
     }
@@ -224,9 +255,8 @@ impl<'a, F: Files> Sema<'a, F> {
         if let Some(seen) = self.expansions.borrow().get(&tree) {
             return seen.clone(); // clone: a few tree numbers
         }
-        let root = self.tree_at(tree).root;
         let mut out = Vec::new();
-        for call in root.descendants().filter_map(ast::MacroCall::cast) {
+        for call in self.written(tree).filter_map(ast::MacroCall::cast) {
             let Some(id) = self.sema.to_def(call) else { continue };
             let expanded = self.sema.expand(id).value;
             let at = self.tree(expanded);
@@ -1015,10 +1045,13 @@ impl<'a, F: Files> Sema<'a, F> {
         let name = name.as_str();
         let finder = Finder::new(name.as_bytes());
         for &tree in &self.targets {
-            let root = self.tree_at(tree).root;
+            let Tree { root, compiler, .. } = self.tree_at(tree);
             let text = root.text().as_bytes();
             for start in finder.find_iter(text) {
                 let at = syntax::TextSize::from(u32::try_from(start).expect("a file under 4 GiB"));
+                if compiler.is_some_and(|it| it.contains(at)) {
+                    continue;
+                }
                 let Some(token) = root.token_at_offset(at).right_biased() else { continue };
                 // A tuple field's name is a number: `value.0` names field `0` by an INT_NUMBER.
                 if !matches!(token.kind(), SyntaxKind::IDENT | SyntaxKind::INT_NUMBER) || unraw(token.text()) != name {
@@ -1114,8 +1147,7 @@ impl<'a, F: Files> Sema<'a, F> {
             None => trees
                 .into_iter()
                 .flat_map(|tree| {
-                    let root = self.tree_at(tree).root;
-                    root.descendants().filter(|it| it.kind() == pattern.root_kind).collect::<Vec<_>>()
+                    self.written(tree).filter(|it| it.kind() == pattern.root_kind).collect::<Vec<_>>()
                 })
                 .collect(),
         };
@@ -1170,8 +1202,7 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                 }
                 None => {
                     for tree in self.searched(None) {
-                        let root = self.tree_at(tree).root;
-                        for at in root.descendants().filter(|it| it.kind() == *kind) {
+                        for at in self.written(tree).filter(|it| it.kind() == *kind) {
                             out.push(vec![node(self.syn(at))]);
                         }
                     }
@@ -1380,7 +1411,7 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     (None, None) => self
                         .searched(None)
                         .into_iter()
-                        .flat_map(|tree| self.tree_at(tree).root.descendants())
+                        .flat_map(|tree| self.written(tree))
                         .filter(|it| it.kind() == SyntaxKind::MATCH_ARM)
                         .collect(),
                 };

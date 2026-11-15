@@ -880,9 +880,8 @@ impl<'a, 'db> Cx<'a, 'db> {
 /// The crates a file of `krate` is taken as a module of: `krate` only, as a file of two crates
 /// (a crate built for the host and the target) is a module of each and its syntax must map to
 /// this crate's items, not the first crate's.
-fn within(krate: hir::Crate) -> std::sync::Arc<blaze_hash::HashSet<base_db::Crate, Global>> {
-    // alloc: once a check, one crate
-    std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([krate.base()], Global))
+fn within(krate: hir::Crate) -> std::sync::Arc<[base_db::Crate]> {
+    std::sync::Arc::new([krate.base()])
 }
 
 /// rustc's `fast_print_path`: a macro's path as its call writes it, the segments joined by

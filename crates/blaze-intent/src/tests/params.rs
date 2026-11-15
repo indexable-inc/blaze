@@ -9,8 +9,8 @@ use blaze_api::{Edit, Param, Target};
 use hir::{Crate, diagnostics::AnyDiagnostic};
 use hir_expand::fixture;
 
-use super::{applied, db::TestDB};
-use crate::{Files, apply};
+use super::{applied, apply, db::TestDB};
+use crate::Files;
 
 /// The view's files: path, the fixture's header for it, and its text.
 type Spec<'a> = [(&'a str, &'a str, &'a str)];
