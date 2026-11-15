@@ -2,13 +2,15 @@
 //! (docs/v2/plan/design/store-pool.md, "Superseded for the read path (2026-11-13)").
 //!
 //! The page cache is the one cache. A [`Direct`] owns no copy of any record between calls: a
-//! small value is read with a positional read ([`Effect::ReadInto`], `pread`) straight into the
-//! caller's buffer, a task's frame, and verified there; a value of [`MAP_FROM`] bytes or more is
-//! read in place through a shared read-only mapping ([`Direct::map`]). Measured on the Mac (APFS,
-//! 16 KiB pages, a 2 GiB file of 256-byte records, cached, a fresh process per sample): a record
-//! at a random offset costs 593 ns by `pread` and 707 ns by a mapping, and 10,000 of them leave
-//! 4.8 MB resident and 4.2 MB of footprint by `pread` against 160 MB resident and 2.6 MB of
-//! footprint by mapping; opening and mapping a file costs about 15 µs.
+//! small value is copied out of its file's mapping ("Copies" below) straight into the caller's
+//! buffer, a task's frame, and verified there, and a run of [`MAP_FROM`] bytes or more is read
+//! there with a positional read ([`Effect::ReadInto`], `pread`); a value of [`MAP_FROM`] bytes
+//! or more is read in place through a shared read-only mapping ([`Direct::map`]). Measured on
+//! the Mac (APFS, 16 KiB pages, a 2 GiB file of 256-byte records, cached, a fresh process per
+//! sample; copies are not measured there): a record at a random offset costs 593 ns by `pread`
+//! and 707 ns by a mapping, and 10,000 of them leave 4.8 MB resident and 4.2 MB of footprint by
+//! `pread` against 160 MB resident and 2.6 MB of footprint by mapping; opening and mapping a
+//! file costs about 15 µs.
 //!
 //! **Finding a key.** The store's index and deltas, exactly as every other read finds it
 //! (`Look::find`): the own tiers first, then the live layer's. A key in a writer's segment is
@@ -18,9 +20,10 @@
 //!
 //! **The core.** `plan::Plan` is sans-IO (rule `sans-io-cores`): told what records are wanted,
 //! it sorts them by (file, offset), joins those at most `plan::GAP_MOST` apart into runs of at
-//! most `plan::RUN_MOST`, lays the runs end to end in one region, hands back one
-//! [`Effect::ReadInto`] per part of a run, takes their completions, and says for each record
-//! where its bytes are or why they are not. The shell ([`Direct`]) finds keys, registers the
+//! most `plan::RUN_MOST`, lays the runs end to end in one region, names the short runs the
+//! shell copies (`Plan::short`, `Plan::copied`), hands back one [`Effect::ReadInto`] per part of
+//! every other run, takes their completions, and says for each record where its bytes are or
+//! why they are not. The shell ([`Direct`]) finds keys, copies the short runs, registers the
 //! region, drives the effects on the caller's driver, verifies, and puts each value where the
 //! caller asked. The effects are the ones every driver already serves (uring, kqueue, the
 //! simulation): `ReadInto` with `Cache::Kept` and `Priority::Demand`, and [`Effect::Map`].
@@ -54,6 +57,24 @@
 //! mapping kept in the file table, made again only when a record lies past its end, as the pack
 //! grew), and an external value's file once a read.
 //!
+//! **Copies.** A run shorter than [`MAP_FROM`] (one small record, or near neighbours) is copied
+//! out of its file's mapping into the region, with no read asked: the same mapping the file
+//! table keeps for [`Direct::map`], made at the first such run of the file and again only when
+//! a run lies past its end. Why: a read is a round trip through the reader's driver (on Linux
+//! its ring, whose kernel thread, `IORING_SETUP_SQPOLL`, takes it while the reader sleeps in
+//! `io_uring_enter` for its completion; and a page the cache does not hold, as a pack is
+//! written around it, is read from the disk a page at a time), and a task that reads item by
+//! item pays it once a record. Measured (issue #2174, a 64-vCPU aarch64 VM): a restarted
+//! daemon's first build of hello world read 136,565 records of 234 bytes on average, one read
+//! each, at about 0.7 ms a read end to end, 87 to 152 s in all. A copy is the copy and a fault
+//! per page it first touches; a page the cache does not hold is read by the fault, with its
+//! neighbours where the kernel reads around it. What the caller holds is the same bytes in the
+//! same frame as a read's, so the footprint is a read's; the mapping adds resident pages of
+//! the page cache, shared and clean, which the footprint does not count (rule
+//! `one-memory-measure`). A copied record is checked as a read one is; a file not mapped as
+//! far as the run fails the run's records, naming why, and they are not read instead. Not
+//! measured yet: a copy's cost on Linux, and a fault's on an uncached disk.
+//!
 //! **The collector.** Only a pack's committed bytes are read or mapped, and the store cuts a pack
 //! only back to what it committed, never below (`write_pack`), so no truncate takes bytes a read
 //! or a mapping touches. A pack the collector retires is unlinked: a mapping of it stays readable
@@ -82,8 +103,8 @@ use std::{
 };
 
 use blaze_core::{
-    ABANDONED_SPAN, Completion, Done, Driver, Effect, Extent, FileName, IDLE_STALL, Mapping, Spans,
-    spans::SpansFull, wait::Deadline,
+    ABANDONED_SPAN, Completion, Done, Driver, Effect, Extent, FileName, IDLE_STALL, IoError, Mapping,
+    Spans, spans::SpansFull, wait::Deadline,
 };
 use blaze_format::SchemaHash;
 use blaze_graph::wait::{WaitOn, wait};
@@ -194,6 +215,17 @@ mod plan {
         into: u64,
         len: u32,
         state: State,
+    }
+
+    /// A short run's one part, copied by the shell out of its file's mapping: `len` bytes at
+    /// `at` of the caller's file `file`, into the region at `into`.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Copying {
+        pub(crate) part: u32,
+        pub(crate) file: u32,
+        pub(crate) at: u64,
+        pub(crate) into: u64,
+        pub(crate) len: u32,
     }
 
     #[derive(Debug)]
@@ -341,14 +373,43 @@ mod plan {
             0
         }
 
-        /// The reads of every part into `region`, each of the file `name_of` names.
+        /// The parts of the runs shorter than `most`, each its run's one part: what the shell
+        /// copies out of a mapping ([`Plan::copied`]) in place of a read.
+        pub(crate) fn short(&self, most: u64) -> impl Iterator<Item = Copying> + '_ {
+            self.parts.iter().enumerate().filter_map(move |(n, part)| {
+                let run = self.runs[part.run as usize];
+                (run.len < most).then_some(Copying {
+                    part: n as u32,
+                    file: run.file,
+                    at: part.at,
+                    into: part.into,
+                    len: part.len,
+                })
+            })
+        }
+
+        /// Part `part` copied into the region by the shell, not read: `Ok` of the bytes copied,
+        /// or why not, as a read's completion says ([`Plan::complete`]). Before [`Plan::issue`].
+        pub(crate) fn copied(&mut self, part: u32, outcome: Result<u32, IoError>) {
+            let part = &mut self.parts[part as usize];
+            part.state = match outcome {
+                Ok(len) => State::Read(len.min(part.len)),
+                Err(why) => State::Failed(why),
+            };
+        }
+
+        /// The reads of every part not copied into `region`, each of the file `name_of` names.
         pub(crate) fn issue(
             &mut self,
             region: SpanRegion,
             name_of: impl Fn(u32) -> FileName,
             effects: &mut Vec<Effect>,
         ) {
+            self.left = 0;
             for (n, part) in self.parts.iter().enumerate() {
+                if !matches!(part.state, State::Asked) {
+                    continue;
+                }
                 let file = self.runs[part.run as usize].file;
                 effects.push(Effect::ReadInto {
                     file: name_of(file),
@@ -358,8 +419,8 @@ mod plan {
                     priority: Priority::Demand,
                     tag: self.tag(n as u64),
                 });
+                self.left += 1;
             }
-            self.left = self.parts.len();
         }
 
         fn tag(&self, part: u64) -> Tag {
@@ -443,7 +504,7 @@ mod plan {
             self.runs.len() as u64
         }
 
-        /// Reads of this call.
+        /// Parts of this call, copied or read.
         pub(crate) fn parts(&self) -> u64 {
             self.parts.len() as u64
         }
@@ -460,8 +521,12 @@ pub struct Counts {
     pub bytes: u64,
     /// Reads asked ([`Effect::ReadInto`]).
     pub reads: u64,
-    /// Runs read, each one or more neighbouring records.
+    /// Runs read, each one or more neighbouring records: those copied and those read.
     pub runs: u64,
+    /// Runs copied out of their file's mapping, each shorter than [`MAP_FROM`], with no read
+    /// asked (as `reads`, one whose mapping failed is counted): counted in `runs` and `bytes`
+    /// too, never in `reads`.
+    pub copied: u64,
     /// Files entered in a reader's table: what an open-once effect opens.
     pub files_opened: u64,
     /// Files mapped.
@@ -476,6 +541,7 @@ static RECORDS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static READS: AtomicU64 = AtomicU64::new(0);
 static RUNS: AtomicU64 = AtomicU64::new(0);
+static COPIED: AtomicU64 = AtomicU64::new(0);
 static FILES_OPENED: AtomicU64 = AtomicU64::new(0);
 static MAPS: AtomicU64 = AtomicU64::new(0);
 static MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -489,6 +555,7 @@ pub fn counts() -> Counts {
         bytes: get(&BYTES),
         reads: get(&READS),
         runs: get(&RUNS),
+        copied: get(&COPIED),
         files_opened: get(&FILES_OPENED),
         maps: get(&MAPS),
         mapped_bytes: get(&MAPPED_BYTES),
@@ -687,6 +754,28 @@ enum Fetched {
     Unregistered(SpansFull),
 }
 
+/// Why a file was not mapped as far as was asked ([`Direct::mapping_reaching`]).
+enum Unmapped {
+    /// Nothing completed for this long with the map in flight.
+    Stalled(Duration),
+    /// The map failed, as the driver says.
+    Failed(String),
+    /// The file was mapped at this many bytes, short of the end asked.
+    Short(u64),
+}
+
+impl fmt::Display for Unmapped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unmapped::Stalled(waited) => {
+                write!(f, "nothing completed for {waited:?} with its map in flight (blaze_core::IDLE_STALL)")
+            }
+            Unmapped::Failed(why) => f.write_str(why),
+            Unmapped::Short(len) => write!(f, "it is mapped at {len} bytes, short of the run's end"),
+        }
+    }
+}
+
 /// A reader of a store's files that owns no cache: see the module's docs.
 pub struct Direct {
     reader: Reader,
@@ -706,6 +795,8 @@ pub struct Direct {
     out: Vec<Completion>,
     // alloc: effects to submit, kept between calls
     effects: Vec<Effect>,
+    // alloc: the call's short runs to copy out of a mapping, kept and cleared between calls
+    copying: Vec<plan::Copying>,
     // alloc: completions of others' effects the driver handed this reader, kept for them
     others: Vec<Completion>,
     // alloc: `read`'s one answer, kept between calls
@@ -754,6 +845,8 @@ impl Direct {
             out: Vec::new(),
             // alloc: empty
             effects: Vec::new(),
+            // alloc: empty
+            copying: Vec::new(),
             // alloc: empty
             others: Vec::new(),
             // alloc: empty
@@ -1321,6 +1414,13 @@ impl Direct {
         let total = usize::try_from(total).expect("a region the caller's memory holds");
         // Zeroed: a short read leaves the rest as it was, and nothing reads it unchecked.
         into.resize(start + total, 0);
+        let copied = self.copy_short(driver, into, start);
+        count(&mut self.counts.copied, &COPIED, copied);
+        if copied == self.plan.parts() {
+            count(&mut self.counts.runs, &RUNS, self.plan.runs());
+            count(&mut self.counts.bytes, &BYTES, total as u64);
+            return Fetched::Read;
+        }
         // SAFETY: `start < into.len()`, so the pointer is inside the buffer, and not null.
         let base = NonNull::new(unsafe { into.as_mut_ptr().add(start) }).expect("a buffer is not null");
         // SAFETY: `base .. base + total` is `into`'s, which this call borrows mutably and does
@@ -1338,7 +1438,7 @@ impl Direct {
         // clone: a refcount per read
         self.plan.issue(registered.region(), |slot| files[slot as usize].name.clone(), &mut self.effects);
         count(&mut self.counts.runs, &RUNS, self.plan.runs());
-        count(&mut self.counts.reads, &READS, self.plan.parts());
+        count(&mut self.counts.reads, &READS, self.plan.left() as u64);
         count(&mut self.counts.bytes, &BYTES, total as u64);
         let stalled = self.drive(driver).err();
         if stalled.is_none() && !self.plan.abandoned() {
@@ -1356,6 +1456,31 @@ impl Direct {
             Some(waited) => Fetched::Stalled(waited),
             None => Fetched::Abandoned,
         }
+    }
+
+    /// The call's runs shorter than [`MAP_FROM`] copied into `into` from `start` out of their
+    /// files' mappings, with no read asked (the module's docs, "Copies"): how many. A run whose
+    /// file is not mapped as far as its end fails, naming why, and is not read instead.
+    fn copy_short<D: Driver, A: Allocator>(&mut self, driver: &mut D, into: &mut Vec<u8, A>, start: usize) -> u64 {
+        let mut copying = std::mem::take(&mut self.copying);
+        copying.clear();
+        copying.extend(self.plan.short(MAP_FROM));
+        for it in &copying {
+            let end = it.at + u64::from(it.len);
+            let outcome = match self.mapping_reaching(driver, it.file, end) {
+                Ok(mapping) => {
+                    let to = start + it.into as usize;
+                    into[to..to + it.len as usize].copy_from_slice(&mapping.bytes()[it.at as usize..end as usize]);
+                    Ok(it.len)
+                }
+                // alloc: the error's message
+                Err(unmapped) => Err(IoError(format!("its file's mapping, to copy the run out of: {unmapped}"))),
+            };
+            self.plan.copied(it.part, outcome);
+        }
+        let copied = copying.len() as u64;
+        self.copying = copying;
+        copied
     }
 
     /// Runs the call's effects until its reads and its mapping have completed, or until nothing
@@ -1400,6 +1525,18 @@ impl Direct {
 
     /// The mapping of the file at `slot`, at least `end` bytes long: the table's, or a new one.
     fn mapping_of<D: Driver>(&mut self, driver: &mut D, key: &Key, slot: u32, end: u64) -> Result<Mapping, Failed> {
+        self.mapping_reaching(driver, slot, end).map_err(|unmapped| {
+            let (key, file) = (*key, self.files[slot as usize].name.clone()); // clone: a refcount
+            match unmapped {
+                Unmapped::Stalled(waited) => Failed::Stalled { key, file, at: 0, waited },
+                Unmapped::Failed(why) => Failed::Read { key, file, at: 0, why },
+                Unmapped::Short(len) => Failed::Short { key, file, at: 0, asked: end, read: len },
+            }
+        })
+    }
+
+    /// [`Direct::mapping_of`], of no key: why not, when not.
+    fn mapping_reaching<D: Driver>(&mut self, driver: &mut D, slot: u32, end: u64) -> Result<Mapping, Unmapped> {
         let open = &self.files[slot as usize];
         if let Some(mapping) = &open.mapping
             && mapping.bytes().len() as u64 >= end
@@ -1407,30 +1544,22 @@ impl Direct {
             return Ok(mapping.clone()); // clone: a refcount
         }
         let file = open.name.clone(); // clone: a refcount
-        // clone: a refcount
-        self.effects.push(Effect::Map { file: file.clone(), extent: Extent::Whole, tag: self.plan.map_tag() });
+        self.effects.push(Effect::Map { file, extent: Extent::Whole, tag: self.plan.map_tag() });
         self.mapping = true;
         if let Err(waited) = self.drive(driver) {
             self.mapping = false;
-            return Err(Failed::Stalled { key: *key, file, at: 0, waited });
+            return Err(Unmapped::Stalled(waited));
         }
         let mapping = match self.mapped.take() {
             Some(Done::Mapped(mapping)) => mapping,
-            Some(Done::Failed(why)) => return Err(Failed::Read { key: *key, file, at: 0, why: why.0 }),
-            other => {
-                return Err(Failed::Read {
-                    key: *key,
-                    file,
-                    at: 0,
-                    // alloc: the error's message
-                    why: format!("the driver answered a map with {other:?}"),
-                });
-            }
+            Some(Done::Failed(why)) => return Err(Unmapped::Failed(why.0)),
+            // alloc: the error's message
+            other => return Err(Unmapped::Failed(format!("the driver answered a map with {other:?}"))),
         };
         count(&mut self.counts.maps, &MAPS, 1);
         let len = mapping.bytes().len() as u64;
         if len < end {
-            return Err(Failed::Short { key: *key, file, at: 0, asked: end, read: len });
+            return Err(Unmapped::Short(len));
         }
         // clone: a refcount, kept in the table
         self.files[slot as usize].mapping = Some(mapping.clone());

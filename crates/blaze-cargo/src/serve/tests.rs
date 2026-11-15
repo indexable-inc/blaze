@@ -4585,6 +4585,7 @@ fn direct_reads_after_a_restart(seed: u64) -> (blaze_cas::direct::Counts, bool) 
         bytes: after.bytes - before.bytes,
         reads: after.reads - before.reads,
         runs: after.runs - before.runs,
+        copied: after.copied - before.copied,
         files_opened: after.files_opened - before.files_opened,
         maps: after.maps - before.maps,
         mapped_bytes: after.mapped_bytes - before.mapped_bytes,

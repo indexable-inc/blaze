@@ -22,8 +22,9 @@
 //!   ([`blaze_cas::pool_counts`]): `pool resident bytes`, `store heap bytes`, `pool pinned
 //!   bytes`, `pool loaded bytes`, `pool prefetched bytes`, `pool evicted bytes` and `pool
 //!   pinned bound waits`, and the tasks' direct reads ([`blaze_cas::direct::counts`]):
-//!   `direct records read`, `direct bytes read`, `direct reads`, `direct runs`, `direct files
-//!   opened`, `direct maps`, `direct mapped bytes` and `direct leaked bytes`;
+//!   `direct records read`, `direct bytes read`, `direct reads`, `direct runs`, `direct copied
+//!   runs`, `direct files opened`, `direct maps`, `direct mapped bytes` and `direct leaked
+//!   bytes`;
 //!   `stack bytes` (what the live fibers' stacks hold, [`blaze_graph::sched::stack::resident`])
 //!   and `threads` (the process's threads, each with a stack and heaps of its own).
 //!
@@ -147,6 +148,7 @@ pub(super) fn plot(memory: &Snapshot, heap: u64, shown: &mut Shown) {
     plot_named("direct bytes read", direct.bytes);
     plot_named("direct reads", direct.reads);
     plot_named("direct runs", direct.runs);
+    plot_named("direct copied runs", direct.copied);
     plot_named("direct files opened", direct.files_opened);
     plot_named("direct maps", direct.maps);
     plot_named("direct mapped bytes", direct.mapped_bytes);

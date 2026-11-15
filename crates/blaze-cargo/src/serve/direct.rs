@@ -23,9 +23,10 @@
 //! readers ask with [`HOME_TAGS`] and [`STD_TAGS`], past every range of the daemon's own
 //! (`daemon::RUNS_END` is `1 << 62`).
 //!
-//! **Floors.** A record read costs one positional read of its bytes (or one run of neighbours,
-//! [`read_many`]), plus a lookup in the index, which is memory: the floor (`direct`'s module
-//! docs: 593 ns a cached record on the Mac). What this layer adds is one thread-local borrow
+//! **Floors.** A record read costs one copy of its bytes out of its pack's mapping, or one
+//! positional read of them in a run of [`blaze_cas::direct::MAP_FROM`] bytes or more (one run
+//! of neighbours, [`read_many`]), plus a lookup in the index, which is memory: the floor
+//! (`direct`'s module docs: 593 ns a cached record on the Mac). What this layer adds is one thread-local borrow
 //! and, on the first read of a thread, its driver's making (a kqueue and a thread on macOS):
 //! once a thread, not a read. The number to move: `direct::counts` (`records`, `reads`, `runs`)
 //! grows and the pool's counters stay 0 (`blaze explain memory`'s `pool resident bytes`, gone
@@ -279,6 +280,7 @@ pub(crate) fn thread_counts() -> blaze_cas::direct::Counts {
                 all.bytes += own.bytes;
                 all.reads += own.reads;
                 all.runs += own.runs;
+                all.copied += own.copied;
                 all.files_opened += own.files_opened;
                 all.maps += own.maps;
                 all.mapped_bytes += own.mapped_bytes;
