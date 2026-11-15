@@ -833,6 +833,7 @@ impl<S: Steps> plane::Work for Step<S> {
                             outputs: Vec::new(),
                             artifact: None,
                             macros: None,
+                            moved: false,
                             gpu_msl: None,
                             links: Vec::new(),
                             misses: Vec::new(),
@@ -882,6 +883,7 @@ impl<S: Steps> plane::Work for Step<S> {
                             outputs: Vec::new(),
                             artifact: None,
                             macros: None,
+                            moved: false,
                             gpu_msl: None,
                             links: Vec::new(),
                             misses: Vec::new(),
@@ -3035,6 +3037,9 @@ struct Build<S: Steps> {
     /// What became of each unit by its place in the plan, as its nodes settle: what the
     /// build's report of what it left unchecked is made of ([`Build::unchecked`]).
     verdicts: Vec<Verdict>,
+    /// By unit, whether its compile said its crate's identity moved after its record's lookup
+    /// ([`Compiled::moved`]): such a unit does not stand in the next build.
+    moved: Vec<bool>,
     /// It builds every unit of its plan, the job's end with them: not a build ahead's picks,
     /// nor the units a view's front end applies. Only such a build that ends ok leaves its
     /// units standing ([`standing::Stood`]).
@@ -8374,6 +8379,7 @@ impl<S: Steps> Jobs<S> {
         let mut last = vec![u32::MAX; all.len()]; // alloc: once per build
         let fresh_units = vec![None; all.len()]; // alloc: once per build
         let verdicts = vec![Verdict::Unsettled; all.len()]; // alloc: once per build
+        let moved = vec![false; all.len()]; // alloc: once per build
         let mut units_of = Vec::new(); // alloc: once per build, a unit a node
         // Each package's `name version` by its id, what a node is named by.
         let mut packages = HashMap::new_in(Global); // alloc: once per build, a package an entry
@@ -8597,6 +8603,7 @@ impl<S: Steps> Jobs<S> {
             refused: None,
             fresh: fresh_units,
             verdicts,
+            moved,
             whole: picked.is_none() && !applying,
             applying: applying.then_some(Applying { left: count, failed: false, first: None }),
             made_wait: (count > 0).then(|| {
@@ -8890,6 +8897,11 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         };
+        if let Stage::Units(build) = &mut job.stage
+            && let Some(moved) = build.moved.get_mut(unit)
+        {
+            *moved = compiled.moved;
+        }
         if let Stage::Units(build) = &mut job.stage
             && let Some(verdict) = build.verdicts.get_mut(unit)
         {
@@ -9885,8 +9897,12 @@ impl<S: Steps> Jobs<S> {
             && let Some(root) = build.root
             && let Some(plan) = plan_of(&mut self.roots.plans[root as usize], &build.input.units)
         {
+            // A unit whose identity moved after its lookup filed its record under a key the
+            // next build of this front end does not ask: it does not stand.
             // alloc: once per build that ended ok, a flag a unit
-            let kept = build.verdicts.iter().map(|it| matches!(it, Verdict::Done)).collect();
+            let kept = (build.verdicts.iter().zip(&build.moved))
+                .map(|(it, moved)| matches!(it, Verdict::Done) && !moved)
+                .collect();
             plan.stood = Some(standing::Stood {
                 units: build.input.units.clone(),   // clone: a refcount
                 config: build.input.config.clone(), // clone: a refcount

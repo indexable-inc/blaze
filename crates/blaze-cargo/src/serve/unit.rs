@@ -1118,6 +1118,11 @@ impl UnitReader {
         &self.walks
     }
 
+    /// Unit `unit`'s crate identity as the front end makes it now ([`Lowered::identity_now`]).
+    pub(crate) fn identity_now(&self, unit: usize) -> Option<blaze_ids::ContentId> {
+        self.front.identity_now(unit)
+    }
+
     /// What unit `unit`'s identity is made of ([`Lowered::identity_parts`]), for `blaze why`.
     pub(crate) fn identity_parts(
         &self,

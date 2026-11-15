@@ -3033,6 +3033,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
             why: record.why,
             puts,
             put_of: Vec::new(),
+            moved: false,
             record: None,
             body_sessions: Vec::new(),
             share: Vec::new(),
@@ -3850,6 +3851,8 @@ fn store(
     drop(hashing);
     let misses = std::mem::take(&mut phases.misses);
     let why = why.map(str::to_owned); // alloc: a unit that failed, once
+    // The identity the record was looked up under against the one the front end makes now.
+    let moved = identity(job, unit).is_some_and(|looked| reader.identity_now(unit) != Some(looked));
     let mut compiled = Compiled {
         diagnostics,
         ok,
@@ -3857,6 +3860,7 @@ fn store(
         why,
         puts,
         put_of,
+        moved,
         record: None,
         body_sessions: Vec::new(),
         share: Vec::new(),
