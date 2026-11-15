@@ -340,6 +340,7 @@ fn package(manifest: &str, source: Option<&str>, checksum: Option<[u8; 32]>, is_
         tree: None,
         tests: blaze_units::query::TestSandbox::default(),
         const_macros: None,
+        targets: Vec::new(),
     }
 }
 

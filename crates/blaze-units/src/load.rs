@@ -366,7 +366,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 10");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 11");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -473,7 +473,7 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 8");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 9");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 

@@ -2061,24 +2061,7 @@ fn schema_target(pkg: PackageId, target: &Target) -> anyhow::Result<schema::Targ
         .as_ref()
         // alloc: the error's text.
         .with_context(|| format!("`{}`'s target `{}` has no source file", pkg, target.name))?;
-    // alloc: the output owns its strings.
-    let one = |name: &str| vec![name.to_owned()];
-    // alloc: the output owns its strings.
-    let types = |kinds: &[CrateType]| -> Vec<String> {
-        kinds.iter().map(|it| it.as_str().to_owned()).collect()
-    };
-    let kind = match &target.kind {
-        TargetKind::Lib(kinds) => types(kinds),
-        TargetKind::Bin => one("bin"),
-        TargetKind::ExampleBin | TargetKind::ExampleLib(_) => one("example"),
-        TargetKind::Test => one("test"),
-        TargetKind::CustomBuild => one("custom-build"),
-        TargetKind::Bench => one("bench"),
-    };
-    let crate_types = match &target.kind {
-        TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => types(kinds),
-        _ => one("bin"),
-    };
+    let (kind, crate_types) = kinds(&target.kind);
     Ok(schema::Target {
         kind,
         crate_types,
@@ -2094,6 +2077,29 @@ fn schema_target(pkg: PackageId, target: &Target) -> anyhow::Result<schema::Targ
         doctest: target.doctest && target.doctestable(),
         test: target.tested,
     })
+}
+
+/// A target's `kind` and `crate_types` as `cargo metadata` prints them.
+pub(crate) fn kinds(kind: &TargetKind) -> (Vec<String>, Vec<String>) {
+    // alloc: the output owns its strings.
+    let one = |name: &str| vec![name.to_owned()];
+    // alloc: the output owns its strings.
+    let types = |kinds: &[CrateType]| -> Vec<String> {
+        kinds.iter().map(|it| it.as_str().to_owned()).collect()
+    };
+    let words = match kind {
+        TargetKind::Lib(kinds) => types(kinds),
+        TargetKind::Bin => one("bin"),
+        TargetKind::ExampleBin | TargetKind::ExampleLib(_) => one("example"),
+        TargetKind::Test => one("test"),
+        TargetKind::CustomBuild => one("custom-build"),
+        TargetKind::Bench => one("bench"),
+    };
+    let crate_types = match kind {
+        TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => types(kinds),
+        _ => one("bin"),
+    };
+    (words, crate_types)
 }
 
 #[cfg(test)]

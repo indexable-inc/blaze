@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use blaze_api::{Artifact, ArtifactKind, Level, UnitProfile};
 use blaze_ids::ContentId;
 use blaze_units::{
-    query::{PackagePlan, TestSandbox, UnitPlan, Units},
+    query::{PackagePlan, PackageTarget, TestSandbox, UnitPlan, Units},
     schema::{Mode, Profile, Target, Unit, UnitDep, UnitGraph},
 };
 use blaze_usercode::run::Value;
@@ -129,6 +129,7 @@ fn package(id: &str, name: &str, dir: &str) -> PackagePlan {
         tree: None,
         tests: TestSandbox::default(),
         const_macros: None,
+        targets: Vec::new(),
     }
 }
 
@@ -279,6 +280,31 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
     let env = blaze_build_script::env(&p, &[]).unwrap();
     assert_eq!(env.get("DEP_Z_INCLUDE"), Some(OsStr::new(&format!("{out_dir}/include"))));
     assert_eq!(p.tools.rustc, tools.join(format!("rustc{}", std::env::consts::EXE_SUFFIX)));
+}
+
+/// A script's `rustc-link-arg-benches` is checked against the package's targets, as cargo's
+/// is, not against the units of the build: nushell's `nu` prints it in a build of its bin
+/// alone, which has no unit of its bench.
+#[test]
+fn a_link_arg_for_a_target_the_build_does_not_make_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut units = build(dir.path());
+    let bench = PackageTarget {
+        name: "benchmarks".to_owned(),
+        kind: vec!["bench".to_owned()],
+        crate_types: vec!["bin".to_owned()],
+    };
+    units.packages[1].targets.push(bench);
+    let scripts = slots(&units);
+    let tools = PathBuf::from("/state/tools");
+    let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
+    let printed = "cargo:rustc-link-arg-benches=-rdynamic\n";
+    let judged = script::judge(&z, &[], &value(0, printed, ""), Some(&[]), None, false);
+    let output = judged.output.expect("cargo reads it");
+    assert_eq!(
+        output.linker_args,
+        [(blaze_build_script::output::LinkArgTarget::Bench, "-rdynamic".to_owned())]
+    );
 }
 
 /// cc prints `cargo:rustc-link-search=native=OUT_DIR` (blake3's `blake3_neon`, tree-sitter's

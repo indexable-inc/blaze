@@ -164,6 +164,7 @@ fn package(
         tree: None,
         tests: TestSandbox::default(),
         const_macros: None,
+        targets: Vec::new(),
     }
 }
 

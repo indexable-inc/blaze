@@ -651,6 +651,7 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             tree: None,
             tests: TestSandbox::default(),
             const_macros: None,
+            targets: Vec::new(),
         };
     // The program's plan lists the files its compile gives ([`Fake`]'s store step: unit 3's),
     // as cargo's plan lists every file it writes for a unit (`UnitPlan::outputs`): what a
