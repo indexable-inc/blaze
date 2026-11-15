@@ -1003,6 +1003,9 @@ impl Steps for Fake {
         Vec::new_in(std::alloc::Global)
     }
 
+    /// No task of the fakes serves launched runs' first calls, so none is lost.
+    fn lose_needs(&self, _: &str, _: &str) {}
+
     /// No task of the fakes serves launched runs' first calls, so none is woken.
     fn wake_needs(&self) {}
 
