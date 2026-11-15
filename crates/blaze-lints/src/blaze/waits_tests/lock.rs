@@ -1,4 +1,4 @@
-//! `lock_across_query` over [`super`]'s fixtures, with a `blaze_query_macros` whose `tracked`,
+//! `lock_across_query` over [`super`]'s fixtures, with a `blaze_memo_macros` whose `tracked`,
 //! `input` and `interned` are given the test proc macro `identity` (so what each makes is the
 //! item it is on, defined in the attribute's expansion), `base_db`'s `Db`, and a `parking_lot`
 //! whose guards are `lock_api`'s.
@@ -14,7 +14,7 @@ use super::{assert_marked, fixture as joined};
 use crate::{conf::Conf, tests::lint_given};
 
 const CRATES: &str = r#"
-//- /blaze_query_macros.rs crate:proc-macro:blaze_query_macros
+//- /blaze_memo_macros.rs crate:proc-macro:blaze_memo_macros
 #[proc_macro_attribute]
 pub fn tracked(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -27,8 +27,8 @@ pub fn input(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn interned(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
-//- /blaze_query.rs crate:blaze_query deps:blaze_query_macros
-pub use blaze_query_macros::{input, interned, tracked};
+//- /blaze_memo.rs crate:blaze_memo deps:blaze_memo_macros
+pub use blaze_memo_macros::{input, interned, tracked};
 //- /base_db.rs crate:base_db
 pub struct Db;
 //- /lock_api.rs crate:lock_api
@@ -52,7 +52,7 @@ impl<R, T> core::ops::Deref for MutexGuard<'_, R, T> {
 pub struct RawMutex;
 pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
 pub type MutexGuard<'a, T> = lock_api::MutexGuard<'a, RawMutex, T>;
-//- /src/lib.rs crate:main deps:blaze_query,base_db,parking_lot,std
+//- /src/lib.rs crate:main deps:blaze_memo,base_db,parking_lot,std
 "#;
 
 /// The test proc macro `identity`, as the fixture's proc macros' crate has it.
@@ -73,7 +73,7 @@ fn identity() -> ProcMacro {
     loaded.macros().expect("they loaded")[0].clone() // clone: a test's macro, once per fixture
 }
 
-/// Gives `blaze_query_macros` its three attribute macros, each `identity` under its name.
+/// Gives `blaze_memo_macros` its three attribute macros, each `identity` under its name.
 fn give_query_macros(built: &mut Fixture) {
     let identity = identity();
     let db = built.db();
@@ -83,9 +83,9 @@ fn give_query_macros(built: &mut Fixture) {
             it.extra_data(db)
                 .display_name
                 .as_ref()
-                .is_some_and(|it| it.crate_name().as_str() == "blaze_query_macros")
+                .is_some_and(|it| it.crate_name().as_str() == "blaze_memo_macros")
         })
-        .expect("the fixture has `blaze_query_macros`");
+        .expect("the fixture has `blaze_memo_macros`");
     let macros = ["tracked", "input", "interned"]
         .map(|name| ProcMacro { name: Symbol::intern(name), ..identity.clone() }) // clone: a test's macro
         .to_vec();
@@ -93,7 +93,7 @@ fn give_query_macros(built: &mut Fixture) {
 }
 
 /// A `parking_lot` guard (written, through a renamed type, in a macro) or std's held across a
-/// `#[blaze_query::tracked]` function (also through a renamed attribute) or a method of a trait
+/// `#[blaze_memo::tracked]` function (also through a renamed attribute) or a method of a trait
 /// implemented for `base_db::Db` is a finding; a guard dropped before the call, and one held
 /// across a call that is no query, are none.
 #[test]
@@ -102,11 +102,11 @@ fn lock_across_query() {
         CRATES,
         r#"
 use base_db::Db;
-use blaze_query::tracked as query;
+use blaze_memo::tracked as query;
 use parking_lot::Mutex;
 use parking_lot::Mutex as Lock;
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 pub fn width(db: &Db, x: u32) -> u32 {
     let _ = db;
     x
@@ -191,7 +191,7 @@ pub fn by_macro(db: &Db, cache: &Cache) -> u32 {
     assert_marked(&out, &source, flags);
     assert!(out.contains("the lock guard `guard` (`"), "the guard is named with its type:\n{out}");
     assert!(
-        out.contains("held across the query `width` (made by `#[blaze_query::tracked]`)"),
+        out.contains("held across the query `width` (made by `#[blaze_memo::tracked]`)"),
         "{out}"
     );
     assert!(

@@ -1,11 +1,14 @@
 //! The lint queries over a database edited between runs: which queries run again, and what a
 //! hit costs.
 
+use std::alloc::Global;
+
 use base_db::{Db, FileId};
+use blaze_memo::testing::Ran;
 use hir_def::DefWithBodyId;
 use hir_expand::fixture;
 
-use super::{LintSet, body_lints};
+use super::{LintSet, body_lints, item_lints};
 use crate::{
     check::{Setup, check},
     conf::Conf,
@@ -51,9 +54,31 @@ fn lint(db: &Db, setup: &Setup) -> usize {
     check(db, krate, setup, &name_of).expect("every file is named").len()
 }
 
-/// How many times `query` is among the ingredient names in `executed`.
-fn runs(executed: &[String], query: &str) -> usize {
-    executed.iter().filter(|it| it.trim_end_matches('_').ends_with(query)).count()
+/// The queries `work` ran, from the fixture database's run log.
+fn runs_of(db: &Db, work: impl FnOnce()) -> Vec<Ran, Global> {
+    let log = db.runs().expect("a fixture's database logs its runs");
+    _ = log.take();
+    work();
+    log.take()
+}
+
+/// How many of `executed` ran the query whose kind is named `query` (its `KIND_NAME`),
+/// whatever its key.
+fn runs(executed: &[Ran], query: &str) -> usize {
+    executed.iter().filter(|it| it.query == query).count()
+}
+
+/// The kinds the tests count, by their generated names.
+const BODY_LINTS: &str = body_lints::KIND_NAME;
+const ITEM_LINTS: &str = item_lints::KIND_NAME;
+const INFER: &str = hir_ty::kinds::infer_body_query::KIND_NAME;
+
+/// Sets `file`'s text in a new snapshot: one edit and its commit. Every id but the file's is
+/// of the snapshot it was taken in, so a test takes them again after.
+fn set_file_text(db: &mut Db, file: FileId, text: &str) {
+    let mut edit = db.edit();
+    edit.set_file_text(file, text);
+    _ = edit.commit();
 }
 
 /// The body of the function `name` of the crate `main`'s root module.
@@ -70,33 +95,39 @@ fn body_named(db: &Db, name: &str) -> DefWithBodyId {
         .expect("a function of that name")
 }
 
+/// False by design on blaze-memo (port decision: reuse across edits comes from records, not
+/// the memo): it claimed an edit of one body lints that body alone again, and an edit outside
+/// every body lints none; an edit of a file now rebuilds its crate's arena, so every body and
+/// item of the crate is linted again. Left failing.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_one_body_lints_that_body_and_no_other() {
     let (mut db, file) = db(TWO);
     let setup = setup("");
-    let cold = db.log_executed(|| _ = lint(&db, &setup));
-    assert_eq!(runs(&cold, "body_lints"), 2, "{cold:#?}");
+    let cold = runs_of(&db, || _ = lint(&db, &setup));
+    assert_eq!(runs(&cold, BODY_LINTS), 2, "{cold:#?}");
 
     // A statement more in `a` moves `b` in the file without changing it.
     let edited = TWO.replacen("let _ = 1;", "let _ = 1;\n            let _ = 3;", 1);
-    db.set_file_text(file, &edited);
-    let warm = db.log_executed(|| _ = lint(&db, &setup));
-    assert_eq!(runs(&warm, "body_lints"), 1, "{warm:#?}");
+    set_file_text(&mut db, file, &edited);
+    let warm = runs_of(&db, || _ = lint(&db, &setup));
+    assert_eq!(runs(&warm, BODY_LINTS), 1, "{warm:#?}");
 
     // An edit of what is in no body lints no body again.
-    db.set_file_text(file, &format!("struct S;\n{edited}"));
-    let items = db.log_executed(|| _ = lint(&db, &setup));
-    assert_eq!(runs(&items, "body_lints"), 0, "{items:#?}");
-    assert_eq!(runs(&items, "item_lints"), 1, "{items:#?}");
+    set_file_text(&mut db, file, &format!("struct S;\n{edited}"));
+    let items = runs_of(&db, || _ = lint(&db, &setup));
+    assert_eq!(runs(&items, BODY_LINTS), 0, "{items:#?}");
+    assert_eq!(runs(&items, ITEM_LINTS), 1, "{items:#?}");
 }
 
 #[test]
 fn what_an_edit_moves_is_found_where_it_moved_to() {
     let (mut db, file) = db(TWO);
     let setup = setup("-A clippy::all -W clippy::collapsible_if");
-    let krate = crate::tests::main_crate(&db);
     let name_of = |_: FileId| Some("main.rs".to_owned());
+    // The crate taken in each snapshot: its id dies at a commit.
     let lo = |db: &Db| {
+        let krate = crate::tests::main_crate(db);
         let found = check(db, krate, &setup, &name_of).expect("every file is named");
         found
             .iter()
@@ -105,7 +136,7 @@ fn what_an_edit_moves_is_found_where_it_moved_to() {
     };
     let before = lo(&db);
     assert_eq!(before.len(), 1, "`a`'s `if`s collapse; `b` has one");
-    db.set_file_text(file, &format!("struct S;\n{TWO}"));
+    set_file_text(&mut db, file, &format!("struct S;\n{TWO}"));
     assert_eq!(lo(&db), [before[0] + "struct S;\n".len() as u32]);
 }
 
@@ -118,16 +149,16 @@ fn a_crate_linted_with_syntactic_lints_only_infers_nothing() {
     let setup =
         setup(&format!("{} -A blaze::general -W clippy::collapsible_if", crate::tests::CLIPPY_OFF));
     let mut found = 0;
-    let executed = db.log_executed(|| found = lint(&db, &setup));
+    let executed = runs_of(&db, || found = lint(&db, &setup));
     assert_eq!(found, 1);
-    assert!(runs(&executed, "body_lints") > 0, "{executed:#?}");
-    assert_eq!(runs(&executed, "infer_body_query"), 0, "{executed:#?}");
+    assert!(runs(&executed, BODY_LINTS) > 0, "{executed:#?}");
+    assert_eq!(runs(&executed, INFER), 0, "{executed:#?}");
 }
 
 #[test]
 fn a_body_lints_hit_allocates_nothing() {
     let (db, _) = db(TWO);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = body_named(&db, "a");
         let set = LintSet::new(&db, Implemented::CollapsibleIf.bit(), Conf::default());
         assert_eq!(body_lints(&db, def, set).findings.len(), 1);

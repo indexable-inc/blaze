@@ -70,7 +70,7 @@ fn suggested(lint_name: &str, fixture: &str) -> (String, Vec<(TextRange, String)
     let fx = fixture::db(fixture);
     let file = *fx.files().last().expect("the last file");
     let db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let krate = blaze_memo::attach(&db, || main_crate(&db));
     let file = file.file_id(&db);
     // `check` names every module file of the crate; only the last file's suggestions are kept.
     let last = "src/last.rs";
@@ -78,7 +78,7 @@ fn suggested(lint_name: &str, fixture: &str) -> (String, Vec<(TextRange, String)
     let flags: Vec<String> = flags(lint_name).split_whitespace().map(str::to_owned).collect();
     let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() };
     let text = db.file_text(file).text(&db).to_string();
-    let found = blaze_query::db::attach(&db, || check(&db, krate, &setup, &name_of).expect("the file is named"));
+    let found = blaze_memo::attach(&db, || check(&db, krate, &setup, &name_of).expect("the file is named"));
     let mut parts: Vec<(TextRange, String)> = found
         .iter()
         .filter_map(|it| it.diagnostic.suggestions.first()?.substitutions.first())

@@ -54,7 +54,8 @@ fn alone(text: &str) -> Vec<(String, PreludeError)> {
             trusted: Box::default(),
         }),
     );
-    let krate = graph.set_in_db(&mut db)[&krate];
+    let key = db.commit_with(|edit| _ = edit.set_crate_graph(graph)).crates[&krate];
+    let krate = db.krate(key);
     let def_map = crate_def_map(&db, krate);
     assert!(def_map.prelude().is_none(), "a crate with no prelude crate has no prelude");
     prelude_errors(&db, def_map)

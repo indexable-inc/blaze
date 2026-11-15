@@ -1,0 +1,14 @@
+{
+ "id": "pool-off-fiber-waits-are-thread-parks",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, port of the front end onto blaze-memo; found by a Claude Opus 5.5 lane reading blaze-graph for the flight fix",
+ "where": "crates/blaze-graph/src/pool.rs `block_until`/`block` (about lines 2756 to 2850): `thread::park()`, `thread::park_timeout(left)`, and `rest(..)`",
+ "what": "A thread that is on no fiber and waits on a pool's work (a client of pools: a test thread, a driver's thread) blocks with `std::thread::park`, in two places with no deadline of its own; only the scheduler's stall check bounds it. AGENTS.md rule 44 wants every blocking kernel wait through `blaze_core::wait`, and rule 18 a bound and a typed outcome on every wait for progress.",
+ "cost": "a test database could not be given the scheduler's flight (`blaze_memo::Scheduled`) as its one flight, because its wait off a fiber is this park: there are now two test constructors (`Db::for_tests`, one task; `Db::for_tests_driven`, several) and two fixtures (`db`, `db_driven`) where one would do",
+ "cause": "the pool's client-side block predates `blaze_core::wait` and was not moved to it",
+ "whys": "the lint that holds rule 44 does not flag `std::thread::park` in blaze-graph (not checked: the lane read the code, nobody ran the lint for this); workers park on the scheduler, so only the off-fiber path is left on the old wait and builds never take it",
+ "class": "a blocking wait outside blaze-core's one deadline wait",
+ "prevention": "owed: move `block` onto `blaze_core::wait` with the caller's deadline and a typed timeout; then `Db::for_tests` takes `Scheduled`, `Db::for_tests_driven` and `fixture::db_driven` merge into it, and `blaze_memo::Alone` stays only for a memo built with no scheduler (span's hygiene tests, blaze-macro-eval's tests, a bench). A `.clippy.toml` ban of `std::thread::park*` outside blaze-core is the guard.",
+ "workaround": "`Db::for_tests_driven` (the scheduler's flight, batches on the calling thread) for a fixture database that several tasks drive",
+ "state": "open; the workaround is in the port checkout, uncompiled at the time of writing"
+}

@@ -322,9 +322,22 @@ impl<'f> Data<'f> {
                     out.raw(&span.anchor.0);
                     out.u32(span.index);
                 }
-                DataPlace::Text(it) => {
+                DataPlace::Text(slots) => {
                     out.u8(2);
-                    out.bytes(it.as_bytes());
+                    out.u32(slots.len() as u32);
+                    for slot in slots {
+                        match slot {
+                            super::TextSlot::Bytes(text) => {
+                                out.u8(0);
+                                out.bytes(text.as_bytes());
+                            }
+                            super::TextSlot::File(span) => {
+                                out.u8(1);
+                                out.raw(&span.anchor.0);
+                                out.u32(span.index);
+                            }
+                        }
+                    }
                 }
                 DataPlace::Nowhere => out.u8(3),
                 DataPlace::Own => {

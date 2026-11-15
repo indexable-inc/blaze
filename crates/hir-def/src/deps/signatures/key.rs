@@ -48,6 +48,10 @@ pub(crate) enum Item {
     Fields(VariantId),
     /// `EnumVariants::of`.
     Variants(EnumId),
+    /// `ImplItems::of`, with each item's written visibility.
+    ImplItems(ImplId),
+    /// `TraitItems::query_with_diagnostics`, with the trait's written visibility.
+    TraitItems(TraitId),
 }
 
 impl Item {
@@ -65,6 +69,8 @@ impl Item {
             Item::TypeAlias(_) => 8,
             Item::Fields(_) => 9,
             Item::Variants(_) => 10,
+            Item::ImplItems(_) => 11,
+            Item::TraitItems(_) => 12,
         }
     }
 
@@ -74,8 +80,8 @@ impl Item {
             Item::Struct(it) => it.lookup(db).container,
             Item::Union(it) => it.lookup(db).container,
             Item::Enum(it) | Item::Variants(it) => it.lookup(db).container,
-            Item::Impl(it) => it.lookup(db).container,
-            Item::Trait(it) => it.lookup(db).container,
+            Item::Impl(it) | Item::ImplItems(it) => it.lookup(db).container,
+            Item::Trait(it) | Item::TraitItems(it) => it.lookup(db).container,
             Item::Const(it) => it.module(db),
             Item::Static(it) => it.module(db),
             Item::Function(it) => it.module(db),
@@ -86,7 +92,7 @@ impl Item {
 }
 
 /// The modules of `krate`'s `DefMap` by their index in it.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub(super) fn module_indexes(db: &Db, krate: Crate) -> HashMap<ModuleId, u32, Global> {
     let modules = crate_def_map(db, krate).modules(db);
     // alloc: once per crate, the map every key of the crate reads.
@@ -106,8 +112,8 @@ pub(super) fn of(db: &Db, item: Item) -> Option<(Crate, ContentId)> {
         Item::Struct(it) => key.adt(AdtId::StructId(it)),
         Item::Union(it) => key.adt(AdtId::UnionId(it)),
         Item::Enum(it) | Item::Variants(it) => key.adt(AdtId::EnumId(it)),
-        Item::Impl(it) => key.impl_(it),
-        Item::Trait(it) => key.trait_(it),
+        Item::Impl(it) | Item::ImplItems(it) => key.impl_(it),
+        Item::Trait(it) | Item::TraitItems(it) => key.trait_(it),
         Item::Const(it) => {
             let loc = it.lookup(db);
             key.container(loc.container);

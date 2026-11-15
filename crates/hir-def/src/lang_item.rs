@@ -35,7 +35,7 @@ impl_from!(
 );
 
 /// A query. This will look for lang items in a specific crate.
-#[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(as_deref), owns, mem_tag = Nameres)]
 pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
     if let Some(frozen) = crate::nameres::frozen::served_lang_items(db, krate) {
@@ -125,7 +125,7 @@ pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
 
 /// A query. Look for a lang items, starting from the specified crate and recursively
 /// traversing its dependencies.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn lang_items(db: &Db, start_crate: Crate) -> LangItems {
     let _p = tracing::info_span!("lang_items_query").entered();
 
@@ -354,8 +354,8 @@ impl LangItems {
     }
 }
 
-#[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
-pub fn crate_notable_traits(db: &Db, krate: Crate) -> Option<Box<[TraitId]>> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
+pub fn crate_notable_traits<'db>(db: &'db Db, krate: Crate) -> Option<&'db [TraitId]> {
     blaze_mem::frame::current(|frame| {
         let mut traits = Vec::new_in(frame);
         let crate_def_map = crate_def_map(db, krate);
@@ -368,8 +368,8 @@ pub fn crate_notable_traits(db: &Db, krate: Crate) -> Option<Box<[TraitId]>> {
                 }
             }
         }
-        // alloc: the memo's traits, exact
-        if traits.is_empty() { None } else { Some(Box::from(&traits[..])) }
+        let memo = blaze_memo::Database::memo(db);
+        if traits.is_empty() { None } else { Some(blaze_memo::keep_slice(memo, &traits)) }
     })
 }
 
@@ -937,7 +937,7 @@ language_item_table! { LangItems =>
 
 #[cfg(test)]
 mod tests {
-    use blaze_query::db::FromId;
+    use blaze_memo::Id as _;
     use hir_expand::fixture;
     use intern::{Symbol, sym};
 
@@ -993,8 +993,8 @@ mod tests {
 
     #[test]
     fn assign_keeps_to_the_kind() {
-        let trait_ = TraitId::from_id(blaze_query::db::Id::from_u32(5));
-        let struct_ = StructId::from_id(blaze_query::db::Id::from_u32(6));
+        let trait_ = TraitId::from_gid(blaze_memo::Gid::for_test(5));
+        let struct_ = StructId::from_gid(blaze_memo::Gid::for_test(6));
         let mut items = LangItems::default();
         items.assign_lang_item(sym::sized, struct_.into());
         assert_eq!(items, LangItems::default());

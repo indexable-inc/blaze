@@ -1,0 +1,12 @@
+{
+ "id": "A-port-l8a-changed-set-consumers",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane L8a hir + hir-ty-codegen",
+ "where": "crates/hir/src/check/bodies.rs, crates/hir-ty-codegen/v2/frontend.rs, v2/linked.rs, v2/frontend/described.rs",
+ "what": "Three consumers kept state across builds by the query engine's changed set and views (the body check's kept plan, the codegen walk's witnesses and changed_since/view/durable_view, the link's span-table verify). The session memo has no changed set, and the kept state holds Gids that die with their arena, so each was rewritten to be of use only while every arena it was made under lives (ArenaId lists compared), and to start whole otherwise. Correct, but every edit now makes the kept plan, the walk and the link tables whole: the floor tests (link body-edit counter, body-check edit cost) fail by design until per-item records land.",
+ "cost": "the walk and link lose incremental patching on every edit; three hand redesigns in a lane meant to port engine calls",
+ "cause": "the spec's rule 1 removes the changed set but names no replacement for the consumers that patched kept state from it, and kept state names items by session ids instead of stable ids",
+ "workaround": "arena-liveness keys (`Memo::arenas()`), whole rebuild on any dropped arena, controls retargeted to `Plant::CarriesDropped`",
+ "fix": "kept walk/link/plan state named by stable ids (item keys) and re-resolved per snapshot, with per-item records so an edit re-asks only its own items",
+ "state": "open"
+}

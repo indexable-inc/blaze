@@ -24,7 +24,7 @@ mod tests;
 /// associated item path of a body resolved through ([`body_trait_uses`]). The fold over the
 /// crate: it reads each body's record, never a body, so a body edit that changes none of the
 /// traits it picks leaves every record equal and this does not run again.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
     // alloc: the query's result's input, once per execution.
     let mut uses = Vec::new();
@@ -41,8 +41,8 @@ pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
 /// type checking resolved to nothing, those of every binding of every trait in scope with a
 /// value item of its name ([`every_trait_use`]), since rustc may pick any of them (no import a
 /// failed call may read is linted). One record per body.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-pub(crate) fn body_trait_uses(db: &Db, owner: DefWithBodyId) -> Box<[Use]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub(crate) fn body_trait_uses<'db>(db: &'db Db, owner: DefWithBodyId) -> &'db [Use] {
     let infer = InferenceResult::of(db, InferBodyId::DefWithBodyId(owner));
     let picks = infer.traits_in_scope_used();
     let store = ExpressionStore::of(db, owner.into());
@@ -55,8 +55,7 @@ pub(crate) fn body_trait_uses(db: &Db, owner: DefWithBodyId) -> Box<[Use]> {
         })
     };
     if picks.is_empty() && failed().next().is_none() {
-        // alloc: an empty box allocates nothing
-        return Box::default();
+        return &[];
     }
     // alloc: the record, once per execution
     let mut uses = Vec::new();
@@ -78,7 +77,7 @@ pub(crate) fn body_trait_uses(db: &Db, owner: DefWithBodyId) -> Box<[Use]> {
         let module = resolver_for_scope(db, owner, scopes.scope_for(expr)).module();
         every_trait_use(db, krate, module, &name, &mut uses);
     }
-    uses.into_boxed_slice()
+    blaze_memo::keep_iter(blaze_memo::Database::memo(db), uses)
 }
 
 /// The expression each pattern of `store` is written in (a `let`'s block, a `match`, a closure,

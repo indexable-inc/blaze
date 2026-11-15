@@ -50,6 +50,7 @@
 pub mod assoc;
 pub mod attr_resolution;
 mod batch;
+pub mod boundary;
 pub(crate) mod def_site;
 pub use def_site::{
     assoc_item_binding_name, for_each_hygienic_trait_in_scope, implemented_name, implements,
@@ -60,24 +61,12 @@ pub use def_site::{
     binding_key_at, def_binding_key, import_binding_key, param_name, path_param_name,
 };
 pub use def_site::{impl_expansion, privacy_scope, variant_expansion};
-pub mod delta;
 pub mod demand;
 pub mod diagnostics;
 mod facts;
 pub use self::facts::kinds;
 pub mod frozen;
 pub use hir_expand::proc_macro::may_have_session_macros;
-
-/// The module a published row of name resolution is of (a module's scope, a crate's
-/// resolution), for the run log's names (`crate::span_names::name_log_rows`); None for a row
-/// that is not one.
-pub(crate) fn log_row_module(
-    db: &Db,
-    ingredient: &str,
-    id: blaze_query::db::Id,
-) -> Option<crate::ModuleId> {
-    delta::log_row_module(db, ingredient, id)
-}
 mod mod_resolution;
 pub mod named;
 mod path_resolution;
@@ -110,14 +99,14 @@ use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
 use std::alloc::Global;
 use stdx::format_to;
 use syntax::{
-    AstNode, SmolStr, TextSize, ToSmolStr, ast,
+    AstNode, SmolStr, TextSize, ast,
     view::{self, AstNode as _},
 };
 use triomphe::Arc;
 use tt::TextRange;
 
 use crate::{
-    AstId, BlockId, BlockIdLt, BuiltinDeriveImplId, ExternCrateId, FunctionId, FxIndexMap, Lookup,
+    AstId, BlockId, BuiltinDeriveImplId, ExternCrateId, FunctionId, FxIndexMap, Lookup,
     MacroCallStyles, MacroExpander, MacroId, ModuleId, ModuleIdLt, ProcMacroId, UseId,
     builtin_type::BuiltinType,
     item_scope::{BuiltinShadowMode, ItemScope},
@@ -148,29 +137,29 @@ thread_local! {
 pub static EXPAND_BUILTIN_DERIVES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Builtin derives expanded in one database only: an input, so a def map collected on any
-/// thread of the plane sees it, and setting it reruns what it changes.
-#[blaze_query::input(singleton, debug)]
+/// Builtin derives expanded in one database only: an input of the session arena, so a def map
+/// collected on any thread of the plane sees it. Every crate's collection reads it, so a
+/// change of it is a change of the session arena, which every crate arena borrows: the next
+/// snapshot drops them all.
+#[blaze_memo::input(singleton, debug)]
 pub struct BuiltinDerives {
     #[returns(copy)]
     pub expand: bool,
 }
 
-/// Has the def maps of `db` expand builtin derives (`true`) or only record them. Every crate's
-/// collection reads it, so a change is a crate-wide write: the name resolution maintainer
-/// resolves every crate it has already published again.
-pub fn set_expand_builtin_derives(db: &mut Db, expand: bool) {
-    use blaze_query::db::{Durability, Setter};
-    match BuiltinDerives::try_get(db) {
-        Some(it) if it.expand(db) == expand => return,
-        Some(it) => {
-            it.set_expand(db).with_durability(Durability::HIGH).to(expand);
-        }
-        None => {
-            _ = BuiltinDerives::new(db, Durability::HIGH, expand);
-        }
+/// The fact [`BuiltinDerives`] is read by: one id, and the value as its digest.
+pub fn builtin_derives_fact(expand: bool) -> blaze_memo::Fact {
+    blaze_memo::Fact {
+        id: blaze_ids::ContentId::of("hir-def builtin derives", &[]),
+        digest: blaze_ids::ContentId::of("hir-def builtin derives value", &[u8::from(expand)]),
     }
-    db.note_crates_changed();
+}
+
+/// Has the def maps of the snapshot `inputs` builds (its session arena's) expand builtin
+/// derives (`true`) or only record them. Called by the driver while it builds a snapshot,
+/// before any query is asked; a snapshot's inputs never change after.
+pub fn set_expand_builtin_derives(inputs: &blaze_memo::Inputs<'_>, expand: bool) {
+    BuiltinDerives::set(inputs, builtin_derives_fact(expand), expand);
 }
 
 /// Whether the collection of a def map of `db` records builtin derives instead of expanding
@@ -283,10 +272,9 @@ pub struct DefMap {
     diagnostics: Vec<DefDiagnostic>,
     /// `diagnostics` grouped by module, made once collection is done ([`Self::hand_over_scopes`]).
     diagnostics_by_module: DiagnosticsByModule,
-    /// The [`HeldRecords`] that `names`, `diagnostics`, `diagnostics_by_module` and
-    /// `derive_helpers_in_scope` move to when collection is done, leaving them empty: a `use` or a
-    /// derive added changes the records and leaves this value equal, so what reads the `DefMap`
-    /// (every resolver, every solver) is not run again for it.
+    /// Where the records are when they are not the four fields above: a crate read from pages
+    /// keeps them in its tail segment. `None` for a def map collected here, whose records are
+    /// its own fields.
     records: Option<RecordsSlot>,
 
     /// The crate data that is shared between a crate's def map and all its block def maps.
@@ -299,27 +287,16 @@ type DeriveHelpers = HashMap<
     Global,
 >;
 
-/// What a collected def map recorded that no resolution reads: how its imports and macro calls
-/// resolved, its diagnostics and the derive helpers in scope of its items.
-#[blaze_query::tracked]
-struct HeldRecords<'db> {
-    root: ModuleIdLt<'db>,
-    #[tracked]
-    #[returns(ref)]
-    records: OwnedRecords,
-}
-
-/// Where a handed-over def map's records are: a block's `HeldRecords`, or a crate's
-/// `delta::CrateResolution`, which the name resolution maintainer sets.
+/// Where a def map's records are when it does not hold them itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordsSlot {
-    Held(blaze_query::db::Id),
-    Published(blaze_query::db::Id),
     /// The records of a crate read from pages (`frozen::pages`): its tail segment, decoded
     /// when first asked for.
     Paged(Crate),
 }
 
+/// What a def map recorded that no resolution reads: how its imports and macro calls
+/// resolved, its diagnostics and the derive helpers in scope of its items.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct OwnedRecords {
     names: uses::NameRecords,
@@ -476,7 +453,7 @@ struct BlockInfo {
     parent: ModuleId,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, blaze_memo::Home)]
 pub enum ModuleOrigin {
     CrateRoot {
         definition: EditionedFileId,
@@ -563,112 +540,35 @@ pub struct ModuleData {
     scope: ScopeSlot,
 }
 
-/// The modules of a `DefMap`, held by the database on their own: a `DefMap` stays what it was
-/// when a module is added to it, and so does everything that was resolved through it.
-#[blaze_query::tracked]
-struct Modules<'db> {
-    root: ModuleIdLt<'db>,
-    #[tracked]
-    #[returns(ref)]
-    table: ModulesMap,
-}
-
-#[blaze_query::tracked]
-impl<'db> Modules<'db> {
-    /// One module of a collected `DefMap`. Depends on the modules there are, and is the same
-    /// for as long as the module is.
-    #[blaze_query::tracked(returns(ref))]
-    fn module(self, db: &'db Db, module: ModuleId) -> Option<ModuleData> {
-        self.table(db).get(&module).cloned()
-    }
-
-    /// What `name` means in `module`: one memo for a path segment, where reading the module
-    /// and then its scope is two. Depends on the modules there are and on that module's scope;
-    /// backdated while the name means what it did.
-    #[blaze_query::tracked]
-    fn name(self, db: &'db Db, module: ModuleId, name: Name) -> PerNs {
-        let Some(data) = self.table(db).get(&module) else {
-            panic!("ModuleId not found in ModulesMap: {module:#?}")
-        };
-        // A module of a crate read from pages: the one name, from the page it is on. This memo
-        // is the name's; nothing else of the scope is decoded.
-        if let ScopeSlot::Paged(paged) = &data.scope {
-            return frozen::pages::name_now(db, *paged, &name);
-        }
-        data.scope(db).get(&name)
-    }
-}
-
 impl ModulesSlot {
     /// The modules of a `DefMap` that is being collected.
     fn building(&mut self) -> &mut ModulesMap {
         match self {
-            ModulesSlot::Building(modules)
-            | ModulesSlot::Unit { own: modules, .. }
-            | ModulesSlot::Maintained { own: modules, .. } => modules,
-            ModulesSlot::Collected(_) | ModulesSlot::Published(_) => {
+            ModulesSlot::Building(modules) | ModulesSlot::Unit { own: modules, .. } => modules,
+            ModulesSlot::Collected(_) => {
                 panic!("the modules of a collected `DefMap` are read-only")
             }
         }
     }
 }
 
+/// The modules of a `DefMap`. They are part of the value of the query that collected it
+/// (`crate_resolution`, `block_def_map`): a crate's arena holds them for the snapshot, and a
+/// change of any input of the crate drops them with the arena (decision 4), so nothing
+/// tracks which module a reader read.
 #[derive(Debug, PartialEq, Eq)]
 enum ModulesSlot {
     /// While the `DefMap` is being collected.
     Building(ModulesMap),
-    /// A `Modules`, once it is.
-    Collected(blaze_query::db::Id),
+    /// Once it is: read-only.
+    Collected(ModulesMap),
     /// A view of the per-module resolver (`facts`): the modules it holds, and every other
-    /// module of its crate read through `facts::row` of `rows` (a `facts` `RowsKey`).
-    Unit { own: ModulesMap, rows: blaze_query::db::Id },
-    /// A view of the name resolution maintainer (`delta`): the modules its run holds, and every
-    /// other module of the crate as the maintainer's state has it. Every read is noted
-    /// (`delta::reads`) with its reader: it is what wakes that reader again when the module
-    /// changes.
-    Maintained { own: ModulesMap, outside: ModulesMap },
-    /// A crate's modules as the maintainer published them: `delta::CrateResolution::modules`.
-    Published(blaze_query::db::Id),
+    /// module of its crate read through `facts::row` of `rows`.
+    Unit { own: ModulesMap, rows: facts::queries::RowsKey },
 }
 
-/// The items of one module, held by the database on their own. A query that reads the scope of
-/// a module then depends on that scope and not on the whole `DefMap`, so adding an item to one
-/// module leaves what was resolved through the others alone.
-#[blaze_query::tracked]
-struct ModuleScope<'db> {
-    module: ModuleIdLt<'db>,
-    #[tracked]
-    #[returns(ref)]
-    scope: ItemScope,
-    #[tracked]
-    #[returns(ref)]
-    children: FxIndexMap<Name, ModuleId>,
-}
-
-#[blaze_query::tracked]
-impl<'db> ModuleScope<'db> {
-    /// What one name means in the module. Adding or removing another item leaves this equal,
-    /// so a query that only looked names up is not re-run.
-    #[blaze_query::tracked]
-    fn name(self, db: &'db Db, name: Name) -> PerNs {
-        self.scope(db).get(&name)
-    }
-
-    #[blaze_query::tracked(returns(ref))]
-    fn legacy_macro(self, db: &'db Db, name: Name) -> Option<Box<[MacroId]>> {
-        self.scope(db).get_legacy_macro(&name).map(Box::from)
-    }
-
-    #[blaze_query::tracked(returns(ref))]
-    fn traits(self, db: &'db Db) -> Box<[crate::TraitId]> {
-        // alloc: the memo's value, once per module scope
-        self.scope(db).traits().collect()
-    }
-}
-
-/// What a module holds while its `DefMap` is collected: boxed together, so a collected
-/// `ModuleData` (every module of every def map the database keeps) carries 16 bytes for its
-/// scope, not the box and the map's 56.
+/// What a module holds while its `DefMap` is collected, and after: boxed together, so a
+/// `ModuleData` carries 16 bytes for its scope, not the box and the map's 56.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct BuildingScope {
     scope: ItemScope,
@@ -679,24 +579,29 @@ struct BuildingScope {
 enum ScopeSlot {
     /// While the `DefMap` is being collected.
     Building(Box<BuildingScope>),
-    /// A `ModuleScope`, once it is.
-    Collected(blaze_query::db::Id),
-    /// The `ModuleScope` a resolver fact names (a `facts` `ScopeRef`), looked up on first read.
-    Fact(blaze_query::db::Id),
-    /// The module's scope as the name resolution maintainer published it (`delta::ScopeInput`).
-    Input(blaze_query::db::Id),
+    /// Once it is: read-only.
+    Collected(Box<BuildingScope>),
+    /// The scope a resolver fact names (a `facts` `ScopeRef`), looked up on first read.
+    Fact(facts::queries::ScopeRef),
     /// The module's scope in its crate's pages (a `frozen::pages::PagedScope`): a name is read
     /// from the page it is on, the whole scope decoded only for a reader of all of it.
-    Paged(blaze_query::db::Id),
+    Paged(frozen::pages::PagedScope),
+    /// The scope of a module of a crate's finished def map (what `crate_resolution` holds):
+    /// the final round's fact, as `Fact`, read only through name resolution's fact boundaries
+    /// ([`boundary`]), so a reader's list holds one row per name it looked up there and never
+    /// the crate's files. Made by [`DefMap::hand_over_scopes`] from the final table's `Fact`
+    /// slots; the views collection reads keep `Fact`, read directly.
+    Final(facts::queries::ScopeRef),
 }
 
 impl ScopeSlot {
-    /// The `ModuleScope` of a handed-over or fact slot.
-    fn handle(&self, db: &Db) -> Option<blaze_query::db::Id> {
+    /// The scope and children of a slot that holds them, or that a fact names. Never a
+    /// `Final` slot's, which is read through its boundaries alone.
+    fn held<'a>(&'a self, db: &'a Db) -> Option<&'a BuildingScope> {
         match self {
-            ScopeSlot::Building(_) | ScopeSlot::Input(_) | ScopeSlot::Paged(_) => None,
-            ScopeSlot::Collected(id) => Some(*id),
+            ScopeSlot::Building(it) | ScopeSlot::Collected(it) => Some(it),
             ScopeSlot::Fact(fact) => Some(facts::fact_scope(db, *fact)),
+            ScopeSlot::Paged(_) | ScopeSlot::Final(_) => None,
         }
     }
 }
@@ -710,7 +615,7 @@ pub fn crate_def_map(db: &Db, crate_id: Crate) -> &DefMap {
 
 /// The recursion limit of `krate` (`#![recursion_limit]`, 128 by default): what the solver
 /// reads of the def map, so that it depends on that alone.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
     crate_def_map(db, krate).recursion_limit()
 }
@@ -722,7 +627,7 @@ pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
 /// that primitive type, unless a generic parameter or a block scope around the path has the
 /// name: blocks are not counted (each has its own def map), nor are generic parameters, so a
 /// caller checks those itself.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub fn crate_shadows_primitive_type(db: &Db, krate: Crate) -> bool {
     let pair = crate_local_def_map(db, krate);
     let def_map = pair.def_map(db);
@@ -739,80 +644,55 @@ pub fn crate_shadows_primitive_type(db: &Db, krate: Crate) -> bool {
             .is_some_and(|(prelude, _)| shadows(prelude.def_map(db).module(db, prelude).scope(db)))
 }
 
-#[blaze_query::tracked]
-pub(crate) struct DefMapPair<'db> {
-    #[tracked]
-    #[returns(ref)]
-    pub(crate) def_map: DefMap,
-    #[returns(ref)]
-    pub(crate) local: LocalDefMap,
+/// A crate's resolution: its `DefMap` and its `LocalDefMap`, one value of the crate's arena.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CrateResolution {
+    def_map: DefMap,
+    local: LocalDefMap,
 }
 
-/// `krate` as a span names it ([`Crate::named`]), backdated when the rest of its extra data
-/// (version, potential cfg options) changes.
-#[blaze_query::tracked(returns(ref))]
-fn crate_display_name(db: &Db, krate: Crate) -> SmolStr {
-    krate.named(db).to_smolstr()
+impl CrateResolution {
+    pub(crate) fn def_map<'a>(&'a self, _db: &Db) -> &'a DefMap {
+        &self.def_map
+    }
+
+    pub(crate) fn local<'a>(&'a self, _db: &Db) -> &'a LocalDefMap {
+        &self.local
+    }
 }
 
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
-    let _p = tracing::info_span!("crate_def_map_query", krate = ?crate_display_name(db, crate_id))
-        .entered();
-
-    if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
-        return DefMapPair::new(db, def_map, local_def_map);
-    }
-    let Some((def_map, local_def_map)) = delta::published(db, crate_id) else {
-        Unmaintained::of(db, crate_id, delta::maintaining()).throw()
-    };
-    frozen::check(db, crate_id, &def_map, &local_def_map);
-    DefMapPair::new(db, def_map, local_def_map)
+/// The resolution of `krate` read in place from its pages, when its image serves it
+/// ([`frozen::served`]); `None` for a crate resolved here.
+#[blaze_memo::tracked(returns(as_ref), owns)]
+fn crate_served(db: &Db, krate: Crate) -> Option<CrateResolution> {
+    let (def_map, local) = frozen::served(db, krate)?;
+    Some(CrateResolution { def_map, local })
 }
 
-/// A crate's `DefMap` asked for when no frozen image serves it and the name resolution
-/// maintainer published none: a bug in whoever asked or in the maintainer, never resolved
-/// another way. It unwinds out of the query with this as its payload, and the driver that
-/// catches it ([`Unmaintained::catch`]) stops the build with it as the error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unmaintained {
-    pub krate: Crate,
-    /// Its display name, if it has one.
-    pub name: Option<String>,
-    /// The crate the maintainer was resolving when it asked, with its display name: the
-    /// crate asked for is not maintained before it. `None` when no maintainer ran.
-    pub asking: Option<(Crate, Option<String>)>,
+/// The resolution of `krate` resolved from its sources, in its own arena (how-to item 8:
+/// the per-crate query that replaces the name resolution maintainer); asked only for a crate
+/// no image serves.
+#[blaze_memo::tracked(returns(ref), owns)]
+pub(crate) fn crate_resolution(db: &Db, krate: Crate) -> CrateResolution {
+    let _p = tracing::info_span!("crate_resolution", krate = %krate.named(db)).entered();
+    let (def_map, local) =
+        blaze_mem::frame::task(Tag::Nameres, |frame| facts::collect_crate(db, frame, krate));
+    frozen::check(db, krate, &def_map, &local);
+    CrateResolution { def_map, local }
 }
 
-impl Unmaintained {
-    fn of(db: &Db, krate: Crate, asking: Option<Crate>) -> Unmaintained {
-        let name = |krate: Crate| {
-            // alloc: an error's crate name, once
-            krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().to_string())
-        };
-        Unmaintained { krate, name: name(krate), asking: asking.map(|it| (it, name(it))) }
-    }
+/// The resolution of `krate`: served from its image when one serves it, else resolved
+/// ([`crate_resolution`]); never both, and never another route.
+pub(crate) fn crate_local_def_map(db: &Db, krate: Crate) -> &CrateResolution {
+    crate::signatures::Serve::new(crate_served(db, krate), || crate_resolution(db, krate)).get()
+}
 
-    /// Unwinds with `self` as the payload. It is logged first: a catcher that reads only a
-    /// panic's text finds none in it, and the panic hook prints only where it was thrown.
-    pub fn throw(self) -> ! {
-        tracing::error!(target: "blaze", "{self}");
-        std::panic::panic_any(self)
-    }
-
-    /// Runs `f`; an [`Unmaintained`] it unwinds with is returned, any other panic goes on.
-    pub fn catch<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Result<T, Unmaintained> {
-        std::panic::catch_unwind(f).map_err(|payload| match payload.downcast::<Unmaintained>() {
-            Ok(it) => *it,
-            Err(payload) => std::panic::resume_unwind(payload),
-        })
-    }
-
-    /// The `Unmaintained` a caught panic's payload is, if it is one.
-    // dyn: a caught panic's payload, read once
-    pub fn of_payload(payload: &(dyn std::any::Any + Send)) -> Option<&Unmaintained> {
-        payload.downcast_ref::<Unmaintained>()
-    }
+/// The scope of `module`, as its crate's resolution has it (how-to item 8). A projection of
+/// [`crate_local_def_map`] (or of a block's [`block_def_map`]), not a memo entry of its own:
+/// the crate's arena is dropped whole on a change, so a second entry would only copy a
+/// reference.
+pub fn module_scope(db: &Db, module: ModuleId) -> &ItemScope {
+    module.def_map(db).module(db, module).scope(db)
 }
 
 fn write_crate(
@@ -826,28 +706,11 @@ fn write_crate(
     }
 }
 
-impl std::fmt::Display for Unmaintained {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("name resolution: no maintained resolution for crate ")?;
-        write_crate(f, self.krate, self.name.as_deref())?;
-        match &self.asking {
-            Some((asking, name)) => {
-                f.write_str(", read while maintaining crate ")?;
-                write_crate(f, *asking, name.as_deref())?;
-                f.write_str(", which it is not maintained before")
-            }
-            None => f.write_str(": no maintainer ran for it and no frozen image serves it"),
-        }
-    }
-}
-
-impl std::error::Error for Unmaintained {}
-
 /// Name resolution of a crate, or of a block of it, that still made progress after
 /// `FIXED_POINT_LIMIT` macro rounds: every round resolved a macro call or reseeded an
 /// attribute, so it would never reach its fixed point. A bug in blaze, or a program whose
-/// macros expand without end below the recursion limit. It unwinds like [`Unmaintained`], and
-/// the driver that catches it stops the build with it as the error.
+/// macros expand without end below the recursion limit. It unwinds with itself as the
+/// payload, and the driver that catches it stops the build with it as the error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixpointLimit {
     pub krate: Crate,
@@ -868,7 +731,8 @@ impl FixpointLimit {
     /// How many of the pending macro calls and imports [`FixpointLimit::first`] lists.
     pub(crate) const LISTED: usize = 8;
 
-    /// Unwinds with `self` as the payload, logged first as [`Unmaintained::throw`] is.
+    /// Unwinds with `self` as the payload. It is logged first: a catcher that reads only a
+    /// panic's text finds none in it, and the panic hook prints only where it was thrown.
     pub fn throw(self) -> ! {
         tracing::error!(target: "blaze", "{self}");
         std::panic::panic_any(self)
@@ -904,23 +768,22 @@ impl std::fmt::Display for FixpointLimit {
 impl std::error::Error for FixpointLimit {}
 
 /// The error a caught panic's payload is, when it is one of name resolution's typed stops
-/// ([`Unmaintained`], [`FixpointLimit`], [`frozen::Unreadable`]): what a driver fails the one
-/// job that asked with (rule 20). `None` for any other payload.
+/// ([`FixpointLimit`], [`frozen::Unreadable`]) or base-db's refused parse of a file with no
+/// text ([`base_db::NoText`]): what a driver fails the one job that asked with (rule 20).
+/// `None` for any other payload.
 // dyn: a caught panic's payload, read once
 pub fn stopped(payload: &(dyn std::any::Any + Send)) -> Option<String> {
-    if let Some(it) = Unmaintained::of_payload(payload) {
-        return Some(it.to_string()); // alloc: an error, once
-    }
     if let Some(it) = FixpointLimit::of_payload(payload) {
-        return Some(it.to_string()); // alloc: as above
+        return Some(it.to_string());
     }
-    frozen::Unreadable::of_payload(payload).map(|it| it.to_string()) // alloc: as above
+    if let Some(it) = base_db::NoText::of_payload(payload) {
+        return Some(it.to_string());
+    }
+    frozen::Unreadable::of_payload(payload).map(|it| it.to_string())
 }
 
-#[blaze_query::tracked(returns(ref))]
-pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
-    // The `'static` ids go only into the `DefMap` this query returns, invalidated with its key.
-    let block_id = block_id.to_static();
+#[blaze_memo::tracked(returns(ref), owns)]
+pub fn block_def_map(db: &Db, block_id: BlockId) -> DefMap {
     let ast_id = block_id.ast_id(db);
     let module = block_id.module(db).to_static();
 
@@ -1003,8 +866,7 @@ impl DefMap {
             derive_helpers_in_scope: HashMap::new_in(Global),
             session_macros: false,
             names: uses::NameRecords::default(),
-            // alloc: empty; allocates nothing until a diagnostic
-            diagnostics: Vec::new(),
+            diagnostics: Vec::new_in(Global),
             diagnostics_by_module: DiagnosticsByModule::default(),
             records: None,
             data: crate_data,
@@ -1041,88 +903,66 @@ impl DefMap {
         }
     }
 
-    /// Hands the scope of every module to the database. Called once, when collection is done.
-    fn hand_over_scopes(&mut self, db: &Db) {
+    /// Seals the `DefMap` once collection is done: every module and scope becomes read-only and
+    /// the diagnostics are grouped by module. Called once.
+    ///
+    /// A crate's own def map (no block) has every scope a fact of the final round: each
+    /// becomes `ScopeSlot::Final`, read through name resolution's fact boundaries
+    /// ([`boundary`]) from then on.
+    fn hand_over_scopes(&mut self, _db: &Db) {
         let ModulesSlot::Building(modules) = &mut self.modules else { return };
-        let diagnostics = std::mem::take(&mut self.diagnostics);
-        let records = OwnedRecords {
-            names: std::mem::take(&mut self.names),
-            diagnostics_by_module: DiagnosticsByModule::of(&diagnostics),
-            diagnostics,
-            derive_helpers_in_scope: std::mem::take(&mut self.derive_helpers_in_scope),
-        };
-        let held = HeldRecords::new(db, self.root, records);
-        self.records = Some(RecordsSlot::Held(blaze_query::db::AsId::as_id(&held)));
-        for (id, module) in modules.iter_mut() {
-            if let ScopeSlot::Building(building) = &mut module.scope {
-                let BuildingScope { scope, children } = std::mem::take(&mut **building);
-                let scope = ModuleScope::new(db, id, scope, children);
-                module.scope = ScopeSlot::Collected(blaze_query::db::AsId::as_id(&scope));
-            }
-        }
-        let modules = Modules::new(db, self.root, std::mem::replace(modules, ModulesMap::new()));
-        self.modules = ModulesSlot::Collected(blaze_query::db::AsId::as_id(&modules));
-    }
-
-    /// What `name` means in module `id` of this `DefMap`; depends on that name only.
-    pub(crate) fn name_in_module(&self, db: &Db, id: ModuleIdLt<'_>, name: &Name) -> PerNs {
-        match &self.modules {
-            ModulesSlot::Building(_) | ModulesSlot::Unit { .. } | ModulesSlot::Published(_) => {
-                self.module(db, id).name_in_scope(db, name)
-            }
-            ModulesSlot::Maintained { own, outside } => {
-                let id = id.to_static();
-                delta::reads::note(id, Some(*name));
-                if let Some(data) = own.get(&id) {
-                    return data.name_in_scope(db, name);
+        self.diagnostics_by_module = DiagnosticsByModule::of(&self.diagnostics);
+        let finished = self.block.is_none();
+        for (_, module) in modules.iter_mut() {
+            match &mut module.scope {
+                ScopeSlot::Building(building) => {
+                    module.scope = ScopeSlot::Collected(std::mem::take(building));
                 }
-                let Some(data) = outside.get(&id) else {
-                    panic!("ModuleId not found in ModulesMap {:#?}: {id:#?}", self.root)
-                };
-                data.name_in_scope(db, name)
-            }
-            ModulesSlot::Collected(modules) => {
-                let id = id.to_static();
-                *<Modules<'_> as blaze_query::db::FromId>::from_id(*modules).name(db, id, *name)
+                ScopeSlot::Fact(fact) if finished => module.scope = ScopeSlot::Final(*fact),
+                ScopeSlot::Fact(_)
+                | ScopeSlot::Collected(_)
+                | ScopeSlot::Paged(_)
+                | ScopeSlot::Final(_) => {}
             }
         }
+        self.modules = ModulesSlot::Collected(std::mem::replace(modules, ModulesMap::new()));
     }
 
-    /// One module of the `DefMap`; depends on that module only.
+    /// What `name` means in module `id` of this `DefMap`.
+    pub(crate) fn name_in_module(&self, db: &Db, id: ModuleIdLt<'_>, name: &Name) -> PerNs {
+        self.module(db, id).name_in_scope(db, name)
+    }
+
+    /// One module of the `DefMap`.
     pub fn module<'a>(&'a self, db: &'a Db, id: ModuleIdLt<'_>) -> &'a ModuleData {
-        // The `'static` copy only keys the lookup in `self.modules` (and in a collected map the
-        // `Modules::module` query); the query database never frees an id, so none is reused.
         let id = id.to_static();
         let found = match &self.modules {
-            ModulesSlot::Building(modules) => modules.get(&id),
+            ModulesSlot::Building(modules) | ModulesSlot::Collected(modules) => modules.get(&id),
             ModulesSlot::Unit { own, rows } => match own.get(&id) {
                 Some(it) => Some(it),
                 None => facts::row(db, *rows, id),
             },
-            ModulesSlot::Maintained { own, outside } => {
-                delta::reads::note(id, None);
-                own.get(&id).or_else(|| outside.get(&id))
-            }
-            ModulesSlot::Published(resolution) => delta::published_module(db, *resolution, id),
-            ModulesSlot::Collected(modules) => {
-                <Modules<'a> as blaze_query::db::FromId>::from_id(*modules).module(db, id).as_ref()
-            }
         };
         found
             .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap {:#?}: {id:#?}", self.root))
     }
 
-    /// Every module of the `DefMap`; depends on which there are.
+    /// Every module of the `DefMap`. A crate's finished def map lists the read of all of its
+    /// modules ([`boundary::all_modules`]): what it gives changes with any module added,
+    /// removed or moved, which no name's row stands for. A block's table is its one module,
+    /// made from the text of the body that holds the block (its key covers it) and the rows of
+    /// what the block's resolution looked up outside it, which its reader lists
+    /// (`block_def_map` is no boundary, [`boundary`]).
     fn table<'a>(&'a self, db: &'a Db) -> &'a ModulesMap {
         match &self.modules {
             ModulesSlot::Building(modules) => modules,
-            ModulesSlot::Unit { .. } | ModulesSlot::Maintained { .. } => {
-                panic!("the modules of a resolver view are not listed")
+            ModulesSlot::Collected(modules) => {
+                if self.block.is_none() {
+                    boundary::all_modules(db, self.krate);
+                }
+                modules
             }
-            ModulesSlot::Published(resolution) => delta::published_modules(db, *resolution),
-            ModulesSlot::Collected(id) => {
-                <Modules<'a> as blaze_query::db::FromId>::from_id(*id).table(db)
-            }
+            ModulesSlot::Unit { .. } => panic!("the modules of a resolver view are not listed"),
         }
     }
 }
@@ -1174,16 +1014,11 @@ impl DefMap {
             .map(|(id, _)| id)
     }
 
-    /// This def map's records: its own while it is collected, the database's once handed over,
-    /// so that a read of them depends on them and not on the `DefMap`.
+    /// This def map's records: its own, or, for a crate read from pages, its tail's.
     pub fn records<'a>(&'a self, db: &'a Db) -> Records<'a> {
         match self.records {
             Some(slot) => {
                 let held = match slot {
-                    RecordsSlot::Held(id) => {
-                        <HeldRecords<'a> as blaze_query::db::FromId>::from_id(id).records(db)
-                    }
-                    RecordsSlot::Published(resolution) => delta::published_records(db, resolution),
                     RecordsSlot::Paged(krate) => frozen::pages::records(db, krate),
                 };
                 Records {
@@ -1427,9 +1262,12 @@ impl DefMap {
     }
 
     /// The first `Option<usize>` points at the `Enum` segment in case of `Enum::Variant`, the second
-    /// points at the unresolved segments.
+    /// points at the unresolved segments. `table`: the table `path`'s contexts are of, the
+    /// [`DefMap::ctx_table`] of the def map it is written in, which def-site hygiene may have
+    /// moved the lookup out of.
     pub(crate) fn resolve_path_locally(
         &self,
+        table: blaze_memo::ArenaId,
         local_def_map: &LocalDefMap,
         db: &Db,
         original_module: ModuleId,
@@ -1437,6 +1275,7 @@ impl DefMap {
         shadow: BuiltinShadowMode,
     ) -> (PerNs, Option<usize>, ResolvePathResultPrefixInfo) {
         let res = self.resolve_path_fp_with_macro_single(
+            table,
             local_def_map,
             db,
             ResolveMode::Other,
@@ -1452,13 +1291,15 @@ impl DefMap {
     /// does): where def-site hygiene names a block, its lookup is rustc's lexical walk out of it.
     pub(crate) fn resolve_path_around(
         &self,
+        table: blaze_memo::ArenaId,
         local_def_map: &LocalDefMap,
         db: &Db,
         original_module: ModuleId,
         path: &ModPath,
         shadow: BuiltinShadowMode,
     ) -> (PerNs, Option<usize>, ResolvePathResultPrefixInfo) {
-        let res = self.resolve_path_fp_with_macro(
+        let res = self.resolve_path_written_in(
+            table,
             local_def_map,
             db,
             ResolveMode::Other,
@@ -1466,6 +1307,7 @@ impl DefMap {
             path,
             shadow,
             None,
+            &mut |_| {},
         );
         (res.resolved_def, res.segment_index, res.prefix_info)
     }
@@ -1607,53 +1449,27 @@ impl ModuleData {
             origin,
             visibility,
             parent,
-            // alloc: one box per module of a def map being built, moved to the database when it is done
-            scope: ScopeSlot::Building(Box::new(BuildingScope { scope, children })),
+            scope: ScopeSlot::Building(Box::new_in(BuildingScope { scope, children }, Global)),
         }
     }
 
-    /// A module of a `DefMap` whose scope is final (a frozen `DefMap` read back): the scope
-    /// goes to the database at once, with no `BuildingScope` in between.
-    pub(crate) fn collected(
-        db: &Db,
-        id: ModuleId,
-        origin: ModuleOrigin,
-        visibility: Visibility,
-        parent: Option<ModuleId>,
-        scope: ItemScope,
-        children: FxIndexMap<Name, ModuleId>,
-    ) -> Self {
-        let scope = ModuleScope::new(db, id, scope, children);
-        ModuleData {
-            origin,
-            visibility,
-            parent,
-            scope: ScopeSlot::Collected(blaze_query::db::AsId::as_id(&scope)),
-        }
-    }
-
+    /// The whole of this module's scope. Of a crate's finished def map or its pages, read
+    /// through a boundary whose row stands for every name of the scope (a scan of it).
     pub fn scope<'a>(&'a self, db: &'a Db) -> &'a ItemScope {
         match &self.scope {
-            ScopeSlot::Building(building) => &building.scope,
-            ScopeSlot::Input(input) => delta::input_scope(db, *input),
-            ScopeSlot::Paged(paged) => frozen::pages::scope(db, *paged),
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
-                let id = self.scope.handle(db).expect("a handed-over slot");
-                <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id).scope(db)
-            }
+            ScopeSlot::Paged(paged) => boundary::paged_scope(db, *paged),
+            ScopeSlot::Final(scope) => boundary::final_scope(db, *scope),
+            slot => &slot.held(db).expect("a slot that holds its scope").scope,
         }
     }
 
-    /// What `name` means in this module; depends on that name only.
+    /// What `name` means in this module. Of a crate's finished def map or its pages, read
+    /// through a boundary keyed by the scope and the name: one row for this name alone.
     pub fn name_in_scope(&self, db: &Db, name: &Name) -> PerNs {
         match &self.scope {
-            ScopeSlot::Building(building) => building.scope.get(name),
-            ScopeSlot::Input(input) => delta::input_name(db, *input, *name),
-            ScopeSlot::Paged(paged) => frozen::pages::name(db, *paged, *name),
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
-                let id = self.scope.handle(db).expect("a handed-over slot");
-                *<ModuleScope<'_> as blaze_query::db::FromId>::from_id(id).name(db, *name)
-            }
+            ScopeSlot::Paged(paged) => boundary::paged_name(db, *paged, *name),
+            ScopeSlot::Final(scope) => boundary::final_name(db, *scope, *name),
+            slot => slot.held(db).expect("a slot that holds its scope").scope.get(name),
         }
     }
 
@@ -1663,53 +1479,28 @@ impl ModuleData {
         name: &Name,
     ) -> Option<&'a [MacroId]> {
         match &self.scope {
-            ScopeSlot::Building(building) => building.scope.get_legacy_macro(name),
-            ScopeSlot::Input(input) => delta::input_legacy_macro(db, *input, *name),
-            ScopeSlot::Paged(paged) => frozen::pages::legacy_macro(db, *paged, *name),
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
-                let id = self.scope.handle(db).expect("a handed-over slot");
-                <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id)
-                    .legacy_macro(db, *name)
-                    .as_deref()
-            }
+            ScopeSlot::Paged(paged) => boundary::paged_legacy_macro(db, *paged, *name),
+            ScopeSlot::Final(scope) => boundary::final_legacy_macro(db, *scope, *name),
+            slot => slot.held(db).expect("a slot that holds its scope").scope.get_legacy_macro(name),
         }
     }
 
-    /// The traits in scope in this module; depends on those only.
+    /// The traits in scope in this module.
     pub fn traits_in_scope<'a>(&'a self, db: &'a Db) -> impl Iterator<Item = crate::TraitId> + 'a {
-        let (building, collected) = match &self.scope {
-            ScopeSlot::Building(building) => (Some(building.scope.traits()), None),
-            ScopeSlot::Input(input) => {
-                (None, Some(delta::input_traits(db, *input).iter().copied()))
-            }
-            ScopeSlot::Paged(paged) => {
-                (None, Some(frozen::pages::traits(db, *paged).iter().copied()))
-            }
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => (
-                None,
-                Some(
-                    <ModuleScope<'a> as blaze_query::db::FromId>::from_id(
-                        self.scope.handle(db).expect("a handed-over slot"),
-                    )
-                    .traits(db)
-                    .iter()
-                    .copied(),
-                ),
-            ),
+        let (held, listed) = match &self.scope {
+            ScopeSlot::Paged(paged) => (None, Some(boundary::paged_traits(db, *paged).iter().copied())),
+            ScopeSlot::Final(scope) => (Some(boundary::final_traits(db, *scope).traits()), None),
+            slot => (Some(slot.held(db).expect("a slot that holds its scope").scope.traits()), None),
         };
-        building.into_iter().flatten().chain(collected.into_iter().flatten())
+        held.into_iter().flatten().chain(listed.into_iter().flatten())
     }
 
     /// The modules declared in this one, by name.
     pub fn children<'a>(&'a self, db: &'a Db) -> &'a FxIndexMap<Name, ModuleId> {
         match &self.scope {
-            ScopeSlot::Building(building) => &building.children,
-            ScopeSlot::Input(input) => delta::input_children(db, *input),
-            ScopeSlot::Paged(paged) => frozen::pages::children(db, *paged),
-            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
-                let id = self.scope.handle(db).expect("a handed-over slot");
-                <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id).children(db)
-            }
+            ScopeSlot::Paged(paged) => boundary::paged_children(db, *paged),
+            ScopeSlot::Final(scope) => boundary::final_children(db, *scope),
+            slot => &slot.held(db).expect("a slot that holds its scope").children,
         }
     }
 
@@ -1718,8 +1509,8 @@ impl ModuleData {
             ScopeSlot::Building(building) => &mut building.children,
             ScopeSlot::Collected(_)
             | ScopeSlot::Fact(_)
-            | ScopeSlot::Input(_)
-            | ScopeSlot::Paged(_) => {
+            | ScopeSlot::Paged(_)
+            | ScopeSlot::Final(_) => {
                 panic!("the children of a collected module are read-only")
             }
         }
@@ -1731,8 +1522,8 @@ impl ModuleData {
             ScopeSlot::Building(building) => &mut building.scope,
             ScopeSlot::Collected(_)
             | ScopeSlot::Fact(_)
-            | ScopeSlot::Input(_)
-            | ScopeSlot::Paged(_) => {
+            | ScopeSlot::Paged(_)
+            | ScopeSlot::Final(_) => {
                 panic!("the scope of a collected module is read-only")
             }
         }
@@ -1940,107 +1731,6 @@ pub enum NameRead {
     Handle,
 }
 
-/// What `read` was of: `None` when it is of no row of name resolution this function knows. The
-/// rows are told apart by their name and the file they are declared in, as the engine has them.
-pub fn name_read(
-    db: &Db,
-    read: blaze_query::db::DatabaseKeyIndex,
-    kind: blaze_query::db::ReadKind,
-) -> Option<NameRead> {
-    use blaze_query::db::{FromId, ReadKind};
-    if kind == ReadKind::Interned {
-        return None;
-    }
-    let storage = blaze_query::db::Database::storage(db);
-    let name = storage.read_name(read, kind);
-    let file = storage.ingredient_file(read.ingredient_index());
-    let key = read.key_index();
-    let in_file = |tail: &str| file.ends_with(tail);
-    if in_file("nameres/delta/publish.rs") {
-        return delta::name_read(db, name, kind, key);
-    }
-    if in_file("nameres/frozen/pages.rs") {
-        let (krate, paged, of) = frozen::pages::read_of(db, name, key)?;
-        let module = paged_module(db, krate, paged);
-        return Some(match of {
-            frozen::pages::PagedRead::Name(name) => NameRead::Name(module, name),
-            frozen::pages::PagedRead::Traits => NameRead::Traits(module),
-            frozen::pages::PagedRead::Whole => NameRead::WholeScope(module),
-        });
-    }
-    if in_file("nameres/facts/queries.rs") {
-        return (name == "row" && kind == ReadKind::Function).then_some(NameRead::Handle);
-    }
-    if in_file("hir-def/src/lib.rs") {
-        return matches!(name, "ModuleIdLt" | "BlockIdLt").then_some(NameRead::Handle);
-    }
-    if !in_file("hir-def/src/nameres.rs") {
-        return None;
-    }
-    let scope_module = |key| <ModuleScope<'_> as FromId>::from_id(key).module(db).to_static();
-    let pair_crate = |key| <DefMapPair<'_> as FromId>::from_id(key).def_map(db).krate();
-    Some(match (name, kind) {
-        ("Modules::name", ReadKind::Function) => {
-            let (_, module, name) = Modules_name::arguments(db, key)?;
-            NameRead::Name(module, name)
-        }
-        ("ModuleScope::name", ReadKind::Function) => {
-            let (scope, name) = ModuleScope_name::arguments(db, key)?;
-            NameRead::Name(scope.module(db).to_static(), name)
-        }
-        ("ModuleScope::legacy_macro", ReadKind::Function) => {
-            let (scope, name) = ModuleScope_legacy_macro::arguments(db, key)?;
-            NameRead::Name(scope.module(db).to_static(), name)
-        }
-        ("ModuleScope::traits", ReadKind::Function) => NameRead::Traits(scope_module(key)),
-        ("scope", ReadKind::TrackedField(_)) => NameRead::WholeScope(scope_module(key)),
-        ("children", ReadKind::TrackedField(_)) => NameRead::Children(scope_module(key)),
-        // The table of every module: whoever reads it iterates them (a crate's inherent
-        // impls' associated types, a walk of its modules), so it is no handle: what it gives
-        // changes with any module added, removed or moved. A block's table is its one
-        // module, whose scope is the read.
-        ("table", ReadKind::TrackedField(_)) => {
-            let root = <Modules<'_> as FromId>::from_id(key).root(db).to_static();
-            match root.is_block_module(db) {
-                true => NameRead::WholeScope(root),
-                false => NameRead::AllModules(root.krate(db)),
-            }
-        }
-        // A module's row: its origin, visibility, parent and the id of its scope. What a name
-        // of it means is read through that scope's own rows.
-        ("Modules::module", ReadKind::Function)
-        | ("Modules" | "ModuleScope", ReadKind::Function)
-        | ("crate_local_def_map", ReadKind::Function) => NameRead::Handle,
-        // The pair's untracked half is the extern prelude; the `DefMap` holds the preludes
-        // and the root's attributes.
-        ("DefMapPair", ReadKind::Function) | ("def_map", ReadKind::TrackedField(_)) => {
-            NameRead::Crate(pair_crate(key))
-        }
-        ("crate_shadows_primitive_type", ReadKind::Function) => {
-            NameRead::Crate(<Crate as FromId>::from_id(key))
-        }
-        // A block's def map: its one module's scope, with the items the block declares.
-        ("block_def_map", ReadKind::Function) => {
-            let block = <BlockIdLt<'_> as FromId>::from_id(key);
-            NameRead::WholeScope(block_def_map(db, block).root)
-        }
-        _ => return None,
-    })
-}
-
-/// The module of `krate` whose scope is the paged scope `paged`
-/// (`frozen::pages::PagedScope`, whose `module` is the module's place in the crate's table).
-fn paged_module(db: &Db, krate: Crate, paged: blaze_query::db::Id) -> ModuleId {
-    let at = frozen::pages::paged_index(db, paged);
-    match crate_def_map(db, krate).table(db).get_index(at) {
-        Some((&module, data)) if data.scope == ScopeSlot::Paged(paged) => module,
-        _ => panic!(
-            "paged scope {at} of {} is not the scope of module {at} of its def map",
-            crate_display_name(db, krate)
-        ),
-    }
-}
-
 /// What `krate`'s def map holds outside its modules' scopes, for a hash of it
 /// ([`NameRead::Crate`]): `each` is given, in an order that is the same in every database,
 /// a tag and one row at a time.
@@ -2083,6 +1773,25 @@ pub fn crate_names(db: &Db, krate: Crate, each: &mut dyn FnMut(CrateName<'_>)) {
         crate_shadows_primitive_type(db, krate),
     ];
     each(CrateName::Flags(&flags, data.edition));
+    // The crate's features, sorted for an order no set decides: once per change of a crate's
+    // def map, a few names.
+    let mut features: Vec<Symbol, Global> = Vec::new_in(Global);
+    features.extend(data.unstable_features.iter());
+    features.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    for feature in &features {
+        each(CrateName::Feature(feature.as_str()));
+    }
+    each(CrateName::Limit(def_map.recursion_limit()));
+    // In the maps' order: the reader sorts them by key, which no map here can.
+    for (&it, helpers) in &data.exported_derives {
+        each(CrateName::Derive(it, helpers));
+    }
+    for (&function, &it) in &data.fn_proc_macro_mapping {
+        each(CrateName::ProcMacro(function, it));
+    }
+    // Read through its boundary, as a block's collection reads it: the reader of this crate's
+    // names is the one row of it, never the root file the edition is said in.
+    each(CrateName::BlazeEdition(boundary::blaze_edition(db, krate)));
 }
 
 /// One row of [`crate_names`].
@@ -2099,4 +1808,16 @@ pub enum CrateName<'a> {
     /// What the root's attributes and the crate's names decide for every module, and the
     /// edition.
     Flags(&'a [bool], Edition),
+    /// A `#![feature]` of the crate, in name order.
+    Feature(&'a str),
+    /// The crate's recursion limit.
+    Limit(u32),
+    /// A derive macro the crate exports and its helper attributes, in no set order.
+    Derive(MacroId, &'a [Name]),
+    /// A proc macro function of the crate and the macro it defines, in no set order.
+    ProcMacro(FunctionId, ProcMacroId),
+    /// The crate's blaze edition (`#![blaze::edition]`), `None` for a crate of Rust's own: it
+    /// decides which dependency is the crate's `std` and which prelude its modules and blocks
+    /// see.
+    BlazeEdition(Option<span::BlazeEdition>),
 }

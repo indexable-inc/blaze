@@ -12,7 +12,8 @@ use intern::Symbol;
 use std::alloc::Global;
 
 use super::{
-    Enc, HEADER, LAYOUT, PageSource, Paged, encode, encode_maps, names_of, read_head, set,
+    Enc, HEADER, LAYOUT, PageSource, Paged, encode, encode_maps, names_of, read_head,
+    set_for_test as set,
 };
 use crate::{
     nameres::{
@@ -379,42 +380,6 @@ fn the_print_of_a_meaning_tells_two_apart() {
     assert_eq!(print(&db, lib, PerNs::none()), print(&db, lib, PerNs::none()));
 }
 
-/// What reading the pages of `lib` runs after `main`, a crate beside it, was given other
-/// pages; and what reading `main`'s runs then.
-fn runs_after_another_crates_gift() -> (Vec<String>, Vec<String>) {
-    use crate::test_db::TestDBExt;
-    let pages = written(FIXTURE, &["lib", "main"]);
-    let mut db = paged(FIXTURE, &sources(&pages));
-    let (lib, main) = (crate_named(&db, "lib"), crate_named(&db, "main"));
-    assert!(super::paged(&db, lib).is_some() && super::paged(&db, main).is_some());
-    let mut maps = super::all(&db);
-    maps.get_mut(&main).unwrap().key = ContentId([9; 32]);
-    set(&mut db, maps);
-    let of_lib = db.executed_in_read_order(|| _ = super::paged(&db, lib));
-    let of_main = db.executed_in_read_order(|| _ = super::paged(&db, main));
-    assert_eq!(super::paged(&db, main).as_ref().map(|it| it.key), Some(ContentId([9; 32])));
-    assert_eq!(super::paged(&db, lib).as_ref().map(|it| it.key), Some(ContentId([1; 32])));
-    (of_lib, of_main)
-}
-
-/// The invariant: what a crate is read from is the crate's own slot (`deps::given`), so pages
-/// given to one crate run no row of another crate; the crate given them runs its own again.
-#[test]
-fn pages_given_to_one_crate_run_no_row_of_another() {
-    let (of_lib, of_main) = runs_after_another_crates_gift();
-    assert_eq!(of_lib, Vec::<String>::new(), "`lib` was given nothing");
-    assert_eq!(of_main.len(), 1, "`main`'s reader runs once: {of_main:?}");
-}
-
-/// The control: every crate given its entry again at each set, as one map of every crate
-/// did to its readers, runs `lib`'s reader too.
-#[test]
-fn the_oracle_catches_a_gift_to_every_crate() {
-    crate::deps::given::GIVES_EVERY_CRATE.set(true);
-    let (of_lib, _) = runs_after_another_crates_gift();
-    crate::deps::given::GIVES_EVERY_CRATE.set(false);
-    assert_eq!(of_lib.len(), 1, "the planted bug writes `lib`'s slot: {of_lib:?}");
-}
 
 /// What a random edit appends to `main.rs`: items, uses of `lib`'s names (one a glob, one
 /// through a module of its own) and a use of a name `lib` does not have.
@@ -461,7 +426,25 @@ fn agree_under_edits(
         text.push_str(&EDITS[draw() % EDITS.len()].replace('N', &step.to_string()));
         for db in [&mut resolved, &mut read] {
             let root = crate_named(db, "main").data(db).root_file_id;
-            db.set_file_text(root, &text);
+            // What a driver does at a write: the crates read from pages whose files the write
+            // moves (`deps::withdrawn`, asked of the snapshot before it) lose their pages in
+            // the snapshot the write makes. A gift lasts until it is taken and no commit takes
+            // one on its own, so the test writes as the driver does.
+            let paged: Vec<Crate> = base_db::all_crates(db)
+                .iter()
+                .copied()
+                .filter(|&krate| super::is_paged(db, krate))
+                .collect();
+            let gone: Vec<base_db::CrateKey> = crate::deps::withdrawn(db, &paged, &[root], &[])
+                .iter()
+                .map(|krate| krate.key(db))
+                .collect();
+            let mut edit = db.edit();
+            _ = edit.set_file_text(root, &text);
+            for &key in &gone {
+                _ = crate::deps::withdraw_image(&mut edit, key);
+            }
+            _ = edit.commit();
         }
         let lib = crate_named(&read, "lib");
         if super::paged(&read, lib).is_none() {
@@ -629,8 +612,14 @@ fn sealed_run(whole: bool) -> Vec<String> {
         }
     });
     // An ingredient's name is its function's: `tail` is the pages' tail, which only a crate
-    // read from pages runs.
-    ran.into_iter().filter(|it| it.ends_with("scope_memo") || it == "tail" || it.ends_with("::tail")).collect()
+    // read from pages runs. The run log writes a run as `path::to::query(key)`, so a run is
+    // told by its path, up to the key's parenthesis.
+    ran.into_iter()
+        .filter(|it| {
+            let path = it.split_once('(').map_or(it.as_str(), |(path, _)| path);
+            path.ends_with("scope_memo") || path == "tail" || path.ends_with("::tail")
+        })
+        .collect()
 }
 
 /// The invariant: name resolution holds no decoded state of a sealed crate. `main` resolved
@@ -695,4 +684,79 @@ fn a_whole_scope_asked_for_is_seen_by_the_check() {
     let root = def_map.module(&db, def_map.root);
     let ran = db.executed_in_read_order(|| _ = root.scope(&db).legacy_macros().count());
     assert!(ran.iter().any(|it| it.contains("scope_memo")), "{ran:?}");
+}
+
+/// `lib` re-exports one item of each of its two dependencies, written with them in the order
+/// `deps` names. The dependencies' texts are equal, so nothing but the crate a reference names
+/// tells their items apart (no file content check can catch a swap).
+fn closure_text(deps: &str) -> String {
+    format!(
+        "//- /a/lib.rs crate:a new_source_root:library\npub struct S;\n\
+         //- /b/lib.rs crate:b new_source_root:library\npub struct S;\n\
+         //- /c/lib.rs crate:c new_source_root:library\npub struct S;\n\
+         //- /lib/lib.rs crate:lib deps:{deps} new_source_root:library\n\
+         pub use a::S as First;\npub use b::S as Second;\n"
+    )
+}
+
+/// The crate `lib`'s root's `name` names, in the type namespace, and the crate it is of.
+fn reexported(db: &Db, name: &str) -> (Option<crate::ModuleDefId>, Option<Crate>) {
+    use crate::HasModule;
+    let def_map = crate_def_map(db, crate_named(db, "lib"));
+    let found = def_map.name_in_module(db, def_map.root, &plain(name)).take_types();
+    let krate = match found {
+        Some(crate::ModuleDefId::AdtId(it)) => Some(it.krate(db)),
+        _ => None,
+    };
+    (found, krate)
+}
+
+/// The invariant (rule 21): pages name every crate of their closure by its item key
+/// (`Crate::item_key`), so a database whose dependencies are of another order reads the same
+/// crates from them: `lib`'s pages written with `deps:a,b` and read where `lib` has
+/// `deps:b,a` re-export `a::A` and `b::B`, as the crate resolved there from source does. One
+/// whose closure lacks a crate the pages name (`deps:a,c`, no `b`) is the typed refusal
+/// (`Unreadable`, kind [`super::CLOSURE`]) naming `b`, never another crate's item.
+///
+/// The planted control: with the keys not read (`POSITIONAL`, crates taken by their index in
+/// this database's walk, as layout 3 took them), the reordered read decodes `First` as an item
+/// of `b`, so the check is known to bite.
+#[test]
+fn pages_name_their_closure_by_key_so_a_reordered_closure_reads_the_same_crates() {
+    let pages = written(&closure_text("a,b"), &["lib"]).remove(0).1;
+    let reordered = closure_text("b,a");
+    let fresh = fixture::db(&reordered).into_db();
+    let (want_first, want_second) = (reexported(&fresh, "First"), reexported(&fresh, "Second"));
+    assert_eq!(want_first.1, Some(crate_named(&fresh, "a")), "premise: `First` is `a`'s from source");
+
+    let db = paged(&reordered, &[("lib", Counting::new(pages.clone()))]);
+    let (first, second) = (reexported(&db, "First"), reexported(&db, "Second"));
+    assert_eq!(first.1, Some(crate_named(&db, "a")), "`First`, read from pages written with `deps:a,b`");
+    assert_eq!(second.1, Some(crate_named(&db, "b")), "`Second`, read so");
+    assert_eq!((first.0.is_some(), second.0.is_some()), (want_first.0.is_some(), want_second.0.is_some()));
+
+    // A closure without `b`: refused, typed, naming it.
+    let lacking = paged(&closure_text("a,c"), &[("lib", Counting::new(pages.clone()))]);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| _ = reexported(&lacking, "First")));
+    let Err(payload) = caught else {
+        panic!("pages naming `b` read in a database whose `lib` has no `b`")
+    };
+    let Some(stop) = super::super::Unreadable::of_payload(&*payload) else {
+        panic!("the refusal unwound with another payload than `Unreadable`")
+    };
+    assert_eq!((stop.krate, stop.kind), (crate_named(&lacking, "lib"), super::CLOSURE));
+    assert!(stop.why.contains("`b`"), "{}", stop.why);
+
+    // The planted control: crates by index, keys unread.
+    super::POSITIONAL.with(|it| it.set(true));
+    let planted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let db = paged(&reordered, &[("lib", Counting::new(pages))]);
+        let first = reexported(&db, "First");
+        (first.1, crate_named(&db, "b"))
+    }));
+    super::POSITIONAL.with(|it| it.set(false));
+    let Ok((krate, b)) = planted else {
+        panic!("planted: the read by index failed outright, so it shows no silent swap")
+    };
+    assert_eq!(krate, Some(b), "planted: `First` read by index is not `b`'s, so the test does not bite");
 }

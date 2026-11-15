@@ -194,10 +194,10 @@ pub const UNSEEN: EffectSet = EffectSet::of(&[Rule::Unchecked, Rule::ForeignUnkn
 /// the toolchain it calls, makes a pointer of, puts in a vtable or gives a toolchain function
 /// that calls it back. A tracked query keyed as the summary is: an edit reruns the edges of the
 /// bodies whose summaries changed.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+    reason = "a tracked query's arguments are its key, which `blaze_memo::tracked` hands the body by value"
 )]
 pub(crate) fn edge(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Edge {
     // clone: the query's key, reference counts
@@ -325,10 +325,10 @@ pub(crate) struct ToolchainCall {
 
 /// What the toolchain's `instance` does below it: one pass over the summaries of the
 /// toolchain's instances under it, stopping at code outside the toolchain.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+    reason = "a tracked query's arguments are its key, which `blaze_memo::tracked` hands the body by value"
 )]
 pub(crate) fn toolchain_call(
     db: &Db,

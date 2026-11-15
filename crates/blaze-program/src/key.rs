@@ -188,6 +188,26 @@ pub enum Tier {
     Release,
 }
 
+impl Tier {
+    /// The tier by its number, as a record outside this crate carries it (blaze-keyed's kept
+    /// rows and code asks): `Edit` 0, `Release` 1.
+    pub fn number(self) -> u32 {
+        match self {
+            Tier::Edit => 0,
+            Tier::Release => 1,
+        }
+    }
+
+    /// The tier numbered `number` ([`Tier::number`]); `None` for a number no tier has.
+    pub fn of_number(number: u32) -> Option<Tier> {
+        match number {
+            0 => Some(Tier::Edit),
+            1 => Some(Tier::Release),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Panic {
     Unwind,

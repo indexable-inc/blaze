@@ -49,7 +49,7 @@ fn generic<T>(_: Small<{ 1 + 3 }>, _: T) {}
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         assert_eq!(errors_in_signature(&db, "big"), [Some(ValTreeError::NodesOverflow)]);
         assert_eq!(errors_in_signature(&db, "small"), [None]);
         assert_eq!(

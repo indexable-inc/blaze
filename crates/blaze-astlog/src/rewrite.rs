@@ -46,7 +46,7 @@ pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Rows> {
     let program = Program::parse(rules)?;
     let facts = Sema::new(db, files)?;
     let rewrites = Program { rules: program.rules, rewrites: Vec::new(), lints: program.lints };
-    let (database, _) = blaze_query::db::attach(db, || astlog_engine::run(&rewrites, &facts))?;
+    let (database, _) = blaze_memo::attach(db, || astlog_engine::run(&rewrites, &facts))?;
     let mut relations = Vec::new(); // alloc: one per relation, the answer's own
     for (name, relation) in &database.relations {
         let mut rows: Vec<Vec<Cell>> = relation
@@ -141,7 +141,7 @@ pub(crate) fn edit_with<F: Files>(
 ) -> Res<Applied> {
     let program = Program::parse(rules)?;
     let facts = Sema::new(db, files)?;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let (_, planned) = astlog_engine::run(&program, &facts)?;
         let literal = literal_paths(&facts, &program)?;
         let mut text = Vec::new(); // alloc: the text edits of one request

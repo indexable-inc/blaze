@@ -25,6 +25,7 @@ pub mod early_drop;
 mod eval;
 mod framed;
 pub mod handles;
+pub mod held;
 pub mod home;
 pub mod location;
 pub mod loop_match;

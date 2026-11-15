@@ -55,7 +55,7 @@ fn reference<'db>(infer: &InferenceResult<'db>, e: ExprId) -> Ty<'db> {
 #[test]
 fn an_expressions_adjusted_type_is_what_both_old_copies_said() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, "f"));
         let body = Body::of(&db, def);
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));

@@ -14,14 +14,14 @@ use blaze_format::{
 };
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id as _;
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, HasModule, ImplId, StaticId,
     StructId, TraitId, TypeAliasId, UnionId, expr_store::Body,
 };
 use std::alloc::Global;
 
-use super::{BodyFacts, Lookup, REGISTRY, Step};
+use super::{BodyFacts, Lookup, REGISTRY, Reads, Step};
 use crate::{
     InferenceResult,
     check_cache::ids::{self, IdKind, ItemSink, Table},
@@ -98,7 +98,7 @@ fn stored<'db>(
     match lookup_inference(db, def) {
         Lookup::Off => ran(run),
         Lookup::Miss => {
-            let (result, reads) = blaze_query::db::capture_reads(db, || ran(run));
+            let (result, reads) = super::capture(db, || ran(run));
             offer_inference(db, def, &result, reads);
             result
         }
@@ -131,7 +131,7 @@ pub(crate) fn offer_inference<'db>(
     db: &'db Db,
     def: DefWithBodyId,
     result: &InferenceResult<'db>,
-    reads: Option<blaze_query::db::Reads>,
+    reads: Option<Reads>,
 ) {
     super::offer(db, def, Step::Infer, SCHEMA, reads, |facts, out| {
         encode(db, facts, def, result, out)
@@ -293,6 +293,12 @@ impl<'a, 'db> Keyed<'a, 'db> {
             seen: HashMap::new_in(Global),
         }
     }
+
+    /// The id bits in the writer's database of the item at `index`: for a planted bug of a
+    /// test alone (`mir::testing`), a scan of what was given.
+    pub(super) fn bits_at(&self, index: u32) -> Option<u64> {
+        self.seen.values().find(|&&(_, _, at)| at == index).map(|&(_, bits, _)| bits)
+    }
 }
 
 impl ItemSink for Keyed<'_, '_> {
@@ -324,20 +330,20 @@ impl ItemSink for Keyed<'_, '_> {
 }
 
 /// The item `bits` of `kind` name, as the solver names it; `None` for a kind that is no item
-/// or bits that are no id (0, or past `Id::MAX_U32`).
+/// or bits that are no id (0).
 fn solver_def<'db>(kind: IdKind, bits: u64) -> Option<SolverDefId<'db>> {
-    let id = u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)?;
+    let id = ids::id_at(bits)?;
     Some(match kind {
-        IdKind::Function => SolverDefId::FunctionId(FunctionId::from_id(id)),
-        IdKind::Struct => SolverDefId::AdtId(AdtId::StructId(StructId::from_id(id))),
-        IdKind::Union => SolverDefId::AdtId(AdtId::UnionId(UnionId::from_id(id))),
-        IdKind::Enum => SolverDefId::AdtId(AdtId::EnumId(EnumId::from_id(id))),
-        IdKind::Const => SolverDefId::ConstId(ConstId::from_id(id)),
-        IdKind::Static => SolverDefId::StaticId(StaticId::from_id(id)),
-        IdKind::Trait => SolverDefId::TraitId(TraitId::from_id(id)),
-        IdKind::TypeAlias => SolverDefId::TypeAliasId(TypeAliasId::from_id(id)),
-        IdKind::Impl => SolverDefId::ImplId(ImplId::from_id(id)),
-        IdKind::EnumVariant => SolverDefId::EnumVariantId(EnumVariantId::from_id(id)),
+        IdKind::Function => SolverDefId::FunctionId(FunctionId::from_gid(id)),
+        IdKind::Struct => SolverDefId::AdtId(AdtId::StructId(StructId::from_gid(id))),
+        IdKind::Union => SolverDefId::AdtId(AdtId::UnionId(UnionId::from_gid(id))),
+        IdKind::Enum => SolverDefId::AdtId(AdtId::EnumId(EnumId::from_gid(id))),
+        IdKind::Const => SolverDefId::ConstId(ConstId::from_gid(id)),
+        IdKind::Static => SolverDefId::StaticId(StaticId::from_gid(id)),
+        IdKind::Trait => SolverDefId::TraitId(TraitId::from_gid(id)),
+        IdKind::TypeAlias => SolverDefId::TypeAliasId(TypeAliasId::from_gid(id)),
+        IdKind::Impl => SolverDefId::ImplId(ImplId::from_gid(id)),
+        IdKind::EnumVariant => SolverDefId::EnumVariantId(EnumVariantId::from_gid(id)),
         IdKind::BuiltinDeriveImpl
         | IdKind::OpaqueTy
         | IdKind::Closure
@@ -350,17 +356,17 @@ fn solver_def<'db>(kind: IdKind, bits: u64) -> Option<SolverDefId<'db>> {
 /// The bits of `def` when it is an item of `kind`.
 fn bits_of(kind: IdKind, def: SolverDefId<'_>) -> Option<u64> {
     let id = match (kind, def) {
-        (IdKind::Function, SolverDefId::FunctionId(it)) => it.as_id(),
-        (IdKind::Struct, SolverDefId::AdtId(AdtId::StructId(it))) => it.as_id(),
-        (IdKind::Union, SolverDefId::AdtId(AdtId::UnionId(it))) => it.as_id(),
-        (IdKind::Enum, SolverDefId::AdtId(AdtId::EnumId(it))) => it.as_id(),
-        (IdKind::Const, SolverDefId::ConstId(it)) => it.as_id(),
-        (IdKind::Static, SolverDefId::StaticId(it)) => it.as_id(),
-        (IdKind::Trait, SolverDefId::TraitId(it)) => it.as_id(),
-        (IdKind::TypeAlias, SolverDefId::TypeAliasId(it)) => it.as_id(),
-        (IdKind::Impl, SolverDefId::ImplId(it)) => it.as_id(),
-        (IdKind::EnumVariant, SolverDefId::EnumVariantId(it)) => it.as_id(),
+        (IdKind::Function, SolverDefId::FunctionId(it)) => it.gid(),
+        (IdKind::Struct, SolverDefId::AdtId(AdtId::StructId(it))) => it.gid(),
+        (IdKind::Union, SolverDefId::AdtId(AdtId::UnionId(it))) => it.gid(),
+        (IdKind::Enum, SolverDefId::AdtId(AdtId::EnumId(it))) => it.gid(),
+        (IdKind::Const, SolverDefId::ConstId(it)) => it.gid(),
+        (IdKind::Static, SolverDefId::StaticId(it)) => it.gid(),
+        (IdKind::Trait, SolverDefId::TraitId(it)) => it.gid(),
+        (IdKind::TypeAlias, SolverDefId::TypeAliasId(it)) => it.gid(),
+        (IdKind::Impl, SolverDefId::ImplId(it)) => it.gid(),
+        (IdKind::EnumVariant, SolverDefId::EnumVariantId(it)) => it.gid(),
         _ => return None,
     };
-    Some(u64::from(id.as_u32()))
+    Some(ids::gid_bits(id))
 }

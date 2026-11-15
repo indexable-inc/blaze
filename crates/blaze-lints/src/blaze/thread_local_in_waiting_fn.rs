@@ -34,7 +34,7 @@ use hir_def::{
 use hir_ty::InferenceResult;
 
 use super::{Finding, Lint, alloc::written_callee, facts, general_facts};
-use crate::check::Cx;
+use crate::{check::Cx, kept};
 
 /// The methods of `LocalKey` that reach the thread's slot, with how a finding names each.
 const READS: &[(&str, &str)] = &[
@@ -150,15 +150,23 @@ fn inlinable(
 
 /// The first thread-local `f` reads in its own body (its closures included), not in what it
 /// calls; `None` for a function of `LocalKey`'s own, whose call is the read.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn first_read(db: &Db, f: FunctionId) -> Option<Read> {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn first_read<'db>(db: &'db Db, f: FunctionId) -> Option<FirstRead<'db>> {
     if local_key_method(db, f).is_some() || !FunctionSignature::of(db, f).has_body() {
         return None;
     }
     let def = DefWithBodyId::FunctionId(f);
     let body = Body::of(db, def);
     let infer = InferenceResult::of(db, def);
-    body.exprs().find_map(|(id, _)| read_at(db, def, body, infer, id))
+    let read = body.exprs().find_map(|(id, _)| read_at(db, def, body, infer, id))?;
+    Some(FirstRead { key: kept::text(db, &read.key), method: read.method })
+}
+
+/// [`first_read`]'s value: a [`Read`] with its name kept in the query's arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FirstRead<'db> {
+    key: &'db str,
+    method: &'static str,
 }
 
 /// The read the call `id` of `def`'s body is, when it calls a method of [`READS`].

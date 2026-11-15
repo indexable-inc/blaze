@@ -135,7 +135,7 @@ pub(crate) fn with_cx(fixture: &str, args: &[&str], check: impl FnOnce(&Cx<'_, '
     let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
     let cmd = CommandLine::parse(&args).unwrap();
     let db = &checked.db;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
         let cx = Cx::new(db, krate, checked.files(), &frame).with_lints(&cmd);

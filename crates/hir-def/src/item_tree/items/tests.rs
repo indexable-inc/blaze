@@ -11,7 +11,7 @@ use syntax::view::HasModuleItem;
 
 use crate::{
     item_tree::{ItemTree, lower_whole, tests::assert_assembled_is_whole},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 /// Real files with nested and outline modules, `use` trees, macros, `extern` blocks, `impl`s
@@ -50,7 +50,7 @@ fn db_of(text: &str) -> (TestDB, EditionedFileId) {
     let fx = fixture::db("");
     let file = fx.only_file();
     let mut db = fx.into_db();
-    db.set_file_text(file.file_id(&db), text);
+    let file = db.set_text_of(file, text);
     (db, file)
 }
 
@@ -61,10 +61,10 @@ fn assembled(db: &TestDB, file: EditionedFileId) -> Arc<ItemTree> {
 #[test]
 fn real_files_assemble_to_their_whole_trees() {
     let fx = fixture::db("");
-    let file = fx.only_file();
+    let mut file = fx.only_file();
     let mut db = fx.into_db();
     for (path, text) in &corpus() {
-        db.set_file_text(file.file_id(&db), text);
+        file = db.set_text_of(file, text);
         assert_assembled_is_whole(&db, file, path);
     }
 }
@@ -108,16 +108,16 @@ fn random_edit(rng: &mut SplitMix64, text: &str) -> (Range<usize>, String) {
 fn random_edits_assemble_to_a_fresh_whole_tree() {
     let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     let fx = fixture::db("");
-    let file = fx.only_file();
+    let mut file = fx.only_file();
     let mut db = fx.into_db();
     for (path, text) in corpus().iter().step_by(2) {
         let mut text = text.clone();
-        db.set_file_text(file.file_id(&db), &text);
+        file = db.set_text_of(file, &text);
         assembled(&db, file);
         for _ in 0..6 {
             let (range, insert) = random_edit(&mut rng, &text);
             text.replace_range(range.clone(), &insert);
-            db.set_file_text(file.file_id(&db), &text);
+            file = db.set_text_of(file, &text);
             let (fresh, fresh_file) = db_of(&text);
             let edited = assembled(&db, file);
             let whole = lower_whole(&fresh, fresh_file.into(), fixture::test_crate(&fresh));
@@ -147,25 +147,26 @@ mod m { pub fn inner() {} }
 /// How many top-level items making the file's tree lowers once it holds `text`, whole or
 /// alone. Before it, an edit that changes no item (a newline at the end) has the file lowered
 /// whole and keyed, as a file's first edit is, so what is counted is an edit of a keyed file.
-/// Counted from before the write: the write's name resolution maintainer asks for the tree.
-fn items_lowered_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize {
-    let krate = fixture::test_crate(db);
-    let file_id = file.file_id(&*db);
-    crate::file_item_tree(&*db, file.into(), krate);
+/// Counted from before the write.
+///
+/// `file` and the crate are made again in each snapshot the writes commit: the ones before are
+/// dropped with their arena, so the crate is taken again after each write.
+fn items_lowered_by(db: &mut TestDB, file: &mut EditionedFileId, text: &str) -> usize {
+    crate::file_item_tree(&*db, (*file).into(), fixture::test_crate(db));
     let before = file.parse(&*db).root().text().to_string();
-    db.set_file_text(file_id, &format!("{before}\n"));
-    crate::file_item_tree(&*db, file.into(), krate);
+    *file = db.set_text_of(*file, &format!("{before}\n"));
+    crate::file_item_tree(&*db, (*file).into(), fixture::test_crate(db));
     super::LOWERED.set(0);
-    db.set_file_text(file_id, text);
-    crate::file_item_tree(&*db, file.into(), krate);
+    *file = db.set_text_of(*file, text);
+    crate::file_item_tree(&*db, (*file).into(), fixture::test_crate(db));
     let lowered = super::LOWERED.get();
-    assert_assembled_is_whole(db, file, text);
+    assert_assembled_is_whole(db, *file, text);
     lowered
 }
 
 #[test]
 fn an_edit_inside_bodies_lowers_no_item() {
-    let (mut db, file) = db_of(ITEMS);
+    let (mut db, mut file) = db_of(ITEMS);
     let mut text = ITEMS.to_owned();
     for (from, to) in [
         ("{ s.0 }", "{ let y = s.0 + 1; y * 2 }"),
@@ -177,16 +178,16 @@ fn an_edit_inside_bodies_lowers_no_item() {
         ("{ 1 + 1 }", "{ 2 }"),
     ] {
         text = text.replace(from, to);
-        assert_eq!(items_lowered_by(&mut db, file, &text), 0, "after {to}");
+        assert_eq!(items_lowered_by(&mut db, &mut file, &text), 0, "after {to}");
     }
 }
 
 /// An edit that changes no item gives back the kept tree itself: the query database sees the same value.
 #[test]
 fn an_edit_inside_a_body_gives_the_kept_tree() {
-    let (mut db, file) = db_of(ITEMS);
+    let (mut db, mut file) = db_of(ITEMS);
+    items_lowered_by(&mut db, &mut file, &ITEMS.replace("{ s.0 }", "{ s.0 + 1 }"));
     let krate = fixture::test_crate(&db);
-    items_lowered_by(&mut db, file, &ITEMS.replace("{ s.0 }", "{ s.0 + 1 }"));
     let kept = super::file_item_tree(&db, file, krate);
     let again = super::file_item_tree(&db, file, krate);
     assert!(Arc::ptr_eq(&kept, &again));
@@ -203,18 +204,18 @@ fn an_edit_of_one_item_lowers_it_alone() {
         ("pub fn inner", "fn inner"),
         ("pub fn f(s: S) -> u8 { s.0 }", "pub fn f(s: S) -> u8 {\n    #![allow(x)]\n    s.0\n}"),
     ] {
-        let (mut db, file) = db_of(ITEMS);
+        let (mut db, mut file) = db_of(ITEMS);
         let edited = ITEMS.replace(from, to);
-        assert_eq!(items_lowered_by(&mut db, file, &edited), 1, "after {to}");
+        assert_eq!(items_lowered_by(&mut db, &mut file, &edited), 1, "after {to}");
     }
 }
 
 /// Removing an item lowers none, and an item moved by another's removal keeps its rows.
 #[test]
 fn removing_an_item_lowers_none() {
-    let (mut db, file) = db_of(ITEMS);
+    let (mut db, mut file) = db_of(ITEMS);
     let edited = ITEMS.replace("pub struct S(pub u8);\n", "");
-    assert_eq!(items_lowered_by(&mut db, file, &edited), 0);
+    assert_eq!(items_lowered_by(&mut db, &mut file, &edited), 0);
 }
 
 #[test]
@@ -222,34 +223,32 @@ fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
     let rules: String = (0..300).map(|i| format!("    (a{i}) => {{ {i} }};\n")).collect();
     let text = format!("macro_rules! big {{\n{rules}}}\nfn f() {{}}\nstruct S;\n");
     assert!(text.len() > 4096 + 32);
-    let (mut db, file) = db_of(&text);
+    let (mut db, mut file) = db_of(&text);
     crate::file_item_tree(&db, file.into(), fixture::test_crate(&db));
-    assert_eq!(items_lowered_by(&mut db, file, &text.replace("struct S;", "struct T;")), 1);
+    assert_eq!(items_lowered_by(&mut db, &mut file, &text.replace("struct S;", "struct T;")), 1);
     let renamed = text.replace("struct S;", "struct T;").replace("(a7)", "(b7)");
-    assert_eq!(items_lowered_by(&mut db, file, &renamed), 1);
+    assert_eq!(items_lowered_by(&mut db, &mut file, &renamed), 1);
 }
 
 /// How many top-level items' syntax making the file's tree hashes once it holds `text`, and how
 /// many items' ast ids and anchors it reads from the maps, the file keyed at the text it holds
 /// before. Counted from before the write, as [`items_lowered_by`] is.
-fn items_keyed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> (usize, usize) {
-    let krate = fixture::test_crate(db);
-    let file_id = file.file_id(&*db);
+fn items_keyed_by(db: &mut TestDB, file: &mut EditionedFileId, text: &str) -> (usize, usize) {
     let before = file.parse(&*db).root().text().to_string();
     for warm in [format!("{before}\n"), before] {
-        db.set_file_text(file_id, &warm);
-        crate::file_item_tree(&*db, file.into(), krate);
+        *file = db.set_text_of(*file, &warm);
+        crate::file_item_tree(&*db, (*file).into(), fixture::test_crate(db));
     }
     super::HASHED.set(0);
     super::READ.set(0);
-    db.set_file_text(file_id, text);
-    crate::file_item_tree(&*db, file.into(), krate);
+    *file = db.set_text_of(*file, text);
+    crate::file_item_tree(&*db, (*file).into(), fixture::test_crate(db));
     let counts = (super::HASHED.get(), super::READ.get());
-    assert_assembled_is_whole(db, file, text);
+    assert_assembled_is_whole(db, *file, text);
     counts
 }
 
-fn items_hashed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize {
+fn items_hashed_by(db: &mut TestDB, file: &mut EditionedFileId, text: &str) -> usize {
     items_keyed_by(db, file, text).0
 }
 
@@ -257,16 +256,16 @@ fn items_hashed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize 
 fn an_edit_hashes_only_the_items_it_touched() {
     let items: String =
         (0..40).map(|i| format!("pub fn f{i}(a: u8) -> u8 {{ a + {i} }}\n")).collect();
-    let (mut db, file) = db_of(&items);
+    let (mut db, mut file) = db_of(&items);
     // The item edited, and the two before it, past which the parser may have looked.
     let edited = items.replace("{ a + 20 }", "{ a * 20 }");
-    assert_eq!(items_hashed_by(&mut db, file, &edited), 3);
+    assert_eq!(items_hashed_by(&mut db, &mut file, &edited), 3);
     // The item added at the end, and the two before it.
     let appended = format!("{edited}struct S;\n");
-    assert_eq!(items_hashed_by(&mut db, file, &appended), 3);
+    assert_eq!(items_hashed_by(&mut db, &mut file, &appended), 3);
     // With the first item gone, the second begins where the text was the first's.
     let removed = appended.replacen("pub fn f0(a: u8) -> u8 { a + 0 }\n", "", 1);
-    assert_eq!(items_hashed_by(&mut db, file, &removed), 1);
+    assert_eq!(items_hashed_by(&mut db, &mut file, &removed), 1);
 }
 
 /// A body edit changes no entry of the ast id map or anchor of the span map outside the item
@@ -276,14 +275,14 @@ fn an_edit_hashes_only_the_items_it_touched() {
 fn an_edit_reads_ids_only_for_the_items_it_touched() {
     let items: String =
         (0..40).map(|i| format!("pub fn f{i}(a: u8) -> u8 {{ a + {i} }}\n")).collect();
-    let (mut db, file) = db_of(&items);
+    let (mut db, mut file) = db_of(&items);
     let edited = items.replace("{ a + 20 }", "{ a * 20 }");
-    assert_eq!(items_keyed_by(&mut db, file, &edited), (3, 3));
+    assert_eq!(items_keyed_by(&mut db, &mut file, &edited), (3, 3));
     let longer = edited.replace("{ a + 30 }", "{ let b = a; b + 30 }");
-    assert_eq!(items_keyed_by(&mut db, file, &longer), (3, 3));
+    assert_eq!(items_keyed_by(&mut db, &mut file, &longer), (3, 3));
     // An item added at the start moves every other, and their ids and anchors stay theirs.
     let added = format!("struct S;\n{longer}");
-    assert_eq!(items_keyed_by(&mut db, file, &added), (1, 1));
+    assert_eq!(items_keyed_by(&mut db, &mut file, &added), (1, 1));
 }
 
 /// A second `fn f` before another takes the first id of its name, so the later one's id, in
@@ -294,9 +293,9 @@ fn a_renumbered_id_reads_the_item_holding_it() {
     let gs: String = (0..6).map(|i| format!("fn g{i}() {{}}\n")).collect();
     let hs: String = (0..4).map(|i| format!("fn h{i}() {{}}\n")).collect();
     let text = format!("{gs}fn f() {{}}\n{hs}");
-    let (mut db, file) = db_of(&text);
+    let (mut db, mut file) = db_of(&text);
     let edited = text.replacen("fn g4()", "fn f() {}\nfn g4()", 1);
-    let (hashed, read) = items_keyed_by(&mut db, file, &edited);
+    let (hashed, read) = items_keyed_by(&mut db, &mut file, &edited);
     assert!(hashed < 12, "the items kept are not hashed");
     assert_eq!(read, hashed + 1, "the renumbered `fn f` is read, and no other item kept");
 }

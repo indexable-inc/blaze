@@ -26,7 +26,8 @@
 //! concat!(..)]`) reads which macro its path names, and is made again each time; a name with a
 //! hygiene key, a path naming `$crate` or a context that is not its file's root is not kept. A
 //! module's attributes are its declaration's, its file's and, of a crate root, the command
-//! line's: not one row, so no module is kept here.
+//! line's: not one row, so a module's entry is keyed by one hash of those rows
+//! ([`module_place`]).
 //!
 //! The values name nothing of a database or a file: symbols as their text, an ABI as its
 //! place among `ExternAbi::ALL_VARIANTS`, a set in its text order (rule 25).
@@ -229,7 +230,29 @@ pub(crate) fn fact<T: Value>(
     part: Part,
     make: impl FnOnce() -> (T, bool),
 ) -> T {
-    let Some(place) = at.filter(|_| !live()).and_then(|at| place(db, at)) else {
+    let place = at.filter(|_| !live()).and_then(|at| place(db, at));
+    fact_placed(db, family, what, kind, at, place, part, make)
+}
+
+/// [`fact`] with the place found: `at` is what a miss demands the text of before `make` reads
+/// it, `place` where its entry is kept (`None`: made each time, nothing kept).
+#[expect(clippy::too_many_arguments, reason = "the one body of `fact` and of a module's fact")]
+fn fact_placed<T: Value>(
+    db: &Db,
+    family: &'static str,
+    what: &str,
+    kind: u8,
+    at: Option<At>,
+    place: Option<Place>,
+    part: Part,
+    make: impl FnOnce() -> (T, bool),
+) -> T {
+    let Some(place) = place else {
+        // `make` reads the item's syntax: of a crate given by its address whose file has no
+        // text here, a typed refusal naming the file first.
+        if let Some(at) = at {
+            crate::nameres::frozen::pages::demand_text(db, at.krate, at.file);
+        }
         return make().0;
     };
     let ctx = Ctx { edition: place.edition };
@@ -249,6 +272,10 @@ pub(crate) fn fact<T: Value>(
         Err(why) => refuse(db, &place, family, what, why),
     }
     ran();
+    // Not kept: made off the item's syntax, refused first as above. A fact found reads no text
+    // (its file's index and set are found by the file's content, which a file given by its
+    // address has as its record names it).
+    crate::nameres::frozen::pages::demand_text(db, place.at.krate, place.at.file);
     let (value, keep) = make();
     if keep {
         // alloc: one value's bytes, a few dozen, while it is kept
@@ -265,18 +292,92 @@ pub(crate) fn fact<T: Value>(
 /// The family of every attribute's value: `what` names the attribute.
 pub(crate) const ATTR: &str = "attr value";
 
-/// [`fact`] of the attribute `what` of `owner`, keyed by its attributes alone: a module's is
-/// made each time ([`owner_at`]).
+/// [`fact`] of the attribute `what` of `owner`, keyed by its attributes alone: an item's by its
+/// row, a module's by its rows ([`module_place`]).
 pub(crate) fn of_attrs<T: Value>(
     db: &Db,
     what: &str,
     owner: AttrDefId,
     make: impl FnOnce() -> (T, bool),
 ) -> T {
-    match owner_at(db, owner) {
-        Some((kind, at)) => fact(db, ATTR, what, kind, Some(at), Part::Attrs, make),
-        None => make().0,
+    match (owner_at(db, owner), owner) {
+        // Refused by [`fact`] before `make` reads the owner's syntax, where it is of a crate
+        // given by its address and its file has no text here.
+        (Some((kind, at)), _) => fact(db, ATTR, what, kind, Some(at), Part::Attrs, make),
+        (None, AttrDefId::ModuleId(module)) => {
+            let place = if live() { None } else { module_place(db, module) };
+            // A miss demands the module's file (and `make`, through `attrs`' guarded readers
+            // `attrs_source` and `item_node`, its declaration's) before reading it.
+            let at = place.as_ref().map(|it| it.at);
+            fact_placed(db, ATTR, what, MODULE, at, place, Part::Attrs, make)
+        }
+        (None, other) => unreachable!("`owner_at` places every owner but a module, not {other:?}"),
     }
+}
+
+/// The kind of a module in a key: after [`owner_at`]'s.
+const MODULE: u8 = 17;
+
+/// The domain of the hash of a module's attribute rows ([`module_place`]).
+const MODULE_ATTRS_DOMAIN: &str = "blaze v2 module attrs";
+
+/// The place of `module`'s attributes: `None` for a block's module (its attributes are its
+/// body's) and where no entries are kept. A module's attributes are not one row
+/// (`attrs::attrs_source`): its file's inner attributes (its file's root row) or an inline
+/// module's own row; for a `mod m;`, its declaration's row too; for a crate root, the crate
+/// attributes of the command line. Its entry is packed with its definition's file's, and keyed
+/// by one hash of all of them: each row's attribute hash and how its file is read, and each
+/// command-line file's content, the crate's cfg where any of them names `cfg` or the root has
+/// command-line attributes (their `cfg_attr` reads it).
+///
+/// Floor (rule 67): one or two rows of indexes found by their files' content and one hash of
+/// under a hundred bytes; no text read. Cost: one entry a module whose attribute is asked.
+fn module_place(db: &Db, module: crate::ModuleId) -> Option<Place> {
+    use crate::nameres::ModuleOrigin;
+
+    let def_map = module.def_map(db);
+    let krate = def_map.krate();
+    let file_root = |file: base_db::EditionedFileId| At {
+        file: file.into(),
+        ast: span::ROOT_ERASED_FILE_AST_ID,
+        krate,
+    };
+    let (origin, definition, declaration) = match def_map.module(db, module).origin {
+        ModuleOrigin::CrateRoot { definition } => (0u8, file_root(definition), None),
+        ModuleOrigin::File { declaration, declaration_tree_id, definition, .. } => {
+            let declaration =
+                At { file: declaration_tree_id.file_id(), ast: declaration.erase(), krate };
+            (1, file_root(definition), Some(declaration))
+        }
+        ModuleOrigin::Inline { definition_tree_id, definition } => {
+            (2, At { file: definition_tree_id.file_id(), ast: definition.erase(), krate }, None)
+        }
+        ModuleOrigin::BlockExpr { .. } => return None,
+    };
+    let mut place = place(db, definition)?;
+    let mut hasher = Hasher::new(MODULE_ATTRS_DOMAIN);
+    hasher.update(&[origin, place.read_as]).update(&place.source.attrs.to_le_bytes());
+    let mut cfg = place.source.attrs_cfg;
+    if let Some(at) = declaration {
+        let source = stored::index::source(db, at.file, at.ast, krate)?;
+        let (_, read_as) = stored::set_of(db, at.file)?;
+        hasher.update(&[read_as]).update(&source.attrs.to_le_bytes());
+        cfg |= source.attrs_cfg;
+    }
+    if origin == 0 {
+        let files = krate.crate_attr_files(db);
+        hasher.update(&(files.len() as u32).to_le_bytes());
+        for &file in files {
+            hasher.id(&db.file_content(file));
+        }
+        cfg |= !files.is_empty();
+    }
+    let id = hasher.finish();
+    let mut attrs = [0; 16];
+    attrs.copy_from_slice(&id.0[..16]);
+    place.source.attrs = u128::from_le_bytes(attrs);
+    place.source.attrs_cfg = cfg;
+    Some(place)
 }
 
 /// Refuses the fact of `family` of the item at `place`, naming the item by its file and ast
@@ -690,6 +791,23 @@ impl Value for crate::attrs::AttrFlags {
     }
 }
 
+/// Its place among `BlazeEdition::ALL`.
+impl Value for span::BlazeEdition {
+    fn put(&self, _: Ctx, out: &mut Out) -> bool {
+        let at = span::BlazeEdition::ALL.iter().position(|it| it == self);
+        out.u8(at.expect("`BlazeEdition::ALL` lists every blaze edition") as u8);
+        true
+    }
+
+    fn take(_: Ctx, input: &mut In<'_>) -> R<span::BlazeEdition> {
+        let tag = input.u8()?;
+        span::BlazeEdition::ALL
+            .get(usize::from(tag))
+            .copied()
+            .ok_or_else(|| tag_error("a blaze edition", tag))
+    }
+}
+
 impl<A: Value, B: Value> Value for (A, B) {
     fn put(&self, ctx: Ctx, out: &mut Out) -> bool {
         self.0.put(ctx, out) && self.1.put(ctx, out)
@@ -936,10 +1054,20 @@ pub(crate) fn keep_all(db: &Db, krate: Crate) {
         _ = AttrFlags::must_use_message(db, owner);
         _ = flags.unstable_feature(db, owner);
         _ = flags.cfgs(db, Either::Left(owner));
+        _ = flags.doc_aliases(db, Either::Left(owner));
+        // Its own deprecation and stability, where its flags say it has one
+        // (`attrs::stability::own` asks nothing of the others).
+        _ = crate::attrs::stability::own_deprecation(db, owner.into());
+    };
+    // The flags of a definition's generic parameters, asked where it has any (a dependent's
+    // drop check reads `#[may_dangle]`).
+    let params = |def: crate::GenericDefId| {
+        _ = AttrFlags::query_generic_params(db, def);
     };
     let function = |it: crate::FunctionId| {
         let owner = AttrDefId::FunctionId(it);
         attrs(owner);
+        params(it.into());
         let flags = AttrFlags::query(db, owner);
         _ = AttrFlags::target_features(db, it);
         if flags.contains(AttrFlags::HAS_LEGACY_CONST_GENERICS) {
@@ -960,29 +1088,42 @@ pub(crate) fn keep_all(db: &Db, krate: Crate) {
                 }
                 AssocItemId::TypeAliasId(it) => {
                     attrs(AttrDefId::TypeAliasId(it));
+                    params(it.into());
                     _ = written_visibility(db, it.lookup(db).ast_id(), it.module(db));
                 }
             }
         }
     };
     // A variant's field flags, one memo of every field: asked through its first.
+    // And its fields' own deprecation and stability, one memo of every field.
     let fields = |parent: crate::VariantId| {
         let local_id = crate::LocalFieldId::from_raw(la_arena::RawIdx::from_u32(0));
         _ = AttrFlags::query_field(db, crate::FieldId { parent, local_id });
+        for (local_id, _) in crate::signatures::VariantFields::of(db, parent).fields().iter() {
+            let field = crate::FieldId { parent, local_id };
+            _ = crate::attrs::stability::own_deprecation(db, field.into());
+        }
     };
+    // The crate root's blaze edition, a fact of its root module (`boundary::blaze_edition`).
+    _ = crate::nameres::boundary::blaze_edition_fact(db, krate);
     let def_map = crate_def_map(db, krate);
     for (module, data) in def_map.modules(db) {
         // An item in a block is the block's body's, made with it (lane records-bodies).
         if module.block(db).is_some() {
             continue;
         }
+        // The module's own attributes (`module_place`): its flags, which stability's
+        // inheritance reads of every module above an item, and its values.
+        attrs(AttrDefId::ModuleId(module));
         let scope = data.scope(db);
         for def in scope.declarations() {
             match def {
                 ModuleDefId::FunctionId(it) => function(it),
                 ModuleDefId::AdtId(it) => {
                     attrs(AttrDefId::AdtId(it));
+                    params(it.into());
                     _ = AttrFlags::repr(db, it);
+                    _ = AttrFlags::rustc_layout_scalar_valid_range(db, it);
                     _ = match it {
                         AdtId::StructId(it) => {
                             fields(crate::VariantId::StructId(it));
@@ -1012,20 +1153,22 @@ pub(crate) fn keep_all(db: &Db, krate: Crate) {
                 }
                 ModuleDefId::TraitId(it) => {
                     attrs(AttrDefId::TraitId(it));
+                    params(it.into());
                     _ = AttrFlags::must_implement_one_of(db, it);
                     _ = written_visibility(db, it.lookup(db).ast_id(), module);
                     assoc(&TraitItems::query_with_diagnostics(db, it).0.items);
                 }
                 ModuleDefId::TypeAliasId(it) => {
                     attrs(AttrDefId::TypeAliasId(it));
+                    params(it.into());
                     _ = written_visibility(db, it.lookup(db).ast_id(), it.module(db));
                 }
                 ModuleDefId::MacroId(it) => {
                     attrs(AttrDefId::MacroId(it));
                     _ = it.name(db);
                 }
-                // A module's attributes are its declaration's and its file's: not one row
-                // (this module's doc); a variant is asked with its enum.
+                // A module is asked as its own def map's module, above; a variant with its
+                // enum.
                 ModuleDefId::ModuleId(_)
                 | ModuleDefId::EnumVariantId(_)
                 | ModuleDefId::BuiltinType(_) => {}
@@ -1042,7 +1185,12 @@ pub(crate) fn keep_all(db: &Db, krate: Crate) {
         }
         for it in scope.impls() {
             attrs(AttrDefId::ImplId(it));
+            params(it.into());
             assoc(&ImplItems::of(db, it).0.items);
+        }
+        // A `use`'s flags: the crate's diagnostic items read each (`diagnostic_item`).
+        for it in scope.use_decls() {
+            attrs(AttrDefId::UseId(it));
         }
         for it in scope.extern_crate_decls() {
             attrs(AttrDefId::ExternCrateId(it));

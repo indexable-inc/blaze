@@ -123,7 +123,7 @@ fn by_closure(f: &Format) -> usize {
 #[test]
 fn a_method_path_predicate_resolves_the_adaptors_methods() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut funcs = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);
@@ -198,7 +198,7 @@ fn through(job: &dyn Fn(usize)) { let _o: &dyn Fn(usize) = returns_it(job); }
 #[test]
 fn a_fn_item_with_a_reference_to_dyn_fn_parameter_meets_fn_of_every_lifetime() {
     let db = fixture::db(DYN_FN_PARAM).into_db();
-    blaze_query::db::attach(&db, || {
+    let failed = blaze_memo::attach(&db, || {
         let mut failed = String::new();
         let mut checked = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
@@ -221,8 +221,110 @@ fn a_fn_item_with_a_reference_to_dyn_fn_parameter_meets_fn_of_every_lifetime() {
         for name in ["as_jobs", "as_dyn", "as_static", "as_bound", "through"] {
             assert!(checked.iter().any(|it| it == name), "`{name}` was not checked: {checked:?}");
         }
-        assert!(failed.is_empty(), "{failed}");
+        failed
     });
+    // The evidence is made only on a failure (an `assert!`'s message is), each database
+    // attached on its own.
+    assert!(failed.is_empty(), "{}\n{failed}", dyn_fn_param_evidence(&db));
+}
+
+/// What decides why [`DYN_FN_PARAM`] fails, printed ahead of its diagnostics: the signatures of
+/// `serial` and `with_static` (the solver's, with the elided lifetimes bound, and the plain
+/// one), the elision counts and groups that bind them, the lang items an unsizing coercion
+/// needs with the `Fn` traits' dyn compatibility, and four smaller probes: an unsizing that is
+/// no `Fn` (`&S` to `&dyn T`), a fn item to `&dyn Fn` with no lifetime, one whose parameter
+/// is `&usize`, and the same item as a `Fn(&usize)` bound (the control: a bound passes in the
+/// fixture).
+fn dyn_fn_param_evidence(db: &base_db::Db) -> String {
+    let mut out = String::from("evidence:\n");
+    blaze_memo::attach(db, || {
+        let krate = fixture::test_crate(db);
+        let lang = hir_def::lang_item::lang_items(db, krate);
+        out.push_str(&format!(
+            "  lang items: Unsize {:?} CoerceUnsized {:?} Fn {:?} FnMut {:?} FnOnce {:?} \
+             Sync {:?} DispatchFromDyn {:?} MetaSized {:?}\n",
+            lang.Unsize,
+            lang.CoerceUnsized,
+            lang.Fn,
+            lang.FnMut,
+            lang.FnOnce,
+            lang.Sync,
+            // `receiver_is_dispatchable` (dyn_compatibility.rs) answers "undispatchable" with
+            // no `DispatchFromDyn` or `MetaSized`, before asking the solver anything.
+            lang.DispatchFromDyn,
+            lang.MetaSized,
+        ));
+        for (name, it) in [("Fn", lang.Fn), ("FnMut", lang.FnMut), ("FnOnce", lang.FnOnce)] {
+            if let Some(it) = it {
+                out.push_str(&format!(
+                    "  dyn_compatibility({name}): {:?}\n",
+                    crate::dyn_compatibility::dyn_compatibility(db, it),
+                ));
+            }
+        }
+        for (_, module) in crate_def_map(db, krate).modules(db) {
+            for def in module.scope(db).declarations() {
+                let ModuleDefId::FunctionId(func) = def else { continue };
+                let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+                if name != "serial" && name != "with_static" {
+                    continue;
+                }
+                let callable = hir_def::CallableDefId::FunctionId(func);
+                out.push_str(&format!(
+                    "  {name}: solver_fn_sig {:?}\n  {name}: callable_item_signature {:?}\n  \
+                     {name}: elided_lifetimes {:?}\n  {name}: elided_groups {:?}\n",
+                    crate::lower::solver_fn_sig(db, callable).skip_binder(),
+                    crate::lower::callable_item_signature(db, callable).skip_binder(),
+                    crate::lower::elided_lifetimes(db, func),
+                    crate::lower::elided_groups(db, func),
+                ));
+            }
+        }
+    });
+    let probes = [
+        ("unsize, no Fn", "struct S;\ntrait T {}\nimpl T for S {}\nfn p() { let _j: &dyn T = &S; }"),
+        ("fn item to dyn Fn(usize)", "fn f(_: usize) {}\nfn p() { let _j: &dyn Fn(usize) = &f; }"),
+        ("fn item to dyn Fn(&usize)", "fn g(_: &usize) {}\nfn p() { let _j: &dyn Fn(&usize) = &g; }"),
+        ("bound Fn(&usize)", "fn g(_: &usize) {}\nfn t<F: Fn(&usize)>(_: F) {}\nfn p() { t(g) }"),
+    ];
+    // The second probe again with minicore's `DispatchFromDyn`: passing there and failing above
+    // says the fixture's `core` has no `DispatchFromDyn`, which makes `Fn::call`'s `&self`
+    // undispatchable by `receiver_is_dispatchable`'s rule.
+    let probes = probes.into_iter().map(|(what, body)| (what, "", body)).chain([(
+        "fn item to dyn Fn(usize), core with dispatch_from_dyn",
+        ", dispatch_from_dyn",
+        "fn f(_: usize) {}\nfn p() { let _j: &dyn Fn(usize) = &f; }",
+    )]);
+    for (what, flags, body) in probes {
+        let source = format!(
+            "//- minicore: sized, fn, coerce_unsized, sync{flags}\n//- /main.rs edition:2024\n\
+             {body}\n"
+        );
+        let probe = fixture::db(&source).into_db();
+        let said = blaze_memo::attach(&probe, || {
+            for (_, module) in crate_def_map(&probe, fixture::test_crate(&probe)).modules(&probe) {
+                for def in module.scope(&probe).declarations() {
+                    let ModuleDefId::FunctionId(func) = def else { continue };
+                    if FunctionSignature::of(&probe, func).name.as_str() != "p" {
+                        continue;
+                    }
+                    let infer = InferenceResult::of(
+                        &probe,
+                        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)),
+                    );
+                    if infer.diagnostics().is_empty() && !infer.has_type_mismatches() {
+                        return "ok".to_owned();
+                    }
+                    // The first 400 characters: enough to name the mismatch.
+                    let said = format!("fails: {:?}", infer.diagnostics());
+                    return said.chars().take(400).collect();
+                }
+            }
+            "no `p` found".to_owned()
+        });
+        out.push_str(&format!("  probe {what}: {said}\n"));
+    }
+    out
 }
 
 /// rustc_next_trait_solver's `probe_and_evaluate_goal_for_constituent_tys(..,
@@ -276,7 +378,7 @@ fn as_pointer<I: Interner>() { let _p: for<'a> fn(&'a I, I::Ty) -> &'a I = retur
 #[test]
 fn a_fn_item_with_an_associated_type_parameter_meets_fn_of_every_lifetime() {
     let db = fixture::db(ASSOC_TY_PARAM).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut funcs = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);

@@ -72,7 +72,7 @@ pub fn use_trees_view<'db>(db: &'db Db, use_ast_id: AstId<ast::Use>) -> Arena<vi
     // Note: The AST unwraps are fine, since if they fail we should have never obtained `index`.
     let use_tree = use_ast_id.to_view(db).use_tree().expect("missing `use_tree`");
     let mut span_map = None;
-    crate::item_tree::lower_use_tree(db, use_tree, &mut |range| {
+    crate::item_tree::lower_use_tree(db, use_ast_id.file_id, use_tree, &mut |range| {
         span_map.get_or_insert_with(|| use_ast_id.file_id.span_map(db)).span_for_range(range).ctx
     })
     .expect("failed to lower use tree")

@@ -367,14 +367,20 @@ pub(crate) fn lower_with(
     let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
     query::register(&mut db);
     let (units, config) = plan(&db, dir, view, cargo_home, homes)?;
-    let mut lowered = blaze_lower::lower(Lower {
-        units: &units,
-        config: &config,
-        files: &**tree,
-        root: view,
-        host_cpu: None,
-        sealed: &blaze_lower::unsealed(&units),
-    })
+    // No read lists, so no fact boundaries to cut them at: these tests expand macros and file
+    // no body records.
+    let mut lowered = blaze_lower::lower(
+        Lower {
+            units: &units,
+            config: &config,
+            files: &**tree,
+            root: view,
+            host_cpu: None,
+            sealed: &blaze_lower::unsealed(&units),
+        },
+        |_| {},
+        blaze_memo::Reads::Off,
+    )
     .map_err(|error| format!("lowering {dir}: {error}"))?;
     for (unit, it) in units.graph.units.iter().enumerate() {
         if it.mode == Mode::RunCustomBuild {

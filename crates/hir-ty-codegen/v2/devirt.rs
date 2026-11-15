@@ -156,7 +156,7 @@ pub(crate) fn takes_world(
 
 /// Whether the body of `instance` as any of [`Build::WALKS_INLINED`] builds it calls a trait
 /// method through a `dyn`: what `Devirtualize` looks at.
-#[blaze_query::tracked]
+#[blaze_memo::tracked(owns)]
 pub(crate) fn has_sites(
     db: &Db,
     instance: Instance,
@@ -504,7 +504,7 @@ fn object(
             Some(last) if last.id == target.id && last.ty == target.ty => {}
             Some(last) if last.id == target.id => {
                 // alloc: the error's message
-                return Err(blaze_query::db::attach(db, || {
+                return Err(blaze_memo::attach(db, || {
                     format!("{:?} and {:?} have one content ID {:?}", last.ty, target.ty, target.id)
                 }));
             }
@@ -513,7 +513,7 @@ fn object(
     }
     let open = found.open.as_deref().or(everything);
     let digest = devirt::object_digest(&trait_id, &args_id, &kept, open);
-    let name = blaze_query::db::attach(db, || {
+    let name = blaze_memo::attach(db, || {
         let trait_name = TraitSignature::of(db, key.trait_).name.as_str().to_owned();
         match after_self.is_empty() {
             true => format!("dyn {trait_name}"),

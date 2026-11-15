@@ -26,7 +26,7 @@ use syntax::TextRange;
 use super::{NEAR_LEN, Value, const_value, literals, near, one_edit};
 use crate::{
     blaze::{dup::index::is_test_target, test_code},
-    query,
+    kept, query,
 };
 
 /// What a key-like string is used as.
@@ -106,11 +106,11 @@ const PLURAL_FLOOR: usize = 3;
 /// The key-like strings of `krate`, sorted ([`StringRow::order`]): the strings of its bodies
 /// that [`literals`] classes, the strings its `match`es match against, and its string
 /// `const`s. Empty for a test, bench or example target.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn string_rows(db: &Db, krate: base_db::Crate) -> Box<[StringRow]> {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn string_rows<'db>(db: &'db Db, krate: base_db::Crate) -> &'db [StringRow] {
     let mut out: Vec<StringRow, Global> = Vec::new_in(Global);
     if is_test_target(db, krate) {
-        return out.into_boxed_slice();
+        return &[];
     }
     for body in query::lint_plan(db, krate).bodies.iter() {
         let def = body.def;
@@ -134,19 +134,19 @@ pub(crate) fn string_rows(db: &Db, krate: base_db::Crate) -> Box<[StringRow]> {
             continue;
         }
         let found = literals(db, def);
-        for lit in &found.lits {
+        for lit in found.lits {
             if let (Value::Str(text), Some(class)) = (lit.value, lit.lookup) {
                 out.push(row(text, class, lit.access, lit.range + body.offset));
             }
         }
-        for matched in &found.matched {
-            for &text in &matched.values {
+        for matched in found.matched {
+            for &text in found.values_of(matched) {
                 out.push(row(text, UseClass::Matched, Access::Reads, matched.range + body.offset));
             }
         }
     }
     out.sort_unstable_by(|a, b| a.order().cmp(&b.order()));
-    out.into_boxed_slice()
+    kept::slice(db, out)
 }
 
 /// The path of the item `def` is: its crate's name, its modules and its own name.

@@ -13,9 +13,10 @@
 //!
 //! [`RunKey::code`]: blaze_usercode::RunKey
 
+use std::alloc::Global;
 use std::path::PathBuf;
 
-use base_db::{Crate, Db, Nonce, SourceRootId};
+use base_db::{Crate, CrateKey, Db, SourceRootId};
 use blaze_ids::{ContentId, Hasher};
 
 /// What the code is hashed with: a version of this crate's server and shims, which an
@@ -63,15 +64,19 @@ pub(crate) fn of(db: &Db, krate: Crate) -> ContentId {
 /// The files outside the source roots that the crates of `krate`'s closure have read so far:
 /// what an expansion is traced to have read besides what its macro read itself.
 pub(crate) fn included(db: &Db, krate: Crate, out: &mut Vec<PathBuf>) {
+    // The closure by key: what the files' tables name a reading crate by. Sorted, to look up.
     let closure = krate.transitive_deps(db);
+    let mut keys: Vec<CrateKey, Global> = Vec::with_capacity_in(closure.len(), Global);
+    keys.extend(closure.iter().map(|dep| dep.key(db)));
+    keys.sort_unstable();
     let files = db.files();
-    for &dep in closure {
+    for &dep in &keys {
         for (path, _) in files.included_by(db, dep) {
             out.push(path.into());
         }
     }
     for (by, path) in files.sources_included_by() {
-        if closure.contains(&by) {
+        if keys.binary_search(&by).is_ok() {
             out.push(path.into());
         }
     }
@@ -82,7 +87,7 @@ pub(crate) fn included(db: &Db, krate: Crate, out: &mut Vec<PathBuf>) {
 /// [`of`], kept for one revision of one database: an expansion asks for it every time, and the
 /// closure's files are hashed once a revision.
 pub(crate) struct Memo {
-    last: blaze_core::lock::Lock<Option<((Nonce, blaze_query::db::View), ContentId)>>,
+    last: blaze_core::lock::Lock<Option<(blaze_memo::Epoch, ContentId)>>,
 }
 
 impl Default for Memo {
@@ -93,7 +98,7 @@ impl Default for Memo {
 
 impl Memo {
     pub(crate) fn get(&self, db: &Db, krate: Crate) -> ContentId {
-        let now = db.nonce_and_revision();
+        let now = blaze_memo::Database::memo(db).snapshot_epoch();
         let last = *self.last.lock();
         if let Some((at, code)) = last
             && at == now

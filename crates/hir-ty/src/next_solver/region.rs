@@ -40,10 +40,9 @@ const _: () = assert!(size_of::<RegionKind<'static>>() <= 48);
 impl<'db> InternedRegion<'db> {
     #[inline]
     pub(crate) fn intern(kind: RegionKind<'db>) -> Self {
-        Self::at(REGIONS.intern(kind, || table::RowInfo {
-            tag: persist::tag(&kind),
-            flags: region_flags(kind),
-            binder: region_binder(kind),
+        Self::at(REGIONS.intern(kind, || {
+            let (tag, home) = persist::tag_and_home(&kind);
+            table::RowInfo { tag, flags: region_flags(kind), binder: region_binder(kind), home }
         }))
     }
 
@@ -83,6 +82,32 @@ impl std::fmt::Debug for InternedRegion<'_> {
         self.get().fmt(f)
     }
 }
+
+table::holds_by_visit!(RegionKind<'static>);
+
+impl<'db> table::Homed for InternedRegion<'db> {
+    /// Its row's home, written when the row was added.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        REGIONS.home(self.index)
+    }
+}
+
+impl<'db> table::Homed for Region<'db> {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        table::Homed::home(&self.0)
+    }
+}
+
+impl table::Homed for StoredRegion {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        REGIONS.home(self.index)
+    }
+}
+
+crate::next_solver::interner::memo_home!(InternedRegion<'db>, StoredRegion);
 
 // SAFETY: the handle holds one value, its row's kind, which this visits whenever the visitor
 // asks to go into the row.
@@ -159,7 +184,7 @@ impl<'db> RegionExt<'db> for Region<'db> {
 
 /// A region as kept in a query result: its row, which stays valid in every revision, as an
 /// interned value is never freed.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StoredRegion {
     index: NonZeroU32,
 }
@@ -293,6 +318,14 @@ impl std::fmt::Debug for EarlyParamRegion {
 
 type GenericArgOutlivesClause<'db> = OutlivesClause<'db, GenericArg<'db>>;
 
+/// The newer of its argument's and region's homes, by its encoding.
+impl<'db> table::Homed for GenericArgOutlivesClause<'db> {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        persist::home(self)
+    }
+}
+
 interned_slice!(
     RegionAssumptionsStorage,
     RegionAssumptions,
@@ -351,8 +384,8 @@ mod tests {
     fn a_late_param_keeps_its_bound_var() {
         let a = BoundRegion { var: BoundVar::from_u32(0), kind: BoundRegionKind::Anon };
         let b = BoundRegion { var: BoundVar::from_u32(1), kind: BoundRegionKind::Anon };
-        let scope: SolverDefId<'static> = SolverDefId::StaticId(blaze_query::db::FromId::from_id(
-            blaze_query::db::Id::from_u32(1),
+        let scope: SolverDefId<'static> = SolverDefId::StaticId(blaze_memo::Id::from_gid(
+            blaze_memo::Gid::for_test(1),
         ));
         let late = |kind| RegionKind::ReLateParam(LateParamRegion { scope, kind });
         assert_ne!(Region::new_without_interner(late(a)), Region::new_without_interner(late(b)));

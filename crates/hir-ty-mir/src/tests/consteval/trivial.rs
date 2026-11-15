@@ -58,7 +58,7 @@ fn the_fast_path_gives_what_mir_gives() {
     let fx = fixture::db(BODIES);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module = db.module_for_file(file_id.file_id(&db));
         let edition = file_id.edition(&db);
         let (mut trivial, mut not) = (0, 0);

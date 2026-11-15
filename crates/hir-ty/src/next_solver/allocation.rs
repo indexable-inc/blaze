@@ -114,6 +114,39 @@ impl<'db> Hash for AllocationData<'db> {
     }
 }
 
+table::holds_by_visit!(AllocationData<'static>);
+
+/// The newest arena the data names: its type's, and in a complex memory map its statics' and
+/// the types of its vtables and `TypeId`s. By hand, as a `StaticId` is an id, not a row the
+/// visit sees.
+impl<'db> table::Homed for AllocationData<'db> {
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        let mut home = table::Homed::home(&self.ty);
+        if let MemoryMap::Complex(map) = &self.memory_map {
+            for stat in &map.statics {
+                home = home.max(Some(blaze_memo::Id::gid(stat.id).arena()));
+            }
+            for (ty, dyn_ty) in map.vtable.entries() {
+                home = home.max(table::Homed::home(&ty));
+                if let Some(dyn_ty) = dyn_ty {
+                    home = home.max(table::Homed::home(&dyn_ty));
+                }
+            }
+            for ty in map.type_ids.iter().flatten() {
+                home = home.max(table::Homed::home(ty));
+            }
+        }
+        home
+    }
+}
+
+impl<'db> table::Homed for Allocation<'db> {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        ALLOCATIONS.home(self.index)
+    }
+}
+
 impl_stored_interned!(Allocation, StoredAllocation);
 
 #[cfg(test)]

@@ -15,10 +15,10 @@
 //!
 //! A plan of every body ([`Plan::of_every_body`]) keeps what each check found as the database's
 //! memo: whether the body, or the module's items, gave no diagnostic ([`body_check_clean`],
-//! [`module_check_clean`]). A build after an edit asks each memo, which the query engine
-//! verifies against what the check read (the body, its inference, its borrow check, the
-//! signatures it names) without running anything, and only a body one of whose reads changed
-//! is checked again. A clean body's task then reads no inference result and no MIR: until
+//! [`module_check_clean`]). A build after an edit asks each memo, which hits while the arena
+//! it lives in is carried into the snapshot (blaze-memo: an arena is carried only if nothing
+//! any of its entries could have read changed), and only a body whose arena was dropped is
+//! checked again. A clean body's task then reads no inference result and no MIR: until
 //! 2026-11-10 every task ran the whole check, which read each body's inference and MIR by
 //! value, and since a build lets those values go when it ends (blaze-cargo's front end
 //! release) a one-line edit of one function inferred every body of the crate again and built
@@ -26,27 +26,44 @@
 //! `mir_body_query` 1,166 with 1 changed).
 //!
 //! Such a plan also keeps, beside the database, what it listed and which checks gave a
-//! diagnostic ([`Kept`]), and the next plan of the same crates starts from the engine's changed
-//! set since then (docs/v2/plan/design/incremental-walk.md, "The changed set from the
-//! engine"): it holds a slot and posts a task only for the bodies and modules the engine names
-//! (`changed_since` of [`body_check_clean`], [`module_check_clean`], [`module_bodies`]), those
-//! that were not clean, and the bodies new in a module listed again. Every other body's and
-//! module's answer is the kept one, clean, with no task and no fetch, so the check costs the
-//! edit and the modules it touches, not the crate ([`Work`]). Where nothing is kept (the first
-//! check of its key) or a crate's file modules changed, the plan is whole and says why
-//! ([`Whole`]). Where a check is kept and the engine cannot name what changed since it, there
-//! is no plan: that is an error naming the crates and the engine's reason ([`NoChangedSet`]),
-//! never a sweep of every body in its place (rule no-fallback).
+//! diagnostic ([`Kept`]), with the arenas its memos live in. The next plan of the same crates
+//! whose arenas were all carried into its snapshot (none dropped: [`Memo::next`] carries an
+//! arena only if no input any of its entries could have read changed) holds a slot and posts a
+//! task only for the bodies and modules that were not clean: every other body's and module's
+//! answer is the kept one, clean, with no task and no fetch, as its memo would hit ([`Work`]).
+//! Where nothing is kept (the first check of its key) or an arena of a crate's check was
+//! dropped (its kept IDs are dead), the plan is whole and says why ([`Whole`]).
+//!
+//! A kept check is found by stable names (the database's nonce and each crate's
+//! [`CrateKey`]), never by an id: an edit of a crate makes its arena again and its `Crate` id
+//! with it, and a check found by that id would never be found after the one edit whose kept
+//! answers must be refused for it. The ids it holds are touched only once every arena it names
+//! is known carried. An [`ArenaId`] (index and generation) names one making of an arena for
+//! ever within one database nonce (blaze-memo's id space: an arena a commit drops, a sealed
+//! crate's as any other's together with every arena that declared or read it, and every arena
+//! of a new session, base-db's `Fresh`, is made again at its index's next generation), so an
+//! arena the snapshot holds with the kept id is the one the memos were made in.
+//!
+//! What this keeps across an edit on blaze-memo (decision 4: an edit makes its crate's arena
+//! again, and every crate's that borrows it): nothing of the edited crate nor of its
+//! dependents; their plans are whole ([`Whole::Dropped`]). Its answers stand for the crates the
+//! edit did not reach. The floor of an edit of one body among N is a check of the bodies whose
+//! reads moved (the edited one); this reaches N for the edited crate and every crate on it.
+//! Reuse across an edit of a crate is the host's, on body records
+//! (docs/v2/plan/design/host.md): a kept "clean" is valid here only as long as the memo it
+//! stands for is carried, and that memo is arena memory.
+//!
+//! [`Memo::next`]: blaze_memo::Memo::next
 
 use std::{
-    fmt, mem, ptr,
+    fmt, ptr,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use base_db::{Db, Nonce};
+use base_db::{CrateKey, Db, Nonce};
 use blaze_core::lock::Lock;
-use blaze_query::db::{AsId, Changed, ChangedUnknown, Id, View};
 use blaze_hash::{HashMap, HashSet};
+use blaze_memo::{ArenaId, Database as _, Id as _};
 use blaze_ids::bits::AtomicBits;
 use blaze_mem::Tag;
 use hir_def::{
@@ -68,7 +85,7 @@ mod tests;
 
 /// The sweep's loop, as the pool's small-loop predictor knows it: an edit's one or two tasks
 /// run on the thread that runs the plan.
-pub(crate) static SWEEP: blaze_query::db::Small = blaze_query::db::Small::new("body check sweep");
+pub(crate) static SWEEP: blaze_graph::par::Small = blaze_graph::par::Small::new("body check sweep");
 
 /// No body: an empty place of the reached ring, a task checking none.
 const NONE: u32 = u32::MAX;
@@ -127,9 +144,10 @@ pub enum Whole {
     /// Nothing is kept for this database, these crates and these style lints: the first plan
     /// of them in this process, or another plan of them has not run yet.
     NothingKept,
-    /// The file modules of this crate changed: every position the kept check holds is of the
-    /// list before.
-    Modules(Crate),
+    /// An arena the kept check of this crate lives in (its crate's, a module's, a body's) was
+    /// dropped since (by a commit, or a new session that made every arena again): its memos
+    /// are gone and the IDs it holds are dead.
+    Dropped(Crate),
 }
 
 impl fmt::Display for Whole {
@@ -139,52 +157,11 @@ impl fmt::Display for Whole {
             Whole::NothingKept => {
                 f.write_str("nothing is kept for this database, these crates and style lints")
             }
-            Whole::Modules(krate) => write!(f, "the file modules of {krate:?} changed"),
+            Whole::Dropped(krate) => {
+                write!(f, "an arena of the kept check of {krate:?} was dropped since")
+            }
         }
     }
-}
-
-/// Why no plan of every body could be made from the check kept of its crates: the query
-/// engine could not name what changed since that check. A plan that swept every body in its
-/// place would be right and cost the crate on every edit with nothing saying so, so this is
-/// the plan's error (rule no-fallback); [`Plan::of_every_body`] panics with it, which fails
-/// the unit whose check it is and names it (rule panics-fail-one-job). The kept check is put
-/// back first, as it was.
-///
-/// What can cause it, each a bug of its caller and none an edit's: a plan made inside a
-/// query while the engine's walk of the changed set is due (a walk starts only outside one),
-/// or a kept view that is after the database's (a view counter set back).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NoChangedSet {
-    pub crates: Vec<Crate>,
-    pub style_lints: bool,
-    /// The view the kept check ran in, which the engine was asked from.
-    pub since: View,
-    pub why: ChangedUnknown,
-}
-
-impl fmt::Display for NoChangedSet {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the check of every body of {:?} (style lints: {}) holds a kept check of view {} \
-             and the query engine cannot name what changed since it: {}. A plan from a kept \
-             check starts from the engine's changed set and has no sweep of every body to \
-             take its place (hir::check::bodies, rule no-fallback)",
-            self.crates,
-            self.style_lints,
-            self.since.as_u64(),
-            self.why
-        )
-    }
-}
-
-/// Why [`changes`] gives no patch of a kept check.
-enum Unpatched {
-    /// The plan is whole, by design, and says this.
-    Whole(Whole),
-    /// The engine cannot name the changed set: the plan's error.
-    Unknown(ChangedUnknown),
 }
 
 /// What a plan holds and what it visits: on the spans `body check plan` and `body check
@@ -195,12 +172,6 @@ pub struct Work {
     /// The file modules of the plan's crates, and the bodies they list.
     pub held_modules: u32,
     pub held_bodies: u32,
-    /// The modules and bodies of the plan the engine named as changed since the kept check
-    /// (`changed_since` of [`module_check_clean`] and [`body_check_clean`]); 0 in a whole plan.
-    pub named_modules: u32,
-    pub named_bodies: u32,
-    /// The modules whose list of bodies is another than the kept one.
-    pub relisted: u32,
     /// The modules and bodies the plan has a slot for: those of the modules it touches.
     pub slots_modules: u32,
     pub slots_bodies: u32,
@@ -224,19 +195,24 @@ impl Work {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Plant {
-    /// This body gets no task even when the engine names it or it was not clean.
+    /// This body gets no task even when it was not clean.
     Unvisited(DefWithBodyId),
     /// The bodies a run found not clean are kept as clean.
     KeepsNotClean,
+    /// A kept check is taken though an arena of its memos was dropped ([`changes`] looks at
+    /// no arena).
+    CarriesDropped,
 }
 
-/// What a kept check is of: its key. The database (its nonce: the IDs below are that
-/// database's, and a view is one of its storage's), the crates in the plan's order, and the
-/// style lints the checks ran with.
+/// What a kept check is of: its key, by stable names only. The database (its nonce: the IDs
+/// the kept check holds are that database's, and a view is one of its storage's), the crates
+/// in the plan's order by their world keys (a `Crate` id is made again with its arena, so a
+/// key of ids would lose the kept check at the edit that must refuse it), and the style lints
+/// the checks ran with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Of {
     database: Nonce,
-    crates: Vec<Crate>,
+    crates: Vec<CrateKey, Global>,
     style_lints: bool,
 }
 
@@ -245,21 +221,29 @@ struct Of {
 /// diagnostic; every other one's gave none.
 ///
 /// Why the key is complete (rule keys-cover-every-input). What a kept answer says is the value
-/// of a query in view `view`: a crate's file modules ([`crate_file_modules`]), a module's
-/// bodies ([`module_bodies`]), that a body's or a module's check is clean
-/// ([`body_check_clean`], [`module_check_clean`], whose keys hold the style lints). The engine
-/// records every read of each, so its changed set since `view` names every one of them whose
-/// value is now another; the plan takes the kept answer only for one it does not name, and for
-/// "clean" only: a body or module that was not clean is visited every time, since its
-/// diagnostics are not kept. A row first made after `view` is not named, and there is none
-/// among what is held: every module and body here had its queries asked by the plan that kept
-/// it, in `view`. A database made again has another nonce, so no kept check.
+/// of a query in the snapshot the plan that kept it ran in: a crate's file modules
+/// ([`crate_file_modules`]), a module's bodies ([`module_bodies`]), that a body's or a
+/// module's check is clean ([`body_check_clean`], [`module_check_clean`], whose keys hold the
+/// style lints). Each lives in the home arena of its key (the crate's, the module's, the
+/// body's), and those arenas are `arenas`. A later snapshot that holds every one of them, of
+/// the same generation, carried them (blaze-memo's carry invariant: an arena is carried only
+/// if no input any of its entries could have read changed), so every such memo would hit with
+/// the kept value; the plan takes the kept answer for "clean" only: a body or module that was
+/// not clean is visited every time, since its diagnostics are not kept. Where one of them was
+/// dropped the plan is whole ([`Whole::Dropped`]), and no ID held here is touched. A database
+/// made again has another nonce, so no kept check.
+///
+/// An `ArenaId` names one making of an arena for ever within the database's nonce (blaze-memo:
+/// a database's sessions share one id space; base-db gives the database another nonce when it
+/// starts a new one), so an equal `ArenaId` in a later snapshot of the same nonce says carried,
+/// across commits and new sessions alike.
 ///
 /// Memory only: it names the database's IDs, and a restart begins with none (the first plan is
 /// whole and says so, [`Whole::NothingKept`]).
 struct Kept {
-    /// The storage's view the plan that kept this ran in.
-    view: View,
+    /// By crate, in the plan's order: the arenas its check's memos live in, sorted, each once
+    /// ([`arenas_of`]).
+    arenas: Vec<Vec<ArenaId>>,
     /// Every file module of the crates, crate after crate, each in def-map order.
     modules: Vec<Module>,
     /// Where each crate's modules end in `modules`.
@@ -268,8 +252,6 @@ struct Kept {
     lists: Vec<Vec<Planned>>,
     /// How many bodies `lists` holds.
     bodies: u32,
-    /// Each module's place in `modules`, by the ID that is its key in the module queries.
-    place: HashMap<Id, u32, Global>,
     /// The place in `modules` of the module that lists each body.
     home: HashMap<DefWithBodyId, u32, Global>,
     /// The modules whose item checks gave a diagnostic, by place, in order.
@@ -319,9 +301,12 @@ fn put_kept(of: Of, kept: Kept) {
 
 /// What a plan that keeps its check holds until its run: the key, and the kept check it was
 /// made from with what it changes of it. Its run makes the next kept check of both; a plan
-/// dropped before it ran puts the kept check back as it was, which its view still describes.
+/// dropped before it ran puts the kept check back as it was, which its arenas still describe.
 struct Carry {
     of: Of,
+    /// The plan's crates in this snapshot, in `of`'s order: what the arenas of a whole plan's
+    /// kept check are read from.
+    crates: Vec<Crate, Global>,
     /// `None` for a whole plan: the next kept check is made from the plan's own tables.
     last: Option<Last>,
 }
@@ -330,12 +315,10 @@ struct Last {
     kept: Kept,
     /// The place in the kept check's modules of each module of the plan.
     places: Vec<u32>,
-    /// The modules of the plan, by their index in it, whose list is another than the kept one.
-    relisted: Vec<u32>,
 }
 
-/// What the engine's changed set and the kept check make of a plan: see [`changes`].
-struct Patch<'db> {
+/// What the kept check makes of a plan: see [`changes`].
+struct Patch {
     /// The modules the plan holds a slot for, by place in the kept check, in order: each one
     /// with a visited module check or body.
     touched: Vec<u32>,
@@ -343,77 +326,74 @@ struct Patch<'db> {
     visit_modules: Vec<u32>,
     /// The bodies that get a task where a touched module lists them.
     visit_bodies: HashSet<DefWithBodyId, Global>,
-    /// The modules whose list is another than the kept one, by place, in order, with the list.
-    relisted: Vec<(u32, &'db [Planned])>,
-    named_modules: u32,
-    named_bodies: u32,
 }
 
-/// What a plan from `kept` visits: the modules and bodies the engine names as changed since
-/// the kept view, those that were not clean, and the bodies new in a module whose list
-/// changed. `Err` where a crate's file modules changed (a whole plan) or the engine cannot
-/// say (no plan).
-fn changes<'db>(db: &'db Db, of: &Of, kept: &Kept) -> Result<Patch<'db>, Unpatched> {
-    let since = kept.view;
-    let keys = |changed: Changed<Id>| match changed {
-        Changed::Keys(ids) => Ok(ids),
-        Changed::Unknown(why) => Err(Unpatched::Unknown(why)),
+/// The database `db` is (its nonce: a kept check names its IDs and arenas) and its snapshot
+/// (the epoch: unique to it in the process).
+fn at(db: &Db) -> (Nonce, blaze_memo::Epoch) {
+    (db.nonce(), db.memo().snapshot_epoch())
+}
+
+/// The arena of a key that holds `id` and nothing else naming one: where a memo keyed by it
+/// lives, a `bool` beside it naming none.
+fn arena(id: impl blaze_memo::Id) -> ArenaId {
+    id.gid().arena()
+}
+
+/// The home arena of [`body_check_clean`]'s key for `def`: its one ID's.
+fn body_arena(def: DefWithBodyId) -> ArenaId {
+    match def {
+        DefWithBodyId::FunctionId(it) => arena(it),
+        DefWithBodyId::StaticId(it) => arena(it),
+        DefWithBodyId::ConstId(it) => arena(it),
+        DefWithBodyId::VariantId(it) => arena(it),
+    }
+}
+
+/// The arenas the memos of `krate`'s check live in: [`crate_file_modules`]'s (the crate's),
+/// [`module_bodies`]' and [`module_check_clean`]'s (each module's) and [`body_check_clean`]'s
+/// (each listed body's); sorted, each once.
+fn arenas_of(krate: Crate, modules: &[Module], lists: &[&[Planned]]) -> Vec<ArenaId> {
+    let mut out = Vec::new_in(Global);
+    out.push(arena(krate.id));
+    out.extend(modules.iter().map(|it| arena(it.id)));
+    for list in lists {
+        out.extend(list.iter().map(|it| body_arena(it.def)));
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// What a plan from `kept` visits: the modules and bodies that were not clean, every other
+/// answer being the kept one. `Err` where an arena of a crate's kept check is not in `db`'s
+/// snapshot as it was (dropped, and maybe made again at another generation, in this session or
+/// a new one: within the database's nonce no making takes an earlier one's `ArenaId`): a
+/// whole plan. `crates` are the plan's, of this snapshot, in the kept check's order. No id the
+/// kept check holds is touched before every arena it names is known carried.
+fn changes(db: &Db, of: &Of, crates: &[Crate], kept: &Kept) -> Result<Patch, Whole> {
+    #[cfg(test)]
+    let carries_dropped = tests::planted(of.database) == Some(Plant::CarriesDropped);
+    #[cfg(not(test))]
+    let carries_dropped = {
+        _ = of;
+        false
     };
-    let crates = keys(crate_file_modules::changed_since(db, since))?;
-    for &krate in &of.crates {
-        if crates.binary_search(&AsId::as_id(&krate.id)).is_ok() {
-            return Err(Unpatched::Whole(Whole::Modules(krate)));
+    // Ascending ([`blaze_memo::Memo::arenas`]), so each kept arena is one binary search.
+    let live: Vec<ArenaId> = {
+        let mut live = Vec::new_in(Global);
+        live.extend(db.memo().arenas());
+        live
+    };
+    for (&krate, arenas) in crates.iter().zip(&kept.arenas) {
+        if !carries_dropped && arenas.iter().any(|it| live.binary_search(it).is_err()) {
+            return Err(Whole::Dropped(krate));
         }
     }
-    // alloc: once a plan, a word per module or body the edit touched or that was not clean
-    let mut touched = Vec::new();
-    // alloc: as above
-    let mut visit_modules = Vec::new();
+    let mut touched = Vec::new_in(Global);
+    let mut visit_modules = Vec::new_in(Global);
     let mut visit_bodies = HashSet::new_in(Global);
-    // alloc: once a plan, an entry per module whose list changed
-    let mut relisted = Vec::new();
-    let (mut named_modules, mut named_bodies) = (0, 0);
-    for id in keys(module_bodies::changed_since(db, since))? {
-        // A module of another crate, or of a check with other crates: not held here.
-        let Some(&at) = kept.place.get(&id) else { continue };
-        let list: &'db [Planned] = module_bodies(db, kept.modules[at as usize].id);
-        if list == &kept.lists[at as usize][..] {
-            continue;
-        }
-        // A body the kept check does not hold in this module is new: it has no kept answer.
-        for planned in list {
-            if kept.home.get(&planned.def) != Some(&at) {
-                visit_bodies.insert(planned.def);
-            }
-        }
-        relisted.push((at, list));
-        touched.push(at);
-    }
-    relisted.sort_unstable_by_key(|it| it.0);
-    for id in keys(module_check_clean::changed_since(db, since))? {
-        let Some((module, style_lints)) = module_check_clean::arguments(db, id) else { continue };
-        if style_lints != of.style_lints {
-            continue;
-        }
-        if let Some(&at) = kept.place.get(&AsId::as_id(&module)) {
-            named_modules += 1;
-            visit_modules.push(at);
-        }
-    }
-    for id in keys(body_check_clean::changed_since(db, since))? {
-        let Some((def, style_lints)) = body_check_clean::arguments(db, id) else { continue };
-        if style_lints != of.style_lints {
-            continue;
-        }
-        // A body with no home is another check's, one its module's task checks inline, or
-        // a new one, which its module's new list brought in above.
-        if let Some(&at) = kept.home.get(&def) {
-            named_bodies += 1;
-            visit_bodies.insert(def);
-            touched.push(at);
-        }
-    }
-    // What was not clean is visited whatever the engine says: its diagnostics are not kept.
+    // What was not clean is visited every time: its diagnostics are not kept.
     visit_modules.extend_from_slice(&kept.not_clean_modules);
     for def in &kept.not_clean_bodies {
         if let Some(&at) = kept.home.get(def) {
@@ -426,7 +406,7 @@ fn changes<'db>(db: &'db Db, of: &Of, kept: &Kept) -> Result<Patch<'db>, Unpatch
     touched.extend_from_slice(&visit_modules);
     touched.sort_unstable();
     touched.dedup();
-    Ok(Patch { touched, visit_modules, visit_bodies, relisted, named_modules, named_bodies })
+    Ok(Patch { touched, visit_modules, visit_bodies })
 }
 
 /// A plan's tables: see the fields of [`Plan`].
@@ -448,7 +428,7 @@ impl Tables {
         reason = "a plan's starts are u32 into its bodies, which are not bounded below 2^32 \
                   before this: a larger check needs a typed refusal where the plan is made"
     )]
-    fn patched(kept: &Kept, patch: &Patch<'_>) -> Tables {
+    fn patched(kept: &Kept, patch: &Patch) -> Tables {
         let mut tables = Tables {
             modules: Vec::with_capacity(patch.touched.len()),
             crate_ends: Vec::with_capacity(kept.crate_ends.len()),
@@ -464,10 +444,7 @@ impl Tables {
         };
         for (local, &at) in patch.touched.iter().enumerate() {
             let local = local as u32;
-            let list: &[Planned] = match patch.relisted.binary_search_by_key(&at, |it| it.0) {
-                Ok(found) => patch.relisted[found].1,
-                Err(_) => &kept.lists[at as usize],
-            };
+            let list: &[Planned] = &kept.lists[at as usize];
             let first =
                 u32::try_from(tables.bodies.len()).expect("a check of fewer than 2^31 bodies");
             tables.starts.push(first);
@@ -526,8 +503,9 @@ pub struct Plan<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> {
     /// starts from and leaves a kept check ([`Kept`]). Only for a plan whose `asked` accepts
     /// every body, which is what the memos were checked with ([`Plan::of_every_body`]).
     keep: Option<bool>,
-    /// The database and the view the plan was made in: a plan that keeps runs in them.
-    at: (Nonce, View),
+    /// The database and the snapshot (its epoch) the plan was made in: a plan that keeps runs
+    /// in them.
+    at: (Nonce, blaze_memo::Epoch),
     carry: Lock<Option<Carry>>,
     work: Work,
     #[cfg(test)]
@@ -541,13 +519,8 @@ impl Plan<'static, fn(DefWithBody) -> bool> {
     /// changed, and the plan made from the check the last such plan kept (the module).
     /// The diagnostics are those of a plan that keeps nothing: a memo or a kept answer says
     /// only that a check gave none, and a body or module that gave any is checked by its task
-    /// as before. It runs with the `style_lints` it was made with, in the view it was made in.
-    ///
-    /// # Panics
-    ///
-    /// With [`NoChangedSet`]'s text, when a check is kept of these crates and the query
-    /// engine cannot name what changed since it: there is no sweep of every body in the
-    /// changed set's place.
+    /// as before. It runs with the `style_lints` it was made with, in the snapshot it was made
+    /// in.
     pub fn of_every_body(
         db: &Db,
         crates: &[Crate],
@@ -562,7 +535,7 @@ impl<F: Fn(DefWithBody) -> bool + Sync + ?Sized> Drop for Plan<'_, F> {
     fn drop(&mut self) {
         // A plan that never ran, or whose run unwound: the kept check it took is as it was.
         let carry = self.carry.lock().take();
-        if let Some(Carry { of, last: Some(last) }) = carry {
+        if let Some(Carry { of, last: Some(last), .. }) = carry {
             put_kept(of, last.kept);
         }
     }
@@ -579,39 +552,14 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// [`Plan::new`]; with `keep` (the style lints it will run with) a plan of every body
     /// that asks the memos, starts from the kept check of its key and leaves the next.
     fn make(db: &Db, crates: &[Crate], asked: &'f F, keep: Option<bool>) -> Plan<'f, F> {
-        // First the engine's changed set: a walk from the inputs written since the last one
-        // to the memos that changed, with early cutoff (blaze-query's `frontier`). After it
-        // `changed_since` names the memos whose value is another, and a memo the edit did
-        // not reach is marked unchanged where a task asks it, a few loads, with no walk of
-        // what it read. Its span says what the engine did for this edit; a second plan of
-        // the same view finds the walk done.
-        {
-            let settling = tracing::info_span!(
-                target: "blaze",
-                "body check: changed set",
-                visited = tracing::field::Empty,
-                edges = tracing::field::Empty,
-                changed = tracing::field::Empty,
-                unwound = tracing::field::Empty,
-            )
-            .entered();
-            let work = blaze_query::db::plumbing::walk_changed_set(db);
-            settling.record("visited", work.visited);
-            settling.record("edges", work.edges);
-            settling.record("changed", work.changed);
-            settling.record("unwound", work.unwound);
-        }
         // What of a unit's check is the plan and what the sweep: each its own span. A plan
-        // from a kept check costs the engine's answer and the modules it touches; a whole
+        // from a kept check costs a look at its arenas and the modules it touches; a whole
         // one lists every module of the check, and `why` says what made it whole.
         let listing = tracing::info_span!(
             target: "blaze",
             "body check plan",
             held_modules = tracing::field::Empty,
             held_bodies = tracing::field::Empty,
-            named_modules = tracing::field::Empty,
-            named_bodies = tracing::field::Empty,
-            relisted = tracing::field::Empty,
             visited_modules = tracing::field::Empty,
             visited_bodies = tracing::field::Empty,
             kept_unvisited = tracing::field::Empty,
@@ -619,39 +567,24 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             why = tracing::field::Empty,
         )
         .entered();
-        let at = db.nonce_and_revision();
+        let at = at(db);
         let of = keep.map(|style_lints| Of {
             database: at.0,
-            // alloc: once a plan, the key of what it keeps, a word per crate
-            crates: crates.to_vec(),
+            crates: {
+                let mut key = Vec::with_capacity_in(crates.len(), Global);
+                key.extend(crates.iter().map(|it| it.id.key(db)));
+                key
+            },
             style_lints,
         });
         let from_kept = match &of {
-            None => Err(Whole::KeepsNothing),
             Some(of) => match take_kept(of) {
                 None => Err(Whole::NothingKept),
-                Some(kept) => match changes(db, of, &kept) {
-                    Ok(patch) => Ok((kept, patch)),
-                    // A kept check whose crate's file modules changed is dropped here: the
-                    // whole plan's run keeps the next.
-                    Err(Unpatched::Whole(why)) => Err(why),
-                    // No changed set: no plan. The kept check goes back as it was, so the
-                    // error is the same until its cause is removed, never a whole plan the
-                    // second time.
-                    Err(Unpatched::Unknown(why)) => {
-                        let refused = NoChangedSet {
-                            // clone: the error's, once
-                            crates: of.crates.clone(),
-                            style_lints: of.style_lints,
-                            since: kept.view,
-                            why,
-                        };
-                        // clone: the error path, once
-                        put_kept(of.clone(), kept);
-                        panic!("{refused}");
-                    }
-                },
+                // A kept check one of whose arenas was dropped is dropped here, its IDs
+                // untouched: the whole plan's run keeps the next.
+                Some(kept) => changes(db, of, crates, &kept).map(|patch| (kept, patch)),
             },
+            None => Err(Whole::KeepsNothing),
         };
         let (tables, work, last) = match from_kept {
             Ok((kept, patch)) => {
@@ -664,21 +597,9 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
                     patch
                 };
                 let tables = Tables::patched(&kept, &patch);
-                let mut held_bodies = kept.bodies;
-                // alloc: once a plan, a word per module whose list changed
-                let mut relisted = Vec::with_capacity(patch.relisted.len());
-                for &(place, list) in &patch.relisted {
-                    held_bodies = held_bodies - kept.lists[place as usize].len() as u32
-                        + list.len() as u32;
-                    let local = patch.touched.binary_search(&place);
-                    relisted.push(local.expect("a module listed again is touched") as u32);
-                }
                 let work = Work {
                     held_modules: kept.modules.len() as u32,
-                    held_bodies,
-                    named_modules: patch.named_modules,
-                    named_bodies: patch.named_bodies,
-                    relisted: relisted.len() as u32,
+                    held_bodies: kept.bodies,
                     slots_modules: tables.modules.len() as u32,
                     slots_bodies: tables.bodies.len() as u32,
                     visited_modules: (tables.modules.len() - tables.unvisited_modules.len())
@@ -686,16 +607,13 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
                     visited_bodies: (tables.bodies.len() - tables.unvisited_bodies.len()) as u32,
                     whole: None,
                 };
-                (tables, work, Some(Last { kept, places: patch.touched, relisted }))
+                (tables, work, Some(Last { kept, places: patch.touched }))
             }
             Err(why) => {
                 let tables = Self::whole(db, crates, asked, keep.is_some());
                 let work = Work {
                     held_modules: tables.modules.len() as u32,
                     held_bodies: tables.bodies.len() as u32,
-                    named_modules: 0,
-                    named_bodies: 0,
-                    relisted: 0,
                     slots_modules: tables.modules.len() as u32,
                     slots_bodies: tables.bodies.len() as u32,
                     visited_modules: tables.modules.len() as u32,
@@ -707,9 +625,6 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         };
         listing.record("held_modules", work.held_modules);
         listing.record("held_bodies", work.held_bodies);
-        listing.record("named_modules", work.named_modules);
-        listing.record("named_bodies", work.named_bodies);
-        listing.record("relisted", work.relisted);
         listing.record("visited_modules", work.visited_modules);
         listing.record("visited_bodies", work.visited_bodies);
         listing.record("kept_unvisited", work.kept_unvisited());
@@ -723,12 +638,9 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         if keep.is_some() {
             tracing::info!(
                 target: "blaze",
-                stage = blaze_query::db::edit_work::BODY_CHECK,
+                stage = blaze_query::edit_work::BODY_CHECK,
                 held_modules = u64::from(work.held_modules),
                 held_bodies = u64::from(work.held_bodies),
-                named_modules = u64::from(work.named_modules),
-                named_bodies = u64::from(work.named_bodies),
-                relisted = u64::from(work.relisted),
                 slots_modules = u64::from(work.slots_modules),
                 slots_bodies = u64::from(work.slots_bodies),
                 visited_modules = u64::from(work.visited_modules),
@@ -761,7 +673,18 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             started: AtomicBool::new(false),
             keep,
             at,
-            carry: Lock::new("hir.check.carry", of.map(|of| Carry { of, last })),
+            carry: Lock::new(
+                "hir.check.carry",
+                of.map(|of| Carry {
+                    of,
+                    crates: {
+                        let mut own = Vec::with_capacity_in(crates.len(), Global);
+                        own.extend_from_slice(crates);
+                        own
+                    },
+                    last,
+                }),
+            ),
             work,
             #[cfg(test)]
             ran: Lock::new("test.hir.check.ran", Vec::new()),
@@ -770,8 +693,8 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
 
     /// The tables of a whole plan: every file module of `crates` and every body `asked`
     /// accepts of them, each with a task. With `memo` (a plan of every body that keeps) the
-    /// lists are the database's ([`crate_file_modules`], [`module_bodies`]), so the engine
-    /// names the ones an edit changes to the next plan.
+    /// lists are the database's ([`crate_file_modules`], [`module_bodies`]), memos in the
+    /// arenas the kept check names ([`arenas_of`]).
     #[expect(
         blaze::narrowed_len,
         reason = "a plan's crate ends and starts are u32 into its modules and bodies; the modules' \
@@ -855,12 +778,12 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         }
     }
 
-    /// Whether `db` is, now, the database and the view the plan was made in: where a plan
+    /// Whether `db` is, now, the database and the snapshot the plan was made in: where a plan
     /// that keeps runs ([`Plan::run_marked`] panics elsewhere). A plan that keeps nothing
     /// runs in any. A plan made ahead of its run (a unit's, which its codegen is given
-    /// before its check starts) asks, and one made in a view gone by is made again.
+    /// before its check starts) asks, and one made in a snapshot gone by is made again.
     pub fn made_in(&self, db: &Db) -> bool {
-        self.keep.is_none() || self.at == db.nonce_and_revision()
+        self.keep.is_none() || self.at == at(db)
     }
 
     /// The check's diagnostics, of each of its crates in their order: what
@@ -886,10 +809,10 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
                  check is of them"
             );
             assert_eq!(
-                db.nonce_and_revision(),
+                at(db),
                 self.at,
-                "a plan of every body runs in the database and view it was made in: what it \
-                 visits is the changed set up to that view"
+                "a plan of every body runs in the database and snapshot it was made in: the \
+                 arenas it found carried are that snapshot's"
             );
         }
         #[expect(
@@ -923,14 +846,12 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             );
         }
         let home = ptr::from_ref(db).cast::<()>().addr();
-        // The sweep: a task for each module and body the plan visits, which asks the engine
-        // whether its memo holds ([`body_check_clean`], [`module_check_clean`]) and is
-        // checked again only where it does not. A whole plan visits every one (on ripgrep's
-        // binary, 2026-11-11: `unit bodies` 484 ms, 283 ms of CPU, `body_check_clean`
-        // executed 6 and verified 1,149); a plan from a kept check visits what the engine
-        // named, what was not clean and what is new, and `kept_unvisited` counts the rest,
-        // which cost nothing here. This span holds the sweep's wall time, and the queries
-        // that ran under it name the bodies checked again.
+        // The sweep: a task for each module and body the plan visits, which asks the memo
+        // whether it holds ([`body_check_clean`], [`module_check_clean`]) and is checked
+        // again only where it does not. A whole plan visits every one; a plan from a kept
+        // check visits what was not clean, and `kept_unvisited` counts the rest, which cost
+        // nothing here. This span holds the sweep's wall time, and the queries that ran under
+        // it name the bodies checked again.
         let work = &self.work;
         let sweep = tracing::info_span!(
             target: "blaze",
@@ -938,8 +859,6 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             swept_tasks = self.tasks.len(),
             held_modules = work.held_modules,
             held_bodies = work.held_bodies,
-            named_modules = work.named_modules,
-            named_bodies = work.named_bodies,
             visited_modules = work.visited_modules,
             visited_bodies = work.visited_bodies,
             kept_unvisited = work.kept_unvisited(),
@@ -972,65 +891,54 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     }
 
     /// Leaves the kept check of this run for the next plan of its key: the kept check the
-    /// plan was made from with the lists it changed, or the plan's own tables when it was
-    /// whole; the view it ran in; and the modules and bodies whose task found a diagnostic.
-    /// Every one not visited was clean and stays so. After the batch, so each task's slot is
-    /// set; a run that unwound keeps nothing new ([`Plan`]'s drop).
+    /// plan was made from, or the plan's own tables and the arenas their memos live in when it
+    /// was whole; and the modules and bodies whose task found a diagnostic. Every one not
+    /// visited was clean and stays so. After the batch, so each task's slot is set; a run that
+    /// unwound keeps nothing new ([`Plan`]'s drop).
     fn keep_check(&self, slots: Slots<'_, '_>) {
         const RAN: &str = "`run_all` returned before a task of the check ran";
         let carry = self.carry.lock().take();
-        let Some(Carry { of, last }) = carry else { return };
+        let Some(Carry { of, crates, last }) = carry else { return };
         let (mut kept, places) = match last {
-            Some(Last { mut kept, places, relisted }) => {
-                for &local in &relisted {
-                    let (local, at) = (local as usize, places[local as usize]);
-                    let list =
-                        &self.bodies[self.starts[local] as usize..self.starts[local + 1] as usize];
-                    // alloc: once a module whose list changed, its list kept
-                    let before = mem::replace(&mut kept.lists[at as usize], list.to_vec());
-                    for planned in &before {
-                        if kept.home.get(&planned.def) == Some(&at) {
-                            kept.home.remove(&planned.def);
-                        }
-                    }
-                    for planned in list {
-                        kept.home.insert(planned.def, at);
-                    }
-                    kept.bodies = kept.bodies - before.len() as u32 + list.len() as u32;
-                }
-                (kept, Some(places))
-            }
+            // Every arena it names was carried into this snapshot: they are still its arenas.
+            Some(Last { kept, places }) => (kept, Some(places)),
             None => {
-                let mut place = HashMap::new_in(Global);
-                place.reserve(self.modules.len());
                 let mut home = HashMap::new_in(Global);
                 home.reserve(self.bodies.len());
-                let mut lists = Vec::with_capacity(self.modules.len());
-                for (at, module) in self.modules.iter().enumerate() {
+                let mut lists = Vec::with_capacity_in(self.modules.len(), Global);
+                for (at, _) in self.modules.iter().enumerate() {
                     let list = &self.bodies[self.starts[at] as usize..self.starts[at + 1] as usize];
-                    place.insert(AsId::as_id(&module.id), at as u32);
                     home.extend(list.iter().map(|it| (it.def, at as u32)));
-                    // alloc: once a module of a whole plan, its list kept
-                    lists.push(list.to_vec());
+                    let mut kept_list = Vec::with_capacity_in(list.len(), Global);
+                    kept_list.extend_from_slice(list);
+                    lists.push(kept_list);
                 }
+                let mut arenas = Vec::with_capacity_in(crates.len(), Global);
+                let mut from = 0;
+                for (&krate, &end) in crates.iter().zip(&self.crate_ends) {
+                    let (from_at, end_at) = (from as usize, end as usize);
+                    let mut crate_lists = Vec::with_capacity_in(end_at - from_at, Global);
+                    crate_lists.extend(lists[from_at..end_at].iter().map(|it| &it[..]));
+                    arenas.push(arenas_of(krate, &self.modules[from_at..end_at], &crate_lists));
+                    from = end;
+                }
+                let mut modules = Vec::with_capacity_in(self.modules.len(), Global);
+                modules.extend_from_slice(&self.modules);
+                let mut crate_ends = Vec::with_capacity_in(self.crate_ends.len(), Global);
+                crate_ends.extend_from_slice(&self.crate_ends);
                 let kept = Kept {
-                    view: self.at.1,
-                    // clone: once a whole plan, the modules kept, a word each
-                    modules: self.modules.clone(),
-                    // clone: once a whole plan, a word per crate
-                    crate_ends: self.crate_ends.clone(),
+                    arenas,
+                    modules,
+                    crate_ends,
                     lists,
                     bodies: self.bodies.len() as u32,
-                    place,
                     home,
-                    // alloc: none, empty: filled below
-                    not_clean_modules: Vec::new(),
-                    not_clean_bodies: Vec::new(),
+                    not_clean_modules: Vec::new_in(Global),
+                    not_clean_bodies: Vec::new_in(Global),
                 };
                 (kept, None)
             }
         };
-        kept.view = self.at.1;
         kept.not_clean_modules.clear();
         kept.not_clean_bodies.clear();
         for &task in &self.tasks {
@@ -1217,13 +1125,13 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
 /// made by its task, from the results this run left.
 ///
 /// A check places a diagnostic only once it has found one, so a clean body's run reads no
-/// source position and stays verified when an edit above it in its file moves it.
-#[blaze_query::tracked(returns(copy))]
+/// source position.
+#[blaze_memo::tracked(returns(copy))]
 pub fn body_check_clean(db: &Db, def: DefWithBodyId, style_lints: bool) -> bool {
     #[cfg(test)]
     {
-        tests::CHECKED.lock().push((db.nonce_and_revision().0, def));
-        tests::CHECKED_ON.lock().push((db.nonce_and_revision().0, std::thread::current().id()));
+        tests::CHECKED.lock().push((db.nonce(), def));
+        tests::CHECKED_ON.lock().push((db.nonce(), std::thread::current().id()));
     }
     super::check_body(db, def, style_lints).is_empty()
 }
@@ -1233,7 +1141,7 @@ pub fn body_check_clean(db: &Db, def: DefWithBodyId, style_lints: bool) -> bool 
 /// written in it), the bodies a plan lists left to their own checks ([`list_module`]), give
 /// no diagnostic. Kept by the database as [`body_check_clean`] is. A walk that does not meet
 /// a listed body where the listing has it is the plan's bug, and panics as the task's does.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub fn module_check_clean(db: &Db, module: ModuleId, style_lints: bool) -> bool {
     let every = &super::every_body;
     let expected: &[Planned] = module_bodies(db, module);
@@ -1254,29 +1162,25 @@ pub fn module_check_clean(db: &Db, module: ModuleId, style_lints: bool) -> bool 
 }
 
 /// The file modules of `krate` ([`file_modules`](super::file_modules)): every module but the
-/// inline ones, in the def map's order. Kept by the database, so a plan from a kept check
-/// asks the engine whether the list it holds places in still stands
-/// (`crate_file_modules::changed_since`) and lists no crate again while it does.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn crate_file_modules(db: &Db, krate: base_db::Crate) -> Box<[ModuleId]> {
-    crate_def_map(db, krate)
+/// inline ones, in the def map's order. Kept by the database in the crate's arena, the list
+/// held in it.
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn crate_file_modules<'db>(db: &'db Db, krate: base_db::Crate) -> &'db [ModuleId] {
+    let modules = crate_def_map(db, krate)
         .modules(db)
         .filter(|(_, data)| !data.origin.is_inline())
-        .map(|(id, _)| id)
-        // alloc: once a crate and a change of its modules, the query's value, a word a module
-        .collect()
+        .map(|(id, _)| id);
+    blaze_memo::keep_iter(db.memo(), modules)
 }
 
 /// The bodies a plan of every body checks as tasks of their own in file module `module`, in
-/// the order the collector meets them ([`list_module`]). Kept by the database: a module's
-/// check reads it ([`module_check_clean`]), and a plan from a kept check asks the engine
-/// which modules' lists changed (`module_bodies::changed_since`) and lists only those again.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn module_bodies(db: &Db, module: ModuleId) -> Box<[Planned]> {
-    // alloc: once a module and a change of its items, the query's value
-    let mut out = Vec::new();
+/// the order the collector meets them ([`list_module`]). Kept by the database in the module's
+/// arena, the list held in it: a module's check reads it ([`module_check_clean`]).
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn module_bodies<'db>(db: &'db Db, module: ModuleId) -> &'db [Planned] {
+    let mut out = Vec::new_in(Global);
     list_module(db, module, &super::every_body, &mut out);
-    out.into_boxed_slice()
+    blaze_memo::keep_slice(db.memo(), &out)
 }
 
 /// One crate's diagnostics as [`Plan::run_marked`] gives them.

@@ -9,8 +9,8 @@
 //!   own tables, so two instances, each linked with its own positions.
 //! - Its template code ([`Hashes::template_code`]) is the same without the store's key: no
 //!   name and no place is in it. What the compiled body reads of names beside its code is
-//!   [`Hashes::names_read`]: the files its `file!()` names and, where a debugger is told of
-//!   its locals, what their types' identities read (`code::told_names`). The front end folds
+//!   [`Hashes::names_read`]: where a debugger is told of its locals, what their types'
+//!   identities read (`code::told_names`); never a file's name. The front end folds
 //!   that into both its code and its template code. A template keyed by it holds its own
 //!   anchors by table, and each instance fills its own (docs/v2/plan/design/name-free-identity.md).
 //! - A type or constant is [`hir_ty_share::identity`]'s spelling by content, the one the share
@@ -30,7 +30,7 @@ use base_db::Db;
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey, item_key, key};
-use blaze_query::db::FromId;
+use blaze_memo::Id as _;
 use hir_def::{DefWithBodyId, ExpressionStoreOwnerId, FunctionId, expr_store::Body as BodyStore};
 use hir_ty::{
     InferBodyId,
@@ -48,7 +48,7 @@ use super::{Body, Hashes};
 pub const SPAN_DOMAIN: &str = "blaze v2 codegen span table 1";
 pub const OWNED_DOMAIN: &str = "blaze v2 codegen owned code 1";
 pub const TEMPLATE_CODE_DOMAIN: &str = "blaze v2 codegen template code 2";
-pub const NAMES_READ_DOMAIN: &str = "blaze v2 codegen names read 1";
+pub const NAMES_READ_DOMAIN: &str = "blaze v2 codegen names read 2";
 
 // A template holds an instance's own positions by table, one anchor per table of the body's.
 const _: () = assert!(TABLES == blaze_codegen::template::OWN_TABLES);
@@ -106,19 +106,19 @@ impl Hashes for ItemHashes {
     }
 
     fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let (code, store) = match body {
                 Body::Item(def) => (code::of_item(db, def), ExpressionStoreOwnerId::Body(def)),
                 Body::Closure(id) => {
-                    let id = InternedClosureId::from_id(id);
+                    let id = InternedClosureId::from_gid(id);
                     (code::of_closure(db, id), id.loc(db).owner.expression_store_owner(db))
                 }
                 Body::Coroutine(id) => {
-                    let id = InternedCoroutineId::from_id(id);
+                    let id = InternedCoroutineId::from_gid(id);
                     (code::of_coroutine(db, id), id.loc(db).owner.expression_store_owner(db))
                 }
                 Body::CoroutineByMove(id) => {
-                    let id = InternedCoroutineId::from_id(id);
+                    let id = InternedCoroutineId::from_gid(id);
                     (
                         code::of_coroutine_by_move(db, id),
                         id.loc(db).owner.expression_store_owner(db),
@@ -136,13 +136,13 @@ impl Hashes for ItemHashes {
     }
 
     fn template_code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let code = match body {
                 Body::Item(def) => code::of_item(db, def),
-                Body::Closure(id) => code::of_closure(db, InternedClosureId::from_id(id)),
-                Body::Coroutine(id) => code::of_coroutine(db, InternedCoroutineId::from_id(id)),
+                Body::Closure(id) => code::of_closure(db, InternedClosureId::from_gid(id)),
+                Body::Coroutine(id) => code::of_coroutine(db, InternedCoroutineId::from_gid(id)),
                 Body::CoroutineByMove(id) => {
-                    code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id))
+                    code::of_coroutine_by_move(db, InternedCoroutineId::from_gid(id))
                 }
             };
             let code = code.as_ref().map_err(ToString::to_string)?; // alloc: the error's message
@@ -153,30 +153,10 @@ impl Hashes for ItemHashes {
     }
 
     fn names_read(&self, db: &Db, body: Body, told: bool) -> Result<(ContentId, bool), String> {
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let mut h = Hasher::new(NAMES_READ_DOMAIN);
-            // What `file!()` bakes into its data as text: each file by the name the build gives
-            // it, sorted, each once; a file the build named none is keyed as such, and the
-            // code generator refuses it when it compiles the body.
-            // alloc: none for a body without `file!()`, which is nearly every one
-            let mut files: Vec<Option<String>> = match span_owner(db, body) {
-                Some(owner) => (hir_ty_mir::mir::location::files_read(db, owner).into_iter())
-                    .map(|file| (self.names)(file))
-                    .collect(),
-                None => Vec::new(),
-            };
-            files.sort_unstable();
-            files.dedup();
-            h.update(&(files.len() as u64).to_le_bytes());
-            for file in &files {
-                match file {
-                    Some(name) => h
-                        .update(&[1])
-                        .update(&(name.len() as u64).to_le_bytes())
-                        .update(name.as_bytes()),
-                    None => h.update(&[0]),
-                };
-            }
+            // No file's name: a `file!()`, alone or in a `concat!`, is a span the link names
+            // (`blaze_codegen::Target::Position`, `Target::Text`), so no code holds one.
             // What a debugger told of its locals reads of their types; a told local's type
             // holding an alias is not all of it (`told_names`).
             let whole = match told {
@@ -201,12 +181,12 @@ impl Hashes for ItemHashes {
 
     fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
         // alloc: the error's message
-        blaze_query::db::attach(db, || identity::ty(db, ty).map_err(|why| why.to_string()))
+        blaze_memo::attach(db, || identity::ty(db, ty).map_err(|why| why.to_string()))
     }
 
     fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
         // alloc: the error's message
-        blaze_query::db::attach(db, || identity::konst(db, konst).map_err(|why| why.to_string()))
+        blaze_memo::attach(db, || identity::konst(db, konst).map_err(|why| why.to_string()))
     }
 
     fn span(&self, db: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String> {
@@ -245,10 +225,10 @@ impl Hashes for ItemHashes {
 pub(crate) fn told_of(db: &Db, body: Body) -> Result<Option<ContentId>, String> {
     let mir = match body {
         Body::Item(def) => db.mir_body(InferBodyId::DefWithBodyId(def)),
-        Body::Closure(id) => db.mir_body_for_closure(InternedClosureId::from_id(id)),
-        Body::Coroutine(id) => db.mir_body_for_coroutine(InternedCoroutineId::from_id(id)),
+        Body::Closure(id) => db.mir_body_for_closure(InternedClosureId::from_gid(id)),
+        Body::Coroutine(id) => db.mir_body_for_coroutine(InternedCoroutineId::from_gid(id)),
         Body::CoroutineByMove(id) => {
-            db.mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
+            db.mir_body_for_coroutine_by_move(InternedCoroutineId::from_gid(id))
         }
     };
     // alloc: the error's message
@@ -262,9 +242,9 @@ pub(crate) fn told_of(db: &Db, body: Body) -> Result<Option<ContentId>, String> 
 pub(crate) fn span_owner(db: &Db, body: Body) -> Option<DefWithBodyId> {
     let owner = match body {
         Body::Item(def) => return Some(def),
-        Body::Closure(id) => InternedClosureId::from_id(id).loc(db).owner,
+        Body::Closure(id) => InternedClosureId::from_gid(id).loc(db).owner,
         Body::Coroutine(id) | Body::CoroutineByMove(id) => {
-            InternedCoroutineId::from_id(id).loc(db).owner
+            InternedCoroutineId::from_gid(id).loc(db).owner
         }
     };
     match owner {
@@ -278,7 +258,7 @@ struct Anchors([ContentId; TABLES]);
 
 /// The anchors of a body's span tables: of the key of its store, which an edit of what the
 /// body is keeps.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn anchors(db: &Db, owner: DefWithBodyId) -> Anchors {
     let store = key::store_key(db, ExpressionStoreOwnerId::Body(owner));
     Anchors(std::array::from_fn(|table| {

@@ -191,7 +191,7 @@ impl Qualif {
 
 /// rustc's `ConstQualifs` of a constant (`mir_const_qualif`): which qualifs the value its body
 /// returns has. A const context reading the constant takes these, not its type's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConstQualifs {
     has_mut_interior: bool,
     needs_drop: bool,
@@ -204,7 +204,7 @@ impl ConstQualifs {
         ConstQualifs { has_mut_interior: true, needs_drop: true, needs_non_const_drop: true };
 }
 
-#[blaze_query::tracked(cycle_result = const_qualifs_cycle_result, returns(copy))]
+#[blaze_memo::tracked(cycle_result = const_qualifs_cycle_result, returns(copy))]
 fn const_qualifs<'db>(db: &'db Db, def: InferBodyId<'db>) -> ConstQualifs {
     // A constant whose MIR does not build is refused where it is lowered.
     let Ok(body) = db.mir_body(def) else { return ConstQualifs::BY_TYPE };
@@ -213,11 +213,7 @@ fn const_qualifs<'db>(db: &'db Db, def: InferBodyId<'db>) -> ConstQualifs {
     })
 }
 
-fn const_qualifs_cycle_result<'db>(
-    _db: &'db Db,
-    _: blaze_query::db::Id,
-    _def: InferBodyId<'db>,
-) -> ConstQualifs {
+fn const_qualifs_cycle_result<'db>(_db: &'db Db, _def: InferBodyId<'db>) -> ConstQualifs {
     ConstQualifs::BY_TYPE
 }
 

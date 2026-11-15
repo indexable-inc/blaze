@@ -361,10 +361,7 @@ pub struct Walk {
 }
 
 fn tier_index(tier: Tier) -> usize {
-    match tier {
-        Tier::Edit => 0,
-        Tier::Release => 1,
-    }
+    tier.number() as usize
 }
 
 impl Walk {

@@ -64,7 +64,7 @@ fn called_in(db: &Db, krate: Crate, name: &str) -> Vec<Option<Crate>> {
         })
         .unwrap_or_else(|| panic!("no function `{name}`"));
     let def = DefWithBodyId::FunctionId(func);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let body = Body::of(db, def);
         let infer = InferenceResult::of(db, InferBodyId::DefWithBodyId(def));
         body.exprs()
@@ -99,16 +99,14 @@ fn a_proc_macros_impls_are_not_its_users() {
         "main loads {loaded:?}"
     );
     assert!(loaded_crates(&db, pm).contains(&syn), "the macro's crate loads its own dependencies");
+    // The trait impl tables of `krate` and its dependencies: each loaded crate's own, as the
+    // solver reads them (the memo keeps one table per crate, so one table is one address).
     let syn_impls = TraitImpls::for_crate(&db, syn);
-    assert!(
-        !TraitImpls::for_crate_and_deps(&db, main)
+    let has_syns = |krate: Crate| {
+        loaded_crates(&db, krate)
             .iter()
-            .any(|it| triomphe::Arc::ptr_eq(it, syn_impls)),
-        "`impl Parse for u8` of the macro's `syn` is among main's impls"
-    );
-    assert!(
-        TraitImpls::for_crate_and_deps(&db, pm)
-            .iter()
-            .any(|it| triomphe::Arc::ptr_eq(it, syn_impls))
-    );
+            .any(|&dep| std::ptr::eq(TraitImpls::for_crate(&db, dep), syn_impls))
+    };
+    assert!(!has_syns(main), "`impl Parse for u8` of the macro's `syn` is among main's impls");
+    assert!(has_syns(pm));
 }

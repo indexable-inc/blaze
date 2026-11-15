@@ -307,6 +307,49 @@ impl Digest {
     }
 }
 
+/// The digest as a kept state holds it ([`crate::keep`]): the length and the nodes, sorted by
+/// place. The nodes of a file are canonical, so two digests of one file keep the same bytes.
+impl Digest {
+    /// A copy, for bringing up to date what a caller only borrows.
+    pub(crate) fn copy(&self) -> Digest {
+        Digest {
+            len: self.len,
+            nodes: self.nodes.clone(),
+            zeros: self.zeros,
+            dirty: Vec::new_in(Global),
+            #[cfg(test)]
+            plant_skips_a_block: self.plant_skips_a_block,
+        }
+    }
+
+    pub(crate) fn keep<A: std::alloc::Allocator>(&self, out: &mut crate::keep::Out<A>) {
+        let mut nodes: Vec<(u64, Hash)> = Vec::with_capacity_in(self.nodes.len(), Global);
+        nodes.extend(self.nodes.iter().map(|(at, hash)| (*at, *hash)));
+        nodes.sort_unstable_by_key(|it| it.0);
+        out.u64(self.len);
+        out.len(nodes.len());
+        for (at, hash) in &nodes {
+            out.u64(*at);
+            out.raw(hash);
+        }
+    }
+
+    pub(crate) fn open(input: &mut crate::keep::In<'_>) -> Result<Digest, crate::keep::Bad> {
+        use crate::keep::Kept as _;
+        let mut digest = Digest::new();
+        digest.len = input.u64()?;
+        let count = input.count(40)?;
+        digest.nodes.reserve(count);
+        for _ in 0..count {
+            let at = input.u64()?;
+            if digest.nodes.insert(at, Hash::take(input)?).is_some() {
+                return Err(crate::keep::Bad::What("a node of the file's digest kept twice"));
+            }
+        }
+        Ok(digest)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

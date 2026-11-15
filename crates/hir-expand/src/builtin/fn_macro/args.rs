@@ -172,15 +172,17 @@ pub(super) fn comma_separated(tt: &tt::TopSubtree) -> SmallVec<[Arg<'_>; 4]> {
 
 /// rustc's `get_single_expr_from_tts`: the one expression `tt` has, and a `,` after it if there
 /// is one. No expression is `{name} takes 1 argument` at the call, with none read; more is the
-/// same error, with the first read all the same.
+/// same error, with the first read all the same. `call` is the call's span, asked only for that
+/// error: finding it reads the call's syntax, which a well-formed call never needs (an
+/// `include!` of a crate given by its pages is resolved from its tokens alone).
 pub(super) fn single_expr<'t>(
     db: &Db,
     tt: &'t tt::TopSubtree,
     name: &str,
-    call: Span,
+    call: impl Fn() -> Span,
 ) -> ExpandResult<Option<Arg<'t>>> {
     // alloc: an error's message, on the error path
-    let takes_one = || BuiltinError::new(format!("{name} takes 1 argument")).at(call);
+    let takes_one = || BuiltinError::new(format!("{name} takes 1 argument")).at(call());
     let mut iter = tt.iter();
     if iter.is_empty() {
         return ExpandResult::new(None, takes_one());
@@ -211,12 +213,13 @@ pub(super) fn string(arg: &Arg<'_>, err_msg: &'static str) -> Result<Symbol, Exp
 }
 
 /// rustc's `get_single_str_spanned_from_tts`: the text and span of the string literal that is
-/// the one argument of `tt`. The first error rustc gives is `err`.
+/// the one argument of `tt`. The first error rustc gives is `err`. `call` is asked only for an
+/// error, as in [`single_expr`].
 pub(super) fn single_string(
     db: &Db,
     tt: &tt::TopSubtree,
     name: &str,
-    call: Span,
+    call: impl Fn() -> Span,
 ) -> ExpandResult<Option<(Symbol, Span)>> {
     let ExpandResult { value, err } = single_expr(db, tt, name, call);
     let Some(arg) = value else { return ExpandResult { value: None, err } };

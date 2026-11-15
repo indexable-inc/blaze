@@ -19,7 +19,12 @@ use syntax::{
 };
 
 use super::{eval_goal, pretty_print_err};
-use crate::{const_macro::ConstMacroExpander, test_db::TestDB};
+use blaze_memo::testing::Ran;
+
+use crate::{
+    const_macro::ConstMacroExpander,
+    test_db::{TestDB, runs_of, write_file},
+};
 
 /// The macro crate's derives, every one written with the raw builder: `Named`, `NamedAtCall`
 /// and `Fields` build impls; the rest are the planted bugs the host's checks name.
@@ -323,7 +328,7 @@ fn a_built_derive_is_the_tree_its_text_parsed_to() {
     assert!(expected.len() >= 5, "the files have {} structs", expected.len());
     let fixture = with_const_ast(MACROS, &main);
     let (db, _, _) = load(&fixture, "Fields");
-    let mut built = blaze_query::db::attach(&db, || {
+    let mut built = blaze_memo::attach(&db, || {
         let main = *all_crates(&db).last().expect("the main crate");
         expansions(&db, main)
     });
@@ -352,7 +357,7 @@ fn a_spliced_name_keeps_its_span_and_a_built_token_takes_the_site() {
     .expect("the input is tokens");
     let point = span_of(&input, "Point");
     let env = base_db::Env::default();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let expand = |name: &str| {
             let call = ProcMacroCall {
                 subtree: &input,
@@ -385,7 +390,7 @@ fn refused(name: &str, refusal: &str) {
         &format!("pub trait Named {{ const LEN: usize; }}\n\n#[derive(macros::{name})]\npub struct Point;\n"),
     );
     let (db, _, _) = load(&fixture, name);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let main = *all_crates(&db).last().expect("the main crate");
         let derives = derives(&db, main);
         assert!(derives.contains(refusal), "{derives}");
@@ -448,15 +453,18 @@ fn editing_a_builder_function_reruns_the_expansions_that_used_it() {
         .map(|it| it.file_id(&db))
         .find(|&file| db.file_text(file).text(&db).contains("pub struct Builder<'a>"))
         .expect("the fixture has builder.rs");
-    let main = *all_crates(&db).last().expect("the main crate");
+    // The main crate is taken in the snapshot expanded: a crate's id is of one snapshot.
     let expand = |db: &TestDB| {
-        blaze_query::db::attach(db, || {
+        let main = *all_crates(db).last().expect("the main crate");
+        blaze_memo::attach(db, || {
             let mut tree = String::new();
-            let executed = db.log_executed(|| tree = expansions(db, main).concat());
+            let executed = runs_of(db, || tree = expansions(db, main).concat());
             (tree, executed)
         })
     };
-    let ran = |executed: &[String]| executed.iter().any(|it| it.contains("proc_macro_expansion"));
+    let ran = |executed: &[Ran]| {
+        executed.iter().any(|it| it.query == hir_expand::MacroCallId_proc_macro_expansion::KIND_NAME)
+    };
     let (first, _) = expand(&db);
     assert!(first.contains("IMPL"), "{first}");
     let (again, executed) = expand(&db);
@@ -465,7 +473,7 @@ fn editing_a_builder_function_reruns_the_expansions_that_used_it() {
     let text = db.file_text(builder).text(&db).to_string();
     let close = "    pub const fn close(&mut self, open: Open) {\n";
     assert!(text.contains(close), "builder.rs has `Builder::close`");
-    db.set_file_text(builder, &text.replace(close, &format!("{close}        let _edited = 0u8;\n")));
+    write_file(&mut db, builder, &text.replace(close, &format!("{close}        let _edited = 0u8;\n")));
     let (edited, executed) = expand(&db);
     assert!(ran(&executed), "`Builder::close` changed, and the expansion did not run: {executed:?}");
     assert_eq!(edited, first);
@@ -516,7 +524,7 @@ fn load_files(fixture: &str, name: &str) -> (TestDB, Vec<EditionedFileId>, span:
 /// `GOAL` of the last file of `fixture`, whose macro crate has the derive `name`.
 fn goal(fixture: &str, name: &str) -> Vec<u8> {
     let (db, file_id, _) = load(fixture, name);
-    blaze_query::db::attach(&db, || match eval_goal(&db, file_id) {
+    blaze_memo::attach(&db, || match eval_goal(&db, file_id) {
         Ok(goal) => goal.memory.to_vec(),
         Err(e) => {
             let main = *base_db::all_crates(&db).last().expect("the main crate");

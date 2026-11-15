@@ -10,7 +10,7 @@ use base_db::Db;
 use blaze_hash::{Blake3Hasher, HashMap, HashSet};
 use blaze_ids::Hasher;
 use blaze_items::{ItemId, interface_hash, item_key, key};
-use blaze_query::db::FromId;
+use blaze_memo::Id as _;
 use hir_def::{
     AdtId, CallableDefId, FunctionId, ItemContainerId, StaticId, UnionId, VariantId,
     attrs::AttrFlags,
@@ -219,7 +219,7 @@ impl<'a, 'db> Facts<'a, 'db> {
                                 let parent =
                                     GenericArgs::new_from_slice(args.as_closure().parent_args());
                                 self.closure(
-                                    Body::Closure(blaze_query::db::AsId::as_id(&id.0)),
+                                    Body::Closure(blaze_memo::Id::gid(id.0)),
                                     parent,
                                 );
                             }
@@ -503,7 +503,7 @@ impl<'a, 'db> Facts<'a, 'db> {
             TyKind::Closure(id, args) => {
                 self.h.update(&[1]);
                 let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                self.closure(Body::Closure(blaze_query::db::AsId::as_id(&id.0)), parent);
+                self.closure(Body::Closure(blaze_memo::Id::gid(id.0)), parent);
             }
             _ => unreachable!("`pointee` is asked of a function or a closure only"),
         }
@@ -728,9 +728,9 @@ impl<'a, 'db> Facts<'a, 'db> {
 pub(crate) fn body_key(db: &Db, body: Body) -> (u8, blaze_ids::ContentId) {
     let key = match body {
         Body::Fn(f) => item_key(db, ItemId::Function(f)),
-        Body::Closure(id) => key::closure_key(db, InternedClosureId::from_id(id)),
+        Body::Closure(id) => key::closure_key(db, InternedClosureId::from_gid(id)),
         Body::Coroutine(id) | Body::CoroutineByMove(id) => {
-            key::coroutine_key(db, InternedCoroutineId::from_id(id))
+            key::coroutine_key(db, InternedCoroutineId::from_gid(id))
         }
     };
     let tag = match body {

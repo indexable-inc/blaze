@@ -4,13 +4,11 @@
 
 use std::{
     fmt::Write as _,
-    ops::ControlFlow,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::Database as _;
 use blaze_sim::Config;
 use hir_expand::fixture;
 use blaze_core::lock::Lock;
@@ -172,37 +170,6 @@ fn a_span_name_says_which_impl_const_block_and_build_script() {
     );
 }
 
-/// The run log's rows carry names, not ids: a crate reads as spans name it, a function by its
-/// path, and an id that is no row of the kind asked (a crate's id asked as a function) is left
-/// to its id, never named as another row. On 2026-11-10 `Crate(Id(21548))` was found to be serde
-/// by guessing from symbol names.
-#[test]
-fn the_run_logs_rows_are_named_by_crate_and_path_and_no_id_is_guessed() {
-    use blaze_query::db::AsId as _;
-    let fixture = fixture::db(EXACT);
-    let db = fixture.db();
-    let krate = *all_crates(db)
-        .iter()
-        .find(|krate| krate.data(db).origin.is_local() && !names(db, **krate, EXACT).is_empty())
-        .unwrap();
-    let mut label = String::new();
-    super::write_crate_label(db, krate, &mut label);
-    let named = |ingredient: &str, id| {
-        let mut out = String::new();
-        blaze_query::db::attach(db, || super::name_row(ingredient, id, &mut out)).then_some(out)
-    };
-    assert_eq!(named("Crate", krate.as_id()), Some(label));
-    let (path, def) = names(db, krate, EXACT).into_iter().find(|(_, def)| matches!(def, DefWithBodyId::FunctionId(_))).unwrap();
-    let DefWithBodyId::FunctionId(function) = def else { unreachable!() };
-    assert_eq!(named("FunctionId", function.as_id()), Some(path));
-    // The controls: a row asked as another kind, a kind no namer knows, and no database.
-    assert_eq!(named("FunctionId", krate.as_id()), None);
-    assert_eq!(named("Crate", function.as_id()), None);
-    assert_eq!(named("NoSuchRow", krate.as_id()), None);
-    let mut out = String::new();
-    assert!(!super::name_row("Crate", krate.as_id(), &mut out) && out.is_empty());
-}
-
 /// A macro that calls itself writes each inner call at ordinal 0 of its own output, so its
 /// bodies are named by the whole chain of calls: the two `get`s are two names.
 #[test]
@@ -270,28 +237,27 @@ impl tracing::Subscriber for &'static Named {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-/// What a query that opens `def`'s body span and reads its body read, each read as
-/// `ingredient(id) kind`. `traced` only keys the run: the test asks once with no subscriber and
-/// once under one that records, and so names, the span.
-#[blaze_query::tracked(returns(ref))]
-fn reads_beside_a_named_span(db: &Db, def: DefWithBodyId, traced: bool) -> Vec<String> {
+/// What a query that opens `def`'s body span and reads its body read, each row of its read
+/// list (`blaze_memo::record`) as its `Debug` text. `traced` only keys the run: the test asks
+/// once with no subscriber and once under one that records, and so names, the span. Both runs
+/// are in one snapshot, so a boundary row's id means the same in both.
+#[blaze_memo::tracked(returns(ref), owns)]
+fn reads_beside_a_named_span(db: &Db, def: DefWithBodyId, traced: bool) -> Vec<String, Global> {
     _ = traced;
-    let ((), reads) = blaze_query::db::capture_reads(db, || {
+    let recorded = blaze_memo::record(blaze_memo::Database::memo(db), || {
         let _p = crate::body_span!(db, def, "span_names_reads_query").entered();
         _ = Body::of(db, def);
     });
-    let Some(reads) = reads else { panic!("{def:?}: a span and a body read are shareable") };
-    let mut out = Vec::new();
-    reads.for_each_read(db.storage(), |read| {
-        out.push(format!("{:?} {:?}", read.key, read.kind));
-        ControlFlow::<()>::Continue(())
-    });
+    let ((), reads) = recorded.unwrap_or_else(|off| panic!("{def:?}: {off}"));
+    let mut out = Vec::new_in(Global);
+    out.extend(reads.iter().map(|read| format!("{read:?}")));
     out
 }
 
 #[test]
 fn naming_a_span_reads_nothing_into_its_query() {
-    let fixture = fixture::db(EXACT);
+    // A database that keeps read lists, which `blaze_memo::record` answers only on.
+    let fixture = fixture::db_with_reads(EXACT);
     let db = fixture.db();
     let named: &'static Named = Box::leak(Box::default());
     for def in local_bodies(db) {

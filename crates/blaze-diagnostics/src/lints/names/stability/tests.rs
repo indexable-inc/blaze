@@ -39,12 +39,12 @@ static PLANTED: blaze_core::lock::Lock<Vec<(base_db::Nonce, Plant)>> =
 
 /// The bug planted in `db`, if any.
 pub(super) fn planted(db: &Db) -> Option<Plant> {
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     PLANTED.lock().iter().find(|(of, _)| *of == nonce).map(|&(_, plant)| plant)
 }
 
 fn plant(db: &Db, plant: Plant) {
-    PLANTED.lock().push((db.nonce_and_revision().0, plant));
+    PLANTED.lock().push((db.nonce(), plant));
 }
 
 /// Whether any database records what the walk visits: the walk of every other test reads
@@ -63,20 +63,20 @@ pub(super) fn visited(db: &Db, file: HirFileId, range: TextRange) {
     if !RECORDING.load(Ordering::Relaxed) {
         return;
     }
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     if RECORDED.lock().contains(&nonce) {
         VISITED.lock().push((nonce, file, range));
     }
 }
 
 fn record(db: &Db) {
-    RECORDED.lock().push(db.nonce_and_revision().0);
+    RECORDED.lock().push(db.nonce());
     RECORDING.store(true, Ordering::Relaxed);
 }
 
 /// What the walks of `db` visited since the last take.
 fn take_visited(db: &Db) -> Vec<(HirFileId, TextRange)> {
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     let mut visited = VISITED.lock();
     let mut own = Vec::new();
     visited.retain(|&(of, file, range)| {
@@ -100,7 +100,7 @@ struct Walked {
 /// of the walk that steps over the quiet bodies, each as text, in a context given the check's
 /// pieces as `check::run` gives them.
 fn both_walks(db: &Db, names: &HashMap<FileId, String>, options: &Options) -> Vec<Walked> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let mut out = Vec::new();
         for krate in hir::check::workspace_crates(db) {
             let frame = crate::tests::frame();
@@ -147,10 +147,10 @@ fn refine(fixture: &str, prefix: &str, options: &Options) -> usize {
     let text = db.file_text(first).text(&db).as_str().to_owned();
     for edit in EDITS {
         let Some(new) = edited(&text, edit) else { continue };
-        db.set_file_text(first, &new);
+        crate::tests::set_file_text(&mut db, first, &new);
         check_all(&db, &names, options);
         quiet += holds(&db, &names, options, &format!("{edit:?} of\n{fixture}"));
-        db.set_file_text(first, &text);
+        crate::tests::set_file_text(&mut db, first, &text);
         check_all(&db, &names, options);
     }
     quiet
@@ -335,7 +335,7 @@ fn walked_bodies(plant_it: Option<Plant>) -> (bool, bool) {
     assert!(rows.iter().any(|it| it.whole.contains("deprecated")), "`loud` lints: {}", rows.len());
     // `both_walks` walks the whole crate first: only what the second walk visits counts.
     let _ = take_visited(&db);
-    let skipping: Vec<String> = blaze_query::db::attach(&db, || {
+    let skipping: Vec<String> = blaze_memo::attach(&db, || {
         hir::check::workspace_crates(&db)
             .into_iter()
             .map(|krate| {

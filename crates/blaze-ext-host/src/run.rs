@@ -106,7 +106,7 @@ pub fn check(
     cache: &mut Cache,
     name_of: NameOf<'_>,
 ) -> Result<Checked, CheckError> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let key = HostKey::of(db);
         let bodies = front::bodies(db, krate, &key).map_err(CheckError::Unidentified)?;
         let nodes: Vec<Node> = bodies

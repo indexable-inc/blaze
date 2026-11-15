@@ -271,7 +271,7 @@ impl Facts {
 ///
 /// Both are sound: under [`Proofs::None`] every panic site and check stays a panic, so fewer
 /// facts are inferred, never a wrong one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_memo::Home)]
 pub enum Proofs {
     /// No proof is run: every site is what it is written as.
     None,
@@ -283,7 +283,7 @@ pub enum Proofs {
 /// read past the body run on its MIR (`hir-ty-mir`'s `optimize::passes_at`), and whether the
 /// facts they read spend proofs ([`proofs_at`]). An input of the optimized MIR's key
 /// ([`crate::mir::MirOptions::tier`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_memo::Home)]
 pub enum Tier {
     /// Code a request waits for: copy-and-patch stencils, Cranelift, LLVM at `-O0` (the edit
     /// loop, a cold dev build). No pass reads past the body: no MIR inlining (only the code

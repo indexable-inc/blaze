@@ -50,7 +50,7 @@
 //! files or `include!`s read a file anywhere else (a `#[path]` into another package, a path no
 //! source root has), an `include!` among an impl's or a trait's items too
 //! (`signatures::scope_calls`), is refused an image (`serve::refusal`,
-//! `serve::include_refusal`): that file is known only once the crate is resolved, after the
+//! `late::walk`): that file is known only once the crate is resolved, after the
 //! key is made. So is a crate with a `mod` whose file is not there (`Refused::ModuleFileMissing`):
 //! the key covers the files that are, and would not move once that one appears.
 
@@ -110,30 +110,23 @@ pub fn eligible(db: &Db, krate: Crate) -> bool {
     of(db, krate, &mut HashMap::new_in(Global))
 }
 
-/// Whether `krate` is sealed: its sources, and those of every crate below it, cannot change,
-/// as the planner recorded on each ([`base_db::CrateData::sealed`], decided by the driver's one
-/// rule, blaze-cargo's `serve::sealed::pin`: a tree named by a digest that pins it). Nothing
-/// else is read: not the origin, not the source root's kind, not a name. A workspace member,
-/// a path dependency and a doctest crate carry no pin, so neither they nor any crate above
-/// them is sealed. What a build's end stores (`super::store` with [`super::Which::Sealed`]):
-/// a sealed crate's resolution does not change with an edit of the workspace, so its pages
-/// are written once; a member's are written when its front end is let go, or at a stop.
+/// Whether `krate` is sealed: the driver sealed its arena (`blaze_memo::Inputs::seal`, so
+/// `Memo::changed` is `false` for it; docs/v2/plan/design/front-end-on-memo.md, B "Sealed
+/// summaries"). Who is sealed is the driver's decision: a crate that is not being built, whose
+/// sources are pinned, with all its dependencies sealed too (`Builder::build` checks). A seal
+/// says where the crate's records are kept, not that its arena lives for the session: a write
+/// to a sealed crate's own inputs drops its arena and every arena that declared or read it, as
+/// for any crate (2026-11-14; before, it started a new session), and the arena made again is
+/// sealed again by its maker. A dependency's summary is its image, read in place: nothing has
+/// to witness that it did not change. What a build's end stores (`super::store` with
+/// [`super::Which::Sealed`]): an edit of the workspace never reaches a sealed crate, so its
+/// resolution moves only when its own pinned inputs are written, which moves its key; its
+/// pages are written once per key (a store whose served key moved refuses the crate,
+/// `Refused::KeyMoved`). A member's are written when its front end is let go, or at a stop.
+#[inline]
 pub fn sealed(db: &Db, krate: Crate) -> bool {
-    sealed_in(db, krate, &mut HashMap::new_in(Global))
-}
-
-/// [`sealed`], memoized in `memo` across the crates of one caller's walk.
-pub fn sealed_in(db: &Db, krate: Crate, memo: &mut HashMap<Crate, bool, Global>) -> bool {
-    if let Some(&known) = memo.get(&krate) {
-        return known;
-    }
-    let data = krate.data(db);
-    let mut sealed = data.sealed.is_some();
-    for dep in &data.dependencies {
-        sealed &= sealed_in(db, dep.crate_id, memo);
-    }
-    memo.insert(krate, sealed);
-    sealed
+    use blaze_memo::Id as _;
+    !blaze_memo::Database::memo(db).changed(krate.gid().arena())
 }
 
 /// The key of `krate`'s image by `build`, or `None` when the crate is not [`eligible`]: the
@@ -150,17 +143,17 @@ pub fn sealed_in(db: &Db, krate: Crate, memo: &mut HashMap<Crate, bool, Global>)
 /// Why the memo is complete (rule keys-cover-every-input). Everything [`key`] hashes it
 /// reads from the database inside this run: the crate's data and extra data, its workspace
 /// data, cfg and env, its source root's file set, each file's content, its proc macros'
-/// libraries, and each dependency's key through this same query. The engine records each
-/// read, so a write of any of them runs the key again, and a key that comes out the same
-/// stops there (its dependents are not run). `build` and the crate are the memo's own key;
+/// libraries, and each dependency's key through this same query. The memo records each
+/// read, so a changed input runs the key again in the next snapshot, and a key that comes
+/// out equal stops there (its readers are not run). `build` and the crate are the memo's own key;
 /// [`PRODUCER`] is the process's, and a process is one build of blaze.
 ///
 /// The crate graph has no cycles, which [`Crate::transitive_deps`] relies on too, so the
 /// recursion ends.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn image_key(db: &Db, krate: Crate, build: ContentId) -> Option<ContentId> {
     #[cfg(test)]
-    super::tests::KEYED.lock().push((db.nonce_and_revision().0, krate));
+    super::tests::KEYED.lock().push((db.nonce(), krate.key(db)));
     let data = krate.data(db);
     let mut eligible = libraries_known(db, krate);
     // alloc: once per run of a crate's key, one key a dependency
@@ -195,8 +188,7 @@ pub(crate) fn image_key(db: &Db, krate: Crate, build: ContentId) -> Option<Conte
 /// One walk of the crate graph: each crate is visited once, whether eligible and its key
 /// decided together, so the work is the crates' files and their dependency edges.
 pub fn keys(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, ContentId, Global> {
-    // alloc: setup: the keys of a session, once
-    walked(db, crates, build).into_iter().filter_map(|(krate, key)| Some((krate, key?))).collect()
+    walked(db, crates, build)
 }
 
 /// The walk of [`keys`] kept between calls, for a caller that keys more crates of one
@@ -204,17 +196,35 @@ pub fn keys(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, Conte
 /// batch of its build made ready): a crate keyed once is not keyed again, nor its
 /// dependencies walked, so a call costs the crates it is the first to ask for.
 ///
-/// What the memo is keyed by is the caller's to hold, and is all a key is a function of
-/// (keys-cover-every-input): the database, the view of it (no input written since: a crate's
-/// data, its source root's files and their content IDs, its proc macros' libraries are all
-/// inputs) and `build`. A caller that sees any of the three move calls [`KeyWalk::clear`]
-/// first. [`PRODUCER`] is the process's.
+/// The invariant: nothing in it is tied to a snapshot. It holds crates by their
+/// [`base_db::CrateKey`], never a [`Crate`] id (an id dies at a commit that drops its arena),
+/// so it is valid across any number of commits and may be kept across a serve's.
 ///
-/// What it holds is which crates were asked, not the work of a key: each key is the
-/// database's memo ([`image_key`]), so a walk after [`KeyWalk::clear`] asks the memo of each
-/// crate (a few loads where nothing it read changed) and hashes no file again.
+/// What it caches: of each crate walked, its image key or that it is not [`eligible`], under
+/// the view it was walked at (`at`: the database's [`base_db::Nonce`], the snapshot's
+/// epoch, and `build`). That is all a key is a function of (keys-cover-every-input): a
+/// crate's data, its source root's files and their content IDs, its proc macros' libraries
+/// and its dependencies' keys are all inputs of the snapshot. It is rebuilt, not kept keyed
+/// by what each key read: a [`KeyWalk::more`] at another view (any commit, a commit that
+/// changed a crate's inputs among them, another database or another `build`) forgets every
+/// crate first. A per-crate record of what each key read would be a second copy of the
+/// database memo's own record of it ([`image_key`]), and is not needed for the cost: what it
+/// holds is which crates were asked, not the work of a key, so a walk after a commit asks the
+/// memo of each crate again (a few loads where nothing it read changed) and hashes no file
+/// again. Floor: one memo answer per crate asked per view; this: that, and a map lookup per
+/// crate met again at the same view.
+///
+/// What makes it stale: nothing a caller can see. A key of a crate the world no longer has
+/// is never looked up: such a crate can only be gone after a commit, which moves the view,
+/// and the walk at a new view starts empty. [`PRODUCER`] is the process's.
 pub struct KeyWalk {
-    memo: Memo,
+    /// The view the memo was walked at: the database, its snapshot and `build`.
+    pub(super) at: Option<(base_db::Nonce, blaze_memo::Epoch, ContentId)>,
+    pub(super) memo: Memo,
+    /// Test only: the view is not checked, the walk kept across any write (the planted bug of
+    /// `the_oracle_catches_a_walk_kept_across_a_write`).
+    #[cfg(test)]
+    pub(super) plant_keep_across_views: bool,
 }
 
 impl Default for KeyWalk {
@@ -225,11 +235,18 @@ impl Default for KeyWalk {
 
 impl KeyWalk {
     pub fn new() -> KeyWalk {
-        KeyWalk { memo: HashMap::new_in(Global) }
+        KeyWalk {
+            at: None,
+            memo: HashMap::new_in(Global),
+            #[cfg(test)]
+            plant_keep_across_views: false,
+        }
     }
 
-    /// Forgets every crate walked: the database, its view or `build` moved.
+    /// Forgets every crate walked. [`KeyWalk::more`] forgets them itself when the view moved;
+    /// this is for a caller that drops what it noted with the walk.
     pub fn clear(&mut self) {
+        self.at = None;
         self.memo.clear();
     }
 
@@ -243,14 +260,24 @@ impl KeyWalk {
     }
 
     /// The key of each [`eligible`] crate among `crates` and their dependencies that no call
-    /// since the last [`KeyWalk::clear`] walked: what [`keys`] gives of them. The union over
-    /// the calls is [`keys`] of every crate asked, whatever the order they were asked in.
+    /// at this view (`db`'s database and snapshot, and `build`) since the last
+    /// [`KeyWalk::clear`] walked: what [`keys`] gives of them. The union over the calls at one
+    /// view is [`keys`] of every crate asked, whatever the order they were asked in. At
+    /// another view than the last call's, every crate walked is forgotten first. The crates
+    /// given are `db`'s, live until its next commit.
     pub fn more(
         &mut self,
         db: &Db,
         crates: &[Crate],
         build: ContentId,
     ) -> HashMap<Crate, ContentId, Global> {
+        let at = Some((db.nonce(), db.snapshot_epoch(), build));
+        #[cfg(test)]
+        let at = if self.plant_keep_across_views && self.at.is_some() { self.at } else { at };
+        if self.at != at {
+            self.memo.clear();
+            self.at = at;
+        }
         // alloc: once per call that walks a crate, one entry per crate newly keyed
         let mut fresh = HashMap::new_in(Global);
         // Called once for each eligible crate the walk had not seen ([`walk`]).
@@ -285,8 +312,8 @@ pub fn key_inputs(
     crates: &[Crate],
     build: ContentId,
 ) -> HashMap<Crate, KeyInputs, Global> {
-    let memo = walked(db, crates, build);
-    let inputs = |(&krate, key): (&Crate, &Option<ContentId>)| {
+    let keyed = walked(db, crates, build);
+    let inputs = |(&krate, &key): (&Crate, &ContentId)| {
         // alloc: setup: once per crate a driver publishes
         let mut closure = vec![krate];
         let mut at = 0;
@@ -300,24 +327,29 @@ pub fn key_inputs(
         }
         // alloc: setup, as above
         let out_dirs = closure.iter().filter_map(|it| it.env(db).get("OUT_DIR")).collect();
-        Some((krate, KeyInputs { key: (*key)?, build, closure, out_dirs }))
+        (krate, KeyInputs { key, build, closure, out_dirs })
     };
     // alloc: setup, as above
-    memo.iter().filter_map(inputs).collect()
+    keyed.iter().map(inputs).collect()
 }
 
-/// The walk of [`keys`] and [`key_inputs`]: each crate of `crates` and of their dependencies,
-/// with its key or `None` when it is not [`eligible`].
-fn walked(db: &Db, crates: &[Crate], build: ContentId) -> Memo {
+/// The walk of [`keys`] and [`key_inputs`]: the key of each [`eligible`] crate of `crates`
+/// and of their dependencies.
+fn walked(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, ContentId, Global> {
+    // alloc: setup: once per walk, one entry per crate walked
     let mut memo = HashMap::new_in(Global);
+    // alloc: setup: the keys of a session, once
+    let mut keyed = HashMap::new_in(Global);
     for &krate in crates {
-        walk(db, krate, build, &mut |_, _| {}, &mut memo);
+        walk(db, krate, build, &mut |krate, key| _ = keyed.insert(krate, key), &mut memo);
     }
-    memo
+    keyed
 }
 
-/// Each crate walked: its key, or `None` when it is not [`eligible`].
-type Memo = HashMap<Crate, Option<ContentId>, Global>;
+/// Each crate walked, by its key in the world: its image key, or `None` when it is not
+/// [`eligible`]. By [`base_db::CrateKey`], so a memo kept outlives the commits of the
+/// snapshot it was walked in without holding a dead id ([`KeyWalk`]).
+pub(super) type Memo = HashMap<base_db::CrateKey, Option<ContentId>, Global>;
 
 /// `krate`'s key by `build` ([`image_key`], the database's memo) into `memo`, its
 /// dependencies' first, so `memo` holds every crate `krate`'s key covers; `seen` is told each
@@ -332,7 +364,8 @@ fn walk(
     seen: &mut impl FnMut(Crate, ContentId),
     memo: &mut Memo,
 ) -> Option<ContentId> {
-    if let Some(&key) = memo.get(&krate) {
+    let world = krate.key(db);
+    if let Some(&key) = memo.get(&world) {
         return key;
     }
     for dep in &krate.data(db).dependencies {
@@ -342,7 +375,7 @@ fn walk(
     if let Some(key) = key {
         seen(krate, key);
     }
-    memo.insert(krate, key);
+    memo.insert(world, key);
     key
 }
 

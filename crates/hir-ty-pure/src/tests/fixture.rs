@@ -7,8 +7,7 @@ use hir_expand::fixture;
 
 /// The minicore regions the stand-ins use, then `alloc` and `std`, in a library root as a
 /// build's toolchain is (blaze-lower gives a crate the origin of its root: base-db
-/// `crate_durability`), so their files are `HIGH` and a summary of their instances runs under the
-/// covered frame of a sealed crate (`crate::sealed`). A test appends its crates with
+/// `crate_durability`), so their files are `HIGH` and their crates are sealed. A test appends its crates with
 /// [`with_toolchain`], which starts a local root for them.
 pub(super) const TOOLCHAIN: &str = r#"
 //- minicore: sized, copy, clone, drop, deref, fmt, result, option, panic, as_ref, from, try, fn, transmute, unsize, coerce_unsized, dispatch_from_dyn, builtin_impls, index, slice, str, borrow, asm, write
@@ -717,6 +716,15 @@ pub(super) fn with_toolchain(toolchain: &str, crates: &str) -> String {
         // alloc: a test's fixture text
         false => format!("{toolchain}{}{first} new_source_root:local{}", &crates[..start], &crates[end..]),
     }
+}
+
+/// Tells `db` that front end 7 computes its bodies' identities, from a commit of its own on
+/// (`blaze_item_hash::identity::give_build`, as a driver does): take every id but a file's and
+/// a crate key after it.
+pub(super) fn give_build(db: &mut Db) {
+    let mut edit = db.edit();
+    blaze_item_hash::identity::give_build(&mut edit, blaze_ids::ContentId([7; 32]));
+    _ = edit.commit();
 }
 
 /// The crate named `name` in `db`.

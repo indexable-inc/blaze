@@ -31,7 +31,7 @@ pub(super) fn doc(
     // a member's dev-dependencies is in the crate graph to leave out.
     let test_only = TestOnly::default();
     let db = lowered.served_db();
-    let crates = blaze_query::db::attach(db, || {
+    let mut crates = blaze_memo::attach(db, || {
         blaze_doc::crates_to_document(db, &asked, no_deps, &test_only)
     })
     .map_err(|unnamed| {
@@ -60,9 +60,11 @@ pub(super) fn doc(
             DocumentedCrate { name: it.name.clone(), package, asked }
         })
         .collect();
-    blaze_doc::set_cfg_doc(db, &crates);
+    // Its commit kills the ids read above (`packages`, `asked`), which are read no more; each
+    // of `crates` is given its crate again in the new snapshot.
+    blaze_doc::set_cfg_doc(db, &mut crates);
     let db = &*db;
-    let model = blaze_query::db::attach(db, || blaze_doc::model(db, crates, test_only));
+    let model = blaze_memo::attach(db, || blaze_doc::model(db, crates, test_only));
     let Pages { files, written } = blaze_doc::html::pages(&model);
     let mut out = Vec::with_capacity(files.len() + model.warnings.len() + 2); // alloc: once per documentation
     out.push(Response::Documented(Documented {

@@ -50,7 +50,7 @@ pub const BOUND_DOMAIN: &str = "blaze v2 identity bound 1";
 /// The domain of an ADT's identity: its key, interface, layout and the drop impls it reaches.
 pub const ADT_DOMAIN: &str = "blaze v2 identity adt 1";
 
-/// The identity of `ty`. Call it with the database attached (`blaze_query::db::attach`).
+/// The identity of `ty`. Call it with the database attached (`blaze_memo::attach`).
 pub fn ty<'db>(db: &'db Db, ty: Ty<'db>) -> Result<ContentId, Unshared> {
     let mut spell = Spell::new(db, TY_DOMAIN);
     spell.ty(ty)?;
@@ -83,7 +83,7 @@ fn no_content(what: String) -> Unshared {
 /// An ADT as its identity says it: its key, its interface (fields, variants, `repr`), its
 /// layout, and the `Drop` impls of it and of every ADT its fields' types name, transitively,
 /// which drop glue reads.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
     let item = ItemId::Adt(adt);
     let mut h = Hasher::new(ADT_DOMAIN);

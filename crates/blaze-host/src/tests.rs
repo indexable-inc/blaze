@@ -13,10 +13,16 @@
 //!
 //! Each test states the claim it checks and runs its control: the same request without the
 //! cause, where the effect goes.
+//!
+//! Programs: one program rooted at unit 1's `run`. A plan of an item reads its body (the body
+//! record the host hands it) and its signature, and has an edge per call; its code is opaque
+//! bytes of the plan's result; the linker's state is every row's (instance, code). A whole-walk
+//! [`HostWalk`] walks it through the driver's plan, code and link tasks on the real store and
+//! pool.
 
 use std::{
     alloc::{Allocator, Global},
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     marker::PhantomData,
     path::Path,
     time::Duration,
@@ -27,25 +33,26 @@ use blaze_core::{lock::Lock, temp::TempDir};
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
 use blaze_keyed::{
-    driver::{Failure, Filed, Outcome, Plan, Ran, StoreFault, TaskFailed, UnitPlan},
-    front::{FileItems, Front, Keyed, Unanswerable, Universe},
+    driver::{Bodies, Failure, Filed, Outcome, Plan, Ran, StoreFault, TaskFailed, UnitPlan},
+    front::{FileItems, Front, GivenBody, Keyed, Linked, Patch, PatchBase, PatchWrite, Unanswerable, Universe},
     kind::{
-        Body, BodyInputs, Certificate, CertificateInputs, FileImage, FileInputs, Key, Kind, Namespace, Settings, Surface,
-        SurfaceInputs, Tag, ToolId, UnitInputs, UnitManifest,
+        Body, BodyInputs, Certificate, CertificateInputs, CodeRecord, CodeRecordInputs, FileImage, FileInputs, Key, Kind, Namespace,
+        PlanRecord, ProgramManifest, Settings, Steps, Surface, SurfaceInputs, Tag, ToolId, UnitInputs, UnitManifest,
     },
     machine::Machine,
     memo::{Audit, Memo, RecordsOnly},
+    program::{Kept, Planned, ProgramPlan, Row, RowChange, WalkAsk, WalkEnd, Walker},
     proof,
-    record::{self, Fact, FactKind, Owner, StableId},
+    record::{self, Fact, FactKind, Owner, PlanEdge, StableId, Traced},
     store::{Compacted, Generation, Put, Read, RootRef, Store, StoreError},
 };
 use blaze_sim::{Config, Tape};
 
 use crate::{
-    HostError, Request,
+    HostError, Images, Request,
     disk::Disk,
     outside::{Ask, Leaves, file_answer},
-    run,
+    run, run_programs,
 };
 
 const TOOL: ToolId = ToolId { tool: ContentId([1; 32]), target: ContentId([4; 32]), namespace: Namespace::LOCAL };
@@ -116,6 +123,11 @@ impl World {
         self.units[unit as usize].iter().find(|item| stable(unit, item.name) == id)
     }
 
+    /// The item a fact subject names, with its unit.
+    fn item_of_subject(&self, id: StableId) -> Option<(u32, &Item)> {
+        (0..2u32).find_map(|unit| self.units[unit as usize].iter().find(|item| subject(unit, item.name) == id).map(|item| (unit, item)))
+    }
+
     /// What `call` in unit `unit` is bound to: an item of the unit, else of its dependencies.
     fn resolve(&self, unit: u32, call: &str) -> Option<(u32, &Item)> {
         std::iter::once(unit)
@@ -155,6 +167,14 @@ fn owner(unit: u32) -> Owner {
 
 fn stable(unit: u32, name: &str) -> StableId {
     StableId::of(format!("u{unit}::{name}").as_bytes(), 1)
+}
+
+/// An item as a fact subject (the front's item key): its first eight bytes its unit's owner, so
+/// the driver finds its unit; its surface's maker row maps it to [`stable`].
+fn subject(unit: u32, name: &str) -> StableId {
+    let mut id = StableId::of(format!("u{unit}::subject::{name}").as_bytes(), 1);
+    id.0.0[..8].copy_from_slice(&owner(unit).0);
+    id
 }
 
 fn sig_fact(unit: u32, name: &str) -> ContentId {
@@ -207,8 +227,8 @@ struct Scripted {
     world: World,
     /// A body task that panics: (unit, item).
     panics: Option<(u32, &'static str)>,
-    /// The bodies write how many tasks ran before them into their payload: other bytes at one
-    /// address, which only an audit sees.
+    /// The bodies write how many tasks this front ran before them, over every request it
+    /// answered, into their payload: other bytes at one address, which only an audit sees.
     counts: bool,
     log: Lock<Vec<String>>,
 }
@@ -257,9 +277,12 @@ impl Front for Scripted {
             items.push((stable(unit, item.name), body_key(unit, item)));
         }
         items.sort_by_key(|(item, _)| *item);
-        let mut files = Vec::new_in(frame);
+        let mut files = Vec::new_in(frame.clone());
         files.push(FileItems { image: file_key(&self.world, unit), at: 0, len: items.len() as u32 });
-        Ok(Keyed { manifest: manifest_key(&self.world, unit), surface: surface_key(&self.world, unit), files, items })
+        // The scripted program prints no file name: its file has no span file fact.
+        let mut names = Vec::new_in(frame);
+        names.push(ContentId([0; 32]));
+        Ok(Keyed { manifest: manifest_key(&self.world, unit), surface: surface_key(&self.world, unit), files, items, names })
     }
 
     fn surface(&self, unit: u32, key: Key<Surface>, universe: Universe<'_>) -> Result<Aligned, TaskFailed> {
@@ -277,6 +300,13 @@ impl Front for Scripted {
                 Fact { id: sig_fact(unit, item.name), digest: sig_digest(item.sig) }
             })
             .collect();
+        // Each item's maker row: its subject to its text id, by which a plan's read of its body
+        // finds the body's slot.
+        facts.extend(
+            self.world.units[unit as usize]
+                .iter()
+                .map(|item| Fact { id: record::maker_row(&subject(unit, item.name)), digest: stable(unit, item.name).0 }),
+        );
         facts.push(Fact { id: record::seen_id(), digest: record::digest(&seen) });
         facts.sort_by_key(|fact| fact.id);
         let (_, bytes) = record::write_read::<Surface>(key, &facts_of(&asked), &facts, b"surface");
@@ -309,6 +339,319 @@ impl Front for Scripted {
         let payload = record::digest(&order);
         let (_, bytes) = record::write_read::<Body>(key, &facts_of(&asked), &made, &payload.0);
         Ok(Aligned::copy_from(&bytes))
+    }
+
+    /// The scripted body has no borrow check: both steps are its one work, under the key given.
+    fn body_of(&self, unit: u32, id: StableId, key: Key<Body>, _steps: Steps, universe: Universe<'_>) -> Result<Aligned, TaskFailed> {
+        self.body(unit, id, key, universe)
+    }
+
+    /// The plan asked by `ask` (an item's subject, [`plan_name`]'s input): it reads its body (the
+    /// record given, by its result) and its signature, and its payload has an edge per call,
+    /// with no type arguments, and the body's result as its description.
+    fn plan(
+        &self,
+        program: u32,
+        ask: &[u8],
+        key: Key<PlanRecord>,
+        bodies: &[GivenBody<'_>],
+        universe: Universe<'_>,
+    ) -> Result<Aligned, TaskFailed> {
+        let refused = TaskFailed::Refused { what: "a plan ask of no item, or under another name than its ask's" };
+        let item = StableId(ContentId(ask.try_into().map_err(|_| refused)?));
+        let (at, found) = self.world.item_of_subject(item).filter(|_| program == 0 && key.id() == plan_name(item)).ok_or(refused)?;
+        self.note(format!("plan u{at}::{}", found.name));
+        let body = bodies.iter().find(|body| body.item == item).ok_or(TaskFailed::NoBody { item })?;
+        let mut asked = BTreeMap::new();
+        let mut order = body.result.0.to_vec();
+        ask_of(&universe, &mut asked, &mut order, sig_fact(at, found.name))?;
+        asked.insert(record::mir_id(&item), body.result);
+        let mut edges = Vec::new();
+        for call in found.calls {
+            if let Some((callee_at, callee)) = self.world.resolve(at, call) {
+                edges.push(PlanEdge { item: subject(callee_at, callee.name).0, args_at: 0, args_len: 0, kind: 0, pad: 0, pad2: 0 });
+            }
+        }
+        let payload = record::write_plan_payload(&edges, &[], &body.result.0, Global);
+        let (_, bytes) = record::write_read::<PlanRecord>(key, &facts_of(&asked), &[], &payload);
+        Ok(Aligned::copy_from(&bytes))
+    }
+
+    /// Code: opaque bytes of the plan's result, made against exactly its callees' plans (one per
+    /// edge's instance, as the walk named them), given the bodies its plan read (each with the
+    /// result its plan read) and its plan's universe.
+    fn code(
+        &self,
+        program: u32,
+        key: Key<CodeRecord>,
+        plan: &[u8],
+        callees: &[(Key<PlanRecord>, &[u8])],
+        bodies: &[GivenBody<'_>],
+        universe: Universe<'_>,
+    ) -> Result<Aligned, TaskFailed> {
+        let refused = TaskFailed::Refused { what: "code of a plan record that does not open, or without its callees' plans" };
+        let opened = blaze_format::open::<Traced>(plan).map_err(|_| refused)?;
+        let result = record::result_digest(opened, plan).map_err(|_| refused)?;
+        let reads = opened.reads.follow(plan).map_err(|_| refused)?;
+        let read = |body: &GivenBody<'_>| reads.iter().any(|fact| fact.id == record::mir_id(&body.item) && fact.digest == body.result);
+        if universe.tables.is_empty() || !bodies.iter().all(read) {
+            return Err(TaskFailed::Refused { what: "code given no universe, or a body its plan did not read as given" });
+        }
+        let payload = Aligned::copy_from(opened.payload.follow(plan).map_err(|_| refused)?);
+        let view = record::read_plan_payload(&payload).map_err(|_| refused)?;
+        let mut named: Vec<ContentId> = view.edges.iter().map(|edge| plan_name(StableId(edge.item))).collect();
+        named.sort_unstable();
+        named.dedup();
+        if program != 0 || !named.iter().copied().eq(callees.iter().map(|(instance, _)| instance.id())) {
+            return Err(refused);
+        }
+        self.note(format!("code {:?}", &result.0[..4]));
+        let mut payload = b"code".to_vec();
+        payload.extend_from_slice(&result.0);
+        Ok(Aligned::copy_from(&record::write_opaque(&key, &payload)))
+    }
+
+    /// The linker's state: every row's (instance, code), sorted; each change applied after its
+    /// old code is checked against the state, its new code record against its key, and its plan
+    /// found among `plans`.
+    fn link<A: Allocator + Clone>(
+        &self,
+        program: u32,
+        changes: &[RowChange],
+        code: &[&[u8]],
+        plans: &[(Key<PlanRecord>, &[u8])],
+        spans: &[(ContentId, &[u8])],
+        payload: &[u8],
+        frame: A,
+    ) -> Result<Linked<A>, TaskFailed> {
+        self.note(format!("link p{program} {}", changes.len()));
+        let refused = TaskFailed::Refused { what: "a link step whose rows are not the state it holds" };
+        if payload.len() % 64 != 0 || code.len() != changes.len() || !spans.is_empty() {
+            return Err(refused);
+        }
+        let planned = |instance: Key<PlanRecord>| plans.binary_search_by_key(&instance.id(), |(key, _)| key.id()).is_ok();
+        if changes.iter().any(|change| change.now.is_some() && !planned(change.instance)) {
+            return Err(TaskFailed::Refused { what: "a link step without the plan of a row that came or moved" });
+        }
+        let id = |bytes: &[u8]| {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(bytes);
+            ContentId(id)
+        };
+        let mut image: BTreeMap<ContentId, ContentId> = payload.chunks(64).map(|pair| (id(&pair[..32]), id(&pair[32..]))).collect();
+        for (change, record) in changes.iter().zip(code) {
+            if image.get(&change.instance.id()).copied() != change.was.map(|was| was.id()) {
+                return Err(refused);
+            }
+            match change.now {
+                Some(now) => {
+                    record::open::<CodeRecord>(record, &now).map_err(|_| refused)?;
+                    image.insert(change.instance.id(), now.id());
+                }
+                None => {
+                    image.remove(&change.instance.id());
+                }
+            }
+        }
+        let mut state = Vec::with_capacity_in(image.len() * 64, frame.clone());
+        for (instance, code) in &image {
+            state.extend_from_slice(&instance.0);
+            state.extend_from_slice(&code.0);
+        }
+        // The scripted image is the state's ([`image_of`]); its patch writes all of it at once.
+        let image = image_of(&state);
+        let mut bytes = Vec::with_capacity_in(image.len(), frame.clone());
+        bytes.extend_from_slice(&image);
+        let mut writes = Vec::with_capacity_in(1, frame);
+        writes.push(PatchWrite { at: 0, from: 0, len: image.len() as u32 });
+        Ok(Linked { payload: state, patch: Patch { base: PatchBase::Empty, len: image.len() as u64, writes, bytes } })
+    }
+}
+
+/// The scripted program's image of linker state `state`: a header, then the state.
+fn image_of(state: &[u8]) -> Vec<u8> {
+    let mut image = b"image".to_vec();
+    image.extend_from_slice(state);
+    image
+}
+
+/// The test's [`Images`]: images and paths in memory, each make and place noted in order.
+struct Shelf {
+    images: Lock<BTreeMap<ContentId, Vec<u8>>>,
+    paths: Lock<BTreeMap<u32, ContentId>>,
+}
+
+impl Shelf {
+    fn new() -> Shelf {
+        Shelf { images: Lock::new("test.images", BTreeMap::new()), paths: Lock::new("test.paths", BTreeMap::new()) }
+    }
+
+    /// The bytes program `program`'s path names, if placed.
+    fn placed(&self, program: u32) -> Option<Vec<u8>> {
+        let image = *self.paths.lock().get(&program)?;
+        self.images.lock().get(&image).cloned()
+    }
+}
+
+impl Images for Shelf {
+    fn make<A: Allocator>(&self, _: u32, from: Option<ContentId>, to: ContentId, patch: Option<&Patch<A>>) -> Result<(), TaskFailed> {
+        let mut images = self.images.lock();
+        let mut file = match from {
+            None => Vec::new(),
+            Some(from) => images.get(&from).cloned().ok_or(TaskFailed::Refused { what: "an image made from one the store does not hold" })?,
+        };
+        if let Some(patch) = patch {
+            for write in &patch.writes {
+                let (at, from, len) = (write.at as usize, write.from as usize, write.len as usize);
+                if file.len() < at + len {
+                    file.resize(at + len, 0);
+                }
+                file[at..at + len].copy_from_slice(&patch.bytes[from..from + len]);
+            }
+            file.resize(patch.len as usize, 0);
+        }
+        if images.get(&to).is_some_and(|held| *held != file) {
+            return Err(TaskFailed::Refused { what: "an image made again under its key with other bytes" });
+        }
+        images.insert(to, file);
+        Ok(())
+    }
+
+    fn place(&self, program: u32, image: ContentId) -> Result<(), TaskFailed> {
+        if !self.images.lock().contains_key(&image) {
+            return Err(TaskFailed::Refused { what: "a path placed on an image the store does not hold" });
+        }
+        self.paths.lock().insert(program, image);
+        Ok(())
+    }
+}
+
+// --- a whole walk -----------------------------------------------------------------------------
+
+/// The root of the one program: unit 1's `run`.
+fn root() -> StableId {
+    subject(1, "run")
+}
+
+const PROGRAM_SETTINGS: ContentId = ContentId([6; 32]);
+
+fn program_plan(last: Option<Key<ProgramManifest>>) -> ProgramPlan {
+    ProgramPlan { program: ContentId([0x40; 32]), settings: PROGRAM_SETTINGS, namespace: Namespace::LOCAL, last }
+}
+
+/// The plan name of `item`'s instance (no type arguments): the digest of its ask, the item's
+/// subject, as the front end names a plan from its ask.
+fn plan_name(item: StableId) -> ContentId {
+    let mut ask = b"plan".to_vec();
+    ask.extend_from_slice(&item.0.0);
+    record::digest(&ask)
+}
+
+/// The code key of a plan whose description is `describe`: the model's template identity, the
+/// description alone (no callee's key: places are by kind).
+fn code_key(describe: &[u8]) -> Key<CodeRecord> {
+    let mut template = b"template".to_vec();
+    template.extend_from_slice(describe);
+    CodeRecord::key(&CodeRecordInputs { template: record::digest(&template) })
+}
+
+/// The walk of program 0 from [`root`] along every edge, each instance once; code is asked once
+/// every plan is in (a code ask's callees must be): the whole walk every request, which the
+/// walker's contract allows.
+#[derive(Default)]
+struct HostWalk {
+    /// Per plan ask: its item, and its ask bytes (the item's subject).
+    plans: BTreeMap<u32, (StableId, [u8; 32])>,
+    queue: VecDeque<u32>,
+    /// Plan asks not answered yet: code waits for none.
+    pending: u32,
+    /// Per instance planned: its code key and its callees (plan names, sorted, each once).
+    planned: BTreeMap<ContentId, (Key<CodeRecord>, Vec<Key<PlanRecord>>)>,
+    codes: VecDeque<ContentId>,
+    code_of: BTreeMap<u32, ContentId>,
+    asked: Vec<StableId>,
+    rows: BTreeMap<ContentId, (Key<PlanRecord>, Option<Key<CodeRecord>>)>,
+    kept: Vec<ContentId>,
+    next: u32,
+    out: Vec<Row>,
+    gone: Vec<Key<PlanRecord>>,
+}
+
+const NOT_ASKED: TaskFailed = TaskFailed::Refused { what: "the host walk was answered an ask it did not make" };
+
+impl HostWalk {
+    fn ask_plan(&mut self, item: StableId) {
+        if self.asked.contains(&item) {
+            return;
+        }
+        self.asked.push(item);
+        let ask = self.next;
+        self.next += 1;
+        self.plans.insert(ask, (item, item.0.0));
+        self.queue.push_back(ask);
+        self.pending += 1;
+    }
+}
+
+impl Walker for HostWalk {
+    fn begin(&mut self, program: u32, kept: Kept<'_>, _moved: &[Key<PlanRecord>], _units: &[Key<UnitManifest>]) -> Result<(), TaskFailed> {
+        if program != 0 {
+            return Err(NOT_ASKED);
+        }
+        *self = HostWalk::default();
+        self.kept = kept.rows.iter().map(|row| row.instance).collect();
+        self.ask_plan(root());
+        Ok(())
+    }
+
+    fn ask(&mut self, _program: u32) -> Option<WalkAsk<'_>> {
+        if let Some(ask) = self.queue.pop_front() {
+            let (item, bytes) = self.plans.get(&ask)?;
+            return Some(WalkAsk::Plan { ask, instance: Key::from_id(plan_name(*item)), bytes: Some(&bytes[..]), body: Some(*item) });
+        }
+        if self.pending > 0 {
+            return None;
+        }
+        let instance = self.codes.pop_front()?;
+        let ask = self.next;
+        self.next += 1;
+        self.code_of.insert(ask, instance);
+        let (key, callees) = self.planned.get(&instance)?;
+        Some(WalkAsk::Code { ask, instance: Key::from_id(instance), key: *key, tier: 0, callees, statics: &[], spans: &[] })
+    }
+
+    fn planned(&mut self, _program: u32, ask: u32, plan: Planned<'_>) -> Result<(), TaskFailed> {
+        let (item, _) = *self.plans.get(&ask).ok_or(NOT_ASKED)?;
+        if plan.instance.id() != plan_name(item) {
+            return Err(TaskFailed::Refused { what: "a plan answered with another instance than its ask's" });
+        }
+        let payload = Aligned::copy_from(plan.payload);
+        let view = record::read_plan_payload(&payload).map_err(|_| TaskFailed::Refused { what: "a plan payload that does not open" })?;
+        let mut callees: Vec<Key<PlanRecord>> = view.edges.iter().map(|edge| Key::from_id(plan_name(StableId(edge.item)))).collect();
+        callees.sort_unstable_by_key(|key| key.id());
+        callees.dedup();
+        self.pending -= 1;
+        self.rows.insert(plan.instance.id(), (plan.instance, None));
+        self.planned.insert(plan.instance.id(), (code_key(view.describe), callees));
+        self.codes.push_back(plan.instance.id());
+        for edge in view.edges {
+            self.ask_plan(StableId(edge.item));
+        }
+        Ok(())
+    }
+
+    fn coded(&mut self, _program: u32, ask: u32, code: Key<CodeRecord>) -> Result<(), TaskFailed> {
+        let instance = self.code_of.remove(&ask).ok_or(NOT_ASKED)?;
+        self.rows.get_mut(&instance).ok_or(NOT_ASKED)?.1 = Some(code);
+        Ok(())
+    }
+
+    fn end(&mut self, _program: u32) -> Result<WalkEnd<'_>, TaskFailed> {
+        let rows: Option<Vec<Row>> = self.rows.values().map(|&(instance, code)| code.map(|code| Row { instance, code })).collect();
+        self.out = rows.ok_or(TaskFailed::Refused { what: "a walk ended with a row with no code" })?;
+        let gone: Vec<Key<PlanRecord>> = self.kept.iter().filter(|id| !self.rows.contains_key(*id)).map(|id| Key::from_id(*id)).collect();
+        self.gone = gone;
+        Ok(WalkEnd { rows: &self.out, gone: &self.gone })
     }
 }
 
@@ -357,6 +700,10 @@ struct Asked {
     manifests: Vec<Option<Key<UnitManifest>>>,
     /// (unit, item, kind, key) of every record proved.
     records: Vec<(u32, StableId, Tag, ContentId)>,
+    /// Each program's kept manifest, filed or certified.
+    programs: Vec<Option<Key<ProgramManifest>>>,
+    /// How many failures the request's end carries.
+    failures: usize,
     store_error: Option<StoreError>,
 }
 
@@ -391,14 +738,18 @@ impl Bench {
 }
 
 /// One request of `front`'s world against `store` under memo `memo`, its units' files written
-/// first under `src`.
+/// first under `src`; with `programs`, also building them by a [`HostWalk`], their images and
+/// paths in `images`.
+#[expect(clippy::too_many_arguments, reason = "the request's parts, each its own borrow")]
 fn ask_with<S: Store, M: Memo>(
     src: &Path,
     store: &S,
     front: &Scripted,
+    images: &Shelf,
     memo: &mut M,
     base: u8,
     last: &[Option<Key<UnitManifest>>],
+    programs: &[ProgramPlan],
 ) -> Result<Asked, HostError> {
     let texts: Vec<Vec<u8>> = (0..2).map(|unit| front.world.text(unit)).collect();
     for (unit, text) in texts.iter().enumerate() {
@@ -413,13 +764,20 @@ fn ask_with<S: Store, M: Memo>(
             last: last.get(unit as usize).copied().flatten(),
             namespace: Namespace::LOCAL,
             owner: owner(unit),
+            bodies: Bodies::Asked,
         })
         .collect();
     let plan = Plan { certificate: certificate(base), namespace: Namespace::LOCAL, units: &units };
-    let request = Request { plan, reads: &reads, then: &then, late: &[], leaves: Leaves::NONE, stall: Duration::from_secs(60) };
+    // No unit reads a late input: one empty table per unit.
+    let late: [&[Fact]; 2] = [&[], &[]];
+    let request = Request { plan, reads: &reads, then: &then, late: &late, leaves: Leaves::NONE, stall: Duration::from_secs(60) };
     let files = Disk::new(src);
     proof::scope(|snap| {
-        let answered = run(snap, &request, store, front, memo, &files, MACHINE)?;
+        let answered = if programs.is_empty() {
+            run(snap, &request, None, store, front, memo, &files, MACHINE)?
+        } else {
+            run_programs(snap, &request, None, programs, HostWalk::default(), store, front, memo, &files, images, MACHINE)?
+        };
         let mut records = Vec::new();
         for (unit, proved) in answered.units.iter().enumerate() {
             for (item, holds) in &proved.records {
@@ -432,13 +790,15 @@ fn ask_with<S: Store, M: Memo>(
             certified: answered.certified.is_some(),
             manifests: answered.manifests.iter().copied().collect(),
             records,
+            programs: answered.programs.iter().copied().collect(),
+            failures: answered.failures.len(),
             store_error: answered.store_error,
         })
     })
 }
 
 fn ask<S: Store>(src: &Path, store: &S, front: &Scripted, base: u8, last: &[Option<Key<UnitManifest>>]) -> Result<Asked, HostError> {
-    ask_with(src, store, front, &mut RecordsOnly, base, last)
+    ask_with(src, store, front, &Shelf::new(), &mut RecordsOnly, base, last, &[])
 }
 
 /// The bytes the store holds for a record proved, by its kind's layout.
@@ -652,7 +1012,7 @@ fn an_audit_redoes_every_hit_and_finds_no_difference() {
     for (state, base, what) in states {
         let front = Scripted::new(state);
         let last_of = if base == 6 { Vec::new() } else { last.clone() };
-        let asked = ask_with(&bench.src(), &store, &front, &mut Audit, base, &last_of).expect("the audited request runs");
+        let asked = ask_with(&bench.src(), &store, &front, &Shelf::new(), &mut Audit, base, &last_of, &[]).expect("the audited request runs");
         match &asked.outcome {
             Outcome::Built { .. } => {}
             other => panic!("{what}: an audited request ended {other:?}"),
@@ -669,21 +1029,25 @@ fn an_audit_redoes_every_hit_and_finds_no_difference() {
 
     let bench = Bench::new("blaze-host-audit-control");
     let store = bench.store();
+    // One counting front for every request: its count goes on from one request to the next, so
+    // each body it makes again holds other bytes than the record found, whatever order the pool
+    // runs the tasks in. A fresh front per request restarted the count, and the difference then
+    // hung on the pool running the bodies in another order than the cold request did: a run
+    // that kept the order was not caught (round 26).
     let mut counting = Scripted::new(world());
     counting.counts = true;
     let cold = ask(&bench.src(), &store, &counting, 5, &[]).expect("the counting cold request runs");
     cold.built();
-    let mut counting = Scripted::new(world());
-    counting.counts = true;
-    let asked = ask_with(&bench.src(), &store, &counting, &mut Audit, 5, &cold.manifests).expect("the audited request runs");
+    let asked =
+        ask_with(&bench.src(), &store, &counting, &Shelf::new(), &mut Audit, 5, &cold.manifests, &[]).expect("the audited request runs");
     assert!(
         matches!(asked.outcome, Outcome::Failed { why: Failure::Audit { .. }, .. }),
         "a front end that is not deterministic is caught by the audit: {:?}",
         asked.outcome
     );
-    let mut counting = Scripted::new(world());
-    counting.counts = true;
+    let before = counting.calls();
     let trusted = ask(&bench.src(), &store, &counting, 5, &cold.manifests).expect("the unaudited request runs");
+    assert_eq!(counting.calls(), before, "records only asks nothing of the front end");
     assert!(matches!(trusted.outcome, Outcome::Certified { .. }), "records only trusts the hit: {:?}", trusted.outcome);
 }
 
@@ -735,6 +1099,73 @@ fn a_failed_store_sync_is_reported() {
     let asked = ask(&control.src(), &working, &Scripted::new(world()), 5, &[]).expect("the control runs");
     asked.built();
     assert_eq!(asked.store_error, None);
+}
+
+/// One request with the program rooted at `u1::run`, against the last request's records, its
+/// images and path in `images`.
+fn ask_program<S: Store>(
+    src: &Path,
+    store: &S,
+    front: &Scripted,
+    images: &Shelf,
+    last: &[Option<Key<UnitManifest>>],
+    program: Option<Key<ProgramManifest>>,
+) -> Result<Asked, HostError> {
+    ask_with(src, store, front, images, &mut RecordsOnly, 5, last, &[program_plan(program)])
+}
+
+/// The claim: on the real store and pool, a cold request with one program plans, codes and
+/// links what `run` reaches (`run`, `a`, `new`: three plans, three codes, one link step) and
+/// files its kept manifest; the same request again is certified with no task. An edit of `a`'s
+/// body redoes that body, the one plan that read it, its code and one link step given one row.
+/// The control: an edit of `b`'s body, which the program does not reach, runs its body and no
+/// plan, no code and no link step, and the program's kept manifest stands: what reached the
+/// link step was the plan that read the edited body.
+#[test]
+fn a_program_builds_from_records_and_a_body_edit_relinks_one_row() {
+    let bench = Bench::new("blaze-host-program");
+    let store = bench.store();
+    let shelf = Shelf::new();
+    let path = |shelf: &Shelf| shelf.paths.lock().get(&0).copied();
+    let front = Scripted::new(world());
+    let cold = ask_program(&bench.src(), &store, &front, &shelf, &[], None).expect("the cold request runs");
+    let ran = cold.built();
+    assert_eq!((ran.plans, ran.codes, ran.links), (3, 3, 1));
+    assert_eq!(front.ran("plan"), ["plan u0::a", "plan u0::new", "plan u1::run"]);
+    assert_eq!(front.ran("link"), ["link p0 3"], "the cold link step is given every row as come");
+    assert_eq!(cold.failures, 0);
+    let kept = cold.programs[0].expect("the program's kept manifest is filed");
+    assert!(store.read::<ProgramManifest, _>(&kept, Global).expect("a kept manifest is read").is_some(), "the kept manifest is in the store");
+    assert_eq!(path(&shelf), Some(kept.id()), "the path names the image filed under the kept manifest's key");
+    assert_eq!(shelf.placed(0).map(|image| image.len()), Some(b"image".len() + 3 * 64), "the image is of the three rows");
+
+    // The path gone (a user's delete): the certified answer places it again, with no task.
+    shelf.paths.lock().remove(&0);
+    let again = Scripted::new(world());
+    let noop = ask_program(&bench.src(), &store, &again, &shelf, &cold.manifests, Some(kept)).expect("the same request runs");
+    assert!(matches!(noop.outcome, Outcome::Certified { .. }), "the same request is certified: {:?}", noop.outcome);
+    assert_eq!(again.calls(), 0, "nothing of the front end is asked");
+    assert_eq!(noop.programs, cold.programs, "the certificate names the kept manifest the cold request filed");
+    assert_eq!(path(&shelf), Some(kept.id()), "a certified answer places the path it certified");
+
+    let edited = Scripted::new(world().body(0, "a"));
+    let asked = ask_program(&bench.src(), &store, &edited, &shelf, &cold.manifests, Some(kept)).expect("the edited request runs");
+    let ran = asked.built();
+    assert_eq!(edited.ran("body"), ["body u0::a"]);
+    assert_eq!(edited.ran("plan"), ["plan u0::a"], "only the plan that read the edited body");
+    assert_eq!((ran.plans, ran.codes, ran.links), (1, 1, 1));
+    assert_eq!(edited.ran("link"), ["link p0 1"], "the link step is given the one row that moved");
+    assert_ne!(asked.programs, cold.programs, "the kept manifest moved with its row");
+    assert_eq!(path(&shelf), asked.programs[0].map(|key| key.id()), "the path names the new kept manifest's image");
+
+    let control = Scripted::new(world().body(0, "b"));
+    let asked = ask_program(&bench.src(), &store, &control, &shelf, &cold.manifests, Some(kept)).expect("the control request runs");
+    let ran = asked.built();
+    assert_eq!(control.ran("body"), ["body u0::b"]);
+    assert_eq!((ran.plans, ran.codes, ran.links), (0, 0, 0));
+    assert!(control.ran("plan").is_empty() && control.ran("link").is_empty());
+    assert_eq!(asked.programs, cold.programs, "the kept manifest stands");
+    assert_eq!(path(&shelf), Some(kept.id()), "with no link step the path is placed back on the kept manifest's image");
 }
 
 #[derive(Clone, Copy, Debug)]

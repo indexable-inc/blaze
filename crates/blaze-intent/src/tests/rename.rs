@@ -128,27 +128,28 @@ fn check(edits: &[Edit], after: &BTreeMap<String, String>) -> (TestDB, Applied) 
         assert_fresh(&seed.parse, text);
     }
     // The commit, in a front end of the same files (`db` stays the view as it was, which the
-    // items' keys are of): in one write, the new texts set, then each seed handed over before
-    // the write's maintainers parse the files, and each file's parse is the seed's own tree.
+    // items' keys are of): in one edit, the new texts set and committed, then each seed handed
+    // to the snapshot that commit made before anything parses the files there, and each file's
+    // parse is the seed's own tree.
     let (mut next, files) = self::view(GRAPH, &PATHS);
     let seeds: Vec<_> = made.seeds().collect();
-    next.batch(base_db::Trigger::named("the test's edit and seeds"), |next| {
-        for seed in &seeds {
-            let path = view.path(seed.file).expect("a seed names a file of the view");
-            assert_eq!(files.path(seed.file), Some(path), "the same file in the next front end");
-            next.set_file_text(seed.file, &after[path]);
-        }
-        for seed in &seeds {
-            let id = EditionedFileId::new(next, seed.file, seed.edition);
-            let input = next.file_text(seed.file);
-            assert_eq!(input.content(next), seed.content, "the seed is of the file's text as set");
-            assert!(
-                seed.parse.root().text() == input.text(next).as_str(),
-                "the seed's tree is of the file's text"
-            );
-            assert!(id.seed_parse(next, seed.content, &seed.parse), "the front end takes the seed");
-        }
-    });
+    let mut edit = next.edit();
+    for seed in &seeds {
+        let path = view.path(seed.file).expect("a seed names a file of the view");
+        assert_eq!(files.path(seed.file), Some(path), "the same file in the next front end");
+        edit.set_file_text(seed.file, &after[path]);
+    }
+    _ = edit.commit();
+    for seed in &seeds {
+        let id = EditionedFileId::new(&next, seed.file, seed.edition);
+        let input = next.file_text(seed.file);
+        assert_eq!(input.content(&next), seed.content, "the seed is of the file's text as set");
+        assert!(
+            seed.parse.root().text() == input.text(&next).as_str(),
+            "the seed's tree is of the file's text"
+        );
+        assert!(id.seed_parse(&next, seed.content, &seed.parse), "the front end takes the seed");
+    }
     for seed in &seeds {
         let id = EditionedFileId::new(&next, seed.file, seed.edition);
         assert!(

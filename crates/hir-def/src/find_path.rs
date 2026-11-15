@@ -13,7 +13,7 @@ use std::{
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashSet;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id;
 use hir_expand::{
     Lookup,
     mod_path::{ModPath, PathKind},
@@ -118,14 +118,14 @@ pub fn find_path_with<'db>(
 /// allocates only while it grows.
 pub struct FindPathScratch {
     /// `(item, module)` pairs the local searches on the current stack have looked at, the module
-    /// as its `blaze_query::db::Id`. Empty between top-level searches: each local search removes what it
-    /// added.
-    visited: HashSet<(ItemInNs, blaze_query::db::Id), Global>,
+    /// as its [`blaze_memo::Gid`]. Empty between top-level searches: each local search removes
+    /// what it added.
+    visited: HashSet<(ItemInNs, blaze_memo::Gid), Global>,
     /// The segments of every candidate of the call, each linked to the one before it, so a
     /// candidate extended by a name shares its prefix instead of copying it.
     segments: Vec<Segment>,
     /// Worklists of [`find_local_import_locations`], one per depth of its recursion.
-    worklists: Vec<Vec<(blaze_query::db::Id, bool)>>,
+    worklists: Vec<Vec<(blaze_memo::Gid, bool)>>,
 }
 
 impl Default for FindPathScratch {
@@ -747,7 +747,7 @@ fn find_local_import_locations<'db>(
             .values()
             .copied()
             .chain(iter::successors(ctx.from.containing_module(db), |m| m.containing_module(db)))
-            .map(|it| (it.as_id(), false)),
+            .map(|it| (it.gid(), false)),
     );
 
     let def_map =
@@ -764,7 +764,7 @@ fn find_local_import_locations<'db>(
         *processed = true;
         // Every id in the scratch was made from `db` during this call: the scratch is empty
         // between calls (`reset`, and each local search removes what it added).
-        let module = ModuleIdLt::<'db>::from_id(id);
+        let module = ModuleIdLt::<'db>::from_gid(id);
         let data = if module.block(db).is_some() {
             // Re-query the block's DefMap
             block_def_map = module.def_map(db);
@@ -807,12 +807,12 @@ fn find_local_import_locations<'db>(
                 // current crate
                 continue;
             }
-            if st.visited.contains(&(item, module.as_id())) {
+            if st.visited.contains(&(item, module.gid())) {
                 continue;
             }
 
             if vis.is_visible_from(db, ctx.from) {
-                worklist.push((module.as_id(), false));
+                worklist.push((module.gid(), false));
             }
         }
     }
@@ -867,9 +867,11 @@ pub(crate) mod tests {
         )]
         let span_map =
             std::cell::LazyCell::new(|| hir_expand::HirFileId::from(pos.file_id).span_map(&db));
-        let mod_path =
-            ModPath::from_src_view(&db, ast_path, &mut |range| span_map.span_for_range(range).ctx)
-                .unwrap();
+        let arena = hir_expand::HirFileId::from(pos.file_id).context_arena();
+        let mod_path = ModPath::from_src_view(&db, arena, ast_path, &mut |range| {
+            span_map.span_for_range(range).ctx
+        })
+        .unwrap();
 
         let (def_map, local_def_map) = module.local_def_map(&db);
         let resolved = def_map

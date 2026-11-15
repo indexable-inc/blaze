@@ -104,7 +104,8 @@ pub(crate) fn resolve<'db>(
     name: &str,
 ) -> Resolution {
     let used = ctxt(cx, node.file_id, node.value.text_range());
-    let used_hygiene = used.opaque_and_semiopaque(cx.db);
+    let used_hygiene =
+        used.opaque_and_semiopaque(cx.db, crate::cx::context_arena(node.file_id));
     let mut similar: Option<Similar> = None;
     let mut reachable = true;
     for (it, child) in edges(cx, node) {
@@ -125,7 +126,10 @@ pub(crate) fn resolve<'db>(
         let range = lifetime.syntax().text_range();
         let at = it.with_value(range);
         let ctxt = ctxt(cx, it.file_id, range);
-        if same && ctxt.opaque_and_semiopaque(cx.db) == used_hygiene {
+        if same
+            && ctxt.opaque_and_semiopaque(cx.db, crate::cx::context_arena(it.file_id))
+                == used_hygiene
+        {
             return match reachable {
                 true => Resolution::Found,
                 false => Resolution::Unreachable { defined: at, similar },

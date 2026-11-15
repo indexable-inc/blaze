@@ -66,7 +66,7 @@ pub const EXPANDED: u8 = 0xFF;
 /// The key of `call`'s expansion, or `None` where the expansion reads something the key does
 /// not name (the module's doc). A query of its own so each expansion around a call is hashed
 /// once a revision.
-#[blaze_query::tracked(returns(copy), mem_tag = Expand)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Expand)]
 pub fn key(db: &Db, call: MacroCallId) -> Option<ContentId> {
     let loc = call.loc(db);
     let mut hasher = Hasher::new(DOMAIN);

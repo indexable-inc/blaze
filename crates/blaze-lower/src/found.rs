@@ -179,7 +179,7 @@ pub(crate) struct Said<'a> {
     pub(crate) passed_dir: &'a str,
     /// Whether the crate's root is an alias of the file (a module is appended to it).
     pub(crate) aliased: bool,
-    /// Whether its package is a library's (its inputs' durability).
+    /// Whether its package is a library's (whether its arena may be sealed).
     pub(crate) library: bool,
     pub(crate) edition: Edition,
     pub(crate) origin: &'a CrateOrigin,

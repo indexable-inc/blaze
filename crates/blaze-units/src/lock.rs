@@ -343,11 +343,22 @@ impl BlazeLock {
     }
 }
 
-/// A package as a move names it: its name, and its source unless that is crates.io.
-fn package(id: PackageId) -> String {
-    match id.source_id().is_crates_io() {
-        true => id.name().to_string(),
-        false => format!("{} ({})", id.name(), id.source_id().without_precise()),
+/// A package as a move names it: its name, and its source unless that is crates.io. Written
+/// when printed, into the caller's text.
+fn package(id: PackageId) -> MoveName {
+    MoveName(id)
+}
+
+/// [`package`]'s text.
+struct MoveName(PackageId);
+
+impl std::fmt::Display for MoveName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = self.0;
+        match id.source_id().is_crates_io() {
+            true => write!(f, "{}", id.name()),
+            false => write!(f, "{} ({})", id.name(), id.source_id().without_precise()),
+        }
     }
 }
 
@@ -530,11 +541,21 @@ pub fn pin_moves(old: Option<&BlazeLock>, new: &BlazeLock) -> Vec<String> {
     lines
 }
 
-/// A publish time to the minute: `2026-11-04T10:12Z` of `2026-11-04T10:12:00Z`.
-fn minute(time: &str) -> String {
-    match time.get(..16) {
-        Some(head) if time.len() == 20 => format!("{head}Z"),
-        _ => time.to_owned(),
+/// A publish time to the minute: `2026-11-04T10:12Z` of `2026-11-04T10:12:00Z`. Written when
+/// printed, into the caller's text.
+fn minute(time: &str) -> Minute<'_> {
+    Minute(time)
+}
+
+/// [`minute`]'s text.
+struct Minute<'a>(&'a str);
+
+impl std::fmt::Display for Minute<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.get(..16) {
+            Some(head) if self.0.len() == 20 => write!(f, "{head}Z"),
+            _ => f.write_str(self.0),
+        }
     }
 }
 

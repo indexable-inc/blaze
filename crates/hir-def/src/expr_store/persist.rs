@@ -30,7 +30,7 @@ use blaze_format::{
     FormatError, Part, Persist, Record, SchemaHash, Slice, Str, Writer, open_as, schema_of,
 };
 use blaze_hash::HashMap;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id;
 use hir_expand::{
     MacroCallId, MacroCallStyles, MacroDefId, MacroDefKind,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
@@ -46,7 +46,7 @@ use span::Edition;
 use std::alloc::Global;
 
 use crate::{
-    AdtId, BlockId, ConstId, EnumId, EnumVariantId, FunctionId, GenericDefId, ImplId,
+    AdtId, AssocItemId, BlockId, ConstId, EnumId, EnumVariantId, FunctionId, GenericDefId, ImplId,
     LifetimeParamId, Macro2Id, MacroId, MacroRulesId, ProcMacroId, StaticId, StructId, TraitId,
     TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
@@ -66,7 +66,8 @@ use crate::{
         col::{Col, SlabLayout, SlabWriter},
         columns::{self, Frozen, HirColumns},
         persist::{
-            Code, Column, Node, Placed, Read, Words, WordsRec, id_of_bits, syntax_context,
+            Code, Column, Node, Placed, Read, Words, WordsRec, decode_session_id, session_word, session_id,
+            syntax_context,
         },
     },
     lang_item::LangItemTarget,
@@ -277,8 +278,8 @@ fn idx<T>(raw: u32) -> Idx<T> {
     Idx::from_raw(RawIdx::from_u32(raw))
 }
 
-fn bits(id: impl AsId + Copy) -> u64 {
-    u64::from(id.as_id().as_u32())
+fn bits(id: impl Id) -> u64 {
+    session_word(id.gid())
 }
 
 /// Where `value`, which is in `buffer`, is from the buffer's start.
@@ -1177,10 +1178,10 @@ impl<'a> ExpressionStoreRef<'a> {
             )?;
         }
         for block in self.block_scopes {
-            blaze_query::db::Id::decode(*block, at_of(block, buffer), "a block scope's id")?;
+            decode_session_id(*block, at_of(block, buffer), "a block scope's id")?;
         }
         for call in self.macro_calls {
-            blaze_query::db::Id::decode(*call, at_of(call, buffer), "a macro call's id")?;
+            decode_session_id(*call, at_of(call, buffer), "a macro call's id")?;
         }
         ascending(self.ident_hygiene, |it| it.a, buffer, "ident hygiene out of order")?;
         for pair in self.ident_hygiene {
@@ -1318,8 +1319,8 @@ impl<'a> ExpressionStoreRef<'a> {
     /// The blocks of the store that may hold items, as [`ExpressionStore::blocks`] walks them.
     pub fn block_scopes(self) -> impl Iterator<Item = BlockId> + 'a {
         (self.block_scopes.iter())
-            .filter_map(|&block| id_of_bits(block))
-            .map(<BlockId as FromId>::from_id)
+            .filter_map(|&block| session_id(block))
+            .map(<BlockId as Id>::from_gid)
     }
 
     /// As [`ExpressionStore::inherits_overflow_checks`].
@@ -1564,7 +1565,7 @@ impl<'a> ExpressionStoreRef<'a> {
         });
         let macro_calls = (self.macro_calls.iter())
             .map(|&call| {
-                <MacroCallId as FromId>::from_id(id_of_bits(call).expect("checked when read"))
+                <MacroCallId as Id>::from_gid(session_id(call).expect("checked when read"))
             })
             // alloc: the decode's one copy of the column.
             .collect();
@@ -1973,6 +1974,7 @@ sum_codes! {
         6 => TypeAliasId,
     }
     MacroId { 0 => Macro2Id, 1 => MacroRulesId, 2 => ProcMacroId }
+    AssocItemId { 0 => FunctionId, 1 => ConstId, 2 => TypeAliasId }
     LangItemTarget {
         0 => EnumId,
         1 => FunctionId,

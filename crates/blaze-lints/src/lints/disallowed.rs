@@ -19,6 +19,7 @@ use blaze_diagnostics::model::Applicability;
 use blaze_hash::HashMap;
 use blaze_intent::retarget::{Names, Retarget};
 use hir::{ModuleDef, PathResolution};
+use intern::{Interned, Symbol};
 use std::alloc::Global;
 use syntax::{
     SyntaxKind, TextRange, TextSize,
@@ -30,57 +31,81 @@ use crate::{
     blaze,
     check::Cx,
     conf::{Conf, Disallowed, Kind},
+    kept,
 };
 
-/// The configuration a crate's entries are resolved under.
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+/// The configuration a crate's entries are resolved under: a key of [`disallowed_defs`],
+/// homed in the session's arena (it names no crate). The configuration is interned for the
+/// process ([`Interned`]), as a key owns nothing to drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct ConfKey {
-    #[returns(ref)]
-    pub(crate) conf: Conf,
+    #[home(skip)]
+    conf: Interned<Conf>,
 }
 
-/// An entry, as the crate resolves it.
-#[derive(Debug, PartialEq, Eq)]
+impl ConfKey {
+    pub(crate) fn new(_db: &base_db::Db, conf: Conf) -> ConfKey {
+        ConfKey { conf: Interned::new(conf) }
+    }
+
+    pub(crate) fn conf(&self, _db: &base_db::Db) -> &Conf {
+        &self.conf
+    }
+}
+
+/// An entry, as the crate resolves it. Kept in the query's arena: the configured entry is
+/// interned for the process ([`Interned`]), as a value owns nothing to drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
     pub(crate) kind: Kind,
-    pub(crate) entry: Disallowed,
+    pub(crate) entry: Interned<Disallowed>,
     /// The blaze lint it reports under, for `lint = "blaze::.."`.
     pub(crate) blaze: Option<blaze::Lint>,
     /// What `replacement` resolves to, when it is a path that does.
     pub(crate) replacement: Option<ModuleDef>,
 }
 
-/// A crate's entries, resolved.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Resolved {
-    pub(crate) entries: Box<[Entry]>,
+intern::impl_internable!(Disallowed);
+
+/// A crate's entries, resolved: kept in the query's arena ([`crate::kept`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Resolved<'db> {
+    pub(crate) entries: &'db [Entry],
     /// Each item an entry names, with the entry's index.
-    pub(crate) by_def: HashMap<ModuleDef, u32, Global>,
+    pub(crate) by_def: kept::Map<'db, ModuleDef, u32>,
     /// What of the configuration is wrong for the crate, in the order of its entries: a path
-    /// that resolves to nothing, or to an item of another kind than its list's.
-    pub(crate) errors: Box<[String]>,
+    /// that resolves to nothing, or to an item of another kind than its list's. Interned for
+    /// the process, as a value owns nothing to drop.
+    pub(crate) errors: &'db [Symbol],
     /// The `one-at-a-time` entries, resolved here with the rest of the crate's configured
     /// paths, once per crate and configuration.
-    pub(crate) one_at_a_time: OneAtATime,
+    pub(crate) one_at_a_time: OneAtATime<'db>,
 }
 
+intern::impl_internable!(crate::conf::OneAtATime);
+
 /// `one-at-a-time`'s entries ([`crate::conf::OneAtATime`]) as the crate resolves them, for
-/// `blaze::one_at_a_time`.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct OneAtATime {
-    pub(crate) entries: Box<[crate::conf::OneAtATime], Global>,
+/// `blaze::one_at_a_time`. Kept in the query's arena like [`Resolved`]: each entry interned for
+/// the process ([`Interned`]) and each error a [`Symbol`], as a value owns nothing to drop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OneAtATime<'db> {
+    pub(crate) entries: &'db [Interned<crate::conf::OneAtATime>],
     /// Each function an entry names, with the entry's index: a trait's method as the trait
     /// declares it (an implementation's call is matched through it).
-    pub(crate) by_fn: HashMap<hir::Function, u32, Global>,
+    pub(crate) by_fn: kept::Map<'db, hir::Function, u32>,
     /// An entry whose first segment names a crate this one reaches, and whose path names no
     /// function there. An entry of a crate this one does not depend on is no error: nothing
     /// here can call it.
-    pub(crate) errors: Box<[String], Global>,
+    pub(crate) errors: &'db [Symbol],
 }
 
-impl OneAtATime {
+impl<'db> OneAtATime<'db> {
     /// The entry naming `f`, or the trait method `f` implements.
-    pub(crate) fn of(&self, db: &base_db::Db, f: hir::Function) -> Option<&crate::conf::OneAtATime> {
+    pub(crate) fn of(
+        &self,
+        db: &base_db::Db,
+        f: hir::Function,
+    ) -> Option<&'db crate::conf::OneAtATime> {
         use hir::AsAssocItem as _;
         let at = self.by_fn.get(&f).copied().or_else(|| {
             let trait_ = f.as_assoc_item(db)?.implemented_trait(db)?;
@@ -91,12 +116,13 @@ impl OneAtATime {
             })?;
             self.by_fn.get(&declared).copied()
         })?;
-        Some(&self.entries[at as usize])
+        let entries = self.entries;
+        Some(&*entries[at as usize])
     }
 
-    /// The entries of `conf` as `krate` names their paths.
-    fn of_conf(db: &base_db::Db, krate: hir::Crate, conf: &Conf) -> OneAtATime {
-        let mut errors = Vec::new_in(Global);
+    /// The entries of `conf` as `krate` names their paths, kept in the current run's arena.
+    fn of_conf(db: &'db base_db::Db, krate: hir::Crate, conf: &Conf) -> OneAtATime<'db> {
+        let mut errors: Vec<String, Global> = Vec::new_in(Global);
         let entries = match conf.one_at_a_time(Global) {
             Ok(entries) => entries,
             Err(error) => {
@@ -104,7 +130,7 @@ impl OneAtATime {
                 Vec::new_in(Global)
             }
         };
-        let mut by_fn = HashMap::new_in(Global);
+        let mut by_fn: HashMap<hir::Function, u32, Global> = HashMap::new_in(Global);
         for (at, entry) in entries.iter().enumerate() {
             let mut fns: Vec<hir::Function, Global> = Vec::new_in(Global);
             fns.extend(resolve(db, krate, &entry.path).into_iter().filter_map(|it| match it {
@@ -124,13 +150,18 @@ impl OneAtATime {
                 by_fn.entry(f).or_insert(at as u32);
             }
         }
-        OneAtATime { entries: entries.into_boxed_slice(), by_fn, errors: errors.into_boxed_slice() }
+        OneAtATime {
+            entries: kept::slice(db, entries.into_iter().map(Interned::new)),
+            by_fn: kept::Map::keep(db, by_fn),
+            errors: kept::slice(db, errors.iter().map(|it| Symbol::intern(it))),
+        }
     }
 }
 
-impl Resolved {
-    pub(crate) fn of(&self, def: ModuleDef) -> Option<&Entry> {
-        self.by_def.get(&def).map(|&at| &self.entries[at as usize])
+impl<'db> Resolved<'db> {
+    pub(crate) fn of(&self, def: ModuleDef) -> Option<&'db Entry> {
+        let entries = self.entries;
+        self.by_def.get(&def).map(|&at| &entries[at as usize])
     }
 }
 
@@ -167,13 +198,17 @@ const ABORT_REASON: &str = "`abort` runs no destructor and flushes nothing, and 
 
 /// The `disallowed-*` entries of `key`'s configuration, resolved as `krate` names their paths:
 /// once per crate and configuration.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: ConfKey) -> Resolved {
+#[blaze_memo::tracked(returns(ref))]
+pub(crate) fn disallowed_defs<'db>(
+    db: &'db base_db::Db,
+    krate: base_db::Crate,
+    key: ConfKey,
+) -> Resolved<'db> {
     let krate = hir::Crate::from(krate);
     let conf = key.conf(db);
-    let mut resolved = Resolved::default();
-    let mut entries = Vec::new();
-    let mut errors = Vec::new();
+    let mut by_def: HashMap<ModuleDef, u32, Global> = HashMap::new_in(Global);
+    let mut entries: Vec<Entry, Global> = Vec::new_in(Global);
+    let mut errors: Vec<String, Global> = Vec::new_in(Global);
     for kind in Kind::ALL {
         let list = match conf.disallowed(kind) {
             Ok(list) => list,
@@ -221,9 +256,9 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
                 });
             let at = entries.len() as u32;
             for def in defs {
-                resolved.by_def.entry(def).or_insert(at);
+                by_def.entry(def).or_insert(at);
             }
-            entries.push(Entry { kind, entry, blaze, replacement });
+            entries.push(Entry { kind, entry: Interned::new(entry), blaze, replacement });
         }
     }
     for (path, lint, reason) in BUILT_IN {
@@ -234,7 +269,7 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
         }
         let at = entries.len() as u32;
         for def in defs {
-            resolved.by_def.entry(def).or_insert(at);
+            by_def.entry(def).or_insert(at);
         }
         let entry = Disallowed {
             path: path.to_owned(),
@@ -242,12 +277,19 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
             lint: Some(format!("blaze::{}", lint.name())),
             ..Disallowed::default()
         };
-        entries.push(Entry { kind: Kind::Methods, entry, blaze: Some(lint), replacement: None });
+        entries.push(Entry {
+            kind: Kind::Methods,
+            entry: Interned::new(entry),
+            blaze: Some(lint),
+            replacement: None,
+        });
     }
-    resolved.entries = entries.into_boxed_slice();
-    resolved.errors = errors.into_boxed_slice();
-    resolved.one_at_a_time = OneAtATime::of_conf(db, krate, conf);
-    resolved
+    Resolved {
+        entries: kept::slice(db, entries),
+        by_def: kept::Map::keep(db, by_def),
+        errors: kept::slice(db, errors.iter().map(|it| Symbol::intern(it))),
+        one_at_a_time: OneAtATime::of_conf(db, krate, conf),
+    }
 }
 
 const fn kind_name(kind: Kind) -> &'static str {
@@ -385,7 +427,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         return;
     }
     if node == cx.root() && cx.in_file() && cx.analysis().is_none() && is_crate_root(cx, node) {
-        for error in &resolved.errors {
+        for error in resolved.errors {
             let span = cx.span(TextRange::empty(TextSize::new(0)));
             let lint = Implemented::DisallowedTypes;
             if cx.on(lint) {
@@ -411,7 +453,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
 /// paths are tokens of its attribute, no path node, so their findings are made here from what
 /// the derives resolve to. A qualified one (`serde::Serialize`) is rewritten where it is
 /// written; a bare one names the macro through a `use`, whose finding and fix are the `use`'s.
-fn check_derive<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, attr: ast::Attr<'t>) {
+fn check_derive<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved<'_>, attr: ast::Attr<'t>) {
     if attr.simple_name() != Some("derive") || !cx.in_file() || cx.analysis().is_some() {
         return;
     }
@@ -586,7 +628,7 @@ fn message(entry: &Entry) -> String {
     format!("use of a disallowed {what} `{}`", entry.entry.path)
 }
 
-fn check_path<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>) {
+fn check_path<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved<'_>, path: ast::Path<'t>) {
     let names = names(cx, path);
     if let [Some(ModuleDef::Module(module)), ..] = names {
         check_glob(cx, resolved, path, module);
@@ -608,7 +650,7 @@ fn check_path<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, path: ast::Path<'t>)
 /// the first such item's entry. A body's walk sees only the body, never the file's `use`.
 fn check_glob<'t>(
     cx: &mut Cx<'_, 't>,
-    resolved: &Resolved,
+    resolved: &Resolved<'_>,
     path: ast::Path<'t>,
     module: hir::Module,
 ) {
@@ -644,7 +686,7 @@ fn check_glob<'t>(
 /// that brings it, retargeted.
 fn path_fix<'t>(
     cx: &Cx<'_, 't>,
-    resolved: &Resolved,
+    resolved: &Resolved<'_>,
     path: ast::Path<'t>,
     replacement: &str,
 ) -> Result<Vec<(TextRange, String)>, String> {
@@ -720,7 +762,7 @@ fn written<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, range: TextRange) -> Option
 /// imports none.
 fn use_fix<'t>(
     cx: &Cx<'_, 't>,
-    resolved: &Resolved,
+    resolved: &Resolved<'_>,
     item: ast::Use<'t>,
 ) -> Result<Option<Vec<(TextRange, String)>>, String> {
     if !cx.in_file() {
@@ -753,7 +795,7 @@ const POISONING: [&str; 5] = ["lock", "read", "write", "into_inner", "get_mut"];
 /// the same.
 const TRYING: [&str; 3] = ["try_lock", "try_read", "try_write"];
 
-fn check_method_call<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved, call: ast::MethodCallExpr<'t>) {
+fn check_method_call<'t>(cx: &mut Cx<'_, 't>, resolved: &Resolved<'_>, call: ast::MethodCallExpr<'t>) {
     let Some(f) = cx.method(call) else { return };
     if let Some(entry) = resolved.of(ModuleDef::Function(f)) {
         if on(cx, entry) && !allowed(cx, entry, call.syntax()) {

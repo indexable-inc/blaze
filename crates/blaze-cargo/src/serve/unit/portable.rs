@@ -278,10 +278,16 @@ fn recode(
 pub(crate) fn path_reads(db: &base_db::Db, krate: base_db::Crate, places: &Places) -> Option<String> {
     let rooted = |value: &str| matches!(places.text(value.as_bytes()), Cow::Owned(_));
     // alloc: once per unit stored, a crate of its closure each
-    let closure: blaze_hash::HashSet<base_db::Crate, std::alloc::Global> =
-        krate.transitive_deps(db).iter().copied().collect();
+    // By key, as the log names the crates that read: a key of a crate no longer in this
+    // snapshot is no crate of the closure.
+    let closure: blaze_hash::HashSet<base_db::CrateKey, std::alloc::Global> =
+        krate.transitive_deps(db).iter().map(|it| it.key(db)).collect();
     for (by, name) in db.files().env_read() {
-        if closure.contains(&by) && by.env(db).get(&name).is_some_and(|value| rooted(&value)) {
+        if !closure.contains(&by) {
+            continue;
+        }
+        let by = db.krate(by);
+        if by.env(db).get(&name).is_some_and(|value| rooted(&value)) {
             // alloc: once per record tied
             return Some(format!(
                 "crate {} reads its variable `{name}`, which names a directory of the build",

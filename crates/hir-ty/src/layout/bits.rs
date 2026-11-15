@@ -153,7 +153,7 @@ pub fn bits_layout(db: &Db, id: StructId) -> Result<&BitsLayout, &BitsError> {
     bits_layout_query(db, id).as_ref()
 }
 
-#[blaze_query::tracked(cycle_result = bits_layout_cycle_result, returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(cycle_result = bits_layout_cycle_result, returns(ref), owns, mem_tag = Infer)]
 fn bits_layout_query(db: &Db, id: StructId) -> Result<BitsLayout, BitsError> {
     let strukt = id;
     let explicit = match AttrFlags::blaze_bits(db, id.into()) {
@@ -214,7 +214,6 @@ fn bits_layout_query(db: &Db, id: StructId) -> Result<BitsLayout, BitsError> {
 
 fn bits_layout_cycle_result(
     _: &Db,
-    _: blaze_query::db::Id,
     id: StructId,
 ) -> Result<BitsLayout, BitsError> {
     Err(BitsError::Cycle { strukt: id })
@@ -245,7 +244,9 @@ fn smallest_backing(bits: u32) -> Integer {
 /// Integers of the other widths (`u1..u127`, `i1..i127`, lane `uint`'s `UintTy::Bits` and
 /// `IntTy::Bits`) answer their own width; a standard integer is used whole. Either way the
 /// field's type holds a write to its range, so no write can spill into a neighbour.
-#[blaze_query::tracked(cycle_result = bit_width_of_cycle_result, returns(clone), mem_tag = Infer)]
+// `owns`: a refusal of a nested `#[blaze::bits]` struct boxes that struct's error tree
+// (`BitWidthError::Nested`), as `bits_layout_query`'s value does (port decision 1).
+#[blaze_memo::tracked(cycle_result = bit_width_of_cycle_result, returns(clone), owns, mem_tag = Infer)]
 pub fn bit_width_of(
     db: &Db,
     ty: StoredTy,
@@ -292,7 +293,6 @@ pub fn bit_width_of(
 
 fn bit_width_of_cycle_result(
     _: &Db,
-    _: blaze_query::db::Id,
     ty: StoredTy,
     _: StoredParamEnvAndCrate,
 ) -> Result<BitWidth, BitWidthError> {

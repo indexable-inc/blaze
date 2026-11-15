@@ -106,7 +106,7 @@ fn params_db(features: &str) -> Db {
 #[test]
 fn a_str_parameter_needs_adt_const_params() {
     let db = params_db("");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         assert_eq!(refused(&db, "Str"), [("S".to_owned(), ConstParamTyReason::NotSupported)]);
         assert_eq!(
             refused(&db, "Lifetime"),
@@ -119,7 +119,7 @@ fn a_str_parameter_needs_adt_const_params() {
 #[test]
 fn a_str_parameter_needs_unsized_const_params_too() {
     let db = params_db("adt_const_params");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for (name, param) in [("Str", "S"), ("Bytes", "B"), ("Pair", "P"), ("Mut", "M")] {
             assert_eq!(
                 refused(&db, name),
@@ -135,7 +135,7 @@ fn a_str_parameter_needs_unsized_const_params_too() {
 #[test]
 fn with_both_features_str_and_byte_slices_are_allowed() {
     let db = params_db("adt_const_params, unsized_const_params");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         assert_eq!(refused(&db, "Str"), []);
         assert_eq!(refused(&db, "Bytes"), [], "`&'static [u8]` takes the same path as `&str`");
         assert_eq!(refused(&db, "Pair"), []);
@@ -178,7 +178,7 @@ struct V {
 #[test]
 fn two_arguments_with_equal_bytes_are_one_type() {
     let db = fixture::db(TYPES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let a = field_tys(&db, crate_named(&db, "a"));
         let [abc, braced, abd, empty, escaped, raw] = a[..] else { panic!("{a:?}") };
         assert_eq!(abc, braced, "`{{ \"abc\" }}` is the literal");
@@ -230,7 +230,7 @@ fn mismatches(db: &Db, name: &str) -> Vec<(String, String)> {
 #[test]
 fn a_mismatch_shows_both_strings() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         assert_eq!(mismatches(&db, "mismatch"), [(r#"S<"abc">"#.to_owned(), r#"S<"abd">"#.to_owned())]);
     });
 }
@@ -238,7 +238,7 @@ fn a_mismatch_shows_both_strings() {
 #[test]
 fn a_long_string_is_shown_cut_with_its_length() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let shown = format!("S<\"{}…\" (100 bytes)>", "x".repeat(STR_SHOWN));
         assert_eq!(mismatches(&db, "long"), [(r#"S<"abc">"#.to_owned(), shown)]);
     });
@@ -247,7 +247,7 @@ fn a_long_string_is_shown_cut_with_its_length() {
 #[test]
 fn an_argument_left_out_is_inferred() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let target = DisplayTarget::from_crate(&db, krate);
         let def = DefWithBodyId::FunctionId(function_in(&db, krate, "inferred"));

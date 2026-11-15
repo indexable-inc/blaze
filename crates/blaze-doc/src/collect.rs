@@ -36,7 +36,7 @@ pub(crate) fn build(db: &Db, places: &Places) -> Model {
     let by_trait_arg = impls_by_trait_arg(db, places);
     // As in `places::place`: a waiting worker may run another database's job above this one.
     let built: Vec<(CrateDoc, Vec<Warning>)> = base_db::par_map(places.crates.len(), |krate| {
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let builder = Builder {
                 db,
                 places: places.linking(krate),

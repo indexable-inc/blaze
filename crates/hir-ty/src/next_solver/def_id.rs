@@ -30,7 +30,7 @@ pub enum Ctor {
     Enum(EnumVariantId),
 }
 
-#[derive(PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SolverDefId<'db> {
     AdtId(AdtId),
     ConstId(ConstId),

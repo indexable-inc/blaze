@@ -19,7 +19,8 @@ mod capture;
 mod census;
 mod counts;
 mod dense;
-pub mod edit_work;
+/// The stage names, at the crate root ([`crate::edit_work`]) so they outlive this engine.
+pub use crate::edit_work;
 mod frontier;
 mod function;
 mod id;

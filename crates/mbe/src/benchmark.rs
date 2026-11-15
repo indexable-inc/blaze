@@ -41,7 +41,7 @@ fn benchmark_expand_macro_rules() {
     if skip_slow_tests() {
         return;
     }
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let rules = macro_rules_fixtures();
     let invocations = invocation_fixtures(&db, &rules);
 

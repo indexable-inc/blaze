@@ -198,7 +198,12 @@ impl<'a, 'db> Ctx<'a, 'db> {
             return false;
         };
         let span = call.expansion_span_map(self.db).span_at(name.syntax().text_range().start());
-        let Some(expansion) = span.ctx.outer_expn(self.db) else { return false };
+        // The span's context is of the table of the expansion it is written in: its call's
+        // crate's.
+        let Some(expansion) = span.ctx.outer_expn(self.db, source.file_id.context_arena())
+        else {
+            return false;
+        };
         let loc = MacroCallId::from(expansion).loc(self.db);
         loc.def.krate != self.krate || !matches!(loc.kind, MacroCallKind::FnLike { .. })
     }

@@ -1,74 +1,86 @@
 //! What a crate is read from, kept a crate (restore.md, "A slot a crate for what a crate is
-//! read from").
+//! read from"), on the session memo (docs/v2/plan/design/front-end-on-memo.md, rules 4 and 5).
 //!
 //! Each kind of record a crate is read from (its image, its frozen def map and lang items,
-//! its def-map pages, hir-ty's impl tables) is set as one map of every crate, which the code
-//! outside queries reads: the serve that adds to it, the withdrawals, the maintainers' passes.
-//! A read there records no edge. A row that read the map would depend on every crate's entry,
-//! so a serve of one crate would be a write every served crate's rows verify after, and no
-//! seal group could own the row. So the write that sets a map also gives each crate whose
-//! entry moved its own entry ([`give_changed`], through [`base_db::Crate::give`]), and every
-//! read inside a query is of the crate's slot ([`base_db::Crate::given`]).
+//! its def-map pages, hir-ty's impl tables, its surface) is given to the crate as one slot of
+//! the crate's own arena ([`base_db::Edit::give_by`]), by the driver in an edit of the world,
+//! and read inside a query from the crate's slot ([`base_db::Crate::given`]). Nothing is given
+//! during a build: a snapshot's inputs are fixed for its life, and a change is the next
+//! commit, which makes again the arenas of the crates whose slots moved.
 //!
-//! The invariant: after a map's `set`, a crate's slot of that kind holds the crate's entry of
-//! the map, or nothing when the map has none; both are written in the one write that calls
-//! `set`, so no view has one without the other.
+//! A slot is never an entry of one map of every crate: a map of every crate is an input every
+//! crate's entries read, so a new image of one crate would drop every arena that read the map.
+//!
+//! The invariant: a crate's slot of a kind holds what the driver last gave it, or nothing; the
+//! fact it is read by is the one the driver gave with it, so a read list names the slot's
+//! digest and nothing of another crate's.
 
-use base_db::{Crate, Db, Given};
-use blaze_hash::HashMap;
-use blaze_query::db::Durability;
-use std::alloc::Global;
+use base_db::{Crate, Db, Edit, Given};
+use blaze_memo::Fact;
 
-#[cfg(test)]
-thread_local! {
-    /// The bug a test planted: every crate of the map is given its entry again, moved or not
-    /// (what one map of every crate did to its readers).
-    pub(crate) static GIVES_EVERY_CRATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Gives `krate` (a crate of the edit's last commit) `value` as its slot of kind `K`, read by
+/// `fact`: the one way a slot is given. A value equal to the one the slot holds gives
+/// nothing, so the crate's arena moves only when what it is read from did; whether it was
+/// given.
+///
+/// The fact is the giver's, not drawn per gift: two values a slot held under one fact are the
+/// giver's promise that a reader of the slot alone sees no difference (each part read of it
+/// notes a fact of its own, as an image's items do).
+pub fn give<K: 'static, T: std::any::Any + Send + Sync + PartialEq>(
+    edit: &mut Edit<'_>,
+    krate: Crate,
+    fact: Fact,
+    value: T,
+) -> bool {
+    let db = edit.db();
+    if krate.given::<K, T>(db) == Some(&value) {
+        return false;
+    }
+    let key = krate.key(db);
+    edit.give_by::<K>(key, fact, Given::new(value));
+    true
 }
 
-/// Gives each crate whose entry differs between `was` and `now` its entry of `now` as kind
-/// `K`, or nothing when `now` has none: how many crates were given. A crate whose entry is
-/// equal in both is not written, so no row that read its slot is verified again. Crates are
-/// given in their order, so the slots a first gift makes are numbered alike by every database
-/// that sets the same maps.
-///
-/// Called by the `set` of each map of what crates are read from, in the write that sets the
-/// map, before the map is set.
-pub fn give_changed<K: 'static, T>(
-    db: &mut Db,
-    was: Option<&HashMap<Crate, T, Global>>,
-    now: &HashMap<Crate, T, Global>,
-) -> usize
-where
-    T: PartialEq + Clone + Send + Sync + 'static,
-{
-    #[cfg(test)]
-    let every = GIVES_EVERY_CRATE.get();
-    #[cfg(not(test))]
-    let every = false;
-    // alloc: the crates whose entry moved, once per write that sets a map of them
-    let mut moved: Vec<(Crate, Option<&T>)> = Vec::new();
-    for (krate, entry) in now {
-        if every || was.and_then(|it| it.get(krate)) != Some(entry) {
-            moved.push((*krate, Some(entry)));
-        }
+/// [`give`] for a located kind ([`base_db::Located`]: a gift that says where a value can be
+/// read, which every reader computes alike without it): kept in the snapshot's table, read by
+/// [`Crate::located`], its first gift to a crate marking no arena. A value equal to the one
+/// held gives nothing; whether it was given.
+pub fn give_located<K: base_db::Located, T: std::any::Any + Send + Sync + PartialEq>(
+    edit: &mut Edit<'_>,
+    krate: Crate,
+    fact: Fact,
+    value: T,
+) -> bool {
+    let db = edit.db();
+    if krate.located::<K, T>(db) == Some(&value) {
+        return false;
     }
-    if let Some(was) = was {
-        for krate in was.keys() {
-            if !now.contains_key(krate) {
-                moved.push((*krate, None));
-            }
-        }
+    let key = krate.key(db);
+    edit.give_located::<K>(key, fact, Given::new(value));
+    true
+}
+
+/// [`give`] of each crate of `entries` in `edit`: how many crates were given. For a driver
+/// that gives one kind to many crates at once (`nameres::frozen`'s, hir-ty's impl tables).
+pub fn give_each<K: 'static, T: std::any::Any + Send + Sync + PartialEq>(
+    edit: &mut Edit<'_>,
+    entries: impl IntoIterator<Item = (Crate, Fact, T)>,
+) -> usize {
+    let mut given = 0;
+    for (krate, fact, value) in entries {
+        given += usize::from(give::<K, T>(edit, krate, fact, value));
     }
-    moved.sort_unstable_by_key(|it| it.0);
-    let given = moved.len();
-    for (krate, entry) in moved {
-        let value = match entry {
-            // clone: the entry's handles (a count of a buffer, a key), once per crate given
-            Some(entry) => Given::new(entry.clone()),
-            None => Given::default(),
-        };
-        krate.give::<K>(db, value, Durability::HIGH);
+    given
+}
+
+/// [`give_located`] of each crate of `entries` in `edit`: how many crates were given.
+pub fn give_each_located<K: base_db::Located, T: std::any::Any + Send + Sync + PartialEq>(
+    edit: &mut Edit<'_>,
+    entries: impl IntoIterator<Item = (Crate, Fact, T)>,
+) -> usize {
+    let mut given = 0;
+    for (krate, fact, value) in entries {
+        given += usize::from(give_located::<K, T>(edit, krate, fact, value));
     }
     given
 }
@@ -79,22 +91,29 @@ where
 /// reads records (d)", E), so a body edit below moves no key above.
 pub struct SurfaceSlot;
 
-/// Gives `krate` its surface, in a write: nothing is written when it holds that one already,
-/// so no key that read it is made again. `durability` is the crate's own (a library's `HIGH`,
-/// a workspace member's `LOW`: its surface moves with a signature edit).
-///
-/// The invariant: a key that reads a dependency's surface ([`surface`]) reads the one the
-/// lowering worked out from the files the database holds at that view; the lowering gives it
-/// in the write that changes those files, before any key is asked.
-pub fn set_surface(db: &mut Db, krate: Crate, surface: base_db::ContentId, durability: Durability) {
-    if krate.given::<SurfaceSlot, base_db::ContentId>(db) == Some(&surface) {
-        return;
-    }
-    krate.give::<SurfaceSlot>(db, Given::new(surface), durability);
+/// The fact a crate's surface slot is read by: the slot's id, of the crate's own stable id, and
+/// the surface itself as its digest (a surface is a digest already).
+pub fn surface_fact(krate_id: base_db::ContentId, surface: base_db::ContentId) -> Fact {
+    Fact { id: base_db::ContentId::of("hir-def surface slot", &krate_id.0), digest: surface }
 }
 
-/// `krate`'s surface, a tracked read of its own slot; `None` when the lowering gave none (a
-/// front end no driver keys: its crates have no image key either).
+/// Gives `krate`, whose stable id is `krate_id`, its surface in `edit`, read by
+/// [`surface_fact`]: whether it moved.
+///
+/// The invariant: a key that reads a dependency's surface ([`surface`]) reads the one the
+/// lowering worked out from the files the snapshot holds; the driver gives it in the edit that
+/// commits them, before any key is asked.
+pub fn give_surface(
+    edit: &mut Edit<'_>,
+    krate: Crate,
+    krate_id: base_db::ContentId,
+    surface: base_db::ContentId,
+) -> bool {
+    give::<SurfaceSlot, base_db::ContentId>(edit, krate, surface_fact(krate_id, surface), surface)
+}
+
+/// `krate`'s surface, a read of its own slot; `None` when the lowering gave none (a front end
+/// no driver keys: its crates have no image key either).
 pub fn surface(db: &Db, krate: Crate) -> Option<base_db::ContentId> {
     krate.given::<SurfaceSlot, base_db::ContentId>(db).copied()
 }

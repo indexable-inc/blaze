@@ -1,0 +1,17 @@
+{
+  "id": "unitkey-std-test-cfg-hand-mirrored",
+  "date": "2026-11-14",
+  "who": "claude-opus-5-5 (Claude Opus 5.5), command/unitkey lane, round three; resolved round five",
+  "where": "crates/blaze-unitkey/src/std_tests.rs (features, script)",
+  "what": "the std keying test missed compiler_builtins' four libm aarch64 files because it keyed every crate without its features (`feature = \"arch\"` gates `libm/src/math/arch/mod.rs:11`); the command gets them from cargo's resolution in blaze-units (`StdKey::features`, `load/plan/flags.rs:185`), which blaze-unitkey's test cannot call without a VFS of the library",
+  "cost": "one coordinator job run and a round of a lane",
+  "cause": "the test rebuilt each unit's cfg by hand from the target table and std's script only, not from the graph the command builds",
+  "whys": [
+    "blaze-unitkey's std test predates the command's graph and has no way to ask it for a unit's cfg",
+    "feature resolution lives in blaze-units' query database, which needs a tree of the library to run"
+  ],
+  "class": "a test that mirrors a production input by hand instead of reading it from the code that makes it",
+  "prevention": "built: `blaze_units::stdlib::cfg::{std_graph, std_cfg, unit_cfg}` is the one source; the command's graph calls `unit_cfg`/`std_cfg`, the test resolves std's graph with `std_graph` over the library's files and calls `std_cfg`, and both gather through `blaze_unitkey::gather::gather`",
+  "workaround": "none left: the feature table, the script runner and the test's own gather are deleted",
+  "state": "resolved in source, not compiled"
+}

@@ -30,7 +30,7 @@ use super::{
 // Keys.
 
 /// Which items a module's round-0 collection walks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) enum DeclItems {
     /// The top-level items of the key's tree (a file module, the crate root).
     Top,
@@ -43,7 +43,7 @@ pub(crate) enum DeclItems {
 
 /// A module as it is declared at round 0: everything its collection reads besides item trees
 /// and other crates.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct Decl {
     pub(crate) krate: Crate,
     pub(crate) module: ModuleId,
@@ -59,26 +59,31 @@ pub(crate) struct Decl {
     pub(crate) env: EnvKey,
 }
 
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+#[blaze_memo::interned(debug, unsafe(no_lifetime), owns)]
 pub(crate) struct DeclKey {
     #[returns(ref)]
     pub(crate) decl: Decl,
 }
 
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+#[blaze_memo::interned(debug, unsafe(no_lifetime), owns)]
 pub(crate) struct EnvKey {
     #[returns(ref)]
     pub(crate) env: CollectEnv,
 }
 
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+/// A crate's env as its collection has it. `krate` is the crate collecting: the env names
+/// root modules of several dependency crates, none of which borrows the others, so the key is
+/// homed at the asker (the spec's rule (b), front-end-on-memo.md "2. Home").
+#[blaze_memo::interned(debug, unsafe(no_lifetime), owns)]
 pub(crate) struct CrateEnvKey {
+    #[returns(copy)]
+    pub(crate) krate: Crate,
     #[returns(ref)]
     pub(crate) env: CrateEnv,
 }
 
 /// A round of a crate's collection.
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+#[blaze_memo::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct RoundKey {
     #[returns(copy)]
     pub(crate) krate: Crate,
@@ -89,7 +94,7 @@ pub(crate) struct RoundKey {
 /// A module at a round: `fact_handle`, `module_round`, `macro_step`, `unresolved_named`. Only
 /// a round that can change the module makes one: readers name an idle module's facts by the
 /// round they last changed at (`fact_key`).
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+#[blaze_memo::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct FactKey {
     #[returns(copy)]
     pub(crate) module: ModuleId,
@@ -101,7 +106,7 @@ pub(crate) struct FactKey {
 
 /// A component of a round's import graph, by the smallest module index of its members (its
 /// anchor, `Partition::anchor`), named by the module.
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+#[blaze_memo::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct SccKey {
     #[returns(copy)]
     pub(crate) anchor: ModuleId,
@@ -112,7 +117,7 @@ pub(crate) struct SccKey {
 }
 
 /// Which modules a view reads through `row`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) enum Rows {
     /// Every module of a round, each scope `ScopeRef::Fact` of that round.
     Round(RoundKey),
@@ -121,14 +126,14 @@ pub(crate) enum Rows {
     Decl(DeclKey),
 }
 
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+#[blaze_memo::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct RowsKey {
     #[returns(copy)]
     pub(crate) rows: Rows,
 }
 
 /// What a `ScopeSlot::Fact` holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) enum Scope {
     /// The module's scope after round `FactKey::round`'s import fixed point.
     Fact(FactKey),
@@ -136,10 +141,22 @@ pub(crate) enum Scope {
     Decl(DeclKey),
 }
 
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+#[blaze_memo::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct ScopeRef {
     #[returns(copy)]
     pub(crate) scope: Scope,
+}
+
+/// Where a module's scope (with its children) is held: what was a `ModuleScope` tracked
+/// struct's id. A handle names one scope for the snapshot, and a new one is made exactly when
+/// the scope changed, so two handles are equal exactly when they name the same made scope:
+/// what a reader compares to tell an unchanged upstream (`SccState::upstream`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
+pub(crate) enum ScopeHandle {
+    /// The scope at `at` of the `made` of the component state `by` (`scc_state`).
+    Made { by: SccKey, #[home(skip)] at: u32 },
+    /// The round-0 scope of a module's declarations (`decl_scope`).
+    Decl(DeclKey),
 }
 
 /// What a round does after its import fixed point.
@@ -314,21 +331,23 @@ impl RoundActive {
 /// the state the next round carries on from.
 #[derive(Debug)]
 pub(crate) struct SccState {
-    /// The round whose `ModuleScope`s these are: this one, or the last one at which the
-    /// component changed (`latest`).
+    /// The round whose scopes these are: this one, or the last one at which the component
+    /// changed (`latest`).
     pub(crate) round: u32,
     /// Members, ascending by module index of the round.
     pub(crate) members: Box<[ModuleId]>,
-    /// Each member's `ModuleScope` (as `blaze_query::db::Id`), in `members` order.
-    pub(crate) handles: Box<[blaze_query::db::Id]>,
+    /// Each member's scope, in `members` order.
+    pub(crate) handles: Box<[ScopeHandle]>,
+    /// The scopes this run made, which its handles of `ScopeHandle::Made` name by position.
+    pub(crate) made: Box<[crate::nameres::BuildingScope]>,
     /// The `#[prelude_import]` this component resolved, if it holds it.
     pub(crate) prelude: Option<(ModuleId, Option<UseId>)>,
     /// Every module of another component the state read (a path's `PathRead::Slot`, a glob's
-    /// source), with the `ModuleScope` it read, ascending by module: the next round the
+    /// source), with the scope it read, ascending by module: the next round the
     /// component runs at keeps this state when its members gain no op and each of these is
     /// still the module's `fact_handle` (`fact_key`); a round at which none of these modules'
     /// components runs and no member gains an op does not run the component (`round_active`).
-    pub(crate) upstream: Box<[(ModuleId, blaze_query::db::Id)]>,
+    pub(crate) upstream: Box<[(ModuleId, ScopeHandle)]>,
     /// At a `RoundKind::Final` round, every import of the members in import order with what it
     /// resolved to (`PartialResolvedImport::namespaces`; `None` while still unresolved), for
     /// `finish`'s diagnostics and `NameRecords`; empty at any other round.
@@ -375,7 +394,7 @@ pub(crate) struct RoundOutcome {
 // Queries.
 
 /// The crate's root module id. Created here so every query of the crate shares it.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn crate_root(db: &Db, krate: Crate) -> ModuleId {
     // This query creates it with the same fields every time, so the id is the same for as long
     // as the crate is.
@@ -388,7 +407,7 @@ pub(crate) fn crate_root(db: &Db, krate: Crate) -> ModuleId {
 /// and the name-resolution maintainer's, which runs in no query and so can make no tracked
 /// struct itself. Its interned arguments are never collected: the query database frees no id,
 /// so the module it made keeps its id for the published scopes of other crates that hold it.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn child_module(
     db: &Db,
     krate: Crate,
@@ -400,19 +419,19 @@ pub(crate) fn child_module(
 }
 
 /// The crate attributes of the root file (`seed_with_top_level`'s first part).
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
     collect::crate_data(db, krate)
 }
 
 /// The crate root's round-0 key: the extern prelude of the crate's dependencies.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn root_decl(db: &Db, krate: Crate) -> DeclKey {
     frame::task(Tag::Nameres, |frame| collect::root_decl(db, frame, krate))
 }
 
 /// One module's round-0 declarations.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn module_decls(db: &Db, key: DeclKey) -> ModuleDecls {
     frame::task(Tag::Nameres, |frame| collect::module_decls(db, frame, key))
 }
@@ -420,7 +439,7 @@ pub(crate) fn module_decls(db: &Db, key: DeclKey) -> ModuleDecls {
 /// The module's `macro_rules!` after collection, the last definition of each name it defines
 /// or brings in (not those it only inherited): what a `#[macro_use] mod` brings into its
 /// parent. Backdates unless they change.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> LegacyExports {
     // clone: the query's value, at exact size, once per execution
     module_decls(db, key).legacy.clone()
@@ -431,7 +450,7 @@ pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> LegacyExports {
 /// between the root's collection and their subtrees) and of each descendant that has children
 /// of its own; a leaf's ops are read off its log in place, and only when its log writes the
 /// root at all (`OpLog::writes_elsewhere`).
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn subtree_macro_exports(db: &Db, key: DeclKey) -> Box<[DeclOp]> {
     let root = crate_root(db, key.decl(db).krate);
     let ops = &module_decls(db, key).ops;
@@ -466,26 +485,41 @@ pub(crate) fn child_key(db: &Db, parent: DeclKey, child: ModuleId) -> Option<Dec
     module_decls(db, parent).children.iter().copied().find(|it| it.decl(db).module == child)
 }
 
-/// The module of `key`'s round-0 scope as a `ModuleScope`, for `Scope::Decl` reads.
-#[blaze_query::tracked(returns(copy))]
-pub(crate) fn decl_handle(db: &Db, key: DeclKey) -> blaze_query::db::Id {
+/// The module of `key`'s round-0 scope, for `Scope::Decl` reads.
+pub(crate) fn decl_handle(_db: &Db, key: DeclKey) -> ScopeHandle {
+    ScopeHandle::Decl(key)
+}
+
+/// The round-0 scope and children of the module of `key`.
+#[blaze_memo::tracked(returns(ref), owns)]
+pub(crate) fn decl_scope(db: &Db, key: DeclKey) -> crate::nameres::BuildingScope {
     let decl = key.decl(db);
     let ops = &module_decls(db, key).ops;
     let scope = frame::task(Tag::Nameres, |frame| {
         unit::local_scope(db, frame, decl.module, &decl.inherited, ops)
     });
-    let scope = crate::nameres::ModuleScope::new(db, decl.module, scope.scope, scope.children);
-    blaze_query::db::AsId::as_id(&scope)
+    let mut scope = crate::nameres::BuildingScope { scope: scope.scope, children: scope.children };
+    // Settled as a handed-over scope is (`unit`'s `made`): no read of it allocates.
+    scope.scope.settle();
+    scope
+}
+
+/// The scope and children `handle` names.
+pub(crate) fn handle_scope(db: &Db, handle: ScopeHandle) -> &crate::nameres::BuildingScope {
+    match handle {
+        ScopeHandle::Made { by, at } => &scc_state(db, by).made[at as usize],
+        ScopeHandle::Decl(key) => decl_scope(db, key),
+    }
 }
 
 /// Every module of the round, in order.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
     frame::task(Tag::Nameres, |frame| driver::round_modules(db, frame, round))
 }
 
 /// Which components of the round's partition run at the round.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn round_active(db: &Db, round: RoundKey) -> RoundActive {
     unit::round_active(db, round)
 }
@@ -527,14 +561,14 @@ pub(crate) fn ran_by(db: &Db, round: RoundKey, at: u32) -> u32 {
 }
 
 /// What the module gains at a round `>= 1`.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
     frame::task(Tag::Nameres, |frame| driver::module_round(db, frame, key))
 }
 
 /// The round's import graph, for `graph::partition`. Backdates unless an import, a `mod` or
 /// an `extern crate self` changes.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
     frame::task(Tag::Nameres, |frame| driver::import_shape(db, frame, round))
 }
@@ -545,7 +579,7 @@ pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
 /// name resolution's strongly connected groups are on real crates): `modules`, `groups`, the
 /// `largest` group's modules, and how many groups are `single` (one module). The event names
 /// no crate: a query over the profile joins it to the span it is in.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn partition(db: &Db, round: RoundKey) -> Partition {
     let shape = import_shape(db, round);
     let partition = frame::task(Tag::Nameres, |frame| super::graph::partition(frame, shape));
@@ -563,56 +597,56 @@ pub(crate) fn partition(db: &Db, round: RoundKey) -> Partition {
 
 /// The crate env the round's units and steps start from: the root's crate-level ops of every
 /// round before, and the injected std prelude.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn round_env(db: &Db, round: RoundKey) -> CrateEnvKey {
     driver::round_env(db, round)
 }
 
 /// One component's resolution at one round.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
     frame::task(Tag::Nameres, |frame| unit::scc_state(db, frame, key))
 }
 
 /// The round whose state `scc_state(key)` hands out: `key`'s round, or the last before it at
 /// which the component changed.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn latest(db: &Db, key: SccKey) -> u32 {
     scc_state(db, key).round
 }
 
-/// The module's `ModuleScope` after the round's import fixed point. Backdates while the
-/// component hands out the same one.
-#[blaze_query::tracked(returns(copy))]
-pub(crate) fn fact_handle(db: &Db, key: FactKey) -> blaze_query::db::Id {
+/// The module's scope after the round's import fixed point: the same handle while the
+/// component hands out the same scope.
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn fact_handle(db: &Db, key: FactKey) -> ScopeHandle {
     unit::fact_handle(db, key)
 }
 
 /// The module's plain imports still unresolved after the round's fixed point, by the name each
 /// binds, in import order: what case 1 of a step's macro calls reads (`unresolved_named`).
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn unresolved_named(db: &Db, key: FactKey) -> Box<[(Name, ModPath)]> {
     unit::unresolved_named(db, key)
 }
 
 /// One module's macro resolution at one round.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
     frame::task(Tag::Nameres, |frame| macros::macro_step(db, frame, key))
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn round_progress(db: &Db, round: RoundKey) -> RoundOutcome {
     driver::round_progress(db, round)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn round_kind(db: &Db, round: RoundKey) -> RoundKind {
     driver::round_kind(db, round)
 }
 
 /// The row of `module` in a view that does not hold it.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn row(db: &Db, rows: RowsKey, module: ModuleId) -> Option<ModuleData> {
     match rows.rows(db) {
         Rows::Round(round) => driver::round_row(db, round, module),
@@ -620,15 +654,16 @@ pub(crate) fn row(db: &Db, rows: RowsKey, module: ModuleId) -> Option<ModuleData
     }
 }
 
-/// The `ModuleScope` (as `blaze_query::db::Id`) a `ScopeSlot::Fact` names.
-pub(crate) fn scope_of(db: &Db, scope: ScopeRef) -> blaze_query::db::Id {
-    match scope.scope(db) {
+/// The scope a `ScopeSlot::Fact` names.
+pub(crate) fn scope_of(db: &Db, scope: ScopeRef) -> &crate::nameres::BuildingScope {
+    let handle = match scope.scope(db) {
         Scope::Fact(key) => fact_handle(db, key),
         Scope::Decl(key) => decl_handle(db, key),
-    }
+    };
+    handle_scope(db, handle)
 }
 
 /// A `ScopeSlot::Fact` for `scope`.
 pub(super) fn fact_slot(db: &Db, scope: Scope) -> crate::nameres::ScopeSlot {
-    crate::nameres::ScopeSlot::Fact(blaze_query::db::AsId::as_id(&ScopeRef::new(db, scope)))
+    crate::nameres::ScopeSlot::Fact(ScopeRef::new(db, scope))
 }

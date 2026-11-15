@@ -142,13 +142,13 @@ impl Features {
     /// [`Features::lang`] and [`Features::lib`] are empty: they are read only by the checks of
     /// the crate root's features ([`staged`], `on_non_nightly`, [`unused_or_stable`]), which a
     /// probe never runs.
-    pub(crate) fn of_settings(settings: &super::settings::CrateSettings) -> Features {
+    pub(crate) fn of_settings(settings: &super::settings::CrateSettings<'_>) -> Features {
         let mut features = Features {
             nightly: settings.nightly,
             crate_nightly: settings.crate_nightly,
             ..Features::default()
         };
-        for name in &settings.features {
+        for name in settings.features {
             // alloc: setup, once per `#![feature]`, once per probe
             features.names.insert(name.to_string());
         }
@@ -532,7 +532,7 @@ pub(crate) fn allows_unstable(
     }
     let db = cx.db;
     let ctxt = file.span_map(db).span_for_range(range).ctx;
-    let Some(call) = ctxt.outer_expn(db) else { return false };
+    let Some(call) = ctxt.outer_expn(db, crate::cx::context_arena(file)) else { return false };
     let def = hir_expand::MacroCallId::from(call).loc(db).def;
     let node: ast::Node<'_> = match def.kind {
         MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => match def.ast_id() {

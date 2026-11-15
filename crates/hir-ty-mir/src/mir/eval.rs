@@ -1082,7 +1082,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             owner,
             random_state: blaze_rng::SplitMix64::new(0),
             param_env: trait_env.unwrap_or_else(|| ParamEnvAndCrate {
-                param_env: db.trait_environment(owner.generic_def(db)),
+                param_env: owner.param_env(db),
                 krate: crate_id,
             }),
             crate_id,
@@ -6158,7 +6158,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Either::Right((impl_, method)) => {
                     let derive = impl_.loc(self.db).trait_.name();
                     let self_ty = generic_args.as_slice().first().copied();
-                    let shown = blaze_query::db::attach(self.db, || format!("{self_ty:?}")); // alloc: error path
+                    let shown = blaze_memo::attach(self.db, || format!("{self_ty:?}")); // alloc: error path
                     not_supported!(
                         "`{}::{}` of `{shown}`, which `#[derive({})]` implements: builtin derives \
                          are recorded unexpanded in this database, so the method has no body",

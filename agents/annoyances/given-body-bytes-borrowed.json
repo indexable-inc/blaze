@@ -1,0 +1,14 @@
+{
+ "id": "given-body-bytes-borrowed",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: body record holds generic MIR, served in a plan's snapshot",
+ "where": "crates/blaze-keyed/src/front.rs (GivenBody.record: &'a [u8]), crates/blaze-host/src/workers.rs (Job.bodies: Vec<(StableId, Aligned, ContentId)>), crates/blaze-front/src/body/mir.rs (given), crates/hir-ty/src/store_registry.rs",
+ "what": "A plan task is handed each body record as borrowed bytes, but the item store of the plan's snapshot lives in a 'static registry whose unlinked stores are freed after a reclaim grace, so it cannot hold the borrow: in-flight readers may touch a store after its guard drops. The adapter from GivenBody to the store copies each record once into an aligned holder.",
+ "cost": "one copy of up to BODIES_MOST records per plan run, against a floor of none",
+ "cause": "the host owns each record as a plain Aligned and lends its bytes; the store needs a counted holder",
+ "whys": "the host reads each record into an Aligned of its own (Job.bodies); GivenBody was shaped for a borrow; the store's registry is lock-free with limbo reclamation, so a borrowed store would need a grace wait at the end of the plan task",
+ "class": "a borrow handed across a boundary into a structure that outlives any borrow",
+ "prevention": "the host keeps each record in an Arc<Aligned> and GivenBody carries it (or a &Arc<Aligned>) beside its bytes; blaze_front::body::mir::given then clones it by count",
+ "workaround": "given copies each record once",
+ "state": "open"
+}

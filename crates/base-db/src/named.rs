@@ -12,7 +12,19 @@
 //!
 //! The table behind it is [`Table`]: a lookup is acquire loads, with no lock and nothing
 //! written (docs/v2/plan/design/concurrency.md). Only the setters of [`Files`](crate::Files)
-//! write it, with the database's `&mut`, so no query runs while it changes.
+//! write it, in an edit.
+//!
+//! The inputs (the singleton and its 64 buckets) are the session arena's, made with it
+//! ([`Named::make`]); a setter whose paths moved a bucket marks the session
+//! ([`Named::publish`]), whose arena is then made again. Cost (rule 67): a path named is a
+//! table insert and an `O(1)` sum; a bucket that moved drops the session arena, where the floor
+//! is its readers alone, said plainly: a new path is rare next to an edit of a file's text,
+//! which moves no bucket.
+//!
+//! The table is shared by every snapshot and written in place: a reader of an older snapshot
+//! that looks a path up sees the file the newest setter gave it, and the bucket its snapshot
+//! has. The bucket a reader reads is its snapshot's, so a lookup that found nothing still
+//! reruns at the next snapshot whose bucket moved.
 
 use std::{
     fmt,
@@ -24,10 +36,14 @@ use std::{
 
 use crate::{FileId, VfsPath};
 use blaze_ids::{ContentId, Hasher};
+use blaze_memo::{Fact, Inputs};
 use blaze_mem::{Frame, scratch};
-use blaze_query::db::{Durability, Setter};
+use std::alloc::Global;
 
-use crate::{Db, InputId, SourceRoot, content, table::Table};
+use crate::{Db, InputId, SourceRoot, content, table::Table, world::facts};
+
+/// The domain of a bucket's fact id: of its number.
+const BUCKET_FACT_DOMAIN: &str = "blaze v2 named paths bucket fact 1";
 
 pub(crate) const BUCKETS: usize = 64;
 
@@ -38,9 +54,9 @@ pub(crate) const BUCKETS: usize = 64;
 /// changes it, so a lookup that found the path's old file out of its root runs again.
 pub const NAMED_PATHS_DOMAIN: &str = "blaze v2 named paths bucket 2";
 
-/// The index's handles, set once when the first source root is set and never again: what it
-/// holds is in its buckets' content IDs.
-#[blaze_query::input(singleton, debug)]
+/// The index's handles, made with the session arena: what it holds is in its buckets' content
+/// IDs.
+#[blaze_memo::input(singleton, debug)]
 pub(crate) struct NamedPaths {
     #[returns(ref)]
     table: PathTable,
@@ -49,7 +65,7 @@ pub(crate) struct NamedPaths {
 }
 
 /// The paths of one of [`BUCKETS`], by [`bucket_of`]: see [`NAMED_PATHS_DOMAIN`].
-#[blaze_query::input(debug)]
+#[blaze_memo::input(debug)]
 pub(crate) struct PathBucket {
     #[returns(copy)]
     content: InputId,
@@ -90,7 +106,6 @@ fn bucket_of(path: &VfsPath) -> usize {
 /// The setters' side of the index, in [`Writer`](crate::files::Writer).
 pub(crate) struct Named {
     table: Arc<Table<NamedPath>>,
-    input: Option<NamedPaths>,
     counts: [u64; BUCKETS],
     sums: [[u64; 4]; BUCKETS],
     moves: [u64; BUCKETS],
@@ -98,20 +113,51 @@ pub(crate) struct Named {
     moved: u64,
     /// Paths named since the last [`Named::publish`], as their [`bucket_of`] and place in the
     /// table: hashed for the buckets in one batch there.
-    pending: Vec<(usize, u32)>,
+    pending: Vec<(usize, u32), Global>,
+    /// The sums as the open edit found them ([`Named::begin`]): put back by
+    /// [`Named::rollback`].
+    begun: Sums,
+    /// The open edit's writes of the table: a row it made, or a file it gave a row (with the
+    /// file the row had).
+    undo: Vec<NamedUndo, Global>,
+    /// Rows made by an edit that was dropped: the table only grows, so they stay, counted in
+    /// no bucket. A setter that names one's path again counts it then, as a new path
+    /// ([`Named::note`]). A reader that finds one keeps its file only if its root names the
+    /// file there, which no committed root does.
+    ghosts: blaze_hash::HashSet<u32, Global>,
+}
+
+/// What the buckets' content IDs are made of.
+#[derive(Clone, Copy)]
+struct Sums {
+    counts: [u64; BUCKETS],
+    sums: [[u64; 4]; BUCKETS],
+    moves: [u64; BUCKETS],
+    moved: u64,
+}
+
+/// A write of [`Named`]'s table: see [`Named::rollback`].
+enum NamedUndo {
+    /// The row was made, or a ghost's path named again.
+    Made(u32),
+    /// The row was given another file: the one it had.
+    Given(u32, u32),
 }
 
 impl Default for Named {
     fn default() -> Named {
         Named {
-            // alloc: once per database, when its `Files` is made.
-            table: Arc::new(Table::new(1 << 22)),
-            input: None,
+            // Once per database, when its `Files` is made.
+            table: Arc::new_in(Table::new(1 << 22), Global),
             counts: [0; BUCKETS],
             sums: [[0; 4]; BUCKETS],
             moves: [0; BUCKETS],
             moved: 0,
-            pending: Vec::new(), // alloc: empty until a setter names a path; reused after.
+            // Empty until a setter names a path; reused after.
+            pending: Vec::new_in(Global),
+            begun: Sums { counts: [0; BUCKETS], sums: [[0; 4]; BUCKETS], moves: [0; BUCKETS], moved: 0 },
+            undo: Vec::new_in(Global),
+            ghosts: blaze_hash::HashSet::new_in(Global),
         }
     }
 }
@@ -123,13 +169,46 @@ impl Named {
         // clone: the table's one copy of a path, made once when a source root first names it.
         let make = || NamedPath { path: path.clone(), file: AtomicU32::new(file.index()) };
         let (at, inserted) = self.table.insert(hash, |it| it.path == *path, make);
-        if inserted {
+        if inserted || self.ghosts.remove(&at) {
+            if !inserted {
+                let was = self.table.get(at).file.swap(file.index(), Ordering::Release);
+                self.undo.push(NamedUndo::Given(at, was));
+            }
+            self.undo.push(NamedUndo::Made(at));
             self.pending.push((bucket_of(path), at));
-        } else if self.table.get(at).file.swap(file.index(), Ordering::Release) != file.index() {
+            return;
+        }
+        let was = self.table.get(at).file.swap(file.index(), Ordering::Release);
+        if was != file.index() {
+            self.undo.push(NamedUndo::Given(at, was));
             let bucket = bucket_of(path);
             self.moves[bucket] += 1;
             self.moved |= 1 << bucket;
         }
+    }
+
+    /// Begins an edit: the sums kept for [`Named::rollback`]. A copy of 3 KiB.
+    pub(crate) fn begin(&mut self) {
+        self.begun = Sums { counts: self.counts, sums: self.sums, moves: self.moves, moved: self.moved };
+    }
+
+    /// Ends the open edit, its writes kept.
+    pub(crate) fn forget(&mut self) {
+        self.undo.clear();
+    }
+
+    /// Puts back what the open edit wrote: each row it gave a file has the one it had, each
+    /// row it made is a ghost, and the sums are as it found them. O(the edit's paths).
+    pub(crate) fn rollback(&mut self) {
+        while let Some(undo) = self.undo.pop() {
+            match undo {
+                NamedUndo::Made(at) => _ = self.ghosts.insert(at),
+                NamedUndo::Given(at, was) => self.table.get(at).file.store(was, Ordering::Release),
+            }
+        }
+        let Sums { counts, sums, moves, moved } = self.begun;
+        (self.counts, self.sums, self.moves, self.moved) = (counts, sums, moves, moved);
+        self.pending.clear();
     }
 
     fn content(&self, bucket: usize) -> ContentId {
@@ -142,12 +221,12 @@ impl Named {
         hasher.finish()
     }
 
-    /// Writes the content IDs of the buckets that gained paths or had one move, making the
-    /// inputs the first time. Called by every setter that sets a source root's files, after
-    /// it has.
-    pub(crate) fn publish(&mut self, db: &mut Db, frame: &Frame) {
-        if self.input.is_some() && self.pending.is_empty() && self.moved == 0 {
-            return;
+    /// Brings the content IDs of the buckets that gained paths or had one move up to date, and
+    /// says whether any did: then the session's inputs are to be made again ([`Named::make`]).
+    /// Called by every setter that sets a source root's files, after it has.
+    pub(crate) fn publish(&mut self, frame: &Frame) -> bool {
+        if self.pending.is_empty() && self.moved == 0 {
+            return false;
         }
         let table = &self.table;
         let mut bytes = scratch::lend_bytes();
@@ -169,26 +248,26 @@ impl Named {
             dirty |= 1 << bucket;
         }
         self.pending.clear();
-        let Some(input) = self.input else {
-            // alloc: the 64 bucket inputs, made once per database.
-            let buckets: Box<[PathBucket]> = (0..BUCKETS)
-                .map(|bucket| {
-                    PathBucket::new(&*db, Durability::MEDIUM, InputId(self.content(bucket)))
-                })
-                .collect(); // alloc: as above.
-            let table = PathTable(self.table.clone()); // clone: a refcount, once per database.
-            self.input = Some(NamedPaths::new(db, Durability::HIGH, table, buckets));
-            return;
-        };
-        while dirty != 0 {
-            let bucket = dirty.trailing_zeros() as usize;
-            dirty &= dirty - 1;
-            let content = InputId(self.content(bucket));
-            let input = input.buckets(&*db)[bucket];
-            if input.content(&*db) != content {
-                input.set_content(db).with_durability(Durability::MEDIUM).to(content);
-            }
-        }
+        dirty != 0
+    }
+
+    /// Makes the index's inputs in the session arena being made: each bucket with its content
+    /// ID, and the singleton that names them and the table.
+    pub(crate) fn make(&self, inputs: &Inputs<'_>) {
+        let mut buckets = Vec::with_capacity_in(BUCKETS, Global);
+        buckets.extend((0..BUCKETS).map(|bucket| {
+            let content = self.content(bucket);
+            let fact = Fact {
+                id: ContentId::of(BUCKET_FACT_DOMAIN, &(bucket as u32).to_le_bytes()),
+                digest: content,
+            };
+            PathBucket::new(inputs, fact, InputId(content))
+        }));
+        // The handles hold nothing a reader keys on but through the buckets: the singleton's
+        // digest is of its domain alone.
+        let fact = facts::singleton(NAMED_PATHS_DOMAIN, InputId(ContentId::of(NAMED_PATHS_DOMAIN, b"")));
+        let table = PathTable(Arc::clone(&self.table));
+        NamedPaths::set(inputs, fact, table, buckets.into_boxed_slice());
     }
 }
 

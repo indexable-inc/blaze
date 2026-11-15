@@ -110,7 +110,7 @@ fn candidates<'db>(
         AssocItemId::ConstId(konst).assoc_visibility(db).is_visible_from(db, cx.module)
     };
     let block_maps = blocks.iter().filter_map(|&block| match body.expr(block) {
-        Expr::Block { id: Some(id), .. } => Some(block_def_map(db, id.to_db(db))),
+        Expr::Block { id: Some(id), .. } => Some(block_def_map(db, id)),
         _ => None,
     });
     let def_maps = std::iter::once(crate_def_map(db, cx.krate)).chain(block_maps);

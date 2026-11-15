@@ -45,8 +45,8 @@ fn a_check_posted_again_runs_a_plan_of_its_own() {
     let names = [(file, "src/lib.rs".to_owned())].into_iter().collect();
     let files = Files::new(&names, "");
     let options = Options::default();
-    let krate = blaze_query::db::attach(&db, || hir::check::workspace_crates(&db)[0]);
-    let checking = blaze_query::db::attach(&db, || Checking::new(&db, krate));
+    let krate = blaze_memo::attach(&db, || hir::check::workspace_crates(&db)[0]);
+    let checking = blaze_memo::attach(&db, || Checking::new(&db, krate));
 
     let first = checking.check(&db, files, &options);
     assert!(failed(&first.diags), "the broken body fails the check: {:?}", first.diags);
@@ -73,10 +73,12 @@ fn a_check_begun_in_a_later_view_than_its_checking_runs_a_plan_of_that_view() {
     let names = [(file, "src/lib.rs".to_owned())].into_iter().collect();
     let files = Files::new(&names, "");
     let options = Options::default();
-    let krate = blaze_query::db::attach(&db, || hir::check::workspace_crates(&db)[0]);
-    let checking = blaze_query::db::attach(&db, || Checking::new(&db, krate));
+    let krate = blaze_memo::attach(&db, || hir::check::workspace_crates(&db)[0]);
+    let checking = blaze_memo::attach(&db, || Checking::new(&db, krate));
 
-    db.set_file_text(file, "pub fn clean() -> u8 { 1 }\npub fn broken() { let _: u8 = 2; }\n");
+    let mut edit = db.edit();
+    edit.set_file_text(file, "pub fn clean() -> u8 { 1 }\npub fn broken() { let _: u8 = 2; }\n");
+    _ = edit.commit();
     let check = checking.check(&db, files, &options);
     assert!(!failed(&check.diags), "the body is mended in the view checked: {:?}", check.diags);
     assert!(!checking.stopped());

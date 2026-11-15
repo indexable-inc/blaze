@@ -1581,9 +1581,16 @@ pub mod m { #![doc(hidden)] #[must_use] pub fn b() -> u8 { 0 } }
     assert!(by_name("a").contains(AttrFlags::IS_INLINE));
 }
 
+/// PORT (round 20): false by design on blaze-memo, left failing. It claimed an edit of a fn's
+/// body runs no query of its crate but the body's; on the port an edit makes the edited
+/// crate's arena again, so its resolution (`crate_served`, `crate_resolution`, the facts
+/// rounds), its item trees and its attribute queries run again. A claim about a crate the edit
+/// does not touch would still hold; this one is about the edited crate itself.
+///
 /// An edit of a fn's body leaves the file's outline the same, so no attribute query of the
 /// file runs again, and each reads what it did.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_runs_no_attribute_query() {
     const CODE: &str = r#"
 #![doc(hidden)]
@@ -2439,11 +2446,16 @@ fn function_named(db: &TestDB, name: &str) -> FunctionId {
         .unwrap_or_else(|| panic!("no function `{name}`"))
 }
 
+/// PORT (round 20): false by design on blaze-memo, left failing. It claimed an edit of `f`'s
+/// body leaves `generic_params_attr_flags`'s row verified; on the port an edit makes the
+/// edited crate's arena again, so every row of that crate, this one among them, runs again.
+///
 /// The invariant: the flags of a function's generic parameters are read off the item's
 /// outline, so an edit of its body leaves `generic_params_attr_flags`'s row verified, not run
 /// (it read the file's live parse before, and ran again on every edit of the file). The
 /// control: an edit of the parameter list itself runs it, so the log is seen to hold it.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_leaves_the_generic_parameters_flags_verified() {
     let fx = fixture::db("fn f<#[cfg(all())] T>(t: T) -> u32 { 1 }\nfn g() {}\n");
     let file = fx.only_file();
@@ -2453,7 +2465,10 @@ fn a_body_edit_leaves_the_generic_parameters_flags_verified() {
     let file = file.file_id(&db);
     let ran = |db: &mut TestDB, text: &str| {
         db.executed_in_write(|db| {
-            db.set_file_text(file, text);
+            _ = db.set_file_text(file, text);
+            // `f` again in the new snapshot: the commit drops the crate's arena, which homes
+            // the id it had.
+            let f = function_named(db, "f");
             _ = AttrFlags::query_generic_params(db, f.into());
         })
         .iter()

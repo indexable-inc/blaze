@@ -21,7 +21,7 @@
 //! identity.
 //!
 //! The cycle detector is a query that asks every callee's and returns `false`, with
-//! `cycle_result = true`: blaze_query gives every member of a query cycle the fallback, so it
+//! `cycle_result = true`: blaze_memo gives every member of a query cycle the fallback, so it
 //! is `true` exactly on the nodes of a cycle (and a self-loop), whatever order queries ran in.
 
 use std::{alloc::Global, hash::Hash};

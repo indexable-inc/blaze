@@ -4,6 +4,7 @@ use std::ops::ControlFlow;
 
 use base_db::{Crate, Db};
 use blaze_mem::Frame;
+use blaze_memo::ArenaId;
 use span::{Edition, Span, SyntaxContext};
 use syntax::{
     ast,
@@ -27,6 +28,9 @@ pub struct DeclarativeMacroExpander {
     pub mac: mbe::DeclarativeMacro,
     pub transparency: Transparency,
     edition: Edition,
+    /// The table the definition's token contexts are of ([`HirFileId::context_arena`] of the
+    /// file it is written in): a call's marker carries them into the calling crate's table.
+    pub(crate) table: ArenaId,
 }
 
 impl DeclarativeMacroExpander {
@@ -82,24 +86,29 @@ impl DeclarativeMacroExpander {
     }
 
     /// The hygiene `call_id`'s expansion marks each span with, `marks` keeping the contexts made.
+    /// Every span it marks is a definition token's (mbe marks only what the rules wrote), so
+    /// its context is of [`Self::table`], carried into the call's table before the mark: the
+    /// one place a context crosses crates (a macro of a dependency expanded here).
     fn marker<'a>(
         &'a self,
         db: &'a Db,
         call_id: MacroCallId,
         marks: &'a MarkCache<SyntaxContext, SyntaxContext>,
     ) -> impl Fn(&mut Span) + Copy + 'a {
+        let call: span::MacroCallId = call_id.into();
         move |s| {
             s.ctx = marks.get_or_insert_with(s.ctx, |ctx| {
-                apply_mark(db, ctx, call_id.into(), self.transparency, self.edition)
+                let ctx = ctx.translate(db, self.table, call.arena());
+                apply_mark(db, call.arena(), ctx, call, self.transparency, self.edition)
             })
         }
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl AstId<ast::Macro> {
     /// Fetches (and compiles) the expander of this decl macro.
-    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
     pub fn decl_macro_expander(self, db: &Db, def_crate: Crate) -> DeclarativeMacroExpander {
         let id = self;
         // A definition written in a file, of a database that keeps definitions: found by what
@@ -115,14 +124,20 @@ impl AstId<ast::Macro> {
         if let Some((kept, file, hash)) = kept
             && let Some(def) = stored::find(db, kept, file, id.value.erase(), def_crate, hash)
         {
-            return def.compile(def_crate.data(db).edition);
+            return def.compile(def_crate.data(db).edition, id.file_id.context_arena());
+        }
+        // Made from its file's syntax below, kept or not: a file of a crate given by its
+        // address with no text here is refused first, typed and naming it (`stored::demand_text`).
+        if let HirFileId::FileId(file) = id.file_id {
+            stored::demand_text(db, def_crate, file);
         }
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let map = id.file_id.span_map(db);
             // What is kept of the definition, written as its trees are made: none of one with
             // no row, whose text its spans could not be read back to (`stored::Place::of`).
-            let mut written = kept.and_then(|(_, file, _)| {
-                stored::Place::of(db, file, id.value.erase(), def_crate).map(stored::Writer::new)
+            let mut written = kept.and_then(|(kept, file, _)| {
+                stored::Place::of(db, kept, file, id.value.erase(), def_crate)
+                    .map(|place| stored::Writer::new(place, frame))
             });
             let read_cfg = std::cell::Cell::new(false);
 
@@ -154,13 +169,17 @@ impl AstId<ast::Macro> {
                     },
                 )
             };
+            // The definition's contexts, and its file's call site, are of this table.
+            let table = id.file_id.context_arena();
             let ctx_edition = |ctx: SyntaxContext| {
                 if ctx.is_root() {
                     def_crate.data(db).edition
                 } else {
                     // UNWRAP-SAFETY: Only the root context has no outer expansion
-                    let krate =
-                        crate::MacroCallId::from(ctx.outer_expn(db).unwrap()).loc(db).def.krate;
+                    let krate = crate::MacroCallId::from(ctx.outer_expn(db, table).unwrap())
+                        .loc(db)
+                        .def
+                        .krate;
                     krate.data(db).edition
                 }
             };
@@ -249,7 +268,7 @@ impl AstId<ast::Macro> {
                 }
                 stored::keep(db, kept, file, id.value.erase(), def_crate, hash, written);
             }
-            DeclarativeMacroExpander { mac, transparency, edition }
+            DeclarativeMacroExpander { mac, transparency, edition, table }
         })
     }
 }

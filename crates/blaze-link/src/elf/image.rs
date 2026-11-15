@@ -3,9 +3,22 @@
 //!
 //! [`file`] reads the synthetic regions' bytes from [`Placed::contents`], where the core puts
 //! what [`crate::model::Writer::synthesize`] returned, so no table is built twice. An
-//! incremental output keeps the tail past the debug sections and, where [`Placed::delta`]
-//! spliced functions without changing any name's length, rewrites only their local symbols
-//! and names in it; the rest of the tail is small and written whole.
+//! incremental output keeps the tail past the debug sections and patches it: each function's
+//! local symbol and name keep their places, and a function come or gone takes or frees one
+//! ([`KeptSymtab`]); the globals' run and the section headers are small and written whole.
+//!
+//! **The locals' order.** A tail made whole lists the functions' local symbols by a fixed hash
+//! of their names, never by address ([`crate::model::local_order`], which says why); a patched
+//! one keeps each where it was placed.
+//!
+//! **Floor and cost.** The floor of a patch is the entries and names of the functions that
+//! changed: 24 bytes and a name each. A patch writes those, and the globals' symbols, names and
+//! section headers whole into the kept bytes (`O(exports + imports + sections)`), which the
+//! commit compares with the last file's so only changed words reach the file
+//! (`crate::file`'s `narrowed`). Making the tail whole (a full link, an open whose state kept no
+//! places, or the room used up) is `O(functions)`, once per eighth of the locals added.
+
+use std::alloc::Global;
 
 use blaze_format::cursor::Put;
 use blaze_graph::par;
@@ -180,15 +193,45 @@ impl Layout {
     fn shoff(&self) -> usize {
         (self.shstrtab() + self.shstrtab_len).next_multiple_of(8)
     }
+
+    /// The tail's bytes from `len`: what [`file`] makes of it.
+    fn size(&self) -> usize {
+        self.shoff() + self.shdrs * SHDR - self.len
+    }
+}
+
+/// The empty room an incremental output's `.symtab` keeps past its live locals (`least` 16
+/// entries) and `.strtab` past their names (`least` 1 KiB): an eighth of what is live and
+/// `least`, so a patch that adds a function finds a place for it, and the tables are made whole
+/// again (with new room) only once an eighth of them came since.
+fn spare_room(live: usize, least: usize) -> usize {
+    live / 8 + least
 }
 
 /// The tail past the debug sections as [`file`] made it, kept to patch the next.
+///
+/// **Places.** An incremental output's locals keep their places for their lives: a function's
+/// local symbol keeps its `.symtab` index and its name its run of `.strtab` from the link that
+/// placed it until the tail is made whole. A function gone leaves its entry zeroed (the null
+/// symbol's bytes: `STT_NOTYPE`, `SHN_UNDEF`, no name, which the `backtrace` crate's symboliser
+/// skips, as ix-prof's does, reading only text symbols at an address) and its name's run free;
+/// a function come takes the lowest free entry and the smallest free run its name fits
+/// ([`KeptSymtab::place_locals`]). The names' runs freed are not merged, so `.strtab` holds
+/// dead bytes: at most the room it was made with, since a name that fits no run makes the tail
+/// whole. So a patched tail is history, not a function of the image: it is kept with the state
+/// ([`KeptSymtab::keep`]), and a tail made whole lists the locals in name order
+/// ([`crate::model::local_order`]) with the room after them, the canonical form a full link
+/// writes. A patched file is a full link's but for where each local is: the same symbols.
 #[derive(Default)]
 pub(crate) struct KeptSymtab {
     synthesis: u64,
     layout: Layout,
     /// By function, in [`Placed::functions`] order.
     locals: Vec<Local>,
+    /// The `.symtab` indexes of the locals' entries that are empty.
+    free: std::collections::BTreeSet<u32>,
+    /// The runs of `.strtab`'s locals' names that no name holds, as (length, offset).
+    holes: std::collections::BTreeSet<(u32, u32)>,
     /// What the last link's file holds too.
     bytes: CowBytes,
     /// The globals' symbols and the run from their names to the section headers, as a patch
@@ -209,57 +252,222 @@ struct Local {
 }
 
 impl KeptSymtab {
-    /// Whether each function `splices` put in has a name where the one it replaced had, of
-    /// the length that one's had: then every local keeps its index and its name's place.
-    fn same_locals(&self, functions: &[Function], splices: &[Splice]) -> bool {
-        self.locals.len() == functions.len()
-            && splices.iter().all(|splice| {
-                let (start, end) = (splice.new.start as usize, splice.new.end as usize);
-                match (functions.get(start..end), self.locals.get(start..end)) {
-                    (Some(functions), Some(locals)) => {
-                        functions.iter().zip(locals).all(|(function, local)| {
-                            match function.name.as_deref() {
-                                None => local.sym == 0,
-                                Some(name) => {
-                                    local.sym != 0 && local.stored as usize == stored(name)
-                                }
-                            }
-                        })
+    /// Places the locals of the functions `splices` put in, in the kept tail of the last link:
+    /// a function named as one the splice took out takes that one's entry and name (rewritten
+    /// with its value, size and section); a local taken out and not put back is zeroed and
+    /// freed; a function named anew takes the lowest free entry and the smallest free run of
+    /// `.strtab` its name fits, its name written there. The frees come before the places, so a
+    /// rename takes the entry the old name left. False when the splices are not of the kept
+    /// list or the room is used up; the tail is then made whole, which resets every place, so
+    /// what this changed before it gave up is never read.
+    fn place_locals(&mut self, regions: &[Region], functions: &[Function], splices: &[Splice]) -> bool {
+        let (symtab, strtab) = (self.layout.symtab() - self.layout.len, self.layout.strtab() - self.layout.len);
+        let (mut old_end, mut len) = (0, self.locals.len());
+        for splice in splices {
+            let (old, new) = (&splice.old, &splice.new);
+            if old.start < old_end
+                || old.end < old.start
+                || old.end as usize > self.locals.len()
+                || new.end < new.start
+                || new.end as usize > functions.len()
+            {
+                return false;
+            }
+            old_end = old.end;
+            len = len - old.len() + new.len();
+        }
+        if len != functions.len() {
+            return false;
+        }
+        const UNSET: u32 = u32::MAX;
+        let (mut taken, mut gone) = (Vec::new_in(Global), Vec::new_in(Global));
+        for splice in splices {
+            let old = &self.locals[splice.old.start as usize..splice.old.end as usize];
+            let new = &functions[splice.new.start as usize..splice.new.end as usize];
+            let bytes = &self.bytes;
+            // The splice's old locals by name, read where they are in the kept `.strtab`.
+            let mut by_name = Vec::with_capacity_in(old.len(), Global);
+            by_name.extend((0..old.len()).filter(|at| old[*at].sym != 0).map(|at| {
+                let local = old[at];
+                (bytes.read(strtab + local.name as usize, (local.stored as usize).saturating_sub(1)), at)
+            }));
+            by_name.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let mut used = Vec::with_capacity_in(old.len(), Global);
+            used.resize(old.len(), false);
+            for function in new {
+                let Some(name) = function.name.as_deref() else {
+                    taken.push(Local::default());
+                    continue;
+                };
+                let first = by_name.partition_point(|it| &*it.0 < name.as_bytes());
+                let found = (by_name[first..].iter())
+                    .take_while(|it| &*it.0 == name.as_bytes())
+                    .find(|it| !used[it.1])
+                    .map(|it| it.1);
+                match found {
+                    Some(at) => {
+                        used[at] = true;
+                        taken.push(old[at]);
                     }
-                    _ => false,
+                    None => taken.push(Local { sym: UNSET, name: 0, stored: stored(name) as u32 }),
                 }
-            })
-    }
-
-    /// Rewrites the local symbol and name of each function `splices` put in, once
-    /// [`KeptSymtab::same_locals`] held; `symtab` and `strtab` are where the tables are in the
-    /// kept bytes.
-    fn patch_locals(
-        &mut self,
-        regions: &[Region],
-        functions: &[Function],
-        splices: &[Splice],
-        symtab: usize,
-        strtab: usize,
-    ) {
+            }
+            gone.extend((0..old.len()).filter(|at| old[*at].sym != 0 && !used[*at]).map(|at| old[at]));
+        }
+        for local in &gone {
+            self.free.insert(local.sym);
+            if local.stored != 0 {
+                self.holes.insert((local.stored, local.name));
+            }
+            self.bytes.update(symtab + SYM * local.sym as usize, &[0; SYM]);
+        }
+        let mut at = 0;
+        for splice in splices {
+            for function in &functions[splice.new.start as usize..splice.new.end as usize] {
+                let local = &mut taken[at];
+                at += 1;
+                if local.sym != UNSET {
+                    continue;
+                }
+                let Some(sym) = self.free.pop_first() else { return false };
+                local.sym = sym;
+                if local.stored == 0 {
+                    continue;
+                }
+                let Some(&(run, offset)) = self.holes.range((local.stored, 0)..).next() else { return false };
+                self.holes.remove(&(run, offset));
+                if run > local.stored {
+                    self.holes.insert((run - local.stored, offset + local.stored));
+                }
+                local.name = offset;
+                let name = function.name.as_deref().unwrap_or_default();
+                self.bytes.update(strtab + offset as usize, name.as_bytes());
+                self.bytes.update(strtab + offset as usize + name.len(), &[0]);
+            }
+        }
+        // Back to front, so each splice's place in the kept list is still the last link's.
+        let mut end = taken.len();
+        for splice in splices.iter().rev() {
+            let start = end - splice.new.len();
+            self.locals.splice(splice.old.start as usize..splice.old.end as usize, taken[start..end].iter().copied());
+            end = start;
+        }
         for splice in splices {
             for at in splice.new.start as usize..splice.new.end as usize {
                 let (function, local) = (&functions[at], self.locals[at]);
-                let Some(name) = function.name.as_deref() else { continue };
-                let symbol = local_symbol(regions, function, local.name);
-                self.bytes.update(symtab + SYM * local.sym as usize, &symbol.bytes());
-                self.bytes.update(strtab + local.name as usize, name.as_bytes());
+                if local.sym != 0 {
+                    let symbol = local_symbol(regions, function, local.name);
+                    self.bytes.update(symtab + SYM * local.sym as usize, &symbol.bytes());
+                }
             }
         }
+        true
     }
-}
 
-/// By chunk of [`CHUNK`] functions: how many are named and the bytes their names take.
-fn name_counts(functions: &[Function]) -> Vec<(usize, usize)> {
-    par::map(par::chunks(functions, CHUNK), |chunk| {
-        (chunk.iter().filter_map(|it| it.name.as_deref()))
-            .fold((0, 0), |(count, len), name| (count + 1, len + stored(name)))
-    }) // alloc: once per image, one count per chunk of functions
+    /// Whether it holds no tail.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.synthesis == 0
+    }
+
+    /// The tail's places for a kept state, when they are of the state's synthesis `of`: its
+    /// layout, each function's local, the free entries and the free runs of names. The bytes
+    /// are the state's part, not kept twice.
+    pub(crate) fn keep<A: std::alloc::Allocator>(&self, of: u64, out: &mut crate::keep::Out<A>) {
+        let held = self.synthesis != 0 && self.synthesis == of;
+        out.bool(held);
+        if !held {
+            return;
+        }
+        let layout = &self.layout;
+        out.u64(layout.tail);
+        for it in [
+            layout.len,
+            layout.named,
+            layout.function_names,
+            layout.global_names,
+            layout.globals,
+            layout.shstrtab_len,
+            layout.shdrs,
+        ] {
+            out.len(it);
+        }
+        out.len(self.locals.len());
+        for local in &self.locals {
+            out.u32(local.sym);
+            out.u32(local.name);
+            out.u32(local.stored);
+        }
+        out.len(self.free.len());
+        for sym in &self.free {
+            out.u32(*sym);
+        }
+        out.len(self.holes.len());
+        for &(run, offset) in &self.holes {
+            out.u32(run);
+            out.u32(offset);
+        }
+    }
+
+    /// The places [`KeptSymtab::keep`] wrote, as of the opened state's synthesis `synthesis`,
+    /// over the opened state's tail part among `parts` (shared with it until a patch writes a
+    /// page). Every entry is held by one local or free, every name and free run is within the
+    /// locals' names, and the part is the layout's length: else the state is refused.
+    pub(crate) fn open(
+        input: &mut crate::keep::In<'_>,
+        synthesis: u64,
+        parts: &[(u64, CowBytes)],
+    ) -> Result<KeptSymtab, crate::keep::Bad> {
+        use crate::keep::Bad;
+        if !input.bool()? {
+            return Ok(KeptSymtab::default());
+        }
+        let tail = input.u64()?;
+        let mut sizes = [0usize; 7];
+        for it in &mut sizes {
+            *it = input.len()?;
+        }
+        let [len, named, function_names, global_names, globals, shstrtab_len, shdrs] = sizes;
+        let layout = Layout { tail, len, named, function_names, global_names, globals, shstrtab_len, shdrs };
+        let count = input.count(12)?;
+        let mut locals = Vec::with_capacity_in(count, Global);
+        for _ in 0..count {
+            locals.push(Local { sym: input.u32()?, name: input.u32()?, stored: input.u32()? });
+        }
+        let mut free = std::collections::BTreeSet::new_in(Global);
+        for _ in 0..input.count(4)? {
+            free.insert(input.u32()?);
+        }
+        let mut holes = std::collections::BTreeSet::new_in(Global);
+        for _ in 0..input.count(8)? {
+            holes.insert((input.u32()?, input.u32()?));
+        }
+        let Some((_, bytes)) = parts.iter().find(|it| it.0 == tail + len as u64) else {
+            return Err(Bad::What("`.symtab` places kept for a state with no symbol table part"));
+        };
+        if bytes.len() != layout.size() {
+            return Err(Bad::What("a symbol table part not of its kept layout's length"));
+        }
+        // Every entry of the locals' run held once, by a local or as free.
+        let names_end = 1 + function_names as u64;
+        let mut held = std::collections::BTreeSet::new_in(Global);
+        for local in locals.iter().filter(|it| it.sym != 0) {
+            if local.sym as usize > named
+                || free.contains(&local.sym)
+                || !held.insert(local.sym)
+                || u64::from(local.name) + u64::from(local.stored) > names_end
+            {
+                return Err(Bad::What("a local's `.symtab` entry past the locals, held twice, or its name past theirs"));
+            }
+        }
+        if free.first() == Some(&0) || free.last().is_some_and(|it| *it as usize > named) || held.len() + free.len() != named {
+            return Err(Bad::What("`.symtab`'s free entries not the locals' entries no local holds"));
+        }
+        if holes.iter().any(|&(run, offset)| offset == 0 || u64::from(offset) + u64::from(run) > names_end) {
+            return Err(Bad::What("a free run of `.strtab` past the locals' names"));
+        }
+        // clone: two reference counts, the tail shared with the opened state's part
+        Ok(KeptSymtab { synthesis, layout, locals, free, holes, bytes: bytes.clone(), ..KeptSymtab::default() })
+    }
 }
 
 fn local_symbol(regions: &[Region], function: &Function, name: u32) -> Sym {
@@ -690,44 +898,16 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         shdrs.push(shdr);
     }
 
-    // `.symtab`: the functions by name (locals, for backtraces and debuggers), then the
-    // exports and the imports. Each name has its own place in `.strtab`, unshared as mold
-    // writes it, so both tables are laid out by prefix sums over chunks of functions and
-    // filled in parallel, straight into the file's tail. An incremental output keeps the
-    // tail and, when only functions' symbols changed and no name's length did, rewrites
-    // those in place.
-    let mut last = writer.last();
-    let mut kept = last.as_deref_mut().map(|it| &mut it.symtab);
-    let from = kept.as_deref_mut().map_or(0, |it| std::mem::replace(&mut it.synthesis, 0));
-    let patch = match (kept.as_deref(), placed.delta) {
-        (Some(kept), Some(delta)) => {
-            from != 0
-                && delta.patches(from, &[delta.functions])
-                && kept.same_locals(placed.functions, delta.functions)
-        }
-        _ => false,
-    };
-    let (mut chunks, named, function_names) = match kept.as_deref() {
-        // alloc: none, an empty Vec holds no buffer
-        Some(kept) if patch => (Vec::new(), kept.layout.named, kept.layout.function_names),
-        _ => {
-            let chunks = name_counts(placed.functions);
-            let named: usize = chunks.iter().map(|it| it.0).sum();
-            let function_names: usize = chunks.iter().map(|it| it.1).sum();
-            (chunks, named, function_names)
-        }
-    };
+    // `.symtab`: the functions' locals (for backtraces and debuggers), then the exports and
+    // the imports. Each name has its own place in `.strtab`, unshared as mold writes it. A
+    // tail made whole lists the locals by their names' hash (the module doc's order), laid out
+    // by prefix sums over chunks of functions and filled in parallel, straight into the file's
+    // tail, an incremental output's with room after them ([`room`]). An incremental output
+    // keeps the tail and patches it while its layout holds: each local keeps its place, and a
+    // function come or gone takes or frees one ([`KeptSymtab::place_locals`]).
     let global_names = placed.exports.iter().map(|it| stored(&it.name)).sum::<usize>()
         + placed.imports.iter().map(|it| stored(&it.name)).sum::<usize>();
-    let symbols = 1 + named + placed.exports.len() + placed.imports.len();
-    let strtab_len = 1 + function_names + global_names;
-    if u32::try_from(strtab_len).is_err() {
-        return Err(error(format!(
-            "{strtab_len} bytes of symbol names, more than .strtab offsets reach"
-        ))); // alloc: error path
-    }
-    let first_global = 1 + named as u32;
-
+    let globals = placed.exports.len() + placed.imports.len();
     let tail = regions
         .iter()
         .filter(|it| !zeroed(&it.class))
@@ -746,11 +926,64 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         });
         len += data.len();
     }
+    // The last three sections' names, added now so the layout is known before the locals are
+    // placed: nothing is added to `.shstrtab` after them.
+    let (symtab_name, strtab_name, shstrtab_name) =
+        (names.add(".symtab"), names.add(".strtab"), names.add(".shstrtab"));
+    let shdr_count = shdrs.len() + 3;
+
+    let mut last = writer.last();
+    let mut kept = last.as_deref_mut().map(|it| &mut it.symtab);
+    let from = kept.as_deref_mut().map_or(0, |it| std::mem::replace(&mut it.synthesis, 0));
+    let splices = placed.delta.map_or(&[][..], |it| it.functions);
+    let patched = match (kept.as_deref_mut(), placed.delta) {
+        (Some(kept), Some(delta)) => {
+            let held = &kept.layout;
+            from != 0
+                && delta.from == from
+                && delta.same_places
+                && (held.tail, held.len, held.global_names, held.globals, held.shstrtab_len, held.shdrs)
+                    == (tail, len, global_names, globals, names.bytes.len(), shdr_count)
+                && kept.bytes.len() == held.size()
+                && kept.place_locals(regions, placed.functions, splices)
+        }
+        _ => false,
+    };
+    let (order, chunks, named, function_names) = match kept.as_deref() {
+        Some(kept) if patched => (Vec::new_in(Global), Vec::new_in(Global), kept.layout.named, kept.layout.function_names),
+        _ => {
+            // Every named function's index, in `.symtab`'s order of locals
+            // ([`crate::model::local_order`]); by chunk of [`CHUNK`] of them, how many there are
+            // and the bytes their names take.
+            let order = crate::model::local_order(placed.functions, |_| true, Global);
+            let chunks = par::map(par::chunks(&order, CHUNK), |chunk| {
+                let len: usize =
+                    (chunk.iter().filter_map(|at| placed.functions[*at as usize].name.as_deref())).map(stored).sum();
+                (chunk.len(), len)
+            });
+            let live: usize = chunks.iter().map(|it| it.0).sum();
+            let live_names: usize = chunks.iter().map(|it| it.1).sum();
+            let (named, function_names) = match writer.output.incremental {
+                true => (live + spare_room(live, 16), live_names + spare_room(live_names, 1024)),
+                false => (live, live_names),
+            };
+            (order, chunks, named, function_names)
+        }
+    };
+    let symbols = 1 + named + globals;
+    let strtab_len = 1 + function_names + global_names;
+    if u32::try_from(strtab_len).is_err() {
+        return Err(error(format!(
+            "{strtab_len} bytes of symbol names, more than .strtab offsets reach"
+        )));
+    }
+    let first_global = 1 + named as u32;
+
     let symtab_at = len.next_multiple_of(8);
     let strtab_at = symtab_at + symbols * SYM;
     let symtab_index = shdrs.len() as u32;
     shdrs.push(Shdr {
-        name: names.add(".symtab"),
+        name: symtab_name,
         sh_type: elf::SHT_SYMTAB,
         offset: tail + symtab_at as u64,
         size: (symbols * SYM) as u64,
@@ -761,7 +994,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         ..Shdr::default()
     });
     shdrs.push(Shdr {
-        name: names.add(".strtab"),
+        name: strtab_name,
         sh_type: elf::SHT_STRTAB,
         offset: tail + strtab_at as u64,
         size: strtab_len as u64,
@@ -769,7 +1002,6 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         ..Shdr::default()
     });
     let shstrndx = shdrs.len();
-    let shstrtab_name = names.add(".shstrtab");
     let shstrtab_at = strtab_at + strtab_len;
     shdrs.push(Shdr {
         name: shstrtab_name,
@@ -791,13 +1023,13 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         named,
         function_names,
         global_names,
-        globals: placed.exports.len() + placed.imports.len(),
+        globals,
         shstrtab_len: names.bytes.len(),
         shdrs: shdrs.len(),
     };
     debug_assert_eq!(
-        (layout.symtab(), layout.strtab(), layout.shoff()),
-        (symtab_at, strtab_at, shoff_at)
+        (layout.symtab(), layout.strtab(), layout.shoff(), layout.shdrs),
+        (symtab_at, strtab_at, shoff_at, shdr_count)
     );
 
     // The tail after the debug sections: the padding to `.symtab`, the symbol tables and the
@@ -806,9 +1038,8 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     let size = shoff_at + shdrs.len() * SHDR - len;
     let (symtab, strtab) = (symtab_at - len, strtab_at - len);
     let bytes = match kept {
-        Some(kept) if patch && kept.layout == layout && kept.bytes.len() == size => {
-            let splices = placed.delta.map_or(&[][..], |it| it.functions);
-            kept.patch_locals(regions, placed.functions, splices, symtab, strtab);
+        Some(kept) if patched => {
+            debug_assert!(kept.layout == layout && kept.bytes.len() == size, "a patched tail keeps its layout");
             let (syms, names_at) = globals_at(&layout);
             let scratch = &mut kept.scratch;
             scratch.clear();
@@ -826,54 +1057,56 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
             kept.bytes.clone()
         }
         mut kept => {
-            if patch {
-                chunks = name_counts(placed.functions);
-            }
             // alloc: the output buffer, the file's tail past its debug info
             let mut bytes = vec![0u8; size];
             {
-                let locals: &mut [Local] = match kept.as_deref_mut() {
-                    Some(kept) => {
-                        kept.locals.clear();
-                        kept.locals.resize(placed.functions.len(), Local::default());
-                        &mut kept.locals[..]
-                    }
-                    None => &mut [],
-                };
+                let functions = placed.functions;
                 let (head, rest) = bytes.split_at_mut(strtab);
                 let functions_syms = &mut head[symtab..symtab + SYM * (1 + named)];
                 let function_strs = &mut rest[..1 + function_names];
-                let (mut syms, mut strs, mut locals) =
-                    (&mut functions_syms[SYM..], &mut function_strs[1..], locals);
-                let mut jobs = Vec::with_capacity(chunks.len());
-                let (mut name_at, mut sym_at) = (1u32, 1u32);
-                for (chunk, &(count, len)) in placed.functions.chunks(CHUNK).zip(&chunks) {
+                let (mut syms, mut strs) = (&mut functions_syms[SYM..], &mut function_strs[1..]);
+                let mut jobs = Vec::with_capacity_in(chunks.len(), Global);
+                let mut name_at = 1u32;
+                for (chunk, &(count, len)) in order.chunks(CHUNK).zip(&chunks) {
                     let (these_syms, rest) = std::mem::take(&mut syms).split_at_mut(SYM * count);
                     syms = rest;
                     let (these_strs, rest) = std::mem::take(&mut strs).split_at_mut(len);
                     strs = rest;
-                    let kept_here = if locals.is_empty() { 0 } else { chunk.len() };
-                    let (these_locals, rest) = std::mem::take(&mut locals).split_at_mut(kept_here);
-                    locals = rest;
-                    jobs.push((chunk, these_syms, these_strs, these_locals, name_at, sym_at));
+                    jobs.push((chunk, these_syms, these_strs, name_at));
                     name_at += len as u32;
-                    sym_at += count as u32;
                 }
-                par::for_each(jobs, |(chunk, syms, strs, locals, name_at, sym_at)| {
+                par::for_each(jobs, |(chunk, syms, strs, name_at)| {
                     let mut strings = Names { bytes: strs, at: 0, offset: name_at };
-                    let mut out = syms.chunks_exact_mut(SYM);
-                    let mut sym = sym_at;
-                    for (at, function) in chunk.iter().enumerate() {
-                        let Some(name) = function.name.as_deref() else { continue };
+                    for (at, out) in chunk.iter().zip(syms.chunks_exact_mut(SYM)) {
+                        let function = &functions[*at as usize];
+                        let name = function.name.as_deref().expect("`local_order` gives only named functions");
                         let offset = strings.add(name);
-                        let symbol = local_symbol(regions, function, offset);
-                        out.next().expect("a symbol counted").copy_from_slice(&symbol.bytes());
-                        if let Some(local) = locals.get_mut(at) {
-                            *local = Local { sym, name: offset, stored: stored(name) as u32 };
-                        }
-                        sym += 1;
+                        out.copy_from_slice(&local_symbol(regions, function, offset).bytes());
                     }
                 });
+                // Each function's local by its index in `functions`, for the next link's
+                // patch: one pass over the order, as the fill above laid the names out.
+                if let Some(kept) = kept.as_deref_mut() {
+                    kept.locals.clear();
+                    kept.locals.resize(functions.len(), Local::default());
+                    let mut name_at = 1u32;
+                    for (nth, at) in order.iter().enumerate() {
+                        let name = functions[*at as usize].name.as_deref().unwrap_or_default();
+                        let stored = stored(name) as u32;
+                        let name = if stored == 0 { 0 } else { name_at };
+                        kept.locals[*at as usize] = Local { sym: 1 + nth as u32, name, stored };
+                        name_at += stored;
+                    }
+                    // The room: the entries after the live ones, and the names' run after
+                    // theirs, which starts at `name_at`.
+                    kept.free.clear();
+                    kept.free.extend(1 + order.len() as u32..1 + named as u32);
+                    kept.holes.clear();
+                    let names_end = 1 + function_names as u32;
+                    if names_end > name_at {
+                        kept.holes.insert((names_end - name_at, name_at));
+                    }
+                }
             }
             {
                 let (syms, names_at) = globals_at(&layout);

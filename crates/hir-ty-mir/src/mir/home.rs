@@ -239,7 +239,7 @@ fn written_compiled_by_user(db: &Db, body: Body, args: GenericArgs<'_>) -> Optio
 
 /// [`home`] of an instance whose named crates are all loaded by `lowest`, one of them. What
 /// the answer reads of the instance is `lowest` alone, so the memo is keyed by it.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn home_over(db: &Db, asker: Crate, lowest: Crate) -> Option<Crate> {
     if lowest == asker {
         return Some(asker);
@@ -257,7 +257,7 @@ fn home_over(db: &Db, asker: Crate, lowest: Crate) -> Option<Crate> {
 /// Whether the walk of an instance that names only crates `home` loads answers in `home` as in
 /// `asker` (the module's argument): `asker` loads it, their lang items are equal, they solve
 /// alike, and no crate `asker` loads and `home` does not is a dependency of `home`'s.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub fn stands_for(db: &Db, home: Crate, asker: Crate) -> bool {
     if home == asker {
         return true;

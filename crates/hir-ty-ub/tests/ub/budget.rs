@@ -58,11 +58,11 @@ fn steps_and_site_hits_allocate_nothing() {
     let fx = fixture::db(program!("sized", "fn main() {}\n"));
     let file = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let owner = InferBodyId::DefWithBodyId(main_of(&db, file).into());
         let a = Site { owner, span: MirSpan::Unknown };
         let b = Site { owner, span: MirSpan::SelfParam };
-
+    
         let mut sites = Sites::default();
         sites.intern(a);
         sites.intern(b);
@@ -72,7 +72,7 @@ fn steps_and_site_hits_allocate_nothing() {
                 sites.intern(b);
             }
         });
-
+    
         let mut checker = Checker::new(8, &Config::default(), 0);
         checker.step(a);
         checker.step(b);

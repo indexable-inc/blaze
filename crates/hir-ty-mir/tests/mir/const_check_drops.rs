@@ -28,7 +28,7 @@ fn check(minicore: &str, src: &str, pick: impl FnOnce(&TestDB) -> DefWithBodyId)
     let fx = fixture::db(&format!("//- minicore: {minicore}\n{src}"));
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = pick(&db);
         let map = Body::source_map(&db, def);
         let at = |span: MirSpan| {

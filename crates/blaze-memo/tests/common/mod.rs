@@ -94,6 +94,25 @@ pub fn deps_of(c: u32) -> Vec<u32> {
     (c.saturating_sub(2).max(1)..c).collect()
 }
 
+/// The facts of a recorded list's rows, sorted and merged (rows sort by kind first, so two
+/// input kinds' facts interleave once their kinds are dropped).
+///
+/// # Panics
+///
+/// On a `Read::Query` row: these worlds mark no boundary, so every query is flattened.
+pub fn facts_of(rows: &[blaze_memo::Read]) -> Vec<Fact> {
+    let mut out: Vec<Fact> = rows
+        .iter()
+        .map(|row| match *row {
+            blaze_memo::Read::Input { fact, .. } => fact,
+            blaze_memo::Read::Query { .. } => panic!("a boundary row {row:?} in a world with none"),
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 pub fn leaf_fact(c: u32, l: usize, n: u64) -> Fact {
     Fact {
         id: ContentId::of("blaze-memo sim leaf", &[c.to_le_bytes(), (l as u32).to_le_bytes()].concat()),
@@ -152,7 +171,7 @@ impl World {
     pub fn next(&mut self, memo: &Memo, changed: &[u32]) -> (Memo, Vec<u32>) {
         let ids: Vec<ArenaId> =
             changed.iter().map(|c| self.crates[*c as usize].expect("made").gid().arena()).collect();
-        let next = memo.next(&ids);
+        let next = memo.next(&ids).unwrap_or_else(|refused| panic!("{refused}"));
         let dropped = next.dropped().to_vec();
         let mut builder = next.builder;
         for c in 1..=CRATES {

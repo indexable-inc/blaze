@@ -6,7 +6,7 @@ use hir_expand::{HirFileId, InFile, fixture};
 use span::{ErasedFileAstId, FileAstId};
 use syntax::{AstPtr, SyntaxKind, ast};
 
-use super::{Counts, Memory, set};
+use super::{Counts, Memory, set_for_test as set};
 use crate::{nameres::frozen::tests::crate_named, test_db::TestDBExt};
 
 const MACROS: usize = 4;
@@ -57,16 +57,20 @@ fn macro_ids(db: &Db) -> Vec<u32> {
         .collect()
 }
 
-/// The expander of each macro of `ids`, as its `Debug` text: equal for equal expanders of two
-/// databases of the same text.
+/// The expander of each macro of `ids`, as the `Debug` text of its rules and transparency:
+/// equal for equal expanders of two databases of the same text. Not the whole expander's: it
+/// names the arena its tokens' contexts are of (`table`), whose generation is the database's
+/// own (a database given a store by [`set`] committed an edit of the session, so each of its
+/// arenas is in its second generation, and one of the same text that was not is in its first).
 fn expanders(db: &Db, ids: &[u32]) -> Vec<String> {
     let (lib, file) = lib_file(db);
     ids.iter()
         .map(|&raw| {
             let id = FileAstId::<ast::Macro>::from_erased_unchecked(ErasedFileAstId::from_raw(raw));
             let id = InFile::new(HirFileId::FileId(file), id);
+            let expander = id.decl_macro_expander(db, lib);
             // alloc: a test's text
-            format!("{:?}", id.decl_macro_expander(db, lib))
+            format!("{:?} {:?}", expander.mac, expander.transparency)
         })
         // alloc: a test's list
         .collect()
@@ -103,8 +107,10 @@ fn a_kept_macro_definition_gives_its_expander_with_nothing_made() {
     set(&mut writing, store.clone());
     assert_eq!(expanders(&writing, &ids), want);
     let made = store.take();
-    // The file's index and the tokens of each.
-    assert_eq!((made.made, made.hits, made.again), (1 + MACROS as u64, 0, 0), "{made:?}");
+    // The file's index, and the squeeze and the tokens of each. Each squeeze is found once
+    // after it is made: the miss of its tokens asks the definition's place again to write them.
+    let n = MACROS as u64;
+    assert_eq!((made.made, made.hits, made.again), (1 + 2 * n, n, 0), "{made:?}");
 
     let mut reading = fixture::db(&text).into_db();
     set(&mut reading, store.clone());
@@ -114,7 +120,8 @@ fn a_kept_macro_definition_gives_its_expander_with_nothing_made() {
     assert_eq!(got, want);
     assert_eq!(expanders_run(&ran), MACROS, "each expander is asked again: {ran:?}");
     let read = store.take();
-    assert_eq!(read, Counts { hits: 1 + MACROS as u64, misses: 0, made: 0, again: 0 });
+    // The file's index, and the squeeze and the tokens of each: all found, none made.
+    assert_eq!(read, Counts { hits: 1 + 2 * n, misses: 0, made: 0, again: 0 });
 }
 
 /// The control: the cause removed. The same asks of a database whose store keeps nothing yet
@@ -130,7 +137,10 @@ fn without_kept_definitions_the_same_asks_make_every_entry() {
     let ran = db.executed_in_read_order(|| _ = expanders(&db, &ids));
     assert_eq!(expanders_run(&ran), MACROS, "each expander is asked again: {ran:?}");
     let counts = store.take();
-    assert_eq!((counts.made, counts.hits, counts.again), (1 + MACROS as u64, 0, 0), "{counts:?}");
+    // The file's index, and the squeeze and the tokens of each; each squeeze found once after
+    // it is made, by the second ask of the definition's place.
+    let n = MACROS as u64;
+    assert_eq!((counts.made, counts.hits, counts.again), (1 + 2 * n, n, 0), "{counts:?}");
 }
 
 /// Rule 65 by counts: one macro of N edited. The file's index misses (the file's content is
@@ -155,9 +165,13 @@ fn one_macro_of_n_edited_finds_the_tokens_of_the_others() {
     assert_eq!(expanders(&edited, &ids), want);
     let counts = store.take();
     let n = MACROS as u64;
+    // A squeeze is keyed by its file's content, which the edit changed: the N squeezes miss
+    // and are made again (from the text this database has; each a lex of one definition, no
+    // parse), and the edited one's is found once after, when its tokens are written.
     assert_eq!(
         counts,
-        Counts { hits: n - 1, misses: 2, made: 2, again: 0 },
-        "N-1 tokens found; the file's index and the edited macro's tokens missed and made"
+        Counts { hits: n, misses: n + 2, made: n + 2, again: 0 },
+        "N-1 tokens and one squeeze found; the file's index, the N squeezes and the edited \
+         macro's tokens missed and made"
     );
 }

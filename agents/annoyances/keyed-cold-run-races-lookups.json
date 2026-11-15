@@ -1,0 +1,14 @@
+{
+ "id": "keyed-cold-run-races-lookups",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane K1 of the no-daemon command",
+ "where": "crates/blaze-keyed/src/driver.rs (Driver::run, quiet, start_wave, plan_next) against tests.rs resident_refines_records_only",
+ "what": "Under demanded makers the resident memo ran one body fewer than records-only. A unit going from not asked to asked has no last entries, so its items have no old shape and waits_on_maker cannot hold a reader for its maker; the reader with no trie node ran at once, while the maker (run as a demanded maker the request before, so in the trie and the memo) was still being looked up. Records-only answered the lookup late and the reader read absent and was redone at quiesce; the resident memo answered at once and the reader read the right value. Round 4 (seed 12) showed a second way: a hold per unit counted its items asking, getting or walking, but not one waiting for a demanded maker. A third way was open by design: a cold reader in one unit and another unit's reader of the same not-asked maker, whose demand may or may not have settled before the cold run started.",
+ "cost": "three coordinator rounds and two hand traces",
+ "cause": "a run was started as soon as its own lookups missed, while work that could settle or demand a maker of a fact it reads was still out somewhere in the request",
+ "whys": "waits_on_maker keys on the last manifest's rows and old shapes; a cold item has neither; before demanded makers a cold item's maker was always cold too, so the race never showed; demand made a maker's record exist with no row naming it; the first two holds listed by hand what a run could read (its unit's lookup states, then its known makers), and each list missed a way an answer could still change",
+ "class": "work whose inputs are answered from whatever settled at the moment it starts, so what it reads, files and how often it runs depend on IO order",
+ "prevention": "one rule replaces the lists: every run (surface, body, demanded maker) is held until the request is quiet, nothing out but held runs (Driver::quiet: pending, ready and the run queue empty, O(1) per event), then the held runs start together as a wave, sorted, each unit's runs reading its made answer frozen at the wave's start (Unit::wave), so a run started late by the pool reads what one started first did. No deadlock: quiet waits only for work out, which always drains; a held demanded maker starts in the next wave; a driver with nothing out and nothing to start ends Stalled. Stated as the invariant on resident_refines_records_only; the sim model has a fourth unit beside unit 1 so two readers of one not-asked maker are in flight at once. Controls: Plant::RunBeforeLookups, Plant::ColdRunBeforeQuiet (both the seed-12 case and the cross-unit case), Plant::WaveNeverStarts (caught as the request ending Stalled).",
+ "workaround": "none needed",
+ "state": "fixed"
+}

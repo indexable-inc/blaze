@@ -184,8 +184,8 @@ impl Std {
 
 /// Where the crate `krate` holds its own structs in collections, once per crate: the types of
 /// its items' fields, then the type of every expression of its bodies.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn packable_uses(db: &Db, krate: base_db::Crate) -> Uses {
+#[blaze_memo::tracked(returns(ref), owns)]
+pub(crate) fn packable_uses<'db>(db: &'db Db, krate: base_db::Crate) -> Uses {
     let mut out = Uses(HashMap::new_in(Global));
     let std = Std::new(db, hir::Crate::from(krate));
     // alloc: the structs one type holds, reused for every type of the crate

@@ -223,9 +223,9 @@ fn generate(
     span: Span,
     parent: Option<SyntaxKind>,
 ) -> Result<Generated, String> {
-    let edition = span.ctx.edition(db);
+    let edition = span.ctx.edition();
     let (parsed, map, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-        crate::token_tree_to_syntax_node(db, frame, tt.view(), crate::ExpandTo::Items)
+        crate::token_tree_to_syntax_node(frame, tt.view(), crate::ExpandTo::Items)
     });
     let not_fn = || {
         "`#[blaze::contract_test]` goes on a function with `requires` or `ensures` clauses, and \

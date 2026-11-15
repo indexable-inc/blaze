@@ -12,7 +12,7 @@
 //! calls want, and writes the frames it hands back.
 
 // `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
-#![feature(register_tool)]
+#![feature(allocator_api, register_tool)]
 #![register_tool(blaze)]
 
 pub mod bind;

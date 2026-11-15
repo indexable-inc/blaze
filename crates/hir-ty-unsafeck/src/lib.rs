@@ -9,6 +9,7 @@
 //! `deprecated_safe_2024`; the lint levels are the caller's to apply. [`unsafety_check`] is a
 //! query of the body, so an edit that leaves a body's operations as they were stops there.
 
+#![feature(allocator_api)]
 #![forbid(unsafe_code)]
 
 extern crate rustc_type_ir;
@@ -16,9 +17,10 @@ extern crate rustc_type_ir;
 #[cfg(test)]
 mod tests;
 
-use std::mem;
+use std::{alloc::Global, mem};
 
 use base_db::{Crate, Db};
+use blaze_memo::Database as _;
 use either::Either;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId, GenericDefId,
@@ -125,21 +127,22 @@ impl UnsafeOp {
 }
 
 /// The operations of a body that need `unsafe` where they are not, in rustc's order.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct UnsafetyCheck {
-    ops: Box<[UnsafeOp]>,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct UnsafetyCheck<'db> {
+    /// Kept in the query's arena.
+    ops: &'db [UnsafeOp],
 }
 
-impl UnsafetyCheck {
+impl<'db> UnsafetyCheck<'db> {
     #[inline]
-    pub fn ops(&self) -> &[UnsafeOp] {
-        &self.ops
+    pub fn ops(&self) -> &'db [UnsafeOp] {
+        self.ops
     }
 }
 
 /// rustc's `check_unsafety` of `def`, with the closures, inline consts and repeat counts in it.
-#[blaze_query::tracked(returns(ref))]
-pub fn unsafety_check(db: &Db, def: DefWithBodyId) -> UnsafetyCheck {
+#[blaze_memo::tracked(returns(ref))]
+pub fn unsafety_check<'db>(db: &'db Db, def: DefWithBodyId) -> UnsafetyCheck<'db> {
     let body = Body::of(db, def);
     let infer = InferenceResult::of(db, def);
     let owner = ExpressionStoreOwnerId::Body(def);
@@ -155,8 +158,9 @@ pub fn unsafety_check(db: &Db, def: DefWithBodyId) -> UnsafetyCheck {
             (Context::Safe, TargetFeatures::default())
         }
     };
-    // alloc: only at the first operation, so none for a body without one.
-    let mut ops = Vec::new();
+    // Grows only at the first operation, so takes nothing for a body without one; copied into
+    // the query's arena below and freed.
+    let mut ops = Vec::new_in(Global);
     let mut walker = Walker::new(db, infer, body, owner, context, target_features, &mut ops);
     for param in &body.params {
         walker.walk_pat(param.formal);
@@ -171,7 +175,7 @@ pub fn unsafety_check(db: &Db, def: DefWithBodyId) -> UnsafetyCheck {
         let features = TargetFeatures::default();
         Walker::new(db, infer, body, owner, Context::Safe, features, &mut ops).walk_expr(loc.expr);
     }
-    UnsafetyCheck { ops: ops.into_boxed_slice() }
+    UnsafetyCheck { ops: blaze_memo::keep_slice(db.memo(), &ops) }
 }
 
 /// Whether an operation [`unsafe_operations`] gives is inside an `unsafe` block.
@@ -678,9 +682,12 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                 if let Some(variant) = variant {
                     let fields = self.variant_fields(variant);
                     if has_unsafe_field(fields) {
+                        // The store's contexts are of its crate's table.
+                        let table = hir_ty::ctx_table(self.krate);
                         for arg in args {
                             let hygiene = self.store.record_field_hygiene(arg.pat);
-                            let field = fields.field_written(self.db, variant, &arg.name, hygiene);
+                            let field =
+                                fields.field_written(self.db, table, variant, &arg.name, hygiene);
                             if field.is_some_and(|it| fields.fields()[it].is_unsafe) {
                                 self.requires_unsafe(arg.pat, UnsafetyReason::UseOfUnsafeField);
                             }

@@ -18,7 +18,7 @@ use base_db::{Crate, Db};
 use blaze_hash::FixedState;
 use blaze_ids::{bits::Bits, radix};
 use blaze_mem::scratch;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::{Gid, Id};
 use either::Either;
 use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
 use intern::sym;
@@ -71,7 +71,7 @@ impl Default for PerNsGlobImports {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum ImportOrExternCrate {
     Glob(GlobId),
     Import(ImportId),
@@ -112,7 +112,7 @@ impl ImportOrExternCrate {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum ImportOrGlob {
     Glob(GlobId),
     Import(ImportId),
@@ -138,13 +138,13 @@ pub enum ImportOrDef {
 impl_from!(ImportOrExternCrate { Import, Glob, ExternCrate } for ImportOrDef);
 impl_from!(ImportOrGlob { Import, Glob } for ImportOrDef);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, blaze_memo::Home)]
 pub struct ImportId {
     pub use_: UseId,
     pub idx: Idx<ast::UseTree>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, blaze_memo::Home)]
 pub struct GlobId {
     pub use_: UseId,
     pub idx: Idx<ast::UseTree>,
@@ -322,15 +322,17 @@ impl Iterator for Probe<'_> {
 
 /// One name of one namespace and its [`Item`], packed as tags and ids. Every field the
 /// item does not use is `None` or 0, so two entries are equal exactly when their items are.
-/// 24 bytes (an `IndexMap` bucket of a `TypesItem` is 48: its hash, the name and 32 bytes of
-/// item); reading the item back is a `match` on each tag.
+/// 36 bytes: the name 4, each id an 8-byte `Option<Gid>` (an arena and an index; `None` in the
+/// id's niche), the use tree 4, the three tags 3 and one byte of padding. Reading the item
+/// back is a `match` on each tag. 4 bytes over 32: the tree index and the tags; packing the
+/// tags into the tree's high bits would leave 22 bits of use trees a crate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 struct Entry {
     name: Name,
-    def: Option<blaze_query::db::Id>,
-    vis: Option<blaze_query::db::Id>,
-    import: Option<blaze_query::db::Id>,
+    def: Option<Gid>,
+    vis: Option<Gid>,
+    import: Option<Gid>,
     /// The use tree of a glob or an import.
     tree: u32,
     def_tag: u8,
@@ -338,8 +340,8 @@ struct Entry {
     import_tag: u8,
 }
 
-const _: () = assert!(size_of::<Option<blaze_query::db::Id>>() == 4);
-const _: () = assert!(size_of::<Entry>() == 24);
+const _: () = assert!(size_of::<Option<Gid>>() == 8);
+const _: () = assert!(size_of::<Entry>() == 36);
 
 const DEF_MODULE: u8 = 0;
 const DEF_FUNCTION: u8 = 1;
@@ -385,8 +387,10 @@ const BUILTIN_TYPES: [BuiltinType; 19] = [
     BuiltinType::Float(BuiltinFloat::F128),
 ];
 
-fn pack_builtin(ty: BuiltinType) -> (u8, Option<blaze_query::db::Id>) {
-    let width = |it: crate::builtin_type::IntWidth| Some(blaze_query::db::Id::from_u32(it.bits()));
+fn pack_builtin(ty: BuiltinType) -> (u8, Option<Gid>) {
+    // The width stands in the id's bits, in no arena: the tag says it is no id. A width is
+    // never 0, so the word is an id's.
+    let width = |it: crate::builtin_type::IntWidth| Gid::from_session_bits(u64::from(it.bits()));
     match ty {
         BuiltinType::Int(BuiltinInt::Bits(it)) => (DEF_INT_BITS, width(it)),
         BuiltinType::Uint(BuiltinUint::Bits(it)) => (DEF_UINT_BITS, width(it)),
@@ -395,9 +399,9 @@ fn pack_builtin(ty: BuiltinType) -> (u8, Option<blaze_query::db::Id>) {
     }
 }
 
-fn unpack_bits(tag: u8, id: blaze_query::db::Id) -> BuiltinType {
-    let Some(width) = crate::builtin_type::IntWidth::new(id.as_u32()) else {
-        unreachable!("an arbitrary-width integer entry of width {}", id.as_u32())
+fn unpack_bits(tag: u8, id: Gid) -> BuiltinType {
+    let Some(width) = crate::builtin_type::IntWidth::new(id.local()) else {
+        unreachable!("an arbitrary-width integer entry of width {}", id.local())
     };
     match tag {
         DEF_INT_BITS => BuiltinType::Int(BuiltinInt::Bits(width)),
@@ -406,24 +410,24 @@ fn unpack_bits(tag: u8, id: blaze_query::db::Id) -> BuiltinType {
 }
 
 #[inline]
-fn raw(it: impl AsId + Copy) -> Option<blaze_query::db::Id> {
-    Some(it.as_id())
+fn raw(it: impl Id) -> Option<Gid> {
+    Some(it.gid())
 }
 
 #[inline]
-fn typed<T: FromId>(id: blaze_query::db::Id) -> T {
-    T::from_id(id)
+fn typed<T: Id>(id: Gid) -> T {
+    T::from_gid(id)
 }
 
 /// What an entry's definition is: a tag and, but for a builtin type, an id.
 pub(crate) trait PackedDef: Copy + PartialEq {
-    fn pack(self) -> (u8, Option<blaze_query::db::Id>);
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>) -> Self;
+    fn pack(self) -> (u8, Option<Gid>);
+    fn unpack(tag: u8, id: Option<Gid>) -> Self;
 }
 
 impl PackedDef for MacroId {
     #[inline]
-    fn pack(self) -> (u8, Option<blaze_query::db::Id>) {
+    fn pack(self) -> (u8, Option<Gid>) {
         match self {
             MacroId::Macro2Id(it) => (DEF_MACRO2, raw(it)),
             MacroId::MacroRulesId(it) => (DEF_MACRO_RULES, raw(it)),
@@ -432,7 +436,7 @@ impl PackedDef for MacroId {
     }
 
     #[inline]
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>) -> Self {
+    fn unpack(tag: u8, id: Option<Gid>) -> Self {
         match (tag, id) {
             (DEF_MACRO2, Some(id)) => MacroId::Macro2Id(typed(id)),
             (DEF_MACRO_RULES, Some(id)) => MacroId::MacroRulesId(typed(id)),
@@ -444,7 +448,7 @@ impl PackedDef for MacroId {
 
 impl PackedDef for ModuleDefId {
     #[inline]
-    fn pack(self) -> (u8, Option<blaze_query::db::Id>) {
+    fn pack(self) -> (u8, Option<Gid>) {
         match self {
             ModuleDefId::ModuleId(it) => (DEF_MODULE, raw(it)),
             ModuleDefId::FunctionId(it) => (DEF_FUNCTION, raw(it)),
@@ -462,7 +466,7 @@ impl PackedDef for ModuleDefId {
     }
 
     #[inline]
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>) -> Self {
+    fn unpack(tag: u8, id: Option<Gid>) -> Self {
         let Some(id) = id else {
             return ModuleDefId::BuiltinType(BUILTIN_TYPES[usize::from(tag - DEF_BUILTIN)]);
         };
@@ -492,7 +496,7 @@ const VIS_CRATE: u8 = 2;
 const VIS_PUBLIC: u8 = 3;
 
 #[inline]
-fn pack_vis(vis: Visibility) -> (u8, Option<blaze_query::db::Id>) {
+fn pack_vis(vis: Visibility) -> (u8, Option<Gid>) {
     match vis {
         Visibility::Module(it, VisibilityExplicitness::Explicit) => (VIS_EXPLICIT, raw(it)),
         Visibility::Module(it, VisibilityExplicitness::Implicit) => (VIS_IMPLICIT, raw(it)),
@@ -502,7 +506,7 @@ fn pack_vis(vis: Visibility) -> (u8, Option<blaze_query::db::Id>) {
 }
 
 #[inline]
-fn unpack_vis(tag: u8, id: Option<blaze_query::db::Id>) -> Visibility {
+fn unpack_vis(tag: u8, id: Option<Gid>) -> Visibility {
     match (tag, id) {
         (VIS_EXPLICIT, Some(id)) => Visibility::Module(typed(id), VisibilityExplicitness::Explicit),
         (VIS_IMPLICIT, Some(id)) => Visibility::Module(typed(id), VisibilityExplicitness::Implicit),
@@ -529,13 +533,13 @@ fn tree_at(raw: u32) -> Idx<ast::UseTree> {
 
 /// What an entry was imported by: a tag, an id and a use tree.
 pub(crate) trait PackedImport: Copy + PartialEq {
-    fn pack(import: Option<Self>) -> (u8, Option<blaze_query::db::Id>, u32);
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>, tree: u32) -> Option<Self>;
+    fn pack(import: Option<Self>) -> (u8, Option<Gid>, u32);
+    fn unpack(tag: u8, id: Option<Gid>, tree: u32) -> Option<Self>;
 }
 
 impl PackedImport for ImportOrExternCrate {
     #[inline]
-    fn pack(import: Option<Self>) -> (u8, Option<blaze_query::db::Id>, u32) {
+    fn pack(import: Option<Self>) -> (u8, Option<Gid>, u32) {
         match import {
             None => (IMPORT_NONE, None, 0),
             Some(ImportOrExternCrate::Glob(GlobId { use_, idx })) => {
@@ -549,7 +553,7 @@ impl PackedImport for ImportOrExternCrate {
     }
 
     #[inline]
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>, tree: u32) -> Option<Self> {
+    fn unpack(tag: u8, id: Option<Gid>, tree: u32) -> Option<Self> {
         let id = id?;
         Some(match tag {
             IMPORT_GLOB => {
@@ -566,7 +570,7 @@ impl PackedImport for ImportOrExternCrate {
 
 impl PackedImport for ImportOrGlob {
     #[inline]
-    fn pack(import: Option<Self>) -> (u8, Option<blaze_query::db::Id>, u32) {
+    fn pack(import: Option<Self>) -> (u8, Option<Gid>, u32) {
         match import {
             None => (IMPORT_NONE, None, 0),
             Some(ImportOrGlob::Glob(GlobId { use_, idx })) => {
@@ -579,7 +583,7 @@ impl PackedImport for ImportOrGlob {
     }
 
     #[inline]
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>, tree: u32) -> Option<Self> {
+    fn unpack(tag: u8, id: Option<Gid>, tree: u32) -> Option<Self> {
         let id = id?;
         Some(match tag {
             IMPORT_GLOB => ImportOrGlob::Glob(GlobId { use_: typed(id), idx: tree_at(tree) }),
@@ -621,7 +625,7 @@ impl Entry {
     }
 
     #[inline]
-    fn is_def(&self, (tag, id): (u8, Option<blaze_query::db::Id>)) -> bool {
+    fn is_def(&self, (tag, id): (u8, Option<Gid>)) -> bool {
         self.def_tag == tag && self.def == id
     }
 
@@ -1739,14 +1743,17 @@ impl ItemScope {
             );
             // The position last keeps a def's names in column order, which is the order
             // `name_of` (the first) and `names_of` (the first `Some`) answer in.
-            // `(at >> 30, it.def_tag, it.def, at & POS_MASK)` packed in order: an `Option<Id>`
-            // orders `None` first, then by its id's `as_u32`.
+            // `(at >> 30, it.def_tag, it.def, at & POS_MASK)` packed in order: an `Option<Gid>`
+            // orders `None` first, then by its id's session bits, whose order is `Gid`'s (its
+            // arena, then its local), which `naming` searches by. An in-process index, never
+            // kept or hashed: the bits name this session's arenas.
             scratch::with_u32s(|spare| {
                 radix::sort_copy_by_key_in(
                     all,
                     |&at| {
                         let it = self.entry_at(at);
-                        let def = it.def.map_or(0, |id| 1u128 << 64 | u128::from(id.as_u32()));
+                        let def =
+                            it.def.map_or(0, |id| 1u128 << 64 | u128::from(id.session_bits()));
                         u128::from(at >> 30) << 97
                             | u128::from(it.def_tag) << 89
                             | def << 24
@@ -2559,9 +2566,9 @@ mod tests {
     };
 
     /// An id of no database: the scope only packs and compares it.
-    fn id<T: FromId>(n: u64) -> T {
+    fn id<T: Id>(n: u64) -> T {
         let n = u32::try_from(n).expect("a test id below 2^32");
-        T::from_id(blaze_query::db::Id::from_u32((n % 7 + 1) + ((n / 7) << 20)))
+        T::from_gid(Gid::for_test((n % 7 + 1) + ((n / 7) << 20)))
     }
 
     fn names() -> Vec<Name> {
@@ -3094,17 +3101,27 @@ mod tests {
         }
     }
 
-    /// The sizes the notes give (`docs/v2/plan/design/frontend.md`), with
-    /// ids of 4 bytes (`blaze_query::db::Id`).
+    /// The sizes of an entry and of what it packs, with ids 8-byte [`Gid`]s that have a niche
+    /// (align 4). An enum of ids is a tag word and an id (12: `MacroId`, `AdtId`); an enum
+    /// with such an enum in two variants (`ModuleDefId`: `AdtId` and `MacroId`) a tag word and
+    /// one (16): a `Gid`'s niche is one value, and two 12-byte variants cannot both sit beside
+    /// the other's tag. An import or glob id is a use id and a tree index (12), and an enum of
+    /// them a tag word and one (16, its `Option` in the tag's niche); a visibility a module id
+    /// and its explicitness, whose spare values tag the crate and public cases (9, so 12). An
+    /// item is a def, a visibility and an import: 16 + 12 + 16 for a types or values item,
+    /// 12 + 12 + 16 for a macros item; a `PerNs` three items, each `Option` in its def's tag.
+    /// None of these is stored: `item_scope` packs an entry into 36 bytes.
     #[test]
     fn sizes() {
-        assert_eq!(size_of::<Entry>(), 24);
+        assert_eq!(size_of::<Entry>(), 36);
         assert_eq!(size_of::<Index>(), 8);
-        assert_eq!(size_of::<Visibility>(), 8);
-        assert_eq!(size_of::<ModuleDefId>(), 12);
-        assert_eq!(size_of::<TypesItem>(), 32);
-        assert_eq!(size_of::<ValuesItem>(), 32);
-        assert_eq!(size_of::<MacrosItem>(), 28);
-        assert_eq!(size_of::<PerNs>(), 92);
+        assert_eq!(size_of::<Visibility>(), 12);
+        assert_eq!(size_of::<MacroId>(), 12);
+        assert_eq!(size_of::<ModuleDefId>(), 16);
+        assert_eq!(size_of::<ImportOrExternCrate>(), 16);
+        assert_eq!(size_of::<TypesItem>(), 44);
+        assert_eq!(size_of::<ValuesItem>(), 44);
+        assert_eq!(size_of::<MacrosItem>(), 40);
+        assert_eq!(size_of::<PerNs>(), 128);
     }
 }

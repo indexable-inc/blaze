@@ -16,18 +16,22 @@
 //! setters of the VFS's files refuse it. An attribute rustc refuses has a [`CrateAttrError`]; the
 //! others are [`applied_crate_attr_files`], which rustc appends after the crate root's own inner
 //! attributes (`krate.attrs.push`).
+//!
+//! The world holds each file's text and its crate ([`Files::set_crate_attr_files`]); a crate's
+//! arena has its files' inputs ([`Files::make_files`]) and the crate input its list
+//! ([`Crate::crate_attr_files`]). Cost (rule 67): setting a crate's attributes is a compare of
+//! each with its old file's text, and a write of those that differ, the floor.
 
 use crate::FileId;
 use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame};
-use blaze_query::db::Durability;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{LexedStr, SourceFile, SyntaxKind, T, TextRange, TextSize};
 
 use crate::{
-    Crate, Db, EditionedFileId, FileSourceRootInput, FileText, Files,
-    files::{Writer, set},
-    relevant_crates,
+    Crate, Db, EditionedFileId, FileText, Files, SourceRootId, all_crates, files::Writer,
+    world::CrateKey,
 };
 
 /// The name rustc shows a crate attribute's file by (`FileName::CliCrateAttr`).
@@ -68,13 +72,13 @@ pub enum CrateAttrError {
 impl Crate {
     /// The files of its crate attributes, one each in the order given: see [`crate::crate_attrs`].
     pub fn crate_attr_files(self, db: &Db) -> &[FileId] {
-        self.attr_files_field(db)
+        self.attr_files(db)
     }
 }
 
 /// The files of `krate`'s crate attributes at its edition and under its syntax extensions (a
 /// file of the crate, as its root is), in the order given, refused or not.
-#[blaze_query::tracked(returns(deref))]
+#[blaze_memo::tracked(returns(deref), owns)]
 pub fn crate_attr_files(db: &Db, krate: Crate) -> Box<[EditionedFileId]> {
     let files = krate.crate_attr_files(db);
     if files.is_empty() {
@@ -90,7 +94,7 @@ pub fn crate_attr_files(db: &Db, krate: Crate) -> Box<[EditionedFileId]> {
 
 /// The files of `krate`'s crate attributes rustc applies, in the order given: those without a
 /// [`crate_attr_error`]. They come after the crate root's own inner attributes.
-#[blaze_query::tracked(returns(deref))]
+#[blaze_memo::tracked(returns(deref), owns)]
 pub fn applied_crate_attr_files(db: &Db, krate: Crate) -> Box<[EditionedFileId]> {
     let files = crate_attr_files(db, krate);
     if files.is_empty() {
@@ -100,10 +104,12 @@ pub fn applied_crate_attr_files(db: &Db, krate: Crate) -> Box<[EditionedFileId]>
     files.iter().copied().filter(|&file| crate_attr_error(db, file).is_none()).collect()
 }
 
-/// The crate whose crate attribute `file` holds, if it holds one.
+/// The crate whose crate attribute `file` holds, if it holds one: a look at each crate's list,
+/// `O(crates)`, for a reader that names a file (a diagnostic's path), not for a hot path. Read
+/// off the crates and not off `file`'s source root, which a crate attribute's file need not
+/// have in the snapshot ([`Files::set_crate_attr_root`]).
 pub fn crate_attr_owner(db: &Db, file: FileId) -> Option<Crate> {
-    let has = |krate: &Crate| krate.crate_attr_files(db).contains(&file);
-    relevant_crates(db, file).iter().copied().find(has)
+    all_crates(db).iter().copied().find(|krate| krate.crate_attr_files(db).contains(&file))
 }
 
 /// Why rustc refuses the crate attribute of `file`, if it does: rustc's rule
@@ -111,7 +117,7 @@ pub fn crate_attr_owner(db: &Db, file: FileId) -> Option<Crate> {
 /// wrapped text `#![<attr>]` into token trees (a lexer error or an unbalanced delimiter stops
 /// it), parses one inner attribute off them (`parse_attribute`) and refuses any token after it
 /// (`unexpected`).
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub fn crate_attr_error(db: &Db, file: EditionedFileId) -> Option<CrateAttrError> {
     let (file_id, edition) = file.unpack(db);
     let text: &str = db.file_text(file_id).text(db);
@@ -184,70 +190,68 @@ fn is_wrapped(attr: &str) -> bool {
 }
 
 impl Files {
-    /// Gives `krate` one file per crate attribute its data has, in order, in the source root of
-    /// its root file, and takes out the files of the attributes it no longer has (all of them
-    /// when it is `gone` from the crate graph): see the module. A file whose text is an
-    /// attribute still given keeps it, so an equal set of attributes writes nothing, and one
-    /// moved among them keeps its file.
+    /// Gives the crate `krate` one file per crate attribute of `attrs` (its data's, none when
+    /// it is gone from the crate graph), in order, and takes out those of `old` (its files
+    /// before) that no attribute has: see the module. A file whose text is an attribute still
+    /// given keeps it, so an equal set of attributes writes nothing, and one moved among them
+    /// keeps its file. The crate's files, which the caller puts in its crate input.
     pub(crate) fn set_crate_attr_files(
         &self,
-        db: &mut Db,
-        krate: Crate,
-        gone: bool,
-        durability: Option<Durability>,
-    ) {
+        krate: CrateKey,
+        attrs: &[Box<str>],
+        old: &[FileId],
+    ) -> Box<[FileId]> {
+        if attrs.is_empty() && old.is_empty() {
+            return Box::default();
+        }
+        for attr in attrs {
+            assert!(
+                is_wrapped(attr),
+                "the crate attribute {attr:?} of {krate:?} is not given with \
+                 {CRATE_ATTR_PREFIX:?} and {CRATE_ATTR_SUFFIX:?} around it"
+            );
+        }
         frame::task(Tag::Parse, |frame| {
             let mut writer = self.lock();
-            let data = krate.data(&*db);
-            let attrs: &[Box<str>] = if gone { &[] } else { &data.crate_attrs };
-            let old = frame.alloc_slice_copy(krate.crate_attr_files(&*db));
-            if attrs.is_empty() && old.is_empty() {
-                return;
-            }
-            for attr in attrs {
-                assert!(
-                    is_wrapped(attr),
-                    "the crate attribute {attr:?} of {krate:?} is not given with \
-                     {CRATE_ATTR_PREFIX:?} and {CRATE_ATTR_SUFFIX:?} around it"
-                );
-            }
-            let plan = self.plan_crate_attrs(&mut writer, &*db, attrs, old, frame);
-            let root = match attrs.is_empty() {
-                true => None,
-                false => Some(self.file_source_root(&*db, data.root_file_id).source_root_id(&*db)),
-            };
-
+            let plan = self.plan_crate_attrs(&mut writer, attrs, old, frame);
             for &(at, file) in &plan.rewrite {
-                let attr = &*krate.data(&*db).crate_attrs[at];
+                let attr = &*attrs[at];
                 let id = ContentId::of(blaze_vfs::FILE_DOMAIN, attr.as_bytes());
                 let content = FileText::content_of_file(id, None);
                 let text = syntax::Text::from(attr);
-                self.write_text(&mut writer, db, file, Some((text, id, content)), durability);
+                writer.write_text(file, Some((text, id, content)));
             }
-            if let Some(root) = root {
-                for &file in plan.files.iter() {
-                    match self.file_source_roots.get(file.index()) {
-                        Some(input) if input.source_root_id(&*db) == root => {}
-                        Some(input) => set(input.set_source_root_id(db), durability, root),
-                        None => {
-                            let durability = durability.unwrap_or(Durability::MEDIUM);
-                            let input = FileSourceRootInput::new(&*db, durability, root);
-                            self.file_source_roots.set(file.index(), Some(input));
-                        }
-                    }
-                    writer.crate_attrs.insert(file, krate);
-                }
+            for &file in plan.files.iter() {
+                writer.crate_attrs.insert(file, krate);
             }
             for &file in plan.gone.iter() {
-                self.write_text(&mut writer, db, file, None, durability);
+                writer.write_text(file, None);
                 writer.crate_attrs.remove(file);
+                writer.clear_file_root(file);
                 writer.free_crate_attrs.push(file);
             }
-            if *plan.files != *old {
-                // alloc: the crate's list of files, once per change of its attributes (setup).
-                set(krate.set_attr_files_field(db), durability, Box::from(&*plan.files));
-            }
+            // The crate's list of files, once per change of its attributes (setup).
+            let mut files = Vec::with_capacity_in(plan.files.len(), Global);
+            files.extend_from_slice(plan.files);
+            files.into_boxed_slice()
         })
+    }
+
+    /// Puts the files of a crate's attributes in `root`, its root file's source root (`None`:
+    /// in none), as [`Files::file_source_root`] answers for them. They are in no root's file
+    /// set: no path reaches them ([`Files::make_root`] leaves them to their crate's arena).
+    pub(crate) fn set_crate_attr_root(&self, files: &[FileId], root: Option<SourceRootId>) {
+        let mut writer = self.lock();
+        for &file in files {
+            assert!(
+                writer.crate_attrs.contains_key(file),
+                "{file:?} is not a crate attribute's file, so its source root is the VFS's to set"
+            );
+            match root {
+                Some(root) => writer.set_file_root(file, root),
+                None => writer.clear_file_root(file),
+            }
+        }
     }
 
     /// Which file each of `attrs` gets (an old one whose text it is, else an old one left over,
@@ -256,16 +260,14 @@ impl Files {
     fn plan_crate_attrs<'f>(
         &self,
         writer: &mut Writer,
-        db: &Db,
         attrs: &[Box<str>],
         old: &[FileId],
         frame: &'f Frame,
     ) -> CrateAttrPlan<'f> {
         let kept = frame.alloc_slice_fill_with(old.len(), |_| false);
         let files = frame.alloc_slice_fill_with(attrs.len(), |at| {
-            let has = |file: FileId| {
-                self.text_input(file).is_some_and(|input| **input.text(db) == *attrs[at])
-            };
+            let has =
+                |file: FileId| writer.texts.get(file).is_some_and(|it| *it.text == *attrs[at]);
             let found = (0..old.len()).find(|&slot| !kept[slot] && has(old[slot]))?;
             kept[found] = true;
             Some(old[found])

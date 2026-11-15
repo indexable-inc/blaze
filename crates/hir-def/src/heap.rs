@@ -1,5 +1,6 @@
-//! The heap a value owns, in bytes, for the weighers of the queries kept by their bytes
-//! (`#[blaze_query::tracked(lru, weigh = ..)]`): what dropping the value frees, not its own size.
+//! The heap a value owns, in bytes (`heap_bytes` of the stores and maps): what dropping the
+//! value frees, not its own size. No query is weighed by it: the memo bounds memory by arena
+//! drop, not by eviction.
 
 use la_arena::{Arena, ArenaMap, Idx};
 use thin_vec::ThinVec;

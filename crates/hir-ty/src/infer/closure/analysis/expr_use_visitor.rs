@@ -1089,8 +1089,13 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
                 for (f_index, with_field) in adt_fields.iter() {
                     let is_mentioned = fields.iter().any(|f| {
                         let hygiene = self.cx.store.record_field_hygiene(f.expr);
-                        VariantFields::name_written(self.cx.db, adt.into(), f.name, hygiene)
-                            == with_field.name
+                        VariantFields::name_written(
+                            self.cx.db,
+                            self.cx.resolver.ctx_table(),
+                            adt.into(),
+                            f.name,
+                            hygiene,
+                        ) == with_field.name
                     });
                     if !is_mentioned {
                         let field_place = self.cat_projection(
@@ -2123,7 +2128,13 @@ impl<'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'_, 'db, 'f, D> {
                     let field_ty = self.pat_ty_adjusted(fp.pat)?;
                     let hygiene = self.cx.store.record_field_hygiene(fp.pat);
                     let field_index = fields
-                        .field_written(self.cx.db, variant, &fp.name, hygiene)
+                        .field_written(
+                            self.cx.db,
+                            self.cx.resolver.ctx_table(),
+                            variant,
+                            &fp.name,
+                            hygiene,
+                        )
                         .ok_or(ErrorGuaranteed)?;
 
                     let field_place = self.cat_projection(

@@ -430,10 +430,10 @@ kind! {
     /// A file's image: tokens, the flat tree, the names, the line table, and per item its
     /// header digest, its own-text digest, the digests of the items that escape its bodies, a
     /// flag for a non-quiet macro call or derive in a body, and the token ranges of the item and
-    /// its body (blaze-unitkey). Version 2: that row layout; an older image is not found rather
-    /// than misread.
+    /// its body (blaze-unitkey). Version 3: blaze-unitkey's row layout 3; an older image is not
+    /// found rather than misread.
     FileImage {
-        tag: 2, version: 2, layout: Plain, grain: File, trace: Key, keep: DiskAndResident,
+        tag: 2, version: 3, layout: Plain, grain: File, trace: Key, keep: DiskAndResident,
         root: Sections, inputs: FileInputs,
     }
 }
@@ -486,9 +486,10 @@ impl SurfaceInputs<'_> {
 kind! {
     /// A body's check: inference, MIR, the borrow-check verdict and its item-relative
     /// diagnostics, with the shape the check asked and the facts it makes (a const's value, a
-    /// hidden type, what escapes the body, its effects).
+    /// hidden type, what escapes the body, its effects). Version 3: the body payload's format 2
+    /// (blaze-front, sections 16-aligned); an older body is not found rather than misread.
     Body {
-        tag: 4, version: 2, layout: Flat, grain: Item, trace: Read, keep: DiskAndResident,
+        tag: 4, version: 3, layout: Flat, grain: Item, trace: Read, keep: DiskAndResident,
         root: Traced, owned_inputs: BodyInputs,
     }
 }
@@ -514,6 +515,44 @@ impl BodyInputs {
             .id(&self.item.0)
             .id(&self.text)
             .finish()
+    }
+}
+
+/// Which steps a body task runs: its kind of work, so part of its key (rule 21), and this is its
+/// one home (blaze-front's `body::Steps` and `body::settings` are the copy it replaces).
+///
+/// - [`Steps::Checked`]: inference, the built MIR of each owner and the borrow check's verdict.
+///   The body of a unit a request asks bodies of (`check` covers it). Its key is the one its
+///   unit's key task gave ([`BodyInputs`]).
+/// - [`Steps::Mir`]: inference and the built MIR alone, no borrow check and no lint: a body of a
+///   unit no request checks (a dependency, std), made because a plan reads its MIR or a body
+///   reads a fact it makes. Its record holds no verdict, so nothing takes it as checked.
+///
+/// The invariant: the two records of one body never share a key, and each key covers every
+/// input of its work: a Mir key is made from the Checked key, which covers the toolchain, the
+/// settings, the unit, the item and its text, so it moves whenever the Checked key does. Floor:
+/// one hash of two ids, made by the driver when it demands the body; the key task makes one
+/// key per item, never two.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Steps {
+    Checked,
+    Mir,
+}
+
+impl Steps {
+    /// The key of `item`'s body task running these steps, from `keyed`, the key its unit's key
+    /// task gave it (the Checked key).
+    pub fn key(self, keyed: Key<Body>, item: StableId) -> Key<Body> {
+        match self {
+            Steps::Checked => keyed,
+            // The plant keys a MIR-alone body by its item alone, leaving out its text (and
+            // everything else the Checked key holds): a record made before its text moved is
+            // found under the key now.
+            Steps::Mir if crate::planted(crate::Plant::MirKeyLeavesOutText) => {
+                KeyHasher::of::<Body>().bytes(b"blaze v2 body task: MIR alone 1").id(&item.0).finish()
+            }
+            Steps::Mir => KeyHasher::of::<Body>().bytes(b"blaze v2 body task: MIR alone 1").id(&keyed.id()).finish(),
+        }
     }
 }
 
@@ -936,7 +975,7 @@ kind! {
     /// which manifest is a program's current one is a root the driver keeps, never a record
     /// overwritten.
     ProgramManifest {
-        tag: 10, version: 2, layout: Flat, grain: Program, trace: Key, keep: Disk,
+        tag: 10, version: 3, layout: Flat, grain: Program, trace: Key, keep: Disk,
         root: Opaque, inputs: ProgramInputs,
     }
 }
@@ -1182,6 +1221,93 @@ impl MemoEntryInputs<'_> {
     }
 }
 
+kind! {
+    /// One instance's plan (command.md, "Code"): what the code of an item at its type arguments
+    /// needs that the body's generic MIR does not give (the impls chosen, layouts, vtables, drop
+    /// glue and shims, statics), and its edges. Keyed by its name ([`PlanRecordInputs`]), and
+    /// read-addressed: filed at the address of what it read (the facts at those types, and the
+    /// bodies it planned from, each as a [`crate::record::FactKind::Mir`] fact), so a plan is
+    /// found again exactly when nothing it read moved. Its payload is the front end's
+    /// (hir-ty-codegen's `bzplan01` or `bzsplan1` record): opaque to the driver, read by the
+    /// walker and the front end. Replaces [`InstancePlan`], which blaze-program retires.
+    PlanRecord {
+        tag: 26, version: 2, layout: Flat, grain: Instance, trace: Read, keep: Disk, root: Traced,
+        owned_inputs: PlanRecordInputs,
+    }
+}
+
+/// A plan's key: its name, which the front end makes from text before the work
+/// (hir-ty-codegen's plan module doc, "The name": the producer, the stage, and the ask: the
+/// instance by its item's key and its type arguments by content, and the origin it is compiled
+/// for; a static's by its item key). The key is the name itself, not a hash of it: the name is
+/// already a key of its own domain covering every input of the plan that is not a read, and the
+/// edges of a plan and the link name instances by it, so the driver's instance id and the front
+/// end's name are one value (rule 30). Never a body: a plan reads it, so it is in the shape.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanRecordInputs {
+    pub name: ContentId,
+}
+
+impl PlanRecordInputs {
+    fn key(&self) -> Key<PlanRecord> {
+        Key::from_id(self.name)
+    }
+}
+
+kind! {
+    /// One instance's code, the record blaze-link reads in place: keyed by its template's
+    /// identity, which the walker reads off its plan and its callees' plans with no database
+    /// (blaze-command's `code::code_key`: the template's code, the settings with the tier, the
+    /// places by kind and the toolchain; for a static `static_shape_key`), never a callee's key,
+    /// so a callee's edit moves no caller's code. Opaque to the driver. Replaces
+    /// blaze-codegen's `CompiledFunction` and blaze-program's `InstanceCode` as the one code
+    /// record.
+    CodeRecord {
+        tag: 27, version: 2, layout: Flat, grain: Instance, trace: Key, keep: Disk, root: Opaque,
+        owned_inputs: CodeRecordInputs,
+    }
+}
+
+/// A code record's key: the front end's identity of its template.
+#[derive(Clone, Copy, Debug)]
+pub struct CodeRecordInputs {
+    pub template: ContentId,
+}
+
+impl CodeRecordInputs {
+    fn key(&self) -> Key<CodeRecord> {
+        KeyHasher::of::<CodeRecord>().id(&self.template).finish()
+    }
+}
+
+kind! {
+    /// One span table (hir-ty-codegen's `BZSPANS2`): the places one owner's code can report (a
+    /// panic's `Location`, `file!()`, a backtrace), by item-relative position over its file's
+    /// bases. Keyed by its anchor under the toolchain ([`SpanTableInputs`]), never its place,
+    /// and read-addressed: filed at the address of the files it read, each a
+    /// [`crate::record::FactKind::SpanFile`] fact the driver answers alone, so its address is
+    /// known with no answer from the host, and a comment added above its owner moves it and
+    /// nothing of its owner's plan or code. Its payload is the table; it makes no fact.
+    SpanTable {
+        tag: 28, version: 1, layout: Plain, grain: Item, trace: Read, keep: Disk, root: Traced,
+        owned_inputs: SpanTableInputs,
+    }
+}
+
+/// A span table's key: the toolchain and its anchor, the hash of its owner's store key and the
+/// table's index (hir-ty-codegen's `hashes::anchors`), which names the item and never its place.
+#[derive(Clone, Copy, Debug)]
+pub struct SpanTableInputs {
+    pub tool: ToolId,
+    pub anchor: ContentId,
+}
+
+impl SpanTableInputs {
+    fn key(&self) -> Key<SpanTable> {
+        KeyHasher::of::<SpanTable>().toolchain(&self.tool).id(&self.anchor).finish()
+    }
+}
+
 /// Every kind, once: [`TAGS`] and the compile-time check that each kind declared here is listed
 /// under its own tag.
 macro_rules! tags {
@@ -1218,6 +1344,9 @@ tags![
     Mark,
     UnitChunk,
     MemoEntry,
+    PlanRecord,
+    CodeRecord,
+    SpanTable,
 ];
 
 const fn same_name(a: &str, b: &str) -> bool {

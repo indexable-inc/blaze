@@ -15,7 +15,7 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 hashbrown.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 smallvec.workspace = true
 
 # local deps

@@ -90,10 +90,8 @@ pub(crate) enum StoreMark {
 /// impl's self type and trait, a type alias's bounds and type); a variant's fields' types and
 /// default values. Kept by the database: the marks of a store stay equal (and nothing reads
 /// them again) while what the store names does.
-#[blaze_query::tracked(returns(deref))]
-// `_: ()`: a store owner is an enum of ids, not an id; with a second argument the engine
-// interns the pair as the key (as hir-ty's `closure_exprs`).
-pub(crate) fn store_marks(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[StoreMark]> {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn store_marks<'db>(db: &'db Db, owner: ExpressionStoreOwnerId) -> &'db [StoreMark] {
     #[cfg(test)]
     super::super::tests::executed(db, owner);
     let store = ExpressionStore::of(db, owner);
@@ -124,7 +122,7 @@ pub(crate) fn store_marks(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<
     if let Some(len) = super::super::tests::planted_text_len(db, owner) {
         walk.out.push(StoreMark::Planted(len));
     }
-    walk.out.into_boxed_slice()
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &walk.out)
 }
 
 /// What inference recorded for the expressions being walked.
@@ -540,7 +538,9 @@ impl<'s, 'db> Walk<'s, 'db> {
     /// A field of `variant` by the name it is written with.
     fn field(&self, variant: VariantId, name: &Name, hygiene: HygieneId) -> Option<FieldId> {
         let db = self.db;
-        let local_id = variant.fields(db).field_written(db, variant, name, hygiene)?;
+        // The contexts of the store's hygiene are of its crate's table.
+        let table = self.resolver.ctx_table();
+        let local_id = variant.fields(db).field_written(db, table, variant, name, hygiene)?;
         Some(FieldId { parent: variant, local_id })
     }
 
@@ -651,7 +651,9 @@ impl<'s, 'db> Walk<'s, 'db> {
                     (_, Some(variant)) => (VariantId::EnumVariantId(variant), args),
                     (AdtId::EnumId(it), None) => {
                         let ctxt = offset.field_hygiene(index).syntax_context();
-                        let Some(it) = EnumVariants::variant_written(db, it, name, ctxt) else {
+                        let table = self.resolver.ctx_table();
+                        let Some(it) = EnumVariants::variant_written(db, table, it, name, ctxt)
+                        else {
                             return;
                         };
                         variant = Some(it);
@@ -663,7 +665,8 @@ impl<'s, 'db> Walk<'s, 'db> {
                 _ => return,
             };
             let hygiene = offset.field_hygiene(index);
-            let Some(local_id) = of.fields(db).field_written(db, of, name, hygiene) else {
+            let table = self.resolver.ctx_table();
+            let Some(local_id) = of.fields(db).field_written(db, table, of, name, hygiene) else {
                 return;
             };
             self.mark(StoreMark::Field(FieldId { parent: of, local_id }));

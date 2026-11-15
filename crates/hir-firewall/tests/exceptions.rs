@@ -1,27 +1,44 @@
-//! The harness over fixtures: an edit of each body reaches only it, in each case of
-//! docs/v2/plan/design/item-hash.md section 2 that a body edit can be; and an edit that
-//! changes what another item reads of a body is found.
+//! The harness over fixtures of two crates, `a` and `b` that depends on it: an edit of each
+//! body of `a` recomputes nothing of `b`, in each case of docs/v2/plan/design/item-hash.md
+//! section 2 that a body edit can be; and an edit that changes what `b` reads of a body of `a`
+//! is found.
 
 use std::{collections::HashMap, sync::Arc};
 
+use base_db::{Crate, Db, all_crates};
 use hir_expand::fixture;
 use hir_firewall::{CodeLeak, Codegen, EDIT, Harness, Report};
 
-/// Every function of `fixture` edited in turn, without codegen.
+/// The crate of the fixture named `name`.
+fn crate_named(db: &Db, name: &str) -> Crate {
+    all_crates(db)
+        .iter()
+        .copied()
+        .find(|krate| {
+            krate
+                .extra_data(db)
+                .display_name
+                .as_ref()
+                .is_some_and(|it| it.crate_name().as_str() == name)
+        })
+        .unwrap_or_else(|| panic!("the fixture has no crate `{name}`"))
+}
+
+/// Every function of crate `a` of `fixture` edited in turn, without codegen.
 fn run(fixture: &str) -> Report {
     let mut db = fixture::db(fixture).into_db();
-    let krate = fixture::test_crate(&db);
+    let krate = crate_named(&db, "a");
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
     harness.run(&mut db, 1).expect("every edit is made")
 }
 
-/// [`run`] with codegen's walk, as a dev build of the fixture's crate walks it.
+/// [`run`] with codegen's walk, as a dev build of crate `a` walks it.
 fn run_compiled(fixture: &str) -> Report {
     let mut db = fixture::db(fixture).into_db();
-    let krate = fixture::test_crate(&db);
+    let krate = crate_named(&db, "a");
     let host = blaze_lower::target_data(hir_ty_codegen::Target::host())
         .expect("this machine's target data");
-    let codegen = Codegen::dev("fixture", Arc::new(HashMap::new()), &host)
+    let codegen = Codegen::dev("a", Arc::new(HashMap::new()), &host)
         .expect("a dev build's policy for this machine");
     let mut harness = Harness::new(&mut db, krate, Some(codegen)).expect("the harness sets up");
     harness.run(&mut db, 1).expect("every edit is made")
@@ -34,9 +51,10 @@ fn assert_clean(report: &Report) {
 }
 
 #[test]
-fn an_edit_of_each_function_reaches_only_it() {
+fn an_edit_of_each_function_recomputes_nothing_of_a_dependent() {
     let report = run(r#"
 //- minicore: sized, copy, fn, option, slice, index
+//- /a.rs crate:a
 pub struct Point { pub x: u32, pub y: u32 }
 
 impl Point {
@@ -57,73 +75,82 @@ pub fn first<T: Copy>(items: &[T]) -> Option<T> {
     if items.len() == 0 { None } else { Some(items[0]) }
 }
 
-pub fn caller() -> u32 {
-    let p = Point::new(1, 2);
-    let f = |q: &Point| q.sum();
-    f(&p) + p.twice() + first(&[1u32, 2]).unwrap_or(0)
-}
-
-mod inner {
+pub mod inner {
     pub fn helper(n: u32) -> u32 {
         fn nested(m: u32) -> u32 { m + 1 }
         { let k = nested(n); k * 2 }
     }
 }
 
-pub fn uses_inner() -> u32 { inner::helper(3) }
-
 pub const LIMIT: u32 = 10;
 pub static NAME: &str = "point";
+//- /b.rs crate:b deps:a
+use a::{Area, Point};
+
+pub fn caller() -> u32 {
+    let p = Point::new(1, 2);
+    let f = |q: &Point| q.sum();
+    f(&p) + p.twice() + a::first(&[1u32, 2]).unwrap_or(0)
+}
+
+pub fn uses_inner() -> u32 { a::inner::helper(3) + a::LIMIT }
+pub fn name() -> &'static str { a::NAME }
 "#);
     assert_clean(&report);
 }
 
 /// E1, E2: the hidden type of a return-position `impl Trait` and of an `async fn`'s future,
 /// and the auto traits that leak from it. An edit that keeps the hidden type reaches no
-/// caller.
+/// caller in the dependent.
 #[test]
 fn an_edit_that_keeps_a_hidden_type_reaches_no_caller() {
     let report = run(r#"
 //- minicore: sized, copy, fn, future, send, sync
+//- /a.rs crate:a
 pub fn counter() -> impl Fn() -> u32 { || 1 }
-pub fn calls_counter() -> u32 { counter()() }
-
 pub async fn later() -> u32 { 2 }
+//- /b.rs crate:b deps:a
+pub fn calls_counter() -> u32 { a::counter()() }
 fn is_send<T: Send>(_: T) {}
-pub fn checks_send() { is_send(later()); }
+pub fn checks_send() { is_send(a::later()); }
 "#);
     assert_clean(&report);
 }
 
-/// E4: a `const fn` evaluated elsewhere. An edit that keeps its value evaluates the
-/// constants that call it again (they are backdated) and reaches nothing past them.
+/// E4: a `const fn` evaluated elsewhere. An edit that keeps its value changes no fact the
+/// dependent reads: the constant is evaluated again in `a`, and `b` is served from its
+/// records.
 #[test]
 fn an_edit_of_a_const_fn_that_keeps_its_value_reaches_no_user_of_the_value() {
     let report = run(r#"
 //- minicore: sized, copy
+//- /a.rs crate:a
 pub const fn one() -> u32 { 1 }
 pub const ONE: u32 = one();
-pub fn uses_one() -> [u8; ONE as usize] { [0; ONE as usize] }
+//- /b.rs crate:b deps:a
+pub fn uses_one() -> [u8; a::ONE as usize] { [0; a::ONE as usize] }
 pub fn other() -> u32 { 3 }
 "#);
     assert_clean(&report);
 }
 
-/// E4 the other way: an edit that changes a `const fn`'s value reaches the users of the
-/// value, and the harness reports them; nothing else.
+/// E4 the other way: an edit that changes a `const fn`'s value changes a fact the dependent
+/// reads, so the users of the value run again, and the harness reports them; nothing else.
 #[test]
 fn an_edit_that_changes_a_const_fn_s_value_is_found_at_its_users() {
     let mut db = fixture::db(
         r#"
 //- minicore: sized, copy
+//- /a.rs crate:a
 pub const fn one() -> u32 { 1 }
 pub const ONE: u32 = one();
-pub fn uses_one() -> [u8; ONE as usize] { [0; ONE as usize] }
+//- /b.rs crate:b deps:a
+pub fn uses_one() -> [u8; a::ONE as usize] { [0; a::ONE as usize] }
 pub fn other() -> u32 { 3 }
 "#,
     )
     .into_db();
-    let krate = fixture::test_crate(&db);
+    let krate = crate_named(&db, "a");
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
     let one = harness.function("one").expect("`one` has a body");
     let mut report = Report::default();
@@ -149,11 +176,14 @@ fn an_edit_compiles_again_only_its_instances_and_those_over_its_closures() {
     let report = run_compiled(
         r#"
 //- minicore: sized, copy, fn, drop
+//- /a.rs crate:a
 pub fn apply<F: Fn() -> u32>(f: F) -> u32 { f() }
 pub fn with_closure() -> u32 { apply(|| 1) }
 pub fn with_another() -> u32 { apply(|| 2) }
 pub fn plain(n: u32) -> u32 { n + 1 }
 pub fn calls_plain() -> u32 { plain(1) }
+//- /b.rs crate:b deps:a
+pub fn uses() -> u32 { a::with_closure() + a::calls_plain() }
 "#,
     );
     assert_clean(&report);
@@ -168,9 +198,37 @@ fn the_harness_edit_changes_the_edited_body_s_code() {
     );
     let report = run(r#"
 //- minicore: sized
+//- /a.rs crate:a
 pub fn a() -> u32 { 1 }
 pub fn b() -> u32 { a() }
+//- /b.rs crate:b deps:a
+pub fn c() -> u32 { a::b() }
 "#);
     assert!(report.code.iter().all(|it| !matches!(it, CodeLeak::Unchanged { .. })), "{report}");
-    assert_eq!(report.edits, 2);
+    assert_eq!(report.edits, 2, "only `a`'s functions are edited");
+}
+
+/// The control: the harness sees a run of the dependent. An edit that adds an item to `a`
+/// changes a fact `b` reads (`a`'s exported names), so `b`'s queries run again, and that is
+/// reported as a leak.
+#[test]
+fn a_changed_export_is_a_leak() {
+    let mut db = fixture::db(
+        r#"
+//- minicore: sized, copy
+//- /a.rs crate:a
+pub fn value() -> u32 { 1 }
+//- /b.rs crate:b deps:a
+pub fn reads() -> u32 { a::value() }
+"#,
+    )
+    .into_db();
+    let krate = crate_named(&db, "a");
+    let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
+    let value = harness.function("value").expect("`value` has a body");
+    let mut report = Report::default();
+    // Not after the `{`: the edit's text closes the body and adds a function, so `a` exports
+    // one more item and `b`'s name resolution reads a changed fact.
+    harness.edit(&mut db, value, " 1 } pub fn added() -> u32 {", &mut report).expect("the edit");
+    assert!(!report.leaks.is_empty(), "a changed export reruns `b`, and is found: {report}");
 }

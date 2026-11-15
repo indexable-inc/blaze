@@ -8,7 +8,7 @@ use std::{alloc::Global, sync::Arc};
 use base_db::{Crate, Db, all_crates};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use blaze_query::db::AsId;
+use blaze_memo::Id as _;
 use hir_def::{
     DefWithBodyId, FunctionId, LoweringMode, nameres::demand::crate_body_owners,
     signatures::FunctionSignature,
@@ -66,7 +66,7 @@ fn a_part_of_evaluated_constants_reads_back_in_another_database() {
     let at = DEP.find("//- /").expect("a fixture with a file");
     let mut db = fixture::db(&format!("{}{PAD}{}", &DEP[..at], &DEP[at..])).into_db();
     let dep = crate_named(&db, "dep");
-    let bits = |db: &Db, krate| function(db, krate, "sum").as_id().as_u32();
+    let bits = |db: &Db, krate| function(db, krate, "sum").gid();
     assert_ne!(bits(&first, first_dep), bits(&db, dep), "the two databases' ids differ");
 
     check_cache::open(&bytes).unwrap();
@@ -74,6 +74,8 @@ fn a_part_of_evaluated_constants_reads_back_in_another_database() {
     let mut parts = HashMap::new_in(Global);
     parts.insert(dep, Arc::new(Aligned::copy_from(&bytes)) as hir_def::deps::ImageBuf);
     check_cache::set_served(&mut db, parts);
+    // The gift's commit drops `dep`'s arena: its id is taken again by name.
+    let dep = crate_named(&db, "dep");
 
     for name in ["sum", "named"] {
         let def = DefWithBodyId::FunctionId(function(&db, dep, name));
@@ -93,8 +95,6 @@ mod runtime {
 
     use base_db::{Crate, Db};
     use blaze_format::Aligned;
-    use blaze_mem::Tag;
-    use blaze_query::db::Database as _;
     use hir_def::{DefWithBodyId, nameres::frozen::pages::{PageSource, Whole}};
     use hir_expand::fixture;
     use hir_ty::{
@@ -105,6 +105,7 @@ mod runtime {
     };
 
     use super::{PAD, crate_named, function};
+    use crate::mir::held::held;
 
     /// A dependency with a generic function, a closure, a call across its own functions and
     /// a branch.
@@ -234,10 +235,12 @@ fn main() { let _ = dep::pick(true, dep::first(&dep::Pair { a: 1u32, b: 2 })); }
 
         let (mut db, dep) = padded();
         assert!(runtime::serve(&mut db, dep, Some(source(&value))).unwrap());
+        // `serve` commits, which drops `dep`'s arena: its id is taken again by name.
+        let dep = crate_named(&db, "dep");
         assert!(runtime::is_served(&db, dep));
-        let before = db.storage().values_of(Tag::Mir);
+        let before = held(&db);
         let asked = owners(&db, dep).len();
-        assert_eq!(db.storage().values_of(Tag::Mir) - before, asked);
+        assert_eq!(held(&db) - before, asked);
     }
 
     /// The control of the count: the same database given no value builds each owner's body
@@ -246,9 +249,9 @@ fn main() { let _ = dep::pick(true, dep::first(&dep::Pair { a: 1u32, b: 2 })); }
     fn the_control_a_crate_with_no_value_builds_every_body() {
         let (db, dep) = padded();
         assert!(!runtime::is_served(&db, dep));
-        let before = db.storage().values_of(Tag::Mir);
+        let before = held(&db);
         let asked = owners(&db, dep).len();
-        assert!(db.storage().values_of(Tag::Mir) - before >= 2 * asked);
+        assert!(held(&db) - before >= 2 * asked);
     }
 
     /// The refinement: what a database answers from the value is what it answers after the
@@ -259,11 +262,14 @@ fn main() { let _ = dep::pick(true, dep::first(&dep::Pair { a: 1u32, b: 2 })); }
         let (value, _) = value_of(&first, first_dep);
         let (mut db, dep) = padded();
         runtime::serve(&mut db, dep, Some(source(&value))).unwrap();
+        // Each `serve` commits, which drops `dep`'s arena: its id is taken again by name.
+        let dep = crate_named(&db, "dep");
         let served: Vec<String> = owners(&db, dep)
             .into_iter()
             .map(|owner| format!("{:?}", mir_at(&db, owner, MirStage::Runtime).unwrap()))
             .collect();
         assert!(runtime::serve(&mut db, dep, None).unwrap(), "the value is taken away");
+        let dep = crate_named(&db, "dep");
         let built: Vec<String> = owners(&db, dep)
             .into_iter()
             .map(|owner| format!("{:?}", mir_at(&db, owner, MirStage::Runtime).unwrap()))
@@ -285,6 +291,8 @@ fn main() { let _ = dep::pick(true, dep::first(&dep::Pair { a: 1u32, b: 2 })); }
         }
         let (mut db, dep) = padded();
         runtime::serve(&mut db, dep, Some(source(&value))).unwrap();
+        // `serve` commits, which drops `dep`'s arena: its id is taken again by name.
+        let dep = crate_named(&db, "dep");
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for owner in owners(&db, dep) {
                 drop(mir_at(&db, owner, MirStage::Runtime));

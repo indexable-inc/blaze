@@ -58,7 +58,7 @@ impl IntGates {
 /// `ArbitrarySigned`, `IntFrom` or `IntTryFrom` stands as one of the first eight arguments of
 /// the impl's trait reference (through references). A bound whose parameter also stands past
 /// the eighth, or nowhere, is not checked.
-#[blaze_query::tracked(cycle_result = int_gates_cycle, returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(cycle_result = int_gates_cycle, returns(copy), mem_tag = Infer)]
 pub fn int_gates(db: &Db, impl_: ImplId) -> IntGates {
     let Some(trait_ref) = db.impl_trait(impl_) else { return IntGates::NONE };
     let trait_ref = trait_ref.skip_binder();
@@ -108,7 +108,7 @@ pub fn int_gates(db: &Db, impl_: ImplId) -> IntGates {
     gates
 }
 
-fn int_gates_cycle(_db: &Db, _: blaze_query::db::Id, _impl: ImplId) -> IntGates {
+fn int_gates_cycle(_db: &Db, _impl: ImplId) -> IntGates {
     // A cycle through the impl's own predicates: list it, as the solver did before.
     IntGates::NONE
 }

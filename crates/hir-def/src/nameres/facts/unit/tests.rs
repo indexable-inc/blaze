@@ -7,7 +7,7 @@ use crate::{
         ScopeSlot,
         facts::{
             graph::{ImportGraph, components},
-            queries::{self, FactKey, RoundKey, RoundKind, SccKey},
+            queries::{self, FactKey, RoundKey, RoundKind, SccKey, Scope},
             tests::{Exempt, compare_db, facts_crate_local_def_map, fixture_db},
         },
     },
@@ -52,8 +52,16 @@ fn assert_one_member_unit_resolves(fixture: &str, krate: &str, names: &[&str]) {
     assert!(diff.is_empty(), "{diff}");
 
     let new = facts_crate_local_def_map(&db, krate).def_map(&db);
-    let handle = queries::fact_handle(&db, FactKey::new(&db, root, krate, r));
-    assert_eq!(new.module(&db, root).scope, ScopeSlot::Collected(handle));
+    // A finished crate map holds its final round's fact as `ScopeSlot::Final`, not `Fact`
+    // (`DefMap::hand_over_scopes`), so a reader goes through name resolution's boundaries.
+    // What the unit must agree on is the scope the slot names: the root's slot is `Final` of
+    // exactly the fact the unit handed out, the variant and the scope both checked.
+    let ScopeSlot::Fact(fact) =
+        queries::fact_slot(&db, Scope::Fact(FactKey::new(&db, root, krate, r)))
+    else {
+        panic!("`fact_slot` names a fact");
+    };
+    assert_eq!(new.module(&db, root).scope, ScopeSlot::Final(fact));
     let scope = new.module(&db, root).scope(&db);
     for name in names {
         assert_ne!(scope.get(&Name::new_root(name)), PerNs::none(), "`{name}` in the root");

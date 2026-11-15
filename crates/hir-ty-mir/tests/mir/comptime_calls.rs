@@ -23,7 +23,7 @@ fn refused(src: &str, name: &str) -> Vec<String> {
     let fx = fixture::db(&format!("//- minicore: sized, fn\n{src}"));
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, name));
         let map = Body::source_map(&db, def);
         comptime_calls(&db, def)

@@ -15,7 +15,7 @@ doctest = false
 
 [dependencies]
 blaze-mem.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 
 either.workspace = true
 rustc_type_ir.workspace = true

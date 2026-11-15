@@ -7,6 +7,7 @@
 
 mod model;
 mod props;
+mod walker;
 mod world;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -16,7 +17,7 @@ use blaze_sim::{Broke, Config, Tape};
 use crate::Plant;
 
 /// `world::run` as a control sees it: an oracle's error, or a panic (a maker asked for an
-/// instance the model has not, a write past a section), is the oracle's finding.
+/// instance the model has not), is the oracle's finding.
 fn caught(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     match catch_unwind(AssertUnwindSafe(|| world::run(tape, 12, plant))) {
         Ok(Ok(())) => Ok(()),
@@ -33,13 +34,13 @@ fn caught(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 }
 
 /// Each planted bug is caught by some case. A plant that panics (a maker asked for an instance
-/// the model has not, a write past a section) counts as caught: it stopped loudly.
+/// the model has not) counts as caught: it stopped loudly.
 ///
 /// The invariant: for each plant, the oracles of [`world::World::step`] and
 /// [`world::World::check`] fail on at least one of the first 64 seeds.
 #[test]
 fn controls() {
-    let plants = [Plant::InlineeLeftOut, Plant::SeenDrops, Plant::SiteNotRepatched, Plant::ReachWithoutStatics];
+    let plants = [Plant::InlineeLeftOut, Plant::SeenDrops, Plant::RekeyedNotGone, Plant::ReachWithoutStatics];
     for plant in plants {
         // Each plant is caught by a different oracle (a node that differs, a run that differs,
         // a key that did not move, a panic), so the control asks only that one of them fires.

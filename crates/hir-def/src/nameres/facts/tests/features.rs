@@ -41,25 +41,26 @@ fn the_roots_features_are_the_def_maps() {
     assert!(of_root.is_enabled(&Symbol::intern("never_patterns")));
 }
 
-/// Read inside a batch, after an edit of the root and before any maintainer ran: what the read
-/// executes is what the features need, as when the maintainer's run of a proc macro reads them.
+/// Read first in the snapshot an edit of the root made, before anything else asked of it: what
+/// the read executes is what the features need, as when a proc macro's run reads them.
 #[test]
 fn reading_the_roots_features_builds_no_def_map() {
     let fx = fixture::db(FIXTURE);
     let root = fx.file(0).file_id(fx.db());
     let mut db = fx.into_db();
-    let krate = db.fetch_test_crate();
+    let key = db.fetch_test_crate().key(&db);
     let text = format!("#![feature(deref_patterns)]\n{}", db.file_text(root).text(&db));
-    let (forced, deref, executed) = db.batch(base_db::Trigger::named("the test's edit"), |db| {
-        db.set_file_text(root, &text);
-        let view: &Db = db;
-        let mut read = (false, false);
-        let executed = view.executed_in_read_order(|| {
-            let features = UnstableFeatures::of_root(view, krate);
-            read = (features.forced_keywords, features.deref_patterns);
-        });
-        (read.0, read.1, executed)
+    _ = db.set_file_text(root, &text);
+    // The crate of the new snapshot, by its key (a lookup, no query): the edit drops the
+    // arena its id was homed in.
+    let krate = db.krate(key);
+    let view: &Db = &db;
+    let mut read = (false, false);
+    let executed = view.executed_in_read_order(|| {
+        let features = UnstableFeatures::of_root(view, krate);
+        read = (features.forced_keywords, features.deref_patterns);
     });
+    let (forced, deref) = read;
     assert!(forced && deref, "the edit's feature is read");
     assert!(executed.iter().any(|it| it.contains("crate_data")), "{executed:#?}");
     let resolver = |it: &&String| it.contains("def_map") || it.contains("module_decls");

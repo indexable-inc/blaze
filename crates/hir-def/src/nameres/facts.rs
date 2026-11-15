@@ -3,16 +3,15 @@
 //! rust-analyzer's `DefCollector` rules, on a schedule that memoizes per module: each module's round-0
 //! declarations are a query (`module_decls`) whose value is an op log; each expansion round
 //! resolves imports per strongly connected component of the round's import graph
-//! (`scc_state`), reading other components only through per-name facts (`ModuleScope::name`);
+//! (`scc_state`), reading other components only through their facts (`fact_handle`);
 //! macro resolution is per module and round (`macro_step`); the crate's `DefMap` is assembled
-//! from the final round's `ModuleScope` handles.
+//! from the final round's facts (`ScopeSlot::Fact`).
 //!
 //! "The old `X`" in this module's comments names the part of that `DefCollector`
 //! (`nameres/collector.rs`, deleted 2026-11-03) whose rule `X`'s replacement keeps.
 
-// The round schedule (`driver`, `graph`, the round queries) is the differential reference of
-// the name resolution maintainer (`nameres::delta`), which reuses the rules through `collect`,
-// `env`, `macros`, `ops` and `unit`.
+// The round schedule (`driver`, `graph`, the round queries) is how the crate being built is
+// resolved (`crate_resolution`).
 pub(in crate::nameres) mod collect;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::nameres) mod driver;
@@ -68,10 +67,9 @@ pub(crate) fn set_in<'f, K>(frame: &'f Frame) -> FrameSet<'f, K> {
     hashbrown::HashSet::with_hasher_in(FixedState, frame)
 }
 
-/// The crate's def map with every scope handed over (`ScopeSlot::Collected`), diagnostics
-/// grouped: what `crate_local_def_map` wraps in a `DefMapPair`. Runs inside that query only, in
-/// its frame. The differential reference of the maintained resolution (`nameres::delta`).
-#[cfg(test)]
+/// The crate's def map with every scope handed over (each module's a `ScopeSlot::Fact` of the
+/// final round), diagnostics grouped: what `crate_resolution` holds. Runs inside that query
+/// only, in its frame.
 pub(super) fn collect_crate(db: &Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap) {
     driver::collect_crate(db, frame, krate)
 }
@@ -88,14 +86,12 @@ pub(super) fn collect_block(
     driver::collect_block(db, frame, def_map, tree_id, crate_local_def_map)
 }
 
-/// The `ModuleScope` (as `blaze_query::db::Id`) of a `ScopeSlot::Fact(scope)`.
-pub(super) fn fact_scope(db: &Db, scope: blaze_query::db::Id) -> blaze_query::db::Id {
-    let scope = <queries::ScopeRef as blaze_query::db::FromId>::from_id(scope);
+/// The scope and children of a `ScopeSlot::Fact(scope)`.
+pub(super) fn fact_scope(db: &Db, scope: queries::ScopeRef) -> &crate::nameres::BuildingScope {
     queries::scope_of(db, scope)
 }
 
 /// The row of `module` in a resolver view (`ModulesSlot::Unit`) that does not hold it.
-pub(super) fn row(db: &Db, rows: blaze_query::db::Id, module: ModuleId) -> Option<&ModuleData> {
-    let rows = <queries::RowsKey as blaze_query::db::FromId>::from_id(rows);
+pub(super) fn row(db: &Db, rows: queries::RowsKey, module: ModuleId) -> Option<&ModuleData> {
     queries::row(db, rows, module).as_ref()
 }

@@ -22,6 +22,7 @@ use super::{
     VERNEED, VERSYM, error,
 };
 use crate::cow::CowBytes;
+use crate::keep::{Bad, In, Kept, Out};
 use crate::model::{Class, Counts, Delta, Holds, Placed, Region, SymbolKind, Tls, View};
 use crate::unwind::Frame;
 use crate::{LinkError, Output, OutputKind};
@@ -701,6 +702,59 @@ impl KeptRela {
         self.free.first().map_or(self.slots, |it| *it as usize)
     }
 
+    /// Its part of a kept state (`keep.rs`, the section `rela`): which slot each slid address
+    /// holds and how long the run is, when the table is of the state kept (`of`, the state's
+    /// synthesis); else nothing. The slots are history: a table patched through edits holds an
+    /// empty slot where an address went and a new address in the first empty one, which a table
+    /// made whole in address order does not, so an opened image that made it whole would write
+    /// another file than the image that kept it. The table's bytes are not here: they are the
+    /// state's `.rela.dyn` region, kept with the state and opened in place ([`KeptRela::open`]).
+    pub(crate) fn keep<A: std::alloc::Allocator>(&self, of: u64, out: &mut Out<A>) {
+        let held = self.synthesis != 0 && self.synthesis == of;
+        out.bool(held);
+        if held {
+            out.len(self.slots);
+            self.slot_of.put(out);
+        }
+    }
+
+    /// Whether it holds no table.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.synthesis == 0
+    }
+
+    /// The table [`KeptRela::keep`] wrote, as of the opened state's synthesis `synthesis` (a
+    /// number of this process's), over `region`: the opened state's `.rela.dyn` bytes (`None`:
+    /// the state has no such region), shared with it page by page until a patch writes one.
+    /// Every slot held is below the run's end and held once, the region holds the run, and each
+    /// empty slot is zeros in it: else the state is refused.
+    pub(crate) fn open(input: &mut In<'_>, synthesis: u64, region: Option<&CowBytes>) -> Result<KeptRela, Bad> {
+        if !input.bool()? {
+            return Ok(KeptRela::default());
+        }
+        let slots = input.len()?;
+        let slot_of = Vec::<u32>::take(input)?;
+        let Some(region) = region else {
+            return Err(Bad::What("`.rela.dyn` slots kept for a state with no `.rela.dyn` region"));
+        };
+        if slot_of.len() > slots || region.len() < RELA as usize * slots {
+            return Err(Bad::What("a `.rela.dyn` run longer than its region or with more addresses than slots"));
+        }
+        let mut free = std::collections::BTreeSet::new_in(std::alloc::Global);
+        free.extend(0..slots as u32);
+        for slot in &slot_of {
+            if !free.remove(slot) {
+                return Err(Bad::What("a `.rela.dyn` slot past the run's end, or held twice"));
+            }
+        }
+        let empty = |slot: &u32| region.read(RELA as usize * *slot as usize, RELA as usize).iter().all(|it| *it == 0);
+        if !free.iter().all(empty) {
+            return Err(Bad::What("an empty `.rela.dyn` slot that is not zeros in the region"));
+        }
+        // clone: two reference counts, the table shared with the opened state's region
+        Ok(KeptRela { synthesis, bytes: region.clone(), slot_of, free, slots, ..KeptRela::default() })
+    }
+
     /// The table made whole holds `relative` slid addresses, each in the slot of its index.
     fn made_whole(&mut self, relative: usize) {
         self.slot_of.clear();
@@ -826,21 +880,58 @@ fn patch_relative(
     if len != rebase.len() {
         return false;
     }
-    // Each splice's new addresses take the slots of the ones it took out, in order, as far
-    // as those go: a splice that keeps its length keeps its slots, and asks nothing of the
-    // empty ones. The slots left over are given back; the addresses left over take the
-    // lowest empty slot, or one more at the run's end, once every splice has given back.
+    // Each address a splice keeps keeps its slot, matched by address: the old addresses are
+    // the `r_offset`s of the slots it took out, read from the table, in order as the list
+    // was. An address it took out and did not put back gives its slot back; an address it put
+    // in that was not there takes the lowest empty slot, or one more at the run's end, once
+    // every splice has given back. Until 2026-11-15 the new addresses took the old slots by
+    // position, so the jump table's cells piece (one splice of every filled cell, a body edit
+    // emptying one cell and filling another) moved every cell after the emptied one into its
+    // neighbour's slot: 24 bytes a function for one body edit
+    // (`a_body_edits_patch_does_not_grow_with_the_image`).
     const UNSET: u32 = u32::MAX;
     let (taken, gone) = (&mut kept.taken, &mut kept.gone);
     taken.clear();
     gone.clear();
+    let table = &kept.bytes;
+    let address = |slot: u32| -> u64 {
+        let word = table.read(RELA as usize * slot as usize, 8);
+        u64::from_le_bytes([word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7]])
+    };
     for splice in delta.rebase {
         let old = &kept.slot_of[splice.old.start as usize..splice.old.end as usize];
-        let stay = old.len().min(splice.new.len());
-        taken.extend_from_slice(&old[..stay]); // alloc: none once it has held an edit's slots
-        taken.extend(std::iter::repeat_n(UNSET, splice.new.len() - stay)); // alloc: as above
-        gone.extend_from_slice(&old[stay..]); // alloc: as above
-        kept.free.extend(old[stay..].iter().copied()); // alloc: a node an empty slot, until it is taken
+        let new = &rebase[splice.new.start as usize..splice.new.end as usize];
+        let (mut i, mut j, mut last) = (0, 0, None);
+        while i < old.len() || j < new.len() {
+            let was = old.get(i).map(|slot| address(*slot));
+            if let Some(was) = was {
+                // The kept list was sorted: an old address out of order is a table this run
+                // does not describe, made whole by the caller.
+                if last.is_some_and(|last| was <= last) {
+                    return false;
+                }
+            }
+            match (was, new.get(j)) {
+                (Some(was), Some(&is)) if was == is => {
+                    taken.push(old[i]);
+                    (last, i, j) = (Some(was), i + 1, j + 1);
+                }
+                (Some(was), Some(&is)) if is < was => {
+                    taken.push(UNSET);
+                    j += 1;
+                }
+                (Some(was), _) => {
+                    gone.push(old[i]);
+                    kept.free.insert(old[i]);
+                    (last, i) = (Some(was), i + 1);
+                }
+                (None, Some(_)) => {
+                    taken.push(UNSET);
+                    j += 1;
+                }
+                (None, None) => break,
+            }
+        }
     }
     let mut slots = kept.slots;
     for slot in taken.iter_mut().filter(|it| **it == UNSET) {

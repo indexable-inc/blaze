@@ -1,11 +1,12 @@
-//! Inputs: made by the driver while a snapshot is built, fixed for its life. Each input is one
+//! Inputs: made by the driver while a snapshot is built, fixed from its first run on (before it,
+//! the driver may write one in place, [`Memo::input_mut`]). Each input is one
 //! fact ((fact id, digest), from the driver's records): a getter's read of it is what the
 //! recorder lists.
 
-use std::ptr;
+use std::{ptr, sync::Arc};
 
 use crate::{
-    ArenaId, Fact, Gid, Inputs, Kind, Memo,
+    Fact, Gid, Inputs, Kind, Memo,
     arena::with_local,
     fetch::hash_of,
     task,
@@ -17,6 +18,11 @@ use crate::{
 pub trait Input: 'static {
     type Fields: Send + Sync + 'static;
     const KIND: &'static Kind;
+    /// `#[input(parts)]`: a getter notes no fact. The input is an image read item by item, and
+    /// its accessors list each item's own fact ([`crate::read`]), so a reader depends on the
+    /// items it read, not on the whole image. The arena's read (a borrow) is noted all the
+    /// same.
+    const PARTS: bool = false;
 }
 
 /// Makes an input in `inputs`' arena: the fact the driver knows it by and its fields.
@@ -35,25 +41,88 @@ fn make<'b, T: Input>(
     let local = slot.reserve_local(false);
     let entry = with_local(slot, |at| -> *mut Entry<(), (Fact, T::Fields)> {
         at.alloc(Entry {
-            head: Head::new(hash, T::KIND, &[], local),
+            head: Head::new(hash, T::KIND, local),
             key: (),
             value: (fact, fields),
         })
     });
-    if std::mem::needs_drop::<T::Fields>() {
-        // SAFETY (of the destructor): called once, when the arena drops, on this entry.
-        unsafe fn drop_fields<F>(at: *mut u8) {
-            // SAFETY: `at` is the fields of an entry made above, not dropped before.
-            unsafe { ptr::drop_in_place(at.cast::<F>()) };
-        }
-        // SAFETY: `entry` was just made, in the arena.
-        let fields = unsafe { ptr::addr_of_mut!((*entry).value.1) };
-        slot.drop_with(fields.cast(), drop_fields::<T::Fields>);
-    }
+    // The arena's one drop list, as for an `owns` value and a `keep_owned` one (a no-op where
+    // the fields need no drop).
+    // SAFETY: `entry` was just made in the arena; its fields are listed once, here, and never
+    // dropped or moved out otherwise.
+    unsafe { slot.drop_owned(&raw const (*entry).value.1) };
+    // Stored as the arena's own pointer, not through a shared borrow: it keeps the write
+    // permission [`Memo::input_mut`] needs.
+    // SAFETY: `entry` is the arena's, just made; a place of it, no reference made.
+    let raw: *mut Head = unsafe { &raw mut (*entry).head };
+    slot.set_local_raw(local, raw);
     // SAFETY: just made, in the arena, which lives as long as the builder's slot.
-    let head: &'b Head = unsafe { &(*entry).head };
-    slot.set_local(local, head);
+    let head: &'b Head = unsafe { &*raw };
     (head, Gid::new(inputs.id(), local))
+}
+
+impl Memo {
+    /// The fields of input `id` to write in place: a write of a snapshot built and never run,
+    /// before any query reads it. The driver's use: a change too big to copy (a source root's
+    /// file set, edited where it is once the snapshot that shared it is released) is put in
+    /// the input the next snapshot was made with, so its value is never copied. The input's
+    /// fact is not touched: the driver made it with the digest of the fields as they are
+    /// after this write.
+    ///
+    /// Sound because nothing else can see the fields: `&mut self` ends every borrow of this
+    /// snapshot, no query has run on it (so no value holds what an input gave it), no
+    /// successor shares its arenas, and the arena is held by this snapshot alone.
+    ///
+    /// # Panics
+    ///
+    /// Naming `id` and what refused: a query has run on this snapshot ([`Memo::has_run`]); it
+    /// has a successor ([`Memo::has_successor`]); another snapshot holds `id`'s arena (a
+    /// reader of the snapshot it was carried from); `id` is not an input of `T`.
+    #[track_caller]
+    pub fn input_mut<T: Input>(&mut self, id: Gid) -> &mut T::Fields {
+        assert!(
+            !self.has_run(),
+            "Memo::input_mut of {} {id:?}: a query has run on this snapshot, and its inputs are \
+             fixed from its first run",
+            T::KIND.name()
+        );
+        assert!(
+            !self.has_successor(),
+            "Memo::input_mut of {} {id:?}: this snapshot has a successor, which shares its arenas",
+            T::KIND.name()
+        );
+        // The generation check of `slot`, then the arena's own count.
+        let arena = id.arena();
+        _ = self.slot(arena);
+        let held = self.slots[arena.index() as usize]
+            .as_mut()
+            .expect("`Memo::slot` found the arena above");
+        let slot = Arc::get_mut(held).unwrap_or_else(|| {
+            panic!(
+                "Memo::input_mut of {} {id:?}: another snapshot holds its arena {arena:?} (carried \
+                 from one a reader still holds), so its fields are not this snapshot's alone",
+                T::KIND.name()
+            )
+        });
+        let head = slot
+            .local_raw(id.local())
+            .unwrap_or_else(|| panic!("Memo::input_mut: {id:?} names no input"));
+        // SAFETY: a stored head lives as long as the arena, which `slot` (held alone, `&mut`)
+        // keeps.
+        let kind = unsafe { (*head).kind };
+        assert!(
+            ptr::eq(kind, T::KIND),
+            "Memo::input_mut: {id:?} is a {}, not a {}",
+            kind.name(),
+            T::KIND.name()
+        );
+        let entry = head.cast::<Entry<(), (Fact, T::Fields)>>();
+        // SAFETY: an input of `T::KIND` is an `Entry<(), (Fact, T::Fields)>` (`Entry` is
+        // `#[repr(C)]`, its head first), and `head` is the arena's own pointer to it
+        // ([`make`]), with write permission. Nothing else reads it while this borrow lives:
+        // the asserts above, and `&mut self` for the borrow's whole life.
+        unsafe { &mut (*entry).value.1 }
+    }
 }
 
 /// Sets the singleton input `T` of the session arena.
@@ -63,7 +132,7 @@ fn make<'b, T: Input>(
 /// Where `inputs` is not the session arena's, or `T` is set already in this snapshot.
 pub fn set_singleton<T: Input>(inputs: &Inputs<'_>, fact: Fact, fields: T::Fields) {
     assert!(
-        inputs.id().index() == ArenaId::SESSION.index(),
+        inputs.id().is_session(),
         "singleton {} goes in the session arena, not {:?}",
         T::KIND.name(),
         inputs.id()
@@ -78,10 +147,27 @@ pub fn set_singleton<T: Input>(inputs: &Inputs<'_>, fact: Fact, fields: T::Field
     assert!(inserted, "singleton {} is set twice in one snapshot", T::KIND.name());
 }
 
-/// The fields of input `id`, the read of its fact listed.
+/// The fields of input `id`, the read of its fact listed (none for a `parts` input, whose
+/// accessors list their items' facts: [`Input::PARTS`]).
 pub fn input<'db, T: Input>(memo: &'db Memo, id: Gid) -> &'db T::Fields {
     let slot = memo.slot(id.arena());
     task::note_read_of(memo, slot);
+    let entry = entry_of::<T>(memo, id);
+    if !T::PARTS {
+        task::note_fact(memo, crate::Read::Input { kind: crate::KindId::of(T::KIND), fact: entry.value.0 });
+    }
+    &entry.value.1
+}
+
+/// The fact the driver made input `id` with. Lists no read and notes no borrow: an input's fact
+/// id is its identity (stable across snapshots and processes), what an imaged query's key is
+/// written with ([`crate::Stable`]); its digest is read only through [`input`].
+pub fn input_fact<T: Input>(memo: &Memo, id: Gid) -> Fact {
+    entry_of::<T>(memo, id).value.0
+}
+
+fn entry_of<'db, T: Input>(memo: &'db Memo, id: Gid) -> &'db Entry<(), (Fact, T::Fields)> {
+    let slot = memo.slot(id.arena());
     let head = slot.local(id.local()).unwrap_or_else(|| panic!("{id:?} names no input"));
     assert!(
         ptr::eq(head.kind, T::KIND),
@@ -90,9 +176,7 @@ pub fn input<'db, T: Input>(memo: &'db Memo, id: Gid) -> &'db T::Fields {
         T::KIND.name()
     );
     // SAFETY: an input of `T::KIND` is an `Entry<(), (Fact, T::Fields)>`.
-    let entry = unsafe { Entry::<(), (Fact, T::Fields)>::of(head) };
-    task::note_fact(memo, entry.value.0);
-    &entry.value.1
+    unsafe { Entry::<(), (Fact, T::Fields)>::of(head) }
 }
 
 /// The id of the singleton `T` (its fields are read through [`input`], which lists the read).
@@ -108,15 +192,9 @@ pub fn singleton<T: Input>(memo: &Memo) -> Gid {
 /// The id of the singleton `T`, `None` where the driver did not set it in this snapshot (a
 /// snapshot's inputs are fixed, so the answer is too: no read is listed).
 pub fn try_singleton<T: Input>(memo: &Memo) -> Option<Gid> {
-    let id = memo_session(memo);
+    let id = memo.session();
     let slot = memo.slot(id);
     let kind = T::KIND;
     let head = slot.trie.get(hash_of(kind, &()), |other| ptr::eq(other.kind, kind))?;
     Some(Gid::new(id, head.local))
-}
-
-fn memo_session(memo: &Memo) -> ArenaId {
-    memo.arenas().next().filter(|it| it.index() == 0).unwrap_or_else(|| {
-        panic!("this snapshot has no session arena (index 0): the driver did not add it")
-    })
 }

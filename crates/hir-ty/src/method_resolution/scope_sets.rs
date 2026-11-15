@@ -8,7 +8,7 @@
 //! [`module_items_named`], which backdates when a trait without an item of the name comes into or
 //! leaves scope.
 
-use std::num::NonZeroU32;
+use std::{alloc::Global, num::NonZeroU32};
 
 use base_db::Db;
 use blaze_mem::Frame;
@@ -24,8 +24,9 @@ use smallvec::SmallVec;
 use super::{CandidateId, TraitValueItems, trait_value_item};
 use crate::{
     db::HirDatabase,
-    next_solver::interner::table::{Erase, Lists},
+    next_solver::interner::table::{Erase, Held, Holds, Homed, Lists},
 };
+use blaze_memo::{ArenaId, Id as _};
 
 // SAFETY: `TraitId` has no lifetime: `Static` is `TraitId` itself.
 unsafe impl Erase for TraitId {
@@ -35,6 +36,36 @@ unsafe impl Erase for TraitId {
 // SAFETY: `ScopeItem` has no lifetime: `Static` is `ScopeItem` itself.
 unsafe impl Erase for ScopeItem {
     type Static = ScopeItem;
+}
+
+/// A trait's home is the arena of its id; it holds no row.
+impl Homed for TraitId {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        Some(self.gid().arena())
+    }
+}
+
+impl Holds for TraitId {
+    #[inline]
+    fn hold(&self, _: &mut Held) {}
+}
+
+/// An item's home is the newer arena of its trait's and its item's ids; it holds no row.
+impl Homed for ScopeItem {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        let item = match self.item {
+            CandidateId::FunctionId(it) => it.gid(),
+            CandidateId::ConstId(it) => it.gid(),
+        };
+        Some(self.trait_.gid().arena().max(item.arena()))
+    }
+}
+
+impl Holds for ScopeItem {
+    #[inline]
+    fn hold(&self, _: &mut Held) {}
 }
 
 /// Every [`TraitSet`]. Rows are the same for equal sets on every thread for the life of the
@@ -96,9 +127,10 @@ impl ScopeItems {
     }
 
     /// The items of `traits` (sorted, deduplicated) named `name`, written with `hygiene`: each
-    /// trait's of its [`trait_item_name`].
+    /// trait's of its [`trait_item_name`]. `table` is the table `hygiene`'s context is of.
     fn of_traits(
         db: &Db,
+        table: ArenaId,
         traits: &[TraitId],
         name: Name,
         hygiene: HygieneId,
@@ -107,7 +139,8 @@ impl ScopeItems {
         let mut values = TraitValueItems::new_in(frame);
         let mut items: SmallVec<[ScopeItem; 8]> = SmallVec::new();
         for &trait_ in traits {
-            if let Some(item) = values.get(db, trait_, trait_item_name(db, trait_, name, hygiene)) {
+            let written = trait_item_name(db, table, trait_, name, hygiene);
+            if let Some(item) = values.get(db, trait_, written) {
                 // alloc: only past eight traits with an item of one name, on a miss of the query
                 // or for a caller's own set.
                 items.push(ScopeItem { trait_, item });
@@ -175,9 +208,17 @@ impl TraitsInScope {
     /// extension candidates of a probe for it. A name a `macro` writes (its context keeps an
     /// opaque mark, [`written_key`]) is looked up among the traits of rustc's hygienic walk
     /// ([`for_each_hygienic_trait_in_scope`]) by each trait's [`trait_item_name`], outside the
-    /// per-module memo, which is of plain names.
-    pub fn named(self, db: &Db, name: Name, hygiene: HygieneId, frame: &Frame) -> ScopeItems {
-        match (self, written_key(db, hygiene)) {
+    /// per-module memo, which is of plain names. `table` is the table `hygiene`'s context is of
+    /// (the body's crate's, `Resolver::ctx_table`).
+    pub fn named(
+        self,
+        db: &Db,
+        table: ArenaId,
+        name: Name,
+        hygiene: HygieneId,
+        frame: &Frame,
+    ) -> ScopeItems {
+        match (self, written_key(db, table, hygiene)) {
             (TraitsInScope::Scope { module, impl_trait }, None) => {
                 let items = module_items_named(db, module, name);
                 match impl_trait {
@@ -189,13 +230,13 @@ impl TraitsInScope {
                 // alloc: in the probe's frame, once per probe of a name a `macro` writes
                 let mut traits: Vec<TraitId, &Frame> = Vec::new_in(frame);
                 traits.extend(impl_trait);
-                for_each_hygienic_trait_in_scope(db, module, ctxt, |it| traits.push(it));
+                for_each_hygienic_trait_in_scope(db, table, module, ctxt, |it| traits.push(it));
                 traits.sort_unstable();
                 traits.dedup();
-                ScopeItems::of_traits(db, &traits, name, hygiene, frame)
+                ScopeItems::of_traits(db, table, &traits, name, hygiene, frame)
             }
             (TraitsInScope::Set(set), _) => {
-                ScopeItems::of_traits(db, set.traits(), name, hygiene, frame)
+                ScopeItems::of_traits(db, table, set.traits(), name, hygiene, frame)
             }
         }
     }
@@ -215,21 +256,24 @@ impl TraitsInScope {
 
 /// The traits in scope in `module`: its blocks', its module's and the prelude's, as
 /// `Resolver::for_each_trait_in_scope` walks them.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn module_trait_set(db: &Db, module: ModuleId) -> TraitSet {
-    // alloc: once per module and revision.
-    let mut traits = Vec::new();
+    let mut traits = Vec::new_in(Global);
     module.resolver(db).for_each_trait_in_scope(db, |it| traits.push(it));
     TraitSet::new(&mut traits)
 }
 
 /// The traits in scope in `module` with a value item named `name`, and those items. What a body
 /// reads of its scope's traits, so it is checked again only when this changes.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn module_items_named(db: &Db, module: ModuleId, name: Name) -> ScopeItems {
     blaze_mem::frame::current(|frame| {
         ScopeItems::of_traits(
             db,
+            // A root context is the same word in every table and is looked up in none
+            // (`trait_item_name` returns a root's name as it is); the table named is the
+            // module's crate's, the one a context written in it would be of.
+            crate::ctx_table(module.krate(db)),
             module_trait_set(db, module).traits(),
             name,
             HygieneId::ROOT,

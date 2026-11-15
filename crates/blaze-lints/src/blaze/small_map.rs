@@ -40,7 +40,10 @@ use std::alloc::Global;
 use syntax::view::{self as ast, AstNode as _, HasAttrs as _, HasName as _};
 
 use super::{Finding, Lint, alloc::written_callee, facts, hash_order_output::local_of};
-use crate::check::{self, Cx};
+use crate::{
+    check::{self, Cx},
+    kept,
+};
 
 const LINT: Lint = Lint::SmallMap;
 
@@ -99,9 +102,17 @@ pub(crate) struct FieldUse {
     pub(crate) blocked: bool,
 }
 
-/// The fields of map type the crate's bodies use, and how.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Fields(HashMap<FieldId, FieldUse, Global>);
+/// What [`small_fields`] keeps of one field's [`FieldUse`]: how many distinct constant keys
+/// (up to one past [`KEPT`]), and whether a use blocks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeptUse {
+    pub(crate) keys: u32,
+    pub(crate) blocked: bool,
+}
+
+/// The fields of map type the crate's bodies use, and how: kept in the crate's arena.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Fields<'db>(kept::Map<'db, FieldId, KeptUse>);
 
 /// How many distinct keys are kept before a field counts as large whatever the threshold.
 const KEPT: usize = 64;
@@ -228,11 +239,10 @@ impl Walk<'_, '_> {
 }
 
 /// The private map fields `krate`'s bodies use, as the module docs say, once per crate.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn small_fields(db: &Db, krate: base_db::Crate) -> Fields {
-    let mut fields = Fields(HashMap::new_in(Global));
-    // alloc: the crate's bodies, once per crate and edit
-    let mut defs = Vec::new();
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn small_fields<'db>(db: &'db Db, krate: base_db::Crate) -> Fields<'db> {
+    let mut fields: HashMap<FieldId, FieldUse, Global> = HashMap::new_in(Global);
+    let mut defs = Vec::new_in(Global);
     for (_, module) in crate_def_map(db, krate).modules(db) {
         check::bodies_of(db, module.scope(db), &mut defs);
     }
@@ -244,9 +254,15 @@ pub(crate) fn small_fields(db: &Db, krate: base_db::Crate) -> Fields {
                 check::bodies_of(db, module.scope(db), &mut defs);
             }
         }
-        fields_in(db, def, &mut fields.0);
+        fields_in(db, def, &mut fields);
     }
-    fields
+    Fields(kept::Map::keep(
+        db,
+        fields.into_iter().map(|(field, used)| {
+            let keys = u32::try_from(used.keys.len()).expect("at most `KEPT + 1` keys are kept");
+            (field, KeptUse { keys, blocked: used.blocked })
+        }),
+    ))
 }
 
 /// Adds what the body of `def` does with the crate's map fields to `out`.
@@ -456,7 +472,7 @@ pub(super) fn check_struct<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
         }
         let fields = fields.get_or_insert_with(|| small_fields(db, cx.krate().base()));
         let Some(used) = fields.0.get(&FieldId::from(field)) else { continue };
-        if used.blocked || used.keys.is_empty() || used.keys.len() as u64 > max {
+        if used.blocked || used.keys == 0 || u64::from(used.keys) > max {
             continue;
         }
         let Some(node) = field_node(item, &field.name(db), index) else { continue };
@@ -466,7 +482,7 @@ pub(super) fn check_struct<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
             field.name(db).as_str(),
             def.name(db).as_str(),
             ty.display(db, target),
-            used.keys.len()
+            used.keys
         );
         let note = "hashing a key and probing a table costs more than comparing it with a few others, and the table \
                     is an allocation; the field is private, so its type can change";

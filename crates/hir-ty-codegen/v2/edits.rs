@@ -57,6 +57,7 @@ use hir_expand::fixture;
 
 use crate::v2::{
     Backends, BuildTime, Databases, HashSource, HirFrontend, ItemHashes, RootKind, Runs,
+    tests::write_file,
 };
 use db::TestDB;
 
@@ -529,12 +530,12 @@ fn replay(edits: &[Edit], heap_to_stack: bool) {
     for (n, edit) in edits.iter().enumerate() {
         model.apply(*edit);
         let (text, body) = (model.source(), model.body());
-        db.set_file_text(file, &body);
+        write_file(&mut db, file, &body);
         let incremental = build(&db, &memo, &store, blaze_store_check::Setting::ALL, heap_to_stack);
         // Given the file's text as the incremental database is, before any query: a clean
         // build of the same bytes, whatever the fixture's parser does to its text.
         let (mut fresh, fresh_file) = database(&text);
-        fresh.set_file_text(fresh_file, &body);
+        write_file(&mut fresh, fresh_file, &body);
         let clean = build(
             &fresh,
             &Memo::new(),
@@ -576,7 +577,8 @@ fn replay(edits: &[Edit], heap_to_stack: bool) {
 
 /// The database of fixture `text`, and the edited crate's file.
 fn database(text: &str) -> (TestDB, base_db::FileId) {
-    let fx = fixture::db(text);
+    // The driver's tasks ask the database at once: a flight that can wait (`db_driven`).
+    let fx = fixture::db_driven(text);
     let file = fx.file_at("/lib.rs");
     let db = fx.into_db();
     let file = file.file_id(&db);

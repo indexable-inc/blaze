@@ -82,7 +82,7 @@ fn instance(db: &Db, name: &str) -> Instance {
 }
 
 fn identity(db: &Db, name: &str, compiled: Compiled) -> CompileIdentity {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         match instance_identity(db, &instance(db, name), &env(db), compiled) {
             Ok(it) => *it,
             Err(error) => panic!("`{name}` has no identity: {error}"),
@@ -91,7 +91,7 @@ fn identity(db: &Db, name: &str, compiled: Compiled) -> CompileIdentity {
 }
 
 fn step(db: &Db, name: &str) -> CodeId {
-    blaze_query::db::attach(db, || match code_id(db, &instance(db, name), &env(db)) {
+    blaze_memo::attach(db, || match code_id(db, &instance(db, name), &env(db)) {
         Ok(it) => it,
         Err(error) => panic!("`{name}` has no CodeId: {error}"),
     })
@@ -169,7 +169,7 @@ fn a_field_added_to_a_struct_whose_size_is_read_changes_the_identity() {
 
 /// Whether a release unit's MIR of the function `name` has a callee inlined into it.
 fn inlines(db: &Db, name: &str) -> bool {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let owner = MirOwner::Body(function(db, name).into());
         let body = monomorphized_mir_at(
             db,
@@ -310,7 +310,7 @@ fn a_for_const_instance_is_keyed_by_its_fields_names() {
     let named_a = program("/src/lib.rs", &text("a"));
     let named_b = program("/src/lib.rs", &text("b"));
     let keyed = |db: &Db| {
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let s = struct_ty(db, "S");
             let instance = Instance {
                 subject: Subject::Body(Body::Fn(function(db, "debug"))),
@@ -654,7 +654,7 @@ struct Evaluated {
 fn evaluated(db: &Db, name: &str) -> Evaluated {
     use hir_ty::db::HirDatabase as _;
     let id = impl_const(db, name);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let value = db
             .const_eval(id, GenericArgs::empty(), None)
             .unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
@@ -820,7 +820,7 @@ pub fn run(x: u32) -> u32 {{ walk(&F(x)) }}
 
 /// Every identity of `walk::<F>` in a program of [`rpitit`]'s.
 fn walk_of_f(db: &Db) -> (CompileIdentity, CompileIdentity, CodeId) {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let instance = Instance {
             subject: Subject::Body(Body::Fn(function(db, "walk"))),
             args: GenericArgs::new_from_slice(&[struct_ty(db, "F").into()]).store(),
@@ -950,17 +950,45 @@ fn ladder(instances: usize) -> Db {
     )
 }
 
-/// How many MIR values the database holds once the CodeId of the step rooted at `root` of
-/// [`ladder`] is made: each instance it runs summarized from its body.
+/// How many MIR bodies the memo holds, over every arena: the entries of every MIR body query
+/// of `hir_ty::providers` (each stage of a function's, closure's and coroutine's), what the
+/// old engine counted as its MIR-tagged values.
+fn mir_entries(memo: &blaze_memo::Memo) -> usize {
+    const STAGES: [&str; 6] = [
+        "mir_body",
+        "monomorphized_mir_body",
+        "runtime_mir_body",
+        "monomorphized_runtime_mir_body",
+        "optimized_mir_body",
+        "monomorphized_optimized_mir_body",
+    ];
+    const OWNERS: [&str; 4] = ["", "_for_closure", "_for_coroutine", "_for_coroutine_by_move"];
+    let mut name = String::new();
+    let mut count = 0;
+    for stage in STAGES {
+        for owner in OWNERS {
+            name.clear();
+            name.push_str("hir_ty::providers::");
+            name.push_str(stage);
+            name.push_str(owner);
+            name.push_str("_query");
+            count += memo.arenas().map(|arena| memo.entries(arena, &name)).sum::<usize>();
+        }
+    }
+    count
+}
+
+/// How many MIR bodies the memo holds ([`mir_entries`]) once the CodeId of the step rooted at
+/// `root` of [`ladder`] is made: each instance it runs summarized from its body.
 fn held_after_the_step(instances: usize, keeps_bodies: bool) -> usize {
-    use blaze_query::db::Database as _;
+    use blaze_memo::Database as _;
     let db = ladder(instances);
     let made = || _ = step(&db, "root");
     match keeps_bodies {
         true => crate::walk::plant::keeping_bodies(made),
         false => made(),
     }
-    db.storage().values_of(blaze_query::db::plumbing::Tag::Mir)
+    mir_entries(db.memo())
 }
 
 /// The invariant: a step's walk keeps each instance's part and callees, never the body it read
@@ -990,7 +1018,7 @@ pub fn named<const S: &'static str>() -> &'static str { S }
 
 /// The compile identity of `named::<s>`, in `db`.
 fn str_instance(db: &Db, s: &str) -> CompileIdentity {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let interner = hir_ty::next_solver::DbInterner::new_with(db, fixture::test_crate(db));
         let arg = hir_ty::record::names_const(interner, s);
         let instance = Instance {

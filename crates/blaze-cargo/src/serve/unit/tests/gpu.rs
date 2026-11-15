@@ -273,7 +273,7 @@ fn lowered(units: &Units) -> blaze_lower::Lowered {
         root: view,
         host_cpu: None,
         sealed: &blaze_lower::unsealed(units),
-    })
+    }, blaze_item_hash::reads::mark_boundaries, blaze_memo::Reads::Kept)
     .unwrap()
 }
 
@@ -304,7 +304,7 @@ fn host_reads(lowered: &blaze_lower::Lowered) -> Vec<(base_db::AbsPathBuf, blaze
         .expect("the host crate's root has the static `MSL`");
     // Its value is not what is tested, only what its initializer read.
     let _ = db.const_eval_static(statik);
-    db.files().included_by(db, krate)
+    db.files().included_by(db, krate.key(db))
 }
 
 /// The host crate waits on the device unit's MSL as it would on a build script's run: until

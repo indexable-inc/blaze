@@ -41,7 +41,8 @@ use crate::{
     macro_call_as_call_id,
     nameres::{
         BuiltinShadowMode, DefMap, DefMapCrateData, DiagnosticsByModule, Hygienic, LocalDefMap,
-        MacroSubNs, ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, crate_def_map,
+        MacroSubNs, ModuleData, ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, boundary,
+        crate_def_map,
         diagnostics::{DefDiagnostic, PreludeError},
         enable_builtin_derive_fast_path,
         mod_resolution::ModDir,
@@ -78,7 +79,9 @@ fn deps<'db, 'f>(
     // own `std` has no name in the crate. Everything after this table (the extern prelude,
     // the injected `extern crate std`, the prelude's path) then reads bstd as the crate's
     // std with no rule of its own. A crate of no blaze edition takes neither branch.
-    let blaze_edition = krate.blaze_edition(db);
+    // Through its boundary: a block's collection runs in its reader's list, which must hold a
+    // row of the crate, never the root file the edition is said in.
+    let blaze_edition = boundary::blaze_edition(db, krate);
     let mut deps = Vec::with_capacity_in(data.dependencies.len(), frame);
     for dep in &data.dependencies {
         tracing::debug!("crate dep {:?} -> {:?}", dep.name, dep.crate_id);
@@ -157,7 +160,7 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
     // (`Vec::new_in(cx.frame())`; docs/v2/plan/design/std.md, "Memory is explicit"), so the
     // allocator API needs no `#![feature]` in it: entered as if written, as
     // `#![blaze::simd]` enters its two, and nothing else of the crate changes.
-    if krate.blaze_edition(db).is_some() {
+    if boundary::blaze_edition(db, krate).is_some() {
         for feature in ["allocator_api", "allocator_ext"] {
             crate_data.unstable_features.enable(Symbol::intern(feature));
         }
@@ -244,8 +247,9 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
                 crate_data.rustc_coherence_is_core = true;
             }
             () if *attr_name == sym::feature => {
+                let table = HirFileId::from(file_id).context_arena();
                 let features =
-                    attr.parse_path_comma_token_tree(db).into_iter().flatten().filter_map(
+                    attr.parse_path_comma_token_tree(db, table).into_iter().flatten().filter_map(
                         |(feat, _, _)| match feat.segments() {
                             // clone: an interned symbol
                             [name] => Some(name.symbol().clone()),
@@ -309,6 +313,7 @@ pub(crate) fn root_decl(db: &Db, frame: &Frame, krate: Crate) -> DeclKey {
         .collect();
     let krate_env = CrateEnvKey::new(
         db,
+        krate,
         super::env::CrateEnv { extern_prelude, macro_use: Box::default(), prelude: None },
     );
     let env = EnvKey::new(db, CollectEnv { krate: krate_env, ancestors: Box::default() });
@@ -333,7 +338,7 @@ pub(crate) fn root_decl(db: &Db, frame: &Frame, krate: Crate) -> DeclKey {
 
 /// The `LocalDefMap` paths read under a crate env: one per env, shared by every module whose
 /// collection starts from it.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn crate_env_local(db: &Db, env: CrateEnvKey) -> LocalDefMap {
     env.env(db).local_def_map()
 }
@@ -347,7 +352,7 @@ struct FileHead {
     macro_use: bool,
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn mod_file_head(db: &Db, file: EditionedFileId, krate: Crate) -> FileHead {
     match file_item_tree(db, file.into(), krate).top_level_attrs() {
         // clone: the cfg of a file that is configured out, once per such file
@@ -525,7 +530,7 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
     fn new(cx: &'a CollectCx<'db, 'f>, key: DeclKey, decl: &'db Decl) -> Self {
         let db = cx.db;
         let env = decl.env.env(db);
-        let rows = blaze_query::db::AsId::as_id(&RowsKey::new(db, Rows::Decl(key)));
+        let rows = RowsKey::new(db, Rows::Decl(key));
         let mut def_map = DefMap {
             krate: decl.krate,
             block: None,
@@ -637,7 +642,7 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
     fn env_after(&mut self, op: &DeclOp) {
         let db = self.cx.db;
         let Some(next) = self.crate_env.env(db).after(op) else { return };
-        self.crate_env = CrateEnvKey::new(db, next);
+        self.crate_env = CrateEnvKey::new(db, self.crate_env.krate(db), next);
         let env = self.crate_env.env(db);
         env.install(&mut self.def_map);
         if matches!(op, DeclOp::ExternPrelude { .. }) {
@@ -896,7 +901,7 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
         };
         self.def_map.modules.building().insert(child, row);
         if let ModulesSlot::Unit { rows, .. } = &mut self.def_map.modules {
-            *rows = blaze_query::db::AsId::as_id(&RowsKey::new(db, Rows::Decl(key)));
+            *rows = RowsKey::new(db, Rows::Decl(key));
         }
         self.log.push(DeclOp::Splice { child, key });
         if own == self.def_map.root {
@@ -1019,7 +1024,7 @@ fn inject_prelude<'db, S: Sink<'db>>(sink: &mut S) {
 
     // blaze: a crate of a blaze edition has its std's prelude of that edition
     // (`bstd::prelude::blaze_2026_11`), by the absolute path, as Rust 2018 on has its own.
-    if let Some(blaze) = def_map.krate().blaze_edition(db)
+    if let Some(blaze) = boundary::blaze_edition(db, def_map.krate())
         && !def_map.data.no_std
     {
         let path = ModPath::from_segments(
@@ -1685,7 +1690,8 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         cov_mark::hit!(macro_rules_from_other_crates_are_visible_with_macro_use);
         let mut single_imports = Vec::new_in(self.cx.frame);
         for attr in macro_use_attrs {
-            let Some(paths) = attr.parse_path_comma_token_tree(self.cx.db) else {
+            let table = self.file_id().context_arena();
+            let Some(paths) = attr.parse_path_comma_token_tree(self.cx.db, table) else {
                 // `#[macro_use]` (without any paths) found, forget collected names and just import
                 // all visible macros.
                 self.import_macros_from_extern_crate(target_crate, None, Some(extern_crate_id));

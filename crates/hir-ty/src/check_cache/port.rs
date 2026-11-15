@@ -25,7 +25,7 @@ use blaze_format::{
     FormatError, Part as SchemaPart, Placed, Record, SchemaHash, Slice, open_as, schema_of,
 };
 use blaze_hash::HashMap;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id as _;
 use hir_def::{
     ConstId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId, TraitId, TypeAliasId,
     UnionId,
@@ -98,18 +98,18 @@ pub enum Item {
 
 impl Item {
     fn of(kind: IdKind, bits: u64) -> Option<Item> {
-        let id = u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)?;
+        let id = super::ids::id_at(bits)?;
         Some(match kind {
-            IdKind::Function => Item::Function(FunctionId::from_id(id)),
-            IdKind::Struct => Item::Struct(StructId::from_id(id)),
-            IdKind::Union => Item::Union(UnionId::from_id(id)),
-            IdKind::Enum => Item::Enum(EnumId::from_id(id)),
-            IdKind::Const => Item::Const(ConstId::from_id(id)),
-            IdKind::Static => Item::Static(StaticId::from_id(id)),
-            IdKind::Trait => Item::Trait(TraitId::from_id(id)),
-            IdKind::TypeAlias => Item::TypeAlias(TypeAliasId::from_id(id)),
-            IdKind::Impl => Item::Impl(ImplId::from_id(id)),
-            IdKind::EnumVariant => Item::EnumVariant(EnumVariantId::from_id(id)),
+            IdKind::Function => Item::Function(FunctionId::from_gid(id)),
+            IdKind::Struct => Item::Struct(StructId::from_gid(id)),
+            IdKind::Union => Item::Union(UnionId::from_gid(id)),
+            IdKind::Enum => Item::Enum(EnumId::from_gid(id)),
+            IdKind::Const => Item::Const(ConstId::from_gid(id)),
+            IdKind::Static => Item::Static(StaticId::from_gid(id)),
+            IdKind::Trait => Item::Trait(TraitId::from_gid(id)),
+            IdKind::TypeAlias => Item::TypeAlias(TypeAliasId::from_gid(id)),
+            IdKind::Impl => Item::Impl(ImplId::from_gid(id)),
+            IdKind::EnumVariant => Item::EnumVariant(EnumVariantId::from_gid(id)),
             IdKind::BuiltinDeriveImpl
             | IdKind::OpaqueTy
             | IdKind::Closure
@@ -136,18 +136,18 @@ impl Item {
 
     fn bits(self) -> u64 {
         let id = match self {
-            Item::Function(it) => it.as_id(),
-            Item::Struct(it) => it.as_id(),
-            Item::Union(it) => it.as_id(),
-            Item::Enum(it) => it.as_id(),
-            Item::Const(it) => it.as_id(),
-            Item::Static(it) => it.as_id(),
-            Item::Trait(it) => it.as_id(),
-            Item::TypeAlias(it) => it.as_id(),
-            Item::Impl(it) => it.as_id(),
-            Item::EnumVariant(it) => it.as_id(),
+            Item::Function(it) => it.gid(),
+            Item::Struct(it) => it.gid(),
+            Item::Union(it) => it.gid(),
+            Item::Enum(it) => it.gid(),
+            Item::Const(it) => it.gid(),
+            Item::Static(it) => it.gid(),
+            Item::Trait(it) => it.gid(),
+            Item::TypeAlias(it) => it.gid(),
+            Item::Impl(it) => it.gid(),
+            Item::EnumVariant(it) => it.gid(),
         };
-        u64::from(id.as_u32())
+        super::ids::gid_bits(id)
     }
 }
 

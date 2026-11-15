@@ -1,0 +1,18 @@
+{
+ "id": "front-code-has-no-universe",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane code (program wiring)",
+ "where": "crates/blaze-keyed/src/front.rs:274 (Front::code) against crates/blaze-command/src/program.rs (code)",
+ "what": "Writing the command's code task, the seam gives it a plan and its callees' plans but no universe and no body records, while the compile (prepare and emit) reads the instance's MIR and layouts from a snapshot, and a snapshot opens only from a universe's surface tables. The function had to take both as extra arguments the driver does not pass.",
+ "cost": "One misfit the driver lane must close before the code task runs at all; one round of the wiring left uncompilable against the trait.",
+ "cause": "Front::code was designed as a pure function of records (plan + callee plans), as if codegen read nothing of the front end's database.",
+ "whys": [
+  "Why no universe? The code record is keyed by its template identity with no reads, so the seam author took it to need no facts.",
+  "Why does it need them? prepare_one asks the front end for MIR and layouts, which live in a database built from surfaces and body records.",
+  "Why not from the plan? The plan carries the describe, not the MIR or layouts."
+ ],
+ "class": "A seam typed by what its key holds rather than by what its work reads.",
+ "prevention": "Give Front::code the plan's universe and the plan's given bodies (as Front::plan has), or make the plan record carry what prepare reads.",
+ "workaround": "program::code takes `bodies` and `universe` as arguments; the Front impl must pass the plan task's.",
+ "state": "resolved: Front::code now takes `bodies` and `universe` (2026-11-14)"
+}

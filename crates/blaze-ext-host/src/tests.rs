@@ -112,7 +112,7 @@ fn name_of(file: FileId) -> Option<String> {
 }
 
 fn checked_with(db: &Db, using: &[Using<'_>], limits: Limits, cache: &mut Cache) -> Checked {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         run::check(db, main_crate(db), using, limits, cache, &name_of)
             .expect("the crate is checked")
     })
@@ -137,7 +137,7 @@ fn said(diag: &Diag) -> (String, String, u32, u32) {
 
 /// What blaze's own `blaze::panic_in_drop` says of the crate of `db`, and where, sorted.
 fn in_tree(db: &Db) -> Vec<(String, String, u32, u32)> {
-    let found = blaze_query::db::attach(db, || {
+    let found = blaze_memo::attach(db, || {
         let flags: Vec<String> =
             ["-A", "clippy::all", "--warn=blaze::panic_in_drop"].map(str::to_owned).to_vec();
         let setup = blaze_lints::Setup {

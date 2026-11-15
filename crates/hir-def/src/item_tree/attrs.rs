@@ -42,8 +42,10 @@ impl Default for AttrsOrCfg {
 }
 
 impl AttrsOrCfg {
+    /// `table`: the arena whose syntax contexts `span_map` gives ([`lower_attrs_into`]).
     pub(crate) fn lower<'t, 'a, S>(
         db: &Db,
+        table: blaze_memo::ArenaId,
         owner: impl ast::HasAttrs<'t>,
         cfg_options: &impl Fn() -> &'a CfgOptions,
         span_map: S,
@@ -53,8 +55,8 @@ impl AttrsOrCfg {
     {
         // alloc: the owner's attributes, the value; none for an owner without any
         let mut attrs = Vec::new();
-        let cfg =
-            lower_attrs_into(db, ast::AnyHasAttrs::new(owner), cfg_options, span_map, &mut attrs);
+        let owner = ast::AnyHasAttrs::new(owner);
+        let cfg = lower_attrs_into(db, table, owner, cfg_options, span_map, &mut attrs);
         let attrs = AttrsOwned(attrs.into_boxed_slice());
         match cfg {
             // alloc: once an owner `cfg`d out, which is lowered no further
@@ -67,9 +69,11 @@ impl AttrsOrCfg {
 /// Appends `owner`'s attributes to `attrs`, and returns the `cfg` that disables it, if one
 /// does: the attributes appended are then those before that `cfg` (what crate-level attributes
 /// need), so lowering a second owner after a disabled one is never needed. One instance for
-/// every kind of owner.
+/// every kind of owner. `table` is the arena whose syntax contexts `span_map` gives
+/// (`HirFileId::context_arena` of the owner's file).
 pub(super) fn lower_attrs_into<'t, 'a, S>(
     db: &Db,
+    table: blaze_memo::ArenaId,
     owner: ast::AnyHasAttrs<'t>,
     cfg_options: &impl Fn() -> &'a CfgOptions,
     span_map: S,
@@ -126,7 +130,7 @@ where
         };
 
         let path = path.and_then(|path| {
-            ModPath::from_src_view(db, path, &mut |range| span_map.span_for(range).ctx)
+            ModPath::from_src_view(db, table, path, &mut |range| span_map.span_for(range).ctx)
         });
         let path = path.unwrap_or_else(|| Name::missing().into());
 

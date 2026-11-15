@@ -389,6 +389,8 @@ fn a_fixture_proc_macro_crate_has_the_macros_it_is_given() {
     let identity = super::default_test_proc_macros().into_iter().next().expect("identity").1;
     fixture.set_proc_macros(macros, vec![ProcMacro { name: Symbol::intern("Given"), ..identity }]);
     let db = fixture.db();
+    // The gift dropped the crate's arena, so its id from before is dead: found again.
+    let macros = named(db, "macros");
     let loaded = ProcMacros::get_for_crate(db, macros).expect("the crate was given macros");
     let names: Vec<&str> =
         loaded.macros().expect("loaded").iter().map(|it| it.name.as_str()).collect();
@@ -428,7 +430,9 @@ fn f$0() {}
 fn an_edit_after_setup_is_set_file_text() {
     let mut fixture = db("//- /main.rs\nfn a() {}\n//- /b.rs\nfn b() {}\n");
     let file = file_id(&fixture, 1);
-    fixture.db_mut().set_file_text(file, "fn c() {}\n");
+    _ = fixture.edit(|edit| {
+        edit.set_file_text(file, "fn c() {}\n");
+    });
     let db = fixture.into_db();
     assert_eq!(text(&db, file), "fn c() {}\n");
     assert_eq!(path(&db, file), "/b.rs");
@@ -442,10 +446,24 @@ fn a_path_twice_is_refused() {
 
 #[test]
 fn stable_ids_renumber_by_first_use() {
+    // A pretty print puts a bare id on a line of its own with a comma after it; the same id
+    // on one line is the same label, and what is no id keeps its text.
+    assert_eq!(
+        stable_ids("BlockId(\n    3.0:26,\n) BlockId(3.0:26) BlockId(\n    3.0:4,\n) Some(\n    \"x\",\n)"),
+        "BlockId(\n    #0,\n) BlockId(#0) BlockId(\n    #1,\n) Some(\n    \"x\",\n)",
+    );
     assert_eq!(
         stable_ids(
             "Crate(Id(10240)) FileId(EditionedFileId(Id(13312))) Crate(Id(10240)) FunctionId(8c03) Idx::<FieldData>(0) FunctionId(\"f\")"
         ),
         "Crate(Id(#0)) FileId(EditionedFileId(Id(#1))) Crate(Id(#0)) FunctionId(#0) Idx::<FieldData>(0) FunctionId(\"f\")",
+    );
+    // An id as blaze-memo prints it (arena.generation:place), under any type's name and as the
+    // first field of an interned struct's print; numbered per type, a struct's by its name.
+    assert_eq!(
+        stable_ids(
+            "StructId(1.0:25) StructId(1.0:9) StructId(1.0:25) ModuleIdLt { [id]: 1.0:7, krate: Crate(1.0:2) } VfsText { [id]: 1.0:7 } ModuleIdLt { [id]: 1.0:7 } EditionedFileId(0, Edition2024) [id]: x"
+        ),
+        "StructId(#0) StructId(#1) StructId(#0) ModuleIdLt { [id]: #0, krate: Crate(#0) } VfsText { [id]: #0 } ModuleIdLt { [id]: #0 } EditionedFileId(0, Edition2024) [id]: x",
     );
 }

@@ -8,6 +8,8 @@
 use std::{ops::Range, sync::Arc};
 
 use base_db::ContentId;
+
+pub use crate::hir::persist::Portable;
 use blaze_format::{Aligned, FormatError, Part as SchemaPart, Record, SchemaHash, Slice, Writer};
 
 blaze_format::record! {
@@ -140,6 +142,15 @@ pub enum ImageError {
     },
     /// Its parts are not one of each of [`Part::ALL`], in order, with tags it knows.
     Parts(&'static str),
+    /// The range an image was said to be at in a record ([`super::Image::in_place`]) is not
+    /// inside the record of `len` bytes.
+    OutOfRecord { range: Range<usize>, len: usize },
+    /// The range an image was said to be at in a record starts at `start`, no multiple of
+    /// [`blaze_format::ALIGN`]: an image opens in place only at an aligned address, and a
+    /// record's bytes start at one ([`Held`]).
+    Unaligned { start: usize },
+    /// An image opened in place cannot be read in `mode`, and why.
+    Mode { mode: crate::nameres::frozen::Mode, why: &'static str },
 }
 
 impl std::fmt::Display for ImageError {
@@ -150,6 +161,18 @@ impl std::fmt::Display for ImageError {
                 write!(f, "written under key {found:?}, found by key {wanted:?}")
             }
             ImageError::Parts(what) => f.write_str(what),
+            ImageError::OutOfRecord { range, len } => write!(
+                f,
+                "said to be at bytes {}..{} of a record of {len} bytes, which is not inside it",
+                range.start, range.end
+            ),
+            ImageError::Unaligned { start } => write!(
+                f,
+                "said to start at byte {start} of its record, not a multiple of {} (an image \
+                 opens in place only aligned)",
+                blaze_format::ALIGN
+            ),
+            ImageError::Mode { mode, why } => write!(f, "not readable in place in {mode:?}: {why}"),
         }
     }
 }
@@ -300,8 +323,10 @@ impl From<Arc<[u8]>> for PartBytes {
 }
 
 /// The image of `key` whose parts are `parts`, one of each of [`Part::ALL`] in that order.
-pub fn write_image(key: ContentId, parts: [&[u8]; Part::ALL.len()]) -> Vec<u8> {
-    write_parts(IMAGE_SCHEMA, key, parts, Part::ALL.map(|it| it as u32))
+/// A part is [`Portable`]: bytes that hold a session id ([`crate::hir::persist::SessionBytes`])
+/// cannot be put in an image.
+pub fn write_image(key: ContentId, parts: [&Portable; Part::ALL.len()]) -> Vec<u8> {
+    write_parts(IMAGE_SCHEMA, key, parts.map(Portable::as_bytes), Part::ALL.map(|it| it as u32))
 }
 
 /// An image of layout 7 ([`LAYOUT_7_SCHEMA`]), its three parts tagged 0, 1 and 2 (its def

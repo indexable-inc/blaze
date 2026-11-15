@@ -29,7 +29,7 @@ fn indexes(rows: &[&[u32]], grid: &mut [[u32; 4]; 4], i: usize, j: usize) -> u32
 #[test]
 fn nested_indexing_infers_with_no_error() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut failed = String::new();
         let fns = crate_def_map(&db, fixture::test_crate(&db))
             .modules(&db)

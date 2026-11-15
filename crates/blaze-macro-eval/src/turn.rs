@@ -16,7 +16,7 @@ use blaze_graph::{
     Key,
     pump::{Flights, Held, NotHeld},
 };
-use blaze_query::db::Cancelled;
+use blaze_memo::Cancelled;
 
 /// How many other calls' turns one call waits out before it fails (bounded-progress): each
 /// ends a turn, so a call still waiting after this many is starved, and says so.
@@ -81,7 +81,7 @@ impl Turns {
     /// (holding no thread) until the holder gives it back.
     ///
     /// A wait that would close a cycle of waits gives way: it unwinds with
-    /// [`Cancelled::WouldWaitOnItself`], and the loop running the query this call is part of
+    /// [`Cancelled::GaveWay`], and the loop running the query this call is part of
     /// runs it again, as for a query's own give-way.
     // dyn: what names the session, called only to say a wait or a hold: one shape for every caller
     pub(crate) fn take(
@@ -97,7 +97,7 @@ impl Turns {
                     // Waits for the holder's turn to end: a run of nothing, claimed here only
                     // when the turn was given back before this asked.
                     if self.turns.get_or_run_named(session, &mut *named, || Ok(())).is_err() {
-                        Cancelled::WouldWaitOnItself { asked: None }.throw();
+                        Cancelled::GaveWay.throw();
                     }
                 }
             }

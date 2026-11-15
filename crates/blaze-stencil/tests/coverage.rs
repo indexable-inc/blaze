@@ -839,7 +839,8 @@ fn lower(project: &Project) -> Result<(Lowered, Units), String> {
     let sealed = blaze_lower::unsealed(&units);
     let lower =
         Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None, sealed: &sealed };
-    let mut lowered = blaze_lower::lower_into(Db::logged(), lower)
+    // The survey files no body records and reads no run log: no fact boundaries, no read lists.
+    let mut lowered = blaze_lower::lower(lower, |_| {}, blaze_memo::Reads::Off)
         .map_err(|error| format!("lowering {dir}: {error}"))?;
     eprintln!(
         "{dir}: planned {} units and lowered them in {:.0?}",

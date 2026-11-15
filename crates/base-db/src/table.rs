@@ -1,87 +1,24 @@
-//! The tables [`Files`](crate::Files) reads on every query, without a lock
-//! (docs/v2/plan/design/concurrency.md): a read is acquire loads of data that never moves once
-//! published, and only writers write.
+//! The append-only tables [`Files`](crate::Files) keeps beside the snapshot, read without a
+//! lock (docs/v2/plan/design/concurrency.md): a read is acquire loads of data that never moves
+//! once published, and only writers write. The snapshot's own rows (each file's text, each
+//! root, each crate) are vectors of the snapshot's table ([`crate::world::Table`]), made at a
+//! commit.
 //!
-//! - [`Column`]: a query input per dense `u32` ID (a file, a source root), in a
-//!   `blaze_mem::AppendVec` reserved for every ID. A read is two acquire loads.
 //! - [`Log`]: an append-only list whose values never move, a `blaze_mem::Column`.
 //! - [`Table`]: values found by a hash the caller computed once, in a `blaze_mem::swiss::Index`
 //!   of `u32`s per shard (as `blaze_ids::Sharded`), grown by copying into a table twice the
 //!   size. A lookup is acquire loads and compares; inserting locks one shard to claim a place,
 //!   never while making the value.
 
-use std::{
-    marker::PhantomData,
-    sync::{
-        OnceLock,
-        atomic::{AtomicU32, Ordering},
-    },
-};
+use std::{alloc::Global, sync::OnceLock};
 
-use blaze_hash::SipKey;
-use blaze_mem::{AppendVec, Tag};
-use blaze_query::db::{AsId, FromId, Id};
-use intern::swiss::Index;
 use blaze_core::lock::Lock;
+use blaze_hash::SipKey;
+use blaze_mem::Tag;
+use intern::swiss::Index;
 
-/// A query input per ID up to [`Column::MAX`]: a word of the input's ID per ID, 0 for none
-/// (no ID is 0), in one region reserved for `MAX + 1` words and committed as
-/// IDs are used.
-///
-/// A read is one acquire load of the length, a bounds compare and the word's acquire load, and
-/// writes nothing.
-pub(crate) struct Column<T> {
-    words: AppendVec<AtomicU32>,
-    of: PhantomData<fn() -> T>,
-}
-
-impl<T: AsId + FromId + Copy> Column<T> {
-    /// The largest file ID the front end takes (`span::EditionedFileId` holds 23 bits of one):
-    /// a column indexes `0..=MAX`.
-    pub(crate) const MAX: u32 = span::EditionedFileId::MAX_FILE_ID;
-
-    pub(crate) fn new() -> Column<T> {
-        let words = AppendVec::new(Self::MAX as usize + 1, Tag::Query)
-            .unwrap_or_else(|error| panic!("{error}"));
-        Column { words, of: PhantomData }
-    }
-
-    #[inline]
-    pub(crate) fn get(&self, raw: u32) -> Option<T> {
-        match self.words.get(raw)?.load(Ordering::Acquire) {
-            0 => None,
-            bits => Some(T::from_id(Id::from_u32(bits))),
-        }
-    }
-
-    /// Sets (or with `None` clears) the input of `raw`. Called only by the setters, with the
-    /// files' writer lock held: the one writer `AppendVec` asks for. Panics naming it past
-    /// [`Column::MAX`].
-    pub(crate) fn set(&self, raw: u32, value: Option<T>) {
-        assert!(
-            raw <= Self::MAX,
-            "ID {raw} is past {}, the largest file ID the front end takes",
-            Self::MAX
-        );
-        let bits = value.map_or(0, |it| it.as_id().as_u32());
-        if bits == 0 && raw >= self.words.len() {
-            return;
-        }
-        let len = self.words.len();
-        if len <= raw {
-            self.words.writer().extend_with((raw - len + 1) as usize, |_| AtomicU32::new(0));
-        }
-        self.words.as_slice()[raw as usize].store(bits, Ordering::Release);
-    }
-
-    /// Every ID that has an input, in order.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, T)> + '_ {
-        self.words.iter().enumerate().filter_map(|(raw, word)| match word.load(Ordering::Acquire) {
-            0 => None,
-            bits => Some((raw as u32, T::from_id(Id::from_u32(bits)))),
-        })
-    }
-}
+/// The largest file ID the front end takes (`span::EditionedFileId` holds 23 bits of one).
+pub(crate) const MAX_FILE_ID: u32 = span::EditionedFileId::MAX_FILE_ID;
 
 /// An append-only list whose values never move: `&T` lives as long as the log. Appending
 /// claims an index with one `fetch_add`; a read is an acquire load and a compare.
@@ -140,8 +77,12 @@ impl<T> Table<T> {
         Table {
             key: SipKey::random(),
             values: Log::new(max),
-            // alloc: once per table: 16 bytes a shard.
-            shards: (0..shards).map(|_| OnceLock::new()).collect(),
+            // Once per table: 16 bytes a shard.
+            shards: {
+                let mut all = Vec::with_capacity_in(shards, Global);
+                all.extend((0..shards).map(|_| OnceLock::new()));
+                all.into_boxed_slice()
+            },
             shift: u64::BITS - shards.trailing_zeros(),
         }
     }
@@ -183,8 +124,8 @@ impl<T> Table<T> {
             return (found, false);
         }
         let shard = self.shard(hash).get_or_init(|| {
-            // alloc: a shard, on its first insert.
-            Box::new(Shard { lock: Lock::new("db.table.shard", 0), index: Index::new() })
+            // A shard, on its first insert.
+            Box::new_in(Shard { lock: Lock::new("db.table.shard", 0), index: Index::new() }, Global)
         });
         let mut count = shard.lock.lock();
         if let Some(found) = self.probe(shard, hash, &eq) {

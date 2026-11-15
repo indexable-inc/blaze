@@ -85,7 +85,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// missed. The walk's checks of a use only ever find something of a definition that is
 /// deprecated or unstable (`check`, `segment`), so a body that names none finds nothing.
 /// Kept by the database: a body edit runs it again for that body alone.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn body_quiet(db: &Db, owner: DefWithBodyId, krate: base_db::Crate) -> bool {
     #[cfg(test)]
     if tests::planted(db) == Some(tests::Plant::NeverQuiet) {

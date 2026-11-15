@@ -32,7 +32,7 @@ fn purity(crates: &str, name: &str) -> FnPurity {
     let db = db_with(crates);
     let krate = crate_named(&db, "kernel");
     let func = fn_named(&db, krate, name);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let args = GenericArgs::new_from_slice(&[]).store();
         // The summaries through each instance's home are the ones worked out in `kernel`.
         let root = Instance { def: Def::Body(Body::Fn(func)), args: args.clone() }; // clone: reference counts

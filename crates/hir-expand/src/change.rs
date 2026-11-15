@@ -12,22 +12,21 @@ pub struct ChangeWithProcMacros {
 }
 
 impl ChangeWithProcMacros {
-    /// Makes the change as one write: the maintainers run once, after the crate graph and the
-    /// proc macros it carries are both set. A crate's proc macros are a field of the crate
-    /// (`ProcMacros`), so nothing is made before the graph.
+    /// Makes the change: the source change's commit, then the proc macros' gifts to the crates
+    /// it made, a second commit (a crate's key, which a gift names, is known once the graph is
+    /// committed). A crate's proc macros are a slot of the crate (`ProcMacros`), so nothing is
+    /// made before the graph; nothing reads the snapshot between the two commits.
     pub fn apply(self, db: &mut Db) -> Option<CratesIdMap> {
-        db.batch(base_db::Trigger::named("Change::apply"), |db| {
-            let crates_id_map = self.source_change.apply(db);
-            if let Some(proc_macros) = self.proc_macros {
-                proc_macros.build_in(
-                    db,
-                    crates_id_map
-                        .as_ref()
-                        .expect("cannot set proc macros without setting the crate graph too"),
-                );
-            }
-            crates_id_map
-        })
+        let crates_id_map = self.source_change.apply(db);
+        if let Some(proc_macros) = self.proc_macros {
+            _ = proc_macros.build_in(
+                db,
+                crates_id_map
+                    .as_ref()
+                    .expect("cannot set proc macros without setting the crate graph too"),
+            );
+        }
+        crates_id_map
     }
 
     pub fn change_file(&mut self, file_id: FileId, new_text: Option<String>) {

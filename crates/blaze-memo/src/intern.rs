@@ -24,12 +24,18 @@ pub trait Interned: 'static {
     /// The fields, in their stored form. Owns no memory to drop.
     type Fields: Eq + Hash + Home + Send + Sync + 'static;
     const KIND: &'static Kind;
+    /// `#[interned(owns)]`: the fields may own memory, dropped with their arena.
+    const OWNS: bool = false;
 }
 
 /// The id of `fields`, interned in their home arena.
 pub fn intern<T: Interned>(memo: &Memo, fields: T::Fields) -> Gid {
-    const { crate::plumbing::assert_no_drop::<T::Fields>() };
-    let slot = memo.slot(home_of(&fields));
+    const {
+        if !T::OWNS {
+            crate::plumbing::assert_no_drop::<T::Fields>()
+        }
+    };
+    let slot = memo.slot(home_of(memo, &fields));
     task::note_read_of(memo, slot);
     let hash = hash_of(T::KIND, &fields);
     if let Some(head) = lookup::<T::Fields, ()>(memo, slot, T::KIND, hash, &fields) {
@@ -37,15 +43,22 @@ pub fn intern<T: Interned>(memo: &Memo, fields: T::Fields) -> Gid {
         return gid_of(slot.id, head);
     }
     counts::miss();
-    mark_borrows(memo, slot, &fields);
+    mark_borrows(memo, slot, &fields, &|out: &mut dyn std::fmt::Write| {
+        let _ = write!(out, "interned {}", T::KIND.name());
+    });
     let spill = !slot.writable_by(memo.epoch());
     let column = if spill { memo.spill() } else { slot };
     let local = column.reserve_local(spill);
     let entry = with_local(slot, |at| -> *const Entry<T::Fields, ()> {
-        at.alloc(Entry { head: Head::new(hash, T::KIND, &[], local), key: fields, value: () })
+        at.alloc(Entry { head: Head::new(hash, T::KIND, local), key: fields, value: () })
     });
-    // SAFETY: just made in `slot`'s arena, which `memo` holds.
-    let entry = unsafe { &*entry };
+    // SAFETY: just made in `slot`'s arena, which `memo` holds; an `owns` entry's fields are
+    // dropped with the arena, once, whether or not this one wins the race below (a loser is
+    // still in the arena, with fields of its own).
+    let entry = unsafe {
+        slot.drop_owned(&raw const (*entry).key);
+        &*entry
+    };
     // The column first: whoever finds the entry may look its id up at once.
     column.set_local(local, &entry.head);
     match publish::<T::Fields, ()>(memo, slot, &entry.head) {
@@ -78,4 +91,36 @@ pub fn interned<'db, T: Interned>(memo: &'db Memo, id: Gid) -> &'db T::Fields {
     );
     // SAFETY: an entry of `T::KIND` is an `Entry<T::Fields, ()>`.
     &unsafe { Entry::<T::Fields, ()>::of(head) }.key
+}
+
+/// The fields `id` was interned with, when `id` names a live entry of `T`'s kind in this
+/// snapshot; `None` otherwise, never a panic: how a word from outside (a proc macro's reply,
+/// any id not made by this snapshot's own code) is checked instead of trusted
+/// (the generated `try_from_gid`).
+///
+/// `Some` only when all of these hold: the snapshot holds `id`'s arena at `id`'s generation
+/// (an id of a dropped arena, or of an index the snapshot has no arena at, is `None`); the
+/// local index is filled in that arena's column (or the spill table's, for a spill id); the
+/// entry there is of `T`'s kind (an id of another interned struct, of an input or of nothing
+/// is `None`); and the entry's fields are homed in `id`'s arena (a spill id names its arena's
+/// entry, not another arena's that took the same spill index). Notes the read as
+/// [`interned`] does.
+pub fn try_interned<'db, T: Interned>(memo: &'db Memo, id: Gid) -> Option<&'db T::Fields> {
+    let slot = memo.try_slot(id.arena())?;
+    let head = match id.is_spill() {
+        true => memo.spill().local(id.local())?,
+        false => slot.local(id.local())?,
+    };
+    if !std::ptr::eq(head.kind, T::KIND) {
+        return None;
+    }
+    // SAFETY: an entry of `T::KIND` is an `Entry<T::Fields, ()>` (checked just above).
+    let fields = &unsafe { Entry::<T::Fields, ()>::of(head) }.key;
+    if home_of(memo, fields) != id.arena() {
+        return None;
+    }
+    if !id.is_spill() {
+        task::note_read_of(memo, slot);
+    }
+    Some(fields)
 }

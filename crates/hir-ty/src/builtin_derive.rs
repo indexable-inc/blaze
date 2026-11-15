@@ -169,7 +169,7 @@ pub fn impl_super_outlives<'db>(
     EarlyBinder::bind_iter(&[])
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
 pub fn predicates(db: &Db, impl_: BuiltinDeriveImplId) -> GenericPredicates {
     let loc = impl_.loc(db);
     let generic_params = GenericParams::of(db, loc.adt.into());

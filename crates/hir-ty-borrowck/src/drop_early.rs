@@ -33,7 +33,7 @@ use hir_ty::{
     },
     next_solver::{Ty, TyKind},
 };
-use hir_ty_mir::mir::EarlyDrop;
+use hir_ty_mir::mir::{EarlyDrop, MirLowerError};
 use rustc_type_ir::{TypeVisitableExt as _, inherent::IntoKind as _};
 
 use crate::{
@@ -214,18 +214,18 @@ pub fn drop_point(
 
 /// The borrow check of `def` with `point`'s drop lowered into its body
 /// ([`hir_ty_mir::mir::lower_with_early_drops`]), in `mode`. An error when lowering refuses
-/// the body or does not reach the drop.
-pub fn check(
-    db: &Db,
+/// the body or does not reach the drop: lowering's own, which renders itself with `db`
+/// attached (`blaze_memo::attach`).
+pub fn check<'db>(
+    db: &'db Db,
     def: DefWithBodyId,
     point: &DropPoint,
     mode: Mode,
-) -> Result<BorrowckResult, String> {
+) -> Result<BorrowckResult, MirLowerError<'db>> {
     let drops =
         [EarlyDrop { block: point.block, statement: point.statement, binding: point.binding }];
     let _span = tracing::info_span!(target: "blaze", "borrowck.drop_early", def = ?def, binding = ?point.binding).entered();
-    let body = hir_ty_mir::mir::lower_with_early_drops(db, def, &drops)
-        .map_err(|it| blaze_query::db::attach(db, || format!("{it:?}")))?; // alloc: error path
+    let body = hir_ty_mir::mir::lower_with_early_drops(db, def, &drops)?;
     Ok(crate::borrowck_rewritten(db, def, &body, mode))
 }
 
@@ -264,7 +264,10 @@ pub(crate) fn add_notes(db: &Db, def: DefWithBodyId, mode: Mode, result: &mut Bo
             Ok(it) if it.skipped.is_none() && it.not_checked.is_none() => it,
             Ok(_) => continue,
             Err(error) => {
-                tracing::debug!(target: "blaze", ?def, ?binding, error, "early drop not lowered");
+                // Rendered with `db` attached: the error's types name themselves only through it.
+                blaze_memo::attach(db, || {
+                    tracing::debug!(target: "blaze", ?def, ?binding, ?error, "early drop not lowered");
+                });
                 continue;
             }
         };

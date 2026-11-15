@@ -65,10 +65,9 @@ pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, syntax_cx: &Cx<'_, 'db>) -> Vec<Found
         let (features, found) = features::configured(cx, &owners, &flags);
         let session = attrs::Session::of(cx, &owners, features);
         let root = cx.krate.root_module(cx.db).as_source_file_id(cx.db);
-        let read = settings::CrateSettings::of_parts(root, &session.features, session.tools());
         let given = cx.settings();
         assert!(
-            *given == read,
+            given.are(root, &session.features, session.tools()),
             "{}",
             blaze_report::say!(
                 "the settings of crate ",
@@ -76,7 +75,13 @@ pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, syntax_cx: &Cx<'_, 'db>) -> Vec<Found
                 " its root's outline gives a piece's probe, ",
                 blaze_report::say::Words(&format!("{given:?}")),
                 ", are not those its walk reads, ",
-                blaze_report::say::Words(&format!("{read:?}")),
+                blaze_report::say::Words(&format!(
+                    "root {root:?}, features {:?}, nightly {}, crate nightly {}, tools {:?}",
+                    session.features.names_in_stable_order().collect::<Vec<_>>(),
+                    session.features.nightly,
+                    session.features.crate_nightly,
+                    session.tools(),
+                )),
                 ": a by-piece check would run its passes with other settings than the whole check",
             )
             .flat(),
@@ -149,7 +154,7 @@ pub(crate) fn syntax_clean(cx: &Cx<'_, '_>) -> bool {
     let flags = features::Flags::default();
     let walk = cx.walk();
     let owners = owners_of(cx, walk);
-    let session = attrs::Session::of_settings(cx, settings);
+    let session = attrs::Session::of_settings(cx, &settings);
     let features = &session.features;
     if !macros::check(cx, walk).is_empty()
         || !features::expansion(cx, walk, &owners, features).is_empty()

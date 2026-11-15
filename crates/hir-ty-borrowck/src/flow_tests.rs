@@ -234,13 +234,33 @@ fn errors(result: &BorrowckResult) -> Vec<&'static str> {
         .collect()
 }
 
-/// Each function of `fixture` named in `names`, checked in the alpha and in `polonius-flow`.
+/// Every function of `db` by name ([`budget::functions`]) and every method of an inherent or
+/// trait impl: the upstream cases are methods too (`trigger_bug`, of issue-46589).
+fn functions_and_methods(db: &base_db::Db) -> Vec<(String, DefWithBodyId)> {
+    let mut found = budget::functions(db);
+    for &krate in base_db::all_crates(db).iter() {
+        for (_, module) in hir_def::nameres::crate_def_map(db, krate).modules(db) {
+            for it in module.scope(db).impls() {
+                for &(_, item) in it.impl_items(db).items.iter() {
+                    if let hir_def::AssocItemId::FunctionId(it) = item {
+                        let name = hir_def::signatures::FunctionSignature::of(db, it).name.as_str().to_owned();
+                        found.push((name, it.into()));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Each function or method of `fixture` named in `names`, checked in the alpha and in
+/// `polonius-flow`.
 fn checked(fixture: &str, names: &[&str]) -> Vec<(String, BorrowckResult, BorrowckResult)> {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
-        let functions = budget::functions(&db);
+    blaze_memo::attach(&db, || {
+        let functions = functions_and_methods(&db);
         names
             .iter()
             .map(|&name| {
@@ -290,8 +310,8 @@ fn flow_cost_per_body() {
         let fx = fixture::db(fixture);
         let _ = fx.only_file();
         let db = fx.into_db();
-        blaze_query::db::attach(&db, || {
-            let functions = budget::functions(&db);
+        blaze_memo::attach(&db, || {
+            let functions = functions_and_methods(&db);
             for &name in names {
                 let def: DefWithBodyId =
                     functions.iter().find(|(it, _)| it == name).map(|&(_, def)| def).unwrap();
