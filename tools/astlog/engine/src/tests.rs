@@ -417,6 +417,148 @@ fn dollar_templates_splice_and_escape()-> Result<(), Error<GraphError>> {
 }
 
 #[test]
+fn a_regex_that_does_not_compile_or_is_past_the_size_cap_is_refused_at_load() {
+    let unclosed = Program::<Graph>::parse(
+        "(rule (r a) (edge a b))\n(rule (m a) (edge a b) (text-match a \"(unclosed\"))",
+    )
+    .expect_err("an unclosed group is refused when the file is read, before any fact");
+    assert!(
+        matches!(unclosed, Error::Regex { line: 2, ref name, .. } if name == "text-match"),
+        "{unclosed}"
+    );
+    // The `regex` crate's own default takes this pattern; the cap is what refuses it.
+    let big = r"(?:\w{100}){2}";
+    assert!(regex::Regex::new(big).is_ok(), "within the crate's default limit");
+    let rules = format!("(rule (m a) (edge a b) (text-match a \"{}\"))", big.replace('\\', "\\\\"));
+    let past = Program::<Graph>::parse(&rules).expect_err("past MAX_REGEX_BYTES");
+    assert!(matches!(past, Error::Regex { line: 1, .. }), "{past}");
+}
+
+#[test]
+fn text_capture_binds_each_group_and_holds_only_on_a_match() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (digit a d) (edge a b) (text-capture a \"^1(\\\\d)?$\" d))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1, 2), (12, 3), (5, 6), (123, 7)]))?;
+    // `1` matches with the group unused (empty text); `12` binds `2`; `5` and `123` do not match.
+    assert_eq!(rows(&sets, "digit"), [["1", ""], ["12", "2"]]);
+    Ok(())
+}
+
+#[test]
+fn text_capture_with_a_variable_count_other_than_its_groups_is_refused_at_load() {
+    let error = Program::<Graph>::parse(
+        "(rule (r a) (edge a b))\n(rule (two a x y) (edge a b) (text-capture a \"(\\\\d)\" x y))",
+    )
+    .expect_err("one group, two variables");
+    let message = error.to_string();
+    assert!(
+        message.starts_with("rules:2: ") && message.contains("1 capture groups, but 2 variables"),
+        "{message}"
+    );
+}
+
+#[test]
+fn text_replace_writes_every_match_with_its_groups() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (r t u) (edge a b) (text a t) (text-replace t \"(\\\\d)(\\\\d)\" \"${2}${1}_$$\" u))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1234, 1), (5, 6)]))?;
+    // Both pairs of `1234` swap; `5` has no match and is its own text: the builtin always holds.
+    assert_eq!(rows(&sets, "r"), [["1234", "21_$43_$"], ["5", "5"]]);
+    Ok(())
+}
+
+#[test]
+fn a_text_replace_dollar_that_names_no_group_is_refused_at_load() {
+    let refused = |replacement: &str| {
+        let rules = format!(
+            "(rule (r a) (edge a b))\n(rule (s u) (edge a b) (text a t) \
+             (text-replace t \"legacy_(.*)\" \"{replacement}\" u))"
+        );
+        Program::<Graph>::parse(&rules).err().map(|it| it.to_string())
+    };
+    // The `regex` crate reads `$1_new` as a group named `1_new` and writes empty text for it.
+    let glued = refused("$1_new").expect("`$1_new` is no group");
+    assert!(
+        glued.starts_with("rules:2: ") && glued.contains("`$1_new`") && glued.contains("write `${1}`"),
+        "{glued}"
+    );
+    let missing = refused("$2").expect("one group only");
+    assert!(missing.contains("`$2` names no group") && missing.contains("1 groups"), "{missing}");
+    let stray = refused("cost $ 5").expect("a lone `$`");
+    assert!(stray.contains("write `$$`"), "{stray}");
+    let open = refused("${1").expect("unclosed brace");
+    assert!(open.contains("no closing"), "{open}");
+    for fine in ["${1}_new", "$1", "$$1", "${0}", "new"] {
+        assert_eq!(refused(fine), None, "{fine}");
+    }
+}
+
+#[test]
+fn case_splits_identifier_words_and_writes_each_style() {
+    let cases = [
+        ("legacy_parse_HTTP", "pascal", "LegacyParseHttp"),
+        ("HTTPServer", "snake", "http_server"),
+        ("utf8Error", "kebab", "utf8-error"),
+        ("parse_v2", "camel", "parseV2"),
+        ("fooBar", "upper-snake", "FOO_BAR"),
+        ("_unused_value", "camel", "_unusedValue"),
+        ("type_", "pascal", "Type_"),
+        ("__", "snake", "__"),
+        ("my-crate", "snake", "my_crate"),
+    ];
+    for (text, case, want) in cases {
+        assert_eq!(crate::eval::recase(text, case).as_deref(), Some(want), "{text} as {case}");
+    }
+    assert_eq!(crate::eval::recase("r#type", "snake"), None);
+    assert_eq!(crate::eval::recase("a b", "snake"), None);
+}
+
+#[test]
+fn case_is_a_builtin_with_a_literal_style_and_refuses_text_that_is_no_identifier()
+-> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (r y) (edge a b) (case \"HTTPServer\" \"snake\" y))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1, 2)]))?;
+    assert_eq!(rows(&sets, "r"), [["http_server"]]);
+    let style = Program::<Graph>::parse("(rule (r y) (edge a b) (case \"x\" \"Title\" y))")
+        .expect_err("no such style");
+    assert!(style.to_string().contains("`\"Title\"`") || style.to_string().contains("`Title`"), "{style}");
+    let spaced = Program::<Graph>::parse("(rule (r y) (edge a b) (case \"a b\" \"snake\" y))")?;
+    let error = semi_naive(&spaced, &Edges(vec![(1, 2)])).expect_err("`a b` has a space");
+    assert!(matches!(error, Error::CaseNotIdentifier { line: 1, ref text } if text == "a b"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn a_negated_builtin_holds_when_the_builtin_gives_no_row() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (plain a) (edge a b) (not (text-match a \"^1\")))
+         (rule (out a b) (edge a b))
+         (rule (single a) (edge a x) (count n (out a b)) (not (lt 1 n)))
+         (rule (kept a) (edge a b) (text a t) (not (same-text t \"12\")))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1, 2), (1, 4), (12, 3), (5, 6)]))?;
+    assert_eq!(rows(&sets, "plain"), [["5"]]);
+    assert_eq!(rows(&sets, "single"), [["5"], ["12"]]);
+    assert_eq!(rows(&sets, "kept"), [["1"], ["5"]]);
+    Ok(())
+}
+
+#[test]
+fn a_negated_builtin_with_an_unbound_variable_or_a_counted_builtin_is_refused() {
+    let unbound =
+        Program::<Graph>::parse("(rule (r a) (edge a b) (not (text-capture a \"(\\\\d)\" g)))")
+            .expect_err("`g` is bound by nothing to the left");
+    assert!(matches!(unbound, Error::UnsafeNegation { ref var, .. } if var == "g"), "{unbound}");
+    let counted = Program::<Graph>::parse("(rule (r a n) (edge a b) (count n (text a t)))")
+        .expect_err("a builtin is no finite relation to count");
+    assert!(counted.to_string().contains("(count ...) cannot read the builtin `text`"), "{counted}");
+}
+
+#[test]
 fn a_run_past_its_row_cap_stops_naming_the_relation_and_the_rule() -> Result<(), Error<GraphError>> {
     let program = Program::<Graph>::parse(
         "(rule (path a b) (edge a b))

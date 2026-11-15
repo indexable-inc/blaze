@@ -24,6 +24,7 @@ blaze-vfs.workspace = true
 
 either.workspace = true
 memchr.workspace = true
+snafu.workspace = true
 
 base-db.workspace = true
 hir.workspace = true

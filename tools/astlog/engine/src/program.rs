@@ -19,10 +19,12 @@ use std::fmt;
 
 use blaze_hash::{HashMap, HashSet};
 
+use snafu::ResultExt as _;
+
 use crate::error::{
     ArityMismatchSnafu, BuiltinAritySnafu, DslSnafu, Error, LintSeveritySnafu, LintVarSnafu,
-    TemplateVarSnafu, UnboundBuiltinArgSnafu, UnboundHeadVarSnafu, UnboundSourceArgSnafu,
-    UnknownRelationSnafu, UnsafeNegationSnafu, UnstratifiableProgramSnafu,
+    RegexSnafu, TemplateVarSnafu, UnboundBuiltinArgSnafu, UnboundHeadVarSnafu,
+    UnboundSourceArgSnafu, UnknownRelationSnafu, UnsafeNegationSnafu, UnstratifiableProgramSnafu,
 };
 use crate::sexpr::{self, Sexpr};
 
@@ -104,6 +106,10 @@ pub(crate) const BUILTINS: &[(&str, usize, &[usize])] = &[
     ("same-file", 2, &[0, 1]),
     ("file-path", 2, &[0]),
     ("text-match", 2, &[0, 1]),
+    // Two or more: the text, the pattern, then one variable per capture group.
+    ("text-capture", 2, &[0, 1]),
+    ("text-replace", 4, &[0, 1, 2]),
+    ("case", 3, &[0, 1]),
     ("misgrouped-digits", 2, &[0]),
     ("lt", 2, &[0, 1]),
     ("le", 2, &[0, 1]),
@@ -127,6 +133,39 @@ pub struct AppAtom {
     pub name: String,
     pub args: Vec<Term>,
     pub line: usize,
+    /// The compiled pattern of a builtin in [`REGEX_BUILTINS`], compiled once at load.
+    pub regex: Option<regex::Regex>,
+}
+
+/// The builtins whose second argument is a regex, which must be a string literal.
+pub(crate) const REGEX_BUILTINS: &[&str] = &["text-match", "text-capture", "text-replace"];
+
+/// The identifier styles `case` writes.
+pub(crate) const CASES: &[&str] = &["snake", "camel", "pascal", "upper-snake", "kebab"];
+
+/// The builtins whose arity is a least: `text-capture` binds one variable per capture group.
+const VARIADIC: &[&str] = &["text-capture"];
+
+/// The most bytes one compiled regex may take, its lazy DFA's cache included. The `regex` crate
+/// matches in time linear in the text; this bounds the memory a rules file's pattern takes.
+pub(crate) const MAX_REGEX_BYTES: usize = 1 << 20;
+
+/// `pattern` compiled within [`MAX_REGEX_BYTES`].
+///
+/// # Errors
+///
+/// [`Error::Regex`] naming the line and the builtin, for a pattern that does not compile or is
+/// past the size limit.
+fn compile_regex<S: std::error::Error + 'static>(
+    name: &str,
+    pattern: &str,
+    line: usize,
+) -> Result<regex::Regex, Error<S>> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(MAX_REGEX_BYTES)
+        .dfa_size_limit(MAX_REGEX_BYTES)
+        .build()
+        .context(RegexSnafu { line, name: name.to_owned(), pattern: pattern.to_owned() })
 }
 
 #[derive(Debug)]
@@ -412,9 +451,14 @@ impl<L: Language> Program<L> {
                     BodyAtom::App(app) if builtin(&app.name).is_none() => {
                         edges.push((rule.name.as_str(), app.name.as_str(), false));
                     }
-                    BodyAtom::Negation(neg) => edges.push((&rule.name, &neg.name, true)),
+                    BodyAtom::Negation(neg) if builtin(&neg.name).is_none() => {
+                        edges.push((&rule.name, &neg.name, true));
+                    }
                     BodyAtom::Count(count) => edges.push((&rule.name, &count.inner.name, true)),
-                    BodyAtom::App(_) | BodyAtom::Source(_) | BodyAtom::NegatedSource(_) => {}
+                    BodyAtom::App(_)
+                    | BodyAtom::Negation(_)
+                    | BodyAtom::Source(_)
+                    | BodyAtom::NegatedSource(_) => {}
                 }
             }
         }
@@ -498,17 +542,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
             BodyAtom::Source(_) | BodyAtom::NegatedSource(_) => continue,
             BodyAtom::App(app) => {
                 if let Some((arity, _)) = builtin(&app.name) {
-                    check_arity(app, arity, true)?;
-                    // The pattern is compiled once at evaluator setup, which requires it to be a
-                    // literal; a variable pattern would also make match results depend on corpus
-                    // text, which no rule legitimately needs.
-                    if app.name == "text-match" && !matches!(app.args.get(1), Some(Term::Text(_))) {
-                        return DslSnafu {
-                            line: app.line,
-                            message: "text-match pattern must be a string literal".to_owned(),
-                        }
-                        .fail();
-                    }
+                    check_builtin(app, arity)?;
                     continue;
                 }
                 let expected = *arities.get(app.name.as_str()).ok_or_else(|| {
@@ -518,8 +552,14 @@ fn check_atoms<A, S: std::error::Error + 'static>(
                 continue;
             }
         };
-        // A negated or counted atom must name a defined relation (not a builtin: builtins are
-        // filters, not finite relations to scan) with matching arity.
+        // A negated builtin is a test of bound values (every variable is bound to its left, as
+        // `check_modes` requires of any negation), so it holds when the builtin gives no row.
+        if let (BodyAtom::Negation(neg), Some((arity, _))) = (atom, builtin(&relation.name)) {
+            check_builtin(neg, arity)?;
+            continue;
+        }
+        // A counted atom must name a defined relation (not a builtin: builtins are filters,
+        // not finite relations to scan) with matching arity.
         if builtin(&relation.name).is_some() {
             return DslSnafu {
                 line: relation.line,
@@ -531,6 +571,109 @@ fn check_atoms<A, S: std::error::Error + 'static>(
             UnknownRelationSnafu { name: relation.name.clone(), line: relation.line }.build()
         })?;
         check_arity(relation, expected, false)?;
+    }
+    Ok(())
+}
+
+/// A builtin's arity, and its literal arguments: a regex builtin's pattern is a string literal,
+/// compiled at load (a variable pattern would make what matches depend on corpus text, which no
+/// rule needs), and `text-capture` binds exactly one variable per capture group.
+fn check_builtin<S: std::error::Error + 'static>(app: &AppAtom, arity: usize) -> Result<(), Error<S>> {
+    let dsl = |message: String| DslSnafu { line: app.line, message }.fail();
+    if VARIADIC.contains(&app.name.as_str()) {
+        if app.args.len() < arity {
+            return dsl(format!(
+                "{} takes the text, a pattern and one variable per capture group",
+                app.name
+            ));
+        }
+    } else {
+        check_arity(app, arity, true)?;
+    }
+    if app.name == "case" {
+        return match &app.args[1] {
+            Term::Text(style) if CASES.contains(&style.as_str()) => Ok(()),
+            other => dsl(format!(
+                "case style `{}` is none of {}: write one as a string literal",
+                term_display(other),
+                CASES.iter().map(|it| format!("\"{it}\"")).collect::<Vec<_>>().join(", ")
+            )),
+        };
+    }
+    if !REGEX_BUILTINS.contains(&app.name.as_str()) {
+        return Ok(());
+    }
+    let (Some(regex), Some(Term::Text(pattern))) = (&app.regex, app.args.get(1)) else {
+        return dsl(format!("{} pattern must be a string literal", app.name));
+    };
+    if app.name == "text-capture" {
+        let groups = regex.captures_len() - 1;
+        let vars = app.args.len() - 2;
+        if groups != vars {
+            return dsl(format!(
+                "text-capture pattern `{pattern}` has {groups} capture groups, but {vars} \
+                 variables follow it: one per group"
+            ));
+        }
+    }
+    if app.name == "text-replace" {
+        let Some(Term::Text(replacement)) = app.args.get(2) else {
+            return dsl("text-replace replacement must be a string literal".to_owned());
+        };
+        if let Err(message) = check_replacement(regex, replacement) {
+            return dsl(format!("text-replace replacement `{replacement}`: {message}"));
+        }
+    }
+    Ok(())
+}
+
+/// Every `$` of a `text-replace` replacement names a group of `regex`, or is `$$`.
+///
+/// The `regex` crate reads `$name` as the longest run of letters, digits and `_`, and writes
+/// empty text for a name no group has: `$1_suffix` is group `1_suffix`, so the replacement
+/// would silently drop the group. Here it is refused, naming the group and the `${1}` spelling.
+fn check_replacement(regex: &regex::Regex, replacement: &str) -> Result<(), String> {
+    let named = |name: &str| match name.parse::<usize>() {
+        Ok(index) => index < regex.captures_len(),
+        Err(_) => regex.capture_names().flatten().any(|it| it == name),
+    };
+    let groups = regex.captures_len() - 1;
+    let mut rest = replacement;
+    while let Some(at) = rest.find('$') {
+        rest = &rest[at + 1..];
+        if let Some(after) = rest.strip_prefix('$') {
+            rest = after;
+            continue;
+        }
+        let (name, after, braced) = match rest.strip_prefix('{') {
+            Some(inner) => {
+                let Some(end) = inner.find('}') else {
+                    return Err("`${` has no closing `}`".to_owned());
+                };
+                (&inner[..end], &inner[end + 1..], true)
+            }
+            None => {
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                (&rest[..end], &rest[end..], false)
+            }
+        };
+        if name.is_empty() {
+            return Err("a `$` names no group: write `$$` for a literal `$`".to_owned());
+        }
+        if !named(name) {
+            let hint = match name.find(|c: char| !c.is_ascii_digit()) {
+                Some(cut) if !braced && cut > 0 => {
+                    format!(": for group {} followed by `{}`, write `${{{}}}`", &name[..cut], &name[cut..], &name[..cut])
+                }
+                _ => String::new(),
+            };
+            return Err(format!(
+                "`${name}` names no group of the pattern, which has {groups} groups{hint}"
+            ));
+        }
+        rest = after;
     }
     Ok(())
 }
@@ -916,7 +1059,14 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
             line: form.line(),
         }));
     }
-    Ok(BodyAtom::App(AppAtom { name: name.to_owned(), args: terms(args)?, line: form.line() }))
+    let args = terms(args)?;
+    let regex = match args.get(1) {
+        Some(Term::Text(pattern)) if REGEX_BUILTINS.contains(&name) => {
+            Some(compile_regex(name, pattern, form.line())?)
+        }
+        _ => None,
+    };
+    Ok(BodyAtom::App(AppAtom { name: name.to_owned(), args, line: form.line(), regex }))
 }
 
 /// Atom arguments as terms: a bare number is an integer, any other bare atom a variable, a

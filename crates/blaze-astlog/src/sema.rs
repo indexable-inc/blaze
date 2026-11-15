@@ -18,7 +18,7 @@ use hir::{
     HirDisplay as _, HirFileId, ModuleDef, PathResolution, Type, Visibility, view::Semantics,
 };
 use memchr::memmem::Finder;
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use syntax::{
     SyntaxKind,
     view::{self as ast, AstNode as _, NodeId},
@@ -526,9 +526,12 @@ impl<'a, F: Files> Sema<'a, F> {
         };
         match owner {
             Some(AssocItemContainer::Trait(it)) => segments.push(it.name(db).as_str().to_owned()),
-            Some(AssocItemContainer::Impl(it)) => {
-                segments.push(it.self_ty(db).as_adt()?.name(db).as_str().to_owned());
-            }
+            // An impl on a type no path names (`u32`, `&str`, a blanket `T`) is its own
+            // segment, so the item has a path a reader can place, as rustc writes one.
+            Some(AssocItemContainer::Impl(it)) => segments.push(match it.self_ty(db).as_adt() {
+                Some(adt) => adt.name(db).as_str().to_owned(),
+                None => self.impl_segment(it),
+            }),
             None => {}
         }
         // A variant is under its enum, and a field under its struct, union or variant.
@@ -557,6 +560,110 @@ impl<'a, F: Files> Sema<'a, F> {
         }
         Some(segments.join("::"))
     }
+
+    /// A type's shape, for `type-kind`. `other` is a shape no row names otherwise: a coroutine,
+    /// a foreign type, an unnormalized projection.
+    fn type_kind(&self, ty: Type<'a>) -> &'static str {
+        if let Some(adt) = ty.as_adt() {
+            return match adt {
+                hir::Adt::Struct(_) => "struct",
+                hir::Adt::Enum(_) => "enum",
+                hir::Adt::Union(_) => "union",
+            };
+        }
+        if let Some(builtin) = ty.as_builtin() {
+            return match () {
+                () if builtin.is_int() => "int",
+                () if builtin.is_uint() => "uint",
+                () if builtin.is_float() => "float",
+                () if builtin.is_bool() => "bool",
+                () if builtin.is_char() => "char",
+                () if builtin.is_str() => "str",
+                () => "other",
+            };
+        }
+        let shapes: [(bool, &'static str); 11] = [
+            (ty.is_unknown(), "unknown"),
+            (ty.is_never(), "never"),
+            (ty.is_reference(), "ref"),
+            (ty.is_raw_ptr(), "ptr"),
+            (ty.is_slice(), "slice"),
+            (ty.is_array(), "array"),
+            (ty.is_tuple(), "tuple"),
+            (ty.as_dyn_trait().is_some(), "dyn"),
+            (ty.as_type_param(self.db).is_some(), "param"),
+            (ty.is_closure(), "closure"),
+            (ty.is_fn(), "fn"),
+        ];
+        match shapes.iter().find(|(is, _)| *is) {
+            Some((_, kind)) => kind,
+            None if ty.as_impl_traits(self.db).is_some() => "impl",
+            None => "other",
+        }
+    }
+
+    /// The def that owns `def`: a variant's enum, a field's struct, union or variant, an
+    /// associated item's impl or trait, an impl's or an item's module, a module's parent.
+    /// `None` for a crate's root.
+    fn def_parent(&self, def: Def) -> Option<Def> {
+        let db = self.db;
+        let item = |it: ModuleDef| -> Option<Def> {
+            let container = match it {
+                ModuleDef::Function(it) => it.as_assoc_item(db).map(|it| it.container(db)),
+                ModuleDef::Const(it) => it.as_assoc_item(db).map(|it| it.container(db)),
+                ModuleDef::TypeAlias(it) => it.as_assoc_item(db).map(|it| it.container(db)),
+                ModuleDef::EnumVariant(it) => {
+                    return Some(Def::Item(ModuleDef::Adt(hir::Adt::Enum(it.parent_enum(db)))));
+                }
+                ModuleDef::Module(it) => return it.parent(db).map(|it| Def::Item(ModuleDef::Module(it))),
+                _ => None,
+            };
+            Some(match container {
+                Some(AssocItemContainer::Impl(it)) => Def::Impl(it),
+                Some(AssocItemContainer::Trait(it)) => Def::Item(ModuleDef::Trait(it)),
+                None => Def::Item(ModuleDef::Module(it.module(db)?)),
+            })
+        };
+        match def {
+            Def::Item(it) => item(it),
+            Def::Field(it) => Some(Def::Item(match it.parent_def(db) {
+                hir::Variant::Struct(it) => ModuleDef::Adt(hir::Adt::Struct(it)),
+                hir::Variant::Union(it) => ModuleDef::Adt(hir::Adt::Union(it)),
+                hir::Variant::EnumVariant(it) => ModuleDef::EnumVariant(it),
+            })),
+            Def::Impl(it) => Some(Def::Item(ModuleDef::Module(it.module(db)))),
+        }
+    }
+
+    /// The defs `owner` owns, each one whose [`Self::def_parent`] is `owner`.
+    fn def_children<A: Allocator>(&self, owner: Def, out: &mut Vec<Def, A>) {
+            let db = self.db;
+            let assoc = |items: Vec<hir::AssocItem>, out: &mut Vec<Def, A>| {
+                out.extend(items.into_iter().map(|it| {
+                    Def::Item(match it {
+                        hir::AssocItem::Function(it) => ModuleDef::Function(it),
+                        hir::AssocItem::Const(it) => ModuleDef::Const(it),
+                        hir::AssocItem::TypeAlias(it) => ModuleDef::TypeAlias(it),
+                    })
+                }));
+            };
+            match owner {
+                Def::Item(ModuleDef::Module(it)) => {
+                    out.extend(it.declarations(db).into_iter().map(Def::Item));
+                    out.extend(it.impl_defs(db).into_iter().map(Def::Impl));
+                }
+                Def::Item(ModuleDef::Adt(hir::Adt::Enum(it))) => {
+                    out.extend(it.variants(db).into_iter().map(|it| Def::Item(ModuleDef::EnumVariant(it))));
+                }
+                Def::Item(ModuleDef::Adt(hir::Adt::Struct(it))) => out.extend(it.fields(db).into_iter().map(Def::Field)),
+                Def::Item(ModuleDef::Adt(hir::Adt::Union(it))) => out.extend(it.fields(db).into_iter().map(Def::Field)),
+                Def::Item(ModuleDef::EnumVariant(it)) => out.extend(it.fields(db).into_iter().map(Def::Field)),
+                Def::Item(ModuleDef::Trait(it)) => assoc(it.items(db), out),
+                Def::Impl(it) => assoc(it.items(db), out),
+                Def::Item(_) | Def::Field(_) => {}
+            }
+        }
+    
 
     /// An impl's last segment, as rustc's paths show one: `<impl Type>` or
     /// `<impl Trait<Args> for Type>`. It names the impl and resolves to nothing
@@ -1116,6 +1223,13 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     }
                 }
             }
+            Atom::DefName => {
+                let Some(def) = self.need_def(&inputs[0], "def-name", line)? else { return Ok(()) };
+                // An impl has no name, so no row.
+                if let Some(name) = self.name_of(def) {
+                    out.push(vec![node(self.def(def)), text(&name)]);
+                }
+            }
             Atom::DefKind => {
                 let Some(def) = self.need_def(&inputs[0], "def-kind", line)? else { return Ok(()) };
                 out.push(vec![node(self.def(def)), text(self.def_kind(def))]);
@@ -1167,6 +1281,130 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     out.push(vec![node(self.syn(at))]);
                 }
             }
+            Atom::MatchArm => {
+                let arms: Vec<ast::Node<'a>> = match (&inputs[0], &inputs[1]) {
+                    (_, Some(_)) => vec![self.need_syn(&inputs[1], "match-arm", line)?],
+                    (Some(_), None) => {
+                        let at = self.need_syn(&inputs[0], "match-arm", line)?;
+                        at.children()
+                            .filter(|it| it.kind() == SyntaxKind::MATCH_ARM_LIST)
+                            .flat_map(|list| list.children())
+                            .collect()
+                    }
+                    (None, None) => self
+                        .searched(None)
+                        .into_iter()
+                        .flat_map(|tree| self.tree_at(tree).root.descendants())
+                        .filter(|it| it.kind() == SyntaxKind::MATCH_ARM)
+                        .collect(),
+                };
+                for arm in arms.into_iter().filter_map(ast::MatchArm::cast) {
+                    let list = arm.syntax().parent();
+                    let Some(at) = list.and_then(|it| it.parent()).filter(|it| it.kind() == SyntaxKind::MATCH_EXPR)
+                    else {
+                        continue;
+                    };
+                    // An arm the parser recovered without a pattern or an expression makes no row.
+                    let (Some(pat), Some(expr)) = (arm.pat(), arm.expr()) else { continue };
+                    out.push(vec![
+                        node(self.syn(at)),
+                        node(self.syn(arm.syntax())),
+                        node(self.syn(pat.syntax())),
+                        node(self.syn(expr.syntax())),
+                    ]);
+                }
+            }
+            Atom::Child | Atom::Descendant => {
+                let name = if matches!(atom, Atom::Child) { "child" } else { "descendant" };
+                let at = self.need_syn(&inputs[0], name, line)?;
+                let p = node(self.syn(at));
+                let below: Vec<ast::Node<'a>> = match atom {
+                    Atom::Child => at.children().collect(),
+                    _ => at.descendants().filter(|it| *it != at).collect(),
+                };
+                out.extend(below.into_iter().map(|it| vec![p.clone(), node(self.syn(it))]));
+            }
+            Atom::IntValue => {
+                let at = self.need_syn(&inputs[0], "int-value", line)?;
+                if let Some(value) = int_value(at) {
+                    out.push(vec![node(self.syn(at)), Value::Int(value)]);
+                }
+            }
+            Atom::StrValue => {
+                let at = self.need_syn(&inputs[0], "str-value", line)?;
+                let value = ast::Literal::cast(at).and_then(|it| match it.kind() {
+                    ast::LiteralKind::String(it) => match it.value() {
+                        Ok(value) => Some(value),
+                        // A bad escape is the file's own parse error, which the front end
+                        // reports; the literal means no text.
+                        Err(_) => None,
+                    },
+                    _ => None,
+                });
+                if let Some(value) = value {
+                    out.push(vec![node(self.syn(at)), text(&value)]);
+                }
+            }
+            Atom::DefParent => match &inputs[0] {
+                Some(_) => {
+                    let Some(def) = self.need_def(&inputs[0], "def-parent", line)? else { return Ok(()) };
+                    if let Some(owner) = self.def_parent(def) {
+                        out.push(vec![node(self.def(def)), node(self.def(owner))]);
+                    }
+                }
+                None => {
+                    let owner = match &inputs[1] {
+                        Some(Value::Node(at @ Node::Def(_))) => self.def_at(*at),
+                        Some(Value::Node(at @ Node::Syn { .. })) => {
+                            self.view_of(*at).and_then(|it| self.defines(it))
+                        }
+                        other => {
+                            return WrongValueSnafu {
+                                line,
+                                name: "def-parent",
+                                needs: "a def",
+                                arg: "its second argument",
+                                what: other.as_ref().map_or("unbound", Value::what),
+                            }
+                            .fail()
+                            .map_err(Error::from);
+                        }
+                    };
+                    let Some(owner) = owner else { return Ok(()) };
+                    let p = node(self.def(owner));
+                    let mut children = Vec::new_in(Global);
+                                        self.def_children(owner, &mut children);
+                                        for def in children { out.push(vec![node(self.def(def)), p.clone()]); }
+                    
+                }
+            },
+            Atom::VariantCount => {
+                let Some(def) = self.need_def(&inputs[0], "variant-count", line)? else { return Ok(()) };
+                if let Def::Item(ModuleDef::Adt(hir::Adt::Enum(it))) = def {
+                    let count = i64::try_from(it.variants(self.db).len()).expect("fewer than 2^63 variants");
+                    out.push(vec![node(self.def(def)), Value::Int(count)]);
+                }
+            }
+            Atom::TypeDef | Atom::TypeKind => {
+                let name = if matches!(atom, Atom::TypeDef) { "type-def" } else { "type-kind" };
+                let Some(Value::Node(at)) = inputs[0] else {
+                    return Err(not_a_type(line, name, inputs[0].as_ref().map_or("unbound", Value::what)));
+                };
+                let Some(ty) = self.ty_at(at) else { return Err(not_a_type(line, name, "a syntax node or a def")) };
+                match atom {
+                    Atom::TypeKind => out.push(vec![node(at), text(self.type_kind(ty))]),
+                    _ => {
+                        let def = match (ty.as_adt(), ty.as_dyn_trait()) {
+                            (Some(adt), _) => Some(ModuleDef::Adt(adt)),
+                            (None, Some(it)) => Some(ModuleDef::Trait(it)),
+                            (None, None) => None,
+                        };
+                        if let Some(def) = def {
+                            out.push(vec![node(at), node(self.def(Def::Item(def)))]);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1211,4 +1449,35 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
             (None, _) => Cow::Borrowed("(outside the view)"),
         }
     }
+}
+
+/// The error of a type relation given `what` where its type goes.
+fn not_a_type(line: usize, name: &'static str, what: &'static str) -> Error {
+    WrongValueSnafu { line, name, needs: "a type", arg: "its first argument", what }.build().into()
+}
+
+/// The integer `node` means: an integer literal, or one negated in an expression (`-7`) or a
+/// pattern (`-2 =>`). `None` for any other node and for a value past `i64`, which no rule's
+/// integer can equal.
+fn int_value(node: ast::Node<'_>) -> Option<i64> {
+    let (negated, literal) = match node.kind() {
+        SyntaxKind::LITERAL => (false, node),
+        SyntaxKind::PREFIX_EXPR | SyntaxKind::LITERAL_PAT => {
+            let minus = node.children_with_tokens().any(|it| it.kind() == SyntaxKind::MINUS);
+            let literal = node.children().find(|it| it.kind() == SyntaxKind::LITERAL)?;
+            // `!7` and `*7` are no integer; a pattern's literal has no other prefix.
+            if node.kind() == SyntaxKind::PREFIX_EXPR && !minus {
+                return None;
+            }
+            (minus, literal)
+        }
+        _ => return None,
+    };
+    let ast::LiteralKind::IntNumber(number) = ast::Literal::cast(literal)?.kind() else { return None };
+    // Each failure below is a value past `i64` (the digits past `u128`, then past `i128`, then
+    // the signed value): the doc's `None`.
+    let Ok(magnitude) = number.value() else { return None };
+    let Ok(magnitude) = i128::try_from(magnitude) else { return None };
+    let Ok(value) = i64::try_from(if negated { -magnitude } else { magnitude }) else { return None };
+    Some(value)
 }

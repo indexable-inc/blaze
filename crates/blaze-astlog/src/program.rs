@@ -1,6 +1,7 @@
 //! blaze's atoms and actions on top of the engine's language (`astlog-engine`): code patterns
 //! (`expr`, `type`, `pat`, `stmt`, `item`, `path`), `syntax`, the semantic relations, and the
-//! `rename`, `retarget` and `add-use` actions. Templates splice `$var`.
+//! `rename`, `retarget`, `add-use`, `add-param`, `remove-param` and `reorder-params` actions.
+//! Templates splice `$var`.
 
 use astlog_engine::{BuiltinAritySnafu, DslSnafu, Needs, Parsed, Sexpr, TemplateSyntax, Term};
 use syntax::SyntaxKind;
@@ -39,6 +40,8 @@ pub enum Atom {
     Syntax(SyntaxKind),
     Resolves,
     DefPath,
+    /// A def's own name, the last segment of its path.
+    DefName,
     TypeOf,
     /// A type with every leading `&` and `&mut` stripped.
     PeelRefs,
@@ -57,6 +60,24 @@ pub enum Atom {
     Defines,
     References,
     Filter(Filter),
+    /// `(match-arm m a p b)`: a `match`, one of its arms, the arm's pattern and its expression.
+    MatchArm,
+    /// `(child p c)`: each child node of `p`, in order.
+    Child,
+    /// `(descendant p c)`: each node below `p`, in order.
+    Descendant,
+    /// `(int-value n i)`: the integer an integer literal, or a negated one, means.
+    IntValue,
+    /// `(str-value n s)`: the text a string literal means, unescaped.
+    StrValue,
+    /// `(def-parent d p)`: the def that owns `d`, or each def `p` owns.
+    DefParent,
+    /// `(variant-count e n)`: how many variants the enum `e` has.
+    VariantCount,
+    /// `(type-def t d)`: the ADT a type is, or the trait of a `dyn Trait`.
+    TypeDef,
+    /// `(type-kind t k)`: the type's shape, as text (`struct`, `ref`, `int`, ...).
+    TypeKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +89,26 @@ pub enum Action {
     Retarget,
     /// `(add-use n "krate::path")`: a `use` of the item in the file (or inline module) of `n`.
     AddUse,
+    /// `(add-param d "name: Type" "default")`, or with an index last: the fn `d` takes a new
+    /// parameter at the end or before the parameter of that index (`self` not counted), and
+    /// every call passes `default` for it.
+    AddParam,
+    /// `(remove-param d "name")`: the parameter, and its argument at every call.
+    RemoveParam,
+    /// `(reorder-params d "b" "a")`: every parameter of `d`, in the new order, and every
+    /// call's arguments with them.
+    ReorderParams,
 }
+
+/// The actions and the arities each takes.
+const ACTIONS: &[(&str, Action, usize, usize)] = &[
+    ("rename", Action::Rename, 2, 2),
+    ("retarget", Action::Retarget, 2, 2),
+    ("add-use", Action::AddUse, 2, 2),
+    ("add-param", Action::AddParam, 3, 4),
+    ("remove-param", Action::RemoveParam, 2, 2),
+    ("reorder-params", Action::ReorderParams, 2, usize::MAX),
+];
 
 const PATTERN_FORMS: &str = "(expr n \"...\"), (type n \"...\"), (pat n \"...\"), (stmt n \"...\"), \
                              (item n \"...\") or (path n \"...\")";
@@ -79,6 +119,7 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
     Some(match head {
         "resolves" => (Atom::Resolves, 2, all0),
         "def-path" => (Atom::DefPath, 2, Needs::Any(&[0, 1])),
+        "def-name" => (Atom::DefName, 2, all0),
         "type-of" => (Atom::TypeOf, 2, all0),
         "peel-refs" => (Atom::PeelRefs, 2, all0),
         "callee" => (Atom::Callee, 2, all0),
@@ -92,6 +133,15 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
         "visibility" => (Atom::Visibility, 2, all0),
         "defines" => (Atom::Defines, 2, Needs::Any(&[0, 1])),
         "references" => (Atom::References, 2, all0),
+        "match-arm" => (Atom::MatchArm, 4, Needs::Nothing),
+        "child" => (Atom::Child, 2, all0),
+        "descendant" => (Atom::Descendant, 2, all0),
+        "int-value" => (Atom::IntValue, 2, all0),
+        "str-value" => (Atom::StrValue, 2, all0),
+        "def-parent" => (Atom::DefParent, 2, Needs::Any(&[0, 1])),
+        "variant-count" => (Atom::VariantCount, 2, all0),
+        "type-def" => (Atom::TypeDef, 2, all0),
+        "type-kind" => (Atom::TypeKind, 2, all0),
         "in-macro-input" => (Atom::Filter(Filter::InMacroInput), 1, all0),
         "in-macro-expansion" => (Atom::Filter(Filter::InMacroExpansion), 1, all0),
         "in-unsafe" => (Atom::Filter(Filter::InUnsafe), 1, all0),
@@ -126,7 +176,7 @@ impl astlog_engine::Language for Blaze {
             || form_of(name).is_some()
             || shape(name).is_some()
             || LITERAL_ATOMS.contains(&name)
-            || matches!(name, "rename" | "retarget" | "add-use")
+            || ACTIONS.iter().any(|(action, ..)| *action == name)
     }
 
     fn parse_atom(head: &str, args: &[Sexpr], line: usize) -> Result<Option<Parsed<Atom>>, Error> {
@@ -193,17 +243,50 @@ impl astlog_engine::Language for Blaze {
     }
 
     fn parse_action(head: &str, args: &[Sexpr], line: usize) -> Result<Option<Parsed<Action>>, Error> {
-        let value = match head {
-            "rename" => Action::Rename,
-            "retarget" => Action::Retarget,
-            "add-use" => Action::AddUse,
-            _ => return Ok(None),
+        let Some(&(_, value, least, most)) = ACTIONS.iter().find(|(name, ..)| *name == head) else {
+            return Ok(None);
         };
-        if args.len() != 2 {
-            return BuiltinAritySnafu { line, name: head, expected: 2usize, got: args.len() }.fail();
+        if least == most && args.len() != least {
+            return BuiltinAritySnafu { line, name: head, expected: least, got: args.len() }.fail();
+        }
+        if args.len() < least || args.len() > most {
+            let most = if most == usize::MAX { "more".to_owned() } else { most.to_string() };
+            return DslSnafu {
+                line,
+                message: format!("`{head}` takes {least} or {most} arguments, got {}", args.len()),
+            }
+            .fail();
+        }
+        // An action's text is the name, path or code itself, no template: `(rename d "$t")`
+        // would rename to the text `$t`. A variable is passed bare.
+        for arg in args {
+            if let Sexpr::Str { text, .. } = arg
+                && let Some(var) = dollar_var(text)
+            {
+                return DslSnafu {
+                    line,
+                    message: format!(
+                        "`{head}` takes its text as written, and `\"{text}\"` is no template: pass \
+                         the variable itself, `{var}` without quotes, and compute new text with \
+                         text-replace or case"
+                    ),
+                }
+                .fail();
+            }
         }
         Ok(Some(Parsed { value, args: astlog_engine::terms(args)?, needs: Needs::Nothing }))
     }
+}
+
+/// The first `$name` or `${name}` in `text`, as a template would read it.
+fn dollar_var(text: &str) -> Option<&str> {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices('$').find_map(|(at, _)| {
+        let rest = &text[at + 1..];
+        let inner = rest.strip_prefix('{').unwrap_or(rest);
+        let end = inner.find(|c: char| !ident(c)).unwrap_or(inner.len());
+        (end > 0).then(|| &inner[..end])
+    })
 }
 
 /// `(head term "literal")`: the term, and the literal the atom is compiled from.

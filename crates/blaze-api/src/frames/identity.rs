@@ -16,7 +16,7 @@ use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
     FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
-    NodeKind, NotKept, OpenFailure, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
+    NodeKind, NotKept, OpenFailure, Param, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Tiers, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted,
     UnitTarget, Verb, ViewRef, Worked,
@@ -375,7 +375,7 @@ impl Gen {
     }
 
     fn edit(&mut self) -> Edit {
-        match self.below(11) {
+        match self.below(12) {
             0 => Edit::ReplaceBody { body: self.text(), item: self.target() },
             1 => Edit::ReplaceSignature { item: self.target(), signature: self.text() },
             2 => Edit::ReplaceItem { item: self.target(), text: self.text() },
@@ -388,6 +388,15 @@ impl Gen {
             7 => Edit::AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
             8 => Edit::Rename { to: self.text(), item: self.target() },
             9 => Edit::Rules { rules: self.text() },
+            10 => Edit::Params {
+                item: self.target(),
+                params: (0..self.below(3))
+                    .map(|_| match self.yes() {
+                        true => Param::Kept { name: self.text() },
+                        false => Param::Added { param: self.text(), default: self.text() },
+                    })
+                    .collect(),
+            },
             _ => Edit::Replace { to: self.text(), from: self.text() },
         }
     }
