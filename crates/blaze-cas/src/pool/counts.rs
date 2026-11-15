@@ -78,15 +78,33 @@ pub(crate) fn budget() -> u64 {
 /// The least the pinned bound is, whatever the budget: a link's inputs and a few large
 /// values pinned at once.
 pub(crate) const PINNED_LEAST: u64 = 64 << 20;
-/// The most the pinned bound is while no budget is set (a test, a tool).
-pub(crate) const PINNED_UNSET: u64 = 1 << 30;
-
 /// The pinned bound under `budget`: half of it, so that at least half of the pool's budget
-/// is always the sweep's to take, and never under [`PINNED_LEAST`].
+/// is always the sweep's to take, and never under [`PINNED_LEAST`]. No budget set is no
+/// bound. Nothing sets `Tag::Pool`'s budget since f25aa5be3 deleted
+/// `blaze_graph::admission::set_budgets` (nothing admits or throttles by memory), so the
+/// 1 GiB this returned for an unset budget, meant for a test or a tool, was the daemon's
+/// bound: a build whose pins reached it waited five seconds at every further pin and failed
+/// the read. Measured: ripgrep's first build after a restart and an edit pinned exactly
+/// 1,073,741,824 bytes, waited at the bound 177 times and was killed at 900 s.
 pub(crate) fn pinned_bound(budget: u64) -> u64 {
     match budget {
-        u64::MAX => PINNED_UNSET,
+        u64::MAX => u64::MAX,
         budget => (budget / 2).max(PINNED_LEAST),
+    }
+}
+
+/// What the store's table of pins holds at most while no budget is set, before the store
+/// lets it go ([`pins_most`]).
+pub(crate) const PINS_MOST_UNSET: u64 = 256 << 20;
+
+/// The pins the store's table holds before `tidy` lets it go: a quarter of the pinned bound,
+/// so the pins of tasks that ended are given back long before running tasks reach it; with
+/// no budget set, [`PINS_MOST_UNSET`], what a quarter of the bound was before no budget
+/// meant no bound.
+pub(crate) fn pins_most(budget: u64) -> u64 {
+    match budget {
+        u64::MAX => PINS_MOST_UNSET,
+        budget => pinned_bound(budget) / 4,
     }
 }
 
