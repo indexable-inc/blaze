@@ -385,6 +385,16 @@ pub(crate) struct Frontier {
     reached_before: blaze_core::lock::Lock<Vec<Box<Seen>>>,
     /// How many rows [`Walked::apart`] holds.
     unwound: AtomicU32,
+    /// [`Walked::apart`] as the last walk that ended published it, for the readers that ask
+    /// whether a row is set apart ([`set_apart`]) with no lock: every check of a row a wide
+    /// level marked asks, from every task at once, and until 2026-11-15 each took the walked
+    /// lock (a body edit on the gauntlet: 4,531 waits, 518 ms of the body check's 21 ms on
+    /// 30 threads). It points into the last of `apart_held`, which holds every list published
+    /// until the next view boundary keeps only the last (`&mut`: no reader), as
+    /// `reached_before` does; null before any walk ended.
+    apart: AtomicPtr<Vec<(u32, u32)>>,
+    #[expect(clippy::disallowed_types, reason = "held to push a pointer, never across a call")]
+    apart_held: blaze_core::lock::Lock<Vec<Arc<Vec<(u32, u32)>>>>,
     pub(crate) plant: Plant,
 }
 
@@ -404,6 +414,8 @@ impl Frontier {
             reached: AtomicPtr::new(std::ptr::null_mut()),
             reached_before: blaze_core::lock::Lock::new("query.frontier.reached_before", Vec::new()),
             unwound: AtomicU32::new(0),
+            apart: AtomicPtr::new(std::ptr::null_mut()),
+            apart_held: blaze_core::lock::Lock::new("query.frontier.apart_held", Vec::new()),
             plant: Plant::None,
         }
     }
@@ -1474,6 +1486,10 @@ fn walk(db: *const (), storage: &Storage) {
     unwound.sort_unstable_by_key(|it| it.0);
     let apart = u32::try_from(unwound.len()).unwrap_or(u32::MAX);
     let unwound = Arc::new(unwound); // alloc: as above
+    // Held until the next view boundary, then published: a reader that loads it reads a list
+    // nothing frees while it borrows the storage.
+    frontier.apart_held.lock().push(Arc::clone(&unwound)); // alloc: a pointer a walk; clone: a count
+    frontier.apart.store(Arc::as_ptr(&unwound).cast_mut(), Ordering::Release);
     taken.written.clear();
     taken.said.clear();
     let mut walked = frontier.walked.lock();
@@ -1794,6 +1810,13 @@ fn reach(storage: &Storage, changed: &[ChangedIn], untracked: &[u32], work: &mut
 }
 
 impl Storage {
+    /// The walks' lock held, for a test that asks rows while a walk's bookkeeping is locked:
+    /// what every task's check of a row a wide level set apart met, until 2026-11-15.
+    #[cfg(test)]
+    pub(crate) fn hold_walked(&self) -> impl Drop + '_ {
+        self.frontier.walked.lock()
+    }
+
     /// Frees the reaches the walks of the view before replaced, and forgets the last: with
     /// `&mut`, at a view boundary, so no reader holds one.
     pub(crate) fn drop_reaches(&mut self) {
@@ -1804,6 +1827,12 @@ impl Storage {
             drop(unsafe { Box::from_raw(last) });
         }
         self.frontier.reached_before.get_mut().clear();
+        // The published list stays (it is the last walk's, and a later view asks it); the
+        // ones it replaced go.
+        let held = self.frontier.apart_held.get_mut();
+        let last = held.pop();
+        held.clear();
+        held.extend(last);
     }
 }
 
@@ -1886,7 +1915,15 @@ pub(crate) fn clean(storage: &Storage, header: &Header, node: u32) -> bool {
 
 #[cold]
 fn set_apart(frontier: &Frontier, node: u32) -> bool {
-    let apart = Arc::clone(&frontier.walked.lock().apart); // clone: a count
+    let apart = frontier.apart.load(Ordering::Acquire);
+    if apart.is_null() {
+        return false;
+    }
+    // SAFETY: a non-null `apart` points into an `Arc` that `apart_held` holds until a view
+    // boundary (`Storage::drop_reaches`, `&mut`: no reader) drops it, and that boundary keeps
+    // the one `apart` points to; this reader borrows the storage. The list is never written
+    // after it is published.
+    let apart = unsafe { &*apart };
     apart.binary_search_by_key(&node, |it| it.0).is_ok()
 }
 

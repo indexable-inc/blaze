@@ -603,6 +603,46 @@ fn a_wide_level_is_marked_and_no_row_of_it_runs_in_the_walk() {
     }
 }
 
+/// The invariant: a row asked for after a walk that set rows apart is told whether it is one
+/// of them with no lock: every check of a row asks, from every task at once, and while each
+/// took the walks' lock a body edit's check spent 518 ms of 30 threads' time waiting on it
+/// (the gauntlet, 2026-11-15). 100 readers of one input make a wide level (all set apart);
+/// 10 readers of another input are outside it. With the walks' lock held, a thread asks the
+/// 10: each is proved unchanged by the walk's end, none runs, and the thread ends. The
+/// planted control is the lock taken again in `set_apart`: the thread does not end.
+#[test]
+fn a_row_is_told_apart_or_not_with_the_walks_lock_held() {
+    const WIDE: usize = 100;
+    const ASIDE: usize = 10;
+    let mut flow: Vec<FlowNode> = (0..WIDE).map(|_| sum(&[Dep::Input(0)])).collect();
+    flow.extend((0..ASIDE).map(|_| sum(&[Dep::Input(1)])));
+    let mut db = TestDb::new();
+    *db.flow.lock() = flow;
+    let cells: Vec<Cell> = (0..2).map(|_| Cell::new(&db, 1, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    for at in 0..WIDE + ASIDE {
+        assert_eq!(*fetch::<Flow>(&db, node(&db, at)), 1);
+    }
+    take_ran_on(&db);
+    let since = db.storage().view();
+    cells[0].set_a(&mut db, 7);
+    _ = changed_since::<Flow>(&db, since);
+    assert_eq!(db.storage().changed_set_work().marked, WIDE as u64, "the wide level is set apart");
+    let (done, ended) = std::sync::mpsc::channel();
+    let held = db.storage().hold_walked();
+    std::thread::scope(|scope| {
+        let db = &db;
+        scope.spawn(move || {
+            let answers: Vec<u64> = (WIDE..WIDE + ASIDE).map(|at| *fetch::<Flow>(db, node(db, at))).collect();
+            _ = done.send(answers);
+        });
+        let answers = ended.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        assert_eq!(answers, Ok(vec![1; ASIDE]), "the rows outside the wide level were not answered with the walks' lock held");
+    });
+    assert_eq!(take_ran_on(&db).len(), 0, "a row outside the walk's reach ran");
+}
+
 /// The control of [`a_wide_level_is_marked_and_no_row_of_it_runs_in_the_walk`]: a level
 /// under the bound is verified by the walk itself, so its rows do run in it, and the oracle
 /// tells a walk that marks from one that verifies.
