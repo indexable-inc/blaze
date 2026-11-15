@@ -2594,19 +2594,29 @@ fn use_takes(node: &SyntaxNode, uniform: bool, named: impl Fn(&str) -> bool) -> 
     })
 }
 
-/// Whether the list of items the `use` item `node` is in declares a module `name` that no
-/// `cfg` can take away ([`use_takes`]).
+/// Whether the list of items the `use` item `node` is in declares a module `name` that is
+/// there wherever the `use` is ([`use_takes`]): each `cfg` on the module is on the `use` too,
+/// token for token (`#[cfg(feature = "plugin")] mod plugin;` and
+/// `#[cfg(feature = "plugin")] pub use plugin::*;`: one predicate of one crate's cfgs), and no
+/// `cfg_attr` is, which could add one.
 fn declares_module(node: &SyntaxNode, name: &str) -> bool {
     let Some(list) = node.parent() else { return false };
+    // alloc: once per glob import of a workspace file keyed that names a module beside it
+    let used: Vec<String> = attrs(node)
+        .filter(|attr| matches!(attr.meta(), Some(ast::Meta::CfgMeta(_))))
+        .map(|attr| path_text(attr.syntax()))
+        .collect();
     list.children().filter(|it| it.kind() == SyntaxKind::MODULE).any(|module| {
         let named = module
             .children()
             .find(|it| it.kind() == SyntaxKind::NAME)
             .is_some_and(|it| it.text() == name);
-        let gated = attrs(&module).any(|attr| {
-            matches!(attr.meta(), Some(ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_)) | None)
+        let there = attrs(&module).all(|attr| match attr.meta() {
+            Some(ast::Meta::CfgMeta(_)) => used.contains(&path_text(attr.syntax())),
+            Some(ast::Meta::CfgAttrMeta(_)) | None => false,
+            Some(_) => true,
         });
-        named && !gated
+        named && there
     })
 }
 

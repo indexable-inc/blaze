@@ -126,7 +126,8 @@ fn a_shadowing_file_is_caught() {
 /// A glob of a module declared beside it (`mod attribute; pub use attribute::*;`) is of the
 /// crate's own names in edition 2018 and later, where a first name both a module and a crate
 /// is an error: it neither shadows nor takes a plain macro's name. Not where the module may be
-/// taken away by a `cfg`, not one written `::attribute` (a crate), not a module elsewhere, and
+/// taken away by a `cfg` the `use` lacks, not one written `::attribute` (a crate), not a module
+/// elsewhere, and
 /// not in edition 2015, where the path starts at the root.
 #[test]
 fn a_glob_of_a_module_beside_it_is_the_crates_own() {
@@ -139,12 +140,15 @@ fn a_glob_of_a_module_beside_it_is_the_crates_own() {
         "mod attribute;\npub use attribute::*;\n",
         "pub mod attribute {\n    pub struct A;\n}\npub use attribute::{*};\n",
         "#[doc(hidden)]\nmod attribute;\npub use attribute::*;\n",
+        "#[cfg(feature = \"a\")]\nmod attribute;\n#[cfg(feature = \"a\")]\npub use attribute::*;\n",
     ] {
         assert_eq!(at(text, Edition::Edition2021), (false, false), "{text}");
         assert_eq!(at(text, Edition::Edition2015), (true, true), "2015: {text}");
     }
     for text in [
         "#[cfg(feature = \"a\")]\nmod attribute;\npub use attribute::*;\n",
+        "#[cfg(feature = \"a\")]\nmod attribute;\n#[cfg(feature = \"b\")]\npub use attribute::*;\n",
+        "#[cfg_attr(feature = \"a\", cfg(x))]\nmod attribute;\npub use attribute::*;\n",
         "mod attribute;\npub use ::attribute::*;\n",
         "mod other {\n    mod attribute;\n}\npub use attribute::*;\n",
         "mod attributes;\npub use attribute::*;\n",
@@ -1515,3 +1519,4 @@ fn a_documented_body_is_left_out_as_an_undocumented_one_is() {
         "the control: a plain body under `///` kept"
     );
 }
+
