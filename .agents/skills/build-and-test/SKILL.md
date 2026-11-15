@@ -229,17 +229,20 @@ never mixing two states.
 ## real-run-first (rule 82)
 
 A new command, path or mode (a check with no daemon, a new backend, a new store) is run end to end
-on a real project, hello-world first, on the day its first piece compiles: by the main agent, with a
-release blaze of the exact tree (`measure-the-exact-tree`), and again after every round of lanes.
-What that run prints is the state of the work: its first failure is the next task, and its timing
-line says where the time goes before anyone optimises. Unit tests on fixtures and a passing
-simulation say the pieces agree with their models, not that the command works: nothing is reported
-as working, and no second piece is designed on top, until the real run has been made and its output
-read. A lane's brief names the real run that judges its piece. Where the real run cannot be made yet
-because a piece is not written, say which piece, and make the nearest real run that can be made (the
-real std keyed by the new key rule, the real project gathered) instead of a fixture. When finding
-each failure of the real run would cost one release build, first write the test that finds every
-such case in one run (key every crate of std, check every item), then fix what it lists.
+on a real project, hello-world first, on the day its first piece compiles and before more is built
+on it: by the main agent, with a release blaze of the exact tree (`measure-the-exact-tree`), and
+again after every round of lanes. It writes the profile from that first run (`slow-is-p0-traced`),
+and the run is read through it: what `blaze explain` cannot say about the run's time or memory is
+the run's first bug, fixed before the next piece. What that run prints is the state of the work: its
+first failure is the next task, and its timing line says where the time goes before anyone
+optimises. Unit tests on fixtures and a passing simulation say the pieces agree with their models,
+not that the command works: nothing is reported as working, and no second piece is designed on top,
+until the real run has been made and its output read. A lane's brief names the real run that judges
+its piece. Where the real run cannot be made yet because a piece is not written, say which piece,
+and make the nearest real run that can be made (the real std keyed by the new key rule, the real
+project gathered) instead of a fixture. When finding each failure of the real run would cost one
+release build, first write the test that finds every such case in one run (key every crate of std,
+check every item), then fix what it lists.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 
