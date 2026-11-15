@@ -1488,7 +1488,7 @@ fn walk(db: *const (), storage: &Storage) {
     let unwound = Arc::new(unwound); // alloc: as above
     // Held until the next view boundary, then published: a reader that loads it reads a list
     // nothing frees while it borrows the storage.
-    frontier.apart_held.lock().push(Arc::clone(&unwound)); // alloc: a pointer a walk; clone: a count
+    frontier.apart_held.lock().push(Arc::clone(&unwound)); // clone: a count
     frontier.apart.store(Arc::as_ptr(&unwound).cast_mut(), Ordering::Release);
     taken.written.clear();
     taken.said.clear();

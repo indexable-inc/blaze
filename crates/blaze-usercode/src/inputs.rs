@@ -380,7 +380,6 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<(PathBuf, NameIs)>
             m != n && other.starts_with(name) && (other != name || *is != NameIs::Climbed || m < n)
         })
     };
-    // alloc: cold, as above
     let kept: Vec<bool> =
         names.iter().enumerate().map(|(n, (name, is))| *is != NameIs::Climbed || !covered(n, name)).collect();
     let mut kept = kept.into_iter();

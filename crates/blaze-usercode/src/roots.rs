@@ -1273,7 +1273,7 @@ fn mark_path(role: Role) -> PathBuf {
 /// is the path of the directory `hops` names above the root, or none past the file system's
 /// root.
 fn above_path(role: Role, hops: usize) -> PathBuf {
-    PathBuf::from(format!("{}{}/{ABOVE}/{hops}", char::from(MARK), char::from(role.tag()))) // alloc: a mark, once per root of a run kept that read outside its roots
+    PathBuf::from(format!("{}{}/{ABOVE}/{hops}", char::from(MARK), char::from(role.tag())))
 }
 
 /// The tag of the root `path` is an above mark of, and how many names up ([`above_path`]).

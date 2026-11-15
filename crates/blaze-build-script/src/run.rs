@@ -116,7 +116,7 @@ pub fn own_dir(unit: &Unit) -> Option<PathBuf> {
         && hash.len() == 16
         && hash.bytes().all(|it| it.is_ascii_hexdigit())
         && build.is_some_and(|it| it == "build");
-    first.then(|| around.to_owned()) // alloc: setup, once per run
+    first.then(|| around.to_owned())
 }
 
 /// What an earlier run of `unit` left in its directory that a run could read: the paths of

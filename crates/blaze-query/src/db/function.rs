@@ -2017,7 +2017,6 @@ fn evict_table<F: Function>(storage: &mut Storage, index: u32) -> usize {
 /// waited on).
 fn evict_unread<F: Function>(storage: &Storage, index: u32, before: u32) -> (usize, u64) {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return (0, 0) };
-    // alloc: once an epoch per function with a value to let go, a key per value
     let gone: Vec<u32> = rows::<F>(storage, table)
         .filter(|(_, row)| {
             let word = row.header.verified.load(Ordering::Relaxed);
