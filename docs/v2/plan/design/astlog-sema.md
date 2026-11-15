@@ -134,7 +134,13 @@ And one over the type behind any references, by the names the std prelude gives:
   simulation's `a_query_with_tests_selected_reads_the_test_configuration_over_many_seeds` holds
   a test-selected query to the test configuration after a default check, and two planted bugs
   (a query lowered as the default check, a kept front end left at its old configuration) fail
-  it.
+  it. On a real front end,
+  `tests::relations::a_test_configuration_types_its_cfg_test_module_and_resolves_its_dev_dependency`
+  holds the rules to what each configuration compiles: under `cfg(test)` with the
+  dev-dependency a `#[cfg(test)]` module's code has types and its calls into the
+  dev-dependency resolve; under a plain check the same code is `cfg-off`, untyped, and the
+  dev-dependency's call resolves to nothing, while a `crate::` path still resolves by its
+  module's scope.
 - **Code the build compiles out.** A rewrite edits what the selected build compiles. Its text
   action on a node under an item, variant or field whose `#[cfg]` is off in that build (the
   test `cfg-off` reads) is left as written and named in the answer: schema 65's

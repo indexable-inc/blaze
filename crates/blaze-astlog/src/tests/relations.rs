@@ -142,6 +142,47 @@ fn cfg_off_holds_inside_a_variant_or_a_field_its_cfg_removes() {
     assert!(error.contains("rules:1") && error.contains("`#[cfg(any())]` at lib.rs:1"), "{error}");
 }
 
+/// One lib.rs as the daemon lowers it for a check selecting `--tests` (its test unit: `cfg(test)`
+/// and the dev-dependency) and for a plain check (neither). The test configuration gives a
+/// `#[cfg(test)]` module's code types and resolution into the dev-dependency; the plain one
+/// has the same code compiled out, with none.
+#[test]
+fn a_test_configuration_types_its_cfg_test_module_and_resolves_its_dev_dependency() {
+    const DEV: &str = "//- /dev.rs crate:dev edition:2021\npub fn helper() -> u32 { 7 }\n";
+    const TESTED: &str = "pub fn shipped() -> u32 { 1 }\n\
+                          #[cfg(test)]\n\
+                          mod tests {\n    \
+                              #[test]\n    \
+                              fn uses() { let _ = crate::shipped() + dev::helper(); }\n\
+                          }\n";
+    let rules = r#"
+        (rule (typed e t) (syntax e "BIN_EXPR") (type-of e t))
+        (rule (tested e) (syntax e "BIN_EXPR") (in-test e))
+        (rule (off e) (syntax e "BIN_EXPR") (cfg-off e))
+        (rule (calls c d) (syntax c "CALL_EXPR") (callee c d))
+    "#;
+    let sum = "crate::shipped() + dev::helper()";
+
+    let test_unit = format!("{DEV}//- /lib.rs crate:lib deps:dev cfg:test edition:2021\n{TESTED}");
+    let (db, files) = view(&test_unit, 1, &["lib.rs"]);
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "typed"), [[sum, "u32"]]);
+    assert_eq!(texts(&outcome, "tested"), [[sum]]);
+    assert!(texts(&outcome, "off").is_empty(), "{:?}", texts(&outcome, "off"));
+    let calls = texts(&outcome, "calls");
+    assert_eq!(calls, [["crate::shipped()", "lib::shipped"], ["dev::helper()", "dev::helper"]]);
+
+    let check_unit = format!("{DEV}//- /lib.rs crate:lib edition:2021\n{TESTED}");
+    let (db, files) = view(&check_unit, 1, &["lib.rs"]);
+    let outcome = query(&db, &files, rules).unwrap();
+    assert!(texts(&outcome, "typed").is_empty(), "{:?}", texts(&outcome, "typed"));
+    assert_eq!(texts(&outcome, "tested"), [[sum]], "`in-test` reads the attribute, on or off");
+    assert_eq!(texts(&outcome, "off"), [[sum]]);
+    // A path in compiled-out code still resolves by its module's scope; the dev-dependency is
+    // no crate of this build, so its call resolves to nothing.
+    assert_eq!(texts(&outcome, "calls"), [["crate::shipped()", "lib::shipped"]]);
+}
+
 #[test]
 fn in_macro_input_holds_for_an_expansions_nodes_from_the_input_only() {
     let (db, files) = lib();
