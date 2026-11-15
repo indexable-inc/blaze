@@ -616,19 +616,27 @@ pub fn refused(asked: &Invocation) -> Option<String> {
         Command::Check if flags.dry_run && flags.rules.is_none() && flags.replace.is_empty() => {
             Some("`--dry-run` shows the edits `--rules` or `--replace` would make: give one of them".to_owned())
         }
-        // The view a rules file runs over is the daemon's of the whole checkout; nothing yet
-        // narrows it, so a selection would be accepted and change nothing.
+        // `--query` and `--rules` lower the view as a check of the selection does (its
+        // packages, features, profile, target and targets, `--tests` with its `#[cfg(test)]`
+        // code); `--replace`'s edit carries no selection, and the unit graph and timings
+        // report a build these run none of.
         Command::Check
             if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
-                && !flags.selection.is_empty() =>
+                && unhonoured_selection(flags).next().is_some() =>
         {
-            let given: Vec<String> = flags.selection.iter().map(|it| format!("`--{it}`")).collect(); // alloc: a refusal's few flags
-            Some(format!(
-                "{} reads the daemon's view of the whole checkout, which no build selection narrows yet, \
-                 so {} would change nothing: run it without",
-                rules_mode(flags),
-                given.join(", ")
-            ))
+            let given: Vec<String> = unhonoured_selection(flags).map(|it| format!("`--{it}`")).collect(); // alloc: a refusal's few flags
+            Some(match flags.replace.is_empty() {
+                true => format!(
+                    "{} runs no build, so {} would report nothing: run it without",
+                    rules_mode(flags),
+                    given.join(", ")
+                ),
+                false => format!(
+                    "`--replace` edits the daemon's view of the whole checkout, which no build selection narrows, \
+                     so {} would change nothing: run it without, or write the edit as a `--rules` rewrite",
+                    given.join(", ")
+                ),
+            })
         }
         // `replaced` writes a diff or a status line, never JSON.
         Command::Check
@@ -700,6 +708,13 @@ fn rules_mode(flags: &Flags) -> &'static str {
         (None, Some(_)) => "`--rules`",
         (None, None) => "`--replace`",
     }
+}
+
+/// The selection flags given that the rules modes can't honour: with `--replace` every one,
+/// else those that report a build ([`REPORTS_A_BUILD`]).
+fn unhonoured_selection(flags: &Flags) -> impl Iterator<Item = &'static str> + '_ {
+    let replacing = !flags.replace.is_empty();
+    flags.selection.iter().copied().filter(move |it| replacing || REPORTS_A_BUILD.contains(it))
 }
 
 /// The flags the client reads itself, or puts in `Targets`.
@@ -787,9 +802,14 @@ pub struct Flags {
 const STEERS_A_BUILD: &[&str] =
     &["jobs", "keep-going", "fail-fast", "no-fail-fast", "locked", "frozen", "offline", "no-locked", "config"];
 
+/// Of [`SELECTS_A_BUILD`], the flags that ask for a report of the build run, which
+/// `--query` and `--rules` refuse by name: they lower the view and run no build.
+const REPORTS_A_BUILD: &[&str] = &["unit-graph", "timings"];
+
 /// The flags that choose what a build compiles and reports: packages, features, profile,
-/// target and targets. `--query`, `--rules` and `--replace` read the checkout as the daemon's
-/// view opens it, so they refuse each of these by name ([`refused`]).
+/// target and targets. `--query` and `--rules` lower the view as a check of them does
+/// (`Request::Query`'s and `Edit::Rules`' `targets`), but for [`REPORTS_A_BUILD`];
+/// `--replace` carries no selection and refuses each by name ([`refused`]).
 const SELECTS_A_BUILD: &[&str] = &[
     "package",
     "workspace",

@@ -725,12 +725,18 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
         return refused(&what, color);
     }
     if asked.command() == Command::Check && let Some(file) = &asked.flags.query {
-        return queried(&place, file, format.json(), color);
+        return match selected(request) {
+            Ok(targets) => queried(&place, file, targets, format.json(), color),
+            Err(what) => refused(what, color),
+        };
     }
     if asked.command() == Command::Check
         && (!asked.flags.replace.is_empty() || asked.flags.rules.is_some())
     {
-        return replaced(&place, &asked.flags, color);
+        return match selected(request) {
+            Ok(targets) => replaced(&place, &asked.flags, targets, color),
+            Err(what) => refused(what, color),
+        };
     }
     let pinned = match asked.command() == Command::Check && asked.flags.fix {
         true => match fix::pin(&mut request) {
@@ -912,11 +918,22 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     }
 }
 
+/// The build selection of the check `request` is, with the client's command line and
+/// environment: what `--query` and `--rules` lower the view as, so a query and a check from
+/// one shell plan and run their build scripts alike.
+fn selected(request: Request) -> Result<blaze_api::Targets, &'static str> {
+    match request {
+        Request::Check { targets, .. } => Ok(targets),
+        _ => Err("`--query`, `--rules` and `--replace` run beside `blaze check` alone"),
+    }
+}
+
 /// `check --query FILE`: what the rules derive and find, on stdout (one JSON line of
 /// [`blaze_api::Response::Rows`] with `--message-format json`); its exit code, failed when a
 /// lint of severity `error` found anything.
-fn queried(place: &Place, file: &str, json: bool, color: bool) -> i32 {
-    let done = replace::rules(&place.cwd, file).and_then(|rules| replace::query(&place.root, rules));
+fn queried(place: &Place, file: &str, targets: blaze_api::Targets, json: bool, color: bool) -> i32 {
+    let done = replace::rules(&place.cwd, file)
+        .and_then(|rules| replace::query(&place.root, rules, targets));
     let rows = match done {
         Ok(rows) => rows,
         Err(what) => {
@@ -945,10 +962,11 @@ fn queried(place: &Place, file: &str, json: bool, color: bool) -> i32 {
 
 /// `check --replace` and `--rules`' edits made in the checkout, or with `--dry-run` their
 /// diff on stdout: its exit code.
-fn replaced(place: &Place, flags: &args::Flags, color: bool) -> i32 {
+fn replaced(place: &Place, flags: &args::Flags, targets: blaze_api::Targets, color: bool) -> i32 {
     let done = replace::edits(&flags.replace).and_then(|mut edits| {
         if let Some(file) = &flags.rules {
-            edits.push(blaze_api::Edit::Rules { rules: replace::rules(&place.cwd, file)? });
+            let rules = replace::rules(&place.cwd, file)?;
+            edits.push(blaze_api::Edit::Rules { rules, targets });
         }
         replace::replace(&place.root, edits, flags.dry_run)
     });

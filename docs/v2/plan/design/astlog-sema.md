@@ -103,7 +103,7 @@ And one over the type behind any references, by the names the std prelude gives:
   `(not (in-macro-expansion n))`. A rewritten file that no longer parses (the file, the first
   syntax error), and a file that had a syntax error before the rewrite (the file, the line, the
   error); the whole request fails, nothing is written.
-- **Surfaces.** The API first, schema 62 (63 adds `Edit::Params`): `Edit::Rules { rules }` rides the existing
+- **Surfaces.** The API first, schema 62 (63 adds `Edit::Params`, 64 the `targets` below): `Edit::Rules { rules }` rides the existing
   `Request::Edit`, so the answer is the usual `Edited` (VFS ops and seeds, the way
   `blaze_intent::apply` sends them); one per request, after the request's other edits.
   `Request::Edit`'s `head` is optional: with none, the edits are made and answered and nothing is
@@ -116,6 +116,25 @@ And one over the type behind any references, by the names the std prelude gives:
   unified diff and writes nothing, `--query FILE` prints the rows (one JSON line of
   `Response::Rows` with `--message-format json`) and exits failed when an `error` lint found
   anything.
+- **The build a rules file reads.** Schema 64: `Request::Query { view, rules, targets }` and
+  `Edit::Rules { rules, targets }` carry `Targets`, and the daemon lowers the view as a check of
+  those targets lowers it (`targets_of` in `serve/job.rs`): the selected packages, features,
+  profile and target, and with `--tests` or `--all-targets` each test target's crate with
+  `cfg(test)` and its dev-dependencies. The CLI fills `targets` as it fills a check's, so
+  `--query` and `--rules` honour `-p`, `--workspace`, `--exclude`, `--features`,
+  `--all-features`, `--no-default-features`, `--release`, `--profile`, `--target` and the target
+  flags (`--lib`, `--bin`, `--tests`, `--all-targets` ...), and a query reads the client's
+  environment and Cargo arguments, as a check does, where before it read the daemon's.
+  `--timings` and `--unit-graph` report a build these run none of, and are refused by name.
+  `--replace` carries no selection (its edit is by meaning over the whole view) and still
+  refuses each selection flag by name. A request with an `Edit::Rules` and edits by meaning is
+  lowered as the rules' targets; edits by meaning alone, as the daemon's default check. The kept
+  front end is the checkout's, whatever its configuration: a job of another configuration
+  lowers into it and reads again what its plan changed, as a check after a test does; the
+  simulation's `a_query_with_tests_selected_reads_the_test_configuration_over_many_seeds` holds
+  a test-selected query to the test configuration after a default check, and two planted bugs
+  (a query lowered as the default check, a kept front end left at its old configuration) fail
+  it.
 - `(include "tools/astlog/rules-sema/lib/calls.astlog")` reads another rules file in place. The
   daemon's loader resolves it against the view, so an include is versioned with the tree and
   reads the same for every API client; the request still carries one rules text, and the CLI
@@ -293,19 +312,14 @@ reference model for a property test only.
   takes are matched only as text.
 - Edits inside a macro expansion that do not map to one input range are refused, not split.
 - Rules across checkouts: the target is the daemon's view of one workspace.
-- Build selection for a rules file. `--query`, `--rules` and `--replace` read the daemon's view
-  of the whole checkout and refuse `-p`, `--features`, `--target`, target selection and the
-  other selection flags by name. The end state is a query that carries `Targets`, as
-  `Request::Trace` does, so the view is the selected build's.
-- Queries and rewrites in test configuration. A rules file runs over the view's one cfg set
-  per crate, so code only a test build compiles (`#[cfg(test)]` items, `tests/` targets,
-  dev-dependencies) is matched as syntax but, where that cfg is off, has no types or
-  resolution, and a rename or a parameter change can miss its uses. The end state:
-  `Request::Query` and `Edit::Rules` carry `Targets`, as `Request::Trace` does. The daemon
-  lowers them to the units a build would compile, each with its cfg (`test` for a test target,
-  the features, the target) and its dev-dependencies, opens one view per distinct cfg, and
-  runs the rules over each. Rows are merged; the edits two views make must agree byte for
-  byte, and a disagreement is refused, naming both units.
+- One configuration per request. A rules file reads the build its `targets` select (see "The
+  build a rules file reads"); code only another configuration compiles (a `#[cfg(test)]` item
+  under a check without `--tests`, a feature left off, another target) is matched as syntax and
+  has no types or resolution there. Running the rules over several configurations in one
+  request, merging rows and refusing edits two configurations disagree on, is not built; run
+  the request once per selection.
+- `--replace` reads no selection: its edits by meaning run over the daemon's default check of
+  the view. Write the edit as a `--rules` rewrite to select the build.
 - Prelude resolution of single-segment names in code patterns; they match by text. Type
   patterns resolve them (see Type patterns).
 - A `use` added for a template path `find_path` can only spell through an import; it is written

@@ -711,7 +711,11 @@ mod tests {
             edits: Vec::new(),
         };
         assert!(named(&edit).is_empty());
-        let query = Request::Query { view: ViewRef::Head("/w".to_owned()), rules: String::new() };
+        let query = Request::Query {
+            view: ViewRef::Head("/w".to_owned()),
+            rules: String::new(),
+            targets: targets(),
+        };
         assert_eq!(named(&query), ["/w"], "a rules query reads its view's head");
         assert!(runs_user_code(&query), "it builds its view's proc macros first");
     }

@@ -74,6 +74,10 @@ thread_local! {
     /// lowered as it answers ([`Jobs::keep_queried`] does nothing), as before 2026-11-14, so
     /// every query of a root lowers it anew.
     pub(super) static PLANT_QUERY_DROPS_FRONT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of `serve::tests`' query-configuration control: a query is lowered as
+    /// the daemon's default check of its view, its build selection read by nothing
+    /// ([`targets_of`]), as before schema 64.
+    pub(super) static PLANT_QUERY_IGNORES_TARGETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The command line of each build a row of the history was made for ([`Job::ended`]), on
     /// the loop's thread: one a job's plane request, as a test counts them.
     pub(super) static ENDED_ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -1295,7 +1299,7 @@ fn command_of(work: &Work) -> Command {
         | Work::Snapshot
         | Work::Edit(_)
         | Work::Prove { .. }
-        | Work::Query(_)
+        | Work::Query { .. }
         | Work::Lock(_) => Command::Check,
         Work::Doc { .. } => Command::Doc,
     }
@@ -1317,7 +1321,7 @@ fn kind_of(work: &Work) -> JobKind {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
-        | Work::Query(_)
+        | Work::Query { .. }
         | Work::Doc { .. }
         | Work::Prove { .. }
         | Work::Lock(_) => JobKind::Check,
@@ -1336,7 +1340,7 @@ fn kind_of(work: &Work) -> JobKind {
 /// and a verify walk the plan, the tables count, the codegen inputs read the units' records).
 fn reads_front_unbuilt(work: &Work) -> bool {
     match work {
-        Work::Reach { .. } | Work::Edit(_) | Work::Query(_) | Work::Ahead { .. } | Work::Prove { .. } => true,
+        Work::Reach { .. } | Work::Edit(_) | Work::Query { .. } | Work::Ahead { .. } | Work::Prove { .. } => true,
         Work::Check(_)
         | Work::Build(_)
         | Work::Test { .. }
@@ -1366,7 +1370,7 @@ fn work_word(work: &Work) -> &'static str {
         Work::Tables => "tables",
         Work::Doc { .. } => "doc",
         Work::Edit(_) => "edit",
-        Work::Query(_) => "query",
+        Work::Query { .. } => "query",
         Work::Ahead { .. } => "ahead",
         Work::Lock(_) => "lock",
         Work::Prove { .. } => "prove",
@@ -1408,7 +1412,20 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Doc { targets, .. }
         | Work::Prove { targets, .. }
         | Work::Lock(targets) => Some(targets),
-        Work::Tables | Work::Snapshot | Work::Edit(_) | Work::Query(_) => None,
+        Work::Query { targets, .. } => {
+            #[cfg(test)]
+            if PLANT_QUERY_IGNORES_TARGETS.get() {
+                return None;
+            }
+            Some(targets)
+        }
+        // An edit request is lowered as its rules file's build selects; edits by meaning
+        // alone select none, and are lowered as the daemon's default check of the view.
+        Work::Edit(edits) => edits.iter().find_map(|edit| match edit {
+            blaze_api::Edit::Rules { targets, .. } => Some(targets),
+            _ => None,
+        }),
+        Work::Tables | Work::Snapshot => None,
     }
 }
 
@@ -7839,7 +7856,7 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
-        if !matches!(job.work, Work::Query(_)) || job.cancelled.load(Ordering::Acquire) {
+        if !matches!(job.work, Work::Query { .. }) || job.cancelled.load(Ordering::Acquire) {
             return;
         }
         let Some(request) = job.request else { return };
@@ -11276,7 +11293,7 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
         // clone: the task owns the edits, once per job
         Work::Edit(edits) => Does::Edit { front: lowered()?, edits: edits.clone() },
         // clone: the task owns the rules, once per job
-        Work::Query(rules) => Does::Query { front: lowered()?, rules: rules.clone() },
+        Work::Query { rules, .. } => Does::Query { front: lowered()?, rules: rules.clone() },
         // clone: the task owns the filter, once per job
         Work::Ahead { filter, .. } => Does::Ahead { front: lowered()?, filter: filter.clone() },
         Work::Doc { no_deps, private, .. } => {

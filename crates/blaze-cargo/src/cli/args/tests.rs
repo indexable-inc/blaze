@@ -17,11 +17,14 @@ fn refused(words: &[&str]) -> String {
     refusal(&parse(os(words)).unwrap_err(), false)
 }
 
+/// `--query` and `--rules` lower the view as a check of the selection does (`Request::Query`'s
+/// and `Edit::Rules`' `targets`), so they take every selection flag but those that report a
+/// build they don't run; `--replace`'s edit carries no selection and refuses each by name.
 #[test]
-fn query_rules_and_replace_refuse_each_build_selection_flag_by_name() {
+fn query_and_rules_honour_the_build_selection_and_replace_refuses_it_by_name() {
     let unhonored = |words: &[&str]| super::refused(&cargo(words));
-    let modes: [&[&str]; 3] = [&["--query", "q"], &["--rules", "r", "--dry-run"], &["--replace", "a::B=c::D"]];
-    let selections: [(&str, &[&str]); 14] = [
+    let rules_modes: [&[&str]; 3] = [&["--query", "q"], &["--rules", "r"], &["--rules", "r", "--dry-run"]];
+    let selections: [(&str, &[&str]); 13] = [
         ("--package", &["-p", "a"]),
         ("--workspace", &["--workspace"]),
         ("--exclude", &["--workspace", "--exclude", "a"]),
@@ -35,15 +38,26 @@ fn query_rules_and_replace_refuse_each_build_selection_flag_by_name() {
         ("--bin", &["--bin", "b"]),
         ("--tests", &["--tests"]),
         ("--all-targets", &["--all-targets"]),
-        ("--timings", &["--timings"]),
     ];
-    for mode in modes {
+    let reports: [(&str, &[&str]); 2] = [("--timings", &["--timings"]), ("--unit-graph", &["--unit-graph"])];
+    for mode in rules_modes {
         assert_eq!(unhonored(&[&["check"], mode].concat()), None, "{mode:?} alone");
-        for (flag, words) in selections {
+        for (_, words) in selections {
+            let line = [&["check"], mode, words].concat();
+            assert_eq!(unhonored(&line), None, "{line:?} is honoured");
+        }
+        for (flag, words) in reports {
             let line = [&["check"], mode, words].concat();
             let said = unhonored(&line).unwrap_or_else(|| panic!("{line:?} is accepted"));
-            assert!(said.contains(&format!("`{flag}`")), "{line:?}: {said}");
+            assert!(said.contains(&format!("`{flag}`")) && said.contains("runs no build"), "{line:?}: {said}");
         }
+    }
+    let replace: &[&str] = &["--replace", "a::B=c::D"];
+    assert_eq!(unhonored(&[&["check"], replace].concat()), None, "`--replace` alone");
+    for (flag, words) in selections.iter().chain(&reports) {
+        let line = [&["check"], replace, words].concat();
+        let said = unhonored(&line).unwrap_or_else(|| panic!("{line:?} is accepted"));
+        assert!(said.contains(&format!("`{flag}`")) && said.contains("`--replace`"), "{line:?}: {said}");
     }
     // What the client reads to show the answer stays allowed.
     assert_eq!(unhonored(&["check", "--query", "q", "--message-format", "json", "-v"]), None);

@@ -225,6 +225,48 @@ fn a_build_ahead_compiles_tests_and_an_edit_only_checks() {
     assert!(reuses_plans(&edit) && reuses_plans(&ahead));
 }
 
+/// A query and an edit with a rules file are lowered as the build their selection names, as a
+/// check of it is: the job's config is the request's, never the daemon's default.
+#[test]
+fn a_query_and_a_rules_edit_are_lowered_as_their_selection_builds() {
+    let query = Work::Query { rules: String::new(), targets: targets() };
+    assert_eq!(targets_of(&query), Some(&targets()));
+    assert_eq!((command_of(&query), kind_of(&query)), (Command::Check, JobKind::Check));
+    let rename = blaze_api::Edit::Rename {
+        to: "b".to_owned(),
+        item: blaze_api::Target { file: "src/lib.rs".to_owned(), item: "a".to_owned() },
+    };
+    let rules = blaze_api::Edit::Rules { rules: String::new(), targets: targets() };
+    let edit = Work::Edit(vec![rename, rules]);
+    assert_eq!(targets_of(&edit), Some(&targets()));
+
+    // With the client's Cargo, a query reads the client's environment and arguments, as its
+    // check does, never the daemon's.
+    let mut client = targets();
+    client.cargo = Some(blaze_api::Cargo {
+        command: "check".into(),
+        args: vec!["--tests".into()],
+        root: "/w".into(),
+        cwd: "/w/a".into(),
+        env: vec![("RUSTFLAGS".into(), "--cfg=x".into())],
+        files: Vec::new(),
+        color: false,
+        width: None,
+        verbose: 0,
+        refused: None,
+        prebuilt: true,
+    });
+    let daemons = vec![("RUSTFLAGS".to_owned(), "--cfg=daemon".to_owned())];
+    let query = Work::Query { rules: String::new(), targets: client.clone() };
+    let check = Work::Check(client);
+    let (asked, checked) = (
+        invocation(&query, targets_of(&query), "/w", &daemons),
+        invocation(&check, targets_of(&check), "/w", &daemons),
+    );
+    assert_eq!(asked.env, vec![("RUSTFLAGS".to_owned(), "--cfg=x".to_owned())]);
+    assert_eq!((asked.args, asked.cwd, asked.env), (checked.args, checked.cwd, checked.env));
+}
+
 #[test]
 fn a_fetchs_key_is_its_source() {
     let fetch = |at: &str, sha: &str| Fetch {

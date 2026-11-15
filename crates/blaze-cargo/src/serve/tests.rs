@@ -133,6 +133,13 @@ thread_local! {
     /// The planted bug of the stale-front-end control: a lowering into the root's kept front end
     /// leaves it at the view it was kept at, as a refresh that read nothing again would.
     static STALE_INTO_KEPT: Cell<bool> = const { Cell::new(false) };
+    /// Each query's build config as its front end held it ([`FakeInputs::args`]), in order:
+    /// the configuration its answer was read in.
+    static QUERIED_ARGS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+    /// The planted bug of the stale-configuration control: a lowering into the root's kept
+    /// front end leaves it in the configuration it was kept in, as a refresh that moved it to
+    /// the job's view but not to the job's units would.
+    static STALE_CONFIG_INTO_KEPT: Cell<bool> = const { Cell::new(false) };
     /// How many kept front ends were stored ([`Steps::store_kept`]).
     static STORES: Cell<usize> = const { Cell::new(0) };
     /// How many kept front ends' members were stored, the second store of one
@@ -865,6 +872,11 @@ impl Steps for Fake {
                 if !STALE_INTO_KEPT.get() {
                     inputs.view = Some(job.root);
                 }
+                // And to the job's configuration: the units of its plan, each crate with its
+                // cfg, which a check and a test build of one checkout plan differently.
+                if !STALE_CONFIG_INTO_KEPT.get() {
+                    inputs.args.clone_from(&job.config.invocation.args);
+                }
                 inputs
             }
             None => {
@@ -892,7 +904,8 @@ impl Steps for Fake {
                 // The home's look reads the machine's layer live (`Store::read_live`): a
                 // sealed crate's record another home put there is found through it.
                 SEALED_FOUND.set(holds(&sealed_key(), SEALED_RECORD));
-                FakeInputs { checkout, view: Some(job.root), ..FakeInputs::default() }
+                let args = job.config.invocation.args.clone(); // clone: a test's record
+                FakeInputs { checkout, view: Some(job.root), args, ..FakeInputs::default() }
             }
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
@@ -1029,6 +1042,9 @@ pub(super) struct FakeInputs {
     checkout: String,
     /// The view it was lowered at or last moved to: what a query of it reads.
     view: Option<ContentId>,
+    /// The arguments of the build config it was lowered in or last moved to: the
+    /// configuration a query of it reads (`#[cfg(test)]` code with `--tests`).
+    args: Vec<String>,
 }
 
 /// The fakes' front end has no database: their images store no library trees.
@@ -1891,6 +1907,7 @@ impl Front<Fake> for FakeFront {
         if let Some(view) = read.view {
             QUERIED_AT.with_borrow_mut(|it| it.push(view));
         }
+        QUERIED_ARGS.with_borrow_mut(|it| it.push(read.args.clone())); // clone: a test's record
         Ok(blaze_api::query::Rows { findings: Vec::new(), relations: Vec::new() })
     }
 
@@ -5751,7 +5768,7 @@ fn query_applies(seed: u64) -> (usize, usize, Result<Vec<Vec<usize>>, String>) {
     let mut client = dial(&mut daemon);
     let id = client.send(
         &mut daemon,
-        Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() },
+        Request::Query { view: ViewRef::Head("/w".into()), rules: String::new(), targets: agent() },
     );
     let got = client.wait(&mut daemon, id);
     let stall = got.iter().find_map(|it| match it {
@@ -5811,7 +5828,7 @@ fn a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds()
 /// A query of the head `/w`, its responses; it ended ok.
 fn query_ok(client: &mut Client, daemon: &mut SimDaemon) -> Vec<Response> {
     let id = client
-        .send(daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() });
+        .send(daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new(), targets: agent() });
     let got = client.wait(daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     got
@@ -5930,6 +5947,101 @@ fn the_oracle_catches_a_stale_front_end_handed_back() {
     assert_eq!(queried[1], lowered[0], "the planted bug read the first query's view");
 }
 
+/// A query's build selection as a client sends it: `--tests`, with its command line.
+fn tests_selected() -> Targets {
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: command_env(),
+        args: vec!["--tests".into()],
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: "check".into(),
+        refused: None,
+        verbose: 0,
+        prebuilt: true,
+    };
+    Targets { cargo: Some(cargo), ..agent() }
+}
+
+/// The plants of [`check_then_test_queries`]' controls.
+#[derive(Clone, Copy)]
+enum ConfigPlant {
+    None,
+    /// `job::PLANT_QUERY_IGNORES_TARGETS`: the daemon lowers a query as its default check.
+    IgnoresTargets,
+    /// [`STALE_CONFIG_INTO_KEPT`]: a lowering into the kept front end keeps its config.
+    StaleConfig,
+}
+
+/// A check, two queries with tests selected, and a check, of one unchanged checkout under
+/// `seed`: the configuration each query's answer was read in, and the two queries' lowerings
+/// together, as (anew, into the kept front end).
+fn check_then_test_queries(seed: u64, plant: ConfigPlant) -> (Vec<Vec<String>>, (usize, usize)) {
+    super::job::PLANT_QUERY_IGNORES_TARGETS.set(matches!(plant, ConfigPlant::IgnoresTargets));
+    STALE_CONFIG_INTO_KEPT.set(matches!(plant, ConfigPlant::StaleConfig));
+    QUERIED_ARGS.with(|it| it.borrow_mut().clear());
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    check_ok(&mut client, &mut daemon);
+    let before = lowerings_now();
+    for _ in 0..2 {
+        let query = Request::Query {
+            view: ViewRef::Head("/w".into()),
+            rules: String::new(),
+            targets: tests_selected(),
+        };
+        let id = client.send(&mut daemon, query);
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+    }
+    let queries = lowerings_since(before);
+    check_ok(&mut client, &mut daemon);
+    settle(&mut daemon, &mut client);
+    super::job::PLANT_QUERY_IGNORES_TARGETS.set(false);
+    STALE_CONFIG_INTO_KEPT.set(false);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    (QUERIED_ARGS.with(|it| it.take()), queries)
+}
+
+/// The invariant: a query with tests selected reads the view as a test build compiles it,
+/// never as the check before it did, though it lowers into that check's kept front end (one
+/// front end a checkout, `Roots::fronts`): the lowering moves the front end to the query's
+/// configuration as it moves it to the query's view, and the second query reuses it. The
+/// controls: [`the_oracle_catches_a_query_lowered_as_the_default_check`] and
+/// [`the_oracle_catches_a_kept_front_end_of_another_configuration`].
+#[test]
+fn a_query_with_tests_selected_reads_the_test_configuration_over_many_seeds() {
+    for seed in 0..16 {
+        let (queried, lowerings) = check_then_test_queries(seed, ConfigPlant::None);
+        let tests = vec!["--tests".to_owned()];
+        assert_eq!(queried, vec![tests.clone(), tests], "seed {seed}: each query read the test configuration");
+        assert_eq!(lowerings, (0, 2), "seed {seed}: both queries lower into the kept front end");
+    }
+}
+
+/// A control of [`a_query_with_tests_selected_reads_the_test_configuration_over_many_seeds`]:
+/// a daemon that lowers a query as its default check (`job::PLANT_QUERY_IGNORES_TARGETS`, the
+/// code before schema 64) answers in the check's configuration, which the oracle sees.
+#[test]
+fn the_oracle_catches_a_query_lowered_as_the_default_check() {
+    let (queried, _) = check_then_test_queries(4, ConfigPlant::IgnoresTargets);
+    assert_eq!(queried, vec![Vec::<String>::new(), Vec::new()], "the planted bug's configuration went unseen");
+}
+
+/// A control of [`a_query_with_tests_selected_reads_the_test_configuration_over_many_seeds`]:
+/// a lowering into the kept front end that leaves it in the check's configuration
+/// ([`STALE_CONFIG_INTO_KEPT`]) answers the query stale, which the oracle sees.
+#[test]
+fn the_oracle_catches_a_kept_front_end_of_another_configuration() {
+    let (queried, _) = check_then_test_queries(4, ConfigPlant::StaleConfig);
+    assert_eq!(queried, vec![Vec::<String>::new(), Vec::new()], "the planted stale configuration went unseen");
+}
+
 /// A check, a check, a query and a check of one unchanged checkout under `seed`, the
 /// planted bug set or not: the query's lowerings and the last check's.
 fn check_query_check(seed: u64, plant: bool) -> ((usize, usize), (usize, usize)) {
@@ -6027,7 +6139,7 @@ fn two_applying_queries_planted(seed: u64) -> Result<((usize, usize), Vec<Vec<us
     for at in 0..2 {
         let before = lowerings_now();
         let id = client
-            .send(&mut daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() });
+            .send(&mut daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new(), targets: agent() });
         let got = client.wait(&mut daemon, id);
         if let Some(stall) = stalled(&got) {
             return Err(format!("query {at}: {stall}"));

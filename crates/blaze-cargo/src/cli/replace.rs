@@ -75,12 +75,12 @@ pub fn replace(root: &Path, edits: Vec<Edit>, dry: bool) -> Result<Made, String>
     Ok(Made { edited, diff: None })
 }
 
-/// `rules` run over the checkout at `root` as saved: the relations they derive and the lints'
-/// findings. Nothing is committed or written.
-pub fn query(root: &Path, rules: String) -> Result<Rows, String> {
+/// `rules` run over the checkout at `root` as saved, lowered as a check of `targets` lowers
+/// it: the relations they derive and the lints' findings. Nothing is committed or written.
+pub fn query(root: &Path, rules: String, targets: blaze_api::Targets) -> Result<Rows, String> {
     let head = place::utf8(root)?;
     let mut rows = None;
-    let asked = Request::Query { view: ViewRef::Head(head), rules };
+    let asked = Request::Query { view: ViewRef::Head(head), rules, targets };
     observe::ask(asked, Start::IfMissing, |response| {
         if let ResponseRef::Rows(it) = response {
             rows = Some(it);

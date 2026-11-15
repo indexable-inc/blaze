@@ -25,7 +25,7 @@ use crate::serve::work::Failed;
 pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edited, Failed> {
     macros_built(job, reader, "edit")?;
     let mut rules = edits.iter().filter_map(|it| match it {
-        Edit::Rules { rules } => Some(rules.as_str()),
+        Edit::Rules { rules, .. } => Some(rules.as_str()),
         _ => None,
     });
     let (first, second) = (rules.next(), rules.next());

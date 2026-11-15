@@ -140,7 +140,9 @@ use serde::{Deserialize, Serialize};
 /// [`Response::Rows`] ([`query::Rows`]): its relations and findings, as data, nothing written.
 /// 63: [`Edit::Params`] ([`Param`]): a fn's parameters added, removed or reordered, with every
 /// call.
-pub const SCHEMA: u32 = 63;
+/// 64: [`Request::Query`] and [`Edit::Rules`] carry [`Targets`], the build the view is lowered
+/// as, as a check of them lowers it.
+pub const SCHEMA: u32 = 64;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -551,9 +553,15 @@ pub enum Request {
     /// it derives and every lint's finding, answered with one [`Response::Rows`]
     /// (docs/v2/plan/design/astlog-sema.md). Builds only the view's proc macros and build
     /// scripts' runs, applied before the rules read it, as [`Request::Edit`] does.
+    ///
+    /// `targets` is the build the view is lowered as, as a check of them lowers it: with tests
+    /// selected (`--tests`, `--all-targets`) the rules see `#[cfg(test)]` items, `#[test]` fns
+    /// and dev-dependencies, and with `targets.cargo` the build scripts run in the client's
+    /// environment, so a query and a check from one shell share their runs.
     Query {
         view: ViewRef,
         rules: String,
+        targets: Targets,
     },
     /// What a client recorded of build `build` (its [`Worked::build_id`]), sent as the request
     /// that asked for it ends: its own `spans`, `events` and `folded` rows, each an Arrow IPC
@@ -2446,28 +2454,48 @@ mod tests {
             want.extend_from_slice(key.as_bytes());
         };
 
-        let request =
-            Request::Query { view: ViewRef::Head("/w".to_owned()), rules: "(r)".to_owned() };
+        let targets = Targets {
+            goal: None,
+            cargo: None,
+            target: None,
+            profile: "dev".to_owned(),
+            features: Vec::new(),
+            packages: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+        };
+        // The selection is written as every request's `targets` is, after the shorter keys.
+        let targets_bytes = blaze_protocol::cbor::to_vec(&targets).unwrap();
+
+        let request = Request::Query {
+            view: ViewRef::Head("/w".to_owned()),
+            rules: "(r)".to_owned(),
+            targets: targets.clone(),
+        };
         let bytes = blaze_protocol::cbor::to_vec(&request).unwrap();
         let mut want = vec![0xa1];
         key(&mut want, "Query");
-        want.push(0xa2);
+        want.push(0xa3);
         key(&mut want, "view");
         want.push(0xa1);
         key(&mut want, "Head");
         key(&mut want, "/w");
         key(&mut want, "rules");
         key(&mut want, "(r)");
+        key(&mut want, "targets");
+        want.extend_from_slice(&targets_bytes);
         assert_eq!(bytes, want, "{bytes:02x?}");
         assert_eq!(blaze_protocol::cbor::from_slice::<Request>(&bytes).unwrap(), request);
 
-        let edit = Edit::Rules { rules: "(r)".to_owned() };
+        let edit = Edit::Rules { rules: "(r)".to_owned(), targets };
         let bytes = blaze_protocol::cbor::to_vec(&edit).unwrap();
         let mut want = vec![0xa1];
         key(&mut want, "Rules");
-        want.push(0xa1);
+        want.push(0xa2);
         key(&mut want, "rules");
         key(&mut want, "(r)");
+        key(&mut want, "targets");
+        want.extend_from_slice(&targets_bytes);
         assert_eq!(bytes, want, "{bytes:02x?}");
         assert_eq!(blaze_protocol::cbor::from_slice::<Edit>(&bytes).unwrap(), edit);
 

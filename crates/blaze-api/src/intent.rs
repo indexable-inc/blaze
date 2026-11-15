@@ -85,8 +85,12 @@ pub enum Edit {
     /// request's other edits. Its text edits are placed at the code they match, a macro's
     /// expansion at its input; overlapping ones of two rules, a match a macro made, and a file
     /// left unparsable fail the request, naming the rules and the place. One per request.
+    ///
+    /// `targets` is the build the view is lowered as, for the whole request
+    /// ([`crate::Request::Query`]'s): the rewrites read the view as that build compiles it.
     Rules {
         rules: String,
+        targets: crate::Targets,
     },
     /// The fn's parameters become `params`, `self` kept first, and every call the front end
     /// resolves to it in the crates that can name it passes the arguments that list says: a

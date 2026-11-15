@@ -703,7 +703,9 @@ impl Session {
                 self.build(cx, req, &view, Work::Prove { targets, emit, subset, lean })?
             }
             Request::Tables { view } => self.build(cx, req, &view, Work::Tables)?,
-            Request::Query { view, rules } => self.build(cx, req, &view, Work::Query(rules))?,
+            Request::Query { view, rules, targets } => {
+                self.build(cx, req, &view, Work::Query { rules, targets })?
+            }
             Request::Doc { view, targets, no_deps, private } => {
                 self.build(cx, req, &view, Work::Doc { targets, no_deps, private })?
             }
@@ -1272,7 +1274,7 @@ fn incremental(work: &Work) -> bool {
         | Work::Snapshot
         | Work::Tables
         | Work::Edit(_)
-        | Work::Query(_)
+        | Work::Query { .. }
         | Work::Ahead { .. }
         | Work::Prove { .. }
         | Work::Lock(_) => false,

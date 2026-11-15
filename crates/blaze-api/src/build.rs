@@ -86,8 +86,9 @@ pub enum Work {
     Edit(Vec<Edit>),
     /// An astlog rules file run over the view's front end (`blaze_astlog::query`), reported as
     /// [`crate::Response::Rows`] before an `ok` finish; writes nothing. Builds only the view's
-    /// proc macros and build scripts' runs, applied before the rules read it.
-    Query(String),
+    /// proc macros and build scripts' runs, applied before the rules read it. The view is
+    /// lowered as a check of `targets` lowers it.
+    Query { rules: String, targets: Targets },
     /// Built ahead for [`crate::Request::WillTest`]: the test units holding a test `filter`
     /// selects, and the functions those tests reached when they last ran first
     /// (`blaze_intent::ahead::plan`), chosen once the view's proc macros and build scripts'

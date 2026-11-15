@@ -371,7 +371,7 @@ impl Gen {
                 subset: self.yes(),
                 targets: self.targets(),
             },
-            Query { view: self.view(0), rules: self.text() },
+            Query { view: self.view(0), rules: self.text(), targets: self.targets() },
         })
     }
 
@@ -390,7 +390,7 @@ impl Gen {
             RemoveItem { item: self.target() },
             AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
             Rename { to: self.text(), item: self.target() },
-            Rules { rules: self.text() },
+            Rules { rules: self.text(), targets: self.targets() },
             Params {
                 item: self.target(),
                 params: (0..self.below(3))
