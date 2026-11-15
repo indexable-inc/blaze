@@ -1895,7 +1895,7 @@ impl Front<Fake> for FakeFront {
         _: &[blaze_api::Edit],
     ) -> Result<blaze_api::Edited, Failed> {
         EDITED.with_borrow_mut(|it| it.push(read.runs.clone()));
-        Ok(blaze_api::Edited { ops: Vec::new(), items: Vec::new() })
+        Ok(blaze_api::Edited { ops: Vec::new(), items: Vec::new(), compiled_out: Vec::new() })
     }
 
     fn query(

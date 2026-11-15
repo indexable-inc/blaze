@@ -1353,7 +1353,7 @@ fn body_edited() -> Edited {
         file: "src/lib.rs".to_owned(),
         path: "a".to_owned(),
     };
-    Edited { ops: vec![op], items: vec![item] }
+    Edited { ops: vec![op], items: vec![item], compiled_out: Vec::new() }
 }
 
 fn edit_request(base: ContentId) -> Request {

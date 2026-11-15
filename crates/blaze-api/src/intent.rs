@@ -116,12 +116,27 @@ pub enum Param {
     Added { param: String, default: String },
 }
 
-/// What an edit request did: the ops it commits, and each item they touched.
+/// What an edit request did: the ops it commits, each item they touched, and each rewrite
+/// match it left as written because the build it was lowered as compiles that code out.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Edited {
     pub ops: Vec<Op>,
     /// Sorted by file, path, then how.
     pub items: Vec<EditedItem>,
+    /// Sorted by file, line, then rule.
+    pub compiled_out: Vec<CompiledOut>,
+}
+
+/// A rewrite's match under an item, variant or field whose `#[cfg]` is off in the build the
+/// request was lowered as ([`Edit::Rules`]' `targets`): not rewritten, as a rule that asks for
+/// compiled-out code (a positive `(cfg-off n)`) would have it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct CompiledOut {
+    pub file: String,
+    /// 1-based.
+    pub line: u32,
+    /// The rewrite's name and its rules line, `name (file:line)`.
+    pub rule: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

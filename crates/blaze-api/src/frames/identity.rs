@@ -14,7 +14,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{decode, encode, encode_into};
 use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
-    CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
+    CompiledOut, CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
     FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
     NodeKind, NotKept, OpenFailure, Param, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
@@ -413,6 +413,7 @@ impl Gen {
                 file: g.text(),
                 path: g.text(),
             }),
+            compiled_out: self.many(depth, |g| CompiledOut { file: g.text(), line: g.u32(), rule: g.text() }),
         }
     }
 

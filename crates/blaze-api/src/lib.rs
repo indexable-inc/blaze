@@ -63,7 +63,7 @@ pub use borrowed::{
 };
 pub use diagnostics::{Base, Found, Seen};
 pub use goal::{Goal, Tiers};
-pub use intent::{Edit, Edited, EditedItem, How, Param, Target};
+pub use intent::{CompiledOut, Edit, Edited, EditedItem, How, Param, Target};
 
 use blaze_core::Conn;
 use blaze_ids::{ContentId, Fingerprint};
@@ -142,7 +142,9 @@ use serde::{Deserialize, Serialize};
 /// call.
 /// 64: [`Request::Query`] and [`Edit::Rules`] carry [`Targets`], the build the view is lowered
 /// as, as a check of them lowers it.
-pub const SCHEMA: u32 = 64;
+/// 65: [`Edited::compiled_out`] ([`CompiledOut`]): each rewrite match left as written because
+/// the build the request was lowered as compiles it out.
+pub const SCHEMA: u32 = 65;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.

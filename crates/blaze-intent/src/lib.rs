@@ -428,7 +428,9 @@ impl<F: Files> Edits<'_, F> {
                 parse: file.parse,
             })
             .collect();
-        Applied { edited: Edited { ops, items }, reparsed }
+        // Edits by meaning reach a def the front end has, which is never compiled out; a rules
+        // file's text edits add theirs (`blaze_astlog::edit`).
+        Applied { edited: Edited { ops, items, compiled_out: Vec::new() }, reparsed }
     }
 }
 

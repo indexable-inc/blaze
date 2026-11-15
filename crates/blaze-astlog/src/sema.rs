@@ -909,29 +909,43 @@ impl<'a, F: Files> Sema<'a, F> {
                     && it.child_token(SyntaxKind::UNSAFE_KW).is_some()
             }),
             Filter::InTest => self.ancestors_out(node).into_iter().any(Self::test_item),
-            Filter::CfgOff => {
-                for it in self.ancestors_out(node) {
-                    if !Self::has_attribute(it, "cfg") {
-                        continue;
-                    }
-                    match self.declaration(it) {
-                        Some(None) => return Ok(true),
-                        Some(Some(_)) => {}
-                        // A cfg the front end lowers to no def it could miss: say so.
-                        None => {
-                            let attr = it
-                                .children()
-                                .find(|it| it.kind() == SyntaxKind::ATTR)
-                                .map_or("#[cfg]", |it| it.text());
-                            return CfgUnreadSnafu { line, place: self.place(it), attr, kind: format!("{:?}", it.kind()) }
-                                .fail()
-                                .map_err(Error::from);
-                        }
-                    }
-                }
-                false
-            }
+            // A cfg the front end lowers to no def it could miss: say so.
+            Filter::CfgOff => self.cfg_off_by(node, |it| {
+                let attr = it.children().find(|it| it.kind() == SyntaxKind::ATTR).map_or("#[cfg]", |it| it.text());
+                CfgUnreadSnafu { line, place: self.place(it), attr, kind: format!("{:?}", it.kind()) }
+                    .fail()
+                    .map_err(Error::from)
+            })?,
         })
+    }
+
+    /// Whether `node` is under an item, variant or field (itself included) whose `#[cfg]` the
+    /// build the view was lowered as turns off. Each `#[cfg]` on a node that declares no def
+    /// (a statement, an expression) goes to `unread` first: the front end keeps no def there
+    /// to say whether it is on.
+    fn cfg_off_by<E>(
+        &self,
+        node: ast::Node<'a>,
+        mut unread: impl FnMut(ast::Node<'a>) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        for it in self.ancestors_out(node) {
+            if !Self::has_attribute(it, "cfg") {
+                continue;
+            }
+            match self.declaration(it) {
+                Some(None) => return Ok(true),
+                Some(Some(_)) => {}
+                None => unread(it)?,
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`Self::cfg_off_by`] for a rewrite's match: a `#[cfg]` on a node that declares no def
+    /// is passed over, and the match under it is edited as syntax.
+    pub fn compiled_out(&self, node: ast::Node<'a>) -> bool {
+        let Ok(off) = self.cfg_off_by(node, |_| Ok::<(), std::convert::Infallible>(()));
+        off
     }
 
     /// `path:line` of a syntax node, the path saying when the tree is a macro's expansion.

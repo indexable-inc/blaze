@@ -14,9 +14,11 @@ use std::alloc::{Allocator, Global};
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use astlog_engine::{Base, Facts as _, Includes, Line, PlannedAction, Segment, Severity, TextKind, Value, row_binding};
+use astlog_engine::{
+    Base, BodyAtom, Facts as _, Includes, Line, PlannedAction, Segment, Severity, SourceAtom, TextKind, Value, row_binding,
+};
 use base_db::Db;
-use blaze_api::{Edit, Param};
+use blaze_api::{CompiledOut, Edit, Param};
 use blaze_api::query::{self as api, Cell, Finding, Relation, Rows};
 use blaze_hash::HashMap;
 use blaze_intent::{Applied, Files, TextEdit};
@@ -27,7 +29,7 @@ use syntax::{
 };
 
 use crate::error::{Error, OverlapSnafu, SourceError, UnplaceableSnafu, ViewTextSnafu};
-use crate::program::{Action, Program};
+use crate::program::{Action, Atom, Filter, Program};
 use crate::sema::{Node, Sema};
 use crate::splice::{self, Parens};
 
@@ -163,27 +165,77 @@ pub(crate) fn edit_with<F: Files>(
         let mut text = Vec::new(); // alloc: the text edits of one request
         let mut more: Vec<Edit> = edits.to_vec();
         let mut moved = imports::Moved::default();
-        for planned in planned {
+        for planned in &planned {
             let by = Origin { rule: planned.rule, line: planned.line };
-            match planned.action {
+            if left_out(&facts, &program, planned)?.is_some() {
+                continue;
+            }
+            match &planned.action {
                 PlannedAction::Text { kind, node, template, binding, .. } => {
                     let paths = literal.get(planned.rule).map_or(&[][..], Vec::as_slice);
-                    let written = Written { template, binding: &binding, parens };
-                    let edit = text_edit(&facts, by, kind, node, written, paths)?;
+                    let written = Written { template: *template, binding, parens };
+                    let edit = text_edit(&facts, by, *kind, *node, written, paths)?;
                     text.push(Made { edit, by });
                 }
                 PlannedAction::Source { value, args, .. } => {
                     let out = Out { text: &mut text, edits: &mut more, moved: &mut moved };
-                    source_edit(&facts, by, *value, &args, out)?;
+                    source_edit(&facts, by, **value, args, out)?;
                 }
             }
         }
         imports::finish(&facts, moved, &mut text, &mut more)?;
         let text = without_overlap(files, text)?;
-        blaze_intent::apply_with_text(db, files, &more, &text).map_err(|error| {
-            SourceError::Edit { what: error.what.clone(), at: error.at.clone() }.into()
-        })
+        let mut applied = blaze_intent::apply_with_text(db, files, &more, &text).map_err(|error| {
+            Error::from(SourceError::Edit { what: error.what.clone(), at: error.at.clone() })
+        })?;
+        // The matches the loop left, named in the answer: never edited unseen nor dropped unseen.
+        let compiled_out = &mut applied.edited.compiled_out;
+        for planned in &planned {
+            compiled_out.extend(left_out(&facts, &program, planned)?);
+        }
+        compiled_out.sort_by(|a, b| (&a.file, a.line, &a.rule).cmp(&(&b.file, b.line, &b.rule)));
+        compiled_out.dedup();
+        Ok(applied)
     })
+}
+
+/// A text action's match the build compiles out that its rule did not ask for
+/// ([`asks_compiled_out`]): left as written, and named in the answer.
+fn left_out<F: Files>(
+    facts: &Sema<'_, F>,
+    program: &Program,
+    planned: &astlog_engine::Planned<'_, Node, Action>,
+) -> Res<Option<CompiledOut>> {
+    let PlannedAction::Text { node, .. } = planned.action else { return Ok(None) };
+    if asks_compiled_out(program, planned.rule) {
+        return Ok(None);
+    }
+    left_compiled_out(facts, Origin { rule: planned.rule, line: planned.line }, node)
+}
+
+/// Whether rewrite `rule` asks for code the build compiles out, by a positive `(cfg-off n)` in
+/// its body: its matches there are edited as syntax, as it asked.
+fn asks_compiled_out(program: &Program, rule: &str) -> bool {
+    let asks = |atom: &BodyAtom<Atom>| {
+        matches!(atom, BodyAtom::Source(SourceAtom { value: Atom::Filter(Filter::CfgOff), .. }))
+    };
+    program.rewrites.iter().filter(|it| it.name == rule).any(|it| it.body.iter().any(asks))
+}
+
+/// A text action's match under an item, variant or field the build compiles out
+/// ([`Sema::compiled_out`]), as the answer names it; `None` for one it compiles, and for a value
+/// that is no code, which [`text_edit`] refuses.
+fn left_compiled_out<F: Files>(facts: &Sema<'_, F>, by: Origin<'_>, node: Node) -> Res<Option<CompiledOut>> {
+    let Some(view) = facts.view_of(node) else { return Ok(None) };
+    if !facts.compiled_out(view) {
+        return Ok(None);
+    }
+    // An item the build compiles out is expanded by no macro, so its code is the file's own.
+    let (path, range) = locate(facts, view).map_err(|call| unplaceable(by, call, "compiled-out code in a macro's expansion"))?;
+    let Some(line) = line_of(facts.files, &path, range.start()) else {
+        return Err(unplaceable(by, path, "the view has no line for this compiled-out match"));
+    };
+    Ok(Some(CompiledOut { file: path, line, rule: by.by() }))
 }
 
 #[derive(Clone, Copy)]

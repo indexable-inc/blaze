@@ -1049,10 +1049,17 @@ fn the_status_line_counts_a_modules_scope_apart_from_the_items_edited() {
     use blaze_api::{Edited, EditedItem, How};
     let item = |path: &str, how: How| EditedItem { how, key: None, file: "src/lib.rs".to_owned(), path: path.to_owned() };
     let renamed = ["a", "b", "c"].map(|it| item(it, How::Renamed));
-    let mut edited = Edited { ops: Vec::new(), items: renamed.to_vec() };
+    let mut edited = Edited { ops: Vec::new(), items: renamed.to_vec(), compiled_out: Vec::new() };
     assert_eq!(Count(&edited).to_string(), "3 item(s)");
     edited.items.insert(0, item("", How::Scope));
     assert_eq!(Count(&edited).to_string(), "3 item(s) and 1 module scope(s)");
+    // A match the build compiles out is no item, and is counted apart, never dropped.
+    let left = blaze_api::CompiledOut { file: "src/lib.rs".to_owned(), line: 4, rule: "zero (r.astlog:2)".to_owned() };
+    edited.compiled_out = vec![left.clone(), left];
+    assert_eq!(
+        Count(&edited).to_string(),
+        "3 item(s) and 1 module scope(s), 2 compiled-out match(es) left as written"
+    );
 }
 
 /// `-v` and `-q` are honoured beside `--query`, `--rules` and `--replace`, never refused: `-v`
@@ -1077,7 +1084,7 @@ fn verbose_and_quiet_are_honoured_by_the_rules_modes_and_quiet_drops_the_status_
         file: "src/lib.rs".to_owned(),
         path: "a".to_owned(),
     };
-    let edited = blaze_api::Edited { ops: Vec::new(), items: vec![item] };
+    let edited = blaze_api::Edited { ops: Vec::new(), items: vec![item], compiled_out: Vec::new() };
     let made = replace::Made { edited: edited.clone(), diff: None };
     let said = Status::of(&made, false).map(|it| (it.verb(), it.to_string()));
     assert_eq!(said, Some(("Replaced", "1 item(s) in 1 file(s): src/lib.rs".to_owned())));

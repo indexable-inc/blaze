@@ -94,6 +94,38 @@ fn a_match_the_macro_made_is_refused_at_the_macro_call_unless_excluded() {
     assert!(after(&files, &applied.edited.ops)[0].1.contains("make!()"));
 }
 
+/// A match under an item the build compiles out is left as written and named in the answer,
+/// never edited unseen nor dropped unseen; a rule that asks for such code with a positive
+/// `(cfg-off n)` edits it.
+#[test]
+fn a_match_in_compiled_out_code_is_named_and_left_unless_the_rule_asks_for_it() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub fn kept() { let _ = 1 + 2; }\n\
+                   #[cfg(any())]\n\
+                   pub fn gone() { let _ = 3 + 4; }\n\
+                   pub fn stmt() { #[cfg(any())] let _ = 5 + 6; }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = "\n(rewrite zero (syntax e \"BIN_EXPR\") (replace e \"0\"))\n";
+    let applied = edit(&db, &files, rules, &[]).unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains("pub fn kept() { let _ = 0; }"), "{text}");
+    assert!(text.contains("pub fn gone() { let _ = 3 + 4; }"), "compiled-out code is left: {text}");
+    // A statement's cfg has no def to read: its code is edited as syntax (the documented limit).
+    assert!(text.contains("#[cfg(any())] let _ = 0;"), "{text}");
+    let left = blaze_api::CompiledOut { file: "lib.rs".to_owned(), line: 3, rule: "zero (rules:2)".to_owned() };
+    assert_eq!(applied.edited.compiled_out, [left]);
+
+    // Without the statement's cfg, which `cfg-off` refuses to guess.
+    let fixture = fixture.lines().filter(|it| !it.starts_with("pub fn stmt")).collect::<Vec<_>>().join("\n");
+    let (db, files) = view(&fixture, 0, &["lib.rs"]);
+    let asks = "\n(rewrite off (syntax e \"BIN_EXPR\") (cfg-off e) (replace e \"0\"))\n";
+    let applied = edit(&db, &files, asks, &[]).unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains("pub fn gone() { let _ = 0; }"), "{text}");
+    assert!(text.contains("pub fn kept() { let _ = 1 + 2; }"), "{text}");
+    assert_eq!(applied.edited.compiled_out, []);
+}
+
 #[test]
 fn two_rules_editing_overlapping_text_are_refused_naming_both_and_the_place() {
     let (db, files) = view(LIB, 0, &["lib.rs"]);

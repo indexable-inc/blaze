@@ -135,6 +135,16 @@ And one over the type behind any references, by the names the std prelude gives:
   a test-selected query to the test configuration after a default check, and two planted bugs
   (a query lowered as the default check, a kept front end left at its old configuration) fail
   it.
+- **Code the build compiles out.** A rewrite edits what the selected build compiles. Its text
+  action on a node under an item, variant or field whose `#[cfg]` is off in that build (the
+  test `cfg-off` reads) is left as written and named in the answer: schema 65's
+  `Edited::compiled_out`, each entry the file, the 1-based line and the rule (`name
+  (rules:line)`), sorted and each once. The CLI prints a warning per entry, kept under `-q`,
+  and the status line counts them ("2 compiled-out match(es) left as written"). A rule asks
+  for such code with a positive `(cfg-off n)` in its body; its matches there are edited as
+  syntax. A query reports rows in compiled-out code as before, with no types or resolution
+  there. Tested by `tests::rewrite::a_match_in_compiled_out_code_is_named_and_left_unless_the_rule_asks_for_it`,
+  which fails with the skip removed.
 - `(include "tools/astlog/rules-sema/lib/calls.astlog")` reads another rules file in place. The
   daemon's loader resolves it against the view, so an include is versioned with the tree and
   reads the same for every API client; the request still carries one rules text, and the CLI
@@ -315,7 +325,10 @@ reference model for a property test only.
 - One configuration per request. A rules file reads the build its `targets` select (see "The
   build a rules file reads"); code only another configuration compiles (a `#[cfg(test)]` item
   under a check without `--tests`, a feature left off, another target) is matched as syntax and
-  has no types or resolution there. Running the rules over several configurations in one
+  has no types or resolution there. A text rewrite's match there is named and left (see "Code
+  the build compiles out"), but `rename` and the parameter actions go through the front end's
+  references, which hold no use in such code, so they miss it without naming it. Running the
+  rules over several configurations in one
   request, merging rows and refusing edits two configurations disagree on, is not built; run
   the request once per selection.
 - `--replace` reads no selection: its edits by meaning run over the daemon's default check of
@@ -336,7 +349,8 @@ reference model for a property test only.
   paths, whatever the edited file's edition.
 - `cfg-off` under a `#[cfg]` on a statement, an expression or any node that declares no def. The
   front end keeps no def there to say whether it is on, so the rule is refused, naming the
-  attribute and its place.
+  attribute and its place. A rewrite's match under such a `#[cfg]` (and under no off item) is
+  edited as syntax, whether or not the build compiles it.
 - Text rewrites of a file that already has a syntax error. No count or list of errors maps
   through edits, so such a file is refused whole. The end state checks that the edits add no
   error by reparsing only what they touch.

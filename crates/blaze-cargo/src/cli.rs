@@ -981,6 +981,15 @@ fn replaced(place: &Place, flags: &args::Flags, targets: blaze_api::Targets, col
         Some(diff) => io::stdout().lock().write_all(diff.as_bytes()),
         None => Ok(()),
     };
+    // A warning, as cargo's survive `-q`: a match left as written is no edit the diff shows.
+    for left in &made.edited.compiled_out {
+        let what = format!(
+            "{}:{}: {} matched code the selected build compiles out, left as written: select the \
+             build that compiles it, or ask for it with (cfg-off n)",
+            left.file, left.line, left.rule
+        );
+        blaze_report::err!("{}", say::warning(&what, color));
+    }
     if let Some(status) = Status::of(&made, flags.quiet) {
         blaze_report::err!("{}", say::status(status.verb(), &status.to_string(), color));
     }
@@ -1029,8 +1038,12 @@ impl std::fmt::Display for Count<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let scopes = self.0.items.iter().filter(|it| it.how == blaze_api::intent::How::Scope).count();
         match self.0.items.len() - scopes {
-            items if scopes == 0 => write!(f, "{items} item(s)"),
-            items => write!(f, "{items} item(s) and {scopes} module scope(s)"),
+            items if scopes == 0 => write!(f, "{items} item(s)")?,
+            items => write!(f, "{items} item(s) and {scopes} module scope(s)")?,
+        }
+        match self.0.compiled_out.len() {
+            0 => Ok(()),
+            left => write!(f, ", {left} compiled-out match(es) left as written"),
         }
     }
 }

@@ -137,6 +137,9 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             for item in &edited.items {
                 put!(out, "  {} {}: {}\n", how_word(item.how), item.file, item.path);
             }
+            for left in &edited.compiled_out {
+                put!(out, "  compiled out {}:{}: {}\n", left.file, left.line, left.rule);
+            }
         }
         Response::Announced { root } => put!(out, "{} {root}\n", status("Announced")),
         Response::DocPage { path, page } => {
@@ -1209,10 +1212,16 @@ mod tests {
         let edited = blaze_api::Edited {
             ops: Vec::new(),
             items: vec![item(How::Body, "fn parse"), item(How::Added, "struct Token")],
+            compiled_out: vec![blaze_api::CompiledOut {
+                file: "src/lib.rs".to_owned(),
+                line: 9,
+                rule: "to-arc (r.astlog:3)".to_owned(),
+            }],
         };
         assert_eq!(
             lines(&Response::Edited(edited), false),
-            "      Edited 2 items, 0 ops\n  body src/lib.rs: fn parse\n  added src/lib.rs: struct Token\n"
+            "      Edited 2 items, 0 ops\n  body src/lib.rs: fn parse\n  added src/lib.rs: struct Token\n  \
+             compiled out src/lib.rs:9: to-arc (r.astlog:3)\n"
         );
         let root = ContentId([2; 32]);
         assert_eq!(lines(&Response::Announced { root }, false), format!("   Announced {root}\n"));
