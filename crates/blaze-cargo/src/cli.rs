@@ -955,7 +955,7 @@ fn replaced(place: &Place, flags: &args::Flags, color: bool) -> i32 {
     match done {
         Ok(replace::Made { diff: Some(diff), edited }) => {
             let written = io::stdout().lock().write_all(diff.as_bytes());
-            let rest = format!("{} item(s), nothing written", edited.items.len());
+            let rest = format!("{}, nothing written", Count(&edited));
             blaze_report::err!("{}", say::status("Would edit", &rest, color));
             if written.is_ok() { 0 } else { Exit::Failed.code() }
         }
@@ -963,18 +963,30 @@ fn replaced(place: &Place, flags: &args::Flags, color: bool) -> i32 {
             let mut files: Vec<&str> = edited.items.iter().map(|it| it.file.as_str()).collect(); // alloc: CLI edge, the files named once
             files.sort_unstable();
             files.dedup();
-            let rest = format!(
-                "{} item(s) in {} file(s): {}",
-                edited.items.len(),
-                files.len(),
-                files.join(", ")
-            );
+            let rest = format!("{} in {} file(s): {}", Count(&edited), files.len(), files.join(", "));
             blaze_report::err!("{}", say::status("Replaced", &rest, color));
             0
         }
         Err(what) => {
             blaze_report::err!("{}", say::error(&what, color));
             Exit::Failed.code()
+        }
+    }
+}
+
+/// What an edit request edited, as its status line counts it: the items, and apart from them
+/// each module whose scope changed (`How::Scope`: its `use`s, its macro calls, or the names it
+/// declares). Renaming three fns of one module edits the three and that module's scope, whose
+/// names changed though no line of its own did, so that is "3 item(s) and 1 module scope(s)",
+/// never "4 item(s)" over a diff of three fns.
+struct Count<'e>(&'e blaze_api::intent::Edited);
+
+impl std::fmt::Display for Count<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scopes = self.0.items.iter().filter(|it| it.how == blaze_api::intent::How::Scope).count();
+        match self.0.items.len() - scopes {
+            items if scopes == 0 => write!(f, "{items} item(s)"),
+            items => write!(f, "{items} item(s) and {scopes} module scope(s)"),
         }
     }
 }

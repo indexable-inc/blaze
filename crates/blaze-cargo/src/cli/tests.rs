@@ -1039,3 +1039,18 @@ fn what_this_clis_printer_says_more_of_the_thin_blaze_hands_over() {
         recomputed.into_iter().map(|it| matches!(plain.take(it), Step::HandOver(_))).collect();
     assert_eq!(steps[..3], [false, false, true]);
 }
+
+/// `--rules` renaming three fns of one module edits the three and the module's scope
+/// (blaze-astlog's `renaming_three_fns_of_a_module_edits_the_three_and_the_modules_scope`);
+/// the status line counts three items and the scope apart, never four items over a diff of
+/// three fns.
+#[test]
+fn the_status_line_counts_a_modules_scope_apart_from_the_items_edited() {
+    use blaze_api::{Edited, EditedItem, How};
+    let item = |path: &str, how: How| EditedItem { how, key: None, file: "src/lib.rs".to_owned(), path: path.to_owned() };
+    let renamed = ["a", "b", "c"].map(|it| item(it, How::Renamed));
+    let mut edited = Edited { ops: Vec::new(), items: renamed.to_vec() };
+    assert_eq!(Count(&edited).to_string(), "3 item(s)");
+    edited.items.insert(0, item("", How::Scope));
+    assert_eq!(Count(&edited).to_string(), "3 item(s) and 1 module scope(s)");
+}
