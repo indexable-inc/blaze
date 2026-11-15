@@ -2010,25 +2010,22 @@ fn evict_table<F: Function>(storage: &mut Storage, index: u32) -> usize {
 /// [`Vtable::unread`] of `F`: lets go of each value whose row was last verified in a view
 /// before `before`. A row is stamped with the view of each read of it (a hit needs
 /// `verified == clock`, and the cold path stamps what it verifies or runs), so such a value was
-/// read in no view since. A walk of every row made, for a caller with `&mut` of the storage.
+/// read in no view since. A walk of every row made, for a caller with `&mut` of the storage:
+/// the walk reads stamps alone, and the values it finds go as a pass's do ([`evict_keys`]),
+/// spread over the pool, since hashing each is most of the cost (1.3 s on one thread for
+/// the 358k values a cold build's front end left, 2026-11-15, which the next build's lowering
+/// waited on).
 fn evict_unread<F: Function>(storage: &Storage, index: u32, before: u32) -> (usize, u64) {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return (0, 0) };
-    let (mut evicted, mut freed) = (0usize, 0u64);
-    for (_, row) in rows::<F>(storage, table) {
-        let word = row.header.verified.load(Ordering::Relaxed);
-        if word & VALUE == 0 || word & VIEW_MASK >= before {
-            continue;
-        }
-        if let Some(bytes) = evict::<F>(table, row) {
-            evicted += 1;
-            freed += bytes;
-        }
-    }
-    table.values.fetch_sub(evicted, Ordering::Relaxed);
-    if evicted != 0 {
-        counts::add(index, counts::EVICTED, evicted as u64);
-    }
-    (evicted, freed)
+    // alloc: once an epoch per function with a value to let go, a key per value
+    let gone: Vec<u32> = rows::<F>(storage, table)
+        .filter(|(_, row)| {
+            let word = row.header.verified.load(Ordering::Relaxed);
+            word & VALUE != 0 && word & VIEW_MASK < before
+        })
+        .map(|(id, _)| id.as_u32())
+        .collect();
+    evict_keys::<F, u32>(storage, index, &gone, |key| *key)
 }
 
 /// [`Explicit::values`] of `F`: how many of its rows hold a value, from its counter.
@@ -2103,7 +2100,7 @@ fn held_values<F: Function>(storage: &Storage, index: u32, out: &mut Vec<Held>) 
 }
 
 /// Evictions a pass spreads over the pool: below it, one thread evicts them.
-const PAR_EVICT: usize = 256;
+pub(super) const PAR_EVICT: usize = 256;
 
 /// [`Weighed::evict`] of `F`: evicts the values of `gone` (keys of `F`, each once); returns how
 /// many held one and what they weighed. An eviction hashes its value ([`evict`]), which for a
@@ -2118,9 +2115,25 @@ fn evict_held<F: Function>(storage: &Storage, index: u32, gone: &[Held]) -> (usi
     let _span =
         tracing::info_span!(target: "blaze", "lru evict", function = F::NAME, count = gone.len())
             .entered();
+    evict_keys::<F, Held>(storage, index, gone, |value| value.key)
+}
+
+/// Evicts the rows of `F` whose keys `key` names in `gone` (each once), on the pool when they
+/// are many ([`PAR_EVICT`]); returns how many held a value and what they weighed. For a caller
+/// with `&mut` of the storage, whose rows are distinct: what [`evict_held`] and
+/// [`evict_unread`] share.
+fn evict_keys<F: Function, T: Sync>(
+    storage: &Storage,
+    index: u32,
+    gone: &[T],
+    key: impl Fn(&T) -> u32 + Sync,
+) -> (usize, u64) {
+    if gone.is_empty() {
+        return (0, 0);
+    }
     let Some(table) = storage.table::<FnTable<F>>(index) else { return (0, 0) };
-    let one = |table: &FnTable<F>, value: &Held| {
-        RowOf::<F>::of(&table.pages, Id::from_u32(value.key)).and_then(|row| evict::<F>(table, row))
+    let one = |table: &FnTable<F>, value: &T| {
+        RowOf::<F>::of(&table.pages, Id::from_u32(key(value))).and_then(|row| evict::<F>(table, row))
     };
     let (evicted, freed) = if gone.len() < PAR_EVICT {
         gone.iter().filter_map(|value| one(table, value)).fold((0, 0), |(n, b), it| (n + 1, b + it))
