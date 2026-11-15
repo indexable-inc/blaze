@@ -6,6 +6,7 @@ mod include;
 mod query;
 mod relations;
 mod rewrite;
+mod rules_sema;
 mod types;
 
 use base_db::{Db, FileId};
