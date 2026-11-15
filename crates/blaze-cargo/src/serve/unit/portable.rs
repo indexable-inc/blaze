@@ -353,8 +353,23 @@ fn recode(
 /// ([`Places::here`]). Asked once the unit is compiled: the log then names every read its code
 /// was made from.
 ///
-/// The second is wider than it has to be (most derives read no variable): it ends when a
-/// macro is given paths that name no checkout (store.md, "virtual roots for wasm macros").
+/// The second is wider than most derives need, and still the only thing that keeps such a
+/// record per checkout; narrowing it to the expansions that read a rooted variable or asked a
+/// span's file is not sound while either holds:
+/// - a macro learns its checkout untraced: the wasm glue enters the directory cargo runs rustc
+///   in before the macro runs (blaze-macro-eval's `current_dir`), and `getcwd` answers from
+///   wasi-libc's copy, with no host call to trace;
+/// - the record's slot keeps each expansion's crate variables as they were made
+///   ([`super::reads`]' `Expansions::env`, real paths), and a lookup works the expansions'
+///   reads out with those: the root marks every unverified expansion is kept with
+///   (`blaze_usercode::roots::Roots::mark`) then answer with the first checkout's roots, so a
+///   second checkout finds the record. Removing this clause made the gauntlet's `derive_user`
+///   and `gauntlet` units found in a second checkout from expansions verified nowhere.
+///
+/// It ends when a macro is given paths that name no checkout (store.md, "virtual roots for
+/// wasm macros"), or the slot keeps the variables ported and a lookup places them, so a mark
+/// answers with this checkout's root and only an expansion verified across checkouts
+/// (`blaze_usercode::roots::verify`) leaves the record findable elsewhere.
 pub(crate) fn path_reads(db: &base_db::Db, krate: base_db::Crate, places: &Places) -> Option<String> {
     let rooted = |value: &str| matches!(places.text(value.as_bytes()), Cow::Owned(_));
     // alloc: once per unit stored, a crate of its closure each

@@ -735,6 +735,7 @@ impl Run {
         let (marked, stored) = roots.kept(&traced, &value).map_err(|error| {
             RunError::keep(KeepError::Scan { run: key, why: error.to_string() })
         })?;
+        let (bound, outside, relinked) = (marked.bound, marked.outside.clone(), marked.relinked); // clone: once per run kept, its reason
         let kept = verify::keep(store, &roots, &key, marked, stored.encode(), ported_differs)
             .map_err(|it| match it.error {
                 // The store keeps another value under this run's key and trace: said by what
@@ -757,6 +758,13 @@ impl Run {
                 }
                 error => RunError::Keep { error, landed: it.tickets, retracted: it.retracted },
             })?;
+        tracing::info!(
+            verdict = ?kept.verdict,
+            bound = ?bound,
+            outside = ?outside,
+            relinked,
+            "a run kept for other checkouts as its verdict says"
+        );
         // Verify mode: a copy comparison that retracted is a difference too, said as one.
         if self.spec.mode == Mode::Verify
             && let Some(ticket) = kept.retracted
