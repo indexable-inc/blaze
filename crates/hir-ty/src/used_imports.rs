@@ -29,7 +29,7 @@ mod tests;
 pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
     // alloc: the query's result's input, once per execution.
     let mut uses = Vec::new();
-    for owner in recorded_bodies(db, krate) {
+    for owner in recorded_bodies(db, krate, Global) {
         uses.extend_from_slice(body_trait_uses(db, owner));
     }
     used_imports_with(db, krate, &uses)

@@ -541,7 +541,7 @@ pub(crate) fn crate_uses(db: &Db, krate: Crate) -> CrateUses {
     let def_map = crate_def_map(db, krate);
     let mut walk = Walk::new(db);
     walk.def_map(def_map);
-    for owner in recorded_bodies(db, krate) {
+    for owner in recorded_bodies(db, krate, Global) {
         walk.extend(&body_uses(db, owner).rec);
     }
     CrateUses { rec: walk.finish() }
@@ -551,13 +551,11 @@ pub(crate) fn crate_uses(db: &Db, krate: Crate) -> CrateUses {
 /// blocks declare (the order of [`crate::nameres::demand::walk_bodies`]), found through each
 /// body's [`body_uses`] record and never its body: what a fold over the crate's per-body records
 /// walks, so that a body edit that leaves the records equal runs no fold again.
-pub fn recorded_bodies(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
+pub fn recorded_bodies<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Vec<DefWithBodyId, A> {
     let roots = crate_body_owners(db, krate);
-    // alloc: once per call, at the roots' count: bodies declared in bodies are few
     let mut seen: HashSet<DefWithBodyId, Global> = HashSet::with_capacity_in(roots.len(), Global);
     seen.extend(roots.iter().copied());
-    // alloc: the result, once per call
-    let mut bodies = Vec::with_capacity(roots.len());
+    let mut bodies = Vec::with_capacity_in(roots.len(), alloc);
     let mut queue = roots;
     queue.reverse();
     while let Some(owner) = queue.pop() {
