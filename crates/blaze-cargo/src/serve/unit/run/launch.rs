@@ -19,7 +19,9 @@
 //!    sends itself the `blaze run` it last answered for the program ([`super::needs::Front`],
 //!    the daemon's `launch_turn`), and the need waits for that build's task;
 //! 3. refused by name, when that build fails, makes no start of the program, or holds no
-//!    front end within [`super::needs::BUILD`] (rule 3).
+//!    front end within [`super::needs::BUILD`] (rule 3); when the front end a link held is
+//!    lost before a task serves from it ([`lose_needs`]: the store after the answer failed);
+//!    or when no task serves from it within [`super::needs::SERVED_WITHIN`].
 //!
 //! A program's whole state is kept as a start image ([`keep`]) the loop puts and marks once
 //! durable; after a daemon's start the program is restored from it at its first look
@@ -65,7 +67,7 @@ use blaze_units::schema::Mode;
 use crossbeam_channel::{Receiver, Sender};
 use hir_ty_codegen::v2::{Backends, BuildTime, HashSource, HirFrontend, HirInstance, HirStatic};
 
-use super::needs::{Front, Heard, Need, Serve, Served, Step, Want};
+use super::needs::{Front, Heard, Need, Refuse, Serve, Served, Step, Want};
 use crate::serve::work::{LaunchKept, LaunchMarked};
 use crate::serve::unit::{Job, KeptLowered, UnitReader, codegen, files::Mounted, graph::flag};
 
@@ -702,16 +704,35 @@ impl Launches {
     /// The programs whose first calls asked for a build since the loop last asked, each once,
     /// by the path each runs from ([`Held::runs_as`]);
     /// and, of every program, the needs waiting past [`super::needs::BUILD`] for a build that
-    /// held nothing, refused.
+    /// held nothing, or past [`super::needs::SERVED_WITHIN`] for the task after a link that
+    /// held the front end, refused.
     pub(crate) fn wants(&self) -> Vec<String> {
         let now = self.host.clock.now();
         for held in self.host.programs.pin().values() {
             let mut core = held.core.lock();
-            let late = held.front.lock().tick(now);
-            if late.is_some() {
-                let why = "the build the daemon sent itself for this first call held no front end within 120 s";
-                core.refuse(held, held.needs.1.try_iter(), why);
-            }
+            let refused = held.front.lock().tick(now);
+            let why = match refused {
+                None => continue,
+                Some(Refuse::Late) => format!(
+                    "the build the daemon sent itself for this first call held no front end within {} s",
+                    super::needs::BUILD.as_secs()
+                ),
+                Some(Refuse::Unserved) => format!(
+                    "the build that linked this program held the checkout's front end for its first \
+                     calls, and no task served from it within {} s of this call (rule: a launched \
+                     run's wait is bounded)",
+                    super::needs::SERVED_WITHIN.as_secs()
+                ),
+                // Said by `Front::built` alone, never a tick; named all the same.
+                Some(Refuse::Failed) => {
+                    "the `blaze run` the daemon sent itself for this first call failed".to_owned()
+                }
+                Some(Refuse::NoStart) => {
+                    "the `blaze run` the daemon sent itself for this first call makes no start of this program"
+                        .to_owned()
+                }
+            };
+            core.refuse(held, held.needs.1.try_iter(), &why);
         }
         // alloc: once a turn with wants
         let mut wants: Vec<String> = self.host.wants.1.try_iter().collect();
@@ -851,8 +872,9 @@ impl Launches {
             *held.records.lock() = Some((serving.store.clone(), serving.packs.clone()));
             *held.serving.lock() = Some(serving);
             // The checkout's front end serves the program's needs from the task after the
-            // build's answer ([`serve_needs`]) until it lets go.
-            held.front.lock().held();
+            // build's answer ([`serve_needs`]) until it lets go. Needs queued already wait for
+            // that task within `SERVED_WITHIN` from now.
+            held.front.lock().held(self.host.clock.now(), !held.needs.1.is_empty());
             *held.record.lock() = record;
             let mut what = Vec::with_capacity(told.len()); // alloc: once a build
             for (conn, frames, said) in told {
@@ -1051,8 +1073,17 @@ fn wanted(
         // The lock order is the core's, then the front's: the task that lets the front end go
         // takes both, so a need is queued either before (and it asks again) or after (and this
         // asks), never between.
-        let _core = held.core.lock();
-        let want = held.front.lock().want(now);
+        let mut core = held.core.lock();
+        let mut front = held.front.lock();
+        let want = front.want(now);
+        if want == Want::Refuse {
+            // The front end the program's last link held was lost: nothing will serve this
+            // call, so it is refused now, by the loss's reason, never queued.
+            let why = front.lost_why().unwrap_or("the front end its last link held was lost");
+            core.refuse(held, [Need { program, conn, slot, identity }], why);
+            return Ok(());
+        }
+        drop(front);
         drop(held.needs.0.send(Need { program, conn, slot, identity }));
         if want == Want::Build {
             // The unit is built, not replayed, by the request the daemon sends itself.
@@ -1891,7 +1922,7 @@ pub(crate) fn serve_needs(front: &mut KeptLowered, launches: &Launches, wanted: 
         .programs
         .pin()
         .values()
-        .filter(|it| it.front.lock().is_held() && it.serving.lock().as_ref().is_some_and(|it| it.root == *root))
+        .filter(|it| it.front.lock().servable() && it.serving.lock().as_ref().is_some_and(|it| it.root == *root))
         .cloned()
         .collect();
     let mut puts = Vec::new();
@@ -1903,6 +1934,9 @@ pub(crate) fn serve_needs(front: &mut KeptLowered, launches: &Launches, wanted: 
     let parker = Arc::new(Parker::new()); // alloc: once a task
     for held in &programs {
         *held.waker.lock() = Some(Arc::clone(&parker));
+        // This task serves from now: what was queued since the link is no longer unserved.
+        let _core = held.core.lock();
+        held.front.lock().serving();
     }
     let clock = Monotonic::new();
     let mut attached: u32 = programs.iter().map(|it| it.attached.load(Ordering::Acquire)).sum();
@@ -1961,11 +1995,19 @@ pub(crate) fn serve_needs(front: &mut KeptLowered, launches: &Launches, wanted: 
     match served {
         // The front end goes to the request that wants it; what was not made waits for the
         // task after its build, which holds the front end again.
+        // The wait for that task is bounded as the one after a link is (`Front::handed_back`):
+        // the request may never link.
         Served::Wanted => {
-            for need in serve.left() {
-                if let Some(held) = programs.iter().find(|it| program_id(&it.path) == need.program) {
-                    drop(held.needs.0.send(need));
+            let left = serve.left();
+            let now = launches.host.clock.now();
+            for held in &programs {
+                let id = program_id(&held.path);
+                let _core = held.core.lock();
+                let mut front = held.front.lock();
+                for need in left.iter().filter(|it| it.program == id) {
+                    drop(held.needs.0.send(*need));
                 }
+                front.handed_back(now, !held.needs.1.is_empty());
             }
         }
         // No task holds the front end for these programs any more ([`Front::let_go`]): a need
@@ -1998,6 +2040,28 @@ pub(crate) fn serve_needs(front: &mut KeptLowered, launches: &Launches, wanted: 
         }
     }
     puts
+}
+
+/// The front end of checkout `checkout`, which the build's link held for its launched
+/// programs' first calls, is lost before the task after the answer served from it (`why`:
+/// the store failed or panicked, or the front end was taken first): no task after that build
+/// will serve, so each such program's queued first calls are refused now naming `why`, as
+/// every later one is until a link holds a front end again ([`Front::lost`]). The program
+/// then stops with that error, where it would have waited for a task that never comes.
+pub(crate) fn lose_needs(launches: &Launches, checkout: &str, why: &str) {
+    let root = checkout.trim_end_matches('/');
+    let why = format!("the checkout's front end, held for this program's first calls, was lost: {why}");
+    for held in launches.host.programs.pin().values() {
+        if !held.serving.lock().as_ref().is_some_and(|it| it.root == root) {
+            continue;
+        }
+        let mut core = held.core.lock();
+        let mut front = held.front.lock();
+        if front.lost(&why) {
+            tracing::error!(target: "blaze", "{}: {why}", held.path);
+            core.refuse(held, held.needs.1.try_iter(), &why);
+        }
+    }
 }
 
 #[cfg(test)]

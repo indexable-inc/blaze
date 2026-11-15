@@ -14,7 +14,7 @@ blaze-audit	0	0	65	25
 blaze-bench	0	0	0	12
 blaze-build-script	67	0	7	26
 blaze-bytes	0	0	0	3
-blaze-cargo	2322	2	208	1465
+blaze-cargo	2319	2	209	1465
 blaze-cas	817	0	158	355
 blaze-certify	83	0	0	51
 blaze-check	47	0	2	34
@@ -68,7 +68,7 @@ blaze-lint-defs	22	0	0	8
 blaze-lints	825	0	652	624
 blaze-lir	21	0	8	6
 blaze-live	149	0	0	113
-blaze-lower	166	0	60	71
+blaze-lower	165	0	58	71
 blaze-macro-eval	271	0	5	87
 blaze-manifest	9	0	50	136
 blaze-mem	31	0	0	5
