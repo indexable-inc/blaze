@@ -10,7 +10,7 @@ blaze-api	3	0	0	0	0
 blaze-astlog	5	1	0	0	0
 blaze-audit	4	0	0	0	0
 blaze-bench	0	0	0	0	1
-blaze-cargo	554	8	0	91	2
+blaze-cargo	552	8	0	91	2
 blaze-cas	75	13	0	0	1
 blaze-certify	8	0	0	0	0
 blaze-check	19	0	0	0	0
@@ -18,6 +18,7 @@ blaze-ci	21	0	0	0	0
 blaze-client	11	0	0	0	0
 blaze-codegen	16	4	0	0	0
 blaze-codegen-code	44	0	0	0	0
+blaze-command	0	2	0	0	0
 blaze-core	8	1	0	0	0
 blaze-diagnostics	12	1	0	0	2
 blaze-doc	2	2	0	0	0
@@ -26,6 +27,7 @@ blaze-explore	2	0	0	0	0
 blaze-explore-core	1	0	0	0	0
 blaze-fetch	4	0	0	0	0
 blaze-fmt	3	7	0	4	0
+blaze-front	0	2	0	0	0
 blaze-front-items	17	0	0	0	0
 blaze-gc	63	0	0	0	0
 blaze-global	43	0	0	0	0
@@ -35,7 +37,7 @@ blaze-hub	0	5	0	0	0
 blaze-ids	0	1	0	0	0
 blaze-inproc	1	0	0	0	0
 blaze-intent	34	0	0	0	0
-blaze-item-hash	0	4	0	0	0
+blaze-item-hash	0	7	0	0	0
 blaze-kernel	29	0	0	0	0
 blaze-launch	1	0	0	0	0
 blaze-launch-host	24	0	0	0	0
@@ -46,7 +48,7 @@ blaze-lint-defs	3	0	0	0	0
 blaze-lints	34	0	0	0	0
 blaze-lir	0	5	0	0	0
 blaze-live	92	0	0	0	0
-blaze-lower	13	1	0	0	0
+blaze-lower	6	1	0	0	0
 blaze-macro-eval	19	2	0	0	1
 blaze-manifest	2	0	0	175	2
 blaze-napi	8	0	0	0	0
@@ -68,7 +70,7 @@ blaze-store-check	1	0	0	0	0
 blaze-storemodel	3	0	0	0	0
 blaze-testsel	0	1	0	0	0
 blaze-thin	24	0	0	0	0
-blaze-units	43	1	0	64	0
+blaze-units	44	1	0	64	0
 blaze-usercode	48	0	0	0	0
 blaze-v2-proof	6	0	0	0	0
 blaze-vfs	0	6	0	0	0
@@ -84,18 +86,17 @@ harness/harness-native-render	39	2	0	0	1
 harness/harness-native-ui-inline	4	0	0	0	0
 harness/harness-native-ui-timeline	2	0	0	0	0
 harness/harness-video	13	0	0	0	1
-hir-def	22	6	0	0	8
+hir-def	24	6	0	0	9
 hir-expand	1	0	0	0	2
-hir-firewall	7	0	0	0	0
-hir-ty	33	11	0	0	10
-hir-ty-borrowck	1	0	0	0	0
+hir-firewall	9	0	0	0	0
+hir-ty	38	12	0	0	10
 hir-ty-charon	1	0	0	0	0
-hir-ty-codegen	410	3	0	0	3
-hir-ty-identity	24	0	0	0	0
+hir-ty-codegen	411	19	0	0	4
+hir-ty-identity	25	2	0	0	0
 hir-ty-lean	12	0	0	0	0
 hir-ty-mir	26	5	0	0	0
 hir-ty-print	0	2	0	0	0
-hir-ty-pure	13	3	0	0	0
+hir-ty-pure	13	5	0	0	0
 hir-ty-suspend	0	2	0	0	0
 ix-prof	46	0	0	0	0
 proc-macro-api	14	0	0	0	0
