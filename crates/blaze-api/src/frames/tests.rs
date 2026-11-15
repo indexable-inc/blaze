@@ -1,4 +1,4 @@
-use blaze_ids::rng::SplitMix64 as Rng;
+use blaze_ids::rng::{SplitMix64 as Rng, choose};
 
 use super::*;
 use crate::{Request, Response};
@@ -103,11 +103,11 @@ fn every_way_in_gives_what_the_old_frames_gave() {
         let mut rng = Rng::new(seed);
         let mut stream = Vec::new();
         for id in 0..(1 + rng.below(12)) {
-            let request = match rng.below(3) {
-                0 => Request::Status,
-                1 => Request::Cancel { id: rng.below(u64::MAX) },
-                _ => Request::Close { root: blaze_ids::ContentId([rng.below(256) as u8; 32]) },
-            };
+            let request = choose!(rng;
+                Request::Status,
+                Request::Cancel { id: rng.below(u64::MAX) },
+                Request::Close { root: blaze_ids::ContentId([rng.below(256) as u8; 32]) },
+            );
             stream.extend(encode(&Envelope::new(id, request)).unwrap());
         }
         let (mut frames, mut model) = (Frames::new(), Model::default());
@@ -115,24 +115,24 @@ fn every_way_in_gives_what_the_old_frames_gave() {
         while at < stream.len() {
             let len = (rng.below(90) as usize).min(stream.len() - at);
             let piece = &stream[at..at + len];
-            match rng.below(4) {
-                0 => frames.push(piece),
-                1 => frames.push_vec(piece.to_vec()),
-                2 => {
+            choose!(rng;
+                frames.push(piece),
+                frames.push_vec(piece.to_vec()),
+                {
                     let mut into = frames.lend();
                     assert_eq!(into.len(), model.bytes.len(), "seed {seed}");
                     into.extend_from_slice(piece);
                     assert_eq!(frames.give_back(into), !piece.is_empty(), "seed {seed}");
-                }
-                _ => {
+                },
+                {
                     let most = 1 + rng.below(200) as usize;
                     let mut from = Trickle { bytes: piece, most: 1 + rng.below(50) as usize };
                     let mut got = 0;
                     while got < len {
                         got += frames.fill(&mut from, most.min(len - got)).unwrap();
                     }
-                }
-            }
+                },
+            );
             model.bytes.extend_from_slice(piece);
             at += len;
             assert_eq!(frames.held(), model.bytes.len(), "seed {seed}");
