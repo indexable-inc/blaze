@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # `local.sh CACHE`: the script action's steps (action.yml) outside Actions, with the directory
 # CACHE standing in for the Actions cache (CACHE/<key>), to exercise its hit and miss paths on a
-# machine with the checkout: run from the checkout's top. A miss needs the pinned blaze on PATH
-# and builds; a hit runs no blaze. Prints the key, `hit` or `miss`, and the BLAZE_SCRIPTS line
+# machine with the checkout: run from the checkout's top. A miss needs rustup on PATH and builds
+# with cargo; a hit builds nothing. Prints the key, `hit` or `miss`, and the BLAZE_SCRIPTS line
 # the action exports and the cache directory's total size; then, as a run of a script would,
 # `$BLAZE_SCRIPTS/changed selftest`.
 set -euo pipefail
