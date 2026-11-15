@@ -9,7 +9,7 @@
 base-db	156	0	48	105
 blaze-alloc-count	0	0	0	2
 blaze-api	199	0	13	125
-blaze-astlog	21	0	18	39
+blaze-astlog	21	0	24	38
 blaze-audit	0	0	65	25
 blaze-bench	0	0	0	12
 blaze-build-script	67	0	7	26

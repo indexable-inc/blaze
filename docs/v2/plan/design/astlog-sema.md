@@ -97,8 +97,29 @@ And one over the type behind any references, by the names the std prelude gives:
   is an error naming the rule. A path inside a string, char or byte literal or a comment of the
   template is text and is left as written. A rewrite may hold several actions; the same edit
   from two rules is one edit, and so is the rename of one def asked by several rows.
+- **Nested matches compose.** A capture of a `replace` is a metavariable of its binding bound
+  to a node inside the replaced range: one strictly inside, or the replaced node itself when the
+  template writes it. A text edit (`replace`, `delete`, `insert-before`, `insert-after`, of this
+  rule or another) whose node and text lie inside a capture is made first, and the replace is
+  written from the capture's text with that edit made. So `$r.expect("checked")` over
+  `worker.join().unwrap().unwrap()` writes `worker.join().expect("checked").expect("checked")`,
+  and `f(a.unwrap()).unwrap()` writes `f(a.expect("checked")).expect("checked")`. Edits are
+  written smallest node first, so nesting composes at any depth, and the request's edits stay
+  non-overlapping edits of the original text: an inner edit leaves the request, its text
+  carried by the outer one. A capture the template writes twice (`$r + $r`) carries the rewrite
+  in both copies. One it never writes (`(replace e "0")`) drops the edits inside it with its
+  text, and a `delete` is a replace that writes no capture. Precedence is judged on the text
+  that lands in the hole: an inner rewrite to `x.unwrap_or(0) + 1` under `$x.count_ones()`
+  writes `(x.unwrap_or(0) + 1).count_ones()`, and an inner edit that was the whole capture
+  drops the parentheses its old parent asked for, so its new place decides them. Source actions
+  do not compose: a `retarget` inside a capture is an overlap, and a `rename` or a parameter
+  change whose splice lands in text a rewrite replaces is refused by blaze-intent ("edits text
+  another edit of this request already replaced").
 - **Refusals, each naming what it names.** Two edits that overlap, two insertions at one offset
-  included (both rules, their rules lines, the file and line). A match a macro made, whose node maps back to no range of the macro's input
+  included (both rules, their rules lines, the file and line): two texts for one range, and an
+  edit inside a replaced range that lies in none of its captures (it edits text the template
+  replaces, straddles a capture's edge, or sits in a `$$$run`), or two that overlap inside one
+  capture. A match a macro made, whose node maps back to no range of the macro's input
   (the macro call's `path:line`, the rule), unless the rule excluded it with
   `(not (in-macro-expansion n))`. A rewritten file that no longer parses (the file, the first
   syntax error), and a file that had a syntax error before the rewrite (the file, the line, the
@@ -292,6 +313,10 @@ reference model for a property test only.
 - Patterns inside macro input token trees. A macro's expansion is searched; the tokens a macro
   takes are matched only as text.
 - Edits inside a macro expansion that do not map to one input range are refused, not split.
+- Nested edits inside a `$$$run` capture. A run binds as its text, with no place in the file,
+  so an edit inside it is refused as an overlap. The end state binds a run as a range of
+  sibling nodes that carries its text, and composes an edit inside it like one in a `$name`
+  capture.
 - Rules across checkouts: the target is the daemon's view of one workspace.
 - Build selection for a rules file. `--query`, `--rules` and `--replace` read the daemon's view
   of the whole checkout and refuse `-p`, `--features`, `--target`, target selection and the

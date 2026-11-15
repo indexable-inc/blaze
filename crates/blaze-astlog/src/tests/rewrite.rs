@@ -100,10 +100,11 @@ fn two_rules_editing_overlapping_text_are_refused_naming_both_and_the_place() {
     let rules = r#"
         (rule (call e x) (expr e "lib::old($x)"))
         (rewrite first (call e x) (not (in-macro-expansion e)) (replace e "::lib::new($x)"))
-        (rewrite second (call e x) (not (in-macro-expansion e)) (replace x "0"))
+        (rule (old-path p) (path p "lib::old"))
+        (rewrite second (old-path p) (not (in-macro-expansion p)) (replace p "old"))
     "#;
     let error = refused(edit(&db, &files, rules, &[]));
-    assert!(error.contains("`first` (rules:3)") && error.contains("`second` (rules:4)"), "{error}");
+    assert!(error.contains("`first` (rules:3)") && error.contains("`second` (rules:5)"), "{error}");
     assert!(error.starts_with("lib.rs:"), "{error}");
 }
 
@@ -511,4 +512,163 @@ fn a_param_action_that_names_no_parameter_or_not_every_one_is_refused_naming_the
     assert!(reads.contains("removes parameter `a`, which the body still reads"), "{reads}");
     let arity = refused(edit(&db, &files, "(rule (mix d) (def-path d \"lib::mix\"))\n(rewrite r (mix d) (add-param d \"c: u32\"))", &[]));
     assert!(arity.contains("`add-param` takes 3 or 4 arguments, got 2"), "{arity}");
+}
+
+/// Every `.unwrap()` an `.expect`: the rules ripgrep 15.1.0 refused whole while matches nested.
+const EXPECT: &str = r#"
+(rule (unwrap-call e r) (expr e "$r.unwrap()"))
+(rewrite expect-it (unwrap-call e r)
+  (not (in-macro-expansion e))
+  (replace e "$r.expect(\"checked\")"))
+"#;
+
+const NEST: &str = r#"
+//- minicore: option, result
+//- /lib.rs crate:lib edition:2021
+pub fn chained(o: Option<Option<u8>>) -> u8 { o.unwrap().unwrap() }
+pub fn deeper(o: Option<Option<Option<u8>>>) -> u8 { o.unwrap().unwrap().unwrap() }
+pub fn inside(f: fn(u8) -> Option<u8>, a: Option<u8>) -> u8 { f(a.unwrap()).unwrap() }
+pub fn double(x: u8) -> u8 { x + x }
+pub fn doubled(o: Option<u8>) -> u8 { double(o.unwrap()) }
+pub fn size(x: u8) -> u32 { x.count_ones() }
+pub fn sized(o: Option<u8>) -> u32 { size(o.unwrap()) }
+"#;
+
+/// The lib.rs of `fixture` after `rules`, which must apply.
+fn nested(fixture: &str, rules: &str) -> String {
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let applied = edit(&db, &files, rules, &[]).unwrap_or_else(|error| panic!("{error}"));
+    after(&files, &applied.edited.ops).swap_remove(0).1
+}
+
+#[test]
+fn a_match_inside_another_matchs_capture_is_rewritten_inside_it() {
+    let text = nested(NEST, EXPECT);
+    // The inner match is the whole capture, at any depth.
+    assert!(text.contains(r#"{ o.expect("checked").expect("checked") }"#), "{text}");
+    assert!(text.contains(r#"{ o.expect("checked").expect("checked").expect("checked") }"#), "{text}");
+    // The inner match is strictly inside the capture.
+    assert!(text.contains(r#"{ f(a.expect("checked")).expect("checked") }"#), "{text}");
+}
+
+#[test]
+fn ripgreps_chained_unwraps_both_become_expects() {
+    // tests/util.rs:308 of ripgrep 15.1.0, the line that refused the whole request.
+    let fixture = r#"
+//- minicore: result
+//- /lib.rs crate:lib edition:2021
+pub struct Worker;
+impl Worker { pub fn join(self) -> Result<Result<(), u8>, u8> { Ok(Ok(())) } }
+pub fn wait(worker: Worker) {
+    worker.join().unwrap().unwrap();
+}
+"#;
+    let text = nested(fixture, EXPECT);
+    assert!(text.contains(r#"    worker.join().expect("checked").expect("checked");"#), "{text}");
+}
+
+#[test]
+fn a_capture_written_twice_carries_the_inner_rewrite_in_both_copies() {
+    let rules = format!("{EXPECT}(rule (doubled e x) (expr e \"lib::double($x)\"))\n(rewrite twice (doubled e x) (replace e \"$x + $x\"))");
+    let text = nested(NEST, &rules);
+    assert!(text.contains(r#"{ o.expect("checked") + o.expect("checked") }"#), "{text}");
+}
+
+#[test]
+fn an_edit_inside_a_capture_the_template_drops_goes_with_it() {
+    let rules = format!("{EXPECT}(rule (doubled e x) (expr e \"lib::double($x)\"))\n(rewrite zero (doubled e x) (replace e \"0\"))");
+    let text = nested(NEST, &rules);
+    assert!(text.contains("pub fn doubled(o: Option<u8>) -> u8 { 0 }"), "{text}");
+    assert!(text.contains(r#"{ o.expect("checked").expect("checked") }"#), "{text}");
+}
+
+/// The inner rewrite writes a sum where the call was: each outer template parenthesizes it
+/// where its own hole needs it, judged on the sum and not on the call it replaced.
+const LOOSER: &str = r#"
+(rule (unwrap-call e r) (expr e "$r.unwrap()"))
+(rewrite or-one (unwrap-call e r) (replace e "$r.unwrap_or(0) + 1"))
+(rule (sized e x) (expr e "lib::size($x)"))
+(rewrite as-count (sized e x) (replace e "$x.count_ones()"))
+(rule (doubled e x) (expr e "lib::double($x)"))
+(rewrite as-mul (doubled e x) (replace e "$x * 2"))
+"#;
+
+#[test]
+fn a_rewritten_capture_is_parenthesized_where_its_new_place_needs_it() {
+    let text = nested(NEST, LOOSER);
+    assert!(text.contains("{ (o.unwrap_or(0) + 1).count_ones() }"), "{text}");
+    assert!(text.contains("{ (o.unwrap_or(0) + 1) * 2 }"), "{text}");
+    assert!(text.contains("{ (o.unwrap_or(0) + 1).unwrap_or(0) + 1 }"), "{text}");
+    // Inside an argument list the sum needs none, in its old place or its new one.
+    assert!(text.contains("{ f(a.unwrap_or(0) + 1).unwrap_or(0) + 1 }"), "{text}");
+    assert_eq!(tail(&text, "sized").0, syntax::SyntaxKind::METHOD_CALL_EXPR, "{text}");
+    assert_eq!(tail(&text, "doubled"), (syntax::SyntaxKind::BIN_EXPR, mul_op()), "{text}");
+}
+
+#[test]
+fn a_delete_and_an_insertion_inside_a_capture_are_made_in_its_text() {
+    let fixture = r#"
+//- /lib.rs crate:lib edition:2021
+pub fn note() {}
+pub fn run(f: fn()) { f() }
+pub fn run_twice(f: fn()) { f(); f() }
+pub fn job() { run(|| { note(); let _ = 1; }) }
+"#;
+    let rules = r#"
+        (rule (ran e f) (expr e "lib::run($f)"))
+        (rewrite twice (ran e f) (replace e "run_twice($f)"))
+        (rule (noted s) (stmt s "lib::note();"))
+        (rewrite quiet (noted s) (delete s))
+        (rule (set s) (stmt s "let _ = 1;"))
+        (rewrite traced (set s) (insert-before s "let _ = 0; "))
+    "#;
+    let text = nested(fixture, rules);
+    assert!(text.contains("pub fn job() { run_twice(|| {  let _ = 0; let _ = 1; }) }"), "{text}");
+}
+
+#[test]
+fn an_edit_in_the_replaced_range_but_in_no_capture_is_refused_naming_both_rules() {
+    let (db, files) = view(NEST, 0, &["lib.rs"]);
+    // The callee's path is text the outer template replaces.
+    let callee = format!(
+        "{EXPECT}(rule (doubled e x) (expr e \"lib::double($x)\"))\n(rewrite twice (doubled e x) (replace e \"$x + $x\"))\n\
+         (rule (double-path p) (path p \"lib::double\"))\n(rewrite other (double-path p) (replace p \"size\"))"
+    );
+    let error = refused(edit(&db, &files, &callee, &[]));
+    assert!(error.contains("`twice` (rules:7)") && error.contains("`other` (rules:9)"), "{error}");
+    // A `$$$run` binds as text, with no place an edit could be made in.
+    let run = format!("{EXPECT}(rule (doubled e x) (expr e \"lib::double($$$x)\"))\n(rewrite twice (doubled e x) (replace e \"$x + $x\"))");
+    let error = refused(edit(&db, &files, &run, &[]));
+    assert!(error.contains("`twice` (rules:7)") && error.contains("`expect-it` (rules:3)"), "{error}");
+    assert!(error.contains("edit overlapping text"), "{error}");
+    // Two texts for one range.
+    let twice = format!("{EXPECT}(rewrite again (unwrap-call e r) (replace e \"$r.expect(\\\"again\\\")\"))");
+    let error = refused(edit(&db, &files, &twice, &[]));
+    assert!(error.contains("`expect-it` (rules:3)") && error.contains("`again` (rules:6)"), "{error}");
+}
+
+/// A source action's edit inside a text rewrite's capture is not composed: a retarget's edit
+/// overlaps the rewrite's, and blaze-intent refuses a rename's or a parameter change's splice
+/// inside text the rewrite replaces.
+#[test]
+fn a_source_action_inside_a_text_rewrites_capture_is_refused() {
+    let fixture = r#"
+//- minicore: option
+//- /lib.rs crate:lib edition:2021
+pub fn old(a: u8) -> Option<u8> { Some(a) }
+pub fn new(a: u8) -> Option<u8> { Some(a) }
+pub fn call() -> u8 { old(1).unwrap() }
+"#;
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let with = |action: &str| {
+        let rules = format!("{EXPECT}(rule (old-def d) (def-path d \"lib::old\"))\n\
+                             (rule (old-path p) (path p \"lib::old\"))\n(rewrite source (old-def d) (old-path p) {action})");
+        refused(edit(&db, &files, &rules, &[]))
+    };
+    let retarget = with("(not (in-macro-expansion p)) (retarget p \"lib::new\")");
+    assert!(retarget.contains("`expect-it` (rules:3)") && retarget.contains("`source` (rules:8)"), "{retarget}");
+    let rename = with("(rename d \"older\")");
+    assert!(rename.contains("edits text another edit of this request already replaced"), "{rename}");
+    let param = with("(add-param d \"b: u8\" \"0\")");
+    assert!(param.contains("edits text another edit of this request already replaced"), "{param}");
 }

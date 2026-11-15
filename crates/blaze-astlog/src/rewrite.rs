@@ -4,8 +4,9 @@
 //! A text action edits its node's range in the view's file. A node in a macro's expansion is
 //! edited at the range of the macro input it came from; one the macro made itself has no such
 //! range, and is an error naming the macro call, unless the rule excluded it
-//! (`(not (in-macro-expansion n))`). Two rules' edits of overlapping text are an error naming
-//! both and the place; the same edit twice is one edit. An absolute path written in a template
+//! (`(not (in-macro-expansion n))`). An edit inside a capture of a replace is made in the text
+//! the replace writes for it (`nest`); any other two edits of overlapping text are an error
+//! naming both and the place, and the same edit twice is one edit. An absolute path written in a template
 //! (`::std::sync::Arc`) is a def path, written as the edited node's module names that item
 //! (`Module::find_path`), so the code resolves where it lands.
 
@@ -32,6 +33,7 @@ use crate::sema::{Node, Sema};
 use crate::splice::{self, Parens};
 
 mod imports;
+mod nest;
 
 type Res<T> = Result<T, Error>;
 
@@ -163,21 +165,23 @@ pub(crate) fn edit_with<F: Files>(
         let mut text = Vec::new(); // alloc: the text edits of one request
         let mut more: Vec<Edit> = edits.to_vec();
         let mut moved = imports::Moved::default();
-        for planned in planned {
+        // The text actions, placed: they are written together, nested ones innermost first.
+        let mut placed = Vec::new_in(Global);
+        for planned in &planned {
             let by = Origin { rule: planned.rule, line: planned.line };
-            match planned.action {
+            match &planned.action {
                 PlannedAction::Text { kind, node, template, binding, .. } => {
                     let paths = literal.get(planned.rule).map_or(&[][..], Vec::as_slice);
-                    let written = Written { template, binding: &binding, parens };
-                    let edit = text_edit(&facts, by, kind, node, written, paths)?;
-                    text.push(Made { edit, by });
+                    let written = Written { template, binding, parens };
+                    placed.push(located(&facts, by, *kind, *node, written, paths)?);
                 }
                 PlannedAction::Source { value, args, .. } => {
                     let out = Out { text: &mut text, edits: &mut more, moved: &mut moved };
-                    source_edit(&facts, by, *value, &args, out)?;
+                    source_edit(&facts, by, **value, args, out)?;
                 }
             }
         }
+        nest::compose(&facts, placed, &mut text)?;
         imports::finish(&facts, moved, &mut text, &mut more)?;
         let text = without_overlap(files, text)?;
         blaze_intent::apply_with_text(db, files, &more, &text).map_err(|error| {
@@ -235,12 +239,12 @@ fn place<F: Files>(files: &F, path: &str, at: TextSize) -> String {
 
 /// The file's own text at `range`: a node of an expansion, mapped to the input it came from,
 /// has the expansion's spacing, not the file's.
-fn file_text<F: Files>(files: &F, path: &str, range: TextRange) -> Res<String> {
+fn file_text<'f, F: Files>(files: &'f F, path: &str, range: TextRange) -> Res<&'f str> {
     let bytes = files
         .file(path)
         .and_then(|(_, bytes)| bytes.get(usize::from(range.start())..usize::from(range.end())));
     match bytes.map(std::str::from_utf8) {
-        Some(Ok(text)) => Ok(text.to_owned()),
+        Some(Ok(text)) => Ok(text),
         Some(Err(_)) | None => ViewTextSnafu {
             place: place(files, path, range.start()),
             start: u32::from(range.start()),
@@ -262,7 +266,7 @@ fn cell<F: Files>(facts: &Sema<'_, F>, value: &Value<Node>) -> Res<Cell> {
             match locate(facts, view) {
                 Ok((path, range)) => {
                     let line = line_of(facts.files, &path, range.start());
-                    let text = file_text(facts.files, &path, range)?;
+                    let text = file_text(facts.files, &path, range)?.to_owned();
                     Cell::Code {
                         end: u32::from(range.end()),
                         line,
@@ -289,14 +293,27 @@ struct Written<'w> {
     parens: Parens,
 }
 
-fn text_edit<F: Files>(
-    facts: &Sema<'_, F>,
-    by: Origin<'_>,
+/// A text action whose node is placed in its file, before its text is written.
+struct Placed<'a, 'w, 'p> {
+    by: Origin<'p>,
+    kind: TextKind,
+    view: ast::Node<'a>,
+    path: String,
+    /// The node's range in the file.
+    range: TextRange,
+    written: Written<'w>,
+    paths: &'w [(String, ModuleDef)],
+}
+
+/// The text action `kind` of `node`, placed in the file whose text it edits.
+fn located<'a, 'w, 'p, F: Files>(
+    facts: &Sema<'a, F>,
+    by: Origin<'p>,
     kind: TextKind,
     node: Node,
-    written: Written<'_>,
-    paths: &[(String, ModuleDef)],
-) -> Res<TextEdit> {
+    written: Written<'w>,
+    paths: &'w [(String, ModuleDef)],
+) -> Res<Placed<'a, 'w, 'p>> {
     let Some(view) = facts.view_of(node) else {
         return Err(unplaceable(by, "(a def or a type)".to_owned(), "edits a value that is not code"));
     };
@@ -311,19 +328,34 @@ fn text_edit<F: Files>(
             ),
         )
     })?;
+    Ok(Placed { by, kind, view, path, range, written, paths })
+}
+
+/// The edit `action` makes, each capture of its template written as `rewritten` has it, and
+/// the part of its text that is the replacement without the parentheses its node's parent
+/// asked for: what a capture that is the whole node reads as where another template moves it.
+fn text_edit<'a, F: Files>(
+    facts: &Sema<'a, F>,
+    action: Placed<'a, '_, '_>,
+    rewritten: splice::Rewritten<'_>,
+) -> Res<(TextEdit, Range<usize>)> {
+    let Placed { by, kind, view, path, range, written, paths } = action;
     let at = || place(facts.files, &path, range.start());
     let Written { template, binding, parens } = written;
-    let rendered = splice::render(facts, template, binding, kind, view, parens)
+    let rendered = splice::render(facts, template, binding, rewritten, kind, view, parens)
         .map_err(|message| unplaceable(by, at(), message))?;
     let text = with_paths(facts, by, view, &path, range, &rendered, paths)?;
-    let text = splice::in_place(kind, view, text, parens).map_err(|message| unplaceable(by, at(), message))?;
+    let wrap = splice::in_place(kind, view, &text, parens).map_err(|message| unplaceable(by, at(), message))?;
+    let bare = usize::from(wrap)..usize::from(wrap) + text.len();
     let (range, text) = match kind {
+        TextKind::Replace if wrap => (range, format!("({text})")),
         TextKind::Replace => (range, text),
         TextKind::Delete => (range, String::new()),
         TextKind::InsertBefore => (TextRange::empty(range.start()), text),
         TextKind::InsertAfter => (TextRange::empty(range.end()), text),
     };
-    Ok(TextEdit { path, range, text, by: by.by() })
+    let bare = if kind == TextKind::Delete { 0..0 } else { bare };
+    Ok((TextEdit { path, range, text, by: by.by() }, bare))
 }
 
 /// The def paths a rewrite's templates write literally whose first segment is a crate of the
@@ -719,23 +751,38 @@ fn without_overlap<F: Files>(files: &F, mut made: Vec<Made<'_>>) -> Res<Vec<Text
         (it.edit.path.clone(), it.edit.range.start(), it.edit.range.end(), it.edit.text.clone())
     };
     made.sort_by_key(key);
-    made.dedup_by(|b, a| a.edit.path == b.edit.path && a.edit.range == b.edit.range && a.edit.text == b.edit.text);
+    made.dedup_by(|b, a| same_edit(&a.edit, &b.edit));
     for pair in made.windows(2) {
         let [a, b] = pair else { continue };
-        let (x, y) = (a.edit.range, b.edit.range);
-        let both_insert = x.is_empty() && y.is_empty() && x.start() == y.start();
-        if a.edit.path == b.edit.path && (y.start() < x.end() || both_insert) {
-            return OverlapSnafu {
-                place: place(files, &a.edit.path, y.start()),
-                first: a.by.rule,
-                first_line: a.by.line,
-                second: b.by.rule,
-                second_line: b.by.line,
-            }
-            .fail()
-            .map_err(Error::from);
+        if a.edit.path == b.edit.path && overlaps(&a.edit, &b.edit) {
+            return Err(overlap(files, a.by, b));
         }
     }
     Ok(made.into_iter().map(|it| it.edit).collect())
+}
+
+fn same_edit(a: &TextEdit, b: &TextEdit) -> bool {
+    a.path == b.path && a.range == b.range && a.text == b.text
+}
+
+/// Whether `b`, which starts no earlier than `a` in the same file, edits text `a` edits, or
+/// inserts at the offset `a` inserts at.
+fn overlaps(a: &TextEdit, b: &TextEdit) -> bool {
+    let (x, y) = (a.range, b.range);
+    let both_insert = x.is_empty() && y.is_empty() && x.start() == y.start();
+    y.start() < x.end() || both_insert
+}
+
+/// The refusal of the edit by `a` and `b`, which edit overlapping text, at the start of `b`.
+fn overlap<F: Files>(files: &F, a: Origin<'_>, b: &Made<'_>) -> Error {
+    OverlapSnafu {
+        place: place(files, &b.edit.path, b.edit.range.start()),
+        first: a.rule,
+        first_line: a.line,
+        second: b.by.rule,
+        second_line: b.by.line,
+    }
+    .build()
+    .into()
 }
 
