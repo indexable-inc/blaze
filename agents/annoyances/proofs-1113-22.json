@@ -1,0 +1,21 @@
+{
+ "id": "proofs-1113-22",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "my admin merge of #2164 (landing round 20)",
+ "what": "I merged #2164 with main five commits past the head I had smoked. The round ended with `main past landing: 0`; my merge command fetched again, printed `main past landing: 5` and went on to `gh pr merge --admin --match-head-commit` in the same `&&` chain, because the line that printed the count did not test it. Main`s tree after the merge (27041e05d1) was not the smoked tree (21e57da4b5): another lane`s merge (#2163, the profile history, 12 files of blaze-profile) had landed in the minutes the pull request took to open. I then built and smoked main`s exact tree on blaze-vm: `verdict ok`.",
+ "cost": "a merge on a tree nobody had smoked, for about ten minutes; six minutes of build and smoke after it",
+ "cause": "the check that main had not moved was a line that printed a number, and the pin (`--match-head-commit`) is of the branch`s head, not of the base it merges into",
+ "whys": [
+  "main got a tree that was not smoked",
+  "the merge ran though main had moved",
+  "the count was printed and not tested",
+  "the merge step was a chain I typed each round, not a tool that refuses",
+  "GitHub`s pin names the head only, so the base can move between any check and the merge"
+ ],
+ "class": "a check done by a person reading a number in a chain of commands: the day the number is not what it was every other day, the chain goes on",
+ "prevention": "built: `/Volumes/Projects/blaze-proofs-1113-notes/landmerge.sh <landing worktree> <pr> <quote>` refuses, merging nothing, when origin/main holds a commit the landing branch lacks or the quote is of another tree, and after the merge says whether main`s tree is the smoked one (exit 2 if not). The window between its fetch and GitHub`s merge is seconds, not minutes; closing it needs a merge queue or a required check on the merge commit, which is the repository`s to add.",
+ "workaround": "smoke main`s exact tree at once after such a merge",
+ "fix": "",
+ "state": "fixed"
+}
