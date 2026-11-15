@@ -1,0 +1,19 @@
+;; Hand-kept integer tables in `match`es, shared by the rules that read them.
+;;
+;; A generator arm is `k => E::V ..` and an index arm is `E::V .. => k`. The integer is the
+;; literal's value (`int-value`), so `0x2`, `2u8` and `2` are one integer. The variant is what
+;; a path resolves to, so an alias or a `use` of it is the same variant. An arm's guard is
+;; read by neither side, and an or-pattern (`1 | 2`) has no integer.
+
+(rule (variant-path p d) (syntax p "PATH") (resolves p d) (def-kind d "variant"))
+
+;; Arm `a` of match `m` makes from `i` the first variant written in its expression:
+;; `1 => E::Unit(match .. { 0 => Verb::A, .. })` makes `E::Unit`.
+(rule (makes m a i p d) (match-arm m a k e) (int-value k i) (descendant e p) (variant-path p d))
+(rule (made-after a p) (makes m a i p d) (makes m a i q x) (precedes q p))
+(rule (generated m a i d) (makes m a i p d) (not (made-after a p)))
+
+;; Arm `a` of match `m` counts as `i` the first variant its pattern names.
+(rule (counts m a i p d) (match-arm m a k e) (int-value e i) (descendant k p) (variant-path p d))
+(rule (counted-after a p) (counts m a i p d) (counts m a i q x) (precedes q p))
+(rule (indexed m a i d) (counts m a i p d) (not (counted-after a p)))

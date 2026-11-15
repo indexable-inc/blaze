@@ -1039,3 +1039,51 @@ fn what_this_clis_printer_says_more_of_the_thin_blaze_hands_over() {
         recomputed.into_iter().map(|it| matches!(plain.take(it), Step::HandOver(_))).collect();
     assert_eq!(steps[..3], [false, false, true]);
 }
+
+/// `--rules` renaming three fns of one module edits the three and the module's scope
+/// (blaze-astlog's `renaming_three_fns_of_a_module_edits_the_three_and_the_modules_scope`);
+/// the status line counts three items and the scope apart, never four items over a diff of
+/// three fns.
+#[test]
+fn the_status_line_counts_a_modules_scope_apart_from_the_items_edited() {
+    use blaze_api::{Edited, EditedItem, How};
+    let item = |path: &str, how: How| EditedItem { how, key: None, file: "src/lib.rs".to_owned(), path: path.to_owned() };
+    let renamed = ["a", "b", "c"].map(|it| item(it, How::Renamed));
+    let mut edited = Edited { ops: Vec::new(), items: renamed.to_vec() };
+    assert_eq!(Count(&edited).to_string(), "3 item(s)");
+    edited.items.insert(0, item("", How::Scope));
+    assert_eq!(Count(&edited).to_string(), "3 item(s) and 1 module scope(s)");
+}
+
+/// `-v` and `-q` are honoured beside `--query`, `--rules` and `--replace`, never refused: `-v`
+/// says the toolchain file blaze ignores, as for a build, and `-q` drops the status line an
+/// edit or a dry run ends with. `--query` prints rows and no status line, so `-q` has nothing
+/// to drop there.
+#[test]
+fn verbose_and_quiet_are_honoured_by_the_rules_modes_and_quiet_drops_the_status_line() {
+    let modes: [&[&str]; 3] = [&["--query", "q"], &["--rules", "r"], &["--replace", "a::B=c::D"]];
+    for mode in modes {
+        for flag in ["-v", "-vv", "--verbose", "-q", "--quiet"] {
+            for line in [[&["check", flag], mode].concat(), [&[flag, "check"], mode].concat()] {
+                let asked = invocation(line.iter().map(OsString::from).collect());
+                assert_eq!(args::refused(&asked), None, "{line:?}");
+                assert!(asked.flags.verbose > 0 || asked.flags.quiet, "{line:?}");
+            }
+        }
+    }
+    let item = blaze_api::EditedItem {
+        how: blaze_api::How::Renamed,
+        key: None,
+        file: "src/lib.rs".to_owned(),
+        path: "a".to_owned(),
+    };
+    let edited = blaze_api::Edited { ops: Vec::new(), items: vec![item] };
+    let made = replace::Made { edited: edited.clone(), diff: None };
+    let said = Status::of(&made, false).map(|it| (it.verb(), it.to_string()));
+    assert_eq!(said, Some(("Replaced", "1 item(s) in 1 file(s): src/lib.rs".to_owned())));
+    assert!(Status::of(&made, true).is_none());
+    let dry = replace::Made { edited, diff: Some("--- a\n+++ b\n".to_owned()) };
+    let said = Status::of(&dry, false).map(|it| (it.verb(), it.to_string()));
+    assert_eq!(said, Some(("Would edit", "1 item(s), nothing written".to_owned())));
+    assert!(Status::of(&dry, true).is_none());
+}

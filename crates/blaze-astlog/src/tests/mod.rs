@@ -2,9 +2,11 @@
 //! given as blaze-intent's [`Files`].
 
 mod examples;
+mod include;
 mod query;
 mod relations;
 mod rewrite;
+mod rules_sema;
 mod types;
 
 use base_db::{Db, FileId};

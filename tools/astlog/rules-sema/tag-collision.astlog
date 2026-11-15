@@ -1,0 +1,23 @@
+;; Two arms of one `match` that give two different variants the same integer: `E::A => 2`,
+;; `E::B => 2`.
+;;
+;; A hand-written codec's encoder (crates/hir-ty/src/mir/persist.rs) and identity.rs's
+;; `request_index` give each variant its tag by hand; rustc reports a repeated pattern but not
+;; a repeated result, so two variants on one tag encode to the same bytes and decode as one.
+;; agents/annoyances/image-part-array-positional-callers.json: `Part::DefMap` held tag 2, the
+;; next free part's. Variants are told apart by what their paths resolve to; an or-pattern
+;; (`A | B => 1`) is one arm and says the sharing on purpose.
+;;
+;; Rule 73: a type ends it (tags derived from the declaration, or `#[repr(u8)]` discriminants,
+;; which rustc keeps unique); `hand_written_codec` reads fields, not tags. Rule meanwhile.
+
+(include "tools/astlog/rules-sema/lib/int-arms.astlog")
+
+;; A later arm `b` of the same match counts another variant as the same integer.
+(rule (tag-collision b i a)
+  (indexed m a i d)
+  (indexed m b i e)
+  (precedes a b)
+  (not (indexed m b i d)))
+
+(lint tag-collision error "this arm's tag $i is already an earlier arm's, for another variant")

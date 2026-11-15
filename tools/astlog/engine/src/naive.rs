@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use blaze_hash::HashMap;
 
 use crate::eval::{Facts, Row, Value};
-use crate::program::{AppAtom, BodyAtom, Language, Program, Term};
+use crate::program::{AppAtom, BodyAtom, Counted, Language, Program, Term};
 
 type Env<N> = HashMap<String, Value<N>, Global>;
 
@@ -68,8 +68,7 @@ fn solve<F: Facts>(
             let inputs: Vec<Option<Value<F::Node>>> =
                 source.args.iter().map(|term| bound(term, &env)).collect();
             let mut rows = Vec::new();
-            facts
-                .solve(&source.value, source.line, &inputs, &mut rows)
+            facts.solve(&source.value, &source.line, &inputs, &mut rows)
                 .unwrap_or_else(|error| panic!("source atom failed: {error}"));
             for row in rows {
                 if let Some(next) = unify_all(&env, &source.args, &row) {
@@ -103,15 +102,25 @@ fn solve<F: Facts>(
             let inputs: Vec<Option<Value<F::Node>>> =
                 source.args.iter().map(|term| bound(term, &env)).collect();
             let mut rows = Vec::new();
-            facts
-                .solve(&source.value, source.line, &inputs, &mut rows)
+            facts.solve(&source.value, &source.line, &inputs, &mut rows)
                 .unwrap_or_else(|error| panic!("source atom failed: {error}"));
             if !rows.iter().any(|row| unify_all(&env, &source.args, row).is_some()) {
                 solve(facts, db, rest, env, out);
             }
         }
         BodyAtom::Count(count) => {
-            let n = matches(db, &count.inner, &env).count();
+            let n = match &count.inner {
+                Counted::App(app) => matches(db, app, &env).count(),
+                Counted::Source(source) => {
+                    let inputs: Vec<Option<Value<F::Node>>> =
+                        source.args.iter().map(|term| bound(term, &env)).collect();
+                    let mut rows = Vec::new();
+                    facts.solve(&source.value, &source.line, &inputs, &mut rows)
+                        .unwrap_or_else(|error| panic!("source atom failed: {error}"));
+                    let agree = rows.into_iter().filter(|row| unify_all(&env, &source.args, row).is_some());
+                    agree.collect::<BTreeSet<_>>().len()
+                }
+            };
             let n = Value::Int(i64::try_from(n).unwrap_or(i64::MAX));
             if let Some(next) = unify(&env, &count.result, &n) {
                 solve(facts, db, rest, next, out);

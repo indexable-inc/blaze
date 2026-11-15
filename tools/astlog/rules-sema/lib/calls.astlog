@@ -1,0 +1,12 @@
+;; The call graph, shared by the rules that follow calls.
+;;
+;; `(call c g)`: the call or method call `c` runs the fn `g`, by resolution (`callee`), so a
+;; call through a `use`, an alias or a trait the front end knows the impl of is the same call.
+;; `(calls f g)`: a call written in `f` runs `g`. `(reaches f g)`: `f` runs `g` through any
+;; chain of calls. Tests are not left out here; each rule leaves them out where it needs to.
+
+(rule (call c g) (syntax c "CALL_EXPR") (callee c g))
+(rule (call c g) (syntax c "METHOD_CALL_EXPR") (callee c g))
+(rule (calls f g) (call c g) (enclosing-fn c f))
+(rule (reaches f g) (calls f g))
+(rule (reaches f g) (calls f h) (reaches h g))

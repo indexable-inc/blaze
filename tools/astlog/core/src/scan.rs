@@ -148,7 +148,7 @@ fn for_each_candidate(
                     Value::Text(_) | Value::Int(_) => None,
                 })
                 .ok_or_else(|| {
-                    LintNoNodeSnafu { rule: lint.relation.clone(), line: lint.line }.build()
+                    LintNoNodeSnafu { rule: lint.relation.clone(), line: &lint.line }.build()
                 })?;
             let info = corpus.node_info(node);
             let start = corpus.position(node.file, info.start);

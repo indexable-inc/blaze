@@ -778,3 +778,29 @@ fn a_negated_match_filters_rows_it_holds_for() -> TestResult {
     assert_eq!(text, "fn b() {}");
     Ok(())
 }
+
+#[test]
+fn a_rules_file_on_disk_includes_a_file_beside_it_and_its_errors_name_that_file() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join("rules/lib"))?;
+    std::fs::write(dir.path().join("rules/lib/fns.astlog"), "(rule (item f) (match rust \"(function_item) @f\"))\n")?;
+    std::fs::write(dir.path().join("rules/lib/bad.astlog"), "\n(rule (r f) (match nolang \"(x) @f\"))\n")?;
+    let main = dir.path().join("rules/main.astlog");
+    let rules = "(include \"lib/fns.astlog\")\n(lint item warning \"an item\")\n";
+    std::fs::write(&main, rules)?;
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src)?;
+    std::fs::write(src.join("a.rs"), "fn a() {}\nfn b() {}\n")?;
+    let analysis = crate::analyze_at(rules, &main, &[src])?;
+    assert_eq!(analysis.findings()?.len(), 2);
+    let Err(error) = crate::analyze_at("(include \"lib/bad.astlog\")", &main, &[]) else {
+        panic!("an unknown language is refused");
+    };
+    let bad = format!("{}:2: unknown language `nolang`", dir.path().join("rules/lib/bad.astlog").display());
+    assert_eq!(error.to_string(), bad);
+    let Err(error) = analyze("(include \"lib/fns.astlog\")", &[]) else {
+        panic!("text with no file includes nothing");
+    };
+    assert!(error.to_string().contains("no file of its own"), "{error}");
+    Ok(())
+}

@@ -3,7 +3,7 @@
 //! `rename`, `retarget`, `add-use`, `add-param`, `remove-param` and `reorder-params` actions.
 //! Templates splice `$var`.
 
-use astlog_engine::{BuiltinAritySnafu, DslSnafu, Needs, Parsed, Sexpr, TemplateSyntax, Term};
+use astlog_engine::{BuiltinAritySnafu, DslSnafu, Line, Needs, Parsed, Sexpr, TemplateSyntax, Term};
 use syntax::SyntaxKind;
 
 use crate::error::{Error, SourceError};
@@ -179,7 +179,7 @@ impl astlog_engine::Language for Blaze {
             || ACTIONS.iter().any(|(action, ..)| *action == name)
     }
 
-    fn parse_atom(head: &str, args: &[Sexpr], line: usize) -> Result<Option<Parsed<Atom>>, Error> {
+    fn parse_atom(head: &str, args: &[Sexpr], line: &Line) -> Result<Option<Parsed<Atom>>, Error> {
         if head == "match" {
             return DslSnafu {
                 line,
@@ -201,7 +201,7 @@ impl astlog_engine::Language for Blaze {
             "syntax" => {
                 let (term, text) = term_and_literal(head, args, line)?;
                 let kind = kind_named(text)
-                    .ok_or_else(|| SourceError::UnknownKind { line, kind: text.to_owned() })?;
+                    .ok_or_else(|| SourceError::UnknownKind { line: line.clone(), kind: text.to_owned() })?;
                 return Ok(Some(Parsed {
                     value: Atom::Syntax(kind),
                     args: vec![term],
@@ -242,7 +242,7 @@ impl astlog_engine::Language for Blaze {
         Ok(Some(Parsed { value, args: astlog_engine::terms(args)?, needs }))
     }
 
-    fn parse_action(head: &str, args: &[Sexpr], line: usize) -> Result<Option<Parsed<Action>>, Error> {
+    fn parse_action(head: &str, args: &[Sexpr], line: &Line) -> Result<Option<Parsed<Action>>, Error> {
         let Some(&(_, value, least, most)) = ACTIONS.iter().find(|(name, ..)| *name == head) else {
             return Ok(None);
         };
@@ -290,7 +290,7 @@ fn dollar_var(text: &str) -> Option<&str> {
 }
 
 /// `(head term "literal")`: the term, and the literal the atom is compiled from.
-fn term_and_literal<'a>(head: &str, args: &'a [Sexpr], line: usize) -> Result<(Term, &'a str), Error> {
+fn term_and_literal<'a>(head: &str, args: &'a [Sexpr], line: &Line) -> Result<(Term, &'a str), Error> {
     let [first, Sexpr::Str { text, .. }] = args else {
         return DslSnafu {
             line,
@@ -309,9 +309,9 @@ pub(crate) fn names_an_impl(path: &str) -> bool {
 }
 
 /// The error for a def path that names an impl, which no path resolves to.
-pub(crate) fn impl_has_no_path(path: &str, line: usize) -> Error {
+pub(crate) fn impl_has_no_path(path: &str, line: &Line) -> Error {
     SourceError::DefPath {
-        line,
+        line: line.clone(),
         path: path.to_owned(),
         message: "an impl has no path that names it back: bind it from its syntax, \
                   (syntax n \"IMPL\") (defines n d), or from code in it, (enclosing-impl n d)"

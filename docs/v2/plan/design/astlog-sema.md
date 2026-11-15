@@ -52,7 +52,9 @@ And one over the type behind any references, by the names the std prelude gives:
 - **Code patterns.** `(expr n "...")`, `(type n "...")`, `(pat n "...")`, `(stmt n "...")`,
   `(item n "...")` and `(path n "...")` parse the text as that Rust form with `$name` (one node)
   and `$$$name` (a run of sibling nodes, possibly empty) metavariables, and bind `n` to each node
-  of the target files that matches tree against tree, ignoring whitespace and comments. Each
+  of the target files that matches tree against tree, ignoring whitespace and comments. A
+  pattern that writes no attribute matches a node with any, and one that writes no doc comment
+  matches a node with any; one that writes them matches only nodes with those, in order. Each
   metavariable is a rule variable. One used twice must bind equal code (token-equal). A `match`
   atom in a blaze program is a load error that names the pattern forms. A pattern is parsed as
   edition 2024 reads it; searched over a file of an edition that reads its text as other Rust
@@ -95,8 +97,29 @@ And one over the type behind any references, by the names the std prelude gives:
   is an error naming the rule. A path inside a string, char or byte literal or a comment of the
   template is text and is left as written. A rewrite may hold several actions; the same edit
   from two rules is one edit, and so is the rename of one def asked by several rows.
+- **Nested matches compose.** A capture of a `replace` is a metavariable of its binding bound
+  to a node inside the replaced range: one strictly inside, or the replaced node itself when the
+  template writes it. A text edit (`replace`, `delete`, `insert-before`, `insert-after`, of this
+  rule or another) whose node and text lie inside a capture is made first, and the replace is
+  written from the capture's text with that edit made. So `$r.expect("checked")` over
+  `worker.join().unwrap().unwrap()` writes `worker.join().expect("checked").expect("checked")`,
+  and `f(a.unwrap()).unwrap()` writes `f(a.expect("checked")).expect("checked")`. Edits are
+  written smallest node first, so nesting composes at any depth, and the request's edits stay
+  non-overlapping edits of the original text: an inner edit leaves the request, its text
+  carried by the outer one. A capture the template writes twice (`$r + $r`) carries the rewrite
+  in both copies. One it never writes (`(replace e "0")`) drops the edits inside it with its
+  text, and a `delete` is a replace that writes no capture. Precedence is judged on the text
+  that lands in the hole: an inner rewrite to `x.unwrap_or(0) + 1` under `$x.count_ones()`
+  writes `(x.unwrap_or(0) + 1).count_ones()`, and an inner edit that was the whole capture
+  drops the parentheses its old parent asked for, so its new place decides them. Source actions
+  do not compose: a `retarget` inside a capture is an overlap, and a `rename` or a parameter
+  change whose splice lands in text a rewrite replaces is refused by blaze-intent ("edits text
+  another edit of this request already replaced").
 - **Refusals, each naming what it names.** Two edits that overlap, two insertions at one offset
-  included (both rules, their rules lines, the file and line). A match a macro made, whose node maps back to no range of the macro's input
+  included (both rules, their rules lines, the file and line): two texts for one range, and an
+  edit inside a replaced range that lies in none of its captures (it edits text the template
+  replaces, straddles a capture's edge, or sits in a `$$$run`), or two that overlap inside one
+  capture. A match a macro made, whose node maps back to no range of the macro's input
   (the macro call's `path:line`, the rule), unless the rule excluded it with
   `(not (in-macro-expansion n))`. A rewritten file that no longer parses (the file, the first
   syntax error), and a file that had a syntax error before the rewrite (the file, the line, the
@@ -114,6 +137,19 @@ And one over the type behind any references, by the names the std prelude gives:
   unified diff and writes nothing, `--query FILE` prints the rows (one JSON line of
   `Response::Rows` with `--message-format json`) and exits failed when an `error` lint found
   anything.
+- `(include "tools/astlog/rules-sema/lib/calls.astlog")` reads another rules file in place. The
+  daemon's loader resolves it against the view, so an include is versioned with the tree and
+  reads the same for every API client; the request still carries one rules text, and the CLI
+  sends `--query FILE` and `--rules FILE` as they are, flattening nothing. The path is relative
+  to the view's root whichever file includes it, `/`-separated, with no `.` or `..` segment and
+  no leading `/`, and is read through the job's view files (`Files::with_bytes`), never the
+  disk. A file reached by two routes is read once. A path the view does not hold, a cycle
+  (naming the files on it in order) and a path that breaks the rules above are load errors
+  naming the including file and line. A load reads at most 64 files (`MAX_INCLUDED_FILES`) and
+  1 MiB of rules text, the request's own included (`MAX_RULES_BYTES`); the 64-list nesting cap
+  holds each file on its own. Every error from a form in an included file names that file and
+  its line (`tools/astlog/rules-sema/lib/calls.astlog:3:`) where the request's own text says
+  `rules:3:`. A lint finding carries no rules line, so it names none either way.
 
 ## The relations
 
@@ -131,12 +167,12 @@ argument.
 | `(int-value n i)` | `n` | the integer an integer literal means, in any radix, with `_`s and a suffix (`0x1F` is 31), or a negated one in an expression or a pattern (`-2`); a value past `i64` has no row |
 | `(str-value n s)` | `n` | the text a string literal means, escapes and raw strings read (`"a\tb"` is `a`, a tab, `b`); a byte or C string has no row |
 | `(resolves n d)` | `n` | the def a path, name, method call or field names |
-| `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included. A variant is under its enum (`lib::E::V`), a field under its struct, union or variant (`lib::S::field`, `lib::E::V::inner`, `lib::P::0`). An impl's path ends in `<impl Type>` or `<impl Trait<Args> for Type>`; it names the impl and resolves to nothing, so a `p` naming one is refused. An associated item is under its impl's ADT, or under the impl segment when the self type is no ADT (`lib::<impl Go for &'_ str>::go`) |
+| `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included. A variant is under its enum (`lib::E::V`), a field under its struct, union or variant (`lib::S::field`, `lib::E::V::inner`, `lib::P::0`). An impl's path ends in `<impl Type>` or `<impl Trait<Args> for Type>`; it names the impl and resolves to nothing, so a `p` naming one is refused. An associated item is under its impl's ADT, or under the impl segment when the self type is no ADT (`lib::<impl Go for &'_ str>::go`). An item declared in a fn, const or static body is under that item (`lib::outer::inner`, `lib::outer::Local::x`), never under the module the body is in; two blocks of one body declaring one name give two defs one path, and an item in a block no fn, const or static holds (an array length or a discriminant at module level) has no path. A keyword segment keeps its `r#` as the def's crate's edition writes it (`lib::r#match`) |
 | `(def-parent d p)` | `d` or `p` | the def that owns `d`: a variant's enum, a field's struct, union or variant, an associated item's impl or trait, an item's or an impl's module, a module's parent (a crate's root has none); or each def `p` owns |
 | `(variant-count e n)` | `e` | how many variants the enum has; any other def has no row |
 | `(type-kind t k)` | `t` | the type's shape as text: `struct`, `enum`, `union`, `ref`, `ptr`, `slice`, `array`, `tuple`, `str`, `bool`, `char`, `int` (signed), `uint`, `float`, `dyn`, `param`, `closure`, `fn`, `impl`, `never`, `unknown`, else `other` |
 | `(type-def t d)` | `t` | the ADT the type is, or the trait of a `dyn Trait`; a reference is not peeled, so `(peel-refs t u)` first |
-| `(def-name d t)` | `d` | the def's own name as text, the last segment of its path (`0` for a tuple field); an impl has none, so no row |
+| `(def-name d t)` | `d` | the def's own name as text, the last segment of its path (`0` for a tuple field, `r#match` for a keyword, so a template splicing it writes code); an impl has none, so no row |
 | `(type-of n t)` | `n` | the type of an expression or a pattern |
 | `(type-matches t "pat")` | `t` | holds when the type matches; `$name` in the pattern binds a type argument |
 | `(peel-refs t u)` | `t` | `t` with every leading `&` and `&mut` stripped, or `t` itself |
@@ -148,17 +184,17 @@ argument.
 | `(def-kind d k)`, `(visibility d v)` | `d` | `fn`, `struct`, ...; `pub`, `pub(crate)`, `private`, ... |
 | `(attribute d "name")` | `d` | holds when the item carries that attribute |
 | `(defines n d)` | `n` or `d` | the def an item's, a variant's, a field's (named or tuple), an impl's or a `macro_rules!`'s syntax declares; or that syntax |
-| `(references d n)` | `d` | every name, path, method call and numbered field access (`p.0`) in the target files that resolves to `d` |
+| `(references d n)` | `d` | every name, path, method call and numbered field access (`p.0`) in the target files that resolves to `d`, a raw one (`r#match()`) included |
 | `(in-macro-input n)`, `(in-macro-expansion n)`, `(in-unsafe n)`, `(in-test n)`, `(cfg-off n)` | `n` | filters: `in-macro-input` holds for a node of an expansion that came from the macro's input, `in-macro-expansion` for one the macro made; `in-test` for one under `#[cfg(test)]` or an attribute whose path ends in `test` (`#[tokio::test(...)]`); `cfg-off` for one under an item, variant or field whose `#[cfg]` removed it, and a `#[cfg]` on anything else in between is refused, naming it |
 
 Kept from astlog: `ancestor`, `parent`, `precedes`, `text`, `kind`, `text-match`, `same-text`,
-`same-file`, `file-path`, `misgrouped-digits`. New in the engine for every source: `(count c (rel
-args...))` binds `c` to the number of distinct rows of a lower-stratum relation that agree with the
-bound arguments, and `(lt a b)`, `(le a b)` compare integers; integer literals are bare numbers.
+`same-file`, `file-path`, `misgrouped-digits`. New in the engine for every source: `(count c (atom
+args...))` binds `c` to the number of distinct rows of the atom that agree with the bound arguments,
+none being 0. The atom is a lower-stratum relation, a builtin or a source atom; a builtin's inputs
+and a source atom's demanded columns are bound before the count, as anywhere else. `(lt a b)` and `(le a b)` compare integers; integer literals are bare numbers.
 `(not (atom ...))` negates a source atom or a builtin as well as a relation: every variable bound to its left,
 it needs no stratum, and it is how a rule excludes macro-made matches. `(not (text-match x "re"))`
-holds when the regex finds nothing in `x`. `(count ...)` over a builtin is refused; a builtin is
-no finite relation.
+holds when the regex finds nothing in `x`.
 
 Text builtins take a node or text first and need it bound. A regex is a string literal,
 compiled when the file is read; one that does not compile, or whose compiled program is past
@@ -261,7 +297,7 @@ reference model for a property test only.
 
 | Operation | Floor | This design |
 |---|---|---|
-| Load a rules file | read it once | the same, plus one parse of each pattern |
+| Load a rules file | read it once | the same, plus one parse of each pattern; each included file read once |
 | A code pattern | look at the nodes of the pattern's root kind in files holding its literal tokens | the same: memchr for the pattern's rarest literal token prefilters files, one preorder walk of each survivor |
 | A pattern path | one name resolution per candidate path | the same, memoized per node |
 | `references d` | resolve the names spelled like `d` | memchr for the name, resolve each name with that text |
@@ -277,6 +313,12 @@ reference model for a property test only.
 - Patterns inside macro input token trees. A macro's expansion is searched; the tokens a macro
   takes are matched only as text.
 - Edits inside a macro expansion that do not map to one input range are refused, not split.
+- Nested edits inside a `$$$run` capture. A run binds as its text, with no place in the file,
+  so an edit inside it is refused as an overlap. The end state binds a run as a range of
+  sibling nodes that carries its text, and composes an edit inside it like one in a `$name`
+  capture.
+- A template variable bound to a node outside the replaced range. Its text is copied as the
+  file has it, even when another edit of the request rewrites that node where it stands.
 - Rules across checkouts: the target is the daemon's view of one workspace.
 - Build selection for a rules file. `--query`, `--rules` and `--replace` read the daemon's view
   of the whole checkout and refuse `-p`, `--features`, `--target`, target selection and the

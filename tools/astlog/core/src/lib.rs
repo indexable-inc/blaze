@@ -40,9 +40,10 @@ mod scan;
 #[cfg(test)]
 mod tests;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use ast_merge_langs::Lang;
+use astlog_engine::{Base, Includes};
 pub use astlog_engine::{Lint, Severity};
 
 pub use crate::corpus::{Corpus, LineCol, NodeInfo, NodeRef, SourceFile, Value};
@@ -110,8 +111,43 @@ impl Analysis {
 /// Fails on a malformed rules file, an unloadable or unparseable source path,
 /// an invalid tree-sitter query, an unbound variable at evaluation, or
 /// overlapping rewrites.
+/// An `(include ...)` in `rules` is refused: the text has no file to read one beside
+/// ([`analyze_at`] has).
 pub fn analyze(rules: &str, paths: &[PathBuf]) -> Result<Analysis, Error> {
-    let program = Program::parse(rules)?;
+    run(Program::parse(rules)?, paths)
+}
+
+/// [`analyze`] of `rules`, the text of the rules file at `at`: an `(include "path")` reads the
+/// file at `path` relative to the directory of the file it is written in, from disk.
+///
+/// # Errors
+///
+/// As [`analyze`], and an include that names no file, closes a cycle or passes a cap.
+pub fn analyze_at(rules: &str, at: &Path, paths: &[PathBuf]) -> Result<Analysis, Error> {
+    run(Program::load(rules, &Disk { root: at.to_str() })?, paths)
+}
+
+/// Rules files on disk, each include read beside the file that names it. A rules file whose
+/// path is not UTF-8 has no key to read beside, so its includes are refused.
+struct Disk<'a> {
+    root: Option<&'a str>,
+}
+
+impl Includes for Disk<'_> {
+    fn base(&self) -> Base<'_> {
+        Base::Beside(self.root)
+    }
+
+    fn read<R>(&self, key: &str, with: impl FnOnce(&str) -> R) -> std::io::Result<Option<R>> {
+        match std::fs::read_to_string(key) {
+            Ok(text) => Ok(Some(with(&text))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn run(program: Program, paths: &[PathBuf]) -> Result<Analysis, Error> {
     let corpus = Corpus::load(paths)?;
     let facts = eval::TreeFacts::new(&program, &corpus)?;
     let (database, planned) = astlog_engine::run(&program, &facts)?;

@@ -1,0 +1,6 @@
+warning: this thread writes standard output (through `progress(done)`) while the command may hold its lock
+  --> src/lib.rs:17
+warning: this thread writes standard output (through `std::io::stdout()`) while the command may hold its lock
+  --> src/lib.rs:26
+warning: this thread writes standard output (through `log.line("started")`) while the command may hold its lock
+  --> src/lib.rs:60

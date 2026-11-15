@@ -1,0 +1,33 @@
+;; A `match` over `x.below(N)` or `x % N`, `N` a const, whose arms do not number `N`.
+;;
+;; crates/blaze-api/src/frames/identity.rs bounds `fn request`'s integer by
+;; `const REQUESTS: usize = 39` and `fn response`'s by `RESPONSES = 48`, and keeps the arms
+;; in step by hand. Fewer arms than `N` hand the missing integers to `_`, which then comes up
+;; twice as often and hides the variant whose integer was skipped; more arms are dead. The
+;; const is found by resolution, so a `use`d or re-exported const is the same const, and its
+;; value is the integer its literal means (`int-value`), so `39usize` and `0x27` are 39.
+;;
+;; Rule 73: a type ends it (the bound derived from the enum, `E::ALL.len()`); `magic_number`
+;; leaves `const` initializers alone. A rule is right until then.
+
+(rule (bound s b) (expr s "$r.below($b)"))
+(rule (bound s b) (expr s "$x % $b"))
+
+;; The const a match's bound names, and the integer it is.
+(rule (bounded m d i)
+  (bound s b)
+  (parent m s)
+  (kind m "MATCH_EXPR")
+  (descendant b cp)
+  (kind cp "PATH")
+  (resolves cp d)
+  (def-kind d "const")
+  (defines cn d)
+  (child cn lit)
+  (int-value lit i))
+
+(rule (arms m d i n) (bounded m d i) (count n (match-arm m a p e)))
+(rule (picker-count-const m d i n) (arms m d i n) (lt n i))
+(rule (picker-count-const m d i n) (arms m d i n) (lt i n))
+
+(lint picker-count-const error "this match is bounded by `$d` = $i but has $n arms")

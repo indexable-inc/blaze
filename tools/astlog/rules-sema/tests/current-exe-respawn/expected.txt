@@ -1,0 +1,4 @@
+warning: reads this program's path where `fixture_current_exe_respawn::run_again` runs a program: read it once at start
+  --> src/lib.rs:11
+warning: reads this program's path where `fixture_current_exe_respawn::connect` runs a program: read it once at start
+  --> src/lib.rs:32

@@ -60,6 +60,12 @@ pub trait Files {
     /// The view's path of a front-end file; `None` for one outside the view (a registry
     /// dependency's, the standard library's).
     fn path(&self, file: FileId) -> Option<&str>;
+    /// `with` called on the bytes of any file at `path` in the view, a front-end file or not
+    /// (a rules file an astlog `(include ...)` names); `None` when the view has no file there.
+    /// The front end's files alone, unless a view holds more.
+    fn with_bytes<R>(&self, path: &str, with: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        self.file(path).map(|(_, bytes)| with(bytes))
+    }
 }
 
 /// A file's tree after the edits, parsed in place: what the front end's parse of the file whose

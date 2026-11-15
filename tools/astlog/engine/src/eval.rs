@@ -26,7 +26,8 @@ use crate::error::{
     TooManyBindingsSnafu,
     TooManyRowsSnafu, TooManySourceRowsSnafu,
 };
-use crate::program::{AppAtom, BodyAtom, CASES, Language, Program, Term};
+use crate::line::Line;
+use crate::program::{AppAtom, BodyAtom, CASES, Counted, Language, Program, Term};
 
 /// One value in a relation row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -71,7 +72,7 @@ pub trait Facts {
     fn solve(
         &self,
         atom: &<Self::Lang as Language>::Atom,
-        line: usize,
+        line: &Line,
         inputs: &[Option<Value<Self::Node>>],
         out: &mut Vec<Row<Self::Node>>,
     ) -> Result<(), FError<Self>>;
@@ -229,15 +230,22 @@ impl Builtin {
 enum Step<'p, A, N> {
     Scan { relation: usize, args: Vec<Arg<N>>, index: Option<usize>, recursive: bool },
     Not { relation: usize, args: Vec<Arg<N>>, index: Option<usize> },
-    Count { relation: usize, args: Vec<Arg<N>>, index: Option<usize>, result: Arg<N> },
+    Count { counting: Counting<'p, A>, args: Vec<Arg<N>>, result: Arg<N> },
     Builtin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>> },
     /// `(not (text-match ...))`: every argument bound, it holds when the builtin gives no row
     /// that agrees with them.
     NotBuiltin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>> },
     /// `occurrence` keys the atom's answers in [`Evaluator::asked`]: one per atom in the program
     /// text, so two occurrences never share answers they might not agree on.
-    Source { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
-    NotSource { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
+    Source { atom: &'p A, line: &'p Line, args: Vec<Arg<N>>, occurrence: usize },
+    NotSource { atom: &'p A, line: &'p Line, args: Vec<Arg<N>>, occurrence: usize },
+}
+
+/// What a `(count ...)` step reads its rows from.
+enum Counting<'p, A> {
+    Scan { relation: usize, index: Option<usize> },
+    Builtin { builtin: Builtin, app: &'p AppAtom },
+    Source { atom: &'p A, line: &'p Line, occurrence: usize },
 }
 
 /// A source atom occurrence and the inputs it was asked with.
@@ -259,7 +267,7 @@ struct CompiledRule<'p, A, N> {
     relation: usize,
     head: Vec<usize>,
     body: Body<'p, A, N>,
-    line: usize,
+    line: &'p Line,
 }
 
 /// The most rows one run holds at once by default ([`Limits::DEFAULT`]). A rule's join can
@@ -348,7 +356,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            this.rules.push(CompiledRule { relation, head, body, line: rule.line });
+            this.rules.push(CompiledRule { relation, head, body, line: &rule.line });
         }
         Ok(this)
     }
@@ -369,13 +377,13 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             let step = match atom {
                 BodyAtom::Source(source) => Step::Source {
                     atom: &source.value,
-                    line: source.line,
+                    line: &source.line,
                     args: args(&mut names, &source.args, true),
                     occurrence: self.occurrence(),
                 },
                 BodyAtom::NegatedSource(source) => Step::NotSource {
                     atom: &source.value,
-                    line: source.line,
+                    line: &source.line,
                     args: args(&mut names, &source.args, false),
                     occurrence: self.occurrence(),
                 },
@@ -401,16 +409,29 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     Step::Not { relation, args, index }
                 }
                 BodyAtom::Count(count) => {
-                    let relation = self.relation(&count.inner.name)?;
                     // Local variables get slots that nothing after the count reads.
-                    let args = args(&mut names, &count.inner.args, true);
-                    let index = self.index_of(relation, &args);
+                    let args = args(&mut names, count.inner.args(), true);
+                    let counting = match &count.inner {
+                        Counted::App(app) => match Builtin::of(&app.name) {
+                            Some(builtin) => Counting::Builtin { builtin, app },
+                            None => {
+                                let relation = self.relation(&app.name)?;
+                                let index = self.index_of(relation, &args);
+                                Counting::Scan { relation, index }
+                            }
+                        },
+                        Counted::Source(source) => Counting::Source {
+                            atom: &source.value,
+                            line: &source.line,
+                            occurrence: self.occurrence(),
+                        },
+                    };
                     let mut result =
                         crate::eval::args(&mut names, std::slice::from_ref(&count.result), true);
                     let result = result.pop().ok_or_else(|| {
                         InternalSnafu { what: "count without a result".to_owned() }.build()
                     })?;
-                    Step::Count { relation, args, index, result }
+                    Step::Count { counting, args, result }
                 }
             };
             steps.push(step);
@@ -429,7 +450,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         &self,
         occurrence: usize,
         atom: &<F::Lang as Language>::Atom,
-        line: usize,
+        line: &Line,
         inputs: Vec<Option<Value<F::Node>>>,
     ) -> Result<Rc<Vec<Row<F::Node>>>, FError<F>> {
         let key = (occurrence, inputs);
@@ -589,17 +610,8 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     self.solve(body, at + 1, windows, env, emit)?;
                 }
             }
-            Step::Count { relation, args, index, result } => {
-                let rel = &self.relations[*relation];
-                let window = Window { rows: 0..rel.rows.len() };
-                let mut count = 0i64;
-                for row in candidates(rel, *index, args, env, window) {
-                    if let Some(set) = unify(args, row, env) {
-                        clear(env, &set);
-                        count += 1;
-                    }
-                }
-                let value = [Value::Int(count)];
+            Step::Count { counting, args, result } => {
+                let value = [Value::Int(self.count(counting, args, env)?)];
                 if let Some(set) = unify(std::slice::from_ref(result), &value, env) {
                     self.solve(body, at + 1, windows, env, emit)?;
                     clear(env, &set);
@@ -652,6 +664,51 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         Ok(())
     }
 
+    /// How many distinct rows of what a count reads agree with `env`: a relation's rows are
+    /// distinct already, a builtin's or a source atom's are told apart here.
+    fn count(
+        &self,
+        counting: &Counting<'p, <F::Lang as Language>::Atom>,
+        args: &[Arg<F::Node>],
+        env: &mut Env<F::Node>,
+    ) -> Result<i64, FError<F>> {
+        let distinct = |rows: &[Row<F::Node>], env: &mut Env<F::Node>| {
+            let mut seen = HashSet::new_in(Global);
+            for row in rows {
+                if let Some(set) = unify(args, row, env) {
+                    clear(env, &set);
+                    seen.insert(row);
+                }
+            }
+            seen.len()
+        };
+        let count = match counting {
+            Counting::Scan { relation, index } => {
+                let rel = &self.relations[*relation];
+                let window = Window { rows: 0..rel.rows.len() };
+                let mut count = 0usize;
+                for row in candidates(rel, *index, args, env, window) {
+                    if let Some(set) = unify(args, row, env) {
+                        clear(env, &set);
+                        count += 1;
+                    }
+                }
+                count
+            }
+            Counting::Builtin { builtin, app } => {
+                distinct(&self.builtin(*builtin, app, args, env)?, env)
+            }
+            Counting::Source { atom, line, occurrence } => {
+                let inputs = args.iter().map(|arg| input(arg, env)).collect();
+                distinct(&self.source_rows(*occurrence, atom, *line, inputs)?, env)
+            }
+        };
+        // A count is of rows the run holds, which `Limits::rows` keeps far under `i64::MAX`.
+        i64::try_from(count).map_err(|_| {
+            InternalSnafu { what: format!("a count of {count} rows is past i64") }.build()
+        })
+    }
+
     /// The rows a builtin holds for, given its inputs.
     fn builtin(
         &self,
@@ -682,7 +739,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             match value(at)? {
                 Value::Node(node) => Ok(node),
                 other => BuiltinNotNodeSnafu {
-                    line: app.line,
+                    line: &app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: other.what(),
@@ -694,7 +751,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             let n = node(at)?;
             facts.span(n).ok_or_else(|| {
                 BuiltinNotNodeSnafu {
-                    line: app.line,
+                    line: &app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: "not syntax",
@@ -706,7 +763,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             match value(at)? {
                 Value::Int(int) => Ok(int),
                 other => BuiltinNotNumberSnafu {
-                    line: app.line,
+                    line: &app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: other.what(),
@@ -806,7 +863,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     .fail();
                 };
                 let cased = recase(&text, case).ok_or_else(|| {
-                    CaseNotIdentifierSnafu { line: app.line, text: text.as_ref() }.build()
+                    CaseNotIdentifierSnafu { line: &app.line, text: text.as_ref() }.build()
                 })?;
                 vec![vec![subject, style, Value::Text(Arc::from(cased.as_str()))]]
             }
@@ -832,7 +889,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
     pub fn bindings(
         &mut self,
         atoms: &'p [BodyAtom<<F::Lang as Language>::Atom>],
-        line: usize,
+        line: &Line,
     ) -> Result<Vec<Binding<F::Node>>, FError<F>> {
         let body = self.compile(atoms)?;
         let mut out = Vec::new();

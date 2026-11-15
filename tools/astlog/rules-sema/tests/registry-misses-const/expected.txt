@@ -1,0 +1,2 @@
+error: `fixture_registry_misses_const::schema::PANICS` is in no registry array of its module
+  --> src/lib.rs:14

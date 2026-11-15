@@ -952,29 +952,67 @@ fn replaced(place: &Place, flags: &args::Flags, color: bool) -> i32 {
         }
         replace::replace(&place.root, edits, flags.dry_run)
     });
-    match done {
-        Ok(replace::Made { diff: Some(diff), edited }) => {
-            let written = io::stdout().lock().write_all(diff.as_bytes());
-            let rest = format!("{} item(s), nothing written", edited.items.len());
-            blaze_report::err!("{}", say::status("Would edit", &rest, color));
-            if written.is_ok() { 0 } else { Exit::Failed.code() }
-        }
-        Ok(replace::Made { edited, diff: None }) => {
-            let mut files: Vec<&str> = edited.items.iter().map(|it| it.file.as_str()).collect(); // alloc: CLI edge, the files named once
-            files.sort_unstable();
-            files.dedup();
-            let rest = format!(
-                "{} item(s) in {} file(s): {}",
-                edited.items.len(),
-                files.len(),
-                files.join(", ")
-            );
-            blaze_report::err!("{}", say::status("Replaced", &rest, color));
-            0
-        }
+    let made = match done {
+        Ok(made) => made,
         Err(what) => {
             blaze_report::err!("{}", say::error(&what, color));
-            Exit::Failed.code()
+            return Exit::Failed.code();
+        }
+    };
+    let written = match &made.diff {
+        Some(diff) => io::stdout().lock().write_all(diff.as_bytes()),
+        None => Ok(()),
+    };
+    if let Some(status) = Status::of(&made, flags.quiet) {
+        blaze_report::err!("{}", say::status(status.verb(), &status.to_string(), color));
+    }
+    if written.is_ok() { 0 } else { Exit::Failed.code() }
+}
+
+/// The status line after `--rules` or `--replace`: what `--dry-run` would edit, or what was
+/// edited and in which files. `-q` drops it, as cargo's drops its own status lines; the diff
+/// and an error are still written.
+struct Status<'m>(&'m replace::Made);
+
+impl<'m> Status<'m> {
+    fn of(made: &'m replace::Made, quiet: bool) -> Option<Self> {
+        (!quiet).then_some(Status(made))
+    }
+
+    fn verb(&self) -> &'static str {
+        match self.0.diff {
+            Some(_) => "Would edit",
+            None => "Replaced",
+        }
+    }
+}
+
+impl std::fmt::Display for Status<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let edited = &self.0.edited;
+        if self.0.diff.is_some() {
+            return write!(f, "{}, nothing written", Count(edited));
+        }
+        let mut files: Vec<&str> = edited.items.iter().map(|it| it.file.as_str()).collect(); // alloc: CLI edge, the files named once
+        files.sort_unstable();
+        files.dedup();
+        write!(f, "{} in {} file(s): {}", Count(edited), files.len(), files.join(", "))
+    }
+}
+
+/// What an edit request edited, as its status line counts it: the items, and apart from them
+/// each module whose scope changed (`How::Scope`: its `use`s, its macro calls, or the names it
+/// declares). Renaming three fns of one module edits the three and that module's scope, whose
+/// names changed though no line of its own did, so that is "3 item(s) and 1 module scope(s)",
+/// never "4 item(s)" over a diff of three fns.
+struct Count<'e>(&'e blaze_api::intent::Edited);
+
+impl std::fmt::Display for Count<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scopes = self.0.items.iter().filter(|it| it.how == blaze_api::intent::How::Scope).count();
+        match self.0.items.len() - scopes {
+            items if scopes == 0 => write!(f, "{items} item(s)"),
+            items => write!(f, "{items} item(s) and {scopes} module scope(s)"),
         }
     }
 }

@@ -1,0 +1,19 @@
+;; A `match` that picks enum variants by hand-kept integers: four or more arms `k => E::V ..`.
+;;
+;; crates/blaze-api/src/frames/identity.rs picks 39 requests and 48 responses this way, beside
+;; `const REQUESTS: usize = 39` and `const RESPONSES: usize = 48`. A new variant must be added
+;; to the enum, the table, the count and the index by hand, and a skipped integer (`34` in
+;; `fn request`) silently hands its variant to the `_` arm. The tool sees the variants by
+;; resolution, so the integers are counted per `match` only where each arm makes a variant.
+;;
+;; Rule 73: a type is the end (draw from `E::ALL`, or a reflected variant list); the lint
+;; `blaze::hand_kept_variant_list` reads lists in the enum's own impls only. This is the
+;; advice until that lint reads integer pickers too.
+
+(include "tools/astlog/rules-sema/lib/int-arms.astlog")
+
+;; Counted per enum: a `match` that makes variants of two enums is two pickers.
+(rule (picks m a e) (generated m a i d) (def-parent d e))
+(rule (int-arm-variant-picker m n e v) (picks m a e) (count n (picks m x e)) (le 4 n) (variant-count e v))
+
+(lint int-arm-variant-picker warning "$n arms pick from the $v variants of `$e` by a hand-kept integer: draw from the enum's own list")
