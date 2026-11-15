@@ -16,7 +16,11 @@ branch's head, which contains origin/main), waits for the merge gate, and merges
 passes and the quote still holds for the head GitHub has (`'{"follow": true}'` resumes the waiting).
 It refuses to open, resume or merge without that quote (`proof-before-merge`); the gate's compile
 and unit tests do not stand in for it, and an admin merge needs it as much as any other. Harnesses
-run after merge in the release train. Never push to main.
+run after merge in the release train. Never push to main. Sessions that share main land in turns:
+before the last `git merge origin/main` and its smoke, a session tells the others it is landing,
+they hold main until it says the merge is in (or thirty minutes pass), and it then says what moved
+and which files; a quote is made once, not once per session that moved main under it. `land.py`
+waits for the checks: start it in the background and go on with other work.
 
 See [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change).
 
