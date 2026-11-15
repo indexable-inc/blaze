@@ -4264,14 +4264,15 @@ fn two_crate_front(app: &str, dep: &str) -> blaze_lower::Lowered {
 }
 
 /// What `app`'s narrow key holds of `dep` for a check: the key its check outcome is filed under
-/// holds `dep` by this part alone (`blaze_lower::Lowered::narrow_parts`, design section 15).
+/// holds `dep` by this part alone, its surface, or what stands in for one
+/// (`blaze_lower::Lowered::narrow_parts`, design section 15).
 fn dep_interface_part(lowered: &blaze_lower::Lowered) -> Result<ContentId, String> {
     lowered
         .narrow_parts(0)
         .into_iter()
-        .find(|(what, _)| what.starts_with("the interface") && what.contains("of the crate dep "))
+        .find(|(what, _)| what.starts_with("the surface") && what.contains("of the crate dep "))
         .map(|(_, part)| part)
-        .ok_or_else(|| format!("no interface part of `dep` in `app`'s narrow key: {:?}", lowered.narrow_parts(0)))
+        .ok_or_else(|| format!("no surface part of `dep` in `app`'s narrow key: {:?}", lowered.narrow_parts(0)))
 }
 
 /// The cross-crate form of [`renominal_never_stale`]: `app` on `dep_before` built and kept;
@@ -4365,7 +4366,7 @@ fn dep_renominal(seed: u64, case: &DepRenominal, carried: bool, renamed: bool) -
 ///
 /// The invariant: `app`'s `caller`, served from the entries a build kept, equals a database of
 /// the edited tree served nothing; the item store finds no served answer that disagrees; and
-/// `app`'s check outcome is keyed anew (its narrow key's interface of `dep` moves), so rustc's
+/// `app`'s check outcome is keyed anew (its narrow key's surface of `dep` moves), so rustc's
 /// rejection of `app` is not replayed away. The control: an edit of a private body of `dep`
 /// moves neither, and `app`'s bodies are all served.
 #[test]
