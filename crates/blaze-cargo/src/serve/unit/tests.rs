@@ -3941,3 +3941,29 @@ fn the_oracle_catches_a_driver_that_says_identities_unchanged() {
     let _planted = Planted::set(&bodies::CLEAN_IDENTITIES);
     assert!(carried_serve(8).is_err(), "the oracle passed a carry told no identity moved");
 }
+
+/// The invariant: two units of one package that differ only by features and profile (cargo's
+/// host and target copies of libc's build script run in a build with no `--target`) have two
+/// subjects, so `blaze why` compares each with its own last miss; a unit with no such twin
+/// keeps its subject across an edit of its features, which `why` then names.
+#[test]
+fn twin_units_have_their_own_subjects_and_a_lone_one_keeps_its_own() {
+    use super::compile::{TWINS_UNTOLD, subject_among};
+    use blaze_units::schema::DebugInfo;
+    let run = || unit("registry#libc@0.2.174", target("build-script-build", "custom-build", "build.rs"), Mode::RunCustomBuild, &[]);
+    let host = Unit { features: vec!["std".to_owned()], profile: Profile { debuginfo: DebugInfo::Level(0), ..profile() }, ..run() };
+    let target_side = Unit { features: vec!["extra_traits".to_owned(), "std".to_owned()], ..run() };
+    let twins = [host, target_side];
+    let of = |units: &[Unit], at: usize| subject_among("/w", &units[at], units).unwrap();
+    assert_ne!(of(&twins, 0), of(&twins, 1), "twins have a subject each");
+
+    let lone = [run()];
+    let edited = [Unit { features: vec!["const-extern-fn".to_owned()], ..run() }];
+    assert_eq!(of(&lone, 0), of(&edited, 0), "a lone unit's features are no part of its subject");
+
+    // The control: with twins named as any unit, as until 2026-11-15, they share one.
+    TWINS_UNTOLD.set(true);
+    let planted = (of(&twins, 0), of(&twins, 1));
+    TWINS_UNTOLD.set(false);
+    assert_eq!(planted.0, planted.1, "the oracle's difference is missed");
+}

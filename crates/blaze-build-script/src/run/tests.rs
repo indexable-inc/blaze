@@ -147,6 +147,28 @@ fn a_run_in_cargos_second_layout() {
     assert_eq!(files.stderr.0, dir.join("stderr"));
     assert_eq!(files.root_output, (dir.join("root-output"), path_bytes(&unit.out_dir).unwrap()));
     assert!(!is_second_layout(&target.join("debug/build/foo-1/out")));
+    // The run's own directory holds `OUT_DIR` and `run/`; what an earlier run left is [`files`]'.
+    assert_eq!(own_dir(&unit), Some(target.join("debug/build/foo/0123456789abcdef")));
+    assert_eq!(earlier(&unit), [files.printed.0, files.stderr.0, files.root_output.0]);
+}
+
+/// The directory made for a run alone ([`own_dir`]): the unit's hash directory in cargo's
+/// second layout, its run directory in its first, and none for an `OUT_DIR` in neither,
+/// whose parent may hold another's (a workspace's `out`).
+#[test]
+fn a_runs_own_directory_is_its_units_alone() {
+    let (_dir, mut unit) = package("own");
+    let target = unit.script.ancestors().nth(4).unwrap().to_owned();
+    for (out_dir, own) in [
+        ("debug/build/foo/0123456789abcdef/out", Some("debug/build/foo/0123456789abcdef")),
+        ("debug/build/foo-0123456789abcdef/out", Some("debug/build/foo-0123456789abcdef")),
+        ("debug/build/foo-1/out", None),
+        ("out", None),
+        ("debug/foo-0123456789abcdef/out", None),
+    ] {
+        unit.out_dir = target.join(out_dir);
+        assert_eq!(own_dir(&unit), own.map(|it| target.join(it)), "{out_dir}");
+    }
 }
 
 /// What is logged, read in the bytes, against `str::lines` of the output read lossily (what

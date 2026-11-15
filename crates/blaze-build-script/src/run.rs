@@ -100,6 +100,32 @@ fn layout(unit: &Unit) -> (PathBuf, &'static str) {
     }
 }
 
+/// The directory made for `unit`'s runs alone around its `OUT_DIR`: `build/<package>/<hash>`
+/// in cargo's second layout (`OUT_DIR`, [`run_dir`] and the live record beside them), the
+/// [`run_dir`] `build/<package>-<hash>` in its first; the hash is the run unit's own, so no
+/// other unit writes there. `None` for an `OUT_DIR` in neither layout, whose parent may be
+/// another's.
+pub fn own_dir(unit: &Unit) -> Option<PathBuf> {
+    let around = unit.out_dir.parent()?;
+    if is_second_layout(&unit.out_dir) {
+        return Some(around.to_owned());
+    }
+    let hash = around.file_name()?.to_str()?.rsplit_once('-')?.1;
+    let build = around.parent().and_then(Path::file_name);
+    let first = unit.out_dir.file_name().is_some_and(|it| it == "out")
+        && hash.len() == 16
+        && hash.bytes().all(|it| it.is_ascii_hexdigit())
+        && build.is_some_and(|it| it == "build");
+    first.then(|| around.to_owned()) // alloc: setup, once per run
+}
+
+/// What an earlier run of `unit` left in its directory that a run could read: the paths of
+/// [`files`] (what it printed, its `stderr`, its `root-output`).
+pub fn earlier(unit: &Unit) -> [PathBuf; 3] {
+    let (dir, name) = layout(unit);
+    [dir.join(name), dir.join("stderr"), dir.join("root-output")]
+}
+
 /// Whether `out_dir` is in a unit's directory of cargo's second layout,
 /// `build/<package>/<hash>/out`, where the hash is sixteen hexadecimal digits.
 pub fn is_second_layout(out_dir: &Path) -> bool {
@@ -254,11 +280,11 @@ pub struct Files<'a> {
 /// The [`Files`] of a run of `unit` that printed `stdout` and `stderr`: an error for an
 /// `OUT_DIR` that is not Unicode where paths are not bytes, as cargo's.
 pub fn files<'a>(unit: &'a Unit, stdout: &'a [u8], stderr: &'a [u8]) -> std::io::Result<Files<'a>> {
-    let (dir, name) = layout(unit);
+    let [printed, stderr_at, root_output] = earlier(unit);
     Ok(Files {
-        printed: (dir.join(name), stdout),
-        stderr: (dir.join("stderr"), stderr),
-        root_output: (dir.join("root-output"), path_bytes(&unit.out_dir)?),
+        printed: (printed, stdout),
+        stderr: (stderr_at, stderr),
+        root_output: (root_output, path_bytes(&unit.out_dir)?),
     })
 }
 

@@ -91,8 +91,11 @@ impl Began {
     /// every directory above it are `lstat`ed, and one whose last change can share a tick
     /// with the run's start or come after it ([`blaze_vfs::racy`]) has moved. A path whose names
     /// can't be told has moved: it is never taken as still. Conservative: a change beside the
-    /// name in its directory, or the run's own write of what it read, counts as a move, and
-    /// the pass is not kept, never a stale one kept.
+    /// name in its directory counts as a move, and the pass is not kept, never a stale one
+    /// kept. No read of a build script's run here is of its own product: its `OUT_DIR` and
+    /// the directory made for it around that (the live record made there as it runs), whose
+    /// reads [`crate::run::Run::complete`] drops first ([`crate::run::Spec::product`]), and
+    /// its sandbox's own temporary directory, which the sandbox never traces.
     pub fn moved(&self, traced: &blaze_core::Traced) -> Option<Moved> {
         // A `stat` of each name the watches can't vouch for, and of every directory above it:
         // a row naming how many paths were asked, so its time is never unnamed.
@@ -118,10 +121,9 @@ impl Began {
             // alloc: once per run not kept, the path its line names
             return Some(Moved { read: path.to_path_buf(), at: path.to_path_buf(), why: MovedWhy::Untold });
         };
-        let last = names.len() - 1; // `names` ends with the name the path leads to
-        names.iter().enumerate().find_map(|(n, name)| {
+        names.iter().find_map(|(name, is)| {
             let at = stamped_since(name, self.wall_ns)?;
-            let why = MovedWhy::of(path, name, n == last, at);
+            let why = MovedWhy::of(path, name, *is, at);
             tracing::info!(
                 target: "blaze",
                 read = %path.display(),
@@ -158,22 +160,26 @@ pub enum MovedWhy {
     Above,
     /// A link the path read is named through.
     Link,
-    /// What a link on the way to the path read leads to, or a directory above that.
+    /// A directory the path read climbs out of with `..` (gcc's `lib/gcc/<triple>/13/../../..`).
+    Climbed,
+    /// What a link or a `..` on the way to the path read leads to, or a directory above that.
     Through,
     /// The names the read's answer rests on can't be told (a path that is not absolute,
-    /// has `..` in it, more than [`MOST_LINKS`] links or a part that can't be read): it is
-    /// taken as changed.
+    /// has a `..` below a name that is not a directory, more than [`MOST_LINKS`] links or a
+    /// part that can't be read): it is taken as changed.
     Untold,
 }
 
 impl MovedWhy {
-    /// How `at`, the name [`stamped_since`] found of `name` (the last of [`names`] of `path`
-    /// when `last`), stands to `path`.
-    fn of(path: &Path, name: &Path, last: bool, at: &Path) -> MovedWhy {
+    /// How `at`, the name [`stamped_since`] found of `name` (one of [`names`] of `path`, which
+    /// is to it as `is` says), stands to `path`.
+    fn of(path: &Path, name: &Path, is: NameIs, at: &Path) -> MovedWhy {
         if at == path {
             MovedWhy::Itself
-        } else if !last && at == name {
+        } else if is == NameIs::Link && at == name {
             MovedWhy::Link
+        } else if is == NameIs::Climbed && at == name {
+            MovedWhy::Climbed
         } else if path.starts_with(at) {
             MovedWhy::Above
         } else {
@@ -187,6 +193,7 @@ impl MovedWhy {
             MovedWhy::Itself => "itself",
             MovedWhy::Above => "above",
             MovedWhy::Link => "link",
+            MovedWhy::Climbed => "climbed",
             MovedWhy::Through => "through",
             MovedWhy::Untold => "untold",
         }
@@ -214,8 +221,11 @@ impl fmt::Display for Said<'_> {
             MovedWhy::Itself => write!(f, "{read} changed after {who} began"),
             MovedWhy::Above => write!(f, "{at}, above {read} which it read, changed after {who} began"),
             MovedWhy::Link => write!(f, "{at}, a link on the way to {read} which it read, changed after {who} began"),
+            MovedWhy::Climbed => {
+                write!(f, "{at}, a directory {read} (which it read) climbs out of with `..`, changed after {who} began")
+            }
             MovedWhy::Through => {
-                write!(f, "{at}, reached through a link from {read} which it read, changed after {who} began")
+                write!(f, "{at}, reached through a link or a `..` from {read} which it read, changed after {who} began")
             }
             MovedWhy::Untold => write!(
                 f,
@@ -278,10 +288,18 @@ pub(crate) const MOST_LINKS: usize = 40;
 /// A link pointed elsewhere is a change in the link's own directory, and the file changed is
 /// one in its own: with a watch over each, nothing the answer depends on moves unheard. A
 /// missing path's name is the first part of it that is not there: the name that would be made.
-/// `None` for a path that is not absolute, has `..` in it, has more than [`MOST_LINKS`]
-/// links, or of which a part before the last is unreadable. Cold: on a miss only, and once
+/// A `..`, in the path or in a link's target, is the parent of the name resolved so far, as
+/// the kernel resolves it: `/lib/../lib`, with `/lib` a link to `usr/lib`, is `/usr/lib`, and
+/// rests on `/lib` and `/usr/lib` (gcc names its library directories so). The directory a
+/// `..` climbs out of is a name the answer rests on too, unless it is above another name,
+/// whose stamp asks of it already: gcc's `lib/gcc/<triple>/13/../../../include` leads
+/// anywhere only while `13` is there, a directory it may search, and a change of `13` is
+/// heard in `lib/gcc/<triple>`, which is above no other name of the path.
+/// `None` for a path that is not absolute, has a `..` below a name that is not a directory
+/// (the kernel's `ENOTDIR`), has more than [`MOST_LINKS`] links, or of which a part before the
+/// last is unreadable. Cold: on a miss only, and once
 /// per path a kept test pass read ([`Began::moved`]).
-fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
+fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<(PathBuf, NameIs)>> {
     use std::path::Component;
     let mut parts = path.components();
     if parts.next() != Some(Component::RootDir) {
@@ -292,31 +310,45 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     for part in parts {
         match part {
             Component::Normal(name) => left.push(name.to_owned()),
+            Component::ParentDir if !PARENT_IS_UNTOLD.get() => left.push("..".into()),
             _ => return None,
         }
     }
     left.reverse();
     let mut names = Vec::new(); // alloc: cold, as above
     let mut at = PathBuf::from("/"); // alloc: cold, as above
+    // Whether `at` is a directory: a `..` below a name that is not one is the kernel's
+    // `ENOTDIR`, whose answer no name here vouches for.
+    let mut at_dir = true;
+    let mut links = 0;
     // Bounded: each turn takes one part, and only a link, of which there are at most
     // `MOST_LINKS`, adds any.
     while let Some(part) = left.pop() {
         if part == ".." {
-            // Of a link's target: `at` has no link in it, so its parent is the name's.
+            // `at` has no link in it, so its parent is the name's; `at` itself, climbed out
+            // of, is a name the answer rests on: the path leads anywhere only while it is
+            // there and a directory.
+            if !at_dir {
+                return None;
+            }
+            if !CLIMBED_IS_UNSTAMPED.get() {
+                names.push((at.clone(), NameIs::Climbed)); // clone: cold, as above
+            }
             at.pop();
             continue;
         }
         let name = at.join(&part);
         match std::fs::symlink_metadata(&name) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                if names.len() == MOST_LINKS {
+                if links == MOST_LINKS {
                     return None;
                 }
+                links += 1;
                 let target = std::fs::read_link(&name).ok()?;
-                names.push(name);
+                names.push((name, NameIs::Link));
                 for part in target.components().rev() {
                     match part {
-                        Component::RootDir => at = PathBuf::from("/"),
+                        Component::RootDir => (at, at_dir) = (PathBuf::from("/"), true),
                         Component::CurDir => {}
                         Component::ParentDir => left.push("..".into()),
                         Component::Normal(name) => left.push(name.to_owned()),
@@ -324,7 +356,7 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
                     }
                 }
             }
-            Ok(_) => at = name,
+            Ok(meta) => (at, at_dir) = (name, meta.is_dir()),
             // The name that would be made, for a path that is not there: its last part, or
             // the first part of it that is missing (nothing below a name that is not there
             // is, until that name is made, which its directory hears). Until 2026-11-12 a
@@ -339,8 +371,46 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
             Err(_) => return None,
         }
     }
-    names.push(at);
+    names.push((at, NameIs::End));
+    // A directory climbed out of that is another name or above one is asked of with that
+    // name ([`stamped_since`] asks of every directory above it): kept once, as the first of
+    // two equal ones.
+    let covered = |n: usize, name: &Path| {
+        names.iter().enumerate().any(|(m, (other, is))| {
+            m != n && other.starts_with(name) && (other != name || *is != NameIs::Climbed || m < n)
+        })
+    };
+    // alloc: cold, as above
+    let kept: Vec<bool> =
+        names.iter().enumerate().map(|(n, (name, is))| *is != NameIs::Climbed || !covered(n, name)).collect();
+    let mut kept = kept.into_iter();
+    names.retain(|_| kept.next().unwrap_or(true));
     Some(names)
+}
+
+/// What a name [`names`] gives is to the path it was asked of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NameIs {
+    /// A link the path is named through, where it is.
+    Link,
+    /// A directory the path climbs out of with `..`: the path leads anywhere only while it is
+    /// there and a directory.
+    Climbed,
+    /// What the path leads to, the last name.
+    End,
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a path with a `..` in it has no names, so a run
+    /// that read one (every C compile, through gcc's own `..` paths) is never kept, as until
+    /// 2026-11-15. Never set outside a test.
+    #[doc(hidden)]
+    pub static PARENT_IS_UNTOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A planted bug, for a test's control: a directory climbed out of with `..` is no name,
+    /// so a change of it after a run began (who may search it) is not seen. Never set outside
+    /// a test.
+    #[doc(hidden)]
+    pub static CLIMBED_IS_UNSTAMPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Files {
@@ -1014,7 +1084,9 @@ mod tests {
             assert_eq!(began.moved(&read(&through, Some([1; 32]))), Some(moved(&through, &link, MovedWhy::Link)));
         }
 
-        for untold in [Path::new("relative/file"), Path::new("/a/../b")] {
+        // Not absolute; a `..` after a file, which leads nowhere (the kernel's `ENOTDIR`).
+        let after_a_file = file.join("../b");
+        for untold in [Path::new("relative/file"), after_a_file.as_path()] {
             let said = began.moved(&read(untold, Some([1; 32])));
             assert_eq!(said, Some(moved(untold, untold, MovedWhy::Untold)));
             let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
@@ -1022,14 +1094,18 @@ mod tests {
         }
 
         // How a name stands to the read, for a file that is there: a directory above it whose
-        // stamp moved while the file's did not, and what a link on its way leads to.
-        let (c, f) = (Path::new("/a/b/c"), Path::new("/a/l/f"));
-        assert_eq!(MovedWhy::of(c, c, true, Path::new("/a/b")), MovedWhy::Above);
-        assert_eq!(MovedWhy::of(c, c, true, c), MovedWhy::Itself);
-        assert_eq!(MovedWhy::of(f, Path::new("/a/l"), false, Path::new("/a/l")), MovedWhy::Link);
-        assert_eq!(MovedWhy::of(f, Path::new("/a/l"), false, Path::new("/a")), MovedWhy::Above);
-        assert_eq!(MovedWhy::of(f, Path::new("/x/f"), true, Path::new("/x/f")), MovedWhy::Through);
-        assert_eq!(MovedWhy::of(f, Path::new("/x/f"), true, Path::new("/x")), MovedWhy::Through);
+        // stamp moved while the file's did not, what a link on its way leads to, and a
+        // directory it climbs out of with `..`.
+        let (c, f, up) = (Path::new("/a/b/c"), Path::new("/a/l/f"), Path::new("/a/u/../c"));
+        assert_eq!(MovedWhy::of(c, c, NameIs::End, Path::new("/a/b")), MovedWhy::Above);
+        assert_eq!(MovedWhy::of(c, c, NameIs::End, c), MovedWhy::Itself);
+        assert_eq!(MovedWhy::of(f, Path::new("/a/l"), NameIs::Link, Path::new("/a/l")), MovedWhy::Link);
+        assert_eq!(MovedWhy::of(f, Path::new("/a/l"), NameIs::Link, Path::new("/a")), MovedWhy::Above);
+        assert_eq!(MovedWhy::of(f, Path::new("/x/f"), NameIs::End, Path::new("/x/f")), MovedWhy::Through);
+        assert_eq!(MovedWhy::of(f, Path::new("/x/f"), NameIs::End, Path::new("/x")), MovedWhy::Through);
+        assert_eq!(MovedWhy::of(up, Path::new("/a/u"), NameIs::Climbed, Path::new("/a/u")), MovedWhy::Climbed);
+        assert_eq!(MovedWhy::of(up, Path::new("/a/u"), NameIs::Climbed, Path::new("/a")), MovedWhy::Above);
+        assert_eq!(MovedWhy::of(up, Path::new("/a/c"), NameIs::End, Path::new("/a/c")), MovedWhy::Through);
 
         let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
         assert_eq!(later.moved(&read(&file, Some([1; 32]))), None, "the control");
@@ -1208,11 +1284,11 @@ mod tests {
         std::os::unix::fs::symlink("../sdks/named/lib", dir.join("other/lib")).unwrap();
         let hash = Some(blaze_ids::b3::hash(b"one"));
         assert_eq!(
-            names(&dir.join("sdks/named/lib/m"), hash),
+            paths_of(&dir.join("sdks/named/lib/m"), hash),
             Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/m"), dir.join("sdks/real/lib/system")])
         );
         assert_eq!(
-            names(&dir.join("other/lib/m"), hash),
+            paths_of(&dir.join("other/lib/m"), hash),
             Some(vec![
                 dir.join("other/lib"),
                 dir.join("sdks/named"),
@@ -1220,25 +1296,155 @@ mod tests {
                 dir.join("sdks/real/lib/system"),
             ])
         );
-        assert_eq!(names(&dir.join("sdks/real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
-        assert_eq!(names(&dir.join("sdks/named/lib/gone"), None), Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/gone")]));
+        assert_eq!(paths_of(&dir.join("sdks/real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
+        assert_eq!(paths_of(&dir.join("sdks/named/lib/gone"), None), Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/gone")]));
         // The invariant: a path missing a part before its last rests on that part's name.
-        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), Some(vec![dir.join("sdks/gone")]));
+        assert_eq!(paths_of(&dir.join("sdks/gone/lib/m"), None), Some(vec![dir.join("sdks/gone")]));
         // The control: as until 2026-11-12, such a path is vouched for by nothing.
         MISSING_PARENT_IS_UNVOUCHED.set(true);
-        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "planted");
+        assert_eq!(paths_of(&dir.join("sdks/gone/lib/m"), None), None, "planted");
         MISSING_PARENT_IS_UNVOUCHED.set(false);
-        // A `.` names nothing (`Path::components` drops it); a `..` may cross a link, and is
-        // not resolved here.
-        assert_eq!(names(&dir.join("sdks/./real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
-        assert_eq!(names(&dir.join("sdks/named/../real/lib/system"), hash), None);
-        assert_eq!(names(Path::new("relative/a"), hash), None);
+        // A `.` names nothing (`Path::components` drops it); a `..` is of the directory the
+        // links before it led to (`sdks/real`), which is above the file, so no name of its own.
+        assert_eq!(paths_of(&dir.join("sdks/./real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
+        assert_eq!(
+            paths_of(&dir.join("sdks/named/../real/lib/system"), hash),
+            Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/system")])
+        );
+        // `other/lib` is `sdks/real/lib`, whose parent the `..` climbs to: above the file.
+        assert_eq!(
+            paths_of(&dir.join("other/lib/../lib/m"), hash),
+            Some(vec![
+                dir.join("other/lib"),
+                dir.join("sdks/named"),
+                dir.join("sdks/real/lib/m"),
+                dir.join("sdks/real/lib/system"),
+            ])
+        );
+        // A `..` below a file is the kernel's `ENOTDIR`: vouched for by nothing.
+        assert_eq!(paths_of(&dir.join("sdks/real/lib/system/../system"), hash), None);
+        assert_eq!(paths_of(Path::new("relative/a"), hash), None);
         std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
-        assert_eq!(names(&dir.join("loop"), hash), None, "a link to itself ends at the bound");
+        assert_eq!(paths_of(&dir.join("loop"), hash), None, "a link to itself ends at the bound");
 
         // Read through the links, the file's answer is the file's.
         let path = dir.join("sdks/named/lib/m");
         assert_eq!(Files::new().file(&path, &Looks::none()).unwrap(), hash);
+    }
+
+    /// [`names`] by path alone, for a test that asks only which names a path rests on.
+    fn paths_of(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
+        names(path, answer).map(|names| names.into_iter().map(|it| it.0).collect())
+    }
+
+    /// gcc's own layout under `root`, as its driver and `cc1` name it: the version directory
+    /// `lib/gcc/aarch64-linux-gnu/13`, a header reached from it by `..`s, and an include
+    /// directory reached so that is not there. With the version directory.
+    fn gcc_like(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let version = root.join("lib/gcc/aarch64-linux-gnu/13");
+        std::fs::create_dir_all(&version).unwrap();
+        std::fs::create_dir_all(root.join("include")).unwrap();
+        std::fs::write(root.join("include/stdio.h"), b"int printf(const char *, ...);").unwrap();
+        let header = version.join("../../../../include/stdio.h");
+        let missing = version.join("../../../../aarch64-linux-gnu/include");
+        (version, header, missing)
+    }
+
+    fn read_of(path: &Path, answer: Option<[u8; 32]>) -> blaze_core::Traced {
+        blaze_core::Traced { files: vec![(path.to_path_buf(), answer)], ..Default::default() }
+    }
+
+    /// The invariant: a read named through `..` (every C compile a build script runs reads
+    /// gcc's own such paths) rests on the names the kernel takes for it, the directory it
+    /// climbs out of and the name it ends at, and when none of them changed since the run
+    /// began it has not moved: the run is kept.
+    #[test]
+    fn a_read_through_dot_dot_is_still_when_nothing_it_rests_on_moved() {
+        let made = TempDir::for_test("blaze-usercode-dotdot-");
+        let root = std::fs::canonicalize(&made).unwrap();
+        let (version, header, missing) = gcc_like(&root);
+        assert_eq!(
+            names(&header, Some([1; 32])),
+            Some(vec![(version.clone(), NameIs::Climbed), (root.join("include/stdio.h"), NameIs::End)])
+        );
+        // Not there: the first part missing below where the `..`s lead.
+        assert_eq!(
+            names(&missing, None),
+            Some(vec![(version.clone(), NameIs::Climbed), (root.join("aarch64-linux-gnu"), NameIs::End)])
+        );
+        let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
+        for traced in [read_of(&header, Some([1; 32])), read_of(&missing, None)] {
+            assert_eq!(later.moved(&traced), None, "nothing it rests on moved: {traced:?}");
+        }
+    }
+
+    /// The control (rule 23) of [`a_read_through_dot_dot_is_still_when_nothing_it_rests_on_moved`]:
+    /// with a `..` taken as untold, as until 2026-11-15, the same reads have moved however long
+    /// before them the run began, which kept libsqlite3-sys's and ring's runs under no key in
+    /// every build.
+    #[test]
+    fn the_oracle_catches_a_dot_dot_read_taken_as_untold() {
+        let made = TempDir::for_test("blaze-usercode-dotdot-planted-");
+        let root = std::fs::canonicalize(&made).unwrap();
+        let (_, header, missing) = gcc_like(&root);
+        let later = Began { wall_ns: wall_ns() + 3 * RACY_NS };
+        PARENT_IS_UNTOLD.set(true);
+        let planted = [&header, &missing].map(|path| later.moved(&read_of(path, Some([1; 32]))));
+        PARENT_IS_UNTOLD.set(false);
+        for (path, planted) in [&header, &missing].into_iter().zip(planted) {
+            let untold = Moved { read: path.clone(), at: path.clone(), why: MovedWhy::Untold };
+            assert_eq!(planted, Some(untold), "the oracle's `None` is missed: {}", path.display());
+        }
+    }
+
+    /// The invariant: the directory a read climbs out of with `..` is a name it rests on, though
+    /// the name the path ends at is not below it: a change of it after the run began (here a
+    /// change of who may search it: a process that may not is refused the path, `EACCES`) is a
+    /// move, named by that directory. (A directory removed, made a file or a link is a move of
+    /// itself: its path is then untold, or names the link, as it is asked of after the run.)
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_climbed_out_of_is_a_name_the_read_rests_on() {
+        let made = TempDir::for_test("blaze-usercode-climbed-");
+        let root = std::fs::canonicalize(&made).unwrap();
+        let (version, header, _) = gcc_like(&root);
+        let moved = climbed_moved(&version, &header);
+        let expected = Moved { read: header.clone(), at: version.clone(), why: MovedWhy::Climbed };
+        assert_eq!(moved, Some(expected));
+        assert_eq!(
+            moved.unwrap().said("the run").to_string(),
+            format!(
+                "{}, a directory {} (which it read) climbs out of with `..`, changed after the run began",
+                version.display(),
+                header.display()
+            )
+        );
+    }
+
+    /// What has moved of `header`, read by a run that began before `version`, which it climbs
+    /// out of, was made searchable by its owner alone.
+    #[cfg(unix)]
+    fn climbed_moved(version: &Path, header: &Path) -> Option<Moved> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let began = Began::now();
+        std::fs::set_permissions(version, std::fs::Permissions::from_mode(0o700)).unwrap();
+        began.moved(&read_of(header, Some([1; 32])))
+    }
+
+    /// The control (rule 23) of [`a_directory_climbed_out_of_is_a_name_the_read_rests_on`]: with
+    /// no directory climbed out of stamped, the read rests on the file and the directories above
+    /// it alone, the change is not what moved, and a run that could be refused the path now
+    /// would be kept under what it read before.
+    #[cfg(unix)]
+    #[test]
+    fn the_oracle_catches_a_climbed_directory_left_unstamped() {
+        let made = TempDir::for_test("blaze-usercode-climbed-planted-");
+        let root = std::fs::canonicalize(&made).unwrap();
+        let (version, header, _) = gcc_like(&root);
+        CLIMBED_IS_UNSTAMPED.set(true);
+        let planted = climbed_moved(&version, &header);
+        CLIMBED_IS_UNSTAMPED.set(false);
+        assert_ne!(planted.map(|it| it.at), Some(version), "the planted bug names the change all the same");
     }
 
     /// A file asked again, its stamp known, allocates nothing: the path is hashed in place and

@@ -1394,10 +1394,22 @@ const FILED_BEYOND: &str =
 /// for the wasm macros of one triple): its package, target, mode, platform and whether it is
 /// a wasm macro's, profile and whether it is std's or checked as a test. What `blaze why`
 /// compares it with its last miss by ([`blaze_kernel::Miss::subject`]).
+///
+/// A unit with a twin in the plan that all of those name alike (cargo's host and target
+/// copies of one package in a build with no `--target`: libc's, serde's and serde_core's
+/// build script runs on nushell, told apart by their features and the build-override
+/// profile alone) is named by its features and whole profile too: the two had one subject,
+/// so every build that ran both said "computed 2 times under different keys". Only such a
+/// unit: another keeps its subject across an edit of its features or profile, which `blaze
+/// why` then names as what changed.
 pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
     // The workspace's root too: one `BLAZE_HOME`'s ledger holds every workspace's units, and a
     // registry crate's package id is the same in each (rule 21).
-    let workspace = &job.input.config.invocation.root;
+    subject_among(&job.input.config.invocation.root, u, &job.units().graph.units)
+}
+
+/// [`unit_subject`] of `u`, one of `units`, in the workspace at `workspace`.
+pub(super) fn subject_among(workspace: &str, u: &Unit, units: &[Unit]) -> Result<ContentId, String> {
     let named = (
         workspace,
         &u.pkg_id,
@@ -1410,13 +1422,29 @@ pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
         u.is_std,
         u.checked_as_test,
     );
-    let bytes = blaze_protocol::cbor::to_vec(&named)
+    let alike = |other: &Unit| {
+        (&other.pkg_id, &other.target.name, &other.target.kind, other.mode, &other.platform)
+            == (&u.pkg_id, &u.target.name, &u.target.kind, u.mode, &u.platform)
+            && (other.macro_wasm, &other.profile.name, other.is_std, other.checked_as_test)
+                == (u.macro_wasm, &u.profile.name, u.is_std, u.checked_as_test)
+    };
+    // Cold: on a miss only, a look at each unit of the plan.
+    let twinned = !TWINS_UNTOLD.get()
+        && units.iter().any(|other| !std::ptr::eq(other, u) && alike(other));
+    let told = twinned.then_some((&u.features, &u.profile));
+    let bytes = blaze_protocol::cbor::to_vec(&(named, told))
         .map_err(|why| format!("encoding what unit `{}` is: {why}", span_unit(u)))?;
     Ok(Hasher::new(SUBJECT).part(&bytes).finish())
 }
 
 /// The domain of [`unit_subject`].
-const SUBJECT: &str = "blaze v2 why unit subject 3";
+const SUBJECT: &str = "blaze v2 why unit subject 4";
+
+thread_local! {
+    /// A planted bug, for a test's control: twins are named as any other unit
+    /// ([`unit_subject`]), as until 2026-11-15. Never set outside a test.
+    pub(crate) static TWINS_UNTOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Why `unit`'s record was not in the store, for `blaze why`: its key's parts by name, which
 /// the daemon tells apart against the unit's last compute. Made on a miss only. The parts are
