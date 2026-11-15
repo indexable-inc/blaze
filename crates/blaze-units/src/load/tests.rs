@@ -147,10 +147,13 @@ pub(crate) struct Ask<'a> {
     pub(crate) args: &'a [&'a str],
     pub(crate) env: &'a [(&'a str, &'a str)],
     pub(crate) mounts: Vec<Mount>,
+    /// Where in the view the workspace is mounted from: `ws` for the files under `ws/`, `""`
+    /// for the view mounted whole, as the daemon mounts a checkout.
+    pub(crate) under: &'a str,
 }
 
 pub(crate) fn ask<'a>(files: &'a [(&'a str, &'a str)]) -> Ask<'a> {
-    Ask { files, command: Command::Build, args: &[], env: &[], mounts: Vec::new() }
+    Ask { files, command: Command::Build, args: &[], env: &[], mounts: Vec::new(), under: "ws" }
 }
 
 fn mount(at: &str, under: &str) -> Mount {
@@ -173,7 +176,7 @@ impl Fixture {
         let mut env: Vec<(String, String)> = vec![("HOME".to_owned(), "/home/u".to_owned())];
         env.extend(ask.env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
         env.sort();
-        let mut mounts = vec![mount(WS, "ws"), library_mount(self.library, COMMIT)];
+        let mut mounts = vec![mount(WS, ask.under), library_mount(self.library, COMMIT)];
         mounts.extend(ask.mounts.iter().cloned());
         mounts.sort();
         let config = BuildConfig {
@@ -280,6 +283,24 @@ fn roots_named(units: &Units) -> Vec<String> {
 }
 
 const A: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+
+/// The invariant: a plan of a view mounted whole, as the daemon mounts a checkout, reads no
+/// file at the view's root (path `""`). The listing of the checkout's parent (the workspace
+/// search above it) names the checkout as a directory with no read: a read of the root as a
+/// file is one no change of the view is told of (`Vfs::diff` names files), so the daemon kept
+/// the plan for its view alone and asked it again on every edit (2026-11-15). The planted
+/// control is that read put back (the listing asking `cx.file("")`).
+#[test]
+fn a_view_mounted_whole_is_planned_with_no_read_of_its_root_as_a_file() {
+    let fixture = Fixture::new();
+    let files = [("Cargo.toml", A), ("src/lib.rs", "pub fn f() {}\n")];
+    let view = fixture.open(&Ask { under: "", ..ask(&files) });
+    assert_eq!(roots_named(&ready(fixture.plan(view))), ["a lib"]);
+    let inputs = fixture.db.pin().inputs_of::<Plan>(view, &()).expect("the plan's memo holds in its view");
+    assert!(!inputs.files.is_empty(), "the plan read its manifest");
+    let at_root: Vec<_> = inputs.files.iter().filter(|(path, _)| path.is_empty()).collect();
+    assert!(at_root.is_empty(), "the plan read the view's root as a file: {at_root:?}");
+}
 
 #[test]
 fn one_package_plans_its_library_and_binary_with_the_standard_library() {

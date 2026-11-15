@@ -4983,6 +4983,8 @@ pub struct Jobs<S: Steps> {
     vouching: Vec<Vouching>,
     /// The next vouch's serial: a completion of one replaced is told to none.
     next_vouch: u32,
+    /// The vouches' reads being hashed off the loop.
+    vouch_hashes: vouch::Hashes,
 }
 
 impl<S: Steps> Builder for Jobs<S> {
@@ -5086,6 +5088,7 @@ impl<S: Steps> Jobs<S> {
             recheck: None,
             vouching: Vec::new(), // alloc: none until an output is placed inside its racy window
             next_vouch: 0,
+            vouch_hashes: vouch::Hashes::new(),
         })
     }
 
@@ -9737,17 +9740,50 @@ impl<S: Steps> Jobs<S> {
                 vouching.span = None;
                 return self.vouch_due(w, serial);
             }
+            // Hashed off the loop; told back as `vouch_hashed` takes it.
             Done::Read(bytes) => {
-                let _hash = vouching.span.as_ref().map(|it| {
-                    it.in_scope(|| tracing::info_span!(target: "blaze", "hash the placed output", bytes = bytes.len()).entered())
-                });
-                let content = certify::content_of(&bytes, Some(vouching.vouch.content));
-                vouching.vouch.read(Some(content))
+                let (content, span) = (vouching.vouch.content, vouching.span.clone()); // clone: a span's handle, once a read
+                self.vouch_hashes.hash(serial, bytes, content, span);
+                return self.vouch_hashed(w);
             }
             Done::Failed(_) => vouch::Next::Dropped("a look at the output or its read failed"),
             _ => vouch::Next::Dropped("the driver answered a look or a read with something else"),
         };
         self.vouch_next(w, serial, next);
+    }
+
+    /// Where the vouches' reads are hashed: the daemon's worker pool for a daemon of threads,
+    /// in line (the default) for the simulation's.
+    pub fn vouch_hashes_on(&mut self, on: super::settle::Compress) {
+        self.vouch_hashes.on(on);
+    }
+
+    /// Whether a vouch's read is out being hashed: the loop takes it back within a turn or so
+    /// ([`Jobs::vouch_hashed`]).
+    pub fn vouch_hashing(&self) -> bool {
+        self.vouch_hashes.out()
+    }
+
+    /// Each vouch whose read's hash came back goes on: its second look, or, where a request
+    /// began since its read was asked, back to waiting for nothing to run, its hash let go
+    /// (the evidence a running check reads is not moved under it).
+    pub fn vouch_hashed(&mut self, w: &mut World<'_, S>) {
+        while let Some((serial, content)) = self.vouch_hashes.back() {
+            let Some(at) = self.vouching.iter().position(|it| it.serial == serial) else { continue };
+            if self.vouching[at].vouch.due_ns().is_some() {
+                continue;
+            }
+            let busy = !self.idle() || self.certify.checks();
+            let vouching = &mut self.vouching[at];
+            if busy {
+                vouching.vouch.rewind();
+                vouching.span = None;
+                self.vouch_due(w, serial);
+                continue;
+            }
+            let next = vouching.vouch.read(content);
+            self.vouch_next(w, serial, next);
+        }
     }
 
     /// Vouch `vouch` ended with the output holding the bytes placed under `stamp`, steady as

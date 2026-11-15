@@ -2086,6 +2086,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.settles = Some(settles);
     }
 
+    /// Hashes what a placed output's vouch read on the worker pool, off the loop (a daemon of
+    /// threads; the simulation's hash in line).
+    pub fn vouch_on_pool(&mut self) {
+        self.jobs.vouch_hashes_on(super::settle::Compress::Pool);
+    }
+
     /// Keeps its store under the home's budget, in the background of its turns
     /// ([`super::collect`]).
     pub fn collect_store(&mut self, collects: super::collect::Collects) {
@@ -2527,6 +2533,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // A job's wait for the store to make its puts durable has a deadline of its own.
         sooner(self.jobs.next_deadline().map(Deadline::at), Woken::Durable);
         sooner(self.observe.wait(now).map(|it| Deadline::after(now, it)), Woken::Observe);
+        // A vouch's hash comes back over a channel no driver wakes for.
+        if self.jobs.vouch_hashing() {
+            sooner(Some(Deadline::after(now, Duration::from_millis(1))), Woken::Idle);
+        }
         // A save's quiet running out: its build ahead is due ([`super::ahead::QUIET`]).
         sooner(self.ahead.deadline(now).map(Deadline::at), Woken::Idle);
         // The grace of a daemon nothing holds running out: it stops then, on time.
@@ -2640,6 +2650,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 .entered()
             });
             self.dispatch(handler, completion);
+        }
+        if self.jobs.vouch_hashing() {
+            let _hashed = piece("vouch hashes back");
+            let mut said = self.spare.said.pop().unwrap_or_default();
+            self.jobs.vouch_hashed(&mut world!(self, said));
+            self.said(said);
         }
         // What the loop's own store reads were handed as they dispatched (`World::reads`) is
         // kept for the next turn, which takes it without a wait.

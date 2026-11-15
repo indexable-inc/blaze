@@ -1479,6 +1479,7 @@ fn begin(
     // own; one that does not read stops the start.
     let settings = blaze_gc::settings::GcSettings::read(&root, blaze_gc::pace::Levels::default())
         .map_err(|why| anyhow::anyhow!(why))?;
+    daemon.vouch_on_pool();
     if settings.auto {
         daemon.collect(gc::Gc::new(gc::areas(&root, &machine()?), &state()?, settings.levels));
         daemon.settle(settle::Settles::new(settle::Compress::Pool));

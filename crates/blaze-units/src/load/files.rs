@@ -573,6 +573,13 @@ fn dir_through<'a>(
                     // A mount of one file (a sparse index's) is a file of the directory.
                     None => {
                         let dir = match origin {
+                            // The view mounted whole: its root is a directory in every view,
+                            // so nothing is read. A read of the root as a file is a read no
+                            // change of the view is told of (`Vfs::diff` names files), and
+                            // it kept the daemon's plan to its view alone: the plan asked
+                            // again on every edit (2026-11-15, the gauntlet: 14 ms a body
+                            // edit, `the plan read the file ``).
+                            Origin::View if view && mount_under.is_empty() => true,
                             Origin::View if view => cx.file(mount_under)?.is_none(),
                             Origin::View => continue,
                             Origin::Root(root) => cx.file_at(root, mount_under)?.is_none(),
