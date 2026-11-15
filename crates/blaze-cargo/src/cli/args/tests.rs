@@ -50,6 +50,46 @@ fn query_rules_and_replace_refuse_each_build_selection_flag_by_name() {
 }
 
 #[test]
+fn query_rules_and_replace_refuse_each_flag_that_steers_a_build_by_name() {
+    let unhonored = |words: &[&str]| super::refused(&cargo(words));
+    let modes: [&[&str]; 3] = [&["--query", "q"], &["--rules", "r"], &["--replace", "a::B=c::D"]];
+    // Each flag, and whether it is a global, which may come before the command too.
+    let steering: [(&str, &[&str], bool); 9] = [
+        ("`--jobs`", &["-j", "4"], false),
+        ("`--keep-going`", &["--keep-going"], false),
+        ("`--locked`", &["--locked"], true),
+        ("`--offline`", &["--offline"], true),
+        ("`--frozen`", &["--frozen"], true),
+        ("`--no-locked`", &["--no-locked"], true),
+        ("`--config`", &["--config", "build.jobs=2"], true),
+        ("`-Z build-std`", &["-Z", "build-std"], true),
+        ("`-Z build-std`", &["-Zbuild-std"], true),
+    ];
+    for mode in modes {
+        for (flag, words, global) in steering {
+            let mut lines = vec![[&["check"], mode, words].concat()];
+            if global {
+                lines.push([words, &["check"], mode].concat());
+            }
+            for line in lines {
+                let said = unhonored(&line).unwrap_or_else(|| panic!("{line:?} is accepted"));
+                assert!(said.contains(flag) && said.contains("runs no build"), "{line:?}: {said}");
+            }
+        }
+    }
+    // `--rules` and `--replace` print a diff or a status line; only `--query` writes JSON.
+    for mode in &modes[1..] {
+        let line = [&["check"], *mode, &["--message-format", "json"]].concat();
+        let said = unhonored(&line).unwrap_or_else(|| panic!("{line:?} is accepted"));
+        assert!(said.contains("no JSON messages"), "{line:?}: {said}");
+    }
+    // `-Z unstable-options` allows `-C`, which the rules modes honour.
+    assert_eq!(unhonored(&["-Z", "unstable-options", "check", "--query", "q"]), None);
+    // A build still takes them.
+    assert_eq!(unhonored(&["check", "--locked", "-j", "4", "--keep-going"]), None);
+}
+
+#[test]
 fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load() {
     let asked = cargo(&[
         "check",
