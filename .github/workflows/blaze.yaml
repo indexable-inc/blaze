@@ -466,12 +466,20 @@ jobs:
           tar -xf blaze.tar && uname -r
           ./blaze serve > serve.log 2>&1 & serve=$!
           for _ in $(seq 120); do
-            ./blaze status | grep -qvx "no daemon is running" && break
+            timeout 10 ./blaze status | grep -qvx "no daemon is running" && break
             kill -0 "$serve" 2>/dev/null || { cat serve.log; echo "::error::blaze serve ended before it listened on Linux $(uname -r)"; exit 1; }
             sleep 0.5
           done
-          ./blaze status | grep -qvx "no daemon is running" || { cat serve.log; echo "::error::blaze serve did not listen within 60 s on Linux $(uname -r)"; exit 1; }
-          ./blaze stop && wait "$serve"
+          timeout 10 ./blaze status | grep -qvx "no daemon is running" || { cat serve.log; echo "::error::blaze serve did not listen within 60 s on Linux $(uname -r)"; exit 1; }
+          # Bounded: a daemon that outlives its stop by 30 s is killed and fails the step.
+          timeout 60 ./blaze stop || { echo "::error::blaze stop failed or took over 60 s on Linux $(uname -r)"; kill -KILL "$serve" 2>/dev/null; cat serve.log; exit 1; }
+          for _ in $(seq 60); do
+            state=$(sed -n 's/^State:[[:space:]]*\(.\).*/\1/p' "/proc/$serve/status" 2>/dev/null)
+            [ -z "$state" ] || [ "$state" = Z ] && break
+            sleep 0.5
+          done
+          [ -z "$state" ] || [ "$state" = Z ] || { echo "::error::blaze serve did not end within 30 s of blaze stop on Linux $(uname -r): killed"; kill -KILL "$serve"; cat serve.log; exit 1; }
+          wait "$serve"
 
   macos:
     name: macos arm64

@@ -196,7 +196,8 @@ jobs:
           $PYTHON harness/unittests.py '{"build": true}'
       # The daemon ends first: its last pack seals when it does.
       - if: always() && env.BLAZE == 'true' && steps.blaze.outcome == 'success'
-        run: blaze stop
+        timeout-minutes: 3
+        run: timeout 120 blaze stop
       # The self-build's profile history (blaze's root, docs/profiling.md), for the profile-gate
       # job. After the stop, which flushes and merges the last of it. A build that wrote none
       # hands over its list alone, and the gate says it found no build.
