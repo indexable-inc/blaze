@@ -120,6 +120,51 @@ impl SplitMix64 {
             items.swap(at, self.index(at + 1));
         }
     }
+
+    /// Which arm [`choose!`] takes: the position in `open` of one of its `true`s, each as
+    /// likely; `None` when there is none.
+    pub fn arm(&mut self, open: &[bool]) -> Option<usize> {
+        let at = self.index(open.iter().filter(|it| **it).count());
+        open.iter().enumerate().filter(|(_, it)| **it).nth(at).map(|(arm, _)| arm)
+    }
+}
+
+/// One of the arms, evaluated, drawn from `rng` (a [`SplitMix64`]): each arm whose condition
+/// holds is as likely as the others. `if cond => arm` gives an arm a condition; an arm without
+/// one always can be taken. An arm that is an `if` expression goes in braces.
+///
+/// The list is all the bookkeeping: no count beside it and no number on an arm, so two
+/// changes that each add an arm merge without renumbering. It panics, naming itself, when no
+/// condition holds.
+#[macro_export]
+macro_rules! choose {
+    // Each arm in turn moves to the lists of conditions and arms; one rule per form, since a
+    // matcher that took an optional `if` before an expression could not tell the two apart.
+    (@arms $rng:expr; [$($open:expr),+]; [$($arm:expr),+];) => {
+        'chosen: {
+            let open = [$($open),+];
+            let Some(chosen) = $rng.arm(&open) else {
+                panic!("choose! with no arm whose condition holds");
+            };
+            let mut arms = 0..;
+            $(
+                if arms.next() == Some(chosen) {
+                    break 'chosen $arm;
+                }
+            )+
+            unreachable!("SplitMix64::arm gives a position in the arms")
+        }
+    };
+    (@arms $rng:expr; [$($open:expr),*]; [$($arm:expr),*];
+        if $can:expr => $next:expr $(, $($rest:tt)*)?) => {
+        $crate::choose!(@arms $rng; [$($open,)* $can]; [$($arm,)* $next]; $($($rest)*)?)
+    };
+    (@arms $rng:expr; [$($open:expr),*]; [$($arm:expr),*]; $next:expr $(, $($rest:tt)*)?) => {
+        $crate::choose!(@arms $rng; [$($open,)* true]; [$($arm,)* $next]; $($($rest)*)?)
+    };
+    ($rng:expr; $($arms:tt)+) => {
+        $crate::choose!(@arms $rng; []; []; $($arms)+)
+    };
 }
 
 #[cfg(test)]
@@ -197,6 +242,22 @@ mod tests {
         assert!((2000..3000).contains(&hits), "{hits} of 10000 at 0.25");
         assert_eq!(rng.pick::<u8>(&[]), None);
         assert_eq!(rng.pick(&[9]), Some(&9));
+    }
+
+    /// Each open arm about as often as the others, a closed one never, and nothing to take is
+    /// a panic.
+    #[test]
+    fn choose_takes_open_arms_evenly() {
+        let mut rng = SplitMix64::new(11);
+        let mut taken = [0u32; 4];
+        for _ in 0..12_000 {
+            let arm: usize = choose!(rng; 0, if false => 1, 2, 3);
+            taken[arm] += 1;
+        }
+        assert_eq!(taken[1], 0, "{taken:?}");
+        assert!(taken.iter().all(|&n| n == 0 || (3600..4400).contains(&n)), "{taken:?}");
+        let none = std::panic::catch_unwind(|| choose!(SplitMix64::new(0); if false => 0u8));
+        assert!(none.is_err());
     }
 
     #[test]
