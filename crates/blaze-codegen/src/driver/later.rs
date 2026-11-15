@@ -31,11 +31,10 @@ use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
 use std::alloc::Global;
-use std::sync::Arc;
 
 use super::{
     Build, Built, By, FnNode, FrontInstance, FrontStatic, How, Lookup, MadeIn, Node, Out, Put,
-    PutOf, Sorted, StaticId, StaticOf, Whence, callee, dev_template_key, error, flight_key, placed,
+    Sorted, StaticId, StaticOf, Whence, callee, dev_template_key, error, flight_key, placed,
     prepare_node, stopped, stored, stored_function, unfit, unkept_inline, unkept_message,
 };
 use crate::{
@@ -188,11 +187,13 @@ fn template_instance<I, S>(node: &FnNode<I, S>, unit: &Unit) -> Instance {
     Instance { code: node.described.template_code, ..unit.instance }
 }
 
-/// The store's value of `template`, kept under `at` (a [`dev_template_key`]), with what it is
-/// (`of`).
-fn put_of(at: Key, template: &Template, of: Arc<PutOf>) -> Put {
+/// The store's value of `template`, kept under `at` (a [`dev_template_key`]), with what it is:
+/// `node`'s function at `unit`, compiled at `toolchain`, made by `made` ([`FnNode::put_of`]).
+fn put_of<I, S>(at: Key, template: &Template, (node, unit, toolchain): (&FnNode<I, S>, &Unit, &ContentId), made: MadeIn) -> Put {
     // alloc: the store's value of a template, once a function
-    Put { key: at, kind: Kind::Code, bytes: blob::encode(template), of: Some(of) }
+    let bytes = blob::encode(template);
+    // Global: what it is lives as long as the put, which the caller's store takes.
+    Put { key: at, kind: Kind::Code, bytes, of: Some(node.put_of(unit, toolchain, made, Global)) }
 }
 
 /// Where a compile outside a walk is made ([`MadeIn`]), before how it was made is known.
@@ -231,9 +232,8 @@ fn memoized<I, S>(
     let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), &why);
     let function =
         template.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
-    let of = node.put_of(unit, &spec.toolchain.id, made);
     // alloc: the store's value of a memo hit, once a function
-    Ok((function, vec![put_of(at, template, of)]))
+    Ok((function, vec![put_of(at, template, (node, unit, &spec.toolchain.id), made)]))
 }
 
 /// `unit`, `node`'s function at its own or another tier, where neither the store nor a
@@ -299,7 +299,7 @@ fn compiled<B: Prepare>(
     // alloc: an error
     .map_err(|why| error(key, item, why.to_string()))?;
     let kept = memo.put(compiled, template);
-    puts.push(put_of(at, kept, node.put_of(unit, &spec.toolchain.id, making.made(How::Compiled))));
+    puts.push(put_of(at, kept, (node, unit, &spec.toolchain.id), making.made(How::Compiled)));
     let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), &why);
     let function =
         kept.instantiate_at(key, &node.refs, node.described.anchors.as_ref()).map_err(unfit)?;
@@ -509,7 +509,7 @@ impl<I, S> Later<I, S> {
     pub fn memo_put(&self, memo: &Memo, key: InstanceKey) -> Option<Put> {
         let (node, template, shape) = self.recorded(memo, key)?;
         let made = Making::FirstCall.made(How::Memo { shape });
-        Some(put_of(node.template_key(), template, node.put_of(&node.unit, &node.spec.toolchain.id, made)))
+        Some(put_of(node.template_key(), template, (node, &node.unit, &node.spec.toolchain.id), made))
     }
 
     /// One function of the walk, as a lazy run asks for it on its first call: the store's

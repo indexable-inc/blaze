@@ -16,7 +16,7 @@
 //! [`Built::puts`]: what the build compiled, its keys. A store entry that fails to read is an
 //! error naming the unit, never a reason to compile again.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
@@ -764,19 +764,22 @@ impl<I, S> FnNode<I, S> {
 
     /// What a code value made of it at `unit` (its own or a tier's, compiled at `toolchain`) by
     /// `made` is ([`Put::of`]): its name, its origin, its form and its dev template key's parts.
-    fn put_of(&self, unit: &Unit, toolchain: &ContentId, made: MadeIn) -> Arc<PutOf> {
+    fn put_of<A: Allocator + Clone>(&self, unit: &Unit, toolchain: &ContentId, made: MadeIn, alloc: A) -> Arc<PutOf, A> {
         let instance = Instance { code: self.described.template_code, ..unit.instance };
         let own = unit.instance.key();
-        // alloc: once a code value made outside a walk, what a refusal of its put names
-        Arc::new(PutOf {
-            name: Some(self.described.name.clone()),
-            instance: own,
-            item: unit.item,
-            made,
-            origin: Some(self.described.origin),
-            relative: Some(self.described.anchors.is_some()),
-            parts: Some(template_key_parts(&instance, own, &self.built_in, &self.refs, toolchain)),
-        })
+        Arc::new_in(
+            PutOf {
+                // clone: its path, once a code value made outside a walk
+                name: Some(self.described.name.clone()),
+                instance: own,
+                item: unit.item,
+                made,
+                origin: Some(self.described.origin),
+                relative: Some(self.described.anchors.is_some()),
+                parts: Some(template_key_parts(&instance, own, &self.built_in, &self.refs, toolchain)),
+            },
+            alloc,
+        )
     }
 
     /// The store key of its dev template: the kernel's entry of its stored key, of its
@@ -1638,7 +1641,7 @@ impl Out {
                     // what the walk names its putter.
                     let of = match put.of {
                         Some(of) => Some(of),
-                        None => (put.kind == Kind::Code).then(|| put_by(by, &name_of)),
+                        None => (put.kind == Kind::Code).then(|| put_by(by, &name_of, Global)),
                     };
                     puts.push(Put { of, ..put });
                 }
@@ -1683,23 +1686,25 @@ where
 
 /// What a walked build's code value put by `by` is ([`Put::of`]), named as [`put_twice`]
 /// names its putters.
-fn put_by<'n>(by: By, name_of: &impl Fn(Of) -> Option<&'n str>) -> Arc<PutOf> {
+fn put_by<'n, A: Allocator + Clone>(by: By, name_of: &impl Fn(Of) -> Option<&'n str>, alloc: A) -> Arc<PutOf, A> {
     let what = match by.of {
         Of::Function(_) => "the function's template",
         Of::Folded(_) => "the folded body of the group of the function",
         Of::Static(_) => "the static's template",
         Of::Memo => "the template the memo already kept under its key",
     };
-    // alloc: once a code value a walked build puts, what a refusal of its put names
-    Arc::new(PutOf {
-        name: name_of(by.of).map(str::to_owned),
-        instance: by.unit,
-        item: by.item,
-        made: MadeIn::Walked { what },
-        origin: None,
-        relative: None,
-        parts: None,
-    })
+    Arc::new_in(
+        PutOf {
+            name: name_of(by.of).map(str::to_owned),
+            instance: by.unit,
+            item: by.item,
+            made: MadeIn::Walked { what },
+            origin: None,
+            relative: None,
+            parts: None,
+        },
+        alloc,
+    )
 }
 
 /// A second put under `mismatch.key` in one build, by `then`, of another kind or other bytes
@@ -1756,20 +1761,30 @@ fn put_twice<'n>(
 /// that differs and the part of a template it is in ([`blob::part_at`] of `given`, else of
 /// `kept`), then the first field of the template that differs ([`template_difference`]).
 /// Values that are no templates (a launched function's bind record) are named by offset and
-/// lengths alone here; their own format names its part.
-pub fn code_difference(kept: &[u8], given: &[u8]) -> String {
-    let at = kept.iter().zip(given).position(|(a, b)| a != b).unwrap_or(kept.len().min(given.len()));
-    let part = match (blob::part_at(given, at), blob::part_at(kept, at)) {
-        (Ok(Some(part)), _) | (_, Ok(Some(part))) => format!(", in {part} of the template"),
-        (Err(why), _) => format!(" (the value made now is no template: {why})"),
-        (Ok(None), _) => String::new(),
-    };
-    let fields = template_difference((Kind::Code, Kind::Code), kept, given);
-    format!(
-        "the kept value is {} bytes and the given {}, first differing at byte {at}{part}{fields}",
-        kept.len(),
-        given.len()
-    )
+/// lengths alone here; their own format names its part. Made only by a refusal, and worked
+/// out only as it is printed: it holds the two values' bytes, borrowed.
+pub struct CodeDifference<'a> {
+    pub kept: &'a [u8],
+    pub given: &'a [u8],
+}
+
+impl std::fmt::Display for CodeDifference<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kept, given) = (self.kept, self.given);
+        let at = kept.iter().zip(given).position(|(a, b)| a != b).unwrap_or(kept.len().min(given.len()));
+        write!(
+            f,
+            "the kept value is {} bytes and the given {}, first differing at byte {at}",
+            kept.len(),
+            given.len()
+        )?;
+        match (blob::part_at(given, at), blob::part_at(kept, at)) {
+            (Ok(Some(part)), _) | (_, Ok(Some(part))) => write!(f, ", in {part} of the template")?,
+            (Err(why), _) => write!(f, " (the value made now is no template: {why})")?,
+            (Ok(None), _) => {}
+        }
+        f.write_str(&template_difference((Kind::Code, Kind::Code), kept, given))
+    }
 }
 
 /// Where two templates put under one key differ, for [`put_twice`]'s error: the first field

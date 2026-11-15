@@ -249,11 +249,12 @@ pub fn decode(bytes: &[u8]) -> Result<Bound, String> {
 
 /// The part of the bind record `bytes` that byte `offset` is in, in the layout of the module's
 /// documentation, for a refusal that names where two records under one key differ (rule 19);
-/// `None` past its end, or why `bytes` are no bind record of this layout.
-pub fn part_at(bytes: &[u8], offset: usize) -> Result<Option<&'static str>, String> {
+/// `None` past its end, or where `bytes` do not read as a bind record of this layout (why is
+/// [`decode`]'s to say, which the refusal that prints both records asks).
+pub fn part_at(bytes: &[u8], offset: usize) -> Option<&'static str> {
     let mut from = Reader { bytes, at: 0, what: "a bind record" };
-    if from.take(8, "layout's name")? != MAGIC {
-        return Err(from.refuse(0, format_args!("its layout is not {:?}", String::from_utf8_lossy(MAGIC))));
+    if from.take(8, "layout's name").ok()? != MAGIC {
+        return None;
     }
     let mut ends = [("", 0); 9];
     let mut part = 0;
@@ -262,29 +263,29 @@ pub fn part_at(bytes: &[u8], offset: usize) -> Result<Option<&'static str>, Stri
         part += 1;
     };
     ended(from.at, "its layout's name");
-    from.u8("kind")?;
+    from.u8("kind").ok()?;
     ended(from.at, "its kind");
-    let len = from.u32("record's length")? as usize;
-    from.take(len, "launch record")?;
+    let len = from.u32("record's length").ok()? as usize;
+    from.take(len, "launch record").ok()?;
     ended(from.at, "its launch record");
-    from.u64("placed length")?;
+    from.u64("placed length").ok()?;
     ended(from.at, "its placed length");
-    from.u32("alignment")?;
+    from.u32("alignment").ok()?;
     ended(from.at, "its alignment");
-    from.id("slot identity")?;
+    from.id("slot identity").ok()?;
     ended(from.at, "its slot identity");
-    from.id("code hash")?;
+    from.id("code hash").ok()?;
     ended(from.at, "its code hash");
-    let count = from.u32("count of names")? as usize;
+    let count = from.u32("count of names").ok()? as usize;
     if count > bytes.len().saturating_sub(from.at) / 5 {
-        return Err(from.refuse(from.at - 4, format_args!("it counts {count} names, more than its bytes hold")));
+        return None;
     }
     for _ in 0..count {
-        get_names(&mut from)?;
+        get_names(&mut from).ok()?;
     }
     ended(from.at, "its names (what each of its references binds to)");
     ended(bytes.len(), "its anchors");
-    Ok(ends.iter().find(|(_, end)| offset < *end).map(|(name, _)| *name))
+    ends.iter().find(|(_, end)| offset < *end).map(|(name, _)| *name)
 }
 
 /// Whether `bytes` are in the layout of a bind record, by its name: what a refusal of two

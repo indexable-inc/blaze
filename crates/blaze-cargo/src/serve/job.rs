@@ -1152,60 +1152,58 @@ fn this<S: Steps>(readers: Readers<S>) -> S::Reader {
 /// What a refusal of a put says past the key (rule 19): what the value is and the build mode
 /// that made it (`of`, from codegen, its key's parts among it), then both values' lengths, the
 /// first byte that differs and the part of the value's layout that byte is in: a template's
-/// ([`blaze_codegen::driver::code_difference`]) or a launched run's bind record's
-/// ([`blaze_launch_host::bind::part_at`]). `kept` is read from `store` here, once a refusal:
-/// the put's `Mismatch` holds only its content.
-fn put_refused(
-    store: &Store,
-    key: &blaze_cas::Key,
+/// ([`blaze_codegen::driver::CodeDifference`]) or a launched run's bind record's
+/// ([`blaze_launch_host::bind::part_at`]). `kept` is read from `store` as it is printed, once
+/// a refusal: the put's `Mismatch` holds only its content. Made only by a refusal, it borrows
+/// all it names, and nothing is worked out until it is printed.
+struct PutRefused<'a> {
+    store: &'a Store,
+    key: blaze_cas::Key,
     kind: blaze_cas::Kind,
-    given: &[u8],
-    of: Option<&blaze_codegen::driver::PutOf>,
-) -> String {
-    let made = match of {
-        Some(of) => format!("; it is {of}"),
-        None => String::new(),
-    };
-    let kept = match store.get(key) {
-        Ok(Some(entry)) => entry,
-        Ok(None) => return format!("{made}; the value kept under it does not read back to compare"),
-        Err(why) => return format!("{made}; the value kept under it is corrupt: {why}"),
-    };
-    use blaze_launch_host::bind;
-    let kept_kind = match kept.kind == kind {
-        true => String::new(),
-        false => format!(" (kept as a {:?} value)", kept.kind),
-    };
-    let kept = kept.bytes;
-    if kind == blaze_cas::Kind::Code && !bind::is_bind_record(given) && !bind::is_bind_record(kept) {
-        let differ = blaze_codegen::driver::code_difference(kept, given);
-        return format!("{made}{kept_kind}; {differ}");
+    given: &'a [u8],
+    of: Option<&'a blaze_codegen::driver::PutOf>,
+}
+
+impl std::fmt::Display for PutRefused<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use blaze_launch_host::bind;
+        let given = self.given;
+        if let Some(of) = self.of {
+            write!(f, "; it is {of}")?;
+        }
+        let kept = match self.store.get(&self.key) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return f.write_str("; the value kept under it does not read back to compare"),
+            Err(why) => return write!(f, "; the value kept under it is corrupt: {why}"),
+        };
+        if kept.kind != self.kind {
+            write!(f, " (kept as a {:?} value)", kept.kind)?;
+        }
+        let kept = kept.bytes;
+        if self.kind == blaze_cas::Kind::Code && !bind::is_bind_record(given) && !bind::is_bind_record(kept) {
+            return write!(f, "; {}", blaze_codegen::driver::CodeDifference { kept, given });
+        }
+        let at = kept.iter().zip(given).position(|(a, b)| a != b).unwrap_or(kept.len().min(given.len()));
+        write!(f, "; the kept value is {} bytes and the given {}, first differing at byte {at}", kept.len(), given.len())?;
+        let record = [given, kept].into_iter().find(|it| bind::is_bind_record(it));
+        if let Some(part) = record.and_then(|it| bind::part_at(it, at)) {
+            write!(f, ", in {part} of the bind record")?;
+        }
+        // Both bind records' slot identities and code hashes, decoded: which input of the slot
+        // (its identity's origin, its ABI) or of the code moved is the next question.
+        if bind::is_bind_record(kept) && bind::is_bind_record(given) {
+            match (bind::decode(kept), bind::decode(given)) {
+                (Ok(kept), Ok(given)) => write!(
+                    f,
+                    "; the kept record's slot identity is {:x} and code hash {:x}, the given's {:x} and {:x}",
+                    kept.slot, kept.code.0, given.slot, given.code.0
+                )?,
+                (Err(why), _) => write!(f, "; the kept bind record does not read: {why}")?,
+                (_, Err(why)) => write!(f, "; the given bind record does not read: {why}")?,
+            }
+        }
+        Ok(())
     }
-    let at = kept.iter().zip(given).position(|(a, b)| a != b).unwrap_or(kept.len().min(given.len()));
-    let record = [given, kept].into_iter().find(|it| bind::is_bind_record(it));
-    let part = match record.map(|it| bind::part_at(it, at)) {
-        Some(Ok(Some(part))) => format!(", in {part} of the bind record"),
-        Some(Err(why)) => format!(" ({why})"),
-        Some(Ok(None)) | None => String::new(),
-    };
-    // Both bind records' slot identities and code hashes, decoded: which input of the slot
-    // (its identity's origin, its ABI) or of the code moved is the next question.
-    let decoded = match (bind::is_bind_record(kept), bind::is_bind_record(given)) {
-        (true, true) => match (bind::decode(kept), bind::decode(given)) {
-            (Ok(kept), Ok(given)) => format!(
-                "; the kept record's slot identity is {:x} and code hash {:x}, the given's {:x} and {:x}",
-                kept.slot, kept.code.0, given.slot, given.code.0
-            ),
-            (Err(why), _) => format!("; the kept bind record does not read: {why}"),
-            (_, Err(why)) => format!("; the given bind record does not read: {why}"),
-        },
-        _ => String::new(),
-    };
-    format!(
-        "{made}{kept_kind}; the kept value is {} bytes and the given {}, first differing at byte {at}{part}{decoded}",
-        kept.len(),
-        given.len()
-    )
 }
 
 /// One thread task of kind `kind`, the batch's only one.
@@ -7978,7 +7976,7 @@ impl<S: Steps> Jobs<S> {
                     tickets.add(ticket);
                 }
                 Err(mismatch) => {
-                    let differ = put_refused(store, &key, kind, &put.bytes, None);
+                    let differ = PutRefused { store: &*store, key, kind, given: &put.bytes, of: None };
                     // alloc: a loss, once
                     failed = Some(format!(
                         "the store holds other bytes under {key:?} than the build of {checkout} made now \
@@ -8956,7 +8954,7 @@ impl<S: Steps> Jobs<S> {
             Stage::Units(build) => build.input.units.graph.units.get(unit),
             _ => None,
         };
-        let mismatched = |store: &str, kind: blaze_cas::Kind, mismatch: blaze_cas::Mismatch, differ: String| {
+        let mismatched = |store: &str, kind: blaze_cas::Kind, mismatch: blaze_cas::Mismatch, differ: PutRefused<'_>| {
             let what = match named {
                 // alloc: an error, once
                 Some(it) => format!("unit {unit} (`{}` of {})", it.target.name, it.pkg_id),
@@ -8994,7 +8992,7 @@ impl<S: Steps> Jobs<S> {
                 }
                 Err(mismatch) => {
                     let of = (put_of.binary_search_by_key(&put.key, |it| it.0).ok()).map(|at| &*put_of[at].1);
-                    let differ = put_refused(w.store, &put.key, kind, &put.bytes, of);
+                    let differ = PutRefused { store: &*w.store, key: put.key, kind, given: &put.bytes, of };
                     let error = mismatched("the store", kind, mismatch, differ);
                     job.over.get_or_insert((false, Some(error)));
                 }
@@ -9032,7 +9030,7 @@ impl<S: Steps> Jobs<S> {
             match w.std.put(put.key, put.kind, &put.bytes) {
                 Ok(ticket) => job.layer.add(ticket),
                 Err(mismatch) => {
-                    let differ = put_refused(w.std, &put.key, kind, &put.bytes, None);
+                    let differ = PutRefused { store: &*w.std, key: put.key, kind, given: &put.bytes, of: None };
                     let error = mismatched("the machine's sealed layer", kind, mismatch, differ);
                     job.over.get_or_insert((false, Some(error)));
                 }

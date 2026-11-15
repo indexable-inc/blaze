@@ -1468,7 +1468,8 @@ fn piece_of(
                 key,
                 kind: blaze_cas::Kind::Code,
                 bytes: bind::encode(&bound),
-                of: Some(bind_of(Some(one.name.clone()), one.key, one.item)),
+                // Global: what it is lives as long as the put, which the store takes.
+                of: Some(bind_of(&one.name, one.key, one.item, Global)),
             }),
             _ => {
                 let ids = tables.iter().map(|it| (it.0, hir_ty_codegen::v2::span_table_id(&it.1))).collect();
@@ -1500,7 +1501,8 @@ fn piece_of(
         if bound_all(&bound)
             && let Some(key) = reads.bind_static(&one.asked, &one.id)
         {
-            let of = bind_of(Some(name), InstanceKey(one.id.1), one.id.0);
+            // Global: as a function's, above.
+            let of = bind_of(&name, InstanceKey(one.id.1), one.id.0, Global);
             pieced.puts.push(Put { key, kind: blaze_cas::Kind::Code, bytes: bind::encode(&bound), of: Some(of) });
         }
         pieced.puts.extend(one.puts);
@@ -1511,8 +1513,18 @@ fn piece_of(
 }
 
 /// What a bind record put under its key is, for a refusal of the put that names it (rule 19).
-fn bind_of(name: Option<String>, instance: InstanceKey, item: ItemKey) -> Arc<PutOf> {
-    Arc::new(PutOf { name, instance, item, made: MadeIn::BindRecord, origin: None, relative: None, parts: None })
+fn bind_of<A: std::alloc::Allocator + Clone>(name: &str, instance: InstanceKey, item: ItemKey, alloc: A) -> Arc<PutOf, A> {
+    let of = PutOf {
+        // clone: its path, once a bind record made
+        name: Some(name.to_owned()),
+        instance,
+        item,
+        made: MadeIn::BindRecord,
+        origin: None,
+        relative: None,
+        parts: None,
+    };
+    Arc::new_in(of, alloc)
 }
 
 /// Each of `named` the program was not given yet, and each static those name, made alone.
