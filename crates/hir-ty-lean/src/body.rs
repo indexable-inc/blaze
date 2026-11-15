@@ -821,10 +821,12 @@ pub enum Callee {
     /// A function of the Lean library over the memory threads share, giving a `Threads.Prog`
     /// (`core.sync.atomic.Atomic.fetch_add`, `Threads.wait`): its caller is shared.
     Shared { name: String },
-    /// `blaze_core::world::threads::two(schedule, first, second)`: `Threads.two_of schedule`
-    /// of each closure's call model (by its Lean name), at `()`, as a `Threads.Prog`. The
-    /// arguments are the schedule and the two closures.
-    Two { first: String, second: String },
+    /// `blaze_core::world::threads::two(schedule, first, second)`, or `two_weak` where `weak`:
+    /// `Threads.two_of schedule` of each closure's call model (by its Lean name), at `()`, as a
+    /// `Threads.Prog`. The arguments are the schedule and the two closures. The program is the
+    /// same for both; `weak` says the memory a theorem that reaches it is stated in
+    /// ([`crate::translate::Worlds`]).
+    Two { first: String, second: String, weak: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3586,8 +3588,9 @@ impl<'db> Cx<'db> {
 
     /// A call of a function of `blaze_core::world::threads` ([`THREADS`]), by its name, never
     /// its body (which runs real threads): `wait`, `wake`, `clock`, `now`, `time` and
-    /// `wait_until` are `Threads.<name>`; `two(schedule, first, second)` runs its two closures as the threads of
-    /// `Threads.two_of`. A closure given to `two` must not lend (hold a capture by `&mut`): two
+    /// `wait_until` are `Threads.<name>`; `two(schedule, first, second)` and `two_weak`, its
+    /// signature over the weak world, run their two closures as the threads of
+    /// `Threads.two_of`. A closure given to either must not lend (hold a capture by `&mut`): two
     /// threads never share a place but through the memory. Any other function is refused by
     /// name.
     #[expect(clippy::too_many_arguments, reason = "one call's whole shape")]
@@ -3608,7 +3611,7 @@ impl<'db> Cx<'db> {
                 let callee = Callee::Shared { name: format!("Threads.{name}") };
                 self.call_with(callee, args, destination, target, at, out)
             }
-            "two" => {
+            "two" | "two_weak" => {
                 let closures: Vec<(InternedClosureId<'db>, GenericArgs<'db>)> = generics
                     .iter()
                     .filter_map(|it| it.ty())
@@ -3619,9 +3622,11 @@ impl<'db> Cx<'db> {
                     .collect();
                 let ([(first, first_args), (second, second_args)], 3) = (closures.as_slice(), args.len()) else {
                     return Err(self.refuse(
-                        "a call of `blaze_core::world::threads::two` whose threads are not two \
-                         closures (a function or a reference to a closure given as a thread is not \
-                         translated)",
+                        format!(
+                            "a call of `blaze_core::world::threads::{name}` whose threads are not \
+                             two closures (a function or a reference to a closure given as a thread \
+                             is not translated)"
+                        ),
                         at,
                     ));
                 };
@@ -3632,7 +3637,7 @@ impl<'db> Cx<'db> {
                     if self.envs.get(&env) == Some(&true) {
                         return Err(self.refuse(
                             format!(
-                                "a closure given to `blaze_core::world::threads::two` that captures \
+                                "a closure given to `blaze_core::world::threads::{name}` that captures \
                                  by unique borrow (`{}`; a thread shares nothing with its caller but \
                                  the memory; rule SharedLend)",
                                 env.replace('.', "::")
@@ -3640,10 +3645,10 @@ impl<'db> Cx<'db> {
                             at,
                         ));
                     }
-                    let Callee::Function { name } = self.closure_callee(id, closure_args, at)? else {
+                    let Callee::Function { name: thread } = self.closure_callee(id, closure_args, at)? else {
                         unreachable!("a closure's callee is its body")
                     };
-                    names.push(name);
+                    names.push(thread);
                 }
                 let second_name = names.pop().expect("two names");
                 let first_name = names.pop().expect("two names");
@@ -3651,7 +3656,7 @@ impl<'db> Cx<'db> {
                 let args = self.operands(args, at)?;
                 out.push(Stmt::Call {
                     dest,
-                    callee: Callee::Two { first: first_name, second: second_name },
+                    callee: Callee::Two { first: first_name, second: second_name, weak: name == "two_weak" },
                     args,
                     at: at.to_owned(),
                 });
