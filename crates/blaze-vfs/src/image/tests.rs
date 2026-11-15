@@ -503,6 +503,12 @@ fn a_start_reads_the_journals_tail_and_no_text_until_one_is_read() {
     assert_eq!(counted.gets.load(Ordering::Relaxed), 0, "a start reads no text");
 
     let root = back.root(back.head("main").unwrap()).unwrap();
+    // A file's id and mode come from the tree, its text not paged in.
+    let (small, tree) = (back.tree.id(node_at(&back, "small")), back.tree.id(root));
+    let (id, _) = back.reader().pin().id_and_mode(tree, "small").expect("a file");
+    assert_eq!(id, small);
+    assert_eq!(back.reader().pin().id_and_mode(tree, "dir"), None, "a directory");
+    assert_eq!(counted.gets.load(Ordering::Relaxed), 0, "an id and a mode read no text");
     assert_eq!(back.tree.read(root, "small").unwrap(), Some(&b"small"[..]));
     assert_eq!(counted.gets.load(Ordering::Relaxed), 1, "one read pages one text");
     assert_eq!(back.tree.read(root, "small").unwrap(), Some(&b"small"[..]));

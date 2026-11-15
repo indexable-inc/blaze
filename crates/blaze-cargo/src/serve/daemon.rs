@@ -1834,8 +1834,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         };
         let restoring =
             tracing::info_span!(target: "blaze", "daemon start: restore the VFS").entered();
-        // The VFS's file texts are the store's: the image names each file by its id alone.
-        let texts = super::image::StoreTexts::new(&mut store);
+        // The VFS's file texts are the store's: the image names each file by its id alone. The
+        // daemon's direct reads are made here, before the VFS, which reads its texts by them.
+        let stores = super::direct::Stores::new(store.reader(), std.reader(), options.reads.clone()); // clone: a path's refcount, once a start
+        let texts = super::image::StoreTexts::new(&mut store, Arc::clone(&stores));
         let (mut vfs, recovered) = Vfs::restore(
             journal.clone(),
             VFS,
@@ -1949,7 +1951,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             runs_end: RUNS_END,
             slots: format!("/{state}/slots"),
             premises: options.premises.clone(), // clone: the jobs' own copy, once a start
-            stores: super::direct::Stores::new(store.reader(), std.reader(), options.reads.clone()), // clone: a path's refcount, once a start
+            stores,
         })
         .map_err(|error| format!("the jobs' tables: {error}"))?;
         // The front end's carry sessions the journal marks: each checkout's next build opens

@@ -68,6 +68,7 @@ use crossbeam_channel::{Receiver, Sender};
 use hir_ty_codegen::v2::{Backends, BuildTime, HashSource, HirFrontend, HirInstance, HirStatic};
 
 use super::needs::{Front, Heard, Need, Refuse, Serve, Served, Step, Want};
+use crate::serve::direct::{DirectReading, Which};
 use crate::serve::work::{LaunchKept, LaunchMarked};
 use crate::serve::unit::{Job, KeptLowered, UnitReader, codegen, files::Mounted, graph::flag};
 
@@ -136,6 +137,11 @@ pub(crate) struct Serving {
     mounted: Arc<Mounted>,
     memo: Arc<Memo>,
     store: blaze_cas::Reader,
+    /// The daemon's stores as the build's tasks read them: a first call's build reads its
+    /// records directly into its task's frame, holding no guard and pinning no page of the
+    /// pool however long it runs ([`made_here`]). `store` serves only the describe records
+    /// (`Build::recording`), each one lookup under a guard of its own call.
+    stores: Arc<crate::serve::direct::Stores>,
     packs: Option<Arc<crate::serve::packs::Packs>>,
     under: Under,
     /// The program's own symbols and what each is, sorted by name: [`Positions::defines`].
@@ -1271,21 +1277,6 @@ fn joined(host: &Host, held: &Held, program: &mut Program, conn: Conn, check: [u
     program.join(conn, &table, &record.0, out)
 }
 
-/// The store as a build reads it: with no lock, under the reader's guard.
-struct Looked<'a> {
-    store: &'a blaze_cas::Reader,
-    guard: &'a blaze_cas::Guard,
-}
-
-impl Lookup for Looked<'_> {
-    fn read(&self, key: &blaze_cas::Key) -> Result<Option<&[u8]>, String> {
-        match self.store.get(self.guard, key) {
-            Ok(entry) => Ok(entry.map(|it| it.bytes)),
-            Err(corrupt) => Err(corrupt.to_string()),
-        }
-    }
-}
-
 /// The span tables a record is made against, by anchor, and the program's own symbols.
 struct Spans<'a> {
     tables: &'a [(ContentId, Vec<u8>)],
@@ -1781,6 +1772,7 @@ pub(crate) fn prepare<L: Lookup + ?Sized>(
         mounted: Arc::clone(mounted),
         memo: Arc::clone(&job.memo),
         store: job.input.store.clone(), // clone: a count
+        stores: Arc::clone(&job.input.reads), // clone: a count
         packs: job.input.packs.clone(), // clone: a count
         under,
         defines,
@@ -1912,11 +1904,16 @@ fn made_here(front: &KeptLowered, held: &Held, need: &Need, puts: &mut Vec<Put>)
     let build = Build::new(&backends, &frontend, &serving.policy, &serving.memo)
         .owned_by(&serving.owner)
         .recording(&serving.store);
-    let guard = blaze_cas::enter();
-    let store = Looked { store: &serving.store, guard: &guard };
-    let one = build.one(&ask, &store).map_err(|it| it.what)?;
-    let given = held.core.lock().statics.clone(); // clone: the program's statics, once a need
-    let statics = statics_of(&build, &store, &given, &one.statics).map_err(|it| it.what)?;
+    // The need's reads are direct reads into a frame of its own, freed when the need is made: the
+    // serving task makes needs until a request wants the front end, so what one read stays no
+    // longer than the need.
+    let (one, statics) = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+        let store = DirectReading::new(&serving.stores, Which::Home, frame);
+        let one = build.one(&ask, &store).map_err(|it| it.what)?;
+        let given = held.core.lock().statics.clone(); // clone: the program's statics, once a need
+        let statics = statics_of(&build, &store, &given, &one.statics).map_err(|it| it.what)?;
+        Ok::<_, String>((one, statics))
+    })?;
     let reads = Reads {
         db: lowered.db(),
         hashes: &hashes,

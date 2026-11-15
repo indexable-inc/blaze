@@ -1414,7 +1414,7 @@ pub(crate) fn serve_bodies(job: &Job, reader: &super::UnitReader, unit: usize) -
     let _span = span.enter();
     let in_view = |path: &str| job.mounted.in_view(path).map(std::borrow::Cow::into_owned);
     let marks = &job.input.body_marks;
-    let (puts, did) = serve_bodies_of(&reader.front, krate, &in_view, reader.bodies(), marks, &job.input.store)?;
+    let (puts, did) = serve_bodies_of(&reader.front, krate, &in_view, reader.bodies(), marks, &job.input.reads)?;
     record_did(&span, &did);
     Ok(puts)
 }
@@ -1428,22 +1428,25 @@ pub(crate) struct BodyPuts {
     pub(crate) sessions: Vec<(String, blaze_cas::Key)>,
 }
 
-/// [`serve_bodies`] of `krate` of `front`, over `store`, the view's paths given by `in_view`.
+/// [`serve_bodies`] of `krate` of `front`, over the home store of `stores` read directly into the
+/// task's frame (no guard, no pinned page, however long the serve runs), the view's paths given
+/// by `in_view`.
 pub(crate) fn serve_bodies_of(
     front: &Arc<Lowered>,
     krate: Crate,
     in_view: &impl Fn(&str) -> Option<String>,
     sessions: &bodies::Sessions,
     marks: &BTreeMap<String, blaze_cas::Key>,
-    store: &blaze_cas::Reader,
+    stores: &crate::serve::direct::Stores,
 ) -> Result<(BodyPuts, bodies::Did), ApiError> {
     let kernel = bodies::kernel(front_end()?).map_err(body_error)?;
-    let guard = blaze_cas::enter();
-    let reading = blaze_kernel::Reading { reader: store, guard: &guard };
-    let mut overlay = crate::serve::front_carry::Overlay::new(&reading);
-    let (did, saved) =
-        bodies::serve(&kernel, front, krate, in_view, sessions, marks, &mut overlay).map_err(body_error)?;
-    Ok((BodyPuts { puts: overlay.into_puts(), sessions: saved.into_iter().collect() }, did))
+    blaze_mem::frame::current(|frame| {
+        let reading = crate::serve::direct::DirectReading::new(stores, crate::serve::direct::Which::Home, frame);
+        let mut overlay = crate::serve::front_carry::Overlay::new(&reading);
+        let (did, saved) =
+            bodies::serve(&kernel, front, krate, in_view, sessions, marks, &mut overlay).map_err(body_error)?;
+        Ok((BodyPuts { puts: overlay.into_puts(), sessions: saved.into_iter().collect() }, did))
+    })
 }
 
 /// Keeps, as kernel entries, every body's inference, owner's MIR and silent borrow check the
@@ -1477,26 +1480,27 @@ pub(crate) fn keep_bodies(
     );
     let _span = span.enter();
     let in_view = |path: &str| job.mounted.in_view(path).map(std::borrow::Cow::into_owned);
-    let (puts, did) = keep_bodies_of(&reader.front, &in_view, reader.bodies(), &job.input.store, served)?;
+    let (puts, did) = keep_bodies_of(&reader.front, &in_view, reader.bodies(), &job.input.reads, served)?;
     record_did(&span, &did);
     Ok(puts)
 }
 
-/// [`keep_bodies`] of `front`, over `store` and the puts `served` not in it yet, the view's paths
-/// given by `in_view`.
+/// [`keep_bodies`] of `front`, over the home store of `stores` (read as [`serve_bodies_of`] reads
+/// it) and the puts `served` not in it yet, the view's paths given by `in_view`.
 pub(crate) fn keep_bodies_of(
     front: &Arc<Lowered>,
     in_view: &impl Fn(&str) -> Option<String>,
     sessions: &bodies::Sessions,
-    store: &blaze_cas::Reader,
+    stores: &crate::serve::direct::Stores,
     served: Vec<Put>,
 ) -> Result<(BodyPuts, bodies::Did), ApiError> {
     let kernel = bodies::kernel(front_end()?).map_err(body_error)?;
-    let guard = blaze_cas::enter();
-    let reading = blaze_kernel::Reading { reader: store, guard: &guard };
-    let mut overlay = crate::serve::front_carry::Overlay::seeded(&reading, served);
-    let (did, sessions) = bodies::keep(&kernel, front, in_view, sessions, &mut overlay).map_err(body_error)?;
-    Ok((BodyPuts { puts: overlay.into_puts(), sessions }, did))
+    blaze_mem::frame::current(|frame| {
+        let reading = crate::serve::direct::DirectReading::new(stores, crate::serve::direct::Which::Home, frame);
+        let mut overlay = crate::serve::front_carry::Overlay::seeded(&reading, served);
+        let (did, sessions) = bodies::keep(&kernel, front, in_view, sessions, &mut overlay).map_err(body_error)?;
+        Ok((BodyPuts { puts: overlay.into_puts(), sessions }, did))
+    })
 }
 
 fn body_error(error: impl std::fmt::Display) -> ApiError {
