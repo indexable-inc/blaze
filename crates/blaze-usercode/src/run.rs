@@ -236,9 +236,35 @@ impl Spec {
             .as_ref()
             .is_some_and(|own| path.starts_with(&own.dir) && !own.earlier.iter().any(|it| path.starts_with(it)))
     }
+
+    /// Whether a read of `path` whose `answer` is that it is a directory (a `stat`, no
+    /// listing) is answered by what blaze made for the run before it began: `path` is a
+    /// directory above the run's own directory ([`Own`]), or above its `OUT_DIR` where it has
+    /// none, which is there only below directories. A C compiler resolving its output's path
+    /// `lstat`s each. Its stamp says nothing of that answer: `build/`, above every run's own
+    /// directory, gains a name whenever another unit's run begins, and so moved during most
+    /// runs of a cold build (cc_script, 2026-11-15). A listing of one, a link where one is, or
+    /// a path with a `..` in it says more, and stays an input.
+    pub fn implied(&self, path: &Path, answer: Option<[u8; 32]>) -> bool {
+        if answer != Some(crate::trace::DIRECTORY) || ABOVE_IS_INPUT.get() {
+            return false;
+        }
+        if path.components().any(|it| it == std::path::Component::ParentDir) {
+            return false;
+        }
+        let made = self.own.as_ref().map(|it| it.dir.as_path()).or(self.out_dir.as_deref());
+        made.is_some_and(|made| made != path && made.starts_with(path))
+    }
 }
 
 thread_local! {
+    /// A planted bug, for a test's control: a `stat` of a directory above a run's own
+    /// directory is an input asked whether it moved ([`Spec::implied`]), as until 2026-11-15,
+    /// when another unit's directory made in `build/` as a cold build's runs ran kept them
+    /// under no key. Never set outside a test.
+    #[doc(hidden)]
+    pub static ABOVE_IS_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// A planted bug, for a test's control: a run's own directory ([`Own`]) is taken for its
     /// input, as until 2026-11-15, when the live record made in it during every run kept
     /// libsqlite3-sys's and ring's runs under no key. Never set outside a test.
@@ -611,7 +637,9 @@ impl Run {
         // directory around it but for what an earlier run printed ([`Spec::product`]).
         // Before `moved` asks of the reads: the live record made in that directory as the run
         // runs moves its stamp in every run.
-        traced.files.retain(|it| !self.spec.product(&it.0));
+        // Nor is a `stat` of a directory above that, which is there because blaze made the
+        // run's directory ([`Spec::implied`]).
+        traced.files.retain(|it| !self.spec.product(&it.0) && !self.spec.implied(&it.0, it.1));
         traced.dirs.retain(|it| !self.spec.product(&it.0));
         let key = self.spec.key;
         let rule = (exit.code == Some(0))
@@ -1562,6 +1590,9 @@ mod tests {
     /// Another unit's directory beside [`OWN`].
     const OTHERS: &str = "/ws/target/debug/build/q/fedcba9876543210";
 
+    /// The directory of every unit's run directory, above [`OWN`] and [`OTHERS`].
+    const BUILD: &str = "/ws/target/debug/build";
+
     fn spec_owning() -> Spec {
         let mut spec = spec(Mode::Normal);
         spec.own = Some(Own { dir: OWN.into(), earlier: vec![format!("{OWN}/run/stdout").into()] });
@@ -1570,8 +1601,8 @@ mod tests {
 
     /// A script that reads `/ws/data`, its own directory as a realpath of its `OUT_DIR` and
     /// the sandbox's records of it leave it in a trace (the directory, its listing, the live
-    /// record made in it, `invoked.timestamp`), and each of `also`.
-    fn script_owning(sim: &mut Sim, also: Vec<PathBuf>) {
+    /// record made in it, `invoked.timestamp`), each of `also` and the listings `listed`.
+    fn script_owning(sim: &mut Sim, also: Vec<(PathBuf, Option<[u8; 32]>)>, listed: Vec<(PathBuf, [u8; 32])>) {
         sim.program("/script", move |command, _| {
             let Sandbox::On { trace: true, .. } = command.sandbox else { panic!("a run traces") };
             let mut files: Vec<(PathBuf, Option<[u8; 32]>)> = vec![
@@ -1580,10 +1611,12 @@ mod tests {
                 (format!("{OWN}/blaze-live").into(), Some([7; 32])),
                 (format!("{OWN}/run/invoked.timestamp").into(), Some([8; 32])),
             ];
-            files.extend(also.iter().map(|it| (it.clone(), Some([9; 32]))));
+            files.extend(also.iter().cloned());
+            let mut dirs = vec![(OWN.into(), listing([OsStr::new("blaze-live"), OsStr::new("out"), OsStr::new("run")]))];
+            dirs.extend(listed.iter().cloned());
             let traced = Traced {
                 files,
-                dirs: vec![(OWN.into(), listing([OsStr::new("blaze-live"), OsStr::new("out"), OsStr::new("run")]))],
+                dirs,
                 env: vec![("CC".into(), Some("cc".into()))],
                 untraceable: Vec::new(),
             };
@@ -1600,10 +1633,11 @@ mod tests {
     }
 
     /// What has moved of a run that made its live record in [`OWN`] as it ran while another
-    /// unit wrote in [`OTHERS`]: the stamps of both directories moved, so each read at or
-    /// below either has ([`crate::inputs::Began::moved`] asks of every directory above a name).
+    /// unit made [`OTHERS`] and wrote in it: the stamps of both directories and of [`BUILD`]
+    /// moved, so each read at or below any has ([`crate::inputs::Began::moved`] asks of every
+    /// directory above a name).
     fn own_moved(traced: &Traced) -> Option<crate::inputs::Moved> {
-        let moved = |path: &Path| path.starts_with(OWN) || path.starts_with(OTHERS);
+        let moved = |path: &Path| path.starts_with(BUILD);
         let files = traced.files.iter().map(|it| &it.0);
         let read = files.chain(traced.dirs.iter().map(|it| &it.0)).find(|it| moved(it))?;
         Some(crate::inputs::Moved { read: read.clone(), at: read.clone(), why: crate::inputs::MovedWhy::Itself })
@@ -1644,7 +1678,7 @@ mod tests {
     fn a_runs_own_directory_is_its_product_and_no_input() {
         let mut sim = Sim::new(11, Faults::default());
         let mut store = opened(&mut sim);
-        script_owning(&mut sim, Vec::new());
+        script_owning(&mut sim, Vec::new(), Vec::new());
         let mut inputs = data_only();
         let (ran, not_kept, read) = go_owning(&mut sim, &mut store, &mut inputs);
         assert!(ran, "the first run runs");
@@ -1656,7 +1690,7 @@ mod tests {
         for also in inputs_still.map(PathBuf::from) {
             let mut sim = Sim::new(11, Faults::default());
             let mut store = opened(&mut sim);
-            script_owning(&mut sim, vec![also.clone()]);
+            script_owning(&mut sim, vec![(also.clone(), Some([9; 32]))], Vec::new());
             let (ran, not_kept, read) = go_owning(&mut sim, &mut store, &mut data_only());
             assert!(ran && read.contains(&also), "{} is an input: {read:?}", also.display());
             assert_eq!(not_kept, Some(also.clone()), "a change of {} during the run is a move", also.display());
@@ -1670,11 +1704,61 @@ mod tests {
     fn the_oracle_catches_a_runs_own_directory_taken_for_an_input() {
         let mut sim = Sim::new(11, Faults::default());
         let mut store = opened(&mut sim);
-        script_owning(&mut sim, Vec::new());
+        script_owning(&mut sim, Vec::new(), Vec::new());
         OWN_DIR_IS_INPUT.set(true);
         let (_, not_kept, _) = go_owning(&mut sim, &mut store, &mut data_only());
         OWN_DIR_IS_INPUT.set(false);
         assert_eq!(not_kept, Some(PathBuf::from(OWN)), "the oracle's `None` is missed");
+    }
+
+    /// What a C compiler resolving a path in the run's `OUT_DIR` `lstat`s above [`OWN`]: each
+    /// directory there, every one a directory.
+    fn stats_above() -> Vec<(PathBuf, Option<[u8; 32]>)> {
+        let above = ["/", "/ws", "/ws/target", "/ws/target/debug", BUILD, "/ws/target/debug/build/p"];
+        above.into_iter().map(|it| (PathBuf::from(it), Some(DIRECTORY))).collect()
+    }
+
+    /// The invariant: a `stat` of a directory above a run's own directory (`build/`, as a C
+    /// compiler resolving its output's path makes) is answered by the directory blaze made for
+    /// the run ([`Spec::implied`]): no input, so another unit's directory made in `build/` as
+    /// the run runs moves nothing, and the run is kept and reused. A listing of `build/`, and a
+    /// file read there, say more and stay inputs, asked whether they moved.
+    #[test]
+    fn a_stat_of_a_directory_above_a_runs_own_is_no_input() {
+        let mut sim = Sim::new(11, Faults::default());
+        let mut store = opened(&mut sim);
+        script_owning(&mut sim, stats_above(), Vec::new());
+        let mut inputs = data_only();
+        let (ran, not_kept, read) = go_owning(&mut sim, &mut store, &mut inputs);
+        assert!(ran, "the first run runs");
+        assert_eq!(not_kept, None, "a run whose `build/` alone moved is kept");
+        assert_eq!(read, [PathBuf::from("/ws/data")], "a stat above its own directory is in no key");
+        assert!(!go_owning(&mut sim, &mut store, &mut inputs).0, "kept, it is reused");
+
+        let listed = vec![(PathBuf::from(BUILD), listing([OsStr::new("p"), OsStr::new("q")]))];
+        let file = vec![(PathBuf::from(format!("{BUILD}/p")), Some([9; 32]))];
+        for (also, listed) in [(Vec::new(), listed), (file, Vec::new())] {
+            let mut sim = Sim::new(11, Faults::default());
+            let mut store = opened(&mut sim);
+            script_owning(&mut sim, also, listed);
+            let (ran, not_kept, _) = go_owning(&mut sim, &mut store, &mut data_only());
+            assert!(ran);
+            assert!(not_kept.is_some_and(|it| it.starts_with(BUILD)), "a listing or a file read is an input");
+        }
+    }
+
+    /// The control (rule 23) of [`a_stat_of_a_directory_above_a_runs_own_is_no_input`]: with
+    /// such a `stat` taken for an input ([`ABOVE_IS_INPUT`], as until 2026-11-15), another
+    /// unit's directory made beside the run's keeps it under no key.
+    #[test]
+    fn the_oracle_catches_a_stat_above_a_runs_own_directory_taken_for_an_input() {
+        let mut sim = Sim::new(11, Faults::default());
+        let mut store = opened(&mut sim);
+        script_owning(&mut sim, stats_above(), Vec::new());
+        ABOVE_IS_INPUT.set(true);
+        let (_, not_kept, _) = go_owning(&mut sim, &mut store, &mut data_only());
+        ABOVE_IS_INPUT.set(false);
+        assert_eq!(not_kept, Some(PathBuf::from(BUILD)), "the oracle's `None` is missed");
     }
 
     #[test]
