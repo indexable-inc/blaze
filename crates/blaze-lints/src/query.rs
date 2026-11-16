@@ -228,15 +228,6 @@ pub(crate) fn profile_hits<'db>(
     profile::hits_of(db, krate, key.loaded(db))
 }
 
-/// The greatest crate of the session (by arena index, as ids order), read from the crate list
-/// alone: what the key of a fold over a crate's dependents names besides the crate, so under
-/// the home rule the fold's entry lives at or above every crate it reads (its arena, dropped
-/// when one of them changes) and not in the lower crate's.
-pub(crate) fn top_crate(db: &Db) -> base_db::Crate {
-    let all = base_db::all_crates(db);
-    *all.iter().max().expect("a session with no crate has no item to lint")
-}
-
 /// What `krate` resolves each path of [`famous::KNOWN`] to, by index: once per crate, so a
 /// lint's lookup is a hash of its path and one load, not a walk of `std`'s scopes.
 #[blaze_memo::tracked(returns(copy))]

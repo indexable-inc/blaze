@@ -1507,7 +1507,10 @@ fn left_to_the_next() -> Result<(), String> {
     // The keep failed: its claim gives its runs back (a `Claim` is linear: never a bare drop).
     claim.give_back();
     let next = claim_keeps(db).expect("an item store");
-    let lost: Vec<_> = runs.iter().filter(|run| !kept.contains(*run) && !next.steps.contains(*run)).collect();
+    let claimed = |run: &(DefWithBodyId, Step, SchemaHash)| {
+        next.steps.iter().any(|&(def, step, schema)| (def.get(), step, schema) == *run)
+    };
+    let lost: Vec<_> = runs.iter().filter(|run| !kept.contains(*run) && !claimed(run)).collect();
     if !lost.is_empty() {
         return Err(format!("{} runs neither kept nor claimed again: {lost:?}", lost.len()));
     }
