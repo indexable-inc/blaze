@@ -627,7 +627,7 @@ impl Uring {
     /// the ring: those of kept files and connections dropped since ([`Fixed`]'s drop).
     pub(super) fn drain_closing(&mut self) {
         loop {
-            let slot = self.table.closing.borrow_mut().pop();
+            let slot = self.table.closing.lock().pop();
             let Some(slot) = slot else { return };
             self.close(slot);
         }
@@ -692,10 +692,10 @@ impl Uring {
         if need == 0 || cold.slots[0] != NO_SLOT {
             return true;
         }
-        if self.table.free.borrow().len() < need {
+        if self.table.free.lock().len() < need {
             self.evict();
         }
-        let mut free = self.table.free.borrow_mut();
+        let mut free = self.table.free.lock();
         if free.len() >= need {
             let cold = self.ops.cold_mut(id);
             for slot in &mut cold.slots[..need] {
@@ -737,7 +737,7 @@ impl Uring {
     /// The slots emptied, for the requests that waited for them, in the order they asked.
     fn unslot(&mut self) {
         for _ in 0..self.slot_waiting.len() {
-            if self.table.free.borrow().is_empty() {
+            if self.table.free.lock().is_empty() {
                 return;
             }
             let Some(id) = self.slot_waiting.pop_front() else { return };
@@ -972,7 +972,7 @@ impl Uring {
                 self.closes -= 1;
                 let slot = hot.of as u32;
                 if slot < self.table.ours {
-                    self.table.free.borrow_mut().push(slot);
+                    self.table.free.lock().push(slot);
                 }
                 self.unslot();
                 Step::Ends(None)
@@ -1497,7 +1497,7 @@ impl Uring {
             match opened {
                 true => self.close(slot),
                 false => {
-                    self.table.free.borrow_mut().push(slot);
+                    self.table.free.lock().push(slot);
                     freed = true;
                 }
             }

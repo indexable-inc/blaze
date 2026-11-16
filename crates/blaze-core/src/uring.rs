@@ -46,7 +46,7 @@ mod flight;
 mod ops;
 
 use std::{
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, UnsafeCell},
     collections::VecDeque,
     ffi::CStr,
     fmt::Write as _,
@@ -58,7 +58,6 @@ use std::{
     },
     path::{Path, PathBuf},
     ptr,
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
@@ -79,6 +78,7 @@ use crate::{
     Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names,
     PSI_TRIGGER, RECV_MOST, Stamp, Tag,
     handoff::Claims,
+    lock::Lock,
     wait::{self, Clock, Deadline, Monotonic},
     wheel::{self, Wheel},
 };
@@ -111,7 +111,6 @@ const OP_SEND_ZC: u8 = 47;
 const SETUP_SQPOLL: u32 = 1 << 1;
 const SETUP_CQSIZE: u32 = 1 << 3;
 const SETUP_SUBMIT_ALL: u32 = 1 << 7;
-const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
 const FEAT_SINGLE_MMAP: u32 = 1 << 0;
 const FEAT_NODROP: u32 = 1 << 1;
 const FEAT_SQPOLL_NONFIXED: u32 = 1 << 7;
@@ -464,17 +463,17 @@ fn anonymous(len: usize) -> io::Result<Map> {
 /// files it keeps open and the sockets it connects; the second is the kernel's, which accepts
 /// put connections into directly.
 struct Table {
-    ring: Rc<OwnedFd>,
+    ring: Arc<OwnedFd>,
     /// Slots of the driver's half that are free.
-    free: RefCell<Vec<u32>>,
+    free: Lock<Vec<u32>>,
     /// Slots of either half whose file was let go, to empty through the ring
     /// (`IORING_OP_CLOSE`); free again once that completes.
-    closing: RefCell<Vec<u32>>,
+    closing: Lock<Vec<u32>>,
     ours: u32,
 }
 
 impl Table {
-    fn new(ring: &Rc<OwnedFd>) -> io::Result<Rc<Table>> {
+    fn new(ring: &Arc<OwnedFd>) -> io::Result<Arc<Table>> {
         let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: `&mut limit` is a live, aligned `rlimit` the call writes and does not keep.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
@@ -511,11 +510,11 @@ impl Table {
             "6.0",
         )?;
         // alloc: setup, once per driver: room for every slot, so a drop never grows it.
-        let closing = RefCell::new(Vec::with_capacity(size as usize));
+        let closing = Lock::new("core.uring.closing", Vec::with_capacity(size as usize));
         // alloc: clone: setup, once per driver; `ring` is a reference count.
-        Ok(Rc::new(Table {
+        Ok(Arc::new(Table {
             ring: ring.clone(),
-            free: RefCell::new((0..ours).rev().collect()),
+            free: Lock::new("core.uring.free", (0..ours).rev().collect()),
             closing,
             ours,
         }))
@@ -545,22 +544,22 @@ impl Table {
     }
 
     /// `fd` put in a slot of the driver's half, if one is free.
-    fn install(self: &Rc<Table>, fd: OwnedFd) -> io::Result<Fixed> {
-        let slot = self.free.borrow_mut().pop();
+    fn install(self: &Arc<Table>, fd: OwnedFd) -> io::Result<Fixed> {
+        let slot = self.free.lock().pop();
         if let Some(slot) = slot
             && let Err(error) = self.set(slot, fd.as_raw_fd())
         {
-            self.free.borrow_mut().push(slot);
+            self.free.lock().push(slot);
             return Err(error);
         }
         // clone: a reference count.
-        Ok(Fixed { fd: Some(fd), slot, table: Rc::clone(self) })
+        Ok(Fixed { fd: Some(fd), slot, table: Arc::clone(self) })
     }
 
     /// The connection an accept put in slot `slot` of the kernel's half.
-    fn accepted(self: &Rc<Table>, slot: u32) -> Fixed {
+    fn accepted(self: &Arc<Table>, slot: u32) -> Fixed {
         // clone: a reference count.
-        Fixed { fd: None, slot: Some(slot), table: Rc::clone(self) }
+        Fixed { fd: None, slot: Some(slot), table: Arc::clone(self) }
     }
 }
 
@@ -574,7 +573,7 @@ struct Fixed {
     /// None only where the driver's half of the table was full: the same file, through its
     /// descriptor, so the same bytes.
     slot: Option<u32>,
-    table: Rc<Table>,
+    table: Arc<Table>,
 }
 
 impl Fixed {
@@ -594,9 +593,9 @@ impl Fixed {
 
 impl Fixed {
     /// A kept file's, until its open puts it in a slot.
-    fn unopened(table: &Rc<Table>) -> Fixed {
+    fn unopened(table: &Arc<Table>) -> Fixed {
         // clone: a reference count.
-        Fixed { fd: None, slot: None, table: Rc::clone(table) }
+        Fixed { fd: None, slot: None, table: Arc::clone(table) }
     }
 }
 
@@ -606,7 +605,7 @@ impl Drop for Fixed {
     fn drop(&mut self) {
         let Some(slot) = self.slot else { return };
         // alloc: none, its capacity is every slot's.
-        self.table.closing.borrow_mut().push(slot);
+        self.table.closing.lock().push(slot);
     }
 }
 
@@ -878,6 +877,16 @@ impl Drop for Map {
     }
 }
 
+// SAFETY: a `Map` owns its mapping alone (made by `new` or `anonymous`, unmapped once by its
+// `Drop`); `at` is an address in this process, valid on every thread, and nothing about the
+// mapping belongs to the thread that made it. Moving a `Map` moves that ownership whole: no
+// other value keeps `at` past the `Map` (the pointers into it are its owner's, `Ring`'s and
+// `Provided`'s, and move with it). The memory is shared with the kernel, which synchronizes
+// through the ring's atomic heads and tails the same whatever thread of the process reads and
+// writes them. Not `Sync`: `&Map` hands out `*mut` into it, and two threads writing through
+// those would race.
+unsafe impl Send for Map {}
+
 /// The ring: its file, the mappings and where in them the kernel's counters are.
 struct Ring {
     sq_head: *const AtomicU32,
@@ -904,20 +913,31 @@ struct Ring {
     // Dropped after the pointers into them are no longer used.
     _maps: Vec<Map>,
     /// Shared with the [`Table`], whose slots are emptied through it until the last goes.
-    fd: Rc<OwnedFd>,
+    fd: Arc<OwnedFd>,
 }
+
+// SAFETY: every pointer of a `Ring` (`sq_head` .. `cqes`) points into `_maps`, which the `Ring`
+// owns and which move with it (`Map` is `Send`), so a moved `Ring` takes its pointers' memory
+// along and none is left with the thread it came from. The ring is not bound to a thread: it
+// is made without `IORING_SETUP_SINGLE_ISSUER`, so the kernel takes `io_uring_enter` and
+// `io_uring_register` from any thread of the process (the SQPOLL thread submits either way).
+// One thread at a time uses it: `Ring` is not `Sync`, so no two threads hold a `&Ring`.
+unsafe impl Send for Ring {}
 
 impl Ring {
     /// Submitted by a kernel thread of its own (`IORING_SETUP_SQPOLL`), which takes requests
     /// from the ring as they are written, with no system call, and sleeps after
-    /// [`SQ_THREAD_IDLE_MS`] of nothing to do. For one issuing thread (a [`Uring`] is not
-    /// `Send`; `IORING_SETUP_SINGLE_ISSUER`). With a thread of its own the kernel runs every
+    /// [`SQ_THREAD_IDLE_MS`] of nothing to do. Not `IORING_SETUP_SINGLE_ISSUER`: a [`Uring`] is
+    /// `Send` (blaze-std's world holds it behind its lock and polls it from whichever worker
+    /// waits), and with that flag the kernel refuses `io_uring_register` (a slot of the file
+    /// table set, a connection's buffers registered) from any thread but the one that made the
+    /// ring, with `EEXIST`. With a thread of its own the kernel runs every
     /// completion's work there, so `IORING_SETUP_DEFER_TASKRUN`, `COOP_TASKRUN` and
     /// `TASKRUN_FLAG`, which say when the issuing thread runs it, mean nothing with SQPOLL, and
     /// the kernel refuses them with it.
     fn new(entries: u32, completions: u32) -> io::Result<Ring> {
         let mut params = Params {
-            flags: SETUP_SQPOLL | SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER,
+            flags: SETUP_SQPOLL | SETUP_CQSIZE | SETUP_SUBMIT_ALL,
             sq_thread_idle: SQ_THREAD_IDLE_MS,
             cq_entries: completions,
             ..Params::default()
@@ -940,7 +960,7 @@ impl Ring {
             return Err(io::Error::new(kind, why));
         }
         // SAFETY: the call returned a file descriptor of its own.
-        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }); // alloc: setup, once per driver.
+        let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }); // alloc: setup, once per driver.
         let wanted = [
             (FEAT_SINGLE_MMAP, "IORING_FEAT_SINGLE_MMAP", "5.4"),
             (FEAT_NODROP, "IORING_FEAT_NODROP", "5.5"),
@@ -1168,7 +1188,7 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
         (libc::EINVAL, _) => write!(
             out,
             "this kernel (Linux {kernel}) lacks IORING_SETUP_SQPOLL with \
-             IORING_SETUP_SINGLE_ISSUER, which Linux 6.0 and later have. \
+             IORING_SETUP_SUBMIT_ALL, which Linux 5.18 and later have. \
              Fix: run on Linux 6.0 or later"
         ),
         (libc::ENOMEM, _) => write!(
@@ -1824,7 +1844,7 @@ pub struct Uring {
     /// Shared with the work done off the ring, so handing it out is a count, not a copy.
     root: Arc<Path>,
     ring: Ring,
-    table: Rc<Table>,
+    table: Arc<Table>,
     /// Not freed while the kernel may still write into it (see `Drop`).
     provided: ManuallyDrop<Provided>,
     /// Each file opened, for reading and appending, and the name each is kept under.
@@ -2714,7 +2734,7 @@ fn size_of_file(fd: RawFd) -> io::Result<u64> {
 /// `crate::net::listen` before its bind; the ring accepts straight into its table, and each
 /// connection keeps the listen's options as Linux copies them (sockopt's test
 /// `an_accepted_connection_carries_the_listen_s_options`).
-fn connect_socket(table: &Rc<Table>, domain: libc::c_int, options: &crate::sockopt::Tcp) -> io::Result<Fixed> {
+fn connect_socket(table: &Arc<Table>, domain: libc::c_int, options: &crate::sockopt::Tcp) -> io::Result<Fixed> {
     let fd = crate::net::stream_socket(domain)?;
     crate::sockopt::for_stream(fd.as_raw_fd(), domain, options, crate::sockopt::Side::Connect)?;
     table.install(fd)
@@ -3851,7 +3871,7 @@ mod tests {
         };
         let (a, b) = (slot(&driver, "a").expect("a slot"), slot(&driver, "b").expect("a slot"));
         assert!(a != b && a < driver.table.ours && b < driver.table.ours, "{a} {b}");
-        let free = driver.table.free.borrow().len();
+        let free = driver.table.free.lock().len();
         let mut effects = vec![
             Effect::Read { file: name("a"), at: 0, len: 3, tag: Tag(3) },
             Effect::Remove { file: name("b"), tag: Tag(4) },
@@ -3862,11 +3882,50 @@ mod tests {
         assert_eq!(seen, [Done::Read(b"one".to_vec()), Done::Removed]);
         // The slot is emptied through the ring, a close no effect waits for.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while driver.table.free.borrow().len() < free + 1 && Instant::now() < deadline {
+        while driver.table.free.lock().len() < free + 1 && Instant::now() < deadline {
             driver.poll(&mut Vec::new(), Deadline::after(driver.now(), Duration::from_millis(1)));
         }
-        assert_eq!((driver.table.free.borrow().len(), driver.closes), (free + 1, 0));
+        assert_eq!((driver.table.free.lock().len(), driver.closes), (free + 1, 0));
         drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A driver made on one thread and used on another, as blaze-std's world uses it (one
+    /// driver behind the world's lock, polled by whichever worker waits): the thread that made
+    /// it has ended, and there a file is kept, appended to and read, and a TCP connection is
+    /// made, its socket put in a slot of the table through `io_uring_register`, and round-tripped.
+    /// Under `IORING_SETUP_SINGLE_ISSUER` the kernel refused that register from the second
+    /// thread with `EEXIST`; before the driver was `Send` the move did not compile.
+    #[test]
+    fn a_driver_moved_to_another_thread_keeps_a_file_and_connects() {
+        let root = dir("uring-moved");
+        let at = root.clone();
+        let made = std::thread::spawn(move || Uring::new(&at).unwrap()).join().unwrap();
+        let (seen, slot, trip) = std::thread::spawn(move || {
+            let mut driver = made;
+            let name = FileName::new("a").unwrap();
+            let mut effects =
+                vec![Effect::Append { file: name.clone(), bytes: b"one".to_vec(), tag: Tag(1) }];
+            let mut seen = Vec::new();
+            run_until_idle(&mut driver, &mut effects, |done, effects| {
+                if done.tag == Tag(1) {
+                    effects.push(Effect::Read { file: name.clone(), at: 0, len: 3, tag: Tag(2) });
+                }
+                seen.push(done.done);
+            })
+            .expect("the effects end");
+            let slot = driver.kept.get(driver.names[&name]).expect("kept").fixed.slot;
+            let any = Address::Tcp("127.0.0.1:0".parse().unwrap());
+            driver.submit(&mut vec![Effect::Listen { at: any, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
+            let listening = driver.local_addr(Tag(1)).expect("listening");
+            let trip = round_trip(&mut driver, &Address::Tcp(listening));
+            (seen, slot, trip)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, [Done::Appended, Done::Read(b"one".to_vec())]);
+        assert!(slot.is_some(), "the kept file was not put in a slot of the table");
+        assert_eq!(trip, round_tripped());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5267,7 +5326,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("plain"), b"x").unwrap();
         let mut driver = Uring::new(&root).unwrap();
-        let free = driver.table.free.borrow().len();
+        let free = driver.table.free.lock().len();
         let name = |it: &str| FileName::new(it).unwrap();
         let mut effects = vec![
             Effect::WriteAt { file: name("missing"), at: 0, bytes: b"a".to_vec(), tag: Tag(1) },
@@ -5293,13 +5352,13 @@ mod tests {
         opened(3, root.join("plain"));
         opened(4, root.join("plain/under"));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while (driver.table.free.borrow().len() < free || driver.closes > 0)
+        while (driver.table.free.lock().len() < free || driver.closes > 0)
             && Instant::now() < deadline
         {
             driver.poll(&mut Vec::new(), Deadline::after(driver.now(), Duration::from_millis(1)));
         }
         assert_eq!(
-            (driver.table.free.borrow().len(), driver.closes, driver.slots_held),
+            (driver.table.free.lock().len(), driver.closes, driver.slots_held),
             (free, 0, 0)
         );
         assert_eq!(driver.paths.held(), [0, 0]);
@@ -5326,7 +5385,7 @@ mod tests {
         std::fs::write(root.join("src.rs"), b"old").unwrap();
         std::fs::write(root.join("empty"), b"").unwrap();
         let mut driver = Uring::new(&root).unwrap();
-        let free = driver.table.free.borrow().len();
+        let free = driver.table.free.lock().len();
         let name = |it: &str| FileName::new(it).unwrap();
         let seen = read_all(
             &mut driver,
@@ -5360,7 +5419,7 @@ mod tests {
         assert_eq!(reads(&seen)[0], std::fs::read(root.join("src.rs")).unwrap());
         assert!(driver.kept.is_empty() && driver.names.is_empty());
         assert_eq!((driver.loading, driver.load_waiting.len()), (0, 0));
-        assert_eq!((driver.table.free.borrow().len(), driver.slots_held), (free, 0));
+        assert_eq!((driver.table.free.lock().len(), driver.slots_held), (free, 0));
         assert_eq!(driver.paths.held(), [0, 0]);
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
@@ -5740,7 +5799,7 @@ mod tests {
                 "io_uring_setup, io_uring_enter and io_uring_register",
             ),
             (libc::ENOSYS, None, "with ENOSYS", "Linux 5.0.0", "Linux 6.0 or later"),
-            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "Linux 6.0 or later"),
+            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SUBMIT_ALL", "Linux 6.0 or later"),
             (libc::ENOMEM, None, "with ENOMEM", "RLIMIT_MEMLOCK", "ulimit -l"),
             (libc::EBADF, None, "with errno 9", "not known", "kernel.io_uring_disabled is 0"),
         ];
