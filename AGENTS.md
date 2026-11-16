@@ -54,7 +54,7 @@ Not now:
 
 ## How work is done
 
-- Lanes write in one directory, one pull request; the main agent compiles and merges (35, 36).
+- Work in parallel: lanes write in one directory and never wait on a compile or on a yes (35, 48).
 - Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
@@ -146,12 +146,12 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **8. own-nightly**: Each project builds with `harness/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
 - **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
-- **35. fan-out-write-only**: Lanes only write; the main agent compiles each piece within minutes, then admits it alone.
+- **35. fan-out-write-only**: Lanes only write and never wait on a compile; the main agent compiles the tree in batches.
 - **36. worktree-per-lane**: One directory, each lane in its own files; a worktree is the exception; never `git stash`.
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
 - **46. ledger-decides**: Work comes from the objectives ledger and is done when its row's check passes on a named commit.
 - **47. every-agent-has-a-task**: Every agent starts on one task with its outcome and check; people follow tasks, not agents.
-- **48. agents-are-a-cost**: Start each independent large piece now in its own lane; four at most share files; nothing small.
+- **48. agents-are-a-cost**: Start every independent piece now, in parallel, without asking; disjoint files; nothing small.
 - **69. every-command-has-a-timeout**: Size a timeout to each command; an expiry is a finding, never waited out or retried.
 - **80. act-on-snapshots**: Work starts when asked, on a snapshot; nothing builds, checks or publishes on save or mid-edit.
 - **82. real-run-first**: A new path runs its real command, profile on, on a real project the day it compiles.
