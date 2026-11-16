@@ -273,7 +273,7 @@ impl Shared {
     /// [`AtBound`], after [`BOUND_TICKS`] waits of [`BOUND_TICK`]: the read fails, naming the
     /// bound. It never blocks without end, and never pins past the bound.
     fn pin_room(&self, need: u64) -> Result<(), AtBound> {
-        self.pin_room_within(need, counts::pinned_bound(counts::budget()), BOUND_TICKS)
+        self.pin_room_within(need, counts::pinned_bound(counts::budget()), counts::bound_ticks(BOUND_TICKS))
     }
 
     /// [`Shared::pin_room`] under `bound`, waiting at most `ticks` times.

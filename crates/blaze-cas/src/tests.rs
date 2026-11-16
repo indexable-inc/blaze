@@ -23,6 +23,7 @@ mod whole;
 mod place_crash;
 mod place_made;
 mod place_race;
+mod pinned_unset;
 mod heap;
 mod home;
 
