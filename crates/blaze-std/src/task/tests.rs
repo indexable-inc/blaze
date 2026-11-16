@@ -642,6 +642,59 @@ fn a_program_that_spawns_nothing_starts_no_thread() {
     assert!(status.success(), "the program that spawns nothing started a thread: {said}");
 }
 
+/// One batch of 64 tasks on `workers` workers, joined with `Batch::join_each`: task `key` makes
+/// `key * key + 1`. The bytes are the results merged by key, or, for the control, in the order
+/// the join handed them over. Also the scope's join counts.
+fn batch_bytes(workers: u32, reversed: bool, by_arrival: bool) -> (Vec<u8>, super::JoinCounts) {
+    const KEYS: u32 = 64;
+    let io = Io::sim(5);
+    let running = flat(workers);
+    let cx = root_on(&io, running.pool());
+    let scope = cx.scope();
+    let mut batch = scope.batch::<(u32, u64), Global>(Global);
+    for at in 0..KEYS {
+        let key = if reversed { KEYS - 1 - at } else { at };
+        let index = batch.may_overlap("square", TASK_FRAME, move |_cx| Ok::<_, String>((key, u64::from(key) * u64::from(key) + 1)));
+        assert_eq!(index.expect("room for a handle"), at, "an index is the spawn's place in its batch");
+    }
+    let mut seen = vec![0u32; KEYS as usize];
+    let mut merged = vec![0u64; KEYS as usize];
+    let mut arrived = Vec::new();
+    batch.join_each(&cx, |joined| {
+        seen[joined.index as usize] += 1;
+        let (key, made) = joined.result.expect("no task fails");
+        merged[key as usize] = made;
+        arrived.push(made);
+    });
+    let counts = scope.join_counts();
+    scope.join(&cx).expect("its scope");
+    assert!(seen.iter().all(|it| *it == 1), "{workers} workers: every index delivered exactly once: {seen:?}");
+    drop(cx);
+    stopped(running);
+    let order = if by_arrival { arrived } else { merged };
+    (order.iter().flat_map(|it| it.to_le_bytes()).collect(), counts)
+}
+
+/// A batch join's output merged by key is the same bytes on one worker, on eight, and with the
+/// spawns reversed (rule 25; parallel.md, "End state", point 8). The control merges in the
+/// order results arrive: on one worker every task ended at its spawn, the join's sweep hands
+/// them over as 0, 63, 62, .., and the bytes differ. Prints
+/// `batch join: 8 workers: tasks ended 64: by workers .., by their joiner 0, by a helping join ..; parks .. (.. ns), depth-capped 0`
+/// and `test task::tests::a_batch_join_merged_by_key_gives_equal_bytes_in_any_schedule ... ok`.
+#[test]
+fn a_batch_join_merged_by_key_gives_equal_bytes_in_any_schedule() {
+    let (one, _) = batch_bytes(1, false, false);
+    let (eight, counts) = batch_bytes(8, false, false);
+    let (reversed, _) = batch_bytes(8, true, false);
+    eprintln!("batch join: 8 workers: {counts}");
+    assert_eq!(one, eight, "one worker and eight gave different bytes");
+    assert_eq!(one, reversed, "reversed spawns gave different bytes");
+    assert_eq!(counts.ended, 64, "every queued task is counted ended");
+    assert_eq!(counts.by_workers() + counts.by_helper + counts.by_joiner, 64, "every task ran on a worker or on the joining thread");
+    let (arrival, _) = batch_bytes(1, false, true);
+    assert_ne!(one, arrival, "the control, merged in arrival order, was not caught");
+}
+
 /// The racy form's snapshot reads every slot from any thread, outside the pool too.
 #[test]
 fn a_racy_snapshot_reads_every_slot() {

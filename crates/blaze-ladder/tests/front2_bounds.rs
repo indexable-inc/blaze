@@ -72,6 +72,10 @@ fn pointee<T: core::marker::PointeeSized>(t: &T) -> &T { t }
 fn use_where(s: &str) -> &str { unsized_where(s) }
 fn use_list(s: &str) -> &str { unsized_list(s) }
 fn use_pointee(s: &str) -> &str { pointee(s) }
+fn meta_need<T: core::marker::MetaSized>(p: *const T) -> *const T { p }
+fn relaxed_meta<T: ?Sized>(p: *const T) -> *const T { meta_need(p) }
+fn where_meta<T>(p: *const T) -> *const T where T: ?Sized { meta_need(p) }
+fn pointee_meta<T: core::marker::PointeeSized>(p: *const T) -> *const T { meta_need(p) }
 fn clone_ref<'a>(s: &&'a str) -> &'a str { s.clone() }
 fn hr_where<F>(f: F) -> u8 where for<'a> F: Fn(&'a u8) -> u8 { f(&1) }
 fn hr_bound<F: for<'a> Fn(&'a u8) -> u8>(f: F) -> u8 { f(&1) }
@@ -132,7 +136,7 @@ fn use_wrap2() { let a = wrap(1u8); let b = wrap(true); let _c = need_clone(&a);
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 47] = [
+const CLEAN: [(&str, &str); 50] = [
     ("call_bound", "`F: Fn(u8) -> u16` on the parameter: `Fn<(u8,)>` and `Output = u16`"),
     ("call_where", "`where F: FnMut(u8)`: the output is `()`"),
     ("call_apit", "`impl FnOnce(u8, bool) -> u16` in argument position"),
@@ -145,6 +149,16 @@ const CLEAN: [(&str, &str); 47] = [
     ("use_where", "`unsized_where::<str>`: `where T: ?Sized` takes `Sized` away"),
     ("use_list", "`unsized_list::<str>`"),
     ("use_pointee", "`pointee::<str>`: a `PointeeSized` bound takes `Sized` away"),
+    // The sized hierarchy (RFC 3729; the pinned core's marker.rs: `pub trait Sized: MetaSized`,
+    // `pub trait MetaSized: PointeeSized`, MetaSized's doc: "Types with a size that can be
+    // determined from pointer metadata."): `?Sized` relaxes `Sized` to `MetaSized`, not to
+    // nothing; only `PointeeSized` states no size. alloc's `data_offset<T: ?Sized>` calls
+    // `Alignment::of_val_raw<T: MetaSized>` with its own `T` (alloc/src/rcs/arc.rs). A fix that
+    // drops every sizedness clause fails these; one that gives `PointeeSized` a `MetaSized`
+    // clause fails `pointee_meta` in REFUSED.
+    ("meta_need", "`T: MetaSized` written: states sizedness, no implied `Sized`"),
+    ("relaxed_meta", "`T: ?Sized` keeps `T: MetaSized`: `data_offset`'s call of `Alignment::of_val_raw`"),
+    ("where_meta", "`where T: ?Sized` keeps `T: MetaSized` too"),
     ("clone_ref", "`&str: Clone` by core's `impl<T: PointeeSized> Clone for &T`"),
     ("hr_where", "`for<'a> F: Fn(&'a u8)`: a lifetime binder is erased"),
     ("hr_bound", "`F: for<'a> Fn(&'a u8)`"),
@@ -200,8 +214,9 @@ const CLEAN: [(&str, &str); 47] = [
     ("use_opt_next", "`Some(mut i) => i.next()`: a method through the bound of an opaque bound by a pattern inside `Option`"),
 ];
 
-/// The defining bodies that must be refused, each with the diagnostic it must give.
-const REFUSED: [(&str, &str, &str); 3] = [
+/// The bodies that must be refused, each with the diagnostic it must give.
+const REFUSED: [(&str, &str, &str); 4] = [
+    ("pointee_meta", "Unsatisfied", "`PointeeSized` states no size: `T: MetaSized` is E0277"),
     ("h", "Mismatch", "an async fn's body `\"a\"` against its written `u8`: E0308"),
     ("two_types", "Mismatch", "two return points of two types (`u8`, `&str`): \"one type\": E0308"),
     ("lacks", "Unsatisfied", "the hidden type `u8` is not `Iterator`: E0277 naming the bound"),
@@ -240,16 +255,17 @@ fn bounds_through_front2() {
     let mut buckets = None;
     let mut failed = Vec::new();
     let mut clean = Vec::new();
+        let mut why: Vec<String> = Vec::new();
     for (name, proves) in CLEAN {
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(lib(name))) {
-            println!("{name}: no head: {e:?}");
+            why.push(format!("{name}: no head: {e:?}"));
             failed.push(name);
             continue;
         }
         let body = match lower_fn(&names, prepared, &mut front.keys, &mut store, lib(name)) {
             Ok(b) => b,
             Err(e) => {
-                println!("{name}: does not lower: {e}");
+                why.push(format!("{name}: does not lower: {e}"));
                 failed.push(name);
                 continue;
             }
@@ -262,11 +278,11 @@ fn bounds_through_front2() {
             // One line for every clean body at the end: a failure's line comes first.
             Ok(_) => clean.push(name),
             Err(CheckFail::Diags { diags, .. }) => {
-                println!("{name}: diagnostics {diags:?} ({proves})");
+                why.push(format!("{name}: diagnostics {diags:?} ({proves})"));
                 failed.push(name);
             }
             Err(other) => {
-                println!("{name}: {other:?} ({proves})");
+                why.push(format!("{name}: {other:?}"));
                 failed.push(name);
             }
         }
@@ -321,7 +337,7 @@ fn bounds_through_front2() {
             }
         }
     }
-    assert_eq!(impls, 3, "the fixture's three impls (`impl Make for u8`: its method's own opaque)");
+    assert_eq!(impls, 4, "the fixture's four impls (`impl Make for u8`: its method's own opaque; `impl Fam for Pairs`: its `type Out<T>`)");
     // Two trait aliases that name each other stand for nothing: a typed cycle naming both.
     match store.ensure(&names, &mut front.keys, Want::Fn(lib("cyc"))) {
         Err(e @ blaze_ladder::front2::heads::HeadError::Cycle(_)) => println!("cyc: {e}"),
@@ -331,7 +347,7 @@ fn bounds_through_front2() {
         }
     }
     println!("clean: {clean:?}");
-    assert!(failed.is_empty(), "bodies that must check clean, or impl heads that must build, did not: {failed:?}");
+    assert!(failed.is_empty(), "bodies that must check clean, or impl heads that must build, did not: {failed:?}\n{}", why.join("\n"));
 
     // Every lang item the checker asks for has an answer in the pinned library: by `#[lang]`, or
     // (the formatting traits, `Send`, `IntoFuture`) by its path in core ([`langs::find`]).

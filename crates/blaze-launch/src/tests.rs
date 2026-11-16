@@ -5,6 +5,7 @@
 mod image;
 mod observe;
 mod record;
+mod run_wire;
 mod sim;
 mod wire;
 

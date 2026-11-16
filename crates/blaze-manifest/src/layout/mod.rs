@@ -59,7 +59,7 @@ use edition::{NoEdition, PackageEdition};
 
 use raw::{GitRef as RawGitRef, Raw, RawBuild, RawDep, RawEdition, RawPackage, RawTarget, RawVersion, RawWorkspace};
 
-pub use extra::{ExtraKind, ExtraTarget, TargetRefused};
+pub use extra::{ExtraKind, ExtraTarget, RefusedTarget, TargetRefused};
 pub use raw::GitRef;
 
 /// Text in the caller's allocator.
@@ -195,6 +195,10 @@ pub struct Member<'a> {
     /// Integration tests, examples and benches, sorted by kind, then name bytes; empty unless
     /// read with [`Layout::with_test_targets`].
     pub extras: Vec<ExtraTarget<'a>, Alloc<'a>>,
+    /// Integration tests, examples and benches the rules refuse (a missing file, a path out of
+    /// the package, no name, a second of one name): findings on this manifest, left out of
+    /// `extras`; sorted by line. Empty unless read with [`Layout::with_test_targets`].
+    pub refused_targets: Vec<RefusedTarget<'a>, Alloc<'a>>,
     pub dependencies: Vec<Dependency<'a>, Alloc<'a>>,
     /// Every feature, the implicit ones of optional dependencies included (an optional
     /// dependency no feature names as `dep:<name>`, in every edition).
@@ -797,10 +801,10 @@ impl<'l, 'a> Passing<'l, 'a> {
         // Both asked before either waits, so their listings come in one pass.
         let targets = self.targets(found, edition)?;
         let extras = match self.layout.test_targets {
-            true => self.extras(found, edition)?,
-            false => Some(Vec::new_in(alloc)),
+            true => self.extras(found, edition),
+            false => Some((Vec::new_in(alloc), Vec::new_in(alloc))),
         };
-        let (Some((lib, bins)), Some(extras)) = (targets, extras) else { return Ok(None) };
+        let (Some((lib, bins)), Some((extras, refused_targets))) = (targets, extras) else { return Ok(None) };
         let build = match &package.build {
             RawBuild::None => None,
             RawBuild::Path(path, span) => Some(Target {
@@ -865,6 +869,7 @@ impl<'l, 'a> Passing<'l, 'a> {
             lib,
             bins,
             extras,
+            refused_targets,
             dependencies,
             features,
             build,

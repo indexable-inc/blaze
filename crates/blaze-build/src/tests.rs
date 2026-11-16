@@ -237,6 +237,8 @@ struct Struct {
 /// Fns and structs by one-segment name; one type table for all their types.
 struct TestWorld {
     types: PortableTys<'static>,
+    /// What [`Adts::panic`] answers (tests/unwind.rs sets `Unwind`).
+    panic: crate::Panic,
     fns: Vec<Fun, Global>,
     structs: Vec<Struct, Global>,
     /// The fns declared `extern "C"`; every other is of the Rust ABI.
@@ -282,6 +284,8 @@ struct TestWorld {
     index_assoc: Vec<(Name, PTy), Global>,
     /// What `Adts::index_fn(Not)` answers: the fn a call at `[Self, Idx]` runs.
     index_fn: Option<ItemKey>,
+    /// The bug a control plants in the walk (`Adts::planted`).
+    planted: crate::Planted,
 }
 
 const DEREF: ItemKey = ItemKey(90);
@@ -295,6 +299,7 @@ impl TestWorld {
     fn new() -> TestWorld {
         TestWorld {
             types: PortableTys::new_in(Alloc::global()),
+            panic: crate::Panic::Abort,
             fns: Vec::new_in(Global),
             structs: Vec::new_in(Global),
             c_abi: Vec::new_in(Global),
@@ -317,6 +322,7 @@ impl TestWorld {
             index_defs: Vec::new_in(Global),
             index_assoc: Vec::new_in(Global),
             index_fn: None,
+            planted: crate::Planted::Nothing,
         }
     }
 
@@ -662,6 +668,10 @@ impl Adts for TestAdts<'_> {
         self.world
     }
 
+    fn panic(&self) -> crate::Panic {
+        self.world.panic
+    }
+
     fn static_item(&self, item: ItemKey) -> Option<StaticItem> {
         self.world.statics.iter().find(|(k, _)| *k == item).map(|&(_, s)| s)
     }
@@ -735,6 +745,10 @@ impl Adts for TestAdts<'_> {
 
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
         self.world.intrinsics.iter().find(|(k, _)| *k == item).map(|&(_, i)| i)
+    }
+
+    fn planted(&self) -> crate::Planted {
+        self.world.planted
     }
 
     fn abi(&self, item: ItemKey) -> Option<Abi> {
@@ -3357,7 +3371,9 @@ mod projections;
 mod places;
 mod casts;
 mod matches;
+mod guards;
 mod moves;
+mod unwind;
 #[cfg(target_arch = "aarch64")]
 mod temps;
 mod lets;

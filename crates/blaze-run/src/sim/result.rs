@@ -66,6 +66,8 @@ fn table<'r>(short: &'r [u8], long: &'r [u8], refused: &'r str) -> Vec<Verdict<'
         Ended::Refused { refusal: Refusal::Connect, what: "203.0.113.9:443" },
         Ended::Refused { refusal: Refusal::Spawn, what: "/bin/sh" },
         Ended::Refused { refusal: Refusal::Call, what: "ptrace" },
+        Ended::NoReport { code: 0, torn: 0 },
+        Ended::NoReport { code: -1, torn: 37 },
     ];
     for ended in endings {
         out.push(failed(3, ended, Captured::NONE));

@@ -42,6 +42,7 @@ mod closure_identity;
 mod closures;
 mod const_args;
 mod const_enum;
+mod const_path_args;
 mod const_terms;
 mod coroutine;
 mod discriminant;

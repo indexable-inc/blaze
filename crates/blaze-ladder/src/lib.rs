@@ -12,6 +12,8 @@
 
 #![feature(allocator_api)]
 
+mod class_chain;
+pub mod code_records;
 pub mod crates;
 mod fn_shim;
 pub mod front;
@@ -22,6 +24,8 @@ pub mod refusal;
 pub mod resolve;
 pub mod run;
 pub mod seam;
+pub mod stub;
+pub mod symbols;
 
 #[cfg(test)]
 mod tests;

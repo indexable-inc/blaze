@@ -2,6 +2,8 @@
 //! real machine through it with the simulation as its driver, and checks an oracle; each oracle
 //! has a planted-bug control that must be caught (`blaze_sim::control`).
 
+mod declare;
+mod first_call;
 mod heat_tier;
 mod parent;
 mod plan;
@@ -11,6 +13,7 @@ mod result;
 mod slots;
 mod suite;
 mod toggle;
+mod zygote;
 
 use std::fmt::Display;
 

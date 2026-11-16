@@ -1079,6 +1079,57 @@ fn an_item_position_cfg_select_is_answered_by_the_file_s_cfg_set() {
     assert!(made.iter().any(|t| t.contains("on_unix")) && !made.iter().any(|t| t.contains("elsewhere")), "{made:#?}");
 }
 
+/// std's `current_os_id` (library/std/src/sys/thread/unix.rs:349), cut to two arms: a braced
+/// `cfg_select!` that is the fn body's TAIL, its taken arm a block of statements and a tail.
+/// core's doc (core/src/macros/mod.rs): "This macro evaluates, at compile-time, a series of
+/// `cfg` predicates, selects the first that is true, and emits the code guarded by that
+/// predicate. The code guarded by other predicates is not emitted." The Reference, "Macros":
+/// "When used as an item or a statement, the MacroInvocationSemi form is used where a semicolon
+/// is required at the end when not using curly braces": a braced call ending a block is a
+/// statement, so its expansion is statements whose last expression is the block's tail. Read
+/// as an expression, `let mut id = 0u64; ..` was a `Syntax` diagnostic over the call (13
+/// library fns, "things its lowering did not take"). `Unix` says `unix` holds and
+/// `target_os = "linux"` does not, so the linux arm, and its `syntax!` call, never reach the
+/// expander (no rules: a call that reached it would be a `NoMacro` finding).
+/// Expected: passes; the body's block has 2 statements and the `if` as its tail.
+#[test]
+fn an_expression_cfg_select_with_a_block_arm_lowers() {
+    let text = "fn current_os_id() -> Option<u64> {
+    cfg_select! {
+        any(target_os = \"linux\") => {
+            syntax!(fn g() -> i32;);
+            let id: i32 = 1;
+            Some(id as u64)
+        }
+        unix => {
+            let mut id = 0u64;
+            id += 7;
+            if id == 7 { Some(id) } else { None }
+        }
+        _ => None,
+    }
+}";
+    let rules: &'static [(&'static str, Prepared<'static>)] = &[];
+    let mut expander = ByName::new(rules, at(), Host, Alloc::global());
+    let Ok(l) = lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) else { panic!("needs a cfg") };
+    let f = expander.findings();
+    assert!(f.is_empty(), "{f:#?}\n{}", dump_of(&l));
+    let v = l.view();
+    assert_eq!(v.unhandled().count(), 0, "{}", dump_of(&l));
+    // The unix arm's statements are the body's own: two statements and the `if` as the tail
+    // (an arm read as one expression, or the `_` arm taken, has no statements).
+    let mut found = false;
+    for i in 0..v.exprs.len() as u32 {
+        if let Ok(Expr::Block { stmts, tail: Some(tail), .. }) = v.expr(ExprId(i))
+            && stmts.len == 2
+            && matches!(v.expr(tail), Ok(Expr::If { .. }))
+        {
+            found = true;
+        }
+    }
+    assert!(found, "no block of 2 statements and an `if` tail\n{}", dump_of(&l));
+}
+
 /// The expanded `panic!` shapes, checked: a diverging block made by a macro is `!` as an arm,
 /// as a `-> !` body's statement and as its tail, with no diagnostic (the type checker's
 /// `a_macro_block_that_diverges_is_never` is the same shapes written by hand: clean).

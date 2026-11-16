@@ -15,6 +15,7 @@ use crate::world::World;
 pub(crate) mod adt;
 pub(crate) mod assoc_args;
 pub(crate) mod async_fmt;
+pub(crate) mod async_fn;
 pub(crate) mod block;
 pub(crate) mod call;
 pub(crate) mod cast;

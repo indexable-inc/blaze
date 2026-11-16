@@ -5,6 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
+/// The execution rungs (`front2/x-*`): tests/front2_rungs.rs and examples/front2_rungs.rs.
+pub mod x;
+
 /// The rungs that run today: the next one is added when it runs.
 pub const RUNNING: &[&str] =
     &["1-empty", "2-exit", "3-hello", "4-modules", "5-generics", "6-aggregates", "7-traits", "7a-drops", "7c-main-io"];

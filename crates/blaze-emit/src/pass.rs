@@ -22,6 +22,7 @@ mod int;
 mod runtime;
 pub(crate) mod sites;
 mod tls;
+pub(crate) mod unwind;
 mod wide;
 
 /// `brk` immediates of the traps the pass makes itself; a LIR `trap`'s code is its own `brk`
@@ -215,14 +216,17 @@ pub(crate) fn run<A: Allocator>(
         }
     }
 
+    pass.unwind_begin()?;
     for block in 0..view.blocks() {
         pass.block_at[block] = pass.here();
+        pass.block_entry(Block(block as u32));
         let next = (block + 1 < view.blocks()).then_some(block as u32 + 1);
         let range = view.block(Block(block as u32));
         for inst in view.params(Block(block as u32)).end..range.end {
             pass.lower(inst, next)?;
         }
     }
+    pass.unwind_end()?;
 
     pass.finish(frame_at, most_align)
 }
@@ -1203,7 +1207,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
             | Op::MaskedStore
             | Op::Gather
             | Op::Scatter => return Err(unsupported(inst, op, "a vector operation")),
-            Op::Invoke | Op::InvokeIndirect | Op::Resume => return Err(unsupported(inst, op, "unwinding")),
+            Op::Invoke | Op::InvokeIndirect => self.call(inst, op).map(|()| self.invoke_normal(inst, op, next))?,
+            Op::Resume => self.resume(inst),
             Op::TailCall | Op::TailCallIndirect => return Err(unsupported(inst, op, "a tail call")),
             Op::Asm | Op::AsmBr => return Err(unsupported(inst, op, "inline assembly")),
             // A coroutine body is split by `blaze_lir::coroutine::split` before any backend
@@ -1240,10 +1245,12 @@ impl<A: Allocator> Pass<'_, '_, A> {
         let view = self.view;
         let mut o = view.operands(inst);
         let (direct, indirect) = match op {
-            Op::Call => (Some(o.reference()), None),
+            Op::Call | Op::Invoke => (Some(o.reference()), None),
             _ => (None, Some(o.value())),
         };
-        let (sig_id, args) = (o.sig(), o.values());
+        let sig_id = o.sig();
+        let blocks = self.invoke_blocks(op, &mut o);
+        let args = o.values();
         let sig = view.sig(sig_id);
         let isa = self.isa;
         check_sig(view, isa, view.sigs[sig_id.index()], sig.params, sig.rets).map_err(|why| unsupported(inst, op, why))?;
@@ -1316,6 +1323,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 None => return Err(unsupported(inst, op, "a call that names no callee")),
             },
         }
+        self.call_row(self.here(), blocks);
         self.put(enc::blr(X16));
         // Two returns are a pair in one cell (lib.rs, "Pairs"); one `i128` or float is the cell.
         let mut regs = Regs::new(isa.os);

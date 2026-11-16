@@ -84,6 +84,7 @@
 
 mod claim;
 mod deque;
+mod help;
 mod idle;
 #[expect(unsafe_code, reason = "per-worker slots handed to the worker that owns them: each `unsafe` states why")]
 mod per_worker;
@@ -92,6 +93,7 @@ pub(crate) mod threads;
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
 
+pub use help::{Batch, BatchError, JoinCounts, Joined};
 pub use per_worker::{Exclusive, FoldError, NotAWorker, PerWorker, Racy, Shared};
 pub use threads::{Class, Hung, Stuck};
 
@@ -412,11 +414,9 @@ struct Pending<T> {
 impl<T> Pending<T> {
     /// Its outcome: run here if no worker started it, else waited for.
     fn finish(&self, cx: &Cx, name: &'static str) -> Ran<T> {
-        if let Some(ran) = self.queued.run_here(cx.here()) {
-            return ran;
-        }
-        outlast(cx, &self.pool, self.queued.tally(), name, cx.deadline(), || self.queued.done());
-        self.queued.take()
+        // Help first: while the task has not ended, this thread runs queued tasks it may run,
+        // and parks (`outlast`) only when there is none (task/help.rs, the module's rule).
+        help::finish(self, cx, name)
     }
 }
 

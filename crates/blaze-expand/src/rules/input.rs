@@ -48,12 +48,9 @@ pub(crate) struct View<'c, 'f> {
     /// For a token that opens a group, the index of its close; else unused.
     close: Vec<u32, &'f Frame>,
     site: Edition,
-    /// The parser's words of the tokens, then [`Tokens::PAD`] words `EOF`; empty until a
-    /// fragment is parsed.
-    words: Vec<u32, &'f Frame>,
-    /// For each token, and one past the last, the index of the first word it makes.
-    word_at: Vec<u32, &'f Frame>,
-    /// A window's words, copied with their padding, when it ends before the last token.
+    /// The parser's words of the window a fragment is parsed in, then [`Tokens::PAD`] words
+    /// `EOF`: made for the window's tokens alone, so a parse costs by the fragment's length,
+    /// not the input's.
     window: Vec<u32, &'f Frame>,
 }
 
@@ -108,8 +105,6 @@ impl<'c, 'f> View<'c, 'f> {
             toks,
             close,
             site: call.site.edition,
-            words: Vec::new_in(frame),
-            word_at: Vec::new_in(frame),
             window: Vec::new_in(frame),
         }
     }
@@ -222,24 +217,19 @@ impl<'c, 'f> View<'c, 'f> {
         super::glued_len(|i| (i < end).then(|| self.kind(i)), at)
     }
 
-    /// The parser's words, made once a call.
-    fn make_words(&mut self) {
-        if !self.word_at.is_empty() {
-            return;
+    /// The parser's words of the tokens `from..to` in `self.window`, padded: what [`words_of`]
+    /// gives those tokens in the whole input ([`words_range`]).
+    fn make_window(&mut self, from: u32, to: u32) {
+        let frame: &'f Frame = self.window.allocator();
+        let mut window = core::mem::replace(&mut self.window, Vec::new_in(frame));
+        window.clear();
+        window.reserve((to - from) as usize + Tokens::PAD);
+        let lifetime = lifetime_name_at(|at| self.kind(at), from);
+        words_range(from, to, lifetime, |at| (self.kind(at), self.text(at), self.edition(at)), &mut window, None);
+        for _ in 0..Tokens::PAD {
+            window.push(Tokens::EOF_WORD);
         }
-        let n = crate::tokens::index(self.toks.len());
-        let frame: &'f Frame = self.words.allocator();
-        let (mut words, mut word_at) = (
-            core::mem::replace(&mut self.words, Vec::new_in(frame)),
-            core::mem::replace(&mut self.word_at, Vec::new_in(frame)),
-        );
-        words_of(
-            n,
-            |at| (self.kind(at), self.text(at), self.edition(at)),
-            &mut words,
-            &mut word_at,
-        );
-        (self.words, self.word_at) = (words, word_at);
+        self.window = window;
     }
 
     /// Whether the fragment at the start of `level` is its one token, by the grammar with no
@@ -295,13 +285,26 @@ impl<'c, 'f> View<'c, 'f> {
         if self.one_token_fragment(entry, level) {
             return (level.at + 1, None);
         }
-        self.make_words();
-        // The parser reads the level's first trees, a window doubled until it provably read
-        // nothing past it (mbe's `expect_fragment`, whose windows these are, so that a parse
-        // gives what mbe's does): its position only moves forward, and it reads at most
-        // `LOOKAHEAD - 1` tokens past it.
+        // The parser reads the level's first tokens, a window doubled until it provably read
+        // nothing past it: its position only moves forward, and it reads at most
+        // `LOOKAHEAD - 1` tokens past it, so a parse that ended `LOOKAHEAD` words before the
+        // window's end is the parse of the whole level, whatever the window (mbe's
+        // `expect_fragment` doubles a window of trees by the same test). The window is of whole
+        // trees (a fragment that is a few trees is parsed once), but a tree that would take it
+        // past `cap` tokens is left out unless the parse before asked for it (`least`): a
+        // large group after a short fragment is not read. Its words are made for it alone, so
+        // a parse costs by the fragment's length, not by the trees after it or the input's.
         const LOOKAHEAD: usize = 6;
-        let mut trees = 8usize;
+        const FIRST_TREES: usize = 8;
+        const FIRST_TOKENS: u32 = 16;
+        let (mut trees, mut cap, mut least) = (FIRST_TREES, FIRST_TOKENS, 1usize);
+        // A visibility, type, path or attribute's inside is short and often stands before a
+        // large group it does not reach; an item, block, statement, expression or pattern
+        // usually ends in its large group, so leaving that out would only add a parse.
+        let short = matches!(
+            entry,
+            PrefixEntryPoint::Vis | PrefixEntryPoint::Ty | PrefixEntryPoint::Path | PrefixEntryPoint::MetaItem
+        );
         let start = level.at;
         let first_counts =
             !level.is_empty() && self.kind(start) == TokenKind::Open(Delim::Invisible);
@@ -309,29 +312,25 @@ impl<'c, 'f> View<'c, 'f> {
             let mut end = start;
             let mut taken = 0;
             while taken < trees && end < level.end {
-                end = self.after_tree(end);
+                let next = self.after_tree(end);
+                if short && taken >= least && next - start > cap {
+                    break;
+                }
+                end = next;
                 taken += 1;
             }
             let whole = end >= level.end;
-            let (from, to) = (self.word_at[start as usize] as usize, self.word_at[end as usize] as usize);
-            let tokens = match to + Tokens::PAD == self.words.len() {
-                true => Tokens::new(&self.words[from..], true),
-                false => {
-                    self.window.clear();
-                    self.window.extend_from_slice(&self.words[from..to]);
-                    for _ in 0..Tokens::PAD {
-                        self.window.push(Tokens::EOF_WORD);
-                    }
-                    Tokens::new(&self.window, true)
-                }
-            };
+            self.make_window(start, end);
+            let tokens = Tokens::new(&self.window, true);
             let tokens = if first_counts { tokens } else { tokens.without_first_fragment() };
             let len = tokens.len();
             let output = entry.parse(tokens);
             if whole || consumed(&output) + LOOKAHEAD <= len {
                 break output;
             }
-            trees *= 2;
+            trees = trees.saturating_mul(2);
+            cap = cap.saturating_mul(2);
+            least = taken + 1;
         };
         let mut cursor = Cursor { at: start, end: level.end, depth: 0 };
         let mut error = None;
@@ -475,16 +474,49 @@ pub(crate) fn words_of<'s, A: core::alloc::Allocator>(
 ) {
     words.reserve(n as usize + Tokens::PAD);
     word_at.reserve(n as usize + 1);
+    words_range(0, n, false, token, words, Some(word_at));
+    word_at.push(crate::tokens::index(words.len()));
+    for _ in 0..Tokens::PAD {
+        words.push(Tokens::EOF_WORD);
+    }
+}
+
+/// Whether the token at `at` is a lifetime's name to [`words_of`]: the tokens just before it
+/// are an odd number of `'`. A `'` makes the next token its name whatever that is, and a name
+/// (another `'` too) makes nothing of the token after it, so the conversion's state before a
+/// token is the parity of the run of `'` that ends there.
+pub(crate) fn lifetime_name_at(kind: impl Fn(u32) -> TokenKind, at: u32) -> bool {
+    let mut run = 0u32;
+    while run < at && matches!(kind(at - 1 - run), TokenKind::Punct { char: '\'', .. }) {
+        run += 1;
+    }
+    run % 2 == 1
+}
+
+/// [`words_of`] for the tokens `from..to` alone, appended to `words` with no padding: the same
+/// words the whole conversion gives those tokens, given `lifetime`
+/// ([`lifetime_name_at`] of `from`), but for one flag: a word right after an invisible group
+/// that ends at `from` is not flagged [`parser::FRAGMENT`] here (a reader of a window does not
+/// count its first token's flag: `Tokens::without_first_fragment`).
+fn words_range<'s, A: core::alloc::Allocator>(
+    from: u32,
+    to: u32,
+    mut lifetime: bool,
+    token: impl Fn(u32) -> (TokenKind, &'s str, Edition),
+    words: &mut Vec<u32, A>,
+    mut word_at: Option<&mut Vec<u32, A>>,
+) {
     let mut fragment_at: Option<usize> = None;
-    let mut lifetime = false;
-    for at in 0..n {
+    for at in from..to {
         if let Some(start) = fragment_at
             && words.len() > start
         {
             words[start] |= parser::FRAGMENT;
             fragment_at = None;
         }
-        word_at.push(crate::tokens::index(words.len()));
+        if let Some(word_at) = word_at.as_deref_mut() {
+            word_at.push(crate::tokens::index(words.len()));
+        }
         let (kind, text, edition) = token(at);
         let edition = parser_edition(edition);
         let plain = |kind: SyntaxKind| parser::word(kind, SyntaxKind::EOF, edition);
@@ -545,9 +577,13 @@ pub(crate) fn words_of<'s, A: core::alloc::Allocator>(
             TokenKind::Close(Delim::Invisible) => {}
         }
     }
-    word_at.push(crate::tokens::index(words.len()));
-    for _ in 0..Tokens::PAD {
-        words.push(Tokens::EOF_WORD);
+    // A range that ends on an invisible group's first word (a window cut inside the group; a
+    // whole stream is balanced, so its group goes on to its close): flagged as the token
+    // after would have.
+    if let Some(start) = fragment_at
+        && words.len() > start
+    {
+        words[start] |= parser::FRAGMENT;
     }
 }
 
@@ -567,4 +603,118 @@ fn literal_kind(kind: LitKind) -> SyntaxKind {
 /// Whether two glued punctuations are the same characters.
 pub(crate) fn same_puncts(view: &View<'_, '_>, at: u32, len: u8, def: Def<'_>, tok: DefTok, def_len: u8) -> bool {
     len == def_len && (0..u32::from(len)).all(|i| view.char(at + i) == Some(def.char(DefTok(tok.0 + i))))
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_id::{ContentId, CrateItemKey};
+    use blaze_own::Alloc;
+
+    use super::*;
+    use crate::{CallSite, Ctx, DefAt, DefSite, Export, LocalInner, MacroDefinition, lex};
+
+    /// The Reference, "Macros By Example", "Transcribing": "When matching, no lookahead is
+    /// performed; if the compiler cannot unambiguously determine how to parse the macro
+    /// invocation one token at a time, then it is an error." A fragment is so decided by the
+    /// tokens it starts at, and its cost is theirs: a `vis` of four tokens before 80,000 more
+    /// makes the parser words of its first window (16 tokens), not the input's. Expected:
+    /// "test rules::input::tests::a_fragment_costs_by_its_length_not_the_inputs ... ok"; with
+    /// the first window made the whole input (`FIRST_TREES = usize::MAX`, `FIRST_TOKENS =
+    /// u32::MAX`) it fails: "a `vis` of 4 tokens made 80004 parser words of an input of 80004
+    /// tokens".
+    #[test]
+    fn a_fragment_costs_by_its_length_not_the_inputs() {
+        let alloc = Alloc::global();
+        let mut text = Vec::new_in(alloc);
+        text.extend_from_slice(b"pub(crate) ");
+        for _ in 0..40_000 {
+            text.extend_from_slice(b"x , ");
+        }
+        let text = core::str::from_utf8(&text).expect("the text is ASCII");
+        let input = lex(text, Edition::E2021, alloc).expect("the input lexes");
+        let body = lex("() => {}", Edition::E2021, alloc).expect("the rules lex");
+        let at = DefAt {
+            site: DefSite { krate: CrateItemKey(ContentId([1; 32])), module: None },
+            edition: Edition::E2021,
+            export: Export::Exported,
+            local_inner: LocalInner::No,
+            transparency: None,
+        };
+        let def = MacroDefinition::rules(body, at);
+        let program = super::super::compile(&def).expect("the rules compile");
+        let site = CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) };
+        let call = Call::fn_like(&input, site);
+        blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+            let mut engine = Engine::new_in(&program, Def::of(&def), frame);
+            let mut view = View::new_in(&call, Style::FnLike, frame);
+            let top = view.top();
+            let (end, error) = view.parse_fragment(&mut engine, PrefixEntryPoint::Vis, top);
+            assert_eq!((end, error.is_none()), (4, true), "`pub(crate)` is the `vis`");
+            let made = view.window.len() - Tokens::PAD;
+            assert!(made <= 16, "a `vis` of 4 tokens made {made} parser words of an input of {} tokens", view.len());
+        });
+    }
+
+    /// A window's words are the whole conversion's words of its tokens, wherever it is cut:
+    /// between a `'` and its name, after a run of `'`, inside an invisible group, after an
+    /// empty one. The one difference allowed is the first word's fragment flag when the window
+    /// does not start at an invisible group's open (its reader does not count it). Expected:
+    /// "test rules::input::tests::a_windows_words_are_the_whole_conversions ... ok".
+    #[test]
+    fn a_windows_words_are_the_whole_conversions() {
+        let punct = |char| TokenKind::Punct { char, spacing: Spacing::Alone };
+        let joint = |char| TokenKind::Punct { char, spacing: Spacing::Joint };
+        let ident = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
+        let (open, close) = (TokenKind::Open(Delim::Invisible), TokenKind::Close(Delim::Invisible));
+        let toks: [(TokenKind, &str); 22] = [
+            (punct('\''), ""),
+            (ident, "a"),
+            (punct('\''), ""),
+            (punct('\''), ""),
+            (ident, "x"),
+            (open, ""),
+            (close, ""),
+            (ident, "y"),
+            (open, ""),
+            (ident, "z"),
+            (close, ""),
+            (TokenKind::Open(Delim::Paren), ""),
+            (punct('\''), ""),
+            (punct('\''), ""),
+            (punct('\''), ""),
+            (ident, "b"),
+            (TokenKind::Close(Delim::Paren), ""),
+            (ident, "fn"),
+            (joint(':'), ""),
+            (punct(':'), ""),
+            (ident, "union"),
+            (punct('\''), ""),
+        ];
+        let n = toks.len() as u32;
+        let token = |at: u32| (toks[at as usize].0, toks[at as usize].1, Edition::E2021);
+        let alloc = Alloc::global();
+        let (mut whole, mut word_at) = (Vec::new_in(alloc), Vec::new_in(alloc));
+        words_of(n, token, &mut whole, &mut word_at);
+        let mut windows = 0;
+        for from in 0..n {
+            for to in from..=n {
+                let mut window = Vec::new_in(alloc);
+                let lifetime = lifetime_name_at(|at| toks[at as usize].0, from);
+                words_range(from, to, lifetime, token, &mut window, None);
+                let mut expected = Vec::new_in(alloc);
+                expected.extend_from_slice(&whole[word_at[from as usize] as usize..word_at[to as usize] as usize]);
+                if toks[from as usize].0 != open {
+                    if let Some(first) = window.first_mut() {
+                        *first &= !parser::FRAGMENT;
+                    }
+                    if let Some(first) = expected.first_mut() {
+                        *first &= !parser::FRAGMENT;
+                    }
+                }
+                assert_eq!(&window[..], &expected[..], "the window {from}..{to}");
+                windows += 1;
+            }
+        }
+        assert_eq!(windows, 22 * 23 / 2 + 22);
+    }
 }

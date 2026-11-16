@@ -1946,6 +1946,15 @@ pub trait Driver {
     fn waker(&self) -> Option<Waker> {
         None
     }
+    /// The file calls this driver lets its asker make on the asker's own thread, with no
+    /// queue ([`threads::inline`], whose table says which effects and why): `Some` from a
+    /// native driver whose file calls are blocking calls on its threads (kqueue), `None` from
+    /// every other (the simulation, which keeps its queue so it can reorder, fail and crash;
+    /// io_uring until its ring per worker). Asked once, as the asker's world is made; an
+    /// inline call's `Done` is the queued call's (`inline_and_queued_calls_end_equal`).
+    fn inline_files(&self) -> Option<threads::inline::Inline> {
+        None
+    }
 }
 
 /// The system's wall clock now, in nanoseconds since the Unix epoch: what every native

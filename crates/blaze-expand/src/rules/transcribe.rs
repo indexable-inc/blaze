@@ -9,7 +9,8 @@ use super::{
     Arm, Bound, CallError, ConcatElem, DEPTH_BOUND, DefTok, Engine, Frag, Msg, NONE, Op, RepKind,
     SITE, Sep,
     input::View,
-    matcher::{Binding, Bindings, Fragment, Origin, Toks},
+    linear::{NodeKind, Values},
+    matcher::{Fragment, Origin, Toks},
 };
 use crate::{
     error::ExpandError,
@@ -256,11 +257,11 @@ fn follower(engine: &Engine<'_, '_, '_>, next: Option<Op>) -> Follower {
 /// Transcribes `arm`'s template with `bindings` into `out`: `Ok(None)` when it is written,
 /// `Ok(Some(error))` for the template's first error (what was written is the caller's to
 /// truncate).
-pub(crate) fn transcribe<'f>(
+pub(crate) fn transcribe<'f, B: Values>(
     engine: &mut Engine<'_, '_, 'f>,
     arm: &Arm,
     view: &View<'_, 'f>,
-    bindings: &Bindings<'f>,
+    bindings: &B,
     out: &mut Out<'_, '_>,
     scratch: &mut Scratch<'f>,
 ) -> Result<Result<Option<CallError>, ExpandError>, Bound> {
@@ -359,17 +360,17 @@ pub(crate) fn transcribe<'f>(
                     let mut ended = false;
                     for state in scratch.nesting.iter_mut() {
                         state.hit = true;
-                        match binding {
-                            Binding::Fragment(_) | Binding::Missing(_) => break,
-                            Binding::Nested { start, len } => match state.idx < len {
-                                true => binding = bindings.child(start, state.idx),
+                        match bindings.kind(binding) {
+                            NodeKind::Fragment(_) | NodeKind::Missing(_) => break,
+                            NodeKind::Nested(len) => match state.idx < len {
+                                true => binding = bindings.child(binding, state.idx),
                                 false => {
                                     state.at_end = true;
                                     ended = true;
                                     break;
                                 }
                             },
-                            Binding::Empty => {
+                            NodeKind::Empty => {
                                 state.at_end = true;
                                 break;
                             }
@@ -487,20 +488,20 @@ fn integer(scratch: &mut Scratch<'_>, out: &mut Out<'_, '_>, value: u32) -> Resu
 }
 
 /// `${count(..)}` of a binding at `depth`.
-fn count(bindings: &Bindings<'_>, binding: Binding, depth: u32, max: u32) -> u32 {
-    match binding {
-        Binding::Nested { start, len } => match depth == max {
+fn count<B: Values>(bindings: &B, binding: B::Node, depth: u32, max: u32) -> u32 {
+    match bindings.kind(binding) {
+        NodeKind::Nested(len) => match depth == max {
             true => len,
-            false => (0..len).map(|idx| count(bindings, bindings.child(start, idx), depth + 1, max)).sum(),
+            false => (0..len).map(|idx| count(bindings, bindings.child(binding, idx), depth + 1, max)).sum(),
         },
-        Binding::Empty => 0,
-        Binding::Fragment(_) | Binding::Missing(_) => 1,
+        NodeKind::Empty => 0,
+        NodeKind::Fragment(_) | NodeKind::Missing(_) => 1,
     }
 }
 
 /// A metavariable's value at the repetitions' current iterations.
-fn get_fragment(
-    bindings: &Bindings<'_>,
+fn get_fragment<B: Values>(
+    bindings: &B,
     nesting: &mut [Nesting],
     binder: u32,
     name: DefTok,
@@ -512,14 +513,14 @@ fn get_fragment(
     let innermost = nesting.len().wrapping_sub(1);
     for (depth, state) in nesting.iter_mut().enumerate() {
         state.hit = true;
-        b = match b {
-            Binding::Fragment(_) => break,
-            Binding::Missing(_) => {
+        b = match bindings.kind(b) {
+            NodeKind::Fragment(_) => break,
+            NodeKind::Missing(_) => {
                 state.at_end = true;
                 break;
             }
-            Binding::Nested { start, len } => match state.idx < len {
-                true => bindings.child(start, state.idx),
+            NodeKind::Nested(len) => match state.idx < len {
+                true => bindings.child(b, state.idx),
                 false => {
                     state.at_end = true;
                     return Err(match depth == innermost {
@@ -528,7 +529,7 @@ fn get_fragment(
                     });
                 }
             },
-            Binding::Empty => {
+            NodeKind::Empty => {
                 state.at_end = true;
                 return Err(match depth == innermost {
                     true => Miss::Ended,
@@ -537,20 +538,20 @@ fn get_fragment(
             }
         };
     }
-    match b {
-        Binding::Fragment(f) => Ok(Value::Fragment(bindings.fragments[f as usize])),
-        Binding::Missing(kind) => Ok(Value::Missing(kind)),
-        Binding::Nested { .. } => Err(Miss::Error(CallError::Binding(at, Msg::FoundNested(name)))),
-        Binding::Empty => Err(Miss::Error(CallError::Binding(at, Msg::FoundEmpty(name)))),
+    match bindings.kind(b) {
+        NodeKind::Fragment(fragment) => Ok(Value::Fragment(fragment)),
+        NodeKind::Missing(kind) => Ok(Value::Missing(kind)),
+        NodeKind::Nested(_) => Err(Miss::Error(CallError::Binding(at, Msg::FoundNested(name)))),
+        NodeKind::Empty => Err(Miss::Error(CallError::Binding(at, Msg::FoundEmpty(name)))),
     }
 }
 
 /// `$name`.
 #[expect(clippy::too_many_arguments, reason = "the transcriber's state, passed as its parts")]
-fn var(
+fn var<B: Values>(
     engine: &Engine<'_, '_, '_>,
     view: &View<'_, '_>,
-    bindings: &Bindings<'_>,
+    bindings: &B,
     scratch: &mut Scratch<'_>,
     out: &mut Out<'_, '_>,
     binder: u32,
@@ -668,10 +669,10 @@ fn var(
 
 /// `${concat(..)}`: one identifier made at the expression.
 #[expect(clippy::too_many_arguments, reason = "the transcriber's state, passed as its parts")]
-fn concat<'f>(
+fn concat<'f, B: Values>(
     engine: &Engine<'_, '_, 'f>,
     view: &View<'_, '_>,
-    bindings: &Bindings<'_>,
+    bindings: &B,
     scratch: &mut Scratch<'f>,
     out: &mut Out<'_, '_>,
     start: u32,

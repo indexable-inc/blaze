@@ -108,6 +108,9 @@ pub enum ConstFail {
     /// A key of the qualified constant leaf `need` (its trait, its type, the trait's
     /// constant) clashes in the front end's key map.
     QPathKey { need: ItemKey, clash: super::keys::KeyClash },
+    /// Expression `block` of `owner`'s body, as this evaluator lowered it, is not the
+    /// `const { .. }` block an instance's build asked the value of (const_at.rs).
+    NotConstBlock { owner: ItemKey, block: ExprId },
 }
 
 impl core::fmt::Display for ConstFail {
@@ -132,6 +135,7 @@ impl core::fmt::Display for ConstFail {
             ConstFail::QPathCycle { need } => write!(f, "the qualified constant {need:?} needs itself: an impl header of its own selection writes it"),
             ConstFail::QPathDepth { need, most } => write!(f, "the qualified constant {need:?}: more than {most} are answered inside one another"),
             ConstFail::QPathKey { need, clash } => write!(f, "the qualified constant {need:?}: two origins under one checker key: {clash:?}"),
+            ConstFail::NotConstBlock { owner, block } => write!(f, "fn {owner:?}: expression {} of its body as the evaluator lowered it is not a `const {{ .. }}` block", block.0),
         }
     }
 }
@@ -211,6 +215,9 @@ struct ConstBody<'n> {
     tys: PortableTys<'static>,
     checked: Checked<'static>,
     lits: LitTable,
+    /// `Some(block)`: the body of a `const { .. }` block (front2/const_at.rs): its owner's body
+    /// read from `block` as its root, with no parameters; `key` is the block's own key.
+    root: Option<ExprId>,
 }
 
 /// The constants' state of one build: the bodies checked and the records made.
@@ -236,6 +243,10 @@ struct ConstsWorld<'w, 'n, S> {
     records: &'w [ConstRecord<Alloc<'static>>],
     /// The first `#[rustc_intrinsic]` fn met whose name the table does not hold.
     unknown: core::cell::RefCell<Option<(ItemKey, Box<str>)>>,
+    /// The last (trait, ground `Self`) [`ConstsWorld::impl_const`] selected no impl for among
+    /// the impls made in the store: what [`Consts::value`] makes the candidates of before it
+    /// asks again (front2/const_open.rs `impl_rows`).
+    wanted: core::cell::Cell<Option<super::const_open::Wanted>>,
 }
 
 fn hash_text(text: &str) -> ContentId {
@@ -372,6 +383,13 @@ impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
         // The trait's default is generic over `Self`, and a blanket impl's own definition over
         // its one parameter, which is `Self`: both are evaluated at `args`. A non-generic
         // impl's definition has no parameters.
+        if found.is_none() {
+            // None among the impls MADE so far: the caller that can make headers
+            // ([`Consts::value`]) makes the candidates of (trait, `Self`) once and asks again.
+            let g = ground.view();
+            let self_ty = g.list(args).ok().and_then(|l| l.first().copied());
+            self.wanted.set(self_ty.and_then(|t| Some(super::const_open::Wanted { trait_, self_ty: g.node(t).ok()?, shape: super::buckets::shape_of(g, t) })));
+        }
         found.map(|c| (c, if c == declared || blanket { args } else { List::EMPTY }))
     }
 
@@ -414,7 +432,13 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
 impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     fn body(&self, item: ItemKey) -> Fetch<Option<Typed<'_>>> {
         let b = self.bodies.iter().find(|b| b.key == item).ok_or(Missing)?;
-        Ok(Some(Typed::new(b.typeck.view(b.tys.view()), &b.checked, b.text, b.lits.lend(), b.hash)))
+        let mut view = b.typeck.view(b.tys.view());
+        // A const block's body: its owner's, evaluated from the block (const_at.rs).
+        if let Some(root) = b.root {
+            view.root = root;
+            view.params = &[];
+        }
+        Ok(Some(Typed::new(view, &b.checked, b.text, b.lits.lend(), b.hash)))
     }
 
     fn fn_kind(&self, item: ItemKey) -> FnKind {
@@ -458,9 +482,13 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     fn code_id(&self, item: ItemKey) -> ContentId {
         let mut h = Hasher::new("blaze-ladder front2 constant item");
         h.update(&item.0.to_le_bytes());
-        let text = match self.keys.library_in(self.names, item) {
-            Some(lib) => self.names.text_of(lib).map(|t| t.text),
-            None => self.store.fns.get(&item).map(|f| f.text),
+        let text = match (self.store.locals.head(item), self.keys.library_in(self.names, item)) {
+            // An item declared in a body: its kept text, there from the lowering of its
+            // enclosing body on (its key is derived from that body's key and its name, not
+            // from its own text, so the text must be in the id: rule 21).
+            (Some(local), _) => Some(local.text),
+            (None, Some(lib)) => self.names.text_of(lib).map(|t| t.text),
+            (None, None) => self.store.fns.get(&item).map(|f| f.text),
         };
         if let Some(t) = text {
             h.id(&hash_text(t));
@@ -477,10 +505,20 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     }
 }
 
+/// Where an evaluation starts ([`Consts::value_at`]): `item` at no arguments; a trait's
+/// constant selected for a ground `Self` (a head's qualified path); or `item` at ground
+/// arguments already in the evaluator's own table (an instance's need: const_at.rs).
+#[derive(Clone, Copy)]
+enum Root {
+    Plain,
+    SelfTy(tc::PNode),
+    Args(List),
+}
+
 impl<'n> Consts<'n> {
     /// The record of constant `item` (a checker key), evaluating every constant it needs first.
     pub fn value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>,prepared: &Prepares<'n>, item: ItemKey) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
-        self.value_at(r, prepared, item, None)
+        self.value_at(r, prepared, item, Root::Plain)
     }
 
     /// The record of `<Self as Trait>::NAME` for the ground type `self_ty` (a primitive, or
@@ -491,13 +529,75 @@ impl<'n> Consts<'n> {
     /// definition, or the trait's default at `[self_ty]`) is evaluated as [`Consts::value`]
     /// evaluates any constant. No impl selected: [`ConstFail::NoImplConst`].
     pub fn trait_const_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, declared: ItemKey, self_ty: tc::PNode) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
-        self.value_at(r, prepared, declared, Some(self_ty))
+        self.value_at(r, prepared, declared, Root::SelfTy(self_ty))
+    }
+
+    /// The record of constant `item` at the ground arguments `args` (types of `from`, the
+    /// build's ground table: front2/const_at.rs): `[Self, trait args..]` for a trait's constant
+    /// as declared, whose impl's definition (or the trait's default) is selected at that `Self`
+    /// ([`ConstsWorld::impl_const`], making the candidate impls first where none is made yet);
+    /// the impl's arguments for an inherent impl's. The arguments are copied into this
+    /// evaluator's own table first; every constant the value needs is evaluated first by the
+    /// same work list as [`Consts::value`]'s (a cycle is the evaluator's typed refusal).
+    pub fn value_with_args<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+        let list = self.args_in_unit(item, from, args, scratch)?;
+        self.value_at(r, prepared, item, Root::Args(list))
+    }
+
+    /// The record of `const { .. }` block `block` of `owner`'s body at the owner's ground
+    /// arguments `args` (types of `from`): the owner's body is lowered and checked for this
+    /// evaluator once per block, under the block's key `key` (const_at.rs `block_key`), and
+    /// read from the block as its root ([`ConstBody::root`]); then evaluated as any constant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn block_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, owner: ItemKey, block: ExprId, key: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+        if !self.bodies.iter().any(|b| b.key == key) {
+            self.check_as(r, prepared, owner, key, Some(block))?;
+        }
+        let list = self.args_in_unit(key, from, args, scratch)?;
+        self.value_at(r, prepared, key, Root::Args(list))
+    }
+
+    /// `args` (types of `from`, all ground) copied into this evaluator's own type table, as
+    /// one list of it.
+    fn args_in_unit(&mut self, item: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], scratch: Alloc<'_>) -> Result<List, ConstFail> {
+        let alloc = Alloc::global();
+        let (mut ground, layout, codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
+        let list = super::const_at::copy_ground(from, args, &mut ground, scratch).map_err(|why| ConstFail::Eval(format!("constant {item:?}: its arguments: {why}").into_boxed_str()));
+        self.unit = Some((ground, layout, codes));
+        list
+    }
+
+    /// The root of an evaluation that starts at constant `item` at ground `args` (a list of
+    /// `ground`): a trait's constant is selected at `args[0]` ([`ConstsWorld::impl_const`]);
+    /// where no impl is made yet, the candidates of (trait, `Self`) are made once
+    /// (const_open.rs `impl_rows`, which refuses the same pair twice: rule 18) and it is
+    /// selected again. Any other constant is its own root.
+    fn select_args<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ConstFail> {
+        let mut last: Option<super::const_open::Wanted> = None;
+        loop {
+            let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None), wanted: core::cell::Cell::new(None) };
+            let Some((trait_, name)) = world.trait_const(item) else {
+                return Ok((item, args));
+            };
+            if let Some(found) = world.impl_const(item, trait_, name, args, ground) {
+                return Ok(found);
+            }
+            let wanted = world.wanted.take();
+            let Some(wanted) = wanted else {
+                let self_ty = ground.view().list(args).ok().and_then(|l| l.first().copied()).and_then(|t| ground.view().node(t).ok());
+                return Err(match self_ty {
+                    Some(self_ty) => ConstFail::NoImplConst { trait_, self_ty, constant: item },
+                    None => ConstFail::TraitConstNoSelf { item, constant: item },
+                });
+            };
+            super::const_open::impl_rows(r, &mut last, item, item, wanted)?;
+        }
     }
 
     /// The root of an evaluation that starts at the trait's constant `declared` for the
     /// ground `self_ty`: the selected item and its arguments (in `ground`).
     fn select_root<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, declared: ItemKey, self_ty: tc::PNode, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ConstFail> {
-        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None) };
+        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None), wanted: core::cell::Cell::new(None) };
         let Some((trait_, name)) = world.trait_const(declared) else {
             return Err(ConstFail::TraitConstNoSelf { item: declared, constant: declared });
         };
@@ -509,12 +609,85 @@ impl<'n> Consts<'n> {
 
     /// [`Consts::value`] (`self_ty` is `None`: `item` at no arguments), or
     /// [`Consts::trait_const_value`] (`item` is a trait's constant, selected for `self_ty`).
-    fn value_at<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, self_ty: Option<tc::PNode>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+    fn value_at<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+        // A work list of the constants to evaluate FIRST, innermost last: a head made while a
+        // body of the evaluation was checked names one (front2/const_open.rs `needed_first`:
+        // `[u8; size_of::<Self>()]` on a method of `u8`, met when `u8::MAX` is checked). The
+        // failed evaluation is dropped whole, the constant evaluated and filed
+        // ([`Consts::first`]), and the failed one evaluated again: never a nested evaluation.
+        // One already on the list needs itself: the refusal it failed with is returned.
+        let mut firsts: Vec<LibKey, Global> = Vec::new_in(Global);
+        let mut rounds = 0u32;
+        let key = loop {
+            let step = match firsts.last().copied() {
+                None => self.value_key(r, prepared, item, root).map(Some),
+                Some(c) => self.first(r, prepared, c).map(|()| None),
+            };
+            match step {
+                Ok(Some(key)) => break key,
+                Ok(None) => {
+                    firsts.pop();
+                }
+                Err(e) => {
+                    let Some(c) = super::const_open::needed_first(&e) else { return Err(e) };
+                    // Only a constant this evaluator can file: an anonymous constant's need
+                    // key or an item's own key (a qualified leaf's need key is answered by
+                    // selection, which needs the evaluator free).
+                    let fileable = super::anon::need_key(super::keys::checker_of(c)) == c || r.keys.library_in(r.names, super::keys::checker_of(c)) == Some(c);
+                    if rounds >= super::const_open::MOST_FIRSTS || firsts.contains(&c) || !fileable {
+                        return Err(e);
+                    }
+                    rounds += 1;
+                    firsts.push(c);
+                }
+            }
+        };
+        self.records.iter().find(|x| x.key == key).ok_or(ConstFail::Eval(format!("constant {item:?}: its record was not kept").into_boxed_str()))
+    }
+
+    /// Evaluates the constant `c` a head or a body's conversion needs before an evaluation
+    /// can go on ([`Consts::value_at`]'s work list) and files it exactly as `check::eval_len`
+    /// files the one it is asked: its bits in `Maps::const_bits` (and `const_lens` when they
+    /// fit 64 bits); an ANONYMOUS constant the evaluator refuses is filed in
+    /// `Maps::anon_failed`, so the head that wrote it is refused by name and only that head.
+    /// A failure that itself names a constant to evaluate first is returned for the list.
+    fn first<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, c: LibKey) -> Result<(), ConstFail> {
+        let item = super::keys::checker_of(c);
+        let anonymous = super::anon::need_key(item) == c;
+        super::anon::file_asked(&mut *r.store, &mut *r.keys).map_err(|e| ConstFail::Eval(format!("constant {item:?}: {e}").into_boxed_str()))?;
+        let bits = match self.value_key(r, prepared, item, Root::Plain) {
+            Ok(key) => self.records.iter().find(|x| x.key == key).and_then(int_of),
+            Err(e) if !anonymous || super::const_open::needed_first(&e).is_some() => return Err(e),
+            Err(e) => {
+                r.store.maps.anon_failed.insert(c, format!("{e}").into_boxed_str());
+                return Ok(());
+            }
+        };
+        match bits {
+            Some(bits) => {
+                r.store.maps.const_bits.insert(c, bits);
+                if let Ok(v) = u64::try_from(bits) {
+                    r.store.maps.const_lens.insert(c, v);
+                }
+                Ok(())
+            }
+            None if anonymous => {
+                r.store.maps.anon_failed.insert(c, Box::from("its value is not an integer of at most 16 bytes"));
+                Ok(())
+            }
+            None => Err(ConstFail::NotUsize { item }),
+        }
+    }
+
+    /// One evaluation of [`Consts::value_at`]'s root: the key of its record (kept in
+    /// `self.records`), or the refusal.
+    fn value_key<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root) -> Result<RecordKey, ConstFail> {
         let alloc = Alloc::global();
         let (mut ground, mut layout, mut codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
-        let root = match self_ty {
-            None => Ok((item, List::EMPTY)),
-            Some(node) => self.select_root(&*r, item, node, &mut ground),
+        let root = match root {
+            Root::Plain => Ok((item, List::EMPTY)),
+            Root::SelfTy(node) => self.select_root(&*r, item, node, &mut ground),
+            Root::Args(list) => self.select_args(r, item, list, &mut ground),
         };
         let (item, root_args) = match root {
             Ok(root) => root,
@@ -527,6 +700,8 @@ impl<'n> Consts<'n> {
         let mut last = None;
         let mut out = Ok(());
         let mut steps = 0u32;
+        // The (trait, `Self`) whose candidate impls were made last (const_open.rs `impl_rows`).
+        let mut impls_last: Option<super::const_open::Wanted> = None;
         while let Some(n) = settle.next() {
             steps += 1;
             if steps > MOST_STEPS {
@@ -553,8 +728,9 @@ impl<'n> Consts<'n> {
                 }
                 continue;
             }
-            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None) };
+            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None), wanted: core::cell::Cell::new(None) };
             let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
+            let wanted = world.wanted.take();
             let unknown = world.unknown.into_inner();
             let step = match answer {
                 Ok(Answer::Done(rec)) => {
@@ -578,14 +754,28 @@ impl<'n> Consts<'n> {
                         Refusal::Missing { what: "ADT definition", item: adt } => Some(adt),
                         _ => None,
                     };
+                    // `<T as Trait>::NAME` reached at a ground `T` (`size_of::<usize>()` is
+                    // `<usize as SizedTypeProperties>::SIZE` in the pinned core) with no impl
+                    // of (trait, `T`) made in the store yet: `impl_const` left the pair in
+                    // `wanted`, the evaluator's code that met it is not kept (blaze-consteval
+                    // machine/code.rs, `Expr::Path`), the candidates are made now and the same
+                    // need is evaluated again. A pair is made once (`impl_rows`).
+                    let no_impl = match e.refusal {
+                        Refusal::Missing { what: "impl for an associated item", item: constant } => wanted.map(|w| (constant, w)),
+                        _ => None,
+                    };
                     let text = format!("{e}").into_boxed_str();
-                    match (unknown, no_adt) {
-                        (Some((item, name)), _) => Err(ConstFail::UnknownIntrinsic { item, name }),
-                        (None, Some(adt)) => match adt_row(r, n.item, adt) {
+                    match (unknown, no_adt, no_impl) {
+                        (Some((item, name)), _, _) => Err(ConstFail::UnknownIntrinsic { item, name }),
+                        (None, Some(adt), _) => match adt_row(r, n.item, adt) {
                             Ok(()) => continue,
                             Err(e) => Err(e),
                         },
-                        (None, None) => Err(ConstFail::Eval(text)),
+                        (None, None, Some((constant, w))) => match super::const_open::impl_rows(r, &mut impls_last, n.item, constant, w) {
+                            Ok(()) => continue,
+                            Err(e) => Err(e),
+                        },
+                        (None, None, None) => Err(ConstFail::Eval(text)),
                     }
                 }
             };
@@ -596,13 +786,21 @@ impl<'n> Consts<'n> {
         }
         self.unit = Some((ground, layout, codes));
         out?;
-        let key = last.ok_or(ConstFail::Eval(format!("constant {item:?}: the evaluation settled with no record").into_boxed_str()))?;
-        self.records.iter().find(|x| x.key == key).ok_or(ConstFail::Eval(format!("constant {item:?}: its record was not kept").into_boxed_str()))
+        last.ok_or(ConstFail::Eval(format!("constant {item:?}: the evaluation settled with no record").into_boxed_str()))
     }
 
     /// Lowers and checks the body of `item` (a constant, a static or a `const fn`) for the
     /// evaluator.
     fn check_one<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>,prepared: &Prepares<'n>, item: ItemKey) -> Result<(), ConstFail> {
+        self.check_as(r, prepared, item, item, None)
+    }
+
+    /// [`Consts::check_one`] of `item`'s body, kept under `key`: `item`'s own key, or, with
+    /// `root` a `const { .. }` block of that body, the block's key (const_at.rs `block_key`).
+    /// A `root` that is not a const block of the body as lowered here is refused by name.
+    fn check_as<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, key: ItemKey, root: Option<ExprId>) -> Result<(), ConstFail> {
+        // A constant declared in a body has its head made first (const_open.rs `local_head`).
+        super::const_open::local_head(r, item)?;
         let lowered = match r.keys.library_in(r.names, item) {
             Some(lib) => lower_fn(r.names, prepared, r.keys, r.store, lib),
             None => lower_member(r.names, prepared, r.keys, r.store, item),
@@ -619,12 +817,20 @@ impl<'n> Consts<'n> {
             let lits = LitTable::of(&view, &lowered.typeck, item)?;
             (checked, lits)
         };
-        let text = match r.keys.library_in(r.names, item) {
-            Some(lib) => r.names.text_of(lib).map(|t| t.text),
-            None => r.store.fns.get(&item).map(|f| f.text),
+        if let Some(block) = root
+            && !matches!(lowered.typeck.exprs.get(block.0 as usize), Some(tc::Expr::ConstBlock { .. }))
+        {
+            return Err(ConstFail::NotConstBlock { owner: item, block });
+        }
+        let text = match (r.store.locals.head(item), r.keys.library_in(r.names, item)) {
+            // An item declared in a body: its kept text (the names library holds none for
+            // it; body.rs `lower_fn_into` lowered it from the same text).
+            (Some(local), _) => Some(local.text),
+            (None, Some(lib)) => r.names.text_of(lib).map(|t| t.text),
+            (None, None) => r.store.fns.get(&item).map(|f| f.text),
         }
         .ok_or(ConstFail::Body { item, error: BodyError::NoHead(item) })?;
-        self.bodies.push(ConstBody { key: item, text, hash: hash_text(text), typeck: lowered.typeck, tys: lowered.tys, checked, lits });
+        self.bodies.push(ConstBody { key, text, hash: hash_text(text), typeck: lowered.typeck, tys: lowered.tys, checked, lits, root });
         Ok(())
     }
 }

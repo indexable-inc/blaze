@@ -21,7 +21,9 @@
 //! place: a pointer and an offset, most often into a stack slot. Every size, alignment, field
 //! offset, array stride, tag and niche is [`layout::Layouts`]' (rule 30: one layout), from
 //! the facts [`Adts::facts`] gives: a `repr(Rust)` struct's or tuple's fields are reordered by
-//! falling alignment, a `repr(C)` one's kept in order; `repr(packed)` is refused by name. A
+//! falling alignment, a `repr(C)` one's kept in order; a `repr(packed)` one's at the packed
+//! alignment, and a function that makes its row claims at most that alignment in every plain
+//! access after (walk.rs `layout`; a packed part that needs drop is refused by name). A
 //! fn pointer is a `ptr`. A by-value use of an aggregate place copies its scalar
 //! leaves where the value lands (a binding, a field of a literal, a caller's copy, the result
 //! slot): unrolled up to 16 leaves, in a loop over an array's elements beyond that, never
@@ -286,6 +288,13 @@ pub trait Adts {
         None
     }
 
+    /// What a panic does in this build (part of every code record's key): with
+    /// [`Panic::Unwind`] a call that may unwind past live values gets a landing block that drops
+    /// them (walk/unwind.rs). The default builds none, as before unwinding was built.
+    fn panic(&self) -> Panic {
+        Panic::Abort
+    }
+
     /// The trait method `which` names (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once`): a
     /// closure's body is the instance of its kind's at `[closure, (args..)]`, and a direct call
     /// of a closure calls it (codegen.md, "Closures and the Fn traits"). With no answer the
@@ -392,10 +401,23 @@ pub trait Adts {
     /// The evaluated value of const item `item` at generic arguments `args` (types of the
     /// ground table), as the constant evaluator recorded it. A path to the const is built
     /// from these bytes and never from the const's body (module doc, "Consts"). No answer is
-    /// refused with [`BuildError::NoConstValue`]. The checker records no generic arguments
-    /// of a const path yet, so `args` is empty.
+    /// refused with [`BuildError::NoConstValue`]. `args` are the path's recorded arguments
+    /// (blaze-typeck `Checked::const_args_of`) grounded at the instance: `[Self, trait args..]`
+    /// for a trait's constant, the impl's for an inherent impl's, empty for a free `const`.
     fn const_value(&self, item: ItemKey, args: &[PTy]) -> Option<&data::DataRecord<Global>> {
         let _ = (item, args);
+        None
+    }
+
+    /// The evaluated value of `const { .. }` block `block` of `owner`'s body at the instance's
+    /// ground arguments `args` (the owner's generics, in order), as the constant evaluator
+    /// recorded it: the same record form as [`Adts::const_value`], read by the same code. The
+    /// Reference, "Block expressions", "Const blocks": a const block is evaluated at compile
+    /// time with the enclosing generic parameters in scope, so each instance has its own value.
+    /// No answer is refused with [`BuildError::NoConstBlockValue`]; the block's code is never
+    /// built in its place.
+    fn const_block_value(&self, owner: ItemKey, block: ExprId, args: &[PTy]) -> Option<&data::DataRecord<Global>> {
+        let _ = (owner, block, args);
         None
     }
 
@@ -422,6 +444,26 @@ pub trait Adts {
     fn fmt_argument_adt(&self) -> Option<ItemKey> {
         None
     }
+
+    /// The bug this build plants (test builds of this crate only): a test's control, proving
+    /// the test fails when the rule it tests is broken (tests/guards.rs, tests/operators.rs).
+    #[cfg(test)]
+    fn planted(&self) -> Planted {
+        Planted::Nothing
+    }
+}
+
+/// A bug planted in the walk by a test's control ([`Adts::planted`]).
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Planted {
+    Nothing,
+    /// A false guard goes to the next ARM, never to the next `|` alternative of its own arm
+    /// (the wrong answer of rung x0-match-02-guards, 2026-11-16).
+    GuardToNextArm,
+    /// A comparison of two references compares the two ADDRESSES, not the referents (the
+    /// wrong answer of rung x0-match-05-nested-enums, 2026-11-16).
+    CompareAddresses,
 }
 
 /// One piece of a `format_args!` template ([`Adts::format_template`]).
@@ -516,9 +558,24 @@ pub struct Built<A: Allocator> {
     pub vtables: Vec<vtable::VtableRef, A>,
 }
 
+/// What a panic does. The Reference, "Panic": "unwind — unwinds the stack and is potentially
+/// recoverable"; "if the panic handler is set to abort, panicking will always terminate the
+/// process without destructors being run" (walk/unwind.rs quotes the rest).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Panic {
+    /// The stack unwinds, running destructors: every call that may unwind past live values
+    /// gets a cleanup.
+    Unwind,
+    /// The process aborts: no landing block is built.
+    Abort,
+}
+
 /// Why a body was not built.
 #[derive(Debug)]
 pub enum BuildError {
+    /// A call that may unwind whose cleanup cannot be built exactly (walk/unwind.rs names what
+    /// is missing): refused rather than miss or double a destructor.
+    NoCleanup { what: &'static str },
     /// An expression outside the subset.
     Unsupported { expr: ExprId, what: &'static str },
     /// A pattern outside the subset.
@@ -547,6 +604,9 @@ pub enum BuildError {
     /// Path `expr` names const `item`, whose value [`Adts::const_value`] does not hold. The
     /// const's body is never built in its place.
     NoConstValue { expr: ExprId, item: ItemKey },
+    /// `const { .. }` block `expr` of `owner`'s body, whose value at the instance
+    /// [`Adts::const_block_value`] does not hold. The block's code is never built in its place.
+    NoConstBlockValue { expr: ExprId, owner: ItemKey },
     /// Path pattern `pat` names const `item`, whose value [`Adts::const_value`] does not hold.
     NoPatConstValue { pat: PatId, item: ItemKey },
     /// A layout read a record that is not made yet: `item`'s (an enum's explicit discriminant).
@@ -650,6 +710,9 @@ impl fmt::Display for BuildError {
             BuildError::NoConstValue { expr, item } => {
                 write!(f, "expression {}: const item {:#x} has no evaluated value in the build's `Adts`", expr.0, item.0)
             }
+            BuildError::NoConstBlockValue { expr, owner } => {
+                write!(f, "expression {}: the const block of fn {:#x} has no evaluated value at this instance in the build's `Adts`", expr.0, owner.0)
+            }
             BuildError::NoPatConstValue { pat, item } => {
                 write!(f, "pattern {}: const item {:#x} has no evaluated value in the build's `Adts`", pat.0, item.0)
             }
@@ -677,6 +740,9 @@ impl fmt::Display for BuildError {
             BuildError::Lir(error) => write!(f, "blaze-lir's builder refused the function: {error}"),
             BuildError::Verify(error) => write!(f, "the LIR built does not verify: {error}"),
             BuildError::Coroutine(error) => write!(f, "an async block's body was not split: {error}"),
+            BuildError::NoCleanup { what } => {
+                write!(f, "a call that may unwind (panic = unwind): its cleanup is not built exactly: {what} (blaze-build walk/unwind.rs)")
+            }
         }
     }
 }

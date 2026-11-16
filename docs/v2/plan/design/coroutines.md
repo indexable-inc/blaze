@@ -284,7 +284,7 @@ the block's expression; an `async fn`'s parameters by value): the checker writes
 a seam (`opaque_hidden`, answered in the identity form over the owner's parameters), and
 blaze-typeck instance.rs refuses to export a `Future` (`Limit::Export`).
 
-## Builder writer 5's notes (2026-11-16; the emit points and four tests are WRITTEN and with the builder integrator: NEVER COMPILED when this was written)
+## Builder writer 5's notes (2026-11-16; green on the integrator's run at 14:00: filter coroutines "test blaze-build: exit 0; 6 passed, 0 failed", whole "test blaze-build: exit 0; 143 passed, 0 failed"; an async fn's opaque type must be filed with `Sized`, or a caller's `.await` of it does not check)
 
 Built (crates/blaze-build/src; tests `tests/coroutines_emit.rs`, run with the filter
 `coroutines`, aarch64 only):
@@ -329,3 +329,69 @@ capture); the resumed-after-completion panic block (item 6 above); each `.await`
 `Poll` result slot and the future's slot in the state to the body's end (no `slot_dead` is
 written: the pass's D8), and the body's one `Pin` slot too; a value in flight in an enclosing
 expression at an await is dropped by neither path (the walk's `return` has the same gap).
+
+## Front-end writer 6's notes (2026-11-16; the checker's half green at 14:20: "test blaze-typeck: exit 0; 175 passed, 0 failed"; the blaze-ladder half and the rung NEVER COMPILED when this was written)
+
+What the front end did with async before this leg (read, not built): the checker already TYPED
+it in full (`async fn` as its root `async move` block with the written output, rules/
+opaque_def.rs; `async {}`, rules/coroutine.rs; `.await` as `<T as IntoFuture>::Output` with
+E0728 outside async, rules/async_fmt.rs), and front2 already made an `async fn`'s head as
+`impl Future<Output = T>` (opaque 0, with `Sized`). So a census "clean" async body was really
+checked. Missing were: capture rows for async blocks, an honest `Send` answer, and every seam
+answer of the run path.
+
+Built, the checker (crates/blaze-typeck/src/rules/async_fn.rs, new):
+- **Capture rows** (`analyze_coroutine_captures`, called in `end_sequence` after
+  `analyze_closures`): the closure walk (`visit_for_captures`) run over each `async` block, rows
+  in `Checked::captures` with the block in the first column. `async move`: every row by value,
+  `Copy` never asked. Not `move`: the closure rule's modes, and what an inner `move` closure
+  or `async move` block takes by value the outer block holds by value unless `Copy`.
+- **An auto trait that failed on the superset interior** (`coroutine_interior_gap`, asked in
+  `report_fulfill_errors` for an `Unsatisfied` goal): E0277 stands only when the self type is an
+  `async move` block of this body capturing by value a variable that fails the trait; every
+  other failure is `CheckError::Unported(INTERIOR_GAP)`, never a "no". The suite's two tests
+  that pinned a false E0277 now pin the gap.
+
+Built, the run path (crates/blaze-ladder; new front2/coroutines.rs, hooks in run.rs):
+- `LayoutFacts::coroutine`: `CoroutineTable`, from `blaze_build::coroutine_facts` per block.
+- `LayoutFacts::coroutine_state`: `States`. A state asked before it is made is `Missing` and is
+  remembered as wanted; `build_from` catches the `MissingRecord`, runs `build_coroutines` (a
+  stack: the wanted coroutine and, first, each coroutine its own state holds), records the
+  states, and builds the asking instance again.
+- `LayoutFacts::opaque_hidden`: from the defining fn's `Checked::hidden`; a hidden async block
+  becomes `coroutine_identity` at its ordinal. Needs the seam's new `opaque_of`.
+- `Adts::future_poll` (lang `poll`), `Adts::async_items` (lang `Poll`, `pin`,
+  `coroutine_resume` through the seam's new `lang_named`; `IntoFuture` by path; the variants
+  `Ready` and `Pending` by name in the `Poll` row).
+- The three functions of an instance (`Future::poll`, the resume fn, `drop_in_place`, each at
+  `[coroutine]`) are tabled as their OWNER's (`owner_of`, in the refs loop and for a vtable
+  word), keyed by `key_args`, and taken from the one build's `BuiltParts` at their slots.
+- The walk queues `Future::poll` impl fns once a reached body awaits (back_needs.rs `awaits`).
+
+Proof written: suite/coroutine.rs (`async_move_block_captures_by_value`,
+`outer_block_holds_by_value_what_an_inner_move_takes`, `await_output_mismatch_is_refused`,
+`rc_held_across_await_is_a_gap`, `rc_dropped_before_await_is_a_gap_not_e0277`), and the rung
+crates/blaze-cli/tests/ladder/front2/x0-async-01 (no_core, its own `future.rs`; expected
+`front2/x0-async-01: PASS (status 42, stdout byte-equal)`; 1, 2, 3, 4 name the wrong build).
+
+Typed gaps and refusals, each by name:
+- `Send`/`Sync` of a future that fails only on a value not known live across an `.await`
+  (`INTERIOR_GAP`). Needed: the flow layer's liveness at each `.await` (locals from binding to
+  scope end less moves, temporaries to their statement's end), then the interior is exact and
+  both suite expectations flip (`Ok([Unsatisfied])` and `Ok([])`).
+- A CALLER's auto trait of an `async fn`'s future (`tokio::spawn(f())`): still the older gap
+  "an auto trait of an opaque type: its hidden type is not recorded yet": front2's checker
+  world answers `opaque_hidden` with `None` (world_items.rs). Needed: that world reading the
+  defining body's `Checked::hidden`, and the future's identity spelled in the type
+  (`PNode::Coroutine { owner, ordinal, args }`) so it means the same in another body.
+- Both gaps are `CheckError::Unported(&'static str)` and cannot name the coroutine: a variant
+  that does is not additive (blaze-real's and blaze-ladder's matches are exhaustive).
+- Refused by the builder as before: async closures' `.await`, `async gen`, a zero-sized
+  awaited future. Refused by the driver: an opaque type whose defining fn is not in the
+  program or gave no hidden type; a coroutine whose state holds itself (E0733); an `async`
+  `main` (entry.rs).
+- Not done: a rung on the real core with a `RawWakerVTable` waker; a rung that drops a
+  suspended future (the cancel path); `async_items` is `None` when no reached body names
+  `Poll` (its ADT row is made on demand), which refuses by name.
+- A wrong mode left in the closure rule, not this item's: a closure that is not `move` holding
+  an inner `move` construct still records `ByRef` (the fix made for blocks applies as it is).

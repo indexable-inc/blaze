@@ -33,7 +33,8 @@
 //! in this order (`null` where a key does not apply).
 //! - A failure as it ends: `event` (`"failed"`), `test` (64 hex digits), `path`, `micros`,
 //!   `ended` (`panicked`, `did_not_panic`, `panic_text_missing`, `signal`, `timed_out`,
-//!   `refused`), `message`, `at`, `signal`, `after_ns`, `refused` (`write`, `connect`, `spawn`,
+//!   `refused`, `no_report`), `message`, `at`, `signal`, `exit_code` (a run that exited with no
+//!   whole report), `after_ns`, `refused` (`write`, `connect`, `spawn`,
 //!   `call`), `what`, `output_bytes`, `output_cut`, `output` (the shown tail).
 //! - The summary: for every test in path order `event` (`"test"`), `test`, `path`, `outcome`
 //!   (`kept`, `passed`, `failed`, `ignored`, `bench`), `ran_because` (`run_all`, `no_record`,
@@ -190,6 +191,7 @@ const fn failure_key(why: Failure) -> &'static str {
         Failure::Signal { .. } => "signal",
         Failure::Refused => "refused",
         Failure::TimedOut { .. } => "timed_out",
+        Failure::NoReport { .. } => "no_report",
     }
 }
 
@@ -202,6 +204,7 @@ const fn failure_rank(why: Failure) -> (u8, i64, u64) {
         Failure::Signal { number } => (3, number as i64, 0),
         Failure::Refused => (4, 0, 0),
         Failure::TimedOut { after } => (5, 0, after.0),
+        Failure::NoReport { code } => (6, code as i64, 0),
     }
 }
 
@@ -307,6 +310,10 @@ fn ended_text(out: &mut dyn Write, ended: &Ended<'_>, at: Option<&str>) -> fmt::
             out.write_str(" after its start")
         }
         Ended::Refused { refusal, what } => write!(out, "was refused by the sandbox: {} {what}", refusal_words(refusal)),
+        Ended::NoReport { code, torn: 0 } => write!(out, "exited with code {code} and wrote no report"),
+        Ended::NoReport { code, torn } => {
+            write!(out, "exited with code {code} after {torn} bytes of a report that did not open")
+        }
     }
 }
 
@@ -338,6 +345,11 @@ fn failure_json(out: &mut dyn Write, style: Style, ending: &Ending<'_>) -> fmt::
         Ended::Signal { number } => write!(out, "{number}")?,
         _ => out.write_str("null")?,
     }
+    out.write_str(",\"exit_code\":")?;
+    match failed.ended {
+        Ended::NoReport { code, .. } => write!(out, "{code}")?,
+        _ => out.write_str("null")?,
+    }
     out.write_str(",\"after_ns\":")?;
     match failed.ended {
         Ended::TimedOut { after } => write!(out, "{}", after.0)?,
@@ -366,6 +378,8 @@ struct Counts {
     not_kept: [u32; 7],
     ignored: u32,
     benches: u32,
+    /// Tests the plan wanted run that could not be ([`NotRun`]); set by [`summary_with`].
+    not_run: u32,
 }
 
 impl Counts {
@@ -405,6 +419,37 @@ pub fn summary(
     flaky: &[Finding],
     alloc: Alloc<'_>,
 ) -> Result<(), ReportError> {
+    summary_with(out, style, entries, filtered_out, flaky, &[], alloc)
+}
+
+/// A test the plan wanted run that could not be run at all (no code for its body yet, no runner
+/// on this host): never a pass, never kept, and the summary's result is FAILED while any is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotRun<'r> {
+    pub test: TestId,
+    /// As printed: `module::name`.
+    pub path: &'r str,
+    /// Why, in words: `the code builder cannot build test bodies yet (test.md piece 8)`.
+    pub why: &'r str,
+}
+
+/// [`summary`], with the tests that could not be run. Each is a line before the failures,
+/// in path order (text: `NOT RUN m::a: cannot be run yet: <why>`; JSON: `{"event":"not_run",
+/// "test":..,"path":..,"why":..}`); the text's counts line ends `; N could not be run yet`
+/// when N is not zero, and the result is FAILED (JSON `"result":"failed"`) while N is not zero.
+/// A test in both `entries` and `not_run` is [`ReportError::TwoEntries`].
+pub fn summary_with(
+    out: &mut dyn Write,
+    style: Style,
+    entries: &[Entry<'_>],
+    filtered_out: u32,
+    flaky: &[Finding],
+    not_run: &[NotRun<'_>],
+    alloc: Alloc<'_>,
+) -> Result<(), ReportError> {
+    let not_run_count = u32::try_from(not_run.len()).map_err(|_| ReportError::TooMany { count: not_run.len() })?;
+    let mut not_run_order: AVec<'_, NotRun<'_>> = Vec::from_slice_in(not_run, alloc);
+    not_run_order.sort_unstable_by(|a, b| (a.path, a.test).cmp(&(b.path, b.test)));
     let count = u32::try_from(entries.len()).map_err(|_| ReportError::TooMany { count: entries.len() })?;
     let flaky_count = u32::try_from(flaky.len()).map_err(|_| ReportError::TooMany { count: flaky.len() })?;
 
@@ -448,8 +493,37 @@ pub fn summary(
             Err(_) => return Err(ReportError::NoEntry { test }),
         }
     }
+    // A test not run has no outcome: in both lists, or twice in one, is two outcomes.
+    for pair in not_run_order.windows(2) {
+        if pair[0].test == pair[1].test {
+            return Err(ReportError::TwoEntries { test: pair[0].test });
+        }
+    }
+    for one in not_run_order.iter() {
+        if by_id.binary_search_by(|row| entries[*row as usize].test.cmp(&one.test)).is_ok() {
+            return Err(ReportError::TwoEntries { test: one.test });
+        }
+    }
 
-    let counts = Counts::of(entries);
+    let mut counts = Counts::of(entries);
+    counts.not_run = not_run_count;
+    for one in not_run_order.iter() {
+        match style.format {
+            Format::Text => {
+                paint(out, style, RED, "NOT RUN")?;
+                writeln!(out, " {}: cannot be run yet: {}", one.path, one.why)?;
+            }
+            Format::Json => {
+                out.write_str("{\"event\":\"not_run\",\"test\":")?;
+                hex(out, &one.test.0)?;
+                out.write_str(",\"path\":")?;
+                json_str(out, one.path)?;
+                out.write_str(",\"why\":")?;
+                json_str(out, one.why)?;
+                out.write_str("}\n")?;
+            }
+        }
+    }
     match style.format {
         Format::Text => summary_text(out, style, entries, &by_path, flaky, &findings, &paths, &counts, filtered_out)?,
         Format::Json => summary_json(out, entries, &by_path, flaky, &findings, &paths, &counts, filtered_out)?,
@@ -492,7 +566,7 @@ fn summary_text(
         )?;
     }
     out.write_str("test result: ")?;
-    match counts.failed {
+    match counts.failed + counts.not_run {
         0 => paint(out, style, GREEN, "ok")?,
         _ => paint(out, style, RED, "FAILED")?,
     }
@@ -520,13 +594,17 @@ fn summary_text(
         }
         out.write_char(')')?;
     }
-    writeln!(
+    write!(
         out,
         "; {} ignored; {} benches not run; {filtered_out} filtered out; {} flaky",
         counts.ignored,
         counts.benches,
         findings.len()
-    )
+    )?;
+    if counts.not_run > 0 {
+        write!(out, "; {} could not be run yet", counts.not_run)?;
+    }
+    out.write_char('\n')
 }
 
 #[allow(clippy::too_many_arguments, reason = "the summary's parts, each sorted once by `summary`")]
@@ -594,7 +672,7 @@ fn summary_json(
     write!(
         out,
         "{{\"event\":\"summary\",\"result\":\"{}\",\"ran\":{},\"passed\":{},\"failed\":{},\"reused\":{},\"not_kept\":{},\"not_kept_by\":{{",
-        match counts.failed {
+        match counts.failed + counts.not_run {
             0 => "ok",
             _ => "failed",
         },

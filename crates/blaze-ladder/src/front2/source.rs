@@ -182,6 +182,38 @@ pub trait NamesSource<'n>: Copy {
     /// `each` was not called.
     fn each_impl_row(self, krate: usize, each: &mut dyn FnMut(ImplRow<'n>)) -> bool;
 
+    /// Whether an impl question is answered BY BUCKET (`buckets::Buckets::admit_asked`): the
+    /// source files each crate's impls by resolved (trait or inherent, self type's head), so
+    /// one question reads one bucket of each crate asked and no other impl's row. `false`
+    /// over the solved names, where every impl is filed when the index is made.
+    fn has_buckets(self) -> bool {
+        false
+    }
+
+    /// Each impl crate `krate` files under `key` (a whole bucket, or a prefix: every negative
+    /// impl of a trait), and the digest of that answer (what a body's read list holds for the
+    /// (crate, bucket) it asked). `None`: no bucket index (the solved names), or no record of
+    /// the crate, or a record that did not read (its error is filed).
+    fn bucket(self, _krate: usize, _key: &blaze_scope::items_record::buckets::BucketKey, _each: &mut dyn FnMut(blaze_scope::items_record::buckets::BucketImpl)) -> Option<blaze_id::ContentId> {
+        None
+    }
+
+    /// Each impl of crate `krate` its record's writer filed under NO bucket, as its impl row
+    /// with why, and the digest of the list: candidates of every question the crate is asked,
+    /// filed by the reader. `None` as [`NamesSource::bucket`].
+    fn unfiled(self, _krate: usize, _each: &mut dyn FnMut(ImplRow<'n>, blaze_scope::items_record::buckets::NotFiled)) -> Option<blaze_id::ContentId> {
+        None
+    }
+
+    /// THE CRATES THAT MAY WRITE AN INCOHERENT INHERENT IMPL (an inherent impl of a type they
+    /// do not define: `impl bool` in core, `impl [T]` in alloc, `impl f64` in std), as ONE
+    /// fact of the command with its digest, read once and never by opening every crate's
+    /// record. `None`: the source was not told which crates to ask (a caller then files a
+    /// gap by name).
+    fn incoherent_crates(self) -> Option<(&'n [usize], blaze_id::ContentId)> {
+        None
+    }
+
     /// The impl `key` of crate `krate`, written in `module`, with its header's text: for the
     /// one impl a row does not file ([`NamesSource::each_impl_row`]'s reader). `None`: the
     /// text did not read (filed in the log).
@@ -589,23 +621,17 @@ pub struct Records<'n> {
     /// The command's frame: a path's segments are copied into it for the walk (the names
     /// record's `World` is over `&'n str`, and a caller's segments live less long).
     frame: &'n blaze_mem::Frame,
-    /// Each variant's enum and index, for the crates [`NamesSource::variant_of`] was asked of.
-    variant_homes: RefCell<HashMap<ItemKey, (ItemKey, u32), Alloc<'n>>>,
-    /// The crates whose enums were read into `variant_homes`.
-    variants_read: RefCell<HashMap<usize, (), Alloc<'n>>>,
-    /// Each variant read into `variant_homes`, by its key's first 16 bytes
-    /// ([`NamesSource::key_beginning`]'s third table).
-    variant_beginnings: RefCell<HashMap<[u8; 16], ItemKey, Alloc<'n>>>,
     /// What [`NamesSource::key_beginning`] answered, by the 16 bytes asked: one search per key
     /// per command.
     beginnings: RefCell<HashMap<[u8; 16], Option<ItemKey>, Alloc<'n>>>,
-    /// Each named member's owner and name, for the crates [`NamesSource::member_owner`] was
-    /// asked of.
-    member_owners: RefCell<HashMap<ItemKey, (ItemKey, &'n str), Alloc<'n>>>,
-    /// The crates whose member lists were read into `member_owners`.
-    members_read: RefCell<HashMap<usize, (), Alloc<'n>>>,
     /// A test's planted bug: the crate whose impl rows are withheld ([`Records::plant_no_impls`]).
     no_impls: Cell<Option<usize>>,
+    /// A test's planted bug: the impl whose bucket row is withheld
+    /// ([`Records::plant_no_bucket_impl`]).
+    no_bucket_impl: Cell<Option<ItemKey>>,
+    /// The crates that may write incoherent impls and the fact's digest
+    /// ([`Records::name_lang_crates`]); `None` until the lang crates are named.
+    incoherent: Cell<Option<(&'n [usize], blaze_id::ContentId)>>,
     /// A test's planted bug: the item whose row is withheld ([`Records::plant_no_item`]).
     no_item: Cell<Option<ItemKey>>,
 }
@@ -621,13 +647,10 @@ impl<'n> Records<'n> {
             keys,
             log,
             frame,
-            variant_homes: RefCell::new(HashMap::new_in(alloc)),
-            variants_read: RefCell::new(HashMap::new_in(alloc)),
-            variant_beginnings: RefCell::new(HashMap::new_in(alloc)),
             beginnings: RefCell::new(HashMap::new_in(alloc)),
-            member_owners: RefCell::new(HashMap::new_in(alloc)),
-            members_read: RefCell::new(HashMap::new_in(alloc)),
             no_impls: Cell::new(None),
+            no_bucket_impl: Cell::new(None),
+            incoherent: Cell::new(None),
             no_item: Cell::new(None),
         }
     }
@@ -715,58 +738,6 @@ impl<'n> Records<'n> {
         Written { kind: written.kind, segments }
     }
 
-    /// Reads every trait's and impl's member list of crate `krate` into `member_owners`, once:
-    /// each named member's owner and name (as `Names`' member tables answer it: an unnamed
-    /// member, a macro call, has no owner row).
-    fn read_member_owners(&'n self, krate: usize) {
-        if self.members_read.borrow().get(&krate).is_some() {
-            return;
-        }
-        self.members_read.borrow_mut().insert(krate, ());
-        let Some(items) = self.items_of(krate) else { return };
-        for i in 0..items.items() {
-            let Some(Some(row)) = self.read(krate, items.item_at(i)) else { continue };
-            if !matches!(row.kind, ItemKind::Trait | ItemKind::Impl) {
-                continue;
-            }
-            let Some(Some(members)) = self.read(krate, items.members(row.key)) else { continue };
-            let mut owners = self.member_owners.borrow_mut();
-            for m in members.iter() {
-                if let Some(name) = m.name {
-                    owners.insert(m.key, (row.key, name));
-                }
-            }
-        }
-    }
-
-    /// Reads every enum of crate `krate` into `variant_homes`, once.
-    fn read_variants(&'n self, krate: usize) {
-        if self.variants_read.borrow().get(&krate).is_some() {
-            return;
-        }
-        self.variants_read.borrow_mut().insert(krate, ());
-        let (Some(items), Some(names)) = (self.items_of(krate), self.names_of(krate)) else { return };
-        for i in 0..items.items() {
-            let Some(Some(row)) = self.read(krate, items.item_at(i)) else { continue };
-            if row.kind != ItemKind::Enum {
-                continue;
-            }
-            let Some(Some(vs)) = self.read_names(krate, names.variants(row.key)) else { continue };
-            let mut homes = self.variant_homes.borrow_mut();
-            let mut beginnings = self.variant_beginnings.borrow_mut();
-            for (index, v) in vs.iter().enumerate() {
-                homes.insert(v.key, (row.key, index as u32));
-                match beginnings.get(&first_16(v.key)).copied() {
-                    Some(first) if first != v.key => self.log.put(SourceError::KeysBeginAlike { krate, name: self.log.name(krate), first, second: v.key }),
-                    Some(_) => {}
-                    None => {
-                        beginnings.insert(first_16(v.key), v.key);
-                    }
-                }
-            }
-        }
-    }
-
     /// In a table of `count` rows sorted by key (`key_at(i)` is row `i`'s key, `None` where the
     /// row did not read: its error is filed), the one key that begins with `first`.
     fn one_beginning(&self, krate: usize, first: [u8; 16], count: usize, key_at: &dyn Fn(usize) -> Option<ItemKey>) -> Beginning {
@@ -801,7 +772,8 @@ impl<'n> Records<'n> {
 
     /// [`NamesSource::key_beginning`], not kept: the key's crate by its first eight bytes (no
     /// record is opened to find it), then that crate's item rows, its module rows, and its
-    /// enums' variants (read once per crate: `read_variants`).
+    /// variant table (`blaze_scope::items_record::variants`, sorted by variant key): three
+    /// binary searches at most, no crate scanned.
     fn find_beginning(&'n self, first: [u8; 16]) -> Option<ItemKey> {
         let mut whole = [0u8; 32];
         whole[..16].copy_from_slice(&first);
@@ -819,8 +791,61 @@ impl<'n> Records<'n> {
             Beginning::Void => return None,
             Beginning::Absent => {}
         }
-        self.read_variants(krate);
-        self.variant_beginnings.borrow().get(&first).copied()
+        let variant_at = |i: usize| self.read(krate, record.variant_at(i)).flatten().map(|row| row.0);
+        match self.one_beginning(krate, first, record.variant_rows(), &variant_at) {
+            Beginning::One(key) => Some(key),
+            Beginning::Void | Beginning::Absent => None,
+        }
+    }
+}
+
+impl<'n> Records<'n> {
+    /// Names the crates that can carry the library's coherence exceptions (`lang_crates`: core,
+    /// alloc, std and the program's own, as the driver's crate graph names them: the ones
+    /// `Front2::from_records` reads the lang rows of) and reads, from THEIR items records only,
+    /// which may write an incoherent inherent impl ([`NamesSource::incoherent_crates`]): one
+    /// read for the whole graph, kept for the command; a second call changes nothing.
+    ///
+    /// Why those crates: an inherent impl of a type its crate does not define is E0116/E0390
+    /// (the Reference, "Inherent implementations": "An implementing type must be defined
+    /// within the same crate as the original type definition"), lifted only by the library's
+    /// internal attributes. In the library's source on the toolchain shelf
+    /// (`rustlib/src/rust/library`, read 2026-11-16): `#![rustc_coherence_is_core]` is written
+    /// in core/src/lib.rs alone, and `#[rustc_allow_incoherent_impl]` in core (23 places),
+    /// alloc (44) and std (141), in no other library crate (proc_macro, test, panic_unwind,
+    /// panic_abort: 0, though their roots turn on `rustc_attrs`).
+    ///
+    /// THE GAP THIS LEAVES, by name: a crate NOT in `lang_crates` whose root turns on
+    /// `#![feature(rustc_attrs)]` and writes `#[rustc_allow_incoherent_impl]` (nightly only,
+    /// outside the library) is not asked, so its incoherent impls are no candidates. The
+    /// crate-graph row should carry the flag (asked of the driver's lane); until it does the
+    /// fact is exactly "of the lang crates named, which carry the mark".
+    pub fn name_lang_crates(&'n self, lang_crates: &[usize]) {
+        if self.incoherent.get().is_some() {
+            return;
+        }
+        let marked = |krate: usize| self.items_of(krate).is_some_and(|record| record.may_write_incoherent());
+        let count = lang_crates.iter().filter(|krate| marked(**krate)).count();
+        let mut each = lang_crates.iter().copied().filter(|krate| marked(*krate));
+        let frame: &'n blaze_mem::Frame = self.frame;
+        let crates: &'n [usize] = frame.alloc_slice_fill_with(count, |_| each.next().unwrap_or(usize::MAX));
+        // The fact's digest: each crate asked, by key, with its answer.
+        let mut bytes: AVec<'_, u8> = AVec::new_in(Alloc::global());
+        for krate in lang_crates.iter() {
+            if let Some(key) = self.keys.get(*krate) {
+                bytes.extend_from_slice(&key.0.0);
+                bytes.push(u8::from(crates.contains(krate)));
+            }
+        }
+        self.incoherent.set(Some((crates, blaze_id::ContentId::of("blaze-ladder front2 incoherent crates 1", &bytes))));
+    }
+
+    /// PLANTED BUG, for tests/front2_records.rs only: the bucket row of impl `key` is withheld
+    /// from [`NamesSource::bucket`] from now on, as a bucket index written without that row
+    /// would read. A question whose answer is that impl must then differ.
+    #[doc(hidden)]
+    pub fn plant_no_bucket_impl(&self, key: ItemKey) {
+        self.no_bucket_impl.set(Some(key));
     }
 }
 
@@ -897,11 +922,13 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn variant_of(self, variant: ItemKey) -> Option<(ItemKey, u32)> {
-        // No record holds "the enum of a variant": the enums of the variant's crate are read
-        // once (every item row of kind enum, then its variants) and kept for the command.
+        // One search of the items record's variant table (`blaze_scope::items_record::
+        // variants`: each variant's key with its enum and index, sorted by variant key): no
+        // enum of the crate is scanned.
         let krate = self.items.crate_of(variant)?;
-        self.read_variants(krate);
-        self.variant_homes.borrow().get(&variant).copied()
+        // No record: the loader filed `NoRecord` the one time it was asked.
+        let record = self.items_of(krate)?;
+        self.read(krate, record.variant_home(variant))?
     }
 
     fn has_text(self, key: ItemKey) -> bool {
@@ -996,12 +1023,14 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn member_owner(self, member: ItemKey) -> Option<(ItemKey, &'n str)> {
-        // The items record has members by owner only: the member lists of the member's crate
-        // are read once (every trait and impl row, then its members; no text is opened) and
-        // kept for the command. A row sorted by member key would make this one search.
+        // One search of the items record's member owners section (`blaze_scope::items_record::
+        // owners`: each named member's key with its owner's row, sorted by member key), then
+        // one owner row and one member row read in place: no member list is decoded and no
+        // crate is scanned.
         let krate = self.items.crate_of(member)?;
-        self.read_member_owners(krate);
-        self.member_owners.borrow().get(&member).copied()
+        // No record: the loader filed `NoRecord` the one time it was asked.
+        self.items_of(krate)?;
+        self.read(krate, self.items.member_owner(member))?
     }
 
     fn each_impl(self, krate: usize, each: &mut dyn FnMut(ImplAt<'n>)) {
@@ -1024,6 +1053,41 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             };
             each(ImplAt { krate, key: row.key, module: row.module, header });
         }
+    }
+
+    fn has_buckets(self) -> bool {
+        true
+    }
+
+    fn bucket(self, krate: usize, key: &blaze_scope::items_record::buckets::BucketKey, each: &mut dyn FnMut(blaze_scope::items_record::buckets::BucketImpl)) -> Option<blaze_id::ContentId> {
+        // No record: the loader filed `NoRecord` the one time it was asked.
+        let record = self.items_of(krate)?;
+        if self.no_impls.get() != Some(krate) {
+            for at in self.read(krate, record.bucket(key))? {
+                let it = self.read(krate, record.bucket_impl(at))?;
+                if self.no_bucket_impl.get() != Some(it.key) {
+                    each(it);
+                }
+            }
+        }
+        self.read(krate, record.bucket_digest(key, Alloc::global()))
+    }
+
+    fn unfiled(self, krate: usize, each: &mut dyn FnMut(ImplRow<'n>, blaze_scope::items_record::buckets::NotFiled)) -> Option<blaze_id::ContentId> {
+        let record = self.items_of(krate)?;
+        if self.no_impls.get() != Some(krate) {
+            let mut i = 0;
+            while let Some((it, why)) = self.read(krate, record.unfiled_at(i))? {
+                // A row that does not read is filed by `read`: the list is then void.
+                each(self.read(krate, record.impl_at(it.row))??, why);
+                i += 1;
+            }
+        }
+        self.read(krate, record.unfiled_digest(Alloc::global()))
+    }
+
+    fn incoherent_crates(self) -> Option<(&'n [usize], blaze_id::ContentId)> {
+        self.incoherent.get()
     }
 
     fn each_impl_row(self, krate: usize, each: &mut dyn FnMut(ImplRow<'n>)) -> bool {

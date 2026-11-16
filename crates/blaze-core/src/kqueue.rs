@@ -1596,6 +1596,23 @@ impl Driver for Kqueue {
         // clone: a handle to the kqueue's notify, once per waker asked for
         Some(crate::Waker::new(Arc::clone(&self.notify) as Arc<dyn crate::Wake>))
     }
+
+    /// The file threads' calls, made on the asker's thread: the same [`crate::threads::run`]
+    /// over the same root and kept descriptors (crate::threads::inline, its table).
+    fn inline_files(&self) -> Option<crate::threads::inline::Inline> {
+        // clone: two counts, once per asker's world.
+        Some(crate::threads::inline::Inline::new(Arc::clone(&self.root), Arc::clone(&self.descriptors)))
+    }
+}
+
+impl Kqueue {
+    /// [`Driver::now`]'s clock as a value read with no `&self`: what an asker holds beside
+    /// the lock it keeps the driver under, so a clock read takes no lock (std.md, "End state:
+    /// efficiency", piece 6). On the instant the driver began, as `now` and every poll's
+    /// deadline are.
+    pub fn clock(&self) -> crate::wait::Monotonic {
+        crate::wait::Monotonic::since(self.start)
+    }
 }
 
 /// Runs the file effects this thread takes off `queue`, which every file thread takes from

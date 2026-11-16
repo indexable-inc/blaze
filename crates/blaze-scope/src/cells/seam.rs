@@ -123,6 +123,9 @@ pub struct WrittenDiffer<'a> {
 /// One crate's shadow run: times, and the bindings by agreement (bottom.md section 6).
 #[derive(Debug)]
 pub struct Shadowed<'a> {
+    /// Calls the fill expanded that the cell core did not resolve, and the first of them.
+    pub lost: u64,
+    pub lost_first: AVec<'a, Lost<'a>>,
     /// Unknown imports and unknown calls by [`super::Unfollowed`] class.
     pub unknown_imports: [u64; super::UNFOLLOWED],
     pub unknown_calls: [u64; super::UNFOLLOWED],
@@ -179,6 +182,20 @@ pub struct WrittenAgainst {
     pub origin: u64,
     pub expansion: u64,
     pub state: u64,
+    /// Root entries of `#[macro_export]` macros written by expansions, which the old path
+    /// publishes into the root scope after its fill: held by the cells, compared with nothing.
+    pub exports_published_later: u64,
+}
+
+/// A call the fill expanded that the cell core did not resolve to a macro: what it wrote is
+/// missing from the cells' answers.
+#[derive(Debug)]
+pub struct Lost<'a> {
+    pub module: ItemKey,
+    pub call: ItemKey,
+    pub kind: crate::PathKind,
+    pub segments: AVec<'a, &'a str>,
+    pub outcome: Option<Outcome>,
 }
 
 /// The cell core refused a crate: at its load or its run.
@@ -193,6 +210,9 @@ pub enum ShadowRefused {
 pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
     facts: &F,
     built: &Built<'_, 'a>,
+    enums: &dyn super::EnumNames<&'a str>,
+    // Where each block's body is written ([`Cells::load_more_at`]).
+    places: &dyn Fn(ItemKey) -> Option<(ItemKey, u32)>,
     root: ItemKey,
     done: &HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>>,
     old: Duration,
@@ -203,6 +223,7 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
     let facts = Facts { inner: facts, not_expanded: Cell::new(0), first: Cell::new(None), alloc };
     let start = seam.now();
     let mut c = Cells::load_with(&facts, root, Some(&deps), alloc).map_err(ShadowRefused::Load)?;
+    c.enums = Some(enums);
     let loaded = seam.now().saturating_sub(start);
     c.run(&facts, &|_, _| {}, &[]).map_err(ShadowRefused::Run)?;
     // The modules no `mod` line names (a block's module): the fill has made them all by now,
@@ -210,7 +231,7 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
     let mut extra: AVec<'a, ItemKey> = AVec::new_in(alloc);
     extra.extend(done.keys().copied().filter(|k| !c.by_key.contains_key(k)));
     extra.sort_unstable();
-    let blocks = c.load_more(&facts, &extra).map_err(ShadowRefused::Load)?;
+    let blocks = c.load_more_at(&facts, &extra, places).map_err(ShadowRefused::Load)?;
     if blocks > 0 {
         c.run(&facts, &|_, _| {}, &[]).map_err(ShadowRefused::Run)?;
     }
@@ -219,7 +240,19 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
     let (mut failed, mut outside, mut undecided) = (0u64, 0u64, 0u64);
     let (mut unknown_imports, mut unknown_calls) = ([0u64; super::UNFOLLOWED], [0u64; super::UNFOLLOWED]);
     let mut unknown_first: AVec<'a, Unknown<'a>> = AVec::new_in(alloc);
+    let (mut lost, mut lost_first): (u64, AVec<'a, Lost<'a>>) = (0, AVec::new_in(alloc));
     for r in c.results() {
+        if let Some(call) = r.call
+            && !matches!(r.outcome, Some(Outcome::Called(_)))
+            && matches!(facts.inner.expansion(call), Ok(Some(_)))
+        {
+            lost += 1;
+            if lost_first.len() < DIFFER_SHOWN {
+                let mut segments = AVec::with_capacity_in(r.segments.len(), alloc);
+                segments.extend_from_slice(r.segments);
+                lost_first.push(Lost { module: r.module, call, kind: r.kind, segments, outcome: r.outcome });
+            }
+        }
         match r.outcome {
             Some(Outcome::Failed(_)) => failed += 1,
             Some(Outcome::Outside) => {
@@ -296,7 +329,17 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
         } else {
             written.globs_differ += 1;
         }
-        let (ours, theirs) = (&w.bindings[..], &resolved.scope.bindings[..]);
+        // A `#[macro_export]` macro an expansion wrote is a root binding the old path adds after
+        // its fill (`publish_expanded_exports`, after this comparison): the cells hold it now.
+        let mut held: AVec<'a, blaze_surface::ScopeEntry<&'a str>> = AVec::with_capacity_in(w.bindings.len(), alloc);
+        for e in w.bindings.iter() {
+            if e.binding.origin == crate::Origin::MacroExport && e.binding.expansion > 0 && resolved.scope.get(e.ns, e.name).is_none() {
+                written.exports_published_later += 1;
+            } else {
+                held.push(*e);
+            }
+        }
+        let (ours, theirs) = (&held[..], &resolved.scope.bindings[..]);
         if ours == theirs {
             written.bindings_equal += 1;
             continue;
@@ -353,6 +396,8 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
         }
     }
     Ok(Shadowed {
+        lost,
+        lost_first,
         unknown_imports,
         unknown_calls,
         unknown_first,

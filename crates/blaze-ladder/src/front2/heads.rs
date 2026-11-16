@@ -156,6 +156,11 @@ pub struct Maps {
     /// [`Heads::const_params`] reads), an impl's own, and a fn's with its container's first
     /// (the checker's `const_params`). An item with none has an empty row once made.
     pub const_params: HashMap<LibKey, Vec<(u32, PTy), Global>, Global>,
+    /// Each enum with no generic parameters whose every variant is a unit variant, by its
+    /// checker key, with its variant count: what a const parameter's type may be past the
+    /// integers, `char` and `bool` ([`super::const_enum`]). Filed by `Store::adt_head` with
+    /// the enum's generics, so before any path to the enum has a type.
+    pub fieldless_enums: HashMap<ItemKey, u32, Global>,
     /// How many lowerings of a written bound's arguments are nested right now
     /// ([`Heads::written_depth`]): zero between any two heads.
     pub written_depth: core::cell::Cell<u32>,
@@ -586,6 +591,8 @@ pub(super) fn own_generics<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys
                 let t = b.ty(tys, &env, v, ty)?;
                 match tys.view().nodes.get(t.0 as usize) {
                     Some(PNode::Int(_) | PNode::Uint(_) | PNode::Bool | PNode::Char) => {}
+                    // A fieldless enum (`const ORD: AtomicOrdering`): const_enum.rs.
+                    _ if super::const_enum::accepts(b.heads, tys, t) => {}
                     _ => {
                         let r = v.site(v.row_range(list.start + k as u32)?)?;
                         return Err(Why::Unsupported("a const parameter whose type is not an integer, `char` or `bool` (`adt_const_params`)", r));
@@ -885,6 +892,11 @@ impl<'n> Store<'n> {
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
         let mut defaults = Vec::new_in(Global);
         own_defaults(&b, &mut self.tys, &env, v, 0, &mut defaults)?;
+        // A fieldless enum is filed before its generics are: a path to it has a type only
+        // once `generics` holds it, and `own_generics` then finds it here.
+        if let Some(variants) = super::const_enum::fieldless(names, key, v, g)? {
+            self.maps.fieldless_enums.insert(checker_of(key), variants);
+        }
         self.maps.generics.insert(key, (g, defaults));
         self.maps.const_params.insert(key, cs);
         Ok(())
@@ -1036,10 +1048,28 @@ impl<'n> Store<'n> {
                     // need is passed up; any other refusal is filed in `fn_gaps` under the
                     // type's key and the trait's head goes on: a body whose solve reads the
                     // bounds then gets the gap, by name (`BodyWorld::predicates`).
-                    let alias_args = params(&mut self.tys, 0, own + 1, &cs)?;
+                    // A generic associated type (`type Out<T>: B;`): its own type and const
+                    // parameters follow the trait's, in the alias's list and in scope for
+                    // its bounds (gat.rs; the checker's `AssocGenerics`).
+                    let mut own_ps = Vec::new_in(Global);
+                    own_ps.extend_from_slice(&ps);
+                    let mut own_cs = Vec::new_in(Global);
+                    own_cs.extend_from_slice(&cs);
+                    let of_type = match own_generics(&b, &mut self.tys, module, &mv, own + 1, &mut own_ps, &mut own_cs) {
+                        Ok(n) => n,
+                        Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                        Err(why) => {
+                            self.preds.remove(&item);
+                            self.fn_gaps.insert(item, why);
+                            assoc.push(tc::AssocTyDef { name: Name::of(m.name), item, default });
+                            continue;
+                        }
+                    };
+                    let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
+                    let alias_args = params(&mut self.tys, 0, own + 1 + of_type, &own_cs)?;
                     let alias = intern(&mut self.tys, PNode::Alias { trait_: ck, name: Name::of(m.name), args: alias_args })?;
                     let mut ap = Preds::new();
-                    match b.assoc_ty_bounds(&mut self.tys, &env, &mv, alias, self.sized, &mut ap) {
+                    match b.assoc_ty_bounds(&mut self.tys, &own_env, &mv, alias, self.sized, &mut ap) {
                         Ok(()) => {
                             self.fn_gaps.remove(&item);
                             self.preds.insert(item, ap);
@@ -1446,6 +1476,13 @@ impl<'n> Store<'n> {
             written
         };
         let header = tc::FnPtrHeader { abi: abi_of(v, whole)?, safety: if flags & sig::UNSAFE != 0 { tc::Safety::Unsafe } else { tc::Safety::Safe } };
+        // A fn an `extern` block in a body declares ([`super::foreign_locals`]): its own text
+        // carries no ABI, its block's does, and it "is implicitly unsafe unless the safe
+        // function qualifier is present" (the Reference, "External blocks").
+        let header = match self.locals.foreign(key) {
+            Some(f) if f.kind == super::foreign_locals::ForeignKind::Fn => tc::FnPtrHeader { abi: super::types::fn_ptr_abi(f.abi, whole)?, safety: if f.safe { tc::Safety::Safe } else { tc::Safety::Unsafe } },
+            _ => header,
+        };
         let has_body = flags & sig::HAS_BODY != 0;
         let mut preds = Preds::new();
         preds.clauses.extend_from_slice(inherited);

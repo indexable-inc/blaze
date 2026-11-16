@@ -174,9 +174,15 @@ pub(crate) struct Working<'a> {
     skipped: AVec<'a, Skipped>,
     skeleton: AVec<'a, u8>,
     stacks: Stacks<'a>,
+    /// The working vectors of the sink that writes rows as the grammar closes items, and the
+    /// token columns it and the grammar read.
+    rows: rows::Stacks<'a>,
+    columns: rows::Columns<'a>,
     lexer: Lexer<'a>,
     digest: crate::digest::Scratch<'a>,
 }
+
+pub(crate) mod rows;
 
 /// The lexer's errors of the parts walked so far, in file offsets, and their messages one
 /// after another: empty, and nothing allocated, in nine files in ten.
@@ -192,6 +198,8 @@ impl<'a> Working<'a> {
             skipped: Vec::new_in(alloc),
             skeleton: Vec::new_in(alloc),
             stacks: Stacks::new_in(alloc),
+            rows: rows::Stacks::new_in(alloc),
+            columns: rows::Columns::new_in(alloc),
             lexer: Lexer { errors: Vec::new_in(alloc), messages: Vec::new_in(alloc) },
             digest: crate::digest::Scratch::new_in(alloc),
         }
@@ -267,18 +275,18 @@ fn walk_part<'a>(
 /// `path_or_macro_pat`) unless it is a joint `!=` in an expression or type; only a pattern
 /// right before a joint `!=` (`let a != b`), which nothing valid has, is a call this misses.
 /// A `const` right after `*` is a pointer type's, never an item's.
-fn may_hold_items(input: &Input, from: usize, len: usize) -> bool {
+fn may_hold_items(input: parser::Tokens<'_>, from: usize, len: usize) -> bool {
     let mut prev = EOF;
     for at in from..from + len {
-        let (kind, contextual, _, joint, _) = input.token(at);
+        let kind = input.kind(at);
         let item = match kind {
             FN_KW | STRUCT_KW | ENUM_KW | TRAIT_KW | IMPL_KW | STATIC_KW | TYPE_KW | MOD_KW
             | USE_KW | EXTERN_KW | MACRO_KW => true,
             CONST_KW => prev != STAR,
-            IDENT => contextual == UNION_KW,
+            IDENT => input.contextual_kind(at) == UNION_KW,
             BANG => {
                 matches!(prev, IDENT | SELF_KW | SUPER_KW | CRATE_KW | SELF_TYPE_KW | R_ANGLE)
-                    && !(joint && input.token(at + 1).0 == EQ)
+                    && !(input.is_joint(at) && input.kind(at + 1) == EQ)
             }
             _ => false,
         };
@@ -548,7 +556,7 @@ impl<'t, 'l, 'o, 'a> Walk<'t, 'l, 'o, 'a> {
     fn lazy_body(&mut self, input: &Input, len: u32) {
         let len = usize::try_from(len).expect("a body's tokens are counted in usize");
         let from = self.taken;
-        if !may_hold_items(input, from, len) {
+        if !may_hold_items(input.tokens(), from, len) {
             self.enter(BLOCK_EXPR);
             for _ in 0..len {
                 self.token();

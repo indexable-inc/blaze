@@ -84,7 +84,7 @@ impl RecordColumn {
     ];
 }
 
-const COLUMNS: usize = 14;
+pub(crate) const COLUMNS: usize = 14;
 
 /// The root: each column's bytes.
 type Root = [Slice<u8>; COLUMNS];
@@ -177,7 +177,7 @@ fn lit_bits(kind: LitKind) -> (u32, u8) {
 /// A token's kind as its 4-byte entry: bits 0..3 the kind, 3..5 the spacing, then an
 /// identifier's `r#` at bit 5, a punct's character at bits 8..29, a literal's kind at 5..9 and
 /// its `#`s at 9..17, a delimiter at 5..7. A literal's suffix length is in its own column.
-fn token_word(kind: TokenKind) -> u32 {
+pub fn token_word(kind: TokenKind) -> u32 {
     match kind {
         TokenKind::Ident { raw, spacing } => {
             spacing_bits(spacing) << 3 | u32::from(raw == Raw::Yes) << 5
@@ -246,6 +246,14 @@ impl Expansion<'_> {
     /// The expansion as a record: one blaze-format buffer of [`EXPANSION_SCHEMA`] in `alloc`.
     /// Equal expansions give equal bytes.
     pub fn write_record<'b>(&self, alloc: Alloc<'b>) -> RecordBytes<'b> {
+        let c = Columns { columns: self.write_columns(alloc) };
+        finish_columns(&c, EXPANSION_SCHEMA, alloc)
+    }
+
+    /// The record's columns, each its own bytes in `alloc`, before any root: what a kept
+    /// expansion's entry holds ([`crate::kept::write_entry`]), read back by
+    /// [`Expansion::read_columns`].
+    pub(crate) fn write_columns<'b>(&self, alloc: Alloc<'b>) -> [AVec<'b, u8>; COLUMNS] {
         let mut c = Columns::new_in(alloc);
         write_stream(&mut c, &self.tokens);
         for origin in self.origins.iter() {
@@ -317,7 +325,7 @@ impl Expansion<'_> {
         }
         c.put(RecordColumn::Notes, &self.notes);
         c.leb(RecordColumn::Arm, self.arm.map_or(0, |arm| u64::from(arm) + 1));
-        finish_columns(&c, EXPANSION_SCHEMA, alloc)
+        c.columns
     }
 }
 
@@ -614,7 +622,7 @@ fn lit_of(tag: u32, hashes: u8) -> Option<LitKind> {
 
 /// The kind a token entry is, its suffix length still 0; `None` for an entry [`token_word`]
 /// does not write (an unknown kind, a bit no field uses, a character that is not one).
-fn token_of(word: u32) -> Option<TokenKind> {
+pub fn token_of(word: u32) -> Option<TokenKind> {
     let spacing = spacing_of(word >> 3 & 0b11)?;
     let kind = match word & 0b111 {
         0 => {
@@ -633,7 +641,7 @@ fn token_of(word: u32) -> Option<TokenKind> {
     (token_word(kind) == word).then_some(kind)
 }
 
-fn edition_of(bits: u64) -> Option<Edition> {
+pub(crate) fn edition_of(bits: u64) -> Option<Edition> {
     Edition::from_byte(u8::try_from(bits).ok()?)
 }
 
@@ -661,7 +669,7 @@ impl<'b> Reader<'b> {
 }
 
 /// The context `raw` names: a root, or one of `nodes`, the table read so far.
-fn ctx_of(raw: u64, nodes: &[Ctx]) -> Option<Ctx> {
+pub(crate) fn ctx_of(raw: u64, nodes: &[Ctx]) -> Option<Ctx> {
     match raw.checked_sub(4) {
         None => edition_of(raw).map(Ctx::root),
         Some(node) => nodes.get(usize::try_from(node).ok()?).copied(),
@@ -674,8 +682,29 @@ impl<'a> Expansion<'a> {
     /// buffer is aligned as blaze-format buffers are (to 4 bytes at least).
     pub fn read_record(buffer: &[u8], alloc: Alloc<'a>) -> Result<Expansion<'a>, RecordError> {
         let mut r = open_columns(buffer, EXPANSION_SCHEMA)?;
-        let mut exp = Expansion::new_in(alloc);
         let tokens = read_tokens(&mut r, alloc)?;
+        Expansion::read_rest(r, tokens, alloc)
+    }
+
+    /// The expansion whose columns ([`Expansion::write_columns`]'s) are `columns`, checked as
+    /// [`Expansion::read_record`] checks: a kept expansion's entry ([`crate::kept::KeptEntry`]).
+    pub(crate) fn read_columns(columns: [&[u8]; COLUMNS], alloc: Alloc<'a>) -> Result<Expansion<'a>, RecordError> {
+        let mut r = Reader { columns: core::array::from_fn(|i| Col { column: RecordColumn::ALL[i], bytes: columns[i], at: 0 }) };
+        let tokens = read_tokens(&mut r, alloc)?;
+        Expansion::read_rest(r, tokens, alloc)
+    }
+
+    /// `tokens`, read already where they are kept (a kept set's atoms: [`crate::kept_set`]), with
+    /// the rest of an expansion's columns: `columns` with the stream's columns
+    /// ([`RecordColumn::Tokens`] to [`RecordColumn::Contexts`]) empty.
+    pub(crate) fn read_after_tokens(columns: [&[u8]; COLUMNS], tokens: TokenStream<'a>, alloc: Alloc<'a>) -> Result<Expansion<'a>, RecordError> {
+        let r = Reader { columns: core::array::from_fn(|i| Col { column: RecordColumn::ALL[i], bytes: columns[i], at: 0 }) };
+        Expansion::read_rest(r, tokens, alloc)
+    }
+
+    /// Every column after the stream's, read to its end, beside `tokens`.
+    fn read_rest(mut r: Reader<'_>, tokens: TokenStream<'a>, alloc: Alloc<'a>) -> Result<Expansion<'a>, RecordError> {
+        let mut exp = Expansion::new_in(alloc);
         let len = tokens.len();
         exp.tokens = tokens;
         for _ in 0..len {

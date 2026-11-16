@@ -415,6 +415,12 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 }
                 "macro_use" => attrs.macro_use = true,
                 "lang" => attrs.lang = string_value(content),
+                // `#[panic_handler]` files its fn in the lang rows under the attribute's own
+                // name (the Reference, [panic.panic_handler.unique]: "There must be a single
+                // panic_handler function in the dependency graph"): what a call of core's
+                // `#[lang = "panic_impl"]` declaration is bound to (blaze-ladder
+                // front2/panic_entry.rs asks the row by this name). No `#[lang]` is named so.
+                "panic_handler" => attrs.lang = Some("panic_handler"),
                 "rustc_builtin_macro" => {
                     attrs.builtin = true;
                     let arg = SplitTop::new(args(content)).next().map_or("", str::trim);
@@ -1471,11 +1477,17 @@ pub struct BodySrc<'t> {
     pub loc: Loc,
     /// How many expansions (and bodies) deep its text is.
     pub depth: u16,
+    /// Where it is written: the fragment (its owner's key: the module's own text, or a call's
+    /// expansion) and the last ordered entry's place before it there (`0`: none). A block's
+    /// module reads the textual scope from this place on outward (Reference
+    /// `macro.decl.scope.textual`: a `macro_rules!` is in scope "after the definition .. up
+    /// until its surrounding scope, typically a module, is closed": a body's block is inside it).
+    pub place: (ItemKey, u32),
 }
 
 impl<'t> BodySrc<'t> {
     /// The entry for an item of `detail` and `text`, if its body may write an impl.
-    fn of(detail: ItemDetail, key: ItemKey, module: ItemKey, text: &'t str, loc: Loc, depth: u16) -> Option<BodySrc<'t>> {
+    fn of(detail: ItemDetail, key: ItemKey, module: ItemKey, text: &'t str, loc: Loc, depth: u16, place: (ItemKey, u32)) -> Option<BodySrc<'t>> {
         let holds = matches!(
             detail,
             ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
@@ -1484,7 +1496,7 @@ impl<'t> BodySrc<'t> {
         // (`blaze_file_items::nested::NestedKind::makes_module`): a body without one costs
         // five substring searches and no scan.
         const WORDS: [&str; 5] = ["impl", "struct", "enum", "union", "type"];
-        (holds && WORDS.iter().any(|w| text.contains(w))).then_some(BodySrc { key, module, text, loc, depth })
+        (holds && WORDS.iter().any(|w| text.contains(w))).then_some(BodySrc { key, module, text, loc, depth, place })
     }
 }
 
@@ -1897,7 +1909,7 @@ impl<'t, 'a, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
         }
-        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.depth) {
+        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.depth, (self.owner, self.pos)) {
             self.out.bodies.push(body);
         }
         match item.detail {
@@ -2156,7 +2168,7 @@ impl<'t, 'a, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let key = self.key(key_owner, "assoc", name.unwrap_or(""));
             let whole = &text[item.range.start as usize..item.range.end as usize];
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
-            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.depth) {
+            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.depth, (self.owner, self.pos)) {
                 self.out.bodies.push(body);
             }
             if is_call {

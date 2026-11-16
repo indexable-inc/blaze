@@ -3,7 +3,7 @@
 
 #![feature(allocator_api)]
 
-use blaze_expand::kept::{Asked, KeptEntry, KeptError, KeptSet, write_entry, write_set};
+use blaze_expand::kept::{Asked, KeptEntry, KeptError, KeptSet, SetPlant, SetSource, write_entry, write_set, write_set_planted};
 use blaze_expand::{
     BuiltinFn, Call, CallShape, CallSite, Ctx, DefAt, DefSite, DefText, Edition, ExpandCx, Expanded, Expansion, Export, Held,
     HostAsk, HostError, HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, Place, PlaceOf, ProcCall, Produced, ReadKind,
@@ -104,14 +104,34 @@ fn entries() -> Vec<(TextKey, Vec<u8>)> {
         .collect()
 }
 
+/// `made`'s entries as [`write_set`] takes them.
+fn sources(made: &[(TextKey, Vec<u8>)]) -> Vec<(TextKey, SetSource<'_>)> {
+    made.iter().map(|(key, bytes)| (*key, SetSource::Entry(&bytes[..]))).collect()
+}
+
+/// Whether every one of `made` reads back from `set` as it was put: found under its key, its
+/// asked atoms equal, its expansion equal (`==`, and the same record written again).
+fn reads_back(set: &KeptSet<'_>, made: &[(TextKey, Vec<u8>)]) -> bool {
+    made.iter().all(|(key, bytes)| {
+        let put = KeptEntry::open(bytes).expect("a made entry opens");
+        let want = put.expansion(Alloc::global()).expect("a made entry reads");
+        let Ok(Some(entry)) = set.find(key) else { return false };
+        let Ok(got) = entry.expansion(Alloc::global()) else { return false };
+        got == want
+            && got.write_record(Alloc::global())[..] == want.write_record(Alloc::global())[..]
+            && Iterator::eq(entry.asked(), put.asked())
+    })
+}
+
 /// A set is the same bytes in whatever order its entries were made (rule 25), and every entry
-/// is read back in place: its asked atoms as pushed, its expansion equal to the one written
-/// (written again, the same record). A key not in the set finds nothing.
+/// is read back: its asked atoms as pushed, its expansion equal to the one written (written
+/// again, the same record). A key not in the set finds nothing. The made entry itself reads
+/// back too (its columns without a record root).
 #[test]
 fn a_set_is_order_free_and_reads_every_entry_back() {
     let made = entries();
-    let mut forward: Vec<(TextKey, &[u8])> = made.iter().map(|(key, bytes)| (*key, &bytes[..])).collect();
-    let mut backward: Vec<(TextKey, &[u8])> = forward.iter().rev().copied().collect();
+    let mut forward = sources(&made);
+    let mut backward: Vec<(TextKey, SetSource<'_>)> = forward.iter().rev().copied().collect();
     // The same call made twice (two calls of one text in a crate) is one entry.
     backward.push(forward[0]);
     let set = write_set(&mut forward, Alloc::global()).expect("a set");
@@ -119,35 +139,39 @@ fn a_set_is_order_free_and_reads_every_entry_back() {
     let aligned = Aligned::copy_from(&set);
     let opened = KeptSet::open(&aligned).expect("the set opens");
     assert_eq!(opened.len(), 3);
-    for (key, bytes) in &made {
-        let found = opened.find(key).expect("the key is in the set");
-        assert_eq!(found, &bytes[..]);
-        let entry = KeptEntry::open(found).expect("the entry opens");
-        let expansion = entry.expansion(Alloc::global()).expect("the expansion reads back");
-        assert_eq!(expansion.write_record(Alloc::global())[..], *entry.record(), "a kept expansion written again is the same record");
+    assert!(reads_back(&opened, &made), "every entry reads back as it was put");
+    for (key, _) in &made {
+        let entry = opened.find(key).expect("the entry opens").expect("the key is in the set");
         let asked: Vec<(&str, Option<&str>, bool)> = entry.asked().map(|a| (a.name, a.value, a.answer)).collect();
         match *key == text_key(&call("Two")) {
             true => assert_eq!(asked, [("unix", None, true), ("feature", Some("std"), false)]),
             false => assert!(asked.is_empty()),
         }
     }
-    assert!(opened.find(&text_key(&call("Four"))).is_none());
+    assert!(opened.find(&text_key(&call("Four"))).expect("nothing to open").is_none());
 }
 
-/// Two expansions under one key are refused by name (rule 21), never one of them picked; a
-/// buffer that is not a set, or is cut, is refused too.
+/// Two expansions under one key are refused by name (rule 21), never one of them picked: two
+/// made ones, and a kept one beside a made one of another value. A buffer that is not a set, a
+/// cut one, and one of the earlier layout are refused too, each by its own name.
 #[test]
 fn two_values_under_one_key_and_a_cut_set_are_refused() {
     let made = entries();
-    let mut clash: Vec<(TextKey, &[u8])> = vec![(made[0].0, &made[0].1[..]), (made[0].0, &made[1].1[..])];
+    let mut clash = vec![(made[0].0, SetSource::Entry(&made[0].1[..])), (made[0].0, SetSource::Entry(&made[1].1[..]))];
     assert_eq!(write_set(&mut clash, Alloc::global()).err(), Some(KeptError::TwoValues { key: made[0].0 }));
-    let mut all: Vec<(TextKey, &[u8])> = made.iter().map(|(key, bytes)| (*key, &bytes[..])).collect();
-    let set = write_set(&mut all, Alloc::global()).expect("a set");
-    let cut = Aligned::copy_from(&set[..set.len() - 1]);
-    assert_eq!(KeptSet::open(&cut).err(), Some(KeptError::EntryEnd { index: 2 }));
+    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    let opened = KeptSet::open(&set).expect("the set opens");
+    let kept = opened.find(&made[0].0).expect("opens").expect("found");
+    let mut mixed = vec![(made[0].0, SetSource::Kept(kept)), (made[0].0, SetSource::Entry(&made[1].1[..]))];
+    assert_eq!(write_set(&mut mixed, Alloc::global()).err(), Some(KeptError::TwoValues { key: made[0].0 }));
+    let mut agreeing = vec![(made[0].0, SetSource::Kept(kept)), (made[0].0, SetSource::Entry(&made[0].1[..]))];
+    assert!(write_set(&mut agreeing, Alloc::global()).is_ok(), "a kept entry and a made one of one value are one");
+    assert!(matches!(KeptSet::open(&set[..set.len() - 1]).err(), Some(KeptError::Short { .. })));
     let mut other = set.to_vec();
     other[0] ^= 1;
-    assert_eq!(KeptSet::open(&Aligned::copy_from(&other)).err(), Some(KeptError::Magic));
+    assert_eq!(KeptSet::open(&other).err(), Some(KeptError::Magic));
+    other[..8].copy_from_slice(b"BZXSET1\0");
+    assert_eq!(KeptSet::open(&other).err(), Some(KeptError::OldForm));
 }
 
 /// Every input a text key names moves it: the definition's text, name, crate and edition, its
@@ -196,4 +220,161 @@ fn a_read_list_is_asked_again_and_names_what_moved() {
     let included = fn_like(&include, "\"a.txt\"", &CX).reads;
     assert_eq!(included.askable(), Err((0, ReadKind::IncludeStr)));
     assert_eq!(included.hold(&CX, Edition::E2021, Alloc::global()), Ok(Held::NotAskable { read: 0, kind: ReadKind::IncludeStr }));
+}
+
+/// A derive-like definition: three impls over the same forty-odd identifiers and punctuation,
+/// the type's name the only part that differs between calls.
+const DERIVE: &str = "($name:ident) => { \
+    impl ::core::clone::Clone for $name { #[inline] fn clone(&self) -> $name { let this = self; ::core::clone::Clone::clone(this) } } \
+    impl ::core::fmt::Debug for $name { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { f.write_str(\"x\") } } \
+    impl ::core::cmp::PartialEq for $name { #[inline] fn eq(&self, other: &$name) -> bool { let _ = other; true } } \
+};";
+
+fn derive_key(name: &str) -> TextKey {
+    text_key(&TextCall { def: DefText::Rules { body: DERIVE }, input: name, ..call("") })
+}
+
+/// `n` calls of [`DERIVE`] on `Name0`, `Name1`, ..., each with its key and entry.
+fn derive_like(n: usize) -> Vec<(TextKey, Vec<u8>)> {
+    let def = MacroDefinition::rules(tokens(DERIVE), at());
+    (0..n)
+        .map(|i| {
+            let name = format!("Name{i}");
+            let entry = write_entry(&Asked::new_in(Alloc::global()), &fn_like(&def, &name, &CX), Alloc::global()).expect("an entry");
+            (derive_key(&name), entry.to_vec())
+        })
+        .collect()
+}
+
+/// (i) A set in the one-root form answers every entry with the expansion that was put: a
+/// thousand derive-like calls and the three of [`entries`] (one with asked atoms), each found
+/// under its key with equal asked atoms and an equal expansion (`==`, and the same record
+/// written again). Prints "every entry of a 1003-entry set reads back as it was put".
+#[test]
+fn every_entry_of_a_large_set_reads_back_as_it_was_put() {
+    let mut made = derive_like(1000);
+    made.extend(entries());
+    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    let opened = KeptSet::open(&set).expect("the set opens");
+    assert_eq!(opened.len(), made.len());
+    assert!(reads_back(&opened, &made), "an entry read back otherwise than it was put");
+    println!("every entry of a {}-entry set reads back as it was put", opened.len());
+}
+
+/// (ii) The bytes are a function of the entries (rule 25): two making orders give equal sets,
+/// and so do a set rewritten from its own entries (every call found again, the next solve's
+/// common case) and one half found, half made. The atom and key tables are in first-use order
+/// over the entries sorted by key, never over the order of making. Prints "two making orders, a
+/// rewrite from the set and a half-found set: N bytes each, equal".
+#[test]
+fn two_making_orders_and_a_rewrite_from_the_set_give_equal_bytes() {
+    let made = derive_like(200);
+    let mut forward = sources(&made);
+    let n = forward.len();
+    // 7919 is prime and does not divide 200: a permutation.
+    let mut shuffled: Vec<(TextKey, SetSource<'_>)> = (0..n).map(|i| forward[(i * 7919) % n]).collect();
+    let set = write_set(&mut forward, Alloc::global()).expect("a set");
+    assert_eq!(set[..], write_set(&mut shuffled, Alloc::global()).expect("a set")[..]);
+    let opened = KeptSet::open(&set).expect("the set opens");
+    let mut found: Vec<(TextKey, SetSource<'_>)> =
+        (0..opened.len()).rev().map(|i| (opened.key(i), SetSource::Kept(opened.entry(i).expect("the entry opens")))).collect();
+    assert_eq!(set[..], write_set(&mut found, Alloc::global()).expect("a set")[..], "a set rewritten from itself is the same bytes");
+    let mut half: Vec<(TextKey, SetSource<'_>)> = made
+        .iter()
+        .enumerate()
+        .map(|(i, (key, bytes))| match i % 2 {
+            0 => (*key, SetSource::Entry(&bytes[..])),
+            _ => (*key, SetSource::Kept(opened.find(key).expect("the entry opens").expect("the key is in the set"))),
+        })
+        .collect();
+    assert_eq!(set[..], write_set(&mut half, Alloc::global()).expect("a set")[..], "half found, half made is the same bytes");
+    println!("two making orders, a rewrite from the set and a half-found set: {} bytes each, equal", set.len());
+}
+
+/// (iii) A set cut anywhere (every prefix: each section boundary and every offset between) is
+/// [`KeptError::Short`], a byte past its end [`KeptError::Trailing`], and a set with any one
+/// byte changed either is refused or reads every entry without a panic (a typed error or some
+/// expansion: the store's digest, not this reader, says the bytes are the ones written).
+/// Prints "a changed byte: N of M sets still opened, every entry read without a panic".
+#[test]
+fn a_cut_or_changed_set_is_a_typed_refusal_never_a_panic() {
+    let made = entries();
+    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    for len in 0..set.len() {
+        let refused = KeptSet::open(&set[..len]).err();
+        assert!(matches!(refused, Some(KeptError::Short { .. })), "the set cut at byte {len} of {}: {refused:?}", set.len());
+    }
+    let mut longer = set.to_vec();
+    longer.push(0);
+    assert_eq!(KeptSet::open(&longer).err(), Some(KeptError::Trailing));
+    let mut opened_after_change = 0usize;
+    for at in 0..set.len() {
+        let mut changed = set.to_vec();
+        changed[at] ^= 0xff;
+        let Ok(opened) = KeptSet::open(&changed) else { continue };
+        opened_after_change += 1;
+        for index in 0..opened.len() {
+            if let Ok(entry) = opened.entry(index) {
+                let _ = entry.expansion(Alloc::global());
+                let _ = entry.asked().count();
+            }
+        }
+    }
+    println!("a changed byte: {opened_after_change} of {} sets still opened, every entry read without a panic", set.len());
+}
+
+/// (iv) The one-root form against the per-entry form it replaced, on 1,000 derive-like calls.
+/// The old set (BZXSET1) is computed from its layout: a 16-byte head, 40 bytes a key and its
+/// end, then each entry at a multiple of 16: its 8-byte head padded to 16 and the whole
+/// expansion record (a blaze-format header, a 14-slice root, padded columns, every token's text
+/// and each context's two 32-byte keys). The new one (BZXSET3, its tokens rows of the shared
+/// `atoms` table) pays per entry 32 bytes of key, 48 of row and 4 of asked count beside its
+/// columns; each token is a 4-byte atom id instead of its text, length and 4-byte kind (each
+/// distinct token is one 12-byte atom and its text once a set); the context keys are LEB128
+/// ids. Expected R about 0.6 here
+/// (short texts, one context, the fixed 4-byte id and the origins kept as they are bound it);
+/// asserted below 0.75. Prints "kept set: N bytes new, M bytes old (ratio R)".
+#[test]
+fn a_set_of_derive_like_expansions_is_a_fraction_of_the_old_form() {
+    let made = derive_like(1000);
+    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    let mut end = 0usize;
+    for (_, bytes) in &made {
+        let expansion = KeptEntry::open(bytes).expect("opens").expansion(Alloc::global()).expect("reads");
+        end = end.next_multiple_of(16) + 16 + expansion.write_record(Alloc::global())[..].len();
+    }
+    let old = (16 + made.len() * 40).next_multiple_of(16) + end;
+    let ratio = set.len() as f64 / old as f64;
+    println!("kept set: {} bytes new, {old} bytes old (ratio {ratio:.2})", set.len());
+    assert!(ratio < 0.75, "the one-root set is {ratio:.2} of the per-entry form");
+    assert!(reads_back(&KeptSet::open(&set).expect("the set opens"), &made));
+}
+
+/// (v) The planted bug: the first entry's `Tokens` row ends one token late. The set still opens
+/// (its rows are in order and inside their columns), and the round trip of (i) catches it: the
+/// first entry takes the second's first token. Prints "planted row off by one: caught by the
+/// round trip".
+#[test]
+fn a_row_off_by_one_is_caught_by_the_round_trip() {
+    let made = derive_like(3);
+    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    assert!(reads_back(&KeptSet::open(&set).expect("the set opens"), &made), "the unplanted set reads back");
+    let planted = write_set_planted(&mut sources(&made), SetPlant::RowOffByOne, Alloc::global()).expect("a planted set");
+    let opened = KeptSet::open(&planted).expect("the planted set opens: its rows are in order");
+    assert!(!reads_back(&opened, &made), "the planted row was not caught");
+    println!("planted row off by one: caught by the round trip");
+}
+
+/// The hit's key: a definition digested once and each call keyed from the digest is the key
+/// `text_key` makes, and the planted variant without the definition's name moves it. Prints
+/// "def digest: 3 calls keyed from one digest equal text_key".
+#[test]
+fn a_key_from_the_definition_digest_is_the_text_key() {
+    let digest = blaze_expand::def_digest(&call("One"));
+    for input in ["One", "Two", "Three"] {
+        assert_eq!(blaze_expand::text_key_with(digest, &call(input)), text_key(&call(input)));
+    }
+    let unnamed = blaze_expand::def_digest(&TextCall { def_name: "", ..call("One") });
+    assert_ne!(blaze_expand::text_key_with(unnamed, &call("One")), text_key(&call("One")));
+    println!("def digest: 3 calls keyed from one digest equal text_key");
 }

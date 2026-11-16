@@ -423,6 +423,9 @@ fn wanted(last: &str, name: &str, is_dir: bool) -> bool {
         ("src", true) => name == "bin",
         ("src", false) => name == "lib.rs" || name == "main.rs",
         ("bin", false) => name.ends_with(".rs"),
+        // A member's test, example and bench targets are found by their files
+        // (blaze-manifest layout/extra.rs `inferred`).
+        ("tests" | "examples" | "benches", false) => name.ends_with(".rs"),
         (_, true) => true,
         (_, false) => name == "lib.rs" || name == "main.rs",
     }
@@ -1014,5 +1017,17 @@ mod tests {
         assert_eq!(id(), before, "the home moved the root's listing");
         write("crates2/b/Cargo.toml");
         assert_ne!(id(), before, "control: a new directory at the root moves its listing");
+    }
+
+    /// A member's `examples/mm.rs` (and `tests/`, `benches/` files) reaches the layout: without
+    /// it a written `[[example]] name = "mm"` with no `path` is refused "no file
+    /// `examples/mm.rs`" though the file is there (DRIVER runner 11's repro, 2026-11-16).
+    #[test]
+    fn target_folders_list_their_rust_files() {
+        for folder in ["tests", "examples", "benches"] {
+            assert!(super::wanted(folder, "mm.rs", false), "{folder}/mm.rs is not listed");
+            assert!(!super::wanted(folder, "notes.txt", false), "control: {folder}/notes.txt is listed");
+        }
+        assert!(!super::wanted("m", "mm.rs", false), "control: a package folder lists only lib.rs and main.rs");
     }
 }

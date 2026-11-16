@@ -20,6 +20,10 @@
 //! runs programs in-process) and prints one `VERDICT ..` line. The parent waits for it with a
 //! deadline (`FRONT2_RUNG_SECS`, default 120), so one hang or crash costs one line, not the run.
 //!
+//! SKIPPED unless `FRONT2_RUNGS` is set: the runner is examples/front2_rungs.rs (a release
+//! build, the toolchain library resolved once, a forked child per rung); the rungs' logic both
+//! share is tests/rungs/x.rs.
+//!
 //! The test FAILS only when a rung is WRONG. `FRONT2_RUNGS_OUT` names a file the table goes to:
 //! each line is appended as its rung finishes (the checker scripts keep no test output, and a
 //! run cut short still leaves every finished line).
@@ -28,139 +32,16 @@
 
 mod rungs;
 
-use blaze_ladder::refusal::SourceFile;
-use blaze_ladder::run::{FrontChoice, NewFront, run_with};
-use rungs::{expected, ladder, sources};
+use blaze_ladder::run::{FrontChoice, run_with};
+use rungs::{ladder, x};
 
-/// What one rung did.
-enum Verdict {
-    Pass,
-    Refused { class: String, first: String },
-    Panicked { first: String },
-    Wrong { status: u8, out: Vec<u8> },
-}
-
-/// Runs `f` with fd 1 on a pipe; its status and what it wrote there. As ladder_front2.rs's.
-fn capture(f: impl FnOnce() -> u8) -> (u8, Vec<u8>) {
-    let mut fds = [0; 2];
-    // SAFETY: as tests/ladder.rs: `pipe` fills the array; fd 1 is restored before returning
-    // (`f` cannot unwind past here: the caller catches its panics inside `f`).
-    unsafe {
-        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0, "a pipe");
-        let saved = libc::dup(1);
-        assert!(saved >= 0, "a copy of fd 1");
-        assert!(libc::dup2(fds[1], 1) >= 0, "fd 1 onto the pipe");
-        let status = f();
-        assert!(libc::dup2(saved, 1) >= 0, "fd 1 back");
-        libc::close(saved);
-        libc::close(fds[1]);
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = libc::read(fds[0], buf.as_mut_ptr().cast(), buf.len());
-            if n <= 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        libc::close(fds[0]);
-        (status, out)
-    }
-}
-
-/// The edition line of a rung's `Cargo.toml`.
-fn edition_of(dir: &std::path::Path) -> String {
-    let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).expect("a rung's Cargo.toml");
-    let line = manifest.lines().find_map(|l| l.trim().strip_prefix("edition")).expect("an edition line");
-    line.trim().trim_start_matches('=').trim().trim_matches('"').to_string()
-}
-
-/// Every WHOLE `front2/x-*` rung's directory name, sorted. A folder still being written (no
-/// `Cargo.toml`, `expected` or `src/main.rs` yet) is not a rung yet: its name goes to standard
-/// error and it is left out.
-fn x_rungs() -> Vec<String> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(ladder().join("front2")).expect("the ladder's front2 directory") {
-        let entry = entry.expect("a directory entry");
-        let name = entry.file_name().into_string().expect("a UTF-8 rung name");
-        let dir = entry.path();
-        if !(name.starts_with("x-") || name.starts_with("x0-")) || !dir.is_dir() {
-            continue;
-        }
-        if ["Cargo.toml", "expected", "src/main.rs"].iter().all(|f| dir.join(f).is_file()) {
-            names.push(name);
-        } else {
-            eprintln!("front2_rungs: {name} is not whole yet (Cargo.toml, expected, src/main.rs): left out");
-        }
-    }
-    names.sort();
-    names
-}
-
-/// The variant's name at the head of a `Debug` rendering: `Lower { .. }` gives `Lower`.
-fn class_of(debug: &str) -> String {
-    debug.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect()
-}
-
-fn first_line(text: &str) -> String {
-    text.lines().next().unwrap_or("").to_string()
-}
-
-fn run_one(rung: &str) -> Verdict {
+/// One rung to its verdict in this process, the toolchain library resolved here (`run_with`):
+/// the word and rest a child prints after `VERDICT `. The rungs' logic is rungs/x.rs's.
+fn verdict_of(rung: &str) -> (&'static str, String) {
     let dir = ladder().join("front2").join(rung);
-    let files = sources(&dir);
-    let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
-    let edition = edition_of(&dir);
-    // A blaze edition builds against the real libraries: the toolchain's shelf.
-    let shelf = edition.starts_with("blaze-").then(|| format!("{}/.blaze/v2/toolchain", std::env::var("HOME").expect("HOME")));
-    let choice = FrontChoice::New(NewFront { package: "ladder", edition: &edition, shelf: shelf.as_deref() });
-    let mut refused = None;
-    let mut panicked = None;
-    let (status, out) = capture(|| {
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_with(&views, "src/main.rs", None, choice)));
-        match ran {
-            Ok(Ok(status)) => status,
-            Ok(Err(error)) => {
-                refused = Some((class_of(&format!("{error:?}")), first_line(&error.to_string())));
-                u8::MAX
-            }
-            Err(payload) => {
-                let said = payload
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "a panic with no message".to_string());
-                panicked = Some(first_line(&said));
-                u8::MAX
-            }
-        }
-    });
-    if let Some((class, first)) = refused {
-        return Verdict::Refused { class, first };
-    }
-    if let Some(first) = panicked {
-        return Verdict::Panicked { first };
-    }
-    if (status, &out) == (expected(&dir).0, &expected(&dir).1) { Verdict::Pass } else { Verdict::Wrong { status, out } }
-}
-
-/// The verdict's word and its rest, one line: what a child prints after `VERDICT `.
-fn verdict_line(rung: &str, verdict: Verdict) -> (&'static str, String) {
-    match verdict {
-        Verdict::Pass => ("PASS", String::new()),
-        Verdict::Refused { class, first } => ("REFUSED", format!("{class}: {first}")),
-        Verdict::Panicked { first } => ("PANICKED", first),
-        Verdict::Wrong { status, out } => {
-            let want = expected(&ladder().join("front2").join(rung));
-            let rest = format!(
-                "got status {status} stdout {:?} want status {} stdout {:?}",
-                String::from_utf8_lossy(&out),
-                want.0,
-                String::from_utf8_lossy(&want.1)
-            );
-            ("WRONG", rest)
-        }
-    }
+    let shelf = x::shelf();
+    let verdict = x::run_one(&dir, Some(shelf.as_str()), |views, new| run_with(views, x::ROOT, None, FrontChoice::New(new)));
+    x::verdict_line(&dir, verdict)
 }
 
 /// Runs `rung` in a child (this binary, `FRONT2_RUNGS_ONE=rung`) with a deadline: the word and
@@ -223,37 +104,36 @@ fn append_out(line: &str) {
 fn every_x_rung_runs_right() {
     // The child's side: one rung, in this process, one verdict line on stdout.
     if let Ok(rung) = std::env::var("FRONT2_RUNGS_ONE") {
-        let (word, rest) = verdict_line(&rung, run_one(&rung));
+        let (word, rest) = verdict_of(&rung);
         println!("VERDICT {word} {rest}");
+        return;
+    }
+    // Not run unless asked: every child here resolves the toolchain library itself, in a debug
+    // build (two runs never printed a table); examples/front2_rungs.rs is the runner.
+    if std::env::var_os("FRONT2_RUNGS").is_none() {
+        eprintln!("front2_rungs: skipped (FRONT2_RUNGS is not set); the runner is the example: mixcheck.sh blaze-ladder run front2_rungs");
         return;
     }
     let secs: u64 = std::env::var("FRONT2_RUNG_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
     let deadline = std::time::Duration::from_secs(secs);
-    let all = x_rungs();
+    let all = x::x_rungs(&ladder().join("front2"));
     if let Some(path) = std::env::var_os("FRONT2_RUNGS_OUT") {
         std::fs::write(&path, format!("FRONT2 X RUNGS: started, {} rungs, {secs} s each at most\n", all.len()))
             .expect("starting FRONT2_RUNGS_OUT");
     }
     let mut wrong = Vec::new();
-    let mut counts: Vec<(String, u32)> = Vec::new();
+    let mut counts = x::Counts::default();
     for rung in &all {
-        // `x0-*` are the runnable twins (no_core, edition 2024, success is status 42);
-        // `x-*` the same checks on the blaze edition over the real `core` (success is 0).
-        let family = if rung.starts_with("x0-") { "twin" } else { "core" };
         let (word, rest) = run_child(rung, deadline);
-        let line = format!("[{family}] {rung}: {word} {rest}").trim_end().to_string();
+        let line = x::table_line(rung, &word, &rest);
         println!("{line}");
         append_out(&line);
         if word == "WRONG" {
             wrong.push(line.clone());
         }
-        match counts.iter_mut().find(|(w, _)| *w == word) {
-            Some((_, n)) => *n += 1,
-            None => counts.push((word, 1)),
-        }
+        counts.add(&word);
     }
-    let summary: Vec<String> = counts.iter().map(|(w, n)| format!("{n} {w}")).collect();
-    let last = format!("FRONT2 X RUNGS: {} rungs: {}", all.len(), summary.join(", "));
+    let last = counts.last_line();
     println!("{last}");
     append_out(&last);
     assert!(wrong.is_empty(), "rungs that ran and gave a wrong answer:\n{}", wrong.join("\n"));

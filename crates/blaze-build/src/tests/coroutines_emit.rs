@@ -309,7 +309,12 @@ fn async_fn(w: &mut World, name: &str, future: &str) -> ItemKey {
     let opaque_t = w.fx.ty(PNode::Opaque(opaque, none));
     let is_future = w.fx.bound(w.future, &[opaque_t]);
     let output_is = w.fx.proj(w.future, &[opaque_t], "Output", u64_);
-    w.fx.set_opaque_bounds(opaque, StdVec::from([is_future, output_is]));
+    // `Sized` too, as the front end files an async fn's opaque (blaze-typeck suite/opaque.rs
+    // `async_world`): a caller's `.await` selects the blanket `impl<F: Future> IntoFuture for
+    // F`, whose `F` is implicitly `Sized`.
+    let sized = w.fx.key_of("Sized");
+    let is_sized = w.fx.bound(sized, &[opaque_t]);
+    w.fx.set_opaque_bounds(opaque, StdVec::from([is_future, output_is, is_sized]));
     let item = w.fx.func(name, 0, &[], opaque_t, StdVec::new());
     w.fns.push((item, opaque));
     item

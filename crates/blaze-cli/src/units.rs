@@ -30,6 +30,11 @@ pub const UNREAD: u16 = 3;
 /// section 4). Its range is the whole line with its newline, which its fix deletes; its one
 /// argument is the name.
 pub const TOOLCHAIN_NAMED: u16 = 9;
+/// The finding number of a member's integration test, example or bench the layout refused
+/// (blaze-manifest `Member::refused_targets`): on its table's line, the target left out and the
+/// rest of the workspace checked. Its arguments: the kind's table name (`test`, `example`,
+/// `bench`), the target's name, the package's name and the rule that refused it.
+pub const TARGET_REFUSED: u16 = 15;
 /// The workspace's lock, at its root.
 const LOCK: &str = "Cargo.lock";
 
@@ -252,17 +257,32 @@ fn member_source(made: &Made<'_>) -> ContentId {
 fn member_units<'f>(name: Name, member: &layout::Member<'_>, text: &str, toolchain: blaze_toolchain::ToolchainId, frame: &'f Frame) -> Made<'f> {
     let mut made = Made::new_in(name, frame);
     let edition = syntax_of(member.edition.syntax).byte();
-    for target in member.lib.iter().chain(member.bins.iter()) {
-        let file = Name::file(target.root.as_bytes());
+    // Every crate root the graph makes a unit of is a part: the library, the binaries, and the
+    // integration tests, examples and benches the layout read (`extras`: a unit whose root no
+    // units record lists is `DriveError::NoPart` at its first want).
+    let roots = member.lib.iter().chain(member.bins.iter()).map(|target| &target.root).chain(member.extras.iter().map(|extra| &extra.root));
+    for root in roots {
+        let file = Name::file(root.as_bytes());
         if made.parts.iter().any(|part| part.name == file) {
             continue;
         }
         made.parts.push(Part { name: file, locate: Locate::File { edition }, place: 0 });
-        made.path(file, target.root.as_bytes(), false);
+        made.path(file, root.as_bytes(), false);
     }
     made.parts.sort_unstable_by_key(|part| part.name);
     if member.lib.is_none() && member.bins.is_empty() {
         made.find(UNREAD, (member.span.start, member.span.end), &["the package has no library and no binary"]);
+    }
+    // Each test, example or bench target the layout refused is a finding on its table's line
+    // (rule 3: left out, never quietly): it is in no unit, and the member's other targets and
+    // every other member are read as before. The layout keeps them in manifest-byte order.
+    for refused in member.refused_targets.iter() {
+        let why = bstd::mem::format_in!(frame, "{}", refused.why);
+        made.find(
+            TARGET_REFUSED,
+            (refused.at.start, refused.at.end),
+            &[refused.kind.table(), "\x1f", refused.target.as_str(), "\x1f", member.name.as_str(), "\x1f", why.as_str()],
+        );
     }
     for dep in member.dependencies.iter() {
         if let Source::Member(_) = dep.source {
@@ -277,7 +297,9 @@ fn member_units<'f>(name: Name, member: &layout::Member<'_>, text: &str, toolcha
     // this record's output and in no other key (toolchain.md, section 1).
     let mut out = blaze_ids::Hasher::new(UNITS_OUT_DOMAIN);
     out.update(&parts_out(&made.parts).0).update(&toolchain.0);
-    let kinds = member.lib.iter().map(|lib| if lib.proc_macro { UnitKind::ProcMacro } else { UnitKind::Lib }).chain(member.bins.iter().map(|_| UnitKind::Lib));
+    // A binary, an integration test, an example and a bench are given what a library is.
+    let like_lib = member.bins.len() + member.extras.len();
+    let kinds = member.lib.iter().map(|lib| if lib.proc_macro { UnitKind::ProcMacro } else { UnitKind::Lib }).chain((0..like_lib).map(|_| UnitKind::Lib));
     for kind in kinds {
         let given = implicit(member.edition, &kind);
         let std = match given.std {

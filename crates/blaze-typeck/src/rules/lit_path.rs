@@ -503,6 +503,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(t)
     }
 
+    /// Records the generic arguments a constant's value path is read at (`Checked::const_args`),
+    /// so the builder evaluates the constant at the instance's arguments (the Reference,
+    /// "Associated Items", "Associated Constants": "An associated constant definition defines a
+    /// constant associated with a type": `<T as Tr>::C` at `T = u8` is `u8`'s impl's value, or the
+    /// trait's default where that impl writes none). A constant with no generics (a free `const`
+    /// item) has no row. A pattern's constant has none either: the builder asks it with no
+    /// arguments and a generic one stays refused there by name (front2 `TraitConstNoSelf`).
+    fn record_const_args(&mut self, at: At, args: TyList) {
+        if let At::Expr(e) = at {
+            if self.ty.list_len(args) != 0 {
+                self.const_args.push((e, args));
+            }
+        }
+    }
+
     fn value_def_ty(&mut self, at: At, cause: Cause, def: Def, segs: &[Segment]) -> Result<Ty, Stop> {
         let last = segs.last().copied();
         let name = last.map(|s| s.name);
@@ -525,6 +540,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 };
                 let args = self.fresh_generic_args(k, 0, sig.parent_count + sig.own_count)?;
                 self.register_predicates(k, args, cause)?;
+                if let Def::Const(_) = def {
+                    self.record_const_args(at, args);
+                }
                 self.lower(sig.types, sig.output, Lower::Args(args), cause)
             }
             Def::Ctor { adt, variant, kind } => {
@@ -762,6 +780,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             AssocKind::Const => {
                 self.register_predicates(item, parent_args, cause)?;
                 self.defs.push((at, Def::Const(item)));
+                self.record_const_args(at, parent_args);
                 self.lower(sig.types, sig.output, Lower::Args(parent_args), cause)
             }
             AssocKind::Type => {

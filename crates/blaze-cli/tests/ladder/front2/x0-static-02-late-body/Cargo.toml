@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-static-02-late-body"
+version = "0.1.0"
+edition = "2024"

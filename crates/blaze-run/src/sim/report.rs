@@ -157,7 +157,7 @@ fn a_mebibyte_of_output_is_capped_with_the_cut_line() {
     assert!(json.starts_with("{\"event\":\"failed\",\"test\":\"c9"), "{}", &json[..80]);
     assert!(json.contains(
         ",\"path\":\"m::b\",\"micros\":12000,\"ended\":\"panicked\",\"message\":\"boom\",\"at\":\"src/lib.rs:3:5\",\
-         \"signal\":null,\"after_ns\":null,\"refused\":null,\"what\":null,\"output_bytes\":1048576,\
+         \"signal\":null,\"exit_code\":null,\"after_ns\":null,\"refused\":null,\"what\":null,\"output_bytes\":1048576,\
          \"output_cut\":1032192,\"output\":\"xxx"
     ));
     assert!(json.ends_with("x\\n\"}\n"));

@@ -284,6 +284,7 @@ fn one_lifetime_moves_the_digest() {
 /// standard error. Items the store refuses are not this test's subject (front2_rungs.rs
 /// reports them): they are counted on standard error; a head refused by the RECORD fails.
 #[test]
+#[ignore = "a measurer's run, not a check: it solves std once per rung (83 rungs) and outlasts lanecheck's 900 s in a debug build; run it with --ignored"]
 fn every_head_of_the_rungs_round_trips_equal() {
     let dir = rungs::ladder().join("front2");
     let mut rung_names: Vec<String> = std::fs::read_dir(&dir)

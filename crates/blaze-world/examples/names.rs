@@ -706,7 +706,13 @@ impl blaze_scope::CellsSeam for PrintShadows {
         for d in s.written_first.iter() {
             eprintln!("cells seam: {krate}: written {:?} {:x} {:?} `{}`: old {:?}, cells {:?}", d.which, d.module, d.ns, d.name, d.old, d.cells);
         }
-        eprintln!("cells seam: {krate}: unknown by class: imports {:?} calls {:?}", s.unknown_imports, s.unknown_calls);
+        for l in s.lost_first.iter() {
+            eprintln!("cells seam: {krate}: lost call {:?} {:?} -> {:?} in {:x} (call {:x})", l.kind, &l.segments[..], l.outcome, l.module, l.call);
+        }
+        eprintln!(
+            "cells seam: {krate}: unknown by class: imports {:?} calls {:?}; lost calls {}; exports published later {}",
+            s.unknown_imports, s.unknown_calls, s.lost, s.written.exports_published_later
+        );
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         eprintln!(
             "cells seam: {krate}: old fill {:.2} ms, cells load {:.2} ms + solve {:.2} ms; bindings equal {}, differ {}, cells unknown {}; \
@@ -1082,6 +1088,20 @@ impl SourceTexts<'static> for Timed<'_> {
 fn proc_clock() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// Each crate's proc-macro results written as its one table (the rows this run ran), then the
+/// proc macros' own rows (blaze-proc-macro's parts): the sums since the start.
+fn print_procs(t: usize, p: &Procs) {
+    let keep_start = Instant::now();
+    match p.procs.keep_all() {
+        Ok(kept) => println!("threads {t}: proc results kept: {} tables, {} rows, {} bytes in {:.1} ms", kept.tables, kept.rows, kept.bytes, keep_start.elapsed().as_secs_f64() * 1e3),
+        Err(e) => println!("threads {t}: proc results NOT kept: {e}"),
+    }
+    for row in p.procs.parts().rows() {
+        let each = if row.entered == 0 { 0.0 } else { row.nanos as f64 / 1e3 / row.entered as f64 };
+        println!("threads {t}: proc part {:<12} {:>9.1} ms  entered {:>8} ({each:>8.2} us each)", row.part.name(), row.nanos as f64 / 1e6, row.entered);
+    }
 }
 
 /// The hook over the module store `store`, writing compiled modules and records under `out`:
@@ -1766,6 +1786,9 @@ fn main() {
                 );
             }
             parts::print(t);
+            if let Some(p) = procs {
+                print_procs(t, p);
+            }
             stages::print(t);
             let mut slowest: Vec<(u64, usize)> =
                 solved.iter().map(|&i| (clock.spans[i].1.load(Ordering::Relaxed).saturating_sub(clock.spans[i].0.load(Ordering::Relaxed)), i)).collect();
@@ -1850,12 +1873,7 @@ fn main() {
             }
         };
         if let Some(p) = procs {
-            // Each crate's proc-macro results written as its one table (the rows this run ran).
-            let keep_start = Instant::now();
-            match p.procs.keep_all() {
-                Ok(kept) => println!("threads {t}: proc results kept: {} tables, {} rows, {} bytes in {:.1} ms", kept.tables, kept.rows, kept.bytes, ms(keep_start.elapsed())),
-                Err(e) => println!("threads {t}: proc results NOT kept: {e}"),
-            }
+            print_procs(t, p);
             let findings = p.procs.take_findings();
             let mut by_kind: BTreeMap<String, (usize, String)> = BTreeMap::new();
             for f in &findings {
@@ -1865,11 +1883,6 @@ fn main() {
             println!("proc findings {} in all", findings.len());
             for (kind, (n, first)) in &by_kind {
                 println!("  {n:>6}  {kind}: e.g. {}", first.chars().take(200).collect::<String>());
-            }
-            // The proc macros' own rows (blaze-proc-macro's parts): the sums since the start.
-            for row in p.procs.parts().rows() {
-                let each = if row.entered == 0 { 0.0 } else { row.nanos as f64 / 1e3 / row.entered as f64 };
-                println!("threads {t}: proc part {:<12} {:>9.1} ms  entered {:>8} ({each:>8.2} us each)", row.part.name(), row.nanos as f64 / 1e6, row.entered);
             }
         }
         {

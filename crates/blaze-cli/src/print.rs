@@ -408,6 +408,7 @@ mod tests {
             (Area::Cli, crate::work::SYNTAX),
             (Area::Cli, crate::units::UNREAD),
             (Area::Cli, crate::units::TOOLCHAIN_NAMED),
+            (Area::Cli, crate::units::TARGET_REFUSED),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Cli, crate::names::UNRESOLVED),
             (Area::Drive, OVER_CAP_RULE),

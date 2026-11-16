@@ -133,7 +133,13 @@ fn objects_world(fns: &[(&str, fn(&mut Fx, &Objs) -> PTy, fn(&mut Fx, &Objs) -> 
     fx.unsized_param(cu, 1);
     let ex = |fx: &mut Fx, k| fx.ty(PNode::ExTrait(k, List::EMPTY));
     let (ex_tr, ex_sub, ex_send) = (ex(&mut fx, tr), ex(&mut fx, sub), fx.ty(PNode::ExAuto(send)));
+    // `fn mk_opq() -> impl Tr`: the opaque with the bounds `Tr` and `Sized`, as a caller sees it.
+    let opq_k = fx.opaque_key("mk_opq::{opaque#0}");
+    let opq = fx.ty(PNode::Opaque(opq_k, List::EMPTY));
+    let (opq_tr, opq_sized) = (fx.bound(tr, &[opq]), fx.bound(sized, &[opq]));
+    fx.set_opaque_bounds(opq_k, std::vec![opq_tr, opq_sized]);
     let o = Objs {
+        opq,
         foo,
         box_k,
         dyn_tr: fx.t.dynamic(&[ex_tr]).expect("dyn"),
@@ -150,6 +156,8 @@ fn objects_world(fns: &[(&str, fn(&mut Fx, &Objs) -> PTy, fn(&mut Fx, &Objs) -> 
 
 /// The types the cases' signatures are made of.
 struct Objs {
+    /// A return-position `impl Tr` of another fn (bounds `Tr`, `Sized`).
+    opq: PTy,
     foo: PTy,
     box_k: ItemKey,
     dyn_tr: PTy,
@@ -263,6 +271,28 @@ fn coercion_differences(plant: Plant) -> Vec<String> {
 fn unsized_coercions_to_and_between_objects() {
     let got = coercion_differences(Plant::None);
     assert!(got.is_empty(), "\n{}", got.join("\n"));
+}
+
+/// The Reference, "Unsized Coercions": "`T` to `dyn U`, when `T` implements `U + Sized`, and `U`
+/// is dyn compatible"; "Impl trait", "Abstract return types": "the caller can only use the
+/// methods declared by the trait bound": so a caller knows `impl Tr: Tr` (and `Sized`) from the
+/// opaque's bounds, and `fn d_opq(x: &mut impl-Tr-of-mk_opq) -> &mut dyn Tr { x }` coerces:
+/// no E0308, the last adjustment an unsize to `&mut dyn Tr`. The reduction of std's
+/// `default_hook` (`if let Some(mut out) = panic_output() { write(&mut out) }`, `panic_output()
+/// -> Option<impl io::Write>`, `write: |&mut dyn io::Write|`), which the real front end refused
+/// as "E0308 .. found &mut Opaque(..), expected &mut Dynamic(..)" (ladder_front2, 14:52).
+/// Should print: "test suite::dyn_objects::a_reference_to_an_opaque_unsizes_to_its_bounds_object ... ok".
+#[test]
+fn a_reference_to_an_opaque_unsizes_to_its_bounds_object() {
+    let fx = objects_world(&[("d_opq", |fx, o| fx.r(Mutbl::Mut, o.opq), |fx, o| fx.r(Mutbl::Mut, o.dyn_tr))]);
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let e0 = b.local(x);
+    let root = b.block(&[], Some(e0));
+    let c = check_body(&fx, &b, fx.key_of("d_opq"), root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "{:?}", c.diags);
+    let got = adjusts(&fx, &c, ExprId(0));
+    assert!(got.ends_with("unsize -> &mut dyn Tr"), "adjustments `{got}`");
 }
 
 /// The planted bug: the coercion does not ask the solver, so it invents `+ Send`.

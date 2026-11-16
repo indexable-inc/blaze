@@ -76,7 +76,74 @@ fn op_lang(op: BinOp, assign: bool) -> Option<LangItem> {
     })
 }
 
+/// The trait method an overloaded binary operator or compound assignment calls. The Reference,
+/// "Operator expressions": "Arithmetic and Logical Binary Operators" (the table's "Trait"
+/// column: `+` is `std::ops::Add`, .., `>>` is `std::ops::Shr`), "Comparison Operators"
+/// ([expr.cmp.behavior]: `==` is `std::cmp::PartialEq::eq`, `!=` is `std::cmp::PartialEq::ne`,
+/// `>` is `std::cmp::PartialOrd::gt`, `<` `lt`, `>=` `ge`, `<=` `le`) and "Compound assignment
+/// expressions" (`+=` is `AddAssign::add_assign`, ..). `&&` and `||` are no trait's.
+fn binop_method(op: BinOp, assign: bool) -> Option<&'static str> {
+    Some(match (op, assign) {
+        (BinOp::Add, false) => "add",
+        (BinOp::Sub, false) => "sub",
+        (BinOp::Mul, false) => "mul",
+        (BinOp::Div, false) => "div",
+        (BinOp::Rem, false) => "rem",
+        (BinOp::BitAnd, false) => "bitand",
+        (BinOp::BitOr, false) => "bitor",
+        (BinOp::BitXor, false) => "bitxor",
+        (BinOp::Shl, false) => "shl",
+        (BinOp::Shr, false) => "shr",
+        (BinOp::Add, true) => "add_assign",
+        (BinOp::Sub, true) => "sub_assign",
+        (BinOp::Mul, true) => "mul_assign",
+        (BinOp::Div, true) => "div_assign",
+        (BinOp::Rem, true) => "rem_assign",
+        (BinOp::BitAnd, true) => "bitand_assign",
+        (BinOp::BitOr, true) => "bitor_assign",
+        (BinOp::BitXor, true) => "bitxor_assign",
+        (BinOp::Shl, true) => "shl_assign",
+        (BinOp::Shr, true) => "shr_assign",
+        (BinOp::Eq, _) => "eq",
+        (BinOp::Ne, _) => "ne",
+        (BinOp::Lt, _) => "lt",
+        (BinOp::Le, _) => "le",
+        (BinOp::Gt, _) => "gt",
+        (BinOp::Ge, _) => "ge",
+        (BinOp::And | BinOp::Or, _) => return None,
+    })
+}
+
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
+    /// Whether callee row `(e, _, args)` is an operator's whose FINAL operand types are that
+    /// operator's builtin scalar types: then the operator is the builtin one and the row is
+    /// dropped (rustc's writeback `fix_scalar_builtin_expr`: an operand that was a variable
+    /// when the operator was checked, `let x = Default::default(); x + 1u32`, is known here).
+    /// A row left in `Checked::callees` on an operator expression therefore says: this
+    /// operator is a call of the trait's method at these arguments, and the absence of one
+    /// says: builtin, on builtin scalar types. One home for the decision (rule 30): the build
+    /// reads it and never decides from how a value is held.
+    pub(crate) fn operator_settled_builtin(&mut self, e: ExprId, args: crate::ty::TyList) -> Result<bool, crate::error::CheckError> {
+        let n = self.ty.list_len(args);
+        match self.body.expr(e)? {
+            Expr::Binary { op, .. } | Expr::AssignOp { op, .. } if n == 2 => {
+                let lhs = self.ty.list_get(args, 0);
+                let lhs = self.ty.resolve(lhs)?;
+                let rhs = self.ty.list_get(args, 1);
+                let rhs = self.ty.resolve(rhs)?;
+                Ok(self.is_builtin_binop(lhs, rhs, op))
+            }
+            Expr::Unary { op: op @ (UnOp::Neg | UnOp::Not), .. } if n == 1 => {
+                let t = self.ty.list_get(args, 0);
+                let t = self.ty.resolve(t)?;
+                Ok(self.is_err(t)
+                    || self.is_integral(t)
+                    || if op == UnOp::Not { self.is_bool(t) } else { self.is_float(t) })
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn is_integral(&mut self, t: Ty) -> bool {
         matches!(self.view(t), TyView::Int(_) | TyView::Uint(_) | TyView::Infer(Var { kind: VarKind::Int, .. }))
     }
@@ -224,6 +291,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(Flow::Done(builtin));
                 }
                 if f.b == 1 {
+                    // The operator is the trait's method at `[lhs, rhs]` (the row
+                    // `operator_settled_builtin` drops when the final types are builtin).
+                    if let Some(item) = op_lang(op, assign)
+                        && let Some(tr) = self.lang(item)?
+                        && let Some(name) = binop_method(op, assign)
+                        && let Some(m) = self.reads.assoc_item(tr, Name::of(name))?
+                    {
+                        let args = self.mk_list(&[f.t, f.u])?;
+                        self.callees.push((e, m.item, args));
+                    }
                     return Ok(Flow::Done(out));
                 }
                 if f.b == 2
@@ -287,6 +364,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
                     self.register_trait(tr, args, Cause::Expr(e))?;
                     let out = self.project(tr, args, Name::of("Output"), Cause::Expr(e))?;
+                    // The operator is the trait's method at `[operand]` (`binop`'s row).
+                    let name = if op == UnOp::Not { "not" } else { "neg" };
+                    if let Some(m) = self.reads.assoc_item(tr, Name::of(name))? {
+                        self.callees.push((e, m.item, args));
+                    }
                     return Ok(Flow::Done(out));
                 }
                 self.diag(DiagCode::UnOp, At::Expr(e), None, Some(t), None);

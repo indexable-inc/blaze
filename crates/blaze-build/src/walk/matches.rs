@@ -39,6 +39,7 @@ use blaze_lir::{Block, Flags, IntCond, Op, Ty, Value};
 use blaze_own::Vec;
 use blaze_typeck::{Def, ExprId, List, Lit, Mutbl, Name, PNode, PTy, Pat, PatId};
 
+mod alts;
 mod forms;
 
 use super::{Home, MatchState, Owner, PTR_BITS, Repr, Shape, Task, V, Walk, malformed, mask, unsupported};
@@ -71,6 +72,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut variants = false;
         for arm in list {
             if !self.flat(arm.pat)? {
+                return Ok(false);
+            }
+            // A guard runs once per alternative that matches (matches/alts.rs; two
+            // alternatives may be one value: `1 | 1 if g`): by tests, one chain each.
+            let by_tests = arm.guard.is_some() && matches!(self.pat(arm.pat)?, Pat::Or { .. });
+            #[cfg(test)]
+            let by_tests = by_tests && self.adts.planted() != crate::Planted::GuardToNextArm;
+            if by_tests {
                 return Ok(false);
             }
             variants |= matches!(self.pat(arm.pat)?, Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Path(_) | Pat::Or { .. });
@@ -229,7 +238,17 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn arm_tested(&mut self, m: u32, i: u32, arm: blaze_typeck::Arm, at: At, block: Block, next: Block) -> Result<(), BuildError> {
         self.begin(block);
         let pass = self.create();
-        self.test_pat(arm.pat, at, pass, next)?;
+        // matches/alts.rs: a guard runs once per alternative that matches, so a guarded arm
+        // with or-patterns is one chain of tests per expansion.
+        let expand = arm.guard.is_some() && self.has_or(arm.pat)?;
+        #[cfg(test)]
+        let expand = expand && self.adts.planted() != crate::Planted::GuardToNextArm;
+        let expanded = if expand {
+            Some(self.test_alts(arm.pat, at, pass, next)?)
+        } else {
+            self.test_pat(arm.pat, at, pass, next)?;
+            None
+        };
         self.begin(pass);
         self.scope_marks.push(self.scope_pats.len() as u32);
         // walk/moves.rs: a by-value binding of a part that needs drop moves it out.
@@ -241,7 +260,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.work.push(Task::ScopeEnd(arm.body));
         self.work.push(Task::Eval(arm.body));
         if let Some(g) = arm.guard {
-            self.work.push(Task::Guard { m, i });
+            self.work.push(match expanded {
+                Some((word, chains, n)) => Task::GuardAlts { word, chains, n },
+                None => Task::Guard { m, i },
+            });
             self.work.push(Task::Eval(g));
         }
         Ok(())
@@ -254,6 +276,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// of an or-pattern whose alternatives bind are stored here, on the matching
     /// alternative's pass; `bind_tested` stores the rest.
     pub(super) fn test_pat(&mut self, root: PatId, at: At, ok: Block, fail: Block) -> Result<(), BuildError> {
+        self.test_pat_chosen(root, at, ok, fail, None)
+    }
+
+    /// `test_pat`; with `choice` (one expansion of a guarded arm: matches/alts.rs), each
+    /// or-pattern tests only the alternative `choice` takes for it, so the chain is the tests
+    /// of ONE or-free pattern.
+    fn test_pat_chosen(&mut self, root: PatId, at: At, ok: Block, fail: Block, choice: Option<&[alts::Choice]>) -> Result<(), BuildError> {
         let mut todo: Vec<Test, A> = Vec::new_in(self.alloc.clone());
         let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
         // Each name's first binding in `root`, filled at the first or-pattern that binds.
@@ -361,10 +390,21 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     if binds && alias.is_empty() {
                         self.first_binds(root, &mut alias)?;
                     }
+                    // One expansion of a guarded arm: only the alternative it takes here.
+                    let only = match choice {
+                        Some(c) => {
+                            let &(_, j, _) = c.iter().find(|&&(q, ..)| q == p).ok_or(malformed("an or-pattern its arm's expansion did not choose for"))?;
+                            Some(j as usize)
+                        }
+                        None => None,
+                    };
                     let mut from = self.create();
                     self.jump(from, &[]);
                     for (j, &alt) in list.iter().enumerate() {
-                        let otherwise = if j + 1 == list.len() { fail } else { self.create() };
+                        if only.is_some_and(|taken| taken != j) {
+                            continue;
+                        }
+                        let otherwise = if only.is_some() || j + 1 == list.len() { fail } else { self.create() };
                         let pass = if binds {
                             let bind = self.create();
                             self.begin(bind);

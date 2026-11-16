@@ -59,6 +59,12 @@ use crate::{
     tag,
 };
 
+pub mod grow;
+pub mod table;
+
+pub use grow::{Abandoned, abandoned_on_thread};
+pub use table::{FrameTable, TableRefused};
+
 /// The most one frame holds unless made with [`Frame::with_reserve`]: what one task may take.
 #[cfg(target_pointer_width = "64")]
 pub const FRAME_RESERVE: usize = 4 << 30;
@@ -159,6 +165,10 @@ pub struct Frame {
     /// Blocks `grow` moved since the last reset, and the bytes it copied moving them.
     copies: Cell<u64>,
     copied: Cell<u64>,
+    /// Blocks `grow` or `shrink` moved since the last reset, and the bytes they left behind
+    /// in the bump ([`grow::Abandoned`]).
+    abandons: Cell<u64>,
+    abandoned: Cell<u64>,
     first: Cell<*mut Block>,
     current: Cell<*mut Block>,
     /// Bytes of the blocks it holds: whole chunks, spans' committed pages.
@@ -232,6 +242,8 @@ impl Frame {
             peak: Cell::new(0),
             copies: Cell::new(0),
             copied: Cell::new(0),
+            abandons: Cell::new(0),
+            abandoned: Cell::new(0),
             first: Cell::new(ptr::null_mut()),
             current: Cell::new(ptr::null_mut()),
             held: Cell::new(0),
@@ -757,10 +769,13 @@ impl Frame {
     /// tag ([`tag::task_ended`]).
     pub fn reset(&mut self) {
         tag::task_ended(self.tag.get(), self.peak(), self.copied());
+        grow::report(self.abandoned());
         self.rewind();
         self.peak.set(0);
         self.copies.set(0);
         self.copied.set(0);
+        self.abandons.set(0);
+        self.abandoned.set(0);
     }
 
     /// Runs `f` with this frame and frees what it allocated once it returns. What `f` returns
@@ -822,7 +837,10 @@ impl Frame {
     /// Grows the top allocation, ending at the cursor, to end at `end`, in place: within the
     /// bump's end, or in the current span by committing more. Whether it could.
     fn grow_top(&self, end: usize) -> Result<bool, MemError> {
-        if end > self.end.get() {
+        // The block's end is exact: past the bump's end (a chunk's end, a span's committed end,
+        // the limit's) the block grows only by committing its span further, else it moves.
+        // `grow::ignores_end` is a test's planted bug, false in every other build.
+        if end > self.end.get() && !grow::ignores_end() {
             let current = self.current.get();
             if current.is_null() || header(current).span.is_none() || end > header(current).end {
                 return Ok(false);
@@ -932,6 +950,8 @@ unsafe impl Allocator for Frame {
         unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), old.size()) };
         self.copies.set(self.copies.get() + 1);
         self.copied.set(self.copied.get() + old.size() as u64);
+        // The old block stays taken until a reset: counted, so a profile shows it.
+        self.left_behind(old.size());
         Ok(NonNull::slice_from_raw_parts(to, new.size()))
     }
 
@@ -962,6 +982,7 @@ unsafe impl Allocator for Frame {
             let to = self.try_alloc_layout(new).map_err(|_| AllocError)?;
             // SAFETY: `ptr` is a live block of at least `new.size()` bytes and `to` a fresh one.
             unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), new.size()) };
+            self.left_behind(old.size());
             return Ok(NonNull::slice_from_raw_parts(to, new.size()));
         }
         if self.is_top(ptr, old.size()) {
@@ -1370,6 +1391,7 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
             let held = self.below + self.frame.peak() + grew;
             end_task(&self.frame, self.outer, self.outer_below, held);
             tag::task_ended(self.frame.tag(), self.frame.peak(), self.frame.copied());
+            grow::report(self.frame.abandoned());
             // Dropping the frame, after this, gives its blocks to the thread's shelves.
         }
     }

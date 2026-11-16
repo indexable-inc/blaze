@@ -56,6 +56,18 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             // so a value of the same name outside the block is still found first.
             found = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|r| r.kind.in_block_module());
         }
+        // A glob import of a block around the path (`use E::*;`) gives its first segment
+        // before the items of the blocks outside that block and the module do
+        // (super::glob_uses, where the rules are quoted): the path then stands for `<the
+        // glob's path>::<the name>..`, read where the glob's path is.
+        let glob_ns = if ns == LocalNs::Value { Ns::Value } else { Ns::Type };
+        let via_glob = match super::glob_uses::before(&self.store.locals, &self.resolver(), self.module, self.owner, scope.0, first, glob_ns, found.as_ref(), blaze_own::Alloc::global()) {
+            Ok(hit) => hit,
+            Err(gap) => return self.gap(Gap::Local(gap)),
+        };
+        if via_glob.is_some() {
+            found = None;
+        }
         if let Some(row) = found {
             let k = checker_of(row.key);
             let def = match row.kind {
@@ -95,8 +107,19 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         // Whether the path is read at the body's module exactly as written (no item of a
         // block, no local `use`, no `$crate`): the one case the body's conversion expands an
         // alias in ([`AliasPaths::expand`], which asks the same way).
-        let plain = via_use.is_none() && local_type.is_none() && !written.iter().any(|t| *t == "$crate");
+        let plain = via_use.is_none() && via_glob.is_none() && local_type.is_none() && !written.iter().any(|t| *t == "$crate");
         let mut shift = 0u32;
+        if let Some(hit) = &via_glob {
+            let mut through = Vec::with_capacity_in(hit.path.len() + written.len() + 1, Global);
+            if hit.abs {
+                through.push("{{root}}");
+            }
+            through.extend(hit.path.iter().copied());
+            through.extend(written[1..].iter().copied());
+            shift = (through.len() - written.len()) as u32;
+            written = through;
+            at_module = hit.at;
+        }
         if let Some(row) = via_use {
             let mut through = Vec::with_capacity_in(row.path.len() + written.len(), Global);
             if row.abs {
@@ -303,6 +326,12 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
                 found = self.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|row| row.kind.in_block_module());
             }
             if found.is_some() {
+                return Ok(None);
+            }
+            // A first segment a block's glob import gives is not the module's reading either
+            // (a refusal there is the world's gap, when it reads the same path).
+            let glob_ns = if ns == LocalNs::Value { Ns::Value } else { Ns::Type };
+            if !matches!(super::glob_uses::before(self.locals, &self.builder.resolver, self.env.module, self.owner, scope.0, first, glob_ns, None, blaze_own::Alloc::global()), Ok(None)) {
                 return Ok(None);
             }
         }

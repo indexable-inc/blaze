@@ -726,7 +726,9 @@ impl<'b> View<'b> {
     /// The identifier patterns' read list: each name asked of the world and its answer
     /// ([`crate::value_reads_hold`] asks them again).
     pub fn value_reads(&self) -> impl Iterator<Item = Result<(NameIdx, crate::ValueName), BadRow>> + 'b {
-        self.value_reads.iter().map(|n| match crate::ValueName::of_code(n.tag) {
+        // A row flagged `block_uses::BY_USES` is a question asked through a block's `use`s,
+        // not the module's answer: `block_uses::reads_hold` reads those.
+        self.value_reads.iter().filter(|n| n.flags & crate::block_uses::BY_USES == 0).map(|n| match crate::ValueName::of_code(n.tag) {
             Some(answer) => Ok((NameIdx(n.a), answer)),
             None => Err(BadRow { column: "value_reads", tag: n.tag }),
         })

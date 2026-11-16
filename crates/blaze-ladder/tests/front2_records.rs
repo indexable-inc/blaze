@@ -83,7 +83,7 @@ use std::time::Instant;
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::body::lower_fn;
-use blaze_ladder::front2::buckets::{Buckets, inherent_home, trait_home};
+use blaze_ladder::front2::buckets::{Ask, Buckets, Home, UNFILED_LIST, inherent_home, trait_home};
 use blaze_ladder::front2::check::{self, BuildOrder, CheckFail, check_body};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::Store;
@@ -244,9 +244,11 @@ fn impl_answers<'n, S: NamesSource<'n>>(names: S, sized: Option<ItemKey>, frame:
     let trait_ = checker_of(clone.key);
     let home = trait_home(names, &keys, &store, trait_, Shape::Bool);
     b.admit(names, home);
+    b.admit_asked(names, &keys, home, Ask::Trait(trait_, Shape::Bool));
     let of_trait = b.trait_candidates(trait_, Shape::Bool, home);
     let inherent = inherent_home(names, &keys, Shape::Bool);
     b.admit(names, inherent);
+    b.admit_asked(names, &keys, inherent, Ask::Inherent(Shape::Bool));
     let of_bool = b.inherent_candidates(Shape::Bool, inherent);
     (format!("bool: Clone in {home:?}: {of_trait:?}\nimpl bool in {inherent:?}: {of_bool:?}\n"), of_trait.len())
 }
@@ -340,7 +342,9 @@ fn records_answer_what_the_solved_names_answer() {
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), no_items };
         for c in names.crates().iter() {
             kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-            kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+            // The bucket index resolved by the whole graph's names (`encode_with`): every impl
+            // header's paths are walked to their end, as the reader's names would walk them.
+            kept.items.push(aligned(&items_record::encode_with(c, names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
             kept.files.push(c.files.iter().map(|f| (f.path.to_string(), leak(f.text))).collect());
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         }
@@ -491,15 +495,33 @@ fn records_answer_what_the_solved_names_answer() {
     // files, before `impl_answers` asks it again (nothing more is opened for a crate filed)
     // and then asks the inherent question, whose home is every crate that may write an
     // incoherent impl.
-    let (alone_opened, alone_rows, alone_text) = {
+    let before_alone = asked.opened();
+    let (alone_opened, alone_rows, alone_text, alone_index, alone_asked, alone_reads, alone_home, clone_lib, alone_candidates) = {
         let mut alone_keys = Keys::new();
         let alone_store = Store::new(asked_front.index.lang("sized"), asked_frame);
         let clone = Paths { names: asked }.path(root, false, &["Clone"], Ns::Type).unwrap_or_else(|e| panic!("`Clone` from the program's root over records: {e}"));
         alone_keys.item(clone.key).unwrap_or_else(|e| panic!("filing `Clone`: {e}"));
         let home = trait_home(asked, &alone_keys, &alone_store, checker_of(clone.key), Shape::Bool);
         asked_lazy.admit(asked, home);
-        (asked.opened(), asked_lazy.filed_from_rows, asked_lazy.filed_from_text)
+        asked_lazy.admit_asked(asked, &alone_keys, home, Ask::Trait(checker_of(clone.key), Shape::Bool));
+        let candidates = asked_lazy.trait_candidates(checker_of(clone.key), Shape::Bool, home);
+        (
+            asked.opened(),
+            asked_lazy.filed_from_rows,
+            asked_lazy.filed_from_text,
+            asked_lazy.filed_from_index(),
+            asked_lazy.crates_asked(),
+            asked_lazy.trait_reads(checker_of(clone.key), Shape::Bool).to_vec(),
+            home,
+            clone.key,
+            candidates,
+        )
     };
+    // `Clone` has no parameter but `Self` and `bool` is no crate's local type: the orphan rules
+    // leave the trait's own crate (module docs of this section's asserts, below).
+    assert_eq!(alone_home.all, Home::In(core, None), "the home of `bool: Clone` is core alone");
+    assert_eq!(alone_asked, 1, "`bool: Clone` asked {alone_asked} crates by bucket; its home is core alone");
+    assert!(alone_index > 0, "`impl Clone for bool` was not filed from core's bucket index");
     let (asked_impls, _) = impl_answers(asked, asked_front.index.lang("sized"), asked_frame, root, &mut asked_lazy);
     assert_eq!(asked_impls, solved_impls, "the impl index over a fresh reader");
     let errors: Vec<String> = asked.errors().iter().map(|e| e.to_string()).collect();
@@ -516,7 +538,27 @@ fn records_answer_what_the_solved_names_answer() {
     assert_eq!(by_text_impls, solved_impls, "the impl index over a fresh reader, every impl filed from text");
     let by_text_opened = by_text.opened();
     assert_eq!(by_text_lazy.filed_from_rows, 0, "with the rows off no impl is filed from a row");
-    assert!(asked_lazy.filed_from_rows > 0, "no impl was filed from a row");
+    assert!(asked_lazy.filed_from_index() > 0, "no impl was filed from a bucket of an items record");
+    assert_eq!(by_text_lazy.filed_from_index(), 0, "with the rows off no impl is filed from a bucket");
+
+    // PLANTED BUG for the bucket index: the bucket row of one candidate of `bool: Clone` (an
+    // impl core's index files under (`Clone`, `bool`)) is withheld; over a new index on the
+    // same reader the question's candidates must lose exactly that impl.
+    let bool_key = blaze_scope::builtin_type("bool").expect("`bool` is a builtin type").key;
+    let clone_bool = blaze_scope::items_record::buckets::BucketKey::of_trait(clone_lib, blaze_scope::items_record::buckets::Head::Named(bool_key));
+    let mut in_bucket: Vec<ItemKey> = Vec::new();
+    asked.bucket(core, &clone_bool, &mut |it| in_bucket.push(it.key)).unwrap_or_else(|| panic!("core's record answers no bucket"));
+    assert!(!in_bucket.is_empty() && in_bucket.iter().all(|k| alone_candidates.contains(k)), "core files {in_bucket:?} under (`Clone`, `bool`); the question's candidates are {alone_candidates:?}");
+    asked.plant_no_bucket_impl(in_bucket[0]);
+    let planted_candidates = {
+        let mut planted_index = Buckets::lazy(asked);
+        let mut planted_keys = Keys::new();
+        planted_keys.item(clone_lib).unwrap_or_else(|e| panic!("filing `Clone`: {e}"));
+        planted_index.admit_asked(asked, &planted_keys, alone_home, Ask::Trait(checker_of(clone_lib), Shape::Bool));
+        planted_index.trait_candidates(checker_of(clone_lib), Shape::Bool, alone_home)
+    };
+    let expected: Vec<ItemKey> = alone_candidates.iter().copied().filter(|k| *k != in_bucket[0]).collect();
+    assert_eq!(planted_candidates.to_vec(), expected, "the planted bug (one bucket row withheld) was not caught: `bool: Clone` has the same candidates");
     assert!(
         asked_opened.items.texts < by_text_opened.items.texts,
         "filing from rows opened {} texts, filing from text {}: the rows saved no text",
@@ -548,12 +590,78 @@ fn records_answer_what_the_solved_names_answer() {
             "row misses: {}",
             blaze_ladder::front2::buckets::ROW_MISSES.iter().zip(asked_lazy.row_misses.iter()).map(|(class, n)| format!("{class} {n}")).collect::<Vec<_>>().join(", ")
         ),
+        format!(
+            "bool: Clone alone, by bucket: crates asked {alone_asked}; items records opened by the question {}; impls filed from the index {alone_index}; (crate, bucket) facts read {}",
+            alone_opened.items.crates - before_alone.items.crates,
+            alone_reads.len()
+        ),
+        format!(
+            "bool: Clone, then impl bool, by bucket: crates asked {}; impls filed from the index {}",
+            asked_lazy.crates_asked(),
+            asked_lazy.filed_from_index()
+        ),
+        format!("not filed when written, in the crates asked: {}", asked_lazy.not_filed().iter().map(|(class, n)| format!("{class} {n}")).collect::<Vec<_>>().join(", ")),
+        "planted: bucket row withheld -> candidates differ".to_string(),
     ];
     for line in lines.iter() {
         println!("{line}");
     }
     // The check scripts keep no test output: `FRONT2_RECORDS_OUT` names a file for the lines.
-    if let Some(path) = std::env::var_os("FRONT2_RECORDS_OUT") {
-        std::fs::write(&path, lines.join("\n") + "\n").expect("writing FRONT2_RECORDS_OUT");
+    let out = std::env::var_os("FRONT2_RECORDS_OUT");
+    if let Some(path) = out.as_ref() {
+        std::fs::write(path, lines.join("\n") + "\n").expect("writing FRONT2_RECORDS_OUT");
     }
+
+    // THE ARCHITECT'S TEST (drive.md, "End state: the whole pipeline on the command", piece
+    // 12): "`Display for a::T` opens `core` and `a`". Here `a::T` is `Io` (a nominal type of
+    // blaze's own standard library, named by the program's `main`) and the trait is core's
+    // `fmt::Display`. The Rust Reference, "Implementations", "Trait implementation coherence",
+    // "Orphan rules": "Given `impl<P1..=Pn> Trait<T1..=Tn> for T0`, an `impl` is valid only if
+    // at least one of the following is true: `Trait` is a local trait; All of: At least one of
+    // the types `T0..=Tn` must be a local type. Let `Ti` be the first such type. No uncovered
+    // type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)". `Display` has no
+    // type parameter but `Self`, so `T0` is the only type: an impl answering `Io: Display` is
+    // written in the crate that defines `Display` (core) or in the crate that defines `Io`.
+    // The question must ask those two crates' records and no other, and its read rows must
+    // name those two crates only (each with its unfiled list and the buckets asked). It runs
+    // last: the lines above are written whatever it finds.
+    let a = asked.crate_of(io).unwrap_or_else(|| panic!("`Io` ({io:x}) is of no crate"));
+    let core_root = asked.root_module(core).expect("core's root module");
+    let display = Paths { names: asked }.path(core_root, false, &["fmt", "Display"], Ns::Type).unwrap_or_else(|e| panic!("`fmt::Display` from core's root over records: {e}"));
+    assert_eq!(display.kind, Kind::Trait, "`fmt::Display` names a trait");
+    let mut display_keys = Keys::new();
+    display_keys.item(display.key).unwrap_or_else(|e| panic!("filing `Display`: {e}"));
+    display_keys.item(io).unwrap_or_else(|e| panic!("filing `Io`: {e}"));
+    let display_store = Store::new(asked_front.index.lang("sized"), asked_frame);
+    let (display_trait, io_shape) = (checker_of(display.key), Shape::Adt(checker_of(io)));
+    let display_home = trait_home(asked, &display_keys, &display_store, display_trait, io_shape);
+    let before_display = asked.opened();
+    let mut display_index = Buckets::lazy(asked);
+    display_index.admit_asked(asked, &display_keys, display_home, Ask::Trait(display_trait, io_shape));
+    let after_display = asked.opened();
+    let reads = display_index.trait_reads(display_trait, io_shape);
+    let first_16 = |key: CrateItemKey| u128::from_be_bytes(key.0.0[..16].try_into().expect("sixteen bytes"));
+    let mut read_crates: Vec<u128> = reads.iter().map(|r| r.krate).collect();
+    read_crates.dedup();
+    let mut want_crates = vec![first_16(keys[core]), first_16(keys[a])];
+    want_crates.sort();
+    let display_line = format!(
+        "Display for Io (`{}`): crates asked {} (`core` and `{}`); items records opened by the question {}; (crate, bucket) facts read {}",
+        crate_names[a],
+        display_index.crates_asked(),
+        crate_names[a],
+        after_display.items.crates - before_display.items.crates,
+        reads.len()
+    );
+    println!("{display_line}");
+    if let Some(path) = out.as_ref() {
+        std::fs::write(path, lines.join("\n") + "\n" + &display_line + "\n").expect("writing FRONT2_RECORDS_OUT");
+    }
+    assert_ne!(a, core, "`Io` is not core's");
+    assert_eq!(display_home.all, Home::In(core, Some(a)), "the home of `Io: Display` is core and `{}`", crate_names[a]);
+    assert_eq!(display_index.crates_asked(), 2, "`Io: Display` asked {} crates by bucket; the orphan rules allow two", display_index.crates_asked());
+    assert_eq!(read_crates, want_crates, "the read rows of `Io: Display` name other crates than core and `{}`", crate_names[a]);
+    assert_eq!(reads.iter().filter(|r| r.bucket == UNFILED_LIST).count(), 2, "each crate asked is read with its unfiled list: {reads:?}");
+    let errors: Vec<String> = asked.errors().iter().map(|e| e.to_string()).collect();
+    assert!(errors.is_empty(), "`Io: Display` over records filed {errors:?}");
 }

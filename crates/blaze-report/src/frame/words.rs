@@ -142,6 +142,14 @@ pub const WORDINGS: &[Wording] = &[
         args: 2,
     },
     Wording {
+        area: Area::Cli,
+        number: 15,
+        name: "target-refused",
+        headline: "the {0} target {code:1} of package {code:2} is left out: {3}",
+        label: "this target is not built, checked or run; fix this table",
+        args: 4,
+    },
+    Wording {
         area: Area::Drive,
         number: 0xC0F6,
         name: "too-many-configurations",

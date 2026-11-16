@@ -40,30 +40,71 @@ const EXCHANGE: usize = 4096;
 /// else the checkout holds (a `target/` of a million entries) is never looked at, so the cost
 /// is the program's own files' (rule 77). The one home of the set, for the run and for the
 /// program's refusals (`main.rs`, `program_refusals`).
-pub fn sources<'f>(cx: &Cx, root: &Dir<ReadWrite>, rows: &Rows<'_>, frame: &'f Frame) -> Result<Vec<(&'f str, &'f str), &'f Frame>, CliError> {
-    let mut texts: Vec<(&'f str, &'f str), &'f Frame> = Vec::new_in(frame);
-    for leaf in rows.of(LeafKind::Slot).filter(|leaf| !leaf.absent() && leaf.flags & sweep::BOTH == 0) {
-        let real = sweep::real_path(rows.path(leaf), leaf.flags, frame);
-        let path = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
-        if !path.starts_with(SOURCES) {
-            continue;
+///
+/// `tables` are the rows to read them from: while the request runs (the program starts before
+/// the answer), the last answer's rows as followed and this command's opens, a file in both
+/// taken once; after the answer, the rows it kept. A row of a file no `mod` reaches any more is
+/// read and never used: the runner walks from [`ROOT`].
+pub fn sources<'f>(cx: &Cx, root: &Dir<ReadWrite>, tables: &[&Rows<'_>], frame: &'f Frame) -> Result<Vec<(&'f str, &'f str), &'f Frame>, CliError> {
+    let mut paths: Vec<&'f str, &'f Frame> = Vec::new_in(frame);
+    for rows in tables {
+        for leaf in rows.of(LeafKind::Slot).filter(|leaf| !leaf.absent() && leaf.flags & sweep::BOTH == 0) {
+            let real = sweep::real_path(rows.path(leaf), leaf.flags, frame);
+            let path = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+            if path.starts_with(SOURCES) {
+                paths.push(path);
+            }
         }
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    let mut texts: Vec<(&'f str, &'f str), &'f Frame> = Vec::with_capacity_in(paths.len(), frame);
+    for path in paths.iter().copied() {
         let mut bytes = Bytes::new_in(frame, "a source file of the program");
         root.read_all(cx, &Path::new(path)?, &mut bytes)?;
         let text = core::str::from_utf8(Vec::from_slice_in(bytes.as_slice(), frame).leak())
             .map_err(|_| CliError::Text { what: "a source file of the program is not UTF-8" })?;
         texts.push((path, text));
     }
-    texts.sort_unstable_by(|a, b| a.0.cmp(b.0));
     Ok(texts)
 }
 
 /// Runs the package at `root`: the status `main` ended with. A hosted program (its entry bstd's
 /// `bstd_hosted_start`) reaches the world only through the host table made here, over the
 /// command's `Io` and only what `launch` grants; the host lives until the program has returned.
-pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, rows: &Rows<'_>, frame: &Frame) -> Result<u8, CliError> {
+///
+/// Its files are the root package's `src/` folder, listed: the program starts beside its check
+/// (`Gate::Beside`), before the walk has opened a file, so the walk's rows ([`sources`]) are
+/// not there yet on a first run. Only `src/` is listed, never the checkout: a `target/` of a
+/// million entries beside it costs nothing (it filled the command's frame when the whole
+/// checkout was listed). Owed (drive.md, "RUNNER 11"): the runner walks forward from [`ROOT`]
+/// through a loader, so a file no `mod` reaches is never read.
+pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -> Result<u8, CliError> {
     let cx = cx.span("blaze run: the program");
-    let texts = sources(&cx, root, rows, frame)?;
+    let src = root.subdir(&Path::new(SOURCES.trim_end_matches('/'))?);
+    let listed = match src.list(&cx, frame) {
+        Ok(listed) => Some(listed),
+        // No `src/`: no file, and the runner says the crate root is not among them.
+        Err(error) if error.kind == bstd::fs::FsKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut texts: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
+    for (path, meta) in listed.iter().flatten() {
+        if meta.dir || !path.as_str().ends_with(".rs") {
+            continue;
+        }
+        let mut bytes = Bytes::new_in(frame, "a source file of the program");
+        src.read_all(&cx, path, &mut bytes)?;
+        // Both outlive the listing and the buffer: copied into the command's frame, freed with it.
+        let mut kept = Vec::with_capacity_in(SOURCES.len() + path.as_str().len(), frame);
+        kept.extend_from_slice(SOURCES.as_bytes());
+        kept.extend_from_slice(path.as_str().as_bytes());
+        let kept_path: &str = core::str::from_utf8(kept.leak()).map_err(|_| CliError::Text { what: "a path bstd listed is not UTF-8" })?;
+        let kept_text: &str = core::str::from_utf8(Vec::from_slice_in(bytes.as_slice(), frame).leak())
+            .map_err(|_| CliError::Text { what: "a source file of the program is not UTF-8" })?;
+        texts.push((kept_path, kept_text));
+    }
+    texts.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut files: Vec<SourceFile<'_>, &Frame> = Vec::with_capacity_in(texts.len(), frame);
     for &(path, text) in texts.iter() {
         files.push(SourceFile { path, text });

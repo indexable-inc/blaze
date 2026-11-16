@@ -23,7 +23,7 @@ use super::consts::{ConstFail, Consts};
 use super::heads::{HeadError, Store, Want};
 use super::keys::{MemberKind, checker_of};
 use super::project_records::{BodySource, ByChain, ChainError, ChainOf, Listed, index_by_chain, list_bodies};
-use super::reads::{Asked, BodyReads, Reach, ReadsError, facts_of};
+use super::reads::{Asked, BodyReads, Reach, ReadsError, facts_with_buckets};
 use super::source::{self, NamesSource};
 use super::spell::Spelling;
 use super::types::Why;
@@ -244,16 +244,20 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // that finished, or the questions of the last round of a check that stopped.
         let module = checker_of(lowered.module);
         let written = lowered.typeck.view(lowered.tys.view());
-        let whole = |list: &blaze_typeck::ReadList<'_>| -> Result<BodyReads<'a>, ReadsError> {
-            let rows = facts_of(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, alloc)?;
-            Ok(BodyReads { rows, reach: Reach::Whole })
-        };
         let mut asked = Asked::new_in(alloc);
         let checked = check_body_asked(&mut r, &lowered, &scope, None, Some(&mut asked));
+        // The buckets as the check left them: what each impl question read, per crate.
+        let buckets = r.buckets.as_ref();
+        let whole = |list: &blaze_typeck::ReadList<'_>| -> Result<BodyReads<'a>, ReadsError> {
+            let rows = facts_with_buckets(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, buckets, alloc)?;
+            Ok(BodyReads { rows, reach: Reach::Whole })
+        };
         verdict.facts = match (&checked, &asked.finished) {
             (Ok(done), _) => whole(&done.reads),
             (Err(_), Some(list)) => whole(list),
-            (Err(_), None) => facts_of(&asked.questions, None, module, written.paths, written.segments, alloc).map(|rows| BodyReads { rows, reach: Reach::Asked }),
+            (Err(_), None) => {
+                facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, buckets, alloc).map(|rows| BodyReads { rows, reach: Reach::Asked })
+            }
         };
         if let Ok(list) = &verdict.facts
             && list.reach == Reach::Whole

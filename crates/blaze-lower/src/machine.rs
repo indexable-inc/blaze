@@ -676,7 +676,18 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let Ok(Pat::Bind { name, .. }) = v.pat(PatId(id.pat)) else {
                     unreachable!("an identifier pattern is the binding the lowering wrote");
                 };
-                let answer = match local_value(&v, ScopeId(id.scope), name) {
+                // A `use` of a block around the pattern is asked first (`use E::*;` makes `A`
+                // the variant): crate::block_uses, where the order's rule is quoted.
+                let local = local_value(&v, ScopeId(id.scope), name);
+                let asked = crate::block_uses::ask(&v, ScopeId(id.scope), name, local.is_some(), &mut *values, alloc.clone()).expect("the lowering's own scopes");
+                if let Some(row) = crate::block_uses::read_row(name, ScopeId(id.scope), local.is_some(), asked) {
+                    reads.push(row);
+                }
+                let by_use = match asked {
+                    crate::block_uses::Asked::Bound(a) => Some(a),
+                    _ => None,
+                };
+                let answer = match by_use.or(local) {
                     Some(a) => a,
                     None => {
                         let text = v.name_text(name).expect("a name the lowering wrote has its text");
@@ -3117,7 +3128,19 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         }
         // A statement of a block, `m!(..);` among them, expands to statements (Rust's rule
         // for a call in statement position); every other place to its own fragment.
+        // A BRACED call that is its block's tail (`fn f() -> T { m! { .. } }`, the parser's
+        // `MACRO_EXPR` straight under the statement list, std's `current_os_id` on
+        // `cfg_select!`) is a statement too: the Reference, "Macros": "When used as an item or
+        // a statement, the MacroInvocationSemi form is used where a semicolon is required at
+        // the end when not using curly braces", so a braced call needs no `;` to be one; its
+        // expansion is statements whose last expression, with nothing after it, is the block's
+        // tail (`stmt_list`). A tail call in parentheses or brackets stays an expression.
+        let braced_tail = place == MacroPlace::Expr
+            && self.frames.len() >= 2
+            && matches!(self.frames[self.frames.len() - 2].kind, STMT_LIST | MACRO_STMTS)
+            && input.of(self.text()).starts_with('{');
         let in_stmt = place == MacroPlace::Stmt
+            || braced_tail
             || place == MacroPlace::Expr
                 && self.frames.len() >= 2
                 && self.frames[self.frames.len() - 2].kind == EXPR_STMT;

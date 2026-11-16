@@ -772,6 +772,7 @@ fn main() {
                 }
             }
             let mut by_cause: BTreeMap<String, (u64, String)> = BTreeMap::new();
+            println!("  results kept: {:?}", procs.keep_all().map_err(|error| error.to_string()));
             for finding in procs.take_findings() {
                 let cause = match &finding {
                     Finding::MissingModule { .. } => "missing module".to_owned(),

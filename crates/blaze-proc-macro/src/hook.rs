@@ -34,14 +34,15 @@ use blaze_expand::{
 };
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_own::Alloc;
+use bstd::sync::PublishOnce;
 
 use crate::{
-    host::{CallError, CompiledFinding, ExpandError, Limits, Runtime, RuntimeError},
+    host::{CallError, CompiledFinding, ExpandError, Limits, Loaded, Runtime, RuntimeError},
     module::{Exported, ModuleError, ModuleRecord},
     parts::Part,
     record::{
         DirStore, RecordError, base_key,
-        table::{self, CrateResults, Kept},
+        table::{self, CrateResults, Kept, Verdicts},
     },
     sandbox::Package,
 };
@@ -134,6 +135,26 @@ struct MacroCrate {
     module: Result<ModuleRecord, ModuleError>,
     /// Whether its missing or unloadable module was reported.
     reported: AtomicBool,
+    /// Its module as the runtime loaded it, for the command: asked of the runtime once (its
+    /// compiled record found by the wasm's digest and the engine's settings), then one read
+    /// of this cell a call. Empty while no call has loaded it, and after a load that failed
+    /// (the runtime keeps the failure: the next call is told it again).
+    loaded: PublishOnce<Arc<Loaded>>,
+}
+
+impl MacroCrate {
+    /// See [`MacroCrate::loaded`].
+    fn loaded(&self, runtime: &Runtime, module: &ModuleRecord) -> Result<Arc<Loaded>, RuntimeError> {
+        if let Some(loaded) = self.loaded.get() {
+            // clone: the handle, a refcount.
+            return Ok(Arc::clone(loaded));
+        }
+        let loaded = runtime.load(module)?;
+        // clone: the handle, a refcount. A worker that published first published the same
+        // handle (the runtime loads a module once), so the one given back is dropped.
+        drop(self.loaded.set(Arc::clone(&loaded)));
+        Ok(loaded)
+    }
 }
 
 /// The hook: see the module's doc.
@@ -143,18 +164,25 @@ pub struct ProcMacros<'r> {
     limits: Limits,
     crates: Vec<MacroCrate>,
     findings: Mutex<Vec<Finding>>,
-    /// Each package a call was expanded in, with its crate's results as this command found
-    /// them and the rows it ran ([`crate::record::table`]): sorted by the package's address,
-    /// which a slot keeps alive, so a package is found by identity with no hash of it a call.
+    /// Each package a call was expanded in, with its crate name's results and its own
+    /// verdicts on them: sorted by the package's address, which a slot keeps alive, so a
+    /// package is found by identity with no hash of it a call.
     /// DEBT: prelude `Vec`s here and in the table's rows, not blaze-own's with an allocator
     /// passed: `ProcMacros::new` takes none (its callers are other lanes' drivers).
     slots: Mutex<Vec<Arc<CrateSlot>>>,
+    /// Each crate name's results as this command found them, with the rows it ran
+    /// ([`crate::record::table`]): sorted by the name, one for every package of that name
+    /// (two packages with a table each would each write it, the second without the first's
+    /// rows).
+    tables: Mutex<Vec<Arc<CrateResults>>>,
 }
 
 /// One package's results: see [`ProcMacros::slots`].
 struct CrateSlot {
     package: Arc<Package>,
-    results: CrateResults,
+    results: Arc<CrateResults>,
+    /// This package's verdict on each read list of `results`' table.
+    verdicts: Verdicts,
 }
 
 /// What [`ProcMacros::keep_all`] wrote.
@@ -169,7 +197,40 @@ pub struct KeptAll {
 
 impl<'r> ProcMacros<'r> {
     pub fn new(runtime: &'r Runtime, store: &'r DirStore, limits: Limits) -> ProcMacros<'r> {
-        ProcMacros { runtime, store, limits, crates: Vec::new(), findings: Mutex::new(Vec::new()), slots: Mutex::new(Vec::new()) }
+        ProcMacros {
+            runtime,
+            store,
+            limits,
+            crates: Vec::new(),
+            findings: Mutex::new(Vec::new()),
+            slots: Mutex::new(Vec::new()),
+            tables: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The results filed under the crate name `krate`: opened at the name's first call (one
+    /// read of its table, proved once), shared after.
+    fn results(&self, krate: blaze_ids::ContentId) -> Result<Arc<CrateResults>, RecordError> {
+        let held = |tables: &Vec<Arc<CrateResults>>| {
+            let at = tables.partition_point(|it| it.krate().0 < krate.0);
+            // clone: the table, a refcount.
+            (at, tables.get(at).filter(|it| it.krate() == krate).map(Arc::clone))
+        };
+        if let (_, Some(results)) = held(&crate::host::lock(&self.tables)) {
+            return Ok(results);
+        }
+        // Opened outside the lock: another worker's calls do not wait on this crate's read.
+        let made = Arc::new(table::open(self.store, krate)?);
+        let mut tables = crate::host::lock(&self.tables);
+        match held(&tables) {
+            // Another worker opened it meanwhile: its table is the name's, this one is dropped.
+            (_, Some(results)) => Ok(results),
+            (at, None) => {
+                // clone: the table, a refcount.
+                tables.insert(at, Arc::clone(&made));
+                Ok(made)
+            }
+        }
     }
 
     /// The results of the crate `package` is: opened at the package's first call (one read
@@ -185,9 +246,10 @@ impl<'r> ProcMacros<'r> {
                 return Ok(Arc::clone(slot));
             }
         }
-        // Opened outside the lock: another worker's calls do not wait on this crate's read.
+        let results = self.results(table::crate_name(package))?;
+        let verdicts = Verdicts::of(&results);
         // clone: the package, a refcount the slot holds so its address stays this package's.
-        let made = Arc::new(CrateSlot { package: Arc::clone(package), results: table::open(self.store, table::crate_name(package))? });
+        let made = Arc::new(CrateSlot { package: Arc::clone(package), results, verdicts });
         let mut slots = crate::host::lock(&self.slots);
         let at = slots.partition_point(|slot| address(slot) < wanted);
         if let Some(slot) = slots.get(at).filter(|slot| address(slot) == wanted) {
@@ -203,11 +265,13 @@ impl<'r> ProcMacros<'r> {
     /// are expanded (and may again: a crate with nothing new since is not written).
     pub fn keep_all(&self) -> Result<KeptAll, RecordError> {
         let mut mark = self.runtime.parts().start();
-        // clone: the slots, a refcount each: no table is written under the lock.
+        // clone: the slots and tables, a refcount each: no table is written under a lock.
         let slots: Vec<Arc<CrateSlot>> = crate::host::lock(&self.slots).clone();
+        let tables: Vec<Arc<CrateResults>> = crate::host::lock(&self.tables).clone();
         let mut kept = KeptAll::default();
-        for slot in &slots {
-            if let Kept::Written { rows, bytes } = slot.results.keep(self.store)? {
+        for results in &tables {
+            let verdicts: Vec<&Verdicts> = slots.iter().filter(|slot| Arc::ptr_eq(&slot.results, results)).map(|slot| &slot.verdicts).collect();
+            if let Kept::Written { rows, bytes } = results.keep(self.store, &verdicts)? {
                 kept.tables += 1;
                 kept.rows += rows;
                 kept.bytes += bytes;
@@ -226,6 +290,7 @@ impl<'r> ProcMacros<'r> {
             label: format!("{name} {version}"),
             module,
             reported: AtomicBool::new(false),
+            loaded: PublishOnce::new(),
         });
     }
 
@@ -326,7 +391,7 @@ impl<'r> ProcMacros<'r> {
         let mut mark = parts.start();
         let base = base_key(&module.wasm_sha256, export, edition, call);
         mark.lap(Part::Key);
-        let found = self.slot(package).and_then(|slot| Ok((slot.results.find(self.store, &base, package, edition, alloc)?, slot)));
+        let found = self.slot(package).and_then(|slot| Ok((slot.results.find(self.store, &base, package, &slot.verdicts, edition, alloc)?, slot)));
         mark.lap(Part::Find);
         let slot = match found {
             Ok((Some(produced), _)) => return Ok(produced),
@@ -336,7 +401,7 @@ impl<'r> ProcMacros<'r> {
                 return Err(failed);
             }
         };
-        let loaded = self.runtime.load(module);
+        let loaded = macro_crate.loaded(self.runtime, module);
         mark.lap(Part::Load);
         let loaded = match loaded {
             Ok(loaded) => loaded,
@@ -369,6 +434,18 @@ impl<'r> ProcMacros<'r> {
 /// Whether `error` is a limit, a refusal or a failure: [`CallError::host_error`]'s `why`.
 pub fn cause(error: &CallError) -> HostWhy {
     error.host_error().why
+}
+
+/// A kept answer's sandbox read asked again: what the read `subject` (a
+/// [`blaze_expand::ReadKind::ProcMacro`] read of a [`Produced`]'s reads: `env:NAME`,
+/// `file:path`, `dir:path` or `stat:path`, paths from the package's root) is answered by now
+/// in `package`, in the form the run recorded it: [`blaze_expand::ReadAnswer::Absent`], or
+/// [`blaze_expand::ReadAnswer::Digest`] of the variable's value, the file's bytes, the
+/// folder's sorted listing, or the kind and length. A kept answer is today's exactly when
+/// each of its reads is answered now as its list says. `Err`: a subject of no known form,
+/// which no run records.
+pub fn read_now(package: &Package, subject: &str) -> Result<blaze_expand::ReadAnswer, crate::sandbox::UnknownSubject> {
+    crate::sandbox::answer_now(package, subject).map(|now| now.map_or(blaze_expand::ReadAnswer::Absent, blaze_expand::ReadAnswer::Digest))
 }
 
 /// An expansion's outside for one crate: `inner`'s environment, cfg, includes and places, and

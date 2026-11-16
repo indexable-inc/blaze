@@ -264,6 +264,10 @@ pub struct Builder<A: Allocator + Clone, S: Sink> {
     data_rows: HashMap<u64, u32, A>,
     intrinsic_rows: HashMap<u64, u32, A>,
     span_rows: HashMap<SpanRef, u32, A>,
+    /// The most alignment (log2) a plain access made from now on may claim: `None` until
+    /// [`Builder::cap_access_align`] lowers it (a `repr(packed)` aggregate's parts sit below
+    /// their own alignment). Atomics are never capped: an atomic access is at its size.
+    access_cap: Option<u8>,
 }
 
 /// The row of `hash` in a table of `rows` rows: `Ok` with the one `same` holds of, or `Err`
@@ -320,6 +324,25 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
             data_rows: HashMap::new_in(alloc.clone()),
             intrinsic_rows: HashMap::new_in(alloc.clone()),
             span_rows: HashMap::new_in(alloc),
+            access_cap: None,
+        }
+    }
+
+    /// From now on every plain load, store, bulk copy, `memcmp` and masked access claims at
+    /// most `1 << log2` alignment (the least of every cap asked): the Reference, "Type layout",
+    /// `[layout.repr.alignment.packed-fields]`: under `packed` a field is positioned at "the
+    /// smaller of the specified alignment and the alignment of the field's type", so an access
+    /// through it may claim no more. Lowering a claimed alignment never makes code wrong;
+    /// atomics keep theirs.
+    pub fn cap_access_align(&mut self, log2: u8) {
+        self.access_cap = Some(self.access_cap.map_or(log2, |cap| cap.min(log2)));
+    }
+
+    /// `attrs` with its alignments lowered to the access cap, if one was asked.
+    fn capped(&self, attrs: MemAttrs) -> MemAttrs {
+        match self.access_cap {
+            None => attrs,
+            Some(cap) => MemAttrs { align: attrs.align.min(cap), src_align: attrs.src_align.min(cap), ..attrs },
         }
     }
 
@@ -1024,6 +1047,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     // Memory.
 
     pub fn load(&mut self, ty: Ty, flags: Flags, ptr: Value, offset: i32, attrs: MemAttrs) -> Value {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(Op::Load, flags, ty, attrs, |w| {
             w.value(ptr);
@@ -1032,6 +1056,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     }
 
     pub fn store(&mut self, flags: Flags, value: Value, ptr: Value, offset: i32, attrs: MemAttrs) {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(Op::Store, flags, Ty::NONE, attrs, |w| {
             w.value(value);
@@ -1042,6 +1067,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
 
     /// `memcpy`, `memmove` or `memset`.
     pub fn bulk(&mut self, op: Op, flags: Flags, dst: Value, src: Value, len: Value, attrs: MemAttrs) {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(op, flags, Ty::NONE, attrs, |w| {
             w.value(dst);
@@ -1051,6 +1077,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     }
 
     pub fn memcmp(&mut self, a: Value, b: Value, len: Value, attrs: MemAttrs) -> Value {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(Op::Memcmp, Flags::NONE, Ty::I32, attrs, |w| {
             w.value(a);
@@ -1138,6 +1165,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     /// `masked_load` or `gather` of `ty`: the address(es), the mask and the lanes where it is
     /// false.
     pub fn masked_load(&mut self, op: Op, ty: Ty, ptr: Value, mask: Value, passthru: Value, attrs: MemAttrs) -> Value {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(op, Flags::NONE, ty, attrs, |w| {
             w.value(ptr);
@@ -1148,6 +1176,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
 
     /// `masked_store` or `scatter`: the value, the address(es) and the mask.
     pub fn masked_store(&mut self, op: Op, value: Value, ptr: Value, mask: Value, attrs: MemAttrs) {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(op, Flags::NONE, Ty::NONE, attrs, |w| {
             w.value(value);

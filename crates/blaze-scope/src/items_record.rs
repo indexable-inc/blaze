@@ -24,10 +24,17 @@
 //! item grain section ([`grain`]: each item row's chain and piece digests, its offset in header
 //! field 37), by which an edit voids only the items it touches; then the member owners section
 //! ([`owners`]: each named member's key with its owner's row, sorted by member key, its count
-//! and offset in header fields 35 and 36), by which "who owns this member" is one search.
+//! and offset in header fields 35 and 36), by which "who owns this member" is one search; then
+//! the variant table ([`variants`]: each variant's key with its enum and index, header fields
+//! 29 and 30), by which "which enum is this variant of" is one search; then the bucket index
+//! ([`buckets`]: the impls filed by resolved (trait or inherent, self type's head), header
+//! fields 31 and 32, and the impls the writer could not resolve, fields 33 and 34), by which
+//! one impl question reads one bucket of the crate and no other impl's row.
 
+pub mod buckets;
 pub mod grain;
 pub mod owners;
+pub mod variants;
 
 pub use grain::{ItemNow, ItemPieces, ItemToday};
 
@@ -44,8 +51,9 @@ use crate::task::{MacroBody, MacroSrc};
 const MAGIC: [u8; 4] = *b"BZIT";
 /// 2: the item grain section ([`grain`]); a version-1 record is refused (`NotThisRecord`) and
 /// the crate is solved again. 3: the member owners section ([`owners`]), added after it; a
-/// version-2 record is refused the same way.
-const VERSION: u32 = 3;
+/// version-2 record is refused the same way. 4: the variant table ([`variants`]) and the bucket
+/// index ([`buckets`]), added after them; a version-3 record is refused the same way.
+const VERSION: u32 = 4;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -428,12 +436,28 @@ struct ImplOut<'s> {
     flags: u32,
     head: SelfHead,
     marks: u8,
+    /// Where the bucket index files it ([`buckets::filing`]).
+    filing: buckets::Filing,
 }
 
 /// The items record of a solved crate. Its bytes are a function of the solve's answers: every
 /// table is sorted by key (the impls by what they are filed by), so any worker in any order
 /// writes the same bytes.
+///
+/// The bucket index ([`buckets`]) is resolved by the crate's OWN names only
+/// ([`buckets::OwnNames`]): an impl whose trait or self type is named through another crate's
+/// names is in the unfiled list (`TraitNotRead`, `SelfNotRead`), which a reader files itself.
+/// A caller that holds the names of the crate's dependencies calls [`encode_with`].
 pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
+    encode_with(names, &buckets::OwnNames(names), alloc)
+}
+
+/// [`encode`], its bucket index resolved by `heads`: the names every impl header's trait path
+/// and self type are walked through when the record is written (the whole graph's `Names`, or
+/// the crate's own with its dependencies' records). The record's bytes are a function of the
+/// solve's answers AND of what `heads` answers for the crate's impl headers: a key or read
+/// list the record is kept under must cover the names `heads` reads (rule 21).
+pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, heads: &H, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
     let mut strings: Strings<'b, 'n> = Strings::new(alloc);
     let tables = &names.tables;
 
@@ -479,17 +503,37 @@ pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<Rec
     let mut impls: AVec<'b, ImplOut<'n>> = AVec::with_capacity_in(tables.impls.len(), alloc);
     for i in tables.impls.iter() {
         let out = match blaze_file_items::impl_header(i.header, names.edition, alloc) {
-            Err(_) => ImplOut { key: i.key, module: i.module, trait_path: "", self_path: "", flags: 0, head: SelfHead::Other, marks: HEADER_UNREAD },
+            Err(_) => ImplOut {
+                key: i.key,
+                module: i.module,
+                trait_path: "",
+                self_path: "",
+                flags: 0,
+                head: SelfHead::Other,
+                marks: HEADER_UNREAD,
+                filing: buckets::Filing::Not(buckets::NotFiled::HeaderUnread),
+            },
             Ok(h) => {
                 let (head, self_path) = self_head(h.self_ty, h.params.as_slice());
                 let (trait_path, marks) = match h.trait_ {
                     None => ("", 0),
                     Some(t) => {
                         let (path, bare) = path_and_bare(t);
-                        if plain_path(path) { (path, HAS_TRAIT | if bare { BARE } else { 0 }) } else { ("", HAS_TRAIT | TRAIT_UNREAD) }
+                        // A plain path, or one that reads as a simple path by its tokens: an
+                        // expansion's text writes `:: core :: clone :: Clone` (a derive's impl),
+                        // which is kept as written (a reader trims each segment). Measured
+                        // 2026-11-16 (front2_records, 70 crates): 8,774 of 28,719 impls had
+                        // their trait unread here and were filed from their header's text.
+                        if plain_path(path) || crate::task::parse_path(path, names.key, alloc).is_some() {
+                            (path, HAS_TRAIT | if bare { BARE } else { 0 })
+                        } else {
+                            ("", HAS_TRAIT | TRAIT_UNREAD)
+                        }
                     }
                 };
-                ImplOut { key: i.key, module: i.module, trait_path, self_path: self_path.unwrap_or(""), flags: h.flags.bits(), head, marks }
+                let negative = h.flags.bits() & ImplFlags::NEGATIVE.bits() != 0;
+                let filing = buckets::filing(heads, names.key, i.module, h.trait_, negative, head, self_path, alloc);
+                ImplOut { key: i.key, module: i.module, trait_path, self_path: self_path.unwrap_or(""), flags: h.flags.bits(), head, marks, filing }
             }
         };
         impls.push(out);
@@ -775,6 +819,10 @@ pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<Rec
     out.extend_from_slice(&strings.bytes);
     grain::append(&mut out, names, &items)?;
     owners::append(&mut out, &mut owned)?;
+    variants::append(&mut out, &tables.enums, alloc)?;
+    // In the impl table's order: row `i`'s filing at index `i`.
+    let filings: AVec<'b, buckets::Filing> = AVec::from_iter_in(impls.iter().map(|i| i.filing), alloc);
+    buckets::append(&mut out, &filings, alloc)?;
     Ok(out)
 }
 

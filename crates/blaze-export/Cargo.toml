@@ -1,0 +1,32 @@
+[package]
+name = "blaze-export"
+description = "`blaze export` (docs/v2/plan/design/bottom.md, section 11; run.md, \"Export\"): the code records of everything a program reaches laid out as one whole program (equal records folded, every call in reach a direct `bl`, C names through the platform's own binding) and written as one native executable, Mach-O for arm64 macOS with its ad-hoc code signature or ELF for arm64 Linux; sans-IO, byte-equal on every machine"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The code record (`CodeView`, `Symbol`, `Target`) and the AArch64 site encoders (`a64`).
+blaze-code = { path = "../blaze-code" }
+# `Vec` and `Alloc`: every table in the allocator the caller names.
+blaze-own.workspace = true
+# The domain-separated BLAKE3 `Hasher`: fold digests, the file's identity (`LC_UUID`, build id).
+# By path, as blaze-code takes it: the workspace entry turns on its `serde` adapter.
+blaze-ids = { path = "../blaze-ids" }
+# The code directory's page hashes (Mach-O's ad-hoc signature is SHA-256 by its format).
+blaze-sha256.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()`, the handle the tests hand every function.
+blaze-own = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

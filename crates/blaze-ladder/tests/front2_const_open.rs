@@ -1,0 +1,243 @@
+//! Constants in types through front2 with the real core (front2/const_open.rs; typeck.md,
+//! "Constants in types: three states"): the four faces measured on the walk of the hello world
+//! (port27/front2/list-AG.txt: `check gap: FnHead` 255, `lower: Convert` an array repeat
+//! length 44, `check gap: BodyConst` 23, the byteorder impl's refused header 21).
+//!
+//! Every fixture has a fn that must check clean AND one with the wrong length that must be a
+//! type mismatch of the program: a fix that made a length a hole (a const variable takes any
+//! value) would pass the second clean and fail here.
+//!
+//! The Reference, "Generic parameters", "Const generics": "Const parameters can be used
+//! anywhere a const item can be used, with the exception that when used in a type or array
+//! repeat expression, it must be standalone"; "As a further restriction, const parameters may
+//! only appear as a standalone argument inside of a type or array repeat expression. In those
+//! contexts, they may only be used as a single segment path expression, possibly inside a
+//! block (such as `N` or `{N}`). That is, they cannot be combined with other expressions."
+//! The Reference says nothing more on WHEN a constant expression in a type is evaluated or
+//! how two are compared: with the restriction above, every constant in a type of an accepted
+//! program is a value or one parameter, so there is nothing unevaluated to compare. The
+//! pinned library's own use is the evidence for what must have a value: an expression over a
+//! ground `Self` (library/core/src/num/uint_macros.rs) and over a ground type argument
+//! (library/core/src/num/mod.rs, `repeat_u8`).
+//!
+//! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_items.rs
+//! does. NOT RUN by the writer (a write-only lane).
+
+#![feature(allocator_api)]
+
+use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+use blaze_ladder::front2::Front2;
+use blaze_ladder::front2::body::{BodyError, lower_fn};
+use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records, check_body, eval_len};
+use blaze_ladder::front2::consts::Consts;
+use blaze_ladder::front2::heads::{HeadError, Store};
+use blaze_ladder::front2::spell::Spelling;
+use blaze_ladder::front2::types::Why;
+use blaze_ladder::refusal::SourceFile;
+use blaze_lower::scoped::Prepares;
+use blaze_own::Alloc;
+use blaze_scope::names::{self, Written};
+use blaze_surface::{Namespace, PathKind};
+
+const EDITION: &str = "blaze-2026.11";
+
+/// The most constants one fn's lowering may need evaluated before it converts.
+const MOST_LENS: u32 = 8;
+
+/// Each fn of `fns` in the crate `text`, lowered and checked in order over one store, as
+/// tests/front2_items.rs `check_fns` does, with the driver's round for a constant a body's
+/// conversion needs (front2/reach.rs: `Why::NeedConst` has the constant evaluated by
+/// `eval_len` and the body lowered again): its name and its outcome ("clean", the
+/// diagnostics, or the failure as printed).
+fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let prepared = Prepares::new_in(Alloc::global());
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let mut got = Vec::new();
+    for &n in fns {
+        let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
+            .unwrap_or_else(|e| panic!("`{n}`: {e}"));
+        let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
+        let mut lens = 0;
+        let outcome = loop {
+            match lower_fn(&names, prepared, &mut front.keys, &mut store, k) {
+                Err(BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }) | Err(BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }) if lens < MOST_LENS => {
+                    lens += 1;
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    if let Err(e) = eval_len(&mut records, c) {
+                        break format!("not lowered: the constant {c:x} its body names: {e}");
+                    }
+                }
+                Err(e) => break format!("not lowered: {e}"),
+                Ok(body) => {
+                    let view = body.lowered.view();
+                    let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `{n}`: {e:?}"));
+                    let scope = body.scope(&spell);
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    break match check_body(&mut records, &body, &scope) {
+                        Ok(done) if done.diags.is_empty() => "clean".to_string(),
+                        Ok(done) => {
+                            let d: Vec<String> = done.diags.iter().map(|d| format!("{} at {:?}: `{}`", d.code.code(), d.at, text.get(d.at.start as usize..d.at.end as usize).unwrap_or("?"))).collect();
+                            format!("diags {d:?}")
+                        }
+                        // The program's own errors (`CheckFail::Diags`: "The check finished
+                        // with diagnostics"): an outcome of the check, not a gap.
+                        Err(CheckFail::Diags { diags, .. }) => format!("diags {diags:?}"),
+                        Err(e) => format!("not checked: {e}"),
+                    };
+                }
+            }
+        };
+        got.push((n.to_string(), outcome));
+    }
+    got
+}
+
+/// Prints each outcome as `<what>: <fn>: <outcome>` and asserts, per fn, `clean` (`true`) or
+/// a diagnostic of the program (`false`: the outcome starts with `diags`; a gap or a refusal
+/// is "not checked" or "not lowered" and fails both).
+fn expect(what: &str, got: &[(String, String)], clean: &[bool]) {
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("{what}: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    assert_eq!(got.len(), clean.len(), "{}", lines.join("\n"));
+    for ((n, o), &want) in got.iter().zip(clean) {
+        if want {
+            assert_eq!(o, "clean", "`{n}` must check clean\n{}", lines.join("\n"));
+        } else {
+            assert!(o.starts_with("diags "), "`{n}` must be an error of the program, not clean and not a gap\n{}", lines.join("\n"));
+        }
+    }
+}
+
+/// Face (a): a signature's array length over a GROUND `Self` has a value at the head. The
+/// pinned core, library/core/src/num/uint_macros.rs (inside `impl u16 { uint_impl! { .. } }`):
+/// "pub const fn from_le_bytes(bytes: [u8; size_of::<Self>()]) -> Self": `Self` is `u16`, the
+/// length is 2. It was refused "a constant expression over a generic parameter" (`Self` was
+/// taken for a parameter), and `core::fmt::Arguments::estimated_capacity`, which calls
+/// `u16::from_le_bytes`, was a `check gap: FnHead` with 254 more. `core_two` is that call;
+/// `own_two` is the same form on a struct of the crate (`size_of::<W>()` is 2: the ADT's row
+/// and the impls of `SizedTypeProperties` for it are made inside the evaluation).
+/// Expected lines: "ground Self: core_two: clean", "ground Self: core_three: diags [..]" (a
+/// `[u8; 3]` where `[u8; 2]` is expected), "ground Self: own_two: clean", "ground Self:
+/// own_three: diags [..]".
+#[test]
+fn a_length_over_a_ground_self_has_its_value() {
+    const TEXT: &str = "struct W(u16);
+impl W {
+    fn pick(bytes: [u8; core::mem::size_of::<Self>()]) -> u8 { bytes[1] }
+}
+fn core_two(b: [u8; 2]) -> u16 { u16::from_le_bytes(b) }
+fn core_three(b: [u8; 3]) -> u16 { u16::from_le_bytes(b) }
+fn own_two(b: [u8; 2]) -> u8 { W::pick(b) }
+fn own_three(b: [u8; 3]) -> u8 { W::pick(b) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["core_two", "core_three", "own_two", "own_three"]);
+    expect("ground Self", &got, &[true, false, true, false]);
+}
+
+/// State three stays a typed refusal naming the constant, never a value and never clean: the
+/// Reference's own example of what is not allowed, "fn bad_function<const N: usize>() ->
+/// [u8; {N + 1}]" ("Not allowed to combine in other expressions in types, such as the
+/// arithmetic expression in the return type here."), and the same with `Self` in a generic
+/// impl, where `Self` is not ground. Expected lines: each outcome contains
+/// "a constant expression over a generic parameter".
+#[test]
+fn a_length_over_an_open_parameter_is_refused_by_name() {
+    const TEXT: &str = "struct G<T>(T);
+impl<T> G<T> {
+    fn pick(bytes: [u8; core::mem::size_of::<Self>()]) -> u8 { bytes[0] }
+}
+fn plus<const N: usize>() -> [u8; { N + 1 }] { loop {} }
+fn open_self(b: [u8; 4]) -> u8 { G::<u32>::pick(b) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["plus", "open_self"]);
+    for (n, o) in &got {
+        println!("open: {n}: {o}");
+    }
+    for (n, o) in &got {
+        assert!(o.contains("a constant expression over a generic parameter"), "`{n}`: {got:?}");
+    }
+}
+
+/// Face (b): an impl header whose array length calls `size_of` at a ground type is a
+/// candidate with the length's value. Package 93 (zerocopy), src/byteorder.rs:804, as the
+/// walk printed its header: "( mem:: size_of::< usize> ( ) )" in the array length of the
+/// impl's trait argument. It was a refused header ("the trait's constant .. is read with no
+/// `Self`"): `size_of::<T>()` is "<T as SizedTypeProperties>::SIZE" (the pinned core,
+/// library/core/src/mem/mod.rs), and the evaluator read that path at no arguments. `usize`
+/// is 8 bytes on every host blaze targets (arm64 and x86-64). Expected lines: "header
+/// length: eight: clean", "header length: seven: diags [..]" (no `From<[u8; 7]>` for `W`).
+#[test]
+fn a_header_length_that_calls_size_of_has_its_value() {
+    const TEXT: &str = "use core::mem;
+struct W([u8; 8]);
+impl From<[u8; mem::size_of::<usize>()]> for W {
+    fn from(a: [u8; mem::size_of::<usize>()]) -> W { W(a) }
+}
+fn eight(a: [u8; 8]) -> W { W::from(a) }
+fn seven(a: [u8; 7]) -> W { W::from(a) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["eight", "seven"]);
+    expect("header length", &got, &[true, false]);
+}
+
+/// Face (c): an array repeat length that is a name of the BODY. A const parameter of the fn
+/// is state two (`param`). A `const` item declared in the body is found through the body's
+/// own items and evaluated: blaze-core, src/spans.rs: "const MOST: usize =
+/// crate::threads::RUN_MOST;" then "[Resolved { at: NonNull::dangling(), len: 0 }; MOST]"
+/// (`real` mirrors it). It was "to_typeck refused Form { what: \"an array repeat length\" }
+/// (Resolve .. NotFound)": the name was looked up at the module. The Reference, "Statements",
+/// "Item declarations": "Declaring an item within a statement block restricts its scope to
+/// the block containing the statement"; "Names", "Scopes": a block's item shadows the outer
+/// names, so in `own` and `shadowed` the length is the body's `LEN` (4), not the module's
+/// (9). Expected lines: "body names: param: clean", "body names: real: clean", "body names:
+/// own: clean", "body names: shadowed: diags [..]" (a `[u8; 4]` where `[u8; 9]` is written).
+#[test]
+fn a_repeat_length_names_the_bodys_own_constant() {
+    const TEXT: &str = "const LEN: usize = 9;
+const RUN_MOST: usize = 8;
+fn param<const N: usize>() -> [u8; N] { [0; N] }
+fn real() -> u8 { const MOST: usize = crate::RUN_MOST; let taken = [0u8; MOST]; taken[7] }
+fn own() -> [u8; 4] { const LEN: usize = 4; [0; LEN] }
+fn shadowed() -> [u8; 9] { const LEN: usize = 4; [0; LEN] }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["param", "real", "own", "shadowed"]);
+    expect("body names", &got, &[true, true, true, false]);
+}
+
+/// Face (d): an array repeat length that calls `size_of` at a ground type has its value. The
+/// pinned core, library/core/src/num/mod.rs, in `impl usize`: "pub(crate) const fn
+/// repeat_u8(x: u8) -> usize {" "usize::from_ne_bytes([x; size_of::<usize>()])" (`real`
+/// mirrors it: `from_ne_bytes` takes "[u8; size_of::<Self>()]", face (a), so both lengths
+/// must be 8 for it to check). It was a `check gap: BodyConst` ("an anonymous constant in a
+/// body .. or the evaluator refused it"). Expected lines: "repeat size_of: eight: clean",
+/// "repeat size_of: real: clean", "repeat size_of: seven: diags [..]" (a `[u8; 8]` where
+/// `[u8; 7]` is written).
+#[test]
+fn a_repeat_length_that_calls_size_of_has_its_value() {
+    const TEXT: &str = "fn eight(x: u8) -> [u8; 8] { [x; core::mem::size_of::<usize>()] }
+fn real(x: u8) -> usize { usize::from_ne_bytes([x; core::mem::size_of::<usize>()]) }
+fn seven(x: u8) -> [u8; 7] { [x; core::mem::size_of::<usize>()] }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["eight", "real", "seven"]);
+    expect("repeat size_of", &got, &[true, true, false]);
+}

@@ -46,6 +46,9 @@
 
 pub mod cpu;
 pub mod lanes;
+mod many;
+
+pub use many::{CountMismatch, MANY_DEFAULT, Many, Mode, many_checked};
 
 use blaze_int::{Cast, Int};
 

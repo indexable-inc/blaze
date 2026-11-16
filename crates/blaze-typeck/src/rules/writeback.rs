@@ -15,7 +15,7 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{Adjusts, Callees, Captures, Checked, Closures, ExprDefs, Fields, PatDefs};
+use crate::columns::{Adjusts, Callees, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, PatDefs};
 use crate::ty::ClosureKind;
 use crate::diag::{At, Diag, DiagCode};
 use crate::error::{CheckError, Limit};
@@ -57,7 +57,7 @@ impl<'a> Export<'a> {
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The children of one level of a type.
-    fn ty_children(&self, v: TyView, out: &mut Vec<Ty, Alloc<'a>>) {
+    pub(super) fn ty_children(&self, v: TyView, out: &mut Vec<Ty, Alloc<'a>>) {
         let list = |l: TyList, out: &mut Vec<Ty, Alloc<'a>>| {
             for i in 0..self.ty.list_len(l) {
                 out.push(self.ty.list_get(l, i));
@@ -281,6 +281,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut callees: Callees<'a> = Soa::with_capacity_in(self.callees.len(), alloc);
         for i in 0..self.callees.len() {
             let (e, item, args) = self.callees[i];
+            // An operator whose final operand types are builtin scalars is the builtin
+            // operator: no row (rules/op.rs).
+            if self.operator_settled_builtin(e, args)? {
+                continue;
+            }
             for j in 0..self.ty.list_len(args) {
                 let t = self.ty.list_get(args, j);
                 let t = self.ty.resolve(t)?;
@@ -291,6 +296,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             callees.push((e, item, l));
         }
         callees.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        // A constant path's arguments, resolved like a callee's: an argument still unknown here
+        // is the export's ordinary "type annotations needed" at the path, never an empty list.
+        let mut const_args: ConstArgs<'a> = Soa::with_capacity_in(self.const_args.len(), alloc);
+        for i in 0..self.const_args.len() {
+            let (e, args) = self.const_args[i];
+            for j in 0..self.ty.list_len(args) {
+                let t = self.ty.list_get(args, j);
+                let t = self.ty.resolve(t)?;
+                self.export(&mut ex, t, At::Expr(e))?;
+            }
+            let args = self.ty_resolve_list(args)?;
+            let l = self.export_list(&mut ex, args)?;
+            const_args.push((e, l));
+        }
+        const_args.sort_by_key(|rows, i| rows.column::<0>()[i]);
         let mut expr_defs: ExprDefs<'a> = Soa::new_in(alloc);
         let mut pat_defs: PatDefs<'a> = Soa::new_in(alloc);
         for &(at, d) in self.defs.iter() {
@@ -451,6 +471,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             adjusts,
             callees,
             expr_defs,
+            const_args,
             pat_defs,
             fields,
             captures,

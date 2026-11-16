@@ -7,14 +7,83 @@
 
 use std::{alloc::Global, path::PathBuf, time::Instant};
 
-use blaze_file_items::{Bodies, OneByOne, SideBySide, outline, outline_hashed_by};
+use blaze_file_items::{Bodies, OneByOne, SideBySide, outline, outline_hashed_by, outline_rows};
 use blaze_own::Alloc;
 use blaze_surface::{Edition, ItemDetail};
+
+/// How many outlines of every file `--profile` runs.
+const PROFILE_ROUNDS: usize = 12;
+
+/// One of the two paths timed side by side.
+#[derive(Clone, Copy)]
+enum Path {
+    /// `outline`: the file split, each part walked from the parser's events.
+    Old,
+    /// `outline_rows`: the item grammar's sink writes the rows.
+    Rows,
+}
+
+impl std::fmt::Display for Path {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Path::Old => "outline (events, then the walk)",
+            Path::Rows => "outline_rows (the grammar's sink)",
+        })
+    }
+}
+
+/// The entries `outline_rows` makes of `text`.
+fn rows(text: &str) -> usize {
+    outline_rows(text, Edition::E2024, Alloc::global()).items().len()
+}
+
+/// The CPU time this thread has used, in seconds: what a round costs whatever else the machine
+/// runs beside it, where wall time on a loaded machine also counts the waits for a core.
+fn cpu() -> f64 {
+    #[repr(C)]
+    struct Timespec {
+        seconds: i64,
+        nanoseconds: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, time: *mut Timespec) -> i32;
+    }
+    // `CLOCK_THREAD_CPUTIME_ID` in each system's <time.h>.
+    let clock = if cfg!(target_os = "macos") { 16 } else { 3 };
+    let mut time = Timespec { seconds: 0, nanoseconds: 0 };
+    // SAFETY: `clock_gettime` (the libc std links, on a 64-bit macOS or Linux, where `time_t`
+    // and `long` are both 64 bits) writes one `timespec` to `time`, which is one.
+    let got = unsafe { clock_gettime(clock, &mut time) };
+    assert_eq!(got, 0, "the thread's CPU clock reads");
+    time.seconds as f64 + time.nanoseconds as f64 * 1e-9
+}
+
+/// The machine's one-minute load average, as text.
+fn load() -> std::string::String {
+    unsafe extern "C" {
+        fn getloadavg(averages: *mut f64, count: i32) -> i32;
+    }
+    let mut averages = [0f64; 3];
+    // SAFETY: `getloadavg` (macOS and Linux libc, which std links) writes at most `count`
+    // doubles to `averages`, which holds three.
+    let got = unsafe { getloadavg(averages.as_mut_ptr(), 3) };
+    match got {
+        1.. => format!("{:.1}", averages[0]),
+        _ => std::string::String::from("unknown"),
+    }
+}
 
 fn main() {
     let mut files: Vec<PathBuf, Global> = Vec::new_in(Global);
     let mut stack: Vec<PathBuf, Global> = Vec::new_in(Global);
-    stack.extend(std::env::args_os().skip(1).map(PathBuf::from));
+    let mut profile = None;
+    for arg in std::env::args_os().skip(1) {
+        match arg.to_str() {
+            Some("--profile=old") => profile = Some(Path::Old),
+            Some("--profile=rows") => profile = Some(Path::Rows),
+            _ => stack.push(PathBuf::from(arg)),
+        }
+    }
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             eprintln!("not a directory that reads: {}", dir.display());
@@ -42,6 +111,63 @@ fn main() {
     }
     let bytes: usize = texts.iter().map(|it| it.len()).sum();
     let lines: usize = texts.iter().map(|it| it.lines().count()).sum();
+    // `--profile=old|rows` first: that path alone, round after round, for a sampling profiler
+    // to attach to (the process prints its id and runs for about `PROFILE_ROUNDS` outlines of
+    // everything).
+    if let Some(path) = profile {
+        println!("profile {path}: pid {}", std::process::id());
+        let start = Instant::now();
+        let mut items = 0usize;
+        for _ in 0..PROFILE_ROUNDS {
+            for text in &texts {
+                items += match path {
+                    Path::Old => outline(text, Edition::E2024, Alloc::global()).items().len(),
+                    Path::Rows => rows(text),
+                };
+            }
+        }
+        println!(
+            "profile {path}: {PROFILE_ROUNDS} rounds, {items} items, {:.1} ms a round, load {}",
+            start.elapsed().as_secs_f64() * 1e3 / PROFILE_ROUNDS as f64,
+            load()
+        );
+        return;
+    }
+    // The before and after of the outline lane: the path that is `outline` today (split, then
+    // each part walked from the parser's events) and the rows path (`outline_rows`: the item
+    // grammar's sink writes the rows), in one run, alternated, best of five, with the machine's
+    // load average when each best round ended.
+    let mut best = [(f64::MAX, std::string::String::new()), (f64::MAX, std::string::String::new())];
+    let mut best_cpu = [f64::MAX; 2];
+    let mut counts = [0usize; 2];
+    for _ in 0..5 {
+        for (slot, path) in [Path::Old, Path::Rows].into_iter().enumerate() {
+            let (start, start_cpu) = (Instant::now(), cpu());
+            let mut items = 0usize;
+            for text in &texts {
+                items += match path {
+                    Path::Old => outline(text, Edition::E2024, Alloc::global()).items().len(),
+                    Path::Rows => rows(text),
+                };
+            }
+            let (took, took_cpu) = (start.elapsed().as_secs_f64(), cpu() - start_cpu);
+            counts[slot] = items;
+            best_cpu[slot] = best_cpu[slot].min(took_cpu);
+            if took < best[slot].0 {
+                best[slot] = (took, load());
+            }
+        }
+    }
+    for (((took, load), cpu), (path, items)) in best.iter().zip(best_cpu).zip([Path::Old, Path::Rows].into_iter().zip(counts)) {
+        println!(
+            "{path}: {} files, {:.1} MB, {items} items, {:.1} ms best of 5 on one thread ({:.0} MB/s), {:.1} ms of CPU, load {load}",
+            files.len(),
+            bytes as f64 / 1e6,
+            took * 1e3,
+            bytes as f64 / 1e6 / took,
+            cpu * 1e3,
+        );
+    }
     for round in 0..3 {
         let (mut items, mut errors, mut unhandled) = (0usize, 0usize, 0usize);
         let start = Instant::now();

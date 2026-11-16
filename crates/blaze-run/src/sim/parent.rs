@@ -104,6 +104,10 @@ impl World {
                     return Err(Broke::Harness(format!("slot {} given hooks with no toggle", slot.0)));
                 }
                 Effect::Say(_) | Effect::WriteImage => {}
+                // Slots by symbol: this simulation's parent has a fixed list and asks by slot.
+                Effect::Declare { .. } | Effect::Unresolved { .. } => {
+                    return Err(Broke::Harness(format!("{effect:?} from a parent asked by slot alone")));
+                }
             }
         }
         Ok(())

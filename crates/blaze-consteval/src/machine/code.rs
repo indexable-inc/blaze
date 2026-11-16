@@ -225,7 +225,9 @@ pub(super) struct Code<A: Allocator + Clone> {
     pub(super) discrs: Vec<i128, A>,
     /// The records compiling read (explicit discriminants): every run reads them too.
     pub(super) reads: Vec<ContentId, A>,
-    /// No `Late::Need` in it: kept for every later evaluation.
+    /// No `Late::Need` in it, and no run of it has stopped on what the world does not hold
+    /// (a reached `Late::Refuse(Refusal::Missing)`: machine.rs, `Op::Late`): kept for every
+    /// later evaluation.
     pub(super) complete: bool,
 }
 
@@ -792,6 +794,47 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         rows(t.expr_defs.0, e).next().map(|i| t.expr_defs.1[i])
     }
 
+    /// The ground arguments a value path gives the constant it names, when the path itself
+    /// says them: `<Q as Trait<A..>>::NAME` with ONE segment after the anchor. The Reference,
+    /// "Paths", "Qualified paths": "Fully qualified paths allow for disambiguating the path
+    /// for trait implementations and for specifying canonical paths": the constant is
+    /// `Trait`'s own `NAME` (the checker records `Def::Const` of the TRAIT's item:
+    /// blaze-typeck rules/lit_path.rs `anchored_value`) at `Self = Q` followed by the
+    /// arguments written on the trait's path. So the list is `[Q, A..]`, each grounded at
+    /// this instance's arguments, and the caller asks [`ConstWorld::resolve`] for the impl's
+    /// item, as for a call (the pinned core, library/core/src/mem/mod.rs: `size_of::<T>()`
+    /// is `<T as SizedTypeProperties>::SIZE`, which has a value only at a ground `T`).
+    ///
+    /// `List::EMPTY` for every other path (`NAME`, `Ty::NAME`, `Self::NAME`, `<Q>::NAME`,
+    /// `<Q as Trait>::Assoc::NAME`): the checker selected by type there and a checked body
+    /// records no arguments for a constant path (owed in blaze-typeck: `Checked` holds
+    /// `Def::Const(key)` alone), so such a path names its constant at no arguments, as before.
+    /// A trait parameter after `Self` that the path does not write (a default, or one the
+    /// checker inferred) is not in the list: the world's `resolve` is asked with what is
+    /// written and refuses a list it cannot select by, never a guessed impl.
+    fn qualified_const_args(&mut self, cc: &Cc<'w, '_>, p: blaze_typeck::PathIdx) -> R<'a, List> {
+        let body = cc.typed.body;
+        let bp = body.paths.get(p.ix()).copied().ok_or(malformed("a path past the body"))?;
+        let Some(anchor) = bp.anchor else { return Ok(List::EMPTY) };
+        let Some(trait_path) = anchor.trait_ else { return Ok(List::EMPTY) };
+        if bp.segments.len != 1 {
+            return Ok(List::EMPTY);
+        }
+        let tp = body.paths.get(trait_path.ix()).copied().ok_or(malformed("a trait's path past the body"))?;
+        let segments = body.segments.get(tp.segments.range()).ok_or(malformed("a trait path's segments past the body"))?;
+        let written: &[PTy] = match segments.last() {
+            Some(s) => body.type_lists.get(s.generic_args.range()).ok_or(malformed("a trait path's arguments past the body"))?,
+            None => &[],
+        };
+        let no_ground = "a qualified constant path `<T as Trait>::NAME` whose type has no ground form (a hole `_`, an alias, an opaque type)";
+        let mut all: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(1 + written.len(), self.alloc);
+        all.push(blaze_build::ground(body.types, anchor.ty, &cc.args, self.ground, self.alloc, self.world).map_err(|_| unsupported(no_ground))?);
+        for &t in written {
+            all.push(blaze_build::ground(body.types, t, &cc.args, self.ground, self.alloc, self.world).map_err(|_| unsupported(no_ground))?);
+        }
+        self.ground.intern_list(&all).map_err(|_| malformed("the ground table is full"))
+    }
+
     fn pat_def_c(&self, cc: &Cc<'w, '_>, p: PatId) -> Option<Def> {
         let t = &cc.typed;
         rows(t.pat_defs.0, p).next().map(|i| t.pat_defs.1[i])
@@ -1246,7 +1289,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 cc.rs.push(dst);
             }
             C::Block { e, next } => {
-                let Expr::Block { stmts, tail, .. } = self.expr_c(cc, e)? else { return Err(malformed("a block task")) };
+                let (Expr::Block { stmts, tail, .. } | Expr::ConstBlock { stmts, tail, .. }) = self.expr_c(cc, e)? else { return Err(malformed("a block task")) };
                 let l = body.stmt_lists.get(stmts.range()).ok_or(malformed("statements past their column"))?;
                 match l.get(next as usize) {
                     Some(&s) => {
@@ -1489,12 +1532,21 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     cc.rs.push(r);
                 }
             },
-            Expr::Path(_) => {
+            Expr::Path(p) => {
                 let t = self.ety_c(cc, e)?;
                 match self.expr_def_c(cc, e) {
                     Some(Def::Const(k)) => {
-                        let key = RecordKey::of(self.instance(k, List::EMPTY)?);
-                        code.consts.push((k, List::EMPTY, key));
+                        // `<Q as Trait>::NAME` names the trait's constant at `Self = Q`
+                        // ([`Self::qualified_const_args`]): the impl is selected for the
+                        // ground `Q`, as a call's callee is. Any other path stays at no
+                        // arguments.
+                        let written = self.qualified_const_args(cc, p)?;
+                        // No impl selected is `Refusal::Missing`: when a run reaches it this
+                        // code is no longer kept (machine.rs, `Op::Late`), so a world that
+                        // then makes the trait's impls and asks again has it compiled again.
+                        let (k, args) = if written.len == 0 { (k, List::EMPTY) } else { self.resolve(k, written)? };
+                        let key = RecordKey::of(self.instance(k, args)?);
+                        code.consts.push((k, args, key));
                         let dst = self.reg(cc, Kind::P);
                         self.emit(code, cc, Op::Const { dst, k: code.consts.len() as u32 - 1 });
                         cc.rs.push(dst);
@@ -1525,7 +1577,12 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let mode = self.natural_c(cc, i)?;
                 cc.tasks.push(C::Eval(i, mode));
             }
-            Expr::Block { .. } => {
+            // The Reference, "Block expressions", "Const blocks": "A const block is a variant of a
+            // block expression whose body evaluates at compile-time instead of at runtime", with
+            // the enclosing generic parameters in scope. Inside an evaluation (already compile
+            // time, at the evaluation's arguments) its value is its block's; it is also the root
+            // of a const block's own evaluation (blaze-ladder front2/const_at.rs).
+            Expr::Block { .. } | Expr::ConstBlock { .. } => {
                 let dst = self.reg(cc, Kind::V);
                 let ends = self.list(cc);
                 cc.targets.push(Target { e, dst, ends, start: None });
@@ -1677,7 +1734,6 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             Expr::Await(_) | Expr::AsyncBlock { .. } => return Err(unsupported("`async` in a constant")),
             Expr::Underscore => return Err(unsupported("`_` (`_ = e`) in a constant")),
             Expr::RawRef { .. } => return Err(unsupported("a raw borrow in a constant")),
-            Expr::ConstBlock { .. } => return Err(unsupported("a const block in a constant")),
             // A field's offset is the container's layout's: `layout` gives sizes, not yet
             // where each field sits.
             Expr::OffsetOf { .. } => return Err(unsupported("`offset_of!` (a field's offset from the layout)")),

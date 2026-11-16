@@ -46,6 +46,155 @@ fn charge(cx: &Cx, key: &StripeKey, api: &Net, cfg: &Dir<ReadOnly>) -> Result<()
 }
 ```
 
+## End state: efficiency (architect, 2026-11-16)
+
+What each operation should cost, and its floor. What it costs today, with evidence, is in
+"Gap" below. "(verify)" marks a platform fact no test here has shown yet (rule 45).
+
+**(a) Files.** The seam stays: ops out, events in ("The boundary" stands). What costs is the
+queue, the world's lock (taken four to six times a call; held across the driver's blocking
+poll, so a world has about one effect in flight) and macOS's two thread hops, not the `match`
+on the backend (about 1 ns).
+- macOS: a blocking call (stat, open, pread, close, getattrlistbulk) runs inline on the asking
+  thread, so the pool's workers are the blocking thread set. Linux: one io_uring per worker
+  ("`Threads`" item 7 stands), with a linked `OPENAT` into a fixed slot, `READ` and `CLOSE`
+  (uring/files.rs stands). The simulation keeps its queue: one `Files` seam, two
+  instantiations (rule 78), held equal by the drivers' equality tests. The clock is read
+  with no lock. A path is text in the thread's path buffer or a `Names` column, never a
+  `format!` and an `Arc<str>`. A read lands in memory the caller handed in.
+- N small files. Floor: `openat(dirfd, leaf)`, one `pread` of the stamp's size plus one byte,
+  `close`: 3 calls a file and no copy (today 6 calls and 2 trips). On Linux a batch is one
+  submission. On macOS a batch spreads over the workers, with `F_RDADVISE` before a cold
+  batch (verify). `F_NOCACHE` is never set: the page cache is the only cache (rule 51).
+- Listing is one level, as columns (`Dir::entries` stands: 1.13x of one `getattrlistbulk`
+  pass). `Dir::list`, at any depth, goes.
+- A repeat's read list. Floor without a journal: ONE `Effect::Stamp` (bstd `Dir::looks`;
+  0.77 us a name, blaze-core `examples/stat_cost.rs`). Floor with a journal: macOS FSEvents
+  since the stored event id, then stat only the named paths. The journal is trusted only when
+  the volume UUID is the stored one, no event carries `MustScanSubDirs`, `UserDropped`,
+  `KernelDropped` or `RootChanged`, the history reached the stored id, and the ids did not go
+  back. Anything else is a full sweep (verify: ids survive a reboot; the UUID changes when the
+  history is lost). Linux keeps no journal for a process that exits, so there the repeat is
+  one `STATX` batch, unless a helper with an expiry keeps an inotify journal. Its absence, or
+  `IN_Q_OVERFLOW`, means a full sweep.
+- Map or read: a pack is mapped read-only once per process and never unmapped in the run (no
+  TLB shootdown across 128 cores), and its records are read in place once it is verified. A
+  file read once is `pread` into the task's frame. The line: map what a process reads many
+  times, or plain arrays over about 64 KiB. This replaces S1f's "no `mmap`" for packs (a
+  decision).
+
+**(b) Memory.** Frames stand (memory.md "Allocators by lifetime"; a bump is 2 ns, the top
+block grows in place). A table that grows while other things are allocated after it gets a
+region of its own in the frame (`Frame::table` over `RegionVec`): it never copies, leaves no
+hole and keeps stable u32 indexes. A refusal is typed (parallel.md items 6 and 7 stand;
+blaze-own has the `try_` forms). Data is columns with u32 indexes (blaze-own `Soa`, `Segs`;
+blaze-mem `Column`; core's `Listing`, `Names` stand). A path is a u32 id into the request's
+path table, with joined text only at the system call. No task copies a path, and no effect
+holds an `Arc<str>` or a copy of the bytes it writes: a write borrows them until it completes.
+
+**(c) Tasks.** parallel.md "End state" stands. bstd's pool adds four things. A joiner that is
+not a worker helps: it takes injected work, and steals once it has a worker identity. Results
+come in completion order and are merged by index. One wake serves a batch, with no mutex per
+task. A worker's frame is reset to a marker after each item. Floor: under 200 ns from a spawn
+to its result being seen.
+
+**(d) Hashing.** BLAKE3 for every key, content id, name another machine or user sees, and
+digest checked after a fetch or a boot. In-process maps need none (foldhash over blaze-swiss
+stands, kept scalar on purpose by measurement). Everything persisted uses one digest (rule 30):
+no XXH3 beside it. Many small inputs go side by side (`hash_many`: 8 lanes at the baseline, 16
+on AVX-512; the outline uses it). A parent's digest takes its children's digests, and an
+unchanged stamp means the file is not read, so no byte is hashed twice.
+
+**(e) The record store.** A put is O(1): the row is appended, sorted once at seal, and found
+meanwhile through a hash map. The maker writes its record into a per-worker segment that never
+moves, and the pack is written by gathered writes. Items that are many make one record a
+crate, not a file an item. Packs are mapped (a), and the index is a column of keys searched in
+place. A pack is verified once per boot ("Verify once" stands, store.rs `read_pack`). Nothing
+is synced on the command path, and a torn pack is never trusted (footer digest plus boot
+record stand). One store serves a user's worktrees (store.rs `OWN` stands). Outputs are placed
+by `clonefile` or `FICLONE`; ext4 has no clone, so there it is `copy_file_range` (store.md
+"Store" stands). Large records stay readable in place: a text table with u32 ids per record,
+u8 kind columns, item-relative u32 spans. zstd is used only for cold records fetched over the
+network, since it forces a copy.
+
+| System | What blaze matches, or does better by design |
+|---|---|
+| io_uring (TigerBeetle, glommio, Seastar) | a ring per core, fixed files, linked ops; blaze also stats a column in one op |
+| LMDB, git packs; Cap'n Proto, rkyv | immutable sorted packs, mapped and read in place; verified once, with a proof |
+| bumpalo, Zig `MultiArrayList`, mimalloc; rayon, Chase-Lev, Tokio | frames, `Soa`, a heap per tag, a growing table that never copies; the joiner helps |
+| BLAKE3 `hash_many`, Swiss, F14; Bazel, Buck2, Nix; APFS clones | digests of digests; keys at item grain; outputs cloned |
+
+Floor (estimate, rule 67): a repeat with nothing changed is two `pread`s, a journal query and
+mapped packs: under 5 ms on tempo (27.9 to 37 ms today) and under 10 ms on blaze (120 ms).
+
+### Gap (tree of 2026-11-16, by search)
+
+| End state needs | Today, with evidence | Cost | Missing |
+|---|---|---|---|
+| A put in O(1) | sorted `index.insert` (blaze-cli store.rs `PackStore::put`) | 2.44 s, 114,429 puts | append, then sort at seal |
+| The joiner helps, in completion order | `Pool::wait` helps only `Here::Worker` (task/threads.rs) | 48.2 s on the main thread, pool parked | piece 1 |
+| A growing table that never copies | frames grow only the top block (blaze-mem frame.rs `grow`, `grow_top`) | 45.8 MB and 4.17 MB abandoned | piece 2 (written, uncompiled) |
+| No whole-depth listing | `Dir::list` (bstd fs.rs); callers blaze-cli program.rs `run`, bstd kv.rs, blobs.rs | 64 MiB overflow in 4 to 21 s | callers moved to `entries`, then a ban |
+| A read list stamped in one effect | `Follow::follow` makes one `Dir::stat` a path (blaze-cli sweep.rs) | tempo 8.8 ms (11.9 on 18 workers) | `Dir::looks` (written, uncompiled); the sweep's switch |
+| IO in parallel | `Io::poll` holds the world's lock across the driver's blocking poll (bstd io.rs) | is the 8.8 against 11.9 ms above | inline blocking calls (macOS), a ring per worker (Linux) |
+| A clock read without the lock | `Io::now` locks the world (bstd io.rs) | not measured: 10^6 `Clock::now` on 1 and 18 threads | the native clock held outside the lock |
+| A source read in one trip | `Dir::read_all` = `found` (a stat) + `ReadAll` (std's read by path; core threads.rs `run_kept`) | not measured: 2,000 `read_all`s against `openat`+`pread` | `Dir::read_sized`: one `Read` of len+1 |
+| A record read without an effect | `get_into` = `read_at` = `Effect::Read` (open by path, `pread`, Vec, copy; core fs.rs `read`) | not measured: the profile's count of gets times their ns | packs mapped once; the index read in place |
+| The pack index read in place | `read_pack` parses every row into a Vec at each open (store.rs) | not measured: open time against row count | binary search over the mapped key column |
+| Writes that borrow | `append_bytes` calls `bytes.to_vec()` (bstd fs.rs) | not measured: bytes copied a command | an op body borrowed until its completion (the `Pending` form) |
+| A repeat that stats nothing | no journal on the command path (`Effect::Journal` exists, used only by blaze-vfs) | part of the 27.9 to 120 ms repeat | the sweep asks FSEvents since its stored id |
+| Outline digests at the floor | digest.rs batches already | 74 ms against 25 ms | the profile's split |
+| Compact expansions | 22 columns, about 400 B each, a call | 321 MB, 128,546 calls | per-record text tables, u8 kinds |
+
+### Pieces, in build order (one writer each; A = can be written at the same time as the others marked A)
+
+1. **A. The pool's join** (writer ab1a42b2898694bd9, written, uncompiled: task/help.rs,
+   `Pool::lend`, `Tally::joins`). A non-worker joiner runs injected tasks of its class. A batch
+   join reads a count of ended tasks and merges by index. Saves up to the 48.2 s of in-order
+   join. Test: `a_batch_join_merged_by_key_gives_equal_bytes_in_any_schedule`, with its plant.
+2. **A. The frame's growing table** (writer a18ba224587a1dab7, written, uncompiled:
+   blaze-mem frame/table.rs, frame/grow.rs). Saves the 45.8 MB and the 4.17 MB. Test: 10^6
+   interleaved pushes, 0 copies, within 1.25x. Left: the profile's row (DRIVER), and on macOS
+   reserving in 4 GiB segments.
+3. **A. `PackStore::put` in O(1)** (writer a5aadb06ee11bb5be). Saves the 2.44 s. Test: the
+   bytes moved by 200,000 puts are linear; the pack's bytes are unchanged.
+4. **A. `Dir::looks`** (this architect, written: bstd fs/looks.rs, tests/looks.rs). Then the
+   sweep uses it (DRIVER: sweep.rs `Follow::follow`). Saves tempo's 8.8 ms, down to about 1 ms
+   (0.77 us a name; tempo's path count is to be printed). Test: one effect, each look the same
+   as its stat.
+5. **A. `Dir::read_sized(cx, path, len, into)`.** One `Read` of len+1, no stat before it; a file
+   that grew is refused by name. Saves one trip and three calls a file read. Test: the effect
+   count, and a file that grew between its stamp and its read.
+6. **A. `Io::now` without the lock.** The native clock is held beside the lock; the simulation
+   keeps its virtual clock under it. Test: the simulated clock still advances only by
+   `idle_until`, and the native reads need no lock (counted).
+7. **Inline blocking file calls** (blaze-core kqueue.rs, bstd io.rs `call`), after 6: a native
+   `perform_now(effect) -> Option<Done>` for blocking calls, asked before `submit`. Test: the
+   drivers' equality tests, and the sweep on 1 and 18 workers (18 must not be slower).
+8. **Packs mapped once, the index in place** (store.rs), after 3: `get_into` reads from the
+   map. Test: the `StorePlant` simulations, and 0 effects a get.
+9. **A. `Dir::list` gone**: kv.rs and blobs.rs move to `entries` with a work list, program.rs
+   follows the loader; then a `.clippy.toml` ban. Test: kv's simulation tests unchanged.
+10. **The journal on a repeat** (sweep.rs, macOS), after 4: `Effect::Journal` since the stored
+    cursor, and every distrust condition above falls back to the full `looks`. Test: the
+    simulation drops a planted event, and the repeat must still see the change.
+11. **A. Writes that borrow** (bstd fs.rs `append_bytes`, `write_at`): the `Pending` form. Test:
+    the copy count is 0.
+12. **Paths as ids** (cross-crate, one batch): `FileName` out of the hot effects.
+13. **Compact expansions** (EXPANSION lane): text tables and u8 kinds.
+14. **The outline's digest split** (OUTLINE lane): profile first.
+15. **The pool as one batch** (task/threads.rs, after 1). A joiner adopts a worker identity so
+    it can steal. A ring per scope replaces the count's sweep, behind `Joining`. `current`
+    becomes an `AtomicPtr`, and the pinned queue is checked through an atomic count. Test: the
+    pool's interleaving model, plus a planted lost wake.
+
+Decisions wanted:
+- core's `Stamp` gains `dev` (40 to 48 bytes; one blaze-core batch), so that a look equals a
+  stat in full. Recommended: yes.
+- packs are mapped (replacing S1f's "no `mmap`" for packs). Recommended: yes.
+- on Linux, a helper with an expiry keeps the journal. Recommended: later, after piece 4
+  on io_uring.
+
 ## The one rule
 
 **With no capability, code is pure computation.** A function that is handed nothing can take its

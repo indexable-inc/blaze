@@ -46,6 +46,18 @@ pub trait Sink {
         self.start(at)
     }
 
+    /// Whether the sink has all it reads of this parse, so that the rest need not be parsed:
+    /// asked where a block's next statement would start, and when true no further statement of
+    /// that block is read, nor of the blocks around it, each asked in turn as its statement
+    /// ends. What the sink is told after it first answers true is of a parse cut short (nodes
+    /// closed early, errors for what was not read): a sink that answers true reads none of it,
+    /// and its answer never turns false again. A sink that reads the whole parse (the tree
+    /// builder's events, an outline's rows) never does: the default.
+    #[inline]
+    fn satisfied(&self) -> bool {
+        false
+    }
+
     /// The next `n_raw_tokens` input tokens are one token of `kind`.
     fn token(&mut self, kind: SyntaxKind, n_raw_tokens: u8);
 
@@ -193,5 +205,73 @@ impl Sink for EventSink {
             Event::Lazy { .. } => Some(T!['}']),
             _ => None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Edition, LexedStr, SyntaxKind::*};
+
+    /// The kinds of the nodes a block's parse finishes, in order; with `stop`, satisfied once a
+    /// `MACRO_CALL` is finished.
+    struct Kinds {
+        stop: bool,
+        seen: Vec<SyntaxKind>,
+    }
+
+    impl Sink for Kinds {
+        fn satisfied(&self) -> bool {
+            self.stop && self.seen.contains(&MACRO_CALL)
+        }
+        fn start(&mut self, _at: u32) -> u32 {
+            0
+        }
+        fn token(&mut self, _kind: SyntaxKind, _n_raw_tokens: u8) {}
+        fn complete(&mut self, _mark: u32, kind: SyntaxKind, at: u32) -> Done {
+            self.seen.push(kind);
+            Done { start: 0, end: at }
+        }
+        fn abandon(&mut self, _mark: u32, _at: u32) {}
+        fn precede(&mut self, _done: u32, _at: u32) -> u32 {
+            0
+        }
+        fn extend_to(&mut self, done: u32, _mark: u32) -> u32 {
+            done
+        }
+        fn split_float(&mut self, mark: u32, _ends_in_dot: bool, _at: u32) -> u32 {
+            mark
+        }
+        fn error(&mut self, _message: Message, _at: u32) {}
+        fn lazy(&mut self, kind: SyntaxKind, _n_input_tokens: u32, _at: u32) {
+            unreachable!("a block's parse leaves no lazy {kind:?}")
+        }
+        fn last_token(&self, end: u32, input: Tokens<'_>) -> Option<SyntaxKind> {
+            end.checked_sub(1).map(|at| input.kind(at as usize))
+        }
+    }
+
+    fn kinds(text: &str, stop: bool) -> Vec<SyntaxKind> {
+        let input = LexedStr::new(Edition::CURRENT, text).to_input(Edition::CURRENT);
+        crate::block_into(input.tokens(), Kinds { stop, seen: Vec::new() }).seen
+    }
+
+    /// A satisfied sink ends the parse at the next statement boundary, in the block the
+    /// statement is in and in each block around it: what comes after is not parsed (no
+    /// `CALL_EXPR`, no `LET_STMT`, no second `MACRO_CALL`), every node open then is still
+    /// finished, and what was finished before the sink was satisfied is what a whole parse
+    /// finishes first. Without the answer the same grammar parses it all.
+    #[test]
+    fn a_satisfied_sink_ends_the_parse_at_the_next_statement() {
+        let text = "{ a; if b { c!(); d(); let e = 1; } f(); g!(); }";
+        let whole = kinds(text, false);
+        assert_eq!(whole.iter().filter(|&&kind| kind == MACRO_CALL).count(), 2);
+        assert!(whole.contains(&CALL_EXPR) && whole.contains(&LET_STMT));
+        let cut = kinds(text, true);
+        assert_eq!(cut.iter().filter(|&&kind| kind == MACRO_CALL).count(), 1);
+        assert!(!cut.contains(&CALL_EXPR) && !cut.contains(&LET_STMT), "{cut:?}");
+        let upto = cut.iter().position(|&kind| kind == MACRO_CALL).expect("the call") + 1;
+        assert_eq!(cut[..upto], whole[..upto], "the same parse up to the call");
+        assert_eq!(cut.last(), Some(&BLOCK_EXPR), "the block itself is finished: {cut:?}");
     }
 }

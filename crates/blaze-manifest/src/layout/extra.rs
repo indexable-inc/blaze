@@ -84,9 +84,33 @@ pub struct ExtraTarget<'a> {
     pub required_features: Vec<Text<'a>, Alloc<'a>>,
 }
 
-/// Why a workspace member's target of the three kinds is refused; [`LayoutError::Target`] names
-/// the package, the kind and the target. Never raised for a layout read without
-/// `Layout::with_test_targets` (a dependency's), which finds no such targets.
+/// A member's integration test, example or bench refused by the rules: a finding on its
+/// manifest's line ([`Member::refused_targets`]), not a [`LayoutError`], so one bad target
+/// leaves the rest of the workspace read and checked. The target is not in
+/// [`Member::extras`] and so is never a unit.
+///
+/// [`Member::refused_targets`]: super::Member::refused_targets
+/// [`Member::extras`]: super::Member::extras
+#[derive(Clone)]
+pub struct RefusedTarget<'a> {
+    pub kind: ExtraKind,
+    /// Its name; empty for a table with no `name`.
+    pub target: Text<'a>,
+    /// Its table's line, or for a found one the `[package]` header.
+    pub at: Span,
+    pub why: TargetRefused<'a>,
+}
+
+impl<'a> RefusedTarget<'a> {
+    /// The same refusal as an error of the package `package`, for a caller that stops on it.
+    pub fn error(&self, package: &str, alloc: Alloc<'a>) -> LayoutError<'a> {
+        LayoutError::Target { package: String::from_str_in(package, alloc), kind: self.kind, target: self.target.clone(), at: self.at, why: self.why.clone() }
+    }
+}
+
+/// Why a workspace member's target of the three kinds is refused ([`RefusedTarget`]). Never
+/// found for a layout read without `Layout::with_test_targets` (a dependency's), which finds
+/// no such targets.
 #[derive(Clone)]
 pub enum TargetRefused<'a> {
     /// A table with no `name`: "This is required for all targets except `[lib]`."
@@ -152,14 +176,20 @@ impl<'l, 'a> Passing<'l, 'a> {
     ///   Beginning with the 2018 edition, the default is always `true`."
     /// - a written table adds a target or renames a found one: a found target whose name or
     ///   root a written one has is not added again (as for binaries).
+    ///
+    /// A target refused by these rules is left out and returned as a [`RefusedTarget`] (a
+    /// finding on its manifest's line), never a [`LayoutError`]: one bad `[[example]]` must not
+    /// hide the rest of the workspace from `check`.
+    #[allow(clippy::type_complexity)]
     pub(super) fn extras(
         &mut self,
         found: &Found<'l, 'a>,
         edition: PackageEdition,
-    ) -> Result<Option<Vec<ExtraTarget<'a>, Alloc<'a>>>, LayoutError<'a>> {
+    ) -> Option<(Vec<ExtraTarget<'a>, Alloc<'a>>, Vec<RefusedTarget<'a>, Alloc<'a>>)> {
         let alloc = self.alloc();
         let package = found.package;
         let mut out: Vec<ExtraTarget<'a>, Alloc<'a>> = Vec::new_in(alloc);
+        let mut refused: Vec<RefusedTarget<'a>, Alloc<'a>> = Vec::new_in(alloc);
         let mut pending = false;
         for kind in ExtraKind::ALL {
             let any_written = package.extras.iter().any(|raw| raw.kind == kind);
@@ -172,8 +202,9 @@ impl<'l, 'a> Passing<'l, 'a> {
             };
             let start = out.len();
             for raw in package.extras.iter().filter(|raw| raw.kind == kind) {
-                match self.written(found, raw, &inferred)? {
-                    Some(target) => out.push(target),
+                match self.written(found, raw, &inferred) {
+                    Some(Ok(target)) => out.push(target),
+                    Some(Err(refusal)) => refused.push(refusal),
                     None => pending = true,
                 }
             }
@@ -194,24 +225,25 @@ impl<'l, 'a> Passing<'l, 'a> {
                     }
                 }
             }
-            // One name per kind: two written tables, or `x.rs` beside `x/main.rs`.
-            for at in start..out.len() {
-                if let Some(first) = out[start..at].iter().find(|other| other.name == out[at].name) {
-                    return Err(LayoutError::Target {
-                        package: package.name.clone(),
-                        kind,
-                        target: out[at].name.clone(),
-                        at: out[at].span,
-                        why: TargetRefused::Duplicate { first: first.span },
-                    });
+            // One name per kind: two written tables, or `x.rs` beside `x/main.rs`. The first
+            // stays; each later one of its name is refused and left out.
+            let mut at = start + 1;
+            while at < out.len() {
+                match out[start..at].iter().find(|other| other.name == out[at].name).map(|first| first.span) {
+                    Some(first) => {
+                        let second = out.remove(at);
+                        refused.push(RefusedTarget { kind, target: second.name, at: second.span, why: TargetRefused::Duplicate { first } });
+                    }
+                    None => at += 1,
                 }
             }
         }
         if pending {
-            return Ok(None);
+            return None;
         }
         out.sort_by(|a, b| (a.kind, a.name.as_str()).cmp(&(b.kind, b.name.as_str())));
-        Ok(Some(out))
+        refused.sort_by(|a, b| (a.at.manifest, a.at.start, a.kind, a.target.as_str()).cmp(&(b.at.manifest, b.at.start, b.kind, b.target.as_str())));
+        Some((out, refused))
     }
 
     /// The targets of `kind` found by their files under the package directory `dir`, each
@@ -254,24 +286,20 @@ impl<'l, 'a> Passing<'l, 'a> {
     /// A `[[test]]` (`[[example]]`, `[[bench]]`) table as a target: "The `path` field specifies
     /// where the source for the crate is located, relative to the `Cargo.toml` file. If not
     /// specified, the inferred path is used based on the target name." A written path's file
-    /// is checked in its directory's listing; `None` while that listing is still to come.
+    /// is checked in its directory's listing; `None` while that listing is still to come, and
+    /// a target these rules refuse is `Some(Err(..))`.
     fn written(
         &mut self,
         found: &Found<'l, 'a>,
         raw: &RawExtra<'a>,
         inferred: &[(Text<'a>, Text<'a>)],
-    ) -> Result<Option<ExtraTarget<'a>>, LayoutError<'a>> {
+    ) -> Option<Result<ExtraTarget<'a>, RefusedTarget<'a>>> {
         let alloc = self.alloc();
-        let package = found.package;
         let dir = found.dir.as_str();
-        let refuse = |target: &str, why: TargetRefused<'a>| LayoutError::Target {
-            package: package.name.clone(),
-            kind: raw.kind,
-            target: String::from_str_in(target, alloc),
-            at: raw.span,
-            why,
+        let refuse = |target: &str, why: TargetRefused<'a>| {
+            Some(Err(RefusedTarget { kind: raw.kind, target: String::from_str_in(target, alloc), at: raw.span, why }))
         };
-        let Some(name) = &raw.name else { return Err(refuse("", TargetRefused::NoName)) };
+        let Some(name) = &raw.name else { return refuse("", TargetRefused::NoName) };
         // Only a workspace member's targets are read here (`Layout::with_test_targets`): a
         // dependency is published without these folders as a matter of course, and its tests,
         // examples and benches are never built, so its tables are read for shape only.
@@ -281,7 +309,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                 None => {
                     let mut path = file(&file(dir, raw.kind.dir(), alloc), name, alloc);
                     path.push_str(".rs");
-                    return Err(refuse(name, TargetRefused::NoFile { path }));
+                    return refuse(name, TargetRefused::NoFile { path });
                 }
             },
             Some(path) => match join(dir, path, alloc) {
@@ -291,17 +319,17 @@ impl<'l, 'a> Passing<'l, 'a> {
                         None => ("", root.as_str()),
                     };
                     match self.list(parent) {
-                        None => return Ok(None),
+                        None => return None,
                         Some(entries) => match entries.is_some_and(|entries| entries.iter().any(|(n, d)| n.as_str() == leaf && !*d)) {
                             true => root,
-                            false => return Err(refuse(name, TargetRefused::NoFile { path: root.clone() })),
+                            false => return refuse(name, TargetRefused::NoFile { path: root.clone() }),
                         },
                     }
                 }
-                _ => return Err(refuse(name, TargetRefused::OutsidePackage { path: path.clone() })),
+                _ => return refuse(name, TargetRefused::OutsidePackage { path: path.clone() }),
             },
         };
-        Ok(Some(ExtraTarget {
+        Some(Ok(ExtraTarget {
             kind: raw.kind,
             name: name.clone(),
             root,

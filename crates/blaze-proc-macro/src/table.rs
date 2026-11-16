@@ -28,22 +28,37 @@
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use blaze_expand::{Edition, Produced, ReadAnswer, ReadKind, Reads};
-use blaze_ids::{ContentId, Hasher};
-use blaze_own::Alloc;
+use blaze_expand::atoms::{ATOM, Atoms, AtomsBuilder, AtomsError, Checked};
+use blaze_expand::{Ctx, Edition, Produced, ReadAnswer, ReadKind, Reads, TokenOrigin, TokenStream};
+use blaze_ids::ContentId;
+use blaze_own::{AVec, Alloc};
 use bstd::sync::Lock;
 
-use super::{Corrupt, Cursor, DirStore, FilesError, RecordError, RecordName, RecordPlant, SEAL_LEN, answer_into, answer_of};
+use super::{
+    Corrupt, Cursor, DirStore, FilesError, Held, RecordError, RecordName, RecordPlant, SEAL_LEN, answer_into, answer_of, origin_bytes, origin_of,
+    tail_of, token_bytes, token_of,
+};
 use crate::sandbox::{Package, answer_now};
 
-/// The layout word a body starts with.
-const MAGIC: u64 = u64::from_le_bytes(*b"bzpmtb01");
-/// The head: the layout word, the row count, the list count.
-const HEAD: usize = 16;
-/// A row: the base key (32), the list's index, the answer's place and length, a zero word.
+/// The layout word a body starts with. 03: a kept answer's tokens are rows over the table's
+/// atoms ([`blaze_expand::atoms`], the token row form's one home) and its origins are runs
+/// (02 held each token's kind and text again in every answer: 21 bytes a token). 02: places
+/// are 64-bit (01's were 32-bit: a table past 4 GB could not be written).
+const MAGIC: u64 = u64::from_le_bytes(*b"bzpmtb03");
+/// The head: the layout word, the row count, the list count, the atom count, the atoms'
+/// text's length. After it: the rows, the lists' places, the atoms, their text, then the
+/// bytes the places point into.
+const HEAD: usize = 24;
+/// An origin run of a dense answer: how many tokens (32 bits), the origin's tag, the stride
+/// (0 or 1), 16 zero bits, the first token's value (32 bits). Token `i` of a run came from
+/// (tag, first + i * stride). Runs are greedy and maximal, so they are a function of the
+/// origins.
+const RUN: usize = 12;
+/// A row: the base key (32), the list's index (32 bits), the answer's length (32 bits), the
+/// answer's place (64 bits).
 pub const ROW: usize = 48;
-/// A list's place: where its bytes start, their length, how many reads it names.
-pub const LIST: usize = 12;
+/// A list's place: where its bytes start (64 bits), their length, how many reads it names.
+pub const LIST: usize = 16;
 /// The seal's domain: the digest of a body under it ends the file.
 const TABLE_SEAL: &str = "blaze proc-macro results table seal 1";
 
@@ -52,18 +67,16 @@ const UNKNOWN: u8 = 0;
 const CURRENT: u8 = 1;
 const STALE: u8 = 2;
 
-/// The name a crate's results are filed under: the digest of the variables its package gives
-/// its macros (cargo's `CARGO_PKG_NAME`, `CARGO_PKG_VERSION`, `CARGO_CRATE_NAME` and the
-/// rest), sorted. A locator: rows are valid by their own keys and read lists.
+/// The name a crate's results are filed under: the digest of its package's name (cargo's
+/// `CARGO_PKG_NAME` among the variables the package gives its macros; of nothing when the
+/// package has none). A locator, never a key: rows are valid by their own keys and read
+/// lists, so the packages of one name (two versions, a library and its tests) share one
+/// table soundly, and a variable or version that changes leaves the table where it was:
+/// only the rows that read it miss. (Layout 1 named the table by every variable's value: any
+/// change of one gave the crate an empty table.)
 pub fn crate_name(package: &Package) -> ContentId {
-    let mut pairs: Vec<&(String, String)> = package.env.iter().collect();
-    pairs.sort();
-    let mut hasher = Hasher::new("blaze proc-macro crate results 1");
-    for (name, value) in pairs {
-        hasher.update(&(name.len() as u32).to_le_bytes()).update(name.as_bytes());
-        hasher.update(&(value.len() as u32).to_le_bytes()).update(value.as_bytes());
-    }
-    hasher.finish()
+    let name = package.env.iter().find(|(name, _)| name == "CARGO_PKG_NAME").map_or("", |(_, value)| value.as_str());
+    ContentId::of("blaze proc-macro crate results 2", name.as_bytes())
 }
 
 fn table_file(krate: &ContentId) -> RecordName {
@@ -78,6 +91,14 @@ fn u32_at(bytes: &[u8], at: usize) -> usize {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize
 }
 
+/// A 64-bit place at `at`: `usize::MAX` (inside no table) when this machine's addresses do
+/// not hold it.
+fn place_at(bytes: &[u8], at: usize) -> usize {
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&bytes[at..at + 8]);
+    usize::try_from(u64::from_le_bytes(word)).unwrap_or(usize::MAX)
+}
+
 /// A body whose seal was checked, or vouched for in this boot: made only by [`read_whole`].
 struct Whole {
     body: Vec<u8>,
@@ -89,6 +110,12 @@ pub struct Table {
     body: Vec<u8>,
     rows: usize,
     lists: usize,
+    /// Where the atoms start in `body`, and how many there are; their text follows them.
+    atoms_at: usize,
+    atoms: usize,
+    text_len: usize,
+    /// The atoms and their text, proved once by [`Table::of`].
+    proved: Checked,
 }
 
 /// One row of a [`Table`].
@@ -102,7 +129,21 @@ struct Row<'t> {
 impl Table {
     /// No rows: what a crate with no record has.
     const fn empty() -> Table {
-        Table { body: Vec::new(), rows: 0, lists: 0 }
+        Table { body: Vec::new(), rows: 0, lists: 0, atoms_at: 0, atoms: 0, text_len: 0, proved: Checked::EMPTY }
+    }
+
+    /// The table's atoms: what a dense answer's token rows name.
+    fn atoms(&self) -> Atoms<'_> {
+        let text_at = self.atoms_at + self.atoms * ATOM;
+        self.proved
+            .atoms(&self.body[self.atoms_at..text_at], &self.body[text_at..text_at + self.text_len])
+            .expect("`Table::of` proved these two sections of the body, which nothing writes after")
+    }
+
+    /// Row `row`'s answer in the loose form ([`answer_into`]'s bytes): what a run's answer is
+    /// compared with.
+    fn loose_answer(&self, row: usize) -> Result<Vec<u8>, Corrupt> {
+        loosen(&self.atoms(), self.row(row).answer)
     }
 
     /// `whole`'s body as a table, or what in it is not one.
@@ -114,22 +155,25 @@ impl Table {
         if u64::from_le_bytes([body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7]]) != MAGIC {
             return Err("its layout word");
         }
-        let (rows, lists) = (u32_at(&body, 8), u32_at(&body, 12));
+        let (rows, lists, atoms, text_len) = (u32_at(&body, 8), u32_at(&body, 12), u32_at(&body, 16), u32_at(&body, 20));
         let lists_at = rows.checked_mul(ROW).and_then(|it| it.checked_add(HEAD)).ok_or("its row count")?;
-        let data_at = lists.checked_mul(LIST).and_then(|it| it.checked_add(lists_at)).ok_or("its list count")?;
+        let atoms_at = lists.checked_mul(LIST).and_then(|it| it.checked_add(lists_at)).ok_or("its list count")?;
+        let text_at = atoms.checked_mul(ATOM).and_then(|it| it.checked_add(atoms_at)).ok_or("its atom count")?;
+        let data_at = text_at.checked_add(text_len).ok_or("its atoms' text length")?;
         if data_at > body.len() {
             return Err("its tables run past its end");
         }
+        let proved = Atoms::of(&body[atoms_at..text_at], &body[text_at..data_at]).map_err(|_| "its atoms")?.checked();
         let inside = |at: usize, len: usize| at >= data_at && at.checked_add(len).is_some_and(|end| end <= body.len());
         for list in 0..lists {
             let entry = lists_at + list * LIST;
-            if !inside(u32_at(&body, entry), u32_at(&body, entry + 4)) {
+            if !inside(place_at(&body, entry), u32_at(&body, entry + 8)) {
                 return Err("a read list's place");
             }
         }
         for row in 0..rows {
             let entry = HEAD + row * ROW;
-            if u32_at(&body, entry + 32) >= lists || !inside(u32_at(&body, entry + 36), u32_at(&body, entry + 40)) {
+            if u32_at(&body, entry + 32) >= lists || !inside(place_at(&body, entry + 40), u32_at(&body, entry + 36)) {
                 return Err("a row's list or answer place");
             }
             // Key then list index, strictly rising: 36 bytes compared as they lie would order
@@ -142,7 +186,7 @@ impl Table {
                 }
             }
         }
-        Ok(Table { body, rows, lists })
+        Ok(Table { body, rows, lists, atoms_at, atoms, text_len, proved })
     }
 
     /// How many rows it holds.
@@ -161,13 +205,13 @@ impl Table {
 
     fn row(&self, row: usize) -> Row<'_> {
         let entry = HEAD + row * ROW;
-        let (at, len) = (u32_at(&self.body, entry + 36), u32_at(&self.body, entry + 40));
+        let (at, len) = (place_at(&self.body, entry + 40), u32_at(&self.body, entry + 36));
         Row { key: &self.body[entry..entry + 32], list: u32_at(&self.body, entry + 32), answer: &self.body[at..at + len] }
     }
 
     fn list(&self, list: usize) -> &[u8] {
         let entry = HEAD + self.rows * ROW + list * LIST;
-        let (at, len) = (u32_at(&self.body, entry), u32_at(&self.body, entry + 4));
+        let (at, len) = (place_at(&self.body, entry), u32_at(&self.body, entry + 8));
         &self.body[at..at + len]
     }
 
@@ -210,8 +254,18 @@ fn list_into(out: &mut Vec<u8>, reads: &Reads<'_>) -> Result<(), usize> {
     Ok(())
 }
 
-/// The [`Produced`] of a row: its read list's reads and its answer, in `alloc`.
-fn produced_of<'a>(list: &[u8], answer: &[u8], edition: Edition, alloc: Alloc<'a>) -> Result<Produced<'a>, Corrupt> {
+/// What a call's row holds beside its key, in canonical bytes: `produced`'s read list, then
+/// its answer. Two runs gave one row exactly when these are equal. `Err`: the index of a
+/// read whose answer a list does not hold.
+pub fn row_bytes(produced: &Produced<'_>) -> Result<Vec<u8>, usize> {
+    let mut out = Vec::new();
+    list_into(&mut out, &produced.reads)?;
+    answer_into(&mut out, produced);
+    Ok(out)
+}
+
+/// The reads of a read list's bytes, in `alloc`.
+fn reads_of<'a>(list: &[u8], alloc: Alloc<'a>) -> Result<Reads<'a>, Corrupt> {
     let mut c = Cursor { bytes: list };
     let mut reads = Reads::new_in(alloc);
     for _ in 0..c.u32("the read count")? {
@@ -221,7 +275,211 @@ fn produced_of<'a>(list: &[u8], answer: &[u8], edition: Edition, alloc: Alloc<'a
     if !c.bytes.is_empty() {
         return Err(Corrupt("bytes after the read list's end"));
     }
-    answer_of(Cursor { bytes: answer }, reads, edition, alloc)
+    Ok(reads)
+}
+
+/// The [`Produced`] of a row this command ran: its read list's reads and its loose answer.
+fn produced_of<'a>(list: &[u8], answer: &[u8], edition: Edition, alloc: Alloc<'a>) -> Result<Produced<'a>, Corrupt> {
+    answer_of(Cursor { bytes: answer }, reads_of(list, alloc)?, edition, alloc)
+}
+
+/// One origin run at `c` ([`RUN`]): its length, its tag, its first value and its stride.
+fn run_of(c: &mut Cursor<'_>) -> Result<(u32, u8, u32, u32), Corrupt> {
+    let len = c.u32("an origin run")?;
+    let tag = c.u8("an origin run's tag")?;
+    let stride = c.u8("an origin run's stride")?;
+    if stride > 1 || c.take(2, "an origin run")? != [0, 0] {
+        return Err(Corrupt("an origin run's stride"));
+    }
+    Ok((len, tag, c.u32("an origin run's first value")?, u32::from(stride)))
+}
+
+/// The origin of token `at` of the run (`tag`, `first`, `stride`).
+fn run_origin(tag: u8, first: u32, stride: u32, at: u32) -> Result<TokenOrigin, Corrupt> {
+    at.checked_mul(stride).and_then(|step| first.checked_add(step)).and_then(|value| origin_of(tag, value)).ok_or(Corrupt("an origin run's values"))
+}
+
+/// A dense answer's head at `c`: how many tokens, how many origin runs, and the tokens' rows.
+fn dense_head<'b>(c: &mut Cursor<'b>) -> Result<(u32, u32, &'b [u8]), Corrupt> {
+    let (count, runs) = (c.u32("the token count")?, c.u32("the origin run count")?);
+    let rows = (count as usize).checked_mul(blaze_expand::atoms::ROW).ok_or(Corrupt("the token count"))?;
+    Ok((count, runs, c.take(rows, "the token rows")?))
+}
+
+/// The [`Produced`] of a table's row: its read list's reads and its dense answer over `atoms`
+/// (the token count, the run count, a row a token, the runs, then the diagnostics and their
+/// text as the loose form has them). The tokens are read with room made once.
+fn dense_produced<'a>(atoms: &Atoms<'_>, list: &[u8], answer: &[u8], edition: Edition, alloc: Alloc<'a>) -> Result<Produced<'a>, Corrupt> {
+    let reads = reads_of(list, alloc)?;
+    let mut c = Cursor { bytes: answer };
+    let (count, runs, rows) = dense_head(&mut c)?;
+    let tokens = TokenStream::from_rows(atoms, rows, Ctx::root(edition), alloc).map_err(|error| match error {
+        AtomsError::NoSuchAtom { .. } => Corrupt("a token row past the table's atoms"),
+        _ => Corrupt("tokens that do not fit a stream"),
+    })?;
+    let mut origins: AVec<'a, TokenOrigin> = AVec::new_in(alloc);
+    origins.reserve(count as usize);
+    for _ in 0..runs {
+        let (len, tag, first, stride) = run_of(&mut c)?;
+        if len as usize > count as usize - origins.len() {
+            return Err(Corrupt("origin runs longer than the tokens"));
+        }
+        for at in 0..len {
+            origins.push(run_origin(tag, first, stride, at)?);
+        }
+    }
+    if origins.len() != count as usize {
+        return Err(Corrupt("origin runs shorter than the tokens"));
+    }
+    let (diagnostics, text) = tail_of(c, alloc)?;
+    Ok(Produced { tokens, origins, reads, diagnostics, text })
+}
+
+/// A dense answer over `atoms` in the loose form: [`answer_into`]'s bytes for the same answer.
+fn loosen(atoms: &Atoms<'_>, answer: &[u8]) -> Result<Vec<u8>, Corrupt> {
+    let mut c = Cursor { bytes: answer };
+    let (count, runs, rows) = dense_head(&mut c)?;
+    let mut out = Vec::with_capacity(answer.len() * 4);
+    out.extend_from_slice(&count.to_le_bytes());
+    for id in rows.chunks_exact(blaze_expand::atoms::ROW) {
+        let id = u32::from_le_bytes([id[0], id[1], id[2], id[3]]);
+        let (kind, text) = atoms.atom(id).ok_or(Corrupt("a token row past the table's atoms"))?;
+        out.extend_from_slice(&token_bytes(kind));
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+    }
+    let mut tokens = 0u32;
+    for _ in 0..runs {
+        let (len, tag, first, stride) = run_of(&mut c)?;
+        if len > count - tokens {
+            return Err(Corrupt("origin runs longer than the tokens"));
+        }
+        for at in 0..len {
+            origin_bytes(&mut out, run_origin(tag, first, stride, at)?);
+        }
+        tokens += len;
+    }
+    if tokens != count {
+        return Err(Corrupt("origin runs shorter than the tokens"));
+    }
+    out.extend_from_slice(c.bytes);
+    Ok(out)
+}
+
+/// A row's answer as [`file_of`] is given it.
+#[derive(Clone, Copy)]
+enum Answer<'r> {
+    /// The loose form ([`answer_into`]'s bytes): a row this command ran.
+    Loose(&'r [u8]),
+    /// The dense form over the atoms of the table the command found: a row it found.
+    Kept(&'r [u8]),
+}
+
+/// Why an answer is not written dense.
+enum Undense {
+    Corrupt(Corrupt),
+    /// More atoms, or more bytes of atom text, than a table's 32-bit words count.
+    Atoms,
+}
+
+impl From<Corrupt> for Undense {
+    fn from(corrupt: Corrupt) -> Undense {
+        Undense::Corrupt(corrupt)
+    }
+}
+
+/// What follows an answer's rows in the dense form: its runs, diagnostics and text.
+enum Tail<'r> {
+    /// A range of the buffer the runs of loose answers are made in.
+    Made(core::ops::Range<usize>),
+    /// A found row's own bytes.
+    Kept(&'r [u8]),
+}
+
+/// One answer as [`file_of`] writes it: its counts, where its tokens' interned ids start, and
+/// its tail.
+struct Part<'r> {
+    tokens: u32,
+    runs: u32,
+    ids: usize,
+    tail: Tail<'r>,
+}
+
+/// `part`'s tail: of `made`, the buffer loose answers' runs were made in, or its own bytes.
+fn tail_bytes<'m>(part: &'m Part<'_>, made: &'m [u8]) -> &'m [u8] {
+    match &part.tail {
+        // clone: a range, two words.
+        Tail::Made(range) => &made[range.clone()],
+        Tail::Kept(bytes) => bytes,
+    }
+}
+
+fn run_into(made: &mut Vec<u8>,(tag, first, len, stride): (u8, u32, u32, u32)) {
+    let mut run = [0u8; RUN];
+    run[..4].copy_from_slice(&len.to_le_bytes());
+    run[4] = tag;
+    run[5] = u8::from(stride == 1);
+    run[8..].copy_from_slice(&first.to_le_bytes());
+    made.extend_from_slice(&run);
+}
+
+/// A loose answer's part: its tokens interned in `builder` (their ids appended to `ids`), its
+/// origins as greedy maximal runs and the rest of it appended to `made`.
+fn loose_part<'r>(bytes: &[u8], builder: &mut AtomsBuilder<'_>, ids: &mut Vec<u32>, made: &mut Vec<u8>) -> Result<Part<'r>, Undense> {
+    let mut c = Cursor { bytes };
+    let count = c.u32("the token count")?;
+    let first_id = ids.len();
+    for _ in 0..count {
+        let kind: [u8; 8] = c.take(8, "a token")?.try_into().map_err(|_| Corrupt("a token"))?;
+        let kind = token_of(kind).ok_or(Corrupt("a token's kind"))?;
+        let text = c.str("a token's text")?;
+        ids.push(builder.intern(kind, text).map_err(|_| Undense::Atoms)?);
+    }
+    let start = made.len();
+    let mut runs = 0u32;
+    // The open run: its tag, its first value, its length, its stride.
+    let mut open: Option<(u8, u32, u32, u32)> = None;
+    for _ in 0..count {
+        let (tag, value) = (c.u8("an origin")?, c.u32("an origin")?);
+        origin_of(tag, value).ok_or(Corrupt("an origin"))?;
+        open = Some(match open {
+            // The second token of a run sets its stride: the same value, or the next one.
+            Some((t, first, 1, _)) if t == tag && (value == first || first.checked_add(1) == Some(value)) => (t, first, 2, value - first),
+            Some((t, first, len, stride)) if t == tag && len > 1 && len.checked_mul(stride).and_then(|step| first.checked_add(step)) == Some(value) => (t, first, len + 1, stride),
+            Some(run) => {
+                run_into(made, run);
+                runs += 1;
+                (tag, value, 1, 0)
+            }
+            None => (tag, value, 1, 0),
+        });
+    }
+    if let Some(run) = open {
+        run_into(made, run);
+        runs += 1;
+    }
+    made.extend_from_slice(c.bytes);
+    Ok(Part { tokens: count, runs, ids: first_id, tail: Tail::Made(start..made.len()) })
+}
+
+/// A found row's part: its rows' atoms (of `old`, the found table's) interned in `builder`,
+/// each once (`remap`: an old atom's interned id, `u32::MAX` while it has none: an interned
+/// id is below that), its tail as it lies.
+fn kept_part<'r>(bytes: &'r [u8], old: Option<&Atoms<'_>>, remap: &mut [u32], builder: &mut AtomsBuilder<'_>, ids: &mut Vec<u32>) -> Result<Part<'r>, Undense> {
+    let past = Corrupt("a token row past the table's atoms");
+    let mut c = Cursor { bytes };
+    let (count, runs, rows) = dense_head(&mut c)?;
+    let first_id = ids.len();
+    for id in rows.chunks_exact(blaze_expand::atoms::ROW) {
+        let id = u32::from_le_bytes([id[0], id[1], id[2], id[3]]);
+        let slot = remap.get_mut(id as usize).ok_or(past.clone())?;
+        if *slot == u32::MAX {
+            let (kind, text) = old.and_then(|old| old.atom(id)).ok_or(past.clone())?;
+            *slot = builder.intern(kind, text).map_err(|_| Undense::Atoms)?;
+        }
+        ids.push(*slot);
+    }
+    Ok(Part { tokens: count, runs, ids: first_id, tail: Tail::Kept(c.bytes) })
 }
 
 /// Whether each read of `list` is answered now, in `package`, as the list says; `valued`
@@ -263,69 +521,134 @@ pub enum Kept {
     Written { rows: usize, bytes: usize },
 }
 
-/// One crate's results for one command: the table as the command found it, each read list's
-/// verdict against the crate's package, and the rows the command ran.
+/// One crate name's results for one command: the table as the command found it and the rows
+/// the command ran. Shared by every package of that name the command expands in; each has
+/// its own [`Verdicts`].
 pub struct CrateResults {
     krate: ContentId,
     table: Table,
-    /// One verdict a list of the table: valued at most once a command.
-    verdicts: Vec<AtomicU8>,
     pending: Lock<Pending>,
     /// How many rows are pending: a lookup takes the lock only when there are some.
     pending_rows: AtomicU64,
-    /// How many reads were valued against the package.
+    /// How many reads were valued against a package.
     valued: AtomicU64,
 }
 
-/// The body of the table holding `rows` (key, list bytes, answer bytes), in any order and
-/// without two of one key and list: sorted here, so the bytes are the set's.
-fn body_of(krate: &ContentId, rows: &mut Vec<(&[u8], &[u8], &[u8])>) -> Result<Vec<u8>, RecordError> {
+/// One package's verdict on each read list of a table: whether the list's reads are answered
+/// in that package now as the list says. A list is valued at most once a package a command,
+/// whatever the number of calls that share it.
+pub struct Verdicts {
+    lists: Vec<AtomicU8>,
+}
+
+impl Verdicts {
+    /// No list of `results`' table valued yet.
+    pub fn of(results: &CrateResults) -> Verdicts {
+        Verdicts { lists: (0..results.table.lists).map(|_| AtomicU8::new(UNKNOWN)).collect() }
+    }
+}
+
+/// The file of the table holding `rows` (key, list bytes, answer bytes), in any order and
+/// without two of one key and list: sorted here, so the bytes are the set's. The body, then
+/// its seal: what [`write_whole`] publishes as it lies. Its length is the rows' own (places
+/// are 64-bit); what is refused by name is a count, or one list or answer, past 32 bits.
+///
+/// Every answer is written dense: a loose one's tokens are interned, a found one's rows
+/// (over `old`, the atoms of the table they were found in) are mapped onto the new table's
+/// atoms, which are sorted by content: the bytes do not depend on which rows were found and
+/// which were run, or in what order.
+fn file_of(krate: &ContentId, old: Option<&Atoms<'_>>, rows: &mut Vec<(&[u8], &[u8], Answer<'_>)>) -> Result<Vec<u8>, RecordError> {
     let mut lists: Vec<&[u8]> = rows.iter().map(|row| row.1).collect();
     lists.sort_unstable();
     lists.dedup();
     rows.sort_unstable_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
-    let lists_at = HEAD + rows.len() * ROW;
-    let data_at = lists_at + lists.len() * LIST;
-    let bytes = data_at + lists.iter().map(|list| list.len()).sum::<usize>() + rows.iter().map(|row| row.2.len()).sum::<usize>();
-    if u32::try_from(bytes).is_err() {
-        return Err(RecordError::TooLarge { krate: *krate, bytes });
+    let too_large = |what: &'static str, count: usize| RecordError::TooLarge { krate: *krate, what, count };
+    let word = |what: &'static str, count: usize| u32::try_from(count).map_err(|_| too_large(what, count));
+    let (row_count, list_count) = (word("rows", rows.len())?, word("read lists", lists.len())?);
+    // DEBT: `Global` and a fixed seed named here: `keep`'s callers (other lanes' drivers) pass
+    // no allocator and no seed. No byte written depends on the seed: the atoms are sorted.
+    let mut builder = AtomsBuilder::new_in(Alloc::global(), 0);
+    let mut remap: Vec<u32> = vec![u32::MAX; old.map_or(0, Atoms::len)];
+    let (mut ids, mut made): (Vec<u32>, Vec<u8>) = (Vec::new(), Vec::new());
+    let mut parts: Vec<Part<'_>> = Vec::with_capacity(rows.len());
+    for (key, _, answer) in rows.iter() {
+        let part = match *answer {
+            Answer::Loose(bytes) => loose_part(bytes, &mut builder, &mut ids, &mut made),
+            Answer::Kept(bytes) => kept_part(bytes, old, &mut remap, &mut builder, &mut ids),
+        };
+        parts.push(part.map_err(|error| match error {
+            Undense::Corrupt(Corrupt(what)) => {
+                let mut base = [0u8; 32];
+                base.copy_from_slice(key);
+                RecordError::Corrupt { base: ContentId(base), what }
+            }
+            Undense::Atoms => too_large("atoms or bytes of their text", builder.len()),
+        })?);
     }
-    let mut out = Vec::with_capacity(bytes);
+    let built = builder.finish();
+    let (atom_count, text_len) = (word("atoms", built.atoms.len() / ATOM)?, word("bytes of atom text", built.text.len())?);
+    let answer_len = |part: &Part<'_>| 8 + part.tokens as usize * blaze_expand::atoms::ROW + tail_bytes(part, &made).len();
+    let lists_at = HEAD + rows.len() * ROW;
+    let atoms_at = lists_at + lists.len() * LIST;
+    let data_at = atoms_at + built.atoms.len() + built.text.len();
+    let lists_len = lists.iter().map(|list| list.len()).sum::<usize>();
+    let bytes = data_at + lists_len + parts.iter().map(answer_len).sum::<usize>();
+    let mut out = Vec::with_capacity(bytes + SEAL_LEN);
     out.extend_from_slice(&MAGIC.to_le_bytes());
-    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(lists.len() as u32).to_le_bytes());
-    // The lists' places first: a row's answer lies after every list.
-    let mut at = data_at;
-    let mut answer_at = data_at + lists.iter().map(|list| list.len()).sum::<usize>();
-    for (key, list, answer) in rows.iter() {
+    out.extend_from_slice(&row_count.to_le_bytes());
+    out.extend_from_slice(&list_count.to_le_bytes());
+    out.extend_from_slice(&atom_count.to_le_bytes());
+    out.extend_from_slice(&text_len.to_le_bytes());
+    // The lists' bytes first: a row's answer lies after every list.
+    let mut answer_at = data_at + lists_len;
+    for ((key, list, _), part) in rows.iter().zip(&parts) {
         // Sorted and without a duplicate above: the list is found.
         let index = lists.partition_point(|it| *it < *list);
         out.extend_from_slice(key);
         out.extend_from_slice(&(index as u32).to_le_bytes());
-        out.extend_from_slice(&(answer_at as u32).to_le_bytes());
-        out.extend_from_slice(&(answer.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        answer_at += answer.len();
+        out.extend_from_slice(&word("bytes of one answer", answer_len(part))?.to_le_bytes());
+        out.extend_from_slice(&(answer_at as u64).to_le_bytes());
+        answer_at += answer_len(part);
     }
+    let mut at = data_at;
     for list in &lists {
-        out.extend_from_slice(&(at as u32).to_le_bytes());
-        out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(at as u64).to_le_bytes());
+        out.extend_from_slice(&word("bytes of one read list", list.len())?.to_le_bytes());
         out.extend_from_slice(&list[..4]);
         at += list.len();
     }
+    out.extend_from_slice(&built.atoms);
+    out.extend_from_slice(&built.text);
     for list in &lists {
         out.extend_from_slice(list);
     }
-    for (_, _, answer) in rows.iter() {
-        out.extend_from_slice(answer);
+    for part in &parts {
+        out.extend_from_slice(&part.tokens.to_le_bytes());
+        out.extend_from_slice(&part.runs.to_le_bytes());
+        for id in &ids[part.ids..part.ids + part.tokens as usize] {
+            out.extend_from_slice(&built.ids[*id as usize].to_le_bytes());
+        }
+        out.extend_from_slice(tail_bytes(part, &made));
     }
+    let seal: [u8; SEAL_LEN] = ContentId::of(TABLE_SEAL, &out).0;
+    out.extend_from_slice(&seal);
     Ok(out)
 }
 
-/// The whole body filed for `krate`, proved: none when no file is there or the file is torn
-/// (a power cut's: counted in [`DirStore::torn`], and the next keep replaces it).
+/// The whole body filed for `krate`, proved: none when no file is there, when the file is
+/// torn (a power cut's: counted in [`DirStore::torn`], and the next keep replaces it), or
+/// when another command put a longer table there under this read (counted in
+/// [`DirStore::replaced`]: this command runs the crate's calls again, as the loser of two
+/// commands' keeps does).
 fn read_whole(store: &DirStore, krate: &ContentId) -> Result<Option<Whole>, FilesError> {
-    let Some(mut bytes) = store.files.read(&table_file(krate))? else { return Ok(None) };
+    let mut bytes = match store.files.read(&table_file(krate))? {
+        Held::Absent => return Ok(None),
+        Held::Whole(bytes) => bytes,
+        Held::Replaced => {
+            store.replaced.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+    };
     let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else {
         store.torn.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
@@ -334,7 +657,7 @@ fn read_whole(store: &DirStore, krate: &ContentId) -> Result<Option<Whole>, File
     let boot = store.files.io.boot().ok();
     let mut vouched = false;
     if let Some(boot) = &boot
-        && let Some(said) = store.files.read(&whole_file(krate))?
+        && let Held::Whole(said) = store.files.read(&whole_file(krate))?
     {
         vouched = said.len() == boot.0.len() + SEAL_LEN && said[..boot.0.len()] == boot.0 && said[boot.0.len()..] == bytes[body_len..];
     }
@@ -345,25 +668,32 @@ fn read_whole(store: &DirStore, krate: &ContentId) -> Result<Option<Whole>, File
         }
         store.hashed.fetch_add(1, Ordering::Relaxed);
         if let Some(boot) = &boot {
-            let seal: [u8; SEAL_LEN] = ContentId::of(TABLE_SEAL, &bytes[..body_len]).0;
-            store.files.publish(&whole_file(krate), &boot.0, &seal)?;
+            store.files.publish(&whole_file(krate), &voucher(&boot.0, &bytes[body_len..]))?;
         }
     }
     bytes.truncate(body_len);
     Ok(Some(Whole { body: bytes }))
 }
 
-/// `body` filed as `krate`'s table: whole under its name or not there (a publish), then
-/// vouched for in this boot, as bytes this process wrote.
-fn write_whole(store: &DirStore, krate: &ContentId, body: &[u8]) -> Result<(), FilesError> {
-    let seal: [u8; SEAL_LEN] = ContentId::of(TABLE_SEAL, body).0;
-    if store.plant == RecordPlant::RenameFirst {
-        store.files.write_in_place(&table_file(krate), body, &seal)?;
-    } else {
-        store.files.publish(&table_file(krate), body, &seal)?;
+/// What `whole/<name>` holds: the boot a table was written or checked in, then its seal.
+fn voucher(boot: &[u8], seal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(boot.len() + seal.len());
+    out.extend_from_slice(boot);
+    out.extend_from_slice(seal);
+    out
+}
+
+/// `file` ([`file_of`]'s: a body, then its seal) filed as `krate`'s table: whole under its
+/// name or not there (a publish of the slice as it lies), then vouched for in this boot, as
+/// bytes this process wrote.
+fn write_whole(store: &DirStore, krate: &ContentId, file: &[u8]) -> Result<(), FilesError> {
+    match store.plant {
+        RecordPlant::RenameFirst => store.files.write_in_place(&table_file(krate), file)?,
+        RecordPlant::FramedPublish => store.files.publish_framed(&table_file(krate), file)?,
+        RecordPlant::None | RecordPlant::SealSkipped => store.files.publish(&table_file(krate), file)?,
     }
     if let Ok(boot) = store.files.io.boot() {
-        store.files.publish(&whole_file(krate), &boot.0, &seal)?;
+        store.files.publish(&whole_file(krate), &voucher(&boot.0, &file[file.len() - SEAL_LEN..]))?;
     }
     Ok(())
 }
@@ -374,11 +704,9 @@ pub fn open(store: &DirStore, krate: ContentId) -> Result<CrateResults, RecordEr
         Some(whole) => Table::of(whole).map_err(|what| RecordError::Table { krate, what })?,
         None => Table::empty(),
     };
-    let verdicts = (0..table.lists).map(|_| AtomicU8::new(UNKNOWN)).collect();
     Ok(CrateResults {
         krate,
         table,
-        verdicts,
         pending: Lock::new("a crate's proc-macro results of this command", Pending { rows: Vec::new(), written: 0 }),
         pending_rows: AtomicU64::new(0),
         valued: AtomicU64::new(0),
@@ -401,17 +729,18 @@ impl CrateResults {
         self.valued.load(Ordering::Relaxed)
     }
 
-    /// Whether the table's read list `list` holds in `package`: valued the first time it is
-    /// asked in this command, a load of its verdict after.
-    fn current(&self, list: usize, package: &Package) -> Result<bool, Corrupt> {
-        match self.verdicts[list].load(Ordering::Relaxed) {
+    /// Whether the table's read list `list` holds in `package`, whose verdicts on this table
+    /// `verdicts` are: valued the first time it is asked in this command, a load of its
+    /// verdict after.
+    fn current(&self, verdicts: &Verdicts, list: usize, package: &Package) -> Result<bool, Corrupt> {
+        match verdicts.lists[list].load(Ordering::Relaxed) {
             CURRENT => Ok(true),
             STALE => Ok(false),
             _ => {
                 let holds = list_holds(self.table.list(list), package, &self.valued)?;
                 // Two workers valuing one list store the same verdict: the package is the
                 // command's snapshot.
-                self.verdicts[list].store(if holds { CURRENT } else { STALE }, Ordering::Relaxed);
+                verdicts.lists[list].store(if holds { CURRENT } else { STALE }, Ordering::Relaxed);
                 Ok(holds)
             }
         }
@@ -424,13 +753,22 @@ impl CrateResults {
     }
 
     /// The answer of `base` under what its reads are in `package` now, decoded in `alloc`:
-    /// a row of the table whose read list holds, or a row this command ran.
-    pub fn find<'a>(&self, store: &DirStore, base: &ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
+    /// a row of the table whose read list holds by `verdicts` (this package's, made by
+    /// [`Verdicts::of`] this value), or a row this command ran whose reads hold in `package`.
+    pub fn find<'a>(
+        &self,
+        store: &DirStore,
+        base: &ContentId,
+        package: &Package,
+        verdicts: &Verdicts,
+        edition: Edition,
+        alloc: Alloc<'a>,
+    ) -> Result<Option<Produced<'a>>, RecordError> {
         let corrupt = |Corrupt(what)| RecordError::Corrupt { base: *base, what };
         for at in self.table.rows_of(base) {
             let row = self.table.row(at);
-            if self.current(row.list, package).map_err(corrupt)? {
-                return produced_of(self.table.list(row.list), row.answer, edition, alloc).map(Some).map_err(corrupt);
+            if self.current(verdicts, row.list, package).map_err(corrupt)? {
+                return dense_produced(&self.table.atoms(), self.table.list(row.list), row.answer, edition, alloc).map(Some).map_err(corrupt);
             }
         }
         if self.pending_rows.load(Ordering::Acquire) == 0 {
@@ -438,11 +776,14 @@ impl CrateResults {
         }
         let pending = self.pending(store)?;
         let first = pending.rows.partition_point(|row| row.key.0 < base.0);
-        // A row this command ran was run in this package: its reads hold.
-        match pending.rows.get(first) {
-            Some(row) if row.key == *base => produced_of(&row.list, &row.answer, edition, alloc).map(Some).map_err(corrupt),
-            _ => Ok(None),
+        // Another package of this name may have run the row: its reads are valued here, as a
+        // table row's are (a call's own package's hold; a repeat inside one command is rare).
+        for row in pending.rows[first..].iter().take_while(|row| row.key == *base) {
+            if list_holds(&row.list, package, &self.valued).map_err(corrupt)? {
+                return produced_of(&row.list, &row.answer, edition, alloc).map(Some).map_err(corrupt);
+            }
         }
+        Ok(None)
     }
 
     /// `produced` taken as `base`'s answer, to be written by the next [`CrateResults::keep`].
@@ -461,7 +802,9 @@ impl CrateResults {
         for at in self.table.rows_of(&base) {
             let row = self.table.row(at);
             if self.table.list(row.list) == list {
-                return if row.answer == answer { Ok(()) } else { Err(RecordError::TwoAnswers { base }) };
+                // The found row is dense: compared in the loose form the run's answer is in.
+                let held = self.table.loose_answer(at).map_err(|Corrupt(what)| RecordError::Corrupt { base, what })?;
+                return if held == answer { Ok(()) } else { Err(RecordError::TwoAnswers { base }) };
             }
         }
         let mut pending = self.pending(store)?;
@@ -477,33 +820,36 @@ impl CrateResults {
         Ok(())
     }
 
-    /// The table this command leaves: the rows it found (but those whose reads it found
-    /// stale) and the rows it ran, as a body. None when it ran nothing since the last keep.
-    fn body(&self, pending: &Pending) -> Result<Option<Vec<u8>>, RecordError> {
+    /// The table this command leaves: the rows it found (but those whose read list some
+    /// package of `verdicts` found stale and none found current) and the rows it ran, as a
+    /// file. None when it ran nothing since the last keep.
+    fn body(&self, pending: &Pending, verdicts: &[&Verdicts]) -> Result<Option<Vec<u8>>, RecordError> {
         if pending.rows.len() == pending.written {
             return Ok(None);
         }
-        let mut rows: Vec<(&[u8], &[u8], &[u8])> = Vec::with_capacity(self.table.rows + pending.rows.len());
+        let verdict = |list: usize, wanted: u8| verdicts.iter().any(|it| it.lists[list].load(Ordering::Relaxed) == wanted);
+        let mut rows: Vec<(&[u8], &[u8], Answer<'_>)> = Vec::with_capacity(self.table.rows + pending.rows.len());
         for at in 0..self.table.rows {
             let row = self.table.row(at);
-            if self.verdicts[row.list].load(Ordering::Relaxed) != STALE {
-                rows.push((row.key, self.table.list(row.list), row.answer));
+            if verdict(row.list, CURRENT) || !verdict(row.list, STALE) {
+                rows.push((row.key, self.table.list(row.list), Answer::Kept(row.answer)));
             }
         }
         for row in &pending.rows {
-            rows.push((&row.key.0, &row.list, &row.answer));
+            rows.push((&row.key.0, &row.list, Answer::Loose(&row.answer)));
         }
-        body_of(&self.krate, &mut rows).map(Some)
+        file_of(&self.krate, Some(&self.table.atoms()), &mut rows).map(Some)
     }
 
     /// Writes the crate's table when this command ran calls it did not hold: whole, under a
-    /// temporary name, renamed onto the crate's.
-    pub fn keep(&self, store: &DirStore) -> Result<Kept, RecordError> {
+    /// temporary name, renamed onto the crate's. `verdicts`: those of every package of this
+    /// name the command expanded in (what says which rows it found stale).
+    pub fn keep(&self, store: &DirStore, verdicts: &[&Verdicts]) -> Result<Kept, RecordError> {
         let mut pending = self.pending(store)?;
-        let Some(body) = self.body(&pending)? else { return Ok(Kept::Nothing) };
-        write_whole(store, &self.krate, &body).map_err(RecordError::Files)?;
+        let Some(file) = self.body(&pending, verdicts)? else { return Ok(Kept::Nothing) };
+        write_whole(store, &self.krate, &file).map_err(RecordError::Files)?;
         pending.written = pending.rows.len();
-        Ok(Kept::Written { rows: u32_at(&body, 8), bytes: body.len() + SEAL_LEN })
+        Ok(Kept::Written { rows: u32_at(&file, 8), bytes: file.len() })
     }
 }
 

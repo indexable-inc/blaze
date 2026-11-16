@@ -88,6 +88,8 @@ pub(crate) struct Form<A: Allocator> {
     /// The bytes of instructions: what follows in the code is the data rows holding no
     /// address, and nothing else.
     pub(crate) insts: u32,
+    /// The calls' unwind rows (pass/unwind.rs).
+    pub(crate) unwind: super::unwind::Rows<A>,
 }
 
 impl<A: Allocator + Clone> Form<A> {
@@ -97,8 +99,9 @@ impl<A: Allocator + Clone> Form<A> {
             relro: Vec::new_in(alloc.clone()),
             words: Vec::new_in(alloc.clone()),
             data_at: Vec::new_in(alloc.clone()),
-            inner: Vec::new_in(alloc),
+            inner: Vec::new_in(alloc.clone()),
             insts: 0,
+            unwind: super::unwind::Rows::new_in(alloc),
         }
     }
 }

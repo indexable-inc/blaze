@@ -130,6 +130,19 @@ pub trait FrontEnd {
     fn left_out(&self, _key: ItemKey) -> Option<&str> {
         None
     }
+    /// The item the library marks `#[lang = "name"]`, for the builder's own items the
+    /// checker's `LangItem` has no variant for (front2/coroutines.rs: the `Poll` enum, the
+    /// `Pin` struct, the coroutine resume fn). `None`: no such mark, or a front end that does
+    /// not answer (the old front): the builder then refuses the form by name.
+    fn lang_named(&self, _name: &str) -> Option<ItemKey> {
+        None
+    }
+    /// The fn whose head made the opaque type `opaque` (an `impl Trait` in its return type, an
+    /// `async fn`'s future), and the opaque's index among that fn's. `None`: no head of the
+    /// program made it, or a front end that does not answer.
+    fn opaque_of(&self, _opaque: ItemKey) -> Option<(ItemKey, u32)> {
+        None
+    }
     /// The cause of the last `normalize` that gave no type (the trait by name, `Self`'s form,
     /// the solver's error or "no answer"): the build's `Projection` refusal then names it.
     fn last_projection(&self) -> Option<Box<str>> {

@@ -17,9 +17,12 @@
 //! already evaluates a constant item a head names (`check::eval_len`), unchanged.
 //!
 //! What is NOT taken (each stays the head's refusal, by name):
-//! - an expression that mentions a generic parameter in scope, or `Self` ([`mentions`]): it has
-//!   no value at the head (`[u8; N + 1]`, `size_of::<Self>()`); blaze-typeck's type form has
-//!   `ConstParam` and `ConstValue` only, no node for an unevaluated expression;
+//! - an expression that mentions a generic parameter in scope, or a `Self` that is not a
+//!   ground type ([`mentions`]): it has no value at the head (`[u8; N + 1]`,
+//!   `size_of::<Self>()` in `impl<T> G<T>`); blaze-typeck's type form has `ConstParam` and
+//!   `ConstValue` only, no node for an unevaluated expression. An expression over a GROUND
+//!   `Self` (`size_of::<Self>()` in `impl u16`) IS taken, filed with that `Self` in scope
+//!   ([`Ask::of_self`]; front2/const_open.rs, where the three states are told apart);
 //! - a type that is not `bool`, `char` or an integer ([`prim_name`]): the item text spells its
 //!   type, and only those are spelled the same in every module.
 //! OWED: the scope is the MODULE's, so an expression naming an item declared in a block is
@@ -54,6 +57,10 @@ pub struct Ask {
     pub name: Box<str, Global>,
     /// The expression as written, trimmed.
     pub text: Box<str, Global>,
+    /// What `Self` is in the expression, for one that names it where `Self` is a ground type
+    /// ([`Ask::of_self`]): a type of the store's table (the enclosing head's own self type,
+    /// made before the ask). `None`: the expression names no `Self`.
+    pub self_ty: Option<tc::PTy>,
 }
 
 /// Why an asked anonymous constant could not be filed.
@@ -136,8 +143,53 @@ impl Ask {
         }
         let name = format!("{prim}: {text}").into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text) })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None })
     }
+
+    /// The anonymous constant `text` of type `ty` written in `module` where `Self` is the
+    /// ground type `self_ty` (its node `self_node`: a built-in type, or an ADT with no generic
+    /// arguments: front2/const_open.rs `ground_self`). The pinned core, library/core/src/num/
+    /// uint_macros.rs, in `impl u16`: "pub const fn from_le_bytes(bytes: [u8;
+    /// size_of::<Self>()]) -> Self". Its head is filed with that `Self` in scope
+    /// ([`file_asked`]), so the expression is lowered and checked as written. Its key is a
+    /// function of (the module, the type, the text, WHAT `Self` IS): `Self` by its built-in
+    /// name or its ADT's key (a key from text), so `size_of::<Self>()` of `impl u16` and of
+    /// `impl u32` in one module are two records (rule 21), and one head asked from two
+    /// places is one. `None` as [`Ask::of`], or when `self_node` is neither.
+    pub fn of_self(module: LibKey, ty: PNode, text: &str, self_ty: tc::PTy, self_node: PNode) -> Option<Ask> {
+        let text = text.trim();
+        let prim = prim_name(ty)?;
+        if text.is_empty() {
+            return None;
+        }
+        let name = match self_node {
+            PNode::Adt(adt, args) if args.len == 0 => format!("{prim}: {text} where Self is the type {:x}", adt.0),
+            other => format!("{prim}: {text} where Self is {}", PRIMS.iter().find(|(_, n)| *n == other)?.0),
+        }
+        .into_boxed_str();
+        let need = need_key(anon_const_key(checker_of(module), &name));
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty) })
+    }
+}
+
+/// The value of the constant expression `text` of type `ty` that names a ground `Self`
+/// ([`Ask::of_self`]), read exactly as `Builder::const_value_bits` reads an anonymous
+/// constant of the module: its bits once evaluated (`Heads::const_bits`), the evaluator's
+/// refusal by the expression's name once it has refused (`Heads::anon_failed`),
+/// [`Why::NeedConst`] naming it until the driver's `eval_len` has filed and evaluated it.
+/// An expression whose type is unknown or is not `bool`, `char` or an integer is
+/// [`Why::ConstPath`] naming its text.
+pub fn self_value<H: super::types::Heads + ?Sized>(heads: &H, module: LibKey, ty: Option<PNode>, text: &str, self_ty: tc::PTy, self_node: PNode, r: blaze_surface::Range) -> Result<u128, Why> {
+    let text = text.trim();
+    let Some(ask) = ty.and_then(|ty| Ask::of_self(module, ty, text, self_ty, self_node)) else { return Err(Why::ConstPath(Box::from(text), r)) };
+    if let Some(bits) = heads.const_bits(ask.need) {
+        return Ok(bits);
+    }
+    if let Some(why) = heads.anon_failed(ask.need) {
+        return Err(Why::ConstPath(format!("{text}: {why}").into_boxed_str(), r));
+    }
+    let need = ask.need;
+    if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(Box::from(text), r)) }
 }
 
 /// Files every anonymous constant the type builder asked for since the last call
@@ -179,7 +231,12 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
                 params: Vec::new_in(Global),
                 consts: Vec::new_in(Global),
                 bounds: Vec::new_in(Global),
-                self_: SelfTy::None,
+                // `Self` for an expression that names it ([`Ask::of_self`]): the ground type
+                // itself, with no trait (the expression is not a member of the impl).
+                self_: match a.self_ty {
+                    Some(t) => SelfTy::Ty(t, None),
+                    None => SelfTy::None,
+                },
                 self_assoc: Vec::new_in(Global),
             },
         );

@@ -205,6 +205,8 @@ pub(crate) struct Tally {
     cancel: Canceller,
     /// The scope's thread parks here while it waits for a task; only that thread parks on it.
     owner: Parker,
+    /// What the scope's joins did, and how many of its tasks ended (task/help.rs).
+    joins: super::help::Joins,
 }
 
 impl Tally {
@@ -215,9 +217,15 @@ impl Tally {
                 failed: Lock::new("bstd.task.failed", None),
                 cancel,
                 owner: Parker::new(),
+                joins: super::help::Joins::new(),
             },
             Global,
         )
+    }
+
+    /// What the scope's joins did so far, and its count of ended tasks (task/help.rs).
+    pub(crate) fn joins(&self) -> &super::help::Joins {
+        &self.joins
     }
 
     /// Task `index` failed: the scope is cancelled, and the failure kept if it is the lowest.
@@ -255,6 +263,9 @@ impl Tally {
     /// before its park is kept).
     fn ended(&self) {
         self.running.0.fetch_sub(1, Ordering::AcqRel);
+        // After the task's `DONE` (its runner's store before this call) and before the wake: a
+        // batch join that reads this count and then sweeps misses no task (task/help.rs).
+        self.joins.ended.fetch_add(1, Ordering::AcqRel);
         self.owner.unpark();
     }
 }
@@ -946,6 +957,34 @@ impl Pool {
                 Waited::Ready(()) | Waited::Deadline => {}
             }
         }
+    }
+
+    /// A queued task for a joining thread that is not a worker (task/help.rs): one off an
+    /// injection queue of `class`, the groups in order. Those queues hold what threads outside
+    /// the pool spawned, which such a thread may run (`run_now` does). Never a worker's deque,
+    /// LIFO slot, pinned queue or mailbox: a task spawned on a worker stays with workers.
+    /// `None` when the pool has not started or those queues are empty.
+    pub(crate) fn lend(&self, class: Class) -> Option<JobPtr> {
+        let shared = self.made()?;
+        shared.groups.iter().find_map(|group| take(group, class))
+    }
+
+    /// Runs a task [`Pool::lend`] gave, on the joining thread `here`, if nobody started it
+    /// since (the joiner's claim: task/claim.rs), then gives up the queue's reference: whether
+    /// it ran here. Its body catches its own error or panic and records it in its own scope, so
+    /// a failure is that task's, never this thread's.
+    pub(crate) fn run_lent(&self, here: Here, job: JobPtr) -> bool {
+        // SAFETY: the queue's reference, which `lend` took out of its queue, keeps the job
+        // alive until the release below.
+        let head = unsafe { job.0.as_ref() };
+        let took = super::help::take(&head.claim, super::help::HelpPlant::None);
+        if took {
+            // SAFETY: claimed by this thread just now, so the body is this thread's to run, once.
+            unsafe { (head.run)(job.0, here) };
+        }
+        // SAFETY: that reference, given up once.
+        unsafe { (head.release)(job.0) };
+        took
     }
 
     /// A task of worker `at`'s own: its pinned queue, its LIFO slot, its deque.

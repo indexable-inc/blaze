@@ -28,6 +28,10 @@ pub enum Target {
     Slot(u32),
     /// An outside symbol, by name: its address in this process.
     Symbol(Box<str, Global>),
+    /// A stub's first word (crate::stub): the address of the placed program's `Stops`.
+    Stops,
+    /// A stub's second word: the address of `stub::stopped`.
+    Stop,
 }
 
 /// One function to place: its code and, by literal place, what each word is filled with.
@@ -163,6 +167,8 @@ pub enum PlaceError {
     NoVtable { table: u32 },
     /// A vtable's address word is not an aligned word inside it.
     VtableWord { table: u32, offset: u32 },
+    /// The placed code is AArch64 and this process is not: its entry is never called.
+    NotThisMachine,
 }
 
 impl core::fmt::Display for PlaceError {
@@ -191,6 +197,7 @@ impl core::fmt::Display for PlaceError {
             PlaceError::NoDescriptor => write!(f, "the program has thread-locals and its static image holds no descriptor"),
             PlaceError::NoVtable { table } => write!(f, "a vtable's word names table {table}, which the program does not have"),
             PlaceError::VtableWord { table, offset } => write!(f, "vtable {table}: the address word at byte {offset} is not an aligned word inside it"),
+            PlaceError::NotThisMachine => write!(f, "the program's code is AArch64 and this machine is not: the skeleton runs a program only where it was emitted for"),
         }
     }
 }
@@ -201,6 +208,18 @@ impl core::error::Error for PlaceError {}
 pub struct Placed {
     _driver: Driver,
     shared: Arc<Shared>,
+    /// Where a called stub leaves the program (crate::stub); the stubs' code holds its
+    /// address, so it is boxed and lives as long as the code does.
+    stops: Box<crate::stub::Stops>,
+}
+
+/// How a placed program's entry ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ended {
+    /// It returned: the process status.
+    Status(u8),
+    /// It called stub `n`, a function that is not built, and was stopped there.
+    Stub(u32),
 }
 
 /// The records of one placement: each slot's body, by slot.
@@ -214,6 +233,8 @@ struct Table<'b> {
     missing: Option<Box<str, Global>>,
     /// The first routine that was not found, said after the edit fails.
     missing_routine: Option<Routine>,
+    /// The address of the placed program's `Stops`: every stub's first word.
+    stops: u64,
 }
 
 /// The library that exports `routine` on this host, named in [`PlaceError::NoRoutine`].
@@ -238,7 +259,8 @@ fn routine_library(routine: Routine) -> &'static str {
         | Routine::Fixdfti
         | Routine::Fixunsdfti
         | Routine::Fixsfti
-        | Routine::Fixunssfti => "libgcc_s.so.1",
+        | Routine::Fixunssfti
+        | Routine::UnwindResume => "libgcc_s.so.1",
     }
 }
 
@@ -281,6 +303,8 @@ impl Records for Table<'_> {
                         return Err(format!("the outside symbol `{name}` is not in this process"));
                     }
                 },
+                Some(Target::Stops) => self.stops,
+                Some(Target::Stop) => crate::stub::stopped as usize as u64,
                 None => return Err(format!("slot {slot}: reference {p} is not in the body's table")),
             };
             let at = at as usize;
@@ -306,6 +330,8 @@ impl Records for Table<'_> {
                             return Err(format!("the outside symbol `{name}` is not in this process"));
                         }
                     },
+                    // A stub's words are literal words (fixups): no code takes their address.
+                    Some(Target::Stops | Target::Stop) => return Err(format!("slot {slot}: reference {p} is a stub's word, which no relocation names")),
                     None => return Err(format!("slot {slot}: reference {p} is not in the body's table")),
                 },
                 RelocTo::Routine(routine) => {
@@ -406,8 +432,10 @@ pub fn create_tls_key(desc: u64) -> Result<(), PlaceError> {
 }
 
 /// Places `bodies`, body `n` in slot `n`, in one edit. `image` is the program's statics as
-/// written at an address ([`load_statics`]); `tls` is what thread-local words name.
-pub fn place(bodies: &[Body], vtables: &[VtableImage], image: Option<(&StaticImage<Global>, u64)>, tls: Option<Tls>) -> Result<Placed, PlaceError> {
+/// written at an address ([`load_statics`]); `tls` is what thread-local words name. `said` is
+/// each stub's refusal in words, by stub number (crate::stub; empty for a program with none).
+pub fn place(bodies: &[Body], vtables: &[VtableImage], image: Option<(&StaticImage<Global>, u64)>, tls: Option<Tls>, said: Box<[Box<str>]>) -> Result<Placed, PlaceError> {
+    let stops = Box::new(crate::stub::Stops::new(said));
     let vtables = Vtables::write(vtables)?;
     let page = blaze_launch_rt::sys::page().map_err(|e| PlaceError::Launcher(e.into()))? as u64;
     let code_len: u64 = bodies.iter().map(|b| (b.code.bytes.len() as u64).next_multiple_of(16)).sum();
@@ -430,7 +458,7 @@ pub fn place(bodies: &[Body], vtables: &[VtableImage], image: Option<(&StaticIma
             refs: List::of(&[]),
         });
     }
-    let mut table = Table { bodies, image, tls, vtables, missing: None, missing_routine: None };
+    let mut table = Table { bodies, image, tls, vtables, missing: None, missing_routine: None, stops: (&raw const *stops) as u64 };
     // Not `together`: nothing runs before the commit, so no gate is needed.
     if let Err(error) = driver.edit(Txn(1), &binds, false, &mut table) {
         return Err(match (table.missing_routine, table.missing) {
@@ -440,7 +468,7 @@ pub fn place(bodies: &[Body], vtables: &[VtableImage], image: Option<(&StaticIma
         });
     }
     let shared = driver.shared();
-    Ok(Placed { _driver: driver, shared })
+    Ok(Placed { _driver: driver, shared, stops })
 }
 
 /// How the entry is called, by its signature.
@@ -456,38 +484,36 @@ pub enum Entry {
 }
 
 impl Placed {
-    /// Calls the function in `slot` on this thread and gives the process status it ends with.
-    pub fn call(&self, slot: u32, entry: Entry) -> Result<u8, PlaceError> {
+    /// Calls the function in `slot` on this thread: the process status it ends with, or the
+    /// stub it called (a function that is not built: the program is left there, crate::stub).
+    pub fn call(&self, slot: u32, entry: Entry) -> Result<Ended, PlaceError> {
         let at = match self.shared.target(Slot(slot)) {
             Some(at) if at != 0 => at,
             _ => return Err(PlaceError::NoEntry { slot }),
         };
         let me = self.shared.birth().begin();
-        let status = match entry {
-            Entry::Unit => {
-                // SAFETY: `at` is the slot's word: the address of a body this module placed
-                // (`place`), emitted by blaze-emit for a function of no parameters and no
-                // result in the C convention, in a mapping never unmapped (`sys::Code`).
-                let function: extern "C" fn() = unsafe { core::mem::transmute::<usize, extern "C" fn()>(at) };
-                function();
-                0
-            }
-            Entry::I32 => {
-                // SAFETY: as above, for a function of no parameters returning an `i32` in `w0`.
-                let function: extern "C" fn() -> i32 =
-                    unsafe { core::mem::transmute::<usize, extern "C" fn() -> i32>(at) };
-                function() as u8
-            }
-            Entry::Hosted(table) => {
-                // SAFETY: as above, for a function of one pointer parameter in `x0` returning an
-                // `i32` in `w0`; `table` is the host's table, alive for this call (the caller
-                // holds the `Hosting` it points into).
-                let function: extern "C" fn(*const core::ffi::c_void) -> i32 =
-                    unsafe { core::mem::transmute::<usize, extern "C" fn(*const core::ffi::c_void) -> i32>(at) };
-                function(table.as_ptr()) as u8
-            }
+        // The one argument: the host's table for a hosted entry; the other entries take none
+        // and do not read `x0`.
+        let argument = match entry {
+            Entry::Unit | Entry::I32 => core::ptr::null(),
+            Entry::Hosted(table) => table.as_ptr().cast_const(),
         };
+        // SAFETY: `at` is the slot's word: the address of a body this module placed (`place`),
+        // emitted by blaze-emit in the C convention for a function of no parameters (`Unit`,
+        // `I32`) or one pointer parameter in `x0` (`Hosted`: the host's table, alive for this
+        // call: the caller holds the `Hosting` it points into), in a mapping never unmapped
+        // (`sys::Code`); the program's stubs were placed with `self.stops`' address, and
+        // `&self` is one run at a time on this thread.
+        let left = unsafe { self.stops.run(at, argument) }.ok_or(PlaceError::NotThisMachine)?;
         me.safepoint();
-        Ok(status)
+        if left.stopped != 0 {
+            return Ok(Ended::Stub(left.value as u32));
+        }
+        Ok(Ended::Status(match entry {
+            // `fn()`: nothing is returned.
+            Entry::Unit => 0,
+            // An `i32` in `w0`: its low 8 bits, as the C runtime's `exit` takes it.
+            Entry::I32 | Entry::Hosted(_) => left.value as u8,
+        }))
     }
 }

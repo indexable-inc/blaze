@@ -532,3 +532,240 @@ now `RangeStatus { status: 404 }`. `HttpOrigin` (store.rs) is on bstd's `Http`
 - **Keeping the origin's open files across asks.** Each ask opens its object again.
 - **The reader's tables live in the command's frame,** so the bytes fetched stay until the
   command ends, as the drive's record buffers already do.
+
+## End state: what a record's key says about its producer, and a home that stays bounded (architect, 2026-11-16)
+
+**The problem, measured.** Every key holds one `Tool` (blaze-drive key.rs `task_key`,
+`cert_key`), made in blaze-cli home.rs `tool` from the running binary's linker id
+(main.rs: `home::tool(host.build_id()?.as_bytes())`) chained with every `FORMATS` magic. So
+each rebuilt blaze reuses nothing: the owner's home held twelve packs in `v2/shared`, about
+215 MB, eight of 23 to 24 MB with equal sizes and different keys, the toolchain's 27 records
+written again per binary (compact.rs, module doc). compact.rs `compaction` bounds the number of
+packs, not the bytes: an old binary's records stay live by key forever.
+
+### 1. The decision: a key holds its producer, the code of its stage, not the binary
+
+A key is `H(producer(kind), kind, subject, source)`. `producer(kind) = H(drive, stage(kind),
+bits)`, where `drive` is the identity of the code that writes every record's envelope and read
+list (blaze-drive), `stage(kind)` the identity of the code that makes that kind's payload and
+decodes it, and `bits` the two build settings that change what Rust code computes:
+debug-assertions and overflow-checks (opt-level changes no result). The certificate and the
+answer pages hold `H(every producer)`; the pointer is per (that digest, request shape). A
+record's form needs no separate version: its encoder and decoder are code of its stage, so a
+form change moves the producer. The `FORMATS` chain in home.rs `tool` goes.
+
+| Kind | Stage code (end state: one root per kind; world (a) roots in brackets) |
+|---|---|
+| `Units`, `UnitGraph`, `Fetch` | manifests, lock, graph, fetch: [blaze-manifest, blaze-unit-graph, blaze-fetch, after piece 6] |
+| `FileItems`, `Surface` | the outline and its digests: [blaze-file-items, parser] |
+| `CrateScope`, `ModuleScope`, `Group` (names and solve) | [blaze-world, blaze-scope] |
+| `Expansion` | the host side (wasm runner, token codec): [blaze-proc-macro, blaze-expand]; the user's expander stays in the source (`MacroModule` id) |
+| `MacroModule` | the wasm compile of a proc-macro crate: [blaze-proc-macro] |
+| `Signature`, `ImplBucket` | heads and buckets: [blaze-surface, blaze-typeck] |
+| `BodyCheck` (types and borrows, one task) | [blaze-typeck, blaze-flow, blaze-flow-lower] |
+| `Code` (build to LIR, emit) | lowering and emit: [the LIR and codegen crates] |
+| `Test` | the runner and its wire: [blaze-run] |
+| the toolchain's records | not a stage: they are `CrateScope` (and its shapes) records of public crates, keyed by that stage; the pinned toolchain is in their source by its files' content ids, and in `stage` by blaze-toolchain's `PINNED` file |
+
+**(a) Today, cargo builds blaze.** `stage(kind)` is a digest of source text, computed before
+cargo runs by a build-time script (tools/stage-ids, piece 2), never by blaze at run time: over
+the cargo closure of the kind's root packages (normal and build dependencies, every platform,
+from `cargo metadata --locked --offline`, the only cargo run, at build time), each workspace or
+vendored package by every regular file under its directory sorted by relative path (target/
+and nested packages excluded), each registry package by (name, version, source, checksum), plus
+the toolchain pin cargo builds blaze with. `drive` is the same over blaze-drive. The ids reach
+the binary through one compile-time variable, `BLAZE_STAGE_IDS`, read by `option_env!` in a new
+tiny crate (piece 3); rustc records the variable in dep-info, so cargo rebuilds that crate when
+it moves. `bits` are `cfg!(debug_assertions)` and `cfg!(overflow_checks)` in that crate.
+
+A build without the variable (plain `cargo build` in the shared directory) is UNSTAMPED: every
+producer is `H(build id, kind)`, as today, and the profile says `identity: whole binary
+(unstamped)`. This is chosen at compile time, never at run time on a failure, so it is a mode,
+not a fallback (rule 3). Only the build entry (piece 4) sets the variable, and it computes the
+ids from a SNAPSHOT it builds (rule 80), never from the directory thirty lanes write in: ids
+computed from the tree while a lane writes could describe text cargo did not compile.
+
+Why the closure is complete: a file enters a crate only through an edit of a file already in
+it (`mod`, `#[path]`, `include_bytes!` are in the includer; a new dependency is in a
+`Cargo.toml`, which is under the package directory); a third-party change moves its checksum.
+Coarse but sound: a test-file or README edit in a closure moves the id (a miss, never wrong).
+
+Rejected: **hand-kept form versions under a digest ratchet.** The ratchet must allow "digest
+moved, version kept" for a refactor, and that declaration is the failure: a person says nothing
+changed, a stale record is read by changed code, the build is wrong. An identity is computed,
+never declared. **Whole-binary id for release builds only:** CI would refill every record per
+release, and the shared cache would hold one copy of the toolchain per release (the bug above).
+**Hashing blaze's sources in const eval or at start:** tens of MB per build or per command
+(estimate), and a check at start compares to the disk now, not to what was compiled.
+
+**(b) When blaze builds blaze.** `stage(kind)` is `core::reflect::fn_info(root).code_id`, the
+behaviour identity (code-identity.md) of one root function per kind that calls both the stage's
+run and its record's decoder; `drive` the same over the envelope and read-list writers. The
+compiler computes it while compiling the binary, so it describes exactly the code linked, at
+function grain: a bstd edit moves only stages that reach the changed functions. Two
+conditions, both gates: a stage root reaches no IO driver (rule 14; IO is a door leaf), and
+SIMD or arch-specific helpers in reach (BLAKE3) are `#[blaze::pure(trusted = ..)]` leaves, so
+the id is equal on aarch64 macOS, aarch64 Linux and x86-64 (checked: blaze computes each root's
+id for the three targets and they must agree). A foreign function is identified by link name
+only, so a stage's root id also holds the digest of each native object it links. Pieces 2 to 4
+and the variable are then deleted, with a `.clippy.toml` ban on `blaze_stage_id`.
+
+**What makes a stale read impossible, and the test.** A record is found only by its key, and
+its key holds the producer of the code that will decode it; a changed stage computes other keys,
+so it cannot be handed a record its old code wrote. The drive's simulation (piece 1) gives each
+simulated stage an output that is a function of (its producer, its inputs): a stale record then
+differs in bytes from a fresh one. Oracle: after a rebuild that changed one producer, every
+answer equals a fresh home's in bytes (rule 26), only the changed kind's tasks ran, and every
+other kind ran nothing. Planted `Plant::ProducerLeftOut` (one kind's key holds the drive id
+only): caught as "a BodyCheck record made by producer A answered producer B". The world (a)
+closure is tested causally (rule 23): in a temporary copy, an edit of each file of a closure
+moves its stage, an edit outside moves none; planted `omit-lock` (registry checksums left out)
+is caught by bumping one checksum.
+
+### 2. The shared cache
+
+Equal on two machines and two builders: in (a) the ids are a function of file bytes, relative
+paths, lock entries and two bits; no path, host, time or target is read, so CI on Linux and a
+Mac building one commit compute equal ids (piece 4 tests two snapshot slots; CI compares a Linux
+and a macOS line). The records themselves are equal only if no stage output depends on the host
+(rule 25); that is a separate check this design leans on, not one it proves: CI computes the
+toolchain's public records on two hosts and compares keys and bytes (gap row 11). Across an
+upgrade: in (a) a stage whose closure did not move keeps its id, and every record of it, local
+and in the bucket, still answers; in (b) the same at function grain. CI fills the bucket only
+from stamped builds; an unstamped binary's keys never reach it.
+
+### 3. The bound on bytes
+
+**Liveness.** A record is live when its producer belongs to a live binary and some command
+used it within 30 days. Two facts, both files beside the packs, neither in a key:
+- *The roster*: `<home>/.blaze/v2/roster/<hex16 of H(exe path, build id)>`, one per binary
+  that ran: its path, build id, its producers, written (unsynced, by rename) when absent or older
+  than a day, so one stat a command. An entry is live while it ran in the last 30 days AND the
+  file at its path still carries its build id (Mach-O `LC_UUID`, ELF `NT_GNU_BUILD_ID`, read from
+  the file's first 64 KiB). `blaze` and `blaze-old` both installed: both entries live, both
+  binaries' records kept. A rebuild replacing `~/.cargo/bin/blaze`: the old entry is dead at once,
+  and its producers' records, unless another live entry shares a producer.
+- *The use log*: per layer, `used`, fixed 12-byte rows (pack number, row) of records the command
+  got from that layer's packs, appended once after the answer, unsynced; a torn tail row is
+  dropped. A lost row makes a record look unused: at worst it is collected and made again.
+
+**Each record's producer in its pack.** Pack format 3 (store.rs `FORMAT`): a producer table
+(count, 32 bytes each) before the footer; each index row's four spare bytes (store.rs `ROW`) hold
+a u16 index into it. A row stays 48 bytes. Format 2 packs are refused and removed at the first
+open, as format 1 was: that open alone frees today's 215 MB.
+
+**The collector.** After the answer the command decides from what it already holds (the
+indexes, the roster listing, the `collected` stamp's mtime, one stat): collect a layer when its
+dead bytes (dead producer, or no use in 30 days and older than 30 days) pass a quarter of it, or
+the layer passes its cap, and none ran in the last hour. Then it starts a detached helper,
+`blaze collect`, at utility QoS with a 120 s deadline, and exits; the helper takes an
+exclusive-create `collecting` stamp (one past its deadline is taken over; a second collector
+does not start, nothing waits), streams the survivors into one pack as `PackStore::merge` does,
+publishes it, names it in the boot record, then removes the old packs, then rewrites `used`. If
+the layer is still over its cap, the packs whose last use is oldest go first.
+
+**Crash safety.** As the merge: publish before remove, nothing synced; a crash keeps both (equal
+bytes twice, folded by the duplicate rule) or loses records the driver makes again; never a torn
+or wrong record (footer digest, once-a-boot read). A command reading a removed pack keeps its
+open file; one that lists after answers a miss. Proof is a DST (rule 43), store/collect_tests.rs
+on `blaze_sim` and bstd's crashing `SimWorld`: two binaries' rosters, commands of both
+interleaved with a collector, power cut anywhere. Oracle: every get answers its key's bytes or a
+miss; after a collection that finished, every record of a live entry's producer used within the
+window is present, and no record of a dead producer remains. Planted bugs: `CollectLiveProducer`
+(the path check skipped: `blaze-old`'s records removed), `RemoveBeforePublish`, `UseIgnored`.
+
+**The bound.** `shared` ≤ the union over live producers of public records: with the toolchain
+at 24 MB (measured, compact.rs doc), L live binaries hold at most L × 24 MB, about 48 MB for
+`blaze` and `blaze-old` and less where their stages agree, against 215 MB today and +24 MB a
+rebuild. `own` and the checkout store ≤ min(the records of the workspaces used in 30 days under
+live producers, the cap); cap = min(16 GiB, 5% of the volume) for `own`, 4 GiB for `shared`
+(caps are estimates, sized by the machine, constants in store.rs). Dead bytes are removed within
+an hour of the command after the binary that made them is replaced.
+
+### 4. Floors in numbers
+
+| After a rebuild of blaze that... | Today | End state |
+|---|---|---|
+| changed nothing a stage reaches (docs, tests, another builder of the commit) | all tasks rerun; hello 37 runs, 2,769 ms cold, 27 records, 24 MB written (measured: "Shared across projects", compact.rs doc) | (a) and (b): the certificate hits, 0 tasks, 0 bytes |
+| changed `BodyCheck`'s code only | as above; tempo pays its whole first run, about 32 s CPU (drive.md floors, estimate) | toolchain 0 of 27 records, 0 of 24 MB; tempo reruns its bodies only, 31.2 s one thread for 20,000 (measured, tempo-front-9.txt), about 2 to 4 s on 8 to 16 cores (estimate); bytes = the body records (not measured) |
+| changed `CrateScope`'s code | as above | 27 records, about 24 MB, rewritten: the floor, as the code changed |
+| changed bstd, blaze-ids or blaze-drive | as above | (a): everything, as today; (b): only stages reaching a changed function |
+
+World (a) is coarse where it matters: in this tree since 2026-11-09, of 1,458 commits under
+crates/, non-test commits touched blaze-std 42 times, blaze-drive 28, blaze-ids 16 (git log,
+counted here); these are in every closure, so a rebuild spanning a day of main is almost always
+a full re-make (estimate). World (a) wins inside a lane's session (a typeck lane keeps tempo's
+names and scopes across its rebuilds) and across builders of one commit; the floor is world (b).
+
+### 5. Gap (tree blaze-fresh-1115, read 2026-11-16)
+
+| # | Needed | Today | Difference |
+|---|---|---|---|
+| 1 | a producer per kind in keys | key.rs `task_key(tool, ..)`, `cert_key(tool, ..)`; request.rs `Config.tool` | one `Tool` for all kinds |
+| 2 | ids from stage code | home.rs `tool`: build id + `FORMATS` magics; main.rs calls it with `host.build_id()` | whole binary |
+| 3 | pointer per (producers, shape) | request.rs `walks_from(last, tool, shape)`; answers.rs `Last.tool` (`BDL1`) | form `BDL2` with the digest |
+| 4 | stage code outside the dispatcher | work.rs `run` arms call blaze-cli units.rs, graph.rs, fetch.rs, names.rs (`parts` fills the `UnitGraph` record), macros.rs; the `Surface` record is made in work.rs | moved to stage crates (also rule 31) |
+| 5 | a build-time id script and a stamp crate | none | pieces 2 to 4 |
+| 6 | a pack names each record's producer | store.rs `FORMAT` 2, `ROW` = key, offset, length, four zero bytes | format 3 |
+| 7 | binary liveness | none; compact.rs doc names the gap | roster |
+| 8 | own path; another binary's build id | bstd rt/image.rs `build_id` reads the running image only (dyld, dl_iterate_phdr); `uuid_in`, `note_in` parse bytes | `Host::exe`, `build_id_in(file bytes)` |
+| 9 | per-record last use | none (this doc, "Shared across worktrees": owed) | `used` log |
+| 10 | collection by producer, use and cap | compact.rs `compaction` (pack count, duplicate share); store.rs `merge` drops only duplicates | collector, helper, DST |
+| 11 | records equal across hosts, checked | not found by search | CI comparison of public records |
+| 12 | code ids on the new layer (world b) | code-identity.md's `fn_info(f).code_id` is the old layer's (hir-ty-identity) | port when blaze builds blaze |
+
+### 6. Pieces (one writer each, none compiles)
+
+1. **PRODUCERS IN THE DRIVE.** CROSS-CRATE BATCH. blaze-drive key.rs (`Producers { drive,
+   by_kind: [ContentId; KINDS] }`, `of(kind)`, `digest()`; `task_key(producer, ..)`,
+   `cert_key(digest, ..)`), request.rs (`Config.producers`, `walks_from`), answers.rs (`Last`
+   form `BDL2`), sim.rs; callers: blaze-cli main.rs, home.rs, store_worktree_tests.rs. Test in
+   sim.rs replacing `another_tool_shares_no_record_and_no_certificate`: prints `test
+   sim::a_changed_stage_reruns_its_own_records_alone ... ok` and `test
+   sim::the_oracle_catches_a_producer_left_out_of_its_key ... ok`. Not: store.rs.
+2. **STAGE-ID SCRIPT** (parallel with 1). NEW tools/stage-ids/stage-ids.ts and stages.json (kind
+   to root packages; `drive` to blaze-drive); one typed JSON input (rule 42); prints one line of
+   hex ids in `Kind` order. Test (bun, temporary copy): prints `stage-ids: blaze-typeck edit moved
+   BodyCheck; 15 stood` and `planted omit-lock: caught`. Refuses a closure holding blaze-cli
+   once piece 6 is done. Not: any Rust.
+3. **STAMP CRATE** (after 1, 2). NEW crates/blaze-stage-id: `const STAMP: Stamp` from
+   `option_env!("BLAZE_STAGE_IDS")` (const parse, the count checked against `KINDS + 1`), the two
+   bits mixed in; blaze-cli main.rs builds `Producers` from it or, unstamped, from the build
+   id; home.rs `tool` deleted with a `.clippy.toml` ban; profile row `identity`. Test: `test
+   tests::a_stamp_parses_into_one_producer_per_kind ... ok`. CROSS-CRATE (blaze-cli main.rs).
+4. **BUILD ENTRY** (after 2, 3). NEW tools/stage-ids/build.ts: sync the tree into a fixed slot
+   snapshot (unchanged files keep their mtimes, so cargo stays incremental), ids from the
+   snapshot, `cargo build` there with the variable; refuses when the variable is already set;
+   CI's release job and the install scripts call it. Test: one commit in two slots prints
+   `build: ids equal across 2 slots`. Not: Rust.
+5. **TASK INTERFACE CRATE** (after 1). NEW crates/blaze-task: `Did`, `Made`, `held_str` and the
+   task inputs moved from blaze-cli work.rs. CROSS-CRATE (blaze-cli). Test: the existing
+   blaze-cli tests, unchanged. Not: stage logic.
+6. **STAGE MOVES** (after 5; serialized, one batch at a time, all touch work.rs `run`): (a)
+   units.rs, fetch.rs, graph.rs and `names::parts` into their library crates' `task` modules;
+   (b) names.rs into blaze-world; (c) macros.rs into blaze-proc-macro; (d) `FileItems`,
+   `Surface`, `BodyCheck` arms into blaze-file-items and blaze-typeck. Then a `.clippy.toml`
+   `disallowed-methods` entry: blaze-cli makes no `Record`. Test after each: piece 2's script
+   prints `stage-ids: blaze-cli edit moved none` for the moved kinds.
+7. **PACK FORMAT 3** (after 1). store.rs `seal_records`, `merge`, `read_pack`, chunks.rs: the
+   producer table and the row's u16; `put` names the producer from the record's kind
+   (blaze-drive `record::open`, as `Sharing::place` does), certificates and pages under
+   `digest()`. Test in scale_tests.rs: `test store::scale_tests::a_pack_names_each_records_producer
+   ... ok`; a format 2 pack refused and removed. Not: blaze-drive.
+8. **ROSTER** (parallel with 7; bstd part first). bstd host.rs `Host::exe`, rt/image.rs
+   `build_id_in(&[u8])`; NEW blaze-cli roster.rs: write own entry, `live(cx, home)`. Test (sim):
+   `test roster::tests::a_replaced_binary_is_dead_and_an_installed_one_lives ... ok`.
+9. **USE LOG** (after 7). store.rs `after_answer` appends each layer's used rows. Test: `test
+   store::tests::a_torn_use_log_drops_its_last_row ... ok`.
+10. **COLLECTOR** (after 7, 8, 9). NEW store/collect.rs (the rule, survivors, publish then remove);
+    compact.rs counts dead-producer bytes as dead; main.rs starts `blaze collect` after the answer
+    with its deadline. DST store/collect_tests.rs: `test
+    store::collect_tests::a_collection_crashed_anywhere_keeps_live_records ... ok`, and one
+    `the_collect_oracle_catches_<plant> ... ok` line for each of the three planted bugs. Not: the
+    drive.
+11. **WORLD (b)** (when blaze builds blaze and the new layer has code ids). A root per kind, its
+    `fn_info(root).code_id` into `Producers`; delete 2 to 4. Test: each root's id equal for the
+    three targets, and an edit of one reached function moves exactly its stages.
+
+At once: 1, 2 and the bstd half of 8. Then 3, 5 and 7. Then 4, 6 (serial), 9 and the rest of
+8. Then 10. 11 waits for the switch.

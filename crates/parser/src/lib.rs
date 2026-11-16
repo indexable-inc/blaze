@@ -52,12 +52,12 @@ pub(crate) use token_set::TokenSet;
 pub use edition::{BlazeEdition, Edition, Extensions, UnknownBlazeEdition};
 
 pub use crate::{
-    input::{FRAGMENT, Input, JOINT, Tokens, word},
+    input::{FRAGMENT, Input, JOINT, Tokens, WordRefused, token_word, word, word_kind},
     lexed_str::LexedStr,
     outline::lazy_block_len,
     output::{OutlineStep, Output, Step},
-    shortcuts::{OutlineStrStep, StrStep},
-    sink::{Done, Sink},
+    shortcuts::{Joiner, Joins, OutlineStrStep, StrStep},
+    sink::{Done, Message, Sink},
     syntax_kind::SyntaxKind,
 };
 

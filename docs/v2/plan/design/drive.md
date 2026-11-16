@@ -1121,6 +1121,183 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       architect's build order for this lane's files, "End state: the whole pipeline on the
       command" below, "Gap" and "Pieces" (1 MEMBERS, 2 POOLED SCOPES, 3, 6, 7, 9, 11, 13; 14
       any time after 2).
+    - RUNNER 11 2026-11-16 (uncommitted; handed on at the context limit; last build: snapshot
+      9b16d92249, binary port27/drive-1116/blaze-r11-c). Runs: main-clone, the scratch home, no
+      network, load 11 to 17.
+      RESULT. `blaze check` on blaze's clone: "5.15 real 7.56 user 1.27 sys", exit 3
+      ("incomplete: NOT checked: types, borrows", "0 errors"), 982 MB peak RSS; before
+      (blaze-1354-step1): "53.95 real 130.23 user", a panic. CAVEAT: in the 5.15 s run NO
+      `UnitGraph`, `Fetch` or `CrateScope` task ran (no such rows; the 13:36 build ran 8, 289
+      and 549 of them, 1.1 s of main thread): another piece of the live tree between 13:36
+      and 14:13 dropped the graph on this checkout: NOT investigated, the first thing to do.
+      DONE 1 (the profile on failure, the frame's rows): main.rs `command` runs the request
+      behind `work::unwinding` (the one home of `catch_unwind`; `CliError::Panicked`);
+      `print::profile_failed` writes `stopped ..` and the phases in a frame of its own.
+      phases.rs `mark_in`/`took`/`worked`/`times`: two `frame` lines (bytes by phase; bytes,
+      times and main-thread ns by effect kind and task kind; pooled worker ns).
+      MEASURED CAUSES (neither was what had been read): (a) the frame: "effect publish (the
+      settled table) 45776916 114429x" of "64562474 of 67108864 bytes used": `Settled::
+      grown_in(frame)` kept every outgrown table; then jobs' paths 4.2 MB, the effects list
+      2.6 MB, the work list 1.8 MB. (b) the 120 CPU seconds: "pooled BodyCheck (worker ns)
+      108606x 252125445249" against "pooled FileItems 4581x 2901540261": work.rs `body_syntax`
+      read and outlined the whole home file once a BODY (sample: 6,539 of 8,463 worker samples
+      in `blaze_file_items::outline`). Nothing for the outline's lane.
+      DONE 2, part (by lifetime; NOT the typed seam): the settled table, `effects` and `todo`
+      on the named global heap (an outgrown buffer is freed); a round's jobs' paths and body
+      lists in `Frames::jobs`, reset when the round's scope has joined, grown by `try_`
+      (`JOBS_FULL` fails the one task). After: "the command's frame: 15116635 of 67108864
+      bytes used"; its largest row is "task Units 9387632 181x" (the layout, handed the
+      command's frame by `run_one`: next). NOT DONE: `Kept`/`CliError::FrameFull`,
+      `Why::FrameFull` at the job seam (parallel.md pieces 1, 3), footprint per task (7).
+      NOTE: the command writes the settled table and nothing in blaze-cli reads it
+      (`worker::answer_in_place` has no caller there): 21 MB and 42 ms for no reader; delete
+      or wire it with the claims piece.
+      DONE 4: a round's `BodyCheck` tasks are ONE pooled job a home file (work.rs `BodiesJob`,
+      `Group`, `pooled_bodies`, `bodies_syntax`: read once, outline once, each body found by
+      search and parsed; a body's panic fails that body). "pooled body jobs, one a file a
+      round 4653x 3699235550", "pooled BodyCheck 108606x 3699184913" (252 s -> 3.7 s). Test
+      `a_files_bodies_are_checked_by_one_job_a_round`: "1 passed"; without the grouping: "400
+      file jobs for 400 bodies of one file". Still twice the floor on a first run (the file is
+      outlined by `FileItems`, then again by its body job): the body job should take the
+      item ranges from the `FileItems` record.
+      WHERE THE 5.1 s GO NOW (main thread): "effect put 118207x 2362855830" (the store lane's
+      `PackStore::put`), "pooled tasks joined 8064x 1255300337", "opens probed 203x
+      785145917", "machine step 130596x 384067087"; workers 6.6 s over 449 rounds.
+      DONE 3, the symptom not the design: `program::run` lists the package's `src/` alone,
+      never the checkout. `blaze run` on the hello rung, fresh `.blaze` each: alone "real 0.05"
+      and "real 0.02"; beside a 374,012-entry `target/`: "real 0.05" and "real 0.02"; the
+      13:36 build beside it: "real 2.34", exit 1, "arena the packs' records: 15104 more bytes
+      would pass its limit". WHY NOT THE WALK'S ROWS: under `Gate::Beside` the program starts
+      before the walk has opened any file (tried: "the crate root `src/main.rs` is not among
+      the files", rows 0 and 7). `program::sources` (the rows' slots under `src/`) serves
+      `program_refusals` after the answer. Owed: the runner walks forward from its root
+      through a loader.
+      DONE 7: the names note is not printed after a program that ran. "mixcheck test
+      blaze-cli: exit 0; 2 passed, 0 failed" (`a_clean_run_prints_only_its_program`,
+      `a_clean_run_says_nothing_of_its_own`); before: "3-hello: a clean run says nothing".
+      NOT DONE: 5 (the three timings: only the first run above), 6 (`last` -> `.blaze/v2/at/
+      <hex16 of H(tool, shape)>`, 8 kept: read-addressed.md "End state", piece 1), the
+      typed seam of 2. No change to the machine, so no new sim case.
+      RED, NOT ATTRIBUTED (blaze-cli tests at 14:16, tree b1960bb662: "66 passed, 10 failed";
+      no baseline was taken before this runner's edits): `a_planted_panic_fails_one_task`
+      (the second check makes everything again: "Units 2 made, FileItems 41 made, BodyCheck
+      3910 made"), `an_oversize_file_fails_its_task_alone_and_names_the_file` (green at
+      14:07, red at 14:16), `a_bad_import_is_one_error_at_its_segment` (the finding printed
+      twice: check now covers test targets), `a_body_edit_reruns_no_surface_and_a_signature_
+      edit_one`, `a_signature_edit_in_a_binary_reruns_its_names`, three `fix_tests`,
+      `members_tests::two_members..`, `refused_targets_tests::..`. Other writers changed
+      main.rs:631, units.rs, sweep.rs `wanted`, names.rs, fetch.rs, graph.rs today.
+      TEST TARGETS (the command-crates integrator a9e02845f61bde508, after the hand-on): since
+      its 13:56 wiring a member with any `tests/*.rs` makes `blaze check` fail with
+      `DriveError::NoPart` (`FileItems` of the test root; units.rs `member_units` lists only
+      lib and bin parts); with main to choose a fix or a revert. NOT SEEN in this runner's
+      14:13 run on the clone (exit 3, "0 errors"), where no `UnitGraph` ran either: the two
+      may be one cause (the graph for `check` is made with tests since main.rs:631 changed).
+      Start the search for the missing `UnitGraph` there.
+      PROC MACROS (from PROC MACRO SPEED runner 2, aa75ce262a4184b21; not looked at by this
+      runner, the call site in the command not searched): the command's path must call
+      `procs.keep_all()` (`blaze_proc_macro::hook::ProcMacros`; `-> Result<KeptAll,
+      RecordError>`) once its crates are expanded and before `take_findings()`: results are
+      one table a crate written only there; without it a command keeps nothing and every
+      later command runs every macro again. Its `Err` is a finding printed by name.
+      THE JOIN (from ab1a42b2898694bd9, NEVER COMPILED, with the BUILD INTEGRATOR; do not
+      switch before its "blaze-std: check ok"): `handle.join(&cx)` keeps its signature and
+      now helps (runs queued tasks spawned from outside the pool while it waits); and a batch
+      join in completion order: `scope.batch::<Pooled, _>(alloc)`, `.may_overlap(..) ->
+      Result<u32, BatchError>`, `.join_each(&cx, |joined| ..)` (store `joined.result` by
+      `joined.index`, step the request in index order after it: rule 25), and
+      `scope.join_counts()` (`Display`) for a `phases` row. Its reason quoted the row from
+      BEFORE this runner's fix ("pooled tasks joined 113209x 48174625328"); the row is now
+      "8064x 1255300337": measure again before and after switching `run_batches`.
+      THE `effect put` ROW (from the pack store's writer a5aadb06ee11bb5be, NEVER COMPILED,
+      with the command-crates integrator): the 2.4 s was store.rs `put` inserting into a
+      sorted index (n^2/4 rows moved); now rows are appended and sorted once at the seal,
+      `Store::put`'s signature unchanged. OWED BY THIS LANE once it is green: re-measure
+      `check` on the clone and send the `effect put` row to the coordinator (the writer
+      expects tens of milliseconds for 114,429 puts: its arithmetic, not a measurement).
+      It also asks for `CliError::Store(store::chunks::PutError)` in main.rs (today the
+      refusal rides in `CliError::Remote(RemoteError::Put(..))`): tell it when added.
+      FOR THE TYPED SEAM OF 2 (from a18ba224587a1dab7, 14:2x, UNCOMPILED, with the BSTD
+      INTEGRATOR): `frame.table::<T>(most)?` -> `blaze_mem::frame::FrameTable` (its own
+      reservation, `try_push -> Result<u32, TableRefused>`, never copies, never panics), or
+      `blaze_own::Segs<T, &Frame>` where no single slice is needed; `frame.abandoned()`
+      prints "abandoned by growth: N bytes in M growths". Once it compiles, the settled
+      table, `effects` and `todo` (on the global heap since this runner) can move to it, and
+      the profile's frame line can quote `abandoned()`.
+      FOR THE TYPED BodyCheck (parallel.md piece 12): the RECORDS SWITCH writer
+      (a6e38604c026598f8) sent the calls (`source::Records::new`, `Front2::from_records`,
+      `body::lower_fn`, `check::check_body`, the log's count before and after a body).
+    - RUNNER 12 2026-11-16 (uncommitted; handed on at the context limit; run files in
+      port27/drive-1116/r12/; binary port27/drive-1116/blaze-r12-a = snapshot c587e87afe, which
+      has steps 1's fixes and NOT step 2's).
+      DONE 1 (the ten red tests; baseline "70 passed, 10 failed" at 14:24): after, "test
+      blaze-cli: exit 101; 83 passed, 1 failed" (the one is the store's, below), "test
+      blaze-drive: exit 0; 40 passed, 0 failed". Runner 11 read the profile's columns shifted
+      (the label is BEFORE its number): nothing "reran everything". Three causes: (a) five
+      tests: a library's test unit (`TestLib`) is a second `CrateScope` holding the same
+      finding ("2 errors", "id gv7fz begins another"): request.rs `print` now returns (count,
+      errors) and a crate's finding held by two crates prints and counts once; sim
+      `one_finding_held_by_two_names_prints_and_counts_once`, control with
+      `Plant::PrintEachName` ("the twins' finding printed 2 times"). (b) units.rs
+      `member_units` listed only lib and bin roots as parts: any member with `tests/*.rs`
+      was `DriveError::NoPart`; `member.extras` roots are parts now. (c) four stale counts,
+      each test's doc says what changed (two crates' names: 106 -> 110, 16 -> 20, 1 -> 2; a
+      parameter edit leaves the surface equal by names_digest.rs, and a new item reruns one
+      `Surface` and two `CrateScope`s, 7 runs). `blaze build`: `CliError::NoSuchCommand`
+      (process test `build_is_no_command_and_names_run_and_export` passed).
+      STEP 2, THE CAUSE (read from the profile and the code, NOT yet shown by a run): nothing
+      landed between 13:36 and 14:13. The 14:13 build ran over the 13:36 build's pointer:
+      main.rs read the layout only when `cold || followed.layout_moved`; another tool's leaf
+      table made neither true, so `laid` was `None`, `Start` got `graph: None`, the machine
+      (not forward: `last.tool` differs) made the units again through work.rs's lazy `lay`
+      ("Units made 181") and no `UnitGraph`, `Fetch` or `CrateScope` job existed. The same
+      holds for another SHAPE's pointer (`test` or `run` before `check`) and after every
+      upgrade. A cold run of blaze-r12-a (pointer and stores set aside) did reach the names:
+      "error: a task wanted FileItems(8002d59876ff) of FileItems(8002d59876ff), which does
+      not list it", "15.05 real 16.66 user", exit 1, 5.07 GB peak RSS.
+      WRITTEN AND GREEN, 14:43 ("mixcheck blaze-cli: check ok (all targets) at 14:43; tree
+      fde9505b0a", "mixcheck test blaze-cli: exit 0; 88 passed, 0 failed (against green:
+      blaze-typeck blaze-ladder)": the store's streaming merge landed, `run_output` passes);
+      NOT YET shown: test (iv) failing without (i) (the tree went red under the attempt:
+      "test_loop.rs:897:1: error: couldn't find file `crates/blaze-cli/src/tests/
+      test_loop_tests.rs`", another writer's), and no real run of a build that has them:
+      (i) blaze-drive request.rs `shape_of(&Ask)` and `walks_from(last, tool, &shape)`;
+      main.rs `request`: a pointer that is not this tool's and shape's is absent (cold);
+      (ii) main.rs `Finished::names_held`, `check_coverage(names_held, ..)`, work.rs
+      `NAMES_STAGE`: a whole walk with source files and no `CrateScope` row closes with "NOT
+      checked: names, .." and exit 3; (iii) names.rs `Unlisted`, `Names::reader_of`, work.rs
+      `answer_batch`: `NoPart` of a file a crate's names read becomes `CliError::Unlisted`
+      naming the package and the path; (iv) tests `a_check_after_another_command_resolves_
+      the_names` (must fail without (i)) and `a_check_without_names_says_names_were_not_
+      checked`. NOT done: the lazy `lay` in work.rs `run` (Kind::Units) still loses the
+      graph when a store lost the units record: make it loud or hand the graph late.
+      THE STORE: `PackStore::merge` read every pack into one TASK_FRAME: "arena the packs'
+      records: 1485760 more bytes would pass its limit" (`--test run_output`, real home, 8
+      packs, 169 MB) and "15104 more bytes" (the scratch home's own store): every command
+      in such a home exits 1. Sent to a5aadb06ee11bb5be; its streaming merge landed (14:43).
+      AFTER THE HAND-ON, from the store's next writer (ac22ba2da3b1ba1cd; uncompiled, with
+      the COMMAND-CRATES INTEGRATOR; not checked by this runner): `Layered::put` writes
+      nothing when any layer holds the key; `PackStore::open_in` takes a `folder`; a layer
+      merges past 8 packs or 1/4 duplicate bytes; the `run_output` process tests set HOME
+      to a temp folder (this runner's `build_is_no_command_and_names_run_and_export` is in
+      that file: see it still runs). Its cause for the repeated packs is the one behind
+      step 2: `home::tool` (the binary's build id) is in every `task_key`, so each rebuilt
+      blaze is another tool, writes every record again and reads no earlier pointer.
+      SET ASIDE for the cold run (put back or delete): r12/aside/home-own (the scratch
+      home's `.blaze/v2/own`), r12/aside/clone/{last,packs}; the 289 source records were
+      copied to home/.blaze/v2/sources (the new place, D78).
+      OWED BY DESIGN: `TestLib`/`TestBin` as crates of their own double each member's names;
+      "One check covers every configuration" makes `test` a variable of one crate's
+      condition. `--test run_output` reads the real `$HOME`.
+      NOT STARTED: 3 (timings), 4 (`FrameFull`), 5 (the pointer a (tool, shape): it is the
+      end state of step 2's fix: do it next), 6; queued from others: program.rs `Dir::walk`
+      (limits folders 1 << 12, entries 1 << 16, depth 32), sweep.rs `facts_of`/`read_sized`
+      (aeeae1de06257a7d3), `procs.keep_all()` before `take_findings` (a7696bf9081b5dc2b),
+      the `effect put` row re-measured for a5aadb06ee11bb5be.
+      FIRST THING NEXT: run test (iv)'s first test once without (i) (main.rs `request`: make
+      the `walks_from` arm give `(last, leaves)`) and quote its line; greenbuild; in the
+      clone run `check` cold and read which path `Unlisted` names, then a second build's
+      `check` over the first's pointer and quote its `UnitGraph`/`CrateScope` rows; step 5.
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

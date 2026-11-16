@@ -103,6 +103,23 @@ use crate::{
 mod ancestors;
 pub use ancestors::{Ancestor, AncestorError, AncestorKind};
 
+// Many paths looked at in one effect: the batched stat; and sorted paths of many folders, each
+// folder listed whole or its paths stamped, chosen by a count (`Dir::facts_of`).
+mod looks;
+pub use looks::{ByCount, EachPath, Facts, FactsError, Look, Looks, Strategy, Whole};
+#[cfg(test)]
+pub(crate) use looks::SkipsLast;
+
+// A file read whose length the caller knows: one read of len + 1, no stat before it.
+mod read_sized;
+pub use read_sized::SizedError;
+
+// A walk over folders, bounded by its caller: the visitor chooses each folder's sub-folders.
+mod walk;
+#[cfg(test)]
+pub(crate) use walk::WalkPlant;
+pub use walk::{Enter, WalkError, WalkLimit, WalkLimits, Walked};
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for super::ReadOnly {}
@@ -382,9 +399,44 @@ enum Kind<'a> {
     CloneOf(&'a Flushed),
     CopyOf { of: &'a File<ReadOnly>, chunk: NonZero<usize> },
     PatchOf { base: &'a Flushed, patches: &'a [Patch<'a>] },
+    Parts { parts: &'a [&'a [u8]], most: NonZero<usize> },
+    PartsOf { parts: &'a [FilePart<'a>], then: &'a [u8], chunk: NonZero<usize> },
+}
+
+/// One range of a [`Content::parts_of`]: the `len` bytes `of` holds from `at`.
+#[derive(Clone, Copy, Debug)]
+pub struct FilePart<'a> {
+    pub of: &'a File<ReadOnly>,
+    pub at: u64,
+    pub len: u64,
 }
 
 impl<'a> Content<'a> {
+    /// These ranges of files end to end, then `then`, read and appended through one buffer of
+    /// `chunk` bytes: a file made of pieces of other files with memory for one chunk, never
+    /// for the sum (a merge of files larger than any frame). A range its file does not hold
+    /// whole fails the publish, naming the file; the path then holds what it held before.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn parts_of(parts: &'a [FilePart<'a>], then: &'a [u8], chunk: NonZero<usize>) -> Content<'a> {
+        Content { kind: Kind::PartsOf { parts, then, chunk } }
+    }
+
+    /// These slices end to end, written in order by appends of at most `most` bytes each: a
+    /// gathered write. Each byte is copied once, into the effect that writes it (blaze-core's
+    /// `Effect` owns its bytes); nothing is joined into one buffer first, so a file of many
+    /// pieces costs its maker no second copy of them. The path holds all of it or what it held
+    /// before, as with [`Content::bytes`]: the appends go to the temporary file.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn parts(parts: &'a [&'a [u8]], most: NonZero<usize>) -> Content<'a> {
+        Content { kind: Kind::Parts { parts, most } }
+    }
+
     /// These bytes, written.
     #[blaze::pure]
     #[blaze::nopanic]
@@ -1104,6 +1156,12 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     /// Every file beneath this directory, at any depth, sorted by name, in `frame`: each one's
     /// path relative to this directory, and what it is. A directory that is not there yet (no
     /// file was made under it) has none.
+    ///
+    /// DEPRECATED, to be deleted: unbounded (on a checkout with a build folder it listed
+    /// 374,012 entries for seconds and then overflowed its frame). Use [`Dir::walk`], whose
+    /// caller chooses each folder's sub-folders and names its limits, or [`Dir::entries`] for
+    /// one level. Its last caller is blaze-cli's `program.rs`; once that moves, this function
+    /// goes, and its name is banned in `.clippy.toml`.
     pub fn list<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<(Path, Meta), &'a Frame>, FsError> {
         let mut found = Vec::new_in(frame);
         // The root is always there; a named directory may not be yet.
@@ -1299,6 +1357,80 @@ impl Dir<ReadWrite> {
                         // alloc: the effect's bytes, which blaze-core's `Effect` owns.
                         append(&self.io, cx, FsOp::Publish, &temp, bytes.to_vec())
                     })?;
+                }
+                How::Written
+            }
+            Kind::Parts { parts, most } => {
+                truncate(&self.io, cx, FsOp::Publish, &temp, 0)?;
+                let mut left: usize = parts.iter().map(|part| part.len()).sum();
+                let mut rest = parts.iter();
+                let mut part: &[u8] = &[];
+                // Each turn appends at least one byte of the `left` it counts down: bounded.
+                while left > 0 {
+                    let room = left.min(most.get());
+                    // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+                    let mut bytes = Vec::with_capacity(room);
+                    while bytes.len() < room {
+                        if part.is_empty() {
+                            match rest.next() {
+                                Some(next) => part = next,
+                                None => break,
+                            }
+                            continue;
+                        }
+                        let take = part.len().min(room - bytes.len());
+                        bytes.extend_from_slice(&part[..take]);
+                        part = &part[take..];
+                    }
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    left -= bytes.len();
+                    within(&self.io, quota, FsOp::Publish, &temp, bytes.len() as u64, || append(&self.io, cx, FsOp::Publish, &temp, bytes))?;
+                }
+                How::Written
+            }
+            Kind::PartsOf { parts, then, chunk } => {
+                truncate(&self.io, cx, FsOp::Publish, &temp, 0)?;
+                let room = chunk.get();
+                let flush = |full: Vec<u8>| within(&self.io, quota, FsOp::Publish, &temp, full.len() as u64, || append(&self.io, cx, FsOp::Publish, &temp, full));
+                // alloc: the effect's bytes, which blaze-core's `Effect` owns; one chunk at a time.
+                let mut bytes: Vec<u8> = Vec::with_capacity(room);
+                for part in parts {
+                    let of = part.of.name();
+                    let (mut at, end) = (part.at, part.at.saturating_add(part.len));
+                    // Each turn reads at least one byte toward `end`, or fails: bounded.
+                    while at < end {
+                        if bytes.len() == room {
+                            flush(core::mem::replace(&mut bytes, Vec::with_capacity(room)))?;
+                        }
+                        let len = (end - at).min((room - bytes.len()) as u64) as usize;
+                        // clone: the effect's name, a refcount.
+                        let file = of.clone();
+                        let read = match call(&self.io, cx, FsOp::Publish, of, |tag| Effect::Read { file, at, len, tag })? {
+                            Done::Read(read) => read,
+                            done => return Err(unexpected(FsOp::Publish, of, done)),
+                        };
+                        if read.is_empty() || read.len() > len {
+                            // alloc: an error's words.
+                            let said = format!("{} bytes read at {at} of a part that ends at {end}", read.len());
+                            return Err(FsError::new(FsOp::Publish, of, FsKind::Answered(said)));
+                        }
+                        bytes.extend_from_slice(&read);
+                        at += read.len() as u64;
+                    }
+                }
+                let mut rest = then;
+                while !rest.is_empty() {
+                    if bytes.len() == room {
+                        flush(core::mem::replace(&mut bytes, Vec::with_capacity(room)))?;
+                    }
+                    let take = rest.len().min(room - bytes.len());
+                    bytes.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                }
+                if !bytes.is_empty() {
+                    flush(bytes)?;
                 }
                 How::Written
             }
@@ -1763,11 +1895,16 @@ impl<#[blaze::linear] P: Rights> File<P> {
 }
 
 impl File<ReadWrite> {
-    /// The bytes handed to the driver at the file's end, within the quota.
+    /// The bytes handed to the driver at the file's end, within the quota: lent for the call
+    /// ([`Io::write_lent`]), so a native world writes them with no copy and the simulation
+    /// queues its own copy, as before.
     fn append_bytes(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
         within(&self.io, self.quota.as_deref(), FsOp::Append, &self.name, bytes.len() as u64, || {
-            // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-            append(&self.io, cx, FsOp::Append, &self.name, bytes.to_vec())
+            match self.io.write_lent(cx, &self.name, crate::io::Lent::End, bytes) {
+                Ok(Done::Appended) => Ok(()),
+                Ok(done) => Err(unexpected(FsOp::Append, &self.name, done)),
+                Err(stopped) => Err(FsError::new(FsOp::Append, &self.name, FsKind::Stopped(stopped))),
+            }
         })
     }
 
@@ -1838,12 +1975,20 @@ impl File<ReadWrite> {
         }
     }
 
-    /// `bytes` written at `at`, not flushed: its [`File::write_from`], waited for. It never
-    /// waits for the device.
+    /// `bytes` written at `at`, not flushed: what [`File::write_from`] waited for does, with
+    /// the bytes lent for the call (`Io::write_lent`): a native world writes them with no
+    /// copy, the simulation queues its own copy as `write_from` did. Within the quota as
+    /// `write_from` is. It never waits for the device.
     pub fn write_at_unsynced(&self, cx: &Cx, at: u64, bytes: &[u8], unsynced: Unsynced) -> Result<(), FsError> {
         cx.stopped_by(self.io.now())
             .map_err(|stopped| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(stopped)))?;
-        self.write_from(bytes, at).wait(cx)?;
+        within(&self.io, self.quota.as_deref(), FsOp::WriteAt, &self.name, bytes.len() as u64, || {
+            match self.io.write_lent(cx, &self.name, crate::io::Lent::At(at), bytes) {
+                Ok(Done::Written) => Ok(()),
+                Ok(done) => Err(unexpected(FsOp::WriteAt, &self.name, done)),
+                Err(stopped) => Err(FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(stopped))),
+            }
+        })?;
         started(&self.io, &self.name, unsynced);
         Ok(())
     }

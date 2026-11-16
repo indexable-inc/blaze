@@ -72,6 +72,7 @@
 #![feature(allocator_api)]
 
 mod adt;
+pub mod atoms;
 mod body;
 mod builtin;
 mod call;
@@ -84,6 +85,7 @@ mod expand;
 mod expansion;
 mod item;
 pub mod kept;
+pub mod kept_set;
 mod key;
 mod limit;
 mod literal;
@@ -92,6 +94,7 @@ mod record;
 mod rules;
 mod tokens;
 
+pub use crate::rules::{rules_oracle, rules_oracle_counts};
 pub use crate::{
     body::{
         BodyWord, BodyWords, Fragment, ParserWords, body_words, local_hygiene, parser_words,
@@ -116,7 +119,10 @@ pub use crate::{
         PathScope, ProcLevel, Range, Read, ReadAnswer, ReadKind, Reads, TokenOrigin,
     },
     item::{AttrCall, DeriveUse, Derives, ItemAttrs, ItemAttrsError, NextAttr},
-    key::{CallKey, DefText, EXPANDER, ExpansionKey, TextCall, TextKey, call_key, expansion_key, text_key},
+    key::{
+        CallKey, DefDigest, DefText, EXPANDER, ExpansionKey, TextCall, TextKey, call_key, def_digest, expansion_key, text_key,
+        text_key_with,
+    },
     limit::{Depth, LimitReached, RecursionLimit},
     nested::find_calls,
     record::{

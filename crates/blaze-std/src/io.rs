@@ -82,6 +82,14 @@ use crate::{
     window::Window,
 };
 
+/// What a world reads and does without its lock: the native clock, inline file calls, lent
+/// writes (std.md, "End state: efficiency", pieces 6, 7 and 11).
+mod fast;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use blaze_core::threads::inline::Lent;
+
 /// The bounds bstd would otherwise pick for its caller, said once where the [`Io`] is made
 /// (docs/v2/plan/design/std.md, "The second rule": a bound is an argument, never a default).
 /// A world is made with one ([`SimWorld::limits`], [`NativeWorld::limits`]); there is no
@@ -330,8 +338,9 @@ impl Clone for Io {
 #[derive(Clone)]
 enum Reach {
     /// A native or simulated world: shared by the `Io`s cloned from it, on any thread, behind
-    /// its lock.
-    Shared { world: Arc<Lock<World>>, env: Vars, args: ArgList },
+    /// its lock; with what is read or done without the lock beside it ([`fast::Beside`]: the
+    /// native clock and inline file calls).
+    Shared { world: Arc<Lock<World>>, env: Vars, args: ArgList, beside: fast::Beside },
     /// A hosted run's ([`crate::guest::Run`]): found through the calling thread's run, never
     /// held, so cloning and dropping an `Io` of it touches nothing. Its hot calls (a write,
     /// the clock, a grant, the exit) go straight to the host's table with no lock; the rest
@@ -709,6 +718,9 @@ impl Io {
     }
 
     fn world(&self) -> &Lock<World> {
+        // The tests' count of reaches of the lock (io/tests.rs, `native_now_takes_no_lock`).
+        #[cfg(test)]
+        self.counted(|seen| &seen.locks);
         match &self.reach {
             Reach::Shared { world, .. } => world,
             Reach::Hosted => &crate::guest::Run::current().escape().0,
@@ -719,9 +731,11 @@ impl Io {
         let (offers, limits, plant) = (start.offers, start.limits, start.plant);
         // clone: the world's environment and command line, `Arc`s.
         let (env, args) = (start.env.clone(), start.args.clone());
+        // Chosen once, from the driver, before it moves under the lock.
+        let beside = fast::Beside::of(&start.driver);
         Io {
             // alloc: once per world.
-            reach: Reach::Shared { world: Arc::new(Lock::new("bstd.io.world", World::new(start))), env, args },
+            reach: Reach::Shared { world: Arc::new(Lock::new("bstd.io.world", World::new(start))), env, args, beside },
             offers,
             limits,
             plant,
@@ -1298,10 +1312,15 @@ impl Io {
         crate::rt::resume_unwind(Box::new(Exit { status }))
     }
 
-    /// The driver's clock.
+    /// The driver's clock: a native world's read beside its lock, with none taken (the
+    /// driver's own clock, on the instant it began: [`fast::Time::Native`]); a simulated
+    /// world's virtual clock under its lock, which moves only inside the driver's own calls.
     pub(crate) fn now(&self) -> Duration {
         match &self.reach {
-            Reach::Shared { world, .. } => world.lock().driver.now(),
+            Reach::Shared { beside, .. } => match beside.now() {
+                Some(now) => now,
+                None => self.world().lock().driver.now(),
+            },
             Reach::Hosted => crate::guest::now_of(&crate::guest::Run::current().table),
         }
     }
@@ -1389,9 +1408,15 @@ impl Io {
     }
 
     /// `effect` of a fresh tag, handed to the driver, then waited for under `cx`: one call.
-    /// A `cx` that stopped already asks nothing of the driver.
+    /// A `cx` that stopped already asks nothing of the driver. On a native world whose driver
+    /// gives inline calls, a blocking file call of blaze-core's table is made on this thread
+    /// instead, its `Done` the queue's ([`fast`]); every other effect, and every effect of a
+    /// simulated world, is queued and waited for as before.
     pub(crate) fn call(&self, cx: &Cx, effect: impl FnOnce(Tag) -> Effect) -> Result<Done, Stopped> {
         cx.stopped_by(self.now())?;
+        if let Some(files) = self.inline_files() {
+            return self.call_inline(cx, files, effect);
+        }
         let tag = self.submit(effect);
         cx.wait(self, tag, Ends::Once)
     }
@@ -1399,29 +1424,9 @@ impl Io {
     /// `effect` of a fresh tag, handed to the driver now.
     pub(crate) fn submit(&self, effect: impl FnOnce(Tag) -> Effect) -> Tag {
         let mut world = self.world().lock();
-        let tag = Tag(world.next);
-        world.next += 1;
-        let effect = effect(tag);
-        if world.record {
-            touch(&mut world.touched, &effect);
-            // clone: a test's record of what was asked.
-            world.asked.push(effect.clone());
-        }
-        change(&mut world.changed, &effect, tag.0 + 1);
-        let World { driver, effects, disk, .. } = &mut *world;
-        // A machine whose power `bstd::test` cut takes nothing: its ledger is told nothing.
-        if let (Some(disk), Some(_)) = (disk.as_deref_mut(), driver.sim().filter(|sim| !sim.is_off())) {
-            disk.submitted(&effect);
-        }
-        effects.push(effect);
-        driver.submit(effects);
-        // Under `bstd::test` the armed simulation cuts the power at an effect of its seed's: the
-        // world crashes and the program's start ends here, unwound, with the lock let go first.
-        let cut = driver.sim().is_some_and(Sim::cut_due);
-        drop(world);
-        if cut {
-            crate::simtest::power_lost(self);
-        }
+        let effect = fast::stamp(&mut world, effect);
+        let tag = effect.tag();
+        self.hand_over(world, effect);
         tag
     }
 

@@ -16,13 +16,18 @@ pub mod body;
 pub mod buckets;
 pub mod check;
 mod const_args_in_bounds;
+mod const_enum;
+mod const_open;
 pub mod const_qpath;
 pub mod consts;
+pub(crate) mod coroutines;
 pub mod dyn_ty;
 pub mod entry;
 pub mod fill;
 pub(crate) mod fmt_template;
 pub mod gat;
+pub mod glob_uses;
+pub mod foreign_locals;
 pub mod head_record;
 pub mod heads;
 pub mod index;
@@ -31,6 +36,7 @@ pub mod langs;
 pub mod lifetimes;
 pub mod locals;
 pub mod own_trait;
+pub mod panic_entry;
 pub mod pattern_ty;
 pub mod preds;
 pub mod program;
@@ -39,9 +45,11 @@ pub mod project_records;
 pub mod reach;
 pub mod reads;
 pub mod scoped;
+pub mod shared_keys;
 pub mod source;
 pub mod spell;
 pub mod statics;
+pub mod test_entry;
 pub mod texts;
 pub mod types;
 pub mod world_items;
@@ -145,6 +153,9 @@ impl<'n> Front2<'n, &'n source::Records<'n>> {
     /// are in `records.errors()` (see [`source`]): read it after each body.
     pub fn from_records(records: &'n source::Records<'n>, frame: &'n blaze_mem::Frame, lang_crates: &[usize]) -> Result<Front2<'n, &'n source::Records<'n>>, FrontError> {
         let index = index::Index::from_source(records, lang_crates).map_err(FrontError::Lang)?;
+        // The same crates' records (opened just above) say which may write incoherent impls:
+        // one fact for the whole graph, so no inherent question opens every crate's record.
+        records.name_lang_crates(lang_crates);
         Ok(Front2 { names: records, resolver: crate::resolve::Paths { names: records }, texts: texts::Texts::empty(), keys: keys::Keys::new(), index, frame })
     }
 }

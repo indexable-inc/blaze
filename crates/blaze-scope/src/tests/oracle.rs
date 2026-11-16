@@ -564,6 +564,12 @@ enum Bug {
     R6IgnoresEnclosure,
     /// R8: a macro-written root `extern crate` replaces a dependency's extern-prelude name.
     R8MacroReplaces,
+    /// A `pub use` of an `extern crate` item's binding is narrowed to the item's visibility (the
+    /// reference's own answer until the deep tape `5 0 0 0 0 0 0 0 1 1 ..`).
+    ExternReexportNarrowed,
+    /// R6: a definition standing in the module's own text does not stop the finding (the
+    /// reference's own bug until the deep tape `1 0 0 0 0 0 1 1 ..`).
+    R6IgnoresStanding,
     /// R9: a one-segment type path whose lexical binding is a module names the module.
     R9ModuleIsTheType,
 }
@@ -627,6 +633,24 @@ impl<'w> Ref<'w> {
     /// text or an expanded call there adds (`names.preludes.extern`). It never replaces a
     /// dependency's name: that one stays and the `extern crate` is an error (D56; planted
     /// `R8MacroReplaces`).
+    /// The name an `extern crate` item binds in its module: `as name`, else the crate's own
+    /// name; `as _` and a bare `extern crate self;` bind none.
+    fn extern_binds(target: crate::ExternTarget<N>, rename: Rename<N>) -> Option<N> {
+        match (rename, target) {
+            (Rename::To(n), _) => Some(n),
+            (Rename::Same, crate::ExternTarget::Dep(d)) => Some(d),
+            (Rename::Same, crate::ExternTarget::SelfCrate) | (Rename::Underscore, _) => None,
+        }
+    }
+
+    /// Whether `name` in the type namespace of `m` is bound by an `extern crate` item of crate
+    /// `def`.
+    fn extern_item(&self, m: ItemKey, name: N, def: Def) -> bool {
+        self.frags(m).iter().any(|&f| {
+            self.w.decls[&f].extern_crates.iter().any(|ec| Ref::extern_binds(ec.target, ec.rename) == Some(name) && self.extern_target(ec.target) == Some(def.key))
+        })
+    }
+
     fn extern_added(&self, s0: N) -> Option<ItemKey> {
         for f in self.frags(self.root) {
             for ec in self.w.decls[&f].extern_crates.iter() {
@@ -724,6 +748,26 @@ impl<'w> Ref<'w> {
                 // failing as private; outward in the solver's order, resolving).
                 let Some(outer) = self.outer(s0) else { continue };
                 let other = |b: Option<B>| b.is_some_and(|b| b.def != outer.def);
+                // R6's precondition (bottom.md section 6): "A path's first segment `n` that
+                // misses in the inner scope goes outward". A `mod`, a type item or an `extern
+                // crate` of the module's own text, or of an expansion enclosing the use, stood
+                // in the inner scope before the use did: the lookup never missed, in no order,
+                // so nothing an expansion writes later is R6's error (the deep tape `1 0 0 0 0
+                // 0 1 1 ..`: `mod m1 {}` beside the extern prelude's `m1`, and `mk! { use
+                // crate::*; }` bringing that same `m1`; the Reference,
+                // `names.resolution.expansion.imports.shadowing`: an outer name is "shadowed by
+                // candidates in the same namespace with the same name from an inner scope").
+                // An `extern crate` binds in both forms (Reference `items.extern-crate`: "bound
+                // into the declaring scope as the identifier provided").
+                let stood = frags.iter().filter(|&&g| g == m || self.encloses(g, f)).any(|&g| {
+                    let e = &self.w.decls[&g];
+                    e.mods.iter().any(|d| d.name == s0)
+                        || e.items.iter().any(|it| it.ns == Namespace::Types && it.name == s0)
+                        || e.extern_crates.iter().any(|ec| ec.rename == Rename::To(s0) || (ec.rename == Rename::Same && ec.target == crate::ExternTarget::Dep(s0)))
+                });
+                if stood && self.bug != Some(Bug::R6IgnoresStanding) {
+                    continue;
+                }
                 let by_expansion = frags.iter().filter(|&&g| g != m && !self.encloses(g, f)).any(|&g| {
                     let e = &self.w.decls[&g];
                     let defined = e.mods.iter().any(|d| d.name == s0)
@@ -933,7 +977,10 @@ impl<'w> Ref<'w> {
                 continue;
             }
             for ec in self.w.decls[&f].extern_crates.iter() {
-                if let (Rename::To(n), Some(k)) = (ec.rename, self.extern_target(ec.target))
+                // The Reference, `items.extern-crate`: "The external crate is then bound into
+                // the declaring scope as the identifier provided in the extern crate
+                // declaration": the renamed form and the plain `extern crate x;` both.
+                if let (Some(n), Some(k)) = (Ref::extern_binds(ec.target, ec.rename), self.extern_target(ec.target))
                     && n == name
                 {
                     return (Some(B { def: Def::module(k), vis: self.vis_of(m, &ec.vis), amb: false }), Vec::new());
@@ -1174,12 +1221,30 @@ impl<'w> Ref<'w> {
             }
             // A lexical first segment (the wide distribution): taken below, as segment 0.
             PathKind::Plain => self.root,
-            PathKind::Abs | PathKind::DollarCrate(_) => unreachable!("the generator writes crate, self, super and plain paths"),
+            // The Reference, `paths.qualifiers.global-root.edition2018`: "In the 2015 Edition,
+            // identifiers resolve from the "crate root"" and "Beginning with the 2018 Edition,
+            // paths starting with `::` resolve from crates in the extern prelude. That is, they
+            // must be followed by the name of a crate."
+            PathKind::Abs if self.w.roots[&self.krate].head.edition == crate::Edition::E2015 => self.root,
+            PathKind::Abs => {
+                let s0 = u.path.segments[0];
+                let dep = self.w.roots[&self.krate].extern_prelude.iter().find(|(n, _)| *n == s0).map(|&(_, k)| k);
+                let Some(k) = dep.or_else(|| self.extern_added(s0)) else { return Ok(Imp::Failed(Unresolved::NotFound)) };
+                if u.path.segments.len() == 1 && u.leaf != UseForm::Glob {
+                    // `use ::name;`: the crate itself, in the type namespace.
+                    return Ok(Imp::Named([Some(B { def: Def::module(k), vis: self.vis_of(m, &u.vis), amb: false }), None, None]));
+                }
+                k
+            }
+            PathKind::DollarCrate(_) => unreachable!("the generator writes crate, self, super, plain and `::` paths"),
         };
         let me = Some(Bk::Imp(f, i));
         let segs = &u.path.segments[..];
         let steps = if u.leaf == UseForm::Glob { segs.len() } else { segs.len() - 1 };
         let mut first = 0;
+        if u.path.kind == PathKind::Abs && self.w.roots[&self.krate].head.edition != crate::Edition::E2015 {
+            first = 1; // segment 0 named the crate `cur` is the root of
+        }
         // The Reference, `items.use.path.edition2018`: "In the 2015 edition, `use` paths are
         // relative to the crate root." and "The 2015 edition does not allow use declarations to
         // reference the extern prelude.": a 2015 plain path is walked from `self.root` (set
@@ -1252,7 +1317,17 @@ impl<'w> Ref<'w> {
                 Ok(Some(b)) if b.amb => amb = true,
                 Ok(Some(b)) => {
                     found = true;
-                    out[ns_at(ns)] = Some(B { def: b.def, vis: self.narrower(ivis, b.vis, m), amb: false });
+                    // A `pub use` of an `extern crate` item's binding is a public re-export:
+                    // the Reference does not state the case; rustc decides it
+                    // (rustc_resolve imports.rs, `pub_use_of_private_extern_crate_hack`: "if let
+                    // ImportKind::ExternCrate { .. } = decl_import.kind && import.vis.is_public()",
+                    // then the import's own visibility with the lint
+                    // PUB_USE_OF_PRIVATE_EXTERN_CRATE, capped in a dependency: `pub use core as
+                    // core_;` over the private injected `extern crate core;`). Only a fully
+                    // public `use`: any narrower one keeps the binding's visibility.
+                    let reexported = ns == Namespace::Types && ivis == Visibility::Public && self.w.decls.contains_key(&cur) && self.extern_item(cur, leaf, b.def);
+                    let vis = if reexported && self.bug != Some(Bug::ExternReexportNarrowed) { ivis } else { self.narrower(ivis, b.vis, m) };
+                    out[ns_at(ns)] = Some(B { def: b.def, vis, amb: false });
                 }
             }
         }
@@ -2262,6 +2337,10 @@ fn known_run(label: &str, calls: bool) {
     });
     if let blaze_sim::Verdict::Failed(f) = verdict {
         let tape: Vec<String> = f.least.choices.iter().map(|c| c.value.to_string()).collect();
+        // With `ORACLE_OUT`, the whole tape is kept in the file (a checker cuts a long line).
+        if std::env::var("ORACLE_OUT").is_ok() {
+            keep(&std::format!("{label}: FAILED\nORACLE_TAPE='{}'", tape.join(" ")));
+        }
         panic!("{label}: {}\nORACLE_TAPE='{}'", f.failure.text, tape.join(" "));
     }
     keep(&std::format!("{label}: {CASES} cases; cases with a KNOWN difference, by class: {seen:?}"));
@@ -2304,6 +2383,8 @@ fn every_planted_reference_bug_is_caught() {
         Bug::R6IgnoresEnclosure,
         Bug::R8MacroReplaces,
         Bug::R9ModuleIsTheType,
+        Bug::R6IgnoresStanding,
+        Bug::ExternReexportNarrowed,
     ] {
         // The clean runs are the two comparisons above (both green). A planted bug is caught
         // where the old solver is right: R7's glob-vs-outer is mostly a KNOWN class of the old

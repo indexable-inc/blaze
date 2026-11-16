@@ -2306,3 +2306,68 @@ Named gaps, not refusals: gat.rs `OUTLIVES_NOT_CHECKED`: an outlives clause on a
 dropped after the same refusals) and nothing checks it. A bound on an associated type's own
 parameter (`type Out<T: Clone>`) is not in scope for a `T::X` shorthand inside the impl's value.
 The solver's object candidate still skips a generic associated type's bounds (builtin.rs).
+
+## Constants in types: three states (2026-11-16; WRITTEN, NEVER COMPILED)
+
+A constant written in a type (an array length, a const argument, an array repeat length) is in one
+of three states where the front end builds a signature or converts a body (front2/const_open.rs):
+
+1. A value (`PNode::ConstValue`).
+2. One const parameter in scope, alone (`PNode::ConstParam`).
+3. Open: an expression over a generic parameter, or over a `Self` that is not ground.
+
+The Reference, "Generic parameters", "Const generics": "const parameters may only appear as a
+standalone argument inside of a type or array repeat expression. [..] they cannot be combined with
+other expressions", with `fn bad_function<const N: usize>() -> [u8; {N + 1}]` as its example of
+what is not allowed. So state three is in no accepted program without the unstable
+`generic_const_exprs`, which the pinned library does not turn on. It stays a typed refusal naming
+the constant by its range ("a constant expression over a generic parameter": a head's refusal, a
+body's `ConstGapWhy::OverGeneric` gap). The four measured classes were all state one, refused for
+other reasons:
+
+- `[u8; size_of::<Self>()]` in `impl u16` (core's `from_le_bytes`; the 255 `check gap: FnHead`):
+  `Self` was taken for a parameter. `const_open::ground_self` tells a ground `Self` (a built-in
+  type, an ADT with no generic arguments) apart; `anon::Ask::of_self` files the anonymous constant
+  with that `Self` in scope, its key over (module, type, text, what `Self` is).
+- `size_of::<usize>()` in an impl header and in a repeat length (21 and 23): `size_of::<T>()` is
+  `<T as SizedTypeProperties>::SIZE`, and the evaluator read a constant path at no arguments
+  (`ConstFail::TraitConstNoSelf`). blaze-consteval machine/code.rs `qualified_const_args`: a path
+  `<Q as Trait<A..>>::NAME` gives `[Q, A..]` grounded at the instance, then `ConstWorld::resolve`.
+  The front end's world makes the trait's candidate impls when its selection finds none and asks
+  again (`ConstsWorld::wanted`, `const_open::impl_rows`); a run that stops on `Refusal::Missing`
+  marks its code not kept (machine.rs `Op::Late`), so the second asking compiles it again.
+- `const MOST: usize = ..; [x; MOST]` (44 `lower: Convert`): `const_open::local_const` finds a
+  `const` declared in the body before the module is asked (a block's item shadows the module's);
+  its head is made before its own body is checked (`const_open::local_head`).
+
+A consequence, and its fix: a method of `u8` now has a signature that needs a constant, and the
+check of `u8::MAX`'s body (inside an evaluation) fills `u8`'s inherent impls, so the head asked
+for a value while the evaluator was busy (`ConstFail::Nested`). `Consts::value_at` is a work list:
+a failure that names a constant to have first (`const_open::needed_first`) has that constant
+evaluated and filed (`Consts::first`), then the failed one evaluated again; at most 64, and one
+that needs itself returns its refusal. No evaluation runs inside another.
+
+Still gaps, by name: a constant path that is not `<Q as Trait>::NAME` with one segment after the
+anchor (`T::NAME`, `Self::NAME`, `<Q>::NAME`) in a generic body is `ConstFail::TraitConstNoSelf`
+(the checker records `Def::Const(key)` with no arguments: a column `(expr, item, args)` in
+`Checked` is the fix, written where rules/lit_path.rs `assoc_item_ty` has `parent_args`); a
+`Self` with generic arguments; a body's `const` named in a const ARGUMENT (`foo::<LEN>()`: the
+lowering gives a const argument no block scope to look it up from) or through a local `use`.
+
+Carrying state three (when `generic_const_exprs` is wanted): blaze-ty and the solver already hold
+it (`ConstKind::Unevaluated(def, args)`, `Alias(_, Const, ..)`); the portable form does not. One
+cross-crate batch: `PNode::ConstExpr { item, args }` (the anonymous constant's key and the
+enclosing item's generic arguments; equal when both are), lowered to `const_unevaluated`, written
+back, and normalized by a world question for the value once `args` is ground. The front end's half
+exists: a filed head per anonymous constant, and `Consts::value_at` evaluates a root at arguments.
+Tests: crates/blaze-ladder/tests/front2_const_open.rs.
+
+State at 14:35 (generic associated types): the checker's side is green (blaze-typeck "172 passed, 0
+failed", suite::gat 2, suite::holes 1). The front end compiles; `front2_bounds` at 14:26 had
+`gat_where` clean and `gat_bind`, `gat_impl` stopped by "the bounds of an associated type with type
+or const parameters of its own" (preds.rs `assoc_ty_bounds`). That refusal is now built (heads.rs
+`Store::trait_members`: the alias lists the trait's parameters then the type's own; the bounds are
+read with them in scope): NEVER COMPILED, the rerun is queued in BUILD-STATUS-FRONT.md "Hand-on
+14:30". Still refused: "a bound on an associated type's own parameter (`type Out<T: Bound>`)". Gap:
+the implied `Sized` of a generic associated type's own parameters is not filed. The tempo census for
+the three classes has not been run.

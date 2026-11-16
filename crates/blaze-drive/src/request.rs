@@ -605,6 +605,22 @@ enum Phase {
     Answered,
 }
 
+/// A request's shape: its command, its arguments and the space it is checked under. A
+/// certificate and a last answer are one shape's; the machine walks forward only from its own.
+pub fn shape_of(ask: &Ask<'_>) -> ContentId {
+    let mut h = Hasher::new(SHAPE_DOMAIN);
+    h.update(&[ask.command.byte()]).part(ask.args).id(&key::space_digest(&ask.space));
+    h.finish()
+}
+
+/// Whether the last answer `last` (a pointer's record) is `tool`'s and of `shape`: the one the
+/// machine walks forward from. Another's is no answer of this request's: its caller starts
+/// cold (the layout read, the dependency graph's job handed to `Start`), as with none.
+pub fn walks_from(last: &[u8], tool: Tool, shape: &ContentId) -> Result<bool, WireError> {
+    let last = answers::read_last(last)?;
+    Ok(last.tool == tool.0 && last.shape == *shape)
+}
+
 /// A name's findings as printed: its file, its start, its findings.
 struct Held<'a> {
     file: Name,
@@ -786,8 +802,7 @@ impl<'a> Request<'a> {
         // The space is part of the request's shape: a certificate answers for the space it
         // was checked under, and no other.
         let space_digest = key::space_digest(&ask.space);
-        let mut h = Hasher::new(SHAPE_DOMAIN);
-        h.update(&[ask.command.byte()]).part(ask.args).id(&space_digest);
+        let shape_digest = shape_of(&ask);
         let a = alloc.clone();
         let mut now = Table::new_in(a.clone());
         now.insert(key::space_name(), Now { at: Key::default(), out: space_digest });
@@ -800,7 +815,7 @@ impl<'a> Request<'a> {
             conditioned: Table::new_in(a.clone()),
             config,
             command: ask.command,
-            shape_digest: h.finish(),
+            shape_digest,
             units_source: ABSENT,
             plant,
             phase: Phase::Idle,
@@ -1264,10 +1279,8 @@ impl<'a> Request<'a> {
             let last = Last { tool, shape: self.shape_digest, units: self.units_source, cert: self.cert, root };
             out.push(Effect::WriteLast { bytes: answers::write_last(&last, self.alloc) });
         }
-        let count = self.print(&held, out);
-        let is_error = self.config.is_error;
-        let errors = held.values().flat_map(|entry| entry.findings.iter()).filter(|f| is_error(f.rule)).count();
-        self.errors = u32::try_from(errors).unwrap_or(u32::MAX);
+        let (count, errors) = self.print(&held, out);
+        self.errors = errors;
         self.units_at = units;
         // The repeat: the walk stands whole. A stored error refuses the start at this one read
         // (every gate); a clean one starts the program now, nothing left to check beside it.
@@ -3036,12 +3049,10 @@ impl<'a> Request<'a> {
             };
             out.push(Effect::WriteLast { bytes: answers::write_last(&last, a) });
         }
-        let count = self.print(&all, out);
         // Every finding of the answer counts, the stood ones too: an unchanged item's error is
-        // still an error of the scope.
-        let is_error = self.config.is_error;
-        let errors = all.values().flat_map(|entry| entry.findings.iter()).filter(|f| is_error(f.rule)).count();
-        self.errors = u32::try_from(errors).unwrap_or(u32::MAX);
+        // still an error of the scope. One finding held by two names counts once (`print`).
+        let (count, errors) = self.print(&all, out);
+        self.errors = errors;
         if self.gate == Gate::Beside && self.program == Program::Running && self.errors > 0 {
             self.program = Program::Stopped;
             out.push(Effect::Stop { errors: self.errors });
@@ -3052,8 +3063,15 @@ impl<'a> Request<'a> {
         Ok(())
     }
 
-    /// `Print` effects for `held`, sorted by path and position; how many.
-    fn print(&self, held: &SortedMap<Name, Held<'a>, Alloc<'a>>, out: &mut AVec<'_, Effect<'a>>) -> u32 {
+    /// `Print` effects for `held`, sorted by path and position; how many, and how many of them
+    /// are errors. An item's or a manifest's finding is its own: its name is where it is. A
+    /// crate's finding carries its file and item in its words, so it is its rule, range, words
+    /// and condition, whichever crate's record holds it: two crates holding one finding (a
+    /// library and its test unit each resolve the same `use` of the same file) print it once
+    /// and count it once, as the name first in the order. (Owed: `test` as a variable of one
+    /// crate's condition, "One check covers every configuration", so there is one record.)
+    fn print(&self, held: &SortedMap<Name, Held<'a>, Alloc<'a>>, out: &mut AVec<'_, Effect<'a>>) -> (u32, u32) {
+        // (path, place, name, the finding's index in its record, file, the record's findings).
         let mut order = Vec::with_capacity_in(held.len(), self.alloc);
         for (name, entry) in held.iter() {
             let file = match entry.file.kind {
@@ -3061,29 +3079,57 @@ impl<'a> Request<'a> {
                 _ => None,
             };
             let path: &[u8] = file.map_or(&[], |i| self.path(i));
-            order.push((path, entry.place, *name, file));
-        }
-        order.sort_unstable_by(|x, y| (x.0, x.1, x.2).cmp(&(y.0, y.1, y.2)));
-        let mut count = 0;
-        for (_, place, name, file) in order.iter() {
-            let entry = held.get(name).expect("listed above");
-            for finding in entry.findings.iter() {
-                let mut message = Vec::with_capacity_in(finding.message.len(), self.alloc);
-                message.extend_from_slice(&finding.message);
-                out.push(Effect::Print(Print {
-                    name: entry.base,
-                    condition: entry.condition,
-                    file: *file,
-                    place: *place,
-                    rule: finding.rule,
-                    start: finding.start,
-                    end: finding.end,
-                    message,
-                }));
-                count += 1;
+            for nth in 0..entry.findings.len() {
+                order.push((path, entry.place, *name, nth, file, entry));
             }
         }
-        count
+        order.sort_unstable_by(|x, y| (x.0, x.1, x.2, x.3).cmp(&(y.0, y.1, y.2, y.3)));
+        // What a finding is: rows equal in it are one finding. Found by sorting the rows'
+        // indices by it (ties in print order, so the first printed is the one kept).
+        let what = |at: u32| {
+            let row = &order[at as usize];
+            let finding = &row.5.findings[row.3];
+            let of = (row.5.base.kind != Kind::CrateScope).then_some((row.2, row.3));
+            (row.0, row.1, of, finding.rule, finding.start, finding.end, finding.message.as_slice(), row.5.condition)
+        };
+        let mut by_what = Vec::with_capacity_in(order.len(), self.alloc);
+        let mut again = Vec::with_capacity_in(order.len(), self.alloc);
+        for at in 0..order.len() {
+            by_what.push(u32::try_from(at).expect("an answer's findings fit 32 bits"));
+            again.push(false);
+        }
+        by_what.sort_unstable_by(|x, y| what(*x).cmp(&what(*y)).then(x.cmp(y)));
+        // The planted bug: each name's copy is a finding of its own.
+        if self.plant != Plant::PrintEachName {
+            for at in 1..by_what.len() {
+                if what(by_what[at - 1]) == what(by_what[at]) {
+                    again[by_what[at] as usize] = true;
+                }
+            }
+        }
+        let is_error = self.config.is_error;
+        let (mut count, mut errors) = (0, 0);
+        for (at, (_, place, _, nth, file, entry)) in order.iter().enumerate() {
+            if again[at] {
+                continue;
+            }
+            let finding = &entry.findings[*nth];
+            let mut message = Vec::with_capacity_in(finding.message.len(), self.alloc);
+            message.extend_from_slice(&finding.message);
+            out.push(Effect::Print(Print {
+                name: entry.base,
+                condition: entry.condition,
+                file: *file,
+                place: *place,
+                rule: finding.rule,
+                start: finding.start,
+                end: finding.end,
+                message,
+            }));
+            count += 1;
+            errors += u32::from(is_error(finding.rule));
+        }
+        (count, errors)
     }
 }
 

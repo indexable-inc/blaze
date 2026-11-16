@@ -675,6 +675,15 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             return Err(program(format!("`{text}` is a type parameter; a constant is expected here"), r));
         }
         let ty = want(tys)?;
+        // A parameter of a fieldless enum type takes a path to a unit variant, whose value is
+        // that variant under the enum's key (const_enum.rs); nothing below reads an enum.
+        match super::const_enum::term(tys, &|abs, segs| self.resolver.path(env.module, abs, segs, Ns::Value), ty, text, r)? {
+            super::const_enum::Term::Is(value) => return Ok(value),
+            super::const_enum::Term::OtherEnum(_) => {
+                return Err(program(format!("mismatched types: the const argument `{text}` is a variant of another enum than its parameter's type"), r));
+            }
+            super::const_enum::Term::NotEnum => {}
+        }
         // A literal is one token, `-` before it for a signed one: `1usize << 0` is an
         // expression, never a literal with the suffix `usize << 0`.
         let digits = text.strip_prefix('-').map_or(text, str::trim_start);
@@ -687,7 +696,14 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // width (`ty`'s node says how the anonymous one is typed; an unknown type, a body's
         // `_`, takes only a constant item's path).
         let node = tys.view().nodes.get(ty.0 as usize).copied();
-        let bits = self.const_value_bits(env, text, r, node)?;
+        // An expression that names `Self` where `Self` is a ground type has a value here
+        // (`[u8; size_of::<Self>()]` in `impl u16`: front2/const_open.rs, state one): its
+        // anonymous constant is filed with that `Self` in scope. Every other expression is
+        // read as before; one over a generic parameter is refused there by name.
+        let bits = match super::const_open::ground_self(tys.view(), env, text) {
+            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, text, self_ty, self_node, r)?,
+            None => self.const_value_bits(env, text, r, node)?,
+        };
         intern(tys, PNode::ConstValue { ty, bits })
     }
 

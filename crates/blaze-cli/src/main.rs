@@ -37,6 +37,8 @@ mod seal;
 mod store;
 mod sweep;
 mod graph;
+mod test_args;
+mod test_loop;
 mod toolchain;
 mod units;
 mod work;
@@ -73,11 +75,16 @@ pub enum CliError {
     Usage(&'static str),
     /// A command this binary does not do yet.
     NotBuilt { command: &'static str },
+    /// A word that is no command of blaze and never will be: the commands that do its work.
+    NoSuchCommand { command: &'static str, instead: &'static str },
     Missing(Missing),
     Path(PathError),
     Fs(FsError),
     Out(OutError),
     Drive(DriveError),
+    /// A crate's names read a checkout file that no units record and no file's outline lists
+    /// (`DriveError::NoPart`, named: the package and the file's path).
+    Unlisted(names::Unlisted),
     /// The checkout's leaf table is not one.
     Leaves(WireError),
     /// A file the outline cannot read: not UTF-8, or past 4 GiB.
@@ -113,11 +120,13 @@ impl fmt::Display for CliError {
         match self {
             CliError::Usage(what) => write!(f, "usage: blaze <check|run|test> [dir] [--color=auto|always|never] [--stats] [--workers N]: {what}"),
             CliError::NotBuilt { command } => write!(f, "`blaze {command}` is not built on the new item layer yet (drive.md)"),
+            CliError::NoSuchCommand { command, instead } => write!(f, "blaze has no `{command}` command: {instead}"),
             CliError::Missing(missing) => write!(f, "{missing}"),
             CliError::Path(error) => write!(f, "{error}"),
             CliError::Fs(error) => write!(f, "{error}"),
             CliError::Out(error) => write!(f, "{error}"),
             CliError::Drive(error) => write!(f, "{error}"),
+            CliError::Unlisted(unlisted) => write!(f, "{unlisted}"),
             CliError::Leaves(error) => write!(f, "the checkout's leaf table (in .blaze/v2/last), of this build's form, is malformed: {error}"),
             CliError::Text { what } => write!(f, "{what}"),
             CliError::Table(full) => write!(f, "{full}"),
@@ -267,13 +276,17 @@ fn words<'o>(command: Command, out: &'o Out, err: &'o Out) -> &'o Out {
     }
 }
 
+/// What `blaze build` is told: the two commands that do what it would.
+const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` (not built yet) writes the program as a file";
+
 fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Result<Status, CliError> {
     let args = io.need_args()?;
     let (command, word) = match args.get(1) {
         Some("check") => (Command::Check, "check"),
         Some("run") => (Command::Run, "run"),
         Some("test") => (Command::Test, "test"),
-        Some("build") => return Err(CliError::NotBuilt { command: "build" }),
+        // The commands are `check`, `run`, `test` and, later, `export`: there is no `build`.
+        Some("build") => return Err(CliError::NoSuchCommand { command: "build", instead: NO_BUILD }),
         Some("export") => return Err(CliError::NotBuilt { command: "export" }),
         Some("explain") => return explain(cx, args.get(2), out),
         Some(_) | None => return Err(CliError::Usage("the command is check, run, test or explain")),
@@ -394,7 +407,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
 /// `check` names what it did not check, and never says `ok` over it (decision D61 item 5).
 #[expect(clippy::too_many_arguments, reason = "the request's parts, each read once")]
 fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Shown<'_>, ran: Option<u8>, in_main: u64, frame: &Frame, out: &Out) -> Result<Status, CliError> {
-    let (ran_stages, not_stages) = check_coverage(frame);
+    let (ran_stages, not_stages) = check_coverage(finished.names_held, frame);
     let coverage = (command == Command::Check && !not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     if ran.is_none() {
         let tail = (command == Command::Test).then_some("tests are not run yet: this build of blaze checks them");
@@ -486,12 +499,14 @@ fn explain(cx: &Cx, asked: Option<&str>, out: &Out) -> Result<Status, CliError> 
     }
 }
 
-/// [`work::CHECK_STAGES`] split: those this build runs, and those it does not.
-fn check_coverage(frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
+/// [`work::CHECK_STAGES`] split: those this command ran, and those it did not: a stage this
+/// build does not run, and the names stage when the answer holds no crate's names
+/// (`Finished::names_held`): never a pass printed over a stage that did not run.
+fn check_coverage(names_held: bool, frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
     let mut ran = Vec::new_in(frame);
     let mut not = Vec::new_in(frame);
     for (stage, built) in work::CHECK_STAGES {
-        match built {
+        match built && (names_held || stage != work::NAMES_STAGE) {
             true => ran.push(stage),
             false => not.push(stage),
         }
@@ -509,6 +524,9 @@ struct Finished<'f> {
     failed: Vec<work::Failed<'f>, &'f Frame>,
     /// The crates whose names this command resolved (names.rs): the closing note's count.
     resolved: u32,
+    /// Whether the answer holds the crates' names: `false` when the stage did not run, which
+    /// the closing line then names ("NOT checked: names, ..").
+    names_held: bool,
 }
 
 /// The rows the answer keeps (the leaf table): each source file the request holds, each absent
@@ -596,6 +614,18 @@ fn request<'f>(
             },
         },
     };
+    // A pointer left by another build of blaze, or by another command (`test` before `check`),
+    // is no answer of this request's: the machine does not walk forward from it, and the leaf
+    // table beside it would keep the layout from being read here, so `Start` was handed no
+    // dependency graph and no `UnitGraph`, `Fetch` or `CrateScope` ran, with "0 errors" over
+    // the hole (blaze's own checkout after a new build, 2026-11-16). It is absent: the
+    // request starts cold. (Owed: one pointer a (tool, shape), read-addressed.md piece 1.)
+    let ask = Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE };
+    let shape = blaze_drive::request::shape_of(&ask);
+    let (last, leaves) = match last {
+        Some(bytes) if !blaze_drive::request::walks_from(bytes, tool, &shape).map_err(|error| CliError::Drive(DriveError::LastFile(error)))? => (None, Leaves::EMPTY),
+        _ => (last, leaves),
+    };
     phases.mark_in("pointer read (last answer and leaf table)", frame);
     let stamps = FromMeta::now(phases.clock());
     let sweep_plant = match sizes.plant {
@@ -665,7 +695,7 @@ fn request<'f>(
         work::Plant::Drive(plant) => plant,
         _ => blaze_drive::Plant::None,
     };
-    let mut req = Request::planted_in(config, Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE }, drive_plant, Alloc::global());
+    let mut req = Request::planted_in(config, ask, drive_plant, Alloc::global());
     // Frames for the tasks and for records read back, made on first use (a repeat runs none).
     let mut frames: Option<work::Frames> = None;
     let mut got = bstd::mem::Frame::with_reserve(bstd::mem::TASK_FRAME, bstd::mem::Tag::Other)
@@ -827,9 +857,8 @@ fn request<'f>(
             // taking the units' record and answering `Exited` when the child ends (drive.md, "Run").
             Effect::StartProgram { .. } => {
                 started = phases.since(began);
-                // The program's files are the ones the walk opened (or, on a repeat, the leaf
-                // table's rows): the checkout is never listed.
-                let ok = match program::run(&cx, root, launch, &kept(&req, &followed, &facts.rows, frame), frame) {
+                // The program's files are its package's `src/`, listed alone: never the checkout.
+                let ok = match program::run(&cx, root, launch, frame) {
                     Ok(status) => {
                         *ran = Some(status);
                         status == 0
@@ -880,7 +909,9 @@ fn request<'f>(
     };
     draw(&cx, root, &req, command, &facts.found, &prints, program.as_ref(), &failed, &notices, shown, frame, out)?;
     // The names step (names.rs): what this command resolved, never printed as errors.
-    if let Some(names) = facts.names.as_ref().filter(|names| names.unresolved > 0) {
+    // Nothing follows a program that ran (`close`): its output is the command's, and a note
+    // about the check's known gaps is `check`'s to say, not a clean run's.
+    if let Some(names) = facts.names.as_ref().filter(|names| names.unresolved > 0 && ran.is_none()) {
         let words = bstd::mem::format_in!(
             frame,
             "names resolved for {} crates; {} paths unresolved by known gaps (not reported as errors; interim: macros are not run, build scripts' outputs are not given, every record is in the project's store)",
@@ -893,7 +924,14 @@ fn request<'f>(
     let checked = rows.of(LeafKind::Slot).filter(|leaf| !leaf.absent()).count();
     high.request = frame.peak();
     let resolved = facts.names.as_ref().map_or(0, |names| names.resolved);
-    Ok(Finished { answer, checked: u32::try_from(checked).unwrap_or(u32::MAX), high, failed, resolved })
+    // Whether the answer holds the crates' names. A walk forward from this request's own last
+    // answer, and a certificate, stand on an answer that passed this test when it was made; a
+    // whole walk (no last answer) lists every kind it holds in the profile's rows, so one with
+    // source files and no `CrateScope` standing, found, made or fetched checked no names (no
+    // dependency graph's job: a lock that is not there, or a layout read after `Start`).
+    let scopes = answer.profile.kinds[blaze_drive::Kind::CrateScope.index()];
+    let names_held = last.is_some() || answer.profile.certified || checked == 0 || scopes.standing + scopes.found + scopes.made + scopes.fetched > 0;
+    Ok(Finished { answer, checked: u32::try_from(checked).unwrap_or(u32::MAX), high, failed, resolved, names_held })
 }
 
 const LAST: &str = ".blaze/v2/last";
@@ -919,7 +957,7 @@ struct Refused<'f> {
 /// The lowering's refusals of the files the answer holds, read at their real paths: what `blaze
 /// run` would refuse to run, drawn beside the findings that kept it from running.
 fn program_refusals<'f>(cx: &Cx, root: &Dir<ReadWrite>, rows: &Rows<'_>, frame: &'f Frame) -> Result<Refused<'f>, CliError> {
-    let texts = program::sources(cx, root, rows, frame)?;
+    let texts = program::sources(cx, root, &[rows], frame)?;
     let mut files: Vec<SourceFile<'_>, &Frame> = Vec::with_capacity_in(texts.len(), frame);
     for &(path, text) in texts.iter() {
         files.push(SourceFile { path, text });
@@ -1211,9 +1249,11 @@ mod tests {
         }
     }
 
+    mod extra_roots_tests;
     mod fix_tests;
     mod members_tests;
     mod names_records_tests;
+    mod refused_targets_tests;
 
     fn write(io: &Io, path: &str, text: &str) {
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
@@ -1698,16 +1738,23 @@ mod tests {
         write(&io, "src/big.rs", &functions(10));
         let fixed = check(&io, SMALL);
         assert!(fixed.failed.is_empty(), "{:?}", fixed.failed);
-        // As in `a_planted_panic_fails_one_task`: outline, surface, the crate's names (4
-        // entries), and the file's 10 bodies.
-        assert_eq!((fixed.runs, made(&fixed.profile, "BodyCheck")), (16, 10), "only the failed file's task runs again, its new surface and its crate's names:\n{}", fixed.profile);
+        // As in `a_planted_panic_fails_one_task`: outline, surface, the names of the library and
+        // of its test unit (4 entries each), and the file's 10 bodies. (16 until 2026-11-16,
+        // when `check` took the test targets: the library's test unit is a crate of its own.)
+        assert_eq!((fixed.runs, made(&fixed.profile, "BodyCheck")), (20, 10), "only the failed file's task runs again, its new surface and its two crates' names:\n{}", fixed.profile);
         let again = check(&io, SMALL);
         assert!(again.certified && again.runs == 0);
     }
 
-    /// A body edit reruns the file's outline and no `Surface`: the surface's source holds
-    /// signatures and `use`/`pub` lines, never a body. A signature edit reruns that one
-    /// `Surface`. Control: a surface that hashed bodies would make the first edit's runs 2.
+    /// A body edit reruns the file's outline and no `Surface`: the surface's source is what
+    /// name resolution reads of each entry (blaze-file-items names_digest.rs: its name,
+    /// visibility, attributes, form), never a body. A parameter added to a function leaves it
+    /// equal too (2026-11-16: the surface hashed signatures until then, and this edit reran the
+    /// surface and the crate's names: 5 runs; "an edit to a parameter's, a field's or a return
+    /// type [..] leaves a file's surface equal and its crate's names are not solved again").
+    /// A new item moves that one `Surface`, and the names of the library and of its test unit
+    /// (a crate of its own since `check` took the test targets) are solved again. Control: a
+    /// surface that hashed bodies would make the first edit's runs more than 2.
     #[test]
     fn a_body_edit_reruns_no_surface_and_a_signature_edit_one() {
         let io = workspace(10);
@@ -1719,17 +1766,30 @@ mod tests {
         assert_eq!((body.runs, made(&body.profile, "BodyCheck")), (2, 1), "a body edit runs its file's outline and that one body:\n{}", body.profile);
         write(&io, "src/m3.rs", &functions(100).replace("fn f00003() {}", "fn f00003(_x: u8) { let _x = 1; }"));
         let signature = check(&io, SMALL);
-        // Entries, not tasks: the outline, the surface, and the crate's `CrateScope` twice (its
-        // first entry answers `Need` of the moved surface, the second resolves; profile of
-        // 2026-11-16: "CrateScope ... entries 2 needs 1"), and the edited item's body.
-        assert_eq!(signature.runs, 5, "a signature edit runs its file's outline, its surface, its crate's names (two entries) and its body:\n{}", signature.profile);
+        assert_eq!((signature.runs, made(&signature.profile, "Surface"), made(&signature.profile, "CrateScope")), (2, 0, 0), "a parameter edit runs its file's outline and its body:\n{}", signature.profile);
+        let added = functions(100).replace("fn f00003() {}", "fn f00003(_x: u8) { let _x = 1; }") + "pub fn added() {}\n";
+        write(&io, "src/m3.rs", &added);
+        let item = check(&io, SMALL);
+        // Entries, not tasks: the outline, the surface, each of the two crates' `CrateScope`
+        // twice (its first entry answers `Need` of the moved surface, the second resolves),
+        // and the new item's body.
+        assert_eq!(
+            (item.runs, made(&item.profile, "Surface"), made(&item.profile, "CrateScope"), made(&item.profile, "BodyCheck")),
+            (7, 1, 2, 1),
+            "a new item runs its file's outline, its surface, its two crates' names (two entries each) and its body:\n{}",
+            item.profile
+        );
     }
 
     /// The project's own BINARY reruns its names after a signature edit (the stale answer of
     /// 2026-11-16: blaze-world's `held` kept only libraries and proc macros, so a binary had no
     /// `CrateScope` and an added `pub fn` was never seen). Cold: every crate's names (the
     /// fixture toolchain's and the binary's); a body edit: none; an added `pub fn`: the
-    /// binary's alone. Control: `held` put back to libraries makes the third count 0.
+    /// binary's and its test unit's, no other crate's (1 until 2026-11-16, when `check` took
+    /// the test targets: blaze-unit-graph's `TestBin` is the same file as a crate of its own;
+    /// owed: `test` as a variable of one crate's condition, drive.md "One check covers every
+    /// configuration", which makes it 1 again). Control: `held` put back to libraries makes
+    /// the third count 0.
     #[test]
     fn a_signature_edit_in_a_binary_reruns_its_names() {
         let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
@@ -1743,7 +1803,7 @@ mod tests {
         assert_eq!(body.resolved, 0, "a body edit resolves no crate's names");
         write(&io, "src/main.rs", "fn main() { let _x = 1; }\npub fn extra(_x: u8) {}\n");
         let signature = check(&io, work::Sizes::USUAL);
-        assert_eq!(signature.resolved, 1, "an added `pub fn` reruns the binary's names alone");
+        assert_eq!(signature.resolved, 2, "an added `pub fn` reruns the names of the binary and of its test unit alone");
     }
 
     /// Rule 20 for a bug: a task that panics fails alone; the rest of the request goes on.
@@ -1757,9 +1817,82 @@ mod tests {
         assert!(matches!(failure.why, Why::Panicked { .. }), "{failure:?}");
         let fixed = check(&io, SMALL);
         assert!(fixed.failed.is_empty());
-        // The file's outline, its surface, and the crate's names, failed `Waited` last time:
-        // made fresh in 4 entries (`Need` of the graph, then of its files' surfaces); and the
-        // file's 100 bodies, never listed before.
-        assert_eq!((fixed.runs, made(&fixed.profile, "BodyCheck")), (106, 100), "only the panicked file's task runs again, its surface and its crate's names, never made:\n{}", fixed.profile);
+        // The file's outline, its surface, and the names of the library and of its test unit
+        // (a crate of its own since `check` took the test targets, 2026-11-16: 106 runs until
+        // then), failed `Waited` last time: each made fresh in 4 entries (`Need` of the graph,
+        // then of its files' surfaces); and the file's 100 bodies, never listed before.
+        assert_eq!(
+            (fixed.runs, made(&fixed.profile, "BodyCheck"), made(&fixed.profile, "FileItems"), made(&fixed.profile, "CrateScope")),
+            (110, 100, 1, 2),
+            "only the panicked file's task runs again, its surface and its two crates' names, never made:\n{}",
+            fixed.profile
+        );
+    }
+
+    /// A `check` after another command (here `test`, another shape; a new build of blaze is
+    /// another tool) answers as a first `check` does: the pointer the other command left is no
+    /// answer of this one's, so the layout is read and the dependency graph's job is handed to
+    /// the machine. On blaze's own checkout (2026-11-16) a new build's `check` over the old
+    /// build's pointer ran no `UnitGraph`, `Fetch` or `CrateScope` and printed "0 errors".
+    /// Without `walks_from` in `request` the last assertion fails: the bad import is not found.
+    #[test]
+    fn a_check_after_another_command_resolves_the_names() {
+        let io = Io::simulated(SimWorld::new(13, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\nuse crate::nope::Thing;\n");
+        let tested = ask(&io, (Command::Test, "test"), work::Sizes::USUAL).expect("the request answers");
+        assert_eq!(tested.errors, 1, "{}", tested.profile);
+        let seen = stdout(&io).len();
+        let checked = check(&io, work::Sizes::USUAL);
+        let out = stdout(&io);
+        assert!(checked.resolved > 0 || made(&checked.profile, "CrateScope") > 0 || checked.profile.lines().any(|line| line.starts_with("CrateScope")), "no crate's names in the answer:\n{}", checked.profile);
+        assert_eq!((checked.errors, checked.status), (1, Some(1)), "{}\n{}", &out[seen..], checked.profile);
+    }
+
+    /// A stage that did not run is named, never passed over: a package that depends on a
+    /// registry crate and has no `Cargo.lock` has no dependency graph, so no crate's names are
+    /// resolved; the closing line says "NOT checked: names, .." and the status is 3. (Before:
+    /// "NOT checked: types, borrows" alone, as if the names had been checked.) Control: the
+    /// same package without the dependency names no `names` there.
+    #[test]
+    fn a_check_without_names_says_names_were_not_checked() {
+        let io = Io::simulated(SimWorld::new(14, Limits::USUAL));
+        write(&io, "Cargo.toml", "[package]\nname = \"lockless\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nserde = \"1\"\n");
+        write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\n");
+        let hollow = check(&io, work::Sizes::USUAL);
+        let out = stdout(&io);
+        assert!(hollow.failed.is_empty(), "{:?}", hollow.failed);
+        assert!(out.contains("NOT checked: names, types, borrows"), "{out}\n{}", hollow.profile);
+        assert_eq!(hollow.status, Some(3), "{out}");
+        let seen = out.len();
+        write(&io, "Cargo.toml", "[package]\nname = \"lockless\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        let whole = check(&io, work::Sizes::USUAL);
+        let out = stdout(&io);
+        assert!(whole.failed.is_empty(), "{:?}", whole.failed);
+        assert!(out[seen..].contains("NOT checked: types, borrows") && !out[seen..].contains("NOT checked: names"), "{}", &out[seen..]);
+    }
+
+    /// A module whose items come from `include!("file")` (blaze-diff's `mod rules_gen {
+    /// include!("rules_gen.rs"); }`): the included file is a part of the file that includes it
+    /// (core's `include`: "the file is located relative to the current file"), so the crate's
+    /// names read a listed file: the file is outlined and each of its bodies is a part.
+    /// Without the `MacroCall` arm in work.rs's outline task only `src/lib.rs` is outlined
+    /// ("FileItems .. made 1"), and on a project with `core` the request stops: "the names of
+    /// package `blaze-diff` read `crates/blaze-diff/src/rules_gen.rs`, which no manifest's
+    /// targets and no file's `mod` lines list" (blaze's checkout, 2026-11-16). This project
+    /// has no `core`, so its names cannot expand `include!` ("no `include` in this scope"):
+    /// what is shown here is the listing; the names' side is the real run's.
+    #[test]
+    fn an_included_file_is_a_part_of_the_file_that_includes_it() {
+        let io = Io::simulated(SimWorld::new(15, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "mod rules {\n    include!(\"rules.rs\");\n}\npub fn f() -> u8 { 1 }\n");
+        write(&io, "src/rules.rs", "pub struct A;\npub fn g() -> A { A }\npub fn h() -> A { A }\n");
+        let whole = match ask(&io, (Command::Check, "check"), work::Sizes::USUAL) {
+            Ok(whole) => whole,
+            Err(error) => panic!("the request stops: {error}"),
+        };
+        assert!(whole.failed.is_empty(), "{:?}", whole.failed);
+        assert_eq!((made(&whole.profile, "FileItems"), made(&whole.profile, "BodyCheck")), (2, 3), "{}\n{}", stdout(&io), whole.profile);
     }
 }

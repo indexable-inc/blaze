@@ -67,11 +67,19 @@ pub(super) struct BackNeeds {
     /// Whether a reached body indexes a type that is not an array or a slice: the `Index` and
     /// `IndexMut` impls are then asked at the program's shapes.
     pub(super) overloaded_index: bool,
+    /// Whether a reached body holds an `.await`: the builder polls the held future by the
+    /// selected `Future::poll` impl fn (the Reference, "Await expressions": "This pinned
+    /// future is then polled by calling the `Future::poll` method"), which no checked body
+    /// names (the checker records `IntoFuture::into_future` alone). The `Future` impls are
+    /// then asked at the program's shapes, as `Index`'s are.
+    pub(super) awaits: bool,
+    /// Whether the `index` / `index_mut` trait fns were queued as declared already.
+    index_declared: bool,
 }
 
 impl BackNeeds {
     pub(super) const fn new() -> Self {
-        BackNeeds { fmt_done: [false; FMT_TRAITS], overloaded_index: false }
+        BackNeeds { fmt_done: [false; FMT_TRAITS], overloaded_index: false, awaits: false, index_declared: false }
     }
 
     /// Reads checked body `c` of `owner` (its lowering `body`, when the caller has it: a
@@ -110,6 +118,7 @@ impl BackNeeds {
                         None => true,
                     };
                 }
+                tc::Expr::Await(_) => self.awaits = true,
                 _ => {}
             }
         }
@@ -119,6 +128,49 @@ impl BackNeeds {
                 Err((at, why)) => fns.push((at.unwrap_or(owner), Reached::Failed { class: Box::from("fmt argument"), detail: why })),
             }
         }
+        // The builder names the TRAIT's fn at the index (`Adts::index_fn`) and reads its ABI
+        // before resolving it to the selected impl's: the trait's fn is tabled as declared,
+        // as a trait's fn on a parameter is (`Reached::AtInstance`), and `Instances` then asks
+        // its impls. Once per program.
+        if self.overloaded_index && !self.index_declared {
+            self.index_declared = true;
+            for (lang, name) in [("index", "index"), ("index_mut", "index_mut")] {
+                match lang_trait_fn(r, owner, lang, name) {
+                    Ok(Some(k)) => queue.push((k, Some(Reached::AtInstance))),
+                    // A program declaring no such lang trait: the checker refused its `a[b]`
+                    // already (`MissingLangItem`), or it never writes one in a mutable place.
+                    Ok(None) => {}
+                    Err((at, why)) => fns.push((at, Reached::Failed { class: Box::from("index lang fn"), detail: why })),
+                }
+            }
+        }
+    }
+}
+
+/// The fn `name` of the lang trait `lang`, its head made first (a member key is filed only
+/// when its trait's head is); `None` when the program declares no such lang trait. The error
+/// carries the trait's key and the cause.
+fn lang_trait_fn(r: &mut Records<'_, '_>, owner: ItemKey, lang: &str, name: &str) -> Result<Option<ItemKey>, (ItemKey, Box<str>)> {
+    let Some(lib) = r.index.lang(lang) else { return Ok(None) };
+    let tr = checker_of(lib);
+    let refuse = |why: std::string::String| Err((tr, format!("the builder calls `{lang}` lang trait's `{name}` at an overloaded index: {why}").into_boxed_str()));
+    if let Err(clash) = r.keys.item(lib) {
+        return refuse(format!("its key: {clash}"));
+    }
+    if r.keys.filed_member(tr, MemberKind::Fn, name).is_none() {
+        let want = match want_of_item(r.names, lib) {
+            Ok(w) => w,
+            Err(e) => return refuse(format!("its head: {e:?}")),
+        };
+        let mut fills: Vec<Fill, Global> = Vec::new_in(Global);
+        fills.push(Fill::Store(want));
+        if let Err(e) = make_all(r, fills, owner) {
+            return refuse(format!("making its head: {e}"));
+        }
+    }
+    match r.keys.filed_member(tr, MemberKind::Fn, name) {
+        Some(k) => Ok(Some(k)),
+        None => refuse(std::string::String::from("the trait has no fn of that name")),
     }
 }
 

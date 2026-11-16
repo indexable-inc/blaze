@@ -51,11 +51,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 let at = self.place(v, from)?;
                 V::Place(at.0, at.1)
             }
-            // An enum with a tag: its discriminant at the target's width.
-            (PNode::Adt(..), Repr::Agg(_), Repr::Int { ty, .. }) => {
+            // An enum with a tag: its discriminant at the target's width. "Casts an enum to its
+            // discriminant, then uses a numeric cast": the discriminant is of the enum's integer
+            // type (`isize` without a primitive `repr`), so a widening cast extends by THAT type's
+            // sign: `repr(usize)`'s `1 << 63` as `u128` is `1 << 63`, not sign-extended.
+            (PNode::Adt(k, _), Repr::Agg(_), Repr::Int { ty, .. }) => {
                 let at = self.place(v, from)?;
                 let d = self.enum_discriminant(operand, t, at)?;
-                V::Scalar(self.resize(d, Ty::I64, ty, true))
+                let signed = !matches!(self.adts.facts().repr(k).int, Some(crate::layout::IntRepr::Unsigned(_)));
+                V::Scalar(self.resize(d, Ty::I64, ty, signed))
             }
             // An enum of one variant and no size: that variant's discriminant.
             (PNode::Adt(..), Repr::None, Repr::Int { ty, .. }) => {

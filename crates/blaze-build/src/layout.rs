@@ -73,7 +73,10 @@
 //! - **Discriminants**: explicit (`= n`, [`LayoutFacts::discriminant`]) or one more than the
 //!   previous variant's, the first 0.
 //!
-//! Refused by name, never guessed ([`Refusal`]): `repr(simd)`, closures (their captures are
+//! - **`repr(simd)`** (layout/simd.rs): a vector is its one array field `[E; N]` aligned to its
+//!   size, 8 or 16 bytes (AAPCS64's short vectors); any other vector is refused by name.
+//!
+//! Refused by name, never guessed ([`Refusal`]): closures (their captures are
 //! not in the portable form), types with no ground form (a parameter, an alias, an opaque
 //! type, a hole), a type that holds itself by value, a `repr(C)` discriminant past C's `int`,
 //! a valid-range attribute on a struct that is not one scalar.
@@ -88,6 +91,7 @@ use blaze_typeck::{Adt, AdtKind, FloatTy, IntTy, ItemKey, Name, PNode, PTy, Port
 
 use crate::{BuildError, ground};
 
+pub mod simd;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -109,7 +113,8 @@ pub struct ReprAttrs {
     pub packed: Option<u8>,
     /// `repr(align(n))`: log2 of `n`.
     pub align: Option<u8>,
-    /// `repr(simd)`: refused.
+    /// `repr(simd)`: a vector, its one array field at AAPCS64's short-vector alignment
+    /// (layout/simd.rs).
     pub simd: bool,
     /// The type hides its fields' niches: `UnsafeCell` (the `unsafe_cell` lang item) and
     /// `UnsafePinned`.
@@ -1244,8 +1249,9 @@ impl<A: Allocator + Clone> Layouts<A> {
         let facts = cx.facts;
         let adt = facts.adt(key).ok_or(Refusal::NoAdt(key))?;
         let attrs = facts.repr(key);
+        // A vector (layout/simd.rs): its array at the target's short-vector alignment.
         if attrs.simd {
-            return Err(Refusal::Unsupported("a `repr(simd)` type"));
+            return self.simd(t, &adt, attrs, cx, parts);
         }
         match adt.kind {
             AdtKind::Struct => {

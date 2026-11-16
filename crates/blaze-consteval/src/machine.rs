@@ -1016,10 +1016,20 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 self.mem.copy(s.ptr, d.ptr, size)?;
             }
             Op::Late { k } => {
-                return Err(match code.lates.get(k as usize).ok_or(malformed("a stop past its code"))? {
+                let stop = match code.lates.get(k as usize).ok_or(malformed("a stop past its code"))? {
                     Late::Need(n) => Stop::Need(*n),
                     Late::Refuse(r) => Stop::Refused(r.attach()),
-                });
+                };
+                // A stop on what the world does not hold (an ADT's definition, the impl for
+                // an associated item) was compiled in: a world that makes records on demand
+                // (the front end makes the ADT's row or the trait's impl headers and asks
+                // again) must not be answered from this code again, so it is compiled again
+                // when next asked for. Only a REACHED stop does this: one in a branch not
+                // taken refuses nothing and costs no compile.
+                if matches!(stop, Stop::Refused(Refusal::Missing { .. })) {
+                    codes.list[f.code as usize].complete = false;
+                }
+                return Err(stop);
             }
         }
         Ok(Flow::Next)

@@ -31,6 +31,23 @@ pub(crate) trait DepNames<N> {
 
     /// The root module of `krate`, a crate read here (what a `$crate` of its macros names).
     fn crate_root(&self, krate: CrateItemKey) -> Option<ItemKey>;
+
+    /// Whether `key` is an enum of a dependency read here: [`DepNames::name_in`] of it answers
+    /// with its variants.
+    fn has_enum(&self, key: ItemKey) -> bool;
+}
+
+/// The variants of the enums of the crate being solved (its text's and its expansions'), as a
+/// path through an enum reads them. Reference `names.namespaces`: the type namespace holds
+/// "Struct, union, enum, enum variant declarations", the value namespace "Enum variant
+/// constructors" (a variant with fields in braces has none).
+pub(crate) trait EnumNames<N> {
+    /// Whether enum `of` is held here. One an expansion wrote is held once that expansion is
+    /// read, which is before any path can reach its name.
+    fn holds(&self, of: ItemKey) -> bool;
+
+    /// Enum `of`'s variant `name` in `ns`; `of` is one [`EnumNames::holds`] holds.
+    fn variant(&self, of: ItemKey, ns: Namespace, name: N) -> DepAnswer;
 }
 
 /// The seam's reader: the names library's built crates (each a `CrateNames` finished in this
@@ -50,6 +67,10 @@ impl<'a> DepNames<&'a str> for BuiltDeps<'_, '_, 'a> {
     fn crate_root(&self, krate: CrateItemKey) -> Option<ItemKey> {
         let at = *self.built.by_prefix.get(&krate.prefix())?;
         self.built.crates.get(at).copied().flatten().filter(|d| d.key() == krate).map(|d| d.root())
+    }
+
+    fn has_enum(&self, key: ItemKey) -> bool {
+        self.built.of(key).is_some_and(|d| d.enum_of(key).is_some())
     }
 
     fn name_in(&self, module: ItemKey, ns: Namespace, name: &'a str) -> DepAnswer {

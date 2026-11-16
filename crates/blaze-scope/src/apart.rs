@@ -181,9 +181,7 @@ impl<'a> Apart<'a> {
             return Err(ApartError::Differs { krate: input.name, what });
         }
         for (at, c) in self.whole.iter().enumerate() {
-            if let Some(c) = c
-                && c.key != crates[at].key
-            {
+            if c.is_some_and(|c| c.key != crates[at].key) {
                 return Err(ApartError::Differs { krate: crates[at].name, what: "key" });
             }
         }

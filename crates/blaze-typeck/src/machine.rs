@@ -197,6 +197,7 @@ pub(crate) struct MachineSnapshot<S> {
     adj_scratch: usize,
     callees: usize,
     defs: usize,
+    const_args: usize,
     fields: usize,
     captures: usize,
     casts: usize,
@@ -282,6 +283,10 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub callees: Vec<(ExprId, ItemKey, TyList), Alloc<'a>>,
     /// What each value or struct path resolved to, at its expression or pattern.
     pub defs: Vec<(At, Def), Alloc<'a>>,
+    /// The generic arguments of each constant a value path names whose arguments are not empty
+    /// (`<T as Tr>::C`: `[Self, trait args..]`; an inherent impl's constant: the impl's), at its
+    /// expression: written back as `Checked::const_args` (rules/lit_path.rs `record_const_args`).
+    pub const_args: Vec<(ExprId, TyList), Alloc<'a>>,
     pub fields: Vec<(ExprId, u32, u32), Alloc<'a>>,
     pub captures: Vec<(ExprId, PatId, CaptureKind), Alloc<'a>>,
     pub diags: Vec<PendingDiag, Alloc<'a>>,
@@ -373,6 +378,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             adjust: Soa::new_in(alloc),
             callees: Vec::new_in(alloc),
             defs: Vec::new_in(alloc),
+            const_args: Vec::new_in(alloc),
             fields: Vec::new_in(alloc),
             captures: Vec::new_in(alloc),
             diags: Vec::new_in(alloc),
@@ -799,6 +805,14 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         // Bounded by the context's error count; each `next_error` removes one.
         while let Some(err) = self.ty.next_error() {
             let at = At::of(err.obligation.cause);
+            // An auto trait of an async block's future that failed on the superset interior
+            // and is not known to fail on the exact one: a typed gap, never E0277
+            // (rules/async_fn.rs, 2).
+            if matches!(err.kind, crate::ty::FulfillErrorKind::Unsatisfied)
+                && let Some(gap) = self.coroutine_interior_gap(err.obligation.goal)?
+            {
+                return Err(gap.into());
+            }
             match err.kind {
                 crate::ty::FulfillErrorKind::Ambiguous => {
                     if ambiguity && self.errors == 0 {
@@ -1014,6 +1028,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             adj_scratch: self.adj_scratch.len(),
             callees: self.callees.len(),
             defs: self.defs.len(),
+            const_args: self.const_args.len(),
             fields: self.fields.len(),
             captures: self.captures.len(),
             casts: self.casts.len(),
@@ -1033,6 +1048,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.adj_scratch.truncate(s.adj_scratch);
         self.callees.truncate(s.callees);
         self.defs.truncate(s.defs);
+        self.const_args.truncate(s.const_args);
         self.fields.truncate(s.fields);
         self.captures.truncate(s.captures);
         self.casts.truncate(s.casts);

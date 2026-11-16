@@ -158,6 +158,22 @@ const CONTEXTUAL_NAMES: [&str; CONTEXTUAL.len()] = names(CONTEXTUAL);
 const STRICT_LENGTHS: (usize, usize) = lengths(&STRICT_NAMES);
 const CONTEXTUAL_LENGTHS: (usize, usize) = lengths(&CONTEXTUAL_NAMES);
 
+/// For each first byte, the lengths of the contextual keywords that start with it, bit `len`
+/// for a length: an identifier whose first byte and length are no contextual keyword's (most
+/// identifiers of a source file) is told apart by one load and one test, before any hash of
+/// its bytes. Made from [`CONTEXTUAL_NAMES`], so a keyword added there is here.
+const CONTEXTUAL_SHAPES: [u16; 256] = {
+    assert!(CONTEXTUAL_LENGTHS.1 < 16, "a contextual keyword's length is a bit of a u16");
+    let mut shapes = [0u16; 256];
+    let mut i = 0;
+    while i < CONTEXTUAL_NAMES.len() {
+        let name = CONTEXTUAL_NAMES[i].as_bytes();
+        shapes[name[0] as usize] |= 1 << name.len();
+        i += 1;
+    }
+    shapes
+};
+
 blaze_phf::phf_table!(static CONTEXTUAL_TABLE = &CONTEXTUAL_NAMES;);
 
 /// An identifier of 2 to 8 bytes as one word, its bytes little-endian and zero above them, read
@@ -341,6 +357,10 @@ fn strict_window(window: u64, len: usize, edition: Edition) -> Option<SyntaxKind
 pub(super) fn contextual(ident: &str, edition: Edition) -> Option<SyntaxKind> {
     let len = ident.len();
     if len < CONTEXTUAL_LENGTHS.0 || len > CONTEXTUAL_LENGTHS.1 {
+        return None;
+    }
+    // The length is between 2 and 15: the first byte is there and the bit is in the word.
+    if CONTEXTUAL_SHAPES[ident.as_bytes()[0] as usize] & (1 << len) == 0 {
         return None;
     }
     let (_, kind, until) = CONTEXTUAL[CONTEXTUAL_TABLE.get(ident)?];

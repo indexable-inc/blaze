@@ -26,6 +26,7 @@ use super::heads::HeadError;
 use super::keys::{MemberKind, Origin};
 use blaze_typeck as tc;
 use super::types::Why;
+use crate::class_chain::class_chain;
 use super::spell::Spelling;
 use crate::front::FnLang;
 use super::back_needs::BackNeeds;
@@ -73,6 +74,38 @@ pub struct Census<'n> {
     /// The calls of bodies that did not check which only their types could name (a method
     /// call, a path through a type, a trait's fn, a qualified path): not followed.
     pub not_followed: usize,
+    /// Each step the walk took, as (the fn whose reading queued it, the fn queued), in the
+    /// order queued; a fn the builder calls on its own account (FnLang::ALL, drop glue's
+    /// `Drop::drop`, an overloaded index, a held future's `poll`) is queued from [`AMBIENT`],
+    /// and an impl fn an instance resolves to from the trait's fn decided at the call. What a
+    /// test's static reach is read from (program/suite.rs `Suite::reach_of`, test.md piece 13).
+    pub edges: Vec<(ItemKey, ItemKey), Global>,
+}
+
+/// The source of every edge the walk takes for the builder's own account (no body names the
+/// fn it queues): in every entry's reach. No item has the checker key 0 (a library key's first
+/// 8 bytes are its crate's prefix, a content hash).
+pub const AMBIENT: ItemKey = ItemKey(0);
+
+/// One entry a walk starts from: `first`, checked as `owner` at `scope`.
+pub struct Start<'a, 'c, 'n, 's> {
+    pub owner: ItemKey,
+    pub first: First<'a, 'c, 'n>,
+    pub scope: &'a BodyScope<'s>,
+}
+
+/// Files each fn queued, and each outcome filed, since `from` was read as an edge from it.
+fn note_edges(edges: &mut Vec<(ItemKey, ItemKey), Global>, from: ItemKey, queued: &[(ItemKey, Option<Reached>)], filed: &[(ItemKey, Reached)]) {
+    for &(to, _) in queued {
+        if to != from {
+            edges.push((from, to));
+        }
+    }
+    for (to, _) in filed {
+        if *to != from {
+            edges.push((from, *to));
+        }
+    }
 }
 
 /// Where a walk starts: a body that checked, or one that did not, whose calls by name are
@@ -178,6 +211,49 @@ fn check_failed(r: &Records<'_, '_>, e: &CheckFail) -> Reached {
             let first = gaps.first().map(|g| format!("{g:?}")).unwrap_or_default();
             (format!("check gap: {}", class_of(&first)), format!("{} gaps; the first: {}", gaps.len(), gaps.first().map(|g| format!("{g}")).unwrap_or_default()))
         }
+        // By the head error's variant chain and, for a path that did not resolve, the path as
+        // written (from the item's text): head failures of unrelated causes are not one class
+        // (walk-AH Brief 2's addendum: 117 "check: Head").
+        CheckFail::Head { error, .. } => {
+            let class = match error {
+                HeadError::Item(lib, why) => {
+                    let chain = class_chain(&format!("{why:?}"), 3);
+                    let path = match why {
+                        Why::Resolve(_, at) => r.names.item_text(*lib).and_then(|t| t.text.get(at.start as usize..at.end as usize)),
+                        _ => None,
+                    };
+                    match path {
+                        Some(path) => {
+                            let cut = path.char_indices().nth(80).map_or(path, |(i, _)| &path[..i]);
+                            format!("check: Head: Item: {chain}: `{cut}`")
+                        }
+                        None => format!("check: Head: Item: {chain}"),
+                    }
+                }
+                other => format!("check: Head: {}", class_chain(&format!("{other:?}"), 3)),
+            };
+            (class, format!("{e}"))
+        }
+        CheckFail::Check { error, .. } => (format!("check: Check: {}", class_chain(&format!("{error:?}"), 3)), format!("{e}")),
+        // By the first diagnostic's code and its message's first words (`E0277 Param(0):
+        // MetaSized`): bodies with diagnostics of unrelated causes are not one class.
+        CheckFail::Diags { diags, .. } => {
+            let class = match diags.first() {
+                Some((code, _, about)) => {
+                    let mut words = String::new();
+                    for word in about.split_whitespace().take(4) {
+                        if !words.is_empty() {
+                            words.push(' ');
+                        }
+                        words.push_str(word);
+                    }
+                    let cut = words.char_indices().nth(60).map_or(&*words, |(i, _)| &words[..i]);
+                    format!("check: Diags: {} {cut}", code.code())
+                }
+                None => String::from("check: Diags"),
+            };
+            (class, format!("{e}"))
+        }
         other => {
             let d = format!("{other:?}");
             (format!("check: {}", class_of(&d)), format!("{other}"))
@@ -242,9 +318,21 @@ fn queue_targets(r: &mut Records<'_, '_>, scope: &BodyScope<'_>, owner: ItemKey,
 /// A body that did not check (`first` unchecked, or one met on the way) is no dead end: what it
 /// calls by name is walked too ([`queue_by_name`]), so the walk visits every fn reachable.
 pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKey, first: First<'_, '_, '_>, scope: &BodyScope<'_>) -> Census<'n> {
+    let mut starts = Vec::with_capacity_in(1, Global);
+    starts.push(Start { owner, first, scope });
+    reach_all(r, prepared, starts, &[])
+}
+
+/// [`reach`] from MANY entries at once (a test suite's, program/suite.rs): one walk, so a fn two
+/// entries reach is lowered and checked once (rule 77); [`Census::edges`] keeps which entry
+/// reached what. `also` are roots with no body read here (a test's `Termination::report` fn,
+/// test_entry.rs), walked like any queued fn.
+pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: Vec<Start<'_, '_, '_, '_>, Global>, also: &[ItemKey]) -> Census<'n> {
     let mut seen: HashMap<ItemKey, (), Global> = HashMap::new_in(Global);
-    // `first` is walked already: a call back to it is no new fn.
-    seen.insert(owner, ());
+    // Each entry is walked already: a call back to one is no new fn.
+    for s in starts.iter() {
+        seen.insert(s.owner, ());
+    }
     let mut queue: Vec<(ItemKey, Option<Reached>), Global> = Vec::new_in(Global);
     for l in FnLang::ALL {
         let Some(lib) = r.index.fn_lang(l) else { continue };
@@ -253,30 +341,44 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
             Err(clash) => (clash.key, Some(Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str() })),
         });
     }
-    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0 };
+    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0, edges: Vec::new_in(Global) };
+    note_edges(&mut census.edges, AMBIENT, &queue, &[]);
+    queue.extend(also.iter().map(|&k| (k, None)));
     // What the builder calls on its own for what the reached bodies write, queued as read.
     let mut needs = BackNeeds::new();
-    let first: Option<&Checked<'_>> = match first {
-        First::Checked(c) => {
-            queue_targets(r, scope, owner, c, &mut queue);
-            needs.read(r, owner, None, c, &mut queue, &mut census.fns);
-            Some(c)
+    let mut firsts: Vec<&Checked<'_>, Global> = Vec::with_capacity_in(starts.len(), Global);
+    for s in starts {
+        let (queue_mark, fns_mark) = (queue.len(), census.fns.len());
+        match s.first {
+            First::Checked(c) => {
+                queue_targets(r, s.scope, s.owner, c, &mut queue);
+                needs.read(r, s.owner, None, c, &mut queue, &mut census.fns);
+                firsts.push(c);
+            }
+            First::CheckedBody(body, c) => {
+                queue_targets(r, s.scope, s.owner, c, &mut queue);
+                needs.read(r, s.owner, Some(body), c, &mut queue, &mut census.fns);
+                firsts.push(c);
+            }
+            First::Unchecked(body) => {
+                queue_by_name(r, body, s.scope, &mut queue, &mut census.not_followed);
+            }
         }
-        First::CheckedBody(body, c) => {
-            queue_targets(r, scope, owner, c, &mut queue);
-            needs.read(r, owner, Some(body), c, &mut queue, &mut census.fns);
-            Some(c)
-        }
-        First::Unchecked(body) => {
-            queue_by_name(r, body, scope, &mut queue, &mut census.not_followed);
-            None
-        }
-    };
+        note_edges(&mut census.edges, s.owner, &queue[queue_mark..], &census.fns[fns_mark..]);
+    }
     let mut instances = Instances::default();
+    // The fn read last, with the queue's and the census's lengths when its reading began: what
+    // was queued or filed since is its edges, noted before the next pop.
+    let mut reading: Option<(ItemKey, usize, usize)> = None;
     // Rounds: the work list drained, then the impl fns the back half's instances can resolve
     // to, until a round adds none (each round adds a fn, so `MOST_FNS` bounds the rounds).
     loop {
-    while let Some((k, decided)) = queue.pop() {
+    while let Some((k, decided)) = {
+        if let Some((from, q, f)) = reading.take() {
+            note_edges(&mut census.edges, from, &queue[q.min(queue.len())..], &census.fns[f.min(census.fns.len())..]);
+        }
+        queue.pop()
+    } {
         // A trait's provided fn met on a parameter or `dyn` is decided at the site; it is walked
         // as a body only when an instance resolves to it (an impl leaves it out: `Instances`),
         // and its decided outcome is then replaced by the walk's.
@@ -286,6 +388,8 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
         } else if seen.insert(k, ()).is_some() {
             continue;
         }
+        // From here every fn queued and outcome filed until the next pop is `k`'s reading.
+        reading = Some((k, queue.len(), census.fns.len()));
         if matches!(decided, Some(Reached::AtInstance | Reached::AtObject)) {
             instances.declared.insert(k, ());
         }
@@ -301,7 +405,12 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
         // A fn whose head says it has no body (a foreign fn's declaration, an intrinsic's):
         // nothing to lower; what calls it is the table's to say.
         if r.store.fns.get(&k).is_some_and(|h| !h.has_body) {
-            census.fns.push((k, Reached::NoBody));
+            // The one declaration that is a call of a Rust fn: core's `#[lang = "panic_impl"]`
+            // runs the program's `#[panic_handler]` fn, queued here as its callee
+            // ([`super::panic_entry`]); every other fn with no body is `NoBody`.
+            let (outcome, handler) = super::panic_entry::reached(r, k, blaze_own::Alloc::global());
+            queue.extend(handler.map(|h| (h, None)));
+            census.fns.push((k, outcome));
             continue;
         }
         // A length naming a constant (`[0; HELD]`, or one in a head the body needs) has it
@@ -362,7 +471,11 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
             census.bodies.push((body, c));
         }
     }
-    if census.capped || !instances.round(r, first, &census, &needs, &mut queue) {
+    // The last fn read before the list ran dry (or the cap stopped it).
+    if let Some((from, q, f)) = reading.take() {
+        note_edges(&mut census.edges, from, &queue[q.min(queue.len())..], &census.fns[f.min(census.fns.len())..]);
+    }
+    if census.capped || !instances.round(r, &firsts, &mut census, &needs, &mut queue) {
         break;
     }
     }
@@ -391,7 +504,11 @@ struct Instances {
 
 impl Instances {
     /// Queues the impl fns of the questions not asked yet; whether it queued any.
-    fn round(&mut self, r: &mut Records<'_, '_>, first: Option<&Checked<'_>>, census: &Census<'_>, needs: &BackNeeds, queue: &mut Vec<(ItemKey, Option<Reached>), Global>) -> bool {
+    /// Each impl fn queued is an edge ([`Census::edges`]) from the trait's fn decided at the
+    /// call, or from [`AMBIENT`] for a question the builder asks on its own (drop glue, an
+    /// overloaded index, `.await`): every entry's reach holds those (a superset, named: drop
+    /// glue's impls are not yet narrowed to the types an entry's bodies hold).
+    fn round(&mut self, r: &mut Records<'_, '_>, firsts: &[&Checked<'_>], census: &mut Census<'_>, needs: &BackNeeds, queue: &mut Vec<(ItemKey, Option<Reached>), Global>) -> bool {
         let mut add = |tys: tc::PTys<'_>, shapes: &mut HashMap<tc::Shape, (), Global>| {
             for i in 0..tys.nodes.len() {
                 if let Some(s) = shape_of(tys, tc::PTy(i as u32)) {
@@ -403,7 +520,7 @@ impl Instances {
             self.first_read = true;
             // A type parameter's question is answered by the blanket impls alone.
             self.shapes.insert(tc::Shape::Param, ());
-            if let Some(first) = first {
+            for first in firsts {
                 add(first.types.view(), &mut self.shapes);
             }
         }
@@ -417,6 +534,8 @@ impl Instances {
                 traits.push((*container, name.clone()));
             }
         }
+        // Every pair from here on is a question the builder asks on its own.
+        let decided = traits.len();
         if let Some(Ok(drop)) = r.index.lang("drop").map(|lib| r.keys.item(lib)) {
             traits.push((drop, Box::from("drop")));
         }
@@ -430,6 +549,16 @@ impl Instances {
                 }
             }
         }
+        // `.await`: the builder calls the selected `Future::poll` impl fn of the held future
+        // (back_needs.rs `awaits`). A coroutine's own `poll` is the builder's, no impl's.
+        if needs.awaits
+            && let Some(Ok(tr)) = r.index.lang("future_trait").map(|lib| r.keys.item(lib))
+        {
+            traits.push((tr, Box::from("poll")));
+        }
+        // The questions the builder asks on its own: their impl fns are queued from `AMBIENT`.
+        let mut builder: Vec<(ItemKey, Box<str>), Global> = Vec::new_in(Global);
+        builder.extend(traits[decided..].iter().cloned());
         traits.sort_unstable();
         traits.dedup();
         let mut shapes: Vec<(String, tc::Shape), Global> = Vec::new_in(Global);
@@ -437,6 +566,10 @@ impl Instances {
         shapes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let before = queue.len();
         for (trait_, name) in traits.iter() {
+            let source = match builder.iter().any(|(t, n)| t == trait_ && n == name) {
+                true => AMBIENT,
+                false => r.keys.filed_member(*trait_, MemberKind::Fn, name).unwrap_or(AMBIENT),
+            };
             for (_, shape) in shapes.iter() {
                 if self.asked.insert((*trait_, name.clone(), *shape), ()).is_some() {
                     continue;
@@ -444,6 +577,7 @@ impl Instances {
                 // A question whose candidates refused stays a gap: the back half's asking it
                 // refuses by name (`trait_gap`), so nothing here is dropped unseen.
                 let Some(impls) = answer_impls(r, *trait_, *shape) else { continue };
+                let mark = queue.len();
                 for imp in impls {
                     match r.keys.filed_member(imp, MemberKind::Fn, name) {
                         Some(m) => queue.push((m, None)),
@@ -459,6 +593,7 @@ impl Instances {
                         }
                     }
                 }
+                note_edges(&mut census.edges, source, &queue[mark..], &[]);
             }
         }
         queue.len() > before

@@ -44,10 +44,14 @@
 
 #![blaze::sans_io]
 
+pub mod declare;
+
 use core::fmt;
 
 use blaze_own::{ADeque, ASortedMap, AVec, Alloc, SortedMap, Vec, VecDeque, soa};
 
+pub use self::declare::{CompiledNamed, Named, NamedOptimized, Resolve};
+pub use crate::first_call::Symbol;
 use crate::registry::RunEvent;
 use crate::tier::{Identities, Inlined, usable_planted};
 use crate::{
@@ -178,6 +182,12 @@ pub enum Effect {
     Stop(CompileError),
     /// For the run's event stream.
     Say(RunEvent),
+    /// Tell the program `symbol` runs through `slot` (the run wire's `Down::Declare`): pushed
+    /// before any [`Effect::Publish`] of a record that names `symbol` ([`declare`]).
+    Declare { symbol: Symbol, slot: SlotId },
+    /// `thread` asked for `symbol`, which names no function of the program: its call fails,
+    /// naming it (the run wire's `Down::Failed` with `Failure::Unresolved`).
+    Unresolved { thread: ThreadId, symbol: Symbol },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -198,6 +208,11 @@ pub enum Error {
     StartedTwice,
     /// The startup image was given after the start, or twice: it must come before the start.
     WarmLate,
+    /// A new instance was declared past the slots the program's reservation holds.
+    Full { most: u32 },
+    /// An instance declared again with another code identity than its slot runs (rule 21: two
+    /// values under one key).
+    TwoCodes { instance: InstanceKey, slot: SlotId },
 }
 
 impl fmt::Display for Error {
@@ -229,6 +244,16 @@ impl fmt::Display for Error {
             Error::WarmLate => {
                 write!(f, "the startup image was given after the start or twice; it comes once, first")
             }
+            Error::Full { most } => write!(
+                f,
+                "a new function was declared past the {most} slots the program's reservation holds (run.md, \"Slot table\")"
+            ),
+            Error::TwoCodes { instance, slot } => write!(
+                f,
+                "instance {:02x?} was declared again with another code identity than slot {} runs (rule 21)",
+                &instance.0[..8],
+                slot.0
+            ),
         }
     }
 }
@@ -295,6 +320,8 @@ pub struct Parent<'a> {
     start: Start,
     now: Nanos,
     compiles: u64,
+    /// Each instance's slot, the pairs told to the program, and the most slots ([`declare`]).
+    names: declare::Names<'a>,
     pub(crate) plant: Plant,
 }
 
@@ -326,7 +353,9 @@ impl<'a> Parent<'a> {
         pairs.sort_unstable_by_key(|(instance, _)| *instance);
         let ids = SortedMap::from_sorted(pairs)
             .map_err(|twice| Error::Config { what: "two slots run one instance", value: twice.at as u64 })?;
+        let names = declare::Names::new(functions, alloc);
         Ok(Parent {
+            names,
             config,
             table,
             ids,

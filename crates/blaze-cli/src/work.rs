@@ -554,7 +554,16 @@ fn answer_batch<'f, 'r>(
     }
     let stepped = phases.now();
     phases.took("a batch's lists", request_frame);
-    req.step(Event::Ran { batch: batch.id, results: &results }, effects)?;
+    // A file a crate's names read that no units record and no outline lists stops the machine
+    // by its name alone (a digest): the names step knows which crate read which path, so the
+    // error names both (rule 19).
+    req.step(Event::Ran { batch: batch.id, results: &results }, effects).map_err(|error| match (&error, facts.names.as_ref()) {
+        (blaze_drive::DriveError::NoPart { name, .. }, Some(names)) => match names.reader_of(*name) {
+            Some(unlisted) => CliError::Unlisted(unlisted),
+            None => CliError::Drive(error),
+        },
+        _ => CliError::Drive(error),
+    })?;
     phases.took(crate::STEP, request_frame);
     phases.request.steps += phases.since(stepped);
     Ok(())
@@ -669,6 +678,10 @@ pub fn does(kind: Kind) -> &'static str {
     }
 }
 
+/// The names stage's word in [`CHECK_STAGES`]: the one stage a command can also find not run
+/// (main.rs `Finished::names_held`).
+pub(crate) const NAMES_STAGE: &str = "names";
+
 /// The one list of the stages `check` is defined to run, in order, and whether this build runs
 /// each, derived from the kinds this worker builds: the closing line's "NOT checked" and
 /// `blaze explain 3` read it. When all are `true`, `check` can say `ok`.
@@ -676,7 +689,7 @@ pub(crate) const CHECK_STAGES: [(&str, bool); 6] = [
     ("manifests", builds(Kind::Units) && builds(Kind::UnitGraph)),
     ("syntax of items", builds(Kind::FileItems)),
     ("syntax inside bodies", builds(Kind::BodyCheck)),
-    ("names", builds(Kind::CrateScope)),
+    (NAMES_STAGE, builds(Kind::CrateScope)),
     // A body's types are its `BodyCheck` task's, an item's its `Signature`'s.
     ("types", whole(Kind::Signature) && whole(Kind::ImplBucket) && whole(Kind::BodyCheck)),
     ("borrows", whole(Kind::BodyCheck)),
@@ -868,11 +881,27 @@ fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'
             // their modules beside them; a `mod x;` found at `x.rs` holds them in `x/`.
             let owns_dir = flags & crate::sweep::MODULE == 0 || path == "mod.rs" || path.ends_with("/mod.rs");
             for item in outline.items() {
-                let ItemDetail::Mod { inline: false, path: attr } = item.detail else { continue };
-                let Some(name) = item.name else { continue };
-                let child = match attr {
-                    None => module_file(path, owns_dir, text, &outline, item, Segment::Slot(item.text(text, name)), scratch),
-                    Some(attr) => module_file(path, owns_dir, text, &outline, item, Segment::Attr(item.text(text, attr)), scratch),
+                let (child, slot) = match item.detail {
+                    ItemDetail::Mod { inline: false, path: attr } => {
+                        let Some(name) = item.name else { continue };
+                        let child = match attr {
+                            None => module_file(path, owns_dir, text, &outline, item, Segment::Slot(item.text(text, name)), scratch),
+                            Some(attr) => module_file(path, owns_dir, text, &outline, item, Segment::Attr(item.text(text, attr)), scratch),
+                        };
+                        // A `#[path]` names its file: it alone is opened, with no `x/mod.rs` beside it.
+                        (child, attr.is_none())
+                    }
+                    // An item-position `include!("file")`: the file's items are this crate's, so
+                    // the file is a part like a module's, opened as the one file it names. (The
+                    // names step reads it; unlisted, its read had no record to stand on:
+                    // blaze-diff's `mod rules_gen { include!("rules_gen.rs"); }`, 2026-11-16.)
+                    ItemDetail::MacroCall { path: Some(call), input: Some(input) } if in_modules(&outline, item) => {
+                        match included_file(path, item.text(text, call), item.text(text, input), scratch) {
+                            Some(child) => (child, false),
+                            None => continue,
+                        }
+                    }
+                    _ => continue,
                 };
                 let child = match child {
                     Ok(child) => child,
@@ -880,8 +909,6 @@ fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'
                         return Ok(Err(Why::Refused { what, rule: "blaze-cli work.rs, module_file" }));
                     }
                 };
-                // A `#[path]` names its file: it alone is opened, with no `x/mod.rs` beside it.
-                let slot = attr.is_none();
                 parts.push(Part { name: Name::file(&child), locate: Locate::File { edition: job.edition }, place: item.range.start });
                 let at = path_bytes.len() as u32;
                 path_bytes.extend_from_slice(&child);
@@ -1304,6 +1331,49 @@ fn module_file<'f, 't>(
         Segment::Attr(literal) => join(&mut out, &path_literal(literal, frame)?)?,
     }
     Ok(out)
+}
+
+/// Whether every entry enclosing `item` is an inline module: it is in item position of the
+/// file, not inside a body, an impl or a trait.
+fn in_modules(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item) -> bool {
+    let mut parent = item.parent;
+    while let Some(at) = parent {
+        let entry = outline.item(at);
+        if !matches!(entry.detail, ItemDetail::Mod { inline: true, .. }) {
+            return false;
+        }
+        parent = entry.parent;
+    }
+    true
+}
+
+/// The file a macro call `call ! input` in item position of the file at `path` includes: `Some`
+/// for `include!`, `core::include!` and `std::include!` whose input is one string literal (the
+/// Reference, "Macros", and core's `include`: "the file is located relative to the current
+/// file"), so relative to `path`'s directory whatever inline modules enclose the call. `None`
+/// for any other macro, and for an `include!` whose input is no literal (`concat!(env!(..))`:
+/// only expansion knows that path; a checkout file it names stops the command by name, names.rs
+/// `Unlisted`). Debt: the part is opened as a `#[path]` file is, so a `mod x;` line INSIDE an
+/// included file is looked for beside it, where rustc looks from the including module's
+/// directory; the names step's read of the other place is then `Unlisted`, never quiet.
+fn included_file<'f>(path: &str, call: &str, input: &str, frame: &'f Frame) -> Option<Result<Vec<u8, &'f Frame>, &'static str>> {
+    let call = call.trim();
+    let call = call.strip_prefix("::").unwrap_or(call);
+    if !matches!(call, "include" | "core::include" | "std::include") {
+        return None;
+    }
+    let input = input.trim();
+    let inner = [('(', ')'), ('[', ']'), ('{', '}')].iter().find_map(|(open, close)| input.strip_prefix(*open)?.strip_suffix(*close));
+    let literal = inner.unwrap_or(input).trim();
+    let literal = literal.strip_suffix(',').unwrap_or(literal).trim_end();
+    if !(literal.starts_with('"') || literal.starts_with("r\"") || literal.starts_with("r#")) {
+        return None;
+    }
+    const REFUSED: &str = "an `include!` whose literal blaze does not read: an escape past `\\n`, an absolute path, or one that climbs out of the checkout";
+    let dir = path.rfind('/').map_or("", |at| &path[..at]);
+    let mut out = Vec::new_in(frame);
+    out.extend_from_slice(dir.as_bytes());
+    Some(path_literal(literal, frame).and_then(|rel| join(&mut out, &rel)).map(|()| out).map_err(|_| REFUSED))
 }
 
 /// A `#[path]` string literal's value: `"..."` with its escapes, or a raw `r#"..."#`.

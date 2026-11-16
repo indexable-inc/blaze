@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-adt-09-discriminant-high-bit"
+version = "0.1.0"
+edition = "2024"

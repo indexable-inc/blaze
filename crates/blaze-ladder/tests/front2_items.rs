@@ -303,6 +303,13 @@ fn main() {}
 /// world answers a shape's impls whole, so a built impl's proof cannot yet stand beside a
 /// refused candidate; that answer is the checker's `World::impls_of`) is the gap naming the
 /// refused impl, never E0277. Before the fix every body asking about `W` stopped as "check Head".
+/// CHANGED 2026-11-16 14:3x (front-end integrator, leg 4): the constants pieces (front2
+/// consts.rs / const_open.rs) now evaluate `size_of::<u8>()` in a header, so that impl is no
+/// longer refused: it is `impl Tr for W<1>`. The right answers are then the language's own:
+/// `proven` (`W<3>: Tr`) and `depends` (`W<1>: Tr`, by the evaluated impl) are clean and
+/// `other` (`u16: Tr`) is E0277. The run of 14:31 printed exactly that. This fixture no longer
+/// reaches the refused-header gap; a header the evaluator still refuses is owed by the ITEMS
+/// writer (a5eefcbfe224f7f51) to cover it again.
 #[test]
 fn a_refused_impl_is_a_named_gap() {
     const TEXT: &str = "struct W<const N: usize>;
@@ -321,7 +328,7 @@ fn main() {}
     }
     assert!(got[1].1.contains("E0277"), "{got:?}");
     for i in [0, 2] {
-        assert!(got[i].1.contains("a candidate of this question, has a refused header") && got[i].1.contains("src/main.rs:4"), "{got:?}");
+        assert_eq!(got[i].1, "clean", "{got:?}");
     }
 }
 
@@ -414,10 +421,13 @@ fn main() {}
 ";
     let got = check_fns(TEXT, &["foreign_inherent", "foreign_trait", "builtin_inherent", "bare_trait", "local_inherent", "local_trait"]);
     println!("by crate: {got:?}");
-    all_clean("by crate", &got[..4]);
-    for i in [4, 5] {
-        assert!(got[i].1.contains("has a refused header"), "{got:?}");
-    }
+    // CHANGED 2026-11-16 14:3x (front-end integrator, leg 4): the constants pieces (front2
+    // consts.rs / const_open.rs) now evaluate `size_of::<..>()` in a header, so none of the three
+    // `dyn Tr<W<..>>` impls is refused any more and `S`'s two goals are answered by its own
+    // impls: all six are clean, as the language says (the 14:31 run). The refused-header gap
+    // this test was written for needs a header the evaluator still refuses: owed by the ITEMS
+    // writer (a5eefcbfe224f7f51).
+    all_clean("by crate", &got);
 }
 
 /// An impl's header is built from its own text and names: a projection of its own parameter in
@@ -662,6 +672,46 @@ fn main() {}
     }
     assert_eq!(got[0].1, "clean", "{got:?}");
     assert!(got[1].1.contains("unread as written"), "{got:?}");
+}
+
+/// The "has a refused header" gap and its narrowing by crate, on headers NO evaluator can ever
+/// build: each names a type that does not exist (`Missing`: rustc's E0412), so the refusal is
+/// the program's own and stays one whatever constants become evaluable (the two older
+/// fixtures used `W<{ size_of::<u8>() }>`, which the constants pieces of 14:31 now evaluate).
+/// `impl Tr for G<Missing>` is a candidate of `Tr` at `G`: `G<u8>: Tr` is the gap naming it,
+/// never E0277 (the Reference, "Trait and lifetime bounds": a bound holds when an impl
+/// applies, and an impl that is not read could be the one); `u16: Tr` is at another shape:
+/// E0277. `impl core::fmt::Display for dyn Dy<Missing>` has no self constructor read as
+/// written, so it is a candidate of `Display` at every shape this crate may implement it for:
+/// `S: Display` (S is this crate's) is the gap; `u16: Display` (core's trait, a built-in type:
+/// "Orphan rules": "at least one of the types `T0..=Tn` must be a local type") is clean; and
+/// `S.s()`, an inherent question, is clean: a trait impl is never its candidate.
+#[test]
+fn an_unbuildable_header_is_a_named_gap_of_its_own_questions_only() {
+    const TEXT: &str = "struct G<T>(T);
+struct S;
+trait Tr { fn t(&self) -> u8 { 0 } }
+trait Dy<T> {}
+impl Tr for G<Missing> {}
+impl S { fn s(&self) -> u8 { 1 } }
+impl core::fmt::Display for dyn Dy<Missing> { fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }
+fn need<T: Tr>(t: T) -> u8 { t.t() }
+fn show<T: core::fmt::Display>(_t: T) {}
+fn same_shape() -> u8 { need(G(1u8)) }
+fn other_shape() -> u8 { need(7u16) }
+fn local_display() { show(S) }
+fn foreign_display() { show(7u16) }
+fn inherent() -> u8 { S.s() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["same_shape", "other_shape", "local_display", "foreign_display", "inherent"]);
+    for (n, o) in &got {
+        println!("unbuildable header: {n}: {o}");
+    }
+    assert!(got[0].1.contains("has a refused header") && got[0].1.contains("src/main.rs:5"), "{got:?}");
+    assert!(got[1].1.contains("E0277"), "{got:?}");
+    assert!(got[2].1.contains("has a refused header") && got[2].1.contains("src/main.rs:7"), "{got:?}");
+    all_clean("unbuildable header", &got[3..]);
 }
 
 /// The row of each ADT named `adts` in the crate `text`, made as front2/program.rs's ADT-row
@@ -956,7 +1006,11 @@ fn main() {}
 /// `<B4 as Spec>::BITS` reaches front2 with no `Self`, and front2 refuses it by name
 /// (`ConstFail::TraitConstNoSelf`). While `true`, the trait-constant test asserts exactly that
 /// refusal; set it to `false` when the arguments arrive, and the values above are asserted.
-const CONST_PATH_ARGS_OWED: bool = true;
+/// Set to `false` 2026-11-16 14:3x (front-end integrator, leg 4): the 14:31 run printed
+/// "qualified constants: Inner: fields [array of Uint(U8) len 4] discrs []" (`INNER` =
+/// `<B4 as Spec>::BITS` = 4: right), after the constants pieces (front2 consts.rs /
+/// const_open.rs) landed.
+const CONST_PATH_ARGS_OWED: bool = false;
 
 /// A struct's size in a constant: `size_of::<S>()` reaches the constant evaluator's layout,
 /// which reads the store's row of `S` (front2/consts.rs `LayoutFacts::adt`, the row made on

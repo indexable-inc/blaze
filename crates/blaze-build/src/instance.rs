@@ -233,8 +233,9 @@ pub fn ground(
     Ok(mapped[top])
 }
 
-/// The children of `node` (of table `from`), pushed to `out`.
-pub(crate) fn each_child(from: PTys<'_>, node: PNode, out: &mut Vec<PTy, Alloc<'_>>) -> Result<(), BuildError> {
+/// The children of `node` (of table `from`), pushed to `out`: the one order a ground type's
+/// tree is written in (here, and blaze-ladder symbols.rs's instance names).
+pub fn each_child(from: PTys<'_>, node: PNode, out: &mut Vec<PTy, Alloc<'_>>) -> Result<(), BuildError> {
     let malformed = |_| BuildError::Malformed { what: "a list past its table" };
     match node {
         PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Opaque(_, l) => {

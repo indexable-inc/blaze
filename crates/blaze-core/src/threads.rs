@@ -69,6 +69,10 @@ const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive
 /// Values in slots of their own, each named by a [`Tag`] and by a generational handle: what a
 /// driver keeps of the spawns, watches and listens in flight. A handle of one removed, or
 /// replaced by another of its tag, names nothing.
+/// File calls made on the asker's own thread: [`inline::Inline`], what a native driver whose
+/// file calls are this module's blocking calls hands out ([`crate::Driver::inline_files`]).
+pub mod inline;
+
 #[cfg_attr(
     target_os = "wasi",
     allow(dead_code, reason = "WASI keeps no spawns, watches or listens")
@@ -2217,6 +2221,13 @@ fn no_watch(watch: Tag) -> String {
         "nothing is watched as {watch:?}: watching files, and so flushing a watch, is built on \
          Linux (inotify, fanotify) and macOS (FSEvents) only"
     )
+}
+
+impl Threads {
+    /// [`Driver::now`]'s clock as a value read with no `&self` (`Kqueue::clock`'s doc).
+    pub fn clock(&self) -> crate::wait::Monotonic {
+        crate::wait::Monotonic::since(self.start)
+    }
 }
 
 impl Driver for Threads {

@@ -3176,7 +3176,9 @@ impl Driver for Sim {
                 self.held_lists.push((dir.clone(), *tag));
                 continue;
             }
-            if let (Effect::List { dir, tag }, Some((failing, left))) =
+            // A directory the user may not read fails both listings: names alone, and names
+            // with stamps (bstd's `Dir::facts_of` lists folders by the second).
+            if let (Effect::List { dir, tag } | Effect::Entries { dir, tag }, Some((failing, left))) =
                 (&effect, &mut self.fail_lists)
                 && dir.name() == Some(&*failing)
                 && *left > 0

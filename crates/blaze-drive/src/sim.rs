@@ -113,6 +113,9 @@ struct SimCrate {
     globs: StdVec<usize>,
     macros: StdVec<usize>,
     fails: bool,
+    /// A finding its scope holds, by its words: a library and its test unit (the same files
+    /// under another identity) hold the same one.
+    says: Option<StdVec<u8>>,
 }
 
 fn crate_scope_name(c: usize) -> Name {
@@ -152,7 +155,7 @@ fn draw_crates(tape: &Tape, world: &mut World) {
         let deps: StdVec<usize> = (0..c).filter(|_| tape.one_in(2, "dep")).collect();
         let globs = deps.iter().copied().filter(|_| tape.one_in(3, "glob")).collect();
         let macros = (0..world.macros.len()).filter(|_| tape.one_in(2, "calls macro")).collect();
-        world.crates.push(SimCrate { identity: 5_000 + c as u64, files, deps, globs, macros, fails: false });
+        world.crates.push(SimCrate { identity: 5_000 + c as u64, files, deps, globs, macros, fails: false, says: None });
     }
 }
 
@@ -181,10 +184,14 @@ fn crate_scope(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
             let own: StdVec<ContentId> = krate.files.iter().filter_map(|f| input_out(task, surface_name(*f))).collect();
             let globbed: StdVec<ContentId> = krate.globs.iter().filter_map(|d| input_out(task, crate_scope_name(*d))).collect();
             let out = key::digest("sim crate scope out", format!("{c} {own:?} {globbed:?}").as_bytes());
-            Ok(Answered::Done(Made { name, out, reads, parts: StdVec::new(), findings: StdVec::new(), paths: StdVec::new() }))
+            let findings = krate.says.iter().map(|words| (TWIN_RULE, 3, 7, words.clone())).collect();
+            Ok(Answered::Done(Made { name, out, reads, parts: StdVec::new(), findings, paths: StdVec::new() }))
         }
     }
 }
+
+/// The rule of a sim crate's own finding ([`SimCrate::says`]).
+const TWIN_RULE: u16 = 0x51D0;
 
 fn path(file: usize) -> StdVec<u8> {
     format!("src/f{file}.rs").into_bytes()
@@ -1752,6 +1759,42 @@ fn a_body_edit_runs_no_crate_scope() {
         })?;
         same_as_fresh(tape, &next, &store, &ended)
     });
+}
+
+/// A crate and its twin (a library and its test unit: the same files under another identity,
+/// each its own `CrateScope`) hold the same finding, and a third crate one of other words. The
+/// answer prints the twins' finding once and counts it once, made fresh and stood on a repeat
+/// (the certificate's findings); the other finding is untouched.
+fn twins(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let mut world = names_world(tape);
+    let words = b"no `nope` in `crate`".to_vec();
+    world.crates[0].says = Some(words.clone());
+    let twin = SimCrate { identity: 9_000, ..world.crates[0].clone() };
+    let other = SimCrate { identity: 9_001, says: Some(b"no `gone` in `crate`".to_vec()), ..world.crates[0].clone() };
+    world.crates.push(twin);
+    world.crates.push(other);
+    let mut store = Store::default();
+    let (answer, first) = finished(request(tape, &world, None, &mut store, None, plant)?)?;
+    let once = |ended: &Ended, answer: &Answer, when: &str| {
+        let twins = ended.prints.iter().filter(|p| p.4 == words).count();
+        let others = ended.prints.iter().filter(|p| p.1 == TWIN_RULE).count() - twins;
+        oracle(twins == 1 && others == 1, || format!("{when}: the twins' finding printed {twins} times, the other crate's {others}"))?;
+        oracle(answer.findings as usize == ended.prints.len(), || format!("{when}: {} errors counted over {} printed", answer.findings, ended.prints.len()))
+    };
+    once(&first, &answer, "fresh")?;
+    let (answer, again) = finished(request(tape, &world, Some(&world), &mut store, first.last.as_deref(), plant)?)?;
+    oracle(again.runs.is_empty(), || format!("a repeat ran {:?}", again.runs))?;
+    once(&again, &answer, "a repeat")
+}
+
+#[test]
+fn one_finding_held_by_two_names_prints_and_counts_once() {
+    check(SimConfig::cases(200), |tape| twins(tape, Plant::None));
+}
+
+#[test]
+fn control_a_finding_printed_once_a_name_is_caught() {
+    control(SimConfig::cases(200), Plant::None, Plant::PrintEachName, "the twins' finding printed 2 times", twins);
 }
 
 /// An added `pub fn` in a crate reruns that crate's scope and its direct dependents' (their

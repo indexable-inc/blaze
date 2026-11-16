@@ -36,6 +36,10 @@ use super::source::NamesSource;
 use super::types::{PRIMS, children, path_texts};
 use crate::resolve::{Kind, Ns, ResolveError};
 
+mod asked;
+
+pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
+
 /// A candidate impl whose header the store does not hold when the answer is made, or an
 /// inherent impl's fn whose signature it does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,6 +361,9 @@ fn row_path(path: &str) -> Option<(bool, Vec<&str, Global>)> {
     };
     let mut texts: Vec<&str, Global> = Vec::new_in(Global);
     for s in rest.split("::") {
+        // An expansion's text writes a path's tokens apart (`:: core :: clone :: Clone`, a
+        // derive's impl): the row keeps the path as written.
+        let s = s.trim();
         let ident = s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_');
         if !ident {
             return None;
@@ -619,7 +626,13 @@ pub fn trait_home<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'
                 let mut ps = Vec::new_in(Global);
                 super::heads::param_names(&low.view(), 1, &mut ps, super::heads::Consts::Keep).ok()
             });
-            (n, false)
+            // `param_names` counts the WRITTEN parameters (from index 1: `Self` is 0 and is
+            // not written); `generics` counts `Self` too, as the head's `t.generics` does.
+            // Without the `+ 1` a trait with no parameter but `Self` (`Clone`) read 0 here,
+            // fell to `wide` below, and its question admitted EVERY crate whenever the store
+            // did not hold the trait's head yet (measured 2026-11-16, front2_records: `bool:
+            // Clone` alone over a fresh reader opened 70 crates and filed 28,719 impls).
+            (n.map(|written| written + 1), false)
         }
     };
     match generics {
@@ -729,6 +742,9 @@ pub struct Buckets {
     /// A test's removed cause ([`Buckets::plant_no_rows`]): every impl is filed from its
     /// header's text, as before impls were filed from rows.
     no_rows: bool,
+    /// Over a source with a bucket index: which buckets are filed and what each question read
+    /// ([`Buckets::admit_asked`]).
+    indexed: asked::Indexed,
 }
 
 impl Buckets {
@@ -764,6 +780,7 @@ impl Buckets {
             filed_from_text: 0,
             row_misses: [0; 6],
             no_rows: false,
+            indexed: asked::Indexed::new(),
         }
     }
 
@@ -815,6 +832,11 @@ impl Buckets {
     /// Returns how many crates this call filed.
     pub fn admit<'n, S: NamesSource<'n>>(&mut self, names: S, home: Homes) -> usize {
         if !self.is_lazy() {
+            return 0;
+        }
+        // Over a bucket index no crate is filed whole: the question's own buckets are filed
+        // by `Buckets::admit_asked`, which the caller calls next with the question.
+        if names.has_buckets() && !self.no_rows {
             return 0;
         }
         // Every field: a new kind of home is a compile error here, not a crate left unfiled.

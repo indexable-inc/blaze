@@ -257,12 +257,18 @@ impl<#[blaze::linear] P: Rights> Kv<P> {
 
     /// Every key of the store, sorted, in `frame`. A file beneath the directory that is no
     /// key's (in a directory of its own, or with a name no [`Key`] has) is not the store's
-    /// and is not listed.
+    /// and is not listed. A key is one part of a path, so the store's own folder is listed one
+    /// level ([`crate::fs::Dir::own_entries_if_there`]), never at depth: a folder beneath it is skipped
+    /// unread.
     pub fn list<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<Key, &'a Frame>, KvError> {
-        let files = self.dir.list(cx, frame).map_err(|error| Self::refuse(KvOp::List, None, error))?;
+        let listed = self.dir.own_entries_if_there(cx).map_err(|error| Self::refuse(KvOp::List, None, error))?;
         let mut keys = Vec::new_in(frame);
-        for (path, _) in &files {
-            let Ok(key) = Key::new(path.as_str()) else { continue };
+        let Some(entries) = listed else { return Ok(keys) };
+        for (name, kind) in entries.iter() {
+            if kind == crate::fs::EntryKind::Dir {
+                continue;
+            }
+            let Ok(key) = Key::new(name) else { continue };
             keys.try_reserve(1).map_err(|_| {
                 let stopped = Stopped::OutOfMemory { arena: "bstd::kv list", asked: size_of::<Key>() };
                 // clone: an error's name of the store's directory, a refcount.

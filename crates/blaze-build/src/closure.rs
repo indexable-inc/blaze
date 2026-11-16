@@ -620,6 +620,7 @@ fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         adjusts: blaze_own::Soa::new_in(a),
         callees: blaze_own::Soa::new_in(a),
         expr_defs: blaze_own::Soa::new_in(a),
+        const_args: blaze_own::Soa::new_in(a),
         pat_defs: blaze_own::Soa::new_in(a),
         fields: blaze_own::Soa::new_in(a),
         captures: blaze_own::Soa::new_in(a),

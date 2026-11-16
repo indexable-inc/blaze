@@ -2130,6 +2130,8 @@ fn bodies_named(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scri
         let registered = procs.procs.crates().count();
         let with_module = procs.procs.crates().filter(|c| c.2).count();
         println!("  proc-macro crates: {registered} registered, {with_module} with a module");
+        // The crates' results tables are written here: without it the next run finds nothing.
+        println!("  proc-macro results kept: {:?}", procs.procs.keep_all().map_err(|error| error.to_string()));
         for finding in procs.procs.take_findings() {
             println!("    proc-macro finding: {finding}");
         }

@@ -14,7 +14,8 @@
 //!   reason's number), seven zero bytes.
 //! - A failure, 160 bytes and then its text and its output's tail: at 56 how it ended (0
 //!   panicked, 1 did not panic, 2 panicked without the expected text, 3 a signal, 4 timed out,
-//!   5 refused by the sandbox); 57 whether a place is given; 58 what the sandbox refused; 59
+//!   5 refused by the sandbox, 6 exited with no whole report: its exit code where a signal goes,
+//!   the torn report's byte count where the nanoseconds go); 57 whether a place is given; 58 what the sandbox refused; 59
 //!   zero; 60 the signal (i32); 64 nanoseconds after its start it was killed (u64); 72 the
 //!   place's item (32 bytes) and 104 its item-relative offset (u32); 108 the text's length (u32:
 //!   the panic message, or what the sandbox refused); 112 the output's digest (32 bytes); 144 the
@@ -100,6 +101,9 @@ pub enum Ended<'r> {
     TimedOut { after: Nanos },
     /// The sandbox refused something and the run was stopped.
     Refused { refusal: Refusal, what: &'r str },
+    /// The process exited by itself with this code and no whole report on descriptor 3;
+    /// `torn` bytes of a report came that did not open (0: none came).
+    NoReport { code: i32, torn: u64 },
 }
 
 impl Ended<'_> {
@@ -112,6 +116,7 @@ impl Ended<'_> {
             Ended::Signal { number } => Failure::Signal { number },
             Ended::TimedOut { after } => Failure::TimedOut { after },
             Ended::Refused { .. } => Failure::Refused,
+            Ended::NoReport { code, .. } => Failure::NoReport { code },
         }
     }
 }
@@ -229,7 +234,7 @@ pub fn capped(text: &str) -> &str {
     &text[..end]
 }
 
-const fn not_kept_number(why: NotKept) -> u8 {
+pub(crate) const fn not_kept_number(why: NotKept) -> u8 {
     match why {
         NotKept::Clock => 1,
         NotKept::Network => 2,
@@ -241,7 +246,7 @@ const fn not_kept_number(why: NotKept) -> u8 {
     }
 }
 
-const fn not_kept_of(byte: u8) -> Option<Result<(), NotKept>> {
+pub(crate) const fn not_kept_of(byte: u8) -> Option<Result<(), NotKept>> {
     match byte {
         0 => Some(Ok(())),
         1 => Some(Err(NotKept::Clock)),
@@ -255,7 +260,7 @@ const fn not_kept_of(byte: u8) -> Option<Result<(), NotKept>> {
     }
 }
 
-const fn refusal_number(refusal: Refusal) -> u8 {
+pub(crate) const fn refusal_number(refusal: Refusal) -> u8 {
     match refusal {
         Refusal::Write => 0,
         Refusal::Connect => 1,
@@ -264,7 +269,7 @@ const fn refusal_number(refusal: Refusal) -> u8 {
     }
 }
 
-const fn refusal_of(byte: u8) -> Option<Refusal> {
+pub(crate) const fn refusal_of(byte: u8) -> Option<Refusal> {
     match byte {
         0 => Some(Refusal::Write),
         1 => Some(Refusal::Connect),
@@ -293,6 +298,7 @@ fn wire<'r>(ended: &Ended<'r>) -> Wire<'r> {
         Ended::Signal { number } => Wire { tag: 3, signal: number, ..none },
         Ended::TimedOut { after } => Wire { tag: 4, after: after.0, ..none },
         Ended::Refused { refusal, what } => Wire { tag: 5, refusal: refusal_number(refusal), text: what, ..none },
+        Ended::NoReport { code, torn } => Wire { tag: 6, signal: code, after: torn, ..none },
     }
 }
 
@@ -418,7 +424,7 @@ fn open_fail(bytes: &[u8]) -> Result<Verdict<'_>, ResultError> {
     zero(bytes, 156, FAIL_FIXED)?;
 
     let tag = bytes[56];
-    if tag > 5 {
+    if tag > 6 {
         return Err(ResultError::Tag { at: 56, byte: tag });
     }
     let (uses_place, uses_text) = (matches!(tag, 0 | 2), matches!(tag, 0 | 2 | 5));
@@ -441,10 +447,12 @@ fn open_fail(bytes: &[u8]) -> Result<Verdict<'_>, ResultError> {
             Refusal::Write
         }
     };
-    if tag != 3 {
+    // Tag 6 (no report) keeps its exit code where a signal's number goes and its torn byte
+    // count where a deadline's nanoseconds go.
+    if tag != 3 && tag != 6 {
         zero(bytes, 60, 64)?;
     }
-    if tag != 4 {
+    if tag != 4 && tag != 6 {
         zero(bytes, 64, 72)?;
     }
     if !uses_text && text_len != 0 {
@@ -458,7 +466,8 @@ fn open_fail(bytes: &[u8]) -> Result<Verdict<'_>, ResultError> {
         2 => Ended::PanicTextMissing { message: text, at: place },
         3 => Ended::Signal { number: le32(bytes, 60) as i32 },
         4 => Ended::TimedOut { after: Nanos(le64(bytes, 64)) },
-        _ => Ended::Refused { refusal, what: text },
+        5 => Ended::Refused { refusal, what: text },
+        _ => Ended::NoReport { code: le32(bytes, 60) as i32, torn: le64(bytes, 64) },
     };
     let output = Captured { digest: key(bytes, 112), total, tail: &bytes[FAIL_FIXED + text_len..] };
     Ok(Verdict::Fail(Failed { run: CheckoutKey(key(bytes, 16)), micros: le64(bytes, 48), ended, output }))
@@ -645,6 +654,7 @@ impl fmt::Display for Why {
             Failure::Signal { number } => write!(f, "ended by signal {number}"),
             Failure::Refused => f.write_str("was refused by the sandbox"),
             Failure::TimedOut { .. } => f.write_str("was killed past its deadline"),
+            Failure::NoReport { code } => write!(f, "exited with code {code} and no whole report"),
         }
     }
 }

@@ -17,6 +17,7 @@
 //! | [`unwind`] | a placed function's unwind entry, told to the system's unwinder and taken back when the body is freed |
 //! | [`retired`] | code given back and made inaccessible: an append-only table a fault handler reads without a lock, and the stop line it writes |
 //! | [`waits`] | which thread waits for what since when, a seqlocked row per thread in the region the monitor reads: why a run hangs |
+//! | [`zygote`] | `blaze test`'s system calls: the zygote forks one child per test (one thread at each fork, counted), a child's setup steps and its report on descriptor 3, the pipes polled and children reaped under each test's deadline; the decisions are blaze-run's `zygote` and `child` machines |
 //!
 //! Who touches what, which is the whole of the design's safety:
 //!
@@ -49,6 +50,7 @@
 )]
 
 pub mod arch;
+pub mod code_unwind;
 pub mod control;
 pub mod drive;
 pub mod fault;
@@ -62,6 +64,7 @@ pub mod threads;
 pub mod tls;
 pub mod unwind;
 pub mod waits;
+pub mod zygote;
 
 #[cfg(test)]
 mod tests;

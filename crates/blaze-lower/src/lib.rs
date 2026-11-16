@@ -418,6 +418,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod block_uses;
 pub mod by_name;
 mod columns;
 pub mod desugar;
@@ -462,7 +463,7 @@ pub use crate::type_text::{TypeTextRefused, lower_type_text, lower_type_text_exp
 /// The domain of [`signature_key`]: this lowering's version and the parser's.
 pub const SIGNATURE_KEY_DOMAIN: &str = "blaze v2 lower signature 3, parser 1";
 /// The domain of [`body_key`].
-pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body 6, parser 1";
+pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body 7, parser 1";
 /// The domain of [`anon_const_key`].
 pub const ANON_CONST_KEY_DOMAIN: &str = "blaze v2 lower anon const 3, parser 1";
 
@@ -512,6 +513,19 @@ impl ValueName {
 /// ([`View::value_reads`]).
 pub trait ValueNames {
     fn value_name(&mut self, name: &str) -> ValueName;
+
+    /// What `name`, an identifier pattern, is through the `use` declarations of the blocks
+    /// around it (`uses`: innermost block first; `locals`: the names of those blocks' own
+    /// items, which a `use` path may start with): `Some` when one of them binds the name in the
+    /// value namespace (a named import, or a glob import whose module or enum holds it:
+    /// `use E::*;` makes a pattern `A` the variant), `None` when none does, and
+    /// `Some(ValueName::Need)` when the world cannot say yet. Asked before the block's item
+    /// and the module ([`block_uses`], where the order's rule is quoted). The default is a
+    /// world with no modules to import from (a fixture's): no `use` binds anything.
+    fn value_name_by_uses(&mut self, name: &str, uses: &[block_uses::BlockUse<'_>], locals: &[&str]) -> Option<ValueName> {
+        let _ = (name, uses, locals);
+        None
+    }
 }
 
 /// A test fixture's world, with no module around the body: every name is [`ValueName::Nothing`].
@@ -527,6 +541,11 @@ impl ValueNames for NoModule {
 /// Whether every answer `view`'s lowering read of `names` still holds: when one does not (a
 /// name it bound is now a constant), the body is lowered again.
 pub fn value_reads_hold(view: &View<'_>, names: &mut dyn ValueNames) -> Result<bool, TextAt> {
+    // A read through a block's `use` is asked again with the block's `use`s, which takes an
+    // allocator: [`block_uses::reads_hold`] asks both kinds. Here such a record does not hold.
+    if view.value_reads.iter().any(|n| n.flags & block_uses::BY_USES != 0) {
+        return Ok(false);
+    }
     for read in view.value_reads() {
         let (name, answer) = read.map_err(TextAt::Row)?;
         if names.value_name(view.name_text(name)?) != answer {

@@ -35,7 +35,7 @@ use crate::ty::{Ty, TyList, TyView, TypeCtx, Var, VarKind};
 use crate::world::World;
 
 /// A capture walk's usage: the expression's value is taken (moved, or copied when `Copy`).
-const USE_MOVE: u8 = 2;
+pub(super) const USE_MOVE: u8 = 2;
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The expected signature: inputs, and the output if known.
@@ -264,7 +264,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(none)
     }
 
-    fn visit_for_captures(
+    pub(super) fn visit_for_captures(
         &mut self,
         closure: ExprId,
         x: ExprId,
@@ -283,8 +283,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     // moved out (not `Copy`) by value.
                     // The closure's kind follows the use, not the mode ("Closure types": a
                     // `move` closure that only reads its captures is still `Fn`).
-                    let is_move = matches!(self.body.expr(closure)?, Expr::Closure { is_move: true, .. });
-                    let moved = usage == USE_MOVE && self.moved_out(x)?;
+                    // An async block's rows are found by this walk too (rules/async_fn.rs).
+                    let is_move = self.captures_by_move(closure)?;
+                    // A block's rows ask `Copy` only where the answer changes the mode, and
+                    // never as a finding (`block_moved_out`): a body that was clean stays so.
+                    let of_block = matches!(self.body.expr(closure)?, Expr::AsyncBlock { .. });
+                    let moved = usage == USE_MOVE
+                        && if of_block { !is_move && self.block_moved_out(x)? } else { self.moved_out(x)? };
                     let kind = if is_move || moved {
                         CaptureKind::ByValue
                     } else if usage == 1 {
@@ -434,7 +439,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// and its type is not `Copy` (the Reference, "Capture modes": a moved non-`Copy` value is
     /// captured by value). An unknown type (`Copy` may hold) is not a move; with no `Copy`
     /// lang item in the world no type is known `Copy`-free, so nothing moves.
-    fn moved_out(&mut self, x: ExprId) -> Result<bool, Stop> {
+    pub(super) fn moved_out(&mut self, x: ExprId) -> Result<bool, Stop> {
         let exprs = self.adjust.column::<0>();
         let kinds = self.adjust.column::<1>();
         if exprs.iter().zip(kinds).any(|(&e, k)| e == x && matches!(k, crate::columns::AdjustKind::Borrow { .. })) {

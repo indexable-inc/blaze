@@ -53,6 +53,11 @@ pub type Callees<'a> = Soa<(ExprId, ItemKey, List), Alloc<'a>>;
 /// expression: a variant is `Def::Ctor` with its index, a struct `Def::Adt` (variant 0), a
 /// type-relative `T::f` the picked associated item. A path that failed has no row.
 pub type ExprDefs<'a> = Soa<(ExprId, Def), Alloc<'a>>;
+/// The generic arguments each constant value path is read at, by expression (a list of the
+/// record's `types`): `<T as Tr>::C` holds `[Self, trait args..]`, an inherent impl's constant
+/// the impl's arguments. A constant with no generics (a free `const` item) has no row; the
+/// item itself is the expression's `Def::Const` in `expr_defs`.
+pub type ConstArgs<'a> = Soa<(ExprId, List), Alloc<'a>>;
 /// The same for `Pat::Path`, `Pat::TupleStruct` and `Pat::Struct`, by pattern: the variant a
 /// `match` switches on.
 pub type PatDefs<'a> = Soa<(PatId, Def), Alloc<'a>>;
@@ -77,6 +82,8 @@ pub struct Checked<'a> {
     pub adjusts: Adjusts<'a>,
     pub callees: Callees<'a>,
     pub expr_defs: ExprDefs<'a>,
+    /// Sorted by expression; read with [`Checked::const_args_of`].
+    pub const_args: ConstArgs<'a>,
     pub pat_defs: PatDefs<'a>,
     pub fields: Fields<'a>,
     pub captures: Captures<'a>,
@@ -134,6 +141,13 @@ macro_rules! columns_eq {
 pub(crate) use columns_eq;
 
 impl<'a> Checked<'a> {
+    /// The generic arguments the constant path at `e` is read at (a list of `types`), or `None`
+    /// for a constant with no generics or an expression that names no constant.
+    pub fn const_args_of(&self, e: ExprId) -> Option<List> {
+        let at = self.const_args.column::<0>().binary_search(&e).ok()?;
+        Some(self.const_args.column::<1>()[at])
+    }
+
     /// Equal results ignoring the read list and needs: what the read-list property compares.
     pub fn same_result(&self, other: &Checked<'a>) -> bool {
         self.types == other.types
@@ -143,6 +157,7 @@ impl<'a> Checked<'a> {
             && soa3_eq(&self.adjusts, &other.adjusts)
             && soa3_eq(&self.callees, &other.callees)
             && soa2_eq(&self.expr_defs, &other.expr_defs)
+            && soa2_eq(&self.const_args, &other.const_args)
             && soa2_eq(&self.pat_defs, &other.pat_defs)
             && soa3_eq(&self.fields, &other.fields)
             && soa3_eq(&self.captures, &other.captures)

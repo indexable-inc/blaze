@@ -225,6 +225,43 @@ pub fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a
     walk::outline_parts::<SideBySide>(text, parts.iter().copied(), parser_edition(edition), Bodies::Skipped, alloc)
 }
 
+/// [`outline`] with its rows written by the item grammar's sink as each item closes
+/// (crate::walk::rows), no event list and no walk of one: the path under the oracle
+/// (examples/oracle.rs) until it is equal on every file, then [`outline`] itself.
+#[doc(hidden)]
+pub fn outline_rows<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
+    walk::rows::outline::<SideBySide>(text, parser_edition(edition), Bodies::Skipped, alloc)
+}
+
+/// [`outline_rows`] with every body parsed with the rest ([`Bodies::Parsed`]): the same rows, and
+/// the findings inside the bodies too.
+#[doc(hidden)]
+pub fn outline_rows_with<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
+    walk::rows::outline::<SideBySide>(text, parser_edition(edition), bodies, alloc)
+}
+
+/// The outline of `text`, a text written from tokens (an expansion rendered), read back with no
+/// lexer: `tokens` are its tokens as its writer has them, one [`TokenColumns::push`] each, in
+/// order. `edition` is the file's, as [`outline`]'s is; each token's own is in its word.
+///
+/// It is [`outline`]`(text)` in every entry, key, digest, attribute, flag and parser finding
+/// when the tokens are what the lexer makes of `text` (examples/oracle.rs `--tokens` proves it
+/// over library/ and tempo's packages; tests/rows.rs on the forms where joint tokens decide the
+/// parse). The lexer's findings are not in it: nothing is lexed.
+///
+/// Refused, by name ([`TokensRefused`]): a text longer than `u32::MAX` bytes, a token that
+/// ends past the text or is cut inside one of its characters.
+pub fn outline_tokens<'a>(
+    text: &str,
+    tokens: &TokenColumns<'_>,
+    edition: Edition,
+    alloc: Alloc<'a>,
+) -> Result<Outline<'a>, TokensRefused> {
+    walk::rows::outline_tokens::<SideBySide>(text, tokens, parser_edition(edition), alloc)
+}
+
+pub use walk::rows::{TokenColumns, TokensRefused};
+
 /// The outline of one part of a file ([`split_top_level`]), from its bytes and the edition
 /// alone: positions are relative to the part's start, and the top-level disambiguators count
 /// only the part's entries until [`Assembled`] recounts them.

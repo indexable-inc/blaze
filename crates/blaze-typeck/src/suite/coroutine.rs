@@ -58,6 +58,10 @@ fn world() -> (Fx, Items) {
     let error = fx.key_of("Error");
     let (p0, unit, u8_) = (fx.param(0), fx.unit(), fx.u8());
 
+    // An async block's capture modes ask `Copy` of what the block takes by value, as a
+    // closure's do (rules/async_fn.rs, rules/closure.rs `moved_out`).
+    let copy = fx.tr("Copy", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Copy, copy);
     let future = fx.tr("Future", 1, Vec::new(), &["Output"]);
     fx.lang(LangItem::Future, future);
     let into_future = fx.tr("IntoFuture", 1, Vec::new(), &["Output", "IntoFuture"]);
@@ -357,20 +361,57 @@ fn no_rc(b: &mut Bb) -> ExprId {
     b.block(&[s0], None)
 }
 
-/// "Auto traits": an async block's future is `Send` when every type in its interior is, and an
-/// `Rc` live across an `.await` is in it: `spawn`'s `F: Send` is E0277.
-#[test]
-fn rc_held_across_await_is_not_send() {
-    assert_eq!(spawn_case(|it| it.c_sync, rc_across_await, Capture::Ref), std::vec![DiagCode::Unsatisfied]);
+/// As [`spawn_case`], with the check's own refusal kept: a typed gap is the `Err`.
+fn spawn_outcome(owner: fn(&Items) -> ItemKey, inner: fn(&mut Bb) -> ExprId, capture: Capture) -> Result<Vec<DiagCode>, crate::error::CheckError> {
+    let (fx, it) = world();
+    let mut b = Bb::new();
+    if owner(&it) != it.c_sync {
+        b.param("t");
+    }
+    let e0 = b.path(&["spawn"]);
+    let body = inner(&mut b);
+    let fut = b.async_block(body, capture);
+    let call = b.call(e0, &[fut]);
+    let s = b.semi(call);
+    let root = b.block(&[s], None);
+    let mut cx = crate::infer::InferCtx::new_in(blaze_own::Alloc::global());
+    let needs = crate::world::Needs::new_in(blaze_own::Alloc::global());
+    match crate::check_with(&b.view(owner(&it), root), &fx, &mut cx, &needs, Plant::None, blaze_own::Alloc::global()) {
+        Ok(crate::Outcome::Done(c)) => Ok(c.diags.iter().map(|d| d.code).collect()),
+        Ok(crate::Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
+        Err(e) => Err(e),
+    }
 }
 
-/// The Reference accepts this one (the `Rc` is dropped before the `.await`, so not in the
-/// interior), but the superset interior holds every type the body names: CONSERVATIVELY
-/// REFUSED, owed to the exact interior (rules/coroutine.rs). When liveness lands this
-/// expectation flips to no finding.
+/// Whether `got` is the gap of an auto trait that failed only on the superset interior.
+fn is_interior_gap(got: &Result<Vec<DiagCode>, crate::error::CheckError>) -> bool {
+    matches!(got, Err(crate::error::CheckError::Unported(what)) if *what == crate::rules::async_fn::INTERIOR_GAP)
+}
+
+/// "Auto traits": an async block's future is `Send` when every value its state holds is, and
+/// an `Rc` live across an `.await` is one: the Reference refuses this `spawn`. The checker
+/// cannot tell it from the next case until liveness across `.await` is computed, so it gives
+/// neither answer: the typed gap (rules/async_fn.rs, 2). When liveness lands this expectation
+/// becomes `Ok([DiagCode::Unsatisfied])`.
+///
+/// Expected line: `test suite::coroutine::rc_held_across_await_is_a_gap ... ok`.
 #[test]
-fn rc_dropped_before_await_is_conservatively_refused() {
-    assert_eq!(spawn_case(|it| it.c_sync, rc_before_await, Capture::Ref), std::vec![DiagCode::Unsatisfied]);
+fn rc_held_across_await_is_a_gap() {
+    let got = spawn_outcome(|it| it.c_sync, rc_across_await, Capture::Ref);
+    assert!(is_interior_gap(&got), "{got:?}");
+}
+
+/// The Reference ACCEPTS this one (the `Rc` is dropped before the `.await`, so it is not in
+/// the future's state). The superset interior holds every type the body names, so the goal
+/// fails on it; that failure is not an answer: the typed gap, never E0277 (this test was
+/// `rc_dropped_before_await_is_conservatively_refused` and pinned a false E0277). When
+/// liveness lands this expectation becomes `Ok([])`.
+///
+/// Expected line: `test suite::coroutine::rc_dropped_before_await_is_a_gap_not_e0277 ... ok`.
+#[test]
+fn rc_dropped_before_await_is_a_gap_not_e0277() {
+    let got = spawn_outcome(|it| it.c_sync, rc_before_await, Capture::Ref);
+    assert!(is_interior_gap(&got), "{got:?}");
 }
 
 /// The control for both: with no `Rc`, the interior is `Ready`, `()` and `u8`, all `Send` by
@@ -398,4 +439,90 @@ fn generic_async_block_is_send_by_the_bound() {
 #[test]
 fn generic_async_block_without_the_bound_is_refused() {
     assert_eq!(spawn_case(|it| it.c_gen_unbound, move_t, Capture::Move), std::vec![DiagCode::Unsatisfied]);
+}
+
+/// The capture rows of `fn <owner>(t: T) { <block>; }`, and the block's expression (no
+/// `spawn`: the rows are asked, not the future's `Send`).
+fn capture_rows(owner: fn(&Items) -> ItemKey, inner: fn(&mut Bb) -> ExprId, capture: Capture) -> (ExprId, Vec<(ExprId, PatId, crate::columns::CaptureKind)>) {
+    let (fx, it) = world();
+    let mut b = Bb::new();
+    b.param("t");
+    let body = inner(&mut b);
+    let fut = b.async_block(body, capture);
+    let s = b.semi(fut);
+    let root = b.block(&[s], None);
+    let c = check_body(&fx, &b, owner(&it), root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "{:?}", c.diags);
+    let rows = (0..c.captures.len()).map(|i| (c.captures.column::<0>()[i], c.captures.column::<1>()[i], c.captures.column::<2>()[i])).collect();
+    (fut, rows)
+}
+
+/// `fn c_gen<T: Send>(t: T) { async move { t }; }`. The Reference, "Async blocks",
+/// "Capture modes": "Async blocks capture variables from their environment using the same
+/// capture modes as closures." "`async move { .. }` blocks however will move all referenced
+/// variables into the resulting future." So the record holds one capture row: the block, `t`,
+/// by value: what the code builder makes the future's first field from. Without
+/// `analyze_coroutine_captures` there is no row (the closure walk took only closures).
+///
+/// Expected line: `test suite::coroutine::async_move_block_captures_by_value ... ok`.
+#[test]
+fn async_move_block_captures_by_value() {
+    let (fut, rows) = capture_rows(|it| it.c_gen, move_t, Capture::Move);
+    assert_eq!(rows, std::vec![(fut, PatId(0), crate::columns::CaptureKind::ByValue)]);
+}
+
+/// `{ async move { t }; }`: `t` named only by an inner `async move` block.
+fn inner_move_t(b: &mut Bb) -> ExprId {
+    let e0 = b.local(PatId(0));
+    let e1 = b.block(&[], Some(e0));
+    let e2 = b.async_block(e1, Capture::Move);
+    let s0 = b.semi(e2);
+    b.block(&[s0], None)
+}
+
+/// `fn c_gen<T: Send>(t: T) { async { async move { t }; }; }`: "Capture modes": "when
+/// written `async { .. }` the capture mode for each variable will be inferred from the content
+/// of the block", and the content uses `t` by value (the inner `async move` moves it in), so
+/// the OUTER block captures `t` by value too: `T` is not `Copy`. Two rows: the inner block's
+/// and the outer's, both by value. With the closure walk alone the outer row is `ByRef` (the
+/// walk reads a nested body's names as borrowed), and the built future would move `t` out of
+/// a reference.
+///
+/// Expected line: `test suite::coroutine::outer_block_holds_by_value_what_an_inner_move_takes ... ok`.
+#[test]
+fn outer_block_holds_by_value_what_an_inner_move_takes() {
+    let (outer, rows) = capture_rows(|it| it.c_gen, inner_move_t, Capture::Ref);
+    let by_value = crate::columns::CaptureKind::ByValue;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| r.1 == PatId(0) && r.2 == by_value), "{rows:?}");
+    assert!(rows.iter().any(|r| r.0 == outer), "{rows:?}");
+}
+
+/// `async fn c_async() -> u8 { let x: u16 = ready().await; 0u8 }`, `ready()`'s future having
+/// `Output = u8`. The Reference, "Await expressions": "the value contained in the
+/// `Poll::Ready` variant is used as the result of the await expression itself", so the
+/// `.await` is a `u8` and a `u16` binding of it is refused. The one finding is the unmet goal
+/// `<Ready as IntoFuture>::Output == u16` (`Unsatisfied`, E0271's shape: the annotation
+/// reaches the `.await` as its expected type, and the output is a projection); a body whose
+/// `.await` output is taken as written (no goal on `Output`) has no finding and fails this.
+/// Owed, not checked here: the same refusal worded as E0308 naming `u8` and `u16`.
+///
+/// Expected line: `test suite::coroutine::await_output_mismatch_is_refused ... ok`.
+#[test]
+fn await_output_mismatch_is_refused() {
+    let (fx, it) = world();
+    let mut b = Bb::new();
+    let out = b.ty(PNode::Uint(UintTy::U8));
+    b.async_fn(out);
+    let e0 = b.path(&["ready"]);
+    let e1 = b.call(e0, &[]);
+    let e2 = b.await_(e1);
+    let x = b.bind("x");
+    let u16_ = b.ty(PNode::Uint(UintTy::U16));
+    let s0 = b.let_(x, Some(u16_), e2);
+    let e3 = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let root = b.block(&[s0], Some(e3));
+    let c = check_body(&fx, &b, it.c_async, root, Plant::None, InferPlant::None);
+    let codes: Vec<DiagCode> = c.diags.iter().map(|d| d.code).collect();
+    assert_eq!(codes, std::vec![DiagCode::Unsatisfied], "{:?}", c.diags);
 }

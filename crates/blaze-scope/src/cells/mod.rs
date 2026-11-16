@@ -30,7 +30,7 @@ mod seam;
 mod tests;
 mod write;
 
-pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames};
+pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames, EnumNames};
 pub(crate) use seam::shadow;
 pub use seam::{DIFFER_SHOWN, Differ, Seam, ShadowRefused, Shadowed, Unknown, WrittenAgainst, WrittenDiffer, WrittenWhich};
 
@@ -171,8 +171,7 @@ impl fmt::Display for CellError {
             CellError::DecidedTooEarly { module, ns } => {
                 write!(f, "module {module:?}: an expansion writes a {ns:?} name whose cell was decided not found (a bug in the core)")
             }
-            CellError::AllSpared { module } => write!(f, "module {module:?}: every member of a stalled group is spared by text order"),
-            CellError::Facts { module, error } => write!(f, "module {module:?}: reading its facts: {error}"),
+            CellError::AllSpared { module } => write!(f, "module {module:?}: every member of a stalled group is spared by text order"),            CellError::Facts { module, error } => write!(f, "module {module:?}: reading its facts: {error}"),
             CellError::BadVisibility { module, why } => write!(f, "module {module:?}: a visibility that names no ancestor: {why:?}"),
             CellError::NoFixpoint { module, cells } => {
                 write!(f, "module {module:?}: a glob cycle of {cells} cells has no fixed point within its bound")
@@ -240,6 +239,13 @@ pub struct CellStats {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CellPlant {
     None,
+    /// An enum is no source of names: a path through one stays unknown.
+    EnumIsOutside,
+    /// A glob of an enum is as visible as the glob alone, not narrowed by the enum's binding.
+    EnumGlobNotClamped,
+    /// A macro name a glob brings waits for the module's other calls to expand (as a type or a
+    /// value does), so two calls named through a glob in one module stall and fail.
+    MacroGlobWaits,
     /// R1 broken: a glob binding shadows the module's own entries.
     GlobsShadowExplicit,
     /// R2 broken: the first glob wins over a second bringing another item.
@@ -301,6 +307,23 @@ pub(crate) enum CellPlant {
     /// `use name;` does not read the textual scope of `macro_rules!`: beside a `macro_rules!
     /// name` of the module's text it is unknown (the core's answer until runner 11).
     NoTextualImport,
+    /// `use ::name;` (a crate alone) is unknown (the core's answer until runner 11).
+    CrateAloneUnknown,
+    /// A block's module has no place in the text around its body: its textual scope ends at
+    /// its own text (the core's answer until runner 13: zerocopy's `impl_for_transmute_from`).
+    BlockHasNoPlace,
+    /// The first segment of a call's path (`a::m!`) found through a glob waits for the module's
+    /// other calls (the core's answer until runner 13: icu's `#[derive(yoke::Yokeable,
+    /// zerofrom::ZeroFrom)]` under `use icu_provider::prelude::*;` stalled and failed).
+    CallPrefixGlobWaits,
+    /// A stalled call `a::m!` whose first segment only an outer scope holds fails with the
+    /// stall (the core's answer until runner 14: alloy_primitives' `paste::paste!` in a module
+    /// whose glob cycle waits on that very call).
+    StallFailsOuterPrefixCall,
+    /// A stalled one-segment call whose macro a glob source of its module holds decided fails
+    /// with the stall (the core's answer until runner 14: objc2_core_foundation's
+    /// `cf_objc2_type!` in `generated`, which globs its children and the root, which glob it).
+    StallFailsGlobCall,
 }
 
 type ModId = u32;
@@ -369,6 +392,10 @@ struct Module<'a, N> {
     text: FragId,
     /// Where its `mod` line is: a fragment of its parent and a position there.
     mod_line: Option<(FragId, u32)>,
+    /// A block's module (no `mod` line): where its body is written, as the lowering files it
+    /// (the fragment's owner, the last ordered entry's position before the body). Found, and
+    /// kept in `mod_line`, when the textual scope first goes out of it ([`Cells::line_of`]).
+    block_at: Option<(ItemKey, u32)>,
     /// Its imports read so far: the next one's index.
     uses: u32,
     /// A module of a dependency: each of its cells is decided when made, from the dependency's
@@ -422,6 +449,9 @@ struct Item<'a, N> {
     types_only: bool,
     /// Why its outcome is `Outside`, when it is.
     why: Option<Unfollowed>,
+    /// A path whose last module-like segment is an enum: the visibility the enum was read
+    /// with there, which its glob is narrowed by (a variant is as visible as its enum).
+    clamp: Option<Visibility>,
 }
 
 /// What a module's own view leaves out of its growth (calls not expanded yet).
@@ -494,6 +524,11 @@ pub(crate) struct Cells<'a, N> {
     pub(crate) plant: CellPlant,
     /// The dependencies' decided names; `None`: every path into another crate is unknown.
     deps: Option<&'a dyn DepNames<N>>,
+    /// This crate's enums' variants; `None`: every path through one of them is unknown.
+    pub(crate) enums: Option<&'a dyn EnumNames<N>>,
+    /// The sources of names that are enums ([`Cells::enum_at`]): a glob edge of one is written
+    /// with the enum's own definition kind.
+    enum_mods: ABTreeSet<'a, ModId>,
     /// The crate's edition: what `::name` starts from.
     edition: Edition,
     /// The `#[macro_use]` prelude's crates' root modules, in order (their exported macros).
@@ -509,6 +544,11 @@ pub(crate) struct Cells<'a, N> {
     /// R6's watches for the extern prelude: a use whose first segment took a later outer scope's
     /// binding while the root's calls could still add an extern-prelude name, by name.
     extern_watches: ABTreeMap<'a, N, AVec<'a, (ItemId, Def)>>,
+    /// Every macro call by its key: a block's body written by an expansion is found by it.
+    call_ids: ABTreeMap<'a, ItemKey, ItemId>,
+    /// The glob candidates stalled calls took ([`Cells::glob_call`]): the call, its module's
+    /// `Globs` cell of the macro's name and the definition taken, validated when the run ends.
+    speculated: AVec<'a, (ItemId, CellId, Def)>,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -590,6 +630,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             stats: CellStats::default(),
             plant,
             deps,
+            enums: None,
+            enum_mods: ABTreeSet::new_in(alloc),
             edition: Edition::E2021,
             macro_use: AVec::new_in(alloc),
             dep_roots: AVec::new_in(alloc),
@@ -597,6 +639,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             r8: AVec::new_in(alloc),
             unread: AVec::new_in(alloc),
             extern_watches: ABTreeMap::new_in(alloc),
+            call_ids: ABTreeMap::new_in(alloc),
+            speculated: AVec::new_in(alloc),
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
@@ -659,6 +703,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 growth: 0,
                 text: FragId::MAX,
                 mod_line: None,
+                block_at: None,
                 uses: 0,
                 foreign: false,
                 unread: unread.contains(&k),
@@ -696,9 +741,34 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// the old fill is (`FillEnv::made`). Their imports and calls are queued: the caller runs
     /// again. How many were made.
     pub(crate) fn load_more<F: ScopeFacts<Name = N>>(&mut self, facts: &F, tops: &[ItemKey]) -> Result<usize, CellError> {
+        self.load_more_at(facts, tops, &|_| None)
+    }
+
+    /// [`Cells::load_more`] with each block's place: `place(module)` is where the body whose
+    /// block `module` is was written, as the lowering files it (`BodySrc::place`: the fragment's
+    /// owner, a module's key for its own text or a call's key for its expansion, and the last
+    /// ordered entry's position before the body there). The module's textual scope goes on
+    /// outward from that place (Reference `macro.decl.scope.textual`: "When `macro_rules!` is
+    /// used to define a macro, the macro enters the scope after the definition (note that it
+    /// can still be used recursively, since names are looked up from the invocation site), up
+    /// until its surrounding scope, typically a module, is closed."): a body's block is inside
+    /// that scope. `None`: a module with no text around it (its textual scope is its own).
+    pub(crate) fn load_more_at<F: ScopeFacts<Name = N>>(
+        &mut self,
+        facts: &F,
+        tops: &[ItemKey],
+        place: &dyn Fn(ItemKey) -> Option<(ItemKey, u32)>,
+    ) -> Result<usize, CellError> {
         let made = self.make_modules(facts, tops)?;
         for &m in made.iter() {
             self.read_text(facts, m)?;
+        }
+        // The place is kept as written and found when first read ([`Cells::line_of`]): the
+        // body may be written by an expansion of a call of this same batch, read only later.
+        for &m in made.iter() {
+            if self.plant != CellPlant::BlockHasNoPlace {
+                self.modules[m as usize].block_at = place(self.modules[m as usize].key);
+            }
         }
         Ok(made.len())
     }
@@ -829,7 +899,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 of_enum: false,
                 types_only: false,
                 why: None,
+                clamp: None,
             });
+            self.call_ids.insert(c.call, id);
             let module = &mut self.modules[m as usize];
             module.calls.push(id);
             module.growth += 1;
@@ -885,6 +957,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 of_enum: false,
                 types_only: false,
                 why: None,
+                clamp: None,
             });
             // `use a::b::{self};` binds `b` in the type namespace alone (Reference
             // `items.use.self`: "only the type namespace").
@@ -1111,6 +1184,36 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if self.plant == CellPlant::DepIsOutside || !deps.has_module(key) {
             return None;
         }
+        Some(self.decided_module(key))
+    }
+
+    /// The enum `key` as a source of names (its variants), when its variants are held: this
+    /// crate's by [`EnumNames`], a dependency's by [`DepNames`]. Reference `items.use.restrictions.variant`
+    /// has `use MyEnum::MyVariant;` as the accepted form, and `paths` reads a path's prefix
+    /// through an enum to its variants as through a module to its items.
+    fn enum_at(&mut self, key: ItemKey) -> Option<ModId> {
+        if self.plant == CellPlant::EnumIsOutside {
+            return None;
+        }
+        if let Some(&m) = self.by_key.get(&key) {
+            return Some(m);
+        }
+        let held = if key.crate_prefix() == self.krate.prefix() {
+            self.enums.is_some_and(|e| e.holds(key))
+        } else {
+            self.plant != CellPlant::DepIsOutside && self.deps.is_some_and(|d| d.has_enum(key))
+        };
+        if !held {
+            return None;
+        }
+        let id = self.decided_module(key);
+        self.enum_mods.insert(id);
+        Some(id)
+    }
+
+    /// A source of names whose cells are decided when made (a dependency's module, an enum):
+    /// no text, items or growth here.
+    fn decided_module(&mut self, key: ItemKey) -> ModId {
         let id = self.modules.len() as ModId;
         let alloc = self.alloc;
         self.by_key.insert(key, id);
@@ -1131,11 +1234,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             growth: 0,
             text: FragId::MAX,
             mod_line: None,
+            block_at: None,
             uses: 0,
             foreign: true,
             unread: false,
         });
-        Some(id)
+        id
     }
 
     fn cell(&mut self, m: ModId, ns: Namespace, name: N, layer: Layer) -> CellId {
@@ -1152,16 +1256,21 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.stats.decisions += 1;
             return id;
         }
-        if self.modules[m as usize].foreign
-            && let Some(deps) = self.deps
-        {
-            // Decided already, in the dependency: read, never waited on.
-            let value = deps.name_in(self.modules[m as usize].key, ns, name).value();
+        if self.modules[m as usize].foreign {
+            // Decided already (in the dependency, or an enum's variants): read, never waited
+            // on. A reader gone since the module was made is unknown, never "not there".
+            let of = self.modules[m as usize].key;
+            let answer = if of.crate_prefix() == self.krate.prefix() {
+                self.enums.map(|e| e.variant(of, ns, name))
+            } else {
+                self.stats.dep_reads += 1;
+                self.deps.map(|d| d.name_in(of, ns, name))
+            };
+            let value = answer.map_or(Value::Outside, DepAnswer::value);
             self.cells.push(Cell { module: m, ns, name, layer, value: Some(value), waiters: AVec::new_in(self.alloc), waiting_on: None });
             self.cell_ids.insert(key, id);
             self.stats.cells += 1;
             self.stats.decisions += 1;
-            self.stats.dep_reads += 1;
             return id;
         }
         self.cells.push(Cell { module: m, ns, name, layer, value: None, waiters: AVec::new_in(self.alloc), waiting_on: None });
@@ -1314,7 +1423,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                                 match guess.map(|g| g.items.get(&i)) {
                                     Some(Some(Some(Outcome::Glob(src)))) => {
                                         if let Some(&s) = self.by_key.get(src) {
-                                            edges.push((s, it.vis));
+                                            let vis = match it.clamp {
+                                                Some(c) if self.plant != CellPlant::EnumGlobNotClamped => self.narrower(it.vis, c, m),
+                                                _ => it.vis,
+                                            };
+                                            edges.push((s, vis));
                                         }
                                     }
                                     Some(Some(_)) => {}
@@ -1475,6 +1588,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
             }
         }
+        self.items[i as usize].clamp = None;
         // The first segment the walk reads (`::dep` reads its crate from the extern prelude).
         let mut first = 0;
         let mut cur = match kind {
@@ -1502,10 +1616,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             PathKind::Abs if self.edition == Edition::E2015 => self.root,
             PathKind::Abs => {
                 let len = self.items[i as usize].segments.len();
-                if len < 2 && !glob {
-                    return self.unfollowed(i, Unfollowed::CrateAlone);
-                }
-                let s = self.items[i as usize].segments[0];
+                let Some(&s) = self.items[i as usize].segments.first() else {
+                    return Step::Done(Outcome::Failed(Unresolved::NotFound));
+                };
                 let named = match self.outer.externs.binary_search_by(|e| e.0.cmp(&s)) {
                     Ok(k) => Some(self.outer.externs[k].1),
                     Err(_) => self.outer.added.get(&s).copied(),
@@ -1518,6 +1631,19 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     }
                     return Step::Done(Outcome::Failed(Unresolved::NotFound));
                 };
+                if len < 2 && !glob {
+                    // `use ::name;` / `use ::name as n;`: the crate itself, bound in the type
+                    // namespace at the import's own visibility (Reference
+                    // `paths.qualifiers.global-root.intro`: "Paths starting with `::` are
+                    // considered to be global paths where the segments of the path start being
+                    // resolved from a place which differs based on edition"; from 2018 on "they
+                    // must be followed by the name of a crate"; `names.preludes.extern`: the
+                    // extern prelude's names are the crates themselves).
+                    if self.items[i as usize].call.is_some() || self.plant == CellPlant::CrateAloneUnknown {
+                        return self.unfollowed(i, Unfollowed::CrateAlone);
+                    }
+                    return Step::Done(Outcome::Named([Some((Def::module(named), ivis)), None, None]));
+                }
                 first = 1;
                 match self.module_at(named) {
                     Some(r) => r,
@@ -1553,6 +1679,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     return Step::Done(Outcome::Failed(Unresolved::Private));
                 }
                 Value::Ambiguous(..) => return Step::Done(Outcome::Failed(Unresolved::Ambiguous(AmbiguityKind::GlobVsGlob))),
+                Value::Found(def, vis) if def.kind == DefKind::Enum && self.enum_at(def.key).is_some() => {
+                    // Through an enum whose variants are held: its variants are its names.
+                    if let Some(e) = self.enum_at(def.key) {
+                        cur = e;
+                        self.items[i as usize].clamp = Some(vis);
+                    }
+                }
                 Value::Found(def, _) if def.kind != DefKind::Module => {
                     return Step::Done(if def.kind == DefKind::Enum {
                         // Through an enum: its variants, unread here, are types and values,
@@ -1675,7 +1808,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     // visibility (rustc's `Resolver::import`: `pub use core as core_;` over the
                     // private injected `extern crate core;` is a public re-export, a lint at most).
                     let through = if lexical { m } else { cur };
+                    // Only a fully public `use` (rustc's hack tests `import.vis.is_public()`):
+                    // a narrower one keeps the binding's own visibility.
                     let of_extern = ns == Namespace::Types
+                        && ivis == Visibility::Public
                         && self.plant != CellPlant::ExternReexportNarrowed
                         && self.modules[through as usize].explicit.get(&(ns, leaf)).is_some_and(|e| e.0 == def && e.2 == Origin::ExternCrate);
                     out[ns_at(ns)] = Some((def, if of_extern { ivis } else { self.narrower(ivis, vis, m) }));
@@ -1867,6 +2003,38 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     // `...ambiguity.glob-vs-outer`: the import fails at its first segment.
                     return Step::Done(Value::Ambiguous(d, v));
                 }
+                // Every candidate a macro call's path selects is speculative (the rule quoted
+                // below): its macro name, and the first segment of `a::m!` in the type namespace.
+                let speculative = match ns {
+                    Namespace::Macros => self.plant != CellPlant::MacroGlobWaits,
+                    Namespace::Types | Namespace::Values => self.items[me as usize].call.is_some() && self.plant != CellPlant::CallPrefixGlobWaits,
+                };
+                if let From::Wrote(f) = from
+                    && speculative
+                    && !self.encloses(f, self.items[me as usize].at)
+                {
+                    // The speculation rule in the other order: the expansion's definition came
+                    // first, beside a different candidate of the module's globs, and does not
+                    // enclose this use. The answer is the one every order gives (Reference
+                    // `names.resolution.expansion.expansion-order-stability`): the glob's
+                    // candidate, with the error (`...macros.ambiguity.more-expanded-vs-outer`).
+                    let g = self.cell(m, ns, name, Layer::Globs);
+                    let globbed = match self.current(g, guess) {
+                        Some(v) => v,
+                        None => match self.cell_value(g, guess, Skip::Growth) {
+                            Step::Done(v) => v,
+                            Step::Wait(n) => return Step::Wait(n),
+                        },
+                    };
+                    if let Value::Found(gd, _) | Value::Ambiguous(gd, _) = globbed
+                        && gd != d
+                    {
+                        if guess.is_none() {
+                            self.r6_error(me);
+                        }
+                        return Step::Done(globbed);
+                    }
+                }
                 if let From::Wrote(f) = from
                     && let Some(o) = outer
                     && outer_def.is_some_and(|od| od != d)
@@ -1886,8 +2054,23 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 if from == From::Glob
                     && let Some(j) = self.growing(m, me, guess)
                 {
-                    // A glob candidate may still be shadowed by what a call writes.
-                    return Step::Wait(Node::Item(j));
+                    if !speculative {
+                        // A glob candidate may still be shadowed by what a call writes.
+                        return Step::Wait(Node::Item(j));
+                    }
+                    // In the macro namespace the glob's candidate is selected now (Reference
+                    // `names.resolution.expansion.speculation`: "All name resolution candidates
+                    // selected during macro expansion are considered speculative. Once the
+                    // crate has been fully expanded, all speculative import resolutions are
+                    // validated to ensure that macro expansion did not introduce any new
+                    // ambiguities."): the module's other calls are not waited for (two derives
+                    // of one item named through a glob would wait on each other and fail,
+                    // against `...unresolved-invocations`: "Every macro invocation resolves to
+                    // a valid definition"); a later write of the name by an expansion that
+                    // does not enclose this use is the error, by the watch.
+                    if guess.is_none() {
+                        self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(self.alloc)).push((me, d));
+                    }
                 }
                 Step::Done(inner)
             }
@@ -2013,8 +2196,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     }
                 }
             }
-            let fr = &self.frags[f as usize];
-            match fr.up.or(self.modules[fr.module as usize].mod_line) {
+            let (up, module) = (self.frags[f as usize].up, self.frags[f as usize].module);
+            let out = match up {
+                Some(u) => Some(u),
+                None => match self.line_of(module, guess) {
+                    Step::Done(l) => l,
+                    Step::Wait(n) => return Step::Wait(n),
+                },
+            };
+            match out {
                 Some((p, at)) => {
                     f = p;
                     end = at;
@@ -2022,6 +2212,30 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 None => return Step::Done(None),
             }
         }
+    }
+
+    /// Where module `m`'s own text stands in the text around it: its `mod` line, or, for a
+    /// block's module, the place of its body (every entry at or before the body's place is
+    /// before the block). A body an expansion writes is found once its call has grown: until
+    /// then the read waits on that call. `None`: the root, or a block whose body no fragment
+    /// held here holds (its call did not resolve here): nothing outside is in its scope.
+    fn line_of(&mut self, m: ModId, guess: Option<&Guess<'a>>) -> Step<Option<(FragId, u32)>> {
+        if let Some(l) = self.modules[m as usize].mod_line {
+            return Step::Done(Some(l));
+        }
+        let Some((owner, pos)) = self.modules[m as usize].block_at else { return Step::Done(None) };
+        let frag = match self.by_key.get(&owner) {
+            Some(&o) => Some(self.modules[o as usize].text).filter(|&t| t != FragId::MAX),
+            None => match self.call_ids.get(&owner) {
+                Some(&j) if self.items[j as usize].grown => self.items[j as usize].expansion,
+                Some(&j) if !guess.is_some_and(|g| g.items.contains_key(&j)) => return Step::Wait(Node::Item(j)),
+                _ => None,
+            },
+        };
+        if let Some(f) = frag {
+            self.modules[m as usize].mod_line = Some((f, pos + 1));
+        }
+        Step::Done(frag.map(|f| (f, pos + 1)))
     }
 
     /// Item `i` is decided: its growth ends.
@@ -2053,7 +2267,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 && let Some(&s) = self.by_key.get(&src)
                 && !(self.modules[s as usize].foreign && self.plant == CellPlant::DepGlobEmpty)
             {
-                let vis = self.items[i as usize].vis;
+                // A glob of an enum brings its variants as visible as the enum was read there
+                // (Reference `vis.default`: "Enum variants in a pub enum are also public by
+                // default": a variant is as visible as its enum, never wider).
+                let vis = match self.items[i as usize].clamp {
+                    Some(c) if self.plant != CellPlant::EnumGlobNotClamped => self.narrower(self.items[i as usize].vis, c, m),
+                    _ => self.items[i as usize].vis,
+                };
                 self.modules[m as usize].edges.insert(index, (s, vis));
             }
             if self.modules[m as usize].globs_pending == 0 {
@@ -2132,6 +2352,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 continue;
             }
             if !self.quiet_point()? {
+                self.validate_speculated();
                 return Ok(());
             }
         }
@@ -2539,6 +2760,85 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         Ok(())
     }
 
+    /// A stalled plain call `a::..::m!` (item `i`) that only an outer scope answers: the
+    /// module's own view of `a` under `guess` is absent, an outer scope holds `a` as a module,
+    /// and every later segment is read from a cell decided already (a dependency's are decided
+    /// when made), never from a guess. The outer definition of `a` and the macro named.
+    fn outer_prefix_call(&mut self, i: ItemId, guess: &Guess<'a>) -> Option<(Def, Def)> {
+        let (m, len) = (self.items[i as usize].module, self.items[i as usize].segments.len());
+        let first = *self.items[i as usize].segments.first()?;
+        match self.own_view(m, Namespace::Types, first, i, Skip::Growth, Some(guess)) {
+            Step::Done((Value::NotFound, _)) => {}
+            Step::Done(_) | Step::Wait(_) => return None,
+        }
+        let Step::Done(Some(Value::Found(od, _))) = self.outer_of(Namespace::Types, first, Some(guess)) else { return None };
+        if od.kind != DefKind::Module {
+            return None;
+        }
+        let mut cur = self.module_at(od.key)?;
+        for k in 1..len {
+            let s = self.items[i as usize].segments[k];
+            let leaf = k + 1 == len;
+            let c = self.cell(cur, if leaf { Namespace::Macros } else { Namespace::Types }, s, Layer::Full);
+            let Some(Value::Found(d, vis)) = self.cells[c as usize].value else { return None };
+            if !self.visible(vis, m) {
+                return None;
+            }
+            if leaf {
+                return Some((od, d));
+            }
+            if d.kind != DefKind::Module {
+                return None;
+            }
+            cur = self.module_at(d.key)?;
+        }
+        None
+    }
+
+    /// A stalled one-segment call `name!` (item `i` of `m`) that the module's globs answer: no
+    /// textual candidate is open (its textual read waits on no call), the module's own view
+    /// under `guess` is `def` through its globs, and one of the module's glob sources holds
+    /// `def` decided already (a dependency's module is decided when made), never by the guess
+    /// alone. The module's `Globs` cell of the name, validated when the run ends.
+    fn glob_call(&mut self, i: ItemId, m: ModId, name: N, def: Def, guess: &Guess<'a>) -> Option<CellId> {
+        let at = self.items[i as usize].call?;
+        if !matches!(self.textual(at.frag, at.pos, name, None), Step::Done(None)) {
+            return None;
+        }
+        match self.own_view(m, Namespace::Macros, name, i, Skip::Growth, Some(guess)) {
+            Step::Done((Value::Found(d, _), From::Glob)) if d == def => {}
+            Step::Done(_) | Step::Wait(_) => return None,
+        }
+        let mut sources: AVec<'a, ModId> = AVec::new_in(self.alloc);
+        sources.extend(self.modules[m as usize].edges.iter().map(|e| e.1.0));
+        for &src in sources.iter() {
+            let c = self.cell(src, Namespace::Macros, name, Layer::Full);
+            if let Some(Value::Found(d, vis)) = self.cells[c as usize].value
+                && d == def
+                && self.visible(vis, m)
+            {
+                return Some(self.cell(m, Namespace::Macros, name, Layer::Globs));
+            }
+        }
+        None
+    }
+
+    /// Reference `names.resolution.expansion.speculation`: "Once the crate has been fully
+    /// expanded, all speculative import resolutions are validated to ensure that macro
+    /// expansion did not introduce any new ambiguities." Each glob candidate a stalled call
+    /// took is read again: another definition, an ambiguity or none is the error at the call.
+    fn validate_speculated(&mut self) {
+        for k in 0..self.speculated.len() {
+            let (i, g, def) = self.speculated[k];
+            match self.cells[g as usize].value {
+                Some(Value::Found(d, _)) if d == def => {}
+                // Unknown here, or not decided: no other answer is shown.
+                Some(Value::Outside) | None => {}
+                Some(Value::Found(..) | Value::Ambiguous(..) | Value::NotFound) => self.r6_error(i),
+            }
+        }
+    }
+
     /// R5 over a sink holding a macro call, its least fixed point `guess` computed with the
     /// group's calls adding nothing. Imports the guess resolves are decided first, alone (what
     /// they bring may answer the rest); else the stall: every call fails as not found (none is
@@ -2576,6 +2876,28 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             // R6's watch: a later write of `name` into `m` by an expansion that
                             // does not enclose the call is the error.
                             self.watches.entry((m, Namespace::Macros, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def));
+                        } else if self.plant != CellPlant::StallFailsGlobCall
+                            && let Some(g) = self.glob_call(i, m, name, def, guess)
+                        {
+                            // The macro namespace's glob candidate, decided in one of the
+                            // module's glob sources already, is selected now (Reference
+                            // `names.resolution.expansion.speculation`); a later write into `m`
+                            // is the watch's error, another answer of the globs the validation's.
+                            picked.push((i, Outcome::Called(def)));
+                            self.watches.entry((m, Namespace::Macros, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def));
+                            self.speculated.push((i, g, def));
+                        }
+                    } else if it.kind == PathKind::Plain && it.segments.len() >= 2 && self.plant != CellPlant::StallFailsOuterPrefixCall {
+                        // The same rule one segment earlier: `a::m!` whose `a` the stalled
+                        // module's own view lacks goes outward for `a` (the extern prelude's
+                        // crate), and the rest of the path is read from decided cells alone.
+                        let (m, first) = (it.module, it.segments[0]);
+                        if let Some((od, d)) = self.outer_prefix_call(i, guess)
+                            && d == def
+                        {
+                            picked.push((i, Outcome::Called(def)));
+                            // R6's watch on the first segment, in the type namespace.
+                            self.watches.entry((m, Namespace::Types, first)).or_insert_with(|| AVec::new_in(alloc)).push((i, od));
                         }
                     }
                 }
@@ -2619,6 +2941,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 self.stats.stalls += 1;
                 self.stats.spared += spared.len() as u64;
                 for &j in blocking.iter() {
+                    // TEMP-R14
+                    std::eprintln!("TEMP-R14 blocking fails call {:?} {:?} in {:x} guess {:?} waits {:?}", self.items[j as usize].kind, &self.items[j as usize].segments[..], self.modules[self.items[j as usize].module as usize].key, guess.items.get(&j), &self.items[j as usize].waits[..]);
                     self.stats.stalled_items += 1;
                     self.settle(j, Outcome::Failed(Unresolved::NotFound));
                 }
@@ -2647,6 +2971,30 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let Node::Item(i) = n else { continue };
             if spared.contains(&i) {
                 continue;
+            }
+            // TEMP-R14
+            if self.items[i as usize].call.is_some() {
+                std::eprintln!("TEMP-R14 stall fails call {:?} {:?} in {:x} guess {:?} members {}", self.items[i as usize].kind, &self.items[i as usize].segments[..], self.modules[self.items[i as usize].module as usize].key, guess.items.get(&i), members.len());
+                for &w in self.items[i as usize].waits.iter() {
+                    match w {
+                        Node::Cell(c) => {
+                            let ce = &self.cells[c as usize];
+                            std::eprintln!("TEMP-R14   waits cell {:x} {:?} {:?} {:?} on {:?}", self.modules[ce.module as usize].key, ce.ns, ce.name, ce.layer, ce.waiting_on);
+                        }
+                        Node::Item(j) => std::eprintln!("TEMP-R14   waits item {:?} {:?} call {}", self.items[j as usize].kind, &self.items[j as usize].segments[..], self.items[j as usize].call.is_some()),
+                    }
+                }
+                if members.len() < 40 {
+                    for &mn in members {
+                        match mn {
+                            Node::Cell(c) => {
+                                let ce = &self.cells[c as usize];
+                                std::eprintln!("TEMP-R14   member cell {:x} {:?} {:?} {:?} on {:?} guess {:?}", self.modules[ce.module as usize].key, ce.ns, ce.name, ce.layer, ce.waiting_on, guess.cells.get(&c));
+                            }
+                            Node::Item(j) => std::eprintln!("TEMP-R14   member item {j} {:?} {:?} call {} guess {:?}", self.items[j as usize].kind, &self.items[j as usize].segments[..], self.items[j as usize].call.is_some(), guess.items.get(&j)),
+                        }
+                    }
+                }
             }
             let o = if self.items[i as usize].call.is_some() {
                 Outcome::Failed(Unresolved::NotFound)

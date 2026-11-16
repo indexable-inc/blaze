@@ -49,7 +49,7 @@ pub(crate) enum Fragment {
 }
 
 impl Fragment {
-    fn is_empty(self) -> bool {
+    pub(super) fn is_empty(self) -> bool {
         match self {
             Fragment::Empty => true,
             Fragment::Tokens { toks, .. }
@@ -126,6 +126,31 @@ impl<'f> Bindings<'f> {
             }
             _ => 1,
         }
+    }
+}
+
+impl super::linear::Values for Bindings<'_> {
+    type Node = Binding;
+
+    fn root(&self, binder: u32) -> Option<Binding> {
+        Bindings::root(self, binder)
+    }
+
+    fn kind(&self, node: Binding) -> super::linear::NodeKind {
+        use super::linear::NodeKind;
+        match node {
+            Binding::Empty => NodeKind::Empty,
+            Binding::Fragment(fragment) => NodeKind::Fragment(self.fragments[fragment as usize]),
+            Binding::Missing(kind) => NodeKind::Missing(kind),
+            Binding::Nested { len, .. } => NodeKind::Nested(len),
+        }
+    }
+
+    fn child(&self, node: Binding, idx: u32) -> Binding {
+        let Binding::Nested { start, .. } = node else {
+            unreachable!("an iteration is asked of a nested node")
+        };
+        Bindings::child(self, start, idx)
     }
 }
 
@@ -849,7 +874,7 @@ fn remaining(view: &View<'_, '_>, src: Level) -> usize {
 }
 
 /// Takes a fragment of `kind` at `src`: its value and the first error.
-fn match_meta_var<'f>(
+pub(super) fn match_meta_var<'f>(
     engine: &mut Engine<'_, '_, 'f>,
     view: &mut View<'_, 'f>,
     kind: Frag,
@@ -985,7 +1010,7 @@ fn expect_lifetime(view: &View<'_, '_>, src: &mut Level) -> Option<u32> {
 }
 
 /// One token tree: a lifetime, glued punctuation, or any other tree.
-fn expect_tt(view: &View<'_, '_>, src: &mut Level) -> bool {
+pub(super) fn expect_tt(view: &View<'_, '_>, src: &mut Level) -> bool {
     if src.is_empty() {
         return false;
     }
@@ -1012,7 +1037,7 @@ fn eat_char(view: &View<'_, '_>, src: &mut Level, c: char) -> bool {
 }
 
 /// Whether `src` starts with the separator: where the input goes on after it.
-fn expect_separator(view: &View<'_, '_>, def: super::Def<'_>, src: Level, sep: Sep) -> Option<u32> {
+pub(super) fn expect_separator(view: &View<'_, '_>, def: super::Def<'_>, src: Level, sep: Sep) -> Option<u32> {
     let mut fork = src;
     let ok = match sep {
         Sep::Ident(lhs) => {

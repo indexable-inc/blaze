@@ -41,7 +41,7 @@ pub fn chain_at(outline: &Outline<'_>, at: ItemIndex, text: &str) -> ContentId {
     chain_from(outline, Some(outline.item(at)), text)
 }
 
-fn chain_from(outline: &Outline<'_>, mut at: Option<&Item>, text: &str) -> ContentId {
+fn chain_from<'o>(outline: &'o Outline<'_>, mut at: Option<&'o Item>, text: &str) -> ContentId {
     let mut h = Hasher::new(CHAIN_DOMAIN);
     while let Some(entry) = at {
         let name = entry.name.map_or("", |range| entry.text(text, range));

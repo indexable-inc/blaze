@@ -1,5 +1,5 @@
 //! The form of a `CrateScope` record's payload (drive.md, "End state", piece 3, NAMES AND ITEMS
-//! FILED): one head, then four sections, each found by its place in the head.
+//! FILED): one head, then five sections, each found by its place in the head.
 //!
 //! - `exports`: the exports record, what a dependent reads and keys on (the task's out is its
 //!   digest alone);
@@ -7,28 +7,36 @@
 //! - `names`: the names record ([`blaze_scope::names_record::encode`]), read through
 //!   `RecordNames`: a path in the crate answered without solving it;
 //! - `items`: the items record ([`blaze_scope::items_record::encode`]), read through
-//!   `RecordItems`: an item's row (kind, module, text place) without its crate's tables.
+//!   `RecordItems`: an item's row (kind, module, text place) without its crate's tables;
+//! - `tests`: a test unit's tests record ([`blaze_scope::tests_record::encode`], test.md "The
+//!   tests record", piece 6), read through `TestsRecord::open`: one row per `#[test]` or
+//!   `#[bench]` function, from attributes alone. EMPTY for a unit without `test` in its cfg
+//!   (`NotATestUnit`): a plain library or binary has no tests record.
 //!
 //! The head, [`HEAD`] bytes, little-endian: [`MAGIC`] (4), [`FORM`] (u32), the crate's
 //! unresolved count (u32), 4 zero bytes, then per section in the order above its place (u64)
 //! and its length (u64). Each section starts at the end of the one before (the head for the
 //! first) rounded up to 16, so a reader may map it 16-aligned; the padding is zero; the payload
-//! ends where the items end. [`sections`] checks all of it and copies nothing.
+//! ends where the tests end (an empty tests section ends at its place). [`sections`] checks all
+//! of it and copies nothing.
 //!
-//! An older form (the 16-byte head of exports then inner, before 2026-11-16) is a record under
-//! another name: names.rs's subject and source domains moved with this form, so an old home's
-//! records are never found and are made again; one read anyway is [`SectionsError::Form`].
+//! Older forms (the 16-byte head of exports then inner, before 2026-11-16; form 2, four
+//! sections without the tests) are records under other names: names.rs's subject and source
+//! domains moved with each form, so an old home's records are never found and are made again;
+//! one read anyway is [`SectionsError::Form`].
 
 use super::Global;
 
 /// The payload's first bytes.
 pub(crate) const MAGIC: [u8; 4] = *b"BZCS";
 /// This form's number. Bump it, and names.rs's domains, at any change of the layout.
-pub(crate) const FORM: u32 = 2;
-/// Where the four (place, length) pairs start.
+pub(crate) const FORM: u32 = 3;
+/// How many sections a payload of this form holds.
+const SECTIONS: usize = 5;
+/// Where the five (place, length) pairs start.
 const PLACES: usize = 16;
-/// The head's length: the fixed words, then four pairs of u64.
-pub(crate) const HEAD: usize = PLACES + 4 * 16;
+/// The head's length: the fixed words, then five pairs of u64.
+pub(crate) const HEAD: usize = PLACES + SECTIONS * 16;
 /// What each section's place is rounded up to.
 const ALIGN: usize = 16;
 
@@ -39,10 +47,11 @@ pub(crate) enum Section {
     Inner,
     Names,
     Items,
+    Tests,
 }
 
 impl Section {
-    pub(crate) const ALL: [Section; 4] = [Section::Exports, Section::Inner, Section::Names, Section::Items];
+    pub(crate) const ALL: [Section; SECTIONS] = [Section::Exports, Section::Inner, Section::Names, Section::Items, Section::Tests];
 
     fn says(self) -> &'static str {
         match self {
@@ -50,18 +59,21 @@ impl Section {
             Section::Inner => "the inner record",
             Section::Names => "the names record",
             Section::Items => "the items record",
+            Section::Tests => "the tests record",
         }
     }
 }
 
-/// The four parts of a `CrateScope` payload, slices of the bytes given (no copy).
+/// The five parts of a `CrateScope` payload, slices of the bytes given (no copy).
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "the command reads `exports` today; the names and items sections' readers are drive.md's pieces 5 and 9"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "the command reads `exports` today; the names and items sections' readers are drive.md's pieces 5 and 9, the tests section's is test_loop.rs's driver"))]
 pub(crate) struct Sections<'p> {
     pub exports: &'p [u8],
     pub inner: &'p [u8],
     pub names: &'p [u8],
     pub items: &'p [u8],
+    /// The unit's tests record; empty when the unit is not compiled with `test`.
+    pub tests: &'p [u8],
     /// The crate's unresolved paths, counted when it was made.
     pub unresolved: u32,
 }
@@ -77,7 +89,7 @@ pub(crate) enum SectionsError {
     Misplaced { section: Section, at: u64, want: u64 },
     /// A section runs past the payload's end: the payload was cut short.
     Short { section: Section, end: u64, len: usize },
-    /// Bytes after the items record.
+    /// Bytes after the tests record (the last section).
     Trailing { end: u64, len: usize },
 }
 
@@ -95,7 +107,7 @@ impl core::fmt::Display for SectionsError {
                 write!(f, "a `CrateScope` payload of {len} bytes is cut short: {} ends at byte {end} (rule: names.rs)", section.says())
             }
             SectionsError::Trailing { end, len } => {
-                write!(f, "a `CrateScope` payload of {len} bytes goes on past its items record's end at byte {end} (rule: names.rs)")
+                write!(f, "a `CrateScope` payload of {len} bytes goes on past its tests record's end at byte {end} (rule: names.rs)")
             }
         }
     }
@@ -108,10 +120,10 @@ fn word(head: &[u8; HEAD], at: usize) -> u64 {
 }
 
 /// The payload of a crate's `CrateScope` record: the head, then `parts` (exports, inner, names,
-/// items) each at a 16-aligned place. A function of its arguments only: the same crate gives
-/// the same bytes on any machine.
-pub(crate) fn write(unresolved: u32, parts: [&[u8]; 4]) -> blaze_own::Vec<u8, Global> {
-    let mut places = [(0usize, 0usize); 4];
+/// items, tests) each at a 16-aligned place. A function of its arguments only: the same crate
+/// gives the same bytes on any machine.
+pub(crate) fn write(unresolved: u32, parts: [&[u8]; SECTIONS]) -> blaze_own::Vec<u8, Global> {
+    let mut places = [(0usize, 0usize); SECTIONS];
     let mut end = HEAD;
     for (place, part) in places.iter_mut().zip(parts) {
         let at = end.next_multiple_of(ALIGN);
@@ -150,7 +162,7 @@ pub(crate) fn sections(payload: &[u8]) -> Result<Sections<'_>, SectionsError> {
     }
     words.copy_from_slice(&head[8..12]);
     let unresolved = u32::from_le_bytes(words);
-    let mut parts: [&[u8]; 4] = [&[]; 4];
+    let mut parts: [&[u8]; SECTIONS] = [&[]; SECTIONS];
     let mut end = HEAD as u64;
     for (i, section) in Section::ALL.into_iter().enumerate() {
         let at = word(head, PLACES + 16 * i);
@@ -170,8 +182,8 @@ pub(crate) fn sections(payload: &[u8]) -> Result<Sections<'_>, SectionsError> {
     if end != payload.len() as u64 {
         return Err(SectionsError::Trailing { end, len: payload.len() });
     }
-    let [exports, inner, names, items] = parts;
-    Ok(Sections { exports, inner, names, items, unresolved })
+    let [exports, inner, names, items, tests] = parts;
+    Ok(Sections { exports, inner, names, items, tests, unresolved })
 }
 
 /// Tests: the one crate whose dependency payload, as a dependent read it from the store, is
@@ -185,6 +197,22 @@ pub(crate) static WATCHED: blaze_core::lock::Lock<Watched> =
 pub(crate) struct Watched {
     pub krate: &'static str,
     pub payload: blaze_own::Vec<u8, Global>,
+}
+
+/// Tests: the first payload WRITTEN with a non-empty tests section, kept for the test to look at
+/// ([`watch_tests`]). A test unit is no dependency of anything, so [`WATCHED`] never sees it.
+#[cfg(test)]
+pub(crate) static WATCHED_TESTS: blaze_core::lock::Lock<Watched> =
+    blaze_core::lock::Lock::new("names.watched_tests (tests)", Watched { krate: "", payload: blaze_own::Vec::new_in(Global) });
+
+/// A payload as the names step wrote it: kept when its crate is the one watched and its tests
+/// section is not empty (the crate's test unit, not its plain library).
+#[cfg(test)]
+pub(crate) fn watch_tests(krate: &str, payload: &[u8], tests: &[u8]) {
+    let mut watched = WATCHED_TESTS.lock();
+    if !watched.krate.is_empty() && watched.krate == krate && !tests.is_empty() && watched.payload.is_empty() {
+        watched.payload.extend_from_slice(payload);
+    }
 }
 
 /// A dependency's payload as read from the store: kept when its crate is the one watched.

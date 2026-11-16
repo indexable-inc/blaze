@@ -169,6 +169,7 @@ fn main() {
             "--record" => baseline = args.next().map(|it| (PathBuf::from(it), Baseline::Record)),
             "--check" => baseline = args.next().map(|it| (PathBuf::from(it), Baseline::Check)),
             "--only" => only = true,
+            "--oracle" => blaze_expand::rules_oracle(true),
             _ => library = Some(PathBuf::from(arg)),
         }
     }
@@ -434,4 +435,14 @@ fn main() {
         floor_rate / rate,
         bytes / floor_bytes
     );
+    // `--oracle`: both matchers on every arm tried; a difference fails the run.
+    let [equal, different, exact, failed, calls] = blaze_expand::rules_oracle_counts();
+    if calls > 0 {
+        println!(
+            "rules oracle: {calls} calls: {equal} arms equal, {different} different; {exact} arms left to the exact mode; {failed} calls no arm matched"
+        );
+        if different > 0 {
+            std::process::exit(1);
+        }
+    }
 }

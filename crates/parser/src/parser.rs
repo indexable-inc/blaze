@@ -175,6 +175,12 @@ impl<'t, S: Sink> Parser<'t, S> {
         self.outline = outline;
     }
 
+    /// Whether the sink has all it reads of this parse ([`Sink::satisfied`]).
+    #[inline]
+    pub(crate) fn satisfied(&self) -> bool {
+        self.sink.satisfied()
+    }
+
     /// Returns the kind of the current token.
     /// If parser has already reached the end of input,
     /// the special `EOF` kind is returned.

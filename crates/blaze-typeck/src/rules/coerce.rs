@@ -157,8 +157,13 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             }
             (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
             (_, TyView::Dynamic(_)) => {
-                // Equal pointees are no unsizing: the reborrow arms take them.
-                if self.probe(|m| m.unify_some(pointee_a, pointee_b))?.is_some() {
+                // Equal pointees are no unsizing: the reborrow arms take them. An opaque type is
+                // never the object type (a caller knows only its bounds: the Reference, "Abstract
+                // return types"), and must not be asked: unification with an alias is lazy (the
+                // pair is deferred and "succeeds"), which made `&mut impl Tr` to `&mut dyn Tr`
+                // a plain reborrow whose deferred `impl Tr == dyn Tr` then failed.
+                let opaque_source = matches!(self.view(pointee_a), TyView::Opaque(..));
+                if !opaque_source && self.probe(|m| m.unify_some(pointee_a, pointee_b))?.is_some() {
                     return Ok(None);
                 }
                 // No `Unsize` in the world: the coercion is undecidable, so the finding naming

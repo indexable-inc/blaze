@@ -167,6 +167,9 @@ pub enum Exit<'e> {
     Refused,
     /// The driver killed it, as a [`Effect::Kill`] asked.
     Killed,
+    /// The process exited by itself with this code and without a whole report on descriptor
+    /// 3 (the test called `exit`, or its report was torn): what it did is unknown, so it failed.
+    NoReport { code: i32 },
 }
 
 /// One run, ended.
@@ -190,6 +193,8 @@ pub enum Failure {
     Refused,
     /// Past its deadline: killed this long after its start.
     TimedOut { after: Nanos },
+    /// It exited with this code and no whole report ([`Exit::NoReport`]).
+    NoReport { code: i32 },
 }
 
 /// A test's outcome in this request.
@@ -430,8 +435,9 @@ impl<'a, 'r> Plan<'a, 'r> {
         Ok(())
     }
 
-    /// Whether the filter, `--skip` and the ignore mode let `one` through.
-    fn lets_through(&self, one: &Asked<'_>) -> bool {
+    /// Whether the filter, `--skip` and the ignore mode let `one` through: the one home of the
+    /// filter, read by `decide` and by `blaze test --list`.
+    pub fn lets_through(&self, one: &Asked<'_>) -> bool {
         let named = match self.config.filter {
             Filter::All => true,
             Filter::Substring(text) => one.path.contains(text),
@@ -511,6 +517,21 @@ impl<'a, 'r> Plan<'a, 'r> {
         Ok(())
     }
 
+    /// A run the machine started ([`Effect::Start`]) that the driver could not start at all (no
+    /// code for the test's body yet, no runner on this host). Nothing ran, so nothing is judged,
+    /// reported or filed here: the caller reports it as not run, and it is never a pass. Its slot
+    /// is freed and the next queued run starts.
+    pub fn not_run(&mut self, test: TestId, now: Nanos, out: &mut AVec<'_, Effect>) -> Result<(), PlanError> {
+        let Some(at) = self.row_of(test) else { return Err(PlanError::NotRunning { test }) };
+        if !matches!(self.rows[at].state, State::Running { .. } | State::Killing { .. }) {
+            return Err(PlanError::NotRunning { test });
+        }
+        self.rows[at].state = State::Done;
+        self.running -= 1;
+        self.pump(now, out);
+        Ok(())
+    }
+
     /// The driver's clock reached `now`: every run past its deadline is killed, in row order.
     pub fn tick(&mut self, now: Nanos, out: &mut AVec<'_, Effect>) {
         if self.plant == Plant::NoDeadline {
@@ -564,6 +585,7 @@ pub fn judge(should_panic: ShouldPanic<'_>, exit: Exit<'_>) -> Result<(), Failur
         (_, Exit::Signal { number }) => Err(Failure::Signal { number }),
         (_, Exit::Refused) => Err(Failure::Refused),
         (_, Exit::Killed) => Err(Failure::TimedOut { after: Nanos(0) }),
+        (_, Exit::NoReport { code }) => Err(Failure::NoReport { code }),
     }
 }
 

@@ -29,7 +29,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use blaze_expand::TextKey;
-use blaze_expand::kept::{KeptEntry, KeptError, KeptSet, write_set};
+use blaze_expand::kept::{KeptError, KeptSet, SetEntry, SetSource, write_set};
 use blaze_own::{AVec, Alloc};
 
 /// One of this solve's expansions: found in the earlier set (its index there), or made now
@@ -92,9 +92,12 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
     /// A solve that keeps its expansions, with the crate's `earlier` set when one was kept
     /// (aligned to [`blaze_expand::kept::ALIGN`] bytes; its table is checked here, once).
     pub fn open(earlier: Option<&'k [u8]>, alloc: Alloc<'a>) -> Result<KeptExpansions<'k, 'a>, KeptError> {
-        let earlier = match earlier {
-            Some(bytes) => Some(KeptSet::open(bytes)?),
-            None => None,
+        // A set of an earlier layout is detected by its magic and rebuilt by this solve (an old
+        // home after an upgrade), never read as this one.
+        let earlier = match earlier.map(KeptSet::open) {
+            Some(Ok(set)) => Some(set),
+            Some(Err(KeptError::OldForm)) | None => None,
+            Some(Err(error)) => return Err(error),
         };
         Ok(KeptExpansions { keeps: true, earlier, ..KeptExpansions::none(alloc) })
     }
@@ -131,10 +134,10 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
     }
 
     /// The earlier solve's entry under `key`, opened, with its index for [`Self::found`].
-    pub(crate) fn find(&self, key: &TextKey) -> Result<Option<(usize, KeptEntry<'k>)>, KeptError> {
+    pub(crate) fn find(&self, key: &TextKey) -> Result<Option<(usize, SetEntry<'k>)>, KeptError> {
         let Some(set) = self.earlier else { return Ok(None) };
         match set.position(key) {
-            Some(index) => Ok(Some((index, KeptEntry::open(set.entry(index))?))),
+            Some(index) => Ok(Some((index, set.entry(index)?))),
             None => Ok(None),
         }
     }
@@ -170,15 +173,15 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
             Ok(list) => list,
             Err(_) => panic!("a fill thread panicked holding the kept expansions lock"),
         };
-        let mut entries: AVec<'b, (TextKey, &[u8])> = AVec::with_capacity_in(list.len(), alloc);
+        let mut entries: AVec<'b, (TextKey, SetSource<'_>)> = AVec::with_capacity_in(list.len(), alloc);
         for &(key, now) in list.iter() {
-            let bytes = match (now, self.earlier) {
-                (Now::Made(bytes), _) => bytes,
-                (Now::Found(index), Some(set)) => set.entry(index),
+            let source = match (now, self.earlier) {
+                (Now::Made(bytes), _) => SetSource::Entry(bytes),
+                (Now::Found(index), Some(set)) => SetSource::Kept(set.entry(index)?),
                 // `found` is told only an index `find` gave, of the earlier set.
                 (Now::Found(index), None) => panic!("a kept expansion found at index {index} of no earlier set"),
             };
-            entries.push((key, bytes));
+            entries.push((key, source));
         }
         write_set(&mut entries, alloc)
     }

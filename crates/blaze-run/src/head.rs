@@ -509,17 +509,19 @@ fn count(n: usize, what: &'static str) -> Result<u32, HeadError> {
     u32::try_from(n).map_err(|_| HeadError::TooMany { what, count: n })
 }
 
-fn word(bytes: &[u8], at: usize) -> [u8; 32] {
+// `word`, `le32` and `le64` are the crate's readers of fixed-width little-endian fields (wire.rs
+// reads with them too); each takes a range its caller checked.
+pub(crate) fn word(bytes: &[u8], at: usize) -> [u8; 32] {
     let mut out = [0; 32];
     out.copy_from_slice(&bytes[at..at + 32]);
     out
 }
 
-fn le32(bytes: &[u8], at: usize) -> u32 {
+pub(crate) fn le32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
-fn le64(bytes: &[u8], at: usize) -> u64 {
+pub(crate) fn le64(bytes: &[u8], at: usize) -> u64 {
     let mut out = [0; 8];
     out.copy_from_slice(&bytes[at..at + 8]);
     u64::from_le_bytes(out)

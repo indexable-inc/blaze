@@ -49,10 +49,10 @@ const CHILD: u8 = 1;
 
 /// The inputs hashed in one call at most: enough that the lanes left idle at the end of a call
 /// (a lane waits for no other, `blaze_blake3::many`) are few beside the steps of the call.
-const BATCH: usize = 64;
+pub(crate) const BATCH: usize = 64;
 
 /// The message bytes one call copies at most: they stay in the second-level cache.
-const BATCH_BYTES: usize = 32 * 1024;
+pub(crate) const BATCH_BYTES: usize = 32 * 1024;
 
 /// The longest entry whose message is copied to be hashed side by side: a chunk, BLAKE3's unit
 /// of one compression chain. A longer one is hashed alone either way.
@@ -165,7 +165,7 @@ pub(crate) fn digest<C: Compress>(text: &str, edition: u8, out: &mut Outline<'_>
     sibling_keys::<C>(text, out, bytes, siblings);
     entry_digests::<C>(text.as_bytes(), edition, &mut out.items, bytes);
     // Last: an entry's names digest may take its `hash` or `signature_hash`.
-    crate::names_digest::names_digests(text, edition, &out.items, &out.attrs, &mut out.names);
+    crate::names_digest::names_digests::<C>(text, edition, &out.items, &out.attrs, &mut out.names, bytes);
 }
 
 /// What [`digest`] works in and no outline keeps: the counts of the sibling keys seen, and the
@@ -341,8 +341,27 @@ impl Batch {
 
 /// Where an entry's message goes: bytes `put` in order. A message is copied for a side by
 /// side hash, or streamed through one hasher.
-trait Sink {
+pub(crate) trait Sink {
     fn put(&mut self, bytes: &[u8]);
+
+    /// A length-prefixed part: the bytes `blaze_ids::Hasher::part` hashes.
+    fn part(&mut self, bytes: &[u8]) -> &mut Self
+    where
+        Self: Sized,
+    {
+        self.put(&(bytes.len() as u64).to_le_bytes());
+        self.put(bytes);
+        self
+    }
+
+    /// A digest's 32 bytes: the bytes `blaze_ids::Hasher::id` hashes.
+    fn id(&mut self, id: &ContentId) -> &mut Self
+    where
+        Self: Sized,
+    {
+        self.put(&id.0);
+        self
+    }
 }
 
 impl Sink for AVec<'_, u8> {

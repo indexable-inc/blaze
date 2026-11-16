@@ -2754,6 +2754,13 @@ fn connect_socket(table: &Rc<Table>, domain: libc::c_int) -> io::Result<Fixed> {
     table.install(fd)
 }
 
+impl Uring {
+    /// [`Driver::now`]'s clock as a value read with no `&self` (`Kqueue::clock`'s doc).
+    pub fn clock(&self) -> crate::wait::Monotonic {
+        crate::wait::Monotonic::since(self.start)
+    }
+}
+
 impl Driver for Uring {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         // The one now of every timer in this submit: each one's `after` counts from when it was

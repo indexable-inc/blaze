@@ -109,6 +109,8 @@ mod hosted;
 mod inflight;
 mod kv;
 mod local;
+mod looks;
+mod read_sized;
 mod missing;
 #[cfg(feature = "image")]
 mod image;
@@ -133,6 +135,7 @@ mod simtest;
 mod swap;
 mod syncs;
 mod unfinished;
+mod walk;
 mod world;
 
 use std::{fmt, time::Duration};

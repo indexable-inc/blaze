@@ -171,14 +171,18 @@ use blaze_lir::{Op, View};
 mod enc;
 mod pass;
 mod record;
+mod record_check;
 
 pub use record::{Named, Names, Outside, RecordEmitError, emit_record};
+pub use record_check::{AddressWord, emit_record_measured, no_address_word};
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod record_tests;
+#[cfg(test)]
+mod unwind_tests;
 
 #[cfg(test)]
 mod reloc_tests;
@@ -277,6 +281,9 @@ pub enum Routine {
     Fixsfti,
     /// `__fixunssfti(f32) -> u128`.
     Fixunssfti,
+    /// `_Unwind_Resume(exception)`: a landing block's `resume` (pass/unwind.rs); it does not
+    /// return. macOS: libSystem (its libunwind); Linux: libgcc_s.
+    UnwindResume,
 }
 
 impl Routine {
@@ -302,6 +309,7 @@ impl Routine {
             Routine::Fixunsdfti => "__fixunsdfti",
             Routine::Fixsfti => "__fixsfti",
             Routine::Fixunssfti => "__fixunssfti",
+            Routine::UnwindResume => "_Unwind_Resume",
         }
     }
 }

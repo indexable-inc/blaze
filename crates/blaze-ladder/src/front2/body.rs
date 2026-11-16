@@ -135,6 +135,13 @@ struct ModuleValues<'n, 's, S> {
     store: &'s mut Store<'n>,
     keys: &'s mut Keys,
     failed: Option<ValuesFail>,
+    /// The body: its crate, its item (a member's: its container) and the text it is lowered
+    /// from; and its blocks' modules, scanned at the first question a block's `use` raises
+    /// ([`super::glob_uses::by_uses`]).
+    krate: usize,
+    item: LibKey,
+    text: &'n str,
+    blocks: Option<super::glob_uses::PatternBlocks<'static>>,
 }
 
 impl<'n, S: NamesSource<'n>> ModuleValues<'n, '_, S> {
@@ -156,6 +163,39 @@ impl<'n, S: NamesSource<'n>> ModuleValues<'n, '_, S> {
 }
 
 impl<'n, S: NamesSource<'n>> blaze_lower::ValueNames for ModuleValues<'n, '_, S> {
+    /// The name through the `use` items of the blocks around the pattern: a named import's
+    /// path, or a glob import's (`use E::*;` makes `A` the variant `E::A`), read by
+    /// [`super::glob_uses::by_uses`], where the rules are quoted; its shape as
+    /// [`Self::value_name`] gives a module's. A refusal there is the body's, by its name.
+    fn value_name_by_uses(&mut self, name: &str, uses: &[blaze_lower::block_uses::BlockUse<'_>], locals: &[&str]) -> Option<blaze_lower::ValueName> {
+        use crate::resolve::Kind;
+        use blaze_lower::ValueName as V;
+        if self.failed.is_some() {
+            return Some(V::Need);
+        }
+        let (names, krate, item, text) = (self.names, self.krate, self.item, self.text);
+        let blocks = self.blocks.get_or_insert_with(|| super::glob_uses::PatternBlocks::of(names, krate, item, text, Alloc::global()));
+        let target = match super::glob_uses::by_uses(&Paths { names }, self.module, item, blocks, name, uses, locals, Alloc::global()) {
+            Ok(Some(target)) => target,
+            Ok(None) => return None,
+            Err(gap) => {
+                self.failed = Some(ValuesFail::Head(HeadError::Item(gap.item, Why::Unsupported(gap.form, gap.range))));
+                return Some(V::Need);
+            }
+        };
+        let answer = match target.kind {
+            Kind::Const => Ok(V::Const),
+            Kind::Static => Ok(V::Static),
+            Kind::Struct if super::source::NamesSource::is_ctor(self.names, target.key) => self.shape(target.key, 0, V::UnitStruct),
+            Kind::Variant { adt, index } => self.shape(adt, index, V::UnitVariant),
+            _ => Ok(V::Nothing),
+        };
+        Some(answer.unwrap_or_else(|fail| {
+            self.failed = Some(fail);
+            V::Need
+        }))
+    }
+
     fn value_name(&mut self, name: &str) -> blaze_lower::ValueName {
         use crate::resolve::{Kind, Ns, ResolveError};
         use blaze_lower::ValueName as V;
@@ -290,6 +330,14 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         match self.builder.ty(tys, &env, view, t) {
             Ok(ty) => Ok(ty),
             Err(why) => {
+                // A type the body's module does not resolve, in a body with a glob import in
+                // a block: the name may be the glob's to give, which the type builder (it
+                // reads at one module) does not ask. Refused by that name, never as a
+                // program that names nothing (super::glob_uses, "Owed").
+                let why = match why {
+                    Why::Resolve(_, r) if super::glob_uses::any_glob(self.locals, self.owner) => Why::Unsupported(super::glob_uses::TYPE_THROUGH_GLOB, r),
+                    why => why,
+                };
                 self.failed = Some(why);
                 Err(Refused::Form { what: "a written type", range: view.site(view.type_range(t)?)? })
             }
@@ -382,7 +430,16 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         let at = view.expr_range(len)?;
         let range = view.site(at)?;
         let text = view.text_at(at)?.trim();
-        let made = self.builder.const_term(tys, &self.env, text, range, &|tys| super::types::intern(tys, blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize)));
+        // A `const` item declared in the body comes first (`const MOST: usize = ..; [x; MOST]`:
+        // front2/const_open.rs `local_const`): a block's item shadows the module's name.
+        let made = match super::const_open::local_const(self.locals, self.owner, self.builder.heads, view, len, text, range) {
+            Ok(Some(bits)) => match super::types::intern(tys, blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize)) {
+                Ok(ty) => super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty, bits }),
+                Err(why) => Err(why),
+            },
+            Ok(None) => self.builder.const_term(tys, &self.env, text, range, &|tys| super::types::intern(tys, blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize))),
+            Err(why) => Err(why),
+        };
         self.term(made, "an array repeat length", range)
     }
 
@@ -569,7 +626,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
 
     let scoped = ScopedBy { names, module, prepared: Some(prepared) };
     let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
-    let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None };
+    let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None, krate, item, text, blocks: None };
     let lowered = blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut values, &mut expand, Alloc::global());
     match values.failed {
         Some(ValuesFail::Resolve(error)) => return Err(BodyError::PatternName { item, error }),

@@ -20,9 +20,20 @@ blaze-launch.workspace = true
 blaze-queue.workspace = true
 # A record's id is the BLAKE3 hash of its bytes: checked when the daemon gives one.
 blaze-blake3.workspace = true
+# `zygote`: the test pool, a child's steps, the report form and the OS-call classifier it drives.
+blaze-run.workspace = true
+# `zygote`: the driver's vectors, in the allocator the caller names.
+blaze-own.workspace = true
+# `code_unwind`: a code record's unwind entry (blaze-code eh.rs), registered before its slot's
+# word is published.
+blaze-code = { path = "../blaze-code" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+# examples/fork_smoke: `Alloc::global()`, the handle a test program hands the zygote.
+blaze-own = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

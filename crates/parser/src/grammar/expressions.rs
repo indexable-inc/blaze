@@ -183,7 +183,10 @@ pub(super) fn let_stmt<S: Sink>(p: &mut Parser<'_, S>, with_semi: Semicolon) {
 pub(super) fn expr_block_contents<S: Sink>(p: &mut Parser<'_, S>) {
     attributes::inner_attrs(p);
 
-    while !p.at(EOF) && !p.at(T!['}']) {
+    // A sink that has all it reads of the parse (`Sink::satisfied`) is asked here, where a
+    // statement would start: the block's other statements are not read, and each block around
+    // it stops the same way when its statement ends.
+    while !p.at(EOF) && !p.at(T!['}']) && !p.satisfied() {
         // test nocontentexpr
         // fn foo(){
         //     ;;;some_expr();;;;{;;;};;;;Ok(())

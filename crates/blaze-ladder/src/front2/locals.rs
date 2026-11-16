@@ -35,6 +35,7 @@ use blaze_surface::{ItemDetail, Rename, UseForm};
 use blaze_typeck::ItemKey;
 use parser::SyntaxKind;
 
+use super::foreign_locals::{ForeignKind, LocalForeign};
 use super::heads::HeadError;
 use super::keys::{Keys, checker_of};
 use super::types::Why;
@@ -272,6 +273,9 @@ pub struct Locals<'n> {
     frame: &'n Frame,
     bodies: HashMap<ItemKey, BodyLocals<'n>, &'n Frame>,
     heads: HashMap<ItemKey, LocalHead<'n>, &'n Frame>,
+    /// The fns and statics of `extern` blocks declared in bodies, by checker key: each one's
+    /// block's ABI and its safety ([`super::foreign_locals`]). Each is in `heads` too.
+    foreign: HashMap<ItemKey, LocalForeign<'n>, &'n Frame>,
 }
 
 /// The `n`th hex digit of `k`, most significant first.
@@ -282,7 +286,15 @@ fn hex_digit(k: u128, n: usize) -> u8 {
 
 impl<'n> Locals<'n> {
     pub fn new(frame: &'n Frame) -> Locals<'n> {
-        Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame) }
+        Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame), foreign: HashMap::new_in(frame) }
+    }
+
+    /// The local item whose checker key is `key`, when an `extern` block in a body declares
+    /// it: its block's ABI as written and whether it is declared `safe`. `None` for every
+    /// other item. The code builder asks this of a callee with no body (with the `#[lang]`
+    /// and `#[link_name]` of its head's text, [`Locals::head`]).
+    pub fn foreign(&self, key: ItemKey) -> Option<LocalForeign<'n>> {
+        self.foreign.get(&key).copied()
     }
 
     /// A copy of `text` kept in the command's frame (an anonymous constant's item text,
@@ -381,12 +393,46 @@ impl<'n> Locals<'n> {
                         let bound = match leaf.form {
                             UseForm::Named { rename: Rename::Same, .. } => leaf.segments.last().copied().unwrap_or(""),
                             UseForm::Named { rename: Rename::To(n), .. } => n,
-                            // `as _` binds no name; a glob is refused where a path would need it.
+                            // `as _` binds no name.
                             UseForm::Named { rename: Rename::Underscore, .. } => continue,
-                            UseForm::Glob => return Err(bad(Why::Unsupported("a glob use in a block", range))),
+                            // A glob's row is kept under a name no identifier is, with the
+                            // path before its `*`: a name of the body is looked up through it
+                            // lazily, after the block's own items (super::glob_uses).
+                            UseForm::Glob => super::glob_uses::GLOB,
                         };
                         let path: &'n [&'n str] = frame.alloc_slice_copy(&leaf.segments);
                         rows.push(Row { scope: s as u32, kind, name: bound, key: parent, range, path, abs: leaf.abs, module: None });
+                    }
+                    continue;
+                }
+                if kind == LocalKind::ExternBlock {
+                    // An `extern` block declares its fns and statics in the value namespace
+                    // of the block it is written in (the Reference, "External blocks",
+                    // [items.extern.namespace]): each is a row of this block, a fn's or a
+                    // static's like any local one (its key, its text, its head by
+                    // `Store::step`), and its block's ABI and its safety are kept beside it
+                    // ([`Locals::foreign`]). The block itself binds no name: no row.
+                    let edition = names.edition_of(at.krate).ok_or(HeadError::NoText(at.item))?;
+                    let (abi, decls) = super::foreign_locals::declared(text, edition, alloc).map_err(|r| bad(Why::Unsupported(r.form(), range)))?;
+                    let from = view.item_relative(it.range).map(|r| r.start);
+                    for d in decls.iter() {
+                        let kind = match d.kind {
+                            ForeignKind::Fn => LocalKind::Fn,
+                            ForeignKind::Static => LocalKind::Static,
+                        };
+                        // Written in the enclosing item's text: its own place there; an
+                        // expansion's: its block's (the outermost call).
+                        let range = match from {
+                            Some(start) => Range::new(start + d.at.start, start + d.at.end),
+                            None => range,
+                        };
+                        let ordinal = rows.iter().filter(|r| r.kind == kind && r.name == d.name).count() as u32;
+                        let mut key = blaze_scope::task::key_of(crate_key, parent, kind.tag(), d.name, ordinal);
+                        key.0.0[8] |= LibKey::INNER;
+                        rows.push(Row { scope: s as u32, kind, name: d.name, key, range, path: &[], abs: false, module: None });
+                        let ck = keys.item(key).map_err(HeadError::Key)?;
+                        self.heads.insert(ck, LocalHead { lib: key, kind, text: d.text, module: at.module, enclosing: at.owner, scope: s as u32, range });
+                        self.foreign.insert(ck, LocalForeign { kind: d.kind, abi, safe: d.safe });
                     }
                     continue;
                 }
@@ -497,7 +543,7 @@ impl<'n> Locals<'n> {
 
 /// A `use` item's tree: its text after `use`, without the `;` (attributes and a visibility
 /// before `use` dropped).
-fn use_tree(text: &str) -> &str {
+pub(super) fn use_tree(text: &str) -> &str {
     let t = text.trim_end();
     let t = t.strip_suffix(';').unwrap_or(t);
     let mut from = 0;

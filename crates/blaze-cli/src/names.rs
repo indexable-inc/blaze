@@ -52,10 +52,11 @@ use crate::work::{Did, Made, held_str};
 
 pub(crate) mod sections;
 
-// The subject and source domains name the payload's form ([`sections::FORM`] 2): an old home's
-// records (form 1: exports then inner) are under other names, never found, made again.
-const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 2";
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 2";
+// The subject and source domains name the payload's form ([`sections::FORM`] 3): an old home's
+// records (form 1: exports then inner; form 2: no tests section) are under other names, never
+// found, made again.
+const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 3";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 3";
 const OUT_DOMAIN: &str = "blaze-cli crate scope out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "names.rs";
@@ -349,6 +350,38 @@ pub struct Names<'f> {
     /// Crates whose names were resolved this command, and the unresolved paths among them.
     pub resolved: u32,
     pub unresolved: u64,
+}
+
+/// A checkout file a package's names read that no units record and no file's outline lists
+/// (the machine's `DriveError::NoPart`, which names the file by its digest alone).
+#[derive(Debug)]
+pub struct Unlisted {
+    pub package: String,
+    /// The file's path (its slot's: `x.rs` for `x/mod.rs` too), checkout-relative.
+    pub path: String,
+}
+
+impl core::fmt::Display for Unlisted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "the names of package `{}` read `{}`, which no manifest's targets and no file's `mod` lines list (a module under a macro, an attribute or a `#[path]` the outline does not follow): its items cannot be checked",
+            self.package, self.path
+        )
+    }
+}
+
+impl Names<'_> {
+    /// The package whose names read the checkout file `file` names, and the file's path: the
+    /// first in subject order. For an error that would name the file by its digest.
+    pub(crate) fn reader_of(&self, file: Name) -> Option<Unlisted> {
+        for (subject, resolved) in self.made.iter() {
+            let Some(path) = resolved.files.iter().find(|path| Name::file(path.as_bytes()) == file) else { continue };
+            let at = self.by_subject.binary_search_by_key(subject, |(subject, _)| *subject).ok()?;
+            return Some(Unlisted { package: String::from(self.world.crates[self.by_subject[at].1].package), path: path.clone() });
+        }
+        None
+    }
 }
 
 /// Each workspace member's lock entry and directory, anchor-relative, from the layout the
@@ -681,7 +714,23 @@ pub(crate) fn run<'f, 'b>(
                 return Ok(Did::FailedSaying(refused("the crate's items record could not be written"), held_str(words.as_str(), held)));
             }
         };
-        let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..]]);
+        // A test unit's tests, from attributes alone (test.md, "The tests record", piece 6): the
+        // fifth section. A unit without `test` in its cfg has none, and its section is empty.
+        let tests_record = match blaze_scope::tests_record::encode(done.names, Alloc::global()) {
+            Ok(bytes) => Some(bytes),
+            Err(blaze_scope::tests_record::TestsRecordError::NotATestUnit { .. }) => None,
+            Err(error) => {
+                let words = bstd::mem::format_in!(held, "crate `{}`: its tests record could not be written: {error}", input.name);
+                return Ok(Did::FailedSaying(refused("the crate's tests record could not be written"), held_str(words.as_str(), held)));
+            }
+        };
+        let tests: &[u8] = match &tests_record {
+            Some(bytes) => &bytes[..],
+            None => &[],
+        };
+        let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests]);
+        #[cfg(test)]
+        sections::watch_tests(input.name, &payload, tests);
         // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
         // read of either place is a read of the slot's `Surface`.
         let mut files = texts.read.into_inner();

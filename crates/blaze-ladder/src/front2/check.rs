@@ -688,6 +688,8 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
             // Only impls written where the orphan rules allow (`trait_home`) are candidates.
             let home = trait_home(r.names, r.keys, r.store, trait_, shape);
             let b = buckets_for(r.buckets, r.names, r.index, home);
+            // Over a bucket index: this question's buckets of the crates `home` admits.
+            b.admit_asked(r.names, r.keys, home, super::buckets::Ask::Trait(trait_, shape));
             let mut candidates = b.trait_candidates(trait_, shape, home);
             // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
             // decides an auto trait's structural rule, and the solver matches it to no positive
@@ -702,6 +704,7 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
             // Only impls written in the type's own crate (`inherent_home`) are candidates.
             let home = inherent_home(r.names, r.keys, shape);
             let b = buckets_for(r.buckets, r.names, r.index, home);
+            b.admit_asked(r.names, r.keys, home, super::buckets::Ask::Inherent(shape));
             let candidates = b.inherent_candidates(shape, home);
             lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;
             b.answer_inherent(r.store, shape, home).map_err(MakeFail::Buckets)

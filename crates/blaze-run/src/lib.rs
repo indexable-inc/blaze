@@ -11,6 +11,7 @@
 //! |---|---|---|
 //! | [`parent`] | [`parent::Parent`]: the start, a program's needs, single flight, speculation | the `blaze run` process, alive exactly as long as the program |
 //! | [`slots`] | [`slots::Slots`]: two words a function (the slot word callers jump through, the body word stubs jump through), publish, observe and plain, retirement by per-thread epochs | the program's control thread |
+//! | [`first_call`] | [`first_call::FirstCall`]: slots numbered by symbol as they appear; a stub's first call placed from a known record or asked of the parent once, published once, every waiter woken after the store | the program's control thread |
 //! | [`heat`] | [`heat::Heat`]: a count stub's "bound reached" for a slot; a function is hot once | the program's control thread |
 //! | [`tier`] | [`tier::Tier`]: hot functions optimized across functions; the record valid while every inlined callee is | the parent |
 //! | [`registry`] | [`registry::Registry`]: the directory of live runs; [`registry::RunEvent`], the stream a viewer reads | the parent |
@@ -21,6 +22,10 @@
 //! | [`postings`] | the suite's postings record: from each ask to the tests that asked it, read in place | the store |
 //! | [`result`] | a test's result record: a pass or a failure at its address, filed beside each other; the `Flaky` finding | the store |
 //! | [`report`] | the run report: failures as they end, capped output, the summary, `--format json`; a pure formatter | the `blaze test` process |
+//! | [`zygote`] | [`zygote::Pool`]: one process per test forked from the suite's zygote, at most `width` at once; descriptor 3 read, output captured, deadlines, reaping; [`zygote::Gate`], the one-thread proof every fork takes | the suite's zygote |
+//! | [`child`] | [`child::Child`]: a forked child's steps from the fork to the test's call, and its one report | a forked child |
+//! | [`wire`] | `TestEnded` and `Stacks` on descriptor 3: framed, versioned, digested; opened with every length checked | both |
+//! | [`oscall`] | an observed OS call to an ask or a not-kept reason; [`oscall::Observe`], what the launcher's wrappers call | a forked child |
 //!
 //! The ids below are this crate's own so that it compiles alone today; each says the type it
 //! becomes when the crate that owns that type is on the new item layer (bottom.md).
@@ -41,6 +46,7 @@
 extern crate std;
 
 pub mod events;
+pub mod first_call;
 pub mod head;
 pub mod heat;
 pub mod parent;
@@ -53,6 +59,10 @@ pub mod slots;
 pub mod suite;
 pub mod tier;
 pub mod viewer;
+pub mod child;
+pub mod oscall;
+pub mod wire;
+pub mod zygote;
 
 #[cfg(test)]
 mod sim;
@@ -235,6 +245,9 @@ pub enum Why {
     NotBuilt { what: &'static str },
     /// The compile ran past its bound (`parent::Config::compile_bound`) without an answer.
     Overran { bound: Nanos },
+    /// The function's code record names a target `symbol` the program's manifest does not
+    /// resolve (`parent::Resolve`): no slot can be declared for it, so the record is not sent.
+    Unresolved { symbol: first_call::Symbol },
 }
 
 impl fmt::Display for CompileError {
@@ -247,6 +260,11 @@ impl fmt::Display for CompileError {
             Why::Overran { bound } => {
                 write!(f, "its compile ran past {} ms (rule 18)", bound.0 / 1_000_000)
             }
+            Why::Unresolved { symbol } => write!(
+                f,
+                "its record calls symbol {}, which names no function of the program (rule 21: the record and the manifest disagree)",
+                Hex(&symbol.0)
+            ),
         }
     }
 }
@@ -293,4 +311,12 @@ pub(crate) enum Plant {
     OffKeepsHooks,
     /// [`slots::Slots`] stores the new body in the slot word whatever it held, over a stub.
     PublishOverStub,
+    /// [`zygote::Pool`] takes a report whose digest does not match its body.
+    TrustTornReport,
+    /// [`zygote::Pool`] takes the report of a child it killed past its deadline as its result.
+    KilledReportStands,
+    /// [`parent::Parent::declare`] gives an instance already declared a second slot.
+    DeclareTwice,
+    /// [`parent::Parent`] sends a record before telling the program its targets' slots.
+    PublishBeforeTell,
 }

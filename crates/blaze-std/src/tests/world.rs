@@ -82,22 +82,18 @@ fn a_write_is_stamped_on_the_wall_clock() {
     let clock = io.clock().expect("Io::sim offers clock");
     let fs = io.need_fs().expect("Io::sim offers files");
     let dir = fs.open_dir(&cx, &super::path("w")).expect("a directory");
-    let stamp_of = |frame| {
-        let listed = dir.list(&cx, frame).expect("the listing");
-        listed.iter().find(|(path, _)| path.as_str() == "a").expect("the file").1.stamp
-    };
-    let frame = blaze_mem::Frame::with_reserve(1 << 20, blaze_mem::Tag::Other).expect("a test frame");
+    let stamp_of = || dir.stat(&cx, &super::path("a")).expect("the stat").expect("the file").stamp;
     let before = clock.wall();
     dir.publish(&cx, &super::path("a"), Content::bytes(b"one"), Durable::No).expect("the write");
     let after = clock.wall();
-    let first = stamp_of(&frame);
+    let first = stamp_of();
     assert!(before.as_ns() <= first.modified_ns && first.modified_ns <= after.as_ns(), "{before:?} {first:?} {after:?}");
     clock.sleep(&cx, Duration::from_millis(20)).expect("the sleep");
     let later = clock.wall();
     assert!(later.as_ns() > first.modified_ns.max(first.changed_ns) + 10_000_000, "{later:?} {first:?}");
     assert_eq!((later.secs(), later.subsec_nanos()), (later.as_ns() / 1_000_000_000, (later.as_ns() % 1_000_000_000) as u32));
     dir.publish(&cx, &super::path("a"), Content::bytes(b"two"), Durable::No).expect("the second write");
-    let second = stamp_of(&frame);
+    let second = stamp_of();
     assert!(second.modified_ns >= later.as_ns() && second != first, "{first:?} then {second:?}");
 }
 

@@ -288,24 +288,34 @@ fn the_root_lists_and_syncs_as_any_directory() {
         assert_eq!(top.name(), &DirName::Root);
         // An empty root lists as empty: it is there before anything is made in it.
         let frame = blaze_mem::Frame::with_reserve(1 << 20, blaze_mem::Tag::Other).expect("a test frame");
-        assert!(top.list(&cx, &frame).expect("the empty root's listing").is_empty(), "seed {seed}");
+        // Every file beneath the root at any depth, by a walk entering every folder.
+        let files_of = |frame: &blaze_mem::Frame| -> Vec<String> {
+            let mut files = Vec::new();
+            let limits = crate::fs::WalkLimits { folders: 64, entries: 1024, depth: 8 };
+            top.walk(&cx, None, limits, frame, |entries, enter| {
+                files.extend((0..entries.len()).filter(|&i| entries.kind(i) == crate::fs::EntryKind::File).map(|i| entries.path(i).expect("a path").as_str().to_owned()));
+                enter.enter_all();
+                Ok::<(), core::convert::Infallible>(())
+            })
+            .expect("the root's walk");
+            files
+        };
+        assert!(files_of(&frame).is_empty(), "seed {seed}");
         top.publish(&cx, &path("kept"), Content::bytes(b"kept"), Durable::Yes).expect("a synced publish at the root");
         top.publish(&cx, &path("d/deep"), Content::bytes(b"deep"), Durable::No).expect("a publish beneath the root");
         top.publish(&cx, &path("a.new"), Content::bytes(b"a"), Durable::No).expect("the source");
         top.rename_replacing(&cx, &path("a.new"), &path("a"), Durable::No).expect("an unsynced rename at the root");
-        let listed = top.list(&cx, &frame).expect("the root's listing");
-        let names: Vec<&str> = listed.iter().map(|(path, _)| path.as_str()).collect();
-        assert_eq!(names, ["a", "d/deep", "kept"], "seed {seed}");
+        // The walk's order (fs/walk.rs): a folder's own files before its sub-folders.
+        assert_eq!(files_of(&frame), ["a", "kept", "d/deep"], "seed {seed}");
         io.record();
         io.asked();
         top.sync_names(&cx).expect("the root's names synced");
         let asked = io.asked();
         assert!(matches!(asked.as_slice(), [Effect::SyncDir { dir: DirName::Root, .. }]), "seed {seed}: {asked:?}");
         assert!(io.crash(), "the world is simulated");
-        let after = top.list(&cx, &frame).expect("the root's listing after the crash");
-        let names: Vec<&str> = after.iter().map(|(path, _)| path.as_str()).collect();
-        assert!(names.contains(&"kept"), "seed {seed}: {names:?}");
-        assert!(names.iter().all(|it| ["a", "a.new", "kept"].contains(it) || it.starts_with("d/")), "seed {seed}: {names:?}");
+        let names = files_of(&frame);
+        assert!(names.iter().any(|it| it == "kept"), "seed {seed}: {names:?}");
+        assert!(names.iter().all(|it| ["a", "a.new", "kept"].contains(&it.as_str()) || it.starts_with("d/")), "seed {seed}: {names:?}");
     }
 }
 

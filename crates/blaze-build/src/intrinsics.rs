@@ -128,7 +128,13 @@ pub enum Which {
     PtrMetadata,
     AggregateRawPtr,
     ConstEvalSelect,
+    /// Built by the walk (walk/unwind.rs): an `invoke` and a `catch` landing block.
+    CatchUnwind,
     PtrGuaranteedCmp,
+    ThreeWayCompare,
+    SliceGetUnchecked,
+    /// A `simd_*` intrinsic: its rows and its build are intrinsics/simd.rs's.
+    Simd(simd::SimdOp),
 }
 
 /// One row of the table.
@@ -175,6 +181,7 @@ pub const TABLE: &[Entry] = &[
     e("black_box", Which::BlackBox, "See documentation of [`std::hint::black_box`] for details.", "its argument"),
     e("bswap", Which::Bswap, "Reverses the bytes in an integer type `T`.", "`bswap` (a byte: itself)"),
     e("caller_location", Which::CallerLocation, "Gets a reference to a static `Location` indicating where it was called.", "the address of a data row of the site's `Location`, or the location a `#[track_caller]` fn was passed"),
+    e("catch_unwind", Which::CatchUnwind, "Rust's \"try catch\" construct for unwinding.", "an `invoke` of `try_fn` whose `catch` landing block calls `catch_fn` (walk/unwind.rs); under `panic = abort` a call and `false`"),
     e("cold_path", Which::ColdPath, "Hints to the compiler that current code path is cold.", "nothing"),
     e("const_eval_select", Which::ConstEvalSelect, "Selects which function to call depending on the context.", "the walk calls the run-time fn with the tuple's fields; the constant evaluator calls the const fn"),
     e("copy", Which::Copy, "Copies `count * size_of::<T>()` bytes from `src` to `dst`. The source and destination may overlap.", "`memmove` of `count * size`"),
@@ -202,7 +209,9 @@ pub const TABLE: &[Entry] = &[
     e("saturating_sub", Which::SaturatingSub, "Computes `a - b`, saturating at numeric bounds.", "`usub_sat`/`ssub_sat`"),
     e("size_of", Which::SizeOf, "The size of a type in bytes.", "a constant from the layout"),
     e("size_of_val", Which::SizeOfVal, "The size of the referenced value in bytes.", "a constant, or the slice length times the stride plus the prefix, rounded; of `dyn`, the vtable's word 1"),
+    e("slice_get_unchecked", Which::SliceGetUnchecked, "Projects to the `index`-th element of `slice_ptr`, as the same kind of pointer as the slice was provided -- so `&mut [T] → &mut T`, `&[T] → &T`, `*mut [T] → *mut T`, or `*const [T] → *const T` -- without a bounds check.", "the data word, `ptr_add inbounds` of `index * size_of::<T>()`; a zero-sized `T`: the data word"),
     e("sub_with_overflow", Which::SubWithOverflow, "Performs checked integer subtraction", "`usub_overflow`/`ssub_overflow`"),
+    e("three_way_compare", Which::ThreeWayCompare, "Does a three-way comparison between the two arguments, which must be of character or integer (signed or unsigned) type.", "two `icmp`s (`slt`/`sgt`, or `ult`/`ugt` for unsigned and `char`) and two `select`s to `Ordering`'s -1/0/1"),
     e("transmute", Which::Transmute, "Reinterprets the bits of a value of one type as another type.", "the bits kept (`expose`/`from_exposed`/`bitcast` between scalar kinds); an aggregate through memory"),
     e("transmute_unchecked", Which::TransmuteUnchecked, "Like [`transmute`], but even less checked at compile-time: rather than giving an error for `size_of::<Src>() != size_of::<Dst>()`, it's **Undefined Behavior** at runtime.", "as `transmute`; sizes must still agree here"),
     e("unaligned_volatile_load", Which::UnalignedVolatileLoad, "Performs a volatile load from the `src` pointer The pointer is not required to be aligned.", "`load volatile`, alignment 1"),
@@ -245,11 +254,15 @@ impl core::error::Error for UnknownIntrinsic<'_> {}
 impl Which {
     /// The table's row for `name` (an intrinsic fn's name, as declared).
     pub fn named(name: &str) -> Result<Which, UnknownIntrinsic<'_>> {
-        TABLE.binary_search_by(|e| e.name.cmp(name)).map(|i| TABLE[i].which).map_err(|_| UnknownIntrinsic { name })
+        match TABLE.binary_search_by(|e| e.name.cmp(name)) {
+            Ok(i) => Ok(TABLE[i].which),
+            // The `simd_*` rows are intrinsics/simd.rs's table.
+            Err(_) => simd::named(name).ok_or(UnknownIntrinsic { name }),
+        }
     }
 
     pub fn entry(self) -> &'static Entry {
-        TABLE.iter().find(|e| e.which == self).expect("every `Which` has its row (tested)")
+        TABLE.iter().chain(simd::TABLE).find(|e| e.which == self).expect("every `Which` has its row (tested)")
     }
 }
 
@@ -503,6 +516,7 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             Out::Scalar(s.b.iconst(Ty::I8, v))
         }
         W::Forget | W::ColdPath => Out::None,
+        W::Simd(op) => simd::build(&mut s, c, op)?,
         W::Transmute | W::TransmuteUnchecked => {
             let (from, to) = (t0.ok_or_else(need_t)?, ty_arg(c, 1).ok_or_else(need_t)?);
             let (fid, tid) = (s.layout(from)?, s.layout(to)?);
@@ -826,8 +840,61 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             let eq = s.b.icmp(IntCond::Eq, a, b);
             Out::Scalar(s.b.convert(Op::Zext, Flags::NONE, Ty::I8, eq))
         }
+        // `three_way_compare::<T>(lhs, rhs)`: "Does a three-way comparison between the two
+        // arguments, which must be of character or integer (signed or unsigned) type." The
+        // result is `cmp::Ordering` (`#[repr(i8)]`: Less = -1, Equal = 0, Greater = 1), its
+        // scalar the call's type; `char` compares as its unsigned code point.
+        W::ThreeWayCompare => {
+            let t = t0.ok_or_else(need_t)?;
+            let signed = match s.node(t) {
+                Some(PNode::Int(_)) => true,
+                Some(PNode::Uint(_) | PNode::Char) => false,
+                // The declaration's own rule ("which must be of character or integer type").
+                _ => return Err(s.shape("`three_way_compare` of a type that is not an integer or `char`")),
+            };
+            let (Some(x), Some(y)) = (scalar(0), scalar(1)) else { return Err(shape()) };
+            let (rty, _) = s.scalar(c.ret)?;
+            let (lt, gt) = if signed { (IntCond::Slt, IntCond::Sgt) } else { (IntCond::Ult, IntCond::Ugt) };
+            let less = s.b.icmp(lt, x, y);
+            let greater = s.b.icmp(gt, x, y);
+            // `iconst` truncates to the width: all ones is -1.
+            let minus_one = s.b.iconst(rty, u128::MAX);
+            let zero = s.b.iconst(rty, 0);
+            let one = s.b.iconst(rty, 1);
+            let not_less = s.b.select(Flags::NONE, greater, one, zero);
+            Out::Scalar(s.b.select(Flags::NONE, less, minus_one, not_less))
+        }
+        // `slice_get_unchecked::<ItemPtr, SlicePtr, T>(slice_ptr, index)`: "Projects to the
+        // `index`-th element of `slice_ptr` ... without a bounds check" (`index <
+        // PtrMetadata(slice_ptr)` is the caller's promise, so nothing is checked). The wide
+        // pointer is an aggregate (its data word at 0, its length at 8, as `ptr_metadata` reads
+        // it); the result is the thin pointer of the same kind.
+        W::SliceGetUnchecked => {
+            let slice_ptr = ty_arg(c, 1).ok_or_else(need_t)?;
+            let pointee = s.pointee(slice_ptr)?;
+            // `ItemPtr: ChangePointee<[T], Pointee = T, Output = SlicePtr>` makes it a pointer to `[T]`.
+            let Some(PNode::Slice(elem)) = s.node(pointee) else {
+                return Err(s.shape("`slice_get_unchecked` of a `SlicePtr` that is not a pointer to a slice"));
+            };
+            if ty_arg(c, 2).is_some_and(|t| t != elem) {
+                return Err(s.shape("`slice_get_unchecked`'s `T` is not the element of its `SlicePtr`"));
+            }
+            let (Some(Arg::Place(at)), Some(index)) = (c.args.first().copied(), scalar(1)) else { return Err(shape()) };
+            let data = s.b.load(Ty::PTR, Flags::NONE, at, 0, MemAttrs::aligned(3));
+            let id = s.layout(elem)?;
+            let size = s.cx.layouts.get(id).size;
+            if size == 0 {
+                Out::Scalar(data)
+            } else {
+                let index = s.resize(index, Ty::I64, false);
+                let sz = s.usize(size);
+                let bytes = s.b.binary(Op::Mul, Flags::NUW, index, sz);
+                Out::Scalar(s.b.ptr_add(Flags::INBOUNDS, data, bytes))
+            }
+        }
         // A call of its run-time fn, which only the walk can make (lib.rs, "Intrinsics").
         W::ConstEvalSelect => return Err(s.shape("`const_eval_select` reached the intrinsic builder: the walk calls its run-time fn")),
+        W::CatchUnwind => return Err(s.shape("`catch_unwind` reached the intrinsic builder: the walk builds its landing block")),
     };
     Ok(out)
 }
@@ -961,5 +1028,6 @@ fn location<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
     Ok(s.b.data_addr(row))
 }
 
+pub mod simd;
 #[cfg(test)]
 mod tests;

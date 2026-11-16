@@ -87,9 +87,23 @@ pub struct TextKey(pub ContentId);
 // SAFETY: a content hash.
 unsafe impl Portable for TextKey {}
 
-/// The key of `call`, from text alone: nothing is lexed (rule 65).
+/// The key of `call`, from text alone: nothing is lexed (rule 65). Equal to
+/// `text_key_with(def_digest(call), call)`: a caller with many calls of one definition digests
+/// the definition once ([`def_digest`]) and keys each call with [`text_key_with`].
 pub fn text_key(call: &TextCall<'_>) -> TextKey {
-    let mut hasher = Hasher::new("blaze v2 expand text call 1");
+    text_key_with(def_digest(call), call)
+}
+
+/// The definition's part of a [`TextKey`]: the expander's code, the definition's text, name,
+/// crate, edition, export and `local_inner_macros` ([`def_digest`]). Equal for every call of
+/// one definition, so it is computed once per definition per command, not once per call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DefDigest(pub ContentId);
+
+/// The digest of `call`'s definition. Reads only `def`, `def_name`, `def_krate`,
+/// `def_edition`, `export` and `local_inner`; the call's own fields are [`text_key_with`]'s.
+pub fn def_digest(call: &TextCall<'_>) -> DefDigest {
+    let mut hasher = Hasher::new("blaze v2 expand text definition 1");
     hasher.part(EXPANDER.as_bytes());
     match call.def {
         DefText::Rules { body } => {
@@ -115,7 +129,17 @@ pub fn text_key(call: &TextCall<'_>) -> TextKey {
         LocalInner::No => 0,
         LocalInner::Yes => 1,
     };
-    hasher.update(&[call.def_edition.byte(), export, local_inner, call.shape.byte(), call.edition.byte()]);
+    hasher.update(&[call.def_edition.byte(), export, local_inner]);
+    DefDigest(hasher.finish())
+}
+
+/// The key of `call` given its definition's digest `def` (`def_digest(call)`'s, computed once
+/// for the definition): the digest, then the call's shape, edition, attribute and input. Every
+/// input of [`TextCall`] is in the key, the definition's through its digest.
+pub fn text_key_with(def: DefDigest, call: &TextCall<'_>) -> TextKey {
+    let mut hasher = Hasher::new("blaze v2 expand text call 2");
+    hasher.id(&def.0);
+    hasher.update(&[call.shape.byte(), call.edition.byte()]);
     hasher.part(call.attr.as_bytes());
     hasher.part(call.input.as_bytes());
     TextKey(hasher.finish())

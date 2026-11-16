@@ -19,19 +19,10 @@ use core::fmt;
 use blaze_ids::Hasher;
 use blaze_own::{ABTreeMap, AVec, Alloc, BTreeMap, Vec};
 
+use crate::a64::{ADD64, ADRP, BLR, LDR64, NOP, add_lo12, adrp, bl, expect, ldr_lo12, up, write32};
 use crate::record::{CodeView, OWN_CODE, OWN_RELRO, SiteKind, Space, Symbol, Target};
 
 const FOLD_DOMAIN: &str = "blaze-code fold 1";
-
-const NOP: u32 = 0xD503_201F;
-/// `adrp`: bit 31 and bits 28..24 fixed.
-const ADRP: (u32, u32) = (0x9F00_0000, 0x9000_0000);
-/// `ldr Xt, [Xn, #imm12 * 8]` (64-bit, unsigned offset).
-const LDR64: (u32, u32) = (0xFFC0_0000, 0xF940_0000);
-/// `add Xd, Xn, #imm12` (64-bit, no shift).
-const ADD64: (u32, u32) = (0xFFC0_0000, 0x9100_0000);
-/// `blr Xn`.
-const BLR: (u32, u32) = (0xFFFF_FC1F, 0xD63F_0000);
 
 /// Whether a segment's records may be replaced one by one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,60 +110,6 @@ impl fmt::Display for ImageError {
 }
 
 impl core::error::Error for ImageError {}
-
-fn up(n: u64, to: u64) -> u64 {
-    (n + to - 1) & !(to - 1)
-}
-
-fn read32(code: &[u8], at: u64) -> u32 {
-    let a = at as usize;
-    u32::from_le_bytes([code[a], code[a + 1], code[a + 2], code[a + 3]])
-}
-
-fn write32(code: &mut [u8], at: u64, value: u32) {
-    let a = at as usize;
-    code[a..a + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-/// The instruction at `at`, refused unless it is the `want` the site says.
-fn expect(code: &[u8], at: u64, (mask, value): (u32, u32), symbol: Symbol, want: &'static str) -> Result<u32, ImageError> {
-    let inst = read32(code, at);
-    match inst & mask == value {
-        true => Ok(inst),
-        false => Err(ImageError::NotInstruction { symbol, at, want }),
-    }
-}
-
-/// `adrp` at `pc` made to reach the 4 KiB page of `to`.
-fn adrp(inst: u32, pc: u64, to: u64, symbol: Symbol) -> Result<u32, ImageError> {
-    let pages = (to >> 12) as i64 - (pc >> 12) as i64;
-    if !(-(1i64 << 20)..(1i64 << 20)).contains(&pages) {
-        return Err(ImageError::OutOfReach { symbol, at: pc, what: "adrp (4 GiB)" });
-    }
-    let imm = (pages as u32) & 0x1F_FFFF;
-    Ok((inst & 0x9F00_001F) | ((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5))
-}
-
-/// `ldr Xt, [Xn, #lo12(to)]`; `to` is 8-aligned (an import word).
-fn ldr_lo12(inst: u32, to: u64) -> u32 {
-    (inst & !(0xFFF << 10)) | ((((to & 0xFFF) >> 3) as u32) << 10)
-}
-
-/// `add Xd, Xn, #lo12(to)`, from an `add` or from the `ldr` it replaces (same registers).
-fn add_lo12(inst: u32, to: u64) -> u32 {
-    let rd = inst & 0x1F;
-    let rn = (inst >> 5) & 0x1F;
-    0x9100_0000 | (((to & 0xFFF) as u32) << 10) | (rn << 5) | rd
-}
-
-/// `bl to` at `pc`.
-fn bl(pc: u64, to: u64, symbol: Symbol) -> Result<u32, ImageError> {
-    let delta = to as i64 - pc as i64;
-    if delta % 4 != 0 || !(-(1i64 << 27)..(1i64 << 27)).contains(&delta) {
-        return Err(ImageError::OutOfReach { symbol, at: pc, what: "bl (128 MiB)" });
-    }
-    Ok(0x9400_0000 | (((delta >> 2) as u32) & 0x03FF_FFFF))
-}
 
 /// Lays `members` out as one segment for a target whose pages are `page` bytes (16 KiB on macOS
 /// on arm64; the largest page a Linux arm64 kernel may use, 64 KiB, so one layout serves every

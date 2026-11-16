@@ -215,7 +215,7 @@ fn no_literal_word_is_left_in_a_record() {
     let (sealed, insts) = sealed_of(reader().view(), &ByPlace, ISA).expect("emits");
     let record = sealed.record();
     assert_eq!(record.relro.len(), 8, "the table row is the relro part");
-    assert_eq!(&record.relro[..], &[0; 8], "its word is zero until the image binds it");
+    assert_eq!(&record.relro[..], &[0u8; 8], "its word is zero until the image binds it");
     assert_eq!(record.words[0].target, OWN_CODE);
     let text_at = record.words[0].addend as usize - 1;
     assert!(text_at >= insts as usize, "the text row follows the instructions");

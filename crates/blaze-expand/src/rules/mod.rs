@@ -23,6 +23,7 @@
 
 mod failure;
 mod input;
+mod linear;
 mod matcher;
 
 pub(crate) use input::{consumed, words_of};
@@ -31,6 +32,7 @@ mod transcribe;
 use blaze_mem::frame::Frame;
 use blaze_own::{AVec, Alloc, Vec};
 use core::fmt::{self, Write as _};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{
     call::{CallKind, Checked},
@@ -364,6 +366,25 @@ pub(crate) struct Program<'a> {
     pub(crate) names: AVec<'a, DefTok>,
     /// The first parse error; the arms before it are kept, as rustc keeps them.
     pub(crate) error: Option<DefError>,
+    /// The matchers' nesting, for the linear matcher ([`linear::nest`]).
+    pub(crate) nests: linear::Nests<'a>,
+}
+
+/// Whether every call runs both matchers and compares them ([`rules_oracle`]).
+static ORACLE: AtomicBool = AtomicBool::new(false);
+static ORACLE_COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Turns the matchers' oracle on or off for the process: with it on, every arm a call tries
+/// is matched by the linear matcher and by the position-set matcher, and the two are compared
+/// (matched or not, every binding, the tokens written and the transcription's error).
+pub fn rules_oracle(on: bool) {
+    ORACLE.store(on, Ordering::Relaxed);
+}
+
+/// The oracle's counts since the process began: arms equal, arms different, arms left to the
+/// exact mode, calls no arm matched (the exact mode makes their diagnostic), calls.
+pub fn rules_oracle_counts() -> [u64; 5] {
+    core::array::from_fn(|at| ORACLE_COUNTS[at].load(Ordering::Relaxed))
 }
 
 /// Compiles `def`, a `macro_rules!` or `macro`, in the definition's allocator.
@@ -388,6 +409,7 @@ pub(crate) fn compile<'d>(def: &'d MacroDefinition<'d>) -> Result<Program<'d>, E
         concat: Vec::new_in(alloc),
         names: Vec::new_in(alloc),
         error: None,
+        nests: linear::Nests::new_in(alloc),
     };
     let refused = |bound| ExpandError::RulesBound {
         bound,
@@ -420,6 +442,7 @@ pub(crate) fn compile<'d>(def: &'d MacroDefinition<'d>) -> Result<Program<'d>, E
             Err(Stop::Deep) => Err(refused(RulesLimit::Depth)),
         }
     })?;
+    linear::nest(&mut program);
     Ok(program)
 }
 
@@ -1394,16 +1417,46 @@ impl<'p, 'd, 'f> Engine<'p, 'd, 'f> {
         let start = out.exp.tokens.mark();
         // The arms that can match, in order: the first that matches and transcribes is the
         // call's, as in rustc.
+        let mut lin = linear::Linear::new_in(self.program, self.frame);
+        let oracle = ORACLE.load(Ordering::Relaxed);
+        if oracle {
+            ORACLE_COUNTS[4].fetch_add(1, Ordering::Relaxed);
+        }
         for idx in 0..self.program.arms.len() {
             let arm = self.program.arms[idx];
             if arm.style != style || !view.admits(self.def, arm.first) {
                 continue;
             }
-            matcher::match_(self, &arm, &mut view, &mut buffers, &mut scratch, None)?;
-            if scratch.err.is_some() {
-                continue;
+            let outcome = linear::match_(self, idx, &mut view, &mut lin)?;
+            if oracle {
+                match outcome {
+                    linear::Outcome::Exact => {
+                        ORACLE_COUNTS[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        let checked = self.oracle_arm(
+                            &arm, outcome, &mut view, &mut buffers, &mut scratch, &lin, &mut tx, out,
+                        )?;
+                        if let Err(error) = checked {
+                            return Ok(Err(error));
+                        }
+                    }
+                }
             }
-            match transcribe::transcribe(self, &arm, &view, &scratch.bindings, out, &mut tx)? {
+            let written = match outcome {
+                linear::Outcome::Failed => continue,
+                linear::Outcome::Matched => {
+                    transcribe::transcribe(self, &arm, &view, &lin.flat, out, &mut tx)?
+                }
+                linear::Outcome::Exact => {
+                    matcher::match_(self, &arm, &mut view, &mut buffers, &mut scratch, None)?;
+                    if scratch.err.is_some() {
+                        continue;
+                    }
+                    transcribe::transcribe(self, &arm, &view, &scratch.bindings, out, &mut tx)?
+                }
+            };
+            match written {
                 Ok(None) => {
                     out.exp.arm = Some(crate::tokens::index(idx));
                     return Ok(Ok(()));
@@ -1414,7 +1467,11 @@ impl<'p, 'd, 'f> Engine<'p, 'd, 'f> {
         }
         // No arm gave the expansion: every arm of the style again, as rustc's expander tries
         // them, for the error of the best. An arm that matched failed to transcribe above, so
-        // it is matched again only.
+        // it is matched again only. This is the exact mode: the position-set matcher, which
+        // keeps every position's first error and what it had bound.
+        if oracle {
+            ORACLE_COUNTS[3].fetch_add(1, Ordering::Relaxed);
+        }
         let mut best: Option<(matcher::Match<'f>, usize)> = None;
         for idx in 0..self.program.arms.len() {
             let arm = self.program.arms[idx];
@@ -1464,6 +1521,52 @@ impl<'p, 'd, 'f> Engine<'p, 'd, 'f> {
             }
         };
         Ok(diagnose(out, error, rules, self))
+    }
+
+    /// The oracle's check of one arm: the position-set matcher on it too, then whether both
+    /// matched, the bindings node by node, and (transcribed from each) the tokens written,
+    /// their origins and the transcription's error. Leaves the expansion as it found it.
+    #[expect(clippy::too_many_arguments, reason = "the engine's state, passed as its parts")]
+    fn oracle_arm(
+        &mut self,
+        arm: &Arm,
+        outcome: linear::Outcome,
+        view: &mut input::View<'_, 'f>,
+        buffers: &mut matcher::Buffers<'f>,
+        scratch: &mut matcher::Match<'f>,
+        lin: &linear::Linear<'_, 'f>,
+        tx: &mut transcribe::Scratch<'f>,
+        out: &mut Out<'_, '_>,
+    ) -> Result<Result<(), ExpandError>, Bound> {
+        matcher::match_(self, arm, view, buffers, scratch, None)?;
+        let old = scratch.err.is_none();
+        let mut equal = old == (outcome == linear::Outcome::Matched);
+        if equal && old {
+            equal = linear::same(&scratch.bindings, &lin.flat, arm.binders, self.frame);
+            let start = out.exp.tokens.mark();
+            let a = match transcribe::transcribe(self, arm, view, &scratch.bindings, out, tx)? {
+                Ok(error) => error,
+                Err(error) => return Ok(Err(error)),
+            };
+            let mut wrote = Vec::new_in(self.frame);
+            for at in start.tokens..out.exp.tokens.len() {
+                wrote.push((out.exp.tokens.tokens()[at].kind, out.exp.origins[at]));
+            }
+            tx.truncate(out, start);
+            let b = match transcribe::transcribe(self, arm, view, &lin.flat, out, tx)? {
+                Ok(error) => error,
+                Err(error) => return Ok(Err(error)),
+            };
+            equal &= a == b && out.exp.tokens.len() - start.tokens == wrote.len();
+            equal = equal
+                && wrote.iter().enumerate().all(|(i, &(kind, origin))| {
+                    let at = start.tokens + i;
+                    out.exp.tokens.tokens()[at].kind == kind && out.exp.origins[at] == origin
+                });
+            tx.truncate(out, start);
+        }
+        ORACLE_COUNTS[if equal { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+        Ok(Ok(()))
     }
 
     /// The text of a kept parser message.

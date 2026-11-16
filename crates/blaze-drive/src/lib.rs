@@ -107,4 +107,7 @@ pub enum Plant {
     /// `test` starts the package's program as `run` does: `main` is no test, and until tests
     /// run on this path `test` is its check alone (decision D61 item 5).
     TestStartsProgram,
+    /// One finding held by two names' records (a library's and its test unit's names) prints
+    /// and counts once a name.
+    PrintEachName,
 }

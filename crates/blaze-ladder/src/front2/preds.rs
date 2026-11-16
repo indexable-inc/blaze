@@ -18,7 +18,7 @@ use super::types::{Bounded, Bounds, Builder, Env, Heads, ParamBound, Why, intern
 /// What one bound says of its type's sizedness ([`Builder::bound`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sizing {
-    /// `?Sized`: no clause.
+    /// `?Sized`: the implied clause is `MetaSized`, not `Sized` (`Builder::implied_size`).
     Relaxed,
     /// A trait bound, its trait.
     Trait(LibKey),
@@ -254,6 +254,30 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         Ok(false)
     }
 
+    /// The implied sizedness clause's trait for a type whose bounds are `stated` (a sizedness
+    /// trait is written: none) or `relaxed` (`?Sized`): `?Sized` relaxes `Sized` one level of
+    /// the sized hierarchy (RFC 3729), to `MetaSized`, not to nothing; only a written
+    /// `PointeeSized` states no size at all. The pinned core: `pub trait Sized: MetaSized`
+    /// (marker.rs), and `alloc`'s `data_offset<T: ?Sized>` calls
+    /// `Alignment::of_val_raw<T: MetaSized>` with its own `T`. `MetaSized` is found as
+    /// `Sized`'s one supertrait (the heads hold `Sized` and no lang table); a core whose
+    /// `Sized` has none (a `no_core` rung) gets no clause for `?Sized`, as before the
+    /// hierarchy. `None`: push nothing (also when `sized` is none).
+    fn implied_size(&self, stated: bool, relaxed: bool, sized: Option<LibKey>) -> Result<Option<LibKey>, Why> {
+        let Some(s) = sized else { return Ok(None) };
+        if stated {
+            return Ok(None);
+        }
+        if !relaxed {
+            return Ok(Some(s));
+        }
+        match self.heads.trait_supers(s).ok_or(Why::Need(s))? {
+            [] => Ok(None),
+            [(meta, _)] => Ok(Some(*meta)),
+            _ => Err(Why::Unsupported("`?Sized` where the `sized` lang trait has more than one supertrait (the sized hierarchy puts one, `MetaSized`, above it)", Range::new(0, 0))),
+        }
+    }
+
     /// The trait bounds on type parameters written in `v` (on its own parameters, from index
     /// `base`, and in its `where` clauses on any parameter in scope), appended to `out`, which
     /// holds the container's: what `T::X` is looked up through. Each is lowered with the ones
@@ -340,12 +364,13 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             let lf::TypeRef::Impl(bounds) = v.ty(t)? else {
                 return Err(Why::Program("an `impl Trait` entry names no `impl Trait` type".into(), place(v, v.type_range(t))?));
             };
-            let mut stated = false;
+            let (mut stated, mut relaxed) = (false, false);
             for &b in v.rows(bounds)? {
                 let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
-                stated |= self.states_size(s, sized)?;
+                relaxed |= s == Sizing::Relaxed;
+                stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
             }
-            if let (false, Some(s)) = (stated, sized) {
+            if let Some(s) = self.implied_size(stated, relaxed, sized)? {
                 let args = intern_list(tys, &[me])?;
                 out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
             }
@@ -362,20 +387,29 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
     /// solver as the alias's bounds: without them `<S as Serializer>::SerializeStruct` is
     /// neither `Sized` nor a `SerializeStruct` in a body generic over `S: Serializer`.
     ///
-    /// Refused by name: an associated type with type or const parameters of its own (its
-    /// bounds name them, and the checker's alias carries no arguments for them yet).
+    /// An associated type with type or const parameters of its own (`type Out<T>: B;`): the
+    /// caller gives `me` with those parameters after the trait's (`<Self as
+    /// Trait<params>>::Out<T>`, the checker's `AssocGenerics`) and an `env` that has them in
+    /// scope (heads.rs `Store::trait_members`). Refused by name: a bound written on such a
+    /// parameter (`type Out<T: Clone>;`): it is a predicate on the parameter, not on the
+    /// alias, and nothing files it yet. The parameters' implied `Sized` is not filed either
+    /// (typeck.md, "Generic associated types").
     pub fn assoc_ty_bounds(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, me: PTy, sized: Option<LibKey>, out: &mut Preds) -> Result<(), Why> {
         for &n in v.rows(v.list(head::GENERICS))? {
-            if let lf::GenericParam::Type { .. } | lf::GenericParam::Const { .. } = lf::GenericParam::decode(n)? {
-                return Err(Why::Unsupported("the bounds of an associated type with type or const parameters of its own", Range::new(0, 0)));
+            if let lf::GenericParam::Type { bounds, .. } = lf::GenericParam::decode(n)?
+                && !v.rows(bounds)?.is_empty()
+            {
+                return Err(Why::Unsupported("a bound on an associated type's own parameter (`type Out<T: Bound>`)", Range::new(0, 0)));
             }
         }
-        let mut stated = false;
+        // `type X: ?Sized;` keeps `<Self as Tr>::X: MetaSized` ([`Self::implied_size`]).
+        let (mut stated, mut relaxed) = (false, false);
         for &b in v.rows(v.list(head::BOUNDS))? {
             let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
-            stated |= self.states_size(s, sized)?;
+            relaxed |= s == Sizing::Relaxed;
+            stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
         }
-        if let (false, Some(s)) = (stated, sized) {
+        if let Some(s) = self.implied_size(stated, relaxed, sized)? {
             let args = intern_list(tys, &[me])?;
             out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
         }
@@ -387,8 +421,12 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         // The Reference, "Trait and lifetime bounds": every type parameter is `Sized` unless its
         // bounds say otherwise (`?Sized`, or a sizedness trait: [`Self::states_size`]), on the
         // parameter or in a `where` clause of the same item. Each own parameter, and the index
-        // of its implied `Sized` clause while no bound has said otherwise.
+        // of its implied `Sized` clause while no bound has said otherwise. `?Sized` (in either
+        // place) does not take the clause away: it relaxes it to `MetaSized`
+        // ([`Self::implied_size`]; `relax`, applied at the end); a written sizedness trait
+        // (`Sized`, `MetaSized`, `PointeeSized`) takes it away (`dropped`).
         let mut own: Vec<(PTy, Option<usize>), Global> = Vec::new_in(Global);
+        let mut relax: Vec<usize, Global> = Vec::new_in(Global);
         let mut i = base;
         for &n in v.rows(v.list(head::GENERICS))? {
             // A const parameter takes an index too (`heads::param_names`) and is never `Sized`.
@@ -398,15 +436,19 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             }
             if let lf::GenericParam::Type { bounds, .. } = lf::GenericParam::decode(n)? {
                 let me = intern(tys, PNode::Param(i))?;
-                let mut stated = false;
+                let (mut stated, mut relaxed) = (false, false);
                 for &b in v.rows(bounds)? {
                     let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
-                    stated |= self.states_size(s, sized)?;
+                    relaxed |= s == Sizing::Relaxed;
+                    stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
                 }
                 let mut at = None;
                 if let (false, Some(s)) = (stated, sized) {
                     let args = intern_list(tys, &[me])?;
                     at = Some(out.clauses.len());
+                    if relaxed {
+                        relax.push(out.clauses.len());
+                    }
                     out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
                 }
                 own.push((me, at));
@@ -438,7 +480,9 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                     for &b in v.rows(bounds)? {
                         let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
                         match mine {
-                            // A where clause on the item's own parameter takes its default away.
+                            // `where T: ?Sized` on the item's own parameter relaxes its default
+                            // to `MetaSized`; a sizedness trait there takes it away.
+                            Some((_, Some(at))) if s == Sizing::Relaxed => relax.push(at),
                             Some((_, Some(at))) if self.states_size(s, sized)? => dropped.push(at),
                             Some(_) => {}
                             // `?Sized` on what has no implied bound here (an outer item's
@@ -454,6 +498,22 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         }
         dropped.sort_unstable();
         dropped.dedup();
+        relax.sort_unstable();
+        relax.dedup();
+        if !relax.is_empty() {
+            let meta = self.implied_size(false, true, sized)?;
+            for &at in relax.iter() {
+                if dropped.binary_search(&at).is_ok() {
+                    continue;
+                }
+                match (meta, &mut out.clauses[at]) {
+                    (Some(m), PClause::Trait { trait_, .. }) => *trait_ = self.heads.checker(m),
+                    (None, _) => dropped.push(at),
+                    (Some(_), _) => return Err(Why::Program("an own parameter's implied `Sized` is no trait clause".into(), Range::new(0, 0))),
+                }
+            }
+            dropped.sort_unstable();
+        }
         for &at in dropped.iter().rev() {
             out.clauses.remove(at);
         }

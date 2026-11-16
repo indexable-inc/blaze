@@ -64,6 +64,8 @@ blaze-world = { workspace = true, features = ["procs"] }
 blaze-toolchain.workspace = true
 # The names step's per-crate entry (names.rs).
 blaze-scope.workspace = true
+# `blaze test`'s plan, head, postings, results and report (test_args.rs, test_loop.rs).
+blaze-run.workspace = true
 blaze-id.workspace = true
 # The lock's units (`plan`) and the machine that fetches them (fetch.rs). The plan is needed
 # without `fetch` too: a unit the store lacks is then a finding naming it. blaze-drive's

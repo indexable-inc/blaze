@@ -814,6 +814,94 @@ impl super::DepNames<N> for SolvedDep {
     fn crate_root(&self, krate: blaze_id::CrateItemKey) -> Option<ItemKey> {
         (krate == self.krate).then_some(self.root)
     }
+
+    fn has_enum(&self, _key: ItemKey) -> bool {
+        false
+    }
+}
+
+/// A crate's enums as the tests write them: each variant's name, key and whether it is a
+/// record variant (`V { .. }`: no value).
+struct TestEnums(std::collections::BTreeMap<ItemKey, Vec<(N, ItemKey, bool)>>);
+
+impl super::EnumNames<N> for TestEnums {
+    fn holds(&self, of: ItemKey) -> bool {
+        self.0.contains_key(&of)
+    }
+
+    fn variant(&self, of: ItemKey, ns: Namespace, name: N) -> super::DepAnswer {
+        let Some(variants) = self.0.get(&of) else { return super::DepAnswer::Unknown };
+        match variants.iter().find(|v| v.0 == name && (ns == Namespace::Types || (ns == Namespace::Values && !v.2))) {
+            Some(v) => super::DepAnswer::Found(crate::Def { key: v.1, kind: crate::DefKind::Other }, crate::Visibility::Public),
+            None => super::DepAnswer::NotFound,
+        }
+    }
+}
+
+/// `root`'s crate solved with its enums' variants held.
+fn with_enums(w: &World, root: ItemKey, enums: &'static TestEnums, plant: CellPlant) -> Cells<'static, N> {
+    w.expanded.borrow_mut().clear();
+    let mut c = Cells::load_planted(w, root, None, plant, Alloc::global()).expect("the core loads");
+    c.enums = Some(enums);
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    c.run(w, &expand, &[]).expect("the core runs");
+    c
+}
+
+/// Enum paths (566 unknown imports on tempo, c10-r11c: `use Enum::Variant`, `use
+/// self::Ordering::*` in `core::cmp`, which left every lexical read of `core::cmp` unknown: "lost
+/// call Plain ["PartialEq"] -> Some(Outside)"). The Reference, `items.use.restrictions.variant`:
+/// "`use MyEnum::MyVariant; //~ OK`"; `names.namespaces`: the type namespace holds "Struct,
+/// union, enum, enum variant declarations", the value namespace "Enum variant constructors";
+/// `vis.default`: "Enum variants in a pub enum are also public by default" (a variant is as
+/// visible as its enum). The crate: `mod m { pub(crate) enum E { A, R { .. } } }`, at the root
+/// `use m::E::A;` (types and values), `use m::E::R;` (the type alone: a record variant has no
+/// constructor), `use m::E::Q;` (not found, never unknown), `mod g { pub use crate::m::E::*; }`
+/// (the glob brings `A` no wider than `E` is read there: `pub(crate)`), and a derive call `Cl`
+/// in `g` that the standard prelude answers (the enum glob holds no lexical read up).
+/// Controls: `EnumIsOutside` leaves the imports and the call's module unknown (runner 11's
+/// state), `EnumGlobNotClamped` leaves `g::A` public.
+#[test]
+fn a_path_through_an_enum_reads_its_variants() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let prelude = w.module(root, "prelude", V::Pub);
+    let cl = w.item(prelude, "Cl", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::DERIVE), V::Pub);
+    w.cr(root).head.prelude = Some(prelude);
+    let m = w.module(root, "m", V::Pub);
+    let e = w.item(m, "E", Namespace::Types, crate::DefKind::Enum, V::Crate);
+    let (a, r) = (w.fun(prelude, "variant_a", V::Priv), w.fun(prelude, "variant_r", V::Priv));
+    let mut held = std::collections::BTreeMap::new();
+    held.insert(e, std::vec![("A", a, false), ("R", r, true)]);
+    let enums: &'static TestEnums = std::boxed::Box::leak(std::boxed::Box::new(TestEnums(held)));
+    w.use_(root, "m::E::A", V::Priv);
+    w.use_(root, "m::E::R", V::Priv);
+    w.use_(root, "m::E::Q", V::Priv);
+    let g = w.module(root, "g", V::Pub);
+    w.glob(g, "crate::m::E", V::Pub);
+    let call = w.call(g, "Cl", crate::CallShape::Derive);
+    let mut ok = with_enums(&w, root, enums, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, root, 0), Namespace::Types), Some(a), "{:?}", outcome(&ok, root, 0));
+    assert_eq!(named_def(outcome(&ok, root, 0), Namespace::Values), Some(a), "a unit variant is a value");
+    assert_eq!(named_def(outcome(&ok, root, 1), Namespace::Types), Some(r));
+    assert_eq!(named_def(outcome(&ok, root, 1), Namespace::Values), None, "a record variant has no constructor");
+    assert!(matches!(outcome(&ok, root, 2), Outcome::Failed(Unresolved::NotFound)), "{:?}", outcome(&ok, root, 2));
+    assert_eq!(outcome(&ok, g, 0), Outcome::Glob(e), "the glob's source is the enum");
+    let krate = crate::Visibility::Crate(crate::tests::crate_key(1));
+    assert_eq!(ok.ask(g, Namespace::Values, "A").expect("asks"), Some(Value::Found(crate::Def { key: a, kind: crate::DefKind::Other }, krate)));
+    assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == cl), "{:?}", ok.call_outcome(call));
+    // The edge as the record's list holds it: the enum under its own kind (c10-r12-zc2 wrote
+    // it as a module: "globs_differ 21"), narrowed to the enum's visibility.
+    let written = ok.written(g, Alloc::global()).expect("`g` is written");
+    assert_eq!(written.globs.len(), 1);
+    assert_eq!((written.globs[0].source, written.globs[0].vis), (crate::Def { key: e, kind: crate::DefKind::Enum }, krate));
+    let mut bad = with_enums(&w, root, enums, CellPlant::EnumIsOutside);
+    assert_eq!(outcome(&bad, root, 0), Outcome::Outside, "the control EnumIsOutside");
+    assert_eq!(bad.ask(g, Namespace::Values, "A").expect("asks"), Some(Value::Outside), "the control EnumIsOutside, the glob");
+    let mut bad = with_enums(&w, root, enums, CellPlant::EnumGlobNotClamped);
+    assert!(matches!(bad.ask(g, Namespace::Values, "A").expect("asks"), Some(Value::Found(_, crate::Visibility::Public))), "the control EnumGlobNotClamped");
 }
 
 /// `root`'s crate solved with `dep`'s (crate 2) read as decided.
@@ -1100,6 +1188,50 @@ fn a_use_of_a_macro_rules_name_reads_the_textual_scope() {
     assert_ne!(found(bad.ask(b, Namespace::Types, "Decoder").expect("asks")), Some(made), "the control, `Decoder`");
 }
 
+/// tempo_contracts on tempo's graph (c10-r11a: 897 of its imports "unknown import CrateAlone Abs
+/// ["alloy_sol_types"]": `use ::alloy_sol_types as alloy_sol_types;` in each `sol!` expansion;
+/// 933 on the whole graph). The Reference, `paths.qualifiers.global-root.edition2018`:
+/// "Beginning with the 2018 Edition, paths starting with `::` resolve from crates in the extern
+/// prelude. That is, they must be followed by the name of a crate." Dependency `e` (crate 2):
+/// `pub struct x;`. The crate: `mod b { use ::e as k; use self::k::x as u; pub use ::e; use
+/// ::nothere as z; }`. `k` is the crate `e` itself, private to `b`; `u` is its `x`; `pub use
+/// ::e;` is public; `::nothere` is not found. The reference solver agrees on the three `::`
+/// imports. Control `CrateAloneUnknown`: `k` and with it `u` are unknown.
+/// Prints: "test cells::tests::a_use_of_a_crate_alone_binds_the_crate ... ok".
+#[test]
+fn a_use_of_a_crate_alone_binds_the_crate() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let x = w.item(dep, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.dep(root, "e", dep);
+    let b = w.module(root, "b", V::Pub);
+    w.use_as(b, "::e", "k", V::Priv);
+    w.use_as(b, "self::k::x", "u", V::Priv);
+    w.use_(b, "::e", V::Pub);
+    w.use_as(b, "::nothere", "z", V::Priv);
+    let types = |c: &Cells<'static, N>, index: u32| match outcome(c, b, index) {
+        Outcome::Named(n) => n[super::ns_at(Namespace::Types)],
+        other => panic!("import {index} is not bound: {other:?}"),
+    };
+    let ok = with_dep(&w, root, dep, CellPlant::None);
+    assert_eq!(types(&ok, 0), Some((crate::Def::module(dep), crate::Visibility::Restricted(b))), "`use ::e as k;`");
+    assert_eq!(named_def(outcome(&ok, b, 1), Namespace::Types), Some(x), "`u`: {:?}", outcome(&ok, b, 1));
+    assert_eq!(types(&ok, 2), Some((crate::Def::module(dep), crate::Visibility::Public)), "`pub use ::e;`");
+    assert!(matches!(outcome(&ok, b, 3), Outcome::Failed(Unresolved::NotFound)), "`::nothere`: {:?}", outcome(&ok, b, 3));
+    let reference = reference_imports(&w, root);
+    for index in [0, 2] {
+        match reference.get(&(b, index)) {
+            Some(Imp::Named(n)) => assert_eq!(n[0].map(|y: B| (y.def, y.vis)), types(&ok, index), "the reference, import {index}"),
+            other => panic!("the reference, import {index}: {other:?}"),
+        }
+    }
+    assert!(matches!(reference.get(&(b, 3)), Some(Imp::Failed(Unresolved::NotFound))), "the reference, `::nothere`: {:?}", reference.get(&(b, 3)));
+    let bad = with_dep(&w, root, dep, CellPlant::CrateAloneUnknown);
+    assert!(matches!(outcome(&bad, b, 0), Outcome::Outside), "the control, `k`: {:?}", outcome(&bad, b, 0));
+    assert!(matches!(outcome(&bad, b, 1), Outcome::Outside), "the control, `u`: {:?}", outcome(&bad, b, 1));
+}
+
 /// mach2 0.5.0 on tempo's graph (edition 2015; c10-g3: "differ 153, cells failed 153, stalls 1").
 /// The Reference, `items.use.path.edition2018`: "In the 2015 edition, `use` paths are relative to
 /// the crate root." and "The 2015 edition does not allow use declarations to reference the extern
@@ -1146,4 +1278,224 @@ fn a_2015_use_path_starts_at_the_crate_root() {
     let mut vis = cells_of(&w, root, CellPlant::None);
     assert!(matches!(vis.ask(ti, Namespace::Types, "S").expect("asks"), Some(Value::Found(_, crate::Visibility::Restricted(k))) if k == ti));
     assert!(Cells::load_planted(&w, root, None, CellPlant::Use2015Lexical, Alloc::global()).is_err(), "the control, `pub(in task_info)`");
+}
+
+/// Two derives of one item named through a glob (zerocopy's `byteorder`: `use super::*;` and
+/// `derive(KnownLayout, Immutable, FromBytes, IntoBytes, Unaligned)`; c10-r11c: "lost call Plain
+/// ["IntoBytes"] -> Some(Failed(NotFound))", zerocopy "stalls 90"). The Reference,
+/// `names.resolution.expansion.speculation`: "All name resolution candidates selected during
+/// macro expansion are considered speculative. Once the crate has been fully expanded, all
+/// speculative import resolutions are validated to ensure that macro expansion did not introduce
+/// any new ambiguities."; `names.resolution.expansion.unresolved-invocations`: "Every macro
+/// invocation resolves to a valid definition that exists in the final AST or in an external
+/// crate." So each call takes the glob's candidate at once, without waiting for the module's
+/// other calls, and a later write of the name by an expansion is the error. The crate: `mod defs
+/// { pub macro D1; pub macro D2; pub macro mk; }`, `mod a { use crate::defs::*; #[derive(D1, D2)]
+/// struct S; }`; in `b` the same with `crate::defs::mk!()` whose expansion writes a macro `D1`
+/// into `b` (the time-travel error at `b`'s `D1` call, whose answer stays the glob's `D1` in
+/// either order). Controls: `MacroGlobWaits` stalls `a` and fails a derive of it, and reports
+/// no error in `b` (it takes the written `D1`).
+#[test]
+fn two_calls_named_through_a_glob_do_not_wait_on_each_other() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let defs = w.module(root, "defs", V::Pub);
+    let derive = crate::DefKind::Macro(crate::MacroShapes::DERIVE);
+    let d1 = w.item(defs, "D1", Namespace::Macros, derive, V::Pub);
+    let d2 = w.item(defs, "D2", Namespace::Macros, derive, V::Pub);
+    w.item(defs, "mk", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+    let a = w.module(root, "a", V::Pub);
+    w.glob(a, "crate::defs", V::Priv);
+    let c1 = w.call(a, "D1", crate::CallShape::Derive);
+    let c2 = w.call(a, "D2", crate::CallShape::Derive);
+    let b = w.module(root, "b", V::Pub);
+    w.glob(b, "crate::defs", V::Priv);
+    let b1 = w.call(b, "D1", crate::CallShape::Derive);
+    let mk = w.call(b, "crate::defs::mk", crate::CallShape::FnLike);
+    w.item(mk, "D1", Namespace::Macros, derive, V::Pub);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(ok.call_outcome(c1), Some(Outcome::Called(d)) if d.key == d1), "{:?}", ok.call_outcome(c1));
+    assert!(matches!(ok.call_outcome(c2), Some(Outcome::Called(d)) if d.key == d2), "{:?}", ok.call_outcome(c2));
+    assert!(matches!(ok.call_outcome(b1), Some(Outcome::Called(d)) if d.key == d1), "{:?}", ok.call_outcome(b1));
+    assert_eq!(ok.stats.r6_errors, 1, "the later write of `D1` into `b` is the error");
+    let bad = cells_of(&w, root, CellPlant::MacroGlobWaits);
+    // The two wait on each other and the group stalls. Until runner 14 the stall failed its
+    // sink; since `a_stalled_call_a_decided_glob_source_names_resolves` the stall selects the
+    // decided glob candidate, so the control shows as the stall alone, and as `b1` below.
+    assert!(bad.stats.stalls > ok.stats.stalls, "the control MacroGlobWaits: {:?} {:?}, stalls {}", bad.call_outcome(c1), bad.call_outcome(c2), bad.stats.stalls);
+    assert!(matches!(bad.call_outcome(b1), Some(Outcome::Called(d)) if d.key != d1) && bad.stats.r6_errors == 0, "the control MacroGlobWaits in `b`: {:?}", bad.call_outcome(b1));
+}
+
+/// icu_normalizer and icu_properties on tempo's graph (c10-r13c: "lost call Plain ["yoke",
+/// "Yokeable"] -> Some(Failed(NotFound))" and `["zerofrom", "ZeroFrom"]`, 16 in all:
+/// `use icu_provider::prelude::*;` brings `yoke` and `zerofrom`, and each struct is
+/// `#[derive(.., yoke::Yokeable, zerofrom::ZeroFrom)]`). The Reference,
+/// `names.resolution.expansion.speculation`: "All name resolution candidates selected during
+/// macro expansion are considered speculative. Once the crate has been fully expanded, all
+/// speculative import resolutions are validated to ensure that macro expansion did not introduce
+/// any new ambiguities." The first segment of a call's path is such a candidate, in the type
+/// namespace: it is taken from the glob at once, with a watch, as the macro's own name is. The
+/// crate: `mod defs { pub mod yoke { pub macro D1; pub macro D2; } }`, `mod a { use
+/// crate::defs::*; #[derive(yoke::D1, yoke::D2)] struct S; }`. Both derives resolve. Control
+/// `CallPrefixGlobWaits`: each waits on the other's growth, the group stalls and a derive fails.
+/// Prints: "test cells::tests::a_calls_first_segment_through_a_glob_does_not_wait ... ok".
+#[test]
+fn a_calls_first_segment_through_a_glob_does_not_wait() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let defs = w.module(root, "defs", V::Pub);
+    let yoke = w.module(defs, "yoke", V::Pub);
+    let derive = crate::DefKind::Macro(crate::MacroShapes::DERIVE);
+    let d1 = w.item(yoke, "D1", Namespace::Macros, derive, V::Pub);
+    let d2 = w.item(yoke, "D2", Namespace::Macros, derive, V::Pub);
+    let a = w.module(root, "a", V::Pub);
+    w.glob(a, "crate::defs", V::Priv);
+    let c1 = w.call(a, "yoke::D1", crate::CallShape::Derive);
+    let c2 = w.call(a, "yoke::D2", crate::CallShape::Derive);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(ok.call_outcome(c1), Some(Outcome::Called(d)) if d.key == d1), "{:?}", ok.call_outcome(c1));
+    assert!(matches!(ok.call_outcome(c2), Some(Outcome::Called(d)) if d.key == d2), "{:?}", ok.call_outcome(c2));
+    assert_eq!(ok.stats.r6_errors, 0);
+    let bad = cells_of(&w, root, CellPlant::CallPrefixGlobWaits);
+    let failed = [c1, c2].iter().filter(|c| matches!(bad.call_outcome(**c), Some(Outcome::Failed(Unresolved::NotFound)))).count();
+    assert!(failed >= 1 && bad.stats.stalls > ok.stats.stalls, "the control CallPrefixGlobWaits: {:?} {:?}, stalls {}", bad.call_outcome(c1), bad.call_outcome(c2), bad.stats.stalls);
+}
+
+/// zerocopy on tempo's graph (c10-r13a, `--roots zerocopy`: "lost call Plain
+/// ["impl_for_transmute_from"] -> Some(Failed(NotFound))", 66 of them, each in a different
+/// module: the macro's own expansion is `const _: () = { .. impl_for_transmute_from!(@..); .. }`,
+/// and a body's block that holds an impl is a module of its own with no `mod` line). The
+/// Reference, `macro.decl.scope.textual`: "Textual scope is based largely on the order that
+/// things appear in source files, and works similarly to the scope of local variables declared
+/// with `let` except it also applies at the module level. When `macro_rules!` is used to define
+/// a macro, the macro enters the scope after the definition (note that it can still be used
+/// recursively, since names are looked up from the invocation site), up until its surrounding
+/// scope, typically a module, is closed." So a block reads what is in scope where its body is
+/// written. The crate: `macro_rules! far; macro_rules! mk; mod b { macro_rules! before;
+/// const _: () = { far!(); before!(); after!(); }; macro_rules! after; } mod e { mk!(); }`,
+/// `mk!()` writing `macro_rules! inner; const _: () = { inner!(); far!(); };`. `far`, `before`
+/// and `inner` resolve (the body's place is in `b`'s text after `before`, and in the expansion
+/// after `inner`); `after` is defined after the body and is not found. Control
+/// `BlockHasNoPlace`: every one of them is not found.
+/// Prints: "test cells::tests::a_blocks_module_reads_the_textual_scope_around_its_body ... ok".
+#[test]
+fn a_blocks_module_reads_the_textual_scope_around_its_body() {
+    let fn_like = crate::CallShape::FnLike;
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let far = w.rules(root, "far");
+    w.rules(root, "mk");
+    let b = w.module(root, "b", V::Pub);
+    let before = w.rules(b, "before");
+    w.rules(b, "after");
+    let blk = w.module(b, "blk", V::Priv);
+    w.decls.get_mut(&b).expect("b's text").mods.retain(|c| c.module != blk);
+    let (c_far, c_before, c_after) = (w.call(blk, "far", fn_like), w.call(blk, "before", fn_like), w.call(blk, "after", fn_like));
+    let e = w.module(root, "e", V::Pub);
+    let mk = w.call(e, "mk", fn_like);
+    let inner = w.rules(mk, "inner");
+    let blk2 = w.module(e, "blk2", V::Priv);
+    w.decls.get_mut(&e).expect("e's text").mods.retain(|c| c.module != blk2);
+    let (c_inner, c_far2) = (w.call(blk2, "inner", fn_like), w.call(blk2, "far", fn_like));
+    // `before` is `b`'s first ordered entry, `inner` the expansion's first: each body follows it.
+    let place = |m: ItemKey| if m == blk { Some((b, 1)) } else if m == blk2 { Some((mk, 1)) } else { None };
+    let run = |plant: CellPlant| {
+        let mut c = cells_of(&w, root, plant);
+        assert_eq!(c.load_more_at(&w, &[blk, blk2], &place).map_err(|e| format!("{e}")), Ok(2));
+        let expand = |call: ItemKey, _: crate::Def| {
+            w.expanded.borrow_mut().insert(call);
+        };
+        c.run(&w, &expand, &[]).unwrap_or_else(|e| panic!("the core runs: {e}"));
+        c
+    };
+    let ok = run(CellPlant::None);
+    for (call, def, what) in [(c_far, far, "far"), (c_before, before, "before"), (c_inner, inner, "inner"), (c_far2, far, "far, from the expansion's block")] {
+        assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == def), "`{what}!`: {:?}", ok.call_outcome(call));
+    }
+    assert!(matches!(ok.call_outcome(c_after), Some(Outcome::Failed(Unresolved::NotFound))), "`after!`, defined after the body: {:?}", ok.call_outcome(c_after));
+    let bad = run(CellPlant::BlockHasNoPlace);
+    for (call, what) in [(c_far, "far"), (c_before, "before"), (c_inner, "inner"), (c_far2, "far, from the expansion's block")] {
+        assert!(matches!(bad.call_outcome(call), Some(Outcome::Failed(Unresolved::NotFound))), "the control, `{what}!`: {:?}", bad.call_outcome(call));
+    }
+}
+
+/// alloy_primitives on tempo's graph (c10-r13d: "lost call Plain ["paste", "paste"] ->
+/// Some(Failed(NotFound))", src/map/fixed.rs:30: `mod map { pub use fixed::*; mod fixed { use
+/// super::*; paste::paste! { .. } } }`, the eight `pub type ..Map` aliases it writes absent).
+/// The call reads `paste` in the type namespace of `fixed`; `fixed`'s glob reads `map`, whose
+/// glob reads `fixed`, whose own cell waits on its growth: that very call. The Reference,
+/// `names.resolution.expansion.unresolved-invocations`: "Every macro invocation resolves to a
+/// valid definition that exists in the final AST or in an external crate.", and
+/// `names.resolution.expansion.speculation`: "All name resolution candidates selected during
+/// macro expansion are considered speculative. Once the crate has been fully expanded, all
+/// speculative import resolutions are validated to ensure that macro expansion did not introduce
+/// any new ambiguities." So in the stalled group the module's own view of `paste` is absent,
+/// the first segment goes outward to the extern prelude's crate (`names.preludes.extern`), the
+/// rest of the path is read from the dependency's decided names, and the call resolves; what it
+/// writes is then read by the glob (`T` through `map`). Control `StallFailsOuterPrefixCall`:
+/// the call fails as not found and `T` is absent.
+/// Prints: "test cells::tests::a_stalled_call_whose_first_segment_is_an_outer_crate_resolves ... ok".
+#[test]
+fn a_stalled_call_whose_first_segment_is_an_outer_crate_resolves() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let paste = w.item(dep, "paste", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+    w.dep(root, "paste", dep);
+    let map = w.module(root, "map", V::Pub);
+    let fixed = w.module(map, "fixed", V::Priv);
+    w.glob(map, "self::fixed", V::Pub);
+    w.glob(fixed, "super", V::Priv);
+    let call = w.call(fixed, "paste::paste", crate::CallShape::FnLike);
+    let t = w.item(call, "T", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let mut ok = with_dep(&w, root, dep, CellPlant::None);
+    assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == paste), "{:?}", ok.call_outcome(call));
+    assert_eq!(found(ok.ask(map, Namespace::Types, "T").expect("asks")), Some(t), "what the call writes, through `map`'s glob");
+    assert_eq!(ok.stats.r6_errors, 0);
+    let mut bad = with_dep(&w, root, dep, CellPlant::StallFailsOuterPrefixCall);
+    assert!(matches!(bad.call_outcome(call), Some(Outcome::Failed(Unresolved::NotFound))), "the control: {:?}", bad.call_outcome(call));
+    assert_eq!(found(bad.ask(map, Namespace::Types, "T").expect("asks")), None, "the control: nothing was written");
+}
+
+/// objc2_core_foundation and objc2_open_directory on tempo's graph (c10-r14b: "lost call Plain
+/// ["cf_objc2_type"] -> Some(Failed(NotFound))", 4 in `generated` and 5 with 5 `cf_type` in
+/// open_directory's `CFOpenDirectory`: `use objc2::__framework_prelude::*; use crate::*;` in a
+/// module that also globs its children, while the root globs it: `cf_type!(..);
+/// cf_objc2_type!(..);` one after the other). Each call's macro is a glob candidate from the
+/// dependency; the module's `Globs` cell waits on the root's, which waits on the module's own
+/// growth: its calls; each later call's textual read waits on the call before it, and the
+/// stall failed that earlier call first. The Reference, `names.resolution.expansion.speculation`:
+/// "All name resolution candidates selected during macro expansion are considered speculative.
+/// Once the crate has been fully expanded, all speculative import resolutions are validated to
+/// ensure that macro expansion did not introduce any new ambiguities.", and
+/// `...unresolved-invocations`: "Every macro invocation resolves to a valid definition that
+/// exists in the final AST or in an external crate." So the candidate a glob source holds
+/// decided is selected at the stall, and validated when the crate is expanded. The crate:
+/// dependency `e` with `pub macro m1; pub macro m2;`, `pub use self::g::*;` at the root, `mod g
+/// { use e::*; use crate::*; m1!(); m2!(); }`, `m1!()` writing `struct T`. Both calls resolve
+/// and `T` reaches the root. Control `StallFailsGlobCall`: `m1!` fails as not found.
+/// Prints: "test cells::tests::a_stalled_call_a_decided_glob_source_names_resolves ... ok".
+#[test]
+fn a_stalled_call_a_decided_glob_source_names_resolves() {
+    let fn_like = crate::DefKind::Macro(crate::MacroShapes::FN_LIKE);
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let m1 = w.item(dep, "m1", Namespace::Macros, fn_like, V::Pub);
+    let m2 = w.item(dep, "m2", Namespace::Macros, fn_like, V::Pub);
+    w.dep(root, "e", dep);
+    let g = w.module(root, "g", V::Pub);
+    w.glob(root, "self::g", V::Pub);
+    w.glob(g, "e", V::Priv);
+    w.glob(g, "crate", V::Priv);
+    let c1 = w.call(g, "m1", crate::CallShape::FnLike);
+    let c2 = w.call(g, "m2", crate::CallShape::FnLike);
+    let t = w.item(c1, "T", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let mut ok = with_dep(&w, root, dep, CellPlant::None);
+    assert!(matches!(ok.call_outcome(c1), Some(Outcome::Called(d)) if d.key == m1), "{:?}", ok.call_outcome(c1));
+    assert!(matches!(ok.call_outcome(c2), Some(Outcome::Called(d)) if d.key == m2), "{:?}", ok.call_outcome(c2));
+    assert_eq!(found(ok.ask(root, Namespace::Types, "T").expect("asks")), Some(t), "what `m1!` writes, through the root's glob");
+    assert_eq!(ok.stats.r6_errors, 0);
+    let bad = with_dep(&w, root, dep, CellPlant::StallFailsGlobCall);
+    assert!(matches!(bad.call_outcome(c1), Some(Outcome::Failed(Unresolved::NotFound))), "the control: {:?}", bad.call_outcome(c1));
 }

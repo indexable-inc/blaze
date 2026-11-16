@@ -97,17 +97,36 @@ pub(crate) fn files_under(folder: &str) -> Result<std::vec::Vec<(std::string::St
     let failed = |why: std::string::String| NativeScriptError::Files { folder: folder.to_owned(), why };
     let (io, root) = native_world(Path::new(folder)).map_err(|e| failed(e.to_string()))?;
     let cx = io.cx(Duration::from_secs(60), TASK_FRAME).map_err(|_| failed("its world stopped".to_owned()))?;
-    let listed = root.list(&cx, cx.frame()).map_err(|e| failed(e.to_string()))?;
-    let mut out = std::vec::Vec::new();
-    for (path, meta) in listed.iter() {
-        if meta.dir {
-            continue;
+    // `folder` is one build script's `OUT_DIR`: everything the script left there is its
+    // output, so the walk enters every folder of it (never the package's sources or a
+    // checkout: those are not under it). The limits fit the largest outputs met (a C
+    // library's objects and generated headers: a few thousand files in a few dozen folders)
+    // with room, and refuse, naming the folder, a script that left a tree no record should
+    // hold: 4,096 folders, 262,144 entries in all, 64 levels deep.
+    let limits = bstd::fs::WalkLimits { folders: 4096, entries: 1 << 18, depth: 64 };
+    let mut paths = std::vec::Vec::new();
+    root.walk(&cx, None, limits, cx.frame(), |entries, enter| {
+        for i in 0..entries.len() {
+            // A folder is walked, not read; anything else is an output, as it was listed.
+            if entries.kind(i) == bstd::fs::EntryKind::Dir {
+                continue;
+            }
+            paths.push(entries.path(i).map_err(|e| format!("{}: not a path: {e:?}", entries.name(i)))?);
         }
+        enter.enter_all();
+        Ok::<(), std::string::String>(())
+    })
+    .map_err(|e| failed(e.to_string()))?;
+    let mut out = std::vec::Vec::new();
+    for path in &paths {
         let cx = io.cx(Duration::from_secs(60), TASK_FRAME).map_err(|_| failed("its world stopped".to_owned()))?;
         let mut bytes = Bytes::new_in(cx.frame(), "a native build script's output file");
         root.read_all(&cx, path, &mut bytes).map_err(|e| failed(format!("{}: {e}", path.as_str())))?;
         out.push((path.as_str().to_owned(), bytes.as_slice().to_vec()));
     }
+    // Sorted by the paths' bytes, as the outputs record has always had them (the walk's own
+    // order compares part by part).
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 

@@ -14,7 +14,7 @@
 //! - A zero-sized type takes nothing ([`Class::Ignore`]), as GNU C's empty struct.
 //! - Refused by name ([`CAbiError`]): a union, an enum with fields (C has neither in this
 //!   form; `repr(C)` enums of fields are a later piece), an unsized type, an `f128` or a
-//!   vector.
+//!   `repr(simd)` vector, alone or inside an aggregate (its SIMD register is not built).
 //!
 //! # Assignment ([`assign`])
 //!
@@ -128,6 +128,11 @@ pub fn class_of<A: Allocator + Clone>(ls: &mut Layouts<A>, ty: PTy, cx: &mut Lay
         }
         let node = cx.ground.view().nodes.get(t.0 as usize).copied();
         match node {
+            // A short vector (layout/simd.rs) is a fundamental type of its own (AAPCS64 5.9):
+            // passed in ONE SIMD register, never as an HFA of its lanes or in `x` registers.
+            Some(PNode::Adt(key, _)) if cx.facts.repr(key).simd => {
+                return Err(refused("a `repr(simd)` vector (AAPCS64 passes it in one SIMD register, which blaze's C calls do not build yet)"));
+            }
             Some(PNode::Adt(key, _)) => match cx.facts.adt(key).map(|a| a.kind) {
                 Some(AdtKind::Union) => return Err(refused("a union")),
                 Some(AdtKind::Enum) if tl.scalar.is_none() => return Err(refused("an enum with fields")),

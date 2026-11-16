@@ -98,6 +98,12 @@ pub enum FactKind {
     Closure = 19,
     /// The generics of a trait's associated type. `key`: the trait; `detail`: the name.
     AssocGenerics = 20,
+    /// One crate's bucket of impls the world read to answer an impl question over records
+    /// (front2 buckets/asked.rs `BucketRead`). `key`: the first 16 bytes of the crate's key (0
+    /// for a fact of the whole graph); `detail`: the bucket (the first 8 bytes of its key's
+    /// digest, or `buckets::UNFILED_LIST`, or `buckets::INCOHERENT_FACT`). Its answer is the
+    /// bucket's own digest: an impl added to another bucket or crate leaves it equal.
+    CrateBucket = 21,
 }
 
 /// One fact a body's check asked for (module docs). Ordered as its bytes are
@@ -341,10 +347,35 @@ pub fn fact_of(q: Question, module: tc::ItemKey, paths: &[BodyPath], segments: &
 /// one), sorted by fact, one row per fact. Two questions that are one fact must have one
 /// answer.
 pub fn facts_of<'a>(questions: &[Question], answers: Option<&[u64]>, module: tc::ItemKey, paths: &[BodyPath], segments: &[Segment], alloc: Alloc<'a>) -> Result<AVec<'a, Read>, ReadsError> {
+    facts_with_buckets(questions, answers, module, paths, segments, None, alloc)
+}
+
+/// [`facts_of`] that also lists, for each impl question (`ImplsOf`, `Inherent`), the buckets
+/// of each crate the world read to answer it (`buckets::asked`: `Buckets::trait_reads`,
+/// `Buckets::inherent_reads`; a pure function of the question and the records, whichever body
+/// asked first) as [`FactKind::CrateBucket`] rows: `key` the crate, `detail` the bucket, each
+/// with its own answer digest. Over the solved names no bucket is read and no row is added.
+pub fn facts_with_buckets<'a>(
+    questions: &[Question],
+    answers: Option<&[u64]>,
+    module: tc::ItemKey,
+    paths: &[BodyPath],
+    segments: &[Segment],
+    buckets: Option<&super::buckets::Buckets>,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, Read>, ReadsError> {
     let mut rows: AVec<'a, Read> = AVec::new_in(alloc);
     for (i, &q) in questions.iter().enumerate() {
         let answer = answers.and_then(|all| all.get(i).copied());
         rows.push(Read { fact: fact_of(q, module, paths, segments)?, answer });
+        let read = match (buckets, q) {
+            (Some(b), Question::ImplsOf(trait_, shape)) => b.trait_reads(trait_, shape),
+            (Some(b), Question::Inherent(shape, _)) => b.inherent_reads(shape),
+            _ => &[],
+        };
+        for bucket in read {
+            rows.push(Read { fact: Fact { kind: FactKind::CrateBucket, key: bucket.krate, detail: bucket.bucket }, answer: Some(bucket.answer) });
+        }
     }
     rows.sort_unstable();
     let mut kept = 0;

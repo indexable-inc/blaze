@@ -4,8 +4,8 @@
 //! by (space, symbol). The pass's side is pass/sites.rs; here its rows of reference places
 //! become `blaze_code` targets through the caller's [`Names`].
 //!
-//! The record comes back unsealed: its caller adds the frame word and landing pads when it has
-//! them, then `CodeRecord::seal` sorts the targets by (space, symbol) and the sites by offset,
+//! The record comes back unsealed, with its frame word and one unwind row a call (pass/unwind.rs);
+//! its caller then calls `CodeRecord::seal`, which sorts the targets by (space, symbol) and the sites by offset,
 //! so the same function gives the same bytes (rule 25).
 
 use core::fmt;
@@ -154,6 +154,7 @@ pub(crate) fn emit_record_up_to<'a>(
         };
         record.words.push(Word { at: row.at, target, addend: row.addend });
     }
+    pass::unwind::into_record(&form.unwind, &mut record).map_err(RecordEmitError::Emit)?;
     Ok((record, form.insts))
 }
 

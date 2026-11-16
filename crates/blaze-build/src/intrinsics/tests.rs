@@ -105,8 +105,9 @@ fn the_table_is_sorted_whole_and_refuses_what_it_lacks() {
         assert_eq!(e.which.entry().name, e.name, "one row per intrinsic");
         assert!(!e.meaning.is_empty() && !e.built.is_empty());
     }
-    let refused = Which::named("simd_add").unwrap_err();
-    assert_eq!(refused.to_string(), "intrinsic `simd_add` is not in blaze's intrinsics table (crates/blaze-build/src/intrinsics.rs)");
+    // `simd_add` is intrinsics/simd.rs's row now; `simd_shuffle` is in no table.
+    let refused = Which::named("simd_shuffle").unwrap_err();
+    assert_eq!(refused.to_string(), "intrinsic `simd_shuffle` is not in blaze's intrinsics table (crates/blaze-build/src/intrinsics.rs)");
 }
 
 /// Two-operand integer intrinsics, each case `(intrinsic, T, x, y, results)`, run.
@@ -428,4 +429,91 @@ fn caller_location_is_a_location_in_data() {
     assert_eq!((&row[16..20], &row[20..24]), (&7u32.to_le_bytes()[..], &5u32.to_le_bytes()[..]), "line, then col");
     let relocs = v.data_relocs_of(DataId(1));
     assert_eq!((relocs.len(), relocs[0].offset), (1, 0), "the filename's address is a relocation");
+}
+
+/// `three_way_compare`: "Does a three-way comparison between the two arguments, which must be
+/// of character or integer (signed or unsigned) type." (core/src/intrinsics/mod.rs), its
+/// result `cmp::Ordering` (`#[repr(i8)]`: Less = -1, Equal = 0, Greater = 1) as the `i8`
+/// scalar. A builder that compares a signed `T` unsigned fails the `-1` vs `1` case (it says
+/// Greater); one that compares `u32` signed fails `u32::MAX` vs `1` (it says Less). Passes
+/// silently; on a wrong answer it prints e.g. "ThreeWayCompare::<Int(I32)>(0xffffffff, 0x1)".
+#[test]
+fn three_way_compare_orders_by_the_types_signedness() {
+    const LESS: u128 = 0xff;
+    let cases: &[(PNode, u128, u128, u128)] = &[
+        (I32, 0xffff_ffff, 1, LESS),
+        (U32, 0xffff_ffff, 1, 1),
+        (PNode::Char, 'a' as u128, 'a' as u128, 0),
+        (I8, 0x80, 0x7f, LESS),
+        (U8, 3, 3, 0),
+        (U64, 2, 7, LESS),
+        (ISIZE, 5, 0xffff_ffff_ffff_fffe, 1),
+    ];
+    for &(t, x, y, want) in cases {
+        let mut env = Env::new();
+        let tp = env.g.n(t);
+        let i8_ = env.g.n(I8);
+        let ty = if t == PNode::Char { Ty::I32 } else { lir_of(t) };
+        let f = func(&[ty, ty], &[Ty::I8], |b, a| {
+            let c = Call { which: Which::ThreeWayCompare, generics: &[GenericArg::Ty(tp)], args: &[Arg::Scalar(a[0]), Arg::Scalar(a[1])], ret: i8_, site: None };
+            vec![scalar(env.call(b, &c).expect("builds"))]
+        });
+        assert_eq!(eval(&f, &[x, y]), [want], "ThreeWayCompare::<{t:?}>({x:#x}, {y:#x})");
+    }
+    // Not an integer or `char`: refused by name, never guessed.
+    let mut env = Env::new();
+    let bool_ = env.g.n(PNode::Bool);
+    let i8_ = env.g.n(I8);
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let x = b.iconst(Ty::I8, 1);
+    let c = Call { which: Which::ThreeWayCompare, generics: &[GenericArg::Ty(bool_)], args: &[Arg::Scalar(x), Arg::Scalar(x)], ret: i8_, site: None };
+    assert_eq!(
+        env.call(&mut b, &c).unwrap_err().to_string(),
+        "intrinsic `three_way_compare`: `three_way_compare` of a type that is not an integer or `char`"
+    );
+}
+
+/// `slice_get_unchecked::<*const u16, *const [u16], u16>(p, i)`: "Projects to the `index`-th
+/// element of `slice_ptr` ... without a bounds check" (core/src/intrinsics/mod.rs): the wide
+/// pointer's data word (at 0 of its two words), then `ptr_add inbounds` of `i * 2`; no
+/// compare of `i` with the length (the caller's promise, `index < PtrMetadata(slice_ptr)`).
+/// A zero-sized element: the data word itself. A `SlicePtr` to no slice is refused by name.
+/// The run's memory holds no pointers, so this reads the built operations back; the value is
+/// the rung x0-ref-13-slice-get-unchecked's. Passes silently.
+#[test]
+fn slice_get_unchecked_projects_without_a_check() {
+    let mut env = Env::new();
+    let u16_ = env.g.n(U16);
+    let slice = env.g.n(PNode::Slice(u16_));
+    let sp = env.g.n(PNode::Ptr(blaze_typeck::Mutbl::Not, slice));
+    let ip = env.g.n(PNode::Ptr(blaze_typeck::Mutbl::Not, u16_));
+    let unit = env.g.tuple(&[]);
+    let units = env.g.n(PNode::Slice(unit));
+    let usp = env.g.n(PNode::Ptr(blaze_typeck::Mutbl::Not, units));
+    let uip = env.g.n(PNode::Ptr(blaze_typeck::Mutbl::Not, unit));
+    let mut get = |b: &mut Builder<Global, Full>, item: PTy, slice_ptr: PTy, elem: PTy, index: Value| {
+        let slot = b.slot(16, 3, SlotKind::Temp);
+        let at = b.slot_addr(slot);
+        let c = Call {
+            which: Which::SliceGetUnchecked,
+            generics: &[GenericArg::Ty(item), GenericArg::Ty(slice_ptr), GenericArg::Ty(elem)],
+            args: &[Arg::Place(at), Arg::Scalar(index)],
+            ret: item,
+            site: None,
+        };
+        env.call(b, &c)
+    };
+    let f = func(&[Ty::I64], &[Ty::PTR], |b, a| vec![scalar(get(b, ip, sp, u16_, a[0]).expect("builds"))]);
+    let built = ops(&f);
+    assert!(built.contains(&(Op::Mul, Flags::NUW)), "index times the stride: {built:?}");
+    assert!(built.contains(&(Op::PtrAdd, Flags::INBOUNDS)), "an in-bounds projection: {built:?}");
+    assert!(!built.iter().any(|&(op, _)| op == Op::Icmp), "no bounds check: {built:?}");
+    let f = func(&[Ty::I64], &[Ty::PTR], |b, a| vec![scalar(get(b, uip, usp, unit, a[0]).expect("builds"))]);
+    assert!(!ops(&f).iter().any(|&(op, _)| op == Op::PtrAdd), "a zero-sized element is at the data word: {:?}", ops(&f));
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let i = b.iconst(Ty::I64, 0);
+    assert_eq!(
+        get(&mut b, ip, ip, u16_, i).unwrap_err().to_string(),
+        "intrinsic `slice_get_unchecked`: `slice_get_unchecked` of a `SlicePtr` that is not a pointer to a slice"
+    );
 }

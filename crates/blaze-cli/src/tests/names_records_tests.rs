@@ -42,7 +42,7 @@ impl LoadItems<'static> for OneItems {
 /// names first and `reader`'s from `filed`'s record as the store hands it back: that payload,
 /// kept by the names step's test watch, is what this test reads.
 ///
-/// 1. `sections` of it gives four sections; the names section, through `RecordNames`, answers
+/// 1. `sections` of it gives five sections (the tests section empty: a plain library); the names section, through `RecordNames`, answers
 ///    the path `crate::m::f` in the value namespace from `filed`'s root (two segments
 ///    consumed: the Rust Reference, "Paths", `crate` names the crate root), and `crate::m` in
 ///    the type namespace as a module;
@@ -86,6 +86,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
     // 1. The names section answers `crate::m::f` and `crate::m`.
     let parts = sections(&payload).unwrap_or_else(|e| panic!("`filed`'s payload: {e}"));
     assert!(!parts.exports.is_empty() && !parts.names.is_empty() && !parts.items.is_empty(), "an empty section: {parts:?}");
+    assert!(parts.tests.is_empty(), "`filed`'s plain library is not compiled with `test`, so it has no tests record: {parts:?}");
     let g = blaze_own::Alloc::global();
     let names_bytes = aligned(parts.names, g);
     let items_bytes = aligned(parts.items, g);
@@ -111,7 +112,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
     // 3. Cut short at every section boundary: a typed refusal.
     let start = payload.as_ptr().addr();
     let mut cuts = std::vec::Vec::from([0, HEAD - 1, HEAD]);
-    for part in [parts.exports, parts.inner, parts.names, parts.items] {
+    for part in [parts.exports, parts.inner, parts.names, parts.items, parts.tests] {
         let at = part.as_ptr().addr() - start;
         cuts.extend([at, at + part.len()]);
     }
@@ -122,9 +123,11 @@ fn a_crate_scope_record_files_its_names_and_items() {
             other => panic!("a payload cut at byte {cut} of {} was not refused as short: {other:?}", payload.len()),
         }
     }
+    // The tests section is empty here: it sits at the items' end rounded up to 16, so one byte
+    // off the end cuts either the items record or the padding before the empty tests record.
     assert!(
-        matches!(sections(&payload[..payload.len() - 1]), Err(SectionsError::Short { section: Section::Items, .. })),
-        "one byte off the end is the items record cut short"
+        matches!(sections(&payload[..payload.len() - 1]), Err(SectionsError::Short { section: Section::Items | Section::Tests, .. })),
+        "one byte off the end is the items record, or the place of the empty tests record, cut short"
     );
     let mut longer = payload.clone();
     longer.push(0);
@@ -132,4 +135,80 @@ fn a_crate_scope_record_files_its_names_and_items() {
     let mut older = payload.clone();
     older[4] = 1;
     assert!(matches!(sections(&older), Err(SectionsError::Form { form: 1, .. })), "another form's number is refused");
+}
+
+/// The tests record filed as the fifth section of a TEST unit's `CrateScope` payload (test.md,
+/// "The tests record", piece 6). A one-member workspace whose library holds a `#[cfg(test)]`
+/// module of two tests, one `#[ignore = "slow"]`, and one `#[should_panic(expected = "boom")]`
+/// at the root; the check makes the library's plain unit and its test unit (the unit graph's
+/// `Test { bin: None }`), and the names step writes the test unit's payload, kept by its watch.
+///
+/// The Reference, "Testing attributes": tests are "only compiled when in test mode"; `ignore`
+/// "may optionally be written with the MetaNameValueStr syntax to specify a reason"; the
+/// `should_panic` "input string ... must appear within the panic message". So: the payload's
+/// `sections` give a non-empty tests section; `TestsRecord::open` of it lists exactly the three
+/// tests in path order (`boom`, `tests::fast`, `tests::slow`) with their flags, and not the
+/// plain `helper`; the payload, written again from its own five sections, is the same bytes
+/// (the round trip); and the plain unit's payload (the first test) has an empty tests section.
+///
+/// A names step that drops the tests record (form 2's four sections) fails at "no payload with
+/// a tests section"; a tests section put in the items' place fails `TestsRecord::open`.
+///
+/// Expected, from `LANECHECK_WAIT=540 bash /Volumes/Projects/blaze-int-1112-notes/lanecheck.sh
+/// blaze-cli test names_records_tests`:
+/// `test tests::names_records_tests::a_test_units_payload_files_its_tests_record ... ok`.
+#[test]
+fn a_test_units_payload_files_its_tests_record() {
+    use blaze_scope::tests_record::{ShouldPanic, TestsRecord};
+
+    use crate::names::sections::{WATCHED_TESTS, write as write_payload};
+
+    {
+        let mut watched = WATCHED_TESTS.lock();
+        watched.krate = "tested";
+        watched.payload.clear();
+    }
+    let io = Io::simulated(SimWorld::new(17, Limits::USUAL));
+    write(&io, "Cargo.toml", "[workspace]\nmembers = [\"tested\"]\nresolver = \"2\"\n");
+    write(&io, "tested/Cargo.toml", "[package]\nname = \"tested\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "tested/src/lib.rs",
+        "pub fn helper() {}\n\n#[test]\n#[should_panic(expected = \"boom\")]\nfn boom() {\n    panic!(\"boom\")\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn fast() {}\n\n    #[test]\n    #[ignore = \"slow\"]\n    fn slow() {}\n}\n",
+    );
+    let checked = check(&io, work::Sizes::USUAL);
+    let out = stdout(&io);
+    let payload: std::vec::Vec<u8> = {
+        let mut watched = WATCHED_TESTS.lock();
+        watched.krate = "";
+        let kept = watched.payload.to_vec();
+        watched.payload.clear();
+        kept
+    };
+    assert!(checked.failed.is_empty(), "{:?}\n{out}", checked.failed);
+    assert!(!payload.is_empty(), "no payload with a tests section was written for `tested`'s test unit:\n{out}\n{}", checked.profile);
+
+    let parts = sections(&payload).unwrap_or_else(|e| panic!("the test unit's payload: {e}"));
+    assert!(!parts.tests.is_empty(), "the test unit's tests section is empty: {parts:?}");
+    let g = blaze_own::Alloc::global();
+    let record = TestsRecord::open(aligned(parts.tests, g)).unwrap_or_else(|e| panic!("the tests section does not open: {e}"));
+    let mut rows = std::vec::Vec::new();
+    for at in 0..record.len() {
+        let row = record.row(at).unwrap_or_else(|e| panic!("row {at}: {e}")).unwrap_or_else(|| panic!("no row {at} below {}", record.len()));
+        rows.push((row.path, row.ignore, row.should_panic, row.bench));
+    }
+    assert_eq!(
+        rows,
+        [
+            ("boom", None, ShouldPanic::WithMessage("boom"), false),
+            ("tests::fast", None, ShouldPanic::No, false),
+            ("tests::slow", Some("slow"), ShouldPanic::No, false),
+        ],
+        "the test unit's tests, in path order"
+    );
+    assert!(record.find("helper").unwrap_or_else(|e| panic!("find: {e}")).is_none(), "`helper` is no test");
+
+    // The round trip: the payload written again from its own sections is the same bytes.
+    let again = write_payload(parts.unresolved, [parts.exports, parts.inner, parts.names, parts.items, parts.tests]);
+    assert_eq!(again.as_slice(), payload.as_slice(), "the payload written from its five sections differs from the one filed");
 }

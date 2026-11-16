@@ -1007,4 +1007,45 @@ mod tests {
             }
         }
     }
+
+    /// The words `each_input_token` gives, with `JOINT` set in the word before a token it says
+    /// joins and the pad after, are `to_input`'s tokens field for field, and each token's bytes
+    /// are the bytes of the lexer's token that is not trivia, in order: columns filled in that
+    /// one pass parse as the `Input` does.
+    #[test]
+    fn the_input_a_token_at_a_time_is_the_input() {
+        let mut texts = super::differential::parser_files();
+        texts.push(
+            "fn f() { x.0.1 + 1. + 1.5 + 1e3; union::default; a+b-1.5-c; dyn auto macro_rules! /* c */ }"
+                .to_owned(),
+        );
+        texts.push(String::new());
+        for text in &texts {
+            for edition in Edition::iter() {
+                let lexed = LexedStr::new(edition, text);
+                let (mut words, mut ranges) = (Vec::new(), Vec::new());
+                let mut joiner = crate::Joiner::new();
+                lexed.each_input_token(edition, &mut joiner, |word, bytes, joins| {
+                    if joins {
+                        *words.last_mut().expect("a token joins one given before it") |= crate::JOINT;
+                    }
+                    words.push(word);
+                    ranges.push(bytes);
+                });
+                words.extend([crate::Tokens::EOF_WORD; crate::Tokens::PAD]);
+                let got = crate::Tokens::new(&words, true);
+                let input = lexed.to_input(edition);
+                let expected = input.tokens();
+                assert_eq!(got.len(), expected.len(), "{edition:?}");
+                for i in 0..got.len() {
+                    assert_eq!(got.token(i), expected.token(i), "token {i} in {edition:?}");
+                }
+                let not_trivia = (0..lexed.len()).filter(|&i| !lexed.kind(i).is_trivia());
+                assert!(
+                    not_trivia.map(|i| lexed.text_range(i)).eq(ranges.iter().cloned()),
+                    "each token's bytes in {edition:?}"
+                );
+            }
+        }
+    }
 }

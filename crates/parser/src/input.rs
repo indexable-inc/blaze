@@ -91,6 +91,44 @@ pub const fn word(kind: SyntaxKind, contextual_kind: SyntaxKind, edition: Editio
         | (edition as u32) << EDITION_SHIFT
 }
 
+/// The kind of the token `word` is the word of ([`word`]). Panics on a word whose kind field is
+/// no `SyntaxKind`, which [`word`] never makes.
+#[inline]
+pub fn word_kind(word: u32) -> SyntaxKind {
+    kind_of(word)
+}
+
+/// Why a word made outside this crate is no token's word ([`token_word`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordRefused {
+    /// One of its two kind fields holds no `SyntaxKind`.
+    Kind,
+    /// Its edition field holds no `Edition`.
+    Edition,
+    /// It is marked with syntax extensions ([`Input::mark_extensions`]): a reader that parses
+    /// Rust's grammar alone does not take it.
+    Extensions,
+}
+
+/// What `word` says of its token alone: the word [`word`] makes of its kind, contextual kind
+/// and edition. [`JOINT`] and [`FRAGMENT`] say where a token stands among others, which is its
+/// reader's to say, and are left out. For a reader handed words it did not make (a rendered
+/// expansion's, blaze-file-items' `outline_tokens`): every word this returns is one
+/// [`Tokens::new`] takes.
+#[inline]
+pub const fn token_word(word: u32) -> Result<u32, WordRefused> {
+    if !has_valid_kinds(word) {
+        return Err(WordRefused::Kind);
+    }
+    if (word >> EDITION_SHIFT) & EDITION_MASK > Edition::LATEST as u32 {
+        return Err(WordRefused::Edition);
+    }
+    if (word >> EXTENSIONS_SHIFT) & EXTENSIONS_MASK != 0 {
+        return Err(WordRefused::Extensions);
+    }
+    Ok(word & (KIND_MASK | KIND_MASK << CONTEXTUAL_SHIFT | EDITION_MASK << EDITION_SHIFT))
+}
+
 /// The word of the `EOF` tokens past the end.
 const EOF_WORD: u32 = word(SyntaxKind::EOF, SyntaxKind::EOF, Edition::LATEST);
 
@@ -162,7 +200,7 @@ impl Input {
     /// Appends a token's word: it takes the place of the first pad word, and a pad word goes
     /// on the end.
     #[inline]
-    fn push_word(&mut self, word: u32) {
+    pub(crate) fn push_word(&mut self, word: u32) {
         let at = self.len();
         self.words[at] = word;
         self.words.push(EOF_WORD);
@@ -379,20 +417,25 @@ impl<'t> Tokens<'t> {
         )
     }
 
+    /// The kind of token `idx`: `EOF` up to [`Tokens::PAD`] tokens past the last, a panic
+    /// past those.
     #[inline]
-    pub(crate) fn kind(self, idx: usize) -> SyntaxKind {
+    pub fn kind(self, idx: usize) -> SyntaxKind {
         kind_of(self.words[idx])
     }
+    /// The contextual keyword an `IDENT` at `idx` spells, or `IDENT`; `EOF` for a token of
+    /// another kind.
     #[inline]
-    pub(crate) fn contextual_kind(self, idx: usize) -> SyntaxKind {
+    pub fn contextual_kind(self, idx: usize) -> SyntaxKind {
         kind_of(self.words[idx] >> CONTEXTUAL_SHIFT)
     }
     #[inline]
     pub(crate) fn edition(self, idx: usize) -> Edition {
         Edition::from_u32((self.words[..self.len()][idx] >> EDITION_SHIFT) & EDITION_MASK)
     }
+    /// Whether token `n` is joint to the next.
     #[inline]
-    pub(crate) fn is_joint(self, n: usize) -> bool {
+    pub fn is_joint(self, n: usize) -> bool {
         self.words[n] & JOINT != 0
     }
     #[inline]

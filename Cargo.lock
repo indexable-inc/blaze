@@ -421,6 +421,7 @@ dependencies = [
  "blaze-proc-macro",
  "blaze-remote",
  "blaze-report",
+ "blaze-run",
  "blaze-scope",
  "blaze-sha256",
  "blaze-sim",
@@ -605,6 +606,16 @@ dependencies = [
  "blaze-surface",
  "parser",
  "rustc_lexer",
+]
+
+[[package]]
+name = "blaze-export"
+version = "0.0.0"
+dependencies = [
+ "blaze-code",
+ "blaze-ids",
+ "blaze-own",
+ "blaze-sha256",
 ]
 
 [[package]]
@@ -1008,6 +1019,7 @@ name = "blaze-ladder"
 version = "0.0.0"
 dependencies = [
  "blaze-build",
+ "blaze-code",
  "blaze-consteval",
  "blaze-emit",
  "blaze-expand",
@@ -1023,6 +1035,7 @@ dependencies = [
  "blaze-lower",
  "blaze-mem",
  "blaze-own",
+ "blaze-run",
  "blaze-scope",
  "blaze-sim",
  "blaze-std",
@@ -1048,8 +1061,11 @@ name = "blaze-launch-rt"
 version = "0.0.0"
 dependencies = [
  "blaze-blake3",
+ "blaze-code",
  "blaze-launch",
+ "blaze-own",
  "blaze-queue",
+ "blaze-run",
  "libc",
 ]
 
@@ -1499,8 +1515,10 @@ dependencies = [
 name = "blaze-run"
 version = "0.0.0"
 dependencies = [
+ "blaze-blake3",
  "blaze-format",
  "blaze-hash",
+ "blaze-launch",
  "blaze-own",
  "blaze-sim",
 ]

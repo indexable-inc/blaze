@@ -11,7 +11,7 @@ use blaze_own::{AVec, Alloc};
 use blaze_surface::{Binding, GlobEdge, ScopeEntry};
 
 use super::{Cells, FragId, NAMESPACES, Outcome, ns_at};
-use crate::{BindingState, Def, Namespace, Origin};
+use crate::{BindingState, Def, DefKind, Namespace, Origin};
 
 /// One module's bindings and glob edges as the cell core decided them.
 pub(crate) struct Written<'a, N> {
@@ -85,6 +85,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
                 continue;
             };
+            // An enum's edge names the enum (its variants are the names it brings).
+            let kind = if self.enum_mods.contains(&source) { DefKind::Enum } else { DefKind::Module };
             let source = self.modules[source as usize].key;
             let expansion = self.depth(it.at);
             match globs.iter_mut().find(|e| e.source.key == source) {
@@ -92,7 +94,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     e.vis = self.wider(e.vis, vis, m);
                     e.expansion = e.expansion.min(expansion);
                 }
-                None => globs.push(GlobEdge { source: Def::module(source), vis, expansion }),
+                None => globs.push(GlobEdge { source: Def { key: source, kind }, vis, expansion }),
             }
         }
         globs.sort_unstable_by_key(|e| e.source.key);

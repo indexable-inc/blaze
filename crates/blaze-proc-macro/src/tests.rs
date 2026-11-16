@@ -18,11 +18,24 @@ use blaze_sim::{Broke, Config, Tape};
 use crate::{
     host::{CallError, CompiledFinding, Limits, Loaded, Refused, Runtime, Settings},
     module::{CrateId, Exported, ModuleRecord, Source, lock_closure, module_key, sha256_hex},
-    record::{DirStore, base_key, find, keep},
+    record::{DirStore, RecordError, base_key, table},
     sandbox::{Files, PACKAGE, Package, Sandbox},
 };
 
 const EDITION: Edition = Edition::E2024;
+
+/// `produced` kept as `base`'s answer in `package`'s crate, as a command does it: the crate's
+/// results opened, the row taken, the table written.
+fn keep(store: &DirStore, base: blaze_ids::ContentId, package: &Package, produced: &Produced<'_>) -> Result<(), RecordError> {
+    let results = table::open(store, table::crate_name(package))?;
+    results.insert(store, base, produced)?;
+    results.keep(store, &[]).map(|_| ())
+}
+
+/// What a later command finds for `base` in `package`'s crate: its table opened again.
+fn find<'a>(store: &DirStore, base: &blaze_ids::ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
+    { let results = table::open(store, table::crate_name(package))?; results.find(store, base, package, &table::Verdicts::of(&results), edition, alloc) }
+}
 
 /// The expansion records under the folder `store`, through a world over that folder.
 fn records_at(store: &Path) -> DirStore {
@@ -384,7 +397,7 @@ fn invalidation(setup: &Setup, tape: &Tape, plant: Plant) -> Result<(), Broke> {
             produced.reads = Reads::new_in(Alloc::global());
         }
         let base = base_key(&setup.module.wasm_sha256, &setup.module.macros[index as usize], EDITION, &call);
-        keep(&store, base, &produced).map_err(|e| harness(&e))?;
+        keep(&store, base, &before, &produced).map_err(|e| harness(&e))?;
     }
     let mut changed = [false; 4];
     for (at, change) in changed.iter_mut().enumerate() {
@@ -432,7 +445,7 @@ fn reader_outputs(setup: &Setup) -> Vec<Vec<u8>> {
     (0..4)
         .map(|index| {
             let produced = run(setup, index, Arc::clone(&pkg), Limits::STANDARD, Alloc::global()).expect("it runs");
-            crate::record::encode(&produced).expect("keepable")
+            crate::record::table::row_bytes(&produced).expect("keepable")
         })
         .collect()
 }
@@ -700,10 +713,10 @@ fn an_answer_of_another_host_version_is_not_read() {
     let now = base_key(&setup.module.wasm_sha256, export, EDITION, &call);
     assert_ne!(old, now);
     let old_store = records_at(&folder("host-version-old"));
-    keep(&old_store, old, &produced).expect("kept under the old version");
+    keep(&old_store, old, &pkg, &produced).expect("kept under the old version");
     assert!(find(&old_store, &now, &pkg, EDITION, Alloc::global()).expect("read").is_none(), "the old host's answer was read");
     let store = records_at(&folder("host-version-now"));
-    keep(&store, now, &produced).expect("kept under this version");
+    keep(&store, now, &pkg, &produced).expect("kept under this version");
     assert!(find(&store, &now, &pkg, EDITION, Alloc::global()).expect("read").is_some(), "control: this version's answer is found");
 }
 
@@ -772,6 +785,94 @@ fn a_malformed_output_is_refused() {
     assert!(matches!(error, CallError::Failed(_) | CallError::Refused(_)), "{error:?}");
 }
 
+/// One command through the hook: the reader's four macros called in two packages (`one`,
+/// `two`) in `order`, then `keep_all`. Each call's row bytes, or `None` for a call the hook
+/// refused; and what was written.
+fn hook_command(setup: &Setup, store_dir: &Path, packages: &[Arc<Package>; 2], order: &[(usize, u32)], limits: Limits) -> (Vec<Option<Vec<u8>>>, crate::hook::KeptAll) {
+    let records = records_at(store_dir);
+    let key = crate::hook::crate_key(&setup.module.key);
+    let mut procs = crate::hook::ProcMacros::new(&setup.runtime, &records, limits);
+    procs.add_crate(key, "test-macros", "0.0.0", Ok(reader_in(&setup.module.dir)));
+    let input = lex("struct A;", EDITION, Alloc::global()).expect("the input lexes");
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+    let mut rows = vec![None; 8];
+    for (package, index) in order {
+        let def = proc_def(key, &format!("m{index}"));
+        let produced = procs.run(&def, &call, EDITION, &packages[*package], Alloc::global());
+        rows[package * 4 + *index as usize] = produced.ok().map(|it| table::row_bytes(&it).expect("keepable"));
+    }
+    (rows, procs.keep_all().unwrap_or_else(|error| panic!("the tables are kept: {error}")))
+}
+
+/// Every file under `dir`, by its path from it, sorted.
+fn files_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut folders = vec![dir.to_owned()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).expect("a folder of the store").map(|it| it.expect("an entry")) {
+            let path = entry.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                let name = path.strip_prefix(dir).expect("under the store").to_string_lossy().into_owned();
+                out.push((name, std::fs::read(&path).expect("a file of the store")));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The hook's round trip. (1) Calls one command ran and kept (`keep_all`) are found by the
+/// next command's fresh `ProcMacros` over the same store as the same rows, with no run: the
+/// second command has no fuel, so a call it ran would be refused (the control: with an
+/// empty store every call of it is). (2) Two commands making the calls in two orders, in two
+/// packages of two crate names, leave equal table files. (3) A changed variable misses
+/// exactly the call that read it: the crate's table stays where it was.
+#[test]
+fn the_hook_keeps_calls_for_the_next_command_whatever_their_order() {
+    let setup = reader();
+    let root = folder("round-ws");
+    std::fs::write(root.join("a.txt"), "alpha").expect("a file");
+    std::fs::write(root.join("b.txt"), "beta").expect("a file");
+    let package_of = |name: &str, foo: &str| package(&root, &[("CARGO_PKG_NAME", name), ("FOO", foo), ("BAR", "2")]);
+    let packages = [package_of("one", "1"), package_of("two", "1")];
+    let forward: Vec<(usize, u32)> = (0..2).flat_map(|package| (0..4).map(move |index| (package, index))).collect();
+    let backward: Vec<(usize, u32)> = forward.iter().rev().copied().collect();
+    let no_fuel = Limits { fuel: 0, ..Limits::STANDARD };
+
+    let (store_a, store_b, empty) = (folder("round-a"), folder("round-b"), folder("round-empty"));
+    let (ran, kept) = hook_command(&setup, &store_a, &packages, &forward, Limits::STANDARD);
+    assert!(ran.iter().all(Option::is_some), "a call of the first command was refused");
+    assert_eq!((kept.tables, kept.rows), (2, 8), "two crate names' tables, four rows each: {kept:?}");
+
+    // Control: without fuel and without records, every call is refused.
+    let (refused, wrote) = hook_command(&setup, &empty, &packages, &forward, no_fuel);
+    assert!(refused.iter().all(Option::is_none), "control: a call ran without fuel");
+    assert_eq!(wrote.tables, 0);
+
+    // (1) The next command finds all eight, running none, and writes nothing.
+    let (found, wrote) = hook_command(&setup, &store_a, &packages, &backward, no_fuel);
+    assert!(found == ran, "a kept call was not found as the row that was kept");
+    assert_eq!(wrote.tables, 0, "a command that ran nothing wrote a table");
+
+    // (2) The other order of calls, in another store: equal files.
+    let (ran_b, _) = hook_command(&setup, &store_b, &packages, &backward, Limits::STANDARD);
+    assert!(ran_b == ran, "two orders of calls gave two rows for one call");
+    let (files_a, files_b) = (files_under(&store_a), files_under(&store_b));
+    assert_eq!(files_a.iter().filter(|(name, _)| name.contains("crate/")).count(), 2, "two tables: {:?}", files_a.iter().map(|it| &it.0).collect::<Vec<_>>());
+    assert!(files_a == files_b, "two orders of calls wrote two stores");
+
+    // (3) `FOO` changes in package one: its m0 (which read FOO) misses, its other three and
+    // all of package two's are found.
+    let changed = [package_of("one", "9"), Arc::clone(&packages[1])];
+    let (after, _) = hook_command(&setup, &store_a, &changed, &forward, no_fuel);
+    let missed: Vec<usize> = (0..8).filter(|at| after[*at].is_none()).collect();
+    assert_eq!(missed, [0], "a changed variable must miss exactly the call that read it");
+    assert!(after[1..] == ran[1..], "an unchanged call was found as another row");
+    println!("hook round trip: 8 calls kept in {} tables, {} bytes; found by the next command; one of 8 missed after FOO changed", kept.tables, kept.bytes);
+}
+
 /// The same call on two workers (two threads, one runtime and module) writes equal records.
 #[test]
 fn the_same_call_on_two_workers_gives_equal_bytes() {
@@ -781,7 +882,7 @@ fn the_same_call_on_two_workers_gives_equal_bytes() {
     let pkg = package(&root, &[("FOO", "1")]);
     let bytes = |index: u32| {
         let produced = run(&setup, index, Arc::clone(&pkg), Limits::STANDARD, Alloc::global()).expect("it runs");
-        crate::record::encode(&produced).expect("keepable")
+        crate::record::table::row_bytes(&produced).expect("keepable")
     };
     for index in 0..3 {
         let (a, b) = std::thread::scope(|s| {

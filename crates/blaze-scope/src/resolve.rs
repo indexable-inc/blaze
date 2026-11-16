@@ -1153,7 +1153,8 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         #[cfg(feature = "cells")]
         if let Some((seam, fill_start)) = seam {
             let old = seam.now().saturating_sub(fill_start);
-            seam.report(input.name, crate::cells::shadow(&cx.facts, built, tree.modules[0].key, &fill.done, old, seam, alloc));
+            let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
+            seam.report(input.name, crate::cells::shadow(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &fill.done, old, seam, alloc));
         }
     }
     par.stage(crate::task::Stage::Publish);
@@ -1168,7 +1169,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let failed = core::mem::replace(&mut fill.failed, HashMap::new_in(alloc));
     let report = fill.report;
 
-    let Run { files, tables, expansions, made, notes: run_notes, new_modules: _, prepares: _ } = run;
+    let Run { files, tables, expansions, made, notes: run_notes, new_modules: _, block_places: _, prepares: _ } = run;
     let files = held(files.into_inner(), "files").files;
     let mut tables_all = low.tables;
     tables_all.merge(held(tables.into_inner(), "tables"));
@@ -1382,6 +1383,9 @@ struct Run<'a> {
     notes: Mutex<AVec<'a, NamesNote<'a>>>,
     /// Made modules the fill has not been told of yet.
     new_modules: Mutex<AVec<'a, ItemKey>>,
+    /// Each body's outermost block module: where the body is written (`BodySrc::place`), which
+    /// its textual scope goes on from. Lookups only.
+    block_places: Mutex<HashMap<ItemKey, (ItemKey, u32), Alloc<'a>>>,
     /// Each declarative macro this crate's item calls name, prepared once: the call's set,
     /// shared by every crate it resolves (a definition is keyed by its defining item, which
     /// names its crate).
@@ -1398,6 +1402,7 @@ impl<'a> Run<'a> {
             made: RwLock::new(HashMap::new_in(alloc)),
             notes: Mutex::new(AVec::new_in(alloc)),
             new_modules: Mutex::new(AVec::new_in(alloc)),
+            block_places: Mutex::new(HashMap::new_in(alloc)),
         }
     }
 
@@ -1409,6 +1414,28 @@ impl<'a> Run<'a> {
 struct Facts<'r, 'a, S> {
     base: &'r Base<'r, 'a, S>,
     run: &'r Run<'a>,
+}
+
+/// This crate's enums for the cell core: the lowered text's, then the expansions' so far.
+#[cfg(feature = "cells")]
+impl<'a, S> crate::cells::EnumNames<&'a str> for Facts<'_, 'a, S> {
+    fn holds(&self, of: ItemKey) -> bool {
+        self.base.tables.enums.contains_key(&of) || held(self.run.tables.read(), "tables").enums.contains_key(&of)
+    }
+
+    fn variant(&self, of: ItemKey, ns: Namespace, name: &'a str) -> crate::cells::DepAnswer {
+        let answer = |variants: &[Variant<&str>]| match variant_answer(variants, ns, name) {
+            NameAnswer::Found { def, vis, .. } => crate::cells::DepAnswer::Found(def, vis),
+            NameAnswer::Absent => crate::cells::DepAnswer::NotFound,
+        };
+        if let Some(v) = self.base.tables.enums.get(&of) {
+            return answer(v);
+        }
+        match held(self.run.tables.read(), "tables").enums.get(&of) {
+            Some(v) => answer(v),
+            None => crate::cells::DepAnswer::Unknown,
+        }
+    }
 }
 
 impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
@@ -1794,6 +1821,9 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // anything is lexed or prepared ([`blaze_expand::TextCall`] lists every input). A
     // function-like builtin has no key: it is expanded each solve.
     let kept = base.kept;
+    if kept.keeps() {
+        part(ExpandPart::Kept, mac.name, src.input.len());
+    }
     let text_key = match mac.body {
         _ if !kept.keeps() => None,
         MacroBody::Rules(body) => Some(blaze_expand::DefText::Rules { body }),
@@ -1821,7 +1851,6 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // the item walk asked, then each read the expansion made.
     let mut found: Option<blaze_expand::Expansion<'a>> = None;
     if let Some(key) = text_key {
-        part(ExpandPart::Kept, mac.name, src.input.len());
         let entry = kept.find(&key).unwrap_or_else(|e| panic!("the kept expansion of a call of `{}` did not open: {e}", mac.name));
         if let Some((index, entry)) = entry {
             let mut taken = None;
@@ -2027,7 +2056,12 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         members_of: src.owner,
     };
     let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
-    part(ExpandPart::Modules, mac.name, out.mods_made.len());
+    // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
+    // few moves below (what the part costs is what `make_modules` does: a module's file read,
+    // outlined and lowered).
+    if !out.mods_made.is_empty() {
+        part(ExpandPart::Modules, mac.name, out.mods_made.len());
+    }
     let mods =core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
     // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
     // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
@@ -2093,6 +2127,12 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
         let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
         let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None };
+        {
+            let mut places = held(run.block_places.lock(), "block places");
+            for m in mods.iter() {
+                places.insert(m.key, body.place);
+            }
+        }
         make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work);
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);

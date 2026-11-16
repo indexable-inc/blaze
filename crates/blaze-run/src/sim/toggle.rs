@@ -69,6 +69,9 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                     return Err(Broke::Harness(format!("{effect:?} with no failure and nothing lacking")));
                 }
                 Effect::Begin | Effect::Say(_) | Effect::WriteImage => {}
+                Effect::Declare { .. } | Effect::Unresolved { .. } => {
+                    return Err(Broke::Harness(format!("{effect:?} from a parent asked by slot alone")));
+                }
             }
         }
         for at in 0..FUNCTIONS as usize {

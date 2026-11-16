@@ -2347,6 +2347,13 @@ impl Drop for Iocp {
     }
 }
 
+impl Iocp {
+    /// [`Driver::now`]'s clock as a value read with no `&self` (`Kqueue::clock`'s doc).
+    pub fn clock(&self) -> crate::wait::Monotonic {
+        crate::wait::Monotonic::since(self.start)
+    }
+}
+
 impl Driver for Iocp {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         for effect in effects.drain(..) {

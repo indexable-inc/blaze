@@ -107,7 +107,19 @@ pub(crate) enum StorePlant {
     /// The chain puts a record about the checkout (a certificate, a page) in the user's own
     /// store ([`OWN`]), where another checkout would take it as its own answer.
     CheckoutIntoOwn,
+    /// The seal makes the pack's name hold its index and footer, and the boot record vouch for
+    /// it, before the payloads are written (store/chunks.rs, `seal_records`).
+    IndexBeforePayloads,
 }
+
+/// A command's own records before the seal: bytes that never move, rows sorted once.
+mod chunks;
+/// When a layer's packs are merged, and the merge's typed refusal.
+mod compact;
+/// The store at a real home's size: what a get reads, what a repeated command writes, the
+/// compaction's crash proof.
+#[cfg(test)]
+mod scale_tests;
 
 /// A pack's index, read once at the open: rows sorted by key.
 struct Pack {
@@ -115,6 +127,9 @@ struct Pack {
     rows: std::vec::Vec<(Key, u64, u32), Global>,
     /// Removed by another command's merge since this one listed it ([`PackStore::get_into`]).
     gone: bool,
+    /// Bytes the open read of it: its footer, its index and footer, and its payloads when it
+    /// was verified (store/scale_tests.rs counts them).
+    read: u64,
 }
 
 impl Pack {
@@ -160,13 +175,18 @@ pub struct PackStore {
     packs_dir: Dir<ReadWrite>,
     /// With their names' numbers (for the merge), in the listing's order.
     packs: std::vec::Vec<(u64, Pack), Global>,
-    /// This command's records: their bytes end to end, and (key, offset, length) sorted.
-    written: std::vec::Vec<u8, Global>,
-    index: std::vec::Vec<(Key, u64, u32), Global>,
+    /// This command's records: bytes in chunks that never move, rows in put order, sorted
+    /// once at the seal (store/chunks.rs).
+    own: chunks::Records,
     /// Packs the open found torn or foreign and removed: said by the caller, and made again.
     pub(crate) refused: u32,
     /// Packs read whole and checked at this open (their first in this boot).
     pub(crate) verified: u32,
+    /// Bytes this store read from its packs since the open, the open's included: footers,
+    /// indexes, payloads verified, records got (not the merge's copy).
+    pub(crate) read: u64,
+    /// Its folder under its root ([`PACKS`], [`SHARED`] or [`OWN`]): what its errors name.
+    folder: &'static str,
     boot: Boot,
     packs_most: usize,
     plant: StorePlant,
@@ -174,21 +194,17 @@ pub struct PackStore {
     scratch: bstd::mem::Frame,
 }
 
-/// A pack's name: the first 8 bytes of the digest of its index and footer, in hex. The footer
-/// holds the payloads' digest, so the name stands for every byte.
-fn pack_number(bytes: &[u8]) -> u64 {
-    let index_at = le_u64(&bytes[bytes.len() - FOOTER + 16..]) as usize;
-    index_number(&bytes[index_at..])
-}
-
-/// [`pack_number`] of a pack's index and footer, as read.
+/// A pack's name, from its index and footer: the first 8 bytes of their digest, in hex. The
+/// footer holds the payloads' digest, so the name stands for every byte.
 fn index_number(index_and_footer: &[u8]) -> u64 {
     let digest = blaze_ids::ContentId::of("blaze-cli pack index", index_and_footer);
     le_u64(&digest.0[..8])
 }
 
+/// The payloads' digest of a pack built whole ([`pack_bytes`]); the open streams it.
+#[cfg(test)]
 fn payloads_digest(payloads: &[u8]) -> [u8; 32] {
-    blaze_ids::ContentId::of("blaze-cli pack payloads", payloads).0
+    blaze_ids::ContentId::of(chunks::PAYLOADS, payloads).0
 }
 
 /// The boot record: `BLZB`, the boot, then the numbers of the packs known whole in it, sorted.
@@ -265,8 +281,9 @@ impl PackStore {
 
     /// The pack store in `folder` under `root`: the project's ([`PACKS`] under the checkout)
     /// or the machine's ([`SHARED`] under the home). One kind of store, one set of rules.
-    pub(crate) fn open_in(cx: &Cx, root: &Dir<ReadWrite>, folder: &str, boot: Boot, packs_most: usize, plant: StorePlant) -> Result<PackStore, CliError> {
+    pub(crate) fn open_in(cx: &Cx, root: &Dir<ReadWrite>, folder: &'static str, boot: Boot, packs_most: usize, plant: StorePlant) -> Result<PackStore, CliError> {
         let cx = cx.span("store open");
+        let named = folder;
         let folder = Path::new(folder)?;
         let packs_dir = root.subdir(&folder);
         let mut scratch = bstd::mem::Frame::with_reserve(bstd::mem::TASK_FRAME, bstd::mem::Tag::Other)
@@ -276,10 +293,11 @@ impl PackStore {
         let mut store = PackStore {
             packs_dir,
             packs: std::vec::Vec::new_in(Global),
-            written: std::vec::Vec::new_in(Global),
-            index: std::vec::Vec::new_in(Global),
+            own: chunks::Records::new(chunks::CHUNK_HERE),
             refused: 0,
             verified: 0,
+            read: 0,
+            folder: named,
             boot,
             packs_most,
             plant,
@@ -300,6 +318,7 @@ impl PackStore {
                 match taken {
                     Ok(pack) => {
                         store.verified += u32::from(!known);
+                        store.read += pack.read;
                         store.packs.push((number, pack));
                     }
                     Err(Untaken::Gone) => {}
@@ -369,16 +388,32 @@ impl PackStore {
         if index.len() != rows_len + FOOTER {
             return Err(Untaken::Refused);
         }
+        let mut read = (FOOTER + rows_len + FOOTER) as u64;
         if verify {
             let vouched = match plant {
                 StorePlant::VerifySkipped => true,
                 // The pack's own index standing for its payloads.
                 StorePlant::SelfVouching => index_number(index.as_slice()) == number,
                 _ => {
-                    let mut payloads = Bytes::new_in(scratch, "a pack's payloads, read once a boot");
-                    let whole = usize::try_from(index_at).map_err(|_| Untaken::Refused)?;
-                    file.read_at(cx, 0, whole, &mut payloads)?;
-                    index_number(index.as_slice()) == number && payloads.len() == whole && payloads_digest(payloads.as_slice()) == digest
+                    // Streamed through one piece of `chunks::PART` bytes, cleared each turn:
+                    // a pack of any size is verified in bounded memory (2026-11-16: a merged
+                    // pack of ten 24 MB packs read whole passed the 64 MiB frame at the next
+                    // boot's open). Each turn reads a whole piece or refuses: bounded.
+                    let mut hasher = blaze_ids::Hasher::new(chunks::PAYLOADS);
+                    let mut piece = Bytes::new_in(scratch, "a piece of a pack's payloads, read once a boot");
+                    let mut done = 0u64;
+                    while done < index_at {
+                        let want = (index_at - done).min(chunks::PART as u64) as usize;
+                        piece.clear();
+                        file.read_at(cx, done, want, &mut piece)?;
+                        if piece.len() != want {
+                            return Err(Untaken::Refused);
+                        }
+                        hasher.update(piece.as_slice());
+                        done += want as u64;
+                    }
+                    read += index_at;
+                    index_number(index.as_slice()) == number && hasher.finish().0 == digest
                 }
             };
             if !vouched {
@@ -398,43 +433,19 @@ impl PackStore {
         if !rows.is_sorted_by(|a, b| a.0 < b.0) {
             return Err(Untaken::Refused);
         }
-        Ok(Pack { file, rows, gone: false })
-    }
-
-    /// `bytes` published unsynced as the pack they name, and taken: known whole in this boot.
-    fn publish_pack(&mut self, cx: &Cx, bytes: &[u8]) -> Result<u64, CliError> {
-        let number = pack_number(bytes);
-        self.packs_dir.publish(cx, &pack_name(number)?, Content::bytes(bytes), Durable::No)?;
-        let taken = PackStore::read_pack(cx, &self.packs_dir, number, false, &self.scratch, self.plant);
-        self.scratch.reset();
-        match taken {
-            Ok(pack) => self.packs.push((number, pack)),
-            // Another command's merge took it already: its records are in that merge's pack.
-            Err(Untaken::Gone) => {}
-            Err(Untaken::Refused) => return Err(CliError::Text { what: "a pack under .blaze/v2/packs read back as torn just after its publish" }),
-            Err(Untaken::Failed(error)) => return Err(error),
-        }
-        Ok(number)
+        Ok(Pack { file, rows, gone: false, read })
     }
 
     /// This command's records as one pack, if it wrote any: sorted by key, one publish (one
     /// create, write and rename, nothing synced), then the boot record naming it, before the
     /// answer's pointer is written. A command that made no record writes nothing.
     pub fn seal(&mut self, cx: &Cx) -> Result<(), CliError> {
-        if self.index.is_empty() {
-            return Ok(());
-        }
-        let cx = cx.span("store seal");
-        let bytes = pack_bytes(self.index.iter().map(|(key, at, len)| (*key, &self.written[*at as usize..*at as usize + *len as usize])), self.index.len())?;
-        self.publish_pack(&cx, &bytes)?;
-        self.write_boot(&cx)?;
-        self.written.clear();
-        self.index.clear();
-        Ok(())
+        // A gathered write of the records where they lie; no pack is built in memory first.
+        self.seal_records(cx)
     }
 
     fn held(&self, key: Key) -> bool {
-        self.index.binary_search_by(|row| row.0.cmp(&key)).is_ok() || self.packs.iter().any(|(_, pack)| pack.find(key).is_some())
+        self.own.find(key).is_some() || self.packs.iter().any(|(_, pack)| pack.find(key).is_some())
     }
 
     /// Every pack merged into one (a key's records are equal, rule 21), published, named in the
@@ -442,47 +453,97 @@ impl PackStore {
     /// both, equal records twice, or loses records the driver makes again, never tears one.
     fn merge(&mut self, cx: &Cx) -> Result<(), CliError> {
         let cx = cx.span("store merge");
-        let mut rows: std::vec::Vec<(Key, usize, usize), Global> = std::vec::Vec::new_in(Global);
-        let mut payloads = Bytes::new_in(&self.scratch, "the packs' records");
+        // The merge's memory is the packs' indexes (held since the open) and one piece of one
+        // record, never the packs' sum (2026-11-16: eight packs of 23 MB passed the store's
+        // frame, and every command in that home then failed here). Two passes over the records
+        // in the merged order: the first hashes them for the footer's digest, which names the
+        // pack; the second is the publish, which copies each range file to file
+        // ([`Content::parts_of`]). A pack another command's merge removes meanwhile ends this
+        // merge with nothing changed: that merge's pack holds its records, and the next
+        // command merges what is left.
+        // Every table below is reserved before it is filled: a refused allocation is a typed
+        // error naming the folder and the rows (store/compact.rs `no_room`), never a panic.
+        let all_rows: usize = self.packs.iter().map(|(_, pack)| pack.rows.len()).sum();
+        let mut rows: std::vec::Vec<(Key, usize, u64, u32), Global> = std::vec::Vec::new_in(Global);
+        rows.try_reserve_exact(all_rows).map_err(|_| self.no_room(all_rows))?;
         let mut merged = std::vec::Vec::new_in(Global);
-        for (number, pack) in self.packs.iter() {
-            let mark = (rows.len(), payloads.len());
-            let mut whole = true;
-            for (key, at, len) in pack.rows.iter() {
-                let start = payloads.len();
-                let read = pack.file.read_at(&cx, *at, *len as usize, &mut payloads);
-                if matches!(read, Ok(_)) && payloads.len() - start == *len as usize {
-                    rows.push((*key, start, payloads.len()));
-                    continue;
-                }
-                // Merged away by another command since the open: its records stand there.
-                if pack.removed(&cx)? {
-                    whole = false;
-                    break;
-                }
-                read?;
-                return Err(CliError::Text { what: "a pack under .blaze/v2/packs is shorter than its index" });
-            }
-            if whole {
-                merged.push(*number);
-            } else {
-                rows.truncate(mark.0);
-                payloads.truncate(mark.1);
-            }
+        merged.try_reserve_exact(self.packs.len()).map_err(|_| self.no_room(all_rows))?;
+        for (at, (number, pack)) in self.packs.iter().enumerate() {
+            rows.extend(pack.rows.iter().map(|(key, offset, len)| (*key, at, *offset, *len)));
+            merged.push(*number);
         }
+        // Stable: of a key in two packs (equal bytes, rule 21), the first pack's stays.
         rows.sort_by_key(|row| row.0);
         rows.dedup_by_key(|row| row.0);
-        let all = payloads.as_slice();
-        let bytes = pack_bytes(rows.iter().map(|(key, start, end)| (*key, &all[*start..*end])), rows.len())?;
-        drop(payloads);
+        let mut tail: std::vec::Vec<u8, Global> = std::vec::Vec::new_in(Global);
+        tail.try_reserve_exact(rows.len() * ROW + FOOTER).map_err(|_| self.no_room(all_rows))?;
+        let mut hasher = blaze_ids::Hasher::new(chunks::PAYLOADS);
+        let mut index_at = 0u64;
+        for (key, pack_at, offset, len) in rows.iter() {
+            let pack = &self.packs[*pack_at].1;
+            // A payload and the zeros that pad it to 8 bytes, as its pack holds them.
+            let padded = u64::from(*len).next_multiple_of(8);
+            let mut done = 0u64;
+            // Each turn hashes a whole piece toward `padded`, or returns: bounded.
+            while done < padded {
+                let piece = (padded - done).min(chunks::PART as u64) as usize;
+                let whole = {
+                    let mut bytes = Bytes::new_in(&self.scratch, "a piece of a record being merged");
+                    let read = pack.file.read_at(&cx, *offset + done, piece, &mut bytes);
+                    if matches!(read, Ok(_)) && bytes.len() == piece {
+                        hasher.update(bytes.as_slice());
+                        Ok(())
+                    } else {
+                        Err(read)
+                    }
+                };
+                self.scratch.reset();
+                if let Err(read) = whole {
+                    if pack.removed(&cx)? {
+                        return Ok(());
+                    }
+                    read?;
+                    return Err(CliError::Text { what: "a pack under .blaze/v2/packs is shorter than its index" });
+                }
+                done += piece as u64;
+            }
+            tail.extend_from_slice(&key.0.0);
+            tail.extend_from_slice(&index_at.to_le_bytes());
+            tail.extend_from_slice(&len.to_le_bytes());
+            tail.extend_from_slice(&[0; 4]);
+            index_at += padded;
+        }
+        tail.extend_from_slice(MAGIC);
+        tail.extend_from_slice(&FORMAT.to_le_bytes());
+        tail.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+        tail.extend_from_slice(&index_at.to_le_bytes());
+        tail.extend_from_slice(&hasher.finish().0);
+        let number = index_number(&tail);
         let removes_first = self.plant == StorePlant::MergeRemovesFirst;
         if removes_first {
             for gone in merged.iter() {
                 self.packs_dir.remove(&cx, &pack_name(*gone)?, Durable::No)?;
             }
         }
+        let published = {
+            let mut parts: std::vec::Vec<bstd::fs::FilePart<'_>, Global> = std::vec::Vec::new_in(Global);
+            parts.try_reserve_exact(rows.len()).map_err(|_| self.no_room(all_rows))?;
+            for (_, pack_at, offset, len) in rows.iter().filter(|row| row.3 > 0) {
+                parts.push(bstd::fs::FilePart { of: &self.packs[*pack_at].1.file, at: *offset, len: u64::from(*len).next_multiple_of(8) });
+            }
+            let chunk = core::num::NonZero::new(chunks::PART).unwrap_or(core::num::NonZero::<usize>::MIN);
+            self.packs_dir.publish(&cx, &pack_name(number)?, Content::parts_of(&parts, &tail, chunk), Durable::No).map(|_| ())
+        };
+        if let Err(error) = published {
+            for (_, pack) in self.packs.iter() {
+                if pack.removed(&cx)? {
+                    return Ok(());
+                }
+            }
+            return Err(error.into());
+        }
         let old = core::mem::replace(&mut self.packs, std::vec::Vec::new_in(Global));
-        let number = self.publish_pack(&cx, &bytes)?;
+        self.take_pack(&cx, number)?;
         self.write_boot(&cx)?;
         if !removes_first {
             // A pack whose records equal the merge's has its name: it is the merge, kept.
@@ -527,7 +588,10 @@ impl PackStore {
 }
 
 /// A pack's bytes from records sorted by key: each payload at an 8-aligned offset, the
-/// index, the footer.
+/// index, the footer. The layout's one statement, built whole in memory: what the tests hold
+/// the seal's and the merge's streamed packs equal to (store/chunks_tests.rs); no command
+/// path builds a pack this way.
+#[cfg(test)]
 fn pack_bytes<'b>(records: impl Iterator<Item = (Key, &'b [u8])> + Clone, count: usize) -> Result<std::vec::Vec<u8, Global>, CliError> {
     let too_big = || CliError::Text { what: "a record past 4 GiB" };
     let payloads: usize = records.clone().map(|(_, bytes)| bytes.len().next_multiple_of(8)).sum();
@@ -555,15 +619,15 @@ fn pack_bytes<'b>(records: impl Iterator<Item = (Key, &'b [u8])> + Clone, count:
 
 impl Store for PackStore {
     fn get_into(&mut self, cx: &Cx, key: Key, into: &mut Bytes) -> Result<bool, CliError> {
-        if let Ok(at) = self.index.binary_search_by(|row| row.0.cmp(&key)) {
-            let (_, start, len) = self.index[at];
-            into.try_extend(&self.written[start as usize..start as usize + len as usize]).map_err(|stopped| CliError::Remote(RemoteError::Copy(stopped)))?;
+        if let Some(bytes) = self.own.find(key) {
+            into.try_extend(bytes).map_err(|stopped| CliError::Remote(RemoteError::Copy(stopped)))?;
             return Ok(true);
         }
         for (_, pack) in self.packs.iter_mut().filter(|(_, pack)| !pack.gone) {
             if let Some((at, len)) = pack.find(key) {
                 let start = into.len();
                 let read = pack.file.read_at(cx, at, len as usize, into);
+                self.read += (into.len() - start) as u64;
                 if matches!(read, Ok(_)) && into.len() - start == len as usize {
                     return Ok(true);
                 }
@@ -582,15 +646,8 @@ impl Store for PackStore {
     }
 
     fn put(&mut self, _cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
-        if self.held(key) {
-            return Ok(());
-        }
-        let len = u32::try_from(bytes.len()).map_err(|_| CliError::Text { what: "a record past 4 GiB" })?;
-        let at = self.written.len() as u64;
-        self.written.extend_from_slice(bytes);
-        let place = self.index.binary_search_by(|row| row.0.cmp(&key)).unwrap_or_else(|place| place);
-        self.index.insert(place, (key, at, len));
-        Ok(())
+        // One copy of the record to where it stays; its row appended, sorted at the seal.
+        self.put_record(key, bytes)
     }
 
     fn seal(&mut self, cx: &Cx) -> Result<(), CliError> {
@@ -602,7 +659,8 @@ impl Store for PackStore {
 
     fn after_answer(&mut self, cx: &Cx, _profile: &mut Profile) -> Result<(), CliError> {
         self.seal(cx)?;
-        if self.packs.len() > self.packs_most {
+        // Past `packs_most` packs, or past one byte in `compact::DEAD_SHARE` held twice.
+        if self.compaction()? != compact::Compact::Not {
             self.merge(cx)?;
         }
         Ok(())
@@ -672,6 +730,9 @@ pub enum RemoteError {
     Batch(BatchError),
     /// A fetched record could not be copied into the request's buffer.
     Copy(Stopped),
+    /// The command's own store refused a put or a seal (store/chunks.rs): not an origin's
+    /// error; it rides here until `CliError` has a variant of its own.
+    Put(chunks::PutError),
 }
 
 impl core::fmt::Display for RemoteError {
@@ -679,6 +740,7 @@ impl core::fmt::Display for RemoteError {
         match self {
             RemoteError::Batch(error) => write!(f, "the origin's read path: {error}"),
             RemoteError::Copy(stopped) => write!(f, "a record fetched from the origin: {stopped}"),
+            RemoteError::Put(error) => write!(f, "{error}"),
         }
     }
 }
@@ -1083,6 +1145,12 @@ impl<S: Sharing> Store for Layered<'_, S> {
     }
 
     fn put(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
+        // A key any layer this command reads already holds is not written again (rule 21: one
+        // value a key; rule 77: work once), in whichever layer it is: the get finds it there.
+        // A command that changed nothing so puts nothing and seals no pack.
+        if self.local.held(key) || [&self.machine, &self.own].into_iter().flatten().any(|store| store.held(key)) {
+            return Ok(());
+        }
         let place = match (self.plant, self.sharing.place(bytes)) {
             (StorePlant::PrivateIntoMachine, _) => Place::Public,
             (StorePlant::CheckoutIntoOwn, Place::Checkout) => Place::Own,
@@ -1305,6 +1373,15 @@ mod tests {
     #[test]
     fn the_oracle_catches_a_merge_that_removes_first() {
         caught(StorePlant::MergeRemovesFirst, "is lost");
+    }
+
+    /// The seal's order (store/chunks.rs `seal_records`): a failure between the planted first
+    /// publish (index and footer over a hole, vouched for in the boot record) and the payloads
+    /// restarts the command in the same boot, which trusts the pack and reads zeros.
+    /// Expected: passes, `caught` having seen "store oracle" (a key read back as other bytes).
+    #[test]
+    fn the_oracle_catches_an_index_published_before_its_payloads() {
+        caught(StorePlant::IndexBeforePayloads, "store oracle");
     }
 
     // The two below need a power cut that keeps an unsynced rename and leaves the pack's

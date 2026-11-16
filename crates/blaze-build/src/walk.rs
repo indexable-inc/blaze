@@ -37,9 +37,12 @@ mod lets;
 mod matches;
 mod numbers;
 mod moves;
+mod slice_glue;
 mod strs;
 mod temps;
 mod unsized_tail;
+mod unwind;
+mod wide_cmp;
 
 /// The target's pointer width: the ladder runs on AArch64.
 const PTR_BITS: u32 = 64;
@@ -325,6 +328,9 @@ enum Task {
     Match(ExprId),
     Arm { m: u32, i: u32 },
     Guard { m: u32, i: u32 },
+    /// The guard of an arm whose pattern holds or-patterns (walk/matches/alts.rs): a false
+    /// guard goes on at the alternative after the one that matched, numbered in `word`.
+    GuardAlts { word: SlotId, chains: u32, n: u32 },
     ArmEnd { m: u32 },
     MatchEnd,
     Call(ExprId),
@@ -451,6 +457,8 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     moves: moves::Moves<A>,
     /// `Some` while a coroutine's body is built (coroutine.rs `run_coroutine`).
     co: Option<coroutine::Co>,
+    /// While a landing block's drops are built (walk/unwind.rs): their calls are plain.
+    cleanup: bool,
 }
 
 fn unsupported(expr: ExprId, what: &'static str) -> BuildError {
@@ -682,6 +690,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         scope_marks: Vec::new_in(alloc.clone()),
         moves: moves::Moves::new_in(alloc.clone()),
         co: None,
+        cleanup: false,
     }
     }
 
@@ -968,6 +977,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let mut drop_fn = None;
             // `ManuallyDrop<T>` (core's `#[lang = "manually_drop"]`): its field is never dropped.
             let mut keeps_fields = false;
+            // `repr(packed(n))`'s log2 of `n`: the most alignment a part's access may claim.
+            let mut packed: Option<u8> = None;
             match self.ground_node(t)? {
                 PNode::Adt(k, l) => {
                     args.clear();
@@ -975,11 +986,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?,
                     );
                     let adts = self.adts;
-                    // The walk's loads and stores are at each part's alignment: a packed
-                    // struct's parts may sit below theirs.
-                    if adts.facts().repr(k).packed.is_some() {
-                        return Err(TyErr::Unsupported("a `repr(packed)` type"));
-                    }
+                    // A packed struct's or union's parts may sit below their alignment: `ls`
+                    // places them (layout.rs `univariant`), and once the row is made every
+                    // plain access of this function claims at most the cap (below).
+                    packed = adts.facts().repr(k).packed;
                     drop_fn = adts.drop_impl(t, self.ground).map_err(TyErr::Other)?;
                     keeps_fields = adts.lang_adt(LangItem::ManuallyDrop) == Some(k);
                     let adt = adts.adt(k).ok_or(TyErr::Other(BuildError::NoAdt { adt: k }))?;
@@ -989,6 +999,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                                 return Err(TyErr::Malformed("a struct without exactly one variant"));
                             }
                         }
+                        // The Reference, `[layout.repr.alignment.intro]`: "The align and packed
+                        // modifiers can be used to respectively raise or lower the alignment of
+                        // structs and unions": a packed enum is no Rust program's.
+                        AdtKind::Enum if packed.is_some() => return Err(TyErr::Malformed("a `repr(packed)` enum")),
                         AdtKind::Enum => is_enum = true,
                         // Every field at offset 0 (`ls`'s); a copy copies each field's leaves,
                         // so every byte some field holds; its fields are never dropped.
@@ -1076,6 +1090,44 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 needs_drop |= part.needs_drop;
             }
+            // A packed struct or union (the Reference, `[layout.repr.alignment.packed-fields]`:
+            // "The alignments of each field, for the purpose of positioning fields, is the
+            // smaller of the specified alignment and the alignment of the field's type"): when
+            // some part's alignment is above the cap, a part may sit below its own alignment,
+            // so from here on every plain access this function makes claims at most the cap
+            // (`Builder::cap_access_align`). The carrier is the function, not the place: places
+            // are `(Value, i32)` everywhere and offsets are read from rows at dozens of sites; a
+            // per-place cap one of them forgot would claim too much (a miscompile), while a
+            // lowered claim is never wrong. No access through such a part can come before
+            // this: its offset is read from this row, made here.
+            if let Some(cap) = packed {
+                let mut most = 0u8;
+                for &(_, pt) in parts.iter() {
+                    let align = if self.is_agg(pt)? {
+                        let at = self.find_layout(pt).ok_or(TyErr::Malformed("a part whose layout was not made"))?;
+                        let part = &self.layouts[at as usize];
+                        // Its drop takes `&mut` to the part (the Reference, "Destructors"), a
+                        // reference that must be aligned: rustc moves such a part to an aligned
+                        // place first; the walk does not yet.
+                        if part.needs_drop && part.align > cap && !is_union {
+                            return Err(TyErr::Unsupported(
+                                "a `repr(packed)` struct with a part that needs drop above the packed alignment",
+                            ));
+                        }
+                        part.align
+                    } else {
+                        if matches!(self.ground_node(pt)?, PNode::Slice(_) | PNode::Str | PNode::Dynamic(_)) {
+                            return Err(TyErr::Unsupported("a `repr(packed)` struct with an unsized tail"));
+                        }
+                        let repr = self.repr(pt)?;
+                        self.size_align(repr).1
+                    };
+                    most = most.max(align);
+                }
+                if most > cap {
+                    self.b.cap_access_align(cap);
+                }
+            }
             // The size, alignment and every offset are `ls`'s (rule 30: one layout).
             let id = self.ls_of(t)?;
             let lt = *self.ls.get(id);
@@ -1100,11 +1152,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let n = variant_ends.len();
                     let vfirst = self.layout_variants.len() as u32;
                     if let Variants::Multiple { .. } = lt.variants {
-                        // The walk switches on the discriminant as an `i64`.
+                        // The walk switches on the discriminant's 64-bit pattern (`read_discriminant`
+                        // reads an `i64`; `discriminant_case` masks each case to 64 bits), so any
+                        // discriminant of a primitive representation of 64 bits or less fits, signed
+                        // or unsigned: the Reference, `[layout.repr.primitive.enum]`, "primitive
+                        // representations set the size and alignment to be the same as the primitive
+                        // type of the same name": a `repr(usize)` discriminant is any `usize`, e.g.
+                        // core's `AlignmentEnum::_Align1Shl63 = 1 << 63`.
                         for v in 0..n as u32 {
                             let d = self.ls.discriminant(id, v).ok_or(TyErr::Malformed("an enum without its discriminants"))?;
-                            if i64::try_from(d).is_err() {
-                                return Err(TyErr::Unsupported("an enum discriminant past 64 bits"));
+                            if i64::try_from(d).is_err() && u64::try_from(d).is_err() {
+                                return Err(TyErr::Unsupported(
+                                    "an enum discriminant that needs more than 64 bits (a `repr(u128)` or `repr(i128)` value)",
+                                ));
                             }
                         }
                     }
@@ -2517,8 +2577,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 return Ok(());
             }
+            // `drop_glue::<[U]>` and `drop_glue::<str>`: the wide pointer by reference; each
+            // element's glue in order (walk/slice_glue.rs).
+            if let (true, &[Repr::Agg(_)], Repr::None, &[q]) =
+                (self.is_slice_pointee(g)?, reprs.as_slice(), self.ret, values.as_slice())
+            {
+                self.slice_glue(g, q)?;
+                self.b.ret(&[]);
+                if let Some(error) = self.b.error() {
+                    return Err(BuildError::Lir(error.clone()));
+                }
+                return Ok(());
+            }
             let (&[Repr::Ptr], Repr::None, &[p]) = (reprs.as_slice(), self.ret, values.as_slice()) else {
-                return Err(malformed("a `drop_in_place` whose signature is not `(*mut T)`"));
+                return Err(malformed("a `drop_glue` parameter that is neither a thin pointer, a slice, `str` nor `dyn`"));
             };
             self.glue(p)?;
             self.b.ret(&[]);
@@ -2863,10 +2935,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         self.vals.truncate(base);
         let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
-        let r = match callee {
-            Callee::Direct(reference) => self.b.call(Flags::NONE, reference, sig, &values),
-            Callee::Pointer(p) => self.b.call_indirect(Flags::NONE, p, sig, &values),
-        };
+        let r = self.call_unwinding(callee, sig, &values)?;
         let v = match (result, rets.len()) {
             (Some(at), _) => V::Place(at.0, at.1),
             (None, 0) => V::None,
@@ -3131,6 +3200,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.br(c, (body, &[]), (next, &[]));
                 self.begin(body);
             }
+            Task::GuardAlts { word, chains, n } => self.guard_alts(word, chains, n)?,
             Task::ArmEnd { m } => {
                 let v = self.pop()?;
                 let st = self.matches[m as usize];
@@ -3443,15 +3513,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Adjustment `n` of `e`, an overloaded dereference: calls `Deref::deref` (or
     /// `DerefMut::deref_mut`) at `[Self]` with the pointer on top, and leaves the reference it
-    /// returns. A reference to an unsized target (`String` to `str`) is a wide pointer, which
-    /// only a borrow right after may take as is: a place carries no length.
+    /// returns. A reference to an unsized target (`String` to `str`, `W` to `[u8]`) is a wide
+    /// pointer, left as the place of its own memory (`emit_call` puts an aggregate result in a
+    /// temporary); the `DerefPlace` after makes that the target's unsized place (`V::Unsized`),
+    /// exactly as for the builtin `*r` of `r: &[T]`. The Reference, "The dereference operator":
+    /// "On non-pointer types *x is equivalent to *std::ops::Deref::deref(&x) in an immutable
+    /// place expression context". Its consumers are the unsized place's: a borrow, a field of
+    /// an unsized tail, an index (`push_index_base`) and a pattern (walk/matches.rs).
     fn deref_call(&mut self, e: ExprId, n: usize) -> Result<(), BuildError> {
         let rows = self.adjust_rows(e);
         let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
         let AdjustKind::Deref { overloaded: Some(m) } = kinds[n] else {
             return Err(malformed("a deref call on an adjustment that is not an overloaded dereference"));
         };
-        let borrowed_next = matches!(kinds.get(n + 1), Some(AdjustKind::Borrow { .. }));
         // A place borrowed `&mut` through `Deref::deref` would be written through a shared
         // reference: the check must record `DerefMut` there (rustc's
         // `convert_place_derefs_to_mutable`), and the build never upgrades it on its own.
@@ -3473,10 +3547,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if arepr != Repr::Ptr {
             return Err(unsupported(e, "an overloaded dereference of an unsized `Self`"));
         }
+        // A wide `rrepr` (an aggregate) comes back as `V::Place` of its temporary: the memory
+        // `DerefPlace` keeps as the unsized place (`take_passed`, every aggregate pass).
         let rrepr = self.repr(g_ret).map_err(|error| Self::ty_err(e, error))?;
-        if rrepr != Repr::Ptr && !borrowed_next {
-            return Err(unsupported(e, "a place behind an overloaded dereference to an unsized target (a place carries no length yet)"));
-        }
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let apass = self.pass(g_arg, arepr, abi, Some(item))?;
         let rpass = self.pass(g_ret, rrepr, abi, Some(item))?;
@@ -3726,8 +3799,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(());
         }
         let lead = kinds.iter().take_while(|k| matches!(k, AdjustKind::Deref { .. })).count();
-        if lead == 0 || lead != kinds.len() || !matches!(kinds[lead - 1], AdjustKind::Deref { overloaded: None }) {
-            return Err(unsupported(base, "indexing a slice not reached by a builtin dereference of a wide pointer"));
+        if lead == 0 || lead != kinds.len() {
+            return Err(unsupported(base, "indexing a slice not reached by a dereference of a wide pointer"));
+        }
+        // `w[i]` with `W: Deref<Target = [T]>`: the last step calls `Deref::deref`, and the
+        // slice's place is the unsized place behind the wide reference it returns (`place_of`:
+        // the chain, then `DerefPlace`; `deref_call`).
+        if matches!(kinds[lead - 1], AdjustKind::Deref { overloaded: Some(_) }) {
+            self.work.push(Task::Place(base));
+            return Ok(());
         }
         if lead == 1 {
             self.raw(base)?;
@@ -3881,16 +3961,53 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if which == Which::CallerLocation {
             return Err(BuildError::Intrinsic { expr: e, which, why: "`caller_location` (a `#[track_caller]` site)", unsupported: true });
         }
-        // The generic arguments, grounded. The portable form has no const generic: every
-        // argument is a type (an intrinsic that needs a const one is refused by `build`).
+        // The generic arguments, grounded: a type stays a type; a const argument is a
+        // `ConstValue` (portable.rs) and reaches `build` as its value (intrinsics.rs, "The
+        // seam"): a `bool`, integer or `char` as its bits; a fieldless enum's value (under
+        // `adt_const_params`, core's `AtomicOrdering`: "These values must match the compiler's
+        // `AtomicOrdering`") is its VARIANT INDEX in the ground table and becomes the variant's
+        // discriminant through the one discriminant table (`ls`, rule 30).
         let t = self.expr_ty(callee)?;
         let PNode::FnDef(_, gl) = self.node_at(callee, t)? else { return Err(malformed("an intrinsic call whose callee is not a fn item")) };
         if which == Which::ConstEvalSelect {
             return self.const_eval_select(e, gl, list.len());
         }
+        if which == Which::CatchUnwind {
+            return self.catch_unwind(e, list.len());
+        }
         let mut generics = Vec::new_in(self.alloc.clone());
-        for &g in self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))? {
-            generics.push(GenericArg::Ty(g));
+        let n_generics = self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))?.len();
+        for i in 0..n_generics {
+            let g = *self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))?.get(i).ok_or(malformed("a list past the ground table"))?;
+            let arg = match self.ground_node(g).map_err(|error| Self::ty_err(callee, error))? {
+                PNode::ConstValue { ty, bits } => match self.ground_node(ty).map_err(|error| Self::ty_err(callee, error))? {
+                    PNode::Bool | PNode::Int(_) | PNode::Uint(_) | PNode::Char => GenericArg::Const(bits),
+                    PNode::Adt(..) => {
+                        let id = self.ls_of(ty).map_err(|error| Self::ty_err(callee, error))?;
+                        let variant = u32::try_from(bits).map_err(|_| malformed("an enum const argument whose variant index passes 32 bits"))?;
+                        let d = self.ls.discriminant(id, variant).ok_or(BuildError::Intrinsic {
+                            expr: e,
+                            which,
+                            why: "a const generic argument of an ADT type that is not a fieldless enum's variant",
+                            unsupported: true,
+                        })?;
+                        // Two's complement in 128 bits: `build` reads an ordering as 0..=4 and
+                        // refuses any other value by name.
+                        GenericArg::Const(d as u128)
+                    }
+                    _ => {
+                        return Err(BuildError::Intrinsic {
+                            expr: e,
+                            which,
+                            why: "a const generic argument of a type that is not `bool`, an integer, `char` or a fieldless enum",
+                            unsupported: true,
+                        });
+                    }
+                },
+                PNode::ConstParam(_) => return Err(malformed("a const generic parameter left in an intrinsic call's grounded arguments")),
+                _ => GenericArg::Ty(g),
+            };
+            generics.push(arg);
         }
         // The arguments as `build` takes them: a value `ls` lays out as one scalar is that
         // scalar (a newtype's too), any other aggregate its address.
@@ -3984,14 +4101,39 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
-    /// The function reference place of `instance`: one per instance.
-    /// The value of const `item`, named by path `e`, from its evaluated record (lib.rs,
-    /// "Consts"): a scalar is a constant of the root's bytes, little-endian at the type's
-    /// width; anything else is the place of the root's data row, its relocations to the
-    /// record's other allocations (each a data row of its own), to statics and to fns.
+    /// The value of const `item`, named by path `e`, at the arguments the check recorded for the
+    /// path (`Checked::const_args_of`: `[Self, trait args..]` of `<T as Tr>::C`, the impl's of an
+    /// inherent impl's constant, none for a free `const`) grounded at this instance's: the
+    /// Reference, "Associated Items", "Associated Constants": `<T as Tr>::C` at `T = u8` is
+    /// `u8`'s impl's value, so `size_of::<u8>` and `size_of::<u64>` read different records.
     fn const_value(&mut self, e: ExprId, item: ItemKey) -> Result<V, BuildError> {
+        let args = self.const_path_args(e)?;
         let adts = self.adts;
-        let record = adts.const_value(item, &[]).ok_or(BuildError::NoConstValue { expr: e, item })?;
+        let record = adts.const_value(item, &args[..]).ok_or(BuildError::NoConstValue { expr: e, item })?;
+        self.const_record_value(e, record)
+    }
+
+    /// The generic arguments the check recorded for constant path `e`, grounded at this
+    /// instance's arguments (as [`Self::method_callee`] grounds a callee's); empty for a path
+    /// with no row (a constant with no generics).
+    fn const_path_args(&mut self, e: ExprId) -> Result<Vec<PTy, A>, BuildError> {
+        let Some(list) = self.checked.const_args_of(e) else {
+            return Ok(Vec::new_in(self.alloc.clone()));
+        };
+        let tys = self.types.list(list).map_err(|_| malformed("a constant path's arguments past the record's types"))?;
+        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        for &t in tys {
+            grounded.push(self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?);
+        }
+        Ok(grounded)
+    }
+
+    /// The value of expression `e` from evaluated record `record` (lib.rs, "Consts"): a constant
+    /// path's or a `const { .. }` block's (one home for both): a scalar is a constant of the
+    /// root's bytes, little-endian at the type's width; anything else is the place of the root's
+    /// data row, its relocations to the record's other allocations (each a data row of its own),
+    /// to statics and to fns.
+    fn const_record_value(&mut self, e: ExprId, record: &DataRecord<Global>) -> Result<V, BuildError> {
         let bad = |why| BuildError::Malformed { what: why };
         record.check().map_err(|_| bad("a const's record that breaks the data form"))?;
         let repr = self.expr_repr(e)?;
@@ -4388,7 +4530,17 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::AsyncBlock { .. } => self.coroutine_value(e)?,
             Expr::Underscore => return Err(unsupported(e, "`_` (`_ = e` is not built yet)")),
             Expr::RawRef { mutbl, operand } => self.push_raw_ref(e, mutbl, operand)?,
-            Expr::ConstBlock { .. } => return Err(unsupported(e, "a const block")),
+            // The Reference, "Block expressions", "Const blocks": the block is evaluated at compile
+            // time with the enclosing generics in scope, its value the expression's; one value
+            // per instance (`size_of::<T>()` in it differs at `u8` and `u64`): the front's
+            // record of it at this instance's ground arguments, read as a constant path's is.
+            Expr::ConstBlock { .. } => {
+                let adts = self.adts;
+                let owner = self.body.owner;
+                let record = adts.const_block_value(owner, e, self.args).ok_or(BuildError::NoConstBlockValue { expr: e, owner })?;
+                let v = self.const_record_value(e, record)?;
+                self.vals.push(v);
+            }
             // Its value is the container's layout: a field's offset, which the code builder
             // does not compute yet.
             Expr::OffsetOf { ty, fields } => {
@@ -4770,8 +4922,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let Expr::Binary { lhs, rhs, .. } = self.expr(e)? else { return Err(malformed("a binary task on another expression")) };
         let lrepr = self.adjusted_repr(lhs)?;
         let rrepr = self.adjusted_repr(rhs)?;
-        let lty = lrepr.scalar().ok_or(unsupported(e, "a binary operator on a non-scalar"))?;
-        let rty = rrepr.scalar().ok_or(unsupported(e, "a binary operator on a non-scalar"))?;
+        // Of the operands a builtin binary operator takes, only a wide raw pointer is an
+        // aggregate (walk/wide_cmp.rs: `==` and `!=` word by word).
+        if matches!(lrepr, Repr::Agg(_)) || matches!(rrepr, Repr::Agg(_)) {
+            let v = self.wide_ptr_binary(e, op, lhs, (l, lrepr), (r, rrepr))?;
+            self.vals.push(v);
+            return Ok(());
+        }
+        let lty = lrepr.scalar().ok_or(unsupported(e, "a binary operator on an operand of no value"))?;
+        let rty = rrepr.scalar().ok_or(unsupported(e, "a binary operator on an operand of no value"))?;
         let l = self.scalar(l, lty)?;
         let r = self.scalar(r, rty)?;
         // walk/numbers.rs: IEEE comparisons and arithmetic.

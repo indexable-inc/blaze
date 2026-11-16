@@ -686,10 +686,58 @@
   {
    "id": "D82",
    "date": "2026-11-16",
-   "decision": "`blaze run` and `blaze build` (docs/v2/plan/design/run.md, \"End state\"): (1) the run path builds eagerly, files the manifest and image, and execs a launcher that maps signed segment files read-only and executable in place and enters `main`; the lazy compile-on-first-call machines stay only for later live patching; (2) code records live in the new crate blaze-code (record form, segment layout, image binding, the edit patch); (3) a dev run's image is bound at fixed addresses so an edit rewrites only the words posted under what moved; `blaze build`'s output keeps address randomisation; (4) on macOS the launcher uses the hardened runtime with library validation off and NO JIT entitlement, resting on a test that a signed segment maps executable; (5) nothing observed is in a key: `code_name` drops `hooks`.",
+   "decision": "`blaze run` and `blaze export` (docs/v2/plan/design/run.md, \"End state\"): (1) the run path builds eagerly, files the manifest and image, and execs a launcher that maps signed segment files read-only and executable in place and enters `main`; the lazy compile-on-first-call machines stay only for later live patching; (2) code records live in the new crate blaze-code (record form, segment layout, image binding, the edit patch); (3) a dev run's image is bound at fixed addresses so an edit rewrites only the words posted under what moved; `blaze export`'s output keeps address randomisation; (4) on macOS the launcher uses the hardened runtime with library validation off and NO JIT entitlement, resting on a test that a signed segment maps executable; (5) nothing observed is in a key: `code_name` drops `hooks`.",
    "recommended": "The architect's sixteen pieces; 3 and 4 written (blaze-code, uncompiled); 2 with a writer; 1 when the hello world's `main` builds on the new front end; 5 after blaze-code compiles.",
    "why": "Today the program runs inside blaze's own process from code held in memory with literal addresses patched on every run; no code record is in the store; `blaze build` does not exist. Floor for a repeat run: about 5 ms to `main`.",
-   "state": "decided by the coordinator on the architect's recommendations; assigned; the owner may veto fixed addresses for dev runs (item 3)"
+   "state": "WITHDRAWN in part 2026-11-16 14:30 by D83: items 1 and 3 and the \"patch a clone\" piece contradicted the owner's decision of 2026-11-15; item 2 (the crate blaze-code for the record form) and item 5 stand; item 4 is reopened by D83"
+  },
+  {
+   "id": "D83",
+   "date": "2026-11-16",
+   "decision": "The owner's commands of 2026-11-15 stand (bottom.md section 11): `run`, `test`, `check`, later `export`; no `build`. `run` and `test` never write an executable: code records placed by the launcher in the program's own process behind one slot word a function; an uncompiled function is a stub whose first call asks the run's parent for its code record; no link step; a test run is a program run. `export` writes one native executable, whole, every reached function, no stubs, at the optimized tier; not incremental. The run architect's eager build, ahead-of-time bound image, fixed-address edit patch and patched clone are withdrawn. How run-time-made code becomes executable on macOS (JIT memory with its entitlement, or signed segment files) is reopened and decided by a test, not by preference.",
+   "recommended": "A corrected end state for run.md from a new writer; the record form, read-only mapped segments, dependency bundles, unwinding rows and blaze-emit's import sites (a slot word is an import word) are kept.",
+   "why": "The coordinator accepted D82 from an architect's recommendation without reading it against bottom.md section 11. The owner, 2026-11-15: \"no blaze build and just blaze export ... and blaze run / test / check that are fast\"; \"everything in JIT world\"; and today: \"blaze buidl no longer exists i thougt\".",
+   "state": "decided by the owner on 2026-11-15; restored by the coordinator"
+  },
+  {
+   "id": "D84",
+   "date": "2026-11-16",
+   "decision": "A constant, a trait or associated constant, or a `const { }` block at an instance's ground arguments is PULLED before that instance is walked: the needs of an instance are read from the checker's `const_args` column and the body's const blocks, grounded by the instance's arguments; the build's instance loop asks the front end for each (the evaluator stays alive after the program is made and may check a body or make an impl row then), files the answers in a per-build table keyed by (item, ground arguments), and the walk only reads that table. No walk is done twice, nothing is parked or retried, and the result does not depend on instance order.",
+   "recommended": "One writer builds it in front2/const_at.rs with additive edits in run.rs and program.rs; rungs x0-const-assoc-01, x0-const-block-01 and x0-const-assoc-02-order are the proof.",
+   "why": "The earlier brief filled a table before the build, where concrete instance arguments do not exist yet; the writer's alternative (evaluate read-only at build time, refuse what is not made yet) would leave refusals that depend on what happened to be checked first. Needs known before the work and pulled at item grain is the item layer's own rule (keys from text before the work; pull at item grain).",
+   "state": "decided; writing"
+  },
+  {
+   "id": "D85",
+   "date": "2026-11-16",
+   "decision": "Verification, after the owner asked whether blaze supports end-to-end, property and differential tests well (2026-11-16). (1) The command is the judge: the ladder rungs and the owner's hello world run through the built `blaze` binary (crates/blaze-cli tests/command_rungs.rs: clone, scratch HOME, deadline, no network), reported in the library harness's words so a rung that passes in the harness and not through the command is a named finding; a must-pass list that only grows. (2) Each coordinator snapshot commit carries a `Verified:` trailer saying what ran on that tree (per-crate suites with their status files' time, rungs, command rungs, censuses), with `none` allowed so unverified commits can be found. (3) At each snapshot the coordinator lists every MODIFIED existing expectation file (a rung's `expected`, an oracle's fold, a must-pass list) and reads each change before committing: a change may add a check, never quietly rewrite the one that judges it. (4) Property, differential and end-to-end tests become kinds `blaze test` knows (kept failing tapes as records replayed first; the previous version of a function as the oracle from its code record; step traces from spans; reads as keys): an architect writes the end state into test.md.",
+   "recommended": "Writers for (1) and (4) started; (2) and (3) from the next snapshot.",
+   "why": "Two wrong answers found today (a false guard on an or-pattern jumped to the next arm; `&u32 == &u32` compared addresses) passed 143 builder unit tests and were caught only by whole programs; and twice a stage proven in a harness did not run through the command. test.md says nothing about property, differential or end-to-end tests, while blaze-sim (tapes, shrinking, replay) is used by about fifty of blaze's own crates and unknown to the test runner.",
+   "state": "decided; in progress"
+  },
+  {
+   "id": "D86",
+   "date": "2026-11-16",
+   "decision": "`blaze run` and `blaze test` exit with status 125 when blaze itself could not build or start the program, or stopped it at a function it cannot build yet; the program's own status passes through unchanged (Rust's 101 stays the program's panic). One named constant.",
+   "recommended": "The hello-world lane wires it with the switch to the new front end; the end-to-end test reads it in place of scanning standard error.",
+   "why": "The end-to-end writer found that `run` returns the program's status and uses status 1 for its own failures, so a refusal cannot be told from a program that exits 1; the launcher's stub used 101, which is also a Rust panic. 125 is what `env`, `timeout` and container runners use for the tool's own failure.",
+   "state": "decided; wiring"
+  },
+  {
+   "id": "D87",
+   "date": "2026-11-16",
+   "decision": "A record's key holds a PRODUCER for its kind in place of the whole binary's build id: the code identity of the envelope writer (blaze-drive), of that kind's stage, and the two build settings that change behaviour; when blaze builds blaze, a stage's identity is its root function's code identity at function grain. Bounded home: pack format 3 stores each record's producer; a roster of live binaries (ran within 30 days and still at their path); a per-layer use log; a detached collector with a deadline that publishes the new pack before removing old ones, proven by a crash simulation with planted bugs (docs/v2/plan/design/remote-read.md, End state section). NOT built: the interim build-time script that hashes each stage's source closure, its stamp crate and build entry (the architect's pieces 2 to 4).",
+   "recommended": "Pieces 7 to 10 (format 3, roster, use log, collector) and 1 (producers in the drive) start once the command path (hello world, the whole check) is green; they are off the first goal's path and piece 1 is a cross-crate batch in the driver's files.",
+   "why": "Every rebuilt blaze rewrote all records (twelve packs, about 215 MB, in the owner's home in a day) and compaction bounds pack count, not bytes. The interim script is scaffolding deleted at self-hosting and buys little before it by the architect's own count: every stage's closure holds bstd, blaze-ids and blaze-drive, which changed in 42, 16 and 28 commits in a week, so nearly every rebuild would move every stage's identity anyway. Hand-kept form versions behind a ratchet were rejected: a person declaring that nothing changed is how a stale record gets read.",
+   "state": "decided; pieces parked behind the command path"
+  },
+  {
+   "id": "D88",
+   "date": "2026-11-16",
+   "decision": "The end state for property, differential and end-to-end tests in `blaze test` is the architect's section in docs/v2/plan/design/test.md (2026-11-16): a tape search is recognised when a test opens a case board, with the search and shrinker in the parent; existing proptest and quickcheck suites run unchanged on a seed from the test's key; failing tapes, regression tapes and the corpus are records replayed first and shared through the cache; more search runs after the answer in a helper that expires; `blaze_sim::differ` and a `SeamUntested` finding for rule 78; the previous version of a function as the oracle from its code record; a timeout prints the step that failed; a deleted test, an added `ignore`, a changed expectation or a lowered budget is a judge-changed finding that the merge script refuses without a stated reason.",
+   "recommended": "Writers now for the pieces that need no test child: the case board and `check` from it (1, 2), `differ` (13), the coverage-guided search phase (8), judge-changed findings and the timeout formatter (19, 18a). The blaze-run planning pieces (3 to 6) wait until `blaze test` runs a plain test.",
+   "why": "test.md said nothing about these kinds while blaze-sim was used by about fifty crates and unknown to the runner. Accepted with one caution passed to the test child's owner: treating monotonic and CPU clock reads as reusable trades a little soundness (a timing-dependent test keeps its pass) for any async test being reusable at all.",
+   "state": "decided; writing"
   }
  ]
 }

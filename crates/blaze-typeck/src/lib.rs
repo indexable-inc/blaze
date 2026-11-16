@@ -61,7 +61,7 @@ pub use body::{
     Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
     IntSuffix, Lit, Pat, Segment, Stmt, UnOp,
 };
-pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ExprDefs, Fields, PatDefs};
+pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, PatDefs};
 pub use diag::{Because, Diag, DiagCode, UnmetGoal};
 /// The fix offered for a name that does not resolve: `Checked::suggests` and `suggest::pick`.
 pub use rules::suggest;

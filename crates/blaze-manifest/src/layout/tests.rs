@@ -206,7 +206,9 @@ fn a_target_path_out_of_the_anchor_is_refused() {
 /// as a member: package `cookie-factory` test `http`: no file `pkg/tests/http.rs` for its root
 /// ```
 ///
-/// and, as a member, refuses a `path` out of the package and two tables of one name.
+/// A member's bad target (no file, a `path` out of the package, a second of one name) is a
+/// finding in `Member::refused_targets`, never a `LayoutError`: the layout is read whole and the
+/// member's other targets stay.
 #[test]
 fn tests_examples_and_benches_are_targets() {
     const MANIFEST: &str = "[package]\nname = \"pkg\"\nedition = \"2021\"\n\n[[test]]\nname = \"c\"\npath = \"other/c.rs\"\nharness = false\n";
@@ -265,28 +267,36 @@ fn tests_examples_and_benches_are_targets() {
     let doesnt = Tree { files: &[("pkg/Cargo.toml", MANIFEST), ("pkg/src/lib.rs", "")] };
     assert_eq!(doesnt.read("pkg").unwrap().0.members[0].extras.len(), 0, "a dependency's `[[test]]` path was looked for");
 
-    // The same manifests as the workspace the user builds: typed errors naming the package,
-    // the target and the rule.
-    let refused = |files: &[(&'static str, &'static str)]| match (Tree { files }).read_as("pkg", true) {
-        Err(LayoutError::Target { package, target, why, .. }) => (package.as_str().to_owned(), target.as_str().to_owned(), why),
-        Err(other) => panic!("another refusal: {other}"),
-        Ok(_) => panic!("a bad `[[test]]` was read"),
+    // The same manifests as the workspace the user builds: each bad target is a finding on its
+    // member (`refused_targets`, naming the target and the rule), left out of `extras`, and the
+    // layout is still read whole: the member's library and its good targets are all there, so
+    // one bad `[[example]]` hides nothing else from `check`.
+    let refused = |files: &[(&'static str, &'static str)]| {
+        let (units, _) = (Tree { files }).read_as("pkg", true).unwrap();
+        let member = &units.members[0];
+        assert!(member.lib.is_some(), "a refused target cost the member its library");
+        let good: std::vec::Vec<std::string::String> = member.extras.iter().map(|t| t.name.as_str().to_owned()).collect();
+        let found: std::vec::Vec<(std::string::String, super::TargetRefused<'static>)> =
+            member.refused_targets.iter().map(|r| (r.target.as_str().to_owned(), r.why.clone())).collect();
+        (member.name.as_str().to_owned(), good, found)
     };
-    let (package, target, why) = refused(&[("pkg/Cargo.toml", HTTP), ("pkg/src/lib.rs", "")]);
+    let (package, good, found) = refused(&[("pkg/Cargo.toml", HTTP), ("pkg/src/lib.rs", ""), ("pkg/examples/e.rs", "")]);
+    assert_eq!(good, ["e"], "the good example was dropped with the bad test");
+    assert_eq!(found.len(), 1);
+    let (target, why) = &found[0];
     std::println!("as a member: package `{package}` test `{target}`: {why}");
     assert_eq!((package.as_str(), target.as_str()), ("cookie-factory", "http"));
     assert!(matches!(why, super::TargetRefused::NoFile { .. }));
-    let (package, target, why) = refused(&[("pkg/Cargo.toml", "[package]\nname = \"pkg\"\n[[test]]\nname = \"out\"\npath = \"../x.rs\"\n"), ("pkg/src/lib.rs", ""), ("x.rs", "")]);
-    assert_eq!((package.as_str(), target.as_str()), ("pkg", "out"));
-    assert!(matches!(why, super::TargetRefused::OutsidePackage { .. }));
-    // Two tables of one kind and name are the layout's refusal, naming the package and target.
-    match (Tree { files: &[("pkg/Cargo.toml", "[package]\nname = \"pkg\"\n[[test]]\nname = \"d\"\npath = \"src/lib.rs\"\n[[test]]\nname = \"d\"\npath = \"src/lib.rs\"\n"), ("pkg/src/lib.rs", "")] }).read_as("pkg", true) {
-        Err(LayoutError::Target { package, target, why: super::TargetRefused::Duplicate { .. }, .. }) => {
-            assert_eq!((package.as_str(), target.as_str()), ("pkg", "d"));
-        }
-        Err(other) => panic!("another refusal: {other}"),
-        Ok(_) => panic!("two `[[test]]` of one name were read"),
-    }
+    let (_, _, found) = refused(&[("pkg/Cargo.toml", "[package]\nname = \"pkg\"\n[[test]]\nname = \"out\"\npath = \"../x.rs\"\n"), ("pkg/src/lib.rs", ""), ("x.rs", "")]);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0.as_str(), "out");
+    assert!(matches!(found[0].1, super::TargetRefused::OutsidePackage { .. }));
+    // Two tables of one kind and name: the first stays, the second is the finding.
+    let (_, good, found) = refused(&[("pkg/Cargo.toml", "[package]\nname = \"pkg\"\nedition = \"2021\"\n[[test]]\nname = \"d\"\npath = \"src/lib.rs\"\n[[test]]\nname = \"d\"\npath = \"src/lib.rs\"\n"), ("pkg/src/lib.rs", "")]);
+    assert_eq!(good, ["d"]);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0.as_str(), "d");
+    assert!(matches!(found[0].1, super::TargetRefused::Duplicate { .. }));
 }
 
 #[test]

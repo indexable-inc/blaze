@@ -1,21 +1,21 @@
-//! The expansion record: what one call gave, kept by blaze-record's form `base → read-lists →
-//! answer` in a write-once folder of the store.
+//! The expansion record: what one call gave, kept as a row of its crate's results table
+//! ([`table`]): `base → read list → answer`.
 //!
 //! - The base is computed from text before the run ([`base_key`]): the module's wasm digest,
 //!   the macro's index, name and kind, the edition, and the input's and the attribute's tokens
 //!   as the macro sees them (kind, spacing and text; never a position or a context, which it
 //!   cannot see).
-//! - The read-list names what the run read (`env:NAME`, `file:path`, `dir:path`,
-//!   `stat:path`, paths from the workspace root); a lookup values each now
-//!   ([`crate::sandbox::answer_now`]), so a changed file or variable misses exactly the
-//!   expansions that read it.
-//! - The answer is the [`Produced`] in canonical bytes ([`encode`]), kept in the read-list's
-//!   note after the digest each read had: a hit on a base's first list is one read of one
-//!   file, its reads valued, then the decode. Two runs of one key write equal bytes, wherever
-//!   the checkout is; two answers under equal reads and digests are refused (rule 21).
+//! - The read list names what the run read (`env:NAME`, `file:path`, `dir:path`,
+//!   `stat:path`, paths from the workspace root) and the answer each had; a lookup values
+//!   each now ([`crate::sandbox::answer_now`]), so a changed file or variable misses exactly
+//!   the expansions that read it.
+//! - The answer is the [`Produced`] in canonical bytes ([`table::row_bytes`]). Two runs of one key
+//!   write equal bytes, wherever the checkout is; two answers under equal reads and digests
+//!   are refused (rule 21).
 //!
-//! The folder is `<store>/proc-macro/records/list/<id>`, the chain's slots (blaze-record's
-//! [`walk`]); a put never replaces bytes, and other bytes under a held key are refused.
+//! The store's folder also holds the build scripts' records, one write-once file each
+//! ([`DirStore::build_scripts`], blaze-record's [`Store`]): a put never replaces bytes, and
+//! other bytes under a held key are refused.
 
 use std::path::Path;
 
@@ -24,7 +24,7 @@ use bstd::cx::Cx;
 use bstd::env::Vars;
 use bstd::fs::{Content, Dir, Durable, FsError, FsKind, ReadWrite};
 use bstd::io::{Io, Limits, NativeWorld, OpenError};
-use bstd::mem::{Bytes, TASK_FRAME};
+use bstd::mem::TASK_FRAME;
 use core::time::Duration;
 use bstd::path::Path as BPath;
 
@@ -34,7 +34,7 @@ use blaze_expand::{
 };
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AVec, Alloc};
-use blaze_record::{Bounds, Filing, Kind, ListRef, Placed, Store, Tally, Walked, walk, write_list_with};
+use blaze_record::{Kind, Store, Tally};
 
 use crate::{
     module::Exported,
@@ -50,6 +50,16 @@ const SEAL_LEN: usize = 32;
 /// How long one record read or publish may take (rule 18): a record is a small file, so a
 /// minute is a hang, failed by the effect layer naming the record.
 const RECORD_BUDGET: Duration = Duration::from_secs(60);
+
+/// What a read of a record's file found ([`OnDir::read`]).
+enum Held {
+    /// No file under the name.
+    Absent,
+    /// One file's bytes, all of them.
+    Whole(Vec<u8>),
+    /// A longer file took the name between the read's two effects: only its start was read.
+    Replaced,
+}
 
 /// The records' one home: a directory of the effect layer, with the world it came from.
 ///
@@ -73,36 +83,69 @@ impl OnDir {
         self.io.cx(RECORD_BUDGET, TASK_FRAME).map_err(|_| FilesError::Stopped { name: *name })
     }
 
-    /// The bytes at `name`, none when nothing is there.
-    fn read(&self, name: &RecordName) -> Result<Option<Vec<u8>>, FilesError> {
+    /// The bytes at `name`, in a buffer of the file's own length (no frame, no fixed block: a
+    /// file of any length is read): [`Held::Absent`] when nothing is there.
+    ///
+    /// Two effects: the file's length, then ONE read of that length and a byte more. One read
+    /// is one file's bytes (another command's publish replaces the name, never the bytes
+    /// under a read), so what comes back is a whole file whenever the read met the file's end:
+    /// at the length asked, or sooner (a shorter file took the name between the two effects).
+    /// A read that filled the byte more met a LONGER file put there in between and holds only
+    /// its start: [`Held::Replaced`], which the caller answers by name.
+    fn read(&self, name: &RecordName) -> Result<Held, FilesError> {
         let cx = self.cx(name)?;
-        let mut into = Bytes::new_in(cx.frame(), "an expansion record read back");
-        match self.dir.read_all(&cx, &Self::path(name)?, &mut into) {
-            Ok(_) => Ok(Some(into.as_slice().to_vec())),
-            Err(error) if error.kind == FsKind::NotFound => Ok(None),
-            Err(error) => Err(FilesError::Effect(error)),
+        let file = match self.dir.open_read(&cx, &Self::path(name)?) {
+            Ok(file) => file,
+            Err(error) if error.kind == FsKind::NotFound => return Ok(Held::Absent),
+            Err(error) => return Err(FilesError::Effect(error)),
+        };
+        let len = match file.len(&cx) {
+            Ok(len) => usize::try_from(len).map_err(|_| FilesError::Stopped { name: *name })?,
+            Err(error) if error.kind == FsKind::NotFound => return Ok(Held::Absent),
+            Err(error) => return Err(FilesError::Effect(error)),
+        };
+        let mut bytes = vec![0u8; len + 1];
+        let read = file.read_into(&mut bytes, 0).wait(&cx).map_err(FilesError::Effect)?;
+        if read > len {
+            return Ok(Held::Replaced);
         }
+        bytes.truncate(read);
+        Ok(Held::Whole(bytes))
     }
 
-    /// `name` made to hold `body` then `seal`, replaced all at once for a reader (never a
-    /// part), nothing synced: after a power cut it holds what it held, or a torn part.
-    fn publish(&self, name: &RecordName, body: &[u8], seal: &[u8; SEAL_LEN]) -> Result<(), FilesError> {
+    /// `name` made to hold `whole` (a record's body with its seal at its end), replaced all
+    /// at once for a reader (never a part), nothing synced: after a power cut it holds what
+    /// it held, or a torn part. The slice is handed to the effect as it lies: nothing here
+    /// copies it or bounds its length.
+    fn publish(&self, name: &RecordName, whole: &[u8]) -> Result<(), FilesError> {
         let cx = self.cx(name)?;
-        let mut whole = Bytes::new_in(cx.frame(), "an expansion record and its seal");
-        whole.try_extend(body).and_then(|()| whole.try_extend(seal)).map_err(|_| FilesError::Stopped { name: *name })?;
-        self.dir.publish(&cx, &Self::path(name)?, Content::bytes(whole.as_slice()), Durable::No).map(|_| ()).map_err(FilesError::Effect)
+        self.dir.publish(&cx, &Self::path(name)?, Content::bytes(whole), Durable::No).map(|_| ()).map_err(FilesError::Effect)
     }
 
-    /// [`RecordPlant::RenameFirst`]'s write: `name` cut to nothing in place, then `body` and
-    /// `seal` appended in two parts. Never taken but by the simulation's planted bug.
-    fn write_in_place(&self, name: &RecordName, body: &[u8], seal: &[u8; SEAL_LEN]) -> Result<(), FilesError> {
+    /// [`RecordPlant::FramedPublish`]'s write: `whole` copied into the task's frame, then
+    /// published from there, so a record longer than the frame is refused. Never taken but by
+    /// the planted bug's test.
+    fn publish_framed(&self, name: &RecordName, whole: &[u8]) -> Result<(), FilesError> {
+        let cx = self.cx(name)?;
+        let mut framed = bstd::mem::Bytes::new_in(cx.frame(), "a record copied into the task's frame");
+        framed.try_extend(whole).map_err(|_| FilesError::Stopped { name: *name })?;
+        self.dir.publish(&cx, &Self::path(name)?, Content::bytes(framed.as_slice()), Durable::No).map(|_| ()).map_err(FilesError::Effect)
+    }
+
+    /// [`RecordPlant::RenameFirst`]'s write: `name` cut to nothing in place, then `whole`
+    /// appended in three parts. Never taken but by the simulation's planted bug.
+    fn write_in_place(&self, name: &RecordName, whole: &[u8]) -> Result<(), FilesError> {
         let cx = self.cx(name)?;
         let file = self.dir.create(&cx, &Self::path(name)?).map_err(FilesError::Effect)?;
+        let (body, seal) = whole.split_at(whole.len().saturating_sub(SEAL_LEN));
         let (first, second) = body.split_at(body.len() / 2);
-        file.append(&cx, first, Durable::No).map_err(FilesError::Effect)?;
-        file.append(&cx, second, Durable::No).map_err(FilesError::Effect)?;
-        file.append(&cx, seal, Durable::No).map_err(FilesError::Effect)?;
-        file.close(&cx, Durable::No).map(|_| ()).map_err(FilesError::Effect)
+        let appended = file
+            .append(&cx, first, Durable::No)
+            .and_then(|()| file.append(&cx, second, Durable::No))
+            .and_then(|()| file.append(&cx, seal, Durable::No));
+        // The file is finished whether or not an append failed: the part written stays there.
+        let closed = file.close(&cx, Durable::No).map(|_| ());
+        appended.and(closed).map_err(FilesError::Effect)
     }
 }
 
@@ -163,6 +206,9 @@ pub enum RecordPlant {
     /// name before the bytes are whole): a failure between two parts leaves a part there with
     /// no power lost ([`table`]).
     RenameFirst,
+    /// A crate's results table is copied into the task's frame before it is published: a
+    /// table longer than the frame is refused ([`table`]'s hundred-megabyte test).
+    FramedPublish,
 }
 
 /// The folder store of records: each file the record's bytes then their [`SEAL`], published
@@ -175,6 +221,9 @@ pub struct DirStore {
     torn: core::sync::atomic::AtomicU64,
     /// How many results tables were hashed whole: once a boot each, not once a command.
     hashed: core::sync::atomic::AtomicU64,
+    /// How many results tables another command replaced by a longer one under this
+    /// command's read ([`Held::Replaced`]): read as absent, their calls run again.
+    replaced: core::sync::atomic::AtomicU64,
 }
 
 impl DirStore {
@@ -207,7 +256,19 @@ impl DirStore {
 
     /// The store over `files`; `plant` is [`RecordPlant::None`] but in the simulation.
     pub fn on(files: OnDir, plant: RecordPlant) -> DirStore {
-        DirStore { files, tally: Tally::default(), plant, torn: core::sync::atomic::AtomicU64::new(0), hashed: core::sync::atomic::AtomicU64::new(0) }
+        DirStore {
+            files,
+            tally: Tally::default(),
+            plant,
+            torn: core::sync::atomic::AtomicU64::new(0),
+            hashed: core::sync::atomic::AtomicU64::new(0),
+            replaced: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// How many results tables were replaced by a longer one under this store's read of them.
+    pub fn replaced(&self) -> u64 {
+        self.replaced.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many results tables this store found torn, and how many it hashed whole.
@@ -262,7 +323,14 @@ impl Store for DirStore {
     type Error = FilesError;
 
     fn get(&self, kind: Kind, key: &ContentId) -> Result<Option<Self::Held>, FilesError> {
-        let Some(mut bytes) = self.files.read(&Self::name(kind, key))? else { return Ok(None) };
+        let name = Self::name(kind, key);
+        let mut bytes = match self.files.read(&name)? {
+            Held::Absent => return Ok(None),
+            Held::Whole(bytes) => bytes,
+            // A record of this store is written once and never by other bytes (`put`), so a
+            // longer file under its name is not a record of it: refused by name.
+            Held::Replaced => return Err(FilesError::OtherBytes { name }),
+        };
         // A torn file (any prefix of a publish, or zeros where a sector was lost) is a miss.
         let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else { return Ok(None) };
         let sealed = ContentId::of(SEAL, &bytes[..body_len]).0 == bytes[body_len..];
@@ -278,7 +346,10 @@ impl Store for DirStore {
         if let Some(held) = self.get(kind, &key)? {
             return if held == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
         }
-        self.files.publish(&name, bytes, &ContentId::of(SEAL, bytes).0)
+        let mut whole = Vec::with_capacity(bytes.len() + SEAL_LEN);
+        whole.extend_from_slice(bytes);
+        whole.extend_from_slice(&ContentId::of(SEAL, bytes).0);
+        self.files.publish(&name, &whole)
     }
 
     fn bytes(held: &Self::Held) -> &[u8] {
@@ -517,42 +588,6 @@ fn level_of(byte: u8) -> Option<ProcLevel> {
     })
 }
 
-/// The layout of a record's note. 2: the answer lives in its read-list's note, after the digest
-/// each read had, so a hit is one read of one file (layout 1 kept it in a second file).
-const NOTE_LAYOUT: u32 = 2;
-
-/// A read's answer as the note holds it: absent, or a digest. A proc macro's run makes no other.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Unkeepable {
-    /// The read's subject.
-    pub read: usize,
-}
-
-/// `produced` as its read-list's note, in canonical bytes: the layout, the digest each read had
-/// (in the reads' order), then the tokens with their origins, the diagnostics and their text.
-/// The reads' subjects are the list's own names ([`keep`]).
-pub fn encode(produced: &Produced<'_>) -> Result<Vec<u8>, Unkeepable> {
-    let mut out = Vec::new();
-    encode_into(&mut out, produced)?;
-    Ok(out)
-}
-
-fn encode_into(out: &mut Vec<u8>, produced: &Produced<'_>) -> Result<(), Unkeepable> {
-    out.extend_from_slice(&NOTE_LAYOUT.to_le_bytes());
-    for (at, read) in produced.reads.list().iter().enumerate() {
-        match read.answer {
-            ReadAnswer::Digest(id) => {
-                out.push(1);
-                out.extend_from_slice(&id.0);
-            }
-            ReadAnswer::Absent => out.push(0),
-            ReadAnswer::Bool(_) | ReadAnswer::Number(_) => return Err(Unkeepable { read: at }),
-        }
-    }
-    answer_into(out, produced);
-    Ok(())
-}
-
 /// `produced` without its reads, in canonical bytes: the tokens with their origins, the
 /// diagnostics and their text. What a crate's results table keeps a call's answer as
 /// ([`table`]); the reads are the row's read list.
@@ -634,27 +669,6 @@ impl<'b> Cursor<'b> {
             _ => return Err(Corrupt("a read's answer tag")),
         })
     }
-
-    /// The note's layout word, checked.
-    fn layout(&mut self) -> Result<(), Corrupt> {
-        match self.u32("the layout")? == NOTE_LAYOUT {
-            true => Ok(()),
-            false => Err(Corrupt("the layout word")),
-        }
-    }
-}
-
-/// The [`Produced`] a read-list holds: its reads named by `list`, their digests and the answer
-/// in its note ([`encode`]'s), in `alloc`.
-pub fn decode<'a>(list: ListRef<'_>, edition: Edition, alloc: Alloc<'a>) -> Result<Produced<'a>, Corrupt> {
-    let mut c = Cursor { bytes: list.note() };
-    c.layout()?;
-    let mut reads = Reads::new_in(alloc);
-    for subject in list.reads() {
-        let subject = std::str::from_utf8(subject).map_err(|_| Corrupt("a read's subject"))?;
-        reads.push(ReadKind::ProcMacro, subject, c.answer()?).map_err(|_| Corrupt("a read that does not fit"))?;
-    }
-    answer_of(c, reads, edition, alloc)
 }
 
 /// The [`Produced`] whose answer ([`answer_into`]'s bytes) is all `c` still holds, with the
@@ -673,6 +687,13 @@ fn answer_of<'a>(mut c: Cursor<'_>, reads: Reads<'a>, edition: Edition, alloc: A
     for _ in 0..count {
         origins.push(c.origin()?);
     }
+    let (diagnostics, text) = tail_of(c, alloc)?;
+    Ok(Produced { tokens, origins, reads, diagnostics, text })
+}
+
+/// An answer's diagnostics and their text: what `c` holds after the tokens and their origins,
+/// in the loose form ([`answer_into`]) and in a table's dense one alike.
+fn tail_of<'a>(mut c: Cursor<'_>, alloc: Alloc<'a>) -> Result<(AVec<'a, ProcDiagnostic>, AVec<'a, u8>), Corrupt> {
     let mut diagnostics: AVec<'a, ProcDiagnostic> = AVec::new_in(alloc);
     for _ in 0..c.u32("the diagnostic count")? {
         let diagnostic = match c.u8("a diagnostic")? {
@@ -696,44 +717,33 @@ fn answer_of<'a>(mut c: Cursor<'_>, reads: Reads<'a>, edition: Edition, alloc: A
     if !c.bytes.is_empty() {
         return Err(Corrupt("bytes after the record's end"));
     }
-    Ok(Produced { tokens, origins, reads, diagnostics, text })
+    Ok((diagnostics, text))
 }
 
 /// Why a record could not be read or kept.
 #[derive(Debug)]
 pub enum RecordError {
-    /// The store failed under the chain, or a slot of the base's chain holds what is no
-    /// read-list of it: the error names the key or the slot and what was being done.
-    Chain(blaze_record::Error<FilesError>),
-    /// The read-list under `base` is not this layout's record.
+    /// The row of `base` in its crate's table is not this layout's answer.
     Corrupt { base: ContentId, what: &'static str },
-    /// The run's read `read` (its index) had an answer a note does not hold.
+    /// The run's read `read` (its index) had an answer a read list does not hold.
     Unkeepable { base: ContentId, read: usize },
     /// Another answer is kept under `base` for the same reads with the same digests: the run
     /// read or depended on something its key and list do not name (rule 21).
     TwoAnswers { base: ContentId },
-    /// Every generation of `base`'s chain is full ([`Placed::Full`]): the answer is not kept.
-    Full { base: ContentId },
     /// A crate's results table, or the file vouching for it, could not be read or written.
     Files(FilesError),
     /// The results table of the crate named `krate` is whole by its seal and is no table of
     /// this layout: `what` in it is wrong.
     Table { krate: ContentId, what: &'static str },
-    /// The results of the crate named `krate` are `bytes` bytes: more than a table's 32-bit
-    /// places hold.
-    TooLarge { krate: ContentId, bytes: usize },
-}
-
-impl From<blaze_record::Error<FilesError>> for RecordError {
-    fn from(error: blaze_record::Error<FilesError>) -> RecordError {
-        RecordError::Chain(error)
-    }
+    /// The results of the crate named `krate` have `count` of `what` (rows, read lists, the
+    /// bytes of one answer or of one read list): more than the table's 32-bit word for it
+    /// holds. The table's own length is not bounded: its places are 64-bit.
+    TooLarge { krate: ContentId, what: &'static str, count: usize },
 }
 
 impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecordError::Chain(error) => write!(f, "the expansion records: {error}"),
             RecordError::Corrupt { base, what } => write!(f, "the expansion record of base {base:x}: {what}"),
             RecordError::Unkeepable { base, read } => {
                 write!(f, "the expansion of base {base:x}: its read {read} has an answer that is neither absent nor a digest")
@@ -742,101 +752,16 @@ impl std::fmt::Display for RecordError {
                 f,
                 "the expansion of base {base:x}: another answer is kept under the same reads and digests; the run read something its key does not name (rule 21)"
             ),
-            RecordError::Full { base } => write!(f, "the expansion of base {base:x}: every generation of its chain is full; not kept"),
             RecordError::Files(error) => write!(f, "a crate's proc-macro results table: {error}"),
             RecordError::Table { krate, what } => write!(f, "the proc-macro results table of crate {krate:x} (crate/{krate:x}): {what} is not this layout's"),
-            RecordError::TooLarge { krate, bytes } => {
-                write!(f, "the proc-macro results of crate {krate:x}: {bytes} bytes, more than a table's 32-bit places hold; not kept")
+            RecordError::TooLarge { krate, what, count } => {
+                write!(f, "the proc-macro results of crate {krate:x}: {count} {what}, more than the table's 32-bit word for it holds; not kept")
             }
         }
     }
 }
 
 impl std::error::Error for RecordError {}
-
-/// The note's digests checked against what each read of `list` is answered by now in
-/// `package`: `false` at the first that differs or has no answer now. `valued` counts the reads
-/// asked.
-fn current(list: ListRef<'_>, package: &Package, valued: &mut u64) -> Result<bool, Corrupt> {
-    let mut c = Cursor { bytes: list.note() };
-    c.layout()?;
-    for subject in list.reads() {
-        let held = c.answer()?;
-        *valued += 1;
-        let Ok(subject) = std::str::from_utf8(subject) else { return Err(Corrupt("a read's subject")) };
-        let Ok(now) = answer_now(package, subject) else { return Ok(false) };
-        let now = now.map_or(ReadAnswer::Absent, ReadAnswer::Digest);
-        if now != held {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// The answer of `base` under what its reads are in `package` now, decoded in `alloc`. A hit
-/// on the base's first list is one read of one file: the list holds the answer.
-pub fn find<'a>(store: &DirStore, base: &ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
-    let corrupt = |Corrupt(what)| RecordError::Corrupt { base: *base, what };
-    let mut valued = 0;
-    let walked = walk::<DirStore, Produced<'a>, RecordError, _>(store, Bounds::STANDARD, base, |_at, _bytes, list| {
-        if !current(list, package, &mut valued).map_err(corrupt)? {
-            return Ok(None);
-        }
-        decode(list, edition, alloc).map(Some).map_err(corrupt)
-    });
-    store.tally.valued(valued);
-    Ok(match walked? {
-        Walked::Found { found, .. } => Some(found),
-        Walked::Passed { .. } => None,
-    })
-}
-
-/// Keeps `produced` under `base`: one read-list naming its reads, whose note holds the digest
-/// each had and the answer. A list of the same reads and digests with another answer already
-/// under `base` is refused ([`RecordError::TwoAnswers`]).
-pub fn keep(store: &DirStore, base: ContentId, produced: &Produced<'_>) -> Result<(), RecordError> {
-    let reads = &produced.reads;
-    let list = record_bytes(base, produced)?;
-    let mine = ListRef::open(&list, &base).map_err(|why| blaze_record::Error::List { at: blaze_record::Slot { generation: 0, n: 0 }, why })?;
-    // The note's head, the layout and the digests: equal heads under equal reads are one
-    // key's two values when the rest differs.
-    let head = 4 + reads.list().iter().map(|read| if matches!(read.answer, ReadAnswer::Digest(_)) { 33 } else { 1 }).sum::<usize>();
-    let walked = walk::<DirStore, (), RecordError, _>(store, Bounds::STANDARD, &base, |_at, _bytes, held| {
-        let same_reads = held.len() == mine.len() && held.reads().eq(mine.reads());
-        let same_head = held.note().get(..head) == mine.note().get(..head);
-        Ok((same_reads && same_head && held.note() != mine.note()).then_some(()))
-    })?;
-    if let Walked::Found { .. } = walked {
-        return Err(RecordError::TwoAnswers { base });
-    }
-    let mut filing = Filing::new(base, Bounds::STANDARD);
-    match filing.place(store, &list)? {
-        Placed::Written(_) | Placed::Kept(_) => Ok(()),
-        Placed::Full => Err(RecordError::Full { base }),
-    }
-}
-
-/// The bytes of `produced`'s record under `base`: the read-list of its reads, whose note holds
-/// their digests and the answer ([`encode`]). One file a hit reads whole.
-pub fn record_bytes(base: ContentId, produced: &Produced<'_>) -> Result<Vec<u8>, RecordError> {
-    let reads = &produced.reads;
-    let mut list = Vec::new();
-    let mut unkeepable = None;
-    write_list_with(
-        &mut list,
-        &base,
-        |out| {
-            if let Err(Unkeepable { read }) = encode_into(out, produced) {
-                unkeepable = Some(read);
-            }
-        },
-        reads.list().iter().map(|read| reads.subject(read).as_bytes()),
-    );
-    if let Some(read) = unkeepable {
-        return Err(RecordError::Unkeepable { base, read });
-    }
-    Ok(list)
-}
 
 #[path = "table.rs"]
 pub mod table;

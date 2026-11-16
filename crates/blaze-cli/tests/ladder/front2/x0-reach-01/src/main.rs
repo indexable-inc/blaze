@@ -81,5 +81,8 @@ pub extern "C" fn main() -> i32 {
         let o = Outer { tag: 1, inner: Inner { weight: 30, count: p } };
     }
     let t = Table { cells: [5, 12, 7] };
-    count + t[1]
+    // Annotated: `t[1]`'s type is the projection `<Table as Index<usize>>::Output`, and the
+    // `+` on `i32` is then the built-in one (this no_core crate declares no `add` lang trait).
+    let e: i32 = t[1];
+    count + e
 }

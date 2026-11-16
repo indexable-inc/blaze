@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-ref-11-deref-unsized"
+version = "0.1.0"
+edition = "blaze-2026.11"
