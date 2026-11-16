@@ -1154,6 +1154,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-file-items"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-sim",
+ "parser",
+]
+
+[[package]]
 name = "blaze-findings"
 version = "0.0.0"
 dependencies = [
@@ -1483,6 +1493,15 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-ids",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-impls"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-id",
  "blaze-sim",
 ]
 
@@ -2463,6 +2482,16 @@ dependencies = [
  "blaze-rng",
  "blaze-store-check",
  "crossbeam-channel",
+]
+
+[[package]]
+name = "blaze-surface"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-hash",
+ "blaze-id",
+ "blaze-sim",
 ]
 
 [[package]]

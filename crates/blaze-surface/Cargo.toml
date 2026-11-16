@@ -1,0 +1,34 @@
+[package]
+name = "blaze-surface"
+description = "The item layer's schema and its two traits (docs/v2/plan/design/bottom.md): the records a question about one item reads (file items, module declarations and scopes, module files, crate roots, macro definitions, key index pages, lang items, the crate graph), each written once and read in place, and `Items` and `Source`, everything the type checker may ask"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Doc tests run here, as in blaze-id: that `Local` is not `Portable` is a `compile_fail` doc
+# test, beside its control that compiles.
+
+[features]
+# `testing::MemSurface`: an in-memory `Items` and `Source` over hand-built records, for the
+# tests of the crates that ask through the two traits.
+testing = []
+
+[dependencies]
+# `ItemKey`, `CrateItemKey`, `ContentId`, `NoItem`, `Portable`: every item and file is named by
+# its key.
+blaze-id.workspace = true
+# `record!`, `Writer`, `open`, `Slice`, `Aligned`: each record is a flat buffer read in place.
+blaze-format.workspace = true
+# `HashMap`: a task's table from item keys to its local numbers.
+blaze-hash.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true
