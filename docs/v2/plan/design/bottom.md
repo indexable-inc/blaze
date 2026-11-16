@@ -297,6 +297,17 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   switch is the exception and says why. What stays at compile time is what decides whether
   the program is right: types, borrows, capabilities. A toggle is a request to a live run
   through the viewer's channel and is a permitted action of a paired browser, never open.
+- **How a task waits: it does not** (Andrew: "why not explicit state machine sans io").
+  Logic whose states are the design is a hand-written sans-IO machine (`step(event) ->
+  effects`; rule 14): name resolution, the run, the drivers. A compiler task that is recursive
+  code (the type checker asks for a callee's signature in the middle of an expression) is not
+  turned inside out and does not park: it is a pure function of its inputs that returns its
+  result or the list of what it lacks (`Need(keys)`); the driver gets those, as records or by
+  running their tasks, and enters the task again from the top. What it already read is a
+  record, so a re-entry is cheap; what it asked for is its read list; and having no stack to
+  keep, it can run on another machine. Fibers are bstd's convenience for sequential code of
+  an ordinary program (no `async`, one kind of function), until blaze generates the state
+  machine from straight-line code; they are not how the compiler's own tasks wait.
 - **Many machines on one page** (Andrew: "a monitor of what might be happening even on
   multiple machines"). The viewer's events (a command began or ended, what it runs, compiles
   or tests, on which machine and checkout, time and memory) are one stream. When an
