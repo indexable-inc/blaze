@@ -245,6 +245,17 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   impl. It is for cleanup that cannot fail and cannot wait: what must be finished with a result
   or under a deadline is a linear type (`#[blaze::linear]`) with an explicit `finish(cx)`.
   `async_drop` is not used (a destructor takes no context and returns no error).
+- **Layout: columns** (Andrew: "use soa as much as possible ... and other things that will
+  optimize"). A record, and an in-memory table of more than a few rows, is a struct of arrays:
+  one packed column per field, one length, one buffer. Rows of structs only where every access
+  reads the whole row. With it: fields read on every lookup apart from fields read rarely; a
+  `u32` index into a column, never a pointer (half the size, valid wherever the record is
+  mapped); a sorted column with binary search or a perfect hash, never a linked map; a bitset
+  for a yes-or-no fact; strings and other variable data in one side table by offset; no
+  allocation per item (a table is one buffer from the task's frame); LEB128 for positions. The
+  in-memory container is a multi-column vector of our own (one array per field of a row type,
+  declared by a `macro_rules!`). The type checker's own trees are not reshaped by this rule;
+  that is done where a profile says it pays.
 - **Hot counters in the slot.** A function's stub counts its calls; past a bound the function
   is queued for the optimizing tier. No profiler is needed to tier up.
 - **Tests that pick themselves.** A test's record lists the functions its run entered (their
