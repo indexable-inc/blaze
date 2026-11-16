@@ -543,6 +543,10 @@ pub struct Crate {
     /// edition it did not name).
     #[returns(copy)]
     pub blaze_edition: Option<span::BlazeEdition>,
+    /// The directory a proc macro called from this crate runs in, as its sandbox names it
+    /// (the package's manifest directory under the sandbox's root): a driver's fact, read only
+    /// by a proc macro's call, never by a key of this crate's records.
+    pub proc_macro_cwd: Box<str, Global>,
 }
 
 impl Crate {

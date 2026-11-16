@@ -1,20 +1,18 @@
-use smallvec::SmallVec;
-
 /// A position: lexicographic path of `u32`s (module declaration chain, then op index, then an
 /// expansion's op index...). The textual order of the expanded source: a position sorts before
 /// every position under it, and those before its next sibling.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Pos(pub SmallVec<[u32; 6]>);
+pub struct Pos(pub Vec<u32>);
 
 impl Pos {
     /// The empty path, the ancestor of every position.
     pub fn root() -> Pos {
-        Pos(SmallVec::new())
+        Pos(Vec::new())
     }
 
-    /// The position `at` under this one. Inline (no allocation) to a depth of 6.
+    /// The position `at` under this one, in one allocation of exactly its length.
     pub fn child(&self, at: u32) -> Pos {
-        let mut path = SmallVec::with_capacity(self.0.len() + 1);
+        let mut path = Vec::with_capacity(self.0.len() + 1);
         path.extend_from_slice(&self.0);
         path.push(at);
         Pos(path)
@@ -33,6 +31,6 @@ impl Pos {
     /// The position this one is directly under; `None` for the root.
     pub fn parent(&self) -> Option<Pos> {
         let (_, up) = self.0.split_last()?;
-        Some(Pos(SmallVec::from_slice(up)))
+        Some(Pos(up.to_vec()))
     }
 }

@@ -185,7 +185,8 @@ pub(crate) fn from_half(half: u16) -> f64 {
     let magnitude = match exp {
         0 => mantissa * (1.0 / 16_777_216.0),
         31 if mantissa == 0.0 => f64::INFINITY,
-        31 => f64::NAN,
+        // The one NaN, its bits fixed rather than left to the sign's multiplication.
+        31 => return f64::NAN,
         _ => {
             // 2^(exp - 25), built from its bits: core has no `powi`.
             let scale = f64::from_bits(u64::from(exp + 1023 - 25) << 52);

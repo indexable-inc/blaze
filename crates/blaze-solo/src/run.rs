@@ -45,8 +45,8 @@ use blaze_front_items::{
 };
 use blaze_ids::{ContentId, Hasher};
 use blaze_kernel::{Changed, CodeId, Get, Kernel, KernelError, Pin, Put, Read, Session, World as _};
+use blaze_data::{Map, ToValue, Value};
 use blaze_store_check::Setting;
-use serde::Serialize;
 
 use crate::{
     Plant, planted,
@@ -123,7 +123,7 @@ pub struct Config {
 }
 
 /// Nanoseconds of each phase, by the injected clock.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Phases {
     pub load: u64,
     pub sweep: u64,
@@ -135,7 +135,7 @@ pub struct Phases {
 }
 
 /// What a command did, in a fixed order of fields (rule 25).
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Report {
     /// `new`, `open`, `lost` or `behind` ([`Opened::name`]).
     pub opened: &'static str,
@@ -162,6 +162,53 @@ pub struct Report {
     /// The slot's sequence after this command: the one it wrote, else the one it opened.
     pub sequence: u64,
     pub nanos: Phases,
+}
+
+/// `key: value` appended to `map`, in the allocator the map is in.
+fn put<A: core::alloc::Allocator + Clone>(map: &mut Map<A>, alloc: &A, key: &str, value: &dyn ToValue<A>) {
+    map.insert(blaze_own::String::from_str_in(key, alloc.clone()), value.to_value(alloc.clone()));
+}
+
+/// One map, the fields in declaration order, as serde's derive wrote it.
+impl<A: core::alloc::Allocator + Clone> ToValue<A> for Phases {
+    fn to_value(&self, alloc: A) -> Value<A> {
+        let mut map = Map::with_capacity_in(7, alloc.clone());
+        put(&mut map, &alloc, "load", &self.load);
+        put(&mut map, &alloc, "sweep", &self.sweep);
+        put(&mut map, &alloc, "hash", &self.hash);
+        put(&mut map, &alloc, "open", &self.open);
+        put(&mut map, &alloc, "carry", &self.carry);
+        put(&mut map, &alloc, "ask", &self.ask);
+        put(&mut map, &alloc, "save", &self.save);
+        Value::Map(map)
+    }
+}
+
+/// One map, the fields in declaration order (rule 25), as serde's derive wrote it.
+impl<A: core::alloc::Allocator + Clone> ToValue<A> for Report {
+    fn to_value(&self, alloc: A) -> Value<A> {
+        let mut map = Map::with_capacity_in(20, alloc.clone());
+        put(&mut map, &alloc, "opened", &self.opened);
+        put(&mut map, &alloc, "saved", &self.saved);
+        put(&mut map, &alloc, "files", &self.files);
+        put(&mut map, &alloc, "stated", &self.stated);
+        put(&mut map, &alloc, "listed", &self.listed);
+        put(&mut map, &alloc, "probed", &self.probed);
+        put(&mut map, &alloc, "hashed", &self.hashed);
+        put(&mut map, &alloc, "added", &self.added);
+        put(&mut map, &alloc, "removed", &self.removed);
+        put(&mut map, &alloc, "changed", &self.changed);
+        put(&mut map, &alloc, "asked", &self.asked);
+        put(&mut map, &alloc, "session_entries", &self.session_entries);
+        put(&mut map, &alloc, "repaired", &self.repaired);
+        put(&mut map, &alloc, "cut", &self.cut);
+        put(&mut map, &alloc, "session_hits", &self.session_hits);
+        put(&mut map, &alloc, "store_lookups", &self.store_lookups);
+        put(&mut map, &alloc, "store_bytes_read", &self.store_bytes_read);
+        put(&mut map, &alloc, "sequence", &self.sequence);
+        put(&mut map, &alloc, "nanos", &self.nanos);
+        Value::Map(map)
+    }
 }
 
 /// A command's result, for its caller and a test's oracle.

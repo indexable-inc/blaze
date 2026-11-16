@@ -29,7 +29,7 @@ pub use self::{
 };
 
 pub use syntax::{BlazeEdition, Edition, Extensions, UnknownBlazeEdition};
-pub use text_size::{TextRange, TextSize};
+pub use blaze_text_size::{TextRange, TextSize};
 
 /// A source file: a dense number base-db hands out, at most [`EditionedFileId::MAX_FILE_ID`].
 #[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]

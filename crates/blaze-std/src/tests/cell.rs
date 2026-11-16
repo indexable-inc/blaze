@@ -1,7 +1,6 @@
 //! Token cells: one token reads and writes every cell of its kind, and the token behind one
 //! `Lock` guards them all across threads. That two live `get_mut` through one token do not
-//! compile is the `compile_fail` fixture in `cell.rs`'s docs (unrun: bstd has
-//! `doctest = false`).
+//! compile is `refusals/token_two_borrows.rs`, compiled by `tests/refusals.rs`.
 
 use super::{root, world};
 use crate::{

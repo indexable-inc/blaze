@@ -18,7 +18,6 @@ blaze-mem.workspace = true
 blaze-phf.workspace = true
 rustc_lexer.workspace = true
 rustc-literal-escaper.workspace = true
-smallvec.workspace = true
 stdx.workspace = true
 tracing.workspace = true
 

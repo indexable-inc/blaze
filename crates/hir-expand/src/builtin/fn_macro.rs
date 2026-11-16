@@ -120,7 +120,7 @@ impl EagerExpander {
     pub fn env_var_read(&self, db: &Db, arg_id: MacroCallId, tt: &tt::TopSubtree) -> Option<Symbol> {
         match self {
             EagerExpander::Env => {
-                let exprs = args::exprs(db, tt).ok()?;
+                let exprs = args::exprs(tt).ok()?;
                 let var = match exprs[..] {
                     [var] => var,
                     [var, message] => {
@@ -133,7 +133,7 @@ impl EagerExpander {
             }
             EagerExpander::OptionEnv => {
                 let call = || call_span(db, arg_id, tt.top_subtree().delimiter.open);
-                args::single_string(db, tt, "option_env!", call).value.map(|(key, _)| key)
+                args::single_string(tt, "option_env!", call).value.map(|(key, _)| key)
             }
             _ => None,
         }
@@ -515,7 +515,6 @@ fn assert_expand<'f>(
     let mut iter = tt.iter();
 
     let cond = expect_fragment(
-        db,
         &mut iter,
         parser::PrefixEntryPoint::Expr,
         tt.top_subtree().delimiter.delim_span(),
@@ -671,7 +670,6 @@ fn format_args_nl_of_macro<'f>(
     let pound = mk_pound(span);
     let mut iter = tt.iter();
     let template = expect_fragment(
-        db,
         &mut iter,
         parser::PrefixEntryPoint::Expr,
         tt.top_subtree().delimiter.delim_span(),
@@ -780,7 +778,6 @@ fn cfg_select_expand<'f>(
             }
             Some(_) => {
                 let expr = expect_fragment(
-                    db,
                     &mut iter,
                     parser::PrefixEntryPoint::Expr,
                     tt.top_subtree().delimiter.delim_span(),
@@ -978,7 +975,7 @@ fn concat_expand<'f>(
     _call_site: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let open = tt.top_subtree().delimiter.open;
-    let exprs = match args::exprs(db, tt) {
+    let exprs = match args::exprs(tt) {
         Ok(it) => it,
         Err(err) => return ExpandResult::new(quote_in!(frame, open => ""), err),
     };
@@ -1099,7 +1096,7 @@ fn concat_bytes_expand<'f>(
         });
         tt::TopSubtree::invisible_from_leaves_in(call_site, [tt::Leaf::Literal(literal)], frame)
     };
-    let exprs = match args::exprs(db, tt) {
+    let exprs = match args::exprs(tt) {
         Ok(it) => it,
         Err(err) => return ExpandResult::new(byte_str(&[]), err),
     };
@@ -1108,11 +1105,11 @@ fn concat_bytes_expand<'f>(
     // alloc: the arguments that are no byte literal, on the error path
     let mut missing = Vec::new();
     for arg in &exprs {
-        if let Some(array) = args::array(db, arg) {
+        if let Some(array) = args::array(arg) {
             match array {
                 Ok(Array::List(elements)) => {
                     for element in &elements {
-                        if let Some(byte) = array_element(db, element, &mut err, &mut missing) {
+                        if let Some(byte) = array_element(element, &mut err, &mut missing) {
                             bytes.push(byte);
                         }
                     }
@@ -1124,8 +1121,7 @@ fn concat_bytes_expand<'f>(
                     });
                     match count_value {
                         Some(count) => {
-                            if let Some(byte) = array_element(db, &element, &mut err, &mut missing)
-                            {
+                            if let Some(byte) = array_element(&element, &mut err, &mut missing) {
                                 let count = usize::try_from(count).unwrap_or(usize::MAX);
                                 let len = bytes.len().saturating_add(count);
                                 bytes.resize(len, byte);
@@ -1181,7 +1177,6 @@ fn concat_bytes_expand<'f>(
 /// rustc's `handle_array_element`: the byte an element of an array argument of `concat_bytes!`
 /// is.
 fn array_element(
-    db: &Db,
     element: &Arg<'_>,
     err: &mut Option<ExpandError>,
     missing: &mut Vec<Span>,
@@ -1214,7 +1209,7 @@ fn array_element(
         err.get_or_insert(
             BuiltinError::new("cannot concatenate boolean literals").at(element.span),
         );
-    } else if args::array(db, element).is_some() {
+    } else if args::array(element).is_some() {
         err.get_or_insert(
             BuiltinError::new("cannot concatenate doubly nested array").at(element.span),
         );
@@ -1287,7 +1282,7 @@ fn include_path(
     // The call's span reads its file's syntax: asked only for an error, so a crate given by its
     // pages resolves a well-formed `include!` from its tokens without parsing the calling file.
     let call = || call_span(db, id, tt.top_subtree().delimiter.open);
-    args::single_string(db, tt, name, call)
+    args::single_string(tt, name, call)
 }
 
 fn include_expand<'f>(
@@ -1455,7 +1450,7 @@ fn env_expand<'f>(
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let empty = || tt::TopSubtree::empty_in(DelimSpan { open: span, close: span }, frame);
     let call = call_span(db, arg_id, span);
-    let exprs = match args::exprs(db, tt) {
+    let exprs = match args::exprs(tt) {
         Ok(it) => it,
         Err(e) => return ExpandResult::new(empty(), e),
     };
@@ -1588,7 +1583,7 @@ fn option_env_expand<'f>(
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let call = || call_span(db, arg_id, call_site);
-    let ExpandResult { value, err } = args::single_string(db, tt, "option_env!", call);
+    let ExpandResult { value, err } = args::single_string(tt, "option_env!", call);
     let Some((key, span)) = value else {
         let empty =
             tt::TopSubtree::empty_in(DelimSpan { open: call_site, close: call_site }, frame);

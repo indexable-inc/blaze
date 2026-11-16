@@ -927,8 +927,8 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
 impl ExpressionStoreSourceMap {
     /// As [`ExpressionStore::columns`](crate::expr_store::ExpressionStore::columns), for
     /// [`ExpressionStoreSourceMap`]'s schema.
-    pub fn columns() -> blaze_format::tiers::BufferColumns {
-        blaze_format::tiers::BufferColumns::of::<SourceMapRoot>(
+    pub fn columns() -> blaze_format_tiers::BufferColumns {
+        blaze_format_tiers::BufferColumns::of::<SourceMapRoot>(
             <ExpressionStoreSourceMap as Persist>::SCHEMA,
         )
     }
@@ -984,8 +984,8 @@ impl<'a> BodySourceMapRef<'a> {
 impl BodySourceMap {
     /// As [`ExpressionStore::columns`](crate::expr_store::ExpressionStore::columns), for
     /// [`BodySourceMap`]'s schema.
-    pub fn columns() -> blaze_format::tiers::BufferColumns {
-        blaze_format::tiers::BufferColumns::of::<BodySourceMapRoot>(
+    pub fn columns() -> blaze_format_tiers::BufferColumns {
+        blaze_format_tiers::BufferColumns::of::<BodySourceMapRoot>(
             <BodySourceMap as Persist>::SCHEMA,
         )
     }

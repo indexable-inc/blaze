@@ -481,6 +481,7 @@ dependencies = [
  "blaze-check",
  "blaze-core",
  "blaze-format",
+ "blaze-format-tiers",
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
@@ -505,6 +506,15 @@ dependencies = [
 name = "blaze-cast"
 version = "0.0.0"
 dependencies = [
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-cbor"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-own",
  "blaze-sim",
 ]
 
@@ -536,8 +546,8 @@ name = "blaze-codegen-code"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "blaze-json",
  "glob",
- "serde_json",
  "toml",
 ]
 
@@ -578,7 +588,6 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-sim",
- "smallvec",
 ]
 
 [[package]]
@@ -695,7 +704,6 @@ dependencies = [
  "blaze-ids",
  "blaze-sim",
  "blaze-v2-proof",
- "zstd",
 ]
 
 [[package]]
@@ -704,7 +712,18 @@ version = "0.0.0"
 dependencies = [
  "blaze-ids",
  "blaze-own",
+ "blaze-sim",
  "serde",
+]
+
+[[package]]
+name = "blaze-format-tiers"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-ids",
+ "blaze-v2-proof",
+ "zstd",
 ]
 
 [[package]]
@@ -750,6 +769,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-git-fetch"
+version = "0.0.0"
+dependencies = [
+ "blaze-deflate",
+ "blaze-h1-net",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-std",
+]
+
+[[package]]
 name = "blaze-graph"
 version = "0.0.0"
 dependencies = [
@@ -784,6 +814,15 @@ version = "0.0.0"
 dependencies = [
  "blaze-own",
  "blaze-sim",
+]
+
+[[package]]
+name = "blaze-h1-net"
+version = "0.0.0"
+dependencies = [
+ "blaze-h1",
+ "blaze-own",
+ "blaze-std",
 ]
 
 [[package]]
@@ -875,8 +914,6 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
- "smallvec",
- "thin-vec",
 ]
 
 [[package]]
@@ -1115,6 +1152,7 @@ dependencies = [
 name = "blaze-pack"
 version = "0.0.0"
 dependencies = [
+ "blaze-cbor",
  "blaze-report",
 ]
 
@@ -1368,14 +1406,15 @@ version = "0.0.0"
 dependencies = [
  "blaze-cas",
  "blaze-core",
+ "blaze-data",
  "blaze-front-items",
  "blaze-ids",
+ "blaze-json",
  "blaze-kernel",
+ "blaze-own",
  "blaze-sim",
  "blaze-store-check",
  "blaze-vfs",
- "serde",
- "serde_json",
  "syntax",
  "tracing",
 ]
@@ -1453,10 +1492,10 @@ dependencies = [
 name = "blaze-store-check"
 version = "0.0.0"
 dependencies = [
+ "blaze-data",
  "blaze-ids",
+ "blaze-json",
  "blaze-sim",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1510,6 +1549,10 @@ dependencies = [
  "blaze-sim",
  "tar",
 ]
+
+[[package]]
+name = "blaze-text-size"
+version = "0.0.0"
 
 [[package]]
 name = "blaze-toml"
@@ -1586,6 +1629,7 @@ dependencies = [
 name = "blaze-watch"
 version = "0.0.0"
 dependencies = [
+ "blaze-cbor",
  "blaze-own",
  "blaze-sim",
 ]
@@ -2613,6 +2657,7 @@ dependencies = [
  "blaze-core",
  "blaze-dbsp",
  "blaze-format",
+ "blaze-format-tiers",
  "blaze-graph",
  "blaze-hash",
  "blaze-id",

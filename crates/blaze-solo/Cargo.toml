@@ -36,8 +36,10 @@ blaze-kernel.workspace = true
 blaze-store-check.workspace = true
 # `racy` (the racy window's one home), `watch::fixed_out`, `FILE_DOMAIN`.
 blaze-vfs.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+# The report as a value, the input read from one, both as JSON (rule 42).
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-own.workspace = true
 # `Edition`, `Extensions`: a file's reading.
 syntax.workspace = true
 # The driver's waits, each in a span naming it (rule 15).

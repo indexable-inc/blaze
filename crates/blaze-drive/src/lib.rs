@@ -49,8 +49,8 @@ mod sim;
 pub use crate::key::{Key, Kind, Name, Tool};
 pub use crate::record::{Finding, Locate, Part};
 pub use crate::request::{
-    Answer, Ask, Batch, BatchId, Builder, Class, Command, Config, DriveError, Effect, Event, FileEntry, Input,
-    Outcome, Output, Print, Ran, Request, Task, TaskFailure, Ticket, Want,
+    Answer, Ask, Batch, BatchId, Builder, Class, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Input,
+    Outcome, Output, Print, Ran, Request, Task, TaskFailure, Ticket, Verdict, Want,
 };
 pub use crate::settled::{Settled, TableFull};
 pub use crate::wire::{WireError, WireWhy};
@@ -70,4 +70,6 @@ pub enum Plant {
     /// A settled row is published to the workers' table ahead of its record's `Put`: a worker
     /// can answer a need before the record is written.
     PublishBeforePut,
+    /// A program's success is reported at its exit, before the gate's check is done.
+    EarlySuccess,
 }

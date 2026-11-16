@@ -32,6 +32,39 @@ pub struct Config {
     pub most_entries: u32,
     /// The most jobs one request holds (rule 18: a table has a cap).
     pub most_jobs: u32,
+    /// Whether a finding of this rule is an error: findings carry no level (rule 81), the
+    /// command's policy says which fail it (`blaze run` and `test` fail on any, lints included).
+    pub is_error: fn(u16) -> bool,
+}
+
+/// How `run` and `test` hold the program to the check of its scope (drive.md, "The gate";
+/// bottom.md 11): one seam, chosen at the request (rule 78).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Gate {
+    /// The default. A stored error refuses the start at one read; otherwise the program starts
+    /// once its units are known and the scope's check runs beside it, yielding to what the
+    /// program waits on; the first error stops it; no success is reported before the check is
+    /// done.
+    Beside,
+    /// The check is done before the program starts.
+    Before,
+    /// Only what runs is checked; the verdict says so.
+    Reached,
+}
+
+/// What the command concluded.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Verdict {
+    /// `check`: the findings are the answer.
+    Checked,
+    /// The program succeeded and its scope's check found no error.
+    Passed,
+    /// The program succeeded; only what ran was checked (`Gate::Reached`).
+    PassedReached,
+    /// The check found errors: the program was stopped, or never started.
+    Failed { errors: u32, started: bool },
+    /// The program itself failed, its scope's check clean.
+    ProgramFailed,
 }
 
 /// What the command asks.
@@ -57,6 +90,8 @@ impl Command {
 pub struct Ask<'a> {
     pub command: Command,
     pub args: &'a [u8],
+    /// For `run` and `test`; `check` ignores it.
+    pub gate: Gate,
 }
 
 /// One file of the checkout, as the sweep found it.
@@ -101,6 +136,11 @@ pub enum Event<'a> {
     Got { key: Key, bytes: Option<&'a [u8]> },
     /// A [`Effect::Run`]'s answer: one outcome per task of the batch, together.
     Ran { batch: BatchId, results: &'a [Outcome<'a>] },
+    /// The running program waits on a name (a function's code, through blaze-run's Parent):
+    /// its job is the person's class, ahead of the gate's.
+    Want(Want),
+    /// The program ended (after [`Effect::StartProgram`]), succeeding or not.
+    Exited { ok: bool },
 }
 
 /// One task's answer in a batch.
@@ -158,7 +198,11 @@ pub struct TaskFailure {
 /// from makepad/relax (MIT), libs/cpu_budget/src/lib.rs).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Class {
+    /// What the command asked: `check`'s walk, or what a running program waits on.
     Foreground,
+    /// `run`'s and `test`'s check of the program's scope beside it (drive.md, "The gate"):
+    /// after what the program waits on, before speculative work.
+    Gate,
     Background,
 }
 
@@ -216,6 +260,11 @@ pub enum Effect<A: Allocator> {
     Publish(Input),
     /// Clear the name's row of the settled table (`Settled::clear`): dirtied or dropped.
     Unpublish(Name),
+    /// Start the program whose entry the units' record at `units` names (blaze-run's Parent).
+    /// Answered by [`Event::Exited`].
+    StartProgram { units: Key },
+    /// Stop the running program: the gate found `errors` error-level findings.
+    Stop { errors: u32 },
     Print(Print<A>),
     /// Replace the checkout's `last` file with `bytes`, after every `Put` before it.
     WriteLast { bytes: Vec<u8, A> },
@@ -226,6 +275,7 @@ pub enum Effect<A: Allocator> {
 #[derive(Clone, Copy, Debug)]
 pub struct Answer {
     pub profile: Profile,
+    pub verdict: Verdict,
     pub findings: u32,
     /// Where the units' record is, for `run` and `test` to find the entry.
     pub units: Option<Key>,
@@ -273,6 +323,11 @@ pub enum DriveError {
     TooManyJobs { most: u32, name: Name },
     /// A step after the answer.
     Finished,
+    /// `Exited` with no program started, or a second time.
+    NoProgram,
+    /// The program wanted a name nothing settled after the check was done: code the check's
+    /// walk does not reach is not built yet (drive.md, "The gate").
+    LateWant { name: Name },
 }
 
 impl fmt::Display for DriveError {
@@ -310,6 +365,8 @@ impl fmt::Display for DriveError {
             DriveError::Task(failure) => write!(f, "{}: {} ({})", failure.name, failure.what, failure.rule),
             DriveError::TooManyJobs { most, name } => write!(f, "more than {most} jobs, at {name} (rule 18)"),
             DriveError::Finished => write!(f, "a step after the request answered"),
+            DriveError::NoProgram => write!(f, "a program's exit, with no program running"),
+            DriveError::LateWant { name } => write!(f, "the program wanted {name} after the check was done; a late want is not built (drive.md, \"The gate\")"),
         }
     }
 }
@@ -391,6 +448,8 @@ enum Phase {
     Certifying,
     Working,
     Finishing,
+    /// The walk is done and written; the answer waits for the program's end.
+    Held,
     Answered,
 }
 
@@ -473,6 +532,24 @@ pub struct Request<A: Allocator + Clone> {
     old_findings: SortedMap<Name, Held<A>, A>,
     old_findings_loading: bool,
     units_at: Option<Key>,
+
+    gate: Gate,
+    /// The class the walk's jobs take: `Gate` beside a running program, else the person's.
+    walk: Class,
+    program: Program,
+    /// The answer once the walk is done, held until the program's end (`conclude`).
+    held: Option<Answer>,
+    /// Error-level findings settled this run.
+    errors: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Program {
+    Unstarted,
+    Running,
+    /// Told to stop by the gate; its `Exited` is still to come.
+    Stopped,
+    Ended { ok: bool },
 }
 
 /// The digest domain of a request's shape.
@@ -528,7 +605,117 @@ impl<A: Allocator + Clone> Request<A> {
             old_findings: SortedMap::new_in(a.clone()),
             old_findings_loading: false,
             units_at: None,
+            gate: ask.gate,
+            walk: match (ask.command, ask.gate) {
+                (Command::Run | Command::Test, Gate::Beside) => Class::Gate,
+                _ => Class::Foreground,
+            },
+            program: Program::Unstarted,
+            held: None,
+            errors: 0,
             alloc,
+        }
+    }
+
+    /// `run` or `test`: a program is part of the answer.
+    fn runs_program(&self) -> bool {
+        matches!(self.command, Command::Run | Command::Test)
+    }
+
+    /// The units are known: under `Beside` and `Reached` the program starts now, unless an
+    /// error is already found.
+    fn units_known<B: Allocator>(&mut self, at: Key, out: &mut Vec<Effect<A>, B>) {
+        if self.runs_program() && self.gate != Gate::Before && self.program == Program::Unstarted && self.errors == 0 {
+            self.program = Program::Running;
+            out.push(Effect::StartProgram { units: at });
+        }
+    }
+
+    /// A settled record held `errors` error-level findings: under `Beside`, the first stops the
+    /// running program.
+    fn found_errors<B: Allocator>(&mut self, errors: u32, out: &mut Vec<Effect<A>, B>) {
+        if errors == 0 {
+            return;
+        }
+        self.errors += errors;
+        if self.gate == Gate::Beside && self.program == Program::Running {
+            self.program = Program::Stopped;
+            out.push(Effect::Stop { errors: self.errors });
+        }
+    }
+
+    /// The program ended.
+    fn exited<B: Allocator>(&mut self, ok: bool, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+        match self.program {
+            Program::Running | Program::Stopped => {}
+            Program::Unstarted | Program::Ended { .. } => return Err(DriveError::NoProgram),
+        }
+        if self.program == Program::Running {
+            self.program = Program::Ended { ok };
+        }
+        if self.plant == Plant::EarlySuccess && ok && self.phase != Phase::Held {
+            // The planted bug: success reported at the program's exit, the gate's work not done.
+            self.phase = Phase::Answered;
+            let answer = Answer { profile: self.profile, verdict: Verdict::Passed, findings: self.errors, units: self.units_at };
+            out.push(Effect::Done(answer));
+            return Ok(());
+        }
+        if self.gate == Gate::Reached && self.phase != Phase::Held {
+            // Only what ran was checked: the verdict is the program's, said as such.
+            self.phase = Phase::Answered;
+            let verdict = if ok { Verdict::PassedReached } else { Verdict::ProgramFailed };
+            out.push(Effect::Done(Answer { profile: self.profile, verdict, findings: self.errors, units: self.units_at }));
+            return Ok(());
+        }
+        self.conclude(out);
+        Ok(())
+    }
+
+    /// The answer, once both the check and the program (if any) are done: a success is never
+    /// reported while an error is found or could still be.
+    fn conclude<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) {
+        let Some(mut answer) = self.held else { return };
+        let started = self.program != Program::Unstarted;
+        let verdict = match (self.runs_program(), self.program) {
+            (false, _) => Verdict::Checked,
+            _ if self.errors > 0 => Verdict::Failed { errors: self.errors, started },
+            (true, Program::Unstarted) => {
+                // Before: the check is clean, the program starts now.
+                let units = answer.units.unwrap_or_default();
+                self.program = Program::Running;
+                out.push(Effect::StartProgram { units });
+                return;
+            }
+            (true, Program::Running) => return,
+            (true, Program::Ended { ok: true }) => Verdict::Passed,
+            (true, Program::Ended { ok: false } | Program::Stopped) => Verdict::ProgramFailed,
+        };
+        answer.verdict = verdict;
+        answer.profile = self.profile;
+        self.held = None;
+        self.phase = Phase::Answered;
+        out.push(Effect::Done(answer));
+    }
+
+    /// The running program waits on `want`: its job runs in the person's class.
+    fn wanted(&mut self, want: Want) -> Result<(), DriveError> {
+        if self.phase == Phase::Held {
+            return match self.now.contains_key(&want.name) {
+                true => Ok(()),
+                false => Err(DriveError::LateWant { name: want.name }),
+            };
+        }
+        match self.jobs.get(&want.name).map(|job| (job.class, job.state)) {
+            None => self.add_job(want.name, want.home, None, false, Class::Foreground),
+            Some((class, state)) if class > Class::Foreground => {
+                let home = self.jobs.get(&want.name).map_or(want.name, |job| job.home);
+                self.jobs.get_mut(&want.name).expect("a job").class = Class::Foreground;
+                if state == State::Queued && self.ready.remove(&(class, want.name.kind, home, want.name)) {
+                    self.queue(Class::Foreground, want.name);
+                }
+                Ok(())
+            }
+            Some(_) => Ok(()),
         }
     }
 
@@ -558,6 +745,16 @@ impl<A: Allocator + Clone> Request<A> {
             Event::Start { files, gone, last } => self.start(files, gone, last, out)?,
             Event::Got { key, bytes } => self.got(key, bytes, out)?,
             Event::Ran { batch, results } => self.ran_batch(batch, results, out)?,
+            Event::Want(want) => self.wanted(want)?,
+            Event::Exited { ok } => {
+                self.exited(ok, out)?;
+                if self.phase == Phase::Answered {
+                    return Ok(());
+                }
+            }
+        }
+        if self.phase == Phase::Held {
+            return Ok(());
         }
         self.pump(out)
     }
@@ -676,7 +873,7 @@ impl<A: Allocator + Clone> Request<A> {
             seeds.extend_from_slice(&self.gone);
             for subject in seeds.iter() {
                 let name = Name::new(Kind::FileItems, *subject);
-                self.add_job(name, name, None, true, Class::Foreground)?;
+                self.add_job(name, name, None, true, self.walk)?;
             }
         } else {
             let units = Name::units();
@@ -686,11 +883,27 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     fn certified<B: Allocator>(&mut self, bytes: &[u8], out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
-        let held = read_cert(bytes, self.alloc.clone()).map_err(|error| DriveError::Wire { key: self.cert, error })?;
+        let (units, held) = read_cert(bytes, self.alloc.clone()).map_err(|error| DriveError::Wire { key: self.cert, error })?;
         self.profile.certified = true;
         let count = self.print(&held, out);
-        self.phase = Phase::Answered;
-        out.push(Effect::Done(Answer { profile: self.profile, findings: count, units: None }));
+        let is_error = self.config.is_error;
+        let errors = held.values().flat_map(|entry| entry.findings.iter()).filter(|f| is_error(f.rule)).count();
+        self.errors = u32::try_from(errors).unwrap_or(u32::MAX);
+        self.units_at = units;
+        // The repeat: the walk stands whole. A stored error refuses the start at this one read
+        // (every gate); a clean one starts the program now, nothing left to check beside it.
+        self.held = Some(Answer { profile: self.profile, verdict: Verdict::Checked, findings: count, units });
+        self.phase = Phase::Held;
+        if self.runs_program() && self.errors == 0 {
+            match units {
+                Some(at) => {
+                    self.program = Program::Running;
+                    out.push(Effect::StartProgram { units: at });
+                }
+                None => return Err(DriveError::NoProgram),
+            }
+        }
+        self.conclude(out);
         Ok(())
     }
 
@@ -728,7 +941,7 @@ impl<A: Allocator + Clone> Request<A> {
                 Purpose::OldCert => {
                     self.old_findings_loading = false;
                     if let Some(bytes) = bytes {
-                        self.old_findings = read_cert(bytes, self.alloc.clone()).map_err(|error| DriveError::Wire { key, error })?;
+                        self.old_findings = read_cert(bytes, self.alloc.clone()).map_err(|error| DriveError::Wire { key, error })?.1;
                     }
                 }
                 Purpose::Root => {
@@ -820,7 +1033,7 @@ impl<A: Allocator + Clone> Request<A> {
                         return Err(DriveError::SelfNeed { name });
                     }
                     if !self.jobs.contains_key(&want.name) {
-                        let class = self.jobs.get(&name).map_or(Class::Foreground, |job| job.class);
+                        let class = self.jobs.get(&name).map_or(self.walk, |job| job.class);
                         self.add_job(want.name, want.home, None, false, class)?;
                     } else if self.plant == Plant::DoubleFlight
                         && self.jobs.get(&want.name).is_some_and(|job| job.state == State::Running)
@@ -1172,7 +1385,7 @@ impl<A: Allocator + Clone> Request<A> {
                     return Ok(());
                 }
                 None if home != name && self.state(home).is_none() => {
-                    let class = self.jobs.get(&name).map_or(Class::Foreground, |job| job.class);
+                    let class = self.jobs.get(&name).map_or(self.walk, |job| job.class);
                     self.add_job(home, home, None, false, class)?;
                     self.wait_on(home, name);
                     return Ok(());
@@ -1201,7 +1414,7 @@ impl<A: Allocator + Clone> Request<A> {
                         }
                         None if home == name => Err(DriveError::NoFile { file: name, home }),
                         None => {
-                            self.add_job(home, home, None, false, Class::Foreground)?;
+                            self.add_job(home, home, None, false, self.walk)?;
                             self.wait_on(home, name);
                             Ok(())
                         }
@@ -1223,7 +1436,7 @@ impl<A: Allocator + Clone> Request<A> {
         let (key, recheck) = (job.key, job.recheck);
         if name.kind == Kind::Group {
             self.set_state(name, State::Queued);
-            self.queue(Class::Foreground, name);
+            self.queue(self.walk, name);
             return Ok(());
         }
         let row = self.current(name).map(|row| (row.key, row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc.clone())));
@@ -1462,10 +1675,10 @@ impl<A: Allocator + Clone> Request<A> {
                     }
                 }
                 let held = Held { file: file_of(name, home), place, findings: hold(view, a.clone()) };
+                let is_error = self.config.is_error;
+                let errors = held.findings.iter().filter(|f| is_error(f.rule)).count();
                 self.findings.insert(name, held);
-                if name.kind == Kind::Units {
-                    self.units_at = Some(*at);
-                }
+                self.found_errors(u32::try_from(errors).unwrap_or(u32::MAX), out);
                 self.new.insert(
                     name,
                     Row { key, at: *at, source, out: view.out, home, place, reads, parts, readers },
@@ -1475,10 +1688,15 @@ impl<A: Allocator + Clone> Request<A> {
         };
         self.now.insert(name, now);
         self.dropped.remove(&name);
+        if name.kind == Kind::Units {
+            // Standing or made, the units' record is where the program's entry is.
+            self.units_at = Some(now.at);
+            self.units_known(now.at, out);
+        }
         // Every part of a record walked: a standing one stands on its row at no store read.
         for part in parts_now.iter() {
             match self.state(*part) {
-                None => self.add_job(*part, name, None, false, Class::Foreground)?,
+                None => self.add_job(*part, name, None, false, self.walk)?,
                 Some(State::Start) => self.wake.push_back(*part),
                 Some(_) => {}
             }
@@ -1573,7 +1791,7 @@ impl<A: Allocator + Clone> Request<A> {
         match self.state(name) {
             None => {
                 let home = self.old(name).map_or(name, |row| row.home);
-                self.add_job(name, home, None, false, Class::Foreground)?;
+                self.add_job(name, home, None, false, self.walk)?;
                 if let Some(job) = self.jobs.get_mut(&name) {
                     job.recheck = true;
                 }
@@ -1616,7 +1834,7 @@ impl<A: Allocator + Clone> Request<A> {
             for member in cycle.iter() {
                 sources.id(&self.jobs.get(member).expect("a job").source);
             }
-            self.add_job(group, group, Some(Locate::Source(sources.finish())), false, Class::Foreground)?;
+            self.add_job(group, group, Some(Locate::Source(sources.finish())), false, self.walk)?;
             let job = self.jobs.get_mut(&group).expect("just added");
             job.members.extend_from_slice(&cycle);
             for member in cycle.iter() {
@@ -1796,7 +2014,8 @@ impl<A: Allocator + Clone> Request<A> {
                 }
             }
         }
-        let cert = write_cert(&all, a.clone());
+        let units = self.units_at.or_else(|| self.old(Name::units()).map(|row| row.at));
+        let cert = write_cert(&all, units, a.clone());
         self.put(self.cert, cert, out);
         let last = Last {
             tool: self.config.tool.0,
@@ -1807,9 +2026,18 @@ impl<A: Allocator + Clone> Request<A> {
         };
         out.push(Effect::WriteLast { bytes: answers::write_last(&last, a) });
         let count = self.print(&all, out);
-        self.phase = Phase::Answered;
-        let units = self.units_at.or_else(|| self.old(Name::units()).map(|row| row.at));
-        out.push(Effect::Done(Answer { profile: self.profile, findings: count, units }));
+        // Every finding of the answer counts, the stood ones too: an unchanged item's error is
+        // still an error of the scope.
+        let is_error = self.config.is_error;
+        let errors = all.values().flat_map(|entry| entry.findings.iter()).filter(|f| is_error(f.rule)).count();
+        self.errors = u32::try_from(errors).unwrap_or(u32::MAX);
+        if self.gate == Gate::Beside && self.program == Program::Running && self.errors > 0 {
+            self.program = Program::Stopped;
+            out.push(Effect::Stop { errors: self.errors });
+        }
+        self.held = Some(Answer { profile: self.profile, verdict: Verdict::Checked, findings: count, units });
+        self.phase = Phase::Held;
+        self.conclude(out);
         Ok(())
     }
 
@@ -1865,8 +2093,12 @@ fn hold<A: Allocator + Clone>(view: &WholeView<'_>, alloc: A) -> Vec<HeldFinding
     held
 }
 
-fn write_cert<A: Allocator + Clone>(held: &SortedMap<Name, Held<A>, A>, alloc: A) -> Vec<u8, A> {
+/// The certificate: the units' record (so a repeat `run` starts at one read), then every
+/// finding of the answer.
+fn write_cert<A: Allocator + Clone>(held: &SortedMap<Name, Held<A>, A>, units: Option<Key>, alloc: A) -> Vec<u8, A> {
     let mut w = Writer::new_in(CERT_MAGIC, alloc);
+    w.u32(u32::from(units.is_some()));
+    w.raw(&units.unwrap_or_default().0.0);
     w.count(held.len());
     for (name, entry) in held.iter() {
         w.name(*name);
@@ -1883,8 +2115,14 @@ fn write_cert<A: Allocator + Clone>(held: &SortedMap<Name, Held<A>, A>, alloc: A
     w.finish()
 }
 
-fn read_cert<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<SortedMap<Name, Held<A>, A>, WireError> {
+type Cert<A> = (Option<Key>, SortedMap<Name, Held<A>, A>);
+
+fn read_cert<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<Cert<A>, WireError> {
     let mut r = Reader::new(bytes, CERT_MAGIC, "certificate")?;
+    let has_units = r.u32()? == 1;
+    let mut units = [0u8; 32];
+    units.copy_from_slice(r.take_bytes(32)?);
+    let units = has_units.then_some(Key(ContentId(units)));
     let n = r.count(NAME_BYTES * 2 + 8)?;
     let mut entries = Vec::with_capacity_in(n, alloc.clone());
     for _ in 0..n {
@@ -1905,5 +2143,6 @@ fn read_cert<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<SortedMap<N
         entries.push((name, Held { file, place, findings }));
     }
     r.done()?;
-    SortedMap::from_sorted(entries).map_err(|_| r.error(crate::wire::WireWhy::Unsorted))
+    let held = SortedMap::from_sorted(entries).map_err(|_| r.error(crate::wire::WireWhy::Unsorted))?;
+    Ok((units, held))
 }

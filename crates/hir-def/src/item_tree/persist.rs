@@ -394,8 +394,8 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
 impl ItemTree {
     /// The warm and cold forms of item tree buffers, codec by column: what
     /// `blaze_cas::Store::encode_columns` is given for [`ItemTree`]'s schema.
-    pub fn columns() -> blaze_format::tiers::BufferColumns {
-        blaze_format::tiers::BufferColumns::of::<Root>(<ItemTree as Persist>::SCHEMA)
+    pub fn columns() -> blaze_format_tiers::BufferColumns {
+        blaze_format_tiers::BufferColumns::of::<Root>(<ItemTree as Persist>::SCHEMA)
     }
 }
 

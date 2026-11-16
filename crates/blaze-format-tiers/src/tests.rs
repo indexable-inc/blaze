@@ -7,7 +7,7 @@ use super::{
     WarmColumn, WarmRef, Width, cold_codec, columns_of, compress, decode_cold, decode_cold_bytes,
     decode_raw, encode_cold, encode_cold_bytes, encode_raw, push_hot, push_warm, raw_cold,
 };
-use crate::{
+use blaze_format::{
     Aligned, FormatError, Record, Rel, Slice, Str, WordTable, Writer, leb, open, record, row_words,
 };
 

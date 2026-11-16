@@ -7,7 +7,6 @@ use std::{fmt, iter::successors};
 
 use itertools::Itertools;
 use parser::SyntaxKind;
-use smallvec::{SmallVec, smallvec};
 use syntax_tree::TextSize;
 
 use crate::{
@@ -224,12 +223,12 @@ impl ast::Meta {
     }
 
     /// Includes `cfg_attr()` inner metas (without considering the predicate).
-    pub fn skip_cfg_attrs(self) -> SmallVec<[ast::Meta; 1]> {
+    pub fn skip_cfg_attrs(self) -> Vec<ast::Meta> {
         match self {
             ast::Meta::CfgAttrMeta(meta) => {
                 meta.metas().flat_map(|meta| meta.skip_cfg_attrs()).collect()
             }
-            _ => smallvec![self],
+            _ => vec![self],
         }
     }
 
@@ -268,10 +267,10 @@ impl ast::Attr {
     }
 
     /// Includes `cfg_attr()` inner metas (without considering the predicate).
-    pub fn skip_cfg_attrs(&self) -> SmallVec<[ast::Meta; 1]> {
+    pub fn skip_cfg_attrs(&self) -> Vec<ast::Meta> {
         match self.meta() {
             Some(meta) => meta.skip_cfg_attrs(),
-            None => SmallVec::new(),
+            None => Vec::new(),
         }
     }
 }

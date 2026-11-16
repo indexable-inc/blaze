@@ -9,7 +9,10 @@
 //! a store: the command holds `store.lock` for its whole run, and a second command on the
 //! same state is refused, not queued.
 
+#![feature(allocator_api)]
+
 use std::{
+    alloc::Global,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -18,18 +21,28 @@ use blaze_core::{Done, Driver as _, Effect, FileName, LockMode, Tag, run_until_i
 use blaze_front_items::Reading;
 use blaze_ids::{ContentId, Hasher};
 use blaze_kernel::CodeId;
+use blaze_data::{Cursor, FromValue, ShapeError};
 use blaze_solo::{Ask, Codes, Command, Config, drive::drive};
-use serde::Deserialize;
 use syntax::{Edition, Extensions};
 
 /// The command's one input (rule 42).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Input {
     checkout: PathBuf,
     state: PathBuf,
     /// `2015`, `2018`, `2021` or `2024`: how every file is read.
     edition: String,
+}
+
+/// Three text fields, all required, no other field.
+impl<A: std::alloc::Allocator + Clone> FromValue<A> for Input {
+    fn from_value(c: &Cursor<'_, '_, A>) -> Result<Input, ShapeError<A>> {
+        c.deny_unknown(&["checkout", "state", "edition"])?;
+        Ok(Input {
+            checkout: PathBuf::from(c.field("checkout")?.text()?),
+            state: PathBuf::from(c.field("state")?.text()?),
+            edition: c.field("edition")?.text()?.to_owned(),
+        })
+    }
 }
 
 struct Failed {
@@ -68,8 +81,11 @@ fn run() -> Result<String, Failed> {
     let [json] = args.as_slice() else {
         return Err(Failed::new("the command line", "blaze-solo takes one JSON value", format_args!("{} arguments", args.len())));
     };
-    let input: Input = serde_json::from_str(json)
-        .map_err(|e| Failed::new("the command's JSON value", "one value of {checkout, state, edition}, no other field", e))?;
+    const SHAPE: &str = "one value of {checkout, state, edition}, no other field";
+    let value = blaze_json::read_in(json.as_bytes(), blaze_json::Limits::DEFAULT, Global)
+        .map_err(|e| Failed::new("the command's JSON value", SHAPE, e))?;
+    let input: Input =
+        Cursor::root(&value, Global).get().map_err(|e| Failed::new("the command's JSON value", SHAPE, e))?;
     let edition = Edition::iter()
         .find(|it| it.number().to_string() == input.edition)
         .ok_or_else(|| Failed::new(&input.edition, "an edition is 2015, 2018, 2021 or 2024", "names no edition"))?;
@@ -125,7 +141,11 @@ fn run() -> Result<String, Failed> {
         .map_err(|e| Failed { thing: e.thing, rule: e.rule, why: e.why })?;
     let outcome = drive(&mut driver, &mut command, &mut effects, &mut store)
         .map_err(|e| Failed { thing: e.thing, rule: e.rule, why: e.why })?;
-    serde_json::to_string(&outcome.report).map_err(|e| Failed::new("the report", "a report is JSON", e))
+    let report = blaze_data::ToValue::to_value(&outcome.report, Global);
+    let options = blaze_json::WriteOptions { keys: blaze_json::KeyOrder::Insertion, ..blaze_json::WriteOptions::COMPACT };
+    blaze_json::to_string_in(&report, options, Global)
+        .map(|text| text.as_str().to_owned())
+        .map_err(|e| Failed::new("the report", "a report is JSON", e))
 }
 
 /// An absolute path as a name under the driver's root, `/`.

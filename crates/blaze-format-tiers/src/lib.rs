@@ -18,13 +18,21 @@
 //!   dictionary (for few distinct values), each size computed exactly in one pass so only the
 //!   winner is encoded, then zstd with a dictionary per kind of column ([`ColdDictionary`],
 //!   digested once) on a compression context reused per thread; decoded when read in.
+//!
+//! Its own crate since 2026-11-15 (it was `blaze_format::tiers`): zstd is a third-party package,
+//! and the record format's closure is workspace crates only.
 
 use std::{cell::RefCell, io::Cursor, mem::offset_of};
 
+use blaze_format::{FormatError, Persist, Slice, Spans, SpansRoot, Writer, leb, record};
 use blaze_ids::{ContentId, radix};
 use zstd::zstd_safe::{self, CCtx, CDict, DCtx, DDict};
 
-use crate::{FormatError, Slice, Writer, leb, record};
+/// The warm and cold forms of span table buffers, starts and lengths each a column: what
+/// `blaze_cas::Store::encode_columns` is given for [`Spans`]' schema (it was `Spans::columns`).
+pub fn spans_columns() -> BufferColumns {
+    BufferColumns::of::<SpansRoot>(<Spans as Persist>::SCHEMA)
+}
 
 /// How wide a hot column's values are.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -98,18 +106,22 @@ impl HotColumn {
     pub fn new(field_at: u64, placed: PlacedHot) -> HotColumn {
         let field = |offset: usize| field_at + offset as u64;
         let mut column = HotColumn { u8s: Slice::EMPTY, u16s: Slice::EMPTY, u32s: Slice::EMPTY };
+        let fit = "a hot column's values are written before it, in a buffer under 2 GiB";
         match placed.width {
             Width::U8 => {
                 column.u8s =
                     Slice::between(field(offset_of!(HotColumn, u8s)), placed.at, placed.len)
+                        .expect(fit)
             }
             Width::U16 => {
                 column.u16s =
                     Slice::between(field(offset_of!(HotColumn, u16s)), placed.at, placed.len)
+                        .expect(fit)
             }
             Width::U32 => {
                 column.u32s =
                     Slice::between(field(offset_of!(HotColumn, u32s)), placed.at, placed.len)
+                        .expect(fit)
             }
         }
         column
@@ -368,7 +380,8 @@ impl WarmColumn {
             min: placed.min,
             bits: placed.bits,
             len,
-            words: Slice::between(words, placed.at, placed.words),
+            words: Slice::between(words, placed.at, placed.words)
+                .expect("a warm column's words are written before it, in a buffer under 2 GiB"),
         }
     }
 

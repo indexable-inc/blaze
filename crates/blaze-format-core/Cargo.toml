@@ -26,11 +26,15 @@ alloc = []
 serde = ["dep:serde", "blaze-ids/serde"]
 
 [dependencies]
-# By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter features (serde,
-# smallvec, thin-vec), which a member's entry cannot turn off.
+# By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter feature (serde),
+# which a member's entry cannot turn off.
 blaze-ids = { path = "../blaze-ids" }
 blaze-own = { path = "../blaze-own" }
 serde = { workspace = true, optional = true, features = ["derive"] }
+
+[dev-dependencies]
+# `verified_tests`: the property test, the fuzz and its planted controls.
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

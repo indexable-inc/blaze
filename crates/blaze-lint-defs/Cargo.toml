@@ -13,9 +13,6 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-blaze-serde.workspace = true
-serde = { workspace = true, features = ["derive"] }
-
 # local deps
 blaze-ids.workspace = true
 blaze-phf.workspace = true

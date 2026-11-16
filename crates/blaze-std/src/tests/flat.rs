@@ -1,6 +1,7 @@
 //! `bstd::flat`: what the walk for [`AnyAddress`] clears and refuses, decided as the crate
 //! compiles. The refusal of a channel of a type with an address inside, where the use site's
-//! `const` assertion stops the build, is `flat.rs`'s `compile_fail` example.
+//! `const` assertion stops the build, is compiled by `tests/refusals.rs`
+//! (`refusals/flat_reference.rs` and `refusals/flat_drop_glue.rs`).
 
 use crate::{
     flat::{AnyAddress, is_flat},

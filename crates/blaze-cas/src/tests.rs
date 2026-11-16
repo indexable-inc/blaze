@@ -4162,7 +4162,7 @@ impl OneColumn {
     }
 
     pub(super) fn warm(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
-        let packed = blaze_format::tiers::Packed::pack(&self.values(hot)?);
+        let packed = blaze_format_tiers::Packed::pack(&self.values(hot)?);
         let mut out = blaze_format::MAGIC.to_vec();
         out.extend(self.warm_schema.0.0);
         out.extend(packed.min.to_le_bytes());
@@ -4178,7 +4178,7 @@ impl OneColumn {
         }
         let words =
             warm[WARM_HEAD..].chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap()));
-        let packed = blaze_format::tiers::Packed {
+        let packed = blaze_format_tiers::Packed {
             min: u32::from_le_bytes(word(warm, 40)),
             bits: u32::from_le_bytes(word(warm, 44)),
             len: u64::from_le_bytes(word(warm, 48)) as usize,
@@ -4192,11 +4192,11 @@ impl OneColumn {
     }
 
     pub(super) fn cold(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
-        Ok(blaze_format::tiers::encode_cold(&self.values(hot)?, None))
+        Ok(blaze_format_tiers::encode_cold(&self.values(hot)?, None))
     }
 
     pub(super) fn hot_from_cold(&self, cold: &[u8]) -> Result<Vec<u8>, String> {
-        let values = blaze_format::tiers::decode_cold(cold, None).map_err(|it| it.to_string())?;
+        let values = blaze_format_tiers::decode_cold(cold, None).map_err(|it| it.to_string())?;
         Ok(self.hot(&values))
     }
 }
@@ -4322,7 +4322,7 @@ fn spans_buffer() -> Vec<u8> {
 
 fn with_spans(sim: &mut Sim) -> Store {
     let mut store = open(sim, "store");
-    store.encode_columns(blaze_format::Spans::columns());
+    store.encode_columns(blaze_format_tiers::spans_columns());
     store
 }
 
@@ -4338,7 +4338,7 @@ fn a_buffer_given_its_buffer_columns_goes_warm_then_cold_and_reads_back() {
     }
     assert_eq!(settle(&mut sim, &mut store).demoted, 1);
     assert_eq!(form_of(&store, &key(1)), Form::Warm);
-    let warm = blaze_format::Spans::columns().warm(&hot).unwrap();
+    let warm = blaze_format_tiers::spans_columns().warm(&hot).unwrap();
     let (heat, entry) = store.get_in_place(&key(1)).unwrap().unwrap();
     assert_eq!((heat, entry.bytes, entry.content), (Heat::Warm, warm.as_slice(), content_of(&hot)));
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
@@ -4522,7 +4522,7 @@ fn a_record_moved_hot_to_warm_to_cold_and_back_round_trips_every_column_shape() 
 /// A column as the store leaves it after the mover's first move: read in place where it is.
 enum InPlace {
     Hot(Vec<u8>),
-    Warm(blaze_format::tiers::Packed),
+    Warm(blaze_format_tiers::Packed),
 }
 
 fn moved_once(column: &[u32]) -> InPlace {
@@ -4541,7 +4541,7 @@ fn moved_once(column: &[u32]) -> InPlace {
             let words = warm[WARM_HEAD..]
                 .chunks_exact(4)
                 .map(|it| u32::from_le_bytes(it.try_into().unwrap()));
-            InPlace::Warm(blaze_format::tiers::Packed {
+            InPlace::Warm(blaze_format_tiers::Packed {
                 min: u32::from_le_bytes(word(warm, 40)),
                 bits: u32::from_le_bytes(word(warm, 44)),
                 len: u64::from_le_bytes(word(warm, 48)) as usize,

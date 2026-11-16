@@ -57,7 +57,7 @@
 #![forbid(unsafe_code)]
 // `#![blaze::sans_io]` (on each core module) marks a sans-IO core for `blaze::sans_io_core`;
 // inert under rustc.
-#![feature(register_tool, custom_inner_attributes)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
 pub mod drive;

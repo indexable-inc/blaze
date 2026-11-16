@@ -26,6 +26,8 @@
 //!   typed `NoParallelism` before anything waits, where `may_overlap` runs it inline into its
 //!   deadline; and `may_overlap` gives one result under one worker and many.
 //! - [`flat`]: what the `AnyAddress` walk clears and refuses, decided as the crate compiles.
+//! - `unfinished` (rustc debug builds only): a must-finish value dropped unfinished stops,
+//!   naming its type and where it was made; one finished, or dropped by an unwind, does not.
 //! - [`cell`]: one token reads and writes every cell of its kind, behind one lock across
 //!   threads too.
 //! - [`names`]: the compile-time checks of `path!`, `var!` and `host!` are the run-time ones.

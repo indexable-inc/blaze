@@ -13,12 +13,20 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[features]
+# serde's forms of `SchemaHash`, `SpanRef` and `RelSpan` (blaze-format-core's `serde`), for the
+# old layer's crates that persist them with serde: the workspace entry turns it on; a crate that
+# wants this crate's closure free of third-party packages names it by path instead.
+serde = ["blaze-format-core/serde"]
+
 [dependencies]
 # The records, views and writer; this crate re-exports them at their old paths. `alloc` for
-# `Writer`'s default and `Persist`, `serde` for the serde forms its users persist.
-blaze-format-core = { workspace = true, features = ["alloc", "serde"] }
-blaze-ids.workspace = true
-zstd.workspace = true
+# `Writer`'s default and `Persist`. Nothing here may bring a third-party package: compression by
+# tier, which needs zstd, is blaze-format-tiers (split out 2026-11-15).
+blaze-format-core = { path = "../blaze-format-core", features = ["alloc"] }
+# By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter feature (serde),
+# which a member's entry cannot turn off.
+blaze-ids = { path = "../blaze-ids" }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

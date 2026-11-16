@@ -28,7 +28,7 @@ mod tests;
 use std::fmt;
 
 use blaze_ids::bits::below;
-use text_size::TextSize;
+use blaze_text_size::TextSize;
 use unicode_width::UnicodeWidthChar;
 
 pub use self::simd::Kernel;

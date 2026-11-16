@@ -248,6 +248,7 @@ fn read_table(text: &str) -> Result<Vec<Row>, ToolError> {
 enum J {
     S(String),
     N(usize),
+    I(i64),
     A(Vec<J>),
     O(Vec<(String, J)>),
 }
@@ -265,6 +266,7 @@ impl J {
         match self {
             J::S(text) => pyjson::string(out, text, false),
             J::N(n) => out.push_str(&n.to_string()),
+            J::I(n) => out.push_str(&n.to_string()),
             J::A(items) => {
                 out.push('[');
                 for (at, it) in items.iter().enumerate() {
@@ -529,11 +531,19 @@ fn method_shape(row: &Row, to: &str) -> Result<Shape, String> {
             is_type: false,
         });
     }
-    if !row.written.contains("::<") {
-        return Err("its receiver's type decides it (the type checker's question)".to_owned());
-    }
     if args != ["alloc"] {
         return Err(format!("`{to}` is not `Trait::method(alloc)`"));
+    }
+    if !row.written.contains("::<") {
+        // Only where the text pins the receiver: a string literal's (`"a".to_owned()`). Any
+        // other receiver's type decides the method (the type checker's question).
+        return Ok(Shape {
+            row: format!("\"..\"{}", row.written),
+            rule: o(&[("pattern", s(&format!("$X{}", row.written)))]),
+            constraints: Some(o(&[("X", o(&[("kind", s("string_literal"))]))])),
+            fix: format!("{path}($X, {{V}})"),
+            is_type: false,
+        });
     }
     Ok(Shape {
         row: row.written.clone(),
@@ -554,16 +564,15 @@ fn type_shape(row: &Row, to: &str) -> Result<Shape, String> {
     let path = &to[..open];
     if own == 0 {
         // A type with no generic of its own: the bare name, not a path's last segment.
+        if !plain_path(&row.written) || row.written.contains("::") {
+            return Err(format!("`{}` is not a prelude type's name", row.written));
+        }
         let rule = o(&[
             ("kind", s("type_identifier")),
             ("regex", s(&format!("^{}$", row.written))),
             ("not", o(&[("inside", o(&[("kind", s("scoped_type_identifier"))]))])),
-            ("not", o(&[("inside", o(&[("kind", s("generic_type")), ("field", s("type"))]))])),
         ]);
-        return Ok(Shape { row: row.written.clone(), rule: J::O(match rule {
-            J::O(fields) => fields.into_iter().map(|(k, v)| if k == "not" { (k, v) } else { (k, v) }).collect(),
-            other => vec![("all".to_owned(), J::A(vec![other]))],
-        }), constraints: None, fix: format!("{path}<{{T}}>"), is_type: true });
+        return Ok(Shape { row: row.written.clone(), rule, constraints: None, fix: format!("{path}<{{T}}>"), is_type: true });
     }
     let vars: Vec<String> = (0..own).map(|n| format!("$T{n}")).collect();
     Ok(Shape {
@@ -813,13 +822,16 @@ fn read_context(grep: &Grep<'_>, files: &[String], texts: &BTreeMap<String, Stri
 enum Source {
     /// An expression already in scope (the parameter, `entry`, `self.<field>`).
     Expr(String),
-    /// The function (file, name) gains the parameter.
-    Gain(String, String),
+    /// The function (file, name, start) gains the parameter.
+    Gain(String, String, usize),
     /// A wall: its kind and what.
     Wall(&'static str, String),
 }
 
-fn source_of(ctx: &Context, a: &Args, file: &str, at: usize, gaining: &BTreeSet<(String, String)>) -> Source {
+/// `cands` is every function (file, start) that would gain, or none for the first pass that
+/// finds them: rules select a function by its name, so a name that also names a function that
+/// would not gain is a wall.
+fn source_of(ctx: &Context, a: &Args, file: &str, at: usize, cands: Option<&BTreeSet<(String, usize)>>) -> Source {
     let inner = ctx.funcs.iter().filter(|f| f.file == file && f.start <= at && at < f.end).min_by_key(|f| f.end - f.start);
     let in_static = ctx.statics.iter().any(|(f, s, e)| f == file && *s <= at && at < *e);
     let Some(func) = inner else {
@@ -848,7 +860,10 @@ fn source_of(ctx: &Context, a: &Args, file: &str, at: usize, gaining: &BTreeSet<
         }
     }
     let same: Vec<&Func> = ctx.funcs.iter().filter(|f| f.file == file && f.name == func.name).collect();
-    if same.len() > 1 && !same.iter().all(|f| gaining.contains(&(f.file.clone(), f.name.clone()))) {
+    if let Some(cands) = cands
+        && same.len() > 1
+        && !same.iter().all(|f| cands.contains(&(f.file.clone(), f.start)))
+    {
         return Source::Wall("ambiguous", format!("`{}` names {} functions of the file", func.name, same.len()));
     }
     if let Some(g) = &a.generic {
@@ -857,7 +872,17 @@ fn source_of(ctx: &Context, a: &Args, file: &str, at: usize, gaining: &BTreeSet<
             return Source::Wall("name-taken", format!("`{}` already has a generic `{name}`", func.name));
         }
     }
-    Source::Gain(file.to_owned(), func.name.clone())
+    Source::Gain(file.to_owned(), func.name.clone(), func.start)
+}
+
+/// The functions (file, start) that the sites at `ats` would give the parameter.
+fn candidates(ctx: &Context, a: &Args, ats: &[(String, usize)]) -> BTreeSet<(String, usize)> {
+    ats.iter()
+        .filter_map(|(file, at)| match source_of(ctx, a, file, *at, None) {
+            Source::Gain(f, _, start) => Some((f, start)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whether a parameter list `(..)` has a parameter named `name`.
@@ -882,38 +907,47 @@ fn gain_rules(names: &BTreeSet<String>, a: &Args) -> Vec<Rule> {
             ]))]),
             constraints: None,
             fix: Some(format!("$P, {param}")),
+            transform: None,
         },
         Rule {
             id: "gain-param-first".to_owned(),
             rule: o(&[("kind", s("parameters")), ("not", o(&[("has", any_param)])), ("inside", in_named.clone())]),
             constraints: None,
             fix: Some(format!("({param})")),
+            transform: None,
         },
     ];
     if let Some(g) = &a.generic {
-        rules.push(Rule { id: "gain-generic".to_owned(),
-        rule: o(&[("all", J::A(vec![o(&[("pattern", s("$G"))]), o(&[("kind", s("type_parameters"))]), o(&[("inside", o(&[("field", s("type_parameters")), ("kind", s("function_item")), ("has", o(&[("field", s("name")), ("regex", s(&names_regex(names)))]))]))])]))]),
-        constraints: None,
-        fix: Some(format!("<$INNER, {g}>")),, transform: None });
-        rules.push(Rule { id: "gain-generic-first".to_owned(),
-        rule: o(&[("all", J::A(vec![
-            o(&[("pattern", s("$N"))]),
-            o(&[("kind", s("identifier"))]),
-            o(&[("regex", s(&names_regex(names)))]),
-            o(&[("inside", o(&[("kind", s("function_item")), ("field", s("name"))]))]),
-            o(&[("not", o(&[("inside", o(&[("kind", s("function_item")), ("has", o(&[("field", s("type_parameters")), ("kind", s("type_parameters"))]))]))]))]),
-        ]))]),
-        constraints: None,
-        fix: Some(format!("$N<{g}>")),, transform: None });
+        // `<T>` to `<T, A: ..>`: the fix takes the generics' inside, which `INNER` cuts out.
+        let inner = o(&[("INNER", o(&[("substring", o(&[("source", s("$G")), ("startChar", J::I(1)), ("endChar", J::I(-1))]))]))]);
+        rules.push(Rule {
+            id: "gain-generic".to_owned(),
+            rule: o(&[("all", J::A(vec![
+                o(&[("pattern", s("$G"))]),
+                o(&[("kind", s("type_parameters"))]),
+                o(&[("inside", o(&[("field", s("type_parameters")), ("kind", s("function_item")), ("has", o(&[("field", s("name")), ("regex", s(&names_regex(names)))]))]))]),
+            ]))]),
+            constraints: None,
+            fix: Some(format!("<$INNER, {g}>")),
+            transform: Some(inner),
+        });
+        rules.push(Rule {
+            id: "gain-generic-first".to_owned(),
+            rule: o(&[("all", J::A(vec![
+                o(&[("pattern", s("$N"))]),
+                o(&[("kind", s("identifier"))]),
+                o(&[("regex", s(&names_regex(names)))]),
+                o(&[("inside", o(&[("kind", s("function_item")), ("field", s("name"))]))]),
+                o(&[("not", o(&[("inside", o(&[("kind", s("function_item")), ("has", o(&[("field", s("type_parameters")), ("kind", s("type_parameters"))]))]))]))]),
+            ]))]),
+            constraints: None,
+            fix: Some(format!("$N<{g}>")),
+            transform: None,
+        });
     }
     rules
 }
 
-/// The fix of `gain-generic` takes the generics' inside: ast-grep's `transform` is written
-/// into the rule file by hand, as it is no field of [`Rule`].
-fn with_transform(file: String) -> String {
-    file.replace("\"id\": \"gain-generic\", ", "\"id\": \"gain-generic\", \"transform\": {\"INNER\": {\"substring\": {\"source\": \"$G\", \"startChar\": 1, \"endChar\": -1}}}, ")
-}
 
 /// What one run did.
 #[derive(Debug, Default)]
@@ -1051,8 +1085,6 @@ fn apply_plan(
             .collect();
         grep.apply(&types, &one, PASSES)?;
         let path = grep.write_rules(&gain_rules(&gain, a))?;
-        let text = std::fs::read_to_string(&path).map_err(|e| ToolError::File { path: path.display().to_string(), why: e.to_string() })?;
-        std::fs::write(&path, with_transform(text)).map_err(|e| ToolError::File { path: path.display().to_string(), why: e.to_string() })?;
         let argv = vec!["ast-grep".to_owned(), "scan".to_owned(), "--rule".to_owned(), path.display().to_string(), "-U".to_owned(), file.clone()];
         run(&argv, grep.dir, AST_GREP_LIMIT, grep.tmp, |s| s == 0)?;
         for f in ctx.funcs.iter().filter(|f| &f.file == file && gain.contains(&f.name)) {
@@ -1069,14 +1101,17 @@ fn fn_pointer_walls(grep: &Grep<'_>, gaining: &BTreeSet<(String, String)>, out: 
         return Ok(());
     }
     let regex = format!("^(\\w+::)*({})$", names.iter().cloned().collect::<Vec<_>>().join("|"));
-    let rule = Rule { id: "fn-pointer".to_owned(),
-    rule: o(&[
-        ("any", J::A(vec![o(&[("kind", s("identifier"))]), o(&[("kind", s("scoped_identifier"))])])),
-        ("regex", s(&regex)),
-        ("inside", o(&[("kind", s("arguments"))])),
-    ]),
-    constraints: None,
-    fix: None,, transform: None };
+    let rule = Rule {
+        id: "fn-pointer".to_owned(),
+        rule: o(&[
+            ("any", J::A(vec![o(&[("kind", s("identifier"))]), o(&[("kind", s("scoped_identifier"))])])),
+            ("regex", s(&regex)),
+            ("inside", o(&[("kind", s("arguments"))])),
+        ]),
+        constraints: None,
+        fix: None,
+        transform: None,
+    };
     let files: Vec<String> = rust_files(grep.dir);
     for m in grep.query(&[rule], &files)? {
         out.wall("fn-pointer", &m.file, m.line, "a function that gained the parameter, passed as a value");
@@ -1156,8 +1191,8 @@ fn call_rules(name: &str, given: usize, expr: &str, fns: &BTreeSet<String>) -> V
     let fixed = if given == 0 { expr.to_owned() } else { format!("{args}, {expr}") };
     let callee = o(&[("F", o(&[("regex", s(&format!("^(.*::)?{name}$")))]))]);
     vec![
-        Rule { id: "call".to_owned(), rule: all(o(&[("pattern", s(&format!("$F({args})")))]), inside_fns(fns)), constraints: Some(callee), fix: Some(format!("$F({fixed})")) },
-        Rule { id: "method".to_owned(), rule: all(o(&[("pattern", s(&format!("$R.{name}({args})")))]), inside_fns(fns)), constraints: None, fix: Some(format!("$R.{name}({fixed})")) },
+        Rule { id: "call".to_owned(), rule: all(o(&[("pattern", s(&format!("$F({args})")))]), inside_fns(fns)), constraints: Some(callee), fix: Some(format!("$F({fixed})")), transform: None },
+        Rule { id: "method".to_owned(), rule: all(o(&[("pattern", s(&format!("$R.{name}({args})")))]), inside_fns(fns)), constraints: None, fix: Some(format!("$R.{name}({fixed})")), transform: None },
     ]
 }
 
@@ -1214,6 +1249,7 @@ fn settle(grep: &Grep<'_>, a: &Args, root: &Path, out: &mut Summary) -> Result<(
             }
             return Ok(());
         }
+        let mut changed = 0;
         for (file, by) in &calls {
             let rules: Vec<Rule> = by
                 .iter()
@@ -1225,11 +1261,18 @@ fn settle(grep: &Grep<'_>, a: &Args, root: &Path, out: &mut Summary) -> Result<(
                     })
                 })
                 .collect();
-            *out.sites.entry("E0061".to_owned()).or_default() += grep.apply(&rules, &[file.clone()], 1)?;
+            changed += grep.apply(&rules, &[file.clone()], 1)?;
         }
-        let plan: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
-        let _ = plan;
-        apply_plan(grep, a, &[], &ctx, &gaining.iter().map(|(f, _)| (f.clone(), BTreeMap::new())).collect(), &gaining, out)?;
+        *out.sites.entry("E0061".to_owned()).or_default() += changed;
+        if changed == 0 {
+            // The errors' calls are where ast-grep's rules do not reach: a macro's tokens.
+            for e in errors.iter().filter(|e| e.code == "E0061") {
+                out.wall("unmatched", &e.file, e.line, "the call is not one ast-grep sees (in a macro's tokens?)");
+            }
+            return Ok(());
+        }
+        let files_gaining: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = gaining.iter().map(|(f, _)| (f.clone(), BTreeMap::new())).collect();
+        apply_plan(grep, a, &[], &ctx, &files_gaining, &gaining, out)?;
     }
     Ok(())
 }

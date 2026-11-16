@@ -35,7 +35,6 @@ mod set;
 use std::sync::OnceLock;
 
 use edition::Edition;
-use serde::{Deserialize, Serialize};
 
 use self::index::{
     ALL, BLAZE_END, BUILTIN_END, Entry, FIRST_GROUP, GROUP_COUNT, INTERNAL_END, INTERNAL_GROUP,
@@ -47,7 +46,7 @@ pub use self::{
 };
 
 /// A lint level, in rustc's order: where one is capped, the lower wins.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Level {
     Allow,
     Expect,

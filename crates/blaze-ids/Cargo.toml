@@ -20,10 +20,6 @@ doctest = false
 [features]
 # serde's forms of `ContentId`, `Fingerprint` and `Bits`.
 serde = ["dep:serde"]
-# `Bits` over a `SmallVec` of words (hir-def's variants, hir-ty's representability).
-smallvec = ["dep:smallvec"]
-# `Bits` over a `ThinVec` of words.
-thin-vec = ["dep:thin-vec"]
 
 [dependencies]
 # By path, not `.workspace`: the workspace entries turn on the adapter features the crates above
@@ -34,8 +30,6 @@ blaze-radix = { path = "../blaze-radix" }
 blaze-rng = { path = "../blaze-rng" }
 blaze-swiss = { path = "../blaze-swiss" }
 serde = { workspace = true, optional = true }
-smallvec = { workspace = true, optional = true }
-thin-vec = { workspace = true, optional = true }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

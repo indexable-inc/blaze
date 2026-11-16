@@ -1,10 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, thread};
 
 use blaze_sim::Config;
-#[cfg(feature = "smallvec")]
-use smallvec::SmallVec;
-#[cfg(feature = "thin-vec")]
-use thin_vec::ThinVec;
 
 use crate::rng::SplitMix64;
 
@@ -288,11 +284,10 @@ fn bits_are_a_set() {
 }
 
 /// hir-def's lists of impls: a bit per position pushed beside the list, past its end clear.
-#[cfg(feature = "thin-vec")]
 #[test]
 fn a_set_kept_beside_a_list_has_the_lists_words() {
-    let mut beside = Bits::<ThinVec<u64>>::default();
-    let mut other = Bits::<ThinVec<u64>>::default();
+    let mut beside = Bits::<Vec<u64>>::default();
+    let mut other = Bits::<Vec<u64>>::default();
     for at in 0..65 {
         beside.set_growing(at, at % 2 == 0);
         other.set_growing(at, at % 2 == 0);
@@ -302,11 +297,10 @@ fn a_set_kept_beside_a_list_has_the_lists_words() {
     assert!(beside.contains(64) && !beside.contains(63) && !beside.contains(65));
 }
 
-/// hir-def's enum variants: inline up to 64, cut to the variants kept.
-#[cfg(feature = "smallvec")]
+/// hir-def's enum variants: cut to the variants kept.
 #[test]
-fn a_small_set_is_inline_and_truncates() {
-    let mut set = Bits::<SmallVec<[u64; 1]>>::new(130);
+fn a_small_set_truncates() {
+    let mut set = Bits::<Vec<u64>>::new(130);
     set.insert(1);
     set.insert(70);
     set.insert(129);
@@ -316,7 +310,7 @@ fn a_small_set_is_inline_and_truncates() {
     set.truncate(64);
     set.shrink_to_fit();
     assert_eq!(set.iter().collect::<Vec<_>>(), [1]);
-    assert!(!set.into_words().spilled());
+    assert_eq!(set.into_words().len(), 1);
 }
 
 /// A view of words held elsewhere reads as the set it is.

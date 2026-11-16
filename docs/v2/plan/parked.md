@@ -23,8 +23,10 @@ MIR table links hir-ty-mir itself now.
 - `crates/base-db`: rewritten over the records (design/reconnect.md): the task's `Db`,
   `Records`, `Need`, the `Crate` input, gifts and the include table; awaiting its first compile.
 - `crates/hir-expand`: its lib, files, attrs, proc-macro and cfg modules restored and moved onto
-  the new `Db` (no expansion-read log, no edit, proc macros as gifts); awaiting its first
-  compile; its tests still name the deleted fixture.
+  the new `Db` (no expansion-read log, no edit, proc macros as gifts); its first compile's 13
+  errors (batch 13) fixed against mbe without `db` and `Crate::proc_macro_cwd`, a base-db
+  input; the hygiene and span-map tests are `cfg(any())` until `fixture::db` over an in-memory
+  `Records` exists.
 - `crates/hir-def`: on the records: ids from item keys (`key`), the `nameres` facade (scope
   probes, path resolution, extern prelude and lang items from `CrateGraph`/`LangItems`), the
   resolver and expression scopes, trait and impl items (the `KeyIndex` stand-in), module

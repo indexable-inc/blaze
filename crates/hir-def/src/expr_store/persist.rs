@@ -1608,8 +1608,8 @@ impl AsIs<'_> {
 impl ExpressionStore {
     /// The warm and cold forms of expression store buffers, codec by column: what
     /// `blaze_cas::Store::encode_columns` is given for [`ExpressionStore`]'s schema.
-    pub fn columns() -> blaze_format::tiers::BufferColumns {
-        blaze_format::tiers::BufferColumns::of::<StoreRoot>(<ExpressionStore as Persist>::SCHEMA)
+    pub fn columns() -> blaze_format_tiers::BufferColumns {
+        blaze_format_tiers::BufferColumns::of::<StoreRoot>(<ExpressionStore as Persist>::SCHEMA)
     }
 }
 
@@ -1695,8 +1695,8 @@ impl<'a> BodyRef<'a> {
 
 impl Body {
     /// As [`ExpressionStore::columns`], for [`Body`]'s schema.
-    pub fn columns() -> blaze_format::tiers::BufferColumns {
-        blaze_format::tiers::BufferColumns::of::<BodyRoot>(<Body as Persist>::SCHEMA)
+    pub fn columns() -> blaze_format_tiers::BufferColumns {
+        blaze_format_tiers::BufferColumns::of::<BodyRoot>(<Body as Persist>::SCHEMA)
     }
 }
 

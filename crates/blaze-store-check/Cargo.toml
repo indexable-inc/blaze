@@ -14,9 +14,9 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-data.workspace = true
 blaze-ids.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+blaze-json.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

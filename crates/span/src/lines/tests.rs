@@ -1,5 +1,5 @@
 use blaze_ids::rng::SplitMix64 as Rng;
-use text_size::TextSize;
+use blaze_text_size::TextSize;
 
 use super::{Kernel, LineIndex, char_width, display_width, simd};
 

@@ -1,7 +1,6 @@
 use std::hash::Hash;
 
 use blaze_hash::HashMap;
-use smallvec::SmallVec;
 use std::alloc::Global;
 
 /// [`ReadIndex::forget_many`] sweeps once the readers it forgets hold at least one in this many
@@ -35,7 +34,7 @@ struct Side<A, B> {
 struct Row<A, B> {
     owner: A,
     /// The other side's handle and its row.
-    items: SmallVec<[(B, u32); 4]>,
+    items: Vec<(B, u32)>,
 }
 
 impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
@@ -59,7 +58,7 @@ impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
             }
             None => {
                 let at = u32::try_from(self.rows.len()).expect("more than `u32::MAX` handles");
-                self.rows.push(Row { owner: a, items: SmallVec::new() });
+                self.rows.push(Row { owner: a, items: Vec::new() });
                 at
             }
         };
@@ -179,7 +178,7 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
             if before == 0 {
                 continue;
             }
-            items.retain(|&mut (_, r)| !dropped[r as usize]);
+            items.retain(|&(_, r)| !dropped[r as usize]);
             if items.len() == before {
                 continue;
             }

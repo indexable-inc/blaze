@@ -19,7 +19,7 @@ use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
     View,
-    builder::{Builder, Full, MemAttrs, Param, Variadic},
+    builder::{BuildError, Builder, Full, MemAttrs, Param, Variadic},
     eval::{self, EvalError, Outcome, Trap, Val},
     flags::{Flags, IntCond},
     func::{Block, BlockKind, Conv, Func, SlotKind, Value},
@@ -149,8 +149,12 @@ struct Gen {
     entry: Vec<(Value, Ty)>,
     /// The current block's integers: the entry's, its parameters, what it made.
     pool: Vec<(Value, Ty)>,
-    /// What the current block made, mixed into the accumulator before it ends.
+    /// What the current block made, mixed into the accumulator before it ends. Cleared as each
+    /// block opens: what a terminator's arguments made after the mix is the old block's, and
+    /// may not dominate the next one (the first finding, kept as a regression test below).
     made: Vec<Value>,
+    /// Which blocks an edge of a reached block goes to.
+    reached: Vec<bool>,
     data: Value,
     acc: Value,
     counters: Value,
@@ -321,8 +325,16 @@ impl Gen {
         tys.into_iter().map(|ty| self.of(tape, ty)).collect()
     }
 
-    fn forward(&self, tape: &Tape, from: usize) -> usize {
-        from + 1 + tape.below((self.blocks.len() - from - 1) as u64, "target") as usize
+    /// A forward target of block `from`. The first edge of a block whose next block nothing
+    /// reaches yet goes there, so every block has a predecessor that is itself reached (by
+    /// induction from the entry): no block is unreachable.
+    fn forward(&mut self, tape: &Tape, from: usize, first: bool) -> usize {
+        let to = match first && !self.reached[from + 1] {
+            true => from + 1,
+            false => from + 1 + tape.below((self.blocks.len() - from - 1) as u64, "target") as usize,
+        };
+        self.reached[to] = true;
+        to
     }
 
     /// Block `at`, after its parameters and counter: its body and its end.
@@ -352,22 +364,23 @@ impl Gen {
             return;
         }
         if let Some(again) = counted {
-            let (back, on) = (self.args(tape, at), self.forward(tape, at));
+            let (back, on) = (self.args(tape, at), self.forward(tape, at, true));
             let forth = self.args(tape, on);
             let (this, next) = (self.blocks[at], self.blocks[on]);
             self.b.br(Flags::NONE, again, (this, &back), (next, &forth));
             return;
         }
+        // A trap only where the next block has a predecessor already.
         match tape.below(8, "terminator") {
-            0 => self.b.trap(tape.int_in(0u32..=3, "trap code")),
-            1..=3 => {
-                let on = self.forward(tape, at);
+            0 if self.reached[at + 1] => self.b.trap(tape.int_in(0u32..=3, "trap code")),
+            0..=3 => {
+                let on = self.forward(tape, at, true);
                 let args = self.args(tape, on);
                 self.b.jump((self.blocks[on], &args));
             }
             4..=5 => {
                 let cond = self.of(tape, Ty::I1);
-                let (a, b) = (self.forward(tape, at), self.forward(tape, at));
+                let (a, b) = (self.forward(tape, at, true), self.forward(tape, at, false));
                 let (then, otherwise) = (self.args(tape, a), self.args(tape, b));
                 let to = (self.blocks[a], then.as_slice());
                 self.b.br(Flags::NONE, cond, to, (self.blocks[b], &otherwise));
@@ -375,12 +388,12 @@ impl Gen {
             _ => {
                 let ty = *tape.one_of(&STORED, "scrutinee type");
                 let scrutinee = self.of(tape, ty);
-                let default = self.forward(tape, at);
+                let default = self.forward(tape, at, true);
                 let default_args = self.args(tape, default);
                 let cases = tape.int_in(0usize..=3, "cases");
                 let mut targets = Vec::new();
                 for case in 0..cases {
-                    let on = self.forward(tape, at);
+                    let on = self.forward(tape, at, false);
                     // Small, distinct case values, so drawn scrutinees meet them.
                     targets.push((case as u128 * 3 + tape.below(3, "case") as u128, on, self.args(tape, on)));
                 }
@@ -394,8 +407,9 @@ impl Gen {
     }
 }
 
-/// A random program and the arguments of its run.
-fn program(tape: &Tape) -> Result<(Func<Global>, Vec<Val>), Broke> {
+/// A random program and the arguments of its run; valid by construction, so a refusal is the
+/// generator's bug.
+fn program(tape: &Tape) -> Result<(Func<Global>, Vec<Val>), BuildError> {
     let params: Vec<Ty> = tape.vec(0..=3, "parameters", |tape| ty(tape, "parameter"));
     let n = tape.int_in(1usize..=6, "blocks");
     let mut b = Builder::<Global, Full>::new_in(64, Global);
@@ -441,6 +455,7 @@ fn program(tape: &Tape) -> Result<(Func<Global>, Vec<Val>), Broke> {
         entry: entry.clone(),
         pool: entry,
         made: Vec::new(),
+        reached: (0..n).map(|at| at == 0).collect(),
         data,
         acc,
         counters,
@@ -452,6 +467,7 @@ fn program(tape: &Tape) -> Result<(Func<Global>, Vec<Val>), Broke> {
     for at in 1..n {
         g.b.begin(g.blocks[at]);
         g.pool = g.entry.clone();
+        g.made.clear();
         let params = g.block_params[at].clone();
         for ty in params {
             let value = g.b.param(ty);
@@ -460,13 +476,42 @@ fn program(tape: &Tape) -> Result<(Func<Global>, Vec<Val>), Broke> {
         }
         g.block(tape, at);
     }
-    let func = g.b.finish_checked().map_err(|why| Broke::Harness(format!("a generated program does not build: {why:?}")))?;
-    Ok((func, args))
+    debug_assert!(g.reached.iter().all(|&it| it), "a block no edge reaches");
+    Ok((g.b.finish_checked()?, args))
+}
+
+/// The generator's own contract: every program it makes builds and verifies.
+fn verifies(tape: &Tape) -> Result<(), Broke> {
+    match program(tape) {
+        Ok(_) => Ok(()),
+        Err(why) => Err(Broke::Oracle(format!("a generated program does not verify: {why:?}"))),
+    }
+}
+
+#[test]
+fn every_generated_program_verifies() {
+    blaze_sim::check(Config::cases(512), verifies);
+}
+
+/// The first finding (seed 0, case 1): a constant a terminator's arguments made after the mix
+/// was mixed again by the next block, which it does not dominate.
+#[test]
+fn a_value_made_by_a_terminator_stays_in_its_block() {
+    let mut values = vec![1, 0, 1, 0, 1, 0, 5, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+    values.extend([0; 25]);
+    values.push(4);
+    values.extend([0; 7]);
+    values.push(4);
+    let tape = Tape::replay(&values);
+    if let Err(Broke::Oracle(why) | Broke::Harness(why)) = verifies(&tape) {
+        panic!("{why}");
+    }
 }
 
 /// Every tier runs a random program as the evaluator runs the built function.
 fn tiers_agree(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let (func, args) = program(tape)?;
+    let (func, args) = program(tape)
+        .map_err(|why| Broke::Harness(format!("a generated program does not build: {why:?}")))?;
     let view = func.view();
     let reference = eval::run_in(view, &args, FUEL, Global)
         .map_err(|why: EvalError| Broke::Harness(format!("the evaluator refused a generated program: {why}")))?;

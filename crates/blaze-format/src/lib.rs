@@ -3,9 +3,10 @@
 //!
 //! The format itself (records, their views, [`Writer`], [`record!`]) is blaze-format-core's,
 //! on `core` alone so a `#![no_std]` crate defines and reads records; this crate re-exports all
-//! of it at the paths it always had, and adds what needs `std` or a third-party crate: the
-//! tiers ([`tiers`], zstd), the [`cursor`], [`hex`] and [`leb`] codecs, and the span side table
-//! ([`Spans`]). See blaze-format-core's crate docs for the format.
+//! of it at the paths it always had, and adds what needs `std`: the [`cursor`], [`hex`] and
+//! [`leb`] codecs, and the span side table ([`Spans`]). It brings no third-party package:
+//! compression by tier, which needs zstd, is blaze-format-tiers (it was `tiers` here until
+//! 2026-11-15). See blaze-format-core's crate docs for the format.
 //!
 //! Spans are never in a record that is hashed: they sit in a side table ([`Spans`]), and a
 //! record names one by [`SpanRef`].
@@ -13,7 +14,6 @@
 pub mod cursor;
 pub mod hex;
 pub mod leb;
-pub mod tiers;
 
 use std::mem::offset_of;
 
@@ -22,16 +22,18 @@ use blaze_ids::ContentId;
 // Every public item of blaze-format-core, named one by one: a path of this crate is a promise
 // to the hundred crates that use it, so none appears or goes by a glob.
 pub use blaze_format_core::{
-    ALIGN, Aligned, BUFFER_DOMAIN, FormatError, HEADER_LEN, Header, MAGIC, Own, Part, Persist,
-    Placed, Record, Rel, RelSpan, SCHEMA_DOMAIN, SchemaHash, Slice, SpanRef, Str, WordTable,
-    WordTables, WriteBuffer, Writer, WriterIn, buffer_id, bytes_of_slice, check_field,
-    check_field_shallow, declared, field_columns, header, open, open_as, open_verified,
-    read_verified, record, record_at, row_words, schema, schema_of, to_bytes,
+    ALIGN, Aligned, BUFFER_DOMAIN, FormatError, HEADER_LEN, Header, Items, MAGIC, Offset, Own,
+    Part, Persist, Placed, Record, Rel, RelSpan, SCHEMA_DOMAIN, SchemaHash, Slice, SpanRef, Str,
+    Text, Unfit, Verified, WordTable, WordTables, WriteBuffer, Writer, WriterIn, buffer_id,
+    bytes_of_slice, check_field, check_field_shallow, declared, field, field_columns, header,
+    open, open_as, open_verified, read_verified, record, record_at, row_words, schema, schema_of,
+    to_bytes,
 };
 
 record! {
+    /// A [`Spans`] buffer's root; public for blaze-format-tiers' `spans_columns`.
     #[derive(Clone, Copy)]
-    struct SpansRoot: 1 {
+    pub struct SpansRoot: 1 {
         anchor: ContentId,
         spans: Slice<RelSpan>,
     }
@@ -48,12 +50,6 @@ impl Spans {
     pub fn new(anchor: ContentId) -> Spans {
         // alloc: `Vec::new` allocates nothing until a span is pushed
         Spans { anchor, spans: Vec::new() }
-    }
-
-    /// The warm and cold forms of span table buffers, starts and lengths each a column: what
-    /// `blaze_cas::Store::encode_columns` is given for [`Spans`]' schema.
-    pub fn columns() -> tiers::BufferColumns {
-        tiers::BufferColumns::of::<SpansRoot>(<Spans as Persist>::SCHEMA)
     }
 
     /// Adds a span `len` bytes long, `start` bytes from the anchor's start.
@@ -104,7 +100,8 @@ impl Persist for Spans {
         let field = at + offset_of!(SpansRoot, spans) as u64;
         let root = SpansRoot {
             anchor: self.anchor,
-            spans: Slice::between(field, spans, self.spans.len()),
+            spans: Slice::between(field, spans, self.spans.len())
+                .expect("the spans are written before their root, in a buffer under 2 GiB"),
         };
         let written = out.push(&root);
         debug_assert_eq!(written, at);

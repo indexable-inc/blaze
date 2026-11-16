@@ -299,10 +299,15 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 # `blaze audit`: sources pinned by strong digests, advisories, yanked versions (sans-IO).
 blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
-blaze-format = { path = "crates/blaze-format" }
+# `serde` on for the old layer's crates; the new layer's name blaze-format by path, which keeps
+# its closure to workspace crates.
+blaze-format = { path = "crates/blaze-format", features = ["serde"] }
 # The record half of blaze-format on `core` alone, for the new item layer's `no_std` crates;
-# blaze-format re-exports it whole, with its `alloc` and `serde` features on.
+# blaze-format re-exports it whole, with its `alloc` feature on (`serde` by blaze-format's).
 blaze-format-core = { path = "crates/blaze-format-core" }
+# Compression by tier of blaze-format buffers (hot, warm, cold under zstd): the store's, split
+# out so blaze-format brings no third-party package.
+blaze-format-tiers = { path = "crates/blaze-format-tiers" }
 # The bottom of the tree depends on no crate from outside the workspace
 # (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15"): its adapters to such crates are
 # features, on here for the crates above, and the bottom crates name each other by path without
@@ -313,9 +318,9 @@ blaze-swiss = { path = "crates/blaze-swiss" }
 blaze-hash = { path = "crates/blaze-hash", features = ["serde", "shared"] }
 # blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
-blaze-ids = { path = "crates/blaze-ids", features = ["serde", "smallvec", "thin-vec"] }
+blaze-ids = { path = "crates/blaze-ids", features = ["serde"] }
 # An item's portable identity: its key, the `Portable` bound and the tables that outlive a snapshot (docs/v2/plan/design/identity.md).
-blaze-id = { path = "crates/blaze-id", features = ["serde"] }
+blaze-id = { path = "crates/blaze-id" }
 blaze-impls = { path = "crates/blaze-impls" } # The impl index, lang items and crate graph records (docs/v2/plan/design/bottom.md).
 blaze-expand = { path = "crates/blaze-expand" }
 blaze-scope = { path = "crates/blaze-scope" }
@@ -390,6 +395,8 @@ blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what th
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,
 # toml/toml_edit and semver (docs/v2/plan/third-party.md).
 blaze-base64 = { path = "crates/blaze-base64" }
+# `TextSize` and `TextRange`, in place of text-size.
+blaze-text-size = { path = "crates/blaze-text-size" }
 blaze-cbor = { path = "crates/blaze-cbor" } # Deterministic CBOR (RFC 8949 4.2.1): the one home; blaze-pack and blaze-watch take it from here.
 blaze-data = { path = "crates/blaze-data" } # The one format-neutral value (CBOR, JSON, TOML) and `value!`.
 blaze-json = { path = "crates/blaze-json" }

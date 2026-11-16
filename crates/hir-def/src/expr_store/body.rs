@@ -648,29 +648,6 @@ pub fn item_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
     syntax.clone()
 }
 
-/// Whether `read`, a row of the list `blaze_memo::record` kept for a body's lowering, is a
-/// read of `def`'s own syntax, for whoever files that list (the item store's lowering step,
-/// `blaze_item_hash::reads`): the [`FileText`](base_db::FileText) input of the file `def` is
-/// written in, which [`item_body_syntax`] and [`file_body_syntax`] read and, being kinds that
-/// are not fact boundaries, flatten into their asker. The key the lowering is filed under
-/// hashes the item's own text, so that row is covered by the key. `false` for any other row,
-/// another file's text, and for a body not written in a file (a macro's).
-///
-/// Provisional (port 2026-11-13): it answers by the whole file's fact, so a body in a file
-/// counts the file's text as its own; L9b gives the signature the item store's filing step
-/// calls, and with it whether a row narrower than the file (the item's own syntax) is listed.
-pub fn own_syntax_read(db: &Db, def: DefWithBodyId, read: &blaze_memo::Read) -> bool {
-    let blaze_memo::Read::Input { kind, fact } = read else { return false };
-    if *kind != blaze_memo::KindId::of(base_db::VfsText::INPUT_KIND) {
-        return false;
-    }
-    let InFile { file_id, .. } = def.erased_ast_id(db);
-    let Some(file) = file_id.file_id() else { return false };
-    // A text outside the VFS (`include!`'s) is read as its row's included fact, never as a
-    // `VfsText` input, so no input row of that kind is a read of it.
-    let base_db::FileText::Vfs(text) = db.file_text(file.file_id(db)) else { return false };
-    text.input_fact(blaze_memo::Database::memo(db)) == *fact
-}
 
 /// The [`BodySyntax`] of each fn, const, static and variant of `file` outside fn bodies, by its
 /// ast id: made again at each edit of the file; [`item_body_syntax`] is what a body reads.

@@ -149,7 +149,6 @@ portable_tuples! {
 /// ([`ItemKey::crate_prefix`]), the top bit of byte 8 says whether it is of something inside a
 /// body ([`ItemKey::is_inner`]), and the other 247 bits are the hash.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ItemKey(pub ContentId);
 
 impl ItemKey {
@@ -193,7 +192,6 @@ impl fmt::LowerHex for ItemKey {
 /// as, its edition, crate attributes, dependencies by name and key, and its cfg), never its
 /// session's `Crate` id. base-db computes it (`base_db::crate_item_key`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CrateItemKey(pub ContentId);
 
 impl CrateItemKey {

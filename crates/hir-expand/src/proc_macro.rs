@@ -484,7 +484,7 @@ impl CustomProcMacroExpander {
             def_site,
             call_site,
             mixed_site,
-            current_dir: calling_crate.data(db).proc_macro_cwd.as_str(),
+            current_dir: &**calling_crate.proc_macro_cwd(db),
         }
     }
 

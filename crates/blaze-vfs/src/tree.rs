@@ -25,7 +25,6 @@ use blaze_ids::{
 };
 use blaze_image::Corrupt;
 use hashbrown::{HashTable, hash_table};
-use smallvec::{SmallVec, smallvec};
 
 use crate::{
     Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, ImageUse, MOST_FILE_BYTES, Mode, Op, OpError,
@@ -492,18 +491,18 @@ impl Tree {
         // What is left to walk, as cursors into texts: the path, then each link's target in
         // front of what was left when it was met. A target is borrowed from the tree unless it
         // is not UTF-8.
-        let mut rest: SmallVec<[(Cow<'_, str>, usize); 4]> = SmallVec::new();
+        let mut rest: Vec<(Cow<'_, str>, usize)> = Vec::new();
         if !path.is_empty() {
             check(path)?;
             rest.push((Cow::Borrowed(path), 0));
         }
         // The directories from the root to where the walk is, and the names of all but the root.
-        // alloc: inline, on the heap only past 16 directories deep.
-        let mut dirs: SmallVec<[NodeId; 16]> = smallvec![root];
-        let mut names: SmallVec<[NameId; 16]> = SmallVec::new();
+        // alloc: the walk's stacks, one buffer each, grown to the path's depth.
+        let mut dirs: Vec<NodeId> = vec![root];
+        let mut names: Vec<NameId> = Vec::new();
         let mut links = 0;
         // The last link followed: the names on its path, and its target's bytes.
-        let mut link: SmallVec<[NameId; 16]> = SmallVec::new();
+        let mut link: Vec<NameId> = Vec::new();
         let mut target: Option<&[u8]> = None;
         let bad = |link: &[NameId], target: Option<&[u8]>| {
             let target = target.expect("only a link's target leaves the tree");

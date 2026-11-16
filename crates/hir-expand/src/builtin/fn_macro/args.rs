@@ -5,7 +5,6 @@
 
 use std::borrow::Cow;
 
-use base_db::Db;
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use mbe::expect_fragment;
@@ -116,10 +115,10 @@ fn is_comma(element: &TtElement<'_>) -> bool {
 }
 
 /// The expression `iter` starts with, as rustc's `parse_expr` takes it.
-fn expr<'t>(db: &Db, iter: &mut TtIter<'t>, delim_span: DelimSpan) -> Result<Arg<'t>, ExpandError> {
+fn expr<'t>(iter: &mut TtIter<'t>, delim_span: DelimSpan) -> Result<Arg<'t>, ExpandError> {
     let at = iter.next_span().unwrap_or(delim_span.close);
     let mbe::ValueResult { value, err } =
-        expect_fragment(db, iter, parser::PrefixEntryPoint::Expr, delim_span);
+        expect_fragment(iter, parser::PrefixEntryPoint::Expr, delim_span);
     if let Some(err) = err {
         return Err(err.into());
     }
@@ -131,15 +130,12 @@ fn expr<'t>(db: &Db, iter: &mut TtIter<'t>, delim_span: DelimSpan) -> Result<Arg
 }
 
 /// rustc's `get_exprs_from_tts`: the expressions `tt` has, each followed by a `,` or the end.
-pub(super) fn exprs<'t>(
-    db: &Db,
-    tt: &'t tt::TopSubtree,
-) -> Result<SmallVec<[Arg<'t>; 4]>, ExpandError> {
+pub(super) fn exprs<'t>(tt: &'t tt::TopSubtree) -> Result<SmallVec<[Arg<'t>; 4]>, ExpandError> {
     let delim_span = tt.top_subtree().delimiter.delim_span();
     let mut iter = tt.iter();
     let mut exprs = SmallVec::new();
     while !iter.is_empty() {
-        exprs.push(expr(db, &mut iter, delim_span)?);
+        exprs.push(expr(&mut iter, delim_span)?);
         match iter.peek() {
             None => break,
             Some(it) if is_comma(&it) => {
@@ -176,7 +172,6 @@ pub(super) fn comma_separated(tt: &tt::TopSubtree) -> SmallVec<[Arg<'_>; 4]> {
 /// error: finding it reads the call's syntax, which a well-formed call never needs (an
 /// `include!` of a crate given by its pages is resolved from its tokens alone).
 pub(super) fn single_expr<'t>(
-    db: &Db,
     tt: &'t tt::TopSubtree,
     name: &str,
     call: impl Fn() -> Span,
@@ -187,7 +182,7 @@ pub(super) fn single_expr<'t>(
     if iter.is_empty() {
         return ExpandResult::new(None, takes_one());
     }
-    let arg = match expr(db, &mut iter, tt.top_subtree().delimiter.delim_span()) {
+    let arg = match expr(&mut iter, tt.top_subtree().delimiter.delim_span()) {
         Ok(it) => it,
         Err(err) => return ExpandResult::new(None, err),
     };
@@ -216,12 +211,11 @@ pub(super) fn string(arg: &Arg<'_>, err_msg: &'static str) -> Result<Symbol, Exp
 /// the one argument of `tt`. The first error rustc gives is `err`. `call` is asked only for an
 /// error, as in [`single_expr`].
 pub(super) fn single_string(
-    db: &Db,
     tt: &tt::TopSubtree,
     name: &str,
     call: impl Fn() -> Span,
 ) -> ExpandResult<Option<(Symbol, Span)>> {
-    let ExpandResult { value, err } = single_expr(db, tt, name, call);
+    let ExpandResult { value, err } = single_expr(tt, name, call);
     let Some(arg) = value else { return ExpandResult { value: None, err } };
     match string(&arg, "argument must be a string literal") {
         Ok(text) => ExpandResult { value: Some((text, arg.span)), err },
@@ -238,13 +232,13 @@ pub(super) enum Array<'t> {
 }
 
 /// The array `arg` is, if it is one.
-pub(super) fn array<'t>(db: &Db, arg: &Arg<'t>) -> Option<Result<Array<'t>, ExpandError>> {
+pub(super) fn array<'t>(arg: &Arg<'t>) -> Option<Result<Array<'t>, ExpandError>> {
     let (subtree, mut iter) = arg.bracketed()?;
     let delim_span = subtree.delimiter.delim_span();
     let mut elements = SmallVec::new();
     let read = (|| {
         while !iter.is_empty() {
-            let element = expr(db, &mut iter, delim_span)?;
+            let element = expr(&mut iter, delim_span)?;
             match iter.next() {
                 None => {
                     elements.push(element);
@@ -254,7 +248,7 @@ pub(super) fn array<'t>(db: &Db, arg: &Arg<'t>) -> Option<Result<Array<'t>, Expa
                 Some(TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: ';', .. })))
                     if elements.is_empty() =>
                 {
-                    let count = expr(db, &mut iter, delim_span)?;
+                    let count = expr(&mut iter, delim_span)?;
                     if let Some(it) = iter.next() {
                         return Err(ExpandError::other(it.first_span(), "unexpected token"));
                     }

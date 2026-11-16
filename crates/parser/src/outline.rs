@@ -12,8 +12,6 @@
 //! parameter (`fn f<T, {>()`) in a `fn` nested in a body, makes the body's part fail its check
 //! when parsed; outlines are for the files of dependency crates, which rustc builds.
 
-use smallvec::SmallVec;
-
 use crate::{
     SyntaxKind::{self, EOF, IDENT, OUTER_DOC_COMMENT},
     T, Tokens,
@@ -46,7 +44,7 @@ pub fn lazy_block_len<'t>(input: impl Into<Tokens<'t>>, start: usize) -> Option<
     let mut depth = 0usize;
     let mut brackets = 0usize;
     // The bracket depths at which the outer attributes being read started.
-    let mut attributes: SmallVec<[usize; 4]> = SmallVec::new();
+    let mut attributes: Vec<usize> = Vec::new();
     let mut after_attribute = false;
     let mut at = start;
     loop {

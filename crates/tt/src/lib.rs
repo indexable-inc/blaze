@@ -29,7 +29,7 @@ use stdx::{impl_from, itertools::Itertools as _};
 
 pub use span::Span;
 use span::{Extensions, SyntaxContext};
-pub use text_size::{TextRange, TextSize};
+pub use blaze_text_size::{TextRange, TextSize};
 
 pub use self::iter::{TtElement, TtIter};
 pub use self::storage::{

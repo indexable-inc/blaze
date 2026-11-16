@@ -101,7 +101,8 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 use std::{borrow::Cow, collections::VecDeque, fmt, sync::Arc};
 
 use blaze_core::{Cache, Completion, Done, Durable, Effect, Extent, FileName, Mapping, Stamp, Tag};
-use blaze_format::{SchemaHash, tiers::BufferColumns};
+use blaze_format::SchemaHash;
+use blaze_format_tiers::BufferColumns;
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_reclaim::{Grace, Limbo};
@@ -377,7 +378,7 @@ pub struct Entry<'a> {
     pub bytes: &'a [u8],
 }
 
-/// Format's encodings of the values of one schema (`blaze_format::tiers`), by which
+/// Format's encodings of the values of one schema (`blaze_format_tiers`), by which
 /// [`Store::settle`] moves a value between tiers. The store decides when, by how recently the
 /// value was read; what its columns are and how each is packed is the encoding's. A value is of
 /// a schema when it is a `blaze_format` buffer: its header names the schema.
@@ -444,7 +445,7 @@ impl Columns {
 }
 
 /// The encodings the store was given, by schema. Each behind an `Arc` so publishing a new map
-/// copies no encoding (a [`blaze_format::tiers::ColdDictionary`] rebuilds its tables to clone).
+/// copies no encoding (a [`blaze_format_tiers::ColdDictionary`] rebuilds its tables to clone).
 type Encodings = ByHash<SchemaHash, Arc<Columns>, Global>; // alloc: the store's own table, for its life
 
 /// The encodings of the schema `bytes` are a buffer of, when the store was given them.

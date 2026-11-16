@@ -22,9 +22,11 @@ use crate::answers::{read_last, read_page, read_root};
 use crate::key::{self, Key, Kind, Name, Tool};
 use crate::record::{Finding, Locate, Part};
 use crate::request::{
-    Answer, Ask, Builder, Command, Config, DriveError, Effect, Event, FileEntry, Output, Ran, Request, Task, Ticket,
-    Want,
+    Answer, Ask, BatchId, Builder, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Outcome, Output, Ran,
+    Request, Task, Ticket, Verdict, Want,
 };
+use crate::settled::Settled;
+use crate::worker::{self, InPlace};
 
 // --- The toy checkout -------------------------------------------------------------------------
 
@@ -244,22 +246,46 @@ fn execute(world: &World, task: &Task<Global>) -> Result<Answered, Broke> {
 struct Ended {
     answer: Option<Answer>,
     error: Option<DriveError>,
-    /// Runs emitted, by kind.
+    /// Runs emitted, by kind (in-place re-entries not counted: the coordinator never saw them).
     runs: BTreeMap<Kind, u32>,
     prints: StdVec<(Name, u16, u32, u32, StdVec<u8>, Option<StdVec<u8>>, u32)>,
     last: Option<StdVec<u8>>,
+    /// Records handed back in `Done` outcomes.
+    delivered: u32,
+    /// Needs a worker answered from the settled table.
+    in_place: u32,
+    /// The program: started, stopped, and whether it is still running.
+    started: bool,
+    stopped: bool,
 }
 
-fn config(tape: &Tape) -> Config {
-    Config {
-        tool: Tool(key::digest("sim tool", b"tool")),
-        workers: 1 + u32::try_from(tape.index(4, "workers")).unwrap_or(0),
-        most_entries: 32,
-        most_jobs: 10_000,
-    }
+/// One request's setup: the workers and the command.
+#[derive(Clone, Copy)]
+struct Setup {
+    workers: u32,
+    ask: Ask<'static>,
+    plant: Plant,
 }
 
-const ASK: Ask<'static> = Ask { command: Command::Check, args: b"" };
+/// Every finding is an error in the sim: `run` fails on lints too.
+fn every_rule(_: u16) -> bool {
+    true
+}
+
+fn config(workers: u32) -> Config {
+    Config { tool: Tool(key::digest("sim tool", b"tool")), workers, most_entries: 32, most_jobs: 10_000, is_error: every_rule }
+}
+
+const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside };
+
+/// 1, 2 or 16 workers, as the tape picks.
+fn workers(tape: &Tape) -> u32 {
+    [1, 2, 16][tape.index(3, "workers")]
+}
+
+fn setup(tape: &Tape, plant: Plant) -> Setup {
+    Setup { workers: workers(tape), ask: ASK, plant }
+}
 
 /// The most events one request takes in the sim (rule 18): a toy build is far below it.
 const MOST_EVENTS: u32 = 100_000;
@@ -271,6 +297,51 @@ fn request(
     store: &mut Store,
     last: Option<&[u8]>,
     plant: Plant,
+) -> Result<Ended, Broke> {
+    request_with(tape, world, before, store, last, setup(tape, plant))
+}
+
+/// A batch as the sim's worker runs it: each task to `Done`, `Failed` or a `Need` no row of
+/// the settled table answers, re-entered in place otherwise (`worker::answer_in_place`).
+fn work(world: &World, store: &Store, table: &Settled<Global>, tasks: StdVec<(Ticket, Task<Global>)>) -> Result<(StdVec<(Ticket, Answered, u32)>, u32), Broke> {
+    let mut answered = StdVec::new();
+    let mut resolved = 0;
+    for (ticket, mut task) in tasks {
+        let mut in_place = 0;
+        loop {
+            match execute(world, &task)? {
+                Answered::Need(wants) => {
+                    let mut left: Vec<Want, Global> = Vec::new_in(Global);
+                    let before = task.inputs.len();
+                    let again = worker::answer_in_place(table, &mut task, &wants, 32, &mut left);
+                    for input in &task.inputs[before..] {
+                        // The table's promise: a row read is a record written.
+                        if !store.records.contains_key(&input.at) {
+                            return Err(Broke::Oracle(format!("a need answered before its record is written: {}", input.name)));
+                        }
+                    }
+                    if again == InPlace::Again {
+                        in_place += 1;
+                        resolved += 1;
+                        continue;
+                    }
+                    answered.push((ticket, Answered::Need(left.iter().copied().collect()), in_place));
+                }
+                done => answered.push((ticket, done, in_place)),
+            }
+            break;
+        }
+    }
+    Ok((answered, resolved))
+}
+
+fn request_with(
+    tape: &Tape,
+    world: &World,
+    before: Option<&World>,
+    store: &mut Store,
+    last: Option<&[u8]>,
+    setup: Setup,
 ) -> Result<Ended, Broke> {
     let ids: StdVec<ContentId> = (0..world.files.len()).map(|f| world.id(f)).collect();
     let paths: StdVec<StdVec<u8>> = (0..world.files.len()).map(path).collect();
@@ -286,17 +357,36 @@ fn request(
     files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", b"[package]"), changed: false, manifest: true });
     files.sort_by(|a, b| a.path.cmp(b.path));
 
-    let mut req = Request::planted_in(config(tape), ASK, plant, Global);
+    let mut req = Request::planted_in(config(setup.workers), setup.ask, setup.plant, Global);
+    let table: Settled<Global> = Settled::new_in(1 << 12, Global);
     let mut out: Vec<Effect<Global>, Global> = Vec::new_in(Global);
-    let mut ended = Ended { answer: None, error: None, runs: BTreeMap::new(), prints: StdVec::new(), last: None };
+    let mut ended = Ended {
+        answer: None,
+        error: None,
+        runs: BTreeMap::new(),
+        prints: StdVec::new(),
+        last: None,
+        delivered: 0,
+        in_place: 0,
+        started: false,
+        stopped: false,
+    };
     let mut gets: StdVec<Key> = StdVec::new();
-    let mut runs: StdVec<(Ticket, Task<Global>)> = StdVec::new();
+    let mut batches: StdVec<(BatchId, StdVec<(Ticket, Task<Global>)>)> = StdVec::new();
+    // Puts are written later, in an order the tape picks, as a store's writes complete; a
+    // `Publish` completes every put before it first (the effect's contract).
+    let mut puts: StdVec<(Key, StdVec<u8>)> = StdVec::new();
+    // The program, once started: it wants a body now and then, and exits when the tape says.
+    let mut running = false;
+    let bodies: StdVec<Name> =
+        (0..world.files.len()).flat_map(|f| (0..world.files[f].len()).map(move |i| body_name(f, i))).collect();
     let mut first = Some(Event::Start { files: &files, gone: &[], last });
     for _ in 0..MOST_EVENTS {
         let stepped = match first.take() {
             Some(event) => req.step(event, &mut out),
             None => {
-                let total = gets.len() + runs.len();
+                let program = usize::from(running) * 2;
+                let total = gets.len() + batches.len() + puts.len() + program;
                 if total == 0 {
                     return Err(Broke::Oracle(String::from("the request stalled: nothing out and no answer")));
                 }
@@ -304,29 +394,60 @@ fn request(
                 if pick < gets.len() {
                     let key = gets.swap_remove(pick);
                     store.reads += 1;
-                    let bytes = store.records.get(&key).cloned();
+                    // A get sees the store's writes in flight too: one process, one store.
+                    let bytes = store.records.get(&key).cloned().or_else(|| puts.iter().find(|(k, _)| *k == key).map(|(_, b)| b.clone()));
                     req.step(Event::Got { key, bytes: bytes.as_deref() }, &mut out)
-                } else {
-                    let (ticket, task) = runs.swap_remove(pick - gets.len());
-                    match execute(world, &task)? {
-                        Answered::Need(wants) => req.step(Event::Ran { ticket, ran: Ran::Need(&wants) }, &mut out),
-                        Answered::Done(made) => {
-                            let findings: StdVec<Finding<'_>> = made
+                } else if pick < gets.len() + puts.len() {
+                    let (key, bytes) = puts.swap_remove(pick - gets.len());
+                    store.put(key, &bytes)?;
+                    continue;
+                } else if pick < gets.len() + puts.len() + batches.len() {
+                    let (id, tasks) = batches.swap_remove(pick - gets.len() - puts.len());
+                    let (answered, resolved) = work(world, store, &table, tasks)?;
+                    ended.in_place += resolved;
+                    let mut held: StdVec<(StdVec<Finding<'_>>, &Made)> = StdVec::new();
+                    for (_, answer, _) in &answered {
+                        if let Answered::Done(made) = answer {
+                            let findings = made
                                 .findings
                                 .iter()
                                 .map(|(rule, start, end, message)| Finding { rule: *rule, start: *start, end: *end, message })
                                 .collect();
-                            let output = Output {
-                                name: made.name,
-                                out: made.out,
-                                reads: &made.reads,
-                                parts: &made.parts,
-                                findings: &findings,
-                                payload: b"",
-                            };
-                            req.step(Event::Ran { ticket, ran: Ran::Done(core::slice::from_ref(&output)) }, &mut out)
+                            held.push((findings, made));
                         }
                     }
+                    let outputs: StdVec<Output<'_>> = held
+                        .iter()
+                        .map(|(findings, made)| Output {
+                            name: made.name,
+                            out: made.out,
+                            reads: &made.reads,
+                            parts: &made.parts,
+                            findings,
+                            payload: b"",
+                        })
+                        .collect();
+                    ended.delivered += u32::try_from(outputs.len()).unwrap_or(u32::MAX);
+                    let mut at = 0;
+                    let mut results = StdVec::new();
+                    for (ticket, answer, in_place) in &answered {
+                        let ran = match answer {
+                            Answered::Need(wants) => Ran::Need(wants),
+                            Answered::Done(_) => {
+                                at += 1;
+                                Ran::Done(&outputs[at - 1..at])
+                            }
+                        };
+                        results.push(Outcome { ticket: *ticket, ran, in_place: *in_place, ns: 1_000 });
+                    }
+                    req.step(Event::Ran { batch: id, results: &results }, &mut out)
+                } else if tape.one_in(2, "the program exits") {
+                    running = false;
+                    req.step(Event::Exited { ok: true }, &mut out)
+                } else {
+                    let name = bodies[tape.index(bodies.len(), "the program wants")];
+                    let (f, _) = world.item_of(name).ok_or(Broke::Harness(format!("no item for {name}")))?;
+                    req.step(Event::Want(Want { name, home: file_name(f) }), &mut out)
                 }
             }
         };
@@ -337,13 +458,37 @@ fn request(
         for effect in out.drain(..) {
             match effect {
                 Effect::Get { key } => gets.push(key),
-                Effect::Put { key, bytes } => store.put(key, &bytes)?,
-                Effect::Run { ticket, task } => {
-                    if runs.iter().any(|(_, running)| running.key == task.key) {
-                        return Err(Broke::Oracle(format!("single flight: {} ran twice at once", task.name)));
+                Effect::Put { key, bytes } => puts.push((key, bytes.as_slice().to_vec())),
+                Effect::Publish(input) => {
+                    for (key, bytes) in puts.drain(..) {
+                        store.put(key, &bytes)?;
                     }
-                    *ended.runs.entry(task.name.kind).or_insert(0) += 1;
-                    runs.push((ticket, task));
+                    table.publish(input).map_err(|full| Broke::Harness(format!("{full}")))?;
+                }
+                Effect::Unpublish(name) => table.clear(name).map_err(|full| Broke::Harness(format!("{full}")))?,
+                Effect::StartProgram { .. } => {
+                    oracle(!ended.started, || String::from("the program started twice"))?;
+                    ended.started = true;
+                    running = true;
+                }
+                Effect::Stop { .. } => {
+                    ended.stopped = true;
+                    if running {
+                        running = false;
+                        first = Some(Event::Exited { ok: false });
+                    }
+                }
+                Effect::Run { batch } => {
+                    let mut tasks = StdVec::new();
+                    for (ticket, task) in batch.tasks.into_iter() {
+                        let out_now = batches.iter().flat_map(|(_, b)| b.iter()).chain(tasks.iter());
+                        if out_now.clone().any(|(_, running): &(Ticket, Task<Global>)| running.key == task.key) {
+                            return Err(Broke::Oracle(format!("single flight: {} ran twice at once", task.name)));
+                        }
+                        *ended.runs.entry(task.name.kind).or_insert(0) += 1;
+                        tasks.push((ticket, task));
+                    }
+                    batches.push((batch.id, tasks));
                 }
                 Effect::Print(print) => {
                     let file = print.file.map(|index| req.path(index).to_vec());
@@ -361,10 +506,24 @@ fn request(
                 Effect::Done(answer) => ended.answer = Some(answer),
             }
         }
-        if ended.answer.is_some() {
-            if !gets.is_empty() || !runs.is_empty() {
+        if let Some(answer) = ended.answer {
+            // Under `Reached` the program's exit is the verdict: work still out is abandoned.
+            let abandons = setup.ask.gate == Gate::Reached && setup.ask.command != Command::Check;
+            let unfinished = !gets.is_empty() || !batches.is_empty() || (!answer.profile.certified && ended.last.is_none());
+            if answer.verdict == Verdict::Passed && unfinished {
+                return Err(Broke::Oracle(String::from("a success reported while the check could still find an error")));
+            }
+            if (!gets.is_empty() || !batches.is_empty()) && !abandons {
                 return Err(Broke::Oracle(String::from("answered with work still out")));
             }
+            for (key, bytes) in puts.drain(..) {
+                store.put(key, &bytes)?;
+            }
+            let made: u32 = answer.profile.kinds.iter().map(|k| k.made).sum();
+            // Fewer when a run of a dropped name was answered for nothing; never more.
+            oracle(made <= ended.delivered, || {
+                format!("a batch result applied twice: {made} records made from {} delivered", ended.delivered)
+            })?;
             return Ok(ended);
         }
     }
@@ -567,4 +726,67 @@ fn a_missing_record_of_a_textless_crate_is_the_typed_error() {
             other => Err(Broke::Oracle(format!("a missing dependency record ended as {other:?}"))),
         }
     });
+}
+
+// --- Many workers -----------------------------------------------------------------------------
+
+#[test]
+fn one_two_and_sixteen_workers_write_equal_bytes() {
+    check(SimConfig::cases(200), |tape| {
+        let world = World::draw(tape);
+        let mut answers = StdVec::new();
+        for workers in [1, 2, 16] {
+            let mut store = Store::default();
+            let setup = Setup { workers, ask: ASK, plant: Plant::None };
+            let (_, ended) = finished(request_with(tape, &world, None, &mut store, None, setup)?)?;
+            answers.push((store.records, ended.prints));
+        }
+        oracle(answers[0] == answers[1] && answers[1] == answers[2], || {
+            String::from("1, 2 and 16 workers wrote other records or printed other findings")
+        })
+    });
+}
+
+#[test]
+fn control_a_batch_applied_twice_is_caught() {
+    control(SimConfig::cases(2000), Plant::None, Plant::BatchTwice, "a batch result applied twice", flights);
+}
+
+#[test]
+fn control_a_need_answered_before_its_record_is_written_is_caught() {
+    control(SimConfig::cases(4000), Plant::None, Plant::PublishBeforePut, "a need answered before its record is written", edits);
+}
+
+// --- The gate ---------------------------------------------------------------------------------
+
+/// `run` under `Beside` or `Before`: no success while an error exists or could still be found.
+fn gates(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let world = World::draw(tape);
+    let gate = [Gate::Beside, Gate::Before][tape.index(2, "gate")];
+    let mut store = Store::default();
+    let setup = Setup { workers: workers(tape), ask: Ask { command: Command::Run, args: b"", gate }, plant };
+    let (answer, ended) = finished(request_with(tape, &world, None, &mut store, None, setup)?)?;
+    let (_, checked) = fresh(tape, &world)?;
+    let errors = checked.prints.len();
+    match answer.verdict {
+        Verdict::Passed | Verdict::ProgramFailed => {
+            oracle(errors == 0, || format!("a {:?} verdict over {errors} errors", answer.verdict))
+        }
+        Verdict::Failed { started, .. } => {
+            oracle(errors > 0, || String::from("a failed verdict with no error"))?;
+            oracle(gate == Gate::Beside || !started, || String::from("`Before` started a program over errors"))?;
+            oracle(started == ended.started, || String::from("the verdict's `started` is not what happened"))
+        }
+        other => Err(Broke::Oracle(format!("`run` answered {other:?}"))),
+    }
+}
+
+#[test]
+fn no_success_is_reported_while_an_error_could_be_found() {
+    check(SimConfig::cases(300), |tape| gates(tape, Plant::None));
+}
+
+#[test]
+fn control_a_success_before_the_gate_is_done_is_caught() {
+    control(SimConfig::cases(2000), Plant::None, Plant::EarlySuccess, "could still find an error", gates);
 }

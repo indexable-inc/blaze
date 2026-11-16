@@ -19,8 +19,9 @@ use super::{
     Bytes, CORRUPT, ColdDictionary, MOST_RAW, compress, decode_raw, decompress, put_packed,
     raw_cold,
 };
-use crate::{
-    ALIGN, Aligned, FormatError, Record, SchemaHash, WordTable, bytes_of_slice, leb, open_as,
+use blaze_format::{
+    ALIGN, Aligned, FormatError, Record, SchemaHash, Verified, WordTable, bytes_of_slice, leb,
+    open_as,
 };
 
 const FORM_VERSION: u8 = 2;
@@ -49,7 +50,7 @@ pub fn columns_of<R: Record>(
     let root = open_as::<R>(buffer, schema)?;
     // alloc: the columns of a buffer moved to a tier, once a buffer
     let mut found = Vec::new();
-    R::columns(bytes_of_slice(core::slice::from_ref(root)), buffer, &mut found);
+    R::columns(bytes_of_slice(core::slice::from_ref(Verified::get(root))), buffer, &mut found);
     Ok(merged(found))
 }
 
@@ -216,7 +217,7 @@ pub struct BufferColumns {
 }
 
 impl BufferColumns {
-    /// The forms of buffers of `schema` whose root is an `R`: a [`crate::Persist`] type's
+    /// The forms of buffers of `schema` whose root is an `R`: a [`blaze_format::Persist`] type's
     /// schema and the root record its `write` finishes with.
     pub fn of<R: Record>(schema: SchemaHash) -> BufferColumns {
         BufferColumns { schema, find: columns_of::<R>, dictionary: None }

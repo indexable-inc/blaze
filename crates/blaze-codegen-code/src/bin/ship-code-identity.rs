@@ -6,7 +6,12 @@
 //! .github/scripts/publish_crates.py. One JSON value in (AGENTS.md rule 41); a failure names the
 //! file and the identity, and exits 1.
 
-use std::path::{Path, PathBuf};
+#![feature(allocator_api)]
+
+use std::{
+    alloc::Global,
+    path::{Path, PathBuf},
+};
 
 use blaze_codegen_code::{IDENTITIES, Workspace, ship};
 
@@ -19,11 +24,11 @@ struct Request {
 }
 
 fn request(text: &str) -> Result<Request, String> {
-    let value: serde_json::Value = serde_json::from_str(text)
+    let value = blaze_json::read_in(text.as_bytes(), blaze_json::Limits::DEFAULT, Global)
         .map_err(|why| format!("the request `{text}` is no JSON: {why}"))?;
     let object =
-        value.as_object().ok_or_else(|| format!("the request `{text}` is no JSON object"))?;
-    if let Some(unknown) = object.keys().find(|it| !matches!(it.as_str(), "program" | "into")) {
+        value.as_map().ok_or_else(|| format!("the request `{text}` is no JSON object"))?;
+    if let Some((unknown, _)) = object.iter().find(|(it, _)| !matches!(*it, "program" | "into")) {
         return Err(format!(
             "the request has the field `{unknown}`, and takes only `program` and `into`"
         ));
@@ -31,7 +36,7 @@ fn request(text: &str) -> Result<Request, String> {
     let path = |name: &str| {
         object
             .get(name)
-            .and_then(serde_json::Value::as_str)
+            .and_then(|it| it.as_str())
             .map(PathBuf::from)
             .ok_or_else(|| format!("the request has no string `{name}`"))
     };

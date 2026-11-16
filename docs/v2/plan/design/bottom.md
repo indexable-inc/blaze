@@ -362,6 +362,33 @@ that are fast"; "everything in JIT world". The commands are `run`, `test`, `chec
   the shared cache, so only the diff is checked. `--reached` is the opt-out for the middle of
   a refactor (check only what runs), and it says so in its verdict. The plain alternative,
   one flag away, is to finish the check before the program starts.
+- **One check covers every configuration** (Andrew, 2026-11-15 20:49: "check will test all
+  possible configurations combinations ... instead of having to run multiple times for
+  different targets"). A configuration is a target (which fixes every `target_*` value), a
+  set of features per package (any set closed under the manifest's feature dependencies),
+  and the build's switches (`test`, `debug_assertions`, `--cfg` flags). The design already
+  holds what this needs: the outline keeps `#[cfg]` as an attribute instead of deciding it,
+  an item's key holds no cfg, and every record's read list names the cfg outcomes it read.
+  So the mechanism is the driver's ask-and-re-enter with one more kind of need
+  (the coordinator's, to be built): a task runs under a *condition*, a partial assignment of
+  cfg atoms, starting from "anything the request allows"; when it reads an atom its
+  condition does not fix, it returns `Need(Cfg(atom))` and the driver re-enters it once per
+  outcome the request still allows, each under the narrower condition; its record is stored
+  with the condition it actually read, and a lookup takes a record whose condition the
+  asker's implies. An item that reads no cfg is checked once for every configuration; one
+  that reads two atoms is checked at most four times; the cost of N configurations is one
+  check plus the differences, not N checks. A finding carries its condition, reduced to the
+  atoms that matter: "when feature `x` is off on windows". Bounds and holes, stated:
+  (1) atoms of one variable are one choice (`target_os` has one value), so targets multiply
+  by their count, not by two per atom; the targets are a list the workspace declares
+  (default: the three hosts in scope); (2) an item whose reads would fork past a cap
+  (64 conditions) is a typed finding naming the item and its atoms, never a silent sample;
+  (3) a build script can set cfgs, so it runs per target and its outputs are reads;
+  (4) another target's `std` is needed as records, from the shared cache; (5) layout
+  differs by target, so constant evaluation that reads a size reads the target; (6) this is
+  a check: code is made and tests run only for the host. `blaze run`'s gate covers the
+  configuration being run by default and every configuration with `check`; whether the gate
+  should cover all is open.
 - **`blaze export`** (later) writes one native executable (Mach-O, ELF): every function the
   program reaches, at the optimized tier, no stubs, laid out as the launcher lays them out,
   written once, whole. Not incremental; keeps nothing. Until built, the command says it is not.

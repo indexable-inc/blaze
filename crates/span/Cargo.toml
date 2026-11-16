@@ -13,7 +13,7 @@ authors.workspace = true
 [dependencies]
 blaze-hash.workspace = true
 blaze-memo.workspace = true
-text-size.workspace = true
+blaze-text-size.workspace = true
 unicode-width.workspace = true
 
 # local deps

@@ -17,6 +17,7 @@ doctest = false
 blaze-bytes.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
+blaze-format-tiers.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true

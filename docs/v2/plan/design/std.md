@@ -448,7 +448,7 @@ layout they compile under: same outputs, same order of cancellation, drops and p
 | layout | a task is | a wait |
 |---|---|---|
 | `Inline` | run to completion at `spawn` | nothing else runs; no runtime at all |
-| `Threads` | a pool thread | blocks the thread |
+| `Threads` | a job on a worker of a thread-per-core pool, stolen only before it starts | blocks the worker's thread |
 | `Fibers` | its own stack (the scheduler of section 6) | switches stacks |
 | `Frames` | a bump slab holding the frames of its functions that can wait, each made on call and freed on return; code that cannot wait runs on the worker's stack | returns to the scheduler |
 
@@ -478,7 +478,152 @@ types; the build configuration says which layout they are, as it says which IO d
 gets. Functions are compiled once, and no signature carries a type parameter for it. (The
 alternative, `cx: &impl Tasks` with functions that wait monomorphized over the layout type, lets
 two layouts live in one binary at the price of a generic on every waiting signature and two
-copies of the code. The differential test below builds twice instead.)
+copies of the code. The differential test below builds twice instead.) In the plain form the
+choice is a value of the root context instead: `Io::cx` gives an `Inline` root (the
+simulation's, every test's), and the entry (`bstd::entry::run`) starts a `Threads` pool over
+the machine's topology and gives `main` a root on it. One binary can hold both, so the tests
+compare them in one run; the type that says which is `Layout`, and the bound every spawn takes
+is the strictest layout's (`Send`, below), so code that compiles for one compiles for all.
+
+### `Threads`: the runtime of every bstd program
+
+`Threads` is not a test executor: it is what every bstd program runs on, the compiler's driver
+included, and it is built for a 128-core EPYC or Graviton first and a Mac with performance and
+efficiency cores second, with one code path sized by the machine (crates/blaze-std/src/task/
+threads.rs, its deque in task/deque.rs, its idle protocol in task/idle.rs, the machine's side in
+rt.rs). Each point below says whether it is built (**built**) or designed only (**designed**).
+
+1. **Thread-per-core; only unstarted tasks move** (**built**). A started task never changes
+   thread (above), so stealing takes only tasks that have not begun, and everything a running
+   task touches is its worker's alone: its frame (reserved by the spawner, first touched by the
+   worker, so a pinned worker's pages land on its node), its lock-order token and its placement
+   (`Placed`, an `Rc` made on the worker). A running task takes no atomic of the pool's: the
+   pool's atomics are on the paths between tasks (take, spawn, finish). Its timers, IO ring and
+   trace producer are worker-local in the design (point 7) but not yet: they are the world's,
+   behind its one lock (**designed**).
+2. **Queues** (**built**). Each worker has a fixed ring of 256 tasks, a Chase-Lev deque: the
+   owner pushes and pops at the bottom with no lock and no read-modify-write except on the last
+   task, thieves take from the top with one compare-and-swap each. Beside it a one-task LIFO
+   slot holds the task just spawned (the cache-hot one, run next); a spawn into a full slot moves
+   the slot's task to the deque, so a ping-pong pair stays in the slot and cannot starve the
+   deque, because the slot is taken at most `LIFO_RUN` (3) times in a row before the deque is
+   looked at. Tasks spawned from outside the pool (the entry's thread) go to a bounded injection
+   queue per worker group (1,024 tasks), foreground and background apart: never one global
+   queue. The orderings: the owner's push writes the slot then stores `bottom` with `Release`;
+   a thief loads `top` with `Acquire`, then (after a `SeqCst` fence) `bottom` with `Acquire`, reads the
+   slot and claims it with a `SeqCst` compare-and-swap of `top`, so the slot it read was written
+   before the `bottom` it saw and no other thief or the owner took it; the owner's pop stores
+   `bottom - 1`, then a `SeqCst` fence orders that store before its load of `top` (the store and
+   the thief's load of `bottom` are the two sides of a Dekker pair), and only when one task is
+   left does it race the thieves with the same compare-and-swap. The deque is checked by
+   crates/blaze-check under `cfg(blaze_check)` (`task/deque.rs`), with a planted steal that does
+   not re-check the top that the model must catch.
+3. **Topology is a value** (**built**). `Topology` is a list of groups, each the workers that
+   share a last-level cache, with their level (performance, efficiency, or uniform) and, where
+   the system pins, their CPUs (rule nothing-ambient: the pool reads no machine fact). The entry
+   reads it in `rt.rs`: on Linux from `/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`
+   (an EPYC's eight cores a CCX; a machine that lists no level-3 cache, as one Graviton node, is
+   one group); on macOS from `hw.nperflevels` and `hw.perflevel{N}.logicalcpu` and
+   `.cpusperl2` (a Mac's clusters). A thief tries its own group, from its neighbour on, then the
+   other groups; a steal takes half the victim's tasks in one go (one claim each, so each is the
+   proven single steal), the first run at once and the rest put in the thief's own deque.
+4. **Idle and wake** (**built**). An idle worker spins `SPIN_ROUNDS` (64) looks at the queues,
+   then parks through bstd's one kernel wait (`blaze_core::wait::Parker`: the futex on Linux,
+   `os_sync_wait_on_address_with_deadline` on macOS) with a deadline (one second, then it looks
+   again: rule deadline-waits). A spawn wakes at most one worker, and only when no worker is
+   already searching: the count of searching workers is Go's and Tokio's guard against a
+   thundering herd, and a searcher that finds work and was the last searcher wakes one more, so
+   a burst fans out one worker at a time. At most half the workers search at once. The
+   orderings (`task/idle.rs`): a worker going to sleep stores its state `Parked` and leaves
+   the search (`SeqCst`), then a `SeqCst` fence, then looks at every queue once more; a spawner
+   publishes its task (the deque's `Release`, or the injection queue's lock), then a `SeqCst`
+   fence, then reads the searching count and the states. Of the two fences one is first in the
+   single order, so either the sleeper sees the task or the spawner sees the sleeper: no wake is
+   lost. The wake itself is a compare-and-swap of the sleeper's state `Parked -> Searching` and an
+   unpark (a token: an unpark before the park makes the park return). A blaze-check model runs
+   this protocol on the shims with a planted wake that skips the fence.
+5. **Placement** (**built**). On Linux each worker is pinned to its CPU (`sched_setaffinity`),
+   so first touch keeps its frame on its node. macOS has no affinity: each worker sets a QoS
+   class instead (`pthread_set_qos_class_self_np`, rule macos-private-apis: a public but
+   Darwin-only call, tested to exist): workers of the performance level at user-initiated,
+   those of the efficiency level at utility, so the system keeps them on their cores. A scope
+   narrowed to `Class::Background` (`Scope::narrow_workers(most, class)`) sends its tasks only to
+   the groups' background queues, which a foreground worker takes from only when no foreground
+   task is queued anywhere it looks, and an efficiency worker takes from first.
+6. **Fine-grain loops** (**designed**). Today a `par` call makes one task per chunk at the
+   caller's grain. The design is lazy splitting: a parallel range runs serially on its worker
+   and offers its remaining half as a task only when the worker's deque is empty or a heartbeat
+   passes (100 microseconds on the worker's clock, read every few thousand items). With a
+   heartbeat `H` and a task's creation cost `c` (a frame reserve and one deque push, about a
+   microsecond), the overhead against serial is at most `c / H`, 1% at those numbers, however
+   fine the items are, and a range splits only as fast as idle workers can take it.
+7. **IO per worker** (**designed**). Each worker owns its driver: an io_uring on Linux, a kqueue
+   on macOS. A task's effects are submitted in one batch at the end of its turn (its next wait),
+   and a completion wakes only tasks of that worker, so IO a task started never crosses a core.
+   Today one `Io` holds one driver behind the world's lock (crates/blaze-std/src/io.rs, `World`),
+   and a wait polls it under that lock: IO waits of different workers are serialized. What
+   blaze-core must change: `Uring` and `Kqueue` must be made one per thread from shared roots
+   (the file table and the root directory handle shared read-only, the request slots and wheel
+   per ring), a ring's poll must be callable without a lock other workers take, a completion
+   must name its ring, and `Uring`'s off-ring errands (listings, the kqueue's file threads) must
+   hand back to the ring that asked, by its eventfd or `EVFILT_USER`. bstd then keeps one
+   driver per worker in the worker's state and `Cx::wait` polls its own.
+8. **Backpressure by construction** (the rule; **built** for the pool's queues). Every queue
+   between workers is bounded and holds flat values or task handles of fixed size: the deque
+   (256), the LIFO slot (1), the injection queues (1,024 each), `chan` (its capacity). A full
+   queue never grows: a spawn into a full deque runs the task inline, at its spawn (correct for
+   `may_overlap` by its contract); a full channel makes its sender wait under its deadline. The
+   reason: a producer that outruns its consumer, or a link when the consumer is another machine,
+   must be slowed where it produces, since memory that grows to absorb the difference is only a
+   later and less legible failure (rules bounded-progress and one-memory-measure), and a flow
+   larger than any link carries can only be paced, never buffered.
+9. **No false sharing** (**built**). Each worker's state, and each counter the workers write
+   (searching, parked, the injection queues), is padded to a cache line: `LINE` is 128 bytes on
+   Apple silicon and 64 elsewhere, one `const` a target, asserted against the padding type's
+   alignment.
+10. **The simulation stays the reference** (**built** in part). Every decision the pool makes
+    (which queue, which victim, whom to wake) is a function of the pool's state and the
+    worker's index, never of a clock or a random draw, so a schedule is replayable from the
+    order of events; the simulation executor is `Inline`, against which the tests compare
+    `Threads` at 1, 2 and 8 workers. The deque and the idle protocol are model-checked; the
+    task cell's claim (a task run by its worker or by its joiner, never both) is a compare-and-
+    swap stated in its `SAFETY` and exercised by the stress test, not yet model-checked.
+
+**What a spawn does under `Threads`.** `may_overlap` reserves the task's frame on the spawner,
+records the task's opening in the trace, makes the `Seed` of its context and one task cell (one
+allocation, `blaze_own::Arc` in `Global`), and pushes it onto the spawner's LIFO slot (on a
+worker) or its group's injection queue (outside). When the scope already has `workers - 1`
+tasks outstanding, or the queue is full, the task runs inline instead: never a block, never a
+drop. `Task::join` that finds its task unstarted claims it and runs it on the joiner's thread
+(correct for `may_overlap`: it runs later than its spawn, with its spawner paused); one that
+finds it running parks on its scope's `Parker` until the worker unparks it. `must_overlap`
+reserves a worker that is searching or parked (a compare-and-swap of its state to `Reserved`) and
+hands it the task through its mailbox, which that worker runs before anything else; when the
+scope's budget has one worker, or no worker is idle, it is the typed `NoParallelism`, at once.
+
+**A `Seed`: what of a context crosses threads.** `Cx` is not `Send`: its frame is a bump
+allocator with no lock, its placement and lock-order token are one task's on one thread. A
+`Seed` (cx.rs) carries what may cross: the deadline, the scope's cancellation (an `Arc` of an
+atomic flag and its outer chain), the task's name and its parent's, the frame (reserved, never
+touched by the spawner afterwards; `Frame` is `Send`), the world (`Io` is `Send` and `Sync`),
+the plant, the pool and the scope's class. The worker grows it into the task's `Cx` on its own
+thread, with a placement made there. A task's closure and its result are `Send` (rustc's bound
+on both spawns, in every layout, so code that compiles under `Inline` compiles under `Threads`);
+the closure's error is turned into the task's message on the thread that ran it.
+
+**What stays single-threaded, and why.** A scope and its task handles (they hold the scope's
+context and are joined by the thread that made them, which parks on the scope's one `Parker`);
+the world's driver (point 7); the order of a scope's failures (its first failure is the one of
+the lowest spawn index, so it is the one `Inline` reports, whatever finished first).
+
+**Ending.** A scope returns only once each of its tasks has ended, since they may borrow from
+its frame: its join waits until its context's deadline, then cancels and waits
+`Limits::abandon_wait` more, and a task still running then is a hang, which stops the process
+with a message naming the scope and the task (rule every-command-has-a-timeout: a hang is a bug
+to report, and returning would free what the task borrows). A panic in a task fails that task
+with `TaskWhy::Panicked` and the worker goes on. The entry's end stops the pool: every worker is
+told to stop and is joined by a deadline, and a worker that has not stopped by it is reported by
+name with the task it runs (`Hung`), and the program exits failed.
 
 ### What the compiler checks
 
@@ -491,10 +636,8 @@ copies of the code. The differential test below builds twice instead.)
   `no-fallback`): for one, a foreign (C) frame live across a wait.
 - `must_overlap` under a layout with one worker (`Inline`) is an error; until blaze checks it,
   it is the run-time `NoParallelism`, returned before the task runs.
-- A layout with more than one worker runs a `must_overlap` task beside its spawner. None is
-  built: a task's `Cx` is made on its spawner's thread and is not `Send`, so a `Threads`
-  layout first needs a `Send` seed of a task's context (its deadline, cancellation, plant and
-  world) from which the worker makes the `Cx` and frame on its own thread.
+- A layout with more than one worker runs a `must_overlap` task beside its spawner: `Threads`
+  does, on a reserved worker, from the `Seed` of the task's context (above).
 - A task cannot outlive its scope: the lifetime on the child's `cx` enforces it.
 - In ordinary crates, where thread-locals still exist, their address is reloaded after any call
   that may wait.
@@ -608,6 +751,16 @@ does not need the workarounds.
 - **On a panic** the value's abandonment path runs instead (roll back, cancel and wait, close
   without syncing), as [linear](linear.md) says; that is the one place a destructor of these types
   runs.
+- **Under rustc**, which has no linear types, each must-finish type holds a guard
+  (`crate::unfinished::Unfinished`) that its finishing calls disarm. In a debug build dropping
+  one unfinished stops the program, naming the type, the call that made it (`#[track_caller]`
+  back to the program's line) and how it is finished, unless the thread is already unwinding. A
+  release build of rustc's keeps no guard: an unfinished value there still runs its abandonment
+  path silently, losing what it held, and only blaze's build refuses it. The guarded types:
+  `Pending`, `local::End`, `term::RawMode`, `net::Listener`, `net::Conn`, `streams::Stream`,
+  `task::Scope`, `task::Task`, `power::Awake`, `requests::Exchange`, `fs::Buffered` and
+  `fs::File<ReadWrite>` (through its `ReadWrite`). `own::Shares` is linear but unguarded: a
+  dropped share leaks its value's memory and loses no data.
 - **bstd's containers say whether they admit linear elements.** `Vec`, `Option`, `Result` and
   the maps do (and are then linear themselves). `Shared` and `LocalShared` do when the value's
   type is `Acyclic`, which is derived from its shape, so no cycle can leak one
@@ -1347,7 +1500,7 @@ Lints the second rule implies:
 | `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here. Not built with `default_policy` because the lints read no effect summary yet (`instance_effects` is the MIR walk's, with no query the lint pass can ask per function), and the `Sync` and `Write` kinds are not rows of `effect_attrs::ROWS` |
 | `blaze::default_policy` | `impl Default`, `#[derive(Default)]`, or a `new()` with no arguments, for a type with a field marked `#[blaze::policy]` (a cost or a guarantee) | yes: `crates/blaze-lints/src/blaze/default_policy.rs`, on in bstd; `Limits`, `SimWorld::limits`, `Wire` and `MemoLimit` are marked |
 | `.clippy.toml` bans of the removed names (`Dir::write`, `File::sync`, `File::replace`, `Conn::send`, `End::write`) | a use of one, by resolution | no: the names are gone from bstd, so the ban is for crates that move onto it (S3) |
-| `Flat` (`where const { is_flat::<T>() }`; plain: the `const` assertion in `chan::bounded`) | a flat channel of a type with an address or drop glue in it, naming the field path built by blaze | yes: the walk's answers in `src/tests/flat.rs`; the refused channel is a `compile_fail` example in `flat.rs`, which runs once bstd's doc tests do (`doctest = false` in its manifest today) |
+| `Flat` (`where const { is_flat::<T>() }`; plain: the `const` assertion in `chan::bounded`) | a flat channel of a type with an address or drop glue in it, naming the field path built by blaze | yes: the walk's answers in `src/tests/flat.rs`; the refused channel, by an address and by drop glue, is compiled by `tests/refusals.rs` |
 | compile-fail fixtures for bstd | `written.clone_to(..)`; a `Buffered` dropped; a write through a handle narrowed to read-only; a call of a removed name (`Dir::write`) | yes: `bstd_the_wrong_call_does_not_compile` in `crates/blaze-engine/tests/repro.rs` runs `blaze check` on each file of `crates/blaze-engine/tests/repro/bstd_the_wrong_call_does_not_compile/wrong`, beside a control that checks |
 
 **`blaze::implicit_policy`**, for crates on the trusted list that are libraries (bstd first).

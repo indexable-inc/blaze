@@ -2152,8 +2152,8 @@ fn scrubbing(seed: u64, segments: u32, cut_after: Option<u32>, plant: Plant) -> 
     // The last record in index order with a payload: a pass that stops after its first slice
     // never reaches it.
     let (row, bytes) = w[0].store.segment(rotted).expect("named");
-    let run = row.run(bytes.expect("mapped here"));
-    let target = (0..row.count as usize).rev().map(|i| Entry::read(&run[i * ENTRY..(i + 1) * ENTRY])).find(|it| it.len > 0).expect("a record with a payload");
+    let index = row.run(bytes.expect("mapped here"));
+    let target = (0..row.count as usize).rev().map(|i| Entry::read(&index[i * ENTRY..(i + 1) * ENTRY])).find(|it| it.len > 0).expect("a record with a payload");
     let bad = keys_of[&rotted].clone().find(|&n| key(n).0 == target.key).expect("the record's key");
     drop(w);
     sim.crash();
@@ -2222,7 +2222,7 @@ fn scrubbing(seed: u64, segments: u32, cut_after: Option<u32>, plant: Plant) -> 
     if !lost_by_name {
         return Err(format!("the rot in record {bad} of segment {rotted:016x} was never found and lost by name"));
     }
-    if last.store.get(&key(bad)).is_some() {
+    if last[0].store.get(&key(bad)).is_some() {
         return Err(format!("record {bad} of the retired segment {rotted:016x} is still served"));
     }
     drop(last);

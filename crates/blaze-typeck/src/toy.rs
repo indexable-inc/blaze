@@ -92,6 +92,18 @@ impl ToyCtx {
         self.pending.len()
     }
 
+    /// Undoes the variable table's writes made since `mark` (an undo log length), newest
+    /// first: each binding made since is cleared and each rank raised since is restored.
+    fn undo_to(&mut self, mark: usize) {
+        while self.undo.len() > mark {
+            match self.undo.pop() {
+                Some(Undo::Bound(i)) => self.vals[i as usize] = None,
+                Some(Undo::Rank(i, r)) => self.rank[i as usize] = r,
+                None => {}
+            }
+        }
+    }
+
     fn bind(&mut self, v: Var, t: Ty) {
         self.vals[v.index as usize] = Some(t);
         self.undo.push(Undo::Bound(v.index));
@@ -509,16 +521,6 @@ impl TypeCtx for ToyCtx {
             self.undo_to(mark);
         }
         Ok(ok)
-    }
-
-    fn undo_to(&mut self, mark: usize) {
-        while self.undo.len() > mark {
-            match self.undo.pop() {
-                Some(Undo::Bound(i)) => self.vals[i as usize] = None,
-                Some(Undo::Rank(i, r)) => self.rank[i as usize] = r,
-                None => {}
-            }
-        }
     }
 
     fn snapshot(&mut self) -> Snap {

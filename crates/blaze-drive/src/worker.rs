@@ -48,8 +48,10 @@ pub fn answer_in_place<A: Allocator, B: Allocator, C: Allocator>(
     }
     if left.is_empty() && task.entry + 1 < most_entries {
         task.entry += 1;
-        InPlace::Again
-    } else {
-        InPlace::Coordinator
+        return InPlace::Again;
     }
+    // Every want goes, the answered ones too: the coordinator's next entry hands them all.
+    left.clear();
+    left.extend_from_slice(wants);
+    InPlace::Coordinator
 }

@@ -51,6 +51,7 @@ span.workspace = true
 thin-vec.workspace = true
 syntax-bridge.workspace = true
 blaze-format.workspace = true
+blaze-format-tiers.workspace = true
 blaze-dbsp.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true

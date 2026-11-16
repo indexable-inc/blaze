@@ -44,7 +44,8 @@
 // No unsafe code at all: the rings' payload words are atomics too (watch.md, "The emitter").
 #![forbid(unsafe_code)]
 
-pub mod cbor;
+/// blaze's one deterministic CBOR, by the name every module here uses.
+pub use blaze_cbor as cbor;
 pub mod conn;
 pub mod feed;
 pub mod frame;

@@ -22,8 +22,9 @@
 //! The one `unsafe` of bstd is in this file: the two views of a cell's value through its
 //! token, and the `Sync` of a cell.
 //!
-//! Two live `get_mut` through one token are refused as the crate compiles (E0499). Kept here
-//! as a fixture: bstd builds with `doctest = false`, so it is not run.
+//! Two live `get_mut` through one token are refused as the crate compiles (E0499). bstd builds
+//! with `doctest = false`, so this example is compiled as `refusals/token_two_borrows.rs`, by
+//! `tests/refusals.rs`.
 //!
 //! ```compile_fail,E0499
 //! use bstd::cell::{Token, TokenCell};
