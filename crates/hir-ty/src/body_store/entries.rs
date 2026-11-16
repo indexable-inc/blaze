@@ -1037,8 +1037,9 @@ pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
             .filter(|((_, step, _), _)| step.served())
             .map(|(key, ran)| (*key, Arc::clone(ran)))
             .collect();
-        // alloc: the traces of superseded makings this claim drops, a counted reference each
-        let mut superseded: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Traced>)> = Vec::new();
+        // The traces of superseded makings this claim drops, a counted reference each.
+        let mut superseded: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Traced>), std::alloc::Global> =
+            Vec::new_in(std::alloc::Global);
         let mut elsewhere = 0;
         let mut posted = store.served.lock();
         let (mut steps, mut refused, mut marks) = (Vec::new(), Vec::new(), Vec::new());

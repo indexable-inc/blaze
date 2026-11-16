@@ -74,7 +74,7 @@ blaze-lower	147	0	87	64
 blaze-macro-eval	269	0	6	87
 blaze-manifest	9	0	50	136
 blaze-mem	31	0	0	5
-blaze-memo	0	0	63	6
+blaze-memo	0	0	69	6
 blaze-memo-macros	56	0	5	5
 blaze-metadata	0	0	17	21
 blaze-mutants	0	0	113	15
@@ -151,7 +151,7 @@ hir-def	789	0	247	305
 hir-expand	157	0	14	45
 hir-firewall	2	0	22	11
 hir-lint-levels	12	0	2	2
-hir-ty	729	0	101	257
+hir-ty	729	0	103	257
 hir-ty-borrowck	52	0	7	9
 hir-ty-charon	116	0	8	19
 hir-ty-codegen	1648	0	260	692
