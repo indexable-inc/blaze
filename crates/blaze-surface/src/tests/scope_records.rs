@@ -64,7 +64,8 @@ pub(super) fn bindings(tape: &Tape) -> StdVec<ScopeEntry<&'static str>, Global> 
         }
     }
     let turn = usize::try_from(tape.below(u64::try_from(out.len() + 1).expect("few"), "turn")).expect("few");
-    out.rotate_left(turn.min(out.len()));
+    let len = out.len();
+    out.rotate_left(turn.min(len));
     out
 }
 

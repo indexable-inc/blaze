@@ -104,6 +104,27 @@ pub(crate) fn base64url(bytes: &[u8]) -> String {
     out
 }
 
+/// blaze-run's wire forms as run.md lays them out: the entry's fields at their offsets, and the
+/// toggle's CBOR byte for byte.
+#[test]
+fn blaze_runs_wire_forms_keep_their_layout() {
+    use crate::run_wire::{ENTRY_LEN, Entry, RunName, toggle};
+    let entry = Entry { name: RunName { pid: 0x0102_0304, start: 5 }, checkout: [6; 32], program: [7; 32], began: 8 };
+    let bytes = entry.encode();
+    assert_eq!(ENTRY_LEN, 88);
+    assert_eq!(bytes[..4], 1u32.to_le_bytes());
+    assert_eq!(bytes[4..8], 0x0102_0304u32.to_le_bytes());
+    assert_eq!(bytes[8..16], 5u64.to_le_bytes());
+    assert_eq!(bytes[16..48], [6; 32]);
+    assert_eq!(bytes[48..80], [7; 32]);
+    assert_eq!(bytes[80..88], 8u64.to_le_bytes());
+    assert_eq!(Entry::decode(&bytes), Ok(entry));
+    let mut out = blaze_own::Vec::new_in(std::alloc::Global);
+    toggle(&[3, 300], 5, true, &mut out);
+    // [1, 0, 5, true, [3, 300]]
+    assert_eq!(out[..], [0x85, 0x01, 0x00, 0x05, 0xf5, 0x82, 0x03, 0x19, 0x01, 0x2c]);
+}
+
 #[test]
 fn a_key_survives_base64url() {
     blaze_sim::check(blaze_sim::Config::cases(500), |tape| {

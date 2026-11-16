@@ -173,8 +173,19 @@ run-side index; the drive's readers column is the store form of it.
   it is not the floor above and is not measured against it.
 - **Sweep lanes.** blaze-solo's sweep takes `Config::lanes`, the number of file threads. It is sized
   from the machine's worker count, the same number as `Config::workers`.
-- **Units.** A small reader of `[package] name`, `edition` and the default targets; anything else
-  in a manifest is refused by line (blaze-manifest is std and third-party).
+- **Units.** A small reader of `[package] edition` and the default targets (`src/lib.rs`,
+  `src/main.rs`, `src/bin/*.rs`). It refuses by line any table other than package, profile and
+  lints, and any dependency or build script (blaze-manifest is std and third-party). Gap: target
+  discovery reads the file list, and the units' source holds only the manifests. So a crate root
+  added without a manifest edit is outside the build until the manifest changes. The fix is the
+  key: the root candidates' presence goes into the units' source.
+- **Tasks today** (`work.rs`): `Units`, and `FileItems` (blaze-file-items' outline). A file's
+  record is its `FileItems` record bytes, each `mod x;` is a `Locate::File` part (`x.rs` by
+  rustc's rule; `x/mod.rs` and `#[path]` are not looked for yet), and each syntax error is a
+  finding. No item part is listed until blaze-typeck's `Signature` and `BodyCheck` tasks exist.
+  So `blaze check` today is a syntax check of every file the crate roots reach. Every other kind
+  answers `Failed`, naming itself. Runs go one at a time on the cli's thread; the pool over
+  `workers` is the next piece.
 - **Printing.** `file:line:col` from the file's line table at print time (`lines.rs`).
 - **Profile.** Per kind: standing, found, made, fetched, entries, time; gets, hits, puts, pages;
   the store's segments sealed and checked whole at open.

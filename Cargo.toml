@@ -34,8 +34,6 @@ exclude = [
     "crates/blaze-tree",
     "crates/blaze-units",
     "crates/blaze-usercode",
-    "crates/hir-def",
-    "crates/hir-expand",
     "crates/hir-lint-levels",
     "crates/hir-ty",
     "crates/hir-ty-borrowck",

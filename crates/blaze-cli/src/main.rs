@@ -100,7 +100,7 @@ fn env_version() -> &'static str {
 fn main(cx: &Cx, io: Io) -> Result<(), Error> {
     let out = io.need_out()?;
     let err = io.need_err()?;
-    match command(cx, &io, &out) {
+    match command(cx, &io, &out, &err) {
         Ok(()) => Ok(()),
         Err(error) => {
             err.line(cx, &error)?;
@@ -109,7 +109,7 @@ fn main(cx: &Cx, io: Io) -> Result<(), Error> {
     }
 }
 
-fn command(cx: &Cx, io: &Io, out: &Out) -> Result<(), CliError> {
+fn command(cx: &Cx, io: &Io, out: &Out, err: &Out) -> Result<(), CliError> {
     let args = io.need_args()?;
     let command = match args.get(1) {
         Some("check") => Command::Check,
@@ -126,6 +126,17 @@ fn command(cx: &Cx, io: &Io, out: &Out) -> Result<(), CliError> {
     let frame = cx.frame();
     let answer = request(cx, &root, command, u32::try_from(workers).unwrap_or(u32::MAX), frame, out)?;
     print::profile(cx, &root, &answer, frame)?;
+    let p = &answer.profile;
+    err.line(
+        cx,
+        format_args!(
+            "blaze: {} runs, {} store reads ({} found), certificate {}; .blaze/v2/profile.txt",
+            p.runs(),
+            p.gets,
+            p.hits,
+            if p.certified { "stood" } else { "missed" },
+        ),
+    )?;
     if answer.findings > 0 {
         return Err(CliError::Findings(answer.findings));
     }

@@ -23,3 +23,8 @@ licenses: its crates say theirs in their Cargo.toml. Third-party code and data i
   crates/harness/harness-native/fonts/jetbrains-mono.
 - Symbols Nerd Font (MIT), copyright Ryan L McIntyre: crates/harness/harness-native/fonts/nerd-symbols.
 Each font directory holds its license text.
+
+Relax (MIT), copyright (c) 2026 makepad; license text in licenses/relax-MIT.txt. Code adapted
+from it is marked where it starts with `// adapted from makepad/relax (MIT), <file>`: in
+crates/blaze-base64, blaze-deflate, blaze-tar, blaze-watch and blaze-launch-rt, and in any
+file that carries that line. Find them with `rg "adapted from makepad/relax"`.

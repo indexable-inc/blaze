@@ -32,6 +32,7 @@
 //! Some byte sequences are adapted from makepad/relax (MIT): the counting and entry-mark
 //! stubs of `libs/relax/backend/src/arm64.rs` and `.../x64.rs`.
 
+#[cfg(target_arch = "aarch64")]
 use crate::arch::OutOfReach;
 
 /// One entry of the counter table, 16 bytes, little-endian and deterministic; the table is in
@@ -329,4 +330,109 @@ extern "C" fn hook_resolve(stub: usize, retaddr: usize) {
     // The control thread knows each stub's slot; this seam hands the raw pair on. Until the
     // monitor is wired (blaze-run), it is a no-op that reads its arguments so they are live.
     let _ = (stub, retaddr);
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    fn word(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    /// The count stub's instructions and its body `.quad`, against known encodings.
+    #[test]
+    fn a_count_stub_encodes_to_known_bytes() {
+        // counter = 0x2000 (4-aligned), body = 0xdead_beef_0000_0008.
+        let bytes = count(0x1000, 0x2000, 3, 0xdead_beef_0000_0008).expect("in reach");
+        assert_eq!(bytes.len(), COUNT_STUB);
+        assert_eq!(word(&bytes, 0), 0xd284_0010, "movz x16, #0x2000");
+        assert_eq!(word(&bytes, 16), 0xb940_0211, "ldr w17, [x16]");
+        assert_eq!(word(&bytes, 20), 0x9100_0631, "add w17, w17, #1");
+        assert_eq!(word(&bytes, 24), 0xb900_0211, "str w17, [x16]");
+        assert_eq!(word(&bytes, 32), 0x6b01_023f, "cmp w17, w1");
+        assert_eq!(word(&bytes, 36), 0x5400_0063, "b.lo .+12");
+        assert_eq!(word(&bytes, 48), 0x5800_0050, "ldr x16, .+8");
+        assert_eq!(word(&bytes, 52), 0xd61f_0200, "br x16");
+        assert_eq!(
+            u64::from_le_bytes(bytes[body_offset(Kind::Count)..body_offset(Kind::Count) + 8].try_into().unwrap()),
+            0xdead_beef_0000_0008,
+        );
+        assert_eq!(body_offset(Kind::Count), 56);
+    }
+
+    /// The mark stub's instructions and its body `.quad`.
+    #[test]
+    fn a_mark_stub_encodes_to_known_bytes() {
+        let bytes = mark(0x1000, 8, 5, 0x1234_5678_0000_0010).expect("in reach");
+        assert_eq!(bytes.len(), MARK_STUB);
+        #[cfg(target_os = "macos")]
+        assert_eq!(word(&bytes, 0), 0xd53b_d060, "mrs x16, TPIDRRO_EL0");
+        assert_eq!(word(&bytes, 20), 0x3900_0211, "strb w17, [x16]");
+        assert_eq!(word(&bytes, 24), 0x5800_0050, "ldr x16, .+8");
+        assert_eq!(word(&bytes, 28), 0xd61f_0200, "br x16");
+        assert_eq!(
+            u64::from_le_bytes(bytes[body_offset(Kind::Mark)..body_offset(Kind::Mark) + 8].try_into().unwrap()),
+            0x1234_5678_0000_0010,
+        );
+        assert_eq!(body_offset(Kind::Mark), 32);
+    }
+
+    /// The hook stub: `adr x16, .; b hook_entry; .quad body`.
+    #[test]
+    fn a_hook_stub_encodes_to_known_bytes() {
+        let at = 0x1000;
+        let entry = 0x2000;
+        let bytes = hook_stub(at, entry, 0xbeef).expect("in reach");
+        assert_eq!(bytes.len(), HOOK_STUB);
+        assert_eq!(word(&bytes, 0), 0x1000_0010, "adr x16, .");
+        // b (entry - (at+4)) / 4 = (0x2000 - 0x1004) / 4 = 0xFFF/... compute by the encoder.
+        let delta = (entry - (at + 4)) as i64;
+        assert_eq!(word(&bytes, 4), 0x1400_0000 | (((delta >> 2) as u32) & 0x03ff_ffff));
+        assert_eq!(
+            u64::from_le_bytes(bytes[body_offset(Kind::Hook)..body_offset(Kind::Hook) + 8].try_into().unwrap()),
+            0xbeef,
+        );
+    }
+
+    /// Maps a count stub and a body, runs the stub past its threshold, and checks the counter
+    /// counts, queues once, and the call still reaches the body.
+    #[test]
+    fn a_count_stub_counts_and_queues_and_reaches_the_body() {
+        use crate::sys::Code;
+
+        let page = crate::sys::page().expect("a page");
+        // One page of code, one of data.
+        let mut code = Code::map_with_data(page, page).expect("a mapping");
+        let base = code.base() as u64;
+        let data = code.data_base();
+
+        // The counter at the data region's start: count 0, threshold 3.
+        // SAFETY: `data` is the data region's writable base (`Code::data_base`), covering a
+        // whole page; a `Counter` is 16 bytes, well inside it, and nothing else uses it here.
+        let counter_ptr = data as *mut Counter;
+        unsafe { counter_ptr.write(Counter::new(3)) };
+        let counter_addr = data as u64;
+
+        // The body `extern "C" fn() -> u32 { 7 }` at code offset 0: `movz w0,#7; ret`.
+        let body_off = 0u64;
+        let body = [0x52_80_00_e0u32.to_le_bytes(), 0xd6_5f_03_c0u32.to_le_bytes()].concat();
+        code.write(body_off as usize, &body).expect("body written");
+
+        // The count stub at an 8-aligned offset past the body.
+        let stub_off = 64u64;
+        let stub = count(base + stub_off, counter_addr, 1, base + body_off).expect("in reach");
+        code.write(stub_off as usize, &stub).expect("stub written");
+
+        // SAFETY: the stub at `base + stub_off` is `extern "C" fn() -> u32`: it counts and
+        // jumps to the body, which returns 7. The mapping is live for the call.
+        let call: extern "C" fn() -> u32 = unsafe { core::mem::transmute(base + stub_off) };
+        for n in 1..=4u32 {
+            assert_eq!(call(), 7, "the stub reaches the body");
+            // SAFETY: the counter is live in the data region for the test.
+            let seen = unsafe { counter_ptr.read() };
+            assert_eq!(seen.count, n, "the count rose");
+            assert_eq!(seen.queued, 1, "queued once at or past the threshold");
+        }
+    }
 }

@@ -205,26 +205,43 @@ impl Verified {
     /// The caller's explicit ask, never a read's: every record's CRC-32C evaluated against its
     /// bytes as they lie now, naming each that changed on the disk after its proof was made.
     pub(crate) fn scrub(&self) -> Vec<Corrupt> {
-        let run = self.run();
-        // A scrub's findings, usually none: the global heap, as they outlive the scrub.
         let mut out = Vec::new_in(Global);
-        for i in 0..self.seg.count as usize {
-            let entry = match Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY]) {
-                Ok(entry) => entry,
-                Err(what) => {
-                    out.push(Corrupt { key: Key(blaze_ids::ContentId(run[i * ENTRY..i * ENTRY + 32].try_into().expect("32 bytes"))), pack: self.file.clone(), what: what.to_owned() });
-                    continue;
-                }
-            };
-            let end = entry.at + u64::from(entry.len);
-            if end > self.seg.index_at || record_crc(&entry.key, entry.tag, self.payload(&entry)) != entry.crc {
-                out.push(Corrupt {
-                    key: Key(entry.key),
-                    pack: self.file.clone(),
-                    what: format!("its {} bytes at {} fail their CRC-32C {:08x}: changed on the disk after the segment was proved", entry.len, entry.at, entry.crc),
-                });
-            }
-        }
+        self.scrub_from(0, u64::MAX, &mut out);
         out
+    }
+
+    /// [`Verified::scrub`] from entry `from`, stopping after the entry that takes the payload
+    /// bytes walked to `budget` or more (at least one entry): the background pass's slice
+    /// (store-next.md). Findings go to `out`; returns the next entry and the bytes walked.
+    pub(crate) fn scrub_from(&self, from: usize, budget: u64, out: &mut Vec<Corrupt>) -> (usize, u64) {
+        let run = self.run();
+        let mut walked = 0u64;
+        let mut i = from;
+        while i < self.seg.count as usize && (i == from || walked < budget) {
+            self.scrub_entry(run, i, out);
+            walked += u64::from(u32::from_le_bytes(run[i * ENTRY + 40..i * ENTRY + 44].try_into().expect("4 bytes"))) + ENTRY as u64;
+            i += 1;
+        }
+        (i, walked)
+    }
+
+    /// One entry of the index checked against its payload's CRC-32C, a finding to `out` when
+    /// it fails.
+    fn scrub_entry(&self, run: &[u8], i: usize, out: &mut Vec<Corrupt>) {
+        let entry = match Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY]) {
+            Ok(entry) => entry,
+            Err(what) => {
+                out.push(Corrupt { key: Key(blaze_ids::ContentId(run[i * ENTRY..i * ENTRY + 32].try_into().expect("32 bytes"))), pack: self.file.clone(), what: what.to_owned() });
+                return;
+            }
+        };
+        let end = entry.at + u64::from(entry.len);
+        if end > self.seg.index_at || record_crc(&entry.key, entry.tag, self.payload(&entry)) != entry.crc {
+            out.push(Corrupt {
+                key: Key(entry.key),
+                pack: self.file.clone(),
+                what: format!("its {} bytes at {} fail their CRC-32C {:08x}: changed on the disk after the segment was proved", entry.len, entry.at, entry.crc),
+            });
+        }
     }
 }

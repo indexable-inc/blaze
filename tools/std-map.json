@@ -1,0 +1,2495 @@
+{
+ "version": 1,
+ "counted": "sites under crates/ outside test code on 2026-11-15, read from the text with ambient.rs's scanner: each import leaf, each inline path from `std`/`alloc`, each bare collection name not imported from blaze's own crates (with the associated function after it), each listed macro and each listed method call; `\"..\".to_string()` by a plain search",
+ "rows": [
+  {
+   "path": "alloc::vec::Vec",
+   "written": "Vec",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 14267,
+   "replacement": "blaze_own::Vec<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "the type gains its allocator parameter `A`; where it is made, `new_in(alloc)`"
+  },
+  {
+   "path": "alloc::format",
+   "written": "format!",
+   "form": "macro",
+   "kind": "macro",
+   "sites": 12849,
+   "replacement": "blaze_own::format_in!(alloc, ..)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "`format_into!(&mut buf, ..)` where a buffer is reused"
+  },
+  {
+   "path": "alloc::string::String",
+   "written": "String",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 11513,
+   "replacement": "blaze_own::String<A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "the type gains `A`"
+  },
+  {
+   "path": "alloc::borrow::ToOwned::to_owned",
+   "written": ".to_owned()",
+   "form": "method",
+   "kind": "method",
+   "sites": 4618,
+   "replacement": "blaze_own::ToOwnedIn::to_owned_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "on a slice or a box; on `&str`, `String::from_str_in(s, alloc)`; on a `Copy` or `Clone` value it is `clone()` and stays (the type checker tells which)"
+  },
+  {
+   "path": "core::iter::Iterator::collect",
+   "written": ".collect()",
+   "form": "method",
+   "kind": "method",
+   "sites": 3712,
+   "replacement": "blaze_own::CollectIn::collect_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "only where the target is a collection that allocates (into an `Option`, `Result<(), _>` or a sum it stays); which one needs the type"
+  },
+  {
+   "path": "alloc::vec::Vec::new",
+   "written": "Vec::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 3698,
+   "replacement": "blaze_own::Vec::new_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "alloc::vec",
+   "written": "vec!",
+   "form": "macro",
+   "kind": "macro",
+   "sites": 1890,
+   "replacement": "blaze_own::vec_in![alloc; ..]",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "core::mem::offset_of",
+   "written": "std::mem::offset_of",
+   "form": "path",
+   "kind": "macro",
+   "sites": 1738,
+   "replacement": "core::mem::offset_of",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::vec::Vec::with_capacity",
+   "written": "Vec::with_capacity",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 1565,
+   "replacement": "blaze_own::Vec::with_capacity_in(n, alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "alloc::vec::Vec::new_in",
+   "written": "Vec::new_in",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 1521,
+   "replacement": "blaze_own::Vec::new_in",
+   "needs": [],
+   "class": "rename",
+   "note": "already takes its allocator: the type's path changes, the call does not"
+  },
+  {
+   "path": "alloc::string::ToString::to_string",
+   "written": ".to_string()",
+   "form": "method",
+   "kind": "method",
+   "sites": 1390,
+   "replacement": null,
+   "needs": [
+    "alloc"
+   ],
+   "class": "no-form",
+   "note": "`ToString` is a blanket impl over `Display` with no allocator: write `format_in!(alloc, \"{x}\")`, or `String::from_str_in(s, alloc)` for text (row `\"..\".to_string()`)"
+  },
+  {
+   "path": "alloc::boxed::Box",
+   "written": "Box",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 1377,
+   "replacement": "blaze_own::Box<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "the type gains `A`"
+  },
+  {
+   "path": "core::option::Option",
+   "written": "std::option::Option",
+   "form": "path",
+   "kind": "type",
+   "sites": 1270,
+   "replacement": "core::option::Option",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::ffi::c_int",
+   "written": "std::os::raw::c_int",
+   "form": "path",
+   "kind": "type",
+   "sites": 897,
+   "replacement": "core::ffi::c_int",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::sync::Arc",
+   "written": "Arc",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 876,
+   "replacement": "bstd::sync::Shared",
+   "needs": [],
+   "class": "rename",
+   "note": "std.md \"Moving blaze onto it\": `blaze check --fix` writes `Shared`; on the global heap until S4. `blaze_own::Arc<T, A>` is the allocator form"
+  },
+  {
+   "path": "alloc::string::String::new",
+   "written": "String::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 865,
+   "replacement": "blaze_own::String::new_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "alloc::vec::Vec::with_capacity_in",
+   "written": "Vec::with_capacity_in",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 629,
+   "replacement": "blaze_own::Vec::with_capacity_in",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::alloc::Global",
+   "written": "std::alloc::Global",
+   "form": "path",
+   "kind": "type",
+   "sites": 620,
+   "replacement": null,
+   "needs": [
+    "alloc"
+   ],
+   "class": "missing",
+   "note": "blaze-own has no global allocator of its own and core has none: a `#![no_std]` crate that names `Global` needs `alloc`; S4's runtime is where one lives (blaze-own lacks it)"
+  },
+  {
+   "path": "alloc::boxed::Box::new",
+   "written": "Box::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 515,
+   "replacement": "blaze_own::Box::new_in(value, alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "core::mem::take",
+   "written": "std::mem::take",
+   "form": "path",
+   "kind": "function",
+   "sites": 513,
+   "replacement": "core::mem::take",
+   "needs": [],
+   "class": "rename",
+   "note": "on a blaze-own collection it needs `Default`, which blaze-own's types lack (row `Default`)"
+  },
+  {
+   "path": "alloc::slice::to_vec",
+   "written": ".to_vec()",
+   "form": "method",
+   "kind": "method",
+   "sites": 473,
+   "replacement": "blaze_own::ToOwnedIn::to_owned_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "or `Vec::from_slice_in(s, alloc)`"
+  },
+  {
+   "path": "alloc::collections::BTreeMap",
+   "written": "BTreeMap",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 471,
+   "replacement": "blaze_own::SortedMap<K, V, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "bstd re-exports `alloc`'s B-tree as `bstd::map::SortedMap`; blaze-own has its own `SortedMap`"
+  },
+  {
+   "path": "core::fmt::Result",
+   "written": "std::fmt::Result",
+   "form": "path",
+   "kind": "type",
+   "sites": 461,
+   "replacement": "core::fmt::Result",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::fmt::Formatter",
+   "written": "std::fmt::Formatter",
+   "form": "path",
+   "kind": "type",
+   "sites": 448,
+   "replacement": "core::fmt::Formatter",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::format_args",
+   "written": "format_args!",
+   "form": "macro",
+   "kind": "macro",
+   "sites": 423,
+   "replacement": "core::format_args",
+   "needs": [],
+   "class": "rename",
+   "note": "in core's prelude: the path goes"
+  },
+  {
+   "path": "core::fmt::Display",
+   "written": "std::fmt::Display",
+   "form": "path",
+   "kind": "trait",
+   "sites": 367,
+   "replacement": "core::fmt::Display",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::eprintln",
+   "written": "eprintln!",
+   "form": "macro",
+   "kind": "macro",
+   "sites": 361,
+   "replacement": "bstd::out::Out",
+   "needs": [
+    "Out",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "standard error is a capability (`Out`, `Stream::Err`) passed from `main`; a log line is a trace event instead"
+  },
+  {
+   "path": "core::fmt",
+   "written": "std::fmt",
+   "form": "path",
+   "kind": "module",
+   "sites": 342,
+   "replacement": "core::fmt",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::sync::Arc",
+   "written": "std::sync::Arc",
+   "form": "path",
+   "kind": "type",
+   "sites": 305,
+   "replacement": "bstd::sync::Shared",
+   "needs": [],
+   "class": "rename",
+   "note": "as the prelude's `Arc`"
+  },
+  {
+   "path": "std::path::Path",
+   "written": "std::path::Path",
+   "form": "path",
+   "kind": "type",
+   "sites": 300,
+   "replacement": "bstd::path::Path",
+   "needs": [],
+   "class": "rename",
+   "note": "bstd's is checked at construction (`Path::new` returns `Result<_, PathError>`): a `&Path` in a signature renames; making one is a call with a typed refusal"
+  },
+  {
+   "path": "alloc::sync::Arc::new",
+   "written": "Arc::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 282,
+   "replacement": "bstd::sync::Shared::new",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::path::PathBuf",
+   "written": "std::path::PathBuf",
+   "form": "path",
+   "kind": "type",
+   "sites": 250,
+   "replacement": "bstd::path::Path",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "one owned path type; `join` allocates once (std.md \"Left implicit\")"
+  },
+  {
+   "path": "core::mem::size_of",
+   "written": "std::mem::size_of",
+   "form": "path",
+   "kind": "function",
+   "sites": 240,
+   "replacement": "core::mem::size_of",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::iter::Iterator::collect",
+   "written": ".collect::<Vec<_>>()",
+   "form": "method",
+   "kind": "method",
+   "sites": 238,
+   "replacement": "blaze_own::CollectIn::collect_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "the turbofish says the target: rewritten without types"
+  },
+  {
+   "path": "alloc::collections::BTreeMap::new",
+   "written": "BTreeMap::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 234,
+   "replacement": "blaze_own::SortedMap::new_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "core::mem::replace",
+   "written": "std::mem::replace",
+   "form": "path",
+   "kind": "function",
+   "sites": 228,
+   "replacement": "core::mem::replace",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::borrow::Cow::into_owned",
+   "written": ".into_owned()",
+   "form": "method",
+   "kind": "method",
+   "sites": 226,
+   "replacement": "blaze_own::Cow::into_owned",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "blaze-own's `Cow` holds its allocator; the `Cow` is made with one"
+  },
+  {
+   "path": "alloc::vec::Vec::into_boxed_slice",
+   "written": ".into_boxed_slice()",
+   "form": "method",
+   "kind": "method",
+   "sites": 225,
+   "replacement": "blaze_own::Vec::into_boxed_slice",
+   "needs": [],
+   "class": "rename",
+   "note": "on a blaze-own `Vec` the box keeps its allocator"
+  },
+  {
+   "path": "core::fmt::Display::fmt",
+   "written": "std::fmt::Display::fmt",
+   "form": "path",
+   "kind": "method",
+   "sites": 210,
+   "replacement": "core::fmt::Display::fmt",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::sync::Arc::clone",
+   "written": "Arc::clone",
+   "form": "prelude",
+   "kind": "method",
+   "sites": 202,
+   "replacement": "bstd::sync::Shared::clone",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::collections::BTreeSet",
+   "written": "BTreeSet",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 202,
+   "replacement": "blaze_own::SortedSet<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "core::mem::align_of",
+   "written": "std::mem::align_of",
+   "form": "path",
+   "kind": "function",
+   "sites": 199,
+   "replacement": "core::mem::align_of",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::error::Error",
+   "written": "std::error::Error",
+   "form": "path",
+   "kind": "trait",
+   "sites": 189,
+   "replacement": "core::error::Error",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::collections::BTreeMap",
+   "written": "std::collections::BTreeMap",
+   "form": "path",
+   "kind": "type",
+   "sites": 178,
+   "replacement": "blaze_own::SortedMap<K, V, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::collections::HashMap",
+   "written": "HashMap",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 177,
+   "replacement": "blaze_hash::HashMap<K, V, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "`.clippy.toml` bans `std::collections::HashMap` for `blaze_hash::HashMap`, which takes `A` (`new_in`)"
+  },
+  {
+   "path": "core::str::from_utf8",
+   "written": "std::str::from_utf8",
+   "form": "path",
+   "kind": "function",
+   "sites": 175,
+   "replacement": "core::str::from_utf8",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::string::String::with_capacity",
+   "written": "String::with_capacity",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 171,
+   "replacement": "blaze_own::String::with_capacity_in(n, alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "core::time::Duration",
+   "written": "std::time::Duration",
+   "form": "path",
+   "kind": "type",
+   "sites": 171,
+   "replacement": "core::time::Duration",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::string::String::from_utf8_lossy",
+   "written": "String::from_utf8_lossy",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 169,
+   "replacement": null,
+   "needs": [
+    "alloc"
+   ],
+   "class": "missing",
+   "note": "blaze-own's `String` has `from_utf8` and no lossy form; text from outside is refused with its error or kept as bytes"
+  },
+  {
+   "path": "alloc::string::String::from",
+   "written": "String::from",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 168,
+   "replacement": "blaze_own::String::from_str_in(s, alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "`From<&str>` cannot take an allocator: the named constructor does"
+  },
+  {
+   "path": "core::sync::atomic::Ordering",
+   "written": "std::sync::atomic::Ordering",
+   "form": "path",
+   "kind": "type",
+   "sites": 161,
+   "replacement": "core::sync::atomic::Ordering",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::fmt::Write",
+   "written": "std::fmt::Write",
+   "form": "path",
+   "kind": "trait",
+   "sites": 159,
+   "replacement": "core::fmt::Write",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::ops::Range",
+   "written": "std::ops::Range",
+   "form": "path",
+   "kind": "type",
+   "sites": 150,
+   "replacement": "core::ops::Range",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::rc::Rc",
+   "written": "Rc",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 149,
+   "replacement": "blaze_own::Rc<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "or `bstd::sync::LocalShared`, which keeps the global heap"
+  },
+  {
+   "path": "std::sync::OnceLock",
+   "written": "std::sync::OnceLock",
+   "form": "path",
+   "kind": "type",
+   "sites": 143,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "global state: build the value where the program starts and pass it down (`.clippy.toml`); a process-wide singleton says why with `#[expect]`; inside a struct, `bstd::sync::PublishOnce`"
+  },
+  {
+   "path": "std::thread_local",
+   "written": "thread_local!",
+   "form": "macro",
+   "kind": "macro",
+   "sites": 142,
+   "replacement": null,
+   "needs": [
+    "cx"
+   ],
+   "class": "no-form",
+   "note": "std.md \"What replaces a thread-local\": the value goes in `Cx` or is passed; `bstd::sync::LocalLazy` where a per-thread cache is the design"
+  },
+  {
+   "path": "core::fmt::Debug",
+   "written": "std::fmt::Debug",
+   "form": "path",
+   "kind": "trait",
+   "sites": 134,
+   "replacement": "core::fmt::Debug",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::cell::RefCell",
+   "written": "std::cell::RefCell",
+   "form": "path",
+   "kind": "type",
+   "sites": 130,
+   "replacement": "core::cell::RefCell",
+   "needs": [],
+   "class": "rename",
+   "note": "`bstd::cell::TokenCell` where two borrows are to be refused at compile time"
+  },
+  {
+   "path": "core::ptr::null_mut",
+   "written": "std::ptr::null_mut",
+   "form": "path",
+   "kind": "function",
+   "sites": 129,
+   "replacement": "core::ptr::null_mut",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::collections::VecDeque",
+   "written": "VecDeque",
+   "form": "prelude",
+   "kind": "type",
+   "sites": 127,
+   "replacement": "blaze_own::VecDeque<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::println",
+   "written": "println!",
+   "form": "macro",
+   "kind": "macro",
+   "sites": 125,
+   "replacement": "bstd::out::Out",
+   "needs": [
+    "Out",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "standard output is the `Out` capability from `main`"
+  },
+  {
+   "path": "core::cell::Cell",
+   "written": "std::cell::Cell",
+   "form": "path",
+   "kind": "type",
+   "sites": 122,
+   "replacement": "core::cell::Cell",
+   "needs": [],
+   "class": "rename",
+   "note": "bstd re-exports it as `bstd::cell::Cell`"
+  },
+  {
+   "path": "std::env::var",
+   "written": "std::env::var",
+   "form": "path",
+   "kind": "function",
+   "sites": 122,
+   "replacement": "bstd::env::Env::get(&VarName)",
+   "needs": [
+    "Env"
+   ],
+   "class": "thread",
+   "note": "`.clippy.toml`: read once at the entry point, typed; `Env` from `io.env()`"
+  },
+  {
+   "path": "core::sync::atomic::AtomicU64",
+   "written": "std::sync::atomic::AtomicU64",
+   "form": "path",
+   "kind": "type",
+   "sites": 119,
+   "replacement": "core::sync::atomic::AtomicU64",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::io",
+   "written": "std::io",
+   "form": "path",
+   "kind": "module",
+   "sites": 118,
+   "replacement": null,
+   "needs": [],
+   "class": "missing",
+   "note": "no one `io` module: bstd's errors are per area (`FsError`, `NetError`), and `Read`/`Write` have no bstd trait; each use takes the row of what it names"
+  },
+  {
+   "path": "core::hash::Hash",
+   "written": "std::hash::Hash",
+   "form": "path",
+   "kind": "trait",
+   "sites": 104,
+   "replacement": "core::hash::Hash",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::fs::create_dir_all",
+   "written": "std::fs::create_dir_all",
+   "form": "path",
+   "kind": "function",
+   "sites": 103,
+   "replacement": "bstd::fs::Dir::create_dir_all",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "from a `Dir` the caller holds, opened through `Fs`; durability said"
+  },
+  {
+   "path": "core::iter::once",
+   "written": "std::iter::once",
+   "form": "path",
+   "kind": "function",
+   "sites": 103,
+   "replacement": "core::iter::once",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::io::Result",
+   "written": "std::io::Result",
+   "form": "path",
+   "kind": "type",
+   "sites": 102,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "one error type per area naming its subject (std.md \"Errors\"): the area's error replaces `io::Error`, chosen per function"
+  },
+  {
+   "path": "alloc::borrow::Cow",
+   "written": "std::borrow::Cow",
+   "form": "path",
+   "kind": "type",
+   "sites": 101,
+   "replacement": "blaze_own::Cow<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "alloc::string::String::as_str",
+   "written": "String::as_str",
+   "form": "prelude",
+   "kind": "method",
+   "sites": 97,
+   "replacement": "blaze_own::String::as_str",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::io::Error::last_os_error",
+   "written": "std::io::Error::last_os_error",
+   "form": "path",
+   "kind": "function",
+   "sites": 95,
+   "replacement": null,
+   "needs": [],
+   "class": "missing",
+   "note": "errno lives in blaze-sys; a driver's error type carries it (`FsError`'s kind); no free function reads it"
+  },
+  {
+   "path": "std::io::Write",
+   "written": "std::io::Write",
+   "form": "path",
+   "kind": "trait",
+   "sites": 94,
+   "replacement": "bstd::fs::Buffered or bstd::out::Writer",
+   "needs": [
+    "Fs",
+    "Out"
+   ],
+   "class": "thread",
+   "note": "a writer is a capability's (a file's `Buffered`, `Out`'s `Writer`); in memory, `core::fmt::Write` or a `Vec<u8, A>`"
+  },
+  {
+   "path": "core::marker::PhantomData",
+   "written": "std::marker::PhantomData",
+   "form": "path",
+   "kind": "type",
+   "sites": 92,
+   "replacement": "core::marker::PhantomData",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::fs::read_to_string",
+   "written": "std::fs::read_to_string",
+   "form": "path",
+   "kind": "function",
+   "sites": 91,
+   "replacement": "bstd::fs::Dir::read_all(cx, path, into)",
+   "needs": [
+    "Fs",
+    "cx",
+    "alloc"
+   ],
+   "class": "thread",
+   "note": "into the caller's buffer, then `from_utf8`"
+  },
+  {
+   "path": "std::time::Instant",
+   "written": "std::time::Instant",
+   "form": "path",
+   "kind": "type",
+   "sites": 91,
+   "replacement": "bstd::clock::Instant",
+   "needs": [
+    "Clock"
+   ],
+   "class": "thread",
+   "note": "read from `Clock::now`, passed from `main`"
+  },
+  {
+   "path": "std::env::var_os",
+   "written": "std::env::var_os",
+   "form": "path",
+   "kind": "function",
+   "sites": 90,
+   "replacement": "bstd::env::Env::get(&VarName)",
+   "needs": [
+    "Env"
+   ],
+   "class": "thread",
+   "note": "as `std::env::var`"
+  },
+  {
+   "path": "alloc::collections::BTreeSet::new",
+   "written": "BTreeSet::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 88,
+   "replacement": "blaze_own::SortedSet::new_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::ffi::OsString",
+   "written": "std::ffi::OsString",
+   "form": "path",
+   "kind": "type",
+   "sites": 84,
+   "replacement": null,
+   "needs": [],
+   "class": "missing",
+   "note": "bstd has no OS-string type: names are `bstd::path::Path` and checked text (`VarName`, `Args`'s values)"
+  },
+  {
+   "path": "std::collections::HashMap::new",
+   "written": "HashMap::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 80,
+   "replacement": "blaze_hash::HashMap::new_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::sync::OnceLock::new",
+   "written": "std::sync::OnceLock::new",
+   "form": "path",
+   "kind": "function",
+   "sites": 80,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "as `std::sync::OnceLock`"
+  },
+  {
+   "path": "core::alloc::Allocator",
+   "written": "std::alloc::Allocator",
+   "form": "path",
+   "kind": "trait",
+   "sites": 79,
+   "replacement": "core::alloc::Allocator",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::hash::Hasher",
+   "written": "std::hash::Hasher",
+   "form": "path",
+   "kind": "trait",
+   "sites": 79,
+   "replacement": "core::hash::Hasher",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::ptr::null",
+   "written": "std::ptr::null",
+   "form": "path",
+   "kind": "function",
+   "sites": 79,
+   "replacement": "core::ptr::null",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::boxed::Box::default",
+   "written": "Box::default",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 78,
+   "replacement": null,
+   "needs": [
+    "alloc"
+   ],
+   "class": "no-form",
+   "note": "`Default` takes no allocator: `Box::new_in(T::default(), alloc)`"
+  },
+  {
+   "path": "alloc::collections::VecDeque",
+   "written": "std::collections::VecDeque",
+   "form": "path",
+   "kind": "type",
+   "sites": 78,
+   "replacement": "blaze_own::VecDeque<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::fs::read",
+   "written": "std::fs::read",
+   "form": "path",
+   "kind": "function",
+   "sites": 78,
+   "replacement": "bstd::fs::Dir::read_all(cx, path, into)",
+   "needs": [
+    "Fs",
+    "cx",
+    "alloc"
+   ],
+   "class": "thread",
+   "note": null
+  },
+  {
+   "path": "std::fs::read_dir",
+   "written": "std::fs::read_dir",
+   "form": "path",
+   "kind": "function",
+   "sites": 77,
+   "replacement": "bstd::fs::Dir::list(cx, frame)",
+   "needs": [
+    "Fs",
+    "cx",
+    "alloc"
+   ],
+   "class": "thread",
+   "note": null
+  },
+  {
+   "path": "alloc::collections::BTreeSet",
+   "written": "std::collections::BTreeSet",
+   "form": "path",
+   "kind": "type",
+   "sites": 76,
+   "replacement": "blaze_own::SortedSet<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "core::result::Result",
+   "written": "std::result::Result",
+   "form": "path",
+   "kind": "type",
+   "sites": 76,
+   "replacement": "core::result::Result",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::vec::Vec",
+   "written": "alloc::vec::Vec",
+   "form": "path",
+   "kind": "type",
+   "sites": 75,
+   "replacement": "blaze_own::Vec<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::fs::write",
+   "written": "std::fs::write",
+   "form": "path",
+   "kind": "function",
+   "sites": 73,
+   "replacement": "bstd::fs::Dir::publish(cx, path, content, durable)",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "durability said (std.md \"What each API makes explicit\")"
+  },
+  {
+   "path": "core::mem::zeroed",
+   "written": "std::mem::zeroed",
+   "form": "path",
+   "kind": "function",
+   "sites": 73,
+   "replacement": "core::mem::zeroed",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::str::to_lowercase",
+   "written": ".to_lowercase()",
+   "form": "method",
+   "kind": "method",
+   "sites": 72,
+   "replacement": null,
+   "needs": [
+    "alloc"
+   ],
+   "class": "missing",
+   "note": "blaze-own's `String` has no case mapping; ASCII text has `make_ascii_lowercase` in place, full Unicode needs a `_in` form"
+  },
+  {
+   "path": "std::io::ErrorKind::NotFound",
+   "written": "std::io::ErrorKind::NotFound",
+   "form": "path",
+   "kind": "type",
+   "sites": 71,
+   "replacement": "bstd::fs::FsKind::NotFound",
+   "needs": [
+    "Fs"
+   ],
+   "class": "thread",
+   "note": "the area's kind, from the call that failed"
+  },
+  {
+   "path": "core::ops::Deref",
+   "written": "std::ops::Deref",
+   "form": "path",
+   "kind": "trait",
+   "sites": 69,
+   "replacement": "core::ops::Deref",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::cmp::Ordering",
+   "written": "std::cmp::Ordering",
+   "form": "path",
+   "kind": "type",
+   "sites": 68,
+   "replacement": "core::cmp::Ordering",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::fs::metadata",
+   "written": "std::fs::metadata",
+   "form": "path",
+   "kind": "function",
+   "sites": 68,
+   "replacement": "bstd::fs::Dir::meta",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": null
+  },
+  {
+   "path": "core::iter::successors",
+   "written": "std::iter::successors",
+   "form": "path",
+   "kind": "function",
+   "sites": 68,
+   "replacement": "core::iter::successors",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::process::id",
+   "written": "std::process::id",
+   "form": "path",
+   "kind": "function",
+   "sites": 66,
+   "replacement": "bstd::procs::Procs",
+   "needs": [
+    "Procs"
+   ],
+   "class": "thread",
+   "note": "the process's own id is a fact `main` reads; in a key it is a bug (rule 25)"
+  },
+  {
+   "path": "std::thread::Builder::new",
+   "written": "std::thread::Builder::new",
+   "form": "path",
+   "kind": "function",
+   "sites": 61,
+   "replacement": "bstd::task::Scope::spawn(name, scratch, f)",
+   "needs": [
+    "cx"
+   ],
+   "class": "thread",
+   "note": "a task in a scope, named and sized, joined"
+  },
+  {
+   "path": "core::mem",
+   "written": "std::mem",
+   "form": "path",
+   "kind": "module",
+   "sites": 60,
+   "replacement": "core::mem",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::io::Read",
+   "written": "std::io::Read",
+   "form": "path",
+   "kind": "trait",
+   "sites": 59,
+   "replacement": "bstd::fs::File::read_into",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": null
+  },
+  {
+   "path": "core::sync::atomic::AtomicBool",
+   "written": "std::sync::atomic::AtomicBool",
+   "form": "path",
+   "kind": "type",
+   "sites": 59,
+   "replacement": "core::sync::atomic::AtomicBool",
+   "needs": [],
+   "class": "rename",
+   "note": "`bstd::sync::Flag` where it is a flag"
+  },
+  {
+   "path": "core::array::from_fn",
+   "written": "std::array::from_fn",
+   "form": "path",
+   "kind": "function",
+   "sites": 58,
+   "replacement": "core::array::from_fn",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::ptr",
+   "written": "std::ptr",
+   "form": "path",
+   "kind": "module",
+   "sites": 58,
+   "replacement": "core::ptr",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::collections::VecDeque::new",
+   "written": "VecDeque::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 55,
+   "replacement": "blaze_own::VecDeque::new_in(alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::collections::HashMap",
+   "written": "std::collections::HashMap",
+   "form": "path",
+   "kind": "type",
+   "sites": 55,
+   "replacement": "blaze_hash::HashMap<K, V, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "`.clippy.toml` row: `blaze_hash::HashMap`"
+  },
+  {
+   "path": "std::fs::remove_file",
+   "written": "std::fs::remove_file",
+   "form": "path",
+   "kind": "function",
+   "sites": 55,
+   "replacement": "bstd::fs::Dir::remove(cx, path, durable)",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": null
+  },
+  {
+   "path": "core::slice::from_ref",
+   "written": "std::slice::from_ref",
+   "form": "path",
+   "kind": "function",
+   "sites": 54,
+   "replacement": "core::slice::from_ref",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::boxed::Box::from_raw",
+   "written": "Box::from_raw",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 53,
+   "replacement": "blaze_own::Box::from_raw_in(ptr, alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::ffi::OsStr",
+   "written": "std::ffi::OsStr",
+   "form": "path",
+   "kind": "type",
+   "sites": 53,
+   "replacement": null,
+   "needs": [],
+   "class": "missing",
+   "note": "as `OsString`"
+  },
+  {
+   "path": "alloc::sync::Arc::make_mut",
+   "written": "Arc::make_mut",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 50,
+   "replacement": null,
+   "needs": [],
+   "class": "missing",
+   "note": "`bstd::sync::Shared` has no copy-on-write; `blaze_own::Arc` neither: clone and swap by hand"
+  },
+  {
+   "path": "alloc::boxed::Box::from",
+   "written": "Box::from",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 50,
+   "replacement": "blaze_own::Box::from_slice_in(s, alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "no-form",
+   "note": "`From` cannot take an allocator: the named constructor for the source's shape"
+  },
+  {
+   "path": "core::ptr::NonNull",
+   "written": "std::ptr::NonNull",
+   "form": "path",
+   "kind": "type",
+   "sites": 50,
+   "replacement": "core::ptr::NonNull",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::os::fd::AsRawFd",
+   "written": "std::os::fd::AsRawFd",
+   "form": "path",
+   "kind": "trait",
+   "sites": 47,
+   "replacement": null,
+   "needs": [],
+   "class": "missing",
+   "note": "file descriptors are blaze-sys's, inside the drivers; logic holds a `bstd::fs::File`"
+  },
+  {
+   "path": "alloc::string::String",
+   "written": "alloc::string::String",
+   "form": "path",
+   "kind": "type",
+   "sites": 46,
+   "replacement": "blaze_own::String<A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::fs::File::open",
+   "written": "std::fs::File::open",
+   "form": "path",
+   "kind": "function",
+   "sites": 46,
+   "replacement": "bstd::fs::Dir::open_read(cx, path)",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": null
+  },
+  {
+   "path": "core::slice::from_raw_parts",
+   "written": "std::slice::from_raw_parts",
+   "form": "path",
+   "kind": "function",
+   "sites": 46,
+   "replacement": "core::slice::from_raw_parts",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::rc::Rc::new",
+   "written": "Rc::new",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 45,
+   "replacement": "blaze_own::Rc::new_in(value, alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "std::fs::File",
+   "written": "std::fs::File",
+   "form": "path",
+   "kind": "type",
+   "sites": 44,
+   "replacement": "bstd::fs::File<P>",
+   "needs": [
+    "Fs"
+   ],
+   "class": "thread",
+   "note": "its rights in the type (`ReadOnly`, `ReadWrite`)"
+  },
+  {
+   "path": "std::io::Error",
+   "written": "std::io::Error",
+   "form": "path",
+   "kind": "type",
+   "sites": 44,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "the area's error (`FsError`, `NetError`, `ProcsError`), chosen per function"
+  },
+  {
+   "path": "core::ops::ControlFlow",
+   "written": "std::ops::ControlFlow",
+   "form": "path",
+   "kind": "type",
+   "sites": 44,
+   "replacement": "core::ops::ControlFlow",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::fs::symlink_metadata",
+   "written": "std::fs::symlink_metadata",
+   "form": "path",
+   "kind": "function",
+   "sites": 43,
+   "replacement": "bstd::fs::Dir::meta",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "bstd never follows a link it was not told to"
+  },
+  {
+   "path": "alloc::sync::Arc::from",
+   "written": "Arc::from",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 42,
+   "replacement": null,
+   "needs": [
+    "alloc"
+   ],
+   "class": "no-form",
+   "note": "`From` cannot take an allocator: `Shared::new(value)` or `blaze_own::Arc::from_slice_in`"
+  },
+  {
+   "path": "std::process::exit",
+   "written": "std::process::exit",
+   "form": "path",
+   "kind": "function",
+   "sites": 41,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "`.clippy.toml`: return a typed error from `main`, which bstd's entry turns into the status"
+  },
+  {
+   "path": "core::sync::atomic::AtomicU32",
+   "written": "std::sync::atomic::AtomicU32",
+   "form": "path",
+   "kind": "type",
+   "sites": 41,
+   "replacement": "core::sync::atomic::AtomicU32",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::sync::Arc::new_in",
+   "written": "Arc::new_in",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 40,
+   "replacement": "blaze_own::Arc::new_in",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::string::String::from_utf8",
+   "written": "String::from_utf8",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 40,
+   "replacement": "blaze_own::String::from_utf8",
+   "needs": [],
+   "class": "rename",
+   "note": "from a blaze-own `Vec<u8, A>`"
+  },
+  {
+   "path": "alloc::rc::Rc",
+   "written": "std::rc::Rc",
+   "form": "path",
+   "kind": "type",
+   "sites": 40,
+   "replacement": "blaze_own::Rc<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": null
+  },
+  {
+   "path": "core::sync::atomic::AtomicUsize",
+   "written": "std::sync::atomic::AtomicUsize",
+   "form": "path",
+   "kind": "type",
+   "sites": 39,
+   "replacement": "core::sync::atomic::AtomicUsize",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::panic::AssertUnwindSafe",
+   "written": "std::panic::AssertUnwindSafe",
+   "form": "path",
+   "kind": "type",
+   "sites": 38,
+   "replacement": "core::panic::AssertUnwindSafe",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::sync::Arc::default",
+   "written": "Arc::default",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 37,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "`Default` takes no allocator: `Shared::new(T::default())`"
+  },
+  {
+   "path": "alloc::sync::Arc::ptr_eq",
+   "written": "Arc::ptr_eq",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 37,
+   "replacement": "bstd::sync::Shared::ptr_eq",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::vec::Vec::as_slice",
+   "written": "Vec::as_slice",
+   "form": "prelude",
+   "kind": "method",
+   "sites": 37,
+   "replacement": "blaze_own::Vec::as_slice",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::cell::Cell::new",
+   "written": "std::cell::Cell::new",
+   "form": "path",
+   "kind": "function",
+   "sites": 37,
+   "replacement": "core::cell::Cell::new",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::fs::remove_dir_all",
+   "written": "std::fs::remove_dir_all",
+   "form": "path",
+   "kind": "function",
+   "sites": 37,
+   "replacement": "bstd::fs::Dir::remove_tree",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": null
+  },
+  {
+   "path": "std::fs::rename",
+   "written": "std::fs::rename",
+   "form": "path",
+   "kind": "function",
+   "sites": 37,
+   "replacement": "bstd::fs::Dir::rename_replacing(cx, from, to, durable)",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "that it replaces is in the name"
+  },
+  {
+   "path": "std::panic::catch_unwind",
+   "written": "std::panic::catch_unwind",
+   "form": "path",
+   "kind": "function",
+   "sites": 37,
+   "replacement": "bstd::task::Scope::spawn",
+   "needs": [
+    "cx"
+   ],
+   "class": "thread",
+   "note": "a panic fails its task (rule 20); the scope's join sees it"
+  },
+  {
+   "path": "std::time::UNIX_EPOCH",
+   "written": "std::time::UNIX_EPOCH",
+   "form": "path",
+   "kind": "type",
+   "sites": 37,
+   "replacement": "bstd::clock::Clock",
+   "needs": [
+    "Clock"
+   ],
+   "class": "thread",
+   "note": "wall time is the clock's"
+  },
+  {
+   "path": "alloc::boxed::Box::into_raw",
+   "written": "Box::into_raw",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 36,
+   "replacement": "blaze_own::Box::into_raw_with_allocator",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::iter::repeat_n",
+   "written": "std::iter::repeat_n",
+   "form": "path",
+   "kind": "function",
+   "sites": 36,
+   "replacement": "core::iter::repeat_n",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::fs::canonicalize",
+   "written": "std::fs::canonicalize",
+   "form": "path",
+   "kind": "function",
+   "sites": 35,
+   "replacement": "bstd::fs::Dir::open_dir",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "a path is resolved by opening it from a `Dir`; no absolute name is handed out"
+  },
+  {
+   "path": "std::os::fd::OwnedFd",
+   "written": "std::os::fd::OwnedFd",
+   "form": "path",
+   "kind": "type",
+   "sites": 35,
+   "replacement": null,
+   "needs": [],
+   "class": "missing",
+   "note": "as `AsRawFd`"
+  },
+  {
+   "path": "std::os::unix::ffi::OsStrExt",
+   "written": "std::os::unix::ffi::OsStrExt",
+   "form": "path",
+   "kind": "trait",
+   "sites": 35,
+   "replacement": null,
+   "needs": [],
+   "class": "missing",
+   "note": "as `OsStr`"
+  },
+  {
+   "path": "core::alloc::Layout",
+   "written": "std::alloc::Layout",
+   "form": "path",
+   "kind": "type",
+   "sites": 34,
+   "replacement": "core::alloc::Layout",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::sync::LazyLock",
+   "written": "std::sync::LazyLock",
+   "form": "path",
+   "kind": "type",
+   "sites": 34,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "as `OnceLock` (`.clippy.toml`)"
+  },
+  {
+   "path": "core::any::Any",
+   "written": "std::any::Any",
+   "form": "path",
+   "kind": "trait",
+   "sites": 33,
+   "replacement": "core::any::Any",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::slice::Concat::concat",
+   "written": ".concat()",
+   "form": "method",
+   "kind": "method",
+   "sites": 31,
+   "replacement": null,
+   "needs": [
+    "alloc"
+   ],
+   "class": "missing",
+   "note": "no `concat_in`: a `Vec::with_capacity_in` and `extend_from_slice` per part"
+  },
+  {
+   "path": "core::iter::zip",
+   "written": "std::iter::zip",
+   "form": "path",
+   "kind": "function",
+   "sites": 31,
+   "replacement": "core::iter::zip",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::mem::swap",
+   "written": "std::mem::swap",
+   "form": "path",
+   "kind": "function",
+   "sites": 31,
+   "replacement": "core::mem::swap",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::net::SocketAddr",
+   "written": "std::net::SocketAddr",
+   "form": "path",
+   "kind": "type",
+   "sites": 31,
+   "replacement": "core::net::SocketAddr",
+   "needs": [],
+   "class": "rename",
+   "note": "bstd's own address is `bstd::net::Addr`; `core::net` holds the plain value"
+  },
+  {
+   "path": "core::sync::atomic::Ordering::Relaxed",
+   "written": "std::sync::atomic::Ordering::Relaxed",
+   "form": "path",
+   "kind": "type",
+   "sites": 31,
+   "replacement": "core::sync::atomic::Ordering::Relaxed",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::hash::BuildHasher",
+   "written": "std::hash::BuildHasher",
+   "form": "path",
+   "kind": "trait",
+   "sites": 30,
+   "replacement": "core::hash::BuildHasher",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::iter::from_fn",
+   "written": "std::iter::from_fn",
+   "form": "path",
+   "kind": "function",
+   "sites": 30,
+   "replacement": "core::iter::from_fn",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::num::NonZeroU32",
+   "written": "std::num::NonZeroU32",
+   "form": "path",
+   "kind": "type",
+   "sites": 30,
+   "replacement": "core::num::NonZeroU32",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::os::unix::fs::PermissionsExt",
+   "written": "std::os::unix::fs::PermissionsExt",
+   "form": "path",
+   "kind": "trait",
+   "sites": 30,
+   "replacement": "bstd::fs::Meta",
+   "needs": [
+    "Fs"
+   ],
+   "class": "thread",
+   "note": "a mode is a field of the meta a `Dir` gives"
+  },
+  {
+   "path": "std::io::Error::other",
+   "written": "std::io::Error::other",
+   "form": "path",
+   "kind": "function",
+   "sites": 29,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "an area's error with its kind and subject"
+  },
+  {
+   "path": "core::ptr::from_ref",
+   "written": "std::ptr::from_ref",
+   "form": "path",
+   "kind": "function",
+   "sites": 29,
+   "replacement": "core::ptr::from_ref",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::sync::Arc::new",
+   "written": "std::sync::Arc::new",
+   "form": "path",
+   "kind": "function",
+   "sites": 29,
+   "replacement": "bstd::sync::Shared::new",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "alloc::boxed::Box::leak",
+   "written": "Box::leak",
+   "form": "prelude",
+   "kind": "function",
+   "sites": 28,
+   "replacement": "blaze_own::Box::leak",
+   "needs": [],
+   "class": "rename",
+   "note": "the allocator must live as long as the borrow (`'static` from `Global` or an arena kept)"
+  },
+  {
+   "path": "std::fs::OpenOptions::new",
+   "written": "std::fs::OpenOptions::new",
+   "form": "path",
+   "kind": "function",
+   "sites": 28,
+   "replacement": "bstd::fs::Dir::open",
+   "needs": [
+    "Fs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "the options are the call's name (`open`, `create`, `append`)"
+  },
+  {
+   "path": "core::iter",
+   "written": "std::iter",
+   "form": "path",
+   "kind": "module",
+   "sites": 28,
+   "replacement": "core::iter",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::ptr::eq",
+   "written": "std::ptr::eq",
+   "form": "path",
+   "kind": "function",
+   "sites": 28,
+   "replacement": "core::ptr::eq",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::thread::sleep",
+   "written": "std::thread::sleep",
+   "form": "path",
+   "kind": "function",
+   "sites": 28,
+   "replacement": "bstd::clock::sleep(cx, ..)",
+   "needs": [
+    "Clock",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "`.clippy.toml`: a wait goes through the scheduler or a driver's timer"
+  },
+  {
+   "path": "std::io::stdout",
+   "written": "std::io::stdout",
+   "form": "path",
+   "kind": "function",
+   "sites": 27,
+   "replacement": "bstd::out::Out",
+   "needs": [
+    "Out"
+   ],
+   "class": "thread",
+   "note": null
+  },
+  {
+   "path": "std::path::Path::new",
+   "written": "std::path::Path::new",
+   "form": "path",
+   "kind": "function",
+   "sites": 27,
+   "replacement": "bstd::path::Path::new",
+   "needs": [],
+   "class": "rename",
+   "note": "bstd's returns `Result<Path, PathError>`: the call site gains a `?`, which a person or the type checker places; `path!` for a literal"
+  },
+  {
+   "path": "std::sync::PoisonError::into_inner",
+   "written": "std::sync::PoisonError::into_inner",
+   "form": "path",
+   "kind": "function",
+   "sites": 27,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "`blaze_core::lock`'s locks do not poison (`.clippy.toml` row `std::sync::Mutex`)"
+  },
+  {
+   "path": "core::any::type_name",
+   "written": "std::any::type_name",
+   "form": "path",
+   "kind": "function",
+   "sites": 26,
+   "replacement": "core::any::type_name",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "core::cmp::Reverse",
+   "written": "std::cmp::Reverse",
+   "form": "path",
+   "kind": "type",
+   "sites": 26,
+   "replacement": "core::cmp::Reverse",
+   "needs": [],
+   "class": "rename",
+   "note": null
+  },
+  {
+   "path": "std::process::Command::new",
+   "written": "std::process::Command::new",
+   "form": "path",
+   "kind": "function",
+   "sites": 24,
+   "replacement": "bstd::procs::Procs",
+   "needs": [
+    "Procs",
+    "cx"
+   ],
+   "class": "thread",
+   "note": "`.clippy.toml` says `toolchain::command`; a program runs only in a sandbox (std.md \"Sandboxes\")"
+  },
+  {
+   "path": "std::thread::spawn",
+   "written": "std::thread::spawn",
+   "form": "path",
+   "kind": "function",
+   "sites": 23,
+   "replacement": "bstd::task::Scope::spawn(name, scratch, f)",
+   "needs": [
+    "cx"
+   ],
+   "class": "thread",
+   "note": "`.clippy.toml` says name it with `std::thread::Builder`; bstd's task is named and sized"
+  },
+  {
+   "path": "alloc::string::ToString::to_string",
+   "written": "\"..\".to_string()",
+   "form": "method",
+   "kind": "method",
+   "sites": 22,
+   "replacement": "blaze_own::String::from_str_in(\"..\", alloc)",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "a string literal's receiver only: the one form of `.to_string()` the tool rewrites without types"
+  },
+  {
+   "path": "std::sync::Mutex",
+   "written": "std::sync::Mutex",
+   "form": "path",
+   "kind": "type",
+   "sites": 21,
+   "replacement": "blaze_core::lock::Lock",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row; bstd re-exports it as `bstd::sync::Lock`, whose `lock(cx)` waits with a deadline (needs `cx` there)"
+  },
+  {
+   "path": "core::cell::OnceCell",
+   "written": "std::cell::OnceCell",
+   "form": "path",
+   "kind": "type",
+   "sites": 20,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "`.clippy.toml`: global state; a field set once is `bstd::sync::PublishOnce`"
+  },
+  {
+   "path": "std::collections::HashSet",
+   "written": "std::collections::HashSet",
+   "form": "path",
+   "kind": "type",
+   "sites": 16,
+   "replacement": "blaze_hash::HashSet<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "`.clippy.toml` row"
+  },
+  {
+   "path": "std::thread::scope",
+   "written": "std::thread::scope",
+   "form": "path",
+   "kind": "function",
+   "sites": 13,
+   "replacement": "bstd::task::Scope",
+   "needs": [
+    "cx"
+   ],
+   "class": "thread",
+   "note": "`.clippy.toml`: blaze's one pool"
+  },
+  {
+   "path": "std::sync::mpsc::channel",
+   "written": "std::sync::mpsc::channel",
+   "form": "path",
+   "kind": "function",
+   "sites": 11,
+   "replacement": "bstd::sync::Chan",
+   "needs": [
+    "cx",
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "`.clippy.toml` says `crossbeam_channel::bounded(n)`; bounded either way"
+  },
+  {
+   "path": "std::thread::available_parallelism",
+   "written": "std::thread::available_parallelism",
+   "form": "path",
+   "kind": "function",
+   "sites": 11,
+   "replacement": "bstd::task::Scope",
+   "needs": [
+    "cx"
+   ],
+   "class": "thread",
+   "note": "the pool owns the count (`.clippy.toml`)"
+  },
+  {
+   "path": "std::env::vars_os",
+   "written": "std::env::vars_os",
+   "form": "path",
+   "kind": "function",
+   "sites": 8,
+   "replacement": null,
+   "needs": [
+    "Env"
+   ],
+   "class": "no-form",
+   "note": "as `vars`"
+  },
+  {
+   "path": "std::sync::MutexGuard",
+   "written": "std::sync::MutexGuard",
+   "form": "path",
+   "kind": "type",
+   "sites": 8,
+   "replacement": "blaze_core::lock::LockGuard",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row"
+  },
+  {
+   "path": "std::process::abort",
+   "written": "std::process::abort",
+   "form": "path",
+   "kind": "function",
+   "sites": 7,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "`.clippy.toml`: return a typed error"
+  },
+  {
+   "path": "core::mem::forget",
+   "written": "std::mem::forget",
+   "form": "path",
+   "kind": "function",
+   "sites": 6,
+   "replacement": "core::mem::ManuallyDrop::new",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` says `std::mem::ManuallyDrop::new`: the same item, from `core`"
+  },
+  {
+   "path": "core::hint::spin_loop",
+   "written": "std::hint::spin_loop",
+   "form": "path",
+   "kind": "function",
+   "sites": 5,
+   "replacement": "bstd::sync::SpinWait",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml`: the one bounded spin-then-park helper"
+  },
+  {
+   "path": "std::thread::yield_now",
+   "written": "std::thread::yield_now",
+   "form": "path",
+   "kind": "function",
+   "sites": 5,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "`.clippy.toml`: wait through the scheduler, or the bounded spin-then-park"
+  },
+  {
+   "path": "std::env::vars",
+   "written": "std::env::vars",
+   "form": "path",
+   "kind": "function",
+   "sites": 4,
+   "replacement": null,
+   "needs": [
+    "Env"
+   ],
+   "class": "no-form",
+   "note": "`.clippy.toml`: the whole environment is a hidden input; read named variables through `Env::get`"
+  },
+  {
+   "path": "std::sync::mpsc::Receiver",
+   "written": "std::sync::mpsc::Receiver",
+   "form": "path",
+   "kind": "type",
+   "sites": 4,
+   "replacement": "bstd::sync::Chan",
+   "needs": [
+    "cx"
+   ],
+   "class": "rename",
+   "note": "as `Sender`"
+  },
+  {
+   "path": "std::thread::park_timeout",
+   "written": "std::thread::park_timeout",
+   "form": "path",
+   "kind": "function",
+   "sites": 4,
+   "replacement": null,
+   "needs": [
+    "cx"
+   ],
+   "class": "no-form",
+   "note": "as `park`"
+  },
+  {
+   "path": "std::sync::RwLock",
+   "written": "std::sync::RwLock",
+   "form": "path",
+   "kind": "type",
+   "sites": 3,
+   "replacement": "blaze_core::lock::ReadLock",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row; `bstd::sync::RwLock`"
+  },
+  {
+   "path": "std::sync::mpsc::Sender",
+   "written": "std::sync::mpsc::Sender",
+   "form": "path",
+   "kind": "type",
+   "sites": 3,
+   "replacement": "bstd::sync::Chan",
+   "needs": [
+    "cx"
+   ],
+   "class": "rename",
+   "note": "`.clippy.toml` says `crossbeam_channel::Sender`, a third-party crate the plan removes; bstd's `Chan` is the end state"
+  },
+  {
+   "path": "std::sync::RwLockReadGuard",
+   "written": "std::sync::RwLockReadGuard",
+   "form": "path",
+   "kind": "type",
+   "sites": 2,
+   "replacement": "blaze_core::lock::ReadGuard",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row"
+  },
+  {
+   "path": "std::sync::RwLockWriteGuard",
+   "written": "std::sync::RwLockWriteGuard",
+   "form": "path",
+   "kind": "type",
+   "sites": 2,
+   "replacement": "blaze_core::lock::WriteGuard",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row"
+  },
+  {
+   "path": "std::thread::park",
+   "written": "std::thread::park",
+   "form": "path",
+   "kind": "function",
+   "sites": 2,
+   "replacement": null,
+   "needs": [
+    "cx"
+   ],
+   "class": "no-form",
+   "note": "`.clippy.toml`: a wait goes through the scheduler with `cx`"
+  },
+  {
+   "path": "std::hash::DefaultHasher",
+   "written": "std::collections::hash_map::DefaultHasher",
+   "form": "path",
+   "kind": "type",
+   "sites": 1,
+   "replacement": "blaze_hash::FixedHasher",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row"
+  },
+  {
+   "path": "std::sync::Barrier",
+   "written": "std::sync::Barrier",
+   "form": "path",
+   "kind": "type",
+   "sites": 1,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "`.clippy.toml`: join on a counter or a job"
+  },
+  {
+   "path": "std::sync::Condvar",
+   "written": "std::sync::Condvar",
+   "form": "path",
+   "kind": "type",
+   "sites": 1,
+   "replacement": "blaze_core::lock::Signal",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row"
+  },
+  {
+   "path": "std::sync::mpsc::SyncSender",
+   "written": "std::sync::mpsc::SyncSender",
+   "form": "path",
+   "kind": "type",
+   "sites": 1,
+   "replacement": "bstd::sync::Chan",
+   "needs": [
+    "cx"
+   ],
+   "class": "rename",
+   "note": "as `Sender`"
+  },
+  {
+   "path": "std::sync::mpsc::sync_channel",
+   "written": "std::sync::mpsc::sync_channel",
+   "form": "path",
+   "kind": "function",
+   "sites": 1,
+   "replacement": "bstd::sync::Chan",
+   "needs": [
+    "cx",
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "as `channel`"
+  },
+  {
+   "path": "core::default::Default",
+   "written": "Default",
+   "form": "path",
+   "kind": "trait",
+   "sites": null,
+   "replacement": null,
+   "needs": [
+    "alloc"
+   ],
+   "class": "no-form",
+   "note": "for a collection: `new_in(alloc)`; blaze-own's types have no `Default`, so `mem::take` on one needs `mem::replace(x, Vec::new_in(alloc))`"
+  },
+  {
+   "path": "core::iter::FromIterator",
+   "written": "FromIterator",
+   "form": "path",
+   "kind": "trait",
+   "sites": null,
+   "replacement": "blaze_own::CollectIn",
+   "needs": [
+    "alloc"
+   ],
+   "class": "no-form",
+   "note": "`collect()` into a blaze-own collection is `collect_in(alloc)`; an impl of `FromIterator` for one cannot exist"
+  },
+  {
+   "path": "core::cell::LazyCell",
+   "written": "std::cell::LazyCell",
+   "form": "path",
+   "kind": "type",
+   "sites": null,
+   "replacement": null,
+   "needs": [],
+   "class": "no-form",
+   "note": "as `OnceCell`"
+  },
+  {
+   "path": "alloc::collections::LinkedList",
+   "written": "std::collections::LinkedList",
+   "form": "path",
+   "kind": "type",
+   "sites": null,
+   "replacement": "blaze_own::VecDeque<T, A>",
+   "needs": [
+    "alloc"
+   ],
+   "class": "add-arg",
+   "note": "`.clippy.toml` says `std::collections::VecDeque`, itself banned by this table: blaze-own's"
+  },
+  {
+   "path": "std::hash::RandomState",
+   "written": "std::collections::hash_map::RandomState",
+   "form": "path",
+   "kind": "type",
+   "sites": null,
+   "replacement": "blaze_hash::FixedState",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row"
+  },
+  {
+   "path": "std::env::home_dir",
+   "written": "std::env::home_dir",
+   "form": "path",
+   "kind": "function",
+   "sites": null,
+   "replacement": "bstd::user",
+   "needs": [
+    "Env"
+   ],
+   "class": "thread",
+   "note": "`.clippy.toml` names one home answer; in bstd it is a capability's"
+  },
+  {
+   "path": "std::fs::File::lock",
+   "written": "std::fs::File::lock",
+   "form": "path",
+   "kind": "function",
+   "sites": null,
+   "replacement": null,
+   "needs": [
+    "Fs"
+   ],
+   "class": "missing",
+   "note": "`.clippy.toml` says `stdx::file_lock::Locked::lock`; bstd has no file lock yet"
+  },
+  {
+   "path": "std::hash::DefaultHasher",
+   "written": "std::hash::DefaultHasher",
+   "form": "path",
+   "kind": "type",
+   "sites": null,
+   "replacement": "blaze_hash::FixedHasher",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row"
+  },
+  {
+   "path": "std::hash::RandomState",
+   "written": "std::hash::RandomState",
+   "form": "path",
+   "kind": "type",
+   "sites": null,
+   "replacement": "blaze_hash::FixedState",
+   "needs": [],
+   "class": "rename",
+   "note": "`.clippy.toml` row"
+  }
+ ]
+}

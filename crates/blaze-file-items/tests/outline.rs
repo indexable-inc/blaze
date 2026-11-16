@@ -182,7 +182,7 @@ fn each_item_form_has_its_kind_name_and_ranges() {
         panic!("`extern crate alloc as heap` renames: {:?}", heap.detail)
     };
     assert_eq!(heap.text(text, rename), "heap");
-    assert_eq!(named(&outline, text, "core").1.detail, ItemDetail::ExternCrate { rename: None });
+    assert_eq!(named(&outline, text, "core").1.detail, ItemDetail::ExternCrate { rename: Rename::Same });
 
     let uses: Vec<_> = outline
         .children(None)

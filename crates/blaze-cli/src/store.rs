@@ -7,7 +7,7 @@
 
 use blaze_drive::Key;
 use blaze_drive::profile::Profile;
-use blaze_own::Vec;
+
 use bstd::cx::Cx;
 use bstd::fs::{Content, Dir, Durable, ReadWrite};
 use bstd::mem::Bytes;
@@ -28,15 +28,14 @@ pub trait Store {
 
 const RECORDS: &str = ".blaze/v2/records";
 
-pub struct FileStore<'d> {
+pub struct FileStore {
     records: Dir<ReadWrite>,
-    _root: &'d Dir<ReadWrite>,
 }
 
-impl<'d> FileStore<'d> {
-    pub fn open(cx: &Cx, root: &'d Dir<ReadWrite>) -> Result<FileStore<'d>, CliError> {
-        let records = root.subdir(cx, &Path::new(RECORDS)?)?;
-        Ok(FileStore { records, _root: root })
+impl FileStore {
+    /// The directory need not exist: the first record written makes it.
+    pub fn open(root: &Dir<ReadWrite>) -> Result<FileStore, CliError> {
+        Ok(FileStore { records: root.subdir(&Path::new(RECORDS)?) })
     }
 
     fn path(key: Key) -> Result<Path, CliError> {
@@ -51,7 +50,7 @@ impl<'d> FileStore<'d> {
     }
 }
 
-impl Store for FileStore<'_> {
+impl Store for FileStore {
     fn get_into(&mut self, cx: &Cx, key: Key, into: &mut Bytes) -> Result<bool, CliError> {
         let path = FileStore::path(key)?;
         if self.records.stat(cx, &path)?.is_none() {
@@ -72,7 +71,6 @@ impl Store for FileStore<'_> {
 
     fn after_answer(&mut self, _cx: &Cx, _profile: &mut Profile) -> Result<(), CliError> {
         // Nothing to seal: each record is its own file, published whole.
-        let _: Option<Vec<u8, &bstd::mem::Frame>> = None;
         Ok(())
     }
 }

@@ -1,0 +1,25 @@
+[package]
+name = "blaze-h1-net"
+description = "The thin driver that runs blaze-h1's HTTP/1.1 machine over bstd's `Net`: name lookup through the capability's resolver, one request per connection, bounded redirects and checked byte ranges; TLS is a `Tls` trait implemented outside, over the operating system's stack"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The request's head and the response's index, in the caller's allocator.
+blaze-own.workspace = true
+# `Net`, `Conn`, `Cx` and the checked `Url` and `HostPort`.
+blaze-std.workspace = true
+# The sans-IO request writer, response parser and redirect policy.
+blaze-h1.workspace = true
+
+[lints]
+workspace = true

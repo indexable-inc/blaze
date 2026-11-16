@@ -36,6 +36,15 @@ const DEPTH: u32 = 256;
 
 /// A snapshot: the undo log's length and the pending obligations. Variables made inside a
 /// snapshot stay as unbound handles after a rollback; none is reachable from a type made before.
+/// One undoable write to the variable table.
+#[derive(Clone, Copy)]
+enum Undo {
+    /// The variable was unbound before.
+    Bound(u32),
+    /// The variable's rank was this before.
+    Rank(u32, u8),
+}
+
 pub(crate) struct Snap {
     undo: usize,
     pending: Vec<Obligation, Global>,
@@ -51,7 +60,9 @@ pub(crate) struct ToyCtx {
     vals: Vec<Option<Ty>, Global>,
     /// Each variable's own handle.
     var_ty: Vec<Ty, Global>,
-    undo: Vec<u32, Global>,
+    /// Each variable's union rank: an upper bound on the depth of the chain ending at it.
+    rank: Vec<u8, Global>,
+    undo: Vec<Undo, Global>,
     env: Vec<Goal, Global>,
     pending: Vec<Obligation, Global>,
     errors: Vec<FulfillError, Global>,
@@ -67,6 +78,7 @@ impl ToyCtx {
             list_index: ListIndex::new_in(Global),
             vals: Vec::new_in(Global),
             var_ty: Vec::new_in(Global),
+            rank: Vec::new_in(Global),
             undo: Vec::new_in(Global),
             env: Vec::new_in(Global),
             pending: Vec::new_in(Global),
@@ -82,7 +94,23 @@ impl ToyCtx {
 
     fn bind(&mut self, v: Var, t: Ty) {
         self.vals[v.index as usize] = Some(t);
-        self.undo.push(v.index);
+        self.undo.push(Undo::Bound(v.index));
+    }
+
+    /// Joins two unbound variables of one kind by rank, so a chain of `n` joins is at most
+    /// `log2 n` deep and `shallow_resolve` stays logarithmic (a join of the newest to the
+    /// oldest every time, as a nested operator chain makes, was a chain of length `n`).
+    fn join(&mut self, x: Var, a: Ty, y: Var, b: Ty) {
+        let (rx, ry) = (self.rank[x.index as usize], self.rank[y.index as usize]);
+        if rx < ry {
+            self.bind(x, b);
+        } else {
+            self.bind(y, a);
+            if rx == ry {
+                self.undo.push(Undo::Rank(x.index, rx));
+                self.rank[x.index as usize] = rx.saturating_add(1);
+            }
+        }
     }
 
     fn unify_at(&mut self, a: Ty, b: Ty, depth: u32) -> Result<bool, CheckError> {
@@ -98,16 +126,16 @@ impl ToyCtx {
         Ok(match (va, vb) {
             (TyView::Error, _) | (_, TyView::Error) => true,
             (TyView::Infer(x), TyView::Infer(y)) => match (x.kind, y.kind) {
+                (k, l) if k == l => {
+                    self.join(x, a, y, b);
+                    true
+                }
                 (VarKind::Ty, _) => {
                     self.bind(x, b);
                     true
                 }
                 (_, VarKind::Ty) => {
                     self.bind(y, a);
-                    true
-                }
-                (k, l) if k == l => {
-                    self.bind(x, b);
                     true
                 }
                 _ => false,
@@ -450,6 +478,7 @@ impl TypeCtx for ToyCtx {
         let t = self.mk(TyView::Infer(Var { kind, index }))?;
         self.vals.push(None);
         self.var_ty.push(t);
+        self.rank.push(0);
         Ok(t)
     }
 
@@ -472,10 +501,24 @@ impl TypeCtx for ToyCtx {
     }
 
     fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError> {
-        let s = self.snapshot();
+        // Unification writes only the variable table, so a failed one undoes that log alone;
+        // a full snapshot here copied the pending queue on every unify, quadratic in the body.
+        let mark = self.undo.len();
         let ok = self.unify_at(a, b, 0)?;
-        if ok { self.commit(s) } else { self.rollback_to(s) }
+        if !ok {
+            self.undo_to(mark);
+        }
         Ok(ok)
+    }
+
+    fn undo_to(&mut self, mark: usize) {
+        while self.undo.len() > mark {
+            match self.undo.pop() {
+                Some(Undo::Bound(i)) => self.vals[i as usize] = None,
+                Some(Undo::Rank(i, r)) => self.rank[i as usize] = r,
+                None => {}
+            }
+        }
     }
 
     fn snapshot(&mut self) -> Snap {
@@ -485,11 +528,7 @@ impl TypeCtx for ToyCtx {
     }
 
     fn rollback_to(&mut self, s: Snap) {
-        while self.undo.len() > s.undo {
-            if let Some(i) = self.undo.pop() {
-                self.vals[i as usize] = None;
-            }
-        }
+        self.undo_to(s.undo);
         self.pending = s.pending;
         self.errors.truncate(s.errors);
         self.errors_taken = self.errors_taken.min(s.errors);
@@ -514,23 +553,25 @@ impl TypeCtx for ToyCtx {
         reads: &mut Reads<'_, W, A>,
     ) -> Result<(), Stop> {
         for _ in 0..SOLVER_ROUNDS {
+            // One pass compacts the kept obligations to the front: `Vec::remove` per settled
+            // obligation made a round quadratic in the queue.
             let mut progress = false;
-            let mut i = 0;
-            while i < self.pending.len() {
+            let mut kept = 0;
+            for i in 0..self.pending.len() {
                 let ob = self.pending[i];
                 match self.attempt(ob, reads)? {
-                    None => {
-                        self.pending.remove(i);
-                        progress = true;
+                    None => progress = true,
+                    Some(FulfillErrorKind::Ambiguous) => {
+                        self.pending[kept] = ob;
+                        kept += 1;
                     }
-                    Some(FulfillErrorKind::Ambiguous) => i += 1,
                     Some(kind) => {
-                        self.pending.remove(i);
                         self.errors.push(FulfillError { obligation: ob, kind });
                         progress = true;
                     }
                 }
             }
+            self.pending.truncate(kept);
             if !progress {
                 return Ok(());
             }

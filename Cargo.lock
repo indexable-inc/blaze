@@ -444,6 +444,7 @@ name = "blaze-blake3"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "blaze-int",
  "blaze-sim",
 ]
 
@@ -519,6 +520,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-cli"
+version = "0.0.0"
+dependencies = [
+ "blaze-drive",
+ "blaze-file-items",
+ "blaze-ids",
+ "blaze-own",
+ "blaze-std",
+ "blaze-surface",
+]
+
+[[package]]
 name = "blaze-codegen-code"
 version = "0.0.0"
 dependencies = [
@@ -547,6 +560,14 @@ dependencies = [
  "libc",
  "parking_lot",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "blaze-data"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -758,6 +779,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-h1"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-hash"
 version = "0.0.0"
 dependencies = [
@@ -868,6 +897,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-format",
  "blaze-id",
+ "blaze-int",
  "blaze-sim",
  "blaze-surface",
 ]
@@ -901,6 +931,16 @@ dependencies = [
 [[package]]
 name = "blaze-int"
 version = "0.0.0"
+
+[[package]]
+name = "blaze-json"
+version = "0.0.0"
+dependencies = [
+ "blaze-base64",
+ "blaze-data",
+ "blaze-own",
+ "blaze-sim",
+]
 
 [[package]]
 name = "blaze-kernel"
@@ -1449,6 +1489,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-check",
+ "blaze-int",
  "blaze-own",
  "blaze-rng",
  "blaze-sim",
@@ -1462,9 +1503,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-tar"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+ "tar",
+]
+
+[[package]]
+name = "blaze-toml"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-typeck"
 version = "0.0.0"
 dependencies = [
+ "blaze-hash",
  "blaze-own",
  "blaze-sim",
 ]
@@ -2183,6 +2243,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aeda16ab4059c5fd2a83f2b9c9e9c981327b18aa8e3b313f7e6563799d4f093e"
 
 [[package]]
+name = "drop_bomb"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bda8e21c04aca2ae33ffc2fd8c23134f3cac46db123ba97bd9d3f3b8a4a85e1"
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2333,6 +2399,12 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "fst"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ab85b9b05e3978cc9a9cf8fea7f01b494e1a09ed3037e16ba39edc7a29eb61a"
 
 [[package]]
 name = "futures"
@@ -2529,6 +2601,93 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hir-def"
+version = "0.0.0"
+dependencies = [
+ "arrayvec",
+ "base-db",
+ "bitflags 2.13.2",
+ "blaze-alloc-count",
+ "blaze-core",
+ "blaze-dbsp",
+ "blaze-format",
+ "blaze-graph",
+ "blaze-hash",
+ "blaze-id",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-mem",
+ "blaze-memo",
+ "blaze-phf",
+ "blaze-record",
+ "blaze-sim",
+ "blaze-surface",
+ "blaze-unitkey",
+ "blaze-vfs",
+ "cfg",
+ "cov-mark",
+ "crossbeam-channel",
+ "drop_bomb",
+ "either",
+ "expect-test",
+ "fst",
+ "hashbrown 0.17.1",
+ "hir-expand",
+ "indexmap",
+ "intern",
+ "inventory",
+ "itertools 0.15.0",
+ "la-arena",
+ "ra-ap-rustc_ast_ir",
+ "rustc_abi",
+ "rustc_apfloat",
+ "rustc_parse_format",
+ "smallvec",
+ "span",
+ "stdx",
+ "syntax",
+ "syntax-bridge",
+ "test-utils",
+ "thin-vec",
+ "tracing",
+ "triomphe",
+ "tt",
+ "unicode-ident",
+]
+
+[[package]]
+name = "hir-expand"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-alloc-count",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-mem",
+ "blaze-memo",
+ "blaze-phf",
+ "blaze-vfs",
+ "cfg",
+ "cov-mark",
+ "either",
+ "expect-test",
+ "intern",
+ "itertools 0.15.0",
+ "mbe",
+ "parser",
+ "smallvec",
+ "span",
+ "stdx",
+ "syntax",
+ "syntax-bridge",
+ "test-utils",
+ "thin-vec",
+ "tracing",
+ "triomphe",
+ "tt",
+]
 
 [[package]]
 name = "http"
@@ -2748,6 +2907,15 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",
+]
+
+[[package]]
+name = "inventory"
+version = "0.3.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6928282826c822ad91bf1c9a1cb90a30ba1c26770749929b4656cd6be829cd7c"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]
@@ -3549,6 +3717,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "ra-ap-rustc_ast_ir"
+version = "0.179.0"
+
+[[package]]
 name = "ra-ap-rustc_hashes"
 version = "0.179.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3814,6 +3986,15 @@ dependencies = [
  "memchr",
  "unicode-ident",
  "unicode-properties",
+]
+
+[[package]]
+name = "rustc_parse_format"
+version = "0.0.0"
+dependencies = [
+ "ra-ap-rustc_index",
+ "rustc-literal-escaper",
+ "rustc_lexer",
 ]
 
 [[package]]
@@ -5552,10 +5733,6 @@ version = "0.137.1"
 [[patch.unused]]
 name = "llvm-sys"
 version = "231.0.1"
-
-[[patch.unused]]
-name = "ra-ap-rustc_ast_ir"
-version = "0.179.0"
 
 [[patch.unused]]
 name = "ra-ap-rustc_pattern_analysis"

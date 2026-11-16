@@ -28,9 +28,9 @@
 //! A call loads its word relative to itself (`call [rip + word]`; `adrp`, `ldr`), so every
 //! body must be within reach of the table: 2 GiB on x86-64, 4 GiB on AArch64. The table is
 //! therefore in the mapping the code is in, before it, and the whole is at most [`REACH`]:
-//! any body reaches any word, with no second copy of the table. (On macOS this also has to
-//! be so: a `MAP_JIT` mapping cannot be placed at a chosen address beside another.) The
-//! words are data that happen to lie in the code's mapping; a store to one goes through
+//! any body reaches any word, with no second copy of the table. The words are data that
+//! happen to lie in the code's mapping, with the writable data region (the counter table, the
+//! mark bitmaps, the wait table) beyond the code; a store to one goes through
 //! `sys::Code::store`, as a gate's flag does.
 
 use core::sync::atomic::Ordering;

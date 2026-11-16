@@ -99,6 +99,10 @@ pub struct Records {
     sealed: bool,
 }
 
+/// The key the snapshot's one `CrateGraph` is held under: the graph is the build's, of every
+/// crate in it, so no crate's key is its key.
+const GRAPH_KEY: ContentId = ContentId([0; 32]);
+
 /// The view of a buffer [`Records::insert`] checked.
 fn checked<T>(kind: RecordKind, view: Result<T, FormatError>) -> T {
     view.unwrap_or_else(|error| {
@@ -136,7 +140,12 @@ impl Records {
             RecordKind::MacroDef => MacroDefView::read(&buffer).map_err(format)?.head().item.0,
             RecordKind::KeyIndex => KeyIndexView::read(&buffer).map_err(format)?.module().0,
             RecordKind::LangItems => LangItemsView::read(&buffer).map_err(format)?.krate().0,
-            RecordKind::CrateGraph => CrateGraphView::read(&buffer).map_err(format)?.root().0,
+            RecordKind::CrateGraph => {
+                            // One graph per snapshot, the build's: held under the one key no content
+                            // has, a second refused as `Twice`.
+                            CrateGraphView::read(&buffer).map_err(format)?;
+                            GRAPH_KEY
+                        },
             RecordKind::NoImplsOf => NoImplsOfView::read(&buffer).map_err(format)?.krate().0,
         };
         self.records.push((kind, key, buffer));
@@ -295,7 +304,11 @@ impl Items for Records {
 
     fn crate_graph(&self, krate: CrateItemKey) -> Result<CrateGraphView<'_>, SurfaceError> {
         let kind = RecordKind::CrateGraph;
-        Ok(checked(kind, CrateGraphView::read(self.of_crate(kind, krate)?)))
+        let missing = SurfaceError::NoCrateRecord { fact: kind.name(), krate };
+        let graph = checked(kind, CrateGraphView::read(self.record(kind, GRAPH_KEY).ok_or(missing)?));
+        // The build's graph, asked for a crate it holds; of any other crate there is none.
+        graph.index_of(krate).ok_or(missing)?;
+        Ok(graph)
     }
 
     fn no_impls_of(&self, krate: CrateItemKey) -> Result<NoImplsOfView<'_>, SurfaceError> {

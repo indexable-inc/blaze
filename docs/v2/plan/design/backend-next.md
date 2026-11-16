@@ -171,8 +171,9 @@ conversions, `freeze`, stack slots with `slot_addr`/`ptr_add`/`load`/`store`/`sl
 semantics (lib.rs: shifts mask, division by zero and `MIN / -1` trap); undefined behaviour is
 an outcome of its own, and an operation it does not model is a typed refusal, never a guess.
 Fuel bounds every run. It is a test reference, never const eval. A seeded generator
-(`blaze_sim` tape, bounded: up to 6 blocks, 24 instructions a block, counted loops) builds
-verified functions; the harness runs each through every `Tier` and compares outcomes. Tiers
+(`blaze_sim` tape, bounded: up to 6 blocks of 12 operations, forward edges plus self-loops
+counted to at most 5, every value mixed into a returned accumulator) builds verified functions
+(crates/blaze-lir/src/tiers.rs); the harness runs each through every `Tier` and compares. Tiers
 today: the evaluator on the built function, on its record read in place (`persist`), and on
 `parse(print(f))`; a planted tier that miscompiles `sub` as `add` must be caught
 (`blaze_sim::control`). The stencils on LIR and LLVM on LIR join as `Tier`s when they exist.

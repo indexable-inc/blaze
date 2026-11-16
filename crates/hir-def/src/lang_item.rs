@@ -51,11 +51,17 @@ fn target_of(db: &Db, key: ItemKey) -> Option<LangItemTarget> {
         ItemKind::Variant => LangItemTarget::EnumVariantId(EnumVariantId::of_key(db, key)),
         // A macro's id needs its definition record's expander (not built); the rest are no
         // lang item's kind.
-        ItemKind::Macro
+        ItemKind::MacroRules
+        | ItemKind::Macro2
         | ItemKind::Module
         | ItemKind::Use
         | ItemKind::ExternCrate
-        | ItemKind::Field => return None,
+        | ItemKind::Field
+        | ItemKind::TraitAlias
+        | ItemKind::ExternBlock
+        | ItemKind::MacroCall
+        | ItemKind::Error
+        | ItemKind::Unhandled => return None,
     })
 }
 
@@ -67,9 +73,9 @@ pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
     let view = db.items().lang_items(krate.key(db)).or_need();
     let mut lang_items = LangItems::default();
-    for (name, key) in view.items() {
+    for (name, key) in view.iter() {
         if let Some(target) = target_of(db, key) {
-            lang_items.assign_lang_item(Symbol::intern(name), target);
+            lang_items.assign_lang_item(Symbol::intern(name.as_str()), target);
         }
     }
     if matches!(krate.data(db).origin, base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Core)) {
@@ -80,28 +86,34 @@ pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
     if lang_items.is_empty() { None } else { Some(Box::new(lang_items)) }
 }
 
-/// A query. Look for a lang items, starting from the specified crate and recursively
-/// traversing its dependencies.
+/// The lang items `start_crate` sees: its own, then those of every crate it loads, as its
+/// row of the build's `CrateGraph` lists them (rustc's closure: never into a crate that loads
+/// only macros), the first definition of each kept. Only a crate the graph flags as defining
+/// lang items is read (`CrateFlags::LANG_ITEMS`): one row read, then one record per such crate.
 #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
 pub fn lang_items(db: &Db, start_crate: Crate) -> LangItems {
     let _p = tracing::info_span!("lang_items_query").entered();
-
-    let mut result = crate_lang_items(db, start_crate).cloned().unwrap_or_default();
-
-    // The crates the start crate can name, as its crate graph record lists them (the extern
-    // prelude and every `extern crate`, sysroot complexities already settled there), each
-    // once; the start crate itself is skipped (`extern crate self as core`).
-    let graph = db.items().crate_graph(start_crate.key(db)).or_need();
-    for dep in graph.deps_of(start_crate.key(db)) {
+    let key = start_crate.key(db);
+    let graph = db.items().crate_graph(key).or_need();
+    let Some(start) = graph.index_of(key) else {
+        return Err(base_db::SurfaceError::NoCrateRecord { fact: "CrateGraph", krate: key }).or_need();
+    };
+    let defines = |at| graph.flags(at).contains(blaze_surface::CrateFlags::LANG_ITEMS);
+    let mut result = LangItems::default();
+    if defines(start) {
+        result = crate_lang_items(db, start_crate).cloned().unwrap_or_default();
+    }
+    // The closure holds the crate itself, read above.
+    for at in graph.closure(start).filter(|&at| at != start && defines(at)) {
+        let dep = graph.key(at);
         let Some(krate) = db.crate_of_key(dep) else {
-            return Err(base_db::SurfaceError::NoCrateRecord { fact: "CrateGraph", krate: dep })
+            return Err(base_db::SurfaceError::NoCrateRecord { fact: "the task's crate table", krate: dep })
                 .or_need();
         };
-        if krate != start_crate {
-            result.merge_prefer_self(lang_items(db, krate));
+        if let Some(items) = crate_lang_items(db, krate) {
+            result.merge_prefer_self(items);
         }
     }
-
     result
 }
 
@@ -115,17 +127,13 @@ fn resolve_core_path(
 ) -> Option<ItemKey> {
     let mut current = ModuleScope::of(core_def_map.root_module_id());
     for module in modules {
-        let target = current.get(db, blaze_surface::Namespace::Types, &Name::new_symbol_root(*module))?;
-        let blaze_surface::Target::Item(key) = target else { return None };
+        let key = current.get(db, blaze_surface::Namespace::Types, &Name::new_symbol_root(*module))?;
         if !key.is_of(core_def_map.krate().key(db)) {
             return None;
         }
         current = ModuleScope::of(crate::key::module_of_key(db, key));
     }
-    match current.get(db, ns, &Name::new_symbol_root(name))? {
-        blaze_surface::Target::Item(key) => Some(key),
-        blaze_surface::Target::Undetermined | blaze_surface::Target::Ambiguous(..) => None,
-    }
+    current.get(db, ns, &Name::new_symbol_root(name))
 }
 
 fn resolve_core_trait(

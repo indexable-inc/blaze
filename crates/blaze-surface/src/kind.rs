@@ -30,8 +30,8 @@ macro_rules! byte_enum {
         }
 
         impl $name {
-            /// Every value, in byte order.
-            $vis const ALL: &'static [$name] = &[$( $name::$variant, )*];
+            /// Every value, in byte order: an array, so `for x in T::ALL` yields values.
+            $vis const ALL: [$name; [$( $name::$variant, )*].len()] = [$( $name::$variant, )*];
 
             /// The value whose byte is `byte`, if any.
             $vis const fn from_byte(byte: u8) -> Option<$name> {

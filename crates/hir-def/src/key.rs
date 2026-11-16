@@ -228,7 +228,7 @@ pub fn ast_id_of<N: AstIdNode>(db: &Db, key: ItemKey) -> AstId<N> {
         krate.data(db).edition,
         krate.extensions(db),
     );
-    let range = TextRange::at(TextSize::new(item.at), TextSize::new(item.len));
+    let range = TextRange::at(TextSize::new(item.range.start), TextSize::new(item.range.len()));
     let tree = file_id.parse(db).tree();
     let node = tree
         .syntax()
@@ -259,8 +259,21 @@ pub fn module_def_of_key(db: &Db, key: ItemKey) -> ModuleDefId {
         ItemKind::TypeAlias => ModuleDefId::TypeAliasId(TypeAliasId::of_key(db, key)),
         ItemKind::Module => ModuleDefId::ModuleId(module_of_key(db, key)),
         ItemKind::Variant => ModuleDefId::EnumVariantId(EnumVariantId::of_key(db, key)),
-        ItemKind::Macro => ModuleDefId::MacroId(macro_of_key(db, key)),
-        kind @ (ItemKind::Impl | ItemKind::Use | ItemKind::ExternCrate | ItemKind::Field) => {
+        ItemKind::MacroRules | ItemKind::Macro2 => ModuleDefId::MacroId(macro_of_key(db, key)),
+        // A trait alias has no id of the type checker's yet: a typed stop, not a wrong id.
+        ItemKind::TraitAlias => Err(SurfaceError::NotBuilt(blaze_surface::NotBuilt {
+            method: "a trait alias as the type checker names it",
+            item: key,
+        }))
+        .or_need(),
+        kind @ (ItemKind::Impl
+        | ItemKind::Use
+        | ItemKind::ExternCrate
+        | ItemKind::Field
+        | ItemKind::ExternBlock
+        | ItemKind::MacroCall
+        | ItemKind::Error
+        | ItemKind::Unhandled) => {
             panic!("item {key:x}: a scope binds it, but a {} is bound in no namespace", kind.name())
         }
     }
@@ -305,22 +318,34 @@ pub fn macro_of_key(db: &Db, key: ItemKey) -> MacroId {
             let loc = Macro2Loc { container, key, expander: declarative, allow_internal_unsafe: false, edition };
             MacroId::Macro2Id(loc.intern(db))
         }
-        MacroKind::Builtin => {
-            let expander = match find_builtin_macro(&name) {
-                Some(either::Either::Left(it)) => MacroExpander::BuiltIn(it),
-                Some(either::Either::Right(it)) => MacroExpander::BuiltInEager(it),
-                None => match (find_builtin_attr(&name), find_builtin_derive(&name)) {
-                    (Some(it), _) => MacroExpander::BuiltInAttr(it),
-                    (None, Some(it)) => MacroExpander::BuiltInDerive(it),
-                    (None, None) => MacroExpander::UnimplementedBuiltIn,
+        // The record names which builtin; the expander is found by the definition's name, of
+        // the kind the record says (a name the expander lacks is an unimplemented builtin).
+        kind @ (MacroKind::BuiltinFn(_) | MacroKind::BuiltinAttr(_) | MacroKind::BuiltinDerive(_)) => {
+            let expander = match kind {
+                MacroKind::BuiltinFn(_) => match find_builtin_macro(&name) {
+                    Some(either::Either::Left(it)) => MacroExpander::BuiltIn(it),
+                    Some(either::Either::Right(it)) => MacroExpander::BuiltInEager(it),
+                    None => MacroExpander::UnimplementedBuiltIn,
+                },
+                MacroKind::BuiltinAttr(_) => match find_builtin_attr(&name) {
+                    Some(it) => MacroExpander::BuiltInAttr(it),
+                    None => MacroExpander::UnimplementedBuiltIn,
+                },
+                _ => match find_builtin_derive(&name) {
+                    Some(it) => MacroExpander::BuiltInDerive(it),
+                    None => MacroExpander::UnimplementedBuiltIn,
                 },
             };
             let loc = Macro2Loc { container, key, expander, allow_internal_unsafe: false, edition };
             MacroId::Macro2Id(loc.intern(db))
         }
-        MacroKind::ProcBang => proc_macro(ProcMacroKind::Bang),
-        MacroKind::ProcAttr => proc_macro(ProcMacroKind::Attr),
-        MacroKind::ProcDerive => proc_macro(ProcMacroKind::CustomDerive),
+        // The proc macro's crate is the record's `krate`, which is the crate its key is of:
+        // the definition is an item of the proc-macro crate's root.
+        MacroKind::ProcMacro { kind, .. } => proc_macro(match kind {
+            blaze_surface::ProcKind::FnLike => ProcMacroKind::Bang,
+            blaze_surface::ProcKind::Attr => ProcMacroKind::Attr,
+            blaze_surface::ProcKind::Derive => ProcMacroKind::CustomDerive,
+        }),
     }
 }
 

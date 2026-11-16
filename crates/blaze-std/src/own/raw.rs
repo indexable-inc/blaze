@@ -37,6 +37,13 @@ pub const fn same(a: TypeId, b: TypeId) -> bool {
 #[blaze::noalloc]
 #[blaze::nonblocking]
 pub fn shape(id: TypeId) -> Shape {
+    // An array or slice is asked by its element first, never through `info`: the pinned
+    // nightly's `type_id_type_of` writes a payload into `TypeKind::Array`, which its core
+    // declares without fields, and the compiler panics (index 0 of no fields, in
+    // `write_type_info`). `element_ty` is its own intrinsic and answers both shapes.
+    if id.element_ty().is_some() {
+        return Shape::Elements;
+    }
     match id.info().kind {
         TypeKind::Bool
         | TypeKind::Char

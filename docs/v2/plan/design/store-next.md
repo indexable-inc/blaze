@@ -66,10 +66,27 @@ as a control.
   published row gets an `Effect::Sync` instead: a fetched file is a whole-file write, which a crash
   may undo until a sync covers it. After the barriers comes one flip, `Change::Seal { (id, generation) }`.
   The flip seals a row only while it is still that row: a file written again gets the row's
-  generation anew and is unsealed. A segment that a new boot's open checks whole is sealed by the
-  open's own stamp flip, with no barrier, because its bytes were read from the media.
+  generation anew and is unsealed. A check at a new boot's open does not seal (only the barrier
+  does), so a segment that only a check proved is checked again at the boot after.
   `Verified::sealed` is the third and last way a mapped segment becomes readable. A sealed row
   whose file length differs is lost by name.
+  - **The bound, decided** (2026-11-15, by the coordinator, for the owner to overturn). A sealed
+    segment is not walked before the first answer after a boot; it is walked once a boot in the
+    background. `Plain::scrub_next(budget)` (`Driven::scrub_next`, on a lowered thread) walks the
+    next sealed segment not yet walked this boot, oldest row first, at most `budget` bytes a
+    slice, checking every record's CRC-32C. A whole walk sets the row's boot by a flip (the same
+    record as the open's whole check: "walked this boot" is a row whose boot is this boot's id,
+    a value passed in, rule 75). A rot found is lost by name, out of the lookup at once, and
+    retired by the flip, through the open's own loss path. The next lookup misses, and the
+    record is rebuilt or fetched.
+  - **The accepted risk.** A byte that rots in a sealed segment is found within one boot's
+    background pass, or by `scrub`. A record read before its segment's pass that boot is
+    unchecked, as this boot's own segments are.
+  - **Not taken: a check on first read.** Checking a record's CRC-32C the first time a process
+    hands it out from a sealed segment needs a per-segment bitset that lock-free readers set,
+    costs in proportion to what is read on the answer's path, and reverses decision 18
+    (`Checks::per_read` stays asserted zero). The goal order puts the edit loop after a restart
+    first; the pass costs it nothing.
 - **No index prefault.** `on_map` no longer touches the index; `PlainConfig::page` is gone.
 - **A lookup that reads no run ends.** `format::find` (now `find_by`) interpolates between bounds
   that start as the whole key space and become each probe's prefix as it narrows. Each guess stays
@@ -112,11 +129,16 @@ blaze-drive (another lane's crate; nothing there edited):
 
 1. After the answer, on a lowered thread: `Driven::seal()`, then `Driven::compact(n)`. Never before
    the answer, never waited on by it.
-2. At open: `Driven::machine(&[checkout, home])` in each spelling the command knows, before any put
+2. In the helper left after the answer (rule 70, with its expiry), at idle IO priority:
+   `Driven::scrub_next(SLICE_BYTES)` until it returns `None` (every sealed segment walked this
+   boot) or the helper expires. A slice with `rot` carries a loss the profile records. The boot
+   id passed as `PlainConfig::boot` is `kern.bootsessionuuid` on macOS and
+   `/proc/sys/kernel/random/boot_id` on Linux, hashed to 64 bits.
+3. At open: `Driven::machine(&[checkout, home])` in each spelling the command knows, before any put
    to a shared namespace.
-3. The certificate: `locate` and one `pread` (`Driven::get_into`), not `get` (which faults the
+4. The certificate: `locate` and one `pread` (`Driven::get_into`), not `get` (which faults the
    payload's pages on first touch).
-4. Read `report().sealed` and `report().checked` into the profile: segments proved by row and
+5. Read `report().sealed` and `report().checked` into the profile: segments proved by row and
    checked whole this open.
 
 blaze-solo: pass `Config::lanes` as the number of file threads the native driver was made with
@@ -141,6 +163,15 @@ blaze-run's `Parent`:
     segment proved by its seal passes `check_segment` on the disk's bytes; the boot-1 reader still
     reads what it held; and when the boot's last seal survived, the new boot checks nothing in full.
   - Control `the_oracle_catches_a_seal_before_its_barrier` (`Plant::SealBeforeBarrier`).
+- `the_background_pass_retires_rot_and_resumes_after_a_cut` (property, on `Sim`).
+  - Boot 1 seals one to four segments. One byte of one segment's last record rots. At boot 2 a
+    holder maps a record of that segment, then durable processes walk one record a slice, and a
+    power cut lands anywhere in the pass.
+  - Oracle: no segment is walked again once its walk's flip landed, and none is skipped. The rot
+    is lost by name and no lookup serves it. The holder's bytes stay. The store's oracle holds.
+    Boot 3 has every survivor to walk again.
+  - Control `the_oracle_catches_a_segment_marked_scrubbed_before_its_walk_ends`
+    (`Plant::ScrubMarkedEarly`).
 - `a_lookup_reads_only_the_pages_its_probes_land_on`: page counts for a run of 200,000, against the
   old lookup as the control. `a_lookup_finds_every_key_of_an_uneven_run` (property): clustered
   prefixes.

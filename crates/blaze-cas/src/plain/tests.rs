@@ -2126,6 +2126,160 @@ fn the_oracle_catches_a_seal_before_its_barrier() {
     assert!(caught.is_some(), "no seed of 64 caught a seal flipped before its barriers");
 }
 
+/// One history of the background pass (store-next.md, "the bound"): boot 1 commits `segments`
+/// local segments of eight records each and seals them; the power is cut, and one byte of the
+/// last non-empty record (in index order) of one segment rots on the disk. At boot 2 a holder
+/// opens (every segment proved by its seal, no byte read) and holds a record of the rotted
+/// segment's mapping; then durable processes of boot 2 walk the pass one record a slice, the
+/// power cut after `cut_after` completions once when it is given (the next process resumes).
+/// The oracle: no segment is walked again once its walk's flip landed, none is skipped, the
+/// rot is found, lost by name and retired so no lookup serves it, the holder's bytes stay as
+/// they were mapped, every other committed record reads back, and boot 3 walks the survivors
+/// again.
+fn scrubbing(seed: u64, segments: u32, cut_after: Option<u32>, plant: Plant) -> Result<(), String> {
+    let mut sim = Sim::new(seed, Faults::default());
+    let mut ledger = Ledger::default();
+    let mut w = [Actor::new(cfg(0, 1, true), Plant::None)];
+    settle(&mut sim, &mut w);
+    let mut keys_of = BTreeMap::new();
+    for s in 0..segments {
+        let range = s * 8..s * 8 + 8;
+        keys_of.insert(commit_local(&mut sim, &mut w, range.clone(), &mut ledger), range);
+    }
+    assert!(w[0].store.seal(&mut w[0].effects), "boot 1 has a tail to seal");
+    settle(&mut sim, &mut w);
+    let rotted = *keys_of.keys().nth((seed % u64::from(segments)) as usize).expect("a segment");
+    // The last record in index order with a payload: a pass that stops after its first slice
+    // never reaches it.
+    let (row, bytes) = w[0].store.segment(rotted).expect("named");
+    let run = row.run(bytes.expect("mapped here"));
+    let target = (0..row.count as usize).rev().map(|i| Entry::read(&run[i * ENTRY..(i + 1) * ENTRY])).find(|it| it.len > 0).expect("a record with a payload");
+    let bad = keys_of[&rotted].clone().find(|&n| key(n).0 == target.key).expect("the record's key");
+    drop(w);
+    sim.crash();
+    let file = FileName::new(&format!("plain/seg-{rotted:016x}")).expect("a name");
+    let was = sim.contents(&file)[target.at as usize];
+    sim.rot(&file, target.at, &[!was]);
+
+    let holder = reader(&mut sim, 1, 2);
+    assert_eq!(holder.store.proved_by_seal().len(), segments as usize, "boot 2 proves every segment by its seal");
+    let kept = keys_of[&rotted].clone().find(|&n| n != bad && !value(n).is_empty()).expect("another record");
+    let held = holder.store.get(&key(kept)).expect("mapped by the holder").bytes;
+
+    // Walked to its end by some process (its flip may have been cut), and walked to its end
+    // with its flip landed (a later process of the boot must not walk it again).
+    let mut ended: BTreeSet<u64> = BTreeSet::new();
+    let mut landed: BTreeSet<u64> = BTreeSet::new();
+    let mut lost_by_name = false;
+    let mut budget = cut_after;
+    let mut n = 2;
+    let last = 'pass: loop {
+        let mut b = [Actor::new(cfg(n, 2, true), plant)];
+        n += 1;
+        settle(&mut sim, &mut b);
+        if let Some(why) = b[0].store.broken() {
+            return Err(format!("a scrubber's open broke: {why}"));
+        }
+        // A rot found by a process the cut stopped after its flip landed: reported from its
+        // mark by the next open.
+        lost_by_name |= named_lost(&b[0].store).contains(&rotted);
+        loop {
+            let Some(slice) = b[0].store.scrub_next(1, &mut b[0].effects) else { break 'pass b };
+            if landed.contains(&slice.segment) {
+                return Err(format!("segment {:016x} walked again after its walk's flip landed", slice.segment));
+            }
+            if slice.done {
+                ended.insert(slice.segment);
+            }
+            if !run(&mut sim, &mut b, &mut budget) {
+                // The power cut mid-pass: the next process of this boot resumes.
+                budget = None;
+                drop(b);
+                sim.crash();
+                continue 'pass;
+            }
+            if let Some(why) = b[0].store.broken() {
+                return Err(format!("a scrubber broke on its own: {why}"));
+            }
+            if slice.done {
+                landed.insert(slice.segment);
+            }
+            if let Some(rot) = slice.rot {
+                if slice.segment != rotted || rot.key != key(bad) {
+                    return Err(format!("the pass found rot in {:016x} ({rot:?}), planted only in record {bad} of {rotted:016x}", slice.segment));
+                }
+                lost_by_name |= named_lost(&b[0].store).contains(&rotted);
+                if b[0].store.get(&key(bad)).is_some() {
+                    return Err(format!("record {bad} served by the process that retired its segment"));
+                }
+            }
+        }
+    };
+    let all: BTreeSet<u64> = keys_of.keys().copied().collect();
+    if ended != all {
+        return Err(format!("the pass skipped {:x?}", all.difference(&ended).collect::<Vec<_>>()));
+    }
+    if !lost_by_name {
+        return Err(format!("the rot in record {bad} of segment {rotted:016x} was never found and lost by name"));
+    }
+    if last.store.get(&key(bad)).is_some() {
+        return Err(format!("record {bad} of the retired segment {rotted:016x} is still served"));
+    }
+    drop(last);
+    if held != value(kept).as_slice() {
+        return Err(format!("record {kept}, held through the retire of {rotted:016x}, changed under its holder"));
+    }
+    let after = reader_with(&mut sim, 20, 2, Plant::None);
+    if after.store.get(&key(bad)).is_some() {
+        return Err(format!("a later lookup of record {bad} hit the retired segment {rotted:016x}"));
+    }
+    if !after.store.unscrubbed().is_empty() {
+        return Err(format!("boot 2's pass ended and {:x?} is still left this boot", after.store.unscrubbed()));
+    }
+    // `cut`, not durable: the rotted segment's records are lost, by name.
+    oracle_with(&after.store, &ledger, true, false, &BTreeSet::from([rotted]))?;
+    drop(after);
+    drop(holder);
+    sim.crash();
+    let next = reader(&mut sim, 21, 3);
+    let survivors: BTreeSet<u64> = all.iter().copied().filter(|it| *it != rotted).collect();
+    if next.store.unscrubbed().into_iter().collect::<BTreeSet<u64>>() != survivors {
+        return Err(format!("boot 3 has {:x?} left to walk, not every surviving segment {survivors:x?}", next.store.unscrubbed()));
+    }
+    Ok(())
+}
+
+/// The bound of the accepted risk (store-next.md): a byte that rots in a sealed segment is
+/// found by the boot's background pass and the segment retired, a crash anywhere in the pass
+/// resumes it with nothing walked twice and nothing skipped, and a reader holding the
+/// segment's mapping keeps its bytes.
+#[test]
+fn the_background_pass_retires_rot_and_resumes_after_a_cut() {
+    blaze_sim::check(SimConfig::DEFAULT, |tape| {
+        let seed = tape.next_u64("sim seed");
+        let segments = tape.int_in(1..=4u32, "sealed segments");
+        let cut = tape.int_in(0..=1u32, "power cut") == 1;
+        let after = tape.int_in(0..=80u32, "cut after");
+        let outcome = scrubbing(seed, segments, cut.then_some(after), Plant::None);
+        assert!(outcome.is_ok(), "seed {seed}, {segments} segments, cut {cut} after {after}: {outcome:?}");
+    });
+}
+
+/// The control: a pass that records a segment walked after its first slice never reaches the
+/// rot in its last record; the oracle catches it.
+#[test]
+fn the_oracle_catches_a_segment_marked_scrubbed_before_its_walk_ends() {
+    let mut caught = None;
+    for seed in 0..16 {
+        let honest = scrubbing(seed, 3, None, Plant::None);
+        assert!(honest.is_ok(), "seed {seed} without the plant: {honest:?}");
+        if caught.is_none() {
+            caught = scrubbing(seed, 3, None, Plant::ScrubMarkedEarly).err();
+        }
+    }
+    assert!(caught.is_some(), "no seed of 16 caught a segment marked scrubbed before its walk ended");
+}
+
 /// A run of `n` test keys, sorted.
 fn run_of(n: u32) -> Vec<u8> {
     let mut entries = Vec::new_in(Global);
@@ -2165,22 +2319,25 @@ fn endpoint_find<'a>(n: usize, key: &ContentId, mut key_of: impl FnMut(usize) ->
 }
 
 /// The pages of 16 KiB a lookup of each probed key touches, at most and in all, and how many
-/// lookups touched the run's first or last page with their key on neither.
+/// lookups read the run's first or last entry with their key at neither.
 fn pages_touched(run: &[u8], n: u32, endpoints: bool) -> (usize, usize, usize) {
     const PAGE: usize = 16 << 10;
     let count = run.len() / ENTRY;
-    let last_page = (run.len() - 1) / PAGE;
     let (mut most, mut total, mut at_ends) = (0, 0, 0);
     for k in (0..n).step_by(101).chain([n + 1, n + 7_000]) {
         let mut pages = BTreeSet::new();
+        let mut entries = BTreeSet::new();
         let key_of = |i: usize| {
             pages.insert(i * ENTRY / PAGE);
+            entries.insert(i);
             &run[i * ENTRY..i * ENTRY + 32]
         };
         let found = if endpoints { endpoint_find(count, &key(k).0, key_of) } else { format::find_by(count, &key(k).0, key_of) };
-        assert_eq!(found.map(|i| run[i * ENTRY..i * ENTRY + 32] == key(k).0.0),(k < n).then_some(true), "key {k}");
-        let home = found.map(|i| i * ENTRY / PAGE);
-        if (pages.contains(&0) && home != Some(0)) || (pages.contains(&last_page) && home != Some(last_page)) {
+        assert_eq!(found.map(|i| run[i * ENTRY..i * ENTRY + 32] == key(k).0.0), (k < n).then_some(true), "key {k}");
+        // The cause, measured exactly: a read of the run's first or last entry for a key that
+        // is neither. (A page measure counts a probe that interpolation put on the first or
+        // last page for a key on the page next to it: a probe, not an endpoint read.)
+        if (entries.contains(&0) && found != Some(0)) || (entries.contains(&(count - 1)) && found != Some(count - 1)) {
             at_ends += 1;
         }
         most = most.max(pages.len());
@@ -2197,7 +2354,7 @@ fn a_lookup_reads_only_the_pages_its_probes_land_on() {
     let n = 200_000;
     let run = run_of(n);
     let (most, total, at_ends) = pages_touched(&run, n, false);
-    assert_eq!(at_ends, 0, "lookups read the run's first or last page for keys on neither");
+    assert_eq!(at_ends, 0, "lookups read the run's first or last entry for keys at neither");
     assert!(most <= 6, "a lookup touched {most} pages of a {n}-entry run");
     let (_, old_total, old_at_ends) = pages_touched(&run, n, true);
     assert!(old_at_ends > 0, "the control: the old lookup read the run's ends");

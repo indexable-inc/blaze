@@ -321,7 +321,7 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
     use crate::diag::{At, DiagCode};
     use crate::error::Stop;
     use crate::machine::Machine;
-    use crate::ty::{Cause, Goal, Obligation, TyView, TypeCtx};
+    use crate::ty::{Cause, Goal, Obligation, TypeCtx};
     use crate::world::Reads;
 
     let mut body = BodyBuf::new(Edition::E2021);
@@ -350,8 +350,9 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
     };
     let before = (m.diags.len(), m.errors, m.numeric.len(), m.ty.pending_len());
     let left = |m: &mut Machine<'_, '_, '_, ToyWorld, ToyCtx, Global>| {
-        let resolved = m.ty.shallow_resolve(var);
-        let bound = !matches!(m.ty.view(resolved), TyView::Infer(_));
+        // `var` is bound to `n`, itself an unbound integer variable, so "bound" is "resolves
+        // to something else", not "resolves to a non-variable".
+        let bound = m.ty.shallow_resolve(var) != var;
         (m.diags.len(), m.errors, m.numeric.len(), m.ty.pending_len(), bound)
     };
 

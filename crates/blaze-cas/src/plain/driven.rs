@@ -20,7 +20,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, Committed, Got, Plain, PlainConfig, PutError, Report, Sliced, TAGS},
+    core::{Batch, Committed, Got, Plain, PlainConfig, PutError, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::{Form, Settings},
 };
@@ -402,6 +402,23 @@ impl<D: Driver> Driven<D> {
         }
         self.run("sealing the exit tail")?;
         Ok(true)
+    }
+
+    /// One slice of the background pass ([`Plain::scrub_next`]), on a lowered thread: the
+    /// helper a command leaves after its answer calls it until it returns `None` (every sealed
+    /// segment walked this boot) or the helper expires. A rot it finds is in
+    /// [`Driven::report`]'s losses, handed to the caller with the slice.
+    pub fn scrub_next(&mut self, budget_bytes: u64) -> Result<Option<Scrubbed>, StoreError> {
+        lower_this_thread()?;
+        let Some(slice) = self.core.scrub_next(budget_bytes, &mut self.effects) else { return Ok(None) };
+        if !self.core.ready() {
+            self.run("recording the background pass")?;
+        }
+        if slice.rot.is_some() {
+            // Handed to the caller with the slice: the next flip clears its mark.
+            self.core.handed();
+        }
+        Ok(Some(slice))
     }
 
     /// Adds `paths` (the checkout's, the home's, in each spelling the caller knows) to what a

@@ -210,3 +210,12 @@ the crate):
   (`MacroDefView` holds the definition's place, not its tokens).
 - The include table and the gifts are the driver's facts today; they want a record of their
   own (the crate's surface names its `include!` paths).
+- What hir-def stops on today, each a `NotBuilt` naming the item: an `AssocItems` record (the
+  `KeyIndex` page stands in); block scopes; `Expansion` records (def-site hygiene of a
+  `macro`, a body's macro calls, builtin derive impls, an expanded item's name key); the
+  textual `macro_rules!` scope at a position and the `#[macro_use]` prelude; `use T as _`
+  bindings and import provenance in `Binding` (the unused-import lint is parked); macro
+  attribute flags in `MacroDefHead`; an `Attrs` record and crate attributes of a crate without
+  text; `Signature` records for dependencies; extern blocks; which `extern crate` added an
+  extern-prelude name; diagnostic items in bodies, on extern blocks and of dependencies;
+  command-line crate-attr files. The driver must set `Crate.blaze_edition`.

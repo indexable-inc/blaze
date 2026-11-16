@@ -285,6 +285,31 @@ pub(crate) enum Plant {
     /// [`Plain::seal`] flips without its barriers: a generation names a segment sealed whose
     /// bytes a power cut may still tear.
     SealBeforeBarrier,
+    /// [`Plain::scrub_next`] records a segment scrubbed this boot when its first slice is
+    /// walked, before the rest is: what the slices after would have found is never looked at.
+    ScrubMarkedEarly,
+}
+
+/// What one slice of the background pass did ([`Plain::scrub_next`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Scrubbed {
+    /// The segment walked.
+    pub segment: u64,
+    /// The bytes of it walked in this slice (payloads and entries).
+    pub bytes: u64,
+    /// The segment's walk ended in this slice: whole (recorded for this boot by a flip), or rotted.
+    pub done: bool,
+    /// The first record whose bytes fail their check: the segment is lost by name, as the
+    /// open's whole check loses one, and retired by the flip that follows.
+    pub rot: Option<Corrupt>,
+}
+
+/// Where the background pass stands in this process: the segment and the next entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ScrubAt {
+    id: u64,
+    generation: u64,
+    next: usize,
 }
 
 /// Puts one worker holds for one namespace, laid out as they will lie in a segment: each
@@ -515,6 +540,9 @@ pub struct Plain {
     checked_ids: Vec<u64>,
     /// Each segment of another boot this process proved by its sealed row, in order.
     sealed_ids: Vec<u64>,
+    /// The background pass's place ([`Plain::scrub_next`]); lost with the process, so a
+    /// crash re-walks only the segment it was in.
+    scrubbing: Option<ScrubAt>,
     by_id: BTreeMap<u64, usize>,
     /// What [`Plain::get`] searches: this generation's mapped segments, newest first.
     view: Vec<usize>,
@@ -662,6 +690,7 @@ impl Plain {
             checks: std::cell::Cell::new(Checks::default()),
             checked_ids: Vec::new_in(Global),
             sealed_ids: Vec::new_in(Global),
+            scrubbing: None,
             held,
             sealed: Vec::new_in(Global),
             committing: Vec::new_in(Global),
@@ -1414,10 +1443,11 @@ impl Plain {
         };
         for seg in m.segments.iter_mut() {
             if self.checked.contains(&seg.id) && self.plant() != Plant::ForgetCheck {
+                // Not sealed by the check: a segment only an open's check proved is checked
+                // again at the next boot, which finds a byte that rotted on the disk since
+                // (`a_loss_an_open_retires_is_reported_whatever_fails_after_its_slot_lands`).
+                // Only the exit tail's barrier seals (store-next.md).
                 seg.boot = self.cfg.boot;
-                // Read whole from the media in a boot after the one that wrote it (a new
-                // boot's page cache holds none of it): on the disk, so sealed with no barrier.
-                seg.sealed = seg.local;
             }
         }
         for id in &self.dropped {
@@ -1921,10 +1951,80 @@ impl Plain {
         true
     }
 
+    /// The sealed segments of an earlier boot this boot has not walked yet: what the
+    /// background pass has left ([`Plain::scrub_next`]), oldest generation first.
+    pub fn unscrubbed(&self) -> Vec<u64> {
+        let mut left: Vec<&Segment> = Vec::new_in(Global);
+        // Walked whole or lost by this process, its flip not landed yet: not walked again.
+        let pending = |id: u64| self.checked.contains(&id) || self.dropped.contains(&id);
+        left.extend(self.manifest.segments.iter().filter(|it| it.local && it.sealed && it.boot != self.cfg.boot && self.by_id.contains_key(&it.id) && !pending(it.id)));
+        left.sort_unstable_by_key(|it| (it.generation, it.id));
+        let mut out = Vec::with_capacity_in(left.len(), Global);
+        out.extend(left.iter().map(|it| it.id));
+        out
+    }
+
+    /// One slice of the background pass (store-next.md, "the bound"): run after the answer by
+    /// the helper a command leaves, never before it. A sealed segment is proved at a boot's
+    /// open with no byte read; this walks each once a boot, at most `budget` bytes a slice
+    /// (at least one record), checking every record's CRC-32C as [`Plain::scrub`] does. A
+    /// segment walked whole is recorded for this boot (its row's boot, by a flip: the same
+    /// record as the open's check), so no later slice of this boot, in this process or
+    /// another, walks it again. A segment with a record that fails is lost by name and retired
+    /// by a flip, exactly as the open's whole check loses one: the next lookup misses, and the
+    /// record is rebuilt or fetched. Nothing blocks: the walk reads the mapping, and the flip
+    /// is the store's ordinary one. `None`: nothing left this boot, or the store is busy.
+    pub fn scrub_next(&mut self, budget: u64, effects: &mut Vec<Effect>) -> Option<Scrubbed> {
+        if !self.ready() {
+            return None;
+        }
+        let left = self.unscrubbed();
+        let at = match self.scrubbing {
+            // The segment this process was in, still left and still that row.
+            Some(at) if left.contains(&at.id) && self.manifest.segments.iter().any(|it| it.id == at.id && it.generation == at.generation) => at,
+            _ => {
+                let id = *left.first()?;
+                let generation = self.manifest.segments.iter().find(|it| it.id == id).map_or(0, |it| it.generation);
+                ScrubAt { id, generation, next: 0 }
+            }
+        };
+        let map = *self.by_id.get(&at.id)?;
+        let mut corrupt = Vec::new_in(Global);
+        let (next, bytes) = self.maps[map].scrub_from(at.next, budget, &mut corrupt);
+        let count = self.maps[map].seg().count as usize;
+        let seg = *self.maps[map].seg();
+        if let Some(rot) = corrupt.into_iter().next() {
+            self.scrubbing = None;
+            let why = format!("a sealed segment's record rotted on the disk after its seal ({}): found by this boot's background pass; its records are dropped", rot.what);
+            let file = self.segment_file(at.id);
+            self.lose(seg, file, LostKind::NotWhole, why);
+            // Out of the lookup's view now, before its flip lands: no lookup is served from
+            // it again. The mapping stays (mappings live as long as the process), so a reader
+            // holding its bytes keeps them.
+            self.view.retain(|it| *it != map);
+            self.start_flip(Change::Stamp, effects);
+            return Some(Scrubbed { segment: at.id, bytes, done: true, rot: Some(rot) });
+        }
+        if next >= count {
+            self.scrubbing = None;
+            self.checked.insert(at.id);
+            self.start_flip(Change::Stamp, effects);
+            return Some(Scrubbed { segment: at.id, bytes, done: true, rot: None });
+        }
+        self.scrubbing = Some(ScrubAt { next, ..at });
+        if self.plant() == Plant::ScrubMarkedEarly {
+            self.checked.insert(at.id);
+            self.start_flip(Change::Stamp, effects);
+        }
+        Some(Scrubbed { segment: at.id, bytes, done: false, rot: None })
+    }
+
     fn mapped(&mut self, then: Then, effects: &mut Vec<Effect>) {
         self.view.clear();
         for seg in self.manifest.segments.iter().rev() {
-            if let Some(&at) = self.by_id.get(&seg.id) {
+            if let Some(&at) = self.by_id.get(&seg.id)
+                && !self.dropped.contains(&seg.id)
+            {
                 self.view.push(at);
             }
         }

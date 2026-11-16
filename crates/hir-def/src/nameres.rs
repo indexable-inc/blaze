@@ -38,7 +38,7 @@ pub use def_site::{
 use std::alloc::Global;
 
 use base_db::{Crate, Db, ItemKey, OrNeed, SurfaceError};
-use blaze_surface::{Binding, Items, Namespace as SurfaceNs, NotBuilt, Target};
+use blaze_surface::{Binding, BindingState, Items, Namespace as SurfaceNs, NotBuilt};
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
@@ -209,11 +209,11 @@ fn visibility_of(db: &Db, module: ModuleId, vis: blaze_surface::Visibility) -> V
 /// What a binding's target names: the item, `None` for an ambiguity (two candidates of one
 /// layer, an error the scope's own check reports, as rustc's E0659). An undetermined target in
 /// a finished record is a scope solved short of its fixpoint: a typed stop naming the module.
-fn binding_target(db: &Db, module: ModuleId, binding: Binding<'_>) -> Option<ItemKey> {
-    match binding.target {
-        Target::Item(key) => Some(key),
-        Target::Ambiguous(..) => None,
-        Target::Undetermined => {
+fn binding_target(db: &Db, module: ModuleId, binding: Binding) -> Option<ItemKey> {
+    match binding.state {
+        BindingState::Determined => Some(binding.def.key),
+        BindingState::Ambiguous(..) => None,
+        BindingState::Undetermined => {
             let item = scope_key(db, module);
             Err(SurfaceError::NotBuilt(NotBuilt { method: "an undetermined binding", item }))
                 .or_need()
@@ -230,7 +230,9 @@ pub(crate) fn declared_visibility(db: &Db, key: ItemKey, ns: SurfaceNs) -> Visib
     let name = key::item_name(db, key);
     let view = db.items().scope(scope_key(db, module)).or_need();
     match view.get(ns, name.as_str()) {
-        Some(binding) if matches!(binding.target, Target::Item(it) if it == key) => {
+        Some(binding)
+            if binding.state == BindingState::Determined && binding.def.key == key =>
+        {
             visibility_of(db, module, binding.vis)
         }
         _ => Err(SurfaceError::NotBuilt(NotBuilt { method: "the visibility of an unbound item", item: key }))
@@ -253,10 +255,12 @@ impl ModuleScope {
         self.module
     }
 
-    /// What `name` is bound to in `ns`.
-    pub fn get(self, db: &Db, ns: SurfaceNs, name: &Name) -> Option<Target<ItemKey>> {
+    /// What `name` is bound to in `ns`: the item, `None` for no binding or an ambiguous one
+    /// (an undetermined one is a typed stop, as [`binding_target`] says).
+    pub fn get(self, db: &Db, ns: SurfaceNs, name: &Name) -> Option<ItemKey> {
         let view = db.items().scope(scope_key(db, self.module)).or_need();
-        view.get(ns, record_name(db, self.module, name)).map(|binding| binding.target)
+        let binding = view.get(ns, record_name(db, self.module, name))?;
+        binding_target(db, self.module, binding)
     }
 
     /// `name` in every namespace of the scope, as the old item scope's `get` gave it.
@@ -274,7 +278,7 @@ impl ModuleScope {
     }
 
     /// Every binding of the module, for a caller that needs them all (a glob, a listing).
-    pub fn for_each(self, db: &Db, mut each: impl FnMut(Binding<'_>)) {
+    pub fn for_each(self, db: &Db, mut each: impl FnMut(blaze_surface::ScopeEntry<&str>)) {
         let view = db.items().scope(scope_key(db, self.module)).or_need();
         view.bindings().for_each(&mut each);
     }
@@ -283,15 +287,15 @@ impl ModuleScope {
     /// (namespace, then name). An ambiguous name binds nothing.
     pub fn for_each_per_ns(self, db: &Db, mut each: impl FnMut(Name, PerNs)) {
         let view = db.items().scope(scope_key(db, self.module)).or_need();
-        for binding in view.bindings() {
-            let Some(target) = binding_target(db, self.module, binding) else { continue };
-            let vis = visibility_of(db, self.module, binding.vis);
-            let ns = match binding.ns {
+        for entry in view.bindings() {
+            let Some(target) = binding_target(db, self.module, entry.binding) else { continue };
+            let vis = visibility_of(db, self.module, entry.binding.vis);
+            let ns = match entry.ns {
                 SurfaceNs::Types => Namespace::Types,
                 SurfaceNs::Values => Namespace::Values,
                 SurfaceNs::Macros => Namespace::Macros,
             };
-            let name = Name::new_symbol_root(intern::Symbol::intern(binding.name));
+            let name = Name::new_symbol_root(intern::Symbol::intern(entry.name));
             each(name, per_ns_of(db, ns, target, vis));
         }
     }
@@ -300,16 +304,14 @@ impl ModuleScope {
     /// type namespace. `as _` imports bind no name, and the record lists no such binding yet
     /// (reconnect.md, "What the new-layer crates lack").
     pub fn for_each_trait(self, db: &Db, mut each: impl FnMut(crate::TraitId)) {
-        let items = db.items();
-        let view = items.scope(scope_key(db, self.module)).or_need();
-        for binding in view.bindings() {
-            if binding.ns != SurfaceNs::Types {
+        let view = db.items().scope(scope_key(db, self.module)).or_need();
+        for entry in view.bindings() {
+            // The record says a binding's kind: no read of the item to find its traits.
+            if entry.ns != SurfaceNs::Types || entry.binding.def.kind != blaze_surface::DefKind::Trait {
                 continue;
             }
-            let Some(target) = binding_target(db, self.module, binding) else { continue };
-            if items.kind(target).or_need() == blaze_surface::ItemKind::Trait {
-                each(crate::TraitId::of_key(db, target));
-            }
+            let Some(target) = binding_target(db, self.module, entry.binding) else { continue };
+            each(crate::TraitId::of_key(db, target));
         }
     }
 }
@@ -521,31 +523,44 @@ pub(crate) fn crate_prelude(db: &Db, krate: Crate) -> Option<ModuleId> {
 
 /// The root module of the crate `name` names in `krate`'s extern prelude.
 pub(crate) fn extern_prelude_root(db: &Db, krate: Crate, name: &str) -> Option<ModuleId> {
-    let key = krate.key(db);
-    let dep = db.items().crate_graph(key).or_need().dep(key, name)?;
-    let Some(dep) = db.crate_of_key(dep) else {
-        return Err(SurfaceError::NoCrateRecord { fact: "the task's crate table", krate: dep })
-            .or_need();
-    };
-    Some(key::crate_root_module(db, dep))
+    let mut found = None;
+    // A crate's edges are sorted by extern name and few: the walk is the lookup.
+    for_each_extern_prelude_edge(db, krate, |edge_name, dep| {
+        if found.is_none() && edge_name == name {
+            found = Some(dep);
+        }
+    });
+    found.map(|dep| key::crate_root_module(db, dep))
 }
 
 /// Each crate of `krate`'s extern prelude, by its name there, with its root module.
 pub(crate) fn for_each_extern_prelude(db: &Db, krate: Crate, mut each: impl FnMut(Name, ModuleId)) {
+    for_each_extern_prelude_edge(db, krate, |name, dep| {
+        each(Name::new_symbol_root(intern::Symbol::intern(name)), key::crate_root_module(db, dep))
+    });
+}
+
+/// Each dependency of `krate` its extern prelude holds (an edge the build's `CrateGraph` flags
+/// `PRELUDE`: a `--extern` without `noprelude`), by its extern name, in the record's order.
+fn for_each_extern_prelude_edge(db: &Db, krate: Crate, mut each: impl FnMut(&str, Crate)) {
     let key = krate.key(db);
     let graph = db.items().crate_graph(key).or_need();
-    for (name, dep) in graph.deps_of(key) {
-        let Some(dep) = db.crate_of_key(dep) else {
-            return Err(SurfaceError::NoCrateRecord { fact: "the task's crate table", krate: dep })
+    let Some(at) = graph.index_of(key) else {
+        return Err(SurfaceError::NoCrateRecord { fact: "CrateGraph", krate: key }).or_need();
+    };
+    for edge in graph.deps(at) {
+        if !edge.flags.contains(blaze_surface::EdgeFlags::PRELUDE) {
+            continue;
+        }
+        let dep_key = graph.key(edge.on);
+        let Some(dep) = db.crate_of_key(dep_key) else {
+            return Err(SurfaceError::NoCrateRecord { fact: "the task's crate table", krate: dep_key })
                 .or_need();
         };
-        each(Name::new_symbol_root(intern::Symbol::intern(name)), key::crate_root_module(db, dep));
+        each(edge.name, dep);
     }
 }
 
-/// The extern prelude of `krate`, in the order its crates are listed: each name with the root
-/// of the crate it names. Which `extern crate` added a name is not in the crate-graph record,
-/// so the second of each pair is `None` (reconnect.md, "What the new-layer crates lack").
 /// The guard every read of a crate's syntax goes through first: nothing for the crate whose
 /// text the task holds (`Db::source_of`); for any other, a typed stop naming its root module,
 /// never a read of text the snapshot does not have. `what` is the question that needed it.
@@ -591,6 +606,9 @@ pub fn module_impls(db: &Db, module: ModuleId) -> ModuleImpls {
     }
 }
 
+/// The extern prelude of `krate`, in the order its crates are listed: each name with the root
+/// of the crate it names. Which `extern crate` added a name is not in the crate-graph record,
+/// so the second of each pair is `None` (reconnect.md, "What the new-layer crates lack").
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn crate_extern_prelude(
     db: &Db,

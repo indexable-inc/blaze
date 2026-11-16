@@ -25,9 +25,15 @@ MIR table links hir-ty-mir itself now.
 - `crates/hir-expand`: its lib, files, attrs, proc-macro and cfg modules restored and moved onto
   the new `Db` (no expansion-read log, no edit, proc macros as gifts); awaiting its first
   compile; its tests still name the deleted fixture.
-- `crates/hir-def`: ids from item keys (`key`), the narrow `nameres` facade and record-backed
-  lang items written; the resolver, `item_scope`, trait and impl item lists, and the lowering's
-  use of the deleted def map are not yet ported (design/reconnect.md).
+- `crates/hir-def`: on the records: ids from item keys (`key`), the `nameres` facade (scope
+  probes, path resolution, extern prelude and lang items from `CrateGraph`/`LangItems`), the
+  resolver and expression scopes, trait and impl items (the `KeyIndex` stand-in), module
+  impls, crate attributes, signatures and bodies from text with a typed stop for a crate
+  without it, def-site hygiene with the context table passed in. Awaiting its first compile.
+  Stops, each naming a missing record (design/reconnect.md): block scopes, expansions, the
+  textual macro scope at a position, `as _` imports, attributes and signatures of a crate
+  without text, diagnostic items outside module scopes. Parked tests: the persisted-tree
+  test that read the deleted signature table (item_tree/persist.rs).
 - `crates/mbe`: takes `&base_db::Db`; waits on base-db's replacement.
 - `crates/proc-macro-api`: the expansion store and bridge blaze-macro-eval speaks; on base-db,
   hir-expand.
