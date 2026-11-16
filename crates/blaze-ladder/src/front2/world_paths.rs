@@ -92,6 +92,10 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         }
         // A local `use`'s binding stands for its path: `max` of `use core::cmp::max` is
         // `core::cmp::max`, the rest of the written path after it.
+        // Whether the path is read at the body's module exactly as written (no item of a
+        // block, no local `use`, no `$crate`): the one case the body's conversion expands an
+        // alias in ([`AliasPaths::expand`], which asks the same way).
+        let plain = via_use.is_none() && local_type.is_none() && !written.iter().any(|t| *t == "$crate");
         let mut shift = 0u32;
         if let Some(row) = via_use {
             let mut through = Vec::with_capacity_in(row.path.len() + written.len(), Global);
@@ -163,7 +167,16 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 }
                 Some(&Some((generics, ty))) => match self.alias_def(generics, ty) {
                     Some(d) => d,
-                    None => return self.gap(Gap::TypeAlias(target.key)),
+                    // `type Call<P, C> = Raw<P, C, u8>;`: the aliased ADT, whose arguments the
+                    // body's conversion wrote on this segment ([`AliasPaths::expand`]: the
+                    // alias's parameters substituted into `Raw`'s arguments, the fixed `u8`
+                    // kept), so the checker reads them as `Raw`'s own. Only where that
+                    // conversion expanded it (`plain`, and [`fixed_alias`]'s shape): any other
+                    // alias stays the gap naming it.
+                    None => match fixed_alias(self.store.tys.view(), generics, ty) {
+                        Some((adt, _)) if plain => Def::Adt(adt),
+                        _ => return self.gap(Gap::TypeAlias(target.key)),
+                    },
                 },
             },
             // A built-in type in a body path (`u8::MAX`, `str::len`): the names library's
@@ -194,6 +207,145 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             n if generics == 0 => prim_of(n).map(Def::Prim),
             _ => None,
         }
+    }
+}
+
+/// The most type nodes [`fixed_alias`] walks in one aliased type; a larger one is not expanded
+/// (it stays `Gap::TypeAlias`).
+const MOST_ALIAS_NODES: u32 = 4096;
+
+/// The ADT and its arguments of an alias with `generics` parameters whose aliased type `ty`
+/// is `Adt<args>` where the arguments FIX something (`type Call<P, C> = Raw<P, C, u8>`,
+/// `type Sol<P, C, N> = Raw<P, PhantomData<C>, N>`): the shape a body path through the alias
+/// is expanded for. Each parameter of the alias is used at most once, and each argument holds
+/// at most one: then, where the path writes no arguments, one hole (`_`) per parameter is
+/// the whole of what the path says (a parameter used twice would need the two places held
+/// equal, and two holes in one argument are one node of the type table, which the checker
+/// lowers to one variable). An alias of an alias is already its aliased type here: the head
+/// of an alias is made with every alias in it substituted (types.rs `path_ty`). `None`: any
+/// other aliased type (a tuple, a reference, a projection), or one past [`MOST_ALIAS_NODES`].
+pub(super) fn fixed_alias(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy) -> Option<(blaze_typeck::ItemKey, Vec<PTy, Global>)> {
+    let PNode::Adt(adt, args) = *view.nodes.get(ty.0 as usize)? else { return None };
+    let args = view.list(args).ok()?;
+    let mut used = Vec::with_capacity_in(generics as usize, Global);
+    used.resize(generics as usize, false);
+    let mut work: Vec<PTy, Global> = Vec::new_in(Global);
+    let mut steps = 0u32;
+    for &arg in args {
+        let mut in_arg = 0u32;
+        work.clear();
+        work.push(arg);
+        while let Some(t) = work.pop() {
+            steps += 1;
+            if steps > MOST_ALIAS_NODES {
+                return None;
+            }
+            match *view.nodes.get(t.0 as usize)? {
+                PNode::Param(i) | PNode::ConstParam(i) => {
+                    let slot = used.get_mut(i as usize)?;
+                    in_arg += 1;
+                    if *slot || in_arg > 1 {
+                        return None;
+                    }
+                    *slot = true;
+                }
+                _ => super::types::children_of(view, t, &mut work)?,
+            }
+        }
+    }
+    let mut out = Vec::with_capacity_in(args.len(), Global);
+    out.extend_from_slice(args);
+    Some((adt, out))
+}
+
+/// The body's conversion's side of a path through a type alias ([`fixed_alias`]): what
+/// `blaze_lower::typeck::Types::alias_args` answers for front2.
+pub(super) struct AliasPaths<'a, 'b, 'l, H: super::types::Heads, S> {
+    pub builder: &'a super::types::Builder<'b, H, S>,
+    pub env: &'a super::types::Env<'b>,
+    /// The body's own items, and whose body it is: a first segment one of them names is
+    /// not the module's alias.
+    pub locals: &'a super::locals::Locals<'l>,
+    pub owner: blaze_typeck::ItemKey,
+}
+
+impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'_, '_, '_, H, S> {
+    /// The Reference, "Type aliases": "A type alias defines a new name for an existing
+    /// type". So the plain path `p` of `view`, where its first segments name an alias of
+    /// [`fixed_alias`]'s shape, is given the ALIASED type's arguments on the alias's segment
+    /// (into `out`; the segment's index returned): the alias's parameters replaced by the
+    /// arguments written on that segment (`written[index]`; a parameter not written takes
+    /// its default, by the one home of that, `with_defaults`), or each by a hole when none
+    /// are written (an expression's or a pattern's path leaves them to inference). The path
+    /// is read as `BodyWorld::path` reads it (`Self` and the body's parameters first, then
+    /// the body's own items, then the names library at the body's module, in the value
+    /// namespace), and expanded only where that reading is the module's (`plain` there):
+    /// `None` for any other path, which is converted as written. An alias whose arguments
+    /// are its own parameters in order needs no expansion (`BodyWorld::alias_def`).
+    pub(super) fn expand(&self, view: &blaze_lower::View<'_>, p: blaze_typeck::PathIdx, written: &[&[PTy]], tys: &mut blaze_typeck::PortableTys<'_>, out: &mut dyn FnMut(PTy)) -> Result<Option<u32>, super::types::Why> {
+        use super::types::Why;
+        let Some(scope) = view.path(p)?.scope else { return Ok(None) };
+        let (abs, texts, _, r) = match super::types::path_texts(view, p) {
+            Ok(read) => read,
+            // `$crate`, a parenthesized segment: no plain path (the world's `plain` is false
+            // for `$crate`; the conversion refuses the others itself).
+            Err(Why::Unsupported(..)) => return Ok(None),
+            Err(why) => return Err(why),
+        };
+        let Some(&first) = texts.first() else { return Ok(None) };
+        if !abs {
+            if first == "Self" || self.env.params.iter().any(|(n, _)| *n == Name::of(first)) {
+                return Ok(None);
+            }
+            let ns = if texts.len() == 1 { LocalNs::Value } else { LocalNs::Type };
+            let mut found = self.locals.find(self.owner, Some(scope.0), first, ns);
+            if found.is_none() && ns == LocalNs::Value {
+                found = self.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|row| row.kind.in_block_module());
+            }
+            if found.is_some() {
+                return Ok(None);
+            }
+        }
+        // A path the names library does not resolve is the world's to answer, as before.
+        let Ok(target) = self.builder.resolver.path(self.env.module, abs, &texts, Ns::Value) else { return Ok(None) };
+        // `Vec::<u8>::with_capacity(n)`: the struct's segment written short of parameters
+        // that have defaults takes them (super::adt_paths, where the rule is quoted).
+        if matches!(target.kind, Kind::Struct | Kind::Enum | Kind::Union) {
+            let Some(at) = target.consumed.checked_sub(1) else { return Ok(None) };
+            let Some(&shown) = texts.get(at as usize) else { return Ok(None) };
+            let own = written.get(at as usize).copied().unwrap_or(&[]);
+            let filled = super::adt_paths::adt_segment_defaults(self.builder.heads, target.key, own, tys, shown, r, out)?;
+            return Ok(filled.then_some(at));
+        }
+        if !matches!(target.kind, Kind::TypeAlias) {
+            return Ok(None);
+        }
+        let Some(at) = target.consumed.checked_sub(1) else { return Ok(None) };
+        let Some(&shown) = texts.get(at as usize) else { return Ok(None) };
+        let made = super::types::Heads::alias(self.builder.heads, target.key).ok_or(Why::Need(target.key))?;
+        // A refused alias head is the world's gap naming it (`Gap::AliasHead`).
+        let Some((generics, ty)) = made else { return Ok(None) };
+        let Some((_, of)) = fixed_alias(tys.view(), generics, ty) else { return Ok(None) };
+        let same = of.len() == generics as usize && {
+            let v = tys.view();
+            of.iter().enumerate().all(|(i, a)| matches!(v.nodes.get(a.0 as usize), Some(PNode::Param(p) | PNode::ConstParam(p)) if *p as usize == i))
+        };
+        if same {
+            return Ok(None);
+        }
+        let own = written.get(at as usize).copied().unwrap_or(&[]);
+        let args = if own.is_empty() {
+            let hole = super::types::intern(tys, PNode::Infer)?;
+            let mut holes = Vec::with_capacity_in(generics as usize, Global);
+            holes.resize(generics as usize, hole);
+            holes
+        } else {
+            super::types::with_defaults(tys, own, generics, super::types::Heads::alias_defaults(self.builder.heads, target.key), shown, r)?
+        };
+        for a in of {
+            out(super::types::subst(tys, a, &args)?);
+        }
+        Ok(Some(at))
     }
 }
 

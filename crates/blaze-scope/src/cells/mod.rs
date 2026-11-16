@@ -22,16 +22,17 @@ use blaze_own::{ABTreeMap, ABTreeSet, AVec, Alloc};
 use blaze_surface::{DeclsBuilder, SurfaceError};
 
 use crate::facts::ScopeFacts;
-use crate::{AmbiguityKind, Def, DefKind, Edition, ExternTarget, Namespace, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
+use crate::{AmbiguityKind, Def, DefKind, Edition, ExternTarget, Namespace, Origin, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
 
 mod deps;
 mod seam;
 #[cfg(test)]
 mod tests;
+mod write;
 
 pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames};
 pub(crate) use seam::shadow;
-pub use seam::{DIFFER_SHOWN, Differ, Seam, ShadowRefused, Shadowed};
+pub use seam::{DIFFER_SHOWN, Differ, Seam, ShadowRefused, Shadowed, Unknown, WrittenAgainst, WrittenDiffer, WrittenWhich};
 
 pub(crate) const NAMESPACES: [Namespace; 3] = [Namespace::Types, Namespace::Values, Namespace::Macros];
 
@@ -81,6 +82,8 @@ pub struct ItemResult<'r, N> {
     pub binds: Option<N>,
     /// `None`: left undecided (a bug the run reports first).
     pub outcome: Option<Outcome>,
+    /// Why the outcome is `Outside`, when it is.
+    pub why: Option<Unfollowed>,
 }
 
 /// What an import came to.
@@ -96,6 +99,36 @@ pub enum Outcome {
     Outside,
     /// A macro call's path: the macro it names. Its expansion follows.
     Called(Def),
+}
+
+/// Why an import or a call is [`Outcome::Outside`]: the form this core does not follow, by name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unfollowed {
+    /// `$crate` of a crate no dependency read here names.
+    DollarCrateUnknown,
+    /// A crate (`::name`, `$crate`) whose root module no record read here holds.
+    CrateUnread,
+    /// `use ::name;`: a crate alone.
+    CrateAlone,
+    /// A segment before the leaf is itself unknown.
+    Through,
+    /// A path through an enum to its variants.
+    Enum,
+    /// A segment names a module no record read here holds.
+    ModuleUnread,
+    /// The leaf is unknown in some namespace of the module it is read in.
+    Leaf,
+    /// `use name;` beside a `macro_rules! name` of the module's text.
+    TextualImport,
+}
+
+/// The number of [`Unfollowed`] classes.
+pub const UNFOLLOWED: usize = 8;
+
+impl Unfollowed {
+    pub fn at(self) -> usize {
+        self as usize
+    }
 }
 
 /// Which part of a written visibility names no ancestor of its module.
@@ -259,12 +292,24 @@ pub(crate) enum CellPlant {
     R8MacroReplaces,
     /// A `use` of an `extern crate` item is narrowed to the item's own visibility.
     ExternReexportNarrowed,
+    /// A `mod` line of a module the facts hold no text of refuses the whole crate.
+    UnreadModuleRefuses,
+    /// `use a::b::{self};` binds `b` in every namespace.
+    SelfImportBindsAll,
+    /// A 2015 crate's `use a::b;` starts lexically at its own module, as from 2018 on.
+    Use2015Lexical,
+    /// `use name;` does not read the textual scope of `macro_rules!`: beside a `macro_rules!
+    /// name` of the module's text it is unknown (the core's answer until runner 11).
+    NoTextualImport,
 }
 
 type ModId = u32;
 type CellId = u32;
 type ItemId = u32;
 type FragId = u32;
+/// An explicit entry of a module: the definition, its visibility, what wrote it (an item or
+/// `mod`, an `extern crate`, a `#[macro_export]`) and the fragment it is written in.
+type Entry = (Def, Visibility, Origin, FragId);
 
 /// One entry of a text fragment the textual scope sees.
 #[derive(Clone, Copy)]
@@ -306,7 +351,7 @@ struct Module<'a, N> {
     parent: Option<ModId>,
     /// Itself, then its ancestors up to the root.
     chain: AVec<'a, ItemKey>,
-    explicit: ABTreeMap<'a, (Namespace, N), (Def, Visibility)>,
+    explicit: ABTreeMap<'a, (Namespace, N), Entry>,
     /// The named imports binding each name, by index.
     named: ABTreeMap<'a, N, AVec<'a, ItemId>>,
     globs_pending: u32,
@@ -329,6 +374,11 @@ struct Module<'a, N> {
     /// A module of a dependency: each of its cells is decided when made, from the dependency's
     /// record ([`DepNames`]); it has no text, items or growth here.
     foreign: bool,
+    /// A module a `mod` line names whose text the facts do not hold (its file was not read, or
+    /// an attribute macro on the `mod` item was not expanded): the name is bound in its parent
+    /// (Reference `items.mod`), and every name inside it is unknown (`Value::Outside`), never
+    /// "not there". Listed in [`Cells::unread`].
+    unread: bool,
 }
 
 struct Cell<'a, N> {
@@ -363,9 +413,15 @@ struct Item<'a, N> {
     expansion: Option<FragId>,
     /// The fragment it is written in (its module's text or an expansion).
     at: FragId,
+    /// Its place in that fragment's text: what the textual scope before it is cut at.
+    pos: u32,
     /// An import whose path goes through an enum: `Outside` in types and values only (a
     /// variant is never a macro).
     of_enum: bool,
+    /// `use a::b::{self};`: it binds in the type namespace alone.
+    types_only: bool,
+    /// Why its outcome is `Outside`, when it is.
+    why: Option<Unfollowed>,
 }
 
 /// What a module's own view leaves out of its growth (calls not expanded yet).
@@ -444,13 +500,12 @@ pub(crate) struct Cells<'a, N> {
     macro_use: AVec<'a, ItemKey>,
     /// Every dependency by name, sorted (the root record's): what an `extern crate` names.
     dep_roots: AVec<'a, (N, ItemKey)>,
-    /// The names `extern crate` items bind, by module: a `use` re-exports one at the `use`'s own
-    /// visibility.
-    extern_items: ABTreeSet<'a, (ModId, N)>,
     /// The `extern crate` items naming no dependency: the module and the name written.
     pub(crate) bad_extern: AVec<'a, (ItemKey, N)>,
     /// R8's errors: a macro-written root `extern crate .. as n;` whose `n` a dependency holds.
     pub(crate) r8: AVec<'a, N>,
+    /// The modules a `mod` line names whose text the facts do not hold, in the order met.
+    pub(crate) unread: AVec<'a, ItemKey>,
     /// R6's watches for the extern prelude: a use whose first segment took a later outer scope's
     /// binding while the root's calls could still add an extern-prelude name, by name.
     extern_watches: ABTreeMap<'a, N, AVec<'a, (ItemId, Def)>>,
@@ -495,6 +550,17 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         deps: Option<&'a dyn DepNames<N>>,
         alloc: Alloc<'a>,
     ) -> Result<Cells<'a, N>, CellError> {
+        Cells::load_planted(facts, root, deps, CellPlant::None, alloc)
+    }
+
+    /// [`Cells::load_with`] with a planted bug the load itself reads (a control of the tests).
+    pub(crate) fn load_planted<F: ScopeFacts<Name = N>>(
+        facts: &F,
+        root: ItemKey,
+        deps: Option<&'a dyn DepNames<N>>,
+        plant: CellPlant,
+        alloc: Alloc<'a>,
+    ) -> Result<Cells<'a, N>, CellError> {
         let info = facts.module(root).map_err(|error| CellError::Facts { module: root, error })?;
         let mut cells = Cells {
             alloc,
@@ -522,14 +588,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             written: ABTreeMap::new_in(alloc),
             r6: ABTreeSet::new_in(alloc),
             stats: CellStats::default(),
-            plant: CellPlant::None,
+            plant,
             deps,
             edition: Edition::E2021,
             macro_use: AVec::new_in(alloc),
             dep_roots: AVec::new_in(alloc),
-            extern_items: ABTreeSet::new_in(alloc),
             bad_extern: AVec::new_in(alloc),
             r8: AVec::new_in(alloc),
+            unread: AVec::new_in(alloc),
             extern_watches: ABTreeMap::new_in(alloc),
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
@@ -553,11 +619,23 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         let alloc = self.alloc;
         let mut keys: ABTreeSet<'a, ItemKey> = ABTreeSet::new_in(alloc);
         let mut todo: AVec<'a, ItemKey> = AVec::from_slice_in(tops, alloc);
+        let mut unread: ABTreeSet<'a, ItemKey> = ABTreeSet::new_in(alloc);
         while let Some(m) = todo.pop() {
             if self.by_key.contains_key(&m) || !keys.insert(m) {
                 continue;
             }
-            let d = facts.decls(m).map_err(|error| CellError::Facts { module: m, error })?;
+            let d = match facts.decls(m) {
+                Ok(d) => d,
+                // A `mod` line of a module the facts hold no text of: bound, its inside unknown.
+                Err(SurfaceError::NoRecord { .. })
+                    if self.plant != CellPlant::UnreadModuleRefuses && !(self.modules.is_empty() && tops.first() == Some(&m)) =>
+                {
+                    unread.insert(m);
+                    self.unread.push(m);
+                    continue;
+                }
+                Err(error) => return Err(CellError::Facts { module: m, error }),
+            };
             for c in d.mods.iter() {
                 todo.push(c.module);
             }
@@ -583,8 +661,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 mod_line: None,
                 uses: 0,
                 foreign: false,
+                unread: unread.contains(&k),
             });
-            made.push(id);
+            if !unread.contains(&k) {
+                made.push(id);
+            }
         }
         for &m in made.iter() {
             let key = self.modules[m as usize].key;
@@ -592,6 +673,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.modules[m as usize].parent = info.parent.and_then(|p| self.by_key.get(&p).copied());
             // Its name in its parent: `pub(in path)` walks the chain by name, reading no entries.
             self.modules[m as usize].name = info.name;
+        }
+        for &k in unread.iter() {
+            let m = self.by_key[&k];
+            self.modules[m as usize].chain.push(k);
         }
         // Chains only after every parent is set: modules are numbered in key order, not tree order.
         for &m in made.iter() {
@@ -606,6 +691,18 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         Ok(made)
     }
 
+    /// Loads the modules under `tops` not made yet, with their texts: the modules no `mod` line
+    /// names (a block's module, made beside its body's module), which the caller is told of as
+    /// the old fill is (`FillEnv::made`). Their imports and calls are queued: the caller runs
+    /// again. How many were made.
+    pub(crate) fn load_more<F: ScopeFacts<Name = N>>(&mut self, facts: &F, tops: &[ItemKey]) -> Result<usize, CellError> {
+        let made = self.make_modules(facts, tops)?;
+        for &m in made.iter() {
+            self.read_text(facts, m)?;
+        }
+        Ok(made.len())
+    }
+
     /// Reads module `m`'s own text.
     fn read_text<F: ScopeFacts<Name = N>>(&mut self, facts: &F, m: ModId) -> Result<(), CellError> {
         let key = self.modules[m as usize].key;
@@ -615,7 +712,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // (Reference `macros.by-example.export`).
             let r = facts.crate_root(self.krate).map_err(|error| CellError::Facts { module: key, error })?;
             for &(name, def, shapes) in r.macro_exports.iter() {
-                let entry = (Def { key: def, kind: DefKind::Macro(shapes) }, Visibility::Public);
+                // The root's text fragment is the next one made (`read_fragment` below).
+                let text = self.frags.len() as FragId;
+                let entry = (Def { key: def, kind: DefKind::Macro(shapes) }, Visibility::Public, Origin::MacroExport, text);
                 self.add_explicit(m, Namespace::Macros, name, entry)?;
                 self.stats.names_declared += 1;
             }
@@ -652,7 +751,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
 
     /// An explicit entry of `m`; the first of a name stays. A cell of it decided not found is a
     /// bug in when cells decide (finality).
-    fn add_explicit(&mut self, m: ModId, ns: Namespace, name: N, entry: (Def, Visibility)) -> Result<(), CellError> {
+    fn add_explicit(&mut self, m: ModId, ns: Namespace, name: N, entry: Entry) -> Result<(), CellError> {
         self.check_final(m, ns, name)?;
         self.modules[m as usize].explicit.entry((ns, name)).or_insert(entry);
         Ok(())
@@ -675,7 +774,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         let mut slots: AVec<'a, (u32, Slot<N>)> = AVec::new_in(alloc);
         for it in d.items.iter() {
             let vis = self.vis_of(m, &it.vis)?;
-            self.add_explicit(m, it.ns, it.name, (it.def, vis))?;
+            self.add_explicit(m, it.ns, it.name, (it.def, vis, Origin::Declared, fid))?;
             self.stats.names_declared += 1;
             if up.is_some() {
                 self.wrote(m, it.ns, it.name, it.def, fid);
@@ -683,7 +782,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         for c in d.mods.iter() {
             let vis = self.vis_of(m, &c.vis)?;
-            self.add_explicit(m, Namespace::Types, c.name, (Def::module(c.module), vis))?;
+            self.add_explicit(m, Namespace::Types, c.name, (Def::module(c.module), vis, Origin::Declared, fid))?;
             self.stats.names_declared += 1;
             if up.is_some() {
                 self.wrote(m, Namespace::Types, c.name, Def::module(c.module), fid);
@@ -696,7 +795,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         for ec in d.extern_crates.iter() {
             let vis = self.vis_of(m, &ec.vis)?;
-            self.extern_crate(m, ec.target, ec.rename, vis, up.map(|_| fid))?;
+            self.extern_crate(m, ec.target, ec.rename, vis, fid, up.is_some())?;
         }
         for r in d.macro_rules.iter() {
             let def = Def { key: r.def, kind: DefKind::Macro(r.shapes) };
@@ -705,7 +804,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 // Also a crate-root name in the macro namespace; the root record already holds
                 // those of module texts, so the same def adds nothing.
                 let root = self.root;
-                self.add_explicit(root, Namespace::Macros, r.name, (def, Visibility::Public))?;
+                self.add_explicit(root, Namespace::Macros, r.name, (def, Visibility::Public, Origin::MacroExport, fid))?;
             }
         }
         for c in d.calls.iter() {
@@ -726,7 +825,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 grown: false,
                 expansion: None,
                 at: fid,
+                pos: c.pos,
                 of_enum: false,
+                types_only: false,
+                why: None,
             });
             let module = &mut self.modules[m as usize];
             module.calls.push(id);
@@ -779,8 +881,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 grown: false,
                 expansion: None,
                 at: fid,
+                pos: u.pos,
                 of_enum: false,
+                types_only: false,
+                why: None,
             });
+            // `use a::b::{self};` binds `b` in the type namespace alone (Reference
+            // `items.use.self`: "only the type namespace").
+            if matches!(u.leaf, UseForm::Named { types_only: true, .. }) && self.plant != CellPlant::SelfImportBindsAll {
+                self.items[id as usize].types_only = true;
+            }
             let module = &mut self.modules[m as usize];
             if glob {
                 module.globs_pending += 1;
@@ -796,12 +906,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// One `extern crate` item of `m` (Reference `items.extern-crate`: "The external crate is
     /// then bound into the declaring scope as the identifier provided in the extern crate
     /// declaration"; `as _` binds nothing; `extern crate self` binds only with `as name`).
-    /// `wrote`: the expansion fragment that wrote it. One a macro wrote at the crate root also
+    /// `fid`: the fragment it is written in, `expanded`: an expansion's. One a macro wrote at the crate root also
     /// adds its name to the extern prelude (R8, Reference `names.preludes.extern`), never in
     /// place of a dependency's: `.. as n;` beside a dependency's `n` is R8's error (rustc's
     /// "macro-expanded `extern crate` items cannot shadow names passed with `--extern`"). The
     /// root text's own are in the root record's extern prelude already.
-    fn extern_crate(&mut self, m: ModId, target: ExternTarget<N>, rename: Rename<N>, vis: Visibility, wrote: Option<FragId>) -> Result<(), CellError> {
+    fn extern_crate(&mut self, m: ModId, target: ExternTarget<N>, rename: Rename<N>, vis: Visibility, fid: FragId, expanded: bool) -> Result<(), CellError> {
         let (root, written) = match target {
             ExternTarget::Dep(name) => (self.dep_roots.binary_search_by(|d| d.0.cmp(&name)).ok().map(|k| self.dep_roots[k].1), Some(name)),
             ExternTarget::SelfCrate => (Some(self.modules[self.root as usize].key), None),
@@ -822,12 +932,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return Ok(());
         }
         let def = Def::module(root);
-        self.add_explicit(m, Namespace::Types, name, (def, vis))?;
+        self.add_explicit(m, Namespace::Types, name, (def, vis, Origin::ExternCrate, fid))?;
         self.stats.names_declared += 1;
-        if self.modules[m as usize].explicit.get(&(Namespace::Types, name)).is_some_and(|e| e.0 == def) {
-            self.extern_items.insert((m, name));
+        if !expanded {
+            return Ok(());
         }
-        let Some(f) = wrote else { return Ok(()) };
+        let f = fid;
         self.wrote(m, Namespace::Types, name, def, f);
         if m != self.root || self.plant == CellPlant::R8AddsNothing {
             return Ok(());
@@ -914,6 +1024,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     PathKind::Crate => self.root,
                     PathKind::SelfMod => m,
                     PathKind::Super(n) => self.up(m, n).ok_or(bad(BadVis::AboveRoot))?,
+                    // Reference `vis.scoped.edition2018`: "The 2015 edition may also use paths
+                    // starting with `::` or modules from the crate root."
+                    PathKind::Plain | PathKind::Abs if self.edition == Edition::E2015 && self.plant != CellPlant::Use2015Lexical => self.root,
                     PathKind::Plain | PathKind::Abs | PathKind::DollarCrate(_) => return Err(bad(BadVis::Start)),
                 };
                 // The target must be an ancestor (Reference `vis.scoped.in`): each segment names
@@ -1020,6 +1133,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             mod_line: None,
             uses: 0,
             foreign: true,
+            unread: false,
         });
         Some(id)
     }
@@ -1030,6 +1144,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return c;
         }
         let id = self.cells.len() as CellId;
+        if self.modules[m as usize].unread {
+            // Its text was never read: unknown, decided when made.
+            self.cells.push(Cell { module: m, ns, name, layer, value: Some(Value::Outside), waiters: AVec::new_in(self.alloc), waiting_on: None });
+            self.cell_ids.insert(key, id);
+            self.stats.cells += 1;
+            self.stats.decisions += 1;
+            return id;
+        }
         if self.modules[m as usize].foreign
             && let Some(deps) = self.deps
         {
@@ -1116,7 +1238,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         None => return Step::Wait(Node::Cell(g)),
                     }
                 }
-                if let Some(&(def, vis)) = self.modules[m as usize].explicit.get(&(ns, name)) {
+                if let Some(&(def, vis, ..)) = self.modules[m as usize].explicit.get(&(ns, name)) {
                     return Step::Done(Value::Found(def, vis));
                 }
                 let mut found = None;
@@ -1328,6 +1450,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let it = &self.items[i as usize];
             (it.module, it.kind, it.glob, it.binds, it.vis)
         };
+        // Reference `items.use.path.edition2018`: "In the 2015 edition, `use` paths are relative
+        // to the crate root." and "The 2015 edition does not allow use declarations to reference
+        // the extern prelude." So a 2015 import's plain path is `crate::path`: no lexical first
+        // segment, no outer scope. A macro call's path stays lexical in every edition.
+        let kind = if kind == PathKind::Plain && self.edition == Edition::E2015 && self.items[i as usize].call.is_none() && self.plant != CellPlant::Use2015Lexical {
+            PathKind::Crate
+        } else {
+            kind
+        };
         if let Some(at) = self.items[i as usize].call
             && kind == PathKind::Plain
             && self.items[i as usize].segments.len() == 1
@@ -1359,11 +1490,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             PathKind::DollarCrate(k) => match self.deps.and_then(|d| d.crate_root(k)) {
                 Some(r) => match self.module_at(r) {
                     Some(r) => r,
-                    None => return Step::Done(Outcome::Outside),
+                    None => return self.unfollowed(i, Unfollowed::CrateUnread),
                 },
                 None => {
                     self.stats.dep_absent += 1;
-                    return Step::Done(Outcome::Outside);
+                    return self.unfollowed(i, Unfollowed::DollarCrateUnknown);
                 }
             },
             // `::name` from 2018 on: `name` is a crate of the extern prelude (Reference
@@ -1372,7 +1503,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             PathKind::Abs => {
                 let len = self.items[i as usize].segments.len();
                 if len < 2 && !glob {
-                    return Step::Done(Outcome::Outside);
+                    return self.unfollowed(i, Unfollowed::CrateAlone);
                 }
                 let s = self.items[i as usize].segments[0];
                 let named = match self.outer.externs.binary_search_by(|e| e.0.cmp(&s)) {
@@ -1390,7 +1521,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 first = 1;
                 match self.module_at(named) {
                     Some(r) => r,
-                    None => return Step::Done(Outcome::Outside),
+                    None => return self.unfollowed(i, Unfollowed::CrateUnread),
                 }
             }
         };
@@ -1416,7 +1547,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
             };
             match v {
-                Value::Outside => return Step::Done(Outcome::Outside),
+                Value::Outside => return self.unfollowed(i, Unfollowed::Through),
                 Value::NotFound => return Step::Done(Outcome::Failed(Unresolved::NotFound)),
                 Value::Found(_, vis) | Value::Ambiguous(_, vis) if !self.visible(vis, m) => {
                     return Step::Done(Outcome::Failed(Unresolved::Private));
@@ -1427,6 +1558,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         // Through an enum: its variants, unread here, are types and values,
                         // never macros: the import is unknown in those two namespaces alone.
                         self.items[i as usize].of_enum = self.plant != CellPlant::EnumHidesMacros;
+                        self.items[i as usize].why = Some(Unfollowed::Enum);
                         Outcome::Outside
                     } else {
                         Outcome::Failed(Unresolved::NotAModule)
@@ -1434,7 +1566,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
                 Value::Found(def, _) => match self.module_at(def.key) {
                     Some(next) => cur = next,
-                    None => return Step::Done(Outcome::Outside),
+                    None => return self.unfollowed(i, Unfollowed::ModuleUnread),
                 },
             }
         }
@@ -1466,7 +1598,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     self.items[i as usize].waits.push(n);
                     Step::Wait(n)
                 }
-                Step::Done(Value::Outside) => Step::Done(Outcome::Outside),
+                Step::Done(Value::Outside) => self.unfollowed(i, Unfollowed::Leaf),
                 Step::Done(Value::NotFound) => Step::Done(Outcome::Failed(Unresolved::NotFound)),
                 Step::Done(Value::Found(_, vis) | Value::Ambiguous(_, vis)) if !self.visible(vis, m) => {
                     Step::Done(Outcome::Failed(Unresolved::Private))
@@ -1481,23 +1613,49 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         let (mut found, mut hidden, mut amb, mut wait, mut outside) = (false, false, false, None, false);
         let lexical = kind == PathKind::Plain && len == 1;
         let mut textual_open = false;
+        let types_only = self.items[i as usize].types_only;
         for ns in NAMESPACES {
+            if types_only && ns != Namespace::Types {
+                continue;
+            }
             let r = if lexical {
-                // `use name;`: the leaf is a first segment (R6-R8), in each namespace.
-                match self.first_segment(m, ns, leaf, i, guess) {
-                    Step::Done(Value::NotFound) if ns == Namespace::Macros && self.has_rules(m, leaf) => {
-                        // A `macro_rules!` of the module's text may be in the textual scope
-                        // at the import (core's `pub(crate) use assert_unsafe_precondition;`):
-                        // an import's place in the text is not read yet, so it is unknown.
-                        textual_open = true;
-                        Read::Ready(Value::NotFound)
+                // `use name;` in the macro namespace reads the textual scope at the import
+                // first (Reference `macro.decl.scope.path.reexport`: "Macros can be re-exported
+                // to give them path-based scope from a module other than the crate root.",
+                // its example `macro_rules! m { .. } pub(crate) use m;` "from within `m`'s
+                // textual scope"). The binding's own visibility is the macro's (Reference
+                // `macro.decl.scope.path-based.visibility`: "Macros have an implicit visibility
+                // of `pub(crate)`. `#[macro_export]` changes the implicit visibility to `pub`.").
+                let tex = if ns == Namespace::Macros && self.plant != CellPlant::NoTextualImport {
+                    let (frag, pos) = (self.items[i as usize].at, self.items[i as usize].pos);
+                    match self.textual(frag, pos, leaf, guess) {
+                        Step::Done(d) => d,
+                        Step::Wait(n) => {
+                            self.items[i as usize].waits.push(n);
+                            wait = wait.or(Some(n));
+                            continue;
+                        }
                     }
-                    Step::Done(v) => Read::Ready(v),
-                    Step::Wait(n) => {
-                        self.items[i as usize].waits.push(n);
-                        wait = wait.or(Some(n));
-                        continue;
+                } else {
+                    None
+                };
+                if self.plant == CellPlant::NoTextualImport && ns == Namespace::Macros && self.has_rules(m, leaf) {
+                    textual_open = true;
+                }
+                match tex {
+                    Some(def) => {
+                        let exported = self.modules[self.root as usize].explicit.get(&(Namespace::Macros, leaf)).is_some_and(|e| e.0 == def && e.2 == Origin::MacroExport);
+                        Read::Ready(Value::Found(def, if exported { Visibility::Public } else { Visibility::Crate(self.krate) }))
                     }
+                    // Else the leaf is a first segment (R6-R8), in each namespace.
+                    None => match self.first_segment(m, ns, leaf, i, guess) {
+                        Step::Done(v) => Read::Ready(v),
+                        Step::Wait(n) => {
+                            self.items[i as usize].waits.push(n);
+                            wait = wait.or(Some(n));
+                            continue;
+                        }
+                    },
                 }
             } else {
                 self.read(cur, ns, leaf, layer, guess)
@@ -1519,8 +1677,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     let through = if lexical { m } else { cur };
                     let of_extern = ns == Namespace::Types
                         && self.plant != CellPlant::ExternReexportNarrowed
-                        && self.extern_items.contains(&(through, leaf))
-                        && self.modules[through as usize].explicit.get(&(ns, leaf)).is_some_and(|e| e.0 == def);
+                        && self.modules[through as usize].explicit.get(&(ns, leaf)).is_some_and(|e| e.0 == def && e.2 == Origin::ExternCrate);
                     out[ns_at(ns)] = Some((def, if of_extern { ivis } else { self.narrower(ivis, vis, m) }));
                 }
             }
@@ -1533,15 +1690,22 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return Step::Wait(w);
         }
         // A namespace this core cannot answer leaves the whole import unknown.
-        Step::Done(if outside || textual_open {
-            Outcome::Outside
-        } else if found {
+        if outside || textual_open {
+            return self.unfollowed(i, if outside { Unfollowed::Leaf } else { Unfollowed::TextualImport });
+        }
+        Step::Done(if found {
             Outcome::Named(out)
         } else if hidden {
             Outcome::Failed(Unresolved::Private)
         } else {
             Outcome::Failed(Unresolved::NotFound)
         })
+    }
+
+    /// Item `i` is unknown here, and why, by name.
+    fn unfollowed(&mut self, i: ItemId, why: Unfollowed) -> Step<Outcome> {
+        self.items[i as usize].why = Some(why);
+        Step::Done(Outcome::Outside)
     }
 
     /// `name!` in the macro namespace of `m`, read by `m`'s own call `me`: the cell when decided,
@@ -1557,7 +1721,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         {
             return Step::Done((v, From::Own));
         }
-        if let Some(&(def, vis)) = self.modules[m as usize].explicit.get(&(ns, name)) {
+        if let Some(&(def, vis, ..)) = self.modules[m as usize].explicit.get(&(ns, name)) {
             let from = self.written.get(&(m, ns, name)).map_or(From::Own, |&f| From::Wrote(f));
             return Step::Done((Value::Found(def, vis), from));
         }
@@ -2021,6 +2185,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             glob: it.glob,
             binds: it.binds,
             outcome: it.outcome,
+            why: it.why,
         })
     }
 

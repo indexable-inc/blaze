@@ -84,6 +84,10 @@ pub struct Kept {
 pub enum Last {
     /// A kept pass, filed at this address.
     Passed { address: Address },
+    /// A kept pass at this address, one of whose asks moved in a request that did not ask the
+    /// test (filtered, ignored, a bench): every row of a head is valid at the head's state, so
+    /// this one is looked up before it is used again ([`Effect::Unsettle`]).
+    Unsettled { address: Address },
     Failed,
     NotKept(NotKept),
 }
@@ -136,6 +140,9 @@ pub enum Missed {
     LastNotKept(NotKept),
     /// This ask moved and no pass was filed at the address its asks answer now.
     Moved { ask: Ask },
+    /// Its row was unsettled by an earlier request and no pass was filed at the address its
+    /// asks answer now.
+    Unsettled,
 }
 
 /// What a kept pass rested on.
@@ -212,6 +219,9 @@ pub enum Effect {
     Kill { test: TestId },
     /// File this run's pass at the address its asks answer now, and its row in the head.
     File { test: TestId },
+    /// The test was not asked this time but one of its asks moved: its head row becomes
+    /// [`Last::Unsettled`], so the head stays valid at the new state.
+    Unsettle { test: TestId },
 }
 
 /// A call the machine refuses: the driver broke the protocol. Each names the test.
@@ -266,8 +276,8 @@ pub(crate) enum Plant {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
-    /// Waiting for [`Plan::looked`]; `ask` is the moved ask that made it a candidate.
-    Looking { ask: Ask },
+    /// Waiting for [`Plan::looked`]; `missed` is why it runs if nothing is found.
+    Looking { missed: Missed },
     Queued,
     Running { started: Nanos, deadline: Nanos },
     /// Killed past its deadline; its end is awaited.
@@ -360,8 +370,16 @@ impl<'a, 'r> Plan<'a, 'r> {
         candidates.dedup_by(|later, first| later.0 == first.0);
 
         for one in asked {
+            let head = kept.binary_search_by(|row| row.test.cmp(&one.test)).ok().map(|row| kept[row]);
+            let candidate = candidates.binary_search_by(|(test, _)| test.cmp(&one.test)).ok().map(|found| candidates[found].1);
+            // A kept pass of a test not decided here, whose asks moved, is unsettled so the head
+            // stays valid at the new state.
+            let unsettle = matches!((head, candidate), (Some(Kept { last: Last::Passed { .. }, .. }), Some(_)));
             if !self.lets_through(one) {
                 self.filtered += 1;
+                if unsettle {
+                    out.push(Effect::Unsettle { test: one.test });
+                }
                 continue;
             }
             let at = self.rows.len();
@@ -369,15 +387,18 @@ impl<'a, 'r> Plan<'a, 'r> {
                 Ok(_) => return Err(PlanError::TwoAsked { test: one.test }),
                 Err(slot) => self.by_test.insert_shift(slot, (one.test, at)),
             }
-            let head = kept.binary_search_by(|row| row.test.cmp(&one.test)).ok().map(|row| kept[row]);
             let priority = head.map_or(u64::MAX, |row| row.micros);
             self.rows.push(Row { test: one.test, should_panic: one.should_panic, missed: Missed::NoRecord, priority, state: State::Done });
-            if one.bench && !self.config.benches {
-                out.push(Effect::Report { test: one.test, outcome: Outcome::Bench });
-                continue;
-            }
-            if one.ignore.is_some() && self.config.ignored == Ignored::Skip {
-                out.push(Effect::Report { test: one.test, outcome: Outcome::Ignored });
+            let not_run = match (one.bench && !self.config.benches, one.ignore.is_some() && self.config.ignored == Ignored::Skip) {
+                (true, _) => Some(Outcome::Bench),
+                (false, true) => Some(Outcome::Ignored),
+                (false, false) => None,
+            };
+            if let Some(outcome) = not_run {
+                if unsettle {
+                    out.push(Effect::Unsettle { test: one.test });
+                }
+                out.push(Effect::Report { test: one.test, outcome });
                 continue;
             }
             let last = match (self.config.run_all, head) {
@@ -385,20 +406,24 @@ impl<'a, 'r> Plan<'a, 'r> {
                 (false, None) => Err(Missed::NoRecord),
                 (false, Some(row)) => Ok(row.last),
             };
-            match last {
-                Err(missed) => self.enqueue(at, missed),
-                Ok(Last::Failed) if self.plant == Plant::KeepFailures => {
+            match (last, candidate) {
+                (Err(missed), _) => self.enqueue(at, missed),
+                (Ok(Last::Failed), _) if self.plant == Plant::KeepFailures => {
                     out.push(Effect::Report { test: one.test, outcome: Outcome::Cached(Basis::Unchanged) });
                 }
-                Ok(Last::Failed) => self.enqueue(at, Missed::LastFailed),
-                Ok(Last::NotKept(why)) => self.enqueue(at, Missed::LastNotKept(why)),
-                Ok(Last::Passed { .. }) => match candidates.binary_search_by(|(test, _)| test.cmp(&one.test)) {
-                    Ok(found) => {
-                        self.rows[at].state = State::Looking { ask: candidates[found].1 };
-                        out.push(Effect::Look { test: one.test });
-                    }
-                    Err(_) => out.push(Effect::Report { test: one.test, outcome: Outcome::Cached(Basis::Unchanged) }),
-                },
+                (Ok(Last::Failed), _) => self.enqueue(at, Missed::LastFailed),
+                (Ok(Last::NotKept(why)), _) => self.enqueue(at, Missed::LastNotKept(why)),
+                (Ok(Last::Passed { .. }), Some(ask)) => {
+                    self.rows[at].state = State::Looking { missed: Missed::Moved { ask } };
+                    out.push(Effect::Look { test: one.test });
+                }
+                (Ok(Last::Unsettled { .. }), _) => {
+                    self.rows[at].state = State::Looking { missed: Missed::Unsettled };
+                    out.push(Effect::Look { test: one.test });
+                }
+                (Ok(Last::Passed { .. }), None) => {
+                    out.push(Effect::Report { test: one.test, outcome: Outcome::Cached(Basis::Unchanged) });
+                }
             }
         }
         self.pump(now, out);
@@ -448,12 +473,12 @@ impl<'a, 'r> Plan<'a, 'r> {
     /// asks answer now.
     pub fn looked(&mut self, test: TestId, found: bool, now: Nanos, out: &mut AVec<'_, Effect>) -> Result<(), PlanError> {
         let Some(at) = self.row_of(test) else { return Err(PlanError::NotLooking { test }) };
-        let State::Looking { ask } = self.rows[at].state else { return Err(PlanError::NotLooking { test }) };
+        let State::Looking { missed } = self.rows[at].state else { return Err(PlanError::NotLooking { test }) };
         if found {
             self.rows[at].state = State::Done;
             out.push(Effect::Report { test, outcome: Outcome::Cached(Basis::Answers) });
         } else {
-            self.enqueue(at, Missed::Moved { ask });
+            self.enqueue(at, missed);
             self.pump(now, out);
         }
         Ok(())

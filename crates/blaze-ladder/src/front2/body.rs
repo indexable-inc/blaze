@@ -250,6 +250,11 @@ struct BodyTypes<'b, S> {
     /// The body's blocks that are modules of the names library holding a struct, enum, union
     /// or type alias ([`super::locals::BodyLocals::blocks`]); empty for most bodies.
     blocks: &'b [super::locals::BlockModule],
+    /// The items declared in bodies, and whose body this is: a path through a type alias is
+    /// expanded only where no item of the body takes its first segment
+    /// ([`super::world_paths::AliasPaths`]).
+    locals: &'b super::locals::Locals<'b>,
+    owner: ItemKey,
 }
 
 impl<'b, 'n, S: NamesSource<'n>> BodyTypes<'b, S> {
@@ -409,6 +414,22 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         self.term(made, "a const argument", range)
     }
 
+    /// A path through a type alias whose aliased type fixes arguments (`type Call<P, C> =
+    /// Raw<P, C, u8>;`, `Call::new(..)`): the aliased type's arguments for the alias's
+    /// segment ([`super::world_paths::AliasPaths::expand`], where the rule is quoted). An
+    /// alias whose head is not made yet is `Why::Need`: the body is converted again once it
+    /// is, as for a written type.
+    fn alias_args(&mut self, view: &View<'_>, path: blaze_typeck::PathIdx, written: &[&[blaze_typeck::PTy]], tys: &mut PortableTys<'_>, out: &mut dyn FnMut(blaze_typeck::PTy)) -> Result<Option<u32>, Refused> {
+        let paths = super::world_paths::AliasPaths { builder: &self.builder, env: &self.env, locals: self.locals, owner: self.owner };
+        match paths.expand(view, path, written, tys, out) {
+            Ok(at) => Ok(at),
+            Err(why) => {
+                self.failed = Some(why);
+                Err(Refused::Form { what: "a path through a type alias", range: view.site(view.path_range(path)?)? })
+            }
+        }
+    }
+
     /// The check reports every const gap of a body (check.rs `check_body_counted`:
     /// `Gap::BodyConst`), so a body with one is converted and checked, never passed clean.
     fn takes_const_gaps(&self) -> bool {
@@ -458,7 +479,7 @@ pub fn lower_fn<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys:
 /// body and record from one table (the run path's seam). The returned body's own `tys` is
 /// empty: its types are `into`'s.
 pub fn lower_again<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, body: &Body<'n>, into: &mut PortableTys<'static>) -> Result<Body<'n>, BodyError> {
-    match keys.library(body.owner) {
+    match keys.library_in(names, body.owner) {
         Some(lib) => lower_fn_into(names, prepared, keys, store, lib, Some(into)),
         None => lower_member_into(names, prepared, keys, store, body.owner, Some(into)),
     }
@@ -513,7 +534,16 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
         self_: head.self_,
         self_assoc: head.self_assoc.clone(),
     };
-    lower_at(names, prepared, keys, store, site, into)
+    let container = head.container;
+    let mut body = lower_at(names, prepared, keys, store, site, into)?;
+    // The body's own trait is in scope in it, imported or not (own_trait.rs: `impl
+    // core::hash::Hash for X { .. self.field.hash(state) .. }`); `traits` stays sorted.
+    if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
+        if let Err(at) = body.traits.binary_search(&own) {
+            body.traits.insert(at, own);
+        }
+    }
+    Ok(body)
 }
 
 /// Where a body is lowered: its item (a member's is its container), its checker key, text and
@@ -583,6 +613,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             env: Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts },
             failed: None,
             blocks,
+            locals: &store.locals,
+            owner,
         };
         // Each round converts into a fresh copy of the records' table: a refused round's
         // types are dropped with it, and none reaches `store.tys`.

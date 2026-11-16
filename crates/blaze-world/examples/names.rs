@@ -697,8 +697,16 @@ impl blaze_scope::CellsSeam for PrintShadows {
             }
         };
         for d in s.differ_first.iter() {
-            eprintln!("cells seam: {krate}: differ {:x} {:?}: old {:?}, cells {:?}", d.module, d.ns, d.old, d.cells);
+            eprintln!("cells seam: {krate}: differ {:x} {:?} `{}`: old {:?}, cells {:?}", d.module, d.ns, d.name, d.old, d.cells);
         }
+        for u in s.unknown_first.iter() {
+            let what = if u.call.is_some() { "call" } else if u.glob { "glob" } else { "import" };
+            eprintln!("cells seam: {krate}: unknown {what} {:?} {:?} {:?} in {:x}", u.why, u.kind, &u.segments[..], u.module);
+        }
+        for d in s.written_first.iter() {
+            eprintln!("cells seam: {krate}: written {:?} {:x} {:?} `{}`: old {:?}, cells {:?}", d.which, d.module, d.ns, d.name, d.old, d.cells);
+        }
+        eprintln!("cells seam: {krate}: unknown by class: imports {:?} calls {:?}", s.unknown_imports, s.unknown_calls);
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         eprintln!(
             "cells seam: {krate}: old fill {:.2} ms, cells load {:.2} ms + solve {:.2} ms; bindings equal {}, differ {}, cells unknown {}; \
@@ -707,6 +715,13 @@ impl blaze_scope::CellsSeam for PrintShadows {
             ms(s.old_fill), ms(s.cells_load), ms(s.cells_solve), s.equal, s.differ, s.unknown,
             s.old_errors, s.failed, s.outside, s.undecided, s.dep_reads, s.dep_absent,
             s.not_expanded, s.first_not_expanded, s.cells, s.stalls,
+        );
+        let w = s.written;
+        eprintln!(
+            "cells seam: {krate}: cells written: absent {} unread {} later {} unknown {} bindings_equal {} bindings_differ {} globs_equal {} globs_differ {} \
+             only_old {} only_cells {} def {} vis {} origin {} expansion {} state {}",
+            w.modules_absent, w.modules_unread, w.modules_later, w.modules_unknown, w.bindings_equal, w.bindings_differ, w.globs_equal, w.globs_differ,
+            w.only_old, w.only_cells, w.def, w.vis, w.origin, w.expansion, w.state,
         );
     }
 }
@@ -800,6 +815,14 @@ struct KeptDir<'w> {
     read_digest: AtomicU64,
     names_digest: AtomicU64,
     keeps_names: bool,
+    /// `--expansions`: each crate's expansions set kept (`<hex>.x`); the bytes written this run
+    /// and their digest, summed as the other records' are.
+    keeps_expansions: bool,
+    x_bytes: AtomicU64,
+    x_digest: AtomicU64,
+    /// `--solve-again`: no crate is found, so every crate is solved again (with `--expansions`
+    /// and an earlier run's folder: a re-solve of every crate that finds its expansions).
+    solve_again: bool,
     outlined: AtomicU64,
     /// By crate: why it was not found (`None`: found, or not asked).
     missed: Vec<std::sync::Mutex<Option<String>>>,
@@ -891,6 +914,9 @@ impl<'b> KeptRead<'b> {
 
 impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
     fn find(&self, krate: usize) -> Option<(&[u8], &[u8], &[u8])> {
+        if self.solve_again {
+            return self.miss(krate, "--solve-again".into());
+        }
         let start = Instant::now();
         let file = self.path(krate);
         let bytes: &'static [u8] = match std::fs::read(&file) {
@@ -981,6 +1007,31 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
         self.names_bytes.fetch_add(names.len() as u64, Ordering::Relaxed);
         self.names_digest.fetch_add(self.record_digest(krate, &[names]), Ordering::Relaxed);
     }
+
+    /// `--expansions`: each crate's expansions kept as one set, `<hex>.x` beside its kept file.
+    fn keeps_expansions(&self) -> bool {
+        self.keeps_expansions
+    }
+
+    /// The crate's last set, whether or not its files changed (a copy aligned as the set asks:
+    /// this example reads files whole; the command maps them).
+    fn expansions(&self, krate: usize) -> Option<&[u8]> {
+        let file = self.path(krate).with_extension("x");
+        match std::fs::read(&file) {
+            Ok(bytes) => Some(blaze_scope::resolve::aligned(&bytes, g())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("expansions set {}: {e}", file.display()),
+        }
+    }
+
+    fn expansions_made(&self, krate: usize, set: &[u8]) {
+        let path = self.path(krate).with_extension("x");
+        let part = self.path(krate).with_extension("x-part");
+        std::fs::write(&part, set).unwrap_or_else(|e| panic!("expansions set {}: {e}", part.display()));
+        std::fs::rename(&part, &path).unwrap_or_else(|e| panic!("expansions set {}: {e}", path.display()));
+        self.x_bytes.fetch_add(set.len() as u64, Ordering::Relaxed);
+        self.x_digest.fetch_add(self.record_digest(krate, &[set]), Ordering::Relaxed);
+    }
 }
 
 impl SourceTexts<'static> for Timed<'_> {
@@ -1027,13 +1078,19 @@ impl SourceTexts<'static> for Timed<'_> {
     }
 }
 
+/// The profile's clock for blaze-proc-macro's parts: nanoseconds since its first call.
+fn proc_clock() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
 /// The hook over the module store `store`, writing compiled modules and records under `out`:
 /// each proc-macro crate registered by its lock identity (registry checksum, a path package's
 /// files, a git commit and folder: the folder from the store's module identities, as the lock
 /// does not say it).
 fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, root: &FsPath, world: &World<'static>, graph: &UnitGraph<'static>, lock: &Lock<'static>, lock_text: &str, paths: &[(LockId, &'static str)], places: &mut P) -> Procs {
     use blaze_proc_macro::hook::ProcMacros;
-    let runtime: &'static blaze_proc_macro::host::Runtime = Box::leak(Box::new(blaze_proc_macro::host::Runtime::new().unwrap_or_else(|e| panic!("the proc-macro runtime: {e}"))));
+    let runtime: &'static blaze_proc_macro::host::Runtime = Box::leak(Box::new(blaze_proc_macro::host::Runtime::timed(proc_clock).unwrap_or_else(|e| panic!("the proc-macro runtime: {e}"))));
     let records: &'static blaze_proc_macro::record::DirStore = Box::leak(Box::new(blaze_proc_macro::record::DirStore::new(out)));
     let mut procs = ProcMacros::new(runtime, records, blaze_proc_macro::host::Limits::STANDARD);
     let mut keys = vec![None; world.crates.len()];
@@ -1659,6 +1716,10 @@ fn main() {
                 read_digest: AtomicU64::new(0),
                 names_digest: AtomicU64::new(0),
                 keeps_names: !args.iter().any(|a| a == "--no-names"),
+                keeps_expansions: args.iter().any(|a| a == "--expansions"),
+                x_bytes: AtomicU64::new(0),
+                x_digest: AtomicU64::new(0),
+                solve_again: args.iter().any(|a| a == "--solve-again"),
                 outlined: AtomicU64::new(0),
                 missed: (0..inputs.len()).map(|_| std::sync::Mutex::new(None)).collect(),
             };
@@ -1697,6 +1758,13 @@ fn main() {
                 kept.read_digest.load(Ordering::Relaxed),
                 kept.names_digest.load(Ordering::Relaxed)
             );
+            if kept.keeps_expansions {
+                println!(
+                    "threads {t}: expansions sets written this run: {} bytes, digest {:016x}",
+                    kept.x_bytes.load(Ordering::Relaxed),
+                    kept.x_digest.load(Ordering::Relaxed)
+                );
+            }
             parts::print(t);
             stages::print(t);
             let mut slowest: Vec<(u64, usize)> =
@@ -1782,6 +1850,12 @@ fn main() {
             }
         };
         if let Some(p) = procs {
+            // Each crate's proc-macro results written as its one table (the rows this run ran).
+            let keep_start = Instant::now();
+            match p.procs.keep_all() {
+                Ok(kept) => println!("threads {t}: proc results kept: {} tables, {} rows, {} bytes in {:.1} ms", kept.tables, kept.rows, kept.bytes, ms(keep_start.elapsed())),
+                Err(e) => println!("threads {t}: proc results NOT kept: {e}"),
+            }
             let findings = p.procs.take_findings();
             let mut by_kind: BTreeMap<String, (usize, String)> = BTreeMap::new();
             for f in &findings {
@@ -1791,6 +1865,11 @@ fn main() {
             println!("proc findings {} in all", findings.len());
             for (kind, (n, first)) in &by_kind {
                 println!("  {n:>6}  {kind}: e.g. {}", first.chars().take(200).collect::<String>());
+            }
+            // The proc macros' own rows (blaze-proc-macro's parts): the sums since the start.
+            for row in p.procs.parts().rows() {
+                let each = if row.entered == 0 { 0.0 } else { row.nanos as f64 / 1e3 / row.entered as f64 };
+                println!("threads {t}: proc part {:<12} {:>9.1} ms  entered {:>8} ({each:>8.2} us each)", row.part.name(), row.nanos as f64 / 1e6, row.entered);
             }
         }
         {

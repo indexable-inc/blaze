@@ -589,12 +589,15 @@ impl<'o, 'a> Assembled<'o, 'a> {
             errors: Vec::new_in(alloc),
             messages: Vec::new_in(alloc),
             keys: Vec::new_in(alloc),
+            names: Vec::with_capacity_in(self.len(), alloc),
             own_flags: self.parts.first().map_or(ItemFlags::NONE, |part| part.outline.own_flags),
             flags: self.flags,
         };
         out.items.extend(self.items());
         for part in &self.parts {
             out.attrs.extend_from_slice(&part.outline.attrs);
+            // A names digest holds no position and no parent's place: a part's are the file's.
+            out.names.extend_from_slice(&part.outline.names);
             out.keys.extend(part.outline.keys.iter().map(|&(at, key)| (ItemIndex(at.0 + part.items), key)));
         }
         for (error, message) in self.errors() {

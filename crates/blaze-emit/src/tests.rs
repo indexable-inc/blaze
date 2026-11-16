@@ -162,6 +162,9 @@ pub(crate) fn emitted(view: View<'_>, via: &[Via]) -> Result<Code<Global>, EmitE
 pub(crate) fn emitted_for(view: View<'_>, via: &[Via], isa: Isa) -> Result<Code<Global>, EmitError> {
     let mut code = Code::new_in(Global);
     emit(view, via, isa, &mut code)?;
+    // Every function the tests emit is also built as a code record and checked: no literal
+    // word left, a round trip, equal bytes twice (record_tests.rs).
+    crate::record_tests::holds(view, isa);
     Ok(code)
 }
 
@@ -445,7 +448,7 @@ fn the_cell_baseline_against_registers() {
 
 /// `sum(n) = 1 + 2 + .. + n` through block parameters: entry, a head testing `i > n`, a body
 /// adding, the exit returning.
-fn sum_func() -> Func<Global> {
+pub(crate) fn sum_func() -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
     b.set_signature(sig);
@@ -655,7 +658,7 @@ fn a_slot_aligned_past_the_stack() {
 // Calls.
 
 /// `callee(a: i32, b: i8 signext) -> i32 = a * 3 + sext(b)`.
-fn callee() -> Func<Global> {
+pub(crate) fn callee() -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let params = [Param::of(Ty::I32), Param { ext: Ext::Sext, ..Param::of(Ty::I8) }];
     let sig = b.sig(Conv::C, Variadic::No, &params, &[Param::of(Ty::I32)]);
@@ -672,7 +675,7 @@ fn callee() -> Func<Global> {
 }
 
 /// `caller(x: i32, y: i8) -> i32 = callee(x, y) + 1`, the callee at place 0; returns `ret`.
-fn caller_of(ret: Ty) -> (Func<Global>, ()) {
+pub(crate) fn caller_of(ret: Ty) -> (Func<Global>, ()) {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32), Param::of(Ty::I8)], &[Param::of(ret)]);
     b.set_signature(sig);

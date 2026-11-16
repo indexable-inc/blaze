@@ -1,0 +1,642 @@
+//! One function instance's code record (run.md, "End state", "The code record"): the value
+//! blaze-keyed's `CodeRecord` (tag 27) holds.
+//!
+//! - `code`: AArch64 machine code and its pure read-only data, position-independent. It holds no
+//!   address: every reference outside the record is a [`Site`] that loads an import word, and
+//!   every address in data is a [`Word`] of the `relro` part.
+//! - `targets`: what the sites and words name, each a [`Target`] (a space and a symbol), sorted
+//!   and unique: never an address, a slot number or a path.
+//! - `frame`: the function's compact unwind word (the emitter's encoding, opaque here) and
+//!   `pads`: its landing pads, item-relative.
+//! - Outside names (the C library's) are kept as text by symbol, for the launcher's `dlsym`.
+//!
+//! [`CodeRecord`] is the builder; [`CodeRecord::seal`] checks it and puts it in its one canonical
+//! form ([`Sealed`]), which alone encodes, so two builders of one record write equal bytes
+//! whatever order they added things in (rule 25). [`CodeView`] reads an encoded record in place.
+
+use core::fmt;
+
+use blaze_ids::Hasher;
+use blaze_own::{AVec, Alloc, Vec};
+
+/// The first eight bytes of every encoded record.
+pub const MAGIC: [u8; 8] = *b"bzcode01";
+
+/// The bytes before the sections: magic, frame, flags, eight counts.
+const HEAD: usize = 48;
+
+/// A [`Word`]'s target meaning this record's own code: the word holds the address of code byte
+/// `addend`.
+pub const OWN_CODE: u32 = u32::MAX;
+/// A [`Word`]'s target meaning this record's own relro part: the address of relro byte `addend`.
+pub const OWN_RELRO: u32 = u32::MAX - 1;
+/// A [`SiteKind::Relro`] site's target field: it names no target.
+pub const NO_TARGET: u32 = u32::MAX;
+
+const NAME_DOMAIN: &str = "blaze-code outside name 1";
+
+/// What a target is, by an identity that does not move when the named thing's body is edited:
+/// for a function its item's stable id and type arguments by content (blaze-program's
+/// `Symbol`); for an outside name the hash of the name ([`Symbol::of_name`]).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Symbol(pub [u8; 32]);
+
+impl Symbol {
+    /// The symbol of a C library name.
+    pub fn of_name(name: &str) -> Symbol {
+        Symbol(Hasher::new(NAME_DOMAIN).update(name.as_bytes()).finish().0)
+    }
+}
+
+impl fmt::Display for Symbol {
+    /// The first 12 hex digits.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0[..6].iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+/// The kind of thing a target is. The order is the encoding's and the sort's.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[repr(u8)]
+pub enum Space {
+    /// A function instance: its import word holds its body's address.
+    Func = 0,
+    /// A static: its address.
+    Static = 1,
+    /// A vtable: its address.
+    Vtable = 2,
+    /// A thread-local: its import word holds its offset in a thread's block, not an address.
+    Tls = 3,
+    /// A C library name, bound at start by `dlsym`; the record keeps the name.
+    Outside = 4,
+}
+
+impl Space {
+    const ALL: [Space; 5] = [Space::Func, Space::Static, Space::Vtable, Space::Tls, Space::Outside];
+
+    fn from_byte(byte: u8) -> Option<Space> {
+        Space::ALL.get(usize::from(byte)).copied()
+    }
+}
+
+/// What a site or word names.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Target {
+    pub space: Space,
+    pub symbol: Symbol,
+}
+
+/// The instructions at a site, which the segment's layout completes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[repr(u8)]
+pub enum SiteKind {
+    /// `adrp xN, word@PAGE` at `at`, `ldr xN, [xN, word@PAGEOFF]` at `at + 4`: the target's import
+    /// word's value in `xN`.
+    Load = 0,
+    /// A [`SiteKind::Load`] into `x16`, then `blr x16` at `at + 8`: a call of a function.
+    Call = 1,
+    /// `adrp xN, r@PAGE` at `at`, `add xN, xN, r@PAGEOFF` at `at + 4`: the address of byte
+    /// `addend` of this record's relro part. Its target is [`NO_TARGET`].
+    Relro = 2,
+}
+
+impl SiteKind {
+    const ALL: [SiteKind; 3] = [SiteKind::Load, SiteKind::Call, SiteKind::Relro];
+
+    fn from_byte(byte: u8) -> Option<SiteKind> {
+        SiteKind::ALL.get(usize::from(byte)).copied()
+    }
+
+    /// The bytes of code the site covers.
+    pub fn len(self) -> u32 {
+        match self {
+            SiteKind::Load | SiteKind::Relro => 8,
+            SiteKind::Call => 12,
+        }
+    }
+}
+
+/// Instructions of the code that name a target (or the record's own relro part).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Site {
+    /// The first instruction's offset from the code's first byte (4-aligned).
+    pub at: u32,
+    pub kind: SiteKind,
+    /// The target's index in the record's targets, or [`NO_TARGET`] for [`SiteKind::Relro`].
+    pub target: u32,
+    /// For [`SiteKind::Relro`], the relro byte addressed; 0 otherwise.
+    pub addend: u32,
+}
+
+/// An 8-byte word of the relro part the image fills: the address of `target` plus `addend` (a
+/// thread-local's offset plus `addend`), or of this record's own code or relro byte `addend`
+/// ([`OWN_CODE`], [`OWN_RELRO`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Word {
+    /// The word's offset in the relro part (8-aligned).
+    pub at: u32,
+    pub target: u32,
+    pub addend: i64,
+}
+
+/// A landing pad: a call in `[start, start + len)` that unwinds lands at `landing` with
+/// `action`, all offsets from the code's first byte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Pad {
+    pub start: u32,
+    pub len: u32,
+    pub landing: u32,
+    pub action: u32,
+}
+
+/// Why a record was not sealed: the first broken rule, naming the offset it is about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordError {
+    /// A site or word at `at` names a target index the record does not have.
+    NoSuchTarget { at: u32, target: u32 },
+    /// A site at `at` covering `len` bytes is not inside the code (`code` bytes).
+    SiteOutside { at: u32, len: u32, code: u32 },
+    /// A site's first instruction at `at` is not 4-aligned.
+    SiteMisaligned { at: u32 },
+    /// The site at `at` overlaps the one before it.
+    SitesOverlap { at: u32 },
+    /// A relro site at `at` addresses relro byte `addend`, past the relro part's `relro` bytes.
+    RelroOutside { at: u32, addend: u32, relro: u32 },
+    /// A word at `at` is not inside the relro part (`relro` bytes).
+    WordOutside { at: u32, relro: u32 },
+    /// A word at `at` is not 8-aligned.
+    WordMisaligned { at: u32 },
+    /// Two words at `at`.
+    WordsOverlap { at: u32 },
+    /// A landing pad's range from `start`, or its landing, is not inside the code.
+    PadOutside { start: u32 },
+    /// An outside target with no name kept for it.
+    NameMissing { symbol: Symbol },
+    /// A part (`what`) longer than a `u32` counts.
+    TooLarge { what: &'static str },
+}
+
+impl fmt::Display for RecordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            RecordError::NoSuchTarget { at, target } => write!(f, "a code record's reference at {at} names target {target}, which the record does not list (run.md, \"The code record\")"),
+            RecordError::SiteOutside { at, len, code } => write!(f, "a code record's site at {at} covers {len} bytes past its {code} bytes of code"),
+            RecordError::SiteMisaligned { at } => write!(f, "a code record's site at {at} is not on an instruction (4-aligned)"),
+            RecordError::SitesOverlap { at } => write!(f, "a code record's site at {at} overlaps the site before it"),
+            RecordError::RelroOutside { at, addend, relro } => write!(f, "a code record's site at {at} addresses relro byte {addend}, past its {relro} relro bytes"),
+            RecordError::WordOutside { at, relro } => write!(f, "a code record's relro word at {at} is past its {relro} relro bytes"),
+            RecordError::WordMisaligned { at } => write!(f, "a code record's relro word at {at} is not 8-aligned"),
+            RecordError::WordsOverlap { at } => write!(f, "a code record has two relro words at {at}"),
+            RecordError::PadOutside { start } => write!(f, "a code record's landing pad from {start} is not inside its code"),
+            RecordError::NameMissing { symbol } => write!(f, "a code record names the outside symbol {symbol} but keeps no name for it"),
+            RecordError::TooLarge { what } => write!(f, "a code record's {what} is longer than a u32 counts"),
+        }
+    }
+}
+
+impl core::error::Error for RecordError {}
+
+/// A code record being built. Targets may be added in any order and more than once;
+/// [`CodeRecord::seal`] sorts, merges and renumbers them.
+pub struct CodeRecord<'a> {
+    pub code: AVec<'a, u8>,
+    pub relro: AVec<'a, u8>,
+    pub targets: AVec<'a, Target>,
+    pub sites: AVec<'a, Site>,
+    pub words: AVec<'a, Word>,
+    pub frame: u32,
+    pub pads: AVec<'a, Pad>,
+    /// Each outside name: its symbol and its text's range in `text`.
+    names: AVec<'a, (Symbol, u32, u32)>,
+    text: AVec<'a, u8>,
+    alloc: Alloc<'a>,
+}
+
+impl<'a> CodeRecord<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> CodeRecord<'a> {
+        CodeRecord {
+            code: Vec::new_in(alloc),
+            relro: Vec::new_in(alloc),
+            targets: Vec::new_in(alloc),
+            sites: Vec::new_in(alloc),
+            words: Vec::new_in(alloc),
+            frame: 0,
+            pads: Vec::new_in(alloc),
+            names: Vec::new_in(alloc),
+            text: Vec::new_in(alloc),
+            alloc,
+        }
+    }
+
+    /// `target`'s index, for a site or word made before [`CodeRecord::seal`].
+    pub fn target(&mut self, target: Target) -> u32 {
+        self.targets.push(target);
+        (self.targets.len() - 1) as u32
+    }
+
+    /// The index of the outside name `name`, kept for the launcher's `dlsym`.
+    pub fn outside(&mut self, name: &str) -> u32 {
+        let symbol = Symbol::of_name(name);
+        let start = self.text.len() as u32;
+        self.text.extend_from_slice(name.as_bytes());
+        self.names.push((symbol, start, name.len() as u32));
+        self.target(Target { space: Space::Outside, symbol })
+    }
+
+    /// The record in its one canonical form: targets sorted and unique (every index renumbered),
+    /// sites and words sorted by offset, pads by start, names by symbol; every rule of the form
+    /// checked once here, so a [`Sealed`] needs no check again (rule 74).
+    pub fn seal(self) -> Result<Sealed<'a>, RecordError> {
+        let CodeRecord { code, relro, targets, mut sites, mut words, frame, mut pads, names, text, alloc } = self;
+        fits(code.len(), "code")?;
+        fits(relro.len(), "relro part")?;
+        // Sort the targets by value through an index list; equal targets become one.
+        let mut order: AVec<'a, u32> = Vec::with_capacity_in(targets.len(), alloc);
+        for i in 0..targets.len() {
+            order.push(i as u32);
+        }
+        order.sort_unstable_by(|&a, &b| targets[a as usize].cmp(&targets[b as usize]));
+        let mut renumber: AVec<'a, u32> = Vec::from_elem_in(0, targets.len(), alloc);
+        let mut sorted: AVec<'a, Target> = Vec::with_capacity_in(targets.len(), alloc);
+        for &old in order.iter() {
+            let t = targets[old as usize];
+            if sorted.last() != Some(&t) {
+                sorted.push(t);
+            }
+            renumber[old as usize] = (sorted.len() - 1) as u32;
+        }
+        drop(order);
+        let code_len = code.len() as u32;
+        let relro_len = relro.len() as u32;
+        for site in sites.iter_mut() {
+            match site.kind {
+                SiteKind::Relro => {
+                    if site.target != NO_TARGET {
+                        return Err(RecordError::NoSuchTarget { at: site.at, target: site.target });
+                    }
+                    if u64::from(site.addend) >= u64::from(relro_len) {
+                        return Err(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: relro_len });
+                    }
+                }
+                SiteKind::Load | SiteKind::Call => match renumber.get(site.target as usize) {
+                    Some(&new) => site.target = new,
+                    None => return Err(RecordError::NoSuchTarget { at: site.at, target: site.target }),
+                },
+            }
+        }
+        sites.sort_unstable_by_key(|s| s.at);
+        let mut end = 0u64;
+        for site in sites.iter() {
+            if site.at % 4 != 0 {
+                return Err(RecordError::SiteMisaligned { at: site.at });
+            }
+            if u64::from(site.at) < end {
+                return Err(RecordError::SitesOverlap { at: site.at });
+            }
+            end = u64::from(site.at) + u64::from(site.kind.len());
+            if end > u64::from(code_len) {
+                return Err(RecordError::SiteOutside { at: site.at, len: site.kind.len(), code: code_len });
+            }
+        }
+        for word in words.iter_mut() {
+            if word.target == OWN_CODE || word.target == OWN_RELRO {
+                continue;
+            }
+            match renumber.get(word.target as usize) {
+                Some(&new) => word.target = new,
+                None => return Err(RecordError::NoSuchTarget { at: word.at, target: word.target }),
+            }
+        }
+        drop(renumber);
+        words.sort_unstable_by_key(|w| w.at);
+        let mut next = 0u64;
+        for word in words.iter() {
+            if word.at % 8 != 0 {
+                return Err(RecordError::WordMisaligned { at: word.at });
+            }
+            if u64::from(word.at) < next {
+                return Err(RecordError::WordsOverlap { at: word.at });
+            }
+            next = u64::from(word.at) + 8;
+            if next > u64::from(relro_len) {
+                return Err(RecordError::WordOutside { at: word.at, relro: relro_len });
+            }
+        }
+        pads.sort_unstable_by_key(|p| (p.start, p.len, p.landing, p.action));
+        for pad in pads.iter() {
+            let past = u64::from(pad.start) + u64::from(pad.len);
+            if past > u64::from(code_len) || pad.landing >= code_len {
+                return Err(RecordError::PadOutside { start: pad.start });
+            }
+        }
+        // Names by symbol, each once, the text rebuilt in that order.
+        let mut by_symbol = names;
+        by_symbol.sort_unstable_by_key(|n| n.0);
+        by_symbol.dedup_by_key(|n| n.0);
+        let mut kept: AVec<'a, (Symbol, u32, u32)> = Vec::with_capacity_in(by_symbol.len(), alloc);
+        let mut kept_text: AVec<'a, u8> = Vec::new_in(alloc);
+        for &(symbol, start, len) in by_symbol.iter() {
+            let at = kept_text.len() as u32;
+            kept_text.extend_from_slice(&text[start as usize..(start + len) as usize]);
+            kept.push((symbol, at, len));
+        }
+        drop(by_symbol);
+        drop(text);
+        // Every outside target has a name; a name no target uses is dropped.
+        kept.retain(|n| sorted.binary_search(&Target { space: Space::Outside, symbol: n.0 }).is_ok());
+        let mut packed: AVec<'a, u8> = Vec::new_in(alloc);
+        let mut packed_names: AVec<'a, (Symbol, u32, u32)> = Vec::with_capacity_in(kept.len(), alloc);
+        for &(symbol, start, len) in kept.iter() {
+            let at = packed.len() as u32;
+            packed.extend_from_slice(&kept_text[start as usize..(start + len) as usize]);
+            packed_names.push((symbol, at, len));
+        }
+        for t in sorted.iter() {
+            if t.space == Space::Outside && packed_names.binary_search_by_key(&t.symbol, |n| n.0).is_err() {
+                return Err(RecordError::NameMissing { symbol: t.symbol });
+            }
+        }
+        fits(packed.len(), "names' text")?;
+        Ok(Sealed(CodeRecord { code, relro, targets: sorted, sites, words, frame, pads, names: packed_names, text: packed, alloc }))
+    }
+}
+
+fn fits(len: usize, what: &'static str) -> Result<(), RecordError> {
+    match u32::try_from(len) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(RecordError::TooLarge { what }),
+    }
+}
+
+/// A record in its canonical form ([`CodeRecord::seal`]): the only form that encodes.
+pub struct Sealed<'a>(CodeRecord<'a>);
+
+impl<'a> Sealed<'a> {
+    pub fn record(&self) -> &CodeRecord<'a> {
+        &self.0
+    }
+
+    /// The record's bytes, appended to `out`: the head, then each section 8-aligned (module doc
+    /// of [`CodeView`] says the layout). Equal sealed records write equal bytes.
+    pub fn encode(&self, out: &mut AVec<'_, u8>) {
+        let r = &self.0;
+        let start = out.len();
+        out.extend_from_slice(&MAGIC);
+        put32(out, r.frame);
+        put32(out, 0);
+        for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len()] {
+            put32(out, count as u32);
+        }
+        out.extend_from_slice(&r.code);
+        pad8(out, start);
+        out.extend_from_slice(&r.relro);
+        pad8(out, start);
+        for t in r.targets.iter() {
+            out.push(t.space as u8);
+            out.extend_from_slice(&[0; 7]);
+            out.extend_from_slice(&t.symbol.0);
+        }
+        for s in r.sites.iter() {
+            put32(out, s.at);
+            out.push(s.kind as u8);
+            out.extend_from_slice(&[0; 3]);
+            put32(out, s.target);
+            put32(out, s.addend);
+        }
+        for w in r.words.iter() {
+            put32(out, w.at);
+            put32(out, w.target);
+            out.extend_from_slice(&w.addend.to_le_bytes());
+        }
+        for p in r.pads.iter() {
+            for v in [p.start, p.len, p.landing, p.action] {
+                put32(out, v);
+            }
+        }
+        for &(symbol, at, len) in r.names.iter() {
+            out.extend_from_slice(&symbol.0);
+            put32(out, at);
+            put32(out, len);
+        }
+        out.extend_from_slice(&r.text);
+        pad8(out, start);
+    }
+}
+
+fn put32(out: &mut AVec<'_, u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn pad8(out: &mut AVec<'_, u8>, start: usize) {
+    while (out.len() - start) % 8 != 0 {
+        out.push(0);
+    }
+}
+
+const TARGET_ROW: usize = 40;
+const SITE_ROW: usize = 16;
+const WORD_ROW: usize = 16;
+const PAD_ROW: usize = 16;
+const NAME_ROW: usize = 40;
+
+/// Why bytes are not a code record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecodeError {
+    /// The bytes do not start with [`MAGIC`].
+    Magic,
+    /// The head's counts need `need` bytes; there are `have`.
+    Length { need: usize, have: usize },
+    /// Target `row` has the space byte `byte`.
+    Space { row: u32, byte: u8 },
+    /// Site `row` has the kind byte `byte`.
+    Kind { row: u32, byte: u8 },
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode01` head"),
+            DecodeError::Length { need, have } => write!(f, "a code record's head counts {need} bytes; it has {have}"),
+            DecodeError::Space { row, byte } => write!(f, "a code record's target {row} has the unknown space {byte}"),
+            DecodeError::Kind { row, byte } => write!(f, "a code record's site {row} has the unknown kind {byte}"),
+        }
+    }
+}
+
+impl core::error::Error for DecodeError {}
+
+/// An encoded record read in place. Layout (little-endian; every section starts 8-aligned from
+/// the record's first byte): `MAGIC`; `frame: u32`, `flags: u32` (0); eight `u32` counts (code
+/// bytes, relro bytes, targets, sites, words, pads, names, text bytes); the code; the relro part;
+/// targets (space `u8`, 7 zero bytes, symbol 32); sites (`at: u32`, kind `u8`, 3 zero bytes,
+/// `target: u32`, `addend: u32`); words (`at: u32`, `target: u32`, `addend: i64`); pads (four
+/// `u32`); names (symbol 32, text `at: u32`, `len: u32`); the text.
+#[derive(Clone, Copy)]
+pub struct CodeView<'b> {
+    bytes: &'b [u8],
+    frame: u32,
+    code: &'b [u8],
+    relro: &'b [u8],
+    targets: &'b [u8],
+    sites: &'b [u8],
+    words: &'b [u8],
+    pads: &'b [u8],
+    names: &'b [u8],
+    text: &'b [u8],
+}
+
+fn get32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn get64(b: &[u8], at: usize) -> u64 {
+    u64::from(get32(b, at)) | (u64::from(get32(b, at + 4)) << 32)
+}
+
+fn up8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+/// The `used` bytes at `*at`, then `*at` moved past the section's `len` (its padded length).
+/// The caller checked that every section fits.
+fn part<'b>(bytes: &'b [u8], at: &mut usize, len: usize, used: usize) -> &'b [u8] {
+    let section = &bytes[*at..*at + used];
+    *at += len;
+    section
+}
+
+fn symbol_at(b: &[u8], at: usize) -> Symbol {
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&b[at..at + 32]);
+    Symbol(s)
+}
+
+impl<'b> CodeView<'b> {
+    /// Reads the record at the start of `bytes`, which must be exactly one record. The lengths and
+    /// every tag byte are checked here, once: the accessors below index without checking again.
+    pub fn read(bytes: &'b [u8]) -> Result<CodeView<'b>, DecodeError> {
+        if bytes.len() < HEAD {
+            return Err(DecodeError::Length { need: HEAD, have: bytes.len() });
+        }
+        if bytes[..8] != MAGIC {
+            return Err(DecodeError::Magic);
+        }
+        let frame = get32(bytes, 8);
+        let count = |i: usize| get32(bytes, 16 + 4 * i) as usize;
+        let lens = [
+            up8(count(0)),
+            up8(count(1)),
+            count(2) * TARGET_ROW,
+            count(3) * SITE_ROW,
+            count(4) * WORD_ROW,
+            count(5) * PAD_ROW,
+            count(6) * NAME_ROW,
+            up8(count(7)),
+        ];
+        let need = HEAD + lens.iter().sum::<usize>();
+        if need != bytes.len() {
+            return Err(DecodeError::Length { need, have: bytes.len() });
+        }
+        let mut at = HEAD;
+        let code = part(bytes, &mut at, lens[0], count(0));
+        let relro = part(bytes, &mut at, lens[1], count(1));
+        let targets = part(bytes, &mut at, lens[2], lens[2]);
+        let sites = part(bytes, &mut at, lens[3], lens[3]);
+        let words = part(bytes, &mut at, lens[4], lens[4]);
+        let pads = part(bytes, &mut at, lens[5], lens[5]);
+        let names = part(bytes, &mut at, lens[6], lens[6]);
+        let text = part(bytes, &mut at, lens[7], count(7));
+        for row in 0..count(2) {
+            let byte = targets[row * TARGET_ROW];
+            if Space::from_byte(byte).is_none() {
+                return Err(DecodeError::Space { row: row as u32, byte });
+            }
+        }
+        for row in 0..count(3) {
+            let byte = sites[row * SITE_ROW + 4];
+            if SiteKind::from_byte(byte).is_none() {
+                return Err(DecodeError::Kind { row: row as u32, byte });
+            }
+        }
+        Ok(CodeView { bytes, frame, code, relro, targets, sites, words, pads, names, text })
+    }
+
+    /// The whole encoding: equal records are equal bytes.
+    pub fn bytes(&self) -> &'b [u8] {
+        self.bytes
+    }
+
+    pub fn frame(&self) -> u32 {
+        self.frame
+    }
+
+    pub fn code(&self) -> &'b [u8] {
+        self.code
+    }
+
+    pub fn relro(&self) -> &'b [u8] {
+        self.relro
+    }
+
+    pub fn targets(&self) -> usize {
+        self.targets.len() / TARGET_ROW
+    }
+
+    pub fn target(&self, i: usize) -> Target {
+        let row = i * TARGET_ROW;
+        let Some(space) = Space::from_byte(self.targets[row]) else {
+            unreachable!("CodeView::read checked every target's space byte");
+        };
+        Target { space, symbol: symbol_at(self.targets, row + 8) }
+    }
+
+    pub fn sites(&self) -> usize {
+        self.sites.len() / SITE_ROW
+    }
+
+    pub fn site(&self, i: usize) -> Site {
+        let row = i * SITE_ROW;
+        let Some(kind) = SiteKind::from_byte(self.sites[row + 4]) else {
+            unreachable!("CodeView::read checked every site's kind byte");
+        };
+        Site { at: get32(self.sites, row), kind, target: get32(self.sites, row + 8), addend: get32(self.sites, row + 12) }
+    }
+
+    pub fn words(&self) -> usize {
+        self.words.len() / WORD_ROW
+    }
+
+    pub fn word(&self, i: usize) -> Word {
+        let row = i * WORD_ROW;
+        Word { at: get32(self.words, row), target: get32(self.words, row + 4), addend: get64(self.words, row + 8) as i64 }
+    }
+
+    pub fn pads(&self) -> usize {
+        self.pads.len() / PAD_ROW
+    }
+
+    pub fn pad(&self, i: usize) -> Pad {
+        let row = i * PAD_ROW;
+        Pad { start: get32(self.pads, row), len: get32(self.pads, row + 4), landing: get32(self.pads, row + 8), action: get32(self.pads, row + 12) }
+    }
+
+    /// The name kept for an outside target's symbol, by halving over the sorted names.
+    pub fn name(&self, symbol: Symbol) -> Option<&'b str> {
+        let rows = self.names.len() / NAME_ROW;
+        let (mut lo, mut hi) = (0usize, rows);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let at = mid * NAME_ROW;
+            match symbol_at(self.names, at).cmp(&symbol) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    let start = get32(self.names, at + 32) as usize;
+                    let len = get32(self.names, at + 36) as usize;
+                    return core::str::from_utf8(self.text.get(start..start + len)?).ok();
+                }
+            }
+        }
+        None
+    }
+}

@@ -83,6 +83,7 @@ mod error;
 mod expand;
 mod expansion;
 mod item;
+pub mod kept;
 mod key;
 mod limit;
 mod literal;
@@ -111,11 +112,11 @@ pub use crate::{
     error::{ExpandError, LexError, RulesLimit, Stream, StreamError, Table, Unbuilt},
     expand::{Prepared, expand, expand_prepared, prepare},
     expansion::{
-        Diagnostic, Expanded, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind,
+        Diagnostic, Expanded, Expansion, Held, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind,
         PathScope, ProcLevel, Range, Read, ReadAnswer, ReadKind, Reads, TokenOrigin,
     },
     item::{AttrCall, DeriveUse, Derives, ItemAttrs, ItemAttrsError, NextAttr},
-    key::{CallKey, ExpansionKey, call_key, expansion_key},
+    key::{CallKey, DefText, EXPANDER, ExpansionKey, TextCall, TextKey, call_key, expansion_key, text_key},
     limit::{Depth, LimitReached, RecursionLimit},
     nested::find_calls,
     record::{

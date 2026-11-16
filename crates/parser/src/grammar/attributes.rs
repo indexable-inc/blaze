@@ -2,19 +2,19 @@ use super::*;
 
 pub(super) const OUTER_ATTR_FIRST: TokenSet = TokenSet::new(&[T![#], OUTER_DOC_COMMENT]);
 
-pub(super) fn inner_attrs(p: &mut Parser<'_>) {
+pub(super) fn inner_attrs<S: Sink>(p: &mut Parser<'_, S>) {
     while p.at(INNER_DOC_COMMENT) || (p.at(T![#]) && p.nth_at(1, T![!])) {
         attr(p, true);
     }
 }
 
-pub(super) fn outer_attrs(p: &mut Parser<'_>) {
+pub(super) fn outer_attrs<S: Sink>(p: &mut Parser<'_, S>) {
     while p.at_ts(OUTER_ATTR_FIRST) {
         attr(p, false);
     }
 }
 
-fn attr(p: &mut Parser<'_>, inner: bool) {
+fn attr<S: Sink>(p: &mut Parser<'_, S>, inner: bool) {
     if (inner && p.at(INNER_DOC_COMMENT)) || (!inner && p.at(OUTER_DOC_COMMENT)) {
         let m = p.start();
         p.bump_any();
@@ -46,7 +46,7 @@ fn attr(p: &mut Parser<'_>, inner: bool) {
 // #![unsafe]
 // #![unsafe =]
 
-fn cfg_attr_meta(p: &mut Parser<'_>, m: Marker) {
+fn cfg_attr_meta<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     // test cfg_attr
     // #![cfg_attr(not(foo), unsafe(bar()), cfg_attr(all(true, foo = "bar"), baz = "baz"))]
     p.eat_contextual_kw(T![cfg_attr]);
@@ -66,7 +66,7 @@ fn cfg_attr_meta(p: &mut Parser<'_>, m: Marker) {
 const CFG_PREDICATE_FIRST_SET: TokenSet =
     expressions::LITERAL_FIRST.union(TokenSet::new(&[T![ident]]));
 
-pub(super) fn cfg_predicate(p: &mut Parser<'_>) {
+pub(super) fn cfg_predicate<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     if p.eat(T![true]) || p.eat(T![false]) {
         // test cfg_true_false_pred
@@ -127,7 +127,7 @@ pub(super) fn cfg_predicate(p: &mut Parser<'_>) {
     }
 }
 
-fn cfg_meta(p: &mut Parser<'_>, m: Marker) {
+fn cfg_meta<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     // test cfg_meta
     // #![cfg(foo)]
     // #![cfg(foo = "bar",)]
@@ -160,7 +160,7 @@ fn cfg_meta(p: &mut Parser<'_>, m: Marker) {
 // #![unsafe(simple::path::tt(a b c))]
 // #![unsafe(simple::path::tt[a b c])]
 // #![unsafe(simple::path::tt{a b c})]
-pub(super) fn meta(p: &mut Parser<'_>) {
+pub(super) fn meta<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     if p.eat(T![unsafe]) {
         p.expect(T!['(']);

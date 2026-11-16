@@ -189,8 +189,12 @@ fn main() {}
 ///   a TYPE, so it stays a type: a fix that reads every one-segment path as a constant refuses
 ///   it ("`T` is a type parameter; a constant is expected here").
 ///
-/// Expected line: `const arguments in bounds: needs: clean` (and the same for `inline`, `item`,
-/// `braced`, `typed`). Before the fix each was "not lowered"/"not checked" with
+/// `sized` is checked before `item` so that `CAP` has its value: this harness lowers a fn's
+/// generic parameters with no constant evaluator behind them (`lower_fn`'s first stage has no
+/// round for `Why::NeedConst`; a driver makes the fn's head, and with it the constant, first).
+///
+/// Expected line: `const arguments in bounds: needs: clean` (and the same for `inline`, `sized`,
+/// `item`, `braced`, `typed`). Before the fix each was "not lowered"/"not checked" with
 /// `Unsupported("a const parameter in a type position (a bound's const argument `Tr<N>`)")`.
 #[test]
 fn a_bound_argument_is_const_where_the_trait_declares_const() {
@@ -207,13 +211,44 @@ trait Holds<T, const K: usize> { fn held(&self) -> T; }
 const CAP: usize = 4;
 fn needs(p: &Pair<2, 2>) -> u64 { p.first() }
 fn inline<const N: usize, T: Tr<N>>(t: &T) -> usize { t.k() }
+fn sized(a: [u8; CAP]) -> u8 { a[0] }
 fn item<T: Tr<CAP>>(t: &T) -> usize { t.k() }
 fn braced<const N: usize, T>(t: &T) -> usize where T: Tr<{ N }> { t.k() }
 fn typed<const N: usize, T, H: Holds<T, N>>(h: &H) -> T { h.held() }
 fn main() {}
 ";
-    let got = check_fns(TEXT, &["needs", "inline", "item", "braced", "typed"]);
+    let got = check_fns(TEXT, &["needs", "inline", "sized", "item", "braced", "typed"]);
     all_clean("const arguments in bounds", &got);
+}
+
+/// A member fn's const parameter is the member's own: it never becomes a const parameter of
+/// its trait (the Reference, "Generic parameters": "Generic parameters are in scope within the
+/// item definition where they are declared."). `chunk<const N: usize>` declares index 1 of its
+/// own list; `total<S>` declares index 1 of ITS own list, a type. `other<L: Later>` makes the
+/// trait's members be made a second time when `Later`'s head is not there yet, which is when
+/// the first round's leftovers were read: core's `Iterator::next_chunk<const N: usize>` made
+/// `Iterator::sum<S>`'s `S` "a const parameter in a type position" (8 signatures of
+/// tempo_primitives). Expected line: `a member's const parameter: uses: clean`.
+#[test]
+fn a_members_const_parameter_is_not_its_traits() {
+    const TEXT: &str = "trait Later { fn l(&self) -> u8; }
+trait Walk {
+    fn chunk<const N: usize>(&self) -> [u8; N];
+    fn other<L: Later>(&self, l: &L) -> u8;
+    fn total<S>(&self, s: S) -> S;
+}
+struct W;
+impl Later for W { fn l(&self) -> u8 { 1 } }
+impl Walk for W {
+    fn chunk<const N: usize>(&self) -> [u8; N] { [0u8; N] }
+    fn other<L: Later>(&self, l: &L) -> u8 { l.l() }
+    fn total<S>(&self, s: S) -> S { s }
+}
+fn uses(w: &W) -> u8 { w.total(7u8) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["uses"]);
+    all_clean("a member's const parameter", &got);
 }
 
 /// What a bound's const argument still cannot be: an expression over a generic parameter
@@ -221,17 +256,24 @@ fn main() {}
 /// standalone argument inside of a type or array repeat expression. In those contexts, they may
 /// only be used as a single segment path expression, possibly inside a block (such as N or {N}).
 /// That is, they cannot be combined with other expressions."). It is a typed refusal with its
-/// own name, never a guessed value. Expected line: the outcome of `plus` contains
+/// own name, never a guessed value. `warm` is checked first: it calls `Tr`'s method, so `Tr`'s
+/// head is made (this harness lowers a fn's generic parameters with no round for a head not
+/// made yet, and what says `{ N + 1 }` fills a const parameter is that head). Expected lines:
+/// `warm` is `clean`; the outcome of `plus` contains
 /// `a constant expression over a generic parameter`.
 #[test]
 fn a_bound_argument_that_computes_over_a_parameter_is_refused_by_name() {
     const TEXT: &str = "trait Tr<const K: usize> { fn k(&self) -> usize; }
+struct Unit;
+impl Tr<3> for Unit { fn k(&self) -> usize { 3 } }
+fn warm(u: &Unit) -> usize { u.k() }
 fn plus<const N: usize, T: Tr<{ N + 1 }>>(t: &T) -> usize { t.k() }
 fn main() {}
 ";
-    let got = check_fns(TEXT, &["plus"]);
+    let got = check_fns(TEXT, &["warm", "plus"]);
     println!("{got:?}");
-    assert!(got[0].1.contains("a constant expression over a generic parameter"), "{got:?}");
+    assert_eq!(got[0].1, "clean", "{got:?}");
+    assert!(got[1].1.contains("a constant expression over a generic parameter"), "{got:?}");
 }
 
 /// Statics as items with their type (the Reference, "Static items": "A static item is similar
@@ -286,8 +328,11 @@ fn main() {}
 /// A type alias in a body path (the Reference, "Type aliases": "A type alias defines a new name
 /// for an existing type"; "A type alias to a tuple-struct or unit-struct cannot be used to
 /// qualify that type's constructor"): `Same::<u8>::new()`, `Plain { x }`, `Int::MAX` resolve to
-/// the aliased type; `Fixed::new()` (`type Fixed = P<u16>`, arguments the path cannot carry) is
-/// the gap naming the alias, never a looser `P<_>`. Before the fix each was "gap TypeAlias".
+/// the aliased type; so does `Fixed::new()` (`type Fixed = P<u16>`: the body's conversion writes
+/// the aliased type's arguments on the alias's segment, world_paths.rs `AliasPaths::expand`),
+/// as `P<u16>` and never a looser `P<_>`: `loose`, which wants a `P<u8>` from it, is E0308.
+/// An alias of a type that is no ADT with a path after it (`type Tup = (u8, u8)`,
+/// `Tup::default()`) stays the gap naming the alias. Before the fixes each was "gap TypeAlias".
 #[test]
 fn a_type_alias_in_a_body_path_is_its_type() {
     const TEXT: &str = "struct P<T> { x: T }
@@ -301,12 +346,16 @@ fn same() -> P<u8> { Same::<u8>::new(1) }
 fn plain() -> u8 { let q = Plain { x: 3 }; q.x }
 fn int() -> u32 { Int::MAX }
 fn fixed() -> P<u16> { Fixed::new(2) }
+fn loose() -> P<u8> { Fixed::new(2) }
+type Tup = (u8, u8);
+fn tup() -> (u8, u8) { Tup::default() }
 fn main() {}
 ";
-    let got = check_fns(TEXT, &["same", "plain", "int", "fixed"]);
+    let got = check_fns(TEXT, &["same", "plain", "int", "fixed", "loose", "tup"]);
     println!("alias paths: {got:?}");
-    all_clean("alias paths", &got[..3]);
-    assert!(got[3].1.contains("aliases a type with fixed arguments"), "{got:?}");
+    all_clean("alias paths", &got[..4]);
+    assert!(got[4].1.contains("diagnostics") && got[4].1.contains("E0308"), "{got:?}");
+    assert!(got[5].1.contains("aliases a type with fixed arguments"), "{got:?}");
 }
 
 /// A negative impl is a head with its polarity (rustc's `negative_impls`, which core uses for
@@ -837,16 +886,67 @@ fn main() {}
     for (n, o) in &got {
         println!("trait constants: {n}: {o}");
     }
-    if CONST_PATH_ARGS_OWED {
-        // Today each is refused BY NAME (never the trait's default taken for an impl that
-        // overrides it: the first run of this test printed "Padded: .. len 6", 3 + 3).
-        for (n, o) in &got {
-            assert!(o.starts_with("refused: ") && (o.contains("TraitConstNoSelf") || o.contains("with no `Self`")), "{n}: {o}");
-        }
-        return;
-    }
+    // A qualified leaf of a HEAD's expression is answered by selection before the expression
+    // is evaluated (front2/const_qpath.rs), so these two no longer wait on
+    // [`CONST_PATH_ARGS_OWED`] (which still holds for a path inside a constant's body: the
+    // test below). Never the trait's default taken for an impl that overrides it: the first
+    // run of this test printed "Padded: .. len 6", 3 + 3.
     assert!(got[0].1.starts_with("fields [array of ") && got[0].1.ends_with(" len 2] discrs []"), "{got:?}");
     assert!(got[1].1.starts_with("fields [array of ") && got[1].1.ends_with(" len 8] discrs []"), "{got:?}");
+}
+
+/// What `modular_bitfield` writes for a bitfield struct's bytes (tempo's primitives, about 115
+/// bodies stopped at "Item/ConstPath \"( ( ( < B4 as :: modular_bitfield :: Specifier > ::
+/// BITS + ..\""): an array length that is arithmetic over qualified paths to a trait's
+/// associated constant on concrete types. The Reference, "Associated Items", "Associated
+/// Constants": "An associated constant definition defines a constant associated with a type";
+/// its example "Using default values" (`trait ConstantIdDefault { const ID: i32 = 1; }`, `impl
+/// ConstantIdDefault for Struct {}`, `assert_eq!(1, <Struct as ConstantIdDefault>::ID)`): the
+/// value is the implementing type's definition, or the trait's default where the impl writes
+/// none. So each leaf is answered by SELECTING the impl of the trait for the written type
+/// (front2/const_qpath.rs; `ConstsWorld::impl_const`).
+/// `Packed`: `<B4 as Spec>::BITS` is 4 and `<B1 as Spec>::BITS` is 1, so the length is ((4 +
+/// 1 - 1) / 8) + 1 = (4 / 8) + 1 = 0 + 1 = 1 (integer division: the Reference, "Arithmetic
+/// and Logical Binary Operators": "Integer division rounds towards zero"). `first` reads the
+/// field: its body is clean. `Missing`: `B9` has no impl of `Spec`, so there is no definition
+/// to take: a typed refusal (`ConstFail::NoImplConst`) that names the leaf as written (the
+/// trait and the type) and never a guessed value. `Inner`: the path is inside a constant
+/// item's BODY, where the checker's record holds no `Self` yet: still refused by name
+/// (`ConstFail::TraitConstNoSelf`) while [`CONST_PATH_ARGS_OWED`].
+/// Before the change `Packed` printed "refused: .. TraitConstNoSelf ..". Expected lines:
+/// "qualified constants: Packed: fields [array of Uint(U8) len 1] discrs []", "qualified
+/// constants: Missing: refused: Item(.., ConstPath(\"<B9 as Spec>::BITS: no impl of trait ..
+/// for the type Adt(..) gives its constant ..\", ..))" and "qualified constants: first:
+/// clean".
+#[test]
+fn a_qualified_trait_constant_in_an_array_length_is_selected_by_its_impl() {
+    const TEXT: &str = "trait Spec { const BITS: usize; }
+struct B4;
+impl Spec for B4 { const BITS: usize = 4; }
+struct B1;
+impl Spec for B1 { const BITS: usize = 1; }
+struct B9;
+struct Packed { bytes: [u8; ((<B4 as Spec>::BITS + <B1 as Spec>::BITS - 1) / 8) + 1] }
+struct Missing([u8; <B9 as Spec>::BITS + 1]);
+const INNER: usize = <B4 as Spec>::BITS;
+struct Inner([u8; INNER]);
+fn first(p: Packed) -> u8 { p.bytes[0] }
+fn main() {}
+";
+    let got = adt_rows(TEXT, &["Packed", "Missing", "Inner"]);
+    for (n, o) in &got {
+        println!("qualified constants: {n}: {o}");
+    }
+    assert!(got[0].1.starts_with("fields [array of ") && got[0].1.ends_with(" len 1] discrs []"), "{got:?}");
+    let missing = &got[1].1;
+    assert!(missing.starts_with("refused: ") && missing.contains("ConstPath") && missing.contains("<B9 as Spec>::BITS") && missing.contains("no impl of trait"), "{got:?}");
+    if CONST_PATH_ARGS_OWED {
+        let inner = &got[2].1;
+        assert!(inner.starts_with("refused: ") && (inner.contains("TraitConstNoSelf") || inner.contains("with no `Self`")), "{got:?}");
+    } else {
+        assert!(got[2].1.ends_with(" len 4] discrs []"), "{got:?}");
+    }
+    all_clean("qualified constants", &check_fns(TEXT, &["first"]));
 }
 
 /// OWED BY THE CHECKER AND THE EVALUATOR (2026-11-16): a checked body records a constant path

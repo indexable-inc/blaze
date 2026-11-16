@@ -37,6 +37,7 @@ mod outline;
 mod output;
 mod parser;
 mod shortcuts;
+mod sink;
 mod syntax_kind;
 mod token_set;
 pub mod unescape;
@@ -56,6 +57,7 @@ pub use crate::{
     outline::lazy_block_len,
     output::{OutlineStep, Output, Step},
     shortcuts::{OutlineStrStep, StrStep},
+    sink::{Done, Sink},
     syntax_kind::SyntaxKind,
 };
 
@@ -153,6 +155,25 @@ impl TopEntryPoint {
 
         res
     }
+}
+
+/// A source file's parse told to `sink` step by step ([`Sink`]), with no list of events and no
+/// [`Output`] made: what [`TopEntryPoint::SourceFile`] parses, by the same grammar. `outline`
+/// is whether each `fn` item's body is left a lazy node ([`Sink::lazy`], [`lazy_block_len`])
+/// when it can be one.
+pub fn source_file_into<'t, S: Sink>(input: impl Into<Tokens<'t>>, outline: bool, sink: S) -> S {
+    let mut p = parser::Parser::with_sink(input.into(), outline, sink);
+    grammar::entry::top::source_file(&mut p);
+    p.into_sink()
+}
+
+/// A `{ .. }` block's parse told to `sink`, every body in it parsed: what
+/// `Reparser::for_node(BLOCK_EXPR, None, None)` parses, by the same grammar. The tokens start
+/// with `{`, end with `}` and form a valid brace sequence.
+pub fn block_into<'t, S: Sink>(tokens: impl Into<Tokens<'t>>, sink: S) -> S {
+    let mut p = parser::Parser::with_sink(tokens.into(), false, sink);
+    grammar::block(&mut p);
+    p.into_sink()
 }
 
 /// Parse a prefix of the input as a given syntactic construct.

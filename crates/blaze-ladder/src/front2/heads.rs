@@ -107,6 +107,14 @@ pub struct Maps {
     /// own parameters, `None` where none is written).
     pub generics: HashMap<LibKey, (u32, Vec<Option<PTy>, Global>), Global>,
     pub traits: HashMap<LibKey, TraitHead, Global>,
+    /// Each trait's associated type's count of its OWN type and const parameters (`type
+    /// MapStorage<V>`: one), by the trait and the name, filed with the trait's members
+    /// ([`Heads::assoc_generics`]): what `<K as Key>::MapStorage<V>` is checked against.
+    pub assoc_generics: HashMap<(LibKey, Name), u32, Global>,
+    /// The outlives where clauses of each trait's associated type that writes one (`type
+    /// Iter<'a> where Self: 'a;`), by the trait and the name: read and kept, not checked
+    /// (gat.rs [`super::gat::OUTLIVES_NOT_CHECKED`]).
+    pub assoc_where: HashMap<(LibKey, Name), super::gat::AssocWhere, Global>,
     /// Each trait's supertraits written as bounds on `Self` (see [`Heads::trait_supers`]):
     /// made with its members ([`Want::Members`]), since a supertrait's head may need the
     /// trait's (`FromResidual<R = <Self as Try>::Residual>`).
@@ -138,6 +146,11 @@ pub struct Maps {
     /// Each anonymous constant the evaluator refused, by its need key, with the refusal as
     /// printed ([`Heads::anon_failed`]): the head that wrote it is refused naming both.
     pub anon_failed: HashMap<LibKey, std::boxed::Box<str, Global>, Global>,
+    /// The qualified constant leaves the type builder asked for (`<B4 as Spec>::BITS`:
+    /// [`Heads::ask_qpath`]) and each answered one's type; answered by
+    /// [`super::const_qpath::eval_asked`], which `check::eval_len` calls. A value is in
+    /// `const_bits` and a refusal in `anon_failed`, under the leaf's need key.
+    pub qpaths: core::cell::RefCell<super::const_qpath::Table>,
     /// Each item's const generic parameters (index, declared type), sorted by index: a
     /// struct's, enum's, union's, trait's and alias's own (made with its head, what
     /// [`Heads::const_params`] reads), an impl's own, and a fn's with its container's first
@@ -169,6 +182,14 @@ impl Heads for Maps {
         }
         true
     }
+    /// Kept for `check::eval_len` to answer ([`super::const_qpath::eval_asked`]).
+    fn ask_qpath(&self, ask: super::const_qpath::QAsk) -> bool {
+        self.qpaths.borrow_mut().ask(ask);
+        true
+    }
+    fn qpath_ty(&self, need: LibKey) -> Option<PNode> {
+        self.qpaths.borrow().ty(need)
+    }
     fn adt_generics(&self, adt: LibKey) -> Option<(u32, &[Option<PTy>])> {
         self.generics.get(&adt).map(|(g, d)| (*g, &d[..]))
     }
@@ -192,6 +213,9 @@ impl Heads for Maps {
     }
     fn trait_has_assoc(&self, trait_: LibKey, name: Name) -> Option<bool> {
         self.traits.get(&trait_).map(|t| t.assoc.contains(&name))
+    }
+    fn assoc_generics(&self, trait_: LibKey, name: Name) -> Option<u32> {
+        self.assoc_generics.get(&(trait_, name)).copied()
     }
     fn trait_auto(&self, trait_: LibKey) -> Option<bool> {
         self.traits.get(&trait_).map(|t| t.flags.has(tc::TraitFlags::AUTO))
@@ -817,7 +841,7 @@ impl<'n> Store<'n> {
             let PClause::Trait { trait_, args } = *c else { continue };
             let first = self.tys.view().list(args).map_err(|_| Why::Unsupported("a clause list outside the store's table", whole))?.first().copied();
             if first == Some(me) {
-                let lib = keys.library(trait_).ok_or(Why::Program(format!("the trait {trait_:?} has no library key").into_boxed_str(), whole))?;
+                let lib = keys.library_in(names, trait_).ok_or(Why::Program(format!("the trait {trait_:?} has no library key").into_boxed_str(), whole))?;
                 traits.push((lib, args));
             }
         }
@@ -890,6 +914,8 @@ impl<'n> Store<'n> {
         own_defaults(&b, &mut self.tys, &env, v, 1, &mut defaults)?;
         let ck = checker_of(key);
         let mut assoc = Vec::new_in(Global);
+        let mut assoc_own: Vec<(Name, u32), Global> = Vec::new_in(Global);
+        let mut assoc_where: Vec<(Name, super::gat::AssocWhere), Global> = Vec::new_in(Global);
         let mut fns = Vec::new_in(Global);
         let ms = members(names, key).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
         let mut members = Vec::new_in(Global);
@@ -906,6 +932,24 @@ impl<'n> Store<'n> {
                 }
                 ItemDetail::TypeAlias => {
                     assoc.push(Name::of(m.name));
+                    // Its own type and const parameters, counted (a generic associated type:
+                    // `type MapStorage<V>` has one; a lifetime is none): what arguments on
+                    // its segment are checked against ([`Heads::assoc_generics`]). Filed with
+                    // the head, as its name is: a path may name it before the members exist.
+                    let mv = low.view();
+                    let mut own_params = 0u32;
+                    for &row in mv.rows(mv.list(head::GENERICS))? {
+                        if !matches!(lf::GenericParam::decode(row)?, lf::GenericParam::Lifetime { .. }) {
+                            own_params += 1;
+                        }
+                    }
+                    assoc_own.push((Name::of(m.name), own_params));
+                    // Its where clauses: an outlives clause is kept with the head, any
+                    // other is refused by name (gat.rs).
+                    let kept = super::gat::member_where(&mv, m.name)?;
+                    if !kept.is_empty() {
+                        assoc_where.push((Name::of(m.name), kept));
+                    }
                     DynMember::Type
                 }
                 ItemDetail::Const { .. } => DynMember::Const,
@@ -913,6 +957,12 @@ impl<'n> Store<'n> {
             };
             let shape = super::dyn_ty::member(&b.resolver, module, self.sized, kind, &low.view())?;
             members.push(tc::dyn_compat::MemberFacts { name: Name::of(m.name), shape });
+        }
+        for (name, own_params) in assoc_own {
+            self.maps.assoc_generics.insert((key, name), own_params);
+        }
+        for (name, kept) in assoc_where {
+            self.maps.assoc_where.insert((key, name), kept);
         }
         self.maps.traits.insert(key, TraitHead { generics: own + 1, defaults, assoc, fns, flags: tc::TraitFlags(flags), members });
         self.maps.const_params.insert(key, cs);
@@ -954,7 +1004,7 @@ impl<'n> Store<'n> {
         let mut supers = Vec::new_in(Global);
         for c in supertraits.iter() {
             if let PClause::Trait { trait_, args } = *c {
-                let lib = keys.library(trait_).ok_or(Why::Program(format!("the supertrait {trait_:?} has no library key").into_boxed_str(), whole))?;
+                let lib = keys.library_in(names, trait_).ok_or(Why::Program(format!("the supertrait {trait_:?} has no library key").into_boxed_str(), whole))?;
                 supers.push((lib, args));
             }
         }
@@ -1196,7 +1246,24 @@ impl<'n> Store<'n> {
                 }
                 ItemDetail::TypeAlias => {
                     let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
-                    assoc.push((Name::of(m.name), b.ty(&mut self.tys, &env, &mv, lf::TypeId(t))?));
+                    // `type Out<X> = ..;` (a generic associated type's value): its own type
+                    // and const parameters are in scope after the impl's, at the indices
+                    // `generics..` (the checker's `ImplAssoc`: "over the impl's generics then
+                    // the item's own"; a lifetime is no parameter of a portable type). Its
+                    // where clauses are read and refused or kept by gat.rs.
+                    let value = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
+                        b.ty(&mut self.tys, &env, &mv, lf::TypeId(t))?
+                    } else {
+                        let mut own_ps = Vec::new_in(Global);
+                        own_ps.extend_from_slice(&ps);
+                        let mut own_cs = Vec::new_in(Global);
+                        own_cs.extend_from_slice(&cs);
+                        own_generics(&b, &mut self.tys, module, &mv, generics, &mut own_ps, &mut own_cs)?;
+                        let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
+                        b.ty(&mut self.tys, &own_env, &mv, lf::TypeId(t))?
+                    };
+                    super::gat::member_where(&mv, m.name)?;
+                    assoc.push((Name::of(m.name), value));
                 }
                 ItemDetail::Const { .. } => {
                     let mk = keys.member(ck, MemberKind::Const, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
@@ -1388,7 +1455,15 @@ impl<'n> Store<'n> {
         let mut self_assoc = Vec::with_capacity_in(env.self_assoc.len(), Global);
         self_assoc.extend_from_slice(env.self_assoc);
         let (module, self_) = (env.module, env.self_);
-        self.maps.const_params.insert(lib, cs.clone());
+        // A free fn's const parameters are filed under its own key. A member's `lib` is its
+        // CONTAINER's key (a member has no library key): filing there replaced the trait's or
+        // impl's row with the container's plus this member's, so after `Iterator::next_chunk<const
+        // N: usize>` the trait's index 1 read as a const parameter, and `sum<S>`'s `S` (index 1
+        // too) was refused "a const parameter in a type position" when the trait's members
+        // were made again. A member's own are in its `FnHead::consts`.
+        if container.is_none() {
+            self.maps.const_params.insert(lib, cs.clone());
+        }
         self.fns.insert(key, FnHead { lib, text, container, parent, own, declared, self_param, header, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }

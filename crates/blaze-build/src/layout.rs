@@ -189,6 +189,20 @@ pub trait LayoutFacts {
         let _ = (owner, ordinal, args, ground);
         Ok(None)
     }
+
+    /// The hidden type of `impl Trait` type `opaque` at `args` (the opaque's generic arguments,
+    /// types of `ground`): interned in `ground`, ground, with no projection and no opaque
+    /// inside, as [`LayoutFacts::normalize`] answers. The Reference, "Impl trait", "Abstract
+    /// return types": the type is "an anonymous type" the fn's body fixes (the check record's
+    /// `Checked::hidden`). An `async fn`'s is its coroutine, made with
+    /// [`crate::coroutine_identity`] at the ordinal of the fn body's root block
+    /// ([`crate::coroutines_in`]: not 0 when the body holds other `async` blocks) with these
+    /// arguments (the Reference, "Async functions"). The default, and an opaque the world
+    /// cannot answer: refused naming the form.
+    fn opaque_hidden(&self, opaque: ItemKey, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, crate::BuildError> {
+        let _ = (opaque, args, ground);
+        Err(crate::BuildError::UnsupportedSig { what: "an `impl Trait` type in an instance (the world's `opaque_hidden` did not answer)" })
+    }
 }
 
 /// A closure's facts, of its owner's generic parameters (`Param(i)`) in `types`.

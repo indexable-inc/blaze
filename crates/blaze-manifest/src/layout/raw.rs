@@ -7,7 +7,7 @@ use blaze_own::{Alloc, String, Vec};
 use blaze_toml::{Document, Item, Kind, Limits, Origin};
 use edition::PackageEdition;
 
-use super::{DepKind, Feature, LayoutError, ManifestId, Span, Text};
+use super::{DepKind, ExtraKind, Feature, LayoutError, ManifestId, Span, Text};
 
 type It<'d, 't, 'a> = Item<'d, 't, Alloc<'a>>;
 
@@ -60,6 +60,18 @@ pub(super) struct RawTarget<'a> {
     pub span: Span,
 }
 
+/// A `[[test]]`, `[[example]]` or `[[bench]]` table, as written.
+pub(super) struct RawExtra<'a> {
+    pub kind: ExtraKind,
+    pub name: Option<Text<'a>>,
+    pub path: Option<Text<'a>>,
+    pub harness: Option<bool>,
+    pub test: Option<bool>,
+    /// `required-features`; empty when not written.
+    pub required_features: Vec<Text<'a>, Alloc<'a>>,
+    pub span: Span,
+}
+
 /// What a manifest's `[package]` says.
 pub(super) struct RawPackage<'a> {
     pub span: Span,
@@ -71,6 +83,12 @@ pub(super) struct RawPackage<'a> {
     pub autobins: Option<bool>,
     pub lib: Option<RawTarget<'a>>,
     pub bins: Vec<RawTarget<'a>, Alloc<'a>>,
+    /// `autotests`, `autoexamples`, `autobenches` as written.
+    pub autotests: Option<bool>,
+    pub autoexamples: Option<bool>,
+    pub autobenches: Option<bool>,
+    /// The `[[test]]`, `[[example]]` and `[[bench]]` tables, in that order, each in written order.
+    pub extras: Vec<RawExtra<'a>, Alloc<'a>>,
     pub dependencies: Vec<RawDep<'a>, Alloc<'a>>,
     pub features: Vec<Feature<'a>, Alloc<'a>>,
     pub build: RawBuild<'a>,
@@ -301,6 +319,21 @@ impl<'s, 'a> Reader<'s, 'a> {
                 bins.push(self.target(bin, "bin")?);
             }
         }
+        let autotests = self.opt_bool(package, "autotests")?;
+        let autoexamples = self.opt_bool(package, "autoexamples")?;
+        let autobenches = self.opt_bool(package, "autobenches")?;
+        let mut extras = Vec::new_in(self.alloc);
+        for kind in ExtraKind::ALL {
+            let key = kind.table();
+            if let Some(list) = root.get(key) {
+                if list.kind() != Kind::Array {
+                    return Err(self.expected(list, key, "an array of tables (`[[test]]`, `[[example]]`, `[[bench]]`)"));
+                }
+                for table in list.children() {
+                    extras.push(self.extra(table, key, kind)?);
+                }
+            }
+        }
         let underscores_refused = match &edition {
             RawEdition::Written(edition, _) => edition.syntax >= edition::Edition::Edition2024,
             RawEdition::Absent | RawEdition::Inherited(_) => false,
@@ -353,12 +386,35 @@ impl<'s, 'a> Reader<'s, 'a> {
             autobins,
             lib,
             bins,
+            autotests,
+            autoexamples,
+            autobenches,
+            extras,
             dependencies,
             features,
             build,
             links,
             version,
             resolver,
+        })
+    }
+
+    /// A `[[test]]`, `[[example]]` or `[[bench]]` table: `name`, `path`, `harness`, `test` and
+    /// `required-features` (the Cargo Book, "Cargo Targets", "Configuring a target").
+    fn extra(&self, table: It<'_, '_, 'a>, key: &'static str, kind: ExtraKind) -> Result<RawExtra<'a>, LayoutError<'a>> {
+        self.table(table, key)?;
+        let required_features = match table.get("required-features") {
+            Some(item) => self.texts(item, "required-features")?,
+            None => Vec::new_in(self.alloc),
+        };
+        Ok(RawExtra {
+            kind,
+            name: self.opt_text(table, "name")?,
+            path: self.opt_text(table, "path")?,
+            harness: self.opt_bool(table, "harness")?,
+            test: self.opt_bool(table, "test")?,
+            required_features,
+            span: self.line(table),
         })
     }
 

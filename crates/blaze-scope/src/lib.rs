@@ -47,6 +47,7 @@
 extern crate std;
 
 mod again;
+pub mod apart;
 pub mod asked;
 pub mod blocks;
 mod builtin;
@@ -59,6 +60,7 @@ mod cells;
 pub use cells::{DIFFER_SHOWN, Differ as CellsDiffer, Seam as CellsSeam, ShadowRefused as CellsRefused, Shadowed as CellsShadowed};
 pub mod crate_scope;
 mod error;
+pub mod expansions;
 mod facts;
 mod finish;
 pub mod graph;

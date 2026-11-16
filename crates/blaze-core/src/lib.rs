@@ -39,6 +39,8 @@ pub mod atomic;
 pub mod boot;
 pub mod busy;
 pub mod chan;
+// The records in flight: a per-key claim, its waiters, the cycle walk (parallel.md, end state).
+pub mod claim_table;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 #[allow(

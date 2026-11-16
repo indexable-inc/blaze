@@ -1,0 +1,185 @@
+//! One crate's expansions kept between solves ([`crate::crate_scope::Kept::expansions`]): the
+//! earlier solve's set read in place, and what this solve found again or expanded.
+//!
+//! A crate solved again after an edit expands only the calls the edit moved: a call's key is
+//! made from its TEXT before anything is lexed ([`blaze_expand::text_key`]: the definition's
+//! text and site, the call's shape, attribute, edition and input text, the expander's code),
+//! found in the earlier set by a binary search, and its read list (the cfg atoms the item walk
+//! asked, the expansion's own reads) asked again before the kept expansion is taken. What is
+//! taken is the [`blaze_expand::Expansion`]'s record read back: the same value a fresh
+//! expansion gives, so everything after it (the render, the outline, the lowering) does not
+//! know which it got.
+//!
+//! The driver's duty is three lines around one crate's solve: [`KeptExpansions::open`] with
+//! what [`crate::crate_scope::Kept::expansions`] gave, the value handed to the solve (it
+//! reaches `expand_decls` as a field of its `Base`), and [`KeptExpansions::record`] given to
+//! [`crate::crate_scope::Kept::expansions_made`] after a solve that finished.
+//!
+//! Not kept, each counted in [`KeptCounts::unkept`]: a function-like builtin's call (its work
+//! IS its reads: files, the environment, the calls nested in its input), and an expansion
+//! with a read that cannot be asked again by its subject ([`blaze_expand::Reads::askable`]: a
+//! proc macro's sandbox reads). They are expanded again each solve, as before.
+
+#![allow(
+    clippy::disallowed_types,
+    reason = "a std lock between the fill's threads, as resolve.rs: blaze_core::lock is not a dependency of this sans-IO crate"
+)]
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use blaze_expand::TextKey;
+use blaze_expand::kept::{KeptEntry, KeptError, KeptSet, write_set};
+use blaze_own::{AVec, Alloc};
+
+/// One of this solve's expansions: found in the earlier set (its index there), or made now
+/// (its entry's bytes, [`blaze_expand::kept::write_entry`]'s).
+#[derive(Clone, Copy)]
+enum Now<'a> {
+    Found(usize),
+    Made(&'a [u8]),
+}
+
+/// What one solve did with its kept expansions.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct KeptCounts {
+    /// Calls answered from the earlier set: nothing lexed, nothing run.
+    pub found: usize,
+    /// Calls expanded and kept.
+    pub made: usize,
+    /// Calls whose key was in the earlier set but whose read list is answered otherwise today.
+    pub moved: usize,
+    /// Calls expanded and not kept (the module docs say which).
+    pub unkept: usize,
+}
+
+/// The planted bug of the tests: a key made without the attribute's and the definition's name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Planted {
+    None,
+    KeyWithoutTheAttribute,
+}
+
+/// One crate's kept expansions for one solve. Shared by the fill's threads: the lock is held
+/// for a push, never across an expansion.
+pub struct KeptExpansions<'k, 'a> {
+    keeps: bool,
+    earlier: Option<KeptSet<'k>>,
+    now: Mutex<AVec<'a, (TextKey, Now<'a>)>>,
+    found: AtomicUsize,
+    made: AtomicUsize,
+    moved: AtomicUsize,
+    unkept: AtomicUsize,
+    planted: Planted,
+}
+
+impl<'k, 'a> KeptExpansions<'k, 'a> {
+    /// Nothing kept and nothing collected: a solve with no [`crate::crate_scope::Kept`], or one
+    /// that keeps no expansions. No key is made for any call.
+    pub fn none(alloc: Alloc<'a>) -> KeptExpansions<'k, 'a> {
+        KeptExpansions {
+            keeps: false,
+            earlier: None,
+            now: Mutex::new(AVec::new_in(alloc)),
+            found: AtomicUsize::new(0),
+            made: AtomicUsize::new(0),
+            moved: AtomicUsize::new(0),
+            unkept: AtomicUsize::new(0),
+            planted: Planted::None,
+        }
+    }
+
+    /// A solve that keeps its expansions, with the crate's `earlier` set when one was kept
+    /// (aligned to [`blaze_expand::kept::ALIGN`] bytes; its table is checked here, once).
+    pub fn open(earlier: Option<&'k [u8]>, alloc: Alloc<'a>) -> Result<KeptExpansions<'k, 'a>, KeptError> {
+        let earlier = match earlier {
+            Some(bytes) => Some(KeptSet::open(bytes)?),
+            None => None,
+        };
+        Ok(KeptExpansions { keeps: true, earlier, ..KeptExpansions::none(alloc) })
+    }
+
+    /// [`KeptExpansions::open`] with a planted bug, for the test that must catch it.
+    pub fn open_planted(earlier: Option<&'k [u8]>, planted: Planted, alloc: Alloc<'a>) -> Result<KeptExpansions<'k, 'a>, KeptError> {
+        Ok(KeptExpansions { planted, ..KeptExpansions::open(earlier, alloc)? })
+    }
+
+    /// Whether this solve keeps expansions at all: when not, no call's key is made.
+    pub fn keeps(&self) -> bool {
+        self.keeps
+    }
+
+    pub(crate) fn planted(&self) -> Planted {
+        self.planted
+    }
+
+    /// What this solve found, made, found moved and did not keep, so far.
+    pub fn counts(&self) -> KeptCounts {
+        KeptCounts {
+            found: self.found.load(Ordering::Relaxed),
+            made: self.made.load(Ordering::Relaxed),
+            moved: self.moved.load(Ordering::Relaxed),
+            unkept: self.unkept.load(Ordering::Relaxed),
+        }
+    }
+
+    fn push(&self, key: TextKey, now: Now<'a>) {
+        match self.now.lock() {
+            Ok(mut list) => list.push((key, now)),
+            Err(_) => panic!("a fill thread panicked holding the kept expansions lock"),
+        }
+    }
+
+    /// The earlier solve's entry under `key`, opened, with its index for [`Self::found`].
+    pub(crate) fn find(&self, key: &TextKey) -> Result<Option<(usize, KeptEntry<'k>)>, KeptError> {
+        let Some(set) = self.earlier else { return Ok(None) };
+        match set.position(key) {
+            Some(index) => Ok(Some((index, KeptEntry::open(set.entry(index))?))),
+            None => Ok(None),
+        }
+    }
+
+    /// The entry at `index` of the earlier set answered the call of `key`: it is this solve's
+    /// too.
+    pub(crate) fn found(&self, key: TextKey, index: usize) {
+        self.found.fetch_add(1, Ordering::Relaxed);
+        self.push(key, Now::Found(index));
+    }
+
+    /// The call of `key` was expanded: `entry` is its bytes.
+    pub(crate) fn made(&self, key: TextKey, entry: &'a [u8]) {
+        self.made.fetch_add(1, Ordering::Relaxed);
+        self.push(key, Now::Made(entry));
+    }
+
+    /// An entry under a call's key was not taken: its read list is answered otherwise today.
+    pub(crate) fn moved(&self) {
+        self.moved.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A call was expanded and is not kept.
+    pub(crate) fn unkept(&self) {
+        self.unkept.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This solve's set, in `alloc`: every expansion it found again or made, sorted by key, so
+    /// the bytes are the same whatever order the fill's threads expanded in (rule 25). Two
+    /// expansions under one key with different bytes are refused ([`KeptError::TwoValues`]).
+    pub fn record<'b>(&self, alloc: Alloc<'b>) -> Result<AVec<'b, u8>, KeptError> {
+        let list = match self.now.lock() {
+            Ok(list) => list,
+            Err(_) => panic!("a fill thread panicked holding the kept expansions lock"),
+        };
+        let mut entries: AVec<'b, (TextKey, &[u8])> = AVec::with_capacity_in(list.len(), alloc);
+        for &(key, now) in list.iter() {
+            let bytes = match (now, self.earlier) {
+                (Now::Made(bytes), _) => bytes,
+                (Now::Found(index), Some(set)) => set.entry(index),
+                // `found` is told only an index `find` gave, of the earlier set.
+                (Now::Found(index), None) => panic!("a kept expansion found at index {index} of no earlier set"),
+            };
+            entries.push((key, bytes));
+        }
+        write_set(&mut entries, alloc)
+    }
+}

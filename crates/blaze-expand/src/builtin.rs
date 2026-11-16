@@ -519,13 +519,7 @@ fn env(
         return refuse(out, error.message(), at);
     }
     let value = cx.env(name.as_str())?;
-    let answer = match value {
-        Some(value) => {
-            ReadAnswer::Digest(ContentId::of("blaze v2 expand env value 1", value.as_bytes()))
-        }
-        None => ReadAnswer::Absent,
-    };
-    out.exp.reads.push(ReadKind::Env, name.as_str(), answer)?;
+    out.exp.reads.push(ReadKind::Env, name.as_str(), ReadAnswer::of_env(value))?;
     match (value, optional) {
         (Some(value), Optional::No) => push_str_literal(out, value),
         (None, Optional::No) => {
@@ -1144,9 +1138,10 @@ fn place(
         HoleOf::ModulePath => (PlaceOf::ModulePath, ReadKind::ModulePath),
     };
     let wrong = HostError { ask: HostAsk::Place, why: HostWhy::Unreadable };
-    match (cx.place(ask)?, number) {
+    let place = cx.place(ask)?;
+    match (place, number) {
         (Place::Number(value), true) => {
-            out.exp.reads.push(kind, "", ReadAnswer::Number(value))?;
+            out.exp.reads.push(kind, "", ReadAnswer::of_place(place))?;
             let mut text = Buf::new_in(out.alloc);
             core::fmt::Write::write_fmt(&mut text, format_args!("{value}u32"))
                 .expect("a `Buf` takes any text");
@@ -1158,8 +1153,7 @@ fn place(
             out.made(kind, text.as_str(), MADE)
         }
         (Place::Text(value), false) => {
-            let digest = ContentId::of("blaze v2 expand place 1", value.as_bytes());
-            out.exp.reads.push(kind, "", ReadAnswer::Digest(digest))?;
+            out.exp.reads.push(kind, "", ReadAnswer::of_place(place))?;
             push_str_literal(out, value)
         }
         // The context answered a number for a path or a path for a number.

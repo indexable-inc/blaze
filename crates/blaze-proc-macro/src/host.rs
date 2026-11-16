@@ -72,6 +72,7 @@ use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Memory, Module, Oper
 
 use crate::{
     module::{Exported, ModuleRecord, sha256_hex},
+    parts::{Clock, Mark, Part, Parts},
     sandbox::{Package, Sandbox},
     server::{Outcome, ProduceError, Server, ServerError, ServerLimits, Tracked},
 };
@@ -276,9 +277,11 @@ pub struct Runtime {
     /// Temporary names: one count for the runtime, with the process id.
     temps: AtomicU64,
     findings: Mutex<Vec<CompiledFinding>>,
+    /// Where its calls' time went ([`Runtime::timed`] gives the clock).
+    parts: Parts,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -341,7 +344,21 @@ impl Runtime {
             compiles: AtomicU64::new(0),
             temps: AtomicU64::new(0),
             findings: Mutex::new(Vec::new()),
+            parts: Parts::counted(),
         })
+    }
+
+    /// The runtime with the standard [`Settings`], its calls' parts timed by `clock` (a
+    /// profile's driver gives its own: rule 75).
+    pub fn timed(clock: Clock) -> Result<Runtime, RuntimeError> {
+        let mut runtime = Runtime::new()?;
+        runtime.parts = Parts::timed(clock);
+        Ok(runtime)
+    }
+
+    /// Where the calls' time went so far.
+    pub fn parts(&self) -> &Parts {
+        &self.parts
     }
 
     /// What the machine code depends on besides the module: [`Settings`], Wasmtime's
@@ -563,6 +580,9 @@ pub struct Host {
     server_error: Option<ServerError>,
     over_output: bool,
     requests: u64,
+    /// The profile's clock, and the time the bridge's requests took by it.
+    clock: Option<Clock>,
+    bridge_nanos: u64,
 }
 
 struct Limiter {
@@ -629,9 +649,15 @@ fn give(mem: &mut [u8], into: u32, capacity: u32, value: &[u8]) -> Result<i32, S
 fn imports(l: &mut Linker<Host>) -> wasmtime::Result<()> {
     l.func_wrap(IMPORTS, "dispatch", |mut c: Caller<'_, Host>, request: u32, len: u32| {
         c.data_mut().requests += 1;
+        let clock = c.data().clock;
+        let at = clock.map_or(0, |clock| clock());
         with(&mut c, |mem, host| {
             let request = blaze_wasi::bytes(mem, u64::from(request), u64::from(len))?;
-            match host.server.dispatch(request, &mut host.reply) {
+            let served = host.server.dispatch(request, &mut host.reply);
+            if let Some(clock) = clock {
+                host.bridge_nanos += clock().saturating_sub(at);
+            }
+            match served {
                 Ok(()) => Ok(host.reply.len() as u32),
                 Err(error) => {
                     host.server_error = Some(error);
@@ -750,11 +776,13 @@ impl Runtime {
     ) -> Result<Ran<'a>, ExpandError> {
         let named = |error| ExpandError { krate: loaded.crate_name.clone(), name: format!("{} ({:?})", export.name, export.kind), error };
         let failed = |why: String| named(CallError::Failed(why));
+        let mut mark = self.parts.start();
         let mut run_input = Vec::new();
         let server = Server::new(edition, limits.server, call, Alloc::global(), &mut run_input).map_err(|error| match error {
             ServerError::Limit(limit) => named(CallError::Limit { limit, why: error.to_string() }),
             _ => failed(format!("its input could not be served: {error}")),
         })?;
+        mark.lap(Part::Serve);
         let host = Host {
             server,
             sandbox: Sandbox::new(package),
@@ -767,14 +795,24 @@ impl Runtime {
             server_error: None,
             over_output: false,
             requests: 0,
+            clock: self.parts.clock(),
+            bridge_nanos: 0,
         };
         let mut store = Store::new(&self.engine, host);
         store.limiter(|host| &mut host.limiter);
         store.set_fuel(limits.fuel).map_err(|e| failed(format!("{e:#}")))?;
-        let ran = run(&mut store, loaded, export.index, &run_input);
+        mark.lap(Part::Setup);
+        let ran = run(&mut store, loaded, export.index, &run_input, &mut mark);
+        // The entry's call, or the part an error stopped in: the bridge's share of it is the
+        // host's, the rest the macro's own code.
+        let in_call = mark.split();
+        let bridge = store.data().bridge_nanos.min(in_call);
+        self.parts.add(Part::Guest, in_call - bridge);
+        self.parts.add_many(Part::Bridge, bridge, store.data().requests);
         let left = store.get_fuel().unwrap_or(0);
         let fuel = limits.fuel.saturating_sub(left);
         let mut host = store.into_data();
+        mark.lap(Part::Free);
         let outcome = match ran {
             Ok(()) => match host.output.take() {
                 Some(bytes) => host.server.outcome(&bytes).map_err(|e| failed(format!("its output is not the bridge's: {e}")))?,
@@ -782,6 +820,7 @@ impl Runtime {
             },
             Err(error) => stopped_by(&mut host, &error, fuel >= limits.fuel).map_err(named)?,
         };
+        mark.lap(Part::Outcome);
         // What it read: the sandbox's reads and the variables and paths it tracked.
         for tracked in std::mem::take(&mut host.server.tracked) {
             match tracked {
@@ -802,6 +841,7 @@ impl Runtime {
             let answer = read.digest.map_or(ReadAnswer::Absent, ReadAnswer::Digest);
             reads.push(ReadKind::ProcMacro, &read.subject, answer).map_err(|e| failed(format!("its reads do not fit: {e:?}")))?;
         }
+        mark.lap(Part::Reads);
         let (handle, panicked) = match &outcome {
             Outcome::Tokens(handle) => (*handle, None),
             Outcome::Panicked(message) => (None, Some(message.as_str())),
@@ -810,6 +850,7 @@ impl Runtime {
             ProduceError::Server(ServerError::Limit(limit)) => named(CallError::Limit { limit, why: format!("{error:?}") }),
             _ => failed(format!("its output does not make tokens: {error:?}")),
         })?;
+        mark.lap(Part::Produce);
         Ok(Ran { produced, fuel, peak_memory: host.limiter.peak, requests: host.requests })
     }
 }
@@ -852,15 +893,17 @@ fn stopped_by(host: &mut Host, error: &wasmtime::Error, out_of_fuel: bool) -> Re
 }
 
 /// The instance's part of [`Runtime::expand`].
-fn run(store: &mut Store<Host>, loaded: &Loaded, index: u32, input: &[u8]) -> wasmtime::Result<()> {
+fn run(store: &mut Store<Host>, loaded: &Loaded, index: u32, input: &[u8], mark: &mut Mark<'_>) -> wasmtime::Result<()> {
     let instance = loaded.pre.instantiate(&mut *store)?;
     let Some(memory) = instance.get_memory(&mut *store, "memory") else {
         return Err(wasmtime::Error::msg("the module exports no memory"));
     };
     store.data_mut().memory = Some(memory);
+    mark.lap(Part::Instantiate);
     // A reactor's constructors and wasi-libc's start-up.
     let init: TypedFunc<(), ()> = instance.get_typed_func(&mut *store, "_initialize")?;
     init.call(&mut *store, ())?;
+    mark.lap(Part::Initialize);
     let Some(global) = instance.get_global(&mut *store, &loaded.decls) else {
         return Err(wasmtime::Error::msg(format!("the module exports no `{}`", loaded.decls)));
     };
@@ -872,8 +915,10 @@ fn run(store: &mut Store<Host>, loaded: &Loaded, index: u32, input: &[u8]) -> wa
     let Ok(len) = u32::try_from(input.len()) else {
         return Err(wasmtime::Error::msg("its input is more than a 32-bit memory holds"));
     };
+    mark.lap(Part::Exports);
     let at = alloc.call(&mut *store, len)?;
     memory.write(&mut *store, at as usize, input)?;
+    mark.lap(Part::Input);
     match expand.call(&mut *store, (decls as u32, index, at, len))? {
         0 => Ok(()),
         1 => Err(wasmtime::Error::msg(format!("the module has no macro at index {index}"))),

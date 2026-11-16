@@ -20,6 +20,7 @@ mod bulk;
 mod float;
 mod int;
 mod runtime;
+pub(crate) mod sites;
 mod tls;
 mod wide;
 
@@ -91,6 +92,9 @@ struct Pass<'a, 'c, A: Allocator> {
     staging_at: u32,
     /// The most staging words an edge took.
     staging: u32,
+    /// The record form's rows (pass/sites.rs): `Some` makes every outside reference an
+    /// import site and places no address word; `None` is the literal-word form.
+    record: Option<&'c mut sites::Form<A>>,
 }
 
 /// Runs the pass (see [`crate::emit`]).
@@ -102,6 +106,7 @@ pub(crate) fn run<A: Allocator>(
     bytes: &mut Vec<u8, A>,
     fixups: &mut Vec<Fixup, A>,
     relocs: &mut Vec<Reloc, A>,
+    record: Option<&mut sites::Form<A>>,
 ) -> Result<(), EmitError> {
     if view.head.ptr_bits != 64 {
         return Err(EmitError::Signature { why: "a target whose pointers are not 64 bits" });
@@ -161,6 +166,7 @@ pub(crate) fn run<A: Allocator>(
         slot_at,
         staging_at: staging_at as u32,
         staging: 0,
+        record,
     };
 
     // The prologue; the frame's size is patched in at the end, when the staging is known.
@@ -594,6 +600,10 @@ impl<A: Allocator> Pass<'_, '_, A> {
 
     /// `ldr rt, <the literal word placement fills for to>`, the word made once per `to`.
     fn ld_word(&mut self, rt: Reg, to: RelocTo) {
+        if self.in_record() {
+            // The record form: the word is `to`'s import word, loaded by a site.
+            return self.import_load(rt, to);
+        }
         let index = match self.words.iter().position(|&it| it == to) {
             Some(it) => it as u32,
             None => {
@@ -608,7 +618,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
     /// (`x0..x3`, `d0`/`d1`); it may take every caller-saved register, which nothing holds
     /// across an instruction (every value lives in its cell).
     fn call_routine(&mut self, routine: crate::Routine) {
-        self.ld_word(X16, RelocTo::Routine(routine));
+        match self.in_record() {
+            // The record form: a call site, which the `blr` completes.
+            true => self.import_callee(RelocTo::Routine(routine)),
+            false => self.ld_word(X16, RelocTo::Routine(routine)),
+        }
         self.put(enc::blr(X16));
     }
 
@@ -1019,6 +1033,12 @@ impl<A: Allocator> Pass<'_, '_, A> {
                     return Err(unsupported(inst, op, "data aligned past 16 bytes (placement aligns the code to 16)"));
                 }
                 let index = self.place_data(row);
+                if self.in_record() && !view.data_relocs_of(DataId(row)).is_empty() {
+                    // The record form: a row holding an address lives in the relro part.
+                    self.relro_addr(X9, index);
+                    self.st(X9, inst);
+                    return Ok(());
+                }
                 self.put_to(enc::adr(X9, 0), Field::Adr, Label::Data(index));
                 self.st(X9, inst);
             }
@@ -1026,10 +1046,15 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.result_width(inst, op)?;
                 let reference = o.reference();
                 let place = view.reference(reference).place;
-                match self.via.get(place as usize) {
+                match (self.in_record(), self.via.get(place as usize)) {
+                    // The record form: the function's import word holds its address.
+                    (true, _) => {
+                        let place = self.func_place(inst, op, reference)?;
+                        self.import_load(X9, RelocTo::Func(place));
+                    }
                     // A slot function's address is its slot stub's, stable across patches.
-                    Some(Via::Slot) => self.ld_word(X9, RelocTo::SlotStub(place)),
-                    _ => {
+                    (false, Some(Via::Slot)) => self.ld_word(X9, RelocTo::SlotStub(place)),
+                    (false, _) => {
                         let (literal, _) = self.literal(inst, op, reference)?;
                         self.put_to(enc::ldr_lit(X9, 0), Field::Imm19, Label::Literal(literal));
                     }
@@ -1225,9 +1250,15 @@ impl<A: Allocator> Pass<'_, '_, A> {
         if args.len() != sig.params.len() {
             return Err(unsupported(inst, op, "arguments other than the signature's parameters"));
         }
+        // The record form calls through the callee's import word; the literal-word form through
+        // its literal.
+        let imported = match direct {
+            Some(reference) if self.in_record() => Some(self.func_place(inst, op, reference)?),
+            _ => None,
+        };
         let callee = match direct {
-            Some(reference) => Some(self.literal(inst, op, reference)?),
-            None => None,
+            Some(reference) if imported.is_none() => Some(self.literal(inst, op, reference)?),
+            _ => None,
         };
         // The copies, each at its alignment in this call's stretch of the frame.
         let mut copies: Vec<u32, Global> = Vec::new_in(Global);
@@ -1279,7 +1310,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 }
             }
             (None, Some(pointer)) => self.ld(X16, pointer),
-            (None, None) => return Err(unsupported(inst, op, "a call that names no callee")),
+            (None, None) => match imported {
+                // A call site, which the `blr` below completes.
+                Some(place) => self.import_callee(RelocTo::Func(place)),
+                None => return Err(unsupported(inst, op, "a call that names no callee")),
+            },
         }
         self.put(enc::blr(X16));
         // Two returns are a pair in one cell (lib.rs, "Pairs"); one `i128` or float is the cell.
@@ -1311,7 +1346,10 @@ impl<A: Allocator> Pass<'_, '_, A> {
     /// Places the literal words and the data after the code, patches every field and the
     /// frame's size.
     fn finish(mut self, frame_at: u32, most_align: u64) -> Result<(), EmitError> {
-        let too_far = EmitError::TooLarge { what: "a branch or PC-relative reference past its reach" };
+        if self.in_record() {
+            // The record form places no literal word (pass/sites.rs).
+            return self.finish_record(frame_at, most_align);
+        }
         self.pad_to(8);
         let literals_at = self.here();
         for at in 0..self.fixups.len() {
@@ -1369,6 +1407,14 @@ impl<A: Allocator> Pass<'_, '_, A> {
         for &(word, index, addend) in inner.iter() {
             self.relocs.push(Reloc { at: word, to: RelocTo::Code(data_at[index as usize]), addend });
         }
+        self.settle(frame_at, most_align, literals_at, words_at, &data_at)
+    }
+
+    /// Patches every field and the frame's size once everything after the instructions is
+    /// placed: the literal words from `literals_at` and `words_at`, data row `i` of the placed
+    /// at `data_at[i]` (the record form has no literal word and patches none).
+    fn settle(&mut self, frame_at: u32, most_align: u64, literals_at: u32, words_at: u32, data_at: &[u32]) -> Result<(), EmitError> {
+        let too_far = EmitError::TooLarge { what: "a branch or PC-relative reference past its reach" };
         if self.code.len() > u32::MAX as usize / 2 {
             return Err(EmitError::TooLarge { what: "the code (2 GiB)" });
         }

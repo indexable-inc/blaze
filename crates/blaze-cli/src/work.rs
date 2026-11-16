@@ -193,6 +193,9 @@ impl core::fmt::Display for InputWhy {
 pub struct Frames {
     pub scratch: Frame,
     pub batch: Frame,
+    /// What the pooled jobs of one [`run_batches`] call read while they run (each job's path):
+    /// reset when the call's scope has joined, so nothing a job needs is held past its run.
+    pub jobs: Frame,
 }
 
 /// The most each of [`Frames`] holds, and a bug to plant (the tests' controls).
@@ -224,6 +227,7 @@ impl Sizes {
         Ok(Frames {
             scratch: Frame::with_reserve(self.scratch, Tag::Other).map_err(|_| CliError::Text { what: "a task's scratch frame could not be reserved" })?,
             batch: Frame::with_reserve(self.batch, Tag::Other).map_err(|_| CliError::Text { what: "a batch's frame could not be reserved" })?,
+            jobs: Frame::with_reserve(self.batch, Tag::Other).map_err(|_| CliError::Text { what: "the pooled jobs' frame could not be reserved" })?,
         })
     }
 }
@@ -253,6 +257,8 @@ pub struct HighWater {
     pub batch: usize,
     /// One record read back.
     pub got: usize,
+    /// The pooled jobs' paths and body lists of one round of batches.
+    pub jobs: usize,
     /// The request's own frame at the answer.
     pub request: usize,
 }
@@ -279,10 +285,12 @@ pub fn run_batches<'f, 'r>(
     let began = phases.now();
     let steps_before = phases.request.steps;
     unwind_refusals();
-    let Frames { scratch, batch: held } = frames;
+    let Frames { scratch, batch: held, jobs } = frames;
     // Every batch's `FileItems` tasks go to the pool at once, each in its own frame, so the
     // pool is as wide as every batch the request has handed out (it hands out one a worker);
     // then each batch is answered in turn: its other tasks run here, its pooled ones joined.
+    // A batch's `BodyCheck` tasks are one job a home file: the file is read and outlined once
+    // for all its bodies, not once a body (rule 77).
     let clock = phases.clock().clone();
     let scope = cx.scope();
     if let Some(most) = core::num::NonZeroU32::new(facts.workers) {
@@ -290,43 +298,108 @@ pub fn run_batches<'f, 'r>(
     }
     let task_frame = scratch.reserved();
     let mut pending = std::vec::Vec::with_capacity_in(batches.len(), Global);
-    for batch in batches.iter() {
-        let mut of_batch = std::vec::Vec::with_capacity_in(batch.tasks.len(), Global);
-        for (_, task) in batch.tasks.iter() {
-            of_batch.push(match task.name.kind {
-                Kind::FileItems | Kind::BodyCheck => Some(match job_of(req, facts, task, frame) {
-                    Ok(job) => Ok(scope.may_overlap("outline", task_frame, {
-                        let clock = &clock;
-                        move |cx: &Cx| Ok::<_, core::convert::Infallible>(pooled(cx, root, &job, clock))
-                    })),
-                    Err(what) => Err(what),
-                }),
-                _ => None,
-            });
+    let mut groups: Vec<Group<'_>, Global> = Vec::new_in(Global);
+    {
+        // What a job reads while it runs lives in the jobs' frame, reset below once the scope
+        // has joined: the command's own frame takes nothing per task (memory by lifetime).
+        let jobs: &Frame = jobs;
+        // The round's body jobs being gathered: each file's job and its bodies so far, over
+        // every batch (a batch is of one home; two batches may be of the same one).
+        let mut files: Vec<(Job<'_>, Vec<(Name, u32), &Frame>), Global> = Vec::new_in(Global);
+        for batch in batches.iter() {
+            let mut tasks = Vec::with_capacity_in(batch.tasks.len(), Global);
+            for (_, task) in batch.tasks.iter() {
+                tasks.push(match task.name.kind {
+                    Kind::FileItems => match job_of(req, facts, task, jobs) {
+                        Ok(job) => Spawned::One(scope.may_overlap("outline", task_frame, {
+                            let clock = &clock;
+                            move |cx: &Cx| Ok::<_, core::convert::Infallible>(pooled(cx, root, &job, clock))
+                        })),
+                        Err(what) => Spawned::Refused(what),
+                    },
+                    Kind::BodyCheck => {
+                        let path = req.file_of(task);
+                        let known = files.iter().position(|(job, _)| Some(job.slot.as_bytes()) == path && job.edition == task.edition);
+                        let group = match known {
+                            Some(group) => Ok(group),
+                            None => job_of(req, facts, task, jobs).map(|job| {
+                                files.push((job, Vec::new_in(jobs)));
+                                files.len() - 1
+                            }),
+                        };
+                        match group {
+                            Ok(group) => {
+                                let bodies = &mut files[group].1;
+                                match bodies.try_push((task.name, task.place)) {
+                                    Ok(()) => Spawned::Body { group, at: bodies.len() - 1 },
+                                    Err(_) => Spawned::Refused(JOBS_FULL),
+                                }
+                            }
+                            Err(what) => Spawned::Refused(what),
+                        }
+                    }
+                    _ => Spawned::Here,
+                });
+            }
+            pending.push(tasks);
         }
-        pending.push(of_batch);
+        groups.try_reserve_exact(files.len()).map_err(|_| CliError::Text { what: "the list of a round's body jobs could not be made" })?;
+        for (file, bodies) in files {
+            let job = BodiesJob { file, bodies: bodies.leak() };
+            groups.push(Group::Running(scope.may_overlap("bodies", task_frame, {
+                let clock = &clock;
+                move |cx: &Cx| Ok::<_, core::convert::Infallible>(pooled_bodies(cx, root, &job, clock))
+            })));
+        }
     }
-    phases.took("jobs made (each pooled task's path copied)", frame);
+    phases.took("jobs made", frame);
     let mut answered = Ok(());
     for (batch, of_batch) in batches.into_iter().zip(pending) {
         if answered.is_err() {
             // A command stopping: what is still pooled is joined with the scope, unread.
             continue;
         }
-        answered = answer_batch(&cx, root, store, facts, req, batch, of_batch, frame, held, scratch, failed, high, alloc, effects, phases);
+        answered = answer_batch(&cx, root, store, facts, req, batch, of_batch, &mut groups, frame, held, scratch, failed, high, alloc, effects, phases);
         high.batch = high.batch.max(held.peak());
         held.reset();
     }
+    // A file job no body's task joined (a command stopping) is joined with the scope, unread.
+    drop(groups);
     let joined = scope.join(&cx).map_err(CliError::Pool);
+    // Every job has ended: nothing reads the jobs' frame now.
+    high.jobs = high.jobs.max(jobs.peak());
+    jobs.reset();
     // The batches' steps are counted as steps, not twice as runs.
     let stepped = phases.request.steps - steps_before;
     phases.request.runs += phases.since(began).saturating_sub(stepped);
     answered.and(joined)
 }
 
-/// A batch's tasks as [`run_batches`] spawned them: a `FileItems` task's pool handle (or why its
-/// job could not be made), `None` for a task run here.
-type Pending<'s> = std::vec::Vec<Option<Result<bstd::task::Task<'s, Pooled>, &'static str>>, Global>;
+/// One task of a batch as [`run_batches`] spawned it.
+enum Spawned<'s> {
+    /// Run on the main thread, in `answer_batch`.
+    Here,
+    /// Its job could not be made: the task fails with these words.
+    Refused(&'static str),
+    /// A `FileItems` task's own pool handle.
+    One(bstd::task::Task<'s, Pooled>),
+    /// A `BodyCheck` task: the `at`th body of the round's `group`th file job.
+    Body { group: usize, at: usize },
+}
+
+/// A batch's tasks as [`run_batches`] spawned them.
+type Pending<'s> = Vec<Spawned<'s>, Global>;
+
+/// One file's body job of a round ([`BodiesJob`]): on the pool, then joined by the first of its
+/// bodies' tasks answered, its outcomes taken one a task.
+enum Group<'s> {
+    Running(bstd::task::Task<'s, PooledBodies>),
+    /// Each body's outcome, and the job's time a body (the file's one read and outline are
+    /// shared by its bodies: each is charged its part).
+    Joined { did: BodiesDid, ns: u64 },
+    /// Being joined (never seen: the join's own state).
+    Taken,
+}
 
 /// One batch: its tasks not pooled run here, in order, while the pool works; then each pooled
 /// one is joined in ticket order, its record copied into the batch's frame, and the batch's
@@ -339,7 +412,8 @@ fn answer_batch<'f, 'r>(
     facts: &mut Facts<'f, impl crate::sweep::Stamps>,
     req: &mut Request<'r>,
     batch: Batch<'r>,
-    pending: Pending<'_>,
+    spawned: Pending<'_>,
+    groups: &mut Vec<Group<'_>, Global>,
     frame: &'f Frame,
     held: &Frame,
     scratch: &mut Frame,
@@ -353,8 +427,8 @@ fn answer_batch<'f, 'r>(
     let mut did = Vec::with_capacity_in(batch.tasks.len(), held);
     let mut took = Vec::with_capacity_in(batch.tasks.len(), held);
     let mut ran_here = Vec::with_capacity_in(batch.tasks.len(), held);
-    for ((_, task), pending) in batch.tasks.iter().zip(pending.iter()) {
-        if pending.is_some() {
+    for ((_, task), spawned) in batch.tasks.iter().zip(spawned.iter()) {
+        if !matches!(spawned, Spawned::Here) {
             ran_here.push(None);
             continue;
         }
@@ -364,11 +438,40 @@ fn answer_batch<'f, 'r>(
         phases.took(row_of(task.name.kind), frame);
         ran_here.push(Some((done, phases.since(at))));
     }
-    for (((ticket, task), pending), here) in batch.tasks.iter().zip(pending).zip(ran_here) {
-        let (done, ns) = match (pending, here) {
+    for (((ticket, task), spawned), here) in batch.tasks.iter().zip(spawned).zip(ran_here) {
+        let (done, ns) = match (spawned, here) {
             (_, Some(done)) => done,
-            (Some(Err(what)), _) => (Did::Failed(TaskFailure { name: task.name, why: Why::Refused { what, rule: "blaze-cli work.rs" } }), 0),
-            (Some(Ok(handle)), _) => {
+            (Spawned::Refused(what), _) => (Did::Failed(TaskFailure { name: task.name, why: Why::Refused { what, rule: "blaze-cli work.rs" } }), 0),
+            (Spawned::Body { group, at }, _) => {
+                let unanswered = Why::Refused { what: "a file's body job answered nothing for this body", rule: "blaze-cli work.rs, pooled_bodies" };
+                let Some(slot) = groups.get_mut(group) else {
+                    return Err(CliError::Text { what: "a body's task names a file job its round did not start" });
+                };
+                // The file's job is joined by the first of its bodies answered.
+                if matches!(slot, Group::Running(_))
+                    && let Group::Running(handle) = core::mem::replace(slot, Group::Taken)
+                {
+                    let joined = handle.join(&cx).map_err(CliError::Pool)?;
+                    high.scratch = high.scratch.max(joined.used);
+                    phases.worked(BODY_JOBS, joined.ns);
+                    if let Some(error) = joined.stopped {
+                        return Err(error.into());
+                    }
+                    *slot = Group::Joined { ns: joined.ns / (joined.did.len().max(1) as u64), did: joined.did };
+                }
+                let (done, ns) = match slot {
+                    Group::Joined { did, ns } => (did.get_mut(at).and_then(Option::take), *ns),
+                    Group::Running(_) | Group::Taken => (None, 0),
+                };
+                let done = match done {
+                    Some(Ok(record)) => Did::Done(record.clone_in(held)),
+                    Some(Err(why)) => Did::Failed(TaskFailure { name: task.name, why }),
+                    None => Did::Failed(TaskFailure { name: task.name, why: unanswered }),
+                };
+                phases.worked(row_of(task.name.kind), ns);
+                (done, ns)
+            }
+            (Spawned::One(handle), _) => {
                 let joined = handle.join(&cx).map_err(CliError::Pool)?;
                 high.scratch = high.scratch.max(joined.used);
                 let did = joined.did.map_err(|error| match error {
@@ -383,7 +486,7 @@ fn answer_batch<'f, 'r>(
                 phases.worked(row_of(task.name.kind), joined.ns);
                 (done, joined.ns)
             }
-            (None, None) => unreachable!("a task neither pooled nor run here"),
+            (Spawned::Here, None) => unreachable!("a task neither pooled nor run here"),
         };
         if let Did::Failed(failure) | Did::FailedSaying(failure, _) = &done {
             let path = match req.file_of(task) {
@@ -457,6 +560,13 @@ fn answer_batch<'f, 'r>(
     Ok(())
 }
 
+/// The profile's row of the body jobs, one a file a round: its times are the files read and
+/// outlined for their bodies ([`Phases::times`]).
+pub(crate) const BODY_JOBS: &str = "pooled body jobs, one a file a round (worker ns)";
+
+/// The profile's row of the `BodyCheck` tasks.
+pub(crate) const BODIES: &str = "pooled BodyCheck (worker ns)";
+
 /// A task kind's row in the profile's frame lines (`Phases::took` for a task run on the main
 /// thread, `Phases::worked` for a pooled one).
 fn row_of(kind: Kind) -> &'static str {
@@ -468,7 +578,7 @@ fn row_of(kind: Kind) -> &'static str {
         Kind::MacroModule => "task MacroModule",
         Kind::CrateScope => "task CrateScope",
         Kind::FileItems => "pooled FileItems (worker ns)",
-        Kind::BodyCheck => "pooled BodyCheck (worker ns)",
+        Kind::BodyCheck => BODIES,
         _ => "task of another kind",
     }
 }
@@ -628,7 +738,7 @@ fn run<'f, 'b>(
                 // be made names no part: the closing note says why.
                 let world = {
                     let _cx = cx.span("names: make the world");
-                    crate::names::world(&cx, root, &record.payload, Some(lock), &facts.fetch_env)
+                    crate::names::world(&cx, root, &record.payload, Some(lock), Some(graph.member_dirs()), &facts.fetch_env)
                 };
                 match world {
                     Ok(names) => {
@@ -648,7 +758,7 @@ fn run<'f, 'b>(
             None => Ok(Did::Failed(TaskFailure { name: task.name, why: Why::Refused { what: "a `UnitGraph` task with no lock read this command", rule: "graph.rs" } })),
         },
         Kind::Fetch => match facts.laid.as_mut().and_then(|laid| laid.lock.as_mut()) {
-            Some(lockfile) => crate::fetch::run(&cx, root, lockfile, &facts.fetch_env, task.name, held),
+            Some(lockfile) => crate::fetch::run(&cx, lockfile, &facts.fetch_env, task.name, held),
             // A `Fetch` job comes only from the `UnitGraph` task's asks, which run over the lock
             // read this command.
             None => Ok(Did::Failed(TaskFailure { name: task.name, why: Why::Refused { what: "a `Fetch` task with no lock read this command", rule: "fetch.rs" } })),
@@ -674,7 +784,8 @@ fn run<'f, 'b>(
                 facts.laid = Some(crate::units::lay(&cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
             }
             let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock);
-            crate::names::run(&cx, root, store, &mut facts.names, lock, &facts.fetch_env, task, frame, held)
+            let members = crate::names::member_dirs(facts.laid.as_ref());
+            crate::names::run(&cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, task, frame, held)
         }
         _ => unreachable!("`builds` said yes to {:?} and `run` has no arm for it", task.name.kind),
     }
@@ -690,19 +801,30 @@ struct Job<'a> {
     flags: u8,
     edition: u8,
     plant: Plant,
-    /// A `BodyCheck` job's item: where it starts in the file (its part's place).
-    body: Option<u32>,
 }
 
-/// The `FileItems` or `BodyCheck` job of `task`, or the refusal that fails it. Its slot's path
-/// (a body's home file's) is copied into the request's `frame`: the job outlives the steps of
-/// the batches answered before it joins.
-fn job_of<'f>(req: &Request<'_>, facts: &Facts<'_, impl crate::sweep::Stamps>, task: &Task<'_>, frame: &'f Frame) -> Result<Job<'f>, &'static str> {
+/// Why a task's job could not be made when the frame of one round's jobs is full: the task
+/// fails by these words, the round goes on (rule 20).
+const JOBS_FULL: &str = "the frame of one round's jobs is full: its tasks' paths and body lists are more than it holds";
+
+/// The bodies of one file a batch asked for, as one job: the file's job (its name the first
+/// body's, unused) and each body's task name with where its item starts (its part's place).
+struct BodiesJob<'a> {
+    file: Job<'a>,
+    bodies: &'a [(Name, u32)],
+}
+
+/// The `FileItems` job of `task`, or the job of a `BodyCheck` task's home file, or the refusal
+/// that fails it. Its slot's path is copied into `jobs`, the frame of one round of batches: the
+/// job outlives the steps of the batches answered before it joins (the request's file table
+/// moves under them), and nothing past the round reads it.
+fn job_of<'j>(req: &Request<'_>, facts: &Facts<'_, impl crate::sweep::Stamps>, task: &Task<'_>, jobs: &'j Frame) -> Result<Job<'j>, &'static str> {
     let path = req.file_of(task).ok_or("a file's or a body's task with no file")?;
-    let slot: &'f [u8] = Vec::from_slice_in(path, frame).leak();
+    let mut held = Vec::new_in(jobs);
+    held.try_extend_from_slice(path).map_err(|_| JOBS_FULL)?;
+    let slot: &'j [u8] = held.leak();
     let slot = core::str::from_utf8(slot).map_err(|_| "a path is not UTF-8")?;
-    let body = (task.name.kind == Kind::BodyCheck).then_some(task.place);
-    Ok(Job { name: task.name, slot, flags: facts.found.flags(slot.as_bytes()), edition: task.edition, plant: facts.plant, body })
+    Ok(Job { name: task.name, slot, flags: facts.found.flags(slot.as_bytes()), edition: task.edition, plant: facts.plant })
 }
 
 /// A file's outline as its `FileItems` record, worked in `scratch` and built in `into`: the
@@ -875,13 +997,12 @@ fn parser_edition(edition: Edition) -> parser::Edition {
     }
 }
 
-/// A body's syntax as its `BodyCheck` record: its entry found at `place` in its file's outline,
-/// its text parsed by the entry blaze-lower's `lower_body` parses a body with
-/// (`Reparser::top_level_item().parse`), each lexer and parser error inside the body a
-/// [`SYNTAX`] finding relative to the entry (rule 71). Errors before the body are the file's
-/// outline's. Its out is the entry's text digest: what it says follows from that text.
-fn body_syntax<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_>, place: u32, scratch: &Frame, into: A) -> Result<Result<Record<A>, Why>, Unread> {
-    let real = crate::sweep::real_path(job.slot, job.flags, scratch);
+/// A file's bodies are one job ([`BodiesJob`]): the file is read and outlined once, here, and
+/// each body asked for is found by its place and parsed ([`body_syntax`]), its outcome pushed
+/// to `did` in the order asked. A body's panic fails that body alone. An `Err` is the file's
+/// (unread, not text): `pooled_bodies` gives it to every body not yet answered.
+fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &Frame, did: &mut BodiesDid) -> Result<(), Unread> {
+    let real = crate::sweep::real_path(job.file.slot, job.file.flags, scratch);
     let path = core::str::from_utf8(&real).map_err(|_| Unread::Text("a path is not UTF-8"))?;
     let mut bytes = Bytes::new_in(scratch, "a source file");
     root.read_all(cx, &Path::new(path)?, &mut bytes)?;
@@ -889,19 +1010,45 @@ fn body_syntax<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_
     if u32::try_from(text.len()).is_err() {
         return Err(Unread::Text("a source file past 4 GiB"));
     }
-    let edition = Edition::from_byte(job.edition).ok_or(Unread::Text("a body's home file has no edition byte"))?;
+    let edition = Edition::from_byte(job.file.edition).ok_or(Unread::Text("a body's home file has no edition byte"))?;
     let erased = blaze_own::Erased::new(scratch);
     let outline = blaze_file_items::outline(text, edition, erased.handle());
-    let found = outline.items().iter().find(|item| item.range.start == place && checked_body(&outline, item).is_some());
-    let Some((item, body)) = found.and_then(|item| Some((item, checked_body(&outline, item)?))) else {
-        return Ok(Err(Why::Refused { what: "a body's part whose file holds no body at its place", rule: "blaze-cli work.rs, body_syntax" }));
+    // The items that have a checked body, by where each starts: a body asked for is found by
+    // search, not by a pass over the file's items a body.
+    let mut starts: Vec<(u32, u32), &Frame> = Vec::new_in(scratch);
+    for (index, item) in outline.items().iter().enumerate() {
+        if checked_body(&outline, item).is_some() {
+            starts.push((item.range.start, index as u32));
+        }
+    }
+    starts.sort_unstable();
+    for (name, place) in job.bodies.iter().copied() {
+        let found = starts.binary_search_by_key(&place, |(start, _)| *start).ok().map(|at| &outline.items()[starts[at].1 as usize]);
+        let (used, limit) = (scratch.peak() as u64, scratch.reserved() as u64);
+        did.push(Some(match unwinding(|| body_syntax(&outline, found, text, edition, name, Global)) {
+            Ok(done) => done,
+            Err(Panicked) => Err(Why::Panicked { used, limit }),
+        }));
+    }
+    Ok(())
+}
+
+/// A body's syntax as its `BodyCheck` record, named `name`: `item` is its entry, the item at
+/// its place in its file's outline (`None`: the file holds no body there), its text parsed by
+/// the entry blaze-lower's `lower_body` parses a body with (`Reparser::top_level_item().parse`),
+/// each lexer and parser error inside the body a [`SYNTAX`] finding relative to the entry
+/// (rule 71). Errors before the body are the file's outline's. Its out is the entry's text
+/// digest: what it says follows from that text.
+fn body_syntax<A: Allocator + Copy>(outline: &blaze_file_items::Outline<'_>, item: Option<&blaze_surface::Item>, text: &str, edition: Edition, name: Name, into: A) -> Result<Record<A>, Why> {
+    let Some((item, body)) = item.and_then(|item| Some((item, checked_body(outline, item)?))) else {
+        return Err(Why::Refused { what: "a body's part whose file holds no body at its place", rule: "blaze-cli work.rs, body_syntax" });
     };
     let entry = item.range.of(text);
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, entry);
     let input = lexed.to_input(pe);
     let output = parser::Reparser::top_level_item().parse(input.tokens());
-    let mut made = Record::new_in(job.name, into);
+    let mut made = Record::new_in(name, into);
     for (token, message) in lexed.errors() {
         let range = lexed.text_range(token);
         if range.start as u32 >= body.start {
@@ -940,7 +1087,7 @@ fn body_syntax<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_
         }
     }
     made.out = item.hash;
-    Ok(Ok(made))
+    Ok(made)
 }
 
 
@@ -1032,18 +1179,51 @@ struct Pooled {
 fn pooled(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_>, clock: &bstd::clock::Clock) -> Pooled {
     let began = clock.now();
     let scratch = cx.frame();
-    let ran = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| match job.body {
-        None => outline_file(cx, root, job, scratch, Global),
-        Some(place) => body_syntax(cx, root, job, place, scratch, Global),
-    }));
+    let ran = unwinding(|| outline_file(cx, root, job, scratch, Global));
     let (used, limit) = (scratch.peak(), scratch.reserved());
     let did = match ran {
         Ok(Ok(done)) => Ok(done),
         Ok(Err(Unread::Text(what))) => Ok(Err(Why::Refused { what, rule: "blaze-cli work.rs" })),
         Ok(Err(error)) => Err(error),
-        Err(_) => Ok(Err(Why::Panicked { used: used as u64, limit: limit as u64 })),
+        Err(Panicked) => Ok(Err(Why::Panicked { used: used as u64, limit: limit as u64 })),
     };
     Pooled { did, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) }
+}
+
+/// Each body's outcome of a file's job, in the order asked; `None` once taken by its task.
+type BodiesDid = Vec<Option<Result<Record<Global>, Why>>, Global>;
+
+/// A file's body job's outcome on the pool: each body's record or why it failed; what stopped
+/// the command, if the file could not be read at all (a path or read error); the frame's peak;
+/// the job's time.
+struct PooledBodies {
+    did: BodiesDid,
+    stopped: Option<Unread>,
+    used: usize,
+    ns: u64,
+}
+
+/// `job` on a pool worker, in the worker's task frame, as [`pooled`] runs a file's outline: a
+/// file that is not text, or a panic outside any one body (the read, the outline), fails each
+/// body not yet answered, by name; the pool never sees it.
+fn pooled_bodies(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, clock: &bstd::clock::Clock) -> PooledBodies {
+    let began = clock.now();
+    let scratch = cx.frame();
+    let mut did: BodiesDid = Vec::with_capacity_in(job.bodies.len(), Global);
+    let ran = unwinding(|| bodies_syntax(cx, root, job, scratch, &mut did));
+    let (used, limit) = (scratch.peak(), scratch.reserved());
+    let (rest, stopped) = match ran {
+        Ok(Ok(())) => (None, None),
+        Ok(Err(Unread::Text(what))) => (Some(Why::Refused { what, rule: "blaze-cli work.rs" }), None),
+        Ok(Err(error)) => (None, Some(error)),
+        Err(Panicked) => (Some(Why::Panicked { used: used as u64, limit: limit as u64 }), None),
+    };
+    if let Some(why) = rest {
+        while did.len() < job.bodies.len() {
+            did.push(Some(Err(why)));
+        }
+    }
+    PooledBodies { did, stopped, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) }
 }
 
 /// What a reader of a parts list sees: the parts' names, how each is found and where.

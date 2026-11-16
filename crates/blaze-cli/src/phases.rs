@@ -132,6 +132,11 @@ impl Phases {
         self.charge(kind, 0, ns);
     }
 
+    /// The times `kind` was charged ([`Phases::took`], [`Phases::worked`]): 0 for one never seen.
+    pub fn times(&self, kind: &'static str) -> u64 {
+        self.held.kinds[..self.held.len].iter().find(|row| row.0 == kind).map_or(0, |row| row.2)
+    }
+
     fn charge(&mut self, kind: &'static str, bytes: u64, ns: u64) {
         let at = match self.held.kinds[..self.held.len].iter().position(|row| row.0 == kind) {
             Some(at) => at,

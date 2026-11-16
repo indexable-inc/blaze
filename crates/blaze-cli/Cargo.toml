@@ -91,6 +91,10 @@ sandbox = ["blaze-proc-macro/runtime"]
 [dev-dependencies]
 # `check` and `control`: the sweep's simulation and its planted-bug control.
 blaze-sim.workspace = true
+# fetch_tests.rs: a `.crate` made in the test (a gzip of a tar) and its SHA-256, the lock's pin.
+blaze-tar.workspace = true
+blaze-deflate.workspace = true
+blaze-sha256.workspace = true
 # The HTTP origin's test publishes a signed origin (`read::publish`, behind `sign`) of segments
 # sealed by blaze-cas.
 blaze-remote = { workspace = true, default-features = false, features = ["sign"] }

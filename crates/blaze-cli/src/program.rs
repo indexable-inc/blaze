@@ -12,11 +12,16 @@ use bstd::fs::{Dir, ReadWrite};
 use bstd::hosting::Hosting;
 use bstd::io::Io;
 use bstd::mem::{Bytes, Frame};
+use bstd::path::Path;
 
 use crate::CliError;
+use crate::sweep::{self, LeafKind, Rows};
 
 /// The crate root the skeleton runs: a binary package's.
-const ROOT: &str = "src/main.rs";
+pub(crate) const ROOT: &str = "src/main.rs";
+
+/// Where the root package's sources are: the folder of [`ROOT`].
+const SOURCES: &str = "src/";
 
 /// What `blaze run` hands the program: the command's world, the grants named on its command line
 /// (`--grant name=value`, run.md), and the words after `--`.
@@ -29,28 +34,36 @@ pub struct Launch<'a> {
 /// The bytes of the exchange a hosted program's calls pass through (bstd `Hosting`).
 const EXCHANGE: usize = 4096;
 
-/// Runs the package at `root`: the status `main` ended with. A hosted program (its entry bstd's
-/// `bstd_hosted_start`) reaches the world only through the host table made here, over the
-/// command's `Io` and only what `launch` grants; the host lives until the program has returned.
-pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -> Result<u8, CliError> {
-    let cx = cx.span("blaze run: the program");
-    let listed = root.list(&cx, frame)?;
-    let mut texts: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
-    for (path, meta) in listed.iter() {
-        let name = path.as_str();
-        if meta.dir || !name.starts_with("src/") || !name.ends_with(".rs") {
+/// The program's source files, each path with its text, sorted by path: the files the
+/// request's walk opened (`rows`' slots that are present, from `Effect::Open` this command or
+/// the leaf table's rows on a repeat) under the root package's `src/`. Nothing is listed: what
+/// else the checkout holds (a `target/` of a million entries) is never looked at, so the cost
+/// is the program's own files' (rule 77). The one home of the set, for the run and for the
+/// program's refusals (`main.rs`, `program_refusals`).
+pub fn sources<'f>(cx: &Cx, root: &Dir<ReadWrite>, rows: &Rows<'_>, frame: &'f Frame) -> Result<Vec<(&'f str, &'f str), &'f Frame>, CliError> {
+    let mut texts: Vec<(&'f str, &'f str), &'f Frame> = Vec::new_in(frame);
+    for leaf in rows.of(LeafKind::Slot).filter(|leaf| !leaf.absent() && leaf.flags & sweep::BOTH == 0) {
+        let real = sweep::real_path(rows.path(leaf), leaf.flags, frame);
+        let path = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+        if !path.starts_with(SOURCES) {
             continue;
         }
         let mut bytes = Bytes::new_in(frame, "a source file of the program");
-        root.read_all(&cx, path, &mut bytes)?;
-        // Both outlive the listing and the buffer: copied into the command's frame, freed with it.
-        let kept_path: &str = core::str::from_utf8(Vec::from_slice_in(name.as_bytes(), frame).leak())
-            .map_err(|_| CliError::Text { what: "a path bstd listed is not UTF-8" })?;
-        let kept_text: &str = core::str::from_utf8(Vec::from_slice_in(bytes.as_slice(), frame).leak())
+        root.read_all(cx, &Path::new(path)?, &mut bytes)?;
+        let text = core::str::from_utf8(Vec::from_slice_in(bytes.as_slice(), frame).leak())
             .map_err(|_| CliError::Text { what: "a source file of the program is not UTF-8" })?;
-        texts.push((kept_path, kept_text));
+        texts.push((path, text));
     }
     texts.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    Ok(texts)
+}
+
+/// Runs the package at `root`: the status `main` ended with. A hosted program (its entry bstd's
+/// `bstd_hosted_start`) reaches the world only through the host table made here, over the
+/// command's `Io` and only what `launch` grants; the host lives until the program has returned.
+pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, rows: &Rows<'_>, frame: &Frame) -> Result<u8, CliError> {
+    let cx = cx.span("blaze run: the program");
+    let texts = sources(&cx, root, rows, frame)?;
     let mut files: Vec<SourceFile<'_>, &Frame> = Vec::with_capacity_in(texts.len(), frame);
     for &(path, text) in texts.iter() {
         files.push(SourceFile { path, text });

@@ -17,6 +17,10 @@
 //! | [`events`] | a flush of [`registry::RunEvent`]s as one blaze-format batch in columns | the parent's driver |
 //! | [`viewer`] | a viewer's `Toggle` request, deterministic CBOR, decoded with limits | the parent's driver |
 //! | [`suite`] | [`suite::Tests`]: what each test entered; which tests an edit affects | the parent of a test run |
+//! | [`plan`] | [`plan::Plan`]: one `blaze test` request: kept, looked up or run; width, deadlines, verdicts | the `blaze test` process |
+//! | [`postings`] | the suite's postings record: from each ask to the tests that asked it, read in place | the store |
+//! | [`result`] | a test's result record: a pass or a failure at its address, filed beside each other; the `Flaky` finding | the store |
+//! | [`report`] | the run report: failures as they end, capped output, the summary, `--format json`; a pure formatter | the `blaze test` process |
 //!
 //! The ids below are this crate's own so that it compiles alone today; each says the type it
 //! becomes when the crate that owns that type is on the new item layer (bottom.md).
@@ -37,9 +41,14 @@
 extern crate std;
 
 pub mod events;
+pub mod head;
 pub mod heat;
 pub mod parent;
+pub mod plan;
+pub mod postings;
 pub mod registry;
+pub mod report;
+pub mod result;
 pub mod slots;
 pub mod suite;
 pub mod tier;

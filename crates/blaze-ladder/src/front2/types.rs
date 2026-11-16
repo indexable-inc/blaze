@@ -88,7 +88,7 @@ fn program(message: std::string::String, r: Range) -> Why {
 /// arguments before it put in (the Reference, "Generic parameters": `Vec<u8>` is
 /// `Vec<u8, Global>`; "Type aliases": a type alias's parameters are generic parameters too).
 /// The one home of default filling for a type path.
-fn with_defaults(tys: &mut PortableTys<'_>, kids: &[PTy], g: u32, defaults: &[Option<PTy>], shown: &str, r: Range) -> Result<Vec<PTy, Global>, Why> {
+pub(super) fn with_defaults(tys: &mut PortableTys<'_>, kids: &[PTy], g: u32, defaults: &[Option<PTy>], shown: &str, r: Range) -> Result<Vec<PTy, Global>, Why> {
     if kids.len() > g as usize {
         return Err(program(format!("`{shown}` is written with {} type arguments; it takes {g}", kids.len()), r));
     }
@@ -180,6 +180,17 @@ pub trait Heads {
     fn ask_anon(&self, _ask: super::anon::Ask) -> bool {
         false
     }
+    /// Takes the qualified constant leaf `ask` (`<B4 as Spec>::BITS` in a head's expression:
+    /// [`super::const_qpath`]) to be selected and evaluated; `false` where these heads have
+    /// no evaluator behind them (the default), and the expression is evaluated as written.
+    fn ask_qpath(&self, _ask: super::const_qpath::QAsk) -> bool {
+        false
+    }
+    /// The type of the answered qualified constant leaf under need key `need` (its bits are
+    /// [`Heads::const_bits`]); `None` until it is answered.
+    fn qpath_ty(&self, _need: LibKey) -> Option<PNode> {
+        None
+    }
     /// Why the anonymous constant under need key `key` has no value (the evaluator's refusal,
     /// as printed), once it was tried: the head that wrote it is then refused, naming the
     /// expression and this reason, and only that head. `None`: not tried, or it has a value.
@@ -192,6 +203,13 @@ pub trait Heads {
     fn trait_head(&self, trait_: LibKey) -> Option<(u32, &[Option<PTy>])>;
     /// Whether the trait declares an associated type `name`.
     fn trait_has_assoc(&self, trait_: LibKey, name: Name) -> Option<bool>;
+    /// How many type and const parameters the trait's associated type `name` declares on
+    /// itself (`type MapStorage<V>` has one; a lifetime is none): `None` when that is not on
+    /// record (the default: a source of heads that keeps no such count).
+    fn assoc_generics(&self, trait_: LibKey, name: Name) -> Option<u32> {
+        let _ = (trait_, name);
+        None
+    }
     /// The trait's supertraits written on its header (`: FnMut<Args>`), each with its
     /// arguments (`Self` first) over the trait's own parameters (`Self` = `Param(0)`).
     fn trait_supers(&self, trait_: LibKey) -> Option<&[(LibKey, List)]>;
@@ -369,6 +387,22 @@ fn arg_types(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut Vec<lf::TypeId, 
         }
     }
     Ok(())
+}
+
+/// How many of a segment's generic arguments are types or constants (a lifetime is erased; an
+/// associated item constraint is no argument): how many entries the segment has in
+/// [`Builder::path_args`]' answer.
+fn written_type_args(v: &View<'_>, s: &lf::Segment) -> Result<usize, Why> {
+    if !s.has_args {
+        return Ok(0);
+    }
+    let mut n = 0usize;
+    for &row in v.rows(s.args)? {
+        if matches!(lf::GenericArg::decode(row)?, lf::GenericArg::Type(_) | lf::GenericArg::Const(_)) {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// The name of a type argument written as one plain identifier with no arguments (`N`, `T`,
@@ -583,6 +617,23 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         if super::anon::mentions(text, env.params) {
             return Err(Why::Unsupported("a constant expression over a generic parameter", r));
         }
+        // Each qualified leaf `<T as Trait>::NAME` is answered by selection first
+        // ([`super::const_qpath`]) and the expression is evaluated with its value in its
+        // place: a checked body's constant path holds no `Self` to select an impl by. A leaf
+        // refused there refuses this head, naming the leaf and the reason.
+        let resolve_ty = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
+        let with_values = match super::const_qpath::substitute(self.heads, &resolve_ty, text, blaze_own::Alloc::global()) {
+            Ok(done) => done,
+            Err(super::const_qpath::Stop::Need(need)) => return Err(Why::NeedConst(need, r)),
+            Err(super::const_qpath::Stop::Failed { start, end, why }) => {
+                let leaf = text.get(start..end).unwrap_or(text);
+                return Err(Why::ConstPath(format!("{leaf}: {why}").into_boxed_str(), r));
+            }
+        };
+        let text = match &with_values {
+            Some(done) => done.as_str(),
+            None => text,
+        };
         if plain {
             let found = self.resolver.path(env.module, abs, &segs, Ns::Value).map_err(|e| Why::Resolve(e, r))?;
             if found.kind == Kind::Const && found.consumed as usize == segs.len() {
@@ -823,9 +874,19 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             };
             let tr = segs[0].trait_.ok_or(Why::Unsupported("a qualified path with no trait (`<T>::X`)", r))?;
             let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
-            let (trait_, args) = self.trait_path(tys, env, v, tp, kids[0], &kids[1..])?;
+            // `kids` are the self type, then the arguments written on the trait's path, then
+            // those written on the associated type's own segment (`path_args`' order). The
+            // last are the associated type's (the Reference, "Associated Items", "Associated
+            // Types": "Associated types may include generic parameters and where clauses;
+            // these are often referred to as generic associated types"), never the trait's:
+            // `<K as Key>::MapStorage<V>` gives `Key` no argument.
+            let own = written_type_args(v, last)?;
+            let Some(split) = kids.len().checked_sub(own).filter(|s| *s >= 1) else {
+                return Err(program(format!("`{shown}` has fewer arguments than its last segment writes"), r));
+            };
+            let (trait_, args) = self.trait_path(tys, env, v, tp, kids[0], &kids[1..split])?;
             let Some(n) = last.name else { return Err(Why::Unsupported("this qualified path", r)) };
-            return self.alias(tys, trait_, Name(v.name(n)?), args, r, shown);
+            return self.assoc_with_args(tys, trait_, Name(v.name(n)?), args, &kids[split..], r, shown);
         }
         if !abs && texts[0] == "Self" {
             return match (texts.len(), env.self_) {
@@ -1022,6 +1083,35 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             return Err(program(format!("`{shown}` names no associated type of the trait"), r));
         }
         intern(tys, PNode::Alias { trait_: self.heads.checker(trait_), name, args })
+    }
+
+    /// `<args[0] as trait_<args[1..]>>::name<own..>`: the associated type with the arguments
+    /// written on its OWN segment. None written is [`Self::alias`]. Written ones are checked
+    /// against the associated type's declared type and const parameters
+    /// ([`Heads::assoc_generics`]; a count not on record is refused by name, never taken as
+    /// zero), and follow the trait's arguments in the projection's list: the solver's form
+    /// for a generic associated type (blaze-solve alias.rs: the arguments from the trait's
+    /// generic count on are the associated type's own).
+    #[expect(clippy::too_many_arguments, reason = "the projection, its own arguments, and where it is written")]
+    fn assoc_with_args(&self, tys: &mut PortableTys<'_>, trait_: LibKey, name: Name, args: List, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
+        if own.is_empty() {
+            return self.alias(tys, trait_, name, args, r, shown);
+        }
+        if !self.heads.trait_has_assoc(trait_, name).ok_or(Why::Need(trait_))? {
+            return Err(program(format!("`{shown}` names no associated type of the trait"), r));
+        }
+        let Some(declared) = self.heads.assoc_generics(trait_, name) else {
+            return Err(Why::Unsupported("type arguments on an associated type whose own parameters are not on record", r));
+        };
+        if declared as usize != own.len() {
+            return Err(program(format!("the associated type of `{shown}` is written with {} type arguments; it takes {declared}", own.len()), r));
+        }
+        let of_trait = tys.view().list(args).map_err(|_| program(format!("`{shown}`: the trait's arguments are past the type table"), r))?;
+        let mut all = Vec::with_capacity_in(of_trait.len() + own.len(), Global);
+        all.extend_from_slice(of_trait);
+        all.extend_from_slice(own);
+        let all = intern_list(tys, &all)?;
+        intern(tys, PNode::Alias { trait_: self.heads.checker(trait_), name, args: all })
     }
 
     /// The trait path `p` with `self_ty` as `Self`: the trait and its arguments, `Self` first,

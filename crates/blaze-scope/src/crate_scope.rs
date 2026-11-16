@@ -743,6 +743,30 @@ pub trait Kept: Sync {
     /// `krate` was solved: its items record ([`crate::items_record::encode`]), kept with the
     /// bytes `made` was given and found with them.
     fn items(&self, _krate: usize, _items: &[u8]) {}
+
+    /// Whether each solved crate's expansions are kept ([`crate::expansions`]): when not, no
+    /// call's key is made and nothing is collected.
+    fn keeps_expansions(&self) -> bool {
+        false
+    }
+
+    /// `krate`'s expansions from its last solve ([`Kept::expansions_made`]'s bytes), WHETHER OR
+    /// NOT its files changed since: a crate solved again after an edit finds its unchanged
+    /// calls here, each by its text's key. The bytes start at a multiple of
+    /// [`blaze_expand::kept::ALIGN`]. Asked only when [`Kept::keeps_expansions`].
+    fn expansions(&self, _krate: usize) -> Option<&[u8]> {
+        None
+    }
+
+    /// `krate` was solved: its expansions set ([`crate::expansions::KeptExpansions::record`]),
+    /// kept by the crate, replacing the last. Told only when [`Kept::keeps_expansions`].
+    fn expansions_made(&self, _krate: usize, _set: &[u8]) {}
+
+    /// The planted bug a test's store asks for ([`crate::expansions::Planted`]): none, always,
+    /// outside the test that must catch it.
+    fn expansions_planted(&self) -> crate::expansions::Planted {
+        crate::expansions::Planted::None
+    }
 }
 
 /// One crate's answer from [`resolve_kept`].
@@ -1023,8 +1047,24 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                     Err(e) => break Err(e),
                 };
                 let local_input = CrateInput { deps: own_deps, ..*input };
-                match resolve_crate_decoded(&local_input, &deps, local_sysroot, sources, at, par, leak_private, prepares, alloc) {
-                    Ok(done) => break Ok(done),
+                // The crate's expansions kept between solves ([`crate::expansions`]): asked for
+                // whether or not its files changed, collected anew by each try, told once the
+                // solve finished.
+                let keeper = kept.filter(|k| k.keeps_expansions());
+                let kept_expansions = match keeper {
+                    Some(k) => crate::expansions::KeptExpansions::open_planted(k.expansions(at), k.expansions_planted(), alloc)
+                        .unwrap_or_else(|e| panic!("the kept expansions of `{}` did not open: {e}", input.name)),
+                    None => crate::expansions::KeptExpansions::none(alloc),
+                };
+                match resolve_crate_decoded(&local_input, &deps, local_sysroot, sources, at, par, leak_private, prepares, &kept_expansions, alloc) {
+                    Ok(done) => {
+                        if let Some(k) = keeper {
+                            par.stage(crate::task::Stage::ExpansionsRecord);
+                            let set = kept_expansions.record(alloc).unwrap_or_else(|e| panic!("the kept expansions of `{}` did not write: {e}", input.name));
+                            k.expansions_made(at, &set);
+                        }
+                        break Ok(done);
+                    }
                     Err(CrateScopeError::Need(keys)) if tries <= n => {
                         locked(&queue).needs += 1;
                         let mut unknown = false;
@@ -1137,7 +1177,7 @@ pub(crate) fn resolve_crate_with<'a, S: SourceTexts<'a>, P: Par>(
     for (at, bytes) in deps.iter().enumerate() {
         decoded.push(&*Box::leak(Box::new_in(read_record(bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?, alloc)));
     }
-    resolve_crate_decoded(input, &decoded, sysroot, sources, source, par, leak_private, prepares, alloc)
+    resolve_crate_decoded(input, &decoded, sysroot, sources, source, par, leak_private, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)
 }
 
 /// [`resolve_crate_with`] given its dependencies' records already decoded: the ready queue
@@ -1152,6 +1192,7 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     leak_private: bool,
     prepares: &'a Prepares<'a>,
+    kept: &crate::expansions::KeptExpansions<'_, 'a>,
     alloc: Alloc<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
     let mut slots: AVec<'a, Option<Dep<'a>>> = AVec::with_capacity_in(deps.len() + 1, alloc);
@@ -1203,7 +1244,7 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
     for d in slots.iter().flatten() {
         built.ask(|| Question::krate(*d, alloc));
     }
-    let names = resolve_one::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, alloc).map_err(CrateScopeError::Names)?;
+    let names = resolve_one::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, kept, alloc).map_err(CrateScopeError::Names)?;
     par.stage(crate::task::Stage::Write);
     let Records { exports, inner } = write_records(&names, &built, leak_private, alloc).map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
     let names: &'a CrateNames<'a> = Box::leak(Box::new_in(names, alloc));

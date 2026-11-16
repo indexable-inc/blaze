@@ -140,7 +140,22 @@ pub fn check_body_counted<'n, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
     body: &Body<'_>,
     scope: &BodyScope<'_>,
+    count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
+) -> Result<tc::Checked<'static>, CheckFail> {
+    check_body_asked(r, body, scope, count, None)
+}
+
+/// `check_body_counted` that also leaves, in `asked`, what a check that did NOT end in a
+/// clean `Checked` asked of the world (front2 reads.rs: every body has a read list): the read
+/// list of a run that finished but is returned as a failure (diagnostics, or a gap answered as
+/// missing), and the questions of the last round that ended in a need. A clean check's list is
+/// in its `Checked`. What is left is a report, never an input to the outcome.
+pub fn check_body_asked<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
     mut count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
+    mut asked: Option<&mut super::reads::Asked<'_>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
     let owner = body.typeck.owner;
     let mut hints = Needs::new_in(Alloc::global());
@@ -185,13 +200,25 @@ pub fn check_body_counted<'n, S: NamesSource<'n>>(
                 let mut diags = Vec::with_capacity_in(done.diags.len(), Global);
                 let tys = done.types.view();
                 diags.extend(done.diags.iter().map(|d| (d.code, d.at, diag_about(r, tys, d))));
+                if let Some(asked) = asked.as_deref_mut() {
+                    asked.finished = Some(done.reads.clone());
+                }
                 return Err(CheckFail::Diags { owner, diags });
             }
             Outcome::Done(done) if !round_gaps => return Ok(done),
             // A gap answered `Missing`, so a finished check past one is no answer.
-            Outcome::Done(_) => return Err(CheckFail::Gap { owner, gaps: all_gaps }),
+            Outcome::Done(done) => {
+                if let Some(asked) = asked.as_deref_mut() {
+                    asked.finished = Some(done.reads.clone());
+                }
+                return Err(CheckFail::Gap { owner, gaps: all_gaps });
+            }
             Outcome::Need(needs) => needs,
         };
+        if let Some(asked) = asked.as_deref_mut() {
+            asked.questions.clear();
+            asked.questions.extend_from_slice(&needs.questions);
+        }
         if fills.is_empty() && !all_gaps.is_empty() {
             return Err(CheckFail::Gap { owner, gaps: all_gaps });
         }
@@ -248,7 +275,7 @@ fn make_round<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fills: Vec<Fill
 
 /// An item's name for a finding: its written name, else its key.
 pub(crate) fn item_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,k: ItemKey) -> String {
-    match r.keys.library(k).and_then(|lib| r.names.name_of(lib)) {
+    match r.keys.library_in(r.names, k).and_then(|lib| r.names.name_of(lib)) {
         Some(n) => n.to_string(),
         None => format!("{k:?}"),
     }
@@ -525,6 +552,13 @@ impl MakeFail {
 /// The most constants one fill may need evaluated before it is made (rule 18).
 const MOST_CONSTS: u32 = 64;
 
+/// [`make`] for front2/const_qpath.rs (the trait's members and the impl candidates a
+/// qualified constant leaf is selected from): the fill's refusal as the check's, naming
+/// `owner`.
+pub(super) fn make_for<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, fill: Fill, owner: ItemKey) -> Result<(), CheckFail> {
+    make(r, fill).map_err(|e| e.at(owner))
+}
+
 /// Makes `fill`; a head whose array length names a constant ([`Why::NeedConst`]) has that
 /// constant evaluated (`Records::consts`) and the fill made again. While a constant is being
 /// evaluated the evaluator is taken out of `r`, so one needed inside it is
@@ -548,6 +582,12 @@ fn make<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> Result
 /// `Maps::const_lens`. The evaluator is taken out of `r` meanwhile, so a length met inside
 /// that evaluation is [`ConstFail::Nested`]: never a nested evaluation.
 pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) -> Result<(), ConstFail> {
+    // A qualified constant leaf of a head's expression (`<B4 as Spec>::BITS`:
+    // front2/const_qpath.rs) is answered by selection, with every leaf asked beside it; its
+    // refusal is filed for the head that wrote it, as an anonymous constant's is below.
+    if r.consts.is_some() && super::const_qpath::eval_asked(r, c) {
+        return Ok(());
+    }
     let Some((consts, prepared)) = r.consts.take() else {
         return Err(ConstFail::Nested { item: checker_of(c) });
     };

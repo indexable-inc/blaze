@@ -1,0 +1,315 @@
+//! A package's integration tests, examples and benches: the targets the manifest format finds
+//! in `tests/`, `examples/` and `benches/`, and the `[[test]]`, `[[example]]` and `[[bench]]`
+//! tables that add or rename them. Read by the format's documented rules (the Cargo Book,
+//! "Cargo Targets"), quoted at each branch; nothing here runs cargo or opens a file: each
+//! directory is one listing asked of the caller ([`super::Need::Listing`]), one level, its
+//! entries in name-byte order (as [`super::Layout::listing`] keeps them). No walk of the
+//! checkout: a target directory's subdirectories are listed once each, for their `main.rs`.
+
+use core::fmt;
+
+use blaze_own::{Alloc, String, Vec};
+use edition::PackageEdition;
+
+use super::raw::{RawExtra, RawPackage};
+use super::{Found, LayoutError, Passing, Span, Text, file, join, within};
+
+/// Which of the three kinds a target is; the order is the order targets are listed in.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum ExtraKind {
+    /// An integration test: "When you run `cargo test`, Cargo will compile each of these files
+    /// as a separate crate, and execute them."
+    Test,
+    Example,
+    Bench,
+}
+
+impl ExtraKind {
+    pub const ALL: [ExtraKind; 3] = [ExtraKind::Test, ExtraKind::Example, ExtraKind::Bench];
+
+    /// The package directory its targets are found in.
+    pub fn dir(self) -> &'static str {
+        match self {
+            ExtraKind::Test => "tests",
+            ExtraKind::Example => "examples",
+            ExtraKind::Bench => "benches",
+        }
+    }
+
+    /// The table that writes one (`[[test]]`).
+    pub fn table(self) -> &'static str {
+        match self {
+            ExtraKind::Test => "test",
+            ExtraKind::Example => "example",
+            ExtraKind::Bench => "bench",
+        }
+    }
+
+    /// The `[package]` key that turns its discovery off.
+    pub fn auto_key(self) -> &'static str {
+        match self {
+            ExtraKind::Test => "autotests",
+            ExtraKind::Example => "autoexamples",
+            ExtraKind::Bench => "autobenches",
+        }
+    }
+
+    /// `test` when not written: "The `test` field indicates whether or not the target is tested
+    /// by default by `cargo test`. The default is `true` for lib, bins, and tests."
+    pub fn tested_by_default(self) -> bool {
+        self == ExtraKind::Test
+    }
+}
+
+/// An integration test, example or bench target.
+#[derive(Clone)]
+pub struct ExtraTarget<'a> {
+    pub kind: ExtraKind,
+    pub name: Text<'a>,
+    /// The root file, anchor-relative; always under the package's directory.
+    pub root: Text<'a>,
+    /// Its `[[test]]` (`[[example]]`, `[[bench]]`) table's line, or for one found by its file
+    /// the `[package]` header.
+    pub span: Span,
+    /// Found by its file, not written.
+    pub found: bool,
+    /// `harness`, default `true`: "The `harness` field indicates that the `--test` flag will be
+    /// passed to `rustc` [..]. The default is `true` for all targets." Carried as data: the
+    /// runner decides what a harness-less target is run as.
+    pub harness: bool,
+    /// `test`, by [`ExtraKind::tested_by_default`] when not written.
+    pub test: bool,
+    /// `required-features`, as written: "The `required-features` field specifies which features
+    /// the target needs in order to be built." Carried as data, not judged here.
+    pub required_features: Vec<Text<'a>, Alloc<'a>>,
+}
+
+/// Why a workspace member's target of the three kinds is refused; [`LayoutError::Target`] names
+/// the package, the kind and the target. Never raised for a layout read without
+/// `Layout::with_test_targets` (a dependency's), which finds no such targets.
+#[derive(Clone)]
+pub enum TargetRefused<'a> {
+    /// A table with no `name`: "This is required for all targets except `[lib]`."
+    NoName,
+    /// A `path` that leaves the package's directory (or the anchor): the path as written. blaze
+    /// holds a target's root relative to its package, in the unit's key.
+    OutsidePackage { path: Text<'a> },
+    /// No file where the target's root must be: the written `path`, or with none written the
+    /// inferred `<dir>/<name>.rs` ("If not specified, the inferred path is used based on the
+    /// target name."); anchor-relative.
+    NoFile { path: Text<'a> },
+    /// A second target of this kind and name; the first's line.
+    Duplicate { first: Span },
+}
+
+impl fmt::Display for TargetRefused<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TargetRefused::NoName => f.write_str("the table has no `name` (\"This is required for all targets except `[lib]`.\")"),
+            TargetRefused::OutsidePackage { path } => {
+                write!(f, "its `path` `{}` leaves the package's directory, where blaze reads every target's root", path.as_str())
+            }
+            TargetRefused::NoFile { path } => write!(f, "no file `{}` for its root", path.as_str()),
+            TargetRefused::Duplicate { first } => write!(
+                f,
+                "a second target of this kind and name (the first at manifest {} bytes {}..{})",
+                first.manifest.0, first.start, first.end
+            ),
+        }
+    }
+}
+
+impl fmt::Debug for TargetRefused<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// `autotests` (`autoexamples`, `autobenches`) as written.
+fn auto_written(package: &RawPackage<'_>, kind: ExtraKind) -> Option<bool> {
+    match kind {
+        ExtraKind::Test => package.autotests,
+        ExtraKind::Example => package.autoexamples,
+        ExtraKind::Bench => package.autobenches,
+    }
+}
+
+impl<'l, 'a> Passing<'l, 'a> {
+    /// The package's integration tests, examples and benches, sorted by kind, then name bytes;
+    /// `None` while a listing is still to come (every listing it can see it needs is asked in
+    /// the same pass).
+    ///
+    /// The rules, each from the Cargo Book, "Cargo Targets":
+    /// - found by file: `tests/<name>.rs` and `tests/<name>/main.rs` (likewise `examples/`,
+    ///   `benches/`): "If a binary, example, bench, or integration test consists of multiple
+    ///   source files, place a `main.rs` file along with the extra modules within a subdirectory
+    ///   of the `src/bin`, `examples`, `benches`, or `tests` directory. The name of the
+    ///   executable will be the directory name." Hidden entries are skipped, as for binaries.
+    /// - discovery off: "Setting the keys `autolib`, `autobins`, `autoexamples`, `autotests`, or
+    ///   `autobenches` to `false` in the `[package]` section will disable auto-discovery of the
+    ///   corresponding target type." and "For packages with the 2015 edition, the default for
+    ///   auto-discovery is `false` if at least one target is manually defined in `Cargo.toml`.
+    ///   Beginning with the 2018 edition, the default is always `true`."
+    /// - a written table adds a target or renames a found one: a found target whose name or
+    ///   root a written one has is not added again (as for binaries).
+    pub(super) fn extras(
+        &mut self,
+        found: &Found<'l, 'a>,
+        edition: PackageEdition,
+    ) -> Result<Option<Vec<ExtraTarget<'a>, Alloc<'a>>>, LayoutError<'a>> {
+        let alloc = self.alloc();
+        let package = found.package;
+        let mut out: Vec<ExtraTarget<'a>, Alloc<'a>> = Vec::new_in(alloc);
+        let mut pending = false;
+        for kind in ExtraKind::ALL {
+            let any_written = package.extras.iter().any(|raw| raw.kind == kind);
+            let auto = auto_written(package, kind).unwrap_or(!(edition.syntax == edition::Edition::Edition2015 && any_written));
+            // The found files are needed even with discovery off: a written table with no
+            // `path` takes the found file of its name.
+            let Some(inferred) = self.inferred(&found.dir, kind) else {
+                pending = true;
+                continue;
+            };
+            let start = out.len();
+            for raw in package.extras.iter().filter(|raw| raw.kind == kind) {
+                match self.written(found, raw, &inferred)? {
+                    Some(target) => out.push(target),
+                    None => pending = true,
+                }
+            }
+            if auto {
+                for (name, root) in inferred.iter() {
+                    let taken = out[start..].iter().any(|target| target.name == *name || target.root == *root);
+                    if !taken {
+                        out.push(ExtraTarget {
+                            kind,
+                            name: name.clone(),
+                            root: root.clone(),
+                            span: package.span,
+                            found: true,
+                            harness: true,
+                            test: kind.tested_by_default(),
+                            required_features: Vec::new_in(alloc),
+                        });
+                    }
+                }
+            }
+            // One name per kind: two written tables, or `x.rs` beside `x/main.rs`.
+            for at in start..out.len() {
+                if let Some(first) = out[start..at].iter().find(|other| other.name == out[at].name) {
+                    return Err(LayoutError::Target {
+                        package: package.name.clone(),
+                        kind,
+                        target: out[at].name.clone(),
+                        at: out[at].span,
+                        why: TargetRefused::Duplicate { first: first.span },
+                    });
+                }
+            }
+        }
+        if pending {
+            return Ok(None);
+        }
+        out.sort_by(|a, b| (a.kind, a.name.as_str()).cmp(&(b.kind, b.name.as_str())));
+        Ok(Some(out))
+    }
+
+    /// The targets of `kind` found by their files under the package directory `dir`, each
+    /// (name, anchor-relative root) in name-byte order; `None` while a listing is still to come.
+    fn inferred(&mut self, dir: &str, kind: ExtraKind) -> Option<Vec<(Text<'a>, Text<'a>), Alloc<'a>>> {
+        let alloc = self.alloc();
+        let base = file(dir, kind.dir(), alloc);
+        let mut inferred: Vec<(Text<'a>, Text<'a>), Alloc<'a>> = Vec::new_in(alloc);
+        let entries = match self.list(&base)? {
+            None => return Some(inferred),
+            Some(entries) => entries,
+        };
+        let mut pending = false;
+        for (name, is_dir) in entries {
+            if name.starts_with('.') {
+                continue;
+            }
+            if !*is_dir {
+                if let Some(stem) = name.strip_suffix(".rs") {
+                    inferred.push((String::from_str_in(stem, alloc), file(&base, name, alloc)));
+                }
+                continue;
+            }
+            let sub = file(&base, name, alloc);
+            match self.list(&sub) {
+                None => pending = true,
+                Some(sub_entries) => {
+                    if sub_entries.is_some_and(|sub_entries| sub_entries.iter().any(|(n, d)| n.as_str() == "main.rs" && !*d)) {
+                        inferred.push((name.clone(), file(&sub, "main.rs", alloc)));
+                    }
+                }
+            }
+        }
+        match pending {
+            true => None,
+            false => Some(inferred),
+        }
+    }
+
+    /// A `[[test]]` (`[[example]]`, `[[bench]]`) table as a target: "The `path` field specifies
+    /// where the source for the crate is located, relative to the `Cargo.toml` file. If not
+    /// specified, the inferred path is used based on the target name." A written path's file
+    /// is checked in its directory's listing; `None` while that listing is still to come.
+    fn written(
+        &mut self,
+        found: &Found<'l, 'a>,
+        raw: &RawExtra<'a>,
+        inferred: &[(Text<'a>, Text<'a>)],
+    ) -> Result<Option<ExtraTarget<'a>>, LayoutError<'a>> {
+        let alloc = self.alloc();
+        let package = found.package;
+        let dir = found.dir.as_str();
+        let refuse = |target: &str, why: TargetRefused<'a>| LayoutError::Target {
+            package: package.name.clone(),
+            kind: raw.kind,
+            target: String::from_str_in(target, alloc),
+            at: raw.span,
+            why,
+        };
+        let Some(name) = &raw.name else { return Err(refuse("", TargetRefused::NoName)) };
+        // Only a workspace member's targets are read here (`Layout::with_test_targets`): a
+        // dependency is published without these folders as a matter of course, and its tests,
+        // examples and benches are never built, so its tables are read for shape only.
+        let root = match &raw.path {
+            None => match inferred.iter().find(|(n, _)| n == name) {
+                Some((_, root)) => root.clone(),
+                None => {
+                    let mut path = file(&file(dir, raw.kind.dir(), alloc), name, alloc);
+                    path.push_str(".rs");
+                    return Err(refuse(name, TargetRefused::NoFile { path }));
+                }
+            },
+            Some(path) => match join(dir, path, alloc) {
+                Some(root) if within(&root, dir) && root.as_str() != dir => {
+                    let (parent, leaf) = match root.as_str().rfind('/') {
+                        Some(cut) => (&root.as_str()[..cut], &root.as_str()[cut + 1..]),
+                        None => ("", root.as_str()),
+                    };
+                    match self.list(parent) {
+                        None => return Ok(None),
+                        Some(entries) => match entries.is_some_and(|entries| entries.iter().any(|(n, d)| n.as_str() == leaf && !*d)) {
+                            true => root,
+                            false => return Err(refuse(name, TargetRefused::NoFile { path: root.clone() })),
+                        },
+                    }
+                }
+                _ => return Err(refuse(name, TargetRefused::OutsidePackage { path: path.clone() })),
+            },
+        };
+        Ok(Some(ExtraTarget {
+            kind: raw.kind,
+            name: name.clone(),
+            root,
+            span: raw.span,
+            found: false,
+            harness: raw.harness.unwrap_or(true),
+            test: raw.test.unwrap_or(raw.kind.tested_by_default()),
+            required_features: raw.required_features.clone(),
+        }))
+    }
+}

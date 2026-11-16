@@ -4,7 +4,10 @@
 
 mod heat_tier;
 mod parent;
+mod plan;
 mod registry;
+mod report;
+mod result;
 mod slots;
 mod suite;
 mod toggle;

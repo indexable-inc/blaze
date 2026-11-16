@@ -42,7 +42,7 @@ fn calls_a_routine(code: &Code<Global>) -> bool {
 }
 
 /// `f(dst, src) = op(dst, src, len)`, `len` a constant (or, for `None`, `f(dst, src, len)`).
-fn bulk(op: Op, len: Option<u64>) -> Func<Global> {
+pub(crate) fn bulk(op: Op, len: Option<u64>) -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let src_ty = match op {
         Op::Memset => Ty::I8,

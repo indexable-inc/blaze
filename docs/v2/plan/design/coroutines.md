@@ -283,3 +283,49 @@ the block's expression; an `async fn`'s parameters by value): the checker writes
 `PNode::Opaque`, which instance.rs `ground` refuses: the builder needs the hidden type through
 a seam (`opaque_hidden`, answered in the identity form over the owner's parameters), and
 blaze-typeck instance.rs refuses to export a `Future` (`Limit::Export`).
+
+## Builder writer 5's notes (2026-11-16; the emit points and four tests are WRITTEN and with the builder integrator: NEVER COMPILED when this was written)
+
+Built (crates/blaze-build/src; tests `tests/coroutines_emit.rs`, run with the filter
+`coroutines`, aarch64 only):
+
+- **Three functions per coroutine instance** (`build_coroutine` in lib.rs, `coroutine::build`):
+  RESUME, the body split by the pass, parameters `(result, state, cx)`, instance
+  `(AsyncItems::resume, [coroutine])`; the ENTRY, `Future::poll` at `[coroutine]`, which reads
+  the state pointer out of its `Pin` and calls RESUME; DROP, `drop_in_place` at `[coroutine]`,
+  the pass's `drop`. The entry exists because every aggregate crosses the Rust ABI by address,
+  so `Pin<&mut Self>` arrives as a pointer to a pointer, and the pass needs the state pointer
+  as an entry parameter. It goes when `Pin` crosses as its one scalar (an ABI decision, not
+  taken here).
+- **The state where the block is evaluated** (`coroutine_value`): closure.rs's environment
+  writes, then the tag stored as `Unresumed`. A state is copied as bytes (`copy_state`, hooked
+  in `Walk::copy`): its row has one field, the upvars.
+- **An `async fn`** is its body's root `async move` block: `run` takes the block's coroutine
+  type as the result type whatever the signature writes (`async_fn_output`).
+- **`.await`** (`await_operand`, `Task::Await`, `await_poll`): the Reference's six steps; the
+  cancel block drops the future's temporary, then `drop_from(0)`, then `cancelled`.
+- **A block's type in its own body** is made by `Walk::ground_ty` (`own_block`,
+  `own_coroutine_ty`), never by `ground`.
+
+Seams the front end implements (all defaulted, all refuse by name until answered):
+`Adts::future_poll() -> Option<ItemKey>`; `Adts::async_items() -> Option<AsyncItems>`
+(`into_future`, `poll`, `ready`, `pending`, `pin`, `resume`);
+`LayoutFacts::coroutine(owner, ordinal) -> Option<CoroutineFacts<'_>>`;
+`LayoutFacts::coroutine_state(owner, ordinal, args, ground) -> Result<Option<StateShape>, Missing>`;
+`LayoutFacts::opaque_hidden(opaque, args, ground) -> Result<PTy, BuildError>` (an `async fn`'s
+opaque type is `coroutine_identity` at the ROOT block's ordinal, which is the last when the
+body holds other async blocks); `LayoutFacts::normalize` at `(IntoFuture, "IntoFuture", [T])`
+(it exists). The driver builds a coroutine BEFORE any body that holds its state by value, and
+places the three functions under the three instances above.
+
+Refused by name: `.await` outside an async block's body (an async closure's); an `async fn`
+whose root is not its block; a block naming an outer binding with no row in
+`Checked::captures` (the checker writes none for async blocks today: so NO capture and no
+`async fn` parameter builds yet, and the upvar path has no test); a zero-sized awaited future;
+a `Poll` or `Pin` not of the library's shape; a coroutine type asked of `build_drop_glue`.
+
+Owed: capture rows from the checker (then a test with a parameter and a by-reference
+capture); the resumed-after-completion panic block (item 6 above); each `.await` keeps its
+`Poll` result slot and the future's slot in the state to the body's end (no `slot_dead` is
+written: the pass's D8), and the body's one `Pin` slot too; a value in flight in an enclosing
+expression at an await is dropped by neither path (the walk's `return` has the same gap).

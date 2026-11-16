@@ -164,9 +164,11 @@
 // `thread_local!`: the worker's scratch outline (crate::walk).
 extern crate std;
 
+mod chain;
 mod digest;
 mod flags;
 mod header;
+mod names_digest;
 pub mod nested;
 mod skeleton;
 mod split;
@@ -181,13 +183,10 @@ use blaze_surface::{
 };
 
 pub use blaze_ids::ContentId;
+pub use chain::{CHAIN_DOMAIN, chain_at, head_of, item_chain};
 pub use header::{HeaderError, ImplHeader, impl_header};
 pub use walk::Bodies;
 pub use parser::SyntaxKind;
-
-/// A removal experiment's switch (crate::skeleton::read_body), 0 in every real run.
-#[doc(hidden)]
-pub static REMOVAL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// The domain of [`Item::hash`]: the Merkle step over an item's signature digest, the rest of
 /// its own bytes and its children's digests (crate docs, "Identity").
@@ -197,9 +196,14 @@ pub const ITEM_DOMAIN: &str = "blaze v2 file item merkle 2";
 /// and the digests of its children there (crate docs, "Identity").
 pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
 
-/// The domain of [`Outline::surface`] (the drive's `Surface` part: its value is unchanged
-/// since the digest lived in blaze-cli, so no record keyed by it moves).
-pub const SURFACE_DOMAIN: &str = "blaze-cli surface v1";
+/// The domain of an entry's names digest ([`Outline::names_digest`]): what name resolution can
+/// observe of it without its types (crate::names_digest).
+pub const NAMES_DOMAIN: &str = "blaze v2 file item names 1";
+
+/// The domain of [`Outline::surface`] (the drive's `Surface` part). `v2` since 2026-11-16: the
+/// surface hashes each entry's names digest, no longer its signature digest, so a surface of
+/// `v1` is never compared with one of `v2` and every record keyed by one is made again.
+pub const SURFACE_DOMAIN: &str = "blaze-cli surface v2";
 
 /// The outline of `text`, a source file of `edition`, in `alloc`: every item it declares at any
 /// module-level nesting, in source order, and the syntax errors of the parse. It always
@@ -277,6 +281,10 @@ pub struct Outline<'a> {
     /// Each top-level entry and its sibling key (its parent, kind and name or head), in order:
     /// what its disambiguator counts.
     keys: AVec<'a, (ItemIndex, ContentId)>,
+    /// Each entry's names digest, beside `items` (crate::names_digest): what [`Outline::surface`]
+    /// hashes. A column of the outline, not a field of blaze-surface's `Item`, so the record's
+    /// form is unchanged; position-free, so a part's are the whole file's.
+    names: AVec<'a, ContentId>,
     /// The flags of the file's own tokens, outside every entry.
     own_flags: ItemFlags,
     /// `own_flags` and every entry's together.
@@ -298,6 +306,7 @@ impl Outline<'_> {
             errors: exact(&self.errors, alloc),
             messages: exact(&self.messages, alloc),
             keys: exact(&self.keys, alloc),
+            names: exact(&self.names, alloc),
             own_flags: self.own_flags,
             flags: self.flags,
         }
@@ -340,11 +349,13 @@ impl Outline<'_> {
         &self.items
     }
 
-    /// The file's surface: what name resolution reads of it, never a body. For each entry
-    /// outside a function's body, its kind, its parent's place and its signature's digest
-    /// (attributes, visibility, name, generics, `use` paths), and for a macro definition or an
-    /// item-position macro call its whole digest, since its tokens make names. A body edit
-    /// leaves it equal (the drive's `Surface` part; blaze-world's `names --records`).
+    /// The file's surface: what name resolution reads of it, never a body or a type. For each
+    /// entry outside a function's body, in order, its kind, its parent's place and its names
+    /// digest ([`Outline::names_digest`]: name, visibility, attributes, a struct's or variant's
+    /// form, a `use` tree, an impl's header; the whole entry under a derive or an attribute
+    /// macro, and a macro's or macro call's tokens). A body edit, and an edit to a type, a bound
+    /// or a const's value, leaves it equal (the drive's `Surface` part; blaze-world's `names
+    /// --records`).
     pub fn surface(&self) -> ContentId {
         let items = &self.items;
         let mut hasher = blaze_ids::Hasher::new(SURFACE_DOMAIN);
@@ -352,14 +363,18 @@ impl Outline<'_> {
         while at < items.len() {
             let item = &items[at];
             let parent = item.parent.map_or(u32::MAX, |p| p.0);
-            hasher.part(&[item.kind() as u8]).part(&parent.to_le_bytes()).id(&item.signature_hash);
-            if matches!(item.kind(), ItemKind::MacroRules | ItemKind::Macro2 | ItemKind::MacroCall) {
-                hasher.id(&item.hash);
-            }
+            hasher.part(&[item.kind() as u8]).part(&parent.to_le_bytes()).id(&self.names[at]);
             // Everything written inside a function's body is hidden: skip past its last entry.
             at = if item.kind() == ItemKind::Function { item.end.at().max(at + 1) } else { at + 1 };
         }
         hasher.finish()
+    }
+
+    /// The names digest of the entry at `at`, in [`NAMES_DOMAIN`]: what name resolution can
+    /// observe of it without its types (crate::names_digest, which lists what the solver reads
+    /// and what of it is digested).
+    pub fn names_digest(&self, at: ItemIndex) -> ContentId {
+        self.names[at.at()]
     }
 
     /// The entry at `at`.
@@ -432,6 +447,7 @@ impl PartialEq for Outline<'_> {
             && self.errors[..] == other.errors[..]
             && self.messages[..] == other.messages[..]
             && self.keys[..] == other.keys[..]
+            && self.names[..] == other.names[..]
             && self.own_flags == other.own_flags
             && self.flags == other.flags
     }

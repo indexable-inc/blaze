@@ -238,7 +238,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
 
     /// The library's outline entry of a checker key's item (`None` for a member or a variant).
     pub(super) fn detail(&self, key: ItemKey) -> Option<ItemDetail> {
-        self.resolver().detail(self.keys.library(key)?)
+        self.resolver().detail(self.keys.library_in(self.names, key)?)
     }
 
     fn types(&self) -> PTys<'_> {
@@ -303,14 +303,19 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         match self.keys.origin(item) {
             Some(Origin::Member { kind: MemberKind::Fn, .. }) => self.want(item),
             Some(Origin::Member { kind: MemberKind::Ctor, container, .. }) => self.ctor_owner(item, *container),
-            Some(Origin::Member { .. }) | None => Ok(None),
-            Some(Origin::Item(lib)) => match self.resolver().detail(*lib) {
-                Some(ItemDetail::Fn { .. } | ItemDetail::Const { .. } | ItemDetail::Static { .. }) => self.want(item),
-                Some(_) => Ok(None),
-                // A variant: its enum's head makes its ctor fn.
-                None => match self.enum_of(*lib) {
-                    Some((e, _)) => self.ctor_owner(item, checker_of(e)),
-                    None => self.gap(Gap::CtorFn(item)),
+            Some(Origin::Member { .. }) => Ok(None),
+            // A key in no row of the map is asked of the source (`Keys::library_in`: over
+            // records no item is filed up front); a key of nothing has no signature.
+            Some(Origin::Item(_)) | None => match self.keys.library_in(self.names, item) {
+                None => Ok(None),
+                Some(lib) => match self.resolver().detail(lib) {
+                    Some(ItemDetail::Fn { .. } | ItemDetail::Const { .. } | ItemDetail::Static { .. }) => self.want(item),
+                    Some(_) => Ok(None),
+                    // A variant: its enum's head makes its ctor fn.
+                    None => match self.enum_of(lib) {
+                        Some((e, _)) => self.ctor_owner(item, checker_of(e)),
+                        None => self.gap(Gap::CtorFn(item)),
+                    },
                 },
             },
         }
@@ -344,7 +349,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
 
     fn impls_of(&self, _: Seal, trait_: ItemKey, shape: Shape) -> Fetch<&[ItemKey]> {
         if let Some((k, why)) = self.buckets.and_then(|b| b.trait_gap(trait_, shape)) {
-            let asked = match self.keys.library(trait_) {
+            let asked = match self.keys.library_in(self.names, trait_) {
                 Some(lib) => format!("the impls of the trait {lib:x} at {shape:?}"),
                 None => format!("the impls of the trait {trait_:?} at {shape:?}"),
             };
@@ -402,7 +407,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
             }
             return Ok(None);
         }
-        let Some(lib) = self.keys.library(container) else { return Ok(None) };
+        let Some(lib) = self.keys.library_in(self.names, container) else { return Ok(None) };
         let (Some(t), Some(extra)) = (self.store.maps.traits.get(&lib), self.store.trait_defs.get(&container)) else {
             return match self.resolver().detail(lib) {
                 Some(ItemDetail::Trait | ItemDetail::Impl) => self.want(container),
@@ -492,14 +497,14 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
                 _ => TypeAttrs(0),
             });
         }
-        match self.keys.library(item) {
+        match self.keys.library_in(self.names, item) {
             Some(lib) => self.fill(Fill::Store(Want::Adt(lib))),
             None => self.gap(Gap::Fill(FillError::UnknownKey(item))),
         }
     }
 
     fn trait_def(&self, _: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
-        let Some(lib) = self.keys.library(trait_) else { return Ok(None) };
+        let Some(lib) = self.keys.library_in(self.names, trait_) else { return Ok(None) };
         let (Some(t), Some(extra)) = (self.store.maps.traits.get(&lib), self.store.trait_defs.get(&trait_)) else {
             return match self.resolver().detail(lib) {
                 Some(ItemDetail::Trait) => self.want(trait_),
@@ -537,8 +542,24 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// fn's with its container's first); an item whose head is not made has none to give, and
     /// the checker asks for its head (`fn_sig`, `adt`, `impl_header`) before its parameters.
     fn const_params(&self, _: Seal, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
-        let made = self.keys.library(item).and_then(|lib| self.store.maps.const_params.get(&lib)).map(|c| &c[..]);
+        let made = self.keys.library_in(self.names, item).and_then(|lib| self.store.maps.const_params.get(&lib)).map(|c| &c[..]);
         let params = made.or_else(|| self.store.fns.get(&item).map(|f| &f.consts[..])).unwrap_or(&[]);
         Ok(tc::ConstParams { params, types: self.types() })
+    }
+
+    /// The generics of the trait's associated type `name` as the trait's head counted them
+    /// (`Maps::assoc_generics`, filled by `Store::trait_head`: type and const parameters; a
+    /// lifetime is none, as a portable type holds no region): the Reference, "Associated
+    /// Types": "Associated types may include generic parameters and where clauses". A trait
+    /// whose head is not made is asked for; a trait that declares no such type has no count.
+    fn assoc_generics(&self, _: Seal, trait_: ItemKey, name: Name) -> Fetch<Option<tc::AssocGenerics>> {
+        let Some(lib) = self.keys.library_in(self.names, trait_) else { return Ok(None) };
+        let Some(t) = self.store.maps.traits.get(&lib) else {
+            return match self.resolver().detail(lib) {
+                Some(ItemDetail::Trait) => self.want(trait_),
+                _ => Ok(None),
+            };
+        };
+        Ok(self.store.maps.assoc_generics.get(&(lib, name)).map(|&own| tc::AssocGenerics { parent: t.generics, own }))
     }
 }

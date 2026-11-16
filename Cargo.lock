@@ -405,6 +405,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-cas",
  "blaze-core",
+ "blaze-deflate",
  "blaze-drive",
  "blaze-fetch",
  "blaze-file-items",
@@ -421,9 +422,11 @@ dependencies = [
  "blaze-remote",
  "blaze-report",
  "blaze-scope",
+ "blaze-sha256",
  "blaze-sim",
  "blaze-std",
  "blaze-surface",
+ "blaze-tar",
  "blaze-text",
  "blaze-toolchain",
  "blaze-typeck",
@@ -431,6 +434,14 @@ dependencies = [
  "blaze-world",
  "edition",
  "parser",
+]
+
+[[package]]
+name = "blaze-code"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-own",
 ]
 
 [[package]]
@@ -574,8 +585,10 @@ dependencies = [
 name = "blaze-emit"
 version = "0.0.0"
 dependencies = [
+ "blaze-code",
  "blaze-inproc",
  "blaze-lir",
+ "blaze-own",
  "blaze-sim",
 ]
 

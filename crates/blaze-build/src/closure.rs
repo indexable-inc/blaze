@@ -100,7 +100,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// Closure `e`'s captures in the checker's order: the binding and how.
-    fn captures_of(&self, e: ExprId, out: &mut Vec<(PatId, CaptureKind), A>) {
+    pub(super) fn captures_of(&self, e: ExprId, out: &mut Vec<(PatId, CaptureKind), A>) {
         out.clear();
         let caps = &self.checked.captures;
         for row in 0..caps.len() {
@@ -111,7 +111,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// The offset of field `j` of the struct or tuple laid out as row `l`.
-    fn field_offset(&self, l: u32, j: usize) -> Result<u32, BuildError> {
+    pub(super) fn field_offset(&self, l: u32, j: usize) -> Result<u32, BuildError> {
         let Shape::Fields { first, len } = self.layouts[l as usize].shape else {
             return Err(malformed("a closure's environment not laid out as a struct"));
         };

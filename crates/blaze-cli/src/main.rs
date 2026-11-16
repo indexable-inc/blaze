@@ -324,9 +324,16 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     let mut ran = None;
     let workers = flags.workers.map_or(u32::try_from(workers).unwrap_or(u32::MAX), |n| n.get());
     let launch = program::Launch { io, grants: &flags.grants, args: &flags.program };
+    // Cargo's home (D78), read here at the edge (rule 75): `CARGO_HOME`, else `<HOME>/.cargo`.
+    // Its archive cache is the second place a dependency's bytes come from (fetch.rs).
+    let cargo_home = match (var("CARGO_HOME"), var("HOME")) {
+        (Some(cargo), _) => Some(bstd::mem::format_in!(frame, "{cargo}")),
+        (None, Some(home)) => Some(bstd::mem::format_in!(frame, "{}/.cargo", home.trim_end_matches('/'))),
+        (None, None) => None,
+    };
     // The request as this command makes it; it takes what it prints into and gives it back.
     let mut ask = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
-        let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), var("PWD"), blaze_toolchain::PINNED), origin.as_ref(), (command, word), workers, tool, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
+        let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED), origin.as_ref(), (command, word), workers, tool, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
         finished.map(|finished| (finished, shown))
     };
     // The whole request, behind the command's one edge for a panic (rule 20): a command that
@@ -534,9 +541,10 @@ fn request<'f>(
     root: &Dir<ReadWrite>,
     // The checkout, relative to where blaze was started: the fetched records' driver's root;
     // then `SSL_CERT_FILE` and `SSL_CERT_DIR`, where the HTTPS client's roots are looked for;
-    // then `HOME` and `PWD`, where the toolchain's shelf is (the target's cfg, graph.rs); then
-    // the toolchain the command opens (`blaze_toolchain::PINNED` from `main`, a fixture's in tests).
-    (checkout_at, cert_file, cert_dir, home, start, toolchain): (&'f str, Option<&'f str>, Option<&'f str>, Option<&'f str>, Option<&'f str>, blaze_toolchain::ToolchainId),
+    // then `HOME`, cargo's home (`CARGO_HOME`, else `<HOME>/.cargo`: its archive cache, fetch.rs)
+    // and `PWD`, where the toolchain's shelf is (the target's cfg, graph.rs); then the toolchain
+    // the command opens (`blaze_toolchain::PINNED` from `main`, a fixture's in tests).
+    (checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain): (&'f str, Option<&'f str>, Option<&'f str>, Option<&'f str>, Option<&'f str>, Option<&'f str>, blaze_toolchain::ToolchainId),
     origin: Option<&store::NamedOrigin>,
     (command, word): (Command, &'static str),
     workers: u32,
@@ -603,7 +611,7 @@ fn request<'f>(
     // of its own, so it is erased into one here, on this stack, for this request.
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
-    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, start, toolchain, fs: launch.io.need_fs()? }, macros: None, names: None };
+    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()? }, macros: None, names: None };
     if cold || followed.layout_moved {
         facts.laid = Some(units::lay(&cx, root, &stamps, &mut facts.rows, toolchain, frame, alloc)?);
     } else {
@@ -620,7 +628,7 @@ fn request<'f>(
         && let (Some(lockfile), Some(parts)) = (laid.lock.as_ref(), laid.parts.take())
     {
         let target = graph::target(&cx, &facts.fetch_env, frame)?;
-        laid.graph = Some(graph::Graph::new(parts, lockfile, units, target, command == Command::Test, frame));
+        laid.graph = Some(graph::Graph::new(parts, lockfile, units, target, matches!(command, Command::Test | Command::Check), frame));
         phases.mark_in("the target's cfg", frame);
     }
     let mut files: Vec<FileEntry<'_>, &Frame> = Vec::with_capacity_in(followed.now.rows.len(), frame);
@@ -679,10 +687,17 @@ fn request<'f>(
     let mut store = store::Layered::open(&cx, root, &machine, boot, origin, phases.clock().clone(), err, alloc)?;
     // The workers' read side: today's tasks publish a file's outline and a manifest's units,
     // about one name a file, so 8 a file. A cold run starts with no files listed and opens them
-    // as it goes: the table grows on a full one (`Settled::grown_in`), never stops.
-    let mut table = Settled::new_in(files.len().saturating_mul(8), frame);
-    let mut effects: Vec<Effect<'_>, Alloc<'_>> = Vec::new_in(alloc);
-    let mut todo: VecDeque<Effect<'_>, Alloc<'_>> = VecDeque::new_in(alloc);
+    // as it goes: the table grows on a full one (`Settled::grown_in`), never stops. On the
+    // global heap, named: a table outgrown is freed when the grown one replaces it. Over the
+    // command's frame each stayed until the command ended, 45.8 MB of its 64 MiB on blaze's own
+    // checkout (the profile's `effect publish` row, 2026-11-16).
+    let mut table = Settled::new_in(files.len().saturating_mul(8), std::alloc::Global);
+    // The effects the machine asks and the list they wait in: on the global heap, named, like
+    // the machine that fills them (above). Each grows and empties many times a command; over the
+    // command's frame every outgrown buffer stayed until the command ended (the refusal of
+    // 2026-11-16: "the allocator refused 2850816 bytes ... for `Effect`").
+    let mut effects: Vec<Effect<'_>, Alloc<'_>> = Vec::new_in(Alloc::global());
+    let mut todo: VecDeque<Effect<'_>, Alloc<'_>> = VecDeque::new_in(Alloc::global());
     let mut prints: Vec<Print<'_>, &Frame> = Vec::new_in(frame);
     // The batches handed out and not yet run: at most one a worker (the request's own cap).
     let mut batches = std::vec::Vec::new_in(std::alloc::Global);
@@ -792,14 +807,14 @@ fn request<'f>(
             // Puts are performed as they come, so every one before this is written.
             Effect::Publish(input) => {
                 if table.publish(input).is_err() {
-                    table = table.grown_in(frame)?;
+                    table = table.grown_in(std::alloc::Global)?;
                     table.publish(input)?;
                 }
                 phases.request.publish += phases.since(at);
             }
             Effect::Unpublish(name) => {
                 if table.clear(name).is_err() {
-                    table = table.grown_in(frame)?;
+                    table = table.grown_in(std::alloc::Global)?;
                     table.clear(name)?;
                 }
                 phases.request.publish += phases.since(at);
@@ -812,7 +827,9 @@ fn request<'f>(
             // taking the units' record and answering `Exited` when the child ends (drive.md, "Run").
             Effect::StartProgram { .. } => {
                 started = phases.since(began);
-                let ok = match program::run(&cx, root, launch, frame) {
+                // The program's files are the ones the walk opened (or, on a repeat, the leaf
+                // table's rows): the checkout is never listed.
+                let ok = match program::run(&cx, root, launch, &kept(&req, &followed, &facts.rows, frame), frame) {
                     Ok(status) => {
                         *ran = Some(status);
                         status == 0
@@ -902,17 +919,7 @@ struct Refused<'f> {
 /// The lowering's refusals of the files the answer holds, read at their real paths: what `blaze
 /// run` would refuse to run, drawn beside the findings that kept it from running.
 fn program_refusals<'f>(cx: &Cx, root: &Dir<ReadWrite>, rows: &Rows<'_>, frame: &'f Frame) -> Result<Refused<'f>, CliError> {
-    let mut texts: Vec<(&'f str, &'f str), &'f Frame> = Vec::new_in(frame);
-    for leaf in rows.of(LeafKind::Slot).filter(|leaf| !leaf.absent() && leaf.flags & sweep::BOTH == 0) {
-        let real = sweep::real_path(rows.path(leaf), leaf.flags, frame);
-        let path = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
-        let mut bytes = Bytes::new_in(frame, "a source file of the program");
-        root.read_all(cx, &Path::new(path)?, &mut bytes)?;
-        let text = core::str::from_utf8(Vec::from_slice_in(bytes.as_slice(), frame).leak())
-            .map_err(|_| CliError::Text { what: "a source file of the program is not UTF-8" })?;
-        texts.push((path, text));
-    }
-    texts.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let texts = program::sources(cx, root, rows, frame)?;
     let mut files: Vec<SourceFile<'_>, &Frame> = Vec::with_capacity_in(texts.len(), frame);
     for &(path, text) in texts.iter() {
         files.push(SourceFile { path, text });
@@ -1166,6 +1173,10 @@ mod tests {
         certified: bool,
         checked: u32,
         high: work::HighWater,
+        /// The `BodyCheck` tasks answered, and the file jobs that answered them (one a home
+        /// file a round of batches).
+        bodies: u64,
+        body_jobs: u64,
         /// The crates whose names the command resolved.
         resolved: u32,
         /// Its profile's lines, each kind's counts: what a failing count names.
@@ -1188,6 +1199,8 @@ mod tests {
                 certified: false,
                 checked: 0,
                 high: work::HighWater::default(),
+                bodies: 0,
+                body_jobs: 0,
                 resolved: 0,
                 profile: std::string::String::new(),
                 errors: 0,
@@ -1199,6 +1212,8 @@ mod tests {
     }
 
     mod fix_tests;
+    mod members_tests;
+    mod names_records_tests;
 
     fn write(io: &Io, path: &str, text: &str) {
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
@@ -1233,6 +1248,25 @@ mod tests {
         id
     }
 
+    /// A file's bodies are checked by one job a round of batches: the file is read and outlined
+    /// once for all of them, not once a body (rule 77; on blaze's own checkout the per-body
+    /// outline was the command's 120 CPU seconds). Without the grouping (`run_batches` making
+    /// a job a body) the jobs equal the bodies and this fails.
+    #[test]
+    fn a_files_bodies_are_checked_by_one_job_a_round() {
+        let io = Io::simulated(SimWorld::new(7, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        let mut lib = std::string::String::new();
+        for i in 0..400 {
+            writeln!(lib, "pub fn f{i}() -> u32 {{ {i} }}").expect("a string takes text");
+        }
+        write(&io, "src/lib.rs", &lib);
+        let first = check(&io, work::Sizes::USUAL);
+        assert!(first.failed.is_empty(), "{:?}", first.failed);
+        assert_eq!(first.bodies, 400, "each body is a task of its own");
+        assert!(first.body_jobs >= 1 && first.body_jobs * 8 <= first.bodies, "{} file jobs for {} bodies of one file", first.body_jobs, first.bodies);
+    }
+
     fn check(io: &Io, sizes: work::Sizes) -> Checked {
         ask(io, (Command::Check, "check"), sizes).expect("the request answers")
     }
@@ -1255,7 +1289,7 @@ mod tests {
         let said = words(command.0, &out, &err);
         let toolchain = shelf(io);
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
-            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), Some("/"), toolchain), None, command, 1, home::tool(b"test"), sizes, &launch, frame, said, &err, ran, &mut shown, phases);
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain), None, command, 1, home::tool(b"test"), sizes, &launch, frame, said, &err, ran, &mut shown, phases);
             finished.map(|finished| (finished, shown))
         };
         let (finished, shown) = match fix {
@@ -1282,6 +1316,8 @@ mod tests {
             certified: finished.answer.profile.certified,
             checked: finished.checked,
             high: finished.high,
+            bodies: phases.times(work::BODIES),
+            body_jobs: phases.times(work::BODY_JOBS),
             resolved: finished.resolved,
             profile: finished.answer.profile.to_string(),
             errors: finished.answer.findings,

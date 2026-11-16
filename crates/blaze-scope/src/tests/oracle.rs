@@ -866,7 +866,10 @@ impl<'w> Ref<'w> {
             WrittenVis::Crate => Visibility::Crate(self.krate),
             WrittenVis::Super => Visibility::Restricted(self.parent(m).expect("the generator writes pub(super) below the root")),
             WrittenVis::In(p) => {
-                assert!(p.kind == PathKind::Crate, "the generator writes pub(in crate::..)");
+                // The Reference, `vis.scoped.edition2018`: "The 2015 edition may also use paths
+                // starting with `::` or modules from the crate root."
+                let from_root = matches!(p.kind, PathKind::Plain | PathKind::Abs) && self.w.roots[&self.krate].head.edition == crate::Edition::E2015;
+                assert!(p.kind == PathKind::Crate || from_root, "the generator writes pub(in crate::..)");
                 Visibility::Restricted(self.in_path(&p.segments).expect("pub(in ..) names an ancestor"))
             }
         }
@@ -1177,7 +1180,15 @@ impl<'w> Ref<'w> {
         let segs = &u.path.segments[..];
         let steps = if u.leaf == UseForm::Glob { segs.len() } else { segs.len() - 1 };
         let mut first = 0;
-        if u.path.kind == PathKind::Plain {
+        // The Reference, `items.use.path.edition2018`: "In the 2015 edition, `use` paths are
+        // relative to the crate root." and "The 2015 edition does not allow use declarations to
+        // reference the extern prelude.": a 2015 plain path is walked from `self.root` (set
+        // above), every segment by `lookup`, with no lexical first segment and no outer scope.
+        let lexical = u.path.kind == PathKind::Plain && self.w.roots[&self.krate].head.edition != crate::Edition::E2015;
+        if lexical && steps == 0 {
+            return self.try_one_segment(f, i, stall);
+        }
+        if lexical {
             assert!(steps >= 1, "the generator writes a plain path with a module segment before its leaf");
             let b = match self.first_plain(m, segs[0], me, stall) {
                 Err(wait) => return Err((wait, [None; 3])),
@@ -1247,6 +1258,66 @@ impl<'w> Ref<'w> {
         }
         Ok(if amb {
             // An ambiguous namespace fails the import at once, whatever the others wait on.
+            Imp::Failed(Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsGlob))
+        } else if !waits.is_empty() {
+            return Err((waits, out));
+        } else if found {
+            Imp::Named(out)
+        } else if hidden {
+            Imp::Failed(Unresolved::Private)
+        } else {
+            Imp::Failed(Unresolved::NotFound)
+        })
+    }
+
+    /// `use name;` from 2018 on (import `i` of fragment `f`): the name in each namespace. In the
+    /// macro namespace the textual scope at the import is read first: the Reference,
+    /// `macro.decl.scope.path.reexport`: "Macros can be re-exported to give them path-based scope
+    /// from a module other than the crate root." (`macro_rules! m { .. } pub(crate) use m;`,
+    /// "from within `m`'s textual scope"), with the macro's own visibility,
+    /// `macro.decl.scope.path-based.visibility`: "Macros have an implicit visibility of
+    /// `pub(crate)`. `#[macro_export]` changes the implicit visibility to `pub`." Else the
+    /// module's own scope, then for a type the outer candidate (the extern prelude, R8). This
+    /// states no R6 finding for the leaf: the generator writes no such import.
+    fn try_one_segment(&self, f: ItemKey, i: u32, stall: bool) -> Result<Imp, (Vec<Bk>, [Option<B>; 3])> {
+        let u = &self.w.decls[&f].uses[i as usize];
+        let m = self.module_of(f);
+        let me = Some(Bk::Imp(f, i));
+        let leaf = u.path.segments[0];
+        let ivis = self.vis_of(m, &u.vis);
+        let mut out = [None; 3];
+        let (mut found, mut hidden, mut amb) = (false, false, false);
+        let mut waits: Vec<Bk> = Vec::new();
+        for ns in NSS {
+            let textual = if ns == Namespace::Macros { self.textual(f, u.pos, leaf) } else { Ok(None) };
+            let look = match textual {
+                Ok(Some(b)) => {
+                    let exported = self.w.decls.values().any(|d| d.macro_rules.iter().any(|r| r.def == b.def.key && r.export));
+                    Ok(Some(B { vis: if exported { Visibility::Public } else { b.vis }, ..b }))
+                }
+                Ok(None) => self.lookup(m, ns, leaf, me, m),
+                Err(wait) => Err(wait),
+            };
+            let look = match look {
+                Err(_) if stall => Ok(self.lookup_absent(m, ns, leaf, me, m)),
+                r => r,
+            };
+            let look = match look {
+                Ok(None) if ns == Namespace::Types => Ok(self.outer(leaf)),
+                r => r,
+            };
+            match look {
+                Err(wait) => waits.extend(wait),
+                Ok(None) => {}
+                Ok(Some(b)) if !self.visible(b.vis, m) => hidden = true,
+                Ok(Some(b)) if b.amb => amb = true,
+                Ok(Some(b)) => {
+                    found = true;
+                    out[ns_at(ns)] = Some(B { def: b.def, vis: self.narrower(ivis, b.vis, m), amb: false });
+                }
+            }
+        }
+        Ok(if amb {
             Imp::Failed(Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsGlob))
         } else if !waits.is_empty() {
             return Err((waits, out));

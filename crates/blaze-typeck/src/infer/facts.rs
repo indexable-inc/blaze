@@ -33,6 +33,8 @@ use crate::ids::{FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, UintTy};
 use crate::portable::{PNode, PTy, PTys};
 use crate::world::{AdtKind, PClause, Question, Reads, Shape, World};
 
+mod item_bounds;
+
 /// The solver's def of `<_ as trait_>::name`.
 pub fn assoc_def(trait_: ItemKey, name: Name) -> u128 {
     let mut lo = StableHasher::new("blaze-typeck assoc def lo");
@@ -749,6 +751,23 @@ impl<'a> FactCache<'a> {
         p
     }
 
+    /// The own type and const parameter count of trait `trait_`'s associated type `name`
+    /// (`Question::AssocGenerics`; the Reference, "Associated Types": "Associated types may
+    /// include generic parameters and where clauses"), `trait_generics` the count the
+    /// trait's definition gave when the caller holds it: an answer that counts the trait
+    /// differently is malformed. A world that keeps no count (`None`,
+    /// [`World::assoc_generics`]'s default) files none.
+    fn own_generics<W: World>(trait_: ItemKey, name: Name, trait_generics: Option<u32>, reads: &mut Reads<'_, '_, W>) -> Result<u32, Stop> {
+        match reads.assoc_generics(trait_, name)? {
+            Some(g) if trait_generics.is_some_and(|n| n != g.parent) => {
+                let trait_generics = trait_generics.unwrap_or(g.parent);
+                Err(CheckError::Malformed(Malformed::AssocGenerics { trait_, name, trait_generics, answered: g.parent }).into())
+            }
+            Some(g) => Ok(g.own),
+            None => Ok(0),
+        }
+    }
+
     fn fill_trait<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
         let q = Question::TraitDef(k);
         let Some(t) = reads.trait_def(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
@@ -783,9 +802,18 @@ impl<'a> FactCache<'a> {
             // In the records' order of the associated types, so equal answers of two types
             // do not cancel.
             bounds_digest = bounds_digest.rotate_left(1) ^ digest("blaze-typeck assoc bounds", &reads.digest(bq)?);
+            // Each written bound with its trait's supertraits, transitively (`type Error:
+            // Error;` under `trait Error: Sized + StdError` is a `StdError` too): the solver
+            // reads these as they are given (`item_bounds::elaborate_item_bounds`).
+            let supers_read = self.elaborate_item_bounds(start, reads)?;
+            bounds_digest = bounds_digest.rotate_left(1) ^ digest("blaze-typeck assoc bound supertraits", &supers_read);
+            // The associated type's own parameters (`type Out<T>;`), after the trait's: part
+            // of the trait's facts and of their digest.
+            let own_generics = Self::own_generics(k, a.name, Some(t.generics), reads)?;
+            bounds_digest = bounds_digest.rotate_left(1) ^ digest("blaze-typeck assoc generics", &u64::from(own_generics));
             self.assoc_tys.push(AssocTy {
                 def: SDef(d),
-                own_generics: 0,
+                own_generics,
                 bounds_start: (start - items) as u32,
                 bounds_len: (self.preds.len() - start) as u32,
                 default,
@@ -847,7 +875,10 @@ impl<'a> FactCache<'a> {
             let d = assoc_def(trait_, name);
             self.names.insert(d, (trait_, name));
             let value = self.ty(c, v)?;
-            self.impl_assoc.push(ImplAssoc { trait_item: SDef(d), value, own_generics: 0, is_default: false });
+            // An impl's `type Out<X> = ..;` has the parameters its trait declares for `Out`
+            // (the value is over the impl's generics, then those): the count is the trait's.
+            let own_generics = Self::own_generics(trait_, name, None, reads)?;
+            self.impl_assoc.push(ImplAssoc { trait_item: SDef(d), value, own_generics, is_default: false });
         }
         let assoc = Span::of(&self.impl_assoc, assoc);
         let wcc = self.table(Question::Predicates(k), wc.types);
@@ -981,8 +1012,13 @@ impl<'a> FactCache<'a> {
         // An associated type the cache named by `assoc_def`: its trait's generics.
         if let Some(&(trait_, _)) = self.names.get(&d) {
             self.fill_trait(trait_, reads)?;
-            let generics = self.traits.get(&trait_.0).map_or(0, |t| t.generics);
-            let digest = digest("blaze-typeck assoc", &ItemKey(d));
+            let row = self.traits.get(&trait_.0).copied();
+            let generics = row.map_or(0, |t| t.generics);
+            // Its own parameters, as the trait's facts filed them (`fill_trait`).
+            let own_generics = row.and_then(|t| t.assoc.get(&self.assoc_tys).iter().find(|a| a.def == SDef(d)).map(|a| a.own_generics)).unwrap_or(0);
+            // The count is part of what the associated type is: two traits' types never
+            // share `d`, but one type whose count changed is another answer.
+            let digest = digest("blaze-typeck assoc", &ItemKey(d)) ^ digest("blaze-typeck assoc own generics", &u64::from(own_generics));
             self.assoc.insert(
                 d,
                 AssocDef {
@@ -990,7 +1026,7 @@ impl<'a> FactCache<'a> {
                     trait_: Some(SDef(trait_.0)),
                     kind: AssocKind::Type,
                     parent_generics: generics,
-                    own_generics: 0,
+                    own_generics,
                     digest,
                 },
             );
@@ -1012,10 +1048,16 @@ impl<'a> FactCache<'a> {
             crate::world::AssocKind::Const => AssocKind::Const,
             crate::world::AssocKind::Type => AssocKind::Type,
         };
-        let digest = digest("blaze-typeck assoc parent", &p);
+        // A trait's associated type named by its own item: its own parameters as the world
+        // counts them. A fn's own generics are its signature's, not filed here.
+        let own_generics = match (kind, trait_) {
+            (AssocKind::Type, Some(t)) if t == SDef(p.container.0) => Self::own_generics(p.container, p.name, Some(generics), reads)?,
+            _ => 0,
+        };
+        let digest = digest("blaze-typeck assoc parent", &p) ^ digest("blaze-typeck assoc own generics", &u64::from(own_generics));
         self.assoc.insert(
             d,
-            AssocDef { container: SDef(p.container.0), trait_, kind, parent_generics: generics, own_generics: 0, digest },
+            AssocDef { container: SDef(p.container.0), trait_, kind, parent_generics: generics, own_generics, digest },
         );
         Ok(())
     }

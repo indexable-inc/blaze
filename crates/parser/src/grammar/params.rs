@@ -10,7 +10,7 @@ use super::*;
 
 // test_err empty_param_slot
 // fn f(y: i32, ,t: i32) {}
-pub(super) fn param_list_fn_def(p: &mut Parser<'_>, is_in_trait: bool) {
+pub(super) fn param_list_fn_def<S: Sink>(p: &mut Parser<'_, S>, is_in_trait: bool) {
     // Before the 2018 edition a method of a trait may leave its parameters unnamed, as
     // rustc's `parse_trait_item` passes `|edition| edition >= Edition::Edition2018` for
     // `req_name`.
@@ -18,11 +18,11 @@ pub(super) fn param_list_fn_def(p: &mut Parser<'_>, is_in_trait: bool) {
     list_(p, if unnamed { Flavor::TraitFn2015 } else { Flavor::FnDef });
 }
 
-pub(super) fn param_list_fn_ptr(p: &mut Parser<'_>) {
+pub(super) fn param_list_fn_ptr<S: Sink>(p: &mut Parser<'_, S>) {
     list_(p, Flavor::FnPointer);
 }
 
-pub(super) fn param_list_closure(p: &mut Parser<'_>) {
+pub(super) fn param_list_closure<S: Sink>(p: &mut Parser<'_, S>) {
     list_(p, Flavor::Closure);
 }
 
@@ -35,13 +35,13 @@ enum Flavor {
     Closure,
 }
 
-fn list_(p: &mut Parser<'_>, flavor: Flavor) {
+fn list_<S: Sink>(p: &mut Parser<'_, S>, flavor: Flavor) {
     // blaze: a closure's parameters end at a `|`, so no type in them is an error union
     // (`#![blaze::error_unions]`) unless parenthesized; the others are delimited.
     p.with_unions(flavor != Flavor::Closure, |p| list_in(p, flavor));
 }
 
-fn list_in(p: &mut Parser<'_>, flavor: Flavor) {
+fn list_in<S: Sink>(p: &mut Parser<'_, S>, flavor: Flavor) {
     use Flavor::*;
 
     let (bra, ket) = match flavor {
@@ -111,11 +111,11 @@ const PARAM_FIRST: TokenSet = patterns::PATTERN_FIRST.union(types::TYPE_FIRST);
 /// Whether a parameter may start here: [`PARAM_FIRST`], an attribute, or under
 /// `#![blaze::records]` the `{` of a record pattern (`|{ a, b }| a + b`) or of a record type
 /// (`fn({ a: u8 })`).
-fn at_param_first(p: &Parser<'_>) -> bool {
+fn at_param_first<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at_ts(PARAM_FIRST.union(OUTER_ATTR_FIRST)) || patterns::at_record_pat(p)
 }
 
-fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
+fn param<S: Sink>(p: &mut Parser<'_, S>, m: Marker, flavor: Flavor) {
     match flavor {
         // test param_list_vararg
         // extern "C" { fn printf(format: *const i8, ..., _: u8) -> i32; }
@@ -188,7 +188,7 @@ fn param(p: &mut Parser<'_>, m: Marker, flavor: Flavor) {
 /// rustc's `Parser::is_named_param`, asked of a parameter that may be a type alone: whether it
 /// starts `x:`, `&x:`, `&&x:` or `mut x:`, where `x` is any identifier, keywords and `_`
 /// included.
-fn is_named_param(p: &Parser<'_>) -> bool {
+fn is_named_param<S: Sink>(p: &Parser<'_, S>) -> bool {
     let offset = if p.at(T![&&]) {
         2
     } else if p.at(T![&]) || p.at(T![mut]) {
@@ -201,18 +201,18 @@ fn is_named_param(p: &Parser<'_>) -> bool {
 
 /// Whether a parameter starts `&mut x:`, which rustc's `is_named_param` misses: it parses `&mut x`
 /// as a type, fails at the `:` and reads it again as a pattern.
-fn is_ref_mut_named_param(p: &Parser<'_>) -> bool {
+fn is_ref_mut_named_param<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T![&]) && p.nth_at(1, T![mut]) && is_name_before_colon(p, 2)
 }
 
-fn is_name_before_colon(p: &Parser<'_>, n: usize) -> bool {
+fn is_name_before_colon<S: Sink>(p: &Parser<'_, S>, n: usize) -> bool {
     let name = p.nth(n);
     (name.is_any_identifier() || name == T![_])
         && p.nth_at(n + 1, T![:])
         && !p.nth_at(n + 1, T![::])
 }
 
-fn variadic_param(p: &mut Parser<'_>) -> bool {
+fn variadic_param<S: Sink>(p: &mut Parser<'_, S>) -> bool {
     if p.at(T![:]) && p.nth_at(1, T![...]) {
         p.bump(T![:]);
         p.bump(T![...]);
@@ -230,8 +230,8 @@ fn variadic_param(p: &mut Parser<'_>) -> bool {
 //     fn d(&'a mut self, x: i32) {}
 //     fn e(mut self) {}
 // }
-fn opt_self_param(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
-    let is_isolated_self = |p: &mut Parser<'_>, n| {
+fn opt_self_param<S: Sink>(p: &mut Parser<'_, S>, m: Marker) -> Result<(), Marker> {
+    let is_isolated_self = |p: &mut Parser<'_, S>, n| {
         // test non_isolated_self
         // fn f(self::S: S) {}
         // fn g(&self::S: &S) {}
@@ -300,7 +300,7 @@ fn opt_self_param(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
 /// blaze_verify's clauses are: no Rust program has a `.` after a `self` parameter, so every
 /// program rustc parses parses as before, and the borrow check refuses a view in a crate
 /// without the attribute (`hir_ty_borrowck::views`).
-fn self_view(p: &mut Parser<'_>) {
+fn self_view<S: Sink>(p: &mut Parser<'_, S>) {
     p.bump(T![.]);
     p.bump(T!['{']);
     while !p.at(EOF) && !p.at(T!['}']) {
@@ -319,7 +319,7 @@ fn self_view(p: &mut Parser<'_>) {
     p.expect(T!['}']);
 }
 
-fn self_as_name(p: &mut Parser<'_>) {
+fn self_as_name<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     p.bump(T![self]);
     m.complete(p, NAME);

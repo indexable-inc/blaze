@@ -658,6 +658,38 @@
    "recommended": "The dependencies architect's pieces 1 to 3 (docs/v2/plan/design/fetch.md, \"End state: dependencies on the command path\"): piece 1 is written and green; one writer has pieces 2 and 3.",
    "why": "The owner's `blaze check` in blaze's checkout: \"this build of blaze cannot read the workspace's 144 outside dependencies yet\". All 297 registry archives of blaze's lock are already in cargo's cache on this Mac (the architect's count), so the shortest correct route needs no network; nothing is trusted from the cache because the lock's checksum decides.",
    "state": "decided by the coordinator; assigned; the owner may veto reading cargo's cache"
+  },
+  {
+   "id": "D79",
+   "date": "2026-11-16",
+   "decision": "Parallelism and memory of a command (docs/v2/plan/design/parallel.md, \"End state\"): (1) no fibers for the pipeline's tasks: threads on bstd's work-stealing pool; a task that needs a record another task is writing claims or parks on that key in `blaze_core::claim_table`, or is restarted (its key fixes what it asks); (2) no global interner: a task interns in its own frame and each record carries its own canonical table; (3) a refused allocation is a typed `FrameFull { task, frame, asked, peak, reserve }` failing one job; the class is closed by a type (`A: NeverRefuses`, which a frame is not), reached by a typed handle and a lint first; (4) `claim_table` becomes the hashed core of bstd's `Flight` (one home for single flight); (5) the claim table is sized to twice the keys the request names; (6) the pieces that make heads frozen and `Sync` and put bodies on the pool go to the records writer after the records switch lands.",
+   "recommended": "The architect's thirteen pieces in its order; pieces 1, 3, 7, 13 to the driver's lane, 4 and 8 to the name solver's lane, 5 and 9 to 11 to the records writer.",
+   "why": "Measured: the front end runs on one thread (tempo: names 25.8 s, 20,000 bodies in 31.2 s); 18 workers give the names run only 2.3x because `Par::map` has no `Send`/`Sync` bound and every crate's names are leaked and stay live (2.3 GB); the command's one 64 MiB frame takes a path copy per task and a refusal is a panic.",
+   "state": "decided by the coordinator on the architect's recommendations; assigned"
+  },
+  {
+   "id": "D80",
+   "date": "2026-11-16",
+   "decision": "What an edit costs (docs/v2/plan/design/read-addressed.md, \"End state: what an edit costs\"): (1) `.blaze/v2/last` is replaced by one pointer per (tool, request shape) at `.blaze/v2/at/<hex16>`, 8 kept; (2) a file's surface hashes a per-item NAMES digest, not the signature hash, so a type edit re-solves no crate's names; (3) the type checker's read-list answer digest widens from 64 bits to 32 bytes before a read list is kept on disk or shared; (4) the repeat's 27.9 to 37 ms is split by measurement (stats, pointer read, answer pages) before a file-system journal is built. Parked as side work: deleting caches.md and blaze-certify. The outline is rebuilt as one tokenization plus an item-header recogniser (its lane's floor: 136 ms for the toolchain's library against 688 ms today), the old path kept only as the oracle until byte-equal.",
+   "recommended": "The architect's ten pieces; 1 to the driver's lane, 2 to a writer in blaze-file-items, 3 written (blaze-typeck replay.rs), 10 to the outline's lane.",
+   "why": "Measured on tempo: one `pub fn` edit costs 138.1 ms because `Outline::surface` hashes each item's signature; the impl index is rebuilt on every run (about 190 ms); no body's check result is kept or replayed; two builds of blaze in one checkout knock out each other's `last`.",
+   "state": "decided by the coordinator on the architect's recommendations; assigned"
+  },
+  {
+   "id": "D81",
+   "date": "2026-11-16",
+   "decision": "`blaze test` (docs/v2/plan/design/test.md, \"End state\"): (1) one forked process per test from a per-suite zygote, not tests in one process (a kept result must be a function of what the test entered and read; threads would share statics and the environment); (2) a test's result is a record at an address made from its id, its asks (each function entered, each outside read) and their answers; a pass at an equal address is reused; failures always run again; there is no retry: a pass and a failure at one address is a `Flaky` finding; (3) a test that starts a second thread selects by its static reach; (4) defaults: a 60 s deadline per test; doctests and `tests/` run by default; benches only with `--benches`; (5) blaze-run's in-memory `suite::Tests` and blaze-testsel are deleted once the plan, postings and head records are wired.",
+   "recommended": "The architect's eighteen pieces; 1 to 3 written (plan.rs, postings.rs, head.rs); 4, 5, 14 with writers; 6, 7, 16 to the driver's lane; 18 (a lib unit and its test unit share records) to the front end.",
+   "why": "`blaze test` ran no test: it checked, then started the package's `main`. The owner: \"need to be sota super fast\". Item grain against target grain: an edit reruns only the tests that entered the changed function.",
+   "state": "decided by the coordinator on the architect's recommendations; assigned; running real tests waits on the code builder"
+  },
+  {
+   "id": "D82",
+   "date": "2026-11-16",
+   "decision": "`blaze run` and `blaze build` (docs/v2/plan/design/run.md, \"End state\"): (1) the run path builds eagerly, files the manifest and image, and execs a launcher that maps signed segment files read-only and executable in place and enters `main`; the lazy compile-on-first-call machines stay only for later live patching; (2) code records live in the new crate blaze-code (record form, segment layout, image binding, the edit patch); (3) a dev run's image is bound at fixed addresses so an edit rewrites only the words posted under what moved; `blaze build`'s output keeps address randomisation; (4) on macOS the launcher uses the hardened runtime with library validation off and NO JIT entitlement, resting on a test that a signed segment maps executable; (5) nothing observed is in a key: `code_name` drops `hooks`.",
+   "recommended": "The architect's sixteen pieces; 3 and 4 written (blaze-code, uncompiled); 2 with a writer; 1 when the hello world's `main` builds on the new front end; 5 after blaze-code compiles.",
+   "why": "Today the program runs inside blaze's own process from code held in memory with literal addresses patched on every run; no code record is in the store; `blaze build` does not exist. Floor for a repeat run: about 5 ms to `main`.",
+   "state": "decided by the coordinator on the architect's recommendations; assigned; the owner may veto fixed addresses for dev runs (item 3)"
   }
  ]
 }

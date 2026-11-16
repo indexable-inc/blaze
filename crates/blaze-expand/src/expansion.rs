@@ -7,8 +7,9 @@ use blaze_own::{AVec, Alloc, Vec};
 use blaze_id::{ContentId, Portable};
 
 use crate::{
+    cx::{ExpandCx, HostError, Place, PlaceOf},
     error::{StreamError, Table},
-    tokens::{Sink, Text, TokenHygiene, TokenStream, Transparency, push_text},
+    tokens::{Edition, Sink, Text, TokenHygiene, TokenStream, Transparency, lex, push_text},
 };
 
 /// Where a token of an expansion came from: an index into one of the call's or the
@@ -253,6 +254,78 @@ impl<'a> Reads<'a> {
                 }
             }
         }
+    }
+}
+
+impl ReadAnswer {
+    /// What a read of the environment variable whose value is `value` records.
+    pub(crate) fn of_env(value: Option<&str>) -> ReadAnswer {
+        match value {
+            Some(value) => ReadAnswer::Digest(ContentId::of("blaze v2 expand env value 1", value.as_bytes())),
+            None => ReadAnswer::Absent,
+        }
+    }
+
+    /// What a read of a place answered `place` records.
+    pub(crate) fn of_place(place: Place<'_>) -> ReadAnswer {
+        match place {
+            Place::Number(value) => ReadAnswer::Number(value),
+            Place::Text(value) => ReadAnswer::Digest(ContentId::of("blaze v2 expand place 1", value.as_bytes())),
+        }
+    }
+}
+
+/// What asking a read list again found ([`Reads::hold`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Held {
+    /// Every read is answered today as it was.
+    Holds,
+    /// The read at `read` is answered otherwise today.
+    Moved { read: usize },
+    /// The read at `read` cannot be asked again by its subject (an included file is named by
+    /// where it is in the root, not by the path the call wrote; a proc macro's read is its
+    /// sandbox's): the expansion is not known unchanged, and is not kept ([`Reads::askable`]).
+    NotAskable { read: usize, kind: ReadKind },
+}
+
+impl Reads<'_> {
+    /// Whether every read can be asked again by [`Reads::hold`]: else the first that cannot.
+    pub fn askable(&self) -> Result<(), (usize, ReadKind)> {
+        for (read, it) in self.list.iter().enumerate() {
+            match it.kind {
+                ReadKind::Env | ReadKind::Cfg | ReadKind::Line | ReadKind::Column | ReadKind::File | ReadKind::ModulePath => {}
+                kind @ (ReadKind::IncludeStr | ReadKind::IncludeBytes | ReadKind::ProcMacro) => return Err((read, kind)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Asks `cx` each read again, in the order they were made, and stops at the first that is
+    /// answered otherwise: a kept expansion is today's only when this says [`Held::Holds`]. A
+    /// cfg read's subject is its predicate's text, lexed again in `edition` (the call's).
+    pub fn hold(&self, cx: &impl ExpandCx, edition: Edition, alloc: Alloc<'_>) -> Result<Held, HostError> {
+        for (read, it) in self.list.iter().enumerate() {
+            let subject = self.subject(it);
+            let place = |what: PlaceOf| cx.place(what).map(ReadAnswer::of_place);
+            let today = match it.kind {
+                ReadKind::Env => ReadAnswer::of_env(cx.env(subject)?),
+                ReadKind::Cfg => match lex(subject, edition, alloc) {
+                    Ok(predicate) => ReadAnswer::Bool(cx.cfg(&predicate)?),
+                    Err(_) => return Ok(Held::NotAskable { read, kind: it.kind }),
+                },
+                ReadKind::Line => place(PlaceOf::Line)?,
+                ReadKind::Column => place(PlaceOf::Column)?,
+                ReadKind::File => place(PlaceOf::File)?,
+                ReadKind::ModulePath => place(PlaceOf::ModulePath)?,
+                kind @ (ReadKind::IncludeStr | ReadKind::IncludeBytes | ReadKind::ProcMacro) => {
+                    return Ok(Held::NotAskable { read, kind });
+                }
+            };
+            if today != it.answer {
+                return Ok(Held::Moved { read });
+            }
+        }
+        Ok(Held::Holds)
     }
 }
 

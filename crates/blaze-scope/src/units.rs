@@ -241,7 +241,7 @@ pub fn unit_crates<'a>(
     for (at, u) in units.iter().enumerate() {
         // A member's test unit is a root too (the graph makes one only when tests are asked:
         // `Ask::tests`): left out, `--tests` solved no unit with `test` in its cfg.
-        if members.contains(&u.package) && !u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. }) {
+        if members.contains(&u.package) && !u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Example(_) | UnitKind::Bench(_)) {
             todo.push(at);
         }
     }
@@ -255,7 +255,7 @@ pub fn unit_crates<'a>(
         }
     }
     let kept = |u: &Unit<'_>| {
-        u.kind == UnitKind::ProcMacro || (!u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. }))
+        u.kind == UnitKind::ProcMacro || (!u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Example(_) | UnitKind::Bench(_)))
     };
     let blaze = units
         .iter()
@@ -445,6 +445,8 @@ fn unit_key(u: &Unit<'_>, source: &str, alloc: Alloc<'_>) -> CrateItemKey {
     let bin = match &u.kind {
         // A binary's test unit is keyed by its binary too: two of one package are two crates.
         UnitKind::Bin(name) | UnitKind::Test { bin: Some(name) } => name.as_str(),
+        // Two integration tests (or examples, benches) of one package are two crates.
+        UnitKind::IntegrationTest(x) | UnitKind::Example(x) | UnitKind::Bench(x) => x.name.as_str(),
         _ => "",
     };
     for part in [u.name.as_str(), u.version.as_str(), source, kind_name(&u.kind), bin] {
@@ -516,7 +518,9 @@ fn kind_name(kind: &UnitKind<'_>) -> &'static str {
         UnitKind::ProcMacro => "proc-macro",
         UnitKind::Bin(_) => "bin",
         UnitKind::BuildScript => "build script",
-        UnitKind::Test { .. } => "test",
+        UnitKind::Test { .. } | UnitKind::IntegrationTest(_) => "test",
+        UnitKind::Example(_) => "example",
+        UnitKind::Bench(_) => "bench",
     }
 }
 

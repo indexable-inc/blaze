@@ -45,13 +45,18 @@ pub fn want_of_item<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey
 
 /// The want for checker key `key`: its own item's, or a member's container's.
 pub fn want_of_key<'n, S: super::source::NamesSource<'n>>(names: S, keys: &Keys, key: ItemKey) -> Result<Want, FillError> {
-    let container = match keys.origin(key).ok_or(FillError::UnknownKey(key))? {
-        Origin::Item(lib) => return want_of_item(names, *lib),
-        Origin::Member { container, .. } => *container,
+    // A key in no row of the map is asked of the source (`Keys::library_in`: over records the
+    // map is not filled up front; over the solved names the answer is `None` and the key is
+    // unknown, as before).
+    let container = match keys.origin(key) {
+        Some(Origin::Item(lib)) => return want_of_item(names, *lib),
+        Some(Origin::Member { container, .. }) => *container,
+        None => return want_of_item(names, keys.library_in(names, key).ok_or(FillError::UnknownKey(key))?),
     };
-    match keys.origin(container).ok_or(FillError::UnknownKey(container))? {
-        Origin::Item(lib) => want_of_item(names, *lib),
-        Origin::Member { .. } => Err(FillError::UnknownKey(container)),
+    match keys.origin(container) {
+        Some(Origin::Item(lib)) => want_of_item(names, *lib),
+        Some(Origin::Member { .. }) => Err(FillError::UnknownKey(container)),
+        None => want_of_item(names, keys.library_in(names, container).ok_or(FillError::UnknownKey(container))?),
     }
 }
 
@@ -65,7 +70,8 @@ pub fn want_of<'n, S: super::source::NamesSource<'n>>(names: S, keys: &Keys, q: 
         | Question::TraitDef(k)
         | Question::AssocParent(k)
         | Question::Attrs(k)
-        | Question::AssocItem(k, _) => want_of_key(names, keys, k),
+        | Question::AssocItem(k, _)
+        | Question::AssocGenerics(k, _) => want_of_key(names, keys, k),
         _ => Err(FillError::NotAHead(q)),
     }
 }

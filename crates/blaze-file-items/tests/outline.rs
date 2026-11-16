@@ -887,3 +887,72 @@ fn the_oracle_catches_a_hash_of_file_positions() {
         insert_at_top_moves_only_places,
     );
 }
+
+/// The surface is a digest of what a file's entries name, not of their types
+/// (docs/v2/plan/design/read-addressed.md, "End state: what an edit costs", piece 2; the list of
+/// what the name solver reads is in src/names_digest.rs). A parameter's type, a field's, a
+/// where clause, a body and a comment name nothing: the surface stays equal, while the signature
+/// digest of `fn f(x: u8)` against `fn f(x: u16)` moves. Each edit that can change a name moves
+/// it: a rename; `pub`; an attribute (the Reference, "Attributes": `cfg` can remove the item,
+/// `derive` adds items); a variant (a name in the type and value namespaces: the Reference,
+/// "Enumerations"); `struct S;` to `struct S {}` (the Reference, "Structs": a unit or tuple
+/// struct also defines a constant or constructor in the value namespace, a braced one does not);
+/// a member; a `use`; a `macro_rules!` body (its expansion's items). Under a derive or an
+/// attribute macro the whole item is the macro's input, so a field's type there, or a body,
+/// moves it. A wrong fix fails here either way: the old surface (signature digests) moves on the
+/// type edits; a digest of the name alone stays on the attribute, form and macro edits.
+///
+/// Prints `names digest: 6 edits kept the surface, 11 moved it`.
+#[test]
+fn a_type_edit_keeps_the_surface_and_a_name_edit_moves_it() {
+    let (before, after) = (parse("fn f(x: u8) {}\n"), parse("fn f(x: u16) {}\n"));
+    assert_eq!(before.surface(), after.surface(), "a parameter's type moved the surface");
+    assert_ne!(
+        before.items()[0].signature_hash,
+        after.items()[0].signature_hash,
+        "a parameter's type left the signature digest equal"
+    );
+    let keeps: [(&str, &str, &str); 5] = [
+        ("a comment and a blank line above an item", "struct S;\nfn f() {}\n", "struct S;\n\n// a note\nfn f() {}\n"),
+        ("a body edit", "fn f() -> u8 { 1 }\n", "fn f() -> u8 { 2 + 3 }\n"),
+        ("a field's type", "struct S { a: u8 }\n", "struct S { a: u16 }\n"),
+        ("a where clause", "fn f<T>(t: T) {}\n", "fn f<T>(t: T) where T: Copy {}\n"),
+        (
+            "a body under a tool's attribute on an impl's member",
+            "struct S;\nimpl S {\n    #[tracing::instrument]\n    fn a(&self) { x() }\n}\n",
+            "struct S;\nimpl S {\n    #[tracing::instrument]\n    fn a(&self) { y() }\n}\n",
+        ),
+    ];
+    let moves: [(&str, &str, &str); 11] = [
+        ("renaming `f`", "fn f(x: u8) {}\n", "fn g(x: u8) {}\n"),
+        ("adding `pub`", "fn f(x: u8) {}\n", "pub fn f(x: u8) {}\n"),
+        ("adding `#[derive(Clone)]` to a struct", "struct S { a: u8 }\n", "#[derive(Clone)]\nstruct S { a: u8 }\n"),
+        ("adding a variant to an enum", "enum E { A, B }\n", "enum E { A, B, C }\n"),
+        ("turning `struct S;` into `struct S {}`", "struct S;\n", "struct S {}\n"),
+        (
+            "adding a method to an impl",
+            "struct S;\nimpl S { fn a(&self) {} }\n",
+            "struct S;\nimpl S { fn a(&self) {} fn b(&self) {} }\n",
+        ),
+        ("adding a `use`", "fn f() {}\n", "use core::mem;\nfn f() {}\n"),
+        (
+            "changing a `macro_rules!` body",
+            "macro_rules! m { () => { struct A; }; }\n",
+            "macro_rules! m { () => { struct B; }; }\n",
+        ),
+        ("adding `#[cfg(test)]` to an item", "fn f() {}\n", "#[cfg(test)]\nfn f() {}\n"),
+        (
+            "a field's type under a derive",
+            "#[derive(Clone)]\nstruct S { a: u8 }\n",
+            "#[derive(Clone)]\nstruct S { a: u16 }\n",
+        ),
+        ("a body under an attribute macro", "#[tokio::main]\nfn f() { a() }\n", "#[tokio::main]\nfn f() { b() }\n"),
+    ];
+    for (what, old, new) in keeps {
+        assert_eq!(parse(old).surface(), parse(new).surface(), "{what} moved the surface:\n{old}\nto\n{new}");
+    }
+    for (what, old, new) in moves {
+        assert_ne!(parse(old).surface(), parse(new).surface(), "{what} left the surface equal:\n{old}\nto\n{new}");
+    }
+    println!("names digest: {} edits kept the surface, {} moved it", keeps.len() + 1, moves.len());
+}

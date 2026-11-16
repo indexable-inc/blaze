@@ -19,7 +19,7 @@ const PAT_TOP_FIRST: TokenSet = PATTERN_FIRST.union(TokenSet::new(&[T![|]]));
 
 /// Whether the parser is at a record pattern `{ a, b: x, .. }` (`#![blaze::records]`), which
 /// [`PATTERN_FIRST`] cannot say: a `{` starts a pattern only under the extension.
-pub(super) fn at_record_pat(p: &Parser<'_>) -> bool {
+pub(super) fn at_record_pat<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['{']) && p.records_gate()
 }
 
@@ -28,17 +28,17 @@ const RANGE_PAT_END_FIRST: TokenSet =
     expressions::LITERAL_FIRST.union(paths::PATH_FIRST).union(TokenSet::new(&[T![-], T![const]]));
 
 /// Parses a pattern list separated by pipes `|`.
-pub(crate) fn pattern(p: &mut Parser<'_>) {
+pub(crate) fn pattern<S: Sink>(p: &mut Parser<'_, S>) {
     pattern_r(p, PAT_RECOVERY_SET);
 }
 
-pub(crate) fn pattern_single(p: &mut Parser<'_>) {
+pub(crate) fn pattern_single<S: Sink>(p: &mut Parser<'_, S>) {
     pattern_single_r(p, PAT_RECOVERY_SET);
 }
 
 /// Parses a pattern list separated by pipes `|`
 /// using the given `recovery_set`.
-pub(super) fn pattern_top_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
+pub(super) fn pattern_top_r<S: Sink>(p: &mut Parser<'_, S>, recovery_set: TokenSet) {
     pattern_r(p, recovery_set);
 }
 
@@ -51,7 +51,7 @@ pub(super) fn pattern_top_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
 /// (`guard_patterns`): rustc's `parse_pat_allow_top_guard`, for the elements of tuple, slice and
 /// tuple struct patterns, a struct pattern's field after its `:`, `builtin#deref` and a `for`
 /// loop's pattern. A match arm's guard is the arm's, not its pattern's.
-pub(crate) fn pattern_top_guard(p: &mut Parser<'_>) {
+pub(crate) fn pattern_top_guard<S: Sink>(p: &mut Parser<'_, S>) {
     let pat = pattern_r(p, PAT_RECOVERY_SET);
     if p.at(T![if]) {
         let m = match pat {
@@ -77,7 +77,7 @@ pub(crate) fn pattern_top_guard(p: &mut Parser<'_>) {
 // }
 /// Parses a pattern list separated by pipes `|`, with no leading `|`,using the
 /// given `recovery_set`.
-fn pattern_r(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMarker> {
+fn pattern_r<S: Sink>(p: &mut Parser<'_, S>, recovery_set: TokenSet) -> Option<CompletedMarker> {
     let m = p.start();
     let has_leading_pipe = p.eat(T![|]);
 
@@ -95,15 +95,15 @@ fn pattern_r(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMark
 
 /// A pattern without a top-level `|`, and the operator of the range pattern it is, if it is
 /// one.
-fn pattern_single_r(
-    p: &mut Parser<'_>,
+fn pattern_single_r<S: Sink>(
+    p: &mut Parser<'_, S>,
     recovery_set: TokenSet,
 ) -> (Option<CompletedMarker>, Option<SyntaxKind>) {
     stdx::ensure_sufficient_stack(|| pattern_single_r_here(p, recovery_set))
 }
 
-fn pattern_single_r_here(
-    p: &mut Parser<'_>,
+fn pattern_single_r_here<S: Sink>(
+    p: &mut Parser<'_, S>,
     recovery_set: TokenSet,
 ) -> (Option<CompletedMarker>, Option<SyntaxKind>) {
     // test range_pat
@@ -259,13 +259,13 @@ fn pattern_single_r_here(
 
 /// rustc's `ban_pat_range_if_ambiguous`, after `&` or `box`: a range pattern but one written
 /// with `...` needs parentheses. The error is at the end of the range pattern.
-fn ban_pat_range_if_ambiguous(p: &mut Parser<'_>, range_op: Option<SyntaxKind>) {
+fn ban_pat_range_if_ambiguous<S: Sink>(p: &mut Parser<'_, S>, range_op: Option<SyntaxKind>) {
     if matches!(range_op, Some(T![..=] | T![..])) {
         p.error("the range pattern here has ambiguous interpretation");
     }
 }
 
-fn builtin_pat(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+fn builtin_pat<S: Sink>(p: &mut Parser<'_, S>) -> Option<CompletedMarker> {
     let m = p.start();
     p.bump_remap(T![builtin]);
     p.bump(T![#]);
@@ -304,7 +304,7 @@ const PAT_RECOVERY_SET: TokenSet = TokenSet::new(&[
     T![&],
 ]);
 
-fn atom_pat(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMarker> {
+fn atom_pat<S: Sink>(p: &mut Parser<'_, S>, recovery_set: TokenSet) -> Option<CompletedMarker> {
     if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
         return builtin_pat(p);
     }
@@ -350,7 +350,7 @@ fn atom_pat(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMarke
     Some(m)
 }
 
-fn is_literal_pat_start(p: &Parser<'_>) -> bool {
+fn is_literal_pat_start<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T![-]) && (p.nth(1) == INT_NUMBER || p.nth(1) == FLOAT_NUMBER)
         || p.at_ts(expressions::LITERAL_FIRST)
 }
@@ -364,7 +364,7 @@ fn is_literal_pat_start(p: &Parser<'_>) -> bool {
 //         "hello" => (),
 //     }
 // }
-fn literal_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn literal_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(is_literal_pat_start(p));
     let m = p.start();
     p.eat(T![-]);
@@ -379,7 +379,7 @@ fn literal_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //     let Bar { .. } = ();
 //     let Bar(..) = ();
 // }
-fn path_or_macro_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn path_or_macro_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(paths::is_path_start(p));
     let m = p.start();
     paths::expr_path(p);
@@ -413,7 +413,7 @@ fn path_or_macro_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //     let S(_, .. , x) = ();
 //     let S(| a) = ();
 // }
-fn tuple_pat_fields(p: &mut Parser<'_>) {
+fn tuple_pat_fields<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['(']));
     p.bump(T!['(']);
     pat_list(p, T![')']);
@@ -426,7 +426,7 @@ fn tuple_pat_fields(p: &mut Parser<'_>) {
 //     let S { x: 1 } = ();
 //     let S { #[cfg(any())] x: 1 } = ();
 // }
-fn record_pat_field(p: &mut Parser<'_>) {
+fn record_pat_field<S: Sink>(p: &mut Parser<'_, S>) {
     match p.current() {
         IDENT | INT_NUMBER if p.nth(1) == T![:] => {
             name_ref_or_index(p);
@@ -466,7 +466,7 @@ fn record_pat_field(p: &mut Parser<'_>) {
 //     let S { h: _, } = ();
 //     let S { #[cfg(any())] .. } = ();
 // }
-fn record_pat_field_list(p: &mut Parser<'_>) {
+fn record_pat_field_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.bump(T!['{']);
@@ -499,7 +499,7 @@ fn record_pat_field_list(p: &mut Parser<'_>) {
 
 // test placeholder_pat
 // fn main() { let _ = (); }
-fn wildcard_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn wildcard_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![_]));
     let m = p.start();
     p.bump(T![_]);
@@ -529,7 +529,7 @@ fn wildcard_pat(p: &mut Parser<'_>) -> CompletedMarker {
 // }
 /// `&pat`, `&mut pat`, `&pin const pat` and `&pin mut pat` (rustc's `parse_pat_deref`, with
 /// `parse_pin_and_mut`), and under `#![blaze::uniq]` `&uniq pat`.
-fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn ref_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![&]));
     let m = p.start();
     p.bump(T![&]);
@@ -551,7 +551,7 @@ fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
 // fn main() {
 //     let (!a | !&0) = ();
 // }
-fn not_null_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn not_null_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![!]));
     let m = p.start();
     p.bump(T![!]);
@@ -567,7 +567,7 @@ fn not_null_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //     let () = ();
 //     let (| a | a, | b) = ((),());
 // }
-fn tuple_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn tuple_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T!['(']));
     let m = p.start();
     p.bump(T!['(']);
@@ -607,7 +607,7 @@ fn tuple_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //     let [a, b, ..] = [];
 //     let [| a, ..] = [];
 // }
-fn slice_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn slice_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T!['[']));
     let m = p.start();
     p.bump(T!['[']);
@@ -616,7 +616,7 @@ fn slice_pat(p: &mut Parser<'_>) -> CompletedMarker {
     m.complete(p, SLICE_PAT)
 }
 
-fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
+fn pat_list<S: Sink>(p: &mut Parser<'_, S>, ket: SyntaxKind) {
     while !p.at(EOF) && !p.at(ket) {
         pattern_top_guard(p);
         if !p.eat(T![,]) {
@@ -639,7 +639,7 @@ fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
 //     let e @ _ = ();
 //     let ref mut f @ g @ _ = ();
 // }
-fn ident_pat(p: &mut Parser<'_>, with_at: bool) -> CompletedMarker {
+fn ident_pat<S: Sink>(p: &mut Parser<'_, S>, with_at: bool) -> CompletedMarker {
     assert!(matches!(p.current(), T![ref] | T![mut] | IDENT));
     let m = p.start();
     if p.eat(T![ref]) && !p.eat(T![mut]) && uniq::at_ref_binding(p) {
@@ -661,7 +661,7 @@ fn ident_pat(p: &mut Parser<'_>, with_at: bool) -> CompletedMarker {
 //     let box Outer { box i, j: box Inner(box &x) } = ();
 //     let box ref mut i = ();
 // }
-fn box_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn box_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![box]));
     let m = p.start();
     p.bump(T![box]);
@@ -683,7 +683,7 @@ fn box_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //
 //     let (const { () },) = ();
 // }
-fn const_block_pat(p: &mut Parser<'_>) -> CompletedMarker {
+fn const_block_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![const]));
     let m = p.start();
     p.bump(T![const]);

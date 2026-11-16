@@ -18,10 +18,12 @@
 //! - **[`ClaimTable::publish`]** stores the value, then swaps the waiter stack for CLOSED and
 //!   returns every task that was on it ([`Woken`]), each with its edge cleared. A push before
 //!   the swap is in what it returns; a push after it sees CLOSED and reads the value: no waiter
-//!   is lost (the test `no_waiter_is_lost`, and its planted load-then-store close).
+//!   is lost (`claims_waits_and_cycles_hold_on_drawn_schedules`; its control
+//!   `the_oracle_catches_a_close_by_load`).
 //! - **Two tasks closing one cycle at once**: each stores its edge before it reads the other's
-//!   (all SeqCst), so at least one of them sees the cycle (the test `a_cycle_is_seen`, and its
-//!   planted walk-before-edge).
+//!   (all SeqCst), so at least one of them sees the cycle (the same drawn test; its control
+//!   `the_oracle_catches_a_walk_before_the_edge`). One claim of a new key owns it (control
+//!   `the_oracle_catches_a_reservation_by_store`).
 //! - **Orderings**: every operation is SeqCst. A claim, a wait and a publish are a few atomic
 //!   operations on 10 us to 10 ms tasks, and the cycle argument needs a single total order.
 //! - **Bounded** (rule 18): a probe visits at most every slot; a wait on a key still being
@@ -416,7 +418,7 @@ impl<A: Allocator> Iterator for Chain<'_, A> {
 #[cfg(all(test, not(blaze_check)))]
 mod tests {
     //! Run: `blaze test -p blaze-core claim_table` (or cargo's). Every test prints nothing on a
-    //! pass; `cargo test` reports `test claim_table::tests::... ok` for each of the seven.
+    //! pass; `cargo test` reports `test claim_table::tests::... ok` for each of the six.
 
     use std::alloc::Global;
 

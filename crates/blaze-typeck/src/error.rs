@@ -51,6 +51,10 @@ pub enum Malformed {
     BreakTarget(ExprId),
     /// A hole (`_`) in a type the world answered.
     HoleInAnswer,
+    /// The world's `Question::AssocGenerics(trait_, name)` counts `answered` parameters for
+    /// the trait where its `Question::TraitDef` says `trait_generics`: two answers about one
+    /// trait that disagree.
+    AssocGenerics { trait_: crate::ids::ItemKey, name: crate::ids::Name, trait_generics: u32, answered: u32 },
     /// The world answered "no such item" for an item the solver named: a trait that is no
     /// trait, an impl with no header, an ADT with no definition.
     NoRecord(Question),

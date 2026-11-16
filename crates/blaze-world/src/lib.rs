@@ -394,7 +394,9 @@ fn kind_name(kind: &UnitKind<'_>) -> &'static str {
         UnitKind::ProcMacro => "proc-macro",
         UnitKind::Bin(_) => "binary",
         UnitKind::BuildScript => "build-script",
-        UnitKind::Test { .. } => "test",
+        UnitKind::Test { .. } | UnitKind::IntegrationTest(_) => "test",
+        UnitKind::Example(_) => "example",
+        UnitKind::Bench(_) => "bench",
     }
 }
 
@@ -404,7 +406,12 @@ fn kind_name(kind: &UnitKind<'_>) -> &'static str {
 /// proc macro. A build script is the host's build: not held.
 fn held(kind: &UnitKind<'_>, for_host: bool) -> bool {
     match kind {
-        UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. } => !for_host,
+        UnitKind::Lib
+        | UnitKind::Bin(_)
+        | UnitKind::Test { .. }
+        | UnitKind::IntegrationTest(_)
+        | UnitKind::Example(_)
+        | UnitKind::Bench(_) => !for_host,
         UnitKind::ProcMacro => true,
         UnitKind::BuildScript => false,
     }

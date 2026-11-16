@@ -3365,3 +3365,5 @@ mod wide;
 mod index;
 mod fmt;
 mod coroutines;
+#[cfg(target_arch = "aarch64")]
+mod coroutines_emit;

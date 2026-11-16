@@ -327,11 +327,17 @@ fn macro_for<'m>(modules: &'m [ModuleRecord], text: &str, call: &Call, name: &st
     Some((module, module.find(kind, name)?))
 }
 
+/// The parts' clock: nanoseconds since its first call.
+fn clock() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
 /// One pass over `checkout`: every call expanded, from the records in `records` when they
 /// hold it.
 fn pass(checkout: &Path, modules: &[ModuleRecord], records: &Path, label: &str, show: bool) -> BTreeMap<String, Stats> {
     let edition = Edition::E2024;
-    let runtime = Runtime::new().expect("the runtime");
+    let runtime = Runtime::timed(clock).expect("the runtime");
     let store = expansion_records(records);
     let mut loaded: BTreeMap<String, std::sync::Arc<Loaded>> = BTreeMap::new();
     let mut stats: BTreeMap<String, Stats> = BTreeMap::new();
@@ -475,6 +481,12 @@ fn pass(checkout: &Path, modules: &[ModuleRecord], records: &Path, label: &str, 
         per(t_key + t_find),
         (t_key + t_find).as_secs_f64() / (t_key + t_read_one + t_decode).as_secs_f64().max(1e-12)
     );
+    // A run's own parts (`Runtime::expand`'s rows).
+    for row in runtime.parts().rows() {
+        if row.entered != 0 {
+            println!("{label}: run part {:<12} {:>9.1} ms  entered {:>8} ({:>8.2} us each)", row.part.name(), row.nanos as f64 / 1e6, row.entered, row.nanos as f64 / 1e3 / row.entered as f64);
+        }
+    }
     for (name, s) in &stats {
         let failed: u32 = s.failed.values().sum();
         println!(

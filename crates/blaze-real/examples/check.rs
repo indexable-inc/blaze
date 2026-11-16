@@ -72,7 +72,7 @@ const EDITION: Edition = Edition::E2024;
 // The world, timed: every question the checker asks, counted and timed by kind, then answered
 // by the front end's world. Harness counters only; the checker is unchanged.
 
-const KINDS: usize = 20;
+const KINDS: usize = 21;
 
 fn kind_of(q: &Question) -> usize {
     match q {
@@ -95,12 +95,13 @@ fn kind_of(q: &Question) -> usize {
         Question::ConstHolds(..) => 16,
         Question::ConstParams(_) => 17,
         Question::Closure(..) => 19,
+        Question::AssocGenerics(..) => 20,
     }
 }
 
 const KIND_NAMES: [&str; KINDS] = [
     "FnSig", "Predicates", "Adt", "ImplsOf", "ImplHeader", "Inherent", "AssocItem", "TraitsInScope", "Path", "Lang",
-    "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "prefetch", "Closure",
+    "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "prefetch", "Closure", "AssocGenerics",
 ];
 
 struct Tally {
@@ -187,6 +188,9 @@ impl<W: World> World for Timed<'_, W> {
     }
     fn const_params(&self, seal: Seal, item: ItemKey) -> Fetch<blaze_typeck::ConstParams<'_>> {
         self.time(17, || self.inner.const_params(seal, item))
+    }
+    fn assoc_generics(&self, seal: Seal, trait_: ItemKey, name: blaze_typeck::Name) -> Fetch<Option<blaze_typeck::AssocGenerics>> {
+        self.time(20, || self.inner.assoc_generics(seal, trait_, name))
     }
     fn prefetch(&self, seal: Seal, questions: &[Question]) {
         self.time(18,|| self.inner.prefetch(seal, questions))

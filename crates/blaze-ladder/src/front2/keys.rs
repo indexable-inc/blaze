@@ -152,6 +152,22 @@ impl Keys {
         }
     }
 
+    /// [`Keys::library`] for code that reads its names from a source `S`: a key this map holds
+    /// no row for is asked of the source ([`super::source::NamesSource::key_beginning`]). Over
+    /// records the map is not filled when the front end is made (`Front2::from_records` files
+    /// nothing), so an item's, a module's or a variant's library key is found from the checker
+    /// key itself, by one search in its crate's records; a member's key (filed here when its
+    /// container's head is made) is in no record's table and is `None`, as over the solved
+    /// names. Two library keys under one checker key are refused where the source finds them
+    /// (`source::SourceError::KeysBeginAlike`).
+    pub fn library_in<'n, S: super::source::NamesSource<'n>>(&self, names: S, key: ItemKey) -> Option<LibKey> {
+        match self.origins.get(&key) {
+            Some(Origin::Item(k)) => Some(*k),
+            Some(Origin::Member { .. }) => None,
+            None => names.key_beginning(key.0.to_be_bytes()),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.origins.len()
     }

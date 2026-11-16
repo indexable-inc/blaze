@@ -112,6 +112,23 @@ pub trait Types {
         self.ty(view, t, tys).map(ConstTerm::Is)
     }
 
+    /// A body path THROUGH a type alias whose aliased type fixes arguments (`type Call<P, C> =
+    /// Raw<P, C, u8>;` then `Call::new(..)`, `Call { .. }`). The Reference, "Type aliases": "A
+    /// type alias defines a new name for an existing type": the path means what it would with
+    /// the aliased type written, the alias's own parameters substituted. `path` is a plain
+    /// path of `view` (no anchor, no lang item); `written[i]` are the generic arguments of
+    /// its `i`th segment as converted (empty when none are written). When the caller's names
+    /// say one of its segments names such an alias, the caller gives `out` the arguments of
+    /// the ALIASED type's path in order (the alias's parameters replaced by the written
+    /// arguments, or each by a hole `_` when none are written) and returns that segment's
+    /// index: [`to_typeck`] writes them as that segment's arguments, and the caller's world
+    /// answers the segment with the aliased type's definition. `None` (the default: a caller
+    /// that resolves no name): the path is converted as written.
+    fn alias_args(&mut self, view: &View<'_>, path: PathIdx, written: &[&[PTy]], tys: &mut PortableTys<'_>, out: &mut dyn FnMut(PTy)) -> Result<Option<u32>, Refused> {
+        let _ = (view, path, written, tys, out);
+        Ok(None)
+    }
+
     /// Whether this caller READS [`TypeckBody::const_gaps`] and reports a body with one as
     /// not checked clean. Only then is a gap a hole and the body converted; otherwise
     /// (the default) a gap is the body's refusal by name ([`ConstGapWhy::refusal`]), as
@@ -673,6 +690,28 @@ impl Conv<'_, '_, '_, '_, '_> {
             rest = after;
         }
         self.push_segments(rest, r, &mut segs)?;
+        // A segment naming a type alias whose aliased type fixes arguments takes the aliased
+        // type's arguments ([`Types::alias_args`]: the alias expanded at the path).
+        if anchor.is_none() {
+            let lead = segs.len() - rest.len();
+            let mut expanded: AVec<'_, PTy> = Vec::new_in(*self.out.type_lists.allocator());
+            let named = {
+                let mut written: AVec<'_, &[PTy]> = Vec::new_in(*self.out.type_lists.allocator());
+                for s in &segs[lead..] {
+                    let (from, to) = (s.generic_args.start as usize, s.generic_args.start as usize + s.generic_args.len as usize);
+                    let Some(args) = self.out.type_lists.get(from..to) else { return self.refuse("a segment's arguments past the body's lists", r) };
+                    written.push(args);
+                }
+                self.types.alias_args(self.v, p, &written, self.tys, &mut |t| expanded.push(t))?
+            };
+            if let Some(i) = named {
+                let Some(seg) = segs.get_mut(lead + i as usize) else { return self.refuse("a type alias's segment past its path", r) };
+                let start = len(self.out.type_lists.len());
+                self.out.type_lists.extend_from_slice(&expanded);
+                seg.generic_args = List { start, len: len(expanded.len()) };
+                seg.has_args = !expanded.is_empty();
+            }
+        }
         let start = len(self.out.segments.len());
         self.out.segments.extend_from_slice(&segs);
         let at = PathIdx(len(self.out.paths.len()));

@@ -15,18 +15,18 @@
 use super::*;
 
 /// Whether the parser is at a clause's keyword, or at the end of a clause list.
-fn at_clause_boundary(p: &Parser<'_>) -> bool {
+fn at_clause_boundary<S: Sink>(p: &Parser<'_, S>) -> bool {
     matches!(p.current(), EOF | T!['{'] | T![;] | T!['}']) || at_clause_kw(p, 0)
 }
 
 /// The clause keyword the parser is at.
-fn clause_kw(p: &Parser<'_>) -> Option<SyntaxKind> {
+fn clause_kw<S: Sink>(p: &Parser<'_, S>) -> Option<SyntaxKind> {
     [T![requires], T![recommends], T![ensures], T![decreases], T![invariant]]
         .into_iter()
         .find(|&kw| p.at_contextual_kw(kw))
 }
 
-pub(super) fn at_clause_kw(p: &Parser<'_>, n: usize) -> bool {
+pub(super) fn at_clause_kw<S: Sink>(p: &Parser<'_, S>, n: usize) -> bool {
     p.nth_at_contextual_kw(n, T![requires])
         || p.nth_at_contextual_kw(n, T![recommends])
         || p.nth_at_contextual_kw(n, T![ensures])
@@ -35,7 +35,7 @@ pub(super) fn at_clause_kw(p: &Parser<'_>, n: usize) -> bool {
 }
 
 /// The comma-separated expressions of a clause, up to the next clause or the body.
-fn expr_list(p: &mut Parser<'_>) {
+fn expr_list<S: Sink>(p: &mut Parser<'_, S>) {
     while !at_clause_boundary(p) {
         expressions::expr_no_struct(p);
         if !p.eat(T![,]) {
@@ -45,7 +45,7 @@ fn expr_list(p: &mut Parser<'_>) {
 }
 
 /// One clause: its keyword, then its expressions.
-fn clause(p: &mut Parser<'_>, kw: SyntaxKind) {
+fn clause<S: Sink>(p: &mut Parser<'_, S>, kw: SyntaxKind) {
     let m = p.start();
     p.bump_remap(kw);
     // Clauses are part of the signature: parsed in full in an outline too.
@@ -54,7 +54,7 @@ fn clause(p: &mut Parser<'_>, kw: SyntaxKind) {
 }
 
 /// A function's clauses, between its where clause and its body.
-pub(super) fn fn_clauses(p: &mut Parser<'_>) {
+pub(super) fn fn_clauses<S: Sink>(p: &mut Parser<'_, S>) {
     for kw in [T![requires], T![recommends], T![ensures], T![decreases]] {
         if p.at_contextual_kw(kw) {
             clause(p, kw);
@@ -73,7 +73,7 @@ pub(super) fn fn_clauses(p: &mut Parser<'_>) {
 }
 
 /// A loop's clauses, between its head and its body, in any order, as Verus takes them.
-pub(super) fn loop_clauses(p: &mut Parser<'_>) {
+pub(super) fn loop_clauses<S: Sink>(p: &mut Parser<'_, S>) {
     loop {
         let kw = if p.at_contextual_kw(T![invariant]) {
             T![invariant]
@@ -89,13 +89,13 @@ pub(super) fn loop_clauses(p: &mut Parser<'_>) {
 }
 
 /// `-> (name: Type)`: a function's return type with a name for its `ensures`.
-fn at_named_ret_type(p: &Parser<'_>) -> bool {
+fn at_named_ret_type<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['(']) && p.nth_at(1, IDENT) && p.nth_at(2, T![:]) && !p.nth_at(2, T![::])
 }
 
 /// A function's return type, named or not. The name is looked for after `->` is bumped: the
 /// parser's positions count raw tokens, and `->` is two of them (`-`, `>`).
-pub(super) fn fn_ret_type(p: &mut Parser<'_>) -> bool {
+pub(super) fn fn_ret_type<S: Sink>(p: &mut Parser<'_, S>) -> bool {
     if !p.at(T![->]) {
         return false;
     }

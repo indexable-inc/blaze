@@ -751,7 +751,7 @@ pub fn resolve_crates_with<'a, S: SourceTexts<'a>, P: Par>(
         for &id in wave {
             let done = {
                 let built = Built { crates: &finished, by_prefix: &by_prefix, asked: None };
-                resolve_one::<S, P>(&graph, &crates[id.index()], id, id.index(), &built, sources, par, first, prepares, alloc)?
+                resolve_one::<S, P>(&graph, &crates[id.index()], id, id.index(), &built, sources, par, first, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)?
             };
             let done: &'a CrateNames<'a> = Box::leak(Box::new_in(done, alloc));
             by_prefix.insert(done.key.prefix(), id.index());
@@ -995,6 +995,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     first: First,
     prepares: &'a Prepares<'a>,
+    kept: &crate::expansions::KeptExpansions<'_, 'a>,
     alloc: Alloc<'a>,
 ) -> Result<CrateNames<'a>, NamesError<'a>> {
     // The crate's index for `sources`: its graph id in a whole-set call, the caller's index
@@ -1133,6 +1134,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             built,
             sources,
             listed: listed.is_some(),
+            kept,
             alloc,
         };
         let mark = |stage: crate::task::Stage| par.stage(stage);
@@ -1357,6 +1359,9 @@ struct Base<'r, 'a, S> {
     sources: &'r S,
     /// A macro crate whose module's list declared its macros: an expansion declares none.
     listed: bool,
+    /// The crate's expansions kept between solves ([`crate::expansions`]): asked and told by
+    /// [`expand_decls`] alone.
+    kept: &'r crate::expansions::KeptExpansions<'r, 'a>,
     alloc: Alloc<'a>,
 }
 
@@ -1773,6 +1778,78 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // builtin or a proc macro has nothing to compile and is built for its call's shape.
     let declarative = matches!(mac.body, MacroBody::Rules(_) | MacroBody::Macro2 { .. });
     seen(def_key, src.input);
+    let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
+    let file = held(base_files(run), "files").files[src.loc.file as usize];
+    let host = || Host {
+        cfg: base.cfg,
+        file: shown(file.path, base.shown_from),
+        path: file.path,
+        package: base.shown_from,
+        krate: base.index,
+        sources: base.sources,
+        alloc,
+    };
+    let cfg_atom = |name: &str, value: Option<&str>| base.cfg.atoms().binary_search(&(name, value)).is_ok();
+    // The crate's kept expansions ([`crate::expansions`]): the call's key from its TEXT, before
+    // anything is lexed or prepared ([`blaze_expand::TextCall`] lists every input). A
+    // function-like builtin has no key: it is expanded each solve.
+    let kept = base.kept;
+    let text_key = match mac.body {
+        _ if !kept.keeps() => None,
+        MacroBody::Rules(body) => Some(blaze_expand::DefText::Rules { body }),
+        MacroBody::Macro2 { params, body } => Some(blaze_expand::DefText::Macro2 { params, body, module: mac.module }),
+        MacroBody::BuiltinOther(CallShape::Derive) if src.kind == CallShape::Derive => Some(blaze_expand::DefText::BuiltinDerive),
+        MacroBody::Proc { kind, helpers } => runner.map(|runner| blaze_expand::DefText::Proc { runner, kind, helpers }),
+        MacroBody::BuiltinFn(_) | MacroBody::BuiltinOther(_) => None,
+    }
+    .map(|def| {
+        let named = kept.planted() != crate::expansions::Planted::KeyWithoutTheAttribute;
+        blaze_expand::text_key(&blaze_expand::TextCall {
+            def,
+            def_name: if named { mac.name } else { "" },
+            def_krate,
+            def_edition,
+            export: if mac.export { Export::Exported } else { Export::Local },
+            local_inner: if mac.local_inner { LocalInner::Yes } else { LocalInner::No },
+            shape: src.kind,
+            attr: if named && src.kind != CallShape::FnLike { src.name } else { "" },
+            edition,
+            input: src.input,
+        })
+    });
+    // A kept expansion is taken when its read list is answered today as it was: each cfg atom
+    // the item walk asked, then each read the expansion made.
+    let mut found: Option<blaze_expand::Expansion<'a>> = None;
+    if let Some(key) = text_key {
+        part(ExpandPart::Kept, mac.name, src.input.len());
+        let entry = kept.find(&key).unwrap_or_else(|e| panic!("the kept expansion of a call of `{}` did not open: {e}", mac.name));
+        if let Some((index, entry)) = entry {
+            let mut taken = None;
+            if entry.asked().all(|asked| cfg_atom(asked.name, asked.value) == asked.answer) {
+                let expansion = entry.expansion(alloc).unwrap_or_else(|e| panic!("the kept expansion of a call of `{}` did not read: {e}", mac.name));
+                let held = match base.script {
+                    _ if expansion.reads.list().is_empty() => Ok(blaze_expand::Held::Holds),
+                    Some(out) => expansion.reads.hold(&ScriptCx { inner: host(), out }, edition, alloc),
+                    None => expansion.reads.hold(&host(), edition, alloc),
+                };
+                // A read that cannot be asked today is no answer: the call is expanded, and
+                // says so itself.
+                if held == Ok(blaze_expand::Held::Holds) {
+                    taken = Some(expansion);
+                }
+            }
+            match taken {
+                Some(expansion) => {
+                    kept.found(key, index);
+                    found = Some(expansion);
+                }
+                None => kept.moved(),
+            }
+        }
+    }
+    let expansion = match found {
+    Some(expansion) => expansion,
+    None => {
     part(ExpandPart::Define, mac.name, 0);
     let written;
     let def: Kept<'_> = match run.prepares.get(def_key).filter(|_| declarative) {
@@ -1793,20 +1870,18 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let input = lexed(src.input, Lexed::Input)?;
     part(ExpandPart::Shape, mac.name, 0);
     let input_tokens = input.len();
-    let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
-    let file = held(base_files(run), "files").files[src.loc.file as usize];
-    let host = Host {
-        cfg: base.cfg,
-        file: shown(file.path, base.shown_from),
-        path: file.path,
-        package: base.shown_from,
-        krate: base.index,
-        sources: base.sources,
-        alloc,
-    };
     // An item macro's input as its shape takes it: the item without the attribute (and the
-    // attribute's arguments), or the item as a derive sees it.
-    let atom = &mut |name: &str, value: Option<&str>| Ok::<bool, Infallible>(base.cfg.atoms().binary_search(&(name, value)).is_ok());
+    // attribute's arguments), or the item as a derive sees it. Each cfg atom the walk asks is
+    // a read the call's key does not hold: kept with its answer.
+    let mut asked = blaze_expand::kept::Asked::new_in(alloc);
+    let mut asked_fits = true;
+    let atom = &mut |name: &str, value: Option<&str>| {
+        let answer = cfg_atom(name, value);
+        if text_key.is_some() && asked.push(name, value, answer).is_err() {
+            asked_fits = false;
+        }
+        Ok::<bool, Infallible>(answer)
+    };
     let item_note = |error: ItemAttrsError<Infallible>| note(ExpandNote::ItemAttrs { macro_name: mac.name, error });
     let (args, item): (Option<TokenStream<'a>>, TokenStream<'a>);
     let derive_facts;
@@ -1873,8 +1948,8 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     };
     part(run_part, mac.name, input_tokens);
     let expanded = match base.script {
-        Some(out) => eager.expand(def, &call_of, &ScriptCx { inner: host, out }),
-        None => eager.expand(def, &call_of, &host),
+        Some(out) => eager.expand(def, &call_of, &ScriptCx { inner: host(), out }),
+        None => eager.expand(def, &call_of, &host()),
     };
     let expansion = match expanded {
         Ok(expansion) => expansion,
@@ -1882,6 +1957,25 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             note(why);
             return None;
         }
+    };
+    // Kept for the crate's next solve, unless a read of it cannot be asked again.
+    match text_key {
+        Some(key) => {
+            part(ExpandPart::Keep, mac.name, expansion.tokens.len());
+            let entry = match expansion.reads.askable() {
+                Ok(()) if asked_fits => blaze_expand::kept::write_entry(&asked, &expansion, alloc).ok(),
+                _ => None,
+            };
+            match entry {
+                Some(entry) => kept.made(key, entry.leak()),
+                None => kept.unkept(),
+            }
+        }
+        None if kept.keeps() => kept.unkept(),
+        None => {}
+    }
+    expansion
+    }
     };
     for diagnostic in expansion.diagnostics.iter() {
         note(ExpandNote::Diagnostic { macro_name: mac.name, diagnostic: *diagnostic });

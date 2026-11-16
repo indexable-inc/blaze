@@ -16,8 +16,15 @@ doctest = false
 [dependencies]
 # The input: one function's columns (`View`), its ops, types and signatures.
 blaze-lir.workspace = true
+# The record form's output (`emit_record`): `CodeRecord`, its sites, words and targets. By
+# path, as blaze-code names its own dependencies: it has no workspace entry.
+blaze-code = { path = "../blaze-code" }
+# `Vec` and `Alloc`: the record form's rows, in the allocator the caller names.
+blaze-own.workspace = true
 
 [dev-dependencies]
+# `Alloc::global()`, the handle the record tests hand `emit_record`.
+blaze-own = { workspace = true, features = ["std"] }
 # The reference evaluator every emitted function is compared with.
 blaze-lir = { workspace = true, features = ["eval"] }
 # `check`: random LIR functions run as machine code and in the evaluator.

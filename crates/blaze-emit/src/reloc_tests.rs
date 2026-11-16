@@ -15,7 +15,7 @@ use crate::{Code, RelocTo, Via, emit, tests::ISA};
 
 /// `f() = *(*table) + STATIC` after `STATIC += 2`, where `table` is a data row holding the
 /// address of `text` plus 1, and `STATIC` is static place 0.
-fn reader() -> Func<Global> {
+pub(crate) fn reader() -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
     b.set_signature(sig);

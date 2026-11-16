@@ -164,6 +164,8 @@ pub(crate) fn digest<C: Compress>(text: &str, edition: u8, out: &mut Outline<'_>
     siblings.clear();
     sibling_keys::<C>(text, out, bytes, siblings);
     entry_digests::<C>(text.as_bytes(), edition, &mut out.items, bytes);
+    // Last: an entry's names digest may take its `hash` or `signature_hash`.
+    crate::names_digest::names_digests(text, edition, &out.items, &out.attrs, &mut out.names);
 }
 
 /// What [`digest`] works in and no outline keeps: the counts of the sibling keys seen, and the

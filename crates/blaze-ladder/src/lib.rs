@@ -17,6 +17,7 @@ mod fn_shim;
 pub mod front;
 pub mod front2;
 pub mod place;
+pub mod program_texts;
 pub mod refusal;
 pub mod resolve;
 pub mod run;

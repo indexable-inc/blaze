@@ -202,6 +202,7 @@ impl P {
             edition: PackageEdition { syntax: self.edition, blaze: None },
             lib: self.lib.then(|| Lib { crate_name: t(&self.name.replace('-', "_")), root: t("src/lib.rs"), proc_macro: self.proc_macro }),
             bins,
+            extras: Vec::new_in(a()),
             build: self.build.then(|| t("build.rs")),
             links: None,
             features,
@@ -335,6 +336,9 @@ fn lines(graph: &UnitGraph<'_>) -> StdVec<StdString> {
                 UnitKind::BuildScript => "build".to_owned(),
                 UnitKind::Test { bin: None } => "test".to_owned(),
                 UnitKind::Test { bin: Some(b) } => format!("test:{b}"),
+                UnitKind::IntegrationTest(x) => format!("integration-test:{}", x.name),
+                UnitKind::Example(x) => format!("example:{}", x.name),
+                UnitKind::Bench(x) => format!("bench:{}", x.name),
             };
             let side = if u.for_host { "host" } else { "target" };
             let fs: StdVec<&str> = u.features.iter().map(|f| f.as_str()).collect();
@@ -454,6 +458,115 @@ fn implicit_features_in_every_edition() {
     assert_eq!(p.edition.syntax, Edition::Edition2024);
     assert!(p.feature("x").is_some(), "no implicit feature `x` in edition 2024");
     assert!(p.feature("y").is_none(), "`dep:y` left an implicit feature `y`");
+}
+
+/// Integration tests, examples and benches are units (test.md, "The other targets": "each file
+/// its own unit, kind test, depending on the library's PLAIN unit and the dev-dependencies"),
+/// through the real reader with `with_test_targets`: a package with `src/lib.rs`, `tests/a.rs`,
+/// `tests/b/main.rs`, `examples/e.rs`, `benches/x.rs` and `[[test]] name = "c" path =
+/// "other/c.rs" harness = false`. For `test` (`Ask::tests`) the graph holds one unit per target,
+/// each depending on the plain library unit (and the dev-dependency `rand`); for `run`/`build`
+/// it holds none of them. Prints:
+///
+/// ```text
+/// test: pkg 1.0.0 lib target [] ->  | pkg 1.0.0 test target [] -> rand=rand | pkg 1.0.0 integration-test:a target [] -> pkg=pkg,rand=rand | pkg 1.0.0 integration-test:b target [] -> pkg=pkg,rand=rand | pkg 1.0.0 integration-test:c target [] -> pkg=pkg,rand=rand | pkg 1.0.0 example:e target [] -> pkg=pkg,rand=rand | pkg 1.0.0 bench:x target [] -> pkg=pkg,rand=rand
+/// run: pkg 1.0.0 lib target [] ->
+/// ```
+///
+/// (`rand`'s own units sort before `pkg`'s and are left out of the lines.)
+#[test]
+fn integration_tests_examples_and_benches_are_units() {
+    let manifest = "[package]\nname = \"pkg\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[dev-dependencies]\nrand = \"1\"\n\n[[test]]\nname = \"c\"\npath = \"other/c.rs\"\nharness = false\n";
+    let files: [&'static str; 6] = ["src/lib.rs", "tests/a.rs", "tests/b/main.rs", "examples/e.rs", "benches/x.rs", "other/c.rs"];
+    let mut reader = match blaze_manifest::layout::Layout::new("", a()) {
+        Ok(r) => r.with_test_targets(),
+        Err(e) => panic!("{e}"),
+    };
+    let units = loop {
+        match reader.pass() {
+            Ok(blaze_manifest::layout::Pass::Done(units)) => break units,
+            Ok(blaze_manifest::layout::Pass::Need(needs)) => {
+                for need in needs.iter() {
+                    match need {
+                        blaze_manifest::layout::Need::Manifest(path) => {
+                            let answer = (path.as_str() == "Cargo.toml").then_some(manifest);
+                            if let Err(e) = reader.manifest(path, answer) {
+                                panic!("{e}");
+                            }
+                        }
+                        blaze_manifest::layout::Need::Listing(dir) => {
+                            // Every first component under `dir`, from the file list.
+                            let mut listed: StdVec<blaze_manifest::layout::Entry<'static>> = StdVec::new();
+                            for path in files {
+                                let rest = match dir.is_empty() {
+                                    true => Some(path),
+                                    false => path.strip_prefix(dir.as_str()).and_then(|rest| rest.strip_prefix('/')),
+                                };
+                                let Some(rest) = rest else { continue };
+                                let (name, is_dir) = match rest.find('/') {
+                                    Some(cut) => (&rest[..cut], true),
+                                    None => (rest, false),
+                                };
+                                if !listed.iter().any(|entry| entry.name == name) {
+                                    listed.push(blaze_manifest::layout::Entry { name, is_dir });
+                                }
+                            }
+                            reader.listing(dir, (!listed.is_empty()).then_some(listed.as_slice()));
+                        }
+                    }
+                }
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    let facts = Package::from_member(&units.members[0], a());
+    let world = [pkg("pkg").member().dep(dep("rand").dev()), pkg("rand")];
+    let text = lock_text(&world);
+    let lock = match Lock::read(text.as_bytes(), a()) {
+        Ok(lock) => lock,
+        Err(e) => panic!("fixture lock: {e}\n{text}"),
+    };
+    let lock: &'static Lock<'static> = std::boxed::Box::leak(std::boxed::Box::new(lock));
+    let root = lock.named("pkg").next().expect("pkg is locked");
+    let rand = lock.named("rand").next().expect("rand is locked");
+    let graph_for = |tests: bool| -> StdString {
+        let mut roots = Vec::new_in(a());
+        roots.push(root);
+        let ask = Ask { roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests };
+        let target = mac();
+        let host = mac();
+        let mut res = Resolution::new(lock, &target, &host, &ask, Resolver::V2, a());
+        if let Err(e) = res.member(root, facts.clone()) {
+            panic!("{e}");
+        }
+        for _ in 0..8 {
+            match res.pass() {
+                Ok(Pass::Done(graph)) => {
+                    let lines: StdVec<StdString> = lines(&graph).into_iter().filter(|line| line.starts_with("pkg ")).collect();
+                    return lines.join(" | ");
+                }
+                Ok(Pass::Need(needs)) => {
+                    for id in needs.iter() {
+                        assert_eq!(*id, rand, "only rand is asked for");
+                        if let Err(e) = res.package(*id, Some(pkg("rand").facts())) {
+                            panic!("{e}");
+                        }
+                    }
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("no fixpoint in 8 passes");
+    };
+    let test = graph_for(true);
+    std::println!("test: {test}");
+    assert_eq!(
+        test,
+        "pkg 1.0.0 lib target [] ->  | pkg 1.0.0 test target [] -> rand=rand | pkg 1.0.0 integration-test:a target [] -> pkg=pkg,rand=rand | pkg 1.0.0 integration-test:b target [] -> pkg=pkg,rand=rand | pkg 1.0.0 integration-test:c target [] -> pkg=pkg,rand=rand | pkg 1.0.0 example:e target [] -> pkg=pkg,rand=rand | pkg 1.0.0 bench:x target [] -> pkg=pkg,rand=rand"
+    );
+    let run = graph_for(false);
+    std::println!("run: {run}");
+    assert_eq!(run, "pkg 1.0.0 lib target [] -> ");
 }
 
 /// Rule 3: `default-features = false` drops `default`; another entry with defaults unifies it

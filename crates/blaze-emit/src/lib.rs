@@ -23,6 +23,15 @@
 //! - The code is followed by its literal words (8-aligned) and its data rows (each at least
 //!   8-aligned, at most 16): placement puts the code's first byte at a 16-aligned address.
 //!
+//! # The record form
+//!
+//! [`emit_record`] is the same pass with no address word in its output
+//! (docs/v2/plan/design/run.md, "End state"): it makes a `blaze_code::record::CodeRecord`
+//! whose every outside reference is an import site (`adrp; ldr`, and `blr x16` for a call)
+//! naming its target by (space, symbol), and whose data holding an address is in the relro
+//! part. The table of both forms is in pass/sites.rs. [`emit`] (literal words) stays until the
+//! run path reads code records; both forms run equal (`record_tests`).
+//!
 //! # Values
 //!
 //! One invariant holds for every cell, kept on every write: **a cell's 8 low bytes hold the
@@ -161,9 +170,15 @@ use blaze_lir::{Op, View};
 
 mod enc;
 mod pass;
+mod record;
+
+pub use record::{Named, Names, Outside, RecordEmitError, emit_record};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod record_tests;
 
 #[cfg(test)]
 mod reloc_tests;
@@ -380,6 +395,9 @@ pub enum EmitError {
     Signature { why: &'static str },
     /// Data row `row` holds an address the baseline tier cannot place.
     Data { row: u32, why: &'static str },
+    /// The record form ([`emit_record`]) has no import site or relro word for something the
+    /// function names: refused, never emitted as a literal word.
+    Record { why: &'static str },
 }
 
 impl fmt::Display for EmitError {
@@ -392,6 +410,7 @@ impl fmt::Display for EmitError {
             EmitError::TooLarge { what } => write!(f, "{what} is past what the baseline tier encodes"),
             EmitError::Signature { why } => write!(f, "the function's signature: the baseline tier does not emit {why}"),
             EmitError::Data { row, why } => write!(f, "data row {row}: the baseline tier does not place {why}"),
+            EmitError::Record { why } => write!(f, "the code record form (run.md, \"The code record\") does not emit {why}"),
         }
     }
 }
@@ -417,5 +436,5 @@ pub(crate) fn emit_inline_up_to<A: Allocator>(
     out.bytes.clear();
     out.fixups.clear();
     out.relocs.clear();
-    pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs)
+    pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, None)
 }

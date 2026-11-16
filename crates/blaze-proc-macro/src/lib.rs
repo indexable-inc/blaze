@@ -19,6 +19,7 @@
 // record's key and lookup. A command that only asks whether a module or an answer is kept
 // links no Wasmtime.
 pub mod module;
+pub mod parts;
 pub mod record;
 pub mod sandbox;
 

@@ -14,13 +14,13 @@ pub(super) enum Semicolon {
 
 pub(super) const EXPR_FIRST: TokenSet = LHS_FIRST;
 
-pub(super) fn expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+pub(super) fn expr<S: Sink>(p: &mut Parser<'_, S>) -> Option<CompletedMarker> {
     let r = Restrictions { forbid_structs: false, prefer_stmt: false, macro_ends_stmt: true };
     expr_bp(p, None, r, 1).map(|(m, _)| m)
 }
 
-pub(super) fn expr_stmt(
-    p: &mut Parser<'_>,
+pub(super) fn expr_stmt<S: Sink>(
+    p: &mut Parser<'_, S>,
     m: Option<Marker>,
 ) -> Option<(CompletedMarker, BlockLike)> {
     let r = Restrictions { forbid_structs: false, prefer_stmt: true, macro_ends_stmt: true };
@@ -29,7 +29,7 @@ pub(super) fn expr_stmt(
 
 /// What a match arm gives. A block ends it as it ends a statement; a macro called with braces
 /// does not, as it is not a statement here.
-pub(super) fn match_arm_expr(p: &mut Parser<'_>) -> Option<(CompletedMarker, BlockLike)> {
+pub(super) fn match_arm_expr<S: Sink>(p: &mut Parser<'_, S>) -> Option<(CompletedMarker, BlockLike)> {
     // test match_arm_braced_macro_operand
     // fn f() {
     //     match () {
@@ -41,7 +41,7 @@ pub(super) fn match_arm_expr(p: &mut Parser<'_>) -> Option<(CompletedMarker, Blo
     expr_bp(p, None, r, 1)
 }
 
-pub(super) fn expr_no_struct(p: &mut Parser<'_>) {
+pub(super) fn expr_no_struct<S: Sink>(p: &mut Parser<'_, S>) {
     let r = Restrictions { forbid_structs: true, prefer_stmt: false, macro_ends_stmt: true };
     expr_bp(p, None, r, 1);
 }
@@ -50,11 +50,11 @@ pub(super) fn expr_no_struct(p: &mut Parser<'_>) {
 /// It needs to be parsed with lower precedence than `&&`, so that
 /// `if let true = true && false` is parsed as `if (let true = true) && (true)`
 /// and not `if let true = (true && true)`.
-fn expr_let(p: &mut Parser<'_>, r: Restrictions) {
+fn expr_let<S: Sink>(p: &mut Parser<'_, S>, r: Restrictions) {
     expr_bp(p, None, r, 5);
 }
 
-pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
+pub(super) fn stmt<S: Sink>(p: &mut Parser<'_, S>, semicolon: Semicolon) {
     if p.eat(T![;]) {
         return;
     }
@@ -134,7 +134,7 @@ pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
 
 // test let_stmt
 // fn f() { let x: i32 = 92; super let y; super::foo; }
-pub(super) fn let_stmt(p: &mut Parser<'_>, with_semi: Semicolon) {
+pub(super) fn let_stmt<S: Sink>(p: &mut Parser<'_, S>, with_semi: Semicolon) {
     p.eat(T![super]);
     p.bump(T![let]);
     patterns::pattern(p);
@@ -180,7 +180,7 @@ pub(super) fn let_stmt(p: &mut Parser<'_>, with_semi: Semicolon) {
     }
 }
 
-pub(super) fn expr_block_contents(p: &mut Parser<'_>) {
+pub(super) fn expr_block_contents<S: Sink>(p: &mut Parser<'_, S>) {
     attributes::inner_attrs(p);
 
     while !p.at(EOF) && !p.at(T!['}']) {
@@ -229,7 +229,7 @@ enum Associativity {
 /// Note that Rust doesn't define associativity for some infix operators (e.g. `==` and `..`) and
 /// requires parentheses to disambiguate. We just treat them as left associative.
 #[rustfmt::skip]
-fn current_op(p: &Parser<'_>) -> (u8, SyntaxKind, Associativity) {
+fn current_op<S: Sink>(p: &Parser<'_, S>) -> (u8, SyntaxKind, Associativity) {
     use Associativity::*;
     const NOT_AN_OP: (u8, SyntaxKind, Associativity) = (0, T![@], Left);
     match p.current() {
@@ -272,8 +272,8 @@ fn current_op(p: &Parser<'_>) -> (u8, SyntaxKind, Associativity) {
 }
 
 // Parses expression with binding power of at least bp.
-fn expr_bp(
-    p: &mut Parser<'_>,
+fn expr_bp<S: Sink>(
+    p: &mut Parser<'_, S>,
     m: Option<Marker>,
     r: Restrictions,
     bp: u8,
@@ -281,8 +281,8 @@ fn expr_bp(
     stdx::ensure_sufficient_stack(|| expr_bp_here(p, m, r, bp))
 }
 
-fn expr_bp_here(
-    p: &mut Parser<'_>,
+fn expr_bp_here<S: Sink>(
+    p: &mut Parser<'_, S>,
     m: Option<Marker>,
     r: Restrictions,
     bp: u8,
@@ -377,7 +377,7 @@ fn expr_bp_here(
 const LHS_FIRST: TokenSet =
     atom::ATOM_EXPR_FIRST.union(TokenSet::new(&[T![&], T![*], T![!], T![.], T![-], T![_], T![#]]));
 
-fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLike)> {
+fn lhs<S: Sink>(p: &mut Parser<'_, S>, r: Restrictions) -> Option<(CompletedMarker, BlockLike)> {
     let m;
     let kind = match p.current() {
         // test ref_expr
@@ -462,8 +462,8 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
     Some((cm, BlockLike::NotBlock))
 }
 
-fn postfix_expr(
-    p: &mut Parser<'_>,
+fn postfix_expr<S: Sink>(
+    p: &mut Parser<'_, S>,
     mut lhs: CompletedMarker,
     // Calls are disallowed if the type is a block and we prefer statements because the call cannot be disambiguated from a tuple
     // E.g. `while true {break}();` is parsed as
@@ -491,7 +491,7 @@ fn postfix_expr(
             //     x.
             //     ()
             // }
-            T![.] => match postfix_dot_expr::<false>(p, lhs) {
+            T![.] => match postfix_dot_expr::<_, false>(p, lhs) {
                 Ok(it) => it,
                 Err(it) => {
                     lhs = it;
@@ -507,53 +507,49 @@ fn postfix_expr(
     (lhs, block_like)
 }
 
-fn postfix_dot_expr<const FLOAT_RECOVERY: bool>(
-    p: &mut Parser<'_>,
-    lhs: CompletedMarker,
-) -> Result<CompletedMarker, CompletedMarker> {
-    if !FLOAT_RECOVERY {
-        assert!(p.at(T![.]));
-    }
-    let nth1 = if FLOAT_RECOVERY { 0 } else { 1 };
-    let nth2 = if FLOAT_RECOVERY { 1 } else { 2 };
-
-    if PATH_NAME_REF_KINDS.contains(p.nth(nth1))
-        && (p.nth(nth2) == T!['('] || p.nth_at(nth2, T![::]))
-        || p.nth(nth1) == T!['(']
-    {
-        return Ok(method_call_expr::<FLOAT_RECOVERY>(p, lhs));
-    }
-
-    // test await_expr
-    // fn foo() {
-    //     x.await;
-    //     x.0.await;
-    //     x.0().await?.hello();
-    //     x.0.0.await;
-    //     x.0. await;
-    // }
-    // `x.[f]` (blaze's `#![feature(blaze_comptime)]`): an `INDEX_EXPR` with a `.` before its
-    // `[`. `.[` is a syntax error in Rust, so taking it changes no program; lowering refuses it
-    // without the feature.
-    if p.nth(nth1) == T!['['] {
-        return Ok(reflected_field_expr::<FLOAT_RECOVERY>(p, lhs));
-    }
-
-    if p.nth(nth1) == T![await] {
-        let m = lhs.precede(p);
-        if !FLOAT_RECOVERY {
-            p.bump(T![.]);
-        }
-        p.bump(T![await]);
-        return Ok(m.complete(p, AWAIT_EXPR));
-    }
-
-    if p.at(T![..=]) || p.at(T![..]) {
-        return Err(lhs);
-    }
-
-    field_expr::<FLOAT_RECOVERY>(p, lhs)
+fn postfix_dot_expr<S: Sink, const FLOAT_RECOVERY: bool>(p: &mut Parser<'_, S>,
+lhs: CompletedMarker,) -> Result<CompletedMarker, CompletedMarker> { if !FLOAT_RECOVERY {
+    assert!(p.at(T![.]));
 }
+let nth1 = if FLOAT_RECOVERY { 0 } else { 1 };
+let nth2 = if FLOAT_RECOVERY { 1 } else { 2 };
+
+if PATH_NAME_REF_KINDS.contains(p.nth(nth1))
+    && (p.nth(nth2) == T!['('] || p.nth_at(nth2, T![::]))
+    || p.nth(nth1) == T!['(']
+{
+    return Ok(method_call_expr::<_, FLOAT_RECOVERY>(p, lhs));
+}
+
+// test await_expr
+// fn foo() {
+//     x.await;
+//     x.0.await;
+//     x.0().await?.hello();
+//     x.0.0.await;
+//     x.0. await;
+// }
+// `x.[f]` (blaze's `#![feature(blaze_comptime)]`): an `INDEX_EXPR` with a `.` before its
+// `[`. `.[` is a syntax error in Rust, so taking it changes no program; lowering refuses it
+// without the feature.
+if p.nth(nth1) == T!['['] {
+    return Ok(reflected_field_expr::<_, FLOAT_RECOVERY>(p, lhs));
+}
+
+if p.nth(nth1) == T![await] {
+    let m = lhs.precede(p);
+    if !FLOAT_RECOVERY {
+        p.bump(T![.]);
+    }
+    p.bump(T![await]);
+    return Ok(m.complete(p, AWAIT_EXPR));
+}
+
+if p.at(T![..=]) || p.at(T![..]) {
+    return Err(lhs);
+}
+
+field_expr::<_, FLOAT_RECOVERY>(p, lhs) }
 
 // test call_expr
 // fn foo() {
@@ -562,7 +558,7 @@ fn postfix_dot_expr<const FLOAT_RECOVERY: bool>(
 //     let _ = f(<Foo>::func());
 //     f(<Foo as Trait>::func());
 // }
-fn call_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
+fn call_expr<S: Sink>(p: &mut Parser<'_, S>, lhs: CompletedMarker) -> CompletedMarker {
     assert!(p.at(T!['(']));
     let m = lhs.precede(p);
     arg_list(p);
@@ -573,7 +569,7 @@ fn call_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
 // fn foo() {
 //     x[1][2];
 // }
-fn index_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
+fn index_expr<S: Sink>(p: &mut Parser<'_, S>, lhs: CompletedMarker) -> CompletedMarker {
     assert!(p.at(T!['[']));
     let m = lhs.precede(p);
     p.bump(T!['[']);
@@ -583,19 +579,15 @@ fn index_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
 }
 
 /// `x.[f]`, the `.` already split off a float (`x.0.[f]`) when `FLOAT_RECOVERY`.
-fn reflected_field_expr<const FLOAT_RECOVERY: bool>(
-    p: &mut Parser<'_>,
-    lhs: CompletedMarker,
-) -> CompletedMarker {
-    let m = lhs.precede(p);
-    if !FLOAT_RECOVERY {
-        p.bump(T![.]);
-    }
-    p.bump(T!['[']);
-    expr(p);
-    p.expect(T![']']);
-    m.complete(p, INDEX_EXPR)
+fn reflected_field_expr<S: Sink, const FLOAT_RECOVERY: bool>(p: &mut Parser<'_, S>,
+lhs: CompletedMarker,) -> CompletedMarker { let m = lhs.precede(p);
+if !FLOAT_RECOVERY {
+    p.bump(T![.]);
 }
+p.bump(T!['[']);
+expr(p);
+p.expect(T![']']);
+m.complete(p, INDEX_EXPR) }
 
 // test method_call_expr
 // fn foo() {
@@ -605,46 +597,42 @@ fn reflected_field_expr<const FLOAT_RECOVERY: bool>(
 //     x.0. call();
 //     x.0()
 // }
-fn method_call_expr<const FLOAT_RECOVERY: bool>(
-    p: &mut Parser<'_>,
-    lhs: CompletedMarker,
-) -> CompletedMarker {
-    if FLOAT_RECOVERY {
-        assert!(
-            p.at_ts(PATH_NAME_REF_KINDS) && (p.nth(1) == T!['('] || p.nth_at(1, T![::]))
-                || p.current() == T!['(']
-        );
-    } else {
-        assert!(p.at(T![.]));
-        assert!(
-            PATH_NAME_REF_KINDS.contains(p.nth(1)) && (p.nth(2) == T!['('] || p.nth_at(2, T![::]))
-                || p.nth(1) == T!['(']
-        );
-    }
-    let m = lhs.precede(p);
-    if !FLOAT_RECOVERY {
-        p.bump(T![.]);
-    }
-    if p.at_ts(PATH_NAME_REF_KINDS) {
-        name_ref_mod_path(p);
-    } else {
-        p.error("expected method name, field name or number");
-    }
-    generic_args::opt_generic_arg_list_expr(p);
-    if p.at(T!['(']) {
-        arg_list(p);
-    } else {
-        // emit an error when argument list is missing
-
-        // test_err method_call_missing_argument_list
-        // fn func() {
-        //     foo.bar::<>
-        //     foo.bar::<i32>;
-        // }
-        p.error("expected argument list");
-    }
-    m.complete(p, METHOD_CALL_EXPR)
+fn method_call_expr<S: Sink, const FLOAT_RECOVERY: bool>(p: &mut Parser<'_, S>,
+lhs: CompletedMarker,) -> CompletedMarker { if FLOAT_RECOVERY {
+    assert!(
+        p.at_ts(PATH_NAME_REF_KINDS) && (p.nth(1) == T!['('] || p.nth_at(1, T![::]))
+            || p.current() == T!['(']
+    );
+} else {
+    assert!(p.at(T![.]));
+    assert!(
+        PATH_NAME_REF_KINDS.contains(p.nth(1)) && (p.nth(2) == T!['('] || p.nth_at(2, T![::]))
+            || p.nth(1) == T!['(']
+    );
 }
+let m = lhs.precede(p);
+if !FLOAT_RECOVERY {
+    p.bump(T![.]);
+}
+if p.at_ts(PATH_NAME_REF_KINDS) {
+    name_ref_mod_path(p);
+} else {
+    p.error("expected method name, field name or number");
+}
+generic_args::opt_generic_arg_list_expr(p);
+if p.at(T!['(']) {
+    arg_list(p);
+} else {
+    // emit an error when argument list is missing
+
+    // test_err method_call_missing_argument_list
+    // fn func() {
+    //     foo.bar::<>
+    //     foo.bar::<i32>;
+    // }
+    p.error("expected argument list");
+}
+m.complete(p, METHOD_CALL_EXPR) }
 
 // test field_expr
 // fn foo() {
@@ -656,38 +644,34 @@ fn method_call_expr<const FLOAT_RECOVERY: bool>(
 //     x.0. bar;
 //     x.0();
 // }
-fn field_expr<const FLOAT_RECOVERY: bool>(
-    p: &mut Parser<'_>,
-    lhs: CompletedMarker,
-) -> Result<CompletedMarker, CompletedMarker> {
-    if !FLOAT_RECOVERY {
-        assert!(p.at(T![.]));
-    }
-    let m = lhs.precede(p);
-    if !FLOAT_RECOVERY {
-        p.bump(T![.]);
-    }
-    if p.at_ts(PATH_NAME_REF_OR_INDEX_KINDS) {
-        name_ref_mod_path_or_index(p);
-    } else if p.at(FLOAT_NUMBER) {
-        return match p.split_float(m) {
-            (true, m) => {
-                let lhs = m.complete(p, FIELD_EXPR);
-                postfix_dot_expr::<true>(p, lhs)
-            }
-            (false, m) => Ok(m.complete(p, FIELD_EXPR)),
-        };
-    } else {
-        p.error("expected field name or number");
-    }
-    Ok(m.complete(p, FIELD_EXPR))
+fn field_expr<S: Sink, const FLOAT_RECOVERY: bool>(p: &mut Parser<'_, S>,
+lhs: CompletedMarker,) -> Result<CompletedMarker, CompletedMarker> { if !FLOAT_RECOVERY {
+    assert!(p.at(T![.]));
 }
+let m = lhs.precede(p);
+if !FLOAT_RECOVERY {
+    p.bump(T![.]);
+}
+if p.at_ts(PATH_NAME_REF_OR_INDEX_KINDS) {
+    name_ref_mod_path_or_index(p);
+} else if p.at(FLOAT_NUMBER) {
+    return match p.split_float(m) {
+        (true, m) => {
+            let lhs = m.complete(p, FIELD_EXPR);
+            postfix_dot_expr::<_, true>(p, lhs)
+        }
+        (false, m) => Ok(m.complete(p, FIELD_EXPR)),
+    };
+} else {
+    p.error("expected field name or number");
+}
+Ok(m.complete(p, FIELD_EXPR)) }
 
 // test try_expr
 // fn foo() {
 //     x?;
 // }
-fn try_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
+fn try_expr<S: Sink>(p: &mut Parser<'_, S>, lhs: CompletedMarker) -> CompletedMarker {
     assert!(p.at(T![?]));
     let m = lhs.precede(p);
     p.bump(T![?]);
@@ -701,7 +685,7 @@ fn try_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
 //     79 as i16 - 1;
 //     0x36 as u8 <= 0x37;
 // }
-fn cast_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
+fn cast_expr<S: Sink>(p: &mut Parser<'_, S>, lhs: CompletedMarker) -> CompletedMarker {
     assert!(p.at(T![as]));
     let m = lhs.precede(p);
     p.bump(T![as]);
@@ -718,7 +702,7 @@ fn cast_expr(p: &mut Parser<'_>, lhs: CompletedMarker) -> CompletedMarker {
 //     foo(bar+);
 //     foo(a, , b);
 // }
-fn arg_list(p: &mut Parser<'_>) {
+fn arg_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['(']));
     let m = p.start();
     // test arg_with_attr
@@ -744,7 +728,7 @@ fn arg_list(p: &mut Parser<'_>) {
 //     let _ = ::a::<b>;
 //     let _ = format!();
 // }
-fn path_expr(p: &mut Parser<'_>, r: Restrictions) -> (CompletedMarker, BlockLike) {
+fn path_expr<S: Sink>(p: &mut Parser<'_, S>, r: Restrictions) -> (CompletedMarker, BlockLike) {
     assert!(paths::is_path_start(p));
     let m = p.start();
     paths::expr_path(p);
@@ -779,7 +763,7 @@ fn path_expr(p: &mut Parser<'_>, r: Restrictions) -> (CompletedMarker, BlockLike
 ///
 /// Where the grammar requires a block (a `fn`, `if`, `while`, `loop`, `unsafe` or `const`
 /// body) it never asks, so those stay blocks under the extension too.
-pub(super) fn at_record_value(p: &Parser<'_>) -> bool {
+pub(super) fn at_record_value<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['{'])
         && p.records_gate()
         && p.nth(1) == IDENT
@@ -797,7 +781,7 @@ pub(super) fn at_record_value(p: &Parser<'_>) -> bool {
 //     S { x: ::default() };
 //     TupleStruct { 0: 1 };
 // }
-pub(crate) fn record_expr_field_list(p: &mut Parser<'_>) {
+pub(crate) fn record_expr_field_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.bump(T!['{']);

@@ -312,6 +312,16 @@ pub(crate) const fn adr(rd: Reg, bytes: i32) -> u32 {
     0x1000_0000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7_ffff) << 5) | rd
 }
 
+// PC-relative to a page (C6.2.11): the record form's import and relro sites (pass/sites.rs).
+
+/// `adrp xd, <the 4 KiB page of pc, plus pages>`, `pages` within ±2^20 (±4 GiB): the low 2 bits
+/// in 29..31 and the rest in 5..24, as `adr`'s bytes. A site is emitted with 0 pages; the
+/// segment's layout sets the field and checks the reach.
+pub(crate) const fn adrp(rd: Reg, pages: i32) -> u32 {
+    let imm = pages as u32;
+    0x9000_0000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7_ffff) << 5) | rd
+}
+
 // Branches (C6.2.26, 25, 66, 65, 37, 35, 290, 49).
 
 /// `b <pc + 4 * words>`.

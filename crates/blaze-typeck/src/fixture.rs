@@ -109,6 +109,9 @@ pub struct Fx {
     conditions: Vec<(ItemKey, fn(&[PNode]) -> ConstHolds)>,
     /// Each item's const generic parameters (index, declared type), sorted by index.
     const_params: Vec<(ItemKey, Vec<(u32, PTy)>)>,
+    /// The own type and const parameter count of each generic associated type, by its item
+    /// ([`Fx::set_assoc_generics`]); an associated type not named here has none.
+    assoc_generics: Vec<(ItemKey, u32)>,
     /// Typing attributes set by [`Fx::set_attrs`]; an enum not named here has the default
     /// representation (discriminant `isize`), any other item none.
     attrs: Vec<(ItemKey, TypeAttrs)>,
@@ -173,6 +176,7 @@ impl Fx {
             path_ix: HashMap::new(),
             conditions: Vec::new(),
             const_params: Vec::new(),
+            assoc_generics: Vec::new(),
             attrs: Vec::new(),
         }
     }
@@ -310,6 +314,17 @@ impl Fx {
     }
 
     /// `<args[0] as trait_<args[1..]>>::name`.
+    /// Makes `trait_`'s associated type `name` generic with `own` type and const parameters of
+    /// its own (`type Out<T>;` is 1): a projection then lists them after the trait's
+    /// arguments, and an impl's value names them as `Param(impl generics + i)`.
+    pub fn set_assoc_generics(&mut self, trait_: ItemKey, name: &str, own: u32) {
+        let item = ItemKey(crate::infer::assoc_def(trait_, Name::of(name)));
+        match self.assoc_generics.iter_mut().find(|(k, _)| *k == item) {
+            Some(row) => row.1 = own,
+            None => self.assoc_generics.push((item, own)),
+        }
+    }
+
     pub fn alias(&mut self, trait_: ItemKey, name: &str, args: &[PTy]) -> PTy {
         let args = self.list(args);
         self.ty(PNode::Alias { trait_, name: Name::of(name), args })
@@ -971,6 +986,13 @@ impl World for Fx {
     fn const_params(&self, _: Seal, item: ItemKey) -> Fetch<ConstParams<'_>> {
         let params = self.const_params.iter().find(|(k, _)| *k == item).map_or(&[] as &[(u32, PTy)], |(_, p)| p.as_slice());
         Ok(ConstParams { params, types: self.t.view() })
+    }
+
+    fn assoc_generics(&self, _: Seal, trait_: ItemKey, name: Name) -> Fetch<Option<crate::world::AssocGenerics>> {
+        let Some(t) = self.traits.iter().find(|t| t.key == trait_ && t.assoc.iter().any(|a| a.name == name)) else { return Ok(None) };
+        let item = ItemKey(crate::infer::assoc_def(trait_, name));
+        let own = self.assoc_generics.iter().find(|(k, _)| *k == item).map_or(0, |&(_, n)| n);
+        Ok(Some(crate::world::AssocGenerics { parent: t.generics, own }))
     }
 }
 

@@ -23,6 +23,8 @@ use blaze_toolchain::{Role, Shelf, ToolchainError, ToolchainId, ToolchainView, U
 use blaze_unit_graph::implicit;
 use edition::PackageEdition;
 
+pub mod library;
+
 /// The one target the ladder runs on.
 pub const TRIPLE: &str = "aarch64-apple-darwin";
 

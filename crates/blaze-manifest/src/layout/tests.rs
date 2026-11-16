@@ -42,8 +42,16 @@ impl<'f> Tree<'f> {
 
     /// The layout read from `start`, and the number of passes it took.
     fn read(&self, start: &str) -> Result<(Units<'static>, usize), LayoutError<'static>> {
+        self.read_as(start, false)
+    }
+
+    /// [`Tree::read`], as the workspace the user builds (`test_targets`) or as a dependency.
+    fn read_as(&self, start: &str, test_targets: bool) -> Result<(Units<'static>, usize), LayoutError<'static>> {
         let alloc = Alloc::global();
         let mut layout = Layout::new(start, alloc)?;
+        if test_targets {
+            layout = layout.with_test_targets();
+        }
         for passes in 1..64 {
             match layout.pass()? {
                 Pass::Done(units) => return Ok((units, passes)),
@@ -177,6 +185,108 @@ fn a_path_dependency_out_of_the_anchor_is_outside() {
 fn a_target_path_out_of_the_anchor_is_refused() {
     let tree = Tree { files: &[("Cargo.toml", "[package]\nname = \"a\"\n[lib]\npath = \"../x.rs\"\n"), ("src/lib.rs", "")] };
     assert!(matches!(tree.read(""), Err(LayoutError::OutsideAnchor { .. })));
+}
+
+/// Integration tests, examples and benches (the Cargo Book, "Cargo Targets", "Target
+/// auto-discovery": `tests/<name>.rs` and `tests/<name>/main.rs`, likewise `examples/` and
+/// `benches/`; "Setting the keys [..] `autotests`, or `autobenches` to `false` [..] will disable
+/// auto-discovery of the corresponding target type"; a `[[test]]` table adds one with its own
+/// `path` and `harness`). Prints:
+///
+/// ```text
+/// extras: test a pkg/tests/a.rs harness found | test b pkg/tests/b/main.rs harness found | test c pkg/other/c.rs no-harness written | example e pkg/examples/e.rs harness found | bench x pkg/benches/x.rs harness found
+/// autotests = false: test c pkg/other/c.rs no-harness written | example e pkg/examples/e.rs harness found | bench x pkg/benches/x.rs harness found
+/// ```
+///
+/// then, for a dependency (read without `with_test_targets`) whose `[[test]] name = "http"` has
+/// no `tests/http.rs`, and for the same manifest as a workspace member:
+///
+/// ```text
+/// as a dependency: 0 test targets, no error
+/// as a member: package `cookie-factory` test `http`: no file `pkg/tests/http.rs` for its root
+/// ```
+///
+/// and, as a member, refuses a `path` out of the package and two tables of one name.
+#[test]
+fn tests_examples_and_benches_are_targets() {
+    const MANIFEST: &str = "[package]\nname = \"pkg\"\nedition = \"2021\"\n\n[[test]]\nname = \"c\"\npath = \"other/c.rs\"\nharness = false\n";
+    const NO_AUTO: &str = "[package]\nname = \"pkg\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"c\"\npath = \"other/c.rs\"\nharness = false\n";
+    let files = |manifest: &'static str| -> std::vec::Vec<(&'static str, &'static str)> {
+        std::vec![
+            ("pkg/Cargo.toml", manifest),
+            ("pkg/src/lib.rs", ""),
+            // Listed out of order: the reader sorts by name bytes.
+            ("pkg/tests/b/main.rs", ""),
+            ("pkg/tests/b/helper.rs", ""),
+            ("pkg/tests/a.rs", ""),
+            ("pkg/tests/.hidden.rs", ""),
+            ("pkg/tests/data.txt", ""),
+            ("pkg/examples/e.rs", ""),
+            ("pkg/benches/x.rs", ""),
+            ("pkg/other/c.rs", ""),
+        ]
+    };
+    let rows = |manifest: &'static str| -> std::string::String {
+        let files = files(manifest);
+        let (units, _) = Tree { files: &files }.read_as("pkg", true).unwrap();
+        let rows: std::vec::Vec<std::string::String> = units.members[0]
+            .extras
+            .iter()
+            .map(|t| {
+                let kind = match t.kind {
+                    super::ExtraKind::Test => "test",
+                    super::ExtraKind::Example => "example",
+                    super::ExtraKind::Bench => "bench",
+                };
+                let harness = if t.harness { "harness" } else { "no-harness" };
+                let how = if t.found { "found" } else { "written" };
+                std::format!("{kind} {} {} {harness} {how}", t.name.as_str(), t.root.as_str())
+            })
+            .collect();
+        rows.join(" | ")
+    };
+    let all = rows(MANIFEST);
+    std::println!("extras: {all}");
+    assert_eq!(
+        all,
+        "test a pkg/tests/a.rs harness found | test b pkg/tests/b/main.rs harness found | test c pkg/other/c.rs no-harness written | example e pkg/examples/e.rs harness found | bench x pkg/benches/x.rs harness found"
+    );
+    let no_auto = rows(NO_AUTO);
+    std::println!("autotests = false: {no_auto}");
+    assert_eq!(no_auto, "test c pkg/other/c.rs no-harness written | example e pkg/examples/e.rs harness found | bench x pkg/benches/x.rs harness found");
+
+    // A dependency (read without `with_test_targets`): no test, example or bench target, and a
+    // `[[test]]` whose file its archive left out is no error (cookie-factory 0.3.3's `http`).
+    const HTTP: &str = "[package]\nname = \"cookie-factory\"\n\n[[test]]\nname = \"http\"\n";
+    let dependency = Tree { files: &[("pkg/Cargo.toml", HTTP), ("pkg/src/lib.rs", "")] };
+    let (units, _) = dependency.read("pkg").unwrap();
+    assert_eq!(units.members[0].extras.len(), 0, "a dependency's layout lists a test target");
+    std::println!("as a dependency: {} test targets, no error", units.members[0].extras.len());
+    let doesnt = Tree { files: &[("pkg/Cargo.toml", MANIFEST), ("pkg/src/lib.rs", "")] };
+    assert_eq!(doesnt.read("pkg").unwrap().0.members[0].extras.len(), 0, "a dependency's `[[test]]` path was looked for");
+
+    // The same manifests as the workspace the user builds: typed errors naming the package,
+    // the target and the rule.
+    let refused = |files: &[(&'static str, &'static str)]| match (Tree { files }).read_as("pkg", true) {
+        Err(LayoutError::Target { package, target, why, .. }) => (package.as_str().to_owned(), target.as_str().to_owned(), why),
+        Err(other) => panic!("another refusal: {other}"),
+        Ok(_) => panic!("a bad `[[test]]` was read"),
+    };
+    let (package, target, why) = refused(&[("pkg/Cargo.toml", HTTP), ("pkg/src/lib.rs", "")]);
+    std::println!("as a member: package `{package}` test `{target}`: {why}");
+    assert_eq!((package.as_str(), target.as_str()), ("cookie-factory", "http"));
+    assert!(matches!(why, super::TargetRefused::NoFile { .. }));
+    let (package, target, why) = refused(&[("pkg/Cargo.toml", "[package]\nname = \"pkg\"\n[[test]]\nname = \"out\"\npath = \"../x.rs\"\n"), ("pkg/src/lib.rs", ""), ("x.rs", "")]);
+    assert_eq!((package.as_str(), target.as_str()), ("pkg", "out"));
+    assert!(matches!(why, super::TargetRefused::OutsidePackage { .. }));
+    // Two tables of one kind and name are the layout's refusal, naming the package and target.
+    match (Tree { files: &[("pkg/Cargo.toml", "[package]\nname = \"pkg\"\n[[test]]\nname = \"d\"\npath = \"src/lib.rs\"\n[[test]]\nname = \"d\"\npath = \"src/lib.rs\"\n"), ("pkg/src/lib.rs", "")] }).read_as("pkg", true) {
+        Err(LayoutError::Target { package, target, why: super::TargetRefused::Duplicate { .. }, .. }) => {
+            assert_eq!((package.as_str(), target.as_str()), ("pkg", "d"));
+        }
+        Err(other) => panic!("another refusal: {other}"),
+        Ok(_) => panic!("two `[[test]]` of one name were read"),
+    }
 }
 
 #[test]

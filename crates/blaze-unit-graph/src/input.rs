@@ -8,6 +8,7 @@ use blaze_own::{AVec, Alloc, String, Vec};
 use edition::PackageEdition;
 
 use crate::Text;
+use crate::extra::Extra;
 
 /// One value of a feature's list, as the Cargo Book's "Features" chapter spells them.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -122,6 +123,8 @@ pub struct Package<'a> {
     pub edition: PackageEdition,
     pub lib: Option<Lib<'a>>,
     pub bins: AVec<'a, Bin<'a>>,
+    /// Integration tests, examples and benches, in the layout's order (kind, then name bytes).
+    pub extras: AVec<'a, Extra<'a>>,
     /// The build script's root, relative to the package's directory.
     pub build: Option<Text<'a>>,
     pub links: Option<Text<'a>>,
@@ -147,6 +150,12 @@ impl<'a> Package<'a> {
         let mut bins = Vec::with_capacity_in(member.bins.len(), alloc);
         for bin in member.bins.iter() {
             bins.push(Bin { name: own(&bin.name), root: relative(&bin.root) });
+        }
+        // The layout keeps every such root under the package's directory, so `relative` never
+        // leaves one anchor-relative here (a unit's root holds nothing of the checkout).
+        let mut extras = Vec::with_capacity_in(member.extras.len(), alloc);
+        for target in member.extras.iter() {
+            extras.push(Extra::of(target, relative(&target.root), alloc));
         }
         let mut features = Vec::with_capacity_in(member.features.len(), alloc);
         for feature in member.features.iter() {
@@ -184,6 +193,7 @@ impl<'a> Package<'a> {
             edition: member.edition,
             lib,
             bins,
+            extras,
             build: member.build.as_ref().map(|b| relative(&b.root)),
             links: member.links.as_ref().map(|l| own(l)),
             features,

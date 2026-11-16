@@ -53,7 +53,7 @@ const PAT_GOES_ON: TokenSet = TokenSet::new(&[T![<], T![:], T![!], T![.]]);
 
 /// Whether the parser, just past the `&` of a reference pattern, is at the keyword `uniq` of
 /// `&uniq pat`.
-pub(super) fn at_ref_pat(p: &Parser<'_>) -> bool {
+pub(super) fn at_ref_pat<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at_contextual_kw(T![uniq])
         && p.uniq_gate(0)
         && !PAT_GOES_ON.contains(p.nth(1))
@@ -62,7 +62,7 @@ pub(super) fn at_ref_pat(p: &Parser<'_>) -> bool {
 
 /// Whether the parser, just past the `&` and lifetime of a reference type, is at the keyword
 /// `uniq` of `&uniq T`.
-pub(super) fn at_type(p: &Parser<'_>) -> bool {
+pub(super) fn at_type<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at_contextual_kw(T![uniq])
         && p.uniq_gate(0)
         && !TYPE_GOES_ON.contains(p.nth(1))
@@ -71,7 +71,7 @@ pub(super) fn at_type(p: &Parser<'_>) -> bool {
 
 /// Whether the parser, just past the `&` of a borrow, is at the keyword `uniq` of
 /// `&uniq expr`.
-pub(super) fn at_expr(p: &Parser<'_>) -> bool {
+pub(super) fn at_expr<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at_contextual_kw(T![uniq])
         && p.uniq_gate(0)
         && !EXPR_GOES_ON.contains(p.nth(1))
@@ -80,12 +80,12 @@ pub(super) fn at_expr(p: &Parser<'_>) -> bool {
 
 /// Whether token `n` is the `uniq` of a receiver `&uniq self`; the caller checks that an
 /// isolated `self` follows it.
-pub(super) fn nth_at_receiver(p: &Parser<'_>, n: usize) -> bool {
+pub(super) fn nth_at_receiver<S: Sink>(p: &Parser<'_, S>, n: usize) -> bool {
     p.nth_at_contextual_kw(n, T![uniq]) && p.uniq_gate(n)
 }
 
 /// Whether the parser, just past the `ref` of a binding, is at the keyword `uniq` of
 /// `ref uniq x`.
-pub(super) fn at_ref_binding(p: &Parser<'_>) -> bool {
+pub(super) fn at_ref_binding<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at_contextual_kw(T![uniq]) && p.uniq_gate(0) && p.nth_at(1, IDENT)
 }

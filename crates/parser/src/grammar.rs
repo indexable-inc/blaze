@@ -44,6 +44,7 @@ use crate::{
     SyntaxKind::{self, *},
     T, TokenSet,
     parser::{CompletedMarker, Marker, Parser},
+    sink::Sink,
 };
 
 pub(crate) mod entry {
@@ -52,41 +53,41 @@ pub(crate) mod entry {
     pub(crate) mod prefix {
         use super::*;
 
-        pub(crate) fn vis(p: &mut Parser<'_>) {
+        pub(crate) fn vis<S: Sink>(p: &mut Parser<'_, S>) {
             opt_visibility(p, false);
         }
 
-        pub(crate) fn block(p: &mut Parser<'_>) {
+        pub(crate) fn block<S: Sink>(p: &mut Parser<'_, S>) {
             expressions::block_expr(p);
         }
 
-        pub(crate) fn stmt(p: &mut Parser<'_>) {
+        pub(crate) fn stmt<S: Sink>(p: &mut Parser<'_, S>) {
             expressions::stmt(p, expressions::Semicolon::Forbidden);
         }
 
-        pub(crate) fn pat(p: &mut Parser<'_>) {
+        pub(crate) fn pat<S: Sink>(p: &mut Parser<'_, S>) {
             patterns::pattern_single(p);
         }
 
-        pub(crate) fn pat_top(p: &mut Parser<'_>) {
+        pub(crate) fn pat_top<S: Sink>(p: &mut Parser<'_, S>) {
             patterns::pattern(p);
         }
 
-        pub(crate) fn ty(p: &mut Parser<'_>) {
+        pub(crate) fn ty<S: Sink>(p: &mut Parser<'_, S>) {
             types::type_(p);
         }
-        pub(crate) fn expr(p: &mut Parser<'_>) {
+        pub(crate) fn expr<S: Sink>(p: &mut Parser<'_, S>) {
             expressions::expr(p);
         }
-        pub(crate) fn path(p: &mut Parser<'_>) {
+        pub(crate) fn path<S: Sink>(p: &mut Parser<'_, S>) {
             paths::type_path(p);
         }
-        pub(crate) fn item(p: &mut Parser<'_>) {
+        pub(crate) fn item<S: Sink>(p: &mut Parser<'_, S>) {
             // `is_in_extern` is set: it only allows `safe fn`, and there is no ambiguity here.
             items::item_fragment(p);
         }
         // Parse a meta item , which excluded [], e.g : #[ MetaItem ]
-        pub(crate) fn meta_item(p: &mut Parser<'_>) {
+        pub(crate) fn meta_item<S: Sink>(p: &mut Parser<'_, S>) {
             attributes::meta(p);
         }
     }
@@ -94,8 +95,8 @@ pub(crate) mod entry {
     pub(crate) mod top {
         use super::*;
 
-        pub(crate) fn source_file(p: &mut Parser<'_>) {
-            let m = p.start();
+        pub(crate) fn source_file<S: Sink>(p: &mut Parser<'_, S>) {
+            let m = p.start_list(SOURCE_FILE);
             // test frontmatter
             // #!/usr/bin/env cargo
             //
@@ -111,7 +112,7 @@ pub(crate) mod entry {
             m.complete(p, SOURCE_FILE);
         }
 
-        pub(crate) fn macro_stmts(p: &mut Parser<'_>) {
+        pub(crate) fn macro_stmts<S: Sink>(p: &mut Parser<'_, S>) {
             let m = p.start();
 
             while !p.at(EOF) {
@@ -125,13 +126,13 @@ pub(crate) mod entry {
             m.complete(p, MACRO_STMTS);
         }
 
-        pub(crate) fn macro_items(p: &mut Parser<'_>) {
+        pub(crate) fn macro_items<S: Sink>(p: &mut Parser<'_, S>) {
             let m = p.start();
             items::mod_contents(p, false);
             m.complete(p, MACRO_ITEMS);
         }
 
-        pub(crate) fn pattern(p: &mut Parser<'_>) {
+        pub(crate) fn pattern<S: Sink>(p: &mut Parser<'_, S>) {
             let m = p.start();
             patterns::pattern(p);
             if p.at(EOF) {
@@ -144,7 +145,7 @@ pub(crate) mod entry {
             m.complete(p, ERROR);
         }
 
-        pub(crate) fn type_(p: &mut Parser<'_>) {
+        pub(crate) fn type_<S: Sink>(p: &mut Parser<'_, S>) {
             let m = p.start();
             types::type_(p);
             if p.at(EOF) {
@@ -157,7 +158,7 @@ pub(crate) mod entry {
             m.complete(p, ERROR);
         }
 
-        pub(crate) fn expr(p: &mut Parser<'_>) {
+        pub(crate) fn expr<S: Sink>(p: &mut Parser<'_, S>) {
             let m = p.start();
             // With no expression, what was read (attributes of none, `/// x` alone) and its
             // error are no one tree, so the `ERROR` node holds them. Empty input reads nothing
@@ -174,7 +175,7 @@ pub(crate) mod entry {
             m.complete(p, ERROR);
         }
 
-        pub(crate) fn meta_item(p: &mut Parser<'_>) {
+        pub(crate) fn meta_item<S: Sink>(p: &mut Parser<'_, S>) {
             let m = p.start();
             attributes::meta(p);
             if p.at(EOF) {
@@ -190,15 +191,21 @@ pub(crate) mod entry {
 }
 
 /// One item of a source file, as its top level parses one (`items::mod_contents`).
-pub(crate) fn top_level_item(p: &mut Parser<'_>) {
+pub(crate) fn top_level_item<S: Sink>(p: &mut Parser<'_, S>) {
     items::item_or_macro(p, false, true, false);
 }
 
-pub(crate) fn reparser(
+/// A `{ .. }` block alone, every body in it parsed: what [`reparser`] gives for a
+/// `BLOCK_EXPR`, for any sink.
+pub(crate) fn block<S: Sink>(p: &mut Parser<'_, S>) {
+    expressions::block_expr(p);
+}
+
+pub(crate) fn reparser<S: Sink>(
     node: SyntaxKind,
     first_child: Option<SyntaxKind>,
     parent: Option<SyntaxKind>,
-) -> Option<fn(&mut Parser<'_>)> {
+) -> Option<fn(&mut Parser<'_, S>)> {
     let res = match node {
         BLOCK_EXPR => expressions::block_expr,
         // A record type's list (`#![blaze::records]`) is read from outside it where it is a
@@ -242,7 +249,7 @@ impl BlockLike {
 
 const VISIBILITY_FIRST: TokenSet = TokenSet::new(&[T![pub]]);
 
-fn opt_visibility(p: &mut Parser<'_>, in_tuple_field: bool) -> bool {
+fn opt_visibility<S: Sink>(p: &mut Parser<'_, S>, in_tuple_field: bool) -> bool {
     if !p.at(T![pub]) {
         return false;
     }
@@ -254,7 +261,7 @@ fn opt_visibility(p: &mut Parser<'_>, in_tuple_field: bool) -> bool {
     true
 }
 
-fn opt_visibility_inner(p: &mut Parser<'_>, in_tuple_field: bool) -> bool {
+fn opt_visibility_inner<S: Sink>(p: &mut Parser<'_, S>, in_tuple_field: bool) -> bool {
     if !p.at(T!['(']) {
         return false;
     }
@@ -307,7 +314,7 @@ fn opt_visibility_inner(p: &mut Parser<'_>, in_tuple_field: bool) -> bool {
     false
 }
 
-fn opt_rename(p: &mut Parser<'_>) {
+fn opt_rename<S: Sink>(p: &mut Parser<'_, S>) {
     if p.at(T![as]) {
         let m = p.start();
         p.bump(T![as]);
@@ -318,7 +325,7 @@ fn opt_rename(p: &mut Parser<'_>) {
     }
 }
 
-fn abi(p: &mut Parser<'_>) {
+fn abi<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T![extern]));
     let abi = p.start();
     p.bump(T![extern]);
@@ -326,7 +333,7 @@ fn abi(p: &mut Parser<'_>) {
     abi.complete(p, ABI);
 }
 
-fn opt_ret_type(p: &mut Parser<'_>) -> bool {
+fn opt_ret_type<S: Sink>(p: &mut Parser<'_, S>) -> bool {
     if p.at(T![->]) {
         let m = p.start();
         p.bump(T![->]);
@@ -338,7 +345,7 @@ fn opt_ret_type(p: &mut Parser<'_>) -> bool {
     }
 }
 
-fn opt_no_arrow_ret_type(p: &mut Parser<'_>) -> bool {
+fn opt_no_arrow_ret_type<S: Sink>(p: &mut Parser<'_, S>) -> bool {
     if p.at_ts(PATH_NAME_REF_KINDS) {
         let m = p.start();
         p.error("missing thin-arrow `->`");
@@ -350,7 +357,7 @@ fn opt_no_arrow_ret_type(p: &mut Parser<'_>) -> bool {
     }
 }
 
-fn name_r(p: &mut Parser<'_>, recovery: TokenSet) {
+fn name_r<S: Sink>(p: &mut Parser<'_, S>, recovery: TokenSet) {
     if p.at(IDENT) {
         let m = p.start();
         p.bump(IDENT);
@@ -360,18 +367,18 @@ fn name_r(p: &mut Parser<'_>, recovery: TokenSet) {
     }
 }
 
-fn name(p: &mut Parser<'_>) {
+fn name<S: Sink>(p: &mut Parser<'_, S>) {
     name_r(p, TokenSet::EMPTY);
 }
 
-fn name_any_identifier(p: &mut Parser<'_>) {
+fn name_any_identifier<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     p.bump_remap_any_ident();
     m.complete(p, NAME);
 }
 
 /// An error at a name that is missing; a `}` there is left to close the block around it.
-fn err_name(p: &mut Parser<'_>, message: &'static str) {
+fn err_name<S: Sink>(p: &mut Parser<'_, S>, message: &'static str) {
     if p.at(T!['}']) {
         p.error(message);
     } else {
@@ -379,7 +386,7 @@ fn err_name(p: &mut Parser<'_>, message: &'static str) {
     }
 }
 
-fn name_ref_or_self(p: &mut Parser<'_>) {
+fn name_ref_or_self<S: Sink>(p: &mut Parser<'_, S>) {
     if matches!(p.current(), T![ident] | T![self]) {
         let m = p.start();
         p.bump_any();
@@ -389,7 +396,7 @@ fn name_ref_or_self(p: &mut Parser<'_>) {
     }
 }
 
-fn name_ref_or_upper_self(p: &mut Parser<'_>) {
+fn name_ref_or_upper_self<S: Sink>(p: &mut Parser<'_, S>) {
     if matches!(p.current(), T![ident] | T![Self]) {
         let m = p.start();
         p.bump_any();
@@ -402,7 +409,7 @@ fn name_ref_or_upper_self(p: &mut Parser<'_>) {
 const PATH_NAME_REF_KINDS: TokenSet =
     TokenSet::new(&[IDENT, T![self], T![super], T![crate], T![Self]]);
 
-fn name_ref_mod_path(p: &mut Parser<'_>) {
+fn name_ref_mod_path<S: Sink>(p: &mut Parser<'_, S>) {
     if p.at_ts(PATH_NAME_REF_KINDS) {
         let m = p.start();
         p.bump_any();
@@ -415,7 +422,7 @@ fn name_ref_mod_path(p: &mut Parser<'_>) {
 const PATH_NAME_REF_OR_INDEX_KINDS: TokenSet =
     PATH_NAME_REF_KINDS.union(TokenSet::new(&[INT_NUMBER]));
 
-fn name_ref_mod_path_or_index(p: &mut Parser<'_>) {
+fn name_ref_mod_path_or_index<S: Sink>(p: &mut Parser<'_, S>) {
     if p.at_ts(PATH_NAME_REF_OR_INDEX_KINDS) {
         let m = p.start();
         p.bump_any();
@@ -425,21 +432,21 @@ fn name_ref_mod_path_or_index(p: &mut Parser<'_>) {
     }
 }
 
-fn name_ref_or_index(p: &mut Parser<'_>) {
+fn name_ref_or_index<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(IDENT) || p.at(INT_NUMBER));
     let m = p.start();
     p.bump_any();
     m.complete(p, NAME_REF);
 }
 
-fn lifetime(p: &mut Parser<'_>) {
+fn lifetime<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(LIFETIME_IDENT));
     let m = p.start();
     p.bump(LIFETIME_IDENT);
     m.complete(p, LIFETIME);
 }
 
-fn error_block(p: &mut Parser<'_>, message: &'static str) {
+fn error_block<S: Sink>(p: &mut Parser<'_, S>, message: &'static str) {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.error(message);
@@ -451,7 +458,7 @@ fn error_block(p: &mut Parser<'_>, message: &'static str) {
 
 // test_err top_level_let
 // let ref foo: fn() = 1 + 3;
-fn error_let_stmt(p: &mut Parser<'_>, message: &'static str) {
+fn error_let_stmt<S: Sink>(p: &mut Parser<'_, S>, message: &'static str) {
     assert!(p.at(T![let]));
     let m = p.start();
     p.error(message);
@@ -463,14 +470,14 @@ fn error_let_stmt(p: &mut Parser<'_>, message: &'static str) {
 /// If the `parser` returns false, parsing will stop. A `{ ... }` list stopped before a `}`
 /// closing it takes the tokens up to that `}` as an error: the `}` is the list's, as in
 /// rustc's token trees, never a block's around it.
-fn delimited(
-    p: &mut Parser<'_>,
+fn delimited<S: Sink>(
+    p: &mut Parser<'_, S>,
     bra: SyntaxKind,
     ket: SyntaxKind,
     delim: SyntaxKind,
     unexpected_delim_message: impl Fn() -> String,
     first_set: TokenSet,
-    mut parser: impl FnMut(&mut Parser<'_>) -> bool,
+    mut parser: impl FnMut(&mut Parser<'_, S>) -> bool,
 ) {
     let open = p.token_index();
     p.bump(bra);

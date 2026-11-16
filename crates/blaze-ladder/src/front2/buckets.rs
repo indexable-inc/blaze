@@ -24,8 +24,10 @@ use blaze_hash::HashMap;
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::machine::sig;
 use blaze_lower::{View, form as lf, head};
+use blaze_scope::items_record::{ImplRow, SelfHead};
 use blaze_scope::resolve::Names;
-use blaze_typeck::{AssocItem, AssocKind, ItemKey, Name, PNode, PTy, PTys, Shape};
+use blaze_surface::ImplFlags;
+use blaze_typeck::{AssocItem, AssocKind, ItemKey, Mutbl, Name, PNode, PTy, PTys, Shape};
 
 use super::heads::{Store, lower};
 use super::index::Index;
@@ -344,6 +346,159 @@ fn file_by_text<'n, S: NamesSource<'n>>(names: S, module: LibKey, trait_text: &s
     }
 }
 
+/// A path as an impl row holds it (`a::b`, `::a::b`: written, without arguments): whether it
+/// is global, and its segments. `None` for a segment that is no plain identifier (`r#a`, a
+/// macro's `$crate`): such an impl is filed from its header's text, where the lowering spells
+/// the segment.
+fn row_path(path: &str) -> Option<(bool, Vec<&str, Global>)> {
+    let (abs, rest) = match path.strip_prefix("::") {
+        Some(rest) => (true, rest),
+        None => (false, path),
+    };
+    let mut texts: Vec<&str, Global> = Vec::new_in(Global);
+    for s in rest.split("::") {
+        let ident = s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_');
+        if !ident {
+            return None;
+        }
+        texts.push(s);
+    }
+    Some((abs, texts))
+}
+
+/// What a self type's head path names, as [`file_row`] keeps it per (module, path).
+#[derive(Clone, Copy)]
+enum SelfAt {
+    Shape(Option<Shape>),
+    NoCheckerType,
+    /// A segment that is no plain identifier: the header's text is read.
+    Text,
+}
+
+/// What one crate's rows resolved so far ([`file_row`]): the trait of the current run of rows
+/// (the rows are sorted by trait path, then module, so each run of equal (trait path, module)
+/// is resolved once) and each self path met, by the module it is written in. One per crate
+/// filed; dropped when its rows are.
+struct RowNames<'n> {
+    /// The run's trait path, its module, and the trait it names (`None`: not a trait as
+    /// written: each impl of the run is filed from its header's text, which says why).
+    run: Option<(&'n str, LibKey, Result<ItemKey, RowMiss>)>,
+    selves: HashMap<(LibKey, &'n str), SelfAt, Global>,
+}
+
+/// Files an impl by its ROW of the items record ([`ImplRow`]: its trait's path and its self
+/// type's head as its header writes them, read from the header's tokens when its crate was
+/// solved), so no text is opened to file it: [`file`]'s twin over a row, with whether the impl
+/// is a blanket trait impl ([`written_trait`]'s second answer).
+///
+/// `None`: the row does not hold what files this impl (its header or its trait did not read
+/// as written; its self type is a form the row does not name, [`SelfHead::Other`]; a path
+/// with a segment that is no plain identifier; a trait path the names do not resolve to a
+/// trait). The caller then reads that impl's header text and files it by [`file`], which
+/// says why.
+///
+/// Where a row files an impl differently from [`file`], it is by a fact of the header as
+/// written, on the side that fact decides:
+/// - the shape is the written self type's head even for a header that does not lower
+///   (`file` then files the impl at every shape of its trait: a wider candidate list);
+/// - `bare` is "the trait is written with no argument list": a trait written with lifetimes
+///   only (`Tr<'a>`) is not bare here, and may be for `file`. Not bare is the wide side
+///   (judged by `Homes::all`): no impl is dropped that `file` keeps.
+fn file_row<'n, S: NamesSource<'n>>(names: S, row: &ImplRow<'n>, kept: &mut RowNames<'n>) -> Result<(Filed, bool), RowMiss> {
+    if row.header_unread {
+        return Err(RowMiss::HeaderUnread);
+    }
+    if row.trait_unread || row.has_trait != row.trait_path.is_some() {
+        return Err(RowMiss::TraitUnread);
+    }
+    let paths = crate::resolve::Paths { names };
+    let shape = match row.head {
+        SelfHead::Other => return Err(RowMiss::SelfOther),
+        // `impl<T> Tr for T`: no constructor (as `shape_step` reads a parameter's name).
+        SelfHead::Param => None,
+        SelfHead::Ref => Some(Shape::Ref(Mutbl::Not)),
+        SelfHead::RefMut => Some(Shape::Ref(Mutbl::Mut)),
+        SelfHead::PtrConst => Some(Shape::Ptr(Mutbl::Not)),
+        SelfHead::PtrMut => Some(Shape::Ptr(Mutbl::Mut)),
+        SelfHead::Slice => Some(Shape::Slice),
+        SelfHead::Array => Some(Shape::Array),
+        SelfHead::Never => Some(Shape::Never),
+        SelfHead::Tuple(n) => Some(Shape::Tuple(u32::from(n))),
+        SelfHead::Path => {
+            let written = row.self_path.ok_or(RowMiss::SelfPath)?;
+            let at = match kept.selves.get(&(row.module, written)).copied() {
+                Some(at) => at,
+                None => {
+                    // The arms of `shape_step`'s path case, over the row's path.
+                    let at = match row_path(written) {
+                        None => SelfAt::Text,
+                        Some((abs, texts)) => match paths.path(row.module, abs, &texts, Ns::Type) {
+                            Ok(f) if f.consumed as usize == texts.len() => match f.kind {
+                                Kind::Struct | Kind::Enum | Kind::Union => SelfAt::Shape(Some(Shape::Adt(checker_of(f.key)))),
+                                Kind::Builtin(name) => SelfAt::Shape(prim_shape(name)),
+                                Kind::TypeAlias => match alias_shape(names, f.key) {
+                                    Ok(shape) => SelfAt::Shape(shape),
+                                    Err(NoCheckerType) => SelfAt::NoCheckerType,
+                                },
+                                Kind::WideInt { .. } => SelfAt::NoCheckerType,
+                                _ => SelfAt::Shape(None),
+                            },
+                            Ok(_) | Err(_) => SelfAt::Shape(None),
+                        },
+                    };
+                    kept.selves.insert((row.module, written), at);
+                    at
+                }
+            };
+            match at {
+                SelfAt::Shape(shape) => shape,
+                // Before the trait is read, as `file` decides it.
+                SelfAt::NoCheckerType => return Ok((Filed::NoCheckerType, false)),
+                SelfAt::Text => return Err(RowMiss::SelfPath),
+            }
+        }
+    };
+    let Some(trait_path) = row.trait_path else { return Ok((Filed::Inherent(shape), false)) };
+    let trait_ = match kept.run {
+        Some((path, module, trait_)) if path == trait_path && module == row.module => trait_,
+        _ => {
+            let trait_ = row_path(trait_path).ok_or(RowMiss::TraitPath).and_then(|(abs, texts)| match paths.path(row.module, abs, &texts, Ns::Type) {
+                Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => Ok(checker_of(f.key)),
+                Ok(_) | Err(_) => Err(RowMiss::NoTrait),
+            });
+            kept.run = Some((trait_path, row.module, trait_));
+            trait_
+        }
+    };
+    let trait_ = trait_?;
+    let blanket = row.head == SelfHead::Param;
+    let negative = row.flags.bits() & ImplFlags::NEGATIVE.bits() != 0;
+    Ok((if negative { Filed::Negative(trait_) } else { Filed::Trait(trait_, shape, row.bare) }, blanket))
+}
+
+/// Why a row did not file its impl ([`file_row`]): the impl's header text is then read. Each
+/// class is counted ([`Buckets::row_misses`], indexed by the class as `usize`): a text opened
+/// that a fuller row would not open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowMiss {
+    /// The header's tokens did not read when the crate was solved.
+    HeaderUnread = 0,
+    /// A trait impl whose trait is not a plain path as written.
+    TraitUnread = 1,
+    /// A self type the row names no head for (`SelfHead::Other`: `dyn Tr`, `fn(A) -> B`,
+    /// `<T as Tr>::Out`, `(T)`, a macro call).
+    SelfOther = 2,
+    /// A self type's path with a segment that is no plain identifier (`$crate`, `r#a`).
+    SelfPath = 3,
+    /// A trait's path with such a segment.
+    TraitPath = 4,
+    /// A trait path the names do not resolve to a trait in the impl's module.
+    NoTrait = 5,
+}
+
+/// The classes of [`RowMiss`], in the order of [`Buckets::row_misses`].
+pub const ROW_MISSES: [&str; 6] = ["header unread", "trait unread", "self type other", "self path not plain", "trait path not plain", "trait not resolved"];
+
 /// The crates an impl must be written in to answer one question, by the coherence rules of the
 /// Reference, "Implementations"; `Any` where they do not narrow it. An impl is filed with its
 /// crate without reading its header, so this narrows unread and refused impls too.
@@ -427,14 +582,14 @@ fn adt_marks<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<Marks> {
 /// Anything else read here (a trait with parameters an impl writes, a reference, a fundamental
 /// wrapper, an opaque type, a closure) is `Any`: the conservative side.
 pub fn trait_home<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>, trait_: ItemKey, shape: Shape) -> Homes {
-    let Some(lib) = keys.library(trait_) else { return Homes::ANY };
+    let Some(lib) = keys.library_in(names, trait_) else { return Homes::ANY };
     let Some(home) = names.crate_of(lib) else { return Homes::ANY };
     // A blanket impl is written in its trait's crate whatever the goal's self type is
     // ([`Homes::blanket`]): the one narrowing that needs nothing but the trait's crate.
     let wide = Homes { blanket: Home::In(home, None), ..Homes::ANY };
     let local = match shape {
         Shape::Adt(k) => {
-            let Some(adt) = keys.library(k) else { return wide };
+            let Some(adt) = keys.library_in(names, k) else { return wide };
             match adt_marks(names, adt) {
                 Some(m) if !m.fundamental => {}
                 _ => return wide,
@@ -443,7 +598,7 @@ pub fn trait_home<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'
             Some(c)
         }
         Shape::Dynamic(Some(t)) => {
-            let Some(c) = keys.library(t).and_then(|l| names.crate_of(l)) else { return wide };
+            let Some(c) = keys.library_in(names, t).and_then(|l| names.crate_of(l)) else { return wide };
             Some(c)
         }
         // Never a local type of any crate (no fundamental type is built in but references).
@@ -490,7 +645,7 @@ pub fn inherent_home<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape
         }
         _ => return Homes::ANY,
     };
-    let Some(lib) = keys.library(nominal) else { return Homes::ANY };
+    let Some(lib) = keys.library_in(names, nominal) else { return Homes::ANY };
     match adt_marks(names, lib) {
         Some(m) if !m.incoherent => {}
         Some(_) => return Homes::one(Home::Incoherent),
@@ -562,6 +717,18 @@ pub struct Buckets {
     /// Over [`Buckets::lazy`]: per crate, whether its impls were filed ([`Buckets::admit`]).
     /// Empty over [`Buckets::new`], which files every crate's.
     lazy_filed: Vec<bool, Global>,
+    /// Over [`Buckets::lazy`]: how many impls [`Buckets::admit`] filed from their rows of the
+    /// items record, no text opened ([`file_row`]).
+    pub filed_from_rows: u32,
+    /// Over [`Buckets::lazy`]: how many impls [`Buckets::admit`] filed from their header's
+    /// text (every impl of a source with no impl rows; else those a row does not file).
+    pub filed_from_text: u32,
+    /// Why each impl a row did not file was read from text, counted by class ([`RowMiss`] as
+    /// `usize`; [`ROW_MISSES`] names the classes).
+    pub row_misses: [u32; 6],
+    /// A test's removed cause ([`Buckets::plant_no_rows`]): every impl is filed from its
+    /// header's text, as before impls were filed from rows.
+    no_rows: bool,
 }
 
 impl Buckets {
@@ -593,7 +760,19 @@ impl Buckets {
             by_text: Vec::new_in(Global),
             blanket: Vec::new_in(Global),
             lazy_filed: Vec::new_in(Global),
+            filed_from_rows: 0,
+            filed_from_text: 0,
+            row_misses: [0; 6],
+            no_rows: false,
         }
+    }
+
+    /// THE CAUSE REMOVED, for tests/front2_records.rs only (rule 23): from now on
+    /// [`Buckets::admit`] files every impl from its header's text, never from its row, so the
+    /// test can count the texts a candidates question opens without the rows.
+    #[doc(hidden)]
+    pub fn plant_no_rows(&mut self) {
+        self.no_rows = true;
     }
 
     /// Files every impl of `index` by its header as written.
@@ -658,11 +837,45 @@ impl Buckets {
             if names.proc_macro(krate) == Some(true) {
                 continue;
             }
+            // The impls whose header text is read: every impl of a source with no impl rows,
+            // else only those a row does not file.
             let mut impls: Vec<super::index::ImplAt<'n>, Global> = Vec::new_in(Global);
-            names.each_impl(krate, &mut |at| impls.push(at));
+            let mut rows: Vec<ImplRow<'n>, Global> = Vec::new_in(Global);
+            if !self.no_rows && names.each_impl_row(krate, &mut |row| rows.push(row)) {
+                // In the record's order (trait path, module, key): `file_row` resolves each run
+                // of equal (trait path, module) once. Every list a row lands in is sorted
+                // before it is read (`sort_filed`, the candidates), so the order filed in is
+                // not seen.
+                let mut kept = RowNames { run: None, selves: HashMap::new_in(Global) };
+                self.krates.extend(rows.iter().map(|row| (row.key, krate)));
+                for row in rows.iter() {
+                    match file_row(names, row, &mut kept) {
+                        Ok((filed, blanket)) => {
+                            if blanket {
+                                self.blanket.push(row.key);
+                            }
+                            self.put(row.key, filed, false);
+                            self.filed_from_rows += 1;
+                        }
+                        Err(miss) => {
+                            self.row_misses[miss as usize] += 1;
+                            match names.impl_with_header(krate, row.key, row.module) {
+                                Some(at) => impls.push(at),
+                                // Its text did not read (the source filed why): unread, a
+                                // candidate of every question, as `file` files an impl with
+                                // no text.
+                                None => self.put(row.key, Filed::Unread(Unread::NoText, None), false),
+                            }
+                        }
+                    }
+                }
+            } else {
+                names.each_impl(krate, &mut |at| impls.push(at));
+                self.krates.extend(impls.iter().map(|at| (at.key, at.krate)));
+            }
             // By key: the order impls are filed in is a function of the records.
             impls.sort_by_key(|at| at.key);
-            self.krates.extend(impls.iter().map(|at| (at.key, at.krate)));
+            self.filed_from_text += impls.len() as u32;
             self.file_all(names, &impls);
         }
         if filed != 0 {
@@ -696,46 +909,55 @@ impl Buckets {
                 }
                 (f, _) => f,
             };
-            if let Filed::Trait(_, _, true) = filed {
-                b.bare.push(at.key);
-            }
-            match filed {
-                Filed::Trait(tr, Some(s), _) => {
-                    push(&mut b.by_shape, (tr, s), at.key);
-                    match s {
-                        Shape::Int(_) | Shape::Uint(_) => push(&mut b.by_shape, (tr, Shape::AnyInt), at.key),
-                        Shape::Float(_) => push(&mut b.by_shape, (tr, Shape::AnyFloat), at.key),
-                        _ => {}
-                    }
+            b.put(at.key, filed, written.is_some_and(bare_text));
+        }
+    }
+
+    /// Puts the impl `key` in the lists `filed` names: the one place an impl is filed, from
+    /// its header's text ([`Buckets::file_all`]) or from its row ([`file_row`]).
+    /// `unread_bare`: for an unread trait impl, whether its trait is written with no type or
+    /// const argument ([`bare_text`]).
+    fn put(&mut self, key: LibKey, filed: Filed, unread_bare: bool) {
+        let b = self;
+        if let Filed::Trait(_, _, true) = filed {
+            b.bare.push(key);
+        }
+        match filed {
+            Filed::Trait(tr, Some(s), _) => {
+                push(&mut b.by_shape, (tr, s), key);
+                match s {
+                    Shape::Int(_) | Shape::Uint(_) => push(&mut b.by_shape, (tr, Shape::AnyInt), key),
+                    Shape::Float(_) => push(&mut b.by_shape, (tr, Shape::AnyFloat), key),
+                    _ => {}
                 }
-                Filed::Trait(tr, None, _) => push(&mut b.any, tr, at.key),
-                Filed::Inherent(Some(s)) => push(&mut b.inherent_by_shape, s, at.key),
-                Filed::Inherent(None) => b.inherent_any.push(at.key),
-                Filed::NoCheckerType => b.no_checker_type += 1,
-                Filed::Negative(tr) => push(&mut b.negative, tr, at.key),
-                Filed::Unread(why, shape) => {
-                    b.unread.push(at.key);
-                    // An unread trait impl written with no type or const argument on its trait
-                    // is judged by `Homes::bare` as a read one is: if it is of the asked trait
-                    // at all, that trait's parameters are at their defaults, so where those
-                    // are `Self` only its self type can be its crate's local type.
-                    if why.is_trait_impl() && written.is_some_and(bare_text) {
-                        b.bare.push(at.key);
-                    }
-                    match (why.is_trait_impl(), shape) {
-                        (false, _) => b.unread_blind.push(at.key),
-                        (true, None) => b.unread_any.push(at.key),
-                        (true, Some(s)) => {
-                            push(&mut b.unread_by_shape, s, at.key);
-                            match s {
-                                Shape::Int(_) | Shape::Uint(_) => push(&mut b.unread_by_shape, Shape::AnyInt, at.key),
-                                Shape::Float(_) => push(&mut b.unread_by_shape, Shape::AnyFloat, at.key),
-                                _ => {}
-                            }
+            }
+            Filed::Trait(tr, None, _) => push(&mut b.any, tr, key),
+            Filed::Inherent(Some(s)) => push(&mut b.inherent_by_shape, s, key),
+            Filed::Inherent(None) => b.inherent_any.push(key),
+            Filed::NoCheckerType => b.no_checker_type += 1,
+            Filed::Negative(tr) => push(&mut b.negative, tr, key),
+            Filed::Unread(why, shape) => {
+                b.unread.push(key);
+                // An unread trait impl written with no type or const argument on its trait
+                // is judged by `Homes::bare` as a read one is: if it is of the asked trait
+                // at all, that trait's parameters are at their defaults, so where those
+                // are `Self` only its self type can be its crate's local type.
+                if why.is_trait_impl() && unread_bare {
+                    b.bare.push(key);
+                }
+                match (why.is_trait_impl(), shape) {
+                    (false, _) => b.unread_blind.push(key),
+                    (true, None) => b.unread_any.push(key),
+                    (true, Some(s)) => {
+                        push(&mut b.unread_by_shape, s, key);
+                        match s {
+                            Shape::Int(_) | Shape::Uint(_) => push(&mut b.unread_by_shape, Shape::AnyInt, key),
+                            Shape::Float(_) => push(&mut b.unread_by_shape, Shape::AnyFloat, key),
+                            _ => {}
                         }
                     }
-                    b.unread_why.push((at.key, why));
                 }
+                b.unread_why.push((key, why));
             }
         }
     }
@@ -746,6 +968,9 @@ impl Buckets {
         b.unread.sort_unstable();
         b.bare.sort_unstable();
         b.blanket.sort_unstable();
+        // Searched by key ([`Buckets::is_unsure`]); over `Buckets::lazy` crates are filed in
+        // the order questions admit them, and a crate's rows before the impls read from text.
+        b.inherent_any.sort_unstable();
         for v in b.negative.values_mut() {
             v.sort_unstable();
         }

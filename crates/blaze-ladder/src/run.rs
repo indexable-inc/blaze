@@ -28,10 +28,10 @@ use blaze_typeck::{
 };
 
 use crate::front::{At, BlazeAttrs, FnKind, FnLang, Front, HOSTED_START};
-use crate::crates::{CratesError, DirShelf, Inputs, Toolchain, UserCrate};
+use crate::crates::{CratesError, DirShelf, Inputs, Toolchain};
+use crate::program_texts::ProgramTexts;
 use crate::front2::program::{Front2Program, Front2Refusal};
 use crate::seam::FrontEnd;
-use edition::PackageEdition;
 use crate::refusal::{NOT_YET, Refusal, RefusalRule, SourceFile};
 use crate::place::{self, Body, Entry, PlaceError, Target, VtableImage, VtableWord};
 
@@ -970,6 +970,12 @@ pub fn run_with(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_voi
         FrontChoice::Old => build(files, root)?,
         FrontChoice::New(new) => build_new(files, root, new)?,
     };
+    run_built(built, host)
+}
+
+/// The last stage of [`run`]: `built` placed in this process and its entry called; the
+/// program's status.
+pub fn run_built(built: Built, host: Option<NonNull<c_void>>) -> Result<u8, RunError> {
     let entry = match (built.start, host) {
         (Start::Plain(entry), _) => entry,
         (Start::Hosted, Some(table)) => Entry::Hosted(table),
@@ -1027,22 +1033,21 @@ pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>) -> Res
         Some(shelf) => Toolchain::open(&mut DirShelf::new(shelf.into())).map_err(RunError::Crates)?,
         None => Toolchain::none(),
     };
-    let dir = std::format!("/{}/", new.package);
-    let mut owned: std::vec::Vec<(std::string::String, std::string::String)> =
-        files.iter().map(|f| (std::format!("{dir}{}", f.path), f.text.into())).collect();
-    let root_at = std::format!("{dir}{root}");
-    let edition = PackageEdition::of_manifest(new.edition).map_err(|_| RunError::Edition { written: new.edition.into() })?;
-    // D59's interim: the entry module is appended to the root's text here, before names
-    // resolve; the names library reads (and keys) the root from `owned` (crates.rs `Texts`).
-    let root_file = files.iter().position(|f| f.path == root).ok_or(RunError::NoMain)?;
-    let appended = crate::front2::entry::append(&mut owned[root_file].1, crate::crates::syntax_of(edition), edition.blaze.is_some(), &tc.program_cfg())
-        .map_err(|e| RunError::Entry { file: root_file as u32, range: e.range(), why: std::format!("{e}").into_boxed_str() })?;
-    let user = UserCrate { name: new.package, dir: &dir, root: &root_at, files: &owned, edition };
+    let texts = ProgramTexts::new(files, root, new, &tc)?;
+    let user = texts.user();
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
+    build_over(&names, files, &texts)
+}
+
+/// [`build_new`] from the program's names on: front2's answers to the back half over `names`
+/// (the program's crate at index 0, resolved from `texts`). For a caller that resolved the
+/// names itself (examples/front2_rungs.rs: the toolchain library once, `crates::library`).
+pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts) -> Result<Built, RunError> {
+    let (root_file, appended) = (texts.root_file, texts.appended);
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
-    let mut program = Front2Program::new(&names, &frame, files).map_err(RunError::Front2)?;
+    let mut program = Front2Program::new(names, &frame, files).map_err(RunError::Front2)?;
     build_with(&mut program).map_err(|error| match (appended, error.function_at()) {
         // A finding inside text the user never wrote is reported at `main`'s parameters.
         (Some(a), Some(at)) if at.file as usize == root_file && at.place >= a.user_len => RunError::Entry {

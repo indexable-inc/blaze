@@ -2266,3 +2266,43 @@ Owed:
   scope; (1) the kind the position needs (a trait in a bound, a type elsewhere), generic arity;
   (3) spelling. A path of several segments: rank the first unresolved segment among the names of
   its parent module or type, with the same counts.
+
+## Generic associated types (2026-11-16; WRITTEN, NEVER COMPILED)
+
+The form: a projection's list is the trait's arguments, `Self` first, then the associated type's
+own type and const arguments in declaration order (`<T as Tr<A>>::Out<B>` is `Alias { args: [T, A,
+B] }`); an impl's `type Out<X> = ..;` is a type over the impl's generics then `X`, which the solver
+instantiates with the impl's arguments and the goal's own (blaze-solve alias.rs `step_impl`).
+Lifetimes are in no list: a portable type holds no region, so `type Iter<'a>` has no own parameter
+and `Iter<'a>` no own argument, as every other lifetime argument is treated.
+
+- The checker is told the counts by a new question, `Question::AssocGenerics(trait, name)` ->
+  `AssocGenerics { parent, own }` (world.rs; `World::assoc_generics` is defaulted to `None` for
+  worlds that declare no generic associated type: make it required in the next batch over the
+  worlds). infer/facts.rs files `own` in `AssocTy`, `ImplAssoc` and `AssocDef` (`own_generics`,
+  `fill_trait`, `fill_impl`, `fill_assoc`). rules/assoc_args.rs `alias_arity`: a written projection
+  with the wrong count is E0107 (`Because::ArgCount`, the own counts) and the error type
+  (machine.rs `lower_node`, `Lower::Body` only). Tests: suite/gat.rs.
+- The front end: world_items.rs answers the question from `Maps::assoc_generics`; heads.rs
+  `Store::impl_` reads an impl's `type Out<X> = ..;` with `X` in scope after the impl's parameters;
+  gat.rs `Builder::gat_bindings` makes `U: Tr<Out<T> = X>` the projection clause with `[U, T]`
+  (called by preds.rs `one_bound`; const_args_in_bounds.rs `angle_args` no longer refuses the form
+  for that caller). Tests: tests/front2_bounds.rs `gat_bind`, `gat_impl`, `gat_where`.
+- Holes: machine.rs `lower_at` no longer memoizes a node that holds a `_`; `lower_holes` lowers it
+  once per written occurrence (`(_, _)` is two variables). Test: suite/holes.rs.
+
+Refused by name (front2 `Why::Unsupported`): "a const argument in a binding of a generic associated
+type (`Name<3> = U`)"; "a binding with type arguments of an associated type whose own parameters
+are not on record"; "a where clause with a trait bound on an associated type (`type Out<T> where T:
+Bound`)"; "a `where const` condition on an associated type"; "a `use<..>` bound in an associated
+type's where clause"; "more than 8 outlives where clauses on one associated type"; "an associated
+type binding on a trait alias (`Alias<Name = T>`)"; and, where the trait is not known to the caller
+(a trait object, `impl Trait`), still "a binding of a generic associated type with type or const
+arguments (`Name<T> = U`)" and "an associated type bound with type or const arguments (`Item<T>:
+Bound`)".
+
+Named gaps, not refusals: gat.rs `OUTLIVES_NOT_CHECKED`: an outlives clause on an associated type
+(`where Self: 'a`) is read and kept (`Maps::assoc_where` for a trait's; an impl's is read and
+dropped after the same refusals) and nothing checks it. A bound on an associated type's own
+parameter (`type Out<T: Clone>`) is not in scope for a `T::X` shorthand inside the impl's value.
+The solver's object candidate still skips a generic associated type's bounds (builtin.rs).

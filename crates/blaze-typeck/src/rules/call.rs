@@ -10,8 +10,10 @@
 //! is not yet known: a deferred call resolution). Arguments are checked in two passes, closures
 //! last after a selection (`Machine::next_arg`). Any other step (a type parameter bounded by
 //! `Fn*`, `dyn Fn*`, a reference to either) is an overloaded call through the `Fn*` traits
-//! (`Machine::overloaded_call`). Omitted for now: the expected-input deduction from the
-//! expected output (`expected_inputs_for_expected_output`), which only sharpens hints.
+//! (`Machine::overloaded_call`). The expected-input deduction from the expected output
+//! (`expected_inputs_for_expected_output`) is `Machine::expected_inputs`
+//! (rules/expect_inputs.rs), for a fn item, a fn pointer and a closure; an overloaded call and
+//! a method call do not ask it yet.
 
 use blaze_own::{Alloc, Vec};
 
@@ -165,6 +167,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     };
                     if let Some((inputs, output)) = sig {
                         self.adjust_autoderef(callee, &steps, i);
+                        // The call's expected type decides what it can of the formal inputs
+                        // before an argument is typed (rules/expect_inputs.rs).
+                        self.expected_inputs(f.expect, inputs, output)?;
                         return self.start_args(f, e, arg_ids, inputs, output, 2, true);
                     }
                 }

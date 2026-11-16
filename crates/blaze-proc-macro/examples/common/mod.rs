@@ -47,10 +47,12 @@ pub fn modules(store: &Path, checkout: &Path) -> Vec<ModuleRecord> {
         let deps = lock_closure(&lock, &name, &version).expect("the macro crate's closure in the lock");
         let id = CrateId { name: &name, version: &version, source, deps: &deps, features: &features };
         match read_module(store, &id) {
-            Ok(module) => {
-                assert_eq!(Some(module.key.as_str()), dir.file_name().and_then(|it| it.to_str()), "the crate's module key is the builder's");
-                out.push(module);
+            // The identity of a record an older builder keyed otherwise now names another
+            // folder of the store (visited in its own turn): this one is no module of today's.
+            Ok(module) if Some(module.key.as_str()) != dir.file_name().and_then(|it| it.to_str()) => {
+                println!("module {}: its identity is keyed {} today: skipped", dir.display(), module.key);
             }
+            Ok(module) => out.push(module),
             Err(error) => println!("module {}: {error}", dir.display()),
         }
     }

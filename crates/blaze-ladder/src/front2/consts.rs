@@ -151,7 +151,7 @@ fn adt_row<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,item: ItemKey, adt
         Some(_) => return Err(refuse(String::from("its row is made and the layout still does not find it"))),
         None => {}
     }
-    let lib = r.keys.library(adt).ok_or_else(|| refuse(String::from("it has no library key")))?;
+    let lib = r.keys.library_in(r.names, adt).ok_or_else(|| refuse(String::from("it has no library key")))?;
     r.store.ensure(r.names, &mut *r.keys, super::heads::Want::Adt(lib)).map_err(|e| refuse(format!("{e}")))?;
     match r.store.adts.get(&adt) {
         Some(a) if a.narrowed => Err(refuse(String::from(narrowed))),
@@ -419,10 +419,10 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
 
     fn fn_kind(&self, item: ItemKey) -> FnKind {
         if let Some(c) = self.store.ctors.get(&item) {
-            let variant = self.keys.library(item).and_then(|lib| crate::resolve::Paths { names: self.names }.variant_of(lib)).map_or(0, |(_, i)| i);
+            let variant = self.keys.library_in(self.names, item).and_then(|lib| crate::resolve::Paths { names: self.names }.variant_of(lib)).map_or(0, |(_, i)| i);
             return FnKind::Ctor { adt: c.adt, variant };
         }
-        match self.keys.library(item) {
+        match self.keys.library_in(self.names, item) {
             Some(lib) => self.free_fn_kind(item, lib),
             None => match self.store.fns.get(&item) {
                 Some(f) if f.has_body => {
@@ -458,7 +458,7 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     fn code_id(&self, item: ItemKey) -> ContentId {
         let mut h = Hasher::new("blaze-ladder front2 constant item");
         h.update(&item.0.to_le_bytes());
-        let text = match self.keys.library(item) {
+        let text = match self.keys.library_in(self.names, item) {
             Some(lib) => self.names.text_of(lib).map(|t| t.text),
             None => self.store.fns.get(&item).map(|f| f.text),
         };
@@ -603,7 +603,7 @@ impl<'n> Consts<'n> {
     /// Lowers and checks the body of `item` (a constant, a static or a `const fn`) for the
     /// evaluator.
     fn check_one<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>,prepared: &Prepares<'n>, item: ItemKey) -> Result<(), ConstFail> {
-        let lowered = match r.keys.library(item) {
+        let lowered = match r.keys.library_in(r.names, item) {
             Some(lib) => lower_fn(r.names, prepared, r.keys, r.store, lib),
             None => lower_member(r.names, prepared, r.keys, r.store, item),
         }
@@ -619,7 +619,7 @@ impl<'n> Consts<'n> {
             let lits = LitTable::of(&view, &lowered.typeck, item)?;
             (checked, lits)
         };
-        let text = match r.keys.library(item) {
+        let text = match r.keys.library_in(r.names, item) {
             Some(lib) => r.names.text_of(lib).map(|t| t.text),
             None => r.store.fns.get(&item).map(|f| f.text),
         }

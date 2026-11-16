@@ -38,7 +38,11 @@ use blaze_own::Alloc;
 use crate::{
     host::{CallError, CompiledFinding, ExpandError, Limits, Runtime, RuntimeError},
     module::{Exported, ModuleError, ModuleRecord},
-    record::{DirStore, RecordError, base_key, find, keep},
+    parts::Part,
+    record::{
+        DirStore, RecordError, base_key,
+        table::{self, CrateResults, Kept},
+    },
     sandbox::Package,
 };
 
@@ -139,11 +143,78 @@ pub struct ProcMacros<'r> {
     limits: Limits,
     crates: Vec<MacroCrate>,
     findings: Mutex<Vec<Finding>>,
+    /// Each package a call was expanded in, with its crate's results as this command found
+    /// them and the rows it ran ([`crate::record::table`]): sorted by the package's address,
+    /// which a slot keeps alive, so a package is found by identity with no hash of it a call.
+    /// DEBT: prelude `Vec`s here and in the table's rows, not blaze-own's with an allocator
+    /// passed: `ProcMacros::new` takes none (its callers are other lanes' drivers).
+    slots: Mutex<Vec<Arc<CrateSlot>>>,
+}
+
+/// One package's results: see [`ProcMacros::slots`].
+struct CrateSlot {
+    package: Arc<Package>,
+    results: CrateResults,
+}
+
+/// What [`ProcMacros::keep_all`] wrote.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct KeptAll {
+    /// Crates whose table was written again.
+    pub tables: usize,
+    /// The rows those tables hold, and their bytes with the seals.
+    pub rows: usize,
+    pub bytes: usize,
 }
 
 impl<'r> ProcMacros<'r> {
     pub fn new(runtime: &'r Runtime, store: &'r DirStore, limits: Limits) -> ProcMacros<'r> {
-        ProcMacros { runtime, store, limits, crates: Vec::new(), findings: Mutex::new(Vec::new()) }
+        ProcMacros { runtime, store, limits, crates: Vec::new(), findings: Mutex::new(Vec::new()), slots: Mutex::new(Vec::new()) }
+    }
+
+    /// The results of the crate `package` is: opened at the package's first call (one read
+    /// of the crate's table, proved once), found by the package's identity after.
+    fn slot(&self, package: &Arc<Package>) -> Result<Arc<CrateSlot>, RecordError> {
+        let address = |slot: &Arc<CrateSlot>| Arc::as_ptr(&slot.package).addr();
+        let wanted = Arc::as_ptr(package).addr();
+        {
+            let slots = crate::host::lock(&self.slots);
+            let at = slots.partition_point(|slot| address(slot) < wanted);
+            if let Some(slot) = slots.get(at).filter(|slot| address(slot) == wanted) {
+                // clone: the slot, a refcount.
+                return Ok(Arc::clone(slot));
+            }
+        }
+        // Opened outside the lock: another worker's calls do not wait on this crate's read.
+        // clone: the package, a refcount the slot holds so its address stays this package's.
+        let made = Arc::new(CrateSlot { package: Arc::clone(package), results: table::open(self.store, table::crate_name(package))? });
+        let mut slots = crate::host::lock(&self.slots);
+        let at = slots.partition_point(|slot| address(slot) < wanted);
+        if let Some(slot) = slots.get(at).filter(|slot| address(slot) == wanted) {
+            // Another worker opened it meanwhile: its slot is the crate's, this one is dropped.
+            return Ok(Arc::clone(slot));
+        }
+        slots.insert(at, Arc::clone(&made));
+        Ok(made)
+    }
+
+    /// Writes the results table of every crate this command ran a new call in: each whole,
+    /// under a temporary name, renamed onto the crate's. A driver calls it when its crates
+    /// are expanded (and may again: a crate with nothing new since is not written).
+    pub fn keep_all(&self) -> Result<KeptAll, RecordError> {
+        let mut mark = self.runtime.parts().start();
+        // clone: the slots, a refcount each: no table is written under the lock.
+        let slots: Vec<Arc<CrateSlot>> = crate::host::lock(&self.slots).clone();
+        let mut kept = KeptAll::default();
+        for slot in &slots {
+            if let Kept::Written { rows, bytes } = slot.results.keep(self.store)? {
+                kept.tables += 1;
+                kept.rows += rows;
+                kept.bytes += bytes;
+            }
+        }
+        mark.lap(Part::Keep);
+        Ok(kept)
     }
 
     /// Registers a macro crate `name version` with its module (as [`crate::module::read_module`]
@@ -217,6 +288,11 @@ impl<'r> ProcMacros<'r> {
         Ok(self.runtime.compiles() - before)
     }
 
+    /// Where the calls' time went so far ([`crate::parts`]).
+    pub fn parts(&self) -> &crate::parts::Parts {
+        self.runtime.parts()
+    }
+
     fn report(&self, finding: Finding) {
         self.findings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(finding);
     }
@@ -246,16 +322,23 @@ impl<'r> ProcMacros<'r> {
             self.report(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
             return Err(refused);
         };
+        let parts = self.runtime.parts();
+        let mut mark = parts.start();
         let base = base_key(&module.wasm_sha256, export, edition, call);
-        match find(self.store, &base, package, edition, alloc) {
-            Ok(Some(produced)) => return Ok(produced),
-            Ok(None) => {}
+        mark.lap(Part::Key);
+        let found = self.slot(package).and_then(|slot| Ok((slot.results.find(self.store, &base, package, edition, alloc)?, slot)));
+        mark.lap(Part::Find);
+        let slot = match found {
+            Ok((Some(produced), _)) => return Ok(produced),
+            Ok((None, slot)) => slot,
             Err(error) => {
                 self.report(Finding::Record { base, error });
                 return Err(failed);
             }
-        }
-        let loaded = match self.runtime.load(module) {
+        };
+        let loaded = self.runtime.load(module);
+        mark.lap(Part::Load);
+        let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(error) => {
                 if !macro_crate.reported.swap(true, Ordering::Relaxed) {
@@ -266,7 +349,10 @@ impl<'r> ProcMacros<'r> {
         };
         match self.runtime.expand(&loaded, export, call, edition, package.clone(), self.limits, alloc) {
             Ok(ran) => {
-                if let Err(error) = keep(self.store, base, &ran.produced) {
+                let mut mark = parts.start();
+                let kept = slot.results.insert(self.store, base, &ran.produced);
+                mark.lap(Part::Keep);
+                if let Err(error) = kept {
                     self.report(Finding::Record { base, error });
                 }
                 Ok(ran.produced)

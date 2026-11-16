@@ -212,6 +212,19 @@ pub(crate) struct Step {
     pub overloaded: bool,
 }
 
+/// The steps [`Machine::lower_holes`] takes over one written type that holds a hole (rule 18):
+/// two per written node, so a type of 32,768 written nodes.
+const HOLE_STEPS: usize = 1 << 16;
+
+/// What the nodes under the one being lowered were lowered to ([`Machine::lower_at`]).
+pub(crate) struct Lowered<'a> {
+    /// By node index: a node without a hole in its subtree, lowered once.
+    memo: Vec<Option<Ty>, Alloc<'a>>,
+    /// A node that holds a hole is lowered once per written occurrence
+    /// ([`Machine::lower_holes`]): `(node, type)` for each occurrence its parent has not taken.
+    pool: Vec<(u32, Ty), Alloc<'a>>,
+}
+
 /// How a portable type's generic parameters and holes are lowered.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Lower {
@@ -1070,8 +1083,16 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         if n > types.nodes.len() {
             return Err(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }).into());
         }
-        let mut memo: Vec<Option<Ty>, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
-        memo.resize(n, None);
+        let mut low = Lowered { memo: Vec::with_capacity_in(n, self.alloc), pool: Vec::new_in(self.alloc) };
+        low.memo.resize(n, None);
+        // A node is `holey` when a hole (`_`) is in its subtree. The table interns nodes, so
+        // two written holes are ONE `Infer` node, and `Vec<_>` written twice is one node too: a
+        // holey node is never memoized (one memo entry would make the two holes one
+        // variable); it is lowered once per written occurrence, after this loop
+        // ([`Machine::lower_holes`]). Filled (and read) only once a hole was met, so a type
+        // without holes pays nothing.
+        let mut holey: Vec<bool, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut any_hole = false;
         let mut stack: Vec<(u32, bool), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
         stack.push((root.0, false));
@@ -1084,7 +1105,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             if steps > bound {
                 return Err(CheckError::Limit(Limit::Export).into());
             }
-            if memo[at as usize].is_some() {
+            if low.memo[at as usize].is_some() || (any_hole && holey[at as usize]) {
                 continue;
             }
             let node = types.node(PTy(at))?;
@@ -1096,19 +1117,33 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     if c.0 >= at {
                         return Err(CheckError::Malformed(Malformed::TypeOrder { node: at, child: c.0 }).into());
                     }
-                    if memo[c.0 as usize].is_none() {
+                    if low.memo[c.0 as usize].is_none() && !(any_hole && holey[c.0 as usize]) {
                         stack.push((c.0, false));
                     }
                 }
                 continue;
             }
-            let ty = self.lower_node(node, types, &memo, mode, cause)?;
-            memo[at as usize] = Some(ty);
+            let mut hole = matches!(node, PNode::Infer);
+            if any_hole && !hole {
+                kids.clear();
+                children(node, types, &mut kids)?;
+                hole = kids.iter().any(|c| holey[c.0 as usize]);
+            }
+            if hole {
+                if !any_hole {
+                    holey.resize(n, false);
+                    any_hole = true;
+                }
+                holey[at as usize] = true;
+                continue;
+            }
+            let ty = self.lower_node(node, types, &mut low, mode, cause)?;
+            low.memo[at as usize] = Some(ty);
         }
         // The lowered nodes are exactly the type's subtree.
         if let Some(at) = dyn_at {
-            for (i, m) in memo.iter().enumerate() {
-                if m.is_none() {
+            for (i, m) in low.memo.iter().enumerate() {
+                if m.is_none() && !(any_hole && holey[i]) {
                     continue;
                 }
                 if let PNode::Dynamic(l) = types.node(PTy(i as u32))?
@@ -1118,20 +1153,74 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 }
             }
         }
-        match memo[root.0 as usize] {
+        if any_hole && holey[root.0 as usize] {
+            return self.lower_holes(types, root, mode, cause, &mut low, &holey);
+        }
+        match low.memo[root.0 as usize] {
             Some(t) => Ok(t),
             None => Err(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }).into()),
         }
     }
 
-    fn lowered(memo: &[Option<Ty>], t: PTy) -> Result<Ty, Stop> {
-        match memo.get(t.0 as usize).copied().flatten() {
-            Some(t) => Ok(t),
+    /// Lowers a type that holds a hole, once per WRITTEN OCCURRENCE of each holey node (the
+    /// Reference, "Inferred type": "The inferred type asks the compiler to infer the type if
+    /// possible based on the surrounding information available": each written `_` asks on its
+    /// own, so `(_, _)` is two variables, and `(Vec<_>, Vec<_>)` two too). `low.memo` holds
+    /// every node of the subtree without a hole ([`Machine::lower_at`] lowered those once: a
+    /// type without a hole means the same wherever it is written); each occurrence of a holey
+    /// node goes to `low.pool` when it is lowered, and its parent takes it from there
+    /// ([`Machine::lowered`]). The walk is over the written tree, so its steps are the
+    /// written type's size; a table whose sharing makes that tree larger than
+    /// [`HOLE_STEPS`] is refused ([`Limit::Export`]).
+    fn lower_holes(&mut self, types: PTys<'_>, root: PTy, mode: Lower, cause: Cause, low: &mut Lowered<'a>, holey: &[bool]) -> Result<Ty, Stop> {
+        let mut stack: Vec<(u32, bool), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        stack.push((root.0, false));
+        let mut steps = 0usize;
+        while let Some((at, expanded)) = stack.pop() {
+            steps += 1;
+            if steps > HOLE_STEPS {
+                return Err(CheckError::Limit(Limit::Export).into());
+            }
+            let node = types.node(PTy(at))?;
+            if expanded {
+                let ty = self.lower_node(node, types, low, mode, cause)?;
+                low.pool.push((at, ty));
+                continue;
+            }
+            stack.push((at, true));
+            kids.clear();
+            children(node, types, &mut kids)?;
+            // An array's `_` length is made by the array's own arm (a const variable), which
+            // never reads the node: no occurrence is lowered for it.
+            let len_hole = match (node, mode) {
+                (PNode::Array(_, len), Lower::Body) if matches!(types.node(len)?, PNode::Infer) => Some(len),
+                _ => None,
+            };
+            for &c in kids.iter() {
+                // `lower_at` checked the order of every node reached here.
+                if holey.get(c.0 as usize).copied().unwrap_or(false) && Some(c) != len_hole {
+                    stack.push((c.0, false));
+                }
+            }
+        }
+        Self::lowered(low, root)
+    }
+
+    /// What the child `t` of the node being lowered was lowered to: the memo's entry, or (a
+    /// node that holds a hole) one of its occurrences waiting in the pool: which one does not
+    /// matter, each is a lowering of the same node with its own fresh variables.
+    fn lowered(low: &mut Lowered<'a>, t: PTy) -> Result<Ty, Stop> {
+        if let Some(t) = low.memo.get(t.0 as usize).copied().flatten() {
+            return Ok(t);
+        }
+        match low.pool.iter().rposition(|&(n, _)| n == t.0) {
+            Some(i) => Ok(low.pool.swap_remove(i).1),
             None => Err(CheckError::Malformed(Malformed::TypeOrder { node: t.0, child: t.0 }).into()),
         }
     }
 
-    fn lowered_list(&mut self, memo: &[Option<Ty>], types: PTys<'_>, l: crate::ids::List) -> Result<TyList, Stop> {
+    fn lowered_list(&mut self, memo: &mut Lowered<'a>, types: PTys<'_>, l: crate::ids::List) -> Result<TyList, Stop> {
         let src = types.list(l)?;
         let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(src.len(), self.alloc);
         for &t in src {
@@ -1140,7 +1229,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.mk_list(&v)
     }
 
-    fn lower_node(&mut self, node: PNode, types: PTys<'_>, memo: &[Option<Ty>], mode: Lower, cause: Cause) -> Result<Ty, Stop> {
+    fn lower_node(&mut self, node: PNode, types: PTys<'_>, memo: &mut Lowered<'a>, mode: Lower, cause: Cause) -> Result<Ty, Stop> {
         let view = match node {
             PNode::Bool => TyView::Bool,
             PNode::Char => TyView::Char,
@@ -1203,6 +1292,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             PNode::Alias { trait_, name, args } => {
                 let args = self.lowered_list(memo, types, args)?;
+                // A written projection onto a generic associated type with the wrong count
+                // of arguments is E0107 and the error type (rules/assoc_args.rs); a world's
+                // answer (`Lower::Args`) is not re-checked here.
+                if matches!(mode, Lower::Body) {
+                    let written = self.ty.list_len(args);
+                    if !self.alias_arity(trait_, name, written, cause)? {
+                        return self.mk(TyView::Error);
+                    }
+                }
                 let term = self.fresh()?;
                 self.ty.register(Obligation {
                     goal: Goal::Projection { trait_, args, name, term },

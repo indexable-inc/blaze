@@ -30,7 +30,7 @@ use bstd::fs::Fs;
 use bstd::mem::Frame;
 
 use crate::CliError;
-use crate::fetch::{FetchEnv, Lockfile, SOURCES};
+use crate::fetch::{FetchEnv, Lockfile};
 use crate::work::{Did, Made, held_str};
 
 const GRAPH_OUT_DOMAIN: &str = "blaze-cli unit graph out 1";
@@ -174,6 +174,13 @@ pub struct Parts {
     resolver: Resolver,
 }
 
+impl Parts {
+    /// Each member's lock entry and its directory, anchor-relative, in the layout's order.
+    pub fn member_dirs(&self) -> &[(LockId, blaze_unit_graph::Text<'static>)] {
+        &self.dirs
+    }
+}
+
 /// The job's inputs and what its entries mapped, for the command.
 pub struct Graph<'f> {
     /// The job's source (`unit_graph_task::source`), handed in `Start`.
@@ -230,13 +237,13 @@ pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, frame: &Frame) -> Resul
     Ok(TargetDesc::new(TRIPLE, cfg, Alloc::global()))
 }
 
-/// The records of the `Fetch` jobs the task was handed, mapped from `.blaze/v2/sources/` once a
+/// The records of the `Fetch` jobs the task was handed, mapped from `<home>/.blaze/v2/sources/` once a
 /// command and read in place (never read whole).
 struct Mapped<'s, 'f> {
     /// The subjects of the handed `Fetch` jobs that hold their sources, sorted.
     handed: &'s [ContentId],
     mapped: &'s mut Vec<(ContentId, &'f [u8]), &'f Frame>,
-    /// The records' folder, relative to where blaze was started.
+    /// The records' folder as the machine names it (`fetch::sources_native`).
     folder: &'s str,
     frame: &'f Frame,
     /// The first record that could not be mapped: the store's fault.
@@ -290,14 +297,13 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
     let mut failed = Vec::new_in(held);
     failed.extend(task.failed.iter().filter(|need| need.kind == Kind::Fetch).map(|need| need.subject));
     failed.sort_unstable();
-    let mut folder = std::string::String::with_capacity(env.checkout.len() + SOURCES.len() + 1);
-    if !env.checkout.is_empty() {
-        folder.push_str(env.checkout);
-        folder.push('/');
-    }
-    folder.push_str(SOURCES);
+    // The machine's sources store beneath the home (fetch.rs `SOURCES`), where every `Fetch`
+    // task wrote its unit's record: never the checkout.
+    let Some(folder) = crate::fetch::sources_native(env, held) else {
+        return Err(CliError::Text { what: "HOME is not set: the sources store (fetch.rs `SOURCES`) is beneath it" });
+    };
     let mut unmapped = None;
-    let records = Mapped { handed: &handed, mapped: &mut graph.mapped, folder: &folder, frame, error: &mut unmapped };
+    let records = Mapped { handed: &handed, mapped: &mut graph.mapped, folder: folder.as_str(), frame, error: &mut unmapped };
     let unheld = Unheld { failed: &failed, refused: &refused };
     let entry = unit_graph_task::run(&graph.inputs, lockfile.lock, records, PackView::open_source_put, unheld, Alloc::global());
     if let Some(error) = unmapped {

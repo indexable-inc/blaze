@@ -12,17 +12,19 @@ use blaze_id::ItemKey as LibKey;
 use blaze_ids::ContentId;
 use blaze_lower::scoped::Prepares;
 use blaze_own::{AString, AVec, Alloc};
-use blaze_scope::resolve::{At, Names};
-use blaze_surface::ItemDetail;
+use blaze_scope::resolve::Names;
 
 use super::Front2;
 use super::FrontError;
 use super::body::{Body, BodyError, lower_fn, lower_member};
 use super::buckets::Buckets;
-use super::check::{CheckFail, Records, BuildOrder, check_body, eval_len};
+use super::check::{CheckFail, Records, BuildOrder, check_body_asked, eval_len};
 use super::consts::{ConstFail, Consts};
 use super::heads::{HeadError, Store, Want};
 use super::keys::{MemberKind, checker_of};
+use super::project_records::{BodySource, ByChain, ChainError, ChainOf, Listed, index_by_chain, list_bodies};
+use super::reads::{Asked, BodyReads, Reach, ReadsError, facts_of};
+use super::source::{self, NamesSource};
 use super::spell::Spelling;
 use super::types::Why;
 use super::world_items::Gap;
@@ -31,9 +33,6 @@ use crate::refusal::SourceFile;
 /// How many constants an array length in one body's heads may name before the body is
 /// refused ([`Refused::Lengths`]): reach.rs's and the census's `MOST_LENS`.
 const MOST_LENS: u32 = 64;
-
-/// The domain of a body's read-list digest ([`BodyVerdict::reads`]).
-const READS_DOMAIN: &str = "blaze-ladder front2 body reads v1";
 
 /// One body of the program's own crate: a free fn, or a fn member of an impl or a trait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -110,10 +109,14 @@ pub struct BodyVerdict<'a> {
     pub gaps: AVec<'a, Gap>,
     /// The one refusal that stopped the body, if any.
     pub refused: Option<Refused>,
-    /// The digest of the check's read list (each question and its answer's hash, sorted by
-    /// question): `Some` only for a check that finished clean (a check with diagnostics does not
-    /// hand its read list back from front2/check.rs yet).
+    /// The digest of [`BodyVerdict::facts`] (`BodyReads::digest`): `Some` for a check that
+    /// finished (clean or with diagnostics: the list is then whole, every fact with its
+    /// answer), `None` for one that stopped or never ran, and for a list that was refused.
     pub reads: Option<ContentId>,
+    /// The body's read list as facts (front2 reads.rs): what its check asked of the world, each
+    /// with the digest of the answer it got, sorted by fact. Every body has one, whatever its
+    /// verdict; `reach` says how far the check got. `Err`: a read that names no fact, by name.
+    pub facts: Result<BodyReads<'a>, ReadsError>,
 }
 
 impl BodyVerdict<'_> {
@@ -124,12 +127,21 @@ impl BodyVerdict<'_> {
 }
 
 /// The front end and its records over one command's names: made once, then one body at a time.
-pub struct ProjectWorld<'n> {
-    pub front: Front2<'n>,
+///
+/// Its names come from the source `S` (`source::NamesSource`), in the shape of
+/// `check::Records`: the names this command solved (`ProjectWorld<'n>`, made by
+/// [`ProjectWorld::new`]) or each crate's records (`ProjectWorld<'n, &source::Records>`, made
+/// by [`ProjectWorld::from_records`]). Every method is one function over both.
+pub struct ProjectWorld<'n, S = &'n Names<'n>> {
+    pub front: Front2<'n, S>,
     store: Store<'n>,
     buckets: Option<Buckets>,
     consts: Consts<'n>,
     prepared: &'n Prepares<'n>,
+    /// The command's allocator: the body index ([`ProjectWorld::chains`]) is made in it once.
+    alloc: Alloc<'n>,
+    /// The bodies by (file, chain), made by the first [`ProjectWorld::chains`].
+    by_chain: Option<ByChain<'n>>,
 }
 
 impl<'n> ProjectWorld<'n> {
@@ -138,54 +150,70 @@ impl<'n> ProjectWorld<'n> {
     pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], alloc: Alloc<'n>) -> Result<ProjectWorld<'n>, FrontError> {
         let front = Front2::new(names, frame, user)?;
         let store = Store::new(front.index.lang("sized"), frame);
-        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc) })
+        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
     }
+}
 
+impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
+    /// The world over each crate's records, nothing solved in this command (the program's
+    /// crate at index 0): `Front2::from_records`, which reads only the lang rows of
+    /// `lang_crates`. What a record could not answer is in `records.errors()`: read it after
+    /// each body, a verdict over a log that is not empty is void.
+    pub fn from_records(records: &'n source::Records<'n>, frame: &'n blaze_mem::Frame, lang_crates: &[usize], alloc: Alloc<'n>) -> Result<ProjectWorld<'n, &'n source::Records<'n>>, FrontError> {
+        let front = Front2::from_records(records, frame, lang_crates)?;
+        let store = Store::new(front.index.lang("sized"), frame);
+        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
+    }
+}
+
+impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// Every body of the program's own crate, in key order (free fns, then each container's
     /// fn members), each with where it is written.
     pub fn bodies<'a>(&self, alloc: Alloc<'a>) -> AVec<'a, (BodyRef<'n>, Option<BodyAt>)> {
-        let names = self.front.names;
+        let listed = list_bodies(self.front.names, alloc);
         let mut out: AVec<'a, (BodyRef<'n>, Option<BodyAt>)> = AVec::new_in(alloc);
-        let at = |key: LibKey, text: &str| -> Option<BodyAt> {
-            let place = names.place(key)?;
-            let At::File(file) = place.at else { return None };
-            let (base, _) = names.krate(0).outline_at(place.at)?;
-            let (b, t) = (base.as_ptr() as usize, text.as_ptr() as usize);
-            (t >= b && t <= b + base.len()).then(|| BodyAt { file, start: (t - b) as u32 })
-        };
-        for (key, _, _) in names.items(0) {
-            let Some(it) = names.item_text(key) else { continue };
-            match self.front.resolver.detail(key) {
-                Some(ItemDetail::Fn { .. }) if !it.text.trim_end().ends_with(';') => out.push((BodyRef::Free(key), at(key, it.text))),
-                Some(d @ (ItemDetail::Impl | ItemDetail::Trait)) => {
-                    for m in names.members(key).unwrap_or(&[]) {
-                        let (ItemDetail::Fn { .. }, Some(name)) = (m.detail, m.name) else { continue };
-                        out.push((BodyRef::Member { container: key, is_trait: matches!(d, ItemDetail::Trait), name }, at(key, m.text)));
-                    }
-                }
-                _ => {}
-            }
+        for l in listed.iter() {
+            out.push((l.body, l.at));
         }
-        // Members are filed under their container: a free fn listed again as a member is one body.
-        let members: AVec<'a, LibKey> = {
-            let mut v = AVec::new_in(alloc);
-            for (key, _, _) in names.items(0) {
-                for m in names.members(key).unwrap_or(&[]) {
-                    v.push(m.key);
-                }
-            }
-            v.sort_unstable();
-            v
-        };
-        out.retain(|(b, _)| !matches!(b, BodyRef::Free(k) if members.binary_search(k).is_ok()));
-        out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// [`ProjectWorld::bodies`] with each body's entry in its file's outline.
+    pub fn listed<'a>(&self, alloc: Alloc<'a>) -> AVec<'a, Listed<'n>> {
+        list_bodies(self.front.names, alloc)
+    }
+
+    /// The program's own bodies by (file, item chain), made on the first call in the world's
+    /// allocator and kept: each file that holds a body is outlined at most once per world.
+    pub fn chains(&mut self) -> Result<&ByChain<'n>, ChainError<'n>> {
+        let index = match self.by_chain.take() {
+            Some(index) => index,
+            None => self.index_with(&blaze_file_items::item_chain)?,
+        };
+        Ok(self.by_chain.insert(index))
+    }
+
+    /// The body the command names by its file (the file's index in the program's own crate:
+    /// an `At::File`'s, the items record's file row) and the chain of its outline entry
+    /// (`blaze_file_items::item_chain(&outline, item, text)`): one binary search in
+    /// [`ProjectWorld::chains`]. `Ok(None)`: no body of that file has that chain.
+    pub fn body_by_chain(&mut self, file: u32, chain: ContentId) -> Result<Option<BodyRef<'n>>, ChainError<'n>> {
+        Ok(self.chains()?.get(file, chain))
+    }
+
+    /// The body index made with `chain` as the chain function, not kept: the seam
+    /// [`ProjectWorld::chains`] fills with `blaze_file_items::item_chain`, and a test with a
+    /// planted bug.
+    pub fn index_with(&self, chain: ChainOf<'_>) -> Result<ByChain<'n>, ChainError<'n>> {
+        let listed = list_bodies(self.front.names, self.alloc);
+        index_by_chain(self.front.names, &listed, chain, self.alloc)
     }
 
     /// Checks one body: lowered, its heads made (an array length's constant evaluated as met),
     /// then checked over the command's records.
     pub fn check<'a>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>) -> BodyVerdict<'a> {
-        let mut verdict = BodyVerdict { diagnostics: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None };
+        let mut verdict =
+            BodyVerdict { diagnostics: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)) };
         let prepared = self.prepared;
         let mut r = Records {
             names: self.front.names,
@@ -212,13 +240,31 @@ impl<'n> ProjectWorld<'n> {
             }
         };
         let scope = lowered.scope(&spell);
-        match check_body(&mut r, &lowered, &scope) {
+        // The read list as facts (front2 reads.rs), for every outcome: the list of the run
+        // that finished, or the questions of the last round of a check that stopped.
+        let module = checker_of(lowered.module);
+        let written = lowered.typeck.view(lowered.tys.view());
+        let whole = |list: &blaze_typeck::ReadList<'_>| -> Result<BodyReads<'a>, ReadsError> {
+            let rows = facts_of(list.questions(), Some(list.rows.column::<1>()), module, written.paths, written.segments, alloc)?;
+            Ok(BodyReads { rows, reach: Reach::Whole })
+        };
+        let mut asked = Asked::new_in(alloc);
+        let checked = check_body_asked(&mut r, &lowered, &scope, None, Some(&mut asked));
+        verdict.facts = match (&checked, &asked.finished) {
+            (Ok(done), _) => whole(&done.reads),
+            (Err(_), Some(list)) => whole(list),
+            (Err(_), None) => facts_of(&asked.questions, None, module, written.paths, written.segments, alloc).map(|rows| BodyReads { rows, reach: Reach::Asked }),
+        };
+        if let Ok(list) = &verdict.facts
+            && list.reach == Reach::Whole
+            && matches!(checked, Ok(_) | Err(CheckFail::Diags { .. }))
+        {
+            verdict.reads = Some(list.digest(alloc));
+        }
+        match checked {
             Ok(done) => {
                 for d in done.diags.iter() {
                     verdict.diagnostics.push(BodyDiagnostic { code: d.code.code(), text: AString::new_in(alloc), start: d.at.start, end: d.at.end });
-                }
-                if done.diags.is_empty() {
-                    verdict.reads = Some(reads_digest(&done.reads, alloc));
                 }
             }
             Err(CheckFail::Diags { diags, .. }) => {
@@ -240,7 +286,7 @@ impl<'n> ProjectWorld<'n> {
 
 /// Lowers `body`, evaluating each constant an array length in its heads names, at most
 /// [`MOST_LENS`] of them; a member's container head is made first.
-fn lower<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, body: BodyRef<'n>) -> Result<Body<'n>, Refused> {
+fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, body: BodyRef<'n>) -> Result<Body<'n>, Refused> {
     enum Target {
         Free(LibKey),
         Member(blaze_typeck::ItemKey),
@@ -289,23 +335,3 @@ fn lower<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, body: BodyRef<'n>
     }
 }
 
-/// The digest of a read list: each question (its derived `Hash` bytes) and its answer's hash,
-/// in the list's order (sorted by question, deduplicated, by blaze-typeck's contract).
-fn reads_digest(reads: &blaze_typeck::ReadList<'_>, alloc: Alloc<'_>) -> ContentId {
-    use core::hash::{Hash, Hasher};
-    struct Bytes<'b>(AVec<'b, u8>);
-    impl Hasher for Bytes<'_> {
-        fn write(&mut self, bytes: &[u8]) {
-            self.0.extend_from_slice(bytes);
-        }
-        fn finish(&self) -> u64 {
-            0
-        }
-    }
-    let mut out = Bytes(AVec::new_in(alloc));
-    for (q, h) in reads.rows.column::<0>().iter().zip(reads.rows.column::<1>().iter()) {
-        q.hash(&mut out);
-        out.write(&h.to_le_bytes());
-    }
-    ContentId::of(READS_DOMAIN, &out.0)
-}

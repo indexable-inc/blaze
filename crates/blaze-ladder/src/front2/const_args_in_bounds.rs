@@ -97,8 +97,15 @@ pub(super) fn angle_args<'t>(
             // is in a type.
             lf::GenericArg::AssocType { name, args, ty } if lifetime_args(v, args)? => binds.push((Name(v.name(name)?), make(tys, ty)?)),
             lf::GenericArg::AssocBound { name, args, bounds } if lifetime_args(v, args)? => nested.push((Name(v.name(name)?), bounds)),
-            // The projection clause has no place for the associated type's own arguments yet
-            // (hybrid_array's `U: ArraySize<ArrayType<T> = [T; N]>`): refused by name.
+            // A binding of a generic associated type with type arguments (hybrid_array's `U:
+            // ArraySize<ArrayType<T> = [T; N]>`) is a projection whose list carries those
+            // arguments after the trait's: made by `Builder::gat_bindings` (gat.rs), which
+            // reads the segment again, for the one caller that knows the trait and makes
+            // clauses (`Builder::one_bound`, through `bound_segment_args`, which refuses the
+            // form on a trait alias). Not in `binds`: that list has no place for them.
+            lf::GenericArg::AssocType { .. } if declared.is_some() => {}
+            // A caller that does not know the trait (a trait object, `impl Trait`): refused
+            // by name.
             lf::GenericArg::AssocType { .. } => return Err(Why::Unsupported("a binding of a generic associated type with type or const arguments (`Name<T> = U`)", r)),
             lf::GenericArg::AssocBound { .. } => return Err(Why::Unsupported("an associated type bound with type or const arguments (`Item<T>: Bound`)", r)),
             lf::GenericArg::AssocConst { .. } => return Err(Why::Unsupported("an associated const binding in a bound (`Tr<N = 3>`)", r)),
@@ -119,7 +126,20 @@ impl<'b, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
             return segment_args(tys, v, seg, r, &mut |tys, t| self.ty(tys, env, v, t));
         }
         let key = match target {
-            Bounded::Trait(key) | Bounded::Alias(key) => key,
+            Bounded::Trait(key) => key,
+            // A trait alias takes no binding (`one_bound` refuses `Alias<Name = T>`), and
+            // one with type arguments is never handed back by `angle_args`: refused here
+            // under the same name.
+            Bounded::Alias(key) => {
+                for &n in v.rows(seg.args)? {
+                    if let lf::GenericArg::AssocType { args, .. } = lf::GenericArg::decode(n)?
+                        && !lifetime_args(v, args)?
+                    {
+                        return Err(Why::Unsupported("an associated type binding on a trait alias (`Alias<Name = T>`)", r));
+                    }
+                }
+                key
+            }
         };
         let consts = self.heads.const_params(key).ok_or(Why::Need(key))?;
         let declared = Declared { consts, make: &mut |tys, text, at, want| self.const_term(tys, env, text, at, &|_| Ok(want)) };

@@ -20,7 +20,16 @@
 //! in any order writes equal bytes): a 256-byte header (`BZIT`, version, then u32 fields: crate
 //! flags, edition, the count of each table, the offset of each section, the strings' length, the
 //! crate's name; at 160 the crate key, at 192 the root module, at 224 the proc-macro key); then
-//! the rows of each table, each laid out at its row type below; then the strings.
+//! the rows of each table, each laid out at its row type below; then the strings; then the
+//! item grain section ([`grain`]: each item row's chain and piece digests, its offset in header
+//! field 37), by which an edit voids only the items it touches; then the member owners section
+//! ([`owners`]: each named member's key with its owner's row, sorted by member key, its count
+//! and offset in header fields 35 and 36), by which "who owns this member" is one search.
+
+pub mod grain;
+pub mod owners;
+
+pub use grain::{ItemNow, ItemPieces, ItemToday};
 
 use core::cell::{Cell, OnceCell};
 
@@ -33,7 +42,10 @@ use crate::resolve::{At, CrateNames};
 use crate::task::{MacroBody, MacroSrc};
 
 const MAGIC: [u8; 4] = *b"BZIT";
-const VERSION: u32 = 1;
+/// 2: the item grain section ([`grain`]); a version-1 record is refused (`NotThisRecord`) and
+/// the crate is solved again. 3: the member owners section ([`owners`]), added after it; a
+/// version-2 record is refused the same way.
+const VERSION: u32 = 3;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -601,6 +613,9 @@ pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<Rec
     let mut owner_rows = RecordBytes::new_in(alloc);
     let mut member_rows = RecordBytes::new_in(alloc);
     let mut members = 0usize;
+    // Each named member's key, its owner's row and its own row: the member owners section
+    // ([`owners`]), written after everything else.
+    let mut owned: AVec<'b, (ItemKey, u32, u32)> = AVec::new_in(alloc);
     #[cfg(test)]
     let mut cut = plant::is(plant::Plant::ShortMembers);
     for owner in owners.iter() {
@@ -638,6 +653,11 @@ pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<Rec
             }
             put16(&mut member_rows, u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "a member's name" })?);
             member_rows.extend_from_slice(&[m.detail.kind().byte(), flags]);
+            if m.name.is_some() {
+                // Both rows are whole here: the owner's was pushed before its members, this
+                // member's just above.
+                owned.push((m.key, u32_of(owner_rows.len() / OWNER_ROW - 1, "a crate's owners")?, u32_of(member_rows.len() / MEMBER_ROW - 1, "a crate's members")?));
+            }
         }
         members += list.len();
     }
@@ -753,6 +773,8 @@ pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<Rec
         out.extend_from_slice(s);
     }
     out.extend_from_slice(&strings.bytes);
+    grain::append(&mut out, names, &items)?;
+    owners::append(&mut out, &mut owned)?;
     Ok(out)
 }
 
@@ -1463,6 +1485,14 @@ pub trait LoadItems<'a> {
     /// The text the macro call `call` of the crate expanded to, from the expansion's own
     /// record.
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'a str>;
+
+    /// The entry of the crate's file at `path`, as it is now, whose item chain is `chain`
+    /// ([`grain::item_chain`]): what a row whose file changed is checked against, item by item
+    /// ([`ItemsRecord::item_now`]). This one outlines the file's text now in `alloc`; a loader
+    /// that holds the file's `FileItems` record answers from that instead, with equal entries.
+    fn item(&self, krate: usize, path: &str, chain: ContentId, edition: Edition, alloc: Alloc<'a>) -> Option<ItemToday<'a>> {
+        grain::outline_today(self.file(krate, path)?, chain, edition, alloc)
+    }
 }
 
 /// The items of a set of crates, through their items records, each crate opened the first time

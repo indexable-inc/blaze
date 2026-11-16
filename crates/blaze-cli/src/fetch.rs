@@ -4,8 +4,11 @@
 //!   edit moves the units' source and with it the certificate. [`Lockfile::read`] plans it once
 //!   a command, and only when the layout was read. Each unit's key is a `Fetch` subject, asked
 //!   for by the `UnitGraph` task only once the graph reaches it (graph.rs).
-//! - **The records.** One file a unit, `.blaze/v2/sources/<64 hex key>`, outside the packs:
-//!   tempo's are hundreds of MiB, and a pack is merged and read whole.
+//! - **The records.** One file a unit, `<home>/.blaze/v2/sources/<64 hex key>`, outside the
+//!   packs: tempo's are hundreds of MiB, and a pack is merged and read whole. One store a
+//!   machine, so a second project or worktree fetches and adopts nothing another holds.
+//!   Whichever place gave the bytes (cargo's archive or the registry), the record is written
+//!   whole under a temporary name and renamed onto its key.
 //!   - A small record (a crate) is published unsynced.
 //!   - A large one (a git commit) is written in place through `blaze_core::reserve`, synced:
 //!     the fetch is the cold path, its wait the network's.
@@ -23,13 +26,15 @@
 
 use blaze_drive::fetch_task::{self, Index};
 use blaze_drive::{Name, TaskFailure, Why};
+use blaze_fetch::local::{self, Miss, Try};
 use blaze_fetch::pack::PackView;
 use blaze_fetch::plan::{self, Unit};
 use blaze_ids::ContentId;
 use blaze_manifest::lock::Lock;
 use blaze_own::Alloc;
+use blaze_text::Writes as _;
 use bstd::cx::Cx;
-use bstd::fs::{Dir, FsKind, ReadWrite};
+use bstd::fs::{Content, Dir, Durable, FsError, FsKind, ReadOnly, ReadWrite};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
@@ -46,8 +51,32 @@ pub const SOURCE_REFUSED: u16 = 12;
 /// names the unit.
 pub const CANNOT_FETCH: u16 = 13;
 
-/// Where the units' records are, under the checkout.
+/// Where the units' records are: the machine's sources store, under the user's home (fetch.md,
+/// "Where bytes come from", place 1; piece 3), beneath blaze's folder there (store.rs
+/// `HOME_FOLDER`). One record a unit, keyed from the lock's text alone, so every project and
+/// every worktree on the machine reads the same bytes in place and none fetches or adopts a
+/// unit another already holds. Never under a checkout.
 pub const SOURCES: &str = ".blaze/v2/sources";
+
+/// The sources store ([`SOURCES`] beneath the home main.rs read, rule 75), through the effect
+/// layer's second tree (`Fs::home`). No home is a typed stop, never a folder chosen instead.
+pub(crate) fn sources_dir(cx: &Cx, env: &FetchEnv<'_>) -> Result<Dir<ReadWrite>, CliError> {
+    let Some(home) = env.home else {
+        return Err(CliError::Text { what: "HOME is not set: the sources store (fetch.rs `SOURCES`) is beneath it" });
+    };
+    env.fs.home(cx, home, &Path::new(SOURCES)?).map_err(|error| match error.why {
+        bstd::fs::HomeWhy::Fs(error) => CliError::Fs(error),
+        _ => CliError::Text { what: "HOME could not be opened for the sources store (fetch.rs `SOURCES`): not absolute, with `.` or `..`, or no second tree" },
+    })
+}
+
+/// The sources store's folder as the machine names it, `<home>/.blaze/v2/sources`, in `frame`:
+/// for the readers that map a record in place (graph.rs `Mapped`) and the reservations' driver.
+/// `None` when no home is set.
+pub(crate) fn sources_native<'f>(env: &FetchEnv<'_>, frame: &'f Frame) -> Option<bstd::mem::String<&'f Frame>> {
+    let home = env.home?;
+    Some(bstd::mem::format_in!(frame, "{}/{SOURCES}", home.trim_end_matches('/')))
+}
 
 const REFUSED_DOMAIN: &str = "blaze-cli fetch refused 1";
 
@@ -59,6 +88,11 @@ pub struct Lockfile<'f> {
     pub lock: &'f Lock<'static>,
     units: &'f [Unit<'f, 'static>],
     index: Index<'static>,
+    /// Cargo's archive cache, looked at once a command, at the first unit the sources store
+    /// lacks.
+    cargo: CargoCache,
+    /// The sources store ([`sources_dir`]), opened at the command's first `Fetch` task.
+    sources: Option<Dir<ReadWrite>>,
     #[cfg(feature = "fetch")]
     net: Option<net::Net<'f>>,
 }
@@ -91,6 +125,8 @@ impl<'f> Lockfile<'f> {
             lock,
             units,
             index: fetch_task::index(units, Alloc::global()),
+            cargo: CargoCache { looked: None },
+            sources: None,
             #[cfg(feature = "fetch")]
             net: None,
         })
@@ -132,6 +168,10 @@ pub struct FetchEnv<'f> {
     /// The user's home, read at the edge (rule 75): the shared store is under it (the module
     /// store, macros.rs). `None` when `HOME` is not set.
     pub home: Option<&'f str>,
+    /// Cargo's home, read at the edge (rule 75; D78): `CARGO_HOME`, else `<HOME>/.cargo`; `None`
+    /// when neither is set. Its `registry/cache` is the second place a crate's archive comes
+    /// from (fetch.md, "Where bytes come from"), adopted only by the lock's pin.
+    pub cargo_home: Option<&'f str>,
     /// The folder blaze was started in (`PWD`), read at the edge: the toolchain's shelf under
     /// the home is reached from it (toolchain.rs). `None` when `PWD` is not set.
     pub start: Option<&'f str>,
@@ -142,10 +182,10 @@ pub struct FetchEnv<'f> {
     pub fs: bstd::fs::Fs,
 }
 
-/// One `Fetch` task: its unit's record held, or the finding of why not.
+/// One `Fetch` task: its unit's record held in the machine's sources store (never the
+/// checkout's: [`SOURCES`]), or the finding of why not.
 pub(crate) fn run<'b>(
     cx: &Cx,
-    root: &Dir<ReadWrite>,
     lockfile: &mut Lockfile<'_>,
     env: &FetchEnv<'_>,
     name: Name,
@@ -156,6 +196,11 @@ pub(crate) fn run<'b>(
         return Ok(Did::Failed(TaskFailure { name, why: Why::Refused { what: "a `Fetch` name no unit of the lock has", rule: "fetch_task::unit_of" } }));
     };
     let unit = &lockfile.units[at as usize];
+    // The sources store, where every place's record is looked for and written.
+    let root: &Dir<ReadWrite> = match &mut lockfile.sources {
+        Some(sources) => &*sources,
+        none => &*none.insert(sources_dir(&cx, env)?),
+    };
     #[cfg(feature = "fetch")]
     let made = {
         let units = lockfile.units;
@@ -163,22 +208,47 @@ pub(crate) fn run<'b>(
             Some(net) => net,
             none => none.insert(net::Net::new(units, env)),
         };
-        match net.outcome(&cx, root, units, &lockfile.index, at)? {
-            Ok(outcome) => fetch_task::made(unit, &outcome, Alloc::global()).ok_or(CliError::Text { what: "the fetch machine stopped with a unit pending" })?,
+        // The machine's `lookup` tries the places on this machine first (net.rs `Scope::lookup`);
+        // what they gave is named beside the network's outcome when no place gave the unit.
+        match net.outcome(&cx, root, &mut lockfile.cargo, env, units, &lockfile.index, at)? {
+            Ok(outcome) => {
+                let mut made = fetch_task::made(unit, &outcome, Alloc::global()).ok_or(CliError::Text { what: "the fetch machine stopped with a unit pending" })?;
+                if let fetch_task::Made::Failed { message, .. } = &mut made
+                    && let Some(tried) = net.tried(at)
+                {
+                    message.str("; before the network: ").str(tried);
+                }
+                made
+            }
             Err(untrusted) => {
                 let mut words = blaze_own::String::new_in(Alloc::global());
-                blaze_text::Writes::show(&mut words, unit);
+                words.show(unit);
+                if let Some(tried) = net.tried(at) {
+                    words.str(" (before the network: ").str(tried).str(")");
+                }
                 let words = bstd::mem::format_in!(held, "{}: {untrusted}", words.as_str());
                 return Ok(Did::FailedSaying(TaskFailure { name, why: Why::Refused { what: "its sources were not fetched now; the next command asks again", rule: "fetch_task::made" } }, held_str(words.as_str(), held)));
             }
         }
     };
+    // fetch.md's order of places, each checked against the unit's one key (D78): the sources
+    // store, then cargo's archive (adopted only by the lock's SHA-256); this build has no third
+    // place (the registry). Not a fallback (rule 3): every place gives the same bytes at the same
+    // key or is refused, and a unit no place gives fails naming every place tried.
     #[cfg(not(feature = "fetch"))]
-    let made = {
-        let _ = env;
-        match held_record(&cx, root, unit)? {
-            true => fetch_task::Made::Held { out: fetch_task::source(unit), down: 0 },
-            false => fetch_task::cannot_fetch(unit, Alloc::global()),
+    let made = match held_record(&cx, root, unit)? {
+        true => fetch_task::Made::Held { out: fetch_task::source(unit), down: 0 },
+        false => {
+            let mut tries = blaze_own::Vec::new_in(Alloc::global());
+            tries.push(Try { place: STORE_PLACE, miss: Miss::Absent });
+            match adopt_local(&cx, root, &mut lockfile.cargo, env, unit, &mut tries)? {
+                true => fetch_task::Made::Held { out: fetch_task::source(unit), down: 0 },
+                false => {
+                    let mut message = blaze_own::String::new_in(Alloc::global());
+                    message.show(&local::Tried { unit, tries: tries.as_slice() }).str("; this build cannot fetch (built without `fetch`)");
+                    fetch_task::Made::Failed { message, lasting: false }
+                }
+            }
         }
     };
     let mut record = Made::new_in(name, held);
@@ -212,19 +282,15 @@ pub(crate) fn key_hex(key: &ContentId) -> [u8; 64] {
     hex
 }
 
-/// The path of the record at `key`.
+/// The path of the record at `key` in the sources store ([`sources_dir`]): its 64 hex digits.
 fn record_path(key: &ContentId) -> Result<Path, CliError> {
     let hex = key_hex(key);
     let hex = core::str::from_utf8(&hex).map_err(|_| CliError::Text { what: "a key's hex is not UTF-8" })?;
-    let mut path = std::string::String::with_capacity(SOURCES.len() + 65);
-    path.push_str(SOURCES);
-    path.push('/');
-    path.push_str(hex);
-    Ok(Path::new(&path)?)
+    Ok(Path::new(hex)?)
 }
 
-/// Whether the store holds `unit`'s record whole: read and checked against its BLAKE3. One that
-/// fails the check is removed (it is made again).
+/// Whether the sources store `root` ([`sources_dir`]) holds `unit`'s record whole: read and
+/// checked against its BLAKE3. One that fails the check is removed (it is made again).
 fn held_record(cx: &Cx, root: &Dir<ReadWrite>, unit: &Unit<'_, '_>) -> Result<bool, CliError> {
     let path = record_path(&unit.key())?;
     let Some(meta) = root.stat(cx, &path)?.filter(|meta| !meta.dir) else {
@@ -249,6 +315,171 @@ fn held_record(cx: &Cx, root: &Dir<ReadWrite>, unit: &Unit<'_, '_>) -> Result<bo
     }
 }
 
+/// `record` published at `path` (a record's, [`record_path`]), as every source record is,
+/// whichever place its bytes came from: whole bytes under a unique temporary name, renamed onto
+/// the key (`Dir::publish`), so a reader never sees a part; unsynced (a lost record is made
+/// again from its place).
+fn write_record(cx: &Cx, root: &Dir<ReadWrite>, path: &Path, record: &[u8]) -> Result<(), FsError> {
+    root.publish(cx, path, Content::bytes(record), Durable::No).map(|_| ())
+}
+
+/// The first place of fetch.md's order, as a finding names it.
+const STORE_PLACE: &str = "blaze's sources store";
+
+/// The folder of cargo's home opened as a second tree, and the folder in it listed: together
+/// `local::CARGO_CACHE`. The listing is asked of the parent so that a cargo home without a
+/// cache is a miss named "absent", not an error.
+const CARGO_REGISTRY: &str = "registry";
+const CARGO_CACHE_IN_REGISTRY: &str = "cache";
+
+/// Cargo's archive cache on this machine, `<cargo home>/registry/cache` (D78; fetch.md, "Where
+/// bytes come from", place 2): looked at once a command, at the first unit the sources store
+/// lacks, through the effect layer's second tree (`Fs::home`), never `std::fs`. Nothing of it is
+/// believed but an archive's bytes, and those only when their SHA-256 is the lock's.
+pub(crate) struct CargoCache {
+    looked: Option<Looked>,
+}
+
+/// What looking at cargo's cache found.
+enum Looked {
+    /// No archive can come from it: the one place a finding names, and why (no cargo home, the
+    /// home not opened, no cache, or no crates.io folder in it).
+    Closed { shown: blaze_own::String<Alloc<'static>>, miss: Miss },
+    /// The cache's parent folder, read only, and crates.io's folders in the cache
+    /// (`local::crates_io_folder`), sorted by the names' bytes so every machine tries them in one
+    /// order: each as the person knows it (`<cargo home>/registry/cache/<folder>`) with where its
+    /// own name starts.
+    Open { registry: Dir<ReadOnly>, folders: blaze_own::Vec<(blaze_own::String<Alloc<'static>>, usize), Alloc<'static>> },
+}
+
+impl CargoCache {
+    /// What the cache holds, looked at on the first call of the command.
+    fn looked(&mut self, cx: &Cx, env: &FetchEnv<'_>) -> Result<&Looked, CliError> {
+        Ok(match &mut self.looked {
+            Some(looked) => &*looked,
+            none => &*none.insert(Looked::open(cx, env)?),
+        })
+    }
+}
+
+impl Looked {
+    fn open(cx: &Cx, env: &FetchEnv<'_>) -> Result<Looked, CliError> {
+        let global = Alloc::global();
+        let mut shown = blaze_own::String::new_in(global);
+        let Some(home) = env.cargo_home else {
+            shown.str("cargo's archive cache (neither CARGO_HOME nor HOME is set)");
+            return Ok(Looked::Closed { shown, miss: Miss::Absent });
+        };
+        shown.str(home.trim_end_matches('/')).str("/").str(local::CARGO_CACHE);
+        let said = |shown: &mut blaze_own::String<Alloc<'static>>, error: &dyn core::fmt::Display| {
+            core::fmt::Write::write_fmt(shown, format_args!(" ({error})")).map_err(|_| CliError::Text { what: "a place's words could not be written" })
+        };
+        let registry = match env.fs.home(cx, home, &Path::new(CARGO_REGISTRY)?) {
+            Ok(registry) => registry.read_only(),
+            Err(error) => {
+                said(&mut shown, &error)?;
+                return Ok(Looked::Closed { shown, miss: Miss::Unreadable });
+            }
+        };
+        let entries = match registry.entries(cx, &Path::new(CARGO_CACHE_IN_REGISTRY)?) {
+            Ok(Some(entries)) => entries,
+            Ok(None) => return Ok(Looked::Closed { shown, miss: Miss::Absent }),
+            Err(error) => {
+                said(&mut shown, &error)?;
+                return Ok(Looked::Closed { shown, miss: Miss::Unreadable });
+            }
+        };
+        let mut folders = blaze_own::Vec::new_in(global);
+        // In the listing's order: sorted by the names' bytes (`Dir::entries`).
+        for (name, _) in entries.iter().filter(|(name, _)| local::crates_io_folder(name)) {
+            let mut place = blaze_own::String::new_in(global);
+            place.str(shown.as_str()).str("/");
+            let at = place.as_str().len();
+            place.str(name);
+            folders.push((place, at));
+        }
+        if folders.is_empty() {
+            shown.str(" (no crates.io folder in it)");
+            return Ok(Looked::Closed { shown, miss: Miss::Absent });
+        }
+        Ok(Looked::Open { registry, folders })
+    }
+}
+
+/// The second place of fetch.md's order for `unit`, after the sources store lacked it: its
+/// archive in cargo's cache, tried in each crates.io folder in order, adopted only when its
+/// SHA-256 is the lock's (`local::adopt`, D78) and then written at the unit's key exactly as the
+/// network path's record is ([`write_record`]): the same bytes at the same key, so no reader can
+/// tell which place gave them. `true` when adopted; else every place tried, and what it gave, is
+/// pushed on `tries` for the finding. An archive refused in one folder is named and the next
+/// folder tried: it is never adopted, and never passed over in silence.
+fn adopt_local<'c>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    cargo: &'c mut CargoCache,
+    env: &FetchEnv<'_>,
+    unit: &Unit<'_, '_>,
+    tries: &mut blaze_own::Vec<Try<'c>, Alloc<'static>>,
+) -> Result<bool, CliError> {
+    let looked: &'c Looked = cargo.looked(cx, env)?;
+    let (registry, folders) = match looked {
+        Looked::Closed { shown, miss } => {
+            tries.push(Try { place: shown.as_str(), miss: miss.clone() });
+            return Ok(false);
+        }
+        Looked::Open { registry, folders } => (registry, folders),
+    };
+    let archive = match local::archive_name(unit) {
+        Ok(archive) => archive,
+        Err(refused) => {
+            tries.push(Try { place: local::CARGO_CACHE, miss: Miss::Refused(refused) });
+            return Ok(false);
+        }
+    };
+    let archive = Path::new(archive.as_str())?;
+    let cache = Path::new(CARGO_CACHE_IN_REGISTRY)?;
+    for (shown, at) in folders.iter() {
+        let place = shown.as_str();
+        let path = cache.join(&Path::new(&place[*at..])?).join(&archive);
+        let len = match registry.stat(cx, &path) {
+            Ok(Some(meta)) if !meta.dir => meta.len,
+            Ok(_) => {
+                tries.push(Try { place, miss: Miss::Absent });
+                continue;
+            }
+            Err(_) => {
+                tries.push(Try { place, miss: Miss::Unreadable });
+                continue;
+            }
+        };
+        let Ok(len) = usize::try_from(len) else {
+            tries.push(Try { place, miss: Miss::Unreadable });
+            continue;
+        };
+        let scratch = Frame::with_reserve(len.max(1 << 16).saturating_add(1 << 16), bstd::mem::Tag::Other)
+            .map_err(|_| CliError::Text { what: "the frame a cargo archive is read in could not be reserved" })?;
+        let mut bytes = Bytes::new_in(&scratch, "an archive in cargo's cache, checked against the lock");
+        if registry.read_all(cx, &path, &mut bytes).is_err() {
+            tries.push(Try { place, miss: Miss::Unreadable });
+            continue;
+        }
+        match local::adopt(unit, bytes.as_slice(), &blaze_fetch::fetch::Limits::REAL.unpack, Alloc::global()) {
+            Ok((record, _)) => {
+                write_record(cx, root, &record_path(&unit.key())?, record.as_slice())?;
+                return Ok(true);
+            }
+            Err(refused) => tries.push(Try { place, miss: Miss::Refused(refused) }),
+        }
+    }
+    Ok(false)
+}
+
+/// The command adopts: cargo's archive taken by the lock's pin only (fetch.md piece 2; D78);
+/// the record in the home's sources store, shared by worktrees (piece 3).
+#[cfg(test)]
+#[path = "fetch_tests.rs"]
+mod tests;
+
 #[cfg(feature = "fetch")]
 mod net {
     //! The machine and its IO: blaze-http's driver thread for HTTPS, the records' files, the
@@ -269,9 +500,11 @@ mod net {
     use blaze_ids::ContentId;
     use blaze_own::Alloc;
     use bstd::cx::Cx;
-    use bstd::fs::{Content, Dir, Durable, FsKind, ReadWrite};
+    use bstd::fs::{Dir, FsKind, ReadWrite};
 
-    use super::{FetchEnv, held_record, record_path, SOURCES};
+    use blaze_fetch::local::{Miss, Tried, Try};
+
+    use super::{CargoCache, FetchEnv, STORE_PLACE, SOURCES, adopt_local, held_record, record_path, write_record};
     use crate::CliError;
 
     const USER_AGENT: &str = concat!("blaze/", env!("CARGO_PKG_VERSION"));
@@ -316,12 +549,15 @@ mod net {
         pub(super) fn new(units: &'f [Unit<'f, 'static>], env: &FetchEnv<'_>) -> Net<'f> {
             let machine = Machine::wanting(units, Limits::REAL, Alloc::global());
             let (to, answers) = mailbox::channel::<(u64, Fetched)>(None);
-            let mut sources = std::string::String::with_capacity(env.checkout.len() + SOURCES.len() + 1);
-            if !env.checkout.is_empty() {
-                sources.push_str(env.checkout);
+            // The sources store beneath the home (`sources_native`). Empty with no home: then
+            // every reservation fails as the store's, though `run` has stopped the command
+            // first (`sources_dir` refuses no home).
+            let mut sources = std::string::String::new();
+            if let Some(home) = env.home {
+                sources.push_str(home.trim_end_matches('/'));
                 sources.push('/');
+                sources.push_str(SOURCES);
             }
-            sources.push_str(SOURCES);
             Net {
                 machine,
                 io: Io {
@@ -335,6 +571,7 @@ mod net {
                     sources,
                     cert_file: env.cert_file.map(std::ffi::OsString::from),
                     cert_dir: env.cert_dir.map(std::ffi::OsString::from),
+                    tried: blaze_own::Vec::new_in(Alloc::global()),
                 },
                 steps: 0,
             }
@@ -345,18 +582,27 @@ mod net {
             self.machine.want(at);
         }
 
+        /// The places on this machine tried for unit `at` before the network, and what each gave
+        /// (`local::Tried`'s words), when its `lookup` found none that held it.
+        pub(super) fn tried(&self, at: u32) -> Option<&str> {
+            self.io.tried.iter().find(|(unit, _)| *unit == at).map(|(_, words)| words.as_str())
+        }
+
         /// Steps the machine until unit `at` has its outcome; `Err` with the words when HTTPS
         /// could not be set up and the unit needs a request (every such unit after the first).
+        #[expect(clippy::too_many_arguments, reason = "the task's handles: each one the machine's IO needs")]
         pub(super) fn outcome(
             &mut self,
             cx: &Cx,
             root: &Dir<ReadWrite>,
+            cargo: &mut CargoCache,
+            env: &FetchEnv<'_>,
             units: &'f [Unit<'f, 'static>],
             index: &[(ContentId, u32)],
             at: u32,
         ) -> Result<Result<Outcome, Untrusted>, CliError> {
             self.machine.want(at);
-            let mut scope = Scope { io: &mut self.io, cx, root, units, index, failed: None };
+            let mut scope = Scope { io: &mut self.io, cx, root, cargo, env, units, index, failed: None };
             loop {
                 if !matches!(self.machine.outcome(at), Outcome::Pending) {
                     return Ok(Ok(self.machine.outcome(at).clone()));
@@ -389,30 +635,30 @@ mod net {
         kept: HashMap<u32, std::vec::Vec<u8>>,
         /// The records' driver for reservations, made at the first.
         disk: Option<blaze_core::Native>,
-        /// The records' folder, relative to where blaze was started.
+        /// The sources store's folder as the machine names it (`<home>/.blaze/v2/sources`).
         sources: std::string::String,
         /// `SSL_CERT_FILE` and `SSL_CERT_DIR` as the command was given them (rule 75).
         cert_file: Option<std::ffi::OsString>,
         cert_dir: Option<std::ffi::OsString>,
+        /// For each unit whose `lookup` found it on no place of this machine: the places tried
+        /// and what each gave, in words, for its finding if the network does not give it either.
+        tried: blaze_own::Vec<(u32, blaze_own::String<Alloc<'static>>), Alloc<'static>>,
     }
 
     /// The IO for one task's steps: what the machine's effects need of this task's context.
     struct Scope<'s, 'f> {
         io: &'s mut Io,
         cx: &'s Cx,
+        /// The sources store (`sources_dir`), the first place `lookup` tries and where `put`
+        /// writes.
         root: &'s Dir<ReadWrite>,
+        /// Cargo's archive cache, the second place `lookup` tries.
+        cargo: &'s mut CargoCache,
+        env: &'s FetchEnv<'s>,
         units: &'f [Unit<'f, 'static>],
         index: &'s [(ContentId, u32)],
         /// The first error the store gave that is the tool's, not the unit's.
         failed: Option<CliError>,
-    }
-
-    impl Scope<'_, '_> {
-        /// By the plan's sorted index: a scan would hash every unit's key at each lookup.
-        fn unit_of_key(&self, key: &ContentId) -> Option<&Unit<'_, 'static>> {
-            let at = fetch_task::unit_of(self.index, Name::new(TaskKind::Fetch, *key))?;
-            self.units.get(at as usize)
-        }
     }
 
     impl FetchIo for Scope<'_, '_> {
@@ -420,10 +666,36 @@ mod net {
             self.io.clock.now().since_start().as_nanos() as u64
         }
 
+        /// fetch.md's order of places, each checked against the unit's one key (D78): the sources
+        /// store, then cargo's archive (adopted only by the lock's SHA-256), and on a miss of
+        /// both the machine's next step, the registry over HTTPS. Not a fallback (rule 3): every
+        /// place gives the same bytes at the same key or is refused, and what each gave is kept
+        /// for the finding of a unit no place gives.
         fn lookup(&mut self, key: &ContentId) -> bool {
-            let Some(unit) = self.unit_of_key(key) else { return false };
+            // By the plan's sorted index: a scan would hash every unit's key at each lookup.
+            let (units, index) = (self.units, self.index);
+            let Some(at) = fetch_task::unit_of(index, Name::new(TaskKind::Fetch, *key)) else { return false };
+            let Some(unit) = units.get(at as usize) else { return false };
             match held_record(self.cx, self.root, unit) {
-                Ok(held) => held,
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(error) => {
+                    self.failed.get_or_insert(error);
+                    return false;
+                }
+            }
+            let mut tries = blaze_own::Vec::new_in(Alloc::global());
+            tries.push(Try { place: STORE_PLACE, miss: Miss::Absent });
+            match adopt_local(self.cx, self.root, &mut *self.cargo, self.env, unit, &mut tries) {
+                Ok(true) => true,
+                Ok(false) => {
+                    let mut words = blaze_own::String::new_in(Alloc::global());
+                    blaze_text::Writes::show(&mut words, &Tried { unit, tries: tries.as_slice() });
+                    drop(tries);
+                    self.io.tried.retain(|(unit, _)| *unit != at);
+                    self.io.tried.push((at, words));
+                    false
+                }
                 Err(error) => {
                     self.failed.get_or_insert(error);
                     false
@@ -433,7 +705,7 @@ mod net {
 
         fn put(&mut self, key: &ContentId, record: &[u8]) -> Result<(), StoreFailure> {
             let path = record_path(key).map_err(|_| StoreFailure::Io)?;
-            match self.root.publish(self.cx, &path, Content::bytes(record), Durable::No) {
+            match write_record(self.cx, self.root, &path, record) {
                 Ok(_) => Ok(()),
                 Err(error) if matches!(error.kind, FsKind::OverQuota(_)) => Err(StoreFailure::Full),
                 Err(_) => Err(StoreFailure::Io),
@@ -507,6 +779,7 @@ mod net {
             let body = self.io.kept.remove(&unit).unwrap_or_default();
             let made = match &mut self.io.disk {
                 Some(disk) => Ok(disk),
+                _ if self.io.sources.is_empty() => Err(()),
                 none => {
                     let folder = std::path::Path::new(self.io.sources.as_str());
                     match std::fs::create_dir_all(folder).and_then(|()| blaze_core::native(folder, 2)) {

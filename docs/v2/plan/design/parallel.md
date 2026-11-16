@@ -57,8 +57,8 @@ heap 2,309 MB live after them; 20,000 bodies of one crate 31.2 s (640 a second);
    worker, 8, and reversed order.
 9. **Sized by one rule.** Workers = cores of every level (Mac perflevel0 + perflevel1 at
    user-initiated; Linux the cgroup quota), started in proportion to queued work (a one-body edit
-   stays on the main thread); frames, the claim table (a power of two, 4 x the tasks in flight)
-   and queues scale with workers. Only that number differs between 8 cores and 128.
+   stays on the main thread); frames and queues scale with workers, the claim table with the
+   keys the request names (a power of two over twice that; 48 bytes a slot). Only that number differs between 8 cores and 128.
 10. **Expected** (estimates; wall = T1/P + Tinf). Tempo cold front end at today's item costs:
    T1 about 130 s (names 29.5, heads 5, about 60,000 own bodies at 640 a second 94); Tinf, the
    crate chain's names, assumed 3 s (1 s with a crate's modules in parallel): 8 cores about 17 s,

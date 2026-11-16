@@ -38,12 +38,16 @@
 //! edition, unless any `[[bin]]` is written), `src/main.rs` (named as the package),
 //! `src/bin/<name>.rs` and `src/bin/<name>/main.rs`.
 //!
-//! Not read here, and so never wrong here: examples, tests, benches and build scripts;
+//! Integration tests, examples and benches are read in `extra.rs` ([`ExtraTarget`]: `tests/`,
+//! `examples/`, `benches/` and their tables).
+//!
+//! Not read here, and so never wrong here:
 //! `default-members`; a path dependency outside the root's directory is not a member (cargo
 //! would look for that directory's own root). The caller stops the search above at the anchor:
 //! cargo stops after `CARGO_HOME` and at `target/package`, which the caller chooses the anchor
 //! by.
 
+mod extra;
 mod raw;
 #[cfg(test)]
 mod tests;
@@ -55,6 +59,7 @@ use edition::{NoEdition, PackageEdition};
 
 use raw::{GitRef as RawGitRef, Raw, RawBuild, RawDep, RawEdition, RawPackage, RawTarget, RawVersion, RawWorkspace};
 
+pub use extra::{ExtraKind, ExtraTarget, TargetRefused};
 pub use raw::GitRef;
 
 /// Text in the caller's allocator.
@@ -187,6 +192,9 @@ pub struct Member<'a> {
     pub edition_span: Option<Span>,
     pub lib: Option<Target<'a>>,
     pub bins: Vec<Target<'a>, Alloc<'a>>,
+    /// Integration tests, examples and benches, sorted by kind, then name bytes; empty unless
+    /// read with [`Layout::with_test_targets`].
+    pub extras: Vec<ExtraTarget<'a>, Alloc<'a>>,
     pub dependencies: Vec<Dependency<'a>, Alloc<'a>>,
     /// Every feature, the implicit ones of optional dependencies included (an optional
     /// dependency no feature names as `dep:<name>`, in every edition).
@@ -254,6 +262,9 @@ pub enum LayoutError<'a> {
     GitAndPath { at: Span },
     /// `[dev_dependencies]` and `[build_dependencies]` from the 2024 edition on.
     Underscored { at: Span },
+    /// An integration test, example or bench refused: the package, the kind, the target (empty
+    /// for a table with no name), its line, and the rule.
+    Target { package: Text<'a>, kind: ExtraKind, target: Text<'a>, at: Span, why: TargetRefused<'a> },
 }
 
 impl fmt::Display for LayoutError<'_> {
@@ -321,6 +332,10 @@ impl fmt::Display for LayoutError<'_> {
                 at(f, span)?;
                 f.write_str("the underscored table name is refused from the 2024 edition on; use the dashed one")
             }
+            LayoutError::Target { package, kind, target, at: span, why } => {
+                at(f, span)?;
+                write!(f, "package `{}`: {} target `{}`: {why}", package.as_str(), kind.table(), target.as_str())
+            }
         }
     }
 }
@@ -349,9 +364,22 @@ pub struct Layout<'a> {
     by_path: SortedMap<Text<'a>, u32, Alloc<'a>>,
     /// Directory to its entries, sorted by name (`None`: no such directory).
     listings: SortedMap<Text<'a>, Option<Vec<(Text<'a>, bool), Alloc<'a>>>, Alloc<'a>>,
+    /// Whether the members' integration tests, examples and benches are read
+    /// ([`Layout::with_test_targets`]); off by default.
+    test_targets: bool,
 }
 
 impl<'a> Layout<'a> {
+    /// The same reader, also finding and checking each member's integration tests, examples and
+    /// benches ([`Member::extras`]). Only for the workspace the user builds: a dependency is
+    /// published without `tests/`, `examples/` and `benches/` as a matter of course and its
+    /// targets of those kinds are never built, so a dependency's layout is read with [`Layout::new`]
+    /// alone, which finds none of them and reads their tables for shape only.
+    pub fn with_test_targets(mut self) -> Layout<'a> {
+        self.test_targets = true;
+        self
+    }
+
     /// A reader of the workspace of the package in `start` (anchor-relative; normalized here).
     /// A `start` that leaves the anchor is refused.
     pub fn new(start: &str, alloc: Alloc<'a>) -> Result<Layout<'a>, LayoutError<'a>> {
@@ -365,6 +393,7 @@ impl<'a> Layout<'a> {
             manifests: Vec::new_in(alloc),
             by_path: SortedMap::with_capacity_in(0, alloc),
             listings: SortedMap::with_capacity_in(0, alloc),
+            test_targets: false,
         })
     }
 
@@ -480,6 +509,13 @@ impl<'l, 'a> Passing<'l, 'a> {
         let _ = self.list(dir);
         let _ = self.list(&src);
         let _ = self.list(&bin);
+        // `tests/`, `examples/`, `benches/`: the integration tests, examples and benches, when
+        // they are read at all.
+        if self.layout.test_targets {
+            for kind in ExtraKind::ALL {
+                let _ = self.list(&file(dir, kind.dir(), alloc));
+            }
+        }
     }
 
     fn manifest_of(&self, dir: &str) -> Text<'a> {
@@ -758,7 +794,13 @@ impl<'l, 'a> Passing<'l, 'a> {
                 None => return Err(LayoutError::NotInherited { at: *span, key: "edition" }),
             },
         };
-        let Some((lib, bins)) = self.targets(found, edition)? else { return Ok(None) };
+        // Both asked before either waits, so their listings come in one pass.
+        let targets = self.targets(found, edition)?;
+        let extras = match self.layout.test_targets {
+            true => self.extras(found, edition)?,
+            false => Some(Vec::new_in(alloc)),
+        };
+        let (Some((lib, bins)), Some(extras)) = (targets, extras) else { return Ok(None) };
         let build = match &package.build {
             RawBuild::None => None,
             RawBuild::Path(path, span) => Some(Target {
@@ -822,6 +864,7 @@ impl<'l, 'a> Passing<'l, 'a> {
             edition_span,
             lib,
             bins,
+            extras,
             dependencies,
             features,
             build,

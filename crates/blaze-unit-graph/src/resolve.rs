@@ -7,6 +7,7 @@ use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, BTreeMap, String, Vec};
 
 use crate::input::{Ask, CfgAtom, DepSource, FeatureValue, Package, Resolver, TargetDesc};
+use crate::extra::has_test_cfg;
 use crate::{Pass, Plant, Text, Unit, UnitDep, UnitError, UnitGraph, UnitId, UnitKind};
 
 /// An answer to a [`Pass::Need`].
@@ -531,6 +532,15 @@ impl<'l, 'a> Resolution<'l, 'a> {
                     add(Key::new(root, Kind::TestBin, i, Side::Target, Side::Target), &mut keys, &mut index, &mut tmp);
                 }
             }
+            // Integration tests, examples and benches: by the same switch as the library's
+            // test unit (test.md, "The other targets").
+            // Roots only: a dependency's layout lists none of these (the layout reads them only
+            // with `with_test_targets`, for the workspace the user builds).
+            if self.ask.tests {
+                for i in 0..package.extras.len() as u32 {
+                    add(Key::new(root, Kind::Extra, i, Side::Target, Side::Target), &mut keys, &mut index, &mut tmp);
+                }
+            }
         }
         let mut next = 0usize;
         while next < keys.len() {
@@ -545,7 +555,7 @@ impl<'l, 'a> Resolution<'l, 'a> {
             for (e, dep) in package.deps.iter().enumerate() {
                 let wanted = match key.kind {
                     Kind::BuildScript => dep.kind == DepKind::Build,
-                    Kind::TestLib | Kind::TestBin => dep.kind == DepKind::Normal || (dep.kind == DepKind::Dev && self.members[id.index()]),
+                    Kind::TestLib | Kind::TestBin | Kind::Extra => dep.kind == DepKind::Normal || (dep.kind == DepKind::Dev && self.members[id.index()]),
                     Kind::Lib | Kind::ProcMacro | Kind::Bin => dep.kind == DepKind::Normal,
                 };
                 if !wanted {
@@ -588,7 +598,9 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 let cu = add(ckey, &mut keys, &mut index, &mut tmp);
                 deps.push((name, cu));
             }
-            if matches!(key.kind, Kind::Bin | Kind::TestBin)
+            // A binary, and an integration test, example or bench, uses its package's plain
+            // library unit (never the library's test unit).
+            if matches!(key.kind, Kind::Bin | Kind::TestBin | Kind::Extra)
                 && let Some(lib) = &package.lib
             {
                 let own_lib = match lib.proc_macro {
@@ -654,7 +666,6 @@ impl<'l, 'a> Resolution<'l, 'a> {
             Side::Target => self.target,
             Side::Host => self.host,
         };
-        let cfg = unit_cfg(desc, &features, matches!(key.kind, Kind::TestLib | Kind::TestBin), key.kind == Kind::ProcMacro, alloc);
         let lib_root = package.lib.as_ref().map(|lib| (&lib.crate_name, &lib.root));
         let bin = |i: u32| &package.bins[i as usize];
         let (kind, crate_name, root) = match key.kind {
@@ -668,7 +679,14 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 Some(bin(key.idx).root.clone()),
             ),
             Kind::BuildScript => (UnitKind::BuildScript, Some(own("build_script_build", alloc)), package.build.clone()),
+            Kind::Extra => {
+                let extra = &package.extras[key.idx as usize];
+                (extra.unit_kind(), Some(underscored(&extra.name, alloc)), Some(extra.root.clone()))
+            }
         };
+        // `test` by the kind: the library's and a binary's test units, and a harnessed
+        // integration test or bench (the one rule, also the record's).
+        let cfg = unit_cfg(desc, &features, has_test_cfg(&kind), key.kind == Kind::ProcMacro, alloc);
         let mut deps = Vec::with_capacity_in(t.deps.len(), alloc);
         for (name, cu) in t.deps.iter() {
             deps.push(UnitDep { name: name.clone(), unit: UnitId(new_id[*cu as usize]) });
@@ -715,6 +733,8 @@ enum Kind {
     BuildScript,
     TestLib,
     TestBin,
+    /// An integration test, example or bench: `idx` is its place in [`Package::extras`].
+    Extra,
 }
 
 /// A unit's cfg set (rule 13): its platform's atoms, `feature = "f"` for each feature on,

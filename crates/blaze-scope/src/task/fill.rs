@@ -85,6 +85,8 @@ pub enum Stage {
     NamesRecord,
     /// The items record encoded and handed to the store.
     ItemsRecord,
+    /// The crate's kept expansions written as one set and handed to the store.
+    ExpansionsRecord,
     /// The crate's own exports record decoded for its dependents.
     Decode,
     /// The crate is done on this thread.
@@ -93,7 +95,7 @@ pub enum Stage {
 
 impl Stage {
     /// Every stage, in [`Stage`]'s order: `ALL[s as usize] == s`.
-    pub const ALL: [Stage; 13] = [
+    pub const ALL: [Stage; 14] = [
         Stage::Try,
         Stage::Files,
         Stage::Lower,
@@ -105,6 +107,7 @@ impl Stage {
         Stage::ReadList,
         Stage::NamesRecord,
         Stage::ItemsRecord,
+        Stage::ExpansionsRecord,
         Stage::Decode,
         Stage::Done,
     ];
@@ -117,6 +120,10 @@ impl Stage {
 pub enum ExpandPart {
     /// The call and its macro found in the crate's tables, or asked of the defining crate.
     Find,
+    /// The call's key made from its text and looked up in the crate's kept expansions
+    /// ([`crate::expansions`]); on a hit its read list asked again and its record read back, and
+    /// the call passes to [`ExpandPart::Render`] (size: the input's bytes).
+    Kept,
     /// The definition: found prepared, or else its text lexed and its rules compiled.
     Define,
     /// The call's input text lexed into tokens (size: its bytes).
@@ -131,6 +138,8 @@ pub enum ExpandPart {
     RunDerive,
     /// A proc macro run by the host (size: input tokens).
     RunProc,
+    /// A fresh expansion written as its kept entry (size: tokens).
+    Keep,
     /// The expansion's tokens written as text (size: tokens).
     Render,
     /// The text outlined: lexed and parsed again (size: its bytes).
@@ -151,8 +160,9 @@ pub enum ExpandPart {
 
 impl ExpandPart {
     /// Every part, in [`ExpandPart`]'s order: `ALL[p as usize] == p`.
-    pub const ALL: [ExpandPart; 16] = [
+    pub const ALL: [ExpandPart; 18] = [
         ExpandPart::Find,
+        ExpandPart::Kept,
         ExpandPart::Define,
         ExpandPart::LexInput,
         ExpandPart::Shape,
@@ -160,6 +170,7 @@ impl ExpandPart {
         ExpandPart::RunBuiltin,
         ExpandPart::RunDerive,
         ExpandPart::RunProc,
+        ExpandPart::Keep,
         ExpandPart::Render,
         ExpandPart::Outline,
         ExpandPart::Lower,

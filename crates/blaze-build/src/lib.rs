@@ -304,6 +304,14 @@ pub trait Adts {
         None
     }
 
+    /// The library items an `.await` and a coroutine's entries are built from ([`AsyncItems`]:
+    /// the `IntoFuture` trait, the `Poll` enum with its two variants, the `Pin` struct, and
+    /// the item a coroutine's resume fn is named by). With no answer an async block's body
+    /// and an `.await` are refused with [`BuildError::NoLangFn`] naming this method.
+    fn async_items(&self) -> Option<AsyncItems> {
+        None
+    }
+
     /// The `Deref::deref` (`Mutbl::Not`) or `DerefMut::deref_mut` (`Mutbl::Mut`) trait method,
     /// which a call at `[Self]` runs as `Self`'s impl's, as with [`Adts::drop_impl`]'s fn. An
     /// overloaded dereference with no answer is refused with [`BuildError::NoLangFn`] naming
@@ -564,6 +572,49 @@ pub enum BuildError {
     Lir(blaze_lir::BuildError),
     /// The built function failed blaze-lir's verifier: this crate's bug, named.
     Verify(VerifyError),
+    /// The coroutine pass refused an `async` block's built body ([`build_coroutine`]), naming
+    /// the operation and its rule (unwinding in the body, a compound value live across a
+    /// suspend, a cancel path that suspends...).
+    Coroutine(blaze_lir::coroutine::CoroutineError),
+}
+
+/// What an `.await` and a coroutine's entries need of the library: the answer of
+/// [`Adts::async_items`]. The Reference, "Await expressions", names each: `IntoFuture::
+/// into_future`, `Pin::new_unchecked`, `Future::poll`, `Poll::Pending` and `Poll::Ready`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AsyncItems {
+    /// The trait `IntoFuture` (core's future/into_future.rs): an `.await` of `T` holds
+    /// `<T as IntoFuture>::IntoFuture` while suspended, asked of `LayoutFacts::normalize`
+    /// under this trait and the name `IntoFuture`.
+    pub into_future: ItemKey,
+    /// The enum `Poll` (core's task/poll.rs: `pub enum Poll<T> { Ready(T), Pending }`).
+    pub poll: ItemKey,
+    /// The index of its variant `Ready`, by declaration.
+    pub ready: u32,
+    /// The index of its variant `Pending`, by declaration.
+    pub pending: u32,
+    /// The struct `Pin` (core's pin.rs: `pub struct Pin<Ptr> { pointer: Ptr }`).
+    pub pin: ItemKey,
+    /// The item a coroutine's RESUME fn is named by: the instance `(resume, [coroutine])` is
+    /// the split body, taking the state pointer itself; `Future::poll` at `[coroutine]` is
+    /// the entry that reads that pointer out of its `Pin` and calls it. An item no program
+    /// calls by this argument list otherwise (the library's `Coroutine::resume` where it has
+    /// one).
+    pub resume: ItemKey,
+}
+
+/// One built coroutine instance ([`build_coroutine`]): three functions and the state's shape.
+pub struct BuiltCoroutine<A: Allocator> {
+    /// `Future::poll` at `[coroutine]` (the instance `(Adts::future_poll, [coroutine])`): the
+    /// entry, which calls [`BuiltCoroutine::resume`].
+    pub poll: Built<A>,
+    /// The instance `(AsyncItems::resume, [coroutine])`: the body, as the pass's `poll`.
+    pub resume: Built<A>,
+    /// `drop_in_place` at `[coroutine]`: the pass's `drop`, the state's whole drop glue.
+    pub drop: Built<A>,
+    /// The state as the pass laid it out: the record `LayoutFacts::coroutine_state` answers
+    /// from for this instance.
+    pub state: StateShape,
 }
 
 impl fmt::Display for BuildError {
@@ -625,11 +676,35 @@ impl fmt::Display for BuildError {
             BuildError::Vtable { at: None, error } => write!(f, "a trait object's vtable: {error}"),
             BuildError::Lir(error) => write!(f, "blaze-lir's builder refused the function: {error}"),
             BuildError::Verify(error) => write!(f, "the LIR built does not verify: {error}"),
+            BuildError::Coroutine(error) => write!(f, "an async block's body was not split: {error}"),
         }
     }
 }
 
 impl core::error::Error for BuildError {}
+
+/// Builds coroutine `ordinal` of `body` (the owner's, checked once as `checked`: the
+/// `ordinal`-th `async` block in expression order, [`coroutines_in`]) at the owner's instance
+/// `subst` names (coroutine.rs, "THE EMIT POINTS"): its entry, its resume fn, its drop and its
+/// state's shape. The caller finds the owner, its arguments and the ordinal from the
+/// coroutine's ground type ([`coroutine_of`]), for an instance of `Adts::future_poll`, of
+/// `AsyncItems::resume` or of `drop_in_place` whose first argument is a coroutine; one build
+/// gives all three. It is built BEFORE any body that holds the state by value (the state's
+/// layout is this build's answer): until then that body's build is refused with
+/// [`BuildError::MissingRecord`] naming the owner.
+pub fn build_coroutine<A: Allocator + Clone>(
+    body: &BodyView<'_>,
+    checked: &Checked<'_>,
+    ordinal: u32,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<BuiltCoroutine<A>, BuildError> {
+    if !checked.diags.is_empty() {
+        return Err(BuildError::Diagnostics { count: u32::try_from(checked.diags.len()).unwrap_or(u32::MAX) });
+    }
+    walk::coroutine::build(body, checked, ordinal, subst, adts, alloc)
+}
 
 /// Builds the instance `subst` names of `body`, checked once generically as `checked`, of a fn
 /// whose signature is `sig`, in `alloc`.

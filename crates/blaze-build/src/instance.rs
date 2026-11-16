@@ -207,7 +207,14 @@ pub fn ground(
                 projections = true;
                 PNode::Alias { trait_, name, args: map_list(args, &mut list)? }
             }
-            PNode::Opaque(..) => return Err(BuildError::UnsupportedSig { what: "an `impl Trait` type in an instance" }),
+            // An `impl Trait` type is its hidden type at these arguments, the world's answer
+            // (`LayoutFacts::opaque_hidden`; an `async fn`'s is its coroutine, coroutine.rs).
+            // `list` holds the mapped arguments after `map_list`. Not answered: refused by name.
+            PNode::Opaque(key, l) => {
+                map_list(l, &mut list)?;
+                mapped[at] = facts.opaque_hidden(key, &list, ground)?;
+                continue;
+            }
             // The predicates' order is by (kind, trait, name), which no argument changes: the
             // mapped list keeps the one form (`PortableTys::dynamic`).
             PNode::Dynamic(l) => PNode::Dynamic(map_list(l, &mut list)?),

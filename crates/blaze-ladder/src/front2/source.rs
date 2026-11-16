@@ -31,7 +31,7 @@ use core::cell::{Cell, Ref, RefCell};
 use blaze_hash::HashMap;
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
-use blaze_scope::items_record::{ItemsDecoded, ItemsRecord, ItemsRecordError, LoadItems, RecordItems};
+use blaze_scope::items_record::{ImplRow, ItemsDecoded, ItemsRecord, ItemsRecordError, LoadItems, RecordItems};
 use blaze_scope::names::{self, PathError, Resolved, Why, Written};
 use blaze_scope::names_record::{Decoded, LoadNames, NamesRecord, NamesRecordError, RecordNames};
 use blaze_scope::resolve::{Names, Place};
@@ -174,6 +174,18 @@ pub trait NamesSource<'n>: Copy {
     /// Question 14: the impls written in crate `krate`, each given to `each` (in no promised
     /// order: the caller sorts by key).
     fn each_impl(self, krate: usize, each: &mut dyn FnMut(ImplAt<'n>));
+
+    /// Question 14 from ROWS: the impls crate `krate` writes, each given to `each` as its row
+    /// of the items record (what an impl index files it by: the trait's path, the self type's
+    /// head, both as written; no text is opened). `false`: this source has no impl rows (the
+    /// solved names: [`NamesSource::each_impl`] gives each impl with its header's text) and
+    /// `each` was not called.
+    fn each_impl_row(self, krate: usize, each: &mut dyn FnMut(ImplRow<'n>)) -> bool;
+
+    /// The impl `key` of crate `krate`, written in `module`, with its header's text: for the
+    /// one impl a row does not file ([`NamesSource::each_impl_row`]'s reader). `None`: the
+    /// text did not read (filed in the log).
+    fn impl_with_header(self, krate: usize, key: ItemKey, module: ItemKey) -> Option<ImplAt<'n>>;
 
     /// Question 15: the lang items crate `krate` declares, each given to `each`.
     fn each_lang(self, krate: usize, each: &mut dyn FnMut(&'n str, ItemKey));
@@ -356,6 +368,16 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         }
     }
 
+    fn each_impl_row(self, _krate: usize, _each: &mut dyn FnMut(ImplRow<'n>)) -> bool {
+        // The solved names hold each impl's header text, not a row: `each_impl`.
+        false
+    }
+
+    fn impl_with_header(self, krate: usize, key: ItemKey, _module: ItemKey) -> Option<ImplAt<'n>> {
+        let c = self.crates().get(krate).copied()?;
+        c.tables.impls.iter().find(|i| i.key == key).map(|i| ImplAt { krate, key: i.key, module: i.module, header: i.header })
+    }
+
     fn each_lang(self, krate: usize, each: &mut dyn FnMut(&'n str, ItemKey)) {
         let Some(c) = self.crates().get(krate).copied() else { return };
         for l in c.tables.langs.iter() {
@@ -503,6 +525,13 @@ pub trait Load<'n> {
     fn file(&self, krate: usize, path: &str) -> Option<&'n str>;
     /// The text the macro call `call` of the crate expanded to.
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str>;
+    /// The entry of the crate's file at `path`, as it is now, whose item chain is `chain`: what
+    /// an items record row whose file changed is checked against, item by item
+    /// (`blaze_scope::items_record::ItemsRecord::item_now`). This one outlines the file's text
+    /// now; a caller that holds the file's `FileItems` record answers from it instead.
+    fn item(&self, krate: usize, path: &str, chain: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Option<blaze_scope::items_record::ItemToday<'n>> {
+        blaze_scope::items_record::grain::outline_today(self.file(krate, path)?, chain, edition, alloc)
+    }
 }
 
 /// The loader the two readers hold: the caller's, with "no record kept" filed in the log.
@@ -538,6 +567,10 @@ impl<'n> LoadItems<'n> for Loader<'n> {
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str> {
         self.load.expansion(krate, call)
     }
+
+    fn item(&self, krate: usize, path: &str, chain: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Option<blaze_scope::items_record::ItemToday<'n>> {
+        self.load.item(krate, path, chain, edition, alloc)
+    }
 }
 
 /// What the records path read so far: the measure tests/front2_records.rs prints.
@@ -560,6 +593,12 @@ pub struct Records<'n> {
     variant_homes: RefCell<HashMap<ItemKey, (ItemKey, u32), Alloc<'n>>>,
     /// The crates whose enums were read into `variant_homes`.
     variants_read: RefCell<HashMap<usize, (), Alloc<'n>>>,
+    /// Each variant read into `variant_homes`, by its key's first 16 bytes
+    /// ([`NamesSource::key_beginning`]'s third table).
+    variant_beginnings: RefCell<HashMap<[u8; 16], ItemKey, Alloc<'n>>>,
+    /// What [`NamesSource::key_beginning`] answered, by the 16 bytes asked: one search per key
+    /// per command.
+    beginnings: RefCell<HashMap<[u8; 16], Option<ItemKey>, Alloc<'n>>>,
     /// Each named member's owner and name, for the crates [`NamesSource::member_owner`] was
     /// asked of.
     member_owners: RefCell<HashMap<ItemKey, (ItemKey, &'n str), Alloc<'n>>>,
@@ -584,6 +623,8 @@ impl<'n> Records<'n> {
             frame,
             variant_homes: RefCell::new(HashMap::new_in(alloc)),
             variants_read: RefCell::new(HashMap::new_in(alloc)),
+            variant_beginnings: RefCell::new(HashMap::new_in(alloc)),
+            beginnings: RefCell::new(HashMap::new_in(alloc)),
             member_owners: RefCell::new(HashMap::new_in(alloc)),
             members_read: RefCell::new(HashMap::new_in(alloc)),
             no_impls: Cell::new(None),
@@ -608,6 +649,14 @@ impl<'n> Records<'n> {
 
     pub fn log(&self) -> &'n Log<'n> {
         self.log
+    }
+
+    /// The whole text `at` of crate `krate`, as the loader has it today and the items record
+    /// proves it (its digest): what a body's chain is computed in
+    /// (`project_records::BodySource`). `None` with the reason filed in the log.
+    pub fn whole_text(&'n self, krate: usize, at: blaze_scope::resolve::At) -> Option<&'n str> {
+        self.items_of(krate)?;
+        self.read(krate, self.items.whole(krate, at))
     }
 
     /// What was opened and decoded so far.
@@ -704,11 +753,91 @@ impl<'n> Records<'n> {
             }
             let Some(Some(vs)) = self.read_names(krate, names.variants(row.key)) else { continue };
             let mut homes = self.variant_homes.borrow_mut();
+            let mut beginnings = self.variant_beginnings.borrow_mut();
             for (index, v) in vs.iter().enumerate() {
                 homes.insert(v.key, (row.key, index as u32));
+                match beginnings.get(&first_16(v.key)).copied() {
+                    Some(first) if first != v.key => self.log.put(SourceError::KeysBeginAlike { krate, name: self.log.name(krate), first, second: v.key }),
+                    Some(_) => {}
+                    None => {
+                        beginnings.insert(first_16(v.key), v.key);
+                    }
+                }
             }
         }
     }
+
+    /// In a table of `count` rows sorted by key (`key_at(i)` is row `i`'s key, `None` where the
+    /// row did not read: its error is filed), the one key that begins with `first`.
+    fn one_beginning(&self, krate: usize, first: [u8; 16], count: usize, key_at: &dyn Fn(usize) -> Option<ItemKey>) -> Beginning {
+        // The first row whose key's first 16 bytes are not below `first`.
+        let (mut lo, mut hi) = (0usize, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let Some(key) = key_at(mid) else { return Beginning::Void };
+            if first_16(key) < first {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= count {
+            return Beginning::Absent;
+        }
+        let Some(key) = key_at(lo) else { return Beginning::Void };
+        if first_16(key) != first {
+            return Beginning::Absent;
+        }
+        // The rows are sorted: a second key beginning alike is the next row.
+        if lo + 1 < count {
+            let Some(next) = key_at(lo + 1) else { return Beginning::Void };
+            if first_16(next) == first {
+                self.log.put(SourceError::KeysBeginAlike { krate, name: self.log.name(krate), first: key, second: next });
+                return Beginning::Void;
+            }
+        }
+        Beginning::One(key)
+    }
+
+    /// [`NamesSource::key_beginning`], not kept: the key's crate by its first eight bytes (no
+    /// record is opened to find it), then that crate's item rows, its module rows, and its
+    /// enums' variants (read once per crate: `read_variants`).
+    fn find_beginning(&'n self, first: [u8; 16]) -> Option<ItemKey> {
+        let mut whole = [0u8; 32];
+        whole[..16].copy_from_slice(&first);
+        let krate = self.items.crate_of(ItemKey(blaze_id::ContentId(whole)))?;
+        let record = self.items_of(krate)?;
+        let item_at = |i: usize| self.read(krate, record.item_at(i)).flatten().map(|row| row.key);
+        match self.one_beginning(krate, first, record.items(), &item_at) {
+            Beginning::One(key) => return Some(key),
+            Beginning::Void => return None,
+            Beginning::Absent => {}
+        }
+        let module_at = |i: usize| self.read(krate, record.module_at(i)).flatten().map(|row| row.key);
+        match self.one_beginning(krate, first, record.modules(), &module_at) {
+            Beginning::One(key) => return Some(key),
+            Beginning::Void => return None,
+            Beginning::Absent => {}
+        }
+        self.read_variants(krate);
+        self.variant_beginnings.borrow().get(&first).copied()
+    }
+}
+
+/// A library key's first 16 bytes: what `keys::checker_of` keeps of it.
+fn first_16(key: ItemKey) -> [u8; 16] {
+    let mut first = [0u8; 16];
+    first.copy_from_slice(&key.0.0[..16]);
+    first
+}
+
+/// What a sorted table holds for 16 leading bytes ([`Records::one_beginning`]).
+enum Beginning {
+    One(ItemKey),
+    /// No key of the table begins so.
+    Absent,
+    /// A row did not read, or two keys begin so: the error is filed and the answer is void.
+    Void,
 }
 
 impl<'n> NamesSource<'n> for &'n Records<'n> {
@@ -897,6 +1026,31 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         }
     }
 
+    fn each_impl_row(self, krate: usize, each: &mut dyn FnMut(ImplRow<'n>)) -> bool {
+        // No record: the loader filed `NoRecord`; the crate then has no impl this can file.
+        let Some(record) = self.items_of(krate) else { return true };
+        if self.no_impls.get() == Some(krate) {
+            return true;
+        }
+        for i in 0..record.impls() {
+            if let Some(Some(row)) = self.read(krate, record.impl_at(i)) {
+                each(row);
+            }
+        }
+        true
+    }
+
+    fn impl_with_header(self, krate: usize, key: ItemKey, module: ItemKey) -> Option<ImplAt<'n>> {
+        let record = self.items_of(krate)?;
+        let item = self.read(krate, record.item(key))??;
+        let Some(span) = item.impl_header else {
+            self.gap("an impl's header text (its item row has no header range)", Some(key));
+            return None;
+        };
+        let header = self.read(krate, self.items.text(krate, span))?;
+        Some(ImplAt { krate, key, module, header })
+    }
+
     fn each_lang(self, krate: usize, each: &mut dyn FnMut(&'n str, ItemKey)) {
         let Some(record) = self.items_of(krate) else { return };
         for i in 0..record.langs() {
@@ -947,11 +1101,35 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         true
     }
 
-    fn binds(self, module: ItemKey, _ns: Namespace, _name: &'n str) -> bool {
-        // A typed gap, not a guess: `Names::lookup` reads the solved scopes (the module's own
-        // binding, then its glob edges, nothing else), and the names record's reader has the
-        // path walk only, whose `self::name` is not known to stay in a block's module.
-        self.gap("whether a block's module binds a name (`Names::lookup`: a type declared in a block of a body); the names record's reader has no own-scope lookup", Some(module));
-        false
+    fn binds(self, module: ItemKey, ns: Namespace, name: &'n str) -> bool {
+        // The names record holds a block's module as any module: its writer writes a scope row
+        // for every finished scope of the crate (`names_record::encode`: `CrateNames::done`),
+        // the table `Names::lookup` itself reads. The walk of `self::name` starts IN `module`
+        // (`names::walk`: `PathKind::SelfMod` is the module the path is written in, a block's
+        // module included) and looks the one segment up there: the module's own binding, then
+        // its glob edges, which is what `Names::lookup` reads. `NotFound` is the answer "no";
+        // any other refusal (the scope is not held, an ambiguous or unbounded glob walk) is
+        // no answer: a typed gap naming the module, never taken for "no".
+        match self.walk(module, ns, Written { kind: blaze_surface::PathKind::SelfMod, segments: &[name] }) {
+            Ok(found) => found.consumed == 1,
+            Err(PathError { why: Why::NotFound, .. }) => false,
+            Err(PathError { why: Why::NotRead { .. }, .. }) => {
+                self.gap("whether a block's module binds a name: the names record holds no scope row (or no chain) for the module asked", Some(module));
+                false
+            }
+            Err(_) => {
+                self.gap("whether a block's module binds a name: the walk of `self::name` in the module was refused (private, ambiguous or past its bound), where `Names::lookup` reads the binding itself", Some(module));
+                false
+            }
+        }
+    }
+
+    fn key_beginning(self, first: [u8; 16]) -> Option<ItemKey> {
+        if let Some(found) = self.beginnings.borrow().get(&first) {
+            return *found;
+        }
+        let found = self.find_beginning(first);
+        self.beginnings.borrow_mut().insert(first, found);
+        found
     }
 }

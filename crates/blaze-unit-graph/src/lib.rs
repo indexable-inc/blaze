@@ -94,6 +94,7 @@
 #[cfg(test)]
 extern crate std;
 
+mod extra;
 pub mod implicit;
 pub mod input;
 mod resolve;
@@ -109,6 +110,7 @@ use blaze_manifest::lock::LockId;
 use blaze_own::{AVec, Alloc, String};
 use edition::PackageEdition;
 
+pub use extra::{Extra, ExtraUnit};
 pub use implicit::{Implicit, Prelude, StdIs, Sysroot, ToolchainUnit, implicit};
 pub use input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, NoResolver, Package, Platform, Resolver, TargetDesc};
 pub use resolve::Resolution;
@@ -143,6 +145,12 @@ pub enum UnitKind<'a> {
     BuildScript,
     /// The test harness of the library (`bin: None`) or of a binary.
     Test { bin: Option<Text<'a>> },
+    /// An integration test: `tests/<name>.rs`, `tests/<name>/main.rs` or a `[[test]]` table.
+    IntegrationTest(ExtraUnit<'a>),
+    /// An example: `examples/..` or an `[[example]]` table.
+    Example(ExtraUnit<'a>),
+    /// A bench: `benches/..` or a `[[bench]]` table.
+    Bench(ExtraUnit<'a>),
 }
 
 /// A dependency of a unit: the name the code calls it by, and the unit.
@@ -223,8 +231,7 @@ impl fmt::Display for UnitError<'_> {
             UnitError::AmbiguousLock { package, dep } => write!(f, "`{package}`'s dependency `{dep}` fits two packages of Cargo.lock"),
             UnitError::Requirement { package, dep, req } => write!(f, "`{package}`'s dependency `{dep}`: requirement `{req}` does not parse"),
             UnitError::Platform { package, platform, error } => write!(f, "`{package}`: platform `cfg({platform})`: {error}"),
-            UnitError::RootUnanswered { root } => write!(f, "the root package {} was not answered with its manifest", root.0),
-        }
+            UnitError::RootUnanswered { root } => write!(f, "the root package {} was not answered with its manifest", root.0),        }
     }
 }
 

@@ -74,7 +74,7 @@ pub use ids::{
 pub use portable::{MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, PNode, PTy, PTys, PortableTys, canonical_ranges, object_principal};
 pub use ty::{Cause, ClosureKind, FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 pub use world::{
-    Adt, AdtKind, ArgsAfterSelf, SplitSelf, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
+    Adt, AdtKind, ArgsAfterSelf, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
     Hidden, ImplHeader, ImplPolarity, Missing, Needs, PClause, PathRes, Predicates, Prim, Question, ReadList, Reads, RecordKind, Seal, Shape,
     TraitDef, TraitFlags, TraitMembers, TypeAttrs, DiscrRepr, Variant, World, ground_args_digest,
 };

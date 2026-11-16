@@ -92,6 +92,18 @@ impl OnDir {
         whole.try_extend(body).and_then(|()| whole.try_extend(seal)).map_err(|_| FilesError::Stopped { name: *name })?;
         self.dir.publish(&cx, &Self::path(name)?, Content::bytes(whole.as_slice()), Durable::No).map(|_| ()).map_err(FilesError::Effect)
     }
+
+    /// [`RecordPlant::RenameFirst`]'s write: `name` cut to nothing in place, then `body` and
+    /// `seal` appended in two parts. Never taken but by the simulation's planted bug.
+    fn write_in_place(&self, name: &RecordName, body: &[u8], seal: &[u8; SEAL_LEN]) -> Result<(), FilesError> {
+        let cx = self.cx(name)?;
+        let file = self.dir.create(&cx, &Self::path(name)?).map_err(FilesError::Effect)?;
+        let (first, second) = body.split_at(body.len() / 2);
+        file.append(&cx, first, Durable::No).map_err(FilesError::Effect)?;
+        file.append(&cx, second, Durable::No).map_err(FilesError::Effect)?;
+        file.append(&cx, seal, Durable::No).map_err(FilesError::Effect)?;
+        file.close(&cx, Durable::No).map(|_| ()).map_err(FilesError::Effect)
+    }
 }
 
 /// A world over the folder `store` for a program's start (an example, a test), and that
@@ -147,6 +159,10 @@ pub enum RecordPlant {
     None,
     /// A read takes a file without checking its seal: a torn record is handed back.
     SealSkipped,
+    /// A crate's results table is written in place under its own name, a part at a time (the
+    /// name before the bytes are whole): a failure between two parts leaves a part there with
+    /// no power lost ([`table`]).
+    RenameFirst,
 }
 
 /// The folder store of records: each file the record's bytes then their [`SEAL`], published
@@ -155,6 +171,10 @@ pub struct DirStore {
     files: OnDir,
     tally: Tally,
     plant: RecordPlant,
+    /// How many results tables were found torn ([`table`]): a power cut's, read as absent.
+    torn: core::sync::atomic::AtomicU64,
+    /// How many results tables were hashed whole: once a boot each, not once a command.
+    hashed: core::sync::atomic::AtomicU64,
 }
 
 impl DirStore {
@@ -187,7 +207,12 @@ impl DirStore {
 
     /// The store over `files`; `plant` is [`RecordPlant::None`] but in the simulation.
     pub fn on(files: OnDir, plant: RecordPlant) -> DirStore {
-        DirStore { files, tally: Tally::default(), plant }
+        DirStore { files, tally: Tally::default(), plant, torn: core::sync::atomic::AtomicU64::new(0), hashed: core::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// How many results tables this store found torn, and how many it hashed whole.
+    pub fn torn_and_hashed(&self) -> (u64, u64) {
+        (self.torn.load(core::sync::atomic::Ordering::Relaxed), self.hashed.load(core::sync::atomic::Ordering::Relaxed))
     }
 
     fn name(kind: Kind, key: &ContentId) -> RecordName {
@@ -195,6 +220,11 @@ impl DirStore {
             Kind::List => b"list/",
             Kind::Answer => b"answer/",
         };
+        Self::named(kind, key)
+    }
+
+    /// `<folder><64 hex of key>`: `folder` is one of the store's (at most seven bytes).
+    fn named(kind: &[u8], key: &ContentId) -> RecordName {
         let mut name = RecordName { bytes: [0; 71], len: 0 };
         name.bytes[..kind.len()].copy_from_slice(kind);
         let mut at = kind.len();
@@ -519,7 +549,14 @@ fn encode_into(out: &mut Vec<u8>, produced: &Produced<'_>) -> Result<(), Unkeepa
             ReadAnswer::Bool(_) | ReadAnswer::Number(_) => return Err(Unkeepable { read: at }),
         }
     }
-    let out = &mut *out;
+    answer_into(out, produced);
+    Ok(())
+}
+
+/// `produced` without its reads, in canonical bytes: the tokens with their origins, the
+/// diagnostics and their text. What a crate's results table keeps a call's answer as
+/// ([`table`]); the reads are the row's read list.
+fn answer_into(out: &mut Vec<u8>, produced: &Produced<'_>) {
     stream_bytes(out, &produced.tokens);
     for origin in produced.origins.iter() {
         origin_bytes(out, *origin);
@@ -549,7 +586,6 @@ fn encode_into(out: &mut Vec<u8>, produced: &Produced<'_>) -> Result<(), Unkeepa
     }
     out.extend_from_slice(&(produced.text.len() as u32).to_le_bytes());
     out.extend_from_slice(&produced.text);
-    Ok(())
 }
 
 /// Why a record's bytes are not one.
@@ -618,6 +654,12 @@ pub fn decode<'a>(list: ListRef<'_>, edition: Edition, alloc: Alloc<'a>) -> Resu
         let subject = std::str::from_utf8(subject).map_err(|_| Corrupt("a read's subject"))?;
         reads.push(ReadKind::ProcMacro, subject, c.answer()?).map_err(|_| Corrupt("a read that does not fit"))?;
     }
+    answer_of(c, reads, edition, alloc)
+}
+
+/// The [`Produced`] whose answer ([`answer_into`]'s bytes) is all `c` still holds, with the
+/// reads `reads`, in `alloc`.
+fn answer_of<'a>(mut c: Cursor<'_>, reads: Reads<'a>, edition: Edition, alloc: Alloc<'a>) -> Result<Produced<'a>, Corrupt> {
     let ctx = Ctx::root(edition);
     let mut tokens = TokenStream::new_in(alloc);
     let count = c.u32("the token count")?;
@@ -672,6 +714,14 @@ pub enum RecordError {
     TwoAnswers { base: ContentId },
     /// Every generation of `base`'s chain is full ([`Placed::Full`]): the answer is not kept.
     Full { base: ContentId },
+    /// A crate's results table, or the file vouching for it, could not be read or written.
+    Files(FilesError),
+    /// The results table of the crate named `krate` is whole by its seal and is no table of
+    /// this layout: `what` in it is wrong.
+    Table { krate: ContentId, what: &'static str },
+    /// The results of the crate named `krate` are `bytes` bytes: more than a table's 32-bit
+    /// places hold.
+    TooLarge { krate: ContentId, bytes: usize },
 }
 
 impl From<blaze_record::Error<FilesError>> for RecordError {
@@ -693,6 +743,11 @@ impl std::fmt::Display for RecordError {
                 "the expansion of base {base:x}: another answer is kept under the same reads and digests; the run read something its key does not name (rule 21)"
             ),
             RecordError::Full { base } => write!(f, "the expansion of base {base:x}: every generation of its chain is full; not kept"),
+            RecordError::Files(error) => write!(f, "a crate's proc-macro results table: {error}"),
+            RecordError::Table { krate, what } => write!(f, "the proc-macro results table of crate {krate:x} (crate/{krate:x}): {what} is not this layout's"),
+            RecordError::TooLarge { krate, bytes } => {
+                write!(f, "the proc-macro results of crate {krate:x}: {bytes} bytes, more than a table's 32-bit places hold; not kept")
+            }
         }
     }
 }
@@ -782,6 +837,9 @@ pub fn record_bytes(base: ContentId, produced: &Produced<'_>) -> Result<Vec<u8>,
     }
     Ok(list)
 }
+
+#[path = "table.rs"]
+pub mod table;
 
 #[cfg(test)]
 #[path = "record_tests.rs"]

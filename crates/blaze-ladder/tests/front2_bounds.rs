@@ -80,6 +80,13 @@ fn display<T: core::fmt::Display>(t: T, f: &mut core::fmt::Formatter<'_>) -> cor
 fn need_clone<T: Clone>(t: &T) -> T { t.clone() }
 fn assoc_bound<I: Iterator<Item: Clone>>(mut i: I) { if let Some(x) = i.next() { let _y = need_clone(&x); } }
 fn gat_bound<'a, P: core::str::pattern::Pattern<Searcher<'a>: Clone>>(s: &P::Searcher<'a>) -> P::Searcher<'a> { need_clone(s) }
+trait Fam { type Out<T>; }
+struct Pairs;
+impl Fam for Pairs { type Out<T> = (T, u8); }
+fn gat_bind<F: Fam<Out<u16> = (u16, u8)>>(x: <F as Fam>::Out<u16>) -> (u16, u8) { x }
+fn gat_impl(x: <Pairs as Fam>::Out<u16>) -> (u16, u8) { x }
+trait Lend { type Iter<'a> where Self: 'a; }
+fn gat_where<'a, L: Lend + 'a>(x: <L as Lend>::Iter<'a>) -> <L as Lend>::Iter<'a> { x }
 struct Count(u8);
 impl Iterator for Count { type Item = u8; fn next(&mut self) -> Option<u8> { None } }
 impl DoubleEndedIterator for Count { fn next_back(&mut self) -> Option<Self::Item> { None } }
@@ -125,7 +132,7 @@ fn use_wrap2() { let a = wrap(1u8); let b = wrap(true); let _c = need_clone(&a);
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 44] = [
+const CLEAN: [(&str, &str); 47] = [
     ("call_bound", "`F: Fn(u8) -> u16` on the parameter: `Fn<(u8,)>` and `Output = u16`"),
     ("call_where", "`where F: FnMut(u8)`: the output is `()`"),
     ("call_apit", "`impl FnOnce(u8, bool) -> u16` in argument position"),
@@ -144,6 +151,18 @@ const CLEAN: [(&str, &str); 44] = [
     ("hr_ptr", "`for<'a> fn(&'a u8) -> u8`"),
     ("assoc_bound", "`I: Iterator<Item: Clone>` (an associated type bound): `<I as Iterator>::Item: Clone`"),
     ("gat_bound", "`P: Pattern<Searcher<'a>: Clone>`: a lifetime argument of the associated type is erased"),
+    // Generic associated types (the Reference, "Associated Items", "Associated Types":
+    // "Associated types may include generic parameters and where clauses; these are often
+    // referred to as generic associated types, or GATs"; "Paths", "Qualified paths": "Fully
+    // qualified paths allow for disambiguating the path for trait implementations and for
+    // specifying canonical paths"). front2/gat.rs; the checker's side is blaze-typeck
+    // suite/gat.rs. Each is clean only when the projection's list carries the associated
+    // type's own argument after the trait's: without it `gat_bind` has no head (the refusal
+    // "a binding of a generic associated type with type or const arguments") and
+    // `gat_impl`'s `T` names nothing in the impl's `type Out<T> = (T, u8);`.
+    ("gat_bind", "`F: Fam<Out<u16> = (u16, u8)>`: the clause `<F as Fam>::Out<u16> == (u16, u8)`, so `x` is the pair"),
+    ("gat_impl", "`<Pairs as Fam>::Out<u16>` through `impl Fam for Pairs { type Out<T> = (T, u8); }` is `(u16, u8)`"),
+    ("gat_where", "`type Iter<'a> where Self: 'a;`: the outlives clause is read and kept (not checked); `Iter<'a>` has no own argument"),
     ("thin", "`T: Thin` (core: `pub trait Thin = Pointee<Metadata = ()> + PointeeSized;`): the trait clause and the projection, so `metadata(p)` is `()`"),
     ("thin_where", "`where P: Thin`"),
     ("conv", "`trait Conv<T> = Into<T> + Copy`: a generic alias, its parameter substituted"),

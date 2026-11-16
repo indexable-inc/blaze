@@ -111,7 +111,7 @@ impl World for FmtWorld {
     }
 
     fn opaque_hidden(&self, s: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
-        self.w.opaque_hidden(s, item)
+        World::opaque_hidden(&self.w, s, item)
     }
 
     fn attrs(&self, s: Seal, item: ItemKey) -> Fetch<TypeAttrs> {

@@ -73,8 +73,10 @@ pub fn lay<'f, 'l>(
     let mut texts: Texts<&Frame> = Texts::new_in(frame);
     let mut present: Vec<bool, &Frame> = Vec::new_in(frame);
     let laid = (|| -> Result<Result<layout::Units<'l>, LayoutError<'l>>, CliError> {
+        // The workspace's own members read their test, example and bench targets; a fetched
+        // dependency's layout never does (it ships without tests/).
         let mut layout = match Layout::new("", alloc) {
-            Ok(layout) => layout,
+            Ok(layout) => layout.with_test_targets(),
             Err(error) => return Ok(Err(error)),
         };
         for _ in 0..MOST_PASSES {
@@ -213,7 +215,8 @@ fn place_of(error: &LayoutError<'_>) -> (Option<u32>, Option<Span>) {
         | LayoutError::NoTargetFile { at }
         | LayoutError::GitReferences { at }
         | LayoutError::GitAndPath { at }
-        | LayoutError::Underscored { at } => Some(*at),
+        | LayoutError::Underscored { at }
+        | LayoutError::Target { at, .. } => Some(*at),
         LayoutError::DuplicateName { second, .. } => Some(*second),
         LayoutError::Toml { .. } | LayoutError::NoManifest { .. } | LayoutError::NotAPackage { .. } | LayoutError::NotAMember { .. } => None,
     };

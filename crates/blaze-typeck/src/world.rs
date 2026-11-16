@@ -95,6 +95,9 @@ pub enum Question {
     ConstParams(ItemKey),
     /// The facts of closure `ordinal` of `owner`'s body ([`ClosureFacts`]): its owner's check.
     Closure(ItemKey, u32),
+    /// The generics of a trait's associated type, by its trait and name (as a projection
+    /// names it): the trait's count and its own ([`AssocGenerics`]).
+    AssocGenerics(ItemKey, Name),
 }
 
 /// Whether a question's record is made from items alone or from another body's check.
@@ -127,7 +130,8 @@ impl Question {
             | Question::Attrs(_)
             | Question::TraitDef(_)
             | Question::AssocParent(_)
-            | Question::ConstParams(_) => RecordKind::Item,
+            | Question::ConstParams(_)
+            | Question::AssocGenerics(..) => RecordKind::Item,
         }
     }
 }
@@ -186,6 +190,22 @@ pub struct AssocTyDef {
     pub item: ItemKey,
     /// The default (`type A = T;` in the trait), in the trait's table.
     pub default: Option<PTy>,
+}
+
+/// The generics of a trait's associated type (the Reference, "Associated Items", "Associated
+/// Types": "Associated types may include generic parameters and where clauses; these are often
+/// referred to as generic associated types, or GATs"). A projection's argument list is the
+/// trait's arguments, `Self` first, then the associated type's own in declaration order:
+/// `<T as Tr<A>>::Out<B>` is `Alias { args: [T, A, B] }`, and an impl's `type Out<X> = ..;` is
+/// a type over the impl's generics then `X`. Lifetime parameters are not counted: portable
+/// types hold no regions (`PNode::Ref` has none either), so `type Iter<'a>` has `own: 0` and
+/// `Iter<'a>` no argument, exactly as `&'a T` is `Ref(T)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AssocGenerics {
+    /// The trait's generic parameters, `Self` (index 0) included ([`TraitDef::generics`]).
+    pub parent: u32,
+    /// The associated type's own type and const parameters.
+    pub own: u32,
 }
 
 /// Where an associated item is: its trait or impl, and its name.
@@ -542,6 +562,17 @@ pub trait World {
     fn const_holds(&self, seal: Seal, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Fetch<ConstHolds>;
     /// The const generic parameters of `item`'s generics, the parent's first ([`ConstParams`]).
     fn const_params(&self, seal: Seal, item: ItemKey) -> Fetch<ConstParams<'_>>;
+    /// The generics of the associated type `name` of trait `trait_`: the trait's count and
+    /// the type's own ([`AssocGenerics`]). `None`: this world keeps no such count, which is
+    /// what the default answers: right only for a world none of whose traits declares a
+    /// generic associated type (the checker then files no own parameter and checks no
+    /// count, as it did before this question). A world that reads real traits answers it
+    /// (blaze-ladder front2 does); the method becomes required with the next batch over
+    /// the worlds.
+    fn assoc_generics(&self, seal: Seal, trait_: ItemKey, name: Name) -> Fetch<Option<AssocGenerics>> {
+        let (_, _, _) = (seal, trait_, name);
+        Ok(None)
+    }
     /// The questions the last check of this body asked, before the walk starts: fetch them in
     /// one batch. Answers nothing.
     fn prefetch(&self, seal: Seal, questions: &[Question]) {
@@ -1308,6 +1339,13 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         self.record_tabled(Question::ConstParams(item), got, asked_at)
     }
 
+    /// The generics of a trait's associated type ([`World::assoc_generics`]).
+    pub fn assoc_generics(&mut self, trait_: ItemKey, name: Name) -> Result<Option<AssocGenerics>, Stop> {
+        let asked_at = self.stamp();
+        let got = self.world.assoc_generics(Self::seal(), trait_, name);
+        self.record(Question::AssocGenerics(trait_, name), got, asked_at)
+    }
+
     /// The test build's one backdoor: an ADT read that is not recorded. Only the planted bug
     /// of the read-list property calls it, to show the oracle catches what the seal prevents.
     #[cfg(test)]
@@ -1634,6 +1672,13 @@ impl ContentHash for TraitMembers<'_> {
                 }
             }
         }
+    }
+}
+
+impl ContentHash for AssocGenerics {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u64(u64::from(self.parent));
+        h.u64(u64::from(self.own));
     }
 }
 

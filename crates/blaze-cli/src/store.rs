@@ -843,9 +843,9 @@ pub trait Sharing {
 /// `CrateScope` of a public crate (the toolchain's, a checksummed registry archive's: target.md,
 /// "Namespaces"); any other drive record is [`Place::Own`]: its key is from text alone (rules 25
 /// and 71: no path of the checkout, no stamp), so another worktree with the same text finds it.
-/// A `Fetch` record stands for this checkout's sources folder (fetch.rs `SOURCES`), so it is
-/// [`Place::Checkout`] until that folder is the home's; so is anything not a drive record (a
-/// certificate, a root, a page).
+/// A `Fetch` record stands for the home's sources folder (fetch.rs `SOURCES`), so it is
+/// [`Place::Own`]: this machine's, never public (D78). Anything not a drive record (a
+/// certificate, a root, a page) is [`Place::Checkout`].
 pub struct ToolchainCrates {
     /// Sorted, without repeats.
     subjects: std::vec::Vec<ContentId, Global>,
@@ -873,7 +873,8 @@ impl Sharing for ToolchainCrates {
             Err(_) => return Place::Checkout,
         };
         match (name.kind, all_public) {
-            (Kind::Fetch, _) => Place::Checkout,
+            // Fetched and adopted sources are this machine's (D78): never the shared namespace.
+            (Kind::Fetch, _) => Place::Own,
             (_, true) => Place::Public,
             (_, false) => Place::Own,
         }

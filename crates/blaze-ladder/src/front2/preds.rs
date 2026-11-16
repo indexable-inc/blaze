@@ -203,6 +203,12 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             let (owner, oargs) = self.assoc_owner(tys, key, args, name, pr, shown)?.ok_or_else(|| Why::AssocNotFound(shown.into(), pr))?;
             out.push(PClause::Projection { trait_: self.heads.checker(owner), args: oargs, name, term });
         }
+        // `Name<T> = X` (a generic associated type's binding with type arguments): the
+        // projection's list is the owner's arguments then the binding's own (gat.rs).
+        if let Some(last) = segs.last() {
+            let shown = v.text_at(v.path_range(p)?)?;
+            self.gat_bindings(tys, env, v, last, key, args, pr, shown, &mut |c| out.push(c))?;
+        }
         // `Name: Bounds`: each bound on `<self_ty as Owner>::Name`, the owner found as for
         // `Name = T`.
         for (name, list) in nested {

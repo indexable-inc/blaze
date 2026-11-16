@@ -9,8 +9,8 @@
 //!
 //! A task asks for its direct dependencies' and the sysroot crates' records, then runs
 //! blaze-scope's `resolve_crate`; a `Need` from it asks for those records too and enters again.
-//! The record is the exports record then the inner one; its out is the digest of the EXPORTS
-//! only, so a private change does not move a dependent. The task's key is the crate's key (an
+//! The record is a head, then the exports record, the inner one, the names record and the
+//! items record ([`sections`]); its out is the digest of the EXPORTS only, so a private change does not move a dependent. The task's key is the crate's key (an
 //! identity, no text): every checkout file the resolution read is listed in its reads as that
 //! file's `Surface`, so a body edit (every `Surface` out unchanged) runs no `CrateScope` task,
 //! and a signature edit runs that crate's. A fetched or toolchain file is under the key.
@@ -50,14 +50,15 @@ use crate::fetch::FetchEnv;
 use crate::store::Store;
 use crate::work::{Did, Made, held_str};
 
-const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 1";
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 1";
+pub(crate) mod sections;
+
+// The subject and source domains name the payload's form ([`sections::FORM`] 2): an old home's
+// records (form 1: exports then inner) are under other names, never found, made again.
+const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 2";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 2";
 const OUT_DOMAIN: &str = "blaze-cli crate scope out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "names.rs";
-/// The payload's head: exports length (u64), resolved-from-records flag pair (u32 unresolved
-/// count, u32 reserved), padded to 16.
-const HEAD: usize = 16;
 
 /// A crate's `CrateScope` name: its subject is its key.
 pub(crate) fn name_of(key: CrateItemKey) -> Name {
@@ -83,6 +84,9 @@ pub enum NamesError {
     Sources(String),
     /// The world could not be laid out (its words).
     World(String),
+    /// The workspace's members were not matched to the lock this command (its finding is on
+    /// the root's units): no member's directory is known.
+    NoMembers,
     /// Two members whose directory is one: neither's files can be told apart.
     SharedDirectory { first: String, second: String, dir: String },
     /// A path package the graph reaches that is no member of the workspace (a path dependency
@@ -102,6 +106,7 @@ impl core::fmt::Display for NamesError {
             NamesError::Toolchain(words) => write!(f, "the pinned toolchain: {words}"),
             NamesError::Sources(words) => write!(f, "the fetched sources: {words}"),
             NamesError::World(words) => write!(f, "the crates' inputs: {words}"),
+            NamesError::NoMembers => f.write_str("the workspace's members were not matched to the lock this command: no member's directory is known"),
             NamesError::SharedDirectory { first, second, dir } => {
                 write!(f, "the members `{first}` and `{second}` are both in the directory `{dir}`: one directory holds one package")
             }
@@ -155,24 +160,30 @@ impl Tree for ReadTree {
     }
 }
 
-/// The fetched sources' records: `.blaze/v2/sources/<hex of the key>` under the checkout, for
-/// any key the graph pins.
-struct Folder(&'static Reader);
+/// The fetched sources' records: `<hex of the key>` in the machine's sources store
+/// (`<home>/.blaze/v2/sources`, fetch.rs `SOURCES`), never the checkout, for any key the graph
+/// pins: a reader over that store, with the names step's context and frame.
+struct Folder(Reader);
+
+impl Folder {
+    /// The sources store opened read only beside `checkout`'s reader (its context and frame).
+    fn of(checkout: &'static Reader, env: &FetchEnv<'_>) -> Result<Folder, NamesError> {
+        let sources = crate::fetch::sources_dir(checkout.cx, env).map_err(|error| NamesError::Sources(error.to_string()))?;
+        Ok(Folder(Reader { cx: checkout.cx, root: sources.read_only(), frame: checkout.frame }))
+    }
+}
 
 impl<'b> Records<'b> for Folder {
     fn record(&mut self, source: &SourceId<'_>) -> Option<&'b [u8]> {
         let hex = crate::fetch::key_hex(&source.key());
-        let mut path = String::with_capacity(crate::fetch::SOURCES.len() + 65);
-        path.push_str(crate::fetch::SOURCES);
-        path.push('/');
-        path.extend(hex.iter().map(|digit| char::from(*digit)));
-        self.0.read(&path)
+        self.0.read(core::str::from_utf8(&hex).ok()?)
     }
 }
 
 /// One crate made this command: its payload, out, and the checkout files its resolution read.
 struct Resolved {
-    payload: std::vec::Vec<u8, Global>,
+    /// The record's payload ([`sections::write`]).
+    payload: blaze_own::Vec<u8, Global>,
     out: ContentId,
     /// Each checkout file read, checkout-relative, sorted and without repeats.
     files: std::vec::Vec<String, Global>,
@@ -340,17 +351,30 @@ pub struct Names<'f> {
     pub unresolved: u64,
 }
 
+/// Each workspace member's lock entry and directory, anchor-relative, from the layout the
+/// command read: the graph job's when it was made, else the members matched to the lock;
+/// `None` when the members were not matched to a lock this command.
+pub(crate) fn member_dirs<'l>(laid: Option<&'l crate::units::Laid<'_>>) -> Option<&'l [(LockId, blaze_unit_graph::Text<'static>)]> {
+    let laid = laid?;
+    match (&laid.graph, &laid.parts) {
+        (Some(graph), _) => Some(graph.member_dirs()),
+        (None, Some(parts)) => Some(parts.member_dirs()),
+        (None, None) => None,
+    }
+}
+
 /// The names world of a command, made from the graph record `graph_record`; `members` is each
-/// workspace member's lock entry and directory, anchor-relative (`Graph::member_dirs`).
+/// workspace member's lock entry and directory, anchor-relative ([`member_dirs`]).
 pub(crate) fn world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     graph_record: &[u8],
     lock: Option<&'f Lock<'static>>,
-    members: &[(LockId, blaze_unit_graph::Text<'_>)],
+    members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
     env: &FetchEnv<'_>,
 ) -> Result<Names<'f>, NamesError> {
     let lock: &'f Lock<'f> = lock.ok_or(NamesError::NoLock)?;
+    let members = members.ok_or(NamesError::NoMembers)?;
     // The command's allocator for the world and the records: the global one, held to the end.
     let alloc: Alloc<'f> = Alloc::global();
     let Some(home) = env.home else { return Err(NamesError::NoHome) };
@@ -367,7 +391,7 @@ pub(crate) fn world<'f>(
         .map_err(|e| NamesError::Toolchain(std::format!("{e}")))?;
     let toolchain: &'f Toolchain<'f, crate::toolchain::Held<'static>> = std::boxed::Box::leak(std::boxed::Box::new(toolchain));
     let reader: &'static Reader = std::boxed::Box::leak(std::boxed::Box::new(Reader { cx, root: root.read_only(), frame }));
-    let sources = StoreSources::new(lock, Folder(reader), PackView::open_source_put, Alloc::global())
+    let sources = StoreSources::new(lock, Folder::of(reader, env)?, PackView::open_source_put, Alloc::global())
         .map_err(|e| NamesError::Sources(std::format!("{e}")))?;
     let sources = std::boxed::Box::leak(std::boxed::Box::new(sources));
     // Every path package the graph reaches is a member, placed at its own directory (the
@@ -481,11 +505,6 @@ impl<'w> SourceTexts<'w> for Recording<'_, 'w> {
     }
 }
 
-/// The exports record in a `CrateScope` payload.
-fn exports(payload: &[u8]) -> Option<&[u8]> {
-    let len = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?) as usize;
-    payload.get(HEAD..HEAD.checked_add(len)?)
-}
 
 /// The surface name of a checkout file.
 /// The slot a module file is named by: `a/x.rs` for `a/x/mod.rs`, else the path itself. Debt:
@@ -515,6 +534,7 @@ pub(crate) fn run<'f, 'b>(
     store: &mut dyn Store,
     names: &mut Option<Names<'f>>,
     lock: Option<&'f Lock<'static>>,
+    members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
     env: &FetchEnv<'_>,
     task: &Task<'_>,
     frame: &Frame,
@@ -530,7 +550,7 @@ pub(crate) fn run<'f, 'b>(
             return Ok(Did::Need(wants));
         };
         let read = crate::work::payload(&cx, store, graph, frame)?;
-        match world(&cx, root, read.payload(), lock, env) {
+        match world(&cx, root, read.payload(), lock, members, env) {
             Ok(made) => {
                 tell_public(store, &made);
                 *names = Some(made);
@@ -604,9 +624,15 @@ pub(crate) fn run<'f, 'b>(
         let mut deps: std::vec::Vec<&'static [u8], Global> = std::vec::Vec::with_capacity(local.len());
         for g in local.iter() {
             let read = crate::work::payload(&cx, store, have(*g).expect("checked above"), frame)?;
-            let Some(record) = exports(read.payload()) else {
-                return Ok(Did::FailedSaying(refused("a dependency's record"), "a dependency's `CrateScope` record has no exports record at its head"));
+            let record = match sections::sections(read.payload()) {
+                Ok(parts) => parts.exports,
+                Err(error) => {
+                    let words = bstd::mem::format_in!(held, "crate `{}`: the record of its dependency `{}`: {error}", input.name, crates[*g].input.name);
+                    return Ok(Did::FailedSaying(refused("a dependency's record"), held_str(words.as_str(), held)));
+                }
             };
+            #[cfg(test)]
+            sections::watch(crates[*g].input.name, read.payload());
             deps.push(blaze_scope::resolve::aligned(record, Alloc::global()));
         }
         let me = local.len();
@@ -639,13 +665,23 @@ pub(crate) fn run<'f, 'b>(
         };
         let mut findings = blaze_own::Vec::new_in(Global);
         let unresolved = done.names.notes.len() as u32 + unresolved(&done.names, &mut findings);
-        let mut payload = std::vec::Vec::with_capacity(HEAD + done.record.len() + 16 + done.inner.len());
-        payload.extend_from_slice(&(done.record.len() as u64).to_le_bytes());
-        payload.extend_from_slice(&unresolved.to_le_bytes());
-        payload.resize(HEAD, 0);
-        payload.extend_from_slice(&done.record);
-        payload.resize(payload.len().next_multiple_of(16), 0);
-        payload.extend_from_slice(&done.inner);
+        // The names and items records, filed in the same record (drive.md, "End state", piece
+        // 3): a body is checked by reading them, never by solving the crate graph again.
+        let names_record = match blaze_scope::names_record::encode(done.names, Alloc::global()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let words = bstd::mem::format_in!(held, "crate `{}`: its names record could not be written: {error:?}", input.name);
+                return Ok(Did::FailedSaying(refused("the crate's names record could not be written"), held_str(words.as_str(), held)));
+            }
+        };
+        let items_record = match blaze_scope::items_record::encode(done.names, Alloc::global()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let words = bstd::mem::format_in!(held, "crate `{}`: its items record could not be written: {error:?}", input.name);
+                return Ok(Did::FailedSaying(refused("the crate's items record could not be written"), held_str(words.as_str(), held)));
+            }
+        };
+        let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..]]);
         // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
         // read of either place is a read of the slot's `Surface`.
         let mut files = texts.read.into_inner();

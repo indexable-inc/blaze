@@ -821,8 +821,7 @@ fn with_dep(w: &World, root: ItemKey, dep: ItemKey, plant: CellPlant) -> Cells<'
     let d = cells_of(w, dep, CellPlant::None);
     let reader: &'static SolvedDep = std::boxed::Box::leak(std::boxed::Box::new(SolvedDep { cells: core::cell::RefCell::new(d), krate: crate::tests::crate_key(2), root: dep }));
     w.expanded.borrow_mut().clear();
-    let mut c = Cells::load_with(w, root, Some(reader), Alloc::global()).expect("the core loads");
-    c.plant = plant;
+    let mut c = Cells::load_planted(w, root, Some(reader), plant, Alloc::global()).expect("the core loads");
     let expand = |call: ItemKey, _: crate::Def| {
         w.expanded.borrow_mut().insert(call);
     };
@@ -975,4 +974,176 @@ fn r8_a_macro_written_root_extern_crate_adds_a_name_and_never_replaces_one() {
     assert!(matches!(outcome(&bad, b, 0), Outcome::Failed(Unresolved::NotFound)), "the control R8AddsNothing: {:?}", outcome(&bad, b, 0));
     let bad = with_dep(&w, root, dep, CellPlant::R8MacroReplaces);
     assert_ne!(named_def(outcome(&bad, b, 1), Namespace::Types), Some(x), "the control R8MacroReplaces: {:?}", outcome(&bad, b, 1));
+}
+
+/// A `mod c;` whose text the facts do not hold (its file was not read, or an attribute macro on
+/// the item was not expanded: std, tokio and reqwest on tempo's graph). The Reference,
+/// `items.mod`: a module item "introduces a new, named module into the tree of modules making
+/// up a crate": the name is bound in its parent whatever its inside is. `mod c;` (no text),
+/// `use self::c as d;` binds the module; `use self::c::x as u;` is unknown (`Outside`), never
+/// "not found"; the module is listed as unread. Control `UnreadModuleRefuses`: the load refuses
+/// the whole crate, as it did before.
+/// Prints: "test cells::tests::a_mod_line_without_a_text_is_bound_and_unknown_inside ... ok".
+#[test]
+fn a_mod_line_without_a_text_is_bound_and_unknown_inside() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let c = w.module(root, "c", V::Pub);
+    w.decls.remove(&c);
+    w.use_as(root, "self::c", "d", V::Priv);
+    w.use_as(root, "self::c::x", "u", V::Priv);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, root, 0), Namespace::Types), Some(c), "`d`: {:?}", outcome(&ok, root, 0));
+    assert_eq!(outcome(&ok, root, 1), Outcome::Outside, "`u` is unknown");
+    assert_eq!(&ok.unread[..], &[c][..]);
+    let written = ok.written(root, Alloc::global()).expect("the root is a module");
+    assert_eq!(written.unknown, 1, "the root holds one import that is unknown");
+    assert!(ok.written(c, Alloc::global()).is_none(), "an unread module has no lists");
+    let refused = Cells::load_planted(&w, root, None, CellPlant::UnreadModuleRefuses, Alloc::global());
+    assert!(matches!(refused, Err(super::CellError::Facts { module, .. }) if module == c), "the control UnreadModuleRefuses");
+}
+
+/// `use self::b::k::{self};` binds `k` in the type namespace alone. The Reference,
+/// `items.use.self`: "`self` may be used as the last segment in a brace syntax ... to import
+/// the parent entity under its own name. This only creates a binding in the type namespace."
+/// `mod b { pub mod k {} pub fn k() {} }` and `use self::b::k::{self} as u;`: `u` is the module,
+/// no function. Control `SelfImportBindsAll`: `u` is the function too.
+/// Prints: "test cells::tests::a_self_import_binds_the_type_namespace_alone ... ok".
+#[test]
+fn a_self_import_binds_the_type_namespace_alone() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let b = w.module(root, "b", V::Pub);
+    let k = w.module(b, "k", V::Pub);
+    w.fun(b, "k", V::Pub);
+    w.use_as(root, "self::b::k", "u", V::Priv);
+    let last = w.decls.get_mut(&root).expect("the root's text").uses.last_mut().expect("the import");
+    last.leaf = crate::UseForm::Named { rename: crate::Rename::To("u"), types_only: true };
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, root, 0), Namespace::Types), Some(k));
+    assert_eq!(named_def(outcome(&ok, root, 0), Namespace::Values), None, "no value is bound");
+    let bad = Cells::load_planted(&w, root, None, CellPlant::SelfImportBindsAll, Alloc::global());
+    let mut bad = bad.unwrap_or_else(|e| panic!("the core loads: {e}"));
+    bad.run(&w, &|_, _| {}, &[]).unwrap_or_else(|e| panic!("the core runs: {e}"));
+    assert!(named_def(outcome(&bad, root, 0), Namespace::Values).is_some(), "the control SelfImportBindsAll");
+}
+
+/// A module no `mod` line names (a block's module, made beside its body's module) is loaded
+/// when the caller tells of it, solved by a second run, and written in the record's forms:
+/// bindings sorted by namespace then name, each with its origin. `pub struct S;` at the root;
+/// the block's module (parent: the root) holds `struct Q;` and `use super::S as T;`. Before it
+/// is told of, the core has no lists for it (the control: the shadow counted its bindings as
+/// different); after, `Q` is declared and `T` is an import of `S`.
+/// Prints: "test cells::tests::a_module_no_mod_line_names_is_loaded_later_and_written ... ok".
+#[test]
+fn a_module_no_mod_line_names_is_loaded_later_and_written() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let s = w.item(root, "S", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let blk = w.module(root, "blk", V::Priv);
+    w.decls.get_mut(&root).expect("the root's text").mods.retain(|c| c.module != blk);
+    let q = w.item(blk, "Q", Namespace::Types, crate::DefKind::Other, V::Priv);
+    w.use_as(blk, "super::S", "T", V::Priv);
+    let mut c = cells_of(&w, root, CellPlant::None);
+    assert!(c.written(blk, Alloc::global()).is_none(), "the control: not told of, no lists");
+    assert_eq!(c.load_more(&w, &[blk]).map_err(|e| format!("{e}")), Ok(1));
+    c.run(&w, &|_, _| {}, &[]).unwrap_or_else(|e| panic!("the core runs: {e}"));
+    let written = c.written(blk, Alloc::global()).expect("told of, it is a module");
+    assert_eq!(written.unknown, 0);
+    let got: Vec<(N, ItemKey, crate::Origin)> = written.bindings.iter().map(|e| (e.name, e.binding.def.key, e.binding.origin)).collect();
+    assert_eq!(got, [("Q", q, crate::Origin::Declared), ("T", s, crate::Origin::Import)]);
+    assert!(written.globs.is_empty());
+}
+
+/// async_compression, icu_locale_core, wincode and core on tempo's graph (c10-r11a: 104 imports
+/// "unknown import TextualImport", and behind them the calls through the re-export, unknown,
+/// whose expansions' items the cells then lacked: "differ" with "cells None"). The Reference,
+/// `macro.decl.scope.path.reexport`: "Macros can be re-exported to give them path-based scope
+/// from a module other than the crate root." (its example: `macro_rules! m { () => {}; }
+/// pub(crate) use m;`, "Reexport with path-based scope from within `m`'s textual scope");
+/// `macro.decl.scope.path-based.visibility`: "Macros have an implicit visibility of
+/// `pub(crate)`. `#[macro_export]` changes the implicit visibility to `pub`." The crate: `mod
+/// generic { pub(crate) use late; macro_rules! impl_decoder; pub(crate) use impl_decoder;
+/// macro_rules! late; #[macro_export] macro_rules! ex; pub use ex as ex2; }` and `mod b {
+/// crate::generic::impl_decoder! {} }` writing `pub struct Decoder;`. `impl_decoder` is bound in
+/// `generic`'s macro namespace, crate-wide; `late` is not found (the import stands before the
+/// definition: outside its textual scope); `ex2` is public; the call through the re-export
+/// expands and `Decoder` stands in `b`. The reference solver agrees on every import. Control
+/// `NoTextualImport`: the import is unknown and `Decoder` is not there.
+/// Prints: "test cells::tests::a_use_of_a_macro_rules_name_reads_the_textual_scope ... ok".
+#[test]
+fn a_use_of_a_macro_rules_name_reads_the_textual_scope() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let generic = w.module(root, "generic", V::Pub);
+    w.use_(generic, "late", V::Crate);
+    let dec = w.rules(generic, "impl_decoder");
+    w.use_(generic, "impl_decoder", V::Crate);
+    w.rules(generic, "late");
+    let ex = w.rules_with(generic, "ex", true);
+    w.use_as(generic, "ex", "ex2", V::Pub);
+    let b = w.module(root, "b", V::Pub);
+    let call = w.call(b, "crate::generic::impl_decoder", crate::CallShape::FnLike);
+    let made = w.item(call, "Decoder", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let macros = |c: &Cells<'static, N>, index: u32| match outcome(c, generic, index) {
+        Outcome::Named(n) => n[super::ns_at(Namespace::Macros)].map(|(d, v)| (d.key, v)),
+        other => panic!("import {index} is not bound: {other:?}"),
+    };
+    let mut ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(outcome(&ok, generic, 0), Outcome::Failed(Unresolved::NotFound)), "`use late;`: {:?}", outcome(&ok, generic, 0));
+    assert_eq!(macros(&ok, 1), Some((dec, crate::Visibility::Crate(crate::tests::crate_key(1)))), "`pub(crate) use impl_decoder;`");
+    assert_eq!(macros(&ok, 2), Some((ex, crate::Visibility::Public)), "`pub use ex as ex2;`");
+    assert_eq!(found(ok.ask(b, Namespace::Types, "Decoder").expect("asks")), Some(made), "the call through the re-export expands");
+    compare(&w, root, &ok).expect("the reference solver agrees");
+    let mut bad = cells_of(&w, root, CellPlant::NoTextualImport);
+    assert!(matches!(outcome(&bad, generic, 1), Outcome::Outside), "the control: {:?}", outcome(&bad, generic, 1));
+    assert_ne!(found(bad.ask(b, Namespace::Types, "Decoder").expect("asks")), Some(made), "the control, `Decoder`");
+}
+
+/// mach2 0.5.0 on tempo's graph (edition 2015; c10-g3: "differ 153, cells failed 153, stalls 1").
+/// The Reference, `items.use.path.edition2018`: "In the 2015 edition, `use` paths are relative to
+/// the crate root." and "The 2015 edition does not allow use declarations to reference the extern
+/// prelude."; `vis.scoped.edition2018`: "The 2015 edition may also use paths starting with `::`
+/// or modules from the crate root." The crate (2015), mach2's shape: `mod core_ { pub mod mem {}
+/// }` (the injected `extern crate core;`), `use core_::mem;`, `pub mod kern_return { pub struct
+/// kern_return_t; }`, `pub mod task_info { mod kern_return {} use mem; use
+/// kern_return::kern_return_t; pub(in task_info) struct S; use e::x as u; }` with a dependency
+/// `e` (`pub struct x;`) that no `extern crate` names. `use mem;` is the root's `mem` (read
+/// lexically it waits on itself: the stall); `kern_return` is the root's module, not the empty
+/// one beside the import; `S` is visible in `task_info`; `u` is not found (no extern prelude).
+/// The reference solver agrees on every import. Control `Use2015Lexical`: `use mem;` and the
+/// `kern_return` import fail, `u` resolves, and `pub(in task_info)` refuses the load.
+/// Prints: "test cells::tests::a_2015_use_path_starts_at_the_crate_root ... ok".
+#[test]
+fn a_2015_use_path_starts_at_the_crate_root() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2015);
+    let dep = w.root(2, Edition::E2021);
+    w.item(dep, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.dep(root, "e", dep);
+    let core_ = w.module(root, "core_", V::Priv);
+    let mem = w.module(core_, "mem", V::Pub);
+    w.use_(root, "core_::mem", V::Priv);
+    let kr = w.module(root, "kern_return", V::Pub);
+    let t = w.item(kr, "kern_return_t", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let ti = w.module(root, "task_info", V::Pub);
+    w.module(ti, "kern_return", V::Priv);
+    w.use_(ti, "mem", V::Priv);
+    w.use_(ti, "kern_return::kern_return_t", V::Priv);
+    w.use_as(ti, "e::x", "u", V::Priv);
+    let ok = with_dep(&w, root, dep, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, ti, 0), Namespace::Types), Some(mem), "`use mem;`: {:?}", outcome(&ok, ti, 0));
+    assert_eq!(named_def(outcome(&ok, ti, 1), Namespace::Types), Some(t), "`use kern_return::kern_return_t;`: {:?}", outcome(&ok, ti, 1));
+    assert!(matches!(outcome(&ok, ti, 2), Outcome::Failed(Unresolved::NotFound)), "`use e::x as u;`: {:?}", outcome(&ok, ti, 2));
+    assert_eq!(ok.stats.stalls, 0, "no import waits on itself");
+    compare(&w, root, &ok).expect("the reference solver agrees");
+    let bad = with_dep(&w, root, dep, CellPlant::Use2015Lexical);
+    assert!(matches!(outcome(&bad, ti, 0), Outcome::Failed(_)), "the control, `use mem;`: {:?}", outcome(&bad, ti, 0));
+    assert!(matches!(outcome(&bad, ti, 1), Outcome::Failed(_)), "the control, `kern_return`: {:?}", outcome(&bad, ti, 1));
+    assert!(matches!(outcome(&bad, ti, 2), Outcome::Named(_)), "the control, `u`: {:?}", outcome(&bad, ti, 2));
+    // `pub(in task_info)`: an ancestor named from the crate root.
+    w.item(ti, "S", Namespace::Types, crate::DefKind::Other, V::In("task_info"));
+    let mut vis = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(vis.ask(ti, Namespace::Types, "S").expect("asks"), Some(Value::Found(_, crate::Visibility::Restricted(k))) if k == ti));
+    assert!(Cells::load_planted(&w, root, None, CellPlant::Use2015Lexical, Alloc::global()).is_err(), "the control, `pub(in task_info)`");
 }

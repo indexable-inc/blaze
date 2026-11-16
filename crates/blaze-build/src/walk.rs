@@ -356,6 +356,8 @@ enum Task {
     Ref,
     /// Build `format_args!` `e` from its arguments' references on top (walk/fmt.rs).
     FormatArgs(ExprId),
+    /// The poll loop of `.await` `e`, its operand's value on top (coroutine.rs `await_poll`).
+    Await(ExprId),
 }
 
 struct Walk<'x, 'c, 't, A: Allocator + Clone> {
@@ -447,6 +449,8 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     scope_marks: Vec<u32, A>,
     /// The parts matches by tests moved out of their scrutinees (walk/moves.rs).
     moves: moves::Moves<A>,
+    /// `Some` while a coroutine's body is built (coroutine.rs `run_coroutine`).
+    co: Option<coroutine::Co>,
 }
 
 fn unsupported(expr: ExprId, what: &'static str) -> BuildError {
@@ -677,6 +681,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         scope_pats: Vec::new_in(alloc.clone()),
         scope_marks: Vec::new_in(alloc.clone()),
         moves: moves::Moves::new_in(alloc.clone()),
+        co: None,
     }
     }
 
@@ -748,7 +753,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(found);
         }
         let types = self.types;
-        let g = self.ground_in(types, t)?;
+        // An `async` block of this body, still named by its expression: its identity here
+        // (coroutine.rs `own_block`); every other type through `ground`.
+        let g = match coroutine::own_block(types, t) {
+            Some((block, output)) => self.own_coroutine_ty(block, output)?,
+            None => self.ground_in(types, t)?,
+        };
         self.grounded[at] = g;
         Ok(g)
     }
@@ -788,8 +798,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
             PNode::Never | PNode::FnDef(..) => Repr::None,
             PNode::Tuple(l) if l.len == 0 => Repr::None,
-            // A closure: a struct of one field, its environment (closure.rs).
-            PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) | PNode::Closure { .. } => {
+            // A closure: a struct of one field, its environment (closure.rs). A coroutine: its
+            // state, whose first bytes are its upvars (coroutine.rs).
+            PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Future(..) => {
                 let l = self.layout(g)?;
                 // An unsized tail's struct is only ever behind a pointer (walk/unsized_tail.rs).
                 if self.has_unsized_tail(l) {
@@ -812,7 +823,6 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::Float(f) => numbers::float_repr(f)?,
             PNode::Str => return Err(TyErr::Unsupported("str")),
             PNode::Slice(_) => return Err(TyErr::Unsupported("a slice")),
-            PNode::Future(..) => return Err(TyErr::Unsupported("an async block's future")),
             PNode::Dynamic(_) => return Err(TyErr::Unsupported("a trait object (`dyn`)")),
             PNode::ExTrait(..) | PNode::ExProj { .. } | PNode::ExAuto(_) => {
                 return Err(TyErr::Malformed("a trait object's predicate row as a type"));
@@ -865,7 +875,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// tuple, or a wide pointer (a pointer `ls` lays out as an address and a length).
     fn is_agg(&mut self, g: PTy) -> Result<bool, TyErr> {
         Ok(match self.ground_node(g)? {
-            PNode::Adt(..) | PNode::Array(..) => true,
+            // A coroutine's state holds its tag at least (coroutine.rs).
+            PNode::Adt(..) | PNode::Array(..) | PNode::Future(..) => true,
             PNode::Tuple(l) => l.len > 0,
             // Its environment is a tuple: an aggregate when it captures something.
             PNode::Closure { .. } => {
@@ -1026,6 +1037,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let env = self.closure_parts(t)?.env;
                     parts.push((Name(0), env));
                 }
+                // A coroutine: one field, its upvars, in the state's size (coroutine.rs).
+                PNode::Future(..) => {
+                    let env = self.coroutine_parts(t)?.env;
+                    parts.push((Name(0), env));
+                }
                 _ => return Err(TyErr::Malformed("a layout asked of other than an aggregate")),
             }
             let mut missing = None;
@@ -1043,7 +1059,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 continue;
             }
             // Every aggregate part is laid out by now: whether one needs drop is known.
-            let mut needs_drop = drop_fn.is_some();
+            // A coroutine always needs drop (core's `needs_drop`: it "may return `true` for types
+            // that don't actually need to be dropped"): its drop is the pass's `drop`, which
+            // reads the tag (coroutine.rs).
+            let mut needs_drop = drop_fn.is_some() || matches!(self.ground_node(t)?, PNode::Future(..));
             // A union's fields are never dropped (the reference, "Unions"): only its own
             // `Drop` impl runs. Nor are `ManuallyDrop`'s.
             for &(_, pt) in parts.iter().filter(|_| !is_union && !keeps_fields) {
@@ -1412,6 +1431,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     continue;
                 }
             };
+            // A coroutine's state is copied whole: what the pass keeps in it and its tag are no
+            // field of its row (coroutine.rs `copy_state`).
+            if self.copy_state(l, from, to) {
+                continue;
+            }
             match self.layouts[l as usize].shape {
                 Shape::Fields { first, len } => {
                     for i in (first..first + len).rev() {
@@ -2282,6 +2306,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             TyErr::Malformed(what) => malformed(what),
             TyErr::Other(error) => error,
         };
+        // A coroutine's drop is the pass's `drop` of its split body, never glue over fields.
+        if coroutine::coroutine_of(self.ground.view(), g).is_some() {
+            return Err(BuildError::UnsupportedSig { what: "a coroutine's drop glue asked of `build_drop_glue` (it is `build_coroutine`'s `drop`)" });
+        }
         if !self.needs_drop(g).map_err(sig_err)? {
             return Ok(());
         }
@@ -2452,7 +2480,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 passes.push(self.pass(g, repr, abi, Some(owner))?);
             }
         }
-        let g = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
+        // An `async fn` returns its coroutine, whatever its signature writes (coroutine.rs).
+        let g = match self.async_fn_output()? {
+            Some(g) => g,
+            None => self.ground_in(sig.types, sig.output).map_err(sig_err)?,
+        };
         self.ret = self.repr(g).map_err(sig_err)?;
         self.ret_pass = self.pass(g, self.ret, abi, Some(owner))?;
         let (params, rets) = self.sig_of(&passes, self.ret_pass);
@@ -2854,6 +2886,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Returns `v` from the function: as the one result, through the result pointer, or as
     /// nothing; the value is made first, then every open scope is dropped, parameters last.
     fn ret_value(&mut self, v: V) -> Result<(), BuildError> {
+        // A coroutine's body returns `Poll::Ready(v)` (coroutine.rs).
+        if self.co.is_some() {
+            return self.coroutine_return(v);
+        }
         let ret = self.ret;
         let mut xs = Vec::with_capacity_in(2, self.alloc.clone());
         match self.ret_pass {
@@ -3313,6 +3349,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             Task::Repeat(e) => self.repeat(e)?,
             Task::FormatArgs(e) => self.format_args_done(e)?,
+            Task::Await(e) => self.await_poll(e)?,
             Task::Ref => {
                 let v = match self.pop()? {
                     // A borrow of an unsized place is the wide pointer that reached it.
@@ -4346,8 +4383,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::Let { .. } => return Err(unsupported(e, "`let` outside an `if` or `while` condition")),
             // walk/fmt.rs: the arguments, then `Task::FormatArgs`.
             Expr::FormatArgs { args, uses } => self.format_args(e, args, uses)?,
-            Expr::Await(_) => return Err(unsupported(e, "`.await`")),
-            Expr::AsyncBlock { .. } => return Err(unsupported(e, "an async block")),
+            // coroutine.rs: the operand, then `Task::Await`; the state, its tag `Unresumed`.
+            Expr::Await(operand) => self.await_operand(e, operand)?,
+            Expr::AsyncBlock { .. } => self.coroutine_value(e)?,
             Expr::Underscore => return Err(unsupported(e, "`_` (`_ = e` is not built yet)")),
             Expr::RawRef { mutbl, operand } => self.push_raw_ref(e, mutbl, operand)?,
             Expr::ConstBlock { .. } => return Err(unsupported(e, "a const block")),

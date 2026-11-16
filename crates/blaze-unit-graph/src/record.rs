@@ -24,7 +24,7 @@ use blaze_own::{AVec, Alloc, String, Vec};
 use edition::{Edition, PackageEdition};
 
 use crate::resolve::unit_cfg;
-use crate::{Ask, CfgAtom, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+use crate::{Ask, CfgAtom, ExtraUnit, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 
 /// The record's form. A change to it is a new magic; an older one is refused by it.
 pub const MAGIC: &[u8; 4] = b"BUG1";
@@ -84,6 +84,21 @@ pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetD
                 w.u8(5);
                 w.text(name);
             }
+            // The target's name, then its flags and required features: all in the record, so
+            // two targets of one package, or one whose `harness` changed, are two records.
+            UnitKind::IntegrationTest(extra) | UnitKind::Example(extra) | UnitKind::Bench(extra) => {
+                w.u8(match &unit.kind {
+                    UnitKind::IntegrationTest(_) => 6,
+                    UnitKind::Example(_) => 7,
+                    _ => 8,
+                });
+                w.text(&extra.name);
+                w.u8(u8::from(extra.harness) | (u8::from(extra.test) << 1));
+                w.u32(extra.required_features.len() as u32);
+                for feature in extra.required_features.iter() {
+                    w.text(feature);
+                }
+            }
         }
         w.u8(u8::from(unit.for_host) | (u8::from(unit.incomplete) << 1));
         match unit.edition.blaze {
@@ -124,7 +139,7 @@ pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetD
 }
 
 fn is_test(kind: &UnitKind<'_>) -> bool {
-    matches!(kind, UnitKind::Test { .. })
+    crate::extra::has_test_cfg(kind)
 }
 
 /// Whether `unit`'s cfg is the set [`crate::resolve::unit_cfg`] makes on `desc`.
@@ -179,6 +194,24 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
             3 => UnitKind::BuildScript,
             4 => UnitKind::Test { bin: None },
             5 => UnitKind::Test { bin: Some(r.text()?) },
+            tag @ 6..=8 => {
+                let name = r.text()?;
+                let flags = r.u8()?;
+                if flags > 3 {
+                    return r.refuse("unknown target flags");
+                }
+                let nr = r.count()?;
+                let mut required_features = Vec::with_capacity_in(nr, alloc);
+                for _ in 0..nr {
+                    required_features.push(r.text()?);
+                }
+                let extra = ExtraUnit { name, harness: flags & 1 != 0, test: flags & 2 != 0, required_features };
+                match tag {
+                    6 => UnitKind::IntegrationTest(extra),
+                    7 => UnitKind::Example(extra),
+                    _ => UnitKind::Bench(extra),
+                }
+            }
             _ => return r.refuse("no such unit kind"),
         };
         let flags = r.u8()?;

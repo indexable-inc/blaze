@@ -5,6 +5,10 @@ date: 2026-11-12
 ---
 # The launcher: running a program under `edit`
 
+For `blaze run` this page is superseded by run.md, "End state (architect, 2026-11-16)": the
+launcher maps signed segments and a prebound image and writes no code. Sections 1, 4 and 5 (slot
+words, the edit transaction, a body edit while running) are kept for live patching, later.
+
 ## What exists (read 2026-11-11, tree `all-1111`)
 
 | Piece | Where | What it does, and what is wrong with it for `edit` |
