@@ -27,6 +27,11 @@ parser.workspace = true
 blaze-surface.workspace = true
 # `Vec`: an outline's columns, in the allocator its caller names.
 blaze-own.workspace = true
+# `tokenize` and `skip_body`: the bodies an outline leaves unlexed; `validate`: the skeleton's
+# UTF-8.
+blaze-lex.workspace = true
+# `memchr`: the end of a shebang line.
+blaze-memchr.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

@@ -18,8 +18,8 @@
 //! Hashes are not stored: a grow asks the caller for each id's hash (`rehash`), which is
 //! recomputed from the row in one multiply.
 
-use core::simd::Simd;
 use core::simd::cmp::SimdPartialEq;
+use core::simd::{Select, Simd};
 
 use blaze_int::Int;
 use blaze_own::{Alloc, Vec};
@@ -115,6 +115,22 @@ impl<'a> Index<'a> {
     /// Bytes held.
     pub(crate) fn bytes(&self) -> usize {
         self.groups.capacity() * core::mem::size_of::<Group>()
+    }
+
+    /// Starts loading `hash`'s home group, for a batch that probes it soon (the first phase of
+    /// `Tys::intern_many`, as of blaze-swiss's `Index::find_many`).
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, hash: u64) {
+        let g = &self.groups[hash.truncate_to::<usize>() & self.mask];
+        core::hint::prefetch_read(core::ptr::from_ref(g), core::hint::Locality::L1);
+    }
+
+    /// The id in the first slot of `hash`'s tag in its home group: the row a batch prefetches
+    /// before probing (a hint: another key's tag makes it wasted, never wrong).
+    #[inline(always)]
+    pub(crate) fn ahead(&self, hash: u64) -> Option<u32> {
+        let g = &self.groups[hash.truncate_to::<usize>() & self.mask];
+        first(&matches(g, tag(hash))).map(|at| g.ids[at % SLOTS])
     }
 
     /// The id whose `is` holds among those of `hash`'s tag, or where an id of `hash` goes.

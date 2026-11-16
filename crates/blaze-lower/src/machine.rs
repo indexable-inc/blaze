@@ -2274,7 +2274,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.coros.push(if coro { NONE } else { NOT_CORO });
                 self.top_mut().flags |= F_CORO;
             }
-            Some(FN) if self.mode == Mode::Body && self.is_root_frame() => self.activate(f.pending),
+            // The root fn's own parameters (the root's frame is still open above this list).
+            Some(FN) if self.mode == Mode::Body && self.frames.len() == self.root_depth + 1 => {
+                self.activate(f.pending)
+            }
             // A fn pointer's names, a signature's patterns: bound nowhere.
             _ => self.pending.truncate(f.pending as usize),
         }

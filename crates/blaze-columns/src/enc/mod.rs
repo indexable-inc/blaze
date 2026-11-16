@@ -6,9 +6,10 @@
 //!
 //! | module | what |
 //! |---|---|
-//! | [`bits`] | bit-packing: `n` values of `w` bits end to end, least significant bit first; `get(i)` is one unaligned load, a shift and a mask; a block unpacks with `core::simd` |
-//! | [`block`] | the schemes of one block of 1,024 integers: frame of reference, frame against a line, run-length, delta, delta of delta; each block names its scheme in its first byte |
+//! | [`bits`] | bit-packing: `n` values of `w` bits end to end, least significant bit first; `get(i)` is one unaligned load, a shift and a mask; eight values unpack by one 16-byte load and a byte shuffle (`swizzle_dyn`) a part |
+//! | [`block`] | the schemes of one block of 1,024 integers: frame of reference, frame against a line, run-length, delta, delta of delta; each block's scheme and parameters in a fixed 24-byte directory entry, its body only packed values |
 //! | [`ints`] | an integer column: blocks behind a directory, or a dictionary (distinct values in first-use order) over a column of codes; the chooser |
+//! | [`ids`] | a column of fixed-width ids (32-byte `ContentId`s): each distinct id once in a table, rows as bit-packed codes |
 //! | [`fsst`] | FSST's symbol table: up to 255 symbols of 1 to 8 bytes, an escape for any other byte |
 //! | [`strs`] | a string column: offsets and bytes, FSST codes, or a dictionary of whole strings; the chooser |
 //!
@@ -23,6 +24,7 @@
 pub mod bits;
 pub mod block;
 pub mod fsst;
+pub mod ids;
 pub mod ints;
 mod plant;
 pub mod strs;
@@ -34,6 +36,7 @@ use core::fmt;
 use blaze_own::{AVec, AllocFailure};
 
 pub use block::{GetCost, Scheme};
+pub use ids::{IdView, encode_ids};
 pub use ints::{DictUse, IntChoice, IntPolicy, IntView, encode_ints, ints_size};
 pub use strs::{StrChoice, StrPolicy, StrScheme, StrView, encode_strs};
 

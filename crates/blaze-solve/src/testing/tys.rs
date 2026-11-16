@@ -309,7 +309,9 @@ impl Tys for TestTys {
             if is_region(kx) || is_region(ky) {
                 continue;
             }
-            if matches!(kx, TyKind::Error) || matches!(ky, TyKind::Error) {
+            // `Error` relates to anything, but a variable still binds to it.
+            let var = matches!(kx, TyKind::Infer(_)) || matches!(ky, TyKind::Infer(_));
+            if !var && (matches!(kx, TyKind::Error) || matches!(ky, TyKind::Error)) {
                 continue;
             }
             if how == Relate::Lazy {

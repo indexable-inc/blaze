@@ -433,6 +433,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-cond"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-int",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-core"
 version = "0.0.0"
 dependencies = [
@@ -549,6 +559,8 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-lex",
+ "blaze-memchr",
  "blaze-own",
  "blaze-sim",
  "blaze-surface",
@@ -740,6 +752,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1111,6 +1124,7 @@ dependencies = [
  "blaze-int",
  "blaze-kit",
  "blaze-own",
+ "zstd",
 ]
 
 [[package]]

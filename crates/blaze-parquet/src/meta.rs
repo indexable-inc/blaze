@@ -57,12 +57,17 @@ pub mod encoding {
     pub const PLAIN_DICTIONARY: i32 = 2;
     pub const RLE: i32 = 3;
     pub const BIT_PACKED: i32 = 4;
+    pub const DELTA_BINARY_PACKED: i32 = 5;
+    pub const DELTA_LENGTH_BYTE_ARRAY: i32 = 6;
+    pub const DELTA_BYTE_ARRAY: i32 = 7;
     pub const RLE_DICTIONARY: i32 = 8;
 }
 
 /// `CompressionCodec`.
 pub mod codec {
     pub const UNCOMPRESSED: i32 = 0;
+    pub const ZSTD: i32 = 6;
+    pub const LZ4_RAW: i32 = 7;
 }
 
 /// `PageType`.

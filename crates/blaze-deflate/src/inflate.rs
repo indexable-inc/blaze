@@ -25,6 +25,21 @@
 //! as one step or not at all, so a piece's end inside a symbol leaves the state as it was; the bit
 //! buffer holds 57 bits or more whenever input remains, and one step needs at most 48.
 //!
+//! **The fast loop** ([`InflateInto`] only) is the shape the fast decoders share: a 64-bit bit
+//! buffer refilled by one unaligned 8-byte load; an 11-bit literal/length table and an 8-bit
+//! distance table with subtables behind them ([`crate::fast`]), each entry packed with the
+//! symbol's byte or base, extra bits and code length; two literals per refill; no bounds
+//! checked inside, because it runs only while 8 bytes of input and a match plus 16 bytes of
+//! output remain and every limit is a match away; matches copied 16 bytes at a time, distance 1
+//! as a fill and shorter distances doubled first. The careful decoder takes the tails, block
+//! headers and every error, and is the twin the tests hold it equal to (equal bytes, equal
+//! answers at every feed).
+//!
+//! Cost (`examples/cost.rs`, 8 MiB of the workspace's Rust, an Apple M-series core, 2026-11-15):
+//! into a slice 1027 MB/s, the careful decoder 504, miniz_oxide 569. Floor: taken as twice
+//! miniz_oxide (the best decoders' advantage on such input), about 1140 MB/s: the fast loop
+//! is at 0.90 of it. Into a vector the ring's flush still holds it to 461 MB/s.
+//!
 //! **Where a stream ends.** The bit buffer reads up to eight bytes ahead. When the final block
 //! ends, the whole bytes it read past it are kept in [`Inflate::tail`]: they are the next thing's
 //! (a zlib or gzip trailer, the next object of a git pack), and the framings feed them on.
@@ -37,6 +52,7 @@ use blaze_own::{Box, Vec};
 
 use crate::{
     error::{Error, Format, Tree, Why},
+    fast::{self, DIST_BITS, END, LIT_BITS, LITERAL, SUB, VALUE},
     plant::{self, Plant},
     tables::{
         DIST_BASE, DIST_EXTRA, FIXED_DIST_LENS, FIXED_LIT_LENS, LEN_BASE, LEN_EXTRA, MAX_MATCH,
@@ -200,6 +216,9 @@ struct Tables {
     lens: [u8; 286 + 32],
     /// Whether `lit` and `dist` hold the fixed code now (so a fixed block builds nothing).
     fixed: bool,
+    /// The fast loop's tables of the same codes (see [`crate::fast`]), built when it runs.
+    lit_fast: [u32; fast::LIT_ENOUGH],
+    dist_fast: [u32; fast::DIST_ENOUGH],
 }
 
 impl Tables {
@@ -210,7 +229,15 @@ impl Tables {
         pre_lens: [0; 19],
         lens: [0; 286 + 32],
         fixed: false,
+        lit_fast: [0; fast::LIT_ENOUGH],
+        dist_fast: [0; fast::DIST_ENOUGH],
     };
+
+    /// The fast tables of the codes `lit` and `dist` were just built from.
+    fn build_fast(&mut self, lit: &[u8], dist: &[u8]) {
+        fast::build_lit(lit, &mut self.lit_fast);
+        fast::build_dist(dist, &mut self.dist_fast);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -237,6 +264,8 @@ pub(crate) trait Out {
     fn put_bytes(&mut self, at: u64, bytes: &[u8]) -> Result<(), Why>;
     /// `length` bytes copied from `distance` back (`distance <= at`, checked by the caller).
     fn put_match(&mut self, at: u64, distance: usize, length: usize) -> Result<(), Why>;
+    /// The whole output as one slice, if the strategy keeps it so: where the fast loop runs.
+    fn flat(&mut self) -> Option<&mut [u8]>;
 }
 
 /// [`Inflate`]'s strategy: a 32 KiB ring, flushed to the caller's vector.
@@ -303,6 +332,10 @@ impl<B: Allocator> Out for Ring<'_, B> {
         }
         Ok(())
     }
+
+    fn flat(&mut self) -> Option<&mut [u8]> {
+        None
+    }
 }
 
 /// [`InflateInto`]'s strategy: the caller's slice, output and window at once.
@@ -358,6 +391,10 @@ impl Out for Flat<'_> {
         }
         Ok(())
     }
+
+    fn flat(&mut self) -> Option<&mut [u8]> {
+        Some(self.out)
+    }
 }
 
 /// The decoder's state, whatever the output: see the module.
@@ -378,11 +415,15 @@ struct Core {
     /// Whole bytes the bit buffer read past the final block.
     tail: [u8; 8],
     tail_len: u8,
+    /// Whether the fast loop runs where the output is one slice; the careful decoder alone is
+    /// its twin in the tests.
+    fast: bool,
 }
 
 impl Core {
-    const fn new(limits: Limits) -> Core {
+    const fn new(limits: Limits, fast: bool) -> Core {
         Core {
+            fast,
             tables: Tables::EMPTY,
             written: 0,
             bits: 0,
@@ -475,6 +516,9 @@ impl Core {
                             if !t.fixed {
                                 t.lit.build(&FIXED_LIT_LENS, Tree::Literals)?;
                                 t.dist.build(&FIXED_DIST_LENS, Tree::Distances)?;
+                                if self.fast {
+                                    t.build_fast(&FIXED_LIT_LENS, &FIXED_DIST_LENS);
+                                }
                                 t.fixed = true;
                             }
                             State::Codes
@@ -607,6 +651,10 @@ impl Core {
                     }
                     t.lit.build(&t.lens[..hlit], Tree::Literals)?;
                     t.dist.build(&t.lens[hlit..hlit + hdist], Tree::Distances)?;
+                    if self.fast {
+                        let lens = t.lens;
+                        t.build_fast(&lens[..hlit], &lens[hlit..hlit + hdist]);
+                    }
                     t.fixed = false;
                     self.state = State::Codes;
                 }
@@ -622,6 +670,11 @@ impl Core {
     /// The symbols of a Huffman block, to its end (`true`) or the input's (`false`).
     fn codes<O: Out>(&mut self, input: &[u8], at: &mut usize, out: &mut O) -> Result<bool, Why> {
         loop {
+            if self.fast
+                && let Some(flat) = out.flat()
+            {
+                self.fast_codes(input, at, flat);
+            }
             self.refill(input, at);
             out.make_room(self.written)?;
             let (symbol, len) = match self.tables.lit.decode(self.bits, self.nbits) {
@@ -675,6 +728,132 @@ impl Core {
             self.written += length as u64;
         }
     }
+
+    /// The fast loop: symbols decoded into the flat output while every bound is far enough
+    /// away that none needs checking (see [`InflateInto`]). It stops, with the state as the
+    /// careful decoder would have it, before anything it does not do itself: a block's end, a
+    /// code that is no code, a distance past the output, the last 8 bytes of input or the last
+    /// [`FAST_ROOM`] of output, or a bound within one match. The careful decoder takes that
+    /// symbol, with its errors, and the loop runs again after it.
+    ///
+    /// Its refill is the careful decoder's, done at once: the bytes that bring the buffer past
+    /// 56 bits are loaded as one 8-byte word, so the two take equal input at every symbol and
+    /// report equal errors at equal offsets. The bits above `nbits` hold the input's next
+    /// bytes in their places (OR-ing them in again changes nothing); they are cleared on exit.
+    #[inline(never)]
+    fn fast_codes(&mut self, input: &[u8], at: &mut usize, out: &mut [u8]) {
+        let (lit, dist) = (&self.tables.lit_fast, &self.tables.dist_fast);
+        let (mut bits, mut nbits, mut pos, mut w) = (self.bits, self.nbits, *at, self.written as usize);
+        // Bytes taken before this call's input, so `taken` is `base + pos` throughout.
+        let base = self.taken - pos as u64;
+        let (most_out, ratio) = (self.limits.most_out, self.limits.most_ratio);
+        while pos + 8 <= input.len() && w + FAST_ROOM <= out.len() {
+            let n = (64 - nbits as usize) >> 3;
+            if nbits < 64 {
+                let word = u64::from_le_bytes(input[pos..pos + 8].try_into().expect("8 bytes"));
+                bits |= word << nbits;
+            }
+            pos += n;
+            nbits += 8 * n as u32;
+            let most = (base + pos as u64).saturating_mul(ratio).saturating_add(RATIO_SLACK).min(most_out);
+            if (w + MAX_MATCH) as u64 > most {
+                break;
+            }
+            let mut e = lit[(bits as usize) & ((1 << LIT_BITS) - 1)];
+            if e & SUB != 0 {
+                let index = (bits >> LIT_BITS) as usize & ((1 << ((e >> 8) & 15)) - 1);
+                e = lit[(e >> 16) as usize + index];
+            }
+            let len = e & 15;
+            if e & LITERAL != 0 {
+                out[w] = (e >> 16) as u8;
+                w += 1;
+                bits >>= len;
+                nbits -= len;
+                // At least 41 bits remain, enough for any code: a second literal needs no refill
+                // (the next refill brings the buffer to where the careful decoder's would be).
+                let mut e = lit[(bits as usize) & ((1 << LIT_BITS) - 1)];
+                if e & SUB != 0 {
+                    let index = (bits >> LIT_BITS) as usize & ((1 << ((e >> 8) & 15)) - 1);
+                    e = lit[(e >> 16) as usize + index];
+                }
+                if e & LITERAL != 0 {
+                    out[w] = (e >> 16) as u8;
+                    w += 1;
+                    let len = e & 15;
+                    bits >>= len;
+                    nbits -= len;
+                }
+                continue;
+            }
+            if e & VALUE == 0 {
+                // A block's end or no code: the careful decoder's.
+                debug_assert!(e & END != 0 || e == 0);
+                break;
+            }
+            let extra = (e >> 8) & 15;
+            let length = (e >> 16) as usize + ((bits >> len) as usize & ((1 << extra) - 1));
+            let used = len + extra;
+            let rest = bits >> used;
+            let mut d = dist[(rest as usize) & ((1 << DIST_BITS) - 1)];
+            if d & SUB != 0 {
+                let index = (rest >> DIST_BITS) as usize & ((1 << ((d >> 8) & 15)) - 1);
+                d = dist[(d >> 16) as usize + index];
+            }
+            if d & VALUE == 0 {
+                break;
+            }
+            let (dlen, dextra) = (d & 15, (d >> 8) & 15);
+            let distance = (d >> 16) as usize
+                + ((rest >> dlen) as usize & ((1 << dextra) - 1))
+                + usize::from(plant::on(Plant::FastDistanceOffByOne));
+            if distance > w {
+                break;
+            }
+            bits = rest >> (dlen + dextra);
+            nbits -= used + dlen + dextra;
+            copy_match(out, w, distance, length);
+            w += length;
+        }
+        self.bits = match nbits {
+            64 => bits,
+            _ => bits & ((1 << nbits) - 1),
+        };
+        self.nbits = nbits;
+        self.taken = base + pos as u64;
+        self.written = w as u64;
+        *at = pos;
+    }
+}
+
+/// Output the fast loop keeps free past its write position: the longest match and the most a
+/// 16-byte copy writes past a match's end.
+const FAST_ROOM: usize = MAX_MATCH + 16;
+
+/// `length` bytes from `distance` back, written at `at` 16 at a time: up to 15 bytes past the
+/// match are overwritten (the fast loop keeps them free). A distance under 16 first doubles the
+/// pattern until a whole period of 16 or more lies behind the write position.
+#[inline(always)]
+fn copy_match(out: &mut [u8], at: usize, distance: usize, length: usize) {
+    let src = at - distance;
+    let mut done = 0;
+    if distance == 1 {
+        let byte = out[src];
+        out[at..at + length.next_multiple_of(16)].fill(byte);
+        return;
+    }
+    while done < length && distance + done < 16 {
+        let n = (length - done).min(distance + done);
+        out.copy_within(src..src + n, at + done);
+        done += n;
+    }
+    let period = (distance + done) / distance * distance;
+    while done < length {
+        let from = at + done - period;
+        let chunk: [u8; 16] = out[from..from + 16].try_into().expect("16 bytes");
+        out[at + done..at + done + 16].copy_from_slice(&chunk);
+        done += 16;
+    }
 }
 
 /// A streaming inflater appending to the caller's vector: see the module.
@@ -689,7 +868,7 @@ impl<A: Allocator + Clone> Inflate<A> {
     /// An inflater held to `limits`, its window and tables in `alloc`.
     pub fn new_in(limits: Limits, alloc: A) -> Inflate<A> {
         Inflate {
-            core: Box::new_in(Core::new(limits), alloc.clone()),
+            core: Box::new_in(Core::new(limits, false), alloc.clone()),
             window: Vec::from_elem_in(0u8, WINDOW, alloc),
             flushed: 0,
         }
@@ -744,7 +923,12 @@ pub struct InflateInto {
 impl InflateInto {
     /// An inflater held to `limits` (and to the slice it is fed: the lesser bound wins).
     pub const fn new(limits: Limits) -> InflateInto {
-        InflateInto { core: Core::new(limits) }
+        InflateInto { core: Core::new(limits, true) }
+    }
+
+    /// The same decoder without its fast loop: the twin the tests hold it equal to.
+    pub const fn careful(limits: Limits) -> InflateInto {
+        InflateInto { core: Core::new(limits, false) }
     }
 
     /// Takes what it can of `input`, writing the output into `out` after the

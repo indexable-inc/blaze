@@ -55,7 +55,7 @@ pub struct Dict<C: Id, K: Hash + Eq, A: Allocator + Clone> {
 }
 
 #[inline]
-fn hash32<K: Hash>(value: &K) -> u32 {
+fn hash32<K: Hash + ?Sized>(value: &K) -> u32 {
     // The low half: the slot index is its low bits.
     FixedState.hash_one(value).truncate_to::<u32>()
 }
@@ -112,7 +112,10 @@ impl<C: Id, K: Hash + Eq, A: Allocator + Clone> Dict<C, K, A> {
     /// The slot holding `value` (`Ok`), or the empty slot it would go in (`Err`); with no
     /// table, `Err(0)`.
     #[inline]
-    fn find(&self, hash: u32, value: &K) -> Result<usize, usize> {
+    fn find<Q: Eq + ?Sized>(&self, hash: u32, value: &Q) -> Result<usize, usize>
+    where
+        K: core::borrow::Borrow<Q>,
+    {
         if self.slots.is_empty() {
             return Err(0);
         }
@@ -125,7 +128,7 @@ impl<C: Id, K: Hash + Eq, A: Allocator + Clone> Dict<C, K, A> {
             }
             if (slot >> 32).truncate_to::<u32>() == hash {
                 let code = blaze_int::idx((slot & 0xffff_ffff).truncate_to::<u32>());
-                if self.values[code] == *value {
+                if self.values[code].borrow() == value {
                     return Ok(at);
                 }
             }
@@ -185,6 +188,46 @@ impl<C: Id, K: Hash + Eq, A: Allocator + Clone> Dict<C, K, A> {
         if blaze_int::idx(raw) == len {
             self.values.push(value);
         }
+        let code = C::from_u32(raw);
+        self.codes.push(code);
+        Ok(code)
+    }
+
+    /// Pushes a row of the value `key` names, made by `own` only when it is new: a text
+    /// column's `&str` against `String` values, with nothing made for a row already seen. `K`'s
+    /// hash and equality are `Q`'s (what `Borrow` promises). Refused with nothing changed.
+    pub fn try_push_by<Q: Hash + Eq + ?Sized>(
+        &mut self,
+        key: &Q,
+        own: impl FnOnce(&Q) -> Result<K, AllocFailure>,
+    ) -> Result<C, AllocFailure>
+    where
+        K: core::borrow::Borrow<Q>,
+    {
+        let hash = hash32(key);
+        self.codes.try_reserve(1)?;
+        if let Ok(slot) = self.find(hash, key) {
+            let code = C::from_u32((self.slots[slot] & 0xffff_ffff).truncate_to::<u32>());
+            self.codes.push(code);
+            return Ok(code);
+        }
+        let len = self.values.len();
+        let raw = match len.narrow::<u32>() {
+            Ok(raw) if raw < MOST => raw,
+            _ => return Err(overflow(type_name::<Self>(), len, 1)),
+        };
+        self.values.try_reserve(1)?;
+        if (len + 1) * 4 > self.slots.len() * 3 {
+            let slots = (self.slots.len() * 2).max(MIN_SLOTS);
+            self.slots = self.try_rehash(slots)?;
+        }
+        let value = own(key)?;
+        let at = match self.find(hash, key) {
+            Err(at) => at,
+            Ok(_) => unreachable!("the value was not in the table"),
+        };
+        self.slots[at] = (u64::from(hash) << 32) | u64::from(raw);
+        self.values.push(value);
         let code = C::from_u32(raw);
         self.codes.push(code);
         Ok(code)

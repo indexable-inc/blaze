@@ -103,28 +103,32 @@ const LOSES: u32 = EVENT_MUST_SCAN_SUB_DIRS
 /// stopping: a stop waits on the queue, so a callback waiting on a full sink must give up.
 const ROOM: Duration = Duration::from_millis(1);
 
-// SAFETY: these signatures match CoreFoundation's CFString.h, CFArray.h and CFUUID.h (`CFRef`
-// is `CFTypeRef` and `CFUUIDRef`, `CFIndex` is `isize`, `CFUUIDBytes` is laid out as its
-// sixteen `UInt8` fields); a mismatch would be UB at every call.
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    static kCFTypeArrayCallBacks: CFArrayCallBacks;
-    fn CFStringCreateWithFileSystemRepresentation(allocator: CFRef, path: *const c_char) -> CFRef;
-    fn CFArrayCreate(
+/// CoreFoundation's and FSEvents' calls this driver makes, found when the first watch is made
+/// ([`Frameworks::get`]), never linked: a program that never watches loads neither framework at
+/// start (docs/v2/plan/design/std.md, "What a program pays for at start"). dyld would otherwise
+/// load and initialise both, with everything they depend on, on every run of every program
+/// with blaze-core in it. A `Watch` holds the `&'static Frameworks` it was made with, so every
+/// call below is made only once they are loaded.
+///
+/// The signatures are CoreFoundation's CFString.h, CFArray.h and CFUUID.h (`CFRef` is
+/// `CFTypeRef` and `CFUUIDRef`, `CFIndex` is `isize`, `CFUUIDBytes` is laid out as its sixteen
+/// `UInt8` fields) and FSEvents.h (`FSEventStreamEventId` is `UInt64`,
+/// `FSEventStreamCreateFlags` is `UInt32`, `dev_t` is `__darwin_dev_t`, an `int32_t`); a
+/// mismatch would be UB at every call.
+struct Frameworks {
+    /// `kCFTypeArrayCallBacks`: a constant of CoreFoundation's, never written.
+    type_array_callbacks: *const CFArrayCallBacks,
+    string_create_with_file_system_representation:
+        unsafe extern "C" fn(allocator: CFRef, path: *const c_char) -> CFRef,
+    array_create: unsafe extern "C" fn(
         allocator: CFRef,
         values: *const CFRef,
         count: CFIndex,
         callbacks: *const CFArrayCallBacks,
-    ) -> CFRef;
-    fn CFUUIDGetUUIDBytes(uuid: CFRef) -> CFUUIDBytes;
-    fn CFRelease(object: CFRef);
-}
-
-// SAFETY: these signatures match FSEvents.h (`FSEventStreamEventId` is `UInt64`,
-// `FSEventStreamCreateFlags` is `UInt32`, `dev_t` is `__darwin_dev_t`, an `int32_t`).
-#[link(name = "CoreServices", kind = "framework")]
-unsafe extern "C" {
-    fn FSEventStreamCreate(
+    ) -> CFRef,
+    uuid_get_uuid_bytes: unsafe extern "C" fn(uuid: CFRef) -> CFUUIDBytes,
+    release: unsafe extern "C" fn(object: CFRef),
+    stream_create: unsafe extern "C" fn(
         allocator: CFRef,
         callback: Callback,
         context: *const Context,
@@ -132,14 +136,118 @@ unsafe extern "C" {
         since: u64,
         latency: f64,
         flags: u32,
-    ) -> FSEventStreamRef;
-    fn FSEventStreamSetDispatchQueue(stream: FSEventStreamRef, queue: DispatchQueue);
-    fn FSEventStreamStart(stream: FSEventStreamRef) -> u8;
-    fn FSEventStreamStop(stream: FSEventStreamRef);
-    fn FSEventStreamInvalidate(stream: FSEventStreamRef);
-    fn FSEventStreamRelease(stream: FSEventStreamRef);
-    fn FSEventsGetCurrentEventId() -> u64;
-    fn FSEventsCopyUUIDForDevice(device: libc::dev_t) -> CFRef;
+    ) -> FSEventStreamRef,
+    stream_set_dispatch_queue: unsafe extern "C" fn(stream: FSEventStreamRef, queue: DispatchQueue),
+    stream_start: unsafe extern "C" fn(stream: FSEventStreamRef) -> u8,
+    stream_stop: unsafe extern "C" fn(stream: FSEventStreamRef),
+    stream_invalidate: unsafe extern "C" fn(stream: FSEventStreamRef),
+    stream_release: unsafe extern "C" fn(stream: FSEventStreamRef),
+    get_current_event_id: unsafe extern "C" fn() -> u64,
+    copy_uuid_for_device: unsafe extern "C" fn(device: libc::dev_t) -> CFRef,
+}
+
+// SAFETY: function pointers, and the address of a constant of CoreFoundation's that nothing
+// writes; both frameworks stay loaded for the life of the process (never `dlclose`d).
+unsafe impl Send for Frameworks {}
+// SAFETY: as above: nothing in it is written after it is made.
+unsafe impl Sync for Frameworks {}
+
+/// A framework, or a symbol in it, that could not be found at first use.
+#[derive(Clone, Copy, Debug)]
+struct Missing {
+    /// The framework's binary, as `dlopen` was given it.
+    framework: &'static CStr,
+    /// The symbol it lacked; `None` when the framework itself did not load.
+    symbol: Option<&'static CStr>,
+}
+
+impl Missing {
+    fn to_error(self) -> io::Error {
+        let framework = self.framework.to_string_lossy();
+        // alloc: an error path.
+        io::Error::new(io::ErrorKind::Unsupported, match self.symbol {
+            None => format!("watching needs {framework}, which this system cannot load"),
+            Some(symbol) => format!(
+                "watching needs `{}` from {framework}, which this system's copy does not have",
+                symbol.to_string_lossy()
+            ),
+        })
+    }
+}
+
+const CORE_FOUNDATION: &CStr = c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+const CORE_SERVICES: &CStr = c"/System/Library/Frameworks/CoreServices.framework/CoreServices";
+
+impl Frameworks {
+    /// Both frameworks, loaded and their symbols found on the first call of the process (each
+    /// later call reads what that one found, an error included): the one place this driver
+    /// pays for them.
+    fn get() -> io::Result<&'static Frameworks> {
+        static LOADED: std::sync::OnceLock<Result<Frameworks, Missing>> = std::sync::OnceLock::new();
+        match LOADED.get_or_init(Frameworks::load) {
+            Ok(it) => Ok(it),
+            Err(missing) => Err(missing.to_error()),
+        }
+    }
+
+    fn load() -> Result<Frameworks, Missing> {
+        let cf = open(CORE_FOUNDATION)?;
+        let cs = open(CORE_SERVICES)?;
+        // SAFETY: each type is the symbol's as the header declares it (the struct's doc).
+        unsafe {
+            Ok(Frameworks {
+                type_array_callbacks: symbol(cf, CORE_FOUNDATION, c"kCFTypeArrayCallBacks")?,
+                string_create_with_file_system_representation: symbol(
+                    cf,
+                    CORE_FOUNDATION,
+                    c"CFStringCreateWithFileSystemRepresentation",
+                )?,
+                array_create: symbol(cf, CORE_FOUNDATION, c"CFArrayCreate")?,
+                uuid_get_uuid_bytes: symbol(cf, CORE_FOUNDATION, c"CFUUIDGetUUIDBytes")?,
+                release: symbol(cf, CORE_FOUNDATION, c"CFRelease")?,
+                stream_create: symbol(cs, CORE_SERVICES, c"FSEventStreamCreate")?,
+                stream_set_dispatch_queue: symbol(cs, CORE_SERVICES, c"FSEventStreamSetDispatchQueue")?,
+                stream_start: symbol(cs, CORE_SERVICES, c"FSEventStreamStart")?,
+                stream_stop: symbol(cs, CORE_SERVICES, c"FSEventStreamStop")?,
+                stream_invalidate: symbol(cs, CORE_SERVICES, c"FSEventStreamInvalidate")?,
+                stream_release: symbol(cs, CORE_SERVICES, c"FSEventStreamRelease")?,
+                get_current_event_id: symbol(cs, CORE_SERVICES, c"FSEventsGetCurrentEventId")?,
+                copy_uuid_for_device: symbol(cs, CORE_SERVICES, c"FSEventsCopyUUIDForDevice")?,
+            })
+        }
+    }
+}
+
+/// The framework at `path`, loaded for the life of the process.
+fn open(path: &'static CStr) -> Result<*mut c_void, Missing> {
+    // SAFETY: a NUL-terminated path; the handle is never closed, so what it gives stays valid.
+    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    match handle.is_null() {
+        true => Err(Missing { framework: path, symbol: None }),
+        false => Ok(handle),
+    }
+}
+
+/// The symbol `name` of the framework `handle` loaded, as an `F`.
+///
+/// # Safety
+///
+/// `F` is a pointer type (a function pointer or a raw pointer) that is the symbol's type as its
+/// header declares it; a call through another would be UB.
+unsafe fn symbol<F: Copy>(
+    handle: *mut c_void,
+    framework: &'static CStr,
+    name: &'static CStr,
+) -> Result<F, Missing> {
+    const { assert!(size_of::<F>() == size_of::<*mut c_void>(), "a symbol is one address") };
+    // SAFETY: a handle `open` returned, never closed, and a NUL-terminated name.
+    let found = unsafe { libc::dlsym(handle, name.as_ptr()) };
+    if found.is_null() {
+        return Err(Missing { framework, symbol: Some(name) });
+    }
+    // SAFETY: an address the size of `F` (asserted above), of the symbol whose type `F` is
+    // (the caller's contract).
+    Ok(unsafe { std::mem::transmute_copy::<*mut c_void, F>(&found) })
 }
 
 // libdispatch, in libSystem.
@@ -331,7 +439,7 @@ fn is_under(name: &str, dir: &str) -> bool {
 /// The UUID of the FSEvents store of the volume `path` is on: of its nearest ancestor that is
 /// there, for a directory not made yet. A volume with no store (one fseventsd does not keep)
 /// fails, naming the device.
-fn store_of(path: &Path) -> io::Result<[u8; 16]> {
+fn store_of(fw: &Frameworks, path: &Path) -> io::Result<[u8; 16]> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = path.ancestors().find_map(|it| std::fs::metadata(it).ok()).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "none of its directories is there")
@@ -339,7 +447,7 @@ fn store_of(path: &Path) -> io::Result<[u8; 16]> {
     // `st_dev` is an `int32_t` that `dev()` widened; narrowing gives it back.
     let device = meta.dev() as libc::dev_t;
     // SAFETY: no pointers; the result is a CFUUID retained for the caller, or null.
-    let uuid = unsafe { FSEventsCopyUUIDForDevice(device) };
+    let uuid = unsafe { (fw.copy_uuid_for_device)(device) };
     if uuid.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -348,9 +456,9 @@ fn store_of(path: &Path) -> io::Result<[u8; 16]> {
         ));
     }
     // SAFETY: a CFUUID, alive until it is released below.
-    let bytes = unsafe { CFUUIDGetUUIDBytes(uuid) };
+    let bytes = unsafe { (fw.uuid_get_uuid_bytes)(uuid) };
     // SAFETY: retained by the copy above for this function, released once, not used after.
-    unsafe { CFRelease(uuid) };
+    unsafe { (fw.release)(uuid) };
     Ok(bytes.bytes)
 }
 
@@ -431,6 +539,8 @@ impl<S: Tell> Shared<S> {
 /// once ([`Watch::new`]) and started and stopped any number of times; a start after a stop
 /// reuses everything but the stream.
 pub(crate) struct Watch<S> {
+    /// The frameworks every call below is made through, loaded before the watch was made.
+    fw: &'static Frameworks,
     shared: Owned<S>,
     /// Serial: the stream's callbacks, and its stop, run on it one at a time.
     queue: DispatchQueue,
@@ -492,6 +602,7 @@ impl<S: Tell> Watch<S> {
     /// A watch telling `sink`, with its directory of cookies and its queue made: none of them
     /// is made again for any stream it runs.
     pub(crate) fn new(sink: S) -> io::Result<Watch<S>> {
+        let fw = Frameworks::get()?;
         let cookies = cookies().map_err(|error| {
             // alloc: an error path.
             io::Error::new(error.kind(), format!("making the cookies of a watch: {error}"))
@@ -501,7 +612,7 @@ impl<S: Tell> Watch<S> {
         c_string(&cookies, &mut c_path)?;
         // SAFETY: a NUL-terminated path; the string is released in `Drop`.
         let cookie_string = unsafe {
-            CFStringCreateWithFileSystemRepresentation(std::ptr::null(), c_path.as_ptr().cast())
+            (fw.string_create_with_file_system_representation)(std::ptr::null(), c_path.as_ptr().cast())
         };
         if cookie_string.is_null() {
             _ = std::fs::remove_dir_all(&cookies);
@@ -511,7 +622,7 @@ impl<S: Tell> Watch<S> {
         let queue = unsafe { dispatch_queue_create(c"blaze-fsevents".as_ptr(), std::ptr::null()) };
         if queue.is_null() {
             // SAFETY: made above, released once, not used after.
-            unsafe { CFRelease(cookie_string) };
+            unsafe { (fw.release)(cookie_string) };
             _ = std::fs::remove_dir_all(&cookies);
             return Err(io::Error::other("libdispatch made no queue"));
         }
@@ -543,6 +654,7 @@ impl<S: Tell> Watch<S> {
             payload: AtomicU64::new(0),
         };
         Ok(Watch {
+            fw,
             shared: Owned::new(shared),
             queue,
             cookie_string,
@@ -581,13 +693,13 @@ impl<S: Tell> Watch<S> {
         first: impl FnOnce(Journaled),
     ) -> io::Result<()> {
         self.locate(root, &dir)?;
-        let volume = store_of(&self.shared.get().real_dir).map_err(|error| {
+        let volume = store_of(self.fw, &self.shared.get().real_dir).map_err(|error| {
             let at = root.join(dir.as_str()); // alloc: an error path.
             // alloc: an error path.
             io::Error::new(error.kind(), format!("the journal of {}: {error}", at.display()))
         })?;
         // SAFETY: no arguments; reads the system's last event ID.
-        let now = unsafe { FSEventsGetCurrentEventId() };
+        let now = unsafe { (self.fw.get_current_event_id)() };
         let resumed = match since {
             Cursor::FsEvents { event, volume: of } if of == volume && event <= now => Some(event),
             _ => None,
@@ -658,8 +770,9 @@ impl<S: Tell> Watch<S> {
         }
         c_string(&self.shared.get().real_dir, &mut self.c_path)?;
         // SAFETY: a NUL-terminated path; the string is released below.
+        let fw = self.fw;
         let dir_string = unsafe {
-            CFStringCreateWithFileSystemRepresentation(
+            (fw.string_create_with_file_system_representation)(
                 std::ptr::null(),
                 self.c_path.as_ptr().cast(),
             )
@@ -670,10 +783,10 @@ impl<S: Tell> Watch<S> {
         let strings = [dir_string, self.cookie_string];
         // SAFETY: two CFStrings, retained by the array with the callbacks of CF types.
         let paths = unsafe {
-            CFArrayCreate(std::ptr::null(), strings.as_ptr(), 2, &raw const kCFTypeArrayCallBacks)
+            (fw.array_create)(std::ptr::null(), strings.as_ptr(), 2, fw.type_array_callbacks)
         };
         // SAFETY: made above, released once; the array holds its own reference.
-        unsafe { CFRelease(dir_string) };
+        unsafe { (fw.release)(dir_string) };
         if paths.is_null() {
             return Err(failed(self.shared.get(), "CoreFoundation made no array of the path"));
         }
@@ -689,7 +802,7 @@ impl<S: Tell> Watch<S> {
         // address of its own, freed only after `Drop` or `stop` has run the stream's last
         // callback, however the watch moves.
         let stream = unsafe {
-            FSEventStreamCreate(
+            (fw.stream_create)(
                 std::ptr::null(),
                 heard::<S>,
                 &context,
@@ -700,20 +813,20 @@ impl<S: Tell> Watch<S> {
             )
         };
         // SAFETY: the stream holds its own reference to the paths.
-        unsafe { CFRelease(paths) };
+        unsafe { (fw.release)(paths) };
         if stream.is_null() {
             self.shared.get().stopped.store(true, Ordering::Release);
             return Err(failed(self.shared.get(), "FSEventStreamCreate made no stream"));
         }
         // SAFETY: a stream not yet started and the watch's queue, which outlives it.
-        unsafe { FSEventStreamSetDispatchQueue(stream, self.queue) };
+        unsafe { (fw.stream_set_dispatch_queue)(stream, self.queue) };
         before();
         // SAFETY: the stream is scheduled on the queue.
-        if unsafe { FSEventStreamStart(stream) } == 0 {
+        if unsafe { (fw.stream_start)(stream) } == 0 {
             // SAFETY: the stream did not start, so no callback runs during or after this.
-            unsafe { FSEventStreamInvalidate(stream) };
+            unsafe { (fw.stream_invalidate)(stream) };
             // SAFETY: the stream made above, released once and not used after.
-            unsafe { FSEventStreamRelease(stream) };
+            unsafe { (fw.stream_release)(stream) };
             self.shared.get().stopped.store(true, Ordering::Release);
             return Err(failed(self.shared.get(), "FSEventStreamStart refused it"));
         }
@@ -729,14 +842,14 @@ impl<S: Tell> Watch<S> {
             return;
         }
         self.shared.get().stopped.store(true, Ordering::Release);
-        let mut stream = self.stream;
+        let mut ending = Ending { fw: self.fw, stream: self.stream };
         // SAFETY: the stream is stopped and invalidated on its own queue, so no callback runs
-        // during it; `stream` outlives the call, which returns once the work has run.
-        unsafe { dispatch_sync_f(self.queue, (&raw mut stream).cast(), end_on_queue) };
+        // during it; `ending` outlives the call, which returns once the work has run.
+        unsafe { dispatch_sync_f(self.queue, (&raw mut ending).cast(), end_on_queue) };
         // SAFETY: a serial queue: this runs after any callback queued before the invalidation.
         unsafe { dispatch_sync_f(self.queue, std::ptr::null_mut(), nothing) };
         // SAFETY: invalidated, with no callback left to run; released once, not used after.
-        unsafe { FSEventStreamRelease(self.stream) };
+        unsafe { (self.fw.stream_release)(self.stream) };
         self.stream = std::ptr::null_mut();
         let mut writing = lock(&self.shared.get().writing);
         for tag in lock(&self.shared.get().flushes).drain(..) {
@@ -783,30 +896,36 @@ impl<S> Drop for Watch<S> {
     fn drop(&mut self) {
         if !self.stream.is_null() {
             self.shared.get().stopped.store(true, Ordering::Release);
-            let mut stream = self.stream;
+            let mut ending = Ending { fw: self.fw, stream: self.stream };
             // SAFETY: as in `stop`.
-            unsafe { dispatch_sync_f(self.queue, (&raw mut stream).cast(), end_on_queue) };
+            unsafe { dispatch_sync_f(self.queue, (&raw mut ending).cast(), end_on_queue) };
             // SAFETY: as in `stop`.
             unsafe { dispatch_sync_f(self.queue, std::ptr::null_mut(), nothing) };
             // SAFETY: as in `stop`.
-            unsafe { FSEventStreamRelease(self.stream) };
+            unsafe { (self.fw.stream_release)(self.stream) };
         }
         // SAFETY: no stream uses the queue any more; released once, not used after.
         unsafe { dispatch_release(self.queue) };
         // SAFETY: made in `new`, released once, not used after; every array that held it is
         // released with its stream.
-        unsafe { CFRelease(self.cookie_string) };
+        unsafe { (self.fw.release)(self.cookie_string) };
         _ = std::fs::remove_dir_all(&self.shared.get().cookies);
     }
 }
 
-extern "C" fn end_on_queue(stream: *mut c_void) {
-    // SAFETY: `stop` passes a pointer to its copy of the stream, alive for this call.
-    let stream = unsafe { *stream.cast::<FSEventStreamRef>() };
+/// What [`end_on_queue`] is handed: the stream to end, and the frameworks to end it with.
+struct Ending {
+    fw: &'static Frameworks,
+    stream: FSEventStreamRef,
+}
+
+extern "C" fn end_on_queue(ending: *mut c_void) {
+    // SAFETY: `stop` and `Drop` pass a pointer to their `Ending`, alive for this call.
+    let Ending { fw, stream } = unsafe { &*ending.cast::<Ending>() };
     // SAFETY: a stream started and not yet released, stopped on its own queue.
-    unsafe { FSEventStreamStop(stream) };
+    unsafe { (fw.stream_stop)(*stream) };
     // SAFETY: as above; no callback is scheduled once this returns.
-    unsafe { FSEventStreamInvalidate(stream) };
+    unsafe { (fw.stream_invalidate)(*stream) };
 }
 
 extern "C" fn nothing(_: *mut c_void) {}
@@ -1086,6 +1205,25 @@ mod tests {
     fn watch() -> (Watch<Sink>, Heard) {
         let (send, heard) = crate::chan::bounded(1024);
         (Watch::new(send).unwrap(), heard)
+    }
+
+    /// Every symbol the driver finds at first use is in this OS's frameworks (rule 45): a
+    /// framework or symbol gone from a later macOS fails here, naming it, not in a user's watch.
+    #[test]
+    fn every_symbol_is_found_on_this_os() {
+        if let Err(error) = Frameworks::get() {
+            panic!("{error}");
+        }
+    }
+
+    /// A missing framework or symbol is an error naming both, not a crash at the call.
+    #[test]
+    fn a_missing_symbol_is_named() {
+        let fw = open(CORE_FOUNDATION).unwrap_or_else(|missing| panic!("{}", missing.to_error()));
+        // SAFETY: never called: the symbol is not there.
+        let found = unsafe { symbol::<unsafe extern "C" fn()>(fw, CORE_FOUNDATION, c"CFNoSuchFunction") };
+        let error = found.map(|_| ()).unwrap_err().to_error().to_string();
+        assert!(error.contains("CFNoSuchFunction") && error.contains("CoreFoundation"), "{error}");
     }
 
     fn journaled(completion: Completion, tag: Tag) -> Journaled {

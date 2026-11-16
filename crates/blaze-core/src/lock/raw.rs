@@ -58,10 +58,12 @@ mod tests;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Plant {
     None,
-    /// A woken [`Mutex`] waiter takes the word as 1, not 2: the waiters still asleep behind it
-    /// are forgotten, so its release wakes none of them (the classic lost wakeup of mutex 2).
+    /// A [`Mutex`] release that finds the word contended (2) wakes no one: the waiter asleep
+    /// on it sleeps on. (A woken waiter taking the word as 1, Drepper's other lost wakeup, is
+    /// no model control: the next waiter's wait for a 2 then returns at once, so it spins
+    /// rather than sleeps, and the model reports the spin before any lost waiter.)
     #[cfg(test)]
-    TakeAsUncontended,
+    ReleaseUnwoken,
     /// A [`RwLock`]'s write release wakes no one when only readers wait: they sleep on.
     #[cfg(test)]
     ReadersUnwoken,
@@ -234,13 +236,13 @@ impl RawMutex {
     #[inline]
     pub(crate) fn lock(&self) {
         if !self.try_lock() {
-            self.lock_contended(None, Plant::None);
+            self.lock_contended(None);
         }
     }
 
     /// The lock within `within`: whether it was taken.
     pub(crate) fn lock_within(&self, within: Duration) -> bool {
-        self.try_lock() || self.lock_contended(Some(within), Plant::None)
+        self.try_lock() || self.lock_contended(Some(within))
     }
 
     pub(crate) fn is_locked(&self) -> bool {
@@ -251,7 +253,7 @@ impl RawMutex {
     /// contended and sleep until it is free. Whether it was taken before `within` passed.
     #[cold]
     #[inline(never)]
-    pub(crate) fn lock_contended(&self, within: Option<Duration>, plant: Plant) -> bool {
+    pub(crate) fn lock_contended(&self, within: Option<Duration>) -> bool {
         let started = within.map(|_| Clock::start());
         let mut state = spin_while(&self.word.value, |it| it == HELD);
         if state == FREE {
@@ -267,15 +269,8 @@ impl RawMutex {
         }
         // Taken from here on as contended: some other thread may still sleep on the word, and
         // only a 2 makes this thread's release wake it.
-        #[cfg(test)]
-        let mut take = CONTENDED;
-        #[cfg(not(test))]
-        let take = {
-            _ = plant;
-            CONTENDED
-        };
         loop {
-            if state != CONTENDED && self.word.value.swap(take, Ordering::Acquire) == FREE {
+            if state != CONTENDED && self.word.value.swap(CONTENDED, Ordering::Acquire) == FREE {
                 return true;
             }
             let spent = started.as_ref().map_or(Duration::ZERO, Clock::spent);
@@ -285,13 +280,6 @@ impl RawMutex {
             }
             // wakes: `unlock`, which wakes one sleeper whenever the word said 2
             self.word.wait(CONTENDED, rest);
-            // The plant: woken, this waiter forgets the others asleep behind it. (Taken as 1
-            // before any sleep, a waiter could not sleep at all: its wait for a 2 would return
-            // at once, a spin and not the lost wakeup the plant is for.)
-            #[cfg(test)]
-            if plant == Plant::TakeAsUncontended {
-                take = HELD;
-            }
             state = spin_while(&self.word.value, |it| it == HELD);
         }
     }
@@ -304,7 +292,25 @@ impl RawMutex {
     /// yet let go).
     #[inline]
     pub(crate) unsafe fn unlock(&self) {
-        if self.word.value.swap(FREE, Ordering::Release) == CONTENDED {
+        // SAFETY: the caller's.
+        unsafe { self.unlock_with(Plant::None) };
+    }
+
+    /// [`RawMutex::unlock`], with a safeguard removed for a model test.
+    ///
+    /// # Safety
+    ///
+    /// As [`RawMutex::unlock`].
+    #[inline]
+    pub(crate) unsafe fn unlock_with(&self, plant: Plant) {
+        #[cfg(test)]
+        let wakes = plant != Plant::ReleaseUnwoken;
+        #[cfg(not(test))]
+        let wakes = {
+            _ = plant;
+            true
+        };
+        if self.word.value.swap(FREE, Ordering::Release) == CONTENDED && wakes {
             self.word.wake(false);
         }
     }

@@ -462,12 +462,15 @@ impl<'p> Scope<'p> {
         Scope { live, parent: PhantomData, unfinished: Unfinished::new("task::Scope", "join(cx)") }
     }
 
-    /// A task's handle.
+    /// A task's handle. `#[track_caller]` down from the spawn, so an unfinished task names the
+    /// line that spawned it (`crate::unfinished`).
+    #[track_caller]
     fn handle<T>(name: &'static str, held: Held<T>) -> Task<'_, T> {
         Task { name, held, scope: PhantomData, thread: PhantomData, unfinished: Unfinished::new("task::Task", "join(cx)") }
     }
 
     /// The next spawn's index and frame: `Err` with the task's handle when no frame can be had.
+    #[track_caller]
     fn prepare<T>(&self, name: &'static str, scratch: usize) -> Result<(u32, Frame), Task<'_, T>> {
         let live = &self.live;
         live.last.set(name);
@@ -608,6 +611,7 @@ impl<'p> Scope<'p> {
     /// same way when no worker is idle at that moment, or when the scope already has
     /// `workers - 1` tasks out (its budget, the spawner being one): a spawn never waits for a
     /// worker.
+    #[track_caller]
     pub fn must_overlap<T: Send, E: fmt::Display>(
         &self,
         name: &'static str,

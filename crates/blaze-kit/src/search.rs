@@ -221,6 +221,37 @@ impl<K: SearchKey, A: Allocator> StaticSearch<K, A> {
         (k * B + self.nodes[self.leaves + k].below(x)).min(self.len)
     }
 
+    /// The lower bounds of `N` probes at once, each as [`lower_bound`] gives it. The `N`
+    /// descents go level by level together, so each level issues `N` independent loads, and each
+    /// probe's next node is prefetched as soon as its index is known. For a caller with many
+    /// probes in hand (8 is the measured choice; see the module's "Batched").
+    ///
+    /// [`lower_bound`]: StaticSearch::lower_bound
+    #[inline]
+    pub fn lower_bounds<const N: usize>(&self, xs: &[K; N]) -> [usize; N] {
+        let mut k = [0usize; N];
+        if self.len == 0 {
+            return k;
+        }
+        let left = plant::on(Plant::SearchChildLeft);
+        let base = self.nodes.as_ptr();
+        for top in 0..self.depth {
+            let next = if top + 1 < self.depth { self.starts[top + 1] } else { self.leaves };
+            let start = self.starts[top];
+            for s in 0..N {
+                let i = self.nodes[start + k[s]].below(xs[s]);
+                k[s] = k[s] * FAN + if left && i > 0 { i - 1 } else { i };
+                // A hint, never a read: the node at `next + k[s]` is in `nodes` (the child of a
+                // node of this layer), and a prefetch of any address does not fault.
+                core::intrinsics::prefetch_read_data::<Node<K>, 3>(base.wrapping_add(next + k[s]));
+            }
+        }
+        for s in 0..N {
+            k[s] = (k[s] * B + self.nodes[self.leaves + k[s]].below(xs[s])).min(self.len);
+        }
+        k
+    }
+
     /// Whether `x` is in.
     #[inline]
     pub fn contains(&self, x: K) -> bool {

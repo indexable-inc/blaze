@@ -236,6 +236,39 @@ allocator), and the reads it makes. The floor for a repeat check with nothing ch
 the record's read list stands and the driver does not run. The ratio is measured on std's
 bodies once blaze-ty lands.
 
+## Owed to blaze-lower
+
+blaze-lower (crates/blaze-lower) lowers bodies with rustc's desugarings and converts them to this
+crate's `BodyView` in `blaze_lower::typeck::to_typeck`. It refuses each form below by name
+(`Refused::Form`), because `BodyView` has no place for it. In order of how much code needs it:
+
+1. **Lang-item paths.** Every `for` (`IntoIterator::into_iter`, `Iterator::next`, `Some`,
+   `None`), every `?` (`Try::branch`, `FromResidual::from_residual`, `ControlFlow::Continue`,
+   `ControlFlow::Break`), every range (`Range`, `RangeFrom`, `RangeTo`, `RangeFull`,
+   `RangeToInclusive`, `RangeInclusive::new`) and every `.await` (`IntoFuture::into_future`,
+   `Pin::new_unchecked`, `Future::poll`, `Poll::Ready`, `Poll::Pending`, `get_context`). A path whose head is a
+   `LangItem` rather than segments: needed by most bodies in std.
+2. **`let` in a condition** (`if let`, `while let`, let chains): rustc keeps them as `Let`
+   expressions, not desugared to `match`.
+3. **Breaks with a target that is a desugaring's**: `?` in a `try` block, the `break` a `for`
+   or `while` makes; and loops by source (`for`, `while`), carried for diagnostics.
+4. **Coroutines**: `async` blocks, closures and fns (a `Closure` of kind `Async` with a resume
+   pattern), `gen` blocks, `yield`.
+5. **Format arguments**: one `FormatArgs` node with a parsed template (pieces, specs,
+   positional and captured arguments).
+6. **Patterns**: box, range (`a..=b`, `a..`), rest outside a tuple, a slice's `..`, macro calls.
+7. **Literals**: `b'x'`, `c"..."`.
+8. **The rest**: `become`, raw borrows (`&raw const`), `const` and `try` blocks, struct
+   defaults (`..` with no base), path anchors (`<T as Tr>::x`), absolute paths, lifetime,
+   const and associated-item generic arguments, inline asm, `offset_of!`, `_` expressions.
+
+Dropped in the conversion, as no type depends on them: match and loop sources, `unsafe` on a
+block, the shadowing links, and the hygiene of names made by desugarings.
+
+blaze-lower's record keys hash the item's raw bytes (its text, item-relative), never a token
+stream, the same bytes the outline's entry digests now hash. `ItemKey` is only where a record is
+filed: two items of equal text share one record.
+
 ## Not decided here
 
 - Whether a run stopped at `Need` should save its state instead of re-entering: decided by a

@@ -34,16 +34,40 @@
 //! Each entry carries what the keys of later records are made from:
 //!
 //! - [`Item::disambiguator`]: the number of earlier siblings with the same kind and the same
-//!   name (for an entry with no name: the same signature tokens outside its attributes, so
-//!   whitespace runs count as one; for a tuple field: its position). Two builders of one text
-//!   agree on it, and an edit outside the item's earlier equals does not move it. It is the
-//!   index among equals the inherited layer's AST ids carry (`span::ast_id`).
-//! - [`Item::hash`]: the [`ContentId`] of the item's tokens in [`ITEM_DOMAIN`], and
-//!   [`Item::signature_hash`] of its tokens outside its body in [`SIGNATURE_DOMAIN`]. Both hash
-//!   each token's text and whether it touches the token before it in the item, and no
-//!   position, whitespace or non-doc comment; doc comments are tokens and are hashed. An
-//!   entry's hash covers the entries written inside it (a module's covers its items), and its
-//!   signature hash covers none of its body.
+//!   name (for an entry with no name: the same bytes of its signature from its first token
+//!   outside its attributes; for a tuple field: its position). Two builders of one text agree
+//!   on it, and an edit outside the item's earlier equals does not move it. It is the index
+//!   among equals the inherited layer's AST ids carry (`span::ast_id`).
+//! - [`Item::hash`]: the [`ContentId`] in [`ITEM_DOMAIN`] of the edition and the item's bytes,
+//!   from its first token (an outer attribute's or doc comment's) to its last, and
+//!   [`Item::signature_hash`] of the edition and the prefix of those bytes before its body:
+//!   one hasher is fed the signature's bytes, read at the cut, then fed the rest, so no byte is
+//!   hashed twice. An entry's hash covers the entries written inside it (a module's covers its
+//!   items), and its signature hash covers none of its body.
+//!
+//! ## Why bytes, not tokens (decided 2026-11-15 by the coordinator of the rebuild)
+//!
+//! The digests are of bytes, not of the token stream. The cost accepted: an edit to only the
+//! whitespace or a comment inside an item changes that item's digests, and the records keyed
+//! by them are made again, for that one item. What it buys: a `fn` body that can hold no item
+//! and no macro call is never lexed or parsed by the outline. Its end is found by
+//! `blaze_lex::skip_body` (bracket depth over a structural mask, about 3.4 GB/s on one core)
+//! and its bytes go to BLAKE3 as one slice (crate::skeleton). Positions stay byte offsets
+//! relative to the item, which the diagnostics read anyway. The floor of an outline is then
+//! one skip of the file plus one BLAKE3 pass over each byte times the number of entries
+//! enclosing it.
+//!
+//! # A file is outlined item by item
+//!
+//! 1. [`split_top_level`] cuts a file at its top-level item boundaries by a structural scan, no
+//!    parse: after a `;` outside brackets, and after a `}` closing a top-level brace group
+//!    (found by `blaze_lex::skip_body`, unlexed) when an item's first token follows.
+//! 2. [`outline_item`] outlines one part from its bytes and the edition alone, so its result
+//!    is a record keyed by the part's digest, made on any thread or found made before.
+//! 3. [`assemble`] concatenates the parts' outlines: it moves file positions and indices by
+//!    each part's base, and recounts the top-level disambiguators across parts.
+//! 4. [`outline`] is the three in a row on one thread, tested equal to a whole-file walk on
+//!    every file of library/; an edit to one item costs the scan, one part and the assembly.
 //!
 //! # What the outline is the input of
 //!
@@ -68,6 +92,8 @@
 #![feature(allocator_api)]
 
 mod header;
+mod skeleton;
+mod split;
 mod walk;
 
 use core::fmt;
@@ -82,11 +108,9 @@ pub use header::{HeaderError, ImplHeader, impl_header};
 pub use walk::Bodies;
 pub use parser::SyntaxKind;
 
-/// The domain of [`Item::hash`]: an item's tokens, whole.
-pub const ITEM_DOMAIN: &str = "blaze v2 file item 1";
-
-/// The domain of [`Item::signature_hash`]: an item's tokens outside its body.
-pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
+/// The domain of [`Item::hash`] and [`Item::signature_hash`]: the edition and an item's bytes,
+/// whole or before its body.
+pub const ITEM_DOMAIN: &str = "blaze v2 file item bytes 1";
 
 /// The outline of `text`, a source file of `edition`, in `alloc`: every item it declares at any
 /// module-level nesting, in source order, and the syntax errors of the parse. It always
@@ -101,18 +125,32 @@ pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
 /// When `text` is longer than `u32::MAX` bytes: every range is a `u32` pair, as the lexer's
 /// offsets are.
 ///
-/// A `fn` body is not parsed ([`Bodies::Skipped`]): its tokens are hashed, and it is parsed
-/// only when they may hold an item or a macro call. The syntax errors are those outside such
-/// bodies, and every lexer error.
+/// A `fn` body is read only as far as it may hold an item or a macro call ([`Bodies::Skipped`]):
+/// the syntax errors are those outside the bodies it leaves unread.
 pub fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
-    outline_with(text, edition, Bodies::Skipped, alloc)
+    let parts = split_top_level(text, alloc);
+    let mut outlines: AVec<'a, (u32, Outline<'a>)> = AVec::with_capacity_in(parts.len(), alloc);
+    for part in &parts {
+        outlines.push((part.start, outline_item(&text[part.to_usize()], edition, alloc)));
+    }
+    assemble(outlines.iter().map(|(base, outline)| (*base, outline)), alloc)
 }
 
-/// As [`outline`], with `fn` bodies read as `bodies` says: [`Bodies::Parsed`] is the reference
-/// [`outline`] is tested equal to.
+/// The outline of one part of a file ([`split_top_level`]), from its bytes and the edition
+/// alone: positions are relative to the part's start, and the top-level disambiguators count
+/// only the part's entries until [`assemble`] recounts them.
+pub fn outline_item<'a>(part: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
+    walk::outline(part, parser_edition(edition), Bodies::Skipped, alloc)
+}
+
+/// The whole file walked at once, with `fn` bodies read as `bodies` says: the reference
+/// [`outline`] is tested equal to ([`Bodies::Skipped`]), and the reference that is to
+/// ([`Bodies::Parsed`]).
 pub fn outline_with<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
     walk::outline(text, parser_edition(edition), bodies, alloc)
 }
+
+pub use split::{assemble, split_top_level};
 
 /// The schema's edition as the parser's.
 fn parser_edition(edition: Edition) -> parser::Edition {
@@ -140,6 +178,9 @@ pub struct Outline<'a> {
     errors: AVec<'a, SyntaxError>,
     /// The errors' messages, one after another, each copied from a `&str`.
     messages: AVec<'a, u8>,
+    /// Each top-level entry's sibling key (its parent, kind and name or head), in order: what
+    /// its disambiguator counts.
+    keys: AVec<'a, ContentId>,
 }
 
 impl Outline<'_> {
@@ -238,6 +279,7 @@ impl PartialEq for Outline<'_> {
             && self.file_attrs == other.file_attrs
             && self.errors[..] == other.errors[..]
             && self.messages[..] == other.messages[..]
+            && self.keys[..] == other.keys[..]
     }
 }
 

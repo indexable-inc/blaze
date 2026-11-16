@@ -231,7 +231,7 @@ land the cli runs batches inline on one thread.
 
 ## One check covers every configuration
 
-`check` answers for every target, feature set and switch at once (bottom.md 11). `condition.rs`:
+Superseded by conditions.md when it lands (tokio's 21 root switches are 2^21 forks). Built:
 
 - A `Condition` is a sorted list of (variable, value), at most 16, inline and `Copy`: a target is
   one variable (it fixes every `target_*`), each package's feature a boolean, `test`,
@@ -250,7 +250,7 @@ the job's record a split: its parts are the forks, its read list the space's dig
 space, other forks). Workers name reads by base; the machine walks splits down to the fork the
 task's condition implies (`resolve`), and a need that splits on a variable the asker does not fix
 forks the asker. Rows keep `split` and `cond`. The cap is the span of the node's variables, so the
-same node is refused in any settle order. Not yet: batches grouped by condition. The oracle runs
+same node is refused in any settle order. Batches are not grouped by condition. The oracle runs
 on the model and through `Request`: the findings a full configuration implies are its own, each
 once; the plant `RanUnderCondition` (an asker served a fork it does not imply) is caught.
 
@@ -260,7 +260,7 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
   plugs in: it answers every file's (path, content id, changed) and the gone ones. Today's
   implementation is bstd's `Dir::list` and a read and hash of every file: bstd's `Meta` has no
   stamp, so Relax's stat rule cannot run yet (gap). The leaf table is written after `WriteLast`, so a
-  crash between them reports more files changed, never fewer.
+  crash between them reports more files changed, never fewer. Its lanes: `Config::workers`.
 - **Store.** Behind one trait (`store::Store`: `get_into`, `put`, `after_answer`). The open it
   is to call is blaze-cas's `plain::Driven::open(root, settings)`, then
   `Driven::machine(&[checkout, home])` before any put to a shared namespace (a value naming the
@@ -271,8 +271,6 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
   driver of the plain store (gap, blaze-cas's lane). Until then the trait's one implementation is
   one file per record under `.blaze/v2/records/`, written whole through bstd. This is a stand-in:
   it is not the floor above and is not measured against it.
-- **Sweep lanes.** blaze-solo's sweep takes `Config::lanes`, the number of file threads. It is sized
-  from the machine's worker count, the same number as `Config::workers`.
 - **Units.** A small reader of `[package] edition` and the default targets (`src/lib.rs`,
   `src/main.rs`, `src/bin/*.rs`). It refuses by line any table other than package, profile and
   lints, and any dependency or build script (blaze-manifest is std and third-party). Gap: target
@@ -288,8 +286,11 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
   batches); the pool waits on bstd (above).
 - **Printing.** `file:line:col` from the file's line table at print time (`lines.rs`).
 - **Profile.** Per kind: standing, found, made, fetched, entries, time; gets, hits, puts, pages;
-  the store's segments sealed and checked whole at open.
-  Written to `.blaze/v2/profile.txt` and summarised on stderr.
+  segments; then `phases` (each phase of the command in order, ns, on the clock `main` is
+  handed) and `request` (steps and each effect kind summed). Written in place after the answer
+  is printed, never synced. **Repeat-check floor:** one open, one read, a stat per file, a print:
+  0.3 ms in main. Debug, 2026-11-15: 0.96 ms (ratio 3.2): the frame's first chunk 0.31, the
+  sweep (reads and hashes every file) 0.29. A directory sync on every publish cost 5 ms each.
 - `export` and `build` say they are not built.
 
 ## Not decided here

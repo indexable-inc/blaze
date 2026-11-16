@@ -321,6 +321,9 @@ fn a_ty_fragment_followed_by_as_matches() {
     // As the inner call of a macro whose own `$Src:ty` it passes on.
     let outer = rules("([$($Src:ty),*]) => { $(m!($Src as [u8, i8]);)* }", 1);
     let exp = call_fn(&outer, "[u8, usize]", &cx);
+    // `u8` was joint with the `,` after it in the call; it is not joint with the `as` after it
+    // here (a printer would write `u8as`, which `impl_int_cast!` matches no rule of).
+    assert_no_glued_words(&exp.tokens);
     let calls = find_calls(&exp.tokens, Alloc::global()).expect("the expansion's calls are found");
     assert_eq!(calls.len(), 2);
     for call in calls.iter() {
@@ -328,6 +331,16 @@ fn a_ty_fragment_followed_by_as_matches() {
         input.seal(ContentId([7; 32]));
         let inner = call_fn_tokens(&def, &input, &cx);
         assert!(inner.diagnostics.is_empty(), "{:?}: {:?}", show(&input), inner.diagnostics);
+    }
+}
+
+/// No identifier or literal is joint with an identifier or literal after it: written glued,
+/// two words would read as one (`Debugfor`, `u8as`).
+fn assert_no_glued_words(stream: &TokenStream<'_>) {
+    let tokens = shape(stream);
+    for pair in tokens.windows(2) {
+        let word = |t: &(char, String, bool)| t.0 == 'i' || t.0 == 'l';
+        assert!(!(word(&pair[0]) && pair[0].2 && word(&pair[1])), "{pair:?} in {tokens:?}");
     }
 }
 
@@ -343,6 +356,7 @@ fn lifetimes_and_double_angles_are_transcribed_as_written() {
     let cx = TestCx::new();
     let def = rules("($($tr:ident),*) => { $(impl<T: $tr> $tr for &T { fn fmt(&self, f: &mut F<'_>) {} })* }", 1);
     let exp = call_fn(&def, "Debug, Display", &cx);
+    assert_no_glued_words(&exp.tokens);
     let tokens = shape(&exp.tokens);
     let quotes: Vec<usize> = tokens.iter().enumerate().filter(|(_, t)| t.1 == "'").map(|(at, _)| at).collect();
     assert_eq!(quotes.len(), 2, "{tokens:?}");
@@ -353,6 +367,7 @@ fn lifetimes_and_double_angles_are_transcribed_as_written() {
     }
     let def = rules("{ $($number:ty),* } => { $(type M = Mask<<$number as E>::Mask, N>;)* }", 1);
     let exp = call_fn(&def, "f16, u8", &cx);
+    assert_no_glued_words(&exp.tokens);
     let tokens = shape(&exp.tokens);
     let angles = tokens.windows(2).filter(|w| w[0].1 == "<" && w[1].1 == "<").count();
     assert_eq!(angles, 2, "{tokens:?}");

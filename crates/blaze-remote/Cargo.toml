@@ -27,7 +27,8 @@ blaze-format.workspace = true
 # Ed25519 (statements, roots, key lists), SHA-256 and HMAC (SigV4).
 ring.workspace = true
 # The HTTP driver: blaze-http's sans-IO client on its driver on blaze-core's effects.
-blaze-http.workspace = true
+# `native-roots`: `roots::native`, the machine's roots its client checks the cache against.
+blaze-http = { workspace = true, features = ["native-roots"] }
 http.workspace = true
 # Settings and the commands' typed input.
 blaze-data.workspace = true

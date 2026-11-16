@@ -176,6 +176,24 @@ What is about building Rust (the cargo graph, the store, codegen) stays out.
 `stdx` (leftover helpers) is dissolved into the modules above or deleted. Each merge follows rule
 `one-concept-one-home`: one type per concept, and the removed name banned.
 
+### What a program pays for at start
+
+A bstd program pays at start only for what it calls. Every library a binary links, dyld loads and
+initialises before `main` on every run: CoreFoundation and CoreServices alone cost a tiny Rust
+program about 1.0 ms and 11 M instructions (measured 2026-11-16). So:
+
+- **Heavy areas are features.** The default is the core a command-line tool needs; `image` and
+  `video` (VideoToolbox, CoreMedia, CoreVideo, libobjc, Foundation) are bstd features, and a crate
+  that uses one names it in its manifest. A feature is for what a program never calls.
+- **A system library wanted on some paths is loaded at first use**, never linked: one `dlopen` of
+  the framework's binary, each symbol `dlsym`ed once into a typed table of function pointers
+  behind a `OnceLock`, the table's `&'static` held by the value that needs it (so no call is made
+  before the load), and an error naming the framework and symbol when either is absent, with no
+  fallback. A test finds every symbol on the OS it runs on. blaze-core's FSEvents driver is the
+  first (`fsevents.rs`, `Frameworks`): a check that never watches loads neither framework.
+- **The binary is linked with `-dead_strip_dylibs`** on macOS (blaze-cli's `build.rs`), and
+  `tests/links.rs` fails when `blaze` links anything but libSystem.
+
 ### `bstd::data`: serialization by reflection
 
 `Encode` and `Decode` are implemented for a type from its fields ([comptime](comptime.md)), in
@@ -951,6 +969,12 @@ provider:
 Writing a file is the caller's: packets go to a `File` it holds. So rendering a video is
 `Gpu` renders a frame into a buffer, `Encoder` turns frames into packets, `Muxer` into bytes,
 `File` takes the bytes, and each step can be tested without the others.
+
+Both are behind bstd features, `video` and `image` (above, "What a program pays for at start").
+**Known failing (2026-11-16):** `video::videotoolbox::tests::the_media_engine_encodes_frames_into_packets_an_mp4_takes`
+fails on macOS with `the muxer takes the packet: Order { sample: 3, why: "it is presented before
+it is decoded" }`: the hardware session hands a packet whose presentation time is before its
+decode time, and the muxer refuses it. Run it with `LANECHECK_FEATURES="image,video"`.
 
 **Images are functions.** `bstd::image::{decode, encode}` take bytes and an allocator and return
 pixels, or the reverse, with a size limit on decode since input is untrusted. PNG first; no

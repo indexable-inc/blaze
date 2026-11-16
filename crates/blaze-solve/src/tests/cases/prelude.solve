@@ -2,7 +2,8 @@
 # `extern` (of another crate than the one under test), as the pinned library declares them.
 extern lang(pointee_sized) trait PointeeSized
 extern lang(meta_sized) coinductive trait MetaSized: PointeeSized
-extern lang(sized) coinductive trait Sized: MetaSized
+# `Sized` is `#[fundamental]` in core (so `[T]: !Default`-style questions are knowable).
+extern lang(sized) coinductive fundamental trait Sized: MetaSized
 extern lang(clone) trait Clone: Sized
 extern lang(copy) trait Copy: Clone
 extern lang(send) auto unsafe trait Send

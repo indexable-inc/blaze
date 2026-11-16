@@ -2,12 +2,12 @@
 //!
 //! Run (release): `cargo run --release -p blaze-ty --example cost`.
 //!
-//! The floor: a type row is `kind` (1 byte), `a` and `b` (4 each), `flags` (2) and the
-//! solver's `markers` (4): 15 bytes; its index slot is a tag byte and a 4-byte id at a load of
-//! at most 7/8, about 5.7 bytes, so about 21 bytes a type before growth's slack (columns grow
-//! by doubling: up to twice that just after a grow). An intern hit is a hash, one 16-byte
-//! group compare and one row compare: a few nanoseconds. Relating or folding is linear in the
-//! nodes visited, a few nanoseconds a node.
+//! The floor: a type row is 12 bytes (`a`, `b`, `kind`, `flags`) and the solver's `markers`
+//! 4; its index slot is 5.3 bytes (128-byte groups of 24) at a load of at most 7/8, about 6, so
+//! about 21 bytes a type before growth's slack (columns grow by doubling). An intern hit is a
+//! hash, one group's cache line and one row's: in a loop where each lookup waits on the last,
+//! about six dependent L1 loads (about 30 cycles) hot, and two cache misses cold. A fold over
+//! a subtree its flags say is untouched costs one load of the flags.
 
 #![feature(allocator_api)]
 #![expect(clippy::print_stdout, reason = "a measurement tool prints its table")]
@@ -34,69 +34,11 @@ fn chain(tys: &mut Tys<'_>, bottom: Ty, depth: usize) -> Ty {
     t
 }
 
-/// The intern hit's pieces, timed apart, on the million-row table `tys` (a chain of slices
-/// over `bool`).
-fn pieces(tys: &mut Tys<'_>, n: usize) {
-    use blaze_ty::pieces::{find_slice, probe_only, row_hash};
+/// An intern hit with the working set in cache: a thousand types looked up a thousand times.
+/// (The hit's pieces were timed apart once, through a module that existed only for this; the
+/// findings are in `src/tys.rs` and `src/index.rs`, and the module is gone.)
+fn hot_hit() {
     use std::hint::black_box;
-    // The chain's types, in order, then in a scrambled order (an odd multiplier mod 2^20 is a
-    // permutation of the first 2^20 numbers; those past `n` are skipped).
-    let mut chain = Vec::with_capacity(n);
-    let mut t = Ty::BOOL;
-    for _ in 0..n {
-        chain.push(t);
-        t = tys.slice(t);
-    }
-    let mut scrambled = Vec::with_capacity(n);
-    for i in 0..(1usize << 20) {
-        let j = (i.wrapping_mul(0x9e37_79b1) ^ 0x5555) & ((1 << 20) - 1);
-        if j < n {
-            scrambled.push(chain[j]);
-        }
-    }
-
-    let start = Instant::now();
-    let mut acc = 0u64;
-    for (i, e) in chain.iter().enumerate() {
-        acc ^= row_hash(black_box(10), e.index() ^ u32::try_from(i & 1).unwrap_or(0), 0);
-    }
-    black_box(acc);
-    println!("  piece: row hash alone: {:.2} ns", per(start, n));
-
-    let start = Instant::now();
-    let mut found = 0usize;
-    for e in &scrambled {
-        found += usize::from(probe_only(tys, row_hash(10, e.node().bits(), 0)));
-    }
-    black_box(found);
-    println!("  piece: probe alone (groups and tags, no compare), scrambled order: {:.1} ns", per(start, scrambled.len()));
-
-    let start = Instant::now();
-    let mut hits = 0usize;
-    for e in &chain {
-        hits += usize::from(find_slice(tys, black_box(*e)).is_some());
-    }
-    println!("  piece: find (hash, probe, compare), chain order, independent: {:.1} ns", per(start, n));
-    assert_eq!(hits, n);
-
-    let start = Instant::now();
-    for e in &scrambled {
-        hits += usize::from(find_slice(tys, black_box(*e)).is_some());
-    }
-    println!("  piece: find, scrambled order, independent: {:.1} ns", per(start, scrambled.len()));
-
-    let start = Instant::now();
-    let mut t = Ty::BOOL;
-    for _ in 0..n {
-        t = match find_slice(tys, t) {
-            Some(x) => x,
-            None => break,
-        };
-    }
-    black_box(t);
-    println!("  piece: find, each waiting on the last (the hit loop's shape): {:.1} ns", per(start, n));
-
-    // Hot: a thousand types looked up a thousand times, the working set in cache.
     let mut hot = Tys::new_in(Alloc::global());
     let mut t = Ty::BOOL;
     for _ in 0..1000 {
@@ -110,16 +52,7 @@ fn pieces(tys: &mut Tys<'_>, n: usize) {
         }
         black_box(t);
     }
-    println!("  piece: intern hit, 1,000 hot types: {:.1} ns", per(start, 1_000_000));
-    let start = Instant::now();
-    for _ in 0..1000 {
-        let mut t = Ty::BOOL;
-        for _ in 0..1000 {
-            t = find_slice(&hot, black_box(t)).unwrap_or(Ty::BOOL);
-        }
-        black_box(t);
-    }
-    println!("  piece: find alone, 1,000 hot types: {:.1} ns", per(start, 1_000_000));
+    println!("intern hit, 1,000 hot types: {:.1} ns", per(start, 1_000_000));
 }
 
 fn main() {
@@ -143,7 +76,7 @@ fn main() {
     let hit = per(start, N);
     assert_eq!(t, u);
     println!("intern miss: {miss:.1} ns/type; intern hit: {hit:.1} ns/type (1,000,000 rows, each lookup waiting on the last)");
-    pieces(&mut tys, N);
+    hot_hit();
 
     for n in [10_000usize, 1_000_000] {
         let mut tys = Tys::new_in(Alloc::global());
@@ -206,6 +139,24 @@ fn main() {
         assert!(r.is_ok());
     }
     println!("subst, one field of 10,000 changed: {:.2} ns/field", per(start, DEEP * ROUNDS));
+    // Subst over a tuple of a million fields `[T; i]`, every one changed: siblings whose
+    // interns do not wait on each other, on a table past the cache (the first round inserts,
+    // the rest hit).
+    const WIDE: usize = 1_000_000;
+    let mut fields = vec![Ty::BOOL; WIDE];
+    for (i, x) in fields.iter_mut().enumerate() {
+        *x = cx.tys.array_n(p, u64::try_from(i).unwrap_or(0));
+    }
+    let wide = cx.tys.tuple_of(&fields);
+    let r = cx.subst_ty(wide, args);
+    assert!(r.is_ok());
+    const WIDE_ROUNDS: usize = 5;
+    let start = Instant::now();
+    for _ in 0..WIDE_ROUNDS {
+        let r = cx.subst_ty(wide, args);
+        assert!(r.is_ok());
+    }
+    println!("subst, 1,000,000 fields all changed (siblings): {:.1} ns/field", per(start, WIDE * WIDE_ROUNDS));
 
     // Canonicalize: a small goal with three variables, key and all.
     let (a, b, c) = (cx.next_ty_var(), cx.next_ty_var(), cx.next_int_var());

@@ -61,6 +61,7 @@ fn main() {
     println!("input: {} bytes of the workspace's Rust source; best of {RUNS}", text.len());
     println!("{:<34} {:>14}  {:>14}  ratio", "", "blaze-deflate", "miniz_oxide");
 
+    let mut fast_size = 0;
     for (level, theirs_level) in [(Level::Fast, 1u8), (Level::Default, 6u8)] {
         let mut ours = Vec::new_in(Global);
         let o = rate(text.len(), || {
@@ -72,6 +73,24 @@ fn main() {
         let t = rate(text.len(), || theirs = black_box(miniz_oxide::deflate::compress_to_vec(&text, theirs_level)));
         line(&format!("deflate {level:?} (theirs level {theirs_level})"), o, t);
         println!("{:<34} {:>9} B       {:>9} B", "  compressed size", ours.len(), theirs.len());
+        if level == Level::Fast {
+            fast_size = ours.len();
+        }
+    }
+    // The curve: miniz at each level, and the first whose output is no larger than Fast's.
+    println!("miniz_oxide by level (size, MB/s); Fast is {fast_size} B:");
+    let mut equal = None;
+    for theirs_level in 1..=9u8 {
+        let mut theirs = std::vec::Vec::new();
+        let t = rate(text.len(), || theirs = black_box(miniz_oxide::deflate::compress_to_vec(&text, theirs_level)));
+        println!("  level {theirs_level}: {:>9} B {t:>9.1} MB/s", theirs.len());
+        if equal.is_none() && theirs.len() <= fast_size {
+            equal = Some((theirs_level, t));
+        }
+    }
+    match equal {
+        Some((theirs_level, t)) => println!("  at equal size: level {theirs_level}, {t:.1} MB/s"),
+        None => println!("  no level reaches Fast's size"),
     }
 
     let stream = miniz_oxide::deflate::compress_to_vec(&text, 6);
@@ -97,6 +116,28 @@ fn main() {
     });
     line("inflate into a slice", into, theirs);
     assert!(out[..] == text[..] && flat == text, "an inflater read the stream wrongly");
+    let careful = rate(text.len(), || {
+        let mut i = InflateInto::careful(limits);
+        i.feed(&stream, &mut flat).expect("inflate");
+        i.finish().expect("ends");
+        black_box(&flat);
+    });
+    line("  its careful twin", careful, theirs);
+    let ours_stream = {
+        let mut s = Vec::new_in(Global);
+        blaze_deflate::deflate(&text, Level::Default, Global, &mut s).expect("deflate");
+        s
+    };
+    let theirs_own = rate(text.len(), || {
+        black_box(miniz_oxide::inflate::decompress_to_vec(&ours_stream).expect("inflate"));
+    });
+    let into_own = rate(text.len(), || {
+        let mut i = InflateInto::new(limits);
+        i.feed(&ours_stream, &mut flat).expect("inflate");
+        i.finish().expect("ends");
+        black_box(&flat);
+    });
+    line("inflate into a slice (our stream)", into_own, theirs_own);
 
     println!("{:<34} {:>14}  {:>14}", "", "core::simd", "scalar twin");
     let v = rate(text.len(), || {

@@ -16,7 +16,7 @@
 use std::{
     alloc::Global,
     hint::black_box,
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, atomic::AtomicU64},
     time::Instant,
 };
 
@@ -219,6 +219,21 @@ fn ladder_off(lines: &mut Vec<(&'static str, f64)>) {
     ));
     lines.push(("(b2) Site::how alone, nothing records", per(|_| _ = black_box(LADDER_SITE.how().is_some()))));
     lines.push((
+        "(c0) Span::none() made and dropped",
+        per(|i| {
+            let span = black_box(blaze_trace::Span::none());
+            drop(span);
+            black_box(i);
+        }),
+    ));
+    lines.push((
+        "(c1) the disabled macro, not entered",
+        per(|i| {
+            let _span = blaze_trace::info_span!("ladder_off_open");
+            black_box(i);
+        }),
+    ));
+    lines.push((
         "(c) the disabled macro, entered",
         per(|i| {
             let _span = blaze_trace::info_span!("ladder_off").entered();
@@ -236,8 +251,83 @@ fn ladder_off(lines: &mut Vec<(&'static str, f64)>) {
     lines.push(("(f) the thread-state pointer (thread-local)", per(|_| _ = black_box(record::thread_state()))));
 }
 
+/// A ring of 32-byte slots of the example's own, to take the protocol's stores apart.
+static SLOTS: [AtomicU64; 4 * 4096] = [const { AtomicU64::new(0) }; 4 * 4096];
+static HEAD: AtomicU64 = AtomicU64::new(0);
+
+#[inline(always)]
+fn slot(i: u64) -> &'static [AtomicU64] {
+    let at = (i as usize & 4095) * 4;
+    &black_box(&SLOTS)[at..at + 4]
+}
+
 /// The ladder's second part, once the rings are installed.
 fn ladder_on(lines: &mut Vec<(&'static str, f64)>) {
+    use core::sync::atomic::Ordering::{Relaxed, Release};
+    lines.push((
+        "(g1) 4 relaxed stores into a slot",
+        per(|i| {
+            let s = slot(i);
+            for (w, it) in s.iter().enumerate() {
+                it.store(i + w as u64, Relaxed);
+            }
+        }),
+    ));
+    lines.push((
+        "(g2) 3 relaxed + the stamp Release",
+        per(|i| {
+            let s = slot(i);
+            for (w, it) in s[1..].iter().enumerate() {
+                it.store(i + w as u64, Relaxed);
+            }
+            s[0].store(i << 1, Release);
+        }),
+    ));
+    lines.push((
+        "(g3) + busy stamp first, dmb ishst",
+        per(|i| {
+            let s = slot(i);
+            s[0].store(i << 1 | 1, Relaxed);
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: a barrier only.
+            unsafe {
+                core::arch::asm!("dmb ishst", options(nostack, preserves_flags));
+            }
+            for (w, it) in s[1..].iter().enumerate() {
+                it.store(i + w as u64, Relaxed);
+            }
+            s[0].store(i << 1, Release);
+        }),
+    ));
+    lines.push((
+        "(g4) + the head Release (the protocol)",
+        per(|i| {
+            let s = slot(i);
+            s[0].store(i << 1 | 1, Relaxed);
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: a barrier only.
+            unsafe {
+                core::arch::asm!("dmb ishst", options(nostack, preserves_flags));
+            }
+            for (w, it) in s[1..].iter().enumerate() {
+                it.store(i + w as u64, Relaxed);
+            }
+            s[0].store(i << 1, Release);
+            HEAD.store(i + 1, Release);
+        }),
+    ));
+    lines.push((
+        "(g5) the protocol, no barrier",
+        per(|i| {
+            let s = slot(i);
+            s[0].store(i << 1 | 1, Relaxed);
+            for (w, it) in s[1..].iter().enumerate() {
+                it.store(i + w as u64, Relaxed);
+            }
+            s[0].store(i << 1, Release);
+            HEAD.store(i + 1, Release);
+        }),
+    ));
     lines.push(("(g) one slot write, barrier, no counter", per(|i| _ = black_box(record::emit([0x80, i, i])))));
     lines.push((
         "(h) two slot writes",

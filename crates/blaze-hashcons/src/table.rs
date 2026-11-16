@@ -157,6 +157,24 @@ impl<T: Consed> HashCons<T> {
         self.intern_content(content, value)
     }
 
+    /// [`HashCons::intern`] of each of `values`, as one batch: every content ID computed and
+    /// its shard's index group prefetched first, then each interned in order, so on indexes
+    /// larger than the cache the groups' misses overlap. Equal values in one batch get one
+    /// handle, as one `intern` after another would give them.
+    pub fn intern_many<const N: usize>(&self, values: [T; N]) -> [Interned<'_, T>; N] {
+        let contents = values.each_ref().map(|value| content_of(value));
+        for content in &contents {
+            let key = Key::of(content, self.mask);
+            self.shards[key.shard].index.prefetch(key.hash);
+        }
+        let mut at = 0;
+        values.map(|value| {
+            let content = contents[at];
+            at += 1;
+            self.intern_content(content, value)
+        })
+    }
+
     /// [`HashCons::intern`] of a value whose content ID the caller has just computed with
     /// [`content_of`].
     pub(crate) fn intern_content(&self, content: ContentId, value: T) -> Interned<'_, T> {

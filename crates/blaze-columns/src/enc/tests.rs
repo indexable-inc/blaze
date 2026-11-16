@@ -11,7 +11,7 @@ use super::block::{GetCost, Scheme};
 use super::ints::{DictUse, IntPolicy, encode_ints};
 use super::plant::{self, Plant};
 use super::strs::{StrPolicy, StrScheme, encode_strs};
-use super::{IntView, StrView};
+use super::{IdView, IntView, StrView, encode_ids};
 
 fn global() -> Alloc<'static> {
     Alloc::global()
@@ -276,6 +276,45 @@ fn read_all(bytes: &[u8]) {
             core::hint::black_box(view.get(i, &mut buf).ok());
         }
     }
+    if let Ok(view) = IdView::<4>::open(bytes) {
+        for i in 0..view.len() {
+            core::hint::black_box(view.get(i));
+        }
+    }
+}
+
+/// Ids of 4 bytes (the layout is `W`-generic; 4 keeps the cases small) drawn from a pool, so
+/// rows repeat as a record's references to one item do.
+fn draw_ids(tape: &Tape) -> std::vec::Vec<[u8; 4]> {
+    let pool: std::vec::Vec<[u8; 4]> = tape.vec(1..=40, "pool", |tape| tape.next_u32("id").to_le_bytes());
+    let n = tape.int_in(0usize..=2200, "rows");
+    (0..n).map(|_| pool[tape.index(pool.len(), "pick")]).collect()
+}
+
+fn check_ids(rows: &[[u8; 4]]) -> Result<(), Broke> {
+    let mut bytes = Vec::new_in(global());
+    encode_ids(rows, global(), &mut bytes).map_err(|e| oracle(format!("encode refused: {e}")))?;
+    let view = IdView::<4>::open(&bytes).map_err(|e| oracle(format!("id round trip: open refused: {e}")))?;
+    if view.len() != rows.len() {
+        return Err(oracle(format!("id round trip: {} ids, not {}", view.len(), rows.len())));
+    }
+    for (i, row) in rows.iter().enumerate() {
+        if view.get(i) != row {
+            return Err(oracle(format!("id round trip: id {i}: {:?}, not {row:?}", view.get(i))));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn id_columns_read_back_their_ids() {
+    blaze_sim::check(Config::cases(300), |tape| check_ids(&draw_ids(tape)));
+}
+
+#[test]
+fn the_oracle_catches_an_id_code_one_off() {
+    let run = |tape: &Tape, p: Plant| plant::with(p, || check_ids(&draw_ids(tape)));
+    blaze_sim::control(Config::cases(300), Plant::Clean, Plant::DictCodePlusOne, "id round trip", run);
 }
 
 #[test]
@@ -283,7 +322,9 @@ fn corrupt_bytes_are_refused_or_read_in_bounds() {
     blaze_sim::check(Config::cases(400), |tape| {
         let mut bytes = if tape.coin("from a column") {
             let mut bytes = Vec::new_in(global());
-            if tape.coin("strings") {
+            if tape.coin("ids") {
+                encode_ids(&draw_ids(tape), global(), &mut bytes).map_err(|e| oracle(format!("encode refused: {e}")))?;
+            } else if tape.coin("strings") {
                 let strs = draw_strs(tape);
                 let refs: std::vec::Vec<&[u8]> = strs.iter().map(std::vec::Vec::as_slice).collect();
                 let scheme = *tape.one_of(&StrScheme::ALL, "scheme");
@@ -314,9 +355,15 @@ fn corrupt_bytes_are_refused_or_read_in_bounds() {
 /// The layout of the smallest frame-of-reference column, byte for byte (columns.md).
 #[test]
 fn a_frame_of_reference_column_is_these_bytes() {
-    let bytes = encode(&[5, 6, 7], IntPolicy::RECORD).unwrap_or_else(|_| panic!("encode refused"));
-    let mut want = vec![0u8, 3, 0, 0, 0, 0, 0, 0, 0];
-    want.extend_from_slice(&[1, 2, 5, 0, 0, 0, 0, 0, 0, 0, 0b10_01_00]);
+    // Not 5, 6, 7: a line through them leaves nothing to pack, so `Linear` wins with no body.
+    let bytes = encode(&[5, 7, 6], IntPolicy::RECORD).unwrap_or_else(|_| panic!("encode refused"));
+    // Kind 0 and `len` 3; the entry: base 5, slope 0, body at 0, width 2, scheme `For`, w2 0,
+    // a zero byte; the body: 0, 2, 1 at two bits each.
+    let mut want = vec![0u8, 3, 0, 0, 0];
+    want.extend_from_slice(&[5, 0, 0, 0, 0, 0, 0, 0]);
+    want.extend_from_slice(&[0; 8]);
+    want.extend_from_slice(&[0, 0, 0, 0, 2, 1, 0, 0]);
+    want.push(0b01_10_00);
     want.extend_from_slice(&[0; PAD]);
     assert_eq!(bytes.as_slice(), want.as_slice());
 }

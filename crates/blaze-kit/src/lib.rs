@@ -48,7 +48,13 @@
 //! (symbols.rs, macho.rs, native.rs, target.rs, lib.rs) to [`InlineVec`].
 
 #![no_std]
-#![feature(allocator_ext)]
+#![feature(allocator_ext, core_intrinsics)]
+#![allow(
+    internal_features,
+    reason = "`core_intrinsics` for `prefetch_read_data` alone, which has no stable form: \
+              `StaticSearch::lower_bounds` prefetches each probe's next node (measured in \
+              search.rs's doc)"
+)]
 // blaze's lints (`blaze::trust`) name their tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]

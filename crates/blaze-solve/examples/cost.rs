@@ -24,7 +24,10 @@ use blaze_solve::testing::world::{World, def_of};
 use blaze_solve::tys::Tys;
 
 fn world() -> World {
-    let prelude = parse_file(PRELUDE).expect("prelude parses");
+    // core's `impl Clone for u32` (ints are not a builtin Clone candidate: "Implementations are
+    // provided in core", structural_traits.rs).
+    let text = format!("{PRELUDE}\nextern impl Clone for u32\n");
+    let prelude = parse_file(&text).expect("prelude parses");
     let decls: Vec<(u32, &DeclA)> = prelude.decls.iter().map(|(l, d)| (*l, d)).collect();
     World::build(&decls).expect("prelude lowers")
 }
@@ -179,4 +182,13 @@ fn main() {
     for len in [8, 64, 1024] {
         prefilter_cost(len);
     }
+}
+
+/// The same report under the test harness (`cargo test --release --example cost`), for a lane
+/// that may only run tests: `println!` is captured there, so the run is also asked to fail
+/// with nothing else to say when `BLAZE_SOLVE_COST_SHOW` is set, which prints the captured lines.
+#[test]
+fn cost_report() {
+    main();
+    assert!(std::env::var_os("BLAZE_SOLVE_COST_SHOW").is_none(), "the cost report above (BLAZE_SOLVE_COST_SHOW is set)");
 }

@@ -272,6 +272,85 @@ impl FileName {
     }
 }
 
+/// A directory an effect names as a whole ([`Effect::List`], [`Effect::SyncDir`]): the driver's
+/// root itself, or a directory beneath it. A [`FileName`] is never empty, so the root has a
+/// value of its own here: the folder a program was started in (bstd's driver root) is listed
+/// and synced as any other, and nothing of its path is in the value, so none enters a key.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)] // clone: a refcount at most
+pub enum DirName {
+    /// The driver's root.
+    Root,
+    /// The directory of that name beneath it.
+    Named(FileName),
+}
+
+impl DirName {
+    /// The directory's name beneath the root; `None` for the root.
+    pub fn name(&self) -> Option<&FileName> {
+        match self {
+            DirName::Root => None,
+            DirName::Named(name) => Some(name),
+        }
+    }
+
+    /// Whether `file` is beneath this directory, or is it.
+    pub fn holds(&self, file: &FileName) -> bool {
+        match self {
+            DirName::Root => true,
+            DirName::Named(dir) => file.is_under(dir),
+        }
+    }
+
+    /// Where, in the name of a file beneath it, the part relative to it starts: past the
+    /// directory's name and its `/`, or 0 for the root.
+    pub fn start(&self) -> usize {
+        match self {
+            DirName::Root => 0,
+            DirName::Named(dir) => dir.as_str().len() + 1,
+        }
+    }
+
+    /// The name of `child`, one part, directly in this directory; `None` where it is no part
+    /// of a name (empty, `.`, `..`, or with a `/`).
+    pub fn child(&self, child: &str) -> Option<FileName> {
+        if child.contains('/') {
+            return None;
+        }
+        match self {
+            DirName::Root => FileName::new(child),
+            DirName::Named(dir) => {
+                // alloc: once per name made, as `FileName::new`.
+                let joined = format!("{dir}/{child}");
+                FileName::new(&joined)
+            }
+        }
+    }
+
+    /// The directory as a path under `root`: `root` itself for [`DirName::Root`].
+    pub fn path_under(&self, root: &std::path::Path) -> std::path::PathBuf {
+        match self {
+            DirName::Root => root.to_path_buf(),
+            DirName::Named(dir) => root.join(dir.as_str()),
+        }
+    }
+}
+
+impl From<FileName> for DirName {
+    fn from(name: FileName) -> DirName {
+        DirName::Named(name)
+    }
+}
+
+/// The root is written `.`, as a person names the folder they are in.
+impl fmt::Display for DirName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DirName::Root => f.write_str("."),
+            DirName::Named(dir) => f.write_str(dir.as_str()),
+        }
+    }
+}
+
 /// A [`FileName`] written as a path under a root ([`FileName::under`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Under<'a> {
@@ -455,9 +534,10 @@ pub enum Effect {
     /// `_synced` remove, create or `sync_names` of bstd waits for; a file's bytes are
     /// [`Effect::Sync`]'s. Unix: `fsync` of the directory (Apple's: `F_FULLFSYNC`, through
     /// `sync_all`). Windows has no such call yet and fails, naming that. A `dir` that is not
-    /// there fails. Completes with [`Done::Synced`].
+    /// there fails. The root ([`DirName::Root`]) is synced as any directory. Completes with
+    /// [`Done::Synced`].
     SyncDir {
-        dir: FileName,
+        dir: DirName,
         tag: Tag,
     },
     /// The file cut to its first `len` bytes (made if missing); durable once a later sync
@@ -487,9 +567,10 @@ pub enum Effect {
     },
     /// Every file and directory under `dir`, at any depth, sorted by name, each with its
     /// [`Meta`]. A symbolic link is listed as a file of its own length and not followed.
-    /// Completes with [`Done::Listed`]; a `dir` that is not there fails.
+    /// Completes with [`Done::Listed`]; a `dir` that is not there fails. Of the root
+    /// ([`DirName::Root`]), everything under the driver's root, named as every name is.
     List {
-        dir: FileName,
+        dir: DirName,
         tag: Tag,
     },
     /// `bytes` written at `at` of `file`, which exists, past its end making it longer; durable

@@ -62,6 +62,25 @@ fn main() {
             took.as_secs_f64() * 1e6 / lines as f64,
         );
     }
+    // Half the floor (crate docs, "Why bytes, not tokens"): one BLAKE3 pass over every byte,
+    // on one thread. The other half is a skip of every byte, measured by blaze-lex's `cost`.
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let start = Instant::now();
+        let mut sum = 0u8;
+        for text in &texts {
+            let mut hasher = blaze_ids::Hasher::new("blaze-file-items time: the floor");
+            hasher.update(text.as_bytes());
+            sum ^= hasher.finish().0[0];
+        }
+        best = best.min(start.elapsed().as_secs_f64());
+        std::hint::black_box(sum);
+    }
+    println!(
+        "blake3 over every byte: {:.1} ms best of 3 on one thread ({:.0} MB/s)",
+        best * 1e3,
+        bytes as f64 / 1e6 / best
+    );
     // The same work on N threads, each taking the next file from one shared counter (so big
     // files do not unbalance a thread): what "divides by N" comes to on this machine. Every
     // outline allocates from the global heap here, so its contention is in the number.

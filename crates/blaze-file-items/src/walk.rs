@@ -1,8 +1,9 @@
 //! The walk that makes an [`Outline`]: the parser's event stream for the whole file, read once
 //! with a stack of the nodes open at each step and, beside it, the entries open at each step.
 //!
-//! Each raw token the parser takes is found in the lexer's tokens (trivia skipped), given to
-//! every open node that has no start yet, and fed to the hashers of every open entry. A node
+//! Each raw token the parser takes is found in the lexer's tokens (trivia skipped) and given to
+//! every open node that has no start yet; an entry's digests are taken from its bytes when it
+//! closes. A node
 //! the outline reads is recognised by its kind and its parent's role ([`Role`]); what it holds
 //! is taken when it closes, from its range or from the tokens recorded while it was open (a
 //! visibility, a rename, an attribute). No node is kept past its exit.
@@ -19,10 +20,13 @@ use parser::{
     SyntaxKind::{self, *},
 };
 
-use crate::{ITEM_DOMAIN, Outline, SIGNATURE_DOMAIN};
+use blaze_lex::Cpu;
 
-/// The domain of an unnamed entry's head: its signature tokens outside its attributes, which
-/// stand for its name among its siblings.
+use crate::skeleton::{Skipped, skeleton};
+use crate::{ITEM_DOMAIN, Outline};
+
+/// The domain of an unnamed entry's head: its signature's bytes from its first token outside
+/// its attributes, which stand for its name among its siblings.
 const HEAD_DOMAIN: &str = "blaze v2 file item head 1";
 
 /// The domain of a sibling group's key: the parent, the kind and the name (or head).
@@ -50,13 +54,24 @@ pub(crate) fn outline<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: A
         "a source file of {} bytes: an outline's ranges are u32 pairs",
         text.len()
     );
-    let lexed = LexedStr::new(edition, text);
+    let (skipped, skeleton) = match bodies {
+        Bodies::Parsed => (Vec::new_in(alloc), Vec::new_in(alloc)),
+        Bodies::Skipped => skeleton(text, Cpu::BASELINE, alloc),
+    };
+    let parsed_text = match bodies {
+        Bodies::Parsed => text,
+        Bodies::Skipped => match blaze_lex::validate(Cpu::BASELINE, &skeleton) {
+            Ok(valid) => valid.as_str(),
+            Err(invalid) => unreachable!("a text cut at ASCII braces is UTF-8, not at byte {}", invalid.valid_up_to),
+        },
+    };
+    let lexed = LexedStr::new(edition, parsed_text);
     let input = lexed.to_input(edition);
     let output = match bodies {
         Bodies::Parsed => parser::TopEntryPoint::SourceFile.parse(input.tokens()),
         Bodies::Skipped => parser::TopEntryPoint::SourceFile.parse_outline(input.tokens()),
     };
-    let mut walk = Walk::new(text, &lexed, edition, alloc);
+    let mut walk = Walk::new(text, &lexed, &skipped, edition, alloc);
     for step in output.steps() {
         match step {
             OutlineStep::Step(step) => walk.step(step),
@@ -102,16 +117,16 @@ fn may_hold_items(input: &Input, from: usize, len: usize) -> bool {
     false
 }
 
-/// How an outline reads a `fn` body: parsed with the rest, or left unparsed, as the parser's
-/// outline mode leaves it (`TopEntryPoint::parse_outline`, `lazy_block_len`).
+/// How an outline reads a `fn` body: lexed and parsed with the rest, or left unread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bodies {
-    /// Every body parsed: the reference the skipping walk is tested equal to.
+    /// Every body lexed and parsed: the reference the skipping walk is tested equal to.
     Parsed,
-    /// A body the parser may leave unparsed is not parsed, unless its tokens may hold an item or
-    /// a macro call ([`may_hold_items`]), which only a parse can tell apart from a body that does
-    /// not; its tokens are hashed as they are either way. A body's own syntax errors are not the
-    /// outline's then: they are found when the body is parsed for its own record.
+    /// A body whose bytes cannot hold an item or a macro call is not lexed (crate::skeleton);
+    /// one the parser may leave unparsed (`parse_outline`, `lazy_block_len`) is parsed only when
+    /// its tokens may hold one ([`may_hold_items`]). A body's own syntax errors (the lexer's
+    /// and the parser's) are not the outline's then: they are found when the body is parsed
+    /// for its own record.
     Skipped,
 }
 
@@ -161,11 +176,9 @@ struct Open {
     index: ItemIndex,
     parent: Option<ItemIndex>,
     syntax: SyntaxKind,
-    whole: Hasher,
-    signature: Hasher,
-    /// For an entry with no name: its signature tokens outside its attributes.
-    head: Option<Hasher>,
-    head_fed: bool,
+    /// Where its first token outside its attributes and before its body starts: its head's
+    /// start, for an entry with no name.
+    head_start: Option<u32>,
     start: Option<u32>,
     /// The end of its last token so far.
     last_end: Option<u32>,
@@ -195,12 +208,17 @@ struct Open {
 }
 
 struct Walk<'t, 'l, 'a> {
+    /// The file. The lexer's tokens are the skeleton's (crate::skeleton), the same as the
+    /// file's but inside each skipped body.
     text: &'t str,
-    lexed: &'l LexedStr<'t>,
+    lexed: &'l LexedStr<'l>,
+    /// The bodies the skeleton cut, in order, and the next one the walk has not passed.
+    skipped: &'l [Skipped],
+    next_skipped: usize,
     edition: u8,
     /// The next lexer token.
     pos: usize,
-    /// Where token `pos` starts, or the trivia before it.
+    /// Where token `pos` starts in the file, or the trivia before it.
     offset: u32,
     /// The end of the last token the parser took.
     prev_end: Option<u32>,
@@ -222,10 +240,12 @@ struct Walk<'t, 'l, 'a> {
 }
 
 impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
-    fn new(text: &'t str, lexed: &'l LexedStr<'t>, edition: Edition, alloc: Alloc<'a>) -> Self {
+    fn new(text: &'t str, lexed: &'l LexedStr<'l>, skipped: &'l [Skipped], edition: Edition, alloc: Alloc<'a>) -> Self {
         Walk {
             text,
             lexed,
+            skipped,
+            next_skipped: 0,
             edition: edition_byte(edition),
             pos: 0,
             offset: 0,
@@ -244,6 +264,7 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
                 file_attrs: AttrSpan::default(),
                 errors: Vec::new_in(alloc),
                 messages: Vec::new_in(alloc),
+                keys: Vec::new_in(alloc),
             },
         }
     }
@@ -308,7 +329,7 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
     }
 
     /// A `fn` body the parser left unparsed, its next `len` input tokens: walked as the block it
-    /// is, its tokens hashed, and parsed only when it may hold an item or a macro call.
+    /// is, and parsed only when it may hold an item or a macro call.
     fn lazy_body(&mut self, input: &Input, len: u32) {
         let len = usize::try_from(len).expect("a body's tokens are counted in usize");
         let from = self.taken;
@@ -354,7 +375,6 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
         assert!(self.pos < self.lexed.len(), "the parser took a token past the lexer's last");
         let kind = self.lexed.kind(self.pos);
         let range = Range::new(self.offset, self.offset + self.token_len(self.pos));
-        let touches = self.prev_end == Some(range.start);
         for frame in self.frames.iter_mut().rev() {
             if frame.start.is_some() {
                 break;
@@ -377,26 +397,27 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
         if self.recorded.is_some() {
             self.tokens.push(Tok { kind, range });
         }
-        let bytes = range.of(self.text).as_bytes();
+        if let Some(open) = self.open.last_mut()
+            && !open.body_open
+            && !open.attr_open
+        {
+            open.head_start.get_or_insert(range.start);
+        }
         for open in self.open.iter_mut() {
-            // Whether it touches the token before it in this entry: never for its first.
-            let joint = [u8::from(touches && open.last_end.is_some())];
-            open.whole.update(&joint).part(bytes);
-            if !open.body_open {
-                open.signature.update(&joint).part(bytes);
-                if !open.attr_open
-                    && let Some(head) = &mut open.head
-                {
-                    head.update(&[u8::from(touches && open.head_fed)]).part(bytes);
-                    open.head_fed = true;
-                }
-            }
             open.start.get_or_insert(range.start);
             open.last_end = Some(range.end);
         }
         self.prev_end = Some(range.end);
         self.offset = range.end;
         self.pos += 1;
+        // A skipped body's `{`: its inside is not in the skeleton, and its `}` is next.
+        if let Some(body) = self.skipped.get(self.next_skipped)
+            && range.start == body.open
+        {
+            assert_eq!(kind, L_CURLY, "a skipped body starts at its `{{`");
+            self.offset = body.close;
+            self.next_skipped += 1;
+        }
     }
 
     fn enter(&mut self, kind: SyntaxKind) {
@@ -462,18 +483,11 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
             }
         };
         let at = u32::try_from(self.out.attrs.len()).expect("attributes are counted in u32");
-        let mut whole = Hasher::new(ITEM_DOMAIN);
-        whole.update(&[self.edition]);
-        let mut signature = Hasher::new(SIGNATURE_DOMAIN);
-        signature.update(&[self.edition]);
         self.open.push(Open {
             index,
             parent,
             syntax,
-            whole,
-            signature,
-            head: (!is_named(syntax)).then(|| Hasher::new(HEAD_DOMAIN)),
-            head_fed: false,
+            head_start: None,
             start: None,
             last_end: None,
             body_open: false,
@@ -694,22 +708,38 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
         sibling
             .update(&open.parent.map_or(0u64, |parent| u64::from(parent.0) + 1).to_le_bytes())
             .update(&[tag_of(kind)]);
-        match (&open.head, open.syntax) {
-            (Some(head), _) => {
-                sibling.id(&head.finish());
-            }
+        let bytes = self.text.as_bytes();
+        let at = |offset: u32| usize::try_from(offset).expect("a file offset fits usize");
+        match open.syntax {
             // A tuple field is told apart by its position alone.
-            (None, TUPLE_FIELD) => {}
-            (None, _) => {
+            TUPLE_FIELD => {}
+            syntax if is_named(syntax) => {
                 sibling.opt_part(open.name.map(|name| {
                     let name = name.of(self.text);
                     name.strip_prefix("r#").unwrap_or(name)
                 }));
             }
+            _ => {
+                let head_start = open.head_start.unwrap_or(signature_end).min(signature_end);
+                let mut head = Hasher::new(HEAD_DOMAIN);
+                head.update(&bytes[at(head_start)..at(signature_end)]);
+                sibling.id(&head.finish());
+            }
         }
-        let count = self.siblings.entry(sibling.finish()).or_insert(0);
+        let key = sibling.finish();
+        if open.parent.is_none() {
+            self.out.keys.push(key);
+        }
+        let count = self.siblings.entry(key).or_insert(0);
         let disambiguator = *count;
         *count += 1;
+        // The digests are of the entry's bytes; the signature's is the prefix's, read from the
+        // same hasher at the cut.
+        let mut digest = Hasher::new(ITEM_DOMAIN);
+        digest.update(&[self.edition]).update(&bytes[at(start)..at(signature_end)]);
+        let signature_hash = digest.finish();
+        digest.update(&bytes[at(signature_end)..at(end)]);
+        let hash = digest.finish();
         let after = u32::try_from(self.out.items.len()).expect("an outline's entries are counted in u32");
         self.out.items[open.index.at()] = Item {
             detail: kind,
@@ -722,8 +752,8 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
             body: open.body.map(rel),
             attrs: open.attrs,
             disambiguator,
-            hash: open.whole.finish(),
-            signature_hash: open.signature.finish(),
+            hash,
+            signature_hash,
         };
     }
 
@@ -748,12 +778,26 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
         for (token, message) in lexed.errors() {
             let at = lexed.text_range(token);
             let range = Range::new(
-                u32::try_from(at.start).expect("a file under 4 GiB"),
-                u32::try_from(at.end).expect("a file under 4 GiB"),
+                self.in_file(u32::try_from(at.start).expect("a file under 4 GiB")),
+                self.in_file(u32::try_from(at.end).expect("a file under 4 GiB")),
             );
             self.push_error(range, ErrorOrigin::Lexer, message);
         }
         self.out
+    }
+
+    /// The file's offset of the skeleton's `offset` (none falls inside a skipped body, whose
+    /// skeleton is `{}`).
+    fn in_file(&self, offset: u32) -> u32 {
+        let mut cut = 0;
+        for body in self.skipped {
+            // The skeleton's offset of the body's `}`.
+            if offset <= body.open - cut {
+                break;
+            }
+            cut += body.cut();
+        }
+        offset + cut
     }
 }
 

@@ -153,6 +153,13 @@ as a control.
     Warm columns are read in place, so they keep the two periods.
   - A store of format 9 may hold LZ4 chunks: it is refused by name and rebuilt (rule 26).
 
+- **(i) Batches.** `format::find_many` sorts a batch's keys and seeks each from where the last
+  ended: one guess, a gallop to the key, bisection inside its last step. Index pages of a
+  million entries (test `a_batch_touches_the_index_pages_its_keys_live_on`): 64 keys 171 one
+  at a time, 87 batched, floor 63; 4,096 keys 2,776, 2,234, floor 2,186 (1.02). Not built yet:
+  the read-ahead of a batch's ranges (needs a range advice on blaze-core's mapping, another
+  lane's crate), the fuse filter (above), and a cold wall-time run.
+
 ## Left, and why
 
 - **(a) A read-list digest per index entry.** blaze's is already as good. A record with reads is

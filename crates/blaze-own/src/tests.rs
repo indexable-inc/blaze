@@ -18,7 +18,10 @@
 //! `cargo miri test -p blaze-own` runs the whole suite at Miri sizes: every property test
 //! [`MIRI_CASES`] cases (`cases`), and the sizes inside them small (`sized`), each still
 //! reaching its code: the B-tree tests insert at least [`MIRI_TALL`] keys where they need
-//! height two, which `miri_sizes_reach_every_shape` holds in the normal suite. The planted-bug
+//! height two, which `miri_sizes_reach_every_shape` holds in the normal suite. Every
+//! `every_failure` test refuses at most `testing::MIRI_FAILURE_POINTS` (24) allocations, spread
+//! evenly over its run, and the B-tree's builds its smallest splitting tree
+//! (`MIRI_BTREE_TRY`, which `btree_try_forms_at_miri_sizes` runs in the normal suite). The planted-bug
 //! controls are ignored under Miri (each says why): they test the oracle, not the crate's
 //! unsafe code, and their plants leak or read stale slots on purpose; each one's clean half is
 //! a test of its own. The one test that leaks on purpose (the `every_failure` control) names
@@ -3079,21 +3082,42 @@ fn tree_values<A: Allocator, B: Allocator>(m: &OwnMap<u64, Box<u64, A>, B>) -> S
 
 #[test]
 fn btree_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
+    // Under Miri the smallest that still splits (16 keys fill a 15-entry leaf and split it; the
+    // splits off cut through a node and fix its edges): each refusal reruns everything, and the
+    // interpreter cannot pay the square of the full size.
+    let (up_n, down_n, set_n, tall) = sized((40, 200, 60, 2), MIRI_BTREE_TRY);
+    btree_try_forms(up_n, down_n, set_n, tall)
+}
+
+/// The sizes `btree_try_forms_fail_cleanly_at_every_allocation` runs under Miri.
+const MIRI_BTREE_TRY: (u64, u64, u64, usize) = (16, 20, 20, 1);
+
+/// The Miri sizes of the B-tree's try forms, run in the normal suite so they are known to pass.
+#[test]
+#[cfg_attr(miri, ignore = "under Miri the test above runs these sizes")]
+fn btree_try_forms_at_miri_sizes() -> Result<(), Broke> {
+    let (up_n, down_n, set_n, tall) = MIRI_BTREE_TRY;
+    btree_try_forms(up_n, down_n, set_n, tall)
+}
+
+/// `up_n` boxed keys ascending and `down_n` plain ones descending, a tree at least `tall` high,
+/// split off in the middle, and a set of `set_n` scattered keys, every allocation refused in turn.
+fn btree_try_forms(up_n: u64, down_n: u64, set_n: u64, tall: usize) -> Result<(), Broke> {
     under_every_failure("BTreeMap", |alloc| {
         // Ascending and descending: splits on the right edge and on the left. `Failing` keeps
         // at most `testing::SLOTS` (256) blocks live, so the boxed map is small and the tall one
         // (height 2) holds plain values.
         let (mut up, mut down) = (OwnMap::new_in(alloc), OwnMap::new_in(alloc));
         let down_values = |m: &OwnMap<u64, u64, &Failing>| m.iter().map(|(k, v)| (*k, *v)).collect::<StdVec<_>>();
-        for n in 0..200u64 {
-            if n < 40 {
+        for n in 0..down_n {
+            if n < up_n {
                 let value = Box::try_new_in(n, alloc)?;
                 step(&mut up, tree_values, |m| m.try_insert(n, value).map(|_| ()))?;
             }
             step(&mut down, down_values, |m| m.try_insert(1000 - n, n).map(|_| ()))?;
         }
-        if down.height() < 2 {
-            return Err(Why::Changed(format!("200 keys made a tree of height {}", down.height())));
+        if down.height() < tall {
+            return Err(Why::Changed(format!("{down_n} keys made a tree of height {}, not {tall}", down.height())));
         }
         let value = Box::try_new_in(7, alloc)?;
         step(&mut up, tree_values, |m| match m.entry(500) {
@@ -3104,14 +3128,16 @@ fn btree_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
         if tree_values(&copy) != tree_values(&up) {
             return Err(Why::Changed(String::from("the copy differs from the map")));
         }
-        let right = step(&mut up, tree_values, |m| m.try_split_off(&20))?;
-        let mut want: StdVec<(u64, u64)> = (20..40).map(|k| (k, k)).collect();
+        let half = up_n / 2;
+        let right = step(&mut up, tree_values, |m| m.try_split_off(&half))?;
+        let mut want: StdVec<(u64, u64)> = (half..up_n).map(|k| (k, k)).collect();
         want.push((500, 7));
-        if tree_values(&up) != (0..20).map(|k| (k, k)).collect::<StdVec<_>>() || tree_values(&right) != want {
+        if tree_values(&up) != (0..half).map(|k| (k, k)).collect::<StdVec<_>>() || tree_values(&right) != want {
             return Err(Why::Changed(format!("split_off gave {:?} and {:?}", tree_values(&up), tree_values(&right))));
         }
-        let low = step(&mut down, down_values, |m| m.try_split_off(&900))?;
-        if down_values(&low) != (900..=1000).map(|k| (k, 1000 - k)).collect::<StdVec<_>>() {
+        let cut = 1000 - down_n / 2;
+        let low = step(&mut down, down_values, |m| m.try_split_off(&cut))?;
+        if down_values(&low) != (cut..=1000).map(|k| (k, 1000 - k)).collect::<StdVec<_>>() {
             return Err(Why::Changed(format!("split_off gave {:?}", down_values(&low))));
         }
         for map in [&up, &copy, &right] {
@@ -3121,7 +3147,7 @@ fn btree_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
             map.invariants().map_err(Why::Changed)?;
         }
         let mut set = OwnSet::new_in(alloc);
-        for n in 0..60u64 {
+        for n in 0..set_n {
             step(&mut set, |s: &OwnSet<u64, &Failing>| s.iter().copied().collect::<StdVec<u64>>(), |s| {
                 s.try_insert(n * 7 % 61).map(|_| ())
             })?;

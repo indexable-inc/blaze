@@ -435,6 +435,7 @@ blaze-text = { path = "crates/blaze-text" } # Typed writers into a `Put` sink, `
 blaze-columns = { path = "crates/blaze-columns" }
 blaze-kit = { path = "crates/blaze-kit" } # Specialized collections: typed tables, inline vectors, union-find, sparse and chunked sets, heaps, a timer wheel, column codecs, static search.
 blaze-memchr = { path = "crates/blaze-memchr" } # Byte search (NEON, SSE2, SWAR), in place of memchr.
+blaze-cond = { path = "crates/blaze-cond" } # Presence conditions: hash-consed decision diagrams over a request's cfg variables.
 blaze-lex = { path = "crates/blaze-lex" } # The SIMD lexer: rustc_lexer's tokens, a body skipper, UTF-8 validation.
 blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of bitflags.
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,

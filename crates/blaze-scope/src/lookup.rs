@@ -527,7 +527,10 @@ impl<'a, N: Name> Resolver<'a, N> {
                 _ => Res::None,
             };
         }
-        self.lexical(LexQuery { ns, name, at, want: None, textual: false, ignore }, env, sink)
+        // An import's macro reads the `macro_rules!` scope at its place (rustc's
+        // `Scope::MacroRules` in the import's parent scope): `macro_rules! m {} pub(crate) use m;`.
+        let textual = used == PathUse::Import && ns == Namespace::Macros;
+        self.lexical(LexQuery { ns, name, at, want: None, textual, ignore }, env, sink)
     }
 
     /// A first segment through the lexical layers, innermost first: the `macro_rules!` textual
@@ -592,6 +595,22 @@ impl<'a, N: Name> Resolver<'a, N> {
             if let Some(prelude) = self.prelude {
                 let r = self.layer_name(prelude, lq.ns, lq.name, Layer::StdPrelude, env, sink);
                 if let Some(stop) = self.layer(r, &lq, &mut inner, &mut undet, sink) {
+                    return stop;
+                }
+            }
+        }
+        if lq.ns == Namespace::Types {
+            if let Some(def) = crate::builtin_type(lq.name.as_ref()) {
+                let hit = Hit {
+                    def,
+                    vis: Visibility::Public,
+                    origin: Origin::Prelude,
+                    expansion: 0,
+                    frag: None,
+                    state: BindingState::Determined,
+                    layer: Layer::Builtin,
+                };
+                if let Some(stop) = self.layer(Res::Found(hit), &lq, &mut inner, &mut undet, sink) {
                     return stop;
                 }
             }
@@ -712,16 +731,12 @@ impl<'a, N: Name> Resolver<'a, N> {
         let f = &self.frags[frag as usize];
         for s in (0..end).rev() {
             match f.slots[s] {
-                Slot::Rules { name: n, def } if n == name => {
-                    return Tex::Hit(Hit {
-                        def: Def { key: def, kind: DefKind::Macro(CallShape::FnLike) },
-                        vis: self.restricted(self.module),
-                        origin: Origin::Declared,
-                        expansion: f.expansion,
-                        frag: Some(frag),
-                        state: BindingState::Determined,
-                        layer: Layer::Textual,
-                    });
+                Slot::Rules { name: n, def, export } if n == name => {
+                    let hit = self.textual_hit(&TextualDef { name: n, def, expansion: f.expansion });
+                    // rustc's `define_macro`: a `#[macro_export]` macro's textual binding is
+                    // public, so `pub use m;` beside it re-exports it (core's `ub_checks`).
+                    let vis = if export { Visibility::Public } else { hit.vis };
+                    return Tex::Hit(Hit { frag: Some(frag), vis, ..hit });
                 }
                 Slot::Call(i) => {
                     let call = &self.calls[i as usize];
@@ -748,10 +763,15 @@ impl<'a, N: Name> Resolver<'a, N> {
         Tex::Start
     }
 
+    /// A `macro_rules!` of the textual scope. Its binding is visible in the whole crate
+    /// (rustc's `define_macro`: `Restricted(CRATE_DEF_ID)`), so `pub(crate) use m;` re-exports
+    /// it and `pub use m;` is a wider re-export; one of this module marked `#[macro_export]`
+    /// is public (`textual_back`). A record's `TextualDef` does not say export, so one read
+    /// from another module stays crate-wide.
     fn textual_hit(&self, d: &TextualDef<N>) -> Hit {
         Hit {
             def: Def { key: d.def, kind: DefKind::Macro(CallShape::FnLike) },
-            vis: self.restricted(self.module),
+            vis: Visibility::Crate(self.krate),
             origin: Origin::Declared,
             expansion: d.expansion,
             frag: None,
@@ -1065,11 +1085,15 @@ impl<'a, N: Name> Resolver<'a, N> {
         {
             return CallOutcome { state: Some(CallState::Inert), first: None, wait: false };
         }
-        if n == 0 || (n == 1 && call.path.kind != PathKind::Plain) {
+        // `crate::m!`, `self::m!`, `super::m!` and `$crate::m!` are one segment after a start
+        // module; only a plain one segment goes through the lexical layers. `::m!` alone names
+        // an extern crate, never a macro (a 2015 `::m!` is refused here too).
+        if n == 0 || (n == 1 && call.path.kind == PathKind::Abs) {
             return fail(0, Unresolved::NotFound);
         }
+        let single = n == 1 && call.path.kind == PathKind::Plain;
         let inert = CallOutcome { state: Some(CallState::Inert), first: None, wait: false };
-        let one_attr = call.kind == CallShape::Attr && n == 1;
+        let one_attr = call.kind == CallShape::Attr && single;
         if one_attr {
             // rustc's innermost scope for an attribute: the helpers of the derives before it
             // on its item.
@@ -1084,7 +1108,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         let undetermined = |weak: bool| {
             if force { fail(last, if weak { Unresolved::NotFound } else { Unresolved::Undetermined }) } else { stay }
         };
-        let (r, first) = if n == 1 {
+        let (r, first) = if single {
             let lq = LexQuery {
                 ns: Namespace::Macros,
                 name: segs[0],
@@ -1129,14 +1153,14 @@ impl<'a, N: Name> Resolver<'a, N> {
                 BindingState::Ambiguous(k) => fail(last, Unresolved::Ambiguous(k)),
                 BindingState::Undetermined => undetermined(false),
                 BindingState::Determined => {
-                    if n > 1 && !hit.vis.visible_from(self.asker()) {
+                    if !single && !hit.vis.visible_from(self.asker()) {
                         fail(last, Unresolved::Private)
                     } else if !self.kind_ok(&hit, Some(call.kind)) {
                         fail(last, Unresolved::WrongMacroKind)
                     } else {
                         CallOutcome {
                             state: Some(CallState::Resolved(hit.def)),
-                            first: if n == 1 { Some(hit.def) } else { first },
+                            first: if single { Some(hit.def) } else { first },
                             wait: false,
                         }
                     }

@@ -174,18 +174,19 @@ mod checked {
         a_waiter_hears_the_send(Plant::Unfenced);
     }
 
-    /// Two senders into a ring of one slot and one receiver: the second sender waits for room
-    /// and is woken by the receive; both values arrive.
+    /// A sender puts two values into a ring of one slot while the model's thread receives:
+    /// the second send waits for room and is woken by the first receive; both arrive, in
+    /// order. (The receiver is not also a sender: a thread whose own send waits on a full ring
+    /// it alone drains is a deadlock of the test, which the model rightly reports.)
     #[test]
     fn model_chan_a_full_ring_wakes_its_sender() {
         model(|| {
             let (send, recv) = bounded::<u32>(1);
-            let other = send.clone();
-            let sender = thread::spawn(move || other.send(2).expect("a receiver"));
-            send.send(1).expect("a receiver");
-            let mut got = [recv.recv().unwrap(), recv.recv().unwrap()];
-            got.sort_unstable();
-            assert_eq!(got, [1, 2]);
+            let sender = thread::spawn(move || {
+                send.send(1).expect("a receiver");
+                send.send(2).expect("a receiver");
+            });
+            assert_eq!([recv.recv().unwrap(), recv.recv().unwrap()], [1, 2]);
             sender.join().unwrap();
         });
     }

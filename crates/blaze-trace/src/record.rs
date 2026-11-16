@@ -103,11 +103,13 @@ impl Site {
         None
     }
 
+    #[inline(always)]
     pub const fn metadata(&self) -> &'static Metadata<'static> {
         self.meta
     }
 
     /// Its id in the site table ([`site`]); 0 until its first call.
+    #[inline(always)]
     pub fn id(&self) -> u32 {
         self.state.load(Ordering::Relaxed) >> ID_SHIFT
     }
@@ -398,6 +400,7 @@ const LANE_SHIFT: u32 = 51;
 
 /// The span id of entry `n` of `lane`: never 0. An enter entry naming span 0 opened its span:
 /// the span's id is that entry's.
+#[inline(always)]
 pub const fn span_id(lane: u32, n: u64) -> u64 {
     (lane as u64 + 1) << LANE_SHIFT | n
 }
@@ -532,6 +535,7 @@ const fn head(kind: u8, tag: u8, small: u16, site: u32) -> u64 {
 }
 
 /// A parent as an entry's word 2: 0 the thread's innermost span, `u64::MAX` none.
+#[inline]
 fn parent_word(parent: Parent) -> u64 {
     match parent {
         Parent::Current => 0,

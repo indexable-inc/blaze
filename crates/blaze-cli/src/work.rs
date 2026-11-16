@@ -25,6 +25,7 @@ use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
 use crate::CliError;
+use crate::phases::Phases;
 
 /// The finding number of a syntax error: the outline's, rule-free (a lint has its rule's number).
 pub const SYNTAX: u16 = 1;
@@ -56,11 +57,16 @@ pub fn run_batch<'f, 'r>(
     batch: Batch<'r>,
     frame: &'f Frame,
     effects: &mut AVec<'_, Effect<'r>>,
+    phases: &mut Phases,
 ) -> Result<(), CliError> {
     let cx = cx.span("batch");
+    let began = phases.now();
     let mut did = Vec::with_capacity_in(batch.tasks.len(), frame);
+    let mut took = Vec::with_capacity_in(batch.tasks.len(), frame);
     for (ticket, task) in batch.tasks.iter() {
+        let at = phases.now();
         did.push((*ticket, run(&cx, root, files, req, task, frame)?));
+        took.push(phases.since(at));
     }
     let mut findings: Vec<Vec<Finding<'_>, &Frame>, &Frame> = Vec::with_capacity_in(did.len(), frame);
     for (_, done) in did.iter() {
@@ -87,7 +93,7 @@ pub fn run_batch<'f, 'r>(
     }
     let mut results = Vec::with_capacity_in(did.len(), frame);
     let mut at = 0;
-    for (ticket, done) in did.iter() {
+    for ((ticket, done), ns) in did.iter().zip(took.iter()) {
         let ran = match done {
             Did::Done(_) => {
                 at += 1;
@@ -95,10 +101,12 @@ pub fn run_batch<'f, 'r>(
             }
             Did::Failed(failure) => Ran::Failed(*failure),
         };
-        // No clock in this binary yet (bstd has none passed in): time is 0, said by the profile.
-        results.push(Outcome { ticket: *ticket, ran, in_place: 0, ns: 0 });
+        results.push(Outcome { ticket: *ticket, ran, in_place: 0, ns: *ns });
     }
+    let stepped = phases.now();
+    phases.request.runs += stepped.since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     req.step(Event::Ran { batch: batch.id, results: &results }, effects)?;
+    phases.request.steps += phases.since(stepped);
     Ok(())
 }
 

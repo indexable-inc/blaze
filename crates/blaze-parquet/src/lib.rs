@@ -7,10 +7,12 @@
 //!
 //! A file of [`blaze_columns::Batch`]es of one set of fields: `PAR1`, row groups of at most
 //! [`Options::row_group_rows`] rows, the footer, its length, `PAR1`. Each column chunk is data
-//! pages v1 of at most about [`Options::page_bytes`] of values, cut at a row: PLAIN-encoded
-//! values, no compression, no dictionary. A nullable column's definition levels, and a list
-//! column's repetition levels, are the RLE/bit-packed hybrid (each length-prefixed, as v1 has
-//! them). The types:
+//! pages v1 of at most about [`Options::page_bytes`] of values, cut at a row, each encoded as its
+//! chunk's first page says is smallest ([`Encoding`]: PLAIN, a dictionary, DELTA_BINARY_PACKED,
+//! DELTA_BYTE_ARRAY, DELTA_LENGTH_BYTE_ARRAY; RLE booleans) and compressed as
+//! [`Options::compression`] says ([`Compression`]). A nullable column's definition levels, and a
+//! list column's repetition levels, are the RLE/bit-packed hybrid (each length-prefixed, as v1
+//! has them). The types:
 //!
 //! | column | physical | annotation | DuckDB reads |
 //! |---|---|---|---|
@@ -36,8 +38,9 @@
 //! COMPRESSION uncompressed)`): flat columns and 3-level lists of the types above (and DuckDB's
 //! others that map onto them: TINYINT and SMALLINT as `I32`, UTINYINT as `U16`, FLOAT as `F64`,
 //! DECIMAL as `F64`, DATE as `I32`, TIMESTAMP as `I64`, HUGEINT, which DuckDB writes as
-//! DOUBLE), data pages v1 and v2, PLAIN values or a dictionary page and RLE_DICTIONARY indices.
-//! Anything else (a codec, an encoding, a nested group, a null list element) is a
+//! DOUBLE), data pages v1 and v2, every encoding and codec the writer writes (and
+//! PLAIN_DICTIONARY). Anything else (another codec or encoding, a nested group, a null list
+//! element) is a
 //! [`ParquetError`] naming the column and what it is, never a guess. Every length read is held
 //! to the bytes it lies in.
 //!
@@ -58,8 +61,11 @@ use core::fmt;
 use blaze_columns::ColumnError;
 use blaze_own::FixedString;
 
+mod compress;
 mod concat;
+mod delta;
 mod levels;
+mod lz4;
 pub mod meta;
 mod read;
 mod thrift;
@@ -68,9 +74,10 @@ mod write;
 #[cfg(test)]
 mod tests;
 
+pub use compress::Compression;
 pub use concat::{Concat, Failed, Input};
 pub use read::{File, IntStats};
-pub use write::{Options, STAT_BYTES, Writer, write};
+pub use write::{Encoding, Options, STAT_BYTES, Writer, write};
 
 /// The four bytes a Parquet file begins and ends with.
 pub const MAGIC: [u8; 4] = *b"PAR1";

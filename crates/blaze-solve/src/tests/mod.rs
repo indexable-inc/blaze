@@ -22,11 +22,11 @@ use plant::Plant;
 
 fn print(r: &Report) {
     std::println!("solve cases: {} cases, {} goals, {} passed, {} failed", r.cases, r.goals, r.passed, r.failures.len());
-    for (rule, n) in &r.by_rule {
-        std::println!("  {n:3}  {rule}");
-    }
     for f in &r.failures {
         std::println!("FAIL {f}");
+    }
+    for (rule, n) in &r.by_rule {
+        std::println!("  {n:3}  {rule}");
     }
 }
 

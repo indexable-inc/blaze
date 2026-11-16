@@ -677,6 +677,31 @@ the ratio shown.
 | A prologue counter and a test-lane store are worth their cost | reth's suite against program-counter sampling (run.md 1 and 3) |
 | Zero third-party is affordable before hello-world | add up third-party.md's replacement lines; schedule after the first rung |
 
+### Structures and algorithms, by the goal they serve (2026-11-15)
+
+Started on 2026-11-15, each with a floor and a measurement owed:
+
+| what | where | why |
+|---|---|---|
+| Presence conditions as decision diagrams (`blaze-cond`, conditions.md) | every record entry, for the all-configurations check | one real crate root reads 21 (tokio), 33 (rustix), 48 (std) cfg switches; a fork per switch cannot hold that |
+| Entry digests over raw bytes, and a file outlined per top-level item | the outline | bodies need no lexing; an edit to a 10 MB file costs the edited item |
+| Batched lookups with prefetch (`get_many`) | the hash tables | cache misses of independent lookups overlap |
+| `find_many`: finds in key order with read-ahead | the store, after a restart | index pages touched once, read in parallel, not one fault at a time |
+| A discrimination tree over impl headers | the impl index and the solver's prefilter | one walk returns the impls that can unify, where rustc filters one level |
+| Dictionary and delta encodings in the Parquet writer | profile files | plain files are 22 times the old size |
+
+Not started: each waits for the piece it serves.
+
+| what | waits for | why |
+|---|---|---|
+| Git's index as a source of content digests and per-directory digests | a measured file sweep on a real monorepo | a tracked file whose stat matches the index needs no read; a tree id proves a whole crate unchanged; filters and SHA-1 need care |
+| Content-defined chunking of large records | the shared cache | a transfer in proportion to the change |
+| Set reconciliation between peers (rateless IBLT) | peer-to-peer records | finding what a peer lacks costs the difference, not the set |
+| A history-independent tree for a program's manifest | the first linked program | two builders write equal bytes; two manifests share all but the edit |
+| Heartbeat scheduling for bstd's parallel loops | bstd's runtime passing its tests | latent parallelism at item grain with no task per item |
+| An acyclic e-graph middle end with proved rules | the optimizing tier | one pass of rewrites, numbering and hoisting |
+| Quantile and heavy-hitter sketches in tracing | the trace lane's floor | always-on summaries in constant memory |
+
 ## 18. Superseded and disagreeing docs
 
 - Superseded: [certificate.md](certificate.md) by section 9 (checked by the daemon's loop) and

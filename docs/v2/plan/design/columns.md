@@ -36,37 +36,45 @@ when the sample says it saves more than 5%.
 Value `i` of width `w` is at bit `i * w`, least significant bit first (the horizontal order).
 `get(i)` is one unaligned 8-byte load at byte `i * w / 8`, a shift by `i * w % 8` and a mask
 (above 56 bits a ninth byte too); every column ends with 8 zero bytes so the last load stays
-inside it. Eight values are exactly `w` bytes, so the vector unpack (`core::simd`, eight `u64`
-lanes) loads each lane at an offset and shifts it by an amount fixed by `w` alone, then masks
-all eight at once.
+inside it. Eight values are exactly `w` bytes, so a group's shape is fixed by `w` alone: the
+vector unpack does one 16-byte load per part, one byte shuffle (`swizzle_dyn`: `tbl` on NEON,
+`pshufb` on SSSE3) from a per-width constant table moving each value's bytes to its lane, a
+per-lane shift and a mask (up to 25 bits two parts of four `u32` lanes, up to 56 four parts of
+two `u64` lanes, scalar above).
 
 FastLanes' interleaved order puts value `i` in lane `i % L` at row `i / L`, so a whole block
 unpacks with only vector shifts and ORs, no per-lane load: the fastest scan known (well under a
 cycle a value). Its price is the read of one value: two words of one lane are `L` words apart,
 so a value that straddles a word is two loads up to 128 bytes apart, and a delta in that order
 also needs the transposed layout. blaze reads records a few values at a time and scans rarely,
-so `get` wins: the horizontal order is chosen. The choice is per block (the scheme byte), so an
+so `get` wins: the horizontal order is chosen. The choice is per block (the scheme id), so an
 interleaved scheme can join later for a column that is mostly scanned, without a format change.
 
 ## Layout
 
 All little-endian, unaligned, readable as a view over a record's `Slice<u8>`.
 
-- A column of integers: kind 0 (1), `len` (`u32`), a directory of a `u32` start a block, the
-  blocks end to end, 8 zero bytes. A dictionary: kind 1, `len`, the values column's size
-  (`u32`), the values column, the codes column; neither is a dictionary (no recursion).
-- A block: its scheme (1), then `For`: width (1), min (8), packed; `Linear`: width, base (8),
-  slope (8), packed `x - base - slope * j`; `Rle`: start width, value width, runs (`u16`),
-  value min (8), packed starts, packed values; `Delta`: width, first (8), least delta (8),
-  `n - 1` packed; `Delta2`: width, first, first delta, least second delta, `n - 2` packed.
+- A column of integers: kind 0 (1), `len` (`u32`), a flat directory of one 24-byte entry a
+  block, the bodies end to end, 8 zero bytes. A dictionary: kind 1, `len`, the values column's
+  size (`u32`), the values column, the codes column; neither is a dictionary (no recursion).
+- An entry: `base` (8), `slope` (8), the body's start (`u32`), width, scheme, second width, a
+  zero byte. A body is only packed values. `For` is `base` = min, `slope` = 0; `Linear` a line
+  `base + slope * j`; both read `base + slope * j + packed[j]`, one formula, so `get` is index,
+  entry, load, with no header parsed and no dispatch between them. `Rle`: `base` = value min,
+  `slope` = runs, the two widths; body: packed starts, packed values. `Delta`: first, least
+  delta; `n - 1` packed. `Delta2`: first, first delta; body: least second delta (8), `n - 2`
+  packed. Fields a scheme does not use are zero and `open` refuses others (one encoding).
   Arithmetic wraps, and "least" is the signed least, so falling columns pack small too.
+- A column of ids (`[u8; W]`, `W` = 32 for `ContentId`): kind 3, `W`, the distinct count
+  (`u32`), the distinct ids in first-use order, then the codes as an integer column with a
+  constant `get`. `open` checks every code is below the count, once.
 - A string column: kind (plain 0, FSST 1, dictionary 2), count (`u32`). Plain: offsets size,
   offsets (`n + 1` ends, an integer column chosen with a constant `get`), bytes. FSST: table
   size, offsets size, the table (count, lengths, symbol bytes), offsets over the codes, codes.
   Dictionary: the strings' size, a plain or FSST column of the distinct strings, the codes.
 
-A block header is 10 to 26 bytes for 1,024 values: at most 0.2 bits a value; the directory 4
-bytes a block.
+An entry is 24 bytes for 1,024 values, 0.19 bits a value; against the earlier 4-byte
+directory and in-block header it costs 1 to 1.5% on `core`'s columns and buys 40% off `get`.
 
 ## Choosing (rule 25: equal input, equal bytes)
 
@@ -89,12 +97,14 @@ real columns and read everything `open` accepts.
 
 ## The floor and the ratio (rule 67)
 
-- `get` on a hot column: the value's cache line, the block header's and the directory's (one
-  line serves 16 blocks): a few nanoseconds. The cost example measures it against a plain
-  array's `get`; the ratio is reported there, not here, until it has run.
-- Whole-block decode: memory bandwidth, about 0.1 ns a value; the horizontal order's vector
-  unpack issues eight scalar loads a group, so expect several times that floor, and the
-  scalar twin about twice the vector.
+Measured on `core` (Apple arm64, the cost example, 2026-11-15):
+
+- `get` on a hot column: floor about 1 ns (a plain array's load, 0.5 ns, plus the entry's,
+  whose address is known first). Measured 1.6 to 1.8 ns for `For`/`Linear` (2.7 to 3.6 before
+  the flat directory): 1.6 to 1.8 times the floor; what is left is instruction count (bounds
+  checks, the entry's five fields), not loads.
+- Whole-block decode: about 0.1 ns a value. Measured 0.17 ns by the shuffle unpack (0.34 by
+  eight scalar loads a group before; the scalar twin 0.47 to 0.55): 1.7 times the floor.
 - Size: for `For` the entropy of the value range a block; nothing here measures against an
   entropy coder, the ratio to DEFLATE on the plain bytes is printed as a reference only.
 
@@ -105,9 +115,11 @@ real columns and read everything `open` accepts.
   end, disambiguator and tags (about 90 bytes) become columns of 8 to 16 bits a value, many
   runs of zero: an estimated 40 to 50% smaller record, 8.1 MB to about 4.5 MB on `core`.
 - Scope records (`ModuleScope`, a `BindingRow` of about 84 bytes, 64 of them ids): about 15%
-  from the narrow fields alone. The large win needs a dictionary of 32-byte ids (the same
-  `def` and `vis_key` repeat within a record): the next piece, a dictionary over fixed-width
-  byte values beside the `u64` one.
+  from the narrow fields alone. The id dictionary (`enc::ids`) on a synthetic set shaped like
+  `core` (406 records, 102,681 bindings; 15% of defs repeat in a record, 4 `vis_key`s a record:
+  a model, not a measurement) takes the two id columns from 64 to 29 bytes a row: `vis_key`
+  34 times smaller, `def` 1.13 times (ids that do not repeat do not shrink). Measured on real
+  records once a scope record is written as columns.
 - Names (the string tables of both): names repeat; a dictionary of whole strings, its strings
   in FSST, is expected near 3 to 5 times smaller than plain offsets and bytes.
 

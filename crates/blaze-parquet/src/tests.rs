@@ -6,8 +6,11 @@ use std::alloc::Global;
 use blaze_columns::{Batch, Column, Field, Scalar, Texts, Type};
 use blaze_own::Vec;
 
+use blaze_columns::Values;
+use blaze_int::Int;
+
 use crate::{
-    Concat, File, Input, Options, ParquetError, levels,
+    Compression, Concat, Encoding, File, Input, Options, ParquetError, delta, levels, lz4,
     thrift::{In, Struct, zigzag},
     write,
 };
@@ -115,7 +118,7 @@ fn a_truncated_or_deep_footer_is_refused() {
 
 fn encode(values: &[u8], width: u8) -> std::vec::Vec<u8> {
     let mut out = Vec::new_in(Global);
-    levels::encode(&mut out, values, width);
+    levels::encode(&mut out, values.len(), width, |i| u32::from(values[i])).unwrap();
     out.as_slice().to_vec()
 }
 
@@ -331,4 +334,231 @@ fn a_cut_file_is_refused_not_read() {
     moved.extend_from_slice(&file[file.len() - 8 - footer_len..]);
     let read = File::open(&moved, Global).unwrap();
     assert!(read.read_all().is_err());
+}
+
+fn delta_bytes(values: &[i64], narrow: bool) -> std::vec::Vec<u8> {
+    let mut out = Vec::new_in(Global);
+    delta::encode(&mut out, values.len(), narrow, |i| values[i]).unwrap();
+    out.as_slice().to_vec()
+}
+
+fn delta_values(bytes: &[u8], most: usize) -> std::vec::Vec<i64> {
+    let mut out = vec![];
+    let (total, used) = delta::decode(bytes, most, |it| out.push(it)).unwrap();
+    assert_eq!((total, used), (out.len(), bytes.len()));
+    out
+}
+
+#[test]
+fn delta_binary_packed_is_the_specs() {
+    // The spec's 1..=5: header (128, 4, 5, zigzag 1 = 2), then one block: least delta 1
+    // (zigzag 2), four widths of 0 and no miniblock bytes.
+    let got = delta_bytes(&[1, 2, 3, 4, 5], false);
+    assert_eq!(got, [0x80, 0x01, 0x04, 0x05, 0x02, 0x02, 0, 0, 0, 0]);
+    assert_eq!(delta_values(&got, 5), [1, 2, 3, 4, 5]);
+    // 7, 5, 3, 1, 2, 3, 4, 5: deltas -2 -2 -2 1 1 1 1, least -2 (zigzag 3), the rest 0 0 0 3 3 3 3
+    // at width 2 in a whole miniblock of 32 (8 bytes), its last bytes zero.
+    let got = delta_bytes(&[7, 5, 3, 1, 2, 3, 4, 5], false);
+    assert_eq!(got[..10], [0x80, 0x01, 0x04, 0x08, 0x0E, 0x03, 2, 0, 0, 0]);
+    assert_eq!(got[10..], [0b1100_0000, 0b0011_1111, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(delta_values(&got, 8), [7, 5, 3, 1, 2, 3, 4, 5]);
+    // None, and one.
+    assert_eq!(delta_values(&delta_bytes(&[], false), 0), [] as [i64; 0]);
+    assert_eq!(delta_values(&delta_bytes(&[-9], false), 1), [-9]);
+}
+
+#[test]
+fn delta_round_trips_across_blocks_and_extremes() {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let wide: std::vec::Vec<i64> =
+        (0..1000).map(|i| if i % 97 == 0 { i64::MIN } else if i % 89 == 0 { i64::MAX } else { next().cast_signed() >> (i % 60) }).collect();
+    assert_eq!(delta_values(&delta_bytes(&wide, false), wide.len()), wide);
+    let rising: std::vec::Vec<i64> = (0..777).map(|i| 1_700_000_000_000_000_000 + i * 1_000 + (i % 13)).collect();
+    let got = delta_bytes(&rising, false);
+    assert!(got.len() < rising.len() * 2, "{} bytes for {} rising values", got.len(), rising.len());
+    assert_eq!(delta_values(&got, rising.len()), rising);
+    // INT32s wrap in 32 bits: the reader's 64-bit sums keep the right low half.
+    let narrow: std::vec::Vec<i64> = (0..300).map(|i| i64::from(if i % 2 == 0 { i32::MIN } else { i32::MAX }) + i).collect();
+    let back = delta_values(&delta_bytes(&narrow, true), narrow.len());
+    let low: std::vec::Vec<i32> = back.iter().map(|it| it.truncate_to::<i32>()).collect();
+    let want: std::vec::Vec<i32> = narrow.iter().map(|it| it.truncate_to::<i32>()).collect();
+    assert_eq!(low, want);
+    // More values than the page holds, and bytes cut short, are refused.
+    let five = delta_bytes(&[1, 2, 3, 4, 50], false);
+    assert!(delta::decode(&five, 4, |_| {}).is_err());
+    assert!(delta::decode(&five[..five.len() - 1], 5, |_| {}).is_err());
+}
+
+#[test]
+fn lz4_round_trips_and_refuses_what_lies() {
+    let mut cases: std::vec::Vec<std::vec::Vec<u8>> = vec![vec![], b"a".to_vec(), b"abcdefghijkl".to_vec(), vec![7; 100_000]];
+    cases.push((0..70_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect());
+    cases.push(b"crate::module::function_".repeat(500));
+    let mut seed = 1u64;
+    cases.push(
+        (0..5000)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (seed >> 56).truncate_to::<u8>()
+            })
+            .collect(),
+    );
+    for case in &cases {
+        let mut packed = Vec::new_in(Global);
+        lz4::compress(case, &mut packed);
+        assert!(packed.len() <= lz4::bound(case.len()));
+        let mut back = vec![0; case.len()];
+        lz4::decompress(&packed, &mut back).unwrap();
+        assert_eq!(&back, case);
+        if case.len() > 1000 {
+            let mut short = vec![0; case.len() - 1];
+            assert!(lz4::decompress(&packed, &mut short).is_err());
+            assert!(lz4::decompress(&packed[..packed.len() / 2], &mut back).is_err());
+        }
+    }
+    let mut repeat = Vec::new_in(Global);
+    lz4::compress(&[7; 100_000], &mut repeat);
+    assert!(repeat.len() < 500, "{} bytes for 100 000 sevens", repeat.len());
+    // An offset before the start.
+    assert!(lz4::decompress(&[0x10, b'a', 0x05, 0x00], &mut [0; 5]).is_err());
+}
+
+/// Row `at` of `values` as text.
+fn cell(values: &Values<Global>, at: usize) -> String {
+    match values {
+        Values::Bool(it) => it[at].to_string(),
+        Values::I32(it) => it[at].to_string(),
+        Values::U16(it) => it[at].to_string(),
+        Values::U32(it) => it[at].to_string(),
+        Values::I64(it) => it[at].to_string(),
+        Values::U64(it) => it[at].to_string(),
+        Values::F64(it) => format!("{:x}", it[at].to_bits()),
+        Values::Text(it) => format!("{:?}", it.get(at)),
+        Values::Dict { keys, values } => format!("{:?}", values.get(usize::try_from(keys[at]).unwrap())),
+    }
+}
+
+/// Every row of `batches`, each column as text.
+fn rows(batches: &[Batch<Global>]) -> std::vec::Vec<String> {
+    let mut out = vec![];
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let mut line = String::new();
+            for column in batch.columns() {
+                if column.is_null(row) {
+                    line.push_str("NULL");
+                } else if let Some(lists) = column.lists() {
+                    let range = lists.row(row).unwrap();
+                    let items: std::vec::Vec<_> = range.map(|at| cell(lists.elements(), at)).collect();
+                    line.push_str(&format!("{items:?}"));
+                } else {
+                    line.push_str(&cell(column.buffer(), row));
+                }
+                line.push('|');
+            }
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// `n` rows of every type, as a profile's: rising times, a few names, paths that share
+/// prefixes, nulls and empty lists.
+fn many(n: usize) -> Batch<Global> {
+    let names: std::vec::Vec<String> = (0..n).map(|i| format!("blaze_query::passes::item_{}", (i * 7) % 40)).collect();
+    let mut stack_texts = Texts::new_in(Global);
+    let mut stack_offsets = Vec::new_in(Global);
+    stack_offsets.push(0u32);
+    let mut pcs = Vec::new_in(Global);
+    let mut pc_offsets = Vec::new_in(Global);
+    pc_offsets.push(0u32);
+    for i in 0..n {
+        for depth in 0..i % 4 {
+            stack_texts.push(&format!("crates/blaze-front/src/f{}.rs", (i + depth) % 9));
+        }
+        stack_offsets.push(u32::try_from(stack_texts.len()).unwrap());
+        for depth in 0..(i % 3) {
+            pcs.push(0x1_0000_0000u64 + u64::try_from(i * 16 + depth).unwrap());
+        }
+        pc_offsets.push(u32::try_from(pcs.len()).unwrap());
+    }
+    let stack_valid: std::vec::Vec<bool> = (0..n).map(|i| i % 11 != 3).collect();
+    let mut kinds = Texts::new_in(Global);
+    for kind in ["span", "event", "counter"] {
+        kinds.push(kind);
+    }
+    let columns = [
+        Column::values((0..n).map(|i| i % 3 == 0 || i % 50 > 40), Global),
+        Column::options((0..n).map(|i| (i % 5 != 0).then(|| i32::try_from(i * 7919 % 1000).unwrap() - 500)), Global),
+        Column::values((0..n).map(|i| 1_700_000_000_000_000_000i64 + i64::try_from(i * 1_000 + i % 13).unwrap()), Global),
+        Column::values((0..n).map(|i| u16::try_from(i % 7).unwrap()), Global),
+        Column::options((0..n).map(|i| (i % 9 != 0).then_some(4242u32)), Global),
+        Column::options((0..n).map(|i| (i % 17 != 0).then(|| u64::MAX - u64::try_from(i / 100).unwrap())), Global),
+        Column::options((0..n).map(|i| (i % 6 != 0).then(|| f64::from(u32::try_from(i % 300).unwrap()) / 8.0)), Global),
+        Column::opt_texts(&names.iter().enumerate().map(|(i, it)| (i % 13 != 0).then_some(it.as_str())).collect::<std::vec::Vec<_>>(), Global),
+        Column::dict((0..n).map(|i| Some(u32::try_from(i % 3).unwrap())), kinds, Global).unwrap(),
+        Column::list(stack_offsets, Some(Vec::from_iter_in(stack_valid, Global)), Values::Text(stack_texts)).unwrap(),
+        Column::list(pc_offsets, None, Values::U64(pcs)).unwrap(),
+    ];
+    Batch::try_new(Vec::from_iter_in(fields(), Global), Vec::from_iter_in(columns, Global)).unwrap()
+}
+
+const ENCODINGS: [Encoding; 5] = [Encoding::Auto, Encoding::Plain, Encoding::Dictionary, Encoding::Delta, Encoding::DeltaLength];
+const CODECS: [Compression; 3] = [Compression::None, Compression::Lz4, Compression::Zstd { level: 3 }];
+
+#[test]
+fn every_encoding_and_codec_reads_back_as_written() {
+    let small = [three(true)];
+    let big = [many(5000)];
+    for encoding in ENCODINGS {
+        for compression in CODECS {
+            for (batches, page_rows) in [(&small[..], 1), (&big[..], 700)] {
+                let options = Options { row_group_rows: 2000, page_rows, encoding, compression, ..Options::DEFAULT };
+                let file = write(&fields(), batches, &[], options, Global).unwrap();
+                let read = File::open(&file, Global).unwrap();
+                let got = rows(&read.read_all().unwrap());
+                assert_eq!(got, rows(batches), "{encoding:?} {compression:?} pages of {page_rows}");
+            }
+        }
+    }
+}
+
+#[test]
+fn auto_picks_the_encoding_each_column_suits() {
+    let file = write(&fields(), &[many(5000)], &[], Options { row_group_rows: 10_000, ..Options::DEFAULT }, Global).unwrap();
+    let read = File::open(&file, Global).unwrap();
+    let mut got = vec![];
+    for chunk in read.meta().row_groups[0].columns.iter() {
+        let meta = chunk.meta.as_ref().unwrap();
+        got.push((meta.path.last().unwrap().as_str().to_owned(), meta.encodings.as_slice().to_vec()));
+    }
+    let want: std::vec::Vec<(&str, std::vec::Vec<i32>)> = vec![
+        ("flag", vec![3]),
+        ("small", vec![3, 5]),
+        ("t_ns", vec![3, 5]),
+        ("depth", vec![3, 0, 8]),
+        ("pid", vec![3, 0, 8]),
+        // Slowly falling from u64::MAX: deltas of 0 and -1 pack smaller than a dictionary.
+        ("build_id", vec![3, 5]),
+        ("ratio", vec![3, 0, 8]),
+        ("name", vec![3, 0, 8]),
+        ("kind", vec![3, 0, 8]),
+        ("element", vec![3, 0, 8]),
+        ("element", vec![3, 5]),
+    ];
+    let got: std::vec::Vec<(&str, std::vec::Vec<i32>)> = got.iter().map(|(name, it)| (name.as_str(), it.clone())).collect();
+    assert_eq!(got, want);
+    // A dictionary past its bound gives way to the best encoding that is not one.
+    let options = Options { row_group_rows: 10_000, page_rows: 500, dictionary_bytes: 16, ..Options::DEFAULT };
+    let file = write(&fields(), &[many(5000)], &[], options, Global).unwrap();
+    let read = File::open(&file, Global).unwrap();
+    let name = read.meta().row_groups[0].columns[7].meta.as_ref().unwrap();
+    assert!(!name.encodings.contains(&8), "{:?}", name.encodings.as_slice());
+    assert_eq!(rows(&read.read_all().unwrap()), rows(&[many(5000)]));
 }

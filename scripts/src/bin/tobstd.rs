@@ -51,6 +51,24 @@ const DOC: &str = r#"tobstd: moves one crate from `std` onto bstd and blaze-own 
                        the table moves to blaze_own, or that with `A` before it) becomes
                        `$R.clone_in(<value>)`, threading `value` as add-arg does; any other is
                        `$R.clone()` again and a wall `kept-clone` naming its type
+              fmt      the format macros (`format!`, `write!`, `writeln!`, `print!`, `println!`,
+                       `eprint!`, `eprintln!`, `format_args!`) to blaze-text's chain
+                       (`out.str("x = ").int(x)`), outside tests: the format string is parsed
+                       (pieces, `{}`, `{0}`, `{name}`, fill, alignment, `#`, `0`, width,
+                       precision, `x X b ?`); a piece is `.str(..)`; an argument is the writer
+                       its text shows (`.str` of a literal, `.int` of an integer literal, an
+                       `as` cast or `.len()`), else `.show(&e)`; `{:x}` `.hex`, `{:08x}`
+                       `.hex_fixed`, `{:.N}` `.float_fixed`, columns `.right`/`.left`/
+                       `.int_padded`/`.int_zeros`. `write!(dst, ..)` is a chain on `dst`;
+                       `format!` a block that fills `blaze_own::String::new_in(<value>)` when
+                       the value is in scope. Each other site is classed: `display-impl`
+                       (`write!` in a `Display` or `Debug` impl: the change is `impl Show`),
+                       `no-sink` (print macros: bstd's `Out` is no `Put`), `add-arg` (a
+                       `format!` with no allocator in scope), `no-form: <why>`, `no-dep` (the
+                       crate does not depend on blaze-text), `no-use` (no top-level `use`
+                       for the trait's import), or an add-arg wall. Without `apply` it only
+                       classifies; the summary's `sites` are the classes' counts
+    apply     fmt: rewrite (false: only classify)
     steps     settle's most checks (8)
     value     the name threaded ("alloc"; "fs", "net", "clock" for a capability)
     type      the parameter's type ("blaze_own::Alloc<'_>", a one-word `Copy` handle; "&bstd::fs::Fs"
@@ -143,6 +161,8 @@ struct Args {
     roots: Vec<String>,
     cargo: String,
     root: String,
+    /// fmt: rewrite, or only classify (the default).
+    apply: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +171,7 @@ enum Mode {
     AddArg,
     Settle,
     ShareClone,
+    Fmt,
 }
 
 impl Mode {
@@ -160,6 +181,7 @@ impl Mode {
             Mode::AddArg => "add-arg",
             Mode::Settle => "settle",
             Mode::ShareClone => "share-clone",
+            Mode::Fmt => "fmt",
         }
     }
 }
@@ -173,14 +195,15 @@ const SHARE_USE: &str = "use blaze_own::Share as _;";
 
 impl Input for Args {
     const FIELDS: &'static [&'static str] =
-        &["crate", "mode", "steps", "value", "type", "generic", "entry", "roots", "cargo", "root"];
+        &["crate", "mode", "steps", "value", "type", "generic", "entry", "roots", "cargo", "root", "apply"];
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
-        let mode = match f.one_of("mode", &["rename", "add-arg", "settle", "share-clone"], None)?.as_str() {
+        let mode = match f.one_of("mode", &["rename", "add-arg", "settle", "share-clone", "fmt"], None)?.as_str() {
             "rename" => Mode::Rename,
             "add-arg" => Mode::AddArg,
             "settle" => Mode::Settle,
-            _ => Mode::ShareClone,
+            "share-clone" => Mode::ShareClone,
+            _ => Mode::Fmt,
         };
         let steps = f.int("steps", Some(8))?;
         let steps = usize::try_from(steps).map_err(|_| InputError(format!("{} is {steps}: a count of checks", f.at("steps"))))?;
@@ -209,6 +232,7 @@ impl Input for Args {
             roots: if roots.is_empty() { vec!["core".to_owned(), "blaze_own".to_owned()] } else { roots },
             cargo: f.str("cargo", Some("/Volumes/Projects/blaze-int-1112-notes/wtcargo.sh"))?,
             root: f.str("root", Some("."))?,
+            apply: f.bool("apply", Some(false))?,
         })
     }
 }
@@ -1565,6 +1589,698 @@ fn settle(grep: &Grep<'_>, a: &Args, root: &Path, own: Option<&BTreeSet<String>>
     Ok(())
 }
 
+// fmt: the format macros to blaze-text's chain of typed writers.
+
+/// The macros `fmt` reads.
+const FMT_MACROS: &[&str] = &["format", "write", "writeln", "print", "println", "eprint", "eprintln", "format_args"];
+/// The trait whose writers a chain calls, imported by `fmt` where it rewrites.
+const WRITES_USE: &str = "use blaze_text::Writes as _;";
+
+/// Which argument a placeholder or a count names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArgRef {
+    /// `{}`: the next positional one.
+    Next,
+    /// `{0}`.
+    Index(usize),
+    /// `{name}`: a named argument, or the variable it captures.
+    Name(String),
+}
+
+/// A width or precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Count {
+    N(usize),
+    /// `name$` or `0$`.
+    Of(ArgRef),
+    /// `.*`.
+    Star,
+}
+
+/// A placeholder's `:` part.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Spec {
+    fill: Option<char>,
+    align: Option<char>,
+    sign: bool,
+    alt: bool,
+    zero: bool,
+    width: Option<Count>,
+    precision: Option<Count>,
+    ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    /// A literal piece's source text, its escapes as written and `{{`, `}}` undone.
+    Lit(String),
+    Arg(ArgRef, Spec),
+}
+
+/// The pieces of a format string's source text (between its quotes; `raw` for `r"..."`).
+fn parse_format(src: &str, raw: bool) -> Result<Vec<Piece>, String> {
+    let c: Vec<char> = src.chars().collect();
+    let mut pieces = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '\\' if !raw => {
+                // An escape is kept whole: `\u{..}` holds braces.
+                lit.push('\\');
+                i += 1;
+                if c.get(i) == Some(&'u') && c.get(i + 1) == Some(&'{') {
+                    while i < c.len() && c[i] != '}' {
+                        lit.push(c[i]);
+                        i += 1;
+                    }
+                }
+                if let Some(&next) = c.get(i) {
+                    lit.push(next);
+                    i += 1;
+                }
+            }
+            '{' if c.get(i + 1) == Some(&'{') => {
+                lit.push('{');
+                i += 2;
+            }
+            '}' if c.get(i + 1) == Some(&'}') => {
+                lit.push('}');
+                i += 2;
+            }
+            '}' => return Err("a lone `}`".to_owned()),
+            '{' => {
+                let close = (i + 1..c.len()).find(|&j| c[j] == '}').ok_or("an unclosed `{`")?;
+                let inner: String = c[i + 1..close].iter().collect();
+                if !lit.is_empty() {
+                    pieces.push(Piece::Lit(std::mem::take(&mut lit)));
+                }
+                let (name, spec) = inner.split_once(':').unwrap_or((&inner, ""));
+                pieces.push(Piece::Arg(arg_ref(name.trim())?, parse_spec(spec)?));
+                i = close + 1;
+            }
+            ch => {
+                lit.push(ch);
+                i += 1;
+            }
+        }
+    }
+    if !lit.is_empty() {
+        pieces.push(Piece::Lit(lit));
+    }
+    Ok(pieces)
+}
+
+fn arg_ref(name: &str) -> Result<ArgRef, String> {
+    if name.is_empty() {
+        return Ok(ArgRef::Next);
+    }
+    if let Ok(n) = name.parse::<usize>() {
+        return Ok(ArgRef::Index(n));
+    }
+    match ident_len(name.as_bytes()) == name.len() {
+        true => Ok(ArgRef::Name(name.to_owned())),
+        false => Err(format!("`{name}` names no argument")),
+    }
+}
+
+/// `[[fill]align][sign]['#']['0'][width]['.' precision][type]`.
+fn parse_spec(spec: &str) -> Result<Spec, String> {
+    let c: Vec<char> = spec.chars().collect();
+    let mut s = Spec::default();
+    let is_align = |ch: &char| matches!(ch, '<' | '>' | '^');
+    let mut i = 0;
+    if c.get(1).is_some_and(is_align) {
+        s.fill = c.first().copied();
+        s.align = c.get(1).copied();
+        i = 2;
+    } else if c.first().is_some_and(is_align) {
+        s.align = c.first().copied();
+        i = 1;
+    }
+    if matches!(c.get(i), Some('+' | '-')) {
+        s.sign = true;
+        i += 1;
+    }
+    if c.get(i) == Some(&'#') {
+        s.alt = true;
+        i += 1;
+    }
+    if c.get(i) == Some(&'0') && c.get(i + 1) != Some(&'$') {
+        s.zero = true;
+        i += 1;
+    }
+    let (width, at) = count_at(&c, i)?;
+    s.width = width;
+    i = at;
+    if c.get(i) == Some(&'.') {
+        i += 1;
+        if c.get(i) == Some(&'*') {
+            s.precision = Some(Count::Star);
+            i += 1;
+        } else {
+            let (p, at) = count_at(&c, i)?;
+            s.precision = Some(p.ok_or("a `.` with no precision")?);
+            i = at;
+        }
+    }
+    s.ty = c[i..].iter().collect();
+    match s.ty.as_str() {
+        "" | "?" | "x?" | "X?" | "x" | "X" | "b" | "o" | "e" | "E" => Ok(s),
+        ty => Err(format!("`{ty}` is no format type")),
+    }
+}
+
+/// A count at `c[i..]`: digits, or digits or a name before `$`; none if neither.
+fn count_at(c: &[char], i: usize) -> Result<(Option<Count>, usize), String> {
+    let mut j = i;
+    while j < c.len() && (c[j].is_ascii_alphanumeric() || c[j] == '_') {
+        j += 1;
+    }
+    let word: String = c[i..j].iter().collect();
+    if j > i && c.get(j) == Some(&'$') {
+        return Ok((Some(Count::Of(arg_ref(&word)?)), j + 1));
+    }
+    // No `$`: leading digits are the count, and what follows is the type.
+    let digits = word.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return Ok((None, i));
+    }
+    let n: usize = word[..digits].parse().map_err(|_| "a count past usize".to_owned())?;
+    Ok((Some(Count::N(n)), i + digits))
+}
+
+/// Past the string literal starting at `b[i]` (`"`).
+fn skip_str(b: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return j + 1,
+            _ => j += 1,
+        }
+    }
+    b.len()
+}
+
+/// Whether a raw string (`r"`, `r#"`, `br"`) starts at `b[i]` (`r`).
+fn raw_at(b: &[u8], i: usize) -> bool {
+    let ident = |at: usize| b[at].is_ascii_alphanumeric() || b[at] == b'_';
+    let alone = i == 0 || !ident(i - 1) || (b[i - 1] == b'b' && (i < 2 || !ident(i - 2)));
+    let hashes = b[i + 1..].iter().take_while(|it| **it == b'#').count();
+    alone && b.get(i + 1 + hashes) == Some(&b'"')
+}
+
+fn skip_raw(b: &[u8], i: usize) -> usize {
+    let hashes = b[i + 1..].iter().take_while(|it| **it == b'#').count();
+    let mut j = i + 2 + hashes;
+    while j < b.len() {
+        if b[j] == b'"' && b[j + 1..].iter().take(hashes).filter(|it| **it == b'#').count() == hashes {
+            return j + 1 + hashes;
+        }
+        j += 1;
+    }
+    b.len()
+}
+
+/// Past the char literal at `b[i]` (`'`), or past the `'` of a lifetime.
+fn skip_char(b: &[u8], i: usize) -> usize {
+    if b.get(i + 1) == Some(&b'\\') {
+        return b[i + 2..].iter().position(|it| *it == b'\'').map_or(b.len(), |p| i + 3 + p);
+    }
+    let len = match b.get(i + 1) {
+        Some(x) if *x >= 0xf0 => 4,
+        Some(x) if *x >= 0xe0 => 3,
+        Some(x) if *x >= 0xc0 => 2,
+        _ => 1,
+    };
+    match b.get(i + 1 + len) {
+        Some(b'\'') => i + 2 + len,
+        _ => i + 1,
+    }
+}
+
+/// A macro call's arguments: its tokens split at top-level commas, each trimmed.
+fn split_args(inner: &str) -> Vec<String> {
+    let b = inner.as_bytes();
+    let mut out = Vec::new();
+    let (mut depth, mut from, mut i) = (0i32, 0, 0);
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'"' => {
+                i = skip_str(b, i);
+                continue;
+            }
+            b'r' if raw_at(b, i) => {
+                i = skip_raw(b, i);
+                continue;
+            }
+            b'\'' => {
+                i = skip_char(b, i);
+                continue;
+            }
+            b',' if depth == 0 => {
+                out.push(inner[from..i].trim().to_owned());
+                from = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = inner[from..].trim();
+    if !last.is_empty() {
+        out.push(last.to_owned());
+    }
+    out
+}
+
+/// A string literal's body and delimiters.
+struct StrLit {
+    body: String,
+    open: String,
+    close: String,
+    raw: bool,
+}
+
+fn str_lit(text: &str) -> Option<StrLit> {
+    if let Some(rest) = text.strip_prefix('r') {
+        let hashes = "#".repeat(rest.bytes().take_while(|b| *b == b'#').count());
+        let (open, close) = (format!("r{hashes}\""), format!("\"{hashes}"));
+        let body = text.strip_prefix(open.as_str())?.strip_suffix(close.as_str())?;
+        return Some(StrLit { body: body.to_owned(), open, close, raw: true });
+    }
+    let body = text.strip_prefix('"')?.strip_suffix('"')?;
+    Some(StrLit { body: body.to_owned(), open: "\"".to_owned(), close: "\"".to_owned(), raw: false })
+}
+
+/// What an argument's text shows of its type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Syn {
+    Str,
+    Char,
+    Bool,
+    Int,
+    Float,
+    Other,
+}
+
+const INT_TYPES: &[&str] = &["u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize"];
+
+fn syntax_of(e: &str) -> Syn {
+    let e = e.trim();
+    if e.starts_with('"') || e.starts_with("r\"") || e.starts_with("r#") {
+        return Syn::Str;
+    }
+    if e.len() >= 3 && e.starts_with('\'') && e.ends_with('\'') {
+        return Syn::Char;
+    }
+    if e == "true" || e == "false" {
+        return Syn::Bool;
+    }
+    let number = e.strip_prefix('-').unwrap_or(e);
+    if number.starts_with(|c: char| c.is_ascii_digit()) && number.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.') {
+        let float = number.ends_with("f32") || number.ends_with("f64") || (number.contains('.') && !number.starts_with("0x"));
+        return if float { Syn::Float } else { Syn::Int };
+    }
+    if let Some((_, ty)) = e.rsplit_once(" as ") {
+        let ty = ty.trim();
+        if INT_TYPES.contains(&ty) {
+            return Syn::Int;
+        }
+        if ty == "f32" || ty == "f64" {
+            return Syn::Float;
+        }
+    }
+    if e.ends_with(".len()") || e.ends_with(".count()") || e.ends_with(".capacity()") {
+        return Syn::Int;
+    }
+    Syn::Other
+}
+
+/// A path, a field chain or a literal: evaluated twice it is the same, and it needs no parentheses.
+fn simple_expr(e: &str) -> bool {
+    let e = e.trim().trim_start_matches('&');
+    syntax_of(e) != Syn::Other || (!e.is_empty() && e.split('.').all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')) && !e.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+fn reference(e: &str) -> String {
+    if simple_expr(e) { format!("&{e}") } else { format!("&({e})") }
+}
+
+/// The writer for one argument and its spec: `.int(x)`, or why there is none.
+fn writer(e: &str, s: &Spec, width: Option<String>, prec: Option<String>) -> Result<String, String> {
+    let syn = syntax_of(e);
+    let r = reference(e);
+    let no = |why: &str| Err(why.to_owned());
+    if s.sign {
+        return no("a sign flag");
+    }
+    match s.ty.as_str() {
+        "?" | "x?" | "X?" => {
+            return match (syn, s.alt || width.is_some() || prec.is_some()) {
+                (Syn::Str, false) => Ok(format!(".escaped({e})")),
+                _ => no("`{:?}`: blaze-text has no debug adapter"),
+            };
+        }
+        "x" | "X" | "b" => {
+            if prec.is_some() {
+                return no("a precision on an integer");
+            }
+            let prefix = match (s.alt, s.ty.as_str()) {
+                (false, _) => "",
+                (true, "b") => ".str(\"0b\")",
+                (true, _) => ".str(\"0x\")",
+            };
+            let plain = match s.ty.as_str() {
+                "x" => "hex",
+                "X" => "hex_upper",
+                _ => "bin",
+            };
+            return match (width, s.zero, s.align, s.fill.unwrap_or(' ')) {
+                (None, _, None, _) => Ok(format!("{prefix}.{plain}({e})")),
+                (Some(w), true, None, _) if s.ty != "X" => {
+                    // `{:#010x}`: the width holds the prefix.
+                    let digits = match (s.alt, w.parse::<usize>()) {
+                        (false, _) => w,
+                        (true, Ok(n)) => n.saturating_sub(2).to_string(),
+                        (true, Err(_)) => format!("{w} - 2"),
+                    };
+                    Ok(format!("{prefix}.{}({e}, {digits})", if s.ty == "b" { "bin_fixed" } else { "hex_fixed" }))
+                }
+                (Some(w), false, None | Some('>'), ' ') if s.ty == "x" && !s.alt => Ok(format!(".right(&blaze_text::Hex({e}), {w})")),
+                _ => no("a padded hex or binary form blaze-text has no writer for (upper-case, left, centred or filled)"),
+            };
+        }
+        "" => {}
+        _ => return no("`{:o}` or `{:e}`: blaze-text has no octal or exponent writer"),
+    }
+    if let Some(p) = prec {
+        if matches!(syn, Syn::Str | Syn::Char | Syn::Bool | Syn::Int) {
+            return no("a precision on a non-float (it truncates a string)");
+        }
+        if s.zero {
+            return no("a zero-padded float");
+        }
+        let fixed = format!("blaze_text::Fixed({e}, {p})");
+        return match (width, s.align, s.fill.unwrap_or(' ')) {
+            (None, _, _) => Ok(format!(".float_fixed({e}, {p})")),
+            (Some(w), None | Some('>'), ' ') => Ok(format!(".right(&{fixed}, {w})")),
+            (Some(w), Some('<'), ' ') => Ok(format!(".left(&{fixed}, {w})")),
+            _ => no("a float in a centred or filled column"),
+        };
+    }
+    if s.alt {
+        return no("`#` on a plain `{}`");
+    }
+    let Some(w) = width else {
+        return match syn {
+            Syn::Str => Ok(format!(".str({e})")),
+            Syn::Char => Ok(format!(".char({e})")),
+            Syn::Bool => Ok(format!(".bool({e})")),
+            Syn::Int => Ok(format!(".int({e})")),
+            Syn::Float => no("`{}` of a float: blaze-text's float writer and `Show` give the `{:?}` form (`1.0`), Display gives `1`"),
+            Syn::Other => Ok(format!(".show({r})")),
+        };
+    };
+    if s.zero {
+        return match (syn, s.align) {
+            (Syn::Int | Syn::Other, None) => Ok(format!(".int_zeros({e}, {w})")),
+            _ => no("a zero-padded non-integer"),
+        };
+    }
+    match (s.align, s.fill.unwrap_or(' '), syn) {
+        (Some('>'), ' ', _) | (None, ' ', Syn::Int) => Ok(format!(".right({r}, {w})")),
+        (Some('<'), ' ', _) | (None, ' ', Syn::Str) => Ok(format!(".left({r}, {w})")),
+        (Some('>') | None, fill, Syn::Int) => Ok(format!(".int_padded({e}, {w}, {fill:?})")),
+        (None, _, _) => no("a column whose side depends on the argument's type"),
+        _ => no("a centred or filled column"),
+    }
+}
+
+/// `name = expr`: the name and the expression.
+fn named_arg(arg: &str) -> Option<(String, String)> {
+    let n = ident_len(arg.as_bytes());
+    let rest = arg[n..].trim_start();
+    (n > 0 && rest.starts_with('=') && !rest.starts_with("==")).then(|| (arg[..n].to_owned(), rest[1..].trim().to_owned()))
+}
+
+/// The chain for a format string and its arguments (`.str("x = ").int(x)`), or why not.
+fn chain(fmt_arg: &str, rest: &[String], newline: bool) -> Result<String, String> {
+    let lit = str_lit(fmt_arg.trim()).ok_or("a format string that is not a literal")?;
+    let mut pieces = parse_format(&lit.body, lit.raw)?;
+    // `writeln!`'s line feed joins the last literal piece, or is a piece of its own.
+    let raw_tail = lit.raw && newline;
+    if newline && !lit.raw {
+        match pieces.last_mut() {
+            Some(Piece::Lit(text)) => text.push_str("\\n"),
+            _ => pieces.push(Piece::Lit("\\n".to_owned())),
+        }
+    }
+    let mut positional = Vec::new();
+    let mut named: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for (order, arg) in rest.iter().enumerate() {
+        match named_arg(arg) {
+            Some((n, e)) => {
+                named.insert(n, (order, e));
+            }
+            None => positional.push((order, arg.clone())),
+        }
+    }
+    // An argument as (its order among the given ones, or none for a captured variable; its text).
+    let resolve = |r: &ArgRef, next: &mut usize| -> Result<(Option<usize>, String), String> {
+        let at = |n: usize| positional.get(n).map(|(o, e)| (Some(*o), e.clone())).ok_or_else(|| format!("argument {n} is not given"));
+        match r {
+            ArgRef::Next => {
+                *next += 1;
+                at(*next - 1)
+            }
+            ArgRef::Index(n) => at(*n),
+            ArgRef::Name(name) => Ok(named.get(name).map_or((None, name.clone()), |(o, e)| (Some(*o), e.clone()))),
+        }
+    };
+    let mut next = 0;
+    let mut out = String::new();
+    let mut seen: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut last_order = None;
+    for piece in &pieces {
+        match piece {
+            Piece::Lit(text) => out.push_str(&format!(".str({}{text}{})", lit.open, lit.close)),
+            Piece::Arg(r, spec) => {
+                let count = |c: &Option<Count>, next: &mut usize| -> Result<Option<String>, String> {
+                    match c {
+                        None => Ok(None),
+                        Some(Count::N(n)) => Ok(Some(n.to_string())),
+                        Some(Count::Star) => Err("a `.*` precision".to_owned()),
+                        Some(Count::Of(r)) => {
+                            let (_, e) = resolve(r, next)?;
+                            if simple_expr(&e) { Ok(Some(e)) } else { Err("a width or precision from an expression".to_owned()) }
+                        }
+                    }
+                };
+                let width = count(&spec.width, &mut next)?;
+                let prec = count(&spec.precision, &mut next)?;
+                let (order, e) = resolve(r, &mut next)?;
+                if let Some(o) = order
+                    && !simple_expr(&e)
+                {
+                    // Rust evaluates every argument once, in the order given, before writing.
+                    *seen.entry(o).or_default() += 1;
+                    if seen[&o] > 1 || last_order.is_some_and(|l| l > o) {
+                        return Err("an expression written twice or out of its order".to_owned());
+                    }
+                    last_order = Some(o);
+                }
+                out.push_str(&writer(&e, spec, width, prec)?);
+            }
+        }
+    }
+    if raw_tail {
+        out.push_str(".byte(b'\\n')");
+    }
+    Ok(out)
+}
+
+/// A rule for the node of `kind` at bytes `start..end` of `text` (lines from 0, columns in
+/// characters), fixed to `fix`.
+fn node_at_rule(id: String, kind: &str, text: &str, start: usize, end: usize, fix: String) -> Option<Rule> {
+    let point = |at: usize| -> Option<J> {
+        let before = text.get(..at)?;
+        let line_start = before.rfind('\n').map_or(0, |n| n + 1);
+        Some(o(&[("line", J::N(before.matches('\n').count())), ("column", J::N(before[line_start..].chars().count()))]))
+    };
+    let rule = o(&[("kind", s(kind)), ("range", o(&[("start", point(start)?), ("end", point(end)?)]))]);
+    Some(Rule { id, rule, constraints: None, fix: Some(fix), transform: None })
+}
+
+/// Whether a file is a test's or an example's by its path.
+fn test_path(file: &str) -> bool {
+    let parts: Vec<&str> = file.split('/').collect();
+    parts.iter().any(|p| matches!(*p, "tests" | "examples" | "benches"))
+        || parts.last().is_some_and(|f| *f == "tests.rs" || *f == "test.rs" || f.ends_with("_tests.rs") || f.ends_with("_test.rs"))
+}
+
+/// `fmt`: each format macro's class, and with `apply`, the rewrite of those that have one.
+fn run_fmt(grep: &Grep<'_>, a: &Args, files: &[String], manifest: &str, out: &mut Summary) -> Result<(), ToolError> {
+    let texts = texts_of(grep.dir, files)?;
+    let ctx = read_context(grep, files, &texts)?;
+    let q = |id: &str, rule: J, constraints: Option<J>| Rule { id: id.to_owned(), rule, constraints, fix: None, transform: None };
+    let mac = o(&[("kind", s("macro_invocation"))]);
+    let m_is_macro = Some(o(&[("M", mac.clone())]));
+    let rules = vec![
+        q("site", o(&[("kind", s("macro_invocation")), ("has", o(&[("field", s("macro")), ("regex", s(&format!("^((std|core|alloc)::)?({})$", FMT_MACROS.join("|"))))]))]), None),
+        q("try", o(&[("kind", s("try_expression")), ("has", mac.clone())]), None),
+        q("unwrap", o(&[("pattern", s("$M.unwrap()"))]), m_is_macro.clone()),
+        q("expect", o(&[("pattern", s("$M.expect($E)"))]), m_is_macro.clone()),
+        q("let", o(&[("pattern", s("let _ = $M;"))]), m_is_macro),
+        q("test-mod", o(&[("kind", s("mod_item")), ("has", o(&[("field", s("name")), ("regex", s("^tests?$"))]))]), None),
+        q("first-use", o(&[("all", J::A(vec![
+            o(&[("kind", s("use_declaration"))]),
+            o(&[("inside", o(&[("kind", s("source_file"))]))]),
+            o(&[("not", o(&[("follows", o(&[("stopBy", s("end")), ("kind", s("use_declaration"))]))]))]),
+        ]))]), None),
+    ];
+    let found = grep.query(&rules, files)?;
+    // A wrapper (`?`, `.unwrap()`, `.expect(..)`, `let _ = ..;`) by its macro's place: its node's kind and range.
+    let mut wraps: BTreeMap<(String, usize), (&'static str, usize, usize)> = BTreeMap::new();
+    let mut test_mods: Vec<(String, usize, usize)> = Vec::new();
+    let mut with_use = BTreeSet::new();
+    for m in &found {
+        let text = texts.get(&m.file).map_or("", String::as_str);
+        let inner_start = |prefix: &str| text.get(m.start..).map(|t| m.start + (t.len() - t.trim_start_matches(prefix).trim_start().len()));
+        match m.rule.as_str() {
+            "try" => {
+                wraps.insert((m.file.clone(), m.start), ("try_expression", m.start, m.end));
+            }
+            "unwrap" | "expect" => {
+                wraps.insert((m.file.clone(), m.start), ("call_expression", m.start, m.end));
+            }
+            "let" => {
+                if let Some(at) = inner_start("let _ =") {
+                    wraps.insert((m.file.clone(), at), ("let_declaration", m.start, m.end));
+                }
+            }
+            "test-mod" => test_mods.push((m.file.clone(), m.start, m.end)),
+            "first-use" => {
+                with_use.insert(m.file.clone());
+            }
+            _ => {}
+        }
+    }
+    let has_dep = manifest.split('\n').any(|l| l.trim_start().starts_with("blaze-text"));
+    let mut plan: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
+    for m in found.iter().filter(|m| m.rule == "site") {
+        let text = texts.get(&m.file).map_or("", String::as_str);
+        let call = text.get(m.start..m.end).unwrap_or("");
+        let (path, tokens) = call.split_once('!').unwrap_or((call, ""));
+        let name = path.trim().rsplit("::").next().unwrap_or("");
+        let tokens = tokens.trim();
+        let inner = tokens.get(1..tokens.len().saturating_sub(1)).unwrap_or("");
+        let args = split_args(inner);
+        let func = innermost(&ctx, &m.file, m.start);
+        let in_test = test_path(&m.file)
+            || test_mods.iter().any(|(f, s, e)| *f == m.file && *s <= m.start && m.end <= *e)
+            || func.is_some_and(|f| f.entry && f.name != "main");
+        if in_test {
+            *out.sites.entry("(in tests, not counted)".to_owned()).or_default() += 1;
+            continue;
+        }
+        let after = text.get(m.end..).unwrap_or("").trim_start();
+        // The replacement: (node kind, start, end, text), or the class.
+        let outcome: Result<(&str, usize, usize, String), String> = match name {
+            "print" | "println" | "eprint" | "eprintln" => Err("no-sink".to_owned()),
+            "format_args" => Err("no-form: `format_args!` is a value; blaze-text has no `Show` made from a writing closure".to_owned()),
+            "write" | "writeln" => {
+                let shown = func.and_then(|f| f.trait_of.as_deref()).map(|t| t.split('<').next().unwrap_or(t).trim().rsplit("::").next().unwrap_or("").to_owned());
+                if matches!(shown.as_deref(), Some("Display" | "Debug")) {
+                    Err("display-impl".to_owned())
+                } else {
+                    let dst = args.first().cloned().unwrap_or_default();
+                    let dst = if simple_expr(&dst) && !dst.starts_with('&') { dst } else { format!("({dst})") };
+                    let newline = name == "writeln";
+                    let body = match args.get(1) {
+                        Some(f) => chain(f, &args[2..], newline).map_err(|why| format!("no-form: {why}")),
+                        None if newline => Ok(".byte(b'\\n')".to_owned()),
+                        None => Ok(String::new()),
+                    };
+                    body.map(|b| {
+                        let chained = format!("{dst}{b}");
+                        match wraps.get(&(m.file.clone(), m.start)) {
+                            Some(&("let_declaration", s0, e0)) => ("let_declaration", s0, e0, format!("{chained};")),
+                            Some(&(kind, s0, e0)) if text.get(e0..).unwrap_or("").trim_start().starts_with(';') => (kind, s0, e0, chained),
+                            _ if after.starts_with(';') => ("macro_invocation", m.start, m.end, chained),
+                            _ => ("macro_invocation", m.start, m.end, format!("{{ {chained}; Ok::<(), core::fmt::Error>(()) }}")),
+                        }
+                    })
+                }
+            }
+            _ => match source_of(&ctx, a, &m.file, m.start, None) {
+                Source::Gain(..) => Err("add-arg".to_owned()),
+                Source::Wall(kind, _) => Err(kind.to_owned()),
+                Source::Expr(alloc) => args.first().ok_or_else(|| "no-form: no format string".to_owned()).and_then(|f| chain(f, &args[1..], false).map_err(|why| format!("no-form: {why}"))).map(|b| {
+                    let words: BTreeSet<&str> = inner.split(|c: char| !c.is_alphanumeric() && c != '_').collect();
+                    let var = ["text", "written", "out_text"].into_iter().find(|w| !words.contains(w)).unwrap_or("out_text");
+                    ("macro_invocation", m.start, m.end, format!("{{ let mut {var} = blaze_own::String::new_in({alloc}); {var}{b}; {var} }}"))
+                }),
+            },
+        };
+        let outcome = outcome.and_then(|(kind, s0, e0, fix)| {
+            // ast-grep reads `$` and a capital as a metavariable in a fix.
+            let dollar = fix.as_bytes().windows(2).any(|w| w[0] == b'$' && (w[1].is_ascii_uppercase() || w[1] == b'$'));
+            // A dry run counts what has a chain; whether the crate can take it yet is a note.
+            match (dollar, has_dep || !a.apply, with_use.contains(&m.file) || !a.apply) {
+                (true, _, _) => Err("no-form: a `$` before a capital in the text, which ast-grep's fix would read".to_owned()),
+                (_, false, _) => Err("no-dep".to_owned()),
+                (_, _, false) => Err("no-use".to_owned()),
+                _ => {
+                    if !has_dep {
+                        *out.sites.entry("(chain, in a crate with no blaze-text dependency yet)".to_owned()).or_default() += 1;
+                    }
+                    Ok((kind, s0, e0, fix))
+                }
+            }
+        });
+        match outcome {
+            Ok((kind, s0, e0, fix)) => {
+                *out.sites.entry("chain".to_owned()).or_default() += 1;
+                if a.apply {
+                    let id = format!("f{}", plan.get(&m.file).map_or(0, Vec::len));
+                    match node_at_rule(id, kind, text, s0, e0, fix) {
+                        Some(rule) => plan.entry(m.file.clone()).or_default().push(rule),
+                        None => out.wall("unmatched", &m.file, m.line, "a place not in its file"),
+                    }
+                }
+            }
+            Err(class) => {
+                *out.sites.entry(class.clone()).or_default() += 1;
+                let (kind, why) = class.split_once(": ").unwrap_or((class.as_str(), ""));
+                out.wall(kind, &m.file, m.line, &format!("{name}! {why}").trim().to_owned());
+            }
+        }
+    }
+    for (file, rules) in &plan {
+        let applied = grep.apply(rules, &[file.clone()], 1)?;
+        if applied != rules.len() {
+            out.wall("unmatched", file, 0, &format!("{applied} of {} rewrites applied", rules.len()));
+        }
+        let first_use = Rule {
+            id: "writes-use".to_owned(),
+            rule: o(&[("all", J::A(vec![
+                o(&[("pattern", s("$U"))]),
+                o(&[("kind", s("use_declaration"))]),
+                o(&[("inside", o(&[("kind", s("source_file"))]))]),
+                o(&[("not", o(&[("follows", o(&[("stopBy", s("end")), ("kind", s("use_declaration"))]))]))]),
+            ]))]),
+            constraints: None,
+            fix: Some(format!("{WRITES_USE}\n$U")),
+            transform: None,
+        };
+        grep.apply(&[first_use], &[file.clone()], 1)?;
+    }
+    Ok(())
+}
+
 fn run_mode(a: &Args) -> Result<Summary, ToolError> {
     let root = std::fs::canonicalize(&a.root).map_err(|e| ToolError::File { path: a.root.clone(), why: e.to_string() })?;
     let dir = root.join(&a.krate);
@@ -1609,6 +2325,7 @@ fn run_mode(a: &Args) -> Result<Summary, ToolError> {
             thread_sites(&grep, a, &shapes, &files, &mut out)?;
         }
         Mode::Settle => settle(&grep, a, &root, None, &mut out)?,
+        Mode::Fmt => run_fmt(&grep, a, &files, manifest.as_deref().unwrap_or(""), &mut out)?,
         Mode::ShareClone => {
             let text = std::fs::read_to_string(root.join(TABLE)).map_err(|e| ToolError::File { path: TABLE.to_owned(), why: e.to_string() })?;
             let own = own_collections(&read_table(&text)?);
@@ -1641,6 +2358,7 @@ fn args(krate: &str, mode: Mode, root: &str) -> Args {
         roots: vec!["core".to_owned(), "blaze_own".to_owned()],
         cargo: String::new(),
         root: root.to_owned(),
+        apply: false,
     }
 }
 
@@ -1676,6 +2394,18 @@ fn selftest() {
     expect(alloc_field("struct S<T, A: Allocator + Copy> { buf: Vec<T, A>, pub alloc: A }").as_deref() == Some("alloc"), "a struct's allocator field");
     expect(alloc_field("struct S<'a> { buf: Vec<u8>, pub(crate) alloc: blaze_own::Alloc<'a> }").as_deref() == Some("alloc"), "a struct's concrete allocator field");
     expect(package_name("[package]\nname = \"x\"\n") == Some("x".to_owned()), "a package's name");
+    // fmt's format strings and chains.
+    let args_of = |text: &str| split_args(text);
+    expect(args_of(r#"f, "a, {}", g(1, 2), ',', 'a, "x\"y""#) == ["f", "\"a, {}\"", "g(1, 2)", "','", "'a", "\"x\\\"y\""], "a macro's arguments at top-level commas");
+    let ch = |f: &str, rest: &[&str]| chain(f, &rest.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(), false);
+    expect(ch(r#""x = {x}, {} of {}""#, &["a.len()", "n"]) == Ok(".str(\"x = \").show(&x).str(\", \").int(a.len()).str(\" of \").show(&n)".to_owned()), "a chain");
+    expect(ch(r#""{:08x}|{:#010x}|{:X}|{:b}""#, &["a", "b", "c", "d"]) == Ok(".hex_fixed(a, 8).str(\"|\").str(\"0x\").hex_fixed(b, 8).str(\"|\").hex_upper(c).str(\"|\").bin(d)".to_owned()), "hex and binary");
+    expect(ch(r#""{:.2} {:>7.1} {:>5} {:<5} {:04} {n:0w$}""#, &["x", "y", "a", "b", "c"]) == Ok(".float_fixed(x, 2).str(\" \").right(&blaze_text::Fixed(y, 1), 7).str(\" \").right(&a, 5).str(\" \").left(&b, 5).str(\" \").int_zeros(c, 4).str(\" \").int_zeros(n, w)".to_owned()), "precision, columns and zeros");
+    expect(ch(r#""{{{}}} \u{7b}""#, &["'c'"]) == Ok(".str(\"{\").char('c').str(\"} \\u{7b}\")".to_owned()), "escaped braces, and an escape holding braces");
+    expect(ch(r#""{:?}""#, &["x"]).is_err() && ch(r#""{:?}""#, &["\"a\""]) == Ok(".escaped(\"a\")".to_owned()), "`{:?}` only of a literal string");
+    expect(ch(r#""{} {}""#, &["f()", "g()"]).is_ok() && ch(r#""{1} {0}""#, &["f()", "g()"]).is_err() && ch(r#""{0} {0}""#, &["f()"]).is_err(), "side effects keep their order and count");
+    expect(ch(r#""{}""#, &["1.5"]).is_err(), "a float's `{}` form is refused");
+    expect(chain(r#""a{}""#, &["n".to_owned()], true) == Ok(".str(\"a\").show(&n).str(\"\\n\")".to_owned()), "writeln's line feed");
     // share-clone's classifier, from E0599's messages.
     let own: BTreeSet<String> = ["Vec", "AVec", "String"].into_iter().map(str::to_owned).collect();
     let site = |m: &str, notes: &str| share_site(m, notes, &own);

@@ -105,11 +105,39 @@ fn main() {
     );
 
     let floats: std::vec::Vec<f64> = spread.iter().map(|&b| f64::from_bits(b >> 2 | 0x3000_0000_0000_0000)).collect();
+    // Everyday magnitudes, 1e-3 to 1e6, where `{}` and `{:?}` mostly agree in shape.
+    let everyday: std::vec::Vec<f64> = spread.iter().map(|&b| f64::from_bits(b >> 12 | (1013 + b % 30) << 52)).collect();
     bench.pair(
-        "f64 shortest",
+        "f64 {} (Display), 1e-3..1e6",
+        |i| {
+            ours.clear();
+            ours.float(black_box(everyday[i]));
+            black_box(ours.as_str());
+        },
+        |i| {
+            theirs.clear();
+            let _ = write!(theirs, "{}", black_box(everyday[i]));
+            black_box(theirs.as_str());
+        },
+    );
+    bench.pair(
+        "f64 {} (Display), 2^-255..",
         |i| {
             ours.clear();
             ours.float(black_box(floats[i]));
+            black_box(ours.as_str());
+        },
+        |i| {
+            theirs.clear();
+            let _ = write!(theirs, "{}", black_box(floats[i]));
+            black_box(theirs.as_str());
+        },
+    );
+    bench.pair(
+        "f64 {:?} (float_debug)",
+        |i| {
+            ours.clear();
+            ours.float_debug(black_box(floats[i]));
             black_box(ours.as_str());
         },
         |i| {

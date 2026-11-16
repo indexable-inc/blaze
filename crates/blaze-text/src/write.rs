@@ -115,11 +115,19 @@ pub trait Writes: Put {
         self
     }
 
-    /// The shortest form that reads back as the same float, laid out as `{:?}`: `0.1`, `1.0`,
-    /// `1e16`, `NaN`.
+    /// The shortest form that reads back as the same float, laid out as `{}`: plain decimal,
+    /// no exponent, no forced point: `0.1`, `1`, `-0`, `10000000000000000`, `NaN`, `inf`.
     #[inline]
     fn float<F: Float>(&mut self, x: F) -> &mut Self {
-        crate::float::shortest(x, self);
+        crate::float::display(x, self);
+        self
+    }
+
+    /// The same digits laid out as `{:?}`: a point always (`1.0`), an exponent outside
+    /// `1e-5..1e16` (`1e16`, `1.5e-7`).
+    #[inline]
+    fn float_debug<F: Float>(&mut self, x: F) -> &mut Self {
+        crate::float::debug(x, self);
         self
     }
 

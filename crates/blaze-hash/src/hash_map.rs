@@ -205,6 +205,96 @@ impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Map<K, V, S, A> {
         Some(&self.table.get(index).1)
     }
 
+    /// Starts loading what a [`Map::get`] of `key` reads first (its home control word and,
+    /// when a group's eight entries fit in two cache lines, those entries), for a caller that
+    /// interleaves its own lookups: issue it a few lookups ahead of the `get`. A hint: it
+    /// changes nothing and reads no entry.
+    #[inline]
+    pub fn prefetch<Q: ?Sized>(&self, key: &Q)
+    where
+        S: KeyHash<Q>,
+    {
+        self.table.prefetch(<S as KeyHash<Q>>::hash_key(&self.hasher, key));
+    }
+
+    /// The slots of `keys`, by group prefetching: every key hashed and its home group's load
+    /// started, then each probed in order, so on a table larger than the cache the batch's
+    /// misses overlap.
+    #[inline]
+    pub(crate) fn find_many<Q: ?Sized + Equivalent<K>, const N: usize>(
+        &self,
+        keys: [&Q; N],
+    ) -> [Option<usize>; N]
+    where
+        S: KeyHash<Q>,
+    {
+        let hashes = keys.map(|key| <S as KeyHash<Q>>::hash_key(&self.hasher, key));
+        self.table.prefetch_all(&hashes);
+        core::array::from_fn(|at| {
+            self.table.find(hashes[at], |(held, _)| keys[at].equivalent(held))
+        })
+    }
+
+    /// The slot of each of `keys`, `answer(at, slot)` for `keys[at]` in order, as a pipeline:
+    /// key `at + raw::BATCH` is hashed and its home prefetched as key `at` is probed, so the
+    /// misses in flight stay [`raw::BATCH`] deep with no stall between batches.
+    #[inline]
+    pub(crate) fn find_each<Q: Equivalent<K>>(
+        &self,
+        keys: &[Q],
+        mut answer: impl FnMut(usize, Option<usize>),
+    ) where
+        S: KeyHash<Q>,
+    {
+        let hash = |key: &Q| <S as KeyHash<Q>>::hash_key(&self.hasher, key);
+        // `ring[at % BATCH]` is key `at`'s hash, from its prefetch to its probe.
+        let mut ring = [0u64; raw::BATCH];
+        for (at, key) in keys.iter().take(raw::BATCH).enumerate() {
+            ring[at] = hash(key);
+            self.table.prefetch(ring[at]);
+        }
+        for (at, key) in keys.iter().enumerate() {
+            let this = ring[at % raw::BATCH];
+            if let Some(ahead) = keys.get(at + raw::BATCH) {
+                let ahead = hash(ahead);
+                self.table.prefetch(ahead);
+                ring[at % raw::BATCH] = ahead;
+            }
+            answer(at, self.table.find(this, |(held, _)| key.equivalent(held)));
+        }
+    }
+
+    /// [`Map::get`] of each of `keys`, as one batch: on a table larger than the cache, the
+    /// lookups' cache misses overlap instead of queueing. Duplicates and absent keys are
+    /// answered as `get` answers them.
+    ///
+    /// When it pays (`examples/hash_cost.rs batch`, `HashMap<u64, u32>` on an M-series Mac):
+    /// keys that are mostly held, on a table past the cache, in batches of 4: 1.3 times the
+    /// lookups a second of `get` one at a time at 10^7 entries. It loses where the keys are
+    /// mostly absent (0.65 times: the slot line it prefetches is wasted bandwidth), and at 8
+    /// or more keys on a table the cache holds (10^3 to 10^5 entries: up to 0.6 times); 4 on
+    /// such a table is even. `get` in a loop already overlaps some misses out of order.
+    #[inline]
+    pub fn get_many<Q: ?Sized + Equivalent<K>, const N: usize>(
+        &self,
+        keys: [&Q; N],
+    ) -> [Option<&V>; N]
+    where
+        S: KeyHash<Q>,
+    {
+        self.find_many(keys).map(|slot| slot.map(|index| &self.table.get(index).1))
+    }
+
+    /// [`Map::get_many`] of a slice: `out[at]` is the value of `keys[at]`, each key's home
+    /// prefetched eight keys before its probe. Panics unless `out` is as long as `keys`.
+    pub fn get_many_into<'a, Q: Equivalent<K>>(&'a self, keys: &[Q], out: &mut [Option<&'a V>])
+    where
+        S: KeyHash<Q>,
+    {
+        assert_eq!(keys.len(), out.len(), "Map::get_many_into: one answer per key");
+        self.find_each(keys, |at, slot| out[at] = slot.map(|index| &self.table.get(index).1));
+    }
+
     #[inline]
     pub fn get_mut<Q: ?Sized + Equivalent<K>>(&mut self, key: &Q) -> Option<&mut V>
     where

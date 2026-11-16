@@ -132,6 +132,15 @@ normalizes-to and projection goals (rigid and non-rigid aliases as the reference
 types, associated consts); helper 3 writes coherence (src/coherence.rs: overlap of two impl
 headers with the intercrate mode and the orphan check).
 
+Two typed seams carry what the reference keeps in side channels. A normalization asks how its
+trait goal was proven through a `via_only` nested goal: its response is not applied, and the
+frame records its `TraitGoalProvenVia`. A failed trait goal is `Via::Failed`, which fails the
+normalization the way the reference's `NoSolution` does. A form not ported (inherent and free
+aliases, anon consts, const evaluation) stops with `SolveError::Unsupported`, never a guessed
+answer (rule 3). Fulfillment's two strategies (`fulfill::Wake`, `fulfill::Rescan`) are one
+type parameter (rule 78) and are tested equal. A portable term is imported by a walk of the
+nodes its root reaches, so a record's table may hold many terms.
+
 ## The engineering, each with its floor (rule 67)
 
 **(a) Records in columns, no recursion, no allocation per goal.** Obligations, frames,
@@ -177,6 +186,18 @@ Floor: (non-wildcard positions) x ceil(n / 16) vector compares; at n = 1,024 and
 128 compares where a scan touches 1,024 headers. The columns belong in the bucket record
 (written once by the index builder through `prefilter::fingerprint`, read in place); until
 blaze-impls writes them, the `Facts` implementation builds them per bucket.
+
+**(d') Next: a discrimination tree (planned, not built).** The fingerprint is exact only to
+depth 2 and four arguments. The end state is the theorem provers' index (Lean 4's instance
+index, E and Vampire): impl headers flattened in pre-order over (constructor, arity) symbols
+into a trie, with impl parameters as `*`. It is built once per (trait, crate) as a sealed flat
+record in blaze-impls' index (node arrays in deterministic order, read in place). The walk
+lives here in `prefilter.rs`, because what counts as a wildcard is solver semantics: inference
+variables and non-rigid aliases in the goal match any subtree. Floor: one node step per goal
+symbol on each surviving path, with no unification attempt for headers that cannot unify.
+Before it is built, cost.rs reports candidates left and ns per lookup for both filters on
+`core`'s impls (6,170). This crate's world has no real `core`, so the comparison waits for
+blaze-impls' records.
 
 **(e) Results are records (rule 77).** A solved canonical goal is stored with its response and
 its **read list**: every `Facts` question its subtree asked, with the answer's digest, negative
@@ -231,6 +252,11 @@ a coinductive cycle taken as inductive must fail the cycle cases; a prefilter th
 wildcard must fail the prefilter's property against the truth, at every alignment. Wake lists
 and rescan are tested equal on the staggered load (`testing/stagger.rs`), which
 `examples/cost.rs` also times.
+
+Measured 2026-11-15 (Mac, release, `cost_report` through lanecheck): cold 91k ground and 98k
+generic goals/s, warm (canonical cache) 7.5M and 7.9M; fulfillment of 10,000 obligations in
+100 waves, wake lists 2.1 ms and 20,199 evaluations against rescan's 40.5 ms and 510,180
+(25x); prefilter scalar/simd 7.3/8.0 ns at 8 impls, 40/16 ns at 64, 678/297 ns at 1,024.
 
 ## What blaze-ty and blaze-typeck change
 

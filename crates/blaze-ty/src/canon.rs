@@ -9,6 +9,8 @@
 //! The canonical term is in the arena (its variables are `CANONICAL` rows); its key is a
 //! sequence of words written post-order with back-references to repeated nodes, items as their
 //! 32-byte keys, so the key is the same in every task's arena and can key a shared cache.
+//! The canonical term and its key are made in one walk ([`walk`]): a node's words are written
+//! at its exit, from its canonical node, so the term is read once.
 //! Deviation: type variables carry no sub-unification root (rustc's `sub_root`): blaze-ty
 //! records two-variable subtyping as a goal and has no sub-unification table.
 
@@ -145,19 +147,14 @@ impl Canonicalize<'_, '_, '_> {
     }
 }
 
-impl Hook for Canonicalize<'_, '_, '_> {
-    type Error = FoldError;
+/// What canonicalization may replace: a node of none of these flags is its own canonical form.
+const NEEDS: u16 = Flags::INFER | Flags::PLACEHOLDER | Flags::PARAM | Flags::FREE_REGIONS;
 
-    #[inline(always)]
-    fn skip(&self, f: Flags, _: u32) -> bool {
-        !f.has(Flags::INFER | Flags::PLACEHOLDER | Flags::PARAM | Flags::FREE_REGIONS)
-    }
-
-    fn pre(&mut self, tys: &mut Tys<'_>, vars: &mut Vars<'_>, n: Node, _: u32, _: u8) -> Result<Step, FoldError> {
-        let need = Flags::INFER | Flags::PLACEHOLDER | Flags::PARAM | Flags::FREE_REGIONS;
-        if !tys.node_flags(n).has(need) {
-            return Ok(Step::Keep);
-        }
+impl Canonicalize<'_, '_, '_> {
+    /// What becomes of `n`, a node of [`NEEDS`]'s flags: `Keep` (as it is, not descended),
+    /// `Replace` (a leaf: a canonical variable or a variable's integer or float value),
+    /// `Again` (a variable's value, canonicalized in its place) or `Descend`.
+    fn pre(&mut self, tys: &mut Tys<'_>, vars: &mut Vars<'_>, n: Node) -> Result<Step, FoldError> {
         let (k, a, b) = tys.raw(n);
         let input = self.input();
         let root = Universe::ROOT;
@@ -314,14 +311,197 @@ impl Hook for Values {
 const KEY_BACKREF: u32 = 1 << 31;
 const KEY_LIST: u32 = 3 << 8;
 
+/// The walk's memo holds three maps, told apart by the high word of the key: a variable's
+/// root to its canonical index (`Canonicalize::var`, high word 0), an input node to its
+/// canonical node (only where they differ), and a canonical node to its post-order number in
+/// the key (the back-reference target).
+const FOLDED: u64 = 1 << 32;
+const KEYED: u64 = 2 << 32;
+
+const ENTER: u8 = 0;
+const EXIT: u8 = 1;
+/// After a variable's value: the variable's canonical node is the value's.
+const ALIAS: u8 = 2;
+
+/// One frame of canonicalization's walk.
+#[derive(Clone, Copy)]
+pub(crate) struct CanonFrame {
+    node: Node,
+    /// For an exit: where the node's children's results start on the result stack.
+    base: u32,
+    /// For an exit: where the node's key words start.
+    key_at: u32,
+    op: u8,
+    /// The node is its own canonical form (no [`NEEDS`] flag, or kept): its subtree is only
+    /// written to the key.
+    plain: bool,
+}
+
+/// The canonical form of `root` and its key, in one post-order walk: each node's canonical
+/// node is made at its exit and written to the key there, so the key is the canonical term's
+/// (a node equal to one written before, by the canonical node, is one back-reference). Where
+/// a node's canonical node was written before, the words its children wrote are cut back to
+/// that one back-reference: they were all back-references, since the earlier node's subtree
+/// was written first.
+fn walk(
+    tys: &mut Tys<'_>,
+    vars: &mut Vars<'_>,
+    stack: &mut Vec<CanonFrame, Alloc<'_>>,
+    out: &mut Vec<Node, Alloc<'_>>,
+    h: &mut Canonicalize<'_, '_, '_>,
+    root: Node,
+) -> Result<Node, FoldError> {
+    stack.clear();
+    out.clear();
+    stack.push(CanonFrame { node: root, base: 0, key_at: 0, op: ENTER, plain: false });
+    let mut count: u32 = 0;
+    while let Some(f) = stack.pop() {
+        let n = f.node;
+        match f.op {
+            ENTER => {
+                let plain = f.plain || !tys.node_flags(n).has(NEEDS);
+                let cand = if plain { n } else { h.map.get(FOLDED | u64::from(n.bits())).map_or(n, Node) };
+                if let Some(at) = h.map.get(KEYED | u64::from(cand.bits())) {
+                    out.push(cand);
+                    h.buf.key.push(KEY_BACKREF | at);
+                    continue;
+                }
+                let plain = if plain {
+                    true
+                } else {
+                    match h.pre(tys, vars, n)? {
+                        Step::Keep => true,
+                        Step::Descend => false,
+                        Step::Replace(x) => {
+                            h.map.insert(FOLDED | u64::from(n.bits()), x.bits());
+                            stack.push(CanonFrame { node: x, plain: true, ..f });
+                            continue;
+                        }
+                        Step::Again(v) => {
+                            stack.push(CanonFrame { op: ALIAS, ..f });
+                            stack.push(CanonFrame { node: v, ..f });
+                            continue;
+                        }
+                        Step::ShiftIn(..) => unreachable!("canonicalization shifts nothing"),
+                    }
+                };
+                let (Some(base), Some(key_at)) = (crate::ids::row(out.len()), crate::ids::row(h.buf.key.len())) else {
+                    panic!("blaze-ty: a canonical term is too large (rule 18)")
+                };
+                stack.push(CanonFrame { node: n, base, key_at, op: EXIT, plain });
+                if n.tag() == TAG_LIST {
+                    for el in tys.list(n.list()).iter().rev() {
+                        stack.push(CanonFrame { node: el.node(), base: 0, key_at: 0, op: ENTER, plain });
+                    }
+                } else {
+                    let (_, a, b) = tys.raw(n);
+                    let d = tys.desc(n);
+                    if d.b == Role::Child {
+                        stack.push(CanonFrame { node: Node(b), base: 0, key_at: 0, op: ENTER, plain });
+                    }
+                    if d.a == Role::Child {
+                        stack.push(CanonFrame { node: Node(a), base: 0, key_at: 0, op: ENTER, plain });
+                    }
+                }
+            }
+            EXIT => {
+                let base = ix(f.base);
+                let r = if f.plain { n } else { rebuild(tys, n, &out[base..]) };
+                out.truncate(base);
+                out.push(r);
+                if r != n {
+                    h.map.insert(FOLDED | u64::from(n.bits()), r.bits());
+                }
+                if let Some(at) = h.map.get(KEYED | u64::from(r.bits())) {
+                    h.buf.key.truncate(ix(f.key_at));
+                    h.buf.key.push(KEY_BACKREF | at);
+                } else {
+                    write_node(tys, r, &mut h.buf.key);
+                    h.map.insert(KEYED | u64::from(r.bits()), count);
+                    count += 1;
+                }
+            }
+            _ => {
+                if let Some(r) = out.last() {
+                    h.map.insert(FOLDED | u64::from(n.bits()), r.bits());
+                }
+            }
+        }
+    }
+    Ok(out.pop().unwrap_or(root))
+}
+
+/// `n` with its children's results `kids`, interned only if one changed.
+#[inline]
+fn rebuild(tys: &mut Tys<'_>, n: Node, kids: &[Node]) -> Node {
+    if n.tag() == TAG_LIST {
+        let l = n.list();
+        let same = {
+            let old = tys.list(l);
+            old.len() == kids.len() && old.iter().zip(kids.iter()).all(|(o, r)| o.bits() == r.bits())
+        };
+        if same {
+            return n;
+        }
+        let m = tys.list_mark();
+        for r in kids {
+            tys.list_push(Arg(r.bits()));
+        }
+        return tys.list_finish(m).node();
+    }
+    let (k, a, b) = tys.raw(n);
+    let d = tys.desc(n);
+    let mut i = 0;
+    let na = if d.a == Role::Child {
+        i += 1;
+        kids[0].bits()
+    } else {
+        a
+    };
+    let nb = if d.b == Role::Child { kids[i].bits() } else { b };
+    if na == a && nb == b { n } else { tys.intern_node(n.tag(), k, na, nb) }
+}
+
+/// A node's own words in the key, after its children's: a header (class and kind), its
+/// numbers, its item as eight words of its key, its scalar as four words.
+#[inline]
+fn write_node(tys: &Tys<'_>, n: Node, out: &mut Vec<u32, Alloc<'_>>) {
+    if n.tag() == TAG_LIST {
+        out.push(KEY_LIST);
+        out.push(tys.list_len(n.list()));
+        return;
+    }
+    let (k, a, b) = tys.raw(n);
+    let d = tys.desc(n);
+    out.push(n.tag() << 8 | u32::from(k));
+    for (role, x) in [(d.a, a), (d.b, b)] {
+        match role {
+            Role::Raw => out.push(x),
+            Role::Def => {
+                let key = tys.item_key(crate::ids::Def(x));
+                for w in key.0.0.chunks_exact(4) {
+                    out.push(u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+                }
+            }
+            Role::Scalar => {
+                let v = tys.scalar_value(x);
+                for s in 0..4u32 {
+                    out.push((v >> (32 * s)).truncate_to::<u32>());
+                }
+            }
+            Role::None | Role::Child => {}
+        }
+    }
+}
+
 impl<'a> TyCx<'a> {
     /// Canonicalizes `value` into `buf` (cleared first): the canonical term, its variables in
-    /// first-visit order, the caller's values of them, and the key.
+    /// first-visit order, the caller's values of them, and the key, in one walk.
     pub fn canonicalize(&mut self, value: Node, mode: Mode, buf: &mut CanonBuf<'_>) -> Result<Canonical, FoldError> {
         buf.clear();
         self.canon_map.clear();
         let mut h = Canonicalize { mode, map: &mut self.canon_map, buf };
-        let c = self.eng.run(&mut self.tys, &mut self.vars, &mut AllInvariant, &mut h, value, ctx_of(Variance::Invariant))?;
+        let c = walk(&mut self.tys, &mut self.vars, &mut self.canon_stack, &mut self.canon_out, &mut h, value)?;
         let max_universe = match mode {
             Mode::Input { .. } => Universe::ROOT,
             Mode::Response { .. } => buf.vars.iter().map(|v| v.universe).max().unwrap_or(Universe::ROOT),
@@ -329,7 +509,6 @@ impl<'a> TyCx<'a> {
         let Some(count) = crate::ids::row(buf.vars.len()) else {
             panic!("blaze-ty: a canonical term has too many variables (rule 18)")
         };
-        self.write_key(c, &mut buf.key);
         for v in buf.vars.iter() {
             buf.key.push(v.kind.code() << 24 | (v.universe.0 & 0x00ff_ffff));
             buf.key.push(v.var);
@@ -337,68 +516,6 @@ impl<'a> TyCx<'a> {
         buf.key.push(max_universe.0);
         buf.key.push(count);
         Ok(Canonical { value: c, max_universe, vars: count })
-    }
-
-    /// The key of a term: post-order, a header per node (class and kind), its numbers, its
-    /// items as eight words of their keys, its scalars as four words; a node seen before is
-    /// one back-reference word to its first position.
-    fn write_key(&mut self, root: Node, out: &mut Vec<u32, Alloc<'_>>) {
-        self.canon_map.clear();
-        self.key_stack.clear();
-        self.key_stack.push((root, false));
-        let mut count: u32 = 0;
-        while let Some((n, exit)) = self.key_stack.pop() {
-            if !exit {
-                if let Some(at) = self.canon_map.get(u64::from(n.bits())) {
-                    out.push(KEY_BACKREF | at);
-                    continue;
-                }
-                self.key_stack.push((n, true));
-                if n.tag() == TAG_LIST {
-                    for el in self.tys.list(n.list()).iter().rev() {
-                        self.key_stack.push((el.node(), false));
-                    }
-                } else {
-                    let (_, a, b) = self.tys.raw(n);
-                    let d = self.tys.desc(n);
-                    if d.b == Role::Child {
-                        self.key_stack.push((Node(b), false));
-                    }
-                    if d.a == Role::Child {
-                        self.key_stack.push((Node(a), false));
-                    }
-                }
-                continue;
-            }
-            if n.tag() == TAG_LIST {
-                out.push(KEY_LIST);
-                out.push(self.tys.list_len(n.list()));
-            } else {
-                let (k, a, b) = self.tys.raw(n);
-                let d = self.tys.desc(n);
-                out.push(n.tag() << 8 | u32::from(k));
-                for (role, x) in [(d.a, a), (d.b, b)] {
-                    match role {
-                        Role::Raw => out.push(x),
-                        Role::Def => {
-                            let key = self.tys.item_key(crate::ids::Def(x));
-                            for w in key.0.0.chunks_exact(4) {
-                                out.push(u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
-                            }
-                        }
-                        Role::Scalar => {
-                            let v = self.tys.scalar_value(x);
-                            for s in 0..4u32 {
-                                out.push((v >> (32 * s)).truncate_to::<u32>());
-                            }
-                        }
-                        Role::None | Role::Child => {}
-                    }
-                }
-            }
-            self.canon_map.insert(u64::from(n.bits()), count);
-            count += 1;
-        }
     }
 
     /// The canonical term with its variables replaced by `values` (one per variable, of its

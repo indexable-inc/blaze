@@ -38,6 +38,11 @@ use blaze_reclaim::{Guard, Horizon, Limbo};
 
 use crate::Equivalent;
 
+/// Keys a batch of [`Pinned::get_many_into`] prefetches before it probes: two dependent
+/// misses a key (its slot, its boxed entry), so deeper than the owning map's pipeline.
+/// Chosen by blaze-hashcons' `examples/batch_cost.rs`.
+pub const SHARED_BATCH: usize = 32;
+
 #[cfg(test)]
 mod tests;
 
@@ -166,6 +171,24 @@ impl<K, V> Table<K, V> {
                 }
             }
             at = (at + 1) & self.mask;
+        }
+    }
+
+    /// Starts loading the slot a [`Table::find`] of `hash` reads first.
+    #[inline]
+    fn prefetch_slot(&self, hash: u64) {
+        blaze_swiss::prefetch(ptr::from_ref(&self.slots[hash as usize & self.mask]));
+    }
+
+    /// Starts loading the entry the first slot of `hash` points at: a batch's second step,
+    /// once [`Table::prefetch_slot`] brought the slot in. A hint: the pointer is not read
+    /// through.
+    #[inline]
+    fn prefetch_entry(&self, hash: u64) {
+        // Relaxed: the pointer only names a line to load; `find` loads it again, Acquire.
+        let slot = self.slots[hash as usize & self.mask].load(Ordering::Relaxed);
+        if live(slot) {
+            blaze_swiss::prefetch(slot.cast_const());
         }
     }
 
@@ -379,6 +402,81 @@ impl<K, V, S: BuildHasher> Pinned<'_, K, V, S> {
     /// The value of `key`, read with no lock.
     pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<&V> {
         self.entry(key).map(|entry| &entry.value)
+    }
+
+    /// Starts loading the slot a [`Pinned::get`] of `key` reads first, for a caller that
+    /// interleaves its own lookups. A hint: it reads no entry.
+    pub fn prefetch<Q: ?Sized + Hash>(&self, key: &Q) {
+        let hash = self.map.hasher.hash_one(key);
+        if let Some(table) = self.shard_of(hash).current() {
+            table.prefetch_slot(hash);
+        }
+    }
+
+    /// The entry of each of the `count` keys `key(at)` names, handed to `answer(at, entry)` in
+    /// order, by group prefetching `CHUNK` keys at a time in three steps: every key's first
+    /// slot loaded, then the entry each points at, then each probed. A lookup here is two
+    /// dependent misses (the slot, then its boxed entry), so a batch on tables larger than the
+    /// cache waits about two misses in all rather than two per key.
+    fn each_entry<'s, 'k, Q: ?Sized + Hash + Equivalent<K>, const CHUNK: usize>(
+        &'s self,
+        count: usize,
+        key: impl Fn(usize) -> &'k Q,
+        mut answer: impl FnMut(usize, Option<&'s Entry<K, V>>),
+    ) {
+        let mut start = 0;
+        while start < count {
+            let len = (count - start).min(CHUNK);
+            let mut hashes = [0u64; CHUNK];
+            let mut tables = [None; CHUNK];
+            for at in 0..len {
+                hashes[at] = self.map.hasher.hash_one(key(start + at));
+                tables[at] = self.shard_of(hashes[at]).current();
+                if let Some(table) = tables[at] {
+                    table.prefetch_slot(hashes[at]);
+                }
+            }
+            for at in 0..len {
+                if let Some(table) = tables[at] {
+                    table.prefetch_entry(hashes[at]);
+                }
+            }
+            for at in 0..len {
+                let entry = tables[at].and_then(|table| table.find(hashes[at], key(start + at)));
+                answer(start + at, entry);
+            }
+            start += len;
+        }
+    }
+
+    /// [`Pinned::get`] of each of `keys`, as one batch ([`Pinned::each_entry`]'s prefetching);
+    /// duplicates and absent keys are answered as `get` answers them.
+    pub fn get_many<Q: ?Sized + Hash + Equivalent<K>, const N: usize>(
+        &self,
+        keys: [&Q; N],
+    ) -> [Option<&V>; N] {
+        let mut out = [None; N];
+        self.each_entry::<Q, N>(
+            N,
+            |at| keys[at],
+            |at, entry| out[at] = entry.map(|entry| &entry.value),
+        );
+        out
+    }
+
+    /// [`Pinned::get_many`] of a slice, [`SHARED_BATCH`] keys a batch: `out[at]` is the
+    /// value of `keys[at]`. Panics unless `out` is as long as `keys`.
+    pub fn get_many_into<'a, Q: Hash + Equivalent<K>>(
+        &'a self,
+        keys: &[Q],
+        out: &mut [Option<&'a V>],
+    ) {
+        assert_eq!(keys.len(), out.len(), "Pinned::get_many_into: one answer per key");
+        self.each_entry::<Q, SHARED_BATCH>(
+            keys.len(),
+            |at| &keys[at],
+            |at, entry| out[at] = entry.map(|entry| &entry.value),
+        );
     }
 
     /// The key and value of `key`, read with no lock.
@@ -759,6 +857,26 @@ impl<K, S: BuildHasher> PinnedSet<'_, K, S> {
 
     pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<&K> {
         self.0.get_key_value(key).map(|(key, ())| key)
+    }
+
+    /// Starts loading the slot a [`PinnedSet::get`] of `key` reads first, as
+    /// [`Pinned::prefetch`].
+    pub fn prefetch<Q: ?Sized + Hash>(&self, key: &Q) {
+        self.0.prefetch(key);
+    }
+
+    /// [`PinnedSet::get`] of each of `keys`, as [`Pinned::get_many`] batches them.
+    pub fn get_many<Q: ?Sized + Hash + Equivalent<K>, const N: usize>(
+        &self,
+        keys: [&Q; N],
+    ) -> [Option<&K>; N] {
+        let mut out = [None; N];
+        self.0.each_entry::<Q, N>(
+            N,
+            |at| keys[at],
+            |at, entry| out[at] = entry.map(|entry| &entry.key),
+        );
+        out
     }
 }
 

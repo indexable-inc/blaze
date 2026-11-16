@@ -167,7 +167,130 @@ fn row<K: Key + Hash>(n: usize) {
     );
 }
 
+/// The best of `ROUNDS` timings of `pass` over `count` lookups: ns per lookup.
+fn best_ns(count: usize, mut pass: impl FnMut() -> usize) -> f64 {
+    const ROUNDS: usize = 7;
+    let mut best = f64::INFINITY;
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        black_box(pass());
+        best = best.min(start.elapsed().as_nanos() as f64 / count as f64);
+    }
+    best
+}
+
+/// What one cache miss costs on this machine, over an array of `words` u64s, larger than
+/// every cache: a dependent chase (the latency, one miss at a time) and independent random
+/// loads with software prefetch 16 ahead (the throughput: the latency over the misses the
+/// core overlaps). The latter is the floor of a lookup that misses once.
+fn miss_costs(words: usize) -> (f64, f64) {
+    // Sattolo's shuffle: one cycle through every word, so the chase visits them all.
+    let mut next: Vec<u64> = (0..words as u64).collect();
+    let mut state = 0x5eed;
+    for at in (1..words).rev() {
+        state = splitmix(state);
+        let to = (state % at as u64) as usize;
+        next.swap(at, to);
+    }
+    let steps = 2_000_000;
+    let latency = best_ns(steps, || {
+        let mut at = 0usize;
+        for _ in 0..steps {
+            at = next[at] as usize;
+        }
+        at
+    });
+    let picks: Vec<usize> =
+        (0..1u64 << 20).map(|at| (splitmix(at ^ 0xfeed) % words as u64) as usize).collect();
+    let gather = best_ns(picks.len(), || {
+        let mut sum = 0u64;
+        for (at, &pick) in picks.iter().enumerate() {
+            if let Some(&ahead) = picks.get(at + 16) {
+                blaze_swiss::prefetch(next.as_ptr().wrapping_add(ahead));
+            }
+            sum = sum.wrapping_add(next[pick]);
+        }
+        sum as usize
+    });
+    (latency, gather)
+}
+
+/// ns per lookup of `get_many` over `queries`, `B` at a time.
+fn batched<const B: usize>(map: &HashMap<u64, u32, Global>, queries: &[u64]) -> f64 {
+    best_ns(queries.len(), || {
+        let mut found = 0;
+        for chunk in queries.chunks_exact(B) {
+            let keys: [&u64; B] = std::array::from_fn(|at| &chunk[at]);
+            found += map.get_many(keys).iter().filter(|value| value.is_some()).count();
+        }
+        found
+    })
+}
+
+/// Lookups one at a time against batches of 4 to 32 (`get_many`) and the slice form
+/// (`get_many_into`, a pipeline 8 keys deep), on a `HashMap<u64, u32>` of 10^3, 10^5 and
+/// 10^7 entries, with 2^20 random hits and misses; the floor is the misses a lookup takes on
+/// a table larger than the cache (a hit: its home control word and its slot's line, two; a
+/// miss: the word, one) times one overlapped miss, and the ratio is the best form's time
+/// over it.
+fn batch_rows() {
+    let (latency, gather) = miss_costs(1 << 25);
+    println!(
+        "a miss over 256 MB: {latency:.1} ns alone, {gather:.2} ns overlapped ({:.1} misses \
+         out at once); a lookup's floor on a table past the cache: 2 misses, {:.2} ns",
+        latency / gather,
+        2.0 * gather
+    );
+    println!(
+        "{:>9} {:<4} | {:>7} | {:>7} {:>7} {:>7} {:>7} | {:>7} | {:>7} {:>6}",
+        "entries", "", "one", "4", "8", "16", "32", "pipe8", "best/1", "/floor"
+    );
+    for n in [1_000, 100_000, 10_000_000] {
+        let (held, missed) = keys::<u64>(n);
+        let mut map: HashMap<u64, u32, Global> = HashMap::with_capacity_in(n, Global);
+        map.extend(held.iter().enumerate().map(|(at, key)| (*key, at as u32)));
+        let pick = |from: &[u64], salt: u64| -> Vec<u64> {
+            (0..1u64 << 20).map(|at| from[(splitmix(at ^ salt) % n as u64) as usize]).collect()
+        };
+        for (label, queries) in [("hit", pick(&held, 1)), ("miss", pick(&missed, 2))] {
+            let one = best_ns(queries.len(), || {
+                queries.iter().filter(|key| map.get(*key).is_some()).count()
+            });
+            let many = [
+                batched::<4>(&map, &queries),
+                batched::<8>(&map, &queries),
+                batched::<16>(&map, &queries),
+                batched::<32>(&map, &queries),
+            ];
+            let mut out = vec![None; queries.len()];
+            let slice = best_ns(queries.len(), || {
+                map.get_many_into(&queries, &mut out);
+                out.iter().filter(|value| value.is_some()).count()
+            });
+            let best = many.iter().copied().fold(slice, f64::min);
+            println!(
+                "{:>9} {:<4} | {:>7.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>7.2} | {:>7.2} {:>6.2}",
+                n,
+                label,
+                one,
+                many[0],
+                many[1],
+                many[2],
+                many[3],
+                slice,
+                one / best,
+                best / (if label == "hit" { 2.0 } else { 1.0 } * gather)
+            );
+        }
+    }
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("batch") {
+        println!("ns per lookup, one at a time against get_many batches");
+        batch_rows();
+        return;
+    }
     println!("ns per lookup: hit and miss");
     println!(
         "{:<9} {:>9} | {:^13} | {:^13} | {:^13}",
@@ -179,4 +302,6 @@ fn main() {
         row::<[u8; 16]>(n);
         row::<Digest>(n);
     }
+    println!("\nns per lookup, one at a time against get_many batches");
+    batch_rows();
 }

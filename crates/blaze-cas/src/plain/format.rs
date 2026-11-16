@@ -926,75 +926,118 @@ pub(crate) fn key_at(run: &[u8], i: usize) -> ContentId {
 }
 
 /// The position of `key` in `run`, entries sorted by key. Keys are hashes, spread evenly, so
-/// the first steps interpolate on their first eight bytes (about one probe of a page for a
-/// run of millions, where bisection takes some twenty), each guess with a fence that closes
-/// the range's other side; bisection finishes, so a run whose keys are not even still costs at
-/// most `6 + log2(n)` probes.
+/// one guess interpolates on their first eight bytes, then a gallop from it reaches the key and
+/// bisection finishes inside the gallop's last step: the probes land on the guess's page and
+/// the key's, where bisection alone takes some twenty over a run of millions, and a run whose
+/// keys are not even still costs at most `1 + 2 log2(n)` probes.
 ///
-/// No entry is read but the probes (store-next.md): the bounds the guesses interpolate between
-/// start as the whole key space (`0`, `u64::MAX`) and become each probe's prefix as it narrows
-/// the range, so a lookup in a cold run reads the pages its probes land on and not the run's
-/// first and last (two pages a segment, before). Every entry in `lo..hi` has a prefix in
-/// `lo_p..=hi_p`, and `want` is in it too, so each guess is in `lo..hi`.
+/// No entry is read but the probes (store-next.md): the guess interpolates over the whole key
+/// space (`0`, `u64::MAX`), so a lookup in a cold run reads the pages its probes land on and not
+/// the run's first and last (two pages a segment, before).
 pub(crate) fn find(run: &[u8], key: &ContentId) -> Option<usize> {
     find_by(run.len() / ENTRY, key, |i| &run[i * ENTRY..i * ENTRY + 32])
 }
 
 /// [`find`] over `n` entries whose `i`th key `key_of` reads: the entries a lookup touches are
 /// the `i` it asks for, which a test counts as pages.
-pub(crate) fn find_by<'a>(n: usize, key: &ContentId, mut key_of: impl FnMut(usize) -> &'a [u8]) -> Option<usize> {
-    let want = u64::from_be_bytes(key.0[0..8].try_into().expect("8 bytes"));
-    let prefix = |k: &[u8]| u64::from_be_bytes(k[0..8].try_into().expect("8 bytes"));
-    let (mut lo, mut hi) = (0usize, n);
-    let (mut lo_p, mut hi_p) = (0u64, u64::MAX);
-    let mut guesses = 0;
-    while lo < hi {
-        let guessed = guesses < 3 && hi - lo > 8;
-        let mid = if guessed {
-            guesses += 1;
-            // want - lo_p <= hi_p - lo_p < span: the guess is below hi.
-            let span = u128::from(hi_p - lo_p) + 1;
-            lo + ((u128::from(want - lo_p) * (hi - lo) as u128) / span) as usize
-        } else {
-            lo + (hi - lo) / 2
+pub(crate) fn find_by<'a>(n: usize, key: &ContentId, key_of: impl FnMut(usize) -> &'a [u8]) -> Option<usize> {
+    seek(0, n, 0, key, key_of).ok()
+}
+
+/// The positions of `keys` in a run of `n` entries whose `i`th key `key_of` reads, in the
+/// order `keys` were given: what [`find_by`] answers for each, found in one pass. The keys are
+/// sorted as the run is, and each is sought from where the one before it ended, never before:
+/// the run's pages are touched in ascending order, a page the keys share probed once for all of
+/// them, where one lookup a key starts each from the whole run (store-next.md, "Batches").
+pub(crate) fn find_many<'a>(n: usize, keys: &[ContentId], mut key_of: impl FnMut(usize) -> &'a [u8]) -> Vec<Option<usize>, Global> {
+    // alloc: once per batch, the order its keys are sought in and its answers
+    let mut order: Vec<usize, Global> = Vec::with_capacity_in(keys.len(), Global);
+    order.extend(0..keys.len());
+    order.sort_unstable_by(|a, b| keys[*a].cmp(&keys[*b]));
+    let mut found: Vec<Option<usize>, Global> = Vec::with_capacity_in(keys.len(), Global);
+    found.resize(keys.len(), None);
+    // Every entry from `lo` on has a key above the last one sought, so a prefix at least its.
+    let (mut lo, mut lo_p) = (0usize, 0u64);
+    let mut last: Option<(&ContentId, Option<usize>)> = None;
+    for at in order {
+        let key = &keys[at];
+        if let Some((before, answer)) = last
+            && before == key
+        {
+            found[at] = answer;
+            continue;
+        }
+        let answer = seek(lo, n, lo_p, key, &mut key_of);
+        lo = match answer {
+            Ok(i) => i + 1,
+            Err(insert) => insert,
         };
-        // A guess over even keys misses by about the square root of the range's length: a
-        // fence twice that far on the side the key lies closes the range on both sides, on
-        // the guess's page or the next, where a guess alone moves one bound and leaves the
-        // other at the range's end for bisection to walk back across pages.
-        let gap = 2 * (hi - lo).isqrt() + 1;
-        let probed = key_of(mid);
-        match probed.cmp(&key.0[..]) {
-            Ordering::Equal => return Some(mid),
-            // Its key is below the one wanted: its prefix is at most want's.
-            Ordering::Less => {
-                (lo, lo_p) = (mid + 1, prefix(probed));
-                let fence = mid + gap;
-                if guessed && fence < hi {
-                    let fenced = key_of(fence);
-                    match fenced.cmp(&key.0[..]) {
-                        Ordering::Equal => return Some(fence),
-                        Ordering::Less => (lo, lo_p) = (fence + 1, prefix(fenced)),
-                        Ordering::Greater => (hi, hi_p) = (fence, prefix(fenced)),
+        lo_p = u64::from_be_bytes(key.0[0..8].try_into().expect("8 bytes"));
+        found[at] = answer.ok();
+        last = Some((key, answer.ok()));
+    }
+    found
+}
+
+/// `key`'s position among entries `lo..n` (`Ok`), or where it would go (`Err`), every entry of
+/// `lo..n` having a prefix of at least `lo_p`, which is at most `key`'s.
+fn seek<'a>(lo: usize, n: usize, lo_p: u64, key: &ContentId, mut key_of: impl FnMut(usize) -> &'a [u8]) -> Result<usize, usize> {
+    let want = u64::from_be_bytes(key.0[0..8].try_into().expect("8 bytes"));
+    let (mut lo, mut hi) = (lo, n);
+    if lo >= hi {
+        return Err(lo);
+    }
+    // One guess: want - lo_p <= u64::MAX - lo_p < span, so it is in lo..hi.
+    let span = u128::from(u64::MAX - lo_p) + 1;
+    let guess = lo + ((u128::from(want - lo_p) * (hi - lo) as u128) / span) as usize;
+    // Then a gallop from the guess toward the key, steps doubling, until a probe passes it: a
+    // guess over even keys misses by about the square root of the range's length, so the
+    // probes stay on the guess's page and the key's (the floor: the page the key lives on),
+    // where bisecting from a range's end walks back across pages.
+    let mut step = 1;
+    match key_of(guess).cmp(&key.0[..]) {
+        Ordering::Equal => return Ok(guess),
+        Ordering::Less => {
+            lo = guess + 1;
+            while guess + step < hi {
+                let at = guess + step;
+                match key_of(at).cmp(&key.0[..]) {
+                    Ordering::Equal => return Ok(at),
+                    Ordering::Less => lo = at + 1,
+                    Ordering::Greater => {
+                        hi = at;
+                        break;
                     }
                 }
+                step *= 2;
             }
-            // Above: its prefix is at least want's.
-            Ordering::Greater => {
-                (hi, hi_p) = (mid, prefix(probed));
-                if guessed && mid >= lo + gap {
-                    let fence = mid - gap;
-                    let fenced = key_of(fence);
-                    match fenced.cmp(&key.0[..]) {
-                        Ordering::Equal => return Some(fence),
-                        Ordering::Less => (lo, lo_p) = (fence + 1, prefix(fenced)),
-                        Ordering::Greater => (hi, hi_p) = (fence, prefix(fenced)),
+        }
+        Ordering::Greater => {
+            hi = guess;
+            while step <= guess - lo {
+                let at = guess - step;
+                match key_of(at).cmp(&key.0[..]) {
+                    Ordering::Equal => return Ok(at),
+                    Ordering::Greater => hi = at,
+                    Ordering::Less => {
+                        lo = at + 1;
+                        break;
                     }
                 }
+                step *= 2;
             }
         }
     }
-    None
+    // Bisection inside the last step, which holds the key if the run does.
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match key_of(mid).cmp(&key.0[..]) {
+            Ordering::Equal => return Ok(mid),
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+        }
+    }
+    Err(lo)
 }
 
 /// `entries` as one sorted run, each key once. Two entries of one key that are not one record

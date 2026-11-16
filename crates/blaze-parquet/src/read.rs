@@ -1,6 +1,7 @@
 //! The reader: a Parquet file's bytes in place, its columns read into batches.
 //!
-//! It reads what blaze reads back: its own files and DuckDB's uncompressed answers. Every
+//! It reads what blaze reads back: its own files (every encoding and codec the writer writes)
+//! and DuckDB's answers. Every
 //! offset and length the file gives is held to the bytes it points into, and every count to
 //! what those bytes can hold, so a hostile file is a typed refusal, never a large allocation.
 
@@ -11,7 +12,7 @@ use blaze_int::Int;
 use blaze_own::{String, Vec};
 
 use crate::{
-    MAGIC, ParquetError, column_name, levels,
+    MAGIC, ParquetError, column_name, delta, levels,
     meta::{
         self, ColumnMeta, FileMeta, Logical, SchemaElement, codec, converted, encoding, page, physical,
         repetition,
@@ -307,9 +308,6 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
 
     /// One column chunk, read.
     fn chunk(&self, name: &str, leaf: Leaf, meta: &ColumnMeta<A>, rows: usize) -> Result<Column<A>, ParquetError> {
-        if meta.codec != codec::UNCOMPRESSED {
-            return Err(unsupported(name, "a compressed column", meta.codec.into()));
-        }
         if meta.ty != leaf.physical {
             return Err(corrupt(name, "a column chunk of another type than its schema's"));
         }
@@ -322,14 +320,16 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
         let mut state = State::new(name, leaf, rows, &self.alloc);
         let mut at = 0;
         let mut dict: Option<Sink<A>> = None;
+        let mut inflated = Vec::new_in(self.alloc.clone());
         while state.entries < entries {
             let (header, header_len) = meta::read_page_header(&bytes[at..])?;
             let body_len = header.compressed_page_size.narrow::<usize>().map_err(|_| corrupt(name, "a page of negative size"))?;
             let body_start = at + header_len;
-            let body = bytes
+            let stored = bytes
                 .get(body_start..body_start.checked_add(body_len).ok_or_else(|| corrupt(name, "a page past memory"))?)
                 .ok_or(ParquetError::Truncated { what: "a page", at: start + body_start })?;
             at = body_start + body_len;
+            let body = self.inflate(name, meta.codec, &header, stored, &mut inflated)?;
             match header.ty {
                 page::DICTIONARY_PAGE => {
                     let (count, how) = header.dictionary.ok_or_else(|| corrupt(name, "a dictionary page of no header"))?;
@@ -359,6 +359,44 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
             }
         }
         state.finish()
+    }
+
+    /// A page's body as it was before `codec` compressed it: `stored` itself when it was not,
+    /// else decompressed into `inflated` (a v2 page's levels stay as they are, before its
+    /// values).
+    fn inflate<'p>(
+        &self,
+        name: &str,
+        codec: i32,
+        header: &meta::PageHeader,
+        stored: &'p [u8],
+        inflated: &'p mut Vec<u8, A>,
+    ) -> Result<&'p [u8], ParquetError> {
+        if codec == codec::UNCOMPRESSED {
+            return Ok(stored);
+        }
+        let size = header.uncompressed_page_size.narrow::<usize>().map_err(|_| corrupt(name, "a page of negative size"))?;
+        let levels = match &header.data {
+            Some(data) if header.ty == page::DATA_PAGE_V2 => {
+                if !data.is_compressed {
+                    return Ok(stored);
+                }
+                let rep = data.repetition_levels_byte_length.narrow::<usize>();
+                let def = data.definition_levels_byte_length.narrow::<usize>();
+                match (rep, def) {
+                    (Ok(rep), Ok(def)) => rep.saturating_add(def),
+                    _ => return Err(corrupt(name, "levels of negative length")),
+                }
+            }
+            _ => 0,
+        };
+        if levels > stored.len() || levels > size {
+            return Err(corrupt(name, "a page's levels past its bytes"));
+        }
+        inflated.clear();
+        inflated.extend_from_slice(&stored[..levels]);
+        crate::compress::decompress(name, codec, &stored[levels..], size - levels, inflated)?;
+        Ok(inflated)
     }
 }
 
@@ -485,6 +523,127 @@ fn decimal(raw: i64, scale: i32) -> f64 {
     raw as f64 / ten_to(scale)
 }
 
+/// An INT32 value read into `sink` as the leaf says.
+fn int32<A: Allocator>(sink: &mut Sink<A>, raw: i32, leaf: Leaf, name: &str) -> Result<(), ParquetError> {
+    match sink {
+        Sink::I32(it) => it.push(raw),
+        Sink::U16(it) => {
+            it.push(u16::try_from(raw.cast_unsigned()).map_err(|_| corrupt(name, "a 16-bit value past 16 bits"))?);
+        }
+        Sink::U32(it) => it.push(raw.cast_unsigned()),
+        Sink::F64(it) => it.push(decimal(raw.into(), leaf.scale.unwrap_or(0))),
+        _ => return Err(corrupt(name, "an INT32 read as another type")),
+    }
+    Ok(())
+}
+
+/// An INT64 value read into `sink` as the leaf says.
+fn int64<A: Allocator>(sink: &mut Sink<A>, raw: i64, leaf: Leaf, name: &str) -> Result<(), ParquetError> {
+    match sink {
+        Sink::I64(it) => it.push(raw),
+        Sink::U64(it) => it.push(raw.cast_unsigned()),
+        Sink::F64(it) => it.push(decimal(raw, leaf.scale.unwrap_or(0))),
+        _ => return Err(corrupt(name, "an INT64 read as another type")),
+    }
+    Ok(())
+}
+
+/// A text read into `sink`.
+fn text<A: Allocator + Clone>(sink: &mut Sink<A>, raw: &[u8], name: &str) -> Result<(), ParquetError> {
+    let Sink::Text(it) = sink else {
+        return Err(corrupt(name, "a text in a column of another type"));
+    };
+    let text = core::str::from_utf8(raw).map_err(|_| corrupt(name, "a text not UTF-8"))?;
+    it.try_push(text).map_err(|error| ParquetError::Column { column: column_name(name), error })
+}
+
+/// A length of DELTA_LENGTH_BYTE_ARRAY or DELTA_BYTE_ARRAY: not negative, and within `room`.
+fn length(raw: i64, room: usize, name: &str) -> Result<usize, ParquetError> {
+    usize::try_from(raw).ok().filter(|&it| it <= room).ok_or_else(|| corrupt(name, "a delta-encoded length that is negative or past its page"))
+}
+
+/// `present` values of a page in a delta encoding or RLE, decoded into `sink`.
+fn decode<A: Allocator + Clone>(
+    sink: &mut Sink<A>,
+    how: i32,
+    values: &[u8],
+    present: usize,
+    leaf: Leaf,
+    name: &str,
+    alloc: &A,
+) -> Result<(), ParquetError> {
+    let bad = |_| corrupt(name, "delta-encoded values that end early or say something impossible");
+    let mut failed = None;
+    match (how, leaf.physical) {
+        (encoding::RLE, physical::BOOLEAN) => {
+            let len = values.get(..4).ok_or_else(|| corrupt(name, "a page ends inside its booleans' length"))?;
+            let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]).widen_to::<usize>();
+            let bytes = values.get(4..4usize.saturating_add(len)).ok_or_else(|| corrupt(name, "a page ends inside its booleans"))?;
+            let Sink::Bool(out) = sink else {
+                return Err(corrupt(name, "booleans in a column of another type"));
+            };
+            let before = out.len();
+            levels::decode(bytes, 1, present, |it| out.push(it == 1)).map_err(|_| corrupt(name, "booleans that end early"))?;
+            if out.len() - before != present {
+                return Err(corrupt(name, "fewer booleans than the page's values"));
+            }
+        }
+        (encoding::DELTA_BINARY_PACKED, physical::INT32 | physical::INT64) => {
+            let (total, _) = delta::decode(values, present, |raw| {
+                if failed.is_none() {
+                    let pushed = if leaf.physical == physical::INT32 {
+                        int32(sink, raw.truncate_to::<i32>(), leaf, name)
+                    } else {
+                        int64(sink, raw, leaf, name)
+                    };
+                    failed = pushed.err();
+                }
+            })
+            .map_err(bad)?;
+            if total != present {
+                return Err(corrupt(name, "delta-encoded values of another number than the page's"));
+            }
+        }
+        (encoding::DELTA_LENGTH_BYTE_ARRAY, physical::BYTE_ARRAY) => {
+            let mut lengths = Vec::with_capacity_in(present, alloc.clone());
+            let (total, used) = delta::decode(values, present, |it| lengths.push(it)).map_err(bad)?;
+            if total != present {
+                return Err(corrupt(name, "delta-encoded lengths of another number than the page's values"));
+            }
+            let mut at = used;
+            for &raw in lengths.iter() {
+                let len = length(raw, values.len() - at, name)?;
+                text(sink, &values[at..at + len], name)?;
+                at += len;
+            }
+        }
+        (encoding::DELTA_BYTE_ARRAY, physical::BYTE_ARRAY) => {
+            let mut prefixes = Vec::with_capacity_in(present, alloc.clone());
+            let (total, used) = delta::decode(values, present, |it| prefixes.push(it)).map_err(bad)?;
+            let mut suffixes = Vec::with_capacity_in(present, alloc.clone());
+            let (rest, more) = delta::decode(&values[used..], present, |it| suffixes.push(it)).map_err(bad)?;
+            if total != present || rest != present {
+                return Err(corrupt(name, "delta-encoded lengths of another number than the page's values"));
+            }
+            let mut at = used + more;
+            let mut last: Vec<u8, A> = Vec::new_in(alloc.clone());
+            for (&prefix, &suffix) in prefixes.iter().zip(suffixes.iter()) {
+                let prefix = length(prefix, last.len(), name)?;
+                let suffix = length(suffix, values.len() - at, name)?;
+                last.truncate(prefix);
+                last.extend_from_slice(&values[at..at + suffix]);
+                at += suffix;
+                text(sink, &last, name)?;
+            }
+        }
+        (other, _) => return Err(unsupported(name, "values of an encoding this reader does not read for their type", other.into())),
+    }
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// PLAIN values being read from a page.
 struct Plain<'b> {
     bytes: &'b [u8],
@@ -514,36 +673,17 @@ impl<'b> Plain<'b> {
                     self.at += 1;
                 }
             }
-            (physical::INT32, sink) => {
-                let raw = i32::from_le_bytes(self.take::<4>(name)?);
-                match sink {
-                    Sink::I32(it) => it.push(raw),
-                    Sink::U16(it) => it.push(
-                        u16::try_from(raw.cast_unsigned()).map_err(|_| corrupt(name, "a 16-bit value past 16 bits"))?,
-                    ),
-                    Sink::U32(it) => it.push(raw.cast_unsigned()),
-                    Sink::F64(it) => it.push(decimal(raw.into(), leaf.scale.unwrap_or(0))),
-                    _ => return Err(corrupt(name, "an INT32 read as another type")),
-                }
-            }
-            (physical::INT64, sink) => {
-                let raw = i64::from_le_bytes(self.take::<8>(name)?);
-                match sink {
-                    Sink::I64(it) => it.push(raw),
-                    Sink::U64(it) => it.push(raw.cast_unsigned()),
-                    Sink::F64(it) => it.push(decimal(raw, leaf.scale.unwrap_or(0))),
-                    _ => return Err(corrupt(name, "an INT64 read as another type")),
-                }
-            }
+            (physical::INT32, sink) => int32(sink, i32::from_le_bytes(self.take::<4>(name)?), leaf, name)?,
+            (physical::INT64, sink) => int64(sink, i64::from_le_bytes(self.take::<8>(name)?), leaf, name)?,
             (physical::FLOAT, Sink::F64(it)) => it.push(f64::from(f32::from_le_bytes(self.take::<4>(name)?))),
             (physical::DOUBLE, Sink::F64(it)) => it.push(f64::from_le_bytes(self.take::<8>(name)?)),
-            (physical::BYTE_ARRAY, Sink::Text(it)) => {
+            (physical::BYTE_ARRAY, sink @ Sink::Text(_)) => {
                 let len = u32::from_le_bytes(self.take::<4>(name)?).widen_to::<usize>();
                 let end = self.at.checked_add(len).filter(|&it| it <= self.bytes.len());
                 let end = end.ok_or_else(|| corrupt(name, "a page ends inside a text"))?;
-                let text = core::str::from_utf8(&self.bytes[self.at..end]).map_err(|_| corrupt(name, "a text not UTF-8"))?;
+                let raw = &self.bytes[self.at..end];
                 self.at = end;
-                it.try_push(text).map_err(|error| ParquetError::Column { column: column_name(name), error })?;
+                text(sink, raw, name)?;
             }
             _ => return Err(corrupt(name, "a value of another type than its column")),
         }
@@ -555,6 +695,8 @@ impl<'b> Plain<'b> {
 enum Cursor<'b, 'd, A: Allocator> {
     Plain(Plain<'b>),
     Dict { indices: Vec<u32, A>, at: usize, dict: &'d Sink<A> },
+    /// Values decoded whole (a delta encoding, RLE booleans), taken in order.
+    Decoded { values: Sink<A>, at: usize },
 }
 
 /// A column chunk being read, page by page.
@@ -661,16 +803,12 @@ impl<'n, A: Allocator + Clone> State<'n, A> {
             return Err(corrupt(name, "definition levels in a column that has none"));
         }
         let values = &body[at..];
+        let present = if leaf.max_def == 0 { count } else { defs.iter().filter(|&&it| it == leaf.max_def).count() };
         let mut cursor = match data.encoding {
             encoding::PLAIN => Cursor::Plain(Plain { bytes: values, at: 0, bit: 0 }),
             encoding::RLE_DICTIONARY | encoding::PLAIN_DICTIONARY => {
                 let dict = dict.ok_or_else(|| corrupt(name, "dictionary indices before a dictionary page"))?;
                 let (&width, packed) = values.split_first().ok_or_else(|| corrupt(name, "a page of no indices' width"))?;
-                let present = if leaf.max_def == 0 {
-                    count
-                } else {
-                    defs.iter().filter(|&&it| it == leaf.max_def).count()
-                };
                 let mut indices = Vec::with_capacity_in(present, self.alloc.clone());
                 levels::decode(packed, width, present, |it| indices.push(it))
                     .map_err(|_| corrupt(name, "dictionary indices that end early or say too much"))?;
@@ -679,15 +817,23 @@ impl<'n, A: Allocator + Clone> State<'n, A> {
                 }
                 Cursor::Dict { indices, at: 0, dict }
             }
-            other => return Err(unsupported(name, "values of an encoding other than PLAIN or a dictionary", other.into())),
+            how => {
+                let mut decoded = Sink::new(leaf.scalar, present, &self.alloc);
+                decode(&mut decoded, how, values, present, leaf, name, &self.alloc)?;
+                Cursor::Decoded { values: decoded, at: 0 }
+            }
         };
         let mut next = |sink: &mut Sink<A>| -> Result<(), ParquetError> {
             match &mut cursor {
                 Cursor::Plain(plain) => plain.next(sink, leaf, name),
                 Cursor::Dict { indices, at, dict } => {
-                    let index = indices[*at].widen_to::<usize>();
+                    let index = indices.get(*at).ok_or_else(|| corrupt(name, "fewer dictionary indices than values"))?.widen_to::<usize>();
                     *at += 1;
                     sink.copy(*dict, index, name)
+                }
+                Cursor::Decoded { values, at } => {
+                    *at += 1;
+                    sink.copy(values, *at - 1, name)
                 }
             }
         };

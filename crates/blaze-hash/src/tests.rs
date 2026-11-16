@@ -461,3 +461,90 @@ fn honest_keys_never_walk_the_refused_run() {
         }
     }
 }
+
+/// A map of `held` keys below `range` (some removed again, so dead slots stand in probes),
+/// each key's value `value(key)`.
+fn map_of<V>(
+    tape: &blaze_sim::Tape,
+    range: u64,
+    value: impl Fn(u64) -> V,
+) -> HashMap<u64, V, Global> {
+    let mut map = HashMap::new_in(Global);
+    for _ in 0..tape.below(if cfg!(miri) { 60 } else { 500 }, "held") {
+        let key = tape.below(range, "key");
+        if tape.one_in(5, "remove") {
+            map.remove(&key);
+        } else {
+            map.insert(key, value(key));
+        }
+    }
+    map
+}
+
+/// `count` keys to ask, from twice the held range (so about half are absent), every batch
+/// holding a duplicate.
+fn asked(tape: &blaze_sim::Tape, range: u64, count: usize) -> Vec<u64> {
+    let mut keys: Vec<u64> = (0..count).map(|_| tape.below(2 * range, "asked")).collect();
+    if count > 1 {
+        let to = tape.index(count, "duplicate to");
+        keys[to] = keys[tape.index(count, "duplicate from")];
+    }
+    keys
+}
+
+/// `get_many` and `get_many_into` answer what `get` answers of each key, duplicates and absent
+/// keys among them: on entries narrow enough that a group's slots are prefetched with its word
+/// (`u64` to `u32`) and wide enough that only the matched slot is (`u64` to 64 bytes), on a
+/// set, on borrowed `str` keys, and across the slice form's batch boundaries.
+#[test]
+fn get_many_is_get_of_each() {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let range = 1 + tape.below(400, "range");
+
+        let narrow = map_of(tape, range, |key| key as u32);
+        let keys = asked(tape, range, 8);
+        let many = narrow.get_many(core::array::from_fn::<_, 8, _>(|at| &keys[at]));
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(many[at], narrow.get(key), "narrow: key {key} of {keys:?}");
+        }
+        let keys = asked(tape, range, tape.index(40, "slice length"));
+        let mut out = std::vec![None; keys.len()];
+        narrow.get_many_into(&keys, &mut out);
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(out[at], narrow.get(key), "narrow slice: key {key} at {at}");
+        }
+
+        let wide = map_of(tape, range, |key| [key; 8]);
+        let keys = asked(tape, range, 5);
+        let many = wide.get_many(core::array::from_fn::<_, 5, _>(|at| &keys[at]));
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(many[at], wide.get(key), "wide: key {key} of {keys:?}");
+        }
+        let keys = asked(tape, range, tape.index(40, "wide slice length"));
+        let mut out = std::vec![None; keys.len()];
+        wide.get_many_into(&keys, &mut out);
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(out[at], wide.get(key), "wide slice: key {key} at {at}");
+        }
+
+        let mut set: crate::HashSet<u64, Global> = crate::HashSet::new_in(Global);
+        set.extend(narrow.keys().copied());
+        let keys = asked(tape, range, 4);
+        let many = set.get_many(core::array::from_fn::<_, 4, _>(|at| &keys[at]));
+        let mut out = std::vec![None; keys.len()];
+        set.get_many_into(&keys, &mut out);
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(many[at], set.get(key), "set: key {key} of {keys:?}");
+            assert_eq!(out[at], set.get(key), "set slice: key {key} of {keys:?}");
+        }
+
+        let mut names: HashMap<std::string::String, u64, Global> = HashMap::new_in(Global);
+        names.extend(narrow.keys().map(|&key| (std::format!("k{key}"), key)));
+        let asked_names: Vec<std::string::String> =
+            asked(tape, range, 3).iter().map(|key| std::format!("k{key}")).collect();
+        let many = names.get_many(core::array::from_fn::<_, 3, _>(|at| asked_names[at].as_str()));
+        for (at, name) in asked_names.iter().enumerate() {
+            assert_eq!(many[at], names.get(name.as_str()), "names: {name} of {asked_names:?}");
+        }
+    });
+}

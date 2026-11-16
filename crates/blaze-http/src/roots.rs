@@ -34,13 +34,17 @@ impl fmt::Display for TlsSetup {
 impl std::error::Error for TlsSetup {}
 
 /// rustls on ring with the machine's roots, as hyper-rustls's `with_native_roots` read them: a
-/// certificate that does not parse is skipped, none at all is [`TlsSetup::NoRoots`].
+/// certificate that does not parse is skipped, none at all is [`TlsSetup::NoRoots`]. Behind the
+/// `native-roots` feature: reading them links the platform's certificate store (Security and
+/// CoreFoundation on macOS), which a program that never asks should not load at start.
+#[cfg(feature = "native-roots")]
 pub fn native() -> Result<Arc<rustls::ClientConfig>, TlsSetup> {
     with_roots(native_roots()?)
 }
 
 /// The machine's roots, as [`native`] reads them: for a client that makes its own rustls
-/// config (h3's, with ALPN `h3` and resumption).
+/// config (h3's, with ALPN `h3` and resumption). Behind `native-roots`, as [`native`] is.
+#[cfg(feature = "native-roots")]
 pub fn native_roots() -> Result<rustls::RootCertStore, TlsSetup> {
     let found = rustls_native_certs::load_native_certs();
     let mut roots = rustls::RootCertStore::empty();

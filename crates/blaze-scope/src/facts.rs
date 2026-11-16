@@ -19,10 +19,11 @@ use blaze_surface::{
 
 /// What a name is to the machine: a small value that compares, orders and hashes. Its order
 /// must be the order of the names' text, since a scope is sorted by it: `&str` (what
-/// [`RecordFacts`] gives) orders by its text, and so do the tests' `&'static str`.
-pub trait Name: Copy + Ord + Hash + fmt::Debug {}
+/// [`RecordFacts`] gives) orders by its text, and so do the tests' `&'static str`. Its text is
+/// read where a rule names words of the language (the builtin types).
+pub trait Name: Copy + Ord + Hash + fmt::Debug + AsRef<str> {}
 
-impl<T: Copy + Ord + Hash + fmt::Debug> Name for T {}
+impl<T: Copy + Ord + Hash + fmt::Debug + AsRef<str>> Name for T {}
 
 /// Everything the machine reads of the module it resolves and of its crate, each a record
 /// decoded into its working form in the facts' own allocator (which outlives the borrow of the

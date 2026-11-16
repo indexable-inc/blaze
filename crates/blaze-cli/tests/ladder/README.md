@@ -15,10 +15,10 @@ after line 2 is the program's standard output, exactly.
 
 | rung | what | status |
 |---|---|---|
-| 1-empty | `fn main() {}`: exit 0 | wired, not yet run |
-| 2-exit | `#![no_core]`, `extern "C" fn main() -> i32`: arithmetic, `let`, `if`, `while`, a call: exit 42 | |
-| 3-hello | `#![no_core]`, `extern "C" { fn write(..) }`, a byte string cast to a pointer: prints `hello` | |
-| 4-modules | `mod util;` in a second file, a struct with fields, a `match` on an integer | |
+| 1-empty | `fn main() {}`: exit 0 | runs (2026-11-15) |
+| 2-exit | `#![no_core]`, `extern "C" fn main() -> i32`: arithmetic, `let`, `if`, `while`, a call: exit 42 | runs (2026-11-15) |
+| 3-hello | `#![no_core]`, `extern "C" { fn write(..) }`, a byte string cast to a pointer: prints `hello` | runs (2026-11-15) |
+| 4-modules | `mod util;` in a second file, a struct with fields, a `match` on an integer | runs (2026-11-15) |
 
 Next, not this ladder's yet: the real `println!` hello world. It needs `core`, `alloc` and `std`
 lowered, checked and built through the new layer: blaze-lower for their bodies and signatures,
@@ -51,8 +51,9 @@ placement, unwinding, and `lang_start`.
   bound in one edit, called through the slot's word; outside symbols (`write`) by `dlsym` of
   `RTLD_DEFAULT` in `blaze-ladder::place` (blaze-launch-rt's own `dlsym` is private to its
   `Loaded` records). `main` runs on the `blaze` process's own thread.
-- **(e) The command.** crates/blaze-cli's `run` does the check request as before, then hands the
-  package's files (read through bstd) to `blaze_ladder::run::run`, and exits with `main`'s status.
+- **(e) The command.** crates/blaze-cli's `run` performs the request machine's
+  `Effect::StartProgram` by handing the package's `src/**.rs` (read through bstd) to
+  `blaze_ladder::run::run`, steps `Event::Exited`, and exits with `main`'s status.
 
 ## Where the skeleton shortcuts the design (a list that shrinks)
 
@@ -81,3 +82,8 @@ placement, unwinding, and `lang_start`.
 ## Log
 
 One line per rung run: date, rung, command, output, exit status.
+
+- 2026-11-15, 1-empty: `ladderrun.sh crates/blaze-cli/tests/ladder run 1-empty` printed `blaze: 2 runs, 3 store reads (0 found), certificate missed`, no stdout; `ladderrun: exit status 0`. Again as `run ./1-empty/`: `0 runs, 1 store reads (1 found), certificate stood`; exit status 0.
+- 2026-11-15, 2-exit: `ladderrun.sh crates/blaze-cli/tests/ladder run 2-exit`: `blaze: 2 runs, 3 store reads (0 found), certificate missed; 59.565 ms in main`, no stdout; `ladderrun: exit status 42`.
+- 2026-11-15, 3-hello: `... run 3-hello`: stdout `hello`; `45.141 ms in main`; `ladderrun: exit status 0`.
+- 2026-11-15, 4-modules: `... run 4-modules`: `blaze: 3 runs, 4 store reads (0 found)`, no stdout; `ladderrun: exit status 42`.

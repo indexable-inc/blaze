@@ -46,6 +46,7 @@
 #[cfg(test)]
 extern crate std;
 
+mod builtin;
 mod error;
 mod facts;
 mod finish;
@@ -58,6 +59,7 @@ mod scope;
 #[cfg(test)]
 mod tests;
 
+pub use builtin::{BUILTIN_TYPES, builtin_type, is_builtin_type};
 pub use error::ResolveError;
 pub use facts::{Name, RecordFacts, ScopeFacts};
 pub use group::Group;

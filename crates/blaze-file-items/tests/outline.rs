@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use blaze_file_items::{Bodies, Outline, outline, outline_with};
+use blaze_file_items::{Bodies, Outline, outline, outline_with, split_top_level};
 use blaze_own::Alloc;
 use blaze_format::Aligned;
 use blaze_surface::{
@@ -330,12 +330,16 @@ fn each_item_form_has_its_kind_name_and_ranges() {
     assert_eq!(call.name, None);
 }
 
-/// A second `impl S {}` after the first is told apart by its disambiguator, 1, whatever its
-/// whitespace; the first keeps 0, and an impl with another header counts apart.
+/// A second `impl S {}` after the first is told apart by its disambiguator, 1; the first keeps
+/// 0, and an impl with another header counts apart. A head is its bytes: `impl   S` is another
+/// head than `impl S` (crate docs, "Why bytes, not tokens").
 #[test]
 fn a_second_equal_impl_gets_disambiguator_one() {
     let one = "struct S;\nimpl S {}\nimpl Clone for S { fn clone(&self) -> S { S } }\n";
-    let two = format!("{one}impl   S {{}}\n");
+    let two = format!("{one}impl S {{}}\n");
+    let spaced = parse(&format!("{one}impl   S {{}}\n"));
+    let disambiguators = spaced.children(None).map(|(_, item)| item.disambiguator).collect::<Vec<_>>();
+    assert_eq!(disambiguators, [0, 0, 0, 0], "a head with other whitespace is another head");
     let (first, second) = (parse(one), parse(&two));
     let impls = |outline: &Outline<'_>| -> Vec<(u32, ContentId)> {
         outline
@@ -348,7 +352,7 @@ fn a_second_equal_impl_gets_disambiguator_one() {
     assert_eq!(before.iter().map(|it| it.0).collect::<Vec<_>>(), [0, 0]);
     assert_eq!(after.iter().map(|it| it.0).collect::<Vec<_>>(), [0, 0, 1]);
     assert_eq!(before[..], after[..2], "the first two impls keep their disambiguators and hashes");
-    assert_eq!(after[0].1, after[2].1, "equal impls apart from whitespace hash alike");
+    assert_eq!(after[0].1, after[2].1, "impls of equal bytes hash alike");
 }
 
 /// A file with syntax errors around items that parse.
@@ -565,6 +569,68 @@ fn skipping_bodies_outlines_as_parsing_them() {
         }
     }
     assert!(files > 250,"library/core under {} holds only {files} .rs files", root.display());
+}
+
+/// Whether the outline made part by part (`outline`: `split_top_level`, `outline_item`,
+/// `assemble`) equals the walk of the whole file, and the parts cover the file in order.
+fn parts_equal_whole(what: &str, text: &str) -> Result<usize, String> {
+    let parts = split_top_level(text, Alloc::global());
+    let mut from = 0;
+    for part in parts.iter() {
+        if part.start != from || part.end < part.start {
+            return Err(format!("{what}: the parts do not cover the file in order: {:?}", &parts[..]));
+        }
+        from = part.end;
+    }
+    if usize::try_from(from).expect("a small file") != text.len() {
+        return Err(format!("{what}: the parts end at {from}, the file at {}", text.len()));
+    }
+    let whole = outline_with(text, Edition::E2024, Bodies::Skipped, Alloc::global());
+    let assembled = outline(text, Edition::E2024, Alloc::global());
+    if whole != assembled {
+        let at = whole.items().iter().zip(assembled.items()).position(|(a, b)| a != b);
+        return Err(format!(
+            "{what}: {} parts outline other than the whole file: {} entries against {}, first at {at:?}: {:?} against {:?}; errors {:?} against {:?}",
+            parts.len(),
+            assembled.items().len(),
+            whole.items().len(),
+            at.and_then(|at| assembled.items().get(at)),
+            at.and_then(|at| whole.items().get(at)),
+            assembled.errors(),
+            whole.errors(),
+        ));
+    }
+    Ok(parts.len())
+}
+
+/// The composition: a file outlined part by part equals the whole file's walk, on the
+/// fixtures, drawn files, and every file of library/.
+#[test]
+fn a_file_outlined_by_parts_equals_its_whole_walk() {
+    for (what, text) in [("FORMS", FORMS), ("BROKEN", BROKEN)] {
+        parts_equal_whole(what, text).unwrap_or_else(|why| panic!("{why}"));
+    }
+    blaze_sim::check(Config::cases(200), |tape| {
+        let (text, _) = text(&file(tape), "", false);
+        parts_equal_whole("a drawn file", &text).map(|_| ()).map_err(Broke::Oracle)
+    });
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut stack = vec![root.clone()];
+    let (mut files, mut parts) = (0usize, 0usize);
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())).flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|it| it == "rs") {
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                parts += parts_equal_whole(&path.display().to_string(), &text).unwrap_or_else(|why| panic!("{why}"));
+                files += 1;
+            }
+        }
+    }
+    assert!(files > 3000, "library/ under {} holds only {files} .rs files", root.display());
+    assert!(parts > 10 * files, "library/'s {files} files split into only {parts} parts");
 }
 
 /// The invariant: editing one function's body changes that entry's whole hash and no other

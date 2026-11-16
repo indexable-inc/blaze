@@ -33,6 +33,50 @@ mod threads {
         }
     }
 
+    /// `get_many` and `get_many_into` answer what `get` answers of each key, duplicates,
+    /// absent and removed keys among them, past the slice form's batch of 16; a set's too.
+    #[test]
+    fn get_many_is_get_of_each() {
+        use blaze_sim::Config;
+
+        blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+            let map: SharedMap<u64, u64> = SharedMap::default();
+            let set: crate::SharedSet<u64> = crate::SharedSet::default();
+            let (pinned, pinned_set) = (map.pin(), set.pin());
+            let range = 1 + tape.below(300, "range");
+            for _ in 0..tape.below(if cfg!(miri) { 40 } else { 300 }, "held") {
+                let key = tape.below(range, "key");
+                if tape.one_in(5, "remove") {
+                    pinned.remove(&key);
+                    pinned_set.remove(&key);
+                } else {
+                    pinned.insert(key, key * 3);
+                    pinned_set.insert(key);
+                }
+            }
+            let mut asked: Vec<u64> =
+                (0..1 + tape.index(40, "asked")).map(|_| tape.below(2 * range, "ask")).collect();
+            let to = tape.index(asked.len(), "duplicate to");
+            asked[to] = asked[tape.index(asked.len(), "duplicate from")];
+
+            let mut out = std::vec![None; asked.len()];
+            pinned.get_many_into(&asked, &mut out);
+            for (at, key) in asked.iter().enumerate() {
+                assert_eq!(out[at], pinned.get(key), "slice: key {key} at {at} of {asked:?}");
+            }
+            let first: [&u64; 1] = [&asked[0]];
+            assert_eq!(pinned.get_many(first), [pinned.get(&asked[0])]);
+            if let Ok(eight) = <[u64; 8]>::try_from(&asked[..asked.len().min(8)]) {
+                let many = pinned.get_many(eight.each_ref());
+                let keys = pinned_set.get_many(eight.each_ref());
+                for (at, key) in eight.iter().enumerate() {
+                    assert_eq!(many[at], pinned.get(key), "array: key {key} of {eight:?}");
+                    assert_eq!(keys[at], pinned_set.get(key), "set: key {key} of {eight:?}");
+                }
+            }
+        });
+    }
+
     #[test]
     fn every_key_is_found_after_its_insert_and_gone_after_its_remove() {
         let map: Arc<SharedMap<usize, usize>> = Arc::new(SharedMap::default());

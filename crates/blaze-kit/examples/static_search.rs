@@ -24,8 +24,18 @@ fn main() {
         let probes: Vec<u32> = (0..1_000_000).map(|_| mix.next().truncate_to::<u32>()).collect();
         let ops = 1_000_000u64;
         let tree = bench::ns_per_op(ops, || probes.iter().map(|&x| u64::try_from(set.lower_bound(x)).unwrap_or(0)).fold(0, u64::wrapping_add));
+        let batched = bench::ns_per_op(ops, || {
+            let (eights, _) = probes.as_chunks::<8>();
+            let mut sum = 0u64;
+            for xs in eights {
+                for at in set.lower_bounds(xs) {
+                    sum = sum.wrapping_add(u64::try_from(at).unwrap_or(0));
+                }
+            }
+            sum
+        });
         let binary =
             bench::ns_per_op(ops, || probes.iter().map(|&x| u64::try_from(keys.partition_point(|&k| k < x)).unwrap_or(0)).fold(0, u64::wrapping_add));
-        bench::row(keys.len(), &[("StaticSearch", tree), ("partition_point", binary), ("bytes", format!("{} vs {}", set.bytes(), keys.len() * 4))]);
+        bench::row(keys.len(), &[("StaticSearch", tree), ("lower_bounds x8", batched), ("partition_point", binary), ("bytes", format!("{} vs {}", set.bytes(), keys.len() * 4))]);
     }
 }

@@ -186,6 +186,9 @@ pub mod flat;
 pub mod fs;
 pub mod gpu;
 pub mod host;
+// The heavy areas, each behind its feature (Cargo.toml, "[features]"; std.md, "What a program
+// pays for at start"): a program that turns none on links none of their dependencies.
+#[cfg(feature = "image")]
 pub mod image;
 /// The simulated host behind the capabilities blaze-core has no effect for, and how a call
 /// on one fails.
@@ -250,6 +253,7 @@ pub mod term;
 pub mod trace;
 /// The rustc debug build's check that a must-finish value was finished, not dropped.
 pub(crate) mod unfinished;
+#[cfg(feature = "video")]
 pub mod video;
 /// Addresses as types: `Scheme`, `Origin`, `Url`.
 pub mod url;

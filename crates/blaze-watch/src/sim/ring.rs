@@ -1,10 +1,10 @@
 //! The emitter's rings under N producers and one reader, interleaved at every atomic operation.
 //!
-//! The oracles: no producer operation ever waits (each push is its eleven operations, each
+//! The oracles: no producer operation ever waits (each push is its twelve operations, each
 //! done when scheduled); every entry the reader keeps is exactly the entry its producer pushed
 //! under that number (never torn); and per lane the reader's reports, in order, cover every
-//! number pushed exactly once, an entry reported lost only once the producer had begun pushing
-//! the entry `len` after it (only the oldest are lost, and the gap count is exact).
+//! number pushed exactly once, an entry reported lost only once the producer had opened the
+//! block of the entry `len` after it (only the oldest are lost, and the gap count is exact).
 
 use std::sync::atomic::Ordering;
 
@@ -35,8 +35,8 @@ struct Producer {
     n: u64,
     ops: [Op; PUSH_OPS],
     op: usize,
-    /// Entries whose first operation is done.
-    begun: u64,
+    /// The frontier the producer has stored: entries at or past it are untouched.
+    frontier: u64,
 }
 
 struct Reader {
@@ -58,7 +58,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             n: 0,
             ops: [Op::Fence(Ordering::Release); PUSH_OPS],
             op: PUSH_OPS,
-            begun: 0,
+            frontier: 0,
         })
         .collect();
     let mut reader = Reader { lane: 0, drain: None, next: vec![0; lanes] };
@@ -97,8 +97,10 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                     p.lane, p.n
                 )));
             }
-            if p.op == 0 {
-                p.begun += 1;
+            if let Op::Store { at, value, .. } = p.ops[p.op]
+                && at == p.ring.frontier()
+            {
+                p.frontier = value;
             }
             p.op += 1;
             if p.op == PUSH_OPS {
@@ -116,7 +118,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         match drain.step(&cells).map_err(harness)? {
             Step::Working => {}
             Step::Got(got) => {
-                let begun = producers[lane].begun;
+                let frontier = producers[lane].frontier;
                 let (from, count) = match got {
                     Got::Event { n, event } => {
                         oracle(event == event_of(lane as u32, n), || {
@@ -125,9 +127,9 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                         (n, 1)
                     }
                     Got::Lost { from, count } => {
-                        oracle(from + count + len <= begun, || {
+                        oracle(from + count + len <= frontier, || {
                             format!(
-                                "gap count: lane {lane} reported entries {from}..{} lost, but only {begun} pushes began (ring of {len})",
+                                "gap count: lane {lane} reported entries {from}..{} lost, but the producer opened entries only below {frontier} (ring of {len})",
                                 from + count
                             )
                         })?;

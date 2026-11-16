@@ -409,8 +409,17 @@ fn canon_key(m: &Model, t: usize, nvars: usize, order: &[usize], junk: usize) ->
     let term = build(&mut cx.tys, m, t, &vars, None);
     let mut buf = CanonBuf::new_in(Alloc::global());
     let c = cx.canonicalize(term.node(), Mode::Input { param_env: false }, &mut buf);
-    assert!(c.is_ok(), "canonicalizing a plain term refused: {c:?}");
-    buf.key.iter().copied().collect()
+    let Ok(c) = c else { panic!("canonicalizing a plain term refused: {c:?}") };
+    let key: Vec<u32> = buf.key.iter().copied().collect();
+    // The one walk wrote the term's words from the canonical nodes as it made them: they are
+    // the words of the finished canonical term written alone (canonicalizing it changes
+    // nothing, so its walk only writes).
+    let mut again = CanonBuf::new_in(Alloc::global());
+    let c2 = cx.canonicalize(c.value, Mode::Input { param_env: false }, &mut again);
+    assert!(matches!(c2, Ok(x) if x.value == c.value && x.vars == 0), "a canonical term canonicalized changed: {c2:?}");
+    let words = key.len() - 2 * buf.vars.len() - 2;
+    assert_eq!(key[..words], again.key[..again.key.len() - 2], "the one walk's key is not the canonical term's");
+    key
 }
 
 #[test]

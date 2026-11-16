@@ -7,8 +7,9 @@
 //!
 //! # Layout
 //!
-//! A column of blocks: kind 0 (1 byte), `len` (`u32`), the directory (a `u32` a block, its
-//! start counted from the first block's), the blocks end to end, [`PAD`] zero bytes. A
+//! A column of blocks: kind 0 (1 byte), `len` (`u32`), the directory (an [`ENTRY`] of 24
+//! bytes a block: its scheme, parameters and body's start, [`block`]'s table), the bodies end
+//! to end, [`PAD`] zero bytes. A
 //! dictionary: kind 1, `len`, the bytes of its values column (`u32`), the values column, the
 //! codes column (each a column of blocks). A dictionary's columns are never dictionaries, so
 //! nothing recurses.
@@ -28,7 +29,7 @@ use blaze_kit::Dict;
 use blaze_own::{AVec, Alloc, Vec};
 
 use super::bits::{BLOCK, PAD};
-use super::block::{self, GetCost, Plan, Scheme};
+use super::block::{self, ENTRY, Entry, GetCost, Plan, Scheme};
 use super::plant::{self, Plant};
 use super::{EncError, len32, patch32, put, read8, read32};
 
@@ -91,11 +92,11 @@ fn choose(values: &[u64], policy: IntPolicy) -> Plan {
     best
 }
 
-/// Bytes the column of blocks of `values` takes under `policy`.
+/// Bytes the column of blocks of `values` takes under `policy` (each plan's size holds its
+/// directory entry).
 fn blocks_size(values: &[u64], policy: IntPolicy) -> usize {
-    let blocks = values.len().div_ceil(BLOCK);
-    let data: usize = values.chunks(BLOCK).map(|chunk| choose(chunk, policy).size(chunk.len())).sum();
-    5 + 4 * blocks + data + PAD
+    let blocks: usize = values.chunks(BLOCK).map(|chunk| choose(chunk, policy).size(chunk.len())).sum();
+    5 + blocks + PAD
 }
 
 /// Appends the column of blocks of `values`; the blocks in each scheme.
@@ -105,15 +106,15 @@ fn write_blocks(values: &[u64], policy: IntPolicy, out: &mut AVec<'_, u8>) -> Re
     put(out, &[KIND_BLOCKS])?;
     put(out, &len.to_le_bytes())?;
     let dir = out.len();
-    out.try_reserve(4 * blocks)?;
-    out.resize(dir + 4 * blocks, 0);
-    let data = out.len();
+    out.try_reserve(ENTRY * blocks)?;
+    out.resize(dir + ENTRY * blocks, 0);
+    let bodies = out.len();
     let mut counts = [0usize; 5];
     for (b, chunk) in values.chunks(BLOCK).enumerate() {
         let plan = choose(chunk, policy);
-        let start = len32(out.len() - data, "an integer column's bytes")?;
-        patch32(out, dir + 4 * b, start);
-        plan.write(chunk, out)?;
+        let start = len32(out.len() - bodies, "an integer column's bytes")?;
+        plan.write_body(chunk, out)?;
+        plan.write_entry(start, &mut out[dir + ENTRY * b..dir + ENTRY * (b + 1)]);
         counts[Scheme::ALL.iter().position(|&s| s == plan.scheme()).unwrap_or(0)] += 1;
     }
     put(out, &[0; PAD])?;
@@ -188,15 +189,15 @@ pub fn ints_size(values: &[u64], policy: IntPolicy, alloc: Alloc<'_>) -> Result<
 /// A column of blocks, checked by [`Blocks::open`].
 #[derive(Clone, Copy, Debug)]
 pub struct Blocks<'a> {
-    /// The column's bytes, from its kind byte to the end of its padding.
-    bytes: &'a [u8],
+    /// The directory: an [`ENTRY`] a block.
+    dir: &'a [u8],
+    /// The blocks' bodies end to end, then the padding.
+    bodies: &'a [u8],
     len: usize,
-    /// Where the first block starts.
-    data: usize,
 }
 
 impl<'a> Blocks<'a> {
-    /// The column of blocks at the start of `bytes`, every block's header checked; the bytes
+    /// The column of blocks at the start of `bytes`, every block's entry checked; the bytes
     /// it takes. `at` is its place, for errors.
     fn open(bytes: &'a [u8], at: usize) -> Result<(Blocks<'a>, usize), EncError> {
         let corrupt = |what, off: usize| EncError::Corrupt { what, at: at + off };
@@ -205,22 +206,26 @@ impl<'a> Blocks<'a> {
         }
         let len = blaze_int::idx(read32(bytes, 1, "a column's length")?);
         let blocks = len.div_ceil(BLOCK);
-        let data = 5 + 4 * blocks;
-        if data > bytes.len() {
+        let data = 5 + ENTRY * blocks;
+        let (Some(dir), Some(rest)) = (bytes.get(5..data), bytes.get(data..)) else {
             return Err(corrupt("a directory past the column's end", 5));
-        }
+        };
         let mut end = 0usize;
-        for b in 0..blocks {
-            let start = blaze_int::idx(read32(bytes, 5 + 4 * b, "a block's start")?);
-            if start != end {
-                return Err(corrupt("a block that does not start where the one before ends", 5 + 4 * b));
+        for (b, raw) in dir.chunks_exact(ENTRY).enumerate() {
+            let place = 5 + ENTRY * b;
+            let e = match raw.first_chunk::<ENTRY>() {
+                Some(raw) if raw[ENTRY - 1] == 0 => Entry::read(raw),
+                _ => return Err(corrupt("an entry whose last byte is not zero", place)),
+            };
+            if e.at != end {
+                return Err(corrupt("a block that does not start where the one before ends", place));
             }
             let n = (len - b * BLOCK).min(BLOCK);
-            end = start + block::check(&bytes[data + start..], n, at + data + start)?;
+            end = e.at + block::check(&e, rest, n, at + place)?;
         }
         let size = data + end + PAD;
         match bytes.get(data + end..size) {
-            Some(pad) if pad.iter().all(|&byte| byte == 0) => Ok((Blocks { bytes: &bytes[..size], len, data }, size)),
+            Some(pad) if pad.iter().all(|&byte| byte == 0) => Ok((Blocks { dir, bodies: &bytes[data..size], len }, size)),
             _ => Err(corrupt("a column without its padding", data + end)),
         }
     }
@@ -229,21 +234,23 @@ impl<'a> Blocks<'a> {
         self.len
     }
 
-    /// The block `b`'s bytes, to the column's end.
+    /// Block `b`'s entry, `b` below the blocks.
     #[inline(always)]
-    fn block(&self, b: usize) -> &'a [u8] {
-        let at = 5 + 4 * b;
-        let start = u32::from_le_bytes([self.bytes[at], self.bytes[at + 1], self.bytes[at + 2], self.bytes[at + 3]]);
-        &self.bytes[self.data + blaze_int::idx(start)..]
+    fn entry(&self, b: usize) -> Entry {
+        match self.dir.get(b * ENTRY..).and_then(<[u8]>::first_chunk::<ENTRY>) {
+            Some(raw) => Entry::read(raw),
+            None => out_of_range(b * BLOCK, self.len),
+        }
     }
 
-    /// Value `i`, below `len`.
+    /// Value `i`, below `len`: block `i / BLOCK`'s entry, then, for `For` and `Linear`, one
+    /// load of the packed value.
     #[inline]
     pub fn get(&self, i: usize) -> u64 {
         if i >= self.len {
             out_of_range(i, self.len);
         }
-        block::get(self.block(i / BLOCK), i % BLOCK)
+        block::get(&self.entry(i / BLOCK), self.bodies, i % BLOCK)
     }
 
     /// The number of values in block `b`.
@@ -255,7 +262,7 @@ impl<'a> Blocks<'a> {
     pub fn decode_block(&self, b: usize, out: &mut [u64], vector: bool) -> usize {
         let n = self.block_len(b);
         if n > 0 {
-            block::decode(self.block(b), &mut out[..n], vector);
+            block::decode(&self.entry(b), self.bodies, &mut out[..n], vector);
         }
         n
     }

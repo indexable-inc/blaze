@@ -52,7 +52,8 @@ pub struct TyCx<'a> {
     pub(crate) rel: Vec<RelFrame, Alloc<'a>>,
     pub(crate) rel_seen: Memo<'a>,
     pub(crate) canon_map: Memo<'a>,
-    pub(crate) key_stack: Vec<(Node, bool), Alloc<'a>>,
+    pub(crate) canon_stack: Vec<crate::canon::CanonFrame, Alloc<'a>>,
+    pub(crate) canon_out: Vec<Node, Alloc<'a>>,
     pub(crate) tainted: bool,
     /// Set by relate when it binds or joins a variable.
     pub(crate) bound: bool,
@@ -75,7 +76,8 @@ impl<'a> TyCx<'a> {
             rel: Vec::new_in(alloc),
             rel_seen: Memo::new_in(alloc),
             canon_map: Memo::new_in(alloc),
-            key_stack: Vec::new_in(alloc),
+            canon_stack: Vec::new_in(alloc),
+            canon_out: Vec::new_in(alloc),
             tainted: false,
             bound: false,
         }

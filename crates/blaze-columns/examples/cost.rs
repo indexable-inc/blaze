@@ -9,8 +9,9 @@
 //!
 //!     cargo run --release -p blaze-columns --example cost -- <dir>
 //!
-//! The floor a `get` aims at: the value's cache line and its block's header line, hot, a few
-//! nanoseconds; the directory's line serves 16 blocks and stays hot.
+//! The floor a `get` aims at: the plain array's get (one load) plus the block's directory
+//! entry, a load whose address is known before the value's, so about a nanosecond. Last, the
+//! id dictionary on a synthetic set of `ModuleScope` id columns ([`scope_ids`]).
 
 #![expect(clippy::print_stdout, reason = "an example prints its measurements")]
 
@@ -21,7 +22,8 @@ use std::time::Instant;
 use blaze_columns::enc::bits::BLOCK;
 use blaze_columns::enc::block::pfor_estimate;
 use blaze_columns::enc::{
-    DictUse, GetCost, IntPolicy, IntView, Scheme, StrPolicy, StrScheme, StrView, encode_ints, encode_strs,
+    DictUse, GetCost, IdView, IntPolicy, IntView, Scheme, StrPolicy, StrScheme, StrView, encode_ids, encode_ints,
+    encode_strs,
 };
 use blaze_own::{Alloc, Vec};
 use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
@@ -245,6 +247,102 @@ fn strs_column(name: &str, strs: &[&[u8]]) {
     }
 }
 
+/// 32 bytes from the generator: an id as uniform as a `ContentId`.
+fn random_id(rng: &mut Rng) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    for chunk in id.chunks_mut(8) {
+        rng.below(2);
+        chunk.copy_from_slice(&rng.0.to_le_bytes());
+    }
+    id
+}
+
+/// The `ContentId` columns of `ModuleScope` binding rows (`def` and `vis_key`, 64 of a row's
+/// bytes), synthetic: core's real shape from the scope pipeline's run (406 modules, 102,681
+/// bindings, 253 a module) with a model of repetition (stated in the output), written plain
+/// and as id dictionaries, a record at a time.
+fn scope_ids() {
+    const MODULES: usize = 406;
+    const BINDINGS: usize = 102_681;
+    let mut rng = Rng(0x5eed_0000_0000_0001);
+    let crate_root = random_id(&mut rng);
+    let mut records: std::vec::Vec<(std::vec::Vec<[u8; 32]>, std::vec::Vec<[u8; 32]>)> = std::vec::Vec::new();
+    for m in 0..MODULES {
+        let rows = BINDINGS / MODULES + usize::from(m < BINDINGS % MODULES);
+        let (module, parent) = (random_id(&mut rng), random_id(&mut rng));
+        let mut defs: std::vec::Vec<[u8; 32]> = std::vec::Vec::with_capacity(rows);
+        let mut vis: std::vec::Vec<[u8; 32]> = std::vec::Vec::with_capacity(rows);
+        for _ in 0..rows {
+            // 15% a def bound before in another namespace (a unit or tuple struct's type and
+            // constructor, a fn and its macro), else a new def.
+            let def = if !defs.is_empty() && rng.below(100) < 15 { defs[rng.below(defs.len())] } else { random_id(&mut rng) };
+            defs.push(def);
+            // `pub` (the zero key) half the time, `pub(crate)` a fifth, private a quarter,
+            // `pub(super)` the rest.
+            vis.push(match rng.below(100) {
+                0..50 => [0; 32],
+                50..70 => crate_root,
+                70..95 => module,
+                _ => parent,
+            });
+        }
+        records.push((defs, vis));
+    }
+    println!(
+        "\nscope record ids (synthetic, described above `scope_ids`): {MODULES} records, {BINDINGS} binding rows; def: 15% repeats in a record; vis_key: 4 keys a record"
+    );
+    println!("  {:<14} {:>10} {:>10} {:>7} {:>9}", "column", "plain", "dict", "ratio", "get ns");
+    for (label, pick) in [("def", 0usize), ("vis_key", 1)] {
+        let mut encoded: std::vec::Vec<Vec<u8, Alloc<'static>>> = std::vec::Vec::new();
+        let (mut plain, mut dict) = (0usize, 0usize);
+        for (defs, vis) in &records {
+            let rows = if pick == 0 { defs } else { vis };
+            let mut bytes = Vec::new_in(Alloc::global());
+            if let Err(e) = encode_ids(rows, Alloc::global(), &mut bytes) {
+                println!("  {label:<14} refused: {e}");
+                return;
+            }
+            plain += 32 * rows.len();
+            dict += bytes.len();
+            encoded.push(bytes);
+        }
+        let views: std::vec::Vec<IdView<'_, 32>> = match encoded.iter().map(|b| IdView::<32>::open(b)).collect() {
+            Ok(views) => views,
+            Err(e) => {
+                println!("  {label:<14} open refused: {e}");
+                return;
+            }
+        };
+        let picks: std::vec::Vec<(usize, usize)> = indices(BINDINGS, GETS)
+            .into_iter()
+            .map(|i| {
+                let r = i % MODULES;
+                (r, i % views[r].len().max(1))
+            })
+            .collect();
+        let start = Instant::now();
+        let mut sum = 0u8;
+        for &(r, i) in &picks {
+            sum ^= views[r].get(i)[0];
+        }
+        let get = ns(start, picks.len());
+        std::hint::black_box(sum);
+        let wrong = records
+            .iter()
+            .zip(&views)
+            .map(|((defs, vis), view)| {
+                let rows = if pick == 0 { defs } else { vis };
+                rows.iter().enumerate().filter(|&(i, row)| view.get(i) != row).count()
+            })
+            .sum::<usize>();
+        println!(
+            "  {label:<14} {plain:>10} {dict:>10} {:>7.2} {get:>9.2}{}",
+            plain as f64 / dict.max(1) as f64,
+            if wrong > 0 { format!("  {wrong} WRONG") } else { String::new() }
+        );
+    }
+}
+
 /// A token kind's variant name, interned to a small id in order of first sight.
 fn kind_id(kind: &TokenKind, ids: &mut HashMap<String, u64>) -> u64 {
     let text = format!("{kind:?}");
@@ -293,4 +391,5 @@ fn main() {
     ints_column("identifier offsets", &offsets);
     ints_column("line lengths", &lines);
     ints_column("token kinds", &kinds);
+    scope_ids();
 }

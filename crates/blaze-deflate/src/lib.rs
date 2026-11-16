@@ -30,6 +30,7 @@
 extern crate std;
 
 mod checksum;
+mod fast;
 pub mod simd;
 mod deflate;
 mod error;

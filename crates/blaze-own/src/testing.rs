@@ -11,7 +11,8 @@
 //! - [`every_failure`] runs a closure once to count its allocations and growths, then once per
 //!   one of them with that one refused, and requires every run to come back with the closure's
 //!   typed error and to leave nothing live. A panic fails the test that called it, and an abort
-//!   ends it: both are findings, as the rule for library code is a typed error.
+//!   ends it: both are findings, as the rule for library code is a typed error. Under Miri it
+//!   refuses [`MIRI_FAILURE_POINTS`] of them, spread evenly over the run.
 //!
 //! The table of live blocks has [`SLOTS`] entries (rule 18, a table a cap): an allocation past
 //! it is refused and recorded as wrong, never untracked.
@@ -503,9 +504,21 @@ impl<E: fmt::Display> fmt::Display for EveryFailure<E> {
     }
 }
 
+/// Failure points [`every_failure`] tries under Miri at most. Each point reruns the whole
+/// closure, so the cost is the square of its size, which the interpreter cannot pay.
+pub const MIRI_FAILURE_POINTS: usize = 24;
+
+/// The allocations and growths to refuse, one run each: all `events` of them, or under Miri
+/// [`MIRI_FAILURE_POINTS`] spread evenly from the first to the last, so the early growth, the
+/// middle and the last allocation are each still refused once.
+fn failure_points(events: usize) -> impl Iterator<Item = usize> {
+    let tried = if cfg!(miri) { events.min(MIRI_FAILURE_POINTS) } else { events };
+    (0..tried).map(move |i| if tried == events { i } else { i * (events - 1) / (tried - 1) })
+}
+
 /// Runs `run` once with nothing refused, counting its allocations and growths, then once per
-/// one of them with that one refused (see the module); the number of events, or the first run
-/// that broke the rule.
+/// one of them with that one refused (see the module; under Miri, [`MIRI_FAILURE_POINTS`] of
+/// them spread evenly); the number of events, or the first run that broke the rule.
 ///
 /// `run` gets the allocator to build with; what it returns cannot borrow it, so everything it
 /// made is dropped by the time it returns, and anything still live is a leak.
@@ -519,7 +532,7 @@ pub fn every_failure<'b, B: Allocator, T, E>(
     let result = result.map(drop);
     clean.inner().check().map_err(|leaked| EveryFailure::Leaked { at: None, leaked })?;
     result.map_err(EveryFailure::CleanRunFailed)?;
-    for at in 0..events {
+    for at in failure_points(events) {
         let alloc = FailAt::at(Counting::new(base), at);
         let result = run(&alloc);
         let seen = alloc.seen();

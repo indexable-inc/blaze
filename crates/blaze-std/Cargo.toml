@@ -40,14 +40,32 @@ blaze-report.workspace = true
 blaze-sha256.workspace = true
 blaze-spin.workspace = true
 # bstd::image's zlib: inflated straight into the buffer decode sized and limited, and deflated.
-blaze-deflate.workspace = true
+blaze-deflate = { workspace = true, optional = true }
 
 # bstd::video's VideoToolbox provider (src/video/videotoolbox.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-core-foundation.workspace = true
-objc2-core-media.workspace = true
-objc2-core-video.workspace = true
-objc2-video-toolbox.workspace = true
+objc2-core-foundation = { workspace = true, optional = true }
+objc2-core-media = { workspace = true, optional = true }
+objc2-core-video = { workspace = true, optional = true }
+objc2-video-toolbox = { workspace = true, optional = true }
+
+# A bstd program pays at start only for what it calls (std.md, "What a program pays for at
+# start"): the default is the core a command-line tool needs (files, output, the host's core
+# count, frames, threads, time, text, the capabilities with no dependency of their own), and
+# each heavy area, with the dependencies it links, is behind its feature. A crate that uses one
+# names it in its own manifest.
+[features]
+default = []
+# `bstd::image`: PNG decode and encode, and its zlib.
+image = ["dep:blaze-deflate"]
+# `bstd::video`: the MP4 muxer, and the HEVC encoder on VideoToolbox on macOS, which links
+# VideoToolbox, CoreMedia, CoreVideo, CoreFoundation, IOSurface, libobjc and Foundation.
+video = [
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-media",
+    "dep:objc2-core-video",
+    "dep:objc2-video-toolbox",
+]
 
 [dev-dependencies]
 blaze-sim.workspace = true

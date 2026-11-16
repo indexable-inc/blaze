@@ -14,6 +14,8 @@ pub(crate) enum Plant {
     DistanceOffByOne,
     /// The gzip reader takes any CRC-32 in a trailer.
     GzipCrcUnchecked,
+    /// The fast loop copies every match from one byte farther back than its distance says.
+    FastDistanceOffByOne,
 }
 
 #[cfg(test)]

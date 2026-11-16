@@ -9,30 +9,38 @@
 //! ([`Ring::words`]), so two producers never share a line; a producer shares one with the reader
 //! only on the slots it writes.
 //!
-//! **The protocol** is a seqlock with every word atomic (so no data race exists to reason about,
-//! and no `unsafe`): Boehm's form ("Can seqlocks get along with programming language memory
-//! models?", 2012). Entry `n` (0-based) is in slot `n mod len`; its stamp is `(n + 1) << 1`, odd
-//! while it is written. A push is the fixed list [`push_ops`]:
+//! **The protocol** has every word atomic (so no data race exists to reason about), and a fence
+//! a block of entries, not a slot. Entry `n` (0-based) is in slot `n mod len`; its stamp is
+//! `(n + 1) << 1`. The ring's slots are cut in blocks of [`Ring::block`] entries (64 in a real
+//! ring), and the ring's **frontier** word says how far the producer may be writing: every entry
+//! at or past it is untouched. A push is the fixed list [`push_ops`]:
 //!
-//! 1. the stamp, odd (`Relaxed`): marks the slot busy;
-//! 2. a `Release` fence: a reader that sees any payload word of this write, and then fences
-//!    `Acquire`, sees step 1 or later in its second stamp load, so it cannot accept a torn copy;
-//! 3. the payload words (`Relaxed`);
-//! 4. the stamp, even (`Release`): a reader that loads it `Acquire` sees the whole payload;
-//! 5. the ring's head, `n + 1` (`Release`): a reader that loads it `Acquire` knows every entry
-//!    below is stamped (or overwritten by a later lap, which its stamp says).
+//! 1. at a block's first entry only, the frontier, the block's end (`Relaxed`);
+//! 2. then only, a `Release` fence: a reader that sees any payload word written after it, and
+//!    then fences `Acquire`, sees step 1's frontier or a later one;
+//! 3. the payload words and the stamp (`Relaxed`);
+//! 4. the ring's head, `n + 1` (`Release`): a reader that loads it `Acquire` sees every entry
+//!    below it whole (or overwritten by a later lap, which the frontier says).
 //!
 //! The producer is the ring's only writer, so the head is a store, not a `fetch_add`: no
 //! read-modify-write and no contention. A push is the same operations whatever any reader does:
-//! wait-free. When the ring is full the oldest entry is overwritten.
+//! wait-free. When the ring is full the oldest entry is overwritten. Measured
+//! (`examples/cost.rs`, 2026-11-15, an arm64 Mac): a fence a slot was 1.2 ns of a 2.6 ns push.
+//!
+//! Why the fence is still needed, a block: without it the stores of entry `n + len` (the next
+//! lap in `n`'s slot) may be seen before anything that says they began, so a reader copying
+//! entry `n` could take half of each and keep it. Step 2 orders "this block may be written"
+//! before the block's stores; the reader's check after its copy sees it.
 //!
 //! **A drain** ([`Drain`], a step machine, one atomic operation a step) loads the head
-//! (`Acquire`), and for each entry from its cursor: the stamp (`Acquire`), the payload
-//! (`Relaxed`), an `Acquire` fence, the stamp again (`Relaxed`); the entry is kept only when
-//! both stamps are its own even stamp. Entries the producer lapped before the drain reached
-//! them, and entries overwritten during the copy, are reported as [`Got::Lost`] with their
-//! numbers, so `delivered + lost` is exactly the number of entries pushed since the cursor, and
-//! an entry is lost only when `len` newer ones were pushed: only the oldest are lost.
+//! (`Acquire`), and for each entry `n` from its cursor: the stamp, the payload (`Relaxed`), an
+//! `Acquire` fence, then the frontier (`Relaxed`); the entry is kept only when the stamp is its
+//! own and the frontier is at most `n + len` (no later lap has begun in its slot). Entries the
+//! producer lapped before the drain reached them, and entries whose block was opened for the
+//! next lap during the copy, are reported as [`Got::Lost`] with their numbers, so
+//! `delivered + lost` is exactly the number of entries pushed since the cursor, and an entry is
+//! lost only once its slot's block was opened for the next lap: only the oldest are lost (at
+//! most a block sooner than a slot-at-a-time ring would lose them).
 //!
 //! **A thread's lane** is claimed once, when the thread first records (a compare-exchange over
 //! the lane states, the only read-modify-write in the emitter), and given back by dropping its
@@ -53,24 +61,30 @@ use core::sync::atomic::{AtomicU64, Ordering, fence};
 pub const LINE: usize = 8;
 /// The most payload words a slot has.
 pub const MOST_PAYLOAD: usize = LINE - 1;
-/// The most atomic operations of one push: busy stamp, fence, payload, stamp, head.
-pub const MOST_PUSH_OPS: usize = 4 + MOST_PAYLOAD;
+/// The most atomic operations of one push: frontier, fence, a plant's wait, payload, stamp,
+/// head.
+pub const MOST_PUSH_OPS: usize = 5 + MOST_PAYLOAD;
 /// The most lanes an emitter may have (a thread each).
 pub const MOST_LANES: usize = 4096;
 /// The most entries a ring may hold.
 pub const MOST_LEN: u64 = 1 << 20;
 
-/// The odd bit of a stamp: the slot is being written.
-const BUSY: u64 = 1;
-
-/// Entry `n`'s stamp once written.
+/// Entry `n`'s stamp.
+#[inline(always)]
 pub const fn stamp(n: u64) -> u64 {
     (n + 1) << 1
 }
 
-/// That `W` words with `P` of payload is a slot: `W` divides a line and `P` is `W - 1`.
+/// The frontier's word in a ring's head slot (the head is word 0, the plant's reader word 1).
+const FRONTIER: usize = 2;
+
+/// The most entries of a block: one frontier store and one fence each.
+pub const MOST_BLOCK: u64 = 64;
+
+/// That `W` words with `P` of payload is a slot: `W` divides a line and `P` is `W - 1`; the
+/// head's slot holds the head, the reader's word and the frontier.
 const fn shape<const W: usize, const P: usize>() {
-    assert!(W >= 2 && LINE.is_multiple_of(W), "a slot is 2, 4 or 8 words");
+    assert!(W >= 4 && LINE.is_multiple_of(W), "a slot is 4 or 8 words");
     assert!(P + 1 == W, "a slot's payload is its words but the stamp");
 }
 
@@ -80,7 +94,7 @@ const fn shape<const W: usize, const P: usize>() {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Plant {
     None,
-    /// The drain keeps a slot without checking its stamp again after the copy: a torn entry is
+    /// The drain keeps a slot without checking the frontier after the copy: a torn entry is
     /// delivered.
     NoRecheck,
     /// The drain counts one more lost entry than were overwritten when a ring was lapped.
@@ -161,6 +175,13 @@ impl<A: Allocator> Lines<A> {
     fn word(&self, at: usize) -> &AtomicU64 {
         &self.lines[at / LINE].0[at % LINE]
     }
+
+    /// Every word, in order.
+    fn all(&self) -> &[AtomicU64] {
+        // SAFETY: `Line` is `repr(C)`, 8 words of 8 bytes aligned to 64: no padding, so `count`
+        // lines are `count * LINE` words in a row, borrowed for as long as `self` is.
+        unsafe { core::slice::from_raw_parts(self.lines.as_ptr().cast::<AtomicU64>(), self.lines.len() * LINE) }
+    }
 }
 
 impl<A: Allocator> Cells for Lines<A> {
@@ -199,6 +220,24 @@ impl<const W: usize> Ring<W> {
         self.base + 1
     }
 
+    /// The word of the ring's frontier: every entry at or past it is untouched.
+    pub const fn frontier(self) -> usize {
+        self.base + FRONTIER
+    }
+
+    /// The entries of a block: an eighth of the ring, 1 to [`MOST_BLOCK`], a power of two.
+    #[inline(always)]
+    pub const fn block(self) -> u64 {
+        let block = self.len / 8;
+        if block == 0 {
+            1
+        } else if block > MOST_BLOCK {
+            MOST_BLOCK
+        } else {
+            block
+        }
+    }
+
     /// Word `w` of entry `n`'s slot.
     #[inline(always)]
     pub const fn word(self, n: u64, w: usize) -> usize {
@@ -223,18 +262,22 @@ pub struct PushOps {
 /// [`Producer::push`] does the same stores directly.
 pub fn push_ops<const W: usize, const P: usize>(ring: Ring<W>, n: u64, payload: &[u64; P], plant: Plant) -> PushOps {
     const { shape::<W, P>() };
+    // The fillers are fences, which order nothing more than the protocol's own operations do.
     let mut ops = [Op::Fence(Ordering::Release); MOST_PUSH_OPS];
-    ops[0] = Op::Store { at: ring.word(n, 0), value: stamp(n) | BUSY, order: Ordering::Relaxed };
+    let block = ring.block();
+    if n % block == 0 {
+        ops[0] = Op::Store { at: ring.frontier(), value: n + block, order: Ordering::Relaxed };
+    }
     if plant == Plant::WaitForReader && n >= ring.len {
         // The plant: do not overwrite an entry the reader has not passed.
-        ops[1] = Op::Await { at: ring.reader(), least: n + 1 - ring.len };
+        ops[2] = Op::Await { at: ring.reader(), least: n + 1 - ring.len };
     }
     for (w, value) in payload.iter().enumerate() {
-        ops[2 + w] = Op::Store { at: ring.word(n, 1 + w), value: *value, order: Ordering::Relaxed };
+        ops[3 + w] = Op::Store { at: ring.word(n, 1 + w), value: *value, order: Ordering::Relaxed };
     }
-    ops[2 + P] = Op::Store { at: ring.word(n, 0), value: stamp(n), order: Ordering::Release };
-    ops[3 + P] = Op::Store { at: ring.head(), value: n + 1, order: Ordering::Release };
-    PushOps { ops, len: P + 4 }
+    ops[3 + P] = Op::Store { at: ring.word(n, 0), value: stamp(n), order: Ordering::Relaxed };
+    ops[4 + P] = Op::Store { at: ring.head(), value: n + 1, order: Ordering::Release };
+    PushOps { ops, len: P + 5 }
 }
 
 /// What a drain found, in entry order: an entry's `P` payload words, or a run of lost entries.
@@ -292,7 +335,6 @@ pub struct Drain<const W: usize, const P: usize> {
     from: u64,
     head: u64,
     n: u64,
-    first: u64,
     words: [u64; P],
     phase: Phase,
     #[doc(hidden)]
@@ -302,7 +344,7 @@ pub struct Drain<const W: usize, const P: usize> {
 impl<const W: usize, const P: usize> Drain<W, P> {
     pub fn new(ring: Ring<W>, from: u64) -> Drain<W, P> {
         const { shape::<W, P>() };
-        Drain { ring, from, head: 0, n: from, first: 0, words: [0; P], phase: Phase::Head, plant: Plant::None }
+        Drain { ring, from, head: 0, n: from, words: [0; P], phase: Phase::Head, plant: Plant::None }
     }
 
     fn advance(&mut self) {
@@ -333,14 +375,12 @@ impl<const W: usize, const P: usize> Drain<W, P> {
                 Ok(Step::Working)
             }
             Phase::Stamp => {
-                let first = cells.load(ring.word(self.n, 0), Ordering::Acquire);
-                if first != stamp(self.n) {
-                    // Below the head, so written: a later lap is in the slot, or being written.
+                // Below the head, so written: another stamp is a later lap's.
+                if cells.load(ring.word(self.n, 0), Ordering::Relaxed) != stamp(self.n) {
                     let from = self.n;
                     self.advance();
                     return Ok(Step::Got(Got::Lost { from, count: 1 }));
                 }
-                self.first = first;
                 self.phase = Phase::Word(0);
                 Ok(Step::Working)
             }
@@ -364,10 +404,11 @@ impl<const W: usize, const P: usize> Drain<W, P> {
                 Ok(Step::Working)
             }
             Phase::Recheck => {
-                let again = cells.load(ring.word(self.n, 0), Ordering::Relaxed);
+                // After the fence: a later lap that began in this slot opened its block first.
+                let frontier = cells.load(ring.frontier(), Ordering::Relaxed);
                 let n = self.n;
                 self.advance();
-                if again != self.first {
+                if frontier > n + ring.len {
                     return Ok(Step::Got(Got::Lost { from: n, count: 1 }));
                 }
                 Ok(Step::Got(Got::Entry { n, words: self.words }))
@@ -473,7 +514,10 @@ impl<A: Allocator, const W: usize> Emitter<A, W> {
                 let lane = Lane(index as u32);
                 let ring = self.ring(lane);
                 let next = self.cells.load(ring.head(), Ordering::Relaxed);
-                return Ok(Producer { emitter: self, ring, lane, next });
+                let words = &self.cells.all()[ring.base..ring.base + Ring::<W>::words(self.len)];
+                // The first push opens its block whatever its number: the last producer's
+                // frontier was its own thread's.
+                return Ok(Producer { emitter: self, words, mask: self.len - 1, block: ring.block(), lane, next, open: next });
             }
         }
         Err(EmitterError::Full { lanes: self.states.len() })
@@ -519,9 +563,15 @@ impl<A: Allocator, const W: usize> Emitter<A, W> {
 /// ends the lane (a `Release` store, so the reader that sees `Ended` sees every entry before).
 pub struct Producer<'e, A: Allocator, const W: usize> {
     emitter: &'e Emitter<A, W>,
-    ring: Ring<W>,
+    /// The ring's own words: its head slot, then its `len` slots.
+    words: &'e [AtomicU64],
+    /// `len - 1`: a slot's number from an entry's.
+    mask: u64,
+    block: u64,
     lane: Lane,
     next: u64,
+    /// The entry whose push opens a block next.
+    open: u64,
 }
 
 impl<A: Allocator, const W: usize> Producer<'_, A, W> {
@@ -534,44 +584,40 @@ impl<A: Allocator, const W: usize> Producer<'_, A, W> {
         self.next
     }
 
-    /// Pushes `payload` as the next entry and returns its number: [`push_ops`]' stores and
-    /// fence, done directly, never a wait.
+    /// Pushes `payload` as the next entry and returns its number: [`push_ops`]' stores (and, a
+    /// block, its fence), done directly, never a wait.
     #[inline(always)]
     pub fn push<const P: usize>(&mut self, payload: &[u64; P]) -> u64 {
         const { shape::<W, P>() };
-        let (ring, n, cells) = (self.ring, self.next, &self.emitter.cells);
-        let slot = ring.word(n, 0);
-        let line = &cells.lines[slot / LINE].0;
-        let at = slot % LINE;
-        line[at].store(stamp(n) | BUSY, Ordering::Relaxed);
-        store_store();
-        for (w, value) in payload.iter().enumerate() {
-            line[at + 1 + w].store(*value, Ordering::Relaxed);
+        let n = self.next;
+        if n == self.open {
+            self.open_block(n);
         }
-        line[at].store(stamp(n), Ordering::Release);
-        cells.store(ring.head(), n + 1, Ordering::Release);
+        // In locals: the stores below may not be assumed apart from `self`, which would be read
+        // again after each.
+        let words = self.words;
+        let at = W * (1 + (n & self.mask) as usize);
+        // SAFETY: `words` is the ring's `Ring::words(len)` words, at least `W * (1 + len)`, and
+        // `at + W <= W * (1 + len)` because `n & mask < len`; the head is word 0.
+        unsafe {
+            for (w, value) in payload.iter().enumerate() {
+                words.get_unchecked(at + 1 + w).store(*value, Ordering::Relaxed);
+            }
+            words.get_unchecked(at).store(stamp(n), Ordering::Relaxed);
+            words.get_unchecked(0).store(n + 1, Ordering::Release);
+        }
         self.next = n + 1;
         n
     }
-}
 
-/// Step 2's fence, as the hardware needs it: between the busy stamp and the payload the producer
-/// only stores, so all the `Release` fence has to give is that the busy stamp is visible before
-/// any payload word (a reader that read a new payload word and then fenced sees the stamp
-/// busy). On arm64 that is `dmb ishst` (a store-store barrier), where `fence(Release)` is a full
-/// `dmb ish` that also waits for every earlier load; Rust has no store-store fence, so it is
-/// written out. The asm has no `nomem`, so the compiler moves no memory access across it either.
-/// The simulation keeps `Op::Fence(Release)`, the stronger form. On x86-64 (TSO: stores are seen
-/// in order) the fence is the compiler's only, as `fence(Release)` is there.
-#[inline(always)]
-fn store_store() {
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: a barrier: reads and writes no register or memory of the program's.
-    unsafe {
-        core::arch::asm!("dmb ishst", options(nostack, preserves_flags));
+    /// Steps 1 and 2: the frontier moves to the end of `n`'s block, then the fence.
+    #[inline(never)]
+    fn open_block(&mut self, n: u64) {
+        let end = (n | (self.block - 1)) + 1;
+        self.words[FRONTIER].store(end, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.open = end;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    fence(Ordering::Release);
 }
 
 impl<A: Allocator, const W: usize> Drop for Producer<'_, A, W> {

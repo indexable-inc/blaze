@@ -5,7 +5,8 @@
 //! The rings are blaze-trace's (`blaze_trace::ring`, their one home: the protocol, the drain
 //! and the lanes are documented there); this module is their 64-byte width carrying an
 //! [`Event`]: a stamp word and seven payload words (kind, flags, detail, time, value and a
-//! 32-byte key). A push is eleven operations ([`push_ops`]).
+//! 32-byte key). A push is twelve operations ([`push_ops`]), fences filling the ones only a
+//! block's first push needs.
 //!
 //! **The flight recorder** is these rings, read from `head - len` without moving any cursor
 //! ([`Emitter::drain`] takes the cursor it is given): the last `len` entries of every thread are
@@ -25,8 +26,8 @@ use crate::Plant;
 pub const WORDS: usize = 8;
 /// The payload words of an entry.
 pub const PAYLOAD: usize = WORDS - 1;
-/// The atomic operations of one push: busy stamp, fence, payload, stamp, head.
-pub const PUSH_OPS: usize = 4 + PAYLOAD;
+/// The atomic operations of one push: frontier, fence, a plant's wait, payload, stamp, head.
+pub const PUSH_OPS: usize = 5 + PAYLOAD;
 
 /// Where one ring of events is in the cells.
 pub type Ring = base::Ring<WORDS>;
@@ -113,7 +114,7 @@ fn ring_plant(plant: Plant) -> base::Plant {
     }
 }
 
-/// The operations of pushing `event` as entry `n` of `ring`, in order. The same eleven
+/// The operations of pushing `event` as entry `n` of `ring`, in order. The same twelve
 /// whatever the ring holds: no loop, no wait.
 pub fn push_ops(ring: Ring, n: u64, event: &Event) -> [Op; PUSH_OPS] {
     push_ops_planted(ring, n, event, Plant::None)
@@ -231,7 +232,7 @@ impl<A: Allocator> Producer<'_, A> {
         self.0.lane()
     }
 
-    /// Emits `event`: eleven stores and a fence, never a wait.
+    /// Emits `event`: nine stores (a block's first: one more and a fence), never a wait.
     #[inline]
     pub fn push(&mut self, event: &Event) {
         self.0.push(&event.words());

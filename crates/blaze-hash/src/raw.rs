@@ -28,10 +28,20 @@ use core::{
 };
 
 use blaze_own::AllocFailure;
-use blaze_swiss::{Ctrl, DEAD, EMPTY, Slots, find, live_tag, vacant};
+use blaze_swiss::{Ctrl, DEAD, EMPTY, Slots, find, home, live_tag, vacant};
 
 /// Slots per group: one control word holds eight tags.
 pub(crate) const SLOTS: usize = 8;
+
+/// The cache line: 128 bytes on Apple's arm64 cores, 64 elsewhere.
+const LINE: usize =
+    if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) { 128 } else { 64 };
+
+/// How many keys the slice forms (`get_many_into`) prefetch ahead of the one they probe:
+/// with a home word and a slot line each, eight keys keep about the 30 misses an Apple core
+/// overlaps in flight. `examples/hash_cost.rs batch` on an M-series Mac, 10^7 entries, hits:
+/// depth 8 at 8.9 to 9.3 ns a lookup, depth 16 at 10.2, one at a time 11.9.
+pub(crate) const BATCH: usize = 8;
 
 type Word = Ctrl<SLOTS>;
 
@@ -198,6 +208,53 @@ impl<T, A: Allocator> RawTable<T, A> {
             let index = at.index();
             eq(self.get(index)).then_some(index)
         })
+    }
+
+    /// Whether a group's slots are at most two lines, so a prefetch loads them all before its
+    /// word is read; wider groups prefetch only the slot the word's first tag match names.
+    const SLOTS_AHEAD: bool = size_of::<T>() * SLOTS <= 2 * LINE;
+
+    /// Starts loading what a [`RawTable::find`] of `hash` reads first: the home group's word
+    /// and, for a group of at most two lines, its slots. A hint: it reads nothing.
+    #[inline]
+    pub(crate) fn prefetch(&self, hash: u64) {
+        if self.groups == 0 {
+            return;
+        }
+        let group = home(hash, self.groups);
+        blaze_swiss::prefetch(self.ctrl.as_ptr().wrapping_add(group).cast_const());
+        let bytes = size_of::<T>() * SLOTS;
+        if Self::SLOTS_AHEAD && bytes > 0 {
+            let first = self.slots.as_ptr().wrapping_add(group * SLOTS).cast::<u8>().cast_const();
+            let mut offset = 0;
+            while offset < bytes {
+                blaze_swiss::prefetch(first.wrapping_add(offset));
+                offset += LINE;
+            }
+            // The group need not start a line: its last byte may be one line further.
+            blaze_swiss::prefetch(first.wrapping_add(bytes - 1));
+        }
+    }
+
+    /// [`RawTable::prefetch`] of every hash, then, for groups too wide to load whole, the
+    /// slot each home word's first tag match names: what a batch of finds runs first, so its
+    /// misses overlap rather than queue.
+    #[inline]
+    pub(crate) fn prefetch_all(&self, hashes: &[u64]) {
+        for &hash in hashes {
+            self.prefetch(hash);
+        }
+        if Self::SLOTS_AHEAD || self.groups == 0 {
+            return;
+        }
+        for &hash in hashes {
+            let group = home(hash, self.groups);
+            if let Some(slot) = self.word(group).matching(live_tag(hash)).first() {
+                blaze_swiss::prefetch(
+                    self.slots.as_ptr().wrapping_add(group * SLOTS + slot).cast_const(),
+                );
+            }
+        }
     }
 
     /// Puts `value` of `hash` in a new slot, which it returns; `hasher` hashes a held value if

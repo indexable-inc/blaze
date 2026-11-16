@@ -13,6 +13,9 @@
 
 #![no_std]
 #![feature(allocator_api, portable_simd, register_tool, custom_inner_attributes)]
+// `core::hint::prefetch_read`: `Tys::intern_many` starts every home group's load before the
+// first probe, so a batch's cache misses overlap.
+#![feature(hint_prefetch)]
 #![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
@@ -30,8 +33,6 @@ mod index;
 mod infer;
 mod kind;
 mod memo;
-#[doc(hidden)]
-pub mod pieces;
 mod portable;
 mod print;
 mod relate;

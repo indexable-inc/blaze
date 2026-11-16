@@ -6,12 +6,13 @@
 use blaze_drive::lines::LineTable;
 use blaze_drive::{Answer, Print, Request};
 use bstd::cx::Cx;
-use bstd::fs::{Content, Dir, Durable, ReadWrite};
+use bstd::fs::{Dir, Durable, ReadWrite};
 use bstd::mem::{Bytes, Frame, format_in};
 use bstd::out::Out;
 use bstd::path::Path;
 
 use crate::CliError;
+use crate::phases::Phases;
 
 pub fn finding(cx: &Cx, root: &Dir<ReadWrite>, req: &Request<'_>, finding: &Print<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
     let message = core::str::from_utf8(&finding.message).unwrap_or("(a message that is not UTF-8)");
@@ -34,8 +35,16 @@ pub fn finding(cx: &Cx, root: &Dir<ReadWrite>, req: &Request<'_>, finding: &Prin
 
 const PROFILE: &str = ".blaze/v2/profile.txt";
 
-pub fn profile(cx: &Cx, root: &Dir<ReadWrite>, answer: &Answer, frame: &Frame) -> Result<(), CliError> {
-    let text = format_in!(frame, "{}", answer.profile);
-    root.publish(cx, &Path::new(PROFILE)?, Content::bytes(text.as_bytes()), Durable::No)?;
+/// The profile and the command's phases, written in place and never synced: a crash, or a
+/// reader during the write, sees a part of it; it is a report, read by a person, made again by
+/// the next command. Not `publish`: bstd's unsynced publish renames through `Effect::Rename`,
+/// which syncs the directory (`F_FULLFSYNC` on macOS, about 5 ms), the whole of a repeat
+/// check's own time before this. One truncating open (its directory made only when missing),
+/// one append, one close.
+pub fn profile(cx: &Cx, root: &Dir<ReadWrite>, answer: &Answer, phases: &Phases, frame: &Frame) -> Result<(), CliError> {
+    let text = format_in!(frame, "{}{}", answer.profile, phases);
+    let file = root.create(cx, &Path::new(PROFILE)?)?;
+    file.append(cx, text.as_bytes(), Durable::No)?;
+    file.close(cx, Durable::No)?;
     Ok(())
 }

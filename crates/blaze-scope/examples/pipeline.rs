@@ -119,6 +119,9 @@ fn main() {
                 };
             }
             "--repeat" => REPEAT.store(args.next().and_then(|it| it.parse().ok()).unwrap_or(1), Ordering::Relaxed),
+            "--show" => {
+                let _ = SHOW.set(args.next().unwrap_or_default());
+            }
             "--examples" => EXAMPLES.store(args.next().and_then(|it| it.parse().ok()).unwrap_or(3), Ordering::Relaxed),
             _ => dirs.push(PathBuf::from(arg)),
         }
@@ -197,6 +200,8 @@ struct Loc {
 static REPEAT: AtomicUsize = AtomicUsize::new(1);
 /// Examples kept per failure kind (`--examples N`).
 static EXAMPLES: AtomicUsize = AtomicUsize::new(3);
+/// A name whose bindings in every scope are printed (`--show NAME`).
+static SHOW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn example_cap() -> usize { EXAMPLES.load(Ordering::Relaxed) }
 
@@ -466,6 +471,8 @@ impl Cfg {
             }
         }
         cfg.name("target_has_atomic");
+        cfg.name("target_has_atomic_load_store");
+        cfg.name("target_has_atomic_equal_alignment");
         let features_on: [(&str, bool); 14] = [
             ("neon", cfg!(target_feature = "neon")),
             ("fp-armv8", cfg!(target_feature = "fp-armv8")),
@@ -489,6 +496,8 @@ impl Cfg {
         }
         cfg.keys.insert("target_feature".to_string());
         cfg.keys.insert("target_has_atomic".to_string());
+        cfg.keys.insert("target_has_atomic_load_store".to_string());
+        cfg.keys.insert("target_has_atomic_equal_alignment".to_string());
         for feature in features {
             cfg.pair("feature", feature);
         }
@@ -2737,7 +2746,15 @@ fn resolve_type(base: &Base<'_>, done: &Done, module: ItemKey, text: &'static st
         }
         PathKind::Plain => {
             let first = segments.next()?;
-            let binding = scope_get(module, first).or_else(|| base.root.head.prelude.and_then(|p| scope_get(p, first)))?;
+            // The lexical layers a type path's first segment goes through: the module, the
+            // extern prelude (an `extern crate` at the root joins it: core's `extern crate self
+            // as core`), the standard prelude.
+            let extern_prelude = || {
+                scope_get(root, first).filter(|b| b.origin == blaze_surface::Origin::ExternCrate)
+            };
+            let binding = scope_get(module, first)
+                .or_else(extern_prelude)
+                .or_else(|| base.root.head.prelude.and_then(|p| scope_get(p, first)))?;
             binding.def.key
         }
     };
@@ -2774,78 +2791,11 @@ struct Header {
     self_ty: &'static str,
 }
 
-fn parse_header(text: &'static str) -> Option<Header> {
-    let mut t = text.trim();
-    let mut flags = ImplFlags::NONE;
-    loop {
-        if let Some(rest) = t.strip_prefix("default ") {
-            flags = flags.union(ImplFlags::DEFAULT);
-            t = rest.trim_start();
-        } else if let Some(rest) = t.strip_prefix("unsafe ") {
-            flags = flags.union(ImplFlags::UNSAFE);
-            t = rest.trim_start();
-        } else {
-            break;
-        }
-    }
-    t = t.strip_prefix("impl")?.trim_start();
-    let mut params = Vec::new();
-    if t.starts_with('<') {
-        let bytes = t.as_bytes();
-        let mut depth = 0i32;
-        let mut end = 0;
-        for (i, &c) in bytes.iter().enumerate() {
-            match c {
-                b'<' => depth += 1,
-                b'>' if i == 0 || bytes[i - 1] != b'-' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if end == 0 {
-            return None;
-        }
-        for param in split_top(&t[1..end]) {
-            let param = param.trim();
-            let param = param.strip_prefix("const ").unwrap_or(param).trim_start();
-            if param.starts_with('\'') {
-                continue;
-            }
-            let name_end = param.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(param.len());
-            if name_end > 0 {
-                params.push(&param[..name_end]);
-            }
-        }
-        t = t[end + 1..].trim_start();
-    }
-    if let Some(rest) = t.strip_prefix("const ") {
-        flags = flags.union(ImplFlags::CONST);
-        t = rest.trim_start();
-    }
-    let t = match find_top(t, " where") {
-        Some(at) => t[..at].trim(),
-        None => t.trim(),
-    };
-    let (trait_, self_ty) = match find_top(t, " for ") {
-        Some(at) => {
-            let tr = t[..at].trim();
-            let tr = match tr.strip_prefix('!') {
-                Some(rest) => {
-                    flags = flags.union(ImplFlags::NEGATIVE);
-                    rest.trim_start()
-                }
-                None => tr,
-            };
-            (Some(tr), t[at + 5..].trim())
-        }
-        None => (None, t),
-    };
-    Some(Header { flags, params, trait_, self_ty })
+/// An impl's header, read by `blaze_file_items::impl_header` (by tokens: `const impl`, line
+/// breaks and nightly forms included); `Err` says why it did not read.
+fn parse_header(text: &'static str, edition: Edition) -> Result<Header, blaze_file_items::HeaderError> {
+    let read = blaze_file_items::impl_header(text, edition, g())?;
+    Ok(Header { flags: read.flags, params: read.params.iter().copied().collect(), trait_: read.trait_, self_ty: read.self_ty })
 }
 
 /// The first `needle` outside brackets.
@@ -2949,9 +2899,12 @@ fn index(base: &Base<'_>, res: &Resolution) -> Indexed {
     impls.extend(res.run.impls.lock().expect("the impls' lock").iter().copied());
     let mut rows = Vec::with_capacity(impls.len());
     for src in &impls {
-        let Some(header) = parse_header(src.header) else {
-            fails.add("impl header not read", || format!("{}: {}", k.at(src.loc), first_line(src.header)));
-            continue;
+        let header = match parse_header(src.header, k.edition) {
+            Ok(header) => header,
+            Err(why) => {
+                fails.add(format!("impl header not read: {why}"), || format!("{}: {}", k.at(src.loc), first_line(src.header)));
+                continue;
+            }
         };
         let trait_ = match header.trait_ {
             Some(text) => match resolve_type(base, &res.done, src.module, bare_path(text)) {
@@ -3362,6 +3315,12 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         res.run.expansion_bytes.load(Ordering::Relaxed) as f64 / 1e6,
         scope_bytes as f64 / 1e6
     );
+    let read_entries: usize = res.done.values().map(|r| r.reads.entries.len()).sum();
+    let read_capacity: usize = res.done.values().map(|r| r.reads.entries.capacity()).sum();
+    println!(
+        "    read lists: {read_entries} entries ({:.2} MB held for {read_capacity} slots)",
+        (read_capacity * size_of::<blaze_scope::ReadEntry<N>>()) as f64 / 1e6
+    );
     println!("    per round (last run): modules finished / import bindings in them / expansions made / ms");
     for (i, (finished, imported, expanded, ms)) in res.per_round.iter().enumerate() {
         println!("      round {:>3}: {finished:>5} / {imported:>6} / {expanded:>5} / {ms:>8.1}", i + 1);
@@ -3384,6 +3343,15 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         }
     }
     fails.print();
+    if let Some(show) = SHOW.get() {
+        // `--show NAME`: every scope's binding of the name, to see where a chain breaks.
+        for r in res.done.values() {
+            for e in r.scope.bindings.iter().filter(|e| e.name == show.as_str()) {
+                let mpath = tree.by_key.get(&r.scope.module).map_or_else(String::new, |&i| tree.modules[i].path.clone());
+                println!("    show {show}: {mpath} {:?} {:?}", e.ns, e.binding);
+            }
+        }
+    }
     let unknown = k.cfg.unknown.lock().expect("the cfg counts' lock").clone();
     let mut unknown: Vec<(String, usize)> = unknown.into_iter().collect();
     unknown.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

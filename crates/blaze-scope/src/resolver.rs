@@ -58,7 +58,8 @@ pub(crate) struct At {
 /// One ordered entry of a fragment: what textual order matters for.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Slot<N> {
-    Rules { name: N, def: ItemKey },
+    /// A `macro_rules!`; `export` for a `#[macro_export]` one, whose textual binding is public.
+    Rules { name: N, def: ItemKey, export: bool },
     Call(u32),
     Mod { child: ItemKey, macro_use: bool },
     Use(u32),
@@ -73,6 +74,9 @@ pub(crate) struct DefEntry {
     pub(crate) origin: Origin,
     pub(crate) expansion: u16,
     pub(crate) frag: u32,
+    /// Its presence condition: a `blaze-cond` decision-diagram id, 0 for always. Reserved:
+    /// cfg is evaluated under one configuration today, so every entry is 0.
+    pub(crate) cond: u32,
 }
 
 /// The module's own text, or one call's expansion.
@@ -103,6 +107,8 @@ pub(crate) enum Layer {
     ExternPrelude,
     MacroUsePrelude,
     StdPrelude,
+    /// The builtin types, last of the type namespace.
+    Builtin,
     /// Another module's scope, through a path.
     Path,
 }
@@ -187,6 +193,8 @@ pub(crate) struct Import<'a, N> {
     /// What its first segment resolved to, early.
     pub(crate) first: Option<Def>,
     pub(crate) blocked: bool,
+    /// Its presence condition, as [`DefEntry::cond`]: 0 today.
+    pub(crate) cond: u32,
 }
 
 impl<N> Import<'_, N> {
@@ -223,6 +231,8 @@ pub(crate) struct Glob<'a, N> {
     pub(crate) source: Source<'a>,
     pub(crate) first: Option<Def>,
     pub(crate) blocked: bool,
+    /// Its presence condition, as [`DefEntry::cond`]: 0 today.
+    pub(crate) cond: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -546,6 +556,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                     origin: Origin::MacroExport,
                     expansion: 0,
                     frag: 0,
+                    cond: 0,
                 };
                 r.frags[0].items.push((Namespace::Macros, name, entry));
                 r.insert_def(Namespace::Macros, name, entry);
@@ -676,6 +687,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             origin,
             expansion,
             frag: fid,
+            cond: 0,
         };
 
         for it in decls.items.iter() {
@@ -730,6 +742,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                         source: Source::Pending,
                         first: None,
                         blocked: true,
+                        cond: 0,
                     });
                     ordered.push((u.pos, Slot::Glob(g)));
                 }
@@ -755,13 +768,14 @@ impl<'a, N: Name> Resolver<'a, N> {
                         failed: None,
                         first: None,
                         blocked: true,
+                        cond: 0,
                     });
                     ordered.push((u.pos, Slot::Use(i)));
                 }
             }
         }
         for mr in decls.macro_rules.iter() {
-            ordered.push((mr.pos, Slot::Rules { name: mr.name, def: mr.def }));
+            ordered.push((mr.pos, Slot::Rules { name: mr.name, def: mr.def, export: mr.export }));
             if mr.export && expansion > 0 {
                 exports.push(TextualDef { name: mr.name, def: mr.def, expansion });
             }

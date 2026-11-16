@@ -224,6 +224,30 @@ fn hits_reads_and_compares_allocate_nothing() {
     });
 }
 
+/// `intern_many` gives each value the handle `intern` gives it, whether it was interned
+/// before, is new, or comes twice in one batch.
+#[test]
+fn intern_many_is_intern_of_each() {
+    blaze_sim::check(blaze_sim::Config::cases(if cfg!(miri) { 16 } else { 64 }), |tape| {
+        let cons = HashCons::<Leaf>::new();
+        let range = 1 + tape.below(200, "range");
+        for _ in 0..tape.below(300, "before") {
+            cons.intern(leaf(tape.below(range, "held"), "v"));
+        }
+        for _ in 0..3 {
+            let mut asked: [u64; 8] = std::array::from_fn(|_| tape.below(2 * range, "asked"));
+            asked[7] = asked[tape.index(7, "duplicated")];
+            let many = cons.intern_many(asked.map(|n| leaf(n, "v")));
+            for (at, &n) in asked.iter().enumerate() {
+                let one = cons.intern(leaf(n, "v"));
+                assert_eq!(many[at], one, "{n} at {at} of {asked:?}");
+                assert_eq!(many[at].idx(), one.idx());
+                assert_eq!(*many[at].get(), leaf(n, "v"));
+            }
+        }
+    });
+}
+
 #[test]
 fn chunks_cover_every_place() {
     let mut expected = (0, 0);

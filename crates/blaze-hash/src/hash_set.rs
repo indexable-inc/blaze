@@ -172,6 +172,38 @@ impl<T: Eq, S: KeyHash<T>, A: Allocator> Set<T, S, A> {
         self.0.get_key_value(value).map(|(it, ())| it)
     }
 
+    /// Starts loading what a [`Set::get`] or [`Set::contains`] of `value` reads first, as
+    /// [`Map::prefetch`].
+    #[inline]
+    pub fn prefetch<Q: ?Sized>(&self, value: &Q)
+    where
+        S: KeyHash<Q>,
+    {
+        self.0.prefetch(value);
+    }
+
+    /// [`Set::get`] of each of `values`, as one batch: [`Map::get_many`]'s group prefetching.
+    #[inline]
+    pub fn get_many<Q: ?Sized + Equivalent<T>, const N: usize>(
+        &self,
+        values: [&Q; N],
+    ) -> [Option<&T>; N]
+    where
+        S: KeyHash<Q>,
+    {
+        self.0.find_many(values).map(|slot| slot.map(|index| &self.0.table.get(index).0))
+    }
+
+    /// [`Set::get_many`] of a slice: `out[at]` is the held element equal to `values[at]`, in
+    /// [`Map::get_many_into`]'s pipeline. Panics unless `out` is as long as `values`.
+    pub fn get_many_into<'a, Q: Equivalent<T>>(&'a self, values: &[Q], out: &mut [Option<&'a T>])
+    where
+        S: KeyHash<Q>,
+    {
+        assert_eq!(values.len(), out.len(), "Set::get_many_into: one answer per value");
+        self.0.find_each(values, |at, slot| out[at] = slot.map(|index| &self.0.table.get(index).0));
+    }
+
     /// Removes `value`: whether it was held.
     #[inline]
     pub fn remove<Q: ?Sized + Equivalent<T>>(&mut self, value: &Q) -> bool

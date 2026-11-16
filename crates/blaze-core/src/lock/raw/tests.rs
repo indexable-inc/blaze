@@ -121,7 +121,7 @@ mod checked {
 
     /// Three threads (the model's own and two) take one mutex in turn, each writing the byte it
     /// guards (tracked: two holders at once are a race) and counting itself: every thread gets
-    /// through, once each. With [`Plant::TakeAsUncontended`] the third sleeps forever.
+    /// through, once each. With [`Plant::ReleaseUnwoken`] a sleeper is never woken.
     fn mutex_hands_over(plant: Plant) {
         model(move || {
             let lock = Arc::new(RawMutex::new());
@@ -131,12 +131,12 @@ mod checked {
                 let (lock, byte, done) = (lock.clone(), byte.clone(), done.clone());
                 move || {
                     if !lock.try_lock() {
-                        lock.lock_contended(None, plant);
+                        lock.lock_contended(None);
                     }
                     cell::write(byte.as_ptr(), 1);
                     done.fetch_add(1, Ordering::Relaxed);
                     // SAFETY: taken above.
-                    unsafe { lock.unlock() };
+                    unsafe { lock.unlock_with(plant) };
                 }
             };
             let threads: Vec<_> = (0..2).map(|_| thread::spawn(work.clone())).collect();
@@ -154,11 +154,11 @@ mod checked {
         mutex_hands_over(Plant::None);
     }
 
-    /// The control: a woken waiter that takes the word as uncontended loses the sleeper behind.
+    /// The control: a release that skips the wake of a contended word loses its sleeper.
     #[test]
     #[should_panic(expected = "deadlock")]
-    fn model_raw_mutex_taken_as_uncontended_loses_a_waiter() {
-        mutex_hands_over(Plant::TakeAsUncontended);
+    fn model_raw_mutex_release_unwoken_loses_a_waiter() {
+        mutex_hands_over(Plant::ReleaseUnwoken);
     }
 
     /// A writer (the model's thread) and two readers: the writer writes the guarded bytes

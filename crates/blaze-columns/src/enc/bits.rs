@@ -9,10 +9,9 @@
 //! zero bytes a column ends with), so the load of the last value never reads past the column.
 //! A width above 56 bits can straddle nine bytes: its read takes the ninth byte too.
 
-use core::simd::Simd;
+use core::simd::{Simd, ToBytes, num::SimdUint};
 
 use blaze_int::Int;
-use blaze_own::AVec;
 
 use super::plant::{self, Plant};
 use super::EncError;
@@ -60,10 +59,16 @@ fn past_end(at: usize, len: usize) -> ! {
 /// Value `i` of the values of width `w` packed at the start of `data`.
 #[inline(always)]
 pub fn get(data: &[u8], i: usize, w: u8) -> u64 {
+    get_bit(data, i * usize::from(w), w)
+}
+
+/// The value of width `w` starting at bit `bit` of `data`: one unaligned 8-byte load, a shift
+/// and a mask (and a ninth byte above 56 bits). A width of 0 loads nothing.
+#[inline(always)]
+pub fn get_bit(data: &[u8], bit: usize, w: u8) -> u64 {
     if w == 0 {
         return 0;
     }
-    let bit = i * usize::from(w);
     let at = bit >> 3;
     let shift = (bit & 7).truncate_to::<u32>();
     let low = load64(data, at) >> shift;
@@ -81,8 +86,15 @@ pub fn get(data: &[u8], i: usize, w: u8) -> u64 {
 }
 
 /// Appends `n` values of width `w`, value `j` being `value(j)` (which must fit `w` bits; the
-/// bits above are dropped and a debug build stops on them). Refused with nothing written.
-pub fn pack(n: usize, w: u8, out: &mut AVec<'_, u8>, value: impl Fn(usize) -> u64) -> Result<(), EncError> {
+/// bits above are dropped and a debug build stops on them). Refused with nothing written. In
+/// any allocator: blaze-parquet packs its hybrid runs and delta miniblocks with it (Parquet's
+/// bit-packing is this layout).
+pub fn pack<A: core::alloc::Allocator>(
+    n: usize,
+    w: u8,
+    out: &mut blaze_own::Vec<u8, A>,
+    value: impl Fn(usize) -> u64,
+) -> Result<(), EncError> {
     let bytes = packed_len(n, w);
     out.try_reserve(bytes)?;
     if w == 0 {
@@ -119,13 +131,84 @@ pub fn unpack_scalar(data: &[u8], w: u8, out: &mut [u64]) {
     }
 }
 
-/// Lanes of the vector unpack: eight values of `w` bits are `w` whole bytes.
-const LANES: usize = 8;
+/// Values a group of the vector unpack: eight values of `w` bits are `w` whole bytes, so every
+/// group starts on a byte and has the same shape.
+const GROUP: usize = 8;
 
-/// Fills `out` with the first `out.len()` values of width `w` at the start of `data`: eight
-/// at a time in a `Simd<u64, 8>`, each lane loaded at its fixed byte offset in the group and
-/// shifted by its fixed amount, the mask applied to all eight; the scalar [`get`] for the last
-/// few and for widths above 56 bits (which straddle nine bytes).
+/// How one width's group of eight unpacks: the shape is fixed by the width alone, so it is a
+/// table built at compile time ([`KERNELS`]).
+///
+/// A group is cut into parts, each one 16-byte load at `load[p]` bytes into the group, one
+/// byte shuffle (`swizzle_dyn`, a `tbl` on NEON, `pshufb` on SSSE3) that moves each value's
+/// bytes to the bottom of its lane, a per-lane right shift by `shift` and a mask. Up to 25
+/// bits a value and its shift fit a `u32` lane: two parts of four lanes. Up to 56 bits they
+/// fit a `u64` lane: four parts of two. Past 56 a value can need a ninth byte: scalar.
+#[derive(Clone, Copy)]
+struct Kernel {
+    /// Two parts of four `u32` lanes, else four of two `u64` lanes.
+    narrow: bool,
+    load: [usize; 4],
+    shuffle: [[u8; 16]; 4],
+    /// Value `v` of the group's shift within its lane.
+    shift: [u64; GROUP],
+}
+
+const NO_KERNEL: Kernel = Kernel { narrow: false, load: [0; 4], shuffle: [[0; 16]; 4], shift: [0; GROUP] };
+
+#[allow(blaze::as_cast, reason = "a `const fn` table: byte offsets below 16 and shifts below 8, which fit their types")]
+const fn kernel(w: usize) -> Kernel {
+    let mut k = NO_KERNEL;
+    if w == 0 || w > 56 {
+        return k;
+    }
+    k.narrow = w <= 25;
+    let (parts, lanes, bytes) = if k.narrow { (2, 4, 4) } else { (4, 2, 8) };
+    let mut p = 0;
+    while p < parts {
+        let start = (p * lanes * w) >> 3;
+        k.load[p] = start;
+        let mut lane = 0;
+        while lane < lanes {
+            let v = p * lanes + lane;
+            let bit = v * w;
+            k.shift[v] = (bit & 7) as u64;
+            let mut t = 0;
+            while t < bytes {
+                // Below 16: the furthest is (3 * 25 + 7) / 8 + 3 = 13, or (56 + 7) / 8 + 7 = 14.
+                k.shuffle[p][lane * bytes + t] = ((bit >> 3) - start + t) as u8;
+                t += 1;
+            }
+            lane += 1;
+        }
+        p += 1;
+    }
+    k
+}
+
+/// [`kernel`] of every width.
+static KERNELS: [Kernel; 65] = {
+    let mut all = [NO_KERNEL; 65];
+    let mut w = 0;
+    while w < 65 {
+        all[w] = kernel(w);
+        w += 1;
+    }
+    all
+};
+
+/// 16 bytes of `data` from `at`.
+#[inline(always)]
+fn load16(data: &[u8], at: usize) -> Simd<u8, 16> {
+    match data.get(at..).and_then(<[u8]>::first_chunk::<16>) {
+        Some(b) => Simd::from_array(*b),
+        None => past_end(at, data.len()),
+    }
+}
+
+/// Fills `out` with the first `out.len()` values of width `w` at the start of `data`, a group
+/// of eight at a time by [`Kernel`]'s shuffle; the scalar [`get`] for the groups whose 16-byte
+/// loads would pass the end of `data`, the last few values, and widths above 56 bits. Needs
+/// [`PAD`] readable bytes after the packed values, as [`get`] does.
 pub fn unpack(data: &[u8], w: u8, out: &mut [u64]) {
     if w == 0 {
         out.fill(0);
@@ -135,34 +218,44 @@ pub fn unpack(data: &[u8], w: u8, out: &mut [u64]) {
         unpack_scalar(data, w, out);
         return;
     }
+    let k = &KERNELS[usize::from(w)];
     let wide = usize::from(w);
-    let mut offsets = [0usize; LANES];
-    let mut shifts = [0u64; LANES];
-    for lane in 0..LANES {
-        offsets[lane] = (lane * wide) >> 3;
-        shifts[lane] = ((lane * wide) & 7).widen_to::<u64>();
+    let mut shift = k.shift;
+    if plant::on(Plant::LaneShiftShort) && shift[GROUP - 1] > 0 {
+        shift[GROUP - 1] -= 1;
     }
-    if plant::on(Plant::LaneShiftShort) && shifts[LANES - 1] > 0 {
-        shifts[LANES - 1] -= 1;
+    // The groups whose every load stays inside `data`: group `g`'s last part loads 16 bytes at
+    // `g * w + load[3 or 1]`.
+    let last = if k.narrow { k.load[1] } else { k.load[3] };
+    let fit = match data.len().checked_sub(16 + last) {
+        Some(room) => room / wide + 1,
+        None => 0,
+    };
+    let groups = (out.len() / GROUP).min(fit);
+    if k.narrow {
+        let keep = Simd::<u32, 4>::splat(mask(w).truncate_to::<u32>());
+        let shifts = [0, 1].map(|p| Simd::<u32, 4>::from_array(core::array::from_fn(|l| shift[4 * p + l].truncate_to::<u32>())));
+        let shuffles = [Simd::from_array(k.shuffle[0]), Simd::from_array(k.shuffle[1])];
+        for (g, chunk) in out[..groups * GROUP].chunks_exact_mut(GROUP).enumerate() {
+            let base = g * wide;
+            for p in 0..2 {
+                let lanes = Simd::<u32, 4>::from_le_bytes(load16(data, base + k.load[p]).swizzle_dyn(shuffles[p]));
+                ((lanes >> shifts[p]) & keep).cast::<u64>().copy_to_slice(&mut chunk[4 * p..4 * p + 4]);
+            }
+        }
+    } else {
+        let keep = Simd::<u64, 2>::splat(mask(w));
+        let shifts = [0, 1, 2, 3].map(|p| Simd::<u64, 2>::from_array([shift[2 * p], shift[2 * p + 1]]));
+        let shuffles = k.shuffle.map(Simd::from_array);
+        for (g, chunk) in out[..groups * GROUP].chunks_exact_mut(GROUP).enumerate() {
+            let base = g * wide;
+            for p in 0..4 {
+                let lanes = Simd::<u64, 2>::from_le_bytes(load16(data, base + k.load[p]).swizzle_dyn(shuffles[p]));
+                ((lanes >> shifts[p]) & keep).copy_to_slice(&mut chunk[2 * p..2 * p + 2]);
+            }
+        }
     }
-    let shifts = Simd::<u64, LANES>::from_array(shifts);
-    let keep = Simd::<u64, LANES>::splat(mask(w));
-    let groups = out.len() / LANES;
-    for (g, chunk) in out[..groups * LANES].chunks_exact_mut(LANES).enumerate() {
-        let base = g * wide;
-        let lanes = Simd::<u64, LANES>::from_array([
-            load64(data, base + offsets[0]),
-            load64(data, base + offsets[1]),
-            load64(data, base + offsets[2]),
-            load64(data, base + offsets[3]),
-            load64(data, base + offsets[4]),
-            load64(data, base + offsets[5]),
-            load64(data, base + offsets[6]),
-            load64(data, base + offsets[7]),
-        ]);
-        ((lanes >> shifts) & keep).copy_to_slice(chunk);
-    }
-    for j in groups * LANES..out.len() {
+    for j in groups * GROUP..out.len() {
         out[j] = get(data, j, w);
     }
 }

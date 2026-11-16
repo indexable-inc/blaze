@@ -27,12 +27,21 @@ fn case(tape: &Tape) -> Result<(), Broke> {
         let keys: StdVec<u32> = keys.into_iter().collect();
         let set = StaticSearch::try_new_in(&keys, &alloc).map_err(|e| Broke::Harness(format!("{e}")))?;
         ensure(set.len() == keys.len(), || format!("len differs"))?;
+        let mut probes = StdVec::new();
         for _ in 0..200 {
-            let x = match tape.below(3, "probe") {
+            probes.push(match tape.below(3, "probe") {
                 0 if !keys.is_empty() => keys[tape.index(keys.len(), "at")],
                 1 => u32::MAX - blaze_int::Int::truncate_to::<u32>(tape.below(2, "top")),
                 _ => tape.next_u32("x") >> tape.below(32, "scale"),
-            };
+            });
+        }
+        let (eights, _) = probes.as_chunks::<8>();
+        for xs in eights {
+            let want: [usize; 8] = xs.map(|x| keys.partition_point(|&k| k < x));
+            let got = set.lower_bounds(xs);
+            ensure(got == want, || format!("the lower bounds of {xs:?} are {got:?}, the sorted keys' {want:?} of {}", keys.len()))?;
+        }
+        for &x in &probes {
             let want = keys.partition_point(|&k| k < x);
             let got = set.lower_bound(x);
             ensure(got == want, || format!("the lower bound of {x} is {got}, the sorted keys' {want} of {}", keys.len()))?;
@@ -51,7 +60,7 @@ fn static_search_matches_partition_point() {
 
 #[test]
 fn the_oracle_catches_a_descent_one_child_left() {
-    blaze_sim::control(Config::cases(200), Plant::Clean, Plant::SearchChildLeft, "the lower bound of", |tape, p| {
+    blaze_sim::control(Config::cases(200), Plant::Clean, Plant::SearchChildLeft, "the lower bound", |tape, p| {
         planted(p, tape, case)
     });
 }

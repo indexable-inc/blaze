@@ -1,5 +1,6 @@
 //! Folds as linear passes: an explicit stack, no recursion, and a memo by (node, binder depth,
-//! context) so a node shared many times in a term is visited once per pass
+//! context) so a node shared in a term is walked again only if the memo, a cache that stays
+//! in L1 ([`Cache`]), lost it
 //! (rustc_type_ir/src/fold.rs, `TypeFolder` and `super_fold_with`; rustc recurses and guards
 //! the stack with `ensure_sufficient_stack`, which grows it).
 //!
@@ -22,8 +23,8 @@ use crate::flags::Flags;
 use crate::ids::{Arg, Const, Def, List, Node, TAG_CONST, TAG_LIST, TAG_REGION, TAG_TY, Ty, Universe, Variance, ix};
 use crate::infer::{Table, Vars};
 use crate::kind::{self, Role, ct, re, ty};
-use crate::memo::Memo;
-use crate::tys::Tys;
+use crate::memo::{Cache, Memo};
+use crate::tys::{Tys, Want};
 
 /// The variances of an item's parameters (rustc's `variances_of`), asked only when a relation
 /// or generalization passes a non-invariant position into an ADT, fn item or opaque.
@@ -162,16 +163,60 @@ struct Frame {
     rule: u8,
 }
 
+/// A result not interned yet: its place on the result stack and its memo key.
+#[derive(Clone, Copy)]
+struct Pend {
+    at: u32,
+    /// [`NO_MEMO`] for none.
+    memo: u64,
+}
+
+/// No memo key is all ones: a key's context is three bits at bit 56.
+const NO_MEMO: u64 = u64::MAX;
+
 /// One engine's stacks and memo.
+///
+/// A rebuilt row is not interned at its own exit but at its parent's, with its siblings',
+/// through [`Tys::intern_many`]: siblings' rows do not depend on each other, so their probes'
+/// cache misses overlap. `want` and `pend` are the rows waiting, in result-stack order, so a
+/// node's children's are a suffix.
 pub(crate) struct Stacks<'a> {
     stack: Vec<Frame, Alloc<'a>>,
     out: Vec<Node, Alloc<'a>>,
-    memo: Memo<'a>,
+    memo: Cache<'a>,
+    want: Vec<Want, Alloc<'a>>,
+    pend: Vec<Pend, Alloc<'a>>,
 }
 
 impl<'a> Stacks<'a> {
     pub(crate) fn new_in(alloc: Alloc<'a>) -> Stacks<'a> {
-        Stacks { stack: Vec::new_in(alloc), out: Vec::new_in(alloc), memo: Memo::new_in(alloc) }
+        Stacks {
+            stack: Vec::new_in(alloc),
+            out: Vec::new_in(alloc),
+            memo: Cache::new_in(alloc),
+            want: Vec::new_in(alloc),
+            pend: Vec::new_in(alloc),
+        }
+    }
+
+    /// Interns the waiting rows at result positions `at` and above, into their places and the
+    /// memo.
+    #[inline]
+    fn resolve_from(&mut self, tys: &mut Tys<'_>, at: u32) {
+        let from = self.pend.partition_point(|p| p.at < at);
+        if from == self.want.len() {
+            return;
+        }
+        let Stacks { want, pend, out, memo, .. } = self;
+        tys.intern_many(&want[from..], |i, node| {
+            let p = pend[from + i];
+            out[ix(p.at)] = node;
+            if p.memo != NO_MEMO {
+                memo.insert(p.memo, node.bits());
+            }
+        });
+        want.truncate(from);
+        pend.truncate(from);
     }
 }
 
@@ -222,6 +267,8 @@ fn run_on<H: Hook>(
     st.stack.clear();
     st.out.clear();
     st.memo.clear();
+    st.want.clear();
+    st.pend.clear();
     st.stack.push(Frame { node: root, depth: 0, def: 0, base: 0, ctx, op: ENTER, rule: RULE_SAME });
     while let Some(f) = st.stack.pop() {
         match f.op {
@@ -263,8 +310,10 @@ fn run_on<H: Hook>(
                 }
             }
             EXIT => {
+                st.resolve_from(tys, f.base);
                 let base = ix(f.base);
                 let n = f.node;
+                let key = if f.rule == RULE_SAME { memo_key(n, f.depth, f.ctx) } else { None };
                 let result = if n.tag() == TAG_LIST {
                     let l = n.list();
                     let same = {
@@ -292,24 +341,35 @@ fn run_on<H: Hook>(
                         a
                     };
                     let nb = if d.b == Role::Child { st.out[i].bits() } else { b };
-                    if na == a && nb == b { n } else { tys.intern_node(n.tag(), k, na, nb) }
+                    if na == a && nb == b {
+                        n
+                    } else {
+                        // Interned at the parent's exit, with its siblings; `n` holds the place.
+                        st.out.truncate(base);
+                        st.out.push(n);
+                        st.want.push(Want { tag: n.tag(), kind: k, a: na, b: nb });
+                        st.pend.push(Pend { at: f.base, memo: key.unwrap_or(NO_MEMO) });
+                        continue;
+                    }
                 };
                 st.out.truncate(base);
                 st.out.push(result);
-                if f.rule == RULE_SAME
-                    && let Some(k) = memo_key(n, f.depth, f.ctx)
-                {
+                if let Some(k) = key {
                     st.memo.insert(k, result.bits());
                 }
             }
             _ => {
                 // The result of the node folded in `f.node`'s place is `f.node`'s.
+                if let Some(last) = st.out.len().checked_sub(1).and_then(crate::ids::row) {
+                    st.resolve_from(tys, last);
+                }
                 if let (Some(k), Some(r)) = (memo_key(f.node, f.depth, f.ctx), st.out.last()) {
                     st.memo.insert(k, r.bits());
                 }
             }
         }
     }
+    st.resolve_from(tys, 0);
     match st.out.pop() {
         Some(r) => Ok(r),
         None => Ok(root),

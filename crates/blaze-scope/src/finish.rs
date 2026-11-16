@@ -166,6 +166,8 @@ impl<'a, N: Name> Resolver<'a, N> {
         });
         entries.sort_unstable_by(|x, y| x.read.cmp(&y.read));
         entries.dedup_by(|x, y| x.read == y.read);
+        // The pass pushed one entry per use; the record keeps one per read.
+        entries.shrink_to_fit();
         let mut others = Vec::with_capacity_in(fellows.len(), a);
         others.extend(fellows.iter().copied().filter(|&m| m != self.module));
         others.sort_unstable();
@@ -539,7 +541,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         let f = &self.frags[frag as usize];
         for slot in f.slots.iter() {
             match *slot {
-                Slot::Rules { name, def } => out.push(TextualDef { name, def, expansion: f.expansion }),
+                Slot::Rules { name, def, .. } => out.push(TextualDef { name, def, expansion: f.expansion }),
                 Slot::Call(c) => {
                     if let CallState::Expanded { frag: inner, .. } = self.calls[c as usize].state {
                         self.flatten(inner, out, marks.as_deref_mut(), env, sink);

@@ -131,41 +131,85 @@ fn spacing_of(span: Span) -> Spacing {
 }
 
 /// Appends the token trees of `iter` to `out`, each with the origin its span names.
+///
+/// An identifier or literal is joint with the next token (`JointHidden`) only when the next
+/// token written is the one that followed it where it was read: a fragment's last token,
+/// joint with the `,` after it in the call (`[u8, u16]`), is not joint with the `as` the
+/// transcriber writes after it (`$Src as`), or a printer would write `u8as`.
 pub(crate) fn from_tt(
     out: &mut Out<'_, '_>,
     iter: tt::TtIter<'_>,
     made: Transparency,
 ) -> Result<(), ExpandError> {
+    let mut pending = None;
+    from_tt_walk(out, iter, made, &mut pending)
+}
+
+/// The last identifier or literal written that was joint where it was read: its index in the
+/// expansion and its span.
+type JointPending = Option<(usize, Span)>;
+
+fn from_tt_walk(
+    out: &mut Out<'_, '_>,
+    iter: tt::TtIter<'_>,
+    made: Transparency,
+    pending: &mut JointPending,
+) -> Result<(), ExpandError> {
     for element in iter {
         match element {
             tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => {
+                joined_in_source(out, pending, ident.span);
                 let origin = origin_of(ident.span, made)?;
                 let raw = if ident.is_raw.yes() { Raw::Yes } else { Raw::No };
-                let kind = TokenKind::Ident { raw, spacing: spacing_of(ident.span) };
+                let kind = TokenKind::Ident { raw, spacing: Spacing::Alone };
                 out.push(kind, ident.sym.as_str(), origin)?;
+                wait_for_next(out, pending, ident.span);
             }
             tt::TtElement::Leaf(tt::Leaf::Punct(punct)) => {
+                joined_in_source(out, pending, punct.span);
                 let kind =
                     TokenKind::Punct { char: punct.char, spacing: Spacing::of_tt(punct.spacing) };
                 out.push(kind, "", origin_of(punct.span, made)?)?;
             }
             tt::TtElement::Leaf(tt::Leaf::Literal(literal)) => {
+                joined_in_source(out, pending, literal.span);
                 let kind = TokenKind::Literal {
                     kind: LitKind::of_tt(literal.kind),
                     suffix_len: literal.suffix_len,
-                    spacing: spacing_of(literal.span),
+                    spacing: Spacing::Alone,
                 };
                 out.push(kind, literal.text_and_suffix.as_str(), origin_of(literal.span, made)?)?;
+                wait_for_next(out, pending, literal.span);
             }
             tt::TtElement::Subtree(subtree, inner) => {
                 let delim = Delim::of_tt(subtree.delimiter.kind);
+                joined_in_source(out, pending, subtree.delimiter.open);
                 out.push(TokenKind::Open(delim), "", origin_of(subtree.delimiter.open, made)?)?;
-                from_tt(out, inner, made)?;
+                from_tt_walk(out, inner, made, pending)?;
+                joined_in_source(out, pending, subtree.delimiter.close);
                 out.push(TokenKind::Close(delim), "", origin_of(subtree.delimiter.close, made)?)?;
             }
         }
     }
     Ok(())
+}
+
+/// Marks the pending token joint if `next`, about to be written, is the token after it in the
+/// stream both were read from ([`span_of`]: one stream's anchor, positions two apart).
+fn joined_in_source(out: &mut Out<'_, '_>, pending: &mut JointPending, next: Span) {
+    if let Some((at, span)) = pending.take()
+        && span.anchor == next.anchor
+        && u32::from(span.range.start()).checked_add(2) == Some(u32::from(next.range.start()))
+    {
+        out.exp.tokens.set_spacing(at, Spacing::JointHidden);
+    }
+}
+
+/// Makes the token just written pending when it was joint where it was read.
+fn wait_for_next(out: &Out<'_, '_>, pending: &mut JointPending, span: Span) {
+    if spacing_of(span) == Spacing::JointHidden {
+        *pending = out.exp.tokens.len().checked_sub(1).map(|at| (at, span));
+    }
 }
 
 /// `tt::stringify`'s question about a token of a stream given by [`to_tt`]: whether the source

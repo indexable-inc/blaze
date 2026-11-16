@@ -102,7 +102,9 @@ mod inflight;
 mod kv;
 mod local;
 mod missing;
+#[cfg(feature = "image")]
 mod image;
+#[cfg(feature = "video")]
 mod mp4;
 mod names;
 mod narrowing;

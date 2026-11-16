@@ -122,17 +122,24 @@ const HARD_F64: [f64; 16] = [
     -0.0,
 ];
 
-fn float_text<F: Float>(x: F) -> StdString {
+fn display_text<F: Float>(x: F) -> StdString {
     text(|o| _ = o.float(x))
 }
 
+fn debug_text<F: Float>(x: F) -> StdString {
+    text(|o| _ = o.float_debug(x))
+}
+
 fn check_f64(x: f64) -> Result<(), Broke> {
-    same("shortest f64", &x, float_text(x), format!("{x:?}"))?;
+    same("shortest f64", &x, debug_text(x), format!("{x:?}"))?;
+    same("display f64", &x, display_text(x), format!("{x}"))?;
+    same("Show f64", &x, text(|o| _ = o.show(&x)), format!("{x}"))?;
     if x.is_finite() {
-        let written = float_text(x);
-        match parse_all::<f64>(&written) {
-            Ok(back) if back.to_bits() == x.to_bits() => {}
-            other => return Err(Broke::Oracle(format!("{x:?} wrote {written:?}, which read back as {other:?}"))),
+        for written in [display_text(x), debug_text(x)] {
+            match parse_all::<f64>(&written) {
+                Ok(back) if back.to_bits() == x.to_bits() => {}
+                other => return Err(Broke::Oracle(format!("{x:?} wrote {written:?}, which read back as {other:?}"))),
+            }
         }
     }
     let places = [0usize, 1, 2, 3, 6, 17, 20, 30];
@@ -143,12 +150,15 @@ fn check_f64(x: f64) -> Result<(), Broke> {
 }
 
 fn check_f32(x: f32) -> Result<(), Broke> {
-    same("shortest f32", &x, float_text(x), format!("{x:?}"))?;
+    same("shortest f32", &x, debug_text(x), format!("{x:?}"))?;
+    same("display f32", &x, display_text(x), format!("{x}"))?;
+    same("Show f32", &x, text(|o| _ = o.show(&x)), format!("{x}"))?;
     if x.is_finite() {
-        let written = float_text(x);
-        match parse_all::<f32>(&written) {
-            Ok(back) if back.to_bits() == x.to_bits() => {}
-            other => return Err(Broke::Oracle(format!("{x:?} wrote {written:?}, which read back as {other:?}"))),
+        for written in [display_text(x), debug_text(x)] {
+            match parse_all::<f32>(&written) {
+                Ok(back) if back.to_bits() == x.to_bits() => {}
+                other => return Err(Broke::Oracle(format!("{x:?} wrote {written:?}, which read back as {other:?}"))),
+            }
         }
     }
     for p in [0usize, 2, 9, 20] {
@@ -169,10 +179,15 @@ fn hard_floats_match_core_fmt_and_read_back() {
             panic!("{broke:?}");
         }
     }
-    let specials = [(f64::NAN, "NaN"), (f64::INFINITY, "inf"), (f64::NEG_INFINITY, "-inf"), (0.0, "0.0")];
-    for (x, want) in specials {
-        assert_eq!(float_text(x), want);
+    let specials = [(f64::NAN, "NaN", "NaN"), (f64::INFINITY, "inf", "inf"), (f64::NEG_INFINITY, "-inf", "-inf"), (0.0, "0", "0.0")];
+    for (x, display, debug) in specials {
+        assert_eq!(display_text(x), display);
+        assert_eq!(debug_text(x), debug);
     }
+    assert_eq!(display_text(1.0f64), "1");
+    assert_eq!(display_text(-0.0f64), "-0");
+    assert_eq!(display_text(1e-7f64), "0.0000001");
+    assert_eq!(display_text(1e300f64), format!("{}", 1e300f64));
     assert_eq!(text(|o| _ = o.float_fixed(-0.001, 2)), "-0.00");
     assert_eq!(text(|o| _ = o.float_fixed(0.125, 2)), "0.12");
     assert_eq!(text(|o| _ = o.float_fixed(0.375, 2)), "0.38");

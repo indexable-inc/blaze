@@ -1,7 +1,11 @@
-//! A walk's memo: `u64` key to `u32` value, cleared in O(1) by a generation stamp, so a pass
-//! over a large shared type visits each distinct (node, depth) once and a pass over a small
-//! one pays nothing to clear. Linear probing, at most half full; an entry is one 16-byte slot
-//! (key, value, generation), so a probe touches one cache line.
+//! A walk's maps: `u64` key to `u32` value, cleared in O(1) by a generation stamp, so a pass
+//! over a small term pays nothing to clear. An entry is one 16-byte slot (key, value,
+//! generation), so a probe touches one cache line.
+//!
+//! [`Memo`] is exact (linear probing, at most half full): for maps whose answers must not be
+//! lost (canonical variables, the canonical key's back-references, fresh bound variables).
+//! [`Cache`] is a fixed direct-mapped table that may lose entries: a fold's memo, where a
+//! lost entry is only work done again.
 
 use blaze_int::Int;
 use blaze_own::{Alloc, Vec};
@@ -86,7 +90,67 @@ impl<'a> Memo<'a> {
 
     #[cold]
     fn grow(&mut self) {
-        let cap = (self.slots.len() * 2).max(64);
+        self.grow_to((self.slots.len() * 2).max(64));
+    }
+}
+
+/// Slots of a [`Cache`]: 64 KiB, half an Apple core's L1 data cache.
+const CACHE_SLOTS: usize = 4096;
+
+/// A fold's memo: a direct-mapped cache of [`CACHE_SLOTS`] slots, where an insert overwrites
+/// what was in its slot. A lost entry costs a walk of that subtree again, never a wrong
+/// answer, and the table stays in L1: an exact table of a million-node pass was 64 MiB, and
+/// its get and insert were two cache misses a node, which the cost example measured as 61 of
+/// the 110 ns a field of a substitution over a million fields. A subtree met again soon (the
+/// sharing a DAG has: `(T, T)`, a parameter's argument used twice) is still met in the cache,
+/// since nothing is inserted between its first walk's end and its second's start but the
+/// first's own result.
+pub(crate) struct Cache<'a> {
+    slots: Vec<Slot, Alloc<'a>>,
+    gen_now: u32,
+}
+
+impl<'a> Cache<'a> {
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> Cache<'a> {
+        Cache { slots: Vec::new_in(alloc), gen_now: 1 }
+    }
+
+    /// Forgets every entry.
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.gen_now = self.gen_now.wrapping_add(1);
+        if self.gen_now == 0 {
+            for s in self.slots.iter_mut() {
+                s.generation = 0;
+            }
+            self.gen_now = 1;
+        }
+    }
+
+    #[inline(always)]
+    fn at(key: u64) -> usize {
+        hash::key(key).truncate_to::<usize>() & (CACHE_SLOTS - 1)
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, key: u64) -> Option<u32> {
+        let s = self.slots.get(Cache::at(key))?;
+        (s.generation == self.gen_now && s.key == key).then_some(s.val)
+    }
+
+    #[inline]
+    pub(crate) fn insert(&mut self, key: u64, val: u32) {
+        if self.slots.is_empty() {
+            self.slots.resize(CACHE_SLOTS, Slot::default());
+        }
+        self.slots[Cache::at(key)] = Slot { key, val, generation: self.gen_now };
+    }
+}
+
+impl Memo<'_> {
+    /// Moves every entry to a table of `cap` slots.
+    #[cold]
+    fn grow_to(&mut self, cap: usize) {
         let alloc = *self.slots.allocator();
         let mut slots = Vec::new_in(alloc);
         slots.resize(cap, Slot::default());

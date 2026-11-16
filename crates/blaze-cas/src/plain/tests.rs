@@ -2527,6 +2527,96 @@ fn a_lookup_reads_only_the_pages_its_probes_land_on() {
     assert!(total < old_total, "the endpoint-free lookup touched {total} pages in all, the old {old_total}");
 }
 
+/// `find_many` answers what `find_by` does for every key of a batch, in the batch's order: held
+/// keys, absent ones, a key twice, an empty batch, a run of none.
+#[test]
+fn find_many_equals_find_by_for_every_key() {
+    blaze_sim::check(SimConfig::DEFAULT, |tape| {
+        let n = tape.int_in(0..=3000u32, "entries");
+        let run = run_of(n);
+        let count = run.len() / ENTRY;
+        let take = tape.int_in(0..=200u32, "keys");
+        let mut keys = Vec::new_in(Global);
+        for _ in 0..take {
+            let k = tape.int_in(0..=n + 50, "key");
+            keys.push(key(k).0);
+            if tape.int_in(0..=7u32, "twice") == 0 {
+                keys.push(key(k).0);
+            }
+        }
+        let at = |i: usize| &run[i * ENTRY..i * ENTRY + 32];
+        let many = format::find_many(count, &keys, at);
+        for (k, got) in keys.iter().zip(&many) {
+            assert_eq!(*got, format::find_by(count, k, at), "{k:?} in a run of {n}");
+        }
+    });
+}
+
+/// What a batch of lookups touches of a million-entry index: `(pages, probes)` one lookup a
+/// key against `find_many`, and the floor, the distinct pages the batch's held keys live on.
+fn batch_pages(run: &[u8], keys: &[ContentId]) -> [(usize, usize); 3] {
+    const PAGE: usize = 16 << 10;
+    let count = run.len() / ENTRY;
+    let mut one = (BTreeSet::new(), 0usize);
+    for k in keys {
+        format::find_by(count, k, |i| {
+            one.0.insert(i * ENTRY / PAGE);
+            one.1 += 1;
+            &run[i * ENTRY..i * ENTRY + 32]
+        });
+    }
+    let mut many = (BTreeSet::new(), 0usize);
+    let found = format::find_many(count, keys, |i| {
+        many.0.insert(i * ENTRY / PAGE);
+        many.1 += 1;
+        &run[i * ENTRY..i * ENTRY + 32]
+    });
+    // The floor with a filter: the pages held keys live on. Without one: those, and the page
+    // an absent key's neighbours are on, which a lookup must read to say it is absent.
+    let held: BTreeSet<usize> = found.iter().flatten().map(|i| i * ENTRY / PAGE).collect();
+    let all: BTreeSet<usize> = keys
+        .iter()
+        .map(|k| {
+            let (mut lo, mut hi) = (0, count);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if run[mid * ENTRY..mid * ENTRY + 32] < k.0[..] { lo = mid + 1 } else { hi = mid }
+            }
+            lo.min(count - 1) * ENTRY / PAGE
+        })
+        .collect();
+    [(one.0.len(), one.1), (many.0.len(), many.1), (held.len(), all.len())]
+}
+
+/// The pages and probes of batches of 1, 64 and 4,096 keys (three in four held) over a run of a
+/// million entries: `find_many` touches no more pages than a lookup a key and fewer probes, and
+/// its pages are within 10% of the floor's (rule 67) once a batch shares pages. Measured
+/// 2026-11-15 (16 KiB pages): 1 key 2 pages either way, floor 1; 64 keys 171 one at a time, 87
+/// batched, floor 63; 4,096 keys 2,776, 2,234, floor 2,186 (1.02). Before the gallop (three
+/// guesses and fences): 147 and 2,626 batched.
+#[test]
+fn a_batch_touches_the_index_pages_its_keys_live_on() {
+    let n = 1_000_000u32;
+    let run = run_of(n);
+    let mut lines = Vec::new_in(Global);
+    for batch in [1u32, 64, 4096] {
+        let keys: Vec<ContentId> = (0..batch).map(|i| key(i.wrapping_mul(2_654_435_761) % (n + n / 3)).0).collect();
+        let [(one_pages, one_probes), (many_pages, many_probes), (held, all)] = batch_pages(&run, &keys);
+        let line = format!("{batch}: one at a time {one_pages} pages {one_probes} probes; find_many {many_pages} pages {many_probes} probes; floor {all} (held keys only {held})");
+        assert!(many_pages <= one_pages && many_probes <= one_probes, "{line}");
+        // The guess's page and the key's for one key; within 10% of the floor once a batch
+        // shares pages.
+        let bound = match batch {
+            1 => 2 * all,
+            64 => all * 3 / 2,
+            _ => all * 11 / 10,
+        };
+        assert!(many_pages <= bound, "{line}");
+        lines.push(line);
+    }
+    assert_eq!(lines.len(), 3);
+}
+
 /// The lookup finds every key of a run whose keys are not spread evenly (clusters of prefixes,
 /// runs of one prefix), and no key it does not hold.
 #[test]

@@ -13,7 +13,6 @@ repository.workspace = true
 [[bin]]
 name = "blaze"
 path = "src/main.rs"
-test = false
 doctest = false
 
 [dependencies]

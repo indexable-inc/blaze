@@ -35,9 +35,15 @@ quinn-proto.workspace = true
 # A proxy address's user and password, percent-decoded.
 percent-encoding.workspace = true
 # The machine's roots (`roots::native`), read once as a client is made; not the core's.
-rustls-native-certs.workspace = true
+rustls-native-certs = { workspace = true, optional = true }
 # Addresses and where their redirects lead.
 url.workspace = true
+
+[features]
+# `roots::native`: the machine's certificate store, which on macOS links Security and
+# CoreFoundation into every program built with it. Off for bstd (its `requests` takes roots
+# from `Io::roots`), on for the clients that read the machine's own.
+native-roots = ["dep:rustls-native-certs"]
 
 [dev-dependencies]
 # The certificates of the in-memory rustls server the TLS test speaks to and of the h3 pair.

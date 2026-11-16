@@ -252,9 +252,9 @@ pub struct Item {
     /// How many earlier siblings have the same kind and the same name (blaze-file-items'
     /// docs, "Identity").
     pub disambiguator: u32,
-    /// Its tokens' [`ContentId`] in blaze-file-items' `ITEM_DOMAIN`.
+    /// Its bytes' [`ContentId`] in blaze-file-items' `ITEM_DOMAIN`.
     pub hash: ContentId,
-    /// Its tokens outside its body, in blaze-file-items' `SIGNATURE_DOMAIN`.
+    /// Its bytes before its body, in blaze-file-items' `ITEM_DOMAIN`.
     pub signature_hash: ContentId,
 }
 

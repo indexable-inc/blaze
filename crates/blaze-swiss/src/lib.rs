@@ -21,6 +21,9 @@
 
 #![no_std]
 #![feature(allocator_ext)]
+// `core::hint::prefetch_read`: a batch's lookups start every home group's load before the
+// first probe, so their misses overlap ([`Index::find_many`], `blaze_hash`'s `get_many`).
+#![feature(hint_prefetch)]
 #![deny(unsafe_code)]
 
 // The tests' threads, collections and global allocator: `core` has none.
@@ -185,6 +188,21 @@ impl<const SLOTS: usize> At<SLOTS> {
     }
 }
 
+/// The group a probe of `hash` starts at in a table of `groups` (a power of two): where
+/// [`find`] and [`vacant`] begin, and what a prefetch ahead of either loads.
+#[inline]
+pub fn home(hash: u64, groups: usize) -> usize {
+    debug_assert!(groups.is_power_of_two());
+    hash.truncate_to::<usize>() & (groups - 1)
+}
+
+/// Starts loading the cache line at `at` for a read soon, into the nearest cache: a hint that
+/// loads nothing the caller can see and faults on no address.
+#[inline(always)]
+pub fn prefetch<T>(at: *const T) {
+    core::hint::prefetch_read(at, core::hint::Locality::L1);
+}
+
 /// The first slot tagged `tag` that `hit` accepts, probing from `hash`'s home group in a table
 /// of `groups` (a power of two) until a group with an empty slot. `ctrl` loads group `g`'s
 /// word; a table never fills, so a miss ends.
@@ -196,9 +214,8 @@ pub fn find<const SLOTS: usize, T>(
     mut ctrl: impl FnMut(usize) -> Ctrl<SLOTS>,
     mut hit: impl FnMut(At<SLOTS>) -> Option<T>,
 ) -> Option<T> {
-    debug_assert!(groups.is_power_of_two());
     let mask = groups - 1;
-    let mut group = hash.truncate_to::<usize>() & mask;
+    let mut group = home(hash, groups);
     loop {
         let word = ctrl(group);
         for slot in word.matching(tag) {
@@ -221,9 +238,8 @@ pub fn vacant<const SLOTS: usize>(
     groups: usize,
     mut ctrl: impl FnMut(usize) -> Ctrl<SLOTS>,
 ) -> At<SLOTS> {
-    debug_assert!(groups.is_power_of_two());
     let mask = groups - 1;
-    let mut group = hash.truncate_to::<usize>() & mask;
+    let mut group = home(hash, groups);
     loop {
         let word = ctrl(group);
         if let Some(slot) = word.empty().first() {
@@ -290,6 +306,17 @@ fn below_growth(len: usize, groups: usize) -> bool {
 /// seven eighths full after it, so a probe always meets an empty slot.
 fn below_full(len: usize, groups: usize) -> bool {
     (len + 1) * 8 <= groups * INDEX_SLOTS * 7
+}
+
+/// [`Index::find`] in the level `groups`.
+#[inline]
+fn find_in(groups: &[Group], hash: u64, mut is: impl FnMut(u32) -> bool) -> Option<u32> {
+    let ctrl = |at: usize| Ctrl::<INDEX_SLOTS>(groups[at].ctrl.load(Ordering::Acquire));
+    find(hash, tag(hash), groups.len(), ctrl, |at| {
+        // Relaxed: the tag's `Acquire` ordered the slot's store before us.
+        let value = groups[at.group].values[at.slot].load(Ordering::Relaxed);
+        is(value).then_some(value)
+    })
 }
 
 /// Whether `groups` holds `value` under `hash`, for the one thread filling them.
@@ -450,14 +477,54 @@ impl<A: Allocator + Clone> Index<A> {
     /// The value inserted under `hash` that `is` accepts. `is` is asked only of values whose
     /// insert was published, so what the caller wrote of one before [`Index::insert`] is there.
     #[inline]
-    pub fn find(&self, hash: u64, mut is: impl FnMut(u32) -> bool) -> Option<u32> {
+    pub fn find(&self, hash: u64, is: impl FnMut(u32) -> bool) -> Option<u32> {
         let groups = self.at_level(self.level.load(Ordering::Acquire))?;
-        let ctrl = |at: usize| Ctrl::<INDEX_SLOTS>(groups[at].ctrl.load(Ordering::Acquire));
-        find(hash, tag(hash), groups.len(), ctrl, |at| {
-            // Relaxed: the tag's `Acquire` ordered the slot's store before us.
-            let value = groups[at.group].values[at.slot].load(Ordering::Relaxed);
-            is(value).then_some(value)
-        })
+        find_in(groups, hash, is)
+    }
+
+    /// Starts loading `hash`'s home group (its word and its slots: one 32-byte group, in one
+    /// line), for a caller that interleaves its own lookups: a [`Index::find`] of `hash` soon
+    /// after finds the line on its way.
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        if let Some(groups) = self.at_level(self.level.load(Ordering::Acquire)) {
+            prefetch(core::ptr::from_ref(&groups[home(hash, groups.len())]));
+        }
+    }
+
+    /// [`Index::find`] of each of `hashes` (`is(at, value)` asks of `hashes[at]`), as group
+    /// prefetching: every home group's load is started first, then each home word is read and
+    /// `ahead` told the first value under its tag (the caller prefetches that value's place in
+    /// its column: a hint, which a miss of another value's tag makes wasted, never wrong), then
+    /// each is probed in order. A table larger than the cache pays one miss's latency for the
+    /// batch's groups and one for their columns, not two per lookup.
+    ///
+    /// When it pays (`examples/index_cost.rs`, an M-series Mac): on 10^7 values, batches of
+    /// 32 to 64 run hits 2.0 to 2.4 times and misses 1.6 to 2.0 times as fast as `find` one
+    /// at a time (a hit there is two dependent misses, which out-of-order execution cannot
+    /// overlap by itself); batches of 4 to 8 gain little. On an index the cache holds (10^3
+    /// to 10^5 values) every batch size loses, to 0.76 times: call `find` there.
+    pub fn find_many<const N: usize>(
+        &self,
+        hashes: [u64; N],
+        mut ahead: impl FnMut(u32),
+        mut is: impl FnMut(usize, u32) -> bool,
+    ) -> [Option<u32>; N] {
+        let Some(groups) = self.at_level(self.level.load(Ordering::Acquire)) else {
+            return [None; N];
+        };
+        for &hash in &hashes {
+            prefetch(core::ptr::from_ref(&groups[home(hash, groups.len())]));
+        }
+        for &hash in &hashes {
+            let group = &groups[home(hash, groups.len())];
+            // Acquire, as `find`'s word: the slot's store is ordered before its tag's.
+            let word = Ctrl::<INDEX_SLOTS>(group.ctrl.load(Ordering::Acquire));
+            if let Some(slot) = word.matching(tag(hash)).next() {
+                ahead(group.values[slot].load(Ordering::Relaxed));
+            }
+        }
+        core::array::from_fn(|at| find_in(groups, hashes[at], |value| is(at, value)))
     }
 
     /// Publishes `value` under `hash` and, if that fills the table to three quarters, grows it
@@ -905,6 +972,43 @@ mod tests {
                 assert_eq!(index.find(hash_of(key), |it| keys[it as usize] == key), Some(value));
             }
         }
+    }
+
+    /// `find_many` answers what `find` answers of each of its hashes, duplicates and absent
+    /// keys among them, over indexes from empty to several levels grown, with colliding
+    /// hashes; `ahead` is told only values the index holds.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn find_many_is_find_of_each() {
+        blaze_sim::check(Config::cases(CASES), |tape: &Tape| {
+            let index = Index::new_in(Global);
+            let mut keys: Vec<u64> = Vec::new();
+            let held = tape.below(sized!(400, 60), "held");
+            for _ in 0..held {
+                let key = tape.below(500, "key");
+                if index.find(hash_of(key), |value| keys[value as usize] == key).is_none() {
+                    let value = keys.len() as u32;
+                    keys.push(key);
+                    index.insert(keys.len() - 1, hash_of(key), value, |value| {
+                        hash_of(keys[value as usize])
+                    });
+                }
+            }
+            for _ in 0..4 {
+                let mut asked: [u64; 8] = core::array::from_fn(|_| tape.below(600, "asked"));
+                // A duplicate in every batch: keys above 500 are never held.
+                asked[7] = asked[tape.index(7, "duplicated")];
+                let found = index.find_many(
+                    asked.map(hash_of),
+                    |value| assert!((value as usize) < keys.len(), "ahead of a held value"),
+                    |at, value| keys[value as usize] == asked[at],
+                );
+                for (at, &key) in asked.iter().enumerate() {
+                    let one = index.find(hash_of(key), |value| keys[value as usize] == key);
+                    assert_eq!(found[at], one, "key {key} at {at} of {asked:?}");
+                }
+            }
+        });
     }
 
     /// One writer at a time behind a lock, readers with none: every value a reader finds is

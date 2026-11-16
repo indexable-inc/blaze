@@ -12,7 +12,7 @@ use blaze_own::Vec;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use crate::{
-    Adler32, Crc32, Deflate, Error, GzipDecoder, Inflate, InflateInto, Level, Limits, Tree, Why,
+    Adler32, Crc32, Deflate, Error, Fed, GzipDecoder, MAX_RATIO, Inflate, InflateInto, Level, Limits, Tree, Why,
     ZlibDecoder, ZlibInto, adler32, crc32, gunzip, gzip, inflate, unzlib, unzlib_prefix, zlib,
     plant::{self, Plant},
 };
@@ -426,6 +426,105 @@ fn deflate_is_deterministic_across_runs() {
         let a = compress(&data, level, &[]);
         let b = compress(&data, level, &[1, 2, 3, 65_536, 100_000]);
         assert!(a[..] == b[..], "{level:?}: bytes differ by split");
+    }
+}
+
+/// What one decoder made of a stream fed in pieces: each feed's answer, then the output.
+fn run_into(mut i: InflateInto, stream: &[u8], room: usize, splits: &[usize]) -> (StdVec<Result<Fed, Error>>, StdVec<u8>) {
+    let mut out = std::vec![0u8; room];
+    let mut feeds = StdVec::new();
+    let mut at = 0usize;
+    let mut sizes = splits.iter().copied().chain(core::iter::repeat(usize::MAX));
+    while at < stream.len() && !i.is_done() {
+        let end = at.saturating_add(sizes.next().unwrap_or(usize::MAX).max(1)).min(stream.len());
+        let fed = i.feed(&stream[at..end], &mut out);
+        feeds.push(fed);
+        match fed {
+            Ok(fed) => at += fed.consumed,
+            Err(_) => break,
+        }
+    }
+    feeds.push(i.finish().map(|()| Fed { consumed: 0, done: true }));
+    out.truncate(i.written() as usize);
+    (feeds, out)
+}
+
+/// The fast loop's oracle: the careful decoder alone, fed the same, answers the same at every
+/// feed (equal errors at equal offsets) and writes the same bytes.
+fn fast_equals_careful(stream: &[u8], limits: Limits, room: usize, splits: &[usize]) -> Result<(), Broke> {
+    let fast = run_into(InflateInto::new(limits), stream, room, splits);
+    let careful = run_into(InflateInto::careful(limits), stream, room, splits);
+    if fast.0 != careful.0 {
+        return Err(oracle(format!("the fast loop answers {:?}, the careful decoder {:?}", fast.0, careful.0)));
+    }
+    if fast.1 != careful.1 {
+        return Err(oracle(format!("the fast loop wrote other bytes ({} and {})", fast.1.len(), careful.1.len())));
+    }
+    Ok(())
+}
+
+/// The streams the twin test reads: the crate's own source by every encoder at hand.
+fn corpus() -> StdVec<StdVec<u8>> {
+    let files: [&[u8]; 4] =
+        [include_bytes!("inflate.rs"), include_bytes!("deflate.rs"), include_bytes!("tables.rs"), include_bytes!("tests.rs")];
+    let mut streams = StdVec::new();
+    for file in files {
+        for level in [Level::Store, Level::Fast, Level::Default] {
+            streams.push(compress(file, level, &[]).as_slice().to_vec());
+        }
+        for level in [1, 6, 9] {
+            streams.push(miniz_oxide::deflate::compress_to_vec(file, level));
+        }
+    }
+    streams
+}
+
+#[test]
+fn the_fast_loop_equals_the_careful_decoder() {
+    let streams = corpus();
+    check(Config::cases(300), |tape| {
+        let mut stream = match tape.coin("corpus or shaped") {
+            true => streams[tape.index(streams.len(), "stream")].clone(),
+            false => compress(&shaped(tape), level(tape), &[]).as_slice().to_vec(),
+        };
+        // A truncation, a corrupted byte, both or neither.
+        if tape.coin("truncate") && !stream.is_empty() {
+            stream.truncate(tape.index(stream.len(), "keep"));
+        }
+        if tape.coin("corrupt") && !stream.is_empty() {
+            let at = tape.index(stream.len(), "corrupt at");
+            stream[at] ^= 1 + tape.int_in(0u8..=254, "by");
+        }
+        // Room short of, at, or past the output, and bounds the stream may meet.
+        let room = tape.int_in(0usize..=400_000, "room");
+        let limits = Limits {
+            most_out: tape.int_in(0u64..=400_000, "most out"),
+            most_ratio: *tape.pick(&[1u64, 4, 64, MAX_RATIO], "ratio").expect("ratios"),
+            most_header: 0,
+        };
+        fast_equals_careful(&stream, limits, room, &splits(tape, "feed splits"))
+    });
+}
+
+#[test]
+fn the_oracle_catches_a_fast_distance_off_by_one() {
+    control(Config::cases(64), Plant::Clean, Plant::FastDistanceOffByOne, "other bytes", |tape, p| {
+        let period = tape.bytes(2..=15, "period");
+        let data: StdVec<u8> = (0..tape.int_in(2_000usize..=20_000, "len")).map(|i| period[i % period.len()]).collect();
+        let stream = compress(&data, Level::Fast, &[]);
+        plant::with(p, || fast_equals_careful(&stream, LOOSE, data.len() + 300, &[]))
+    });
+}
+
+#[test]
+fn the_fast_loop_equals_the_careful_decoder_at_every_truncation() {
+    let file = include_bytes!("tables.rs");
+    for stream in [compress(file, Level::Default, &[]).as_slice().to_vec(), miniz_oxide::deflate::compress_to_vec(file, 9)] {
+        for keep in 0..=stream.len() {
+            if let Err(Broke::Oracle(why)) = fast_equals_careful(&stream[..keep], LOOSE, file.len() + 300, &[]) {
+                panic!("cut at {keep} of {}: {why}", stream.len());
+            }
+        }
     }
 }
 

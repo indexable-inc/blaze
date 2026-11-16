@@ -2,6 +2,7 @@
 //! the arena with some subterms replaced, and importing a term of a portable answer into the
 //! arena with its generic parameters instantiated.
 
+use blaze_hash::HashMap;
 use blaze_own::{Alloc, Vec};
 
 use crate::error::{Limit, Malformed, SolveError};
@@ -16,12 +17,14 @@ pub const MAX_WALK: usize = 1 << 22;
 pub struct Scratch<'a> {
     work: Vec<(Ty, u32), Alloc<'a>>,
     out: Vec<Ty, Alloc<'a>>,
-    memo: Vec<Ty, Alloc<'a>>,
+    /// The import's memo: a portable node to its arena handle, for the nodes one import
+    /// reaches (a record's table may hold many terms; only the root's are walked).
+    memo: HashMap<u32, Ty, Alloc<'a>>,
 }
 
 impl<'a> Scratch<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Scratch<'a> {
-        Scratch { work: Vec::new_in(alloc), out: Vec::new_in(alloc), memo: Vec::new_in(alloc) }
+        Scratch { work: Vec::new_in(alloc), out: Vec::new_in(alloc), memo: HashMap::new_in(alloc) }
     }
 }
 
@@ -173,36 +176,63 @@ pub fn import<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: T
     if root.0 >= len {
         return Err(SolveError::Malformed(Malformed::PortableIndex { node: root.0, len }));
     }
-    // Children come before parents, so one forward pass over the prefix up to `root` imports
-    // every node it can reach; the memo keeps each node's arena handle.
-    let base = s.memo.len();
-    let mut kids: Vec<Ty, Alloc<'_>> = Vec::new_in(*s.memo.allocator());
-    for i in 0..=root.0 {
-        let k = p.nodes[i as usize];
+    // A post-order walk of the nodes `root` reaches (a record's table may hold other terms,
+    // over other parameters, that this import must not touch). A child's index is below its
+    // parent's (children come first in a table), which bounds the walk on a malformed table.
+    s.memo.clear();
+    let wb = s.work.len();
+    let r = import_walk(tys, s, p, root, inst);
+    s.work.truncate(wb);
+    s.memo.clear();
+    r
+}
+
+fn import_walk<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: Ty, inst: Inst<'_>) -> Result<Ty, SolveError> {
+    let get = |l: List, x: u32| {
+        let at = (l.start + x) as usize;
+        if at < p.lists.len() { p.lists[at] } else { Ty::NONE }
+    };
+    let base = s.work.len();
+    let mut kids: Vec<Ty, Alloc<'_>> = Vec::new_in(*s.work.allocator());
+    s.work.push((root, 0));
+    let mut steps = 0usize;
+    while s.work.len() > base {
+        let Some((t, exit)) = s.work.pop() else { break };
+        steps += 1;
+        if steps > MAX_WALK {
+            s.work.truncate(base);
+            return Err(SolveError::Limit(Limit::Walk));
+        }
+        if exit == 0 && s.memo.contains_key(&t.0) {
+            continue;
+        }
+        let k = p.nodes[t.0 as usize];
         let c = children(k);
         let n = arity(c);
-        kids.clear();
-        let mut bad = None;
-        for j in 0..n {
-            let ch = child(c, j, |l, x| {
-                let at = (l.start + x) as usize;
-                if at < p.lists.len() { p.lists[at] } else { Ty::NONE }
-            });
-            if ch.0 >= i {
-                bad = Some(ch.0);
-                break;
+        if exit == 0 {
+            s.work.push((t, 1));
+            for j in (0..n).rev() {
+                let ch = child(c, j, get);
+                if ch.0 >= t.0 {
+                    s.work.truncate(base);
+                    return Err(SolveError::Malformed(Malformed::PortableIndex { node: ch.0, len: t.0 }));
+                }
+                if !s.memo.contains_key(&ch.0) {
+                    s.work.push((ch, 0));
+                }
             }
-            kids.push(s.memo[base + ch.0 as usize]);
+            continue;
         }
-        if let Some(node) = bad {
-            s.memo.truncate(base);
-            return Err(SolveError::Malformed(Malformed::PortableIndex { node, len: i }));
+        kids.clear();
+        for j in 0..n {
+            let ch = child(c, j, get);
+            kids.push(s.memo[&ch.0]);
         }
         let made = match k {
             TyKind::Param(x) | TyKind::ConstParam(x) => match inst.args.get(x as usize) {
                 Some(&a) => a,
                 None => {
-                    s.memo.truncate(base);
+                    s.work.truncate(base);
                     return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.args.len() as u32 }));
                 }
             },
@@ -210,7 +240,7 @@ pub fn import<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: T
             TyKind::Bound(0, x) if !inst.bound.is_empty() => match inst.bound.get(x as usize) {
                 Some(&b) => b,
                 None => {
-                    s.memo.truncate(base);
+                    s.work.truncate(base);
                     return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.bound.len() as u32 }));
                 }
             },
@@ -222,11 +252,9 @@ pub fn import<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: T
                 }
             }
         };
-        s.memo.push(made);
+        s.memo.insert(t.0, made);
     }
-    let r = s.memo[base + root.0 as usize];
-    s.memo.truncate(base);
-    Ok(r)
+    Ok(s.memo[&root.0])
 }
 
 /// Visits every node of `root` (resolving variables at each node) before its children, until

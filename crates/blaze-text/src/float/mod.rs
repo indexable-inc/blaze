@@ -1,5 +1,5 @@
 //! Floats as text: the shortest form that reads back as the same float ([`ryu`]), in exactly
-//! `core::fmt`'s `{:?}` layout, and a fixed number of places ([`fixed`]), exactly
+//! `core::fmt`'s `{}` layout ([`display`]) or its `{:?}` layout ([`debug`]), and a fixed number of places ([`fixed`]), exactly
 //! `core::fmt`'s `{:.N}`: the exact binary value rounded half to even. Reading them back is
 //! [`parse`].
 
@@ -169,29 +169,101 @@ pub(crate) fn fields<F: Float>(x: F) -> (bool, u32, u64) {
     (negative, exponent, mantissa)
 }
 
-/// `x` as `{:?}` writes it: `0.1`, `1.0`, `-0.0`, `1e16`, `1.5e-5`, `inf`, `NaN`.
-pub(crate) fn shortest<F: Float, P: Put + ?Sized>(x: F, out: &mut P) {
+/// A float's shortest round-tripping form before it is laid out.
+enum Shortest {
+    /// `NaN`, `inf` or `-inf`: one text in both layouts.
+    Special(&'static str),
+    /// Zero, with its sign.
+    Zero { negative: bool },
+    /// `digits * 10^e10`, the digits without leading or trailing zeros.
+    Digits { negative: bool, digits: Decimal, e10: i32 },
+}
+
+#[inline(always)]
+fn shortest_of<F: Float>(x: F) -> Shortest {
     let (negative, exponent, mantissa) = fields(x);
     let all_ones = (1u32 << F::EXPONENT_BITS) - 1;
     if exponent == all_ones {
-        return match (mantissa != 0, negative) {
-            (true, _) => out.put_str("NaN"),
-            (false, true) => out.put_str("-inf"),
-            (false, false) => out.put_str("inf"),
-        };
+        return Shortest::Special(match (mantissa != 0, negative) {
+            (true, _) => "NaN",
+            (false, true) => "-inf",
+            (false, false) => "inf",
+        });
     }
     if exponent == 0 && mantissa == 0 {
-        return out.put_str(if negative { "-0.0" } else { "0.0" });
+        return Shortest::Zero { negative };
     }
-    let (digits, e10) = ryu::shortest(mantissa, exponent, F::MANTISSA_BITS, F::BIAS);
-    let mut d = Decimal::at_end();
-    u64_into(digits, &mut d);
-    let mut text = Ascii::<64>::at_start();
-    if negative {
-        text.back(b'-');
+    let (value, e10) = ryu::shortest(mantissa, exponent, F::MANTISSA_BITS, F::BIAS);
+    let mut digits = Decimal::at_end();
+    u64_into(value, &mut digits);
+    Shortest::Digits { negative, digits, e10 }
+}
+
+/// `x` as `{}` writes it: the shortest digits that read back as `x`, in plain decimal with no
+/// exponent and no forced point: `0.1`, `1`, `-0`, `1e16` as `10000000000000000`, `inf`,
+/// `NaN`.
+pub(crate) fn display<F: Float, P: Put + ?Sized>(x: F, out: &mut P) {
+    match shortest_of(x) {
+        Shortest::Special(text) => out.put_str(text),
+        Shortest::Zero { negative } => out.put_str(if negative { "-0" } else { "0" }),
+        Shortest::Digits { negative, digits, e10 } => {
+            // Up to 17 digits, a sign, a point and a few zeros fit in one piece; the long zero
+            // runs of `1e300` or `5e-324` go out in blocks.
+            let digits = digits.as_bytes();
+            let n = digits.len().narrow_or_stop::<i32>();
+            let point = n + e10;
+            let mut text = Ascii::<64>::at_start();
+            if negative {
+                text.back(b'-');
+            }
+            if e10 >= 0 {
+                text.back_all(digits);
+                out.put_str(text.as_str());
+                zeros(e10.cast_unsigned(), out);
+            } else if point > 0 {
+                let point = idx(point.cast_unsigned());
+                text.back_all(&digits[..point]);
+                text.back(b'.');
+                text.back_all(&digits[point..]);
+                out.put_str(text.as_str());
+            } else {
+                text.back_all(b"0.");
+                out.put_str(text.as_str());
+                zeros(point.unsigned_abs(), out);
+                let mut tail = Ascii::<64>::at_start();
+                tail.back_all(digits);
+                out.put_str(tail.as_str());
+            }
+        }
     }
-    lay_out(d.as_bytes(), e10, x.scientific(), &mut text);
-    out.put_str(text.as_str());
+}
+
+/// `n` zeros, 64 at a time.
+#[inline]
+fn zeros<P: Put + ?Sized>(n: u32, out: &mut P) {
+    const BLOCK: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let mut left = idx(n);
+    while left > 0 {
+        let take = left.min(BLOCK.len());
+        out.put_str(&BLOCK[..take]);
+        left -= take;
+    }
+}
+
+/// `x` as `{:?}` writes it: `0.1`, `1.0`, `-0.0`, `1e16`, `1.5e-5`, `inf`, `NaN`.
+pub(crate) fn debug<F: Float, P: Put + ?Sized>(x: F, out: &mut P) {
+    match shortest_of(x) {
+        Shortest::Special(text) => out.put_str(text),
+        Shortest::Zero { negative } => out.put_str(if negative { "-0.0" } else { "0.0" }),
+        Shortest::Digits { negative, digits, e10 } => {
+            let mut text = Ascii::<64>::at_start();
+            if negative {
+                text.back(b'-');
+            }
+            lay_out(digits.as_bytes(), e10, x.scientific(), &mut text);
+            out.put_str(text.as_str());
+        }
+    }
 }
 
 /// `digits * 10^e10` laid out as `{:?}` does, into `text`.

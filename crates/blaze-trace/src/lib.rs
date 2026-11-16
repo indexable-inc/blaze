@@ -40,26 +40,27 @@
 //! ([`Level::COMPILED`]). Evidence: [`tests::no_sink_evaluates_no_field`], `examples/cost.rs`.
 //!
 //! Measured 2026-11-15, one run, this machine (an arm64 Mac), `examples/cost.rs` in release,
-//! ns per span (open, enter, exit, close), 2M spans a thread, before the fixes below:
+//! ns per span (open, enter, exit, close), 2M spans a thread; first run, then after the fixes:
 //!
-//! | case                                       | 1 thread | 8 threads |
-//! |--------------------------------------------|---------:|----------:|
-//! | blaze_trace, nothing recording             |     2.52 |      2.96 |
-//! | tracing, no subscriber                     |     1.83 |      1.89 |
-//! | tracing, a subscriber keeping nothing      |     6.23 |     54.61 |
-//! | blaze_trace, rings                         |    10.34 |     11.60 |
-//! | tracing, a subscriber writing the rings    |    13.72 |     97.96 |
-//! | floor: two counter reads, two slot writes  |     5.94 |           |
+//! | case                                       | first, 1 / 8 thr | now, 1 / 8 thr |
+//! |--------------------------------------------|-----------------:|---------------:|
+//! | empty loop                                 |                  |    0.23        |
+//! | blaze_trace, nothing recording             |     2.52 /  2.96 |    0.93 /  1.19 |
+//! | tracing, no subscriber                     |     1.83 /  1.89 |    1.75 /  1.81 |
+//! | tracing, a subscriber keeping nothing      |     6.23 / 54.61 |    5.23 / 29.52 |
+//! | blaze_trace, rings                         |    10.34 / 11.60 |    6.06 /  6.73 |
+//! | tracing, a subscriber writing the rings    |    13.72 / 97.96 |   10.53 / 27.84 |
+//! | floor: two counter reads, two slot writes  |     5.94         |    3.95        |
 //!
-//! Recording: 1.33x faster than `tracing` on one thread, 8.4x on eight (no shared state);
-//! 1.74x the floor (rule 67 wants 1.1x). Disabled: 1.38x `tracing`'s. Fixed since, to be
-//! measured again: a span finds its thread's state once, at its enter, and its guard keeps it
-//! for the exit (it was four thread-local accesses a span, each a call on macOS); the rings'
-//! config is taken once, at open (it was an acquire load an edge); the tick is the counter with
-//! no branch (the simulation clock is the `sim-clock` feature); `Span`'s drop is inlined (it was
-//! an out-of-line call at every site, recorded or not); the push's step-2 fence is `dmb ishst`,
-//! not a full `dmb ish` ([`ring`]), which lowers the floor too. The table gains an empty-loop line
-//! to subtract.
+//! Now: recording 1.74x faster than `tracing` on one thread, 4.1x on eight; 1.53x the floor
+//! (rule 67 wants 1.1x). Disabled: 0.53x `tracing`'s. The fixes, each found by the ladder in
+//! `examples/cost.rs` and the disassembly: a span finds its thread's state once, at its enter,
+//! and its guard keeps it; the rings' config is taken once, at open; the tick is the counter with
+//! no branch (the simulation clock is the `sim-clock` feature); a guard's drop is one test of
+//! the thread pointer it holds, the edge out of line (it was an out-of-line drop with a
+//! six-register prologue, calling `stamp`, `span_id` and `Site::id`, at every site); the push
+//! writes through the ring's own words without bounds checks; and the ring fences once a block
+//! of 64 entries, not once a slot ([`ring`]: that fence was 1.2 ns of a 2.6 ns push).
 
 #![no_std]
 #![feature(thread_local, allocator_api)]
@@ -683,6 +684,20 @@ struct Open {
     meta: &'static Metadata<'static>,
 }
 
+/// A sink span's edges: out of line, so a guard's drop inlined at every site is the ring's
+/// stores or nothing.
+#[cold]
+#[inline(never)]
+fn sink_enter(open: &Open) {
+    open.sink.enter(&open.id);
+}
+
+#[cold]
+#[inline(never)]
+fn sink_exit(open: &Open) {
+    open.sink.exit(&open.id);
+}
+
 /// Who records a span.
 enum Inner {
     None,
@@ -700,6 +715,7 @@ pub struct Span {
 
 impl Span {
     /// The span nothing records.
+    #[inline(always)]
     pub const fn none() -> Span {
         Span { inner: Inner::None }
     }
@@ -739,8 +755,9 @@ impl Span {
                 here
             }
             Inner::Sink(open) => {
-                open.sink.enter(&open.id);
-                core::ptr::null()
+                sink_enter(open);
+                // Not null, so the guard leaves it; a sink's exit never reads it.
+                core::ptr::dangling()
             }
         }
     }
@@ -755,19 +772,27 @@ impl Span {
             Inner::Ring { site, config, span } => unsafe {
                 record::exit(config, here, site.id(), span.load(Ordering::Relaxed));
             },
-            Inner::Sink(open) => open.sink.exit(&open.id),
+            Inner::Sink(open) => sink_exit(open),
         }
     }
 
+    /// A guard's drop: out of line, so the guard's own drop, inlined at every site, is one test
+    /// of `here`, null only for a span nothing records (a register, where the span's tag would
+    /// be a load of the guard just stored).
+    #[inline(never)]
+    fn leave(&self, here: *const record::Thread) {
+        self.edge_out(here);
+    }
+
     /// Enters it on this thread until the guard drops.
-    #[inline]
+    #[inline(always)]
     pub fn entered(self) -> EnteredSpan {
         let here = self.edge_in();
         EnteredSpan { span: self, here }
     }
 
     /// Enters it on this thread until the guard drops, keeping the handle.
-    #[inline]
+    #[inline(always)]
     pub fn enter(&self) -> Entered<'_> {
         let here = self.edge_in();
         Entered { span: self, here }
@@ -827,6 +852,7 @@ impl Span {
         }
     }
 
+    #[inline(always)]
     pub fn is_none(&self) -> bool {
         matches!(self.inner, Inner::None)
     }
@@ -874,6 +900,7 @@ impl Drop for Span {
 }
 
 impl Default for Span {
+    #[inline(always)]
     fn default() -> Span {
         Span::none()
     }
@@ -906,7 +933,8 @@ impl EnteredSpan {
     /// Leaves it, keeping it open.
     pub fn exit(mut self) -> Span {
         let span = core::mem::replace(&mut self.span, Span::none());
-        span.edge_out(self.here);
+        let here = core::mem::replace(&mut self.here, core::ptr::null());
+        span.edge_out(here);
         span
     }
 
@@ -926,7 +954,9 @@ impl core::ops::Deref for EnteredSpan {
 impl Drop for EnteredSpan {
     #[inline(always)]
     fn drop(&mut self) {
-        self.span.edge_out(self.here);
+        if !self.here.is_null() {
+            self.span.leave(self.here);
+        }
     }
 }
 
@@ -946,6 +976,8 @@ pub struct Entered<'a> {
 impl Drop for Entered<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        self.span.edge_out(self.here);
+        if !self.here.is_null() {
+            self.span.leave(self.here);
+        }
     }
 }

@@ -72,7 +72,7 @@ fn capture(f: impl FnOnce() -> u8) -> (u8, Vec<u8>) {
 }
 
 /// The rungs that run today: the next one is added when it runs.
-const RUNNING: &[&str] = &["1-empty"];
+const RUNNING: &[&str] = &["1-empty", "2-exit", "3-hello", "4-modules"];
 
 #[test]
 fn every_running_rung_ends_as_expected() {

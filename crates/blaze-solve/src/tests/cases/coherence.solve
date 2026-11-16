@@ -45,7 +45,9 @@ trait Foo
 struct Local<T>
 impl@a<T> Foo for Local<T>
 impl@b<U> Foo for Local<U>
-overlap @a @b => overlap
+# Both impls' implicit `T: Sized` is `?T: Sized`, ambiguous on a variable self type: the same
+# rule as may_overlap_where_clause_on_unresolved_var (rustc reports both as one overlap).
+overlap @a @b => may_overlap
 
 case overlap_with_unresolved_var = rustc_trait_selection coherence.rs overlap
 # The intersection leaves impl a's T bound to bool; nothing else is asked.
@@ -357,7 +359,8 @@ mode coherence
 trait Bar
 trait Baz
 impl<T> Bar for Vec<T>
-goal Vec<?0>: Bar => yes
+# The impl's implicit `T: Sized` is `?0: Sized`, ambiguous while ?0 is unresolved.
+goal Vec<?0>: Bar => maybe
 goal Vec<?0>: Baz => no
 
 case unknowable_foreign_trait_foreign_type = coherence.rs trait_ref_is_knowable Conflict::Upstream

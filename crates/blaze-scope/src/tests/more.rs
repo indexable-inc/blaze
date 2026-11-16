@@ -199,6 +199,87 @@ fn a_prelude_in_the_crate_s_own_cycle_is_read_live() {
     assert_eq!(s.def(root, Namespace::Types, "C"), Some(b));
 }
 
+/// Rule: a macro path through a named import of the crate root resolves once the import does.
+/// core's shape: `#[macro_use] mod macros { pub macro cfg_select }`, `pub use
+/// crate::macros::cfg_select;`, a prelude module of the crate globbing the root, and `mod ffi {
+/// mod va_list { crate::cfg_select!(); } }`.
+#[test]
+fn a_macro_path_through_a_root_import() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2024);
+    let macros = w.module_with(root, "macros", V::Priv, true, false);
+    let mac = w.item(macros, "cfg_select", Namespace::Macros, DefKind::Macro(CallShape::FnLike), V::Pub);
+    let p = w.module(root, "prelude", V::Pub);
+    w.glob(p, "crate::macros", V::Pub);
+    w.cr(root).head.prelude = Some(p);
+    w.use_(root, "crate::macros::cfg_select", V::Pub);
+    let ffi = w.module(root, "ffi", V::Pub);
+    let va = w.module(ffi, "va_list", V::Priv);
+    let call = w.call(va, "crate::cfg_select", CallShape::FnLike);
+    w.fun(call, "made", V::Pub);
+    let s = solved(&w);
+    assert_eq!(macro_error(&s, va, call), None, "{:?}", s.errors(va));
+    assert_eq!(s.def(root, Namespace::Macros, "cfg_select"), Some(mac));
+    assert!(s.def(va, Namespace::Values, "made").is_some());
+}
+
+/// Rule: an import's macro reads the `macro_rules!` scope at its place. `mod u { macro_rules!
+/// m {} pub(crate) use m; } use u::m as n;` (core's `ub_checks::assert_unsafe_precondition`):
+/// `u` binds `m` to the macro, and the root's `n` is it.
+#[test]
+fn a_macro_rules_is_imported_by_name() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let u = w.module(root, "u", V::Pub);
+    let m = w.rules(u, "m");
+    w.use_(u, "m", V::Crate);
+    w.use_as(root, "u::m", "n", V::Priv);
+    let s = solved(&w);
+    assert!(s.errors(u).is_empty(), "{:?}", s.errors(u));
+    assert!(s.errors(root).is_empty(), "{:?}", s.errors(root));
+    assert_eq!(s.def(u, Namespace::Macros, "m"), Some(m));
+    assert_eq!(s.def(root, Namespace::Macros, "n"), Some(m));
+
+    // `#[macro_export] macro_rules! e {} pub use e;` is public; without the export, a wider
+    // re-export.
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let u = w.module(root, "u", V::Pub);
+    w.rules_with(u, "e", true);
+    w.use_(u, "e", V::Pub);
+    w.rules(u, "p");
+    w.use_(u, "p", V::Pub);
+    let s = solved(&w);
+    let wider: Vec<_> = s
+        .errors(u)
+        .iter()
+        .filter_map(|e| match e {
+            ScopeError::WiderReexport { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(wider, ["p"], "{:?}", s.errors(u));
+}
+
+/// Rule: the builtin types are the last layer of the type namespace, `#[no_implicit_prelude]`
+/// or not, and a nearer binding shadows one. `pub use bool;` (core's `primitive.rs`) binds the
+/// builtin; with `mod u8 {}` beside it, `use u8;` is the module.
+#[test]
+fn builtin_types_are_the_last_layer() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let p = w.module_with(root, "p", V::Pub, false, true);
+    w.use_(p, "bool", V::Pub);
+    let u8_mod = w.module(root, "u8", V::Pub);
+    w.use_as(root, "u8", "byte", V::Priv);
+    let s = solved(&w);
+    assert!(s.errors(p).is_empty(), "{:?}", s.errors(p));
+    let bool_def = crate::builtin_type("bool").map(|d| d.key);
+    assert!(bool_def.is_some_and(crate::is_builtin_type));
+    assert_eq!(s.def(p, Namespace::Types, "bool"), bool_def);
+    assert_eq!(s.def(root, Namespace::Types, "byte"), Some(u8_mod));
+}
+
 /// Rule: `pub(in path)` names a module by path, an alias of an ancestor included; a path to a
 /// module that is no ancestor is an error.
 #[test]

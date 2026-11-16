@@ -7,15 +7,23 @@
 //! column of `u128`s. Every class is hash-consed: a row is interned once, so equal types are
 //! equal ids, and `==` on a `Ty` is type equality (up to inference variables).
 //!
-//! Memory per distinct type: 1 + 4 + 4 + 2 + 4 = 15 bytes of columns and about 5 bytes of
-//! index (4-byte slot and 1-byte tag at 7/8 load at most), against rustc's 48-byte
-//! `WithCachedTypeInfo<TyKind>` behind a pointer in a sharded set. No hash column (a deviation
-//! from the brief's layout): a grow recomputes each row's hash in one multiply, which costs
-//! less than 8 bytes a row of memory held for the whole task.
+//! Memory per distinct type: a 12-byte row (`a`, `b`, `kind`, `flags`) and a 4-byte markers
+//! column, and about 6 bytes of index (5.3 bytes a slot at 7/8 load at most): a floor of about
+//! 21 bytes, against rustc's 48-byte `WithCachedTypeInfo<TyKind>` behind a pointer in a
+//! sharded set. Measured (examples/cost.rs, 2026-11-15, this Mac): 25.2 bytes a type at
+//! 1,000,000 types, ratio 1.20 (doubling slack); 33.6 at 10,000 (the presets' and the first
+//! grow's slack), ratio 1.60. No hash column: a grow recomputes each row's hash in one multiply.
 //!
-//! The intern floor is one hash (one multiply), one 16-wide tag compare and one row compare;
-//! a hit reads three columns at one row. A miss adds four pushes and the flags of at most two
-//! children.
+//! Rows, not one column per field (a deviation from the brief's columns): a hit compares
+//! `a`, `b` and `kind` and a walk reads the flags and then the row, so one 12-byte record is
+//! one cache line where three columns were three; on a million-row table that cut a cold
+//! hit from 56.5 ns to 25.0 ns.
+//!
+//! The intern floor: one hash (one multiply, 0.5 ns measured), one group probe (one cache
+//! line: [`crate::index`]) and one row compare. A hot hit measured 10.0 ns (find alone 9.1)
+//! in a loop where each lookup takes the last one's result: a chain of about six dependent
+//! L1 loads and the multiply, about 30 cycles; independent hot lookups overlap. A miss adds
+//! two pushes and the flags of at most two children; a hit computes no flags.
 
 use blaze_id::ItemKey;
 use blaze_int::Cast;
@@ -51,6 +59,20 @@ pub(crate) struct Row {
     pub(crate) flags: Flags,
 }
 
+/// A row to intern in a batch ([`Tys::intern_many`]): its class (not a list), kind and
+/// columns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Want {
+    pub(crate) tag: u32,
+    pub(crate) kind: u8,
+    pub(crate) a: u32,
+    pub(crate) b: u32,
+}
+
+/// Rows a batch prefetches before probing: enough misses in flight to fill the core's
+/// miss buffers, few enough that the first lines are still in L1 when probed.
+pub(crate) const INTERN_BATCH: usize = 16;
+
 /// One class's rows.
 pub(crate) struct Rows<'a> {
     rows: Vec<Row, Alloc<'a>>,
@@ -83,6 +105,14 @@ impl<'a> Rows<'a> {
             hash::row(r.kind, r.a, r.b)
         });
         id
+    }
+
+    /// Starts loading row `id`'s line, if it is a row.
+    #[inline(always)]
+    fn prefetch_row(&self, id: u32) {
+        if let Some(r) = self.rows.get(ix(id)) {
+            core::hint::prefetch_read(core::ptr::from_ref(r), core::hint::Locality::L1);
+        }
     }
 
     #[inline(always)]
@@ -440,6 +470,45 @@ impl<'a> Tys<'a> {
             TAG_TY => self.intern_ty(kind, a, b).node(),
             TAG_REGION => self.intern_re(kind, a, b).node(),
             _ => self.intern_ct(kind, a, b).node(),
+        }
+    }
+
+    #[inline(always)]
+    fn rows_of(&self, tag: u32) -> &Rows<'a> {
+        match tag {
+            TAG_TY => &self.ty,
+            TAG_REGION => &self.re,
+            _ => &self.ct,
+        }
+    }
+
+    /// Interns each of `want` (rows of independent children), answering `got(at, node)` for
+    /// `want[at]` in order, as group prefetching (blaze-swiss's `Index::find_many` and
+    /// blaze-hash's `get_many` do the same, in three phases): in batches of [`INTERN_BATCH`],
+    /// every home group's load is started, then each home group's first row of the key's tag
+    /// is prefetched, then each row is interned. On a table past the cache a batch waits for
+    /// about one group miss and one row miss, not two of each per row. One row goes straight
+    /// to [`Tys::intern_node`]: there is nothing to overlap.
+    pub(crate) fn intern_many(&mut self, want: &[Want], mut got: impl FnMut(usize, Node)) {
+        if let [w] = want {
+            got(0, self.intern_node(w.tag, w.kind, w.a, w.b));
+            return;
+        }
+        for (c, chunk) in want.chunks(INTERN_BATCH).enumerate() {
+            let mut h = [0u64; INTERN_BATCH];
+            for (h, w) in h.iter_mut().zip(chunk) {
+                *h = hash::row(w.kind, w.a, w.b);
+                self.rows_of(w.tag).index.prefetch(*h);
+            }
+            for (h, w) in h.iter().zip(chunk) {
+                let rows = self.rows_of(w.tag);
+                if let Some(id) = rows.index.ahead(*h) {
+                    rows.prefetch_row(id);
+                }
+            }
+            for (i, w) in chunk.iter().enumerate() {
+                got(c * INTERN_BATCH + i, self.intern_node(w.tag, w.kind, w.a, w.b));
+            }
         }
     }
 
