@@ -331,7 +331,7 @@ impl<A: Allocator + Clone> Chunk<A> {
 
     /// Rows `rows` of `column` appended, a page ending at each row that fills one.
     fn push(&mut self, column: &Column<A>, rows: Range<usize>, options: &Options, alloc: &A) -> Result<(), ParquetError> {
-        let values = column.values();
+        let values = column.buffer();
         let valid = column.validity();
         let max_def = self.leaf.max_def;
         match column.list_offsets() {

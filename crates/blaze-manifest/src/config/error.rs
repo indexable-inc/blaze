@@ -129,10 +129,12 @@ pub enum ConfigWhat {
     NoShowOrigin { format: &'static str },
     NoMergedNo { format: &'static str },
     NotSet { key: String },
-    /// An error of a crate whose errors are not typed yet (blaze-source's `SourceId`, the
-    /// manifest's URL parsing, cargo-util-schemas' names, the caller's rustc): its text and
-    /// causes, as they are.
-    // dyn: another crate's error, held only on an error path until that crate's is typed.
+    /// A `profile.<name>` value that does not fit the manifest's profile schema, in its words.
+    Schema(crate::schema::SchemaError),
+    /// A typed error of another crate (blaze-source's `SourceId`, the manifest's URL parsing,
+    /// a registry name, blaze-toml's writer, the caller's rustc): its text and causes, as they
+    /// are.
+    // dyn: another crate's error, held only on an error path; its types are many.
     Foreign(Box<dyn Error + Send + Sync>),
 }
 
@@ -381,6 +383,7 @@ impl fmt::Display for ConfigWhat {
                 "the `{format}` format does not support --merged=no, try the `toml` format instead"
             ),
             W::NotSet { key } => write!(f, "config value `{key}` is not set"),
+            W::Schema(error) => error.fmt(f),
             W::Foreign(error) => error.fmt(f),
         }
     }
@@ -472,9 +475,24 @@ impl ConfigError {
         ConfigError(Box::new(Inner { what, definition: None, cause: Some(cause) }))
     }
 
-    /// Another crate's error as it is ([`ConfigWhat::Foreign`]).
-    pub(crate) fn foreign(error: impl Into<Box<dyn Error + Send + Sync>>) -> ConfigError {
-        ConfigError::new(ConfigWhat::Foreign(error.into()))
+    /// Another crate's typed error as it is ([`ConfigWhat::Foreign`]). The bound is `Error`,
+    /// not `Into<Box<dyn Error>>`, so that neither a string nor an `anyhow::Error` fits.
+    pub(crate) fn foreign(error: impl Error + Send + Sync + 'static) -> ConfigError {
+        ConfigError::new(ConfigWhat::Foreign(Box::new(error)))
+    }
+
+    /// A `profile.<name>` value the schema refused, as cargo reports a value its deserializer
+    /// refused: `could not load config key` of the value's key path, where it was defined,
+    /// caused by what is wrong.
+    pub(crate) fn schema(
+        error: crate::schema::SchemaError,
+        definition: Option<Definition>,
+    ) -> ConfigError {
+        let key = error.key.clone();
+        let mut error =
+            ConfigError::new(ConfigWhat::Schema(error)).context(ConfigWhat::LoadKey { key });
+        error.0.definition = definition;
+        error
     }
 
     /// `what`, caused by this error.

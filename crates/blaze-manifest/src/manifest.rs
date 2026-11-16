@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use blaze_data::Value;
 use blaze_hash::HashMap;
-use blaze_resolve::{PackageIdSpec, PartialVersion, Platform};
+use blaze_resolve::{PackageIdSpec, PartialVersion, Platform, RustVersion};
 use blaze_semver::{Comparator, Op, Version, VersionReq};
 use std::alloc::Global;
 use url::Url;
@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::error::{Context as During, ManifestError, ResultExt as _};
 use crate::schema::{
     self as manifest, Hints, InheritableField, InheritablePackage, PackageName, PathBaseName,
-    RustVersion, StringOrBool, TomlDependency, TomlDetailedDependency, TomlInheritedDependency,
+    StringOrBool, TomlDependency, TomlDetailedDependency, TomlInheritedDependency,
     TomlLints, TomlManifest, TomlPackage, TomlPackageBuild, TomlWorkspace, VecStringOrBool,
 };
 use crate::config::path::ConfigRelativePath;
@@ -1519,7 +1519,7 @@ fn replace<F: Files>(
         let mut spec =
             PackageIdSpec::parse(spec).context(|| During::ReplaceSpec { spec: spec.clone() })?;
         if spec.url().is_none() {
-            spec.set_url(CRATES_IO_INDEX.parse().unwrap());
+            spec = spec.with_url(CRATES_IO_INDEX.parse().unwrap());
         }
         if replacement.is_version_specified() {
             return Err(InvalidManifest::ReplaceWithVersion { spec: spec.to_string() }.into());
@@ -1723,19 +1723,19 @@ fn to_dependency_source_id<F: Files>(
                      use `rev = \"{fragment}\"` in the dependency declaration.",
                 ));
             }
-            SourceId::for_git(&loc, reference)
+            Ok(SourceId::for_git(&loc, reference)?)
         }
         (None, Some(path), _, _) => {
             if manifest_ctx.source_id.is_path() {
                 let path = manifest_ctx.file.parent().unwrap().join(path);
-                SourceId::for_path(&normalize_path(&path))
+                Ok(SourceId::for_path(&normalize_path(&path))?)
             } else {
                 Ok(manifest_ctx.source_id)
             }
         }
         (None, None, Some(registry), None) => source::alt_registry(manifest_ctx.config, registry),
         (None, None, None, Some(registry_index)) => {
-            SourceId::for_registry(&into_url(registry_index)?)
+            Ok(SourceId::for_registry(&into_url(registry_index)?)?)
         }
         (None, None, None, None) => source::crates_io(manifest_ctx.config),
     }

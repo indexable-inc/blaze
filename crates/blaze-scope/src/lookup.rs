@@ -5,11 +5,10 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use core::alloc::Allocator;
 use core::cmp::Ordering;
 
 use blaze_id::ItemKey;
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
     AmbiguityKind, BindingState, CallShape, Def, DefKind, Edition, Namespace, Origin, Path,
     PathKind, TextualDef, Unresolved, Visibility, VisibilityClass,
@@ -70,8 +69,8 @@ enum Tex {
     Wait,
 }
 
-pub(crate) struct GlobOutcome<A: Allocator> {
-    pub(crate) source: Option<Source<A>>,
+pub(crate) struct GlobOutcome<'a> {
+    pub(crate) source: Option<Source<'a>>,
     pub(crate) first: Option<Def>,
     pub(crate) wait: bool,
 }
@@ -99,13 +98,13 @@ fn seg(i: usize) -> u32 {
 /// each member `i` with a glob of `f`, what `f` binds the name to as `i` sees it, each value
 /// from the table's last values, from none, until a round changes nothing. A round past the
 /// bound sets `sink.overrun`, which the pass stops on.
-fn group_fixpoint<N: Name, A: Allocator + Clone>(
+fn group_fixpoint<'a, N: Name>(
     key: (Namespace, N, Option<(ItemKey, u32)>),
-    env: Env<'_, N, A>,
-    sink: &mut Sink<N, A>,
-    alloc: &A,
+    env: Env<'_, 'a, N>,
+    sink: &mut Sink<'a, N>,
+    alloc: Alloc<'a>,
 ) {
-    let mut edges: Vec<(usize, usize), A> = Vec::new_in(alloc.clone());
+    let mut edges: AVec<'a, (usize, usize)> = Vec::new_in(alloc);
     for (i, m) in env.members.iter().enumerate() {
         for g in m.globs.iter() {
             if let Source::Resolved { def, .. } = &g.source {
@@ -119,7 +118,7 @@ fn group_fixpoint<N: Name, A: Allocator + Clone>(
     }
     edges.sort_unstable();
     edges.dedup();
-    let mut table = Vec::with_capacity_in(edges.len(), alloc.clone());
+    let mut table = Vec::with_capacity_in(edges.len(), alloc);
     table.extend(edges.iter().map(|&(f, i)| (f, i, Res::None)));
     sink.memo.insert(key, table);
     let (ns, name, ignore) = key;
@@ -145,7 +144,7 @@ fn group_fixpoint<N: Name, A: Allocator + Clone>(
     sink.overrun = true;
 }
 
-impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
+impl<'a, N: Name> Resolver<'a, N> {
     /// Whether a call may still add names, and whether one pending waits on an answer.
     fn calls_state(&self) -> (bool, bool) {
         let mut unexpanded = false;
@@ -165,8 +164,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         ns: Namespace,
         name: N,
         q: Query<'_>,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
     ) -> Res {
         if let Some(e) = self.defs.get(&(ns, name)) {
             return Res::Found(e.hit());
@@ -255,8 +254,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         ns: Namespace,
         name: N,
         q: Query<'_>,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
     ) -> GlobFound {
         let mut out = GlobFound { found: None, undet: false, wait: false };
         let importer = self.asker();
@@ -358,7 +357,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
 
     /// Keeps glob `g` as the one that left a name undetermined, if it is this module's
     /// earliest so far (a fellow's note, made inside this lookup, gives way to this module's).
-    fn note_undet(&self, g: usize, sink: &mut Sink<N, A>) {
+    fn note_undet(&self, g: usize, sink: &mut Sink<'a, N>) {
         let at = self.globs[g].at;
         let keep = match sink.undet_glob {
             Some((m, at0, _)) if m == self.module => self.tree_cmp(at, at0) == Ordering::Less,
@@ -379,8 +378,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         ns: Namespace,
         name: N,
         ignore: Option<(ItemKey, u32)>,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
     ) -> Res {
         let Some(me) = env.index(self.module) else {
             // Only a member looks up through a fellow: a machine's own bug, stopped on.
@@ -389,7 +388,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         };
         let key = (ns, name, ignore);
         if !sink.memo.contains_key(&key) {
-            group_fixpoint(key, env, sink, &self.alloc);
+            group_fixpoint(key, env, sink, self.alloc);
         }
         let found = sink.memo.get(&key).and_then(|table| {
             table.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, me))).ok().map(|k| table[k].2)
@@ -410,8 +409,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         ns: Namespace,
         name: N,
         ignore: Option<(ItemKey, u32)>,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
     ) -> Res {
         let q = Query { asker: self.asker(), restricted: false, ignore };
         if def.key == self.module {
@@ -432,7 +431,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// A `Name` read of another module.
-    fn read_name(&self, module: ItemKey, ns: Namespace, name: N, layer: Layer, sink: &mut Sink<N, A>) -> Res {
+    fn read_name(&self, module: ItemKey, ns: Namespace, name: N, layer: Layer, sink: &mut Sink<'a, N>) -> Res {
         match self.cached(Read::Name { module, ns, name }, sink) {
             Some(Cached::Name(NameAnswer::Absent)) => Res::None,
             Some(Cached::Name(NameAnswer::Found { def, vis, state })) => {
@@ -469,7 +468,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// The module a path that does not begin with a name begins at.
-    pub(crate) fn start_module<B: Allocator>(&self, path: &Path<N, B>) -> Result<Hit, (u32, Unresolved)> {
+    pub(crate) fn start_module(&self, path: &Path<'_, N>) -> Result<Hit, (u32, Unresolved)> {
         match path.kind {
             PathKind::Crate => Ok(Hit::module(self.root)),
             PathKind::SelfMod => Ok(Hit::module(self.module)),
@@ -500,8 +499,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         name: N,
         at: At,
         ignore: Option<(ItemKey, u32)>,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
     ) -> Res {
         let from_root = self.edition == Edition::E2015
             && (kind == PathKind::Abs || (kind == PathKind::Plain && used == PathUse::Import));
@@ -522,7 +521,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     /// prelude (rustc's `early_resolve_ident_in_lexical_scope`). Early, the first binding wins
     /// and a weak undeterminacy goes on outward; in the final pass the outer layers are read
     /// too where they could make the innermost ambiguous, and the ambiguity goes to the sink.
-    pub(crate) fn lexical(&self, lq: LexQuery<N>, env: Env<'_, N, A>, sink: &mut Sink<N, A>) -> Res {
+    pub(crate) fn lexical(&self, lq: LexQuery<N>, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
         let mut inner: Option<Hit> = None;
         let mut undet = false;
         if lq.textual && lq.ns == Namespace::Macros {
@@ -604,7 +603,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         lq: &LexQuery<N>,
         inner: &mut Option<Hit>,
         undet: &mut bool,
-        sink: &mut Sink<N, A>,
+        sink: &mut Sink<'a, N>,
     ) -> Option<Res> {
         match r {
             Res::Found(hit) if self.kind_ok(&hit, lq.want) => match *inner {
@@ -674,7 +673,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     /// The `macro_rules!` named `name` visible at `at`: back through the fragment, into
     /// expanded calls and `#[macro_use]` children, out through the call a fragment expands,
     /// then the module's entry.
-    fn textual(&self, name: N, at: At, env: Env<'_, N, A>, sink: &mut Sink<N, A>) -> Res {
+    fn textual(&self, name: N, at: At, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
         let mut frag = at.frag;
         let mut end = at.slot as usize;
         loop {
@@ -695,7 +694,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         self.textual_entry(name, env, sink)
     }
 
-    fn textual_back(&self, name: N, frag: u32, end: usize, env: Env<'_, N, A>, sink: &mut Sink<N, A>) -> Tex {
+    fn textual_back(&self, name: N, frag: u32, end: usize, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Tex {
         let f = &self.frags[frag as usize];
         for s in (0..end).rev() {
             match f.slots[s] {
@@ -748,7 +747,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// What a `#[macro_use]` child carries out, searched from its end.
-    fn textual_out(&self, name: N, child: ItemKey, env: Env<'_, N, A>, sink: &mut Sink<N, A>) -> Tex {
+    fn textual_out(&self, name: N, child: ItemKey, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Tex {
         if child != self.module {
             if let Some(f) = env.fellow(child) {
                 let len = f.frags[0].slots.len();
@@ -774,7 +773,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// The `macro_rules!` visible at this module's `mod` line.
-    fn textual_entry(&self, name: N, env: Env<'_, N, A>, sink: &mut Sink<N, A>) -> Res {
+    fn textual_entry(&self, name: N, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
         let Some(&parent) = self.chain.get(1) else { return Res::None };
         if let Some(p) = env.fellow(parent) {
             return match p.find_mod(self.module) {
@@ -816,15 +815,15 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// The first `upto` segments of `path`, resolved to a module or an enum.
-    pub(crate) fn resolve_prefix<B: Allocator>(
+    pub(crate) fn resolve_prefix(
         &self,
-        path: &Path<N, B>,
+        path: &Path<'_, N>,
         upto: usize,
         used: PathUse,
         at: At,
         ignore: Option<(ItemKey, u32)>,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
     ) -> Prefix {
         let force = sink.scan == Scan::Force;
         let segs = &path.segments;
@@ -907,7 +906,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// Import `i` resolved from the state as it is, every namespace from scratch.
-    pub(crate) fn resolve_import(&self, i: usize, env: Env<'_, N, A>, sink: &mut Sink<N, A>) -> ImportOutcome {
+    pub(crate) fn resolve_import(&self, i: usize, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> ImportOutcome {
         let imp = &self.imports[i];
         let ignore = Some((self.module, seg(i)));
         let mut out = ImportOutcome { ns: [NsRes::Pending; 3], failed: None, first: None, wait: false };
@@ -968,7 +967,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         &self,
         target: ItemKey,
         facts: &F,
-    ) -> Result<Vec<VisibilityClass, A>, ResolveError> {
+    ) -> Result<AVec<'a, VisibilityClass>, ResolveError> {
         let mut classes = Vec::new_in(self.alloc.clone());
         classes.push(VisibilityClass::Public);
         if !target.is_of(self.krate) {
@@ -998,9 +997,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         &self,
         g: usize,
         facts: &F,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
-    ) -> Result<GlobOutcome<A>, ResolveError> {
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
+    ) -> Result<GlobOutcome<'a>, ResolveError> {
         let glob = &self.globs[g];
         let n = glob.path.segments.len();
         let pre = if n == 0 {
@@ -1033,7 +1032,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// Call `c`'s path resolved from the state as it is; forced in a `Force` pass.
-    pub(crate) fn resolve_call(&self, c: usize, env: Env<'_, N, A>, sink: &mut Sink<N, A>) -> CallOutcome {
+    pub(crate) fn resolve_call(&self, c: usize, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> CallOutcome {
         let call = &self.calls[c];
         let force = sink.scan == Scan::Force;
         let segs = &call.path.segments;
@@ -1133,7 +1132,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// Whether `name` is a helper attribute of a derive written before call `c` on its item.
-    fn derive_helper(&self, c: usize, name: N, force: bool, sink: &mut Sink<N, A>) -> Helper {
+    fn derive_helper(&self, c: usize, name: N, force: bool, sink: &mut Sink<'a, N>) -> Helper {
         let call = &self.calls[c];
         let Some(item) = call.item else { return Helper::Not };
         let mut wait = false;
@@ -1179,9 +1178,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     pub(crate) fn plan<F: ScopeFacts<Name = N>>(
         &self,
         facts: &F,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
-    ) -> Result<Plan<A>, ResolveError> {
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
+    ) -> Result<Plan<'a>, ResolveError> {
         let a = self.alloc.clone();
         let mut plan = Plan {
             imports: Vec::new_in(a.clone()),

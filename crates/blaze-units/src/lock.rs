@@ -260,21 +260,24 @@ impl BlazeLock {
     /// the fix. A lock of another format version is refused, never guessed at.
     pub fn parse(text: &str, path: &str) -> Result<BlazeLock, String> {
         let bad = |what: String| format!("{path} {what}; `blaze lock` writes it again");
-        let table: toml::Table = toml::from_str(text).map_err(|error| bad(format!("is not TOML: {error}")))?;
+        let doc = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, std::alloc::Global)
+            .map_err(|error| bad(format!("is not TOML: {}", error.display(text))))?;
         let mut lock = BlazeLock::default();
         let mut version = None;
-        let strings = |table: &toml::Value, at: &str| -> Result<Vec<(String, String)>, String> {
-            let table = table.as_table().ok_or_else(|| bad(format!("has `{at}`, which is not a table")))?;
+        let strings = |table: blaze_toml::Item<'_, '_, std::alloc::Global>, at: &str| -> Result<Vec<(String, String)>, String> {
+            if !table.is_table() {
+                return Err(bad(format!("has `{at}`, which is not a table")));
+            }
             table
-                .iter()
-                .map(|(name, value)| match value.as_str() {
-                    Some(text) => Ok((name.clone(), text.to_owned())),
-                    None => Err(bad(format!("has `{at}.{name}`, which is not a string"))),
+                .children()
+                .map(|value| match value.as_str() {
+                    Some(text) => Ok((value.key().to_owned(), text.to_owned())),
+                    None => Err(bad(format!("has `{at}.{}`, which is not a string", value.key()))),
                 })
                 .collect()
         };
-        for (name, value) in &table {
-            match name.as_str() {
+        for value in doc.root().children() {
+            match value.key() {
                 "version" => version = Some(value.as_integer().ok_or_else(|| bad("has a `version` that is not a number".to_owned()))?),
                 "blaze" => {
                     let (mut release, mut toolchain) = (None, None);
@@ -299,12 +302,17 @@ impl BlazeLock {
                     }
                 }
                 "native" => {
-                    let inputs = value.as_table().ok_or_else(|| bad("has `native`, which is not a table".to_owned()))?;
-                    for (input, fields) in inputs {
-                        let fields = fields.as_table().ok_or_else(|| bad(format!("has `native.{input}`, which is not a table")))?;
+                    if !value.is_table() {
+                        return Err(bad("has `native`, which is not a table".to_owned()));
+                    }
+                    for fields in value.children() {
+                        let input = fields.key();
+                        if !fields.is_table() {
+                            return Err(bad(format!("has `native.{input}`, which is not a table")));
+                        }
                         let (mut pin, mut targets) = (None, None);
-                        for (field, value) in fields {
-                            match field.as_str() {
+                        for value in fields.children() {
+                            match value.key() {
                                 "pin" => {
                                     let text = value.as_str().ok_or_else(|| bad(format!("has `native.{input}.pin`, which is not a string")))?;
                                     pin = Some(text.to_owned());
@@ -321,7 +329,7 @@ impl BlazeLock {
                             return Err(bad(format!("has a `[native.{input}]` without both `pin` and `targets`")));
                         };
                         targets.sort();
-                        lock.native.push(NativePin { name: input.clone(), pin, targets });
+                        lock.native.push(NativePin { name: input.to_owned(), pin, targets });
                     }
                 }
                 "git" => lock.sources.parse_git(value, &bad)?,

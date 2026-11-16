@@ -44,11 +44,7 @@ pub struct Builder {
 /// One model at a time in a process: a shim names its object in the running execution by
 /// storing that execution's epoch in itself, so two models on two OS threads (libtest's default)
 /// touching one `static` would keep renaming it under each other.
-#[expect(
-    clippy::disallowed_types,
-    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the one-model-at-a-time lock of a test process"
-)]
-static MODELS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static MODELS: crate::held::Mutex<()> = crate::held::Mutex::new(());
 
 impl Default for Builder {
     fn default() -> Builder {

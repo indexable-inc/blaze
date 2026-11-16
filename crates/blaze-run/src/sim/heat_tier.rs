@@ -6,10 +6,9 @@
 //! snapshot is never filed or published. Of the second: an optimized record whose inlined
 //! callee changed is never published, and the fast record is; one whose callees hold is.
 
-use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 
-use blaze_own::Vec as Own;
+use blaze_own::{AVec, Alloc, Vec as Own};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
@@ -25,7 +24,7 @@ fn instance(slot: SlotId) -> InstanceKey {
 }
 
 /// Gives each slot made hot to the tier; a second start of one is the oracle's finding.
-fn give(hot: &mut Own<SlotId, Global>, tier: &mut tier::Tier<Global>, effects: &mut Own<tier::Effect, Global>) -> Result<(), Broke> {
+fn give(hot: &mut AVec<'_, SlotId>, tier: &mut tier::Tier<'_>, effects: &mut AVec<'_, tier::Effect>) -> Result<(), Broke> {
     for slot in hot.drain(..) {
         match tier.hot(slot, instance(slot), effects) {
             Ok(()) => {}
@@ -39,14 +38,14 @@ fn give(hot: &mut Own<SlotId, Global>, tier: &mut tier::Tier<Global>, effects: &
 }
 
 fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let mut heat = Heat::new(SLOTS, HeatConfig { bound: 40 }, Global).map_err(harness)?;
+    let mut heat = Heat::new(SLOTS, HeatConfig { bound: 40 }, Alloc::global()).map_err(harness)?;
     heat.plant = plant;
-    let mut tier = tier::Tier::new(SLOTS, 2, Snapshot(0), Global).map_err(harness)?;
+    let mut tier = tier::Tier::new(SLOTS, 2, Snapshot(0), Alloc::global()).map_err(harness)?;
     // Each count stub's counter, as the stub counts it down, while its stub is in.
     let mut counters: [Option<u32>; SLOTS as usize] = [Some(heat.bound()); SLOTS as usize];
     let mut crossed = BTreeSet::new();
-    let mut hot = Own::new_in(Global);
-    let mut effects = Own::new_in(Global);
+    let mut hot = Own::new_in(Alloc::global());
+    let mut effects = Own::new_in(Alloc::global());
     let mut running: Vec<Job> = Vec::new();
     let mut optimized: BTreeMap<SlotId, u32> = BTreeMap::new();
     let mut snapshot = Snapshot(0);
@@ -82,7 +81,7 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             }
             2 if !running.is_empty() => {
                 let job = running.remove(tape.index(running.len(), "ended"));
-                let mut inlined = Own::new_in(Global);
+                let mut inlined = Own::new_in(Alloc::global());
                 inlined.push(Inlined { instance: InstanceKey(key(99)), code: CodeId(key(98)) });
                 let lacks = [RecordKey(key(60 + u64::from(job.slot.0)))];
                 let ended = if !lacked.contains(&job.slot) && tape.coin("lacks a record") {
@@ -165,13 +164,13 @@ fn the_oracle_catches_a_function_queued_twice() {
 /// An optimizer that inlines every callee it is given, as the identities it was told.
 struct InlinesAll;
 
-impl Optimizer<Global> for InlinesAll {
-    fn optimize(
+impl Optimizer for InlinesAll {
+    fn optimize<'a>(
         &mut self,
         instance: InstanceKey,
         callees: &[Callee],
-        alloc: Global,
-    ) -> Result<Made<Optimized<Global>, Global>, Why> {
+        alloc: Alloc<'a>,
+    ) -> Result<Made<'a, Optimized<'a>>, Why> {
         let mut inlined = Own::with_capacity_in(callees.len(), alloc);
         inlined.extend(callees.iter().map(|callee| Inlined { instance: callee.instance, code: callee.code }));
         let mut code = instance.0;
@@ -189,8 +188,8 @@ fn reloaded(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         Function { instance: instance(h), code: CodeId(key(12)) },
     ];
     // Run one: f is hot; the optimizer absorbs g and h at their identities of run one.
-    let mut tier = tier::Tier::new(3, 1, Snapshot(0), Global).map_err(harness)?;
-    let mut effects = Own::new_in(Global);
+    let mut tier = tier::Tier::new(3, 1, Snapshot(0), Alloc::global()).map_err(harness)?;
+    let mut effects = Own::new_in(Alloc::global());
     tier.hot(f, instance(f), &mut effects).map_err(harness)?;
     let Some(tier::Effect::Optimize(job)) = effects.pop() else {
         return Err(Broke::Harness("the tier did not start f".into()));
@@ -199,7 +198,7 @@ fn reloaded(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         Callee { instance: first[1].instance, code: first[1].code },
         Callee { instance: first[2].instance, code: first[2].code },
     ];
-    let ended = match InlinesAll.optimize(job.instance, &callees, Global) {
+    let ended = match InlinesAll.optimize(job.instance, &callees, Alloc::global()) {
         Ok(Made::Done(optimized)) => tier::Ended::Record(optimized),
         Ok(Made::Need(_)) => return Err(Broke::Harness("InlinesAll lacks nothing".into())),
         Err(why) => tier::Ended::Failed(why),
@@ -218,9 +217,9 @@ fn reloaded(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         second[2].code = CodeId(key(22));
     }
     let config = ParentConfig { workers: 2, compile_bound: Nanos(1 << 40), most_waiters: 8 };
-    let mut parent = Parent::new(&second, config, Global).map_err(harness)?;
+    let mut parent = Parent::new(&second, config, Alloc::global()).map_err(harness)?;
     parent.plant = plant;
-    let mut out = Own::new_in(Global);
+    let mut out = Own::new_in(Alloc::global());
     parent.start(&[f], &[], Nanos(0), &mut out).map_err(harness)?;
     out.clear();
     let fast = CodeRef(key(700));

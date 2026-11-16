@@ -247,17 +247,21 @@ clippy's own lints) and extend the one that covers it, or say in the change why 
 ## correct-by-construction (rule 76)
 
 What `type-then-lint-then-rule` means by a type, for any code here: a value that carries an
-obligation, a proof or a meaning is a type that states it, so the wrong program does not compile. A
-value that must be handed over or consumed (a lease, a reservation, a write to commit or abort) is
-linear (`#[blaze::linear]`): dropping it is an error. What was checked is a proof type only its
-checker can make (`verify-once`). A key, a digest or an id is its own type (a digest per record
-kind, a dense id per table), never raw bytes, a `u64` or a `usize`, so two kinds cannot be mixed and
-a key cannot be built from part of its inputs. A length, an offset or a count is a newtype with
-checked arithmetic, and item-relative and absolute positions are two types
-(`item-relative-positions`). A state is an enum or a typestate, not a flag beside the data, and a
-unit (bytes, pages, nanoseconds) is in the type. How: before writing a function that takes a bare
-integer, bytes or a bool, ask what the value means and what must be true of it, and make that the
-type; where the language cannot state it, extend the language (`own-the-language`).
+obligation, a proof or a meaning is a type that states it, so the wrong program does not compile.
+Embrace the newtype: when a number, a string or a `bool` means something (an id, an index into one
+table, a byte offset, a line, a length, a count, a tick, a size in bytes, a percentage, a name of
+one kind), wrap it, even for one use, and when in doubt, wrap; a function that takes two bare
+integers will one day be called with them swapped. A newtype costs nothing at run time and a model
+writes its conversions for free. A value that must be handed over or consumed (a lease, a
+reservation, a write to commit or abort) is linear (`#[blaze::linear]`): dropping it is an error.
+What was checked is a proof type only its checker can make (`verify-once`). A key, a digest or an id
+is its own type (a digest per record kind, a dense id per table), never raw bytes, a `u64` or a
+`usize`, so two kinds cannot be mixed and a key cannot be built from part of its inputs. A length,
+an offset or a count is a newtype with checked arithmetic, and item-relative and absolute positions
+are two types (`item-relative-positions`). A state is an enum or a typestate, not a flag beside the
+data, and a unit (bytes, pages, nanoseconds) is in the type. How: before writing a function that
+takes a bare integer, bytes or a bool, ask what the value means and what must be true of it, and
+make that the type; where the language cannot state it, extend the language (`own-the-language`).
 
 ## strategy-is-a-type-parameter (rule 78)
 

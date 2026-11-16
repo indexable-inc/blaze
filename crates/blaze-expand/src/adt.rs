@@ -8,9 +8,9 @@
 //! variant's discriminant or a field's default, after a lone `=`, `<` and `>` are operators and
 //! count for nothing.
 
-use core::{alloc::Allocator, ops::Range};
+use core::ops::Range;
 
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::tokens::{Delim, Raw, Spacing, Token, TokenKind, TokenStream};
 
@@ -81,25 +81,25 @@ pub(crate) struct Param {
 }
 
 /// The item a derive is of, by token indices of its stream.
-pub(crate) struct Adt<A: Allocator> {
+pub(crate) struct Adt<'a> {
     pub(crate) name: usize,
     pub(crate) kind: AdtKind,
     /// One for a struct, none for a union.
-    pub(crate) variants: Vec<Variant, A>,
+    pub(crate) variants: AVec<'a, Variant>,
     /// The fields of every variant, a variant's together; a union's.
-    pub(crate) fields: Vec<Field, A>,
-    pub(crate) params: Vec<Param, A>,
+    pub(crate) fields: AVec<'a, Field>,
+    pub(crate) params: AVec<'a, Param>,
     /// Each `where` predicate, without its comma.
-    pub(crate) predicates: Vec<Range<usize>, A>,
+    pub(crate) predicates: AVec<'a, Range<usize>>,
     /// Each `T::Assoc` path type of a field, `T` a type or const parameter: what rustc's
     /// derives bound by the trait too (`find_type_parameters`), in the order written.
-    pub(crate) assoc: Vec<Range<usize>, A>,
+    pub(crate) assoc: AVec<'a, Range<usize>>,
     /// `#[repr(packed)]` (`packed(N)` too) or `#[blaze::bits]`: the fields may have no
     /// address of their own, so they are copied out to be used.
     pub(crate) packed: bool,
 }
 
-impl<A: Allocator> Adt<A> {
+impl Adt<'_> {
     pub(crate) fn is_enum(&self) -> bool {
         matches!(self.kind, AdtKind::Enum { .. })
     }
@@ -143,10 +143,10 @@ enum Angles {
 }
 
 /// Reads the derive's item, `stream`, in `alloc`.
-pub(crate) fn read<A: Allocator, B: Allocator + Clone>(
-    stream: &TokenStream<A>,
-    alloc: B,
-) -> Result<Adt<B>, NotAnAdt> {
+pub(crate) fn read<'a>(
+    stream: &TokenStream<'_>,
+    alloc: Alloc<'a>,
+) -> Result<Adt<'a>, NotAnAdt> {
     let r = Reader { stream, tokens: stream.tokens() };
     let end = r.tokens.len();
     let mut packed = false;
@@ -168,10 +168,10 @@ pub(crate) fn read<A: Allocator, B: Allocator + Clone>(
     let mut adt = Adt {
         name,
         kind,
-        variants: Vec::new_in(alloc.clone()),
-        fields: Vec::new_in(alloc.clone()),
-        params: Vec::new_in(alloc.clone()),
-        predicates: Vec::new_in(alloc.clone()),
+        variants: Vec::new_in(alloc),
+        fields: Vec::new_in(alloc),
+        params: Vec::new_in(alloc),
+        predicates: Vec::new_in(alloc),
         assoc: Vec::new_in(alloc),
         packed,
     };
@@ -223,12 +223,12 @@ pub(crate) fn read<A: Allocator, B: Allocator + Clone>(
     Ok(adt)
 }
 
-struct Reader<'s, A: Allocator> {
-    stream: &'s TokenStream<A>,
+struct Reader<'s> {
+    stream: &'s TokenStream<'s>,
     tokens: &'s [Token],
 }
 
-impl<'s, A: Allocator> Reader<'s, A> {
+impl<'s> Reader<'s> {
     fn kind(&self, at: usize) -> Option<TokenKind> {
         self.tokens.get(at).map(|it| it.kind)
     }
@@ -392,10 +392,10 @@ impl<'s, A: Allocator> Reader<'s, A> {
     }
 
     /// One generic parameter.
-    fn param<B: Allocator>(
+    fn param(
         &self,
         piece: Range<usize>,
-        params: &mut Vec<Param, B>,
+        params: &mut AVec<'_, Param>,
     ) -> Result<(), NotAnAdt> {
         let at = self.skip_attrs(piece.start, piece.end, |_| {})?;
         if at >= piece.end {
@@ -428,10 +428,10 @@ impl<'s, A: Allocator> Reader<'s, A> {
 
     /// The `where` clause at `at`: its predicates, and the index of what ends it (a body's
     /// `{`, a `;`, or the item's end).
-    fn where_clause<B: Allocator>(
+    fn where_clause(
         &self,
         at: usize,
-        predicates: &mut Vec<Range<usize>, B>,
+        predicates: &mut AVec<'_, Range<usize>>,
     ) -> Result<usize, NotAnAdt> {
         let (mut stop, mut depth) = (at + 1, 0u32);
         while stop < self.tokens.len() {
@@ -453,11 +453,11 @@ impl<'s, A: Allocator> Reader<'s, A> {
     }
 
     /// The fields inside a record's braces or a tuple's parentheses.
-    fn fields<B: Allocator>(
+    fn fields(
         &self,
         range: Range<usize>,
         kind: FieldsKind,
-        fields: &mut Vec<Field, B>,
+        fields: &mut AVec<'_, Field>,
     ) -> Result<(), NotAnAdt> {
         let first = fields.len();
         self.split(range, Angles::UntilEq, |piece| {
@@ -485,10 +485,10 @@ impl<'s, A: Allocator> Reader<'s, A> {
     }
 
     /// An enum's variants, inside its braces.
-    fn variants<B: Allocator>(
+    fn variants(
         &self,
         range: Range<usize>,
-        adt: &mut Adt<B>,
+        adt: &mut Adt<'_>,
     ) -> Result<(), NotAnAdt> {
         self.split(range, Angles::UntilEq, |piece| {
             let mut default = false;
@@ -533,7 +533,7 @@ impl<'s, A: Allocator> Reader<'s, A> {
 
     /// Each `T::Assoc` path type of the fields' types, `T` a parameter: `T` not after `::`,
     /// `as` or `'`, one segment after it with its generic arguments, and no `::` after that.
-    fn assoc_types<B: Allocator>(&self, adt: &mut Adt<B>) -> Result<(), NotAnAdt> {
+    fn assoc_types(&self, adt: &mut Adt<'_>) -> Result<(), NotAnAdt> {
         if adt.params.iter().all(|it| it.kind == ParamKind::Lifetime) {
             return Ok(());
         }

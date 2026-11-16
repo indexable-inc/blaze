@@ -152,17 +152,25 @@ impl fmt::Display for TomlLockfilePackageId {
     }
 }
 
-impl FromStr for TomlLockfilePackageId {
-    type Err = anyhow::Error;
+/// Why a written package id could not be read: its form, or its source.
+enum PackageIdWhy {
+    /// A third part not in parentheses.
+    Form,
+    Source(SourceError),
+}
 
-    fn from_str(s: &str) -> Result<TomlLockfilePackageId> {
+impl TomlLockfilePackageId {
+    /// `name`, `name version` or `name version (source)`.
+    fn read(s: &str) -> Result<TomlLockfilePackageId, PackageIdWhy> {
         let mut s = s.splitn(3, ' ');
-        let name = s.next().unwrap();
+        let name = s.next().unwrap_or_else(|| unreachable!("`splitn` yields a first part"));
         let version = s.next();
         let source = match s.next() {
             Some(s) => match s.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-                Some(s) => Some(TomlLockfileSourceId::new(s.to_owned())?),
-                None => bail!("invalid serialied PackageId"),
+                Some(s) => {
+                    Some(TomlLockfileSourceId::new(s.to_owned()).map_err(PackageIdWhy::Source)?)
+                }
+                None => return Err(PackageIdWhy::Form),
             },
             None => None,
         };
@@ -174,22 +182,215 @@ impl FromStr for TomlLockfilePackageId {
     }
 }
 
-impl<'de> Deserialize<'de> for TomlLockfilePackageId {
-    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<TomlLockfilePackageId, D::Error> {
-        String::deserialize(d)
-            .and_then(|string| string.parse::<TomlLockfilePackageId>().map_err(de::Error::custom))
+impl FromStr for TomlLockfilePackageId {
+    type Err = ResolveError;
+
+    fn from_str(s: &str) -> Result<TomlLockfilePackageId> {
+        TomlLockfilePackageId::read(s).map_err(|why| match why {
+            PackageIdWhy::Form => ResolveError::SerializedPackageId { text: s.to_owned() },
+            PackageIdWhy::Source(error) => ResolveError::Source(error),
+        })
     }
+}
+
+type Item<'d, 't> = blaze_toml::Item<'d, 't, Global>;
+
+/// Where in the lock file a value is, as a key path: `package[3].dependencies[0]`.
+#[derive(Clone, Copy)]
+struct At<'a> {
+    table: &'static str,
+    index: Option<usize>,
+    field: Option<&'a str>,
+    element: Option<usize>,
+}
+
+impl<'a> At<'a> {
+    const fn top(table: &'static str) -> At<'a> {
+        At { table, index: None, field: None, element: None }
+    }
+
+    fn index(self, index: usize) -> At<'a> {
+        At { index: Some(index), ..self }
+    }
+
+    fn field(self, field: &'a str) -> At<'a> {
+        At { field: Some(field), ..self }
+    }
+
+    fn element(self, element: usize) -> At<'a> {
+        At { element: Some(element), ..self }
+    }
+
+    fn wrong(self, item: Item<'_, '_>, expected: &'static str) -> ResolveError {
+        let (key, line) = (self.to_string(), item.line_col().0);
+        ResolveError::LockfileType { key, line, expected, found: item.kind().name() }
+    }
+
+    fn table<'d, 't>(self, item: Item<'d, 't>) -> Result<Item<'d, 't>> {
+        match item.is_table() {
+            true => Ok(item),
+            false => Err(self.wrong(item, "a table")),
+        }
+    }
+
+    fn array<'d, 't>(self, item: Item<'d, 't>) -> Result<Item<'d, 't>> {
+        match item.is_array() {
+            true => Ok(item),
+            false => Err(self.wrong(item, "an array")),
+        }
+    }
+
+    fn string<'d>(self, item: Item<'d, '_>) -> Result<&'d str> {
+        item.as_str().ok_or_else(|| self.wrong(item, "a string"))
+    }
+
+    /// The field `self.field` of `table`, which must be there.
+    fn required<'d, 't>(self, table: Item<'d, 't>, field: &'a str) -> Result<Item<'d, 't>> {
+        let at = self.field(field);
+        table.get(field).ok_or_else(|| ResolveError::LockfileMissing {
+            key: at.to_string(),
+            line: table.line_col().0,
+        })
+    }
+
+    fn source(self, item: Item<'_, '_>) -> Result<TomlLockfileSourceId> {
+        let text = self.string(item)?;
+        TomlLockfileSourceId::new(text.to_owned()).map_err(|error| ResolveError::LockfileSource {
+            key: self.to_string(),
+            line: item.line_col().0,
+            error,
+        })
+    }
+
+    fn package_id(self, item: Item<'_, '_>) -> Result<TomlLockfilePackageId> {
+        let text = self.string(item)?;
+        TomlLockfilePackageId::read(text).map_err(|why| {
+            let (key, line) = (self.to_string(), item.line_col().0);
+            match why {
+                PackageIdWhy::Form => {
+                    ResolveError::LockfilePackageId { key, line, text: text.to_owned() }
+                }
+                PackageIdWhy::Source(error) => ResolveError::LockfileSource { key, line, error },
+            }
+        })
+    }
+}
+
+impl fmt::Display for At<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.table)?;
+        if let Some(index) = self.index {
+            write!(f, "[{index}]")?;
+        }
+        if let Some(field) = self.field {
+            write!(f, ".{field}")?;
+        }
+        if let Some(element) = self.element {
+            write!(f, "[{element}]")?;
+        }
+        Ok(())
+    }
+}
+
+/// A `[[package]]`, `[root]` or `[[patch.unused]]` table.
+fn read_dependency(at: At<'_>, item: Item<'_, '_>) -> Result<TomlLockfileDependency> {
+    let table = at.table(item)?;
+    let name = at.field("name").string(at.required(table, "name")?)?.to_owned();
+    let version = at.field("version").string(at.required(table, "version")?)?.to_owned();
+    let source = match table.get("source") {
+        Some(item) => Some(at.field("source").source(item)?),
+        None => None,
+    };
+    let checksum = match table.get("checksum") {
+        Some(item) => Some(at.field("checksum").string(item)?.to_owned()),
+        None => None,
+    };
+    let dependencies = match table.get("dependencies") {
+        Some(item) => {
+            let at = at.field("dependencies");
+            let array = at.array(item)?;
+            let mut dependencies = Vec::with_capacity(array.len());
+            for (i, item) in array.children().enumerate() {
+                dependencies.push(at.element(i).package_id(item)?);
+            }
+            Some(dependencies)
+        }
+        None => None,
+    };
+    let replace = match table.get("replace") {
+        Some(item) => Some(at.field("replace").package_id(item)?),
+        None => None,
+    };
+    Ok(TomlLockfileDependency { name, version, source, checksum, dependencies, replace })
+}
+
+/// An array of `[[...]]` tables.
+fn read_dependencies(at: At<'_>, item: Item<'_, '_>) -> Result<Vec<TomlLockfileDependency>> {
+    let array = at.array(item)?;
+    let mut entries = Vec::with_capacity(array.len());
+    for (i, item) in array.children().enumerate() {
+        entries.push(read_dependency(at.index(i), item)?);
+    }
+    Ok(entries)
 }
 
 /// Parses the TOML of a lock file.
 pub fn parse(text: &str) -> Result<TomlLockfile> {
-    Ok(toml::from_str(text)?)
+    let doc = Document::parse_in(text, Limits::CARGO, Global).map_err(|error| {
+        let (line, column) = error.line_col(text);
+        ResolveError::LockfileToml { error, line, column }
+    })?;
+    let root = doc.root();
+    let version = match root.get("version") {
+        Some(item) => {
+            let Some(n) = item.as_integer() else {
+                return Err(At::top("version").wrong(item, "an integer"));
+            };
+            // A version past `u32` is one this reader does not know, as any other is.
+            match u32::try_from(n) {
+                Ok(n) => Some(n),
+                Err(_) => return Err(ResolveError::LockfileFuture { version: n }),
+            }
+        }
+        None => None,
+    };
+    let package = match root.get("package") {
+        Some(item) => Some(read_dependencies(At::top("package"), item)?),
+        None => None,
+    };
+    let root_package = match root.get("root") {
+        Some(item) => Some(read_dependency(At::top("root"), item)?),
+        None => None,
+    };
+    let metadata = match root.get("metadata") {
+        Some(item) => {
+            let at = At::top("metadata");
+            let table = at.table(item)?;
+            let mut metadata = LockfileMetadata::new();
+            for item in table.children() {
+                let value = at.field(item.key()).string(item)?;
+                metadata.insert(item.key().to_owned(), value.to_owned());
+            }
+            Some(metadata)
+        }
+        None => None,
+    };
+    let patch = match root.get("patch") {
+        Some(item) => {
+            let at = At::top("patch");
+            let table = at.table(item)?;
+            let unused = at.required(table, "unused")?;
+            TomlLockfilePatch { unused: read_dependencies(At::top("patch.unused"), unused)? }
+        }
+        None => TomlLockfilePatch::default(),
+    };
+    Ok(TomlLockfile { version, package, root: root_package, metadata, patch })
 }
 
 /// The path packages of the workspace, by name and version: what a lock file's entries
 /// without a source are matched to. cargo collects the workspace members, the path
 /// dependencies reachable from them, and those of the root `[patch]` and `[replace]`.
-pub type PathDeps = HashMap<String, HashMap<semver::Version, SourceId, Global>, Global>;
+pub type PathDeps = HashMap<String, HashMap<Version, SourceId, Global>, Global>;
 
 /// The packages and edges of a lock file. Its edges have no dependencies and it has no
 /// features: it guides a resolve, it is not one. Entries without a source that match no path
@@ -205,12 +406,7 @@ pub fn into_resolve(
     let mut version = match resolve.version {
         Some(4) => ResolveVersion::V4,
         Some(3) => ResolveVersion::V3,
-        Some(n) => bail!(
-            "lock file version `{}` was found, but this version of Cargo \
-             does not understand this lock file, perhaps Cargo needs \
-             to be updated?",
-            n,
-        ),
+        Some(n) => return Err(ResolveError::LockfileFuture { version: n.into() }),
         // 1 or 2; 1 until something says 2.
         None => ResolveVersion::V1,
     };
@@ -228,7 +424,8 @@ pub fn into_resolve(
         if version_source.len() == 1 {
             return version_source.values().next().copied();
         }
-        let pkg_version = pkg.version.parse::<semver::Version>().ok()?;
+        // A version that does not parse matches no path package.
+        let pkg_version = parse_version(&pkg.version).ok()?;
         version_source.get(&pkg_version).copied()
     };
 
@@ -242,7 +439,7 @@ pub fn into_resolve(
                 source: pkg.source.clone(),
             };
             if !all_pkgs.insert(enc_id.clone()) {
-                bail!("package `{}` is specified twice in the lockfile", pkg.name);
+                return Err(ResolveError::LockfileTwice { name: pkg.name.clone() });
             }
             let source = match &pkg.source {
                 Some(source) => Some(SourceId::from_url(source.source_str())?),
@@ -344,9 +541,9 @@ pub fn into_resolve(
     for (k, v) in metadata.iter().filter(|p| p.0.starts_with(prefix)) {
         to_remove.push(k.to_owned());
         let k = k.strip_prefix(prefix).unwrap();
-        let enc_id: TomlLockfilePackageId = k
-            .parse()
-            .with_context(|| "internal error: invalid encoding of checksum in lockfile")?;
+        let enc_id: TomlLockfilePackageId = k.parse().map_err(|cause| {
+            ResolveError::LockfileChecksumKey { key: k.to_owned(), cause: Box::new(cause) }
+        })?;
         let Some(id) = lookup_id(&enc_id) else { continue };
         let v = if v == "<none>" { None } else { Some(v.to_owned()) };
         checksums.insert(id, v);
@@ -395,7 +592,7 @@ pub fn into_resolve(
 /// How many packages of a name and version the resolve has, which decides how briefly an
 /// edge can be written.
 pub(crate) struct EncodeState<'a> {
-    counts: Option<HashMap<InternedString, HashMap<&'a semver::Version, usize, Global>, Global>>,
+    counts: Option<HashMap<InternedString, HashMap<&'a Version, usize, Global>, Global>>,
 }
 
 impl<'a> EncodeState<'a> {
@@ -490,30 +687,80 @@ fn encodable_source_id(id: SourceId, version: ResolveVersion) -> Option<TomlLock
     Some(TomlLockfileSourceId::new(url).expect("source ID should have valid URLs"))
 }
 
-fn toml_str(s: &str) -> toml::Value {
-    toml::Value::String(s.to_owned())
+/// A TOML control character, which no string but a basic one with escapes may hold.
+fn control(c: char) -> bool {
+    matches!(c, '\0'..='\x1f' | '\x7f')
+}
+
+/// `text` quoted as toml 1.1.2 quotes it (toml_writer 1.0.6): `"text"` when nothing in it
+/// needs an escape (a value may hold a tab there, a key may not), else `'text'` when it can
+/// be literal, else a basic string with escapes. toml writes a text with a newline (or with
+/// both quotes and a backslash) as a multi-line string instead; here it gets the escaped
+/// form, which reads back the same but is not cargo's bytes. No name, version, source or
+/// checksum holds such a text; a hand-written `[metadata]` value could.
+fn push_quoted(text: &str, value: bool, out: &mut String) {
+    let escape = |c: char| (control(c) && !(value && c == '\t')) || c == '"' || c == '\\';
+    if !text.chars().any(escape) {
+        out.push('"');
+        out.push_str(text);
+        out.push('"');
+    } else if !text.chars().any(|c| control(c) || c == '\'') {
+        out.push('\'');
+        out.push_str(text);
+        out.push('\'');
+    } else {
+        // A text with a quote, backslash or control character is never a bare key, so
+        // `write_key` writes it as a basic string with escapes.
+        let mut escaped = blaze_own::String::new_in(Global);
+        blaze_toml::write_key(text, &mut escaped);
+        out.push_str(escaped.as_str());
+    }
+}
+
+fn push_value(text: &str, out: &mut String) {
+    push_quoted(text, true, out);
+}
+
+fn push_key(key: &str, out: &mut String) {
+    match !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        true => out.push_str(key),
+        false => push_quoted(key, false, out),
+    }
+}
+
+/// `key = "value"` and a newline.
+fn push_line(key: &str, value: &str, out: &mut String) {
+    push_key(key, out);
+    out.push_str(" = ");
+    push_value(value, out);
+    out.push('\n');
 }
 
 fn emit_package(dep: &EncodedPackage, out: &mut String) {
-    out.push_str(&format!("name = {}\n", toml_str(&dep.name)));
-    out.push_str(&format!("version = {}\n", toml_str(&dep.version)));
+    push_line("name", &dep.name, out);
+    push_line("version", &dep.version, out);
     if let Some(source) = &dep.source {
-        out.push_str(&format!("source = {}\n", toml_str(&source.source_str)));
+        push_line("source", &source.source_str, out);
     }
     if let Some(checksum) = &dep.checksum {
-        out.push_str(&format!("checksum = {}\n", toml_str(checksum)));
+        push_line("checksum", checksum, out);
     }
     if let Some(slice) = &dep.dependencies {
         if !slice.is_empty() {
             out.push_str("dependencies = [\n");
             for child in slice.iter() {
-                out.push_str(&format!(" {},\n", toml_str(&child.to_string())));
+                out.push(' ');
+                push_value(&child.to_string(), out);
+                out.push_str(",\n");
             }
             out.push_str("]\n");
         }
         out.push('\n');
     } else if let Some(replace) = &dep.replace {
-        out.push_str(&format!("replace = {}\n\n", toml_str(&replace.to_string())));
+        out.push_str("replace = ");
+        push_value(&replace.to_string(), out);
+        out.push_str("\n\n");
     }
 }
 
@@ -581,7 +828,7 @@ pub fn serialize_resolve(resolve: &Resolve, orig: Option<&str>) -> String {
     }
 
     if let Some(version) = resolve.version().number() {
-        out.push_str(&format!("version = {}\n\n", toml::Value::Integer(version.into())));
+        out.push_str(&format!("version = {version}\n\n"));
     }
 
     for dep in &packages {
@@ -595,12 +842,12 @@ pub fn serialize_resolve(resolve: &Resolve, orig: Option<&str>) -> String {
         out.push('\n');
     }
 
+    // As toml writes a table of one table of strings, in the map's (sorted) order.
     if !metadata.is_empty() {
-        let meta_table: toml::Table =
-            metadata.into_iter().map(|(k, v)| (k, toml::Value::String(v))).collect();
-        let mut meta_doc = toml::Table::new();
-        meta_doc.insert("metadata".to_owned(), toml::Value::Table(meta_table));
-        out.push_str(&meta_doc.to_string());
+        out.push_str("[metadata]\n");
+        for (key, value) in &metadata {
+            push_line(key, value, &mut out);
+        }
     }
 
     // Encoding 1 could end in blank lines, and keeps them; the others end in one newline.

@@ -134,7 +134,7 @@ struct Holder {
     /// Killed and reaped on drop, so a test that fails between its steps leaves no holder.
     child: stdx::JodChild,
     /// The child's stdout, a line at a time, from a reader thread: waited on with a timeout.
-    lines: crossbeam_channel::Receiver<String>,
+    lines: blaze_core::chan::Receiver<String>,
 }
 
 impl Holder {
@@ -151,7 +151,7 @@ impl Holder {
             .map(stdx::JodChild)
             .unwrap();
         let out = std::io::BufReader::new(child.stdout.take().unwrap());
-        let (send, lines) = crossbeam_channel::unbounded();
+        let (send, lines) = blaze_core::chan::unbounded();
         // Reads to the end, so the child's harness never writes into a closed pipe.
         std::thread::spawn(move || {
             for line in out.lines().map_while(Result::ok) {
@@ -179,14 +179,14 @@ impl Holder {
             match self.lines.recv_timeout(left) {
                 Ok(line) if done(&line) => return,
                 Ok(line) => seen.push(line),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(blaze_core::chan::RecvTimeoutError::Timeout) => {
                     _ = self.child.kill();
                     _ = self.child.wait();
                     panic!(
                         "waiting for {step}: nothing in {CHILD_WAIT:?}, so the child was killed; it printed {seen:?}"
                     );
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(blaze_core::chan::RecvTimeoutError::Disconnected) => {
                     let status =
                         stdx::child::exit_within(&mut self.child, "the lease holder whose output ended", CHILD_WAIT);
                     panic!(
@@ -206,8 +206,8 @@ impl Holder {
             let left = until.saturating_duration_since(std::time::Instant::now());
             match self.lines.recv_timeout(left) {
                 Ok(_) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(blaze_core::chan::RecvTimeoutError::Disconnected) => break,
+                Err(blaze_core::chan::RecvTimeoutError::Timeout) => {
                     _ = self.child.kill();
                     _ = self.child.wait();
                     panic!(

@@ -7,11 +7,9 @@
 //! is taken when it closes, from its range or from the tokens recorded while it was open (a
 //! visibility, a rename, an attribute). No node is kept past its exit.
 
-use core::alloc::Allocator;
-
 use blaze_hash::ByHash;
 use blaze_ids::{ContentId, Hasher};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
     Attr, AttrKind, AttrSpan, ErrorOrigin, Item, ItemDetail, ItemIndex, Range, Rename, SyntaxError,
     WrittenVis,
@@ -46,7 +44,7 @@ const PLACEHOLDER: Item = Item {
     signature_hash: ContentId([0; 32]),
 };
 
-pub(crate) fn outline<A: Allocator + Clone>(text: &str, edition: Edition, alloc: A) -> Outline<A> {
+pub(crate) fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
     assert!(
         u32::try_from(text.len()).is_ok(),
         "a source file of {} bytes: an outline's ranges are u32 pairs",
@@ -162,7 +160,7 @@ struct Open {
     children: u32,
 }
 
-struct Walk<'t, 'l, A: Allocator + Clone> {
+struct Walk<'t, 'l, 'a> {
     text: &'t str,
     lexed: &'l LexedStr<'t>,
     edition: u8,
@@ -172,19 +170,20 @@ struct Walk<'t, 'l, A: Allocator + Clone> {
     offset: u32,
     /// The end of the last token the parser took.
     prev_end: Option<u32>,
-    frames: Vec<Frame, A>,
-    open: Vec<Open, A>,
+    frames: AVec<'a, Frame>,
+    open: AVec<'a, Open>,
     /// The depth of the node whose tokens are being recorded into `tokens`.
     recorded: Option<usize>,
-    tokens: Vec<Tok, A>,
-    /// How many entries of each sibling key the walk has closed.
-    siblings: ByHash<ContentId, u32, A>,
+    tokens: AVec<'a, Tok>,
+    /// How many entries of each sibling key the walk has closed. `ByHash` is a general table,
+    /// generic over its allocator; here it is the handle's.
+    siblings: ByHash<ContentId, u32, Alloc<'a>>,
     file_children: u32,
-    out: Outline<A>,
+    out: Outline<'a>,
 }
 
-impl<'t, 'l, A: Allocator + Clone> Walk<'t, 'l, A> {
-    fn new(text: &'t str, lexed: &'l LexedStr<'t>, edition: Edition, alloc: A) -> Self {
+impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
+    fn new(text: &'t str, lexed: &'l LexedStr<'t>, edition: Edition, alloc: Alloc<'a>) -> Self {
         Walk {
             text,
             lexed,
@@ -192,17 +191,17 @@ impl<'t, 'l, A: Allocator + Clone> Walk<'t, 'l, A> {
             pos: 0,
             offset: 0,
             prev_end: None,
-            frames: Vec::new_in(alloc.clone()),
-            open: Vec::new_in(alloc.clone()),
+            frames: Vec::new_in(alloc),
+            open: Vec::new_in(alloc),
             recorded: None,
-            tokens: Vec::new_in(alloc.clone()),
-            siblings: ByHash::new_in(alloc.clone()),
+            tokens: Vec::new_in(alloc),
+            siblings: ByHash::new_in(alloc),
             file_children: 0,
             out: Outline {
-                items: Vec::new_in(alloc.clone()),
-                attrs: Vec::new_in(alloc.clone()),
+                items: Vec::new_in(alloc),
+                attrs: Vec::new_in(alloc),
                 file_attrs: AttrSpan::default(),
-                errors: Vec::new_in(alloc.clone()),
+                errors: Vec::new_in(alloc),
                 messages: Vec::new_in(alloc),
             },
         }
@@ -635,7 +634,7 @@ impl<'t, 'l, A: Allocator + Clone> Walk<'t, 'l, A> {
         self.out.errors.push(SyntaxError { range, origin, message: Range::new(start, end) });
     }
 
-    fn finish(mut self) -> Outline<A> {
+    fn finish(mut self) -> Outline<'a> {
         assert!(
             self.frames.is_empty() && self.open.is_empty(),
             "the parser's output closes every node it opens"

@@ -7,7 +7,7 @@ use std::{format, vec::Vec};
 
 use blaze_sim::{Broke, Config, Tape};
 
-use crate::{Lanes, Native, Word, find, find_bytes, memchr_iter, memmem, rfind};
+use crate::{Lanes, Native, Portable, Word, find, find_bytes, memchr_iter, memmem, rfind};
 
 /// The bytes the haystacks are made of: few, so hits are common; the ones the tree searches for.
 const ALPHABET: &[u8] = b"ab\n\r\"\\*/";
@@ -108,8 +108,38 @@ fn every_search_on_the_word_is_the_naive_search() {
 }
 
 #[test]
-fn every_search_on_the_native_vector_is_the_naive_search() {
-    blaze_sim::check(Config::cases(500), case::<Native>);
+fn every_search_on_the_portable_vector_is_the_naive_search() {
+    blaze_sim::check(Config::cases(500), case::<Portable<16>>);
+    blaze_sim::check(Config::cases(500), case::<Portable<32>>);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn every_search_on_the_neon_reference_is_the_naive_search() {
+    blaze_sim::check(Config::cases(500), case::<crate::neon::Neon>);
+}
+
+/// The vector and its scalar twin give one answer at every start of one drawn buffer, across
+/// more than two of the widest vector's four-vector steps, for every search.
+fn alignments<L: Lanes>(tape: &Tape) -> Result<(), Broke> {
+    let buffer = tape.vec(0..=300, "haystack", byte);
+    let [a, b, c] = [byte(tape), byte(tape), byte(tape)];
+    let needle = tape.vec(2..=5, "needle", byte);
+    for start in 0..=buffer.len() {
+        let haystack = &buffer[start..];
+        let at = format!("at start {start} of {buffer:?}");
+        same(&format!("find {a:?} {at}"), find::<L, 1>([a], haystack), find::<Word, 1>([a], haystack))?;
+        same(&format!("find3 {a:?} {b:?} {c:?} {at}"), find::<L, 3>([a, b, c], haystack), find::<Word, 3>([a, b, c], haystack))?;
+        same(&format!("rfind2 {a:?} {b:?} {at}"), rfind::<L, 2>([a, b], haystack), rfind::<Word, 2>([a, b], haystack))?;
+        same(&format!("find {needle:?} {at}"), find_bytes::<L>(haystack, &needle), find_bytes::<Word>(haystack, &needle))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn the_vector_and_the_word_agree_at_every_alignment() {
+    blaze_sim::check(Config::cases(100), alignments::<Native>);
+    blaze_sim::check(Config::cases(100), alignments::<Portable<32>>);
 }
 
 #[test]
@@ -122,6 +152,7 @@ fn the_iterators_and_the_finder_are_the_naive_search() {
 struct DropsLastLane<L>(L);
 
 impl<L: Lanes> Lanes for DropsLastLane<L> {
+    type Hit = L::Hit;
     const WIDTH: usize = L::WIDTH;
     const BITS: u32 = L::BITS;
 
@@ -133,22 +164,22 @@ impl<L: Lanes> Lanes for DropsLastLane<L> {
         DropsLastLane(L::load(bytes))
     }
 
-    fn eq(self, other: Self) -> Self {
-        DropsLastLane(self.0.eq(other.0))
+    fn eq(self, other: Self) -> L::Hit {
+        self.0.eq(other.0)
     }
 
-    fn or(self, other: Self) -> Self {
-        DropsLastLane(self.0.or(other.0))
+    fn or(a: L::Hit, b: L::Hit) -> L::Hit {
+        L::or(a, b)
     }
 
-    fn and(self, other: Self) -> Self {
-        DropsLastLane(self.0.and(other.0))
+    fn and(a: L::Hit, b: L::Hit) -> L::Hit {
+        L::and(a, b)
     }
 
-    fn mask(self) -> u64 {
+    fn mask(hit: L::Hit) -> u64 {
         let lane = (1u64 << L::BITS) - 1;
         let last = u32::try_from(L::WIDTH - 1).expect("a vector of under 2^32 lanes") * L::BITS;
-        self.0.mask() & !(lane << last)
+        L::mask(hit) & !(lane << last)
     }
 }
 

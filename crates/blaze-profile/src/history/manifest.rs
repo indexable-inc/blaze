@@ -57,21 +57,11 @@ use std::{
     time::Duration,
 };
 
-use arrow_array::{
-    RecordBatch,
-    cast::AsArray,
-    types::{Int64Type, UInt64Type},
-};
-use parquet::file::{
-    metadata::{ParquetMetaData, ParquetMetaDataReader},
-    statistics::Statistics,
-};
 use blaze_report::{say, say::Code};
-use bytes::Bytes;
 use serde_derive::{Deserialize, Serialize};
 
-use super::{HistoryError, compact::Name, merge, retire::Retired};
-use crate::{perf, schema};
+use super::{HistoryError, compact::Name, retire::Retired};
+use crate::{columns::Batch, perf, schema};
 
 /// The manifest's file in the history's directory.
 pub const FILE: &str = "manifest.json";
@@ -198,7 +188,7 @@ impl Entry {
     /// writes with the rows of `parts` (the driver's [`Entry::of_batches`] says this process's).
     pub(crate) fn of_rows(
         table: &schema::Table,
-        parts: &[RecordBatch],
+        parts: &[Batch],
         pid: u32,
         boot: Option<&str>,
     ) -> Entry {
@@ -214,7 +204,7 @@ impl Entry {
         for part in parts {
             entry.rows += part.num_rows() as u64;
             if let Some(at) = table.column("build_id")
-                && let Some(ids) = part.column(at).as_primitive_opt::<UInt64Type>()
+                && let Some(ids) = part.column(at).u64s()
             {
                 for id in ids.iter().flatten() {
                     entry.builds = Some(widen(entry.builds, id, id));
@@ -222,7 +212,7 @@ impl Entry {
             }
             for name in INSTANTS {
                 let Some(at) = table.column(name) else { continue };
-                let Some(times) = part.column(at).as_primitive_opt::<Int64Type>() else { continue };
+                let Some(times) = part.column(at).i64s() else { continue };
                 for t in times.iter().flatten() {
                     entry.t_ns = Some(widen(entry.t_ns, t, t));
                 }
@@ -238,10 +228,10 @@ impl Entry {
     /// `version` given is [`ManifestError::Unversioned`].
     pub(crate) fn of_footer(
         path: &Path,
-        bytes: &Bytes,
+        bytes: &[u8],
         version: Option<u32>,
     ) -> Result<Entry, HistoryError> {
-        let metadata = ParquetMetaDataReader::new().parse_and_finish(bytes).map_err(|error| {
+        let file = blaze_parquet::File::open(bytes, std::alloc::Global).map_err(|error| {
             HistoryError::Io {
                 // alloc: an error
                 path: path.to_owned(),
@@ -252,56 +242,46 @@ impl Entry {
         // alloc: an error
         let unversioned =
             || HistoryError::Manifest { path: path.to_owned(), why: ManifestError::Unversioned };
-        let version = match footer_version(&metadata) {
+        let version = match file.value("blaze.schema").and_then(|it| it.parse().ok()) {
             Some(it) => it,
             None => version.ok_or_else(unversioned)?,
         };
         let mut entry = Entry {
             version,
-            rows: u64::try_from(metadata.file_metadata().num_rows()).unwrap_or(0),
+            rows: u64::try_from(file.num_rows()).unwrap_or(0),
             builds: None,
             t_ns: None,
             boot: None,
             pid: None,
         };
-        let schema = metadata.file_metadata().schema_descr();
-        let column = |name: &str| {
-            (0..schema.num_columns()).find(|&at| schema.column(at).path().string() == name)
+        // The range of column `at` in row group `group`: `None` when every row there is null,
+        // `[MIN, MAX]` (of `T`) when the footer does not bound it.
+        let range = |group: usize, at: usize| -> Option<Option<(i128, i128)>> {
+            let rows = file.group_rows(group);
+            match file.int_stats(group, at) {
+                Some(stats) if stats.nulls == Some(rows) => None,
+                Some(stats) => Some(stats.range),
+                None => Some(None),
+            }
         };
-        for group in metadata.row_groups() {
-            if group.num_rows() == 0 {
+        for group in 0..file.row_groups() {
+            if file.group_rows(group) == 0 {
                 continue;
             }
-            if let Some(at) = column("build_id") {
-                entry.builds = match group.column(at).statistics() {
-                    Some(Statistics::Int64(it))
-                        if it.null_count_opt() == Some(group.num_rows() as u64) =>
-                    {
-                        entry.builds
-                    }
-                    // A `UBIGINT`, stored as INT64: build ids are far below 2^63.
-                    Some(Statistics::Int64(it)) => match (it.min_opt(), it.max_opt()) {
-                        (Some(&low), Some(&high)) => {
-                            Some(widen(entry.builds, low as u64, high as u64))
-                        }
-                        _ => Some([0, u64::MAX]),
-                    },
-                    _ => Some([0, u64::MAX]),
+            if let Some(at) = file.column("build_id")
+                && let Some(range) = range(group, at)
+            {
+                entry.builds = match range.and_then(|(low, high)| Some((u64::try_from(low).ok()?, u64::try_from(high).ok()?))) {
+                    Some((low, high)) => Some(widen(entry.builds, low, high)),
+                    None => Some([0, u64::MAX]),
                 };
             }
             for name in INSTANTS {
-                let Some(at) = column(name) else { continue };
-                entry.t_ns = match group.column(at).statistics() {
-                    Some(Statistics::Int64(it))
-                        if it.null_count_opt() == Some(group.num_rows() as u64) =>
-                    {
-                        entry.t_ns
-                    }
-                    Some(Statistics::Int64(it)) => match (it.min_opt(), it.max_opt()) {
-                        (Some(&low), Some(&high)) => Some(widen(entry.t_ns, low, high)),
-                        _ => Some([i64::MIN, i64::MAX]),
-                    },
-                    _ => Some([i64::MIN, i64::MAX]),
+                let Some(at) = file.column(name) else { continue };
+                let Some(range) = range(group, at) else { continue };
+                entry.t_ns = match range.and_then(|(low, high)| Some((i64::try_from(low).ok()?, i64::try_from(high).ok()?))) {
+                    Some((low, high)) => Some(widen(entry.t_ns, low, high)),
+                    None => Some([i64::MIN, i64::MAX]),
                 };
             }
         }
@@ -342,36 +322,6 @@ fn widen<T: Ord + Copy>(range: Option<[T; 2]>, low: T, high: T) -> [T; 2] {
         Some([a, b]) => [a.min(low), b.max(high)],
         None => [low, high],
     }
-}
-
-/// The `blaze.schema` a file's footer says: a key of its own, or one of its Arrow schema's.
-fn footer_version(metadata: &ParquetMetaData) -> Option<u32> {
-    let file = metadata.file_metadata();
-    let own = file.key_value_metadata().into_iter().flatten().find(|it| it.key == "blaze.schema");
-    if let Some(value) = own.and_then(|it| it.value.as_deref()) {
-        return value.parse().ok();
-    }
-    let pairs = file.key_value_metadata()?;
-    let encoded = pairs.iter().find(|it| it.key == "ARROW:schema")?.value.as_deref()?;
-    arrow_schema_version(encoded)
-}
-
-/// The `blaze.schema` key of the Arrow schema a Parquet footer encodes (`ARROW:schema`: base64
-/// of an IPC schema message, after a continuation marker and length when it has one, as
-/// parquet's `get_arrow_schema_from_metadata` reads it), read from the flatbuffer in place: no
-/// `Schema` is built, whose metadata map would draw a hasher's random state, which a sans-IO
-/// core does not read.
-fn arrow_schema_version(encoded: &str) -> Option<u32> {
-    // alloc: the footer's encoded schema, decoded once a file read
-    let bytes = blaze_base64::STANDARD.decode_in(encoded.as_bytes(), std::alloc::Global).ok()?;
-    let bytes = bytes.as_slice();
-    let message = match bytes.get(..4) {
-        Some([0xff, 0xff, 0xff, 0xff]) if bytes.len() > 8 => &bytes[8..],
-        _ => &bytes[..],
-    };
-    let schema = arrow_ipc::root_as_message(message).ok()?.header_as_schema()?;
-    let pair = schema.custom_metadata()?.iter().find(|it| it.key() == Some("blaze.schema"))?;
-    pair.value()?.parse().ok()
 }
 
 /// Which files a reader reads.
@@ -808,7 +758,7 @@ pub(crate) fn adopt(
         let Some(mapping) = footers.remove(&name) else {
             unreachable!("a mapping of each file adopted")
         };
-        let entry = Entry::of_footer(&dir.join(&name), &merge::bytes_of(mapping), None)?;
+        let entry = Entry::of_footer(&dir.join(&name), mapping.bytes(), None)?;
         manifest
             .insert(&name, entry)
             .map_err(|why| HistoryError::Manifest { path: dir.join(FILE), why })?;

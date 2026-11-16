@@ -6,10 +6,10 @@
 
 #![feature(allocator_api)]
 
-use std::alloc::Global;
 use std::fmt::Write as _;
 
 use blaze_file_items::{Outline, outline};
+use blaze_own::Alloc;
 use blaze_format::Aligned;
 use blaze_surface::{
     AttrKind, ContentId, Edition, FileItemsView, Item, ItemDetail, ItemIndex, Range, Rename,
@@ -17,12 +17,12 @@ use blaze_surface::{
 };
 use blaze_sim::{Broke, Config, Tape};
 
-fn parse(text: &str) -> Outline<Global> {
-    outline(text, Edition::E2024, Global)
+fn parse(text: &str) -> Outline<'static> {
+    outline(text, Edition::E2024, Alloc::global())
 }
 
 /// The first entry in source order whose name is `name`.
-fn named<'o>(outline: &'o Outline<Global>, text: &str, name: &str) -> (ItemIndex, &'o Item) {
+fn named<'o>(outline: &'o Outline<'_>, text: &str, name: &str) -> (ItemIndex, &'o Item) {
     outline
         .items()
         .iter()
@@ -64,7 +64,7 @@ fn kind_name(kind: ItemDetail) -> &'static str {
     }
 }
 
-fn kinds(outline: &Outline<Global>, parent: Option<ItemIndex>) -> Vec<&'static str> {
+fn kinds(outline: &Outline<'_>, parent: Option<ItemIndex>) -> Vec<&'static str> {
     outline.children(parent).map(|(_, item)| kind_name(item.detail)).collect()
 }
 
@@ -337,7 +337,7 @@ fn a_second_equal_impl_gets_disambiguator_one() {
     let one = "struct S;\nimpl S {}\nimpl Clone for S { fn clone(&self) -> S { S } }\n";
     let two = format!("{one}impl   S {{}}\n");
     let (first, second) = (parse(one), parse(&two));
-    let impls = |outline: &Outline<Global>| -> Vec<(u32, ContentId)> {
+    let impls = |outline: &Outline<'_>| -> Vec<(u32, ContentId)> {
         outline
             .children(None)
             .filter(|(_, item)| item.detail == ItemDetail::Impl)
@@ -472,7 +472,7 @@ fn an_outline_is_a_function_of_the_text() {
 fn record_answers_as_outline(text: &str) -> Result<(), Broke> {
     let made = parse(text);
     let broke = |what: &str| Broke::Oracle(format!("{what}:\n{text}"));
-    let bytes = made.to_file_items(text, ContentId([7; 32]), Global).map_err(|error| broke(&error.to_string()))?;
+    let bytes = made.to_file_items(text, ContentId([7; 32]), Alloc::global()).map_err(|error| broke(&error.to_string()))?;
     let buffer = Aligned::copy_from(&bytes);
     let view = FileItemsView::read(&buffer).map_err(|error| broke(&error.to_string()))?;
     let entries = view.file() == ContentId([7; 32])
@@ -551,7 +551,7 @@ enum Plant {
 }
 
 /// What must not move when text is inserted above an item: its hashes and disambiguator.
-fn identities(outline: &Outline<Global>, plant: Plant) -> Vec<(ContentId, ContentId, u32)> {
+fn identities(outline: &Outline<'_>, plant: Plant) -> Vec<(ContentId, ContentId, u32)> {
     outline
         .items()
         .iter()

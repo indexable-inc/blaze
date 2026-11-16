@@ -314,6 +314,9 @@ pub enum Plan<'s, A: Allocator> {
         keys: Vec<Key<A>, A>,
         /// Over the left's columns then the right's.
         residual: Option<Expr<A>>,
+        /// The join's number in its query: the key its built side is kept under while a
+        /// fixpoint runs, when that side reads no working table.
+        id: u32,
         at: Loc,
     },
     /// DuckDB's asof join: each left row with the right row of equal `keys` nearest under
@@ -326,6 +329,7 @@ pub enum Plan<'s, A: Allocator> {
         op: Cmp,
         probe: Expr<A>,
         build: Expr<A>,
+        id: u32,
         at: Loc,
     },
     /// The keys' columns, then the aggregates'. With no keys, one row even over no input.

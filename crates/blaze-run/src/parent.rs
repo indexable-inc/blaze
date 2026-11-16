@@ -44,10 +44,9 @@
 
 #![blaze::sans_io]
 
-
 use core::fmt;
 
-use blaze_own::{SortedMap, Vec, VecDeque, soa};
+use blaze_own::{ADeque, ASortedMap, AVec, Alloc, SortedMap, Vec, VecDeque, soa};
 
 use crate::registry::RunEvent;
 use crate::tier::{Identities, Inlined, usable_planted};
@@ -97,22 +96,23 @@ pub struct Read {
 
 /// What the compiler made of one function: its fast-tier code record (written to the store by
 /// the compile's task before it ends), the slots its code calls through, and its read list.
-pub struct FastRecord<A: Allocator> {
+pub struct FastRecord<'a> {
     pub code: CodeRef,
-    pub callees: Vec<SlotId, A>,
-    pub reads: Vec<Read, A>,
+    pub callees: AVec<'a, SlotId>,
+    pub reads: AVec<'a, Read>,
 }
 
 /// The fast tier's compiler: the type checker and codegen behind one call (the real one comes
 /// from the new item layer, bottom.md). A pure function of what it reads: it returns its record
 /// or the records it lacks, and never waits. Its driver calls it for each [`Effect::Compile`].
-pub trait Compiler<A: Allocator + Clone> {
-    fn compile(&mut self, key: CodeKey, alloc: A) -> Result<Made<FastRecord<A>, A>, Why>;
+pub trait Compiler {
+    fn compile<'a>(&mut self, key: CodeKey, alloc: Alloc<'a>) -> Result<Made<'a, FastRecord<'a>>, Why>;
 }
 
-/// How one entry of a compile ended, as its driver hands it back.
-pub enum Compiled<'r, A: Allocator> {
-    Record(&'r FastRecord<A>),
+/// How one entry of a compile ended, as its driver hands it back. One lifetime: a record's
+/// allocator outlives the borrow of it, and the parent reads only its code and callees.
+pub enum Compiled<'r> {
+    Record(&'r FastRecord<'r>),
     Need(&'r [RecordKey]),
     Failed(Why),
 }
@@ -273,24 +273,24 @@ soa! {
 }
 
 /// One program's parent. See the module's documentation.
-pub struct Parent<A: Allocator + Clone> {
-    alloc: A,
+pub struct Parent<'a> {
+    alloc: Alloc<'a>,
     config: Config,
     /// A row a slot, by columns ([`Row`]).
-    table: Rows<A>,
+    table: Rows<Alloc<'a>>,
     /// Each instance's code identity, sorted once at the start and never inserted into.
-    ids: SortedMap<InstanceKey, CodeId, A>,
+    ids: ASortedMap<'a, InstanceKey, CodeId>,
     /// Who waits for which slot, in the order they asked.
-    waiters: Vec<(SlotId, Asker), A>,
-    queues: [VecDeque<SlotId, A>; 3],
+    waiters: AVec<'a, (SlotId, Asker)>,
+    queues: [ADeque<'a, SlotId>; 3],
     /// Each record being made, and the slots whose compiles lack it: the few in flight.
-    making: SortedMap<RecordKey, Vec<SlotId, A>, A>,
+    making: ASortedMap<'a, RecordKey, AVec<'a, SlotId>>,
     running: u32,
     running_background: u32,
     /// What this run placed before `main`, in order: the next startup image.
-    placed: Vec<Placement, A>,
+    placed: AVec<'a, Placement>,
     /// The image this run started from (empty without one), and whether one was given.
-    image: Vec<Placement, A>,
+    image: AVec<'a, Placement>,
     warmed: bool,
     start: Start,
     now: Nanos,
@@ -298,15 +298,15 @@ pub struct Parent<A: Allocator + Clone> {
     pub(crate) plant: Plant,
 }
 
-impl<A: Allocator + Clone> Identities for Parent<A> {
+impl Identities for Parent<'_> {
     fn code_id(&self, instance: InstanceKey) -> Option<CodeId> {
         self.ids.get(&instance).copied()
     }
 }
 
-impl<A: Allocator + Clone> Parent<A> {
+impl<'a> Parent<'a> {
     /// The parent of a program whose slots run `functions`, in `alloc`.
-    pub fn new(functions: &[Function], config: Config, alloc: A) -> Result<Parent<A>, Error> {
+    pub fn new(functions: &[Function], config: Config, alloc: Alloc<'a>) -> Result<Parent<'a>, Error> {
         if config.workers < 2 {
             return Err(Error::Config {
                 what: "fewer than 2 workers: none would be kept for a thread's own function",
@@ -317,11 +317,11 @@ impl<A: Allocator + Clone> Parent<A> {
             return Err(Error::Config { what: "a bound of 0", value: 0 });
         }
         let n = functions.len();
-        let mut table = Rows::with_capacity_in(n, alloc.clone());
+        let mut table = Rows::with_capacity_in(n, alloc);
         for function in functions {
             table.push(Row { function: *function, state: State::Unasked, hooks: Hooks::NONE });
         }
-        let mut pairs = Vec::with_capacity_in(n, alloc.clone());
+        let mut pairs = Vec::with_capacity_in(n, alloc);
         pairs.extend(functions.iter().map(|function| (function.instance, function.code)));
         pairs.sort_unstable_by_key(|(instance, _)| *instance);
         let ids = SortedMap::from_sorted(pairs)
@@ -330,11 +330,11 @@ impl<A: Allocator + Clone> Parent<A> {
             config,
             table,
             ids,
-            waiters: Vec::new_in(alloc.clone()),
-            queues: [VecDeque::new_in(alloc.clone()), VecDeque::new_in(alloc.clone()), VecDeque::new_in(alloc.clone())],
-            making: SortedMap::new_in(alloc.clone()),
-            placed: Vec::new_in(alloc.clone()),
-            image: Vec::new_in(alloc.clone()),
+            waiters: Vec::new_in(alloc),
+            queues: [VecDeque::new_in(alloc), VecDeque::new_in(alloc), VecDeque::new_in(alloc)],
+            making: SortedMap::new_in(alloc),
+            placed: Vec::new_in(alloc),
+            image: Vec::new_in(alloc),
             warmed: false,
             alloc,
             running: 0,
@@ -401,7 +401,7 @@ impl<A: Allocator + Clone> Parent<A> {
     /// places them before the child's first ask: the Welcome's known slots. A hint, never a
     /// proof: a row is looked up by its slot's key as any need is, and a row the store lacks is
     /// a miss like any other, compiled only when asked.
-    pub fn warm(&mut self, image: Option<&[Placement]>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+    pub fn warm(&mut self, image: Option<&[Placement]>, out: &mut AVec<'_, Effect>) -> Result<(), Error> {
         if self.warmed || self.start != Start::NotYet {
             return Err(Error::WarmLate);
         }
@@ -424,7 +424,7 @@ impl<A: Allocator + Clone> Parent<A> {
 
     /// `main` returned: the image is written when what was placed before it differs, in set or
     /// order, from the image the run started from.
-    pub fn ended(&mut self, out: &mut Vec<Effect, A>) {
+    pub fn ended(&mut self, out: &mut AVec<'_, Effect>) {
         if self.placed.as_slice() != self.image.as_slice() {
             out.push(Effect::WriteImage);
         }
@@ -436,7 +436,7 @@ impl<A: Allocator + Clone> Parent<A> {
         needed: &[SlotId],
         history: &[SlotId],
         now: Nanos,
-        out: &mut Vec<Effect, A>,
+        out: &mut AVec<'_, Effect>,
     ) -> Result<(), Error> {
         if self.start != Start::NotYet {
             return Err(Error::StartedTwice);
@@ -478,7 +478,7 @@ impl<A: Allocator + Clone> Parent<A> {
         thread: ThreadId,
         slot: SlotId,
         now: Nanos,
-        out: &mut Vec<Effect, A>,
+        out: &mut AVec<'_, Effect>,
     ) -> Result<(), Error> {
         self.check(slot)?;
         self.now = self.now.max(now);
@@ -514,7 +514,7 @@ impl<A: Allocator + Clone> Parent<A> {
         slots: &[SlotId],
         hooks: Hooks,
         on: bool,
-        out: &mut Vec<Effect, A>,
+        out: &mut AVec<'_, Effect>,
     ) -> Result<(), Error> {
         for slot in slots {
             self.check(*slot)?;
@@ -533,7 +533,7 @@ impl<A: Allocator + Clone> Parent<A> {
 
     /// The tier made optimized `code` for `slot`: its code from now, published at once (a stub
     /// in front of it stays in front of the new body).
-    pub fn tiered(&mut self, slot: SlotId, code: CodeRef, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+    pub fn tiered(&mut self, slot: SlotId, code: CodeRef, out: &mut AVec<'_, Effect>) -> Result<(), Error> {
         self.check(slot)?;
         let State::Ready { .. } = self.state(slot) else {
             return Err(Error::NotReady { slot });
@@ -555,7 +555,7 @@ impl<A: Allocator + Clone> Parent<A> {
     }
 
     /// Wants `slot` at `priority`: looked up first, or moved up in its queue.
-    fn want(&mut self, slot: SlotId, priority: Priority, out: &mut Vec<Effect, A>) {
+    fn want(&mut self, slot: SlotId, priority: Priority, out: &mut AVec<'_, Effect>) {
         match self.state(slot) {
             State::Unasked => {
                 self.set(slot, State::Looking { priority });
@@ -583,7 +583,7 @@ impl<A: Allocator + Clone> Parent<A> {
         &mut self,
         slot: SlotId,
         found: Option<Found<'_>>,
-        out: &mut Vec<Effect, A>,
+        out: &mut AVec<'_, Effect>,
     ) -> Result<(), Error> {
         self.check(slot)?;
         let State::Looking { priority } = self.state(slot) else {
@@ -612,9 +612,9 @@ impl<A: Allocator + Clone> Parent<A> {
     pub fn compiled(
         &mut self,
         slot: SlotId,
-        ended: Compiled<'_, A>,
+        ended: Compiled<'_>,
         now: Nanos,
-        out: &mut Vec<Effect, A>,
+        out: &mut AVec<'_, Effect>,
     ) -> Result<(), Error> {
         self.check(slot)?;
         self.now = self.now.max(now);
@@ -646,7 +646,7 @@ impl<A: Allocator + Clone> Parent<A> {
                         Some(slots) if slots.contains(&slot) => continue,
                         Some(slots) => slots.push(slot),
                         None => {
-                            let mut slots = Vec::new_in(self.alloc.clone());
+                            let mut slots = Vec::new_in(self.alloc);
                             slots.push(slot);
                             self.making.insert(*key, slots);
                             out.push(Effect::Make { key: *key, priority });
@@ -667,7 +667,7 @@ impl<A: Allocator + Clone> Parent<A> {
 
     /// The record `key` was made (or could not be): each compile that lacked it is entered again
     /// once it lacks nothing, or fails with the record's error.
-    pub fn made(&mut self, key: RecordKey, result: Result<(), Why>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+    pub fn made(&mut self, key: RecordKey, result: Result<(), Why>, out: &mut AVec<'_, Effect>) -> Result<(), Error> {
         let Some(slots) = self.making.remove(&key) else {
             return Err(Error::NotNeeded { key });
         };
@@ -692,9 +692,9 @@ impl<A: Allocator + Clone> Parent<A> {
     }
 
     /// The driver's clock: every compile past its deadline fails its askers.
-    pub fn tick(&mut self, now: Nanos, out: &mut Vec<Effect, A>) {
+    pub fn tick(&mut self, now: Nanos, out: &mut AVec<'_, Effect>) {
         self.now = self.now.max(now);
-        let mut over = Vec::new_in(self.alloc.clone());
+        let mut over = Vec::new_in(self.alloc);
         for (at, state) in self.table.states().iter().enumerate() {
             let (deadline, holds) = match *state {
                 State::Compiling { priority, deadline } => (deadline, Some(priority)),
@@ -716,7 +716,7 @@ impl<A: Allocator + Clone> Parent<A> {
     }
 
     /// `slot` has code: kept, published, its askers answered, its callees wanted.
-    fn has_code(&mut self, slot: SlotId, tier: Tier, code: CodeRef, callees: &[SlotId], out: &mut Vec<Effect, A>) {
+    fn has_code(&mut self, slot: SlotId, tier: Tier, code: CodeRef, callees: &[SlotId], out: &mut AVec<'_, Effect>) {
         self.set(slot, State::Ready { tier, code });
         let function = self.instance(slot);
         out.push(Effect::Say(match tier {
@@ -735,7 +735,7 @@ impl<A: Allocator + Clone> Parent<A> {
         }
     }
 
-    fn fail(&mut self, slot: SlotId, error: CompileError, out: &mut Vec<Effect, A>) {
+    fn fail(&mut self, slot: SlotId, error: CompileError, out: &mut AVec<'_, Effect>) {
         self.set(slot, State::Failed { error, compiling: None });
         out.push(Effect::Say(RunEvent::Failed { function: error.function }));
         self.answer(slot, Answer::Failed(error), out);
@@ -745,7 +745,7 @@ impl<A: Allocator + Clone> Parent<A> {
     }
 
     /// Answers `slot`'s waiters in the order they asked, and the start if it waited.
-    fn answer(&mut self, slot: SlotId, answer: Answer, out: &mut Vec<Effect, A>) {
+    fn answer(&mut self, slot: SlotId, answer: Answer, out: &mut AVec<'_, Effect>) {
         let mut start = false;
         self.waiters.retain(|(waits, asker)| {
             if *waits != slot {
@@ -771,14 +771,14 @@ impl<A: Allocator + Clone> Parent<A> {
         }
     }
 
-    fn begin_if_ready(&mut self, out: &mut Vec<Effect, A>) {
+    fn begin_if_ready(&mut self, out: &mut AVec<'_, Effect>) {
         if self.start == (Start::Waiting { left: 0 }) {
             self.start = Start::Begun;
             out.push(Effect::Begin);
         }
     }
 
-    fn refuse_start(&mut self, error: CompileError, out: &mut Vec<Effect, A>) {
+    fn refuse_start(&mut self, error: CompileError, out: &mut AVec<'_, Effect>) {
         if matches!(self.start, Start::Waiting { .. }) {
             self.start = Start::Refused;
             self.waiters.retain(|(_, asker)| *asker != Asker::Start);
@@ -788,7 +788,7 @@ impl<A: Allocator + Clone> Parent<A> {
 
     /// Starts what the workers may take: asks on any free worker, background work only while
     /// one worker stays free.
-    fn pump(&mut self, out: &mut Vec<Effect, A>) {
+    fn pump(&mut self, out: &mut AVec<'_, Effect>) {
         for priority in PRIORITIES {
             let background = priority != Priority::Asked;
             loop {

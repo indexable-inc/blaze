@@ -170,18 +170,24 @@ impl core::error::Error for ErrorKind {
 /// file's edition, or for the targets to format, could not be read.
 #[derive(Debug)]
 pub enum FmtError {
-    /// blaze-manifest could not read the workspace.
+    /// The process's cargo configuration could not be read (`Config::from_process`).
+    Config(blaze_manifest::config::ConfigError),
+    /// No manifest could be chosen (`metadata::root_manifest`).
+    Metadata(blaze_manifest::metadata::MetadataError),
+    /// The workspace could not be read (`Workspace::new`).
     Manifest(blaze_manifest::ManifestError),
     /// The workspace of `manifest` could not be read for the edition of the files in it.
     Workspace {
         manifest: PathBuf,
-        error: blaze_manifest::ManifestError,
+        error: Box<FmtError>,
     },
 }
 
 impl fmt::Display for FmtError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            FmtError::Config(error) => write!(f, "{error}"),
+            FmtError::Metadata(error) => write!(f, "{error}"),
             FmtError::Manifest(error) => write!(f, "{error}"),
             FmtError::Workspace { manifest, error } => write!(
                 f,
@@ -195,8 +201,23 @@ impl fmt::Display for FmtError {
 impl core::error::Error for FmtError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            FmtError::Manifest(error) | FmtError::Workspace { error, .. } => Some(error),
+            FmtError::Config(error) => Some(error),
+            FmtError::Metadata(error) => Some(error),
+            FmtError::Manifest(error) => Some(error),
+            FmtError::Workspace { error, .. } => Some(&**error),
         }
+    }
+}
+
+impl From<blaze_manifest::config::ConfigError> for FmtError {
+    fn from(error: blaze_manifest::config::ConfigError) -> FmtError {
+        FmtError::Config(error)
+    }
+}
+
+impl From<blaze_manifest::metadata::MetadataError> for FmtError {
+    fn from(error: blaze_manifest::metadata::MetadataError) -> FmtError {
+        FmtError::Metadata(error)
     }
 }
 
@@ -205,6 +226,13 @@ impl From<blaze_manifest::ManifestError> for FmtError {
         FmtError::Manifest(error)
     }
 }
+
+// `cargo_fmt` hands a `FmtError` to `io::Error::other`, which takes only `Send + Sync` errors:
+// this fails to compile, naming the type, if one of blaze-manifest's errors stops being so.
+const _: fn() = || {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<FmtError>();
+};
 
 impl From<ModuleResolutionErrors> for ErrorKind {
     fn from(e: ModuleResolutionErrors) -> ErrorKind {

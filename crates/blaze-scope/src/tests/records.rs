@@ -3,13 +3,13 @@
 //! the world's records (through [`RecordFacts`]) resolves what it resolves from the working
 //! forms the tests wrote.
 
-use std::alloc::Global;
 use std::boxed::Box;
 use std::format;
 use std::string::String;
 use std::vec::Vec;
 
 use blaze_id::{CrateItemKey, ItemKey};
+use blaze_own::Alloc;
 use blaze_surface::testing::{Fact, MemSurface};
 use blaze_surface::{Items, NotBuilt, SurfaceError};
 
@@ -18,17 +18,17 @@ use crate::resolver::Plant;
 use crate::{RecordFacts, ResolveError, ScopeBuilder};
 
 /// Every record of `w`'s modules and crates: one surface per crate.
-fn surfaces(w: &World) -> Result<Vec<(CrateItemKey, MemSurface<Global>)>, String> {
-    let mut out: Vec<(CrateItemKey, MemSurface<Global>)> = Vec::new();
+fn surfaces(w: &World) -> Result<Vec<(CrateItemKey, MemSurface<'static>)>, String> {
+    let mut out: Vec<(CrateItemKey, MemSurface<'static>)> = Vec::new();
     for (&krate, cr) in w.roots.iter() {
-        let mut mem = MemSurface::new_in(krate, Global);
-        let bytes = cr.write(Global).map_err(|e| format!("the CrateRoot of {krate:x}: {e}"))?;
+        let mut mem = MemSurface::new_in(krate, Alloc::global());
+        let bytes = cr.write(Alloc::global()).map_err(|e| format!("the CrateRoot of {krate:x}: {e}"))?;
         mem.insert(Fact::CrateRoot, &bytes).map_err(|e| format!("the CrateRoot of {krate:x}: {e}"))?;
         out.push((krate, mem));
     }
     for (&module, info) in w.modules.iter() {
         let bytes = w.decls[&module]
-            .write(module, info, Global)
+            .write(module, info, Alloc::global())
             .map_err(|e| format!("the ModuleDecls of {module:x}: {e}"))?;
         let Some((_, mem)) = out.iter_mut().find(|(krate, _)| module.is_of(*krate)) else {
             return Err(format!("module {module:x} is of no crate of the world"));
@@ -46,16 +46,16 @@ fn every_resolved_scope_round_trips_through_its_record() {
         let solved = solve(w, None, Plant::None).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
         let mut by_crate = surfaces(w).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
         for (&module, resolved) in solved.by.iter() {
-            let bytes = resolved.scope.write(Global).unwrap_or_else(|e| panic!("fixture {i}: {module:x}: {e}"));
+            let bytes = resolved.scope.write(Alloc::global()).unwrap_or_else(|e| panic!("fixture {i}: {module:x}: {e}"));
             let Some((_, mem)) = by_crate.iter_mut().find(|(krate, _)| module.is_of(*krate)) else {
                 panic!("fixture {i}: module {module:x} is of no crate");
             };
             mem.insert(Fact::ModuleScope, &bytes).unwrap_or_else(|e| panic!("fixture {i}: {module:x}: {e}"));
             let view = mem.scope(module).unwrap_or_else(|e| panic!("fixture {i}: {module:x}: {e}"));
-            let back = ScopeBuilder::from(&view, Global);
+            let back = ScopeBuilder::from(&view, Alloc::global());
             assert!(resolved.scope == back, "fixture {i}: module {module:x}:\n made: {:?}\n read: {back:?}", resolved.scope);
             // The same scope written again is the same bytes.
-            let again = back.write(Global).unwrap_or_else(|e| panic!("fixture {i}: {module:x}: {e}"));
+            let again = back.write(Alloc::global()).unwrap_or_else(|e| panic!("fixture {i}: {module:x}: {e}"));
             assert!(again[..] == bytes[..], "fixture {i}: module {module:x}: a second write differs");
         }
     }
@@ -75,8 +75,8 @@ fn record_facts_resolve_as_the_working_forms_do() {
         let (_, mem) = by_crate.pop().unwrap_or_else(|| panic!("fixture {i}: one crate"));
         // `RecordFacts` names are the records' text, borrowed for the surface's life: the test
         // keeps the surface for the whole run.
-        let mem: &'static MemSurface<Global> = Box::leak(Box::new(mem));
-        let facts = RecordFacts::new_in(mem, Global);
+        let mem: &'static MemSurface<'static> = Box::leak(Box::new(mem));
+        let facts = RecordFacts::new_in(mem, Alloc::global());
         let want = solve(w, None, Plant::None).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
         match solve_with(w, &facts, None, Plant::None) {
             Ok(got) => {
@@ -108,14 +108,14 @@ fn a_record_missing_a_declaration_is_seen() {
     // The root's record written without its `use a::foo as bar;`.
     let mut cut = w.decls[&k.root].clone();
     cut.uses.truncate(1);
-    let bytes = cut.write(k.root, &w.modules[&k.root], Global).unwrap_or_else(|e| panic!("{e}"));
+    let bytes = cut.write(k.root, &w.modules[&k.root], Alloc::global()).unwrap_or_else(|e| panic!("{e}"));
     mem.insert(Fact::ModuleDecls, &bytes).unwrap_or_else(|e| panic!("{e}"));
-    let mem: &'static MemSurface<Global> = Box::leak(Box::new(mem));
-    let facts = RecordFacts::new_in(mem, Global);
+    let mem: &'static MemSurface<'static> = Box::leak(Box::new(mem));
+    let facts = RecordFacts::new_in(mem, Alloc::global());
     let want = solve(&w, None, Plant::None).unwrap_or_else(|e| panic!("{e}"));
     let got = solve_with(&w, &facts, None, Plant::None).unwrap_or_else(|e| panic!("{e}"));
     assert!(got.by != want.by, "a record without `bar` resolved as the whole module");
-    let bar = |by: &std::collections::BTreeMap<ItemKey, crate::Resolved<super::N, Global>>| {
+    let bar = |by: &std::collections::BTreeMap<ItemKey, crate::Resolved<'static, super::N>>| {
         by[&k.root].scope.get(crate::Namespace::Values, "bar").map(|b| b.def.key)
     };
     assert_eq!(bar(&want.by), Some(k.foo));

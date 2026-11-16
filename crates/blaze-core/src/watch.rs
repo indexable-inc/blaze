@@ -109,7 +109,7 @@ thread_local! {
 /// until the test lets one through, so a test can ask while a watch is provably not in place.
 /// Nothing outside tests.
 #[cfg(test)]
-pub(crate) type Gate = Option<crossbeam_channel::Receiver<()>>;
+pub(crate) type Gate = Option<crate::chan::Receiver<()>>;
 #[cfg(not(test))]
 pub(crate) type Gate = ();
 

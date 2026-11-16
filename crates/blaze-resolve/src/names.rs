@@ -22,6 +22,11 @@ pub fn validate_registry_name(name: &str) -> Result<()> {
     validate_name(name, "registry name")
 }
 
+/// A `[path-bases]` name, checked as cargo-util-schemas checks one.
+pub fn validate_path_base_name(name: &str) -> Result<()> {
+    validate_name(name, "path base name")
+}
+
 fn validate_name(name: &str, what: &'static str) -> Result<()> {
     if name.is_empty() {
         return Err(ResolveError::EmptyName { what });

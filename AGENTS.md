@@ -136,7 +136,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **67. within-ten-percent-of-the-floor**: Aim every design at the floor from the start; state it and report the ratio.
 - **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
 - **73. type-then-lint-then-rule**: Prevent a mistake by a type, then a lint with a fix; a rule here comes last.
-- **76. correct-by-construction**: A value with an obligation or meaning is a type saying so: linear, proof, typed id, checked length.
+- **76. correct-by-construction**: A value that means something is a newtype, never a bare number; an obligation is linear or a proof.
 - **78. strategy-is-a-type-parameter**: A choice between strategies is a type parameter at one seam, each instantiation tested equal.
 - **79. interfaces-first**: A rewrite starts as one small crate of types and state machines that compiles and is simulated.
 

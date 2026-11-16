@@ -69,10 +69,9 @@
 
 mod walk;
 
-use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 use blaze_surface::{
     Attr, AttrSpan, BuildError, Edition, FileItems, Item, ItemIndex, RecordBytes, SyntaxError,
 };
@@ -98,7 +97,7 @@ pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
 ///
 /// When `text` is longer than `u32::MAX` bytes: every range is a `u32` pair, as the lexer's
 /// offsets are.
-pub fn outline<A: Allocator + Clone>(text: &str, edition: Edition, alloc: A) -> Outline<A> {
+pub fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
     walk::outline(text, parser_edition(edition), alloc)
 }
 
@@ -119,27 +118,27 @@ pub fn syntax_kind(syntax: u16) -> SyntaxKind {
     SyntaxKind::from(syntax)
 }
 
-/// What [`outline`] gives: plain data in the allocator `A`, the working form of a file's
+/// What [`outline`] gives: plain data in the allocator `'a` names, the working form of a file's
 /// `FileItems` record ([`Outline::to_file_items`]).
-pub struct Outline<A: Allocator> {
-    items: Vec<Item, A>,
-    attrs: Vec<Attr, A>,
+pub struct Outline<'a> {
+    items: AVec<'a, Item>,
+    attrs: AVec<'a, Attr>,
     file_attrs: AttrSpan,
-    errors: Vec<SyntaxError, A>,
+    errors: AVec<'a, SyntaxError>,
     /// The errors' messages, one after another, each copied from a `&str`.
-    messages: Vec<u8, A>,
+    messages: AVec<'a, u8>,
 }
 
-impl<A: Allocator> Outline<A> {
+impl Outline<'_> {
     /// The `FileItems` record of this outline of `text`, the file whose content is `file`, in
     /// `alloc`: every value the outline holds, and each entry's name's text. Refused only when
     /// the outline is not one of `text`, whose names it would cut.
-    pub fn to_file_items<B: Allocator + Clone>(
+    pub fn to_file_items<'b>(
         &self,
         text: &str,
         file: ContentId,
-        alloc: B,
-    ) -> Result<RecordBytes<B>, BuildError> {
+        alloc: Alloc<'b>,
+    ) -> Result<RecordBytes<'b>, BuildError> {
         let parts = FileItems {
             file,
             text,
@@ -219,8 +218,8 @@ impl<'o> Iterator for Children<'o> {
     }
 }
 
-impl<A: Allocator> PartialEq for Outline<A> {
-    fn eq(&self, other: &Outline<A>) -> bool {
+impl PartialEq for Outline<'_> {
+    fn eq(&self, other: &Outline<'_>) -> bool {
         self.items[..] == other.items[..]
             && self.attrs[..] == other.attrs[..]
             && self.file_attrs == other.file_attrs
@@ -229,9 +228,9 @@ impl<A: Allocator> PartialEq for Outline<A> {
     }
 }
 
-impl<A: Allocator> Eq for Outline<A> {}
+impl Eq for Outline<'_> {}
 
-impl<A: Allocator> fmt::Debug for Outline<A> {
+impl fmt::Debug for Outline<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Outline")
             .field("items", &&self.items[..])

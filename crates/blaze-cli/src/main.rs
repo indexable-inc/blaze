@@ -21,7 +21,7 @@ mod work;
 use core::fmt;
 
 use blaze_drive::{
-    Answer, Ask, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Request, Settled, TableFull, Tool,
+    Answer, Ask, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Request, Settled, Space, TableFull, Tool,
     WireError,
 };
 use blaze_own::{Vec, VecDeque};
@@ -189,7 +189,7 @@ fn request(cx: &Cx, root: &Dir<ReadWrite>, command: Command, workers: u32, frame
         None => None,
     };
     let config = Config { tool: tool(), workers, most_entries: 64, most_jobs: 1 << 24, is_error: every_rule };
-    let mut req = Request::new_in(config, Ask { command, args: b"", gate: Gate::Beside }, frame);
+    let mut req = Request::new_in(config, Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE }, frame);
     let mut store = FileStore::open(root)?;
     // The workers' read side: two slots a name at most a half full; about 128 names a file
     // (items, bodies, scopes) is the sizing until the profile says otherwise.

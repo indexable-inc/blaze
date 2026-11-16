@@ -1904,7 +1904,7 @@ struct Watching {
 #[cfg(all(test, target_os = "linux"))]
 impl Threads {
     /// Each watch's start from here waits at `gate` ([`crate::watch::Gate`]).
-    pub(crate) fn gate_walks(&mut self, gate: crossbeam_channel::Receiver<()>) {
+    pub(crate) fn gate_walks(&mut self, gate: crate::chan::Receiver<()>) {
         self.walk_gate = Some(gate);
     }
 

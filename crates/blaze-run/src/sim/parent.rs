@@ -9,10 +9,9 @@
 //! the run (rule 20); a waiting thread's function is never left idle while a worker is free (it
 //! never waits behind speculation); the start is answered once.
 
-use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 
-use blaze_own::Vec as Own;
+use blaze_own::{AVec, Alloc, Vec as Own};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
@@ -58,7 +57,7 @@ struct World {
 }
 
 impl World {
-    fn see(&mut self, effects: &mut Own<Effect, Global>, failing: Option<SlotId>) -> Result<(), Broke> {
+    fn see(&mut self, effects: &mut AVec<'_, Effect>, failing: Option<SlotId>) -> Result<(), Broke> {
         for effect in effects.drain(..) {
             match effect {
                 Effect::Lookup { slot, .. } => self.lookups.push(slot),
@@ -128,7 +127,7 @@ impl World {
 fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let functions = functions();
     let config = ParentConfig { workers: WORKERS, compile_bound: Nanos(u64::MAX / 4), most_waiters: 64 };
-    let mut parent = Parent::new(&functions, config, Global).map_err(harness)?;
+    let mut parent = Parent::new(&functions, config, Alloc::global()).map_err(harness)?;
     parent.plant = plant;
     let failing = tape.coin("a failure").then(|| SlotId(tape.below(u64::from(FUNCTIONS), "failing") as u32));
     let mut store: BTreeSet<SlotId> = (0..FUNCTIONS).filter(|_| tape.coin("in the store")).map(SlotId).collect();
@@ -140,7 +139,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         .map(|_| (0..KEYS).filter(|_| tape.one_in(3, "lacks")).map(|n| RecordKey(key(50 + n))).collect())
         .collect();
     let mut world = World::default();
-    let mut out = Own::new_in(Global);
+    let mut out = Own::new_in(Alloc::global());
     let mut now = Nanos(0);
     let history: Vec<SlotId> = (0..FUNCTIONS).filter(|_| tape.one_in(3, "ran last time")).map(SlotId).collect();
     parent.start(&[SlotId(0)], &history, now, &mut out).map_err(harness)?;
@@ -170,9 +169,9 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             }
             2 if !world.compiles.is_empty() => {
                 let slot = world.compiles.remove(tape.index(world.compiles.len(), "compile"));
-                let mut callees = Own::new_in(Global);
+                let mut callees = Own::new_in(Alloc::global());
                 callees.extend_from_slice(&callees_of(slot));
-                let record = FastRecord { code: code_of(slot), callees, reads: Own::new_in(Global) };
+                let record = FastRecord { code: code_of(slot), callees, reads: Own::new_in(Alloc::global()) };
                 let missing: Vec<RecordKey> =
                     lacks[slot.index()].iter().filter(|it| !world.made.contains(*it)).copied().collect();
                 let ended = if failing == Some(slot) {
@@ -233,11 +232,11 @@ struct Started {
 
 fn start_once(tape: &Tape, needed: &[SlotId], image: Option<&[Placement]>) -> Result<Started, Broke> {
     let config = ParentConfig { workers: WORKERS, compile_bound: Nanos(u64::MAX / 4), most_waiters: 64 };
-    let mut parent = Parent::new(&functions(), config, Global).map_err(harness)?;
-    let mut out = Own::new_in(Global);
+    let mut parent = Parent::new(&functions(), config, Alloc::global()).map_err(harness)?;
+    let mut out = Own::new_in(Alloc::global());
     let mut lookups = Vec::new();
     let mut pending = Vec::new();
-    let see = |out: &mut Own<Effect, Global>, lookups: &mut Vec<SlotId>, pending: &mut Vec<SlotId>| {
+    let see = |out: &mut AVec<'static, Effect>, lookups: &mut Vec<SlotId>, pending: &mut Vec<SlotId>| {
         for effect in out.drain(..) {
             match effect {
                 Effect::Lookup { slot, .. } => {
@@ -303,8 +302,8 @@ fn a_run_with_an_image_asks_for_the_same_records_only_earlier_and_in_one_pass() 
 fn an_overrun_compile_fails_its_askers_and_a_late_success_serves_later_ones() {
     let functions = [Function { instance: InstanceKey(key(0)), code: CodeId(key(100)) }];
     let config = ParentConfig { workers: 2, compile_bound: Nanos(10), most_waiters: 8 };
-    let mut parent = Parent::new(&functions, config, Global).expect("a parent");
-    let mut out = Own::new_in(Global);
+    let mut parent = Parent::new(&functions, config, Alloc::global()).expect("a parent");
+    let mut out = Own::new_in(Alloc::global());
     parent.start(&[], &[], Nanos(0), &mut out).expect("started");
     out.clear();
     parent.need(ThreadId(1), SlotId(0), Nanos(0), &mut out).expect("needed");
@@ -317,7 +316,7 @@ fn an_overrun_compile_fails_its_askers_and_a_late_success_serves_later_ones() {
     });
     assert!(failed, "the asker was not failed past the bound: {out:?}");
     out.clear();
-    let record = FastRecord { code: CodeRef(key(5)), callees: Own::new_in(Global), reads: Own::new_in(Global) };
+    let record = FastRecord { code: CodeRef(key(5)), callees: Own::new_in(Alloc::global()), reads: Own::new_in(Alloc::global()) };
     parent.compiled(SlotId(0), Compiled::Record(&record), Nanos(12), &mut out).expect("a late end");
     assert!(out.iter().any(|effect| matches!(effect, Effect::Publish { .. })), "{out:?}");
     out.clear();

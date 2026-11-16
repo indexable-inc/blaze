@@ -48,7 +48,6 @@ use std::os::unix::net::UnixStream;
 
 use blaze_launch::wire::{self, Ask, ProgramId, Tell, WireError};
 use blaze_launch::{Slot, Target, Thread};
-use crossbeam_channel::Sender;
 
 use crate::drive::{Driver, EditError, Error, Records};
 use crate::sys;
@@ -175,10 +174,28 @@ struct Control<'a, 'h> {
     out: Vec<u8>,
     /// Where the program's main thread waits for what to run ([`Start`], once the daemon
     /// said the statics are defined), or for why nothing can.
-    ready: Sender<Result<Start, String>>,
+    ready: Ready,
     /// What a [`Tell::Restart`] does: starts the program again in place. It returns only
     /// when it could not, with why.
     restart: fn(&str) -> String,
+}
+
+/// Where the program's main thread waits for its [`Start`], or for why there is none.
+#[expect(
+    clippy::disallowed_types,
+    reason = "below blaze-core, whose `chan` is the one channel: the launcher's runtime links no more than std, and this channel carries one message"
+)]
+pub type Ready = std::sync::mpsc::SyncSender<Result<Start, String>>;
+
+/// The channel of a launch's [`Start`]: its [`Ready`] for [`run`], and the end the program's
+/// main thread waits on.
+#[expect(
+    clippy::disallowed_types,
+    clippy::disallowed_methods,
+    reason = "below blaze-core, whose `chan` is the one channel: see `Ready`"
+)]
+pub fn ready() -> (Ready, std::sync::mpsc::Receiver<Result<Start, String>>) {
+    std::sync::mpsc::sync_channel(1)
 }
 
 /// What the program's main thread runs: the addresses of its initializer statics (each
@@ -199,7 +216,7 @@ pub fn run(
     held: Option<Held<'_>>,
     program: ProgramId,
     records: &mut dyn Records,
-    ready: Sender<Result<Start, String>>,
+    ready: Ready,
     restart: fn(&str) -> String,
 ) -> (Driver, Result<(), ControlError>) {
     let shared = driver.shared();

@@ -6,8 +6,6 @@
 //! source tokens holds), and its context is the root of its edition. Every span that comes
 //! back maps to a [`TokenOrigin`]; one of another anchor is refused.
 
-use core::alloc::Allocator;
-
 use intern::Symbol;
 use span::{
     EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext, TextRange,
@@ -67,8 +65,8 @@ pub(crate) fn site_span(edition: Edition) -> Span {
 }
 
 /// `stream` as a token tree under an invisible top group, each token's span its origin.
-pub(crate) fn to_tt<A: Allocator>(
-    stream: &TokenStream<A>,
+pub(crate) fn to_tt(
+    stream: &TokenStream<'_>,
     role: Role,
     which: Stream,
     site: Edition,
@@ -133,8 +131,8 @@ fn spacing_of(span: Span) -> Spacing {
 }
 
 /// Appends the token trees of `iter` to `out`, each with the origin its span names.
-pub(crate) fn from_tt<A: Allocator + Clone>(
-    out: &mut Out<'_, A>,
+pub(crate) fn from_tt(
+    out: &mut Out<'_, '_>,
     iter: tt::TtIter<'_>,
     made: Transparency,
 ) -> Result<(), ExpandError> {
@@ -172,7 +170,7 @@ pub(crate) fn from_tt<A: Allocator + Clone>(
 
 /// `tt::stringify`'s question about a token of a stream given by [`to_tt`]: whether the source
 /// wrote it right against the next one.
-pub(crate) fn source_joined<A: Allocator>(stream: &TokenStream<A>, span: Span) -> Option<bool> {
+pub(crate) fn source_joined(stream: &TokenStream<'_>, span: Span) -> Option<bool> {
     if span.anchor.file_id.file_id().index() != Role::Input.raw() {
         return None;
     }

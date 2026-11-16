@@ -410,6 +410,14 @@ impl Shards {
     pub fn count(self) -> usize {
         self.0 as usize
     }
+
+    /// For a table made once per process (a `static` interner), which has no scheduler to ask:
+    /// [`Shards::for_workers`] of the machine's available parallelism, read once, here, by
+    /// name. A table with a maker that knows its worker count passes it instead.
+    pub fn for_this_machine() -> Shards {
+        let workers = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+        Shards::for_workers(workers)
+    }
 }
 
 /// Chunk `k` holds `FIRST << k` slots, so an index's chunk and place in it are arithmetic and

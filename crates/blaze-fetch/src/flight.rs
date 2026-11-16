@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use blaze_core::chan::{Receiver, RecvTimeoutError, Sender};
 
 use crate::digest::Digest;
 
@@ -22,7 +22,7 @@ pub type Flight = (usize, blaze_cas::Key);
 
 /// The pins being downloaded, each with the receiver its followers wait on.
 pub struct Flights {
-    live: papaya::HashMap<Flight, Receiver<()>>,
+    live: blaze_hash::SharedMap<Flight, Receiver<()>>,
     /// Told once each time a request begins to follow: a test's proof that its requests
     /// waited on a leader rather than downloading or finding the store already filled.
     followed: Option<Sender<()>>,
@@ -72,12 +72,12 @@ impl Default for Flights {
 
 impl Flights {
     pub fn new() -> Flights {
-        Flights { live: papaya::HashMap::new(), followed: None }
+        Flights { live: blaze_hash::SharedMap::default(), followed: None }
     }
 
     /// A table that sends on `followed` each time a request begins to follow (a test's).
     pub fn watched(followed: Sender<()>) -> Flights {
-        Flights { live: papaya::HashMap::new(), followed: Some(followed) }
+        Flights { live: blaze_hash::SharedMap::default(), followed: Some(followed) }
     }
 
     /// The process's table: every [`crate::Fetcher`] of the process shares it.
@@ -92,7 +92,7 @@ impl Flights {
 
     /// Leads `flight`, or follows its leader; `pin` names it in a follower's span.
     pub fn begin(&self, flight: Flight, pin: Digest) -> Role<'_> {
-        let (ended, waiting) = crossbeam_channel::bounded(0);
+        let (ended, waiting) = blaze_core::chan::bounded(0);
         match self.live.pin().try_insert(flight, waiting) {
             Ok(_) => Role::Lead(Leader { flights: self, flight, _ended: ended }),
             Err(occupied) => {

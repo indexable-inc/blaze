@@ -205,6 +205,42 @@ fn bounds_are_parameters_and_refused() {
     assert_eq!(refused("a16161"), Error { at: 3, why: why::END_AT_VALUE });
 }
 
+/// `body` on a thread with a 64 KiB stack, where a recursion on depth overflows long before a
+/// million levels.
+fn small_stack(body: impl FnOnce() + Send + 'static) {
+    let thread = std::thread::Builder::new().stack_size(64 << 10).spawn(body).unwrap();
+    thread.join().unwrap();
+}
+
+/// `n` levels, one-element arrays and one-entry maps (key `"k"`) by turns, around a `0`.
+fn nested(n: usize) -> StdVec<u8> {
+    let mut bytes = StdVec::new();
+    for i in 0..n {
+        match i % 2 {
+            0 => bytes.push(0x81),
+            _ => bytes.extend_from_slice(&[0xa1, 0x61, b'k']),
+        }
+    }
+    bytes.push(0x00);
+    bytes
+}
+
+#[test]
+fn deep_nesting_reads_writes_and_drops_in_a_small_stack() {
+    for (n, limits) in [(128, Limits::DEFAULT), (1_000_000, Limits { most_depth: 1_000_000, ..Limits::DEFAULT })] {
+        small_stack(move || {
+            let bytes = nested(n);
+            let value = read_in(&bytes, limits, Global).unwrap();
+            assert_eq!(to_vec_in(&value, Global).as_slice(), bytes.as_slice(), "write(read(bytes)) is the bytes");
+            let copy = value.copy_in(Global);
+            assert_eq!(to_vec_in(&copy, Global).as_slice(), bytes.as_slice(), "the copy writes the same");
+            assert_eq!(read_in(&nested(n + 1), limits, Global).unwrap_err().why, why::TOO_DEEP);
+            drop(value);
+            drop(copy);
+        });
+    }
+}
+
 /// The field reader blaze-pack's and blaze-watch's records are read with, as it was moved.
 #[test]
 fn the_field_reader_reads_records() {

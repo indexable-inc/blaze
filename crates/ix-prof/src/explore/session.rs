@@ -1,8 +1,8 @@
 //! The session core: what a session answers and sends, with no transport in it. Its clock is
 //! the driver's (`at_ns` arguments), it owns no socket, thread or timer, and each step hands back
 //! a typed decision the driver carries out ([`Step`], [`Emit`], the bytes of a header, an
-//! answer's header). An answer's Arrow IPC is [`frame::answer_bytes`]'s: arrow's IPC writer keys
-//! its dictionaries in a `HashMap` of `RandomState`, OS randomness a core does not reach.
+//! answer's header). An answer's Arrow IPC is [`frame::answer_bytes`]'s, written by the driver
+//! that holds the answer's bytes.
 //!
 //! For the same reason the core makes no `serde_json::Map` and parses no `serde_json::Value`:
 //! where a crate of the build turns on serde_json's `preserve_order`, a `Map` is an `IndexMap`

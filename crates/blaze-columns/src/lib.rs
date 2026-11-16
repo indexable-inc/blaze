@@ -706,7 +706,7 @@ impl<A: Allocator> Column<A> {
     }
 
     /// Its values: a row each, or a list column's elements.
-    pub fn values(&self) -> &Values<A> {
+    pub fn buffer(&self) -> &Values<A> {
         &self.values
     }
 

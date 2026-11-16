@@ -27,6 +27,8 @@ blaze-surface.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `Alloc::global()`: the handle the tests build records in.
+blaze-own = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

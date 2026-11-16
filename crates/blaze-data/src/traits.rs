@@ -25,6 +25,8 @@
 //! }
 //! ```
 
+#![blaze::sans_io]
+
 use core::alloc::Allocator;
 
 use blaze_own::{String, Vec};

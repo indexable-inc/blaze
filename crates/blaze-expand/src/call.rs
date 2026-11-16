@@ -1,8 +1,6 @@
 //! One macro call: its tokens, its kind, its call-site hygiene and, for an eager macro
 //! re-entered, the answers to the calls in its input.
 
-use core::alloc::Allocator;
-
 use crate::{
     error::{ExpandError, Stream},
     tokens::{Ctx, Edition, Sink, TokenStream},
@@ -11,14 +9,15 @@ use crate::{
 /// The three kinds of macro call: the schema's one `CallShape`.
 pub use blaze_surface::CallShape;
 
-/// A call's tokens by its kind.
-pub enum CallKind<'a, A: Allocator> {
+/// A call's tokens by its kind. A stream borrowed for `'a` is in an allocator that lives at
+/// least that long (a stream is covariant in its allocator's lifetime).
+pub enum CallKind<'a> {
     /// `m!(args)`: the tokens inside the delimiters.
-    FnLike { args: &'a TokenStream<A> },
+    FnLike { args: &'a TokenStream<'a> },
     /// `#[m]` (`args` `None`) or `#[m(args)]` on `item`: the item without this attribute.
-    Attr { args: Option<&'a TokenStream<A>>, item: &'a TokenStream<A> },
+    Attr { args: Option<&'a TokenStream<'a>>, item: &'a TokenStream<'a> },
     /// `#[derive(m)]` or `#[derive_const(m)]` on `item`.
-    Derive { item: &'a TokenStream<A>, facts: DeriveFacts },
+    Derive { item: &'a TokenStream<'a>, facts: DeriveFacts },
 }
 
 /// What a derive's output depends on besides the item: they are in the call's key.
@@ -77,14 +76,14 @@ pub enum Inside {
 }
 
 /// The eager facts of a call.
-pub struct Eager<'a, A: Allocator> {
+pub struct Eager<'a> {
     pub inside: Inside,
     /// For an eager macro re-entered after [`crate::Expanded::NeedsExpanded`]: the tokens of
     /// each nested call it listed, in its order, each sealed ([`TokenStream::seal`]).
-    pub answers: &'a [&'a TokenStream<A>],
+    pub answers: &'a [&'a TokenStream<'a>],
 }
 
-impl<A: Allocator> Eager<'_, A> {
+impl Eager<'_> {
     /// A call where it is written, with no answers.
     pub fn plain() -> Self {
         Eager { inside: Inside::Plain, answers: &[] }
@@ -92,15 +91,15 @@ impl<A: Allocator> Eager<'_, A> {
 }
 
 /// One macro call.
-pub struct Call<'a, A: Allocator> {
-    pub kind: CallKind<'a, A>,
+pub struct Call<'a> {
+    pub kind: CallKind<'a>,
     pub site: CallSite,
-    pub eager: Eager<'a, A>,
+    pub eager: Eager<'a>,
 }
 
-impl<'a, A: Allocator> Call<'a, A> {
+impl<'a> Call<'a> {
     /// `m!(args)` where it is written.
-    pub fn fn_like(args: &'a TokenStream<A>, site: CallSite) -> Self {
+    pub fn fn_like(args: &'a TokenStream<'a>, site: CallSite) -> Self {
         Call { kind: CallKind::FnLike { args }, site, eager: Eager::plain() }
     }
 
@@ -113,7 +112,7 @@ impl<'a, A: Allocator> Call<'a, A> {
     }
 
     /// The tokens the macro is given: the fn-like call's arguments, or the item.
-    pub fn input(&self) -> &'a TokenStream<A> {
+    pub fn input(&self) -> &'a TokenStream<'a> {
         match self.kind {
             CallKind::FnLike { args } => args,
             CallKind::Attr { item, .. } | CallKind::Derive { item, .. } => item,
@@ -121,7 +120,7 @@ impl<'a, A: Allocator> Call<'a, A> {
     }
 
     /// An attribute's arguments.
-    pub fn attr_args(&self) -> Option<&'a TokenStream<A>> {
+    pub fn attr_args(&self) -> Option<&'a TokenStream<'a>> {
         match self.kind {
             CallKind::Attr { args, .. } => args,
             CallKind::FnLike { .. } | CallKind::Derive { .. } => None,
@@ -129,7 +128,7 @@ impl<'a, A: Allocator> Call<'a, A> {
     }
 
     /// Every stream of the call, with its name.
-    pub(crate) fn streams(&self) -> impl Iterator<Item = (Stream, &'a TokenStream<A>)> + '_ {
+    pub(crate) fn streams(&self) -> impl Iterator<Item = (Stream, &'a TokenStream<'a>)> + '_ {
         let answers = self
             .eager
             .answers

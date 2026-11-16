@@ -4,8 +4,6 @@
 //!
 //! mbe takes no database: its matcher and transcriber read only the trees and the spans.
 
-use core::alloc::Allocator;
-
 use mbe::{DeclarativeMacro, ExpandErrorKind, MacroCall};
 use span::SyntaxContext;
 
@@ -20,7 +18,7 @@ use crate::{
 };
 
 /// The definition's rules, parsed.
-pub(crate) fn parse<A: Allocator>(def: &MacroDefinition<A>) -> Result<DeclarativeMacro, ExpandError> {
+pub(crate) fn parse(def: &MacroDefinition<'_>) -> Result<DeclarativeMacro, ExpandError> {
     let edition = |ctx: SyntaxContext| ctx.edition();
     let body = bridge::to_tt(def.body(), Role::Def, Stream::Def, def.edition())?;
     Ok(match def.kind() {
@@ -38,9 +36,9 @@ pub(crate) fn parse<A: Allocator>(def: &MacroDefinition<A>) -> Result<Declarativ
 }
 
 /// Expands the call in `out` by `rules`.
-pub(crate) fn expand<A: Allocator + Clone>(
+pub(crate) fn expand(
     rules: &DeclarativeMacro,
-    out: &mut Out<'_, A>,
+    out: &mut Out<'_, '_>,
 ) -> Result<(), ExpandError> {
     if let Some(error) = rules.err() {
         let message = out.note_display(error)?;
@@ -74,8 +72,8 @@ pub(crate) fn expand<A: Allocator + Clone>(
 }
 
 /// mbe's error as the expansion's diagnostic.
-fn diagnose<A: Allocator + Clone>(
-    out: &mut Out<'_, A>,
+fn diagnose(
+    out: &mut Out<'_, '_>,
     error: &mbe::ExpandError,
     rules: u32,
 ) -> Result<(), ExpandError> {

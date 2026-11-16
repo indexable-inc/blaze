@@ -213,19 +213,21 @@ sweep and the critical path, about 0.65 s in all: speedup about 17." This design
    (frozen). No interner: names are content ids. No lock on the hot path.
 5. **The names' first fill**: `ModuleScope` jobs in rounds over all modules of a crate, a wait cycle
    as one `Group`; expected rounds = the longest import chain, about 3-5. The crate root is decoded
-   once per fill and shared (parallel.md change 9; scope_task.rs today decodes it per module).
+   once per fill round and shared (`scope_task::SharedRoot`, `fill_round`; parallel.md change 9).
 6. **Classes and workers** as above; `workers` from `Host::cores()`.
 7. **Profile**: tasks, batches, steps, in place, coordinator ns, idle ns, entries histogram.
    **Floor** (rule 67): total task work / N plus the serial part: the sweep's parallel share,
    `Units`, the critical path of `Need` rounds (A5: 20 ms), and the finish (pages, certificate).
    parallel.md's after-column: about 130 ms against 106 ms, ratio 1.2.
 
-Not yet O(1) (parallel.md change 3): the ready set, jobs and tickets are sorted vectors, and
-`unsettled()` scans every job; each must become a ring per (class, kind), a hash from name to
-job, and a live-job counter, with a test that steps 100,000 jobs and counts operations. The pool
-needs from bstd: a threaded layout with N workers spawned by `scope.must_overlap`, a stealing
-deque, an MPSC ring, and a `Send` cx; none exist yet (`Layout::Inline` only). The cli runs batches
-inline on one thread until then.
+O(1) per event (parallel.md change 3): every map a step touches is `table.rs`'s open-addressed
+table (content-id bits as the hash, probes counted); the ready set is one ring per (class, kind)
+with generation-stamped entries, so leaving it is O(1); a settled counter replaces the scan; a job
+registers at most one wait per advance, so no wait list is searched. `finish` sorts once and
+merges (reverse index, pages bucketed in one pass, findings). The test steps 101,000 jobs and
+holds bookkeeping per job and edge within 2x of a 1,000-job run (`bookkeeping()`). The pool
+codes against bstd's `scope.must_overlap`, `workers()` and `PerWorker::take_all`; until they
+land the cli runs batches inline on one thread.
 
 ## One check covers every configuration
 
@@ -239,16 +241,18 @@ inline on one thread until then.
   the machine re-enters it once per value `Space::fork` allows, each narrower. Its record is
   stored under the condition it **read**; a lookup takes a record whose condition the asker's
   implies, so a record that read nothing serves every configuration.
-- Batches group by condition, so a worker's world is stable within one.
 - More than 64 conditions for one item is `ConditionError::OverCap`, a finding naming the item
-  and its variables; never a sample.
-- A finding carries its condition reduced to the variables read.
-- The profile counts items by conditions: 1, 2, 3-4, 5+.
+  and its variables; never a sample. A finding carries its reduced condition.
 
-The model (condition.rs tests): checking the whole space equals the union of checking each full
-configuration; the plant `RanUnderCondition` (stored under the job's start condition) is caught.
-Not yet in the request machine: `Want` needs a `Cfg` form, jobs a condition in their name, and
-the answer table a condition column.
+In the request machine: a fork is a job named `key::at_condition(base, condition)` (the base
+itself under `ANY`), so records, rows and readers are an ordinary job's. `Ran::Cfg(var)` makes
+the job's record a split: its parts are the forks, its read list the space's digest (another
+space, other forks). Workers name reads by base; the machine walks splits down to the fork the
+task's condition implies (`resolve`), and a need that splits on a variable the asker does not fix
+forks the asker. Rows keep `split` and `cond`. The cap is the span of the node's variables, so the
+same node is refused in any settle order. Not yet: batches grouped by condition. The oracle runs
+on the model and through `Request`: the findings a full configuration implies are its own, each
+once; the plant `RanUnderCondition` (an asker served a fork it does not imply) is caught.
 
 ## The system side (blaze-cli)
 

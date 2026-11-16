@@ -22,7 +22,7 @@ use std::{
     },
 };
 
-use crossbeam_queue::ArrayQueue;
+use blaze_queue::ArrayQueue;
 
 /// Return addresses an allocation sample keeps.
 pub const DEPTH: usize = 32;

@@ -25,6 +25,20 @@ impl Part {
     const EMPTY: Part = Part { text: Text::EMPTY, span: Span { start: 0, end: 0 } };
 }
 
+/// What [`Parser::begin`] read: a whole scalar, or an opened array or inline table.
+enum Began {
+    Done(u32),
+    Opened(u32),
+}
+
+/// Where the cursor stands in the innermost open array or inline table: at its start (or,
+/// in an array, after a comma), or after an element or entry.
+#[derive(Clone, Copy)]
+enum Within {
+    Start,
+    After,
+}
+
 /// A dotted key's parts, in place.
 struct Key {
     parts: [Part; MOST_KEY_PARTS],
@@ -275,6 +289,13 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
 
     /// `key = value` into `table`.
     fn keyval(&mut self, table: u32) -> Result<(), Error> {
+        let (parent, last) = self.keyval_head(table)?;
+        self.value(parent, last).map(|_| ())
+    }
+
+    /// `key =` of a key/value into `table`, up to its value: the table the value goes in (the
+    /// last dotted one) and the key's last part, checked new there.
+    fn keyval_head(&mut self, table: u32) -> Result<(u32, Part), Error> {
         let key = self.key()?;
         self.spaces();
         if self.peek() != Some(b'=') {
@@ -291,7 +312,7 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
             let first = self.first(existing);
             return Err(self.err(widen(last.span.start), What::Duplicate { first }));
         }
-        self.value(parent, last).map(|_| ())
+        Ok((parent, last))
     }
 
     /// Where node `id` was first written: its key, or itself for a keyless one.
@@ -395,8 +416,99 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
         Ok(id)
     }
 
-    /// A value under `parent`, keyed by `key` (empty for an array's element).
+    /// A value under `parent`, keyed by `key` (empty for an array's element). Arrays and
+    /// inline tables nest without recursion: the innermost open one is `open`, and the node
+    /// tree's parent links are the stack, so no depth the limits accept overflows this stack.
     fn value(&mut self, parent: u32, key: Part) -> Result<u32, Error> {
+        let top = match self.begin(parent, key)? {
+            Began::Done(id) => return Ok(id),
+            Began::Opened(id) => id,
+        };
+        let mut open = top;
+        let mut at = Within::Start;
+        loop {
+            let array = self.doc.nodes.kinds()[widen(open)] == Kind::Array;
+            let close = match (array, at) {
+                (true, Within::Start) => {
+                    self.array_blanks()?;
+                    self.peek() == Some(b']')
+                }
+                (true, Within::After) => {
+                    self.array_blanks()?;
+                    match self.peek() {
+                        // A comma, then an element or (a trailing comma) the close.
+                        Some(b',') => {
+                            self.at += 1;
+                            at = Within::Start;
+                            continue;
+                        }
+                        Some(b']') => true,
+                        _ => return Err(self.unexpected(self.at, Expected::CommaOrEndArray)),
+                    }
+                }
+                (false, Within::Start) => {
+                    self.spaces();
+                    self.peek() == Some(b'}')
+                }
+                (false, Within::After) => {
+                    self.spaces();
+                    match self.peek() {
+                        // A comma, then an entry: TOML 1.0 has no trailing comma here.
+                        Some(b',') => {
+                            self.at += 1;
+                            self.spaces();
+                            false
+                        }
+                        Some(b'}') => true,
+                        _ => return Err(self.unexpected(self.at, Expected::CommaOrEndInline)),
+                    }
+                }
+            };
+            if close {
+                self.at += 1;
+                self.doc.nodes.spans_mut()[widen(open)].end = narrow(self.at);
+                self.depth -= 1;
+                if open == top {
+                    return Ok(top);
+                }
+                open = self.enclosing(open);
+                at = Within::After;
+                continue;
+            }
+            let began = match array {
+                true => {
+                    let here = Span { start: narrow(self.at), end: narrow(self.at) };
+                    self.begin(open, Part { text: Text::EMPTY, span: here })?
+                }
+                false => {
+                    let (parent, last) = self.keyval_head(open)?;
+                    self.begin(parent, last)?
+                }
+            };
+            match began {
+                Began::Done(_) => at = Within::After,
+                Began::Opened(id) => {
+                    open = id;
+                    at = Within::Start;
+                }
+            }
+        }
+    }
+
+    /// The array or inline table that `id`, an array or inline table inside another, is
+    /// written in: its parent, past the dotted tables an inline table's keys made.
+    fn enclosing(&self, id: u32) -> u32 {
+        let nodes = &self.doc.nodes;
+        let mut at = nodes.parents()[widen(id)];
+        while nodes.kinds()[widen(at)] == Kind::Table && nodes.origins()[widen(at)] == Origin::Dotted {
+            at = nodes.parents()[widen(at)];
+        }
+        at
+    }
+
+    /// A value's start: a scalar read whole, or an array or inline table opened (its bracket
+    /// eaten, its node added with its span's end still to set).
+    fn begin(&mut self, parent: u32, key: Part) -> Result<Began, Error> {
         let start = self.at;
         let (kind, payload) = match self.peek() {
             Some(b'"') => {
@@ -411,14 +523,26 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
             }
             Some(b't') => (Kind::Bool, self.word("true", 1)?),
             Some(b'f') => (Kind::Bool, self.word("false", 0)?),
-            Some(b'[') => return self.array(parent, key),
-            Some(b'{') => return self.inline(parent, key),
+            Some(open @ (b'[' | b'{')) => {
+                if self.depth == self.limits.most_depth {
+                    return Err(self.err(self.at, What::TooDeep { most: self.limits.most_depth }));
+                }
+                self.depth += 1;
+                let (kind, origin) = match open {
+                    b'[' => (Kind::Array, Origin::Value),
+                    _ => (Kind::Table, Origin::Inline),
+                };
+                let at = narrow(start);
+                let id = self.add(kind, origin, parent, key, Span { start: at, end: at }, 0)?;
+                self.at += 1;
+                return Ok(Began::Opened(id));
+            }
             Some(b'0'..=b'9') if self.is_datetime() => (Kind::Datetime, self.datetime()?),
             Some(b'+' | b'-' | b'0'..=b'9' | b'i' | b'n') => self.number()?,
             _ => return Err(self.unexpected(start, Expected::Value)),
         };
         let span = Span { start: narrow(start), end: narrow(self.at) };
-        self.add(kind, Origin::Value, parent, key, span, payload)
+        self.add(kind, Origin::Value, parent, key, span, payload).map(Began::Done)
     }
 
     fn word(&mut self, word: &'static str, payload: u64) -> Result<u64, Error> {
@@ -431,71 +555,6 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
         Ok(payload)
     }
 
-    fn open(&mut self) -> Result<(), Error> {
-        if self.depth == self.limits.most_depth {
-            return Err(self.err(self.at, What::TooDeep { most: self.limits.most_depth }));
-        }
-        self.depth += 1;
-        Ok(())
-    }
-
-    fn array(&mut self, parent: u32, key: Part) -> Result<u32, Error> {
-        self.open()?;
-        let start = narrow(self.at);
-        let id = self.add(Kind::Array, Origin::Value, parent, key, Span { start, end: start }, 0)?;
-        self.at += 1;
-        loop {
-            self.array_blanks()?;
-            if self.peek() == Some(b']') {
-                self.at += 1;
-                break;
-            }
-            self.value(id, Part { text: Text::EMPTY, span: Span { start: narrow(self.at), end: narrow(self.at) } })?;
-            self.array_blanks()?;
-            match self.peek() {
-                Some(b',') => self.at += 1,
-                Some(b']') => {
-                    self.at += 1;
-                    break;
-                }
-                _ => return Err(self.unexpected(self.at, Expected::CommaOrEndArray)),
-            }
-        }
-        self.doc.nodes.spans_mut()[widen(id)].end = narrow(self.at);
-        self.depth -= 1;
-        Ok(id)
-    }
-
-    /// `{ k = v, ... }` on one line, no trailing comma (TOML 1.0).
-    fn inline(&mut self, parent: u32, key: Part) -> Result<u32, Error> {
-        self.open()?;
-        let start = narrow(self.at);
-        let id = self.add(Kind::Table, Origin::Inline, parent, key, Span { start, end: start }, 0)?;
-        self.at += 1;
-        self.spaces();
-        if self.peek() == Some(b'}') {
-            self.at += 1;
-        } else {
-            loop {
-                self.keyval(id)?;
-                self.spaces();
-                match self.peek() {
-                    Some(b',') => {
-                        self.at += 1;
-                        self.spaces();
-                    }
-                    Some(b'}') => {
-                        self.at += 1;
-                        break;
-                    }
-                    _ => return Err(self.unexpected(self.at, Expected::CommaOrEndInline)),
-                }
-            }
-        }
-        self.doc.nodes.spans_mut()[widen(id)].end = narrow(self.at);
-        self.depth -= 1;
-        Ok(id)
-    }
 
     /// A basic string (`"..."`, or `"""..."""` when `multi`) decoded into the arena.
     fn basic(&mut self, multi: bool) -> Result<Text, Error> {

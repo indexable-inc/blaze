@@ -16,13 +16,12 @@
 //! typically `core`, `alloc` and `std`; every read is noted, and a second definition is a
 //! refusal naming both.
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::column::RecordBytes;
 use crate::crate_graph::slice_field;
@@ -159,15 +158,15 @@ pub const LANG_SCHEMA: SchemaHash =
 
 /// `krate`'s `LangItems` record of `items`, in any order, in `alloc`: equal bytes for every
 /// order.
-pub fn build_lang_items<A: Allocator + Clone>(
+pub fn build_lang_items<'a>(
     krate: CrateItemKey,
     items: &[(LangName, ItemKey)],
-    alloc: A,
-) -> Result<RecordBytes<A>, LangItemsError> {
+    alloc: Alloc<'a>,
+) -> Result<RecordBytes<'a>, LangItemsError> {
     if let Some(&(name, item)) = items.iter().find(|(_, item)| !item.is_of(krate)) {
         return Err(LangItemsError::ForeignItem { krate, name, item });
     }
-    let mut entries: Vec<(LangName, ItemKey), A> = Vec::with_capacity_in(items.len(), alloc.clone());
+    let mut entries: AVec<'a, (LangName, ItemKey)> = AVec::with_capacity_in(items.len(), alloc);
     entries.extend_from_slice(items);
     entries.sort_unstable();
     if let Some(pair) = entries.windows(2).find(|pair| pair[0].0 == pair[1].0) {
@@ -178,7 +177,7 @@ pub fn build_lang_items<A: Allocator + Clone>(
             second: pair[1].1,
         });
     }
-    let mut rows: Vec<LangEntry, A> = Vec::with_capacity_in(entries.len(), alloc.clone());
+    let mut rows: AVec<'a, LangEntry> = AVec::with_capacity_in(entries.len(), alloc);
     rows.extend(entries.iter().map(|&(name, item)| LangEntry { name: name.0, item: item.0 }));
     let mut out = Writer::new_in(LANG_SCHEMA, alloc);
     let entries_at = out.push_slice(&rows);

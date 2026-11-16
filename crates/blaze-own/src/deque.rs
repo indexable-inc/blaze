@@ -24,6 +24,7 @@ use crate::{
     error::{AllocFailure, fail},
     make::CloneIn,
     raw::RawBuf,
+    spec::CloneSlice,
     vec::{Refused, out_of_bounds},
 };
 
@@ -390,18 +391,34 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// Moves every value of `other` to the back of this ring; `other` is left empty with its
     /// capacity.
     pub fn append<B: Allocator>(&mut self, other: &mut VecDeque<T, B>) {
-        let n = other.len;
-        self.reserve(n);
-        for i in 0..n {
-            let from = other.at(other.slot(i));
-            let to = self.at(self.slot(self.len + i));
-            // SAFETY: index `i` of `other` holds a value; index `len + i` of this ring is in its
-            // capacity (reserved) and empty; two buffers.
-            unsafe { ptr::copy_nonoverlapping(from, to, 1) };
-        }
-        self.len += n;
+        self.reserve(other.len);
+        let (front, back) = other.as_slices();
+        let (front, front_len, back, back_len) = (front.as_ptr(), front.len(), back.as_ptr(), back.len());
+        // SAFETY: each run of `other` holds values, which move bitwise into room reserved here,
+        // in another buffer; `other` then counts none of them, so each is owned once.
+        unsafe { self.move_to_back(front, front_len) };
+        // SAFETY: as above, for the second run.
+        unsafe { self.move_to_back(back, back_len) };
         other.len = 0;
         other.head = 0;
+    }
+
+    /// Moves `n` values from `src` to the back, bitwise, in at most two copies (the free room
+    /// may wrap), and counts them.
+    ///
+    /// # Safety
+    ///
+    /// `src` holds `n` values, which the caller then treats as moved; the ring has room for `n`
+    /// more; `src` is not in this ring's buffer.
+    unsafe fn move_to_back(&mut self, src: *const T, n: usize) {
+        let start = self.slot(self.len);
+        let first = n.min(self.buf.capacity() - start);
+        // SAFETY: the free room runs from slot `start` to the end of the buffer, then from slot
+        // 0 up to `head`; `first` values fit the first part, the rest the second.
+        unsafe { ptr::copy_nonoverlapping(src, self.at(start), first) };
+        // SAFETY: as above; `n - first` is 0 when the room did not wrap.
+        unsafe { ptr::copy_nonoverlapping(src.add(first), self.at(0), n - first) };
+        self.len += n;
     }
 
     /// Puts `value` at `index` from the front, moving the values after it back one.
@@ -566,6 +583,9 @@ impl<T, A: Allocator> DoubleEndedIterator for Drain<'_, T, A> {
 }
 
 impl<T, A: Allocator> ExactSizeIterator for Drain<'_, T, A> {}
+
+// SAFETY: `size_hint` is `back - front`, exactly the values left to give.
+unsafe impl<T, A: Allocator> core::iter::TrustedLen for Drain<'_, T, A> {}
 impl<T, A: Allocator> FusedIterator for Drain<'_, T, A> {}
 
 impl<T, A: Allocator> Drop for Drain<'_, T, A> {
@@ -617,9 +637,16 @@ impl<T, A: Allocator> IndexMut<usize> for VecDeque<T, A> {
 
 impl<T: Clone, A: Allocator + Clone> Clone for VecDeque<T, A> {
     /// Allocates from the collection's own allocator: prefer `clone_in`.
+    /// Front first, unwrapped; one block copy per run for `TrivialClone` values.
     fn clone(&self) -> VecDeque<T, A> {
         let mut out = VecDeque::with_capacity_in(self.len, self.allocator().clone());
-        out.extend(self.iter().cloned());
+        let (front, back) = self.as_slices();
+        let base = out.buf.ptr();
+        // SAFETY: `out` is new, its head 0, with room for `len` values from slot 0, apart from
+        // `self`'s buffer; its length counts each clone as it lands.
+        unsafe { <T as CloneSlice>::clone_to(front, base, &mut out.len) };
+        // SAFETY: as above, after the front run.
+        unsafe { <T as CloneSlice>::clone_to(back, base, &mut out.len) };
         out
     }
 }
@@ -633,10 +660,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
         T: CloneIn<B>,
     {
         let mut out = VecDeque::try_with_capacity_in(self.len, alloc.clone())?;
-        for value in self.iter() {
-            // The room is reserved: the push does not allocate.
-            out.push_back(value.try_clone_in(alloc.clone())?);
-        }
+        let (front, back) = self.as_slices();
+        let base = out.buf.ptr();
+        // SAFETY: `out` is new, its head 0, with room for `len` values from slot 0, apart from
+        // `self`'s buffer; its length counts each copy as it lands, so a refusal drops those.
+        unsafe { T::try_clone_slice_in(front, base, &mut out.len, &alloc)? };
+        // SAFETY: as above, after the front run.
+        unsafe { T::try_clone_slice_in(back, base, &mut out.len, &alloc)? };
         Ok(out)
     }
 
@@ -758,6 +788,9 @@ impl<T> DoubleEndedIterator for Iter<'_, T> {
 }
 
 impl<T> ExactSizeIterator for Iter<'_, T> {}
+
+// SAFETY: `size_hint` is the lengths of the two slice runs left, exactly the values left.
+unsafe impl<T> core::iter::TrustedLen for Iter<'_, T> {}
 impl<T> FusedIterator for Iter<'_, T> {}
 
 /// A ring's values by mutable reference, front to back.
@@ -792,6 +825,9 @@ impl<T> DoubleEndedIterator for IterMut<'_, T> {
 }
 
 impl<T> ExactSizeIterator for IterMut<'_, T> {}
+
+// SAFETY: as `Iter`'s.
+unsafe impl<T> core::iter::TrustedLen for IterMut<'_, T> {}
 impl<T> FusedIterator for IterMut<'_, T> {}
 
 /// A ring's values by value, front to back.
@@ -818,4 +854,7 @@ impl<T, A: Allocator> DoubleEndedIterator for IntoIter<T, A> {
 }
 
 impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {}
+
+// SAFETY: `size_hint` is the ring's length, exactly the values its pops give.
+unsafe impl<T, A: Allocator> core::iter::TrustedLen for IntoIter<T, A> {}
 impl<T, A: Allocator> FusedIterator for IntoIter<T, A> {}

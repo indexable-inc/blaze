@@ -2,12 +2,18 @@
 //! and written back byte for byte, and cargo's `tests/testsuite/lockfile_compat.rs` (MIT or
 //! Apache-2.0) ported, with the resolve the resolver would hand over built by hand.
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 use blaze_resolve::lockfile::{self, PathDeps};
-use blaze_resolve::{GitReference, PackageId, Resolve, ResolveVersion, RustVersion, SourceId};
+use blaze_resolve::{
+    GitReference, PackageId, Resolve, ResolveError, ResolveVersion, RustVersion, SourceId,
+};
 use url::Url;
+
+type Result<T> = std::result::Result<T, ResolveError>;
 
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CKSUM: &str = "8e1b9346248cf3391ead604c4407258d327c28e37209f6d56127598165165dda";
@@ -27,7 +33,10 @@ fn path_deps(toml: &lockfile::TomlLockfile) -> PathDeps {
         if pkg.source.is_none() {
             deps.entry(pkg.name.clone())
                 .or_default()
-                .insert(pkg.version.parse().unwrap(), path_source(&pkg.name, &pkg.version));
+                .insert(
+                    blaze_resolve::parse_version(&pkg.version).unwrap(),
+                    path_source(&pkg.name, &pkg.version),
+                );
         }
     }
     deps
@@ -632,8 +641,8 @@ dependencies = [
         let new = foo_bar(Some(CKSUM), ResolveVersion::with_rust_version(Some(&msrv_parsed)));
         let out = write_msrv(new, orig.as_deref(), None, Some(&msrv_parsed)).unwrap();
         let lock = out.or(orig).unwrap();
-        let toml: toml::Table = lock.parse().unwrap();
-        let actual = match toml.get("version").and_then(|v| v.as_integer()) {
+        let toml = blaze_toml::Document::parse_in(&lock, blaze_toml::Limits::CARGO, Global).unwrap();
+        let actual = match toml.root().get("version").and_then(|v| v.as_integer()) {
             Some(v) => v,
             None if lock.contains("\nchecksum = ") => 2,
             None => 1,

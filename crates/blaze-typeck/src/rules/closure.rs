@@ -19,8 +19,7 @@
 //! lowering does not yet say `move`), precise place paths (rustc captures `a.b`, not `a`),
 //! the closure kind (`Fn`/`FnMut`/`FnOnce`, which follows from the captures), and coroutines.
 
-use blaze_own::Vec;
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Vec};
 
 use crate::body::{Expr, Pat, Stmt, UnOp};
 use crate::columns::CaptureKind;
@@ -71,7 +70,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let written = self.body.opt_type_list(param_tys)?;
             let expected = self.deduce_sig(f.expect)?;
             let arity_ok = expected.is_some_and(|(l, _)| self.ty.list_len(l) as usize == pats.len());
-            let mut inputs: Vec<Ty, A> = Vec::with_capacity_in(pats.len() + 1, self.alloc.clone());
+            let mut inputs: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(pats.len() + 1, self.alloc);
             for i in 0..pats.len() {
                 let exp = match expected {
                     Some((l, _)) if arity_ok => Some(self.ty.list_get(l, i as u32)),
@@ -121,9 +120,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `closure_analyze`: the captures of every closure, innermost first as the walk met them.
     pub(crate) fn analyze_closures(&mut self) -> Result<(), Stop> {
-        let mut bound: Vec<bool, A> = Vec::with_capacity_in(self.body.pats.len(), self.alloc.clone());
-        let mut exprs: Vec<(ExprId, u8), A> = Vec::new_in(self.alloc.clone());
-        let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut bound: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.pats.len(), self.alloc);
+        let mut exprs: Vec<(ExprId, u8), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut pats: Vec<PatId, Alloc<'a>> = Vec::new_in(self.alloc);
         for ci in 0..self.closures.len() {
             let closure = self.closures[ci].expr;
             let Expr::Closure { params, body, .. } = self.body.expr(closure)? else { continue };
@@ -156,9 +155,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         closure: ExprId,
         x: ExprId,
         usage: u8,
-        exprs: &mut Vec<(ExprId, u8), A>,
-        pats: &mut Vec<PatId, A>,
-        bound: &mut Vec<bool, A>,
+        exprs: &mut Vec<(ExprId, u8), Alloc<'a>>,
+        pats: &mut Vec<PatId, Alloc<'a>>,
+        bound: &mut Vec<bool, Alloc<'a>>,
     ) -> Result<(), Stop> {
         let bv = self.body;
         let el = |l: List| bv.expr_list(l);
@@ -284,7 +283,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// Marks every binding under the patterns in `stack` as bound (the stack is consumed).
-    fn mark_bound(&self, stack: &mut Vec<PatId, A>, bound: &mut Vec<bool, A>) -> Result<(), Stop> {
+    fn mark_bound(&self, stack: &mut Vec<PatId, Alloc<'a>>, bound: &mut Vec<bool, Alloc<'a>>) -> Result<(), Stop> {
         let mut steps = 0usize;
         while let Some(p) = stack.pop() {
             steps += 1;

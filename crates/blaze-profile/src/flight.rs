@@ -5035,11 +5035,11 @@ mod tests {
 
     /// The next message on `rx`, or `None` once its senders are gone; past [`WAIT`] the test
     /// fails naming `what` it waited for.
-    fn heard<T>(rx: &crossbeam_channel::Receiver<T>, what: &str) -> Option<T> {
+    fn heard<T>(rx: &blaze_core::chan::Receiver<T>, what: &str) -> Option<T> {
         match rx.recv_timeout(WAIT) {
             Ok(it) => Some(it),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err(blaze_core::chan::RecvTimeoutError::Disconnected) => None,
+            Err(blaze_core::chan::RecvTimeoutError::Timeout) => {
                 panic!("waited {WAIT:?} for {what}")
             }
         }
@@ -5323,16 +5323,16 @@ mod tests {
         let flights: &'static Flights<u32> = Box::leak(Box::new(Flights::new()));
         let key = Key([0x5a; 32]);
         let named = |it: &mut String| it.push_str("slow_query(of_square)");
-        let (started, has_started) = crossbeam_channel::unbounded();
+        let (started, has_started) = blaze_core::chan::unbounded();
         // The two threads' ends each lock the scheduler their wait joined: the asker ends once
         // the run's end let go of it, and the runner once the asker ended, so neither waits on
         // the other's lock.
-        let (ran_out, has_ran_out) = crossbeam_channel::unbounded();
-        let (asked_out, has_asked_out) = crossbeam_channel::unbounded::<()>();
+        let (ran_out, has_ran_out) = blaze_core::chan::unbounded();
+        let (asked_out, has_asked_out) = blaze_core::chan::unbounded::<()>();
         // The run goes on for 300 ms from the moment the asker is about to ask, however late
         // its thread starts: on a loaded machine the asker began 230 ms into a run that slept
         // 300 ms from its own start, and its wait was 68 ms.
-        let (asking_now, is_asking) = crossbeam_channel::unbounded::<()>();
+        let (asking_now, is_asking) = blaze_core::chan::unbounded::<()>();
         let runner = std::thread::spawn(move || {
             let got = flights.get_or_run_named(key, named, || {
                 started.send(()).unwrap();
@@ -5416,11 +5416,11 @@ mod tests {
         crate::install();
         let flights: &'static Flights<u32> = Box::leak(Box::new(Flights::new()));
         let key = Key([0x6b; 32]);
-        let (held, has_held) = crossbeam_channel::unbounded();
+        let (held, has_held) = blaze_core::chan::unbounded();
         // As in the test above: the waiter ends once the hold's end let go of the scheduler
         // their wait joined, and the holder once the waiter ended.
-        let (ended, has_ended) = crossbeam_channel::unbounded();
-        let (waited, has_waited) = crossbeam_channel::unbounded::<()>();
+        let (ended, has_ended) = blaze_core::chan::unbounded();
+        let (waited, has_waited) = blaze_core::chan::unbounded::<()>();
         let holder = std::thread::spawn(move || {
             let hold = flights
                 .hold_named(key, |it| it.push_str("codegen round 3 of app"))
@@ -5532,7 +5532,7 @@ mod tests {
         let passed = || left.lease.load(Ordering::Relaxed) != lease;
         // Threads take the lowest free ring: start them, each holding its ring, until the ring
         // the maker left is held by another thread (one of these, or another test's).
-        let (took, taken) = crossbeam_channel::unbounded::<u16>();
+        let (took, taken) = blaze_core::chan::unbounded::<u16>();
         // alloc: a test's threads
         let mut holders = Vec::new();
         let mut taker = None;
@@ -5541,7 +5541,7 @@ mod tests {
                 break;
             }
             let took = took.clone();
-            let (to_close, close) = crossbeam_channel::bounded::<Option<blaze_trace::Span>>(1);
+            let (to_close, close) = blaze_core::chan::bounded::<Option<blaze_trace::Span>>(1);
             holders.push((
                 to_close,
                 std::thread::spawn(move || {
@@ -5816,9 +5816,9 @@ mod tests {
         let key = Key([0x7c; 32]);
         let named = |it: &mut String| it.push_str("job span test key");
         let since = clock::mono_ns();
-        let (started, has_started) = crossbeam_channel::unbounded();
-        let (first, first_done) = crossbeam_channel::unbounded();
-        let (second, second_done) = crossbeam_channel::unbounded();
+        let (started, has_started) = blaze_core::chan::unbounded();
+        let (first, first_done) = blaze_core::chan::unbounded();
+        let (second, second_done) = blaze_core::chan::unbounded();
         pool.submit(
             None,
             move || {
@@ -6033,7 +6033,7 @@ mod tests {
 
         crate::install();
         let pool = Pool::new(&Topology::flat(1), false).expect("the pool starts");
-        let (done, ran) = crossbeam_channel::bounded(1);
+        let (done, ran) = blaze_core::chan::bounded(1);
         let giver = blaze_trace::info_span!(target: "blaze", "creator test giver").entered();
         let creator = giver.id().unwrap().into_u64();
         pool.submit(None, tid, move |on| done.send(on.unwrap()).unwrap());
@@ -6086,7 +6086,7 @@ mod tests {
         build: u32,
         flights: blaze_graph::pump::Flights<u32>,
         pool: std::sync::Weak<blaze_graph::pool::Pool>,
-        done: crossbeam_channel::Sender<(usize, bool)>,
+        done: blaze_core::chan::Sender<(usize, bool)>,
     }
 
     /// Gives `job` to `pool`: called with the test's handle for the root, and with a parent
@@ -6198,7 +6198,7 @@ mod tests {
         let tree = tree(tape);
         let jobs = tree.parent.len();
         let build = BUILDS.fetch_add(1, Ordering::Relaxed);
-        let (done, finished) = crossbeam_channel::unbounded();
+        let (done, finished) = blaze_core::chan::unbounded();
         let case = Case {
             tree,
             build,
@@ -6417,8 +6417,8 @@ mod tests {
     fn a_span_read_before_its_threads_next_boundary_waits_for_it_and_is_never_read_uncounted() {
         crate::install();
         _ = count_cpu(test_cpu);
-        let (ready, is_ready) = crossbeam_channel::bounded(0);
-        let (read_once, has_read) = crossbeam_channel::bounded(0);
+        let (ready, is_ready) = blaze_core::chan::bounded(0);
+        let (read_once, has_read) = blaze_core::chan::bounded(0);
         let mut cursor = Cursor::default();
         let mut first = Read::default();
         self::read(&mut cursor, &mut first);

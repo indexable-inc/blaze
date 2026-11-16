@@ -45,11 +45,13 @@ impl fmt::Display for ConditionError {
                 write!(f, "an item reads more than {MOST_ATOMS} cfg variables (at variable {var})")
             }
             ConditionError::UnknownVar { var } => write!(f, "cfg variable {var} is not in the request's space"),
-            ConditionError::OverCap { conditions, vars } => write!(
-                f,
-                "an item forks into {conditions} configurations, past {MOST_CONDITIONS} (bottom.md 11): it reads {:?}",
-                vars.vars()
-            ),
+            ConditionError::OverCap { conditions, vars } => {
+                write!(f, "an item forks into {conditions} configurations, past {MOST_CONDITIONS} (bottom.md 11): it reads")?;
+                for var in vars.vars() {
+                    write!(f, " {var}")?;
+                }
+                Ok(())
+            }
         }
     }
 }

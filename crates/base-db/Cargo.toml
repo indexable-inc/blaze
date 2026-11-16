@@ -24,7 +24,6 @@ blaze-memo.workspace = true
 blaze-surface.workspace = true
 cfg.workspace = true
 intern.workspace = true
-semver.workspace = true
 span.workspace = true
 syntax.workspace = true
 

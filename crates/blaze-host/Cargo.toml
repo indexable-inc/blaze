@@ -27,7 +27,7 @@ blaze-keyed.workspace = true
 # `FILE_DOMAIN`, a file's content id, and `racy`, when a stamp vouches for nothing.
 blaze-vfs.workspace = true
 # `SegQueue`: the finished tasks, pushed by workers and taken by the request's thread.
-crossbeam-queue.workspace = true
+blaze-queue.workspace = true
 # The spans every wait opens.
 blaze-trace.workspace = true
 

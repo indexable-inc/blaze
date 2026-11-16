@@ -1624,7 +1624,7 @@ mod tests {
         let pool = Pool::new(&Topology::flat(1), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         let run = |what: &'static str, f: Box<dyn FnOnce() + Send>| {
-            let (tx, rx) = crossbeam_channel::unbounded::<Result<(), String>>();
+            let (tx, rx) = blaze_core::chan::unbounded::<Result<(), String>>();
             pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
             rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the pool said its job ended").unwrap();
         };
@@ -1635,7 +1635,7 @@ mod tests {
                 bytes[4] = 2;
                 Key(bytes)
             });
-            let (tx, rx) = crossbeam_channel::unbounded::<Result<u32, String>>();
+            let (tx, rx) = blaze_core::chan::unbounded::<Result<u32, String>>();
             let waiting = Arc::new(AtomicUsize::new(0));
             let order = Arc::new(Lock::new("test.def.persist.resume_order", Vec::new()));
             let parked = |count: usize| {

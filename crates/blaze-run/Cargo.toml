@@ -28,6 +28,8 @@ blaze-hash.workspace = true
 [dev-dependencies]
 # `check` and `control`: every machine's simulation and its planted-bug controls.
 blaze-sim.workspace = true
+# `Alloc::global()`, the handle the simulations hand every machine.
+blaze-own = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

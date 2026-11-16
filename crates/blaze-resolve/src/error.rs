@@ -186,6 +186,12 @@ impl From<Unfinished> for ResolveError {
     }
 }
 
+// Callers box it into errors that cross threads.
+const _: () = {
+    const fn send_sync<T: Send + Sync + 'static>() {}
+    send_sync::<ResolveError>();
+};
+
 impl ResolveError {
     /// The packages from the one whose requirements could not be met up to the root, for an
     /// unresolvable graph; empty otherwise.

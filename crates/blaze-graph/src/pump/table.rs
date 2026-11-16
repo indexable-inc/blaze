@@ -22,7 +22,7 @@
 
 use std::{cell::UnsafeCell, iter, marker::PhantomData, mem, ptr};
 
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 use super::Lock;
 use crate::{

@@ -1,5 +1,4 @@
-use arrow_array::{Array, cast::AsArray, types};
-use arrow_schema::DataType;
+use blaze_columns::{Scalar, Type};
 
 use super::*;
 
@@ -139,33 +138,29 @@ enum Cell {
 }
 
 /// An answer's column names and rows.
-fn cells_of(batches: &[RecordBatch]) -> (Vec<String>, Vec<Vec<Cell>>) {
+fn cells_of(batches: &[Batch]) -> (Vec<String>, Vec<Vec<Cell>>) {
     let Some(first) = batches.first() else { return (Vec::new(), Vec::new()) };
-    let names = first.schema().fields().iter().map(|it| it.name().to_owned()).collect();
+    let names = first.fields().iter().map(|it| it.name().to_owned()).collect();
     let mut rows = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {
-            rows.push(batch.columns().iter().map(|column| cell(column.as_ref(), row)).collect());
+            rows.push(batch.columns().iter().map(|column| cell(column, row)).collect());
         }
     }
     (names, rows)
 }
 
-fn cell(column: &dyn Array, row: usize) -> Cell {
+fn cell(column: &Column, row: usize) -> Cell {
     if column.is_null(row) {
         return Cell::Null;
     }
-    match column.data_type() {
-        DataType::Int32 => Cell::Int(column.as_primitive::<types::Int32Type>().value(row).into()),
-        DataType::Int64 => Cell::Int(column.as_primitive::<types::Int64Type>().value(row).into()),
-        DataType::UInt64 => Cell::Int(column.as_primitive::<types::UInt64Type>().value(row).into()),
-        DataType::Float64 => {
-            Cell::Float(column.as_primitive::<types::Float64Type>().value(row).to_bits())
+    match column.ty() {
+        Type::One(Scalar::F64) => Cell::Float(column.float(row).expect("a double").to_bits()),
+        Type::One(Scalar::Text | Scalar::Dict) => Cell::Text(column.text(row).expect("a text").to_owned()),
+        Type::One(Scalar::I32 | Scalar::I64 | Scalar::U16 | Scalar::U32 | Scalar::U64) => {
+            Cell::Int(column.int(row).expect("an int"))
         }
-        DataType::Utf8 => Cell::Text(column.as_string::<i32>().value(row).to_owned()),
-        DataType::LargeUtf8 => Cell::Text(column.as_string::<i64>().value(row).to_owned()),
-        DataType::Utf8View => Cell::Text(column.as_string_view().value(row).to_owned()),
-        other => panic!("an answer's column of type {other}"),
+        other => panic!("an answer's column of type {other:?}"),
     }
 }
 
@@ -176,7 +171,7 @@ fn cell(column: &dyn Array, row: usize) -> Cell {
 const FIXTURE: &str = "\
 COPY (SELECT * FROM (VALUES (1::UBIGINT, 0::BIGINT, 300000000000::BIGINT, 'ok', '/work', 'build'), \
     (2, 400000000000, 100000000000, 'ok', '/work', 'build'), (2, 400000000000, NULL, 'running', '/work', 'build')) \
-    AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000001.builds.parquet';
+    AS t(build_id, started_ns, dur_ns, outcome, workspace, command)) TO '{d}/1-00000001.builds.parquet' (FORMAT parquet, COMPRESSION uncompressed);
 COPY (SELECT * FROM (VALUES \
     (1::UBIGINT, 7::UINTEGER, 'footprint bytes', 0::BIGINT, 2147483648.0::DOUBLE), \
     (1, 7, 'footprint bytes', 60000000000, 5368709120.0), \
@@ -205,7 +200,7 @@ COPY (SELECT * FROM (VALUES \
     (NULL, 7, 'footprint bytes', 470000000000, 2147483648.0), \
     (NULL, 7, 'allocator kept bytes', 470000000000, 268435456.0), \
     (NULL, 7, 'footprint bytes', 600000000000, 8589934592.0)) \
-    AS t(build_id, process, name, t_ns, value)) TO '{d}/1-00000001.counters.parquet';
+    AS t(build_id, process, name, t_ns, value)) TO '{d}/1-00000001.counters.parquet' (FORMAT parquet, COMPRESSION uncompressed);
 COPY (SELECT * FROM (VALUES \
     (1::UBIGINT, 7::UINTEGER, 1::UINTEGER, 2::UBIGINT, NULL::UBIGINT, 0::USMALLINT, 'task', 1000000000::BIGINT, 25000000000::BIGINT, \
         'codegen', 'tokio', 'lib', 2147483648::UBIGINT, 3221225472::UBIGINT, 5368709120::UBIGINT, 4294967296::UBIGINT, NULL::VARCHAR), \
@@ -221,20 +216,20 @@ COPY (SELECT * FROM (VALUES \
     (NULL, 7, 1, 22, NULL, 0, 'memory give-back plan', 300000000000, 2000000, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'late'), \
     (2, 7, 1, 23, NULL, 0, 'kept front ends let go for memory', 450000000000, 3000000, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'what=front end')) \
     AS t(build_id, process, thread, span_id, parent, depth, name, start_ns, dur_ns, function, crate, unit, \
-        peak_bytes, granted_bytes, heap_allocated_bytes, heap_freed_bytes, fields)) TO '{d}/1-00000001.spans.parquet';
+        peak_bytes, granted_bytes, heap_allocated_bytes, heap_freed_bytes, fields)) TO '{d}/1-00000001.spans.parquet' (FORMAT parquet, COMPRESSION uncompressed);
 COPY (SELECT * FROM (VALUES \
     (1::UBIGINT, 7::UINTEGER, 1::UINTEGER, 0::BIGINT, 4194304::UBIGINT, 'query', 10::UBIGINT, 'a'), \
     (1, 7, 1, 1, 4194304, 'mir', 11, 'a'), \
     (1, 7, 1, 2, 8388608, NULL, 7, NULL), \
     (1, 7, 1, 3, 8388608, 'query', 1, 'b'), \
     (2, 7, 1, 450000000000, 1073741824, 'query', 1, 'c')) \
-    AS t(build_id, process, thread, t_ns, bytes, tag, block_bytes, site)) TO '{d}/1-00000001.alloc_samples.parquet';
+    AS t(build_id, process, thread, t_ns, bytes, tag, block_bytes, site)) TO '{d}/1-00000001.alloc_samples.parquet' (FORMAT parquet, COMPRESSION uncompressed);
 COPY (SELECT * FROM (VALUES \
     (1::UBIGINT, 7::UINTEGER, 1::UINTEGER, 10000000000::BIGINT, 1073741824::UBIGINT, 'query', 100::UBIGINT, 'x', 50000000000::BIGINT), \
     (NULL, 7, 1, 20000000000, 1073741824, NULL, 101, 'x', 50000000000), \
     (1, 8, 1, 40000000000, 3221225472, 'mir', 7, 'y', 50000000000), \
     (1, 7, 1, 10000000000, 9663676416, 'query', 9, 'z', 130000000000)) \
-    AS t(build_id, process, thread, t_ns, bytes, tag, block_bytes, site, read_ns)) TO '{d}/1-00000001.held_samples.parquet';
+    AS t(build_id, process, thread, t_ns, bytes, tag, block_bytes, site, read_ns)) TO '{d}/1-00000001.held_samples.parquet' (FORMAT parquet, COMPRESSION uncompressed);
 ";
 
 /// The invariant: each part of `blaze explain memory`, answered without DuckDB, is its view's

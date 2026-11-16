@@ -2,7 +2,7 @@
 //! `src/util/canonical_url.rs` and `cargo-util-schemas`' `core/source_kind.rs` of cargo 1.99.0
 //! (5f94df4789).
 
-use blaze_ids::{ContentId, Domain, Interner, Sharded};
+use blaze_ids::{ContentId, Domain, Interner, Shards, Sharded};
 use blaze_semver::{Limits, Version};
 use std::alloc::Global;
 use std::cmp::{self, Ordering};
@@ -272,7 +272,7 @@ static REGISTRY_NAMES: std::sync::OnceLock<Sharded<KeyOf>> = std::sync::OnceLock
 static REGISTRY_NAME: Domain = Domain::new("blaze-source registry name 1");
 
 fn registry_names() -> &'static Sharded<KeyOf> {
-    REGISTRY_NAMES.get_or_init(Sharded::new)
+    REGISTRY_NAMES.get_or_init(|| Sharded::new(Shards::for_this_machine()))
 }
 
 /// The key of a registry in [`REGISTRY_NAMES`]. `std` hashing is only ever compared within
@@ -393,7 +393,7 @@ impl SourceId {
     }
 
     fn wrap(inner: SourceIdInner) -> SourceId {
-        let ids = SOURCE_IDS.get_or_init(Sharded::new);
+        let ids = SOURCE_IDS.get_or_init(|| Sharded::new(Shards::for_this_machine()));
         let mut hasher = blaze_ids::Hasher::of(&SOURCE_ID);
         hasher.std(&inner);
         let at = ids.intern(hasher.finish(), || inner);

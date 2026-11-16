@@ -2131,7 +2131,7 @@ fn pool_a_producer_and_a_consumer_move_batches_and_reuse_descriptors() {
     const ROUNDS: u64 = 400;
     const EACH: u64 = 1000;
     let pool = Pool::<u64>::new(1 << 20, Tag::Io).expect("reserve");
-    let (send, take) = crossbeam_channel::bounded::<Vec<pool::Pooled<'_, u64>>>(4);
+    let (send, take) = std::sync::mpsc::sync_channel::<Vec<pool::Pooled<'_, u64>>>(4);
     thread::scope(|scope| {
         let pool = &pool;
         scope.spawn(move || {

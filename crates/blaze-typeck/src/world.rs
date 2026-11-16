@@ -257,27 +257,27 @@ pub trait World {
 /// The read list: each question asked and the content hash of its answer, sorted by question
 /// and deduplicated at the end of the run. A lookup scans the question column only.
 #[derive(Clone)]
-pub struct ReadList<A: Allocator + Clone> {
-    pub rows: Soa<(Question, u64), A>,
+pub struct ReadList<'a> {
+    pub rows: Soa<(Question, u64), Alloc<'a>>,
 }
 
 columns_eq!(Needs { questions });
 
-impl<A: Allocator + Clone> PartialEq for ReadList<A> {
-    fn eq(&self, other: &ReadList<A>) -> bool {
+impl<'a> PartialEq for ReadList<'a> {
+    fn eq(&self, other: &ReadList<'a>) -> bool {
         self.rows.column::<0>() == other.rows.column::<0>() && self.rows.column::<1>() == other.rows.column::<1>()
     }
 }
 
-impl<A: Allocator + Clone> Eq for ReadList<A> {}
+impl<'a> Eq for ReadList<'a> {}
 
-impl<A: Allocator + Clone> core::fmt::Debug for ReadList<A> {
+impl<'a> core::fmt::Debug for ReadList<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ReadList").field("rows", &self.rows).finish()
     }
 }
 
-impl<A: Allocator + Clone> ReadList<A> {
+impl<'a> ReadList<'a> {
     /// The questions read, sorted.
     pub fn questions(&self) -> &[Question] {
         self.rows.column::<0>()
@@ -299,11 +299,11 @@ impl<A: Allocator + Clone> ReadList<A> {
 
 /// The questions a check needed: what the next check of the body fetches up front.
 #[derive(Clone)]
-pub struct Needs<A: Allocator + Clone> {
-    pub questions: Vec<Question, A>,
+pub struct Needs<'a> {
+    pub questions: Vec<Question, Alloc<'a>>,
 }
 
-impl<A: Allocator + Clone> Needs<A> {
+impl<'a> Needs<'a> {
     /// No needs.
     pub fn new_in(alloc: Alloc<'a>) -> Needs<'a> {
         Needs { questions: Vec::new_in(alloc) }
@@ -313,7 +313,7 @@ impl<A: Allocator + Clone> Needs<A> {
 /// The recorder: owns the world's borrow and the read list. The only caller of `World`.
 pub struct Reads<'w, 'a, W: World> {
     world: &'w W,
-    entries: Vec<(Question, u64), A>,
+    entries: Vec<(Question, u64), Alloc<'a>>,
 }
 
 fn hash_of(domain: &str, v: &impl ContentHash) -> u64 {

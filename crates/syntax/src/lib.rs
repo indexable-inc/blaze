@@ -538,11 +538,11 @@ impl<T> Drop for Parse<T> {
         let Some(tree) = self.tree.take().and_then(Tree::into_unique) else {
             return;
         };
-        static PARSE_DROP_THREAD: std::sync::OnceLock<crossbeam_channel::Sender<FlatTree>> =
+        static PARSE_DROP_THREAD: std::sync::OnceLock<blaze_core::chan::Sender<FlatTree>> =
             std::sync::OnceLock::new();
         PARSE_DROP_THREAD
             .get_or_init(|| {
-                let (sender, receiver) = crossbeam_channel::unbounded::<FlatTree>();
+                let (sender, receiver) = blaze_core::chan::unbounded::<FlatTree>();
                 std::thread::Builder::new()
                     .name("ParseNodeDropper".to_owned())
                     .spawn(move || {

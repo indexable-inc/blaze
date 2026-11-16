@@ -5,10 +5,13 @@
 //!
 //! `cargo run --release -p blaze-own --example alloc_cost`
 //!
+//! Then the fast paths of `blaze_own::spec`, each against the generic way (values behind a
+//! wrapper that is not `TrivialClone`, an iterator behind one that is not `TrustedLen`).
+//!
 //! The handles pass through `black_box`, so the compiler cannot see which table they point at
 //! and every call is the indirect call a function taking `Alloc<'_>` makes.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 use std::{
     alloc::{AllocError, Allocator, Global, Layout},
@@ -18,7 +21,7 @@ use std::{
     time::Instant,
 };
 
-use blaze_own::{Alloc, Box, Erased, Vec};
+use blaze_own::{Alloc, AllocFailure, Box, CloneIn, CollectIn, Erased, Soa, Vec, VecDeque};
 
 /// A bump allocator over one buffer, like a task's frame: the newest block is freed, grown and
 /// shrunk in place; older frees wait for `reset`.
@@ -148,6 +151,158 @@ fn per_box<A: Allocator + Copy, const BYTES: usize>(alloc: A) -> f64 {
     start.elapsed().as_nanos() as f64 / BOXES as f64
 }
 
+/// A value as it is, but not `TrivialClone`, so the collections take it the generic way.
+#[derive(Clone, PartialEq)]
+struct Plain<T>(T);
+
+impl<T: Clone, B: Allocator> CloneIn<B> for Plain<T> {
+    type In = Plain<T>;
+
+    fn try_clone_in(&self, _alloc: B) -> Result<Plain<T>, AllocFailure> {
+        Ok(self.clone())
+    }
+}
+
+/// An iterator as it is, but not `TrustedLen`.
+struct Hidden<I>(I);
+
+impl<I: Iterator> Iterator for Hidden<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+/// Values per call in the fast-path table.
+const VALUES: usize = 4096;
+/// Calls per measurement in the fast-path table.
+const CALLS: usize = 4096;
+
+/// Nanoseconds per value: `CALLS` calls of `call`, each over `VALUES` values.
+#[inline(never)]
+fn per_value(call: impl Fn()) -> f64 {
+    let start = Instant::now();
+    for _ in 0..CALLS {
+        call();
+    }
+    start.elapsed().as_nanos() as f64 / (CALLS * VALUES) as f64
+}
+
+/// The fast paths of `blaze_own::spec` against the generic way, which `Plain` and `Hidden` force.
+fn fast_paths() {
+    let words: std::vec::Vec<u32> = (0..VALUES as u32).collect();
+    let plain_words: std::vec::Vec<Plain<u32>> = words.iter().copied().map(Plain).collect();
+    let bytes = std::vec![7u8; VALUES];
+    let plain_bytes: std::vec::Vec<Plain<u8>> = bytes.iter().copied().map(Plain).collect();
+    let fast_vec = Vec::from_slice_in(&words, Global);
+    let plain_vec = Vec::from_slice_in(&plain_words, Global);
+    let byte_vec = Vec::from_slice_in(&bytes, Global);
+    let plain_byte_vec = Vec::from_slice_in(&plain_bytes, Global);
+    let mut fast_rows: Soa<(u8, u32), Global> = Soa::new_in(Global);
+    let mut plain_rows: Soa<(Plain<u8>, u32), Global> = Soa::new_in(Global);
+    for k in 0..VALUES {
+        fast_rows.push((k as u8, k as u32));
+        plain_rows.push((Plain(k as u8), k as u32));
+    }
+
+    println!();
+    println!("ns per value, fast path against the generic way ({VALUES} values a call, Global)");
+    println!("{:>34} {:>10} {:>10}", "path", "fast", "generic");
+    let row = |path: &str, fast: f64, generic: f64| println!("{path:>34} {fast:>10.3} {generic:>10.3}");
+    // Reused across calls, so the extends measure the copy, not the allocation.
+    let into = std::cell::RefCell::new(Vec::with_capacity_in(VALUES, Global));
+    let plain_into = std::cell::RefCell::new(Vec::with_capacity_in(VALUES, Global));
+    row(
+        "extend_from_slice, u32",
+        best(|| per_value(|| {
+            let mut v = into.borrow_mut();
+            v.clear();
+            v.extend_from_slice(black_box(&words));
+            black_box(v.as_slice());
+        })),
+        best(|| per_value(|| {
+            let mut v = plain_into.borrow_mut();
+            v.clear();
+            v.extend_from_slice(black_box(&plain_words));
+            black_box(v.as_slice());
+        })),
+    );
+    row(
+        "extend(&[T]), u32",
+        best(|| per_value(|| {
+            let mut v = into.borrow_mut();
+            v.clear();
+            v.extend(black_box(&words).iter());
+            black_box(v.as_slice());
+        })),
+        best(|| per_value(|| {
+            let mut v = into.borrow_mut();
+            v.clear();
+            v.extend(Hidden(black_box(&words).iter()));
+            black_box(v.as_slice());
+        })),
+    );
+    row(
+        "insert_many at 0 of 4096, u32",
+        best(|| per_value(|| {
+            let mut v = into.borrow_mut();
+            v.clear();
+            v.insert_many(0, black_box(&words));
+            black_box(v.as_slice());
+        })),
+        best(|| per_value(|| {
+            let mut v = plain_into.borrow_mut();
+            v.clear();
+            v.insert_many(0, black_box(&plain_words));
+            black_box(v.as_slice());
+        })),
+    );
+    row(
+        "clone_in (alloc + copy), u32",
+        best(|| per_value(|| drop(black_box(black_box(&fast_vec).clone_in(Global))))),
+        best(|| per_value(|| drop(black_box(black_box(&plain_vec).clone_in(Global))))),
+    );
+    row(
+        "collect_in from map(range), u32",
+        best(|| per_value(|| drop(black_box((0..black_box(VALUES) as u32).map(|i| i * 3).collect_in(Global))))),
+        best(|| per_value(|| drop(black_box(Hidden((0..black_box(VALUES) as u32).map(|i| i * 3)).collect_in(Global))))),
+    );
+    row(
+        "position of an absent byte",
+        best(|| per_value(|| drop(black_box(black_box(&byte_vec).position(&3))))),
+        best(|| per_value(|| drop(black_box(black_box(&plain_byte_vec).position(&Plain(3)))))),
+    );
+    row(
+        "Soa<(u8, u32)> clone_in",
+        best(|| per_value(|| drop(black_box(black_box(&fast_rows).clone_in(Global))))),
+        best(|| per_value(|| drop(black_box(black_box(&plain_rows).clone_in(Global))))),
+    );
+    let ring = std::cell::RefCell::new((VecDeque::with_capacity_in(VALUES, Global), VecDeque::with_capacity_in(VALUES, Global)));
+    ring.borrow_mut().0.extend(words.iter().copied());
+    row(
+        "VecDeque append (runs vs per value)",
+        best(|| per_value(|| {
+            let (a, b) = &mut *ring.borrow_mut();
+            b.append(a);
+            core::mem::swap(a, b);
+            black_box(&*a);
+        })),
+        best(|| per_value(|| {
+            let (a, b) = &mut *ring.borrow_mut();
+            while let Some(value) = a.pop_front() {
+                b.push_back(value);
+            }
+            core::mem::swap(a, b);
+            black_box(&*a);
+        })),
+    );
+}
+
 /// The best of three runs of `measure`, after one to warm up.
 fn best(measure: impl Fn() -> f64) -> f64 {
     measure();
@@ -201,4 +356,6 @@ fn main() {
         best(|| per_box::<_, 1024>(global_handle)),
     ]);
     bump.reset();
+
+    fast_paths();
 }

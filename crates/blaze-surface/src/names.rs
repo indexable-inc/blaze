@@ -2,12 +2,11 @@
 //! names need"): [`TextualEntry`] and [`ModuleFile`]; the crate root
 //! ([`crate::CrateRootBuilder`]) and [`crate::MacroDef`] are in their own modules.
 
-use core::alloc::Allocator;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Slice, Writer};
 use blaze_id::{ContentId, ItemKey};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::column::{
     Column, RecordBytes, Strings, Text, check_increasing, check_text, finish_with, index_of,
@@ -36,21 +35,16 @@ blaze_format::record! {
 /// The writer of a module's [`TextualEntry`]: the `macro_rules!` scope at the module's `mod`
 /// line, with the macros of earlier `#[macro_use]` siblings, in textual order. The order is the
 /// source's, so it fixes the bytes; a later definition of a name shadows an earlier one.
-pub struct TextualEntry<A: Allocator + Clone> {
+pub struct TextualEntry<'a> {
     module: ItemKey,
-    rows: Vec<MacroRow, A>,
-    staging: Strings<A>,
-    alloc: A,
+    rows: AVec<'a, MacroRow>,
+    staging: Strings<'a>,
+    alloc: Alloc<'a>,
 }
 
-impl<A: Allocator + Clone> TextualEntry<A> {
-    pub fn new_in(module: ItemKey, alloc: A) -> TextualEntry<A> {
-        TextualEntry {
-            module,
-            rows: Vec::new_in(alloc.clone()),
-            staging: Strings::new_in(alloc.clone()),
-            alloc,
-        }
+impl<'a> TextualEntry<'a> {
+    pub fn new_in(module: ItemKey, alloc: Alloc<'a>) -> TextualEntry<'a> {
+        TextualEntry { module, rows: AVec::new_in(alloc), staging: Strings::new_in(alloc), alloc }
     }
 
     /// The next `macro_rules!` in textual order: its name and its [`crate::MacroDef`]'s item.
@@ -60,13 +54,13 @@ impl<A: Allocator + Clone> TextualEntry<A> {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<RecordBytes<A>, BuildError> {
-        let mut strings = Strings::new_in(self.alloc.clone());
+    pub fn finish(mut self) -> Result<RecordBytes<'a>, BuildError> {
+        let mut strings = Strings::new_in(self.alloc);
         for row in &mut self.rows {
             row.name = strings.moved(&self.staging, row.name, "TextualEntry strings")?;
         }
         let mut out =
-            Writer::new_in(<TextualEntryRoot as blaze_format::Record>::SCHEMA, self.alloc.clone());
+            Writer::new_in(<TextualEntryRoot as blaze_format::Record>::SCHEMA, self.alloc);
         let text = Column::push(&mut out, strings.bytes());
         let macros = Column::push(&mut out, &self.rows);
         Ok(finish_with(out, |at| TextualEntryRoot {
@@ -132,17 +126,17 @@ blaze_format::record! {
 /// The writer of a module's [`ModuleFile`]: which file holds its items, and the candidate paths
 /// read and found absent (`foo.rs` against `foo/mod.rs`), so a file added at one of them moves
 /// the record's read list.
-pub struct ModuleFile<A: Allocator + Clone> {
+pub struct ModuleFile<'a> {
     module: ItemKey,
     file: ContentId,
     path: Text,
     inline: Option<ItemIndex>,
-    absent: Vec<Text, A>,
-    staging: Strings<A>,
-    alloc: A,
+    absent: AVec<'a, Text>,
+    staging: Strings<'a>,
+    alloc: Alloc<'a>,
 }
 
-impl<A: Allocator + Clone> ModuleFile<A> {
+impl<'a> ModuleFile<'a> {
     /// The module `module` is in the file of content `file` at `path`, relative to the crate's
     /// root directory with `/` between its parts (rule 25: never absolute). `inline` is the
     /// `mod name { .. }` item of that file the module is, `None` for the whole file.
@@ -151,11 +145,11 @@ impl<A: Allocator + Clone> ModuleFile<A> {
         file: ContentId,
         path: &str,
         inline: Option<ItemIndex>,
-        alloc: A,
-    ) -> Result<ModuleFile<A>, BuildError> {
-        let mut staging = Strings::new_in(alloc.clone());
+        alloc: Alloc<'a>,
+    ) -> Result<ModuleFile<'a>, BuildError> {
+        let mut staging = Strings::new_in(alloc);
         let path = staging.push(path, "ModuleFile strings")?;
-        Ok(ModuleFile { module, file, path, inline, absent: Vec::new_in(alloc.clone()), staging, alloc })
+        Ok(ModuleFile { module, file, path, inline, absent: AVec::new_in(alloc), staging, alloc })
     }
 
     /// A candidate path read and found absent, relative as the module's path is.
@@ -165,17 +159,17 @@ impl<A: Allocator + Clone> ModuleFile<A> {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<RecordBytes<A>, BuildError> {
+    pub fn finish(mut self) -> Result<RecordBytes<'a>, BuildError> {
         let staging = &self.staging;
         self.absent.sort_unstable_by(|a, b| staging.of(*a).cmp(staging.of(*b)));
         self.absent.dedup_by(|a, b| staging.of(*a) == staging.of(*b));
-        let mut strings = Strings::new_in(self.alloc.clone());
+        let mut strings = Strings::new_in(self.alloc);
         let path = strings.moved(&self.staging, self.path, "ModuleFile strings")?;
         for text in &mut self.absent {
             *text = strings.moved(&self.staging, *text, "ModuleFile strings")?;
         }
         let mut out =
-            Writer::new_in(<ModuleFileRoot as blaze_format::Record>::SCHEMA, self.alloc.clone());
+            Writer::new_in(<ModuleFileRoot as blaze_format::Record>::SCHEMA, self.alloc);
         let text = Column::push(&mut out, strings.bytes());
         let absent = Column::push(&mut out, &self.absent);
         Ok(finish_with(out, |at| ModuleFileRoot {

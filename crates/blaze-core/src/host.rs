@@ -134,8 +134,8 @@ mod unix {
     };
 
     use blaze_hash::HashMap;
-    use crossbeam_channel::{Receiver, Sender};
-    use crossbeam_queue::SegQueue;
+    use crate::chan::{Receiver, Sender};
+    use blaze_queue::SegQueue;
 
     use crate::{
         Completion, Dgram, Done, Effect, IoError, RECV_MOST, Stream, Tag,
@@ -499,7 +499,7 @@ mod unix {
                     }
                 },
             };
-            if let Err(crossbeam_channel::SendError(write)) = queue.send(Write { tag, bytes }) {
+            if let Err(crate::chan::SendError(write)) = queue.send(Write { tag, bytes }) {
                 let done = Done::unsent(
                     write.bytes,
                     format_args!("writing {stream}: its thread has ended"),
@@ -512,7 +512,7 @@ mod unix {
         fn stream_thread(&mut self, stream: Stream) -> io::Result<Sender<Write>> {
             let shared = self.shared()?;
             // alloc: once per stream written, the queue of its writes.
-            let (send, take): (Sender<Write>, Receiver<Write>) = crossbeam_channel::unbounded();
+            let (send, take): (Sender<Write>, Receiver<Write>) = crate::chan::unbounded();
             spawn("blaze-host-out", move || {
                 while let Ok(Write { tag, bytes }) = take.recv() {
                     let done = write_all(&shared, stream, bytes);
@@ -533,7 +533,7 @@ mod unix {
                 let started = self.shared().and_then(|shared| {
                     // alloc: once per host that reads its input, the queue of its reads.
                     let (send, take): (Sender<Read>, Receiver<Read>) =
-                        crossbeam_channel::unbounded();
+                        crate::chan::unbounded();
                     spawn("blaze-host-in", move || {
                         while let Ok(Read { tag, most, into }) = take.recv() {
                             let done = read_input(&shared, most, into);
@@ -556,7 +556,7 @@ mod unix {
                 }
             }
             let queue = self.stdin.as_ref().expect("started above");
-            if let Err(crossbeam_channel::SendError(read)) = queue.send(Read { tag, most, into }) {
+            if let Err(crate::chan::SendError(read)) = queue.send(Read { tag, most, into }) {
                 let why = "reading the standard input: its thread has ended";
                 self.tell(tag, Done::unread(read.into, why));
             }

@@ -10,11 +10,9 @@
 
 use std::alloc::Global;
 
-use arrow_array::RecordBatch;
-use arrow_schema::ArrowError;
 use blaze_hash::{HashMap, HashSet};
 
-use crate::batches::{self, ImageRow, Process};
+use crate::batches::{self, Batch, BatchError, ImageRow, Process};
 
 /// The address a stack's frame `i` (innermost first, as the samplers keep them) is named at: the
 /// innermost is where the thread was, each other a return address, whose call is the
@@ -121,7 +119,7 @@ impl ImagesWritten {
         stacks: impl Iterator<Item = &'a [u64]>,
         seen_ns: i64,
         process: Process<'_>,
-    ) -> Result<RecordBatch, ArrowError> {
+    ) -> Result<Batch, BatchError> {
         // alloc: a flush's addresses, once a flush
         let mut pcs: Vec<u64> = stacks.flat_map(|it| it.iter().copied()).collect();
         if pcs.is_empty() {

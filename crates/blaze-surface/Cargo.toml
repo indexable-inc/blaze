@@ -32,6 +32,8 @@ blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `Alloc::global()`: the handle the tests pass.
+blaze-own = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

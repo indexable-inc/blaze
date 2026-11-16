@@ -13,13 +13,12 @@
 //! module's `macro_rules!` sequence and its children's marks in it, the fellows of its group,
 //! the `use .. as _` traits and the macro-expanded `#[macro_export]`s.
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Record, Slice, Writer};
 use blaze_id::{ContentId, ItemKey, Portable};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::column::{
     Column, NONE, RecordBytes, Strings, Text, at_of, at_of_record, check_increasing, check_text,
@@ -204,44 +203,44 @@ impl<N, P> ScopeError<N, P> {
 /// `fellows` by key. `errors` is in the order the module's text and expansions are written in.
 /// A member of a cycle names its fellows.
 #[derive(Clone, Debug)]
-pub struct ScopeBuilder<N, A: Allocator> {
+pub struct ScopeBuilder<'a, N> {
     pub module: ItemKey,
-    pub bindings: Vec<ScopeEntry<N>, A>,
-    pub errors: Vec<ScopeError<N, Path<N, A>>, A>,
+    pub bindings: AVec<'a, ScopeEntry<N>>,
+    pub errors: AVec<'a, ScopeError<N, Path<'a, N>>>,
     /// The `macro_rules!` defined in this module and in its `#[macro_use]` children, in the
     /// order they are visible: what a `#[macro_use]` on this module carries out to the parent
     /// (its `TextualOut`), and, by [`ScopeBuilder::marks`], each child's textual entry.
-    pub textual: Vec<TextualDef<N>, A>,
+    pub textual: AVec<'a, TextualDef<N>>,
     /// For each `mod` child (sorted by child key), where its `mod` line falls in `textual`.
-    pub marks: Vec<TextualMark, A>,
-    pub fellows: Vec<ItemKey, A>,
+    pub marks: AVec<'a, TextualMark>,
+    pub fellows: AVec<'a, ItemKey>,
     /// The `use .. as _` imports, in the module's tree order: the traits they bring into scope.
     /// (A glob does not carry them on yet.)
-    pub traits: Vec<AnonImport, A>,
+    pub traits: AVec<'a, AnonImport>,
     /// The `#[macro_export]` `macro_rules!` a macro expansion of this module wrote, in tree
     /// order. They are bindings of the crate root for other crates: the writer of the crate's
     /// records adds them to the root's answers once every module of the crate is done. In
     /// their own crate they are not reachable by path (rustc refuses that too).
-    pub macro_exports: Vec<TextualDef<N>, A>,
+    pub macro_exports: AVec<'a, TextualDef<N>>,
 }
 
-impl<N, A: Allocator + Clone> ScopeBuilder<N, A> {
+impl<'a, N> ScopeBuilder<'a, N> {
     /// The empty scope of `module`.
-    pub fn new_in(module: ItemKey, alloc: A) -> ScopeBuilder<N, A> {
+    pub fn new_in(module: ItemKey, alloc: Alloc<'a>) -> ScopeBuilder<'a, N> {
         ScopeBuilder {
             module,
-            bindings: Vec::new_in(alloc.clone()),
-            errors: Vec::new_in(alloc.clone()),
-            textual: Vec::new_in(alloc.clone()),
-            marks: Vec::new_in(alloc.clone()),
-            fellows: Vec::new_in(alloc.clone()),
-            traits: Vec::new_in(alloc.clone()),
-            macro_exports: Vec::new_in(alloc),
+            bindings: AVec::new_in(alloc),
+            errors: AVec::new_in(alloc),
+            textual: AVec::new_in(alloc),
+            marks: AVec::new_in(alloc),
+            fellows: AVec::new_in(alloc),
+            traits: AVec::new_in(alloc),
+            macro_exports: AVec::new_in(alloc),
         }
     }
 }
 
-impl<N: Ord + Copy, A: Allocator> ScopeBuilder<N, A> {
+impl<N: Ord + Copy> ScopeBuilder<'_, N> {
     /// The binding of `name` in `ns`, by one binary search.
     pub fn get(&self, ns: Namespace, name: N) -> Option<&Binding> {
         self.bindings
@@ -266,8 +265,8 @@ fn export_of<N>(e: ScopeEntry<N>) -> ExportEntry<N> {
     ExportEntry { ns: e.ns, name: e.name, def: e.binding.def, vis: e.binding.vis, state: e.binding.state }
 }
 
-impl<N: PartialEq, A: Allocator, B: Allocator> PartialEq<ScopeBuilder<N, B>> for ScopeBuilder<N, A> {
-    fn eq(&self, other: &ScopeBuilder<N, B>) -> bool {
+impl<'b, N: PartialEq> PartialEq<ScopeBuilder<'b, N>> for ScopeBuilder<'_, N> {
+    fn eq(&self, other: &ScopeBuilder<'b, N>) -> bool {
         self.module == other.module
             && self.bindings[..] == other.bindings[..]
             && self.errors.len() == other.errors.len()
@@ -478,11 +477,11 @@ fn use_site_of(row: &ErrorRow) -> UseSite {
 }
 
 /// The digest of one class's exports, in scope order: everything a glob of that class reads.
-pub fn exports_digest<N: AsRef<str>, B: Allocator>(
+pub fn exports_digest<N: AsRef<str>>(
     entries: impl Iterator<Item = ExportEntry<N>>,
-    alloc: B,
+    alloc: Alloc<'_>,
 ) -> ContentId {
-    let mut bytes = Vec::new_in(alloc);
+    let mut bytes = AVec::new_in(alloc);
     for e in entries {
         let name = e.name.as_ref();
         let (def, kind, shape) = def_parts(Some(e.def));
@@ -498,20 +497,20 @@ pub fn exports_digest<N: AsRef<str>, B: Allocator>(
     ContentId::of(EXPORTS_DOMAIN, &bytes)
 }
 
-impl<N: AsRef<str> + Copy, A: Allocator> ScopeBuilder<N, A> {
+impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
     /// The [`ModuleScope`] record of this scope, in `alloc`. The bindings are sorted by
     /// namespace and name, the marks by child and the fellows by key, so the order they are
     /// in moves no byte; two bindings of one slot are refused.
-    pub fn write<B: Allocator + Clone>(&self, alloc: B) -> Result<RecordBytes<B>, BuildError> {
+    pub fn write<'b>(&self, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, BuildError> {
         self.write_sorted(true, alloc)
     }
 
     /// [`ScopeBuilder::write`], with the planted bug of the order test: `sort` off.
-    pub(crate) fn write_sorted<B: Allocator + Clone>(&self, sort: bool, alloc: B) -> Result<RecordBytes<B>, BuildError> {
-        let mut strings = Strings::new_in(alloc.clone());
-        let mut paths = PathTable::new_in(alloc.clone());
+    pub(crate) fn write_sorted<'b>(&self, sort: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, BuildError> {
+        let mut strings = Strings::new_in(alloc);
+        let mut paths = PathTable::new_in(alloc);
 
-        let mut order = Vec::from_iter_in(0..self.bindings.len(), alloc.clone());
+        let mut order = Vec::from_iter_in(0..self.bindings.len(), alloc);
         let bindings = &self.bindings;
         let slot = |at: &usize| (bindings[*at].ns, bindings[*at].name.as_ref());
         if sort {
@@ -520,7 +519,7 @@ impl<N: AsRef<str> + Copy, A: Allocator> ScopeBuilder<N, A> {
         if let Some(pair) = order.windows(2).find(|pair| slot(&pair[0]) == slot(&pair[1])) {
             return Err(BuildError::Twice { table: "ModuleScope bindings", key: bindings[pair[1]].binding.def.key.0 });
         }
-        let mut rows = Vec::with_capacity_in(order.len(), alloc.clone());
+        let mut rows = Vec::with_capacity_in(order.len(), alloc);
         for &at in order.iter() {
             let e = bindings[at];
             let (def, def_kind, shape) = def_parts(Some(e.binding.def));
@@ -544,26 +543,26 @@ impl<N: AsRef<str> + Copy, A: Allocator> ScopeBuilder<N, A> {
         }
 
         // Each class a binding is in, by its bytes, then its digest over the sorted bindings.
-        let mut classes = Vec::with_capacity_in(order.len(), alloc.clone());
+        let mut classes = Vec::with_capacity_in(order.len(), alloc);
         classes.extend(order.iter().map(|&at| bindings[at].binding.vis.class()));
         classes.sort_unstable_by_key(|class| class.to_record());
         classes.dedup();
-        let mut exports = Vec::with_capacity_in(classes.len(), alloc.clone());
+        let mut exports = Vec::with_capacity_in(classes.len(), alloc);
         for &class in classes.iter() {
             let entries = order.iter().map(|&at| bindings[at]).filter(|e| e.binding.vis.class() == class).map(export_of);
             let (tag, module) = class.to_record();
-            exports.push(ExportRow { module, digest: exports_digest(entries, alloc.clone()), class: tag });
+            exports.push(ExportRow { module, digest: exports_digest(entries, alloc), class: tag });
         }
 
-        let mut errors = Vec::with_capacity_in(self.errors.len(), alloc.clone());
+        let mut errors = Vec::with_capacity_in(self.errors.len(), alloc);
         for error in self.errors.iter() {
             errors.push(error_row(error, &mut paths, &mut strings)?);
         }
-        let textual = textual_rows(&self.textual, &mut strings, alloc.clone())?;
-        let macro_exports = textual_rows(&self.macro_exports, &mut strings, alloc.clone())?;
+        let textual = textual_rows(&self.textual, &mut strings, alloc)?;
+        let macro_exports = textual_rows(&self.macro_exports, &mut strings, alloc)?;
 
-        let mut marks = Vec::from_iter_in(self.marks.iter().map(|m| MarkRow { len: m.len, child: m.child.0 }), alloc.clone());
-        let mut fellows = Vec::from_iter_in(self.fellows.iter().map(|key| key.0), alloc.clone());
+        let mut marks = Vec::from_iter_in(self.marks.iter().map(|m| MarkRow { len: m.len, child: m.child.0 }), alloc);
+        let mut fellows = Vec::from_iter_in(self.fellows.iter().map(|key| key.0), alloc);
         if sort {
             marks.sort_unstable_by_key(|m| m.child);
             fellows.sort_unstable();
@@ -587,7 +586,7 @@ impl<N: AsRef<str> + Copy, A: Allocator> ScopeBuilder<N, A> {
                     pad: 0,
                 }
             }),
-            alloc.clone(),
+            alloc,
         );
 
         let mut out = Writer::new_in(<ModuleScopeRoot as Record>::SCHEMA, alloc);
@@ -619,22 +618,22 @@ impl<N: AsRef<str> + Copy, A: Allocator> ScopeBuilder<N, A> {
     }
 }
 
-fn textual_rows<N: AsRef<str>, B: Allocator, C: Allocator>(
+fn textual_rows<'b, N: AsRef<str>>(
     defs: &[TextualDef<N>],
-    strings: &mut Strings<C>,
-    alloc: B,
-) -> Result<Vec<TextualRow, B>, BuildError> {
-    let mut rows = Vec::with_capacity_in(defs.len(), alloc);
+    strings: &mut Strings<'_>,
+    alloc: Alloc<'b>,
+) -> Result<AVec<'b, TextualRow>, BuildError> {
+    let mut rows = AVec::with_capacity_in(defs.len(), alloc);
     for d in defs {
         rows.push(TextualRow { name: strings.push(d.name.as_ref(), TABLE)?, def: d.def.0, expansion: d.expansion, pad: 0 });
     }
     Ok(rows)
 }
 
-fn error_row<N: AsRef<str>, A: Allocator, B: Allocator + Clone, C: Allocator>(
-    error: &ScopeError<N, Path<N, A>>,
-    paths: &mut PathTable<B>,
-    strings: &mut Strings<C>,
+fn error_row<N: AsRef<str>>(
+    error: &ScopeError<N, Path<'_, N>>,
+    paths: &mut PathTable<'_>,
+    strings: &mut Strings<'_>,
 ) -> Result<ErrorRow, BuildError> {
     use ScopeError as E;
     let (tag, site, name, ns, why, ambiguity, first, second) = match error {
@@ -692,13 +691,13 @@ fn error_row<N: AsRef<str>, A: Allocator, B: Allocator + Clone, C: Allocator>(
     })
 }
 
-impl<'a, A: Allocator + Clone> ScopeBuilder<&'a str, A> {
+impl<'a, 'b> ScopeBuilder<'b, &'a str> {
     /// The working form of a [`ModuleScope`] record, its names borrowed from the record, in
     /// `alloc`: equal to the scope that wrote it.
-    pub fn from(view: &ScopeView<'a>, alloc: A) -> ScopeBuilder<&'a str, A> {
-        let mut out = ScopeBuilder::new_in(view.module(), alloc.clone());
+    pub fn from(view: &ScopeView<'a>, alloc: Alloc<'b>) -> ScopeBuilder<'b, &'a str> {
+        let mut out = ScopeBuilder::new_in(view.module(), alloc);
         out.bindings.extend(view.bindings());
-        out.errors.extend(view.errors().map(|e| e.map_path(|p| p.to_path_in(alloc.clone()))));
+        out.errors.extend(view.errors().map(|e| e.map_path(|p| p.to_path_in(alloc))));
         out.textual.extend(view.textual());
         out.marks.extend(view.marks());
         out.fellows.extend(view.fellows());

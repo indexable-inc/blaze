@@ -6,11 +6,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use core::alloc::Allocator;
-
 use blaze_hash::HashMap;
 use blaze_id::ItemKey;
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
     AnonImport, Binding, Def, DefKind, Namespace, Origin, Path, ScopeBuilder, ScopeEntry, ScopeError,
     Site, TextualDef, TextualMark, Unresolved, Visibility,
@@ -25,10 +23,10 @@ use crate::resolver::{Cached, CallState, Env, NsRes, Query, Res, Resolver, Scan,
 use crate::scope::{ReadList, Resolved, SeenFrom};
 
 /// What a member's final pass came to.
-pub(crate) enum Finish<N, A: Allocator> {
+pub(crate) enum Finish<'a, N> {
     /// It read what has no answer yet (`asks`), or what is in progress (`waits`).
-    Need { asks: Vec<Read<N>, A>, waits: Vec<Read<N>, A> },
-    Done(Resolved<N, A>),
+    Need { asks: AVec<'a, Read<N>>, waits: AVec<'a, Read<N>> },
+    Done(Resolved<'a, N>),
 }
 
 fn len32(n: usize) -> u32 {
@@ -37,12 +35,12 @@ fn len32(n: usize) -> u32 {
 
 /// The errors of the final pass, in the module's tree order, and the non-glob bindings seen so
 /// far for `Duplicate`.
-struct Errors<N, A: Allocator> {
-    list: Vec<ScopeError<N, Path<N, A>>, A>,
-    seen: HashMap<(Namespace, N), Def, A>,
+struct Errors<'a, N> {
+    list: AVec<'a, ScopeError<N, Path<'a, N>>>,
+    seen: HashMap<(Namespace, N), Def, Alloc<'a>>,
 }
 
-impl<N: Name, A: Allocator + Clone> Errors<N, A> {
+impl<N: Name> Errors<'_, N> {
     /// A non-glob binding of `(ns, name)`: a second one with another target is `Duplicate`.
     fn bind(&mut self, ns: Namespace, name: N, def: Def) {
         let first = *self.seen.entry((ns, name)).or_insert(def);
@@ -52,16 +50,16 @@ impl<N: Name, A: Allocator + Clone> Errors<N, A> {
     }
 }
 
-impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
+impl<'a, N: Name> Resolver<'a, N> {
     /// The final pass of this member of a group of `fellows` (sorted, itself among them).
     pub(crate) fn finalize<F: ScopeFacts<Name = N>>(
         &self,
         facts: &F,
-        env: Env<'_, N, A>,
+        env: Env<'_, 'a, N>,
         fellows: &[ItemKey],
-    ) -> Result<Finish<N, A>, ResolveError> {
+    ) -> Result<Finish<'a, N>, ResolveError> {
         let a = self.alloc.clone();
-        let mut sink = Sink::new_in(&a, Scan::Final);
+        let mut sink = Sink::new_in(a, Scan::Final);
         #[cfg(test)]
         {
             sink.forget_negative = self.plant == Plant::ForgetNegativeReads;
@@ -77,7 +75,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         let q = Query { asker: self.asker(), restricted: false, ignore: None };
         let mut bindings = Vec::with_capacity_in(names.len(), a.clone());
         // The globs that left a name undetermined, by tree place: one error each.
-        let mut undetermined: Vec<(crate::resolver::At, u32), A> = Vec::new_in(a.clone());
+        let mut undetermined: AVec<'a, (crate::resolver::At, u32)> = Vec::new_in(a.clone());
         for &(ns, name) in names.iter() {
             sink.undet_glob = None;
             match self.lookup_module(ns, name, q, env, &mut sink) {
@@ -199,9 +197,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         &self,
         frag: u32,
         facts: &F,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
-        errors: &mut Errors<N, A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
+        errors: &mut Errors<'a, N>,
     ) -> Result<(), ResolveError> {
         let f = &self.frags[frag as usize];
         for &(ns, name, e) in f.items.iter() {
@@ -229,7 +227,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         Ok(())
     }
 
-    fn finish_import(&self, i: usize, env: Env<'_, N, A>, sink: &mut Sink<N, A>, errors: &mut Errors<N, A>) {
+    fn finish_import(&self, i: usize, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>, errors: &mut Errors<'a, N>) {
         let imp = &self.imports[i];
         let site = imp.site;
         let n = imp.path.segments.len();
@@ -322,9 +320,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         &self,
         g: usize,
         facts: &F,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
-        errors: &mut Errors<N, A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
+        errors: &mut Errors<'a, N>,
     ) -> Result<(), ResolveError> {
         let glob = &self.globs[g];
         let site = glob.site;
@@ -390,7 +388,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         Ok(())
     }
 
-    fn finish_call(&self, c: usize, env: Env<'_, N, A>, sink: &mut Sink<N, A>, errors: &mut Errors<N, A>) {
+    fn finish_call(&self, c: usize, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>, errors: &mut Errors<'a, N>) {
         let call = &self.calls[c];
         let fail = |segment: u32, why: Unresolved| ScopeError::Macro {
             call: call.key,
@@ -457,10 +455,10 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     /// each glob's source binds (a fellow's live, others' by their exports).
     fn glob_names(
         &self,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
-        seen: &mut Vec<ItemKey, A>,
-        out: &mut Vec<(Namespace, N), A>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
+        seen: &mut AVec<'a, ItemKey>,
+        out: &mut AVec<'a, (Namespace, N)>,
     ) {
         // Each member once: the names are a union, so the order of the walk does not matter.
         if seen.contains(&self.module) {
@@ -495,8 +493,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     fn anon_and_exports(
         &self,
         frag: u32,
-        traits: &mut Vec<AnonImport, A>,
-        exports: &mut Vec<TextualDef<N>, A>,
+        traits: &mut AVec<'a, AnonImport>,
+        exports: &mut AVec<'a, TextualDef<N>>,
     ) {
         let f = &self.frags[frag as usize];
         exports.extend_from_slice(&f.exports);
@@ -529,10 +527,10 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     fn flatten(
         &self,
         frag: u32,
-        out: &mut Vec<TextualDef<N>, A>,
-        mut marks: Option<&mut Vec<TextualMark, A>>,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
+        out: &mut AVec<'a, TextualDef<N>>,
+        mut marks: Option<&mut AVec<'a, TextualMark>>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
     ) {
         let f = &self.frags[frag as usize];
         for slot in f.slots.iter() {
@@ -557,7 +555,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// What a `#[macro_use]` child carries out: a fellow's live, another's by its record.
-    fn carry_out(&self, child: ItemKey, out: &mut Vec<TextualDef<N>, A>, env: Env<'_, N, A>, sink: &mut Sink<N, A>) {
+    fn carry_out(&self, child: ItemKey, out: &mut AVec<'a, TextualDef<N>>, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) {
         if child != self.module {
             if let Some(f) = env.fellow(child) {
                 f.flatten(0, out, None, env, sink);

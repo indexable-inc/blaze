@@ -35,6 +35,8 @@
 #![no_std]
 // blaze's lints (`blaze::trust`, `blaze::sans_io`) name their tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
+// `core::simd`: digit runs, escape scanning and hex encoding (`simd`).
+#![feature(portable_simd)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![blaze::trust(
@@ -58,7 +60,36 @@ pub mod int;
 pub mod parse;
 pub mod put;
 pub mod show;
+mod simd;
 mod write;
+
+/// The vector routines and their scalar twins side by side, for `examples/cost.rs` to time
+/// the crossover; not an interface.
+#[doc(hidden)]
+pub mod twins {
+    /// A decimal `u64` at the front of `bytes`: `(value, digits)`, or `None`.
+    pub fn decimal_u64(bytes: &[u8]) -> Option<(u64, usize)> {
+        match crate::parse::decimal_u64(bytes) {
+            crate::parse::Decimal64::Value(v, n) => Some((v, n)),
+            _ => None,
+        }
+    }
+
+    pub fn decimal_u64_scalar(bytes: &[u8]) -> Option<(u64, usize)> {
+        match crate::parse::decimal_u64_scalar(bytes) {
+            crate::parse::Decimal64::Value(v, n) => Some((v, n)),
+            _ => None,
+        }
+    }
+
+    pub fn next_special(bytes: &[u8]) -> usize {
+        crate::simd::next_special(bytes, 0)
+    }
+
+    pub fn next_special_scalar(bytes: &[u8]) -> usize {
+        crate::simd::next_special_scalar(bytes, 0)
+    }
+}
 
 #[cfg(test)]
 mod plant;

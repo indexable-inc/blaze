@@ -13,11 +13,10 @@
 //! tokens it has, a diagnostic's text is a whole `str` of its notes); a buffer that is not one
 //! this writes is a typed [`RecordError`] naming the column and the byte.
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::size_of;
 
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, leb};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
@@ -132,7 +131,7 @@ impl fmt::Display for RecordError {
 impl core::error::Error for RecordError {}
 
 /// Appends `value` as LEB128.
-fn leb<B: Allocator>(out: &mut Vec<u8, B>, value: u64) {
+fn leb(out: &mut AVec<'_, u8>, value: u64) {
     let mut place = [0; leb::MAX_LEN];
     let len = leb::put_u64(&mut place, value);
     out.extend_from_slice(&place[..len]);
@@ -210,18 +209,16 @@ fn origin_option(origin: Option<TokenOrigin>) -> u64 {
 }
 
 /// The columns while they are written, each in the writer's allocator.
-struct Columns<A: Allocator> {
-    columns: [Vec<u8, A>; COLUMNS],
+struct Columns<'a> {
+    columns: [AVec<'a, u8>; COLUMNS],
 }
 
-impl<A: Allocator + Clone> Columns<A> {
-    fn new_in(alloc: &A) -> Columns<A> {
-        Columns { columns: core::array::from_fn(|_| Vec::new_in(alloc.clone())) }
+impl<'a> Columns<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Columns<'a> {
+        Columns { columns: core::array::from_fn(|_| Vec::new_in(alloc)) }
     }
-}
 
-impl<A: Allocator> Columns<A> {
-    fn of(&mut self, column: RecordColumn) -> &mut Vec<u8, A> {
+    fn of(&mut self, column: RecordColumn) -> &mut AVec<'a, u8> {
         &mut self.columns[column as usize]
     }
 
@@ -245,11 +242,11 @@ impl<A: Allocator> Columns<A> {
     }
 }
 
-impl<A: Allocator> Expansion<A> {
+impl Expansion<'_> {
     /// The expansion as a record: one blaze-format buffer of [`EXPANSION_SCHEMA`] in `alloc`.
     /// Equal expansions give equal bytes.
-    pub fn write_record<B: Allocator + Clone>(&self, alloc: B) -> RecordBytes<B> {
-        let mut c = Columns::new_in(&alloc);
+    pub fn write_record<'b>(&self, alloc: Alloc<'b>) -> RecordBytes<'b> {
+        let mut c = Columns::new_in(alloc);
         write_stream(&mut c, &self.tokens);
         for origin in self.origins.iter() {
             c.leb(RecordColumn::Origins, origin_word(*origin));
@@ -324,22 +321,20 @@ impl<A: Allocator> Expansion<A> {
     }
 }
 
-impl<A: Allocator> TokenStream<A> {
+impl<'a> TokenStream<'a> {
     /// The stream alone as a record: one blaze-format buffer of [`STREAM_SCHEMA`] in `alloc`,
     /// the stream columns of an expansion record ([`RecordColumn::Tokens`] to
     /// [`RecordColumn::Contexts`]) and every other column empty. What a macro definition's
     /// body and parameters are stored as, each by its [`TokenStream::record_id`]. Equal streams
     /// give equal bytes.
-    pub fn write_record<B: Allocator + Clone>(&self, alloc: B) -> RecordBytes<B> {
-        let mut c = Columns::new_in(&alloc);
+    pub fn write_record<'b>(&self, alloc: Alloc<'b>) -> RecordBytes<'b> {
+        let mut c = Columns::new_in(alloc);
         write_stream(&mut c, self);
         finish_columns(&c, STREAM_SCHEMA, alloc)
     }
-}
 
-impl<A: Allocator + Clone> TokenStream<A> {
     /// The stream a [`TokenStream::write_record`] buffer holds, in `alloc`, checked once.
-    pub fn read_record(buffer: &[u8], alloc: A) -> Result<TokenStream<A>, RecordError> {
+    pub fn read_record(buffer: &[u8], alloc: Alloc<'a>) -> Result<TokenStream<'a>, RecordError> {
         let mut r = open_columns(buffer, STREAM_SCHEMA)?;
         let stream = read_tokens(&mut r, alloc)?;
         for col in &r.columns {
@@ -366,7 +361,7 @@ pub use blaze_surface::RecordBytes;
 
 /// The stream's columns: each token's entry, text, length, context and suffix, then the
 /// context table.
-fn write_stream<A: Allocator, B: Allocator>(c: &mut Columns<B>, tokens: &TokenStream<A>) {
+fn write_stream(c: &mut Columns<'_>, tokens: &TokenStream<'_>) {
     for token in tokens.tokens() {
         c.put(RecordColumn::Tokens, &token_word(token.kind).to_le_bytes());
         let text = tokens.text_of(token);
@@ -395,11 +390,11 @@ fn write_stream<A: Allocator, B: Allocator>(c: &mut Columns<B>, tokens: &TokenSt
 }
 
 /// The columns as one buffer of `schema`: each non-empty column's bytes, then the root.
-fn finish_columns<A: Allocator, B: Allocator + Clone>(
-    c: &Columns<A>,
+fn finish_columns<'b>(
+    c: &Columns<'_>,
     schema: SchemaHash,
-    alloc: B,
-) -> RecordBytes<B> {
+    alloc: Alloc<'b>,
+) -> RecordBytes<'b> {
     let mut out = Writer::new_in(schema, alloc);
     let mut places = [(0u64, 0usize); COLUMNS];
     for (place, bytes) in places.iter_mut().zip(c.columns.iter()) {
@@ -430,10 +425,10 @@ fn open_columns(buffer: &[u8], schema: SchemaHash) -> Result<Reader<'_>, RecordE
     })
 }
 
-fn write_diagnostic<A: Allocator>(c: &mut Columns<A>, diagnostic: Diagnostic) {
+fn write_diagnostic(c: &mut Columns<'_>, diagnostic: Diagnostic) {
     let column = RecordColumn::Diagnostics;
-    let tag = |c: &mut Columns<A>, tag: u8| c.put(column, &[tag]);
-    let origin = |c: &mut Columns<A>, at: Option<TokenOrigin>| c.leb(column, origin_option(at));
+    let tag = |c: &mut Columns<'_>, tag: u8| c.put(column, &[tag]);
+    let origin = |c: &mut Columns<'_>, at: Option<TokenOrigin>| c.leb(column, origin_option(at));
     match diagnostic {
         Diagnostic::NoRuleMatched { rules, token, expected, at } => {
             tag(c, 0);
@@ -663,14 +658,14 @@ fn ctx_of(raw: u64, nodes: &[Ctx]) -> Option<Ctx> {
     }
 }
 
-impl<A: Allocator + Clone> Expansion<A> {
+impl<'a> Expansion<'a> {
     /// The expansion a [`Expansion::write_record`] buffer holds, in `alloc`, checked once:
     /// equal to the expansion written, and refused with the column and byte otherwise. The
     /// buffer is aligned as blaze-format buffers are (to 4 bytes at least).
-    pub fn read_record(buffer: &[u8], alloc: A) -> Result<Expansion<A>, RecordError> {
+    pub fn read_record(buffer: &[u8], alloc: Alloc<'a>) -> Result<Expansion<'a>, RecordError> {
         let mut r = open_columns(buffer, EXPANSION_SCHEMA)?;
-        let mut exp = Expansion::new_in(alloc.clone());
-        let tokens = read_tokens(&mut r, alloc.clone())?;
+        let mut exp = Expansion::new_in(alloc);
+        let tokens = read_tokens(&mut r, alloc)?;
         let len = tokens.len();
         exp.tokens = tokens;
         for _ in 0..len {
@@ -747,12 +742,12 @@ impl<A: Allocator + Clone> Expansion<A> {
 }
 
 /// The token stream: the context table first, then each token.
-fn read_tokens<A: Allocator + Clone>(
+fn read_tokens<'a>(
     r: &mut Reader<'_>,
-    alloc: A,
-) -> Result<TokenStream<A>, RecordError> {
-    let mut stream = TokenStream::new_in(alloc.clone());
-    let mut nodes: Vec<Ctx, A> = Vec::new_in(alloc);
+    alloc: Alloc<'a>,
+) -> Result<TokenStream<'a>, RecordError> {
+    let mut stream = TokenStream::new_in(alloc);
+    let mut nodes: AVec<'a, Ctx> = Vec::new_in(alloc);
     let contexts = r.col(RecordColumn::Contexts);
     while contexts.more() {
         let parent = contexts.u64()?;
@@ -822,9 +817,9 @@ fn read_tokens<A: Allocator + Clone>(
     Ok(stream)
 }
 
-fn read_reads<A: Allocator + Clone>(
+fn read_reads(
     r: &mut Reader<'_>,
-    exp: &mut Expansion<A>,
+    exp: &mut Expansion<'_>,
 ) -> Result<(), RecordError> {
     while r.col(RecordColumn::Reads).more() {
         let reads = r.col(RecordColumn::Reads);
@@ -860,9 +855,9 @@ fn read_reads<A: Allocator + Clone>(
     Ok(())
 }
 
-fn read_diagnostics<A: Allocator + Clone>(
+fn read_diagnostics(
     r: &mut Reader<'_>,
-    exp: &mut Expansion<A>,
+    exp: &mut Expansion<'_>,
 ) -> Result<(), RecordError> {
     let notes = &exp.notes;
     let col = r.col(RecordColumn::Diagnostics);
@@ -895,7 +890,7 @@ fn read_diagnostics<A: Allocator + Clone>(
             _ => Err(col.bad("an option neither absent nor given")),
         }
     };
-    let mut read = Vec::new_in(exp.diagnostics.allocator().clone());
+    let mut read = Vec::new_in(*exp.diagnostics.allocator());
     while col.more() {
         let diagnostic = match col.byte()? {
             0 => {

@@ -8,23 +8,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::time::Instant;
 
-use anyhow::Result as CargoResult;
 use blaze_resolve::resolver::{
     self, ResolveOpts, ResolveSettings, VersionOrdering, VersionPreferences,
 };
 use blaze_resolve::{
     DepKind, Dependency, GitReference, IndexSummary, InternedString, PackageId, QueryKind,
-    Registry, Resolve, ResolveVersion, SourceId, Summary,
+    Registry, Resolve, ResolveError, ResolveVersion, SourceId, Summary,
 };
 use url::Url;
 
+type CargoResult<T> = Result<T, ResolveError>;
+
 trait IntoUrl {
-    fn into_url(self) -> CargoResult<Url>;
+    fn into_url(self) -> Result<Url, url::ParseError>;
 }
 
 impl IntoUrl for &str {
-    fn into_url(self) -> CargoResult<Url> {
-        Ok(Url::parse(self)?)
+    fn into_url(self) -> Result<Url, url::ParseError> {
+        Url::parse(self)
     }
 }
 

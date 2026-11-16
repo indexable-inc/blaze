@@ -9,8 +9,8 @@
 
 use core::{alloc::Allocator, fmt};
 
-use blaze_data::{At, Map, Value};
-use blaze_own::String;
+use blaze_data::{Map, Order, Step, Value, Visit, Walk, write_step};
+use blaze_own::{String, Vec};
 
 /// How [`write_document`] lays a document out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,9 +62,20 @@ impl<A: Allocator> fmt::Debug for WriteError<A> {
 
 impl<A: Allocator> core::error::Error for WriteError<A> {}
 
-pub(crate) fn fail<B: Allocator + Clone>(out: &String<B>, at: &At<'_>, what: Unwritable) -> WriteError<B> {
+/// The error for `what` at the steps `prefix` (a document's table path) and then where `walk`
+/// stands (inside an inline value).
+fn fail<A: Allocator, B: Allocator + Clone>(
+    out: &String<B>,
+    prefix: &[Step<'_>],
+    walk: &Walk<'_, A, B>,
+    what: Unwritable,
+) -> WriteError<B> {
     let mut path = String::new_in(out.allocator().clone());
-    if at.write_into(&mut path).is_err() {
+    let written = prefix
+        .iter()
+        .try_fold(false, |before, step| write_step(&mut path, *step, before))
+        .and_then(|before| walk.path_after(&mut path, before));
+    if written.is_err() {
         unreachable!("writing into a `String` does not fail");
     }
     WriteError { path, what }
@@ -109,52 +120,64 @@ fn basic<B: Allocator>(text: &str, out: &mut String<B>) {
     out.push('"');
 }
 
-/// `value` as an inline TOML value (`1`, `"x"`, `[1, 2]`, `{ a = 1 }`) appended to `out`.
+/// `value` as an inline TOML value (`1`, `"x"`, `[1, 2]`, `{ a = 1 }`) appended to `out`,
+/// walked with its stack in `out`'s allocator, so no depth recurses.
 pub fn write_inline<A: Allocator, B: Allocator + Clone>(value: &Value<A>, out: &mut String<B>) -> Result<(), WriteError<B>> {
-    inline(value, out, &At::ROOT)
+    inline(value, out, &[])
 }
 
-fn inline<A: Allocator, B: Allocator + Clone>(value: &Value<A>, out: &mut String<B>, at: &At<'_>) -> Result<(), WriteError<B>> {
+/// [`write_inline`] for the value at the steps `prefix`, which an error's path starts with.
+fn inline<A: Allocator, B: Allocator + Clone>(
+    value: &Value<A>,
+    out: &mut String<B>,
+    prefix: &[Step<'_>],
+) -> Result<(), WriteError<B>> {
+    let mut walk = Walk::new_in(value, Order::Insertion, out.allocator().clone());
+    while let Some(visit) = walk.next() {
+        match visit {
+            Visit::Leaf(leaf) => {
+                if let Err(what) = scalar(leaf, out) {
+                    return Err(fail(out, prefix, &walk, what));
+                }
+            }
+            Visit::StartList(_) => out.push('['),
+            Visit::Item(i) => {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+            }
+            Visit::EndList(_) => out.push(']'),
+            Visit::StartMap(map) => out.push_str(if map.is_empty() { "{" } else { "{ " }),
+            Visit::Key(i, key) => {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_key(key, out);
+                out.push_str(" = ");
+            }
+            Visit::EndMap(len) => out.push_str(if len == 0 { "}" } else { " }" }),
+        }
+    }
+    Ok(())
+}
+
+/// A value that is no list or map, or why TOML cannot say it.
+fn scalar<A: Allocator, B: Allocator>(value: &Value<A>, out: &mut String<B>) -> Result<(), Unwritable> {
     match value {
-        Value::Null => return Err(fail(out, at, Unwritable::Null)),
-        Value::Bytes(_) => return Err(fail(out, at, Unwritable::Bytes)),
+        Value::Null => return Err(Unwritable::Null),
+        Value::Bytes(_) => return Err(Unwritable::Bytes),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
         Value::Int(n) => match n.as_i64() {
             Some(n) => blaze_own::format_into!(out, "{n}"),
             None => {
                 let n = n.as_u64().unwrap_or_else(|| unreachable!("an Int outside i64 is a large u64"));
-                return Err(fail(out, at, Unwritable::Integer(n)));
+                return Err(Unwritable::Integer(n));
             }
         },
         Value::Float(x) => float(*x, out),
         Value::Text(text) => basic(text.as_str(), out),
-        Value::List(list) => {
-            out.push('[');
-            for (i, item) in list.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                inline(item, out, &at.index(i))?;
-            }
-            out.push(']');
-        }
-        Value::Map(map) => {
-            if map.is_empty() {
-                out.push_str("{}");
-                return Ok(());
-            }
-            out.push_str("{ ");
-            for (i, (key, item)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_key(key, out);
-                out.push_str(" = ");
-                inline(item, out, &at.key(key))?;
-            }
-            out.push_str(" }");
-        }
+        Value::List(_) | Value::Map(_) => unreachable!("a walk visits containers as starts"),
     }
     Ok(())
 }
@@ -167,22 +190,6 @@ fn float<B: Allocator>(x: f64, out: &mut String<B>) {
     } else {
         // Debug is the shortest text that reads back as `x`, always with a `.` or an `e`.
         blaze_own::format_into!(out, "{x:?}");
-    }
-}
-
-/// A header's keys, chained on the stack.
-struct Keys<'p> {
-    parent: Option<&'p Keys<'p>>,
-    key: &'p str,
-}
-
-impl Keys<'_> {
-    fn write<B: Allocator>(&self, out: &mut String<B>) {
-        if let Some(parent) = self.parent {
-            parent.write(out);
-            out.push('.');
-        }
-        write_key(self.key, out);
     }
 }
 
@@ -203,60 +210,127 @@ fn entry<'v, A: Allocator>(value: &'v Value<A>, inline: bool) -> Entry<'v, A> {
     }
 }
 
-/// `map` as a TOML document appended to `out`, by the order rule in this module's docs.
+/// A table being written: its map, its depth (the root is 0), the next entry to look at for a
+/// sub-table, the next element of an array of tables under that entry, and how many steps of
+/// the path lead to it.
+struct Table<'v, A: Allocator> {
+    map: &'v Map<A>,
+    depth: usize,
+    next: usize,
+    element: usize,
+    steps: usize,
+}
+
+// By hand: a derive would ask `A: Copy` of the allocator, which only the reference holds.
+impl<A: Allocator> Clone for Table<'_, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A: Allocator> Copy for Table<'_, A> {}
+
+/// `map` as a TOML document appended to `out`, by the order rule in this module's docs. Tables
+/// are walked with a stack, and the path in steps, in `out`'s allocator, so no depth recurses.
 pub fn write_document<A: Allocator, B: Allocator + Clone>(
     map: &Map<A>,
     out: &mut String<B>,
     options: DocumentOptions,
 ) -> Result<(), WriteError<B>> {
-    body(map, out, options, None, &At::ROOT, 0)
+    let scratch = out.allocator().clone();
+    let mut steps: Vec<Step<'_>, B> = Vec::new_in(scratch.clone());
+    let mut stack = Vec::new_in(scratch);
+    plain(map, 0, out, options, &mut steps)?;
+    stack.push(Table { map, depth: 0, next: 0, element: 0, steps: 0 });
+    while let Some(top) = stack.last_mut() {
+        let table = *top;
+        let Some((key, value)) = table.map.entry_at(table.next) else {
+            stack.pop();
+            continue;
+        };
+        let inline_below = table.depth + 1 >= options.inline_from_depth;
+        let (child, array) = match entry(value, inline_below) {
+            Entry::Plain => {
+                top.next += 1;
+                continue;
+            }
+            Entry::Table(child) => {
+                top.next += 1;
+                (child, false)
+            }
+            Entry::Tables(list) => match list.get(table.element) {
+                None => {
+                    top.next += 1;
+                    top.element = 0;
+                    continue;
+                }
+                Some(element) => {
+                    top.element += 1;
+                    let Value::Map(child) = element else { unreachable!("`entry` saw only maps") };
+                    (child, true)
+                }
+            },
+        };
+        steps.truncate(table.steps);
+        steps.push(Step::Key(key));
+        let depth = table.depth + 1;
+        let header_due = match array {
+            true => true,
+            false => {
+                let below = depth + 1 >= options.inline_from_depth;
+                child.is_empty() || child.iter().any(|(_, v)| matches!(entry(v, below), Entry::Plain))
+            }
+        };
+        if header_due {
+            header(out, steps.as_slice(), array);
+        }
+        if array {
+            steps.push(Step::Index(table.element));
+        }
+        plain(child, depth, out, options, &mut steps)?;
+        stack.push(Table { map: child, depth, next: 0, element: 0, steps: steps.len() });
+    }
+    Ok(())
 }
 
-fn header<B: Allocator>(out: &mut String<B>, keys: &Keys<'_>, array: bool) {
+/// `[a.b]` or `[[a.b]]` for the table at `steps` (its keys; indices are not in a header).
+fn header<B: Allocator>(out: &mut String<B>, steps: &[Step<'_>], array: bool) {
     if !out.is_empty() {
         out.push('\n');
     }
     out.push_str(if array { "[[" } else { "[" });
-    keys.write(out);
+    let mut first = true;
+    for step in steps {
+        if let Step::Key(key) = step {
+            if !first {
+                out.push('.');
+            }
+            write_key(key, out);
+            first = false;
+        }
+    }
     out.push_str(if array { "]]\n" } else { "]\n" });
 }
 
-fn body<A: Allocator, B: Allocator + Clone>(
-    map: &Map<A>,
+/// The plain entries of `map`, a table at `depth` whose path is `steps`, as `key = value`
+/// lines; `steps` is as it was after.
+fn plain<'v, A: Allocator, B: Allocator + Clone>(
+    map: &'v Map<A>,
+    depth: usize,
     out: &mut String<B>,
     options: DocumentOptions,
-    keys: Option<&Keys<'_>>,
-    at: &At<'_>,
-    depth: usize,
+    steps: &mut Vec<Step<'v>, B>,
 ) -> Result<(), WriteError<B>> {
     let inline_below = depth + 1 >= options.inline_from_depth;
     for (key, value) in map.iter() {
         if let Entry::Plain = entry(value, inline_below) {
             write_key(key, out);
             out.push_str(" = ");
-            inline(value, out, &at.key(key))?;
+            steps.push(Step::Key(key));
+            let written = inline(value, out, steps.as_slice());
+            steps.pop();
+            written?;
             out.push('\n');
-        }
-    }
-    for (key, value) in map.iter() {
-        let here = Keys { parent: keys, key };
-        let at = at.key(key);
-        match entry(value, inline_below) {
-            Entry::Plain => {}
-            Entry::Table(table) => {
-                let plain = table.iter().any(|(_, v)| matches!(entry(v, depth + 2 >= options.inline_from_depth), Entry::Plain));
-                if plain || table.is_empty() {
-                    header(out, &here, false);
-                }
-                body(table, out, options, Some(&here), &at, depth + 1)?;
-            }
-            Entry::Tables(list) => {
-                for (i, element) in list.iter().enumerate() {
-                    let Value::Map(table) = element else { unreachable!("`entry` saw only maps") };
-                    header(out, &here, true);
-                    body(table, out, options, Some(&here), &at.index(i), depth + 1)?;
-                }
-            }
         }
     }
     Ok(())

@@ -229,6 +229,9 @@ ra-ap-rustc_pattern_analysis = { path = "vendor/ra-ap-rustc_pattern_analysis" }
 rustls = { path = "vendor/rustls" }
 
 [workspace.dependencies]
+crossbeam-channel = "0.5.17"
+crossbeam-queue = "0.3.14"
+parking_lot = "0.12.5"
 aho-corasick = "1.1.5"
 arrayvec = "0.7.8"
 arrow-array = { version = "60.1.0", default-features = false }
@@ -391,8 +394,11 @@ blaze-git-fetch = { path = "crates/blaze-git-fetch" }
 # blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).
 blaze-sim = { path = "crates/blaze-sim" }
 blaze-typeck = { path = "crates/blaze-typeck" }
+# blaze's own trait solver (docs/v2/plan/design/solve.md).
+blaze-solve = { path = "crates/blaze-solve" }
 # Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
 blaze-sql = { path = "crates/blaze-sql" }
+blaze-rel = { path = "crates/blaze-rel" }
 blaze-sqlite = { path = "crates/blaze-sqlite" }
 blaze-pg = { path = "crates/blaze-pg" }
 # C SQLite itself, built from the amalgamation; blaze-sqlite is its only user and takes nothing of rusqlite.
@@ -507,9 +513,7 @@ wasmtime = { version = "=50.0.1", default-features = false, features = ["craneli
 llvm-sys = "231"
 # The stackful fibers blaze-graph's scheduler parks a waiting job on (docs/v2/plan/design/fibers.md, Phase 2).
 corosensei = "0.3.4"
-crossbeam-channel = "0.5.17"
 crossbeam-deque = "0.8.8"
-crossbeam-queue = "0.3.14"
 base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -579,7 +583,6 @@ hashbrown = { version = "0.17.1", features = [
 # Dependencies of one member, moved to the root (dedup, 2026-10-30).
 blaze-cargo = { path = "crates/blaze-cargo", default-features = false }
 blaze-registry = { path = "crates/blaze-registry", default-features = false }
-cargo-platform = "0.3.3"
 cargo-util-schemas = "=0.14.3"
 cov-mark = "2.2.0"
 cranelift-module = "=0.137.1"
@@ -614,12 +617,8 @@ inkwell = { version = "0.11.0", default-features = false }
 # The assembler of a blaze without LLVM (the seed): hir-ty-codegen's `asm/rsasm.rs`.
 rsasm = { version = "=0.1.3", default-features = false, features = ["x86", "aarch64"] }
 lzma-rust2 = { version = "0.24.0", default-features = false }
-# blaze's map shared between threads (`blaze_hash::SharedMap`): lock-free reads, no guard held across calls.
-papaya = "0.2.5"
 # SHA-512 for blaze-fetch's pins; SHA-256 is blaze-sha256's.
 sha2 = "0.11"
-# blaze's locks and condition variables: `std::sync`'s are disallowed (`.clippy.toml`).
-parking_lot = "0.12.5"
 pathdiff = "0.2.3"
 percent-encoding = "2.3.2"
 proc-macro2 = "1.0.107"
@@ -628,7 +627,6 @@ rustc-demangle = "0.1.28"
 rustc-stable-hash = "0.1.2"
 rustc_hashes = { version = "0.179.0", package = "ra-ap-rustc_hashes" }
 rustc_index = { version = "0.179.0", package = "ra-ap-rustc_index", default-features = false }
-serde-untagged = "0.1.9"
 shell-escape = "=0.1.5"
 stacker = "0.1.25"
 syn = "2.0.117"
@@ -636,8 +634,6 @@ synstructure = "0.13.2"
 tar = { version = "0.4.46", default-features = false }
 target-lexicon = "0.13.5"
 tempfile = "3.27.0"
-thiserror = "2.0.18"
-toml_edit = { version = "=0.25.12", default-features = false }
 uds_windows = "1.2.1"
 wasm-encoder = { version = "0.263.0", default-features = false }
 zip = { version = "9.1.3", default-features = false }
@@ -649,10 +645,7 @@ ast-merge-langs = { path = "tools/astlog/langs" }
 edit-applier = { path = "tools/astlog/edit-applier" }
 astlog-engine = { path = "tools/astlog/engine" }
 error-chain = { path = "tools/astlog/error-chain" }
-clap = "4.6.7"
-ignore = "0.4.33"
 similar = "3.2.1"
-snafu = "0.8.9"
 tree-sitter = "0.26.13"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"

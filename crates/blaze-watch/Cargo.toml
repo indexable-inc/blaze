@@ -19,6 +19,8 @@ doctest = false
 [dependencies]
 blaze-cbor.workspace = true
 blaze-own.workspace = true
+# The rings (`blaze_trace::ring`, their one home): the emitter is their 64-byte width.
+blaze-trace.workspace = true
 
 [dev-dependencies]
 # `check` and `control`: every machine's simulation and its planted-bug controls.

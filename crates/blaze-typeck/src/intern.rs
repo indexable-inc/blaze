@@ -4,23 +4,22 @@
 //! content only among lists of equal hash.
 
 use blaze_hash::ByHash;
-use blaze_own::Vec;
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Vec};
 
 use crate::error::{CheckError, Limit};
 
 const NONE: u32 = u32::MAX;
 
 /// Lists by content hash. Lists are numbered densely in the order inserted.
-pub(crate) struct ListIndex<A: Allocator + Clone> {
-    newest: ByHash<u64, u32, A>,
+pub(crate) struct ListIndex<'a> {
+    newest: ByHash<u64, u32, Alloc<'a>>,
     /// Per list: the previous list with the same hash, or `NONE`.
-    prev: Vec<u32, A>,
+    prev: Vec<u32, Alloc<'a>>,
 }
 
-impl<A: Allocator + Clone> ListIndex<A> {
-    pub(crate) fn new_in(alloc: A) -> ListIndex<A> {
-        ListIndex { newest: ByHash::new_in(alloc.clone()), prev: Vec::new_in(alloc) }
+impl<'a> ListIndex<'a> {
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> ListIndex<'a> {
+        ListIndex { newest: ByHash::new_in(alloc), prev: Vec::new_in(alloc) }
     }
 
     /// The list of `hash` for which `eq` holds. The chain is at most every list.

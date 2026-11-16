@@ -4,12 +4,16 @@
 //! `Recorder`) is the sink that keeps what they say.
 //!
 //! - A site is static data, made by the macro where it is written: its name, target, level,
-//!   file, line and field names ([`Metadata`]). Nothing about a site is registered here; a
-//!   sink keys whatever it keeps by the site's address.
-//! - A span or an event is plain data handed to the sink as it happens: its site, its parent
-//!   ([`Parent`]) and its fields' values ([`Value`]: numbers as themselves, text borrowed, a
-//!   `Display` or `Debug` value borrowed and formatted only if the sink wants text). A sink that
-//!   keeps time reads its own clock; [`capture::Capture`] takes one passed in.
+//!   file, line and field names ([`Metadata`]), and one state word ([`Site`]): its id in the
+//!   process's site table and who records it.
+//! - **The recording path** ([`record`]): a span's edges and an event are fixed 32-byte
+//!   entries in the calling thread's ring ([`ring`], the one home of the rings, blaze-watch's
+//!   too), timed by the CPU's counter. No `dyn` call, no allocation, no lock, no formatting but
+//!   of text fields; the reader formats, later.
+//! - **A sink** ([`Sink`]) is the other consumer: a span or an event handed to it as it happens,
+//!   its fields' values borrowed ([`Value`]). It is how blaze-profile's flight recorder and the
+//!   tests read spans until the flight recorder drains the rings; a site the rings record does
+//!   not go to a sink.
 //! - The macros have the call shape crates already wrote (`info_span!(target: "blaze", "name",
 //!   krate = %k, unit)`, `warn!(%dir, "text {x}")`, `field::Empty` then `span.record(..)`), so
 //!   moving a crate here changes its import and nothing else.
@@ -17,39 +21,42 @@
 //! # The one ambient hook
 //!
 //! Rule 75 (nothing ambient) says the clock, the environment and IO are passed in. A span site
-//! has no handle in scope (it is a line in a parser or a type checker, 300 of them), so its sink
-//! is reached ambiently, through exactly one hook: the sink of the calling thread
-//! ([`set_thread`]), or else the one the program's entry installed ([`install`], once a
-//! process, never replaced). That is the whole of it: no dispatcher stack, no registry, no
-//! callsite interest cache. A thread a pool or a test spawns reaches the entry's sink with no
-//! step of its own, which is why the entry's sink is a process value and not only a thread's:
-//! the flight recorder must see every thread's spans. A task that wants its own record (a
+//! has no handle in scope (it is a line in a parser or a type checker, 300 of them), so what
+//! records it is reached ambiently, through exactly one thread-local ([`record`]'s thread
+//! state: the thread's ring producer and its own sink, when it set one with [`set_thread`])
+//! and what the program's entry installed once ([`install_rings`], [`install`], never
+//! replaced). A thread a pool or a test spawns reaches the entry's rings and sink with no step
+//! of its own: the flight recorder must see every thread. A task that wants its own record (a
 //! test, a simulation) sets its thread's sink and gets the entry's back when it is done
-//! ([`with_thread_sink`]). Code that has a context (`bstd::Cx`) records through it instead.
+//! ([`with_thread_sink`]). bstd's runtime has no thread-local of its own yet; when its
+//! current-worker pointer lands, this state moves into it, and code with a `bstd::Cx` records
+//! through it.
 //!
-//! # What a site costs with no sink
+//! # What a site costs
 //!
-//! One thread-local read, one relaxed atomic load and a branch: the macro evaluates no field
-//! and formats nothing until a sink said it wants the site ([`enabled`]). `trace!` and
-//! `trace_span!` compile out of builds without debug assertions ([`Level::COMPILED`]).
-//! Evidence: [`tests::no_sink_evaluates_no_field`].
+//! Recorded by nobody: one relaxed load of the site's state and a branch; no field is
+//! evaluated. Recorded by the rings: per edge, a counter read and one 32-byte slot written.
+//! `trace!` and `trace_span!` compile out of builds without debug assertions
+//! ([`Level::COMPILED`]). Evidence: [`tests::no_sink_evaluates_no_field`], `examples/cost.rs`.
 
 #![no_std]
-#![feature(thread_local)]
+#![feature(thread_local, allocator_api)]
 
 extern crate alloc;
 
 use core::{
-    cell::{Cell, UnsafeCell},
     fmt,
     marker::PhantomData,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub mod capture;
 mod macros;
+pub mod record;
+pub mod ring;
 mod value;
 
+pub use record::{RingConfig, RingsRefused, Site, install_rings};
 pub use value::{ToValue, Value};
 
 #[cfg(test)]
@@ -66,7 +73,7 @@ impl Level {
     pub const INFO: Level = Level(3);
     pub const DEBUG: Level = Level(4);
     pub const TRACE: Level = Level(5);
-    /// Below every level: what a sink that keeps nothing says ([`Sink::max_level`]).
+    /// Below every level: no site is at it.
     pub const NONE: Level = Level(0);
 
     /// The most verbose level a site is compiled at: `TRACE` with debug assertions, `DEBUG`
@@ -376,7 +383,7 @@ impl From<&EnteredSpan> for ParentOf {
 
 /// The values of a site's fields in its field order: `None` for one not given (`field::Empty`
 /// or an `Option` that was `None`).
-type Values<'a> = &'a [Option<Value<'a>>];
+pub type Values<'a> = &'a [Option<Value<'a>>];
 
 fn visit(meta: &Metadata<'_>, values: Values<'_>, visitor: &mut dyn Visit) {
     for (index, value) in values.iter().enumerate() {
@@ -447,9 +454,33 @@ impl<'a> Event<'a> {
         Event { meta, values, parent }
     }
 
-    /// Gives the event to `sink`: what each event macro does once [`enabled`] said yes.
+    /// Gives the event to `sink`.
     pub fn dispatch(sink: &dyn Sink, meta: &'static Metadata<'static>, parent: Parent, values: Values<'_>) {
         sink.event(&Event { meta, values, parent });
+    }
+
+    /// Records an event of `site` in what records it: what each event macro does once the
+    /// site's state said something may.
+    #[inline]
+    pub fn emit(site: &'static Site, parent: Parent, values: Values<'_>) {
+        let state = site.state();
+        // As for a span ([`Span::open`]): the thread's own sink, the rings, the entry's sink.
+        if record::by_sink(state)
+            && let Some(sink) = record::THREAD.sink.get()
+        {
+            if sink.enabled(site.metadata()) {
+                Event::dispatch(sink, site.metadata(), parent, values);
+            }
+        } else if record::by_ring(state)
+            && let Some(config) = record::config()
+        {
+            record::event(config, record::id_of(state), parent, values);
+        } else if record::by_sink(state)
+            && let Some(sink) = current()
+            && sink.enabled(site.metadata())
+        {
+            Event::dispatch(sink, site.metadata(), parent, values);
+        }
     }
 
     pub const fn metadata(&self) -> &'static Metadata<'static> {
@@ -512,14 +543,9 @@ impl<'a> Record<'a> {
 /// Called on the thread the span or event happens on; a span's [`Sink::try_close`] on the
 /// thread its last handle drops on.
 pub trait Sink: Sync {
-    /// The most verbose level it keeps anything of: installing it raises the process's group
-    /// flag ([`wanted`]) to it, so a site above every sink's level costs one relaxed load.
-    fn max_level(&self) -> Level {
-        Level::TRACE
-    }
-
-    /// Whether it keeps `meta`'s spans or events: asked at every site reached, before any field
-    /// is evaluated.
+    /// Whether it keeps `meta`'s spans or events: the entry's sink is asked once a site (the
+    /// answer kept in the site's state), a thread's own sink at every call, before any field is
+    /// evaluated.
     fn enabled(&self, meta: &'static Metadata<'static>) -> bool;
 
     /// A span begins: its id, for the calls about it that follow.
@@ -553,10 +579,6 @@ pub trait Sink: Sync {
 pub struct Off;
 
 impl Sink for Off {
-    fn max_level(&self) -> Level {
-        Level::NONE
-    }
-
     fn enabled(&self, _: &'static Metadata<'static>) -> bool {
         false
     }
@@ -576,72 +598,45 @@ impl Sink for Off {
 
 // --- The one ambient hook ---------------------------------------------------------------
 
-/// The calling thread's own sink, ahead of the entry's.
-#[thread_local]
-static THREAD: Cell<Option<&'static dyn Sink>> = Cell::new(None);
-
-/// The entry's sink: written once under [`ENTRY_STATE`], then only read.
-struct EntrySink(UnsafeCell<Option<&'static dyn Sink>>);
-
-// SAFETY: written once, by the one `install` that moved ENTRY_STATE from EMPTY to WRITING, and
-// read only after ENTRY_STATE is READY (release, then acquire), so no read races the write.
-unsafe impl Sync for EntrySink {}
-
-static ENTRY: EntrySink = EntrySink(UnsafeCell::new(None));
-static ENTRY_STATE: AtomicU8 = AtomicU8::new(EMPTY);
-const EMPTY: u8 = 0;
-const WRITING: u8 = 1;
-const READY: u8 = 2;
-
-/// The group flag: the most verbose level any sink installed in this process keeps (0 while
-/// none is). Raised as a sink is installed and never lowered, so it only says "maybe": a site
-/// more verbose than it stops at one relaxed load, before the thread's sink is read.
-static MOST: AtomicU8 = AtomicU8::new(0);
-
-fn raise(sink: &dyn Sink) {
-    MOST.fetch_max(sink.max_level().0, Ordering::Relaxed);
-}
-
-/// Whether any sink of the process may keep a site at `level`: the first thing every macro
-/// asks after [`Level::compiled`], one relaxed load of a `static` and a branch.
-#[inline(always)]
-pub fn wanted(level: Level) -> bool {
-    level.0 <= MOST.load(Ordering::Relaxed)
-}
+/// The entry's sink: written once, then only read.
+static ENTRY: record::Once<&'static dyn Sink> = record::Once::new();
 
 /// The entry's sink was installed already: a process has one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Installed;
 
-/// Makes `sink` the process's: every thread with no sink of its own records into it. The
-/// program's entry calls it once, before it starts work; a second call is refused and changes
-/// nothing.
+/// Makes `sink` the process's: every thread with no sink of its own records into it the sites
+/// the rings do not. The program's entry calls it once, before it starts work; a second call
+/// is refused and changes nothing.
 pub fn install(sink: &'static dyn Sink) -> Result<(), Installed> {
-    if ENTRY_STATE.compare_exchange(EMPTY, WRITING, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        return Err(Installed);
-    }
-    // SAFETY: this call alone moved the state to WRITING, and no reader reads before READY.
-    unsafe { *ENTRY.0.get() = Some(sink) };
-    ENTRY_STATE.store(READY, Ordering::Release);
-    raise(sink);
+    ENTRY.set(sink)?;
+    record::decide_all();
     Ok(())
 }
 
 #[inline]
 fn entry() -> Option<&'static dyn Sink> {
-    if ENTRY_STATE.load(Ordering::Acquire) != READY {
-        return None;
-    }
-    // SAFETY: READY was stored after the one write, with release, and read here with acquire.
-    unsafe { *ENTRY.0.get() }
+    ENTRY.get().copied()
 }
 
-/// Sets the calling thread's own sink (`None`: the entry's again): the one it had.
+/// Sets the calling thread's own sink (`None`: the entry's again): the one it had. While any
+/// thread has one, every site takes the sink path, which asks the calling thread's sink.
 pub fn set_thread(sink: Option<&'static dyn Sink>) -> Option<&'static dyn Sink> {
-    if let Some(sink) = sink {
-        raise(sink);
+    let had = record::THREAD.sink.replace(sink);
+    match (had.is_some(), sink.is_some()) {
+        (false, true) => {
+            if record::THREAD_SINKS.fetch_add(1, Ordering::AcqRel) == 0 {
+                record::decide_all();
+            }
+        }
+        (true, false) => {
+            if record::THREAD_SINKS.fetch_sub(1, Ordering::AcqRel) == 1 {
+                record::decide_all();
+            }
+        }
+        _ => {}
     }
-    THREAD.replace(sink)
+    had
 }
 
 /// Runs `f` with `sink` as the calling thread's, then gives the thread back the one it had,
@@ -650,7 +645,7 @@ pub fn with_thread_sink<R>(sink: &'static dyn Sink, f: impl FnOnce() -> R) -> R 
     struct Restore(Option<&'static dyn Sink>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            THREAD.set(self.0);
+            set_thread(self.0);
         }
     }
     let _restore = Restore(set_thread(Some(sink)));
@@ -660,14 +655,13 @@ pub fn with_thread_sink<R>(sink: &'static dyn Sink, f: impl FnOnce() -> R) -> R 
 /// The sink the calling thread records into: its own, else the entry's.
 #[inline]
 pub fn current() -> Option<&'static dyn Sink> {
-    match THREAD.get() {
+    match record::THREAD.sink.get() {
         Some(sink) => Some(sink),
         None => entry(),
     }
 }
 
-/// The sink to give `meta`'s span or event to, if any wants it: what every macro asks before
-/// it evaluates a field.
+/// The sink to give `meta`'s span or event to, if any wants it.
 #[inline]
 pub fn enabled(meta: &'static Metadata<'static>) -> Option<&'static dyn Sink> {
     let sink = current()?;
@@ -683,37 +677,105 @@ struct Open {
     meta: &'static Metadata<'static>,
 }
 
+/// Who records a span.
+enum Inner {
+    None,
+    /// The rings: its site's id and its span id, 0 until its first entry.
+    Ring { site: &'static Site, span: AtomicU64 },
+    Sink(Open),
+}
+
 /// A handle of an open span: it closes when its last handle drops. Made by the span macros;
-/// none when no sink wanted it, and then every call on it does nothing.
+/// none when nothing records it, and then every call on it does nothing.
 pub struct Span {
-    open: Option<Open>,
+    inner: Inner,
 }
 
 impl Span {
-    /// The span no sink wanted.
+    /// The span nothing records.
     pub const fn none() -> Span {
-        Span { open: None }
+        Span { inner: Inner::None }
     }
 
-    /// Begins a span of `meta` in `sink`: what the span macros do once [`enabled`] said yes.
+    /// Begins a span of `site` in what records it: what the span macros do once the site's
+    /// state said something may. A span with no field and no named parent writes nothing yet:
+    /// its first entry is its enter.
+    #[inline]
+    pub fn open(site: &'static Site, parent: Parent, values: Values<'_>) -> Span {
+        let state = site.state();
+        // A thread's own sink comes first (a test's, a simulation's), then the rings, then the
+        // entry's sink.
+        if record::by_sink(state)
+            && let Some(sink) = record::THREAD.sink.get()
+        {
+            return match sink.enabled(site.metadata()) {
+                true => Span::new(sink, site.metadata(), parent, values),
+                false => Span::none(),
+            };
+        }
+        if record::by_ring(state)
+            && let Some(config) = record::config()
+        {
+            let span = if parent == Parent::Current && values.iter().all(Option::is_none) {
+                0
+            } else {
+                record::open(config, record::id_of(state), parent, values)
+            };
+            return Span { inner: Inner::Ring { site, span: AtomicU64::new(span) } };
+        }
+        if record::by_sink(state)
+            && let Some(sink) = current()
+            && sink.enabled(site.metadata())
+        {
+            return Span::new(sink, site.metadata(), parent, values);
+        }
+        Span::none()
+    }
+
+    /// Begins a span of `meta` in `sink`.
     pub fn new(sink: &'static dyn Sink, meta: &'static Metadata<'static>, parent: Parent, values: Values<'_>) -> Span {
         let id = sink.new_span(&Attributes { meta, values, parent });
-        Span { open: Some(Open { sink, id, meta }) }
+        Span { inner: Inner::Sink(Open { sink, id, meta }) }
+    }
+
+    #[inline(always)]
+    fn edge_in(&self) {
+        match &self.inner {
+            Inner::None => {}
+            Inner::Ring { site, span } => {
+                if let Some(config) = record::config() {
+                    let given = record::enter(config, site.id(), span.load(Ordering::Relaxed));
+                    span.store(given, Ordering::Relaxed);
+                }
+            }
+            Inner::Sink(open) => open.sink.enter(&open.id),
+        }
+    }
+
+    #[inline(always)]
+    fn edge_out(&self) {
+        match &self.inner {
+            Inner::None => {}
+            Inner::Ring { site, span } => {
+                if let Some(config) = record::config() {
+                    record::exit(config, site.id(), span.load(Ordering::Relaxed));
+                }
+            }
+            Inner::Sink(open) => open.sink.exit(&open.id),
+        }
     }
 
     /// Enters it on this thread until the guard drops.
+    #[inline]
     pub fn entered(self) -> EnteredSpan {
-        if let Some(open) = &self.open {
-            open.sink.enter(&open.id);
-        }
+        self.edge_in();
         EnteredSpan { span: self, _here: PhantomData }
     }
 
     /// Enters it on this thread until the guard drops, keeping the handle.
+    #[inline]
     pub fn enter(&self) -> Entered<'_> {
-        if let Some(open) = &self.open {
-            open.sink.enter(&open.id);
-        }
+        self.edge_in();
         Entered { span: self, _here: PhantomData }
     }
 
@@ -723,47 +785,87 @@ impl Span {
         f()
     }
 
+    /// The span id of a ring span, writing its open entry if it has none yet.
+    fn ring_id(site: &'static Site, span: &AtomicU64) -> u64 {
+        let id = span.load(Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+        let Some(config) = record::config() else { return 0 };
+        let id = record::open(config, site.id(), Parent::Current, &[]);
+        span.store(id, Ordering::Relaxed);
+        id
+    }
+
     /// Gives its field `field` the value `value`. Nothing for a field its site did not name,
     /// or a value that is `None`.
     pub fn record<V: ToValue>(&self, field: &str, value: V) -> &Span {
-        if let Some(open) = &self.open
-            && let Some(field) = open.meta.fields().field(field)
-            && let Some(value) = value.to_value()
-        {
-            open.sink.record(&open.id, &Record { field, value });
+        match &self.inner {
+            Inner::None => {}
+            Inner::Ring { site, span } => {
+                if let Some(field) = site.metadata().fields().field(field)
+                    && let Some(value) = value.to_value()
+                    && let Some(config) = record::config()
+                {
+                    let id = Span::ring_id(*site, span);
+                    record::record(config, site.id(), id, field.index() as u16, &value);
+                }
+            }
+            Inner::Sink(open) => {
+                if let Some(field) = open.meta.fields().field(field)
+                    && let Some(value) = value.to_value()
+                {
+                    open.sink.record(&open.id, &Record { field, value });
+                }
+            }
         }
         self
     }
 
-    /// Its id, `None` when no sink wanted it.
+    /// Its id, `None` when nothing records it. A ring span's id is its first entry's.
     pub fn id(&self) -> Option<Id> {
-        self.open.map(|it| it.id)
+        match &self.inner {
+            Inner::None => None,
+            Inner::Ring { site, span } => match Span::ring_id(*site, span) {
+                0 => None,
+                id => Some(Id(id)),
+            },
+            Inner::Sink(open) => Some(open.id),
+        }
     }
 
     pub fn is_none(&self) -> bool {
-        self.open.is_none()
+        matches!(self.inner, Inner::None)
     }
 
     pub fn is_disabled(&self) -> bool {
-        self.open.is_none()
+        self.is_none()
     }
 
     pub fn metadata(&self) -> Option<&'static Metadata<'static>> {
-        self.open.map(|it| it.meta)
+        match &self.inner {
+            Inner::None => None,
+            Inner::Ring { site, .. } => Some(site.metadata()),
+            Inner::Sink(open) => Some(open.meta),
+        }
     }
 }
 
 impl Clone for Span {
     fn clone(&self) -> Span {
         Span {
-            open: self.open.map(|open| Open { id: open.sink.clone_span(&open.id), ..open }),
+            inner: match &self.inner {
+                Inner::None => Inner::None,
+                Inner::Ring { site, span } => Inner::Ring { site: *site, span: AtomicU64::new(span.load(Ordering::Relaxed)) },
+                Inner::Sink(open) => Inner::Sink(Open { id: open.sink.clone_span(&open.id), ..*open }),
+            },
         }
     }
 }
 
 impl Drop for Span {
     fn drop(&mut self) {
-        if let Some(open) = self.open.take() {
+        if let Inner::Sink(open) = &self.inner {
             open.sink.try_close(open.id);
         }
     }
@@ -777,9 +879,14 @@ impl Default for Span {
 
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.open {
-            Some(open) => f.debug_struct("Span").field("name", &open.meta.name()).field("id", &open.id).finish(),
-            None => f.write_str("Span(none)"),
+        match &self.inner {
+            Inner::None => f.write_str("Span(none)"),
+            Inner::Ring { site, span } => f
+                .debug_struct("Span")
+                .field("name", &site.metadata().name())
+                .field("id", &span.load(Ordering::Relaxed))
+                .finish(),
+            Inner::Sink(open) => f.debug_struct("Span").field("name", &open.meta.name()).field("id", &open.id).finish(),
         }
     }
 }
@@ -795,9 +902,7 @@ impl EnteredSpan {
     /// Leaves it, keeping it open.
     pub fn exit(mut self) -> Span {
         let span = core::mem::replace(&mut self.span, Span::none());
-        if let Some(open) = &span.open {
-            open.sink.exit(&open.id);
-        }
+        span.edge_out();
         span
     }
 
@@ -815,10 +920,9 @@ impl core::ops::Deref for EnteredSpan {
 }
 
 impl Drop for EnteredSpan {
+    #[inline]
     fn drop(&mut self) {
-        if let Some(open) = &self.span.open {
-            open.sink.exit(&open.id);
-        }
+        self.span.edge_out();
     }
 }
 
@@ -835,9 +939,8 @@ pub struct Entered<'a> {
 }
 
 impl Drop for Entered<'_> {
+    #[inline]
     fn drop(&mut self) {
-        if let Some(open) = &self.span.open {
-            open.sink.exit(&open.id);
-        }
+        self.span.edge_out();
     }
 }

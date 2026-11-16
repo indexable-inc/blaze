@@ -37,7 +37,7 @@ use std::{
 
 use blaze_hash::HashMap;
 use blaze_mem::{MemError, Slab, Tag as MemTag};
-use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
+use crate::chan::{Receiver, SendTimeoutError, Sender};
 use std::alloc::Global;
 
 use crate::{
@@ -402,9 +402,9 @@ impl Kqueue {
         let kq = unsafe { OwnedFd::from_raw_fd(kq) };
         net::set_cloexec(kq.as_raw_fd())?;
         // alloc: setup, once per driver: each channel's slots.
-        let (files_done, files) = crossbeam_channel::bounded(FILES);
-        let (watched_done, watched) = crossbeam_channel::bounded(WATCHED); // alloc: as above.
-        let (work, queue) = crossbeam_channel::bounded::<Effect>(FILES); // alloc: as above.
+        let (files_done, files) = crate::chan::bounded(FILES);
+        let (watched_done, watched) = crate::chan::bounded(WATCHED); // alloc: as above.
+        let (work, queue) = crate::chan::bounded::<Effect>(FILES); // alloc: as above.
         let notify = Arc::new(Notify {
             kq,
             files: files_done,
@@ -426,7 +426,7 @@ impl Kqueue {
         )?;
         // alloc: setup, once per driver: the host's channel, which grows with what it tells
         // between two polls.
-        let (host_done, hosted) = crossbeam_channel::unbounded();
+        let (host_done, hosted) = crate::chan::unbounded();
         // clone: setup, a count of the kqueue for the host's wakes.
         let sink = HostSink { done: host_done, notify: Arc::clone(&notify) };
         let host = crate::host::Host::new(Arc::new(sink)); // alloc: setup, once per driver.

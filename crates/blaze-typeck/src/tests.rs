@@ -10,7 +10,7 @@
 //! - depth: 100,000 nested parentheses and 100,000 nested binary operators check without
 //!   growing the native stack.
 
-use blaze_own::Vec;
+use blaze_own::{Alloc, Vec};
 use blaze_sim::{Broke, Config, Tape};
 use std::alloc::Global;
 use std::format;
@@ -211,14 +211,14 @@ fn world(case: &Case) -> ToyWorld {
     }
 }
 
-fn run(case: &Case, w: &ToyWorld, hints: &Needs<Global>, plant: Plant) -> Result<Outcome<Global>, CheckError> {
+fn run(case: &Case, w: &ToyWorld, hints: &Needs<'_>, plant: Plant) -> Result<Outcome<'static>, CheckError> {
     let mut ty = ToyCtx::new();
     let body = case.body.view(w.owner, case.root);
-    check_with(&body, w, &mut ty, hints, plant, Global)
+    check_with(&body, w, &mut ty, hints, plant, Alloc::global())
 }
 
-fn done(case: &Case, w: &ToyWorld, plant: Plant) -> Result<Checked<Global>, Broke> {
-    match run(case, w, &Needs::new_in(Global), plant) {
+fn done(case: &Case, w: &ToyWorld, plant: Plant) -> Result<Checked<'static>, Broke> {
+    match run(case, w, &Needs::new_in(Alloc::global()), plant) {
         Ok(Outcome::Done(c)) => Ok(c),
         Ok(Outcome::Need(n)) => Err(Broke::Harness(format!("a full world was missing {:?}", n.questions))),
         Err(e) => Err(Broke::Oracle(format!("the check failed: {e}"))),
@@ -281,7 +281,7 @@ fn a_need_then_reentry_equals_one_run() {
                 w.missing.push(q);
             }
         }
-        let mut hints = Needs::new_in(Global);
+        let mut hints = Needs::new_in(Alloc::global());
         // Each stop fetches at least the question it missed.
         for _ in 0..=full.reads.questions().len() + 1 {
             match run(&case, &w, &hints, Plant::None) {
@@ -330,8 +330,8 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
     let w = world(&case);
     let view = case.body.view(w.owner, case.root);
     let mut ty = ToyCtx::new();
-    let reads = Reads::new_in(&w, Global);
-    let mut m = match Machine::new_in(view, reads, &mut ty, Plant::None, Global) {
+    let reads = Reads::new_in(&w, Alloc::global());
+    let mut m = match Machine::new_in(view, reads, &mut ty, Plant::None, Alloc::global()) {
         Ok(m) => m,
         Err(e) => panic!("the machine could not be made: {e}"),
     };
@@ -340,7 +340,7 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
         Err(e) => panic!("{e:?}"),
     };
     // Every undoable write a rule makes, then the variable's binding.
-    let write = |m: &mut Machine<'_, '_, '_, ToyWorld, ToyCtx, Global>| -> Result<Option<()>, Stop> {
+    let write = |m: &mut Machine<'_, '_, '_, '_, ToyWorld, ToyCtx>| -> Result<Option<()>, Stop> {
         m.diag(DiagCode::Mismatch, At::Body, None, None, None);
         let n = m.fresh_int()?;
         let unit = m.common.unit;
@@ -349,7 +349,7 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
         Ok(Some(()))
     };
     let before = (m.diags.len(), m.errors, m.numeric.len(), m.ty.pending_len());
-    let left = |m: &mut Machine<'_, '_, '_, ToyWorld, ToyCtx, Global>| {
+    let left = |m: &mut Machine<'_, '_, '_, '_, ToyWorld, ToyCtx>| {
         // `var` is bound to `n`, itself an unbound integer variable, so "bound" is "resolves
         // to something else", not "resolves to a non-variable".
         let bound = m.ty.shallow_resolve(var) != var;
@@ -386,7 +386,7 @@ fn deep(depth: u32, wrap: impl Fn(&mut BodyBuf, ExprId) -> ExprId) -> Result<(),
     let structs = Vec::new_in(Global);
     let case = Case { structs, params: Vec::new_in(Global), body, root: e };
     let w = world(&case);
-    match run(&case, &w, &Needs::new_in(Global), Plant::None) {
+    match run(&case, &w, &Needs::new_in(Alloc::global()), Plant::None) {
         Ok(Outcome::Done(c)) if c.diags.is_empty() => Ok(()),
         Ok(Outcome::Done(c)) => Err(format!("unexpected diagnostics: {:?}", c.diags)),
         Ok(Outcome::Need(n)) => Err(format!("needed {:?}", n.questions)),

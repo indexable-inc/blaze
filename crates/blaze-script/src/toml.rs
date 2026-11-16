@@ -24,8 +24,5 @@ pub fn read(text: &str) -> Result<Doc<'_>, Error> {
 
 /// `text` read as TOML and lowered to its root table.
 pub fn parse(text: &str) -> Result<Table, Error> {
-    match read(text)?.to_value_in(Global) {
-        blaze_data::Value::Map(table) => Ok(table),
-        _ => unreachable!("a TOML document's root is a table"),
-    }
+    Ok(read(text)?.to_map_in(Global))
 }

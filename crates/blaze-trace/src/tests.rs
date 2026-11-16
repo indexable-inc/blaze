@@ -10,6 +10,7 @@ use crate::{
     Attributes, Event, Id, Level, Metadata, Off, Record, Sink,
     capture::{Capture, Captured, Counter, Kept},
     field::Empty,
+    record,
 };
 
 /// The oracle of nesting: every span or event lies inside its parent's time (from the
@@ -234,4 +235,111 @@ fn levels_read_and_order_as_written() {
     assert!(Level::TRACE > Level::DEBUG && Level::WARN < Level::INFO && Level::ERROR < Level::WARN);
     assert_eq!(Level::compiled(Level::TRACE), cfg!(debug_assertions));
     assert!(Level::compiled(Level::DEBUG));
+}
+
+/// The only target the rings record in these tests, so the sink tests beside them are not
+/// changed by the rings being installed.
+const RING_TARGET: &str = "blaze_trace::ring_test";
+
+/// The rings' clock in these tests: every read one tick later.
+fn ring_clock() -> u64 {
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    TICK.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The oracle of the rings' edges: each exit leaves the innermost span entered and not left,
+/// at that span's depth, with a tick after its enter's; every span entered is left.
+fn edges_nest(entries: &[record::Entry]) -> Result<(), String> {
+    let mut open: Vec<(u64, u16, u64)> = Vec::new();
+    for entry in entries {
+        match *entry {
+            record::Entry::Enter { depth, tick, span, .. } => {
+                if usize::from(depth) != open.len() {
+                    return Err(format!("span {span} entered at depth {depth} inside {} spans", open.len()));
+                }
+                open.push((span, depth, tick));
+            }
+            record::Entry::Exit { depth, tick, span, .. } => match open.pop() {
+                Some((inner, at, began)) if inner == span && at == depth && began < tick => {}
+                other => return Err(format!("span {span} left at depth {depth} where the innermost is {other:?}")),
+            },
+            _ => {}
+        }
+    }
+    match open.is_empty() {
+        true => Ok(()),
+        false => Err(format!("spans {open:?} were never left")),
+    }
+}
+
+/// Spans nest in the thread's ring as they were entered, and every field is in the entries as
+/// written: a number as its raw word, text as its bytes.
+#[test]
+fn the_rings_hold_each_edge_and_field_as_written() {
+    use alloc::alloc::Global;
+    use alloc::boxed::Box;
+
+    let rings: &'static record::Rings = Box::leak(Box::new(record::Rings::new_in(8, 256, Global).unwrap()));
+    crate::install_rings(crate::RingConfig { rings, wants: |meta| meta.target() == RING_TARGET, clock: Some(ring_clock) })
+        .unwrap();
+    std::thread::spawn(move || {
+        let outer = crate::info_span!(target: RING_TARGET, "outer").entered();
+        {
+            let _inner = crate::info_span!(target: RING_TARGET, "inner", n = 7u64, name = %"a text").entered();
+        }
+        let first = outer.id().unwrap().into_u64();
+        drop(outer);
+        let (lane, from) = record::span_parts(first).unwrap();
+        let mut entries = Vec::new();
+        rings
+            .drain::<{ record::WORDS }>(crate::ring::Lane(lane), from, |got| match got {
+                crate::ring::Got::Entry { words, .. } => entries.push(record::decode(words)),
+                crate::ring::Got::Lost { from, count } => panic!("entries {from}..+{count} lost in a ring of 256"),
+            })
+            .unwrap();
+        edges_nest(&entries).unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .filter_map(|it| match *it {
+                record::Entry::Enter { site, .. } => record::site(site).map(Metadata::name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["outer", "inner"]);
+        let fields: Vec<record::Raw> = entries
+            .iter()
+            .filter_map(|it| match *it {
+                record::Entry::Field { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fields, [record::Raw::U64(7), record::Raw::Text { kept: 6, cut: 0 }]);
+        let text: Vec<u8> = entries
+            .iter()
+            .filter_map(|it| match *it {
+                record::Entry::Text { len, bytes } => Some(bytes[..usize::from(len)].to_vec()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(text, b"a text");
+    })
+    .join()
+    .unwrap();
+}
+
+/// The control of [`edges_nest`]: entries whose spans are left in the wrong order, or never,
+/// are caught.
+#[test]
+fn the_oracle_catches_edges_left_out_of_order() {
+    use record::Entry::{Enter, Exit};
+    let crossed = [
+        Enter { site: 1, depth: 0, tick: 1, span: 10 },
+        Enter { site: 2, depth: 1, tick: 2, span: 11 },
+        Exit { site: 1, depth: 0, tick: 3, span: 10 },
+        Exit { site: 2, depth: 1, tick: 4, span: 11 },
+    ];
+    assert!(edges_nest(&crossed).is_err());
+    assert!(edges_nest(&crossed[..2]).is_err());
+    assert!(edges_nest(&[crossed[0], Exit { site: 1, depth: 0, tick: 5, span: 10 }]).is_ok());
 }

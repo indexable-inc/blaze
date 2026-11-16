@@ -447,7 +447,7 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
 
     let driver = driver(8);
     let shared = driver.shared();
-    let (ready, entry) = crossbeam_channel::bounded(1);
+    let (ready, entry) = crate::ready();
     let control = std::thread::spawn(move || {
         let mut records = records;
         let stay = |why: &str| format!("a test's launcher does not restart: {why}");
@@ -474,8 +474,8 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
     assert_ne!(shared.target(Slot(0)), Some(0));
 
     // A thread calls slot 0, which has no code: its stub fires and the thread waits.
-    let (results, result) = crossbeam_channel::bounded::<u32>(2);
-    let (go, gone) = crossbeam_channel::bounded::<()>(1);
+    let (results, result) = std::sync::mpsc::sync_channel::<u32>(2);
+    let (go, gone) = std::sync::mpsc::sync_channel::<()>(1);
     let birth = shared.birth();
     let caller = std::thread::spawn(move || {
         let me = birth.begin();
@@ -539,7 +539,7 @@ fn a_launcher_starts_from_an_image_of_placed_code() {
     // A program's own launcher: an image is made for its mapping, not a test's small one.
     let driver = Driver::new(Config::PROGRAM).expect("a launcher's mapping");
     let shared = driver.shared();
-    let (ready, entry) = crossbeam_channel::bounded(1);
+    let (ready, entry) = crate::ready();
     let control = std::thread::spawn(move || {
         let mut records = crate::Loaded::new().expect("the program's data mapping");
         let stay = |why: &str| format!("a test's launcher does not restart: {why}");
@@ -636,7 +636,7 @@ fn an_image_of_another_geometry_is_refused() {
     daemon.set_read_timeout(Some(PATIENCE)).expect("a read timeout");
     let driver = Driver::new(Config::PROGRAM).expect("a launcher's mapping");
     let shared = driver.shared();
-    let (ready, entry) = crossbeam_channel::bounded(1);
+    let (ready, entry) = crate::ready();
     let control = std::thread::spawn(move || {
         let mut records = crate::Loaded::new().expect("the program's data mapping");
         let stay = |why: &str| format!("a test's launcher does not restart: {why}");

@@ -3,8 +3,7 @@
 //! (`/Volumes/Projects/ref-relax/relax/libs/relax/types/src`). This file dispatches a frame to
 //! its rule and holds what several rules share: argument checking and the `rvalue_hint`.
 
-use blaze_own::Vec;
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Vec};
 
 use crate::body::Expr;
 use crate::error::Stop;
@@ -153,7 +152,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// The types of a list's elements, all the error type: the inputs of a callee that failed.
     pub(crate) fn err_list(&mut self, n: usize) -> Result<TyList, Stop> {
-        let mut v: Vec<Ty, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
         v.resize(n, self.common.err);
         self.mk_list(&v)
     }

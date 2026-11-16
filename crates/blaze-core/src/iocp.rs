@@ -71,7 +71,7 @@ use std::{
 
 use blaze_hash::HashMap;
 use blaze_mem::{Slab, Tag as MemTag};
-use crossbeam_channel::{Receiver, Sender};
+use crate::chan::{Receiver, Sender};
 use std::alloc::Global;
 use windows_sys::Win32::{
     Foundation::{
@@ -616,8 +616,8 @@ impl Iocp {
         let port = Arc::new(Port::new()?);
         // Every work sends one thing back, and at most `WORK` are at the threads: neither
         // channel is ever full.
-        let (sender, back) = crossbeam_channel::bounded(WORK);
-        let (work, queue) = crossbeam_channel::bounded::<Work>(WORK);
+        let (sender, back) = crate::chan::bounded(WORK);
+        let (work, queue) = crate::chan::bounded::<Work>(WORK);
         // alloc: setup, the flag the threads share.
         let woken = Arc::new(Wake::new());
         #[cfg(test)]

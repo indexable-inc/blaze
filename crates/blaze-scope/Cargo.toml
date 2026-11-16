@@ -27,8 +27,14 @@ blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `Alloc::global()`: the tests' allocator handle.
+blaze-own = { workspace = true, features = ["std"] }
 # `testing::MemSurface`: the records the fixtures write, read back through `RecordFacts`.
 blaze-surface = { workspace = true, features = ["testing"] }
+# examples/pipeline.rs: `outline`, the FileItems of each file of a real crate.
+blaze-file-items.workspace = true
+# examples/pipeline.rs: the item macros the resolver asks to expand.
+blaze-expand.workspace = true
 
 [lints]
 workspace = true

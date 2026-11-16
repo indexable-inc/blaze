@@ -61,3 +61,9 @@ impl core::error::Error for SourceError {
         }
     }
 }
+
+// Callers box it into errors that cross threads.
+const _: () = {
+    const fn send_sync<T: Send + Sync + 'static>() {}
+    send_sync::<SourceError>();
+};

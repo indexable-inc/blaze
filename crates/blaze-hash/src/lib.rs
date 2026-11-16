@@ -20,12 +20,12 @@
 //!   hasher, the capacity or the process: dense entries and a table of `u32` indices, in a
 //!   named allocator as above. They replace the `indexmap` crate in blaze's own code.
 //! - A map or set shared between threads: [`SharedMap`] and [`SharedSet`] (and [`SharedByHash`]
-//!   for keys that are hashes), papaya's lock-free tables on the same hashers. A read takes no
-//!   lock and writes no shared memory, and nothing is held across a call, so no thread waits on
-//!   another's lookup. Its values are lent (`map.pin().get(..)`), never moved out: a table whose
-//!   entries are taken by value stays a locked [`HashMap`]. These name no allocator: papaya
-//!   takes none, and a shared table is long-lived (a daemon's, a view's), so the global heap is
-//!   its lifetime's allocator; `blaze::implicit_allocator` leaves them alone for that reason.
+//!   for keys that are hashes), this crate's sharded tables on the same hashers ([`shared`]). A
+//!   read takes no lock and writes no shared memory, and nothing is held across a call, so no
+//!   thread waits on another's lookup; a write locks one shard of 64. Its values are lent
+//!   (`map.pin().get(..)`), never moved out: a table whose entries are taken by value stays a
+//!   locked [`HashMap`]. They are on the global heap, named in code (`Global`): a shared table
+//!   is long-lived (a daemon's, a view's), so the global heap is its lifetime's allocator.
 //! - Keys an attacker may pick (a source's names and literals, a tree's file names, a path a
 //!   build script reads, a symbol's name) in a table that grows with them (an interner, an
 //!   index, a linker's symbols): [`SipKey`], SipHash-1-3 under a key drawn at random for a
@@ -77,6 +77,10 @@
 #[macro_use]
 extern crate std;
 
+// The shared tables lock a shard with std's lock and box their entries on std's heap.
+#[cfg(all(feature = "shared", not(test)))]
+extern crate std;
+
 use core::hash::{BuildHasher, Hasher};
 
 pub mod adaptive;
@@ -92,6 +96,8 @@ mod plain;
 mod raw;
 #[cfg(test)]
 mod raw_tests;
+#[cfg(feature = "shared")]
+pub mod shared;
 mod sip;
 #[cfg(test)]
 mod tests;
@@ -108,14 +114,11 @@ pub use blaze_own::AllocFailure;
 
 /// A borrowed form of a key that a table is asked with (`map.get(&("a", 1))` for a key of
 /// `(String, u32)`, through a type that compares to it); every `Q: Eq` that a key `Borrow`s is
-/// one. Under the `shared` feature it is papaya's trait of the same shape, so one impl serves
-/// the shared tables and these.
-#[cfg(not(feature = "shared"))]
+/// one. The shared tables take it too, so one impl serves them and these.
 pub trait Equivalent<K: ?Sized> {
     fn equivalent(&self, key: &K) -> bool;
 }
 
-#[cfg(not(feature = "shared"))]
 impl<Q: ?Sized + Eq, K: ?Sized + core::borrow::Borrow<Q>> Equivalent<K> for Q {
     #[inline]
     fn equivalent(&self, key: &K) -> bool {
@@ -147,28 +150,22 @@ pub type KeyedMap<K, V, A> = Map<K, V, SipKey, A>;
 /// A set of keys an attacker may pick, as [`KeyedMap`].
 pub type KeyedSet<K, A> = Set<K, SipKey, A>;
 
-/// A map of ordinary keys shared between threads, made by `SharedMap::default()`. Like the
-/// other shared tables it names no allocator: papaya takes none, and a shared table is
-/// long-lived, so it is on the global heap (see the crate's documentation). Behind the
-/// `shared` feature, which the crates that share a table turn on (the root manifest's entry).
+/// A map of ordinary keys shared between threads, made by `SharedMap::default()` ([`shared`]):
+/// on the global heap, as a shared table is long-lived (see the crate's documentation). Behind
+/// the `shared` feature, which the crates that share a table turn on (the root manifest's entry).
 #[cfg(feature = "shared")]
-pub type SharedMap<K, V> = papaya::HashMap<K, V, FixedState>;
+pub type SharedMap<K, V> = shared::Map<K, V, FixedState>;
 
 /// A set of ordinary keys shared between threads, made by `SharedSet::default()`.
 #[cfg(feature = "shared")]
-pub type SharedSet<K> = papaya::HashSet<K, FixedState>;
+pub type SharedSet<K> = shared::Set<K, FixedState>;
 
 /// A map on hashes shared between threads, indexed by the hash itself.
 #[cfg(feature = "shared")]
-pub type SharedByHash<K, V> = papaya::HashMap<K, V, BuildKeyHasher>;
-
-/// What every table is asked with under `shared`: a borrowed form of a key ([`Equivalent`]),
-/// and what a compare-and-swap of an entry does ([`Operation`], for `map.pin().compute(..)`).
-#[cfg(feature = "shared")]
-pub use papaya::{Equivalent, Operation};
+pub type SharedByHash<K, V> = shared::Map<K, V, BuildKeyHasher>;
 
 /// The `BuildHasher` of [`HashMap`] and [`HashSet`], and of any other table of ordinary keys
-/// (`OrderMap`, `papaya`'s): every hasher it builds is [`FixedHasher::default`].
+/// (`OrderMap`, the shared tables): every hasher it builds is [`FixedHasher::default`].
 /// Zero-sized and `Copy`, so a table holds nothing for it, and the type is its own value
 /// (`FixedState.hash_one(key)`, `HashMap::with_hasher(FixedState)`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]

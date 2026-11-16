@@ -202,32 +202,32 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub ret: Ty,
     /// Whether the code checked so far always diverges (rustc's `Diverges::Always`).
     pub diverges: bool,
-    pub frames: Vec<Frame, A>,
+    pub frames: Vec<Frame, Alloc<'a>>,
     pub max_frames: usize,
     // Results, by node.
-    pub expr_ty: Vec<Ty, A>,
-    pub pat_ty: Vec<Ty, A>,
-    pub local_ty: Vec<Ty, A>,
+    pub expr_ty: Vec<Ty, Alloc<'a>>,
+    pub pat_ty: Vec<Ty, Alloc<'a>>,
+    pub local_ty: Vec<Ty, Alloc<'a>>,
     // Sparse results, rows read whole.
     /// Adjustments in the order made; scanned by expression (a receiver's autoref).
-    pub adjust: Soa<(ExprId, AdjustKind, Ty), A>,
-    pub callees: Vec<(ExprId, ItemKey, TyList), A>,
-    pub fields: Vec<(ExprId, u32, u32), A>,
-    pub captures: Vec<(ExprId, PatId, CaptureKind), A>,
-    pub diags: Vec<PendingDiag, A>,
+    pub adjust: Soa<(ExprId, AdjustKind, Ty), Alloc<'a>>,
+    pub callees: Vec<(ExprId, ItemKey, TyList), Alloc<'a>>,
+    pub fields: Vec<(ExprId, u32, u32), Alloc<'a>>,
+    pub captures: Vec<(ExprId, PatId, CaptureKind), Alloc<'a>>,
+    pub diags: Vec<PendingDiag, Alloc<'a>>,
     /// The number of errors reported: the body is "tainted by errors" when it is not zero.
     pub errors: u32,
     // Queues, processed where rustc processes them.
-    pub casts: Vec<CastCheck, A>,
-    pub numeric: Vec<Ty, A>,
-    pub diverging: Vec<Ty, A>,
-    pub closures: Vec<PendingClosure, A>,
-    pub coerce_many: Vec<CoerceMany, A>,
-    pub breaks: Vec<BreakCtx, A>,
+    pub casts: Vec<CastCheck, Alloc<'a>>,
+    pub numeric: Vec<Ty, Alloc<'a>>,
+    pub diverging: Vec<Ty, Alloc<'a>>,
+    pub closures: Vec<PendingClosure, Alloc<'a>>,
+    pub coerce_many: Vec<CoerceMany, Alloc<'a>>,
+    pub breaks: Vec<BreakCtx, Alloc<'a>>,
     /// The innermost body's return site (the fn's, or a closure's).
-    pub ret_sites: Vec<u32, A>,
+    pub ret_sites: Vec<u32, Alloc<'a>>,
     /// The adjustments of the coercion being tried, moved to `adjust` once it commits.
-    pub adj_scratch: Vec<(AdjustKind, Ty), A>,
+    pub adj_scratch: Vec<(AdjustKind, Ty), Alloc<'a>>,
 }
 
 impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
@@ -256,11 +256,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             empty,
         };
         let err = common.err;
-        let mut expr_ty = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
+        let mut expr_ty = Vec::with_capacity_in(body.exprs.len(), alloc);
         expr_ty.resize(body.exprs.len(), err);
-        let mut pat_ty = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+        let mut pat_ty = Vec::with_capacity_in(body.pats.len(), alloc);
         pat_ty.resize(body.pats.len(), err);
-        let mut local_ty = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+        let mut local_ty = Vec::with_capacity_in(body.pats.len(), alloc);
         local_ty.resize(body.pats.len(), err);
         Ok(Machine {
             body,
@@ -270,25 +270,25 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             common,
             ret: err,
             diverges: false,
-            frames: Vec::new_in(alloc.clone()),
+            frames: Vec::new_in(alloc),
             max_frames: 4 * body.nodes() + 64,
             expr_ty,
             pat_ty,
             local_ty,
-            adjust: Soa::new_in(alloc.clone()),
-            callees: Vec::new_in(alloc.clone()),
-            fields: Vec::new_in(alloc.clone()),
-            captures: Vec::new_in(alloc.clone()),
-            diags: Vec::new_in(alloc.clone()),
+            adjust: Soa::new_in(alloc),
+            callees: Vec::new_in(alloc),
+            fields: Vec::new_in(alloc),
+            captures: Vec::new_in(alloc),
+            diags: Vec::new_in(alloc),
             errors: 0,
-            casts: Vec::new_in(alloc.clone()),
-            numeric: Vec::new_in(alloc.clone()),
-            diverging: Vec::new_in(alloc.clone()),
-            closures: Vec::new_in(alloc.clone()),
-            coerce_many: Vec::new_in(alloc.clone()),
-            breaks: Vec::new_in(alloc.clone()),
-            ret_sites: Vec::new_in(alloc.clone()),
-            adj_scratch: Vec::new_in(alloc.clone()),
+            casts: Vec::new_in(alloc),
+            numeric: Vec::new_in(alloc),
+            diverging: Vec::new_in(alloc),
+            closures: Vec::new_in(alloc),
+            coerce_many: Vec::new_in(alloc),
+            breaks: Vec::new_in(alloc),
+            ret_sites: Vec::new_in(alloc),
+            adj_scratch: Vec::new_in(alloc),
             alloc,
         })
     }
@@ -530,7 +530,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
 
     /// `n` fresh type variables.
     pub(crate) fn fresh_args(&mut self, n: u32) -> Result<TyList, Stop> {
-        let mut v: Vec<Ty, A> = Vec::with_capacity_in(n as usize, self.alloc.clone());
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
         for _ in 0..n {
             v.push(self.fresh()?);
         }
@@ -538,9 +538,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     }
 
     /// The list's types, copied out.
-    pub(crate) fn list(&self, l: TyList) -> Vec<Ty, A> {
+    pub(crate) fn list(&self, l: TyList) -> Vec<Ty, Alloc<'a>> {
         let n = self.ty.list_len(l);
-        let mut v = Vec::with_capacity_in(n as usize, self.alloc.clone());
+        let mut v = Vec::with_capacity_in(n as usize, self.alloc);
         for i in 0..n {
             v.push(self.ty.list_get(l, i));
         }
@@ -732,10 +732,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         if n > types.nodes.len() {
             return Err(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }).into());
         }
-        let mut memo: Vec<Option<Ty>, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut memo: Vec<Option<Ty>, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
         memo.resize(n, None);
-        let mut stack: Vec<(u32, bool), A> = Vec::new_in(self.alloc.clone());
-        let mut kids: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<(u32, bool), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
         stack.push((root.0, false));
         // Each node is expanded once and finished once; each list entry is pushed at most once
         // per expansion of its parent.
@@ -782,7 +782,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
 
     fn lowered_list(&mut self, memo: &[Option<Ty>], types: PTys<'_>, l: crate::ids::List) -> Result<TyList, Stop> {
         let src = types.list(l)?;
-        let mut v: Vec<Ty, A> = Vec::with_capacity_in(src.len(), self.alloc.clone());
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(src.len(), self.alloc);
         for &t in src {
             v.push(Self::lowered(memo, t)?);
         }
@@ -845,7 +845,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// A list of a world's answer, lowered with `args`.
     pub(crate) fn lower_list(&mut self, types: PTys<'_>, l: crate::ids::List, args: TyList) -> Result<TyList, Stop> {
         let src = types.list(l)?;
-        let mut v: Vec<Ty, A> = Vec::with_capacity_in(src.len(), self.alloc.clone());
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(src.len(), self.alloc);
         for &t in src {
             v.push(self.lower(types, t, Lower::Args(args))?);
         }
@@ -918,8 +918,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// The autoderef steps of `base` (rustc's `Autoderef`): `base` first, then each builtin or
     /// overloaded deref, until a type that does not deref, a variable, or the recursion limit
     /// (the second value: E0055 when true).
-    pub(crate) fn autoderef(&mut self, base: Ty, raw_ptrs: bool) -> Result<(Vec<Step, A>, bool), Stop> {
-        let mut steps: Vec<Step, A> = Vec::new_in(self.alloc.clone());
+    pub(crate) fn autoderef(&mut self, base: Ty, raw_ptrs: bool) -> Result<(Vec<Step, Alloc<'a>>, bool), Stop> {
+        let mut steps: Vec<Step, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut cur = self.try_structurally_resolve(base)?;
         steps.push(Step { ty: cur, overloaded: false });
         for _ in 0..RECURSION_LIMIT {

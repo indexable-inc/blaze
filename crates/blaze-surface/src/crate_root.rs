@@ -7,12 +7,11 @@
 //! the toolchain's built-in attributes. Every list but the `#[macro_use]` prelude, whose order
 //! is the source's, is sorted when it is written, so the order it was given in moves no byte.
 
-use core::alloc::Allocator;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Record, Slice, Writer};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::column::{
     Column, RecordBytes, Strings, Text, check_increasing, check_text, finish_with, key_of_word,
@@ -54,45 +53,45 @@ unsafe impl<N: Portable> Portable for Dep<N> {}
 /// [`CrateRoot`] record and [`CrateRootBuilder::from`] reads it back, equal when its lists were
 /// sorted as the record sorts them.
 #[derive(Clone, Debug)]
-pub struct CrateRootBuilder<N, A: Allocator> {
+pub struct CrateRootBuilder<'a, N> {
     pub head: CrateRootHead,
     /// The extern prelude, sorted by name: the `--extern` crates and the root's `extern crate`
     /// items (`extern crate self as name` too), each to its root module.
-    pub extern_prelude: Vec<(N, ItemKey), A>,
+    pub extern_prelude: AVec<'a, (N, ItemKey)>,
     /// Every dependency by name, sorted: what an `extern crate` and a `$crate` resolve against.
-    pub deps: Vec<Dep<N>, A>,
+    pub deps: AVec<'a, Dep<N>>,
     /// The root modules of the crates under `#[macro_use] extern crate` (std's or core's
     /// injected one included), whose exported macros are the `#[macro_use]` prelude, in order.
-    pub macro_use: Vec<ItemKey, A>,
+    pub macro_use: AVec<'a, ItemKey>,
     /// The crate's `#[macro_export]` `macro_rules!` written in source (not macro-expanded),
     /// sorted by name: they are bindings of the root's scope.
-    pub macro_exports: Vec<(N, ItemKey), A>,
+    pub macro_exports: AVec<'a, (N, ItemKey)>,
     /// The tool names (`rustfmt`, `clippy`, `register_tool`'s), sorted: an attribute path
     /// beginning with one is inert.
-    pub tools: Vec<N, A>,
+    pub tools: AVec<'a, N>,
     /// The toolchain's built-in attribute names (`inline`, `test`, `derive`, ...), sorted:
     /// a one-segment attribute naming one is inert, and an attribute macro of a nearer scope
     /// shadowing one is ambiguous (rustc's built-in attribute scope).
-    pub builtin_attrs: Vec<N, A>,
+    pub builtin_attrs: AVec<'a, N>,
 }
 
-impl<N, A: Allocator + Clone> CrateRootBuilder<N, A> {
+impl<'a, N> CrateRootBuilder<'a, N> {
     /// A crate of `head` with empty lists.
-    pub fn new_in(head: CrateRootHead, alloc: A) -> CrateRootBuilder<N, A> {
+    pub fn new_in(head: CrateRootHead, alloc: Alloc<'a>) -> CrateRootBuilder<'a, N> {
         CrateRootBuilder {
             head,
-            extern_prelude: Vec::new_in(alloc.clone()),
-            deps: Vec::new_in(alloc.clone()),
-            macro_use: Vec::new_in(alloc.clone()),
-            macro_exports: Vec::new_in(alloc.clone()),
-            tools: Vec::new_in(alloc.clone()),
-            builtin_attrs: Vec::new_in(alloc),
+            extern_prelude: AVec::new_in(alloc),
+            deps: AVec::new_in(alloc),
+            macro_use: AVec::new_in(alloc),
+            macro_exports: AVec::new_in(alloc),
+            tools: AVec::new_in(alloc),
+            builtin_attrs: AVec::new_in(alloc),
         }
     }
 }
 
-impl<N: PartialEq, A: Allocator, B: Allocator> PartialEq<CrateRootBuilder<N, B>> for CrateRootBuilder<N, A> {
-    fn eq(&self, other: &CrateRootBuilder<N, B>) -> bool {
+impl<'b, N: PartialEq> PartialEq<CrateRootBuilder<'b, N>> for CrateRootBuilder<'_, N> {
+    fn eq(&self, other: &CrateRootBuilder<'b, N>) -> bool {
         self.head == other.head
             && self.extern_prelude[..] == other.extern_prelude[..]
             && self.deps[..] == other.deps[..]
@@ -145,13 +144,13 @@ const TABLE: &str = "CrateRoot";
 
 /// The indexes of `rows` in the order of `key` (a name, then a key), an exact repeat kept
 /// once; with `unique`, two rows of one name are refused as a repeat of that table.
-fn sorted_order<T, B: Allocator>(
+fn sorted_order<'b, T>(
     rows: &[T],
     key: impl Fn(&T) -> (&str, ContentId),
     unique: Option<&'static str>,
-    alloc: B,
-) -> Result<Vec<usize, B>, BuildError> {
-    let mut order = Vec::from_iter_in(0..rows.len(), alloc);
+    alloc: Alloc<'b>,
+) -> Result<AVec<'b, usize>, BuildError> {
+    let mut order = AVec::from_iter_in(0..rows.len(), alloc);
     order.sort_unstable_by(|a, b| key(&rows[*a]).cmp(&key(&rows[*b])));
     order.dedup_by(|a, b| key(&rows[*a]) == key(&rows[*b]));
     if let Some(table) = unique {
@@ -162,15 +161,15 @@ fn sorted_order<T, B: Allocator>(
     Ok(order)
 }
 
-impl<N: AsRef<str>, A: Allocator> CrateRootBuilder<N, A> {
+impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
     /// The [`CrateRoot`] record of this crate, in `alloc`. Two names of the extern prelude or
     /// of the dependencies that name different crates are refused; an exact repeat is kept once.
-    pub fn write<B: Allocator + Clone>(&self, alloc: B) -> Result<RecordBytes<B>, BuildError> {
+    pub fn write<'b>(&self, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, BuildError> {
         let zero = ContentId([0; 32]);
-        let mut strings = Strings::new_in(alloc.clone());
-        let named = |rows: &[(N, ItemKey)], unique, strings: &mut Strings<B>| -> Result<Vec<NamedKeyRow, B>, BuildError> {
-            let order = sorted_order(rows, |(name, key)| (name.as_ref(), key.0), unique, alloc.clone())?;
-            let mut out = Vec::with_capacity_in(order.len(), alloc.clone());
+        let mut strings = Strings::new_in(alloc);
+        let named = |rows: &[(N, ItemKey)], unique, strings: &mut Strings<'b>| -> Result<AVec<'b, NamedKeyRow>, BuildError> {
+            let order = sorted_order(rows, |(name, key)| (name.as_ref(), key.0), unique, alloc)?;
+            let mut out = Vec::with_capacity_in(order.len(), alloc);
             for &at in order.iter() {
                 let (name, key) = &rows[at];
                 out.push(NamedKeyRow { name: strings.push(name.as_ref(), TABLE)?, key: key.0 });
@@ -178,16 +177,16 @@ impl<N: AsRef<str>, A: Allocator> CrateRootBuilder<N, A> {
             Ok(out)
         };
         let externs = named(&self.extern_prelude, Some("CrateRoot extern prelude"), &mut strings)?;
-        let order = sorted_order(&self.deps, |d| (d.name.as_ref(), d.krate.0), Some("CrateRoot deps"), alloc.clone())?;
-        let mut deps = Vec::with_capacity_in(order.len(), alloc.clone());
+        let order = sorted_order(&self.deps, |d| (d.name.as_ref(), d.krate.0), Some("CrateRoot deps"), alloc)?;
+        let mut deps = Vec::with_capacity_in(order.len(), alloc);
         for &at in order.iter() {
             let d = &self.deps[at];
             deps.push(DepRow { name: strings.push(d.name.as_ref(), TABLE)?, krate: d.krate.0, root: d.root.0 });
         }
         let macro_exports = named(&self.macro_exports, None, &mut strings)?;
-        let names = |rows: &[N], strings: &mut Strings<B>| -> Result<Vec<Text, B>, BuildError> {
-            let order = sorted_order(rows, |name| (name.as_ref(), zero), None, alloc.clone())?;
-            let mut out = Vec::with_capacity_in(order.len(), alloc.clone());
+        let names = |rows: &[N], strings: &mut Strings<'b>| -> Result<AVec<'b, Text>, BuildError> {
+            let order = sorted_order(rows, |name| (name.as_ref(), zero), None, alloc)?;
+            let mut out = Vec::with_capacity_in(order.len(), alloc);
             for &at in order.iter() {
                 out.push(strings.push(rows[at].as_ref(), TABLE)?);
             }
@@ -195,7 +194,7 @@ impl<N: AsRef<str>, A: Allocator> CrateRootBuilder<N, A> {
         };
         let tools = names(&self.tools, &mut strings)?;
         let builtin_attrs = names(&self.builtin_attrs, &mut strings)?;
-        let macro_use = Vec::from_iter_in(self.macro_use.iter().map(|key| key.0), alloc.clone());
+        let macro_use = Vec::from_iter_in(self.macro_use.iter().map(|key| key.0), alloc);
 
         let mut out = Writer::new_in(<CrateRootRoot as Record>::SCHEMA, alloc);
         let text = Column::push(&mut out, strings.bytes());
@@ -226,10 +225,10 @@ impl<N: AsRef<str>, A: Allocator> CrateRootBuilder<N, A> {
     }
 }
 
-impl<'a, A: Allocator + Clone> CrateRootBuilder<&'a str, A> {
+impl<'a, 'b> CrateRootBuilder<'b, &'a str> {
     /// The working form of a [`CrateRoot`] record, its names borrowed from the record, in
     /// `alloc`.
-    pub fn from(view: &CrateRootView<'a>, alloc: A) -> CrateRootBuilder<&'a str, A> {
+    pub fn from(view: &CrateRootView<'a>, alloc: Alloc<'b>) -> CrateRootBuilder<'b, &'a str> {
         let mut out = CrateRootBuilder::new_in(view.head(), alloc);
         out.extern_prelude.extend(view.externs());
         out.deps.extend(view.deps());

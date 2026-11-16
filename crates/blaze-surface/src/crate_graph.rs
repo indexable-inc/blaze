@@ -28,13 +28,12 @@
 //! The record is built here and read here; the lookups across it (`blaze_impls::candidates`,
 //! `blaze_impls::lang_item`) are blaze-impls'.
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::column::RecordBytes;
 use crate::kind::Edition;
@@ -310,10 +309,10 @@ pub(crate) fn slice_field<T>(record_at: u64, offset: usize, target: u64, len: us
 
 /// The graph of `crates`, in any order, as one buffer in `alloc`: equal bytes for every order
 /// of the same crates and of each crate's dependencies.
-pub fn build_crate_graph<A: Allocator + Clone>(
+pub fn build_crate_graph<'a>(
     crates: &[CrateInput<'_>],
-    alloc: A,
-) -> Result<RecordBytes<A>, GraphError> {
+    alloc: Alloc<'a>,
+) -> Result<RecordBytes<'a>, GraphError> {
     let n = crates.len();
     if n > MAX_CRATES {
         return Err(GraphError::TooManyCrates { count: n });
@@ -323,7 +322,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
         return Err(GraphError::TooManyEdges { count: edge_count });
     }
     // The crates by key: input places sorted by key, which sorts them by prefix as well.
-    let mut by_key: Vec<u32, A> = Vec::with_capacity_in(n, alloc.clone());
+    let mut by_key: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
     by_key.extend((0..n).map(|p| p as u32));
     by_key.sort_unstable_by_key(|&p| crates[p as usize].key);
     for &p in &by_key {
@@ -341,7 +340,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
             return Err(GraphError::PrefixClash { first, second });
         }
     }
-    let mut rank = Vec::from_elem_in(0u32, n, alloc.clone());
+    let mut rank = Vec::from_elem_in(0u32, n, alloc);
     for (r, &p) in by_key.iter().enumerate() {
         rank[p as usize] = r as u32;
     }
@@ -352,8 +351,8 @@ pub fn build_crate_graph<A: Allocator + Clone>(
             .map(|r| by_key[r] as usize)
     };
     // Each edge's target, by input place, in each crate's run of `starts`.
-    let mut starts = Vec::from_elem_in(0usize, n + 1, alloc.clone());
-    let mut targets: Vec<u32, A> = Vec::with_capacity_in(edge_count, alloc.clone());
+    let mut starts = Vec::from_elem_in(0usize, n + 1, alloc);
+    let mut targets: AVec<'a, u32> = Vec::with_capacity_in(edge_count, alloc);
     for (p, krate) in crates.iter().enumerate() {
         starts[p] = targets.len();
         for dep in krate.deps {
@@ -371,7 +370,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
     }
     starts[n] = targets.len();
     // Who depends on each crate, by input place: the reverse edges, as runs.
-    let mut rev_starts = Vec::from_elem_in(0usize, n + 1, alloc.clone());
+    let mut rev_starts = Vec::from_elem_in(0usize, n + 1, alloc);
     for &q in &targets {
         rev_starts[q as usize + 1] += 1;
     }
@@ -379,7 +378,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
         rev_starts[q + 1] += rev_starts[q];
     }
     let mut rev_fill = rev_starts.clone();
-    let mut rev = Vec::from_elem_in(0u32, targets.len(), alloc.clone());
+    let mut rev = Vec::from_elem_in(0u32, targets.len(), alloc);
     for p in 0..n {
         for &q in &targets[starts[p]..starts[p + 1]] {
             rev[rev_fill[q as usize]] = p as u32;
@@ -387,8 +386,8 @@ pub fn build_crate_graph<A: Allocator + Clone>(
         }
     }
     // Kahn's order, the ready crate of least key first: a bit per rank.
-    let mut remaining = Vec::from_elem_in(0usize, n, alloc.clone());
-    let mut ready = Vec::from_elem_in(0u64, words_for(n), alloc.clone());
+    let mut remaining = Vec::from_elem_in(0usize, n, alloc);
+    let mut ready = Vec::from_elem_in(0u64, words_for(n), alloc);
     for p in 0..n {
         remaining[p] = starts[p + 1] - starts[p];
         if remaining[p] == 0 {
@@ -397,8 +396,8 @@ pub fn build_crate_graph<A: Allocator + Clone>(
         }
     }
     const UNPLACED: u32 = u32::MAX;
-    let mut index = Vec::from_elem_in(UNPLACED, n, alloc.clone());
-    let mut order: Vec<u32, A> = Vec::with_capacity_in(n, alloc.clone());
+    let mut index = Vec::from_elem_in(UNPLACED, n, alloc);
+    let mut order: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
     for i in 0..n {
         let Some(word) = ready.iter().position(|&it| it != 0) else {
             let left = by_key.iter().find(|&&p| index[p as usize] == UNPLACED);
@@ -420,10 +419,10 @@ pub fn build_crate_graph<A: Allocator + Clone>(
         }
     }
     // The rows, the edges and the names, in index order.
-    let mut crate_rows: Vec<CrateRow, A> = Vec::with_capacity_in(n, alloc.clone());
-    let mut edge_rows: Vec<EdgeRow, A> = Vec::with_capacity_in(edge_count, alloc.clone());
-    let mut names: Vec<u8, A> = Vec::new_in(alloc.clone());
-    let mut slots: Vec<usize, A> = Vec::new_in(alloc.clone());
+    let mut crate_rows: AVec<'a, CrateRow> = Vec::with_capacity_in(n, alloc);
+    let mut edge_rows: AVec<'a, EdgeRow> = Vec::with_capacity_in(edge_count, alloc);
+    let mut names: AVec<'a, u8> = Vec::new_in(alloc);
+    let mut slots: AVec<'a, usize> = Vec::new_in(alloc);
     for &p in &order {
         let krate = &crates[p as usize];
         slots.clear();
@@ -462,7 +461,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
     }
     // What each crate loads, its dependencies' rows before its own; and the transpose.
     let words = words_for(n);
-    let mut closure = Vec::from_elem_in(0u64, n * words, alloc.clone());
+    let mut closure = Vec::from_elem_in(0u64, n * words, alloc);
     for i in 0..n {
         let (done, rest) = closure.split_at_mut(i * words);
         let row = &mut rest[..words];
@@ -478,13 +477,13 @@ pub fn build_crate_graph<A: Allocator + Clone>(
             }
         }
     }
-    let mut dependents = Vec::from_elem_in(0u64, n * words, alloc.clone());
+    let mut dependents = Vec::from_elem_in(0u64, n * words, alloc);
     for i in 0..n {
         for j in (Members { words: &closure[i * words..(i + 1) * words], at: 0, bits: 0 }) {
             dependents[j.at() * words + i / 64] |= 1 << (i % 64);
         }
     }
-    let mut prefix_rows: Vec<PrefixRow, A> = Vec::with_capacity_in(n, alloc.clone());
+    let mut prefix_rows: AVec<'a, PrefixRow> = Vec::with_capacity_in(n, alloc);
     prefix_rows.extend(by_key.iter().map(|&p| PrefixRow {
         prefix: crates[p as usize].key.prefix(),
         index: index[p as usize],

@@ -78,7 +78,7 @@ use blaze_script::{
     fail, git,
     input::{self, Fields, Input, InputError},
     read_text,
-    toml::{self, Node},
+    toml,
     universal_newlines,
 };
 
@@ -141,7 +141,7 @@ fn read_toml<'t>(file: &str, text: &'t str) -> Result<toml::Doc<'t>, DepsError> 
 }
 
 /// The line (from 1) a key, table or value of a document starts at.
-fn line_of(item: Node<'_, '_>) -> usize {
+fn line_of(item: toml::Node<'_, '_>) -> usize {
     item.line_col().0
 }
 
@@ -363,21 +363,21 @@ fn manifest_path(dir: &str) -> String {
 }
 
 /// The key `key` of `table` is not `want`: refused at its line.
-fn shape(item: Node<'_, '_>, key: &str, file: &str, want: &'static str) -> DepsError {
+fn shape(item: toml::Node<'_, '_>, key: &str, file: &str, want: &'static str) -> DepsError {
     DepsError::Shape { at: Place { file: file.to_owned(), line: line_of(item) }, key: key.to_owned(), want }
 }
 
-fn get_str(table: Node<'_, '_>, key: &str, file: &str) -> Result<Option<String>, DepsError> {
+fn get_str(table: toml::Node<'_, '_>, key: &str, file: &str) -> Result<Option<String>, DepsError> {
     let Some(item) = table.get(key) else { return Ok(None) };
     item.as_str().map(|it| Some(it.to_owned())).ok_or_else(|| shape(item, key, file, "a string"))
 }
 
-fn get_bool(table: Node<'_, '_>, key: &str, file: &str) -> Result<Option<bool>, DepsError> {
+fn get_bool(table: toml::Node<'_, '_>, key: &str, file: &str) -> Result<Option<bool>, DepsError> {
     let Some(item) = table.get(key) else { return Ok(None) };
     item.as_bool().map(Some).ok_or_else(|| shape(item, key, file, "a boolean"))
 }
 
-fn get_table<'d, 't>(table: Node<'d, 't>, key: &str, file: &str) -> Result<Option<Node<'d, 't>>, DepsError> {
+fn get_table<'d, 't>(table: toml::Node<'d, 't>, key: &str, file: &str) -> Result<Option<toml::Node<'d, 't>>, DepsError> {
     match table.get(key) {
         None => Ok(None),
         Some(item) if item.is_table() => Ok(Some(item)),
@@ -386,7 +386,7 @@ fn get_table<'d, 't>(table: Node<'d, 't>, key: &str, file: &str) -> Result<Optio
 }
 
 /// An array of strings, with the line of its key.
-fn get_strs(table: Node<'_, '_>, key: &str, file: &str) -> Result<Option<(usize, Vec<String>)>, DepsError> {
+fn get_strs(table: toml::Node<'_, '_>, key: &str, file: &str) -> Result<Option<(usize, Vec<String>)>, DepsError> {
     let Some(item) = table.get(key) else { return Ok(None) };
     let refused = || shape(item, key, file, "an array of strings");
     if !item.is_array() {
@@ -436,7 +436,7 @@ struct Dep {
 
 /// The dependency `key = value` at `at` of a manifest in `dir`; `root_deps` the root's
 /// `[workspace.dependencies]`, which `workspace = true` reads (its paths from the root).
-fn dep_of(key: &str, value: Node<'_, '_>, kind: DepKind, at: &Place, dir: &str, root_deps: Option<Node<'_, '_>>) -> Result<Dep, DepsError> {
+fn dep_of(key: &str, value: toml::Node<'_, '_>, kind: DepKind, at: &Place, dir: &str, root_deps: Option<toml::Node<'_, '_>>) -> Result<Dep, DepsError> {
     let mut dep = Dep { key: key.to_owned(), package: key.to_owned(), path: None, version: None, optional: false, kind, at: at.clone() };
     let shape = |want: &'static str| DepsError::Shape { at: at.clone(), key: key.to_owned(), want };
     let file = at.file.as_str();
@@ -473,8 +473,8 @@ fn dep_of(key: &str, value: Node<'_, '_>, kind: DepKind, at: &Place, dir: &str, 
 }
 
 /// Every dependency the manifest `table` (the file `file`, in `dir`) names, in line order.
-fn deps_of(file: &str, dir: &str, table: Node<'_, '_>, root_deps: Option<Node<'_, '_>>) -> Result<Vec<Dep>, DepsError> {
-    let mut tables: Vec<(Node<'_, '_>, DepKind)> = Vec::new();
+fn deps_of(file: &str, dir: &str, table: toml::Node<'_, '_>, root_deps: Option<toml::Node<'_, '_>>) -> Result<Vec<Dep>, DepsError> {
+    let mut tables: Vec<(toml::Node<'_, '_>, DepKind)> = Vec::new();
     for (name, kind) in DEP_TABLES {
         if let Some(it) = get_table(table, name, file)? {
             tables.push((it, kind));
@@ -516,7 +516,7 @@ struct Manifest {
 }
 
 /// Whether the `[package]` table `package` says `[package.metadata.blaze] ours = true`.
-fn fork_is_ours(package: Node<'_, '_>, file: &str) -> Result<bool, DepsError> {
+fn fork_is_ours(package: toml::Node<'_, '_>, file: &str) -> Result<bool, DepsError> {
     let Some(metadata) = get_table(package, "metadata", file)? else { return Ok(false) };
     let Some(blaze) = get_table(metadata, "blaze", file)? else { return Ok(false) };
     Ok(get_bool(blaze, OURS, file)? == Some(true))

@@ -567,7 +567,7 @@ mod termination {
     #[test]
     fn every_entry_point_finishes_on_every_input() {
         let done = Arc::new(AtomicUsize::new(0));
-        let (finished, wait) = crossbeam_channel::unbounded();
+        let (finished, wait) = blaze_core::chan::unbounded();
         let worker = {
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
@@ -577,11 +577,11 @@ mod termination {
         };
         match wait.recv_timeout(DEADLINE) {
             Ok(()) => worker.join().unwrap(),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(blaze_core::chan::RecvTimeoutError::Disconnected) => match worker.join() {
                 Ok(()) => unreachable!("the runs end by sending"),
                 Err(panic) => std::panic::resume_unwind(panic),
             },
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => panic!(
+            Err(blaze_core::chan::RecvTimeoutError::Timeout) => panic!(
                 "run {} did not finish within {DEADLINE:?}: the grammar loops without starting \
                  a node, making an error or consuming a token",
                 done.load(Ordering::Relaxed)

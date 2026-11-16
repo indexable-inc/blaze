@@ -19,6 +19,7 @@ use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::Plant;
 use crate::answers::{read_last, read_page, read_root};
+use crate::condition::{Condition, Space, Var};
 use crate::key::{self, Key, Kind, Name, Tool};
 use crate::record::{Finding, Locate, Part};
 use crate::request::{
@@ -38,6 +39,8 @@ struct Item {
     uses: Option<(usize, usize)>,
     /// Items whose signatures the body reads.
     calls: StdVec<(usize, usize)>,
+    /// The cfg variables the item reads (signature and body alike), in order.
+    cfg: StdVec<Var>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +52,12 @@ struct World {
     /// linearity test steps 100,000 jobs). Names do not depend on the text, so an edit keeps it.
     items: BTreeMap<Name, (usize, usize)>,
     file_subjects: BTreeMap<ContentId, usize>,
+    /// The cfg space's value count per variable (empty: one configuration).
+    values: StdVec<u16>,
+    /// Every body is a finding whose message is its out digest: the conditions oracle compares
+    /// every body's value, not only the quarter that are findings.
+    find_all: bool,
+    plant: Plant,
 }
 
 fn path(file: usize) -> StdVec<u8> {
@@ -95,7 +104,7 @@ impl World {
                     false => Some(earlier[tape.index(earlier.len(), "use")]),
                 };
                 let calls = (0..tape.index(3, "calls")).map(|_| all[tape.index(all.len(), "call")]).collect();
-                items.push(Item { sig: tape.below(4, "sig"), body: tape.below(4, "body"), uses, calls });
+                items.push(Item { sig: tape.below(4, "sig"), body: tape.below(4, "body"), uses, calls, cfg: StdVec::new() });
                 earlier.push((f, i));
             }
             files.push(items);
@@ -113,7 +122,7 @@ impl World {
                 items.insert(body_name(f, i), (f, i));
             }
         }
-        World { files, dep: None, items, file_subjects }
+        World { files, dep: None, items, file_subjects, values: StdVec::new(), find_all: false, plant: Plant::None }
     }
 
     fn bytes(&self, file: usize) -> StdVec<u8> {
@@ -169,6 +178,7 @@ struct Made {
 enum Answered {
     Done(Made),
     Need(StdVec<Want>),
+    Cfg(Var),
 }
 
 fn input_out(task: &Task<Global>, name: Name) -> Option<ContentId> {
@@ -194,6 +204,19 @@ fn reads_of(task: &Task<Global>, wanted: &[(Name, Name)]) -> Result<StdVec<(Name
     }
 }
 
+/// An item's out digest: its value, what it read (sorted, by base name), the cfg values read.
+fn item_out(value: u64, reads: &[(Name, ContentId)], cfg: &[u16]) -> ContentId {
+    key::digest("sim item out", format!("{value} {reads:?} {cfg:?}").as_bytes())
+}
+
+/// A body's finding, if it is one.
+fn finding(world: &World, kind: Kind, out: &ContentId) -> Option<StdVec<u8>> {
+    match kind == Kind::BodyCheck && (world.find_all || out.0[0] < 64) {
+        true => Some(format!("toy finding {:02x}{:02x}{:02x}{:02x}", out.0[1], out.0[2], out.0[3], out.0[4]).into_bytes()),
+        false => None,
+    }
+}
+
 fn execute(world: &World, task: &Task<Global>) -> Result<Answered, Broke> {
     let name = task.name;
     let done = |out, reads, parts, findings| Ok(Answered::Done(Made { name, out, reads, parts, findings }));
@@ -210,7 +233,7 @@ fn execute(world: &World, task: &Task<Global>) -> Result<Answered, Broke> {
             done(out, StdVec::new(), parts, StdVec::new())
         }
         Kind::FileItems => {
-            let f = world.file_of(&name.subject).ok_or(Broke::Harness(format!("no file for {name}")))?;
+            let f = world.file_of(&task.base.subject).ok_or(Broke::Harness(format!("no file for {name}")))?;
             let mut parts = StdVec::new();
             for (i, item) in world.files[f].iter().enumerate() {
                 let place = u32::try_from(i).unwrap_or(u32::MAX);
@@ -222,8 +245,16 @@ fn execute(world: &World, task: &Task<Global>) -> Result<Answered, Broke> {
             done(out, StdVec::new(), parts, StdVec::new())
         }
         Kind::Signature | Kind::BodyCheck => {
-            let (f, i) = world.item_of(name).ok_or(Broke::Harness(format!("no item for {name}")))?;
+            let (f, i) = world.item_of(task.base).ok_or(Broke::Harness(format!("no item for {name}")))?;
             let item = &world.files[f][i];
+            // Its cfg reads first: one the condition does not fix is `Need(Cfg(variable))`.
+            let mut values = StdVec::new();
+            for var in &item.cfg {
+                match task.condition.get(*var) {
+                    Some(value) => values.push(value),
+                    None => return Ok(Answered::Cfg(*var)),
+                }
+            }
             let (wanted, value, source): (StdVec<(Name, Name)>, u64, ContentId) = match name.kind {
                 Kind::Signature => {
                     let wanted = item.uses.iter().map(|(uf, ui)| (sig_name(*uf, *ui), file_name(*uf))).collect();
@@ -240,10 +271,10 @@ fn execute(world: &World, task: &Task<Global>) -> Result<Answered, Broke> {
             match reads_of(task, &wanted) {
                 Err(lacking) => Ok(Answered::Need(lacking)),
                 Ok(reads) => {
-                    let out = key::digest("sim item out", format!("{value} {:?}", reads).as_bytes());
-                    let findings = match out.0[0] < 64 && name.kind == Kind::BodyCheck {
-                        true => std::vec![(7, 0, 1, format!("toy finding {}", out.0[1]).into_bytes())],
-                        false => StdVec::new(),
+                    let out = item_out(value, &reads, &values);
+                    let findings = match finding(world, name.kind, &out) {
+                        Some(message) => std::vec![(7, 0, 1, message)],
+                        None => StdVec::new(),
                     };
                     done(out, reads, StdVec::new(), findings)
                 }
@@ -288,7 +319,7 @@ fn config(workers: u32) -> Config {
     Config { tool: Tool(key::digest("sim tool", b"tool")), workers, most_entries: 32, most_jobs: 1 << 20, is_error: every_rule }
 }
 
-const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside };
+const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE };
 
 /// 1, 2 or 16 workers, as the tape picks.
 fn workers(tape: &Tape) -> u32 {
@@ -445,6 +476,7 @@ fn request_with(
                     for (ticket, answer, in_place) in &answered {
                         let ran = match answer {
                             Answered::Need(wants) => Ran::Need(wants),
+                            Answered::Cfg(var) => Ran::Cfg(*var),
                             Answered::Done(_) => {
                                 at += 1;
                                 Ran::Done(&outputs[at - 1..at])
@@ -776,7 +808,7 @@ fn gates(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let world = World::draw(tape);
     let gate = [Gate::Beside, Gate::Before][tape.index(2, "gate")];
     let mut store = Store::default();
-    let setup = Setup { workers: workers(tape), ask: Ask { command: Command::Run, args: b"", gate }, plant };
+    let setup = Setup { workers: workers(tape), ask: Ask { command: Command::Run, args: b"", gate, space: Space::NONE }, plant };
     let (answer, ended) = finished(request_with(tape, &world, None, &mut store, None, setup)?)?;
     let (_, checked) = fresh(tape, &world)?;
     let errors = checked.prints.len();
@@ -816,6 +848,7 @@ fn wide(files: usize, items: usize) -> World {
                     body: 0,
                     uses: (i > 0).then(|| (f, i - 1)),
                     calls: (1..=2).map(|k| ((f * 7 + k) % files, (i * 3 + k) % items)).collect(),
+                    cfg: StdVec::new(),
                 })
                 .collect()
         })
@@ -823,9 +856,25 @@ fn wide(files: usize, items: usize) -> World {
     World::new(world)
 }
 
-/// One cold `check` of `world`, its effects answered first in, first out: the jobs, the edges
-/// (parts listed plus reads), and the machine's bookkeeping count.
+/// What a first-in-first-out run of one cold `check` saw.
+struct Fifo {
+    /// Records made.
+    jobs: u64,
+    /// Parts listed plus reads.
+    edges: u64,
+    /// The machine's own count.
+    bookkeeping: u64,
+    /// Each finding printed: its item, its condition, its message.
+    prints: StdVec<(Name, Condition, StdVec<u8>)>,
+}
+
 fn counted(world: &World) -> Result<(u64, u64, u64), Broke> {
+    let run = fifo(world, ASK)?;
+    Ok((run.jobs, run.edges, run.bookkeeping))
+}
+
+/// One cold `check` of `world` under `ask`, its effects answered first in, first out.
+fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
     let ids: StdVec<ContentId> = (0..world.files.len()).map(|f| world.id(f)).collect();
     let paths: StdVec<StdVec<u8>> = (0..world.files.len()).map(path).collect();
     let mut files: StdVec<FileEntry<'_>> = (0..world.files.len())
@@ -834,11 +883,12 @@ fn counted(world: &World) -> Result<(u64, u64, u64), Broke> {
     let manifest = b"Cargo.toml".to_vec();
     files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", b"[package]"), changed: false, manifest: true });
     files.sort_by(|a, b| a.path.cmp(b.path));
-    let mut req = Request::new_in(config(16), ASK, Global);
+    let mut req = Request::planted_in(config(16), ask, world.plant, Global);
     let mut store: BTreeMap<Key, StdVec<u8>> = BTreeMap::new();
     let mut todo: std::collections::VecDeque<Effect<Global>> = std::collections::VecDeque::new();
     let mut out: Vec<Effect<Global>, Global> = Vec::new_in(Global);
     let (mut jobs, mut edges) = (0u64, 0u64);
+    let mut prints = StdVec::new();
     req.step(Event::Start { files: &files, gone: &[], last: None }, &mut out).map_err(|e| Broke::Oracle(format!("{e}")))?;
     loop {
         todo.extend(out.drain(..));
@@ -861,7 +911,7 @@ fn counted(world: &World) -> Result<(u64, u64, u64), Broke> {
                     .iter()
                     .filter_map(|(_, a)| match a {
                         Answered::Done(made) => Some(made),
-                        Answered::Need(_) => None,
+                        Answered::Need(_) | Answered::Cfg(_) => None,
                     })
                     .collect();
                 let held: StdVec<StdVec<Finding<'_>>> = made
@@ -878,6 +928,7 @@ fn counted(world: &World) -> Result<(u64, u64, u64), Broke> {
                 for (ticket, answer) in &answered {
                     let ran = match answer {
                         Answered::Need(wants) => Ran::Need(wants),
+                        Answered::Cfg(var) => Ran::Cfg(*var),
                         Answered::Done(m) => {
                             jobs += 1;
                             edges += (m.parts.len() + m.reads.len()) as u64;
@@ -889,7 +940,11 @@ fn counted(world: &World) -> Result<(u64, u64, u64), Broke> {
                 }
                 req.step(Event::Ran { batch: batch.id, results: &results }, &mut out)
             }
-            Effect::Done(_) => return Ok((jobs, edges, req.bookkeeping())),
+            Effect::Print(print) => {
+                prints.push((print.name, print.condition, print.message.as_slice().to_vec()));
+                continue;
+            }
+            Effect::Done(_) => return Ok(Fifo { jobs, edges, bookkeeping: req.bookkeeping(), prints }),
             _ => continue,
         };
         stepped.map_err(|e| Broke::Oracle(format!("{e}")))?;
@@ -910,6 +965,116 @@ fn bookkeeping_is_linear_in_jobs_and_edges() {
             format!(
                 "bookkeeping per job and edge grew from {per_small:.1} ({small_jobs} jobs) to {per_large:.1} ({large_jobs} jobs)"
             )
+        })
+    });
+}
+
+// --- Conditions through the request machine (drive.md, "One check covers every configuration") --
+
+/// A toy checkout whose items read cfg variables: one to three variables of two or three values,
+/// each item reading up to two of them; every body a finding (its value compared whole).
+fn draw_cfg(tape: &Tape, plant: Plant) -> World {
+    let mut world = World::draw(tape);
+    let vars = 1 + tape.index(3, "cfg variables");
+    world.values = (0..vars).map(|_| 2 + tape.index(2, "values") as u16).collect();
+    for file in world.files.iter_mut() {
+        for item in file.iter_mut() {
+            item.cfg = (0..tape.index(3, "cfg reads")).map(|_| tape.index(vars, "cfg variable") as Var).collect();
+        }
+    }
+    world.find_all = true;
+    world.plant = plant;
+    world
+}
+
+/// One full configuration directly: an item's signature, then its body, by the toy semantics.
+fn eval_sig(world: &World, f: usize, i: usize, config: &[u16]) -> ContentId {
+    let item = &world.files[f][i];
+    let mut reads: StdVec<(Name, ContentId)> =
+        item.uses.iter().map(|(uf, ui)| (sig_name(*uf, *ui), eval_sig(world, *uf, *ui, config))).collect();
+    reads.sort();
+    reads.dedup();
+    let values: StdVec<u16> = item.cfg.iter().map(|var| config[*var as usize]).collect();
+    item_out(item.sig, &reads, &values)
+}
+
+fn eval_body(world: &World, f: usize, i: usize, config: &[u16]) -> ContentId {
+    let item = &world.files[f][i];
+    let mut reads: StdVec<(Name, ContentId)> =
+        item.calls.iter().map(|(cf, ci)| (sig_name(*cf, *ci), eval_sig(world, *cf, *ci, config))).collect();
+    reads.sort();
+    reads.dedup();
+    let values: StdVec<u16> = item.cfg.iter().map(|var| config[*var as usize]).collect();
+    item_out(item.body, &reads, &values)
+}
+
+/// The oracle (bottom.md 11): checking once under the whole space, forking on each unfixed read
+/// and storing each record under what it read, prints exactly the findings of checking every
+/// full configuration on its own: for each configuration, the findings whose condition it
+/// implies are its findings, each once.
+fn whole_space_equals_each(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let world = draw_cfg(tape, plant);
+    let space = Space { values: &world.values, implications: &[] };
+    let ask = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space };
+    let run = fifo(&world, ask)?;
+    let mut configs: StdVec<StdVec<u16>> = std::vec![StdVec::new()];
+    for count in &world.values {
+        configs = configs.into_iter().flat_map(|c| (0..*count).map(move |v| [c.as_slice(), &[v]].concat())).collect();
+    }
+    for config in &configs {
+        let mut full = Condition::ANY;
+        for (var, value) in config.iter().enumerate() {
+            full = full.with(var as Var, *value).ok().flatten().ok_or(Broke::Harness(String::from("a full configuration")))?;
+        }
+        let mut each: StdVec<(Name, StdVec<u8>)> = StdVec::new();
+        for f in 0..world.files.len() {
+            for i in 0..world.files[f].len() {
+                if let Some(message) = finding(&world, Kind::BodyCheck, &eval_body(&world, f, i, config)) {
+                    each.push((body_name(f, i), message));
+                }
+            }
+        }
+        let mut once: StdVec<(Name, StdVec<u8>)> = run
+            .prints
+            .iter()
+            .filter(|(_, condition, _)| full.implies(condition))
+            .map(|(name, _, message)| (*name, message.clone()))
+            .collect();
+        each.sort();
+        once.sort();
+        oracle(each == once, || {
+            format!(
+                "under {config:?} the whole space's check printed {} findings, the configuration's own {}: they differ",
+                once.len(),
+                each.len()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn the_whole_space_equals_each_configuration_through_the_request() {
+    check(SimConfig::cases(300), |tape| whole_space_equals_each(tape, Plant::None));
+}
+
+#[test]
+fn control_an_asker_served_a_fork_it_does_not_imply_is_caught() {
+    control(SimConfig::cases(2000), Plant::None, Plant::RanUnderCondition, "they differ", whole_space_equals_each);
+}
+
+/// An item reading three variables of five values spans 125 configurations, past the cap of 64:
+/// its answer is the typed finding, not a sample.
+#[test]
+fn an_item_past_the_cap_is_a_finding() {
+    check(SimConfig::cases(1), |_| {
+        let mut world = wide(1, 1);
+        world.values = std::vec![5, 5, 5];
+        world.files[0][0].cfg = std::vec![0, 1, 2];
+        let space = Space { values: &world.values, implications: &[] };
+        let run = fifo(&world, Ask { command: Command::Check, args: b"", gate: Gate::Beside, space })?;
+        oracle(run.prints.iter().any(|(_, _, message)| message.windows(7).any(|w| w == b"past 64")), || {
+            format!("no over-cap finding among {} printed", run.prints.len())
         })
     });
 }

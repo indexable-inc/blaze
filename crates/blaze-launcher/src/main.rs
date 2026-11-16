@@ -168,7 +168,7 @@ fn main() {
         Ok(me) => me,
         Err(errno) => stop(CANNOT_RUN, &format!("pthread_key_create failed with errno {errno}")),
     };
-    let (ready, start) = crossbeam_channel::bounded(1);
+    let (ready, start) = blaze_launch_rt::ready();
     // The control thread: the one writer of code, for the life of the process. It is never
     // joined: the process ends through the program's `main` or an `exit` of its own.
     let control = std::thread::Builder::new().name("blaze-launch".to_owned()).spawn(move || {

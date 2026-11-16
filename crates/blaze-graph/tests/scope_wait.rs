@@ -60,7 +60,7 @@ fn run_key_waiting_on_a_scope_job_that_asks_for_it(
 }
 
 fn done_in_time(
-    rx: &crossbeam_channel::Receiver<Result<u32, Cancelled>>,
+    rx: &blaze_core::chan::Receiver<Result<u32, Cancelled>>,
     owner: &str,
 ) -> Result<u32, Cancelled> {
     rx.recv_timeout(LONG).unwrap_or_else(|_| {
@@ -77,7 +77,7 @@ fn done_in_time(
 fn no_wait_chain_through_a_scope_leaves_every_worker_parked() {
     let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
     let flights = Arc::new(Flights::<u32>::new());
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = blaze_core::chan::unbounded();
     {
         let (inner, flights) = (pool.clone(), flights.clone());
         pool.submit(
@@ -95,7 +95,7 @@ fn no_wait_chain_through_a_scope_leaves_every_worker_parked() {
 fn no_wait_chain_through_a_clients_scope_leaves_every_worker_parked() {
     let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
     let flights = Arc::new(Flights::<u32>::new());
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = blaze_core::chan::unbounded();
     {
         let (pool, flights) = (pool.clone(), flights.clone());
         // Detached: on the deadlock it never returns, and the test fails on the timeout instead.

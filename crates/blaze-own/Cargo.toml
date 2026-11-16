@@ -1,6 +1,6 @@
 [package]
 name = "blaze-own"
-description = "blaze's own owning types in place of Rust's `alloc` crate: Vec, Box, Arc, Rc, VecDeque, a sorted map and set, a borrow-or-own Cow and a struct-of-arrays vector, each over `core::alloc::Allocator` with no default allocator (`new_in(alloc)` is the only constructor); `no_std`, no `alloc`, no dependencies"
+description = "blaze's own owning types in place of Rust's `alloc` crate: Vec, Box, Arc, Rc, VecDeque, a sorted map and set, a borrow-or-own Cow and a struct-of-arrays vector, each over `core::alloc::Allocator` with no default allocator (`new_in(alloc)` is the only constructor); `no_std`, no `alloc`; depends only on blaze-memchr (and its blaze-int), for byte search"
 publish = false
 
 version.workspace = true
@@ -13,8 +13,11 @@ repository.workspace = true
 [lib]
 doctest = false
 
-# Nothing: `core` only. A dependency here would be a dependency of every crate's collections.
+# A dependency here is a dependency of every crate's collections: only crates on `core` alone.
 [dependencies]
+# `Vec::contains` and `Vec::position` on bytes: NEON or SSE2, 64 bytes a step (`spec::Find`).
+# no_std, and itself depends only on blaze-int, which depends on nothing.
+blaze-memchr.workspace = true
 
 [features]
 # `AsRef<OsStr>` and `AsRef<Path>` for `String`, which only this crate may write (the orphan

@@ -11,9 +11,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_ipc::reader::StreamReader;
-use arrow_schema::{DataType, Field, Schema};
+use std::alloc::Global;
+
+use blaze_columns::{Batch, Column, Field, Scalar, Type};
 use blaze_core::{
     Driver as _, Effect, Tag,
     sim::{Datagrams, Faults, Sim},
@@ -58,13 +58,22 @@ fn hello() -> Hello {
     }
 }
 
-fn numbers(n: i64) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..n))]).unwrap()
+fn numbers(n: i64) -> Batch<Global> {
+    Batch::try_new(
+        blaze_own::Vec::from_array_in([Field::new("n", Type::One(Scalar::I64), false)], Global),
+        blaze_own::Vec::from_array_in([Column::values(0..n, Global)], Global),
+    )
+    .unwrap()
 }
 
-fn decode(ipc: &[u8]) -> Vec<RecordBatch> {
-    StreamReader::try_new(ipc, None).unwrap().collect::<Result<_, _>>().unwrap()
+fn decode(ipc: &[u8]) -> blaze_own::Vec<Batch<Global>, Global> {
+    blaze_arrow_ipc::read_stream(ipc, Global).unwrap().batches
+}
+
+/// `batch` as one Arrow IPC stream, appended to `out`.
+fn ipc_of(out: &mut Vec<u8>, batch: &Batch<Global>) -> Result<(), OpError> {
+    frame::ipc(out, batch.fields(), std::slice::from_ref(batch))
+        .map_err(|why| OpError::new(Kind::Encode, why.to_string()))
 }
 
 /// A source with one op, `count` (`n` rows), and a live feed of a `spans` table of two rows a
@@ -83,7 +92,10 @@ impl Source for Test {
     fn op(&self, name: &str, args: &Value, _stop: &Stop) -> Option<Result<Answer, OpError>> {
         match name {
             "count" => Some(match args.get("n").and_then(Value::as_i64) {
-                Some(n) => Ok(Answer { table: Table::of(vec![numbers(n)]), ..Answer::new("count") }
+                Some(n) => Ok(Answer {
+                    table: Table::of(blaze_own::Vec::from_array_in([numbers(n)], Global)),
+                    ..Answer::new("count")
+                }
                     .with("n", n)),
                 None => Err(OpError::new(Kind::BadArgs, "`count` takes a whole `n`")),
             }),
@@ -101,13 +113,11 @@ impl Live for TestLive {
         self.ticks += 1;
         let spans = into.table("spans", Rule::Append);
         spans.rows = 2;
-        frame::ipc(&mut spans.ipc, &numbers(2).schema(), &[numbers(2)])
-            .map_err(|why| OpError::new(Kind::Encode, why.to_string()))?;
+        ipc_of(&mut spans.ipc, &numbers(2))?;
         let open = into.table("open", Rule::Replace);
         if self.ticks == 1 {
             open.rows = 1;
-            frame::ipc(&mut open.ipc, &numbers(1).schema(), &[numbers(1)])
-                .map_err(|why| OpError::new(Kind::Encode, why.to_string()))?;
+            ipc_of(&mut open.ipc, &numbers(1))?;
         }
         Ok(())
     }
@@ -326,7 +336,7 @@ fn an_answer_carries_rows_and_elapsed_and_one_aligned_ipc_stream() {
     let header: Value = serde_json::from_slice(&bytes[4..4 + len]).unwrap();
     assert_eq!((header["op"].as_str(), header["rows"].as_u64()), (Some("count"), Some(7)));
     assert_eq!(header["elapsed_ns"], 1234);
-    let rows: usize = decode(&bytes[4 + len..]).iter().map(RecordBatch::num_rows).sum();
+    let rows: usize = decode(&bytes[4 + len..]).iter().map(Batch::num_rows).sum();
     assert_eq!(rows, 7);
 }
 
@@ -518,7 +528,7 @@ fn a_session_is_refused_until_hello_then_answered_and_fed() {
     assert_eq!(header["op"], "count", "{header}");
     assert_eq!(header["rows"], 3);
     assert!(header["elapsed_ns"].is_u64(), "{header}");
-    assert_eq!(decode(&ipc).iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    assert_eq!(decode(&ipc).iter().map(Batch::num_rows).sum::<usize>(), 3);
 
     let (header, _) = ask(&connection, r#"{"op":"count"}"#);
     assert_eq!(header["error"]["kind"], "bad_args", "the source's own error: {header}");
@@ -539,7 +549,7 @@ fn a_session_is_refused_until_hello_then_answered_and_fed() {
     let (op, table) = (header["op"].as_str(), header["table"].as_str());
     assert_eq!((op, table), (Some("live"), Some("spans")), "{header}");
     assert_eq!(header["rows"], 2, "{header}");
-    assert_eq!(decode(&ipc).iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    assert_eq!(decode(&ipc).iter().map(Batch::num_rows).sum::<usize>(), 2);
 
     let other = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).unwrap();
     let wrong = if token.starts_with('0') {
@@ -837,7 +847,7 @@ impl Page {
                 return Err(format!("request {i} ({request}) ended {} times, finished: {}, told after its end: {}", seen.ends, seen.finished, seen.after_end));
             }
             let (header, ipc) = answer(&seen.body).map_err(|why| format!("request {i} ({request}): {why}"))?;
-            let rows = || decode(ipc).iter().map(RecordBatch::num_rows).sum::<usize>();
+            let rows = || decode(ipc).iter().map(Batch::num_rows).sum::<usize>();
             let right = match *expect {
                 Expect::Error(kind) => header["error"]["kind"] == kind && ipc.is_empty(),
                 Expect::UnknownOp(op) => header["error"]["kind"] == "unknown_op" && header["error"]["op"] == op,
@@ -880,7 +890,7 @@ impl Page {
         let mut open = Vec::new();
         let mut spans = 0u64;
         for (_, header, ipc) in &self.live_frames {
-            let rows = if ipc.is_empty() { 0 } else { decode(ipc).iter().map(RecordBatch::num_rows).sum::<usize>() };
+            let rows = if ipc.is_empty() { 0 } else { decode(ipc).iter().map(Batch::num_rows).sum::<usize>() };
             if header["op"] != "live" || header["rows"] != rows {
                 return Err(format!("a live frame {header} carries {rows} rows"));
             }

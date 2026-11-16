@@ -24,8 +24,7 @@
 //! shadowing, unstable-candidate and private-candidate reporting, and `self: Box<Self>`-style
 //! receivers beyond what autoderef reaches.
 
-use blaze_own::Vec;
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Vec};
 
 use crate::body::Segment;
 use crate::columns::AdjustKind;
@@ -46,9 +45,9 @@ struct Cand {
 }
 
 /// The probe's answer.
-struct Pick<A: Allocator> {
+struct Pick<'a> {
     cand: Cand,
-    steps: Vec<Step, A>,
+    steps: Vec<Step, Alloc<'a>>,
     step: usize,
     autoref: Option<Mutbl>,
     unsize: bool,
@@ -103,7 +102,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// `probe_op` in `Mode::MethodCall`: the pick, or the code of the error.
-    fn probe_method(&mut self, recv: Ty, name: Name, scope: ScopeId) -> Result<Result<Pick<A>, DiagCode>, Stop> {
+    fn probe_method(&mut self, recv: Ty, name: Name, scope: ScopeId) -> Result<Result<Pick<'a>, DiagCode>, Stop> {
         let (mut steps, limit) = self.autoderef(recv, false)?;
         let mut unsize_at = None;
         if let Some(last) = steps.last().copied() {
@@ -114,7 +113,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         // The extension candidates: one per trait in scope with an item of this name.
-        let mut ext: Vec<Cand, A> = Vec::new_in(self.alloc.clone());
+        let mut ext: Vec<Cand, Alloc<'a>> = Vec::new_in(self.alloc);
         for &tr in self.reads.traits_in_scope(scope)? {
             if let Some(it) = self.reads.assoc_item(tr, name)? {
                 if let AssocKind::Fn { self_param } = it.kind {
@@ -127,8 +126,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // an inherent `fn m(&self)` of `Foo` is found by value at the `&Foo` step, before any
         // extension candidate of `&Foo`.
         let mut not_method = false;
-        let mut inh: Vec<Cand, A> = Vec::new_in(self.alloc.clone());
-        let mut bounds: Vec<ItemKey, A> = Vec::new_in(self.alloc.clone());
+        let mut inh: Vec<Cand, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut bounds: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
         for i in 0..steps.len() {
             let step = steps[i];
             if let Some(shape) = self.shape(step.ty) {
@@ -252,7 +251,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// `ConfirmContext::confirm`: the inputs after `self` and the output.
-    fn confirm(&mut self, e: ExprId, receiver: ExprId, pick: &Pick<A>, seg: Segment) -> Result<Option<(TyList, Ty)>, Stop> {
+    fn confirm(&mut self, e: ExprId, receiver: ExprId, pick: &Pick<'a>, seg: Segment) -> Result<Option<(TyList, Ty)>, Stop> {
         let step_ty = pick.steps[pick.step].ty;
         let adjusted = match pick.autoref {
             None => step_ty,

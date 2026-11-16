@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use blaze_manifest::features::Edition;
 use blaze_manifest::metadata::root_manifest;
-use blaze_manifest::{Config, Context, ManifestError, Workspace};
+use blaze_manifest::{Config, Context, Workspace};
 
 use crate::FmtError;
 
@@ -157,7 +157,7 @@ impl Packages {
                 let (root, members) =
                     read_members(manifest).map_err(|error| FmtError::Workspace {
                         manifest: manifest.to_owned(),
-                        error,
+                        error: Box::new(error),
                     })?;
                 self.roots.insert(manifest.to_owned(), root.clone());
                 self.read.entry(root.clone()).or_insert(members);
@@ -170,7 +170,7 @@ impl Packages {
 
 /// The root of the workspace `manifest` is in, and its members, as blaze-manifest reads them
 /// (what cargo-fmt reads from `cargo metadata --no-deps`).
-fn read_members(manifest: &Path) -> Result<(PathBuf, Vec<Member>), ManifestError> {
+fn read_members(manifest: &Path) -> Result<(PathBuf, Vec<Member>), FmtError> {
     let ctx = Context::new(Config::from_process()?);
     let ws = Workspace::new(&root_manifest(Some(manifest), &ctx)?, &ctx)?;
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());

@@ -20,7 +20,6 @@ doctest = false
 [dependencies]
 blaze-launch.workspace = true
 blaze-launch-rt.workspace = true
-crossbeam-channel.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

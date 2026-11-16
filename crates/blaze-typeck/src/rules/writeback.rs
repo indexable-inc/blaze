@@ -13,8 +13,7 @@
 //! which says where). Sparse tables are sorted by expression, stably, so each expression's
 //! adjustments stay in order.
 
-use blaze_own::{Soa, Vec};
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Soa, Vec};
 
 use crate::columns::{Adjusts, Callees, Captures, Checked, Fields};
 use crate::diag::{At, Diag, DiagCode};
@@ -31,17 +30,17 @@ use crate::world::World;
 const EXPORT_STEPS: u64 = 1 << 28;
 
 /// The export state: the table, and the handle-to-portable cache.
-struct Export<A: Allocator + Clone> {
-    out: PortableTys<A>,
+struct Export<'a> {
+    out: PortableTys<'a>,
     /// Each exported handle: its portable type, and whether it held an unresolved variable
     /// (then the portable type is the error type).
-    cache: HashMap<Ty, (PTy, bool), A>,
+    cache: HashMap<Ty, (PTy, bool), Alloc<'a>>,
     steps: u64,
     /// Whether E0282 was reported by writeback.
     reported: bool,
 }
 
-impl<A: Allocator + Clone> Export<A> {
+impl<'a> Export<'a> {
     fn cached(&self, t: Ty) -> Option<PTy> {
         self.cache.get(&t).map(|&(p, _)| p)
     }
@@ -57,8 +56,8 @@ impl<A: Allocator + Clone> Export<A> {
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The children of one level of a type.
-    fn ty_children(&self, v: TyView, out: &mut Vec<Ty, A>) {
-        let list = |l: TyList, out: &mut Vec<Ty, A>| {
+    fn ty_children(&self, v: TyView, out: &mut Vec<Ty, Alloc<'a>>) {
+        let list = |l: TyList, out: &mut Vec<Ty, Alloc<'a>>| {
             for i in 0..self.ty.list_len(l) {
                 out.push(self.ty.list_get(l, i));
             }
@@ -84,9 +83,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    fn export_list(&mut self, ex: &mut Export<A>, l: TyList) -> Result<List, CheckError> {
+    fn export_list(&mut self, ex: &mut Export<'a>, l: TyList) -> Result<List, CheckError> {
         let n = self.ty.list_len(l);
-        let mut v: Vec<PTy, A> = Vec::with_capacity_in(n as usize, self.alloc.clone());
+        let mut v: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
         for i in 0..n {
             let t = self.ty.list_get(l, i);
             let t = self.ty.shallow_resolve(t);
@@ -99,13 +98,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// Exports `t`, resolved, reporting an unresolved variable at `at`.
-    fn export(&mut self, ex: &mut Export<A>, t: Ty, at: At) -> Result<PTy, CheckError> {
+    fn export(&mut self, ex: &mut Export<'a>, t: Ty, at: At) -> Result<PTy, CheckError> {
         let t = self.ty.resolve(t)?;
         if let Some(p) = ex.cached(t) {
             return Ok(p);
         }
-        let mut stack: Vec<(Ty, bool), A> = Vec::new_in(self.alloc.clone());
-        let mut kids: Vec<Ty, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<(Ty, bool), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut kids: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
         stack.push((t, false));
         while let Some((x, expanded)) = stack.pop() {
             ex.steps += 1;
@@ -146,7 +145,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 ex.insert(x_res, p, true);
                 continue;
             }
-            let one = |ex: &Export<A>, c: Ty, ctx: &mut C| -> Result<PTy, CheckError> {
+            let one = |ex: &Export<'a>, c: Ty, ctx: &mut C| -> Result<PTy, CheckError> {
                 let c = ctx.shallow_resolve(c);
                 ex.cached(c).ok_or(CheckError::Limit(Limit::Export))
             };
@@ -181,37 +180,37 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// `resolve_type_vars_in_body`: the record.
-    pub(crate) fn writeback(mut self) -> Result<Checked<A>, CheckError> {
-        let alloc = self.alloc.clone();
+    pub(crate) fn writeback(mut self) -> Result<Checked<'a>, CheckError> {
+        let alloc = self.alloc;
         let mut ex = Export {
-            out: PortableTys::new_in(alloc.clone()),
-            cache: HashMap::new_in(alloc.clone()),
+            out: PortableTys::new_in(alloc),
+            cache: HashMap::new_in(alloc),
             steps: 0,
             reported: false,
         };
-        let mut expr_ty: Vec<PTy, A> = Vec::with_capacity_in(self.expr_ty.len(), alloc.clone());
+        let mut expr_ty: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.expr_ty.len(), alloc);
         for i in 0..self.expr_ty.len() {
             let t = self.expr_ty[i];
             expr_ty.push(self.export(&mut ex, t, At::Expr(ExprId(i as u32)))?);
         }
-        let mut pat_ty: Vec<PTy, A> = Vec::with_capacity_in(self.pat_ty.len(), alloc.clone());
+        let mut pat_ty: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.pat_ty.len(), alloc);
         for i in 0..self.pat_ty.len() {
             let t = self.pat_ty[i];
             pat_ty.push(self.export(&mut ex, t, At::Pat(PatId(i as u32)))?);
         }
-        let mut local_ty: Vec<PTy, A> = Vec::with_capacity_in(self.local_ty.len(), alloc.clone());
+        let mut local_ty: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.local_ty.len(), alloc);
         for i in 0..self.local_ty.len() {
             let t = self.local_ty[i];
             local_ty.push(self.export(&mut ex, t, At::Pat(PatId(i as u32)))?);
         }
-        let mut adjusts: Adjusts<A> = Soa::with_capacity_in(self.adjust.len(), alloc.clone());
+        let mut adjusts: Adjusts<'a> = Soa::with_capacity_in(self.adjust.len(), alloc);
         for i in 0..self.adjust.len() {
             let Some((&e, &kind, &t)) = self.adjust.get(i) else { break };
             let p = self.export(&mut ex, t, At::Expr(e))?;
             adjusts.push((e, kind, p));
         }
         adjusts.sort_by_key(|rows, i| rows.column::<0>()[i]);
-        let mut callees: Callees<A> = Soa::with_capacity_in(self.callees.len(), alloc.clone());
+        let mut callees: Callees<'a> = Soa::with_capacity_in(self.callees.len(), alloc);
         for i in 0..self.callees.len() {
             let (e, item, args) = self.callees[i];
             for j in 0..self.ty.list_len(args) {
@@ -224,16 +223,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             callees.push((e, item, l));
         }
         callees.sort_by_key(|rows, i| rows.column::<0>()[i]);
-        let mut fields: Fields<A> = Soa::with_capacity_in(self.fields.len(), alloc.clone());
+        let mut fields: Fields<'a> = Soa::with_capacity_in(self.fields.len(), alloc);
         for &(e, v, f) in self.fields.iter() {
             fields.push((e, v, f));
         }
         fields.sort_by_key(|rows, i| rows.column::<0>()[i]);
-        let mut captures: Captures<A> = Soa::with_capacity_in(self.captures.len(), alloc.clone());
+        let mut captures: Captures<'a> = Soa::with_capacity_in(self.captures.len(), alloc);
         for &(c, p, k) in self.captures.iter() {
             captures.push((c, p, k));
         }
-        let mut diags: Vec<Diag, A> = Vec::with_capacity_in(self.diags.len(), alloc.clone());
+        let mut diags: Vec<Diag, Alloc<'a>> = Vec::with_capacity_in(self.diags.len(), alloc);
         let mut i = 0;
         // Exporting a diagnostic's types may add an E0282 diagnostic once; the loop reaches it.
         while i < self.diags.len() {
@@ -268,7 +267,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The list with every element resolved, as a list of the context.
     fn ty_resolve_list(&mut self, l: TyList) -> Result<TyList, CheckError> {
         let n = self.ty.list_len(l);
-        let mut v: Vec<Ty, A> = Vec::with_capacity_in(n as usize, self.alloc.clone());
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
         for i in 0..n {
             let t = self.ty.list_get(l, i);
             v.push(self.ty.resolve(t)?);

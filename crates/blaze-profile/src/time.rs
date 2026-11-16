@@ -517,10 +517,7 @@ pub enum TimeError {
         error: crate::sql::SqlError,
     },
     /// A derived table's batch could not be made.
-    Arrow {
-        table: &'static str,
-        error: arrow_schema::ArrowError,
-    },
+    Batch(crate::columns::BatchError),
     /// A derived table could not be written into the history.
     History(crate::history::HistoryError),
     /// The rows of a daemon that died could not be read back from its flight recorder's
@@ -587,8 +584,8 @@ impl fmt::Display for TimeError {
                 write!(f, "the column {table}.{column} {why}")
             }
             TimeError::Sql { doing, error } => write!(f, "{doing}: {error}"),
-            TimeError::Arrow { table, error } => {
-                write!(f, "making the rows of the derived table {table}: {error}")
+            TimeError::Batch(error) => {
+                write!(f, "making the rows of the derived table {}: {}", error.table, error.error)
             }
             TimeError::History(error) => {
                 write!(f, "writing a derived table into the history: {error}")

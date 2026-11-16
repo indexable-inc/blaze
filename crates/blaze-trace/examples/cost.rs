@@ -1,101 +1,34 @@
 //! What a span costs: ns per span (open, enter, exit, close) at 1 and 8 threads, for blaze_trace
-//! with no sink, blaze_trace recording into a per-thread ring, and the third-party `tracing`
-//! with no subscriber, with a subscriber that keeps nothing and with the same ring.
+//! with nothing recording, blaze_trace recording into its rings, and the third-party `tracing`
+//! with no subscriber, with a subscriber that keeps nothing and with a subscriber writing the
+//! same two entries into the same rings.
 //!
 //! `cargo run --release -p blaze-trace --example cost`. `tracing` is a dev-dependency of this
 //! crate only for this comparison; it goes once the numbers are in docs/profiling.md.
 //!
-//! The ring is the same for both: per thread, 4096 entries of 32 bytes (site, depth, tick,
-//! edge), overwrite-oldest with an exact lost count, the tick read from the CPU counter in user
-//! space (`cntvct_el0` on arm64, `rdtsc` on x86-64). A span is two entries: one at enter, one
-//! at exit. The floor is that: two counter reads and two 32-byte stores.
+//! The rings are blaze_trace's: per thread, 32-byte slots (stamp, site and depth, tick, span),
+//! overwrite-oldest with an exact lost count, the tick read from the CPU counter in user space
+//! (`cntvct_el0` on arm64, `rdtsc` on x86-64). A span is two entries: one at enter, one at
+//! exit. The floor line times that alone: two counter reads and two slot writes.
+
+#![feature(allocator_api)]
 
 use std::{
-    cell::Cell,
+    alloc::Global,
     hint::black_box,
     sync::{Arc, Barrier},
     time::Instant,
 };
 
+use blaze_trace::record::{self, Rings};
+
 const SPANS: u64 = 2_000_000;
-const ENTRIES: usize = 4096;
 
-/// The CPU's counter, read in user space.
-#[inline(always)]
-fn ticks() -> u64 {
-    let t: u64;
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: `cntvct_el0` is readable at EL0 on every arm64 host blaze runs on (macOS and
-    // Linux both enable it); the read has no side effect and writes only `t`.
-    unsafe {
-        core::arch::asm!("mrs {t}, cntvct_el0", t = out(reg) t, options(nomem, nostack));
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let (lo, hi): (u32, u32);
-        // SAFETY: `rdtsc` is unprivileged unless CR4.TSD is set, which no host blaze runs on
-        // sets; it writes only eax and edx.
-        unsafe {
-            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
-        }
-        t = u64::from(hi) << 32 | u64::from(lo);
-    }
-    t
-}
-
-thread_local! {
-    static RING: [Cell<[u64; 4]>; ENTRIES] = const { [const { Cell::new([0; 4]) }; ENTRIES] };
-    static HEAD: Cell<u64> = const { Cell::new(0) };
-    static DEPTH: Cell<u64> = const { Cell::new(0) };
-}
-
-/// One edge of a span into this thread's ring: 32 bytes, nothing formatted.
+/// One edge of a span written straight into the thread's ring: the floor.
 #[inline(always)]
 fn edge(site: u64, began: bool) {
-    let depth = DEPTH.get();
-    let depth = if began { DEPTH.set(depth + 1); depth } else { DEPTH.set(depth - 1); depth - 1 };
-    let head = HEAD.get();
-    HEAD.set(head + 1);
-    let at = head as usize & (ENTRIES - 1);
-    RING.with(|ring| ring[at].set([site, depth, ticks(), u64::from(began)]));
+    black_box(record::emit([0x80 | u64::from(began) | site << 32, record::counter(), site]));
 }
-
-/// Entries this thread's ring overwrote: the exact lost count.
-fn lost() -> u64 {
-    HEAD.get().saturating_sub(ENTRIES as u64)
-}
-
-/// blaze_trace's ring sink. A span's id is its site's address, so enter and exit find the
-/// site without a table; the depth tells nested spans of one site apart.
-struct OursRing;
-
-impl blaze_trace::Sink for OursRing {
-    fn enabled(&self, _: &'static blaze_trace::Metadata<'static>) -> bool {
-        true
-    }
-
-    fn new_span(&self, span: &blaze_trace::Attributes<'_>) -> blaze_trace::Id {
-        blaze_trace::Id::from_u64(core::ptr::from_ref(span.metadata()).addr() as u64)
-    }
-
-    fn record(&self, _: &blaze_trace::Id, _: &blaze_trace::Record<'_>) {}
-
-    fn event(&self, _: &blaze_trace::Event<'_>) {}
-
-    fn enter(&self, span: &blaze_trace::Id) {
-        edge(span.into_u64(), true);
-    }
-
-    fn exit(&self, span: &blaze_trace::Id) {
-        edge(span.into_u64(), false);
-    }
-
-    fn try_close(&self, _: blaze_trace::Id) -> bool {
-        true
-    }
-}
-
-static OURS_RING: OursRing = OursRing;
 
 /// `tracing` with a subscriber that is interested in everything and keeps nothing.
 struct TheirsNothing;
@@ -188,6 +121,13 @@ fn ours_loop() {
     }
 }
 
+fn ours_ring_loop() {
+    for i in 0..SPANS {
+        let _span = blaze_trace::info_span!("cost_ring").entered();
+        black_box(i);
+    }
+}
+
 fn theirs_loop() {
     for i in 0..SPANS {
         let _span = tracing::info_span!("cost").entered();
@@ -214,13 +154,12 @@ fn one(case: Case) -> f64 {
     let start = Instant::now();
     match case {
         Case::OursOff => ours_loop(),
-        Case::OursRing => blaze_trace::with_thread_sink(&OURS_RING, ours_loop),
+        Case::OursRing => ours_ring_loop(),
         Case::TheirsNone => theirs_loop(),
         Case::TheirsNothing => tracing::subscriber::with_default(TheirsNothing, theirs_nothing_loop),
         Case::TheirsRing => tracing::subscriber::with_default(TheirsRing, theirs_ring_loop),
     }
     let ns = start.elapsed().as_nanos() as f64 / SPANS as f64;
-    black_box(lost());
     ns
 }
 
@@ -241,20 +180,25 @@ fn run(case: Case, threads: usize) -> f64 {
 }
 
 fn main() {
-    // No sink is installed until `OursRing`, and the group flag is never lowered: the
-    // no-sink case runs first.
-    let cases = [Case::OursOff, Case::TheirsNone, Case::TheirsNothing, Case::TheirsRing, Case::OursRing];
+    println!("{:<40} {:>10} {:>10}", "case", "1 thread", "8 threads");
+    // Nothing records until the rings are installed, once a process: the nothing-records case
+    // runs first.
+    for case in [Case::OursOff, Case::TheirsNone, Case::TheirsNothing] {
+        println!("{:<40} {:>10.2} {:>10.2}", case.name(), run(case, 1), run(case, 8));
+    }
+    let rings: &'static Rings = Box::leak(Box::new(Rings::new_in(64, 1 << 12, Global).expect("the rings")));
+    blaze_trace::install_rings(blaze_trace::RingConfig { rings, wants: |_| true, clock: None }).expect("rings installed once");
+    for case in [Case::OursRing, Case::TheirsRing] {
+        println!("{:<40} {:>10.2} {:>10.2}", case.name(), run(case, 1), run(case, 8));
+    }
     let floor = {
         let start = Instant::now();
         for i in 0..SPANS {
-            edge(i, true);
-            edge(i, false);
+            edge(i & 0xffff, true);
+            edge(i & 0xffff, false);
         }
         start.elapsed().as_nanos() as f64 / SPANS as f64
     };
-    println!("{:<40} {:>10} {:>10}", "case", "1 thread", "8 threads");
-    for case in cases {
-        println!("{:<40} {:>10.2} {:>10.2}", case.name(), run(case, 1), run(case, 8));
-    }
-    println!("{:<40} {:>10.2}", "floor: two ticks, two 32-byte stores", floor);
+    println!("{:<40} {:>10.2}", "floor: two ticks, two slot writes", floor);
+    println!("counter: {:?} Hz; entries not recorded: {}", record::counter_hz(), record::unrecorded());
 }

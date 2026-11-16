@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::thread::JoinHandle;
 
 use blaze_cas::{Key, Ticket};
-use crossbeam_channel::{Receiver, Sender};
+use blaze_core::chan::{Receiver, Sender};
 
 use crate::explore::{Failure, panic_text};
 use crate::properties;
@@ -123,7 +123,7 @@ pub struct Actors {
 
 impl Default for Actors {
     fn default() -> Actors {
-        let (send, events) = crossbeam_channel::unbounded();
+        let (send, events) = blaze_core::chan::unbounded();
         Actors { actors: Vec::new(), events, send }
     }
 }
@@ -135,7 +135,7 @@ impl Actors {
         name: &str,
         body: impl FnOnce(&Turn) + Send + 'static,
     ) -> Result<(), Failure> {
-        let (go, wait) = crossbeam_channel::unbounded();
+        let (go, wait) = blaze_core::chan::unbounded();
         let events = self.send.clone();
         let id = self.actors.len();
         let thread = std::thread::Builder::new()

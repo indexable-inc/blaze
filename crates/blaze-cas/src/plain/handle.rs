@@ -188,9 +188,9 @@ impl<D: Driver> PlainStore<D> {
                 let run = mapped.run();
                 if let Some(i) = format::find(run, key) {
                     // SAFETY: the table is insert-only: each index is inserted once, under the
-                    // writer's lock, and never removed or replaced, so papaya never retires the
-                    // allocation of a value while the map lives; values are allocated one by
-                    // one and a resize moves pointers, not values. The map lives as long as
+                    // writer's lock, and never removed or replaced, so the shared table never
+                    // retires the allocation of a value while the map lives; values are boxed
+                    // one by one and a resize moves pointers, not values. The map lives as long as
                     // `self`, so the value outlives the guard's borrow for `&self`'s lifetime.
                     // Its mapping's bytes are the segment's for as long as the clone lives.
                     let mapped: &Mapped = unsafe { &*(mapped as *const Mapped) };

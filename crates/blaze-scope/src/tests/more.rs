@@ -2,10 +2,10 @@
 //! `Undetermined` answer reaching the final pass, derive helpers, built-in attributes,
 //! `use .. as _`, macro-expanded `#[macro_export]`, and `pub(in path)` through an alias.
 
-use std::alloc::Global;
 use std::vec::Vec;
 
 use blaze_id::ItemKey;
+use blaze_own::Alloc;
 
 use super::{N, Solved, V, World, solve};
 use crate::resolver::Plant;
@@ -72,7 +72,7 @@ fn an_undetermined_answer_is_an_unresolved_import() {
     let root = w.root(1, Edition::E2021);
     w.dep(root, "dep", dep_root);
     w.glob(root, "dep", V::Priv);
-    let mut r = Resolver::new_in(root, &w, Global).expect("the root's records are there");
+    let mut r = Resolver::new_in(root, &w, Alloc::global()).expect("the root's records are there");
     let undetermined = [ExportEntry {
         ns: Namespace::Values,
         name: "u",

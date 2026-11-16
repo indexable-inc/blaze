@@ -45,10 +45,9 @@
 
 #![blaze::sans_io]
 
-
 use core::fmt;
 
-use blaze_own::{Vec, soa};
+use blaze_own::{AVec, Alloc, Vec, soa};
 
 use crate::{CodeRef, Plant, SlotId, ThreadId, Tier, Watch};
 
@@ -203,11 +202,11 @@ struct Placed {
 }
 
 /// One retired body and the threads that have not cleared it.
-struct Batch<A: Allocator> {
+struct Batch<'a> {
     /// The epoch the publish that unlinked it published, after its stores.
     stamp: u64,
     body: Body,
-    waiting: Vec<ThreadId, A>,
+    waiting: AVec<'a, ThreadId>,
 }
 
 /// A body as the core knows it: what a program counter in the area names.
@@ -231,13 +230,13 @@ soa! {
 }
 
 /// The table of one program. See the module's documentation.
-pub struct Slots<A: Allocator + Clone> {
-    alloc: A,
-    table: Rows<A>,
-    bodies: Vec<Placed, A>,
-    batches: Vec<Batch<A>, A>,
+pub struct Slots<'a> {
+    alloc: Alloc<'a>,
+    table: Rows<Alloc<'a>>,
+    bodies: AVec<'a, Placed>,
+    batches: AVec<'a, Batch<'a>>,
     /// Every thread alive, as told.
-    threads: Vec<ThreadId, A>,
+    threads: AVec<'a, ThreadId>,
     epoch: u64,
     /// The newest stamp of a body freed: no thread may begin on an older epoch.
     freed_through: u64,
@@ -246,10 +245,10 @@ pub struct Slots<A: Allocator + Clone> {
     pub(crate) plant: Plant,
 }
 
-impl<A: Allocator + Clone> Slots<A> {
+impl<'a> Slots<'a> {
     /// A table of `slots` slots, each at its need stub and watching nothing, whose area numbers
     /// at most `most_bodies` bodies, in `alloc`.
-    pub fn new(slots: u32, most_bodies: u32, alloc: A) -> Result<Slots<A>, Error> {
+    pub fn new(slots: u32, most_bodies: u32, alloc: Alloc<'a>) -> Result<Slots<'a>, Error> {
         if slots == 0 {
             return Err(Error::Config { what: "a table of no slot", value: 0 });
         }
@@ -259,15 +258,15 @@ impl<A: Allocator + Clone> Slots<A> {
                 value: u64::from(most_bodies),
             });
         }
-        let mut table = Rows::with_capacity_in(slots as usize, alloc.clone());
+        let mut table = Rows::with_capacity_in(slots as usize, alloc);
         for _ in 0..slots {
             table.push(Row { slot_word: Word::NEED, body_word: Word::NEED, watch: Watch::NONE });
         }
         Ok(Slots {
             table,
-            bodies: Vec::new_in(alloc.clone()),
-            batches: Vec::new_in(alloc.clone()),
-            threads: Vec::new_in(alloc.clone()),
+            bodies: Vec::new_in(alloc),
+            batches: Vec::new_in(alloc),
+            threads: Vec::new_in(alloc),
             alloc,
             epoch: 0,
             freed_through: 0,
@@ -326,7 +325,7 @@ impl<A: Allocator + Clone> Slots<A> {
         slot: SlotId,
         tier: Tier,
         code: CodeRef,
-        out: &mut Vec<Write, A>,
+        out: &mut AVec<'_, Write>,
     ) -> Result<Body, Error> {
         self.check(slot)?;
         let at = slot.index();
@@ -360,7 +359,7 @@ impl<A: Allocator + Clone> Slots<A> {
             self.bodies[old.0 as usize].life = Life::Retired;
             let epoch = self.epoch + 1;
             self.epoch = epoch;
-            let mut waiting = Vec::with_capacity_in(self.threads.len(), self.alloc.clone());
+            let mut waiting = Vec::with_capacity_in(self.threads.len(), self.alloc);
             waiting.extend(self.threads.iter().copied());
             self.batches.push(Batch { stamp: epoch, body: old, waiting });
             out.push(Write::Epoch { epoch });
@@ -369,17 +368,17 @@ impl<A: Allocator + Clone> Slots<A> {
     }
 
     /// Turns `watch` on for `slot`: its slot word becomes the stub for the slot's whole watch.
-    pub fn observe(&mut self, slot: SlotId, watch: Watch, out: &mut Vec<Write, A>) -> Result<(), Error> {
+    pub fn observe(&mut self, slot: SlotId, watch: Watch, out: &mut AVec<'_, Write>) -> Result<(), Error> {
         self.watch(slot, watch, true, out)
     }
 
     /// Turns `watch` off for `slot`: its slot word becomes the stub for what is still watched,
     /// or, with nothing left, the body word as it is now (never one remembered from before).
-    pub fn plain(&mut self, slot: SlotId, watch: Watch, out: &mut Vec<Write, A>) -> Result<(), Error> {
+    pub fn plain(&mut self, slot: SlotId, watch: Watch, out: &mut AVec<'_, Write>) -> Result<(), Error> {
         self.watch(slot, watch, false, out)
     }
 
-    fn watch(&mut self, slot: SlotId, watch: Watch, on: bool, out: &mut Vec<Write, A>) -> Result<(), Error> {
+    fn watch(&mut self, slot: SlotId, watch: Watch, on: bool, out: &mut AVec<'_, Write>) -> Result<(), Error> {
         self.check(slot)?;
         let at = slot.index();
         let now = self.table.watches()[at].with(watch, on);
@@ -457,7 +456,7 @@ impl<A: Allocator + Clone> Slots<A> {
     }
 
     /// Frees every retired body every thread cleared, the oldest first: how many.
-    pub fn collect(&mut self, out: &mut Vec<Write, A>) -> usize {
+    pub fn collect(&mut self, out: &mut AVec<'_, Write>) -> usize {
         let mut freed = 0;
         let mut at = 0;
         while at < self.batches.len() {

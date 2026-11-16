@@ -24,6 +24,7 @@ pub mod get;
 pub mod key;
 pub mod path;
 pub mod print;
+mod profile;
 pub mod schema;
 mod source;
 pub mod target;
@@ -896,8 +897,9 @@ impl<F: Files> Config<F> {
     pub fn config_profile(
         &self,
         name: &str,
-    ) -> Result<OptValue<cargo_util_schemas::manifest::TomlProfile>, ConfigError> {
-        self.get(&format!("profile.{name}"))
+    ) -> Result<OptValue<crate::schema::TomlProfile>, ConfigError> {
+        let key = format!("profile.{name}");
+        profile::read(self.get(&key)?, &key)
     }
 
     /// The variables `[env]` adds to what cargo runs, as cargo's `GlobalContext::env_config`:
@@ -1003,7 +1005,7 @@ impl<F: Files> Config<F> {
 
     /// `registries.<name>.index`, as cargo's `GlobalContext::get_registry_index`.
     pub fn registry_index(&self, registry: &str) -> Result<Url, ConfigError> {
-        cargo_util_schemas::manifest::RegistryName::new(registry).map_err(ConfigError::foreign)?;
+        crate::schema::RegistryName::new(registry).map_err(ConfigError::foreign)?;
         let Some(index) = self.get_string(&format!("registries.{registry}.index"))? else {
             let registry = registry.to_owned();
             return Err(ConfigError::new(ConfigWhat::RegistryIndexMissing { registry }));
@@ -1113,9 +1115,7 @@ impl Config<Disk> {
         let doc = Document::parse_in(&contents, Limits::CARGO, Global).map_err(|e| {
             ConfigError::toml(ConfigWhat::ParseToml { path: path.clone() }, &e, &contents)
         })?;
-        let Data::Map(mut toml) = doc.to_value_in(Global) else {
-            unreachable!("a document's root is a table")
-        };
+        let mut toml = doc.to_map_in(Global);
         let text = |s: &str| Text::from_str_in(s, Global);
         let table_of = |key: &str, value: Data<Global>| {
             let mut map = Map::new_in(Global);
@@ -1371,7 +1371,10 @@ fn cli_dotted_keys(arg: &str) -> Result<Document<'_, Global>, ConfigError> {
         if current.len() != 1 {
             return Err(fail());
         }
-        let Some(value) = current.at(0) else { unreachable!("a table of one has its first") };
+        // `at` is an array's; a table's one entry is its first child.
+        let Some(value) = current.children().next() else {
+            unreachable!("a table of one has its first")
+        };
         match value.kind() {
             Kind::Table => current = value,
             _ => break,

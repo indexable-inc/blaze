@@ -119,6 +119,36 @@ pub trait CloneIn<B: Allocator> {
             Err(failure) => fail(failure),
         }
     }
+
+    /// Copies of `values` written at `dst.add(*count)`, `dst.add(*count + 1)`, .., `*count`
+    /// counting each as it lands, up to the first refusal: what every `clone_in` of a collection
+    /// of values goes through. One at a time here; the `Copy` impl makes it one block copy
+    /// (`spec`'s notes). Not for implementations to override.
+    ///
+    /// # Safety
+    ///
+    /// The `values.len()` slots from `dst.add(*count)` are in one allocation, hold no value and
+    /// do not overlap `values`.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn try_clone_slice_in(
+        values: &[Self],
+        dst: *mut Self::In,
+        count: &mut usize,
+        alloc: &B,
+    ) -> Result<(), AllocFailure>
+    where
+        Self: Sized,
+        B: Clone,
+    {
+        for value in values {
+            let copy = value.try_clone_in(alloc.clone())?;
+            // SAFETY: slot `*count` is one of the empty slots the caller gave.
+            unsafe { dst.add(*count).write(copy) };
+            *count += 1;
+        }
+        Ok(())
+    }
 }
 
 /// A `Copy` value is its own copy and allocates nothing.
@@ -128,6 +158,19 @@ impl<T: Copy, B: Allocator> CloneIn<B> for T {
     #[inline]
     fn try_clone_in(&self, _alloc: B) -> Result<T, AllocFailure> {
         Ok(*self)
+    }
+
+    /// One block copy: each value's copy is the value itself.
+    #[inline]
+    unsafe fn try_clone_slice_in(values: &[T], dst: *mut T, count: &mut usize, _alloc: &B) -> Result<(), AllocFailure>
+    where
+        B: Clone,
+    {
+        // SAFETY: the caller's slots: in one allocation, empty, apart from `values`; a `Copy`
+        // value's copy here is `*self`, its bytes.
+        unsafe { core::ptr::copy_nonoverlapping(values.as_ptr(), dst.add(*count), values.len()) };
+        *count += values.len();
+        Ok(())
     }
 }
 
@@ -143,12 +186,7 @@ impl<T: CloneIn<B>, B: Allocator + Clone> CloneIn<B> for [T] {
     type In = Vec<T::In, B>;
 
     fn try_clone_in(&self, alloc: B) -> Result<Vec<T::In, B>, AllocFailure> {
-        let mut out = Vec::try_with_capacity_in(self.len(), alloc.clone())?;
-        for value in self {
-            // The room is reserved: the push does not allocate.
-            out.push(value.try_clone_in(alloc.clone())?);
-        }
-        Ok(out)
+        crate::vec::clone_slice_in(self, alloc)
     }
 }
 

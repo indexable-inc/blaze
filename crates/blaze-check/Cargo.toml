@@ -15,7 +15,6 @@ doctest = false
 
 [dependencies]
 blaze-rng.workspace = true
-parking_lot.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

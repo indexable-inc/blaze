@@ -21,8 +21,7 @@
 //! or-pattern check that every alternative binds a name at one type, and the 2024 rule's exact
 //! diagnostic split (one code here).
 
-use blaze_own::Vec;
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Vec};
 
 use crate::body::{Lit, Pat};
 use crate::diag::{At, DiagCode};
@@ -191,7 +190,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let Some(adt) = self.reads.adt(adt_key)? else { return Ok(expected) };
                 let Some(v) = adt.variants.get(variant as usize).copied() else { return Ok(expected) };
                 let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
-                let mut tys: Vec<Ty, A> = Vec::with_capacity_in(fps.len(), self.alloc.clone());
+                let mut tys: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(fps.len(), self.alloc);
                 for fp in fps {
                     match declared.iter().find(|d| d.name == fp.name) {
                         Some(d) => tys.push(self.lower(adt.types, d.ty, Lower::Args(args))?),

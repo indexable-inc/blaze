@@ -1,7 +1,7 @@
 //! A package at a version in a source: `src/workspace/package_id.rs` of cargo 1.99.0
 //! (5f94df4789).
 
-use blaze_ids::{Domain, Interner, Sharded};
+use blaze_ids::{Domain, Interner, Shards, Sharded};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr;
@@ -93,7 +93,7 @@ impl PackageId {
 
     pub fn new(name: InternedString, version: Version, source_id: SourceId) -> PackageId {
         let inner = PackageIdInner { name, version, source_id };
-        let ids = PACKAGE_IDS.get_or_init(Sharded::new);
+        let ids = PACKAGE_IDS.get_or_init(|| Sharded::new(Shards::for_this_machine()));
         let mut hasher = blaze_ids::Hasher::of(&PACKAGE_ID);
         hasher.std(&inner);
         let at = ids.intern(hasher.finish(), || inner);

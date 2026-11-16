@@ -14,8 +14,6 @@
 //! which blaze-ty's adapter will give); two unresolved variables unify instead of registering a
 //! `Coerce` predicate; a closure does not coerce to a fn pointer yet.
 
-use core::alloc::Allocator;
-
 use crate::columns::AdjustKind;
 use crate::error::Stop;
 use crate::ids::{ExprId, Mutbl};
@@ -23,7 +21,7 @@ use crate::machine::Machine;
 use crate::ty::{Ty, TyView, TypeCtx};
 use crate::world::World;
 
-impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
+impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// Coerces `a` to `b`, recording the adjustments on `e`. `false`: they do not coerce, and
     /// nothing was bound.
     pub(crate) fn coerce(&mut self, e: Option<ExprId>, a: Ty, b: Ty, two_phase: bool) -> Result<bool, Stop> {

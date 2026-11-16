@@ -23,9 +23,8 @@ blaze-reclaim.workspace = true
 blaze-rng.workspace = true
 blaze-serde.workspace = true
 blaze-spin.workspace = true
-crossbeam-channel.workspace = true
+blaze-queue.workspace = true
 crossbeam-deque.workspace = true
-crossbeam-queue.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 stdx.workspace = true

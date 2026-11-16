@@ -93,17 +93,20 @@ to_value!(I128 as i128: i128);
 to_value!(U128 as u128: u128);
 
 macro_rules! non_zero {
-    ($($t:ty),*) => {
+    ($v:ident as $w:ty: $($t:ty),*) => {
         $(impl ToValue for num::NonZero<$t> {
             #[inline]
             fn to_value(&self) -> Option<Value<'_>> {
-                self.get().to_value()
+                Some(Value::$v(self.get() as $w))
             }
         })*
     };
 }
 
-non_zero!(i8, i16, i32, i64, isize, i128, u8, u16, u32, u64, usize, u128);
+non_zero!(I64 as i64: i8, i16, i32, i64, isize);
+non_zero!(U64 as u64: u8, u16, u32, u64, usize);
+non_zero!(I128 as i128: i128);
+non_zero!(U128 as u128: u128);
 
 impl ToValue for bool {
     fn to_value(&self) -> Option<Value<'_>> {

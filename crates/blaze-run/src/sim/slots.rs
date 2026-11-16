@@ -11,10 +11,9 @@
 //! publish nor a watch lost the other's store); at the end, once every thread has left all code
 //! and reported, every retired body is freed.
 
-use std::alloc::Global;
 use std::collections::VecDeque;
 
-use blaze_own::Vec as Own;
+use blaze_own::{Alloc, Vec as Own};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
@@ -105,7 +104,7 @@ fn settled(memory: &Memory, asked: &[Watch], newest: &[Word]) -> Result<(), Brok
 }
 
 fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let mut core = Slots::new(SLOTS, 1 << 20, Global).map_err(harness)?;
+    let mut core = Slots::new(SLOTS, 1 << 20, Alloc::global()).map_err(harness)?;
     core.plant = plant;
     let mut memory = Memory {
         slot_words: vec![Word::NEED; SLOTS as usize],
@@ -117,7 +116,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let mut asked = [Watch::NONE; SLOTS as usize];
     let mut newest = [Word::NEED; SLOTS as usize];
     let mut pending: VecDeque<Write> = VecDeque::new();
-    let mut out = Own::new_in(Global);
+    let mut out = Own::new_in(Alloc::global());
     let mut threads: Vec<Thread> = Vec::new();
     let mut next_thread = 0u64;
     let mut next_code = 0u64;
@@ -234,8 +233,8 @@ fn a_collect_waits_for_the_publish_before_it() {
 /// old epoch is refused by name.
 #[test]
 fn a_thread_behind_a_freed_body_is_refused() {
-    let mut core = Slots::new(1, 8, Global).expect("a table");
-    let mut out = Own::new_in(Global);
+    let mut core = Slots::new(1, 8, Alloc::global()).expect("a table");
+    let mut out = Own::new_in(Alloc::global());
     core.publish(SlotId(0), Tier::Fast, CodeRef(key(1)), &mut out).expect("first");
     core.publish(SlotId(0), Tier::Fast, CodeRef(key(2)), &mut out).expect("second");
     assert_eq!(core.collect(&mut out), 1);
@@ -249,8 +248,8 @@ fn a_thread_behind_a_freed_body_is_refused() {
 /// one the stub went in front of.
 #[test]
 fn a_publish_under_a_stub_keeps_it_and_plain_names_the_newest_body() {
-    let mut core = Slots::new(1, 8, Global).expect("a table");
-    let mut out = Own::new_in(Global);
+    let mut core = Slots::new(1, 8, Alloc::global()).expect("a table");
+    let mut out = Own::new_in(Alloc::global());
     let slot = SlotId(0);
     let first = core.publish(slot, Tier::Fast, CodeRef(key(1)), &mut out).expect("first");
     core.observe(slot, Watch::HEAT, &mut out).expect("counted");

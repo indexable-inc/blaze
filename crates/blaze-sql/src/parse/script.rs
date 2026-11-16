@@ -142,7 +142,7 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
     }
 
     /// Whether the current token is `(` and a query starts after it.
-    fn query_ahead(&self) -> Parsed<'s, bool> {
+    pub(super) fn query_ahead(&self) -> Parsed<'s, bool> {
         if !self.at_punct(Punct::LParen) {
             return Ok(false);
         }

@@ -6,17 +6,14 @@
 //! task/idle.rs).
 
 use std::{
-    eprintln, format,
     num::{NonZeroU32, NonZeroUsize},
-    string::{String, ToString as _},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::{Duration, Instant},
-    vec::Vec,
 };
 
 use alloc::{alloc::Global, sync::Arc};
 
-use blaze_core::wait::{Clock as _, Deadline};
+use blaze_core::wait::Deadline;
 use blaze_mem::{Frame, Tag};
 
 use super::{
@@ -312,8 +309,13 @@ fn a_background_task_never_starts_on_a_foreground_worker_while_foreground_work_i
     let f1 = foreground.may_overlap("f1", TASK_FRAME, note);
     let f2 = foreground.may_overlap("f2", TASK_FRAME, note);
     gate.store(true, Ordering::Release);
-    // The foreground tasks are joined first: a join runs an unstarted task itself, and the
-    // background one must not be started here before the workers had their chance.
+    // Nothing is joined until the workers have run all four: a join runs an unstarted task
+    // itself, which would take it off the queues the order is about.
+    let until = Instant::now() + Duration::from_secs(10);
+    while order.load(Ordering::SeqCst) < 4 {
+        assert!(Instant::now() < until, "the workers did not run the four tasks within 10 s");
+        std::thread::yield_now();
+    }
     let fs = [f0.join(&cx), f1.join(&cx), f2.join(&cx)];
     let bg = late.join(&cx);
     let (a, b) = (a.join(&cx), b.join(&cx));
@@ -427,64 +429,59 @@ fn torn_folds(plant: FoldPlant, folds: u32) -> u64 {
     let slots = PerWorker::new_racy_in(cx.workers(), Global, |_| (AtomicU64::new(0), AtomicU64::new(0))).planted(plant);
     let stop = AtomicBool::new(false);
     let torn = AtomicU64::new(0);
-    let scope = cx.scope();
-    let writers = scope.may_overlap("writers", TASK_FRAME, |cx| -> Result<(), String> {
-        let items: Vec<u64> = (1..=4096).collect();
-        let inner = cx.scope();
-        let grain = Grain::new(NonZeroUsize::new(1).expect("1"), 64 << 10);
-        let done = par::for_each(cx, &inner, &items[..], grain, |items: &[u64]| {
-            for &v in items {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                // No `Cx` reaches here (par's closure takes none): the slot is written through
-                // the worker the chunk runs on, found again by the next fold.
-                let _ = v;
+    let next = AtomicU64::new(0);
+    // One write: both halves of this worker's slot, a long spin between them. Each is its own
+    // task, so a worker reaches a task boundary (where a fold's visit runs) between writes.
+    let write = |cx: &Cx| -> Result<(), String> {
+        let v = next.fetch_add(1, Ordering::Relaxed) + 1;
+        let wrote = slots.with(cx, |(a, b)| {
+            a.store(v, Ordering::Relaxed);
+            for _ in 0..2000 {
+                core::hint::spin_loop();
             }
+            b.store(v, Ordering::Relaxed);
         });
-        inner.join(cx).map_err(|error| error.to_string())?;
-        done.map_err(|error| error.to_string())
-    });
-    let writing = scope.must_overlap("writing", TASK_FRAME, |cx| -> Result<(), String> {
-        let mut v = 0u64;
-        while !stop.load(Ordering::Acquire) {
-            v += 1;
-            slots
-                .with(cx, |(a, b)| {
-                    a.store(v, Ordering::Relaxed);
-                    for _ in 0..2000 {
-                        core::hint::spin_loop();
-                    }
-                    b.store(v, Ordering::Relaxed);
-                })
-                .map_err(|error| error.to_string())?;
-            // Between writes the worker runs other tasks: a fold's visit among them.
-            let inner = cx.scope();
-            let tick = inner.may_overlap("tick", 64 << 10, |_| -> Result<(), String> { Ok(()) });
-            let _ = tick.join(cx);
-            inner.join(cx).map_err(|error| error.to_string())?;
+        match wrote {
+            // A write the root's join ran itself, off every worker: it has no slot to write.
+            Ok(()) | Err(NotAWorker::Outside { .. }) => Ok(()),
+            Err(other) => Err(other.to_string()),
         }
-        Ok(())
-    });
-    let writing = writing.expect("a parked worker for the writer");
+    };
+    let scope = cx.scope();
     let folder = scope.must_overlap("folder", TASK_FRAME, |cx| -> Result<(), String> {
+        let mut folded = Ok(());
         for _ in 0..folds {
-            let seen = slots
-                .fold(cx, 0u64, |(a, b)| u64::from(a.load(Ordering::Relaxed) != b.load(Ordering::Relaxed)), |sum, it| sum + it)
-                .map_err(|error| error.to_string())?;
-            torn.fetch_add(seen, Ordering::Relaxed);
+            match slots.fold(cx, 0u64, |(a, b)| u64::from(a.load(Ordering::Relaxed) != b.load(Ordering::Relaxed)), |sum, it| sum + it) {
+                Ok(seen) => {
+                    torn.fetch_add(seen, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    folded = Err(error.to_string());
+                    break;
+                }
+            }
         }
+        // On every path: the root's writing loop ends on it.
         stop.store(true, Ordering::Release);
-        Ok(())
+        folded
     });
     let folder = folder.expect("a parked worker for the folder");
+    // The root keeps the other workers writing, eight tasks at a time, until the folds end.
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut wrote = Ok(());
+    while !stop.load(Ordering::Acquire) && wrote.is_ok() {
+        assert!(Instant::now() < until, "the folds did not end within 30 s");
+        let writers = cx.scope();
+        let batch = [(); 8].map(|()| writers.may_overlap("write", 64 << 10, write));
+        for task in batch {
+            wrote = wrote.and(task.join(&cx).map_err(|error| error.to_string()));
+        }
+        wrote = wrote.and(writers.join(&cx).map_err(|error| error.to_string()));
+    }
     let folded = folder.join(&cx);
-    stop.store(true, Ordering::Release);
-    let (wrote, ran) = (writing.join(&cx), writers.join(&cx));
     let joined = scope.join(&cx);
     folded.expect("the folds");
-    wrote.expect("the writer");
-    ran.expect("the writers");
+    wrote.expect("the writes");
     joined.expect("their scope");
     drop(cx);
     stopped(running);
@@ -502,9 +499,9 @@ fn the_fold_control_reading_slots_directly_sees_one_torn() {
     assert!(torn > 0, "the planted fold read every slot from its own thread and never saw a write half done");
 }
 
-/// Keeps `Ordering` and `AtomicUsize` named for the tests above that may grow to use them.
+/// The racy form's snapshot reads every slot from any thread, outside the pool too.
 #[test]
-fn per_worker_counts_its_slots() {
+fn a_racy_snapshot_reads_every_slot() {
     let slots: PerWorker<AtomicUsize, Global, super::Shared> = PerWorker::new_racy_in(3, Global, |_| AtomicUsize::new(1));
     let mut sum = 0;
     slots.snapshot_racy(|_, it| sum += it.load(Ordering::Relaxed));

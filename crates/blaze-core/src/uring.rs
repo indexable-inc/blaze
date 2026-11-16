@@ -1292,8 +1292,8 @@ const NOBODYS: Tag = Tag(u64::MAX);
 /// Work done on threads of its own rather than through the ring (a listing, which may take
 /// long): their completions, and the eventfd that wakes the ring when one is sent.
 struct Offload {
-    sender: crossbeam_channel::Sender<Completion>,
-    receiver: crossbeam_channel::Receiver<Completion>,
+    sender: crate::chan::Sender<Completion>,
+    receiver: crate::chan::Receiver<Completion>,
     /// Shared with the threads, so a write of one that ends after the driver is dropped
     /// still reaches an open descriptor.
     wake: Arc<Wake>,
@@ -1314,7 +1314,7 @@ impl Offload {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (sender, receiver) = crate::chan::unbounded();
         // SAFETY: the call returned a descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false), asked: AtomicBool::new(false) }); // alloc: setup, once per driver.
@@ -1374,14 +1374,14 @@ struct Grown {
 /// ([`crate::watch::Grow`]). Made for the first. Its channels are bounded by [`STARTS`] and it
 /// wakes the ring as work off the ring does ([`Offload`]).
 struct Walker {
-    inbox: crossbeam_channel::Sender<Walking>,
-    done: crossbeam_channel::Receiver<Walked>,
+    inbox: crate::chan::Sender<Walking>,
+    done: crate::chan::Receiver<Walked>,
 }
 
 impl Walker {
     fn new(root: Arc<Path>, wake: Arc<Wake>, gate: crate::watch::Gate) -> io::Result<Walker> {
-        let (inbox, jobs) = crossbeam_channel::bounded::<Walking>(STARTS);
-        let (told, done) = crossbeam_channel::bounded(STARTS);
+        let (inbox, jobs) = crate::chan::bounded::<Walking>(STARTS);
+        let (told, done) = crate::chan::bounded(STARTS);
         std::thread::Builder::new().name("blaze-watch-walk".into()).spawn(move || {
             // The buffers of every grow's walk, kept for the next.
             let mut walker = crate::watch::Walker::default();
@@ -1504,7 +1504,7 @@ struct Job {
     /// One stamp per name, written through `base`.
     out: UnsafeCell<Vec<Stamp>>,
     base: *mut Stamp,
-    sender: crossbeam_channel::Sender<Completion>,
+    sender: crate::chan::Sender<Completion>,
     wake: Arc<Wake>,
 }
 
@@ -1587,7 +1587,7 @@ impl Job {
 /// but the first. [`Effect::Entries`]' listings go to one stamper each, in turn, where a thread
 /// of their own would cost as much to start as a listing of a hundred names.
 struct Stampers {
-    inboxes: Arc<[crossbeam_channel::Sender<ToStamp>]>,
+    inboxes: Arc<[crate::chan::Sender<ToStamp>]>,
     /// The stamper the next listing goes to.
     next: std::cell::Cell<usize>,
 }
@@ -1605,7 +1605,7 @@ struct List {
     tag: Tag,
     root: Arc<Path>,
     dir: FileName,
-    sender: crossbeam_channel::Sender<Completion>,
+    sender: crate::chan::Sender<Completion>,
     wake: Arc<Wake>,
 }
 
@@ -1626,9 +1626,9 @@ impl Stampers {
     fn new() -> io::Result<Stampers> {
         let count = std::thread::available_parallelism().map_or(1, |it| it.get());
         let (senders, receivers): (
-            Vec<crossbeam_channel::Sender<ToStamp>>,
-            Vec<crossbeam_channel::Receiver<ToStamp>>,
-        ) = (0..count).map(|_| crossbeam_channel::unbounded()).unzip();
+            Vec<crate::chan::Sender<ToStamp>>,
+            Vec<crate::chan::Receiver<ToStamp>>,
+        ) = (0..count).map(|_| crate::chan::unbounded()).unzip();
         let stampers = Stampers { inboxes: senders.into(), next: std::cell::Cell::new(0) };
         for (me, inbox) in receivers.into_iter().enumerate() {
             let inboxes = Arc::clone(&stampers.inboxes);
@@ -1660,8 +1660,8 @@ impl Drop for Stampers {
 
 fn stamper(
     me: usize,
-    inbox: &crossbeam_channel::Receiver<ToStamp>,
-    inboxes: &[crossbeam_channel::Sender<ToStamp>],
+    inbox: &crate::chan::Receiver<ToStamp>,
+    inboxes: &[crate::chan::Sender<ToStamp>],
 ) {
     // alloc: one buffer per stamper, reused for every directory of every job.
     let mut parent = Vec::with_capacity(libc::PATH_MAX as usize);
@@ -1925,7 +1925,7 @@ pub struct Uring {
 
 /// Where the host's effects are told: the channel of the work off the ring, and its wake.
 struct HostSink {
-    done: crossbeam_channel::Sender<Completion>,
+    done: crate::chan::Sender<Completion>,
     wake: Arc<Wake>,
 }
 
@@ -4447,7 +4447,7 @@ mod tests {
             std::fs::create_dir_all(root.join("src/deep")).unwrap();
             let src = FileName::new("src").unwrap();
             let mut driver = Uring::new(&root).unwrap();
-            let (open, gate) = crossbeam_channel::unbounded();
+            let (open, gate) = crate::chan::unbounded();
             driver.walk_gate = Some(gate);
             crate::watch::FANOTIFY_REFUSED.set(true);
             crate::watch::HOLDS_NOTHING.set(holds_nothing);
@@ -4545,7 +4545,7 @@ mod tests {
             std::fs::create_dir_all(root.join("src")).unwrap();
             let file = FileName::new("src/new/deeper/lib.rs").unwrap();
             let mut driver = Uring::new(&root).unwrap();
-            let (open, gate) = crossbeam_channel::unbounded();
+            let (open, gate) = crate::chan::unbounded();
             driver.walk_gate = Some(gate);
             crate::watch::FANOTIFY_REFUSED.set(true);
             crate::watch::GROW_DROPS_FOUND.set(drops_found);

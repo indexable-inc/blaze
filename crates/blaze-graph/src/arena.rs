@@ -30,7 +30,7 @@ use std::{
 };
 
 use blaze_mem::Tag;
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 pub use global::Holders;
 

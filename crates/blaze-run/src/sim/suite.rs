@@ -1,10 +1,9 @@
 //! [`Tests`] against tests recorded and recorded again with other entered sets; the oracle is a
 //! naive scan of each test's last record. And [`entered`] against a naive read of the bitmaps.
 
-use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 
-use blaze_own::Vec as Own;
+use blaze_own::{Alloc, Vec as Own};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{key, oracle};
@@ -19,7 +18,7 @@ fn body(n: u64) -> CodeId {
 }
 
 fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let mut tests = Tests::new(Global);
+    let mut tests = Tests::new(Alloc::global());
     tests.plant = plant;
     let mut model: BTreeMap<TestId, BTreeSet<CodeId>> = BTreeMap::new();
     let mut known: BTreeSet<TestId> = BTreeSet::new();
@@ -43,7 +42,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             _ => {
                 let changed: Vec<CodeId> =
                     (0..BODIES).filter(|_| tape.one_in(3, "changed")).map(body).collect();
-                let mut got = Own::new_in(Global);
+                let mut got = Own::new_in(Alloc::global());
                 tests.affected(&changed, &mut got);
                 let want: Vec<TestId> = known
                     .iter()
@@ -87,7 +86,7 @@ fn entered_reads_the_bitmaps_and_what_optimized_bodies_inlined() {
         let inlined: Vec<Vec<CodeId>> = (0..slots)
             .map(|_| (0..BODIES).filter(|_| tape.one_in(4, "inlined")).map(body).collect())
             .collect();
-        let mut got = Own::new_in(Global);
+        let mut got = Own::new_in(Alloc::global());
         entered(&marked, &ids, |slot: SlotId| inlined[slot.index()].as_slice(), &mut got);
         let mut want = BTreeSet::new();
         for at in 0..slots {

@@ -30,7 +30,6 @@ explore = [
   "dep:blaze-base64",
   "dep:blaze-http",
   "dep:blaze-sha256",
-  "dep:crossbeam-channel",
   "dep:rcgen",
 ]
 
@@ -39,16 +38,16 @@ blaze-own.workspace = true
 # pprof bodies, gunzipped (`pprof`).
 blaze-deflate.workspace = true
 addr2line.workspace = true
-arrow-array.workspace = true
-arrow-ipc.workspace = true
-arrow-schema.workspace = true
+# The tables' columns and their Arrow IPC files and streams, in place of arrow-*.
+blaze-arrow-ipc.workspace = true
+blaze-columns.workspace = true
 blake3.workspace = true
 # Named locks (blaze_core::lock) and the one deadline wait.
 blaze-core.workspace = true
 # The dev runtime's stubs and jump table: a function pointer of a blaze dev run is its slot's
 # stub, which only the jump table ties to its function (symbols.rs).
 blaze-inproc-rt.workspace = true
-crossbeam-queue.workspace = true
+blaze-queue.workspace = true
 # `endian-reader`: `EndianArcSlice`, the reader the symbolizer keeps DWARF in.
 gimli = { workspace = true, features = ["endian-reader"] }
 object.workspace = true
@@ -61,14 +60,13 @@ serde.workspace = true
 serde_json.workspace = true
 blaze-trace.workspace = true
 # The explorer (feature `explore`): the certificate's hash in the link (base64url, SHA-256), the
-# certificate (rcgen), the request's stop (crossbeam-channel), and the WebTransport server:
-# blaze-http's sans-IO HTTP/3 core and its driver loop, run with the explorer's own sans-IO
-# machine (`explore::serving`) on one blaze-core driver; the jobs' results come back on a
-# crossbeam-queue. No async runtime.
+# certificate (rcgen), and the WebTransport server: blaze-http's sans-IO HTTP/3 core and its
+# driver loop, run with the explorer's own sans-IO machine (`explore::serving`) on one
+# blaze-core driver; the request's stop is a `blaze_core::chan`, and the jobs' results come
+# back on a `blaze_queue::SegQueue`. No async runtime.
 blaze-base64 = { workspace = true, optional = true }
 blaze-http = { workspace = true, optional = true }
 blaze-sha256 = { workspace = true, optional = true }
-crossbeam-channel = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]

@@ -1691,6 +1691,9 @@ impl<'a, K: 'a, V: 'a> DoubleEndedIterator for Iter<'a, K, V> {
 
 impl<'a, K: 'a, V: 'a> ExactSizeIterator for Iter<'a, K, V> {}
 
+// SAFETY: `size_hint` is `left`, the entries left, which each `next` and `next_back` lowers by one.
+unsafe impl<K, V> core::iter::TrustedLen for Iter<'_, K, V> {}
+
 impl<'a, K: 'a, V: 'a> FusedIterator for Iter<'a, K, V> {}
 
 /// The entries in order, values borrowed mutably; from either end.
@@ -1742,6 +1745,9 @@ impl<'a, K: 'a, V: 'a> DoubleEndedIterator for IterMut<'a, K, V> {
 
 impl<'a, K: 'a, V: 'a> ExactSizeIterator for IterMut<'a, K, V> {}
 
+// SAFETY: as `Iter`'s.
+unsafe impl<K, V> core::iter::TrustedLen for IterMut<'_, K, V> {}
+
 impl<'a, K: 'a, V: 'a> FusedIterator for IterMut<'a, K, V> {}
 
 /// The keys in order.
@@ -1774,6 +1780,9 @@ impl<'a, K: 'a, V: 'a> DoubleEndedIterator for Keys<'a, K, V> {
 }
 
 impl<'a, K: 'a, V: 'a> ExactSizeIterator for Keys<'a, K, V> {}
+
+// SAFETY: it forwards `Iter`'s exact `size_hint`.
+unsafe impl<K, V> core::iter::TrustedLen for Keys<'_, K, V> {}
 
 impl<'a, K: 'a, V: 'a> FusedIterator for Keys<'a, K, V> {}
 
@@ -1808,6 +1817,9 @@ impl<'a, K: 'a, V: 'a> DoubleEndedIterator for Values<'a, K, V> {
 
 impl<'a, K: 'a, V: 'a> ExactSizeIterator for Values<'a, K, V> {}
 
+// SAFETY: it forwards `Iter`'s exact `size_hint`.
+unsafe impl<K, V> core::iter::TrustedLen for Values<'_, K, V> {}
+
 impl<'a, K: 'a, V: 'a> FusedIterator for Values<'a, K, V> {}
 
 /// The values in their keys' order, borrowed mutably.
@@ -1834,6 +1846,9 @@ impl<'a, K: 'a, V: 'a> DoubleEndedIterator for ValuesMut<'a, K, V> {
 }
 
 impl<'a, K: 'a, V: 'a> ExactSizeIterator for ValuesMut<'a, K, V> {}
+
+// SAFETY: it forwards `IterMut`'s exact `size_hint`.
+unsafe impl<K, V> core::iter::TrustedLen for ValuesMut<'_, K, V> {}
 
 impl<'a, K: 'a, V: 'a> FusedIterator for ValuesMut<'a, K, V> {}
 
@@ -2023,6 +2038,9 @@ impl<K, V, A: Allocator> DoubleEndedIterator for IntoIter<K, V, A> {
 }
 
 impl<K, V, A: Allocator> ExactSizeIterator for IntoIter<K, V, A> {}
+
+// SAFETY: `size_hint` is `left`, the entries left, which each dying step lowers by one.
+unsafe impl<K, V, A: Allocator> core::iter::TrustedLen for IntoIter<K, V, A> {}
 
 impl<K, V, A: Allocator> FusedIterator for IntoIter<K, V, A> {}
 
@@ -2294,6 +2312,9 @@ impl<'a, T: 'a> DoubleEndedIterator for SetIter<'a, T> {
 
 impl<'a, T: 'a> ExactSizeIterator for SetIter<'a, T> {}
 
+// SAFETY: it forwards `Keys`'s exact `size_hint`.
+unsafe impl<T> core::iter::TrustedLen for SetIter<'_, T> {}
+
 impl<'a, T: 'a> FusedIterator for SetIter<'a, T> {}
 
 /// A set's values in a range, in order; from either end.
@@ -2347,6 +2368,9 @@ impl<T, A: Allocator> DoubleEndedIterator for SetIntoIter<T, A> {
 }
 
 impl<T, A: Allocator> ExactSizeIterator for SetIntoIter<T, A> {}
+
+// SAFETY: it forwards `IntoIter`'s exact `size_hint`.
+unsafe impl<T, A: Allocator> core::iter::TrustedLen for SetIntoIter<T, A> {}
 
 impl<T, A: Allocator> FusedIterator for SetIntoIter<T, A> {}
 

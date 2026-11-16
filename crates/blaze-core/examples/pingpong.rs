@@ -64,8 +64,8 @@ fn spun(a: usize, b: usize, rounds: u64) -> Duration {
 }
 
 fn slept(a: usize, b: usize, rounds: u64) -> Duration {
-    let (there, from_here) = crossbeam_channel::unbounded::<u64>();
-    let (back, from_there) = crossbeam_channel::unbounded::<u64>();
+    let (there, from_here) = blaze_core::chan::unbounded::<u64>();
+    let (back, from_there) = blaze_core::chan::unbounded::<u64>();
     std::thread::scope(|scope| {
         scope.spawn(move || {
             pin(b);

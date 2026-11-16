@@ -57,6 +57,9 @@
 //! | `dropck_eyepatch` | `#[may_dangle]` on the `Drop` of every owner, so a `Vec<&'a T, A>` may be dropped after `'a` ends, as std's may |
 //! | `fn_traits`, `unboxed_closures` | `FnOnce`, `FnMut` and `Fn` for a [`Box`] of a [`CallOnce`] closure, so a boxed one-shot closure is called as `b(x)` |
 //! | `tuple_trait` | the `Tuple` bound on those impls' argument lists |
+//! | `min_specialization` | the fast paths of [`spec`]: a block copy for `TrivialClone` values, a byte search for bytes, one reservation for an iterator of known length; each impl in the sound subset (its notes) |
+//! | `trivial_clone` | `core::clone::TrivialClone`, the specialization trait of a type whose clone is a bitwise copy (every `#[derive(Clone, Copy)]` and core's `Copy` types), which the block copies specialize on |
+//! | `trusted_len` | `core::iter::TrustedLen`, the marker of an iterator whose `size_hint` is exact, which `extend` and `collect_in` specialize on; implemented for this crate's exact iterators |
 //! | `register_tool`, `custom_inner_attributes` | `#![blaze::trust]`, blaze's lint attribute; inert under rustc |
 //!
 //! Stable on the pinned nightly and used without a gate: `core::alloc::Allocator`,
@@ -79,6 +82,10 @@
 #![no_std]
 #![feature(allocator_ext, coerce_unsized, unsize, dropck_eyepatch)]
 #![feature(fn_traits, unboxed_closures, tuple_trait)]
+// The fast paths of `spec`: one block copy or one byte search where a generic method would go
+// element by element.
+#![feature(min_specialization, trusted_len, trivial_clone)]
+#![allow(internal_features, reason = "`min_specialization`, within the subset std itself uses (`spec`)")]
 // blaze's lints (`blaze::trust`) name their tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
@@ -113,6 +120,7 @@ pub mod rc;
 #[macro_use]
 pub mod soa;
 pub mod sorted;
+pub mod spec;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod text;

@@ -5,6 +5,8 @@
 //! an error is made, into the cursor's allocator; reading a value that fits allocates nothing
 //! for the path.
 
+#![blaze::sans_io]
+
 use core::{alloc::Allocator, cell::RefCell, fmt, fmt::Write as _};
 
 use blaze_own::{String, Vec};
@@ -62,9 +64,10 @@ impl<'p> At<'p> {
 }
 
 /// One step of a path written as [`At::write_into`] writes it, after `before` (whether a step
-/// was written already); says whether anything is written now. [`Walk`](crate::Walk), which
-/// keeps its own stack and no chain of `At`s, writes its path step by step with this.
-pub(crate) fn write_step<W: fmt::Write + ?Sized>(out: &mut W, step: Step<'_>, before: bool) -> Result<bool, fmt::Error> {
+/// was written already); says whether anything is written now. A walk that keeps its own
+/// stack (a [`Walk`](crate::Walk), a writer's table stack) and no chain of `At`s writes its
+/// path step by step with this.
+pub fn write_step<W: fmt::Write + ?Sized>(out: &mut W, step: Step<'_>, before: bool) -> Result<bool, fmt::Error> {
     match step {
         Step::Root => Ok(before),
         Step::Key(key) => {

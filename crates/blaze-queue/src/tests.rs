@@ -13,15 +13,25 @@ mod threads {
     const CONSUMERS: usize = 4;
     const EACH: usize = 20_000;
 
+    fn spawn<R: Send + 'static>(
+        name: &str,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> thread::JoinHandle<R> {
+        thread::Builder::new().name(name.into()).spawn(work).expect("a test thread")
+    }
+
     /// Every value of every producer is popped once, and each consumer sees each producer's
     /// values in the order it pushed them.
-    fn hands_over_once(push: impl Fn(usize) + Send + Sync + 'static, pop: impl Fn() -> Option<usize> + Send + Sync + 'static) {
+    fn hands_over_once(
+        push: impl Fn(usize) + Send + Sync + 'static,
+        pop: impl Fn() -> Option<usize> + Send + Sync + 'static,
+    ) {
         let push = Arc::new(push);
         let pop = Arc::new(pop);
         let producers: Vec<_> = (0..PRODUCERS)
             .map(|me| {
                 let push = Arc::clone(&push);
-                thread::spawn(move || {
+                spawn("queue test producer", move || {
                     for at in 0..EACH {
                         push(me * EACH + at);
                     }
@@ -31,7 +41,7 @@ mod threads {
         let consumers: Vec<_> = (0..CONSUMERS)
             .map(|_| {
                 let pop = Arc::clone(&pop);
-                thread::spawn(move || {
+                spawn("queue test consumer", move || {
                     let mut last = [None::<usize>; PRODUCERS];
                     let mut got = Vec::new();
                     while got.len() < PRODUCERS * EACH / CONSUMERS {

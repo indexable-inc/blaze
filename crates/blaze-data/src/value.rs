@@ -1,5 +1,7 @@
 //! [`Value`], [`Int`] and [`Kind`].
 
+#![blaze::sans_io]
+
 use core::{alloc::Allocator, cmp::Ordering, fmt};
 
 use blaze_own::{String, Vec};

@@ -4,6 +4,8 @@
 //! with its open containers on such a stack. Every format's writer is a walk and every reader
 //! a build, so there is one iterative traversal, here.
 
+#![blaze::sans_io]
+
 use core::{alloc::Allocator, fmt};
 
 use blaze_own::{String, Vec};
@@ -67,7 +69,12 @@ impl<'v, A: Allocator, S: Allocator + Clone> Walk<'v, A, S> {
     /// The path to the value visited last (`a.b[3]`, empty at the root), as
     /// [`At::write_into`](crate::At::write_into) writes one.
     pub fn path_into<W: fmt::Write + ?Sized>(&self, out: &mut W) -> fmt::Result {
-        let mut before = false;
+        self.path_after(out, false)
+    }
+
+    /// [`path_into`](Self::path_into) after a prefix: `before` says whether one was written,
+    /// so the first key gets its `.`.
+    pub fn path_after<W: fmt::Write + ?Sized>(&self, out: &mut W, mut before: bool) -> fmt::Result {
         for frame in self.stack.iter() {
             let step = match frame {
                 Frame::List { next: 0, .. } | Frame::Map { next: 0, .. } => continue,

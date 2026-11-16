@@ -41,6 +41,7 @@ blaze-sha256.workspace = true
 # The CPUs of `-C target-cpu` and their features (target_features::cpus).
 target-features.workspace = true
 toml.workspace = true
+blaze-toml.workspace = true
 url.workspace = true
 # The view std's graph is resolved in (`stdlib::cfg::std_graph`).
 blaze-vfs.workspace = true

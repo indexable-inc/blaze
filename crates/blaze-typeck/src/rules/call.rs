@@ -12,8 +12,7 @@
 //! `Fn*` traits on other types, and the expected-input deduction from the expected output
 //! (`expected_inputs_for_expected_output`), which only sharpens hints.
 
-use blaze_own::Vec;
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Vec};
 
 use crate::diag::{At, DiagCode};
 use crate::error::Stop;
@@ -26,7 +25,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// A fn item's inputs and output, instantiated with `args`.
     pub(crate) fn fn_def_sig(&mut self, k: ItemKey, args: TyList) -> Result<Option<(TyList, Ty)>, Stop> {
         let Some(sig) = self.reads.fn_sig(k)? else { return Ok(None) };
-        let mut inputs: Vec<Ty, A> = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
+        let mut inputs: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
         for &t in sig.inputs {
             inputs.push(self.lower(sig.types, t, Lower::Args(args))?);
         }

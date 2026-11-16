@@ -183,7 +183,7 @@ impl<T, const N: usize, A: Allocator> InlineVec<T, N, A> {
             (heap.0.as_ptr(), &mut heap.1)
         } else {
             // SAFETY: inline, so `inline` is the field in use.
-            let first = unsafe { self.data.inline.as_mut_ptr().cast::<T>() };
+            let first = unsafe { (*self.data.inline).as_mut_ptr().cast::<T>() };
             (first, &mut self.capacity)
         }
     }
@@ -285,7 +285,7 @@ impl<T, const N: usize, A: Allocator> InlineVec<T, N, A> {
             self.data.inline = ManuallyDrop::new([const { MaybeUninit::uninit() }; N]);
             // SAFETY: the block's first `len` slots hold values; `inline` (now the field in
             // use) has `N >= len` slots and lives in `self`, not in the block. The values move.
-            unsafe { ptr::copy_nonoverlapping(block.as_ptr(), self.data.inline.as_mut_ptr().cast::<T>(), len) };
+            unsafe { ptr::copy_nonoverlapping(block.as_ptr(), (*self.data.inline).as_mut_ptr().cast::<T>(), len) };
             self.capacity = len;
             // SAFETY: `block` was `alloc`'s, made with `old_layout`, and holds no value now.
             unsafe { self.alloc.deallocate(block.cast(), old_layout) };

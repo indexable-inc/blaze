@@ -9,8 +9,8 @@
 //! `%` gives a field by its `Display`, `?` by its `Debug`, and a plain value must be a
 //! [`crate::ToValue`]. `field = field::Empty` declares a field a later `span.record(..)` gives.
 //! A site's target is its module's path unless it names one. Each site is one `static`
-//! [`crate::Metadata`]; nothing is evaluated past [`crate::enabled`]'s branch unless a sink
-//! wants the site.
+//! [`crate::Metadata`] and one [`crate::Site`]; nothing is evaluated past the site's state's
+//! branch ([`crate::Site::on`]) unless something records the site.
 
 /// Reads a site's fields and message, then gives them to `$done` (`__span` or `__event`):
 /// `[names] [values] [message]`.
@@ -60,11 +60,9 @@ macro_rules! __span {
             $crate::field::FieldSet::new(&[$($n),*]),
             $crate::Kind::SPAN,
         );
-        if $crate::Level::compiled($level)
-            && $crate::wanted($level)
-            && let ::core::option::Option::Some(sink) = $crate::enabled(&META)
-        {
-            $crate::Span::new(sink, &META, $parent, &[$($v),*])
+        static SITE: $crate::Site = $crate::Site::new(&META);
+        if $crate::Level::compiled($level) && SITE.on() {
+            $crate::Span::open(&SITE, $parent, &[$($v),*])
         } else {
             $crate::Span::none()
         }
@@ -88,11 +86,9 @@ macro_rules! __event {
             $crate::field::FieldSet::new(&[$($n),*]),
             $crate::Kind::EVENT,
         );
-        if $crate::Level::compiled($level)
-            && $crate::wanted($level)
-            && let ::core::option::Option::Some(sink) = $crate::enabled(&META)
-        {
-            $crate::Event::dispatch(sink, &META, $parent, &[$($v),*]);
+        static SITE: $crate::Site = $crate::Site::new(&META);
+        if $crate::Level::compiled($level) && SITE.on() {
+            $crate::Event::emit(&SITE, $parent, &[$($v),*]);
         }
     }};
     (@site ($target:expr, $parent:expr, $level:expr) [$($n:expr),*] [$($v:expr),*] [$($message:tt)+]) => {{
@@ -106,13 +102,10 @@ macro_rules! __event {
             $crate::field::FieldSet::new(&[$($n,)* "message"]),
             $crate::Kind::EVENT,
         );
-        if $crate::Level::compiled($level)
-            && $crate::wanted($level)
-            && let ::core::option::Option::Some(sink) = $crate::enabled(&META)
-        {
-            $crate::Event::dispatch(
-                sink,
-                &META,
+        static SITE: $crate::Site = $crate::Site::new(&META);
+        if $crate::Level::compiled($level) && SITE.on() {
+            $crate::Event::emit(
+                &SITE,
                 $parent,
                 &[$($v,)* ::core::option::Option::Some($crate::Value::Display(&format_args!($($message)+)))],
             );

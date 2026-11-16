@@ -39,6 +39,8 @@ use crate::{
 // The cases below again, through an `Alloc` handle; `every_failure`, `Inline` and a planted bug
 // through one.
 mod handle;
+// The fast paths of `spec` against the generic ones.
+mod spec;
 
 // ---------------------------------------------------------------------------------------------
 // The counting allocator.
@@ -2964,13 +2966,20 @@ fn tree_values<A: Allocator, B: Allocator>(m: &OwnMap<u64, Box<u64, A>, B>) -> S
 #[test]
 fn btree_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
     under_every_failure("BTreeMap", |alloc| {
-        // Ascending and descending: splits on the right edge and on the left.
+        // Ascending and descending: splits on the right edge and on the left. `Failing` keeps
+        // at most `testing::SLOTS` (256) blocks live, so the boxed map is small and the tall one
+        // (height 2) holds plain values.
         let (mut up, mut down) = (OwnMap::new_in(alloc), OwnMap::new_in(alloc));
+        let down_values = |m: &OwnMap<u64, u64, &Failing>| m.iter().map(|(k, v)| (*k, *v)).collect::<StdVec<_>>();
         for n in 0..200u64 {
-            let value = Box::try_new_in(n, alloc)?;
-            step(&mut up, tree_values, |m| m.try_insert(n, value).map(|_| ()))?;
-            let value = Box::try_new_in(n, alloc)?;
-            step(&mut down, tree_values, |m| m.try_insert(1000 - n, value).map(|_| ()))?;
+            if n < 40 {
+                let value = Box::try_new_in(n, alloc)?;
+                step(&mut up, tree_values, |m| m.try_insert(n, value).map(|_| ()))?;
+            }
+            step(&mut down, down_values, |m| m.try_insert(1000 - n, n).map(|_| ()))?;
+        }
+        if down.height() < 2 {
+            return Err(Why::Changed(format!("200 keys made a tree of height {}", down.height())));
         }
         let value = Box::try_new_in(7, alloc)?;
         step(&mut up, tree_values, |m| match m.entry(500) {
@@ -2981,13 +2990,20 @@ fn btree_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
         if tree_values(&copy) != tree_values(&up) {
             return Err(Why::Changed(String::from("the copy differs from the map")));
         }
-        let right = step(&mut up, tree_values, |m| m.try_split_off(&100))?;
-        let mut want: StdVec<(u64, u64)> = (100..200).map(|k| (k, k)).collect();
+        let right = step(&mut up, tree_values, |m| m.try_split_off(&20))?;
+        let mut want: StdVec<(u64, u64)> = (20..40).map(|k| (k, k)).collect();
         want.push((500, 7));
-        if tree_values(&up) != (0..100).map(|k| (k, k)).collect::<StdVec<_>>() || tree_values(&right) != want {
+        if tree_values(&up) != (0..20).map(|k| (k, k)).collect::<StdVec<_>>() || tree_values(&right) != want {
             return Err(Why::Changed(format!("split_off gave {:?} and {:?}", tree_values(&up), tree_values(&right))));
         }
-        for map in [&up, &down, &copy, &right] {
+        let low = step(&mut down, down_values, |m| m.try_split_off(&900))?;
+        if down_values(&low) != (900..=1000).map(|k| (k, 1000 - k)).collect::<StdVec<_>>() {
+            return Err(Why::Changed(format!("split_off gave {:?}", down_values(&low))));
+        }
+        for map in [&up, &copy, &right] {
+            map.invariants().map_err(Why::Changed)?;
+        }
+        for map in [&down, &low] {
             map.invariants().map_err(Why::Changed)?;
         }
         let mut set = OwnSet::new_in(alloc);

@@ -15,19 +15,21 @@
 //! copies the words and keeps them only when the mark was `2 * n + 2` before and after. A reader
 //! that finds panic `n` still being written stops there and reads it next time.
 
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering, fence},
+use std::{
+    alloc::Global,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering, fence},
+    },
 };
 
-use arrow_array::{
-    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
-    builder::{ListBuilder, StringDictionaryBuilder, UInt64Builder},
-    types::UInt32Type,
-};
-use arrow_schema::{ArrowError, DataType};
+use blaze_columns::{ColumnError, Values};
 
-use crate::{batches, clock, flight, schema, stack};
+use crate::{
+    clock,
+    columns::{self, Batch, BatchError, Column},
+    errors, flight, schema, stack,
+};
 
 /// Panics the ring keeps: a 65th raised before a flush drains the first writes over it, counted
 /// by [`since`].
@@ -613,67 +615,57 @@ pub(crate) fn rows(raised: &[Raised]) -> Vec<PanicRow> {
         .collect()
 }
 
-fn column(array: impl arrow_array::Array + 'static) -> ArrayRef {
-    // alloc: a batch's column, once a flush
-    std::sync::Arc::new(array)
+/// A list's end, as list offsets hold it.
+fn offset(elements: usize) -> Result<u32, ColumnError> {
+    u32::try_from(elements).map_err(|_| ColumnError::Offsets { why: "pass u32::MAX elements" })
 }
 
-fn dict<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    column(values.collect::<DictionaryArray<UInt32Type>>())
-}
-
-/// A list column of `table`'s column `name`: its Arrow field, as the schema types it.
-fn list_field(name: &str) -> std::sync::Arc<arrow_schema::Field> {
-    let schema = batches::schema_of(&schema::PANICS);
-    let at = schema::PANICS.column(name).unwrap_or_else(|| unreachable!("panics has a {name}"));
-    let DataType::List(field) = schema.field(at).data_type() else {
-        unreachable!("{name} is a list (arrow.rs)")
-    };
-    // clone: an `Arc` of the schema's field, once a batch
-    field.clone()
-}
-
-/// A [`schema::Type::Stack`] column of `stacks`.
-fn names_column<'a>(name: &str, stacks: impl Iterator<Item = &'a [String]>) -> ArrayRef {
-    let mut out =
-        ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new()).with_field(list_field(name));
-    for stack in stacks {
-        for frame in stack {
-            out.values().append_value(frame);
-        }
-        out.append(true);
+/// A [`schema::Type::Stack`] column of `stacks`: a list of dictionary texts a row.
+fn names_column<'a>(stacks: impl Iterator<Item = &'a [String]> + Clone) -> Result<Column, ColumnError> {
+    // alloc: a batch's list offsets, once a flush
+    let mut ends = blaze_own::Vec::from_elem_in(0u32, 1, Global);
+    let mut elements = 0;
+    for stack in stacks.clone() {
+        elements += stack.len();
+        ends.push(offset(elements)?);
     }
-    column(out.finish())
+    let names = errors::dict(stacks.flatten().map(|it| Some(it.as_str())))?;
+    let (values, ..) = names.into_parts();
+    Column::list(ends, None, values)
 }
 
 /// The `panics` rows of `rows`.
-pub fn batch(rows: &[PanicRow]) -> Result<RecordBatch, ArrowError> {
-    let mut pcs = ListBuilder::new(UInt64Builder::new()).with_field(list_field("stack_pcs"));
+pub fn batch(rows: &[PanicRow]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::PANICS);
+    // alloc: a batch's list column, once a flush
+    let (mut pc_ends, mut pcs) = (blaze_own::Vec::from_elem_in(0u32, 1, Global), blaze_own::Vec::new_in(Global));
     for row in rows {
-        pcs.values().append_slice(&row.stack_pcs);
-        pcs.append(true);
+        pcs.extend(row.stack_pcs.iter().copied());
+        pc_ends.push(offset(pcs.len()).map_err(err)?);
     }
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.build_id))),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.process))),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.thread))),
-        dict(rows.iter().map(|it| Some(it.thread_name.as_str()))),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.t_ns))),
-        dict(rows.iter().map(|it| Some(it.kind.name()))),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.job))),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.span_id))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.message.as_deref()))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.location.as_deref()))),
-        names_column("stack", rows.iter().map(|it| it.stack.as_slice())),
-        column(pcs.finish()),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| u32::from(it.caught)))),
-        names_column("open_spans", rows.iter().map(|it| it.open_spans.as_slice())),
-        dict(rows.iter().map(|it| it.signal)),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.fault_addr))),
-        dict(rows.iter().map(|it| it.boot)),
-    ];
-    RecordBatch::try_new(batches::schema_of(&schema::PANICS), columns)
+    columns::batch(
+        &schema::PANICS,
+        [
+            Column::options(rows.iter().map(|it| it.build_id), Global),
+            Column::values(rows.iter().map(|it| it.process), Global),
+            Column::values(rows.iter().map(|it| it.thread), Global),
+            errors::dict(rows.iter().map(|it| Some(it.thread_name.as_str()))).map_err(err)?,
+            Column::values(rows.iter().map(|it| it.t_ns), Global),
+            errors::dict(rows.iter().map(|it| Some(it.kind.name()))).map_err(err)?,
+            Column::options(rows.iter().map(|it| it.job), Global),
+            Column::options(rows.iter().map(|it| it.span_id), Global),
+            Column::opt_texts_of(rows.iter().map(|it| it.message.as_deref()), Global),
+            Column::opt_texts_of(rows.iter().map(|it| it.location.as_deref()), Global),
+            names_column(rows.iter().map(|it| it.stack.as_slice())).map_err(err)?,
+            Column::list(pc_ends, None, Values::U64(pcs)).map_err(err)?,
+            Column::values(rows.iter().map(|it| u32::from(it.caught)), Global),
+            names_column(rows.iter().map(|it| it.open_spans.as_slice())).map_err(err)?,
+            errors::dict(rows.iter().map(|it| it.signal)).map_err(err)?,
+            Column::options(rows.iter().map(|it| it.fault_addr), Global),
+            errors::dict(rows.iter().map(|it| it.boot)).map_err(err)?,
+        ],
+    )
 }
 
 /// The frames of a stack (outermost first) a person reads first: innermost first, past the
@@ -774,7 +766,7 @@ mod tests {
         assert_eq!(row.process, std::process::id());
         let batch = batch(&rows).unwrap();
         assert_eq!(batch.num_rows(), rows.len());
-        assert_eq!(batch.schema(), batches::schema_of(&schema::PANICS));
+        assert_eq!(batch.fields(), columns::fields(&schema::PANICS));
         let top = top_frames(&row.stack, 3);
         assert!(top.first().is_some_and(|it| !it.contains("std::panicking")), "{top:?}");
     }

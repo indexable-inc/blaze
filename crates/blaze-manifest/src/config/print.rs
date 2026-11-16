@@ -17,7 +17,7 @@ use crate::files::Files;
 
 /// What the caller's rustc failed with, as a cause.
 // dyn: the caller's error, held only on an error path.
-fn rustc_failed(error: impl Into<Box<dyn Error + Send + Sync>>) -> ConfigError {
+fn rustc_failed(error: impl Error + Send + Sync + 'static) -> ConfigError {
     ConfigError::foreign(error)
 }
 
@@ -65,7 +65,7 @@ impl<F: Files> Config<F> {
     /// the `cfg` tables first, then again with the `cfg` rustc prints under those, at most
     /// twice, warning when they still differ. `cfg` is rustc's answer for those flags. `rustc`
     /// answers the arguments given as the rustc cargo runs would, `Err` when it fails.
-    pub fn target_rustflags<E: Into<Box<dyn Error + Send + Sync>>>(
+    pub fn target_rustflags<E: Error + Send + Sync + 'static>(
         &self,
         requested: &[CompileKind],
         host: &str,
@@ -98,7 +98,7 @@ impl<F: Files> Config<F> {
     /// What `cargo rustc --print <what>` with `--target` `targets` and `-- <rustc_args>` prints:
     /// for each kind asked for, rustc's answer to that kind's flags, `rustc_args`, the target
     /// and `--print <what>`, an empty line between kinds.
-    pub fn rustc_print<E: Into<Box<dyn Error + Send + Sync>>>(
+    pub fn rustc_print<E: Error + Send + Sync + 'static>(
         &self,
         targets: &[String],
         what: &str,

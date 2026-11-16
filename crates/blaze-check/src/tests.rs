@@ -28,15 +28,11 @@ use crate::{
 use Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
 /// Every outcome `f` returns over the model's executions.
-#[expect(
-    clippy::disallowed_types,
-    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the outcomes collected outside the model"
-)]
 fn outcomes<T: Ord + Clone + 'static>(
     builder: &Builder,
     f: impl Fn() -> T + 'static,
 ) -> BTreeSet<T> {
-    let seen = StdArc::new(parking_lot::Mutex::new(BTreeSet::new()));
+    let seen = StdArc::new(crate::held::Mutex::new(BTreeSet::new()));
     let into = StdArc::clone(&seen);
     builder.check(move || {
         let out = f();
@@ -1118,13 +1114,9 @@ fn executions_after_the_first_allocate_nothing() {
 }
 
 /// Every execution's order of steps, in the order the search ran them.
-#[expect(
-    clippy::disallowed_types,
-    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the steps collected outside the model"
-)]
 fn interleavings() -> Vec<Vec<u8>> {
-    let log = StdArc::new(parking_lot::Mutex::new(Vec::new()));
-    let runs = StdArc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = StdArc::new(crate::held::Mutex::new(Vec::new()));
+    let runs = StdArc::new(crate::held::Mutex::new(Vec::new()));
     let (into_log, into_runs) = (log.clone(), runs.clone());
     let mut builder = builder();
     builder.max_preemptions = Some(2);

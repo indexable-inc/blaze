@@ -40,7 +40,7 @@ use std::{
     time::Instant,
 };
 
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 pub use crate::pool::Scope;
 use crate::{
@@ -973,7 +973,7 @@ mod tests {
     };
 
     use blaze_ids::rng::SplitMix64 as Rng;
-    use crossbeam_channel::unbounded;
+    use blaze_core::chan::unbounded;
     use blaze_core::lock::Lock;
 
     use crate::{Cancelled, Key, pool::Pool, pump::Flights, topology::Topology};

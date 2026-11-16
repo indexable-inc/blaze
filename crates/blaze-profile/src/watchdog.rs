@@ -436,7 +436,7 @@ mod tests {
             }
         }
         let mut done = Done(Some(lost));
-        let (tx, rx) = crossbeam_channel::unbounded::<()>();
+        let (tx, rx) = blaze_core::chan::unbounded::<()>();
         pool.submit(None, move || _ = sched::wait(Wait::Key(lost)), move |_| _ = tx.send(()));
         blaze_graph::spin::SpinWait::within("the job to park", Duration::from_secs(60), || {
             pool.parked() == 1

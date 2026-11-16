@@ -2,11 +2,10 @@
 //! whose pids are reused; the oracle: a read never lists a run whose process is gone, and
 //! removes what it left out. And each event of the stream reads back as it was written.
 
-use std::alloc::Global;
 use std::collections::BTreeMap;
 
 use blaze_format::Aligned;
-use blaze_own::Vec as Own;
+use blaze_own::{AVec, Alloc, Vec as Own};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
@@ -25,7 +24,7 @@ impl Processes for Table {
     }
 }
 
-fn apply(effects: &mut Own<Effect, Global>, directory: &mut BTreeMap<Name, Vec<u8>>) {
+fn apply(effects: &mut AVec<'_, Effect>, directory: &mut BTreeMap<Name, Vec<u8>>) {
     for effect in effects.drain(..) {
         match effect {
             Effect::Put { name, bytes } => {
@@ -43,7 +42,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let mut table = Table(BTreeMap::new());
     let mut runs: BTreeMap<Pid, Registry> = BTreeMap::new();
     let mut directory: BTreeMap<Name, Vec<u8>> = BTreeMap::new();
-    let mut effects = Own::new_in(Global);
+    let mut effects = Own::new_in(Alloc::global());
     let mut starts = 0u64;
     let steps = tape.range(1..80, "steps");
     for _ in 0..steps {
@@ -82,7 +81,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                 registry.plant = plant;
                 let listing: Vec<(Name, &[u8])> =
                     directory.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
-                let mut live = Entries::new_in(Global);
+                let mut live = Entries::new_in(Alloc::global());
                 registry.read(&listing, &table, &mut live, &mut effects).map_err(harness)?;
                 for entry in live.iter() {
                     oracle(table.start_of(entry.name.pid) == Some(entry.name.start), || {
@@ -134,11 +133,11 @@ fn a_batch_of_events_reads_back_as_written() {
                 }
             })
             .collect();
-        let bytes = events::write(&events, Global);
+        let bytes = events::write(&events, Alloc::global());
         // Equal events are equal bytes (rule 25).
-        oracle(events::write(&events, Global) == bytes, || "a batch written twice differs".into())?;
+        oracle(events::write(&events, Alloc::global()) == bytes, || "a batch written twice differs".into())?;
         let aligned = Aligned::copy_from(&bytes);
-        let mut back = Own::new_in(Global);
+        let mut back = Own::new_in(Alloc::global());
         let read = events::read(&aligned, &mut back);
         oracle(read.is_ok() && back.as_slice() == events.as_slice(), || {
             format!("{events:?} read back as {back:?} ({read:?})")

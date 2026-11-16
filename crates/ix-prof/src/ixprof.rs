@@ -1,13 +1,9 @@
 //! The `.ixprof` container (docs/profiling.md, "The file"): magic, a canonical JSON
 //! manifest, then one Arrow IPC file a table, each 8-aligned and hashed with blake3.
 
-use std::{collections::BTreeMap, io::Cursor, sync::Arc};
+use std::{alloc::Global, collections::BTreeMap};
 
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, RecordBatch,
-    StringArray, UInt16Array, UInt32Array, UInt64Array, types::UInt32Type,
-};
-use arrow_schema::{DataType, Field, Schema};
+use blaze_columns::{Batch, Column, Field, Scalar, Texts, Type};
 
 use crate::{
     json::{self, Json},
@@ -62,17 +58,19 @@ pub enum Ty {
 }
 
 impl Ty {
-    fn arrow(self) -> DataType {
-        match self {
-            Ty::U16 => DataType::UInt16,
-            Ty::U32 => DataType::UInt32,
-            Ty::U64 => DataType::UInt64,
-            Ty::I64 => DataType::Int64,
-            Ty::F64 => DataType::Float64,
-            Ty::Bool => DataType::Boolean,
-            Ty::Utf8 => DataType::Utf8,
-            Ty::Dict => DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-        }
+    /// The column type: `Utf8` is plain text, `Dict` text keyed by `u32` into its distinct
+    /// values (Arrow's Dictionary<UInt32, Utf8> in the IPC).
+    fn column_type(self) -> Type {
+        Type::One(match self {
+            Ty::U16 => Scalar::U16,
+            Ty::U32 => Scalar::U32,
+            Ty::U64 => Scalar::U64,
+            Ty::I64 => Scalar::I64,
+            Ty::F64 => Scalar::F64,
+            Ty::Bool => Scalar::Bool,
+            Ty::Utf8 => Scalar::Text,
+            Ty::Dict => Scalar::Dict,
+        })
     }
 }
 
@@ -215,79 +213,51 @@ impl Col {
         }
     }
 
-    fn array(&self, ty: Ty) -> ArrayRef {
-        match (self, ty) {
-            (Col::U16(it), _) => Arc::new(UInt16Array::from(it.clone())),
-            (Col::U32(it), _) => Arc::new(UInt32Array::from(it.clone())),
-            (Col::U64(it), _) => Arc::new(UInt64Array::from(it.clone())),
-            (Col::I64(it), _) => Arc::new(Int64Array::from(it.clone())),
-            (Col::F64(it), _) => Arc::new(Float64Array::from(it.clone())),
-            (Col::Bool(it), _) => Arc::new(BooleanArray::from(it.clone())),
+    /// The column of these values as the format types it: a `Dict` column keyed into its
+    /// distinct values in the order rows first name them.
+    fn column(&self, ty: Ty) -> Result<Column<Global>, blaze_columns::ColumnError> {
+        Ok(match (self, ty) {
+            (Col::U16(it), _) => Column::options(it.iter().copied(), Global),
+            (Col::U32(it), _) => Column::options(it.iter().copied(), Global),
+            (Col::U64(it), _) => Column::options(it.iter().copied(), Global),
+            (Col::I64(it), _) => Column::options(it.iter().copied(), Global),
+            (Col::F64(it), _) => Column::options(it.iter().copied(), Global),
+            (Col::Bool(it), _) => Column::options(it.iter().copied(), Global),
             (Col::Str(it), Ty::Dict) => {
-                Arc::new(it.iter().map(|it| it.as_deref()).collect::<DictionaryArray<UInt32Type>>())
+                let mut values = Texts::new_in(Global);
+                let mut keys_of: BTreeMap<&str, u32> = BTreeMap::new();
+                let keys: Vec<Option<u32>> = it
+                    .iter()
+                    .map(|value| {
+                        let value = value.as_deref()?;
+                        let next = keys_of.len() as u32;
+                        Some(*keys_of.entry(value).or_insert_with(|| {
+                            values.push(value);
+                            next
+                        }))
+                    })
+                    .collect();
+                Column::dict(keys, values, Global)?
             }
-            (Col::Str(it), _) => Arc::new(StringArray::from(it.clone())),
-        }
+            (Col::Str(it), _) => Column::opt_texts(it, Global),
+        })
     }
 
-    fn read(array: &dyn Array, ty: Ty) -> Result<Col, String> {
-        fn get<T: 'static>(array: &dyn Array) -> Result<&T, String> {
-            array
-                .as_any()
-                .downcast_ref::<T>()
-                .ok_or_else(|| format!("is {}, not the type the format gives", array.data_type()))
+    fn read(column: &Column<Global>, ty: Ty) -> Result<Col, String> {
+        if column.ty() != ty.column_type() {
+            return Err(format!("is {:?}, not the type the format gives", column.ty()));
         }
-        let rows = 0..array.len();
+        let wrong = || format!("is not of its type {:?}", column.ty());
         Ok(match ty {
-            Ty::U16 => {
-                let it = get::<UInt16Array>(array)?;
-                Col::U16(rows.map(|i| (!it.is_null(i)).then(|| it.value(i))).collect())
-            }
-            Ty::U32 => {
-                let it = get::<UInt32Array>(array)?;
-                Col::U32(rows.map(|i| (!it.is_null(i)).then(|| it.value(i))).collect())
-            }
-            Ty::U64 => {
-                let it = get::<UInt64Array>(array)?;
-                Col::U64(rows.map(|i| (!it.is_null(i)).then(|| it.value(i))).collect())
-            }
-            Ty::I64 => {
-                let it = get::<Int64Array>(array)?;
-                Col::I64(rows.map(|i| (!it.is_null(i)).then(|| it.value(i))).collect())
-            }
-            Ty::F64 => {
-                let it = get::<Float64Array>(array)?;
-                Col::F64(rows.map(|i| (!it.is_null(i)).then(|| it.value(i))).collect())
-            }
-            Ty::Bool => {
-                let it = get::<BooleanArray>(array)?;
-                Col::Bool(rows.map(|i| (!it.is_null(i)).then(|| it.value(i))).collect())
-            }
-            Ty::Utf8 => {
-                let it = get::<StringArray>(array)?;
-                Col::Str(rows.map(|i| (!it.is_null(i)).then(|| it.value(i).to_owned())).collect())
-            }
-            Ty::Dict => {
-                let dict = get::<DictionaryArray<UInt32Type>>(array)?;
-                let keys = dict.keys();
-                let values = get::<StringArray>(dict.values().as_ref())?;
-                Col::Str(
-                    rows.map(|i| {
-                        if keys.is_null(i) {
-                            return Ok(None);
-                        }
-                        let key = keys.value(i) as usize;
-                        if key >= values.len() {
-                            return Err(format!(
-                                "dictionary key {key} past its {} values",
-                                values.len()
-                            ));
-                        }
-                        Ok((!values.is_null(key)).then(|| values.value(key).to_owned()))
-                    })
-                    .collect::<Result<_, String>>()?,
-                )
-            }
+            Ty::U16 => Col::U16(column.u16s().ok_or_else(wrong)?.iter().collect()),
+            Ty::U32 => Col::U32(column.u32s().ok_or_else(wrong)?.iter().collect()),
+            Ty::U64 => Col::U64(column.u64s().ok_or_else(wrong)?.iter().collect()),
+            Ty::I64 => Col::I64(column.i64s().ok_or_else(wrong)?.iter().collect()),
+            Ty::F64 => Col::F64(column.f64s().ok_or_else(wrong)?.iter().collect()),
+            Ty::Bool => Col::Bool(column.bools().ok_or_else(wrong)?.iter().collect()),
+            Ty::Utf8 | Ty::Dict => Col::Str(
+                column.strs().ok_or_else(wrong)?.iter().map(|it| it.map(str::to_owned)).collect(),
+            ),
         })
     }
 }
@@ -303,78 +273,58 @@ impl Table {
         self.cols.first().map_or(0, Col::len)
     }
 
-    /// The Arrow record batch.
-    pub fn batch(&self) -> Result<RecordBatch, Error> {
-        let spec = columns(self.name).ok_or_else(|| Error::Table {
-            table: self.name.to_owned(),
-            why: "is not a table of the format".to_owned(),
-        })?;
-        let fields: Vec<Field> = spec
-            .iter()
-            .map(|(name, ty, nullable)| Field::new(*name, ty.arrow(), *nullable))
-            .collect();
-        let arrays: Vec<ArrayRef> =
-            self.cols.iter().zip(spec).map(|(col, (_, ty, _))| col.array(*ty)).collect();
-        #[allow(clippy::disallowed_types, reason = "arrow's schema metadata is a std HashMap")]
-        let schema = Schema::new(fields).with_metadata(
-            [
-                ("ixprof.table".to_owned(), self.name.to_owned()),
-                ("ixprof.format_version".to_owned(), FORMAT_VERSION.to_string()),
-            ]
-            .into_iter()
-            .collect::<std::collections::HashMap<String, String>>(),
+    fn error(&self, why: impl std::fmt::Display) -> Error {
+        Error::Table { table: self.name.to_owned(), why: why.to_string() }
+    }
+
+    /// The table's columns as one batch, `Dict` columns keyed into their distinct values.
+    pub fn batch(&self) -> Result<Batch<Global>, Error> {
+        let spec = columns(self.name).ok_or_else(|| self.error("is not a table of the format"))?;
+        let fields = blaze_own::Vec::from_iter_in(
+            spec.iter().map(|(name, ty, nullable)| Field::new(*name, ty.column_type(), *nullable)),
+            Global,
         );
-        RecordBatch::try_new(Arc::new(schema), arrays)
-            .map_err(|why| Error::Table { table: self.name.to_owned(), why: why.to_string() })
+        let mut columns = blaze_own::Vec::with_capacity_in(spec.len(), Global);
+        for (col, (name, ty, _)) in self.cols.iter().zip(spec) {
+            columns.push(col.column(*ty).map_err(|why| self.error(format_args!("column `{name}`: {why}")))?);
+        }
+        Batch::try_new(fields, columns).map_err(|why| self.error(why))
+    }
+
+    /// The key-value metadata of the table's IPC: its name and the format's version.
+    fn metadata<'a>(&'a self, version: &'a str) -> [(&'a str, &'a str); 2] {
+        [("ixprof.table", self.name), ("ixprof.format_version", version)]
     }
 
     /// The table as one Arrow IPC file.
-    pub fn ipc_file(&self) -> Result<Vec<u8>, Error> {
+    pub fn ipc_file(&self) -> Result<blaze_own::Vec<u8, Global>, Error> {
         let batch = self.batch()?;
-        let err = |why: arrow_schema::ArrowError| Error::Table {
-            table: self.name.to_owned(),
-            why: why.to_string(),
-        };
-        let mut out = Vec::new();
-        let mut writer =
-            arrow_ipc::writer::FileWriter::try_new(&mut out, batch.schema_ref()).map_err(err)?;
-        writer.write(&batch).map_err(err)?;
-        writer.finish().map_err(err)?;
-        drop(writer);
-        Ok(out)
+        let version = FORMAT_VERSION.to_string();
+        blaze_arrow_ipc::file(batch.fields(), &self.metadata(&version), std::slice::from_ref(&batch), Global)
+            .map_err(|why| self.error(why))
     }
 
     /// The table as one Arrow IPC stream (schema, one batch, end of stream): what the live
     /// stream's BATCH frames carry.
-    pub fn ipc_stream(&self) -> Result<Vec<u8>, Error> {
+    pub fn ipc_stream(&self) -> Result<blaze_own::Vec<u8, Global>, Error> {
         let batch = self.batch()?;
-        let err = |why: arrow_schema::ArrowError| Error::Table {
-            table: self.name.to_owned(),
-            why: why.to_string(),
-        };
-        let mut out = Vec::new();
-        let mut writer =
-            arrow_ipc::writer::StreamWriter::try_new(&mut out, batch.schema_ref()).map_err(err)?;
-        writer.write(&batch).map_err(err)?;
-        writer.finish().map_err(err)?;
-        drop(writer);
-        Ok(out)
+        let version = FORMAT_VERSION.to_string();
+        blaze_arrow_ipc::stream(batch.fields(), &self.metadata(&version), std::slice::from_ref(&batch), Global)
+            .map_err(|why| self.error(why))
     }
 
     /// Reads table `name` from an Arrow IPC file.
     pub fn read_ipc_file(name: &'static str, bytes: &[u8]) -> Result<Table, Error> {
         let err = |why: String| Error::Table { table: name.to_owned(), why };
         let spec = columns(name).ok_or_else(|| err("is not a table of the format".to_owned()))?;
-        let reader = arrow_ipc::reader::FileReader::try_new(Cursor::new(bytes), None)
-            .map_err(|it| err(it.to_string()))?;
+        let read = blaze_arrow_ipc::read_file(bytes, Global).map_err(|it| err(it.to_string()))?;
         let mut cols: Vec<Option<Col>> = spec.iter().map(|_| None).collect();
-        for batch in reader {
-            let batch = batch.map_err(|it| err(it.to_string()))?;
+        for batch in read.batches.iter() {
             for (i, (column, ty, _)) in spec.iter().enumerate() {
                 let Some(array) = batch.column_by_name(column) else {
                     return Err(err(format!("has no column `{column}`")));
                 };
-                let read = Col::read(array.as_ref(), *ty)
+                let read = Col::read(array, *ty)
                     .map_err(|why| err(format!("column `{column}` {why}")))?;
                 cols[i] = Some(match (cols[i].take(), read) {
                     (None, it) => it,
@@ -912,7 +862,7 @@ impl Profile {
         let mut p = self.clone();
         p.canonicalize();
         let tables = tables(&p);
-        let sections: Vec<(&'static str, usize, Vec<u8>)> = tables
+        let sections: Vec<(&'static str, usize, blaze_own::Vec<u8, Global>)> = tables
             .iter()
             .map(|t| Ok((t.name, t.rows(), t.ipc_file()?)))
             .collect::<Result<_, Error>>()?;
@@ -1007,7 +957,7 @@ impl Profile {
 fn manifest(
     id: &str,
     meta: &Json,
-    sections: &[(&'static str, usize, Vec<u8>)],
+    sections: &[(&'static str, usize, blaze_own::Vec<u8, Global>)],
     hashes: &[blake3::Hash],
     base: usize,
 ) -> String {

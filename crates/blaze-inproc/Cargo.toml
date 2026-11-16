@@ -16,11 +16,10 @@ doctest = false
 [dependencies]
 blaze-inproc-rt.workspace = true
 blaze-mem.workspace = true
-crossbeam-channel.workspace = true
+# The one channel (`blaze_core::chan`); a test sleeps mid-write through `blaze_core::wait`.
+blaze-core.workspace = true
 
 [dev-dependencies]
-# The test that sleeps mid-write sleeps through `blaze_core::wait` (rule deadline-waits).
-blaze-core.workspace = true
 blaze-ids.workspace = true
 blaze-inproc-rt = { workspace = true, features = ["testing"] }
 blaze-spin.workspace = true

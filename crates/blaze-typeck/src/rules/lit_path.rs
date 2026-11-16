@@ -9,8 +9,7 @@
 //! type-relative (`S::new`, `T::default`) and is resolved here: inherent items of the self
 //! type first, then the traits in scope, as rustc's probe does without autoderef.
 
-use blaze_own::Vec;
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Vec};
 
 use crate::body::{IntSuffix, Lit, Segment};
 use crate::diag::{At, DiagCode};
@@ -102,7 +101,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             self.diag(DiagCode::GenericArgCount, at, None, None, Some(seg.name));
             return self.fresh_args(count);
         }
-        let mut v: Vec<Ty, A> = Vec::with_capacity_in(written.len(), self.alloc.clone());
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(written.len(), self.alloc);
         for &t in written {
             v.push(self.lower_body_ty(t)?);
         }
@@ -121,7 +120,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     pub(crate) fn value_path(&mut self, at: At, cause: Cause, path: PathIdx) -> Result<Ty, Stop> {
         let bp = self.body.path(path)?;
         let segs = self.body.segment_list(bp.segments)?;
-        let mut names: Vec<Name, A> = Vec::with_capacity_in(segs.len(), self.alloc.clone());
+        let mut names: Vec<Name, Alloc<'a>> = Vec::with_capacity_in(segs.len(), self.alloc);
         for s in segs {
             names.push(s.name);
         }
@@ -243,7 +242,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         // Trait candidates.
-        let mut traits: Vec<ItemKey, A> = Vec::new_in(self.alloc.clone());
+        let mut traits: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
         traits.extend_from_slice(self.reads.traits_in_scope(scope)?);
         if let TyView::Param(i) = self.view(self_ty) {
             self.param_bound_traits(i, &mut traits)?;
@@ -278,7 +277,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// The traits of the body's where-clauses whose self type is parameter `i`.
-    pub(crate) fn param_bound_traits(&mut self, i: u32, out: &mut Vec<ItemKey, A>) -> Result<(), Stop> {
+    pub(crate) fn param_bound_traits(&mut self, i: u32, out: &mut Vec<ItemKey, Alloc<'a>>) -> Result<(), Stop> {
         let owner = self.body.owner;
         let preds = self.reads.predicates(owner)?;
         for clause in preds.clauses {
@@ -300,7 +299,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Some(sig) => sig.parent_count,
             None => 1,
         };
-        let mut v: Vec<Ty, A> = Vec::with_capacity_in(parent.max(1) as usize, self.alloc.clone());
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(parent.max(1) as usize, self.alloc);
         v.push(self_ty);
         for _ in 1..parent {
             v.push(self.fresh()?);

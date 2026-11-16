@@ -14,8 +14,6 @@
 //! type. None at all is E0608. Omitted for now: `IndexMut` selection for mutable places (that
 //! is fixed up after the walk in rustc, `convert_place_derefs_to_mutable`), and privacy.
 
-use core::alloc::Allocator;
-
 use crate::diag::{At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, ItemKey, LangItem, Name};
@@ -23,7 +21,7 @@ use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::ty::{Cause, Goal, Ty, TyView, TypeCtx, Var, VarKind};
 use crate::world::{Adt, AdtKind, World};
 
-impl<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone> Machine<'b, 'w, 'c, W, C, A> {
+impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
     /// The ADT a field access reads. Under the planted bug it bypasses the recorder.
     fn field_adt(&mut self, k: ItemKey) -> Result<Option<Adt<'w>>, Stop> {
         #[cfg(test)]

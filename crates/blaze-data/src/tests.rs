@@ -15,7 +15,6 @@ use blaze_sim::{Broke, Config, Tape};
 use crate::{
     Cursor, FromValue, Int, Kind, Map, Shape, ShapeError, ToValue, Value,
     plant::{self, Plant},
-    value,
 };
 
 fn text(s: &str) -> String<Global> {
@@ -147,13 +146,13 @@ struct Paint<A: core::alloc::Allocator> {
     color: Option<String<A>>,
     size: Option<u32>,
 }
-crate::fields!(for<A> Paint<A> { ; color, size });
+fields!(for<A> Paint<A> { ; color, size });
 
 /// One required field, for the missing-but-near case.
 struct Pen<A: core::alloc::Allocator> {
     color: String<A>,
 }
-crate::fields!(for<A> Pen<A> { color });
+fields!(for<A> Pen<A> { color });
 
 fn at_a_b<T: FromValue<Global>>(v: &Value<Global>) -> Result<T, StdString> {
     let root = Cursor::root(v, Global);

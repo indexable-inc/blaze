@@ -6,9 +6,7 @@
 //! resolution, and their items' extents a parse, so the caller's parse of the expansion (the
 //! same one a file's items come from) finds them.
 
-use core::alloc::Allocator;
-
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::{
     error::StreamError,
@@ -17,10 +15,10 @@ use crate::{
 };
 
 /// The macro calls and definitions of `stream`, in order.
-pub fn find_calls<A: Allocator, B: Allocator>(
-    stream: &TokenStream<A>,
-    alloc: B,
-) -> Result<Vec<NestedCall, B>, StreamError> {
+pub fn find_calls<'a>(
+    stream: &TokenStream<'_>,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, NestedCall>, StreamError> {
     let mut found = Vec::new_in(alloc);
     let tokens = stream.tokens();
     let mut at = 0;
@@ -36,7 +34,7 @@ pub fn find_calls<A: Allocator, B: Allocator>(
 }
 
 /// `path ! group` at `at`: the call and the index after its group.
-fn call_at<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<(NestedCall, usize)> {
+fn call_at(stream: &TokenStream<'_>, at: usize) -> Option<(NestedCall, usize)> {
     let end = path_at(stream, at)?;
     let tokens = stream.tokens();
     if !is_punct(stream, end, '!') || !matches!(tokens.get(end + 1)?.kind, TokenKind::Open(_)) {
@@ -55,7 +53,7 @@ fn call_at<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<(NestedCa
 }
 
 /// `macro_rules ! name group` or `macro name (params)? {body}` at `at`.
-fn definition_at<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<(NestedCall, usize)> {
+fn definition_at(stream: &TokenStream<'_>, at: usize) -> Option<(NestedCall, usize)> {
     let tokens = stream.tokens();
     let keyword = plain_ident(stream, at)?;
     let path = Range { start: index(at), end: index(at + 1) };
@@ -109,7 +107,7 @@ fn definition_at<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<(Ne
 /// The end of a macro path that starts at `at`: `::`? segment (`::` segment)*. The last
 /// segment, the macro's name, is no keyword; one before it may be `crate`, `self`, `super`,
 /// `Self` or `$crate`.
-fn path_at<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<usize> {
+fn path_at(stream: &TokenStream<'_>, at: usize) -> Option<usize> {
     let mut next = at;
     if is_path_sep(stream, next) {
         next += 2;
@@ -125,7 +123,7 @@ fn path_at<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<usize> {
 
 /// Whether the token at `at` can be a path segment, and if so whether it can be a macro's
 /// name (not a path keyword).
-fn segment<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<bool> {
+fn segment(stream: &TokenStream<'_>, at: usize) -> Option<bool> {
     let token = stream.tokens().get(at)?;
     let TokenKind::Ident { raw, .. } = token.kind else { return None };
     if raw == Raw::Yes {
@@ -138,24 +136,24 @@ fn segment<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<bool> {
     (!is_keyword(text, stream.edition_of(token.ctx))).then_some(true)
 }
 
-fn is_path_sep<A: Allocator>(stream: &TokenStream<A>, at: usize) -> bool {
+fn is_path_sep(stream: &TokenStream<'_>, at: usize) -> bool {
     matches!(
         stream.tokens().get(at).map(|it| it.kind),
         Some(TokenKind::Punct { char: ':', spacing: crate::tokens::Spacing::Joint })
     ) && is_punct(stream, at + 1, ':')
 }
 
-fn is_punct<A: Allocator>(stream: &TokenStream<A>, at: usize, want: char) -> bool {
+fn is_punct(stream: &TokenStream<'_>, at: usize, want: char) -> bool {
     matches!(stream.tokens().get(at).map(|it| it.kind), Some(TokenKind::Punct { char, .. }) if char == want)
 }
 
 /// The text of a plain (not raw) identifier at `at`.
-fn plain_ident<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<&str> {
+fn plain_ident(stream: &TokenStream<'_>, at: usize) -> Option<&str> {
     let token = stream.tokens().get(at)?;
     matches!(token.kind, TokenKind::Ident { raw: Raw::No, .. }).then(|| stream.text_of(token))
 }
 
-fn plain_or_raw_ident<A: Allocator>(stream: &TokenStream<A>, at: usize) -> Option<()> {
+fn plain_or_raw_ident(stream: &TokenStream<'_>, at: usize) -> Option<()> {
     matches!(stream.tokens().get(at)?.kind, TokenKind::Ident { .. }).then_some(())
 }
 

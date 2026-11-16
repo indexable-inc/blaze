@@ -19,7 +19,7 @@ use blaze_graph::{
     spin::SpinWait,
     topology::Topology,
 };
-use crossbeam_channel::{RecvTimeoutError, Sender, unbounded};
+use blaze_core::chan::{RecvTimeoutError, Sender, unbounded};
 
 /// Far past a stall's detection (the pool's two seconds idle, then the check).
 const LONG: Duration = Duration::from_secs(60);

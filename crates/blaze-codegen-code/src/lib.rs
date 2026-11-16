@@ -1243,10 +1243,7 @@ fn read_toml(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Map<G
     let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
     let doc = blaze_toml::Document::parse_in(&text, blaze_toml::Limits::CARGO, Global)
         .map_err(|why| format!("{} is no TOML: {}", path.display(), why.display(&text)))?;
-    match doc.to_value_in(Global) {
-        Value::Map(table) => Ok(table),
-        _ => unreachable!("a TOML document's root is a table"),
-    }
+    Ok(doc.to_map_in(Global))
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, String> {

@@ -23,7 +23,7 @@ blaze-trace.workspace = true
 edition.workspace = true
 
 [dev-dependencies]
-crossbeam-channel.workspace = true
+blaze-core.workspace = true
 test-utils.workspace = true
 
 blaze-alloc-count.workspace = true

@@ -17,7 +17,7 @@
 //! with the site's expected type as a hint, push it (or a forced `()`) into the site, and are
 //! `!`.
 
-use core::alloc::Allocator;
+use blaze_own::Alloc;
 
 use crate::diag::{At, DiagCode};
 use crate::error::{CheckError, Malformed, Stop};
@@ -49,14 +49,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let (inputs, output) = match self.reads.fn_sig(owner)? {
             Some(sig) => {
-                let mut inputs: blaze_own::Vec<Ty, A> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
+                let mut inputs: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc);
                 for &t in sig.inputs {
                     inputs.push(self.lower(sig.types, t, Lower::Body)?);
                 }
                 let output = self.lower(sig.types, sig.output, Lower::Body)?;
                 (inputs, output)
             }
-            None => (blaze_own::Vec::new_in(self.alloc.clone()), self.fresh()?),
+            None => (blaze_own::Vec::new_in(self.alloc), self.fresh()?),
         };
         let site = self.new_coerce_many(output)?;
         self.ret_sites.push(site);
@@ -85,7 +85,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     fn lower_body_list(&mut self, types: crate::portable::PTys<'_>, l: List) -> Result<crate::ty::TyList, Stop> {
         let src = types.list(l)?;
-        let mut v: blaze_own::Vec<Ty, A> = blaze_own::Vec::with_capacity_in(src.len(), self.alloc.clone());
+        let mut v: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(src.len(), self.alloc);
         for &t in src {
             v.push(self.lower(types, t, Lower::Body)?);
         }

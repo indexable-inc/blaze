@@ -33,16 +33,12 @@ use std::{
     },
 };
 
-use arrow_array::{
-    Array, RecordBatch,
-    cast::AsArray,
-    types::{UInt32Type, UInt64Type},
-};
 use blaze_graph::wait::{OwnedBy, WaitKind};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use crate::{
+    columns::Batch,
     flight::{self, SpanRow, names::Token},
     schema::{self, Type},
 };
@@ -659,7 +655,7 @@ fn typed<K: Span>(said: &Said, span_id: u64) -> Result<Typed<K>, KindError> {
 /// The spans of kind `K` in `batch`, a batch of the `spans` table as `batches.rs` writes it
 /// and the Parquet history keeps it, in order. Names are interned in this process as they are
 /// read.
-pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindError> {
+pub fn read_batch<K: Span>(batch: &Batch) -> Result<Vec<Typed<K>>, KindError> {
     let missing = |column: &'static str| KindError::Column {
         kind: K::NAME,
         column,
@@ -667,7 +663,7 @@ pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindErr
     };
     let names = batch.column_by_name("name").ok_or(missing("name"))?;
     let ids = batch.column_by_name("span_id").ok_or(missing("span_id"))?;
-    let ids = ids.as_primitive_opt::<UInt64Type>().ok_or(KindError::Column {
+    let ids = ids.u64s().ok_or(KindError::Column {
         kind: K::NAME,
         column: "span_id",
         why: "is not UInt64",
@@ -676,46 +672,33 @@ pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindErr
     let mut columns = Vec::with_capacity(CELLS.len());
     for cells in &CELLS {
         let column = batch.column_by_name(cells.column.name).ok_or(missing(cells.column.name))?;
-        columns.push((cells, column.as_ref()));
+        columns.push((cells, column));
     }
     // alloc: the spans read, once a read
     let mut out = Vec::new();
     for row in 0..batch.num_rows() {
-        if text_at(names.as_ref(), row) != Some(K::NAME) {
+        if names.text(row) != Some(K::NAME) {
             continue;
         }
         let mut said = Said::EMPTY;
         for &(cells, column) in &columns {
             let word = if cells.column.ty == Type::U64 {
-                let Some(numbers) = column.as_primitive_opt::<UInt64Type>() else {
+                let Some(numbers) = column.u64s() else {
                     return Err(KindError::Column {
                         kind: K::NAME,
                         column: cells.column.name,
                         why: "is not UInt64",
                     });
                 };
-                if numbers.is_valid(row) { numbers.value(row).saturating_add(1) } else { 0 }
+                numbers.get(row).map_or(0, |it| it.saturating_add(1))
             } else {
-                text_at(column, row).map_or(0, cells.of_text)
+                column.text(row).map_or(0, cells.of_text)
             };
             said.set(cells.at, word);
         }
         out.push(typed::<K>(&said, ids.value(row))?);
     }
     Ok(out)
-}
-
-/// The text of a `Dict` or `Utf8` cell; `None` when null or neither.
-fn text_at(column: &dyn Array, row: usize) -> Option<&str> {
-    if !column.is_valid(row) {
-        return None;
-    }
-    if let Some(dict) = column.as_dictionary_opt::<UInt32Type>() {
-        let key = usize::try_from(dict.keys().value(row)).ok()?;
-        let values = dict.values().as_string_opt::<i32>()?;
-        return (key < values.len()).then(|| values.value(key));
-    }
-    column.as_string_opt::<i32>().map(|it| it.value(row))
 }
 
 /// A kind as its SQL view shows it: its name and each field with the column it fills.
@@ -1272,8 +1255,8 @@ mod tests {
             batches::spans(&rows, Process { pid: 1, name: "span kinds test", commit: None })
                 .unwrap();
         let cell = |column: &str| {
-            let column = batch.column(schema::SPANS.column(column).unwrap()).as_string::<i32>();
-            column.is_valid(at).then(|| column.value(at).to_owned())
+            let column = batch.column(schema::SPANS.column(column).unwrap());
+            column.text(at).map(str::to_owned)
         };
         assert_eq!(cell("function").as_deref(), what, "the `function` column");
         assert_eq!(cell("awaits").as_deref(), what, "the `awaits` column");

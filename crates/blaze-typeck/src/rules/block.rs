@@ -17,8 +17,6 @@
 //! by equality rather than coercion in rustc (`check_decl_initializer`'s `ref_bindings`); here
 //! it is always a coercion.
 
-use core::alloc::Allocator;
-
 use crate::body::Stmt;
 use crate::diag::{At, DiagCode};
 use crate::error::Stop;
@@ -27,7 +25,7 @@ use crate::machine::{BreakCtx, Expectation, Flow, Frame, Machine, Then};
 use crate::ty::TypeCtx;
 use crate::world::World;
 
-impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
+impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// `f.a` is the coercion site, `f.b` the next statement.
     pub(crate) fn expr_block(&mut self, mut f: Frame, e: ExprId, stmts: List, tail: Option<ExprId>) -> Result<Flow, Stop> {
         let list = self.body.stmt_list(stmts)?;

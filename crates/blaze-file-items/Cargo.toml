@@ -30,6 +30,8 @@ blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `Alloc::global()`: the handle the tests and the example outline in.
+blaze-own = { workspace = true, features = ["std"] }
 # `Aligned`: a record's bytes at the alignment its view reads them at.
 blaze-format.workspace = true
 

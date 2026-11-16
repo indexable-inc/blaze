@@ -1,7 +1,6 @@
 //! [`expand`]: one macro call of one definition to its [`Expanded`].
 
-use core::alloc::Allocator;
-
+use blaze_own::Alloc;
 use mbe::DeclarativeMacro;
 
 use crate::{
@@ -18,19 +17,19 @@ use crate::{
 };
 
 /// A definition made ready to expand calls: a declarative macro's rules parsed once.
-pub struct Prepared<'d, A: Allocator> {
-    def: &'d MacroDefinition<A>,
+pub struct Prepared<'d> {
+    def: &'d MacroDefinition<'d>,
     rules: Option<DeclarativeMacro>,
 }
 
-impl<'d, A: Allocator> Prepared<'d, A> {
-    pub fn def(&self) -> &'d MacroDefinition<A> {
+impl<'d> Prepared<'d> {
+    pub fn def(&self) -> &'d MacroDefinition<'d> {
         self.def
     }
 }
 
 /// Parses a declarative definition's rules; other kinds have nothing to prepare.
-pub fn prepare<A: Allocator>(def: &MacroDefinition<A>) -> Result<Prepared<'_, A>, ExpandError> {
+pub fn prepare<'d>(def: &'d MacroDefinition<'_>) -> Result<Prepared<'d>, ExpandError> {
     let rules = match def.kind() {
         MacroKind::Rules | MacroKind::Macro2 => Some(declarative::parse(def)?),
         MacroKind::BuiltinFn(_)
@@ -43,22 +42,22 @@ pub fn prepare<A: Allocator>(def: &MacroDefinition<A>) -> Result<Prepared<'_, A>
 
 /// Expands `call` of `def`: the expansion, or the nested calls an eager macro needs first.
 /// Everything outside the tokens is asked of `cx` and recorded in the expansion.
-pub fn expand<A: Allocator + Clone>(
-    def: &MacroDefinition<A>,
-    call: &Call<'_, A>,
+pub fn expand<'a>(
+    def: &MacroDefinition<'_>,
+    call: &Call<'_>,
     cx: &impl ExpandCx,
-    alloc: A,
-) -> Result<Expanded<A>, ExpandError> {
+    alloc: Alloc<'a>,
+) -> Result<Expanded<'a>, ExpandError> {
     expand_prepared(&prepare(def)?, call, cx, alloc)
 }
 
 /// [`expand`] of a definition [`prepare`]d once for many calls.
-pub fn expand_prepared<A: Allocator + Clone>(
-    prepared: &Prepared<'_, A>,
-    call: &Call<'_, A>,
+pub fn expand_prepared<'a>(
+    prepared: &Prepared<'_>,
+    call: &Call<'_>,
     cx: &impl ExpandCx,
-    alloc: A,
-) -> Result<Expanded<A>, ExpandError> {
+    alloc: Alloc<'a>,
+) -> Result<Expanded<'a>, ExpandError> {
     let def = prepared.def;
     if def.body().has_own_marks() {
         return Err(ExpandError::Unsealed { stream: Stream::Def });
@@ -74,7 +73,7 @@ pub fn expand_prepared<A: Allocator + Clone>(
     {
         return Err(ExpandError::WrongCallKind { def: shape, call: call.shape() });
     }
-    let mut out = Out { exp: Expansion::new_in(alloc.clone()), def, call, alloc };
+    let mut out = Out { exp: Expansion::new_in(alloc), def, call, alloc };
     match def.kind() {
         MacroKind::Rules | MacroKind::Macro2 => {
             let rules = prepared.rules.as_ref().expect("`prepare` parses a declarative definition");
@@ -95,13 +94,13 @@ pub fn expand_prepared<A: Allocator + Clone>(
 }
 
 /// A proc macro's call, run by the context.
-fn proc_macro<A: Allocator + Clone>(
+fn proc_macro(
     kind: ProcKind,
-    out: &mut Out<'_, A>,
+    out: &mut Out<'_, '_>,
     cx: &impl ExpandCx,
 ) -> Result<(), ExpandError> {
     let call = ProcCall { kind, input: out.call.input(), attr_args: out.call.attr_args() };
-    let produced = cx.run_proc_macro(out.def, call, out.alloc.clone())?;
+    let produced = cx.run_proc_macro(out.def, call, out.alloc)?;
     let (tokens, origins) = (produced.tokens.len(), produced.origins.len());
     if tokens != origins {
         return Err(ExpandError::ProcMacroOutput {
@@ -120,14 +119,15 @@ fn proc_macro<A: Allocator + Clone>(
 }
 
 /// An expansion being written: each token pushed with its origin, its context made from it.
-pub(crate) struct Out<'c, A: Allocator + Clone> {
-    pub(crate) exp: Expansion<A>,
-    pub(crate) def: &'c MacroDefinition<A>,
-    pub(crate) call: &'c Call<'c, A>,
-    pub(crate) alloc: A,
+/// `'c` borrows the definition and the call; `'a` is the allocator the expansion is written in.
+pub(crate) struct Out<'c, 'a> {
+    pub(crate) exp: Expansion<'a>,
+    pub(crate) def: &'c MacroDefinition<'c>,
+    pub(crate) call: &'c Call<'c>,
+    pub(crate) alloc: Alloc<'a>,
 }
 
-impl<A: Allocator + Clone> Out<'_, A> {
+impl<'a> Out<'_, 'a> {
     /// Appends a token from `origin`: a token of the call's input keeps its context; one of the
     /// definition, or made, gets this expansion's mark.
     pub(crate) fn push(
@@ -220,14 +220,14 @@ impl<A: Allocator + Clone> Out<'_, A> {
 
     /// The expansion: with a diagnostic, no tokens (the call's error is all it makes); else
     /// its nested calls listed.
-    fn finish(mut self) -> Result<Expanded<A>, ExpandError> {
+    fn finish(mut self) -> Result<Expanded<'a>, ExpandError> {
         if !self.exp.diagnostics.is_empty() {
             self.exp.tokens.clear();
             self.exp.origins.clear();
             self.exp.holes.clear();
             return Ok(Expanded::Expansion(self.exp));
         }
-        let mut calls = nested::find_calls(&self.exp.tokens, self.alloc.clone())?;
+        let mut calls = nested::find_calls(&self.exp.tokens, self.alloc)?;
         if self.def.at().local_inner == LocalInner::Yes {
             for call in calls.iter_mut() {
                 let single = call.path.end - call.path.start == 1;

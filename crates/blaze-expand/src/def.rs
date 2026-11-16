@@ -7,12 +7,11 @@
 //! [`TokenStream::write_record`] record named by its digest: [`MacroDefinition::write`] gives
 //! the three, [`MacroDefinition::from`] reads them back and checks they are one definition.
 
-use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_ids::Hasher;
-use blaze_own::{CollectIn, Vec};
+use blaze_own::{AVec, Alloc, CollectIn, Vec};
 use blaze_surface::{BuildError, MacroDef, MacroDefHead, MacroDefView};
 
 use crate::{
@@ -66,19 +65,19 @@ unsafe impl Portable for LocalInner {}
 unsafe impl Portable for DefAt {}
 // SAFETY: every field is `Portable` (streams, UTF-8 bytes, ranges of them, keys, closed
 // enums); the allocator is where the bytes are.
-unsafe impl<A: Allocator> Portable for MacroDefinition<A> {}
+unsafe impl Portable for MacroDefinition<'_> {}
 
 /// A macro's definition, as expansion reads it.
 #[derive(Clone, Debug)]
-pub struct MacroDefinition<A: Allocator> {
+pub struct MacroDefinition<'a> {
     kind: MacroKind,
-    body: TokenStream<A>,
-    params: Option<TokenStream<A>>,
+    body: TokenStream<'a>,
+    params: Option<TokenStream<'a>>,
     /// The text of a proc macro's name and of the helper attributes.
-    names: Vec<u8, A>,
+    names: AVec<'a, u8>,
     /// A proc macro's export name, in `names`.
     proc_name: Option<Text>,
-    helpers: Vec<Text, A>,
+    helpers: AVec<'a, Text>,
     at: DefAt,
     transparency: Transparency,
     content: MacroContent,
@@ -86,11 +85,11 @@ pub struct MacroDefinition<A: Allocator> {
 
 /// A definition as records: the `MacroDef` record, and each token stream's record with the
 /// digest the `MacroDef` names it by. Each is stored by itself.
-pub struct DefinitionRecords<B: Allocator> {
-    pub def: RecordBytes<B>,
+pub struct DefinitionRecords<'a> {
+    pub def: RecordBytes<'a>,
     /// The body's tokens; `None` for a body of no tokens and no contexts.
-    pub body: Option<(ContentId, RecordBytes<B>)>,
-    pub params: Option<(ContentId, RecordBytes<B>)>,
+    pub body: Option<(ContentId, RecordBytes<'a>)>,
+    pub params: Option<(ContentId, RecordBytes<'a>)>,
 }
 
 /// Why records are not one definition.
@@ -116,35 +115,35 @@ impl fmt::Display for DefinitionError {
 
 impl core::error::Error for DefinitionError {}
 
-impl<A: Allocator + Clone> MacroDefinition<A> {
+impl<'a> MacroDefinition<'a> {
     /// `macro_rules! m { body }`: `body` the tokens inside the braces.
-    pub fn rules(body: TokenStream<A>, at: DefAt) -> MacroDefinition<A> {
-        let alloc = body.allocator().clone();
+    pub fn rules(body: TokenStream<'a>, at: DefAt) -> MacroDefinition<'a> {
+        let alloc = body.allocator();
         MacroDefinition::make(MacroKind::Rules, body, None, at, alloc)
     }
 
     /// `macro m { body }` (`params` `None`), or `macro m(params) { body }`.
     pub fn macro2(
-        params: Option<TokenStream<A>>,
-        body: TokenStream<A>,
+        params: Option<TokenStream<'a>>,
+        body: TokenStream<'a>,
         at: DefAt,
-    ) -> MacroDefinition<A> {
-        let alloc = body.allocator().clone();
+    ) -> MacroDefinition<'a> {
+        let alloc = body.allocator();
         MacroDefinition::make(MacroKind::Macro2, body, params, at, alloc)
     }
 
-    pub fn builtin_fn(which: BuiltinFn, at: DefAt, alloc: A) -> MacroDefinition<A> {
-        let body = TokenStream::new_in(alloc.clone());
+    pub fn builtin_fn(which: BuiltinFn, at: DefAt, alloc: Alloc<'a>) -> MacroDefinition<'a> {
+        let body = TokenStream::new_in(alloc);
         MacroDefinition::make(MacroKind::BuiltinFn(which), body, None, at, alloc)
     }
 
-    pub fn builtin_attr(which: BuiltinAttr, at: DefAt, alloc: A) -> MacroDefinition<A> {
-        let body = TokenStream::new_in(alloc.clone());
+    pub fn builtin_attr(which: BuiltinAttr, at: DefAt, alloc: Alloc<'a>) -> MacroDefinition<'a> {
+        let body = TokenStream::new_in(alloc);
         MacroDefinition::make(MacroKind::BuiltinAttr(which), body, None, at, alloc)
     }
 
-    pub fn builtin_derive(which: BuiltinDerive, at: DefAt, alloc: A) -> MacroDefinition<A> {
-        let body = TokenStream::new_in(alloc.clone());
+    pub fn builtin_derive(which: BuiltinDerive, at: DefAt, alloc: Alloc<'a>) -> MacroDefinition<'a> {
+        let body = TokenStream::new_in(alloc);
         MacroDefinition::make(MacroKind::BuiltinDerive(which), body, None, at, alloc)
     }
 
@@ -156,11 +155,11 @@ impl<A: Allocator + Clone> MacroDefinition<A> {
         name: &str,
         helpers: &[&str],
         at: DefAt,
-        alloc: A,
-    ) -> Result<MacroDefinition<A>, StreamError> {
+        alloc: Alloc<'a>,
+    ) -> Result<MacroDefinition<'a>, StreamError> {
         MacroDefinition::with_names(
             MacroKind::ProcMacro { krate, kind },
-            TokenStream::new_in(alloc.clone()),
+            TokenStream::new_in(alloc),
             None,
             Some(name),
             helpers.iter().copied(),
@@ -171,11 +170,11 @@ impl<A: Allocator + Clone> MacroDefinition<A> {
 
     fn make(
         kind: MacroKind,
-        body: TokenStream<A>,
-        params: Option<TokenStream<A>>,
+        body: TokenStream<'a>,
+        params: Option<TokenStream<'a>>,
         at: DefAt,
-        alloc: A,
-    ) -> MacroDefinition<A> {
+        alloc: Alloc<'a>,
+    ) -> MacroDefinition<'a> {
         MacroDefinition::with_names(kind, body, params, None, core::iter::empty(), at, alloc)
             .expect("a definition with no names fits the name table")
     }
@@ -183,14 +182,14 @@ impl<A: Allocator + Clone> MacroDefinition<A> {
     /// The one constructor: every other is this one.
     fn with_names<'h>(
         kind: MacroKind,
-        body: TokenStream<A>,
-        params: Option<TokenStream<A>>,
+        body: TokenStream<'a>,
+        params: Option<TokenStream<'a>>,
         proc_name: Option<&str>,
         helpers: impl ExactSizeIterator<Item = &'h str>,
         at: DefAt,
-        alloc: A,
-    ) -> Result<MacroDefinition<A>, StreamError> {
-        let mut names = Vec::new_in(alloc.clone());
+        alloc: Alloc<'a>,
+    ) -> Result<MacroDefinition<'a>, StreamError> {
+        let mut names = Vec::new_in(alloc);
         let proc_name = match proc_name {
             Some(name) => Some(push_text(&mut names, name, Table::Text)?),
             None => None,
@@ -222,14 +221,14 @@ impl<A: Allocator + Clone> MacroDefinition<A> {
         view: &MacroDefView<'_>,
         body: Option<&[u8]>,
         params: Option<&[u8]>,
-        alloc: A,
-    ) -> Result<MacroDefinition<A>, DefinitionError> {
+        alloc: Alloc<'a>,
+    ) -> Result<MacroDefinition<'a>, DefinitionError> {
         let head = view.head();
         let mismatch = |what| DefinitionError::Mismatch { item: head.item, what };
         let stream = |id: Option<ContentId>, bytes: Option<&[u8]>| match (id, bytes) {
             (None, None) => Ok(None),
             (Some(id), Some(bytes)) if stream_record_id(bytes) == id => {
-                TokenStream::read_record(bytes, alloc.clone())
+                TokenStream::read_record(bytes, alloc)
                     .map(Some)
                     .map_err(DefinitionError::Stream)
             }
@@ -237,7 +236,7 @@ impl<A: Allocator + Clone> MacroDefinition<A> {
             (Some(_), None) => Err(mismatch("a token stream the head names, not given")),
             (None, Some(_)) => Err(mismatch("a token stream given that the head does not name")),
         };
-        let body = stream(head.body, body)?.unwrap_or_else(|| TokenStream::new_in(alloc.clone()));
+        let body = stream(head.body, body)?.unwrap_or_else(|| TokenStream::new_in(alloc));
         let params = stream(head.params, params)?;
         let at = DefAt {
             site: head.site,
@@ -255,7 +254,7 @@ impl<A: Allocator + Clone> MacroDefinition<A> {
             body,
             params,
             proc_name,
-            view.helpers().collect_in(alloc.clone()).into_iter(),
+            view.helpers().collect_in(alloc).into_iter(),
             at,
             alloc,
         )
@@ -268,19 +267,17 @@ impl<A: Allocator + Clone> MacroDefinition<A> {
         }
         Ok(def)
     }
-}
 
-impl<A: Allocator> MacroDefinition<A> {
     pub fn kind(&self) -> MacroKind {
         self.kind
     }
 
     /// The rules of a declarative macro, or a `macro m(..)`'s body; empty for the others.
-    pub fn body(&self) -> &TokenStream<A> {
+    pub fn body(&self) -> &TokenStream<'a> {
         &self.body
     }
 
-    pub fn params(&self) -> Option<&TokenStream<A>> {
+    pub fn params(&self) -> Option<&TokenStream<'a>> {
         self.params.as_ref()
     }
 
@@ -317,21 +314,21 @@ impl<A: Allocator> MacroDefinition<A> {
     /// The definition as records, in `alloc`: the `MacroDef` of the macro `item` named `name`
     /// and written at `place` (`None` for a builtin), and its token streams. A proc macro's
     /// `name` is its export name, refused when it differs.
-    pub fn write<B: Allocator + Clone>(
+    pub fn write<'b>(
         &self,
         item: ItemKey,
         name: &str,
         place: Option<blaze_surface::Place>,
-        alloc: B,
-    ) -> Result<DefinitionRecords<B>, BuildError> {
+        alloc: Alloc<'b>,
+    ) -> Result<DefinitionRecords<'b>, BuildError> {
         if self.proc_name().is_some_and(|proc_name| proc_name != name) {
             return Err(BuildError::Disagrees {
                 table: "MacroDef",
                 what: "a proc macro's export name and the name of its item",
             });
         }
-        let stream = |tokens: &TokenStream<A>| {
-            let bytes = tokens.write_record(alloc.clone());
+        let stream = |tokens: &TokenStream<'a>| {
+            let bytes = tokens.write_record(alloc);
             (stream_record_id(&bytes), bytes)
         };
         let body = match self.body.is_empty() && self.body.contexts().is_empty() {

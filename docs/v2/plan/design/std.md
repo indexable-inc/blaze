@@ -360,15 +360,27 @@ wait (rule `no-wait-across-thread-locals`). Each thing people use one for has an
 | state that belongs to one task | a local the task owns, passed down |
 | per-thread caches and counters that avoid contention (allocator caches, statistics, shards of an interner) | `PerWorker<T>` |
 
-`PerWorker<T>` is an ordinary value: one cache-line-padded slot per scheduler worker, made with
-`PerWorker::new_in(mem, ..)` and owned and passed like anything else. `slots.with(cx, |slot| ..)`
-gives `&mut T` for the worker the task is on. The closure gets no `Cx`, so it cannot wait, so the
-task cannot move to another worker while it holds the slot (the `nonblocking` check enforces it).
-`slots.iter()` reads every slot, for summing counters. This is the per-CPU variable of a kernel
-and the shard of a shared-nothing runtime, without a global.
+`PerWorker<T, A>` is an ordinary value: one cache-line-padded slot per pool worker, made with
+`PerWorker::new_in(workers, alloc, |worker| ..)` and owned and passed like anything else.
+`slots.with(cx, |slot| ..)` gives `&mut T` for the worker in the `Cx` (`Here::Worker(i)`); code
+off the pool (the entry's thread, an `Inline` root) gets a typed `NotAWorker`. The closure gets no
+`Cx`, so it cannot wait and its task cannot leave the worker while it holds the slot. A closure
+can still capture an outer `Cx` and wait through it, letting another task of the worker in, so
+each slot carries an entered flag, checked in every build (not only debug: it is what makes the
+`&mut` sound under rustc); a second entry panics, failing that task.
 
-The runtime keeps one real thread-local, the pointer to the current worker, inside `bstd::rt`
-(trusted); nothing else may.
+- `iter(&mut self)`, `into_iter(self)` and `take_all(&mut self) -> Vec<T, A>` read every slot
+  once no task can reach them: the exact total of counters after their scope joined.
+- `fold(&self, cx, init, visit, merge)` reads them while work runs: a visit per worker goes on
+  that worker's pinned queue, which it runs between tasks (or while it waits, helping), so no
+  visit ever sees a slot mid-`with`; it is awaited with the scope's deadline, and merged in worker
+  order.
+- `snapshot_racy(&self, f)` reads every slot from the calling thread, for a `PerWorker` built
+  with `new_racy_in`, whose `T: Racy` (a marker trait, `unsafe`, for atomics and arrays and tuples
+  of them): the statistics case, with no visit and no wait.
+
+This is the per-CPU variable of a kernel and the shard of a shared-nothing runtime, without a
+global: the worker index lives in the `Cx`, so the runtime keeps no thread-local at all.
 
 **Secrets.** `#[derive(bstd::Secret)]` gives a type no `Debug`, `Display` or `Clone`, zeroes it on
 drop, and hands its bytes only to functions of its own module.
@@ -592,9 +604,8 @@ rt.rs). Each point below says whether it is built (**built**) or designed only (
 **What a spawn does under `Threads`.** `may_overlap` reserves the task's frame on the spawner,
 records the task's opening in the trace, makes the `Seed` of its context and one task cell (one
 allocation, `blaze_own::Arc` in `Global`), and pushes it onto the spawner's LIFO slot (on a
-worker) or its group's injection queue (outside). When the scope already has `workers - 1`
-tasks outstanding, or the queue is full, the task runs inline instead: never a block, never a
-drop. `Task::join` that finds its task unstarted claims it and runs it on the joiner's thread
+worker) or its group's injection queue (outside). When the scope is narrowed to one worker, or
+the queue is full, the task runs inline instead: never a block, never a drop. `Task::join` that finds its task unstarted claims it and runs it on the joiner's thread
 (correct for `may_overlap`: it runs later than its spawn, with its spawner paused); one that
 finds it running parks on its scope's `Parker` until the worker unparks it. `must_overlap`
 reserves a worker that is searching or parked (a compare-and-swap of its state to `Reserved`) and
@@ -1355,6 +1366,21 @@ the handle is checked and compiled once.
 - `Alloc` is neither `Send` nor `Sync` (it may be a task's frame); a value that crosses threads
   names a `Sync` allocator concretely, or takes a fresh handle on the other side.
 
+The measurement behind the rule (blaze-own `examples/alloc_cost.rs`, release, Apple silicon,
+2026-11-15 21:45 PST, one run, this machine; handles hidden from the optimizer by `black_box`):
+
+| ns per | bump | bump through `Alloc` | global | global through `Alloc` |
+|---|---|---|---|---|
+| push, vector of 16 | 0.94 | 1.03 | 3.20 | 3.48 |
+| push, vector of 1024 | 0.46 | 0.46 | 1.02 | 1.05 |
+| push, vector of 65536 | 0.71 | 0.70 | 0.74 | 0.75 |
+| box of 16 bytes made and dropped | 0.99 | 1.52 | 6.43 | 7.32 |
+| box of 128 bytes | 4.46 | 4.57 | 8.56 | 9.58 |
+| box of 1024 bytes | 17.97 | 18.55 | 33.43 | 33.14 |
+
+The handle costs at most about half a nanosecond per allocation and nothing measurable per push:
+an allocator choice (bump over global) is worth ten times what the handle costs.
+
 ### Collections
 
 One type per need. Each is made with `new_in(alloc)` or `with_capacity_in(n, alloc)`; none has a
@@ -1780,6 +1806,26 @@ length is free and the explicit form is the better one, because the compiler can
   types at hot call sites; the compiler knows which generic was made how many times and which
   bounds checks it could not remove. Each is a finding record (rule 81) an agent can act on:
   blaze tells the author where the explicit form would pay. Not built.
+
+### SIMD
+
+Andrew, 2026-11-15: "we love simd"; "there is some simd stuff in rust's, you should be using simd
+properly". The vector API is the language's own, `core::simd` (`#![feature(portable_simd)]`,
+in the pinned library): `Simd<u8, N>`, masks and `to_bitmask`/`first_set`, `swizzle_dyn` (the
+table lookup that classifies bytes), `simd_eq` and friends. One source serves NEON, SSE2, AVX2
+and AVX-512, the compiler picks the instructions, and a target with no vectors still builds.
+Rules: (1) byte and word scanning, classification, comparison of many keys at once,
+bit-unpacking and digit conversion are written in `core::simd` first; (2) `core::arch`
+intrinsics only where the portable form cannot say it (carry-less multiply, CRC and AES
+instructions, a shuffle the portable API lacks), behind `cfg(target_arch)`, with the portable
+version kept as the reference the tests compare against; (3) a wider vector chosen at run
+time (AVX2 over SSE2) is a function compiled with `#[target_feature]` and picked once from a
+`Cpu` value the caller passes (rule 75), never detected inside; (4) every vector routine has
+a scalar twin and a test that the two agree on random input and at every alignment;
+(5) each claims a speedup only from its cost example, run on the machine and quoted. Where it
+is used: crates/blaze-memchr (search), blaze-swiss (group probe), blaze-lex (lexing, body
+skipping, UTF-8), blaze-solve (candidate fingerprints), blaze-text (digits), blaze-columns
+(bit-unpacking), blaze-blake3 (its own intrinsics, by rule 2).
 
 ## Prior art
 

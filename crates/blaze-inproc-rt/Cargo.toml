@@ -50,8 +50,6 @@ windows-sys.workspace = true
 blaze-ids.workspace = true
 blaze-radix.workspace = true
 blaze-spin.workspace = true
-crossbeam-channel.workspace = true
-parking_lot.workspace = true
 
 [lints]
 workspace = true

@@ -3,10 +3,8 @@
 //! form): who is asking ([`Asker`]) and what each visibility lets it name, and the read list
 //! a finished scope is valid by.
 
-use core::alloc::Allocator;
-
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::Vec;
+use blaze_own::AVec;
 use blaze_surface::{ScopeBuilder, Visibility};
 
 use crate::read::{NameAnswer, Read};
@@ -101,11 +99,11 @@ pub struct ReadEntry<N> {
 /// one of them still sees what it saw. Reads of a fellow of a cycle are not in it: the
 /// members are written together and are valid together.
 #[derive(Clone, Debug)]
-pub struct ReadList<N, A: Allocator> {
-    pub entries: Vec<ReadEntry<N>, A>,
+pub struct ReadList<'a, N> {
+    pub entries: AVec<'a, ReadEntry<N>>,
 }
 
-impl<N: Ord + Copy, A: Allocator> ReadList<N, A> {
+impl<N: Ord + Copy> ReadList<'_, N> {
     /// Whether every read still sees what it saw, `now` answering each as today's records do.
     pub fn holds(&self, mut now: impl FnMut(&Read<N>) -> Saw) -> bool {
         self.entries.iter().all(|e| now(&e.read) == e.saw)
@@ -117,7 +115,7 @@ impl<N: Ord + Copy, A: Allocator> ReadList<N, A> {
     }
 }
 
-impl<N: PartialEq, A: Allocator> PartialEq for ReadList<N, A> {
+impl<N: PartialEq> PartialEq for ReadList<'_, N> {
     fn eq(&self, other: &Self) -> bool {
         self.entries[..] == other.entries[..]
     }
@@ -125,12 +123,12 @@ impl<N: PartialEq, A: Allocator> PartialEq for ReadList<N, A> {
 
 /// A finished module: its scope and the reads it is valid by.
 #[derive(Clone, Debug)]
-pub struct Resolved<N, A: Allocator> {
-    pub scope: ScopeBuilder<N, A>,
-    pub reads: ReadList<N, A>,
+pub struct Resolved<'a, N> {
+    pub scope: ScopeBuilder<'a, N>,
+    pub reads: ReadList<'a, N>,
 }
 
-impl<N: PartialEq, A: Allocator> PartialEq for Resolved<N, A> {
+impl<N: PartialEq> PartialEq for Resolved<'_, N> {
     fn eq(&self, other: &Self) -> bool {
         self.scope == other.scope && self.reads == other.reads
     }

@@ -61,7 +61,6 @@ blaze-unicode.workspace = true
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
 blaze-sim.workspace = true
-crossbeam-channel.workspace = true
 fst.workspace = true
 # The census of std's surfaces (`deps::std_census`): the one gather (`gather::gather`), the
 # tool id it is keyed under, and std's graph, cfg and target data from the one source the

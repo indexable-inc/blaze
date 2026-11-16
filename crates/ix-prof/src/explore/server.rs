@@ -30,7 +30,7 @@ use blaze_http::{
     h3::{self, Endpoint, Identity, ServerConfig, Transport, driver::Loop},
     mailbox::{self, Rx, Tx},
 };
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 use serde_json::Value;
 
 use super::{

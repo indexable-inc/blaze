@@ -7,10 +7,8 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use core::alloc::Allocator;
-
-use blaze_own::Vec;
 use blaze_id::ItemKey;
+use blaze_own::{AVec, Alloc};
 
 use crate::error::ResolveError;
 use crate::facts::{Name, ScopeFacts};
@@ -19,17 +17,20 @@ use crate::resolver::{Outbox, Ran, Resolver, run};
 use crate::scope::Resolved;
 
 /// The machines of one cycle, sorted by module.
-pub struct Group<N, A: Allocator + Clone> {
-    members: Vec<Resolver<N, A>, A>,
-    out: Outbox<N, A>,
-    alloc: A,
+pub struct Group<'a, N> {
+    members: AVec<'a, Resolver<'a, N>>,
+    out: Outbox<'a, N>,
+    alloc: Alloc<'a>,
     finished: bool,
 }
 
-impl<N: Name, A: Allocator + Clone> Group<N, A> {
+impl<'a, N: Name> Group<'a, N> {
     /// A group of `members` (at least one, each of another module, none finished), allocating
     /// in `alloc`. What the members were answered they keep; what they decided they keep too.
-    pub fn new_in(members: Vec<Resolver<N, A>, A>, alloc: A) -> Result<Group<N, A>, ResolveError> {
+    pub fn new_in(
+        members: AVec<'a, Resolver<'a, N>>,
+        alloc: Alloc<'a>,
+    ) -> Result<Group<'a, N>, ResolveError> {
         let mut members = members;
         if members.is_empty() {
             return Err(ResolveError::BadGroup { module: None });
@@ -47,7 +48,7 @@ impl<N: Name, A: Allocator + Clone> Group<N, A> {
             // What a member waited on may now be a fellow, read live.
             m.block_all();
         }
-        Ok(Group { members, out: Outbox::new_in(&alloc), alloc, finished: false })
+        Ok(Group { members, out: Outbox::new_in(alloc), alloc, finished: false })
     }
 
     /// The members' modules, sorted.
@@ -61,14 +62,14 @@ impl<N: Name, A: Allocator + Clone> Group<N, A> {
         &mut self,
         facts: &F,
         replies: &[Reply<'_, N>],
-    ) -> Result<Step<'_, N, Vec<Resolved<N, A>, A>>, ResolveError> {
+    ) -> Result<Step<'_, N, AVec<'a, Resolved<'a, N>>>, ResolveError> {
         if self.finished {
             return Err(ResolveError::Finished { module: self.members[0].module });
         }
         for m in self.members.iter_mut() {
             m.absorb(replies)?;
         }
-        match run(self.members.as_mut_slice(), facts, &mut self.out, &self.alloc)? {
+        match run(self.members.as_mut_slice(), facts, &mut self.out, self.alloc)? {
             Ran::Ask => Ok(Step::Ask(&self.out.asks)),
             Ran::Expand => Ok(Step::Expand(&self.out.expand)),
             Ran::Cycle => Ok(Step::Cycle(&self.out.cycle)),
@@ -80,7 +81,7 @@ impl<N: Name, A: Allocator + Clone> Group<N, A> {
     }
 
     /// The members back, to join a larger group when this one meets another cycle.
-    pub fn into_members(self) -> Vec<Resolver<N, A>, A> {
+    pub fn into_members(self) -> AVec<'a, Resolver<'a, N>> {
         self.members
     }
 }

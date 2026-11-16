@@ -17,11 +17,10 @@ use std::{
     time::Duration,
 };
 
-use arrow_array::RecordBatch;
 use blaze_core::{Completion, Driver, Effect, FileName, wait::Deadline};
 
 use super::{
-    BuildRow, HistoryError, Outcome as BuildOutcome, Writer, arrow_error, builds,
+    BuildRow, HistoryError, Outcome as BuildOutcome, Writer, builds,
     compact::Name,
     files::{CrashRead, CrashRow, Dead, Files, Host, Outcome, Placed, Recovery, Wait},
     manifest::{Entry, Manifest},
@@ -29,6 +28,7 @@ use super::{
 };
 use crate::{
     batches::{self, Process},
+    columns::Batch,
     crash::{self, CrashError},
     flight::postmortem,
     schema::{self, Table},
@@ -171,32 +171,32 @@ fn recovered_files(
             daemon_cpu_ns: None,
         })
         .collect();
-    let tables: [(&'static Table, RecordBatch); 7] = [
+    let tables: [(&'static Table, Batch); 7] = [
         (
             &schema::SPANS,
-            batches::spans(&read.spans, process).map_err(arrow_error(&schema::SPANS))?,
+            batches::spans(&read.spans, process).map_err(HistoryError::Batch)?,
         ),
         (
             &schema::COUNTERS,
-            batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?,
+            batches::counters(&read.counters, process).map_err(HistoryError::Batch)?,
         ),
-        (&schema::BUILDS, builds(&crashed, &[], recovered.pid).map_err(arrow_error(&schema::BUILDS))?),
+        (&schema::BUILDS, builds(&crashed, &[], recovered.pid).map_err(HistoryError::Batch)?),
         (
             &schema::SWITCHES,
-            batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?,
+            batches::switches(&read.switches, process).map_err(HistoryError::Batch)?,
         ),
         (
             &schema::EVENTS,
-            batches::events(&read.events, process).map_err(arrow_error(&schema::EVENTS))?,
+            batches::events(&read.events, process).map_err(HistoryError::Batch)?,
         ),
         (
             &schema::EVENT_FIELDS,
             batches::event_fields(&read.fields, process)
-                .map_err(arrow_error(&schema::EVENT_FIELDS))?,
+                .map_err(HistoryError::Batch)?,
         ),
         (
             &schema::FOLDED,
-            batches::folded(&read.folds, process).map_err(arrow_error(&schema::FOLDED))?,
+            batches::folded(&read.folds, process).map_err(HistoryError::Batch)?,
         ),
     ];
     let build = read.highest_build().max(crashed.iter().map(|it| it.build_id).max().unwrap_or(0));
@@ -221,7 +221,7 @@ fn recovered_files(
 impl Entry {
     /// The entry of a file of `table` this process writes with the rows of `parts`: its pid,
     /// and the boot its clock counts from.
-    pub fn of_batches(table: &schema::Table, parts: &[RecordBatch]) -> Entry {
+    pub fn of_batches(table: &schema::Table, parts: &[Batch]) -> Entry {
         Entry::of_rows(table, parts, std::process::id(), crate::clock::boot())
     }
 }
@@ -374,7 +374,7 @@ impl<H: Host> Core<H> {
             doing: "starting the IO driver of the profile history under",
             error,
         })?;
-        let files = Files::new(host, root, name, super::all_properties());
+        let files = Files::new(host, root, name);
         // alloc: a path, once a core
         Ok(Core { files, driver, dir: dir.to_owned() })
     }
@@ -491,7 +491,7 @@ pub fn recover_dead(dir: &Path) -> Result<usize, HistoryError> {
 /// is refused, naming it. The bytes written.
 pub(crate) fn write_listed(
     dir: &Path,
-    files: &[(&Path, &'static Table, &[RecordBatch])],
+    files: &[(&Path, &'static Table, &[Batch])],
 ) -> Result<u64, HistoryError> {
     std::fs::create_dir_all(dir).map_err(super::io_error(dir, "making the directory"))?;
     let writer = Writer::new();
@@ -540,10 +540,10 @@ pub(crate) fn list_written(dir: &Path) {
             continue;
         }
         let path = dir.join(&name);
-        let bytes = bytes::Bytes::from(std::fs::read(&path).unwrap());
+        let bytes = std::fs::read(&path).unwrap();
         let entry = Entry::of_footer(&path, &bytes, Some(schema::VERSION)).unwrap();
         std::fs::remove_file(&path).unwrap();
-        placed.push(Placed { file: name, bytes: bytes.to_vec(), entry });
+        placed.push(Placed { file: name, bytes, entry });
     }
     let mut core = Core::new(Live::new(dir), dir).unwrap();
     match core.job(|it| it.write_listed(placed)).unwrap() {

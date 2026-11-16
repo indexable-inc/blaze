@@ -94,7 +94,7 @@ impl<'a> Tests<'a> {
         match self.tests.column::<TEST>().binary_search(&test) {
             Ok(row) => row,
             Err(row) => {
-                self.tests.insert(row, (test, None, Vec::new_in(self.alloc.clone())));
+                self.tests.insert(row, (test, None, Vec::new_in(self.alloc)));
                 row
             }
         }
@@ -109,7 +109,7 @@ impl<'a> Tests<'a> {
     /// replacing the last.
     pub fn record(&mut self, test: TestId, verdict: Verdict, entered: &[CodeId]) {
         let row = self.row(test);
-        let kept = Vec::from_slice_in(entered, self.alloc.clone());
+        let kept = Vec::from_slice_in(entered, self.alloc);
         let old = mem::replace(&mut self.tests.column_mut::<ENTERED>()[row], kept);
         let was_recorded = self.tests.column::<VERDICT>()[row].is_some();
         self.tests.column_mut::<VERDICT>()[row] = Some(verdict);
@@ -126,7 +126,7 @@ impl<'a> Tests<'a> {
         for id in entered {
             self.postings
                 .entry(*id)
-                .or_insert_with(|| SortedSet::new_in(self.alloc.clone()))
+                .or_insert_with(|| SortedSet::new_in(self.alloc))
                 .insert(test);
         }
     }
@@ -138,7 +138,7 @@ impl<'a> Tests<'a> {
 
     /// The tests an edit that changed the bodies `changed` must run again, sorted: each that
     /// entered one of them, and each that has no record yet.
-    pub fn affected<B: Allocator>(&self, changed: &[CodeId], out: &mut Vec<TestId, B>) {
+    pub fn affected(&self, changed: &[CodeId], out: &mut AVec<'_, TestId>) {
         let first = out.len();
         for id in changed {
             if let Some(tests) = self.postings.get(id) {

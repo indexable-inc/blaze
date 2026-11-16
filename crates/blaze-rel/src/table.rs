@@ -140,9 +140,9 @@ impl<B: Allocator + Clone> Table<B> for MemTable<B> {
     }
 }
 
-/// The base tables a query may name, each by its name.
+/// The base tables a query may name, each by its name (a constant of the profile's schema).
 pub struct Catalog<'t, B: Allocator, A: Allocator> {
-    tables: Vec<(&'t str, &'t dyn Table<B>), A>,
+    tables: Vec<(&'static str, &'t dyn Table<B>), A>,
 }
 
 impl<'t, B: Allocator, A: Allocator> Catalog<'t, B, A> {
@@ -151,7 +151,7 @@ impl<'t, B: Allocator, A: Allocator> Catalog<'t, B, A> {
     }
 
     /// Adds `table` under `name`; a second table of one name replaces the first.
-    pub fn add(&mut self, name: &'t str, table: &'t dyn Table<B>) {
+    pub fn add(&mut self, name: &'static str, table: &'t dyn Table<B>) {
         if let Some(entry) = self.tables.iter_mut().find(|(it, _)| it.eq_ignore_ascii_case(name)) {
             entry.1 = table;
         } else {
@@ -168,7 +168,7 @@ impl<'t, B: Allocator, A: Allocator> Catalog<'t, B, A> {
             .map(|(at, (_, table))| (at, *table))
     }
 
-    pub fn get(&self, at: usize) -> Option<(&'t str, &'t dyn Table<B>)> {
+    pub fn get(&self, at: usize) -> Option<(&'static str, &'t dyn Table<B>)> {
         self.tables.get(at).copied()
     }
 }

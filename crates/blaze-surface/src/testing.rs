@@ -2,11 +2,9 @@
 //! hand, for the tests of this crate and of the crates that ask through the two traits (the
 //! `testing` feature).
 
-use core::alloc::Allocator;
-
 use blaze_format::{Aligned, FormatError};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, NoItem};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::crate_graph::CrateGraphView;
 use crate::impl_index::NoImplsOfView;
@@ -60,11 +58,11 @@ impl Fact {
 /// The records and the file texts of one crate, held in memory. Each buffer is checked whole
 /// when it is inserted; a question reads it in place again, the check standing (a test double:
 /// the store's reader checks a segment once and hands out views with no check).
-pub struct MemSurface<A: Allocator + Clone> {
+pub struct MemSurface<'a> {
     krate: CrateItemKey,
-    records: Vec<(Fact, ContentId, Aligned), A>,
-    texts: Vec<(ContentId, Vec<u8, A>), A>,
-    alloc: A,
+    records: AVec<'a, (Fact, ContentId, Aligned)>,
+    texts: AVec<'a, (ContentId, AVec<'a, u8>)>,
+    alloc: Alloc<'a>,
 }
 
 /// The view of a buffer [`MemSurface::insert`] checked.
@@ -72,15 +70,10 @@ fn checked<T>(view: Result<T, FormatError>) -> T {
     view.unwrap_or_else(|error| panic!("a record checked when it was inserted: {error}"))
 }
 
-impl<A: Allocator + Clone> MemSurface<A> {
+impl<'a> MemSurface<'a> {
     /// An empty surface of the crate `krate`, its tables in `alloc`.
-    pub fn new_in(krate: CrateItemKey, alloc: A) -> MemSurface<A> {
-        MemSurface {
-            krate,
-            records: Vec::new_in(alloc.clone()),
-            texts: Vec::new_in(alloc.clone()),
-            alloc,
-        }
+    pub fn new_in(krate: CrateItemKey, alloc: Alloc<'a>) -> MemSurface<'a> {
+        MemSurface { krate, records: AVec::new_in(alloc), texts: AVec::new_in(alloc), alloc }
     }
 
     /// Holds `bytes`, a record of `fact`, under the key its view names (the file, the module,
@@ -113,7 +106,7 @@ impl<A: Allocator + Clone> MemSurface<A> {
     /// Holds `text` as the text of the file with content `file`.
     pub fn insert_text(&mut self, file: ContentId, text: &str) {
         self.texts.retain(|(at, _)| *at != file);
-        let bytes = Vec::from_slice_in(text.as_bytes(), self.alloc.clone());
+        let bytes = AVec::from_slice_in(text.as_bytes(), self.alloc);
         self.texts.push((file, bytes));
     }
 
@@ -138,7 +131,7 @@ impl<A: Allocator + Clone> MemSurface<A> {
     }
 }
 
-impl<A: Allocator + Clone> Items for MemSurface<A> {
+impl Items for MemSurface<'_> {
     fn entry(&self, item: ItemKey) -> Result<KeyEntry, SurfaceError> {
         let missing = NoItem { krate: self.krate, key: item };
         if !item.is_of(self.krate) {
@@ -195,7 +188,7 @@ impl<A: Allocator + Clone> Items for MemSurface<A> {
     }
 }
 
-impl<A: Allocator + Clone> Source for MemSurface<A> {
+impl Source for MemSurface<'_> {
     fn krate(&self) -> CrateItemKey {
         self.krate
     }

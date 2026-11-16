@@ -14,8 +14,6 @@
 //! Omitted for now: the metadata rules of wide-pointer casts (`*const [T]` to `*const U`
 //! keeps or drops length), `dyn` upcasts, and the trivial-cast lint.
 
-use core::alloc::Allocator;
-
 use crate::diag::{At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, UintTy};
@@ -40,7 +38,7 @@ enum Kind {
     Other,
 }
 
-impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
+impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     pub(crate) fn expr_cast(&mut self, mut f: Frame, e: ExprId, operand: ExprId, ty: PTy) -> Result<Flow, Stop> {
         if f.state == 0 {
             let to = self.lower_body_ty(ty)?;

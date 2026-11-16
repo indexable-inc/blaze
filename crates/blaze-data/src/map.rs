@@ -7,6 +7,8 @@
 //! CBOR want the sorted one (CBOR's by encoded key, which a writer derives from this one), TOML
 //! and a manifest built in code want insertion order.
 
+#![blaze::sans_io]
+
 use core::{alloc::Allocator, fmt, mem};
 
 use blaze_own::{String, Vec};

@@ -20,7 +20,7 @@ blaze-core.workspace = true
 # task's stack of runs.
 blaze-graph.workspace = true
 # `SegQueue`: the image records an imaged run files, drained by the driver between commands.
-crossbeam-queue.workspace = true
+blaze-queue.workspace = true
 # `Record`: an imaged query's value is a plain record, its bytes the value.
 blaze-format.workspace = true
 # `FixedState`: the one deterministic hasher of keys.

@@ -48,6 +48,7 @@ mod wire;
 #[cfg(test)]
 mod sim;
 
+pub use crate::condition::{Condition, ConditionError, Space, Var};
 pub use crate::key::{Key, Kind, Name, Tool};
 pub use crate::record::{Finding, Locate, Part};
 pub use crate::request::{

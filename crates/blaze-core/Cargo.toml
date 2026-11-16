@@ -16,11 +16,11 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 blaze-mem.workspace = true
+# The channel's queues (`chan`), and the queues the drivers hand work through.
+blaze-queue.workspace = true
 blaze-radix.workspace = true
 blaze-rng.workspace = true
 blaze-spin.workspace = true
-crossbeam-channel.workspace = true
-crossbeam-queue.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

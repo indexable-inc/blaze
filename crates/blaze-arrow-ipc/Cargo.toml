@@ -1,0 +1,25 @@
+[package]
+name = "blaze-arrow-ipc"
+description = "A minimal Arrow IPC writer and reader, in place of arrow-ipc and the arrow crates: blaze-columns batches as Arrow IPC streams (the live feed's, with delta dictionaries) and files (the explorer's .ixprof tables), uncompressed, little-endian, the flatbuffers of Schema, DictionaryBatch, RecordBatch and Footer written and read by hand; the reader bounded, with typed refusals; `no_std`, on blaze-own"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# What is written and read: batches of named columns.
+blaze-columns.workspace = true
+# Every buffer, in the allocator the caller names.
+blaze-own.workspace = true
+# Integer conversions that say what they do, in place of `as`.
+blaze-int.workspace = true
+
+[lints]
+workspace = true

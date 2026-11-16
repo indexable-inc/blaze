@@ -10,7 +10,7 @@ use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_id::ItemKey;
-use blaze_own::Vec;
+use blaze_own::{Alloc, Vec};
 use blaze_scope::{Answer, Read, Reply, ResolveError, Resolved, Resolver, ScopeFacts, Step};
 use blaze_surface::SurfaceError;
 
@@ -29,10 +29,10 @@ pub trait ScopeReads<N> {
 }
 
 /// How an entry of the task ended.
-pub enum ScopeOutcome<N, A: Allocator + Clone> {
-    Done(Resolved<N, A>),
+pub enum ScopeOutcome<'a, N> {
+    Done(Resolved<'a, N>),
     /// Names to be handed on the next entry, sorted and without repeats.
-    Need(Vec<Name, A>),
+    Need(Vec<Name, Alloc<'a>>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,19 +64,19 @@ impl fmt::Display for ScopeTaskError {
 impl core::error::Error for ScopeTaskError {}
 
 /// One entry of the `ModuleScope` task of `module`.
-pub fn module_scope<N: blaze_scope::Name, F: ScopeFacts<Name = N>, R: ScopeReads<N>, A: Allocator + Clone>(
+pub fn module_scope<'a, N: blaze_scope::Name, F: ScopeFacts<Name = N>, R: ScopeReads<N>>(
     module: ItemKey,
     facts: &F,
     reads: &R,
-    alloc: A,
-) -> Result<ScopeOutcome<N, A>, ScopeTaskError> {
+    alloc: Alloc<'a>,
+) -> Result<ScopeOutcome<'a, N>, ScopeTaskError> {
     let refused = |error: ResolveError| match error {
         ResolveError::Surface { module, error } => ScopeTaskError::Fact { module, error },
         error => ScopeTaskError::Resolve { module, error },
     };
-    let mut machine = Resolver::new_in(module, facts, alloc.clone()).map_err(refused)?;
-    let mut needs: Vec<Name, A> = Vec::new_in(alloc.clone());
-    let mut replies: Vec<Reply<'_, N>, A> = Vec::new_in(alloc.clone());
+    let mut machine = Resolver::new_in(module, facts, alloc).map_err(refused)?;
+    let mut needs: Vec<Name, Alloc<'a>> = Vec::new_in(alloc);
+    let mut replies: Vec<Reply<'_, N>, Alloc<'a>> = Vec::new_in(alloc);
     for _ in 0..MOST_STEPS {
         let step = machine.step(facts, &replies).map_err(refused)?;
         replies.clear();
@@ -127,7 +127,7 @@ pub fn module_scope<N: blaze_scope::Name, F: ScopeFacts<Name = N>, R: ScopeReads
 pub struct SharedRoot<'f, F: ScopeFacts> {
     facts: &'f F,
     krate: blaze_id::CrateItemKey,
-    root: blaze_surface::CrateRootBuilder<F::Name, F::Alloc>,
+    root: blaze_surface::CrateRootBuilder<'f, F::Name>,
 }
 
 impl<'f, F: ScopeFacts> SharedRoot<'f, F> {
@@ -141,27 +141,26 @@ impl<'f, F: ScopeFacts> SharedRoot<'f, F> {
 
 impl<F: ScopeFacts> ScopeFacts for SharedRoot<'_, F> {
     type Name = F::Name;
-    type Alloc = F::Alloc;
 
     fn module(&self, module: ItemKey) -> Result<blaze_scope::ModuleInfo<F::Name>, SurfaceError> {
         self.facts.module(module)
     }
 
-    fn decls(&self, module: ItemKey) -> Result<blaze_scope::DeclsBuilder<F::Name, F::Alloc>, SurfaceError> {
+    fn decls(&self, module: ItemKey) -> Result<blaze_scope::DeclsBuilder<'_, F::Name>, SurfaceError> {
         self.facts.decls(module)
     }
 
     fn crate_root(
         &self,
         krate: blaze_id::CrateItemKey,
-    ) -> Result<blaze_surface::CrateRootBuilder<F::Name, F::Alloc>, SurfaceError> {
+    ) -> Result<blaze_surface::CrateRootBuilder<'_, F::Name>, SurfaceError> {
         match krate == self.krate {
             true => Ok(self.root.clone()),
             false => self.facts.crate_root(krate),
         }
     }
 
-    fn expansion(&self, call: ItemKey) -> Result<Option<blaze_scope::ExpandedDecls<F::Name, F::Alloc>>, SurfaceError> {
+    fn expansion(&self, call: ItemKey) -> Result<Option<blaze_scope::ExpandedDecls<'_, F::Name>>, SurfaceError> {
         self.facts.expansion(call)
     }
 }
@@ -169,24 +168,23 @@ impl<F: ScopeFacts> ScopeFacts for SharedRoot<'_, F> {
 /// One round of a crate's first fill: an entry of every module in `modules` over one decoded
 /// root, each outcome pushed in order. A module's error is its own (rule 20): it is pushed as
 /// that module's outcome, and the round goes on.
-pub fn fill_round<N, F, R, A, B>(
+pub fn fill_round<'a, N, F, R, B>(
     facts: &F,
     krate: blaze_id::CrateItemKey,
     modules: &[ItemKey],
     reads: &R,
-    alloc: A,
-    out: &mut Vec<Result<ScopeOutcome<N, A>, ScopeTaskError>, B>,
+    alloc: Alloc<'a>,
+    out: &mut Vec<Result<ScopeOutcome<'a, N>, ScopeTaskError>, B>,
 ) -> Result<(), SurfaceError>
 where
     N: blaze_scope::Name,
     F: ScopeFacts<Name = N>,
     R: ScopeReads<N>,
-    A: Allocator + Clone,
     B: Allocator,
 {
     let shared = SharedRoot::new(facts, krate)?;
     for module in modules {
-        out.push(module_scope(*module, &shared, reads, alloc.clone()));
+        out.push(module_scope(*module, &shared, reads, alloc));
     }
     Ok(())
 }

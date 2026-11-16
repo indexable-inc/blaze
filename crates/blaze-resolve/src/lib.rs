@@ -49,7 +49,9 @@ pub use blaze_source::{
 pub use dependency::{DepKind, Dependency};
 pub use edit_distance::{closest, closest_msg, edit_distance};
 pub use graph::Graph;
-pub use names::{validate_feature_name, validate_package_name, validate_registry_name};
+pub use names::{
+    validate_feature_name, validate_package_name, validate_path_base_name, validate_registry_name,
+};
 pub use package_id::PackageId;
 pub use package_id_spec::PackageIdSpec;
 pub use registry::{IndexSummary, MemRegistry, QueryKind, Registry, query_pinned};

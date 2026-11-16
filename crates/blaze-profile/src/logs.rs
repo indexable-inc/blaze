@@ -423,12 +423,12 @@ pub fn fields_text(fields: &[(String, Value)]) -> String {
 mod tests {
     use std::time::Duration;
 
-    use arrow_array::{
-        Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
-    };
-
     use super::*;
-    use crate::{batches, flight};
+    use crate::{
+        batches,
+        columns::{Batch, Column},
+        flight,
+    };
 
     /// Reads the rows of the rings a test's thread `tid` wrote in the last minute.
     fn mine(tid: u32) -> Read {
@@ -441,13 +441,8 @@ mod tests {
         read
     }
 
-    fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
-        batch
-            .column_by_name(name)
-            .unwrap_or_else(|| panic!("event_fields has {name}"))
-            .as_any()
-            .downcast_ref::<T>()
-            .unwrap_or_else(|| panic!("{name} is of its schema's type"))
+    fn column<'a>(batch: &'a Batch, name: &str) -> &'a Column {
+        batch.column_by_name(name).unwrap_or_else(|| panic!("event_fields has {name}"))
     }
 
     #[test]
@@ -471,39 +466,32 @@ mod tests {
         assert!(read.fields.iter().all(|it| it.event_id == event.event_id && it.build == 0x7a11));
         let batch = batches::event_fields(&read.fields, batches::Process::this())
             .expect("a batch of event_fields");
-        let keys = strings(batch.column_by_name("key").expect("key").as_ref());
+        let keys = strings(column(&batch, "key"));
         assert_eq!(keys, ["n", "count", "ratio", "ok", "label", "shown"]);
-        let kinds = strings(batch.column_by_name("kind").expect("kind").as_ref());
+        let kinds = strings(column(&batch, "kind"));
         assert_eq!(kinds, ["i64", "u64", "f64", "bool", "str", "str"]);
-        let ints = column::<Int64Array>(&batch, "value_i64");
-        assert_eq!((ints.value(0), ints.null_count()), (-3, 5));
-        let unsigned = column::<UInt64Array>(&batch, "value_u64");
-        assert_eq!((unsigned.value(1), unsigned.null_count()), (7, 5));
-        let floats = column::<Float64Array>(&batch, "value_f64");
-        assert_eq!((floats.value(2), floats.null_count()), (0.5, 5));
-        let bools = column::<BooleanArray>(&batch, "value_bool");
-        assert_eq!((bools.value(3), bools.null_count()), (true, 5));
-        let texts = column::<StringArray>(&batch, "value_str");
-        assert_eq!((texts.value(4), texts.value(5), texts.null_count()), ("x", "[1, 2]", 4));
+        let ints = column(&batch, "value_i64");
+        assert_eq!((ints.i64s().expect("i64s").value(0), ints.null_count()), (-3, 5));
+        let unsigned = column(&batch, "value_u64");
+        assert_eq!((unsigned.u64s().expect("u64s").value(1), unsigned.null_count()), (7, 5));
+        let floats = column(&batch, "value_f64");
+        assert_eq!((floats.f64s().expect("f64s").value(2), floats.null_count()), (0.5, 5));
+        let bools = column(&batch, "value_bool");
+        assert_eq!((bools.bools().expect("bools").value(3), bools.null_count()), (true, 5));
+        let texts = column(&batch, "value_str");
+        assert_eq!((texts.text(4), texts.text(5), texts.null_count()), (Some("x"), Some("[1, 2]"), 4));
         let ordinals: Vec<u16> = read.fields.iter().map(|it| it.ordinal).collect();
         assert_eq!(ordinals, [0, 1, 2, 3, 4, 5]);
         let events =
             batches::events(&read.events, batches::Process::this()).expect("a batch of events");
-        let ids = column::<UInt64Array>(&events, "event_id");
+        let ids = column(&events, "event_id").u64s().expect("u64s");
         assert_eq!(ids.value(0), event.event_id, "events and event_fields name the event alike");
     }
 
     /// A dictionary column's values, row by row.
-    fn strings(array: &dyn Array) -> Vec<String> {
-        let dict = array
-            .as_any()
-            .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::UInt32Type>>()
-            .expect("a dictionary column");
-        let values = dict.values().as_any().downcast_ref::<StringArray>().expect("of strings");
-        dict.keys()
-            .iter()
-            .map(|key| values.value(key.expect("a key") as usize).to_owned())
-            .collect()
+    fn strings(column: &Column) -> Vec<String> {
+        assert!(column.strs().and_then(|it| it.dict()).is_some(), "a dictionary column");
+        (0..column.len()).map(|row| column.text(row).expect("a key").to_owned()).collect()
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The interner (docs/v2/plan/design/concurrency.md): [`blaze_ids::shard_count`] shards, each
+//! The interner (docs/v2/plan/design/concurrency.md): [`blaze_ids::Shards`] shards, each
 //! an append-only arena of nodes in chunks that never move and one open-addressed table from
 //! fingerprint bits to the node's place in the arena.
 //!
@@ -140,7 +140,7 @@ pub struct HashCons<T> {
 
 impl<T: Consed> HashCons<T> {
     pub fn new() -> HashCons<T> {
-        let count = blaze_ids::shard_count();
+        let count = blaze_ids::Shards::for_this_machine().count();
         debug_assert!(count.is_power_of_two() && count >= 4);
         HashCons {
             shards: (0..count).map(|_| Shard::new()).collect(),

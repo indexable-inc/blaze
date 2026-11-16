@@ -8,6 +8,7 @@
 use std::{alloc::Global, path::PathBuf, time::Instant};
 
 use blaze_file_items::outline;
+use blaze_own::Alloc;
 use blaze_surface::{Edition, ItemDetail};
 
 fn main() {
@@ -45,7 +46,7 @@ fn main() {
         let (mut items, mut errors, mut unhandled) = (0usize, 0usize, 0usize);
         let start = Instant::now();
         for text in &texts {
-            let made = outline(text, Edition::E2024, Global);
+            let made = outline(text, Edition::E2024, Alloc::global());
             items += made.items().len();
             errors += made.errors().len();
             unhandled += made.items().iter().filter(|it| matches!(it.detail, ItemDetail::Unhandled { .. })).count();
@@ -83,7 +84,7 @@ fn main() {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(text) = texts.get(at) else { break };
-                            mine += outline(text, Edition::E2024, Global).items().len();
+                            mine += outline(text, Edition::E2024, Alloc::global()).items().len();
                         }
                         made.fetch_add(mine, std::sync::atomic::Ordering::Relaxed);
                     });

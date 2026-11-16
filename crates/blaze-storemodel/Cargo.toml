@@ -20,7 +20,6 @@ blaze-ids.workspace = true
 blaze-kernel.workspace = true
 blaze-rng.workspace = true
 blaze-store-check.workspace = true
-crossbeam-channel.workspace = true
 
 [lints]
 workspace = true

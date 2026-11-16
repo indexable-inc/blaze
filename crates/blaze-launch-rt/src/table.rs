@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use blaze_launch::{Frame, FrameKind, Slot, Thread};
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 use crate::{arch, sys};
 

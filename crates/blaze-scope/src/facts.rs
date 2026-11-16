@@ -8,11 +8,11 @@
 //! Reads of another module's scope are not here: the machine yields them as asks
 //! ([`crate::Read`]) and takes their answers, so it never computes another module's scope.
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::hash::Hash;
 
 use blaze_id::{CrateItemKey, ItemKey};
+use blaze_own::Alloc;
 use blaze_surface::{
     CrateRootBuilder, DeclsBuilder, ExpandedDecls, Items, ModuleInfo, NotBuilt, SurfaceError,
 };
@@ -25,30 +25,24 @@ pub trait Name: Copy + Ord + Hash + fmt::Debug {}
 impl<T: Copy + Ord + Hash + fmt::Debug> Name for T {}
 
 /// Everything the machine reads of the module it resolves and of its crate, each a record
-/// decoded into its working form in the facts' allocator. A missing record is the
-/// [`SurfaceError`] naming it, which the machine stops on; [`ScopeFacts::expansion`]'s
-/// `Ok(None)` means the call has not been expanded yet.
+/// decoded into its working form in the facts' own allocator (which outlives the borrow of the
+/// facts the working form is read under). A missing record is the [`SurfaceError`] naming it,
+/// which the machine stops on; [`ScopeFacts::expansion`]'s `Ok(None)` means the call has not
+/// been expanded yet.
 pub trait ScopeFacts {
     type Name: Name;
-    type Alloc: Allocator + Clone;
 
     /// The module's place in its crate: the head of its own `ModuleDecls` record.
     fn module(&self, module: ItemKey) -> Result<ModuleInfo<Self::Name>, SurfaceError>;
 
     /// What the module's own text declares: its `ModuleDecls` record.
-    fn decls(&self, module: ItemKey) -> Result<DeclsBuilder<Self::Name, Self::Alloc>, SurfaceError>;
+    fn decls(&self, module: ItemKey) -> Result<DeclsBuilder<'_, Self::Name>, SurfaceError>;
 
     /// The crate's `CrateRoot` record.
-    fn crate_root(
-        &self,
-        krate: CrateItemKey,
-    ) -> Result<CrateRootBuilder<Self::Name, Self::Alloc>, SurfaceError>;
+    fn crate_root(&self, krate: CrateItemKey) -> Result<CrateRootBuilder<'_, Self::Name>, SurfaceError>;
 
     /// What the call's expansion adds to its module, or `None` while it is not expanded.
-    fn expansion(
-        &self,
-        call: ItemKey,
-    ) -> Result<Option<ExpandedDecls<Self::Name, Self::Alloc>>, SurfaceError>;
+    fn expansion(&self, call: ItemKey) -> Result<Option<ExpandedDecls<'_, Self::Name>>, SurfaceError>;
 }
 
 /// [`ScopeFacts`] over the records an [`Items`] reads: names are the records' string-table
@@ -60,34 +54,33 @@ pub trait ScopeFacts {
 /// [`ScopeFacts::crate_root`] the crate's `CrateRoot` record. An expansion has no record yet,
 /// so [`ScopeFacts::expansion`] is [`NotBuilt`]: a module whose macro call resolves stops there
 /// with that error, never on a guess that the call adds nothing.
-pub struct RecordFacts<'a, I: Items, A: Allocator + Clone> {
+pub struct RecordFacts<'a, 'b, I: Items> {
     pub items: &'a I,
-    pub alloc: A,
+    pub alloc: Alloc<'b>,
 }
 
-impl<'a, I: Items, A: Allocator + Clone> RecordFacts<'a, I, A> {
-    pub fn new_in(items: &'a I, alloc: A) -> RecordFacts<'a, I, A> {
+impl<'a, 'b, I: Items> RecordFacts<'a, 'b, I> {
+    pub fn new_in(items: &'a I, alloc: Alloc<'b>) -> RecordFacts<'a, 'b, I> {
         RecordFacts { items, alloc }
     }
 }
 
-impl<'a, I: Items, A: Allocator + Clone> ScopeFacts for RecordFacts<'a, I, A> {
+impl<'a, I: Items> ScopeFacts for RecordFacts<'a, '_, I> {
     type Name = &'a str;
-    type Alloc = A;
 
     fn module(&self, module: ItemKey) -> Result<ModuleInfo<&'a str>, SurfaceError> {
         Ok(self.items.decls(module)?.info())
     }
 
-    fn decls(&self, module: ItemKey) -> Result<DeclsBuilder<&'a str, A>, SurfaceError> {
-        Ok(DeclsBuilder::from(&self.items.decls(module)?, self.alloc.clone()))
+    fn decls(&self, module: ItemKey) -> Result<DeclsBuilder<'_, &'a str>, SurfaceError> {
+        Ok(DeclsBuilder::from(&self.items.decls(module)?, self.alloc))
     }
 
-    fn crate_root(&self, krate: CrateItemKey) -> Result<CrateRootBuilder<&'a str, A>, SurfaceError> {
-        Ok(CrateRootBuilder::from(&self.items.crate_root(krate)?, self.alloc.clone()))
+    fn crate_root(&self, krate: CrateItemKey) -> Result<CrateRootBuilder<'_, &'a str>, SurfaceError> {
+        Ok(CrateRootBuilder::from(&self.items.crate_root(krate)?, self.alloc))
     }
 
-    fn expansion(&self, call: ItemKey) -> Result<Option<ExpandedDecls<&'a str, A>>, SurfaceError> {
+    fn expansion(&self, call: ItemKey) -> Result<Option<ExpandedDecls<'_, &'a str>>, SurfaceError> {
         Err(NotBuilt { method: "expansion", item: call }.into())
     }
 }

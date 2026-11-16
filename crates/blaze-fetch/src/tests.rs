@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use crossbeam_channel::{Receiver, Sender};
+use blaze_core::chan::{Receiver, Sender};
 
 use blaze_cas::{Driven, Handle};
 
@@ -253,10 +253,10 @@ fn the_retry_policy_is_a_transcript() {
 fn one_download_per_pin() {
     let dir = tempfile::tempdir().unwrap();
     let (_driven, store) = store(dir.path());
-    let (started, on_start) = crossbeam_channel::bounded(1);
-    let (release, gate) = crossbeam_channel::bounded(0);
+    let (started, on_start) = blaze_core::chan::bounded(1);
+    let (release, gate) = blaze_core::chan::bounded(0);
     let net = Arc::new(Fake { gate: Some((started, gate)), ..Fake::new(b"one download") });
-    let (followed, on_follow) = crossbeam_channel::unbounded();
+    let (followed, on_follow) = blaze_core::chan::unbounded();
     let flights: &'static Flights = Box::leak(Box::new(Flights::watched(followed)));
     let fetcher = Arc::new(
         fetcher(store, Arc::clone(&net), &dir.path().join("scratch")).with_flights(flights),

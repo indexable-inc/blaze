@@ -3,8 +3,7 @@
 //! Per-node facts are one `Vec` per node kind; sparse facts (adjustments, callees, fields,
 //! captures) are `Soa` tables sorted by expression, so a lookup scans only the expression column.
 
-use blaze_own::{Soa, Vec};
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Soa, Vec};
 
 use crate::diag::Diag;
 use crate::ids::{ExprId, ItemKey, List, Mutbl, PatId};
@@ -40,57 +39,56 @@ pub enum CaptureKind {
 
 /// Adjustments: the expression, the step, the type it produces. Each expression's steps are
 /// consecutive and in order.
-pub type Adjusts<A> = Soa<(ExprId, AdjustKind, PTy), A>;
+pub type Adjusts<'a> = Soa<(ExprId, AdjustKind, PTy), Alloc<'a>>;
 /// The resolved callee of each call and method call: the expression, the item, and its generic
 /// arguments (a list of the record's `types`).
-pub type Callees<A> = Soa<(ExprId, ItemKey, List), A>;
+pub type Callees<'a> = Soa<(ExprId, ItemKey, List), Alloc<'a>>;
 /// Each field access: the expression, the variant and the field's index.
-pub type Fields<A> = Soa<(ExprId, u32, u32), A>;
+pub type Fields<'a> = Soa<(ExprId, u32, u32), Alloc<'a>>;
 /// Each capture: the closure, the binding captured, how.
-pub type Captures<A> = Soa<(ExprId, PatId, CaptureKind), A>;
+pub type Captures<'a> = Soa<(ExprId, PatId, CaptureKind), Alloc<'a>>;
 
 /// The record of one body.
-pub struct Checked<A: Allocator + Clone> {
+pub struct Checked<'a> {
     /// Every type the record names.
-    pub types: PortableTys<A>,
+    pub types: PortableTys<'a>,
     /// One per expression: its type before adjustments.
-    pub expr_ty: Vec<PTy, A>,
+    pub expr_ty: Vec<PTy, Alloc<'a>>,
     /// One per pattern.
-    pub pat_ty: Vec<PTy, A>,
+    pub pat_ty: Vec<PTy, Alloc<'a>>,
     /// One per pattern: the binding's type for a binding pattern, the error type otherwise.
-    pub local_ty: Vec<PTy, A>,
-    pub adjusts: Adjusts<A>,
-    pub callees: Callees<A>,
-    pub fields: Fields<A>,
-    pub captures: Captures<A>,
+    pub local_ty: Vec<PTy, Alloc<'a>>,
+    pub adjusts: Adjusts<'a>,
+    pub callees: Callees<'a>,
+    pub fields: Fields<'a>,
+    pub captures: Captures<'a>,
     /// The body's diagnostics, in the order found.
-    pub diags: Vec<Diag, A>,
+    pub diags: Vec<Diag, Alloc<'a>>,
     /// What the check read, and what to fetch next time.
-    pub reads: ReadList<A>,
-    pub needs: Needs<A>,
+    pub reads: ReadList<'a>,
+    pub needs: Needs<'a>,
 }
 
 /// Two three-column tables are equal column by column.
-fn soa3_eq<X: PartialEq, Y: PartialEq, Z: PartialEq, A: Allocator, B: Allocator>(
-    a: &Soa<(X, Y, Z), A>,
-    b: &Soa<(X, Y, Z), B>,
+fn soa3_eq<X: PartialEq, Y: PartialEq, Z: PartialEq>(
+    a: &Soa<(X, Y, Z), Alloc<'_>>,
+    b: &Soa<(X, Y, Z), Alloc<'_>>,
 ) -> bool {
     a.column::<0>() == b.column::<0>() && a.column::<1>() == b.column::<1>() && a.column::<2>() == b.column::<2>()
 }
 
-/// Columns compared one by one, for records whose fields are `Vec`s (a `derive` would demand
-/// `A: PartialEq`).
+/// Columns compared one by one, for records whose fields are `Vec`s.
 macro_rules! columns_eq {
     ($ty:ident { $($f:ident),* $(,)? }) => {
-        impl<A: Allocator + Clone> PartialEq for $ty<A> {
-            fn eq(&self, other: &$ty<A>) -> bool {
+        impl<'a> PartialEq for $ty<'a> {
+            fn eq(&self, other: &$ty<'a>) -> bool {
                 true $(&& self.$f == other.$f)*
             }
         }
 
-        impl<A: Allocator + Clone> Eq for $ty<A> {}
+        impl Eq for $ty<'_> {}
 
-        impl<A: Allocator + Clone> core::fmt::Debug for $ty<A> {
+        impl core::fmt::Debug for $ty<'_> {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 f.debug_struct(stringify!($ty))
                     $(.field(stringify!($f), &self.$f))*
@@ -102,9 +100,9 @@ macro_rules! columns_eq {
 
 pub(crate) use columns_eq;
 
-impl<A: Allocator + Clone> Checked<A> {
+impl<'a> Checked<'a> {
     /// Equal results ignoring the read list and needs: what the read-list property compares.
-    pub fn same_result(&self, other: &Checked<A>) -> bool {
+    pub fn same_result(&self, other: &Checked<'a>) -> bool {
         self.types == other.types
             && self.expr_ty == other.expr_ty
             && self.pat_ty == other.pat_ty
@@ -117,15 +115,15 @@ impl<A: Allocator + Clone> Checked<A> {
     }
 }
 
-impl<A: Allocator + Clone> PartialEq for Checked<A> {
-    fn eq(&self, other: &Checked<A>) -> bool {
+impl<'a> PartialEq for Checked<'a> {
+    fn eq(&self, other: &Checked<'a>) -> bool {
         self.same_result(other) && self.reads == other.reads && self.needs == other.needs
     }
 }
 
-impl<A: Allocator + Clone> Eq for Checked<A> {}
+impl<'a> Eq for Checked<'a> {}
 
-impl<A: Allocator + Clone> core::fmt::Debug for Checked<A> {
+impl<'a> core::fmt::Debug for Checked<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Checked")
             .field("types", &self.types)

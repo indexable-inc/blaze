@@ -9,9 +9,8 @@
 //! - `may_overlap` gives the sequential result in a scope narrowed to one worker and in one
 //!   with the layout's workers.
 //!
-//! What is not here: the pair passing under two workers. No layout of this build has a second
-//! worker (`Layout::workers` is one for `Inline`, the only one), so that half waits for a
-//! layout that runs a task beside its spawner (std.md, "Tasks and waiting").
+//! The pair passing under two workers of the `Threads` layout is in task/tests.rs: the
+//! simulation runs `Inline` only.
 
 use std::{alloc::Global, num::{NonZeroU32, NonZeroUsize}, time::Duration};
 

@@ -187,7 +187,7 @@ fn make(
     for warning in warned.borrow().iter() {
         shell.warn(warning);
     }
-    made
+    Ok(made?)
 }
 
 /// `blaze new WORDS`, or with `init` `blaze init WORDS`: its exit code.

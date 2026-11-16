@@ -26,7 +26,7 @@ use std::{
 };
 
 use blaze_mem::scratch;
-use crossbeam_queue::ArrayQueue;
+use blaze_queue::ArrayQueue;
 use crate::lock::Lock;
 
 use crate::wait::{Clock as _, Deadline};

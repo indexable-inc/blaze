@@ -289,7 +289,7 @@ pub mod map {
     /// nightly (`SortedMap::new_in(alloc)`).
     pub use alloc::collections::BTreeMap as SortedMap;
     pub use blaze_hash::{
-        ByHash, Equivalent, HashMap, IndexMap, KeyedMap, Operation, OrderMap, SharedByHash,
+        ByHash, Equivalent, HashMap, IndexMap, KeyedMap, OrderMap, SharedByHash,
         SharedMap, hash_map::Entry,
     };
     pub use blaze_hashcons::{Consed as Content, ContentMap, Mismatch, content_of};

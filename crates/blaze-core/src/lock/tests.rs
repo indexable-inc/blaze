@@ -106,7 +106,7 @@ struct Probed {
     began: AtomicU64,
     ended: AtomicU64,
     /// Told of each wait span opened, for a test on real threads to know a waiter waits.
-    on_begin: Option<crossbeam_channel::Sender<()>>,
+    on_begin: Option<crate::chan::Sender<()>>,
     waits: Lock<Vec<LockWait>>,
 }
 
@@ -115,7 +115,7 @@ impl Probed {
         Probed::leaked_telling(None)
     }
 
-    fn leaked_telling(on_begin: Option<crossbeam_channel::Sender<()>>) -> &'static Probed {
+    fn leaked_telling(on_begin: Option<crate::chan::Sender<()>>) -> &'static Probed {
         // alloc: a test's probe, leaked so its locks can hold it as `&'static`.
         Box::leak(Box::new(Probed {
             now_ns: AtomicU64::new(0),
@@ -846,7 +846,7 @@ fn a_healthy_run(tape: &Tape) {
 /// holder and naming where the holder took it.
 #[test]
 fn a_contended_lock_on_two_threads_records_one_wait_behind_its_holder() {
-    let (tell, told) = crossbeam_channel::bounded::<()>(1);
+    let (tell, told) = crate::chan::bounded::<()>(1);
     let probe = Probed::leaked_telling(Some(tell));
     // alloc: a test's lock, leaked so the waiter's thread can borrow it.
     let lock: &'static Lock<u64> = Box::leak(Box::new(Lock::probed("dst.threads.state", 0, probe)));

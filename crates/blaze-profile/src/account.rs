@@ -25,12 +25,13 @@
 //!
 //! Nothing here reads a clock, a file or a lock: an account is a function of rows.
 
-use std::{collections::BTreeSet, fmt::Write as _};
+use std::{alloc::Global, collections::BTreeSet, fmt::Write as _};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
-use arrow_schema::ArrowError;
-
-use crate::{batches, facts::QueryCountRow, schema};
+use crate::{
+    columns::{self, Batch, BatchError, Column},
+    facts::QueryCountRow,
+    schema,
+};
 
 /// Who writes an input of the query engine, told by the input's kind.
 ///
@@ -666,17 +667,17 @@ impl AccountRow {
 }
 
 /// The `accounts` rows of `rows`.
-pub fn accounts(rows: &[AccountRow]) -> Result<RecordBatch, ArrowError> {
-    let count = |of: fn(&AccountRow) -> u64| -> ArrayRef {
+pub fn accounts(rows: &[AccountRow]) -> Result<Batch, BatchError> {
+    let count = |of: fn(&AccountRow) -> u64| -> Column {
         // alloc: a batch's column, once a flush
-        std::sync::Arc::new(UInt64Array::from_iter_values(rows.iter().map(of)))
+        Column::values(rows.iter().map(of), Global)
     };
-    let text = |of: fn(&AccountRow) -> Option<&str>| -> ArrayRef {
+    let text = |of: fn(&AccountRow) -> Option<&str>| -> Column {
         // alloc: a batch's column, once a flush
-        std::sync::Arc::new(StringArray::from_iter(rows.iter().map(of)))
+        Column::opt_texts_of(rows.iter().map(of), Global)
     };
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
+    let columns: Vec<Column> = vec![
         count(|it| it.build_id),
         count(|it| it.written),
         count(|it| it.written_source),
@@ -716,7 +717,7 @@ pub fn accounts(rows: &[AccountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.history_dropped),
         text(|it| it.alarms.as_deref()),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::ACCOUNTS), columns)
+    columns::batch(&schema::ACCOUNTS, columns)
 }
 
 // --- The ledger: causes as a required argument ---------------------------------------------

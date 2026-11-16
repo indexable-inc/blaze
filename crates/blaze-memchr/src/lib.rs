@@ -1,18 +1,20 @@
 //! Byte search: the first (or last) of one, two or three bytes, and the first of a byte string.
 //!
-//! One search, written once over a vector of byte lanes ([`Lanes`]), and three vectors:
+//! One search, written once over a vector of byte lanes ([`Lanes`]), and its vectors:
 //!
-//! | target | vector | a lane's bits in the mask |
-//! |---|---|---|
-//! | aarch64 | NEON, 16 lanes; the mask by `shrn` (a nibble per lane) | 4 |
-//! | x86-64 | SSE2, 16 lanes; the mask by `movemask` | 1 |
-//! | every other | a `u64` word of 8 lanes (SWAR), the exact zero-byte test | 8 |
+//! | vector | lanes | a lane's bits in the mask | used |
+//! |---|---|---|---|
+//! | [`Portable`]: `core::simd`'s `Simd<u8, N>`, `simd_eq`, `to_bitmask` | 16 or 32 | 1 | the search, on every target |
+//! | [`Word`]: a `u64` (SWAR), the exact zero-byte test | 8 | 8 | the scalar twin the tests hold the vector to |
+//! | `neon::Neon`: aarch64 intrinsics, the mask by `shrn` | 16 | 4 | the reference `examples/cost.rs` measures against, until it is deleted |
 //!
-//! NEON and SSE2 are in the baseline of every aarch64 and x86-64 target, so nothing is detected
-//! at run time and each target compiles one path. A search goes four vectors a step while it
-//! can, then one, then one load that ends at the haystack's end and overlaps the bytes already
-//! searched (which held no hit, so the first hit in it is the answer); a haystack shorter than
-//! one vector is searched a byte at a time.
+//! The portable vector is the language's own (docs/v2/plan/design/std.md, "SIMD"): one source,
+//! from which the compiler makes NEON on aarch64, SSE2 on x86-64 (where `to_bitmask` is
+//! `movemask`) and scalar code on a target with no vectors. Two and three needles are the OR of
+//! the comparisons; the first hit is the mask's trailing zeros, the last its leading zeros. A
+//! search goes four vectors a step while it can, then one, then one load that ends at the
+//! haystack's end and overlaps the bytes already searched (which held no hit, so the first hit
+//! in it is the answer); a haystack shorter than one vector is searched a byte at a time.
 //!
 //! The byte string search ([`memmem`]) tests a needle's first and last bytes at every start a
 //! vector at a time and compares the bytes between only where both hold (Muła's filter).
@@ -24,11 +26,11 @@
 //! search by property.
 
 #![no_std]
-#![feature(register_tool, custom_inner_attributes)]
+#![feature(portable_simd, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::trust(
     unsafe,
-    reason = "the NEON and SSE2 intrinsics: each load reads exactly one vector from a `&[u8; 16]`, and every other intrinsic is a `#[target_feature]` function of a feature in the baseline of the only target that compiles it"
+    reason = "the NEON reference's intrinsics: each load reads exactly one vector from a `&[u8; 16]`, and every other intrinsic is a `#[target_feature]` function of NEON, in the baseline of every aarch64 target"
 )]
 
 #[cfg(test)]
@@ -37,30 +39,74 @@ extern crate std;
 #[cfg(test)]
 mod tests;
 
+use core::simd::{Mask, Simd, cmp::SimdPartialEq};
+
 use blaze_int::Int;
 
-/// A vector of byte lanes. `eq` and its `and`/`or` give a hit vector; `mask` packs it into a
-/// `u64` in which lane `i` owns bits `i * BITS .. (i + 1) * BITS`, nonzero exactly where the lane
-/// is a hit.
+/// A vector of byte lanes. `eq` gives a `Hit` (which lanes are equal), `or` and `and` combine
+/// hits, and `mask` packs one into a `u64` in which lane `i` owns bits
+/// `i * BITS .. (i + 1) * BITS`, nonzero exactly where the lane is a hit.
 trait Lanes: Copy {
+    type Hit: Copy;
     const WIDTH: usize;
     const BITS: u32;
     fn splat(byte: u8) -> Self;
     /// The first `WIDTH` bytes of `bytes`. Panics when it is shorter: every caller has checked.
     fn load(bytes: &[u8]) -> Self;
-    fn eq(self, other: Self) -> Self;
-    fn or(self, other: Self) -> Self;
-    fn and(self, other: Self) -> Self;
-    fn mask(self) -> u64;
+    fn eq(self, other: Self) -> Self::Hit;
+    fn or(a: Self::Hit, b: Self::Hit) -> Self::Hit;
+    fn and(a: Self::Hit, b: Self::Hit) -> Self::Hit;
+    fn mask(hit: Self::Hit) -> u64;
 }
 
-/// Eight lanes in a word (SWAR): the portable vector, and the one of the tests on every target.
+/// `N` byte lanes of `core::simd`: the search's vector on every target.
+#[derive(Clone, Copy)]
+struct Portable<const N: usize>(Simd<u8, N>);
+
+impl<const N: usize> Lanes for Portable<N> {
+    type Hit = Mask<i8, N>;
+    const WIDTH: usize = N;
+    const BITS: u32 = 1;
+
+    #[inline(always)]
+    fn splat(byte: u8) -> Portable<N> {
+        Portable(Simd::splat(byte))
+    }
+
+    #[inline(always)]
+    fn load(bytes: &[u8]) -> Portable<N> {
+        Portable(Simd::from_slice(bytes))
+    }
+
+    #[inline(always)]
+    fn eq(self, other: Portable<N>) -> Mask<i8, N> {
+        self.0.simd_eq(other.0)
+    }
+
+    #[inline(always)]
+    fn or(a: Mask<i8, N>, b: Mask<i8, N>) -> Mask<i8, N> {
+        a | b
+    }
+
+    #[inline(always)]
+    fn and(a: Mask<i8, N>, b: Mask<i8, N>) -> Mask<i8, N> {
+        a & b
+    }
+
+    #[inline(always)]
+    fn mask(hit: Mask<i8, N>) -> u64 {
+        hit.to_bitmask()
+    }
+}
+
+/// Eight lanes in a word (SWAR): the scalar twin the tests hold the vector to.
 #[derive(Clone, Copy)]
 struct Word(u64);
 
 const LOW_SEVEN: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 
 impl Lanes for Word {
+    type Hit = u64;
     const WIDTH: usize = 8;
     const BITS: u32 = 8;
 
@@ -79,25 +125,25 @@ impl Lanes for Word {
     /// 0x80 in each byte where the two are equal and 0 elsewhere, with no false hit: the sum
     /// `(x & 0x7f) + 0x7f` of a byte cannot carry into the next one.
     #[inline(always)]
-    fn eq(self, other: Word) -> Word {
+    fn eq(self, other: Word) -> u64 {
         let x = self.0 ^ other.0;
         let low = (x & LOW_SEVEN) + LOW_SEVEN;
-        Word(!(low | x | LOW_SEVEN))
+        !(low | x | LOW_SEVEN)
     }
 
     #[inline(always)]
-    fn or(self, other: Word) -> Word {
-        Word(self.0 | other.0)
+    fn or(a: u64, b: u64) -> u64 {
+        a | b
     }
 
     #[inline(always)]
-    fn and(self, other: Word) -> Word {
-        Word(self.0 & other.0)
+    fn and(a: u64, b: u64) -> u64 {
+        a & b
     }
 
     #[inline(always)]
-    fn mask(self) -> u64 {
-        self.0
+    fn mask(hit: u64) -> u64 {
+        hit
     }
 }
 
@@ -110,12 +156,15 @@ mod neon {
 
     use crate::Lanes;
 
+    /// The intrinsics path the portable one replaced, kept only as the reference
+    /// `examples/cost.rs` measures against (std.md, "SIMD", rule 2).
     #[derive(Clone, Copy)]
     pub(crate) struct Neon(uint8x16_t);
 
     // Every block below calls a `#[target_feature(enable = "neon")]` intrinsic, which is unsafe
     // only for the feature: NEON is in the baseline of every aarch64 target.
     impl Lanes for Neon {
+        type Hit = Neon;
         const WIDTH: usize = 16;
         const BITS: u32 = 4;
 
@@ -139,23 +188,23 @@ mod neon {
         }
 
         #[inline(always)]
-        fn or(self, other: Neon) -> Neon {
+        fn or(a: Neon, b: Neon) -> Neon {
             // SAFETY: NEON is in every aarch64 target's baseline.
-            Neon(unsafe { vorrq_u8(self.0, other.0) })
+            Neon(unsafe { vorrq_u8(a.0, b.0) })
         }
 
         #[inline(always)]
-        fn and(self, other: Neon) -> Neon {
+        fn and(a: Neon, b: Neon) -> Neon {
             // SAFETY: NEON is in every aarch64 target's baseline.
-            Neon(unsafe { vandq_u8(self.0, other.0) })
+            Neon(unsafe { vandq_u8(a.0, b.0) })
         }
 
         /// Each 16-bit pair of lanes shifted right by 4 and narrowed to a byte: lane `i` (0x00
         /// or 0xff) becomes the nibble at bits `4 * i ..`.
         #[inline(always)]
-        fn mask(self) -> u64 {
+        fn mask(hit: Neon) -> u64 {
             // SAFETY: NEON is in every aarch64 target's baseline.
-            let pairs = unsafe { vreinterpretq_u16_u8(self.0) };
+            let pairs = unsafe { vreinterpretq_u16_u8(hit.0) };
             // SAFETY: NEON is in every aarch64 target's baseline.
             let nibbles = unsafe { vshrn_n_u16::<4>(pairs) };
             // SAFETY: NEON is in every aarch64 target's baseline.
@@ -166,71 +215,37 @@ mod neon {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-mod sse2 {
-    use core::arch::x86_64::{
-        __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128,
-        _mm_set1_epi8,
-    };
+/// The search's vector: 16 lanes, one NEON or SSE2 register, until `examples/cost.rs` shows 32
+/// (two registers a step) is faster on the machines blaze is judged on.
+type Native = Portable<16>;
 
-    use crate::Lanes;
+/// Each vector's one-needle search as a function of its own, for `examples/cost.rs` (and only
+/// it): the portable vector at both widths, the word, and the NEON reference.
+#[doc(hidden)]
+pub mod paths {
+    use crate::{Portable, Word, find};
 
-    #[derive(Clone, Copy)]
-    pub(crate) struct Sse2(__m128i);
+    #[inline(never)]
+    pub fn portable_16(needle: u8, haystack: &[u8]) -> Option<usize> {
+        find::<Portable<16>, 1>([needle], haystack)
+    }
 
-    // Every block below calls a `#[target_feature(enable = "sse2")]` intrinsic, which is unsafe
-    // only for the feature: SSE2 is in the baseline of every x86-64 target.
-    impl Lanes for Sse2 {
-        const WIDTH: usize = 16;
-        const BITS: u32 = 1;
+    #[inline(never)]
+    pub fn portable_32(needle: u8, haystack: &[u8]) -> Option<usize> {
+        find::<Portable<32>, 1>([needle], haystack)
+    }
 
-        #[inline(always)]
-        fn splat(byte: u8) -> Sse2 {
-            // SAFETY: SSE2 is in every x86-64 target's baseline.
-            Sse2(unsafe { _mm_set1_epi8(byte.cast_signed()) })
-        }
+    #[inline(never)]
+    pub fn word(needle: u8, haystack: &[u8]) -> Option<usize> {
+        find::<Word, 1>([needle], haystack)
+    }
 
-        #[inline(always)]
-        fn load(bytes: &[u8]) -> Sse2 {
-            let chunk = bytes.first_chunk::<16>().expect("a load of a vector past the haystack's end");
-            // SAFETY: `chunk` is 16 readable bytes, and `_mm_loadu_si128` reads 16 with no
-            // alignment.
-            Sse2(unsafe { _mm_loadu_si128(chunk.as_ptr().cast::<__m128i>()) })
-        }
-
-        #[inline(always)]
-        fn eq(self, other: Sse2) -> Sse2 {
-            // SAFETY: SSE2 is in every x86-64 target's baseline.
-            Sse2(unsafe { _mm_cmpeq_epi8(self.0, other.0) })
-        }
-
-        #[inline(always)]
-        fn or(self, other: Sse2) -> Sse2 {
-            // SAFETY: SSE2 is in every x86-64 target's baseline.
-            Sse2(unsafe { _mm_or_si128(self.0, other.0) })
-        }
-
-        #[inline(always)]
-        fn and(self, other: Sse2) -> Sse2 {
-            // SAFETY: SSE2 is in every x86-64 target's baseline.
-            Sse2(unsafe { _mm_and_si128(self.0, other.0) })
-        }
-
-        #[inline(always)]
-        fn mask(self) -> u64 {
-            // SAFETY: SSE2 is in every x86-64 target's baseline.
-            let bits = unsafe { _mm_movemask_epi8(self.0) };
-            u64::from(bits.cast_unsigned())
-        }
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    pub fn neon(needle: u8, haystack: &[u8]) -> Option<usize> {
+        find::<crate::neon::Neon, 1>([needle], haystack)
     }
 }
-
-#[cfg(target_arch = "aarch64")]
-type Native = neon::Neon;
-#[cfg(target_arch = "x86_64")]
-type Native = sse2::Sse2;
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-type Native = Word;
 
 /// The lane of a mask's lowest hit.
 #[inline(always)]
@@ -246,12 +261,18 @@ fn last_lane<L: Lanes>(mask: u64) -> usize {
 
 /// The lanes of `vector` equal to any of `needles`.
 #[inline(always)]
-fn hits<L: Lanes, const K: usize>(vector: L, needles: &[L; K]) -> L {
+fn hits<L: Lanes, const K: usize>(vector: L, needles: &[L; K]) -> L::Hit {
     let mut hit = vector.eq(needles[0]);
     for needle in &needles[1..] {
-        hit = hit.or(vector.eq(*needle));
+        hit = L::or(hit, vector.eq(*needle));
     }
     hit
+}
+
+/// The mask of the lanes of the vector at `bytes` equal to any of `needles`.
+#[inline(always)]
+fn mask_at<L: Lanes, const K: usize>(bytes: &[u8], needles: &[L; K]) -> u64 {
+    L::mask(hits(L::load(bytes), needles))
 }
 
 /// The first byte of `haystack` that is one of `needles`.
@@ -268,9 +289,9 @@ fn find<L: Lanes, const K: usize>(needles: [u8; K], haystack: &[u8]) -> Option<u
         let b = hits(L::load(&haystack[at + width..]), &splats);
         let c = hits(L::load(&haystack[at + 2 * width..]), &splats);
         let d = hits(L::load(&haystack[at + 3 * width..]), &splats);
-        if a.or(b).or(c.or(d)).mask() != 0 {
-            for (k, vector) in [a, b, c, d].into_iter().enumerate() {
-                let mask = vector.mask();
+        if L::mask(L::or(L::or(a, b), L::or(c, d))) != 0 {
+            for (k, hit) in [a, b, c, d].into_iter().enumerate() {
+                let mask = L::mask(hit);
                 if mask != 0 {
                     return Some(at + k * width + first_lane::<L>(mask));
                 }
@@ -279,7 +300,7 @@ fn find<L: Lanes, const K: usize>(needles: [u8; K], haystack: &[u8]) -> Option<u
         at += 4 * width;
     }
     while at + width <= haystack.len() {
-        let mask = hits(L::load(&haystack[at..]), &splats).mask();
+        let mask = mask_at(&haystack[at..], &splats);
         if mask != 0 {
             return Some(at + first_lane::<L>(mask));
         }
@@ -288,7 +309,7 @@ fn find<L: Lanes, const K: usize>(needles: [u8; K], haystack: &[u8]) -> Option<u
     if at < haystack.len() {
         // The last vector, overlapping bytes already searched, which held no hit.
         let last = haystack.len() - width;
-        let mask = hits(L::load(&haystack[last..]), &splats).mask();
+        let mask = mask_at(&haystack[last..], &splats);
         if mask != 0 {
             return Some(last + first_lane::<L>(mask));
         }
@@ -307,7 +328,7 @@ fn rfind<L: Lanes, const K: usize>(needles: [u8; K], haystack: &[u8]) -> Option<
     let mut end = haystack.len();
     while end >= width {
         let start = end - width;
-        let mask = hits(L::load(&haystack[start..]), &splats).mask();
+        let mask = mask_at(&haystack[start..], &splats);
         if mask != 0 {
             return Some(start + last_lane::<L>(mask));
         }
@@ -315,7 +336,7 @@ fn rfind<L: Lanes, const K: usize>(needles: [u8; K], haystack: &[u8]) -> Option<
     }
     if end > 0 {
         // The first vector, overlapping bytes already searched, which held no hit.
-        let mask = hits(L::load(haystack), &splats).mask();
+        let mask = mask_at(haystack, &splats);
         if mask != 0 {
             return Some(last_lane::<L>(mask));
         }
@@ -345,7 +366,7 @@ fn find_bytes<L: Lanes>(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     while at + L::WIDTH <= starts {
         let firsts = L::load(&haystack[at..]).eq(first_byte);
         let lasts = L::load(&haystack[at + last..]).eq(last_byte);
-        let mut mask = firsts.and(lasts).mask();
+        let mut mask = L::mask(L::and(firsts, lasts));
         while mask != 0 {
             let bit = mask.trailing_zeros();
             let start = at + (bit / L::BITS).widen_to::<usize>();

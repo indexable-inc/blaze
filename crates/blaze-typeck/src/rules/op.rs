@@ -18,7 +18,7 @@
 //! cut does not coerce the left side to a fresh variable (rustc does, which only adds a
 //! reborrow to `&mut` left sides).
 
-use core::alloc::Allocator;
+use blaze_own::Alloc;
 
 use crate::body::{BinOp, Expr, UnOp};
 use crate::diag::{At, DiagCode};
@@ -339,7 +339,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     // A static is a place; anything else a path names is not.
                     let bp = self.body.path(p)?;
                     let segs = self.body.segment_list(bp.segments)?;
-                    let mut names: blaze_own::Vec<Name, A> = blaze_own::Vec::with_capacity_in(segs.len(), self.alloc.clone());
+                    let mut names: blaze_own::Vec<Name, Alloc<'a>> = blaze_own::Vec::with_capacity_in(segs.len(), self.alloc);
                     for s in segs {
                         names.push(s.name);
                     }

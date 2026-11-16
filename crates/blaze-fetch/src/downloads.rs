@@ -22,7 +22,7 @@ pub struct Downloads {
     origin: Instant,
     next: AtomicU64,
     // alloc: the process's one map of downloads in flight, a handful at a time.
-    open: papaya::HashMap<u64, Arc<Entry>>,
+    open: blaze_hash::SharedMap<u64, Arc<Entry>>,
     /// When any download last got a byte, in nanoseconds since `origin` plus one (0: never).
     last_byte: AtomicU64,
 }
@@ -63,7 +63,7 @@ impl Downloads {
         Downloads {
             origin: Instant::now(),
             next: AtomicU64::new(0),
-            open: papaya::HashMap::new(),
+            open: blaze_hash::SharedMap::default(),
             last_byte: AtomicU64::new(0),
         }
     }

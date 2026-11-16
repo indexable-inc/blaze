@@ -260,6 +260,31 @@ pub trait ColumnAt<const I: usize>: Columns {
 pub trait CloneColumns: Columns {
     #[doc(hidden)]
     fn clone_row(row: Self::Ref<'_>) -> Self;
+
+    /// Whether every field's clone is a bitwise copy (`TrivialClone`, `spec`), so the rows clone
+    /// by one block copy per column. Known at compile time for each tuple.
+    #[doc(hidden)]
+    fn trivial() -> bool;
+}
+
+/// Clones of `src`'s rows into `out`, which is empty with room for them: one block copy per
+/// column when every field is `TrivialClone`, else a row at a time (a panicking clone leaves
+/// `out` holding the rows made).
+fn clone_rows<C: CloneColumns, A: Allocator, B: Allocator>(src: &Soa<C, A>, out: &mut Soa<C, B>) {
+    if C::trivial() {
+        for (field, info) in C::FIELDS.iter().enumerate() {
+            // SAFETY: column `field` of `src` holds `len` values; `out`'s has room for them and
+            // is empty, in another block. Each field's clone is its bitwise copy
+            // (`TrivialClone`, which `trivial` says of every field).
+            unsafe { ptr::copy_nonoverlapping(src.cols.starts[field], out.cols.starts[field], info.size * src.len) };
+        }
+        out.len = src.len;
+    } else {
+        for row in src.iter() {
+            // The room is reserved: the push does not allocate.
+            out.push(C::clone_row(row));
+        }
+    }
 }
 
 /// Rows whose every field is `Debug`.
@@ -338,6 +363,11 @@ macro_rules! tuple_columns {
         impl<$($t: Clone),+> CloneColumns for ($($t,)+) {
             fn clone_row(row: Self::Ref<'_>) -> Self {
                 ($( row.$i.clone(), )+)
+            }
+
+            #[inline]
+            fn trivial() -> bool {
+                true $( && <$t as crate::spec::CloneSlice>::trivial() )+
             }
         }
 
@@ -824,10 +854,7 @@ impl<C: CloneColumns, A: Allocator> Soa<C, A> {
     /// panicking clone drops the rows made and frees the block.
     pub fn try_clone_in<B: Allocator>(&self, alloc: B) -> Result<Soa<C, B>, AllocFailure> {
         let mut out = Soa::try_with_capacity_in(self.len, alloc)?;
-        for row in self.iter() {
-            // The room is reserved: the push does not allocate.
-            out.push(C::clone_row(row));
-        }
+        clone_rows(self, &mut out);
         Ok(out)
     }
 
@@ -847,9 +874,7 @@ impl<C: CloneColumns, A: Allocator + Clone> Clone for Soa<C, A> {
     /// frees the block.
     fn clone(&self) -> Soa<C, A> {
         let mut out = Soa::with_capacity_in(self.len, self.alloc.clone());
-        for row in self.iter() {
-            out.push(C::clone_row(row));
-        }
+        clone_rows(self, &mut out);
         out
     }
 }
@@ -909,6 +934,9 @@ impl<'a, C: Columns + 'a> DoubleEndedIterator for Iter<'a, C> {
 }
 
 impl<'a, C: Columns + 'a> ExactSizeIterator for Iter<'a, C> {}
+
+// SAFETY: `size_hint` is `end - at`, exactly the rows left.
+unsafe impl<C: Columns> core::iter::TrustedLen for Iter<'_, C> {}
 impl<'a, C: Columns + 'a> FusedIterator for Iter<'a, C> {}
 
 /// Names a [`Soa`]: a row struct, its vector, a row of references, and a slice accessor per

@@ -1226,7 +1226,7 @@ impl<W: Work> Driver<W> {
         }
         shared.lock().idle = fibers;
         let setup = Arc::new(setup); // alloc: once per driver
-        let (sent, ready) = crossbeam_channel::bounded(n);
+        let (sent, ready) = blaze_core::chan::bounded(n);
         let mut threads = Vec::with_capacity(n);
         let mut failed = None;
         for core in 0..n as u32 {

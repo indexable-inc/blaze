@@ -53,7 +53,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 use stdx::file_lock::Locked;
 
 /// The lease's file in its directory.

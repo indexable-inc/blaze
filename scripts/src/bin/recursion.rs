@@ -48,7 +48,10 @@ Comments, strings and characters are skipped. Syntax resolves no names, so it mi
     through a path naming the type (`Tree::walk(..)`, `crate::m::f(..)`), a function pointer,
     a trait object or another impl of the trait;
   - a function a macro makes (`fn $name`);
-and over-counts a free function whose body calls a local closure or variable of its own name.
+and over-counts a free function whose body calls a local closure or variable of its own name,
+and a method that calls another impl's method of its name (`Extend<&T>::extend` calling
+`Extend<T>`'s): the comment `// recursion: calls another impl`, within 3 lines above the `fn`,
+says so and drops it.
 blaze's lint (`blaze::recursion`, from the call graph) is the definition once blaze checks its
 own crates; this is the count the gate can hold before then.
 
@@ -335,9 +338,17 @@ fn call_of(text: &str, at: usize, end: usize) -> Option<Called> {
     Some(Called::Bare)
 }
 
-/// The recursive functions of a file's text, as (line, name).
+/// The comment that says a function's call of its own name is another impl's function (an
+/// `Extend<&T>` that calls `Extend<T>`'s `extend`): syntax over-counts it, and the author says so.
+const MARK: &str = "// recursion: calls another impl";
+/// How many lines above its `fn` the mark may be (its attributes and docs between).
+const LOOK_UP: usize = 3;
+
+/// The recursive functions of a file's text, as (line, name), less those marked with [`MARK`].
 fn recursive(text: &str) -> Vec<(usize, String)> {
-    functions(text).into_iter().filter(|it| it.recursive).map(|it| (it.line, it.name)).collect()
+    let lines: Vec<&str> = text.split('\n').collect();
+    let marked = |line: usize| lines[line.saturating_sub(1 + LOOK_UP)..line.saturating_sub(1)].iter().any(|it| it.trim_start().starts_with(MARK));
+    functions(text).into_iter().filter(|it| it.recursive && !marked(it.line)).map(|it| (it.line, it.name)).collect()
 }
 
 fn named(it: &Hit<String>) -> String {
@@ -435,6 +446,12 @@ fn selftest(tests: &Tests) {
     // Planted: each cause removed, its effect goes.
     expect(!recursive(&FIXTURE.replace("self.walk(d - 1)", "other.walk(d - 1)")).iter().any(|it| it.0 == 5), "`walk` on another receiver is not seen");
     expect(recursive(&FIXTURE.replace("impl T {", "mod T {")).iter().any(|it| it.0 == 8), "`fact` outside an impl calls the free `fact`: itself");
+    let marked = recursive(&FIXTURE.replace("struct T;", MARK));
+    // The mark on line 3 covers the `fn`s on lines 4 to 6: `walk` and `build`, not `go` on 10.
+    expect(
+        !marked.iter().any(|it| it.0 == 5 || it.0 == 6) && marked.iter().any(|it| it.0 == 10),
+        &format!("the mark drops `walk` and `build`, 2 and 3 lines below it, and not `go`: {marked:?}"),
+    );
     expect(close_of("(a[b])", 0) == Some(5), "a bracket's close");
 
     // A tree: a crate of the old layer held to its row, one of the new layer held at 0.

@@ -1,8 +1,6 @@
 //! The keys of an expansion: [`call_key`] before the work, from text alone (rule 65), and
 //! [`expansion_key`], the record's, which adds the outside reads the work made.
 
-use core::alloc::Allocator;
-
 use blaze_id::{ContentId, Portable};
 use blaze_ids::Hasher;
 
@@ -23,7 +21,7 @@ unsafe impl Portable for CallKey {}
 unsafe impl Portable for ExpansionKey {}
 
 /// The key of `call` of `def`, computed before the work.
-pub fn call_key<A: Allocator, B: Allocator>(def: &MacroDefinition<A>, call: &Call<'_, B>) -> CallKey {
+pub fn call_key(def: &MacroDefinition<'_>, call: &Call<'_>) -> CallKey {
     let mut hasher = Hasher::new("blaze v2 expand call 1");
     hasher.id(&def.content().0);
     let site = def.site();
@@ -40,10 +38,10 @@ pub fn call_key<A: Allocator, B: Allocator>(def: &MacroDefinition<A>, call: &Cal
 }
 
 /// The key of the record of `call` of `def` that made `reads`.
-pub fn expansion_key<A: Allocator, B: Allocator, C: Allocator>(
-    def: &MacroDefinition<A>,
-    call: &Call<'_, B>,
-    reads: &Reads<C>,
+pub fn expansion_key(
+    def: &MacroDefinition<'_>,
+    call: &Call<'_>,
+    reads: &Reads<'_>,
 ) -> ExpansionKey {
     let mut hasher = Hasher::new("blaze v2 expand expansion 1");
     hasher.id(&call_key(def, call).0);

@@ -66,7 +66,7 @@ pub mod waits;
 #[cfg(test)]
 mod tests;
 
-pub use control::{ControlError, Start, run};
+pub use control::{ControlError, Ready, Start, ready, run};
 pub use drive::{Config, Driver, EditError, Error, Place, REACH, Records};
 pub use records::Loaded;
 pub use table::{Birth, Bound, Event, Mutator, Shared, Told};

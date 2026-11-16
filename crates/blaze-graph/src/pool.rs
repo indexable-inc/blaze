@@ -1086,7 +1086,7 @@ impl Pool {
             #[cfg(blaze_check)]
             unreachable!("the model checker's targets have threads");
         }
-        let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
+        let (ready_tx, ready_rx) = blaze_core::chan::unbounded::<io::Result<()>>();
         let mut threads = Vec::with_capacity(deques.len());
         let mut failed = None;
         for (index, deque) in deques.into_iter().enumerate() {
@@ -2954,9 +2954,9 @@ fn cannot_go_on(broken: &Broken) -> ! {
 /// worker, whose turn can't drive the pools; the panic names the channel. And as
 /// [`block_until`] does, when nothing left could send.
 pub(crate) fn recv<T>(
-    rx: &crossbeam_channel::Receiver<T>,
+    rx: &blaze_core::chan::Receiver<T>,
     name: &'static str,
-) -> Result<T, crossbeam_channel::RecvError> {
+) -> Result<T, blaze_core::chan::RecvError> {
     if THREADS {
         return rx.recv();
     }
@@ -2971,11 +2971,11 @@ pub(crate) fn recv<T>(
             got.set(Some(Ok(it)));
             true
         }
-        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-            got.set(Some(Err(crossbeam_channel::RecvError)));
+        Err(blaze_core::chan::TryRecvError::Disconnected) => {
+            got.set(Some(Err(blaze_core::chan::RecvError)));
             true
         }
-        Err(crossbeam_channel::TryRecvError::Empty) => false,
+        Err(blaze_core::chan::TryRecvError::Empty) => false,
     });
     got.into_inner()
         .unwrap_or_else(|| unreachable!("`block_until` returns once the channel `{name}` answered"))
@@ -3120,7 +3120,7 @@ mod tests {
 
     use blaze_alloc_count::measure;
     use blaze_ids::rng::SplitMix64 as Rng;
-    use crossbeam_channel::{bounded, unbounded};
+    use blaze_core::chan::{bounded, unbounded};
     use blaze_core::lock::Lock;
 
     use super::{
@@ -3209,7 +3209,7 @@ mod tests {
             pool: &Pool,
             fill: u64,
             drops: &Arc<AtomicUsize>,
-            tx: crossbeam_channel::Sender<(usize, u64)>,
+            tx: blaze_core::chan::Sender<(usize, u64)>,
             job: usize,
         ) -> u64 {
             let in_place = closure::<N>(fill, Dropped(Arc::clone(drops)));
@@ -3288,7 +3288,7 @@ mod tests {
     fn a_warm_submit_from_outside_allocates_nothing() {
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let (tx, rx) = bounded::<usize>(64);
-        let round = |senders: Vec<crossbeam_channel::Sender<usize>>| {
+        let round = |senders: Vec<blaze_core::chan::Sender<usize>>| {
             for (job, tx) in senders.into_iter().enumerate() {
                 pool.submit(None, move || job, move |it| _ = tx.send(it.unwrap()));
             }
@@ -5001,7 +5001,7 @@ mod broken {
         time::Duration,
     };
 
-    use crossbeam_channel::bounded;
+    use blaze_core::chan::bounded;
 
     use super::{Pool, Unable, park_plant};
     use crate::topology::{Cpu, Topology};

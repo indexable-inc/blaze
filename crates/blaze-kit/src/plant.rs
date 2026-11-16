@@ -26,10 +26,13 @@ pub(crate) enum Plant {
     ChunkWritesShared,
     /// `Heap4`'s sift-down compares only the first three children.
     HeapSkipsFourthChild,
-    /// `TimerWheel` cascades an entry one slot late.
+    /// `TimerWheel` moves its time to the poll's `now` instead of the slot's start when it
+    /// cascades, so a slot between the two is skipped.
     WheelCascadesLate,
-    /// The RLE/bit-packed hybrid's encoder writes a run one value short.
-    HybridRunShort,
+    /// The LEB128 writer drops the last byte of a value of ten.
+    LebDropsLastByte,
+    /// `Dict` gives a new value the code of the one before it.
+    DictReusesCode,
     /// `StaticSearch`'s descent takes the child one to the left.
     SearchChildLeft,
 }

@@ -11,13 +11,12 @@
 //! first of two declarations of one name is kept, a `use`'s index names it). The string table
 //! and the path columns are laid out in the record's own order as it is written.
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Record, Slice, Writer};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::column::{
     Column, NONE, RecordBytes, Strings, Text, at_of, at_of_record, check_text, finish_with,
@@ -119,24 +118,24 @@ unsafe impl<N: Portable> Portable for ModuleInfo<N> {}
 /// [`DeclsBuilder::write`] writes it as a [`ModuleDecls`] record and [`DeclsBuilder::from`]
 /// reads it back, equal.
 #[derive(Clone, Debug)]
-pub struct DeclsBuilder<N, A: Allocator> {
-    pub items: Vec<DeclaredItem<N, Path<N, A>>, A>,
-    pub mods: Vec<ChildModDecl<N, Path<N, A>>, A>,
-    pub uses: Vec<UseDecl<N, Path<N, A>>, A>,
-    pub extern_crates: Vec<ExternCrateDecl<N, Path<N, A>>, A>,
-    pub macro_rules: Vec<MacroRulesDecl<N>, A>,
-    pub calls: Vec<MacroCallDecl<Path<N, A>>, A>,
+pub struct DeclsBuilder<'a, N> {
+    pub items: AVec<'a, DeclaredItem<N, Path<'a, N>>>,
+    pub mods: AVec<'a, ChildModDecl<N, Path<'a, N>>>,
+    pub uses: AVec<'a, UseDecl<N, Path<'a, N>>>,
+    pub extern_crates: AVec<'a, ExternCrateDecl<N, Path<'a, N>>>,
+    pub macro_rules: AVec<'a, MacroRulesDecl<N>>,
+    pub calls: AVec<'a, MacroCallDecl<Path<'a, N>>>,
 }
 
 /// What a macro call's expansion adds to its module: the same shape as the module's own text.
-pub type ExpandedDecls<N, A> = DeclsBuilder<N, A>;
+pub type ExpandedDecls<'a, N> = DeclsBuilder<'a, N>;
 
-impl<N: PartialEq, A: Allocator, B: Allocator> PartialEq<DeclsBuilder<N, B>> for DeclsBuilder<N, A> {
-    fn eq(&self, other: &DeclsBuilder<N, B>) -> bool {
-        fn same<T, U, A: Allocator, B: Allocator>(a: &Vec<T, A>, b: &Vec<U, B>, eq: impl Fn(&T, &U) -> bool) -> bool {
+impl<'b, N: PartialEq> PartialEq<DeclsBuilder<'b, N>> for DeclsBuilder<'_, N> {
+    fn eq(&self, other: &DeclsBuilder<'b, N>) -> bool {
+        fn same<T, U>(a: &[T], b: &[U], eq: impl Fn(&T, &U) -> bool) -> bool {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| eq(x, y))
         }
-        fn vis<N: PartialEq, A: Allocator, B: Allocator>(a: &WrittenVis<Path<N, A>>, b: &WrittenVis<Path<N, B>>) -> bool {
+        fn vis<N: PartialEq>(a: &WrittenVis<Path<'_, N>>, b: &WrittenVis<Path<'_, N>>) -> bool {
             match (a.as_ref().split(), b.as_ref().split()) {
                 ((x, Some(p)), (y, Some(q))) => x == y && p == q,
                 ((x, None), (y, None)) => x == y,
@@ -158,16 +157,16 @@ impl<N: PartialEq, A: Allocator, B: Allocator> PartialEq<DeclsBuilder<N, B>> for
     }
 }
 
-impl<N, A: Allocator + Clone> DeclsBuilder<N, A> {
+impl<'a, N> DeclsBuilder<'a, N> {
     /// Nothing declared.
-    pub fn new_in(alloc: A) -> DeclsBuilder<N, A> {
+    pub fn new_in(alloc: Alloc<'a>) -> DeclsBuilder<'a, N> {
         DeclsBuilder {
-            items: Vec::new_in(alloc.clone()),
-            mods: Vec::new_in(alloc.clone()),
-            uses: Vec::new_in(alloc.clone()),
-            extern_crates: Vec::new_in(alloc.clone()),
-            macro_rules: Vec::new_in(alloc.clone()),
-            calls: Vec::new_in(alloc),
+            items: AVec::new_in(alloc),
+            mods: AVec::new_in(alloc),
+            uses: AVec::new_in(alloc),
+            extern_crates: AVec::new_in(alloc),
+            macro_rules: AVec::new_in(alloc),
+            calls: AVec::new_in(alloc),
         }
     }
 }
@@ -294,10 +293,10 @@ const TABLE: &str = "ModuleDecls";
 pub(crate) const NO_TEXT: Text = Text { at: 0, len: 0 };
 
 /// A written visibility as a row holds it: its byte and its path's row, [`NONE`] for none.
-pub(crate) fn vis_row<N: AsRef<str>, B: Allocator, C: Allocator + Clone, D: Allocator>(
-    vis: &WrittenVis<Path<N, B>>,
-    paths: &mut PathTable<C>,
-    strings: &mut Strings<D>,
+pub(crate) fn vis_row<N: AsRef<str>>(
+    vis: &WrittenVis<Path<'_, N>>,
+    paths: &mut PathTable<'_>,
+    strings: &mut Strings<'_>,
     table: &'static str,
 ) -> Result<(WrittenVisTag, u32), BuildError> {
     let (tag, path) = vis.as_ref().split();
@@ -333,39 +332,39 @@ pub(crate) fn vis_of<'a>(paths: &Paths<'a>, tag: WrittenVisTag, index: u32) -> W
     WrittenVis::join(tag, || paths.get(index))
 }
 
-fn text_or_none<N: AsRef<str>, D: Allocator>(name: Option<&N>, strings: &mut Strings<D>) -> Result<Text, BuildError> {
+fn text_or_none<N: AsRef<str>>(name: Option<&N>, strings: &mut Strings<'_>) -> Result<Text, BuildError> {
     match name {
         Some(name) => strings.push(name.as_ref(), TABLE),
         None => Ok(NO_TEXT),
     }
 }
 
-impl<N: AsRef<str>, A: Allocator> DeclsBuilder<N, A> {
+impl<N: AsRef<str>> DeclsBuilder<'_, N> {
     /// The [`ModuleDecls`] record of `module`, whose place is `info`, in `alloc`.
-    pub fn write<B: Allocator + Clone>(
+    pub fn write<'b>(
         &self,
         module: ItemKey,
         info: &ModuleInfo<N>,
-        alloc: B,
-    ) -> Result<RecordBytes<B>, BuildError> {
-        let mut strings = Strings::new_in(alloc.clone());
-        let mut paths = PathTable::new_in(alloc.clone());
+        alloc: Alloc<'b>,
+    ) -> Result<RecordBytes<'b>, BuildError> {
+        let mut strings = Strings::new_in(alloc);
+        let mut paths = PathTable::new_in(alloc);
         let name = text_or_none(info.name.as_ref(), &mut strings)?;
 
-        let mut items = Vec::with_capacity_in(self.items.len(), alloc.clone());
+        let mut items = Vec::with_capacity_in(self.items.len(), alloc);
         for it in self.items.iter() {
             let name = strings.push(it.name.as_ref(), TABLE)?;
             let (vis, vis_path) = vis_row(&it.vis, &mut paths, &mut strings, TABLE)?;
             let (kind, shape) = it.def.kind.to_record();
             items.push(ItemRow { name, vis_path, key: it.def.key.0, ns: it.ns, kind, shape, vis });
         }
-        let mut mods = Vec::with_capacity_in(self.mods.len(), alloc.clone());
+        let mut mods = Vec::with_capacity_in(self.mods.len(), alloc);
         for m in self.mods.iter() {
             let name = strings.push(m.name.as_ref(), TABLE)?;
             let (vis, vis_path) = vis_row(&m.vis, &mut paths, &mut strings, TABLE)?;
             mods.push(ModRow { name, vis_path, pos: m.pos, module: m.module.0, vis, macro_use: m.macro_use, pad: 0 });
         }
-        let mut uses = Vec::with_capacity_in(self.uses.len(), alloc.clone());
+        let mut uses = Vec::with_capacity_in(self.uses.len(), alloc);
         for u in self.uses.iter() {
             let path = paths.push(&u.path, &mut strings, TABLE)?;
             let (form, rename_tag, rename, types_only) = match u.leaf {
@@ -378,7 +377,7 @@ impl<N: AsRef<str>, A: Allocator> DeclsBuilder<N, A> {
             let (vis, vis_path) = vis_row(&u.vis, &mut paths, &mut strings, TABLE)?;
             uses.push(UseRow { rename, path, vis_path, pos: u.pos, form, rename_tag, types_only, vis });
         }
-        let mut externs = Vec::with_capacity_in(self.extern_crates.len(), alloc.clone());
+        let mut externs = Vec::with_capacity_in(self.extern_crates.len(), alloc);
         for ec in self.extern_crates.iter() {
             let (target_tag, target) = match &ec.target {
                 ExternTarget::Dep(name) => (ExternTargetTag::Dep, strings.push(name.as_ref(), TABLE)?),
@@ -389,12 +388,12 @@ impl<N: AsRef<str>, A: Allocator> DeclsBuilder<N, A> {
             let (vis, vis_path) = vis_row(&ec.vis, &mut paths, &mut strings, TABLE)?;
             externs.push(ExternCrateRow { target, rename, vis_path, target_tag, rename_tag, vis, pad: 0 });
         }
-        let mut rules = Vec::with_capacity_in(self.macro_rules.len(), alloc.clone());
+        let mut rules = Vec::with_capacity_in(self.macro_rules.len(), alloc);
         for mr in self.macro_rules.iter() {
             let name = strings.push(mr.name.as_ref(), TABLE)?;
             rules.push(RulesRow { name, pos: mr.pos, def: mr.def.0, export: mr.export, pad: 0, pad2: 0 });
         }
-        let mut calls = Vec::with_capacity_in(self.calls.len(), alloc.clone());
+        let mut calls = Vec::with_capacity_in(self.calls.len(), alloc);
         for c in self.calls.iter() {
             let path = paths.push(&c.path, &mut strings, TABLE)?;
             let item = match c.item {
@@ -436,12 +435,12 @@ impl<N: AsRef<str>, A: Allocator> DeclsBuilder<N, A> {
     }
 }
 
-impl<'a, A: Allocator + Clone> DeclsBuilder<&'a str, A> {
+impl<'a, 'b> DeclsBuilder<'b, &'a str> {
     /// The working form of a [`ModuleDecls`] record, its names borrowed from the record, in
     /// `alloc`: equal to the builder that wrote it.
-    pub fn from(view: &ModuleDeclsView<'a>, alloc: A) -> DeclsBuilder<&'a str, A> {
-        let path = |p: PathView<'a>| p.to_path_in(alloc.clone());
-        let mut out = DeclsBuilder::new_in(alloc.clone());
+    pub fn from(view: &ModuleDeclsView<'a>, alloc: Alloc<'b>) -> DeclsBuilder<'b, &'a str> {
+        let path = |p: PathView<'a>| p.to_path_in(alloc);
+        let mut out = DeclsBuilder::new_in(alloc);
         out.items.extend(view.items().map(|it| DeclaredItem { name: it.name, ns: it.ns, def: it.def, vis: it.vis.map(path) }));
         out.mods.extend(view.mods().map(|m| ChildModDecl {
             name: m.name,

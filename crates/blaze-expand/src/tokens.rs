@@ -7,9 +7,7 @@
 //! context is pushed once (an equal one is found and reused), so a stream is canonical by
 //! construction.
 
-use core::alloc::Allocator;
-
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use span::{EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, SpanAnchor, SyntaxContext};
@@ -202,8 +200,8 @@ impl Text {
 }
 
 /// Appends `text` to `table`, giving its range.
-pub(crate) fn push_text<A: Allocator>(
-    table: &mut Vec<u8, A>,
+pub(crate) fn push_text(
+    table: &mut AVec<'_, u8>,
     text: &str,
     which: Table,
 ) -> Result<Text, StreamError> {
@@ -389,32 +387,32 @@ impl Sink for blaze_ids::Hasher {
     }
 }
 
-impl<B: Allocator> Sink for Vec<u8, B> {
+impl Sink for AVec<'_, u8> {
     fn put(&mut self, bytes: &[u8]) {
         self.extend_from_slice(bytes);
     }
 }
 
-/// A flat token stream: tokens, their text and their contexts, in `A`.
+/// A flat token stream: tokens, their text and their contexts, in the allocator it was made in.
 #[derive(Clone, Debug)]
-pub struct TokenStream<A: Allocator> {
-    tokens: Vec<Token, A>,
-    text: Vec<u8, A>,
-    contexts: Vec<CtxNode, A>,
+pub struct TokenStream<'a> {
+    tokens: AVec<'a, Token>,
+    text: AVec<'a, u8>,
+    contexts: AVec<'a, CtxNode>,
 }
 
-impl<A: Allocator, B: Allocator> PartialEq<TokenStream<B>> for TokenStream<A> {
+impl<'b> PartialEq<TokenStream<'b>> for TokenStream<'_> {
     /// Equal tokens, text and contexts, wherever each stream is allocated.
-    fn eq(&self, other: &TokenStream<B>) -> bool {
+    fn eq(&self, other: &TokenStream<'b>) -> bool {
         self.tokens[..] == other.tokens[..]
             && self.text[..] == other.text[..]
             && self.contexts[..] == other.contexts[..]
     }
 }
 
-impl<A: Allocator> Eq for TokenStream<A> {}
+impl Eq for TokenStream<'_> {}
 
-impl<A: Allocator> TokenStream<A> {
+impl<'a> TokenStream<'a> {
     pub fn tokens(&self) -> &[Token] {
         &self.tokens
     }
@@ -488,7 +486,7 @@ impl<A: Allocator> TokenStream<A> {
 
     /// The first token at which the delimiters do not pair up, if any.
     pub(crate) fn unbalanced(&self) -> Option<u32> {
-        let mut open = Vec::new_in(self.tokens.allocator());
+        let mut open = Vec::new_in(self.allocator());
         for (at, token) in self.tokens.iter().enumerate() {
             match token.kind {
                 TokenKind::Open(delim) => open.push(delim),
@@ -525,17 +523,18 @@ impl<A: Allocator> TokenStream<A> {
     }
 }
 
-impl<A: Allocator + Clone> TokenStream<A> {
-    pub fn new_in(alloc: A) -> TokenStream<A> {
+impl<'a> TokenStream<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> TokenStream<'a> {
         TokenStream {
-            tokens: Vec::new_in(alloc.clone()),
-            text: Vec::new_in(alloc.clone()),
+            tokens: Vec::new_in(alloc),
+            text: Vec::new_in(alloc),
             contexts: Vec::new_in(alloc),
         }
     }
 
-    pub fn allocator(&self) -> &A {
-        self.tokens.allocator()
+    /// The allocator the stream's tables are in.
+    pub fn allocator(&self) -> Alloc<'a> {
+        *self.tokens.allocator()
     }
 
     /// Appends a token of `kind`, `text` and `ctx`, a context of this stream.
@@ -604,9 +603,9 @@ impl<A: Allocator + Clone> TokenStream<A> {
     }
 
     /// `ctx`, a context of `from`, as a context of this stream: its chain of marks pushed here.
-    pub fn import_ctx<B: Allocator>(
+    pub fn import_ctx(
         &mut self,
-        from: &TokenStream<B>,
+        from: &TokenStream<'_>,
         ctx: Ctx,
     ) -> Result<Ctx, StreamError> {
         let Some(at) = ctx.node() else { return Ok(ctx) };
@@ -617,9 +616,9 @@ impl<A: Allocator + Clone> TokenStream<A> {
     }
 
     /// Appends the token at `at` of `from`, its context imported.
-    pub fn push_from<B: Allocator>(
+    pub fn push_from(
         &mut self,
-        from: &TokenStream<B>,
+        from: &TokenStream<'_>,
         at: usize,
     ) -> Result<(), StreamError> {
         let token = from.tokens[at];
@@ -628,11 +627,11 @@ impl<A: Allocator + Clone> TokenStream<A> {
     }
 
     /// The tokens `range` of this stream, as a stream of their own in `alloc`.
-    pub fn copy_in<B: Allocator + Clone>(
+    pub fn copy_in<'b>(
         &self,
         range: core::ops::Range<usize>,
-        alloc: B,
-    ) -> Result<TokenStream<B>, StreamError> {
+        alloc: Alloc<'b>,
+    ) -> Result<TokenStream<'b>, StreamError> {
         let mut out = TokenStream::new_in(alloc);
         for at in range {
             out.push_from(self, at)?;
@@ -672,11 +671,11 @@ pub(crate) fn index(at: usize) -> u32 {
 
 /// The tokens of `text` read in `edition`, each of the root context of that edition: comments
 /// and spaces gone (a doc comment is its `#[doc = ".."]`), spacing kept.
-pub fn lex<A: Allocator + Clone>(
+pub fn lex<'a>(
     text: &str,
     edition: Edition,
-    alloc: A,
-) -> Result<TokenStream<A>, LexError> {
+    alloc: Alloc<'a>,
+) -> Result<TokenStream<'a>, LexError> {
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), span_edition(edition)),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -707,8 +706,8 @@ pub fn lex<A: Allocator + Clone>(
 /// token if that one starts there.
 type Pending = Option<(usize, tt::TextSize)>;
 
-fn lex_walk<A: Allocator + Clone>(
-    out: &mut TokenStream<A>,
+fn lex_walk(
+    out: &mut TokenStream<'_>,
     iter: tt::TtIter<'_>,
     ctx: Ctx,
     last: &mut Pending,
@@ -753,8 +752,8 @@ fn lex_walk<A: Allocator + Clone>(
 }
 
 /// Marks the pending identifier or literal joint when the next token starts where it ends.
-fn joined_to<A: Allocator + Clone>(
-    out: &mut TokenStream<A>,
+fn joined_to(
+    out: &mut TokenStream<'_>,
     last: &mut Pending,
     next: tt::TextSize,
 ) {
@@ -790,7 +789,7 @@ unsafe impl Portable for CtxNode {}
 unsafe impl Portable for Token {}
 // SAFETY: its three tables hold `Token`, UTF-8 bytes and `CtxNode`, each `Portable`; the
 // allocator is where the bytes are, not what they mean.
-unsafe impl<A: Allocator> Portable for TokenStream<A> {}
+unsafe impl Portable for TokenStream<'_> {}
 
 /// The bound checks behind the `unsafe impl`s of this module: never called, compiled.
 #[expect(dead_code, reason = "compiled for its bounds, never called")]

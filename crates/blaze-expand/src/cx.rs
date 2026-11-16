@@ -2,10 +2,9 @@
 //! each answer recorded in the expansion as a [`crate::Read`] so the record is valid exactly
 //! while those answers stand.
 
-use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::{
     def::{MacroDefinition, ProcKind},
@@ -19,7 +18,7 @@ pub trait ExpandCx {
     fn env(&self, name: &str) -> Result<Option<&str>, HostError>;
 
     /// The outcome of the cfg `predicate` for the crate the call is in.
-    fn cfg<A: Allocator>(&self, predicate: &TokenStream<A>) -> Result<bool, HostError>;
+    fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError>;
 
     /// The file `path` names, as written in the call, from the file of the call.
     fn include(&self, path: &str, how: IncludeAs) -> Result<Included<'_>, HostError>;
@@ -31,12 +30,12 @@ pub trait ExpandCx {
     /// origins, one per token: an index of the input or attribute arguments it passed on, or
     /// made at `Span::call_site` ([`crate::Transparency::Transparent`]), `mixed_site`
     /// (`SemiOpaque`) or `def_site` (`Opaque`).
-    fn run_proc_macro<A: Allocator + Clone>(
+    fn run_proc_macro<'a>(
         &self,
-        def: &MacroDefinition<A>,
-        call: ProcCall<'_, A>,
-        alloc: A,
-    ) -> Result<Produced<A>, HostError>;
+        def: &MacroDefinition<'_>,
+        call: ProcCall<'_>,
+        alloc: Alloc<'a>,
+    ) -> Result<Produced<'a>, HostError>;
 }
 
 /// How an included file is read.
@@ -75,20 +74,20 @@ pub enum Place<'a> {
 }
 
 /// A proc macro's call.
-pub struct ProcCall<'a, A: Allocator> {
+pub struct ProcCall<'a> {
     pub kind: ProcKind,
     /// The fn-like call's arguments, or the item.
-    pub input: &'a TokenStream<A>,
+    pub input: &'a TokenStream<'a>,
     /// An attribute's arguments.
-    pub attr_args: Option<&'a TokenStream<A>>,
+    pub attr_args: Option<&'a TokenStream<'a>>,
 }
 
 /// What a proc macro gave back: its tokens, each one's origin, and the outside reads its run
 /// made (env vars, files), recorded by the sandbox.
-pub struct Produced<A: Allocator> {
-    pub tokens: TokenStream<A>,
-    pub origins: Vec<TokenOrigin, A>,
-    pub reads: Reads<A>,
+pub struct Produced<'a> {
+    pub tokens: TokenStream<'a>,
+    pub origins: AVec<'a, TokenOrigin>,
+    pub reads: Reads<'a>,
 }
 
 /// Which outside question failed.

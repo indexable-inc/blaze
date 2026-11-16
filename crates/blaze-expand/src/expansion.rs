@@ -1,9 +1,8 @@
 //! What one macro call makes: [`Expansion`], a portable value written as one record.
 
-use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use blaze_id::{ContentId, Portable};
 
@@ -183,14 +182,14 @@ pub struct Read {
 
 /// An expansion's reads, in the order they were made, with the text of their subjects.
 #[derive(Clone, Debug)]
-pub struct Reads<A: Allocator> {
-    list: Vec<Read, A>,
-    text: Vec<u8, A>,
+pub struct Reads<'a> {
+    list: AVec<'a, Read>,
+    text: AVec<'a, u8>,
 }
 
-impl<A: Allocator + Clone> Reads<A> {
-    pub fn new_in(alloc: A) -> Reads<A> {
-        Reads { list: Vec::new_in(alloc.clone()), text: Vec::new_in(alloc) }
+impl<'a> Reads<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> Reads<'a> {
+        Reads { list: Vec::new_in(alloc), text: Vec::new_in(alloc) }
     }
 
     pub fn push(
@@ -207,15 +206,13 @@ impl<A: Allocator + Clone> Reads<A> {
     }
 
     /// Appends `other`'s reads.
-    pub fn extend<B: Allocator>(&mut self, other: &Reads<B>) -> Result<(), StreamError> {
+    pub fn extend(&mut self, other: &Reads<'_>) -> Result<(), StreamError> {
         for read in other.list() {
             self.push(read.kind, other.subject(read), read.answer)?;
         }
         Ok(())
     }
-}
 
-impl<A: Allocator> Reads<A> {
     pub fn list(&self) -> &[Read] {
         &self.list
     }
@@ -259,8 +256,8 @@ impl<A: Allocator> Reads<A> {
     }
 }
 
-impl<A: Allocator, B: Allocator> PartialEq<Reads<B>> for Reads<A> {
-    fn eq(&self, other: &Reads<B>) -> bool {
+impl<'b> PartialEq<Reads<'b>> for Reads<'_> {
+    fn eq(&self, other: &Reads<'b>) -> bool {
         self.list[..] == other.list[..] && self.text[..] == other.text[..]
     }
 }
@@ -317,32 +314,32 @@ pub enum Diagnostic {
 
 /// One macro call's expansion.
 #[derive(Clone, Debug)]
-pub struct Expansion<A: Allocator> {
+pub struct Expansion<'a> {
     /// The tokens, position-independent.
-    pub tokens: TokenStream<A>,
+    pub tokens: TokenStream<'a>,
     /// Each token's origin, a column parallel to `tokens`.
-    pub origins: Vec<TokenOrigin, A>,
+    pub origins: AVec<'a, TokenOrigin>,
     /// The macro calls in `tokens`, not expanded.
-    pub nested: Vec<NestedCall, A>,
+    pub nested: AVec<'a, NestedCall>,
     /// The placeholders the reader fills.
-    pub holes: Vec<Hole, A>,
-    pub reads: Reads<A>,
-    pub diagnostics: Vec<Diagnostic, A>,
+    pub holes: AVec<'a, Hole>,
+    pub reads: Reads<'a>,
+    pub diagnostics: AVec<'a, Diagnostic>,
     /// The text the diagnostics' [`Text`]s are ranges of.
-    pub notes: Vec<u8, A>,
+    pub notes: AVec<'a, u8>,
     /// The rule that matched, for a declarative macro.
     pub arm: Option<u32>,
 }
 
-impl<A: Allocator + Clone> Expansion<A> {
-    pub(crate) fn new_in(alloc: A) -> Expansion<A> {
+impl<'a> Expansion<'a> {
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> Expansion<'a> {
         Expansion {
-            tokens: TokenStream::new_in(alloc.clone()),
-            origins: Vec::new_in(alloc.clone()),
-            nested: Vec::new_in(alloc.clone()),
-            holes: Vec::new_in(alloc.clone()),
-            reads: Reads::new_in(alloc.clone()),
-            diagnostics: Vec::new_in(alloc.clone()),
+            tokens: TokenStream::new_in(alloc),
+            origins: Vec::new_in(alloc),
+            nested: Vec::new_in(alloc),
+            holes: Vec::new_in(alloc),
+            reads: Reads::new_in(alloc),
+            diagnostics: Vec::new_in(alloc),
             notes: Vec::new_in(alloc),
             arm: None,
         }
@@ -354,8 +351,8 @@ impl<A: Allocator + Clone> Expansion<A> {
 
     /// A note of what `value` displays, written in place.
     pub(crate) fn note_display(&mut self, value: &impl fmt::Display) -> Result<Text, StreamError> {
-        struct To<'v, B: Allocator>(&'v mut Vec<u8, B>);
-        impl<B: Allocator> fmt::Write for To<'_, B> {
+        struct To<'v, 'a>(&'v mut AVec<'a, u8>);
+        impl fmt::Write for To<'_, '_> {
             fn write_str(&mut self, text: &str) -> fmt::Result {
                 self.0.extend_from_slice(text.as_bytes());
                 Ok(())
@@ -371,9 +368,7 @@ impl<A: Allocator + Clone> Expansion<A> {
         at.checked_add(len).ok_or(too_large)?;
         Ok(Text { at, len })
     }
-}
 
-impl<A: Allocator> Expansion<A> {
     /// A note's text.
     pub fn note_text(&self, text: Text) -> &str {
         text.of(&self.notes)
@@ -491,8 +486,8 @@ impl<A: Allocator> Expansion<A> {
     }
 }
 
-impl<A: Allocator, B: Allocator> PartialEq<Expansion<B>> for Expansion<A> {
-    fn eq(&self, other: &Expansion<B>) -> bool {
+impl<'b> PartialEq<Expansion<'b>> for Expansion<'_> {
+    fn eq(&self, other: &Expansion<'b>) -> bool {
         self.tokens == other.tokens
             && self.origins[..] == other.origins[..]
             && self.nested[..] == other.nested[..]
@@ -506,12 +501,12 @@ impl<A: Allocator, B: Allocator> PartialEq<Expansion<B>> for Expansion<A> {
 
 /// What [`crate::expand`] gives.
 #[derive(Debug)]
-pub enum Expanded<A: Allocator> {
-    Expansion(Expansion<A>),
+pub enum Expanded<'a> {
+    Expansion(Expansion<'a>),
     /// An eager macro whose input has macro calls: expand each (as [`crate::Inside::EagerInput`]),
     /// seal each answer, and call again with them in [`crate::Eager::answers`], in this order.
     /// The ranges are of the call's input.
-    NeedsExpanded(Vec<NestedCall, A>),
+    NeedsExpanded(AVec<'a, NestedCall>),
 }
 
 // SAFETY: indices of the expansion's own streams and a closed enum.
@@ -533,11 +528,11 @@ unsafe impl Portable for ReadAnswer {}
 // SAFETY: every field is `Portable`.
 unsafe impl Portable for Read {}
 // SAFETY: a list of `Read`s and UTF-8 bytes.
-unsafe impl<A: Allocator> Portable for Reads<A> {}
+unsafe impl Portable for Reads<'_> {}
 // SAFETY: a closed enum.
 unsafe impl Portable for IncludeFailure {}
 // SAFETY: counts, ranges of the expansion's notes and `TokenOrigin`s.
 unsafe impl Portable for Diagnostic {}
 // SAFETY: every field is `Portable`: a token stream, columns of the types above, UTF-8
 // bytes and an index. No span, interned symbol or arena pointer is in it.
-unsafe impl<A: Allocator> Portable for Expansion<A> {}
+unsafe impl Portable for Expansion<'_> {}

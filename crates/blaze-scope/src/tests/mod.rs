@@ -3,7 +3,6 @@
 //! module on its stack, groups on a cycle, and, given a tape, answers shuffled and given in
 //! partial batches), the rule tests, and the properties.
 
-use std::alloc::Global;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -12,7 +11,7 @@ use std::vec::Vec;
 use std::{format, vec};
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::Vec as OwnVec;
+use blaze_own::{Alloc, Vec as OwnVec};
 use blaze_sim::Tape;
 use blaze_surface::SurfaceError;
 
@@ -34,7 +33,7 @@ mod rules;
 pub(crate) type N = &'static str;
 
 /// A scope error as the machine makes it in the tests.
-pub(crate) type Error = ScopeError<N, Path<N, Global>>;
+pub(crate) type Error = ScopeError<N, Path<'static, N>>;
 
 /// A visibility as a test writes it.
 #[derive(Clone, Copy, Debug)]
@@ -47,7 +46,7 @@ pub(crate) enum V {
 }
 
 impl V {
-    fn decl(self) -> WrittenVis<Path<N, Global>> {
+    fn decl(self) -> WrittenVis<Path<'static, N>> {
         match self {
             V::Priv => WrittenVis::Private,
             V::Pub => WrittenVis::Pub,
@@ -59,12 +58,12 @@ impl V {
 }
 
 /// `a::b`, `crate::a`, `self::a`, `super::super::a`, `::a`, as a path.
-pub(crate) fn path(text: &'static str) -> Path<N, Global> {
+pub(crate) fn path(text: &'static str) -> Path<'static, N> {
     let (abs, rest) = match text.strip_prefix("::") {
         Some(rest) => (true, rest),
         None => (false, text),
     };
-    let mut segments = OwnVec::from_iter_in(rest.split("::").filter(|s| !s.is_empty()), Global);
+    let mut segments = OwnVec::from_iter_in(rest.split("::").filter(|s| !s.is_empty()), Alloc::global());
     if abs {
         return Path { kind: PathKind::Abs, segments };
     }
@@ -91,8 +90,8 @@ pub(crate) fn path(text: &'static str) -> Path<N, Global> {
 pub(crate) struct World {
     pub(crate) modules: BTreeMap<ItemKey, ModuleInfo<N>>,
     /// The module text of each module, and the expansion of each call.
-    pub(crate) decls: BTreeMap<ItemKey, DeclsBuilder<N, Global>>,
-    pub(crate) roots: BTreeMap<CrateItemKey, CrateRootBuilder<N, Global>>,
+    pub(crate) decls: BTreeMap<ItemKey, DeclsBuilder<'static, N>>,
+    pub(crate) roots: BTreeMap<CrateItemKey, CrateRootBuilder<'static, N>>,
     /// Each call's module.
     pub(crate) owner: BTreeMap<ItemKey, ItemKey>,
     pub(crate) pos: BTreeMap<ItemKey, u32>,
@@ -138,7 +137,7 @@ impl World {
         at.crate_prefix()[0]
     }
 
-    fn d(&mut self, at: ItemKey) -> &mut DeclsBuilder<N, Global> {
+    fn d(&mut self, at: ItemKey) -> &mut DeclsBuilder<'static, N> {
         self.decls.get_mut(&at).expect("a test writes into a module or a call it made")
     }
 
@@ -153,7 +152,7 @@ impl World {
         let root = self.key(k);
         let krate = crate_key(k);
         self.modules.insert(root, ModuleInfo { krate, parent: None, name: None, no_implicit_prelude: false });
-        self.decls.insert(root, DeclsBuilder::new_in(Global));
+        self.decls.insert(root, DeclsBuilder::new_in(Alloc::global()));
         let head = CrateRootHead {
             krate,
             root_module: root,
@@ -163,14 +162,14 @@ impl World {
             no_core: false,
             prelude: None,
         };
-        let mut cr = CrateRootBuilder::new_in(head, Global);
+        let mut cr = CrateRootBuilder::new_in(head, Alloc::global());
         cr.builtin_attrs.extend_from_slice(&["derive", "inline", "test"]);
         self.roots.insert(krate, cr);
         root
     }
 
     /// The crate-root record of the crate `root` is the root of.
-    pub(crate) fn cr(&mut self, root: ItemKey) -> &mut CrateRootBuilder<N, Global> {
+    pub(crate) fn cr(&mut self, root: ItemKey) -> &mut CrateRootBuilder<'static, N> {
         let krate = self.modules[&root].krate;
         self.roots.get_mut(&krate).expect("a crate made by `root`")
     }
@@ -200,7 +199,7 @@ impl World {
         let krate = self.modules[&parent].krate;
         let module = self.key(World::krate_byte(at));
         self.modules.insert(module, ModuleInfo { krate, parent: Some(parent), name: Some(name), no_implicit_prelude });
-        self.decls.insert(module, DeclsBuilder::new_in(Global));
+        self.decls.insert(module, DeclsBuilder::new_in(Alloc::global()));
         let pos = self.next_pos(at);
         self.d(at).mods.push(ChildModDecl { name, module, vis: vis.decl(), macro_use, pos });
         module
@@ -275,20 +274,19 @@ impl World {
         self.d(at).calls.push(MacroCallDecl { call, path: path(p), kind, pos, item });
         let module = self.module_of(at);
         self.owner.insert(call, module);
-        self.decls.insert(call, DeclsBuilder::new_in(Global));
+        self.decls.insert(call, DeclsBuilder::new_in(Alloc::global()));
         call
     }
 }
 
 impl ScopeFacts for World {
     type Name = N;
-    type Alloc = Global;
 
     fn module(&self, module: ItemKey) -> Result<ModuleInfo<N>, SurfaceError> {
         self.modules.get(&module).copied().ok_or(SurfaceError::NoRecord { fact: "ModuleDecls", item: module })
     }
 
-    fn decls(&self, module: ItemKey) -> Result<DeclsBuilder<N, Global>, SurfaceError> {
+    fn decls(&self, module: ItemKey) -> Result<DeclsBuilder<'static, N>, SurfaceError> {
         let missing = SurfaceError::NoRecord { fact: "ModuleDecls", item: module };
         if self.owner.contains_key(&module) {
             return Err(missing);
@@ -296,11 +294,11 @@ impl ScopeFacts for World {
         self.decls.get(&module).cloned().ok_or(missing)
     }
 
-    fn crate_root(&self, krate: CrateItemKey) -> Result<CrateRootBuilder<N, Global>, SurfaceError> {
+    fn crate_root(&self, krate: CrateItemKey) -> Result<CrateRootBuilder<'static, N>, SurfaceError> {
         self.roots.get(&krate).cloned().ok_or(SurfaceError::NoCrateRecord { fact: "CrateRoot", krate })
     }
 
-    fn expansion(&self, call: ItemKey) -> Result<Option<DeclsBuilder<N, Global>>, SurfaceError> {
+    fn expansion(&self, call: ItemKey) -> Result<Option<DeclsBuilder<'static, N>>, SurfaceError> {
         if !self.expanded.borrow().contains(&call) {
             return Ok(None);
         }
@@ -352,7 +350,7 @@ impl Own {
 
 /// The `macro_rules!` visible at `module`'s `mod` line, from its ancestors' scopes; `Err` names
 /// an ancestor not done yet.
-fn entry(w: &World, done: &BTreeMap<ItemKey, Resolved<N, Global>>, module: ItemKey) -> Result<Vec<TextualDef<N>>, ItemKey> {
+fn entry(w: &World, done: &BTreeMap<ItemKey, Resolved<'static, N>>, module: ItemKey) -> Result<Vec<TextualDef<N>>, ItemKey> {
     let Some(parent) = w.modules[&module].parent else { return Ok(Vec::new()) };
     let Some(p) = done.get(&parent) else { return Err(parent) };
     let mut out = entry(w, done, parent)?;
@@ -364,10 +362,13 @@ fn entry(w: &World, done: &BTreeMap<ItemKey, Resolved<N, Global>>, module: ItemK
 /// What today's records answer `read`; `Err` names the module that has to be done first.
 pub(crate) fn answer(
     w: &World,
-    done: &BTreeMap<ItemKey, Resolved<N, Global>>,
+    done: &BTreeMap<ItemKey, Resolved<'static, N>>,
     read: Read<N>,
 ) -> Result<Own, ItemKey> {
-    fn of(done: &BTreeMap<ItemKey, Resolved<N, Global>>, m: ItemKey) -> Result<&ScopeBuilder<N, Global>, ItemKey> {
+    fn of<'d>(
+        done: &'d BTreeMap<ItemKey, Resolved<'static, N>>,
+        m: ItemKey,
+    ) -> Result<&'d ScopeBuilder<'static, N>, ItemKey> {
         done.get(&m).map(|r| &r.scope).ok_or(m)
     }
     let scope = move |m: ItemKey| of(done, m);
@@ -397,8 +398,8 @@ pub(crate) fn answer(
 }
 
 enum Machine {
-    One(Resolver<N, Global>),
-    Many(Group<N, Global>),
+    One(Resolver<'static, N>),
+    Many(Group<'static, N>),
 }
 
 impl Machine {
@@ -419,7 +420,7 @@ enum Out {
     Ask(Vec<Read<N>>),
     Expand(Vec<ItemKey>),
     Cycle(Vec<ItemKey>),
-    Done(Vec<Resolved<N, Global>>),
+    Done(Vec<Resolved<'static, N>>),
 }
 
 fn step<F: ScopeFacts<Name = N>>(m: &mut Machine, w: &F, replies: &[Reply<'_, N>]) -> Result<Out, String> {
@@ -442,11 +443,11 @@ fn step<F: ScopeFacts<Name = N>>(m: &mut Machine, w: &F, replies: &[Reply<'_, N>
 
 /// Every module of a world, finished.
 pub(crate) struct Solved {
-    pub(crate) by: BTreeMap<ItemKey, Resolved<N, Global>>,
+    pub(crate) by: BTreeMap<ItemKey, Resolved<'static, N>>,
 }
 
 impl Solved {
-    pub(crate) fn scope(&self, m: ItemKey) -> &ScopeBuilder<N, Global> {
+    pub(crate) fn scope(&self, m: ItemKey) -> &ScopeBuilder<'static, N> {
         &self.by[&m].scope
     }
 
@@ -460,7 +461,7 @@ impl Solved {
 }
 
 fn new_frame<F: ScopeFacts<Name = N>>(w: &F, module: ItemKey, plant: Plant) -> Result<Frame, String> {
-    let mut r = Resolver::new_in(module, w, Global).map_err(|e| format!("{e}"))?;
+    let mut r = Resolver::new_in(module, w, Alloc::global()).map_err(|e| format!("{e}"))?;
     r.set_plant(plant);
     Ok(Frame { m: Machine::One(r), asks: Vec::new() })
 }
@@ -485,7 +486,7 @@ pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
     if let Some(t) = tape {
         t.shuffle(&mut order, "module order");
     }
-    let mut done: BTreeMap<ItemKey, Resolved<N, Global>> = BTreeMap::new();
+    let mut done: BTreeMap<ItemKey, Resolved<'static, N>> = BTreeMap::new();
     let mut stack: Vec<Frame> = Vec::new();
     let mut next = 0usize;
     let mut steps = 0u32;
@@ -559,7 +560,7 @@ pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
                         Machine::Many(g) => members.extend(g.into_members()),
                     }
                 }
-                let g = Group::new_in(OwnVec::from_iter_in(members, Global), Global)
+                let g = Group::new_in(OwnVec::from_iter_in(members, Alloc::global()), Alloc::global())
                     .map_err(|e| format!("{e}"))?;
                 stack.push(Frame { m: Machine::Many(g), asks: Vec::new() });
             }

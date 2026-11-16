@@ -822,7 +822,7 @@ fn watch() -> Result<(), Refusal> {
     let mut text = String::new();
     // Each table is one stream across the frames: its decoder keeps the schema and dictionaries.
     let mut decoders = [&schema::SPANS, &schema::COUNTERS, &schema::OPEN].map(live::Decoder::new);
-    let mut tables: [Vec<RecordBatch>; 3] = Default::default();
+    let mut tables: [Vec<blaze_profile::columns::Batch>; 3] = Default::default();
     ask(Request::Live, Start::Never, |response| {
         let ResponseRef::Live(frame) = response else { return Ok(()) };
         for ((decoder, bytes), batches) in

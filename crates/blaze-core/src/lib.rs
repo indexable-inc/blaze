@@ -37,6 +37,7 @@
 
 pub mod atomic;
 pub mod busy;
+pub mod chan;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 #[allow(

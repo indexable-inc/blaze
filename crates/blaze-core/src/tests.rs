@@ -769,7 +769,7 @@ fn the_threads_driver_holds_a_look_under_a_starting_watch() {
         let root = root.path();
         std::fs::create_dir_all(root.join("src/deep")).unwrap();
         let mut driver = Threads::new(root, 2);
-        let (open, gate) = crossbeam_channel::unbounded();
+        let (open, gate) = crate::chan::unbounded();
         driver.gate_walks(gate);
         crate::watch::HOLDS_NOTHING.set(holds_nothing);
         driver.submit(&mut vec![

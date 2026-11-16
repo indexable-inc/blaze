@@ -3,18 +3,17 @@
 //! Reference's "Tokens" chapter (no crate of the tree reads them: the lexer leaves a literal's
 //! text as written).
 
-use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::tokens::LitKind;
 
-/// UTF-8 text built in `A`.
-pub(crate) struct Buf<A: Allocator>(pub(crate) Vec<u8, A>);
+/// UTF-8 text built in an allocator the caller names.
+pub(crate) struct Buf<'a>(pub(crate) AVec<'a, u8>);
 
-impl<A: Allocator> Buf<A> {
-    pub(crate) fn new_in(alloc: A) -> Buf<A> {
+impl<'a> Buf<'a> {
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> Buf<'a> {
         Buf(Vec::new_in(alloc))
     }
 
@@ -32,7 +31,7 @@ impl<A: Allocator> Buf<A> {
     }
 }
 
-impl<A: Allocator> fmt::Write for Buf<A> {
+impl fmt::Write for Buf<'_> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         self.push_str(text);
         Ok(())
@@ -80,11 +79,11 @@ impl LitError {
 }
 
 /// `concat_bytes!`'s bytes of one literal outside an array, appended: a byte or a byte string.
-pub(crate) fn bytes_piece<B: Allocator>(
+pub(crate) fn bytes_piece(
     kind: LitKind,
     text: &str,
     suffix_len: u32,
-    out: &mut Vec<u8, B>,
+    out: &mut AVec<'_, u8>,
 ) -> Result<(), LitError> {
     if suffix_len != 0 && !matches!(kind, LitKind::Integer | LitKind::Float) {
         return Err(LitError::Invalid);
@@ -154,7 +153,7 @@ fn unescape_byte(body: &str) -> Result<u8, LitError> {
 
 /// The value of a `b"…"` literal's inside, appended, read as [`unescape_str`] reads a string's
 /// but in bytes: ASCII only, `\x` up to `ff`, no `\u`.
-fn unescape_bytes<B: Allocator>(body: &str, out: &mut Vec<u8, B>) -> Result<(), LitError> {
+fn unescape_bytes(body: &str, out: &mut AVec<'_, u8>) -> Result<(), LitError> {
     let bytes = body.as_bytes();
     let mut at = 0;
     while let Some(&byte) = bytes.get(at) {
@@ -216,11 +215,11 @@ fn byte_escape(rest: &[u8]) -> Result<(u8, usize), LitError> {
 }
 
 /// The value of a string literal (`"…"` or `r#"…"#`), whose tt text is `text`, appended.
-pub(crate) fn string_value<A: Allocator>(
+pub(crate) fn string_value(
     kind: LitKind,
     text: &str,
     suffix_len: u32,
-    out: &mut Buf<A>,
+    out: &mut Buf<'_>,
 ) -> Result<(), LitError> {
     let body = without_suffix(text, suffix_len);
     match kind {
@@ -242,12 +241,12 @@ pub(crate) fn string_value<A: Allocator>(
 }
 
 /// `concat!`'s text of one literal (with a `-` before it when `negative`), appended.
-pub(crate) fn concat_piece<A: Allocator>(
+pub(crate) fn concat_piece(
     kind: LitKind,
     text: &str,
     suffix_len: u32,
     negative: bool,
-    out: &mut Buf<A>,
+    out: &mut Buf<'_>,
 ) -> Result<(), LitError> {
     let body = without_suffix(text, suffix_len);
     match kind {
@@ -285,7 +284,7 @@ fn without_suffix(text: &str, suffix_len: u32) -> &str {
 /// The value of a `"…"` literal's inside, appended: its escapes read, a `\` before a line
 /// break skipping the break and the ASCII whitespace after it, and `\r\n` read as `\n` (rustc
 /// reads a file's CRLFs as LFs); a lone `\r` is refused, as rustc's lexer refuses it.
-fn unescape_str<A: Allocator>(body: &str, out: &mut Buf<A>) -> Result<(), LitError> {
+fn unescape_str(body: &str, out: &mut Buf<'_>) -> Result<(), LitError> {
     let bytes = body.as_bytes();
     let mut at = 0;
     while let Some(char) = body[at..].chars().next() {
@@ -415,7 +414,7 @@ fn integer_value(body: &str) -> Result<u128, LitError> {
 
 /// The inside of a `"…"` literal whose value is `value`, appended: `"`, `\` and the
 /// characters a string literal cannot hold as they are written as escapes.
-pub(crate) fn escape_str<A: Allocator>(value: &str, out: &mut Buf<A>) {
+pub(crate) fn escape_str(value: &str, out: &mut Buf<'_>) {
     for char in value.chars() {
         match char {
             '"' => out.push_str("\\\""),
@@ -434,7 +433,7 @@ pub(crate) fn escape_str<A: Allocator>(value: &str, out: &mut Buf<A>) {
 }
 
 /// The inside of a `b"…"` literal whose value is `bytes`, appended.
-pub(crate) fn escape_bytes<A: Allocator>(bytes: &[u8], out: &mut Buf<A>) {
+pub(crate) fn escape_bytes(bytes: &[u8], out: &mut Buf<'_>) {
     for &byte in bytes {
         match byte {
             b'"' => out.push_str("\\\""),

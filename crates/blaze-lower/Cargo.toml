@@ -1,0 +1,32 @@
+[package]
+name = "blaze-lower"
+description = "Rust source text to signature records and body records, straight from the parser's events with no syntax tree: syntactic types in columns, one task per item, bodies in post-order columns with locals, labels and rustc's desugarings resolved, every position item-relative (docs/v2/plan/design/bottom.md, `Signature`, `Body`)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# By path, as blaze-typeck takes them: the workspace entries turn on features this crate does not use.
+blaze-format-core = { path = "../blaze-format-core" }
+blaze-hash = { path = "../blaze-hash" }
+blaze-ids = { path = "../blaze-ids" }
+blaze-own.workspace = true
+blaze-surface.workspace = true
+blaze-file-items.workspace = true
+blaze-typeck.workspace = true
+parser.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+blaze-format.workspace = true
+
+[lints]
+workspace = true

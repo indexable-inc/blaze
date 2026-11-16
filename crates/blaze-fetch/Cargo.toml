@@ -20,8 +20,7 @@ blaze-cas.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-sha256.workspace = true
-crossbeam-channel.workspace = true
-papaya.workspace = true
+blaze-hash.workspace = true
 # The lock on one download's meter (`downloads`), held for a field update.
 # A partial download's lock (`fetcher::Part`), let go of as it drops.
 stdx.workspace = true

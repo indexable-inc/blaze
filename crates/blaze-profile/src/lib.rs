@@ -27,9 +27,9 @@
 use std::{path::Path, sync::OnceLock, time::Instant};
 
 pub mod account;
-pub mod arrow;
 pub mod batches;
 pub mod clock;
+pub mod columns;
 pub mod crash;
 pub mod describe;
 pub mod diff;
@@ -375,12 +375,7 @@ pub(crate) fn closed(id: u64) -> bool {
 }
 
 impl blaze_trace::Sink for Recorder {
-    /// Wanted ([`Recorder::wanted`]) and given a site in the flight recorder: DEBUG at most,
-    /// for the events of `blaze` targets that opt in ([`logs::keeps_event`]).
-    fn max_level(&self) -> blaze_trace::Level {
-        blaze_trace::Level::DEBUG
-    }
-
+    /// Wanted ([`Recorder::wanted`]) and given a site in the flight recorder: asked once a site.
     fn enabled(&self, meta: &'static blaze_trace::Metadata<'static>) -> bool {
         Self::wanted(meta) && site_of(meta).is_some()
     }

@@ -17,7 +17,7 @@
 //! constants), the `Sized` obligation of the struct, union single-field rules, and
 //! `#[non_exhaustive]` construction from other crates.
 
-use core::alloc::Allocator;
+use blaze_own::Alloc;
 
 use crate::diag::{At, DiagCode};
 use crate::error::Stop;
@@ -55,7 +55,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             return Ok(Flow::Wait);
         }
-        let mut tys: blaze_own::Vec<Ty, A> = blaze_own::Vec::with_capacity_in(ids.len(), self.alloc.clone());
+        let mut tys: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(ids.len(), self.alloc);
         for (i, &el) in ids.iter().enumerate() {
             tys.push(if i < n { self.ty.list_get(f.l, i as u32) } else { self.expr_ty[el.ix()] });
         }
@@ -122,7 +122,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     pub(crate) fn struct_path(&mut self, at: At, path: PathIdx) -> Result<Option<(ItemKey, u32, TyList)>, Stop> {
         let bp = self.body.path(path)?;
         let segs = self.body.segment_list(bp.segments)?;
-        let mut names: blaze_own::Vec<crate::ids::Name, A> = blaze_own::Vec::with_capacity_in(segs.len(), self.alloc.clone());
+        let mut names: blaze_own::Vec<crate::ids::Name, Alloc<'a>> = blaze_own::Vec::with_capacity_in(segs.len(), self.alloc);
         for s in segs {
             names.push(s.name);
         }

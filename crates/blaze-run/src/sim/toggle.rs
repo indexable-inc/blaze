@@ -6,10 +6,9 @@
 //! runs again; at every step each slot's hooks, as the program was last told them, are exactly
 //! what the toggles asked for, and a slot with every hook off was told so.
 
-use std::alloc::Global;
 use std::collections::BTreeMap;
 
-use blaze_own::Vec as Own;
+use blaze_own::{Alloc, Vec as Own};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::key;
@@ -34,9 +33,9 @@ fn refused(error: crate::parent::Error) -> Broke {
 fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let functions: Vec<_> = functions().into_iter().take(FUNCTIONS as usize).collect();
     let config = ParentConfig { workers: 2, compile_bound: Nanos(u64::MAX / 4), most_waiters: 64 };
-    let mut parent = Parent::new(&functions, config, Global).map_err(refused)?;
+    let mut parent = Parent::new(&functions, config, Alloc::global()).map_err(refused)?;
     parent.plant = plant;
-    let mut out = Own::new_in(Global);
+    let mut out = Own::new_in(Alloc::global());
     parent.start(&[], &[], Nanos(0), &mut out).map_err(refused)?;
     let mut wanted = [Hooks::NONE; FUNCTIONS as usize];
     let mut told = [Hooks::NONE; FUNCTIONS as usize];
@@ -117,7 +116,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             }
             3 if !compiles.is_empty() => {
                 let slot = compiles.remove(tape.index(compiles.len(), "compile"));
-                let record = FastRecord { code: code_of(slot), callees: Own::new_in(Global), reads: Own::new_in(Global) };
+                let record = FastRecord { code: code_of(slot), callees: Own::new_in(Alloc::global()), reads: Own::new_in(Alloc::global()) };
                 parent.compiled(slot, Compiled::Record(&record), Nanos(step), &mut out).map_err(refused)?;
             }
             _ => continue,
@@ -139,24 +138,24 @@ fn a_toggle_request_reads_back_and_only_its_shortest_form_does() {
         let hooks = Hooks(tape.next_u32("hooks") as u16 & Hooks::ALL.0);
         let on = tape.coin("on");
         let slots: Vec<SlotId> = (0..tape.below(6, "slots")).map(|_| SlotId(tape.next_u32("slot"))).collect();
-        let mut bytes = Own::new_in(Global);
+        let mut bytes = Own::new_in(Alloc::global());
         viewer::toggle(&slots, hooks, on, &mut bytes);
-        let mut back = Own::new_in(Global);
+        let mut back = Own::new_in(Alloc::global());
         let read = viewer::read(&bytes, 8, &mut back);
         oracle(read == Ok(viewer::Request::Toggle { hooks, on }) && back.as_slice() == slots.as_slice(), || {
             format!("{slots:?} {hooks:?} {on} read back as {read:?} {back:?}")
         })?;
         // The version, 1, as a one-byte head (0x18 0x01): the same value, not the shortest form.
-        let mut longer = Own::new_in(Global);
+        let mut longer = Own::new_in(Alloc::global());
         longer.push(bytes[0]);
         longer.extend_from_slice(&[0x18, 0x01]);
         longer.extend_from_slice(&bytes[2..]);
-        let mut ignored = Own::new_in(Global);
+        let mut ignored = Own::new_in(Alloc::global());
         let refused = viewer::read(&longer, 8, &mut ignored);
         oracle(refused == Err(viewer::Bad::NotDeterministic { at: 1 }), || {
             format!("a longer head was read as {refused:?}")
         })?;
-        let mut few = Own::new_in(Global);
+        let mut few = Own::new_in(Alloc::global());
         let capped = viewer::read(&bytes, 0, &mut few);
         oracle(slots.is_empty() || matches!(capped, Err(viewer::Bad::TooMany { .. })), || {
             format!("the slot cap was not kept: {capped:?}")

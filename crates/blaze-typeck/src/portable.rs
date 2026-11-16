@@ -3,8 +3,7 @@
 //! before parents in one node column, lists of children in one side column. Becomes blaze-ty's
 //! portable type table; what this crate needs of it is exactly this shape.
 
-use blaze_own::Vec;
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Vec};
 
 use crate::error::{CheckError, Malformed};
 use crate::hash::{ContentHash, StableHasher};
@@ -193,23 +192,23 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
 /// An owned portable table, hash-consed: equal structure is an equal `PTy`, and an equal list
 /// is an equal `List`, so the table's bytes depend on structure and the order of first use
 /// only (rule 25).
-pub struct PortableTys<A: Allocator + Clone> {
-    nodes: Vec<PNode, A>,
-    lists: Vec<PTy, A>,
-    node_index: HashMap<PNode, u32, A>,
-    list_index: ListIndex<A>,
+pub struct PortableTys<'a> {
+    nodes: Vec<PNode, Alloc<'a>>,
+    lists: Vec<PTy, Alloc<'a>>,
+    node_index: HashMap<PNode, u32, Alloc<'a>>,
+    list_index: ListIndex<'a>,
     /// Per interned list, in the order interned: where it is in `lists`.
-    list_rows: Vec<List, A>,
+    list_rows: Vec<List, Alloc<'a>>,
 }
 
-impl<A: Allocator + Clone> PortableTys<A> {
+impl<'a> PortableTys<'a> {
     /// An empty table.
-    pub fn new_in(alloc: A) -> PortableTys<A> {
+    pub fn new_in(alloc: Alloc<'a>) -> PortableTys<'a> {
         PortableTys {
-            nodes: Vec::new_in(alloc.clone()),
-            lists: Vec::new_in(alloc.clone()),
-            node_index: HashMap::new_in(alloc.clone()),
-            list_index: ListIndex::new_in(alloc.clone()),
+            nodes: Vec::new_in(alloc),
+            lists: Vec::new_in(alloc),
+            node_index: HashMap::new_in(alloc),
+            list_index: ListIndex::new_in(alloc),
             list_rows: Vec::new_in(alloc),
         }
     }
@@ -261,15 +260,15 @@ impl<A: Allocator + Clone> PortableTys<A> {
     }
 }
 
-impl<A: Allocator + Clone> PartialEq for PortableTys<A> {
-    fn eq(&self, other: &PortableTys<A>) -> bool {
+impl<'a> PartialEq for PortableTys<'a> {
+    fn eq(&self, other: &PortableTys<'a>) -> bool {
         self.nodes == other.nodes && self.lists == other.lists
     }
 }
 
-impl<A: Allocator + Clone> Eq for PortableTys<A> {}
+impl<'a> Eq for PortableTys<'a> {}
 
-impl<A: Allocator + Clone> core::fmt::Debug for PortableTys<A> {
+impl<'a> core::fmt::Debug for PortableTys<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PortableTys")
             .field("nodes", &&self.nodes[..])

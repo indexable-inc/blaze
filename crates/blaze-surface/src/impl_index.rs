@@ -24,13 +24,12 @@
 //! Adding an impl changes its one bucket, the directory and, when its trait or bucket is new
 //! to the crate, `NoImplsOf`: no other bucket, and no other crate's records.
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::column::RecordBytes;
 use crate::crate_graph::slice_field;
@@ -271,20 +270,20 @@ pub const NO_IMPLS_SCHEMA: SchemaHash =
 /// One bucket a build wrote: its content id (what the directory names it by), its key and
 /// its buffer.
 #[derive(Clone, Debug)]
-pub struct Bucket<A: Allocator> {
+pub struct Bucket<'a> {
     pub id: ContentId,
     pub hash: BucketHash,
     pub key: BucketKey,
-    pub bytes: RecordBytes<A>,
+    pub bytes: RecordBytes<'a>,
 }
 
 /// A crate's impl index as [`build_impl_index`] writes it: three kinds of record, each a
 /// buffer of its own. The buckets are in the directory's order.
 #[derive(Clone, Debug)]
-pub struct CrateImpls<A: Allocator> {
-    pub directory: RecordBytes<A>,
-    pub no_impls_of: RecordBytes<A>,
-    pub buckets: Vec<Bucket<A>, A>,
+pub struct CrateImpls<'a> {
+    pub directory: RecordBytes<'a>,
+    pub no_impls_of: RecordBytes<'a>,
+    pub buckets: AVec<'a, Bucket<'a>>,
 }
 
 /// Refuses `row` as a row of `krate`'s index.
@@ -309,16 +308,16 @@ fn check_row(krate: CrateItemKey, row: &ImplRow) -> Result<(), ImplIndexError> {
 
 /// `krate`'s impl index of `rows`, in any order, its buffers in `alloc`: equal bytes for
 /// every order of the same rows.
-pub fn build_impl_index<A: Allocator + Clone>(
+pub fn build_impl_index<'a>(
     krate: CrateItemKey,
     rows: &[ImplRow],
-    alloc: A,
-) -> Result<CrateImpls<A>, ImplIndexError> {
+    alloc: Alloc<'a>,
+) -> Result<CrateImpls<'a>, ImplIndexError> {
     if rows.len() > MAX_ROWS {
         return Err(ImplIndexError::TooManyRows { krate, count: rows.len() });
     }
     rows.iter().try_for_each(|row| check_row(krate, row))?;
-    let mut impls: Vec<ItemKey, A> = Vec::with_capacity_in(rows.len(), alloc.clone());
+    let mut impls: AVec<'a, ItemKey> = AVec::with_capacity_in(rows.len(), alloc);
     impls.extend(rows.iter().map(|row| row.impl_));
     impls.sort_unstable();
     if let Some(pair) = impls.windows(2).find(|pair| pair[0] == pair[1]) {
@@ -326,17 +325,17 @@ pub fn build_impl_index<A: Allocator + Clone>(
     }
     drop(impls);
     // Every row with its bucket, by the bucket's hash and then the impl's key.
-    let mut keyed: Vec<(BucketHash, BucketKey, ImplRow), A> =
-        Vec::with_capacity_in(rows.len(), alloc.clone());
+    let mut keyed: AVec<'a, (BucketHash, BucketKey, ImplRow)> =
+        AVec::with_capacity_in(rows.len(), alloc);
     keyed.extend(rows.iter().map(|row| {
         let key = BucketKey::of(row);
         (key.hash(), key, *row)
     }));
     keyed.sort_unstable_by(|a, b| (a.0, a.2.impl_).cmp(&(b.0, b.2.impl_)));
 
-    let mut buckets: Vec<Bucket<A>, A> = Vec::new_in(alloc.clone());
-    let mut entries: Vec<DirEntry, A> = Vec::new_in(alloc.clone());
-    let mut stored: Vec<StoredRow, A> = Vec::new_in(alloc.clone());
+    let mut buckets: AVec<'a, Bucket<'a>> = AVec::new_in(alloc);
+    let mut entries: AVec<'a, DirEntry> = AVec::new_in(alloc);
+    let mut stored: AVec<'a, StoredRow> = AVec::new_in(alloc);
     let mut start = 0;
     while start < keyed.len() {
         let (hash, key, first) = keyed[start];
@@ -356,7 +355,7 @@ pub fn build_impl_index<A: Allocator + Clone>(
             header: row.header,
             flags: row.flags.bits(),
         }));
-        let bytes = write_bucket(hash, key, &stored, alloc.clone());
+        let bytes = write_bucket(hash, key, &stored, alloc);
         let id = blaze_format::buffer_id(&bytes);
         let (kind, _, _) = key.parts();
         entries.push(DirEntry { hash: hash.0, bucket: id, rows: (end - start) as u32, kind });
@@ -366,23 +365,23 @@ pub fn build_impl_index<A: Allocator + Clone>(
     drop(stored);
     drop(keyed);
 
-    let mut traits: Vec<u64, A> = Vec::with_capacity_in(rows.len(), alloc.clone());
+    let mut traits: AVec<'a, u64> = AVec::with_capacity_in(rows.len(), alloc);
     traits.extend(rows.iter().filter_map(|row| row.trait_).map(trait_mark));
     traits.sort_unstable();
     traits.dedup();
-    let mut marks: Vec<u64, A> = Vec::with_capacity_in(entries.len(), alloc.clone());
+    let mut marks: AVec<'a, u64> = AVec::with_capacity_in(entries.len(), alloc);
     marks.extend(entries.iter().map(|entry| BucketHash(entry.hash).mark()));
     marks.sort_unstable();
     marks.dedup();
 
     Ok(CrateImpls {
-        directory: write_directory(krate, &entries, alloc.clone()),
+        directory: write_directory(krate, &entries, alloc),
         no_impls_of: write_no_impls(krate, &traits, &marks, alloc),
         buckets,
     })
 }
 
-fn write_bucket<A: Allocator>(hash: BucketHash, key: BucketKey, rows: &[StoredRow], alloc: A) -> RecordBytes<A> {
+fn write_bucket<'a>(hash: BucketHash, key: BucketKey, rows: &[StoredRow], alloc: Alloc<'a>) -> RecordBytes<'a> {
     let (kind, trait_, shape) = key.parts();
     let mut out = Writer::new_in(BUCKET_SCHEMA, alloc);
     let rows_at = out.push_slice(rows);
@@ -399,7 +398,7 @@ fn write_bucket<A: Allocator>(hash: BucketHash, key: BucketKey, rows: &[StoredRo
     out.finish(at)
 }
 
-fn write_directory<A: Allocator>(krate: CrateItemKey, entries: &[DirEntry], alloc: A) -> RecordBytes<A> {
+fn write_directory<'a>(krate: CrateItemKey, entries: &[DirEntry], alloc: Alloc<'a>) -> RecordBytes<'a> {
     let mut out = Writer::new_in(DIRECTORY_SCHEMA, alloc);
     let entries_at = out.push_slice(entries);
     let at = out.next::<DirectoryRoot>();
@@ -412,7 +411,7 @@ fn write_directory<A: Allocator>(krate: CrateItemKey, entries: &[DirEntry], allo
     out.finish(at)
 }
 
-fn write_no_impls<A: Allocator>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], alloc: A) -> RecordBytes<A> {
+fn write_no_impls<'a>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], alloc: Alloc<'a>) -> RecordBytes<'a> {
     let mut out = Writer::new_in(NO_IMPLS_SCHEMA, alloc);
     let traits_at = out.push_slice(traits);
     let buckets_at = out.push_slice(buckets);

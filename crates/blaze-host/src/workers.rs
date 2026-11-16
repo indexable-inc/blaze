@@ -38,7 +38,7 @@ use blaze_keyed::{
     pool::{Pool, PoolFull, Ticket},
     record::{Fact, Owner, StableId},
 };
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 /// A surface's bytes as a task reads them.
 #[derive(Clone, Debug)]

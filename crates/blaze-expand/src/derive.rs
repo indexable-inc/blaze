@@ -9,7 +9,7 @@
 //! parameter gets rustc's `*self` `Clone`, and a `#[derive_const]` impl is `impl const`, its
 //! trait bounds `[const]`.
 
-use core::{alloc::Allocator, fmt, ops::Range};
+use core::{fmt, ops::Range};
 
 use crate::{
     adt::{self, Adt, AdtKind, FieldsKind, ParamKind, Variant},
@@ -28,9 +28,9 @@ const MADE: Transparency = Transparency::Opaque;
 const UNIONS: &str = "this trait cannot be derived for unions";
 
 /// Expands the derive `which` of the item in `out`.
-pub(crate) fn expand<A: Allocator + Clone>(
+pub(crate) fn expand(
     which: BuiltinDerive,
-    out: &mut Out<'_, A>,
+    out: &mut Out<'_, '_>,
 ) -> Result<(), ExpandError> {
     let input = out.call.input();
     let facts = match out.call.kind {
@@ -39,7 +39,7 @@ pub(crate) fn expand<A: Allocator + Clone>(
             unreachable!("`expand` checks a derive is called as a derive")
         }
     };
-    let adt = match adt::read(input, out.alloc.clone()) {
+    let adt = match adt::read(input, out.alloc) {
         Ok(adt) => adt,
         Err(error) => return refuse(out, error.message()),
     };
@@ -71,7 +71,7 @@ pub(crate) fn expand<A: Allocator + Clone>(
 }
 
 /// The derive's error, `message`; it makes nothing else.
-fn refuse<A: Allocator + Clone>(out: &mut Out<'_, A>, message: &str) -> Result<(), ExpandError> {
+fn refuse(out: &mut Out<'_, '_>, message: &str) -> Result<(), ExpandError> {
     let message = out.note(message)?;
     out.diagnose(Diagnostic::Derive { message });
     Ok(())
@@ -103,16 +103,16 @@ impl Side {
 }
 
 /// The writer of one derive's impls into the expansion.
-struct W<'w, 'c, A: Allocator + Clone> {
-    out: &'w mut Out<'c, A>,
-    input: &'c TokenStream<A>,
-    adt: &'w Adt<A>,
+struct W<'w, 'c, 'a> {
+    out: &'w mut Out<'c, 'a>,
+    input: &'c TokenStream<'c>,
+    adt: &'w Adt<'a>,
     facts: DeriveFacts,
 }
 
 type Written = Result<(), ExpandError>;
 
-impl<A: Allocator + Clone> W<'_, '_, A> {
+impl<'a> W<'_, '_, 'a> {
     /// Writes `code`, made: a run of letters, digits, `_` and `$` is an identifier (`$crate`
     /// one), each other character a punct, joined to the next when that is a punct too, and a
     /// bracket a group's delimiter. Spaces only separate. `code` is ASCII.
@@ -177,8 +177,8 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
     }
 
     /// A made identifier whose name `name` writes.
-    fn made_ident(&mut self, name: impl FnOnce(&mut Buf<A>)) -> Written {
-        let mut text = Buf::new_in(self.out.alloc.clone());
+    fn made_ident(&mut self, name: impl FnOnce(&mut Buf<'a>)) -> Written {
+        let mut text = Buf::new_in(self.out.alloc);
         name(&mut text);
         let ident = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
         self.out.made(ident, text.as_str(), MADE)
@@ -201,7 +201,7 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
 
     /// A made string literal of the name the item's token `at` is (`r#` not included).
     fn name_literal(&mut self, at: usize) -> Written {
-        let mut text = Buf::new_in(self.out.alloc.clone());
+        let mut text = Buf::new_in(self.out.alloc);
         literal::escape_str(self.input.text_at(at), &mut text);
         let kind =
             TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
@@ -210,7 +210,7 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
 
     /// A made integer literal, a tuple field's index.
     fn index_literal(&mut self, value: usize) -> Written {
-        let mut text = Buf::new_in(self.out.alloc.clone());
+        let mut text = Buf::new_in(self.out.alloc);
         fmt::Write::write_fmt(&mut text, format_args!("{value}")).expect("a `Buf` takes any text");
         let kind =
             TokenKind::Literal { kind: LitKind::Integer, suffix_len: 0, spacing: Spacing::Alone };

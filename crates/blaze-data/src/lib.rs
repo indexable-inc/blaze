@@ -43,10 +43,15 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
-#![blaze::sans_io]
+// Each core module is marked `#![blaze::sans_io]`, not the crate: a tool attribute is an
+// expansion, and one on the crate root makes the `#[macro_export]` macros macro-expanded, which
+// the crate itself then cannot name by `$crate::` path (the macros module stays unmarked; it
+// holds no code).
 #![deny(blaze::sans_io_core)]
 #![forbid(unsafe_code)]
 
+// First, and textually scoped, so the crate's own modules call its macros by name.
+#[macro_use]
 mod macros;
 mod map;
 mod path;
@@ -69,7 +74,7 @@ mod plant {
 }
 
 pub use map::{Map, Taken};
-pub use path::{At, Cursor, Extra, Fields, Shape, ShapeError, Step};
+pub use path::{At, Cursor, Extra, Fields, Shape, ShapeError, Step, write_step};
 pub use traits::{FromValue, ToValue};
 pub use value::{Int, Kind, Value};
 pub use walk::{Build, Order, Visit, Walk};

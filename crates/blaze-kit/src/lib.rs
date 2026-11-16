@@ -15,7 +15,7 @@
 //! | [`ChunkedBitSet`] | a bit set in 2,048-bit chunks, uniform chunks one word, mixed chunks shared between copies | rustc's `ChunkedBitSet` |
 //! | [`Heap4`] | a 4-ary min-heap in one vector | `BinaryHeap<Reverse<T>>` |
 //! | [`TimerWheel`] | a hierarchical timer wheel, O(1) insert and cancel by a generational handle | a heap of deadlines |
-//! | [`codec`], [`Dict`] | integer column codecs: bit-packing, RLE, Parquet's RLE/bit-packed hybrid, delta + zigzag + LEB128; a dictionary column | ad hoc encoders |
+//! | [`codec`], [`Dict`] | zigzag, LEB128 and a delta column on them; a dictionary column builder (bit-packing and Parquet's hybrid live in blaze-parquet) | ad hoc encoders, `IndexSet` interners |
 //! | [`StaticSearch`] | a read-only sorted set laid out as an implicit B-tree of 16 keys a node | `binary_search` |
 //!
 //! # Rules every type here keeps

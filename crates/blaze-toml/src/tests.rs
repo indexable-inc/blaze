@@ -181,6 +181,63 @@ fn bounds_are_parameters_and_refused() {
 }
 
 #[test]
+fn a_key_twice_is_refused_in_every_table_form() {
+    assert_eq!(refused("a = { b = 1, b = 2 }").what, What::Duplicate { first: 6 });
+    assert_eq!(refused("a = { b.c = 1, b.c = 2 }").what, What::Duplicate { first: 8 });
+    assert_eq!(refused("[[t]]\nx = 1\nx = 2").what, What::Duplicate { first: 6 });
+    assert_eq!(refused("[t]\n\"x\" = 1\n'x' = 2").what, What::Duplicate { first: 4 });
+    // One key per element of an array of tables: the same key in the next element is no twice.
+    assert!(Document::parse_in("[[t]]\nx = 1\n[[t]]\nx = 2", Limits::CARGO, Global).is_ok());
+}
+
+/// `body` on a thread with a 64 KiB stack, where a recursion on depth overflows long before a
+/// million levels.
+fn small_stack(body: impl FnOnce() + Send + 'static) {
+    let thread = std::thread::Builder::new().stack_size(64 << 10).spawn(body).unwrap();
+    thread.join().unwrap();
+}
+
+/// `n` levels, arrays and inline tables (key `k`) by turns, around a `1`, as the inline writer
+/// lays them out.
+fn nested_toml(n: usize) -> StdString {
+    let mut text = StdString::new();
+    for i in 0..n {
+        text.push_str(if i % 2 == 0 { "[" } else { "{ k = " });
+    }
+    text.push('1');
+    for i in (0..n).rev() {
+        text.push_str(if i % 2 == 0 { "]" } else { " }" });
+    }
+    text
+}
+
+#[test]
+fn deep_nesting_reads_lowers_writes_and_drops_in_a_small_stack() {
+    for (n, limits) in [(64, Limits::CARGO), (1_000_000, Limits { most_depth: 1_000_000, ..Limits::CARGO })] {
+        small_stack(move || {
+            let inner = nested_toml(n);
+            let text = format!("a = {inner}\n");
+            let doc = Document::parse_in(&text, limits, Global).unwrap();
+            let value = doc.to_value_in(Global);
+            let mut out = String::new_in(Global);
+            write_inline(value.get("a").unwrap(), &mut out).unwrap();
+            assert_eq!(out.as_str(), inner, "write(lower(read(text))) is the text");
+            let mut document = String::new_in(Global);
+            write_document(value.as_map().unwrap(), &mut document, DocumentOptions::CARGO).unwrap();
+            let again = Document::parse_in(document.as_str(), limits, Global).unwrap().to_map_in(Global);
+            let mut out = String::new_in(Global);
+            write_inline(again.get("a").unwrap(), &mut out).unwrap();
+            assert_eq!(out.as_str(), inner, "the document written reads back the same");
+            let past = format!("a = {}\n", nested_toml(n + 1));
+            assert_eq!(refused_in(&past, limits).what, What::TooDeep { most: n });
+            drop(value);
+            drop(again);
+            drop(doc);
+        });
+    }
+}
+
+#[test]
 fn spans_are_the_text_as_written() {
     let text = "[package]\nname = \"x\" # c\n\"a b\".c = 'y'\n[dependencies]\nserde = { version = \"1\" }\n";
     let doc = parse(text);

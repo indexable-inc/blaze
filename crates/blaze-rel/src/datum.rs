@@ -312,7 +312,7 @@ impl<A: Allocator + Copy> Store<A> {
             }
             Datum::Float(f) => {
                 const LIMIT: f64 = 1.7014118346046923e38;
-                if f.fract() == 0.0 && f.abs() < LIMIT {
+                if f.abs() < LIMIT && (f as i128) as f64 == f {
                     hasher.write_u8(2);
                     hasher.write_i128(f as i128);
                 } else if f.is_nan() {

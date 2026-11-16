@@ -41,7 +41,7 @@ use blaze_keyed::{
     proof::{self, Snapshot},
     record,
 };
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 use crate::{
     Fact, Kind, KindId, Memo, Read,

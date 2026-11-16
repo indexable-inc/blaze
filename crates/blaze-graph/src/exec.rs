@@ -27,7 +27,7 @@ use std::{
 use blaze_hash::HashMap;
 use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag, frame};
 use blaze_protocol::events::{Event, Record};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use blaze_core::chan::{Receiver, Sender, bounded, unbounded};
 use std::alloc::Global;
 
 use crate::{
@@ -622,7 +622,7 @@ impl<W> Handle<W> {
     ///
     /// When the scheduler is gone.
     pub fn estimates(&self) -> Vec<u8> {
-        let (reply, estimates) = crossbeam_channel::bounded(1);
+        let (reply, estimates) = blaze_core::chan::bounded(1);
         _ = self.tx.send(Msg::Estimates { reply });
         recv_said(&estimates, "the scheduler's estimates")
             .unwrap_or_else(|_| panic!("the scheduler is gone"))
@@ -630,7 +630,7 @@ impl<W> Handle<W> {
 
     #[cfg(test)]
     fn slots(&self) -> usize {
-        let (reply, slots) = crossbeam_channel::bounded(1);
+        let (reply, slots) = blaze_core::chan::bounded(1);
         _ = self.tx.send(Msg::Slots { reply });
         slots.recv().unwrap_or_else(|_| panic!("the scheduler is gone"))
     }
@@ -1152,11 +1152,11 @@ fn run_io<R: Runner>(run: Ran<R>) {
 /// `rx.recv()`, said as a wait on the channel `name` ([`crate::wait`]) only when nothing is
 /// there yet: a receive that finds a message costs a `try_recv`. On a target without threads
 /// (the seed) the wait gives the pools this thread drives turns ([`pool::recv`]).
-fn recv_said<T>(rx: &Receiver<T>, name: &'static str) -> Result<T, crossbeam_channel::RecvError> {
+fn recv_said<T>(rx: &Receiver<T>, name: &'static str) -> Result<T, blaze_core::chan::RecvError> {
     match rx.try_recv() {
         Ok(it) => Ok(it),
-        Err(crossbeam_channel::TryRecvError::Disconnected) => Err(crossbeam_channel::RecvError),
-        Err(crossbeam_channel::TryRecvError::Empty) => {
+        Err(blaze_core::chan::TryRecvError::Disconnected) => Err(blaze_core::chan::RecvError),
+        Err(blaze_core::chan::TryRecvError::Empty) => {
             crate::wait::wait(crate::wait::WaitOn::Channel(name), None, || pool::recv(rx, name))
         }
     }
@@ -1176,7 +1176,7 @@ mod tests {
 
     use blaze_hash::{HashMap, HashSet};
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
-    use crossbeam_channel::bounded;
+    use blaze_core::chan::bounded;
     use blaze_core::lock::Lock;
     use std::alloc::Global;
 

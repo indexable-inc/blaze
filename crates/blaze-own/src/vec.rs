@@ -6,11 +6,12 @@
 
 use core::{
     alloc::Allocator,
+    any::type_name,
     borrow::{Borrow, BorrowMut},
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
-    iter::FusedIterator,
+    iter::{FusedIterator, TrustedLen},
     marker::PhantomData,
     mem::{DropGuard, ManuallyDrop, MaybeUninit},
     ops::{Bound, Deref, DerefMut, Index, IndexMut, Range, RangeBounds},
@@ -25,6 +26,7 @@ use crate::{
     error::{AllocFailure, fail},
     make::CloneIn,
     raw::RawBuf,
+    spec::{CloneSlice, Find},
 };
 
 /// A growable array of `T` in `A`.
@@ -363,18 +365,102 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     /// Appends clones of `values` into room already reserved, counting each as it lands, so a
-    /// clone that panics leaves the vector holding the ones before it.
+    /// clone that panics leaves the vector holding the ones before it; one block copy for `Copy`
+    /// values ([`CloneSlice`]).
     fn extend_cloned(&mut self, values: &[T])
     where
         T: Clone,
     {
         debug_assert!(self.buf.capacity() - self.len >= values.len());
-        for value in values {
-            let value = value.clone();
-            // SAFETY: room was reserved for every value, and slot `len` holds none.
-            unsafe { ptr::write(self.buf.ptr().add(self.len), value) };
-            self.len += 1;
+        let base = self.buf.ptr();
+        // SAFETY: room was reserved for every value past the length, in the vector's buffer,
+        // which `values` (a shared borrow) is not.
+        unsafe { <T as CloneSlice>::clone_to(values, base, &mut self.len) };
+    }
+
+    /// Puts clones of `values` at `index`, moving the values after it up by their count; one
+    /// block copy for `Copy` values. A clone that panics leaves the ones made before it, and the
+    /// values after `index` closed up behind them.
+    ///
+    /// # Panics
+    ///
+    /// When `index > len()`, or there is no memory.
+    #[track_caller]
+    pub fn insert_many(&mut self, index: usize, values: &[T])
+    where
+        T: Clone,
+    {
+        if index > self.len {
+            out_of_bounds("Vec::insert_many", index, self.len);
         }
+        self.reserve(values.len());
+        // SAFETY: `index <= len` and room for `values` was reserved.
+        unsafe { self.insert_cloned(index, values) };
+    }
+
+    /// [`Vec::insert_many`], or the [`AllocFailure`] with the vector as it was.
+    ///
+    /// # Panics
+    ///
+    /// When `index > len()`.
+    #[track_caller]
+    pub fn try_insert_many(&mut self, index: usize, values: &[T]) -> Result<(), AllocFailure>
+    where
+        T: Clone,
+    {
+        if index > self.len {
+            out_of_bounds("Vec::try_insert_many", index, self.len);
+        }
+        self.try_reserve(values.len())?;
+        // SAFETY: as in `insert_many`.
+        unsafe { self.insert_cloned(index, values) };
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// `index <= len` and the buffer has room for `values.len()` more.
+    unsafe fn insert_cloned(&mut self, index: usize, values: &[T])
+    where
+        T: Clone,
+    {
+        let (len, n) = (self.len, values.len());
+        let base = self.buf.ptr();
+        // SAFETY: slots `index..len` hold values and move up `n` into reserved room; `copy`
+        // allows the overlap.
+        unsafe { ptr::copy(base.add(index), base.add(index + n), len - index) };
+        // While the gap fills only the values before it count; the guard closes what is left of
+        // the gap (all of it on finishing) and counts the moved values again.
+        self.len = index;
+        let mut gap = DropGuard::new((&mut self.len, 0usize), move |(vec_len, made): (&mut usize, usize)| {
+            if made < n {
+                // SAFETY: the moved values are at `index + n..`, and `index + made..` is empty.
+                unsafe { ptr::copy(base.add(index + n), base.add(index + made), len - index) };
+            }
+            *vec_len = len + made;
+        });
+        // SAFETY: the `n` slots from `index` are empty (moved from), in the buffer, and not in
+        // `values`, a shared borrow apart from the vector.
+        unsafe { <T as CloneSlice>::clone_to(values, base.add(index), &mut gap.1) };
+    }
+
+    /// Whether a value equals `needle`: blaze-memchr's vector search for `u8`, `i8` and `bool`,
+    /// `==` per value otherwise ([`Find`]).
+    #[inline]
+    pub fn contains(&self, needle: &T) -> bool
+    where
+        T: PartialEq,
+    {
+        self.position(needle).is_some()
+    }
+
+    /// The index of the first value equal to `needle`, as [`Vec::contains`] searches.
+    #[inline]
+    pub fn position(&self, needle: &T) -> Option<usize>
+    where
+        T: PartialEq,
+    {
+        <T as Find>::find(self.as_slice(), needle)
     }
 
     /// Makes its length `new_len`: clones of `value` added, or values past it dropped.
@@ -721,17 +807,13 @@ impl<T: Clone, A: Allocator + Clone> Clone for Vec<T, A> {
 
 impl<T, A: Allocator> Vec<T, A> {
     /// A deep copy in another allocator: room for exactly the length in `alloc`, and each value
-    /// copied with [`CloneIn`] into `alloc` too. A refusal drops what was copied.
+    /// copied with [`CloneIn`] into `alloc` too, one block copy for `Copy` values. A refusal
+    /// drops what was copied.
     pub fn try_clone_in<B: Allocator + Clone>(&self, alloc: B) -> Result<Vec<T::In, B>, AllocFailure>
     where
         T: CloneIn<B>,
     {
-        let mut out = Vec::try_with_capacity_in(self.len, alloc.clone())?;
-        for value in self.as_slice() {
-            // The room is reserved: the push does not allocate.
-            out.push(value.try_clone_in(alloc.clone())?);
-        }
-        Ok(out)
+        clone_slice_in(self.as_slice(), alloc)
     }
 
     /// [`Vec::try_clone_in`], panicking with the [`AllocFailure`].
@@ -745,6 +827,18 @@ impl<T, A: Allocator> Vec<T, A> {
             Err(failure) => fail(failure),
         }
     }
+}
+
+/// Copies of `values` in a vector of exactly their length in `alloc`, through
+/// [`CloneIn::try_clone_slice_in`] (one block copy for `Copy` values); a refusal drops what was
+/// copied.
+pub(crate) fn clone_slice_in<T: CloneIn<B>, B: Allocator + Clone>(values: &[T], alloc: B) -> Result<Vec<T::In, B>, AllocFailure> {
+    let mut out = Vec::try_with_capacity_in(values.len(), alloc.clone())?;
+    let base = out.buf.ptr();
+    // SAFETY: `out` has room for `values.len()` values and holds none; it is a new block, apart
+    // from `values`. Its length counts each copy as it lands, so a refusal drops those.
+    unsafe { T::try_clone_slice_in(values, base, &mut out.len, &alloc)? };
+    Ok(out)
 }
 
 impl<T: fmt::Debug, A: Allocator> fmt::Debug for Vec<T, A> {
@@ -835,8 +929,33 @@ impl<T, A: Allocator> From<Box<[T], A>> for Vec<T, A> {
 }
 
 impl<T, A: Allocator> Extend<T> for Vec<T, A> {
+    /// Reserves once and writes with no capacity check per value for a `TrustedLen` iterator,
+    /// and moves another vector's values in one copy ([`SpecExtend`]).
+    #[inline]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        let mut iter = iter.into_iter();
+        <Vec<T, A> as SpecExtend<T, I::IntoIter>>::spec_extend(self, iter.into_iter());
+    }
+}
+
+impl<'a, T: Copy + 'a, A: Allocator> Extend<&'a T> for Vec<T, A> {
+    /// One block copy from a slice's `iter()` ([`SpecExtendRef`]).
+    #[inline]
+    fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
+        <Vec<T, A> as SpecExtendRef<'a, T, I::IntoIter>>::spec_extend_ref(self, iter.into_iter());
+    }
+}
+
+/// `extend` by the iterator's kind: any (a check per value), `TrustedLen` (one reservation, no
+/// check), or another vector's values (one copy). Each specializing impl is in
+/// `min_specialization`'s subset (`spec`'s notes): the added bound is `TrustedLen`, a
+/// specialization trait, or none; `IntoIter<T, B>` names `T` inside a type, not as a second
+/// bare parameter.
+trait SpecExtend<T, I> {
+    fn spec_extend(&mut self, iter: I);
+}
+
+impl<T, I: Iterator<Item = T>, A: Allocator> SpecExtend<T, I> for Vec<T, A> {
+    default fn spec_extend(&mut self, mut iter: I) {
         while let Some(value) = iter.next() {
             if self.len == self.buf.capacity() {
                 let (lower, _) = iter.size_hint();
@@ -850,9 +969,61 @@ impl<T, A: Allocator> Extend<T> for Vec<T, A> {
     }
 }
 
-impl<'a, T: Copy + 'a, A: Allocator> Extend<&'a T> for Vec<T, A> {
-    fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
-        self.extend(iter.into_iter().copied());
+impl<T, I: Iterator<Item = T> + TrustedLen, A: Allocator> SpecExtend<T, I> for Vec<T, A> {
+    default fn spec_extend(&mut self, iter: I) {
+        let (lower, upper) = iter.size_hint();
+        // `TrustedLen`: no upper bound means more than `usize::MAX` values.
+        let Some(additional) = upper else {
+            fail(AllocFailure::CapacityOverflow { what: type_name::<T>(), len: self.len, additional: lower })
+        };
+        self.reserve(additional);
+        let base = self.buf.ptr();
+        let start = self.len;
+        // The length is set as the guard drops, a panic in the iterator among the ways, so every
+        // value written is owned.
+        let mut at = DropGuard::new((&mut self.len, start), |(len, written): (&mut usize, usize)| *len = written);
+        iter.for_each(|value| {
+            // SAFETY: `TrustedLen` gives exactly `additional` values, and room for that many was
+            // reserved past `start`; slot `at.1` is one of them and empty.
+            unsafe { base.add(at.1).write(value) };
+            at.1 += 1;
+        });
+    }
+}
+
+impl<T, B: Allocator, A: Allocator> SpecExtend<T, IntoIter<T, B>> for Vec<T, A> {
+    fn spec_extend(&mut self, mut iter: IntoIter<T, B>) {
+        let left = iter.back - iter.front;
+        self.reserve(left);
+        // SAFETY: the iterator's slots `front..back` hold its values, which move bitwise into
+        // reserved room in another buffer; `front` then passes them, so the iterator's drop
+        // drops none of them and frees its block.
+        unsafe { ptr::copy_nonoverlapping(iter.buf.ptr().add(iter.front), self.buf.ptr().add(self.len), left) };
+        iter.front = iter.back;
+        self.len += left;
+    }
+}
+
+/// `extend` from references to `Copy` values: one block copy from a slice's `iter()`. Its
+/// specializing impl adds no bound to the base's.
+trait SpecExtendRef<'a, T: 'a, I> {
+    fn spec_extend_ref(&mut self, iter: I);
+}
+
+impl<'a, T: Copy + 'a, I: Iterator<Item = &'a T>, A: Allocator> SpecExtendRef<'a, T, I> for Vec<T, A> {
+    default fn spec_extend_ref(&mut self, iter: I) {
+        <Vec<T, A> as SpecExtend<T, core::iter::Copied<I>>>::spec_extend(self, iter.copied());
+    }
+}
+
+impl<'a, T: Copy + 'a, A: Allocator> SpecExtendRef<'a, T, slice::Iter<'a, T>> for Vec<T, A> {
+    fn spec_extend_ref(&mut self, iter: slice::Iter<'a, T>) {
+        let values = iter.as_slice();
+        self.reserve(values.len());
+        // SAFETY: room for `values` was reserved past the length, in this vector's buffer,
+        // which a shared slice cannot be; `Copy` values duplicate bitwise.
+        unsafe { ptr::copy_nonoverlapping(values.as_ptr(), self.buf.ptr().add(self.len), values.len()) };
+        self.len += values.len();
     }
 }
 
@@ -950,6 +1121,9 @@ impl<T, A: Allocator> DoubleEndedIterator for IntoIter<T, A> {
 }
 
 impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {}
+
+// SAFETY: `size_hint` is `back - front`, exactly the values `next` and `next_back` give.
+unsafe impl<T, A: Allocator> TrustedLen for IntoIter<T, A> {}
 
 impl<T, A: Allocator> FusedIterator for IntoIter<T, A> {}
 
@@ -1054,6 +1228,9 @@ impl<T, A: Allocator> DoubleEndedIterator for Drain<'_, T, A> {
 }
 
 impl<T, A: Allocator> ExactSizeIterator for Drain<'_, T, A> {}
+
+// SAFETY: `size_hint` is `back - front`, exactly the values `next` and `next_back` give.
+unsafe impl<T, A: Allocator> TrustedLen for Drain<'_, T, A> {}
 
 impl<T, A: Allocator> FusedIterator for Drain<'_, T, A> {}
 

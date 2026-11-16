@@ -13,10 +13,9 @@
 
 #![blaze::sans_io]
 
-
 use core::fmt;
 
-use blaze_own::{Vec, soa};
+use blaze_own::{AVec, Alloc, soa};
 
 use crate::{CheckoutKey, InstanceKey, Nanos, Plant, TestId};
 
@@ -190,10 +189,10 @@ impl Registry {
         Registry { me: None, plant: Plant::None }
     }
 
-    pub fn register<A: Allocator>(
+    pub fn register(
         &mut self,
         entry: &Entry,
-        out: &mut Vec<Effect, A>,
+        out: &mut AVec<'_, Effect>,
     ) -> Result<(), Error> {
         if let Some(name) = self.me {
             return Err(Error::Twice { name });
@@ -203,14 +202,14 @@ impl Registry {
         Ok(())
     }
 
-    pub fn unregister<A: Allocator>(&mut self, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+    pub fn unregister(&mut self, out: &mut AVec<'_, Effect>) -> Result<(), Error> {
         let name = self.me.take().ok_or(Error::NotRegistered)?;
         out.push(Effect::Remove { name });
         Ok(())
     }
 
     /// One event of this run, for its stream.
-    pub fn say<A: Allocator>(&self, event: &RunEvent, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+    pub fn say(&self, event: &RunEvent, out: &mut AVec<'_, Effect>) -> Result<(), Error> {
         let name = self.me.ok_or(Error::NotRegistered)?;
         out.push(Effect::Append { name, event: *event });
         Ok(())
@@ -218,12 +217,12 @@ impl Registry {
 
     /// The directory as listed: the live runs pushed to `live`, which is then sorted by name;
     /// each entry of a dead process removed.
-    pub fn read<A: Allocator, B: Allocator, P: Processes>(
+    pub fn read<P: Processes>(
         &self,
         listing: &[(Name, &[u8])],
         processes: &P,
-        live: &mut Entries<B>,
-        out: &mut Vec<Effect, A>,
+        live: &mut Entries<Alloc<'_>>,
+        out: &mut AVec<'_, Effect>,
     ) -> Result<(), Error> {
         for (file, bytes) in listing {
             let entry = Entry::decode(bytes).map_err(|bad| Error::BadEntry { name: *file, bad })?;

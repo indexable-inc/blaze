@@ -7,7 +7,7 @@
 //! occurs checks (the generated bodies cannot build a cyclic type).
 
 use blaze_hash::HashMap;
-use blaze_own::Vec;
+use blaze_own::{Alloc, Vec};
 use std::alloc::Global;
 
 use crate::error::{CheckError, Limit, Malformed, Stop};
@@ -55,7 +55,7 @@ pub(crate) struct ToyCtx {
     nodes: Vec<TyView, Global>,
     node_index: HashMap<TyView, u32, Global>,
     lists: Vec<Vec<Ty, Global>, Global>,
-    list_index: ListIndex<Global>,
+    list_index: ListIndex<'static>,
     /// Each variable's value, by index.
     vals: Vec<Option<Ty>, Global>,
     /// Each variable's own handle.
@@ -75,7 +75,7 @@ impl ToyCtx {
             nodes: Vec::new_in(Global),
             node_index: HashMap::new_in(Global),
             lists: Vec::new_in(Global),
-            list_index: ListIndex::new_in(Global),
+            list_index: ListIndex::new_in(Alloc::global()),
             vals: Vec::new_in(Global),
             var_ty: Vec::new_in(Global),
             rank: Vec::new_in(Global),
@@ -706,7 +706,7 @@ pub(crate) fn struct_key(i: u32) -> ItemKey {
     ItemKey(0x5_0000 + u128::from(i))
 }
 
-fn to_owned(t: PortableTys<Global>) -> Owned {
+fn to_owned(t: PortableTys<'_>) -> Owned {
     let v = t.view();
     let mut nodes = Vec::with_capacity_in(v.nodes.len(), Global);
     nodes.extend_from_slice(v.nodes);
@@ -715,7 +715,7 @@ fn to_owned(t: PortableTys<Global>) -> Owned {
     Owned { nodes, lists }
 }
 
-fn field_pty(t: &mut PortableTys<Global>, f: FieldTy) -> Result<PTy, CheckError> {
+fn field_pty(t: &mut PortableTys<'_>, f: FieldTy) -> Result<PTy, CheckError> {
     t.intern(match f {
         FieldTy::I32 => PNode::Int(crate::ids::IntTy::I32),
         FieldTy::U8 => PNode::Uint(crate::ids::UintTy::U8),
@@ -727,7 +727,7 @@ fn field_pty(t: &mut PortableTys<Global>, f: FieldTy) -> Result<PTy, CheckError>
 impl ToyWorld {
     /// A world whose owner takes one parameter of each type in `params` and returns `output`.
     pub(crate) fn new(structs: &[ToyStruct], params: &[FieldTy], output: FieldTy) -> Result<ToyWorld, CheckError> {
-        let mut sig = PortableTys::new_in(Global);
+        let mut sig = PortableTys::new_in(Alloc::global());
         let mut sig_inputs = Vec::new_in(Global);
         for &p in params {
             sig_inputs.push(field_pty(&mut sig, p)?);
@@ -735,7 +735,7 @@ impl ToyWorld {
         let sig_output = field_pty(&mut sig, output)?;
         let mut adts = Vec::new_in(Global);
         for (i, s) in structs.iter().enumerate() {
-            let mut t = PortableTys::new_in(Global);
+            let mut t = PortableTys::new_in(Alloc::global());
             let mut fields = Vec::new_in(Global);
             for &(name, f) in s.fields.iter() {
                 fields.push(Field { name, ty: field_pty(&mut t, f)? });

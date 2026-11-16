@@ -57,7 +57,7 @@ use blaze_graph::{
     wait::{WaitOn, wait},
 };
 use blaze_spin::SpinWait;
-use crossbeam_queue::{ArrayQueue, SegQueue};
+use blaze_queue::{ArrayQueue, SegQueue};
 
 use super::{
     Ended, Give, Load, LoadFailure, Loads, Opened, Pins, Pool, PoolError, ReadStep, Reading, Run, State, Window,
@@ -164,7 +164,7 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
             stop: AtomicBool::new(false),
         });
         let theirs = Arc::clone(&shared);
-        let (opened, open) = crossbeam_channel::bounded::<io::Result<()>>(1);
+        let (opened, open) = blaze_core::chan::bounded::<io::Result<()>>(1);
         let thread = std::thread::Builder::new()
             .name("store pool loader".to_owned()) // alloc: the thread's name, once
             .spawn(move || {

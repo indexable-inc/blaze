@@ -163,11 +163,11 @@ pub(crate) trait Tell: Send + Sync + 'static {
 
 /// A bounded channel waits up to `wait` for room and allocates nothing per completion; an
 /// unbounded one always has room, and allocates a block per 31 completions.
-impl Tell for crossbeam_channel::Sender<Completion> {
+impl Tell for crate::chan::Sender<Completion> {
     fn tell(&self, completion: Completion, wait: Duration) -> Result<(), Option<Completion>> {
         self.send_timeout(completion, wait).map_err(|error| match error {
-            crossbeam_channel::SendTimeoutError::Timeout(completion) => Some(completion),
-            crossbeam_channel::SendTimeoutError::Disconnected(_) => None,
+            crate::chan::SendTimeoutError::Timeout(completion) => Some(completion),
+            crate::chan::SendTimeoutError::Disconnected(_) => None,
         })
     }
 }
@@ -1079,12 +1079,12 @@ mod tests {
     }
 
     /// A bounded channel, as the driver's: no allocation per completion.
-    type Sink = crossbeam_channel::Sender<Completion>;
+    type Sink = crate::chan::Sender<Completion>;
 
-    type Heard = crossbeam_channel::Receiver<Completion>;
+    type Heard = crate::chan::Receiver<Completion>;
 
     fn watch() -> (Watch<Sink>, Heard) {
-        let (send, heard) = crossbeam_channel::bounded(1024);
+        let (send, heard) = crate::chan::bounded(1024);
         (Watch::new(send).unwrap(), heard)
     }
 

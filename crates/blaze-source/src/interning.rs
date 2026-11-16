@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::ptr;
 
-use blaze_ids::{ContentId, Domain, Interner, Sharded};
+use blaze_ids::{ContentId, Domain, Interner, Shards, Sharded};
 
 /// Every string interned, by its content ID: a hit is lock-free probes and no allocation.
 #[expect(
@@ -30,7 +30,7 @@ impl serde::Serialize for InternedString {
 
 impl InternedString {
     pub fn new(s: &str) -> InternedString {
-        let strings = STRINGS.get_or_init(Sharded::new);
+        let strings = STRINGS.get_or_init(|| Sharded::new(Shards::for_this_machine()));
         let id = ContentId::of_domain(&STRING, s.as_bytes());
         // alloc: once per distinct string for the life of the process, as cargo's interner.
         let at = strings.intern(id, || s.into());

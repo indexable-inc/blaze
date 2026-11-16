@@ -33,7 +33,7 @@ impl core::hash::Hasher for KeyHasher {
     fn write_usize(&mut self, _: usize) {}
 }
 
-/// The `BuildHasher` of [`KeyHasher`], for a table built elsewhere (papaya's, `with_hasher`).
+/// The `BuildHasher` of [`KeyHasher`], for a table built elsewhere (a shared one's, `with_hasher`).
 pub type BuildKeyHasher = core::hash::BuildHasherDefault<KeyHasher>;
 
 /// A map on hashes, indexed by the hash itself, in the allocator `A`, which every use names

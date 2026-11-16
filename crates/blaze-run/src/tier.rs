@@ -26,11 +26,10 @@
 
 #![blaze::sans_io]
 
-
 use core::fmt;
 
 use blaze_hash::HashMap;
-use blaze_own::{SortedMap, Vec, VecDeque, soa};
+use blaze_own::{ADeque, ASortedMap, AVec, Alloc, SortedMap, Vec, VecDeque, soa};
 
 use crate::{CodeId, CodeRef, CompileError, InstanceKey, Made, Plant, RecordKey, SlotId, Snapshot, Why};
 
@@ -51,9 +50,9 @@ pub struct Inlined {
 }
 
 /// What the optimizer made of one function: its code record, and every callee body in it.
-pub struct Optimized<A: Allocator> {
+pub struct Optimized<'a> {
     pub code: CodeRef,
-    pub inlined: Vec<Inlined, A>,
+    pub inlined: AVec<'a, Inlined>,
 }
 
 /// A callee the optimizer may inline: its instance, whose body it reads by key, and that body's
@@ -66,16 +65,16 @@ pub struct Callee {
 
 /// The optimizing backend (the real one comes from codegen's top tier, function grain). A pure
 /// function of what it reads: it returns its record, or what it lacks, and never waits.
-pub trait Optimizer<A: Allocator + Clone> {
+pub trait Optimizer {
     /// `instance` optimized, with any of `callees` (and, through them, their callees) inlined.
     /// The result lists every body absorbed with the identity it read; a body missing from the
     /// list is a stale-code bug of the optimizer's.
-    fn optimize(
+    fn optimize<'a>(
         &mut self,
         instance: InstanceKey,
         callees: &[Callee],
-        alloc: A,
-    ) -> Result<Made<Optimized<A>, A>, Why>;
+        alloc: Alloc<'a>,
+    ) -> Result<Made<'a, Optimized<'a>>, Why>;
 }
 
 /// The code identity each instance has now: the program's manifest, as the parent holds it.
@@ -122,8 +121,8 @@ pub struct Job {
 }
 
 /// How one entry of a job ended, as its driver hands it back.
-pub enum Ended<'r, A: Allocator> {
-    Record(Optimized<A>),
+pub enum Ended<'r, 'a> {
+    Record(Optimized<'a>),
     Need(&'r [RecordKey]),
     Failed(Why),
 }
@@ -204,41 +203,41 @@ enum State {
 }
 
 /// The optimizing tier of one run. See the module's documentation.
-pub struct Tier<A: Allocator + Clone> {
-    alloc: A,
-    slots: Rows<A>,
-    queue: VecDeque<SlotId, A>,
+pub struct Tier<'a> {
+    alloc: Alloc<'a>,
+    slots: Rows<Alloc<'a>>,
+    queue: ADeque<'a, SlotId>,
     workers: u32,
     running: u32,
     snapshot: Snapshot,
     /// Sorted by slot: one insert a hot function, the few the tier ever optimizes.
-    records: SortedMap<SlotId, Optimized<A>, A>,
+    records: ASortedMap<'a, SlotId, Optimized<'a>>,
     /// Hashed, not sorted: every record adds a key for each body it absorbed, in no order, so a
     /// sorted vector would shift its tail on almost every insert.
-    inlined_into: HashMap<CodeId, Vec<SlotId, A>, A>,
+    inlined_into: HashMap<CodeId, AVec<'a, SlotId>, Alloc<'a>>,
     /// Each record being made, and the jobs that lack it: the few in flight.
-    making: SortedMap<RecordKey, Vec<SlotId, A>, A>,
+    making: ASortedMap<'a, RecordKey, AVec<'a, SlotId>>,
 }
 
-impl<A: Allocator + Clone> Tier<A> {
+impl<'a> Tier<'a> {
     /// A tier of `slots` functions running at most `workers` optimizations at once.
-    pub fn new(slots: u32, workers: u32, snapshot: Snapshot, alloc: A) -> Result<Tier<A>, Error> {
+    pub fn new(slots: u32, workers: u32, snapshot: Snapshot, alloc: Alloc<'a>) -> Result<Tier<'a>, Error> {
         if workers == 0 {
             return Err(Error::Config { what: "no worker" });
         }
-        let mut rows = Rows::with_capacity_in(slots as usize, alloc.clone());
+        let mut rows = Rows::with_capacity_in(slots as usize, alloc);
         for _ in 0..slots {
             rows.push(Row { state: State::Fast, instance: None });
         }
         Ok(Tier {
             slots: rows,
-            queue: VecDeque::new_in(alloc.clone()),
+            queue: VecDeque::new_in(alloc),
             workers,
             running: 0,
             snapshot,
-            records: SortedMap::new_in(alloc.clone()),
-            inlined_into: HashMap::new_in(alloc.clone()),
-            making: SortedMap::new_in(alloc.clone()),
+            records: SortedMap::new_in(alloc),
+            inlined_into: HashMap::new_in(alloc),
+            making: SortedMap::new_in(alloc),
             alloc,
         })
     }
@@ -257,7 +256,7 @@ impl<A: Allocator + Clone> Tier<A> {
         &mut self,
         slot: SlotId,
         instance: InstanceKey,
-        out: &mut Vec<Effect, A>,
+        out: &mut AVec<'_, Effect>,
     ) -> Result<(), Error> {
         let slots = self.slots.len() as u32;
         let snapshot = self.snapshot;
@@ -274,7 +273,7 @@ impl<A: Allocator + Clone> Tier<A> {
         Ok(())
     }
 
-    fn pump(&mut self, out: &mut Vec<Effect, A>) {
+    fn pump(&mut self, out: &mut AVec<'_, Effect>) {
         while self.running < self.workers {
             let Some(slot) = self.queue.pop_front() else { return };
             let State::Queued { snapshot } = *self.state(slot) else { continue };
@@ -291,7 +290,7 @@ impl<A: Allocator + Clone> Tier<A> {
     }
 
     /// The end of one entry of `job`.
-    pub fn done(&mut self, job: Job, ended: Ended<'_, A>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+    pub fn done(&mut self, job: Job, ended: Ended<'_, 'a>, out: &mut AVec<'_, Effect>) -> Result<(), Error> {
         let Job { slot, snapshot, instance } = job;
         if self.slots.states().get(slot.index()) != Some(&State::Optimizing { snapshot }) {
             return Err(Error::NotRunning { slot, snapshot });
@@ -309,7 +308,7 @@ impl<A: Allocator + Clone> Tier<A> {
                     let callers = self
                         .inlined_into
                         .entry(each.code)
-                        .or_insert_with(|| Vec::new_in(self.alloc.clone()));
+                        .or_insert_with(|| Vec::new_in(self.alloc));
                     if !callers.contains(&slot) {
                         callers.push(slot);
                     }
@@ -331,7 +330,7 @@ impl<A: Allocator + Clone> Tier<A> {
                         Some(jobs) if jobs.contains(&slot) => continue,
                         Some(jobs) => jobs.push(slot),
                         None => {
-                            let mut jobs = Vec::new_in(self.alloc.clone());
+                            let mut jobs = Vec::new_in(self.alloc);
                             jobs.push(slot);
                             self.making.insert(*key, jobs);
                             out.push(Effect::Make { key: *key });
@@ -353,7 +352,7 @@ impl<A: Allocator + Clone> Tier<A> {
 
     /// The record `key` was made (or could not be): each job that lacked it is entered again
     /// once it lacks nothing, or fails.
-    pub fn made(&mut self, key: RecordKey, result: Result<(), Why>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+    pub fn made(&mut self, key: RecordKey, result: Result<(), Why>, out: &mut AVec<'_, Effect>) -> Result<(), Error> {
         let Some(jobs) = self.making.remove(&key) else {
             return Err(Error::NotNeeded { key });
         };
@@ -395,7 +394,7 @@ impl<A: Allocator + Clone> Tier<A> {
     }
 
     /// The optimized record of `slot`, once made: what [`Effect::File`] writes.
-    pub fn record(&self, slot: SlotId) -> Option<&Optimized<A>> {
+    pub fn record(&self, slot: SlotId) -> Option<&Optimized<'a>> {
         self.records.get(&slot)
     }
 

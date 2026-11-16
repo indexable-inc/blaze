@@ -25,6 +25,8 @@ blaze-hash = { path = "../blaze-hash" }
 [dev-dependencies]
 # `check`, `control`: the properties of typeck.md, "Proof".
 blaze-sim.workspace = true
+# `Alloc::global()`: the tests' handle.
+blaze-own = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

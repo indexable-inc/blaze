@@ -37,7 +37,6 @@ use std::{
 };
 
 use blaze_core::{Completion, Done, Effect, Extent, FileName, IoError, LockMode, Mapping, Meta, Tag};
-use parquet::file::properties::WriterProperties;
 
 use super::{
     CompactError, HistoryError, OWNER,
@@ -328,9 +327,6 @@ struct State {
     manifest: Manifest,
     /// Crash records a flush wrote the rows of: the next commit consumes them, then they go.
     listing: crash::Written,
-    /// Each table's writer properties, by its place in [`crate::schema::TABLES`]: what a
-    /// merge writes with.
-    properties: Vec<WriterProperties>,
 }
 
 impl State {
@@ -2043,11 +2039,7 @@ impl Compact {
                             }
                         }
                     }
-                    let table = self.current().output.table;
-                    let Some(properties) = st.properties.get(table) else {
-                        unreachable!("a merge's table is one of the history's")
-                    };
-                    match merge::Concat::new(inputs, properties) {
+                    match merge::Concat::new(inputs) {
                         Ok(it) => self.concat = Some(it),
                         Err(failed) => return Step::Ready(Err(self.concat_failed(cx, failed))),
                     }
@@ -3805,15 +3797,8 @@ impl Unpin {
 // --- The core -----------------------------------------------------------------------------
 
 impl<H: Host> Files<H> {
-    /// The core of the history in `dir` under the driver's root `root`, with each table's
-    /// writer properties (what its merges write with), by its place in
-    /// [`crate::schema::TABLES`].
-    pub(crate) fn new(
-        host: H,
-        root: PathBuf,
-        dir: FileName,
-        properties: Vec<WriterProperties>,
-    ) -> Files<H> {
+    /// The core of the history in `dir` under the driver's root `root`.
+    pub(crate) fn new(host: H, root: PathBuf, dir: FileName) -> Files<H> {
         Files {
             host,
             root,
@@ -3832,7 +3817,6 @@ impl<H: Host> Files<H> {
                 reaping: false,
                 manifest: Manifest::new(),
                 listing: crash::Written::default(),
-                properties,
             },
             // alloc: once a core
             io: Io { next: 0, asked: Vec::new(), now: Duration::ZERO, wait: Wait::Nothing },
