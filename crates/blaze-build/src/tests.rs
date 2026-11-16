@@ -565,6 +565,21 @@ impl LayoutFacts for TestWorld {
     fn valid_range(&self, _: ItemKey) -> ValidRange {
         ValidRange::default()
     }
+
+    /// The fixture solver: `<args[0] as Deref>::Target` by the rows of `projs`, compared as
+    /// ground types (the ground table interns, so equal types are equal ids).
+    fn normalize(&self, trait_: ItemKey, name: Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
+        let refused = BuildError::Projection { trait_, name };
+        if trait_ != DEREF || name != Name::of("Target") || args.len() != 1 {
+            return Err(refused);
+        }
+        for &(self_, target) in self.projs.iter() {
+            if crate::ground(self.types.view(), self_, &[], ground, Alloc::global(), self)? == args[0] {
+                return crate::ground(self.types.view(), target, &[], ground, Alloc::global(), self);
+            }
+        }
+        Err(refused)
+    }
 }
 
 struct TestAdts<'a> {
@@ -3244,3 +3259,4 @@ mod objects;
 mod closures;
 
 mod forms;
+mod projections;

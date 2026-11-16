@@ -128,7 +128,9 @@ impl Reader {
         }
         let at = Path::new(path).ok()?;
         let mut bytes = Bytes::new_in(self.frame, "the names step's files");
-        self.root.read_all(self.cx, &at, &mut bytes).ok()?;
+        let r = self.root.read_all(self.cx, &at, &mut bytes);
+        eprintln!("DEBUG read {path}: {:?}", r.as_ref().err());
+        r.ok()?;
         // Held to the end of the command, in the names frame.
         let held: &'static Bytes<'static> = std::boxed::Box::leak(std::boxed::Box::new(bytes));
         Some(held.as_slice())
@@ -607,6 +609,7 @@ pub(crate) fn run<'f, 'b>(
     }
     let i = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject).expect("made above");
     let resolved = &names.made[i].1;
+    eprintln!("DEBUG crate scope: files {:?} absent {:?} findings {} inputs {}", resolved.files, resolved.absent, resolved.findings.len(), task.inputs.len());
     // Each checkout file it read is read as its `Surface`: ask for those not given yet, with
     // the dependencies' records again, so the entry after holds them all.
     let unread: std::vec::Vec<&String, Global> = resolved.files.iter().filter(|path| !task.inputs.iter().any(|input| input.name == surface(path))).collect();

@@ -316,7 +316,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 errors.bind(ns, name, hit.def);
             }
             // E0364/E0365: a `use` may not make a binding more visible than it is.
-            if Visibility::narrower(imp.vis, hit.vis, self.asker()) != imp.vis {
+            if hit.through_import(imp.vis, self.asker()) != imp.vis {
                 if let Some(name) = leaf {
                     errors.list.push(ScopeError::WiderReexport { site, ns, name, def: hit.def });
                 }

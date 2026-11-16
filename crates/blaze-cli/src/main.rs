@@ -1107,7 +1107,7 @@ mod tests {
         write(&io, "src/x.rs", "pub fn f() {}\n");
         let created = check(&io, work::Sizes::USUAL);
         assert!(created.failed.is_empty(), "{:?}", created.failed);
-        assert_eq!(created.errors, 0, "the created file clears the error:\n{}", created.profile);
+        assert_eq!(created.errors, 0, "the created file clears the error:\n{}\n{}", created.profile, stdout(&io));
     }
 
     /// A missing module file is one finding at its `mod` line, naming both places; the rest of

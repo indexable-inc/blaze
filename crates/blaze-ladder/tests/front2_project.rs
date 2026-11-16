@@ -47,11 +47,13 @@ fn own_bodies_checked_with_item_relative_diagnostics() {
     let mut world = ProjectWorld::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let t_world = t.elapsed();
     let bodies = world.bodies(Alloc::global());
-    let name_of = |b: &BodyRef<'_>| match b {
-        BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?"),
-        BodyRef::Member { name, .. } => name,
+    let name_of = |b: &BodyRef<'_>| -> String {
+        match b {
+            BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
+            BodyRef::Member { name, .. } => name.to_string(),
+        }
     };
-    let listed: Vec<(&str, Option<u32>)> = bodies.iter().map(|(b, at)| (name_of(b), at.map(|a| a.start))).collect();
+    let listed: Vec<(String, Option<u32>)> = bodies.iter().map(|(b, at)| (name_of(b), at.map(|a| a.start))).collect();
     println!("bodies: {listed:?}");
     let main = bodies.iter().find(|(b, _)| name_of(b) == "main").map(|(b, _)| *b).expect("`main` listed");
     let bad = bodies.iter().find(|(b, _)| name_of(b) == "bad").map(|(b, _)| *b).expect("`bad` listed");

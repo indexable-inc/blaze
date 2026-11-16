@@ -313,7 +313,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                     NsRes::Found(target) => {
                         let hit = Hit {
                             def: target.def,
-                            vis: Visibility::narrower(imp.vis, target.vis, self.asker()),
+                            vis: target.through_import(imp.vis, self.asker()),
                             origin: Origin::Import,
                             expansion: imp.expansion,
                             frag: Some(imp.at.frag),

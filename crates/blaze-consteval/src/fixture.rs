@@ -698,7 +698,7 @@ impl World {
         let alloc = Alloc::global();
         let key = self.eval(name).unwrap_or_else(|e| panic!("{name}: {e}")).key;
         let (mut ground, mut layouts, codes) = self.unit.take().expect("an evaluation made the unit");
-        let g = blaze_build::ground(self.fx.t.view(), ty, &[], &mut ground, alloc).expect("a ground type");
+        let g = blaze_build::ground(self.fx.t.view(), ty, &[], &mut ground, alloc, &*self).expect("a ground type");
         let got = {
             let rec = self.store.iter().find(|r| r.key == key).expect("stored");
             let mut cx = blaze_build::layout::LayoutCx { ground: &mut ground, facts: &*self, scratch: alloc };

@@ -72,6 +72,23 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         got
     }
 
+    /// A goal left ambiguous whose self type is an opaque: its hidden type is not recorded (the
+    /// world answers `opaque_hidden` with `None`), so an auto trait of it (`Send`, which "leaks"
+    /// from the hidden type) has no answer yet. A typed gap naming the form, never E0283.
+    pub(crate) fn opaque_ambiguity_gap(&mut self, goal: Goal) -> Option<crate::error::CheckError> {
+        let Goal::Trait { args, .. } = goal else { return None };
+        if self.ty.list_len(args) == 0 {
+            return None;
+        }
+        let this = self.ty.shallow_resolve(self.ty.list_get(args, 0));
+        match self.view(this) {
+            crate::ty::TyView::Opaque(..) => {
+                Some(crate::error::CheckError::Unported("an auto trait of an opaque type: its hidden type is not recorded yet"))
+            }
+            _ => None,
+        }
+    }
+
     fn close_one(&mut self, k: ItemKey, cause: Cause) -> Result<(), Stop> {
         let preds = self.reads.predicates(k)?;
         for clause in preds.clauses {

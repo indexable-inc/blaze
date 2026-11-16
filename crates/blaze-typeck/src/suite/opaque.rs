@@ -16,6 +16,7 @@
 //! fn user16() -> u16 { need(mk(1u8)) }  // E0308: the bound says `Out = u8`
 //! ```
 
+use std::format;
 use std::string::String;
 use std::vec::Vec;
 
@@ -202,6 +203,110 @@ fn a_hidden_type_that_lacks_a_bound_is_unsatisfied() {
     let root = b.block(&[], Some(a));
     let c = check_body(&fx, &b, d, root, Plant::None, InferPlant::None);
     let want = Want { exprs: &[], pats: &[], diags: &[(DiagCode::Unsatisfied, root)] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// `use_opt_next` of tests/front2_bounds.rs reduced: `enum Option<T> { None, Some(T) }`,
+/// `trait Iterator { type Item; fn next(&mut self) -> Option<Self::Item>; }`,
+/// `fn opt_iter() -> Option<impl Iterator<Item = u8>>` and `fn plain() -> impl Iterator<Item = u8>`
+/// (one opaque key each, bounds `Iterator`, `Item == u8`, `Sized`), checked as
+/// `fn user() -> Option<u8>`.
+fn next_world() -> (Fx, ItemKey) {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let p0 = fx.param(0);
+    let (option, _) = fx.enum_("Option", 1, &[("None", &[]), ("Some", &[p0])]);
+    let iterator = fx.tr("Iterator", 1, Vec::new(), &["Item"]);
+    let item = fx.alias(iterator, "Item", &[p0]);
+    let opt_item = fx.adt(option, &[item]);
+    let m_self = fx.r(crate::ids::Mutbl::Mut, p0);
+    let next = fx.trait_fn(iterator, "next", true, &[m_self], opt_item);
+    fx.use_trait(iterator);
+    fx.lang_def(LangItem::IteratorNext, crate::world::Def::Fn(next));
+    fx.lang_def(LangItem::OptionNone, crate::world::Def::Ctor { adt: option, variant: 0, kind: crate::world::CtorKind::Unit });
+    fx.lang_def(LangItem::OptionSome, crate::world::Def::Ctor { adt: option, variant: 1, kind: crate::world::CtorKind::Tuple });
+    let u8_ = fx.u8();
+    let none = fx.list(&[]);
+    for name in ["opt_iter", "plain"] {
+        let o = fx.opaque_key(&format!("{name}::{{opaque#0}}"));
+        let opaque = fx.ty(PNode::Opaque(o, none));
+        let is_iter = fx.bound(iterator, &[opaque]);
+        let item_u8 = fx.proj(iterator, &[opaque], "Item", u8_);
+        let is_sized = fx.bound(sized, &[opaque]);
+        fx.set_opaque_bounds(o, std::vec![is_iter, item_u8, is_sized]);
+        let out = if name == "plain" { opaque } else { fx.adt(option, &[opaque]) };
+        fx.func(name, 0, &[], out, Vec::new());
+    }
+    let send = fx.tr("Send", 1, Vec::new(), &[]);
+    fx.auto(send);
+    fx.lang(LangItem::Send, send);
+    let is_send = fx.bound(send, &[p0]);
+    let unit = fx.unit();
+    fx.func("need_send", 1, &[p0], unit, std::vec![is_send]);
+    let opt_u8 = fx.adt(option, &[u8_]);
+    let user = fx.func("user", 0, &[], opt_u8, Vec::new());
+    fx.finish();
+    (fx, user)
+}
+
+/// "the caller may only use the methods declared by the specified Trait": `next` through the
+/// opaque's `Iterator` bound, the receiver bound by a pattern inside `Option`:
+/// `match opt_iter() { Some(i) => i.next(), n => None }` is `Option<u8>`.
+#[test]
+fn a_method_on_an_opaque_bound_by_a_pattern() {
+    let (fx, user) = next_world();
+    let mut b = Bb::new();
+    let f = b.path(&["opt_iter"]);
+    let call = b.call(f, &[]);
+    let i = b.bind("i");
+    let some = b.lang_variant_pat(LangItem::OptionSome, &[i]);
+    let recv = b.local(i);
+    let next = b.method(recv, "next", &[]);
+    let n = b.bind("n");
+    let none = b.lang(LangItem::OptionNone);
+    let m = b.match_(call, &[(some, next), (n, none)]);
+    let root = b.block(&[], Some(m));
+    let c = check_body(&fx, &b, user, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(next, "Option<u8>"), (root, "Option<u8>")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// `Send` of an opaque whose bounds do not say it: an auto trait "leaks" from the hidden type,
+/// which the world does not record yet, so `{ need_send(plain()); None }` is the typed gap
+/// naming that, never E0283 "cannot satisfy" (what it was before rules/opaque_def.rs's gap).
+#[test]
+#[should_panic(expected = "an auto trait of an opaque type")]
+fn send_of_an_opaque_is_a_gap_until_its_hidden_type_is_recorded() {
+    let (fx, user) = next_world();
+    let mut b = Bb::new();
+    let f = b.path(&["plain"]);
+    let call = b.call(f, &[]);
+    let need = b.path(&["need_send"]);
+    let sent = b.call(need, &[call]);
+    let s = b.semi(sent);
+    let none = b.lang(LangItem::OptionNone);
+    let root = b.block(&[s], Some(none));
+    let _ = check_body(&fx, &b, user, root, Plant::None, InferPlant::None);
+}
+
+/// The form that checks clean in tests/front2_bounds.rs (`let mut i = evens(); i.next()`), in
+/// the same world: `{ let i = plain(); i.next() }`.
+#[test]
+fn a_method_on_an_opaque_bound_by_let() {
+    let (fx, user) = next_world();
+    let mut b = Bb::new();
+    let f = b.path(&["plain"]);
+    let call = b.call(f, &[]);
+    let i = b.bind("i");
+    let s = b.let_(i, None, call);
+    let recv = b.local(i);
+    let next = b.method(recv, "next", &[]);
+    let root = b.block(&[s], Some(next));
+    let c = check_body(&fx, &b, user, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(next, "Option<u8>")], pats: &[], diags: &[] };
     let d = written(differences(&fx, &b, &c, &want));
     assert!(d.is_empty(), "\n{}", d.join("\n"));
 }

@@ -1130,7 +1130,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 if field >= v.fields.len {
                     return Err(malformed("a field past its variant"));
                 }
-                Ok(layout::field_ty(&adt, v.fields.start + field, args, self.ground, self.alloc)?)
+                Ok(layout::field_ty(&adt, v.fields.start + field, args, self.ground, self.alloc, self.world)?)
             }
             PNode::Array(e, _) | PNode::Slice(e) => Ok(e),
             _ => Err(malformed("a field of a type with none")),

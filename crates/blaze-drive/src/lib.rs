@@ -80,6 +80,9 @@ pub enum Plant {
     /// A settled record whose out digest changed does not dirty its readers: the validity check
     /// skips a changed read.
     SkipChangedRead,
+    /// A name with no record (never made, or dropped) keeps no watch row: the readers that read
+    /// it absent are forgotten, so its appearing reruns none of them.
+    ForgetAbsentReaders,
     /// A want of a name whose task is running starts a second run of the same key.
     DoubleFlight,
     /// A batch's records are applied a second time, past the ticket check.

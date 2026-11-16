@@ -785,6 +785,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             match err.kind {
                 crate::ty::FulfillErrorKind::Ambiguous => {
                     if ambiguity && self.errors == 0 {
+                        // An auto trait of an opaque: a gap until its hidden type is recorded.
+                        if let Some(gap) = self.opaque_ambiguity_gap(err.obligation.goal) {
+                            return Err(gap.into());
+                        }
                         let code = match err.obligation.goal {
                             crate::ty::Goal::Trait { trait_, .. } if self.lang(LangItem::Sized)? != Some(trait_) => {
                                 DiagCode::CannotSatisfy

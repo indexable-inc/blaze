@@ -255,7 +255,6 @@ const CASES: [(&str, &str, Result<bool, ()>); 11] = [
 /// resolves to that binding: "found Some(\"&MCall\"), expected Some(\"MCall\")" for `by_hand`
 /// and both derived `clone`s. Owner: blaze-lower's scoped resolution ("Items inside bodies").
 #[test]
-#[ignore = "blaze-lower's scoped resolution does not turn a candidate binding into a path pattern yet (Items inside bodies lane)"]
 fn unit_struct_patterns_through_front2() {
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");

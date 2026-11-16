@@ -60,8 +60,8 @@ pub struct InferCtx<'a> {
     /// The next error `next_error` hands out.
     error_at: usize,
     closures: HashMap<u128, ClosureRow, Alloc<'a>>,
-    /// Each closure of another body this context made, by its type.
-    foreign: HashMap<Ty, ForeignClosure, Alloc<'a>>,
+    /// Each closure of another body this context made, in the order made (a body names few).
+    foreign: Vec<ForeignClosure, Alloc<'a>>,
     /// Each async block's future this body made, by its def: its expression.
     futures: HashMap<u128, ExprId, Alloc<'a>>,
     /// Solver reads (the solver's own log; the body's read list is `Reads`).
@@ -104,6 +104,8 @@ struct ClosureRow {
 /// made for it: `view` gives it back.
 #[derive(Clone, Copy, Debug)]
 struct ForeignClosure {
+    /// The solver's term `mk` made for it.
+    made: blaze_ty::Ty,
     owner: ItemKey,
     ordinal: u32,
     args: TyList,
@@ -152,7 +154,7 @@ impl<'a> InferCtx<'a> {
             errors: Vec::new_in(alloc),
             error_at: 0,
             closures: HashMap::new_in(alloc),
-            foreign: HashMap::new_in(alloc),
+            foreign: Vec::new_in(alloc),
             futures: HashMap::new_in(alloc),
             solver_reads: Vec::new_in(alloc),
             need_rounds: 0,
@@ -214,6 +216,29 @@ impl<'a> InferCtx<'a> {
 
     fn bty(&self, t: Ty) -> blaze_ty::Ty {
         ty_of(self.node(t.0))
+    }
+
+    /// The closure of another body this context made whose owner's arguments, with the
+    /// variables bound since resolved, are `l`'s: the solver rebuilds `{closure#0 of gen<?T>}`
+    /// as `{closure#0 of gen<u8>}` once `?T = u8`, a new term of the same closure. Each
+    /// argument is compared after a shallow probe: a variable nested inside an argument
+    /// (`gen::<Vec<?T>>`) is not seen through, and its closure stays unviewable (a panic).
+    fn foreign_resolved(&self, d: blaze_ty::Def, l: blaze_ty::List) -> Option<&ForeignClosure> {
+        let tys = &self.terms.cx.tys;
+        let n = tys.list_len(l);
+        let same = |a: blaze_ty::Arg, b: blaze_ty::Arg| match (a.ty(), b.ty()) {
+            (Some(x), Some(y)) => self.terms.cx.probe(x) == self.terms.cx.probe(y),
+            _ => a == b,
+        };
+        self.foreign.iter().find(|f| {
+            let TyKind::Closure(d2, l2) = tys.ty_kind(f.made) else { return false };
+            d2 == d
+                && tys.list_len(l2) == n
+                && (0..n.saturating_sub(3)).all(|i| match (tys.list_get(l, i), tys.list_get(l2, i)) {
+                    (Some(a), Some(b)) => same(a, b),
+                    _ => false,
+                })
+        })
     }
 
     /// A closure's signature (a `FnPtr`, inputs then output) in the solver's "rust-call" form:
@@ -538,7 +563,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 all.push(B::UNIT.arg());
                 let l = self.terms.cx.tys.mk_list(&all);
                 let t = self.terms.cx.tys.closure(def, l);
-                self.foreign.insert(Ty(t.node().bits()), ForeignClosure { owner, ordinal, args, sig, kind });
+                self.foreign.push(ForeignClosure { made: t, owner, ordinal, args, sig, kind });
                 t
             }
             // `Coroutine(def, [output, interior])`; its def a hash of the block's expression, as
@@ -650,7 +675,11 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 if let Some(r) = self.closures.get(&k) {
                     return TyView::Closure(r.expr, r.sig);
                 }
-                let Some(f) = self.foreign.get(&t) else { panic!("blaze-typeck: a closure this context did not make") };
+                let made = self.bty(t);
+                let exact = self.foreign.iter().find(|f| f.made == made);
+                let Some(f) = exact.or_else(|| self.foreign_resolved(d, l)) else {
+                    panic!("blaze-typeck: a closure this context did not make")
+                };
                 TyView::ClosureOf { owner: f.owner, ordinal: f.ordinal, args: f.args, sig: f.sig, kind: f.kind }
             }
             TyKind::Coroutine(d, l) => {

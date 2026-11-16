@@ -1552,6 +1552,37 @@ started, its result line not captured. The rust-call test: passed (not in the fa
   associated const through a parameter's bound) and `self.code.hash(state)` on `ContentId`.
   Not reduced.
 
+(13) Runner after (12) (2026-11-16), tempo's checker classes (tempo-front-4: 916 E0034, 611
+E0599, 151 E0277):
+- ONE home for `T::name` as a value: lit_path.rs `assoc_value`. Inherent first (an applicable
+  inherent item ends the search, already so), an item listed twice by `World::inherent` counts
+  ONCE (by item key; no order assumed), the trait list deduplicated, and the trait of the impl
+  the body is a member of joins the traits in scope (`assoc_parent(owner)` then
+  `impl_header(container).trait_`: rustc_resolve's `traits_in_scope` adds `current_trait_ref`).
+- `Self::A` / `Alias::A` where the prefix is `Def::Adt` of an enum (front2 world_paths.rs answers
+  `Self` as `Def::Adt` consuming ONE segment): `value_path` takes a variant of that name before
+  any associated item (rustc's `associated_path_to_ty`), in expressions and patterns (both go
+  through `value_path`); the ctor's type is one helper, `ctor_ty`, shared with `Def::Ctor`.
+- Proof: blaze-typeck suite/self_paths.rs (fixture answers as front2 does: `Self` is
+  `Def::Adt`, one segment): with the fix "test blaze-typeck: exit 0; 2 passed, 0 failed";
+  without the two rules: "diagnostics: want [], got [(NoMethod, 0)]" for both
+  (`a_variant_through_self_is_the_variants_ctor`, `self_reaches_the_impls_own_trait_without_an_import`).
+- NOT RUN: blaze-ladder tests/front2_selfpaths.rs (A1-A3, B1-B5, C1-C9 through the real front end,
+  incl. alloy's exact `type RustType = Self; type Token<'a> = <U as SolType>::Token<'a>;`).
+  Every run was blocked by other lanes' open batches (last: "crates/blaze-consteval/src/
+  machine/code.rs:764:19: error[E0061]: this function takes 6 arguments but 5 arguments were
+  supplied": `blaze_build::ground`). RUN IT FIRST. Expected leads: (A) the duplicate is the
+  front end's: buckets.rs `answer_inherent` pushes into `inherent` and can fail mid-loop on
+  `Unfilled::Fn(f)` (`?`), so the retried fill pushes the impl's earlier items again: if the
+  reduction is clean, that is the census's 916 (the checker now counts them once; the bucket
+  should still be made idempotent: ITEMS lane). (C) solve alias.rs `step_impl`: an impl whose
+  `h.assoc` lacks the item gives `TyKind::Error` ("== Error" in the census's SignatureType
+  example): suspect the front end dropping the impl's associated types when one is a GAT whose
+  value is a GAT projection (`Token<'a>`; facts.rs `own_generics: 0`); c7/c8/c9 tell which.
+- Suites: blaze-typeck "115 passed, 5 failed" before the fixture (3 closures: the closure batch's
+  open work; 2 suite/opaque.rs: owed from (12), plain paths only, untouched by this change);
+  blaze-solve "8 passed, 0 failed".
+
 ## Closures against `Fn` bounds (2026-11-16, closures lane)
 
 The library's definitions (library/core/src/ops/function.rs): `#[lang = "fn_once"] pub trait

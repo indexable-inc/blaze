@@ -300,3 +300,43 @@ fn builtin_type_name_beside_a_module_of_its_name() {
     assert_eq!((shadow.def.kind, names.crate_of(shadow.def.key)), (DefKind::Other, Some(0)), "`struct str;` shadows the built-in");
     assert_ne!(Some(shadow.def), crate::builtin::builtin_type("str"), "the local struct, not the built-in");
 }
+
+/// The `uint` crate's `#[doc(hidden)] pub use core as core_;` and its `construct_uint!`
+/// writing `$crate::core_::ops::Mul` (expanded in discv5): a `pub use` of an extern-prelude
+/// crate under a new name is a public re-export (the Reference, "Use declarations", "Use
+/// visibility"), so `uint::core_::ops::Mul` resolves from any crate, from the user's own text and
+/// from the expansion of uint's macro alike. The `extern crate base;` stands for the `extern crate
+/// core;` every root is given (private): `base` names that item first, and a single `use` of an
+/// extern crate item keeps its own visibility (rustc's `pub_use_of_private_extern_crate_hack` in
+/// `Resolver::import`; at most a lint, never a narrower binding).
+const UINT: &str = "#![no_core]
+extern crate base;
+#[doc(hidden)]
+pub use base as base_;
+#[macro_export]
+macro_rules! construct {
+    () => { pub use $crate::base_::ops::Mul as Made; };
+}
+";
+const BASE: &str = "#![no_core]
+pub mod ops { pub trait Mul {} }
+";
+const UINT_USER: &str = "#![no_core]
+uint::construct!();
+";
+static UINT_TEXTS: Texts = Texts(&[&[("/user/lib.rs", UINT_USER)], &[("/uint/lib.rs", UINT)], &[("/base/lib.rs", BASE)]]);
+
+#[test]
+fn a_pub_use_of_a_crate_renamed_is_a_public_re_export() {
+    let crates = [input("user", "/user/lib.rs", &[("uint", 1)]), input("uint", "/uint/lib.rs", &[("base", 2)]), input("base", "/base/lib.rs", &[])];
+    let names = resolved(&crates, &UINT_TEXTS);
+    let root = names.root(0);
+    let at = |segments: &'static [&'static str]| names.item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments }, Alloc::global());
+    let plain = at(&["uint", "base_", "ops", "Mul"]).unwrap_or_else(|e| panic!("`uint::base_::ops::Mul`: {e}"));
+    assert_eq!(plain.krate, 2, "`uint::base_::ops::Mul` is base's");
+    let made = at(&["Made"]).unwrap_or_else(|e| {
+        let errors: Vec<_> = names.krate(0).done.values().map(|d| &d.scope.errors).collect();
+        panic!("`Made`, imported by uint's macro through `$crate::base_`: {e}; errors {errors:?}")
+    });
+    assert_eq!(made.krate, 2, "`Made` is base's `Mul`");
+}

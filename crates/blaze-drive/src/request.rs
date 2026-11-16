@@ -1746,7 +1746,10 @@ impl<'a> Request<'a> {
 
     /// The row this run knows for `name`: made this run, else the old one.
     fn current(&self, name: Name) -> Option<&Row<'a>> {
-        self.new.get(&name).or_else(|| self.old(name))
+        match self.new.get(&name) {
+            Some(row) => (!row.watching()).then_some(row),
+            None => self.old(name),
+        }
     }
 
     /// What a read of `read` sees now, or that `waiter` waits for it.
@@ -2690,8 +2693,8 @@ impl<'a> Request<'a> {
         // Every page the update touches must be loaded first.
         let old_rows = self.root.as_ref().map_or(0, |root| root.rows);
         let mut added = 0u64;
-        for name in self.new.keys() {
-            if self.old(*name).is_none() {
+        for (name, row) in self.new.iter() {
+            if self.old(*name).is_none() && !row.watching() {
                 added += 1;
             }
         }
@@ -3037,6 +3040,23 @@ fn over_cap_message(buf: &mut [u8; MESSAGE_BYTES], span: u32, under: &Condition,
     fmt::Write::write_fmt(&mut cut, format_args!("{}", ConditionError::OverCap { conditions: span, vars }))
         .expect("a cut writer takes every byte (it drops what does not fit)");
     cut.len
+}
+
+/// A watch row for `name` ([`Row::watching`]): no record, its readers only.
+fn watch_row<'a>(name: Name, readers: Vec<Name, Alloc<'a>>, alloc: Alloc<'a>) -> Row<'a> {
+    Row {
+        key: Key::default(),
+        at: Key::default(),
+        source: ABSENT,
+        out: ABSENT,
+        home: name,
+        place: 0,
+        reads: Vec::new_in(alloc.clone()),
+        parts: Vec::new_in(alloc),
+        readers,
+        split: None,
+        cond: None,
+    }
 }
 
 fn file_of(name: Name, home: Name) -> Name {

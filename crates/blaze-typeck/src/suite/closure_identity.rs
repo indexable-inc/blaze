@@ -65,6 +65,8 @@ fn world(with_facts: bool) -> (Fx, Items) {
     fx.set_header(call, rust_call);
 
     let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+    // impl Copy for u8 (core/src/marker.rs `marker_impls!`); `S` below is not Copy.
+    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], Vec::new());
     let io = fx.list(&[u8_, u8_]);
     let sig_u8 = fx.ty(PNode::FnPtr(io, FnPtrHeader::RUST));
     let io = fx.list(&[u8_, p0]);

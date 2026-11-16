@@ -761,7 +761,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 return Ok(PTy(c));
             }
         }
-        let out = blaze_build::ground(cc.typed.types, t, &cc.args, self.ground, self.alloc).map_err(|_| unsupported("a type with no ground form (an alias, an opaque type, a closure)"))?;
+        let out = blaze_build::ground(cc.typed.types, t, &cc.args, self.ground, self.alloc, self.world).map_err(|_| unsupported("a type with no ground form (an alias, an opaque type, a closure)"))?;
         if cc.tys.len() <= t.0 as usize {
             cc.tys.resize(t.0 as usize + 1, u32::MAX);
         }

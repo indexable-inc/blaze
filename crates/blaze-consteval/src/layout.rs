@@ -168,7 +168,7 @@ const TAIL_DEPTH: u32 = 64;
 /// whose last field is, followed through each struct's last field (the Reference, "Dynamically
 /// sized types": "a struct may contain a DST as the last field ... making the struct itself a
 /// DST"; core's `CStr { inner: [c_char] }`).
-pub(crate) fn is_unsized<W: LayoutFacts + ?Sized>(world: &W, g: &mut PortableTys<'_>, pointee: PTy, scratch: Alloc<'_>) -> Result<bool, Refusal<'static>> {
+pub(crate) fn is_unsized<W: LayoutFacts>(world: &W, g: &mut PortableTys<'_>, pointee: PTy, scratch: Alloc<'_>) -> Result<bool, Refusal<'static>> {
     let mut t = pointee;
     for _ in 0..TAIL_DEPTH {
         match g.view().node(t).map_err(|_| bad())? {
@@ -182,7 +182,7 @@ pub(crate) fn is_unsized<W: LayoutFacts + ?Sized>(world: &W, g: &mut PortableTys
                 if v.fields.len == 0 {
                     return Ok(false);
                 }
-                t = field_ty(&adt, v.fields.start + v.fields.len - 1, args, g, scratch)?;
+                t = field_ty(&adt, v.fields.start + v.fields.len - 1, args, g, scratch, world)?;
             }
             _ => return Ok(false),
         }
@@ -195,9 +195,9 @@ fn bad() -> Refusal<'static> {
 }
 
 /// The ground type of field `field` of `adt` at `args`.
-pub(crate) fn field_ty(adt: &Adt<'_>, field: u32, args: List, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Result<PTy, Refusal<'static>> {
+pub(crate) fn field_ty(adt: &Adt<'_>, field: u32, args: List, ground: &mut PortableTys<'_>, scratch: Alloc<'_>, facts: &dyn LayoutFacts) -> Result<PTy, Refusal<'static>> {
     let f = adt.fields.get(field as usize).ok_or(Refusal::Malformed { what: "a field past its ADT" })?;
     let mut a: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     a.extend_from_slice(ground.view().list(args).map_err(|_| bad())?);
-    blaze_build::ground(adt.types, f.ty, &a, ground, scratch).map_err(|_| Refusal::Unsupported { what: "a field type with no ground form" })
+    blaze_build::ground(adt.types, f.ty, &a, ground, scratch, facts).map_err(|_| Refusal::Unsupported { what: "a field type with no ground form" })
 }

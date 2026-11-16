@@ -139,6 +139,15 @@ pub(crate) struct Hit {
 }
 
 impl Hit {
+    /// The visibility a single `use` declared `import` gives this binding: no wider than the
+    /// binding itself (E0364/E0365), except a binding of an `extern crate` item, which a `use`
+    /// re-exports at the `use`'s own visibility: every root's injected `extern crate core;` is
+    /// private, yet `pub use core as core_;` (the `uint` crate) is a public re-export (rustc's
+    /// `Resolver::import`, `pub_use_of_private_extern_crate_hack`: a lint at most).
+    pub(crate) fn through_import(&self, import: Visibility, asker: Asker<'_>) -> Visibility {
+        if self.origin == Origin::ExternCrate { import } else { blaze_surface::SeenFrom::narrower(import, self.vis, asker) }
+    }
+
     /// A module named by a path's start (`crate`, `self`, `super`, `$crate`).
     pub(crate) fn module(key: ItemKey) -> Hit {
         Hit {
