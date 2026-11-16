@@ -91,7 +91,13 @@ See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wor
 
 ## fan-out-write-only (rule 35)
 
-The head is always green. There is one head that has check-compiled whole (`cargo check --workspace
+Bias, by the owner on 2026-11-15 ("cant we just do thign in parlalel? like we odntn eed to wait for
+compile"): writing does not wait for compiling. When pieces are independent, start them all now; a
+lane writes its next piece without waiting for the last to compile; the main agent compiles the
+combined tree when a batch has landed, sometimes, and sends each error to the lane whose file it
+names. A tree that does not compile for a while is normal while lanes are mid-piece and stops no
+one. Do not ask whether to start work that follows from what was decided: start it and say so. The
+head is always green. There is one head that has check-compiled whole (`cargo check --workspace
 --all-targets`, until blaze builds blaze fast) and a lane's piece joins it alone: its files are
 applied onto that head in one scratch checkout with a warm target, the workspace is check-compiled,
 and it is committed only if that passes; if not, the errors go back to that lane and the head does
