@@ -43,7 +43,7 @@ global allocation (`blaze::lock_held_across_slow`); raw `std::sync` and `parking
 banned in `.clippy.toml` outside `crates/blaze-core/src/lock.rs`, and a contended wait records who
 waited behind whom into the profile's `lock_waits` (`blaze debug locks` ranks them and says what to
 use instead: arc-swap or RCU for reads, papaya for a map, an atomic for an integer, a channel for a
-queue, an owner for one holder); a shared map is `papaya::HashMap`; a single-owner map or set is
+queue, an owner for one holder); a shared map is `blaze_hash::SharedMap` (papaya's, `papaya::HashMap` itself banned); a single-owner map or set is
 `blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named as
 `bump-allocate` says: a frame's for a task, `Global` with a reason otherwise), with
 `blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for
@@ -148,7 +148,11 @@ must not panic: render what needs the database while the database is attached.
 
 A fiber can resume on another thread after any wait, so nothing held across a wait may be tied to a
 thread: no thread-local borrow, lock guard or `Rc`. Mark regions that must not wait with `NoWait`;
-read thread-locals in `#[inline(never)]` functions that end before any wait.
+read thread-locals in `#[inline(never)]` functions that end before any wait. That holds for a
+dependency's thread-local too: the compiler may keep a thread-local's address across a call that
+waits, so an inlined read after the wait reads the first thread's slot (papaya's `pin`, inlined,
+made seize guards on the wrong thread's slot and freed a table under a reader; `blaze_hash::SharedMap`
+pins in a call of its own).
 
 ## deadline-waits (rule 44)
 

@@ -6,11 +6,12 @@
 //!   `BTreeMap`, hashbrown's and blaze-hash's `HashMap`, indexmap's `IndexMap`) or a set (std's
 //!   `HashSet` and `BTreeSet`, hashbrown's and blaze-hash's `HashSet`, indexmap's `IndexSet`),
 //!   the lock itself or inside `Arc`s, `LazyLock`s and `OnceLock`s (std's, or once_cell's
-//!   `Lazy` and `OnceCell`): a shared map is `papaya::HashMap`, a shared set `papaya::HashSet`.
-//!   For a hashed collection whose type is written out, in a field or in a static's lazy cell,
-//!   the fix writes the papaya type with the collection's own arguments for the lock; it is
+//!   `Lazy` and `OnceCell`): a shared map is `blaze_hash::SharedMap`, a shared set
+//!   `blaze_hash::SharedSet` (papaya's tables, pinned in a call of their own). For a hashed
+//!   collection whose type is written out, in a field or in a static's lazy cell, the fix
+//!   writes the shared type with the collection's own arguments for the lock; it is
 //!   `MaybeIncorrect`, the uses changing with it. A static with no lazy cell gets no fix (the
-//!   papaya types have no `const` constructor), nor does a local (its type is inferred).
+//!   shared types have no `const` constructor), nor does a local (its type is inferred).
 //! - A `push` or `extend` onto a `Vec` through a lock guard (a `Mutex`'s, or an `RwLock`'s
 //!   write guard), inside a closure handed to a function of `blaze_graph::par`: the results of
 //!   parallel items come back from `par` (`map`, `filter_map`, `extend`) in their order, never
@@ -82,8 +83,8 @@ impl Shape {
     /// What a collection of this shape is shared as.
     fn papaya(self) -> &'static str {
         match self {
-            Shape::Map => "papaya::HashMap",
-            Shape::Set => "papaya::HashSet",
+            Shape::Map => "blaze_hash::SharedMap",
+            Shape::Set => "blaze_hash::SharedSet",
         }
     }
 }
@@ -459,7 +460,7 @@ pub struct Pair(parking_lot::Mutex<hashbrown::HashMap<u32, u32>>);
             found.contains("the field `0` of `Pair` shares a `HashMap` behind one `Mutex`"),
             "{found}"
         );
-        assert!(found.contains("papaya::HashMap<u32, u32>"), "{found}");
+        assert!(found.contains("blaze_hash::SharedMap<u32, u32>"), "{found}");
         assert!(
             found.contains("sorting where its order is read"),
             "an ordered map is not fixed to a hash map:\n{found}"
@@ -478,7 +479,7 @@ pub struct Fine {
     map: HashMap<u32, u32>,
     count: Mutex<u32>,
     list: Mutex<Vec<u32>>,
-    shared: papaya::HashMap<u32, u32>,
+    shared: blaze_hash::SharedMap<u32, u32>,
 }
 pub fn local() -> usize {
     let m: Mutex<HashMap<u32, u32>> = loop {};
@@ -540,7 +541,7 @@ pub struct Seen {
             found.contains("the field `indexed` of `Seen` shares a `IndexSet` behind one `Mutex`"),
             "{found}"
         );
-        assert!(found.contains("papaya::HashSet<u32>"), "{found}");
+        assert!(found.contains("blaze_hash::SharedSet<u32>"), "{found}");
         assert_eq!(
             found.matches("sorting where its order is read").count(),
             3,
@@ -587,8 +588,8 @@ pub static MAP: LazyLock<HashMap<u32, u32>> = LazyLock::new(|| loop {});
             1,
             "only `PLAIN` has no cell:\n{found}"
         );
-        assert!(found.contains("papaya::HashSet<u32>"), "{found}");
-        assert!(found.matches("papaya::HashMap<u32, u32>").count() >= 2, "{found}");
+        assert!(found.contains("blaze_hash::SharedSet<u32>"), "{found}");
+        assert!(found.matches("blaze_hash::SharedMap<u32, u32>").count() >= 2, "{found}");
     }
 
     /// A local is found where its `Arc` is made, not where it is cloned or moved; a lock that
@@ -620,7 +621,7 @@ pub fn shared() {
             found.contains("the local `sets` shares a `BTreeSet` behind one `RwLock` in an `Arc`"),
             "{found}"
         );
-        assert!(found.contains("share it as an `Arc<papaya::HashMap<..>>`"), "{found}");
+        assert!(found.contains("share it as an `Arc<blaze_hash::SharedMap<..>>`"), "{found}");
         assert!(found.contains("sorting where its order is read"), "{found}");
     }
 
@@ -635,8 +636,8 @@ pub fn shared() {
             ),
         ] {
             let found = blaze_only(LINT, &before);
-            assert!(found.contains("papaya::HashMap<u32, u32>"), "{found}");
-            let after = before.replace(lock, "papaya::HashMap<u32, u32>");
+            assert!(found.contains("blaze_hash::SharedMap<u32, u32>"), "{found}");
+            let after = before.replace(lock, "blaze_hash::SharedMap<u32, u32>");
             assert_ne!(after, before);
             let left = blaze_only(LINT, &after);
             assert!(left.is_empty(), "the fixed file lints clean:\n{after}\n{left}");

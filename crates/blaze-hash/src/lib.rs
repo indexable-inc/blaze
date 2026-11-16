@@ -58,6 +58,9 @@ pub mod adaptive;
 mod blake3;
 mod key;
 pub mod order;
+mod shared;
+#[cfg(test)]
+mod shared_tests;
 #[cfg(test)]
 mod order_tests;
 mod sip;
@@ -67,6 +70,7 @@ mod tests;
 
 pub use blake3::{Blake3, Blake3Hasher};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
+pub use shared::{SharedByHash, SharedMap, SharedSet};
 pub use sip::{LazyKey, SipHasher, SipKey};
 pub use order::{OrderMap, OrderSet};
 pub use table::{Map, Set};
@@ -101,17 +105,6 @@ pub type KeyedMap<K, V, A> = Map<K, V, SipKey, A>;
 
 /// A set of keys an attacker may pick, as [`KeyedMap`].
 pub type KeyedSet<K, A> = Set<K, SipKey, A>;
-
-/// A map of ordinary keys shared between threads, made by `SharedMap::default()`. Like the
-/// other shared tables it names no allocator: papaya takes none, and a shared table is
-/// long-lived, so it is on the global heap (see the crate's documentation).
-pub type SharedMap<K, V> = papaya::HashMap<K, V, FixedState>;
-
-/// A set of ordinary keys shared between threads, made by `SharedSet::default()`.
-pub type SharedSet<K> = papaya::HashSet<K, FixedState>;
-
-/// A map on hashes shared between threads, indexed by the hash itself.
-pub type SharedByHash<K, V> = papaya::HashMap<K, V, BuildKeyHasher>;
 
 /// What the shared tables are asked with: a borrowed form of a key ([`Equivalent`]), and what
 /// a compare-and-swap of an entry does ([`Operation`], for `map.pin().compute(..)`).

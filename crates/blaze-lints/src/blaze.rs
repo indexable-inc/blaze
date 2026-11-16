@@ -1864,7 +1864,7 @@ impl Lint {
                 "copy out what the query needs and drop the guard before the call, or make the locked state a query input"
             }
             Lint::LockHeldAcrossSlow => {
-                "copy out what the call needs and drop the guard before it, then take the lock again to write the result; or move the state to an atomic, `papaya::HashMap` or one owner thread"
+                "copy out what the call needs and drop the guard before it, then take the lock again to write the result; or move the state to an atomic, `blaze_hash::SharedMap` or one owner thread"
             }
             Lint::UndeclaredEffect => {
                 "add the word to the function's `#[blaze::expect(..)]` (`blaze check --fix` writes the list), handle the effect so the function no longer has it, or mark a callee proven by hand `#[blaze::expect(.., trusted = \"why\")]` without the word"
@@ -2269,7 +2269,7 @@ impl Lint {
                 "name what is awaited (the key, the lock's data, the channel's message) where the wait is written"
             }
             Lint::SharedCollectionLock => {
-                "share a map as `papaya::HashMap`; take the results of parallel items from `blaze_graph::par`, in order, not from a locked `Vec`"
+                "share a map as `blaze_hash::SharedMap`; take the results of parallel items from `blaze_graph::par`, in order, not from a locked `Vec`"
             }
             Lint::OpenWaitLoop => {
                 "count the rounds or take a deadline from the injected clock, compare it where the loop ends, and return an error naming what it waited for"

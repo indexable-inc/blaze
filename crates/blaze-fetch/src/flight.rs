@@ -22,7 +22,7 @@ pub type Flight = (usize, blaze_cas::Key);
 
 /// The pins being downloaded, each with the receiver its followers wait on.
 pub struct Flights {
-    live: papaya::HashMap<Flight, Receiver<()>>,
+    live: blaze_hash::SharedMap<Flight, Receiver<()>>,
     /// Told once each time a request begins to follow: a test's proof that its requests
     /// waited on a leader rather than downloading or finding the store already filled.
     followed: Option<Sender<()>>,
@@ -72,12 +72,12 @@ impl Default for Flights {
 
 impl Flights {
     pub fn new() -> Flights {
-        Flights { live: papaya::HashMap::new(), followed: None }
+        Flights { live: blaze_hash::SharedMap::default(), followed: None }
     }
 
     /// A table that sends on `followed` each time a request begins to follow (a test's).
     pub fn watched(followed: Sender<()>) -> Flights {
-        Flights { live: papaya::HashMap::new(), followed: Some(followed) }
+        Flights { live: blaze_hash::SharedMap::default(), followed: Some(followed) }
     }
 
     /// The process's table: every [`crate::Fetcher`] of the process shares it.
