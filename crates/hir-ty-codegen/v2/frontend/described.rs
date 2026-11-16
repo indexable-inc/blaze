@@ -18,7 +18,7 @@
 //! - the image key of the crate the instance is worked out in (its home,
 //!   `hir_ty_mir::mir::home`): the content of that crate and, by its dependencies' keys, of
 //!   every crate it loads, which is every crate the describe reads;
-//! - the instance itself, ported ([`hir_ty::check_cache::port`]): its body by its item's key,
+//! - the instance itself, ported ([`hir_ty::next_solver::persist::port`]): its body by its item's key,
 //!   its arguments as types by content.
 //!
 //! Only an instance whose home is read from an image has one, and only when every item and
@@ -46,7 +46,7 @@ use blaze_format::{
 };
 use blaze_hash::SharedMap;
 use blaze_memo::Id as _;
-use hir_ty::check_cache::port;
+use hir_ty::next_solver::persist::port;
 
 use super::*;
 
@@ -1165,10 +1165,7 @@ mod tests {
     use blaze_items::ItemKey;
     use blaze_sim::Config;
     use hir_expand::fixture;
-    use hir_ty::{
-        check_cache::port,
-        next_solver::{DbInterner, GenericArgs, ParamEnv},
-    };
+    use hir_ty::next_solver::{DbInterner, GenericArgs, ParamEnv, persist::port};
 
     use super::{
         BuildTime, Closure, Databases, HashSource, HirFrontend, put_instance, static_key_over,

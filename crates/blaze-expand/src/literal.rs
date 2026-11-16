@@ -48,6 +48,14 @@ pub(crate) enum LitError {
     CStr,
     IntegerTooLarge,
     Invalid,
+    /// `concat_bytes!` of a character or string literal.
+    CharOrStr,
+    /// `concat_bytes!` of a numeric literal outside an array.
+    NumberAlone,
+    /// A `concat_bytes!` array element that is a numeric literal but not a `u8`.
+    NotAU8,
+    /// `concat_bytes!` of a float or C string literal.
+    NotBytes,
 }
 
 impl LitError {
@@ -59,7 +67,151 @@ impl LitError {
             LitError::CStr => "cannot concatenate a C string literal",
             LitError::IntegerTooLarge => "the integer literal is too large",
             LitError::Invalid => "the literal does not lex",
+            LitError::CharOrStr => {
+                "cannot concatenate a character or string literal into bytes: write a byte literal"
+            }
+            LitError::NumberAlone => {
+                "a numeric literal is concatenated into bytes only inside an array: write `[n]`"
+            }
+            LitError::NotAU8 => "the numeric literal is not a `u8`",
+            LitError::NotBytes => "cannot concatenate this literal into bytes",
         }
+    }
+}
+
+/// `concat_bytes!`'s bytes of one literal outside an array, appended: a byte or a byte string.
+pub(crate) fn bytes_piece<B: Allocator>(
+    kind: LitKind,
+    text: &str,
+    suffix_len: u32,
+    out: &mut Vec<u8, B>,
+) -> Result<(), LitError> {
+    if suffix_len != 0 && !matches!(kind, LitKind::Integer | LitKind::Float) {
+        return Err(LitError::Invalid);
+    }
+    match kind {
+        LitKind::Byte => {
+            out.push(unescape_byte(text)?);
+            Ok(())
+        }
+        LitKind::ByteStr => unescape_bytes(text, out),
+        LitKind::ByteStrRaw(_) => {
+            if !text.is_ascii() {
+                return Err(LitError::Invalid);
+            }
+            out.extend_from_slice(text.as_bytes());
+            Ok(())
+        }
+        LitKind::Char | LitKind::Str | LitKind::StrRaw(_) => Err(LitError::CharOrStr),
+        LitKind::Integer => Err(LitError::NumberAlone),
+        LitKind::Float | LitKind::CStr | LitKind::CStrRaw(_) => Err(LitError::NotBytes),
+        LitKind::Err => Err(LitError::Invalid),
+    }
+}
+
+/// One element of a `concat_bytes!` array: a byte literal, or an integer literal up to 255,
+/// unsuffixed or `u8`.
+pub(crate) fn byte_element(kind: LitKind, text: &str, suffix_len: u32) -> Result<u8, LitError> {
+    match kind {
+        LitKind::Byte if suffix_len == 0 => unescape_byte(text),
+        LitKind::Integer => {
+            let suffix = &text[text.len() - suffix_len as usize..];
+            if !matches!(suffix, "" | "u8") {
+                return Err(LitError::NotAU8);
+            }
+            let value = integer_value(without_suffix(text, suffix_len))?;
+            u8::try_from(value).map_err(|_| LitError::NotAU8)
+        }
+        LitKind::Char | LitKind::Str | LitKind::StrRaw(_) => Err(LitError::CharOrStr),
+        LitKind::Byte
+        | LitKind::ByteStr
+        | LitKind::ByteStrRaw(_)
+        | LitKind::Float
+        | LitKind::CStr
+        | LitKind::CStrRaw(_) => Err(LitError::NotBytes),
+        LitKind::Err => Err(LitError::Invalid),
+    }
+}
+
+/// An integer literal's value, its suffix whatever it is; `None` when it does not read.
+pub(crate) fn integer_of(text: &str, suffix_len: u32) -> Option<u128> {
+    integer_value(without_suffix(text, suffix_len)).ok()
+}
+
+/// The value of a `b'…'` literal's inside: one ASCII character, or one byte escape.
+fn unescape_byte(body: &str) -> Result<u8, LitError> {
+    let (byte, len) = match body.as_bytes().first() {
+        Some(b'\\') => {
+            let (byte, len) = byte_escape(&body.as_bytes()[1..])?;
+            (byte, 1 + len)
+        }
+        Some(b'\'' | b'\n' | b'\r' | b'\t') | None => return Err(LitError::BadEscape),
+        Some(&byte) if byte.is_ascii() => (byte, 1),
+        Some(_) => return Err(LitError::Invalid),
+    };
+    if len == body.len() { Ok(byte) } else { Err(LitError::BadEscape) }
+}
+
+/// The value of a `b"…"` literal's inside, appended, read as [`unescape_str`] reads a string's
+/// but in bytes: ASCII only, `\x` up to `ff`, no `\u`.
+fn unescape_bytes<B: Allocator>(body: &str, out: &mut Vec<u8, B>) -> Result<(), LitError> {
+    let bytes = body.as_bytes();
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'\\' if matches!(bytes.get(at + 1), Some(b'\n' | b'\r')) => {
+                at += 1;
+                if bytes[at] == b'\r' && bytes.get(at + 1) != Some(&b'\n') {
+                    return Err(LitError::BadEscape);
+                }
+                while bytes.get(at).is_some_and(|it| matches!(it, b' ' | b'\t' | b'\n' | b'\r')) {
+                    at += 1;
+                }
+            }
+            b'\\' => {
+                let (value, len) = byte_escape(&bytes[at + 1..])?;
+                out.push(value);
+                at += 1 + len;
+            }
+            b'\r' if bytes.get(at + 1) == Some(&b'\n') => {
+                out.push(b'\n');
+                at += 2;
+            }
+            b'\r' => return Err(LitError::BadEscape),
+            byte if byte.is_ascii() => {
+                out.push(byte);
+                at += 1;
+            }
+            _ => return Err(LitError::Invalid),
+        }
+    }
+    Ok(())
+}
+
+/// The byte escape at the start of `rest`, the bytes after a `\`: its value and length.
+fn byte_escape(rest: &[u8]) -> Result<(u8, usize), LitError> {
+    let simple = match rest.first() {
+        Some(b'n') => Some(b'\n'),
+        Some(b'r') => Some(b'\r'),
+        Some(b't') => Some(b'\t'),
+        Some(b'\\') => Some(b'\\'),
+        Some(b'0') => Some(0),
+        Some(b'\'') => Some(b'\''),
+        Some(b'"') => Some(b'"'),
+        _ => None,
+    };
+    if let Some(byte) = simple {
+        return Ok((byte, 1));
+    }
+    let hex = |byte: u8| char::from(byte).to_digit(16);
+    match rest.first() {
+        Some(b'x') => {
+            let high = rest.get(1).copied().and_then(hex).ok_or(LitError::BadEscape)?;
+            let low = rest.get(2).copied().and_then(hex).ok_or(LitError::BadEscape)?;
+            let value = u8::try_from(high * 16 + low).map_err(|_| LitError::BadEscape)?;
+            Ok((value, 3))
+        }
+        _ => Err(LitError::BadEscape),
     }
 }
 

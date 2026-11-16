@@ -33,6 +33,12 @@ pub(crate) fn expand<A: Allocator + Clone>(
     out: &mut Out<'_, A>,
 ) -> Result<(), ExpandError> {
     let input = out.call.input();
+    let facts = match out.call.kind {
+        CallKind::Derive { facts, .. } => facts,
+        CallKind::FnLike { .. } | CallKind::Attr { .. } => {
+            unreachable!("`expand` checks a derive is called as a derive")
+        }
+    };
     let adt = match adt::read(input, out.alloc.clone()) {
         Ok(adt) => adt,
         Err(error) => return refuse(out, error.message()),
@@ -50,7 +56,7 @@ pub(crate) fn expand<A: Allocator + Clone>(
     if union && unions_refused {
         return refuse(out, UNIONS);
     }
-    let mut w = W { out, input, adt: &adt };
+    let mut w = W { out, input, adt: &adt, facts };
     match which {
         BuiltinDerive::Copy => w.marker("$crate::marker::Copy", false),
         BuiltinDerive::Eq => w.marker("$crate::cmp::Eq", adt.packed),
@@ -101,6 +107,7 @@ struct W<'w, 'c, A: Allocator + Clone> {
     out: &'w mut Out<'c, A>,
     input: &'c TokenStream<A>,
     adt: &'w Adt<A>,
+    facts: DeriveFacts,
 }
 
 type Written = Result<(), ExpandError>;
@@ -214,9 +221,23 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
     /// `path`. With `bound`, each type parameter and each `T::Assoc` of the fields is bounded
     /// by the trait; with `copy`, each type parameter and `T::Assoc` by `Copy` too, after the
     /// item's own predicates, as rustc's derives of a packed struct do
-    /// (`needs_copy_as_bound_if_packed`): its fields are copied out.
+    /// (`needs_copy_as_bound_if_packed`): its fields are copied out. Of a `#[derive_const]`
+    /// the impl is `impl const` and the trait's bounds `[const]`.
     fn header(&mut self, path: &str, bound: bool, copy: bool) -> Written {
+        self.header_as(path, bound, copy, self.facts.constness)
+    }
+
+    /// [`Self::header`] of `constness`: `StructuralPartialEq`, no const trait, is never const.
+    fn header_as(&mut self, path: &str, bound: bool, copy: bool, constness: Constness) -> Written {
         let adt = self.adt;
+        let konst = constness == Constness::Const;
+        // The trait as a bound: `[const] Trait` in a const impl.
+        let bound_by = |w: &mut Self| -> Written {
+            if konst {
+                w.code("[const]")?;
+            }
+            w.code(path)
+        };
         self.out.automatically_derived()?;
         self.code("impl")?;
         if !adt.params.is_empty() {
@@ -234,13 +255,16 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
                         self.range(&param.name)?;
                         if bound {
                             self.code(":")?;
-                            self.code(path)?;
+                            bound_by(self)?;
                         }
                     }
                 }
                 self.code(",")?;
             }
             self.code(">")?;
+        }
+        if konst {
+            self.code("const")?;
         }
         self.code(path)?;
         self.code("for")?;
@@ -287,7 +311,7 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
             for ty in &adt.assoc {
                 self.range(ty)?;
                 self.code(":")?;
-                self.code(path)?;
+                bound_by(self)?;
                 self.code(",")?;
             }
         }
@@ -425,13 +449,33 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
         self.code("}")
     }
 
+    /// rustc's `expand_deriving_clone`: a union, and a type that also derives `Copy` and has no
+    /// type parameter, is `*self` after asserting what makes that sound (`cs_clone_simple`);
+    /// anything else clones field by field.
     fn derive_clone(&mut self) -> Written {
         let adt = self.adt;
-        self.header("$crate::clone::Clone", true, adt.packed)?;
-        self.code("{ fn clone(&self) -> Self {")?;
+        let typed = adt.params.iter().any(|it| matches!(it.kind, ParamKind::Type { .. }));
         if adt.kind == AdtKind::Union {
+            // A union's parameters are bounded by `Copy` as well: `*self` copies it.
+            self.header("$crate::clone::Clone", true, true)?;
+            self.code("{ #[inline] fn clone(&self) -> Self {")?;
+            self.code("let _: $crate::clone::AssertParamIsCopy<Self>; *self")?;
+            return self.code("} }");
+        }
+        if self.facts.copy == AlsoCopy::Yes && !typed {
+            self.header("$crate::clone::Clone", true, false)?;
+            self.code("{ #[inline] fn clone(&self) -> Self {")?;
+            for field in &adt.fields {
+                self.code("let _: $crate::clone::AssertParamIsClone<")?;
+                self.range(&field.ty)?;
+                self.code(">;")?;
+            }
             self.code("*self")?;
-        } else if adt.is_empty_enum() {
+            return self.code("} }");
+        }
+        self.header("$crate::clone::Clone", true, adt.packed)?;
+        self.code("{ #[inline] fn clone(&self) -> Self {")?;
+        if adt.is_empty_enum() {
             self.code("match *self {}")?;
         } else {
             self.match_self(|w, v| {
@@ -551,7 +595,7 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
     /// `expand_deriving_partial_eq`.
     fn derive_partial_eq(&mut self) -> Written {
         let adt = self.adt;
-        self.header("$crate::marker::StructuralPartialEq", false, false)?;
+        self.header_as("$crate::marker::StructuralPartialEq", false, false, Constness::NotConst)?;
         self.code("{ }")?;
         self.header("$crate::cmp::PartialEq", true, adt.packed)?;
         self.code("{ fn eq(&self, other: &Self) -> bool {")?;

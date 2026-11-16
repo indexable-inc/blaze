@@ -14,7 +14,7 @@ use super::{harness, key, oracle};
 use crate::heat::{Config as HeatConfig, Heat};
 use crate::parent::{Config as ParentConfig, Effect as ParentEffect, Found, FoundOptimized, Function, Parent};
 use crate::tier::{self, Callee, Inlined, Job, Optimized, Optimizer};
-use crate::{CodeId, CodeRef, InstanceKey, Nanos, Plant, SlotId, Snapshot, Tier, Why};
+use crate::{CodeId, CodeRef, Hooks, InstanceKey, Made, Nanos, Plant, RecordKey, SlotId, Snapshot, Tier, Version, Why};
 
 const SLOTS: u32 = 4;
 
@@ -36,11 +36,15 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let mut running: Vec<Job> = Vec::new();
     let mut optimized: BTreeMap<SlotId, u32> = BTreeMap::new();
     let mut snapshot = Snapshot(0);
+    // Jobs whose optimizer lacked a record, and the records being made.
+    let mut lacked = BTreeSet::new();
+    let mut blocked = BTreeSet::new();
+    let mut makes: Vec<RecordKey> = Vec::new();
     let steps = tape.range(1..200, "steps");
     let mut step = 0;
-    while step < steps || !running.is_empty() {
+    while step < steps || !running.is_empty() || !makes.is_empty() {
         step += 1;
-        let action = if step < steps { tape.below(5, "action") } else { 2 };
+        let action = if step < steps { tape.below(6, "action") } else { 2 + 3 * (step % 2) };
         match action {
             0 | 1 => {
                 let slot = SlotId(tape.below(u64::from(SLOTS), "slot") as u32);
@@ -64,9 +68,16 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                 let job = running.remove(tape.index(running.len(), "ended"));
                 let mut inlined = Vec::new_in(Global);
                 inlined.push(Inlined { instance: InstanceKey(key(99)), code: CodeId(key(98)) });
-                let result = Ok(Optimized { code: CodeRef(key(500 + u64::from(job.slot.0))), inlined });
+                let lacks = [RecordKey(key(60 + u64::from(job.slot.0)))];
+                let ended = if !lacked.contains(&job.slot) && tape.coin("lacks a record") {
+                    lacked.insert(job.slot);
+                    blocked.insert(job.slot);
+                    tier::Ended::Need(&lacks)
+                } else {
+                    tier::Ended::Record(Optimized { code: CodeRef(key(500 + u64::from(job.slot.0))), inlined })
+                };
                 let stale = job.snapshot < snapshot;
-                tier.done(job, result, &mut effects).map_err(harness)?;
+                tier.done(job, ended, &mut effects).map_err(harness)?;
                 for effect in &effects {
                     if let tier::Effect::Publish { slot, .. } | tier::Effect::File { slot } = effect {
                         oracle(!stale, || {
@@ -88,10 +99,17 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                 snapshot = Snapshot(snapshot.0 + 1);
                 tier.newer(snapshot).map_err(harness)?;
             }
+            5 if !makes.is_empty() => {
+                let made = makes.remove(tape.index(makes.len(), "made"));
+                tier.made(made, Ok(()), &mut effects).map_err(harness)?;
+            }
             _ => continue,
         }
         for effect in effects.drain(..) {
             match effect {
+                tier::Effect::Make { key } => makes.push(key),
+                // Entered again once what it lacked was made: the same job, not a second.
+                tier::Effect::Optimize(job) if blocked.remove(&job.slot) => running.push(job),
                 tier::Effect::Optimize(job) => {
                     let count = optimized.entry(job.slot).or_insert(0);
                     *count += 1;
@@ -140,12 +158,12 @@ impl Optimizer<Global> for InlinesAll {
         instance: InstanceKey,
         callees: &[Callee],
         alloc: Global,
-    ) -> Result<Optimized<Global>, Why> {
+    ) -> Result<Made<Optimized<Global>, Global>, Why> {
         let mut inlined = Vec::with_capacity_in(callees.len(), alloc);
         inlined.extend(callees.iter().map(|callee| Inlined { instance: callee.instance, code: callee.code }));
         let mut code = instance.0;
         code[31] = 0xee;
-        Ok(Optimized { code: CodeRef(code), inlined })
+        Ok(Made::Done(Optimized { code: CodeRef(code), inlined }))
     }
 }
 
@@ -168,8 +186,12 @@ fn reloaded(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         Callee { instance: first[1].instance, code: first[1].code },
         Callee { instance: first[2].instance, code: first[2].code },
     ];
-    let result = InlinesAll.optimize(job.instance, &callees, Global);
-    tier.done(job, result, &mut effects).map_err(harness)?;
+    let ended = match InlinesAll.optimize(job.instance, &callees, Global) {
+        Ok(Made::Done(optimized)) => tier::Ended::Record(optimized),
+        Ok(Made::Need(_)) => return Err(Broke::Harness("InlinesAll lacks nothing".into())),
+        Err(why) => tier::Ended::Failed(why),
+    };
+    tier.done(job, ended, &mut effects).map_err(harness)?;
     let record = tier.record(f).ok_or_else(|| Broke::Harness("f was not filed".into()))?;
     oracle(tier.callers_of(first[1].code) == [f], || "the reverse map misses g's caller".into())?;
     // Run two: g, h, both or neither edited.
@@ -194,9 +216,9 @@ fn reloaded(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         callees: &[],
         optimized: Some(FoundOptimized { code: record.code, inlined: &record.inlined }),
     };
-    parent.looked(f, Some(found), &mut out).map_err(harness)?;
+    parent.looked(Version { slot: f, hooks: Hooks::NONE }, Some(found), &mut out).map_err(harness)?;
     let published = out.iter().find_map(|effect| match effect {
-        ParentEffect::Publish { slot, tier, code } if *slot == f => Some((*tier, *code)),
+        ParentEffect::Publish { slot, tier, code, .. } if *slot == f => Some((*tier, *code)),
         _ => None,
     });
     let stale = g_edited || h_edited;

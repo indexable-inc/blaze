@@ -37,7 +37,7 @@ use rustc_type_ir::inherent::IntoKind;
 
 use crate::{
     InferBodyId, InferenceResult,
-    check_cache::ids::{self, Table},
+    next_solver::persist::ids::{self, Table},
     db::{HirDatabase, InternedClosure, closure_exprs},
     mir::{
         MirBody, MirLowerError, MirOwner,
@@ -744,7 +744,7 @@ pub mod testing {
     use std::cell::Cell;
 
     use super::*;
-    use crate::check_cache::ids::IdKind;
+    use crate::next_solver::persist::ids::IdKind;
 
     /// A planted bug of the transport, each a control of a test that a served body equals the
     /// one lowered from its source.

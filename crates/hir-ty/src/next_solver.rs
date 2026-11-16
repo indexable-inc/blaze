@@ -15,7 +15,6 @@ pub mod format_proof_tree;
 pub mod fulfill;
 mod generic_arg;
 pub mod generics;
-mod global_goals;
 pub mod goal_store;
 pub mod infer;
 pub(crate) mod inspect;

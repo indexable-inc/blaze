@@ -61,7 +61,7 @@ use super::{
 use crate::{
     InferenceResult,
     body_store::{
-        BodyFacts, Classified, Installed, Mode, Step, StepCounts, capture, infer, install,
+        BodyFacts, Classified, Installed, ItemKey, Mode, Step, StepCounts, capture, infer, install,
         lookup_passed, offer, offer_passed,
         tests::{BUILD, Memory as Images, OWN, is_impl_table, own},
     },
@@ -398,9 +398,9 @@ impl BodyFacts for EntryFacts {
         }
     }
 
-    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ItemKey {
         if def == own(body) {
-            return OWN;
+            return ItemKey(OWN);
         }
         let (tag, krate, name) = item_name(db, def);
         let key = Hasher::new("blaze v2 body entries test def 2")
@@ -409,12 +409,12 @@ impl BodyFacts for EntryFacts {
             .part(&name)
             .finish();
         self.defs.lock().insert(key, (tag, krate, name));
-        key
+        ItemKey(key)
     }
 
     /// The item of this database named as [`EntryFacts::def_key`] named it, found by walking
     /// its crate's items ([`items_of`]): no id is kept, as none outlives its arena.
-    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, ItemKey(key): ItemKey) -> Option<SolverDefId<'db>> {
         if key == OWN {
             return Some(own(body));
         }

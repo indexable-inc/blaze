@@ -1,7 +1,7 @@
 //! The builtin fn-like macros `println!` and its kin need, written here on the portable form.
 //!
-//! The eager ones (`concat!`, `env!`, `option_env!`, `include_str!`, `include_bytes!`,
-//! `compile_error!`, and the `format_args!` family's template) first list the macro calls in
+//! The eager ones (`concat!`, `concat_bytes!`, `env!`, `option_env!`, `include!`,
+//! `include_str!`, `include_bytes!`, `compile_error!`, and the `format_args!` family's template) first list the macro calls in
 //! their input as [`Expanded::NeedsExpanded`](crate::Expanded::NeedsExpanded); re-entered with
 //! the answers, they read the input with each call replaced by its answer, whose tokens take
 //! the origin of the call's path.
@@ -44,8 +44,10 @@ pub(crate) fn expand<A: Allocator + Clone>(
 ) -> Result<Step<A>, ExpandError> {
     match which {
         BuiltinFn::Concat
+        | BuiltinFn::ConcatBytes
         | BuiltinFn::Env
         | BuiltinFn::OptionEnv
+        | BuiltinFn::Include
         | BuiltinFn::IncludeStr
         | BuiltinFn::IncludeBytes
         | BuiltinFn::CompileError
@@ -54,19 +56,17 @@ pub(crate) fn expand<A: Allocator + Clone>(
         | BuiltinFn::ConstFormatArgs => return eager(which, out, cx),
         BuiltinFn::Stringify => stringify(out)?,
         BuiltinFn::Cfg => cfg(out, cx)?,
+        BuiltinFn::CfgSelect => cfg_select(out, cx)?,
+        BuiltinFn::Assert => assert(out)?,
         BuiltinFn::Line => place(out, cx, HoleOf::Line)?,
         BuiltinFn::Column => place(out, cx, HoleOf::Column)?,
         BuiltinFn::File => place(out, cx, HoleOf::File)?,
         BuiltinFn::ModulePath => place(out, cx, HoleOf::ModulePath)?,
         BuiltinFn::Panic => panic(out, "panic")?,
         BuiltinFn::Unreachable => panic(out, "unreachable")?,
-        BuiltinFn::Include
-        | BuiltinFn::Assert
-        | BuiltinFn::ConcatBytes
-        | BuiltinFn::Asm
+        BuiltinFn::Asm
         | BuiltinFn::GlobalAsm
         | BuiltinFn::NakedAsm
-        | BuiltinFn::CfgSelect
         | BuiltinFn::TraceMacros
         | BuiltinFn::LogSyntax => {
             return Err(ExpandError::NotBuilt { what: Unbuilt::BuiltinFn(which) });
@@ -93,25 +93,45 @@ impl<A: Allocator> Args<'_, A> {
     /// The comma-separated arguments, each without the invisible groups around it; a trailing
     /// comma ends the list.
     fn split<B: Allocator>(&self, alloc: B) -> Vec<core::ops::Range<usize>, B> {
+        self.split_in(0..self.stream.len(), ',', alloc)
+    }
+
+    /// The pieces of the tokens `range` between the `sep`s outside any group, each without
+    /// the invisible groups around it; a trailing `sep` ends the list.
+    fn split_in<B: Allocator>(
+        &self,
+        range: core::ops::Range<usize>,
+        sep: char,
+        alloc: B,
+    ) -> Vec<core::ops::Range<usize>, B> {
         let tokens = self.stream.tokens();
         let mut pieces = Vec::new_in(alloc);
         let mut depth = 0u32;
-        let mut start = 0;
-        for (at, token) in tokens.iter().enumerate() {
-            match token.kind {
+        let mut start = range.start;
+        for at in range.clone() {
+            match tokens[at].kind {
                 TokenKind::Open(_) => depth += 1,
                 TokenKind::Close(_) => depth -= 1,
-                TokenKind::Punct { char: ',', .. } if depth == 0 => {
+                TokenKind::Punct { char, .. } if char == sep && depth == 0 => {
                     pieces.push(self.unwrap(start..at));
                     start = at + 1;
                 }
                 _ => {}
             }
         }
-        if start < tokens.len() {
-            pieces.push(self.unwrap(start..tokens.len()));
+        if start < range.end {
+            pieces.push(self.unwrap(start..range.end));
         }
         pieces
+    }
+
+    /// The inside of the `[..]` group that is all of `range`.
+    fn bracketed(&self, range: &core::ops::Range<usize>) -> Option<core::ops::Range<usize>> {
+        let tokens = self.stream.tokens();
+        let whole = range.len() >= 2
+            && tokens[range.start].kind == TokenKind::Open(Delim::Bracket)
+            && self.stream.close_of(range.start) == Some(range.end - 1);
+        whole.then(|| range.start + 1..range.end - 1)
     }
 
     /// `range` without the invisible groups that wrap all of it.
@@ -255,10 +275,12 @@ fn run_eager<A: Allocator + Clone>(
 ) -> Result<(), ExpandError> {
     match which {
         BuiltinFn::Concat => concat(args, out),
+        BuiltinFn::ConcatBytes => concat_bytes(args, out),
         BuiltinFn::Env => env(args, out, cx, Optional::No),
         BuiltinFn::OptionEnv => env(args, out, cx, Optional::Yes),
-        BuiltinFn::IncludeStr => include(args, out, cx, IncludeAs::Str),
-        BuiltinFn::IncludeBytes => include(args, out, cx, IncludeAs::Bytes),
+        BuiltinFn::Include => include(args, out, cx, Inclusion::Tokens),
+        BuiltinFn::IncludeStr => include(args, out, cx, Inclusion::Str),
+        BuiltinFn::IncludeBytes => include(args, out, cx, Inclusion::Bytes),
         BuiltinFn::CompileError => compile_error(args, out),
         BuiltinFn::FormatArgs | BuiltinFn::ConstFormatArgs => format_args(args, out, Newline::No),
         BuiltinFn::FormatArgsNl => format_args(args, out, Newline::Yes),
@@ -360,6 +382,89 @@ fn concat<A: Allocator + Clone>(
     push_str_literal(out, value.as_str())
 }
 
+/// `concat_bytes!`: byte and byte string literals, and arrays (`[1, b'a']`, `[b'a'; 3]`) of
+/// byte and `u8` literals, as one byte string literal (rustc's `expand_concat_bytes`).
+fn concat_bytes<A: Allocator + Clone>(
+    args: &Args<'_, A>,
+    out: &mut Out<'_, A>,
+) -> Result<(), ExpandError> {
+    let mut value = Vec::new_in(out.alloc.clone());
+    for range in args.split(out.alloc.clone()) {
+        if let Some(inside) = args.bracketed(&range) {
+            if let Err((message, at)) = bytes_array(args, inside, &mut value, out.alloc.clone()) {
+                return refuse(out, message, at);
+            }
+            continue;
+        }
+        match args.atom(range) {
+            Atom::Lit { kind, text, suffix_len, negative: false, at } => {
+                if let Err(error) = literal::bytes_piece(kind, text, suffix_len, &mut value) {
+                    return refuse(out, error.message(), Some(args.origin(at)));
+                }
+            }
+            Atom::Lit { at, .. } | Atom::Other { at } => {
+                return refuse(out, "expected a byte literal", at_token(args, at));
+            }
+            Atom::Bool(_) => return refuse(out, "cannot concatenate a boolean literal", None),
+        }
+    }
+    // The literal's text is a table entry: at most `u32::MAX` bytes, and escapes widen it.
+    u32::try_from(value.len().saturating_mul(4))
+        .map_err(|_| crate::error::StreamError::TooLarge { table: crate::error::Table::Text })?;
+    let mut text = Buf::new_in(out.alloc.clone());
+    literal::escape_bytes(&value, &mut text);
+    let kind =
+        TokenKind::Literal { kind: LitKind::ByteStr, suffix_len: 0, spacing: Spacing::Alone };
+    out.made(kind, text.as_str(), MADE)
+}
+
+/// The bytes of a `concat_bytes!` array whose inside is `inside`, appended to `value`; or the
+/// refusal and where.
+fn bytes_array<A: Allocator, B: Allocator + Clone>(
+    args: &Args<'_, A>,
+    inside: core::ops::Range<usize>,
+    value: &mut Vec<u8, B>,
+    alloc: B,
+) -> Result<(), (&'static str, Option<Origin>)> {
+    let element = |range: core::ops::Range<usize>| -> Result<u8, (&'static str, Option<Origin>)> {
+        if args.bracketed(&range).is_some() {
+            return Err(("cannot concatenate a doubly nested array", at_token(args, range.start)));
+        }
+        match args.atom(range) {
+            Atom::Lit { kind, text, suffix_len, negative: false, at } => {
+                literal::byte_element(kind, text, suffix_len)
+                    .map_err(|error| (error.message(), Some(args.origin(at))))
+            }
+            Atom::Lit { at, .. } | Atom::Other { at } => {
+                Err(("expected a byte or a `u8` literal", at_token(args, at)))
+            }
+            Atom::Bool(_) => Err(("cannot concatenate a boolean literal", None)),
+        }
+    };
+    let repeat = args.split_in(inside.clone(), ';', alloc.clone());
+    if let [byte, count] = &repeat[..] {
+        let byte = element(byte.clone())?;
+        let count = match args.atom(count.clone()) {
+            Atom::Lit { kind: LitKind::Integer, text, suffix_len, negative: false, .. } => {
+                literal::integer_of(text, suffix_len)
+            }
+            _ => None,
+        };
+        let too_large = ("the repeated array is too large", at_token(args, inside.start));
+        let count = count.ok_or(("the repeat count is not an integer literal", None))?;
+        let count = usize::try_from(count).map_err(|_| too_large)?;
+        // A byte string is kept under `u32::MAX` bytes, as every text of a stream.
+        let len = value.len().checked_add(count).filter(|&len| u32::try_from(len).is_ok());
+        len.ok_or(too_large)?;
+        value.extend(core::iter::repeat_n(byte, count));
+        return Ok(());
+    }
+    for range in args.split_in(inside, ',', alloc) {
+        value.push(element(range)?);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Optional {
     No,
@@ -429,11 +534,22 @@ fn env<A: Allocator + Clone>(
     }
 }
 
+/// What an include makes of its file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Inclusion {
+    /// `include!`: the file's tokens.
+    Tokens,
+    /// `include_str!`: a string literal.
+    Str,
+    /// `include_bytes!`: a byte string literal.
+    Bytes,
+}
+
 fn include<A: Allocator + Clone>(
     args: &Args<'_, A>,
     out: &mut Out<'_, A>,
     cx: &impl ExpandCx,
-    how: IncludeAs,
+    inclusion: Inclusion,
 ) -> Result<(), ExpandError> {
     let pieces = args.split(out.alloc.clone());
     if pieces.len() != 1 {
@@ -443,9 +559,10 @@ fn include<A: Allocator + Clone>(
     if let Err((error, at)) = string_arg(args, pieces[0].clone(), &mut path) {
         return refuse(out, error.message(), at);
     }
-    let kind = match how {
-        IncludeAs::Str => ReadKind::IncludeStr,
-        IncludeAs::Bytes => ReadKind::IncludeBytes,
+    // `include!` reads the file as text, the same fact `include_str!` reads.
+    let (kind, how) = match inclusion {
+        Inclusion::Tokens | Inclusion::Str => (ReadKind::IncludeStr, IncludeAs::Str),
+        Inclusion::Bytes => (ReadKind::IncludeBytes, IncludeAs::Bytes),
     };
     let bytes = match cx.include(path.as_str(), how)? {
         Included::Bytes(bytes) => bytes,
@@ -458,16 +575,21 @@ fn include<A: Allocator + Clone>(
     };
     let digest = ContentId::of("blaze v2 expand included file 1", bytes);
     out.exp.reads.push(kind, path.as_str(), ReadAnswer::Digest(digest))?;
-    match how {
-        IncludeAs::Str => match core::str::from_utf8(bytes) {
+    let not_utf8 = |out: &mut Out<'_, A>| -> Result<(), ExpandError> {
+        let path = out.note(path.as_str())?;
+        out.diagnose(Diagnostic::Include { path, why: IncludeFailure::NotUtf8 });
+        Ok(())
+    };
+    match inclusion {
+        Inclusion::Str => match core::str::from_utf8(bytes) {
             Ok(text) => push_str_literal(out, text),
-            Err(_) => {
-                let path = out.note(path.as_str())?;
-                out.diagnose(Diagnostic::Include { path, why: IncludeFailure::NotUtf8 });
-                Ok(())
-            }
+            Err(_) => not_utf8(out),
         },
-        IncludeAs::Bytes => {
+        Inclusion::Tokens => match core::str::from_utf8(bytes) {
+            Ok(text) => included_tokens(out, path.as_str(), text),
+            Err(_) => not_utf8(out),
+        },
+        Inclusion::Bytes => {
             let mut text = Buf::new_in(out.alloc.clone());
             literal::escape_bytes(bytes, &mut text);
             let kind = TokenKind::Literal {
@@ -478,6 +600,175 @@ fn include<A: Allocator + Clone>(
             out.made(kind, text.as_str(), MADE)
         }
     }
+}
+
+/// `include!`'s tokens: the file's text without a byte order mark or a `#!` line, lexed in the
+/// call's edition, each token made at the call site ([`Transparency::Transparent`]): rustc
+/// parses the file with its own spans, which no expansion marks, so its names resolve where
+/// the call is.
+fn included_tokens<A: Allocator + Clone>(
+    out: &mut Out<'_, A>,
+    path: &str,
+    text: &str,
+) -> Result<(), ExpandError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = match text.strip_prefix("#!") {
+        // `#![attr]` is an inner attribute, not a shebang.
+        Some(rest) if !rest.trim_start().starts_with('[') => {
+            rest.find('\n').map_or("", |at| &rest[at..])
+        }
+        _ => text,
+    };
+    let tokens = match crate::tokens::lex(text, out.call.site.edition, out.alloc.clone()) {
+        Ok(tokens) => tokens,
+        Err(crate::error::LexError::Refused { .. }) => {
+            let path = out.note(path)?;
+            out.diagnose(Diagnostic::Include { path, why: IncludeFailure::DoesNotLex });
+            return Ok(());
+        }
+        Err(crate::error::LexError::Stream(error)) => return Err(error.into()),
+    };
+    for token in tokens.tokens() {
+        out.made(token.kind, tokens.text_of(token), Transparency::Transparent)?;
+    }
+    Ok(())
+}
+
+/// `assert!(cond)` as `if !(cond) { $crate::panicking::panic("assertion failed: cond") }`, and
+/// `assert!(cond, args..)` as `if !(cond) { $crate::panic::panic_2021!(args..) }` (or
+/// `panic_2015!` by the call's panic edition), as rustc's `expand_assert`.
+fn assert<A: Allocator + Clone>(out: &mut Out<'_, A>) -> Result<(), ExpandError> {
+    let input = out.call.input();
+    let args = Args { stream: input, from: None };
+    let end = args.first_end();
+    let cond = args.unwrap(0..end);
+    if cond.is_empty() {
+        return refuse(out, "`assert!` takes a boolean expression", None);
+    }
+    // `assert!(cond,)` has no message.
+    let message = (end + 1 < input.len()).then(|| end + 1..input.len());
+    ident(out, "if")?;
+    punct(out, '!', Spacing::Alone)?;
+    out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
+    for at in cond.clone() {
+        let token = input.tokens()[at];
+        out.push(token.kind, input.text_of(&token), Origin::Input(index(at)))?;
+    }
+    out.made(TokenKind::Close(Delim::Paren), "", MADE)?;
+    out.made(TokenKind::Open(Delim::Brace), "", MADE)?;
+    match message {
+        Some(message) => {
+            let which = if out.call.site.panic_edition >= crate::tokens::Edition::E2021 {
+                "panic_2021"
+            } else {
+                "panic_2015"
+            };
+            crate_path(out, &["panic", which])?;
+            punct(out, '!', Spacing::Alone)?;
+            out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
+            for at in message {
+                let token = input.tokens()[at];
+                out.push(token.kind, input.text_of(&token), Origin::Input(index(at)))?;
+            }
+            out.made(TokenKind::Close(Delim::Paren), "", MADE)?;
+        }
+        None => {
+            let cond = input.copy_in(cond, out.alloc.clone())?;
+            let mut text = Buf::new_in(out.alloc.clone());
+            text.push_str("assertion failed: ");
+            stringified(&cond, out.call.site.edition, &mut text)?;
+            crate_path(out, &["panicking", "panic"])?;
+            out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
+            push_str_literal(out, text.as_str())?;
+            out.made(TokenKind::Close(Delim::Paren), "", MADE)?;
+        }
+    }
+    out.made(TokenKind::Close(Delim::Brace), "", MADE)
+}
+
+/// `cfg_select! { pred => { tokens } .. _ => { tokens } }`: the tokens inside the braces of the
+/// first arm whose predicate holds (`_` always does). Every arm is read; the predicates are
+/// asked of the context in order up to the first that holds, each outcome recorded.
+fn cfg_select<A: Allocator + Clone>(
+    out: &mut Out<'_, A>,
+    cx: &impl ExpandCx,
+) -> Result<(), ExpandError> {
+    let input = out.call.input();
+    let tokens = input.tokens();
+    let mut chosen = None;
+    let mut at = 0;
+    while at < tokens.len() {
+        let start = at;
+        let mut depth = 0u32;
+        let arrow = loop {
+            let Some(token) = tokens.get(at) else { break None };
+            match token.kind {
+                TokenKind::Open(_) => depth += 1,
+                TokenKind::Close(_) => depth -= 1,
+                TokenKind::Punct { char: '=', spacing: Spacing::Joint }
+                    if depth == 0
+                        && matches!(
+                            tokens.get(at + 1).map(|it| it.kind),
+                            Some(TokenKind::Punct { char: '>', .. })
+                        ) =>
+                {
+                    break Some(at);
+                }
+                _ => {}
+            }
+            at += 1;
+        };
+        let input_at = |at: usize| (at < tokens.len()).then(|| Origin::Input(index(at)));
+        let Some(arrow) = arrow else {
+            let message = "expected `=>` after a `cfg_select!` predicate";
+            return refuse(out, message, input_at(start));
+        };
+        if arrow == start {
+            return refuse(out, "expected a cfg predicate or `_` before `=>`", input_at(arrow));
+        }
+        let open = arrow + 2;
+        let close = match tokens.get(open).map(|it| it.kind) {
+            Some(TokenKind::Open(Delim::Brace)) => input.close_of(open),
+            _ => None,
+        };
+        let Some(close) = close else {
+            return refuse(out, "expected `{` after `=>` in `cfg_select!`", input_at(open));
+        };
+        at = close + 1;
+        if matches!(tokens.get(at).map(|it| it.kind), Some(TokenKind::Punct { char: ',', .. })) {
+            at += 1;
+        }
+        if chosen.is_some() {
+            continue;
+        }
+        let wildcard = arrow == start + 1
+            && match tokens[start].kind {
+                TokenKind::Ident { raw: Raw::No, .. } => input.text_at(start) == "_",
+                TokenKind::Punct { char: '_', .. } => true,
+                _ => false,
+            };
+        let holds = if wildcard {
+            true
+        } else {
+            let predicate = input.copy_in(start..arrow, out.alloc.clone())?;
+            let outcome = cx.cfg(&predicate)?;
+            let mut subject = Buf::new_in(out.alloc.clone());
+            stringified(&predicate, out.call.site.edition, &mut subject)?;
+            out.exp.reads.push(ReadKind::Cfg, subject.as_str(), ReadAnswer::Bool(outcome))?;
+            outcome
+        };
+        if holds {
+            chosen = Some(open + 1..close);
+        }
+    }
+    let Some(body) = chosen else {
+        return refuse(out, "none of the predicates in this `cfg_select!` holds", None);
+    };
+    for at in body {
+        let token = tokens[at];
+        out.push(token.kind, input.text_of(&token), Origin::Input(index(at)))?;
+    }
+    Ok(())
 }
 
 fn compile_error<A: Allocator + Clone>(

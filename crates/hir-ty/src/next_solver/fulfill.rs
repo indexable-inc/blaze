@@ -11,7 +11,7 @@ use rustc_type_ir::{
 };
 
 use crate::next_solver::{
-    DbInterner, ParamEnv, Predicate, SolverContext, TypingMode, global_goals,
+    DbInterner, ParamEnv, Predicate, SolverContext, TypingMode,
     infer::{
         InferCtxt,
         traits::{Obligation, ObligationCause, PredicateObligation, PredicateObligations},
@@ -197,8 +197,7 @@ impl<'db> FulfillmentCtxt<'db> {
             Some((GoalEvaluation { certainty: Certainty::Maybe(_), stalled_on, .. }, _)) => {
                 self.pending.push(obligation, stalled_on)
             }
-            None if global_goals::holds_at_registration(delegate, obligation.as_goal()) => {}
-            None => self.pending.push(obligation, None),
+            None =>self.pending.push(obligation, None),
         }
     }
 

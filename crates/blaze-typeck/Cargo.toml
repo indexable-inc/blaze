@@ -1,0 +1,25 @@
+[package]
+name = "blaze-typeck"
+description = "blaze's per-body type-check driver, written new (docs/v2/plan/design/typeck.md): one body in, one record out; every outside fact read through a sealed recorder; an explicit work stack in rustc's order; results and diagnostics in portable columns"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# No dependencies: the crate is at zero third-party crates and names no workspace crate yet. The
+# traits it needs from `crates/blaze-ty` are defined in `src/ty.rs` until that crate exists.
+[dependencies]
+
+[dev-dependencies]
+# `check`, `control`: the properties of typeck.md, "Proof".
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

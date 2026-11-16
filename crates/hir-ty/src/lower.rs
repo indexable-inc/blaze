@@ -13,7 +13,7 @@ pub(crate) mod record;
 
 use std::{alloc::Allocator, iter, mem, ops::ControlFlow};
 
-use base_db::{Crate, Db};
+use base_db::Db;
 use blaze_mem::Frame;
 use either::Either;
 use hir_def::{

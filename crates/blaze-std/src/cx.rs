@@ -22,9 +22,17 @@
 //! - Tasks: [`Cx::scope`] makes a scope of tasks, a linear [`Scope`] value joined with
 //!   [`Scope::join`] ([`crate::task`]); [`Cx::scope_with`] runs a closure as one. There is no
 //!   `io.tasks()`.
+//! - Where the task runs: the worker it was placed on when it started, which every wait it
+//!   resumes from keeps (std.md, "Layouts": a started task never changes its thread). A debug
+//!   build checks it at each resume against the OS thread the task started on.
+//! - Lock order: [`Cx::lock_order`] hands the task its one [`crate::sync::ranks::Order`], the
+//!   token ranked locks are taken with.
 
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{rc::Rc, sync::Arc};
+use core::{
+    cell::Cell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use blaze_core::{Done, Tag, wait::Deadline};
 use blaze_mem::Frame;
@@ -47,6 +55,36 @@ pub struct Cx {
     /// The world the root context came from: where its spans and events are recorded.
     world: Io,
     plant: Plant,
+    /// Where its task runs, and its task's lock-order token: one per task, shared by the
+    /// task's contexts.
+    placed: Rc<Placed>,
+}
+
+/// Where a task runs, kept from its start (std.md, "Layouts": a started task never changes its
+/// thread), and whether its lock-order token is out.
+struct Placed {
+    /// The worker it was placed on at its start. Under `Inline` every task runs on the thread
+    /// that spawned it, so the worker is the scope's count of spawns, a model of the placement
+    /// a pool makes; a simulated migration is [`Plant::TaskMigrates`].
+    worker: Cell<u32>,
+    /// The OS thread it started on: a debug build checks each resume against it (rustc's
+    /// builds only: blaze's lets a task move).
+    #[cfg(all(debug_assertions, not(blaze)))]
+    thread: crate::rt::ThreadMark,
+    /// Whether [`Cx::lock_order`]'s token is out.
+    order_out: Cell<bool>,
+}
+
+impl Placed {
+    fn on(worker: u32) -> Rc<Placed> {
+        // alloc: once per task, where it runs.
+        Rc::new(Placed {
+            worker: Cell::new(worker),
+            #[cfg(all(debug_assertions, not(blaze)))]
+            thread: crate::rt::thread_mark(),
+            order_out: Cell::new(false),
+        })
+    }
 }
 
 /// A scope's cancellation: set, or set in a scope it is inside.
@@ -88,14 +126,22 @@ impl Cx {
     pub(crate) fn root(deadline: Deadline, frame: Frame, world: Io) -> Cx {
         let plant = world.plant();
         world.record_trace("main", RecordKind::Opened { parent: "main" });
-        Cx { deadline, cancel: Cancel::new(None), span: "main", frame: shared(frame), world, plant }
+        Cx {
+            deadline,
+            cancel: Cancel::new(None),
+            span: "main",
+            frame: shared(frame),
+            world,
+            plant,
+            placed: Placed::on(0),
+        }
     }
 
     /// A child whose deadline is the earlier of this one's and `deadline`: never later.
     pub fn until(&self, deadline: Deadline) -> Cx {
         let deadline = match self.plant {
             Plant::UntilWidens => deadline,
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.deadline.min(deadline),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.deadline.min(deadline),
         };
         Cx { deadline, ..self.child() }
     }
@@ -209,7 +255,7 @@ impl Cx {
     pub(crate) fn wait(&self, io: &Io, tag: Tag, ends: Ends) -> Result<Done, Stopped> {
         let deadline = match self.plant {
             Plant::WaitIgnoresDeadline => Deadline::NEVER,
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.deadline,
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.deadline,
         };
         let mut idle = 0;
         loop {
@@ -240,6 +286,7 @@ impl Cx {
                 0 => idle += 1,
                 _ => idle = 0,
             }
+            self.resumed();
         }
     }
 
@@ -254,7 +301,7 @@ impl Cx {
     pub(crate) fn wait_for<T>(&self, io: &Io, mut ready: impl FnMut() -> Option<T>) -> Result<T, Stopped> {
         let deadline = match self.plant {
             Plant::WaitIgnoresDeadline => Deadline::NEVER,
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.deadline,
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.deadline,
         };
         let mut idle = 0;
         loop {
@@ -274,7 +321,53 @@ impl Cx {
                 0 => idle += 1,
                 _ => idle = 0,
             }
+            self.resumed();
         }
+    }
+
+    /// The task resumes from a wait: on the worker, and the OS thread, it started on (std.md,
+    /// "Layouts"). Under `Inline` the wait polled on the task's own thread, so this only
+    /// checks; a fiber layout's park returns here, and its scheduler must put the task back
+    /// where it ran. Built by blaze the rule is lifted: a task may move, because blaze refuses
+    /// a value that is not `Send` live across a call that can wait, and the check goes.
+    fn resumed(&self) {
+        if self.plant == Plant::TaskMigrates {
+            let placed = &self.placed;
+            placed.worker.set(placed.worker.get() + 1);
+        }
+        #[cfg(all(debug_assertions, not(blaze)))]
+        if crate::rt::thread_mark() != self.placed.thread {
+            panic!(
+                "bstd::cx task {}: resumed from a wait on another thread than it started on \
+                 (std.md, \"Layouts\": a started task never changes its thread)",
+                self.span
+            );
+        }
+    }
+
+    /// The worker this context's task was placed on at its start, which it keeps.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn worker(&self) -> u32 {
+        self.placed.worker.get()
+    }
+
+    /// Takes the task's lock-order token: `false` when it is out already.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn take_order(&self) -> bool {
+        let was_out = self.placed.order_out.replace(true);
+        !was_out || self.plant == Plant::OrderTokenTwice
+    }
+
+    /// Gives the task's lock-order token back.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn give_order(&self) {
+        self.placed.order_out.set(false);
     }
 
     /// Whether this context stopped already at `now`: then a call asks nothing of the driver.
@@ -297,9 +390,10 @@ impl Cx {
 
     /// The context of a task of the scope `self` is: the scope's deadline and cancellation,
     /// its own name and frame.
-    pub(crate) fn task(&self, name: &'static str, frame: Frame) -> Cx {
+    /// It is placed on `worker` and stays there (std.md, "Layouts").
+    pub(crate) fn task(&self, name: &'static str, frame: Frame, worker: u32) -> Cx {
         self.world.record_trace(name, RecordKind::Opened { parent: self.span });
-        Cx { span: name, frame: shared(frame), ..self.child() }
+        Cx { span: name, frame: shared(frame), placed: Placed::on(worker), ..self.child() }
     }
 
     /// Cancels the scope this context's cancellation is: every context sharing it, and every
@@ -318,6 +412,7 @@ impl Cx {
             frame: Arc::clone(&self.frame),
             world: self.world.clone(),
             plant: self.plant,
+            placed: Rc::clone(&self.placed),
         }
     }
 }

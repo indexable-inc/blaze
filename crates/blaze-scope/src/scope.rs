@@ -200,6 +200,8 @@ pub enum AmbiguityKind {
     MoreExpandedVsOuter,
     /// A macro-expanded `macro_rules!` and a path-based macro of the same name.
     MacroRulesVsModularized,
+    /// An attribute macro of a nearer scope with the name of a built-in attribute.
+    BuiltinAttr,
 }
 
 /// Whether a binding is final.
@@ -261,6 +263,15 @@ pub struct TextualDef<N> {
 pub struct TextualMark {
     pub child: ItemKey,
     pub len: u32,
+}
+
+/// A `use path as _;` that resolved: it binds no name, and brings its target (a trait) into
+/// scope for method resolution.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct AnonImport {
+    pub site: UseSite,
+    pub def: Def,
+    pub vis: Visibility,
 }
 
 /// A `use` item, named by the fragment it is written in (`None` for the module's own text, or
@@ -378,6 +389,14 @@ pub struct ModuleScope<N, A: Allocator> {
     /// For each `mod` child (sorted by child key), where its `mod` line falls in `textual`.
     pub marks: Vec<TextualMark, A>,
     pub fellows: Vec<ItemKey, A>,
+    /// The `use .. as _` imports, in the module's tree order: the traits they bring into scope.
+    /// (A glob does not carry them on yet.)
+    pub traits: Vec<AnonImport, A>,
+    /// The `#[macro_export]` `macro_rules!` a macro expansion of this module wrote, in tree
+    /// order. They are bindings of the crate root for other crates: the writer of the crate's
+    /// records adds them to the root's answers once every module of the crate is done. In
+    /// their own crate they are not reachable by path (rustc refuses that too).
+    pub macro_exports: Vec<TextualDef<N>, A>,
 }
 
 impl<N: Ord + Copy, A: Allocator> ModuleScope<N, A> {
@@ -423,6 +442,8 @@ impl<N: PartialEq, A: Allocator> PartialEq for ModuleScope<N, A> {
             && self.textual == other.textual
             && self.marks == other.marks
             && self.fellows == other.fellows
+            && self.traits == other.traits
+            && self.macro_exports == other.macro_exports
     }
 }
 

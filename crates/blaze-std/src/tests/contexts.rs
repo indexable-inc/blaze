@@ -62,7 +62,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
             Make::Scope => parent.scoped(),
             Make::Task => {
                 let frame = Frame::with_reserve(FRAME, blaze_mem::Tag::Frames).map_err(|e| format!("harness: {e:?}"))?;
-                parent.task("task", frame)
+                parent.task("task", frame, at as u32 + 1)
             }
         };
         if child.deadline() > parent.deadline() {

@@ -184,9 +184,14 @@ impl BodyFacts for Facts {
         None
     }
 
-    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(
+        &self,
+        db: &'db Db,
+        body: DefWithBodyId,
+        def: SolverDefId<'db>,
+    ) -> hir_ty::body_store::ItemKey {
         if def == own(body) {
-            return OWN;
+            return hir_ty::body_store::ItemKey(OWN);
         }
         let mut ids = PortableIds::new();
         let tag: u8 = match def {
@@ -203,10 +208,17 @@ impl BodyFacts for Facts {
             _ => panic!("a key asked of a definition that is no item: {def:?}"),
         };
         let bytes = ids.encode(db, self.main).expect("a test item has a portable form");
-        blaze_ids::Hasher::new("blaze v2 item store test def").update(&[tag]).part(&bytes).finish()
+        hir_ty::body_store::ItemKey(
+            blaze_ids::Hasher::new("blaze v2 item store test def").update(&[tag]).part(&bytes).finish(),
+        )
     }
 
-    fn def_of<'db>(&self, _: &'db Db, _: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    fn def_of<'db>(
+        &self,
+        _: &'db Db,
+        _: DefWithBodyId,
+        key: hir_ty::body_store::ItemKey,
+    ) -> Option<SolverDefId<'db>> {
         unreachable!("a trace store looks nothing up: {key:?}")
     }
 }

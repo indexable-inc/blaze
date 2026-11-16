@@ -23,6 +23,7 @@ use crate::{
 };
 
 mod fixtures;
+mod more;
 mod props;
 mod rules;
 
@@ -90,6 +91,8 @@ pub(crate) struct World {
     pub(crate) pos: BTreeMap<ItemKey, u32>,
     /// The calls expanded so far in a solve.
     pub(crate) expanded: RefCell<BTreeSet<ItemKey>>,
+    /// Each derive macro's helper attributes.
+    pub(crate) helpers: BTreeMap<ItemKey, Vec<N>>,
     next: u16,
 }
 
@@ -106,6 +109,7 @@ impl World {
             owner: BTreeMap::new(),
             pos: BTreeMap::new(),
             expanded: RefCell::new(BTreeSet::new()),
+            helpers: BTreeMap::new(),
             next: 0,
         }
     }
@@ -157,6 +161,7 @@ impl World {
                 prelude: None,
                 macro_exports: Vec::new(),
                 tools: Vec::new(),
+                builtin_attrs: std::vec!["derive", "inline", "test"],
             },
         );
         root
@@ -233,17 +238,39 @@ impl World {
 
     /// `macro_rules! name`.
     pub(crate) fn rules(&mut self, at: ItemKey, name: N) -> ItemKey {
+        self.rules_with(at, name, false)
+    }
+
+    /// `macro_rules! name`, `#[macro_export]` if `export`.
+    pub(crate) fn rules_with(&mut self, at: ItemKey, name: N, export: bool) -> ItemKey {
         let def = self.key(World::krate_byte(at));
         let pos = self.next_pos(at);
-        self.d(at).macro_rules.push(MacroRulesDecl { name, def, pos });
+        self.d(at).macro_rules.push(MacroRulesDecl { name, def, pos, export });
         def
+    }
+
+    /// `use p as _;`.
+    pub(crate) fn use_anon(&mut self, at: ItemKey, p: &'static str) {
+        self.use_leaf(at, p, UseLeaf::Named { rename: Rename::Underscore, types_only: false }, V::Priv);
     }
 
     /// A macro call; its expansion is empty until the test writes into it (at its key).
     pub(crate) fn call(&mut self, at: ItemKey, p: &'static str, kind: MacroKind) -> ItemKey {
+        self.call_on(at, p, kind, None)
+    }
+
+    /// A derive macro `name` with `helpers`, at the root of crate `root`.
+    pub(crate) fn derive_macro(&mut self, root: ItemKey, name: N, helpers: &[N]) -> ItemKey {
+        let def = self.item(root, name, Namespace::Macros, DefKind::Macro(MacroKind::Derive), V::Pub);
+        self.helpers.insert(def, helpers.to_vec());
+        def
+    }
+
+    /// An attribute or a derive on item `item` of its fragment.
+    pub(crate) fn call_on(&mut self, at: ItemKey, p: &'static str, kind: MacroKind, item: Option<u32>) -> ItemKey {
         let call = self.key(World::krate_byte(at));
         let pos = self.next_pos(at);
-        self.d(at).calls.push(MacroCallDecl { call, path: path(p), kind, pos });
+        self.d(at).calls.push(MacroCallDecl { call, path: path(p), kind, pos, item });
         let module = self.module_of(at);
         self.owner.insert(call, module);
         self.decls.insert(call, ModuleDecls::new_in(Global));
@@ -293,15 +320,17 @@ pub(crate) enum Own {
     Name(NameAnswer),
     Exports(Vec<crate::ExportEntry<N>>, ContentId),
     Textual(Vec<TextualDef<N>>, ContentId),
+    Helpers(Vec<N>, ContentId),
     InProgress,
 }
 
 impl Own {
-    fn answer(&self) -> Answer<'_, N> {
+    pub(crate) fn answer(&self) -> Answer<'_, N> {
         match self {
             Own::Name(a) => Answer::Name(*a),
             Own::Exports(entries, digest) => Answer::Exports { entries, digest: *digest },
             Own::Textual(defs, digest) => Answer::Textual { defs, digest: *digest },
+            Own::Helpers(names, digest) => Answer::Helpers { names, digest: *digest },
             Own::InProgress => Answer::InProgress,
         }
     }
@@ -309,7 +338,7 @@ impl Own {
     pub(crate) fn saw(&self) -> Option<Saw> {
         match self {
             Own::Name(a) => Some(Saw::Name(*a)),
-            Own::Exports(_, d) | Own::Textual(_, d) => Some(Saw::Digest(*d)),
+            Own::Exports(_, d) | Own::Textual(_, d) | Own::Helpers(_, d) => Some(Saw::Digest(*d)),
             Own::InProgress => None,
         }
     }
@@ -352,6 +381,11 @@ pub(crate) fn answer(
             let v = entry(w, done, module)?;
             let d = digest(3, &v);
             Own::Textual(v, d)
+        }
+        Read::DeriveHelpers { derive } => {
+            let v = w.helpers.get(&derive).cloned().unwrap_or_default();
+            let d = digest(4, &v);
+            Own::Helpers(v, d)
         }
     })
 }

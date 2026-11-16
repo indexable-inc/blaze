@@ -28,6 +28,8 @@ pub enum ResolveError {
     TooManyExpansions { module: ItemKey },
     /// A run of passes that kept changing state past the bound the work allows: a bug.
     NoProgressBound { module: ItemKey, passes: u32 },
+    /// A group's glob fixpoint of one name kept changing past its bound: a bug.
+    GlobFixpointBound { module: ItemKey },
     /// An answer of the wrong kind for its read.
     WrongAnswer { module: ItemKey, read_of: ItemKey },
     /// A step after the machine finished.
@@ -59,6 +61,10 @@ impl fmt::Display for ResolveError {
             ResolveError::NoProgressBound { module, passes } => write!(
                 f,
                 "name resolution of module {module:x}: {passes} passes changed state, past the bound its work allows"
+            ),
+            ResolveError::GlobFixpointBound { module } => write!(
+                f,
+                "name resolution of the group of module {module:x}: a glob fixpoint changed past its bound"
             ),
             ResolveError::WrongAnswer { module, read_of } => write!(
                 f,

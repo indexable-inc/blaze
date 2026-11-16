@@ -31,6 +31,8 @@ blaze-http.workspace = true
 # A request's method, as blaze-http's h1 request writer takes it (`requests::Http::over`).
 http.workspace = true
 blaze-ids.workspace = true
+# `sync`'s new primitives and `par`: Vec, VecDeque, Box, Arc with an allocator always named.
+blaze-own.workspace = true
 blaze-phf.workspace = true
 blaze-radix.workspace = true
 blaze-reclaim.workspace = true

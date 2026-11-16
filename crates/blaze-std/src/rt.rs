@@ -10,6 +10,7 @@
 //! |---|---|---|
 //! | [`RootPath`] | `NativeWorld::root`, which blaze-core's drivers take as a `std::path::Path` | a `Dir` handle from the start block, when the drivers open beneath a handle |
 //! | [`process_id`] | `Host`'s pid on a native `Io` | `blaze_sys`'s `getpid` |
+//! | [`thread_mark`], [`panicking`] | the debug check that a one-thread value and a started task end on the thread they began on (`sync::home`, `Cx`) | the thread's id from bstd's own thread start, and its unwinder's flag |
 //! | [`exit`] | `Host::exit` on a native `Io` | `blaze_sys`'s `exit_group` |
 //! | [`catch_unwind`], [`resume_unwind`] | a task's panic failing only its task; the simulated exit's unwind | bstd's own unwinder entry (on `library/unwind`) |
 //! | [`LazyLock`], [`OnceLock`] | `bstd::sync`'s `Lazy` and `Once` | the same two on bstd's one wait |
@@ -165,6 +166,26 @@ pub(crate) fn process_id() -> u32 {
 #[blaze::pure]
 pub(crate) fn exit(status: i32) -> ! {
     std::process::exit(status)
+}
+
+/// Which OS thread this is: what a one-thread type ([`crate::sync::home`]) and a task's
+/// context remember at their start, to check in a debug build that they end where they began.
+pub(crate) type ThreadMark = std::thread::ThreadId;
+
+/// The calling thread's mark.
+#[blaze::noalloc]
+#[blaze::nonblocking]
+pub(crate) fn thread_mark() -> ThreadMark {
+    std::thread::current().id()
+}
+
+/// Whether the calling thread is unwinding: a debug check in a destructor says nothing then,
+/// since a second panic would abort the process.
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+pub(crate) fn panicking() -> bool {
+    std::thread::panicking()
 }
 
 // How the containers only Rust's `std` has hold their type arguments, for `bstd::own`'s walk

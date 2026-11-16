@@ -35,7 +35,6 @@ mod variance;
 pub mod arbitrary_ints;
 pub mod autoderef;
 pub mod body_store;
-pub mod check_cache;
 pub mod const_exprs;
 pub mod const_param_ty;
 pub mod const_valtree;

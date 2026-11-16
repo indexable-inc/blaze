@@ -1,11 +1,13 @@
 //! [`Parent`] against threads that need functions in any order, a store that has some records,
-//! lookups and compiles that end in any order, and compiles that fail.
+//! compiles that lack records and are entered again, lookups, compiles and makes that end in any
+//! order, and compiles that fail.
 //!
-//! The oracle: a function is compiled at most once and published at most once; every asker is
-//! answered, after the publish, and all askers of one function get the same answer; a failed
-//! compile fails exactly its own callers with its typed error, and nothing stops the run (rule
-//! 20); a waiting thread's function is never left unstarted while a worker is free (it never
-//! waits behind speculation); the start is answered once.
+//! The oracle: one compile of a function is in flight at a time, and it is entered again only
+//! once every record it lacked is made; each lacking record is made once; a function is published
+//! once; every asker is answered, after the publish, and all askers of one function get the same
+//! answer; a failed compile fails exactly its own callers with its typed error, and nothing stops
+//! the run (rule 20); a waiting thread's function is never left idle while a worker is free (it
+//! never waits behind speculation); the start is answered once.
 
 use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,12 +15,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
-use crate::parent::{Answer, Config as ParentConfig, Effect, FastRecord, Found, Function, Parent};
-use crate::{CodeId, CodeRef, FindingsRef, InstanceKey, Nanos, Plant, SlotId, ThreadId, Why};
+use crate::parent::{Answer, Compiled, Config as ParentConfig, Effect, FastRecord, Found, Function, Parent};
+use crate::{
+    CodeId, CodeRef, FindingsRef, Hooks, InstanceKey, Nanos, Plant, RecordKey, SlotId, ThreadId,
+    Version, Why,
+};
 
 const FUNCTIONS: u32 = 6;
 const THREADS: u64 = 4;
 const WORKERS: u32 = 2;
+const KEYS: u64 = 3;
 
 /// Function `n`'s code record: what the store holds or the compiler makes for it.
 fn code_of(slot: SlotId) -> CodeRef {
@@ -30,38 +36,55 @@ fn callees_of(slot: SlotId) -> [SlotId; 2] {
     [SlotId((slot.0 + 1) % FUNCTIONS), SlotId((slot.0 + 2) % FUNCTIONS)]
 }
 
+fn plain(slot: SlotId) -> Version {
+    Version { slot, hooks: Hooks::NONE }
+}
+
+pub(super) fn functions() -> Vec<Function> {
+    (0..FUNCTIONS)
+        .map(|n| Function { instance: InstanceKey(key(u64::from(n))), code: CodeId(key(100 + u64::from(n))) })
+        .collect()
+}
+
 /// The simulation's view of what is out, and what the oracle has seen.
 #[derive(Default)]
 struct World {
     lookups: Vec<SlotId>,
     compiles: Vec<SlotId>,
+    makes: Vec<RecordKey>,
+    made: BTreeSet<RecordKey>,
+    /// What each blocked function's last compile lacked.
+    blocked: BTreeMap<SlotId, Vec<RecordKey>>,
     waiting: BTreeMap<ThreadId, SlotId>,
-    compiled: BTreeMap<SlotId, u32>,
     published: BTreeSet<SlotId>,
     answers: BTreeMap<SlotId, Answer>,
     starts: u32,
 }
 
 impl World {
-    fn see(
-        &mut self,
-        effects: &mut Vec<Effect, Global>,
-        failing: Option<SlotId>,
-    ) -> Result<(), Broke> {
+    fn see(&mut self, effects: &mut Vec<Effect, Global>, failing: Option<SlotId>) -> Result<(), Broke> {
         for effect in effects.drain(..) {
             match effect {
-                Effect::Lookup { slot, .. } => self.lookups.push(slot),
-                Effect::Compile { slot, .. } => {
-                    let count = self.compiled.entry(slot).or_insert(0);
-                    *count += 1;
-                    let count = *count;
-                    oracle(count == 1, || format!("slot {} was compiled twice", slot.0))?;
+                Effect::Lookup { version, .. } => self.lookups.push(version.slot),
+                Effect::Compile { version, .. } => {
+                    let slot = version.slot;
+                    oracle(!self.compiles.contains(&slot), || format!("slot {} was compiled twice at once", slot.0))?;
+                    if let Some(lacked) = self.blocked.remove(&slot) {
+                        let early = lacked.iter().find(|it| !self.made.contains(*it));
+                        oracle(early.is_none(), || {
+                            format!("slot {}'s compile was re-entered before its records were made", slot.0)
+                        })?;
+                    }
                     self.compiles.push(slot);
                 }
-                Effect::Publish { slot, code, .. } => {
-                    oracle(self.published.insert(slot), || {
-                        format!("slot {} was published twice", slot.0)
+                Effect::Make { key, .. } => {
+                    oracle(!self.made.contains(&key) && !self.makes.contains(&key), || {
+                        format!("record {:?} was made twice", &key.0[..1])
                     })?;
+                    self.makes.push(key);
+                }
+                Effect::Publish { slot, code, .. } => {
+                    oracle(self.published.insert(slot), || format!("slot {} was published twice", slot.0))?;
                     oracle(code == code_of(slot), || format!("slot {} got another's code", slot.0))?;
                 }
                 Effect::Answer { thread, slot, answer } => {
@@ -72,20 +95,19 @@ impl World {
                         Answer::Code { .. } => oracle(self.published.contains(&slot), || {
                             format!("thread {} was answered for slot {} before its publish", thread.0, slot.0)
                         })?,
-                        Answer::Failed(error) => oracle(
-                            failing == Some(slot) && error.slot == slot,
-                            || format!("thread {} was failed for slot {}, which compiles", thread.0, slot.0),
-                        )?,
+                        Answer::Failed(error) => oracle(failing == Some(slot) && error.slot == slot, || {
+                            format!("thread {} was failed for slot {}, which compiles", thread.0, slot.0)
+                        })?,
                     }
                     let first = *self.answers.entry(slot).or_insert(answer);
                     oracle(first == answer, || format!("slot {}'s askers got two answers", slot.0))?;
                 }
                 Effect::Begin | Effect::NoStart(_) => self.starts += 1,
                 Effect::Stop(error) => {
-                    return Err(Broke::Oracle(format!(
-                        "the run stopped at slot {}'s failed compile",
-                        error.slot.0
-                    )));
+                    return Err(Broke::Oracle(format!("the run stopped at slot {}'s failed compile", error.slot.0)));
+                }
+                Effect::Untoggled { slot, .. } => {
+                    return Err(Broke::Harness(format!("slot {} untoggled with no toggle", slot.0)));
                 }
                 Effect::Say(_) => {}
             }
@@ -99,12 +121,9 @@ impl World {
             return Ok(());
         }
         for (thread, slot) in &self.waiting {
-            let busy = self.lookups.contains(slot) || self.compiles.contains(slot);
+            let busy = self.lookups.contains(slot) || self.compiles.contains(slot) || self.blocked.contains_key(slot);
             oracle(busy, || {
-                format!(
-                    "thread {} waits on slot {}, which is neither looked up nor compiling, with a worker free",
-                    thread.0, slot.0
-                )
+                format!("thread {} waits on slot {}, which nothing is doing, with a worker free", thread.0, slot.0)
             })?;
         }
         Ok(())
@@ -112,32 +131,32 @@ impl World {
 }
 
 fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let functions: Vec<Function> = (0..FUNCTIONS)
-        .map(|n| Function { instance: InstanceKey(key(u64::from(n))), code: CodeId(key(100 + u64::from(n))) })
-        .collect();
+    let functions = functions();
     let config = ParentConfig { workers: WORKERS, compile_bound: Nanos(u64::MAX / 4), most_waiters: 64 };
     let mut parent = Parent::new(&functions, config, Global).map_err(harness)?;
     parent.plant = plant;
     let failing = tape.coin("a failure").then(|| SlotId(tape.below(u64::from(FUNCTIONS), "failing") as u32));
-    let mut store: BTreeSet<SlotId> =
-        (0..FUNCTIONS).filter(|_| tape.coin("in the store")).map(SlotId).collect();
+    let mut store: BTreeSet<SlotId> = (0..FUNCTIONS).filter(|_| tape.coin("in the store")).map(SlotId).collect();
     if let Some(failing) = failing {
         store.remove(&failing);
     }
+    // What each function's compile reads that may not be made yet: shared, so makes coalesce.
+    let lacks: Vec<Vec<RecordKey>> = (0..FUNCTIONS)
+        .map(|_| (0..KEYS).filter(|_| tape.one_in(3, "lacks")).map(|n| RecordKey(key(50 + n))).collect())
+        .collect();
     let mut world = World::default();
     let mut out = Vec::new_in(Global);
     let mut now = Nanos(0);
-    let history: Vec<SlotId> =
-        (0..FUNCTIONS).filter(|_| tape.one_in(3, "ran last time")).map(SlotId).collect();
+    let history: Vec<SlotId> = (0..FUNCTIONS).filter(|_| tape.one_in(3, "ran last time")).map(SlotId).collect();
     parent.start(&[SlotId(0)], &history, now, &mut out).map_err(harness)?;
     world.see(&mut out, failing)?;
     let steps = tape.range(1..120, "steps");
     let mut step = 0;
     // Past the drawn steps only deliveries, until nothing is out.
-    while step < steps || !world.lookups.is_empty() || !world.compiles.is_empty() {
+    while step < steps || !world.lookups.is_empty() || !world.compiles.is_empty() || !world.makes.is_empty() {
         step += 1;
         now = Nanos(now.0 + 1);
-        let action = if step < steps { tape.below(4, "action") } else { 1 + step % 2 };
+        let action = if step < steps { tape.below(5, "action") } else { 1 + step % 3 };
         match action {
             0 => {
                 let thread = ThreadId(tape.below(THREADS, "thread"));
@@ -151,26 +170,31 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             1 if !world.lookups.is_empty() => {
                 let slot = world.lookups.remove(tape.index(world.lookups.len(), "lookup"));
                 let callees = callees_of(slot);
-                let found = store.contains(&slot).then(|| Found {
-                    fast: code_of(slot),
-                    callees: &callees,
-                    optimized: None,
-                });
-                parent.looked(slot, found, &mut out).map_err(harness)?;
+                let found = store.contains(&slot).then(|| Found { fast: code_of(slot), callees: &callees, optimized: None });
+                parent.looked(plain(slot), found, &mut out).map_err(harness)?;
             }
             2 if !world.compiles.is_empty() => {
                 let slot = world.compiles.remove(tape.index(world.compiles.len(), "compile"));
                 let mut callees = Vec::new_in(Global);
                 callees.extend_from_slice(&callees_of(slot));
                 let record = FastRecord { code: code_of(slot), callees, reads: Vec::new_in(Global) };
-                let result = match failing == Some(slot) {
-                    true => Err(Why::Refused(FindingsRef(key(7)))),
-                    false => {
-                        store.insert(slot);
-                        Ok(&record)
-                    }
+                let missing: Vec<RecordKey> =
+                    lacks[slot.index()].iter().filter(|it| !world.made.contains(*it)).copied().collect();
+                let ended = if failing == Some(slot) {
+                    Compiled::Failed(Why::Refused(FindingsRef(key(7))))
+                } else if !missing.is_empty() {
+                    world.blocked.insert(slot, missing.clone());
+                    Compiled::Need(&missing)
+                } else {
+                    store.insert(slot);
+                    Compiled::Record(&record)
                 };
-                parent.compiled(slot, result, now, &mut out).map_err(harness)?;
+                parent.compiled(plain(slot), ended, now, &mut out).map_err(harness)?;
+            }
+            3 if !world.makes.is_empty() => {
+                let made = world.makes.remove(tape.index(world.makes.len(), "made"));
+                world.made.insert(made);
+                parent.made(made, Ok(()), &mut out).map_err(harness)?;
             }
             _ => continue,
         }
@@ -198,6 +222,11 @@ fn the_oracle_catches_a_run_stopped_by_one_failure() {
     control(Config::cases(4000), Plant::None, Plant::StopOnFailure, "stopped", run);
 }
 
+#[test]
+fn the_oracle_catches_a_compile_entered_before_what_it_lacked() {
+    control(Config::cases(4000), Plant::None, Plant::ReenterEarly, "re-entered before", run);
+}
+
 /// A compile past its bound fails its askers with `Overran`; its late success still serves the
 /// next caller.
 #[test]
@@ -209,7 +238,7 @@ fn an_overrun_compile_fails_its_askers_and_a_late_success_serves_later_ones() {
     parent.start(&[], &[], Nanos(0), &mut out).expect("started");
     out.clear();
     parent.need(ThreadId(1), SlotId(0), Nanos(0), &mut out).expect("needed");
-    parent.looked(SlotId(0), None, &mut out).expect("looked");
+    parent.looked(plain(SlotId(0)), None, &mut out).expect("looked");
     out.clear();
     parent.tick(Nanos(11), &mut out);
     let failed = out.iter().any(|effect| {
@@ -219,12 +248,9 @@ fn an_overrun_compile_fails_its_askers_and_a_late_success_serves_later_ones() {
     assert!(failed, "the asker was not failed past the bound: {out:?}");
     out.clear();
     let record = FastRecord { code: CodeRef(key(5)), callees: Vec::new_in(Global), reads: Vec::new_in(Global) };
-    parent.compiled(SlotId(0), Ok(&record), Nanos(12), &mut out).expect("a late end");
+    parent.compiled(plain(SlotId(0)), Compiled::Record(&record), Nanos(12), &mut out).expect("a late end");
     assert!(out.iter().any(|effect| matches!(effect, Effect::Publish { .. })), "{out:?}");
     out.clear();
     parent.need(ThreadId(2), SlotId(0), Nanos(13), &mut out).expect("needed again");
-    assert!(
-        matches!(out.as_slice(), [Effect::Answer { answer: Answer::Code { .. }, .. }]),
-        "{out:?}"
-    );
+    assert!(matches!(out.as_slice(), [Effect::Answer { answer: Answer::Code { .. }, .. }]), "{out:?}");
 }

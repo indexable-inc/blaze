@@ -24,8 +24,8 @@ use std::alloc::Global;
 use super::{BodyFacts, Lookup, REGISTRY, Reads, Step};
 use crate::{
     InferenceResult,
-    check_cache::ids::{self, IdKind, ItemSink, Table},
     infer::persist::{InferenceRecord, Nodes},
+    next_solver::persist::ids::{self, IdKind, ItemSink, Table},
     next_solver::{
         DbInterner, SolverDefId,
         persist::{TABLE_SCHEMA, TyTableWriter},
@@ -249,7 +249,7 @@ fn item_in(
     kind: u8,
 ) -> R<(IdKind, u64)> {
     let kind = ids::item_kind_of(kind).ok_or("an item of no kind")?;
-    let Some(def) = facts.def_of(db, body, *key) else {
+    let Some(def) = facts.def_of(db, body, blaze_id::ItemKey(*key)) else {
         // alloc: the reason an answer does not read
         return Err(format!("it names item {key:x}, which this database does not have"));
     };
@@ -310,7 +310,7 @@ impl ItemSink for Keyed<'_, '_> {
         // alloc: the reason a result is not stored
         let def = solver_def(kind, bits)
             .ok_or_else(|| format!("a {kind:?} of id bits {bits} is no item"))?;
-        let key = self.facts.def_key(self.db, self.body, def);
+        let blaze_id::ItemKey(key) = self.facts.def_key(self.db, self.body, def);
         match self.seen.entry(key) {
             Entry::Occupied(found) => match *found.get() {
                 (was, was_bits, index) if (was, was_bits) == (kind, bits) => Ok(index),

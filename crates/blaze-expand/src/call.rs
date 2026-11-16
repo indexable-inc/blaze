@@ -38,7 +38,8 @@ pub struct DeriveFacts {
 
 impl DeriveFacts {
     /// A plain `#[derive]` of an item that does not also derive `Copy`.
-    pub const PLAIN: DeriveFacts = DeriveFacts { copy: AlsoCopy::No, constness: Constness::NotConst };
+    pub const PLAIN: DeriveFacts =
+        DeriveFacts { copy: AlsoCopy::No, constness: Constness::NotConst };
 }
 
 /// Whether the item also derives the builtin `Copy`.

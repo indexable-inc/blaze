@@ -1496,9 +1496,9 @@ pub mod kinds {
         COROUTINE_ENTRY = 0x24f7, "coroutine_entry";
         COROUTINE_BY_MOVE_ENTRY = 0x24f8, "coroutine_by_move_entry";
 
-        // Goals answered from the crate's own impls (`next_solver/global_goals`).
-        AUTO_TRAIT_DEPTH = 0x2500, "auto_trait_depth";
-        COPY_CLONE_IMPL = 0x2501, "copy_clone_impl";
+        // 0x2500 and 0x2501 were the shape table's goals answered from the crate's own impls
+        // (`auto_trait_depth`, `copy_clone_impl`), gone 2026-11-15 with `next_solver/global_goals`:
+        // the solver answers those goals itself.
 
         // Signatures, continued (0x2420..0x2440 is full).
         EXPLICIT_SUPER_CLAUSES = 0x2510, "explicit_super_clauses_of";

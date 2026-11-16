@@ -7,12 +7,12 @@
 use std::alloc::{Allocator, Global};
 
 use blaze_expand::{
-    BuiltinDerive, BuiltinFn, Call, CallKind, CallShape, CallSite, Ctx, DefAt, DefSite, Delim,
-    Diagnostic, Eager, Edition, ExpandCx, ExpandError, Expanded, Expansion, Export, Hole, HoleOf,
-    HostAsk, HostError, HostWhy, IncludeAs, Included, Inside, LitKind, LocalInner, MacroDef,
-    MarkOf, NestedKind, Origin, Place, PlaceOf, ProcCall, ProcKind, Produced, Raw, ReadAnswer,
-    ReadKind, Reads, Spacing, TokenKind, TokenStream, call_key, expand, expansion_key, find_calls,
-    lex,
+    AlsoCopy, BuiltinDerive, BuiltinFn, Call, CallKind, CallShape, CallSite, Constness, Ctx, DefAt,
+    DefSite, Delim, DeriveFacts, Diagnostic, Eager, Edition, ExpandCx, ExpandError, Expanded,
+    Expansion, Export, Hole, HoleOf, HostAsk, HostError, HostWhy, IncludeAs, Included, Inside,
+    LitKind, LocalInner, MacroDef, MarkOf, NestedKind, Origin, Place, PlaceOf, ProcCall, ProcKind,
+    Produced, Raw, ReadAnswer, ReadKind, Reads, Spacing, TokenKind, TokenStream, call_key, expand,
+    expansion_key, find_calls, lex,
 };
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_sim::{Broke, Config, Tape};
@@ -28,7 +28,16 @@ struct TestCx {
 
 impl TestCx {
     fn new() -> TestCx {
-        TestCx { env: &[("V", "v")], files: &[("a.txt", b"hi")], cfgs: &["unix"], line: 12 }
+        TestCx {
+            env: &[("V", "v")],
+            files: &[
+                ("a.txt", b"hi"),
+                ("m.rs", b"\xef\xbb\xbffn f() -> u8 { 1 }"),
+                ("bad.rs", b"\""),
+            ],
+            cfgs: &["unix"],
+            line: 12,
+        }
     }
 }
 
@@ -353,6 +362,68 @@ fn include_str_records_its_late_read() {
 }
 
 #[test]
+fn include_lexes_its_file_at_the_call_site() {
+    let cx = TestCx::new();
+    let exp = call_fn(&builtin(BuiltinFn::Include), "\"m.rs\"", &cx);
+    // The byte order mark is not a token.
+    assert_eq!(show(&exp.tokens), "fn f ( ) -> u8 { 1 }");
+    assert!(
+        exp.origins.iter().all(|it| *it == Origin::Made(blaze_expand::Transparency::Transparent))
+    );
+    let read = exp.reads.list()[0];
+    assert_eq!((read.kind, exp.reads.subject(&read)), (ReadKind::IncludeStr, "m.rs"));
+    let bad = call_fn(&builtin(BuiltinFn::Include), "\"bad.rs\"", &cx);
+    assert!(matches!(bad.diagnostics[..], [Diagnostic::Include { .. }]), "{:?}", bad.diagnostics);
+    assert!(bad.tokens.is_empty());
+}
+
+#[test]
+fn assert_panics_with_its_condition_or_its_message() {
+    let cx = TestCx::new();
+    let exp = call_fn(&builtin(BuiltinFn::Assert), "a == b", &cx);
+    assert_eq!(
+        show(&exp.tokens),
+        "if ! ( a == b ) { $crate :: panicking :: panic ( \"assertion failed: a == b\" ) }"
+    );
+    let exp = call_fn(&builtin(BuiltinFn::Assert), "x, \"m {}\", 1", &cx);
+    assert_eq!(
+        show(&exp.tokens),
+        "if ! ( x ) { $crate :: panic :: panic_2021 ! ( \"m {}\" , 1 ) }"
+    );
+    let exp = call_fn(&builtin(BuiltinFn::Assert), "", &cx);
+    assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { .. }]));
+}
+
+#[test]
+fn concat_bytes_joins_bytes_and_arrays() {
+    let cx = TestCx::new();
+    let exp = call_fn(&builtin(BuiltinFn::ConcatBytes), "b\"ab\", b'c', [1, 2u8], [b'z'; 2]", &cx);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(show(&exp.tokens), "b\"abc\\x01\\x02zz\"");
+    for refused in ["\"s\"", "1", "[256]", "[[1]]", "'c'"] {
+        let exp = call_fn(&builtin(BuiltinFn::ConcatBytes), refused, &cx);
+        assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { .. }]), "{refused}");
+    }
+}
+
+#[test]
+fn cfg_select_takes_the_first_arm_that_holds() {
+    let cx = TestCx::new();
+    let def = builtin(BuiltinFn::CfgSelect);
+    let exp = call_fn(&def, "windows => { a } unix => { b } _ => { c }", &cx);
+    assert_eq!(show(&exp.tokens), "b");
+    // The predicates up to the one that holds are read, no further.
+    let answers: Vec<_> = exp.reads.list().iter().map(|it| it.answer).collect();
+    assert_eq!(answers, [ReadAnswer::Bool(false), ReadAnswer::Bool(true)]);
+    let exp = call_fn(&def, "windows => { a } _ => { c }", &cx);
+    assert_eq!(show(&exp.tokens), "c");
+    let exp = call_fn(&def, "windows => { a }", &cx);
+    assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { .. }]));
+    let exp = call_fn(&def, "unix => a", &cx);
+    assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { .. }]));
+}
+
+#[test]
 fn line_is_a_hole_or_a_read_in_eager_input() {
     let cx = TestCx::new();
     let exp = call_fn(&builtin(BuiltinFn::Line), "", &cx);
@@ -388,11 +459,52 @@ fn format_args_is_the_builtin_form() {
 }
 
 fn derive(which: BuiltinDerive, item: &str) -> Expansion<Global> {
+    derive_with(which, item, DeriveFacts::PLAIN)
+}
+
+fn derive_with(which: BuiltinDerive, item: &str, facts: DeriveFacts) -> Expansion<Global> {
     let cx = TestCx::new();
     let def = MacroDef::builtin_derive(which, at(1), Global);
     let item = tokens(item);
-    let call = Call { kind: CallKind::Derive { item: &item }, site: site(), eager: Eager::plain() };
+    let call =
+        Call { kind: CallKind::Derive { item: &item, facts }, site: site(), eager: Eager::plain() };
     done(expand(&def, &call, &cx, Global))
+}
+
+#[test]
+fn clone_of_a_copy_type_without_type_parameters_is_star_self() {
+    let copy = DeriveFacts { copy: AlsoCopy::Yes, constness: Constness::NotConst };
+    let exp = derive_with(BuiltinDerive::Clone, "struct S { a: u8, b: (u8, u16) }", copy);
+    let text = show(&exp.tokens);
+    assert!(text.contains("$crate :: clone :: AssertParamIsClone < u8"), "{text}");
+    assert!(text.contains("AssertParamIsClone < ( u8 , u16 )"), "{text}");
+    assert!(text.contains("* self } }"), "{text}");
+    assert!(!text.contains("Clone :: clone ("), "{text}");
+    // A type parameter keeps the field-by-field clone, as rustc's.
+    let exp = derive_with(BuiltinDerive::Clone, "struct G<T> { a: T }", copy);
+    let text = show(&exp.tokens);
+    assert!(text.contains("$crate :: clone :: Clone :: clone ( a_self )"), "{text}");
+    // The facts are in the key.
+    let item = tokens("struct S { a: u8 }");
+    let def = MacroDef::builtin_derive(BuiltinDerive::Clone, at(1), Global);
+    let call = |facts| Call {
+        kind: CallKind::Derive { item: &item, facts },
+        site: site(),
+        eager: Eager::plain(),
+    };
+    assert_ne!(call_key(&def, &call(copy)), call_key(&def, &call(DeriveFacts::PLAIN)));
+}
+
+#[test]
+fn derive_const_writes_a_const_impl_with_const_bounds() {
+    let konst = DeriveFacts { copy: AlsoCopy::No, constness: Constness::Const };
+    let exp = derive_with(BuiltinDerive::PartialEq, "struct S<T> { a: T }", konst);
+    let text = show(&exp.tokens);
+    let header = "impl < T : [ const ] $crate :: cmp :: PartialEq , > \
+                  const $crate :: cmp :: PartialEq for S < T , >";
+    assert!(text.contains(header), "{text}");
+    // `StructuralPartialEq` is no const trait.
+    assert!(text.contains("impl < T , > $crate :: marker :: StructuralPartialEq for S"), "{text}");
 }
 
 #[test]
@@ -516,6 +628,66 @@ fn nested_calls_are_listed_not_expanded() {
     assert_eq!(exp.nested.len(), 2);
     assert!(exp.nested.iter().all(|it| it.kind == NestedKind::FnLike));
     assert_eq!((exp.nested[1].path.start, exp.nested[1].path.end), (6, 10));
+}
+
+/// Expansions that between them use every column of the record: definition and call tokens
+/// under marks, nested calls, holes, reads, diagnostics with and without a place, and a rule.
+fn varied_expansions() -> Vec<Expansion<Global>> {
+    let cx = TestCx::new();
+    vec![
+        call_fn(&rules("($($x:ident),*) => { $(let $x = 1;)* foo!(2); }", 1), "a, b", &cx),
+        call_fn(&rules("(a) => {}; (b) => {}", 1), "c", &cx),
+        call_fn(&builtin(BuiltinFn::Line), "", &cx),
+        call_fn(&builtin(BuiltinFn::Env), "\"NOPE\", \"why\"", &cx),
+        call_fn(&builtin(BuiltinFn::OptionEnv), "\"V\"", &cx),
+        call_fn(&builtin(BuiltinFn::IncludeStr), "\"a.txt\"", &cx),
+        call_fn(&builtin(BuiltinFn::Cfg), "unix", &cx),
+        call_fn(&builtin(BuiltinFn::Concat), "\"r#\", 1.5, 'c'", &cx),
+        call_fn(&builtin(BuiltinFn::Include), "\"missing.rs\"", &cx),
+        derive(
+            BuiltinDerive::PartialEq,
+            "enum E<'a, T> where T: Sized { A(&'a T), B { x: T::Out } }",
+        ),
+        derive(BuiltinDerive::Default, "enum E { A }"),
+    ]
+}
+
+#[test]
+fn an_expansion_record_reads_back_equal_and_rewrites_equal_bytes() {
+    for exp in varied_expansions() {
+        let bytes = exp.write_record(Global);
+        let read = Expansion::read_record(&bytes, Global).expect("a written record reads back");
+        assert!(read == exp, "{exp:?} read back as {read:?}");
+        assert_eq!(read.write_record(Global)[..], bytes[..]);
+        // A buffer cut short is refused, never read.
+        let cut = Expansion::<Global>::read_record(&bytes[..bytes.len() - 1], Global);
+        assert!(cut.is_err());
+    }
+}
+
+#[test]
+fn an_expansion_record_refuses_a_token_entry_it_does_not_write() {
+    let exp = call_fn(&builtin(BuiltinFn::Stringify), "a", &TestCx::new());
+    let mut bytes = exp.write_record(Global);
+    // The one token, an unsuffixed string literal standing alone: tag 2, kind 4 at bit 5.
+    let word = (2u32 | 4 << 5).to_le_bytes();
+    let at = bytes
+        .windows(4)
+        .position(|it| it == word)
+        .expect("the string literal's entry is in the buffer");
+    // Tag 7 names no token.
+    bytes[at] = 7;
+    let refused = Expansion::<Global>::read_record(&bytes, Global);
+    assert!(
+        matches!(
+            refused,
+            Err(blaze_expand::RecordError::Invalid {
+                column: blaze_expand::RecordColumn::Tokens,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
 }
 
 /// Which key the oracle is given.

@@ -106,7 +106,7 @@ fn edit_case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         let asked = was.reads.entries.iter().any(|e| match e.read {
             Read::Name { name, .. } => name == FRESH,
             Read::Exports { module, class: c } => module == edited && c == class,
-            Read::TextualEntry { .. } | Read::TextualOut { .. } => false,
+            Read::TextualEntry { .. } | Read::TextualOut { .. } | Read::DeriveHelpers { .. } => false,
         });
         if !asked && !holds {
             return Err(Broke::Oracle(format!(

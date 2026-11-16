@@ -1,12 +1,10 @@
 //! The borrow check's verdict under an item store in `Mode::Trace` (a body task's): offered
 //! whatever it is, so a body with a borrow error has a trace whose answer decodes to its
-//! errors, and never answered from the old cache's parts.
+//! errors.
 
 use std::sync::Arc;
 
 use base_db::{Crate, Db, all_crates};
-use blaze_format::Aligned;
-use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use hir_def::{
     DefWithBodyId, deps::body_key, nameres::demand::crate_body_owners,
@@ -15,10 +13,8 @@ use hir_def::{
 use hir_expand::{fixture, name::Name};
 use hir_ty::{
     body_store::{BodyFacts, Classified, Installed, Step, Traced, entries, install_trace},
-    check_cache,
     next_solver::{SolverDefId, goal_store::FactRef},
 };
-use std::alloc::Global;
 
 use crate::{
     borrowck, checked,
@@ -34,15 +30,6 @@ const FIXTURE: &str = r#"
 //- /main.rs crate:main deps:core
 fn two_mut() { let mut n = 0; let a = &mut n; let b = &mut n; *a += 1; *b += 1; }
 fn fixed() { let mut n = 0; let a = &mut n; *a += 1; let b = &mut n; *b += 1; }
-"#;
-
-/// [`FIXTURE`]'s erring body in a dependency, which a part can serve.
-const SERVED: &str = r#"
-//- minicore: sized, copy, clone, add, fn
-//- /dep.rs crate:dep deps:core new_source_root:library
-pub fn two_mut() { let mut n = 0; let a = &mut n; let b = &mut n; *a += 1; *b += 1; }
-//- /main.rs crate:main deps:core,dep new_source_root:local
-fn main() { dep::two_mut(); }
 "#;
 
 /// The facts of these tests: a body's identity is its item's key; every read of the borrow
@@ -66,11 +53,11 @@ impl BodyFacts for Facts {
         None
     }
 
-    fn def_key<'db>(&self, _: &'db Db, _: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, _: &'db Db, _: DefWithBodyId, def: SolverDefId<'db>) -> hir_ty::body_store::ItemKey {
         unreachable!("only the verdict is traced, and its bytes name no definition: {def:?}")
     }
 
-    fn def_of<'db>(&self, _: &'db Db, _: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    fn def_of<'db>(&self, _: &'db Db, _: DefWithBodyId, key: hir_ty::body_store::ItemKey) -> Option<SolverDefId<'db>> {
         unreachable!("a trace store looks nothing up: {key:?}")
     }
 }
@@ -133,25 +120,3 @@ fn a_borrow_error_is_traced_and_its_fix_traces_a_pass() {
     assert_eq!(decode_verdict(&answer), Ok(Verdict::Passed));
 }
 
-/// The invariant: under `Mode::Trace` the old cache's verdict (`check_cache::served_passed`) is
-/// never consulted. The planted case: a part that says every body of `dep` passed, the erring
-/// one too. Without the trace store the part says "passed" (the control: the plant is live);
-/// with it, nothing is served, the gate refuses the body by its own check, and the trace says
-/// the error.
-#[test]
-fn under_trace_the_old_cache_is_not_read() {
-    let first = fixture::db(SERVED).into_db();
-    let bytes = check_cache::encode(&first, crate_named(&first, "dep"), &|_: DefWithBodyId| true).unwrap();
-    let mut db = fixture::db_with_reads(SERVED).into_db();
-    let mut parts = HashMap::new_in(Global);
-    parts.insert(crate_named(&db, "dep"), Arc::new(Aligned::copy_from(&bytes)) as hir_def::deps::ImageBuf);
-    check_cache::set_served(&mut db, parts);
-    // Taken after the commit `set_served` made: an id from before it is dead.
-    let two_mut = function(&db, "dep", "two_mut");
-    assert!(check_cache::served_passed(&db, two_mut), "the planted part says the body passed");
-
-    let installed = install_trace(&db, Arc::new(Facts), BUILD).unwrap();
-    assert!(!check_cache::served_passed(&db, two_mut), "under `Mode::Trace` no part is read");
-    assert!(checked(&db, two_mut).is_err(), "the verdict is the body's own check");
-    assert_errors(&db, two_mut, &verdict_answer(&db, &installed, two_mut));
-}

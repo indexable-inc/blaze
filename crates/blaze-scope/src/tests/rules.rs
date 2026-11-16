@@ -229,6 +229,31 @@ fn expanded_item_shadowing_a_used_glob_is_ambiguous() {
     );
 }
 
+/// Regression (the edit property, tape `1`): a failed import is determined by its reads too.
+/// `use super::fresh as got;` finding nothing keeps the negative reads of `fresh` in `a`, so
+/// adding `fn fresh` to `a` breaks the list, and the new scope binds `got`.
+#[test]
+fn failed_import_keeps_its_negative_reads() {
+    let (before, k) = fixtures::failed_import(false);
+    let old = solved(&before);
+    assert_eq!(import_error(old.errors(k.a_child)), Some((0, Unresolved::NotFound)));
+    let fresh = Read::Name { module: k.a, ns: VAL, name: "fresh" };
+    let reads = &old.by[&k.a_child].reads;
+    assert!(
+        reads.entries.iter().any(|e| e.read == fresh && e.saw == Saw::Name(NameAnswer::Absent)),
+        "{:?}",
+        reads.entries
+    );
+    let (after, k2) = fixtures::failed_import(true);
+    let new = solved(&after);
+    assert!(new.def(k2.a_child, VAL, "got").is_some());
+    let holds = reads.holds(|read| match super::answer(&after, &new.by, *read) {
+        Ok(own) => own.saw().unwrap_or(Saw::Name(NameAnswer::Absent)),
+        Err(_) => Saw::Name(NameAnswer::Absent),
+    });
+    assert!(!holds, "the edit left the old read list valid");
+}
+
 /// Rule: a read list holds the reads that found nothing too: a lookup that went past the
 /// `#[macro_use]` prelude to the standard prelude depends on the first staying empty.
 #[test]

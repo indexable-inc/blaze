@@ -64,7 +64,7 @@ pub use group::Group;
 pub use read::{Answer, ExpandRequest, NameAnswer, Read, Reply, Step};
 pub use resolver::{MAX_EXPANSIONS, MAX_MODULE_DEPTH, RECURSION_LIMIT, Resolver};
 pub use scope::{
-    AmbiguityKind, Binding, BindingState, Def, DefKind, ExportEntry, MacroKind, ModuleScope,
+    AmbiguityKind, AnonImport, Binding, BindingState, Def, DefKind, ExportEntry, MacroKind, ModuleScope,
     Namespace, Origin, ReadEntry, ReadList, Resolved, Saw, ScopeEntry, ScopeError, Site,
     TextualDef, TextualMark, Unresolved, UseSite, Visibility, VisibilityClass,
 };

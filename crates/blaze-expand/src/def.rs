@@ -36,19 +36,15 @@ pub enum BuiltinFn {
     File,
     ModulePath,
     CompileError,
-    /// Not built yet ([`crate::ExpandError::NotBuilt`]).
     Include,
-    /// Not built yet.
     Assert,
-    /// Not built yet.
     ConcatBytes,
-    /// Not built yet.
+    /// Not built yet ([`crate::ExpandError::NotBuilt`]).
     Asm,
     /// Not built yet.
     GlobalAsm,
     /// Not built yet.
     NakedAsm,
-    /// Not built yet.
     CfgSelect,
     /// Not built yet.
     TraceMacros,

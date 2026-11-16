@@ -27,6 +27,18 @@
 //! a `Task` is not put in a `Vec` or an `Option` (the checker refuses a linear value in a type
 //! argument of a type that is not marked for it): each is joined where it was spawned.
 //!
+//! **A started task never changes its thread** (std.md, "Layouts"; docs/v2/plan/design/bottom.md,
+//! "Fibers and `Send`"). rustc checks `Send` across an `.await`, not across a fiber's wait: a
+//! task that holds an `Rc`, a lock guard or a thread-local borrow, waits and resumes on another
+//! thread is a data race rustc accepts. So, as rustc builds bstd: a new task may be placed on
+//! any worker ([`Scope::spawn`] places it, and [`crate::par`] spreads its chunks that way), and
+//! once it has started, every wait it resumes from resumes it there. Under `Inline` that holds
+//! by construction (a task runs on its spawner's thread to its end); a debug build checks it at
+//! every resume, and the simulation test `placement` holds a planted migration against it. The
+//! contract of the blaze form is different and is not code: built by blaze, a task may move at
+//! a wait, because blaze refuses, at compile time, a value that is not `Send` live across a call
+//! that can wait (rule 27).
+//!
 //! **Layout.** S1 runs the `Inline` layout ([`LAYOUT`]): [`Scope::spawn`] runs its task to
 //! completion before it returns, so spawn is eager and nothing else runs while a task waits.
 //! [`Scope::spawn_concurrent`], which must overlap its task with what follows, cannot under
@@ -130,6 +142,9 @@ struct Live {
     running: Cell<usize>,
     /// The task spawned last: who an [`TaskWhy::Unended`] names.
     last: Cell<&'static str>,
+    /// Tasks spawned so far: the next one is placed on the worker after the scope's own plus
+    /// this many (the model of a pool's spread under `Inline`).
+    placed: Cell<u32>,
     /// Whether the scope is still this value's to end: cleared by [`Scope::join`].
     armed: bool,
 }
@@ -205,6 +220,7 @@ impl<'p> Scope<'p> {
             failed: RefCell::new(None),
             running: Cell::new(0),
             last: Cell::new(""),
+            placed: Cell::new(0),
             armed: true,
         };
         Scope { live, parent: PhantomData }
@@ -234,7 +250,10 @@ impl<'p> Scope<'p> {
                 return Task { name, outcome: Err(error), scope: PhantomData };
             }
         };
-        let cx = live.cx.task(name, frame);
+        // A new task may go to any worker; once started it stays there (the module's doc).
+        let placed = live.placed.get() + 1;
+        live.placed.set(placed);
+        let cx = live.cx.task(name, frame, live.cx.worker().wrapping_add(placed));
         live.running.set(live.running.get() + 1);
         let ran = catch_unwind(AssertUnwindSafe(|| task(&cx)));
         live.running.set(live.running.get() - 1);
@@ -311,8 +330,8 @@ impl<'p> Scope<'p> {
                 why: TaskWhy::Unended { running, stopped },
             }),
             Settled::All => match (failed, cx.plant()) {
-                (Some(_), Plant::JoinDropsFailure) | (None, Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned) => Ok(()),
-                (Some(failed), Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned) => Err(failed),
+                (Some(_), Plant::JoinDropsFailure) | (None, Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates) => Ok(()),
+                (Some(failed), Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates) => Err(failed),
             },
         }
     }

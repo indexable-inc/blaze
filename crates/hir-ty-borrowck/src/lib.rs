@@ -70,8 +70,6 @@ mod views_tests;
 #[cfg(test)]
 mod kept_tests;
 #[cfg(test)]
-mod served;
-#[cfg(test)]
 mod trace_tests;
 
 #[cfg(test)]

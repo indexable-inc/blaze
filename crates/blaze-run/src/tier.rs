@@ -10,10 +10,15 @@
 //! it only if it still holds, and [`usable`] is that check as the parent makes it on load. A stale
 //! optimized record costs nothing: the fast record is found under its own key and runs.
 //!
+//! **No waiting.** The optimizer returns its record or the records it lacks ([`Made::Need`]); the
+//! job is then blocked, the driver makes each lacking record once however many jobs lack it
+//! ([`Effect::Make`], [`Tier::made`]), and the job is entered again from the top once all are
+//! made. A job holds a worker only while it runs.
+//!
 //! **Snapshots.** A job is made against the snapshot the tier was at when it began. The parent
 //! tells the tier of a newer one ([`Tier::newer`]) when another run of the same checkout began on
-//! newer text; from then a job of the older snapshot that ends is dropped, never filed or
-//! published, and nothing queued before it starts.
+//! newer text; from then a job of the older snapshot that ends, or is unblocked, is dropped,
+//! never filed or published, and nothing queued before it starts.
 //!
 //! **The reverse map.** [`Tier::callers_of`] gives, for a callee's code identity, the functions
 //! whose optimized code absorbed it: what a later edit of that callee takes back to fast code
@@ -23,10 +28,10 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
-use core::alloc::Allocator;
+use core::alloc::{Allocator, AllocatorClone};
 use core::fmt;
 
-use crate::{CodeId, CodeRef, CompileError, InstanceKey, Plant, SlotId, Snapshot, Why};
+use crate::{CodeId, CodeRef, CompileError, InstanceKey, Made, Plant, RecordKey, SlotId, Snapshot, Why};
 
 /// One callee body an optimized record absorbed, with the code identity it had then.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -49,8 +54,9 @@ pub struct Callee {
     pub code: CodeId,
 }
 
-/// The optimizing backend (the real one comes from codegen's top tier, function grain).
-pub trait Optimizer<A: Allocator + Clone> {
+/// The optimizing backend (the real one comes from codegen's top tier, function grain). A pure
+/// function of what it reads: it returns its record, or what it lacks, and never waits.
+pub trait Optimizer<A: AllocatorClone> {
     /// `instance` optimized, with any of `callees` (and, through them, their callees) inlined.
     /// The result lists every body absorbed with the identity it read; a body missing from the
     /// list is a stale-code bug of the optimizer's.
@@ -59,7 +65,7 @@ pub trait Optimizer<A: Allocator + Clone> {
         instance: InstanceKey,
         callees: &[Callee],
         alloc: A,
-    ) -> Result<Optimized<A>, Why>;
+    ) -> Result<Made<Optimized<A>, A>, Why>;
 }
 
 /// The code identity each instance has now: the program's manifest, as the parent holds it.
@@ -105,14 +111,23 @@ pub struct Job {
     pub snapshot: Snapshot,
 }
 
+/// How one entry of a job ended, as its driver hands it back.
+pub enum Ended<'r, A: Allocator> {
+    Record(Optimized<A>),
+    Need(&'r [RecordKey]),
+    Failed(Why),
+}
+
 /// What the tier asks its driver to do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Effect {
     /// Run the optimizer for `job` at the lowest priority, then call [`Tier::done`].
     Optimize(Job),
+    /// Make the record `key` (by the store or by its task), then call [`Tier::made`].
+    Make { key: RecordKey },
     /// Write [`Tier::record`]`(slot)` to the store, read-addressed by its inlined list.
     File { slot: SlotId },
-    /// Tell the program to place `code` in `slot` at the optimized tier.
+    /// Tell the parent `slot` has optimized `code` ([`crate::parent::Parent::tiered`]).
     Publish { slot: SlotId, code: CodeRef },
     /// The optimizer failed where the fast tier did not: blaze's bug, reported; the fast code runs.
     Failed { slot: SlotId, error: CompileError },
@@ -129,6 +144,10 @@ pub enum Error {
     NotRunning { slot: SlotId, snapshot: Snapshot },
     /// A snapshot that is not newer than the tier's.
     NotNewer { asked: Snapshot, at: Snapshot },
+    /// A `Need` that names nothing: the job could never be entered again.
+    EmptyNeed { slot: SlotId },
+    /// A record made that no job lacked.
+    NotNeeded { key: RecordKey },
     Config { what: &'static str },
 }
 
@@ -149,6 +168,12 @@ impl fmt::Display for Error {
             Error::NotNewer { asked, at } => {
                 write!(f, "snapshot {} is not newer than the tier's {}", asked.0, at.0)
             }
+            Error::EmptyNeed { slot } => {
+                write!(f, "the optimization of slot {} lacked nothing and returned no record", slot.0)
+            }
+            Error::NotNeeded { key } => {
+                write!(f, "record {:02x?} was made and no optimization lacked it", &key.0[..8])
+            }
             Error::Config { what } => write!(f, "the tier's config: {what}"),
         }
     }
@@ -159,15 +184,17 @@ impl core::error::Error for Error {}
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
     Fast,
-    Queued,
+    Queued { snapshot: Snapshot },
     Optimizing { snapshot: Snapshot },
+    /// Waits for `left` records to be made; holds no worker.
+    Blocked { snapshot: Snapshot, left: u32 },
     Optimized,
     Failed,
     Dropped,
 }
 
 /// The optimizing tier of one run. See the module's documentation.
-pub struct Tier<A: Allocator + Clone> {
+pub struct Tier<A: AllocatorClone> {
     alloc: A,
     state: Vec<State, A>,
     instances: BTreeMap<SlotId, InstanceKey, A>,
@@ -177,9 +204,11 @@ pub struct Tier<A: Allocator + Clone> {
     snapshot: Snapshot,
     records: BTreeMap<SlotId, Optimized<A>, A>,
     inlined_into: BTreeMap<CodeId, Vec<SlotId, A>, A>,
+    /// Each record being made, and the jobs that lack it.
+    making: BTreeMap<RecordKey, Vec<SlotId, A>, A>,
 }
 
-impl<A: Allocator + Clone> Tier<A> {
+impl<A: AllocatorClone> Tier<A> {
     /// A tier of `slots` functions running at most `workers` optimizations at once.
     pub fn new(slots: u32, workers: u32, snapshot: Snapshot, alloc: A) -> Result<Tier<A>, Error> {
         if workers == 0 {
@@ -196,6 +225,7 @@ impl<A: Allocator + Clone> Tier<A> {
             snapshot,
             records: BTreeMap::new_in(alloc.clone()),
             inlined_into: BTreeMap::new_in(alloc.clone()),
+            making: BTreeMap::new_in(alloc.clone()),
             alloc,
         })
     }
@@ -208,13 +238,14 @@ impl<A: Allocator + Clone> Tier<A> {
         out: &mut Vec<Effect, A>,
     ) -> Result<(), Error> {
         let slots = self.state.len() as u32;
+        let snapshot = self.snapshot;
         let Some(state) = self.state.get_mut(slot.index()) else {
             return Err(Error::NoSlot { slot, slots });
         };
         if *state != State::Fast {
             return Err(Error::Twice { slot });
         }
-        *state = State::Queued;
+        *state = State::Queued { snapshot };
         self.instances.insert(slot, instance);
         self.queue.push_back(slot);
         self.pump(out);
@@ -224,23 +255,21 @@ impl<A: Allocator + Clone> Tier<A> {
     fn pump(&mut self, out: &mut Vec<Effect, A>) {
         while self.running < self.workers {
             let Some(slot) = self.queue.pop_front() else { return };
-            if self.state[slot.index()] != State::Queued {
+            let State::Queued { snapshot } = self.state[slot.index()] else { continue };
+            if snapshot < self.snapshot {
+                self.state[slot.index()] = State::Dropped;
+                out.push(Effect::Dropped { slot, snapshot });
                 continue;
             }
-            self.state[slot.index()] = State::Optimizing { snapshot: self.snapshot };
+            self.state[slot.index()] = State::Optimizing { snapshot };
             self.running += 1;
             let instance = self.instances[&slot];
-            out.push(Effect::Optimize(Job { slot, instance, snapshot: self.snapshot }));
+            out.push(Effect::Optimize(Job { slot, instance, snapshot }));
         }
     }
 
-    /// The end of `job`.
-    pub fn done(
-        &mut self,
-        job: Job,
-        result: Result<Optimized<A>, Why>,
-        out: &mut Vec<Effect, A>,
-    ) -> Result<(), Error> {
+    /// The end of one entry of `job`.
+    pub fn done(&mut self, job: Job, ended: Ended<'_, A>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
         let Job { slot, snapshot, instance } = job;
         if self.state.get(slot.index()) != Some(&State::Optimizing { snapshot }) {
             return Err(Error::NotRunning { slot, snapshot });
@@ -249,28 +278,77 @@ impl<A: Allocator + Clone> Tier<A> {
         if snapshot < self.snapshot {
             self.state[slot.index()] = State::Dropped;
             out.push(Effect::Dropped { slot, snapshot });
-        } else {
-            match result {
-                Ok(optimized) => {
-                    for each in &optimized.inlined {
-                        let callers = self
-                            .inlined_into
-                            .entry(each.code)
-                            .or_insert_with(|| Vec::new_in(self.alloc.clone()));
-                        if !callers.contains(&slot) {
-                            callers.push(slot);
+            self.pump(out);
+            return Ok(());
+        }
+        match ended {
+            Ended::Record(optimized) => {
+                for each in &optimized.inlined {
+                    let callers = self
+                        .inlined_into
+                        .entry(each.code)
+                        .or_insert_with(|| Vec::new_in(self.alloc.clone()));
+                    if !callers.contains(&slot) {
+                        callers.push(slot);
+                    }
+                }
+                let code = optimized.code;
+                self.records.insert(slot, optimized);
+                self.state[slot.index()] = State::Optimized;
+                out.push(Effect::File { slot });
+                out.push(Effect::Publish { slot, code });
+            }
+            Ended::Need(keys) => {
+                if keys.is_empty() {
+                    self.state[slot.index()] = State::Failed;
+                    return Err(Error::EmptyNeed { slot });
+                }
+                let mut left = 0;
+                for key in keys {
+                    match self.making.get_mut(key) {
+                        Some(jobs) if jobs.contains(&slot) => continue,
+                        Some(jobs) => jobs.push(slot),
+                        None => {
+                            let mut jobs = Vec::new_in(self.alloc.clone());
+                            jobs.push(slot);
+                            self.making.insert(*key, jobs);
+                            out.push(Effect::Make { key: *key });
                         }
                     }
-                    let code = optimized.code;
-                    self.records.insert(slot, optimized);
-                    self.state[slot.index()] = State::Optimized;
-                    out.push(Effect::File { slot });
-                    out.push(Effect::Publish { slot, code });
+                    left += 1;
                 }
+                self.state[slot.index()] = State::Blocked { snapshot, left };
+            }
+            Ended::Failed(why) => {
+                self.state[slot.index()] = State::Failed;
+                let error = CompileError { function: instance, slot, why };
+                out.push(Effect::Failed { slot, error });
+            }
+        }
+        self.pump(out);
+        Ok(())
+    }
+
+    /// The record `key` was made (or could not be): each job that lacked it is entered again
+    /// once it lacks nothing, or fails.
+    pub fn made(&mut self, key: RecordKey, result: Result<(), Why>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+        let Some(jobs) = self.making.remove(&key) else {
+            return Err(Error::NotNeeded { key });
+        };
+        for slot in jobs {
+            let State::Blocked { snapshot, left } = self.state[slot.index()] else { continue };
+            match result {
                 Err(why) => {
                     self.state[slot.index()] = State::Failed;
-                    let error = CompileError { function: instance, slot, why };
+                    let error = CompileError { function: self.instances[&slot], slot, why };
                     out.push(Effect::Failed { slot, error });
+                }
+                Ok(()) if left > 1 => {
+                    self.state[slot.index()] = State::Blocked { snapshot, left: left - 1 };
+                }
+                Ok(()) => {
+                    self.state[slot.index()] = State::Queued { snapshot };
+                    self.queue.push_front(slot);
                 }
             }
         }
@@ -278,15 +356,15 @@ impl<A: Allocator + Clone> Tier<A> {
         Ok(())
     }
 
-    /// A newer snapshot exists: what runs now is dropped when it ends, what is queued now never
-    /// starts.
+    /// A newer snapshot exists: what runs or is blocked now is dropped when it ends or is
+    /// unblocked, what is queued now never starts.
     pub fn newer(&mut self, snapshot: Snapshot) -> Result<(), Error> {
         if snapshot <= self.snapshot {
             return Err(Error::NotNewer { asked: snapshot, at: self.snapshot });
         }
         self.snapshot = snapshot;
         for slot in self.queue.drain(..) {
-            if self.state[slot.index()] == State::Queued {
+            if let State::Queued { .. } = self.state[slot.index()] {
                 self.state[slot.index()] = State::Dropped;
             }
         }

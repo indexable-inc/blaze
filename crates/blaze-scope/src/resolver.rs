@@ -89,6 +89,12 @@ pub(crate) struct Fragment<N, A: Allocator> {
     pub(crate) bad_extern: Vec<N, A>,
     /// Its `pub(in path)`s whose path names no ancestor.
     pub(crate) bad_vis: Vec<Path<N, A>, A>,
+    /// Its declarations' `pub(in path)`s whose path is not the names of an ancestor as written
+    /// (`pub(in crate::alias)`): private while the module resolves, and resolved as paths in
+    /// the final pass, which writes the binding with the module the path names.
+    pub(crate) deferred_vis: Vec<(Path<N, A>, Namespace, N, Def), A>,
+    /// Its `#[macro_export]` `macro_rules!`, in an expansion only.
+    pub(crate) exports: Vec<TextualDef<N>, A>,
 }
 
 /// Which scope a hit was found in.
@@ -246,6 +252,8 @@ pub(crate) struct Call<N, A: Allocator> {
     pub(crate) path: Path<N, A>,
     pub(crate) kind: MacroKind,
     pub(crate) at: At,
+    /// The item it is on, in its fragment (an attribute or a derive).
+    pub(crate) item: Option<u32>,
     pub(crate) state: CallState,
     pub(crate) first: Option<Def>,
     pub(crate) blocked: bool,
@@ -256,6 +264,7 @@ pub(crate) enum Cached<N, A: Allocator> {
     Name(NameAnswer),
     Exports { entries: Vec<ExportEntry<N>, A>, digest: ContentId },
     Textual { defs: Vec<TextualDef<N>, A>, digest: ContentId },
+    Helpers { names: Vec<N, A>, digest: ContentId },
     InProgress,
 }
 
@@ -288,12 +297,21 @@ pub(crate) struct Sink<N, A: Allocator> {
     pub(crate) waits: Vec<Read<N>, A>,
     pub(crate) used: Vec<ReadEntry<N>, A>,
     pub(crate) amb: Option<Amb<N>>,
+    /// The group's glob fixpoints of this pass, by `(ns, name, ignored import)`: for each glob
+    /// edge, a fellow `f` and an importer `i` (member indexes, sorted), what `f` binds the
+    /// name to as `i` sees it. The state does not change while a pass plans, so one is
+    /// computed once.
+    pub(crate) memo: HashMap<(Namespace, N, Option<(ItemKey, u32)>), Vec<(usize, usize, Res), A>, A>,
+    /// A fixpoint ran past its bound: the pass stops with a typed error.
+    pub(crate) overrun: bool,
+    /// The earliest glob of the module being finished that left a name undetermined.
+    pub(crate) undet_glob: Option<(ItemKey, At, u32)>,
     /// The planted bug of the read-list control: a read that found nothing is not kept.
     #[cfg(test)]
     pub(crate) forget_negative: bool,
 }
 
-impl<N, A: Allocator + Clone> Sink<N, A> {
+impl<N: Name, A: Allocator + Clone> Sink<N, A> {
     pub(crate) fn new_in(alloc: &A, scan: Scan) -> Sink<N, A> {
         Sink {
             scan,
@@ -301,9 +319,17 @@ impl<N, A: Allocator + Clone> Sink<N, A> {
             waits: Vec::new_in(alloc.clone()),
             used: Vec::new_in(alloc.clone()),
             amb: None,
+            memo: HashMap::new_in(alloc.clone()),
+            overrun: false,
+            undet_glob: None,
             #[cfg(test)]
             forget_negative: false,
         }
+    }
+
+    /// The typed error of a fixpoint that ran past its bound, if one did.
+    pub(crate) fn check(&self, module: ItemKey) -> Result<(), ResolveError> {
+        if self.overrun { Err(ResolveError::GlobFixpointBound { module }) } else { Ok(()) }
     }
 }
 
@@ -323,28 +349,11 @@ impl<N, A: Allocator + Clone> Copy for Env<'_, N, A> {}
 
 impl<'a, N, A: Allocator + Clone> Env<'a, N, A> {
     pub(crate) fn fellow(&self, module: ItemKey) -> Option<&'a Resolver<N, A>> {
-        self.members.binary_search_by(|m| m.module.cmp(&module)).ok().map(|at| &self.members[at])
+        self.index(module).map(|at| &self.members[at])
     }
-}
 
-/// The modules a glob traversal has passed through: a cycle of globs contributes nothing
-/// beyond what is bound somewhere on it (the least fixpoint).
-#[derive(Clone, Copy)]
-pub(crate) struct Visited<'v> {
-    pub(crate) module: ItemKey,
-    pub(crate) next: Option<&'v Visited<'v>>,
-}
-
-impl Visited<'_> {
-    pub(crate) fn contains(&self, module: ItemKey) -> bool {
-        let mut at = Some(self);
-        while let Some(link) = at {
-            if link.module == module {
-                return true;
-            }
-            at = link.next;
-        }
-        false
+    pub(crate) fn index(&self, module: ItemKey) -> Option<usize> {
+        self.members.binary_search_by(|m| m.module.cmp(&module)).ok()
     }
 }
 
@@ -356,7 +365,6 @@ pub(crate) struct Query<'q> {
     pub(crate) restricted: bool,
     /// The import being resolved, which may not justify itself (rustc's `ignore_binding`).
     pub(crate) ignore: Option<(ItemKey, u32)>,
-    pub(crate) visited: Option<&'q Visited<'q>>,
 }
 
 /// A pending item, for its blocked flag.
@@ -438,6 +446,8 @@ pub struct Resolver<N, A: Allocator + Clone> {
     pub(crate) macro_use: Vec<ItemKey, A>,
     pub(crate) prelude: Option<ItemKey>,
     pub(crate) tools: Vec<N, A>,
+    /// Sorted.
+    pub(crate) builtin_attrs: Vec<N, A>,
     pub(crate) frags: Vec<Fragment<N, A>, A>,
     /// The non-glob declarations by namespace and name, the first in the module's tree kept.
     pub(crate) defs: HashMap<(Namespace, N), DefEntry, A>,
@@ -501,6 +511,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         macro_use.extend_from_slice(&cr.macro_use);
         let mut tools = Vec::with_capacity_in(cr.tools.len(), alloc.clone());
         tools.extend_from_slice(&cr.tools);
+        let mut builtin_attrs = Vec::with_capacity_in(cr.builtin_attrs.len(), alloc.clone());
+        builtin_attrs.extend_from_slice(&cr.builtin_attrs);
+        builtin_attrs.sort();
         let mut r = Resolver {
             module,
             krate,
@@ -514,6 +527,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             macro_use,
             prelude: cr.prelude,
             tools,
+            builtin_attrs,
             frags: Vec::new_in(alloc.clone()),
             defs: HashMap::new_in(alloc.clone()),
             imports: Vec::new_in(alloc.clone()),
@@ -615,6 +629,35 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         }
     }
 
+    /// A declaration's visibility. A `pub(in path)` from `crate`, `self` or `super` whose
+    /// names are not an ancestor's as written may go through an alias, so it is deferred to
+    /// the final pass (private until then) rather than refused.
+    fn resolve_decl_vis<B: Allocator>(
+        &self,
+        vis: &VisDecl<N, B>,
+        ns: Namespace,
+        name: N,
+        def: Def,
+        bad: &mut Vec<Path<N, A>, A>,
+        deferred: &mut Vec<(Path<N, A>, Namespace, N, Def), A>,
+    ) -> Visibility {
+        let before = bad.len();
+        let resolved = self.resolve_vis(vis, bad);
+        if let VisDecl::In(path) = vis {
+            let as_path = match path.kind {
+                PathKind::Crate | PathKind::SelfMod | PathKind::Super(_) => true,
+                PathKind::Plain => self.edition == Edition::E2015,
+                PathKind::Abs | PathKind::DollarCrate(_) => false,
+            };
+            if as_path && bad.len() > before {
+                if let Some(p) = bad.pop() {
+                    deferred.push((p, ns, name, def));
+                }
+            }
+        }
+        resolved
+    }
+
     /// Adds one fragment (the module's text or a call's expansion), returning its index.
     pub(crate) fn add_fragment<B: Allocator>(
         &mut self,
@@ -629,6 +672,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         let mut items = Vec::new_in(a.clone());
         let mut bad_extern = Vec::new_in(a.clone());
         let mut bad_vis = Vec::new_in(a.clone());
+        let mut deferred_vis = Vec::new_in(a.clone());
+        let mut exports = Vec::new_in(a.clone());
         let mut ordered: Vec<(u32, Slot<N>), A> = Vec::new_in(a.clone());
         let entry = |def: Def, vis: Visibility, origin: Origin| DefEntry {
             def,
@@ -639,12 +684,13 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         };
 
         for it in decls.items.iter() {
-            let vis = self.resolve_vis(&it.vis, &mut bad_vis);
+            let vis = self.resolve_decl_vis(&it.vis, it.ns, it.name, it.def, &mut bad_vis, &mut deferred_vis);
             items.push((it.ns, it.name, entry(it.def, vis, Origin::Declared)));
         }
         for m in decls.mods.iter() {
-            let vis = self.resolve_vis(&m.vis, &mut bad_vis);
-            items.push((Namespace::Types, m.name, entry(Def::module(m.module), vis, Origin::Declared)));
+            let def = Def::module(m.module);
+            let vis = self.resolve_decl_vis(&m.vis, Namespace::Types, m.name, def, &mut bad_vis, &mut deferred_vis);
+            items.push((Namespace::Types, m.name, entry(def, vis, Origin::Declared)));
             ordered.push((m.pos, Slot::Mod { child: m.module, macro_use: m.macro_use }));
         }
         for ec in decls.extern_crates.iter() {
@@ -721,6 +767,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         }
         for mr in decls.macro_rules.iter() {
             ordered.push((mr.pos, Slot::Rules { name: mr.name, def: mr.def }));
+            if mr.export && expansion > 0 {
+                exports.push(TextualDef { name: mr.name, def: mr.def, expansion });
+            }
         }
         for c in decls.calls.iter() {
             let i = count(self.calls.len(), module)?;
@@ -735,6 +784,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 path: c.path.copy_in(a.clone()),
                 kind: c.kind,
                 at: At { frag: fid, slot: 0 },
+                item: c.item,
                 state,
                 first: None,
                 blocked: true,
@@ -753,7 +803,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             }
             slots.push(slot);
         }
-        self.frags.push(Fragment { expansion, parent, slots, items, bad_extern, bad_vis });
+        self.frags.push(Fragment { expansion, parent, slots, items, bad_extern, bad_vis, deferred_vis, exports });
         for k in 0..self.frags[fid as usize].items.len() {
             let (ns, name, e) = self.frags[fid as usize].items[k];
             self.insert_def(ns, name, e);
@@ -834,12 +884,19 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                     v.extend_from_slice(defs);
                     Cached::Textual { defs: v, digest }
                 }
+                (Read::DeriveHelpers { .. }, Answer::Helpers { names, digest }) => {
+                    let mut v = Vec::with_capacity_in(names.len(), self.alloc.clone());
+                    v.extend_from_slice(names);
+                    v.sort();
+                    Cached::Helpers { names: v, digest }
+                }
                 (
                     Read::Name { .. }
                     | Read::Exports { .. }
                     | Read::TextualEntry { .. }
-                    | Read::TextualOut { .. },
-                    Answer::Name(_) | Answer::Exports { .. } | Answer::Textual { .. },
+                    | Read::TextualOut { .. }
+                    | Read::DeriveHelpers { .. },
+                    Answer::Name(_) | Answer::Exports { .. } | Answer::Textual { .. } | Answer::Helpers { .. },
                 ) => {
                     return Err(ResolveError::WrongAnswer {
                         module: self.module,
@@ -865,7 +922,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         };
         let saw = match c {
             Cached::Name(answer) => Saw::Name(*answer),
-            Cached::Exports { digest, .. } | Cached::Textual { digest, .. } => Saw::Digest(*digest),
+            Cached::Exports { digest, .. } | Cached::Textual { digest, .. } | Cached::Helpers { digest, .. } => {
+                Saw::Digest(*digest)
+            }
             Cached::InProgress => {
                 sink.waits.push(read);
                 return None;
@@ -1072,6 +1131,7 @@ fn pass<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
             plans.push(m.plan(facts, env, &mut sink)?);
         }
     }
+    sink.check(ms[0].module)?;
     let mut moved = false;
     for (m, plan) in ms.iter_mut().zip(plans) {
         moved |= m.apply(facts, plan)?;
@@ -1111,6 +1171,7 @@ fn relax<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
                 plans.push(m.plan(facts, env, &mut sink)?);
             }
         }
+        sink.check(ms[0].module)?;
         all.need.extend_from_slice(&sink.need);
         all.waits.extend_from_slice(&sink.waits);
         let mut changed = false;
@@ -1176,6 +1237,8 @@ fn owner<N: Copy, A: Allocator + Clone>(ms: &[Resolver<N, A>], read: &Read<N>) -
             ms.iter().find(|m| m.module == module).and_then(|m| m.chain.get(1).copied())
         }
         Read::Name { .. } | Read::Exports { .. } | Read::TextualOut { .. } => Some(read.module()),
+        // A macro's record, never a module in progress.
+        Read::DeriveHelpers { .. } => None,
     }
 }
 

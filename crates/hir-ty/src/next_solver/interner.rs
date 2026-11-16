@@ -512,15 +512,6 @@ impl<'db> DbInterner<'db> {
         self.regions
     }
 
-    /// Runs `f` on this interner's global-goal table (see `global_goals`).
-    #[inline]
-    pub(crate) fn with_global_goals<R>(
-        self,
-        f: impl FnOnce(&super::global_goals::Goals) -> R,
-    ) -> R {
-        tls_cache::global_goals(self.db, self.krate, self.regions, f)
-    }
-
     #[inline]
     pub fn db(&self) -> &'db Db {
         self.db

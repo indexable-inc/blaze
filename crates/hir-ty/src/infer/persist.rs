@@ -1,10 +1,9 @@
 //! [`InferenceResult`] in blaze's format (docs/v2/plan/design/data.md). [`InferenceRecord`] is
 //! its `'static` form: the result's columns as they are, in three flat arrays of `u64`, `u32` and
 //! `u8` words, each type an index in a type table of its own (`next_solver::persist`), each
-//! definition through `check_cache::id_bits`: inside `check_cache::relocating` (every record
-//! another process reads, the crate's own image among them) its index in the record's table of
-//! portable ids, outside one its memo id's bits, which only the process that wrote them reads
-//! back (a `blaze_memo::Gid` means nothing in another process), and what few nodes have (diagnostics, the
+//! definition through `ids::id_bits`: inside `ids::relocating`, the body store's scope and the
+//! only place a record is written or read, its index in the record's table of portable ids
+//! (a `blaze_memo::Gid` means nothing in another process), and what few nodes have (diagnostics, the
 //! closures' captures) as tagged `u32` words beside them. [`Persist`] writes the arrays and the
 //! table's buffer into one buffer and reads them back in place;
 //! [`InferenceRecordRef::to_result`] makes the result again, every column checked as it is
@@ -37,6 +36,7 @@ use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{ClausePolarity, ClosureKind, inherent::IntoKind, reflect::ReflectedDomain};
 
+use crate::next_solver::persist::ids::{self, Relocate};
 use crate::{
     Span,
     comptime::ReflectedMember,
@@ -283,15 +283,15 @@ fn table_in<'b>(buffer: &'b [u8], table: &[u128]) -> &'b [u8] {
     &buffer[start..][..size_of_val(table)]
 }
 
-/// An id's word: its bits, or inside `check_cache::relocating` its place in the table.
-fn id_bits<T: crate::check_cache::Relocate>(id: T) -> u64 {
-    crate::check_cache::id_bits(id)
+/// An id's word: inside `ids::relocating`, its place in the table.
+fn id_bits<T: Relocate>(id: T) -> u64 {
+    ids::id_bits(id)
 }
 
 /// [`id_bits`]' id back, or why the bits name none (`IdRefused::at` makes it the record's
 /// error).
-fn id_of<T: crate::check_cache::Relocate>(bits: u64) -> Result<T, crate::check_cache::IdRefused> {
-    crate::check_cache::id_of(bits)
+fn id_of<T: Relocate>(bits: u64) -> Result<T, ids::IdRefused> {
+    ids::id_of(bits)
 }
 
 fn local<T>(id: Idx<T>) -> u32 {
@@ -665,7 +665,7 @@ impl TyDecode for TableDecode<'_, '_> {
         let id = id_of::<TraitId>(u64::from(low) | (u64::from(high) << 32))
             .map_err(|refused| refused.at(self.at))?;
         let args = self.table.args(args)?;
-        Ok(StoredTraitRef::new(crate::check_cache::outside(|| {
+        Ok(StoredTraitRef::new(ids::outside(|| {
             TraitRef::new_from_args(self.interner, id.into(), args)
         })))
     }
@@ -1202,7 +1202,7 @@ impl<'a> InferenceRecordRef<'a> {
         &self.bytes[start as usize..][..len as usize]
     }
 
-    fn id<T: crate::check_cache::Relocate>(&self, bits: u64) -> Result<T, FormatError> {
+    fn id<T: Relocate>(&self, bits: u64) -> Result<T, FormatError> {
         id_of(bits).map_err(|refused| refused.at(self.at))
     }
 
@@ -1447,7 +1447,7 @@ impl<'a> InferenceRecordRef<'a> {
                     Ok((self.id::<InternedOpaqueTyId<'db>>(bits)?, tys.ty(ty)?))
                 }),
             )?;
-            if crate::check_cache::in_scope() {
+            if ids::in_scope() {
                 entries.sort_unstable_by_key(|&(id, _)| id);
             }
             SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
@@ -1745,7 +1745,7 @@ impl Sink {
         self.word(local(id));
     }
 
-    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+    fn id<T: Relocate>(&mut self, id: T) {
         self.u64(id_bits(id));
     }
 
@@ -2902,7 +2902,7 @@ impl Source<'_> {
         Ok(local_of(self.word()?))
     }
 
-    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
+    fn id<T: Relocate>(&mut self) -> Result<T, FormatError> {
         let bits = self.u64()?;
         id_of(bits).map_err(|refused| refused.at(self.at))
     }

@@ -29,7 +29,7 @@ use blaze_record::{AnswerKey, Digest};
 use std::alloc::Global;
 
 use super::{
-    BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, Traced, capture,
+    BodyFacts, Classified, Flushed, ItemKey, Lookup, Mode, Step, StepCounts, Traced, capture,
     entries, infer, install, install_trace, lookup_inference, lookup_passed, offer_passed,
     offer_verdict,
     record::{self, ShapeRef},
@@ -403,22 +403,22 @@ impl BodyFacts for TestFacts {
         )
     }
 
-    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ItemKey {
         if def == own(body) {
-            return OWN;
+            return ItemKey(OWN);
         }
         let (tag, ids) = portable(def);
         let bytes = ids.encode(db, self.main).expect("a test item has a portable form");
         let key = Hasher::new("blaze v2 item store test def").update(&[tag]).part(&bytes).finish();
         self.defs.lock().insert(key, (tag, bytes));
-        key
+        ItemKey(key)
     }
 
     fn def_of<'db>(
         &self,
         db: &'db Db,
         body: DefWithBodyId,
-        key: ContentId,
+        ItemKey(key): ItemKey,
     ) -> Option<SolverDefId<'db>> {
         if key == OWN {
             return Some(own(body));

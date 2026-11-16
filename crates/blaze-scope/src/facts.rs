@@ -153,13 +153,16 @@ pub struct ExternCrateDecl<N, A: Allocator> {
     pub vis: VisDecl<N, A>,
 }
 
-/// A `macro_rules!` definition, in the fragment's source order. A `#[macro_export]` one is in
-/// the crate root's scope through [`CrateRoot::macro_exports`].
+/// A `macro_rules!` definition, in the fragment's source order. A `#[macro_export]` one
+/// written in source is in the crate root's scope through [`CrateRoot::macro_exports`]; one
+/// a macro expansion writes is listed in its module's [`crate::ModuleScope::macro_exports`].
 #[derive(Clone, Copy, Debug)]
 pub struct MacroRulesDecl<N> {
     pub name: N,
     pub def: ItemKey,
     pub pos: u32,
+    /// `#[macro_export]`.
+    pub export: bool,
 }
 
 /// An item-position macro call: a bang call, an attribute macro on an item (the item is not a
@@ -171,6 +174,9 @@ pub struct MacroCallDecl<N, A: Allocator> {
     pub path: Path<N, A>,
     pub kind: MacroKind,
     pub pos: u32,
+    /// The item an attribute or a derive is on, an index unique in the fragment: a derive's
+    /// helper attributes are in scope for the attributes written after it on the same item.
+    pub item: Option<u32>,
 }
 
 /// What one fragment of a module declares: the module's own text (with `cfg` already decided:
@@ -248,6 +254,10 @@ pub struct CrateRoot<N, A: Allocator> {
     /// The tool names (`rustfmt`, `clippy`, `register_tool`'s): an attribute path beginning
     /// with one is inert.
     pub tools: Vec<N, A>,
+    /// The toolchain's built-in attribute names (`inline`, `test`, `derive`, ...), sorted:
+    /// a one-segment attribute naming one is inert, and an attribute macro of a nearer scope
+    /// shadowing one is ambiguous (rustc's built-in attribute scope).
+    pub builtin_attrs: Vec<N, A>,
 }
 
 /// Everything the machine reads of the module it resolves and of its crate. Each method is a

@@ -73,6 +73,7 @@ use blaze_ids::ContentId;
 use blaze_record::{AnswerKey, Bounds, Digest, Placed};
 use hir_def::{DefWithBodyId, deps::ImageStore};
 
+pub use blaze_id::ItemKey;
 pub use facts::{BodyFacts, Classified, Step};
 pub use lower::{Closure, Lowered, lowering};
 pub(crate) use infer::inference;
@@ -85,7 +86,7 @@ pub(crate) use mir::{NONE as NO_PLACE, in_body, kind_code};
 pub use mir::{calls_place_macro, is_place, location_literals, place_call, placed_literal};
 #[doc(hidden)]
 pub use mir::testing;
-pub use crate::check_cache::ids::{closure_kind_code, closure_kind_of};
+pub use crate::next_solver::persist::ids::{closure_kind_code, closure_kind_of};
 pub use value::step_value;
 
 /// The inherent impls' associated types of `adt` a path's lowering looks a name up in

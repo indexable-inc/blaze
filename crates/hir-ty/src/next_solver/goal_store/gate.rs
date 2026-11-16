@@ -231,7 +231,6 @@ pub(crate) fn evaluate_root_goal<'db>(
         && let Some(answer) = Answer::of(resolved, &result)
         && Mark::of(infcx) == Some(before)
     {
-        interner.with_global_goals(|table| table.insert(key, answer, &reads));
         goal_store::offer(interner, key, answer, reads);
     }
     result
@@ -282,8 +281,8 @@ impl Mark {
     }
 }
 
-/// Test-only switch: with it off, neither the table nor the shape table answers, so a test
-/// can compare them with the plain solver on one thread.
+/// Test-only switch: with it off, the store is neither asked nor offered, so a test can
+/// compare it with the plain solver on one thread.
 pub(crate) mod switch {
     #[cfg(test)]
     thread_local! {
@@ -302,7 +301,7 @@ pub(crate) mod switch {
         false
     }
 
-    /// Runs `f` with the tables off on this thread.
+    /// Runs `f` with the gate off on this thread.
     #[cfg(test)]
     pub(crate) fn without<R>(f: impl FnOnce() -> R) -> R {
         let was = OFF.with(|off| off.replace(true));

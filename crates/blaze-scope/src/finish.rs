@@ -17,10 +17,10 @@ use crate::facts::{Name, ScopeFacts};
 use crate::read::Read;
 #[cfg(test)]
 use crate::resolver::Plant;
-use crate::resolver::{Cached, CallState, Env, NsRes, Query, Res, Resolver, Scan, Sink, Slot, Source, Visited};
+use crate::resolver::{Cached, CallState, Env, NsRes, Query, Res, Resolver, Scan, Sink, Slot, Source};
 use crate::scope::{
-    Binding, Def, ModuleScope, Namespace, ReadList, Resolved, ScopeEntry, ScopeError, Site,
-    TextualDef, TextualMark, Unresolved, Visibility,
+    AnonImport, Binding, Def, DefKind, ModuleScope, Namespace, ReadList, Resolved, ScopeEntry,
+    ScopeError, Site, TextualDef, TextualMark, Unresolved, Visibility,
 };
 
 /// What a member's final pass came to.
@@ -69,13 +69,16 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         self.finish_frag(0, facts, env, &mut sink, &mut errors)?;
 
         let mut names = Vec::new_in(a.clone());
-        self.glob_names(env, &mut sink, None, &mut names);
+        let mut seen = Vec::new_in(a.clone());
+        self.glob_names(env, &mut sink, &mut seen, &mut names);
         names.sort();
         names.dedup();
-        let q = Query { asker: self.asker(), restricted: false, ignore: None, visited: None };
+        let q = Query { asker: self.asker(), restricted: false, ignore: None };
         let mut bindings = Vec::with_capacity_in(names.len(), a.clone());
-        let mut undetermined = false;
+        // The globs that left a name undetermined, by tree place: one error each.
+        let mut undetermined: Vec<(crate::resolver::At, u32), A> = Vec::new_in(a.clone());
         for &(ns, name) in names.iter() {
+            sink.undet_glob = None;
             match self.lookup_module(ns, name, q, env, &mut sink) {
                 Res::Found(hit) => bindings.push(ScopeEntry {
                     ns,
@@ -89,7 +92,55 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                     },
                 }),
                 Res::None | Res::Wait => {}
-                Res::Undet { .. } => undetermined = true,
+                Res::Undet { .. } => match sink.undet_glob {
+                    // Nothing is pending and every answer is in, so a name stays undecided
+                    // only through a glob whose source answered `Undetermined`: that glob is
+                    // an unresolved import of the scope.
+                    Some((m, at, g)) if m == self.module => undetermined.push((at, g)),
+                    Some(_) | None => {
+                        return Err(ResolveError::NoProgressBound { module: self.module, passes: 0 });
+                    }
+                },
+            }
+        }
+        sink.check(self.module)?;
+        undetermined.sort_by(|x, y| self.tree_cmp(x.0, y.0));
+        undetermined.dedup_by(|x, y| x.1 == y.1);
+        for &(_, g) in undetermined.iter() {
+            let glob = &self.globs[g as usize];
+            errors.list.push(ScopeError::Import {
+                site: glob.site,
+                path: glob.path.copy_in(a.clone()),
+                segment: len32(glob.path.segments.len().saturating_sub(1)),
+                why: Unresolved::Undetermined,
+            });
+        }
+
+        // `pub(in path)` through an alias: resolved as a path now, and written on the binding.
+        for (fi, frag) in self.frags.iter().enumerate() {
+            for (path, ns, name, def) in frag.deferred_vis.iter() {
+                let at = crate::resolver::At { frag: len32(fi), slot: 0 };
+                let n = path.segments.len();
+                let to = match self.resolve_prefix(path, n, crate::lookup::PathUse::Import, at, None, env, &mut sink) {
+                    crate::lookup::Prefix::Found { hit, .. } if self.chain.contains(&hit.def.key) => {
+                        Some(self.restricted(hit.def.key))
+                    }
+                    crate::lookup::Prefix::Found { .. }
+                    | crate::lookup::Prefix::Fail(..)
+                    | crate::lookup::Prefix::Undet
+                    | crate::lookup::Prefix::Wait => None,
+                };
+                match to {
+                    Some(vis) => {
+                        if let Ok(k) = bindings.binary_search_by(|e| (e.ns, e.name).cmp(&(*ns, *name))) {
+                            let b = &mut bindings[k].binding;
+                            if b.def == *def && b.origin == crate::scope::Origin::Declared {
+                                b.vis = vis;
+                            }
+                        }
+                    }
+                    None => errors.list.push(ScopeError::RestrictedNotAncestor { path: path.copy_in(a.clone()) }),
+                }
             }
         }
 
@@ -97,15 +148,12 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         let mut marks = Vec::new_in(a.clone());
         self.flatten(0, &mut textual, Some(&mut marks), env, &mut sink);
         marks.sort_by_key(|m: &TextualMark| m.child);
+        let mut traits = Vec::new_in(a.clone());
+        let mut macro_exports = Vec::new_in(a.clone());
+        self.anon_and_exports(0, &mut traits, &mut macro_exports);
 
         if !sink.need.is_empty() || !sink.waits.is_empty() {
             return Ok(Finish::Need { asks: sink.need, waits: sink.waits });
-        }
-        if undetermined {
-            // Nothing is pending and every answer is in, so only an answer that says
-            // `Undetermined` (which no finished scope holds) leaves a name undecided: the
-            // caller broke the protocol, and the machine stops rather than guess.
-            return Err(ResolveError::NoProgressBound { module: self.module, passes: 0 });
         }
 
         let mut entries = sink.used;
@@ -126,6 +174,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 textual,
                 marks,
                 fellows: others,
+                traits,
+                macro_exports,
             },
             reads: ReadList { entries },
         }))
@@ -139,6 +189,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             | Read::Name { module, .. }
             | Read::Exports { module, .. }
             | Read::TextualOut { module } => Some(module),
+            Read::DeriveHelpers { .. } => None,
         }
     }
 
@@ -188,7 +239,13 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             segment,
             why,
         };
+        // The early resolution, made again against the final state, whatever it came to: a
+        // failed import is determined by its reads as much as a resolved one (a name not found
+        // is a negative read, and the scope changes when that name appears).
+        sink.amb = None;
+        let again = self.resolve_import(i, env, sink);
         if let Some((segment, why)) = imp.failed {
+            sink.amb = None;
             errors.list.push(fail(segment, why));
             return;
         }
@@ -202,12 +259,10 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             }
         }
         if !found {
+            sink.amb = None;
             errors.list.push(fail(last, if private { Unresolved::Private } else { Unresolved::NotFound }));
             return;
         }
-        // The early resolution, made again against the final state.
-        sink.amb = None;
-        let again = self.resolve_import(i, env, sink);
         let leaf = imp.path.segments.last().copied().or(imp.bound);
         if let Some(amb) = sink.amb.take() {
             errors.list.push(ScopeError::Ambiguous {
@@ -278,16 +333,21 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             segment,
             why,
         };
+        // Made again whatever it came to, so a failed glob's reads are kept too.
+        sink.amb = None;
+        let again = self.resolve_glob(g, facts, env, sink)?;
         let early = match &glob.source {
             Source::Failed(segment, why) => {
+                sink.amb = None;
                 errors.list.push(fail(*segment, *why));
                 return Ok(());
             }
-            Source::Itself | Source::Pending => return Ok(()),
+            Source::Itself | Source::Pending => {
+                sink.amb = None;
+                return Ok(());
+            }
             Source::Resolved { def, .. } => *def,
         };
-        sink.amb = None;
-        let again = self.resolve_glob(g, facts, env, sink)?;
         if let Some(amb) = sink.amb.take() {
             errors.list.push(ScopeError::Ambiguous {
                 site: Site::Import(site),
@@ -337,20 +397,26 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             segment,
             why,
         };
+        if call.state == CallState::TooDeep {
+            // Never resolved, so it read nothing.
+            errors.list.push(ScopeError::RecursionLimit { call: call.key });
+            return;
+        }
+        // Made again whatever it came to, so a failed or inert call's reads are kept too.
+        sink.amb = None;
+        let again = self.resolve_call(c, env, sink);
         let early = match call.state {
             CallState::Failed(segment, why) => {
+                sink.amb = None;
                 errors.list.push(fail(segment, why));
                 return;
             }
-            CallState::TooDeep => {
-                errors.list.push(ScopeError::RecursionLimit { call: call.key });
+            CallState::Inert | CallState::Pending | CallState::TooDeep => {
+                sink.amb = None;
                 return;
             }
-            CallState::Inert | CallState::Pending => return,
             CallState::Resolved(def) | CallState::Expanded { def, .. } => def,
         };
-        sink.amb = None;
-        let again = self.resolve_call(c, env, sink);
         if let Some(amb) = sink.amb.take() {
             errors.list.push(ScopeError::Ambiguous {
                 site: Site::Call(call.key),
@@ -392,9 +458,14 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         &self,
         env: Env<'_, N, A>,
         sink: &mut Sink<N, A>,
-        visited: Option<&Visited<'_>>,
+        seen: &mut Vec<ItemKey, A>,
         out: &mut Vec<(Namespace, N), A>,
     ) {
+        // Each member once: the names are a union, so the order of the walk does not matter.
+        if seen.contains(&self.module) {
+            return;
+        }
+        seen.push(self.module);
         out.extend(self.defs.keys().copied());
         for imp in self.imports.iter() {
             let Some(name) = imp.bound else { continue };
@@ -404,19 +475,49 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 }
             }
         }
-        let me = Visited { module: self.module, next: visited };
         for g in self.globs.iter() {
             let Source::Resolved { def, classes, .. } = &g.source else { continue };
             if let Some(f) = env.fellow(def.key) {
-                if def.key != self.module && !visited.is_some_and(|v| v.contains(def.key)) {
-                    f.glob_names(env, sink, Some(&me), out);
-                }
+                f.glob_names(env, sink, seen, out);
                 continue;
             }
             for &class in classes.iter() {
                 if let Some(Cached::Exports { entries, .. }) = self.cached(Read::Exports { module: def.key, class }, sink) {
                     out.extend(entries.iter().map(|e| (e.ns, e.name)));
                 }
+            }
+        }
+    }
+
+    /// From fragment `frag` on, in tree order: the `use .. as _` imports of a trait, and the
+    /// `#[macro_export]` macros an expansion wrote.
+    fn anon_and_exports(
+        &self,
+        frag: u32,
+        traits: &mut Vec<AnonImport, A>,
+        exports: &mut Vec<TextualDef<N>, A>,
+    ) {
+        let f = &self.frags[frag as usize];
+        exports.extend_from_slice(&f.exports);
+        for slot in f.slots.iter() {
+            match *slot {
+                Slot::Use(i) => {
+                    let imp = &self.imports[i as usize];
+                    if imp.bound.is_some() || imp.failed.is_some() {
+                        continue;
+                    }
+                    if let NsRes::Found(hit) = imp.ns[Namespace::Types.index()] {
+                        if hit.def.kind == DefKind::Trait {
+                            traits.push(AnonImport { site: imp.site, def: hit.def, vis: imp.vis });
+                        }
+                    }
+                }
+                Slot::Call(c) => {
+                    if let CallState::Expanded { frag: inner, .. } = self.calls[c as usize].state {
+                        self.anon_and_exports(inner, traits, exports);
+                    }
+                }
+                Slot::Rules { .. } | Slot::Mod { .. } | Slot::Glob(_) => {}
             }
         }
     }
@@ -464,7 +565,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         }
         match self.cached(Read::TextualOut { module: child }, sink) {
             Some(Cached::Textual { defs, .. }) => out.extend_from_slice(defs),
-            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::InProgress) | None => {}
+            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::Helpers { .. } | Cached::InProgress) | None => {}
         }
     }
 }

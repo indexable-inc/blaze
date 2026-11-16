@@ -1,16 +1,18 @@
-//! The ids a body's inference record names, in a form another process makes again.
+//! The ids a record of the item store names, in a form another process makes again
+//! (docs/v2/plan/design/typeck-store.md).
 //!
-//! Inside [`relocating`], every id the inference record and its type tables write goes through
-//! [`id_bits`] as its index in a [`Table`] plus one (0 stays "no id"), and every id they read
-//! through [`id_of`]; outside one, both are what they were: an id's bits. [`write`] then
-//! gives each entry of the table its portable form, its location: a hir-def item as its index in
-//! the crate's portable table (`hir_def::deps::PortableIds`, frontend-deps' frozen encoding), a
-//! hir-ty interned id as what it is interned by, each id that location names an entry of the same
-//! table. [`read`] makes them again in this database.
+//! Inside [`relocating`], every id a record and its type tables write goes through [`id_bits`]
+//! as its index in a [`Table`] plus one (0 stays "no id"), and every id they read through
+//! [`id_of`]; outside one, neither is allowed: no record holds a session's id bits. A table is
+//! one task's: its entries are this process's ids, never written. [`write_with`] then gives each
+//! entry its portable form: a hir-def item as the index the caller's [`ItemSink`] gives it (the
+//! body and goal stores name items by their key), a hir-ty interned id as what it is interned
+//! by, each id that location names an entry of the same table. [`read`] makes them again in
+//! this database.
 
 use std::cell::RefCell;
 
-use base_db::{Crate, Db};
+use base_db::Db;
 use blaze_format::{
     FormatError,
     cursor::{Put, Reader},
@@ -22,7 +24,6 @@ use hir_def::{
     EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, LoweringMode,
     StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
     builtin_derive::BuiltinDeriveImplTrait,
-    deps::PortableIds,
     expr_store::ExpressionStore,
     hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId, Movability},
 };
@@ -253,13 +254,16 @@ pub(crate) fn in_scope() -> bool {
     TABLE.with(|slot| slot.borrow().is_some())
 }
 
-/// The bits written for `id`: its index in the scope's table plus one, or its own bits
-/// outside a scope.
+/// The bits written for `id`: its index in the scope's table plus one. Outside a scope it is a
+/// panic: a record that held this process's id bits would name nothing in another.
 #[inline(never)]
 pub(crate) fn id_bits<T: Relocate>(id: T) -> u64 {
     let id = id.gid();
     TABLE.with(|slot| match slot.borrow_mut().as_mut() {
-        None => gid_bits(id),
+        None => panic!(
+            "a {:?} written outside a relocating scope: every record's ids go through a table",
+            T::KIND
+        ),
         Some(table) => {
             if table.locs && T::KIND.is_late() {
                 table.refused.get_or_insert(
@@ -280,9 +284,8 @@ pub(crate) enum IdRefused {
     PastTable { index: u64, len: u64 },
     /// In a scope, an entry of another kind than the reader's, or one not made yet.
     OtherKind,
-    /// Outside a scope, bits no id of this session has ([`id_at`]: a zero local or an
-    /// all-ones arena half).
-    NoId { bits: u64 },
+    /// Outside a scope, where no record's ids are read.
+    NoScope,
 }
 
 impl IdRefused {
@@ -300,26 +303,23 @@ impl IdRefused {
                 at,
                 what: "an id whose entry in the record's table is of another kind or not made",
             },
-            IdRefused::NoId { .. } => FormatError::Invalid {
+            IdRefused::NoScope => FormatError::Invalid {
                 at,
-                what: "an id's bits that name no id of this session (a zero local or an all-ones arena)",
+                what: "an id read outside a relocating scope, where no record's ids are read",
             },
         }
     }
 }
 
-/// The id `bits` name, as [`id_bits`] wrote them, or why they name none: 0, and in a scope an
-/// index the table has no id of `T`'s kind at. Outside a scope a word is refused when no id
-/// has its bits ([`id_at`]: a damaged word can name none, so this is an error, never a
-/// panic); an id it does name is checked where its fields are read, once
-/// (`blaze_memo::Id::from_gid`).
+/// The id `bits` name, as [`id_bits`] wrote them, or why they name none: 0, an index the
+/// scope's table has no id of `T`'s kind at, or no scope.
 #[inline(never)]
 pub(crate) fn id_of<T: Relocate>(bits: u64) -> Result<T, IdRefused> {
     if bits == 0 {
         return Err(IdRefused::Zero);
     }
     TABLE.with(|slot| match slot.borrow().as_ref() {
-        None => id_at(bits).map(T::from_gid).ok_or(IdRefused::NoId { bits }),
+        None => Err(IdRefused::NoScope),
         Some(table) => {
             let index = bits - 1;
             let len = table.len() as u64;
@@ -333,17 +333,16 @@ pub(crate) fn id_of<T: Relocate>(bits: u64) -> Result<T, IdRefused> {
     })
 }
 
-/// The word an id is in this process, inside a [`Table`] and outside a scope: its arena and
-/// index ([`Gid::session_bits`]) plus one, so that no id is 0, the word of no id. Never written
-/// across processes: [`write`] gives each table entry its portable form (an index in the
-/// crate's [`PortableIds`], or what a hir-ty id is interned by), and [`read`] makes the ids
-/// again; a `Gid` means nothing in another process (spec B, `Revision`).
+/// The word an id is in this process inside a [`Table`], one task's: its arena and index
+/// ([`Gid::session_bits`]) plus one, so that no id is 0. Never written: [`write_with`] gives
+/// each entry its portable form and [`read`] makes the ids again; a `Gid` means nothing in
+/// another process.
 pub(crate) fn gid_bits(id: Gid) -> u64 {
     id.session_bits().checked_add(1).expect("an id's bits under the last word (an arena index of 2^20 - 1 at its last generation)")
 }
 
-/// The word of the id `id`, as [`gid_bits`] gives it.
-pub(crate) fn word_of<T: blaze_memo::Id>(id: T) -> u64 {
+/// The word of the id `id` in a [`Table`], as [`gid_bits`] gives it.
+fn word_of<T: blaze_memo::Id>(id: T) -> u64 {
     gid_bits(id.gid())
 }
 
@@ -357,51 +356,19 @@ fn entry_id(bits: u64) -> Gid {
     id_at(bits).expect("a table entry is an id's bits")
 }
 
-/// The crate's items every body of its part names: frontend-deps' portable table, and the kind
-/// of each of its entries, in the table's order.
-#[derive(Default)]
-pub(crate) struct Items {
-    pub(crate) ids: PortableIds,
-    pub(crate) kinds: Vec<u8>,
-}
+/// The version of what [`write_with`] writes of a record's ids.
+pub(crate) const VERSION: u64 = 2;
 
-/// The version of what [`write`] and [`write_with`] write of a body's ids.
-pub(crate) const VERSION: u64 = 1;
-
-/// Where a body's items go when its ids are written ([`write_with`]): each item is written as
-/// its index there.
+/// Where a record's items go when its ids are written ([`write_with`]): each item is written as
+/// its index there. The stores name each item by its `blaze_id::ItemKey`
+/// (docs/v2/plan/design/typeck-store.md).
 pub(crate) trait ItemSink {
-    /// Whether every item of the body (`items`, as `(kind, bits)`, in the table's order) has a
-    /// form here, asked before any is added: a body refused here adds nothing.
+    /// Whether every item of the record (`items`, as `(kind, bits)`, in the table's order) has
+    /// a form here, asked before any is added: a record refused here adds nothing.
     fn admit(&mut self, db: &Db, items: impl Iterator<Item = (IdKind, u64)>) -> R;
 
     /// The index of the item `bits` of `kind`, added when it is new.
     fn index(&mut self, kind: IdKind, bits: u64) -> R<u32>;
-}
-
-/// A crate's portable table ([`Items`]), as a bodies part writes its bodies' items.
-struct CrateItems<'i> {
-    krate: Crate,
-    items: &'i mut Items,
-}
-
-impl ItemSink for CrateItems<'_> {
-    fn admit(&mut self, db: &Db, items: impl Iterator<Item = (IdKind, u64)>) -> R {
-        // alloc: per body written, at store time
-        let mut own = PortableIds::new();
-        for (kind, bits) in items {
-            index_item(&mut own, kind, bits)?;
-        }
-        own.encode(db, self.krate).map(drop)
-    }
-
-    fn index(&mut self, kind: IdKind, bits: u64) -> R<u32> {
-        let index = index_item(&mut self.items.ids, kind, bits)?;
-        if index as usize == self.items.kinds.len() {
-            self.items.kinds.push(kind as u8);
-        }
-        Ok(index)
-    }
 }
 
 /// What an entry is in another process: where its id comes from. Entries name others by index.
@@ -435,19 +402,8 @@ enum Loc {
 
 /// The words of `table` in portable form, after the record was written into it: the locations
 /// of its hir-ty ids (whose own ids are added to it), the types of its anonymous constants into
-/// `locs`, and its items into `items`, the crate's portable table. A body whose ids have no
-/// portable form is refused with why; nothing of it is added to `items` then.
-pub(crate) fn write<'db>(
-    db: &'db Db,
-    krate: Crate,
-    table: &mut Table,
-    locs: &mut TyTableWriter<'db>,
-    items: &mut Items,
-) -> R<Vec<u8>> {
-    write_with(db, table, locs, &mut CrateItems { krate, items })
-}
-
-/// [`write`], each item of the body written as its index in `items`.
+/// `locs`, and each item as its index in `items`. A record whose ids have no portable form is
+/// refused with why; nothing of it is added to `items` then.
 pub(crate) fn write_with<'db>(
     db: &'db Db,
     table: &mut Table,
@@ -576,46 +532,7 @@ pub(crate) fn write_with<'db>(
     Ok(out)
 }
 
-/// The index of the item `bits` of `kind` in `items`, added when it is new.
-fn index_item(items: &mut PortableIds, kind: IdKind, bits: u64) -> R<u32> {
-    let id = entry_id(bits);
-    Ok(match kind {
-        IdKind::Function => items.index(FunctionId::from_gid(id)),
-        IdKind::Struct => items.index(StructId::from_gid(id)),
-        IdKind::Union => items.index(UnionId::from_gid(id)),
-        IdKind::Enum => items.index(EnumId::from_gid(id)),
-        IdKind::Const => items.index(ConstId::from_gid(id)),
-        IdKind::Static => items.index(StaticId::from_gid(id)),
-        IdKind::Trait => items.index(TraitId::from_gid(id)),
-        IdKind::TypeAlias => items.index(TypeAliasId::from_gid(id)),
-        IdKind::Impl => items.index(ImplId::from_gid(id)),
-        IdKind::EnumVariant => items.index(EnumVariantId::from_gid(id)),
-        // alloc: the error that leaves the body out
-        _ => return Err(format!("a {kind:?} is no item of a portable table")),
-    })
-}
-
-/// The bits of the item `index` names in `items` as a `kind`, `None` when it names another.
-pub(crate) fn item_bits(items: &PortableIds, kind: IdKind, index: u32) -> Option<u64> {
-    fn bits(id: impl blaze_memo::Id) -> u64 {
-        word_of(id)
-    }
-    match kind {
-        IdKind::Function => items.get::<FunctionId>(index).map(bits),
-        IdKind::Struct => items.get::<StructId>(index).map(bits),
-        IdKind::Union => items.get::<UnionId>(index).map(bits),
-        IdKind::Enum => items.get::<EnumId>(index).map(bits),
-        IdKind::Const => items.get::<ConstId>(index).map(bits),
-        IdKind::Static => items.get::<StaticId>(index).map(bits),
-        IdKind::Trait => items.get::<TraitId>(index).map(bits),
-        IdKind::TypeAlias => items.get::<TypeAliasId>(index).map(bits),
-        IdKind::Impl => items.get::<ImplId>(index).map(bits),
-        IdKind::EnumVariant => items.get::<EnumVariantId>(index).map(bits),
-        _ => None,
-    }
-}
-
-/// The kind byte of the crate table's entries, for [`super::part`]'s `kinds` column.
+/// The kind of an item by its byte, as a store writes its items' kinds.
 pub(crate) fn item_kind_of(byte: u8) -> Option<IdKind> {
     IdKind::of(byte).filter(|it| it.is_item())
 }

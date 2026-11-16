@@ -177,7 +177,7 @@ impl<'db, O: Out> Sink<'db> for Stable<'_, 'db, O> {
 
     /// Never reached: `persist` writes ids only through a definition ([`Self::def`]), which a
     /// stable form names by its item key. An id's bits mean nothing past its snapshot.
-    fn id<T: crate::check_cache::Relocate>(&mut self, _: T) {
+    fn id<T: crate::next_solver::persist::ids::Relocate>(&mut self, _: T) {
         panic!("a stable goal form names an id outside a definition, which it has no key for")
     }
 
@@ -186,7 +186,7 @@ impl<'db, O: Out> Sink<'db> for Stable<'_, 'db, O> {
         if self.len > MAX_WORDS {
             return;
         }
-        let key = self.facts.def_key(self.db, def);
+        let blaze_id::ItemKey(key) = self.facts.def_key(self.db, def);
         for word in key.0.chunks_exact(4) {
             self.word(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
         }

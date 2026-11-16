@@ -1250,13 +1250,12 @@ fn invalid_byte_literal(lit: &tt::Literal, value: &Lit<'_>, is_nested: bool) -> 
 }
 
 /// The file `include!` at `call_id` (its argument `tt`) parses, `path_str` at `err_span`: a
-/// file of the VFS, or else one outside it read from disk (rustc's `resolve_path` from the file
-/// of the call, [`Db::included_source`]). When that can't be read, or is not UTF-8, rustc's
-/// error at the call.
+/// file of the task's include table (rustc's `resolve_path` from the file of the call,
+/// [`Db::resolve_path`]). A path the table lacks is rustc's error at the call.
 fn relative_file(
     db: &Db,
     call_id: MacroCallId,
-    tt: &tt::TopSubtree,
+    _tt: &tt::TopSubtree,
     path_str: &str,
     allow_recursion: bool,
     err_span: Span,
@@ -1264,9 +1263,9 @@ fn relative_file(
     let lookup = call_id.loc(db);
     let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor: call_site, path: path_str };
-    let res: FileId = match db.resolve_path(path) {
-        Some(file) => file,
-        None => included_source(db, call_id, tt, path, err_span)?,
+    let Some(res) = db.resolve_path(path) else {
+        // alloc: an error's message, on the error path
+        return Err(ExpandError::other(err_span, format!("failed to load file `{path_str}`")));
     };
     // Prevent include itself
     if res == call_site && !allow_recursion {
@@ -1275,48 +1274,6 @@ fn relative_file(
         let (edition, extensions) = (lookup.krate.data(db).edition, lookup.krate.extensions(db));
         Ok(EditionedFileId::new_with_extensions(db, res, edition, extensions))
     }
-}
-
-/// The file `include!` parses for `path`, which names no file of the VFS: the file outside it
-/// that `path` names, read from disk ([`Db::included_source`]).
-fn included_source(
-    db: &Db,
-    call_id: MacroCallId,
-    tt: &tt::TopSubtree,
-    path: AnchoredPath<'_>,
-    path_span: Span,
-) -> Result<FileId, ExpandError> {
-    let unloaded = || {
-        // alloc: an error's message, on the error path
-        ExpandError::other(path_span, format!("failed to load file `{}`", path.path))
-    };
-    // An anchor with no path on disk (a crate attribute's file) has no directory to read from.
-    let (file, source) = db.included_source(call_id.loc(db).krate, path).ok_or_else(unloaded)?;
-    let unreadable = match file.read(db) {
-        Ok(bytes) if std::str::from_utf8(bytes).is_ok() => None,
-        // The `io::Error` `read_to_string` gives rustc's file loader for bytes that are not UTF-8.
-        Ok(_) => Some("stream did not contain valid UTF-8".to_owned()), // alloc: an error's message, on the error path
-        Err(error) => Some(error.to_string()),                          // alloc: as above
-    };
-    let shown = || db.included_path(path).ok_or_else(unloaded);
-    if let Some(error) = unreadable {
-        let shown = shown()?;
-        let call = call_span(db, call_id, tt.top_subtree().delimiter.open);
-        // alloc: an error's message, on the error path
-        return Err(ExpandError::other(call, format!("couldn't read `{shown}`: {error}")));
-    }
-    source.map_err(|id| match shown() {
-        Ok(shown) => ExpandError::other(
-            path_span,
-            // alloc: an error's message, on the error path
-            format!(
-                "`include!` of `{shown}`: file ID {} is taken by a file of the view, so this \
-                 file outside the VFS has none",
-                id.index()
-            ),
-        ),
-        Err(error) => error,
-    })
 }
 
 /// The path `include!`, `include_str!` or `include_bytes!` (`name`) is given and its span, as
@@ -1445,29 +1402,11 @@ fn included_bytes<'db>(
         // alloc: an error's message, on the error path
         ExpandError::other(path_span, format!("failed to load file `{}`", path.path))
     };
-    // A file of the VFS is read as the view loader gave it: its text, or the bytes of one that
-    // is not UTF-8. Only a file outside the VFS is read from disk.
-    if let Some(file) = db.resolve_path(path) {
-        if db.has_file_text(file) {
-            return Ok(db.file_text(file).text(db).as_bytes());
-        }
-        return match db.raw_file(file).map(|it| it.read(db)) {
-            Some(Ok(bytes)) => Ok(&bytes[..]),
-            // The loader sets bytes it read; a file of the VFS with neither text nor bytes (an
-            // alias) is not read from anywhere else.
-            Some(Err(_)) | None => Err(unloaded()),
-        };
-    }
-    let file = db.included_file(call_id.loc(db).krate, path).ok_or_else(unloaded)?;
-    match file.read(db) {
-        Ok(bytes) => Ok(&bytes[..]),
-        Err(error) => {
-            let shown = db.included_path(path).ok_or_else(unloaded)?;
-            let call = call_span(db, call_id, tt.top_subtree().delimiter.open);
-            // alloc: an error's message, on the error path
-            Err(ExpandError::other(call, format!("couldn't read `{shown}`: {error}")))
-        }
-    }
+    // A file of the task's include table is read as the driver gave it ([`Db::included_bytes`]):
+    // nothing here reads a disk.
+    let _ = tt;
+    let file = db.resolve_path(path).ok_or_else(unloaded)?;
+    db.included_bytes(file).ok_or_else(unloaded)
 }
 
 fn include_str_expand<'f>(
@@ -1502,9 +1441,9 @@ fn include_str_expand<'f>(
 }
 
 fn get_env_inner(db: &Db, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
+    // The read is of the crate's `env` input, which the memo records as the task's read.
     let krate = arg_id.loc(db).krate;
-    db.env_is_read(krate, key.as_str());
-    base_db::env_var(db, krate, key.as_str())
+    base_db::env_var(db, krate, key.as_str()).map(str::to_owned)
 }
 
 fn env_expand<'f>(
@@ -1540,7 +1479,6 @@ fn env_expand<'f>(
 
     let mut err = None;
     let s = get_env_inner(db, arg_id, &key).unwrap_or_else(|| {
-        db.env_is_unset(arg_id.loc(db).krate, key.as_str());
         let lit = var.literal().expect("`args::string` took a literal");
         err = Some(env_not_defined(key.as_str(), &lit, message).at(call));
 

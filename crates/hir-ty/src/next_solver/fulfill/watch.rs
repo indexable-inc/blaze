@@ -23,7 +23,8 @@ use rustc_type_ir::{
 
 use super::{FulfillmentCtxt, NextSolverError, Pending};
 use crate::next_solver::{
-    DbInterner, SolverContext, global_goals,
+    DbInterner, SolverContext,
+    goal_store::gate,
     infer::{
         InferCtxt, InferCtxtInner,
         touched::{TouchedAt, VarTable},
@@ -413,7 +414,7 @@ impl<'db> FulfillmentCtxt<'db> {
                 let mut obligation = pending.obligation(at);
                 let goal = obligation.as_goal();
                 let span = obligation.cause.span();
-                let result = global_goals::evaluate_root_goal(
+                let result = gate::evaluate_root_goal(
                     delegate,
                     goal,
                     span,

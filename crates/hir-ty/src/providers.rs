@@ -235,13 +235,8 @@ fn compute<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Built<'db
     match stage {
         MirStage::Built => crate::body_store::built_mir(db, owner, || (mir.build)(db, owner)),
         MirStage::Runtime => {
-            // A crate given its runtime MIR value answers an owner the value holds from its
-            // entry: no built body, no inference and no lowered body are made for it.
-            if let Some(served) = crate::check_cache::runtime::served(db, owner) {
-                return Ok(served);
-            }
             let built = mir_at(db, owner, MirStage::Built).map_err(Clone::clone)?;
-            crate::check_cache::runtime::built(db, owner, (mir.run_passes)(db, built))
+            (mir.run_passes)(db, built)
         }
         MirStage::Optimized(options) => {
             let runtime = mir_at(db, owner, MirStage::Runtime).map_err(Clone::clone)?;

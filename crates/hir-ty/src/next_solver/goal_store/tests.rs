@@ -43,7 +43,7 @@ use crate::{
     next_solver::{
         AdtDef, Binder, ClauseKind, Clauses, DbInterner, ParamEnv, Pattern, PatternKind, Predicate,
         PredicateKind, SolverDefId, Ty, TyKind, TypingMode,
-        global_goals::GoalKey,
+        goal_store::gate::GoalKey,
         interner::{Reads, recorded, replay},
         persist::{self, Code, Node, Sink, Source},
     },
@@ -272,7 +272,7 @@ impl TestFacts {
 }
 
 impl GoalFacts for TestFacts {
-    fn def_key<'db>(&self, _: &'db Db, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, _: &'db Db, def: SolverDefId<'db>) -> blaze_id::ItemKey {
         let mut words = RawWords::default();
         persist::put_def(&mut words, def);
         // The key names the ids by their parts, in this process alone: a test's keys are
@@ -284,7 +284,7 @@ impl GoalFacts for TestFacts {
             words.words.iter().copied().chain(id_words).flat_map(u32::to_le_bytes).collect();
         let key = ContentId::of("blaze v2 goal test def", &bytes);
         self.defs.lock().insert(key, (words.words, words.ids));
-        key
+        blaze_id::ItemKey(key)
     }
 
     fn crate_key(&self, _: &Db, _: Option<Crate>) -> ContentId {
@@ -325,7 +325,7 @@ impl<'db> Sink<'db> for RawWords {
         self.words.push(word);
     }
 
-    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+    fn id<T: crate::next_solver::persist::ids::Relocate>(&mut self, id: T) {
         self.words.push(u32::try_from(self.ids.len()).expect("a definition names few ids"));
         self.ids.push(id.gid());
     }
@@ -353,7 +353,7 @@ impl<'db> Source<'db> for RawSource<'_> {
         Ok(word)
     }
 
-    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, &'static str> {
+    fn id<T: crate::next_solver::persist::ids::Relocate>(&mut self) -> Result<T, &'static str> {
         let at = self.word()? as usize;
         self.ids.get(at).map(|&gid| T::from_gid(gid)).ok_or("an id past the definition's ids")
     }
@@ -399,7 +399,7 @@ impl<'db> Source<'db> for Back<'_, 'db> {
         N::get_node(self)
     }
 
-    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, &'static str> {
+    fn id<T: crate::next_solver::persist::ids::Relocate>(&mut self) -> Result<T, &'static str> {
         Err("an id in a stable form, which names definitions by their keys")
     }
 

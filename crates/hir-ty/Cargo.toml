@@ -51,6 +51,8 @@ blaze-front-items.workspace = true
 blaze-kernel.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
+# `ItemKey`: how the body and goal stores name an item (docs/v2/plan/design/typeck-store.md).
+blaze-id = { path = "../blaze-id" }
 blaze-phf.workspace = true
 # The memo every query, input and interned id of hir-ty runs on.
 blaze-memo.workspace = true

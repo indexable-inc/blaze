@@ -3,18 +3,17 @@
 //! generator's describe of a function names instances of many crates, each a body with its
 //! arguments.
 //!
-//! The same codec as a bodies part's ([`super::ids`], `next_solver::persist`), one home for it:
-//! inside a [`super::ids::relocating`] scope every id is its index in a table, and the table's
-//! entries are written by where their ids come from. What differs is how a hir-def item is
-//! named. A bodies part names it by its index in its crate's portable table, which only that
-//! crate's image reads; here the caller names each item by 32 bytes of its own (the code
-//! generator gives `blaze_items::item_key`, which is of the item's crate and path and never of
-//! an id) and finds it again from them, so one buffer names items of any crate.
+//! The same codec as the body store's ([`super::ids`], `next_solver::persist`), one home for
+//! it: inside a [`super::ids::relocating`] scope every id is its index in a table, and the
+//! table's entries are written by where their ids come from. The caller names each item by 32
+//! bytes of its own (the code generator gives `blaze_items::item_key`, which is of the item's
+//! crate and path and never of an id) and finds it again from them, so one buffer names items
+//! of any crate.
 //!
 //! Nothing of the writing database is in the bytes: no id, no row of an interner. Two databases
 //! of the same sources that write the same values in the same order give the same bytes, but
 //! for one case: a `dyn` type's projections and auto traits are written in the order the writing
-//! database holds them, which is by its ids ([`super::in_scope`] sorts them again when read).
+//! database holds them, which is by its ids ([`super::ids::in_scope`] sorts them again when read).
 //! A reader of such a type gets the right type; a key made of the bytes may differ between two
 //! databases that numbered those traits in another order, which is a miss, never another value.
 

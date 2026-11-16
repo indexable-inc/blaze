@@ -18,7 +18,7 @@
 //! | [`VecDeque`] | a ring buffer |
 //! | [`SortedMap`], [`SortedSet`] | ordered by key, a sorted vector searched by halving |
 //! | [`Cow`] | borrowed or owned, copied into the allocator the caller names when it must own |
-//! | [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation |
+//! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
 //!
 //! Text (`String<A>`, `format_in!`, `format_into!`) is `blaze_mem::text`'s; it moves here
 //! onto this crate's [`Vec`] when blaze-mem moves onto this crate, so text keeps one home.
@@ -51,7 +51,7 @@
 //!
 //! Every `unsafe` block states the invariant it relies on in a `// SAFETY:` comment. Buffers
 //! are allocated, grown and freed only in [`RawBuf`] and in the struct-of-arrays core
-//! ([`soa::RawSoa`]); [`Box`], [`Arc`] and [`Rc`] allocate their one block each in their own
+//! ([`Soa`], whose [`soa!`] wrappers are safe code); [`Box`], [`Arc`] and [`Rc`] allocate their one block each in their own
 //! module. Panic-safety guards are `core::mem::DropGuard`s; a hand-written guard says why.
 //!
 //! # Send and Sync
@@ -104,6 +104,7 @@ pub use deque::VecDeque;
 pub use error::AllocFailure;
 pub use raw::RawBuf;
 pub use rc::Rc;
+pub use soa::Soa;
 pub use sorted::{SortedMap, SortedSet};
 pub use vec::{CollectIn, Refused, Vec};
 

@@ -536,6 +536,7 @@ dependencies = [
 name = "blaze-expand"
 version = "0.0.0"
 dependencies = [
+ "blaze-format",
  "blaze-id",
  "blaze-ids",
  "blaze-mem",

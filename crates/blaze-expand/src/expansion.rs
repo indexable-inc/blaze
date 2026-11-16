@@ -282,8 +282,20 @@ impl<A: Allocator, B: Allocator> PartialEq<Reads<B>> for Reads<A> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IncludeFailure {
     Missing,
-    /// `include_str!` of a file that is not UTF-8.
+    /// `include_str!` or `include!` of a file that is not UTF-8.
     NotUtf8,
+    /// `include!` of a file that does not lex.
+    DoesNotLex,
+}
+
+impl IncludeFailure {
+    fn byte(self) -> u8 {
+        match self {
+            IncludeFailure::Missing => 0,
+            IncludeFailure::NotUtf8 => 1,
+            IncludeFailure::DoesNotLex => 2,
+        }
+    }
 }
 
 /// A macro call's own error, a value of its expansion: the record keeps it, and a reader
@@ -476,7 +488,7 @@ impl<A: Allocator> Expansion<A> {
                 }
             }
             Diagnostic::Include { path, why } => {
-                out.put(&[8, u8::from(why == IncludeFailure::NotUtf8)]);
+                out.put(&[8, why.byte()]);
                 text(out, path);
             }
             Diagnostic::Derive { message } => {

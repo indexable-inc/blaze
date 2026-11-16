@@ -7,6 +7,7 @@ mod parent;
 mod registry;
 mod slots;
 mod suite;
+mod toggle;
 
 use std::fmt::Display;
 

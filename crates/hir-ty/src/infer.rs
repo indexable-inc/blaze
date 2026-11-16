@@ -2136,9 +2136,6 @@ impl PartialOrd for UpvarCapture {
 /// The inference of a body.
 #[blaze_memo::tracked(returns(ref), cycle_result = infer_cycle_result, owns, mem_tag = Infer)]
 pub fn infer_body_query<'db>(db: &'db Db, def: DefWithBodyId) -> InferenceResult<'db> {
-    if let Some(served) = crate::check_cache::served_inference(db, def) {
-        return served;
-    }
     crate::body_store::inference(db, def, || infer_query(db, def))
 }
 

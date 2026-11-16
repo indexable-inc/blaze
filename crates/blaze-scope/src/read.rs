@@ -17,16 +17,20 @@ pub enum Read<N> {
     TextualEntry { module: ItemKey },
     /// What a `#[macro_use]` on `module`'s `mod` line carries out: its own textual sequence.
     TextualOut { module: ItemKey },
+    /// The helper attributes a derive macro declares (`#[proc_macro_derive(D, attributes(h))]`),
+    /// read from the record of the macro's definition.
+    DeriveHelpers { derive: ItemKey },
 }
 
 impl<N> Read<N> {
-    /// The module the read is of.
+    /// The module the read is of, or for `DeriveHelpers` the derive macro.
     pub fn module(&self) -> ItemKey {
         match *self {
             Read::Name { module, .. }
             | Read::Exports { module, .. }
             | Read::TextualEntry { module }
             | Read::TextualOut { module } => module,
+            Read::DeriveHelpers { derive } => derive,
         }
     }
 }
@@ -47,6 +51,8 @@ pub enum Answer<'a, N> {
     Exports { entries: &'a [ExportEntry<N>], digest: ContentId },
     /// The textual list in order, and its digest.
     Textual { defs: &'a [TextualDef<N>], digest: ContentId },
+    /// A derive's helper attribute names (any order), and their digest.
+    Helpers { names: &'a [N], digest: ContentId },
     /// The module is being computed and is waiting, directly or not, on the asker: a cycle.
     /// The asker joins the module in a [`crate::Group`].
     InProgress,

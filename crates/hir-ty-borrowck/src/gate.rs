@@ -110,14 +110,8 @@ pub(crate) fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(
 /// The build path: `def`'s borrow check, which must pass before any of its code is compiled
 /// for a build or taken from the store into one. A verdict the item store keeps is the
 /// [`borrowck`] query's own answer, so the query is the one place that looks at it.
-///
-/// The old cache's verdict (`check_cache::served_passed`) is never read under an item store in
-/// `Mode::Trace`: its one door, `check_cache::served_body`, gives nothing there, so the verdict
-/// is the [`borrowck`] query's run, which traces it whatever it is.
 pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
-    if !hir_ty::check_cache::served_passed(db, def) {
-        verdict(def, borrowck(db, def))?;
-    }
+    verdict(def, borrowck(db, def))?;
     Ok(Checked { owner: def, _revision: PhantomData })
 }
 

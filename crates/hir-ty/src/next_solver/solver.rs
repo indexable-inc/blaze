@@ -45,7 +45,6 @@ use crate::{
 
 use super::{
     Const, DbInterner, GenericArg, Region,
-    global_goals::shape,
     infer::{DbInternerInferExt, InferCtxt, canonical::instantiate::CanonicalExt},
     inspect::{InspectConfig, InspectGoal},
 };
@@ -332,15 +331,9 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             return Outcome::NoFastPath;
         }
         if depth.depth_free() {
-            match self.depth_free_fast_path(goal, span) {
-                Outcome::NoFastPath => {}
-                outcome => return outcome,
-            }
+            return self.depth_free_fast_path(goal, span);
         }
-        match depth.available().and_then(|available| shape::holds_within(self, goal, available)) {
-            Some(required_depth) => Outcome::HoldsWithin { required_depth },
-            None => Outcome::NoFastPath,
-        }
+        Outcome::NoFastPath
     }
 
     fn fresh_var_for_kind(

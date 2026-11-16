@@ -4,6 +4,7 @@
 //! cannot name `blaze_items`.
 
 use base_db::Db;
+use blaze_id::ItemKey;
 use blaze_ids::ContentId;
 use hir_def::DefWithBodyId;
 
@@ -110,9 +111,11 @@ pub trait BodyFacts: Send + Sync + 'static {
 
     /// The key of a definition `body`'s record names: `body` itself and what it owns (closures
     /// with their kind, coroutines, opaque types) as "self", relative to `body`; anything else,
-    /// an item one of its paths names among them, by its plain item key, the same in every
-    /// database. Reading a key back ([`BodyFacts::def_of`]) lowers no body.
-    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId;
+    /// an item one of its paths names among them, by its plain item key (`blaze_id::key_of`),
+    /// the same in every database. Reading a key back ([`BodyFacts::def_of`], through
+    /// `blaze_id::resolve` for a plain key) lowers no body. Never a `Gid`'s bits, an index of a
+    /// crate's table or a def-map position (docs/v2/plan/design/typeck-store.md).
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ItemKey;
 
     /// The definition [`BodyFacts::def_key`] gave `key` for `body` in `db`; `None` when there is
     /// none: the record names an item this database does not have, which for a record found
@@ -121,6 +124,6 @@ pub trait BodyFacts: Send + Sync + 'static {
         &self,
         db: &'db Db,
         body: DefWithBodyId,
-        key: ContentId,
+        key: ItemKey,
     ) -> Option<SolverDefId<'db>>;
 }

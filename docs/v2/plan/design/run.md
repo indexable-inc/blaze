@@ -52,13 +52,29 @@ the last free worker (workers >= 2), so a thread waits only on its own function.
 compile answers every caller `Failed(CompileError)`: in the program, the call panics on that
 thread with that error (rule 20) and every other function goes on. A compile has a deadline on
 the driver's clock; past it the askers fail with `Why::Overran`, and a late success still
-serves later callers. The `Compiler` trait: instance key -> `FastRecord { code, callees, reads }`
-or `Why`; its task writes the record before it answers.
+serves later callers. The `Compiler` trait: `VersionKey` -> `Made::Done(FastRecord { code,
+callees, reads })`, `Made::Need(keys)` or `Why`; its task writes the record before it answers.
+No compile waits on another (bottom.md, "How a task waits"): on `Need` the version is
+`Blocked{left}` and holds no worker, each lacking record is made once however many compiles
+lack it (`Make`, `made`), and the compile is entered again from the top when it lacks nothing;
+one deadline covers all its entries. The `Optimizer` returns the same shape and `Tier` blocks
+and re-enters its jobs the same way.
+
+**Versions and toggles** (bottom.md, "Decide at run time"). The unit of the parent's work is a
+`Version { slot, hooks }`; a code record's key is `VersionKey { function, tier, hooks }`, so a
+version with hooks (trace, effect log, exact counts, breakpoint, coverage, extra checks) is made
+once and shared by every run. `toggle(slots, hooks, on)` from the viewer sets each slot's
+wanted hooks; the slot keeps running what it shows while the new version is looked up or
+compiled at `Priority::Toggled`, then `Publish{slot, tier, hooks, code}` swaps it in (Slots
+takes any version over any other and refuses only the code it already runs). With every hook
+off the slot returns to its plain version at the best tier made (`tiered` keeps it current
+while a slot runs hooked). A hooked version that does not compile refuses the toggle
+(`Untoggled`); nothing fails. Hooked versions are fast tier; the plain one tests no flag.
 
 **Slots** (`slots::Slots`, in the program's control thread). A word is one `u64`: 0 the stub,
-else body + 1 with a tier bit (in the real table an address; the tier is the body's). States
-Stub -> Fast -> Optimized, or Stub -> Optimized when a valid optimized record exists; nothing
-else (`FastTwice`, `AlreadyOptimized`). `publish` writes `Place`, then `Store` (one aligned
+else body + 1 with a tier bit (in the real table an address; the tier and hooks are the
+body's). Any version replaces any other (a first call, a promotion, a toggle); publishing the
+code the word already names is refused (`Same`). `publish` writes `Place`, then `Store` (one aligned
 atomic store, release), then, if a body was replaced, `Epoch`. Retirement is blaze-launch's
 protocol with one body per batch (a first call and a promotion mean what they replace, so no
 gate): a thread reports the epoch it loaded before walking its stack; it clears each retired
@@ -109,7 +125,7 @@ one Mach-O or ELF whole. It keeps nothing between runs.
 
 | Record | Key | Read list / validity |
 |---|---|---|
-| Fast code (`CodeRecord`, blaze-keyed tag 27) | the instance's template identity at the fast tier | none beyond the key: a callee's edit moves no caller's fast code (calls are through slots) |
+| Fast code (`CodeRecord`, blaze-keyed tag 27), plain or hooked | `VersionKey`: the instance's template identity, the fast tier, the hooks | none beyond the key: a callee's edit moves no caller's fast code (calls are through slots) |
 | Optimized code | the instance at the optimized tier | read-addressed: its shape is the inlined list, each fact a callee's code identity; a changed callee is a new address, so the stale record is never found and costs nothing |
 | Program manifest | the checkout's certificate and the entry | slot -> (instance, code identity, fast record key); what the run reached last (`history`) |
 | Test result (`TestRun`, tag 8) | the test's base key | its asks: the code identities it entered, and its outside reads |
@@ -131,7 +147,8 @@ blaze-inproc's shared-memory asks to the daemon) is the daemon's and goes.
 The control thread places a known record without the parent: `Welcome` carries, for each slot
 whose fast record the manifest names and the store has, its key. Only a slot with no record
 crosses the socket. New messages on the wire: `Hot{slot}`, `TestEnded{test, verdict, entered}`,
-`Publish{slot, tier, record}`, `Failed{slot, error}`.
+`Publish{slot, tier, hooks, record}`, `Failed{slot, error}`; from the viewer to the parent,
+`Toggle{slots, hooks, on}` (over the parent's own socket, beside the registry entry).
 
 ## Floors (rule 67), with everything a record
 

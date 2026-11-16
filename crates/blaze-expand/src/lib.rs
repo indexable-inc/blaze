@@ -17,6 +17,8 @@
 //!   an eager macro needs expanded first ([`Expanded::NeedsExpanded`]).
 //! - [`call_key`] and [`expansion_key`]: a call's key before the work, and the record's key
 //!   with the reads it made, so that equal calls share one record.
+//! - [`Expansion::write_record`] and [`Expansion::read_record`]: the record itself, one
+//!   blaze-format buffer of columns ([`RecordColumn`]), and its value read back, checked once.
 //!
 //! # Positions (rule 71)
 //!
@@ -64,6 +66,7 @@ mod key;
 mod limit;
 mod literal;
 mod nested;
+mod record;
 mod tokens;
 
 pub use crate::{
@@ -85,6 +88,7 @@ pub use crate::{
     key::{CallKey, ExpansionKey, call_key, expansion_key},
     limit::{Depth, LimitReached, RecursionLimit},
     nested::find_calls,
+    record::{EXPANSION_SCHEMA, RecordColumn, RecordError},
     tokens::{
         Ctx, CtxNode, DefSite, Delim, Edition, LitKind, Mark, MarkOf, Raw, Sink, Spacing, Text,
         Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex,

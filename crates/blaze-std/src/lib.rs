@@ -67,8 +67,8 @@
 //! only. Nothing is copied, merged or moved; where two crates offer one concept, the module
 //! says which one it took. Left out on purpose: what reaches state through the thread or the
 //! process (blaze-mem's `frame::current`, blaze-radix's `set_ambient` and its ambient sorts,
-//! blaze-http's `roots` and `proxy_env`, which read the machine), and `chan` (the crossbeam
-//! queue and channel are not yet dependencies of this crate).
+//! blaze-http's `roots` and `proxy_env`, which read the machine). The channel is bstd's own,
+//! bounded only ([`sync::Chan`]), not a re-export.
 //!
 //! | module | what | from |
 //! |---|---|---|
@@ -76,7 +76,8 @@
 //! | [`bytes`], [`text`] | held bytes and UTF-8 text, lent and never copied | blaze-bytes |
 //! | [`map`], [`set`], [`hash`] | one map and set per need (hashed, by hash, by content, insertion-ordered, sorted, keyed, shared), and their hashers | blaze-hash, blaze-hashcons, `alloc` |
 //! | [`id`] | content ids, dense indices, the interner | blaze-ids |
-//! | [`sync`], [`cell`] | `Shared`, named locks, `Atomic`, token cells, the spin, reclamation | std, blaze-core, blaze-spin, blaze-reclaim |
+//! | [`sync`], [`cell`] | `Shared`, named and ranked locks, `Swap`, `Frozen`, `Flight`, the bounded `Chan`, named atomics, one-thread cells, token cells, the spin, reclamation | blaze-core, blaze-own, blaze-spin, blaze-reclaim, new |
+//! | [`par`] | `for_each`, `map_into`, `reduce` over disjoint chunks, deterministic in any schedule | new, over [`task::Scope`] |
 //! | [`own`] | ownership properties derived by reflection (`Acyclic`), `Shared` and `Shares` | new |
 //! | [`sort`], [`phf`] | the radix sort; perfect hashes of fixed name sets | blaze-radix, blaze-phf |
 //! | [`digest`] | BLAKE3 and SHA-256 | blaze-ids' `b3`, blaze-sha256 |
@@ -115,6 +116,7 @@
     contracts,
     core_intrinsics,
     custom_inner_attributes,
+    freeze,
     generic_atomic,
     macro_attr,
     marker_trait_attr,
@@ -199,6 +201,8 @@ pub mod net;
 /// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
 pub mod opener;
 pub mod out;
+/// Data parallelism over disjoint chunks: `for_each`, `map_into`, `reduce`.
+pub mod par;
 /// Ownership properties derived by reflection (`Acyclic`, `NoCapability`), the walk they are
 /// instances of, and the handles built on them: `Shared`, `LocalShared`, `Shares`.
 #[expect(
@@ -548,4 +552,21 @@ pub(crate) enum Plant {
     FlushedBeforeFlush,
     /// `Flushed::clone_to` does not look at whether its file was changed behind it.
     StaleFlushedCloned,
+    /// `par::reduce` and `par::map_into` join their chunks in the order they ran, not by
+    /// position.
+    ParJoinsInRunOrder,
+    /// `Building::freeze` keeps one count of its own: the value is never dropped.
+    FreezeLeaks,
+    /// `Swap::publish` drops the value it replaced at once, not after its grace.
+    SwapFreesAtOnce,
+    /// A `Flight` asked for a key already being computed starts a second computation.
+    FlightComputesTwice,
+    /// A full `Chan` takes one more value.
+    ChanPassesCapacity,
+    /// A second `PublishOnce::set` replaces the value readers saw.
+    PublishOnceOverwrites,
+    /// `Cx::lock_order` hands out a second token while the first is alive.
+    OrderTokenTwice,
+    /// A task resumed from a wait is put on another worker than the one it started on.
+    TaskMigrates,
 }

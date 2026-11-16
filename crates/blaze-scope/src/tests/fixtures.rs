@@ -312,6 +312,28 @@ pub(crate) fn negative() -> (World, Negative) {
     (w, Negative { root, dep_root, prelude })
 }
 
+pub(crate) struct FailedImport {
+    pub(crate) a: ItemKey,
+    pub(crate) a_child: ItemKey,
+}
+
+/// The edit property's least failing case (tape `1`):
+/// `mod a { pub fn x; mod a_child { use super::fresh as got; } }`, and with `fresh`, a private
+/// `fn fresh` in `a`. Before it, the import fails; its negative reads of `a` are what tell
+/// `a_child` that the edit concerns it.
+pub(crate) fn failed_import(fresh: bool) -> (World, FailedImport) {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let a = w.module(root, "a", V::Priv);
+    w.fun(a, "x", V::Pub);
+    let a_child = w.module(a, "a_child", V::Priv);
+    w.use_as(a_child, "super::fresh", "got", V::Priv);
+    if fresh {
+        w.fun(a, "fresh", V::Priv);
+    }
+    (w, FailedImport { a, a_child })
+}
+
 /// Every fixture's world: what the determinism property permutes.
 pub(crate) fn all() -> Vec<World> {
     std::vec![
@@ -330,5 +352,6 @@ pub(crate) fn all() -> Vec<World> {
         expanded().0,
         glob_vs_expanded().0,
         negative().0,
+        failed_import(false).0,
     ]
 }

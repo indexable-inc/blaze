@@ -136,11 +136,11 @@ impl BodyFacts for Facts {
         None
     }
 
-    fn def_key<'db>(&self, _: &'db TestDB, _: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, _: &'db TestDB, _: DefWithBodyId, def: SolverDefId<'db>) -> hir_ty::body_store::ItemKey {
         unreachable!("only the constant step is stored, and its bytes name no definition: {def:?}")
     }
 
-    fn def_of<'db>(&self, _: &'db TestDB, _: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    fn def_of<'db>(&self, _: &'db TestDB, _: DefWithBodyId, key: hir_ty::body_store::ItemKey) -> Option<SolverDefId<'db>> {
         unreachable!("only the constant step is stored, and its bytes name no definition: {key:?}")
     }
 }

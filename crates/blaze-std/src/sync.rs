@@ -1,27 +1,41 @@
 //! Shared mutation across threads, and its cheaper one-thread versions (docs/v2/plan/design/std.md,
-//! "Shared mutation"): the plain name is safe across threads, `Local` marks the version for one
-//! thread. Each but the first is the one structure its rule names, re-exported under bstd's
-//! name, so each is the same type as the original and code moves to the new name with no
-//! conversion. [`Shared`] and [`LocalShared`] are bstd's own handles over `Arc` and `Rc`
-//! ([`crate::own`]): the same calls for an ordinary value, and over an acyclic type they hold a
-//! linear one, released by hand.
+//! "Shared mutation" and "Concurrency: what to reach for"): the plain name is safe across
+//! threads, `Local` marks the version for one thread.
+//!
+//! What to reach for first is the primitive named for the pattern, not a lock and an atomic:
+//!
+//! | you want to | use |
+//! |---|---|
+//! | work on parts of one slice or table at once | [`crate::par`] |
+//! | build a table, then share it read-only | [`Building`] then [`Frozen`] |
+//! | readers that never block a writer who replaces the whole value | [`Swap`] |
+//! | compute a key once while others asking for it wait | [`Flight`] |
+//! | hand values from one task to another | [`Chan`] (bounded only) |
+//! | count, flag, publish once, number events | [`Counter`], [`Flag`], [`PublishOnce`], [`Seq`] |
+//! | hold two locks | [`RankedLock`], in rank order ([`ranks`]) |
+//!
+//! And the pieces under them, each the one structure its rule names:
 //!
 //! | bstd | the original |
 //! |---|---|
 //! | [`Shared`] / [`LocalShared`] | handles over `alloc::sync::Arc` / `alloc::rc::Rc` ([`crate::own`]) |
 //! | [`Lock`], [`RwLock`] | `blaze_core::lock::{Lock, ReadLock}`, the named locks (rule `standard-structures`) |
-//! | [`LocalLock`] | `core::cell::RefCell` |
-//! | [`Once`], [`Lazy`] / [`LocalOnce`], [`LocalLazy`] | `OnceLock`, `LazyLock` / `OnceCell`, `LazyCell` |
-//! | [`Atomic`] | `core::sync::atomic::Atomic<T>`, the one generic atomic (`AtomicU32` is `Atomic<u32>`) |
+//! | [`LocalLock`], [`LocalOnce`], [`LocalLazy`] | `core::cell::{RefCell, OnceCell, LazyCell}`, each checking in a debug build that it ends on the thread that made it ([`home`]) |
+//! | `Once`, `Lazy` | `OnceLock`, `LazyLock`: not here until bstd's own wait is under them; [`PublishOnce`] meanwhile |
+//! | [`raw::Atomic`] | `core::sync::atomic::Atomic<T>`, the one generic atomic, under a longer name: prefer the named ones |
 //! | [`SpinWait`] | `blaze_spin::SpinWait`, the one bounded spin |
 //! | [`reclaim`] | `blaze_reclaim`: memory freed once every task that could read it ended |
 //!
 //! No poisoning: a guard is never a `Result` of a poisoned lock (the locks are `parking_lot`'s
 //! underneath). [`Lock::lock`] takes the task's `Cx`: the wait has its deadline and a span
 //! named for the lock, and ends in a [`Stopped`]. [`RwLock::read`] and [`RwLock::write`] do
-//! not take one yet: a contended acquire waits in the lock's own park with the profiler's span.
+//! not take one: prefer [`Swap`], whose readers never wait.
 //!
-//! `Once`, `Lazy`, `LocalOnce` and `LocalLazy` are values to own and pass: bstd puts none of
+//! Nothing here starts a thread or sleeps: bstd has no bare thread spawn (work starts as a
+//! task of a [`crate::Scope`]) and no sleep but [`crate::Clock::sleep`], which takes a `Cx`.
+//! bstd has no thread-local storage either.
+//!
+//! `PublishOnce`, `LocalOnce` and `LocalLazy` are values to own and pass: bstd puts none of
 //! them in a `static` (no global mutable state), and `.clippy.toml` bans their originals by
 //! name for that reason, so a caller outside bstd names why it holds one.
 
@@ -31,20 +45,46 @@
               one home, and the ban stays on every use of them"
 )]
 
-pub use core::{
-    cell::{LazyCell as LocalLazy, OnceCell as LocalOnce, RefCell as LocalLock},
-    sync::atomic::{Atomic, Ordering},
-};
+#[expect(unsafe_code, reason = "`PublishOnce`'s one slot, written once before it is published, with its SAFETY")]
+mod atomics;
+pub mod chan;
+pub mod flight;
+pub mod freeze;
+pub mod home;
+pub mod ranks;
+#[expect(unsafe_code, reason = "`Swap`'s published pointer and its reclamation, with their SAFETY")]
+pub mod swap;
+
+pub use atomics::{Counter, Flag, PublishOnce, Seq};
+pub use chan::{Chan, Closed, RecvError, SendError};
+pub use flight::{Flight, FlightError};
+pub use freeze::{Building, Frozen};
+pub use home::{LocalLazy, LocalLock, LocalOnce};
+pub use ranks::{Order, Rank, RankedGuard, RankedLock, Unranked};
+pub use swap::Swap;
 
 pub use crate::own::{LocalShared, Released, Shared};
 
-// The two that wait on first use are Rust std's until bstd's own wait is under them (S4's
-// ban list, `crates/blaze-std/src/rt.rs`).
+// `Once` and `Lazy`, the two that wait on first use, are Rust std's `OnceLock` and `LazyLock`
+// and stay out of bstd until bstd's own wait is under them (S4's ban list,
+// `crates/blaze-std/src/rt.rs`). A value published once is [`PublishOnce`], which never waits.
 
+pub use blaze_core::lock::{LockGuard, ReadGuard, Signal, WriteGuard};
 
-pub use blaze_core::lock::{LockGuard, ReadGuard, ReadLock as RwLock, Signal, WriteGuard};
+/// A lock many read and one writes: `blaze_core::lock::ReadLock`. Its `read` and `write` wait
+/// with no `Cx` and no deadline, and a reader blocks a writer. Prefer [`Swap`]: its readers
+/// never wait and never hold a writer back, and a writer publishes a whole new value. Reach for
+/// this only where a writer changes a small part of a large value in place, and say why.
+pub use blaze_core::lock::ReadLock as RwLock;
 
 use crate::{Stopped, cx::Cx};
+
+/// The generic atomic, under a longer name. Prefer the named ones ([`Counter`], [`Flag`],
+/// [`PublishOnce`], [`Seq`]): each chooses its memory ordering inside and says why in one line,
+/// where an `Atomic<T>` asks every caller to choose one at every call.
+pub mod raw {
+    pub use core::sync::atomic::{Atomic, Ordering};
+}
 
 /// The one lock, named. Taking it is a wait like any other (docs/v2/plan/design/std.md, "One
 /// wait"): [`Lock::lock`] takes the task's `Cx`, so the wait has a deadline and a span, and
@@ -54,6 +94,8 @@ use crate::{Stopped, cx::Cx};
 /// The wait is that lock's bounded one (`try_lock_for`), on the wall clock: under the
 /// `Inline` layout a lock is contended only by another thread, never by another task of the
 /// same simulated world, so the simulation's virtual clock has no lock wait to model yet.
+///
+/// Holding two: [`RankedLock`], whose ranks make the order a type.
 pub struct Lock<T>(blaze_core::lock::Lock<T>);
 
 impl<T> Lock<T> {
@@ -98,6 +140,13 @@ impl<T> Lock<T> {
         }
     }
 
+    /// The lock, for a lock this crate holds only for a few moves and never across code it
+    /// does not own (a [`Flight`]'s table, a [`Chan`]'s queue): its wait is bounded by that,
+    /// so a destructor, which has no `Cx`, may take it.
+    pub(crate) fn lock_briefly(&self) -> LockGuard<'_, T> {
+        self.0.lock()
+    }
+
     /// The value, through the only reference to the lock: no wait.
     #[blaze::nopanic]
     #[blaze::noalloc]
@@ -112,6 +161,50 @@ impl<T> Lock<T> {
         self.0.into_inner()
     }
 }
+
+/// The one wait for a condition another task makes true on what `lock` guards: until `ready`
+/// gives a value, or `cx`'s deadline or cancellation, with [`crate::Cx`]'s typed stops. The
+/// condition's maker notifies `signal` after it changes the value.
+///
+/// - In a simulated world the wait is the world's ([`Cx`]'s `wait_for`): under `Inline`
+///   nothing else of the world runs meanwhile, so a condition only another task could make
+///   true ends the wait at its deadline on the virtual clock, and no wall time passes.
+/// - On a native world the condition's maker is another thread: the wait is `signal`'s,
+///   bounded by the time left to the deadline, as [`Lock::lock`]'s is. A cancellation from
+///   another thread is seen when the wait wakes.
+pub(crate) fn wait_ready<T, R>(
+    cx: &Cx,
+    lock: &Lock<T>,
+    signal: &Signal,
+    mut ready: impl FnMut(&mut T) -> Option<R>,
+) -> Result<R, Stopped> {
+    let io = cx.io();
+    if io.with_sim(|_| ()).is_some() {
+        return cx.wait_for(io, || lock.0.try_lock().and_then(|mut held| ready(&mut held)));
+    }
+    let mut held = lock.lock(cx)?;
+    let cx = cx.span(signal.name());
+    loop {
+        if let Some(got) = ready(&mut held) {
+            return Ok(got);
+        }
+        cx.check()?;
+        let Some(deadline) = cx.deadline().finite() else {
+            signal.wait(&mut held);
+            continue;
+        };
+        let now = io.now();
+        let stopped = Stopped::Deadline { span: cx.name(), at: deadline.get() };
+        if deadline.passed(now) {
+            return Err(stopped);
+        }
+        if signal.wait_for(&mut held, deadline.left(now)) {
+            // The deadline passed: one last look, then the stop.
+            return ready(&mut held).ok_or(stopped);
+        }
+    }
+}
+
 pub use blaze_spin::SpinWait;
 
 /// Reclamation at task ends: a value unlinked from a shared table is dropped once every thread

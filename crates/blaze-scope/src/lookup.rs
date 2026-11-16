@@ -16,7 +16,7 @@ use crate::facts::{Edition, Name, Path, PathKind, ScopeFacts};
 use crate::read::{NameAnswer, Read};
 use crate::resolver::{
     Amb, At, CallState, Cached, Env, Hit, ImportOutcome, Item, Layer, NsRes, Plan, Query, Res,
-    Resolver, Scan, Sink, Slot, Source, Visited, MAX_MODULE_DEPTH,
+    Resolver, Scan, Sink, Slot, Source, MAX_MODULE_DEPTH,
 };
 use crate::scope::{
     AmbiguityKind, BindingState, Def, DefKind, MacroKind, Namespace, Origin, TextualDef,
@@ -82,8 +82,66 @@ pub(crate) struct CallOutcome {
     pub(crate) wait: bool,
 }
 
+/// Whether an attribute is a derive's helper.
+enum Helper {
+    Is,
+    Not,
+    Undet,
+    Wait,
+}
+
 fn seg(i: usize) -> u32 {
     u32::try_from(i).unwrap_or(u32::MAX)
+}
+
+/// Computes the group's least fixpoint for `key` into `sink.memo`: for each fellow `f` and
+/// each member `i` with a glob of `f`, what `f` binds the name to as `i` sees it, each value
+/// from the table's last values, from none, until a round changes nothing. A round past the
+/// bound sets `sink.overrun`, which the pass stops on.
+fn group_fixpoint<N: Name, A: Allocator + Clone>(
+    key: (Namespace, N, Option<(ItemKey, u32)>),
+    env: Env<'_, N, A>,
+    sink: &mut Sink<N, A>,
+    alloc: &A,
+) {
+    let mut edges: Vec<(usize, usize), A> = Vec::new_in(alloc.clone());
+    for (i, m) in env.members.iter().enumerate() {
+        for g in m.globs.iter() {
+            if let Source::Resolved { def, .. } = &g.source {
+                if let Some(f) = env.index(def.key) {
+                    if f != i {
+                        edges.push((f, i));
+                    }
+                }
+            }
+        }
+    }
+    edges.sort();
+    edges.dedup();
+    let mut table = Vec::with_capacity_in(edges.len(), alloc.clone());
+    table.extend(edges.iter().map(|&(f, i)| (f, i, Res::None)));
+    sink.memo.insert(key, table);
+    let (ns, name, ignore) = key;
+    // Each value only rises (none, a binding, a wider or ambiguous one, undetermined), so a
+    // few rounds per edge settle it.
+    let bound = 4 * edges.len() + 4;
+    for _ in 0..bound {
+        let mut changed = false;
+        for (k, &(f, i)) in edges.iter().enumerate() {
+            let q = Query { asker: env.members[i].asker(), restricted: false, ignore };
+            let r = env.members[f].lookup_module(ns, name, q, env, sink);
+            if let Some(table) = sink.memo.get_mut(&key) {
+                if table[k].2 != r {
+                    table[k].2 = r;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+    sink.overrun = true;
 }
 
 impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
@@ -200,29 +258,33 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         sink: &mut Sink<N, A>,
     ) -> GlobFound {
         let mut out = GlobFound { found: None, undet: false, wait: false };
-        let me = Visited { module: self.module, next: q.visited };
         let importer = self.asker();
-        for g in self.globs.iter() {
+        for (gi, g) in self.globs.iter().enumerate() {
             let (def, clamp, classes) = match &g.source {
                 Source::Pending => {
                     if g.vis.visible_from(q.asker) {
-                        if g.blocked { out.wait = true } else { out.undet = true }
+                        if g.blocked {
+                            out.wait = true;
+                        } else {
+                            out.undet = true;
+                            self.note_undet(gi, sink);
+                        }
                     }
                     continue;
                 }
                 Source::Itself | Source::Failed(..) => continue,
                 Source::Resolved { def, clamp, classes } => (*def, *clamp, classes),
             };
-            let cand = if let Some(f) = env.fellow(def.key) {
-                if def.key == self.module || q.visited.is_some_and(|v| v.contains(def.key)) {
+            let cand = if let Some(f) = env.index(def.key) {
+                if def.key == self.module {
                     None
                 } else {
-                    let sub = Query { asker: importer, restricted: false, ignore: q.ignore, visited: Some(&me) };
-                    match f.lookup_module(ns, name, sub, env, sink) {
+                    match self.fellow_res(f, ns, name, q.ignore, env, sink) {
                         Res::Found(hit) if hit.vis.visible_from(importer) => Some((hit.def, hit.vis, hit.state)),
                         Res::Found(_) | Res::None => None,
                         Res::Undet { .. } => {
                             out.undet = true;
+                            self.note_undet(gi, sink);
                             None
                         }
                         Res::Wait => {
@@ -243,7 +305,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                                 }
                             }
                         }
-                        Some(Cached::Name(_) | Cached::Textual { .. } | Cached::InProgress) | None => {
+                        Some(Cached::Name(_) | Cached::Textual { .. } | Cached::Helpers { .. } | Cached::InProgress)
+                        | None => {
                             out.wait = true;
                         }
                     }
@@ -253,6 +316,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             let Some((d, vis, state)) = cand else { continue };
             if state == BindingState::Undetermined {
                 out.undet = true;
+                self.note_undet(gi, sink);
                 continue;
             }
             let mut vis = Visibility::narrower(g.vis, vis, importer);
@@ -291,6 +355,53 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         out
     }
 
+    /// Keeps glob `g` as the one that left a name undetermined, if it is this module's
+    /// earliest so far (a fellow's note, made inside this lookup, gives way to this module's).
+    fn note_undet(&self, g: usize, sink: &mut Sink<N, A>) {
+        let at = self.globs[g].at;
+        let keep = match sink.undet_glob {
+            Some((m, at0, _)) if m == self.module => self.tree_cmp(at, at0) == Ordering::Less,
+            Some(_) | None => true,
+        };
+        if keep {
+            sink.undet_glob = Some((self.module, at, seg(g)));
+        }
+    }
+
+    /// What fellow `f` binds `name` in `ns` to, as this module sees it through a glob: the
+    /// group's least fixpoint for the name, computed once per pass (each member's value from
+    /// the others' last values, from none, until nothing changes), so a cycle of globs binds
+    /// what is bound somewhere on it and nothing more, in time polynomial in the group.
+    fn fellow_res(
+        &self,
+        f: usize,
+        ns: Namespace,
+        name: N,
+        ignore: Option<(ItemKey, u32)>,
+        env: Env<'_, N, A>,
+        sink: &mut Sink<N, A>,
+    ) -> Res {
+        let Some(me) = env.index(self.module) else {
+            // Only a member looks up through a fellow: a machine's own bug, stopped on.
+            sink.overrun = true;
+            return Res::Wait;
+        };
+        let key = (ns, name, ignore);
+        if !sink.memo.contains_key(&key) {
+            group_fixpoint(key, env, sink, &self.alloc);
+        }
+        let found = sink.memo.get(&key).and_then(|table| {
+            table.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, me))).ok().map(|k| table[k].2)
+        });
+        match found {
+            Some(r) => r,
+            None => {
+                sink.overrun = true;
+                Res::Wait
+            }
+        }
+    }
+
     /// The binding of `name` in `ns` of the module or enum `def`, from this module.
     pub(crate) fn lookup_in(
         &self,
@@ -301,7 +412,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         env: Env<'_, N, A>,
         sink: &mut Sink<N, A>,
     ) -> Res {
-        let q = Query { asker: self.asker(), restricted: false, ignore, visited: None };
+        let q = Query { asker: self.asker(), restricted: false, ignore };
         if def.key == self.module {
             return self.lookup_module(ns, name, q, env, sink);
         }
@@ -338,7 +449,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                     })
                 }
             }
-            Some(Cached::Exports { .. } | Cached::Textual { .. } | Cached::InProgress) | None => Res::Wait,
+            Some(Cached::Exports { .. } | Cached::Textual { .. } | Cached::Helpers { .. } | Cached::InProgress)
+            | None => Res::Wait,
         }
     }
 
@@ -418,7 +530,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 return stop;
             }
         }
-        let q = Query { asker: self.asker(), restricted: true, ignore: lq.ignore, visited: None };
+        let q = Query { asker: self.asker(), restricted: true, ignore: lq.ignore };
         let r = self.lookup_module(lq.ns, lq.name, q, env, sink);
         if sink.scan == Scan::Final && sink.amb.is_none() {
             if let Res::Found(hit) = r {
@@ -654,7 +766,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 Some(d) => Tex::Hit(self.textual_hit(d)),
                 None => Tex::Start,
             },
-            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::InProgress) | None => Tex::Wait,
+            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::Helpers { .. } | Cached::InProgress) | None => {
+                Tex::Wait
+            }
         }
     }
 
@@ -680,7 +794,9 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 Some(d) => Res::Found(self.textual_hit(d)),
                 None => Res::None,
             },
-            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::InProgress) | None => Res::Wait,
+            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::Helpers { .. } | Cached::InProgress) | None => {
+                Res::Wait
+            }
         }
     }
 
@@ -938,6 +1054,18 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         if n == 0 || (n == 1 && call.path.kind != PathKind::Plain) {
             return fail(0, Unresolved::NotFound);
         }
+        let inert = CallOutcome { state: Some(CallState::Inert), first: None, wait: false };
+        let one_attr = call.kind == MacroKind::Attr && n == 1;
+        if one_attr {
+            // rustc's innermost scope for an attribute: the helpers of the derives before it
+            // on its item.
+            match self.derive_helper(c, segs[0], force, sink) {
+                Helper::Is => return inert,
+                Helper::Wait => return wait,
+                Helper::Undet => return stay,
+                Helper::Not => {}
+            }
+        }
         let last = seg(n - 1);
         let undetermined = |weak: bool| {
             if force { fail(last, if weak { Unresolved::NotFound } else { Unresolved::Undetermined }) } else { stay }
@@ -965,6 +1093,23 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 Prefix::Wait => return wait,
             }
         };
+        if one_attr && self.builtin_attrs.binary_search(&segs[0]).is_ok() {
+            // The built-in attribute scope comes after the `#[macro_use]` prelude: an attribute
+            // macro of a nearer scope with its name is ambiguous, one of the standard prelude
+            // or none leaves the built-in, which is inert.
+            return match r {
+                Res::Found(hit)
+                    if matches!(hit.layer, Layer::Textual | Layer::Module | Layer::MacroUsePrelude) =>
+                {
+                    fail(last, Unresolved::Ambiguous(AmbiguityKind::BuiltinAttr))
+                }
+                Res::Found(_) | Res::None => inert,
+                Res::Undet { .. } => {
+                    if force { inert } else { stay }
+                }
+                Res::Wait => wait,
+            };
+        }
         match r {
             Res::Found(hit) => match hit.state {
                 BindingState::Ambiguous(k) => fail(last, Unresolved::Ambiguous(k)),
@@ -986,6 +1131,48 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             Res::None => fail(last, Unresolved::NotFound),
             Res::Undet { weak } => undetermined(weak),
             Res::Wait => wait,
+        }
+    }
+
+    /// Whether `name` is a helper attribute of a derive written before call `c` on its item.
+    fn derive_helper(&self, c: usize, name: N, force: bool, sink: &mut Sink<N, A>) -> Helper {
+        let call = &self.calls[c];
+        let Some(item) = call.item else { return Helper::Not };
+        let mut wait = false;
+        let mut undet = false;
+        for d in self.calls.iter() {
+            if d.kind != MacroKind::Derive
+                || d.item != Some(item)
+                || d.at.frag != call.at.frag
+                || d.at.slot >= call.at.slot
+            {
+                continue;
+            }
+            match d.state {
+                CallState::Resolved(def) | CallState::Expanded { def, .. } => {
+                    match self.cached(Read::DeriveHelpers { derive: def.key }, sink) {
+                        Some(Cached::Helpers { names, .. }) => {
+                            if names.binary_search(&name).is_ok() {
+                                return Helper::Is;
+                            }
+                        }
+                        Some(Cached::Name(_) | Cached::Exports { .. } | Cached::Textual { .. } | Cached::InProgress)
+                        | None => wait = true,
+                    }
+                }
+                // Forced, a derive still pending gives no helper: it fails in the same pass.
+                CallState::Pending if !force => {
+                    if d.blocked { wait = true } else { undet = true }
+                }
+                CallState::Pending | CallState::Inert | CallState::Failed(..) | CallState::TooDeep => {}
+            }
+        }
+        if wait {
+            Helper::Wait
+        } else if undet {
+            Helper::Undet
+        } else {
+            Helper::Not
         }
     }
 

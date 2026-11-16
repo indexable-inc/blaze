@@ -37,9 +37,6 @@ syntax-bridge.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
 blaze-mem.workspace = true
-# The test fixture (`fixture`): a view's files, and the fixture text parser.
-blaze-vfs = { workspace = true, optional = true }
-test-utils = { workspace = true, optional = true }
 
 [dev-dependencies]
 expect-test.workspace = true
@@ -49,8 +46,9 @@ syntax-bridge = { workspace = true, features = ["reference"] }
 test-utils.workspace = true
 
 [features]
-# `hir_expand::fixture`, for other crates' tests (as a dev-dependency).
-fixture = ["dep:blaze-vfs", "dep:test-utils"]
+# The old view fixture is gone with the world it built (docs/v2/plan/design/reconnect.md,
+# "Callers that need edits"); the feature stays named so dependents' manifests resolve.
+fixture = []
 
 [lints]
 workspace = true

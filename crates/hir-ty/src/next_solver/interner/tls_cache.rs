@@ -188,12 +188,10 @@ fn held_for_field_updates(scans: u64) {
 /// A slot and the generation it was seen to hold.
 type Held<K, S, T> = (usize, *mut Generation<K, S, T>);
 
-/// A shared generation: the search graph's cache and the global-goal table, which answers
-/// root goals before they are canonicalized (`global_goals`).
+/// A shared generation: the search graph's cache.
 #[derive(Default)]
 struct SharedCaches {
     search: Erased,
-    goals: crate::next_solver::global_goals::Goals,
 }
 
 #[expect(
@@ -225,19 +223,6 @@ pub(super) fn shared<'db, R>(
     // count.
     let task = blaze_reclaim::enter();
     f(unerase(&SHARED.of(&task, Scope { nonce, krate, regions }, view).search))
-}
-
-/// Runs `f` on the global-goal table of `krate` (and `regions`) in `db`, as it is now.
-#[inline]
-pub(super) fn global_goals<R>(
-    db: &Db,
-    krate: Option<Crate>,
-    regions: bool,
-    f: impl FnOnce(&crate::next_solver::global_goals::Goals) -> R,
-) -> R {
-    let (nonce, view) = (db.nonce(), view(db, krate));
-    let task = blaze_reclaim::enter();
-    f(&SHARED.of(&task, Scope { nonce, krate, regions }, view).goals)
 }
 
 /// A key of a [`Shared`] table.

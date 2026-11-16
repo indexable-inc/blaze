@@ -9,8 +9,16 @@
 //! - In memory a row keeps its kind whole (`interner::table::Rows`); the codec gives the row's
 //!   tag when it is added ([`tag`]), and in debug builds checks that what it writes reads back
 //!   as the same value, so every interned value is a round trip of the persisted codec.
+//!
+//! The one type codec of the type checker (docs/v2/plan/design/typeck-store.md): the body store
+//! and the goal store write their records' types with it, ids through [`ids`].
+
+pub(crate) mod ids;
+pub mod port;
 
 use std::{convert::Infallible, marker::PhantomData, num::NonZeroU32};
+
+use self::ids::Relocate;
 
 use blaze_format::{
     ALIGN, FormatError, Part, Record, SchemaHash, Slice, Writer, record_at, schema_of,
@@ -62,7 +70,7 @@ pub(crate) trait Sink<'db> {
     /// An id. Every sink says how it names one (a row in memory as the id itself, a persisted
     /// table as a stable id): an id's bits mean nothing past its snapshot, so no sink writes
     /// them by default.
-    fn id<T: crate::check_cache::Relocate>(&mut self, id: T)
+    fn id<T: Relocate>(&mut self, id: T)
     where
         Self: Sized;
     /// A definition: its variant and id, unless the sink names definitions otherwise.
@@ -81,7 +89,7 @@ pub(crate) trait Source<'db> {
     fn node<N: Node<'db>>(&mut self) -> Result<N, Self::Error>;
     fn adt(&mut self) -> Result<AdtDef, Self::Error>;
     /// An id, as the sink it reads back named it ([`Sink::id`]).
-    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, Self::Error>
+    fn id<T: Relocate>(&mut self) -> Result<T, Self::Error>
     where
         Self: Sized;
     /// How many of something follow, each of at least one word.
@@ -180,7 +188,7 @@ impl<'db> Sink<'db> for Words {
     }
 
     #[inline]
-    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+    fn id<T: Relocate>(&mut self, id: T) {
         let gid = blaze_memo::Id::gid(id);
         self.home = self.home.max(Some(gid.arena()));
         self.words.push(u32::try_from(self.ids.len()).expect("a row names fewer than 2^32 ids"));
@@ -234,7 +242,7 @@ impl<'db> Sink<'db> for HomeSink {
     }
 
     #[inline]
-    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+    fn id<T: Relocate>(&mut self, id: T) {
         self.home = self.home.max(Some(blaze_memo::Id::gid(id).arena()));
     }
 }
@@ -346,7 +354,7 @@ impl<'db> Source<'db> for Row<'_> {
     }
 
     #[inline]
-    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, Infallible> {
+    fn id<T: Relocate>(&mut self) -> Result<T, Infallible> {
         let at = self.word()? as usize;
         let gid = *self.ids.get(at).expect("a row's id is one its `put` listed");
         Ok(T::from_gid(gid))
@@ -1912,7 +1920,7 @@ impl<'db> Node<'db> for BoundExistentialPredicates<'db> {
         let mut items = (0..len)
             .map(|_| BoundExistentialPredicate::get(source))
             .collect::<Result<SmallVec<[BoundExistentialPredicate<'db>; 8]>, _>>()?;
-        if crate::check_cache::in_scope() {
+        if ids::in_scope() {
             // In lowering's order, by this database's ids: the principal, projections, auto traits.
             items.sort_by(|a, b| {
                 use ExistentialPredicate as P;
@@ -2116,8 +2124,8 @@ impl<'db> Sink<'db> for Children<'_, 'db> {
         SolverDefId::from(adt.def_id()).put(self);
     }
 
-    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
-        let bits = crate::check_cache::id_bits(id);
+    fn id<T: Relocate>(&mut self, id: T) {
+        let bits = ids::id_bits(id);
         self.word(bits as u32);
         self.word((bits >> 32) as u32);
     }
@@ -2135,7 +2143,7 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
     /// The table [`TyTableWriter::write`] wrote at `at` in `buffer`. An ADT's flags are read
     /// from `interner`'s database.
     pub fn open(interner: DbInterner<'db>, buffer: &'a [u8], at: u64) -> Result<Self, FormatError> {
-        Self::open_with(buffer, at, |id| crate::check_cache::outside(|| AdtDef::new(id, interner)))
+        Self::open_with(buffer, at, |id| ids::outside(|| AdtDef::new(id, interner)))
     }
 
     /// As [`Self::open`], an ADT made by `adt`.
@@ -2269,20 +2277,17 @@ impl<'db, A: Fn(AdtId) -> AdtDef> Source<'db> for Reading<'_, A> {
         }
     }
 
-    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
+    fn id<T: Relocate>(&mut self) -> Result<T, FormatError> {
         let low = self.word()?;
         let high = self.word()?;
-        // As [`TyTableWriter`]'s sink wrote it (`check_cache::id_bits`): inside a relocating
-        // scope, the id's index in the scope's table plus one, whose high word is 0 (refused
-        // on its own, so a corrupt one is not folded into the bits and reported as a huge
-        // table index); outside one, this process's own word of the id (`gid_bits`: its
-        // arena in the high word), which a record outside a scope holds and is never
-        // persisted (port decision 4).
-        if crate::check_cache::ids::in_scope() && high != 0 {
+        // As [`TyTableWriter`]'s sink wrote it ([`ids::id_bits`]): the id's index in the
+        // scope's table plus one, whose high word is 0 (refused on its own, so a corrupt one
+        // is not folded into the bits and reported as a huge table index).
+        if high != 0 {
             return Err(self.past(GENERATION, u64::from(high), 0));
         }
         let bits = (u64::from(high) << 32) | u64::from(low);
-        crate::check_cache::id_of(bits).map_err(|refused| refused.at(self.at))
+        ids::id_of(bits).map_err(|refused| refused.at(self.at))
     }
 
     fn count(&mut self) -> Result<usize, FormatError> {

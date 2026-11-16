@@ -29,9 +29,9 @@ pub(crate) fn with_old_rounds<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Runs `f` with the global-goal and shape tables off, so every root goal goes to the solver.
+/// Runs `f` with the goal store's gate off, so every root goal goes to the solver.
 pub(crate) fn without_goal_tables<R>(f: impl FnOnce() -> R) -> R {
-    global_goals::switch::without(f)
+    gate::switch::without(f)
 }
 
 impl<'db> FulfillmentCtxt<'db> {
@@ -61,7 +61,7 @@ impl<'db> FulfillmentCtxt<'db> {
                 let goal = obligation.as_goal();
                 let span = obligation.cause.span();
                 let result =
-                    global_goals::evaluate_root_goal(delegate, goal, span, opt_stalled_on.take());
+                    gate::evaluate_root_goal(delegate, goal, span, opt_stalled_on.take());
                 infcx.inspect_evaluated_obligation(obligation, &result, || {
                     Some(delegate.evaluate_root_goal_for_proof_tree(goal, span).1)
                 });

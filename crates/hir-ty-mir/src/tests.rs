@@ -1,6 +1,5 @@
 mod assertion_helpers;
 mod builtin_derives;
-mod check_cache;
 mod closure_captures;
 mod coercion;
 mod const_effects;

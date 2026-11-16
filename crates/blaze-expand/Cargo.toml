@@ -17,6 +17,8 @@ doctest = false
 # `ContentId`, `CrateItemKey`, `ItemKey`, `Portable`: what a record names a crate, a module
 # and a definition's content by.
 blaze-id.workspace = true
+# `Writer`, `Slice`, `open_as`, `leb`: the expansion's stored record (its columns, read back).
+blaze-format.workspace = true
 # `Hasher`: the keys and a definition's content hash.
 blaze-ids.workspace = true
 # `frame::task`: the task frame mbe writes its output tree into.

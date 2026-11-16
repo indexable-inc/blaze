@@ -953,7 +953,7 @@ fn write_memory_map<'db>(
                 map.statics.iter().map(|it| StaticRec {
                     start: it.start as u64,
                     size: it.size as u64,
-                    id: crate::check_cache::id_bits(it.id),
+                    id: crate::next_solver::persist::ids::id_bits(it.id),
                 }),
             );
             columns.vtable =
@@ -1045,7 +1045,7 @@ fn read_memory_map<'db>(
         map.aligns.push((word(align.address)?, word(align.align)?));
     }
     for it in statics {
-        let id = crate::check_cache::id_of::<StaticId>(it.id).map_err(|refused| refused.at(at))?;
+        let id = crate::next_solver::persist::ids::id_of::<StaticId>(it.id).map_err(|refused| refused.at(at))?;
         map.statics.push(StaticMemory { start: word(it.start)?, size: word(it.size)?, id });
     }
     if vtable_dyns.len() != vtable.len() {

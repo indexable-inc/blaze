@@ -13,7 +13,7 @@
 //!   when it was solved ([`record`]; the form, its keys and the chain are `blaze_record`'s). A
 //!   lookup reads the shapes, hashes their facts as they are now, and asks for the answer: a
 //!   constructive trace, as Bazel's action cache and Shake keep.
-//! - Only what the global-goal table offers is offered here: root, shareable, global goals,
+//! - Only what the gate ([`gate`]) offers is offered here: root, shareable, global goals,
 //!   never a cycle's provisional answer nor one with inference variables. A goal is stored only
 //!   when every read of its evaluation is an interned value or a fact; any other read (a query
 //!   or input with no fact) keeps it out, counted by name in [`Flushed::inexpressible`].
@@ -24,6 +24,7 @@
 //! that database has no persistent tier, as one given no store by `hir_def::deps::serve` has no
 //! images. Nothing is answered another way: the goal is solved, as it always is.
 
+pub(crate) mod gate;
 mod pending;
 mod record;
 pub(crate) mod slots;
@@ -48,10 +49,10 @@ use hir_def::deps::ImageStore;
 
 use super::{
     DbInterner, SolverDefId,
-    global_goals::{Answer, GoalKey},
     interner::{Reads, recorded, replay},
 };
 use crate::store_registry::{Linked, Registry};
+use gate::{Answer, GoalKey};
 use pending::{Pending, Tallies};
 use stable::Goal;
 
@@ -59,9 +60,9 @@ use stable::Goal;
 /// facts (`blaze_items`), which hir-ty cannot name. Asked only on a global-table miss and after
 /// a solve, never on a hit; every method may be called from any worker at once.
 pub trait GoalFacts: Send + Sync + 'static {
-    /// The key of a definition a goal names (`blaze_items::key::def_key`'s): the same for the
-    /// same item in every database and checkout, another one after a rename or a move.
-    fn def_key<'db>(&self, db: &'db Db, def: SolverDefId<'db>) -> ContentId;
+    /// The key of a definition a goal names (`blaze_id::key_of`'s): the same for the same item
+    /// in every database and checkout, another one after a rename or a move.
+    fn def_key<'db>(&self, db: &'db Db, def: SolverDefId<'db>) -> blaze_id::ItemKey;
 
     /// The key of `krate` and of everything an interner of it reads when it is made, outside
     /// any query a goal's evaluation runs: its identity (`blaze_items::key::crate_key`) and its

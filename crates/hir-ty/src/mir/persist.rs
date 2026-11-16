@@ -13,19 +13,15 @@
 //! store, never a position in a file, so moving the body in its file changes no byte.
 //!
 //! Every id (the owner, a static, a variant, a closure, each definition a type names) is
-//! written through `check_cache::id_bits`: in the item store's relocating scope that is its
-//! place in the record's id table, which the store writes as item keys, so two databases that
-//! built the same body write the same bytes. Outside a scope it is the id's own bits, read
-//! back only by the database that wrote them.
+//! written through `ids::id_bits`: in the body store's relocating scope, the only place a body
+//! is written, that is its place in the record's id table, which the store writes as item keys,
+//! so two databases that built the same body write the same bytes.
 //!
 //! A constant a location macro made (`line!()`, `column!()`, `file!()`, `module_path!()`, a
 //! `concat!` of one) is written as a slot, its literal's expression and its type, never its
 //! value: reading fills it from that literal as the body is now ([`Locations`]), so moving or
 //! renaming the code reads as the MIR building it again gives. `#[track_caller]` and panic
 //! locations are not constants of built MIR: they are read off the spans where used.
-
-#[cfg(test)]
-mod tests;
 
 use std::mem::offset_of;
 
@@ -56,7 +52,6 @@ use super::{
 };
 use crate::{
     InferBodyId, MemoryMap,
-    check_cache::{Relocate, id_bits, id_of},
     closure_analysis,
     consteval::{AllocationRec, read_allocation, write_allocation},
     infer::PointerCast,
@@ -65,7 +60,10 @@ use crate::{
         Allocation, AllocationData, ConstExt as _, DbInterner, StoredAllocation, StoredConst,
         StoredGenericArgs, StoredTy, Ty, TyKind,
         abi::Safety,
-        persist::{TABLE_SCHEMA, TyTableReader, TyTableWriter},
+        persist::{
+            TABLE_SCHEMA, TyTableReader, TyTableWriter,
+            ids::{self, Relocate, id_bits, id_of},
+        },
     },
 };
 
@@ -400,7 +398,7 @@ pub(crate) fn read<'db>(
 /// How many expressions, patterns and bindings the store of a body has: what [`read_in`]
 /// checks every index of the body's store against. [`Bounds::of`] counts a store that is
 /// there; a record of a crate no edit reaches keeps the counts of the store its writer had
-/// (`check_cache::runtime`), so its reader lowers no body to have them.
+/// (the body store's record), so its reader lowers no body to have them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bounds {
     pub(crate) exprs: u32,
@@ -2066,7 +2064,7 @@ impl<'a, 'db> Decode<'a, 'db> {
                         // A query, outside the relocating scope (`ids::relocating`'s contract):
                         // the union's fields are hir-def's and name no id of the record.
                         let fields =
-                            crate::check_cache::outside(|| parent.fields(self.db).fields().len());
+                            ids::outside(|| parent.fields(self.db).fields().len());
                         let fields = table_len(fields);
                         let local_id: LocalFieldId = self.below(
                             "a union aggregate's field, below its union's field count",
