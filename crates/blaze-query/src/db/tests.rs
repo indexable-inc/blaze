@@ -3844,6 +3844,90 @@ fn a_cycle_through_a_scoped_function_iterates_to_its_fixpoint() {
     assert!(text.contains("task-scoped `Loops`") && text.contains("no `cycle_initial`"), "{text}");
 }
 
+/// [`Climb`] asking for itself from inside a covered frame with no query below it, as
+/// `sealed summary reads below HIGH` does in the effects summary.
+struct ClimbCovered;
+
+impl Scoped for ClimbCovered {
+    type Db = TestDb;
+    type Key = (Cell,);
+    type Value = u64;
+    const NAME: &'static str = "ClimbCovered";
+    const CYCLE: CycleKind = CycleKind::Fixpoint;
+    const TAG: Tag = Tag::Query;
+
+    fn execute(db: &TestDb, key: &(Cell,)) -> u64 {
+        db.ran("ClimbCovered", key.0.0);
+        let below =
+            super::covered(db, "a test's cover", || fetch_scoped::<ClimbCovered, _>(db, *key, |it| *it));
+        (below + 1).min(key.0.a(db))
+    }
+
+    fn cycle_initial(_: &TestDb, _: &(Cell,)) -> u64 {
+        0
+    }
+
+    fn equal(old: &u64, new: &u64) -> bool {
+        old == new
+    }
+
+    fn write_key(key: &(Cell,), out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(out, "{:?}", key.0)
+    }
+}
+
+/// A scoped fixpoint whose cycle goes through the persistent query [`BounceBack`].
+struct Bounce;
+
+impl Scoped for Bounce {
+    type Db = TestDb;
+    type Key = (Cell,);
+    type Value = u64;
+    const NAME: &'static str = "Bounce";
+    const CYCLE: CycleKind = CycleKind::Fixpoint;
+    const TAG: Tag = Tag::Query;
+
+    fn execute(db: &TestDb, key: &(Cell,)) -> u64 {
+        *get::<BounceBack>(db, key.0)
+    }
+
+    fn cycle_initial(_: &TestDb, _: &(Cell,)) -> u64 {
+        0
+    }
+
+    fn equal(old: &u64, new: &u64) -> bool {
+        old == new
+    }
+
+    fn write_key(key: &(Cell,), out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(out, "{:?}", key.0)
+    }
+}
+
+query!(BounceBack, u64, |db, key| fetch_scoped::<Bounce, _>(db, (key,), |it| *it) + 1);
+
+/// The invariant: a witness frame is no row, so a scoped cycle passes one, here a covered
+/// frame with no query below it (whose `id` is 0 and names nothing: blaze panicked on
+/// `Id::from_u32(0)` there, crates/blaze-query/src/db/scoped.rs, on blaze's own tree) and
+/// iterates to the same fixpoint as [`Climb`]. Control: a cycle through a persistent query's
+/// row is still refused, naming that query.
+#[test]
+fn a_scoped_cycle_passes_a_witness_frame_and_is_refused_through_a_persistent_row() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 4, 0);
+    assert_eq!(task_scope(&db, || fetch_scoped::<ClimbCovered, _>(&db, (cell,), |it| *it)), 4);
+    assert_eq!(db.runs("ClimbCovered"), 5, "the rounds of `Climb`");
+    let refused = catch_unwind(AssertUnwindSafe(|| {
+        task_scope(&db, || fetch_scoped::<Bounce, _>(&db, (cell,), |it| *it))
+    }))
+    .expect_err("a scoped cycle through a persistent row");
+    let text = message(&*refused);
+    assert!(
+        text.contains("task-scoped `Bounce`") && text.contains("goes through the persistent query"),
+        "{text}"
+    );
+}
+
 /// The invariant: `held_by_function` says, from counters alone, what the walk of
 /// `memory_usage` finds: each function's bytes are its `held()`, and while no value was let go
 /// its values are its rows that ran. Control: once a function's values are evicted its count

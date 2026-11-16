@@ -13,6 +13,14 @@
 //! inside the package's directory is the same path both ways. Modules below a `#[path]` file
 //! resolve beside that file, so `mod ask;` there is library/blaze_inproc_rt/src/ask.rs.
 
+// `#![blaze::trust]` below names blaze's tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "a dev executable's runtime: the start hook and the live tables are `#[no_mangle]` symbols the link and blaze-live name, and the platform layer (`sys`) maps the daemon's code memory over the executable's code and speaks to the daemon through raw system calls, Mach ports and pipes"
+)]
+
 #[path = "../../../library/blaze_inproc_rt/src/lib.rs"]
 mod source;
 

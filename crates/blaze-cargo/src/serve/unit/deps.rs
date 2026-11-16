@@ -1474,6 +1474,8 @@ pub(crate) fn keep_bodies(
         in_macros = tracing::field::Empty,
         unmapped = tracing::field::Empty,
         unkeyed = tracing::field::Empty,
+        superseded = tracing::field::Empty,
+        elsewhere = tracing::field::Empty,
     );
     let _span = span.enter();
     let in_view = |path: &str| job.mounted.in_view(path).map(std::borrow::Cow::into_owned);
@@ -1518,8 +1520,12 @@ fn record_did(span: &tracing::Span, did: &bodies::Did) {
         in_macros,
         unmapped,
         unkeyed,
+        superseded,
+        elsewhere,
         carry,
     } = *did;
+    span.record("superseded", superseded as u64);
+    span.record("elsewhere", elsewhere as u64);
     span.record("skipped", skipped || no_store);
     span.record("session", session.name());
     span.record("bodies", bodies as u64);

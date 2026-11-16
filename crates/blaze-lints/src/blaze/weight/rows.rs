@@ -248,7 +248,7 @@ impl Fold {
 /// The facts of `subject` over every crate that can name it from `home`, the crate linted.
 pub(crate) fn facts(db: &Db, home: hir::Crate, subject: Subject) -> Facts {
     let mut out = Facts::default();
-    for &krate in readers(db, home.base(), crate::query::top_crate(db)) {
+    for &krate in readers(db, home.base()) {
         if let Some(it) = crate_uses(db, krate).of.get(&subject) {
             out.merge(it);
         }
@@ -259,18 +259,16 @@ pub(crate) fn facts(db: &Db, home: hir::Crate, subject: Subject) -> Facts {
 /// The workspace crates that can name an item of `home`: every configuration of `home` (the
 /// local crates of its root file) and every local crate that depends on one of them.
 ///
-/// Keyed by `top` ([`crate::query::top_crate`]) as well as `home`: its run reads the crates
-/// above `home` (it walks
-/// every crate's root file and the reverse dependencies), so under the home rule its key names
-/// a crate at or above all of them and the entry lives in `top`'s arena, dropped when any crate
-/// it read changes, not in `home`'s.
+/// Keyed by `home` alone, and so homed in `home`'s arena: its run reads crates above `home`
+/// (every crate's root file and the reverse dependencies), which a read may do (each sets a
+/// borrow, so the entry goes when one of them changes), but a key may name only its home's
+/// declared closure. Until 2026-11-15 it was keyed by the session's greatest crate as well,
+/// whose arena declares no borrow of `home` in a workspace of many crates: `blaze check
+/// --workspace` of blaze refused the key ("is homed at arena 1410.2 but names arena 766.6").
+/// Its asker, the body's lints (`query::body_lints`), is homed at `home` too, and so borrowed
+/// every crate this reads already; the greatest crate's own edits dropped it as well.
 #[blaze_memo::tracked(returns(copy))]
-pub(crate) fn readers<'db>(
-    db: &'db Db,
-    home: base_db::Crate,
-    top: base_db::Crate,
-) -> &'db [base_db::Crate] {
-    debug_assert!(home <= top, "{home:?} is past the top crate {top:?}");
+pub(crate) fn readers<'db>(db: &'db Db, home: base_db::Crate) -> &'db [base_db::Crate] {
     let home = hir::Crate::from(home);
     let root = home.root_file(db);
     let mut seen: HashSet<base_db::Crate, Global> = HashSet::new_in(Global);

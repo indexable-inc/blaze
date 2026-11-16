@@ -17,6 +17,14 @@
 //! prefetch together), written only by its thread: entering and leaving a task writes no line
 //! another core writes.
 
+// `#![blaze::trust]` below names blaze's tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "epoch reclamation: the per-thread slot blocks are leaked and never freed, so a `&'static` to one is sound, and a retired value is freed (`Box::from_raw`) only once its grace has passed and no task can still read it"
+)]
+
 use std::{cell::Cell, marker::PhantomData, mem::ManuallyDrop, num::NonZeroUsize, ptr};
 
 use crate::sync::{

@@ -21,7 +21,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     the nightly's `rustc -V` and its rust-lang/rust commit);
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src and crates/rustc_lexer/src is compiler/rustc_lexer/src, copied as
-    they are;
+    they are but for blaze's four lines kept at the top of rustc_abi's root (`ABI_ROOT`);
  3a. moves the trait solver and the format-string parser (`tools/v2/solver_sync.py`):
     vendor/rustc_type_ir, vendor/rustc_next_trait_solver, vendor/rustc_type_ir_macros,
     vendor/rustc_transmute and vendor/rustc_parse_format become upstream's crates at the new commit with `PATCHES.md`'s series replayed (exact context, no fuzz); a patch that no
@@ -99,6 +99,10 @@ MENTIONS = ["site/install.sh", "crates/rustc_lexer/Cargo.toml"]
 # in them can be what something was ported from.
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
 ABI = ("crates/rustc_abi/src", "compiler/rustc_abi/src")
+# blaze's lines at the top of crates/rustc_abi/src/lib.rs, kept across a copy: the first is this
+# comment's marker, and it and the three after it (the tool and the crate's
+# `#![blaze::trust(unsafe, ..)]`, docs/lints.md#workspace_unsafe) go above upstream's root.
+ABI_ROOT = ("crates/rustc_abi/src/lib.rs", "// blaze's, not upstream's:", 4)
 LEXER = ("crates/rustc_lexer/src", "compiler/rustc_lexer/src")
 # What crates/blaze-lint-defs/src/rustc.rs is written from (scripts/src/bin/lint_table.rs).
 LINTS = ("compiler/rustc_lint", "compiler/rustc_lint_defs", "compiler/rustc_feature")
@@ -240,8 +244,18 @@ def replace_tree(src, dst):
 async def vendor(new):
     """crates/rustc_abi/src and crates/rustc_lexer/src as rust-lang/rust has them at `new`."""
     repo = await checkout(new, [ABI[1], LEXER[1]])
+    root, marker, count = ABI_ROOT
+    root = os.path.join(ROOT, root)
+    with open(root, encoding="utf-8") as f:
+        kept = f.read().splitlines(keepends=True)[:count]
+    if not kept or not kept[0].startswith(marker):
+        raise Failed(f"vendor: {ABI_ROOT[0]} does not start with blaze's lines (`{marker}`)")
     for ours, theirs in (ABI, LEXER):
         replace_tree(os.path.join(repo, theirs), os.path.join(ROOT, ours))
+    with open(root, encoding="utf-8") as f:
+        upstream = f.read()
+    with open(root, "w", encoding="utf-8") as f:
+        f.write("".join(kept) + upstream)
 
 
 async def lints(new):

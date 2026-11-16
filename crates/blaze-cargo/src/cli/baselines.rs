@@ -9,12 +9,18 @@
 //! directory's `TARGET` file names, and a run for another is refused. blaze's own baselines,
 //! `crates/blaze-lints/baselines`, are `aarch64-unknown-linux-gnu`'s, which the merge gate's
 //! `lint-baselines` job checks.
+//!
+//! A run that failed is measured in part: a crate whose check did not complete (a unit of it
+//! gave an error that is no lint finding, a compiler panic among them; a build script of it
+//! failed; or a unit of it was not checked behind a failure) is [`Unmeasured`], and every other
+//! crate was checked whole. `--bless-baselines` then records the crates it measured, keeps the
+//! rest as the baselines hold them, names each with why, and the command fails.
 
-use std::path::Path;
+use std::{fmt, path::Path};
 
-use blaze_api::DiagnosticRef;
+use blaze_api::{DiagnosticRef, Level, Unchecked, UnitOfRef};
 use blaze_hash::HashSet;
-use blaze_lints::baseline::{self, Baseline, Blessed, Counts, Held, Off};
+use blaze_lints::baseline::{self, Baseline, Blessed, Counts, Held, Off, Unmeasured};
 use std::collections::BTreeMap;
 use std::alloc::Global;
 
@@ -29,13 +35,24 @@ pub struct Counted {
     counts: Counts,
     /// The lint findings that came with no unit, so no crate to count them under.
     unowned: Vec<String>,
+    /// The crates whose check the run did not complete, each with the first cause it gave.
+    unmeasured: Unmeasured,
+    /// The errors that are no lint finding and came with no unit: the run did not say which
+    /// crates' checks they cut short, so it measured none for certain.
+    unplaced: Vec<blaze_mem::String<Global>, Global>,
+}
+
+/// Whether a diagnostic's code names a lint a baseline counts.
+fn is_lint(code: Option<&str>) -> bool {
+    code.is_some_and(|it| it.starts_with("clippy::") || it.starts_with("blaze::"))
 }
 
 impl Counted {
     pub fn add(&mut self, diagnostic: &DiagnosticRef<'_>) {
-        let Some(lint) =
-            diagnostic.code.filter(|it| it.starts_with("clippy::") || it.starts_with("blaze::"))
-        else {
+        if diagnostic.level == Level::Error && !is_lint(diagnostic.code) {
+            self.cut_short(diagnostic);
+        }
+        let Some(lint) = diagnostic.code.filter(|it| is_lint(Some(it))) else {
             return;
         };
         let at = diagnostic.spans.iter().find(|it| it.primary);
@@ -56,6 +73,44 @@ impl Counted {
                 .or_default()
                 .entry(krate.to_owned())
                 .or_default() += 1;
+        }
+    }
+
+    /// An error that is no lint finding: its unit's check stopped short of its end (a panic of
+    /// blaze's, an error in its items), so its crate's counts are of part of it.
+    fn cut_short(&mut self, diagnostic: &DiagnosticRef<'_>) {
+        let first = diagnostic.message.lines().next().unwrap_or("");
+        let Some(unit) = diagnostic.unit else {
+            self.unplaced.push(blaze_mem::String::from_str_in(first, Global));
+            return;
+        };
+        self.unmeasured.add(say::package_name(unit.package_id), format_args!("error: {first}"));
+    }
+
+    /// A build script's failure ([`blaze_api::Response::Report`] of a unit): its package was not
+    /// checked.
+    pub fn report(&mut self, unit: &UnitOfRef<'_>, title: &str) {
+        let krate = say::package_name(unit.package_id);
+        self.unmeasured.add(krate, format_args!("its build failed: {title}"));
+    }
+
+    /// What a failed build left unchecked ([`blaze_api::Response::Unchecked`]): each unit that
+    /// failed with units behind it, and each unit not checked behind it, by its package (a unit
+    /// is named `package v1.2.3 (lib)`, its first word, [`say::unit_package`]). A unit that
+    /// failed only in its bodies or lints (`open`) was checked whole, and its findings counted.
+    pub fn unchecked(&mut self, unchecked: &Unchecked) {
+        for behind in &unchecked.behind {
+            if behind.id.is_some() {
+                let why = &behind.why;
+                self.unmeasured.add(say::unit_package(&behind.unit), format_args!("it failed: {why}"));
+            }
+            for unit in &behind.units {
+                let (failed, why) = (&behind.unit, &behind.why);
+                self.unmeasured.add(
+                    say::unit_package(unit),
+                    format_args!("`{unit}` was not checked behind `{failed}`, which failed: {why}"),
+                );
+            }
         }
     }
 
@@ -97,6 +152,20 @@ impl Counted {
             }
             None => {}
         }
+        if !self.unplaced.is_empty() {
+            return Err(format!(
+                "the run gave errors with no unit, so it did not say whose check they cut short and \
+                 measured no crate for certain; the baselines in {shown} were not compared or written:{}",
+                Lines(&self.unplaced)
+            ));
+        }
+        if !new.is_empty() && !self.unmeasured.crates.is_empty() {
+            return Err(format!(
+                "`--new-baseline` starts a baseline at the run's counts, and this run did not measure \
+                 every crate:{}",
+                UnmeasuredLines(&self.unmeasured)
+            ));
+        }
         let mut said = Vec::new();
         for lint in new {
             let known = baseline::lint_of(&baseline::file_name(lint)).is_some_and(|it| it == *lint);
@@ -134,26 +203,28 @@ impl Counted {
             std::fs::write(&path, format!("{target}\n"))
                 .map_err(|error| format!("{}: {error}", path.display()))?;
         }
-        let off = baseline::check(&dir, &self.counts).map_err(|it| it.to_string())?;
+        let unmeasured = &self.unmeasured;
+        let off =
+            baseline::check(&dir, &self.counts, unmeasured, Global).map_err(|it| it.to_string())?;
         let (over, under): (Vec<_>, Vec<_>) = off.iter().partition(|(_, off)| off.over());
-        let listed = |offs: &[&(String, Off)]| -> String {
+        let listed = |offs: &[&(blaze_mem::String<Global>, Off)]| -> String {
             offs.iter().map(|(lint, off)| format!("\n  {lint}: {off}")).collect::<Vec<_>>().concat()
         };
-        if !over.is_empty() {
-            let then = match bless {
-                true => "; a bless only lowers a baseline, so nothing was written",
-                false => "",
-            };
-            return Err(format!(
+        let over_said = |then: &str| {
+            format!(
                 "the run's findings are over the baselines in {shown}, which may only shrink (AGENTS.md rule \
                  fix-through-blaze-lints): fix the findings the change added (`blaze check --fix` makes the \
                  machine-applicable ones). A lint with no baseline is fixed, set to `deny`, or, when its \
                  findings are being moved off, started with `--new-baseline LINT`{then}:{}",
                 listed(&over)
-            ));
-        }
+            )
+        };
         if bless {
-            let blessed = baseline::bless(&dir, &self.counts).map_err(|it| it.to_string())?;
+            // Each count the run measured is lowered to it, the counts over their baselines and
+            // the crates it did not measure kept as they are: one finding over, or one broken
+            // unit, holds no other crate's count back. The command still fails on either.
+            let blessed = baseline::bless(&dir, &self.counts, unmeasured, Global)
+                .map_err(|it| it.to_string())?;
             said.extend(blessed.into_iter().map(|(lint, blessed)| match blessed {
                 Blessed::Lowered => format!("{lint}: baseline lowered to this run's counts"),
                 Blessed::Emptied => format!(
@@ -161,7 +232,45 @@ impl Counted {
                      workspace's `lints-ratchet` denies it; elsewhere set it to `deny`"
                 ),
             }));
-            return Ok(said);
+            if over.is_empty() && unmeasured.crates.is_empty() {
+                return Ok(said);
+            }
+            // The error's text, on the heap once: the command fails with it.
+            let mut failed = blaze_mem::String::new_in(Global);
+            if !over.is_empty() {
+                failed.push_str(&over_said(
+                    "; a bless only lowers a baseline, so these stay as they are and every other count \
+                     the run measured was recorded",
+                ));
+            }
+            if !unmeasured.crates.is_empty() {
+                if !failed.is_empty() {
+                    failed.push('\n');
+                }
+                blaze_mem::format_into!(
+                    &mut failed,
+                    "the run did not complete the check of {} crate(s), which the baselines in {shown} keep \
+                     as they hold them (`unmeasured` stays so): every other crate's count was recorded. Fix \
+                     what stopped each and bless again:{}",
+                    unmeasured.crates.len(),
+                    UnmeasuredLines(unmeasured)
+                );
+            }
+            for it in &said {
+                blaze_mem::format_into!(&mut failed, "\n  recorded: {it}");
+            }
+            return Err(failed.as_str().to_owned());
+        }
+        if !over.is_empty() {
+            return Err(over_said(""));
+        }
+        if !unmeasured.crates.is_empty() {
+            return Err(format!(
+                "the run did not complete the check of {} crate(s), so their counts were not compared with \
+                 the baselines in {shown}:{}",
+                unmeasured.crates.len(),
+                UnmeasuredLines(unmeasured)
+            ));
         }
         if !under.is_empty() {
             return Err(format!(
@@ -171,6 +280,30 @@ impl Counted {
             ));
         }
         Ok(said)
+    }
+}
+
+/// Each crate a run left unmeasured with why, a line each, written where the error is.
+struct UnmeasuredLines<'a>(&'a Unmeasured);
+
+impl fmt::Display for UnmeasuredLines<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (krate, why) in &self.0.crates {
+            write!(f, "\n  `{krate}`: {why}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Each of `0` on a line of its own, written where the error is.
+struct Lines<'a, T>(&'a [T]);
+
+impl<T: fmt::Display> fmt::Display for Lines<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for it in self.0 {
+            write!(f, "\n  {it}")?;
+        }
+        Ok(())
     }
 }
 
@@ -217,7 +350,7 @@ mod tests {
         let grew = grew.finish(&root, "b", T, true, &[]).unwrap_err();
         assert!(
             grew.contains("`a`: 3 findings, over the baseline's 2")
-                && grew.contains("nothing was written"),
+                && grew.contains("these stay as they are"),
             "{grew}"
         );
         let unbaselined = counted(&[
@@ -296,5 +429,41 @@ mod tests {
             error.contains("no unit") && error.contains("blaze::wall_clock at src/a.rs"),
             "{error}"
         );
+    }
+
+    /// A failed run's bless records the crates it checked whole and keeps the ones a failure
+    /// cut short (the failed unit's and those behind it), naming each, and fails.
+    #[test]
+    fn a_bless_of_a_failed_run_records_what_it_measured_and_names_the_rest() {
+        let made = blaze_core::temp::TempDir::for_test("blaze-clippy-partial-");
+        let root = made.path().to_owned();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("b/TARGET"), format!("{T}\n")).unwrap();
+        let file = root.join("b/blaze.nopanic.txt");
+        std::fs::write(&file, "a\tunmeasured\np\tunmeasured\nq\t7\n").unwrap();
+        let mut run = counted(&[("blaze::nopanic", "a", 3), ("blaze::nopanic", "p", 1)]);
+        run.unchecked(&Unchecked {
+            open: Vec::new(),
+            tests: Vec::new(),
+            behind: vec![blaze_api::Behind {
+                id: Some(4),
+                why: "blaze panicked".to_owned(),
+                unit: "p v0.0.0 (lib)".to_owned(),
+                units: vec!["q v0.0.0 (lib)".to_owned()],
+            }],
+            stopped: false,
+        });
+        let error = run.finish(&root, "b", T, true, &[]).unwrap_err();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\t3\np\tunmeasured\nq\t7\n");
+        assert!(
+            error.contains("`p`: it failed: blaze panicked")
+                && error.contains("`q`: `q v0.0.0 (lib)` was not checked behind `p v0.0.0 (lib)`")
+                && error.contains("recorded: blaze::nopanic: baseline lowered"),
+            "{error}"
+        );
+        // Without the failure the same counts are a whole run's: `q` at 0 is dropped.
+        let whole = counted(&[("blaze::nopanic", "a", 3), ("blaze::nopanic", "p", 1)]);
+        whole.finish(&root, "b", T, true, &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\t3\np\t1\n");
     }
 }

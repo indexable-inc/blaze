@@ -962,8 +962,15 @@ pub struct Refused {
 /// reached the store) or [`Claim::give_back`] (it did not, said so).
 #[blaze::linear]
 pub struct Claim<'db> {
-    pub steps: Vec<(DefWithBodyId, Step, SchemaHash)>,
+    /// Each claimed step's body, live in the claiming database's snapshot ([`claim_keeps`]).
+    pub steps: Vec<(blaze_memo::Live<'db, DefWithBodyId>, Step, SchemaHash)>,
     pub refused: Vec<Refused>,
+    /// Traces of a body of an arena making the snapshot holds a later one of: dropped from the
+    /// table, kept by no keep (an older snapshot still answering would have been their keeper).
+    pub superseded: usize,
+    /// Traces of a body of an arena making the snapshot does not hold yet: left for a later
+    /// snapshot's keep.
+    pub elsewhere: usize,
     db: &'db Db,
     /// Each mark this claim made, with the trace it marked.
     marks: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Traced>)>,
@@ -1006,7 +1013,21 @@ impl Drop for Claim<'_> {
 /// a claim dropped without [`Claim::kept`] gives its runs back ([`Claim`]). The traces are
 /// taken under their lock, then the claims made under the posts' lock: never two at once, and
 /// neither across a wait. None where `db` has no item store installed.
+///
+/// The traces are the database's, kept across `Memo::next` and filled by the tasks of every
+/// snapshot still answering, so a trace may name a body of an arena `db`'s snapshot does not
+/// hold at that generation (a commit dropped it since, or made it after). Each is passed
+/// through `Memo::live` first: only a live body is claimed, as a [`blaze_memo::Live`] proof the
+/// keep takes, so no keep looks up an id of another snapshot's arena (until 2026-11-15 a keep
+/// of a later snapshot claimed such a trace and panicked in `def.krate(db)` with "arena 904.6
+/// is dead", gave the claim back, and the next keep panicked again). A trace of a making this
+/// snapshot holds a later one of, or of a spill id (`blaze_memo::Dead::superseded`), is no
+/// snapshot's from here on but an older one's still
+/// answering: it is dropped from the table and counted ([`Claim::superseded`]); one of a
+/// making this snapshot does not hold yet is left for a later snapshot's keep and counted
+/// ([`Claim::elsewhere`]).
 pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
+    let memo = blaze_memo::Database::memo(db);
     let claimed = with_store(db, |store| {
         // alloc: one claim's snapshot of the database's traces, a counted reference each
         let traced: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Traced>)> = store
@@ -1016,28 +1037,56 @@ pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
             .filter(|((_, step, _), _)| step.served())
             .map(|(key, ran)| (*key, Arc::clone(ran)))
             .collect();
+        // The traces of superseded makings this claim drops, a counted reference each.
+        let mut superseded: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Traced>), std::alloc::Global> =
+            Vec::new_in(std::alloc::Global);
+        let mut elsewhere = 0;
         let mut posted = store.served.lock();
         let (mut steps, mut refused, mut marks) = (Vec::new(), Vec::new(), Vec::new());
         for (key, ran) in traced {
+            let (def, step, schema) = key;
+            let live = match memo.live(def) {
+                Ok(live) => live,
+                Err(dead) if dead.superseded() => {
+                    superseded.push((key, ran));
+                    continue;
+                }
+                Err(_) => {
+                    elsewhere += 1;
+                    continue;
+                }
+            };
             if posted.kept.get(&key).is_some_and(|it| Arc::ptr_eq(it, &ran)) {
                 continue;
             }
-            let (def, step, _) = key;
             match &*ran {
                 // alloc: the refusal's text, named to the driver
                 Traced::Refused(refusal) => refused.push(Refused { def, step, why: format!("{refusal:?}") }),
-                Traced::Kept { .. } => steps.push(key),
+                Traced::Kept { .. } => steps.push((live, step, schema)),
             }
             // clone: a counted reference, the mark and the claim's record of it
             posted.kept.insert(key, Arc::clone(&ran));
             marks.push((key, ran));
         }
-        (steps, refused, marks)
+        for (key, _) in &superseded {
+            posted.kept.remove(key);
+        }
+        drop(posted);
+        // The traces' lock alone, after the posts' (never two at once, rule 27): a trace
+        // replaced since (a run of an older snapshot of the same id) is that run's, and stays.
+        let mut traces = store.traces.lock();
+        for (key, ran) in &superseded {
+            if traces.get(key).is_some_and(|it| Arc::ptr_eq(it, ran)) {
+                traces.remove(key);
+            }
+        }
+        drop(traces);
+        (steps, refused, marks, superseded.len(), elsewhere)
     });
     // Made out here: a `Claim` is linear, and neither `with_store`'s result parameter nor a
     // closure given to `Option::map` may give one back (crates/hir-ty-linear, rule 4).
-    let (steps, refused, marks) = claimed?;
-    Some(Claim { steps, refused, db, marks })
+    let (steps, refused, marks, superseded, elsewhere) = claimed?;
+    Some(Claim { steps, refused, superseded, elsewhere, db, marks })
 }
 
 /// One producer's word on one kind of read: the key ([`Read::key`], as an entry wrote it:
