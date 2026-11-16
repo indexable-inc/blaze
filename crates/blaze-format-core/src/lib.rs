@@ -301,33 +301,28 @@ unsafe impl<T: Record, const N: usize> Record for [T; N] {
 }
 
 /// A reference to a `T` elsewhere in the same buffer: its offset from this field's own
-/// address, in bytes. 0 is no `T`.
+/// address, in bytes, an `O` ([`Offset`]: `i32`, or `i16` or `i8` for a target close behind).
+/// 0 is no `T`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
-pub struct Rel<T> {
-    pub offset: i32,
+pub struct Rel<T, O: Offset = i32> {
+    pub offset: O,
     of: PhantomData<fn() -> T>,
 }
 
-/// `len` `T`s in a row elsewhere in the same buffer, starting `offset` bytes from this field.
+/// `len` `T`s in a row elsewhere in the same buffer, starting `offset` bytes from this field:
+/// an `i32` and a `u32` by default, an `i16` and a `u16` or an `i8` and a `u8` ([`Offset`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
-pub struct Slice<T> {
-    pub offset: i32,
-    pub len: u32,
+pub struct Slice<T, O: Offset = i32> {
+    pub offset: O,
+    pub len: O::Len,
     of: PhantomData<fn() -> T>,
 }
 
-/// UTF-8 bytes in the buffer.
+/// Bytes in the buffer, read as text by [`Slice::as_str`], which checks they are UTF-8 on each
+/// read; a [`Text`] is checked once, by [`open`].
 pub type Str = Slice<u8>;
-
-/// The offset from a field at `field_at` to a target at `target_at`, both from the buffer's
-/// start, the target written before the field.
-fn offset(field_at: u64, target_at: u64) -> i32 {
-    assert!(target_at <= field_at, "a reference to bytes written after it");
-    i32::try_from(target_at as i64 - field_at as i64)
-        .expect("a reference across more than 2 GiB of one buffer")
-}
 
 /// Where `field` is in `buffer`, from its start.
 fn position<F>(field: &F, buffer: &[u8]) -> Result<u64, FormatError> {
@@ -340,18 +335,23 @@ fn position<F>(field: &F, buffer: &[u8]) -> Result<u64, FormatError> {
 }
 
 /// Where `count` `T`s that a field at `field_at` points `offset` bytes away from start, from
-/// the buffer's start: after the header, before the field, aligned for `T`.
-fn target<T>(field_at: u64, offset: i32, count: u32, buffer: &[u8]) -> Result<usize, FormatError> {
+/// the buffer's start: after the header, before the field, aligned for `T`. What [`open`]'s
+/// walk checks of every reference it reaches, so a [`Verified`] reads them with no check.
+fn target<T>(field_at: u64, offset: i64, count: u64, buffer: &[u8]) -> Result<usize, FormatError> {
     let bad = FormatError::OutOfBounds { at: field_at };
-    let target = field_at as i64 + offset as i64;
+    let target = field_at as i64 + offset;
     if target < HEADER_LEN as i64 {
         return Err(bad);
     }
     let target = target as u64;
-    let len = (size_of::<T>() as u64)
-        .checked_mul(count as u64)
-        .ok_or(FormatError::OutOfBounds { at: field_at })?;
-    if target.checked_add(len).is_none_or(|end| end > field_at) {
+    let len =
+        (size_of::<T>() as u64).checked_mul(count).ok_or(FormatError::OutOfBounds { at: field_at })?;
+    // The bound a [`Verified`] relies on to read a target inside the bytes before its field.
+    let bound = match planted::forward() {
+        false => field_at,
+        true => buffer.len() as u64,
+    };
+    if target.checked_add(len).is_none_or(|end| end > bound) {
         return Err(bad);
     }
     let address = (buffer.as_ptr() as usize).wrapping_add(target as usize);
@@ -361,22 +361,23 @@ fn target<T>(field_at: u64, offset: i32, count: u32, buffer: &[u8]) -> Result<us
     }
 }
 
-impl<T> Rel<T> {
-    pub const NONE: Rel<T> = Rel { offset: 0, of: PhantomData };
+impl<T, O: Offset> Rel<T, O> {
+    pub const NONE: Rel<T, O> = Rel { offset: O::ZERO, of: PhantomData };
 
     /// The reference a field at `field_at` holds to a `T` at `target_at`, both from the
-    /// buffer's start: the `T` was written before the record holding the field.
-    pub fn between(field_at: u64, target_at: u64) -> Rel<T> {
-        assert!(target_at < field_at, "a reference to bytes written after it");
-        Rel { offset: offset(field_at, target_at), of: PhantomData }
+    /// buffer's start: the `T` was written before the record holding the field. Refused when
+    /// it was not, or when the distance does not fit an `O`.
+    pub fn between(field_at: u64, target_at: u64) -> Result<Rel<T, O>, Unfit> {
+        let offset = offset::offset_between::<O>(field_at, target_at, true)?;
+        Ok(Rel { offset, of: PhantomData })
     }
 
     pub fn is_none(&self) -> bool {
-        self.offset == 0
+        self.offset == O::ZERO
     }
 }
 
-impl<T: Record> Rel<T> {
+impl<T: Record, O: Offset> Rel<T, O> {
     /// The `T` this points at, `None` for [`Rel::NONE`]. Panics when `buffer` is not the
     /// buffer this field is in, or the `T` is not a valid one there: a buffer from [`open`]
     /// was checked whole, so this checks again only what a reference itself holds.
@@ -396,31 +397,39 @@ impl<T: Record> Rel<T> {
         &'a self,
         buffer: &'a [u8],
     ) -> Result<Option<&'a T>, FormatError> {
-        if self.offset == 0 {
+        if self.offset == O::ZERO {
             return Ok(None);
         }
         let at = position(self, buffer)?;
-        let target = target::<T>(at, self.offset, 1, buffer)?;
+        let target = target::<T>(at, self.offset.distance(), 1, buffer)?;
         raw::view::<T, DEEP>(&buffer[target..target + size_of::<T>()], buffer).map(Some)
     }
 }
 
-impl<T> Slice<T> {
-    pub const EMPTY: Slice<T> = Slice { offset: 0, len: 0, of: PhantomData };
+impl<T, O: Offset> Slice<T, O> {
+    pub const EMPTY: Slice<T, O> = Slice { offset: O::ZERO, len: O::LEN_ZERO, of: PhantomData };
 
     /// The slice a field at `field_at` holds of `len` `T`s at `target_at`, both from the
-    /// buffer's start: the `T`s were written before the record holding the field.
-    pub fn between(field_at: u64, target_at: u64, len: usize) -> Slice<T> {
-        let len = u32::try_from(len).expect("a slice of 2^32 values or more");
-        Slice { offset: offset(field_at, target_at), len, of: PhantomData }
+    /// buffer's start: the `T`s were written before the record holding the field. Refused
+    /// when they were not, or when the distance or the length does not fit an `O`.
+    pub fn between(field_at: u64, target_at: u64, len: usize) -> Result<Slice<T, O>, Unfit> {
+        let long = Unfit::Long { field_at, len: len as u64, offset: O::NAME };
+        let len = O::of_count(len as u64).ok_or(long)?;
+        let offset = offset::offset_between::<O>(field_at, target_at, false)?;
+        Ok(Slice { offset, len, of: PhantomData })
+    }
+
+    /// How many `T`s.
+    pub fn count(&self) -> usize {
+        O::count(self.len) as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len == O::LEN_ZERO
     }
 }
 
-impl<T: Record> Slice<T> {
+impl<T: Record, O: Offset> Slice<T, O> {
     /// The `T`s this points at. Panics as [`Rel::get`] does.
     pub fn get<'a>(&'a self, buffer: &'a [u8]) -> &'a [T] {
         self.follow(buffer).unwrap_or_else(|error| panic!("{error}"))
