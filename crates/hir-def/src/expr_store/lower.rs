@@ -3302,7 +3302,7 @@ impl<'db> ExprCollector<'db> {
                 let resolver = |path: &ModPath, ctx: SyntaxContext| {
                     // Where a `macro`'s def-site hygiene says the path is looked up: here, or
                     // a typed stop.
-                    let Hygienic::Here = hygienic_origin(self.db, self.module, HygieneId::new(ctx));
+                    let Hygienic::Here = hygienic_origin(self.db, self.expander.current_file_id().context_arena(), self.module, HygieneId::new(ctx));
                     // A one-segment path is looked up in the `macro_rules!` textual scope at
                     // the call (the body's own definitions before it, then the module's
                     // `TextualEntry`, its earlier definitions and the `#[macro_use]` prelude),
@@ -4457,7 +4457,7 @@ impl<'db> ExprCollector<'db> {
         }
         // blaze: `5u3` under `#![blaze::arbitrary_ints]`; every other crate reads the suffix
         // as rustc does (docs/v2/plan/design/arbitrary-ints.md).
-        if self.features().blaze_arbitrary_ints
+        if self.def_map.arbitrary_ints(self.db)
             && let ast::LiteralKind::IntNumber(int) = kind
             && let Some(suffix) = int.suffix()
         {

@@ -16,7 +16,8 @@ use crate::locals::{AnyItem, Local, LocalTable};
 use crate::module_decls::ModuleDeclsView;
 use crate::module_scope::ScopeView;
 use crate::macro_def::MacroDefView;
-use crate::names::{CrateRootView, ModuleFileView, TextualEntryView};
+use crate::crate_root::CrateRootView;
+use crate::names::{ModuleFileView, TextualEntryView};
 use crate::proof::HasText;
 
 /// What may be asked of any crate's items: every method reads records, and none can reach

@@ -1,0 +1,34 @@
+[package]
+name = "blaze-cli"
+description = "The `blaze` binary on the new item layer (docs/v2/plan/design/drive.md, \"The system side\"): `check`, `run` and `test` as one blaze-drive request each, its effects performed through bstd (the sweep, the store, the tasks, printing, the profile)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "blaze"
+path = "src/main.rs"
+test = false
+doctest = false
+
+[dependencies]
+# The request machine, its records and keys, the line table and the profile.
+blaze-drive.workspace = true
+# The system, reached only through bstd: the files, the output, the host's core count, frames.
+blaze-std.workspace = true
+# `outline`: a file's text to its items, the `FileItems` task's work.
+blaze-file-items.workspace = true
+# `Edition`, `ItemDetail`, `ItemKind`: the outline's value types.
+blaze-surface.workspace = true
+# `ContentId`: file and item digests. By path: the workspace entry turns on serde adapters.
+blaze-ids = { path = "../blaze-ids" }
+# Vec, SortedMap, VecDeque in the command's frame.
+blaze-own.workspace = true
+
+[lints]
+workspace = true

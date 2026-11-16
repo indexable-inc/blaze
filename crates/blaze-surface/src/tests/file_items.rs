@@ -11,10 +11,10 @@ use blaze_sim::{Broke, Config, Tape};
 use super::{file, name, small};
 use crate::error::BuildError;
 use crate::file_items::{
-    Attr, AttrKind, AttrSpan, ErrorOrigin, FileItems, FileItemsView, Item, ItemDetail, Rename,
-    SyntaxError,
+    Attr, AttrKind, AttrSpan, ErrorOrigin, FileItems, FileItemsView, Item, ItemDetail, SyntaxError,
 };
 use crate::kind::{ItemIndex, Range, WrittenVis};
+use crate::path::Rename;
 
 /// A range inside an entry `len` bytes long.
 fn range_in(tape: &Tape, len: u32) -> Range {
@@ -32,9 +32,9 @@ fn detail(tape: &Tape, len: u32) -> ItemDetail {
         1 => ItemDetail::Mod { inline: tape.coin("inline"), path: maybe(tape, len, "path") },
         2 => ItemDetail::ExternCrate {
             rename: match tape.below(3, "rename") {
-                0 => None,
-                1 => Some(Rename::Name(range_in(tape, len))),
-                _ => Some(Rename::Underscore),
+                0 => Rename::Same,
+                1 => Rename::To(range_in(tape, len)),
+                _ => Rename::Underscore,
             },
         },
         3 => ItemDetail::MacroCall { path: maybe(tape, len, "path"), input: maybe(tape, len, "input") },

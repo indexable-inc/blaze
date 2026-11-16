@@ -5,11 +5,16 @@
 //! `assemble_inherent_candidates_from_param`) and method/confirm.rs (`confirm`,
 //! `adjust_self_ty`, `instantiate_method_args`); Relax maps them in typeck/method.rs.
 //!
-//! The order is rustc's: the receiver is checked with no expectation and resolved structurally
-//! (E0282 on a variable: a method call is never deferred). The steps are its autoderef steps,
-//! then `[T]` when the last is an array. At each step, by value, then `&`, then `&mut`; at each
-//! of those, the inherent candidates (the step's inherent impls, and the bound traits of a
-//! parameter) before the extension candidates (the traits in scope). Two applicable candidates
+//! The order is rustc's, checked against Relax's line-for-line port of probe.rs @8d1a764
+//! (types/src/typeck/probe.rs: `method_autoderef_steps`, `assemble_probe_candidates`,
+//! `pick_all_method`): the receiver is checked with no expectation and resolved structurally
+//! (E0282 on a variable: a method call is never deferred). The steps are its autoderef steps;
+//! an array step is followed by its `[T]` step and autoderef stops there (an array does not
+//! deref, so this is the last step). The inherent candidates of every step (the steps' inherent
+//! impls, and the bound traits of a parameter) are assembled once, before any is tried. At each
+//! step, by value (a reborrow at a reference step; not on the `[T]` step), then `&`, then
+//! `&mut`; at each of those, the inherent candidates before the extension candidates (the
+//! traits in scope). Two applicable candidates
 //! in one group is E0034; none at all is E0599. Confirmation re-instantiates the pick for real,
 //! records the receiver's adjustments (derefs, the autoref with two-phase for `&mut`, the
 //! unsize), the callee, the method's where-clauses and the trait obligation, then checks the
@@ -117,16 +122,22 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
                 }
             }
         }
+        // The inherent candidates of every step, assembled once before any is tried
+        // (`assemble_inherent_candidates` over all steps, as Relax's `assemble_probe_candidates`):
+        // an inherent `fn m(&self)` of `Foo` is found by value at the `&Foo` step, before any
+        // extension candidate of `&Foo`.
         let mut not_method = false;
         let mut inh: Vec<Cand, A> = Vec::new_in(self.alloc.clone());
         let mut bounds: Vec<ItemKey, A> = Vec::new_in(self.alloc.clone());
         for i in 0..steps.len() {
             let step = steps[i];
-            inh.clear();
             if let Some(shape) = self.shape(step.ty) {
                 for it in self.reads.inherent(shape, name)? {
                     if let AssocKind::Fn { self_param } = it.kind {
-                        inh.push(Cand { container: it.container, item: it.item, trait_: None, is_method: self_param });
+                        let c = Cand { container: it.container, item: it.item, trait_: None, is_method: self_param };
+                        if !inh.iter().any(|x| x.item == c.item) {
+                            inh.push(c);
+                        }
                     }
                 }
             }
@@ -136,11 +147,17 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
                 for &tr in bounds.iter() {
                     if let Some(it) = self.reads.assoc_item(tr, name)? {
                         if let AssocKind::Fn { self_param } = it.kind {
-                            inh.push(Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param });
+                            let c = Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param };
+                            if !inh.iter().any(|x| x.item == c.item) {
+                                inh.push(c);
+                            }
                         }
                     }
                 }
             }
+        }
+        for i in 0..steps.len() {
+            let step = steps[i];
             let unsize = unsize_at == Some(i);
             for autoref in [None, Some(Mutbl::Not), Some(Mutbl::Mut)] {
                 if unsize && autoref.is_none() {
@@ -162,7 +179,7 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
                             not_method = true;
                             continue;
                         }
-                        if self.probe(|m| m.instantiate_method(c, step.ty, adjusted, None))?.is_some() {
+                        if self.probe(|m| m.instantiate_method(c, adjusted, None))?.is_some() {
                             count += 1;
                             if found.is_none() {
                                 found = Some(c);
@@ -195,17 +212,19 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
         Ok(if self.unify(impl_self, self_ty)? { Some(args) } else { None })
     }
 
-    /// Instantiates candidate `c` at a step of type `self_ty`, its `self` parameter unified
-    /// with `adjusted`: the parent's arguments and all of them, or `None` when it does not
-    /// apply. With `seg`, the method's own arguments are the written ones (confirmation);
+    /// Instantiates candidate `c` with fresh parent arguments (an impl's, or a trait's `Self`)
+    /// and its `self` parameter unified with `adjusted` (probe.rs `xform_self_ty` against the
+    /// receiver, `consider_probe`): the parent's arguments and all of them, or `None` when it
+    /// does not apply. A candidate is so matched at every step, whichever step it was assembled
+    /// from. With `seg`, the method's own arguments are the written ones (confirmation);
     /// without, fresh (the probe, where no diagnostic may be made).
     fn instantiate_method(
         &mut self,
         c: Cand,
-        self_ty: Ty,
         adjusted: Ty,
         seg: Option<(At, Segment)>,
     ) -> Result<Option<(TyList, TyList)>, Stop> {
+        let self_ty = self.fresh()?;
         let parent = match c.trait_ {
             None => match self.impl_args(c.container, self_ty)? {
                 Some(a) => a,
@@ -239,13 +258,22 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
             None => step_ty,
             Some(m) => self.mk(TyView::Ref(m, step_ty))?,
         };
-        let Some((parent, args)) = self.instantiate_method(pick.cand, step_ty, adjusted, Some((At::Expr(e), seg)))? else {
+        let Some((parent, args)) = self.instantiate_method(pick.cand, adjusted, Some((At::Expr(e), seg)))? else {
             return Ok(None);
         };
         // The receiver's adjustments: derefs to the step (to the array before an unsize), the
         // autoref, the unsize.
         let last_deref = if pick.unsize { pick.step - 1 } else { pick.step };
         self.adjust_autoderef(receiver, &pick.steps, last_deref);
+        // A by-value pick at a `&T` or `&mut T` step reborrows: one more deref and the borrow
+        // again (probe.rs `pick_by_value_method`; Relax's `pick_all_method`, adjustment 0).
+        if pick.autoref.is_none() && !pick.unsize {
+            if let TyView::Ref(m, inner) = self.view(step_ty) {
+                self.adjust.push((receiver, AdjustKind::Deref { overloaded: None }, inner));
+                let kind = AdjustKind::Borrow { mutbl: m, two_phase: m == Mutbl::Mut, raw: false };
+                self.adjust.push((receiver, kind, step_ty));
+            }
+        }
         if let Some(m) = pick.autoref {
             let base = pick.steps[last_deref].ty;
             let borrowed = self.mk(TyView::Ref(m, base))?;

@@ -4,8 +4,10 @@
 //! `!` becomes any type (`NeverToAny`, the target recorded as diverging when it is a variable);
 //! from an unresolved variable, unify; then `coerce_unsized` in its own snapshot; then by the
 //! target (`coerce_raw_ptr`, `coerce_borrowed_pointer`); then by the source (`coerce_from_fn_item`;
-//! a fn pointer or closure source unifies here); else unify. Relax maps it in typeck.rs
-//! (`coerce`, `deref_coercion`, `unsize_coercion`) and typeck/coerce_unsized.rs.
+//! a fn pointer or closure source unifies here); else unify. Unsizing first was checked against
+//! Relax's port of coercion.rs @8d1a764: types/src/typeck.rs `coerce` ("coercion.rs coerce:
+//! unsizing is tried first": never, then `coerce_unsized`, then the reference arms, then fn
+//! items) and types/src/typeck/coerce_unsized.rs (`coerce_unsized`).
 //!
 //! First cut, said where it differs: unsizing is the builtin `[T; N]` to `[T]` behind a
 //! reference or pointer (the general form is `CoerceUnsized` obligations through the solver,

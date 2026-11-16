@@ -34,6 +34,7 @@ use core::fmt;
 
 use blaze_format::FormatError;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
+use blaze_int::{Int, idx};
 
 use blaze_surface::{
     BucketHash, BucketKey, BucketView, CrateFlags, CrateGraphView, CrateIndex, DirectoryView, ImplRow,
@@ -188,7 +189,7 @@ impl<'g> Reach<'g> {
                 while bits != 0 {
                     let bit = bits.trailing_zeros();
                     bits &= bits - 1;
-                    let at = CrateIndex::of_bit(w * 64 + bit as usize);
+                    let at = CrateIndex::of_bit(w * 64 + bit.widen_to::<usize>());
                     let asked = Some(at) == def
                         || Some(at) == from
                         || (lang && graph.flags(at).contains(CrateFlags::LANG));
@@ -310,7 +311,7 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
     fn next_holder(&mut self) -> Option<CrateIndex> {
         loop {
             if self.bits != 0 {
-                let bit = self.bits.trailing_zeros() as usize;
+                let bit = self.bits.trailing_zeros().widen_to::<usize>();
                 self.bits &= self.bits - 1;
                 return Some(CrateIndex::of_bit((self.word - 1) * 64 + bit));
             }
@@ -378,7 +379,7 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
             }
             // A crate that cannot name the shape's definition holds none of the shape's impls,
             // only blanket ones.
-            let bit = at.get() as usize;
+            let bit = idx(at.get());
             let names_shape = self.first_in.is_none_or(|row| row[bit / 64] & (1 << (bit % 64)) != 0);
             let next_want = if names_shape { 0 } else { 1 };
             self.current = Some(InCrate { krate, filter, directory: None, next_want, bucket: None });

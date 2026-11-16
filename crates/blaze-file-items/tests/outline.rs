@@ -178,7 +178,7 @@ fn each_item_form_has_its_kind_name_and_ranges() {
     assert_eq!(file_attrs, [(true, AttrKind::Doc), (true, AttrKind::Other)]);
 
     let (_, heap) = named(&outline, text, "alloc");
-    let ItemDetail::ExternCrate { rename: Some(Rename::Name(rename)) } = heap.detail else {
+    let ItemDetail::ExternCrate { rename: Rename::To(rename) } = heap.detail else {
         panic!("`extern crate alloc as heap` renames: {:?}", heap.detail)
     };
     assert_eq!(heap.text(text, rename), "heap");

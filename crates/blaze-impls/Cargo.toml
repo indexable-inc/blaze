@@ -18,6 +18,8 @@ doctest = false
 blaze-format.workspace = true
 # `ItemKey`, `CrateItemKey`, `ContentId`, `Portable`: what every record names an item and a crate by.
 blaze-id.workspace = true
+# Integer conversions that say what they do: a bit's place widened to an index.
+blaze-int.workspace = true
 # The records the lookups read (`CrateGraphView`, `NoImplsOfView`, `DirectoryView`,
 # `BucketView`, `LangItemsView`), their builders and their row types: one home, re-exported.
 blaze-surface.workspace = true

@@ -1855,7 +1855,7 @@ pub fn include_macro_invoc<'db>(
         found.extend(
             crate_def_map(db, krate)
                 .modules(db)
-                .flat_map(|(_, m)| m.scope(db).iter_macro_invoc())
+                .flat_map(|(_, m)| m.scope(db).iter_macro_invoc(db))
                 .filter_map(|(_, &invoc)| {
                     invoc.loc(db).include_file_id(db, invoc).map(|x| (invoc, x))
                 }),

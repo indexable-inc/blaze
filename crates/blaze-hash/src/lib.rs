@@ -46,6 +46,8 @@
 
 #![no_std]
 #![feature(allocator_ext)]
+// `#[may_dangle]` on the table's drop, as std's and hashbrown's tables have.
+#![feature(dropck_eyepatch)]
 // blaze's lints (`blaze::trust`) name their tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]

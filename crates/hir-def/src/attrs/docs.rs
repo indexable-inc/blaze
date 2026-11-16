@@ -703,7 +703,7 @@ pub(crate) fn expand_attr_value<'db>(
     value: InFile<ast::Expr<'_>>,
 ) -> Option<String> {
     let file_id = value.file_id;
-    let recursion_limit = resolver.top_level_def_map().recursion_limit();
+    let recursion_limit = resolver.top_level_def_map().recursion_limit(db);
     let mut expander = DocMacroExpander {
         db,
         krate,
@@ -755,7 +755,7 @@ fn extend_with_attrs<'a, 'db>(
                                 let exp = expander.get_or_insert_with(|| {
                                     let resolver = make_resolver();
                                     let def_map = resolver.top_level_def_map();
-                                    let recursion_limit = def_map.recursion_limit();
+                                    let recursion_limit = def_map.recursion_limit(db);
                                     DocMacroExpander {
                                         db,
                                         krate,

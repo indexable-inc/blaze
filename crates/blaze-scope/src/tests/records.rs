@@ -18,10 +18,10 @@ use crate::resolver::Plant;
 use crate::{RecordFacts, ResolveError, ScopeBuilder};
 
 /// Every record of `w`'s modules and crates: one surface per crate.
-fn surfaces(w: &World) -> Result<Vec<(CrateItemKey, MemSurface)>, String> {
-    let mut out: Vec<(CrateItemKey, MemSurface)> = Vec::new();
+fn surfaces(w: &World) -> Result<Vec<(CrateItemKey, MemSurface<Global>)>, String> {
+    let mut out: Vec<(CrateItemKey, MemSurface<Global>)> = Vec::new();
     for (&krate, cr) in w.roots.iter() {
-        let mut mem = MemSurface::new(krate);
+        let mut mem = MemSurface::new_in(krate, Global);
         let bytes = cr.write(Global).map_err(|e| format!("the CrateRoot of {krate:x}: {e}"))?;
         mem.insert(Fact::CrateRoot, &bytes).map_err(|e| format!("the CrateRoot of {krate:x}: {e}"))?;
         out.push((krate, mem));
@@ -75,7 +75,7 @@ fn record_facts_resolve_as_the_working_forms_do() {
         let (_, mem) = by_crate.pop().unwrap_or_else(|| panic!("fixture {i}: one crate"));
         // `RecordFacts` names are the records' text, borrowed for the surface's life: the test
         // keeps the surface for the whole run.
-        let mem: &'static MemSurface = Box::leak(Box::new(mem));
+        let mem: &'static MemSurface<Global> = Box::leak(Box::new(mem));
         let facts = RecordFacts::new_in(mem, Global);
         let want = solve(w, None, Plant::None).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
         match solve_with(w, &facts, None, Plant::None) {
@@ -110,7 +110,7 @@ fn a_record_missing_a_declaration_is_seen() {
     cut.uses.truncate(1);
     let bytes = cut.write(k.root, &w.modules[&k.root], Global).unwrap_or_else(|e| panic!("{e}"));
     mem.insert(Fact::ModuleDecls, &bytes).unwrap_or_else(|e| panic!("{e}"));
-    let mem: &'static MemSurface = Box::leak(Box::new(mem));
+    let mem: &'static MemSurface<Global> = Box::leak(Box::new(mem));
     let facts = RecordFacts::new_in(mem, Global);
     let want = solve(&w, None, Plant::None).unwrap_or_else(|e| panic!("{e}"));
     let got = solve_with(&w, &facts, None, Plant::None).unwrap_or_else(|e| panic!("{e}"));

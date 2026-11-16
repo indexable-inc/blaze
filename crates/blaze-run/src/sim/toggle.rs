@@ -69,7 +69,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                 Effect::Make { .. } | Effect::NoStart(_) | Effect::Stop(_) => {
                     return Err(Broke::Harness(format!("{effect:?} with no failure and nothing lacking")));
                 }
-                Effect::Begin | Effect::Say(_) => {}
+                Effect::Begin | Effect::Say(_) | Effect::WriteImage => {}
             }
         }
         for at in 0..FUNCTIONS as usize {

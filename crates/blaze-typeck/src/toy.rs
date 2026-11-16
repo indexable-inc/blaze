@@ -6,13 +6,14 @@
 //! where-clauses (an impl applies when its header unifies), coherence, auto traits, regions,
 //! occurs checks (the generated bodies cannot build a cyclic type).
 
+use blaze_hash::HashMap;
 use blaze_own::Vec;
-use core::hash::{Hash, Hasher};
 use std::alloc::Global;
 
 use crate::error::{CheckError, Limit, Malformed, Stop};
+use crate::hash::StableHasher;
 use crate::ids::{ItemKey, LangItem, List, Name, PathIdx, ScopeId};
-use crate::map::HashIndex;
+use crate::intern::ListIndex;
 use crate::portable::{PNode, PTy, PTys, PortableTys};
 use crate::ty::{FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 use crate::world::{
@@ -20,25 +21,11 @@ use crate::world::{
     Predicates, Question, Reads, Seal, Shape, TypeAttrs, Variant, World,
 };
 
-/// FNV-1a over `core::hash::Hash`, for the toy's interning only.
-struct Fnv(u64);
-
-impl Hasher for Fnv {
-    fn finish(&self) -> u64 {
-        self.0
+fn list_hash(tys: &[Ty]) -> u64 {
+    let mut h = StableHasher::new("toy.list");
+    for t in tys {
+        h.u32(t.0);
     }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= u64::from(b);
-            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
-        }
-    }
-}
-
-fn fnv(v: &impl Hash) -> u64 {
-    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
-    v.hash(&mut h);
     h.finish()
 }
 
@@ -57,9 +44,9 @@ pub(crate) struct Snap {
 
 pub(crate) struct ToyCtx {
     nodes: Vec<TyView, Global>,
-    node_index: HashIndex<Global>,
+    node_index: HashMap<TyView, u32, Global>,
     lists: Vec<Vec<Ty, Global>, Global>,
-    list_index: HashIndex<Global>,
+    list_index: ListIndex<Global>,
     /// Each variable's value, by index.
     vals: Vec<Option<Ty>, Global>,
     /// Each variable's own handle.
@@ -75,9 +62,9 @@ impl ToyCtx {
     pub(crate) fn new() -> ToyCtx {
         ToyCtx {
             nodes: Vec::new_in(Global),
-            node_index: HashIndex::new_in(Global),
+            node_index: HashMap::new_in(Global),
             lists: Vec::new_in(Global),
-            list_index: HashIndex::new_in(Global),
+            list_index: ListIndex::new_in(Global),
             vals: Vec::new_in(Global),
             var_ty: Vec::new_in(Global),
             undo: Vec::new_in(Global),
@@ -86,6 +73,11 @@ impl ToyCtx {
             errors: Vec::new_in(Global),
             errors_taken: 0,
         }
+    }
+
+    /// The obligations pending, for the snapshot test.
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     fn bind(&mut self, v: Var, t: Ty) {
@@ -419,14 +411,12 @@ impl TypeCtx for ToyCtx {
     type Snapshot = Snap;
 
     fn mk(&mut self, v: TyView) -> Result<Ty, CheckError> {
-        let h = fnv(&v);
-        let nodes = &self.nodes;
-        if let Some(i) = self.node_index.find(h, |i| nodes[i as usize] == v) {
+        if let Some(&i) = self.node_index.get(&v) {
             return Ok(Ty(i));
         }
         let at = u32::try_from(self.nodes.len()).map_err(|_| CheckError::Limit(Limit::Interner))?;
         self.nodes.push(v);
-        self.node_index.insert(h, at)?;
+        self.node_index.insert(v, at);
         Ok(Ty(at))
     }
 
@@ -435,16 +425,15 @@ impl TypeCtx for ToyCtx {
     }
 
     fn mk_list(&mut self, tys: &[Ty]) -> Result<TyList, CheckError> {
-        let h = fnv(&tys);
+        let h = list_hash(tys);
         let lists = &self.lists;
         if let Some(i) = self.list_index.find(h, |i| lists[i as usize].as_slice() == tys) {
             return Ok(TyList(i));
         }
-        let at = u32::try_from(self.lists.len()).map_err(|_| CheckError::Limit(Limit::Interner))?;
+        let at = self.list_index.push(h)?;
         let mut v = Vec::with_capacity_in(tys.len(), Global);
         v.extend_from_slice(tys);
         self.lists.push(v);
-        self.list_index.insert(h, at)?;
         Ok(TyList(at))
     }
 

@@ -18,9 +18,21 @@ pub mod origin;
 
 pub use origin::{ModuleOrigin, ModuleSourceView};
 
+/// The old boundary's names its readers still call, each a read of the crate's inputs.
+pub mod boundary {
+    use base_db::{Crate, Db};
+
+    /// The crate's blaze edition: an input of the crate ([`Crate::blaze_edition`]).
+    pub fn blaze_edition(db: &Db, krate: Crate) -> Option<span::BlazeEdition> {
+        krate.blaze_edition(db)
+    }
+}
+
 pub use def_site::{
-    assoc_item_is, assoc_item_key, impl_item_name, param_name, path_param_name, trait_item_name,
-    written_name,
+    assoc_item_binding_name, assoc_item_is, assoc_item_key, crate_table,
+    for_each_hygienic_trait_in_scope, impl_expansion, impl_item_name, implemented_name,
+    param_name, path_param_name, privacy_scope, trait_item_is_written, trait_item_name,
+    trait_item_written, variant_expansion, written_key, written_name,
 };
 
 use std::alloc::Global;
@@ -466,7 +478,7 @@ impl DefMap {
             RawVisibility::Module(path, explicitness, ctxt) => {
                 let path = visibility_path(path, self.krate.data(db).edition)?;
                 let hygiene = crate::expr_store::HygieneId::new(*ctxt);
-                let def_site::Hygienic::Here = def_site::hygienic_origin(db, original_module, hygiene);
+                let def_site::Hygienic::Here = def_site::hygienic_origin(db, def_site::crate_table(self.krate), original_module, hygiene);
                 let (result, remaining, _) =
                     resolve_path(db, original_module, &path, BuiltinShadowMode::Module, None);
                 if remaining.is_some() {

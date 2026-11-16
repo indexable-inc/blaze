@@ -148,7 +148,7 @@ struct Open {
     after_eq: bool,
     name: Option<Range>,
     visibility: WrittenVis<Range>,
-    rename: Option<Rename>,
+    rename: Option<Rename<Range>>,
     tree: Option<Range>,
     path: Option<Range>,
     input: Option<Range>,
@@ -569,10 +569,7 @@ impl<'t, 'l, A: Allocator + Clone> Walk<'t, 'l, A> {
             },
             USE => ItemDetail::Use { tree: open.tree.map(rel) },
             EXTERN_CRATE => ItemDetail::ExternCrate {
-                rename: open.rename.map(|rename| match rename {
-                    Rename::Name(name) => Rename::Name(rel(name)),
-                    Rename::Underscore => Rename::Underscore,
-                }),
+                rename: open.rename.map_or(Rename::Same, |rename| rename.map(rel)),
             },
             EXTERN_BLOCK => ItemDetail::ExternBlock { abi: open.abi.map(rel) },
             MACRO_RULES => ItemDetail::MacroRules {
@@ -785,10 +782,10 @@ fn visibility_of(tokens: &[Tok]) -> WrittenVis<Range> {
 }
 
 /// An `extern crate`'s rename from its tokens: `as`, then a name or `_`.
-fn rename_of(tokens: &[Tok]) -> Option<Rename> {
+fn rename_of(tokens: &[Tok]) -> Option<Rename<Range>> {
     match tokens.get(1) {
         Some(token) if token.kind == UNDERSCORE => Some(Rename::Underscore),
-        Some(token) => Some(Rename::Name(token.range)),
+        Some(token) => Some(Rename::To(token.range)),
         None => None,
     }
 }

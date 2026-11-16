@@ -313,6 +313,68 @@ fn a_need_then_reentry_equals_one_run() {
     });
 }
 
+/// What a probe or a failed `commit_if` may leave behind: a diagnostic, an error count, a
+/// queued variable, a pending obligation, a variable's binding. Each is written inside the
+/// snapshot and must be gone after; the committed case shows the test sees each write.
+#[test]
+fn a_rolled_back_snapshot_leaves_nothing_behind() {
+    use crate::diag::{At, DiagCode};
+    use crate::error::Stop;
+    use crate::machine::Machine;
+    use crate::ty::{Cause, Goal, Obligation, TyView, TypeCtx};
+    use crate::world::Reads;
+
+    let mut body = BodyBuf::new(Edition::E2021);
+    let root = body.expr(Expr::Lit(Lit::Int(None)));
+    let case = Case { structs: Vec::new_in(Global), params: Vec::new_in(Global), body, root };
+    let w = world(&case);
+    let view = case.body.view(w.owner, case.root);
+    let mut ty = ToyCtx::new();
+    let reads = Reads::new_in(&w, Global);
+    let mut m = match Machine::new_in(view, reads, &mut ty, Plant::None, Global) {
+        Ok(m) => m,
+        Err(e) => panic!("the machine could not be made: {e}"),
+    };
+    let var = match m.fresh() {
+        Ok(v) => v,
+        Err(e) => panic!("{e:?}"),
+    };
+    // Every undoable write a rule makes, then the variable's binding.
+    let write = |m: &mut Machine<'_, '_, '_, ToyWorld, ToyCtx, Global>| -> Result<Option<()>, Stop> {
+        m.diag(DiagCode::Mismatch, At::Body, None, None, None);
+        let n = m.fresh_int()?;
+        let unit = m.common.unit;
+        m.ty.register(Obligation { goal: Goal::WellFormed(unit), cause: Cause::Body })?;
+        m.unify(var, n)?;
+        Ok(Some(()))
+    };
+    let before = (m.diags.len(), m.errors, m.numeric.len(), m.ty.pending_len());
+    let left = |m: &mut Machine<'_, '_, '_, ToyWorld, ToyCtx, Global>| {
+        let resolved = m.ty.shallow_resolve(var);
+        let bound = !matches!(m.ty.view(resolved), TyView::Infer(_));
+        (m.diags.len(), m.errors, m.numeric.len(), m.ty.pending_len(), bound)
+    };
+
+    let probed = m.probe(|m| write(m));
+    assert!(matches!(probed, Ok(Some(()))));
+    assert_eq!(left(&mut m), (before.0, before.1, before.2, before.3, false), "a probe left a write behind");
+
+    let failed: Result<Option<()>, Stop> = m.commit_if(|m| {
+        write(m)?;
+        Ok(None)
+    });
+    assert!(matches!(failed, Ok(None)));
+    assert_eq!(left(&mut m), (before.0, before.1, before.2, before.3, false), "a failed commit_if left a write behind");
+
+    let kept = m.commit_if(|m| write(m));
+    assert!(matches!(kept, Ok(Some(()))));
+    assert_eq!(
+        left(&mut m),
+        (before.0 + 1, before.1 + 1, before.2 + 1, before.3 + 1, true),
+        "a committed snapshot lost a write"
+    );
+}
+
 /// A body of `depth` nested nodes made by `wrap` around an integer literal.
 fn deep(depth: u32, wrap: impl Fn(&mut BodyBuf, ExprId) -> ExprId) -> Result<(), String> {
     let mut body = BodyBuf::new(Edition::E2021);

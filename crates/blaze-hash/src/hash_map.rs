@@ -430,6 +430,15 @@ impl<K: fmt::Debug, V, S, A: Allocator> fmt::Debug for VacantEntry<'_, K, V, S, 
     }
 }
 
+impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator> fmt::Debug for Entry<'_, K, V, S, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Entry::Occupied(it) => f.debug_tuple("Entry").field(it).finish(),
+            Entry::Vacant(it) => f.debug_tuple("Entry").field(it).finish(),
+        }
+    }
+}
+
 impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator> fmt::Debug for OccupiedEntry<'_, K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OccupiedEntry").field("key", self.key()).field("value", self.get()).finish()
@@ -631,6 +640,72 @@ exact_in!(IntoIter<K, V, A>, IntoKeys<K, V, A>, IntoValues<K, V, A>, Drain<'_, K
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Iter<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+// The other iterators list what they have not yet yielded, as hashbrown's do: the entries as
+// `(key, value)` pairs, or the keys, or the values.
+
+/// The entries of `rest` as `(key, value)` pairs.
+fn entries<K: fmt::Debug, V: fmt::Debug>(
+    f: &mut fmt::Formatter<'_>,
+    rest: raw::Iter<'_, (K, V)>,
+) -> fmt::Result {
+    f.debug_list().entries(rest.map(|(key, value)| (key, value))).finish()
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        entries(f, self.0.rest())
+    }
+}
+
+impl<K: fmt::Debug, V> fmt::Debug for Keys<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+impl<K, V: fmt::Debug> fmt::Debug for Values<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.0.rest().map(|(_, value)| value)).finish()
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug, A: Allocator> fmt::Debug for IntoIter<K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        entries(f, self.0.rest())
+    }
+}
+
+impl<K: fmt::Debug, V, A: Allocator> fmt::Debug for IntoKeys<K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.0.rest().map(|(key, _)| key)).finish()
+    }
+}
+
+impl<K, V: fmt::Debug, A: Allocator> fmt::Debug for IntoValues<K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.0.rest().map(|(_, value)| value)).finish()
+    }
+}
+
+impl<K, V, A: Allocator> Drain<'_, K, V, A> {
+    /// The keys not yet taken: what a set's drain lists.
+    pub(crate) fn rest_keys(&self) -> impl Iterator<Item = &K> {
+        self.0.rest().map(|(key, _)| key)
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug, A: Allocator> fmt::Debug for Drain<'_, K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        entries(f, self.0.rest())
     }
 }
 

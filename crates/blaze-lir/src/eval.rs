@@ -374,7 +374,6 @@ impl<A: Allocator + Clone> Run<'_, A> {
     }
 
     /// Instruction `inst`, not a terminator: its value, if it has one, or how the run ends.
-    #[expect(clippy::type_complexity, reason = "a step's three ends, each named in its arm")]
     fn step(&mut self, inst: usize, op: Op) -> Result<Result<Option<Val>, Outcome<A>>, EvalError> {
         let mut o = self.view.operands(inst);
         let undefined = |why| Ok(Err(Outcome::Undefined { inst, why }));
@@ -498,7 +497,6 @@ impl<A: Allocator + Clone> Run<'_, A> {
     }
 
     /// The bytes an access of `width` bits at `ptr` plus `at` touches, or why it is undefined.
-    #[expect(clippy::type_complexity, reason = "a refusal, or the access's bytes or why it is undefined")]
     fn access(
         &self,
         inst: usize,

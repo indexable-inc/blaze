@@ -140,6 +140,18 @@ fork under `vendor/` counts as third-party unless its manifest says
 the manifest lines they came in by (`scripts/src/bin/thirdparty.rs`); `docs/v2/plan/third-party.md`
 says what replaces each.
 
+blaze's own code uses no `std` and no `alloc` in the end: a crate is `#![no_std]` on `core`, takes
+its collections from blaze-own and blaze-hash, and is passed its allocator (the same decision; rule
+nothing-ambient). The gate holds the way there by crate, outside test code: the lines naming
+`std` and those naming `alloc` as a path's first segment, 1 when the crate's root lacks
+`#![no_std]`, and the lines naming a `std` or `alloc` collection (`Vec`, `Box`, `String`, `Rc`,
+`Arc`, the `BTree*`, `VecDeque`, `BinaryHeap`, `HashMap`, `HashSet`) written bare and not imported
+from blaze-own, blaze-mem or blaze-hash, or under `std::`/`alloc::`, equal its row in
+`tools/ratchets/std-alloc.txt`, which only shrinks; a crate with no row is held to 0 in every
+column. It reads the text, resolving no names: a rename, `vec!`, `format!` and a prelude use of
+`alloc` with no path are missed, and its usage lists the rest
+(`scripts/src/bin/ambient.rs`); blaze's lints are the definition once blaze checks its own crates.
+
 blaze's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
 writing, the linker, the daemon and its socket, the cargo drop-in, the store and the remote,
 the sandbox, and the harnesses. A change there is one ordinary

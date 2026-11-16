@@ -361,9 +361,8 @@ pub const STREAM_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     Part::Schema(<Root as Record>::SCHEMA),
 ]);
 
-/// A finished record's bytes, as blaze-format's `Writer::finish` hands them back: its `std`
-/// vector until blaze-format moves onto blaze-own.
-pub type RecordBytes<B> = blaze_surface::RecordBytes<B>;
+// A finished record's bytes: the schema's one alias (rule 30).
+pub use blaze_surface::RecordBytes;
 
 /// The stream's columns: each token's entry, text, length, context and suffix, then the
 /// context table.

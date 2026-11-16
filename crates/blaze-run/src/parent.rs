@@ -9,6 +9,12 @@
 //!   instruction (the entry, and what runs before `main`: the start sections' initializers) and
 //!   what the last run's record says ran. The first are wanted at once; [`Effect::Begin`] goes
 //!   out when each is published, [`Effect::NoStart`] when one has no code.
+//! - **The startup image.** Before the start, the driver looks up the program's startup image
+//!   (blaze-cas `plain::image`, keyed by the manifest) and hands it to [`Parent::warm`]: its rows
+//!   are looked up at once, in one pass, so what the start needs is placed before the child's
+//!   first ask. The run keeps what it placed before `main` ([`Parent::image`]); when `main`
+//!   returns ([`Parent::ended`]) a changed set or order is written back ([`Effect::WriteImage`]).
+//!   The image changes when records arrive, never which: a warm run asks for what a cold one does.
 //! - **A need.** A thread called a need stub whose record the program does not hold. The slot's
 //!   record is looked up by key ([`Effect::Lookup`]); found, it is published; absent, compiled
 //!   by the [`Compiler`] ([`Effect::Compile`]), then published. However many threads ask, and
@@ -126,6 +132,14 @@ pub struct FoundOptimized<'a> {
     pub inlined: &'a [Inlined],
 }
 
+/// One row of a startup image (blaze-cas `plain::image`): a slot and the code record placed in
+/// it, in the order the run placed them before `main`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Placement {
+    pub slot: SlotId,
+    pub code: CodeRef,
+}
+
 /// The answer a waiting thread is given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Answer {
@@ -156,6 +170,10 @@ pub enum Effect {
     Begin,
     /// A function the start needs has no code: the program does not start.
     NoStart(CompileError),
+    /// Put [`Parent::image`] in the store as the program's startup image (blaze-cas
+    /// `IMAGE_TAG`, keyed by `StartupImage::key_for(manifest)`), committed with the run's other
+    /// records: the set or order of what was placed before `main` changed from the image read.
+    WriteImage,
     /// Only under a planted bug: the run stopped at a failed compile.
     Stop(CompileError),
     /// For the run's event stream.
@@ -178,6 +196,8 @@ pub enum Error {
     /// Optimized code for a slot with no fast code.
     NotReady { slot: SlotId },
     StartedTwice,
+    /// The startup image was given after the start, or twice: it must come before the start.
+    WarmLate,
 }
 
 impl fmt::Display for Error {
@@ -206,6 +226,9 @@ impl fmt::Display for Error {
                 write!(f, "slot {} was tiered before it had fast code", slot.0)
             }
             Error::StartedTwice => write!(f, "the program was started twice"),
+            Error::WarmLate => {
+                write!(f, "the startup image was given after the start or twice; it comes once, first")
+            }
         }
     }
 }
@@ -264,6 +287,11 @@ pub struct Parent<A: Allocator + Clone> {
     making: SortedMap<RecordKey, Vec<SlotId, A>, A>,
     running: u32,
     running_background: u32,
+    /// What this run placed before `main`, in order: the next startup image.
+    placed: Vec<Placement, A>,
+    /// The image this run started from (empty without one), and whether one was given.
+    image: Vec<Placement, A>,
+    warmed: bool,
     start: Start,
     now: Nanos,
     compiles: u64,
@@ -305,6 +333,9 @@ impl<A: Allocator + Clone> Parent<A> {
             waiters: Vec::new_in(alloc.clone()),
             queues: [VecDeque::new_in(alloc.clone()), VecDeque::new_in(alloc.clone()), VecDeque::new_in(alloc.clone())],
             making: SortedMap::new_in(alloc.clone()),
+            placed: Vec::new_in(alloc.clone()),
+            image: Vec::new_in(alloc.clone()),
+            warmed: false,
             alloc,
             running: 0,
             running_background: 0,
@@ -362,6 +393,41 @@ impl<A: Allocator + Clone> Parent<A> {
     /// The hooks `slot` is to run with.
     pub fn hooks(&self, slot: SlotId) -> Option<Hooks> {
         self.table.hooks().get(slot.index()).copied()
+    }
+
+    /// The startup image's lookup ended, before the start: `None` when the store has no image
+    /// of this manifest, else its rows. Each row's slot is looked up at once, in image order and
+    /// in this one call, so the driver reads them in one pass (in the store's read order) and
+    /// places them before the child's first ask: the Welcome's known slots. A hint, never a
+    /// proof: a row is looked up by its slot's key as any need is, and a row the store lacks is
+    /// a miss like any other, compiled only when asked.
+    pub fn warm(&mut self, image: Option<&[Placement]>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
+        if self.warmed || self.start != Start::NotYet {
+            return Err(Error::WarmLate);
+        }
+        let rows = image.unwrap_or(&[]);
+        for row in rows {
+            self.check(row.slot)?;
+        }
+        self.warmed = true;
+        self.image.extend_from_slice(rows);
+        for row in rows {
+            self.want(row.slot, Priority::History, out);
+        }
+        Ok(())
+    }
+
+    /// What this run placed before `main`, in order: the image [`Effect::WriteImage`] puts.
+    pub fn image(&self) -> &[Placement] {
+        &self.placed
+    }
+
+    /// `main` returned: the image is written when what was placed before it differs, in set or
+    /// order, from the image the run started from.
+    pub fn ended(&mut self, out: &mut Vec<Effect, A>) {
+        if self.placed.as_slice() != self.image.as_slice() {
+            out.push(Effect::WriteImage);
+        }
     }
 
     /// The start: `needed` must have code before the first instruction; `history` ran last time.
@@ -657,6 +723,9 @@ impl<A: Allocator + Clone> Parent<A> {
             Tier::Fast => RunEvent::Published { function },
             Tier::Optimized => RunEvent::Tiered { function },
         }));
+        if !matches!(self.start, Start::Begun | Start::Refused) {
+            self.placed.push(Placement { slot, code });
+        }
         out.push(Effect::Publish { slot, tier, code });
         self.answer(slot, Answer::Code { tier }, out);
         for callee in callees {

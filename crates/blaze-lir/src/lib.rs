@@ -48,6 +48,10 @@
 #![deny(blaze::sans_io_core)]
 
 pub mod builder;
+/// The reference evaluator backends are tested against: in this crate's tests, and for a
+/// backend's tests through the `eval` feature. Never in a build.
+#[cfg(any(test, feature = "eval"))]
+pub mod eval;
 pub mod flags;
 pub mod func;
 pub mod op;
@@ -73,3 +77,5 @@ pub const VERSION: u64 = 1;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tiers;

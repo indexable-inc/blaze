@@ -1,14 +1,17 @@
 //! Writeback: the walk's handles resolved and exported into the record's own type table.
 //!
-//! Follows rustc_hir_typeck/src/writeback.rs (`resolve_type_vars_in_body`, `Resolver`,
-//! `report_error`); Relax maps it in typeck.rs (`resolve_all`, `finish`).
+//! Follows rustc_hir_typeck/src/writeback.rs (`resolve_type_vars_in_body`, `Resolver`),
+//! checked against Relax's port of it @8d1a764 (types/src/typeck/writeback.rs,
+//! `resolve_type_vars_in_body` and `WritebackCx::resolve`).
 //!
 //! Every type is resolved fully and exported children first, each handle once (a cache from
 //! handle to portable type), into a hash-consed table, so the record's bytes depend only on
-//! what was inferred and the order of first use (rule 25). A variable still unresolved is
-//! E0282 at the first node that holds one, when the body has no other error (rustc reports
-//! once and is tainted after), and becomes the error type. Sparse tables are sorted by
-//! expression, stably, so each expression's adjustments stay in order.
+//! what was inferred and the order of first use (rule 25). A type that still holds an
+//! unresolved variable becomes the error type as a whole (Relax: `if has_infer(ty) { unresolved
+//! = true; ty = error }`), and the body gets one E0282 when it has no other error (Relax reports
+//! it once, after every type, at the body's last position; here at the first node holding one,
+//! which says where). Sparse tables are sorted by expression, stably, so each expression's
+//! adjustments stay in order.
 
 use blaze_own::{Soa, Vec};
 use core::alloc::Allocator;
@@ -16,10 +19,10 @@ use core::alloc::Allocator;
 use crate::columns::{Adjusts, Callees, Captures, Checked, Fields};
 use crate::diag::{At, Diag, DiagCode};
 use crate::error::{CheckError, Limit};
-use crate::hash::StableHasher;
+use blaze_hash::HashMap;
+
 use crate::ids::{ExprId, List, PatId};
 use crate::machine::Machine;
-use crate::map::HashIndex;
 use crate::portable::{PNode, PTy, PortableTys};
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
@@ -30,31 +33,25 @@ const EXPORT_STEPS: u64 = 1 << 28;
 /// The export state: the table, and the handle-to-portable cache.
 struct Export<A: Allocator + Clone> {
     out: PortableTys<A>,
-    keys: Vec<Ty, A>,
-    vals: Vec<PTy, A>,
-    index: HashIndex<A>,
+    /// Each exported handle: its portable type, and whether it held an unresolved variable
+    /// (then the portable type is the error type).
+    cache: HashMap<Ty, (PTy, bool), A>,
     steps: u64,
     /// Whether E0282 was reported by writeback.
     reported: bool,
 }
 
-fn ty_hash(t: Ty) -> u64 {
-    let mut h = StableHasher::new("writeback.ty");
-    h.u32(t.0);
-    h.finish()
-}
-
 impl<A: Allocator + Clone> Export<A> {
     fn cached(&self, t: Ty) -> Option<PTy> {
-        let keys = &self.keys;
-        self.index.find(ty_hash(t), |i| keys[i as usize] == t).map(|i| self.vals[i as usize])
+        self.cache.get(&t).map(|&(p, _)| p)
     }
 
-    fn insert(&mut self, t: Ty, p: PTy) -> Result<(), CheckError> {
-        let at = u32::try_from(self.keys.len()).map_err(|_| CheckError::Limit(Limit::Export))?;
-        self.keys.push(t);
-        self.vals.push(p);
-        self.index.insert(ty_hash(t), at)
+    fn holds_var(&self, t: Ty) -> bool {
+        self.cache.get(&t).is_some_and(|&(_, v)| v)
+    }
+
+    fn insert(&mut self, t: Ty, p: PTy, holds_var: bool) {
+        self.cache.insert(t, (p, holds_var));
     }
 }
 
@@ -132,6 +129,23 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
                 }
                 continue;
             }
+            kids.clear();
+            self.ty_children(v, &mut kids);
+            let mut holds_var = matches!(v, TyView::Infer(_));
+            for &k in kids.iter() {
+                let k = self.ty.shallow_resolve(k);
+                holds_var |= ex.holds_var(k);
+            }
+            if holds_var {
+                if self.errors == 0 && !ex.reported {
+                    self.diag(DiagCode::AnnotationsNeeded, at, None, None, None);
+                    ex.reported = true;
+                }
+                let p = ex.out.intern(PNode::Error)?;
+                ex.insert(x, p, true);
+                ex.insert(x_res, p, true);
+                continue;
+            }
             let one = |ex: &Export<A>, c: Ty, ctx: &mut C| -> Result<PTy, CheckError> {
                 let c = ctx.shallow_resolve(c);
                 ex.cached(c).ok_or(CheckError::Limit(Limit::Export))
@@ -156,20 +170,12 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
                 TyView::Param(i) => PNode::Param(i),
                 TyView::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: self.export_list(ex, args)? },
                 TyView::Opaque(k, l) => PNode::Opaque(k, self.export_list(ex, l)?),
-                TyView::Infer(_) => {
-                    if self.errors == 0 && !ex.reported {
-                        self.diag(DiagCode::AnnotationsNeeded, at, None, None, None);
-                        ex.reported = true;
-                    }
-                    PNode::Error
-                }
-                TyView::Error => PNode::Error,
+                // A variable is `holds_var` above.
+                TyView::Infer(_) | TyView::Error => PNode::Error,
             };
             let p = ex.out.intern(node)?;
-            ex.insert(x, p)?;
-            if x_res != x {
-                ex.insert(x_res, p)?;
-            }
+            ex.insert(x, p, false);
+            ex.insert(x_res, p, false);
         }
         ex.cached(t).ok_or(CheckError::Limit(Limit::Export))
     }
@@ -179,9 +185,7 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
         let alloc = self.alloc.clone();
         let mut ex = Export {
             out: PortableTys::new_in(alloc.clone()),
-            keys: Vec::new_in(alloc.clone()),
-            vals: Vec::new_in(alloc.clone()),
-            index: HashIndex::new_in(alloc.clone()),
+            cache: HashMap::new_in(alloc.clone()),
             steps: 0,
             reported: false,
         };

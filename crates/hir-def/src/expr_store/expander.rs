@@ -37,7 +37,7 @@ impl<'db> Expander<'db> {
         Expander {
             current_file_id,
             macro_depth: current_file_id.macro_expansion_depth(db),
-            recursion_limit: Self::recursion_limit(def_map),
+            recursion_limit: Self::recursion_limit(db, def_map),
             span_map: current_file_id.span_map(db),
             ast_id_map: current_file_id.ast_id_map(db),
         }
@@ -56,14 +56,14 @@ impl<'db> Expander<'db> {
         Expander {
             current_file_id,
             macro_depth: current_file_id.macro_expansion_depth(db),
-            recursion_limit: Self::recursion_limit(def_map),
+            recursion_limit: Self::recursion_limit(db, def_map),
             span_map: SpanMap::RealSpanMap(span_map),
             ast_id_map,
         }
     }
 
-    fn recursion_limit(def_map: &DefMap) -> u32 {
-        let recursion_limit = def_map.recursion_limit();
+    fn recursion_limit(db: &Db, def_map: &DefMap) -> u32 {
+        let recursion_limit = def_map.recursion_limit(db);
         if cfg!(test) {
             // Without this, `body::tests::your_stack_belongs_to_me` stack-overflows in debug
             std::cmp::min(32, recursion_limit)

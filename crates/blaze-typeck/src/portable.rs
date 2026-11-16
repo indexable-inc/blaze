@@ -9,7 +9,8 @@ use core::alloc::Allocator;
 use crate::error::{CheckError, Malformed};
 use crate::hash::{ContentHash, StableHasher};
 use crate::ids::{ExprId, FloatTy, IntTy, ItemKey, List, Mutbl, Name, UintTy};
-use crate::map::HashIndex;
+use crate::intern::ListIndex;
+use blaze_hash::HashMap;
 
 /// A type of a portable table, by its node's index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -195,8 +196,10 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
 pub struct PortableTys<A: Allocator + Clone> {
     nodes: Vec<PNode, A>,
     lists: Vec<PTy, A>,
-    node_index: HashIndex<A>,
-    list_index: HashIndex<A>,
+    node_index: HashMap<PNode, u32, A>,
+    list_index: ListIndex<A>,
+    /// Per interned list, in the order interned: where it is in `lists`.
+    list_rows: Vec<List, A>,
 }
 
 impl<A: Allocator + Clone> PortableTys<A> {
@@ -205,8 +208,9 @@ impl<A: Allocator + Clone> PortableTys<A> {
         PortableTys {
             nodes: Vec::new_in(alloc.clone()),
             lists: Vec::new_in(alloc.clone()),
-            node_index: HashIndex::new_in(alloc.clone()),
-            list_index: HashIndex::new_in(alloc),
+            node_index: HashMap::new_in(alloc.clone()),
+            list_index: ListIndex::new_in(alloc.clone()),
+            list_rows: Vec::new_in(alloc),
         }
     }
 
@@ -217,17 +221,13 @@ impl<A: Allocator + Clone> PortableTys<A> {
 
     /// The node `n`, interned. Its children must already be in the table.
     pub fn intern(&mut self, n: PNode) -> Result<PTy, CheckError> {
-        let mut h = StableHasher::new("ptys.node");
-        hash_node(&n, &mut h);
-        let hash = h.finish();
-        let nodes = &self.nodes;
-        if let Some(found) = self.node_index.find(hash, |v| nodes[v as usize] == n) {
+        if let Some(&found) = self.node_index.get(&n) {
             return Ok(PTy(found));
         }
         let at = u32::try_from(self.nodes.len())
             .map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
         self.nodes.push(n);
-        self.node_index.insert(hash, at)?;
+        self.node_index.insert(n, at);
         Ok(PTy(at))
     }
 
@@ -241,18 +241,18 @@ impl<A: Allocator + Clone> PortableTys<A> {
             h.u32(t.0);
         }
         let hash = h.finish();
-        let lists = &self.lists;
-        let len = tys.len();
-        if let Some(found) = self.list_index.find(hash, |start| {
-            lists.get(start as usize..start as usize + len) == Some(tys)
-        }) {
-            return Ok(List { start: found, len: len as u32 });
+        let (lists, rows) = (&self.lists, &self.list_rows);
+        if let Some(found) = self.list_index.find(hash, |id| lists.get(rows[id as usize].range()) == Some(tys)) {
+            return Ok(self.list_rows[found as usize]);
         }
         let start = u32::try_from(self.lists.len())
             .map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
+        let len = u32::try_from(tys.len()).map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
+        self.list_index.push(hash)?;
         self.lists.extend_from_slice(tys);
-        self.list_index.insert(hash, start)?;
-        Ok(List { start, len: len as u32 })
+        let list = List { start, len };
+        self.list_rows.push(list);
+        Ok(list)
     }
 
     /// The number of nodes.

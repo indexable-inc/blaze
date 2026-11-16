@@ -21,8 +21,11 @@
 //! - [`entry`]: a program's `main` run on the simulation: its line on standard output, its
 //!   status, its error said, a withheld `Out` absent.
 //! - [`env`]: `Env::only` never widens.
-//! - [`world`]: `Args`, `Host`, the trace and `spawn_concurrent`'s refusal under `Inline`, each
-//!   once.
+//! - [`world`]: `Args`, `Host` and the trace, each once.
+//! - [`overlap`]: under one worker, `must_overlap` refuses a producer and consumer pair with a
+//!   typed `NoParallelism` before anything waits, where `may_overlap` runs it inline into its
+//!   deadline; and `may_overlap` gives one result under one worker and many.
+//! - [`flat`]: what the `AnyAddress` walk clears and refuses, decided as the crate compiles.
 //! - [`cell`]: one token reads and writes every cell of its kind, behind one lock across
 //!   threads too.
 //! - [`names`]: the compile-time checks of `path!`, `var!` and `host!` are the run-time ones.
@@ -54,7 +57,8 @@
 //! - [`flight`]: a key is computed at most once at a time, failures are retried, the table
 //!   stays in its bound; and the driver once.
 //! - [`chan`]: a channel is bounded, in order, each value once, drained before closed; its
-//!   waits end at their deadline.
+//!   waits end at their deadline; flat messages from many producers come out once each, in
+//!   order, through the ring (plant: the ring's back index forgets its front).
 //! - [`atomics`]: the named atomics mean what their docs say (their orderings are untested).
 //! - [`ranks`]: one lock-order token a task, back when dropped.
 //!
@@ -88,6 +92,7 @@ mod entry;
 mod env;
 mod eval;
 mod explicit;
+mod flat;
 mod flight;
 mod freeze;
 mod hosted;
@@ -100,6 +105,7 @@ mod mp4;
 mod names;
 mod narrowing;
 mod narrows;
+mod overlap;
 mod own;
 mod par;
 mod paths;

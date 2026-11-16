@@ -14,7 +14,7 @@
 //! | [`pack`] | the recording format: LEB128, zigzag deltas, one column an event field | the drain thread's driver; any reader |
 //! | [`cbor`] | deterministic CBOR, written into a named allocator and read with limits | everything on a wire |
 //! | [`frame`] | the transport's frames: a length word, then one CBOR array | both ends |
-//! | [`conn`] | [`conn::Sender`] (channels, credit, a priority writer) and [`conn::Receiver`] (credit grants) | both ends |
+//! | [`conn`] | [`conn::Conn`]: channels, credit both ways ([`conn::Credit`] to send, [`conn::Grant`] to receive), owed control frames, a priority order | both ends |
 //! | [`window`] | [`window::Window`]: the bounded replay window of a feed, by sequence number | the run; the viewer |
 //! | [`feed`] | [`feed::Feed`]: the run's side of the event channel (drained rings into a window, resume with a gap); [`feed::Follow`], the reader's side, which refuses a duplicate or a silent skip | the run; the viewer |
 //! | [`http`] | a request parser with limits, the response heads, CORS and Private Network Access, SSE framing | the viewer |

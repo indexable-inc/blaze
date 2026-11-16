@@ -178,6 +178,10 @@ pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
 /// Flat values: `Flat`, bytes that mean the same on any thread, process or machine.
+#[expect(
+    unsafe_code,
+    reason = "`Flat` is an `unsafe` property trait: its plain blanket impl and its derived one, each with its SAFETY"
+)]
 pub mod flat;
 pub mod fs;
 pub mod gpu;

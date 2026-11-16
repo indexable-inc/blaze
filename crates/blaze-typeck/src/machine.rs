@@ -142,6 +142,22 @@ pub(crate) struct PendingClosure {
     pub expr: ExprId,
 }
 
+/// What `Machine::snapshot` saved: the type context's snapshot and each column's length.
+pub(crate) struct MachineSnapshot<S> {
+    ty: S,
+    diags: usize,
+    errors: u32,
+    adjust: usize,
+    adj_scratch: usize,
+    callees: usize,
+    fields: usize,
+    captures: usize,
+    casts: usize,
+    numeric: usize,
+    diverging: usize,
+    closures: usize,
+}
+
 /// An autoderef step: the type, and whether it was reached by `Deref::deref`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Step {
@@ -645,10 +661,48 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone> Machine<'b, 'w, 'c,
 
     // Snapshots: `DropGuard`s, so any early return rolls back.
 
+    /// A snapshot of the whole run's undoable state (rustc's `InferCtxt` snapshot also covers
+    /// the fulfilment context and, through `TypeckResults` being written only on success, the
+    /// diagnostics a probe may not leave behind): the type context's (variables and pending
+    /// obligations), and the length of every append-only column a rule writes. The read list
+    /// is kept on rollback: a probe's failure was decided by what it read.
+    pub(crate) fn snapshot(&mut self) -> MachineSnapshot<C::Snapshot> {
+        MachineSnapshot {
+            ty: self.ty.snapshot(),
+            diags: self.diags.len(),
+            errors: self.errors,
+            adjust: self.adjust.len(),
+            adj_scratch: self.adj_scratch.len(),
+            callees: self.callees.len(),
+            fields: self.fields.len(),
+            captures: self.captures.len(),
+            casts: self.casts.len(),
+            numeric: self.numeric.len(),
+            diverging: self.diverging.len(),
+            closures: self.closures.len(),
+        }
+    }
+
+    /// Undoes everything since `s`.
+    pub(crate) fn rollback_to(&mut self, s: MachineSnapshot<C::Snapshot>) {
+        self.ty.rollback_to(s.ty);
+        self.diags.truncate(s.diags);
+        self.errors = s.errors;
+        self.adjust.truncate(s.adjust);
+        self.adj_scratch.truncate(s.adj_scratch);
+        self.callees.truncate(s.callees);
+        self.fields.truncate(s.fields);
+        self.captures.truncate(s.captures);
+        self.casts.truncate(s.casts);
+        self.numeric.truncate(s.numeric);
+        self.diverging.truncate(s.diverging);
+        self.closures.truncate(s.closures);
+    }
+
     /// Runs `f` in a snapshot that is always rolled back (`probe`).
     pub(crate) fn probe<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let snap = self.ty.snapshot();
-        let mut g = DropGuard::new((self, snap), |(m, s)| m.ty.rollback_to(s));
+        let snap = self.snapshot();
+        let mut g = DropGuard::new((self, snap), |(m, s)| m.rollback_to(s));
         f(&mut *g.0)
     }
 
@@ -657,12 +711,12 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone> Machine<'b, 'w, 'c,
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<Option<T>, E>,
     ) -> Result<Option<T>, E> {
-        let snap = self.ty.snapshot();
-        let mut g = DropGuard::new((self, snap), |(m, s)| m.ty.rollback_to(s));
+        let snap = self.snapshot();
+        let mut g = DropGuard::new((self, snap), |(m, s)| m.rollback_to(s));
         match f(&mut *g.0) {
             Ok(Some(v)) => {
                 let (m, s) = DropGuard::dismiss(g);
-                m.ty.commit(s);
+                m.ty.commit(s.ty);
                 Ok(Some(v))
             }
             other => other,

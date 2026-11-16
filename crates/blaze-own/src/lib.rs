@@ -21,6 +21,7 @@
 //! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
 //! | [`String`], [`format_in!`], [`format_into!`] | UTF-8 text over [`Vec<u8, A>`](Vec); `blaze_mem` re-exports it, keeping only `OsString` and `PathBuf` |
 //! | [`FixedVec`] | up to `N` values inline, no allocator; a push past `N` is refused with [`Full`], the value handed back |
+//! | [`Packed`], [`Pack`] | values of different sizes end to end in one byte buffer, each its own size; iterated, not indexed, with an optional checkpoint every `K` values for seeking |
 //! | [`Inline`] | an allocator over a buffer inside itself (`&Inline<BYTES>`), so any of these lives on the stack; refuses when full, never falls back |
 //!
 //! The cargo feature `std` (off by default; blaze-mem turns it on) adds what only this crate
@@ -100,6 +101,7 @@ pub mod cow;
 pub mod deque;
 mod error;
 pub mod fixed;
+pub mod packed;
 pub mod raw;
 pub mod rc;
 #[macro_use]
@@ -120,6 +122,7 @@ pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;
 pub use fixed::{FixedVec, Full, Inline};
+pub use packed::{Pack, Packed};
 pub use raw::RawBuf;
 pub use rc::Rc;
 pub use soa::Soa;

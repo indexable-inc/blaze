@@ -451,7 +451,11 @@ impl<T: Clone, A: Allocator + Clone> Clone for RawTable<T, A> {
     }
 }
 
-impl<T, A: Allocator> Drop for RawTable<T, A> {
+// SAFETY (`may_dangle`, as hashbrown's and std's tables): the drop only drops the `T`s it owns
+// (`marker: PhantomData<T>` tells dropck so) and frees its memory; it reads no borrow a `T`
+// holds, so a table of references may outlive what they point to by its drop, as a caller's
+// set of `&str` borrowed from the map it then returns (blaze-resolve's `summary.rs`).
+unsafe impl<#[may_dangle] T, A: Allocator> Drop for RawTable<T, A> {
     fn drop(&mut self) {
         if mem::needs_drop::<T>() && self.items != 0 {
             let mut live = self.live();
@@ -603,6 +607,14 @@ unsafe impl<T: Send> Send for IterMut<'_, T> {}
 // SAFETY: as above.
 unsafe impl<T: Sync> Sync for IterMut<'_, T> {}
 
+impl<T> IterMut<'_, T> {
+    /// The values not yet walked, by reference: what `Debug` lists.
+    pub(crate) fn rest(&self) -> Iter<'_, T> {
+        let (ctrl, groups, slots) = (self.ctrl, self.groups, self.slots);
+        Iter { live: self.live.clone(), ctrl, groups, slots, marker: PhantomData }
+    }
+}
+
 impl<'a, T> Iterator for IterMut<'a, T> {
     type Item = &'a mut T;
 
@@ -642,6 +654,14 @@ impl<T, A: Allocator> IntoIterator for RawTable<T, A> {
     }
 }
 
+impl<T, A: Allocator> IntoIter<T, A> {
+    /// The values not yet taken, by reference: what `Debug` lists.
+    pub(crate) fn rest(&self) -> Iter<'_, T> {
+        let (ctrl, groups, slots) = (self.table.ctrl, self.table.groups, self.table.slots);
+        Iter { live: self.live.clone(), ctrl, groups, slots, marker: PhantomData }
+    }
+}
+
 impl<T, A: Allocator> Iterator for IntoIter<T, A> {
     type Item = T;
 
@@ -661,7 +681,9 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
 impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {}
 impl<T, A: Allocator> core::iter::FusedIterator for IntoIter<T, A> {}
 
-impl<T, A: Allocator> Drop for IntoIter<T, A> {
+// SAFETY (`may_dangle`): as the table's: it drops the `T`s it owns, through the table it
+// holds, and reads nothing they borrow.
+unsafe impl<#[may_dangle] T, A: Allocator> Drop for IntoIter<T, A> {
     fn drop(&mut self) {
         while let Some(index) = self.live.next(&self.table) {
             // SAFETY: `index` was live and not yet taken; dropped once.
@@ -689,6 +711,14 @@ pub(crate) struct Drain<'a, T, A: Allocator> {
 unsafe impl<T: Send, A: Allocator + Send> Send for Drain<'_, T, A> {}
 // SAFETY: as above; `&Drain` reaches no value.
 unsafe impl<T: Sync, A: Allocator + Sync> Sync for Drain<'_, T, A> {}
+
+impl<T, A: Allocator> Drain<'_, T, A> {
+    /// The values not yet taken, by reference: what `Debug` lists.
+    pub(crate) fn rest(&self) -> Iter<'_, T> {
+        let Held { ctrl, slots, groups } = self.held;
+        Iter { live: self.live.clone(), ctrl, groups, slots, marker: PhantomData }
+    }
+}
 
 impl<T, A: Allocator> Iterator for Drain<'_, T, A> {
     type Item = T;

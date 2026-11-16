@@ -49,6 +49,7 @@
 pub mod arch;
 pub mod control;
 pub mod drive;
+pub mod observe;
 pub mod records;
 pub mod retired;
 pub mod symbols;

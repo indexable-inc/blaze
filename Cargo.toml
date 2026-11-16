@@ -326,6 +326,8 @@ blaze-surface = { path = "crates/blaze-surface" }
 # The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
 blaze-keyed = { path = "crates/blaze-keyed" }
 blaze-run = { path = "crates/blaze-run" } # `blaze run`/`blaze test` as sans-IO machines (docs/v2/plan/design/run.md).
+blaze-drive = { path = "crates/blaze-drive" } # One command's request on the new item layer as a sans-IO machine (docs/v2/plan/design/drive.md).
+blaze-cli = { path = "crates/blaze-cli" } # The `blaze` binary over blaze-drive, reaching the system through bstd (drive.md, "The system side").
 blaze-watch = { path = "crates/blaze-watch" } # The monitor's rings, transport, viewer core and recorder (docs/v2/plan/design/watch.md).
 # The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
 # and the process that performs the driver's effects.

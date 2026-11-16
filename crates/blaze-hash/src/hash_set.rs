@@ -275,6 +275,13 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
 impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {}
 impl<T, A: Allocator> FusedIterator for IntoIter<T, A> {}
 
+/// The elements not yet taken, as hashbrown's set iterator lists them.
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for IntoIter<T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
 /// A set's elements taken out by [`Set::drain`].
 pub struct Drain<'a, T, A: Allocator>(hash_map::Drain<'a, T, (), A>);
 
@@ -294,6 +301,28 @@ impl<T, A: Allocator> Iterator for Drain<'_, T, A> {
 
 impl<T, A: Allocator> ExactSizeIterator for Drain<'_, T, A> {}
 impl<T, A: Allocator> FusedIterator for Drain<'_, T, A> {}
+
+/// The elements not yet taken.
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for Drain<'_, T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.0.rest_keys()).finish()
+    }
+}
+
+/// The elements a set operation has not yet yielded, listed from a copy of it, as hashbrown's.
+macro_rules! debug_by_clone {
+    ($($name:ident),* $(,)?) => {$(
+        impl<T: fmt::Debug + Eq + Hash, S: BuildHasher, A: Allocator> fmt::Debug
+            for $name<'_, T, S, A>
+        {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list().entries(self.clone()).finish()
+            }
+        }
+    )*};
+}
+
+debug_by_clone!(Difference, Intersection, Union, SymmetricDifference);
 
 /// The elements of one set not in another: [`Set::difference`].
 pub struct Difference<'a, T, S, A: Allocator> {

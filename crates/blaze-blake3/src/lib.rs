@@ -23,6 +23,8 @@
 pub mod cpu;
 pub mod lanes;
 
+use blaze_int::{Cast, Int};
+
 /// Bytes of a hash, and of a key.
 pub const OUT_LEN: usize = 32;
 /// Bytes of a block, the unit of one compression.
@@ -155,8 +157,9 @@ pub fn compress(
         IV[1],
         IV[2],
         IV[3],
-        counter as u32,
-        (counter >> 32) as u32,
+        // The counter's low word, then its high word: dropping the other half is the point.
+        counter.truncate_to::<u32>(),
+        (counter >> 32).truncate_to::<u32>(),
         block_len,
         flags,
     ];
@@ -213,7 +216,13 @@ fn parent_output(left: &[u32; 8], right: &[u32; 8], key: &[u32; 8], flags: u32) 
     let mut block = [0; 16];
     block[..8].copy_from_slice(left);
     block[8..].copy_from_slice(right);
-    Output { input_cv: *key, block, counter: 0, block_len: BLOCK_LEN as u32, flags: PARENT | flags }
+    Output {
+        input_cv: *key,
+        block,
+        counter: 0,
+        block_len: const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) },
+        flags: PARENT | flags,
+    }
 }
 
 /// The chunk being fed: its chaining value after its compressed blocks, and the block after
@@ -241,7 +250,7 @@ impl ChunkState {
     }
 
     fn len(&self) -> usize {
-        BLOCK_LEN * self.blocks_compressed as usize + self.block_len as usize
+        BLOCK_LEN * self.blocks_compressed.widen_to::<usize>() + self.block_len.widen_to::<usize>()
     }
 
     fn start_flag(&self) -> u32 {
@@ -251,18 +260,20 @@ impl ChunkState {
     /// Feeds `input`; the caller gives a chunk at most [`CHUNK_LEN`] bytes in all.
     fn update(&mut self, mut input: &[u8]) {
         while !input.is_empty() {
-            if self.block_len as usize == BLOCK_LEN {
+            if self.block_len.widen_to::<usize>() == BLOCK_LEN {
                 let words = lanes::block_words(&self.block);
                 let flags = self.flags | self.start_flag();
-                let out = compress(&self.cv, &words, self.counter, BLOCK_LEN as u32, flags);
+                let block_len = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
+                let out = compress(&self.cv, &words, self.counter, block_len, flags);
                 self.cv = first_8(&out);
                 self.blocks_compressed += 1;
                 self.block = [0; BLOCK_LEN];
                 self.block_len = 0;
             }
-            let take = (BLOCK_LEN - self.block_len as usize).min(input.len());
-            self.block[self.block_len as usize..][..take].copy_from_slice(&input[..take]);
-            self.block_len += take as u8;
+            let take = (BLOCK_LEN - self.block_len.widen_to::<usize>()).min(input.len());
+            self.block[self.block_len.widen_to::<usize>()..][..take].copy_from_slice(&input[..take]);
+            // `take` is at most `BLOCK_LEN` (64) less what the block holds, so it fits a `u8`.
+            self.block_len += take.narrow_or_stop::<u8>();
             input = &input[take..];
         }
     }
@@ -325,7 +336,7 @@ impl Hasher {
 
     /// Bytes fed so far.
     pub fn count(&self) -> u64 {
-        self.chunk.counter * CHUNK_LEN as u64 + self.chunk.len() as u64
+        self.chunk.counter * CHUNK_LEN.widen_to::<u64>() + self.chunk.len().widen_to::<u64>()
     }
 
     /// Feeds `input`.
@@ -377,18 +388,18 @@ impl Hasher {
     fn push_chunk(&mut self, mut cv: [u32; 8], mut total: u64) {
         while total & 1 == 0 {
             self.stack_len -= 1;
-            let left = self.stack[self.stack_len as usize];
+            let left = self.stack[self.stack_len.widen_to::<usize>()];
             cv = parent_output(&left, &cv, &self.key, self.flags).chaining_value();
             total >>= 1;
         }
-        self.stack[self.stack_len as usize] = cv;
+        self.stack[self.stack_len.widen_to::<usize>()] = cv;
         self.stack_len += 1;
     }
 
     /// The root node: the current chunk folded with every subtree left of it, right to left.
     fn root(&self) -> Output {
         let mut output = self.chunk.output();
-        for left in self.stack[..self.stack_len as usize].iter().rev() {
+        for left in self.stack[..self.stack_len.widen_to::<usize>()].iter().rev() {
             output = parent_output(left, &output.chaining_value(), &self.key, self.flags);
         }
         output
@@ -422,13 +433,14 @@ impl OutputReader {
     /// Fills `out` with the output from the position on, and moves the position past them.
     pub fn fill(&mut self, mut out: &mut [u8]) {
         while !out.is_empty() {
-            let block = self.root.root_block(self.position / BLOCK_LEN as u64);
-            let offset = (self.position % BLOCK_LEN as u64) as usize;
+            let block = self.root.root_block(self.position / BLOCK_LEN.widen_to::<u64>());
+            // A remainder of `BLOCK_LEN` (64): it fits a `usize`.
+            let offset = (self.position % BLOCK_LEN.widen_to::<u64>()).narrow_or_stop::<usize>();
             let take = (BLOCK_LEN - offset).min(out.len());
             let (head, rest) = core::mem::take(&mut out).split_at_mut(take);
             head.copy_from_slice(&block[offset..offset + take]);
             out = rest;
-            self.position += take as u64;
+            self.position += take.widen_to::<u64>();
         }
     }
 
@@ -482,9 +494,12 @@ fn chunks_of<const N: usize>(
     assert_eq!(out.len(), N, "a batch of {N} chunks");
     assert_eq!(input.len(), N * CHUNK_LEN, "a batch of {N} whole chunks");
     let mut cv: [[u32; N]; 8] = key.map(|word| [word; N]);
-    let counter_low: [u32; N] = core::array::from_fn(|lane| (counter + lane as u64) as u32);
+    // Each lane's counter, split into its low and high words: dropping the other half is the
+    // point.
+    let counter_low: [u32; N] =
+        core::array::from_fn(|lane| (counter + lane.widen_to::<u64>()).truncate_to::<u32>());
     let counter_high: [u32; N] =
-        core::array::from_fn(|lane| ((counter + lane as u64) >> 32) as u32);
+        core::array::from_fn(|lane| ((counter + lane.widen_to::<u64>()) >> 32).truncate_to::<u32>());
     let blocks = CHUNK_LEN / BLOCK_LEN;
     for block in 0..blocks {
         let rows: [[u32; 16]; N] = core::array::from_fn(|lane| {
@@ -503,7 +518,7 @@ fn chunks_of<const N: usize>(
             &lanes::columns(&rows),
             counter_low,
             counter_high,
-            [BLOCK_LEN as u32; N],
+            [const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) }; N],
             block_flags,
         );
     }

@@ -21,6 +21,11 @@ blaze-hash.workspace = true
 # `ContentId`: a variable's type and a span's anchor, by content.
 blaze-ids.workspace = true
 
+[features]
+# `blaze_lir::eval`, the reference evaluator, for a backend's tests (its dev-dependency turns
+# it on); this crate's own tests have it always. Never on in a build.
+eval = []
+
 [dev-dependencies]
 blaze-sim.workspace = true
 

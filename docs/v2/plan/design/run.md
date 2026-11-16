@@ -43,9 +43,9 @@ Each takes an event and pushes effects into a caller's buffer; time is an event 
 
 **Parent** (`parent::Parent`, in `blaze run`). Per slot: `Unasked`, `Looking{priority}`,
 `Queued{priority}`, `Compiling{priority, deadline}`, `Ready{tier}`, `Failed{error}`.
-In: `start(needed, history)`, `need(thread, slot)`, `looked(slot, found)`,
-`compiled(slot, result)`, `tick(now)`. Out: `Lookup`, `Compile`, `Publish`, `Answer`, `Begin`,
-`NoStart`, `Say(RunEvent)`. A need is looked up first (another run may have made the record),
+In: `warm(image)`, `start(needed, history)`, `need(thread, slot)`, `looked(slot, found)`,
+`compiled(slot, result)`, `toggle`, `tiered`, `tick(now)`, `ended`. Out: `Lookup`, `Compile`,
+`Publish`, `Hooks`, `Answer`, `Begin`, `NoStart`, `WriteImage`, `Say(RunEvent)`. A need is looked up first (another run may have made the record),
 compiled only on a miss, at most once however many threads ask; every asker is answered after
 the publish, with the same answer. Priorities: `Asked` (a thread or the start waits), `Callee`
 (a published function calls it), `History` (the last run ran it). Background work never takes
@@ -184,7 +184,17 @@ lane); they keep the rule above: a stub's runtime call queues and never stores a
 
 The control thread places a known record without the parent: `Welcome` carries, for each slot
 whose fast record the manifest names and the store has, its key. Only a slot with no record
-crosses the socket. New messages on the wire: `Hot{slot}`, `TestEnded{test, verdict, entered}`,
+crosses the socket. The warm start is the startup image (blaze-cas `plain::image`): the code
+records the last run of this manifest placed before `main`, in order, under `IMAGE_TAG` keyed by
+`StartupImage::key_for(manifest)`. Before the start the driver looks it up and hands it to
+`Parent::warm(Some(rows) | None)`; every row's slot is looked up in that one call, the driver
+reads them in one pass in the store's `read_order` and places them before the child's first ask,
+which fills the Welcome's known slots. It is a hint, never a proof: a row is found by its slot's
+key as any need is, and one the store lacks is an ordinary miss. The parent keeps what it placed
+before `main` (`Parent::image`); when `main` returns, `ended` pushes `WriteImage` if the set or
+order changed, put with the run's other records. The simulation holds that a run with an image
+asks for exactly the records a run without one does, each once, the image's all first and in one
+pass. New messages on the wire: `Hot{slot}`, `TestEnded{test, verdict, entered}`,
 `Publish{slot, tier, record}`, `Hooks{slot, hooks}`, `Failed{slot, error}`; from the viewer to
 the parent,
 `Toggle{slots, hooks, on}` (over the parent's own socket `<name>.sock`, mode 0600, beside the

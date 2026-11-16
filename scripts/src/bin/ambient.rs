@@ -48,7 +48,8 @@ Each column counts a line once, however many sites it holds:
   is_std   1 when the crate's root does not say `#![no_std]` (or `#![cfg_attr(not(test),
            no_std)]`) on a line of its own, else 0. The root is the manifest's `[lib] path`,
            else `src/lib.rs`, else the first `[[bin]] path`, else `src/main.rs`; a manifest
-           with no `[package]` (a workspace's) is no crate
+           with no `[package]` (a workspace's) is no crate, nor is a package under a directory
+           named `tests` or `benches` (a test's fixture)
   alloc    a line that names `alloc` as a path's first segment (`alloc::vec::Vec`), or after
            `use` or `extern crate`; `core::alloc::Layout` and `std::alloc::Global` are not it
            (the second is `std`'s). A use of `alloc` that names no path is not seen: in a crate
@@ -368,20 +369,19 @@ fn test_attr_end(line: &str) -> Option<usize> {
     let at = line.len() - trimmed.len();
     let rest = trimmed.strip_prefix("#[")?;
     let mut from = 0;
-    let mut last = "";
     // Bounded: each turn reads one word of the path and moves past it.
-    loop {
+    let last = loop {
         let len = ident_len(&rest.as_bytes()[from..]);
         if len == 0 {
             return None;
         }
-        last = &rest[from..from + len];
+        let word = &rest[from..from + len];
         from += len;
         match rest[from..].strip_prefix("::") {
             Some(_) => from += 2,
-            None => break,
+            None => break word,
         }
-    }
+    };
     if last != "test" {
         return None;
     }
@@ -990,7 +990,8 @@ fn count(root: &Path) -> Result<BTreeMap<String, Vec<Site>>, TreeError> {
         }
     }
     let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
-    for parts in &packages {
+    // A package under a `tests` or `benches` directory is a test's fixture, not a crate.
+    for parts in packages.iter().filter(|it| !test_path(it)) {
         let Some(path) = crate_root(root, parts)? else { continue };
         let text = std::fs::read(root.join(&path)).map_err(|e| TreeError::Unreadable { path: path.clone(), why: e.to_string() })?;
         if !declares_no_std(&universal_newlines(String::from_utf8_lossy(&text).into_owned())) {
@@ -1320,7 +1321,7 @@ fn field(&self) -> u8 { self.alloc.Box }
 "##;
 
 /// The sites of [`FIXTURE`] outside its test code, by line and column.
-const FIXTURE_SITES: [(usize, Kind); 12] = [
+const FIXTURE_SITES: [(usize, Kind); 11] = [
     (1, Kind::Std),
     (3, Kind::Alloc),
     (4, Kind::VecBox),
@@ -1332,7 +1333,238 @@ const FIXTURE_SITES: [(usize, Kind); 12] = [
     (11, Kind::VecBox),
     (12, Kind::VecBox),
     (22, Kind::VecBox),
-    // `self.alloc.Box` is no path: line 25 holds none. Line 21's `alloc` is a parameter.
-    (1, Kind::Std),
-    // (deduplicated below: the constant lists 1 twice to keep the array's length honest)
-][..0usize.wrapping_add(12)].len()];
+];
+
+/// The sites of [`FIXTURE`]'s test code: its test module's `use std::vec::Vec;` and the
+/// `Vec`s it makes (an import from `std` makes no name blaze's own), and the test function's.
+const FIXTURE_TEST_SITES: [(usize, Kind); 4] = [(16, Kind::Std), (17, Kind::VecBox), (20, Kind::Std), (20, Kind::VecBox)];
+
+/// A file that takes its collections from blaze-own and from its own crate: only line 4's `Rc`
+/// is `std`'s. Line 2's `alloc` is the crate's own module, named under `crate::`.
+const OWN_FIXTURE: &str = "use blaze_own::{Vec, Box as B};\n\
+                           use crate::alloc::String;\n\
+                           fn f(v: Vec<u8>, b: B<u8>, s: String) {}\n\
+                           fn g() -> Rc<u8> { loop {} }\n";
+
+/// A file that takes every name of blaze-own by a glob.
+const GLOB_FIXTURE: &str = "use blaze_own::*;\nfn f(v: Vec<u8>) -> HashMap<u8, u8> { loop {} }\n";
+
+/// A file that defines its own `Vec`: only line 3's `Box` is `std`'s.
+const DEFINES_FIXTURE: &str = "pub struct Vec<T, A> { a: A, t: T }\nimpl<T, A> Vec<T, A> {}\nfn f() -> Box<u8> { loop {} }\n";
+
+fn compared(found: &[(usize, Kind)], want: &[(usize, Kind)]) -> String {
+    let extra: Vec<&(usize, Kind)> = found.iter().filter(|it| !want.contains(it)).collect();
+    let missing: Vec<&(usize, Kind)> = want.iter().filter(|it| !found.contains(it)).collect();
+    format!("\n  found   {found:?}\n  wanted  {want:?}\n  extra   {extra:?}\n  missing {missing:?}")
+}
+
+/// Ends the selftest with `e`, which a step of it did not expect.
+fn failed(e: &dyn fmt::Display) -> ! {
+    fail(&format!("{SCRIPT} selftest"), &e.to_string())
+}
+
+fn selftest() {
+    // The hand matchers, each against the pattern it reads.
+    expect(test_attr_end("#[test]").is_some() && test_attr_end("  #[tokio::test(flavor = \"x\")]").is_some(), "test attributes");
+    expect(test_attr_end("#[test_case(1)]").is_none() && test_attr_end("#[testing]").is_none(), "an attribute named for no test");
+    expect(
+        cfg_test_end("#[cfg(test)]", false) == Some(12)
+            && cfg_test_end("#[cfg(all(test, feature = \"x\"))]", false).is_some()
+            && cfg_test_end("#[cfg(testing)]", false).is_none()
+            && cfg_test_end("#![cfg(test)]", true).is_some()
+            && cfg_test_end("#[cfg(not(test))]", false).is_none(),
+        "`cfg(test)` and `cfg(all(test, ..))`",
+    );
+    expect(
+        module_decl("pub(crate) mod a;") == Some("a")
+            && module_decl("#[cfg(test)] mod t ;") == Some("t")
+            && module_decl("mod r#type;") == Some("type")
+            && module_decl("mod a {").is_none()
+            && module_decl("model;").is_none(),
+        "out-of-line module declarations",
+    );
+    expect(
+        declares_no_std("//! doc\n#![no_std]\n")
+            && declares_no_std("#![cfg_attr(not(test), no_std)]\n")
+            && !declares_no_std("// #![no_std]\n")
+            && !declares_no_std("#![cfg_attr(feature = \"x\", no_std)]\n"),
+        "a crate root's `#![no_std]`",
+    );
+    let mut leaves = Vec::new();
+    use_leaves("::blaze_own::{self, vec::{Vec as V, self}, *}", None, "", &mut leaves);
+    let pairs: Vec<(&str, &str)> = leaves.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    expect(
+        pairs == [("blaze_own", "blaze_own"), ("blaze_own", "V"), ("blaze_own", "vec"), ("blaze_own", "*")],
+        &format!("a use tree's leaves: {pairs:?}"),
+    );
+
+    // One file: every case of [`FIXTURE`], test code in, then out.
+    let all = code_sites(FIXTURE);
+    let mut want: Vec<(usize, Kind)> = FIXTURE_SITES.iter().chain(&FIXTURE_TEST_SITES).copied().collect();
+    want.sort();
+    expect(all == want, &format!("the fixture's sites, test code in: {}", compared(&all, &want)));
+    let found = scan_file(FIXTURE);
+    expect(found.sites == FIXTURE_SITES, &format!("the fixture's sites outside test code: {}", compared(&found.sites, &FIXTURE_SITES)));
+    expect(found.mods.is_empty() && !found.test, "the fixture declares no module out of line");
+    // Planted: the test module's attribute, then the test's, removed: their lines are sites.
+    let lines = scan_file(&FIXTURE.replace("#[cfg(test)]\n", "\n")).sites;
+    expect(lines.contains(&(16, Kind::Std)) && lines.contains(&(17, Kind::VecBox)), &format!("the test module unmarked counts: {lines:?}"));
+    let lines = scan_file(&FIXTURE.replace("#[test]\n", "\n")).sites;
+    expect(lines.contains(&(20, Kind::Std)) && lines.contains(&(20, Kind::VecBox)), &format!("the test function unmarked counts: {lines:?}"));
+    expect(scan_file("#![cfg(test)]\nuse std::fs;\n").sites.is_empty(), "a file that is test code holds no site");
+
+    // Imports and definitions make a name the file's own; planted: the same names from another
+    // crate are `std`'s again.
+    let own = code_sites(OWN_FIXTURE);
+    expect(own == [(4, Kind::VecBox)], &format!("names imported from blaze-own and the crate: {own:?}"));
+    let other = code_sites(&OWN_FIXTURE.replace("blaze_own", "hashbrown"));
+    expect(other == [(3, Kind::VecBox), (4, Kind::VecBox)], &format!("the same names from another crate: {other:?}"));
+    let glob = code_sites(GLOB_FIXTURE);
+    expect(glob.is_empty(), &format!("a glob of blaze-own: {glob:?}"));
+    let glob = code_sites(&GLOB_FIXTURE.replace("blaze_own", "std::collections"));
+    expect(glob == [(1, Kind::Std), (2, Kind::VecBox)], &format!("a glob of std: {glob:?}"));
+    let defines = code_sites(DEFINES_FIXTURE);
+    expect(defines == [(3, Kind::VecBox)], &format!("a file that defines `Vec`: {defines:?}"));
+
+    // A manifest's targets.
+    let package = manifest_targets("[package]\nname = \"a\"\n[lib]\npath = \"mod.rs\" # here\n[[bin]]\npath = \"b.rs\"\n[[bin]]\npath = \"c.rs\"\n[dependencies.x]\npath = \"../x\"\n", "m");
+    expect(
+        package == Ok(Some((Some("mod.rs".to_owned()), Some("b.rs".to_owned())))),
+        &format!("a package's `[lib]` and first `[[bin]]` path: {package:?}"),
+    );
+    expect(manifest_targets("[workspace]\nmembers = []\n", "m") == Ok(None), "a workspace's manifest is no crate");
+    expect(
+        manifest_targets("[package]\n[lib]\npath = mod.rs\n", "m") == Err(TreeError::NotAPath { manifest: "m".to_owned(), line: 3 }),
+        "a path that is no string is refused, naming its line",
+    );
+
+    // A tree: a crate on `std` with a build script, test files by path and by declaration and a
+    // `target`; a workspace holding a `#![no_std]` crate whose root is a `[lib] path`; a binary
+    // on `cfg_attr(not(test), no_std)` with no site; a test fixture's package.
+    let tmp = TempDir::new("ambient-selftest-").unwrap_or_else(|e| failed(&e));
+    let put = |path: &str, text: &str| {
+        let full = tmp.path().join(path);
+        let made = full.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&full, text));
+        made.unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &format!("{path} is not written: {e}")));
+    };
+    let uses_std = "use std::fs;\n";
+    put("crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
+    put("crates/a/src/lib.rs", FIXTURE);
+    put("crates/a/src/x.rs", "#[cfg(test)]\nmod t;\n");
+    put("crates/a/src/x/t.rs", uses_std);
+    put("crates/a/build.rs", uses_std);
+    put("crates/a/tests/it.rs", uses_std);
+    put("crates/a/tests/fixture/Cargo.toml", "[package]\nname = \"fixture\"\n");
+    put("crates/a/tests/fixture/src/lib.rs", uses_std);
+    put("crates/a/target/debug/build/out.rs", uses_std);
+    put("crates/b/Cargo.toml", "[workspace]\n");
+    put("crates/b/c/Cargo.toml", "[package]\nname = \"c\"\n[lib]\npath = \"mod.rs\"\n");
+    put("crates/b/c/mod.rs", "#![no_std]\nextern crate alloc;\n");
+    put("crates/d/Cargo.toml", "[package]\nname = \"d\"\n");
+    put("crates/d/src/main.rs", "#![cfg_attr(not(test), no_std)]\nfn main() {}\n");
+    let counts = count(tmp.path()).unwrap_or_else(|e| failed(&e));
+    let lib = "crates/a/src/lib.rs";
+    let mut a = sites_of(lib, &[(1, Kind::IsStd)]);
+    a.extend(sites_of("crates/a/build.rs", &[(1, Kind::Std)]));
+    a.extend(sites_of(lib, &FIXTURE_SITES));
+    let want = BTreeMap::from([("a".to_owned(), a), ("b/c".to_owned(), sites_of("crates/b/c/mod.rs", &[(2, Kind::Alloc)]))]);
+    expect(counts == want, &format!("the tree's sites: {}", shown(&counts)));
+    expect(total(&counts) == [3, 1, 3, 7], &format!("the totals: {:?}", total(&counts)));
+
+    // The ratchet. As recorded, nothing is wrong, and the list reads back as it was written.
+    let rows = parse_rows(&render(&counts)).unwrap_or_else(|e| failed(&e));
+    expect(
+        rows == BTreeMap::from([("a".to_owned(), [3, 1, 2, 7]), ("b/c".to_owned(), [0, 0, 1, 0])]),
+        &format!("the rows read back: {rows:?}"),
+    );
+    expect(problems(&counts, &rows, Some(&rows), None).is_empty(), "the tree as recorded is right");
+    // Planted: one collection added, named by its crate, column and place given the base's
+    // diff, with what to write instead and the rule.
+    let mut fewer = rows.clone();
+    fewer.insert("a".to_owned(), [3, 1, 2, 6]);
+    let added = BTreeMap::from([(lib.to_owned(), BTreeSet::from([4]))]);
+    let said = problems(&counts, &fewer, None, Some(&added));
+    expect(
+        said.len() == 1
+            && said[0].contains("`a` has 7 lines naming a collection of `std` or `alloc`")
+            && said[0].contains("over its row's `vec_box` 6")
+            && said[0].contains("new: crates/a/src/lib.rs:4)")
+            && said[0].contains("blaze_own::Vec<T, A>")
+            && said[0].contains("rule 75"),
+        &format!("one collection added is caught and named: {said:?}"),
+    );
+    // Planted: the root's `#![no_std]` taken away, named by the root.
+    let mut no_std = rows.clone();
+    no_std.insert("a".to_owned(), [3, 0, 2, 7]);
+    let said = problems(&counts, &no_std, None, None);
+    expect(
+        said.len() == 1 && said[0].contains("`is_std` 0") && said[0].contains("its root crates/a/src/lib.rs has no `#![no_std]`"),
+        &format!("a root on `std` is caught: {said:?}"),
+    );
+    // Planted: one site removed. Its column must come down; a crate with none left goes.
+    let mut more = rows.clone();
+    more.insert("b/c".to_owned(), [0, 0, 2, 0]);
+    let said = problems(&counts, &more, None, None);
+    expect(said.len() == 1 && said[0].contains("`b/c`") && said[0].contains("lower its `alloc` to 1"), &format!("one site removed: {said:?}"));
+    let mut gone = rows.clone();
+    gone.insert("old".to_owned(), [1, 0, 0, 0]);
+    let said = problems(&counts, &gone, None, None);
+    expect(said.len() == 1 && said[0].contains("`old`") && said[0].contains("remove the row"), &format!("a crate gone: {said:?}"));
+    // Planted: a crate with no row is held to 0; a row raised above the base's is caught even
+    // where the tree matches it.
+    let said = problems(&counts, &BTreeMap::from([("a".to_owned(), [3, 1, 2, 7])]), None, None);
+    expect(said.len() == 1 && said[0].contains("`b/c` has 1") && said[0].contains("held"), &format!("a new crate starts at 0: {said:?}"));
+    let said = problems(&counts, &rows, Some(&fewer), None);
+    expect(said.len() == 1 && said[0].contains("the row `a`'s `vec_box` is 7 and was 6 at the base"), &format!("a row raised: {said:?}"));
+
+    // A package with no root this script finds is refused, naming its manifest.
+    put("crates/e/Cargo.toml", "[package]\nname = \"e\"\n");
+    let refused = count(tmp.path());
+    expect(
+        refused == Err(TreeError::NoRoot { manifest: "crates/e/Cargo.toml".to_owned() }),
+        &format!("a package with no root: {:?}", refused.err()),
+    );
+
+    // The base's diff: hunks of added lines, a deleted file, a hunk that only removes.
+    // The first hunk adds a line whose text starts `++ `: it is no file's header.
+    let diff = "diff --git a/crates/a/src/lib.rs b/crates/a/src/lib.rs\n--- a/crates/a/src/lib.rs\n+++ b/crates/a/src/lib.rs\n\
+        @@ -2,0 +3 @@ fn f() {\n+++ b/not/a/file\n@@ -9 +10,2 @@\n-old\n+y\n+z\n@@ -20 +21,0 @@\n-w\n\
+        diff --git a/crates/a/src/gone.rs b/crates/a/src/gone.rs\n--- a/crates/a/src/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-v\n";
+    let lines = added_lines(diff).unwrap_or_else(|e| failed(&e));
+    expect(lines == BTreeMap::from([(lib.to_owned(), BTreeSet::from([3, 10, 11]))]), &format!("the lines added: {lines:?}"));
+    expect(added_lines("@@ nonsense\n").is_err_and(|e| matches!(e, BaseError::Hunk { .. })), "a hunk that is none is refused");
+    expect(
+        parse_rows("a\t1\t0\t0\t0\nb 2\n").is_err_and(|e| e == ListError::NotARow { line: 2, text: "b 2".to_owned() })
+            && parse_rows("a\t1\t0\t0\t0\na\t2\t0\t0\t0\n").is_err_and(|e| matches!(e, ListError::TwoRows { line: 2, .. }))
+            && parse_rows("a\t0\t2\t0\t0\n").is_err_and(|e| matches!(e, ListError::NotABit { line: 1, found: 2, .. }))
+            && parse_rows("a\t1\t0\t0\n").is_err()
+            && parse_rows("a\t1\t0\t0\tx\n").is_err()
+            && parse_rows("\t1\t0\t0\t0\n").is_err(),
+        "a bad row is refused, naming its line",
+    );
+    println!("{SCRIPT} selftest: ok");
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [one] if one == "selftest" => selftest(),
+        [one] => main_with(&input::parse::<Args>(one, SCRIPT)),
+        _ => {
+            eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The script's own cases run under `blaze test` and `cargo test` too: one that fails ends
+    /// the test process with status 1, which fails the run.
+    #[test]
+    fn the_selftest_holds() {
+        selftest();
+    }
+}

@@ -40,6 +40,7 @@ use crate::column::{
 use crate::error::BuildError;
 // `byte_enum!` names `fmt`, `Portable`, `FormatError` and `at_of` where it is called.
 use crate::kind::{ItemIndex, ItemKind, Range, WrittenVis, WrittenVisTag, byte_enum};
+use crate::path::Rename;
 
 /// What an entry is, and what each kind has that the others have not. Every range is relative
 /// to the entry's start. Its kind alone, the byte records and keys hold, is [`ItemDetail::kind`].
@@ -64,8 +65,9 @@ pub enum ItemDetail {
     Mod { inline: bool, path: Option<Range> },
     /// `use`: the use tree (no `use`, no `;`).
     Use { tree: Option<Range> },
-    /// `extern crate name as rename;`; the name is [`Item::name`].
-    ExternCrate { rename: Option<Rename> },
+    /// `extern crate name as rename;`; the name is [`Item::name`], and the rename's name a
+    /// range of the item.
+    ExternCrate { rename: Rename<Range> },
     /// `extern "abi" { .. }`; its foreign items are its children. `abi`: `extern "abi"`.
     ExternBlock { abi: Option<Range> },
     /// `macro_rules! name { .. }`. `exported`: it has an outer `#[macro_export]`.
@@ -145,9 +147,9 @@ impl ItemDetail {
             | ItemDetail::ExternBlock { abi: first }
             | ItemDetail::Variant { discriminant: first } => Payload { first, ..none },
             ItemDetail::ExternCrate { rename } => match rename {
-                None => none,
-                Some(Rename::Name(name)) => Payload { first: Some(name), ..none },
-                Some(Rename::Underscore) => Payload { flag: true, ..none },
+                Rename::Same => none,
+                Rename::To(name) => Payload { first: Some(name), ..none },
+                Rename::Underscore => Payload { flag: true, ..none },
             },
             ItemDetail::MacroRules { exported } => Payload { flag: exported, ..none },
             ItemDetail::MacroCall { path: first, input: second }
@@ -185,9 +187,9 @@ impl ItemDetail {
             ItemKind::Use => ItemDetail::Use { tree: first },
             ItemKind::ExternCrate => ItemDetail::ExternCrate {
                 rename: match (first, flag) {
-                    (Some(name), _) => Some(Rename::Name(name)),
-                    (None, true) => Some(Rename::Underscore),
-                    (None, false) => None,
+                    (Some(name), _) => Rename::To(name),
+                    (None, true) => Rename::Underscore,
+                    (None, false) => Rename::Same,
                 },
             },
             ItemKind::ExternBlock => ItemDetail::ExternBlock { abi: first },
@@ -200,15 +202,6 @@ impl ItemDetail {
             ItemKind::Unhandled => ItemDetail::Unhandled { syntax },
         }
     }
-}
-
-/// An `extern crate`'s `as ..`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Rename {
-    /// `as name`: the name.
-    Name(Range),
-    /// `as _`.
-    Underscore,
 }
 
 blaze_format::record! {

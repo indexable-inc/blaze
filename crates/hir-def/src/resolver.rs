@@ -284,7 +284,7 @@ impl<'db> Resolver<'db> {
         // name they are looked up by, taken at the first generic parameters met.
         let mut keyed = None;
         let mut param_name = || {
-            *keyed.get_or_insert_with(|| crate::nameres::path_param_name(db, *first_name, hygiene))
+            *keyed.get_or_insert_with(|| crate::nameres::path_param_name(db, self.ctx_table(), *first_name, hygiene))
         };
         if skip_to_mod {
             return match hygienic {
@@ -489,7 +489,7 @@ impl<'db> Resolver<'db> {
         let mut keyed = None;
         let mut param_name = || {
             *keyed.get_or_insert_with(|| {
-                crate::nameres::path_param_name(db, *first_name, path_hygiene)
+                crate::nameres::path_param_name(db, self.ctx_table(), *first_name, path_hygiene)
             })
         };
         let skip_to_mod = path.kind != PathKind::Plain && !path.is_self();
@@ -529,13 +529,10 @@ impl<'db> Resolver<'db> {
                     }
                     Scope::MacroDefScope { store, scope_id } => {
                         let info =
-                            macro_hygiene.get_or_insert_with(|| hygiene_info(db, hygiene_id));
-                        handle_macro_def_scope(
-                            db,
-                            &mut hygiene_id,
-                            info,
-                            self.macro_def(store, scope_id),
-                        )
+                            macro_hygiene.get_or_insert_with(|| hygiene_info(db, self.ctx_table(), hygiene_id));
+                        handle_macro_def_scope(db, self.ctx_table(), &mut hygiene_id,
+                        info,
+                        self.macro_def(store, scope_id),)
                     }
                     Scope::GenericParams { params, def } => {
                         if let GenericDefId::ImplId(impl_) = def
@@ -909,6 +906,13 @@ impl<'db> Resolver<'db> {
         self.module_scope.def_map.krate()
     }
 
+    /// The arena whose syntax-context table the hygiene of what this resolver resolves is of:
+    /// its crate's, where the expansions of the bodies it is in made their contexts
+    /// ([`crate::nameres::crate_table`]).
+    pub fn ctx_table(&self) -> blaze_memo::ArenaId {
+        crate::nameres::crate_table(self.krate())
+    }
+
     pub fn def_map(&self) -> &DefMap {
         self.item_scope_().0
     }
@@ -941,6 +945,7 @@ impl<'db> Resolver<'db> {
             true => None,
             false => crate::nameres::def_site::privacy_scope(
                 db,
+                self.ctx_table(),
                 hygiene.syntax_context(),
                 expn,
                 self.module(),
@@ -1009,8 +1014,8 @@ impl<'db> Resolver<'db> {
         new_name: &Symbol,
         to_be_renamed: BindingId,
     ) -> Option<BindingId> {
-        let mut hygiene_info = hygiene_info(db, hygiene_id);
-        let param_name = crate::nameres::path_param_name(db, *current_name, hygiene_id);
+        let mut hygiene_info = hygiene_info(db, self.ctx_table(), hygiene_id);
+        let param_name = crate::nameres::path_param_name(db, self.ctx_table(), *current_name, hygiene_id);
         let mut will_be_resolved_to = None;
         for scope in self.scopes() {
             match scope {
@@ -1027,12 +1032,9 @@ impl<'db> Resolver<'db> {
                         }
                     }
                 }
-                Scope::MacroDefScope { store, scope_id } => handle_macro_def_scope(
-                    db,
-                    &mut hygiene_id,
-                    &mut hygiene_info,
-                    self.macro_def(store, scope_id),
-                ),
+                Scope::MacroDefScope { store, scope_id } => handle_macro_def_scope(db, self.ctx_table(), &mut hygiene_id,
+                &mut hygiene_info,
+                self.macro_def(store, scope_id),),
                 Scope::GenericParams { params, def } => {
                     if params.find_const_by_name(&param_name, def).is_some() {
                         // It does not resolve to our renamed variable.
@@ -1062,8 +1064,8 @@ impl<'db> Resolver<'db> {
         mut hygiene_id: HygieneId,
         to_be_renamed: BindingId,
     ) -> Option<BindingId> {
-        let mut hygiene_info = hygiene_info(db, hygiene_id);
-        let param_name = crate::nameres::path_param_name(db, *name, hygiene_id);
+        let mut hygiene_info = hygiene_info(db, self.ctx_table(), hygiene_id);
+        let param_name = crate::nameres::path_param_name(db, self.ctx_table(), *name, hygiene_id);
         let mut will_resolve_to_renamed = false;
         for scope in self.scopes() {
             match scope {
@@ -1082,12 +1084,9 @@ impl<'db> Resolver<'db> {
                         }
                     }
                 }
-                Scope::MacroDefScope { store, scope_id } => handle_macro_def_scope(
-                    db,
-                    &mut hygiene_id,
-                    &mut hygiene_info,
-                    self.macro_def(store, scope_id),
-                ),
+                Scope::MacroDefScope { store, scope_id } => handle_macro_def_scope(db, self.ctx_table(), &mut hygiene_id,
+                &mut hygiene_info,
+                self.macro_def(store, scope_id),),
                 Scope::GenericParams { params, def } => {
                     if params.find_const_by_name(&param_name, def).is_some() {
                         // Here and below, it might actually resolve to our renamed variable - in which case it'll
@@ -1179,6 +1178,7 @@ impl<'db> Resolver<'db> {
 #[inline]
 fn handle_macro_def_scope(
     db: &Db,
+    table: blaze_memo::ArenaId,
     hygiene_id: &mut HygieneId,
     hygiene_info: &mut Option<(SyntaxContext, MacroDefId)>,
     macro_id: &MacroDefId,
@@ -1189,21 +1189,25 @@ fn handle_macro_def_scope(
         // A macro is allowed to refer to variables from before its declaration.
         // Therefore, if we got to the rib of its declaration, give up its hygiene
         // and use its parent expansion.
-        *hygiene_id = HygieneId::new(parent_ctx.opaque_and_semiopaque(db));
-        *hygiene_info = parent_ctx.outer_expn(db).map(|expansion| {
+        *hygiene_id = HygieneId::new(parent_ctx.opaque_and_semiopaque(db, table));
+        *hygiene_info = parent_ctx.outer_expn(db, table).map(|expansion| {
             let expansion = hir_expand::MacroCallId::from(expansion).loc(db);
-            (parent_ctx.parent(db), expansion.def)
+            (parent_ctx.parent(db, table), expansion.def)
         });
     }
 }
 
 #[inline]
-fn hygiene_info(db: &Db, hygiene_id: HygieneId) -> Option<(SyntaxContext, MacroDefId)> {
+fn hygiene_info(
+    db: &Db,
+    table: blaze_memo::ArenaId,
+    hygiene_id: HygieneId,
+) -> Option<(SyntaxContext, MacroDefId)> {
     if !hygiene_id.is_root() {
         let ctx = hygiene_id.syntax_context();
-        ctx.outer_expn(db).map(|expansion| {
+        ctx.outer_expn(db, table).map(|expansion| {
             let expansion = hir_expand::MacroCallId::from(expansion).loc(db);
-            (ctx.parent(db), expansion.def)
+            (ctx.parent(db, table), expansion.def)
         })
     } else {
         None
@@ -1256,7 +1260,7 @@ impl<'db> Resolver<'db> {
         _ns: Namespace,
         hygiene: HygieneId,
     ) -> Option<Option<(ModuleItemMap<'a>, ModPath)>> {
-        match hygienic_origin(db, self.module(), hygiene) {
+        match hygienic_origin(db, self.ctx_table(), self.module(), hygiene) {
             Hygienic::Here => None,
         }
     }

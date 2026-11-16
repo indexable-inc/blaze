@@ -115,8 +115,14 @@ Deferred work sits in typed queues and is processed where rustc processes it:
 
 - `casts`: cast checks, after fallback (`check_casts`).
 - `numeric`: every integer and float variable the driver made, for fallback to `i32` and `f64`.
-- `diverging`: variables that received a `!` by coercion, for never-type fallback (`()` before
-  edition 2024, `!` from it).
+- `diverging`: variables that received a `!` by coercion, for never-type fallback (`!` in every
+  edition on the pinned rustc 1.100, as Relax's port of fallback.rs @8d1a764 has it), which
+  runs before the integer and float fallback.
+
+A probe or a failed `commit_if` rolls back the machine, not only the type context: the
+diagnostics and error count, the adjustments, callees, fields and captures written, and every
+queue above, by length; the type context rolls back its variables and pending obligations. The
+read list is kept: a failed probe's outcome was decided by what it read.
 - `closures`: closures whose capture analysis runs after selection (`closure_analyze`), and
   calls of a closure whose kind was not known yet (rustc's deferred call resolutions).
 - `coerce_many`: the state of each `if`/`match`/loop/block-break/return site.

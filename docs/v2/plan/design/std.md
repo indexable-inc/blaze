@@ -129,6 +129,7 @@ Until blaze sets `cfg(blaze)` it compiles the plain forms, which it accepts as a
 | contracts (`budget`, `clock`, `kv`, `fs`) | `#[core::contracts::ensures]`, run under `contract_checks` | native `requires`/`ensures`: after the switch |
 | `own`'s walk (`reach`, `raw`) | nightly's `type_info` and `#[rustc_comptime]` | `raw::name` (`core::reflect::name_of`); plain: a fixed word, so a refusal names fields, not types |
 | `Acyclic`, `NoCapability` | the traits, the questions, `none` | the `where const` impls (`own/extended.rs`); plain: a blanket impl, with the walk asserted in a `const` where `Shared::holding` and `Shares::new` make a handle |
+| `Flat` | the trait, `Address`, the question `AnyAddress`, `is_flat` | the `where const` impl (`flat/extended.rs`); plain: a blanket impl, with `is_flat::<T>()` asserted in a `const` where `chan::bounded` makes a channel |
 | `Shares` | the type, `Deref`, `Send`/`Sync`, `Owns` | `where const` and `{ N + M }` (`own/shares/extended.rs`); plain (`plain.rs`): the same conditions as `const` assertions, `join` with the sum as a parameter `S` |
 | `eval` | `Eval`, `Point`, keys, providers | `MemoPoint` and `code_id_of` (`core::reflect`); plain: every type is a point, and its identity is its `TypeId`'s, for one process |
 | linear types (`Scope`, `Pending`, `File`, `Conn`, ...) | the types and their abandonment path in `Drop`, `#[must_use]` | leaving one unfinished is a compile error under blaze only |
@@ -411,12 +412,24 @@ function. ([may-suspend](may-suspend.md) is the analysis underneath.)
   typed outcome (`Ready`, `Stopped::Deadline`, `Stopped::Cancelled`). Locks, channels, sleeps and
   every IO call are built on it, which is why each takes a `Cx`. Nothing can wait for ever (rules
   `bounded-progress`, `deadline-waits`).
-- **Structured only.** `cx.scope(|s| s.spawn("name", |cx| ..))`. The child's `cx` is borrowed
-  from the scope, so a task cannot outlive it; children may borrow from the parent, as
-  `std::thread::scope` allows. There is no detached task and no `io.tasks()`: starting work is
-  something a `Cx` does.
-- **`spawn` means "may run in any order"; `spawn_concurrent` means "must overlap"** and is a
-  compile error where the layout cannot overlap.
+- **Structured only.** `cx.scope(|s| s.may_overlap("name", scratch, |cx| ..))`. The child's
+  `cx` is borrowed from the scope, so a task cannot outlive it; children may borrow from the
+  parent, as `std::thread::scope` allows. There is no detached task and no `io.tasks()`:
+  starting work is something a `Cx` does.
+- **May overlap, or must** (from Zig's `std.Io`, `async` against `concurrent`). The spawn form
+  says what the code's correctness rests on, at the one seam, the scope:
+  - `scope.may_overlap(..)`: the task may run later or at the same time as what follows, and
+    the code is correct either way. With no worker free it runs inline, to completion, at its
+    spawn; the one-thread executor (the simulation's, a test runner narrowed to one worker)
+    runs every one inline, in spawn order. `par`'s chunks are these.
+  - `scope.must_overlap(..)`: the code is correct only if the task and its spawner make
+    progress at once (a producer and a consumer of one bounded channel). Where the scope has
+    fewer workers than that (`Scope::workers`: the layout's, narrowed by the scope's budget,
+    `narrow_workers`), the task never runs and the call returns a typed `NoParallelism {
+    needed, have, .. }` at once, before anything waits: never a deadlock that ends only at
+    its deadline. The scope is not failed by it; the caller says what follows.
+  - Built by blaze, `must_overlap` where the build's layout has one worker becomes a compile
+    error; the plain form is the run-time refusal, and `Inline` refuses every one.
 - **Spawn is eager, and cancellation is a value.** A cancelled task learns it only as
   `Stopped::Cancelled` from its next wait. Nothing is cancelled by being dropped, and user code
   never holds a task that has not started or is half run.
@@ -448,7 +461,7 @@ The simulation is not a layout: `Io::sim(seed)` picks a seeded scheduler and wor
 under any layout.
 
 **A started task never changes its thread** ([bottom](bottom.md), "Fibers and `Send`"). A new
-task may be placed on any worker (`Scope::spawn` and every `par` chunk); once it has started it
+task may be placed on any worker (`Scope::may_overlap` and every `par` chunk); once it has started it
 resumes from each wait on that worker and OS thread, so a value that is not `Send` (an `Rc`, a
 `LocalLock`, a guard) held across a wait is still on the thread that made it. That is the
 contract of the plain form, the one rustc builds: a fiber or frames scheduler must put a parked
@@ -476,7 +489,12 @@ copies of the code. The differential test below builds twice instead.)
   `dyn` methods and function-pointer fields is also the calling-convention fact `Frames` needs.
 - What `Frames` cannot do is an error with the call path, never a quiet switch to a fiber (rule
   `no-fallback`): for one, a foreign (C) frame live across a wait.
-- `spawn_concurrent` under `Inline` is an error.
+- `must_overlap` under a layout with one worker (`Inline`) is an error; until blaze checks it,
+  it is the run-time `NoParallelism`, returned before the task runs.
+- A layout with more than one worker runs a `must_overlap` task beside its spawner. None is
+  built: a task's `Cx` is made on its spawner's thread and is not `Send`, so a `Threads`
+  layout first needs a `Send` seed of a task's context (its deadline, cancellation, plant and
+  world) from which the worker makes the `Cx` and frame on its own thread.
 - A task cannot outlive its scope: the lifetime on the child's `cx` enforces it.
 - In ordinary crates, where thread-locals still exist, their address is reloaded after any call
   that may wait.
@@ -870,6 +888,10 @@ they mean.
 | `Cell<T>` | `Cell` | unchanged |
 | `RawCell<T>` | `UnsafeCell` | trusted code only |
 
+- **Or none.** Tasks that only hand each other `Flat` values (`bstd::flat`: no pointer,
+  reference, cell, capability, allocator or machine-local id inside) share no memory, so there
+  is nothing to lock between them: a flat channel (`chan::bounded`) is the default way two
+  tasks talk, and every row below is for state that must be shared.
 - **Which sharing.** Borrow from a scope when the owners' lifetimes nest: the default, and it
   costs nothing. `Shares` when the number of owners is fixed and known as the crate compiles:
   each holds a fraction, any part reads, the whole writes or takes the value out. `Shared` over
@@ -913,7 +935,9 @@ purpose. All live in `bstd::sync`, except `par`.
 | build a table, then share it read-only | `Building<T>` then `.freeze()` to `Frozen<T>` | `Arc<RwLock<T>>` read for ever |
 | readers that never block, a writer replacing the whole value | `Swap<T>` | `RwLock<T>`, `ArcSwap` |
 | compute a key once while other askers wait | `Flight<K, V, E>` | a map of `OnceLock`s, a lock held over the computation |
-| hand values from task to task | `Chan<T>` (bounded) | an unbounded channel |
+| hand values from task to task | `chan::bounded::<T: Flat>`: a `Chan` of flat messages | an unbounded channel; `Arc<Mutex<_>>` messages |
+| hand over what a value owns (a buffer, a handle, a capability), in this process | `chan::owned`: an `OwnedChan` | the same, unbounded |
+| run a producer and its consumer at once | `scope.must_overlap` for one of them | `may_overlap`, which runs it inline into its deadline on one worker |
 | count, flag, number versions, publish one value | `Counter`, `Flag`, `Seq`, `PublishOnce<T>` | `AtomicU64` with an ordering chosen at each call |
 | hold two locks at once | `RankedLock<T, R>` | two `Lock`s and a comment about their order |
 | state for one thread | `LocalLock`, `LocalOnce`, `LocalLazy`, `LocalShared` | `thread_local!` |
@@ -938,9 +962,35 @@ purpose. All live in `bstd::sync`, except `par`.
   its oldest finished key or refusing with `FlightError::Full`. Cost: a scan of the table under
   its lock per ask (a hashed core is the same interface for large tables), a clone of the value
   per asker.
-- `Chan<T>`: its capacity is an argument and its room is allocated when made; `send` and `recv`
-  take `cx` and end in `Stopped` at its deadline, a send giving its value back; closed is a
-  typed outcome after what is left is drained. Cost: a lock, a move and a notify per value.
+- `Chan<T, A, M>`: its capacity is an argument and its ring of that many slots is allocated
+  when made; `send` and `recv` take `cx` and end in `Stopped` at its deadline, a send giving
+  its value back; closed is a typed outcome after what is left is drained. One type, one ring,
+  told apart by `M` (`Copies` from `chan::bounded`, `Moves` from `chan::owned`): only the
+  constructors differ. Cost: a lock, a copy into or out of a slot and a notify per value; no
+  allocation and no reference count per message.
+
+**Why messages are flat by default** (the idea is Goose's: each thread its own program, and
+only flat values through typed queues, so data races, locks and atomics do not exist between
+them). `Flat` is derived by the same walk as `Acyclic` (`AnyAddress` finds a raw pointer,
+reference or function pointer, an owning or counted pointer, a cell, a capability, an
+allocator, a `usize`, or a type that says it is a machine-local id by `impl Address`; and drop
+glue is refused), so the bound costs nothing at run time. Three things follow:
+
+- **A flat message crosses to a remote worker unchanged.** Remote execution is the same driver
+  with another executor; a message whose bytes are all of it is already what the wire carries,
+  so the code that sends to a local task sends to a remote one. An `OwnedChan`'s message, a
+  `Box` or a handle, cannot leave the process at all.
+- **No atomic reference counts on 128 cores.** Sending an `Arc` per job makes every receive
+  and every drop an atomic on a shared line; a flat message is copied into a slot and out
+  again, and the lines it touches are the ring's.
+- **No shared mutable state by accident.** A flat value holds no cell and no pointer, so the
+  receiver cannot write anything the sender reads; the sharing that remains is the rows above,
+  each named.
+
+`chan::owned` is the right one when the receiver must own memory or authority the sender made
+and moving it beats copying it: a large buffer filled in the sender's allocator, a narrowed
+capability handed to a worker task. Prefer a flat key or index into data borrowed from the
+scope.
 - `Counter` (relaxed: a total publishes nothing), `Flag` (release set, acquire read), `Seq`
   (acquire/release steps), `PublishOnce<T>` (set once, never waits; a second set gets its value
   back). Cost: one atomic instruction each.
@@ -950,8 +1000,10 @@ purpose. All live in `bstd::sync`, except `par`.
   it holds a guard. Cost: what a `Lock` costs; the ranks are types.
 
 **What the types enforce, and what is convention.** Enforced: disjoint chunks; a frozen value
-never changes; a channel's bound (no constructor without one); every wait takes `cx`; rank
-order; one token a task. By convention until blaze's checks: that ranked code reaches its `Cx`
+never changes; a channel's bound (no constructor without one); a flat channel's messages hold
+no address (at the bound built by blaze, by a `const` assertion in `chan::bounded` under
+rustc); a `must_overlap` task is never run inline; every wait takes `cx`; rank order; one
+token a task. By convention until blaze's checks: that ranked code reaches its `Cx`
 only through the token (blaze's "a guard or a value that is not `Send` live across a call that
 can wait" makes it a compile error everywhere); the atomics' orderings, argued in their docs and
 not yet run under blaze-check's interleavings.
@@ -1295,6 +1347,7 @@ Lints the second rule implies:
 | `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here. Not built with `default_policy` because the lints read no effect summary yet (`instance_effects` is the MIR walk's, with no query the lint pass can ask per function), and the `Sync` and `Write` kinds are not rows of `effect_attrs::ROWS` |
 | `blaze::default_policy` | `impl Default`, `#[derive(Default)]`, or a `new()` with no arguments, for a type with a field marked `#[blaze::policy]` (a cost or a guarantee) | yes: `crates/blaze-lints/src/blaze/default_policy.rs`, on in bstd; `Limits`, `SimWorld::limits`, `Wire` and `MemoLimit` are marked |
 | `.clippy.toml` bans of the removed names (`Dir::write`, `File::sync`, `File::replace`, `Conn::send`, `End::write`) | a use of one, by resolution | no: the names are gone from bstd, so the ban is for crates that move onto it (S3) |
+| `Flat` (`where const { is_flat::<T>() }`; plain: the `const` assertion in `chan::bounded`) | a flat channel of a type with an address or drop glue in it, naming the field path built by blaze | yes: the walk's answers in `src/tests/flat.rs`; the refused channel is a `compile_fail` example in `flat.rs`, which runs once bstd's doc tests do (`doctest = false` in its manifest today) |
 | compile-fail fixtures for bstd | `written.clone_to(..)`; a `Buffered` dropped; a write through a handle narrowed to read-only; a call of a removed name (`Dir::write`) | yes: `bstd_the_wrong_call_does_not_compile` in `crates/blaze-engine/tests/repro.rs` runs `blaze check` on each file of `crates/blaze-engine/tests/repro/bstd_the_wrong_call_does_not_compile/wrong`, beside a control that checks |
 
 **`blaze::implicit_policy`**, for crates on the trusted list that are libraries (bstd first).

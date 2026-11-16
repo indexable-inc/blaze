@@ -1,6 +1,6 @@
 //! The other records name resolution reads (docs/v2/plan/design/bottom.md, "The other records
-//! names need"): [`TextualEntry`] and [`ModuleFile`]; [`crate::CrateRoot`] and
-//! [`crate::MacroDef`] are in their own modules.
+//! names need"): [`TextualEntry`] and [`ModuleFile`]; the crate root
+//! ([`crate::CrateRootBuilder`]) and [`crate::MacroDef`] are in their own modules.
 
 use core::alloc::Allocator;
 use core::mem::offset_of;
@@ -53,7 +53,7 @@ impl<A: Allocator + Clone> TextualEntry<A> {
         }
     }
 
-    /// The next `macro_rules!` in textual order: its name and its [`MacroDef`]'s item.
+    /// The next `macro_rules!` in textual order: its name and its [`crate::MacroDef`]'s item.
     pub fn push(&mut self, name: &str, def: ItemKey) -> Result<(), BuildError> {
         let name = self.staging.push(name, "TextualEntry strings")?;
         self.rows.push(MacroRow { name, def: def.0 });

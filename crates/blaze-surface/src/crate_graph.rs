@@ -514,7 +514,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
 
 /// One dependency as the graph holds it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Dep<'a> {
+pub struct DepEdge<'a> {
     pub on: CrateIndex,
     pub name: &'a str,
     pub flags: EdgeFlags,
@@ -656,7 +656,7 @@ impl<'a> CrateGraphView<'a> {
     }
 
     /// The crate's dependencies, sorted by extern name.
-    pub fn deps(&self, of: CrateIndex) -> impl Iterator<Item = Dep<'a>> + use<'a> {
+    pub fn deps(&self, of: CrateIndex) -> impl Iterator<Item = DepEdge<'a>> + use<'a> {
         let krate = self.crates[of.at()];
         let (names, edges): (&'a [u8], &'a [EdgeRow]) = (self.names, self.edges);
         edges[krate.edges_at as usize..][..krate.edges_len as usize].iter().map(move |edge| {
@@ -665,7 +665,7 @@ impl<'a> CrateGraphView<'a> {
                 Ok(name) => name,
                 Err(_) => unreachable!("a name checked when the graph was read"),
             };
-            Dep { on: CrateIndex(edge.dep), name, flags: EdgeFlags(edge.flags as u16) }
+            DepEdge { on: CrateIndex(edge.dep), name, flags: EdgeFlags(edge.flags as u16) }
         })
     }
 

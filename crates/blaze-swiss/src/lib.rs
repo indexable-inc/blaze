@@ -29,6 +29,7 @@ extern crate std;
 
 use core::alloc::Allocator;
 
+use blaze_int::Int;
 use blaze_own::{Box, Vec};
 
 // The atomics are `core`'s, or under `cfg(blaze_check)` the model checker's
@@ -56,13 +57,15 @@ pub const DEAD: u8 = 0x80;
 /// it; it is part of `intern`'s image layout, so it never changes.
 #[inline]
 pub fn tag(hash: u64) -> u8 {
-    0x80 | (hash >> 57) as u8
+    // `hash >> 57` is seven bits: it fits a `u8`.
+    0x80 | (hash >> 57).narrow_or_stop::<u8>()
 }
 
 /// [`tag`] with 0 folded into 1, so no key's tag is [`DEAD`]: for tables that remove keys.
 #[inline]
 pub fn live_tag(hash: u64) -> u8 {
-    0x80 | ((hash >> 57) as u8).max(1)
+    // `hash >> 57` is seven bits: it fits a `u8`.
+    0x80 | (hash >> 57).narrow_or_stop::<u8>().max(1)
 }
 
 /// A group's control word: byte `i` (from the least significant) is slot `i`'s tag, [`EMPTY`]
@@ -119,7 +122,8 @@ impl<const SLOTS: usize> Ctrl<SLOTS> {
     #[inline]
     pub fn tag_at(self, slot: usize) -> u8 {
         debug_assert!(slot < SLOTS);
-        (self.0 >> (slot * 8)) as u8
+        // The slot's byte: the bytes above it are dropped on purpose.
+        (self.0 >> (slot * 8)).truncate_to::<u8>()
     }
 
     /// The word with slot `slot`'s tag set to `tag`.
@@ -143,7 +147,7 @@ impl Slots {
 
     #[inline]
     pub fn first(self) -> Option<usize> {
-        self.any().then(|| (self.0.trailing_zeros() / 8) as usize)
+        self.any().then(|| (self.0.trailing_zeros() / 8).widen_to::<usize>())
     }
 }
 
@@ -194,7 +198,7 @@ pub fn find<const SLOTS: usize, T>(
 ) -> Option<T> {
     debug_assert!(groups.is_power_of_two());
     let mask = groups - 1;
-    let mut group = hash as usize & mask;
+    let mut group = hash.truncate_to::<usize>() & mask;
     loop {
         let word = ctrl(group);
         for slot in word.matching(tag) {
@@ -219,7 +223,7 @@ pub fn vacant<const SLOTS: usize>(
 ) -> At<SLOTS> {
     debug_assert!(groups.is_power_of_two());
     let mask = groups - 1;
-    let mut group = hash as usize & mask;
+    let mut group = hash.truncate_to::<usize>() & mask;
     loop {
         let word = ctrl(group);
         if let Some(slot) = word.empty().first() {

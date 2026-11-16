@@ -230,6 +230,27 @@ jobs:
             echo "no base to compare with (a run by hand): each crate is held to its row only"
             "$BLAZE_SCRIPTS/thirdparty" '{"command": "check"}'
           fi
+      # `std` and `alloc` only go down, to none (docs/v2/plan/design/bottom.md: blaze's own code
+      # uses no `std`, no `alloc` and no third-party crate): per crate under crates/, outside
+      # tests, the lines naming `std` and `alloc` as a path's first segment, whether its root
+      # lacks `#![no_std]`, and the lines naming a `std` or `alloc` collection (`Vec`, `Box`,
+      # `String`, `HashMap`, ..) not imported from blaze's own crates equal its row of
+      # tools/ratchets/std-alloc.txt, a crate with no row is held to 0, and no row is above the
+      # base's; a crate over its row has its new sites named from the base's diff
+      # (scripts/src/bin/ambient.rs, whose usage says what the text scan misses). It needs no
+      # compiler. Against the base itself: the checkout is shallow.
+      - name: std and alloc only go down
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          "$BLAZE_SCRIPTS/ambient" selftest
+          if [ -n "$BASE" ]; then
+            git fetch -q --depth=1 origin "$BASE"
+            "$BLAZE_SCRIPTS/ambient" "{\"command\": \"check\", \"base\": \"$BASE\"}"
+          else
+            echo "no base to compare with (a run by hand): each crate is held to its row only"
+            "$BLAZE_SCRIPTS/ambient" '{"command": "check"}'
+          fi
       # Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
       # scripts/layouts.txt, and a persisted one whose value changed against the base names its
       # crate's test of the previous layout (rule persisted-state-round-trips;

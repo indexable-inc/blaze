@@ -2273,3 +2273,153 @@ fn inline_under_every_failure() -> Result<(), Broke> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Packed.
+
+use crate::{Pack, Packed};
+
+/// An instruction whose variants pack to 1, 3 and 9 bytes: a tag, then the operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    Nop,
+    Push(u16),
+    Jump(u64),
+}
+
+impl Pack for Op {
+    fn packed_len(&self) -> usize {
+        match self {
+            Op::Nop => 1,
+            Op::Push(_) => 3,
+            Op::Jump(_) => 9,
+        }
+    }
+
+    fn pack(&self, out: &mut [u8]) {
+        match *self {
+            Op::Nop => out[0] = 0,
+            Op::Push(n) => {
+                out[0] = 1;
+                n.pack(&mut out[1..]);
+            }
+            Op::Jump(to) => {
+                out[0] = 2;
+                to.pack(&mut out[1..]);
+            }
+        }
+    }
+
+    fn unpack(bytes: &[u8]) -> (Op, usize) {
+        match bytes[0] {
+            0 => (Op::Nop, 1),
+            1 => (Op::Push(u16::unpack(&bytes[1..]).0), 3),
+            2 => (Op::Jump(u64::unpack(&bytes[1..]).0), 9),
+            tag => panic!("an Op tag {tag} that `pack` never writes"),
+        }
+    }
+}
+
+fn op(tape: &Tape) -> Op {
+    match tape.below(3, "variant") {
+        0 => Op::Nop,
+        1 => Op::Push(tape.below(1 << 16, "push") as u16),
+        _ => Op::Jump(tape.next_u64("jump")),
+    }
+}
+
+/// `packed` holds `model`, read whole and from every place a seek can start.
+fn packed_matches<const K: usize>(packed: &Packed<Op, &Counting, K>, model: &[Op]) -> Result<(), Broke> {
+    let read: StdVec<Op> = packed.iter().collect();
+    if read != model || packed.len() != model.len() || packed.iter().len() != model.len() {
+        return Err(Broke::Oracle(format!("K = {K}: read {read:?}, pushed {model:?}")));
+    }
+    let bytes: usize = model.iter().map(Pack::packed_len).sum();
+    if packed.byte_len() != bytes {
+        return Err(Broke::Oracle(format!("K = {K}: {} bytes for {bytes} bytes of values", packed.byte_len())));
+    }
+    for at in 0..=model.len() {
+        let Some(from) = packed.seek(at) else {
+            return Err(Broke::Oracle(format!("K = {K}: seek({at}) of {} found nothing", model.len())));
+        };
+        let from: StdVec<Op> = from.collect();
+        if from != model[at..] {
+            return Err(Broke::Oracle(format!("K = {K}: seek({at}) read {from:?}")));
+        }
+    }
+    if packed.seek(model.len() + 1).is_some() {
+        return Err(Broke::Oracle(format!("K = {K}: a seek past the end found values")));
+    }
+    Ok(())
+}
+
+fn packed_case(tape: &Tape) -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let mut model = StdVec::new();
+        let mut plain = Packed::<Op, &Counting>::new_in(&alloc);
+        let mut indexed = Packed::<Op, &Counting, 4>::new_in(&alloc);
+        for _ in 0..tape.index(40, "steps") {
+            if tape.one_in(16, "clear") {
+                model.clear();
+                plain.clear();
+                indexed.clear();
+                continue;
+            }
+            let value = op(tape);
+            model.push(value);
+            plain.push(&value);
+            indexed.push(&value);
+        }
+        packed_matches(&plain, &model)?;
+        packed_matches(&indexed, &model)?;
+    }
+    alloc.check()
+}
+
+#[test]
+fn packed_matches_a_vector_and_seeks() {
+    blaze_sim::check(Config::cases(300), packed_case);
+}
+
+#[test]
+fn packed_try_push_fails_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("Packed", |alloc| {
+        let mut packed = Packed::<Op, &Failing, 3>::new_in(alloc);
+        let ops = [Op::Jump(1), Op::Nop, Op::Push(7), Op::Jump(u64::MAX), Op::Nop, Op::Push(9), Op::Nop];
+        for value in ops.iter().cycle().take(40) {
+            step(&mut packed, |p: &Packed<Op, &Failing, 3>| p.iter().collect::<StdVec<Op>>(), |p| p.try_push(value))?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// A `Pack` that reads back one byte more than it wrote: the control for the length check.
+#[derive(Debug)]
+struct Overreads;
+
+impl Pack for Overreads {
+    fn packed_len(&self) -> usize {
+        1
+    }
+    fn pack(&self, out: &mut [u8]) {
+        out[0] = 0;
+    }
+    fn unpack(_bytes: &[u8]) -> (Overreads, usize) {
+        (Overreads, 2)
+    }
+}
+
+#[test]
+fn packed_stops_on_a_pack_that_reads_another_length() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let mut packed = Packed::<Overreads, &Counting>::new_in(&alloc);
+        packed.push(&Overreads);
+        panics(|| {
+            let _read = packed.iter().count();
+        })?;
+    }
+    alloc.check()
+}

@@ -79,7 +79,7 @@ pub(crate) fn path(text: &'static str) -> Path<N, Global> {
         }
         Some("super") => {
             let n = segments.iter().take_while(|s| **s == "super").count();
-            segments.drain(..n);
+            drop(segments.drain(..n));
             PathKind::Super(u8::try_from(n).expect("a test path of few supers"))
         }
         Some(_) | None => PathKind::Plain,

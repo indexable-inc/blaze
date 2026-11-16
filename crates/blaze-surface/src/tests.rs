@@ -47,119 +47,11 @@ fn small(tape: &Tape, below: u32, label: &'static str) -> u32 {
 /// `FileItems`' promises: in the module below, beside the record's own types.
 mod file_items;
 
-/// A drawn scope: at most one binding per (namespace, name), in a drawn order.
-fn bindings(tape: &Tape) -> Vec<Binding<'static>, Global> {
-    let mut out = Vec::new_in(Global);
-    for ns in SPACES {
-        for name in NAMES {
-            if !tape.coin("bound") {
-                continue;
-            }
-            let n = u8::try_from(tape.below(200, "item")).expect("below 200 fits a u8");
-            let target = match tape.below(3, "state") {
-                0 => Target::Item(key(n)),
-                1 => Target::Undetermined,
-                _ => Target::Ambiguous(key(n), key(n ^ 1)),
-            };
-            let vis = match tape.below(4, "vis") {
-                0 => Visibility::Pub,
-                1 => Visibility::Crate,
-                2 => Visibility::Restricted(key(250)),
-                _ => Visibility::Private,
-            };
-            let origin = [Origin::Declared, Origin::Import, Origin::Glob, Origin::Expanded]
-                [usize::try_from(tape.below(4, "origin")).expect("below 4")];
-            out.push(Binding { ns, name, target, vis, origin });
-        }
-    }
-    let turn = usize::try_from(tape.below(u64::try_from(out.len() + 1).expect("few"), "turn")).expect("few");
-    let turn = turn.min(out.len());
-    out.rotate_left(turn);
-    out
-}
+/// The name-resolution records' promises (`ModuleDecls`, `ModuleScope`, `CrateRoot`), and the
+/// drawn scopes the trait tests below read through.
+mod scope_records;
 
-/// A bug planted in a scope's builder, which the order oracle must catch.
-#[derive(Clone, Copy, Debug)]
-enum Plant {
-    None,
-    /// The builder's sort is skipped: rows land in the order given.
-    Unsorted,
-}
-
-fn write_scope(rows: &[Binding<'_>], plant: Plant) -> Vec<u8, Global> {
-    let mut out = ModuleScope::new_in(key(200), Global);
-    out.unsorted = matches!(plant, Plant::Unsorted);
-    for row in rows {
-        out.bind(*row).expect("a drawn binding is valid");
-    }
-    out.fellow(key(202));
-    out.fellow(key(201));
-    out.finish().expect("a drawn scope holds one binding per slot")
-}
-
-/// Two builders of one scope, given its bindings in two orders, write equal bytes; and the
-/// scope answers each binding by its name.
-fn scope_agrees(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let rows = bindings(tape);
-    let mut reversed = Vec::with_capacity_in(rows.len(), Global);
-    reversed.extend(rows.iter().rev().copied());
-    let bytes = write_scope(&rows, plant);
-    if bytes != write_scope(&reversed, plant) {
-        return Err(Broke::Oracle("two builders of one scope wrote different bytes".into()));
-    }
-    let buffer = Aligned::copy_from(&bytes);
-    let view = ScopeView::read(&buffer).map_err(|error| Broke::Oracle(error.to_string()))?;
-    for row in &rows {
-        if view.get(row.ns, row.name) != Some(*row) {
-            return Err(Broke::Oracle(format!("the scope does not answer {row:?} by its name")));
-        }
-    }
-    if view.bindings().count() != rows.len() || !view.fellows().eq([key(201), key(202)]) {
-        return Err(Broke::Oracle("the scope lists other bindings or fellows than written".into()));
-    }
-    Ok(())
-}
-
-/// The invariant: a scope's bytes are a function of its bindings, not of their order, and
-/// each binding is found by its namespace and name.
-#[test]
-fn a_scope_is_its_bindings_in_any_order() {
-    blaze_sim::check(Config::cases(300), |tape| scope_agrees(tape, Plant::None));
-}
-
-/// The control: a builder that keeps the order it was given writes different bytes for two
-/// orders, and the oracle must say so.
-#[test]
-fn the_oracle_catches_an_unsorted_scope() {
-    blaze_sim::control(
-        Config::cases(300),
-        Plant::None,
-        Plant::Unsorted,
-        "wrote different bytes",
-        scope_agrees,
-    );
-}
-
-#[test]
-fn an_export_digest_moves_only_with_its_class() {
-    let public = Binding {
-        ns: Namespace::Values,
-        name: "f",
-        target: Target::Item(key(3)),
-        vis: Visibility::Pub,
-        origin: Origin::Declared,
-    };
-    let private = Binding { name: "g", target: Target::Item(key(4)), vis: Visibility::Private, ..public };
-    let read = |rows: &[Binding<'_>]| {
-        let buffer = Aligned::copy_from(&write_scope(rows, Plant::None));
-        let view = ScopeView::read(&buffer).expect("a written scope reads");
-        [ExportClass::Pub, ExportClass::Crate, ExportClass::Within].map(|class| view.exports(class))
-    };
-    let [pub_before, crate_before, within_before] = read(&[public]);
-    let [pub_after, crate_after, within_after] = read(&[public, private]);
-    assert_eq!((pub_before, crate_before), (pub_after, crate_after));
-    assert_ne!(within_before, within_after);
-}
+use scope_records::{Plant, bindings, write_scope};
 
 /// The refinement: a key index page answers each key with its entry, in any order given.
 #[test]
@@ -197,8 +89,8 @@ fn a_key_index_answers_each_key_in_one_probe() {
 }
 
 /// One module, `key(200)`, of one file, `file(0)`: `fn a() {}` and a struct a macro made.
-fn surface(rows: &[Binding<'_>]) -> MemSurface {
-    let mut surface = MemSurface::new(KRATE);
+fn surface(rows: &[ScopeEntry<&str>]) -> MemSurface<Global> {
+    let mut surface = MemSurface::new_in(KRATE, Global);
     let items = FileItems {
         file: file(0),
         text: "fn a() {}",
@@ -234,15 +126,15 @@ fn lookup_finds_what_scope_lists() {
         let surface = surface(&rows);
         let module = key(200);
         let scope = surface.scope(module).map_err(|error| Broke::Oracle(error.to_string()))?;
-        for binding in scope.bindings() {
-            let found = surface.lookup(module, binding.ns, binding.name);
-            if found != Ok(Some(binding.target)) {
-                return Err(Broke::Oracle(format!("lookup of {binding:?} gave {found:?}")));
+        for entry in scope.bindings() {
+            let found = surface.lookup(module, entry.ns, entry.name);
+            if found != Ok(Some(entry.binding)) {
+                return Err(Broke::Oracle(format!("lookup of {entry:?} gave {found:?}")));
             }
         }
         for ns in SPACES {
             for name in NAMES {
-                let listed = scope.get(ns, name).map(|binding| binding.target);
+                let listed = scope.get(ns, name);
                 if surface.lookup(module, ns, name) != Ok(listed) {
                     return Err(Broke::Oracle(format!("lookup of {name} in {ns} is not what scope lists")));
                 }
@@ -293,19 +185,21 @@ fn source_reads_an_items_text_only_with_its_crates_proof() {
 
 #[test]
 fn a_local_is_its_key_within_one_task() {
-    let rows = [Binding {
-        ns: Namespace::Values,
-        name: "a",
-        target: Target::Item(key(1)),
-        vis: Visibility::Pub,
+    let binding = Binding {
+        def: Def { key: key(1), kind: DefKind::Other },
+        vis: Visibility::Public,
         origin: Origin::Declared,
-    }];
+        expansion: 0,
+        state: BindingState::Determined,
+    };
+    let rows = [ScopeEntry { ns: Namespace::Values, name: "a", binding }];
     let surface = surface(&rows);
     let mut locals: LocalTable<AnyItem, Global> = LocalTable::new_in(Global);
     let module = locals.intern(key(200)).expect("room");
     assert_eq!(locals.intern(key(200)), Ok(module));
     let found = surface.local_lookup(&mut locals, module, Namespace::Values, "a").expect("bound");
-    let Some(Target::Item(item)) = found else { panic!("`a` is an item: {found:?}") };
+    let Some((item, found)) = found else { panic!("`a` is bound") };
+    assert_eq!(found, binding);
     assert_eq!(locals.key(item), Ok(key(1)));
     assert_eq!(surface.local_kind(&locals, item), Ok(ItemKind::Function));
     assert_eq!(surface.local_parent(&mut locals, item), Ok(Some(module)));
@@ -316,28 +210,6 @@ fn a_local_is_its_key_within_one_task() {
     let mut third: LocalTable<AnyItem, Global> = LocalTable::new_in(Global);
     let far = (0..5).map(|n| third.intern(key(n + 10))).last().expect("five").expect("room");
     assert_eq!(locals.key(far), Err(SurfaceError::NoLocal { local: 4 }));
-}
-
-#[test]
-fn module_decls_are_sorted_and_found_by_name() {
-    let names = [
-        DeclaredName { ns: Namespace::Values, name: "b", item: key(2), kind: ItemKind::Function, vis: Visibility::Pub },
-        DeclaredName { ns: Namespace::Types, name: "a", item: key(1), kind: ItemKind::Struct, vis: Visibility::Private },
-        DeclaredName { ns: Namespace::Values, name: "a", item: key(1), kind: ItemKind::Struct, vis: Visibility::Private },
-    ];
-    let write = |rows: &[DeclaredName<'_>]| {
-        let mut out = ModuleDecls::new_in(key(200), Global);
-        rows.iter().for_each(|row| out.declare(*row).expect("small"));
-        out.finish().expect("small")
-    };
-    let mut reversed = names;
-    reversed.reverse();
-    let bytes = write(&names);
-    assert_eq!(bytes, write(&reversed));
-    let buffer = Aligned::copy_from(&bytes);
-    let view = ModuleDeclsView::read(&buffer).expect("a written record");
-    assert!(view.names().eq([names[1], names[2], names[0]]));
-    assert!(view.named(Namespace::Values, "a").eq([names[2]]));
 }
 
 #[test]
@@ -362,37 +234,6 @@ fn a_module_file_reads_back_with_its_absent_paths_sorted() {
     let view = ModuleFileView::read(&buffer).expect("a written record");
     assert_eq!((view.module(), view.file(), view.path(), view.inline()), (key(200), file(1), "src/a.rs", None));
     assert!(view.absent().eq(["src/a.rs.in", "src/a/mod.rs"]));
-}
-
-#[test]
-fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
-    let head = CrateRootHead {
-        krate: KRATE,
-        root_module: key(200),
-        root_file: file(0),
-        edition: Edition::E2024,
-        no_std: true,
-        no_core: false,
-        prelude: Some(key(201)),
-    };
-    let core = CrateItemKey(ContentId([7; 32]));
-    let alloc = CrateItemKey(ContentId([8; 32]));
-    let mut out = CrateRoot::new_in(head, Global);
-    out.extern_crate("core", core).expect("small");
-    out.extern_crate("alloc", alloc).expect("small");
-    out.self_name("me").expect("small");
-    out.tool("blaze").expect("small");
-    out.tool("blaze").expect("small");
-    let buffer = Aligned::copy_from(&out.finish().expect("small"));
-    let view = CrateRootView::read(&buffer).expect("a written record");
-    assert_eq!(view.head(), head);
-    assert!(view.externs().eq([("alloc", alloc), ("core", core)]));
-    assert_eq!((view.extern_crate("core"), view.extern_crate("std")), (Some(core), None));
-    assert!(view.self_names().eq(["me"]) && view.tools().eq(["blaze"]));
-    let mut twice = CrateRoot::new_in(head, Global);
-    twice.extern_crate("core", core).expect("small");
-    twice.extern_crate("core", alloc).expect("small");
-    assert!(matches!(twice.finish().err(), Some(crate::BuildError::Twice { .. })));
 }
 
 #[test]

@@ -16,7 +16,7 @@ use blaze_own::Vec as Own;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
-use crate::parent::{Answer, Compiled, Config as ParentConfig, Effect, FastRecord, Found, Function, Parent};
+use crate::parent::{Answer, Compiled, Config as ParentConfig, Effect, FastRecord, Found, Function, Parent, Placement};
 use crate::{
     CodeId, CodeRef, FindingsRef, InstanceKey, Nanos, Plant, RecordKey, SlotId, ThreadId, Why,
 };
@@ -104,7 +104,7 @@ impl World {
                 Effect::Hooks { slot, .. } => {
                     return Err(Broke::Harness(format!("slot {} given hooks with no toggle", slot.0)));
                 }
-                Effect::Say(_) => {}
+                Effect::Say(_) | Effect::WriteImage => {}
             }
         }
         Ok(())
@@ -220,6 +220,81 @@ fn the_oracle_catches_a_run_stopped_by_one_failure() {
 #[test]
 fn the_oracle_catches_a_compile_entered_before_what_it_lacked() {
     control(Config::cases(4000), Plant::None, Plant::ReenterEarly, "re-entered before", run);
+}
+
+/// One run's start with every record in the store: each lookup it made, in order; how many of
+/// them `warm` made in its one call; and the image it leaves, and whether it writes it.
+struct Started {
+    lookups: Vec<SlotId>,
+    warmed: usize,
+    image: Vec<Placement>,
+    wrote: bool,
+}
+
+fn start_once(tape: &Tape, needed: &[SlotId], image: Option<&[Placement]>) -> Result<Started, Broke> {
+    let config = ParentConfig { workers: WORKERS, compile_bound: Nanos(u64::MAX / 4), most_waiters: 64 };
+    let mut parent = Parent::new(&functions(), config, Global).map_err(harness)?;
+    let mut out = Own::new_in(Global);
+    let mut lookups = Vec::new();
+    let mut pending = Vec::new();
+    let see = |out: &mut Own<Effect, Global>, lookups: &mut Vec<SlotId>, pending: &mut Vec<SlotId>| {
+        for effect in out.drain(..) {
+            match effect {
+                Effect::Lookup { slot, .. } => {
+                    lookups.push(slot);
+                    pending.push(slot);
+                }
+                Effect::Compile { slot, .. } => return Err(Broke::Harness(format!("slot {} compiled with every record stored", slot.0))),
+                _ => {}
+            }
+        }
+        Ok(())
+    };
+    parent.warm(image, &mut out).map_err(harness)?;
+    oracle(out.iter().all(|effect| matches!(effect, Effect::Lookup { .. })), || format!("warm did more than look up: {out:?}"))?;
+    see(&mut out, &mut lookups, &mut pending)?;
+    let warmed = lookups.len();
+    parent.start(needed, &[], Nanos(0), &mut out).map_err(harness)?;
+    see(&mut out, &mut lookups, &mut pending)?;
+    let mut answered = 0;
+    while !pending.is_empty() {
+        // A warm run's first lookups are answered in the one pass's order; any order else.
+        let at = if answered < warmed { 0 } else { tape.index(pending.len(), "answered") };
+        answered += 1;
+        let slot = pending.remove(at);
+        let callees = callees_of(slot);
+        let found = Found { fast: code_of(slot), callees: &callees, optimized: None };
+        parent.looked(slot, Some(found), &mut out).map_err(harness)?;
+        see(&mut out, &mut lookups, &mut pending)?;
+    }
+    parent.ended(&mut out);
+    let wrote = out.iter().any(|effect| matches!(effect, Effect::WriteImage));
+    Ok(Started { lookups, warmed, image: parent.image().to_vec(), wrote })
+}
+
+/// A run from the startup image asks for exactly the records a run without one does, each once,
+/// only earlier: everything the image names is asked for in `warm`'s one call, before the start.
+#[test]
+fn a_run_with_an_image_asks_for_the_same_records_only_earlier_and_in_one_pass() {
+    check(Config::cases(300), |tape| {
+        let mut needed: Vec<SlotId> = (0..FUNCTIONS).filter(|_| tape.coin("needed")).map(SlotId).collect();
+        if needed.is_empty() {
+            needed.push(SlotId(0));
+        }
+        let cold = start_once(tape, &needed, None)?;
+        oracle(cold.wrote && !cold.image.is_empty(), || "a run with no image wrote none".into())?;
+        let warm = start_once(tape, &needed, Some(&cold.image))?;
+        let set = |lookups: &[SlotId]| lookups.iter().copied().collect::<BTreeSet<SlotId>>();
+        oracle(set(&cold.lookups) == set(&warm.lookups), || {
+            format!("the image changed what was asked for: {:?} against {:?}", cold.lookups, warm.lookups)
+        })?;
+        oracle(warm.lookups.len() == set(&warm.lookups).len(), || format!("a record was asked for twice: {:?}", warm.lookups))?;
+        let first: Vec<SlotId> = cold.image.iter().map(|row| row.slot).collect();
+        oracle(warm.lookups[..warm.warmed] == first[..], || {
+            format!("the image's rows {first:?} were not asked for first, in one pass: {:?}", warm.lookups)
+        })?;
+        oracle(needed.iter().all(|slot| first.contains(slot)), || "the image misses a slot the start needs".into())
+    });
 }
 
 /// A compile past its bound fails its askers with `Overran`; its late success still serves the

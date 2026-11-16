@@ -36,7 +36,7 @@ mod lookup;
 // record, rule 30): re-exported so a lookup's caller names one crate.
 pub use blaze_surface::{
     BUCKET_SCHEMA, Bucket, BucketHash, BucketKey, BucketView, CrateFlags, CrateGraphView,
-    CrateImpls, CrateIndex, CrateInput, DIRECTORY_SCHEMA, Dep, DepInput, DirHit, DirectoryView,
+    CrateImpls, CrateIndex, CrateInput, DIRECTORY_SCHEMA, DepEdge, DepInput, DirHit, DirectoryView,
     EdgeFlags, Edition, FloatWidth, GRAPH_SCHEMA, GraphError, ImplFlags, ImplIndexError, ImplRow,
     IntWidth, LANG_SCHEMA, LangItemsError, LangItemsView, LangName, LangNameError, MAX_CRATES,
     MAX_EXTERN_NAME, MAX_ROWS, Members, Mutability, NO_IMPLS_SCHEMA, NoImplsOfView, SelfShape,
