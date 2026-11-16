@@ -12,7 +12,6 @@ use crate::{
     host::{Exit, HostFacts},
     io::{Io, Limits, SimWorld},
     mem::TASK_FRAME,
-    task::{Layout, TaskError, TaskWhy},
     trace::RecordKind,
 };
 
@@ -38,7 +37,7 @@ fn a_simulated_exit_unwinds_its_task_and_the_world_remembers_it() {
     let ended = catch_unwind(AssertUnwindSafe(|| {
         // An exit inside a task passes through its scope rather than failing the task.
         let _ = cx.scope_with(|s| {
-            let task = s.spawn("exits", TASK_FRAME, |_cx| -> Result<(), String> { host.exit(3) });
+            let task = s.may_overlap("exits", TASK_FRAME, |_cx| -> Result<(), String> { host.exit(3) });
             let _ = task.join(s.cx());
         });
     }));
@@ -65,23 +64,4 @@ fn spans_and_events_go_to_the_worlds_trace() {
     // Another world's trace is its own: nothing is global.
     let other = Io::sim(2);
     assert!(other.trace(|trace| trace.records().is_empty()));
-}
-
-#[test]
-fn spawn_concurrent_is_refused_under_inline_and_its_task_never_runs() {
-    let io = Io::sim(3);
-    let cx = root(&io);
-    let mut ran = false;
-    let result = cx.scope_with(|s| {
-        let refused = s.spawn_concurrent("overlaps", TASK_FRAME, |_cx| -> Result<(), String> {
-            ran = true;
-            Ok(())
-        });
-        assert!(refused.join(s.cx()).is_err());
-    });
-    assert!(!ran);
-    assert_eq!(
-        result,
-        Err(TaskError { scope: "main", task: "overlaps", why: TaskWhy::CannotOverlap { layout: Layout::Inline } })
-    );
 }

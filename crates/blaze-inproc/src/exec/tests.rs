@@ -50,45 +50,25 @@ mod reference {
     impl Code {
         pub(super) fn new(bytes: &[u8]) -> Code {
             let len = bytes.len().next_multiple_of(1 << 16);
-            #[cfg(target_os = "macos")]
-            let (protection, flags) = (
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-            );
-            #[cfg(not(target_os = "macos"))]
             let (protection, flags) =
-                (libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS);
+                (libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON);
             // SAFETY: an anonymous mapping at no fixed address; the result is checked.
             let at = unsafe { libc::mmap(std::ptr::null_mut(), len, protection, flags, -1, 0) };
             assert_ne!(at, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
             let code = Code { at: at.cast(), len };
-            #[cfg(target_os = "macos")]
-            // SAFETY: this thread's view of MAP_JIT pages writable, until turned back below.
-            unsafe {
-                libc::pthread_jit_write_protect_np(0)
-            };
             // SAFETY: the fresh mapping of `len >= bytes.len()` writable bytes.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), code.at, bytes.len()) };
-            #[cfg(target_os = "macos")]
-            // SAFETY: executable again on this thread; then the instruction cache sees the bytes.
-            unsafe {
-                libc::pthread_jit_write_protect_np(1)
-            };
+            // SAFETY: the whole mapping made above, which nothing writes from here on.
+            let sealed =
+                unsafe { libc::mprotect(code.at.cast(), len, libc::PROT_READ | libc::PROT_EXEC) };
+            assert_eq!(sealed, 0, "mprotect: {}", std::io::Error::last_os_error());
             #[cfg(target_os = "macos")]
             // SAFETY: the instruction cache sees the bytes in the fresh mapping.
             unsafe {
                 sys_icache_invalidate(code.at.cast(), bytes.len())
             };
-            #[cfg(not(target_os = "macos"))]
-            {
-                // SAFETY: the whole mapping made above.
-                let sealed = unsafe {
-                    libc::mprotect(code.at.cast(), len, libc::PROT_READ | libc::PROT_EXEC)
-                };
-                assert_eq!(sealed, 0, "mprotect: {}", std::io::Error::last_os_error());
-                #[cfg(target_arch = "aarch64")]
-                icache(code.at as usize, bytes.len());
-            }
+            #[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
+            icache(code.at as usize, bytes.len());
             code
         }
     }
@@ -195,9 +175,24 @@ fn its_data_is_zeroed_and_writable() {
     assert_eq!(call(exec.code_address()), 42);
 }
 
-/// The thread's `MAP_JIT` pages are executable again after a `write` that panicked.
+/// Code of an `Executable` runs while another is written, on the writing thread: no
+/// per-thread switch makes one's pages unrunnable while another's are writable (what macOS
+/// `MAP_JIT` did, so a program's own JIT could stop blaze's code).
 #[test]
-fn a_write_that_panics_leaves_the_thread_running_code() {
+fn code_runs_while_another_executable_is_written() {
+    let first = Executable::new(FORTY_TWO, 0).unwrap();
+    let mut ran = 0;
+    let second = Executable::written(FORTY_TWO.len(), 0, |code, _| {
+        ran = call(first.code_address());
+        code.copy_from_slice(FORTY_TWO);
+    })
+    .unwrap();
+    assert_eq!((ran, call(second.code_address())), (42, 42));
+}
+
+/// A `write` that panics leaves the other `Executable`s running.
+#[test]
+fn a_write_that_panics_leaves_the_others_running() {
     let first = Executable::new(FORTY_TWO, 0).unwrap();
     let panicked = std::panic::catch_unwind(|| {
         Executable::written(16, 16, |_, _| panic!("a write that fails"))
@@ -207,10 +202,11 @@ fn a_write_that_panics_leaves_the_thread_running_code() {
     assert_eq!(call(Executable::new(FORTY_TWO, 0).unwrap().code_address()), 42);
 }
 
-/// A child forked right after its parent wrote an `Executable` runs the code once it calls
-/// [`Executable::after_fork`]. The write blocks, so the kernel switches the thread out while
-/// its `MAP_JIT` view is writable: on macOS the child's thread starts with the state saved
-/// then, and its first instruction fetch from the code faults (`SIGBUS`) without the call.
+/// A child forked right after its parent wrote an `Executable` runs the code with nothing to
+/// do first. The write blocks, so the kernel switches the thread out mid-write: with macOS
+/// `MAP_JIT` the child's thread started with the state saved then, and its first instruction
+/// fetch from the code faulted (`SIGBUS`) unless it called an `after_fork` first; a private
+/// mapping made read and execute keeps that protection across the fork.
 #[cfg(unix)]
 #[test]
 fn a_child_forked_after_a_write_runs_the_code() {
@@ -224,12 +220,10 @@ fn a_child_forked_after_a_write_runs_the_code() {
             wait::sleep_until("a millisecond, mid-write", until, &clock).unwrap();
         })
         .unwrap();
-        // SAFETY: the child only sets its view of the code's pages, calls the code (no
-        // allocation, no lock) and `_exit`s.
+        // SAFETY: the child only calls the code (no allocation, no lock) and `_exit`s.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
         if pid == 0 {
-            Executable::after_fork();
             let got = call(exec.code_address());
             // SAFETY: leaves the child at once, running nothing of the parent's.
             unsafe { libc::_exit(got as i32) };

@@ -41,6 +41,10 @@ pub struct Profile {
     /// Tests run again and tests whose stored result was reported.
     pub tests_run: u32,
     pub tests_reused: u32,
+    /// The store's segments proved by their sealed row at open, and checked whole at open
+    /// (blaze-cas `report().sealed` / `.checked`, store-next.md): the caller's to fill.
+    pub segments_sealed: u32,
+    pub segments_checked: u32,
 }
 
 impl Profile {
@@ -84,7 +88,7 @@ impl fmt::Display for Profile {
         }
         writeln!(
             f,
-            "store        gets {} hits {} puts {} pages read {} written {}; certificate {}; tests run {} reused {}",
+            "store        gets {} hits {} puts {} pages read {} written {}; certificate {}; tests run {} reused {}; segments sealed {} checked {}",
             self.gets,
             self.hits,
             self.puts,
@@ -93,6 +97,8 @@ impl fmt::Display for Profile {
             if self.certified { "stood" } else { "missed" },
             self.tests_run,
             self.tests_reused,
+            self.segments_sealed,
+            self.segments_checked,
         )
     }
 }

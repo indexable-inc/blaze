@@ -23,7 +23,24 @@ use std::{
 
 use blaze_mem::{Kept, Tag};
 
-use crate::deps::{Held, ImageBuf};
+/// What holds the bytes of a record as the store gave them: a mapping of the store's file, read
+/// in place with the kernel's page cache the one copy, or one aligned copy of its own. The
+/// bytes start at a multiple of [`blaze_format::ALIGN`] and neither move nor change while it
+/// lives.
+pub trait Held: Send + Sync + 'static {
+    fn bytes(&self) -> &[u8];
+}
+
+impl Held for blaze_format::Aligned {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+/// The bytes a store gave, held where it keeps them.
+// dyn: the store's holder of one record's bytes
+pub type ImageBuf = Arc<dyn Held>;
 
 /// The unit a slab is allocated in. Its alignment bounds the alignment of every element type a
 /// slab holds ([`SlabWriter::take`] checks it at compile time).

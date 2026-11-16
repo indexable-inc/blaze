@@ -316,9 +316,17 @@ Open (regret 2): a cold body with k unknowns found one after another runs k time
 - **Reads**: small records by `pread` into the task's frame, large arrays mapped; verified once
   per fetch or boot. **Remote**: a pack's index once, then byte ranges in parallel; one format
   for R2 and a peer.
-- **Restart checks.** Each pack's index holds, beside each key, its record's read-list digests,
-  so checking a record after a restart touches only index pages. Open: the page bound. Test:
-  count the pages a repeat check touches after a restart, on hello-world and reth.
+- **Restart checks.** A read-addressed key already carries the digests of what its record
+  read, so a lookup that finds the key has checked the reads: the index holds no second
+  digest (it would grow each entry from 48 to 64 bytes for nothing). What made a restart slow
+  was elsewhere and is changed ([store-next.md](store-next.md)): a segment is sealed once
+  (store format 4), so the first open after a boot verifies only the unsealed tail, not
+  every byte; the open reads no index page ahead of need; a lookup reads no page beyond the
+  one its probe lands on. Floor, from reading the code, not yet measured: about 6 pages for
+  a repeat check of hello-world and 45 for reth; after the changes at most about 6 times the
+  floor on hello-world and 1.7 on reth, the gap being lookups that miss in older segments
+  (a filter per segment would close it; not built). Test: count the pages a repeat check
+  touches after a restart, on hello-world and reth.
 - **Trust.** A key names inputs, not a value, so only a statement signed by a trusted builder (CI,
   later the remote workers) binds a key to a digest; the signature, digest and size limits are
   checked before a byte is mapped. A developer's machine never writes a shared namespace; private

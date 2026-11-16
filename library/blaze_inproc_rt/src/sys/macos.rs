@@ -471,53 +471,41 @@ impl View {
     }
 }
 
-/// Anonymous memory of this process: code in a `MAP_JIT` mapping, which macOS lets run
-/// unsigned under any code signing policy, and data in a mapping of its own right after it
-/// (`MAP_JIT` pages are writable or executable per thread together, so data among them would
-/// not be writable while code runs).
+/// Anonymous memory of this process: code, then data right after it, in one mapping, as on
+/// Linux. Mapped readable and writable, written, then the code's pages made read and execute
+/// for good; no page is ever writable and executable at once, and no thread's state decides
+/// which a page is.
+///
+/// Not `MAP_JIT` with `pthread_jit_write_protect_np` (what this was until 2026-11-15): that
+/// switch is per thread and covers every `MAP_JIT` page of the process, so a program that
+/// embeds a JIT of its own would flip these pages for its thread too, and a child forked
+/// while the parent's thread was mid-write started with the pages not executable (`SIGBUS`
+/// at its first fetch; it needed an `after_fork` call, now gone: a private mapping keeps its
+/// protection across `fork`). The price is code signing: the pages carry no signature, so
+/// they run only in a process that does not enforce it (`check_unsigned_code`); an ad hoc
+/// signed test or dev binary does not. Measured on macOS 27.0.1, Apple silicon, 2026-11-15
+/// with a C probe: an ad hoc linker-signed binary runs pages `mprotect`ed read and execute;
+/// with the hardened runtime it is killed at the first fetch, `allow-jit` or not, and runs
+/// again with `com.apple.security.cs.allow-unsigned-executable-memory`.
 pub struct Exec {
-    code: *mut u8,
+    at: *mut u8,
+    /// The code's pages, then the data's.
     code_pages: usize,
-    /// Null when there is no data.
-    data: *mut u8,
-    data_pages: usize,
-    data_len: usize,
+    len: usize,
+    data: usize,
 }
 
 // SAFETY: the code is never written once `Exec::new` returns, and the data only through
-// `&mut self`; nothing of the mappings is tied to a thread.
+// `&mut self`; nothing of the mapping is tied to a thread.
 unsafe impl Send for Exec {}
 // SAFETY: as above: `&self` reads only addresses.
 unsafe impl Sync for Exec {}
 
 impl Drop for Exec {
     fn drop(&mut self) {
-        // SAFETY: this `Exec`'s own mappings; every slice of them borrowed `self` or ended with
-        // `Exec::new`'s `write`.
-        unsafe { libc::munmap(self.code.cast(), self.code_pages) };
-        if !self.data.is_null() {
-            // SAFETY: this `Exec` owns the mapping; every slice borrowed `self` or ended with `write`.
-            unsafe { libc::munmap(self.data.cast(), self.data_pages) };
-        }
-    }
-}
-
-/// Makes this thread's view of every `MAP_JIT` page writable and not executable until dropped,
-/// so a `write` that panics leaves the thread as it found it.
-struct JitWritable;
-
-impl JitWritable {
-    fn new() -> JitWritable {
-        // SAFETY: changes only this thread's view of `MAP_JIT` pages; `Drop` turns it back.
-        unsafe { libc::pthread_jit_write_protect_np(0) };
-        JitWritable
-    }
-}
-
-impl Drop for JitWritable {
-    fn drop(&mut self) {
-        // SAFETY: as in `new`: this thread's `MAP_JIT` pages executable and not writable again.
-        unsafe { libc::pthread_jit_write_protect_np(1) };
+        // SAFETY: `at..at + len` is this `Exec`'s own mapping; every slice of it borrowed `self`
+        // or ended with `Exec::new`'s `write`.
+        unsafe { libc::munmap(self.at.cast(), self.len) };
     }
 }
 
@@ -527,113 +515,61 @@ impl Exec {
         data: usize,
         write: impl FnOnce(&mut [u8], &mut [u8]),
     ) -> Result<Exec, Error> {
+        check_unsigned_code()?;
         let page = page() as usize;
         let code_pages = code.max(1).next_multiple_of(page);
-        let data_pages = data.next_multiple_of(page);
+        let len = code_pages + data.next_multiple_of(page);
         // SAFETY: an anonymous mapping at no fixed address: nothing of this process is replaced.
         let at = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                code_pages,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
                 -1,
                 0,
             )
         };
         if at == libc::MAP_FAILED {
             return Err(Error::new(format!(
-                "mmap MAP_JIT of {code_pages:#x} bytes of code: {}",
+                "mmap of {len:#x} bytes of code and data: {}",
                 std::io::Error::last_os_error()
             )));
         }
-        let mut exec = Exec {
-            code: at.cast(),
-            code_pages,
-            data: std::ptr::null_mut(),
-            data_pages,
-            data_len: data,
-        };
-        if data_pages != 0 {
-            // SAFETY: an anonymous mapping; the address is only a hint, so nothing is replaced,
-            // and where the kernel put it is checked below.
-            let at = unsafe {
-                libc::mmap(
-                    exec.code.wrapping_add(code_pages).cast(),
-                    data_pages,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                )
-            };
-            if at == libc::MAP_FAILED {
-                return Err(Error::new(format!(
-                    "mmap of {data_pages:#x} bytes of data: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            exec.data = at.cast();
-            let far =
-                (exec.data as usize).abs_diff(exec.code as usize) + code_pages.max(data_pages);
-            if far >= 1 << 30 {
-                return Err(Error::new(format!(
-                    "the data was mapped {far:#x} bytes from the code, past the 1 GiB a PC-relative reference reaches"
-                )));
-            }
-        }
+        let exec = Exec { at: at.cast(), code_pages, len, data };
+        // SAFETY: the fresh mapping of `len` readable and writable bytes, which nothing else
+        // refers to; `code <= code_pages` and `code_pages + data <= len`, so the slices are
+        // disjoint and in it. `write` can't keep them past its return (they borrow for the call).
+        let code_bytes = unsafe { std::slice::from_raw_parts_mut(exec.at, code) };
+        // SAFETY: as above, the data's bytes after the code's pages.
+        let data_bytes = unsafe { std::slice::from_raw_parts_mut(exec.at.add(code_pages), data) };
+        write(code_bytes, data_bytes);
+        // SAFETY: the code's pages of the mapping above, which nothing writes from here on.
+        if unsafe { libc::mprotect(exec.at.cast(), code_pages, libc::PROT_READ | libc::PROT_EXEC) }
+            != 0
         {
-            let _writable = JitWritable::new();
-            let data_at = if exec.data.is_null() {
-                std::ptr::NonNull::dangling().as_ptr()
-            } else {
-                exec.data
-            };
-            // SAFETY: the fresh mappings are readable and writable on this thread while
-            // `_writable` lives, nothing else refers to them, and `code <= code_pages`.
-            // `write` cannot keep the slice past its return.
-            let code_bytes = unsafe { std::slice::from_raw_parts_mut(exec.code, code) };
-            // SAFETY: the fresh data mapping is writable, and `data <= data_pages`; null data
-            // has length zero and uses the aligned dangling pointer. `write` cannot retain it.
-            let data_bytes = unsafe { std::slice::from_raw_parts_mut(data_at, data) };
-            write(code_bytes, data_bytes);
+            return Err(Error::new(format!(
+                "mprotect of {code_pages:#x} bytes of code to read and execute: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         // SAFETY: the code's pages, mapped; the maintenance changes no value.
-        unsafe { sys_icache_invalidate(exec.code.cast(), code) };
+        unsafe { sys_icache_invalidate(exec.at.cast(), code) };
         Ok(exec)
     }
 
-    /// Makes the calling thread's `MAP_JIT` pages executable, as [`JitWritable`] leaves them.
-    /// A child just forked can't count on having its parent thread's state: the kernel copies
-    /// the state it saved for that thread, which may be from inside a [`JitWritable`] that
-    /// has since ended, and then the child's first instruction fetch from these pages is a
-    /// permission fault (`SIGBUS`, ESR `0x8200000f`), seen in `blaze-stencil`'s forked runs.
-    pub fn after_fork() {
-        // SAFETY: changes only this thread's view of `MAP_JIT` pages, to executable and not
-        // writable, the state every thread runs `Exec` code in; it takes no lock and allocates
-        // nothing, so a child forked from a process of many threads may call it.
-        unsafe { libc::pthread_jit_write_protect_np(1) };
-    }
-
     pub fn code_address(&self) -> u64 {
-        self.code as u64
+        self.at as u64
     }
 
     pub fn data_address(&self) -> u64 {
-        if self.data.is_null() {
-            self.code as u64 + self.code_pages as u64
-        } else {
-            self.data as u64
-        }
+        self.at as u64 + self.code_pages as u64
     }
 
     pub fn data(&mut self) -> &mut [u8] {
-        if self.data.is_null() {
-            return &mut [];
-        }
-        // SAFETY: the data mapping's first `data_len` bytes, writable, live as long as `self`;
-        // `&mut self` makes this the only borrow.
-        unsafe { std::slice::from_raw_parts_mut(self.data, self.data_len) }
+        // SAFETY: the data's `data` bytes after the code's pages, writable and in the mapping,
+        // which lives as long as `self`; `&mut self` makes this the only borrow.
+        unsafe { std::slice::from_raw_parts_mut(self.at.add(self.code_pages), self.data) }
     }
 }
 

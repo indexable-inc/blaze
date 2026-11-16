@@ -138,7 +138,7 @@ fn scoped(plan: &Plan, io: &Io, cx: &Cx, clock: &Clock, file: &File<ReadWrite>) 
             scope.cancel();
         }
         let log = &log;
-        let task = scope.spawn(NAMES[at], TASK_FRAME, move |cx| -> Result<(), String> {
+        let task = scope.may_overlap(NAMES[at], TASK_FRAME, move |cx| -> Result<(), String> {
             log.started.borrow_mut().push(at);
             let _ends = Ends(log, at);
             let did = act(cx, kind, clock, file);

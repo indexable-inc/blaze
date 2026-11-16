@@ -1005,13 +1005,10 @@ impl MacroId {
 impl ExternCrateId {
     /// The name the crate is reached by from where the item is written: its alias, its own name
     /// with none, and no name for `extern crate krate as _`.
+    /// Off the item's text: the rename is a range of it in the `FileItems` record; of a crate
+    /// without text the read of its syntax stops ([`key::ast_id_of`]).
     pub fn alias_or_name(self, db: &Db) -> Option<hir_expand::name::Name> {
-        // Kept as an entry of the item, keyed by its header (`deps::facts`).
-        let at = deps::facts::at(db, self);
-        let header = deps::facts::Part::Header;
-        deps::facts::fact(db, "extern crate name", "", 15, Some(at), header, || {
-            (self.alias_or_name_made(db), true)
-        })
+        self.alias_or_name_made(db)
     }
 
     /// [`ExternCrateId::alias_or_name`] off the item's syntax.

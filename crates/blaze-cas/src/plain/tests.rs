@@ -2178,7 +2178,7 @@ fn pages_touched(run: &[u8], n: u32, endpoints: bool) -> (usize, usize, usize) {
             &run[i * ENTRY..i * ENTRY + 32]
         };
         let found = if endpoints { endpoint_find(count, &key(k).0, key_of) } else { format::find_by(count, &key(k).0, key_of) };
-        assert_eq!(found.map(|i| run[i * ENTRY..i * ENTRY + 32] == key(k).0), (k < n).then_some(true), "key {k}");
+        assert_eq!(found.map(|i| run[i * ENTRY..i * ENTRY + 32] == key(k).0.0),(k < n).then_some(true), "key {k}");
         let home = found.map(|i| i * ENTRY / PAGE);
         if (pages.contains(&0) && home != Some(0)) || (pages.contains(&last_page) && home != Some(last_page)) {
             at_ends += 1;

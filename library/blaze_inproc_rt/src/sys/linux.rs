@@ -402,9 +402,6 @@ impl Exec {
         self.at as u64 + self.code_pages as u64
     }
 
-    /// The code's pages are executable for every thread: nothing to do.
-    pub fn after_fork() {}
-
     pub fn data(&mut self) -> &mut [u8] {
         // SAFETY: the data's `data` bytes after the code's pages, writable and in the mapping,
         // which lives as long as `self`; `&mut self` makes this the only borrow.

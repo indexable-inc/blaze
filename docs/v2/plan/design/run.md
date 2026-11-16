@@ -61,34 +61,65 @@ lack it (`Make`, `made`), and the compile is entered again from the top when it 
 one deadline covers all its entries. The `Optimizer` returns the same shape and `Tier` blocks
 and re-enters its jobs the same way.
 
-**Versions and toggles** (bottom.md, "Decide at run time"). The unit of the parent's work is a
-`Version { slot, hooks }`; a code record's key is `VersionKey { function, tier, hooks }`, so a
-version with hooks (trace, effect log, exact counts, breakpoint, coverage, extra checks) is made
-once and shared by every run. `toggle(slots, hooks, on)` from the viewer sets each slot's
-wanted hooks; the slot keeps running what it shows while the new version is looked up or
-compiled at `Priority::Toggled`, then `Publish{slot, tier, hooks, code}` swaps it in (Slots
-takes any version over any other and refuses only the code it already runs). With every hook
-off the slot returns to its plain version at the best tier made (`tiered` keeps it current
-while a slot runs hooked). A hooked version that does not compile refuses the toggle
-(`Untoggled`); nothing fails. Hooked versions are fast tier; the plain one tests no flag.
+**Observing is never compiled in** (bottom.md, "Decide at run time"). A function's code, fast or
+optimized, holds no counter, no mark and no hook, so its bytes are the same whatever any run
+observes: a code record's key is `CodeKey { function, tier }`, with no hooks field, and one
+record is shared by every run. What is observed is a stub in the slot word, in front of the
+code, chosen at run time and gone when not wanted: a hot function, a function outside a test
+run and a function nobody watches is called straight into its body and pays nothing. A slot's
+watch (`Watch`) is a set of the run's two observers and the viewer's hooks:
 
-**Slots** (`slots::Slots`, in the program's control thread). A word is one `u64`: 0 the stub,
-else body + 1 with a tier bit (in the real table an address; the tier and hooks are the
-body's). Any version replaces any other (a first call, a promotion, a toggle); publishing the
-code the word already names is refused (`Same`). `publish` writes `Place`, then `Store` (one aligned
-atomic store, release), then, if a body was replaced, `Epoch`. Retirement is blaze-launch's
-protocol with one body per batch (a first call and a promotion mean what they replace, so no
-gate): a thread reports the epoch it loaded before walking its stack; it clears each retired
-body stamped at or before that epoch that no frame of its stack is in; a body is freed once
-every thread alive at its stamp cleared it or ended; a thread born later is told the epoch its
-parent loaded.
+- *Heat*: a count stub while the function is fast (below).
+- *Mark*: a mark stub while tests run (Tests, below).
+- *Hooks*: trace (calls and returns, the return through a trampoline the stub puts in the
+  return address), exact counts and times, a breakpoint that parks the thread with its stack,
+  sampling one call in N. Effects and allocations are traced by hooking the functions that make
+  them (the syscall wrappers, the allocator's entries). What only changed code can see (each
+  block entered, overflow and bounds checks inside one body) is not a hook: it is another
+  program, keyed as such, outside this design.
 
-**Heat** (`heat::Heat`, in the control thread). Fast code's prologue adds one to its slot's
-`u32` beside the words (a plain add: a lost increment only cools a function a little), on every
-call; never the stub, which runs once, at the first call, and is gone once the word is set. The
-control thread samples the counters every period of its clock and charges the differences.
-At `bound` a function is hot, exactly once per run; every `period` each count shifts right by
-`shift`. The parameters are a `Config`; the first values are to be measured (open questions).
+`toggle(slots, hooks, on)` from the viewer sets each slot's hooks in the parent and sends
+`Hooks{slot, hooks}` (the whole set); the control thread turns the hook stub in or out. Nothing
+is compiled, so a toggle cannot fail, waits for nothing, and holds even before the function has
+code (the stub then jumps to the need stub). `tiered` publishes optimized code whatever is
+watched: a stub stays in front of the new body.
+
+**Slots** (`slots::Slots`, in the program's control thread). Two words a function, each one
+`u64`. The *slot word* is what callers load and jump through: the need stub, the function's
+body, or the slot's watch stub. The *body word* is the current code: the need stub or a body;
+a watch stub does its work, then jumps through it. (In the core a word is 0 for the need stub,
+a stub bit with the watch, or body + 1 with a tier bit; in the real table an address.)
+`publish(slot, tier, code)` writes `Place`, then `Body` (the body word), then `Slot` only when
+the slot word held the old body word (no stub in it), then, if a body was replaced, `Epoch`;
+publishing the code the body word already names is refused (`Same`). `observe(slot, watch)` and
+`plain(slot, watch)` change the slot's watch and write `Slot`: the stub for what is still
+watched, or with nothing left the body word as it is now, never one remembered from when the
+stub went in. The control thread is the one writer of both words: a stub's runtime call (a
+count reaching zero) queues its slot and stores nothing, so a publish and an observe or plain
+never race as two writers on a word, in whatever order their requests come; writes are carried
+in order, and an observe or plain may be issued while a publish's writes are still on their way.
+The simulation holds that neither loses the other's store (with every write carried, each slot
+word is exactly the stub of the asked watch or the body word, and each body word the newest
+publish), with a planted `PublishOverStub` caught. Retirement is blaze-launch's protocol with
+one body per batch (a first call and a promotion mean what they replace, so no gate): a thread
+reports the epoch it loaded before walking its stack; it clears each retired body stamped at or
+before that epoch that no frame of its stack is in; a body is freed once every thread alive at
+its stamp cleared it or ended; a thread born later is told the epoch its parent loaded. A stub
+is no safepoint: a thread between its load of the body word and its jump is held as a caller
+between its load of the slot word and its call is.
+
+**Heat** (`heat::Heat`, in the control thread). While a function is fast its slot word is a
+count stub, which counts down a per-function `u32` in a data table beside the words, set to
+`bound` when the stub goes in (a plain decrement: a lost one only delays the function a call).
+At zero the stub's runtime call queues the slot; the control thread hands it to
+`reached(slot)`, which makes the function hot exactly once per run (a stub that fires again
+before its word is gone, or a late event, is nothing), then turns the count stub off
+(`plain(slot, HEAT)`): a hot function stops paying for being counted, at most `bound` calls
+after its first. Relax measured about 5% of cycles in count stubs before removing them at its
+last tier; here they stop at hot, before the optimized tier. The count is of calls, not decayed
+by time: a function called `bound` times is worth one background compile whenever the calls
+came, and that compile never takes the worker kept for a thread's own function. `bound` is a
+`Config`, to be measured on reth and tempo.
 
 **Tier** (`tier::Tier`, in the parent). Per slot: `Fast`, `Queued`, `Optimizing{snapshot}`,
 `Optimized`, `Failed`, `Dropped`. `hot(slot, instance)` -> `Optimize(job)`; the `Optimizer`
@@ -109,14 +140,15 @@ flush as one blaze-format `events::Batch` in columns (`kinds`, `at`, `values`, `
 place; opening one is O(1) in its rows. Keys and numbers only, names coming from records.
 
 **Tests** (`suite::Tests`, in a test run's parent). A test run is a program run whose entry calls
-each test. Entered functions are collected by one byte a slot a lane: the fast prologue stores
-1 to `lanes[lane][slot]` (the lane a thread-local the harness sets per test worker and a thread
-inherits through the launcher's `pthread_create`); at a test's end the control thread reads the
-set bytes and clears them, and an optimized body counts the bodies it absorbed. That is one
-store per call and a scan of one byte a slot per test (a few microseconds for 100k slots);
-the alternative, re-arming every word as a stub per test, costs a miss per function per test.
-`record(test, verdict, entered)` keeps postings from code identity to tests; `affected(changed)`
-is a lookup per changed identity, plus every test with no record.
+each test. While tests run, each slot word is a mark stub (`MARK`), which stores 1 to the slot's
+byte in the calling thread's bitmap and jumps through the body word: one store per call, in the
+stub, only in a test run. At a test's end the control thread reads and clears the bytes set in
+the bitmaps of the test's threads (its worker, and the threads it started, which the launcher's
+`pthread_create` ties to it); `entered(marked, ids, inlined)` takes those slots and adds what the
+optimizer inlined into each optimized body among them, since an inlined callee is never called
+through its own slot. The cost is a scan of one byte a slot per test thread (a few microseconds
+for 100k slots). `record(test, verdict, entered)` keeps postings from code identity to tests;
+`affected(changed)` is a lookup per changed identity, plus every test with no record.
 
 **Export** is not built. `blaze export` reuses: the Parent's lookup and Compiler for every
 function the manifest reaches (no stubs: the walk is the program's reach, computed forward from
@@ -129,7 +161,7 @@ one Mach-O or ELF whole. It keeps nothing between runs.
 
 | Record | Key | Read list / validity |
 |---|---|---|
-| Fast code (`CodeRecord`, blaze-keyed tag 27), plain or hooked | `VersionKey`: the instance's template identity, the fast tier, the hooks | none beyond the key: a callee's edit moves no caller's fast code (calls are through slots) |
+| Fast code (`CodeRecord`, blaze-keyed tag 27) | `CodeKey`: the instance's template identity and the fast tier; nothing observed (stubs are the run's) | none beyond the key: a callee's edit moves no caller's fast code (calls are through slots) |
 | Optimized code | the instance at the optimized tier | read-addressed: its shape is the inlined list, each fact a callee's code identity; a changed callee is a new address, so the stale record is never found and costs nothing |
 | Program manifest | the checkout's certificate and the entry | slot -> (instance, code identity, fast record key); what the run reached last (`history`) |
 | Test result (`TestRun`, tag 8) | the test's base key | its asks: the code identities it entered, and its outside reads |
@@ -138,7 +170,7 @@ one Mach-O or ELF whole. It keeps nothing between runs.
 
 ## What crosses the boundary, and how
 
-The hook that exists is blaze-launch-rt's: a slot's word names its stub (`arch`: `adr x16, .;
+The need stub that exists is blaze-launch-rt's: a slot's word names it (`arch`: `adr x16, .;
 b head` on AArch64), whose resolver saves the argument registers and calls `table::resolve`,
 which pushes `Event::Need { slot, thread, reply }` on the control thread's queue (a lock-free
 `SegQueue`, not a channel, since a stub can fire while its thread ends) and waits on a
@@ -146,15 +178,19 @@ which pushes `Event::Need { slot, thread, reply }` on the control thread's queue
 a Unix socket. That stays: the parent takes the daemon's place at the socket's other end. On
 `Bound::Code` the resolver jumps through the word again, never to an address it was handed;
 `Bound::Refused` becomes the caller's panic. blaze-lazy's hook (`blaze_lazy_resolve` over
-blaze-inproc's shared-memory asks to the daemon) is the daemon's and goes.
+blaze-inproc's shared-memory asks to the daemon) is the daemon's and goes. The count, mark and
+hook stubs, the body word and the swap steps are blaze-launch's and blaze-launch-rt's (another
+lane); they keep the rule above: a stub's runtime call queues and never stores a word.
 
 The control thread places a known record without the parent: `Welcome` carries, for each slot
 whose fast record the manifest names and the store has, its key. Only a slot with no record
 crosses the socket. New messages on the wire: `Hot{slot}`, `TestEnded{test, verdict, entered}`,
-`Publish{slot, tier, hooks, record}`, `Failed{slot, error}`; from the viewer to the parent,
+`Publish{slot, tier, record}`, `Hooks{slot, hooks}`, `Failed{slot, error}`; from the viewer to
+the parent,
 `Toggle{slots, hooks, on}` (over the parent's own socket `<name>.sock`, mode 0600, beside the
 registry entry; `viewer`: the array `[1, 0, hooks, on, [slot...]]` in deterministic CBOR, a
-non-shortest head, a trailing byte or slots past the caller's cap refused by name).
+non-shortest head, a hook bit no hook has, a trailing byte or slots past the caller's cap
+refused by name).
 
 ## Floors (rule 67), with everything a record
 
@@ -169,8 +205,11 @@ non-shortest head, a trailing byte or slots past the caller's cap refused by nam
   wake of the thread: floor about 10 us. Without a record it is that plus a socket round trip
   (10 to 20 us) plus the compile. The daemon-era path was a round trip on every miss.
 - **One publish.** The bytes written into the area once, an icache flush of their lines (and
-  `membarrier` on Linux AArch64), one atomic store, an epoch store when a body is replaced.
-  Floor: under 1 us past the copy.
+  `membarrier` on Linux AArch64), two atomic stores (one under a stub), an epoch store when a
+  body is replaced. Floor: under 1 us past the copy.
+- **A call.** Into a function nobody observes: a load of the slot word and an indirect jump, as
+  before. Through a stub: that, plus the stub's work (a decrement and a branch; a byte store)
+  and a second load and jump through the body word. The floor of observing nothing is nothing.
 
 ## Reused, mirrored, deleted
 
@@ -189,17 +228,13 @@ non-shortest head, a trailing byte or slots past the caller's cap refused by nam
 
 ## Open questions
 
-1. Heat's bound, period and shift; whether the prologue counter is worth its add on every call
-   against sampling the program counter instead (no store on the call path, coarser).
-2. Who owns the slot table across runs: slots are fixed for a run; a later run of an edited
+1. Who owns the slot table across runs: slots are fixed for a run; a later run of an edited
    program numbers its own. A stable numbering (by instance) would let the history record be
    slots; today it is instances, mapped at start.
-3. A test lane per worker thread costs a thread-local load in every fast prologue; tests run
-   one at a time per process would not. Measure on reth's suite.
-4. Whether a newer snapshot should also stop the parent's speculative compiles of this run.
-5. Live patching (not now): an edit while running makes `callers_of` the set to take back to
+2. Whether a newer snapshot should also stop the parent's speculative compiles of this run.
+3. Live patching (not now): an edit while running makes `callers_of` the set to take back to
    fast code, through `Launch`'s gate.
-6. A thread that never reaches a safepoint holds every retired body (blaze-launch-rt has no
+4. A thread that never reaches a safepoint holds every retired body (blaze-launch-rt has no
    scan from outside yet): with one run per program and no edits, only promotions retire, so
    the cost is the old fast bodies' memory until the program ends.
-7. The parent's own footprint with the front end resident for compiles; rule 50.
+5. The parent's own footprint with the front end resident for compiles; rule 50.

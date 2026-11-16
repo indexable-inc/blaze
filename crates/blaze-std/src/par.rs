@@ -27,7 +27,10 @@
 //! - **Nothing outlives the call.** Chunks run as tasks of the caller's `scope`, each joined
 //!   before the call returns; a chunk that panics fails its task and the call
 //!   ([`ParError::Task`]), and cancels the scope.
-//! - **Placement.** Each chunk is a new task, placed by [`Scope::spawn`] on a worker of its own,
+//! - **May overlap.** Each chunk is correct whether it runs beside the others or after them,
+//!   so each is a [`Scope::may_overlap`] task: with no worker free it runs inline, and a scope
+//!   narrowed to one worker gives the same result as one with many.
+//! - **Placement.** Each chunk is a new task, placed by [`Scope::may_overlap`] on a worker of its own,
 //!   and once started it stays there (crate::task, "A started task never changes its thread").
 //!   Under `Inline` the chunks run one after another on the calling thread, in an order the
 //!   simulation draws, which is how the tests show the result does not depend on it.
@@ -44,7 +47,7 @@ use crate::{
 };
 
 /// How finely to cut: the fewest items a chunk is worth, and the most bytes each chunk's
-/// task's frame hands out ([`Scope::spawn`]'s `scratch`).
+/// task's frame hands out ([`Scope::may_overlap`]'s `scratch`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Grain {
     pub items: NonZeroUsize,
@@ -230,7 +233,7 @@ where
     if right_first && let Some(right) = right.take() {
         ran_right = Some(cut(cx, scope, right, len - at, ops));
     }
-    let task = scope.spawn("bstd.par", ops.grain.scratch, |cx| Ok::<_, Infallible>(cut(cx, scope, left, at, ops)));
+    let task = scope.may_overlap("bstd.par", ops.grain.scratch, |cx| Ok::<_, Infallible>(cut(cx, scope, left, at, ops)));
     if let Some(right) = right.take() {
         ran_right = Some(cut(cx, scope, right, len - at, ops));
     }

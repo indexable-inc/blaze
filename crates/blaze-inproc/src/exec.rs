@@ -2,10 +2,13 @@
 //! machine code it made (`blaze-lazy`'s stubs, `blaze-stencil`'s linked units) maps it into.
 //! The memory is private to the process; [`crate::CodeMemory`] is the one shared with a run.
 //!
-//! The code is mapped writable, written, then made read-and-execute (Linux `mprotect`; macOS
-//! `MAP_JIT` with `pthread_jit_write_protect_np`; Windows `VirtualProtectEx`), with the
-//! instruction cache made coherent by the same maintenance as [`crate::CodeMemory::publish`].
-//! It is never writable again. Unmapped when dropped.
+//! The code is mapped writable, written, then made read-and-execute (Linux and macOS
+//! `mprotect`; Windows `VirtualProtectEx`), with the instruction cache made coherent by the
+//! same maintenance as [`crate::CodeMemory::publish`]. It is never writable again, and no
+//! page is ever writable and executable at once: no per-thread switch (macOS `MAP_JIT`) is
+//! involved, so a program's own JIT can't change it and a forked child runs it as it is.
+//! On macOS the pages are unsigned, so a process that enforces code signing (the hardened
+//! runtime without `allow-unsigned-executable-memory`) is refused. Unmapped when dropped.
 
 use crate::{Error, sys};
 
@@ -27,23 +30,14 @@ impl Executable {
     /// for code whose bytes depend on where it and its data are (a linker's relocations).
     ///
     /// `write` is given the code and the data, writable, at the addresses they run at, on the
-    /// calling thread; when it returns the code is made executable. It must run no code of an
-    /// `Executable`: on macOS the thread's `MAP_JIT` pages are writable and not executable
-    /// while it runs.
+    /// calling thread; when it returns the code is made executable. Other `Executable`s run
+    /// meanwhile, on this thread too.
     pub fn written(
         code_len: usize,
         data_len: usize,
         write: impl FnOnce(&mut [u8], &mut [u8]),
     ) -> Result<Executable, Error> {
         Ok(Executable { memory: sys::Exec::new(code_len, data_len, write)? })
-    }
-
-    /// Makes the calling thread able to run every `Executable`'s code: what a child forked
-    /// from a process with `Executable`s calls before it runs any. On macOS the child's one
-    /// thread may start with `MAP_JIT` pages writable and not executable, whatever its
-    /// parent's thread had; elsewhere it does nothing. Async-signal-safe.
-    pub fn after_fork() {
-        sys::Exec::after_fork();
     }
 
     /// Where the code's first byte is.

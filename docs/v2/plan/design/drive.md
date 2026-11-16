@@ -100,11 +100,15 @@ and k reads; the extra 4 + p are a certificate, an index root and its pages (rat
 
 **The early record after a restart** (adapted from Relax's `check_reuse.rs`): the repeat path
 loads nothing but the `last` file, the leaf table and the certificate. Its key is computed from
-the leaf table's content ids, which the stat sweep proves current without reading a source, so
-with the store as target.md's segments it touches **3 pages**: the leaf table's (one per 4 KiB of
-it; one for hello-world, about 40 for reth's 4,000 files), one page of the segment index (the
-probe for the certificate's key) and the certificate's own page (findings inline; a certificate
-past one page spans more). Nothing else is mapped before the findings print.
+the leaf table's content ids, which the stat sweep proves current without reading a source.
+Through the plain store (store-next.md) it reads, from a cold page cache: the head, the manifest,
+one index page of the segment that holds the certificate (`locate`), the certificate's payload
+by one `pread` (`get_into`, never a mapping of the segment), the leaf table (one page per 4 KiB:
+one for hello-world, about 40 for reth's 4,000 files) and the slot file. **The floor to measure
+against: 6 pages for hello-world, about 45 for reth** (store-next.md's count from the code, not
+yet measured). Each segment probed before the one holding the certificate adds 1 or 2 index
+pages (at most 16 segments). Sealed segments are proved by their row with no byte read, so after
+an orderly exit nothing else is touched before the findings print.
 
 ## Tasks and Need
 
@@ -157,12 +161,23 @@ run-side index; the drive's readers column is the store form of it.
   implementation is bstd's `Dir::list` and a read and hash of every file: bstd's `Meta` has no
   stamp, so Relax's stat rule cannot run yet (gap). The leaf table is written after `WriteLast`, so a
   crash between them reports more files changed, never fewer.
-- **Store.** One file per record under `.blaze/v2/records/` written whole: target.md's segment
-  store over bstd does not exist yet (gap).
+- **Store.** Behind one trait (`store::Store`: `get_into`, `put`, `after_answer`). The open it
+  is to call is blaze-cas's `plain::Driven::open(root, settings)`, then
+  `Driven::machine(&[checkout, home])` before any put to a shared namespace (a value naming the
+  machine is `PutError::Machine`). The certificate is read by `locate` and one `pread`
+  (`get_into`). After the answer is printed, never waited on by it: `seal()`, then `compact(n)`.
+  The profile logs `report().sealed` and `report().checked`. Not reached yet: `Driven` takes
+  std's `Path` and `Vec`, and blaze-cli reaches the system only through bstd, so it needs a bstd
+  driver of the plain store (gap, blaze-cas's lane). Until then the trait's one implementation is
+  one file per record under `.blaze/v2/records/`, written whole through bstd. This is a stand-in:
+  it is not the floor above and is not measured against it.
+- **Sweep lanes.** blaze-solo's sweep takes `Config::lanes`, the number of file threads. It is sized
+  from the machine's worker count, the same number as `Config::workers`.
 - **Units.** A small reader of `[package] name`, `edition` and the default targets; anything else
   in a manifest is refused by line (blaze-manifest is std and third-party).
 - **Printing.** `file:line:col` from the file's line table at print time (`lines.rs`).
-- **Profile.** Per kind: standing, found, made, fetched, entries, time; gets, hits, puts, pages.
+- **Profile.** Per kind: standing, found, made, fetched, entries, time; gets, hits, puts, pages;
+  the store's segments sealed and checked whole at open.
   Written to `.blaze/v2/profile.txt` and summarised on stderr.
 - `export` and `build` say they are not built.
 

@@ -10,12 +10,10 @@ use blaze_sim::{Broke, Config, Tape};
 
 use crate::testing::{Fact, MemSurface};
 use crate::{
-    AnyItem, Binding, CrateRoot, CrateRootHead, CrateRootView, DeclaredName, Edition,
-    ExportClass, FileItems, HasText, ItemIndex, ItemKind, Items, KeyEntry,
-    KeyIndex, KeyIndexView, LocalTable, MacroDef, MacroDefHead, MacroDefView, MacroKind,
-    ModuleDecls, ModuleDeclsView, ModuleFile, ModuleFileView, ModuleScope, Namespace,
-    NotBuilt, Origin, Place, ScopeView, Source, SurfaceError, Target, TextualEntry,
-    TextualEntryView, Visibility,
+    AnyItem, Binding, BindingState, Def, DefKind, Edition, FileItems, HasText, ItemIndex,
+    ItemKind, Items, KeyEntry, KeyIndex, KeyIndexView, LocalTable, MacroDef, MacroDefHead,
+    MacroDefView, MacroKind, ModuleFile, ModuleFileView, Namespace, NotBuilt, Origin, Place,
+    ScopeEntry, Source, SurfaceError, TextualEntry, TextualEntryView, Visibility,
 };
 use crate::{BuiltinDerive, DefSite, ProcKind, Transparency};
 

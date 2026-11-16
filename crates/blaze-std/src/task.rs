@@ -264,7 +264,7 @@ pub struct Scope<'p> {
     parent: PhantomData<&'p Cx>,
 }
 
-/// One task of a scope, from [`Scope::spawn`]: finished by [`Task::join`], before its scope
+/// One task of a scope, from [`Scope::may_overlap`] or [`Scope::must_overlap`]: finished by [`Task::join`], before its scope
 /// is. Linear for the scope's reason; dropping one in a panic drops its outcome, which its
 /// scope has seen already.
 #[blaze::linear]

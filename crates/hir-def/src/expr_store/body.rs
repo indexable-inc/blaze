@@ -163,6 +163,10 @@ impl Body {
     #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn of(db: &Db, def: DefWithBodyId) -> Body {
         let _p = crate::body_span!(db, def, "body_query").entered();
+        // Lowered from the body's text, which only the crate the task compiles has: of any
+        // other a typed stop before anything parses (a dependency's body is a record's, never
+        // its text's: a const's value or an inlined fn comes from that crate's build).
+        crate::nameres::demand_text(db, def.krate(db), "the body of an item of a crate without text");
         match lower_relative(db, def, BodyLowering::Body) {
             Some((body, _)) => body,
             None => lower_in_file(db, def, BodyLowering::Body).0,
@@ -621,7 +625,7 @@ pub fn body_syntax(db: &Db, def: DefWithBodyId) -> &Option<BodySyntax> {
     let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
     // A body of a crate given by its address whose file has no text here is refused, typed,
     // naming the crate and the file, before anything parses it.
-    crate::nameres::frozen::pages::demand_text(db, def.krate(db), file_id);
+    crate::nameres::demand_text(db, def.krate(db), "the syntax of a file of a crate without text");
     if file_id.file_id().is_none() || ast_id.in_body() {
         return placed_body_syntax(db, def);
     }

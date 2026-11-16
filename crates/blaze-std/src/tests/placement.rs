@@ -1,6 +1,6 @@
 //! A started task never changes its thread (crate::task, "A started task never changes its
 //! thread"; std.md, "Layouts"): every task, nested ones too, resumes from each of its waits on
-//! the worker it was placed on at its start. `par`'s chunks are tasks of `Scope::spawn`, placed
+//! the worker it was placed on at its start. `par`'s chunks are tasks of `Scope::may_overlap`, placed
 //! the same way; its closures are given no `cx` to wait with.
 //!
 //! Plant: [`Plant::TaskMigrates`], a resume that moves the task to the next worker.
@@ -58,13 +58,13 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let scope = cx.scope();
     for (at, (sleeps, nested)) in plan.tasks.iter().enumerate() {
         let (clock, note) = (&clock, &note);
-        let task = scope.spawn("placed", SCRATCH, move |cx| -> Result<(), String> {
+        let task = scope.may_overlap("placed", SCRATCH, move |cx| -> Result<(), String> {
             for &ms in sleeps {
                 note(sleep_in_place(cx, clock, ms, &format!("task {at}")));
             }
             if *nested {
                 let inner = cx.scope();
-                let child = inner.spawn("nested", SCRATCH, |cx| -> Result<(), String> {
+                let child = inner.may_overlap("nested", SCRATCH, |cx| -> Result<(), String> {
                     note(sleep_in_place(cx, clock, sleeps[0], &format!("task {at}'s nested task")));
                     Ok(())
                 });

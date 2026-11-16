@@ -50,7 +50,7 @@ use crate::{
     LifetimeParamId, Macro2Id, MacroId, MacroRulesId, ProcMacroId, StaticId, StructId, TraitId,
     TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
-    deps::ImageBuf,
+    hir::col::ImageBuf,
     expr_store::{
         Body, ComptimeForm, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId,
         MissingBodyItemKind, NO_OWNER, SpecClauseKind, VerifyRefusal,
@@ -3248,7 +3248,7 @@ fn f() -> u32 {
     fn decode_in_reads_in_its_image() {
         use std::sync::Arc;
 
-        use crate::deps::Held;
+        use crate::hir::col::Held;
 
         let (db, defs) = bodies(EVERY_KIND);
         let body = Body::of(&db, defs[0]);

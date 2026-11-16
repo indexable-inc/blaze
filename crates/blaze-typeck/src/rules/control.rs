@@ -245,7 +245,7 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
     fn find_break(&self, target: ExprId) -> Result<usize, Stop> {
         match self.breaks.iter().rposition(|b| b.target == target) {
             Some(i) => Ok(i),
-            None => Err(CheckError::Malformed(Malformed::BreakTarget).into()),
+            None => Err(CheckError::Malformed(Malformed::BreakTarget(target)).into()),
         }
     }
 
@@ -255,7 +255,7 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
             let i = self.find_break(target)?;
             f.a = i as u32;
             let Some(site) = self.breaks[i].coerce else {
-                return Err(CheckError::Malformed(Malformed::BreakTarget).into());
+                return Err(CheckError::Malformed(Malformed::BreakTarget(target)).into());
             };
             match value {
                 Some(v) => {
@@ -274,10 +274,10 @@ impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
     }
 
     /// `check_expr_return`.
-    pub(crate) fn expr_return(&mut self, f: Frame, _e: ExprId, value: Option<ExprId>) -> Result<Flow, Stop> {
+    pub(crate) fn expr_return(&mut self, f: Frame, e: ExprId, value: Option<ExprId>) -> Result<Flow, Stop> {
         if f.state == 0 {
             let Some(&site) = self.ret_sites.last() else {
-                return Err(CheckError::Malformed(Malformed::BreakTarget).into());
+                return Err(CheckError::Malformed(Malformed::BreakTarget(e)).into());
             };
             match value {
                 Some(v) => {

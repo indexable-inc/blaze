@@ -406,9 +406,6 @@ impl Exec {
         self.at as u64 + self.code_pages as u64
     }
 
-    /// Windows has no `fork`, and the code's pages are executable for every thread.
-    pub fn after_fork() {}
-
     pub fn data(&mut self) -> &mut [u8] {
         // SAFETY: the data's `data` bytes after the code's pages, committed writable, live as
         // long as `self`; `&mut self` makes this the only borrow.
