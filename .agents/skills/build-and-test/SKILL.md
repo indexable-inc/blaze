@@ -59,25 +59,33 @@ committing. A result you can't tie to a tree is not evidence.
 
 ## work-in-ix-vms (rule 34)
 
-There is one ix VM for all of blaze's work: `blaze-vm` (arm64, 128 cores, 256 GiB committed; how-to
-`H12` under `agents/howto/` has its layout and how to remake it). Builds, tests, benchmarks,
-real-project runs and experiments on Linux all run there: nobody makes another VM (`ix new`) for a
-lane, a measurement or a project. It holds the one tree at `/root/blaze` with a warm build; blaze is
-built only through `/root/loop.sh <branch> <command...>`, which takes a lock, checks out the branch,
-builds once, installs to `/root/inst` and runs the command (ten minutes at most inside the lock); a
-lane's own state lives under `/root/wt/<lane>/` and long runs are systemd units it polls. Because
-every lane shares the machine, a timing names the load average it was taken under and compares base
-and new alternately in one window; for a table a claim rests on, the main agent holds the other work
-and the row says so. The exceptions are facts the one VM cannot give, each named in the lane's brief
-with its reason: the Mac for macOS behaviour (one build at a time, since three at once made every
-number of a night unusable). There is no x86-64 machine for now: x86-64 is CI's, and an x86 run (an
-EPYC VM, `ix new --cpu epyc-5`) is an exception the owner is asked for first. Never AWS
-(`fleet-ops`, `dev-aws-N`). Where none of these can do it, stop and say what is missing. The machine
-has one budget, whoever's tree a build is in: one release build at a time, at `-j 48`, taken with
-`flock /root/locks/release.lock` around the cargo call; debug checks and tests run beside it at `-j
-32` at most. A session tells the others before a release build, and a job that needs one waits for
-the lock, never starts beside another. Three release builds at `-j 64` with tests beside them left
-the guest unreachable for minutes, twice in one afternoon (2026-11-14).
+The Mac is a full place for blaze's work since 2026-11-15: builds, one crate's tests or the whole
+test run, the smoke before a merge (`proof-before-merge`) and real-project runs all may run there,
+and they do whenever the VM does not answer, is busy, or its disk hangs; nobody waits on the VM. On
+the Mac: one cargo or blaze build at a time, niced, `-j 6`, a target directory per worktree (two
+worktrees sharing one run each other's stale binaries), outputs kept outside `/tmp`, the disk
+watched (a 312 GB target filled it on 2026-11-13; the machine restarted under load on 2026-11-15). A
+number measured on the Mac says so; the edit-loop table that compares runs stays on one machine. The
+rest of this rule is how the VM is used when it is. There is one ix VM for blaze's Linux work:
+`blaze-vm` (arm64, 128 cores, 256 GiB committed; how-to `H12` under `agents/howto/` has its layout
+and how to remake it). Builds, tests, benchmarks, real-project runs and experiments on Linux all run
+there: nobody makes another VM (`ix new`) for a lane, a measurement or a project. It holds the one
+tree at `/root/blaze` with a warm build; blaze is built only through `/root/loop.sh <branch>
+<command...>`, which takes a lock, checks out the branch, builds once, installs to `/root/inst` and
+runs the command (ten minutes at most inside the lock); a lane's own state lives under
+`/root/wt/<lane>/` and long runs are systemd units it polls. Because every lane shares the machine,
+a timing names the load average it was taken under and compares base and new alternately in one
+window; for a table a claim rests on, the main agent holds the other work and the row says so. The
+exceptions are facts the one VM cannot give, each named in the lane's brief with its reason: the Mac
+for macOS behaviour (one build at a time, since three at once made every number of a night
+unusable). There is no x86-64 machine for now: x86-64 is CI's, and an x86 run (an EPYC VM, `ix new
+--cpu epyc-5`) is an exception the owner is asked for first. Never AWS (`fleet-ops`, `dev-aws-N`).
+Where none of these can do it, stop and say what is missing. The machine has one budget, whoever's
+tree a build is in: one release build at a time, at `-j 48`, taken with `flock
+/root/locks/release.lock` around the cargo call; debug checks and tests run beside it at `-j 32` at
+most. A session tells the others before a release build, and a job that needs one waits for the
+lock, never starts beside another. Three release builds at `-j 64` with tests beside them left the
+guest unreachable for minutes, twice in one afternoon (2026-11-14).
 
 See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel).
 

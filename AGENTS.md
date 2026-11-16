@@ -145,7 +145,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **7. verify-on-real-projects**: Judge blaze by real projects it builds passing their own tests, never against cargo.
 - **8. own-nightly**: Each project builds with `harness/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
-- **34. work-in-ix-vms**: Linux work runs on the one VM, `blaze-vm`, through its queue; the Mac for macOS; no AWS, no x86 VM.
+- **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
 - **35. fan-out-write-only**: Lanes only write; the main agent compiles each piece within minutes, then admits it alone.
 - **36. worktree-per-lane**: One directory, each lane in its own files; a worktree is the exception; never `git stash`.
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
