@@ -45,8 +45,13 @@ pub enum PNode {
     FnDef(ItemKey, List),
     /// A fn pointer: the inputs, then the output last; its ABI and safety.
     FnPtr(List, FnPtrHeader),
-    /// A closure of this body, by its expression, and its signature (a `FnPtr`).
-    Closure(ExprId, PTy),
+    /// A closure type (the Reference, "Closure types": each closure expression has a unique
+    /// anonymous type): the item whose body holds the expression, the closure's ordinal among
+    /// that body's closures in expression order, and the owner's generic arguments in scope
+    /// (`Param(0..n)` in its own record). Its signature, kind and captures are facts of the
+    /// owner's `Checked::closures`, asked as `Question::Closure` (typeck.md, "A closure's
+    /// identity"); never part of the type.
+    Closure { owner: ItemKey, ordinal: u32, args: List },
     /// An async block's future, by its expression: its output and its interior
     /// (`TyView::Future`).
     Future(ExprId, PTy, PTy),
@@ -146,6 +151,61 @@ fn hash_list(l: List, h: &mut StableHasher) {
     h.u32(l.len);
 }
 
+/// Pushes the children of `n` in `t` onto `out` in order (a list's terms in order; a
+/// `ConstValue`'s type too): the one walk order of a record's terms, for converting them
+/// (infer/facts.rs) and for hashing them (world.rs `Hashes`).
+pub(crate) fn node_children(t: PTys<'_>, n: PNode, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>) -> Result<(), CheckError> {
+    let mut list = |l: List, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>| -> Result<(), CheckError> {
+        for i in l.range() {
+            let p = t.lists.get(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
+            out.push(p.0);
+        }
+        Ok(())
+    };
+    match n {
+        PNode::Bool
+        | PNode::Char
+        | PNode::Int(_)
+        | PNode::Uint(_)
+        | PNode::Float(_)
+        | PNode::Str
+        | PNode::Never
+        | PNode::Param(_)
+        | PNode::ConstParam(_)
+        | PNode::Error
+        | PNode::ExAuto(_)
+        | PNode::Future(..)
+        | PNode::Infer => Ok(()),
+        PNode::ConstValue { ty: p, .. } | PNode::Ref(_, p) | PNode::Ptr(_, p) | PNode::Slice(p) => {
+            out.push(p.0);
+            Ok(())
+        }
+        PNode::Array(e, len) => {
+            out.push(e.0);
+            out.push(len.0);
+            Ok(())
+        }
+        PNode::Pat(b, l) => {
+            out.push(b.0);
+            list(l, out)
+        }
+        PNode::Tuple(l)
+        | PNode::Adt(_, l)
+        | PNode::FnDef(_, l)
+        | PNode::FnPtr(l, _)
+        | PNode::Opaque(_, l)
+        | PNode::Dynamic(l)
+        | PNode::ExTrait(_, l)
+        | PNode::Closure { args: l, .. }
+        | PNode::Alias { args: l, .. } => list(l, out),
+        PNode::ExProj { args, term, .. } => {
+            list(args, out)?;
+            out.push(term.0);
+            Ok(())
+        }
+    }
+}
+
 /// The content of one node, its children by index.
 pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
     match *n {
@@ -208,10 +268,11 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
             hash_list(l, h);
             h.u32(u32::from(hdr.bits()));
         }
-        PNode::Closure(e, sig) => {
+        PNode::Closure { owner, ordinal, args } => {
             h.tag(15);
-            h.u32(e.0);
-            h.u32(sig.0);
+            h.u128(owner.0);
+            h.u32(ordinal);
+            hash_list(args, h);
         }
         PNode::Param(i) => {
             h.tag(16);

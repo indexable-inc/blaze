@@ -231,7 +231,7 @@ impl Store for DirStore {
     type Held = Vec<u8>;
     type Error = FilesError;
 
-    fn get(&self, kind: Kind, key: &ContentId) -> Result<Option<Vec<u8>>, FilesError> {
+    fn get(&self, kind: Kind, key: &ContentId) -> Result<Option<Self::Held>, FilesError> {
         let Some(mut bytes) = self.files.read(&Self::name(kind, key))? else { return Ok(None) };
         // A torn file (any prefix of a publish, or zeros where a sector was lost) is a miss.
         let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else { return Ok(None) };
@@ -251,7 +251,7 @@ impl Store for DirStore {
         self.files.publish(&name, bytes, &ContentId::of(SEAL, bytes).0)
     }
 
-    fn bytes(held: &Vec<u8>) -> &[u8] {
+    fn bytes(held: &Self::Held) -> &[u8] {
         held
     }
 
@@ -385,15 +385,20 @@ fn token_of(bytes: [u8; 8]) -> Option<TokenKind> {
     })
 }
 
-/// The tokens of `stream` as the macro sees them: kind, spacing and text.
-fn stream_bytes(out: &mut Vec<u8>, stream: &TokenStream<'_>) {
-    out.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+/// The tokens of `stream` as the macro sees them: kind, spacing and text, each piece handed to
+/// `out` in order (a record's buffer, or the key's hasher, which then holds no copy).
+fn stream_pieces(stream: &TokenStream<'_>, mut out: impl FnMut(&[u8])) {
+    out(&(stream.len() as u32).to_le_bytes());
     for token in stream.tokens() {
-        out.extend_from_slice(&token_bytes(token.kind));
+        out(&token_bytes(token.kind));
         let text = stream.text_of(token);
-        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-        out.extend_from_slice(text.as_bytes());
+        out(&(text.len() as u32).to_le_bytes());
+        out(text.as_bytes());
     }
+}
+
+fn stream_bytes(out: &mut Vec<u8>, stream: &TokenStream<'_>) {
+    stream_pieces(stream, |piece| out.extend_from_slice(piece));
 }
 
 /// The version of what the host gives a macro (the bridge server, the sandbox's answers, the
@@ -411,26 +416,28 @@ pub fn base_key(module_wasm_sha256: &str, export: &Exported, edition: Edition, c
 /// [`base_key`] as the host of `host_version` computes it: an answer kept by another host
 /// version is under another key, so it is never read.
 pub(crate) fn base_key_under(host_version: u32, module_wasm_sha256: &str, export: &Exported, edition: Edition, call: &ProcCall<'_>) -> ContentId {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&host_version.to_le_bytes());
-    bytes.extend_from_slice(b"module ");
-    bytes.extend_from_slice(module_wasm_sha256.as_bytes());
-    bytes.extend_from_slice(&export.index.to_le_bytes());
-    bytes.push(kind_byte(export.kind));
-    bytes.extend_from_slice(&(export.name.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(export.name.as_bytes());
-    bytes.push(kind_byte(call.kind));
-    bytes.push(edition_byte(edition));
-    stream_bytes(&mut bytes, call.input);
+    // Streamed into the hasher, never gathered: the digest of the same bytes in the same
+    // order (BLAKE3 hashes the concatenation), so the keys are those a buffer gave, and a
+    // lookup allocates nothing for its key.
+    let mut hasher = Hasher::new("blaze proc-macro expansion 1");
+    hasher.update(&host_version.to_le_bytes()).update(b"module ").update(module_wasm_sha256.as_bytes());
+    hasher.update(&export.index.to_le_bytes()).update(&[kind_byte(export.kind)]);
+    hasher.update(&(export.name.len() as u32).to_le_bytes()).update(export.name.as_bytes());
+    hasher.update(&[kind_byte(call.kind), edition_byte(edition)]);
+    stream_pieces(call.input, |piece| {
+        hasher.update(piece);
+    });
     match call.attr_args {
         Some(attr) => {
-            bytes.push(1);
-            stream_bytes(&mut bytes, attr);
+            hasher.update(&[1]);
+            stream_pieces(attr, |piece| {
+                hasher.update(piece);
+            });
         }
-        None => bytes.push(0),
+        None => {
+            hasher.update(&[0]);
+        }
     }
-    let mut hasher = Hasher::new("blaze proc-macro expansion 1");
-    hasher.update(&bytes);
     hasher.finish()
 }
 

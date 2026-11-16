@@ -409,8 +409,15 @@ impl World for BodyWorld<'_, '_> {
         self.gap(Gap::BodyRecord(tc::Question::Const(item)))
     }
 
+    /// An opaque type a fn's head made: its hidden type is not told (`None`): a body sees
+    /// only its bounds (the Reference, "Impl trait", "Abstract return types"; auto traits that
+    /// leak from the hidden type need the defining body's record: not made yet). Any other key
+    /// is a gap.
     fn opaque_hidden(&self, _: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
-        self.gap(Gap::BodyRecord(tc::Question::Opaque(item)))
+        match self.store.opaques.get(&item) {
+            Some(_) => Ok(None),
+            None => self.gap(Gap::BodyRecord(tc::Question::Opaque(item))),
+        }
     }
 
     /// No attribute is read into the store yet (`#[non_exhaustive]`, `#[fundamental]`): the

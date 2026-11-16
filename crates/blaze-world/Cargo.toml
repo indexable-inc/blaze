@@ -14,6 +14,9 @@ repository.workspace = true
 doctest = false
 
 [features]
+# The name solver's cell core run beside the old one (blaze-scope's `cells`): examples/names.rs
+# gives it a clock and prints its typed reports.
+cells = ["blaze-scope/cells"]
 # `Checkout`: a workspace's own files read from a folder on disk (the one reader that does IO).
 std = ["dep:blaze-core"]
 # `procs`: a macro crate's module identity and its lookup in the module store (src/procs.rs),

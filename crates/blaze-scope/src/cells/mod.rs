@@ -31,6 +31,7 @@ mod tests;
 
 pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames};
 pub(crate) use seam::shadow;
+pub use seam::{DIFFER_SHOWN, Differ, Seam, ShadowRefused, Shadowed};
 
 pub(crate) const NAMESPACES: [Namespace; 3] = [Namespace::Types, Namespace::Values, Namespace::Macros];
 

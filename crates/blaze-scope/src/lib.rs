@@ -47,11 +47,15 @@
 extern crate std;
 
 mod again;
+pub mod asked;
 mod builtin;
 // The cell core, stage 1 (bottom.md section 6): no caller until stage 2's seam.
 #[cfg(feature = "cells")]
 #[cfg_attr(not(test), expect(dead_code, reason = "the cell core under construction: the seam comes later"))]
 mod cells;
+/// The cell core's shadow seam: what its caller gives (a clock) and gets back (a typed report).
+#[cfg(feature = "cells")]
+pub use cells::{DIFFER_SHOWN, Differ as CellsDiffer, Seam as CellsSeam, ShadowRefused as CellsRefused, Shadowed as CellsShadowed};
 pub mod crate_scope;
 mod error;
 mod facts;

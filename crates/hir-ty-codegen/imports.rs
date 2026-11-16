@@ -177,7 +177,7 @@ type Key = (InstanceDef, StoredGenericArgs, bool);
     clippy::disallowed_types,
     reason = "the process's one table of exports, each built once by the first compile that asks"
 )]
-static EXPORTS: std::sync::LazyLock<SharedMap<Key, Arc<std::sync::OnceLock<Option<Arc<Export>>>>>> =
+static EXPORTS: std::sync::LazyLock<SharedMap<Key, Arc<std::sync::OnceLock<Option<Arc<Export>>>>, Global>> =
     std::sync::LazyLock::new(Default::default);
 
 /// The release of the interner's tables ([`hir_ty::evict::tables_released`]) every entry of

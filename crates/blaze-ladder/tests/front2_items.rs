@@ -279,6 +279,87 @@ fn main() {}
     assert!(got[1].1.contains("diagnostics") && got[1].1.contains("E0277") && got[1].1.contains("`S: Send`"), "{got:?}");
 }
 
+/// A refused impl blocks only the goals whose crate it could be written in (the Reference,
+/// "Implementations", "Inherent implementations": "An implementing type must be defined within
+/// the same crate as the original type definition."; "Orphan rules": "Given `impl<P1..=Pn>
+/// Trait<T1..=Tn> for T0`, an `impl` is valid only if at least one of the following is true:
+/// `Trait` is a local trait; At least one of the types `T0..=Tn` must be a local type."). The
+/// program's `impl dyn Tr<W<{ size_of::<u8>() }>>` and `impl Display for dyn Tr<..>` are refused
+/// (the evaluator runs no call yet) and their self type has no constructor read as written, so
+/// each is a candidate of every inherent question and of every `Display` question. `Option`'s
+/// inherent `is_some` and `u16: Display` are answered (core's type, core's trait: no impl of
+/// this crate can answer them); `S`'s inherent `s` and `S: Display` (S is this crate's) stay
+/// the gap naming the refused impl. Before the fix all four were the gap.
+#[test]
+fn a_refused_impl_blocks_only_its_crates_goals() {
+    const TEXT: &str = "trait Tr<T> {}
+struct W<const N: usize>;
+struct S;
+impl S { fn s(&self) -> u8 { 1 } }
+impl core::fmt::Display for S { fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }
+impl dyn Tr<W<{ core::mem::size_of::<u8>() }>> { fn d(&self) -> u8 { 0 } }
+impl core::fmt::Display for dyn Tr<W<{ core::mem::size_of::<u16>() }>> { fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }
+fn need<T: core::fmt::Display>(_t: T) {}
+fn foreign_inherent() -> bool { Some(1u8).is_some() }
+fn foreign_trait() { need(7u16) }
+fn local_inherent() -> u8 { S.s() }
+fn local_trait() { need(S) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["foreign_inherent", "foreign_trait", "local_inherent", "local_trait"]);
+    println!("by crate: {got:?}");
+    all_clean("by crate", &got[..2]);
+    for i in [2, 3] {
+        assert!(got[i].1.contains("has a refused header"), "{got:?}");
+    }
+}
+
+/// An impl's header is built from its own text and names: a projection of its own parameter in
+/// its trait's arguments (`impl<T: Core> Api<Req<T::N>> for E<T>`, reth_rpc_eth_api core.rs:458's
+/// `impl<T> EthApiServer<RpcTxReq<T::NetworkTypes>, ..>`) is resolved against the parameter's
+/// bounds as written in that header (the Reference, "Paths", "Qualified paths": `T::N` is
+/// `<T as Core>::N` for the one bound of `T` that has an `N`), never through the finished header
+/// of the impl itself. Before the fix tempo's impl was "these items need each other's heads in
+/// a cycle: [e97737e3dcaa, e97737e3dcaa]".
+#[test]
+fn an_impl_header_needs_not_itself() {
+    const TEXT: &str = "trait Net { type Ty; }
+trait Core { type N: Net; }
+trait Full: Core {}
+trait Api<A> { fn a(&self) -> u8 { 0 } }
+type Req<N> = <N as Net>::Ty;
+impl<T> Api<Req<T::N>> for T where T: Full, u8: From<<T::N as Net>::Ty> {}
+struct C;
+struct Nn;
+impl Net for Nn { type Ty = u8; }
+impl Core for C { type N = Nn; }
+impl Full for C {}
+fn need<A, X: Api<A>>(x: X) -> u8 { x.a() }
+fn uses() -> u8 { need::<u8, C>(C) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["uses"]);
+    all_clean("self need", &got);
+}
+
+/// A type alias's defaulted parameter left out of a path takes its default (the Reference,
+/// "Type aliases": "A type alias defines a new name for an existing type"; "Generic parameters":
+/// a type parameter with a default may be left out, the arguments before it put in): `Res<u8>`
+/// for `type Res<T, E = Er> = Result<T, E>` is `Result<u8, Er>` (alloy_sol_types's
+/// `Result<Self>`). Before the fix: "`Res < u8 >` is written with 1 type arguments; it takes 2".
+#[test]
+fn a_type_alias_default_fills_a_left_out_argument() {
+    const TEXT: &str = "struct Er;
+type Res<T, E = Er> = core::result::Result<T, E>;
+fn ok() -> Res<u8> { Ok(1) }
+fn err() -> Res<u8> { Err(Er) }
+fn both() -> Res<u8, u16> { Err(2u16) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["ok", "err", "both"]);
+    all_clean("alias default", &got);
+}
+
 /// Reduction probe for the census's `Malformed/Sort` (bstd::blobs `from_key`).
 #[test]
 fn sort_probe() {

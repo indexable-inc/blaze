@@ -1198,12 +1198,12 @@ impl Io {
     /// Requests the host makes for the program, if it offers that (a wasm worker's `fetch`;
     /// today the simulation's routes alone). A program that has a `Net` makes its own with
     /// [`Http::over`]. Behind bstd's `net` feature.
-    #[cfg(feature = "net")]
+    #[cfg(feature = "requests")]
     pub fn http(&self) -> Option<crate::requests::Http> {
         self.offered(|it| it.http).then(|| crate::requests::Http::host(self.clone()))
     }
 
-    #[cfg(feature = "net")]
+    #[cfg(feature = "requests")]
     pub fn need_http(&self) -> Result<crate::requests::Http, Missing> {
         self.http().ok_or(Missing { capability: "http" })
     }

@@ -49,6 +49,12 @@ pub trait Records<N> {
     /// for any other key. A module of another crate has no entry scope here: its textual
     /// entry is read as empty.
     fn parent(&self, module: ItemKey) -> Option<Option<ItemKey>>;
+
+    /// `read` was answered `own` ([`answer`]): the hook a solve's read list is noted by
+    /// ([`crate::asked`]); nothing by default.
+    fn asked(&self, read: Read<N>, own: &Own<'_, N>) {
+        let _ = (read, own);
+    }
 }
 
 /// An answer, owned: the replies of one step borrow from these.

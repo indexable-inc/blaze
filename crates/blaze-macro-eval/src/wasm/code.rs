@@ -13,7 +13,8 @@
 //! Each load is a `macro module` span ([`MacroModule`]) saying where the code came from and
 //! how many bytes it is, and counts in its source's [`Plot`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::alloc::Global;
+use std::{sync::atomic::{AtomicU64, Ordering},};
 
 use blaze_cas::{Guard, Key, Kind, Origin, Reader};
 use blaze_hash::SharedMap;
@@ -54,7 +55,7 @@ pub struct Loads {
 /// The modules compiled or loaded by a daemon, by id, and how each load went.
 #[derive(Default)]
 pub(crate) struct Codes {
-    memo: SharedMap<ContentId, Module>,
+    memo: SharedMap<ContentId, Module, Global>,
     from_memo: AtomicU64,
     from_store: AtomicU64,
     compiled: AtomicU64,

@@ -45,6 +45,7 @@ mod dyn_objects;
 mod fn_ptr;
 mod fn_traits;
 mod lower_forms;
+mod opaque;
 mod pattern_types;
 mod where_const;
 mod where_projection;

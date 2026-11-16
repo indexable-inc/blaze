@@ -26,6 +26,13 @@ use crate::error::ResolveError;
 /// Runs `f` for each index below `n`, the results in index order: serially, or across threads.
 pub trait Par {
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>);
+
+    /// The cell core's shadow (feature `cells`): its clock and where its reports go. `None`, the
+    /// default, runs no shadow.
+    #[cfg(feature = "cells")]
+    fn cells_seam(&self) -> Option<&dyn crate::cells::Seam> {
+        None
+    }
 }
 
 /// One thread.
@@ -56,6 +63,11 @@ pub trait FillEnv<N>: Expand {
 
     /// The modules macros wrote since the last call.
     fn made(&self, out: &mut AVec<'_, ItemKey>);
+
+    /// A read of the fill was answered: see [`super::Records::asked`]; nothing by default.
+    fn asked(&self, read: crate::read::Read<N>, own: &super::Own<'_, N>) {
+        let _ = (read, own);
+    }
 
     /// The text inside a proc-macro derive's `attributes(..)` (its helper attributes, read by
     /// [`crate::task::ProcAttr::helper_names`]), or `None` when `derive` is no proc derive held.
@@ -151,6 +163,10 @@ impl<N: Name, E: FillEnv<N>> Records<N> for View<'_, '_, N, E> {
 
     fn parent(&self, module: ItemKey) -> Option<Option<ItemKey>> {
         self.env.parent(module)
+    }
+
+    fn asked(&self, read: crate::read::Read<N>, own: &super::Own<'_, N>) {
+        self.env.asked(read, own);
     }
 }
 

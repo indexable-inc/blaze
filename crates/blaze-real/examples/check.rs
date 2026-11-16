@@ -72,7 +72,7 @@ const EDITION: Edition = Edition::E2024;
 // The world, timed: every question the checker asks, counted and timed by kind, then answered
 // by the front end's world. Harness counters only; the checker is unchanged.
 
-const KINDS: usize = 19;
+const KINDS: usize = 20;
 
 fn kind_of(q: &Question) -> usize {
     match q {
@@ -94,12 +94,13 @@ fn kind_of(q: &Question) -> usize {
         Question::AssocParent(_) => 15,
         Question::ConstHolds(..) => 16,
         Question::ConstParams(_) => 17,
+        Question::Closure(..) => 18,
     }
 }
 
 const KIND_NAMES: [&str; KINDS] = [
     "FnSig", "Predicates", "Adt", "ImplsOf", "ImplHeader", "Inherent", "AssocItem", "TraitsInScope", "Path", "Lang",
-    "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "prefetch",
+    "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "Closure", "prefetch",
 ];
 
 struct Tally {
@@ -164,6 +165,9 @@ impl<W: World> World for Timed<'_, W> {
     fn opaque_hidden(&self, seal: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
         self.time(12, || self.inner.opaque_hidden(seal, item))
     }
+    fn closure(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<blaze_typeck::ClosureFacts<'_>>> {
+        self.time(18, || self.inner.closure(seal, owner, ordinal))
+    }
     fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         self.time(13, || self.inner.attrs(seal, item))
     }
@@ -186,7 +190,7 @@ impl<W: World> World for Timed<'_, W> {
         self.time(17, || self.inner.const_params(seal, item))
     }
     fn prefetch(&self, seal: Seal, questions: &[Question]) {
-        self.time(18,|| self.inner.prefetch(seal, questions))
+        self.time(19,|| self.inner.prefetch(seal, questions))
     }
 }
 
@@ -870,6 +874,9 @@ impl World for Empty {
         Ok(None)
     }
     fn opaque_hidden(&self, _: Seal, _: ItemKey) -> Fetch<Option<Hidden<'_>>> {
+        Ok(None)
+    }
+    fn closure(&self, _: Seal, _: ItemKey, _: u32) -> Fetch<Option<blaze_typeck::ClosureFacts<'_>>> {
         Ok(None)
     }
     fn attrs(&self, _: Seal, _: ItemKey) -> Fetch<TypeAttrs> {

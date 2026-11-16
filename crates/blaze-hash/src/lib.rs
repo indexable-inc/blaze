@@ -24,8 +24,9 @@
 //!   read takes no lock and writes no shared memory, and nothing is held across a call, so no
 //!   thread waits on another's lookup; a write locks one shard of 64. Its values are lent
 //!   (`map.pin().get(..)`), never moved out: a table whose entries are taken by value stays a
-//!   locked [`HashMap`]. They are on the global heap, named in code (`Global`): a shared table
-//!   is long-lived (a daemon's, a view's), so the global heap is its lifetime's allocator.
+//!   locked [`HashMap`]. Each takes its allocator from its caller (`SharedMap::new_in(Global)`):
+//!   a shared table is long-lived (a daemon's, a view's), so its allocator is one of its
+//!   lifetime, most often the global heap, named by the caller.
 //! - Keys an attacker may pick (a source's names and literals, a tree's file names, a path a
 //!   build script reads, a symbol's name) in a table that grows with them (an interner, an
 //!   index, a linker's symbols): [`SipKey`], SipHash-1-3 under a key drawn at random for a
@@ -150,19 +151,20 @@ pub type KeyedMap<K, V, A> = Map<K, V, SipKey, A>;
 /// A set of keys an attacker may pick, as [`KeyedMap`].
 pub type KeyedSet<K, A> = Set<K, SipKey, A>;
 
-/// A map of ordinary keys shared between threads, made by `SharedMap::default()` ([`shared`]):
-/// on the global heap, as a shared table is long-lived (see the crate's documentation). Behind
-/// the `shared` feature, which the crates that share a table turn on (the root manifest's entry).
+/// A map of ordinary keys shared between threads, made by `SharedMap::new_in(alloc)`
+/// ([`shared`]) in the allocator its caller names: one that lives as long as the table, as a
+/// shared table is long-lived (see the crate's documentation). Behind the `shared` feature,
+/// which the crates that share a table turn on (the root manifest's entry).
 #[cfg(feature = "shared")]
-pub type SharedMap<K, V> = shared::Map<K, V, FixedState>;
+pub type SharedMap<K, V, A> = shared::Map<K, V, FixedState, A>;
 
-/// A set of ordinary keys shared between threads, made by `SharedSet::default()`.
+/// A set of ordinary keys shared between threads, made by `SharedSet::new_in(alloc)`.
 #[cfg(feature = "shared")]
-pub type SharedSet<K> = shared::Set<K, FixedState>;
+pub type SharedSet<K, A> = shared::Set<K, FixedState, A>;
 
 /// A map on hashes shared between threads, indexed by the hash itself.
 #[cfg(feature = "shared")]
-pub type SharedByHash<K, V> = shared::Map<K, V, BuildKeyHasher>;
+pub type SharedByHash<K, V, A> = shared::Map<K, V, BuildKeyHasher, A>;
 
 /// The `BuildHasher` of [`HashMap`] and [`HashSet`], and of any other table of ordinary keys
 /// (`OrderMap`, the shared tables): every hasher it builds is [`FixedHasher::default`].

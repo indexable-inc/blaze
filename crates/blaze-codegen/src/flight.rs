@@ -33,7 +33,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::alloc::Global;
+use std::{sync::Arc};
 
 use blaze_graph::{Cancelled, Key, pump};
 use blaze_hash::SharedByHash;
@@ -44,18 +45,18 @@ use crate::{InstanceKey, summary::Summary};
 #[derive(Default)]
 pub struct Flights {
     /// Each function landed, by its flight key: the shape its template is kept under in the memo.
-    landed: SharedByHash<InstanceKey, ContentId>,
+    landed: SharedByHash<InstanceKey, ContentId, Global>,
     /// The compile under way of each function, by its flight key: what a wait for it parks on,
     /// and the landing it ends on (`None` for none).
     runs: pump::Flights<Option<ContentId>>,
     /// The build whose run of each function is under way, by its flight key: what a wait for
     /// it names.
-    running: SharedByHash<InstanceKey, Arc<str>>,
+    running: SharedByHash<InstanceKey, Arc<str>, Global>,
     /// The compile under way of each shape (a dev compile's IR), so two functions of one shape
     /// compile it once, whichever builds they are of.
     shapes: pump::Flights<()>,
     /// Each summary landed, by its flight key.
-    summaries: SharedByHash<InstanceKey, Summary>,
+    summaries: SharedByHash<InstanceKey, Summary, Global>,
 }
 
 /// What a build's ask of a function found ([`Flights::ask`]).
@@ -226,7 +227,7 @@ impl Flights {
 
 /// A run's entry in [`Flights::running`], taken out as the run ends, unwound or not.
 struct Running<'f> {
-    running: &'f SharedByHash<InstanceKey, Arc<str>>,
+    running: &'f SharedByHash<InstanceKey, Arc<str>, Global>,
     key: InstanceKey,
 }
 

@@ -27,13 +27,14 @@
 //! entry freed under a reader.
 
 use core::{
+    alloc::Allocator,
     fmt,
     hash::{BuildHasher, Hash},
     marker::PhantomData,
     ptr,
 };
-use std::{alloc::Global, boxed::Box, vec::Vec};
 
+use blaze_own::{Box, Vec};
 use blaze_reclaim::{Guard, Horizon, Limbo};
 
 use crate::Equivalent;
@@ -128,10 +129,11 @@ impl<K, V> Drop for Entry<K, V> {
     }
 }
 
-/// A shard's slots: a power of two of them, each empty (null), an entry, or a tombstone.
-struct Table<K, V> {
+/// A shard's slots: a power of two of them, each empty (null), an entry, or a tombstone. In the
+/// map's allocator, as its entries are.
+struct Table<K, V, A: Allocator> {
     mask: usize,
-    slots: Box<[AtomicPtr<Entry<K, V>>], Global>,
+    slots: Box<[AtomicPtr<Entry<K, V>>], A>,
 }
 
 /// What a removed entry's slot holds: never dereferenced, never an allocation's address.
@@ -144,10 +146,10 @@ fn live<K, V>(at: *mut Entry<K, V>) -> bool {
     !at.is_null() && at != tombstone()
 }
 
-impl<K, V> Table<K, V> {
-    fn new(capacity: usize) -> Table<K, V> {
+impl<K, V, A: Allocator> Table<K, V, A> {
+    fn new(capacity: usize, alloc: A) -> Table<K, V, A> {
         debug_assert!(capacity.is_power_of_two());
-        let mut slots = Vec::with_capacity_in(capacity, Global);
+        let mut slots = Vec::with_capacity_in(capacity, alloc);
         slots.resize_with(capacity, || AtomicPtr::new(ptr::null_mut()));
         Table { mask: capacity - 1, slots: slots.into_boxed_slice() }
     }
@@ -228,16 +230,16 @@ struct Writer {
 
 /// One part of a table, by the top bits of the hash, on lines of its own.
 #[repr(align(128))]
-struct Shard<K, V> {
-    table: AtomicPtr<Table<K, V>>,
+struct Shard<K, V, A: Allocator> {
+    table: AtomicPtr<Table<K, V, A>>,
     len: AtomicUsize,
     /// How many values `limbo` holds, read before the lock to skip the scan of a collect.
     held: AtomicUsize,
     writer: Lock<Writer>,
 }
 
-impl<K, V> Shard<K, V> {
-    fn new() -> Shard<K, V> {
+impl<K, V, A: Allocator> Shard<K, V, A> {
+    fn new() -> Shard<K, V, A> {
         Shard {
             table: AtomicPtr::new(ptr::null_mut()),
             len: AtomicUsize::new(0),
@@ -247,7 +249,7 @@ impl<K, V> Shard<K, V> {
     }
 
     /// The current table, for a reader inside a pin: `None` before the first insert.
-    fn current(&self) -> Option<&Table<K, V>> {
+    fn current(&self) -> Option<&Table<K, V, A>> {
         // Acquire: the table's slots, written before its Release publish.
         let table = self.table.load(Ordering::Acquire);
         // SAFETY: a published table is freed only once retired and its grace passed, which
@@ -256,40 +258,46 @@ impl<K, V> Shard<K, V> {
     }
 }
 
-/// A table shared between threads; see the module docs. Made by `Default` (`SharedMap::default()`)
-/// or [`Map::with_hasher`].
-pub struct Map<K, V, S> {
-    shards: Box<[Shard<K, V>], Global>,
+/// A table shared between threads; see the module docs. Made by [`Map::new_in`] or
+/// [`Map::with_hasher_in`], in the allocator the caller passes: the shards, every table and
+/// every entry are in it. A write retires what it unlinks into a limbo that may outlive the
+/// call, so the allocator is a cloneable handle that lives as long as the program
+/// (`Send + Sync + 'static` for a write): the global heap, or a region kept for the run.
+pub struct Map<K, V, S, A: Allocator + Clone> {
+    shards: Box<[Shard<K, V, A>], A>,
     hasher: S,
-    _owns: PhantomData<Box<Entry<K, V>>>,
+    alloc: A,
+    _owns: PhantomData<Box<Entry<K, V>, A>>,
 }
 
 // SAFETY: the map owns its keys and values (boxed entries) and hands them to whichever thread
 // drops the map or an entry's grace passes on, so they are `Send`; any thread may read them
-// through a pin, so they are `Sync`. The rest is atomics and a lock.
-unsafe impl<K: Send + Sync, V: Send + Sync, S: Send> Send for Map<K, V, S> {}
+// through a pin, so they are `Sync`. The rest is atomics, a lock and the allocator handle,
+// which every thread that writes or drops uses.
+unsafe impl<K: Send + Sync, V: Send + Sync, S: Send, A: Allocator + Clone + Send + Sync> Send for Map<K, V, S, A> {}
 
 // SAFETY: as for `Send`: a shared map lends `&K` and `&V` to every thread and moves them to
-// the thread whose write unlinks them.
-unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync> Sync for Map<K, V, S> {}
+// the thread whose write unlinks them; any thread's write allocates through `&A`.
+unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync, A: Allocator + Clone + Send + Sync> Sync for Map<K, V, S, A> {}
 
-impl<K, V, S: Default> Default for Map<K, V, S> {
-    fn default() -> Map<K, V, S> {
-        Map::with_hasher(S::default())
+impl<K, V, S: Default, A: Allocator + Clone> Map<K, V, S, A> {
+    /// An empty table on a default hasher (the fixed seed's, for the crate's aliases) in `alloc`.
+    pub fn new_in(alloc: A) -> Map<K, V, S, A> {
+        Map::with_hasher_in(S::default(), alloc)
     }
 }
 
-impl<K, V, S> Map<K, V, S> {
-    /// An empty table on `hasher`: the shards, and no slot until a first insert.
-    pub fn with_hasher(hasher: S) -> Map<K, V, S> {
-        let mut shards = Vec::with_capacity_in(SHARDS, Global);
+impl<K, V, S, A: Allocator + Clone> Map<K, V, S, A> {
+    /// An empty table on `hasher` in `alloc`: the shards, and no slot until a first insert.
+    pub fn with_hasher_in(hasher: S, alloc: A) -> Map<K, V, S, A> {
+        let mut shards = Vec::with_capacity_in(SHARDS, alloc.clone());
         shards.resize_with(SHARDS, Shard::new);
-        Map { shards: shards.into_boxed_slice(), hasher, _owns: PhantomData }
+        Map { shards: shards.into_boxed_slice(), hasher, alloc, _owns: PhantomData }
     }
 
     /// Lends the table to this thread's task: what it reads stays valid until the pin drops.
     /// The pin may be held across a wait (`blaze_reclaim::enter`).
-    pub fn pin(&self) -> Pinned<'_, K, V, S> {
+    pub fn pin(&self) -> Pinned<'_, K, V, S, A> {
         Pinned { map: self, _task: blaze_reclaim::enter() }
     }
 
@@ -307,7 +315,7 @@ impl<K, V, S> Map<K, V, S> {
     }
 }
 
-impl<K, V, S> Drop for Map<K, V, S> {
+impl<K, V, S, A: Allocator + Clone> Drop for Map<K, V, S, A> {
     fn drop(&mut self) {
         for shard in &*self.shards {
             // Relaxed: `&mut self`, so every store to it happened before.
@@ -317,19 +325,20 @@ impl<K, V, S> Drop for Map<K, V, S> {
             }
             // SAFETY: the map is dropped, so no pin of it lives: the current table and its
             // live entries are this drop's alone (retired ones are the limbo's, dropped with it).
-            let table = unsafe { Box::from_raw_in(table, Global) };
+            let table = unsafe { Box::from_raw_in(table, self.alloc.clone()) };
             for slot in &*table.slots {
                 let entry = slot.load(Ordering::Relaxed);
                 if live(entry) {
-                    // SAFETY: as above; each live entry is in one slot of the current table.
-                    drop(unsafe { Box::from_raw_in(entry, Global) });
+                    // SAFETY: as above; each live entry is in one slot of the current table, in
+                    // the map's allocator.
+                    drop(unsafe { Box::from_raw_in(entry, self.alloc.clone()) });
                 }
             }
         }
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, S> fmt::Debug for Map<K, V, S> {
+impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Map<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pinned = self.pin();
         f.debug_map().entries(pinned.iter()).finish()
@@ -337,8 +346,8 @@ impl<K: fmt::Debug, V: fmt::Debug, S> fmt::Debug for Map<K, V, S> {
 }
 
 /// A [`Map`] lent to this thread's task ([`Map::pin`]); what it lends lives as long as it does.
-pub struct Pinned<'m, K, V, S> {
-    map: &'m Map<K, V, S>,
+pub struct Pinned<'m, K, V, S, A: Allocator + Clone> {
+    map: &'m Map<K, V, S, A>,
     _task: Guard,
 }
 
@@ -357,7 +366,7 @@ impl<V: fmt::Debug> fmt::Debug for OccupiedError<'_, V> {
     }
 }
 
-impl<K, V, S> Pinned<'_, K, V, S> {
+impl<K, V, S, A: Allocator + Clone> Pinned<'_, K, V, S, A> {
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -389,8 +398,8 @@ impl<K, V, S> Pinned<'_, K, V, S> {
     }
 }
 
-impl<K, V, S: BuildHasher> Pinned<'_, K, V, S> {
-    fn shard_of(&self, hash: u64) -> &Shard<K, V> {
+impl<K, V, S: BuildHasher, A: Allocator + Clone> Pinned<'_, K, V, S, A> {
+    fn shard_of(&self, hash: u64) -> &Shard<K, V, A> {
         &self.map.shards[(hash >> (u64::BITS - SHARDS.trailing_zeros())) as usize]
     }
 
@@ -508,7 +517,9 @@ enum Wrote<'g, K, V> {
     Kept(&'g Entry<K, V>, V),
 }
 
-impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHasher> Pinned<'_, K, V, S> {
+impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone + Send + Sync + 'static>
+    Pinned<'_, K, V, S, A>
+{
     /// Puts `value` for `key`; the value it replaced, readable while this pin lives.
     pub fn insert(&self, key: K, value: V) -> Option<&V> {
         match self.write(key, value, Held::Replace, Plant::None) {
@@ -596,7 +607,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
                         if !keep(&held.key, &held.value) {
                             slot.store(tombstone(), Ordering::Release);
                             shard.len.fetch_sub(1, Ordering::Relaxed);
-                            retire_entry(shard, &mut writer, entry, Plant::None);
+                            retire_entry(shard, &mut writer, &self.map.alloc, entry, Plant::None);
                         }
                     }
                 }
@@ -619,18 +630,18 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
             for slot in unsafe { &*table }.slots.iter() {
                 let entry = slot.load(Ordering::Relaxed);
                 if live(entry) {
-                    retire_entry(shard, &mut writer, entry, Plant::None);
+                    retire_entry(shard, &mut writer, &self.map.alloc, entry, Plant::None);
                 }
             }
             shard.len.store(0, Ordering::Relaxed);
             writer.used = 0;
-            retire_table(shard, &mut writer, table);
+            retire_table(shard, &mut writer, &self.map.alloc, table);
         }
     }
 
     /// The scan of every thread's epoch slot, taken before the lock (`blaze_reclaim::scans`),
     /// when the shard holds enough retired values to free.
-    fn horizon(&self, shard: &Shard<K, V>) -> Option<Horizon> {
+    fn horizon(&self, shard: &Shard<K, V, A>) -> Option<Horizon> {
         (shard.held.load(Ordering::Relaxed) >= COLLECT_AT).then(Horizon::now)
     }
 
@@ -661,7 +672,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
                     if should(&held.key, &held.value) {
                         table.slots[at].store(tombstone(), Ordering::Release);
                         shard.len.fetch_sub(1, Ordering::Relaxed);
-                        retire_entry(shard, &mut writer, entry, Plant::None);
+                        retire_entry(shard, &mut writer, &self.map.alloc, entry, Plant::None);
                         Ok(Some((&held.key, &held.value)))
                     } else {
                         Err((&held.key, &held.value))
@@ -686,14 +697,14 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
         let horizon = self.horizon(shard);
         let (wrote, passed) = {
             let mut writer = lock(shard);
-            let table = room(shard, &mut writer);
+            let table = room(shard, &mut writer, &self.map.alloc);
             let (at, holds) = table.place(hash, &key);
             let wrote = if holds && held == Held::Keep {
                 let entry = table.slots[at].load(Ordering::Relaxed);
                 // SAFETY: a live slot of the current table, under the lock; this pin keeps it.
                 Wrote::Kept(unsafe { &*entry }, value)
             } else {
-                let fresh = Box::into_raw(Box::new_in(Entry { hash, key, value }, Global));
+                let (fresh, _) = Box::into_raw_with_allocator(Box::new_in(Entry { hash, key, value }, self.map.alloc.clone()));
                 sync::wrote(fresh.cast_const());
                 let publish = match plant {
                     #[cfg(test)]
@@ -704,7 +715,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
                 // SAFETY: just published, and freed only once retired: this pin keeps it.
                 let fresh_ref = unsafe { &*fresh };
                 if live(old) {
-                    retire_entry(shard, &mut writer, old, plant);
+                    retire_entry(shard, &mut writer, &self.map.alloc, old, plant);
                     // SAFETY: retired, not freed (except under the planted bug): readable while
                     // this pin lives, as every task that began before its grace.
                     Wrote::Replaced(unsafe { &*old })
@@ -734,15 +745,16 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
 
 /// Takes `shard`'s writers' lock; one a panicking writer left is taken as it was left, which
 /// is whole: a writer changes a slot with one store, after anything that can panic.
-fn lock<K, V>(shard: &Shard<K, V>) -> impl core::ops::DerefMut<Target = Writer> + '_ {
-    shard.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock<K, V, A: Allocator>(shard: &Shard<K, V, A>) -> impl core::ops::DerefMut<Target = Writer> + '_ {
+    shard.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Under the lock: the current table, made or grown so that one more slot can be used.
-fn room<'s, K: Send + Sync + 'static, V: Send + Sync + 'static>(
-    shard: &'s Shard<K, V>,
+/// Under the lock: the current table, made or grown in `alloc` so that one more slot can be used.
+fn room<'s, K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static>(
+    shard: &'s Shard<K, V, A>,
     writer: &mut Writer,
-) -> &'s Table<K, V> {
+    alloc: &A,
+) -> &'s Table<K, V, A> {
     let current = shard.table.load(Ordering::Relaxed);
     // SAFETY: the current table, under the lock: only this writer can retire it.
     let table = (!current.is_null()).then(|| unsafe { &*current });
@@ -751,7 +763,7 @@ fn room<'s, K: Send + Sync + 'static, V: Send + Sync + 'static>(
         return table.expect("a table with room");
     }
     let len = shard.len.load(Ordering::Relaxed);
-    let grown = Table::new(((len + 1) * 2).next_power_of_two().max(SMALLEST));
+    let grown = Table::new(((len + 1) * 2).next_power_of_two().max(SMALLEST), alloc.clone());
     if let Some(table) = table {
         for slot in &*table.slots {
             let entry = slot.load(Ordering::Relaxed);
@@ -768,25 +780,27 @@ fn room<'s, K: Send + Sync + 'static, V: Send + Sync + 'static>(
         }
     }
     writer.used = len;
-    let grown = Box::into_raw(Box::new_in(grown, Global));
+    let (grown, _) = Box::into_raw_with_allocator(Box::new_in(grown, alloc.clone()));
     // Release: the slots above, before a reader that loads the table reads them.
     shard.table.store(grown, Ordering::Release);
     if !current.is_null() {
-        retire_table(shard, writer, current);
+        retire_table(shard, writer, alloc, current);
     }
     // SAFETY: just published, retired only by a later writer under the lock.
     unsafe { &*grown }
 }
 
 /// Under the lock: `entry`, unlinked just now, held until no reader can be in it.
-fn retire_entry<K: Send + Sync + 'static, V: Send + Sync + 'static>(
-    shard: &Shard<K, V>,
+fn retire_entry<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static>(
+    shard: &Shard<K, V, A>,
     writer: &mut Writer,
+    alloc: &A,
     entry: *mut Entry<K, V>,
     plant: Plant,
 ) {
     // SAFETY: unlinked under the lock, by this writer alone: the limbo is its one owner now.
-    let entry = unsafe { Box::from_raw_in(entry, Global) };
+    // Boxed in the map's allocator, which `alloc` is a handle of.
+    let entry = unsafe { Box::from_raw_in(entry, alloc.clone()) };
     // The planted bug frees the entry at once as far as the model can tell (its bytes marked
     // freed), and leaks the box, so the test reads no memory that is really freed.
     #[cfg(test)]
@@ -802,40 +816,42 @@ fn retire_entry<K: Send + Sync + 'static, V: Send + Sync + 'static>(
 
 /// Under the lock: `table`, unlinked just now, held until no reader can be in it. Its slots are
 /// pointers: the entries are the map's or the limbo's, never the table's.
-fn retire_table<K: Send + Sync + 'static, V: Send + Sync + 'static>(
-    shard: &Shard<K, V>,
+fn retire_table<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static>(
+    shard: &Shard<K, V, A>,
     writer: &mut Writer,
-    table: *mut Table<K, V>,
+    alloc: &A,
+    table: *mut Table<K, V, A>,
 ) {
-    // SAFETY: unlinked under the lock, by this writer alone.
-    let table = unsafe { Box::from_raw_in(table, Global) };
+    // SAFETY: unlinked under the lock, by this writer alone; boxed in the map's allocator.
+    let table = unsafe { Box::from_raw_in(table, alloc.clone()) };
     writer.limbo.retire(table);
     shard.held.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Under the lock: what passed its grace by `horizon`, taken out to be dropped once the lock is
 /// let go.
-fn collect<K, V>(shard: &Shard<K, V>, writer: &mut Writer, horizon: Horizon) -> blaze_reclaim::Passed {
+fn collect<K, V, A: Allocator>(shard: &Shard<K, V, A>, writer: &mut Writer, horizon: Horizon) -> blaze_reclaim::Passed {
     let passed = writer.limbo.collect_passed(horizon);
     shard.held.store(writer.limbo.len(), Ordering::Relaxed);
     passed
 }
 
 /// A set shared between threads: a [`Map`] to `()`.
-pub struct Set<K, S>(Map<K, (), S>);
+pub struct Set<K, S, A: Allocator + Clone>(Map<K, (), S, A>);
 
-impl<K, S: Default> Default for Set<K, S> {
-    fn default() -> Set<K, S> {
-        Set(Map::default())
+impl<K, S: Default, A: Allocator + Clone> Set<K, S, A> {
+    /// An empty set on a default hasher in `alloc`, as [`Map::new_in`].
+    pub fn new_in(alloc: A) -> Set<K, S, A> {
+        Set(Map::new_in(alloc))
     }
 }
 
-impl<K, S> Set<K, S> {
-    pub fn with_hasher(hasher: S) -> Set<K, S> {
-        Set(Map::with_hasher(hasher))
+impl<K, S, A: Allocator + Clone> Set<K, S, A> {
+    pub fn with_hasher_in(hasher: S, alloc: A) -> Set<K, S, A> {
+        Set(Map::with_hasher_in(hasher, alloc))
     }
 
-    pub fn pin(&self) -> PinnedSet<'_, K, S> {
+    pub fn pin(&self) -> PinnedSet<'_, K, S, A> {
         PinnedSet(self.0.pin())
     }
 
@@ -848,7 +864,7 @@ impl<K, S> Set<K, S> {
     }
 }
 
-impl<K: fmt::Debug, S> fmt::Debug for Set<K, S> {
+impl<K: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Set<K, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pinned = self.pin();
         f.debug_set().entries(pinned.iter()).finish()
@@ -856,9 +872,9 @@ impl<K: fmt::Debug, S> fmt::Debug for Set<K, S> {
 }
 
 /// A [`Set`] lent to this thread's task.
-pub struct PinnedSet<'m, K, S>(Pinned<'m, K, (), S>);
+pub struct PinnedSet<'m, K, S, A: Allocator + Clone>(Pinned<'m, K, (), S, A>);
 
-impl<K, S> PinnedSet<'_, K, S> {
+impl<K, S, A: Allocator + Clone> PinnedSet<'_, K, S, A> {
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -872,7 +888,7 @@ impl<K, S> PinnedSet<'_, K, S> {
     }
 }
 
-impl<K, S: BuildHasher> PinnedSet<'_, K, S> {
+impl<K, S: BuildHasher, A: Allocator + Clone> PinnedSet<'_, K, S, A> {
     pub fn contains<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> bool {
         self.0.contains_key(key)
     }
@@ -902,7 +918,9 @@ impl<K, S: BuildHasher> PinnedSet<'_, K, S> {
     }
 }
 
-impl<K: Hash + Eq + Send + Sync + 'static, S: BuildHasher> PinnedSet<'_, K, S> {
+impl<K: Hash + Eq + Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone + Send + Sync + 'static>
+    PinnedSet<'_, K, S, A>
+{
     /// Puts `key`; whether it was not held.
     pub fn insert(&self, key: K) -> bool {
         self.0.try_insert(key, ()).is_ok()

@@ -32,7 +32,7 @@ const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
     Ok(())
 }
 fn a(len: usize, index: usize) -> ! { panic!(\"the len is {len} but the index is {index}\") }
-fn a2(len: usize, index: usize) -> ! { if false { core::intrinsics::abort() } panic!(\"the len is {len} but the index is {index}\") }
+fn a2(len: usize, index: usize) -> ! { if false { core::intrinsics::abort_immediate() } panic!(\"the len is {len} but the index is {index}\") }
 fn b(x: u8) -> u8 { match x { 0 => 1, _ => panic!(\"no\") } }
 fn c() -> ! { panic!() }
 fn d(x: u8) { assert!(x > 0, \"x is {x}\") }
@@ -50,7 +50,9 @@ impl core::fmt::Display for V {
 /// The free bodies that must check clean, each with what it proves.
 const CLEAN: [(&str, &str); 6] = [
     ("a", "`panic!` with two captured arguments as a `-> !` tail"),
-    ("a2", "`panic_bounds_check`'s shape: an `if false { abort() }` statement, then `panic!`"),
+    // The pinned core (library/core/src/panicking.rs line 266): `if cfg!(panic = "immediate-abort")
+    // { super::intrinsics::abort_immediate() }`; it has no `intrinsics::abort` (an E0425 here).
+    ("a2", "`panic_bounds_check`'s shape: an `if false { abort_immediate() }` statement, then `panic!`"),
     ("b", "`panic!(\"no\")` as a match arm of type `u8`"),
     ("c", "`panic!()` as a `-> !` tail"),
     ("d", "`assert!` with a captured argument"),
@@ -83,6 +85,8 @@ fn panics_through_front2() {
     let mut buckets = None;
     let mut failed: Vec<String> = Vec::new();
     let mut clean: Vec<String> = Vec::new();
+    // Each failed body's finding, for the failure message: the runner shows only the panic.
+    let mut why: Vec<String> = Vec::new();
 
     // The free fns of the fixture, then core's `panic_bounds_check` by its path.
     let mut targets: Vec<(String, blaze_id::ItemKey, &str)> = CLEAN.iter().map(|(n, p)| (n.to_string(), find(0, &[n]), *p)).collect();
@@ -130,25 +134,25 @@ fn panics_through_front2() {
         match check_body(&mut records, body, &scope) {
             Ok(done) if done.diags.is_empty() => clean.push(name.clone()),
             Ok(done) => {
-                println!("{name}: Ok with {} diagnostics ({proves})", done.diags.len());
+                why.push(format!("{name}: Ok with {} diagnostics {:?} ({proves})", done.diags.len(), done.diags));
                 failed.push(name.clone());
             }
             Err(CheckFail::Check { error: CheckError::UnknownInCleanBody { at: Recorded::ExprTy(x) }, .. }) => {
                 // The untyped node: its kind and its source.
                 let kind = view.expr(x);
                 let text = view.expr_range(x).ok().and_then(|r| view.text_at(r).ok());
-                println!("{name}: UnknownInCleanBody at {x:?}: {kind:?} `{text:?}` ({proves})");
+                why.push(format!("{name}: UnknownInCleanBody at {x:?}: {kind:?} `{text:?}` ({proves})"));
                 failed.push(name.clone());
             }
             Err(CheckFail::Diags { diags, .. }) => {
                 // Which segment a diagnostic's `name` hash is, among the expansion's words.
                 let words = ["panic", "panic_fmt", "panicking", "const_format_args", "format_args", "panic_2021", "unreachable", "core", "crate"];
                 let known: Vec<String> = words.iter().map(|w| format!("{w}={:?}", blaze_typeck::Name::of(w))).collect();
-                println!("{name}: diagnostics {diags:?} ({proves}); names: {known:?}");
+                why.push(format!("{name}: diagnostics {diags:?} ({proves}); names: {known:?}"));
                 failed.push(name.clone());
             }
             Err(other) => {
-                println!("{name}: {other:?} ({proves})");
+                why.push(format!("{name}: {other:?} ({proves})"));
                 failed.push(name.clone());
             }
         }
@@ -160,5 +164,5 @@ fn panics_through_front2() {
     }
     println!("clean: {clean:?}");
     assert_eq!(bodies.len() + failed.iter().filter(|f| !bodies.iter().any(|b| &b.0 == *f)).count(), CLEAN.len() + 3, "every target was taken");
-    assert!(failed.is_empty(), "bodies that must check clean did not: {failed:?}");
+    assert!(failed.is_empty(), "bodies that must check clean did not: {failed:?}\n{}", why.join("\n"));
 }

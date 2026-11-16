@@ -493,10 +493,20 @@ impl<'n> Front2Program<'n> {
         let bodiless = bodiless.into_iter().map(|(k, path)| (k, None, path, false));
         let declared = declared.into_iter().map(|(k, path)| (k, None, path, true));
         for (key, body, path, of_trait) in bodied.chain(bodiless).chain(declared) {
-            let head = store.fns.get(&key).ok_or_else(|| Front2Refusal::NoHead { function: path.clone() })?;
+            let Some(head) = store.fns.get(&key) else {
+                // A survey files it and goes on (a call of it is then a refused callee).
+                match left_out.as_deref_mut() {
+                    Some(out) => {
+                        out.push((path, Box::from("no head in the store (front2's)")));
+                        continue;
+                    }
+                    None => return Err(Front2Refusal::NoHead { function: path }),
+                }
+            };
             let abi = match head.header.abi {
                 tc::Abi::Rust => Abi::Rust,
                 tc::Abi::C => Abi::C,
+                tc::Abi::RustCall => Abi::RustCall,
                 // A survey files it and goes on (a call of it is then a refused callee); a run
                 // stops: the builder spreads no "rust-call" tuple yet.
                 abi => match left_out.as_deref_mut() {
@@ -553,6 +563,7 @@ impl<'n> Front2Program<'n> {
                 None => abi,
                 Some("C" | "C-unwind") => Abi::C,
                 Some("Rust") => Abi::Rust,
+                Some("rust-call") => Abi::RustCall,
                 Some(_) => match left_out.as_deref_mut() {
                     Some(out) => {
                         out.push((path, format!("ABI {:?}: neither Rust nor C", head.header.abi).into_boxed_str()));

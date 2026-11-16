@@ -250,8 +250,8 @@ pub mod power;
 pub mod procs;
 #[cfg(feature = "net")]
 pub mod quic;
-/// Making requests: `Http`, one type over a `Net`, the host or a handler. Behind `net`.
-#[cfg(feature = "net")]
+/// Making requests: `Http`, one type over a `Net`, the host or a handler. Behind `requests`.
+#[cfg(feature = "requests")]
 pub mod requests;
 /// Name lookup alone: `Resolver`, from a `Net`, with no connect.
 pub mod resolver;
@@ -478,7 +478,7 @@ pub use crate::{
     pending::Pending,
     task::{Scope, Task},
 };
-#[cfg(feature = "net")]
+#[cfg(feature = "requests")]
 pub use crate::requests::Http;
 pub use crate::{
     url::{Origin, Url},

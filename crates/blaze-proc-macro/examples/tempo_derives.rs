@@ -25,13 +25,13 @@ use blaze_record::{ListRef, Slot, list_key};
 use blaze_proc_macro::{
     host::{Limits, Loaded, Runtime},
     module::{Exported, ModuleRecord},
-    record::{DirStore, base_key, decode, find, keep, record_bytes},
+    record::{base_key, decode, find, keep, record_bytes},
     sandbox::Package,
 };
 
 mod common;
 
-use common::{modules, package_of, sources};
+use common::{expansion_records, modules, package_of, sources};
 
 /// One derive or function-like call found in a file.
 struct Call {

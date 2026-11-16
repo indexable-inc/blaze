@@ -238,6 +238,9 @@ struct TestWorld {
     structs: Vec<Struct, Global>,
     /// The fns declared `extern "C"`; every other is of the Rust ABI.
     c_abi: Vec<ItemKey, Global>,
+    /// The fns declared `extern "rust-call"` (to the builder only: the checker sees them as
+    /// Rust fns, which types their bodies and calls the same).
+    rust_call: Vec<ItemKey, Global>,
     /// The `panic_bounds_check` lang item fn, if declared.
     bounds: Option<ItemKey>,
     /// The `drop_in_place` lang item fn, if declared.
@@ -275,6 +278,7 @@ impl TestWorld {
             fns: Vec::new_in(Global),
             structs: Vec::new_in(Global),
             c_abi: Vec::new_in(Global),
+            rust_call: Vec::new_in(Global),
             bounds: None,
             drop_in_place: None,
             drops: Vec::new_in(Global),
@@ -611,14 +615,23 @@ impl Adts for TestAdts<'_> {
         self.body.strs.iter().find(|(e, _)| *e == expr).map(|&(_, s)| s)
     }
 
+    fn byte_str(&self, owner: ItemKey, expr: ExprId) -> Option<&[u8]> {
+        self.str_lit(owner, expr).map(str::as_bytes)
+    }
+
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
         self.world.intrinsics.iter().find(|(k, _)| *k == item).map(|&(_, i)| i)
     }
 
     fn abi(&self, item: ItemKey) -> Option<Abi> {
-        self.world.fns.iter().any(|f| f.key == item).then(|| match self.world.c_abi.contains(&item) {
-            true => Abi::C,
-            false => Abi::Rust,
+        self.world.fns.iter().any(|f| f.key == item).then(|| {
+            if self.world.c_abi.contains(&item) {
+                Abi::C
+            } else if self.world.rust_call.contains(&item) {
+                Abi::RustCall
+            } else {
+                Abi::Rust
+            }
         })
     }
 }
@@ -2070,6 +2083,81 @@ fn a_fn_item_reified_is_called_through_its_address() {
     let id = build_instance(&w, &callee, ItemKey(3), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     #[cfg(target_arch = "aarch64")]
     assert_eq!(run_native(&[(ItemKey(3), &id), (MAIN, &built)]) as u32, 5);
+}
+
+/// `extern "rust-call" fn f(a: u32, t: (u32, u32, (u32, u32))) -> u32 { t.2.1 * 1000 + t.1 *
+/// 100 + t.0 * 10 + a }`, `extern "rust-call" fn g(a: u32, t: ()) -> u32 { a }`, and `main` =
+/// `f(1, (2, 3, (4, 5))) + g(7, ()) * 10000`: 75321.
+///
+/// The rule: core's library/core/src/ops/function.rs declares `extern "rust-call" fn
+/// call_once(self, args: Args) -> Self::Output`; the convention of "rust-call" is the
+/// compiler's own (not a stable ABI), and blaze's (codegen.md, "Closures and the Fn traits")
+/// passes the last tuple's fields as separate parameters after the others, so a call through
+/// `Fn*` (its arguments written apart) and a call with the tuple written whole agree. Both the
+/// callee and the caller spread: `f`'s own signature is five registers (the inner pair by
+/// address), `g`'s one (the empty tuple is nothing).
+#[test]
+fn a_rust_call_fn_takes_its_tuples_fields_as_parameters() {
+    let mut w = TestWorld::new();
+    let inner = w.tuple(&[U32, U32]);
+    let t = w.tuple(&[U32, U32, inner]);
+    let unit = w.tuple(&[]);
+    w.func(1, "main", &[], U32);
+    w.func(3, "f", &[U32, t], U32);
+    w.func(4, "g", &[U32, unit], U32);
+    w.rust_call.extend([ItemKey(3), ItemKey(4)]);
+    let mut f = BodyBuf::new();
+    let a = f.bind("a");
+    let tp = f.bind("t");
+    f.params.extend([a, tp]);
+    let term = |f: &mut BodyBuf, path: &[u32], scale: u128| {
+        let mut x = f.local(tp);
+        for &i in path {
+            x = f.tfield(x, i);
+        }
+        let k = f.int(scale, None);
+        f.bin(BinOp::Mul, x, k)
+    };
+    let t21 = term(&mut f, &[2, 1], 1000);
+    let t1 = term(&mut f, &[1], 100);
+    let t0 = term(&mut f, &[0], 10);
+    let a_e = f.local(a);
+    let s = f.bin(BinOp::Add, t21, t1);
+    let s = f.bin(BinOp::Add, s, t0);
+    let s = f.bin(BinOp::Add, s, a_e);
+    let root = f.block(&[], Some(s));
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let fb = build_instance(&w, &f, ItemKey(3), root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
+    let text = blaze_lir::print(fb.func.view());
+    assert_eq!(own_sig(&fb), (vec_of(&[Ty::I32, Ty::I32, Ty::I32, Ty::PTR]), vec_of(&[Ty::I32])), "{text}");
+
+    let mut g = BodyBuf::new();
+    let a = g.bind("a");
+    let up = g.bind("t");
+    g.params.extend([a, up]);
+    let a_e = g.local(a);
+    let root = g.block(&[], Some(a_e));
+    let gb = build_instance(&w, &g, ItemKey(4), root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
+    let text = blaze_lir::print(gb.func.view());
+    assert_eq!(own_sig(&gb), (vec_of(&[Ty::I32]), vec_of(&[Ty::I32])), "{text}");
+
+    let mut b = BodyBuf::new();
+    let n: [ExprId; 5] = core::array::from_fn(|i| b.int(i as u128 + 1, None));
+    let inner_e = b.tuple(&[n[3], n[4]]);
+    let tuple_e = b.tuple(&[n[1], n[2], inner_e]);
+    let call_f = b.call("f", &[n[0], tuple_e]);
+    let seven = b.int(7, None);
+    let unit_e = b.tuple(&[]);
+    let call_g = b.call("g", &[seven, unit_e]);
+    let k = b.int(10000, None);
+    let scaled = b.bin(BinOp::Mul, call_g, k);
+    let sum = b.bin(BinOp::Add, call_f, scaled);
+    let root = b.block(&[], Some(sum));
+    let main = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    let text = blaze_lir::print(main.func.view());
+    assert!(has_call_sig(&main, &[Ty::I32, Ty::I32, Ty::I32, Ty::PTR], &[Ty::I32]), "the caller spreads too\n{text}");
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(run_native(&[(ItemKey(3), &fb), (ItemKey(4), &gb), (MAIN, &main)]) as u32, 75321, "{text}");
 }
 
 /// Emits each built fn (`Via::Address`), maps it, and calls the last: a native run on this

@@ -14,7 +14,7 @@ use blaze_ladder::run::{FrontChoice, NewFront, run_with};
 use rungs::{RUNNING, SUPPORT, expected, ladder, sources};
 
 /// The rungs that pass through front2 today: the next one is added when it passes.
-const PASSING: &[&str] = &["1-empty", "2-exit", "3-hello", "4-modules", "5-generics", "6-aggregates", "7-traits", "7a-drops", "7c-main-io", "support/s1-layout", "support/s3-extern-c", "support/s4-intrinsics", "front2/f1-defaults", "front2/f2-generic-self"];
+const PASSING: &[&str] = &["1-empty", "2-exit", "3-hello", "4-modules", "5-generics", "6-aggregates", "7-traits", "7a-drops", "7c-main-io", "support/s1-layout", "support/s3-extern-c", "support/s4-intrinsics", "front2/f1-defaults", "front2/f2-generic-self", "7b-dyn"];
 
 /// front2's own programs (ladder/front2/*/): each one seam of the run path no rung covers.
 /// The old ladder's `&dyn` rung (no_core) runs here too: front2's vtables, placed.

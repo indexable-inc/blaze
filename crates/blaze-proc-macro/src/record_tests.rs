@@ -8,7 +8,7 @@ use bstd::cx::Cx;
 use bstd::io::Io;
 use bstd::test::{Given, Seeds, seeded};
 
-use super::{DirStore, OnDir, RecordPlant};
+use super::{DirStore, FilesError, OnDir, RecordPlant};
 
 const KEYS: u32 = 24;
 
@@ -16,33 +16,40 @@ fn key(k: u32) -> ContentId {
     ContentId::of("blaze-proc-macro record test", &k.to_le_bytes())
 }
 
-/// Key `k`'s one value (rule 21): from empty to past two sectors, so a cut can tear one.
-fn payload(k: u32) -> std::vec::Vec<u8> {
-    let len = (k as usize * 131) % 1400;
-    (0..len).map(|i| (k as usize * 7 + i * 13 + 1) as u8).collect()
+/// The longest value: past two sectors, so a cut can tear one.
+const LONGEST: usize = 1400;
+
+/// Key `k`'s one value (rule 21), written into `into`: from empty to past two sectors.
+fn payload(k: u32, into: &mut [u8; LONGEST]) -> &[u8] {
+    let len = (k as usize * 131) % LONGEST;
+    for (i, byte) in into[..len].iter_mut().enumerate() {
+        *byte = (k as usize * 7 + i * 13 + 1) as u8;
+    }
+    &into[..len]
 }
 
 /// Every key: a miss, or its whole value. A finding panics: it fails the seed (an error is a
 /// restart, as a failed command is).
-fn oracle(store: &DirStore) -> Result<(), std::string::String> {
+fn oracle(store: &DirStore) -> Result<(), FilesError> {
+    let mut want = [0; LONGEST];
     for k in 0..KEYS {
-        match store.get(Kind::List, &key(k)) {
-            Ok(Some(bytes)) => assert!(bytes == payload(k), "record oracle: key {k} read back as other bytes ({} for {})", bytes.len(), payload(k).len()),
-            Ok(None) => {}
-            Err(error) => return Err(error.to_string()),
+        let want = payload(k, &mut want);
+        if let Some(bytes) = store.get(Kind::List, &key(k))? {
+            assert!(bytes == want, "record oracle: key {k} read back as other bytes ({} for {})", bytes.len(), want.len());
         }
     }
     Ok(())
 }
 
 /// One start: the oracle on what the folder holds, every put, the oracle again.
-fn program(io: &Io, plant: RecordPlant) -> Result<(), std::string::String> {
-    let dir = io.need_fs().map_err(|missing| missing.to_string())?.root();
+fn program(io: &Io, plant: RecordPlant) -> Result<(), FilesError> {
+    let dir = io.need_fs().map_err(|_| FilesError::NoTree)?.root();
     // clone: the world, a refcount.
     let store = DirStore::on(OnDir { io: io.clone(), dir }, plant);
     oracle(&store)?;
+    let mut value = [0; LONGEST];
     for k in 0..KEYS {
-        store.put(Kind::List, key(k), &payload(k)).map_err(|error| error.to_string())?;
+        store.put(Kind::List, key(k), payload(k, &mut value))?;
     }
     oracle(&store)
 }

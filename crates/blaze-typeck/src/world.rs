@@ -9,6 +9,7 @@
 
 #![blaze::sans_io]
 
+use blaze_hash::HashMap;
 use blaze_own::{Alloc, Soa, Vec};
 
 use crate::asks::{Ask, AskLog, Clock, Cursor, Tally, Tallying, question_kind};
@@ -92,6 +93,9 @@ pub enum Question {
     ConstHolds(ItemKey, u64),
     /// The const generic parameters of an item's generics ([`ConstParams`]).
     ConstParams(ItemKey),
+    /// The facts of closure `ordinal` of `owner`'s body ([`ClosureFacts`]): a body record, the
+    /// owner's `Checked::closures` row (typeck.md, "A closure's identity").
+    Closure(ItemKey, u32),
 }
 
 /// Whether a question's record is made from items alone or from another body's check.
@@ -109,7 +113,9 @@ impl Question {
     /// The kind of record the question reads (typeck.md, "Item records and body records").
     pub const fn record_kind(self) -> RecordKind {
         match self {
-            Question::Opaque(_) | Question::Const(_) | Question::ConstHolds(..) => RecordKind::Body,
+            Question::Opaque(_) | Question::Const(_) | Question::ConstHolds(..) | Question::Closure(..) => {
+                RecordKind::Body
+            }
             Question::FnSig(_)
             | Question::Predicates(_)
             | Question::Adt(_)
@@ -470,6 +476,34 @@ pub enum DiscrRepr {
     Uint(UintTy),
 }
 
+/// A closure's facts, from its owner's check (`Checked::closures`, the row at its ordinal): its
+/// kind, the strongest `Fn*` it implements, and its signature, a `FnPtr` in the owner's generics
+/// (`Param(i)` the owner's parameter `i`). Its captures stay in the owner's `Checked::captures`.
+#[derive(Clone, Copy, Debug)]
+pub struct ClosureFacts<'w> {
+    pub kind: crate::ty::ClosureKind,
+    pub sig: PTy,
+    pub types: PTys<'w>,
+}
+
+impl Tabled for ClosureFacts<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.push(Root::Ty(self.sig));
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        ClosureFacts { types: PTys::EMPTY, ..*self }
+    }
+}
+
+impl ContentHash for ClosureFacts<'_> {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.tag(self.kind as u8);
+        h.u32(self.sig.0);
+        self.types.hash_into(h);
+    }
+}
+
 /// An opaque type's hidden type.
 #[derive(Clone, Copy, Debug)]
 pub struct Hidden<'w> {
@@ -514,6 +548,9 @@ pub trait World {
     fn lang_path(&self, seal: Seal, item: LangItem) -> Fetch<Option<Def>>;
     fn const_value(&self, seal: Seal, item: ItemKey) -> Fetch<Option<u64>>;
     fn opaque_hidden(&self, seal: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>>;
+    /// Closure `ordinal` of `owner`'s body (`None`: the checked owner has no such closure;
+    /// `Missing` until the owner is checked).
+    fn closure(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<ClosureFacts<'_>>>;
     fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs>;
     /// The definition of trait `trait_` (`None`: not a trait).
     fn trait_def(&self, seal: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>>;
@@ -597,6 +634,99 @@ pub struct Reads<'w, 'a, W: World> {
     log: Option<AskRecorder<'w, 'a>>,
     /// The tally, when the run counts (asks.rs `Tally`); `None` otherwise.
     tally: Option<Tallying<'w>>,
+    /// The digests of the record tables' terms this run has hashed (`rooted_hash`).
+    hashes: Hashes<'a>,
+}
+
+/// A run's memo of term digests: a record table's node (the table's number, its index) to
+/// the digest of the terms under it. It lives for one run (one `Reads`), so nothing in it
+/// outlives the answers it was read from.
+pub(crate) struct Hashes<'a> {
+    alloc: Alloc<'a>,
+    seen: HashMap<(usize, usize), u32, Alloc<'a>>,
+    memo: HashMap<(u32, u32), u64, Alloc<'a>>,
+    roots: Vec<Root, Alloc<'a>>,
+    work: Vec<(u32, bool), Alloc<'a>>,
+    kids: Vec<u32, Alloc<'a>>,
+}
+
+impl<'a> Hashes<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Hashes<'a> {
+        Hashes {
+            alloc,
+            seen: HashMap::new_in(alloc),
+            memo: HashMap::new_in(alloc),
+            roots: Vec::new_in(alloc),
+            work: Vec::new_in(alloc),
+            kids: Vec::new_in(alloc),
+        }
+    }
+
+    /// The digest of `root` of table number `tab` (`t`): its node, then its children's
+    /// digests in order; each node hashed once per run, children first, by a work list. A
+    /// child must come before its parent in the table, so the walk ends.
+    fn term(&mut self, tab: u32, t: PTys<'_>, root: u32) -> Result<u64, CheckError> {
+        if let Some(&d) = self.memo.get(&(tab, root)) {
+            return Ok(d);
+        }
+        self.work.clear();
+        self.work.push((root, false));
+        while let Some((n, expanded)) = self.work.pop() {
+            if self.memo.contains_key(&(tab, n)) {
+                continue;
+            }
+            let node = t.node(PTy(n))?;
+            self.kids.clear();
+            crate::portable::node_children(t, node, &mut self.kids)?;
+            if !expanded {
+                self.work.push((n, true));
+                for &c in &self.kids {
+                    if c >= n {
+                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: n, child: c }));
+                    }
+                    self.work.push((c, false));
+                }
+                continue;
+            }
+            let mut h = StableHasher::new("term");
+            crate::portable::hash_node(&node, &mut h);
+            for c in &self.kids {
+                let d = self.memo.get(&(tab, *c)).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: n, child: *c }))?;
+                h.u64(d);
+            }
+            self.memo.insert((tab, n), h.finish());
+        }
+        self.memo.get(&(tab, root)).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root, child: root }))
+    }
+
+    /// The read-list digest of a record with a table: the record without its table, then the
+    /// digest of each term its handles reach (a list: its length, then its terms').
+    fn rooted<T: Tabled>(&mut self, v: &T) -> Result<u64, CheckError> {
+        let mut h = StableHasher::new("answer");
+        v.untabled().hash_into(&mut h);
+        self.roots.clear();
+        let mut roots = core::mem::replace(&mut self.roots, Vec::new_in(self.alloc));
+        let t = v.parts(&mut roots);
+        if let Some(t) = t {
+            let id = (t.nodes.as_ptr() as usize, t.lists.as_ptr() as usize);
+            let next = self.seen.len() as u32;
+            let tab = *self.seen.entry(id).or_insert(next);
+            for r in &roots {
+                match *r {
+                    Root::Ty(p) => h.u64(self.term(tab, t, p.0)?),
+                    Root::List(l) => {
+                        h.u32(l.len);
+                        for i in l.range() {
+                            let p = t.lists.get(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
+                            h.u64(self.term(tab, t, p.0)?);
+                        }
+                    }
+                }
+            }
+        }
+        self.roots = roots;
+        Ok(h.finish())
+    }
 }
 
 /// The ask log being written, with the clock it reads and where the walk is.
@@ -611,6 +741,118 @@ fn hash_of(domain: &str, v: &impl ContentHash) -> u64 {
     let mut h = StableHasher::new(domain);
     v.hash_into(&mut h);
     h.finish()
+}
+
+/// A handle of a record into its table: a term or a list of terms.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Root {
+    Ty(PTy),
+    List(List),
+}
+
+/// A record that comes with a table of terms (`types`), which may be a store's whole table:
+/// its read-list digest hashes the record without the table, then the terms its own handles
+/// reach (`Reads::rooted_hash`), never the rest of the table.
+pub(crate) trait Tabled: ContentHash {
+    /// Pushes the record's handles into its table and returns the table (`None`: no record).
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>>;
+    /// The record with an empty table: what is hashed besides the reached terms.
+    fn untabled(&self) -> Self;
+}
+
+impl<T: Tabled> Tabled for Option<T> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        self.as_ref().and_then(|v| v.parts(roots))
+    }
+    fn untabled(&self) -> Self {
+        self.as_ref().map(|v| v.untabled())
+    }
+}
+
+fn clause_roots(cs: &[PClause], roots: &mut Vec<Root, Alloc<'_>>) {
+    for c in cs {
+        match *c {
+            PClause::Trait { args, .. } | PClause::Const { args, .. } => roots.push(Root::List(args)),
+            PClause::Projection { args, term, .. } => {
+                roots.push(Root::List(args));
+                roots.push(Root::Ty(term));
+            }
+        }
+    }
+}
+
+impl Tabled for TraitDef<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        clause_roots(self.supertraits, roots);
+        roots.extend(self.assoc_types.iter().filter_map(|a| a.default).map(Root::Ty));
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        TraitDef { types: PTys::EMPTY, ..*self }
+    }
+}
+
+impl Tabled for ConstParams<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.extend(self.params.iter().map(|&(_, p)| Root::Ty(p)));
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        ConstParams { types: PTys::EMPTY, ..*self }
+    }
+}
+
+impl Tabled for FnSig<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.extend(self.inputs.iter().map(|&p| Root::Ty(p)));
+        roots.push(Root::Ty(self.output));
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        FnSig { types: PTys::EMPTY, ..*self }
+    }
+}
+
+impl Tabled for Predicates<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        clause_roots(self.clauses, roots);
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        Predicates { types: PTys::EMPTY, ..*self }
+    }
+}
+
+impl Tabled for Adt<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.extend(self.fields.iter().map(|f| Root::Ty(f.ty)));
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        Adt { types: PTys::EMPTY, ..*self }
+    }
+}
+
+impl Tabled for ImplHeader<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.push(Root::Ty(self.self_ty));
+        roots.push(Root::List(self.trait_args.list()));
+        roots.extend(self.assoc_types.iter().map(|&(_, p)| Root::Ty(p)));
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        ImplHeader { types: PTys::EMPTY, ..*self }
+    }
+}
+
+impl Tabled for Hidden<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.push(Root::Ty(self.ty));
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        Hidden { types: PTys::EMPTY, ..*self }
+    }
 }
 
 /// The content digest of ground arguments `args` of a table `types` holding only them (as
@@ -629,12 +871,12 @@ pub fn ground_args_digest(args: &[PTy], types: PTys<'_>) -> u64 {
 impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The recorder for one run.
     pub(crate) fn new_in(world: &'w W, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
-        Reads { world, entries: Vec::new_in(alloc), log: None, tally: None }
+        Reads { world, entries: Vec::new_in(alloc), log: None, tally: None, hashes: Hashes::new_in(alloc) }
     }
 
     /// The recorder for one run that also keeps `tally`, reading `clock`.
     pub(crate) fn counted_in(world: &'w W, tally: &'w mut Tally, clock: &'w dyn Clock, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
-        Reads { world, entries: Vec::new_in(alloc), log: None, tally: Some(Tallying { tally, clock }) }
+        Reads { world, entries: Vec::new_in(alloc), log: None, tally: Some(Tallying { tally, clock }), hashes: Hashes::new_in(alloc) }
     }
 
     /// The tally's clock now, when the run counts (0 otherwise).
@@ -651,7 +893,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     pub(crate) fn logged_in(world: &'w W, clock: &'w dyn Clock, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
         let start_ns = clock.now_ns();
         let log = AskRecorder { asks: Vec::new_in(alloc), clock, start_ns, cursor: Cursor::default() };
-        Reads { world, entries: Vec::new_in(alloc), log: Some(log), tally: None }
+        Reads { world, entries: Vec::new_in(alloc), log: Some(log), tally: None, hashes: Hashes::new_in(alloc) }
     }
 
     /// Whether the run writes the ask log (the machine then reports where it is).
@@ -688,6 +930,26 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The one seam every read of another item's record goes through: asks the world, logs
     /// the ask when measuring, and enters the answer's hash into the read list.
     fn record<T: ContentHash>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
+        self.record_with(q, got, asked_at, |_, v| Ok(hash_of("answer", v)))
+    }
+
+    /// The read-list digest of this run's latest answer to `q` (a record already read).
+    pub(crate) fn digest(&self, q: Question) -> Result<u64, CheckError> {
+        self.entries.iter().rev().find(|e| e.0 == q).map(|e| e.1).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))
+    }
+
+    /// `record` for an answer with a table: its digest covers only the terms it reaches.
+    fn record_tabled<T: Tabled>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
+        self.record_with(q, got, asked_at, |h, v| h.rooted(v))
+    }
+
+    fn record_with<T>(
+        &mut self,
+        q: Question,
+        got: Fetch<T>,
+        asked_at: u64,
+        digest: impl FnOnce(&mut Hashes<'a>, &T) -> Result<u64, CheckError>,
+    ) -> Result<T, Stop> {
         let answered_at = self.stamp();
         if let Some(l) = &mut self.log {
             l.asks.push(Ask {
@@ -702,7 +964,8 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         }
         match got {
             Ok(v) => {
-                self.entries.push((q, hash_of("answer", &v)));
+                let d = digest(&mut self.hashes, &v)?;
+                self.entries.push((q, d));
                 self.count(q, false, asked_at, answered_at);
                 Ok(v)
             }
@@ -796,19 +1059,19 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     pub fn fn_sig(&mut self, item: ItemKey) -> Result<Option<FnSig<'w>>, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.fn_sig(Self::seal(), item);
-        self.record(Question::FnSig(item), got, asked_at)
+        self.record_tabled(Question::FnSig(item), got, asked_at)
     }
 
     pub fn predicates(&mut self, item: ItemKey) -> Result<Predicates<'w>, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.predicates(Self::seal(), item);
-        self.record(Question::Predicates(item), got, asked_at)
+        self.record_tabled(Question::Predicates(item), got, asked_at)
     }
 
     pub fn adt(&mut self, item: ItemKey) -> Result<Option<Adt<'w>>, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.adt(Self::seal(), item);
-        self.record(Question::Adt(item), got, asked_at)
+        self.record_tabled(Question::Adt(item), got, asked_at)
     }
 
     pub fn impls_of(&mut self, trait_: ItemKey, shape: Shape) -> Result<&'w [ItemKey], Stop> {
@@ -822,7 +1085,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     pub fn impl_header(&mut self, item: ItemKey) -> Result<Option<ImplHeader<'w>>, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.impl_header(Self::seal(), item);
-        let h = self.record(Question::ImplHeader(item), got, asked_at)?;
+        let h = self.record_tabled(Question::ImplHeader(item), got, asked_at)?;
         if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h {
             let Some(def) = self.trait_def(trait_)? else {
                 return Err(CheckError::Malformed(Malformed::NoRecord(Question::TraitDef(trait_))).into());
@@ -885,7 +1148,13 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     pub fn opaque_hidden(&mut self, item: ItemKey) -> Result<Option<Hidden<'w>>, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.opaque_hidden(Self::seal(), item);
-        self.record(Question::Opaque(item), got, asked_at)
+        self.record_tabled(Question::Opaque(item), got, asked_at)
+    }
+
+    pub fn closure(&mut self, owner: ItemKey, ordinal: u32) -> Result<Option<ClosureFacts<'w>>, Stop> {
+        let asked_at = self.stamp();
+        let got = self.world.closure(Self::seal(), owner, ordinal);
+        self.record_tabled(Question::Closure(owner, ordinal), got, asked_at)
     }
 
     pub fn attrs(&mut self, item: ItemKey) -> Result<TypeAttrs, Stop> {
@@ -897,7 +1166,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     pub fn trait_def(&mut self, trait_: ItemKey) -> Result<Option<TraitDef<'w>>, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.trait_def(Self::seal(), trait_);
-        self.record(Question::TraitDef(trait_), got, asked_at)
+        self.record_tabled(Question::TraitDef(trait_), got, asked_at)
     }
 
     pub fn assoc_parent(&mut self, item: ItemKey) -> Result<Option<AssocParent>, Stop> {
@@ -915,7 +1184,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     pub fn const_params(&mut self, item: ItemKey) -> Result<ConstParams<'w>, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.const_params(Self::seal(), item);
-        self.record(Question::ConstParams(item), got, asked_at)
+        self.record_tabled(Question::ConstParams(item), got, asked_at)
     }
 
     /// The test build's one backdoor: an ADT read that is not recorded. Only the planted bug

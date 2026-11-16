@@ -139,56 +139,6 @@ struct Conv<'t> {
     t: PTys<'t>,
 }
 
-/// Calls `f` with each child of `n` in `t` (a list's terms in order). A `ConstValue`'s type
-/// is read in place by the conversion, never converted, so it is no child here.
-fn children(t: PTys<'_>, n: PNode, mut f: impl FnMut(u32) -> Result<(), CheckError>) -> Result<(), Stop> {
-    let mut list = |l: crate::ids::List, f: &mut dyn FnMut(u32) -> Result<(), CheckError>| -> Result<(), Stop> {
-        for i in l.range() {
-            let p = t.lists.get(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
-            f(p.0)?;
-        }
-        Ok(())
-    };
-    match n {
-        PNode::Bool
-        | PNode::Char
-        | PNode::Int(_)
-        | PNode::Uint(_)
-        | PNode::Float(_)
-        | PNode::Str
-        | PNode::Never
-        | PNode::Param(_)
-        | PNode::ConstParam(_)
-        | PNode::ConstValue { .. }
-        | PNode::Error
-        | PNode::ExAuto(_)
-        | PNode::Closure(..)
-        | PNode::Future(..)
-        | PNode::Infer => Ok(()),
-        PNode::Ref(_, p) | PNode::Ptr(_, p) | PNode::Slice(p) => Ok(f(p.0)?),
-        PNode::Array(e, len) => {
-            f(e.0)?;
-            Ok(f(len.0)?)
-        }
-        PNode::Pat(b, l) => {
-            f(b.0)?;
-            list(l, &mut f)
-        }
-        PNode::Tuple(l)
-        | PNode::Adt(_, l)
-        | PNode::FnDef(_, l)
-        | PNode::FnPtr(l, _)
-        | PNode::Opaque(_, l)
-        | PNode::Dynamic(l)
-        | PNode::ExTrait(_, l)
-        | PNode::Alias { args: l, .. } => list(l, &mut f),
-        PNode::ExProj { args, term, .. } => {
-            list(args, &mut f)?;
-            Ok(f(term.0)?)
-        }
-    }
-}
-
 /// The solver's facts, read through the body's `Reads` (see the module).
 pub struct FactCache<'a> {
     alloc: Alloc<'a>,
@@ -232,6 +182,8 @@ pub struct FactCache<'a> {
     erased: Option<STy>,
     /// `ty`'s work list: a node and whether its children were pushed.
     work: Vec<(u32, bool), Alloc<'a>>,
+    /// `ty`'s scratch: one node's children.
+    kids: Vec<u32, Alloc<'a>>,
     /// A planted bug (`suite::control_first_impl_taken`): an impl bucket keeps only its first impl.
     #[cfg(test)]
     pub(crate) first_impl_only: bool,
@@ -461,6 +413,7 @@ impl<'a> FactCache<'a> {
             memo: HashMap::new_in(alloc),
             erased: None,
             work: Vec::new_in(alloc),
+            kids: Vec::new_in(alloc),
             #[cfg(test)]
             first_impl_only: false,
             #[cfg(test)]
@@ -603,9 +556,8 @@ impl<'a> FactCache<'a> {
         }
     }
 
-    /// Converts `t` into the answer's portable table, which starts at `por`: an erased region
-    /// first, then `t`'s nodes one for one (an array's length is its own node). Returns the
-    /// answer-relative index of `t`'s node 0 and of its list 0.
+    /// Opens `t`, the table of the answer to `q`, for conversion: converts nothing; `ty` and
+    /// `list` then convert exactly what the answer's handles reach (D62 stage one).
     fn table<'t>(&mut self, q: Question, t: PTys<'t>) -> Conv<'t> {
         self.counted.tables += 1;
         self.counted.offered += t.nodes.len() as u64;
@@ -649,14 +601,14 @@ impl<'a> FactCache<'a> {
             let node = c.t.node(PTy(n)).map_err(Stop::from)?;
             if !expanded {
                 self.work.push((n, true));
-                let work = &mut self.work;
-                children(c.t, node, |ch| {
+                self.kids.clear();
+                crate::portable::node_children(c.t, node, &mut self.kids)?;
+                for &ch in &self.kids {
                     if ch >= n {
-                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: n, child: ch }));
+                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: n, child: ch }).into());
                     }
-                    work.push((ch, false));
-                    Ok(())
-                })?;
+                    self.work.push((ch, false));
+                }
                 continue;
             }
             let k = self.convert(c, node)?;
@@ -838,7 +790,7 @@ impl<'a> FactCache<'a> {
             supers,
             assoc,
             por: self.end(por),
-            digest: digest("blaze-typeck trait", &t),
+            digest: digest("blaze-typeck trait", &reads.digest(q)?),
         };
         self.traits.insert(k.0, row);
         Ok(())
@@ -886,7 +838,7 @@ impl<'a> FactCache<'a> {
             wheres,
             assoc,
             por: self.end(por),
-            digest: digest("blaze-typeck impl", &h) ^ digest("blaze-typeck impl where", &wc),
+            digest: digest("blaze-typeck impl", &reads.digest(q)?) ^ digest("blaze-typeck impl where", &reads.digest(Question::Predicates(k))?),
         };
         self.headers.insert(k.0, row);
         Ok(())
@@ -958,7 +910,7 @@ impl<'a> FactCache<'a> {
             discr,
             wheres,
             por: self.end(por),
-            digest: digest("blaze-typeck adt", &a) ^ digest("blaze-typeck adt where", &wc) ^ digest("blaze-typeck adt discr", &(discr_code(discr) as u32)),
+            digest: digest("blaze-typeck adt", &reads.digest(q)?) ^ digest("blaze-typeck adt where", &reads.digest(Question::Predicates(k))?) ^ digest("blaze-typeck adt discr", &(discr_code(discr) as u32)),
         };
         self.adts.insert(k.0, row);
         Ok(())
@@ -990,7 +942,7 @@ impl<'a> FactCache<'a> {
             flags,
             io,
             por: self.end(por),
-            digest: digest("blaze-typeck sig", &s),
+            digest: digest("blaze-typeck sig", &reads.digest(q)?),
         };
         self.sigs.insert(k.0, row);
         Ok(())
@@ -1054,9 +1006,9 @@ impl<'a> FactCache<'a> {
         let bc = self.table(Question::Predicates(k), bounds.types);
         let start = self.preds.len();
         self.clauses(bounds.clauses, bc)?;
-        let mut d = digest("blaze-typeck opaque bounds", &bounds);
-        if let Some(h) = hidden {
-            d ^= digest("blaze-typeck opaque hidden", &h);
+        let mut d = digest("blaze-typeck opaque bounds", &reads.digest(Question::Predicates(k))?);
+        if hidden.is_some() {
+            d ^= digest("blaze-typeck opaque hidden", &reads.digest(q)?);
         }
         let row = OpaqueRow { bounds: Span::of(&self.preds, start), hidden: hidden_ty, por: self.end(por), digest: d };
         self.opaques.insert(k.0, row);

@@ -45,12 +45,11 @@ use blaze_proc_macro::{
     hook::{Finding, ProcCx, ProcMacros, Reached, crate_key},
     host::{Limits, Runtime},
     module::{Source, files_digest, package_files},
-    record::DirStore,
     sandbox::Package,
 };
 use blaze_surface::Edition;
 
-use common::{modules, package_dir, package_of, sources};
+use common::{expansion_records, modules, package_dir, package_of, sources};
 
 /// A git macro crate's commit and folder in its repository, from the identity the bootstrap
 /// builder wrote beside its module (`git <commit> <path>`).

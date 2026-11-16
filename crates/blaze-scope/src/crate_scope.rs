@@ -28,6 +28,7 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc, Box};
 use blaze_surface::{BuildError, CallShape, Edition, GlobEdge, Namespace, ProcKind, RecordBytes, ScopeBuilder, ScopeView, Unresolved, Visibility};
 
+use crate::asked::{Asked, Question, ReadListError, Stale};
 use crate::graph::{CrateGraph, CrateId, GraphCrate, GraphDep, Sysroot};
 use crate::prepares::Prepares;
 use crate::resolve::{Built, CrateInput, CrateNames, NamesError, SourceTexts, resolve_one};
@@ -109,7 +110,7 @@ impl<'a> Dep<'a> {
         }
     }
 
-    fn reaches(self) -> &'a [CrateItemKey] {
+    pub(crate) fn reaches(self) -> &'a [CrateItemKey] {
         match self {
             Dep::Whole(_) => &[],
             Dep::Record(d) => &d.reaches,
@@ -170,6 +171,8 @@ pub enum CrateScopeError<'a> {
     Write { krate: &'a str, error: BuildError },
     /// [`resolve_by_records`]: the exports record `krate` just wrote did not read back.
     OwnRecord { krate: &'a str, error: RecordRead },
+    /// [`resolve_kept`]: the read list kept with `krate`'s solve did not read.
+    ReadList { krate: &'a str, error: ReadListError },
 }
 
 /// One crate's names: what the resolution made (findings, unresolved imports and macro paths
@@ -181,6 +184,8 @@ pub struct CrateScope<'a> {
     pub record: RecordBytes<'a>,
     /// The inner record: the rest, the crate's own.
     pub inner: RecordBytes<'a>,
+    /// Each question the solve asked of another crate's records ([`crate::asked`]).
+    pub(crate) asked: AVec<'a, Question<'a>>,
 }
 
 /// Reads a `CrateScope` record (its bytes 16-aligned and living as long as `alloc`'s values).
@@ -357,7 +362,7 @@ impl Outside<'_> {
 /// Whether a binding `name` in `ns` of a module whose visible globs are `globs` may shadow a
 /// name one of them brings: the glob's source binds the name, or has globs of its own (not
 /// walked: the binding is kept).
-fn may_shadow(names: &CrateNames<'_>, built: &Built<'_, '_>, globs: &[GlobEdge], outside: &Outside<'_>, ns: Namespace, name: &str) -> bool {
+fn may_shadow<'a>(names: &CrateNames<'_>, built: &Built<'_, 'a>, globs: &[GlobEdge], outside: &Outside<'_>, ns: Namespace, name: &'a str) -> bool {
     let own = names.key.prefix();
     globs.iter().filter(|g| outside.sees(g.vis)).any(|g| {
         let key = g.source.key;
@@ -367,12 +372,20 @@ fn may_shadow(names: &CrateNames<'_>, built: &Built<'_, '_>, globs: &[GlobEdge],
             }
             return names.tables.enums.get(&key).is_none_or(|v| v.iter().any(|v| v.name == name));
         }
-        let Some(dep) = built.of(key) else { return true };
-        if let Some(s) = dep.scope(key) {
-            return !s.globs.is_empty() || s.get(ns, name).is_some();
-        }
-        dep.enum_of(key).is_none_or(|v| v.iter().any(|v| v.name == name))
+        let may = dep_may_shadow(built, key, ns, name);
+        built.ask(|| crate::asked::Question::shadow(key, ns, name, may));
+        may
     })
+}
+
+/// [`may_shadow`] of one glob source in another crate: it binds the name, or has globs of its
+/// own; a source of no crate held may.
+pub(crate) fn dep_may_shadow(built: &Built<'_, '_>, key: ItemKey, ns: Namespace, name: &str) -> bool {
+    let Some(dep) = built.of(key) else { return true };
+    if let Some(s) = dep.scope(key) {
+        return !s.globs.is_empty() || s.get(ns, name).is_some();
+    }
+    dep.enum_of(key).is_none_or(|v| v.iter().any(|v| v.name == name))
 }
 
 /// A crate's two `CrateScope` records: `exports`, what its dependents read and key on (the rule
@@ -387,7 +400,7 @@ pub struct Records<'b> {
 /// The two records of `names`, the crates of `built` answering for the items of other crates
 /// its scopes name. `leak_private` is the planted bug of the privacy test: every binding is
 /// written `pub`.
-pub(crate) fn write_records<'b>(names: &CrateNames<'_>, built: &Built<'_, '_>, leak_private: bool, alloc: Alloc<'b>) -> Result<Records<'b>, BuildError> {
+pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a>, leak_private: bool, alloc: Alloc<'b>) -> Result<Records<'b>, BuildError> {
     let own = names.key.prefix();
     let mut def_site = AVec::new_in(alloc);
     for m in names.tables.macros.values() {
@@ -692,18 +705,22 @@ pub trait ReadyHooks {
 pub const EXPORTS_DOMAIN: &str = "blaze-scope exports record v1";
 
 /// Earlier solves kept between calls (the driver's records; blaze-world's `names --records`):
-/// asked before a crate is solved, told once it was. A crate is found, not solved, when what it
-/// read then is read the same now: the exports record of each crate it was handed (its
-/// dependencies, the sysroot crates before it, each crate a `Need` named), by digest, and its
-/// files (the store's own check: [`SourceTexts`] is where it sees them read).
+/// asked before a crate is solved, told once it was. A crate is found, not solved, when its
+/// files are read the same now (the store's own check: [`SourceTexts`] is where it sees them
+/// read) and its read list holds ([`crate::asked::check`]): each crate it was handed has the
+/// same exports digest, or else each question it asked of a moved one is answered the same.
 pub trait Kept: Sync {
-    /// `krate`'s exports and inner records if every record it read is unchanged: `exports(g)`
-    /// is crate `g`'s exports digest in this call (`None`: not written yet, so not found).
-    fn find(&self, krate: usize, exports: &dyn Fn(usize) -> Option<ContentId>) -> Option<(&[u8], &[u8])>;
+    /// `krate`'s exports record, inner record and read list (the bytes `made` was given) if its
+    /// files are unchanged; the read list is checked by the caller.
+    fn find(&self, krate: usize) -> Option<(&[u8], &[u8], &[u8])>;
 
-    /// `krate` was solved: its two records and, sorted by crate index, each crate whose exports
-    /// record it was handed with that record's digest.
-    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[(usize, ContentId)]);
+    /// `krate`'s kept solve was not found after all: its read list did not hold, for `why`.
+    fn stale(&self, krate: usize, why: &Stale<'_>) {
+        let _ = (krate, why);
+    }
+
+    /// `krate` was solved: its two records and its read list record ([`crate::asked::encode`]).
+    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[u8]);
 }
 
 /// One crate's answer from [`resolve_kept`].
@@ -921,13 +938,30 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 *slot = s.filter(|s| s.index() != at && pos[s.index()] < pos[at]).map(|s| place(s.index(), &mut local));
             }
             // An earlier solve whose read list holds today: its records, copied out of the store.
-            let digest_of = |g: usize| locked(&queue).digests[g];
-            let found = kept.and_then(|k| k.find(at, &digest_of)).map(|(record, inner)| {
-                let (r, i) = (crate::resolve::aligned(record, alloc), crate::resolve::aligned(inner, alloc));
-                Solved::Found { record: &r[..record.len()], inner: &i[..inner.len()] }
-            });
+            let now = |key: CrateItemKey| {
+                let &g = by_key.get(&key)?;
+                let q = locked(&queue);
+                Some(q.digests[g].zip(q.records[g]).map(|(d, r)| (g, d, r)))
+            };
+            let found = match kept.and_then(|k| k.find(at).map(|f| (k, f))) {
+                None => Ok(None),
+                Some((k, (record, inner, read))) => {
+                    let read = crate::resolve::aligned(read, alloc);
+                    match crate::asked::check(read, &now, alloc) {
+                        Err(error) => Err(CrateScopeError::ReadList { krate: input.name, error }),
+                        Ok(Some(why)) => {
+                            k.stale(at, &why);
+                            Ok(None)
+                        }
+                        Ok(None) => {
+                            let (r, i) = (crate::resolve::aligned(record, alloc), crate::resolve::aligned(inner, alloc));
+                            Ok(Some(Solved::Found { record: &r[..record.len()], inner: &i[..inner.len()] }))
+                        }
+                    }
+                }
+            };
             let mut tries = 0;
-            let result = if let Some(found) = found { Ok(found) } else { loop {
+            let result = match found { Err(e) => Err(e), Ok(Some(found)) => Ok(found), Ok(None) => loop {
                 tries += 1;
                 let me = local.len();
                 let ids = mapped.map(|p| p.map(|p| CrateId(p as u32)));
@@ -987,14 +1021,15 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 }
             }
             .map(|done| {
-                // Its read list: each crate whose exports record it was handed (all written).
+                // Its read list: each crate whose exports record it was handed (all written),
+                // and each question it asked of them.
                 if let Some(k) = kept {
-                    let mut read = AVec::with_capacity_in(local.len(), alloc);
+                    let mut handed = AVec::with_capacity_in(local.len(), alloc);
                     {
                         let q = locked(&queue);
-                        read.extend(local.iter().filter_map(|&g| q.digests[g].map(|d| (g, d))));
+                        handed.extend(local.iter().filter_map(|&g| q.digests[g].map(|d| (crates[g].key, d))));
                     }
-                    read.sort_unstable_by_key(|(g, _)| *g);
+                    let read = crate::asked::encode(input.key, &handed, &done.asked, alloc);
                     k.made(at, &done.record, &done.inner, &read);
                 }
                 Solved::Solved(done)
@@ -1126,9 +1161,14 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
     slots.push(None);
     let graph = CrateGraph::new_in(graph_crates, sysroot, alloc).map_err(|e| CrateScopeError::Names(NamesError::Graph(e)))?;
     let id = CrateId(u32::try_from(deps.len()).map_err(|_| CrateScopeError::NoSuchDep { krate: input.name, name: input.name, index: deps.len() })?);
-    let built = Built { crates: &slots, by_prefix: &by_prefix };
+    let asked = Asked::new_in(alloc);
+    let built = Built { crates: &slots, by_prefix: &by_prefix, asked: Some(&asked) };
+    // Each handed crate's facts decide what it reaches (`Need`) and the record's reach list.
+    for d in slots.iter().flatten() {
+        built.ask(|| Question::krate(*d, alloc));
+    }
     let names = resolve_one::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, alloc).map_err(CrateScopeError::Names)?;
     let Records { exports, inner } = write_records(&names, &built, leak_private, alloc).map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
     let names: &'a CrateNames<'a> = Box::leak(Box::new_in(names, alloc));
-    Ok(CrateScope { names, record: exports, inner })
+    Ok(CrateScope { names, record: exports, inner, asked: asked.take() })
 }

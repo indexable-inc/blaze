@@ -20,9 +20,9 @@ use blaze_proc_macro::{
 };
 
 /// The runtime over the folder `store`, its records through a world this program opens there.
-fn script_runtime(store: &Path) -> Result<ScriptRuntime, String> {
-    let (io, root) = native_world(store).map_err(|error| error.to_string())?;
-    ScriptRuntime::new(store, DirStore::build_scripts(&io, &root)).map_err(|error| error.to_string())
+fn script_runtime(store: &Path) -> ScriptRuntime {
+    let (io, root) = native_world(store).unwrap_or_else(|error| panic!("the records at {}: {error}", store.display()));
+    ScriptRuntime::new(store, DirStore::build_scripts(&io, &root)).unwrap_or_else(|error| panic!("the script runtime: {error}"))
 }
 
 const TARGET: &str = "aarch64-apple-darwin";
@@ -59,7 +59,7 @@ fn main() {
         limits: RunLimits::STANDARD,
         table,
     });
-    let runtime = script_runtime(Path::new(store)).unwrap_or_else(|e| panic!("{e}"));
+    let runtime = script_runtime(Path::new(store));
     let started = Instant::now();
     let loaded = runtime.load(&script.package, &wasm).unwrap_or_else(|e| panic!("{e}"));
     println!("load {:?} (compiled now: {})", started.elapsed(), loaded.compiled);

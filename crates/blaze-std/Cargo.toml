@@ -70,11 +70,14 @@ objc2-video-toolbox = { workspace = true, optional = true }
 # names it in its own manifest.
 [features]
 default = []
-# `bstd::requests` (`Http`), `bstd::quic` and `bstd::http`: requests and QUIC on blaze-http,
-# which brings rustls, ring, quinn-proto and the rest. A program that makes requests turns it
-# on; one that only reads files and prints (blaze-cli) builds none of it. `net::Net` itself is
+# `bstd::quic` and `bstd::http` (and `requests`): QUIC and blaze-http's client, which bring
+# rustls, ring, quinn-proto and the rest. blaze-cli builds none of it (it takes `requests`
+# alone, below). `net::Net` itself is
 # blaze-core's effects and needs no feature.
-net = ["dep:blaze-http", "blaze-http/h3", "dep:blaze-h1"]
+net = ["requests", "dep:blaze-http", "blaze-http/h3"]
+# `bstd::requests` (`Http`) alone: blaze-h1's sans-IO HTTP/1.1 core driven over `Net`, with no
+# TLS stack and none of blaze-http. blaze-cli's shared-cache origin turns on this one.
+requests = ["dep:blaze-h1"]
 # `bstd::image`: PNG decode and encode, and its zlib.
 image = ["dep:blaze-deflate"]
 # `bstd::video`: the MP4 muxer, and the HEVC encoder on VideoToolbox on macOS, which links

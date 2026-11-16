@@ -1326,8 +1326,16 @@ Twenty-third port lane (2026-11-16 ~11:00; handing on).
   lanes' changes are in it too); the trait-alias rows are gone ("1 1 100.0% trait alias").
 - LEFT: `Alias<Name = T>` on an alias, `?Alias`, alias generic defaults: typed refusals.
   `T::X<A>` (2: GAT projections with type args): the checker's `PNode::Alias` has no own args.
-  Return-position `impl Trait` (16): the checker's `OpaqueDef.generics` is still 0
-  (blaze-typeck infer/facts.rs `opaque`: "does not carry its generics yet"); not built here.
+  Return-position `impl Trait` (16 core heads; it now LEADS the walk's "82 x check: Head",
+  first `std::init_current`): the checker's side is there for non-generic fns (facts.rs
+  `fill_opaque` reads `opaque_hidden(k)` and `predicates(k)`); `OpaqueDef.generics` is still 0
+  ("does not carry its generics yet"), so a generic fn's opaque bounds are not instantiated.
+  Ours, NOT built: a key per occurrence, `PNode::Opaque(k, identity params)` in heads.rs
+  `fn_head`'s output, `Predicates(k)` from the store, `opaque_hidden(k)` a gap (world_items).
+- Walk list-CA (`--test front2_main`; plain `front2_main` as a filter runs 0 tests): "REACHABLE:
+  2347 of 2816 reachable functions type-check"; "82 x check: Head" (was 86), "1 x check gap:
+  RefusedImpl" (was 57). NoCheckerType 22 (`u24`, `i24`, `u40`: blaze's wide ints in core's
+  num/arbitrary.rs) is the checker's (`IntTy` has standard widths only): told main.
 
 #### Heads lane: items (2026-11-16, first runner; handing on)
 
@@ -1430,6 +1438,26 @@ Twenty-third port lane (2026-11-16 ~11:00; handing on).
   The 21 bstd ones are likely `Arc`-like aliases with a fixed or defaulted argument
   (`Arc<T>` = `sync::Arc<T, Global>`): a value path must FIX that argument, so `Def::Adt`
   would be wrong; it needs a checker `Def` carrying a type (the checker lane's).
+- TEMPO ORDER (coordinator, after census-gen-3; ahead of everything else; tempo-front-1.txt:
+  tempo_hardfork bodies 57, clean 4): (A) a refused/unread impl is a gap only for goals it
+  could match. Filing ALREADY does this (buckets.rs `file`/`written_shape`: trait + self
+  shape); the leaks are: `unread_blind` impls (neither trait nor self shape read) are
+  candidates of EVERY trait AND every inherent question (`inherent_candidates` adds them:
+  that is why inherent `is_t2` stops), and a self type whose alias chain `alias_shape` cannot
+  read (None = any shape; curve25519 scalar.rs:1173). Next: an inherent question should not
+  take a blind impl whose trait path is WRITTEN (only its resolve failed), and read the
+  alias/path forms that make shape None. (B) `failed_impl` now puts "at file:line" first in
+  `Gap::UnreadImpl`'s why (SAVED, compiled only if the front2_main run at ~11:05 took it):
+  rerun tempo to see impl 972b915ddd50's place. (C) the cycle "these items need each other's
+  heads" (impl e97737e3dcaa): not looked at.
+- ITEMS INSIDE BODIES (from a61da367157640a67, after I handed on): the 74 E0425 are local
+  fn/const/struct/use items; proof in tests/front2_locals.rs, design in typeck.md "Items
+  inside bodies (2026-11-16)". Changes in this lane's files: world_paths.rs `path` takes the
+  ScopeId (local scope chain before the module), world_items.rs `resolve_path` passes it,
+  heads.rs `Store::step` reads a local item's detail/text/module from a local table. The
+  blocker is this lane's call: my recommendation (not built) is an arena of lifetime 'n,
+  owned beside Front2 and filled when a body is lowered, holding macro-made local item
+  texts, so heads keep borrowing `&'n str` (one memory model, bump-allocated, rule 11).
 - NOT DONE: step 4 (const expressions in signatures: every bstd one is `size_of::<X>()`,
   needing the evaluator to run a generic call with layout), step 5 (trait consts, enum-typed
   const params), the alloc and core census. census-gen-3 ran BEFORE the alias fix.
@@ -1809,4 +1837,39 @@ The one known cost gap: the emitted thread-local access is at its floor, but the
   - native `thread_local!`: 0.84 to 0.95
 - The cause: the baseline tier keeps every value in a 16-byte stack cell, so each LIR value costs a store and a load. The loop's load, add, store, compare and branch therefore pay about five memory round trips that a register allocator would remove.
 - Closing it takes a register-allocating tier: a linear-scan allocator over the LIR's blocks, with the cell model kept as the spill form. LLVM also hoists the thread-local's address out of the loop. Matching that needs loop-invariant motion of `tls_addr`, which is sound because a thread's block never moves.
+
+### Code builder: rust-call and `Fn*` (2026-11-16 ~11:00, runner ad949140bcb6c12b6; handing on)
+
+Uncommitted, in /Volumes/Projects/blaze-fresh-1115. Read codegen.md "Closures and the Fn traits" first
+(what exists, the convention, the build order). blaze-typeck was red under lanecheck at 10:56 (not
+ours): use mixcheck.
+- DONE: `blaze_build::Abi::RustCall` (lib.rs); walk.rs `rust_pass`, `rust_call_fields`, `spread_tuple`;
+  `run` takes the last tuple's fields as parameters and rebuilds the tuple in a slot; `call` and
+  `call_pointer` spread a tuple written whole. Test `a_rust_call_fn_takes_its_tuples_fields_as_parameters`:
+  "mixcheck test blaze-build: exit 0; 1 passed, 0 failed" (native 75321); control (caller's spread
+  removed) fails "the caller spreads too ... sig s1 = c (i32, ptr) -> (i32)". Whole suite: "mixcheck
+  test blaze-build: exit 0; 95 passed, 0 failed (against green: blaze-hash)".
+- WRITTEN, NOT TESTED: an overloaded call `f(x)` (`F: Fn*`, checker's callee row `Fn::call` at `[F,
+  (A,)]`) is a call of that instance with the callee (adjusted: its borrow) as `self`, arguments not
+  spread (walk.rs step `Expr::Call` guard on `checked.callees`, `call`'s `overloaded`). Next test: a
+  fixture `Fn` trait (lang Fn/FnMut/FnOnce, `Tuple`) with a rust-call `call` impl'd for a struct, through
+  `Fx` like tests/objects.rs; then `fn apply<F: Fn(u8) -> u8>(f: &F, x: u8)` once shims exist.
+- A dynamic rust-call call with the tuple written whole is refused by name (walk.rs `call`).
+- RUN lane told (one message): program.rs:497 needs `tc::Abi::RustCall => Abi::RustCall`.
+- NOT STARTED (steps 2-3 of the brief): closure environments and bodies, the `Fn*` shims (closure, fn
+  item, fn pointer), `ClosureFnPointer`, `Lit::CStr`, `offset_of!`. Two seam gaps found: the closure kind
+  is not in `Checked` (derive it from `captures` as rules/closure.rs does, or ask the checker to record
+  it), and `PNode::Closure(ExprId, sig)` carries no owner item or parent args, so it cannot key an
+  instance or name a shim across bodies: ask the checker lane (via main) for an owner in the node first.
+- Refusals in walk.rs, ordered by how often library code will meet them (my judgement): closures (value,
+  direct call, `ClosureFnPointer`); `str` / slices by value and `char` (every formatting path); floats and
+  float literals; `u128`/`i128` (fmt's integer paths, `Duration`); an overloaded index `Index::index`
+  (every `v[i]` on a Vec or slice range); a `match` on other than an int, bool or enum (`match` on
+  `&str`, slices' patterns); a partial move / a move out of a deref or an index of a needs-drop type;
+  a borrowed temporary that needs drop; `repr(packed)`; struct update `..base`; raw borrows; casts of
+  floats, chars and fn items to pointers; a const block; a C-string literal; `offset_of!`; async blocks.
+  BuildError variants (lib.rs): Unsupported/UnsupportedPat/UnsupportedType/UnsupportedSig (the subset,
+  named), Malformed (a record the checker does not make), Diagnostics, NoLiteralValue/NoPatValue,
+  NoLangFn, Select, NoAbi, NoStatic, NoConstValue, MissingRecord, NoAdt, Intrinsic, CAbi, Vtable, Lir,
+  Verify. The RUN lane's build survey, when relayed, replaces this order.
 

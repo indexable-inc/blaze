@@ -77,11 +77,11 @@ pub(crate) struct Sets(ByEnv<Key, Option<TypeSet>>);
 /// What is known of types by the environment they are in, which every thread that compiles
 /// asks of every variable it tells of: one lock-free table, looked up with no lock and without
 /// a copy of the environment or the type, whose counts every thread would write to.
-pub(crate) struct ByEnv<K, V>(SharedMap<(StoredParamEnvAndCrate, K), V>);
+pub(crate) struct ByEnv<K, V>(SharedMap<(StoredParamEnvAndCrate, K), V, Global>);
 
 impl<K, V> Default for ByEnv<K, V> {
     fn default() -> Self {
-        ByEnv(SharedMap::default())
+        ByEnv(SharedMap::new_in(Global))
     }
 }
 

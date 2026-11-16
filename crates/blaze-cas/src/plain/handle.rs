@@ -95,7 +95,7 @@ impl Lane {
 pub struct PlainStore<D: Driver = Native> {
     writer: Lock<Driven<D>>,
     /// Index `i` is the `i`th segment mapped; written under the writer's lock, read without it.
-    table: SharedMap<usize, Mapped>,
+    table: SharedMap<usize, Mapped, Global>,
     /// How many of `table`'s indexes are in: published with `Release` after their inserts.
     len: AtomicUsize,
     /// The namespaces a read asks, in order.
@@ -107,11 +107,11 @@ pub struct PlainStore<D: Driver = Native> {
     /// which [`Driven::machine`] may have grown since.
     needles: Vec<Vec<u8>>,
     /// The lanes, by index; insert-only, each a lock its worker and the commit take.
-    lanes: SharedMap<usize, Lock<Lane>>,
+    lanes: SharedMap<usize, Lock<Lane>, Global>,
     /// The next lane's index.
     next_lane: AtomicUsize,
     /// The lane of each thread that put through [`Store::put`].
-    by_thread: SharedMap<ThreadId, usize>,
+    by_thread: SharedMap<ThreadId, usize, Global>,
     /// The generation the table holds, for the proof of a record read from a lane.
     generation: AtomicU64,
     /// Commits whose flushed batches were let go: a read that missed in the table and then in
@@ -137,14 +137,14 @@ impl<D: Driver> PlainStore<D> {
         needles.extend(driven.core().needles().iter().cloned());
         let it = PlainStore {
             writer: Lock::new("store.plain.writer", driven),
-            table: SharedMap::default(),
+            table: SharedMap::new_in(Global),
             len: AtomicUsize::new(0),
             reads,
             writes,
             needles,
-            lanes: SharedMap::default(),
+            lanes: SharedMap::new_in(Global),
             next_lane: AtomicUsize::new(0),
-            by_thread: SharedMap::default(),
+            by_thread: SharedMap::new_in(Global),
             generation: AtomicU64::new(0),
             released: AtomicU64::new(0),
         };

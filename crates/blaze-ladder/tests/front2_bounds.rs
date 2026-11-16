@@ -27,6 +27,16 @@
 //! `pub unsafe fn catch_unwind<Data: ptr::Thin>`): a bound, a where clause, `impl Alias`, a
 //! supertrait and `dyn Alias` stand for its clauses with `Self` and its parameters substituted,
 //! through an alias of an alias; aliases naming each other are a typed cycle.
+//!
+//! Opaque types (the Reference, "Impl trait", "Abstract return types": "the caller can only use
+//! the functionality specified by the trait bounds"): each `impl Trait` in a return type is its
+//! own opaque type, keyed by its fn and its index (preorder over the written return type), its
+//! bounds its predicates with the opaque as `Self`, its hidden type told to no caller. It
+//! captures every in-scope generic parameter ("Capturing", 2024 edition). A trait's method
+//! (`fn make(&self) -> impl Iterator`, return-position `impl Trait` in traits) gets its opaque
+//! the same way, keyed by the trait's fn; an impl's method has its own key. "Async functions":
+//! "async fn example(x: &str) -> usize" is "roughly equivalent to" "fn example<'a>(x: &'a str)
+//! -> impl Future<Output = usize> + 'a"; its opaque is index 0.
 
 #![feature(variant_count)]
 
@@ -90,10 +100,26 @@ fn bytes_dyn(i: &mut dyn Bytes) -> Option<u8> { i.next() }
 fn sub_next<S: Sub>(mut s: S) -> Option<u8> { s.next() }
 fn cyc<T: CycA>(t: T) -> T { t }
 fn use_conv() -> (u16, u16) { conv(3u8) }
+fn evens() -> impl Iterator<Item = u8> + Send { Count(0) }
+fn use_evens() -> Option<u8> { let mut i = evens(); i.next() }
+fn use_evens_bound() -> Option<u8> { next_bound(evens()) }
+fn wrap<T: Clone>(t: T) -> impl Clone { t }
+fn use_wrap() { let w = wrap(1u8); let _c = need_clone(&w); }
+fn opt_iter() -> Option<impl Iterator<Item = u8>> { None::<Count> }
+fn use_opt() -> bool { opt_iter().is_some() }
+fn use_opt_next() -> Option<u8> { match opt_iter() { Some(mut i) => i.next(), None => None } }
+fn nested() -> impl Iterator<Item = impl Clone> { Count(0) }
+fn use_nested() { let mut n = nested(); if let Some(x) = n.next() { let _c = need_clone(&x); } }
+trait Make { fn make(&self) -> impl Iterator<Item = u8>; }
+impl Make for u8 { fn make(&self) -> impl Iterator<Item = u8> { Count(*self) } }
+fn use_make<M: Make>(m: &M) -> Option<u8> { let mut i = m.make(); i.next() }
+async fn af(x: u8) -> u16 { x as u16 }
+fn need_fut<F: core::future::Future<Output = u16>>(f: F) -> F { f }
+fn use_af() { let _f = need_fut(af(1)); }
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 28] = [
+const CLEAN: [(&str, &str); 36] = [
     ("call_bound", "`F: Fn(u8) -> u16` on the parameter: `Fn<(u8,)>` and `Output = u16`"),
     ("call_where", "`where F: FnMut(u8)`: the output is `()`"),
     ("call_apit", "`impl FnOnce(u8, bool) -> u16` in argument position"),
@@ -122,6 +148,14 @@ const CLEAN: [(&str, &str); 28] = [
     ("bytes_dyn", "`dyn Bytes`: the object of `Iterator<Item = u8>`"),
     ("sub_next", "`trait Sub: Bytes`: an alias as a supertrait"),
     ("use_conv", "`conv(3u8)`: the alias's clauses are what the caller proves"),
+    ("use_evens", "`-> impl Iterator<Item = u8> + Send`: the caller calls `next` through the opaque's bound"),
+    ("use_evens_bound", "the opaque passed where `I: Iterator<Item = u8>` is expected"),
+    ("use_wrap", "a generic fn's opaque `impl Clone`, its bounds instantiated with `T = u8`"),
+    ("use_opt", "`-> Option<impl Iterator<Item = u8>>`: an opaque nested in a type"),
+    ("use_opt_next", "the nested opaque bound by a pattern, then `next` through its bound"),
+    ("use_nested", "`-> impl Iterator<Item = impl Clone>`: occurrence 1 is the `Item`, `Clone`"),
+    ("use_make", "a trait method's `-> impl Iterator<Item = u8>` through `M: Make`"),
+    ("use_af", "`async fn af(x: u8) -> u16` is `fn af(x: u8) -> impl Future<Output = u16>`"),
 ];
 // `display` (`write!(f, \"{t}\")` with `T: Display`) is not in CLEAN: past the lang item it meets
 // the checker's internal `UnknownInCleanBody` at the format arguments (the checker's lane). The
@@ -207,7 +241,7 @@ fn bounds_through_front2() {
             }
         }
     }
-    assert_eq!(impls, 2, "the fixture's two impls");
+    assert_eq!(impls, 3, "the fixture's three impls (`impl Make for u8`: its method's own opaque)");
     // Two trait aliases that name each other stand for nothing: a typed cycle naming both.
     match store.ensure(&names, &mut front.keys, Want::Fn(lib("cyc"))) {
         Err(e @ blaze_ladder::front2::heads::HeadError::Cycle(_)) => println!("cyc: {e}"),

@@ -82,6 +82,27 @@ fn program(message: std::string::String, r: Range) -> Why {
     Why::Program(message.into_boxed_str(), r)
 }
 
+/// The arguments of a struct's, enum's, union's or type alias's path `shown` taking `g`
+/// parameters: the written `kids`, then each parameter not written takes its default with the
+/// arguments before it put in (the Reference, "Generic parameters": `Vec<u8>` is
+/// `Vec<u8, Global>`; "Type aliases": a type alias's parameters are generic parameters too).
+/// The one home of default filling for a type path.
+fn with_defaults(tys: &mut PortableTys<'_>, kids: &[PTy], g: u32, defaults: &[Option<PTy>], shown: &str, r: Range) -> Result<Vec<PTy, Global>, Why> {
+    if kids.len() > g as usize {
+        return Err(program(format!("`{shown}` is written with {} type arguments; it takes {g}", kids.len()), r));
+    }
+    let mut args = Vec::with_capacity_in(g as usize, Global);
+    args.extend_from_slice(kids);
+    for i in kids.len()..g as usize {
+        let Some(d) = defaults.get(i).copied().flatten() else {
+            return Err(program(format!("`{shown}` is written with {} type arguments; it takes {g}, and parameter {i} has no default", kids.len()), r));
+        };
+        let d = subst(tys, d, &args)?;
+        args.push(d);
+    }
+    Ok(args)
+}
+
 fn place(v: &View<'_>, r: Result<BodyRange, lf::BadRow>) -> Result<Range, Why> {
     Ok(v.site(r?)?)
 }
@@ -161,6 +182,9 @@ pub trait Heads {
     /// i-th parameter): a path to it means the aliased type with its arguments substituted.
     /// `Some(None)`: its head was tried and refused (the why is in the store's `alias_gaps`).
     fn alias(&self, alias: LibKey) -> Option<Option<(u32, PTy)>>;
+    /// A type alias's parameter defaults, made with its head (`None` where none is written;
+    /// empty before its head is made).
+    fn alias_defaults(&self, alias: LibKey) -> &[Option<PTy>];
     /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): what a bound naming it stands
     /// for. `None` when not lowered yet.
     fn trait_alias(&self, alias: LibKey) -> Option<&TraitAliasHead>;
@@ -230,10 +254,11 @@ pub struct Env<'e> {
     pub bounds: Bounds<'e>,
     pub self_: SelfTy,
     pub self_assoc: &'e [(Name, PTy)],
-    /// A fn's `impl Trait` parameter types, each an anonymous type parameter (the Reference,
-    /// "Impl trait", "Anonymous type parameters"): the written type and its index. An `impl
-    /// Trait` type not listed here (a return type: an opaque type) is refused by name.
-    pub anon: &'e [(lf::TypeId, u32)],
+    /// A fn's `impl Trait` types and what each stands for: in a parameter's type an anonymous
+    /// type parameter `Param(i)` (the Reference, "Impl trait", "Anonymous type parameters"),
+    /// in the return type an opaque type `Opaque(key, generics in scope)` ("Abstract return
+    /// types"; [`return_impls`]). An `impl Trait` type not listed here is refused by name.
+    pub anon: &'e [(lf::TypeId, PTy)],
     /// The const generic parameters in scope (the Reference, "Generic parameters", "Const
     /// generics"): each one's index (among `params`, which names it) and its declared type.
     /// A name in `params` whose index is here is a constant, never a type.
@@ -678,12 +703,10 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
             // checked where `children` lists the inner type), so the type is its inner type.
             lf::TypeRef::For { .. } => Ok(kids[0]),
             lf::TypeRef::Impl(_) => match env.anon.iter().find(|(at, _)| *at == t) {
-                Some(&(_, i)) => intern(tys, PNode::Param(i)),
-                // Outside a fn's parameter types: in return position an opaque type (the
-                // Reference, "Impl trait", "Abstract return types"); its checker form
-                // (`PNode::Opaque` with its captured generics and bounds) waits on the type
-                // checker's lane (asked 2026-11-16), so a typed refusal names the position.
-                None => Err(Why::Unsupported("an `impl Trait` type in return position (an opaque type; not built yet) or another non-argument position", r)),
+                Some(&(_, ty)) => Ok(ty),
+                // Neither in a fn's parameter types nor in its return type (a field, a `let`,
+                // a type alias, an `impl Trait` inside a fn pointer): refused by name.
+                None => Err(Why::Unsupported("an `impl Trait` type outside a fn's parameters and return type", r)),
             },
             _ => Err(Why::Unsupported("this type", r)),
         }
@@ -761,32 +784,19 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
         match found.kind {
             Kind::Struct | Kind::Enum | Kind::Union => {
                 let (g, defaults) = self.heads.adt_generics(found.key).ok_or(Why::Need(found.key))?;
-                // The Reference, "Generic parameters": a parameter not written takes its
-                // default, with the arguments before it put in (`Vec<u8>` is `Vec<u8, Global>`).
-                if kids.len() > g as usize {
-                    return Err(program(format!("`{shown}` is written with {} type arguments; it takes {g}", kids.len()), r));
-                }
-                let mut args = Vec::with_capacity_in(g as usize, Global);
-                args.extend_from_slice(kids);
-                for i in kids.len()..g as usize {
-                    let Some(d) = defaults.get(i).copied().flatten() else {
-                        return Err(program(format!("`{shown}` is written with {} type arguments; it takes {g}, and parameter {i} has no default", kids.len()), r));
-                    };
-                    let d = subst(tys, d, &args)?;
-                    args.push(d);
-                }
+                let args = with_defaults(tys, kids, g, defaults, shown, r)?;
                 let l = intern_list(tys, &args)?;
                 intern(tys, PNode::Adt(self.heads.checker(found.key), l))
             }
             // The Reference, "Type aliases": the path means the aliased type; a generic
-            // alias's arguments are substituted for its parameters.
+            // alias's arguments are substituted for its parameters, those left out taking
+            // their defaults as a struct's do (`alloy_sol_types::Result<Self>` is
+            // `core::result::Result<Self, Error>` for `type Result<T, E = Error>`).
             Kind::TypeAlias => {
                 let made = self.heads.alias(found.key).ok_or(Why::Need(found.key))?;
                 let (g, t) = made.ok_or(Why::Unsupported("a type alias whose aliased type is refused (its why: the store's `alias_gaps`)", r))?;
-                if kids.len() != g as usize {
-                    return Err(program(format!("`{shown}` is written with {} type arguments; it takes {g}", kids.len()), r));
-                }
-                subst(tys, t, kids)
+                let args = with_defaults(tys, kids, g, self.heads.alias_defaults(found.key), shown, r)?;
+                subst(tys, t, &args)
             }
             Kind::Builtin(name) => {
                 let Some((_, n)) = PRIMS.iter().find(|(p, _)| *p == name) else {
@@ -1105,6 +1115,55 @@ pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global
         _ => {}
     }
     Some(())
+}
+
+/// Each `impl Trait` written in a fn's return type `ret` (the Reference, "Impl trait",
+/// "Abstract return types": each is its own opaque type), in the order that numbers them:
+/// preorder, left to right, an `impl` before the `impl`s in its bounds' arguments and
+/// associated type bindings (`impl Iterator<Item = impl Show>`: the `Iterator` one is 0, the
+/// `Show` one 1). The index is a function of the text alone, never of the order heads are
+/// built in. A work list, no recursion.
+pub(super) fn return_impls(v: &View<'_>, ret: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+    let mut todo: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+    let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+    todo.push(ret);
+    while let Some(t) = todo.pop() {
+        kids.clear();
+        if let lf::TypeRef::Impl(bounds) = v.ty(t)? {
+            out.push(t);
+            for &b in v.rows(bounds)? {
+                if let lf::Bound::Trait { ty, .. } = lf::Bound::decode(b)? {
+                    bound_arg_types(v, ty, &mut kids)?;
+                }
+            }
+        } else {
+            children(v, t, &mut kids)?;
+        }
+        todo.extend(kids.iter().rev());
+    }
+    Ok(())
+}
+
+/// The types written in a bound's trait path's arguments: type arguments, associated type
+/// bindings (`Item = T`) and a parenthesized `Fn(A) -> B`'s inputs and output, in order.
+fn bound_arg_types(v: &View<'_>, ty: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+    let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
+    for &n in v.segments(v.path(p)?)? {
+        let s = lf::Segment::decode(n)?;
+        if !s.has_args && !s.parenthesized {
+            continue;
+        }
+        for &a in v.rows(s.args)? {
+            match lf::GenericArg::decode(a)? {
+                lf::GenericArg::Type(t) | lf::GenericArg::AssocType { ty: t, .. } => out.push(t),
+                _ => {}
+            }
+        }
+        if s.parenthesized {
+            out.extend(s.ty);
+        }
+    }
+    Ok(())
 }
 
 /// The written types a type is made of, in order (the work list's children).

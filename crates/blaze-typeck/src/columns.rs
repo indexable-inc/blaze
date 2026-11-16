@@ -59,6 +59,10 @@ pub type PatDefs<'a> = Soa<(PatId, Def), Alloc<'a>>;
 pub type Fields<'a> = Soa<(ExprId, u32, u32), Alloc<'a>>;
 /// Each capture: the closure, the binding captured, how.
 pub type Captures<'a> = Soa<(ExprId, PatId, CaptureKind), Alloc<'a>>;
+/// Each closure of the body, its ordinal the row's index (expression order, the
+/// `PNode::Closure` ordinal): its expression, its kind (the strongest `Fn*` it implements) and
+/// its signature (a `FnPtr`). What `Question::Closure` answers.
+pub type Closures<'a> = Soa<(ExprId, crate::ty::ClosureKind, PTy), Alloc<'a>>;
 
 /// The record of one body.
 pub struct Checked<'a> {
@@ -76,6 +80,7 @@ pub struct Checked<'a> {
     pub pat_defs: PatDefs<'a>,
     pub fields: Fields<'a>,
     pub captures: Captures<'a>,
+    pub closures: Closures<'a>,
     /// The body's diagnostics, in the order found.
     pub diags: Vec<Diag, Alloc<'a>>,
     /// What the check read, and what to fetch next time.
@@ -132,6 +137,7 @@ impl<'a> Checked<'a> {
             && soa2_eq(&self.pat_defs, &other.pat_defs)
             && soa3_eq(&self.fields, &other.fields)
             && soa3_eq(&self.captures, &other.captures)
+            && soa3_eq(&self.closures, &other.closures)
             && self.diags == other.diags
     }
 }
@@ -155,6 +161,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("callees", &self.callees)
             .field("fields", &self.fields)
             .field("captures", &self.captures)
+            .field("closures", &self.closures)
             .field("diags", &self.diags)
             .field("reads", &self.reads)
             .field("needs", &self.needs)

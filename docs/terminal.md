@@ -159,8 +159,10 @@ Everything a command writes to stdout and stderr outside the screen goes through
 (`blaze --version | head -1`) ends the command quietly with status 141, where std's `println!`
 panics; `crates/blaze-report/tests/prints.txt` counts std's macros left, a crate a row.
 
-`progress` every 10 s of a build under way, never sooner; the diagnostics as before; one `ok`
-or `failed` line always (and `blaze: hint fixable=2 run="blaze check --fix"` when warnings
+`progress` every 10 s of a build under way, never sooner; the diagnostics as before; one
+closing line always: `failed` with the error count (exit 1), or, for `check` while a stage it is
+defined to run is not built, `incomplete · NOT checked: <stages>` (exit 3, `blaze explain 3`),
+never `ok` over a stage it did not run; `ok` (exit 0) only when every stage ran (and `blaze: hint fixable=2 run="blaze check --fix"` when warnings
 have a fix), `key=value` with a value quoted when it is not one word. No start
 line: it says nothing its reader did not type. stdout is the program's and the JSON messages',
 unchanged. Test executables write libtest's own output, and the run ends with its counts

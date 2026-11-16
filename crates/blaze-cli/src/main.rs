@@ -1122,7 +1122,7 @@ mod tests {
         write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\npub fn g() {\n    let x = ;\n}\n");
         let broken = check(&io, work::Sizes::USUAL);
         assert!(broken.failed.is_empty(), "{:?}", broken.failed);
-        assert_eq!((broken.errors, broken.status), (1, Some(1)), "{}\n{}", broken.profile, stdout(&io));
+        assert_eq!((broken.errors, broken.status), (1, Some(1)), "stdout {:?}", stdout(&io));
         let out = stdout(&io);
         assert!(out.contains("lib.rs:3:12"), "{out}");
     }
@@ -1253,7 +1253,7 @@ mod tests {
             assert!(edited.failed.is_empty() && edited.runs >= 1, "edit {edit}: {} runs", edited.runs);
         }
         let again = check(&io, SMALL);
-        assert!(again.certified && again.runs == 0, "a repeat after the merge: certified {}, {} runs", again.certified, again.runs);
+        assert!(again.certified && again.runs == 0, "a repeat after the merge: certified {}, {} runs: {:?}", again.certified, again.runs, again.profile);
         write(&io, "src/m3.rs", &functions(100));
         let undone = check(&io, SMALL);
         assert!(undone.certified && undone.runs == 0 && undone.checked == cold.checked, "the undo: {} runs", undone.runs);
@@ -1308,8 +1308,9 @@ mod tests {
         write(&io, "src/big.rs", &functions(10));
         let fixed = check(&io, SMALL);
         assert!(fixed.failed.is_empty(), "{:?}", fixed.failed);
-        // As in `a_planted_panic_fails_one_task`: outline, surface, the crate's names (4 entries).
-        assert_eq!(fixed.runs, 6, "only the failed file's task runs again, its new surface and its crate's names:\n{}", fixed.profile);
+        // As in `a_planted_panic_fails_one_task`: outline, surface, the crate's names (4
+        // entries), and the file's 10 bodies.
+        assert_eq!((fixed.runs, made(&fixed.profile, "BodyCheck")), (16, 10), "only the failed file's task runs again, its new surface and its crate's names:\n{}", fixed.profile);
         let again = check(&io, SMALL);
         assert!(again.certified && again.runs == 0);
     }
@@ -1325,13 +1326,13 @@ mod tests {
         write(&io, "src/m3.rs", &functions(100).replace("fn f00003() {}", "fn f00003() { let _x = 1; }"));
         let body = check(&io, SMALL);
         assert!(body.failed.is_empty(), "{:?}", body.failed);
-        assert_eq!(body.runs, 1, "a body edit runs its file's outline alone");
+        assert_eq!((body.runs, made(&body.profile, "BodyCheck")), (2, 1), "a body edit runs its file's outline and that one body:\n{}", body.profile);
         write(&io, "src/m3.rs", &functions(100).replace("fn f00003() {}", "fn f00003(_x: u8) { let _x = 1; }"));
         let signature = check(&io, SMALL);
         // Entries, not tasks: the outline, the surface, and the crate's `CrateScope` twice (its
         // first entry answers `Need` of the moved surface, the second resolves; profile of
-        // 2026-11-16: "CrateScope ... entries 2 needs 1").
-        assert_eq!(signature.runs, 4, "a signature edit runs its file's outline, its surface and its crate's names (two entries):\n{}", signature.profile);
+        // 2026-11-16: "CrateScope ... entries 2 needs 1"), and the edited item's body.
+        assert_eq!(signature.runs, 5, "a signature edit runs its file's outline, its surface, its crate's names (two entries) and its body:\n{}", signature.profile);
     }
 
     /// The project's own BINARY reruns its names after a signature edit (the stale answer of
@@ -1367,7 +1368,8 @@ mod tests {
         let fixed = check(&io, SMALL);
         assert!(fixed.failed.is_empty());
         // The file's outline, its surface, and the crate's names, failed `Waited` last time:
-        // made fresh in 4 entries (`Need` of the graph, then of its files' surfaces).
-        assert_eq!(fixed.runs, 6, "only the panicked file's task runs again, its surface and its crate's names, never made:\n{}", fixed.profile);
+        // made fresh in 4 entries (`Need` of the graph, then of its files' surfaces); and the
+        // file's 100 bodies, never listed before.
+        assert_eq!((fixed.runs, made(&fixed.profile, "BodyCheck")), (106, 100), "only the panicked file's task runs again, its surface and its crate's names, never made:\n{}", fixed.profile);
     }
 }

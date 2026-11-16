@@ -79,6 +79,9 @@ pub struct Fx {
     pub t: PortableTys<'static>,
     next: u128,
     names: Vec<(ItemKey, String)>,
+    /// Return-position `impl Trait` occurrences: each one's bounds, `Self` the occurrence's
+    /// `Opaque(k, generics in scope)`, as the front end answers `Predicates(k)`.
+    opaques: Vec<(ItemKey, Vec<PClause>)>,
     fns: Vec<FnRow>,
     adts: Vec<AdtRow>,
     traits: Vec<TraitRow>,
@@ -148,6 +151,7 @@ impl Fx {
             t: PortableTys::new_in(Alloc::global()),
             next: 0x5157_0000,
             names: Vec::new(),
+            opaques: Vec::new(),
             fns: Vec::new(),
             adts: Vec::new(),
             traits: Vec::new(),
@@ -202,6 +206,21 @@ impl Fx {
     /// The clause `where const { cond }` at `args`.
     pub fn holds(&mut self, cond: ItemKey, args: &[PTy]) -> PClause {
         PClause::Const { cond, args: self.list(args) }
+    }
+
+    /// A return-position `impl Trait` occurrence's key (the front end's: the function's key and
+    /// the occurrence's index), its bounds set by [`Fx::set_opaque_bounds`].
+    pub fn opaque_key(&mut self, name: &str) -> ItemKey {
+        let k = self.key(name);
+        self.opaques.push((k, Vec::new()));
+        k
+    }
+
+    /// The bounds of opaque `k`, each with `Self` the opaque type over the generics in scope.
+    pub fn set_opaque_bounds(&mut self, k: ItemKey, bounds: Vec<PClause>) {
+        if let Some(row) = self.opaques.iter_mut().find(|(o, _)| *o == k) {
+            row.1 = bounds;
+        }
     }
 
     fn key(&mut self, name: &str) -> ItemKey {
@@ -763,6 +782,8 @@ impl World for Fx {
             &f.clauses
         } else if let Some(i) = self.impl_row(item) {
             &i.clauses
+        } else if let Some((_, o)) = self.opaques.iter().find(|(k, _)| *k == item) {
+            o
         } else {
             &[]
         };

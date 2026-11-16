@@ -27,6 +27,9 @@ use std::{
 
 use blaze_hash::SharedMap;
 
+// The global heap, as the driver names it: these tables live as long as the build.
+use super::Global;
+
 use super::{CheckRoot, FnNode, StaticNode, recursion::Step};
 use crate::{
     CodegenError,
@@ -71,8 +74,8 @@ pub(super) struct Static<I, S> {
 /// cores: a look is a lock-free read, an entry is made by one insert, and nothing is held
 /// between.
 pub(super) struct Frontier<I, S> {
-    functions: SharedMap<(I, Origin), Arc<Function<I, S>>>,
-    statics: SharedMap<S, Arc<Static<I, S>>>,
+    functions: SharedMap<(I, Origin), Arc<Function<I, S>>, Global>,
+    statics: SharedMap<S, Arc<Static<I, S>>, Global>,
     /// How many [`Order`]s were made of it: each numbers the entries anew.
     orders: AtomicU32,
 }
@@ -84,8 +87,8 @@ where
 {
     pub(super) fn new() -> Self {
         Frontier {
-            functions: SharedMap::default(),
-            statics: SharedMap::default(),
+            functions: SharedMap::new_in(Global),
+            statics: SharedMap::new_in(Global),
             orders: AtomicU32::new(0),
         }
     }

@@ -100,6 +100,9 @@ pub struct Maps {
     /// head was refused, with the why in `alias_gaps`: an alias no path uses never fails a
     /// check, and one that is used fails only the item that names it.
     pub aliases: HashMap<LibKey, Option<(u32, PTy)>, Global>,
+    /// Each type alias's parameter defaults (over its own parameters, `None` where none is
+    /// written), made with its head: `type Result<T, E = Error>`.
+    pub alias_defaults: HashMap<LibKey, Vec<Option<PTy>, Global>, Global>,
     pub alias_gaps: HashMap<LibKey, Why, Global>,
     /// Each trait alias's head ([`Heads::trait_alias`]; made by `Store::trait_alias`).
     pub trait_aliases: HashMap<LibKey, TraitAliasHead, Global>,
@@ -125,6 +128,9 @@ impl Heads for Maps {
     }
     fn alias(&self, alias: LibKey) -> Option<Option<(u32, PTy)>> {
         self.aliases.get(&alias).copied()
+    }
+    fn alias_defaults(&self, alias: LibKey) -> &[Option<PTy>] {
+        self.alias_defaults.get(&alias).map_or(&[], |d| &d[..])
     }
     fn trait_alias(&self, alias: LibKey) -> Option<&TraitAliasHead> {
         self.trait_aliases.get(&alias)
@@ -341,6 +347,10 @@ pub struct Store<'n> {
     /// Each static whose head is made (its type is its [`FnHead`] of no inputs, as a const's),
     /// with its mutability (`static mut`): the checker's `Def::Static`.
     pub statics: HashMap<ItemKey, tc::Mutbl, Global>,
+    /// Each opaque type a fn's head made (an `impl Trait` in its return type, an `async fn`'s
+    /// `impl Future`), by its key ([`super::keys::opaque_key`]): its fn and its index. Its
+    /// bounds are in `preds` under the same key, with the opaque type as `Self`.
+    pub opaques: HashMap<ItemKey, (ItemKey, u32), Global>,
 }
 
 /// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
@@ -555,6 +565,7 @@ impl<'n> Store<'n> {
             fn_gaps: HashMap::new_in(Global),
             ctors: HashMap::new_in(Global),
             statics: HashMap::new_in(Global),
+            opaques: HashMap::new_in(Global),
         }
     }
 
@@ -710,7 +721,12 @@ impl<'n> Store<'n> {
         let mut bounds = Vec::new_in(Global);
         b.param_bounds(&mut self.tys, &env, v, 0, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
+        // Its parameters' defaults (`type Result<T, E = Error>`): a path leaving them out takes
+        // them, as a struct's (types.rs `with_defaults`).
+        let mut defaults = Vec::new_in(Global);
+        own_defaults(&b, &mut self.tys, &env, v, 0, &mut defaults)?;
         let ty = b.ty(&mut self.tys, &env, v, lf::TypeId(t))?;
+        self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
         Ok(())
@@ -1072,9 +1088,39 @@ impl<'n> Store<'n> {
         };
         // Each `impl Trait` parameter type is one more own type parameter, after the declared
         // ones; it has no name, so it is in `anon`, never in `ps`.
-        let mut anon = Vec::new_in(Global);
-        anon_params(v, parent + declared, &mut anon)?;
-        let own = declared + anon.len() as u32;
+        let mut anon_at = Vec::new_in(Global);
+        anon_params(v, parent + declared, &mut anon_at)?;
+        let own = declared + anon_at.len() as u32;
+        let mut anon: Vec<(lf::TypeId, PTy), Global> = Vec::with_capacity_in(anon_at.len(), Global);
+        for &(t, i) in &anon_at {
+            anon.push((t, intern(&mut self.tys, PNode::Param(i))?));
+        }
+        let params_end = anon.len();
+        // Each `impl Trait` in the return type is an opaque type (the Reference, "Impl trait",
+        // "Abstract return types": the caller sees only its bounds), keyed by the fn's key and
+        // its index ([`super::keys::opaque_key`], [`super::types::return_impls`]'s order; an
+        // `async fn`'s `impl Future` is index 0 and the written ones follow). It captures every
+        // generic parameter in scope, the fn's and its container's, `impl Trait` parameters
+        // too ("Capturing", 2024 edition: "all in-scope generic parameters"; in earlier
+        // editions all type and const parameters and only the named lifetimes: lifetimes are
+        // erased here, so both editions give the same list): its args are their identity.
+        let flags = v.head[head::FLAGS];
+        let is_async = flags & sig::ASYNC != 0;
+        let mut ident = Vec::with_capacity_in((parent + own) as usize, Global);
+        for i in 0..parent + own {
+            let node = if cs.iter().any(|&(c, _)| c == i) { PNode::ConstParam(i) } else { PNode::Param(i) };
+            ident.push(intern(&mut self.tys, node)?);
+        }
+        let ident = intern_list(&mut self.tys, &ident)?;
+        let mut rets = Vec::new_in(Global);
+        if let Some(t) = v.head_opt(head::TY) {
+            super::types::return_impls(v, lf::TypeId(t), &mut rets)?;
+        }
+        let first = u32::from(is_async);
+        for (j, &t) in rets.iter().enumerate() {
+            let k = super::keys::opaque_key(key, first + j as u32);
+            anon.push((t, intern(&mut self.tys, PNode::Opaque(k, ident))?));
+        }
         let mut bounds = Vec::new_in(Global);
         let Bounds::Done(outer_bounds) = outer.bounds else {
             return Err(Why::Program("a fn's container's bounds were not lowered before the fn".into(), Range::new(0, 0)));
@@ -1104,21 +1150,54 @@ impl<'n> Store<'n> {
             self_param |= k == 0 && prm.self_kind != lf::SelfKind::No;
             inputs.push(ty);
         }
-        let output = match v.head_opt(head::TY) {
+        let written = match v.head_opt(head::TY) {
             Some(t) => b.ty(&mut self.tys, &env, v, lf::TypeId(t))?,
             None => intern(&mut self.tys, PNode::Tuple(List::EMPTY))?,
         };
-        let flags = v.head[head::FLAGS];
         let whole = Range::new(0, text.len() as u32);
-        if flags & (sig::ASYNC | sig::GEN | sig::VARIADIC) != 0 {
-            return Err(Why::Unsupported("an `async fn`, a `gen fn` or a variadic fn", whole));
+        if flags & (sig::GEN | sig::VARIADIC) != 0 {
+            return Err(Why::Unsupported("a `gen fn` or a variadic fn", whole));
         }
+        // Each opaque's bounds as written, with the opaque type as `Self`, are its own
+        // predicates (the checker's `Predicates(k)`); the written ones' bounds are made after
+        // the fn's own bounds are known (a bound may name `T::Item`).
+        for (j, &(t, me)) in anon[params_end..].iter().enumerate() {
+            let k = super::keys::opaque_key(key, first + j as u32);
+            let mut op = Preds::new();
+            b.impl_bounds(&mut self.tys, &env, v, &[(t, me)], self.sized, &mut op)?;
+            self.preds.insert(k, op);
+            self.opaques.insert(k, (key, first + j as u32));
+        }
+        // An `async fn f(..) -> T` is `fn f(..) -> impl Future<Output = T>` (the Reference,
+        // "Async functions": "async fn example(x: &str) -> usize { x.len() }" is "roughly
+        // equivalent to" "fn example<'a>(x: &'a str) -> impl Future<Output = usize> + 'a"):
+        // its output is opaque 0 with the bounds `Future`, `Output = T` and `Sized`. Its body
+        // is an async block (a coroutine): the checker's and the code builder's, not the head's.
+        let output = if is_async {
+            let fut = super::langs::future_trait(Resolver { names }, self.sized.ok_or(Why::Unsupported("an `async fn` in a program with no `Sized` (no core)", whole))?)
+                .map_err(|e| Why::Program(format!("the `Future` trait of an `async fn`: {e}").into_boxed_str(), whole))?
+                .ok_or(Why::Unsupported("an `async fn` in a program whose core has no `future::Future`", whole))?;
+            let k = super::keys::opaque_key(key, 0);
+            let me = intern(&mut self.tys, PNode::Opaque(k, ident))?;
+            let args = intern_list(&mut self.tys, &[me])?;
+            let mut op = Preds::new();
+            op.clauses.push(PClause::Trait { trait_: checker_of(fut), args });
+            op.clauses.push(PClause::Projection { trait_: checker_of(fut), args, name: Name::of("Output"), term: written });
+            if let Some(s) = self.sized {
+                op.clauses.push(PClause::Trait { trait_: checker_of(s), args });
+            }
+            self.preds.insert(k, op);
+            self.opaques.insert(k, (key, 0));
+            me
+        } else {
+            written
+        };
         let header = tc::FnPtrHeader { abi: abi_of(v, whole)?, safety: if flags & sig::UNSAFE != 0 { tc::Safety::Unsafe } else { tc::Safety::Safe } };
         let has_body = flags & sig::HAS_BODY != 0;
         let mut preds = Preds::new();
         preds.clauses.extend_from_slice(inherited);
         b.predicates(&mut self.tys, &env, v, parent, None, self.sized, &mut preds)?;
-        b.anon_predicates(&mut self.tys, &env, v, self.sized, &mut preds)?;
+        b.impl_bounds(&mut self.tys, &env, v, &anon[..params_end], self.sized, &mut preds)?;
         self.preds.insert(key, preds);
         let mut self_assoc = Vec::with_capacity_in(env.self_assoc.len(), Global);
         self_assoc.extend_from_slice(env.self_assoc);

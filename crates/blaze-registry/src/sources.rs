@@ -126,8 +126,8 @@ pub struct Locked {
 pub struct Sources {
     map: SourceMap,
     context: Arc<Context>,
-    registries: SharedMap<SourceId, Arc<Registry>>,
-    directories: SharedMap<SourceId, Arc<Directory>>,
+    registries: SharedMap<SourceId, Arc<Registry>, Global>,
+    directories: SharedMap<SourceId, Arc<Directory>, Global>,
 }
 
 impl Sources {
@@ -135,8 +135,8 @@ impl Sources {
         Ok(Sources {
             map: source_map(config)?,
             context,
-            registries: SharedMap::default(),
-            directories: SharedMap::default(),
+            registries: SharedMap::new_in(Global),
+            directories: SharedMap::new_in(Global),
         })
     }
 

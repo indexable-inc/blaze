@@ -886,9 +886,15 @@ pub const MAP_AHEAD_MOST: usize = 1024;
 /// asks a record of it, so no thread waits to map a pack another mapped. The store keeps it
 /// ([`crate::Store::reader`] hands it to each reader made). Filled by a reader's round of maps
 /// ([`Direct::map_round`]); a pack its views no longer hold is dropped at the next round.
-#[derive(Default)]
 pub struct Maps {
-    packs: blaze_hash::SharedMap<FileName, PackMap>,
+    packs: blaze_hash::SharedMap<FileName, PackMap, Global>,
+}
+
+impl Default for Maps {
+    /// An empty table on the global heap: it lives as long as its store, a process's.
+    fn default() -> Maps {
+        Maps { packs: blaze_hash::SharedMap::new_in(Global) }
+    }
 }
 
 /// A pack's mapping in [`Maps`], and whether a record of it was asked yet in this process.

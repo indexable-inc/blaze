@@ -409,7 +409,6 @@ dependencies = [
  "blaze-fetch",
  "blaze-file-items",
  "blaze-h1",
- "blaze-h1-net",
  "blaze-http",
  "blaze-id",
  "blaze-ids",
@@ -791,16 +790,6 @@ version = "0.0.0"
 dependencies = [
  "blaze-own",
  "blaze-sim",
-]
-
-[[package]]
-name = "blaze-h1-net"
-version = "0.0.0"
-dependencies = [
- "blaze-h1",
- "blaze-own",
- "blaze-sim",
- "blaze-std",
 ]
 
 [[package]]

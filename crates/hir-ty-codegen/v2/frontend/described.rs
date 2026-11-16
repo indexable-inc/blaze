@@ -163,10 +163,10 @@ struct Under {
 #[derive(Default)]
 pub(super) struct Found {
     /// Each describe read from a record, by the instance and who asked.
-    records: SharedMap<(HirInstance, Origin), Under>,
+    records: SharedMap<(HirInstance, Origin), Under, Global>,
     /// What the recursion limit reads of each function a record refers to
     /// ([`Counted`]), as the record holds it.
-    counted: SharedMap<HirInstance, Counted>,
+    counted: SharedMap<HirInstance, Counted, Global>,
 }
 
 /// Where an owner keeps what its database read from records ([`found_in`]): the table, with

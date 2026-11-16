@@ -19,7 +19,8 @@ doctest = false
 # The request machine, its records and keys, the line table and the profile.
 blaze-drive.workspace = true
 # The system, reached only through bstd: the files, the output, the host's core count, frames.
-blaze-std.workspace = true
+# `requests`: bstd's `Http` alone (blaze-h1 over `Net`), for the shared cache's http origin.
+blaze-std = { workspace = true, features = ["requests"] }
 # `outline`: a file's text to its items, the `FileItems` task's work.
 blaze-file-items.workspace = true
 # A body's parse for its `BodyCheck` task: the entry blaze-lower's `lower_body` parses with.
@@ -41,10 +42,10 @@ blaze-ladder.workspace = true
 # The shared cache's read path (remote-read.md): a named origin folder read by range, checked
 # against a signed head. Without `bucket`: no HTTP client, no TLS, in this binary's graph.
 blaze-remote = { workspace = true, default-features = false }
-# An `http://` origin (store.rs `HttpOrigin`): blaze-h1's HTTP/1.1 core run by blaze-h1-net on
-# bstd's `Net`: ranged GETs, bounded replies, no TLS stack.
+# An `http://` origin (store.rs `HttpOrigin`): bstd's `Http` (its `requests` feature, below)
+# drives blaze-h1's HTTP/1.1 core on bstd's `Net`: ranged GETs, bounded replies, no TLS stack.
+# blaze-h1 itself for the names of its refusals (`Why`) and `Range`.
 blaze-h1.workspace = true
-blaze-h1-net.workspace = true
 # The findings' frames, their wording table and the closing line (blaze_report::frame).
 blaze-report.workspace = true
 # The workspace's layout (`layout::Layout`), sans-IO: members, targets, dependencies, each on its

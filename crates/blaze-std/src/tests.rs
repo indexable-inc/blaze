@@ -124,8 +124,10 @@ mod paths;
 mod placement;
 mod ranks;
 mod reach;
-#[cfg(feature = "net")]
+#[cfg(feature = "requests")]
 mod requests;
+#[cfg(feature = "requests")]
+mod requests_servers;
 mod scopes;
 mod simtest;
 mod swap;

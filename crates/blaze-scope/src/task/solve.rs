@@ -210,6 +210,7 @@ pub fn solve<'a, N: Name, F: ScopeFacts<Name = N>, R: Records<N>, X: Expand>(
                                 Some(Note::Unknown) => tally.unknown_reads += 1,
                                 None => {}
                             }
+                            records.asked(*read, &own);
                             owned.push((*read, own));
                         }
                         Err(Lack::Wait(module)) if is_member(module) => owned.push((*read, Own::InProgress(module))),

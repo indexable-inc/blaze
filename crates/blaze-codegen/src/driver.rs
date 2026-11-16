@@ -1163,7 +1163,7 @@ fn symbols_defined_twice<B: Prepare>(
 /// made from, kept until the function's own compile takes it.
 struct Exports<B: Prepare> {
     /// Each made, by function: `None` for one that failed, its error the maker's.
-    made: blaze_hash::SharedByHash<InstanceKey, Option<Arc<B::Export>>>,
+    made: blaze_hash::SharedByHash<InstanceKey, Option<Arc<B::Export>>, Global>,
     /// The making under way of each, by function.
     making: blaze_graph::pump::Flights<()>,
     /// The IR each was made from, until that function's own compile takes it.
@@ -1173,7 +1173,7 @@ struct Exports<B: Prepare> {
 impl<B: Prepare> Default for Exports<B> {
     fn default() -> Self {
         Exports {
-            made: blaze_hash::SharedByHash::default(),
+            made: blaze_hash::SharedByHash::new_in(Global),
             making: blaze_graph::pump::Flights::default(),
             // alloc: per release build, the IR its exports were made from
             spare: blaze_core::lock::Lock::new("codegen.driver.export_spare", HashMap::new()),

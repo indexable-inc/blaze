@@ -20,7 +20,7 @@ use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::{BodyView, InferCtx, ItemKey, Name, Needs, Outcome, Question};
 
-use super::buckets::{Buckets, Unfilled};
+use super::buckets::{Buckets, Unfilled, inherent_home, trait_home};
 use super::heads::{HeadError, Store, Want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
@@ -550,8 +550,10 @@ fn make_once(r: &mut Records<'_, '_>, fill: Fill) -> Result<(), MakeFail> {
     match fill {
         Fill::Store(want) => r.store.ensure(r.names, r.keys, want).map_err(MakeFail::Head),
         Fill::Impls(trait_, shape) => {
+            // Only impls written where the orphan rules allow (`trait_home`) are candidates.
+            let home = trait_home(r.names, r.keys, r.store, trait_, shape);
             let b = r.buckets.get_or_insert_with(|| Buckets::new(r.names, r.index));
-            let mut candidates = b.trait_candidates(trait_, shape);
+            let mut candidates = b.trait_candidates(trait_, shape, home);
             // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
             // decides an auto trait's structural rule, and the solver matches it to no positive
             // goal; its refused header is the question's gap, never a wrong `yes`.
@@ -559,13 +561,15 @@ fn make_once(r: &mut Records<'_, '_>, fill: Fill) -> Result<(), MakeFail> {
             candidates.sort_unstable();
             candidates.dedup();
             lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;
-            b.answer(r.store, trait_, shape).map_err(MakeFail::Buckets)
+            b.answer(r.store, trait_, shape, home).map_err(MakeFail::Buckets)
         }
         Fill::Inherent(shape) => {
+            // Only impls written in the type's own crate (`inherent_home`) are candidates.
+            let home = inherent_home(r.names, r.keys, shape);
             let b = r.buckets.get_or_insert_with(|| Buckets::new(r.names, r.index));
-            let candidates = b.inherent_candidates(shape);
+            let candidates = b.inherent_candidates(shape, home);
             lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;
-            b.answer_inherent(r.store, shape).map_err(MakeFail::Buckets)
+            b.answer_inherent(r.store, shape, home).map_err(MakeFail::Buckets)
         }
     }
 }

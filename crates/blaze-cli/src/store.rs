@@ -28,8 +28,9 @@ use bstd::path::Path;
 use bstd::Deadline;
 use bstd::net::{Addr, Net};
 use bstd::url::Url;
-use blaze_h1::{Limits as H1Limits, Range as H1Range, Redirects};
-use blaze_h1_net::{Ask, Client, FetchWhy, NoTls};
+use blaze_h1::Range;
+use bstd::requests::{Finished, Http, HttpKind, NO_REDIRECTS, Request, Wire};
+use bstd::roots::Roots;
 
 use crate::CliError;
 
@@ -610,7 +611,7 @@ impl NamedOrigin {
             (Some(folder), Some(key)) => {
                 let key = PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?;
                 let at = if folder.starts_with("https://") {
-                    return Err(CliError::Usage("--origin https://: blaze-h1-net has no TLS yet (its `NoTls`); name an http:// origin or a folder"));
+                    return Err(CliError::Usage("--origin https://: bstd's Http has no TLS yet (D63, stage two); name an http:// origin or a folder"));
                 } else if folder.starts_with("http://") {
                     let net = net.ok_or(CliError::Usage("--origin http://: this host offers no network"))?;
                     OriginAt::Http(HttpAt::of(folder, net)?)
@@ -672,29 +673,57 @@ impl HttpAt {
     }
 }
 
-/// An `http://` origin: each ask one ranged GET of `<base>/<object name>` through blaze-h1-net
-/// on bstd's `Net` (remote-read.md, "HTTP in the tree"). The reply is bounded before it is read
-/// (`most_body` is the ask's length), its `Content-Range` must be the range asked (blaze-h1's
-/// `Response::ranged`), a redirect is refused (`most: 0`), and the ask's deadline ends every
-/// wait. A 404 is `Missing`, a 416 (asked past the object's end) no bytes, anything else
-/// `Unreadable` (blaze-h1-net's tests name each refusal). Nothing here trusts the bytes: the
-/// read machine checks the signed head and the digest chain.
+/// How the shared cache's origin is asked over HTTP: a reply's body is held to the ask's range
+/// by bstd's `Http` itself (and to a record's most here); a redirect is refused; a host that
+/// says nothing for ten seconds is `Silent`, and the ask's deadline bounds the whole.
+const ORIGIN_WIRE: Wire = Wire {
+    user_agent: "blaze",
+    body_most: 64 << 20,
+    // A 64 MiB body in 16 KiB receives, and its head.
+    reads_most: (64 << 20) / (16 << 10) + 64,
+    wait_most: Duration::from_secs(10),
+    redirects: NO_REDIRECTS,
+};
+
+/// An `http://` origin: each ask one ranged GET of `<base>/<object name>` through bstd's
+/// `Http` over its `Net` (D63; remote-read.md, "HTTP in the tree"). bstd holds the reply to the
+/// ask's length before a byte past it is taken, takes only a `206` of exactly the range asked
+/// (blaze-h1's `Response::ranged`), refuses a redirect (`NO_REDIRECTS`) and bounds every wait;
+/// its simulation names each refusal (blaze-std tests/requests_servers.rs). A 404 is `Missing`,
+/// a 416 (asked past the object's end) no bytes, anything else `Unreadable`. Nothing here
+/// trusts the bytes: the read machine checks the signed head and the digest chain.
 struct HttpOrigin<'o> {
     cx: &'o Cx,
     at: &'o HttpAt,
-    /// The URL's text and the reply's body, reused from ask to ask.
+    /// bstd's client, reaching the origin's address alone.
+    http: Http,
+    /// The URL's text, reused from ask to ask.
     url: blaze_own::Vec<u8, Global>,
-    body: blaze_own::Vec<u8, Global>,
 }
 
 impl<'o> HttpOrigin<'o> {
-    fn new(cx: &'o Cx, at: &'o HttpAt) -> HttpOrigin<'o> {
-        HttpOrigin { cx, at, url: blaze_own::Vec::new_in(Global), body: blaze_own::Vec::new_in(Global) }
+    fn new(cx: &'o Cx, at: &'o HttpAt, clock: &Clock) -> HttpOrigin<'o> {
+        // No TLS yet (`https://` is refused where the origin is named), so no roots are trusted.
+        let http = Http::over(&at.net, clock, &Roots::none(), ORIGIN_WIRE);
+        let http = match at.base.origin() {
+            Some(origin) => http.only(origin),
+            None => http,
+        };
+        HttpOrigin { cx, at, http, url: blaze_own::Vec::new_in(Global) }
     }
 }
 
 impl Origin for HttpOrigin<'_> {
     fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        self.read_with(object, at, into, deadline_ns, |_| {})
+    }
+}
+
+impl HttpOrigin<'_> {
+    /// [`Origin::read`], with `between` run after the request is sent and before its answer is
+    /// read: nothing in the command; the test's server, in the simulation (bstd's begin/finish
+    /// split, which lets one lane play both ends).
+    fn read_with(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64, between: impl FnOnce(&Cx)) -> Result<usize, OriginError> {
         if into.is_empty() {
             return Ok(0);
         }
@@ -707,31 +736,39 @@ impl Origin for HttpOrigin<'_> {
         }
         let text = core::str::from_utf8(&self.url).map_err(|_| OriginError::Unreadable)?;
         let url = Url::parse(text).map_err(|_| OriginError::Unreadable)?;
-        let limits = H1Limits { most_head: 16 << 10, most_headers: 64, most_body: into.len() as u64 };
-        let redirects = Redirects { most: 0, cross_scheme: false, cross_origin: false };
-        let client = Client { net: &self.at.net, tls: &NoTls, limits, redirects, agent: "blaze", alloc: Global };
-        let range = H1Range { first: at, last: Some(at + into.len() as u64 - 1) };
-        let ask = Ask { method: "GET", url: &url, headers: &[], body: &[], range: Some(range) };
+        let range = Range { first: at, last: Some(at + into.len() as u64 - 1) };
+        let request = Request { range: Some(range), ..Request::get(&url) };
         let cx = self.cx.until(Deadline::at(Duration::from_nanos(deadline_ns)));
-        self.body.clear();
-        match client.send(&cx, &ask, &mut self.body) {
-            Ok(_) => {
-                // `most_body` held the body to `into.len()`.
-                let got = self.body.len().min(into.len());
-                into[..got].copy_from_slice(&self.body[..got]);
-                Ok(got)
-            }
-            Err(error) => {
-                let status = match &error.why {
-                    FetchWhy::Http(blaze_h1::Error { why: blaze_h1::Why::RangeStatus { status }, .. }) => Some(*status),
-                    _ => None,
-                };
-                match status {
-                    Some(404) => Err(OriginError::Missing),
-                    Some(416) => Ok(0),
-                    _ => Err(OriginError::Unreadable),
+        let mut body = cx.bytes();
+        let answered = match self.http.begin(&cx, &request) {
+            Ok(exchange) => {
+                between(&cx);
+                match exchange.finish(&cx, &mut body) {
+                    Ok(Finished::Answered(response)) => Ok(response),
+                    // `NO_REDIRECTS` makes a redirect an error; a hop is never begun.
+                    Ok(Finished::Redirected(next)) => {
+                        let _ = next.finish(&cx, &mut body);
+                        return Err(OriginError::Unreadable);
+                    }
+                    Err(error) => Err(error),
                 }
             }
+            Err(error) => Err(error),
+        };
+        match answered {
+            Ok(_) => {
+                // bstd held the body to the range, `into.len()` bytes at most.
+                let got = body.len().min(into.len());
+                into[..got].copy_from_slice(&body.as_slice()[..got]);
+                Ok(got)
+            }
+            Err(error) => match error.kind {
+                HttpKind::Protocol(blaze_h1::Error { why: blaze_h1::Why::RangeStatus { status: 404 }, .. }) => {
+                    Err(OriginError::Missing)
+                }
+                HttpKind::Protocol(blaze_h1::Error { why: blaze_h1::Why::RangeStatus { status: 416 }, .. }) => Ok(0),
+                _ => Err(OriginError::Unreadable),
+            },
         }
     }
 }
@@ -950,7 +987,7 @@ impl<S: Sharing> Store for Layered<'_, S> {
         // `BatchError` is only a batch past `keys_most` or one begun mid-batch: neither can be.
         let fetched = match &remote.named.at {
             OriginAt::Folder(folder) => fetch(&mut remote.reader, &mut FolderOrigin { cx, folder }, &mut now, core::slice::from_ref(&key.0), remote.alloc),
-            OriginAt::Http(at) => fetch(&mut remote.reader, &mut HttpOrigin::new(cx, at), &mut now, core::slice::from_ref(&key.0), remote.alloc),
+            OriginAt::Http(at) => fetch(&mut remote.reader, &mut HttpOrigin::new(cx, at, &clock), &mut now, core::slice::from_ref(&key.0), remote.alloc),
         };
         fetched.map_err(|error| CliError::Remote(RemoteError::Batch(error)))?;
         let answer = remote.reader.answer(0);
@@ -1028,6 +1065,11 @@ impl<S: Sharing> Store for Layered<'_, S> {
         Ok(())
     }
 }
+
+/// The http origin's proof: the folder's records byte-equal over HTTP, a liar refused.
+#[cfg(test)]
+#[path = "store_http_tests.rs"]
+mod http_tests;
 
 /// The pack store's proof (rule 43): simulations, never review. Each record's bytes are a
 /// function of its key, so any bytes a get returns are checked without a model. A witness

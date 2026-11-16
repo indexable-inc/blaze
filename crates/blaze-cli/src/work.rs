@@ -843,23 +843,30 @@ fn body_syntax<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_
     }
     // The parser's steps over the lexer's tokens, trivia skipped: an error is placed at the end
     // of the last token taken before it (blaze-file-items walk.rs reads the outline's so).
+    // An error within one token of the one before is the parser's recovery from it (`let x = ;`
+    // is "expected expression", then "expected SEMICOLON" past the `;`): one mistake, one error.
+    const CASCADE: u32 = 1;
     let (mut next, mut end) = (0usize, 0usize);
-    let mut take = |next: &mut usize, end: &mut usize| {
+    let mut since: Option<u32> = None;
+    let mut take = |next: &mut usize, end: &mut usize, since: &mut Option<u32>| {
         while *next < lexed.len() && lexed.kind(*next).is_trivia() {
             *next += 1;
         }
         if *next < lexed.len() {
             *end = lexed.text_range(*next).end;
             *next += 1;
+            *since = since.map(|n| n.saturating_add(1));
         }
     };
     for step in output.iter() {
         match step {
-            parser::Step::Token { n_input_tokens, .. } => (0..n_input_tokens).for_each(|_| take(&mut next, &mut end)),
-            parser::Step::FloatSplit { .. } => take(&mut next, &mut end),
+            parser::Step::Token { n_input_tokens, .. } => (0..n_input_tokens).for_each(|_| take(&mut next, &mut end, &mut since)),
+            parser::Step::FloatSplit { .. } => take(&mut next, &mut end, &mut since),
             parser::Step::Enter { .. } | parser::Step::Exit => {}
             parser::Step::Error { msg } => {
-                if end as u32 >= body.start {
+                let cascade = since.is_some_and(|n| n <= CASCADE);
+                since = Some(0);
+                if end as u32 >= body.start && !cascade {
                     made.find(SYNTAX, (end as u32, end as u32), &[msg]);
                 }
             }

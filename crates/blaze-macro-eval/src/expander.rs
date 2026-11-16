@@ -50,14 +50,13 @@
 //! first call, each is found under the state that call left; once one changed what a call
 //! before it left, it is stateful for good (`proc_macro_api::kept::verdict`).
 
-use std::{
-    fmt,
-    path::PathBuf,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::alloc::Global;
+use std::{fmt,
+path::PathBuf,
+sync::{
+    Arc, Weak,
+    atomic::{AtomicU64, Ordering},
+},};
 
 use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
 use blaze_graph::Key;
@@ -195,12 +194,12 @@ struct Library {
     seen: verdicts::Seen,
     /// Each calling crate's session: its calls run in order, each that runs from its state or
     /// changes it holding its turn in [`Library::turns`].
-    sessions: SharedMap<Crate, Arc<SessionOf>>,
+    sessions: SharedMap<Crate, Arc<SessionOf>, Global>,
     /// The turns of its sessions ([`crate::turn`]): scheduler holds, so a call waiting for one
     /// holds no thread while the call holding it runs its macro.
     turns: Turns,
     /// Each calling crate's roots as its expansions are kept against them ([`Library::kept_roots`]).
-    kept_roots: SharedMap<Crate, Arc<KeptRoots>>,
+    kept_roots: SharedMap<Crate, Arc<KeptRoots>, Global>,
     /// For a crate that settles, the settled state its sessions' first calls left, the first
     /// seen since it loaded ([`Evaluated::same_from_either_state`]): another first call that
     /// leaves another state shows the state depends on which call ran first.
@@ -795,9 +794,9 @@ fn load_on(
         runs,
         code,
         seen: verdicts::Seen::new(verdict),
-        sessions: SharedMap::default(),
+        sessions: SharedMap::new_in(Global),
         turns: Turns::default(),
-        kept_roots: SharedMap::default(),
+        kept_roots: SharedMap::new_in(Global),
         settled: Lock::new("macro.library.settled", None),
         moved_said: std::sync::atomic::AtomicU32::new(0),
     });

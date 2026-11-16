@@ -7,11 +7,11 @@
 //! on stderr, `cells seam: ..`; deleted with the old core.
 
 use core::cell::Cell;
-use std::time::{Duration, Instant};
+use core::time::Duration;
 
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_hash::HashMap;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, FixedVec};
 use blaze_surface::{CrateRootBuilder, DeclsBuilder, ExpandedDecls, ModuleInfo, SurfaceError};
 
 use super::{BuiltDeps, Cells, Outcome, Value};
@@ -59,33 +59,79 @@ impl<'a, F: ScopeFacts<Name = &'a str>> ScopeFacts for Facts<'_, 'a, F> {
     }
 }
 
-/// Solves `krate` with the cell core over `facts` and compares with the old core's `done`; the
-/// old fill took `old`.
+/// What turns the shadow on, given by the caller that turns the `cells` feature on (through
+/// [`crate::task::Par::cells_seam`]): the clock the two cores are timed by, and where each
+/// crate's report goes. A library never prints: the caller does, from the typed report.
+pub trait Seam: Sync {
+    /// The time since a start of the caller's choosing.
+    fn now(&self) -> Duration;
+
+    /// One crate's shadow: what the cell core answered against the old core, or why it refused.
+    fn report(&self, krate: &str, shadowed: Result<Shadowed, ShadowRefused>);
+}
+
+/// The most differing bindings a report names; the rest are only counted.
+pub const DIFFER_SHOWN: usize = 12;
+
+/// One binding the two cores answer differently: the old core's binding, and the def the cell
+/// core found (`None`: not found, or not decided).
+#[derive(Clone, Copy, Debug)]
+pub struct Differ {
+    pub module: ItemKey,
+    pub ns: Namespace,
+    pub old: blaze_surface::Binding,
+    pub cells: Option<blaze_surface::Def>,
+}
+
+/// One crate's shadow run: times, and the bindings by agreement (bottom.md section 6).
+#[derive(Debug)]
+pub struct Shadowed {
+    pub old_fill: Duration,
+    pub cells_load: Duration,
+    pub cells_solve: Duration,
+    pub equal: u64,
+    pub differ: u64,
+    /// Bindings the cell core holds as outside what it follows: neither equal nor different.
+    pub unknown: u64,
+    pub old_errors: u64,
+    pub failed: u64,
+    pub outside: u64,
+    pub undecided: u64,
+    pub dep_reads: u64,
+    pub dep_absent: u64,
+    pub not_expanded: u64,
+    pub first_not_expanded: Option<ItemKey>,
+    pub cells: u64,
+    pub stalls: u64,
+    /// The first [`DIFFER_SHOWN`] differing bindings, in module key order.
+    pub differ_first: FixedVec<Differ, DIFFER_SHOWN>,
+}
+
+/// The cell core refused a crate: at its load or its run.
+#[derive(Debug)]
+pub enum ShadowRefused {
+    Load(super::CellError),
+    Run(super::CellError),
+}
+
+/// Solves a crate with the cell core over `facts` and compares with the old core's `done`; the
+/// old fill took `old`, and the cell core is timed by `seam`'s clock.
 pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
     facts: &F,
     built: &Built<'_, 'a>,
-    krate: &str,
     root: ItemKey,
     done: &HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>>,
     old: Duration,
+    seam: &dyn Seam,
     alloc: Alloc<'a>,
-) {
+) -> Result<Shadowed, ShadowRefused> {
     let deps = BuiltDeps { built, alloc };
     let facts = Facts { inner: facts, not_expanded: Cell::new(0), first: Cell::new(None), alloc };
-    let start = Instant::now();
-    let mut c = match Cells::load_with(&facts, root, Some(&deps), alloc) {
-        Ok(c) => c,
-        Err(e) => {
-            std::eprintln!("cells seam: {krate}: load refused: {e}");
-            return;
-        }
-    };
-    let loaded = start.elapsed();
-    if let Err(e) = c.run(&facts, &|_, _| {}, &[]) {
-        std::eprintln!("cells seam: {krate}: run refused: {e}");
-        return;
-    }
-    let solved = start.elapsed();
+    let start = seam.now();
+    let mut c = Cells::load_with(&facts, root, Some(&deps), alloc).map_err(ShadowRefused::Load)?;
+    let loaded = seam.now().saturating_sub(start);
+    c.run(&facts, &|_, _| {}, &[]).map_err(ShadowRefused::Run)?;
+    let solved = seam.now().saturating_sub(start);
     // The answers: imports and calls by outcome.
     let (mut failed, mut outside, mut undecided) = (0u64, 0u64, 0u64);
     for r in c.results() {
@@ -101,7 +147,7 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
     keys.extend(done.keys().copied());
     keys.sort_unstable();
     let (mut equal, mut differ, mut unknown, mut old_errors) = (0u64, 0u64, 0u64, 0u64);
-    let mut shown = 0;
+    let mut differ_first = FixedVec::new();
     for &m in keys.iter() {
         let Some(resolved) = done.get(&m) else { continue };
         let scope = &resolved.scope;
@@ -123,29 +169,31 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
                 continue;
             }
             differ += 1;
-            if shown < 12 {
-                shown += 1;
-                let ns = match e.ns {
-                    Namespace::Types => "type",
-                    Namespace::Values => "value",
-                    Namespace::Macros => "macro",
-                };
-                std::eprintln!("cells seam: {krate}: differ {m:x} {ns} {}: old {:?} {:?}, cells {got:?}", e.name, e.binding.def, e.binding.state);
-            }
+            let cells = match got {
+                Some(Value::Found(d, _) | Value::Ambiguous(d, _)) => Some(d),
+                _ => None,
+            };
+            // Full past the first DIFFER_SHOWN: the rest are counted in `differ` only.
+            _ = differ_first.push(Differ { module: m, ns: e.ns, old: e.binding, cells });
         }
     }
-    std::eprintln!(
-        "cells seam: {krate}: old fill {:.2} ms, cells load {:.2} ms + solve {:.2} ms; bindings equal {equal}, differ {differ}, cells unknown {unknown}; \
-         old errors {old_errors}, cells failed {failed}, outside {outside}, undecided {undecided}; dep reads {}, dep absent {}; \
-         calls the fill did not expand {} (first {:?}); cells {}, stalls {}",
-        old.as_secs_f64() * 1e3,
-        loaded.as_secs_f64() * 1e3,
-        (solved - loaded).as_secs_f64() * 1e3,
-        c.stats.dep_reads,
-        c.stats.dep_absent,
-        facts.not_expanded.get(),
-        facts.first.get(),
-        c.stats.cells,
-        c.stats.stalls,
-    );
+    Ok(Shadowed {
+        old_fill: old,
+        cells_load: loaded,
+        cells_solve: solved.saturating_sub(loaded),
+        equal,
+        differ,
+        unknown,
+        old_errors,
+        failed,
+        outside,
+        undecided,
+        dep_reads: c.stats.dep_reads as u64,
+        dep_absent: c.stats.dep_absent as u64,
+        not_expanded: facts.not_expanded.get() as u64,
+        first_not_expanded: facts.first.get(),
+        cells: c.stats.cells as u64,
+        stalls: c.stats.stalls as u64,
+        differ_first,
+    })
 }

@@ -101,6 +101,21 @@ fn member_key(container: ItemKey, kind: MemberKind, name: &str) -> ItemKey {
     ItemKey(u128::from_be_bytes(first))
 }
 
+/// The key of the opaque type of the `index`th `impl Trait` in fn `fn_`'s return type (the
+/// order of [`super::types::return_impls`]; an `async fn`'s own `impl Future` is index 0, see
+/// `heads.rs` `fn_head`): a function of the fn's key and the index alone, so it does not
+/// depend on the order heads are built in. The fn's crate prefix is kept.
+pub fn opaque_key(fn_: ItemKey, index: u32) -> ItemKey {
+    let mut bytes = [0u8; 20];
+    bytes[..16].copy_from_slice(&fn_.0.to_be_bytes());
+    bytes[16..].copy_from_slice(&index.to_be_bytes());
+    let id = ContentId::of("blaze-ladder front2 opaque key 1", &bytes);
+    let mut first = [0u8; 16];
+    first[..8].copy_from_slice(&fn_.0.to_be_bytes()[..8]);
+    first[8..].copy_from_slice(&id.0[..8]);
+    ItemKey(u128::from_be_bytes(first))
+}
+
 impl Keys {
     fn file(&mut self, k: ItemKey, origin: Origin) -> Result<ItemKey, KeyClash> {
         match self.origins.get(&k) {

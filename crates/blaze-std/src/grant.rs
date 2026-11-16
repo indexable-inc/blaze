@@ -630,7 +630,7 @@ whole! {
 }
 
 // Requests, behind bstd's `net` feature.
-#[cfg(feature = "net")]
+#[cfg(feature = "requests")]
 whole! {
     crate::requests::Http => "http", need_http;
 }

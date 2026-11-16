@@ -30,6 +30,7 @@ use blaze_manifest::layout::{Entry, Layout, Need, Pass as LayoutPass};
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{Alloc, Vec as AVec};
 use blaze_proc_macro::{
+    record::{DirStore, native_world},
     script::{ScriptError, ScriptRuntime, ScriptWhy},
     script_sandbox::{Refusal, Script, SpawnRefusal, Tree, dir_tree, mem_tree},
     script_unit::{Prepared, Setting, links_inputs, links_order, prepare},
@@ -38,6 +39,12 @@ use blaze_build_script::env::DepMetadata;
 use blaze_unit_graph::{Ask, CfgAtom, Package, Pass, Records, Resolution, Resolver, StoreSources, TargetDesc, UnitId, UnitKind};
 
 const TARGET: &str = "aarch64-apple-darwin";
+
+/// The runtime over the folder `store`, its records through a world this program opens there.
+fn script_runtime(store: &Path) -> ScriptRuntime {
+    let (io, root) = native_world(store).unwrap_or_else(|error| panic!("the records at {}: {error}", store.display()));
+    ScriptRuntime::new(store, DirStore::build_scripts(&io, &root)).unwrap_or_else(|error| panic!("the script runtime: {error}"))
+}
 
 /// The try-compiles the class C scripts make: none. Class A's rows come with their reasons.
 const KNOWN: &[Known] = blaze_build_script::pinned::TEMPO;
@@ -225,7 +232,7 @@ fn main() {
         }
     };
 
-    let runtime = script_runtime(&store).unwrap_or_else(|e| panic!("{e}"));
+    let runtime = script_runtime(&store);
     let table = Arc::new(pinned_rows(TARGET, KNOWN, alloc).to_vec());
     let setting = Setting { store: &store, target: TARGET, host: TARGET, table: Arc::clone(&table), c_mode: CMode::Deferred };
     let units = &graph.units;

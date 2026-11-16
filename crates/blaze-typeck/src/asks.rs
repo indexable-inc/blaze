@@ -56,7 +56,7 @@ pub(crate) struct Cursor {
 }
 
 /// The question kinds the tally counts apart, in [`Question`]'s declaration order.
-pub const QUESTION_KINDS: [&str; 18] = [
+pub const QUESTION_KINDS: [&str; 19] = [
     "FnSig",
     "Predicates",
     "Adt",
@@ -75,6 +75,7 @@ pub const QUESTION_KINDS: [&str; 18] = [
     "AssocParent",
     "ConstHolds",
     "ConstParams",
+    "Closure",
 ];
 
 /// The index of `q`'s kind in [`QUESTION_KINDS`].
@@ -98,6 +99,7 @@ pub const fn question_kind(q: Question) -> usize {
         Question::AssocParent(_) => 15,
         Question::ConstHolds(..) => 16,
         Question::ConstParams(_) => 17,
+        Question::Closure(..) => 18,
     }
 }
 
@@ -110,7 +112,7 @@ pub struct Tally {
     /// Checks run (a body's rounds: each `Outcome::Need` is followed by another check).
     pub checks: u64,
     /// Questions asked of the world, by [`QUESTION_KINDS`].
-    pub asks: [u64; 18],
+    pub asks: [u64; 19],
     /// Questions the world had no answer for.
     pub missing: u64,
     /// Record tables converted into the solver's facts (one per answer with a table).
@@ -151,7 +153,7 @@ impl Tally {
 
     /// `self - earlier`: what happened between two readings of one tally.
     pub fn since(&self, earlier: &Tally) -> Tally {
-        let mut asks = [0u64; 18];
+        let mut asks = [0u64; 19];
         for (i, a) in asks.iter_mut().enumerate() {
             *a = self.asks[i] - earlier.asks[i];
         }

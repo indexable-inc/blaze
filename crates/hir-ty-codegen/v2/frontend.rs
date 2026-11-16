@@ -346,8 +346,8 @@ static UNITS: Lock<Vec<Arc<Units>>> = Lock::new("codegen.frontend.units", Vec::n
 /// place, before that place is handed out, so a place a `Facing` holds is always here.
 /// Until 2026-11-12 the read took the lock: once per describe on every worker, which a cold
 /// build of tempo (bd63ea64fc, 5,597,946 describes) waited 1,559 s for in all.
-static UNITS_BY_PLACE: std::sync::LazyLock<blaze_hash::SharedMap<u32, Arc<Units>>> =
-    std::sync::LazyLock::new(blaze_hash::SharedMap::default);
+static UNITS_BY_PLACE: std::sync::LazyLock<blaze_hash::SharedMap<u32, Arc<Units>, Global>> =
+    std::sync::LazyLock::new(|| blaze_hash::SharedMap::new_in(Global));
 
 /// `units` among those given, by content: its place and the one held there.
 fn give_units(units: Units) -> (u32, Arc<Units>) {

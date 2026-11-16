@@ -18,7 +18,7 @@
 //! The pinned core's `assert_unsafe_precondition!` (library/core/src/ub_checks.rs) expands, in
 //! the calling body, to a block that declares `const fn precondition_check($($name:$ty),*) {..}`
 //! and then calls `precondition_check($($arg,)*)`: `local_macro` is its shape, and
-//! `core::slice::from_raw_parts` (which calls it) is checked by its path.
+//! `core::ptr::read` and `core::ptr::write_bytes` (which call it) are checked by their paths.
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
@@ -71,7 +71,7 @@ const CLEAN: &[(&str, &str)] = &[
 const REFUSED: &[(&str, &str)] = &[("out_of_block", "UnresolvedPath")];
 
 /// Library fns that use `assert_unsafe_precondition!`, by path from their crate's root.
-const LIBRARY: &[(&str, &[&str])] = &[("core", &["slice", "from_raw_parts"])];
+const LIBRARY: &[(&str, &[&str])] = &[("core", &["ptr", "read"]), ("core", &["ptr", "write_bytes"])];
 
 #[test]
 fn items_inside_bodies_through_front2() {
@@ -90,7 +90,7 @@ fn items_inside_bodies_through_front2() {
     let find = |krate: usize, segments: &[&str]| {
         names::path(&names, names.root(krate), Namespace::Values, Written { kind: PathKind::Plain, segments }, Alloc::global())
             .ok()
-            .and_then(|f| f.whole(1))
+            .and_then(|f| f.whole(segments.len()))
             .map(|d| d.key)
             .unwrap_or_else(|| panic!("`{segments:?}` from crate {krate}'s root"))
     };

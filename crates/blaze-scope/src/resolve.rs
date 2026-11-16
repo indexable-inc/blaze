@@ -602,7 +602,7 @@ impl<'a> Names<'a> {
     /// `name` in `ns` of `module` (a module or an enum of any crate) as a reader of the
     /// finished scopes finds it: its own binding, else through its glob edges.
     pub fn lookup(&self, module: ItemKey, ns: Namespace, name: &'a str) -> Option<Binding> {
-        Built { crates: &self.slots, by_prefix: &self.by_prefix }.lookup(module, ns, name, self.alloc)
+        Built { crates: &self.slots, by_prefix: &self.by_prefix, asked: None }.lookup(module, ns, name, self.alloc)
     }
 
     /// [`crate::names::path`] with segments of any lifetime (a lowered body's view, an
@@ -749,7 +749,7 @@ pub fn resolve_crates_with<'a, S: SourceTexts<'a>, P: Par>(
     for wave in graph.waves() {
         for &id in wave {
             let done = {
-                let built = Built { crates: &finished, by_prefix: &by_prefix };
+                let built = Built { crates: &finished, by_prefix: &by_prefix, asked: None };
                 resolve_one::<S, P>(&graph, &crates[id.index()], id, id.index(), &built, sources, par, first, prepares, alloc)?
             };
             let done: &'a CrateNames<'a> = Box::leak(Box::new_in(done, alloc));
@@ -800,6 +800,9 @@ pub(crate) fn graph_of<'a>(crates: &[CrateInput<'a>], sysroot: Sysroot, alloc: A
 pub(crate) struct Built<'r, 'a> {
     pub(crate) crates: &'r [Option<Dep<'a>>],
     pub(crate) by_prefix: &'r HashMap<[u8; 8], usize, Alloc<'a>>,
+    /// Where each question asked of these crates is noted ([`crate::asked`]): a per-crate
+    /// solve's read list; `None` where nothing is kept.
+    pub(crate) asked: Option<&'r crate::asked::Asked<'a>>,
 }
 
 fn prefix(key: ItemKey) -> [u8; 8] {
@@ -815,6 +818,22 @@ impl<'r, 'a> Built<'r, 'a> {
 
     pub(crate) fn of(&self, key: ItemKey) -> Option<Dep<'a>> {
         self.at(*self.by_prefix.get(&prefix(key))?)
+    }
+
+    /// Notes a question asked of these crates (no-op where nothing is kept).
+    pub(crate) fn ask(&self, question: impl FnOnce() -> crate::asked::Question<'a>) {
+        if let Some(asked) = self.asked {
+            asked.push(question());
+        }
+    }
+
+    /// [`Built::ask`] for a read that may be no question ([`crate::asked::Question::of_read`]).
+    pub(crate) fn ask_maybe(&self, question: impl FnOnce() -> Option<crate::asked::Question<'a>>) {
+        if let Some(asked) = self.asked
+            && let Some(q) = question()
+        {
+            asked.push(q);
+        }
     }
 
     /// See [`Names::lookup`].
@@ -1110,12 +1129,16 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             alloc,
         };
         let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run } };
+        // The cell core on the same facts, timed by the caller's clock and compared, the report
+        // handed to the caller; the records stay the fill's.
         #[cfg(feature = "cells")]
-        let fill_start = std::time::Instant::now();
+        let seam = par.cells_seam().map(|seam| (seam, seam.now()));
         fill.run(&cx, par, &all);
-        // The cell core on the same facts, timed and compared; the records stay the fill's.
         #[cfg(feature = "cells")]
-        crate::cells::shadow(&cx.facts, built, input.name, tree.modules[0].key, &fill.done, fill_start.elapsed(), alloc);
+        if let Some((seam, fill_start)) = seam {
+            let old = seam.now().saturating_sub(fill_start);
+            seam.report(input.name, crate::cells::shadow(&cx.facts, built, tree.modules[0].key, &fill.done, old, seam, alloc));
+        }
     }
     let mut done = core::mem::replace(&mut fill.done, HashMap::new_in(alloc));
     let mut in_made: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::new_in(alloc);
@@ -1273,7 +1296,9 @@ fn root_plan<'a>(
         };
         let mut at = other.root();
         for segment in p.path {
-            match built.lookup(at, Namespace::Types, segment, alloc) {
+            let found = built.lookup(at, Namespace::Types, segment, alloc);
+            built.ask(|| crate::asked::Question::lookup(at, Namespace::Types, segment, found, alloc));
+            match found {
                 Some(b) if b.state == BindingState::Determined => at = b.def.key,
                 found => {
                     push_fmt(&mut why, format_args!("`{}", other.name()));
@@ -1450,6 +1475,14 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
         Held::Failed { krate: other.key(), chain: None }
     }
 
+    fn asked(&self, read: crate::read::Read<&'a str>, own: &crate::task::Own<'_, &'a str>) {
+        // Only a question of another crate's record is a read of the list; this crate's own
+        // modules are solved here.
+        if read.module().0.0[..8] != self.base.key.prefix() {
+            self.base.built.ask_maybe(|| crate::asked::Question::of_read(read, own, self.base.alloc));
+        }
+    }
+
     fn made(&self, out: &mut AVec<'_, ItemKey>) {
         let mut new = held(self.run.new_modules.lock(), "new modules");
         out.extend_from_slice(&new);
@@ -1461,7 +1494,11 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
         // so this crate's lowered tables or the defining crate's hold it.
         let src = match self.base.tables.macros.get(&derive) {
             Some(src) => *src,
-            None => self.base.built.of(derive)?.macro_of(derive)?,
+            None => {
+                let src = self.base.built.of(derive).and_then(|d| d.macro_of(derive));
+                self.base.built.ask(|| crate::asked::Question::macro_src(derive, src, self.base.alloc));
+                src?
+            }
         };
         match src.body {
             MacroBody::Proc { kind: ProcKind::Derive, helpers } => Some(helpers),
@@ -1687,7 +1724,11 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let (mac, def_krate, def_edition, runner) = match mac {
         Some(mac) => (Some(mac), base.key, base.edition, base.sources.proc_macro_key(base.index)),
         None => match base.built.of(def_key) {
-            Some(other) => (other.macro_of(def_key), other.key(), other.edition(), other.proc_key()),
+            Some(other) => {
+                let mac = other.macro_of(def_key);
+                base.built.ask(|| crate::asked::Question::macro_src(def_key, mac, alloc));
+                (mac, other.key(), other.edition(), other.proc_key())
+            }
             None => (None, base.key, base.edition, None),
         },
     };

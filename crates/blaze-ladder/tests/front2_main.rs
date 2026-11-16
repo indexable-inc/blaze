@@ -241,7 +241,7 @@ fn his_main_through_the_checker() {
     if let Some(b) = records.buckets.as_ref().filter(|_| std::env::var_os("FRONT2_DUMP").is_some()) {
         for (t, s, got) in b.answered() {
             let tn = records.keys.library(t).map_or_else(|| format!("{t:?}"), |k| shown(&names, &crate_names, k));
-            let cands = b.trait_candidates(t, s);
+            let cands = b.trait_candidates(t, s, b.home_of(t, s));
             out.push_str(&format!("ASKED {tn} at {s:?}: {} candidates, {} answer\n", cands.len(), got.len()));
             for k in cands.iter().take(12) {
                 let h = records.store.impls.get(&blaze_ladder::front2::keys::checker_of(*k));

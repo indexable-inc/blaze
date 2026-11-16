@@ -409,7 +409,6 @@ blaze-tar = { path = "crates/blaze-tar" }
 # blaze's own HTTP/1.1 client machine (no_std, sans-IO), and its driver over bstd's `Net` with a `Tls` seam.
 blaze-h1 = { path = "crates/blaze-h1" }
 blaze-url = { path = "crates/blaze-url" } # HostPort, Scheme, Origin, Url: checked addresses, the one home; bstd re-exports them.
-blaze-h1-net = { path = "crates/blaze-h1-net" }
 # A commit's files over git's smart HTTP protocol v2: pkt-lines, packs with deltas, SHA-1 object ids.
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }
 # blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).

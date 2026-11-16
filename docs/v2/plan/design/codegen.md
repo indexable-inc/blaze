@@ -402,6 +402,63 @@ which follow the supertrait's words); the whole shape hash would rekey every cal
 link resolves to today's vtable key. `size_of_val`, `align_of_val` and drop through an object read the
 fixed words 0 to 2. The cost of the finer form is one pass over the checked body before the build.
 
+## Closures and the Fn traits (2026-11-16)
+
+What exists in blaze-build (walk.rs, by search; the strings are the refusals each form hits):
+- A closure VALUE: not built. `repr` refuses its type (`TyErr::Unsupported("a closure")`) and the walk
+  its expression (`Expr::Closure` -> "a closure"). No environment struct, no closure body fn.
+- A DIRECT call of a closure value: refused by name, "a direct call of a closure".
+- A call of a fn POINTER: built (`call_pointer`, `call_indirect`); since today a "rust-call" pointer too.
+- A call through `Fn*` on a type parameter (`f(x)`, `F: Fn(u8) -> u8`): the checker hands a callee row
+  `Fn::call` (or `call_mut`/`call_once`) at `[F, (A,)]` and a `Borrow` adjustment on the callee
+  (typeck rules/call.rs `overloaded_call`); the arguments stay written apart. Built since today as a
+  call of that instance with the callee as `self` (walk.rs `call`, `overloaded`). NOT natively tested:
+  the world must resolve `Fn::call` at a concrete `F` (an impl, or a built-in shim: below).
+- The closure's kind is not in `Checked`: the checker derives it from `captures` (strongest of
+  `ByRef`/`ByMutRef`/`ByValue` -> `Fn`/`FnMut`/`FnOnce`, rules/closure.rs `analyze_closures`); the
+  builder must read it the same way or the checker must record it (one home: ask the checker).
+- `PNode::Closure(ExprId, sig)` names no owner item or parent arguments: as a ground type it cannot
+  key an instance across bodies. A closure's instance key needs (owner's code id, closure expr's
+  item-relative id, the owner instance's args): a checker/portable-type change, owed before shims.
+
+blaze's "rust-call" convention (rust-call is the compiler's own, not a stable ABI; core's
+library/core/src/ops/function.rs: `extern "rust-call" fn call_once(self, args: Args) -> Self::Output`):
+the last parameter, a tuple, crosses the call as its FIELDS, each a Rust-ABI parameter of its own,
+after the others (`self` first). A zero-sized tuple is nothing. The callee puts the tuple back in a slot
+of its own; a caller that wrote the tuple whole (`(**self).call(args)`) spreads it, field by field from
+its copy (an aggregate field by its address inside that copy); an overloaded call `f(a, b)` passes `a`
+and `b` as they are. So a call through the trait and a direct call of the same body agree, and a
+closure's body fn can take `(env, a, b)` with no repacking. Built: lib.rs `Abi::RustCall`, walk.rs
+`rust_pass`, `rust_call_fields`, `spread_tuple`, `run` (callee), `call` and `call_pointer` (callers).
+Test `a_rust_call_fn_takes_its_tuples_fields_as_parameters` (native 75321); with the caller's spread
+removed it fails: "the caller spreads too ... sig s1 = c (i32, ptr) -> (i32)".
+
+Not built, in order: (1) a closure's environment as a struct of its captures in capture order (`&T`,
+`&mut T` or `T` by `CaptureKind`), its body as a fn `(env by kind, args..)` of the rust-call shape;
+(2) the shims per instance, `Kind::Shim`: `call_once` on a `Fn`/`FnMut` closure borrows from the moved
+environment then drops it; a fn ITEM's shim calls the item (self is zero-sized); a fn POINTER's makes an
+indirect call; `impl<A, F: Fn<A>> Fn<A> for &F` and siblings are ordinary library impls; (3)
+`ClosureFnPointer`: a fn of the pointer's signature whose body is the closure's with an empty environment.
+
+The design (2026-11-16, built in blaze-build src/closure.rs, a child module of walk.rs):
+- ENVIRONMENT: a tuple with one field per capture in the checker's order (`Checked::captures`, sorted
+  by binding): `&T` for `ByRef`, `&mut T` for `ByMutRef`, `T` for `ByValue`; laid out by the walk's own
+  tuple layout (zero-sized when nothing is captured); its drop glue is the tuple's.
+- GROUND FORM: the checker's `Closure(e, sig)` names no owner and no captures, so the builder grounds it
+  self-describing: `Closure(e, (sig, env, FnDef(owner, owner_args), kind))`, `kind` a `u8` const value
+  (0 `Fn`, 1 `FnMut`, 2 `FnOnce`). Any body (a generic `apply<F>` at `F` = it) lays it out from the type
+  alone, and its instance key (owner, item-relative `e`, the owner's ground arguments) is unique across
+  bodies: the identity gap closed on the builder's side, as the brief's step 5 keys it.
+- KIND: the strongest capture (`ByRef` -> `Fn`, `ByMutRef` -> `FnMut`, `ByValue` -> `FnOnce`), the
+  checker's own rule (rules/closure.rs `analyze_closures`), until it records the kind.
+- BODY: the instance of the kind's own method (`Fn::call` / `FnMut::call_mut` / `FnOnce::call_once`) at
+  `[C, (A..)]`: `(&env | &mut env | env, a..)`, the rust-call shape, so a direct call `f(x)` and a call
+  through the trait reach the same code. Inside it a captured binding lives at its field (through the
+  field's pointer for a by-reference capture); by-value captures are owned by the body and dropped there.
+- ENTRIES: the weaker kinds' methods are thin instances of their own key over the body: `call_mut` on an
+  `Fn` closure passes its pointer on; `call_once` on an `Fn`/`FnMut` closure takes the environment by
+  value, calls the body with its address and drops it after.
+
 ## Queries
 
 The codegen query kinds are in [`query`](../../../../crates/blaze-codegen/src/query.rs), in

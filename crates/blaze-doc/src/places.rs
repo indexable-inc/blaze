@@ -70,9 +70,9 @@ pub(crate) struct Places {
     own: Vec<HashMap<ModuleDef, usize, Global>>,
     /// The page of an item of a crate not documented here, found once: on doc.rust-lang.org for
     /// the sysroot's crates, under its `html_root_url` for a crate that has one.
-    elsewhere: SharedMap<ModuleDef, Option<ItemRef>>,
+    elsewhere: SharedMap<ModuleDef, Option<ItemRef>, Global>,
     /// Each crate not documented here: its `html_root_url`.
-    roots: SharedMap<Crate, Option<String>>,
+    roots: SharedMap<Crate, Option<String>, Global>,
     test_only: TestOnly,
 }
 
@@ -482,8 +482,8 @@ pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Pl
         placed,
         canonical: canonical.into_iter().map(|(def, (_, at))| (def, at)).collect(),
         own,
-        elsewhere: SharedMap::default(),
-        roots: SharedMap::default(),
+        elsewhere: SharedMap::new_in(Global),
+        roots: SharedMap::new_in(Global),
         test_only,
     }
 }

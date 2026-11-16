@@ -331,15 +331,16 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
     /// `base`): bounds, where clauses and each own parameter's implied `Sized`; in a trait
     /// (`self_bounds` = `Some(Self)`) its supertraits (BOUNDS) on `Self` too. `where const`
     /// conditions go to `out.conds`.
-    /// The predicates of a fn's anonymous type parameters (`env.anon`, its `impl Trait`
-    /// parameter types): each one's bounds as written on it, and its implied `Sized` unless
-    /// `?Sized` is written, as for a declared type parameter.
-    pub fn anon_predicates(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, sized: Option<LibKey>, out: &mut Preds) -> Result<(), Why> {
-        for &(t, i) in env.anon {
+    /// The predicates of `impl Trait` types (`list`: each written type and the type it is:
+    /// an anonymous parameter `Param(i)` or an opaque `Opaque(k, ..)`): each one's bounds as
+    /// written on it with that type as `Self`, and its implied `Sized` unless `?Sized` is
+    /// written, as for a declared type parameter. One home for both positions: an opaque's
+    /// list is its own predicates (what the checker reads as `Predicates(k)`).
+    pub fn impl_bounds(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, list: &[(lf::TypeId, PTy)], sized: Option<LibKey>, out: &mut Preds) -> Result<(), Why> {
+        for &(t, me) in list {
             let lf::TypeRef::Impl(bounds) = v.ty(t)? else {
-                return Err(Why::Program(format!("anonymous parameter {i} is no `impl Trait` type").into_boxed_str(),place(v, v.type_range(t))?));
+                return Err(Why::Program("an `impl Trait` entry names no `impl Trait` type".into(), place(v, v.type_range(t))?));
             };
-            let me = intern(tys, PNode::Param(i))?;
             let mut stated = false;
             for &b in v.rows(bounds)? {
                 let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;

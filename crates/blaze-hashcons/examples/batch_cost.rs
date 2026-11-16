@@ -14,6 +14,7 @@
 //! `cargo run --release -p blaze-hashcons --example batch_cost`. The 10^7 rows hold about
 //! 600 MB (boxed entries and slots; nodes and indexes), one table at a time.
 
+use std::alloc::Global;
 use std::{hint::black_box, time::Instant};
 
 use blaze_hash::{SharedMap, shared::SHARED_BATCH};
@@ -86,7 +87,7 @@ impl Consed for Word {
     }
 }
 
-fn shared_batched<const B: usize>(map: &SharedMap<u64, u64>, queries: &[u64]) -> f64 {
+fn shared_batched<const B: usize>(map: &SharedMap<u64, u64, Global>, queries: &[u64]) -> f64 {
     let pinned = map.pin();
     best_ns(queries.len(), || {
         let mut found = 0;
@@ -139,7 +140,7 @@ fn main() {
         "table", "entries", "", "one", "4", "8", "16", "32", "64", "slice", "best/1", "/floor"
     );
     for n in [1_000u64, 100_000, 10_000_000] {
-        let map: SharedMap<u64, u64> = SharedMap::default();
+        let map: SharedMap<u64, u64, Global> = SharedMap::new_in(Global);
         {
             let pinned = map.pin();
             for at in 0..n {

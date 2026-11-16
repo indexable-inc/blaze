@@ -12,6 +12,13 @@
 //! implement a specific trait. Furthermore, anywhere a generic or trait object is bounded by a
 //! trait, it has access to the associated items of its supertraits." `#[derive(Clone)]` on a
 //! generic type writes `impl<T: Clone> Clone for Ty<T>` (core/src/clone.rs, "Derivable").
+//! tempo's "347 diag E0308" (`found &MCall, expected MCall`): alloy's `sol!` writes a function
+//! with no parameters as `#[derive(Clone)] pub struct MCall;` (alloy-sol-macro-expander
+//! expand/function.rs), and the derive writes `fn clone(&self) -> Self { match self { MCall =>
+//! MCall, } }`. The Reference, "Identifier patterns": "Path patterns take precedence over
+//! identifier patterns", and "Path patterns": a path to a unit struct is a pattern; so `MCall`
+//! there matches the struct (by default binding mode through `&MCall`), binds nothing, and the
+//! arm's `MCall` is the struct's value.
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_panics.rs.
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
@@ -186,4 +193,79 @@ fn clones_through_front2() {
     assert_eq!(derived, 4, "the four derived `clone` members were found");
     assert!(bodies.iter().any(|b| b.0.ends_with("::planted")), "`Fl::planted` was taken");
     assert!(failed.is_empty(), "bodies that must check clean did not: {failed:?}\n{}", notes.join("\n"));
+}
+
+/// tempo's "347 diag E0308" reduced: a function of a `sol!` interface with no parameters is
+/// `#[derive(Clone)] pub struct MCall;` (alloy-sol-macro-expander 1.7.3, expand/function.rs:
+/// `pub struct #call_name;`), and the derive writes `match self { MCall => MCall, }`.
+const UNIT: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+    Ok(())
+}
+#[derive(Clone)]
+pub struct MCall;
+#[derive(Clone)]
+pub struct NCall;
+#[derive(Clone)]
+pub enum Calls {
+    M(MCall),
+    N(NCall),
+}
+fn by_hand(a: &MCall) -> MCall { match a { MCall => MCall } }
+";
+
+/// The Reference, "Identifier patterns": "Path patterns take precedence over identifier
+/// patterns"; "Path patterns": a path to a unit struct is a pattern, and it matches through a
+/// reference by default binding mode ("Binding modes"). So `MCall` in `match self { MCall =>
+/// MCall }` binds nothing, and the arm's `MCall` is the unit struct's value: each body is clean.
+/// Today the lowering takes the pattern's `MCall` for a binding (blaze-lower's machine.rs makes
+/// it `Pat::Bind { candidate: true }`, and no step reads `candidate`), and the arm's `MCall`
+/// resolves to that binding: "found Some(\"&MCall\"), expected Some(\"MCall\")" for `by_hand`
+/// and both derived `clone`s. Owner: blaze-lower's scoped resolution ("Items inside bodies").
+#[test]
+#[ignore = "blaze-lower's scoped resolution does not turn a candidate binding into a path pattern yet (Items inside bodies lane)"]
+fn unit_struct_patterns_through_front2() {
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/unt/src/main.rs".to_string(), UNIT.to_string())];
+    let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
+    let user = UserCrate { name: "unt", dir: "/unt/", root: "/unt/src/main.rs", files: &files, edition };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: UNIT }];
+    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"));
+    let prepared = Prepares::new_in(Alloc::global());
+    let mut buckets = None;
+    let mut notes: Vec<String> = Vec::new();
+    let mut bodies = Vec::new();
+    let key = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["by_hand"] }, Alloc::global())
+        .ok()
+        .and_then(|f| f.whole(1))
+        .map(|d| d.key)
+        .expect("`by_hand` from the crate's root");
+    store.ensure(&names, &mut front.keys, Want::Fn(key)).unwrap_or_else(|e| panic!("by_hand: no head: {e:?}"));
+    bodies.push(("by_hand".to_string(), lower_fn(&names, prepared, &mut front.keys, &mut store, key).unwrap_or_else(|e| panic!("by_hand: {e}"))));
+    for (k, _, _) in names.items(0) {
+        let Some(header) = names.item_text(k).and_then(|t| t.impl_header) else { continue };
+        store.ensure(&names, &mut front.keys, Want::Impl(k)).unwrap_or_else(|e| panic!("impl `{header}`: no head: {e:?}"));
+        let Some(mk) = front.keys.filed_member(checker_of(k), MemberKind::Fn, "clone") else { continue };
+        let b = lower_member(&names, prepared, &mut front.keys, &mut store, mk).unwrap_or_else(|e| panic!("{header}: {e}"));
+        bodies.push((format!("<{header}>::clone"), b));
+    }
+    assert_eq!(bodies.len(), 4, "`by_hand` and the three derived `clone`s were taken");
+    for (name, body) in &bodies {
+        let view = body.lowered.view();
+        let spell = Spelling::of(&view).expect("spelling");
+        let scope = body.scope(&spell);
+        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+        match check_body(&mut records, body, &scope) {
+            Ok(done) if done.diags.is_empty() => {}
+            Ok(done) => notes.push(format!("{name}: Ok with {} diagnostics", done.diags.len())),
+            Err(CheckFail::Diags { diags, .. }) => notes.push(format!("{name}: diagnostics {diags:?}")),
+            Err(other) => notes.push(format!("{name}: {other:?}")),
+        }
+    }
+    assert!(notes.is_empty(), "bodies that must check clean did not:\n{}", notes.join("\n"));
 }

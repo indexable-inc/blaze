@@ -363,6 +363,11 @@ pub enum Abi {
     Rust,
     /// `extern "C"`.
     C,
+    /// `extern "rust-call"` (core's `Fn*::call*`): blaze's Rust ABI with the last parameter, a
+    /// tuple, crossing the call as its fields, each a Rust parameter of its own (codegen.md,
+    /// "Closures and the Fn traits"). Callers spread a written tuple the same way, so a call
+    /// through the trait and a direct call of the same fn agree.
+    RustCall,
 }
 
 /// One built function.

@@ -425,7 +425,47 @@ impl blaze_scope::crate_scope::ReadyHooks for Clock {
     }
 }
 
+/// The cell core's shadow seam (feature `cells`): the clock is the process's, from its first
+/// ask; each crate's typed report is printed here, the library prints nothing.
+#[cfg(feature = "cells")]
+struct PrintShadows;
+
+#[cfg(feature = "cells")]
+impl blaze_scope::CellsSeam for PrintShadows {
+    fn now(&self) -> Duration {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed()
+    }
+
+    fn report(&self, krate: &str, shadowed: Result<blaze_scope::CellsShadowed, blaze_scope::CellsRefused>) {
+        let s = match shadowed {
+            Ok(s) => s,
+            Err(refused) => {
+                eprintln!("cells seam: {krate}: refused: {refused:?}");
+                return;
+            }
+        };
+        for d in s.differ_first.iter() {
+            eprintln!("cells seam: {krate}: differ {:x} {:?}: old {:?}, cells {:?}", d.module, d.ns, d.old, d.cells);
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "cells seam: {krate}: old fill {:.2} ms, cells load {:.2} ms + solve {:.2} ms; bindings equal {}, differ {}, cells unknown {}; \
+             old errors {}, cells failed {}, outside {}, undecided {}; dep reads {}, dep absent {}; \
+             calls the fill did not expand {} (first {:?}); cells {}, stalls {}",
+            ms(s.old_fill), ms(s.cells_load), ms(s.cells_solve), s.equal, s.differ, s.unknown,
+            s.old_errors, s.failed, s.outside, s.undecided, s.dep_reads, s.dep_absent,
+            s.not_expanded, s.first_not_expanded, s.cells, s.stalls,
+        );
+    }
+}
+
 impl blaze_scope::task::Par for Threads {
+    #[cfg(feature = "cells")]
+    fn cells_seam(&self) -> Option<&dyn blaze_scope::CellsSeam> {
+        Some(&PrintShadows)
+    }
+
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
         if self.0 <= 1 {
             for at in 0..n {
@@ -486,12 +526,14 @@ struct KeptDir<'w> {
     found: AtomicUsize,
     /// Time inside `find`, summed over workers, and the checkout files it outlined there.
     find_ns: AtomicU64,
+    /// Bytes of the read lists written this run (blaze-scope's question-grain record).
+    read_bytes: AtomicU64,
     outlined: AtomicU64,
     /// By crate: why it was not found (`None`: found, or not asked).
     missed: Vec<std::sync::Mutex<Option<String>>>,
 }
 
-const KEPT_MAGIC: &[u8; 8] = b"BZKEPT2\0";
+const KEPT_MAGIC: &[u8; 8] = b"BZKEPT3\0";
 
 impl KeptDir<'_> {
     fn path(&self, krate: usize) -> PathBuf {
@@ -527,7 +569,7 @@ impl KeptDir<'_> {
         }
     }
 
-    fn miss(&self, krate: usize, why: String) -> Option<(&[u8], &[u8])> {
+    fn miss(&self, krate: usize, why: String) -> Option<(&[u8], &[u8], &[u8])> {
         *self.missed[krate].lock().unwrap_or_else(|p| panic!("crate {krate}'s miss lock was poisoned: {p}")) = Some(why);
         None
     }
@@ -563,7 +605,7 @@ impl<'b> KeptRead<'b> {
 }
 
 impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
-    fn find(&self, krate: usize, exports: &dyn Fn(usize) -> Option<blaze_id::ContentId>) -> Option<(&[u8], &[u8])> {
+    fn find(&self, krate: usize) -> Option<(&[u8], &[u8], &[u8])> {
         let start = Instant::now();
         let file = self.path(krate);
         let bytes: &'static [u8] = match std::fs::read(&file) {
@@ -584,20 +626,8 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
                 why = Some(format!("the surface of {path} moved"));
             }
         }
-        for _ in 0..r.u32("the read count") {
-            let key = blaze_id::CrateItemKey(blaze_id::ContentId(r.id("a crate key")));
-            let was = r.id("an exports digest");
-            if why.is_none() {
-                match self.by_key.get(&key) {
-                    None => why = Some("a crate it read is not in the graph".into()),
-                    Some(&g) => match exports(g) {
-                        None => why = Some(format!("`{}`'s exports not written yet", self.inputs[g].name)),
-                        Some(now) if now.0 != was => why = Some(format!("`{}`'s exports changed", self.inputs[g].name)),
-                        Some(_) => {}
-                    },
-                }
-            }
-        }
+        let len = r.u64("the read list length");
+        let read = r.take(len, "the read list");
         let len = r.u64("the exports length");
         let record = r.take(len, "the exports record");
         let len = r.u64("the inner length");
@@ -607,10 +637,24 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
             return self.miss(krate, why);
         }
         self.found.fetch_add(1, Ordering::Relaxed);
-        Some((record, inner))
+        Some((record, inner, read))
     }
 
-    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[(usize, blaze_id::ContentId)]) {
+    fn stale(&self, krate: usize, why: &blaze_scope::asked::Stale<'_>) {
+        use blaze_scope::asked::Stale;
+        self.found.fetch_sub(1, Ordering::Relaxed);
+        let why = match why {
+            Stale::NotInGraph(_) => "a crate it read is not in the graph".to_string(),
+            Stale::NotWritten(key) => format!("{key:?}'s exports not written yet"),
+            Stale::Answer { krate: g, kind, name, .. } => {
+                let dep = self.inputs.get(*g).map_or("?", |c| c.name);
+                format!("`{dep}`'s answer to a {kind:?} question changed (`{name}`)")
+            }
+        };
+        let _ = self.miss(krate, why);
+    }
+
+    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[u8]) {
         let files: Vec<&'static str> = self.texts.read[krate].lock().unwrap_or_else(|p| panic!("crate {krate}'s read list lock was poisoned: {p}")).clone();
         let mut out = Vec::with_capacity(64 + record.len() + inner.len());
         out.extend_from_slice(KEPT_MAGIC);
@@ -623,11 +667,9 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
             out.extend_from_slice(&self.stamp(path));
             out.extend_from_slice(&self.surface(krate, path));
         }
-        out.extend_from_slice(&(read.len() as u32).to_le_bytes());
-        for &(g, digest) in read {
-            out.extend_from_slice(&self.inputs[g].key.0.0);
-            out.extend_from_slice(&digest.0);
-        }
+        out.extend_from_slice(&(read.len() as u64).to_le_bytes());
+        out.extend_from_slice(read);
+        self.read_bytes.fetch_add(read.len() as u64, Ordering::Relaxed);
         out.extend_from_slice(&(record.len() as u64).to_le_bytes());
         out.extend_from_slice(record);
         out.extend_from_slice(&(inner.len() as u64).to_le_bytes());
@@ -1309,6 +1351,7 @@ fn main() {
                 by_key: inputs.iter().enumerate().map(|(i, c)| (c.key, i)).collect(),
                 found: AtomicUsize::new(0),
                 find_ns: AtomicU64::new(0),
+                read_bytes: AtomicU64::new(0),
                 outlined: AtomicU64::new(0),
                 missed: (0..inputs.len()).map(|_| std::sync::Mutex::new(None)).collect(),
             };
@@ -1339,6 +1382,7 @@ fn main() {
                 texts.files.load(Ordering::Relaxed),
                 max_footprint() as f64 / 1e6
             );
+            println!("threads {t}: read lists written this run: {} bytes", kept.read_bytes.load(Ordering::Relaxed));
             let mut whys: BTreeMap<String, Vec<&str>> = BTreeMap::new();
             for &i in &solved {
                 let why = kept.missed[i].lock().unwrap_or_else(|p| panic!("miss lock poisoned: {p}")).clone().unwrap_or_else(|| "not asked".into());

@@ -2,11 +2,10 @@
 //! as cargo 1.99's `RegistrySource` and `RegistryIndex` (`src/sources/registry/mod.rs`,
 //! `index/mod.rs`) have them.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    task::{Poll, Waker},
-};
+use std::alloc::Global;
+use std::{path::{Path, PathBuf},
+sync::Arc,
+task::{Poll, Waker},};
 
 use anyhow::{Context as _, bail};
 use blaze_core::lock::{Lock, LockGuard};
@@ -43,7 +42,7 @@ pub struct Registry {
     crate_dir: PathBuf,
     context: Arc<Context>,
     /// The index files read since the last update, or being read.
-    read: SharedMap<String, Arc<Read>>,
+    read: SharedMap<String, Arc<Read>, Global>,
 }
 
 /// One index file read once for every query that asks for it while it is read.
@@ -135,7 +134,7 @@ impl Registry {
             source,
             name,
             context,
-            read: SharedMap::default(),
+            read: SharedMap::new_in(Global),
         })
     }
 
@@ -150,7 +149,7 @@ impl Registry {
             source,
             name,
             context,
-            read: SharedMap::default(),
+            read: SharedMap::new_in(Global),
         }
     }
 

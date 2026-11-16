@@ -184,7 +184,10 @@ fn crate_by_crate_through_records_answers_as_the_whole_set_and_writes_equal_byte
 fn records_equal_across_workers_and_orders() {
     let crates = crates();
     let g = Alloc::global();
-    let bytes = |all: &[CrateScope<'static>]| all.iter().map(|c| (c.record.to_vec(), c.inner.to_vec())).collect::<Vec<_>>();
+    // The read list is a record too: its bytes are the same whatever order the fill asked in.
+    let bytes = |all: &[CrateScope<'static>]| {
+        all.iter().map(|c| (c.record.to_vec(), c.inner.to_vec(), crate::asked::encode(c.names.key, &[], &c.asked, g).to_vec())).collect::<Vec<_>>()
+    };
     for sysroot in [Sysroot::default(), Sysroot { core: Some(CrateId(2)), ..Sysroot::default() }] {
         let (one, _) = resolve_by_records(&crates, sysroot, &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("one worker: {e:?}"));
         let first = bytes(&one);
@@ -197,6 +200,7 @@ fn records_equal_across_workers_and_orders() {
             for (i, (a, b)) in first.iter().zip(other.iter()).enumerate() {
                 assert!(a.0 == b.0, "crate `{}`: exports differ, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
                 assert!(a.1 == b.1, "crate `{}`: inner differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
+                assert!(!a.2.is_empty() && a.2 == b.2, "crate `{}`: read list differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
             }
         }
     }
@@ -454,7 +458,7 @@ static TEXTS_SHUT: Texts = Texts(&[
 #[derive(Clone, Copy)]
 struct KeptSolve {
     text: &'static str,
-    read: &'static [(usize, ContentId)],
+    read: &'static [u8],
     record: &'static [u8],
     inner: &'static [u8],
 }
@@ -470,19 +474,19 @@ struct MemKept {
 }
 
 impl crate::crate_scope::Kept for MemKept {
-    fn find(&self, krate: usize, exports: &dyn Fn(usize) -> Option<ContentId>) -> Option<(&[u8], &[u8])> {
+    fn find(&self, krate: usize) -> Option<(&[u8], &[u8], &[u8])> {
         let solve = self.kept.lock().unwrap_or_else(|p| panic!("kept: {p}"))[krate]?;
         let now = *self.now.lock().unwrap_or_else(|p| panic!("now: {p}"));
-        let same = now.0[krate][0].1 == solve.text && solve.read.iter().all(|&(g, d)| exports(g) == Some(d));
-        same.then(|| {
+        (now.0[krate][0].1 == solve.text).then(|| {
             self.found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (solve.record, solve.inner)
+            (solve.record, solve.inner, solve.read)
         })
     }
 
-    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[(usize, ContentId)]) {
+    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[u8]) {
         let now = *self.now.lock().unwrap_or_else(|p| panic!("now: {p}"));
-        let read: &'static [(usize, ContentId)] = if self.planted { &[] } else { Vec::leak(read.to_vec()) };
+        let empty = crate::asked::encode(CrateItemKey(ContentId([0; 32])), &[], &[], Alloc::global());
+        let read: &'static [u8] = Vec::leak(if self.planted { empty.to_vec() } else { read.to_vec() });
         let solve = KeptSolve { text: now.0[krate][0].1, read, record: Vec::leak(record.to_vec()), inner: Vec::leak(inner.to_vec()) };
         self.kept.lock().unwrap_or_else(|p| panic!("kept: {p}"))[krate] = Some(solve);
     }

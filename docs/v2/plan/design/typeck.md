@@ -1537,6 +1537,34 @@ deduction (`deduce_sig`, `closure_hint`) and `normalize_fn_once_output` were rig
 lang item's name was not. The census's `FnOnce<(KvError)>` is a one-tuple: check.rs's printer
 writes a one-tuple without its comma.
 
+## A closure's identity (2026-11-16, closure identity lane)
+
+The Reference ("Closure types"): "A closure expression produces a closure value with a unique,
+anonymous type that cannot be written out"; the `Fn*` traits it implements follow from how it
+uses its captures ("Capture modes"); a closure in a generic item is generic over the item's
+parameters. blaze's portable form is `PNode::Closure { owner, ordinal, args }`:
+
+- `owner`: the `ItemKey` of the item whose body holds the closure expression.
+- `ordinal`: the closure's index among the body's `Expr::Closure`s in expression order (the
+  lowering's order, a function of the body's text alone). An edit above it may shift it; the
+  owner's key is from the body's text, so that edit changes the key and every record holding
+  the old ordinal is keyed by the old text anyway. Never an `ExprId` in a shared record.
+- `args`: the owner's generic arguments in scope (`Param(0..n)` in its own record), so `f::<u8>`
+  and `f::<u16>` make two closure types; instantiation substitutes them like any argument.
+
+The signature, the kind (`Fn`, `FnMut`, `FnOnce`: the strongest it implements) and the captures
+(each a binding and a mode: by shared reference, by mutable reference, by value) are not the
+type's identity: they are facts, decided when the owner's body is checked and stored in its
+`Checked::closures` (one row per closure, by ordinal: the expression, the kind, the signature as
+a `FnPtr`; the captures in `Checked::captures`). Another body or an instance that meets the type
+asks the world `Question::Closure(owner, ordinal)` (a body record, as an opaque's hidden type) and
+gets `ClosureFacts { kind, sig, captures, types }`, or a typed gap when the owner is unchecked.
+The checker lowers a foreign closure to `TyView::ClosureOf { owner, ordinal, args, sig, kind }`,
+its signature substituted by `args`; the solver sees rustc's layout `[args.., kind, sig, ()]`,
+so its `Fn*` rules read the signature and the kind from the type with no change. Inside the
+owner's body nothing changes: a closure is `TyView::Closure(expr, sig)` while its signature is
+inferred, and writeback names it by ordinal.
+
 ## Overloaded deref and `?` on the real world (2026-11-16, second checker lane)
 
 The rules (the Reference: "Method call expressions", "Field access expressions", "Type
@@ -1560,6 +1588,119 @@ toolchain (`Vec`, `Box`, `Rc`, `Arc` through `Deref`, one to three steps, `Deref
 of all, and six bodies that must be refused with their finding (a deref's target is the impl's
 `Target`, not a variable the context picks; no `From` for the error; `Option`'s residual in a
 `Result` fn). Before the fix eleven of its bodies failed with the census's findings.
+
+## Items inside bodies (2026-11-16)
+
+The Reference, "Statements", "Item declarations" (fetched 2026-11-16): "Declaring an item within a
+statement block restricts its scope to the block containing the statement. The item is not given a
+canonical path nor are any sub-items it may declare." "The exception to this is that associated
+items defined by implementations are still accessible in outer scopes ..." "There is no implicit
+capture of the containing function's generic parameters, parameters, and local variables."
+
+**The cause, proven.** crates/blaze-ladder/tests/front2_locals.rs checks bodies through the real
+front end. Before any fix every local-item body fails, each with the one finding the census counts:
+`local_fn: diagnostics [(UnresolvedPath, Range { start: 45, end: 50 }, ..)]`, the same for the call
+before the definition, a local `const`, a local struct with an inherent impl, a local `use`, and
+`local_macro` (the pinned core's `assert_unsafe_precondition!` shape: ub_checks.rs line 68 declares
+`const fn precondition_check($($name:$ty),*)` inside the expansion's block, line 78 calls it);
+`local_shadows` checks against the MODULE's `outer` (`Mismatch .. found Bool, expected u8`), which
+shows the module is asked before, and instead of, the block. The expansion lane's reading is right.
+
+**Who knows what, today.** The lowering already does its half: blaze-lower machine.rs
+`stmt_list` makes one `LocalItem` row (syntax kind, name, item-relative range, block scope) per item
+statement, macro-made ones included, and `Scope { parent, items }` per block; blaze-lower
+resolve.rs `local_item` walks that chain innermost first. front2 never reads them:
+world_items.rs `BodyWorld::resolve_path` drops its `ScopeId` and world_paths.rs `BodyWorld::path`
+asks only the names library at the body's module.
+
+**The design.**
+1. Identity (new file front2/locals.rs, this lane's): a local item's library key is
+   `blaze_scope::task::key_of(crate, enclosing_body_key, kind_tag, name, ordinal)` with
+   `ItemKey::INNER` set: the names library's own function for members (lower.rs line 1744), the
+   ordinal counted among the same (kind, name) in the enclosing body's `LocalItem` rows, which are in
+   text order: no dependence on the order bodies are checked in. Filed in `Keys` as `Origin::Item`.
+2. Resolution (world_paths.rs `path`, heads-ITEMS lane's file): `path` takes the `ScopeId`; the
+   first segment is looked up in the body's local items through the scope chain, innermost first
+   (one bounded loop, as blaze-lower's `local_item`), in the path's namespace, BEFORE `Self`-less
+   module lookup; nothing found: the names library at the module, unchanged. A local `use` is a row
+   whose tree is resolved at the module (paths inside it may name local items: same chain).
+3. Head (heads.rs `Store::step`, heads-ITEMS lane): `step` reads (detail, text, module) from the
+   names library; a local item's come from the store's local table instead. THE OPEN POINT: heads
+   borrow their text for `'n`, but a macro-made local item's text lives in the enclosing body's
+   lowering record (`Columns::expanded`), which `Body` owns and drops. Either the store copies the
+   item's text into an arena of its own lifetime, or heads stop borrowing text: the heads lane's
+   call. Its module is the enclosing fn's; types in its signature resolve through the same chain.
+4. Body: a local fn's body is lowered and checked as its own body (its own params, no outer
+   generics, by the Reference), on demand like any fn's.
+5. Impls: a local `impl` is visible crate-wide (associated-scope rule): the impl index learns of it
+   only when its enclosing body is lowered; until a crate-wide pass lists every body's local impls
+   (the names library's outline marks `body_holds_items`, the pass's candidates), a method found
+   only through a local impl from another body is a typed gap naming it.
+6. Forms not reached: `macro_rules!` in a block (textual scope, handled by the lowering's
+   expansion), a local `trait`, `static`, `union`: each a typed refusal naming the form.
+
+**Built.** The fixture (all failing, as quoted). **Next.** Items 1 to 3 for `fn` and `const` (the
+core macro's case, the 74 E0425 of census-gen-3 and the 275 of the owner's walk), then `use`,
+`struct`/`enum` with inherent impls, then item 5.
+
+## Speed on real code (2026-11-16)
+
+Stage one of D62, the checker's side. Measured with `crates/blaze-ladder/examples/check_speed.rs`
+on bstd, release, `--threads 1`, outputs in port27/speed-1116/ (bstd-2.txt before, bstd-3.txt
+after).
+
+**Counters.** asks.rs `Tally` is the ask log's summary form: the one seam (`Reads::record`)
+counts rounds (checks), questions by kind, missing answers, table conversions with entries
+converted, reached and offered, and splits a check's time into the world's answers, hashing
+them into the read list, and the rest; the caller passes the clock (`check_counted`;
+front2's `check_body_counted`). Before (bstd-2, load 18.68 at start): pass A "2300 bodies in
+90004.1 ms: 26 bodies/s", B "61 bodies/s"; A "rounds: 6294 checks for 2300 bodies; bodies by
+rounds 1:1298 2:353 3:163 4:140 5:93 6+:253"; A "questions: 1412447 (4054 missing), 224.4 per
+check"; A "table conversions 208705: entries converted 798380018 .. (3825 per conversion)";
+A "time in checks 88457.9 ms: world answers 1028.6 ms, hashing answers 57008.3 ms, the rest
+(walk, solver, conversions) 30421.1 ms". The world's answers cost 1%; hashing every answer's
+whole table into the read list cost 64%, converting it most of the rest.
+
+**What changed.** (1) `FactCache` converts from an answer's roots by a work list, each node
+once per check, into one table per check whose handles are absolute (an answer's portable
+is that table's prefix); a memo from (table, node) to the solver term lives in the
+`FactCache`, which lives for one check (`InferCtx`), so nothing outlives the call. A child
+after its parent is `Malformed::TypeOrder { node, child }`. (2) A record with a table
+(`world::Tabled`: trait, impl header, predicates, ADT, signature, opaque, const params) is
+hashed into the read list as the record without its table plus a Merkle digest of each term
+its handles reach (`Hashes`, memoized per run); the solver facts' digests reuse that entry
+(`Reads::digest`). (3) One walk order of a node's children (portable.rs `node_children`) for
+both. A table's identity in both memos is its address, valid because every answer is borrowed
+for the whole check; it is never part of a key or an output.
+
+After (bstd-3, tree 0c1585c054, load 29.07 before and 20.97 after): A "2300 bodies in
+2468.5 ms: 932 bodies/s (floor 71747/s: ratio 77.0x)", B "2871 bodies/s (.. ratio 25.0x)"; the
+same outcomes ("clean 2204; check refused .. 96"; "outcomes changed A->B: 0"); A "entries
+converted 114626; entries reached 348467; entries offered 798380018" (converted: 6,965 times
+fewer); A "time in checks 1883.1 ms: world answers 278.0 ms, hashing answers 140.6 ms, the
+rest .. 1464.5 ms". The edit loop: smallest clean body over the crate's table 4687.6 us before,
+51.4 us after (its own records' floor: 49.6 us, ratio 1.04); median 11259.2 us before, 151.2 us
+after (floor 136.5 us, ratio 1.11). front2_order (2 passed), front2_checks (1 passed) and
+blaze-typeck's suite (114 passed) held after each change.
+
+**What remains, by cost, and whose.** From bstd-3:
+1. Rounds (this lane's next step, not built): "first-pass extra (records made, extra rounds)
+   1667.5 ms (67.6%)" of pass A; "rounds: 6294 checks for 2300 bodies; bodies by rounds
+   1:1298 2:353 3:163 4:140 5:93 6+:253". A round stops at its first missing record
+   (`Reads::finish_need` returns that one plus the run's reads as hints), so 649 bodies take
+   three or more. Next: go on past a missing record with a hole where the walk can, and
+   return every need at once, so a cold body takes two rounds.
+2. The impl index per command (the front end's: buckets.rs): "Buckets::new alone .. 190.1
+   ms"; the smallest clean body cold is "check 192709.7 us" and "1484.5 us" with the buckets
+   prebuilt (130x).
+3. Member signatures built with their impl (the ITEMS heads lane): the median clean body cold
+   spends "container 30851.6 us" and makes "heads made 447 .. fns 345".
+4. The store bound to one thread (`Names` holds a thread-bound `Alloc`): "sync: Names false
+   ..; Store false"; on one thread "setup (toolchain+names+front2) 4331.7 ms" against "check
+   2688.1 ms" for the whole crate; every worker would redo it.
+5. Inside the checker, warm: B "the rest (walk, solver, conversions) 662.8 ms" of 796.6 ms,
+   203.3 questions per check, ratio 25.0x to the no-world floor: the next profile is the
+   solver's, not the world's (world answers 85.9 ms, hashing 47.9 ms).
 
 ## Not decided here
 

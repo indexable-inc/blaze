@@ -1,8 +1,8 @@
 //! blaze's own HTTP/1.1 client core, in place of `http` and `httparse`: no dependency but
 //! blaze-own, `no_std`, no IO. It writes requests ([`write_request`]), reads responses
 //! ([`Response`], fed in pieces), checks byte ranges ([`Response::ranged`]) and decides
-//! redirects ([`Follow`]). The connection, TLS and name lookup are a driver's: blaze-h1-net
-//! runs this over bstd's `Net`.
+//! redirects ([`Follow`]). The connection, TLS and name lookup are a driver's: bstd's
+//! `requests::Http::over` runs this over bstd's `Net` (D63).
 //!
 //! Trust: a response is held to its caller's [`Limits`] before it writes a byte past them;
 //! nothing here makes fetched bytes trusted. A record fetched by range is checked against its

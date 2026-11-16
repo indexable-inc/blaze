@@ -4,13 +4,12 @@
 //! and only when the index is to be updated. A registry that requires authentication gets the
 //! token of [`Auth`] in `Authorization` once `config.json` says so or answers 401.
 
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::alloc::Global;
+use std::{path::PathBuf,
+sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+},};
 
 use anyhow::{Context, bail};
 use blaze_core::lock::Lock;
@@ -55,7 +54,7 @@ pub struct SparseIndex {
     /// asked about is locked and found.
     update: AtomicBool,
     /// The files asked for since the index was last updated.
-    fresh: SharedSet<String>,
+    fresh: SharedSet<String, Global>,
     config: Lock<Option<RegistryConfig>>,
     auth: Option<Arc<Auth>>,
     /// The registry's name in the configuration, found once a token is first asked for.
@@ -95,7 +94,7 @@ impl SparseIndex {
             retry,
             offline,
             update: AtomicBool::new(false),
-            fresh: SharedSet::default(),
+            fresh: SharedSet::new_in(Global),
             config: Lock::new("registry.sparse.config", None),
             auth,
             name: Default::default(),

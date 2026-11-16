@@ -22,6 +22,8 @@ use crate::layout::{LayoutCx, LayoutError, LayoutId, Layouts, Prim, Refusal, Tai
 use crate::vtable::ObjectRead;
 use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
+mod strs;
+
 /// The target's pointer width: the ladder runs on AArch64.
 const PTR_BITS: u32 = 64;
 
@@ -704,7 +706,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             // A fn pointer is the code's address (lib.rs, "Fn pointers").
             PNode::FnPtr(..) => Repr::Ptr,
-            PNode::Char => return Err(TyErr::Unsupported("char")),
+            // strs.rs: "`char` ... has the same size and alignment as `u32`" (the Reference).
+            PNode::Char => Repr::Int { ty: Ty::I32, signed: false },
             PNode::Float(_) => return Err(TyErr::Unsupported("a float")),
             PNode::Str => return Err(TyErr::Unsupported("str")),
             PNode::Slice(_) => return Err(TyErr::Unsupported("a slice")),
@@ -2290,11 +2293,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         };
         let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
         let mut passes = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
-        for &t in sig.inputs {
+        // "rust-call": the last parameter, a tuple, arrives as its fields (lib.rs `Abi`).
+        let mut spread = Vec::new_in(self.alloc.clone());
+        for (i, &t) in sig.inputs.iter().enumerate() {
             let g = self.ground_in(sig.types, t).map_err(sig_err)?;
             let repr = self.repr(g).map_err(sig_err)?;
             reprs.push(repr);
-            passes.push(self.pass(g, repr, abi, Some(owner))?);
+            if abi == Abi::RustCall && i + 1 == sig.inputs.len() && kind == Kind::Body {
+                spread = self.rust_call_fields(repr)?;
+                for &(_, frepr) in spread.iter() {
+                    passes.push(Self::rust_pass(frepr)?);
+                }
+            } else {
+                passes.push(self.pass(g, repr, abi, Some(owner))?);
+            }
         }
         let g = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
         self.ret = self.repr(g).map_err(sig_err)?;
@@ -2343,6 +2355,26 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.scope_marks.push(0);
         for (i, &repr) in reprs.iter().enumerate() {
             let p = self.body.params[i];
+            if abi == Abi::RustCall && i + 1 == reprs.len() {
+                // The tuple is put back together in a slot of its own from its fields: each
+                // field's register is stored, an aggregate field copied from the caller's copy.
+                let v = if spread.is_empty() {
+                    V::None
+                } else {
+                    let at = self.temp(repr);
+                    for (j, &(off, frepr)) in spread.iter().enumerate() {
+                        let fv = self.take_passed(frepr, passes[i + j], &mut next)?;
+                        self.store(fv, frepr, (at.0, at.1 + off as i32))?;
+                    }
+                    V::Place(at.0, at.1)
+                };
+                match v {
+                    V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => self.bind_at(p, (at, off))?,
+                    v => self.bind_value(p, v)?,
+                }
+                self.own_pat(p)?;
+                continue;
+            }
             // The caller's copy (or the one a C parameter's registers are written to) is the
             // callee's to keep: a binding lives in it.
             match self.take_passed(repr, passes[i], &mut next)? {
@@ -2370,6 +2402,69 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
+    /// How a value held as `repr` crosses a call of the Rust ABI (lib.rs, "Rust ABI"): nothing
+    /// for a zero-sized value, an aggregate by the address of the caller's copy, a scalar in
+    /// one register.
+    fn rust_pass(repr: Repr) -> Result<Pass, BuildError> {
+        Ok(match repr {
+            Repr::None => Pass::Ignore,
+            Repr::Agg(_) => Pass::Ref,
+            _ => {
+                let ty = repr.scalar().ok_or(malformed("a scalar of no type"))?;
+                Pass::Scalar { ty, ext: abi_param(repr, ty).ext, agg: false }
+            }
+        })
+    }
+
+    /// The fields of a "rust-call" fn's last parameter, a tuple held as `repr`, by their
+    /// offsets and reprs (codegen.md, "Closures and the Fn traits"). A zero-sized tuple has
+    /// none: it crosses the call as nothing.
+    fn rust_call_fields(&self, repr: Repr) -> Result<Vec<(u32, Repr), A>, BuildError> {
+        let mut out = Vec::new_in(self.alloc.clone());
+        let l = match repr {
+            Repr::None => return Ok(out),
+            Repr::Agg(l) => l,
+            _ => return Err(malformed("a \"rust-call\" fn's last parameter is not a tuple")),
+        };
+        let Shape::Fields { first, len } = self.layouts[l as usize].shape else {
+            return Err(malformed("a \"rust-call\" fn's last parameter is not a tuple"));
+        };
+        out.reserve(len as usize);
+        for j in first..first + len {
+            let (_, off, repr) = *self.layout_fields.get(j as usize).ok_or(malformed("a tuple's field past its layout"))?;
+            out.push((off, repr));
+        }
+        Ok(out)
+    }
+
+    /// A call of a "rust-call" fn whose last argument is written as one tuple value (core's
+    /// `(**self).call(args)`): that value, on top of the stack, is replaced by its fields, and
+    /// its repr and pass in `reprs` and `passes` by theirs. A field of an aggregate is passed by
+    /// its address inside the tuple: the tuple is the caller's copy already.
+    fn spread_tuple(&mut self, reprs: &mut Vec<Repr, A>, passes: &mut Vec<Pass, A>) -> Result<(), BuildError> {
+        let lost = || malformed("a \"rust-call\" call without its tuple of arguments");
+        let repr = reprs.pop().ok_or_else(lost)?;
+        passes.pop().ok_or_else(lost)?;
+        let v = self.vals.pop().ok_or_else(lost)?;
+        let fields = self.rust_call_fields(repr)?;
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let at = self.place(v, repr)?;
+        for &(off, frepr) in fields.iter() {
+            let to = (at.0, at.1 + off as i32);
+            let fv = match frepr {
+                Repr::None => V::None,
+                Repr::Agg(_) => V::Place(to.0, to.1),
+                _ => self.load(frepr, to),
+            };
+            self.vals.push(fv);
+            reprs.push(frepr);
+            passes.push(Self::rust_pass(frepr)?);
+        }
+        Ok(())
+    }
+
     /// How a value of ground type `g`, held as `repr`, crosses a call of `abi` (lib.rs, "Rust
     /// ABI" and "The C ABI"); `item` is the fn a C refusal names (`None` through a pointer).
     fn pass(&mut self, g: PTy, repr: Repr, abi: Abi, item: Option<ItemKey>) -> Result<Pass, BuildError> {
@@ -2377,12 +2472,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let ty = repr.scalar().ok_or(malformed("a scalar of no type"))?;
             Ok(Pass::Scalar { ty, ext: abi_param(repr, ty).ext, agg: false })
         };
-        if abi == Abi::Rust {
-            return match repr {
-                Repr::None => Ok(Pass::Ignore),
-                Repr::Agg(_) => Ok(Pass::Ref),
-                _ => scalar(repr),
-            };
+        // "rust-call" passes each parameter (its tuple's fields too) as the Rust ABI does.
+        if let Abi::Rust | Abi::RustCall = abi {
+            return Self::rust_pass(repr);
         }
         let refuse = |why| BuildError::CAbi { item, why };
         let adts = self.adts;
@@ -4053,7 +4145,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::ConstBlock { .. } => return Err(unsupported(e, "a const block")),
             // Its value is the container's layout: a field's offset, which the code builder
             // does not compute yet.
-            Expr::OffsetOf { .. } => return Err(unsupported(e, "`offset_of!` (a field's offset from the layout)")),
+            Expr::OffsetOf { ty, fields } => {
+                let v = self.offset_of(e, ty, fields)?;
+                self.vals.push(v);
+            }
             Expr::Match { scrutinee, .. } => {
                 self.work.push(Task::Match(e));
                 // A local that needs drop is a place expression: matched in place, not moved
@@ -4125,7 +4220,24 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         self.work.push(Task::Eval(callee));
                         return Ok(());
                     }
-                    _ => return Err(unsupported(e, "a call of other than a fn item or a fn pointer (a closure)")),
+                    // A closure called directly: its body is not built yet (codegen.md,
+                    // "Closures and the Fn traits").
+                    PNode::Closure(..) => return Err(unsupported(e, "a direct call of a closure")),
+                    // An overloaded call through `Fn*` (the checker's callee row): the callee is
+                    // `self`, evaluated with its adjustments (the borrow of `call`/`call_mut`),
+                    // then the arguments, each a field of the method's tuple (lib.rs
+                    // `Abi::RustCall`).
+                    _ if self.checked.callees.column::<0>().contains(&e) => {
+                        self.work.push(Task::Call(e));
+                        for &a in list.iter().rev().chain([&callee]) {
+                            if let Repr::Agg(_) = self.adjusted_repr(a)? {
+                                self.work.push(Task::ArgCopy(a));
+                            }
+                            self.work.push(Task::Eval(a));
+                        }
+                        return Ok(());
+                    }
+                    _ => return Err(unsupported(e, "a call of other than a fn item, a fn pointer or a `Fn*` impl")),
                 };
                 // A tuple struct's or tuple variant's ctor: the value built in place.
                 if let Some(Def::Ctor { variant, kind: CtorKind::Tuple, .. }) = self.expr_def(callee) {
@@ -4338,10 +4450,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.vals.push(V::Place(at.0, at.1));
                 return Ok(());
             }
-            // Owed to the code builder's lane: a wide pointer over the bytes and their NUL, as
-            // blaze-consteval builds it (machine/code.rs, `Lit::CStr`).
-            Lit::CStr => return Err(unsupported(e, "a C string literal")),
-            Lit::Char => return Err(unsupported(e, "a char literal")),
+            // strs.rs: a wide pointer over the bytes and their nul; a `char` as its `u32`.
+            Lit::CStr | Lit::Char => {
+                let v = if matches!(lit, Lit::CStr) { self.c_str_lit(e)? } else { self.char_lit(e)? };
+                self.vals.push(v);
+                return Ok(());
+            }
             Lit::Float(_) => return Err(unsupported(e, "a float literal")),
         };
         self.vals.push(V::Scalar(v));
@@ -4482,14 +4596,30 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // The arguments in order (a method's receiver first) and the callee instance: its item
         // and its call's arguments, grounded at this instance's.
         let mut list = Vec::new_in(self.alloc.clone());
+        // An overloaded call (`f(x)` through `Fn*`): its arguments are written apart already,
+        // the fields of the trait method's tuple, so none is spread.
+        let mut overloaded = false;
         let instance = match self.expr(e)? {
             Expr::Call { callee, args } => {
-                list.extend_from_slice(self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?);
+                let written = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
                 let t = self.adjusted_ty(callee)?;
                 match self.node_at(callee, t)? {
-                    PNode::FnDef(item, args) => Instance { item, args },
-                    PNode::FnPtr(_, header) => return self.call_pointer(e, &list, header.abi),
-                    _ => return Err(malformed("a call whose callee is not a fn item or a fn pointer")),
+                    PNode::FnDef(item, args) => {
+                        list.extend_from_slice(written);
+                        Instance { item, args }
+                    }
+                    PNode::FnPtr(_, header) => {
+                        list.extend_from_slice(written);
+                        return self.call_pointer(e, &list, header.abi);
+                    }
+                    // The checker's `Fn*::call*` at `[callee's type, tuple of the arguments]`,
+                    // the callee (adjusted: borrowed for `call` and `call_mut`) its `self`.
+                    _ => {
+                        overloaded = true;
+                        list.push(callee);
+                        list.extend_from_slice(written);
+                        self.method_callee(e)?
+                    }
                 }
             }
             Expr::MethodCall { receiver, args, .. } => {
@@ -4500,6 +4630,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             _ => return Err(malformed("a call task on another expression")),
         };
         if let Some((_, slot)) = self.dyn_slot(e, instance)? {
+            if !overloaded && self.adts.abi(instance.item) == Some(Abi::RustCall) {
+                return Err(unsupported(e, "a \"rust-call\" method of a trait object called with its tuple written whole (not spread yet)"));
+            }
             return self.dyn_call(e, instance, &list, slot);
         }
         let item = instance.item;
@@ -4513,6 +4646,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let repr = self.repr_at(a, t)?;
             reprs.push(repr);
             passes.push(self.pass(g, repr, abi, Some(item))?);
+        }
+        if abi == Abi::RustCall && !overloaded {
+            self.spread_tuple(&mut reprs, &mut passes)?;
         }
         let ty = self.expr_ty(e)?;
         let g = self.ground_ty(ty).map_err(|error| Self::ty_err(e, error))?;
@@ -4639,10 +4775,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let abi = match abi {
             blaze_typeck::Abi::Rust => Abi::Rust,
             blaze_typeck::Abi::C => Abi::C,
-            // Its last parameter is a tuple spread at the ABI level: not built yet.
-            blaze_typeck::Abi::RustCall => {
-                return Err(unsupported(e, "a call through a fn pointer of the \"rust-call\" ABI (its tuple of arguments is not spread yet)"));
-            }
+            // Its written tuple is spread below, as for a direct call (lib.rs `Abi::RustCall`).
+            blaze_typeck::Abi::RustCall => Abi::RustCall,
             _ => return Err(unsupported(e, "a call through a fn pointer of an ABI other than \"Rust\" and \"C\"")),
         };
         let n = list.len();
@@ -4655,12 +4789,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             reprs.push(repr);
             passes.push(self.pass(g, repr, abi, None)?);
         }
+        if abi == Abi::RustCall {
+            self.spread_tuple(&mut reprs, &mut passes)?;
+        }
         let ty = self.expr_ty(e)?;
         let g = self.ground_ty(ty).map_err(|error| Self::ty_err(e, error))?;
         let rrepr = self.repr_at(e, ty)?;
         let rpass = self.pass(g, rrepr, abi, None)?;
-        // The pointer is under the arguments: taken out, so the arguments are the top `n`.
-        let at = self.vals.len().checked_sub(n + 1).ok_or(malformed("a call's pointer missing from the value stack (a build bug)"))?;
+        // The pointer is under the arguments: taken out, so the arguments are the top ones.
+        let at = self.vals.len().checked_sub(reprs.len() + 1).ok_or(malformed("a call's pointer missing from the value stack (a build bug)"))?;
         let p = self.vals.remove(at);
         let p = self.scalar(p, Ty::PTR)?;
         self.emit_call(Callee::Pointer(p), &reprs, &passes, rrepr, rpass)?;
@@ -4701,7 +4838,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     out.push(u128::from(b));
                     Ok(false)
                 }
-                Pat::Lit(Lit::Int(_)) | Pat::NegLit(Lit::Int(_)) => {
+                Pat::Lit(Lit::Int(_) | Lit::Char) | Pat::NegLit(Lit::Int(_)) => {
                     let v = w.adts.int_pat(w.body.owner, alt).ok_or(BuildError::NoPatValue { pat: alt })?;
                     if mask(v, width) != v {
                         return Err(BuildError::UnsupportedPat { pat: alt, what: "an integer literal past its type's width" });

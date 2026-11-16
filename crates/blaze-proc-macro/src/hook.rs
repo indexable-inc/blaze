@@ -203,10 +203,11 @@ impl<'r> ProcMacros<'r> {
     /// load is reported once, as its first call would. Gives how many modules were compiled
     /// (the rest came from their compiled records).
     pub fn load_all(&self, workers: usize) -> Result<u64, RuntimeError> {
-        let with: Vec<&MacroCrate> = self.crates.iter().filter(|it| it.module.is_ok()).collect();
-        let modules: Vec<&ModuleRecord> = with.iter().filter_map(|it| it.module.as_ref().ok()).collect();
+        // The crates with a module, in the order `modules` lists theirs: the loads come back so.
+        let modules: Vec<&ModuleRecord> = self.crates.iter().filter_map(|it| it.module.as_ref().ok()).collect();
         let before = self.runtime.compiles();
-        for (macro_crate, loaded) in with.iter().zip(self.runtime.load_all(&modules, workers)?) {
+        let with = self.crates.iter().filter(|it| it.module.is_ok());
+        for (macro_crate, loaded) in with.zip(self.runtime.load_all(&modules, workers)?) {
             if let Err(error) = loaded
                 && !macro_crate.reported.swap(true, Ordering::Relaxed)
             {

@@ -31,6 +31,9 @@ use std::{
 
 use blaze_hash::SharedMap;
 
+// The global heap, as the driver names it: these tables live as long as the build.
+use super::Global;
+
 use blaze_core::lock::Lock;
 
 use super::{
@@ -52,7 +55,7 @@ pub struct Kept<I, S> {
     /// ID and its entries, which the next build's [`super::Delta`] is made against. Of a
     /// build that is not kept by row (`lists`): a lazy one, one with a folded or release
     /// function.
-    built: SharedMap<u64, Arc<Last>>,
+    built: SharedMap<u64, Arc<Last>, Global>,
     /// Each program's last `Built` by row ([`Lists`]), by the [`program`] its walk is kept
     /// under: taken by the build that patches it, as its walk is.
     lists: Lock<std::collections::HashMap<u64, Lists>>,
@@ -63,7 +66,7 @@ impl<I: Eq + Hash, S> Default for Kept<I, S> {
         Kept {
             // alloc: none until a walk is kept
             walks: Lock::new("codegen.driver.kept_walks", std::collections::HashMap::new()),
-            built: SharedMap::default(),
+            built: SharedMap::new_in(Global),
             // alloc: none until a build's lists are kept
             lists: Lock::new("codegen.driver.kept_lists", std::collections::HashMap::new()),
         }

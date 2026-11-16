@@ -1,9 +1,10 @@
 //! The origin over HTTP is the folder origin's equal: the same signed origin, published into a
 //! folder of bstd's simulated world and served from it over the simulated network by a tiny
 //! server with range support, gives byte-equal records through `FolderOrigin` and through
-//! `HttpOrigin` (blaze-h1-net on bstd's `Net`). A server that lies (one payload byte flipped in
+//! `HttpOrigin` (bstd's `Http` on its `Net`). A server that lies (one payload byte flipped in
 //! every segment it serves) gives no record: the read path's digest chain refuses each, and
-//! nothing wrong is taken.
+//! nothing wrong is taken. One lane plays both ends: each ask's request is sent, the server
+//! answers it, then its answer is read (`HttpOrigin::read_with`, bstd's begin/finish split).
 
 use std::{alloc::Global, collections::BTreeMap, format, string::String, vec::Vec as StdVec};
 
@@ -11,7 +12,7 @@ use blaze_cas::plain::{Namespace, seal_segment};
 use blaze_ids::ContentId;
 use blaze_keyed::{exec::RecordRef, kind::Tag};
 use blaze_own::Erased;
-use blaze_remote::read::{Answer, Limits, Reader, fetch, publish};
+use blaze_remote::read::{Answer, Limits, Object, Origin, OriginError, Reader, fetch, publish};
 use blaze_remote::trust::Signer;
 use bstd::{
     Io,
@@ -64,19 +65,37 @@ fn request(cx: &Cx, conn: &Conn) -> Result<(String, u64, u64), String> {
     Err(String::from("harness: no whole request"))
 }
 
-/// Serves `folder`'s files under `/o/` with ranges, one request a connection, until no client
-/// comes for a minute of the world's clock; a liar flips the first byte of every `seg-` reply.
-fn serve(cx: &Cx, clock: &bstd::clock::Clock, listener: &mut Listener, folder: &Dir<ReadWrite>, lies: bool) -> Result<u32, String> {
-    let mut served = 0;
-    for _ in 0..256 {
-        let waiting = cx.until(clock.after(Duration::from_secs(60)));
-        let Ok(conn) = listener.accept(&waiting) else { return Ok(served) };
-        let answered = answer(cx, &conn, folder, lies);
-        let _ = conn.finish(cx);
-        answered?;
-        served += 1;
+/// One request served from `folder`'s files under `/o/`, with ranges, on the next connection; a
+/// liar flips the first byte of every `seg-` reply.
+fn serve(cx: &Cx, listener: &mut Listener, folder: &Dir<ReadWrite>, lies: bool) -> Result<(), String> {
+    let conn = listener.accept(cx).map_err(|e| format!("harness: accept: {e}"))?;
+    let answered = answer(cx, &conn, folder, lies);
+    let finished = conn.finish(cx);
+    answered?;
+    finished.map_err(|e| format!("harness: the server's finish: {e}"))
+}
+
+/// `HttpOrigin` with the test's server answering each ask between its send and its read.
+struct Served<'t> {
+    origin: HttpOrigin<'t>,
+    listener: &'t mut Listener,
+    folder: &'t Dir<ReadWrite>,
+    lies: bool,
+    served: u32,
+    failed: Option<String>,
+}
+
+impl Origin for Served<'_> {
+    fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        let Served { origin, listener, folder, lies, served, failed } = self;
+        let mut outcome = Ok(());
+        let read = origin.read_with(object, at, into, deadline_ns, |cx| outcome = serve(cx, listener, folder, *lies));
+        match outcome {
+            Ok(()) => *served += 1,
+            Err(why) => *failed = Some(why),
+        }
+        read
     }
-    Err(String::from("harness: more than 256 requests"))
 }
 
 fn answer(cx: &Cx, conn: &Conn, folder: &Dir<ReadWrite>, lies: bool) -> Result<(), String> {
@@ -141,16 +160,12 @@ fn both(lies: bool) -> (StdVec<Option<StdVec<u8>>>, StdVec<Option<StdVec<u8>>>, 
     let mut listener = net.listen(&cx, &addr).expect("a listener");
     let at = HttpAt::of(&format!("http://{}:{}/o/", AT.0, AT.1), &net).expect("an http origin");
     let mut by_http = Reader::new_in(Namespace::PUBLIC, &check, Limits::DEFAULT, global.handle());
-    let served = cx
-        .scope_with(|s| {
-            let server = s.may_overlap("origin server", TASK_FRAME, |cx| serve(cx, &clock, &mut listener, &folder, lies));
-            let fetched = fetch(&mut by_http, &mut HttpOrigin::new(s.cx(), &at), &mut now, &keys, global.handle());
-            (fetched, server.join(s.cx()))
-        })
-        .expect("the scope");
+    let mut served = Served { origin: HttpOrigin::new(&cx, &at, &clock), listener: &mut listener, folder: &folder, lies, served: 0, failed: None };
+    let fetched = fetch(&mut by_http, &mut served, &mut now, &keys, global.handle());
+    let (requests, failed) = (served.served, served.failed.take());
     let _ = listener.close(&cx);
-    served.0.expect("a batch");
-    let requests = served.1.expect("the server");
+    fetched.expect("a batch");
+    assert_eq!(failed, None, "the test's server");
     std::eprintln!("http origin: {requests} ranged GETs served (lies: {lies})");
     (folder_found, read(&by_http), truth)
 }

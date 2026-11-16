@@ -357,7 +357,30 @@ blaze-h1-net, the only driver on `Net` with ranges.
 **Built here: the origin over HTTP is an adapter.** blaze-cli store.rs `HttpOrigin` implements
 `Origin` with blaze-h1-net `Client::send`: a ranged GET of `<base>/<digest-hex name>` per ask,
 `Limits.most_body` the ask's length, redirects `most: 0` (a 3xx is `RedirectsOver`), the
-ask's deadline as `cx.until`, `Net::connect_only(origin)`; `--origin http://host:port/prefix`.
+ask's deadline as `cx.until`, `Net::connect_only(origin)`; `--origin http://host:port/prefix`
+(`https://` refused by name: blaze-h1-net has `NoTls` only). main.rs passes `io.net()`.
+
+**Handing on (third runner, ~11:00).** Written, compiles (`lanecheck blaze-h1-net`: "check ok
+(all targets)"): the adapter above; blaze-h1-net's planted bug (`plant.rs`, the `ranged` call
+skipped) and its simulation `tests.rs` (eight servers: honest in tape-drawn pieces, stalls,
+closes early, wrong range, wrong length, longer than promised, redirect, 404, each refused by
+the name its oracle says). NOT PASSING: "0 passed, 2 failed": in `Io::sim` a `may_overlap`
+server task does not run while the main lane blocks (its accept never completes; listening
+inside the task gives the client "nothing listens there"). `Client::send` is one blocking call,
+so the test needs either the sim's tasks to interleave (ask the effect-layer owner how bstd's
+sim runs a task beside a blocked lane) or `send` split into begin/finish as bstd
+`Http::over`'s `Exchange` is (its test, blaze-std/src/tests/requests.rs, interleaves by hand).
+Same blocker for `crates/blaze-cli/src/store_http_tests.rs` (folder vs HTTP byte-equality and
+the lying server), written and NOT wired: its `mod` line was taken out of store.rs to keep
+blaze-cli's suite green; put back `#[cfg(test)] #[path = "store_http_tests.rs"] mod
+http_tests;` once the server can run. blaze-cli's check: blaze-typeck (another lane) was red
+under it; on the green mix: "mixcheck blaze-cli: check ok (all targets) at 10:53; tree
+1d76b82d5a". Not done: step 4 (measure: exp2.sh e3/e4, then
+the HTTP origin cold run) and the TLS proposal; for TLS the facts: blaze-http's `Client` speaks
+rustls sans-IO with roots from `blaze_core::trust::system`; blaze-h1-net has the `Tls` seam
+only; bstd `Net::roots` gives `blaze_core::trust::Roots`. Moving blaze-fetch: replace blaze-cli
+fetch.rs:418-571 (`Handle::spawn`, `mailbox::block_on`) with the one driver on `Net` once the
+coordinator picks the home above.
 
 ## Not built
 

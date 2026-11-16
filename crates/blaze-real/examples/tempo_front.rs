@@ -511,7 +511,7 @@ fn print_table(out: &mut String, title: &str, t: &Table, std_text: &str, owner: 
 // ---------------------------------------------------------------------------------------------
 // Heads.
 
-fn heads<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, cname: &str, cap: usize, std_heads: &str, out: &mut String) {
+fn heads<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, cname: &str, cap: usize, std_heads: &str, out: &mut String) -> f64 {
     let start = Instant::now();
     let resolver = front.resolver;
     let cn = names.krate(krate);
@@ -679,6 +679,7 @@ fn heads<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, cname: 
         }
     }
     print_table(out, "HEAD REFUSALS", &classes, std_heads, &|c, f| format!("raised in {f}; {}", head_owner(c, f)));
+    start.elapsed().as_secs_f64()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -965,6 +966,38 @@ fn bodies<'n>(
         widest.iter().take(3).collect::<Vec<_>>(),
         r0.elapsed().as_secs_f64()
     ));
+    (pass_s, r0.elapsed().as_secs_f64())
+}
+
+/// An impl that stops bodies as an unread or refused candidate.
+struct Blocker {
+    bodies: usize,
+    /// Bodies whose only gaps are such impls.
+    only: usize,
+    /// Its gap's text in full.
+    text: String,
+    crates: BTreeSet<String>,
+    first: String,
+}
+
+/// The blocking impls, most bodies first, each with its crate, place and refusal in full.
+fn print_blockers(names: &Names<'_>, title: &str, blockers: &BTreeMap<blaze_id::ItemKey, Blocker>) -> String {
+    let mut bs: Vec<_> = blockers.iter().collect();
+    bs.sort_by(|a, b| b.1.bodies.cmp(&a.1.bodies).then_with(|| a.0.cmp(b.0)));
+    let mut out = format!("{title}: {} impls block bodies, most first:\n", bs.len());
+    for (k, b) in bs {
+        let (cr, place) = match (names.crate_of(*k), names.item_text(*k)) {
+            (Some(c), Some(t)) => (names.krate(c).name.to_string(), place_of(names, c, *k, t.text).3),
+            (Some(c), None) => (names.krate(c).name.to_string(), "(no text)".to_string()),
+            _ => ("?".to_string(), "?".to_string()),
+        };
+        let header = names.item_text(*k).and_then(|t| t.impl_header).map_or_else(|| "(no header text)".to_string(), |h| short(h, 120));
+        out.push_str(&format!(
+            "{:6} bodies ({} only by impls) in {:?}: impl {k:x} of crate {cr} at {place}: `{header}`\n         first blocked: {}\n         gap: {}\n",
+            b.bodies, b.only, b.crates, b.first, b.text
+        ));
+    }
+    out
 }
 
 fn main() {
@@ -996,7 +1029,10 @@ fn main() {
         }
     };
     let names: &'static Names<'static> = loaded.names;
-    println!("names: {} crates in {:.1}s (resolve {:.1}s); {}", names.crates().len(), t0.elapsed().as_secs_f64(), loaded.resolve_ms / 1e3, mem());
+    let names_s = t0.elapsed().as_secs_f64();
+    let names_mb = LIVE.load(Ordering::Relaxed) as f64 / 1e6;
+    println!("names: {} crates in {names_s:.1}s (resolve {:.1}s); {}", names.crates().len(), loaded.resolve_ms / 1e3, mem());
+    let mut blockers: BTreeMap<blaze_id::ItemKey, Blocker> = BTreeMap::new();
     let t1 = Instant::now();
     let mut front = match Front2::new(names, &[]) {
         Ok(f) => f,
@@ -1015,8 +1051,21 @@ fn main() {
         for k in ks {
             let c0 = Instant::now();
             let mut out = String::new();
-            heads(names, &mut front, k, want, cap, &std_heads, &mut out);
-            bodies(names, &mut front, k, want, cap, reach, secs, &std_census, &mut out);
+            let heads_s = heads(names, &mut front, k, want, cap, &std_heads, &mut out);
+            let mut mine: BTreeMap<blaze_id::ItemKey, Blocker> = BTreeMap::new();
+            let (bodies_s, reach_s) = bodies(names, &mut front, k, want, cap, reach, secs, &std_census, &mut mine, &mut out);
+            out.push_str(&print_blockers(names, &format!("BLOCKING IMPLS {want}"), &mine));
+            for (key, b) in mine {
+                let all = blockers.entry(key).or_insert_with(|| Blocker { bodies: 0, only: 0, text: b.text.clone(), crates: BTreeSet::new(), first: b.first.clone() });
+                all.bodies += b.bodies;
+                all.only += b.only;
+                all.crates.extend(b.crates);
+            }
+            out.push_str(&format!(
+                "TIME {want}: the graph's names once {names_s:.1}s (heap {names_mb:.0} MB after them); heads {heads_s:.1}s; bodies {bodies_s:.1}s; reach pass {reach_s:.1}s; {}; load {}\n",
+                mem(),
+                load()
+            ));
             let head = out.lines().find(|l| l.starts_with("HEADS ")).unwrap_or("").to_string();
             let body = out.lines().find(|l| l.starts_with("BODIES ") && l.contains("clean")).unwrap_or("").to_string();
             let h = head.split(':').nth(1).and_then(|s| s.split(';').next()).unwrap_or("").trim().to_string();
@@ -1025,5 +1074,6 @@ fn main() {
             print!("{out}");
         }
     }
+    print!("{}", print_blockers(names, "BLOCKING IMPLS ACROSS THE RUN", &blockers));
     println!("load average after: {}; {:.1}s in all", load(), t0.elapsed().as_secs_f64());
 }

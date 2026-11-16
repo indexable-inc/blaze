@@ -886,6 +886,56 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       :732 "names resolved for N crates; N paths unresolved by known gaps" becomes "N paths
       wait on: <cause> (k)" per cause, and "names resolved for N crates" moves to the profile.
       Test: `use nothing::here;` is one error naming the path and line.
+    - RUNNER 6 2026-11-16 (uncommitted; handing on). (3b) written: blaze-cli work.rs
+      `outline_file` lists one `BodyCheck` part per fn/const/static with a body under no other
+      body (`checked_body`), named by `body_name` (file subject + the entry's chain of kind,
+      name, disambiguator), `Locate::Source(item.hash)`, place = the entry's start; the
+      outline's own errors inside those bodies are dropped (one home per error). The task
+      (`body_syntax`, pooled like `FileItems`; `Job.body`) reads the home file
+      (`Request::file_of`), finds the entry at its place, parses its text with
+      `parser::Reparser::top_level_item().parse` (blaze-lower `lower_body`'s entry; `parser`
+      added to blaze-cli), and makes each lexer/parser error inside the body a SYNTAX finding
+      relative to the entry; an error within one token of the one before is recovery, dropped
+      (`CASCADE`). blaze-drive request.rs `emit`: an item's task gets its home file's edition.
+      One home: `work::CHECK_STAGES` (moved from main.rs) is derived from `builds` / `whole`
+      (`whole(BodyCheck)` false: a body's task parses only, so "types" and "borrows" stay
+      NOT checked); `left_out_note` says nothing for `check` (its closing line is the place);
+      for `run` the worker's part is named by `work::does` ("check the bodies' syntax").
+      Seen: "src/lib.rs:3:12: error[syntax]: expected expression" (before CASCADE a second
+      "src/lib.rs:3:14: error[syntax]: expected SEMICOLON" followed it); "NOT checked: types,
+      borrows". Tests: `a_syntax_error_inside_a_body_is_one_error_at_its_line`,
+      `an_edit_of_one_body_reparses_that_body_alone` (profile `BodyCheck made` 2 then 1);
+      run counts of four older tests raised by the bodies they now run.
+      Smoke (scripts/src/bin/smoke.rs): `Step::Check` expects `CHECK_STATUS` 3 and an
+      "incomplete" line; docs/terminal.md's closing-line sentence says what is true.
+      (3c) NOT written; what was found for it: an unresolved `use` is not a `NamesNote` but
+      a module scope error: blaze-cli names.rs `run` has `done.names` (blaze-scope
+      `CrateNames`): for each `done.names.done` value `r`, `r.scope.errors` holds
+      `ScopeError::Import { site, path, segment, why }` (and `::Macro`); its place is
+      `done.names.tables.use_locs[site.expansion.unwrap_or(r.scope.module)][site.index]`, a
+      `Loc { file, offset }` into `done.names.files` (prior art: blaze-world examples/names.rs
+      `count`, ~line 960, which also sorts causes: a proc-macro crate, an `OUT_DIR` include
+      whose build script did not run, `cfg_if!`). The hard part is the place: a `CrateScope`
+      record has no text file (print.rs: "its name is its place"), and its key reads
+      `Surface`s, which hold no positions, so a file offset in its record goes stale on a
+      body edit. Plan: the finding names the path and the module path in its words, and its
+      place is item-relative to the `use` item, printed through that file's `FileItems`
+      record (find the item by name chain like `body_name`), or the error becomes a part of
+      the file's own task. Then main.rs's "N paths unresolved by known gaps" note becomes
+      "N paths wait on: <cause> (k)" per named cause.
+      Runs: "mixcheck test blaze-cli: exit 101; 48 passed, 1 failed (against green:
+      blaze-hash)" (lanecheck: blaze-typeck infer/facts.rs broken underneath); "scripts: check
+      ok (all targets)". The one failure is still `records_outlive_the_packs_merge`. Experiment:
+      with the machine store off (main.rs `Machine::of(.., home.filter(|_| false))`, since
+      restored) it still fails, "certified false, 2 runs": NOT the Sharing seam's, so not the
+      Shared cache lane's by that test; no message sent. Its repeat's profile (message now
+      carries it; mixcheck cuts it) starts "UnitGraph standing 1 / FileItems found 1 / BodyCheck
+      standing 1..": a file's record is FOUND, not standing, on a no-edit repeat after twelve
+      edits: look at the project store's pack merge (store.rs `PackStore`, the Shared cache
+      lane's file) against the drive's settled rows next; run the test alone, print the
+      profile in full. Left: (3c); this test; step 5 (toolchain shelf through
+      `Fs::home(cx, home, &Path::new(SHELF))` in toolchain.rs `HomeShelf::open`, dropping
+      `At::Above` and the `start` argument at its two callers, graph.rs:198 and names.rs:207).
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

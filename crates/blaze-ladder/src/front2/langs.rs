@@ -103,6 +103,20 @@ pub fn find(index: &Index<'_>, resolver: Resolver<'_>, item: LangItem) -> Result
         Mark::CorePath(p) => p,
     };
     let Some(sized) = index.lang("sized") else { return Ok(None) };
+    in_core(resolver, sized, path)
+}
+
+/// The `Future` trait for an `async fn`'s head (the Reference, "Async functions": its return
+/// type is `impl Future<Output = T>`), found from core's `Sized` alone: the head store holds
+/// `Sized` ([`super::heads::Store::sized`]) and no lang table. Core declares
+/// `#[lang = "future_trait"] pub trait Future` at `core::future::Future`; this is the same
+/// item [`find`] gives for [`LangItem::Future`], reached by its path through the names library.
+pub fn future_trait(resolver: Resolver<'_>, sized: LibKey) -> Result<Option<LibKey>, NoAnswer> {
+    in_core(resolver, sized, &["future", "Future"])
+}
+
+/// The trait at `path` in the crate of `sized` (core), resolved by the names library.
+fn in_core(resolver: Resolver<'_>, sized: LibKey, path: &[&str]) -> Result<Option<LibKey>, NoAnswer> {
     let module = resolver.names.module_of(sized).ok_or("core's `Sized` is in no module the names library knows")?;
     let mut texts: [&str; 4] = ["crate"; 4];
     let n = path.len() + 1;

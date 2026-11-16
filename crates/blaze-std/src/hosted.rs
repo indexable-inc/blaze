@@ -131,7 +131,7 @@ pub struct SimHost {
     /// What a name resolves to: the simulation's name service ([`crate::resolver`]).
     pub names: Vec<(String, IpAddr)>,
     /// The requests the host makes for the program ([`Io::http`]). Behind bstd's `net`.
-    #[cfg(feature = "net")]
+    #[cfg(feature = "requests")]
     pub http: crate::requests::SimHttp,
     /// The streams the host carries for the program ([`Io::streams`]).
     pub streams: SimStreams,
@@ -172,7 +172,7 @@ impl SimHost {
             notices: Vec::new(),
             position: Position { lat_e7: 0, lon_e7: 0 },
             names: Vec::new(),
-            #[cfg(feature = "net")]
+            #[cfg(feature = "requests")]
             http: crate::requests::SimHttp::default(),
             streams: SimStreams::default(),
         }
