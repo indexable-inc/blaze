@@ -1,6 +1,14 @@
 //! Thin wrappers around [`camino::Utf8PathBuf`], distinguishing
 //! between absolute and relative paths.
 
+// `#![blaze::trust]` below names blaze's tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "`&Utf8Path` viewed as `&AbsPath` or `&RelPath`, each `#[repr(transparent)]` over `Utf8Path`, so the two share layout and pointer metadata"
+)]
+
 use std::{
     borrow::Borrow,
     ffi::OsStr,
