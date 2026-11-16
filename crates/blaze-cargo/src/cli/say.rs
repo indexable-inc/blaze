@@ -205,6 +205,12 @@ pub fn package_name(package_id: &str) -> &str {
     url.trim_end_matches('/').rsplit('/').next().unwrap_or(url)
 }
 
+/// The package of a unit as the daemon names it in a report (`serve::unit::compile::span_unit`,
+/// `foo v0.1.0 (lib)`): its first word, the [`package_name`] of the unit's package id.
+pub fn unit_package(unit: &str) -> &str {
+    unit.split(' ').next().unwrap_or(unit)
+}
+
 /// The version in cargo's package id: the part after `@`, or the whole fragment.
 pub fn package_version(package_id: &str) -> &str {
     let fragment = package_id.split_once('#').map_or("", |(_, it)| it);

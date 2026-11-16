@@ -267,6 +267,49 @@ pub(crate) fn keep_in<V>(slot: &Slot, value: V) -> &V {
     unsafe { &*at }
 }
 
+/// How many unsettled rounds a fixpoint's head keeps for its panic ([`Unsettled`]).
+const TRAIL: usize = 4;
+
+/// One round of a fixpoint's head that did not settle: whether the head's own value differed
+/// from the last round's (by the query's `PartialEq`; the value has no `Debug` bound, so it is
+/// not printed), and whether its members moved, the first few named with their keys. A head
+/// whose own value flips names no member; a member whose key differs each round (a new
+/// instance asked every round) shows as a new name each round.
+struct Unsettled {
+    round: u32,
+    head_moved: bool,
+    members: task::Moved,
+}
+
+/// The kept rounds, oldest first, as a panic says them.
+struct Trail<'a>(&'a [Option<Unsettled>; TRAIL]);
+
+impl std::fmt::Display for Trail<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut rounds: [Option<&Unsettled>; TRAIL] = [None; TRAIL];
+        for (at, it) in self.0.iter().flatten().enumerate() {
+            rounds[at] = Some(it);
+        }
+        let kept = &mut rounds[..self.0.iter().flatten().count()];
+        kept.sort_unstable_by_key(|it| it.map(|it| it.round));
+        for it in kept.iter().flatten() {
+            write!(f, "[round {}: head {}", it.round, if it.head_moved { "moved" } else { "stood" })?;
+            match (it.members.any, it.members.named.is_empty()) {
+                (false, _) => f.write_str(", no member moved")?,
+                (true, true) => f.write_str(", an inner head moved")?,
+                (true, false) => {
+                    f.write_str(", members moved:")?;
+                    for name in &it.members.named {
+                        write!(f, " {name};")?;
+                    }
+                }
+            }
+            f.write_str("] ")?;
+        }
+        Ok(())
+    }
+}
+
 /// Runs `Q` for `key` on this task, settles its cycle role, and publishes a final value; a
 /// fixpoint member's value is published by its head instead, and the member is returned so its
 /// head keeps its flight until then.
@@ -292,6 +335,9 @@ fn execute<'db, Q: Query>(
     // The round in which this run, a cycle's head, settled: its members are published once its
     // own entry is, with its lists.
     let mut settled: Option<u32> = None;
+    // A head's last [`TRAIL`] rounds that did not settle: what moved in each, named in the
+    // panic of a head that never does.
+    let mut trail: [Option<Unsettled>; TRAIL] = [const { None }; TRAIL];
     let value = loop {
         // Each round its own frame: a round's scratch is freed before the next begins.
         let value = in_frame::<Q, _>(run);
@@ -309,16 +355,20 @@ fn execute<'db, Q: Query>(
                 let last = unsafe { &*frame.provisional().cast::<Q::Value>() };
                 let this_round = frame.round();
                 let members_moved = frame.next_round();
-                if same(last, &value) && !members_moved {
+                let head_moved = !same(last, &value);
+                if !head_moved && !members_moved.any {
                     settled = Some(this_round);
                     break Settled::Final(value);
                 }
+                trail[round as usize % TRAIL] = Some(Unsettled { round, head_moved, members: members_moved });
                 round += 1;
-                assert!(
-                    round < MAX_ROUNDS,
-                    "{} did not settle in {MAX_ROUNDS} rounds",
-                    task::innermost_name().unwrap_or_default()
-                );
+                if round >= MAX_ROUNDS {
+                    panic!(
+                        "{} did not settle in {MAX_ROUNDS} rounds; its last rounds: {}",
+                        task::innermost_name().unwrap_or_default(),
+                        Trail(&trail)
+                    );
+                }
                 let next = match recover {
                     Some(recover) => {
                         let cycle = Cycle {

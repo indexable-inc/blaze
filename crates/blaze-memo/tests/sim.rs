@@ -640,3 +640,181 @@ fn a_worker_panic_is_the_verdict() {
     });
     assert!(seen > 0, "no injected panic was reached");
 }
+
+/// How a reader of a table kept across `Memo::next` treats each id it finds there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reader {
+    /// Through `Memo::live` first: a dead id is a typed answer, never a lookup.
+    Live,
+    /// The planted bug: looks every id up in its snapshot, as `claim_keeps` did before
+    /// 2026-11-15 (the keep of a later snapshot panicked on a trace of a dropped arena).
+    Blind,
+}
+
+struct PlainDb<'a> {
+    memo: &'a Memo,
+}
+
+impl Database for PlainDb<'_> {
+    fn memo(&self) -> &Memo {
+        self.memo
+    }
+}
+
+impl Db for PlainDb<'_> {
+    fn pause(&self) {}
+
+    fn ran(&self, _: u8, _: Gid, _: u32) {}
+}
+
+/// A snapshot still answering: the memo, each crate's leaf values and ids as it was made.
+struct Answering {
+    memo: Memo,
+    values: Vec<Vec<u64>>,
+    /// Crates `1..=CRATES`, crate `c` at `c - 1`.
+    crates: Vec<common::Crate>,
+}
+
+impl Answering {
+    fn of(memo: Memo, world: &World) -> Answering {
+        let crates = (1..=CRATES).map(|c| world.krate(c)).collect();
+        Answering { memo, values: world.values.clone(), crates }
+    }
+
+    fn crate_of(&self, c: u32) -> common::Crate {
+        self.crates[c as usize - 1]
+    }
+}
+
+/// The daemon's shape in miniature: a table of ids (the item store's traces) filled by runs of
+/// every snapshot still answering, while commits replace arenas and older snapshots go on
+/// answering beside the newest; readers of any of them claim from the table between commits.
+/// The order of runs, commits, claims and the snapshot each uses is drawn from the tape.
+///
+/// The invariant: a reader looks up only ids its snapshot holds at their generation, and each
+/// such lookup answers that snapshot's value; an id it refuses names an arena its snapshot
+/// holds no making of that generation of; a refused id of a superseded making leaves the table
+/// (a superseded making's id is held by no later snapshot), and no id a reader's snapshot
+/// holds is ever refused.
+fn carried_reader(tape: &Tape, reader: Reader) -> Result<(), String> {
+    let values: Vec<Vec<u64>> =
+        (0..=CRATES).map(|_| (0..LEAVES).map(|_| tape.below(8, "leaf value")).collect()).collect();
+    let mut world = World::new(values);
+    let config = Config {
+        arenas: CRATES + 1,
+        reads: Reads::Kept,
+        flight: Arc::new(blaze_memo::Alone::new()),
+        cap_bytes: u64::MAX,
+        plant: Plant::None,
+    };
+    let first = world.first(config);
+    let mut answering: Vec<Answering> = vec![Answering::of(first, &world)];
+    // The table: each id with its crate and leaf, as a run put it there.
+    let mut table: Vec<(common::Leaf, u32, usize)> = Vec::new();
+    for step in 0..24 {
+        let at = tape.index(answering.len(), "snapshot");
+        match tape.below(4, "op") {
+            // A commit: edit a crate, make the next snapshot from the newest; the oldest
+            // stops answering past three.
+            0 => {
+                let c = 1 + tape.below(u64::from(CRATES), "edited crate") as u32;
+                let l = tape.index(LEAVES, "edited leaf");
+                world.values[c as usize][l] += 1 + tape.below(4, "edit step");
+                let newest = &answering.last().expect("one answers").memo;
+                let (next, _) = world.next(newest, &[c]);
+                answering.push(Answering::of(next, &world));
+                if answering.len() > 3 {
+                    answering.remove(0);
+                }
+            }
+            // A run in snapshot `at`: its leaf's id goes into the table.
+            1 | 2 => {
+                let it = &answering[at];
+                let db = PlainDb { memo: &it.memo };
+                let c = 1 + tape.below(u64::from(CRATES), "run crate") as u32;
+                let l = tape.index(LEAVES, "run leaf");
+                let leaf = it.crate_of(c).leaves(&db)[l];
+                let got = common::value(&db, leaf);
+                if got != it.values[c as usize][l] {
+                    return Err(format!("step {step}: a run answered {got}, not {}", it.values[c as usize][l]));
+                }
+                table.push((leaf, c, l));
+            }
+            // A claim by a reader of snapshot `at`.
+            _ => {
+                let it = &answering[at];
+                let db = PlainDb { memo: &it.memo };
+                let mut left = Vec::with_capacity(table.len());
+                for &(leaf, c, l) in &table {
+                    let held = blaze_memo::Id::gid(it.crate_of(c)).arena();
+                    let named = blaze_memo::Id::gid(leaf).arena();
+                    let id = match reader {
+                        Reader::Live => match it.memo.live(leaf) {
+                            Ok(live) => {
+                                if named != held {
+                                    return Err(format!(
+                                        "step {step}: a live proof of {named:?}, which the snapshot holds as {held:?}"
+                                    ));
+                                }
+                                live.get()
+                            }
+                            Err(dead) => {
+                                if named == held {
+                                    return Err(format!("step {step}: refused {named:?}, which the snapshot holds"));
+                                }
+                                if dead.named != named || dead.held != Some(held) {
+                                    return Err(format!(
+                                        "step {step}: refused {named:?} as {dead:?}, but the snapshot holds {held:?}"
+                                    ));
+                                }
+                                if !dead.superseded() {
+                                    left.push((leaf, c, l));
+                                }
+                                continue;
+                            }
+                        },
+                        Reader::Blind => leaf,
+                    };
+                    let looked = catch_unwind(AssertUnwindSafe(|| common::value(&db, id)));
+                    match looked {
+                        Ok(got) if got == it.values[c as usize][l] => left.push((leaf, c, l)),
+                        Ok(got) => {
+                            return Err(format!(
+                                "step {step}: {id:?} answered {got}, not its snapshot's {}",
+                                it.values[c as usize][l]
+                            ));
+                        }
+                        Err(payload) => {
+                            let why = payload
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| payload.downcast_ref::<&str>().map(|it| (*it).to_owned()))
+                                .unwrap_or_default();
+                            return Err(format!("step {step}: a reader looked up an id its snapshot does not hold: {why}"));
+                        }
+                    }
+                }
+                table = left;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_reader_of_a_carried_table_looks_up_only_live_ids() {
+    blaze_sim::check(blaze_sim::Config::cases(64), |tape| carried_reader(tape, Reader::Live));
+}
+
+/// The control: a reader that looks every id up ([`Reader::Blind`]) meets an id of an arena a
+/// commit replaced, and the oracle names it.
+#[test]
+fn the_oracle_catches_a_reader_that_looks_up_a_dead_id() {
+    blaze_sim::control(
+        blaze_sim::Config::cases(64),
+        Reader::Live,
+        Reader::Blind,
+        "a reader looked up an id its snapshot does not hold",
+        |tape, reader| carried_reader(tape, reader).map_err(Broke::Oracle),
+    );
+}

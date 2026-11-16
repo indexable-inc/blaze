@@ -32,8 +32,12 @@
 //! [`prepare`]: Connection::prepare
 
 #![feature(allocator_ext)]
-#![feature(register_tool)]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "a driver of C SQLite through `libsqlite3-sys`'s raw FFI: each call takes a handle this crate opened and still owns, and a C string SQLite returns is borrowed only while SQLite keeps it valid (`c_text`)"
+)]
 
 #[cfg(test)]
 mod tests;

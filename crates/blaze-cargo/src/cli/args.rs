@@ -414,7 +414,8 @@ const CHECK_ONLY: &[Flag] = &[
 ];
 
 /// `check`'s baselines, blaze's (`blaze_lints::baseline`): `--baselines DIR` checks the run's
-/// counts against the baselines in `DIR`, `--bless-baselines` lowers them to the run's, and
+/// counts against the baselines in `DIR`, `--bless-baselines` lowers them to the run's (to the
+/// crates it measured, when the run failed: `cli/baselines.rs`), and
 /// `--new-baseline LINT[,LINT...]`, given any number of times, starts each `LINT`'s at the run's.
 const BASELINES: &[Flag] = &[
     Flag::new("baselines", None, Takes::Value, "DIR"),

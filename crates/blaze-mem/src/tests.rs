@@ -2837,16 +2837,16 @@ fn format_in_writes_into_the_allocator_it_is_given_and_allocates_nothing_global_
     let work = || {
         frame::task(Tag::Other, |frame| {
             let before = frame.used();
-            let unit = crate::format_in!(frame, "{}-{:03}", "unit", 7);
+            let unit = format_in!(frame, "{}-{:03}", "unit", 7);
             assert_eq!(unit, "unit-007");
             assert!(
                 frame.contains(unit.as_ptr()) && frame.used() > before,
                 "the text is the frame's"
             );
-            let plain = crate::format_in!(frame, "no arguments");
+            let plain = format_in!(frame, "no arguments");
             assert_eq!(plain, "no arguments");
             let name = "syn";
-            assert_eq!(crate::format_in!(frame, "{name}@{}", 2), "syn@2");
+            assert_eq!(format_in!(frame, "{name}@{}", 2), "syn@2");
             unit.len()
         })
     };

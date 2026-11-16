@@ -559,6 +559,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-file-items"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-sim",
+ "parser",
+]
+
+[[package]]
 name = "blaze-fmt"
 version = "0.0.0"
 dependencies = [
@@ -1281,6 +1291,16 @@ dependencies = [
  "blaze-rng",
  "blaze-store-check",
  "crossbeam-channel",
+]
+
+[[package]]
+name = "blaze-surface"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-hash",
+ "blaze-id",
+ "blaze-sim",
 ]
 
 [[package]]

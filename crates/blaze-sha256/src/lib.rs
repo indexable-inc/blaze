@@ -10,6 +10,13 @@
 //! aarch64 and a build dependency is built for the machine that builds.
 
 #![deny(unsafe_code)]
+// `#![blaze::trust]` below names blaze's tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "the processor's SHA-256 instructions (ARMv8 SHA-256, x86-64 SHA-NI) are `unsafe` intrinsics: each compression runs only after the feature was detected, over loads and stores of whole 16-byte blocks in bounds"
+)]
 
 const INITIAL: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
