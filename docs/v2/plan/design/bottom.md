@@ -271,6 +271,18 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   a record does not. It answers only the ix.dev origin, read-only, after a browser was paired
   once (the page shows a code, the next blaze command asks). The data goes to the browser and
   no further.
+- **Every effect is an event** (Andrew: "it can log the system calls ... and where they came
+  from ... in the panel and in data"). In bstd a program reaches the system only through `Io`:
+  each call is one `Effect` given to the one driver, under a `Cx` that knows its task and
+  span. The driver records, per effect: its kind and the sizes of its arguments, when it was
+  asked, started and done, its outcome, the task and span, and the call site
+  (`#[track_caller]`, no cost at run time). A fixed entry in a per-thread ring, always on (the
+  last minutes); the whole stream to the profile only when asked. Argument values (paths,
+  hosts, bytes) are kept only when asked and never leave the machine without the opt-in. The
+  simulation implements the same driver, so a test can state what a function may do ("no
+  network", "writes one file"). A program on Rust's own `std` does not pass through this
+  driver; because blaze compiles `std` itself, its system layer can carry the same hooks:
+  later.
 - **Many machines on one page** (Andrew: "a monitor of what might be happening even on
   multiple machines"). The viewer's events (a command began or ended, what it runs, compiles
   or tests, on which machine and checkout, time and memory) are one stream. When an

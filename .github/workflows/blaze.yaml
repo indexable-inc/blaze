@@ -1,44 +1,27 @@
-# blaze: the merge gate. What a pull request and each entry of the merge queue has to pass,
-# kept to a few minutes so that the queue moves: one build of blaze and the unit tests on Linux
-# AArch64, a build for Linux x86-64 cross-compiled there, and the checks of the harness scripts. Everything else, every harness on every
-# platform, runs after the merge, in the release train (train.yaml), which releases main when
-# it is green and opens an issue when it is not. What runs where, and how long it takes, is in
-# docs/harness.md ("CI").
+# blaze: the merge gate. What a pull request and each entry of the merge queue has to pass, kept
+# to a few minutes so that the queue moves. What runs where is in docs/harness.md ("CI").
 #
-#   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux AArch64,
-#       `blaze check --workspace` and `blaze check --workspace --all-targets` (every crate's
-#       test targets type-check) with the release on Linux AArch64,
-#       `harness/imports.py` and `rustcsites` (scripts/), actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
-#       formats main after each push instead.
-#   push to main: the build and the unit tests on Linux AArch64 and macOS, which
-#       write the caches every other run reads, and the same `blaze check --workspace`. One runs at a time: the next push waits, and a
-#       newer one replaces it, so each run ends and writes the caches as of its commit.
+#   every change: the checks of the repository's scripts, docs and agent rules (`scripts`),
+#       actionlint over the workflows (`workflows`), the Lean proofs (`lean`);
+#   a change of code: also `cargo check --workspace --exclude blaze-std --all-targets` and the
+#       unit tests of the buildable workspace with cargo and the pinned nightly (`cargo`). No
+#       `blaze fmt --check`: fmt.yaml formats main after each push instead.
 #
-# A change runs the build and the unit tests only when it touches a file they read: the crates,
-# the vendored crates, astlog (tools/astlog), the workspace's manifest, lock file, cargo
-# config, .rustfmt.toml and .clippy.toml, the pinned nightly (harness/toolchain),
-# harness/unittests.py, the flake, the release of blaze that builds blaze
-# (.github/blaze-version, site/install.sh), and these workflows and the actions they use; on a push
-# to main, also the smoke corpus (harness/smoke.py, harness/smoke/).
-# scripts/src/bin/gate_changes.rs has the list and why each path is on it. It names what is
-# code, so a new directory is not: any other change (documentation, the site, benches, the
-# other harnesses and workflows) runs the script checks alone, and a list of files that cannot
-# be had counts as code. `ci` is the one check that says whether everything that ran passed: it
-# is the check branch rules and the merge queue require. The queue tests each pull request
-# merged onto main and whatever is ahead of it, and main moves only to what it tested.
+# A change runs `cargo` only when it touches a file it reads: the crates, the vendored crates,
+# astlog (tools/astlog), the workspace's manifest, lock file, cargo config, .rustfmt.toml and
+# .clippy.toml, the pinned nightly (harness/toolchain), and these workflows and the actions they
+# use. scripts/src/bin/gate_changes.rs has the list and why each path is on it. It names what is
+# code, so a new directory is not: any other change runs the script checks alone, and a list of
+# files that cannot be had counts as code. `ci` is the one check that says whether everything
+# that ran passed: it is the check branch rules and the merge queue require. The queue tests each
+# pull request merged onto main and whatever is ahead of it, and main moves only to what it
+# tested.
 #
-# Runners (docs/harness.md "ix runners"): every Linux job runs on indexable's ix runners
-# (https://ix.dev/docs/runners), on Linux AArch64: the build and unit tests on 64 vCPUs whose
-# memory grows on demand up to 256 GiB, where a hosted runner's 16 GB a build of blaze outgrows
-# into swap for an hour or more and was shut down in (#1654), each forking the snapshot its own
-# job's last green run on main left, store and checkout included; the small jobs on ix's default
-# size. TODO(x86-64): ix has no x86-64 capacity today, so nothing is built or tested on Linux
-# x86-64; `linux-x64-cross` cross-compiles blaze for it and does not run it. One job runs on a Mac,
-# `macos` on main's push: blaze's unit tests on macOS, which run only on macOS, and blaze cannot
-# yet cross-compile for macOS from Linux (no macOS SDK or darwin clang there, and llvm-sys runs
-# the target LLVM's Mach-O llvm-config). A pull request from a fork runs only once a maintainer
-# approves it (fork pull request policy `all_external_contributors`), and a run off main never
-# becomes a snapshot.
+# Runners (docs/harness.md "ix runners"): every job runs on indexable's ix runners
+# (https://ix.dev/docs/runners), on Linux AArch64, each forking the snapshot its own job's last
+# green run on main left. A pull request from a fork runs only once a maintainer approves it
+# (fork pull request policy `all_external_contributors`), and a run off main never becomes a
+# snapshot.
 name: blaze
 on:
   push:
@@ -162,16 +145,8 @@ jobs:
       - run: |
           "$BLAZE_SCRIPTS/ledger" selftest
           "$BLAZE_SCRIPTS/ledger" '{"command": "check"}'
-      # The budget harness's own parts hold: which rows an input selects, the daemon home's layout
-      # against the daemon's rule, the smoke's edit on the fixture (harness/v2/budgets.py). Its
-      # smoke, against the blaze a change builds, is blaze-platform.yaml's profile-gate job.
-      - run: uv run --frozen python harness/v2/budgets.py selftest
-      # The smoke's guards (harness/v2/guards.py): each finding a bound is for, in miniature, is
-      # refused by its bound and the fixed state passes; the known list reads; a result with a
-      # guard missing is refused. And which packages a change touches (scripts/src/bin/changed.rs).
-      - run: |
-          uv run --frozen python harness/v2/guards.py selftest
-          "$BLAZE_SCRIPTS/changed" selftest
+      # Which packages a change touches (scripts/src/bin/changed.rs).
+      - run: '"$BLAZE_SCRIPTS/changed" selftest'
       # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
       # (scripts/src/bin/invariants.rs).
       - run: |
@@ -235,6 +210,26 @@ jobs:
             echo "no base to compare with (a run by hand): each crate is held to its row only"
             "$BLAZE_SCRIPTS/untyped" '{"command": "check"}'
           fi
+      # Third-party dependencies only go down, to none (docs/v2/plan/design/bottom.md, "Also
+      # decided on 2026-11-15"): per workspace crate, the third-party packages in its normal and
+      # build dependencies, in its dev-dependencies only, and in its closure through the
+      # workspace's manifests and Cargo.lock equal its row of tools/ratchets/third-party.txt, a
+      # crate with no row is held to 0, and no row is above the base's; a count over its row has
+      # its new packages named with the manifest line they came in by, from the base's manifests
+      # and lock (scripts/src/bin/deps.rs). It reads the TOML itself and starts no cargo. Against
+      # the base itself: the checkout is shallow.
+      - name: third-party dependencies only go down
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          "$BLAZE_SCRIPTS/deps" selftest
+          if [ -n "$BASE" ]; then
+            git fetch -q --depth=1 origin "$BASE"
+            "$BLAZE_SCRIPTS/deps" "{\"command\": \"check\", \"base\": \"$BASE\"}"
+          else
+            echo "no base to compare with (a run by hand): each crate is held to its row only"
+            "$BLAZE_SCRIPTS/deps" '{"command": "check"}'
+          fi
       # Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
       # scripts/layouts.txt, and a persisted one whose value changed against the base names its
       # crate's test of the previous layout (rule persisted-state-round-trips;
@@ -252,7 +247,7 @@ jobs:
             "$BLAZE_SCRIPTS/layouts" '{"command": "check"}'
           fi
       # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
-      # (.github/scripts/explore_page.py; release.yaml checks every release too).
+      # (.github/scripts/explore_page.py).
       - name: ix.dev/explore reads a new profile schema
         run: |
           git fetch -q --depth=1 origin main
@@ -316,8 +311,8 @@ jobs:
           uv run --frozen python harness/v2/lean_gate.py '{"command": "check"}'
 
   # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
-  # fails on push with no jobs and says so nowhere (release.yaml, promote.yaml and yank.yaml after
-  # #1691, an unquoted `: ` in a `run:` line). The local actions (.github/actions/*/action.yml) are
+  # fails on push with no jobs and says so nowhere (three release workflows after #1691, an
+  # unquoted `: ` in a `run:` line). The local actions (.github/actions/*/action.yml) are
   # parsed where a workflow uses them. actionlint's own checks only: its shellcheck and pyflakes
   # passes are off. What it is told to ignore is in .github/actionlint.yaml.
   workflows:
@@ -342,193 +337,28 @@ jobs:
           tar -xzf "$tgz" -C "$RUNNER_TEMP" actionlint
       - run: '"$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes='
 
-  # TODO(x86-64): no Linux x86-64 test runs anywhere until ix has x86-64 capacity (docs/harness.md
-  # "ix runners"). Until then blaze is cross-compiled for x86_64-unknown-linux-gnu on an AArch64
-  # ix runner, and not run: the target's LLVM `llvm-config` (which llvm-sys's build script runs)
-  # under qemu-user, and Ubuntu's x86-64 cross gcc and glibc for the C and C++ and the start
-  # files blaze's linker asks the C driver for. Not in `ci`'s needs until it has passed once.
-  # llvm-sys is built twice: for the target (hir-ty-codegen, through blaze-engine) and for the
-  # host (a build-dependency of blaze-stencil's build script, which runs here). blaze gives each
-  # run of its build script the LLVM llvm.json pins for that run's target (a pinned native input,
-  # Cargo.toml's `[workspace.metadata.blaze.native.llvm]`, set over the shell's
-  # LLVM_SYS_231_PREFIX), so the job fetches and names none. The C and C++ compilers are named
-  # for the target only: cc-rs (and llvm-sys's libstdc++.a, which it asks cc-rs's compiler for)
-  # takes CC_<target>/CXX_<target> before plain CC/CXX, so the host copy keeps the runner's own
-  # gcc. A plain CXX here would give the host copy x86-64 libstdc++.a and objects.
-  linux-x64-cross:
-    name: linux x64 (cross-compiled, not run)
+  # The buildable workspace (every crate but those parked, docs/v2/plan/parked.md, and
+  # blaze-std, its own world) type-checks with its test targets, and its unit tests pass, with
+  # cargo and the pinned nightly (harness/toolchain): cargo builds blaze in the dev loop until
+  # blaze builds blaze again (AGENTS.md rule blaze-builds-blaze). No LLVM: no buildable crate
+  # links it. The runner's snapshot keeps ~/.rustup and target/ from main's last green run.
+  cargo:
+    name: cargo check and test, linux arm64
     needs: changes
     if: needs.changes.outputs.tier != 'none'
-    runs-on: [ix, arm64, ix-cpu-64, blaze-linux-x64-cross]
-    timeout-minutes: 150
-    env:
-      # Read by blaze's daemon when it starts (blaze-link's C driver, cc-rs in build scripts), so
-      # set for the whole job. For the target alone: no plain CC or CXX (see above).
-      CC_x86_64_unknown_linux_gnu: x86_64-linux-gnu-gcc
-      CXX_x86_64_unknown_linux_gnu: x86_64-linux-gnu-g++
-      # The x86-64 llvm-config's own libraries, for qemu-user.
-      QEMU_LD_PREFIX: /usr/x86_64-linux-gnu
-    steps:
-      - uses: actions/checkout@v7
-      - name: x86-64 cross gcc and glibc, qemu-user
-        uses: ./.github/actions/apt
-        with:
-          packages: gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross qemu-user-static binfmt-support
-      - name: qemu-user runs x86-64 programs
-        run: |
-          sudo systemctl restart systemd-binfmt || sudo update-binfmts --enable qemu-x86_64
-          test -e /proc/sys/fs/binfmt_misc/qemu-x86_64 || { echo "::error::binfmt_misc has no qemu-x86_64 entry: the x86-64 llvm-config cannot run"; exit 1; }
-      - id: blaze
-        uses: ./.github/actions/blaze
-        with:
-          job: cross-x86_64
-      - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu
-      - name: an x86-64 ELF, not run
-        run: |
-          for bin in blaze-engine blaze; do
-            f="target/x86_64-unknown-linux-gnu/release/$bin"
-            file "$f" | tee /dev/stderr | grep -q 'ELF 64-bit LSB .*x86-64' || { echo "::error::$f is not an x86-64 ELF"; exit 1; }
-          done
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
-        uses: ./.github/actions/daemon-log
-
-  # What blaze cross-builds is run (ledger row X1, docs/v2/plan/design/toolchain-c.md "Cross
-  # compilation"): the probe (harness/v2/cross/probe: hello, threads, a file, TCP loopback, a
-  # panic with a backtrace) is built for each Linux glibc triple with nothing of the machine (no
-  # cross gcc, no CC_*: `scripts --bin cross` builds under `env -i` with an empty PATH), the
-  # AArch64 one is run here and the x86-64 one under qemu-user with Debian's x86-64 glibc to load
-  # (libc6-amd64-cross and libgcc-s1-amd64-cross are what it runs against, not what it is built
-  # with). Not part of `ci` until it has been green on main: it needs no secret, and its runner
-  # label is a new one of the same pool as the job above.
-  cross-probe:
-    name: cross-built, run (linux x64 under qemu-user, linux arm64)
-    needs: changes
-    if: needs.changes.outputs.tier != 'none'
-    runs-on: [ix, arm64, ix-cpu-64, blaze-cross-probe]
+    runs-on: [ix, arm64, ix-cpu-64, blaze-cargo]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - name: qemu-user and an x86-64 glibc to run against
-        uses: ./.github/actions/apt
-        with:
-          packages: qemu-user-static libc6-amd64-cross libgcc-s1-amd64-cross
-      - id: blaze
-        uses: ./.github/actions/blaze
-        with:
-          job: cross-probe
-      - run: blaze build --release --locked -p blaze-engine -p blaze-thin
-      - name: build the probe for each triple with nothing of the machine, and run it
-        run: |
-          mkdir -p "$RUNNER_TEMP/cross-bin"
-          cp target/release/blaze-thin "$RUNNER_TEMP/cross-bin/blaze"
-          cp target/release/blaze-engine "$RUNNER_TEMP/cross-bin/blaze-engine"
-          blaze run -q -p scripts --bin cross -- "$(cat <<JSON
-          {"command": "check",
-           "engine": {"kind": "v2", "blaze": "$RUNNER_TEMP/cross-bin/blaze"},
-           "out": "$RUNNER_TEMP/cross.json",
-           "triples": ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"],
-           "run": {"aarch64-unknown-linux-gnu": [],
-                   "x86_64-unknown-linux-gnu": ["qemu-x86_64-static", "-L", "/usr/x86_64-linux-gnu"]}}
-          JSON
-          )"
-      - if: failure()
-        uses: ./.github/actions/daemon-log
-
-  # The gate's build and unit tests, on ix (blaze-platform.yaml). On a push to main, the caches
-  # for the train's runs and the next push's, and the snapshots the gate's runs fork.
-  linux-arm64:
-    name: linux arm64
-    needs: changes
-    if: needs.changes.outputs.tier != 'none'
-    uses: ./.github/workflows/blaze-platform.yaml
-    # For main's push of blaze's store (the cache-writer environment's secrets).
-    secrets: inherit
-    with:
-      platform: linux-arm64
-      os: ubuntu-24.04-arm
-      tier: ${{ needs.changes.outputs.tier }}
-      smoke: true
-
-  macos:
-    name: macos arm64
-    needs: changes
-    if: needs.changes.outputs.tier == 'warm'
-    uses: ./.github/workflows/blaze-platform.yaml
-    # For main's push of blaze's store (the cache-writer environment's secrets).
-    secrets: inherit
-    with:
-      platform: macos-arm64
-      os: macos-15
-      tier: warm
-
-  # TODO(macos): macOS's check left the gate with the move to ix (one Mac job, `macos`); it comes
-  # back as `--target aarch64-apple-darwin` here once a check no longer runs the target LLVM's
-  # Mach-O llvm-config (docs/harness.md "ix runners").
-  # The release .github/blaze-version names loads and checks blaze's whole workspace, as a
-  # contributor's `blaze check --workspace` does: 0.20261028.7 could not load it, and no job ran
-  # it. Installed and given the pinned LLVM (LLVM_SYS_231_PREFIX, which llvm-sys's build script
-  # reads) by .github/actions/blaze, with no Nix, as the build is. Its store's project is its
-  # own and nothing pushes it, so the pull needs no secret; a run starts from the store main's
-  # last green run left in its ix snapshot.
-  workspace-check:
-    name: blaze check --workspace, linux arm64
-    needs: changes
-    if: needs.changes.outputs.tier != 'none'
-    runs-on: [ix, arm64, ix-cpu-64, blaze-workspace-check]
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/blaze
-        with:
-          job: check
-          llvm: true
-      - uses: ./.github/actions/script
-        with:
-          job: check
-      # The fast tier: the packages the change touches and those that depend on them, each
-      # after what it needs (scripts/src/bin/changed.rs), checked before the workspace, so a change's
-      # first compile error comes in minutes and names the earliest cause. What it checks the
-      # workspace check below finds checked. Against the base itself: the checkout is shallow.
-      - name: blaze check of the packages this change touches
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          if [ -z "$BASE" ] || ! git fetch -q --depth=1 origin "$BASE"; then
-            echo "no base to compare with: the workspace check below is the check"; exit 0
-          fi
-          args=$("$BLAZE_SCRIPTS/changed" "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
-          if [ -z "$args" ] || [ "$args" = --workspace ]; then
-            echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; exit 0
-          fi
-          echo "blaze check $args --lib --tests"
-          # TODO(stage 0 with --deny): add `--deny blaze::todo` once .github/blaze-version's release takes it.
-          # shellcheck disable=SC2086
-          blaze check $args --lib --tests --message-format short
-      # TODO(stage 0 with --deny): add `--deny blaze::todo` once .github/blaze-version's release takes it.
-      - run: blaze check --workspace --message-format short
-      # Every target, the test targets among them: a test that no longer type-checks against
-      # the code it tests fails here, in every crate, where the unit tests job compiles the test
-      # targets of harness/unittests.py's CRATES alone (2026-11-09: blaze-cas's place_race.rs and
-      # hir-ty-mir's tests/consteval/comptime.rs did not compile on main). A step of its own,
-      # after the libraries', so the log says which of the two failed; what the first checked
-      # is not checked again.
-      # TODO(stage 0 with --deny): add `--deny blaze::todo` once .github/blaze-version's release takes it.
-      - name: blaze check --workspace --all-targets (the test targets compile)
-        run: blaze check --workspace --all-targets --message-format short
-      # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
-      # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
-      - run: blaze build -p astlog
-      - run: >-
-          PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py
-          '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"], "exclude": ["crates/harness"]}'
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
-        uses: ./.github/actions/daemon-log
+      - uses: ./.github/actions/toolchain
+      - name: cargo check --workspace --exclude blaze-std --all-targets
+        run: cargo +"$(cat harness/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
+      - name: cargo test --workspace --exclude blaze-std
+        run: cargo +"$(cat harness/toolchain)" test --locked --workspace --exclude blaze-std --no-fail-fast
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, lean, linux-arm64, macos, workspace-check]
+    needs: [changes, scripts, workflows, lean, cargo]
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5
@@ -542,11 +372,10 @@ jobs:
           # What this tier was expected to run, each of which has to have succeeded: the absence
           # of a failure is not a pass (agents.json A39), and a job this tier runs that was
           # skipped is a gate that tested nothing. `none` (a change of no code) runs the first
-          # four; any other tier the Linux tests and the workspace check too; `warm` macOS too.
+          # four; any other tier the cargo check and tests too.
           case "$TIER" in
             none) expected='["changes","scripts","workflows","lean"]' ;;
-            gate) expected='["changes","scripts","workflows","lean","linux-arm64","workspace-check"]' ;;
-            warm) expected='["changes","scripts","workflows","lean","linux-arm64","workspace-check","macos"]' ;;
+            gate|warm) expected='["changes","scripts","workflows","lean","cargo"]' ;;
             *) echo "::error::the tier is '$TIER', none of none, gate and warm: what this run was to test is not known"; exit 1 ;;
           esac
           missed=$(echo "$NEEDS" | jq -r --argjson expected "$expected" '$expected - [to_entries[] | select(.value.result == "success") | .key] | join(", ")')
@@ -555,26 +384,3 @@ jobs:
             exit 1
           fi
           echo "tier $TIER: each of $expected ran and succeeded"
-      # The budget smoke's guards ran and held (harness/v2/guards.py, `held`): a tier that builds
-      # blaze has the smoke's result, with an outcome that passed for every bound of every step
-      # of both fixtures and for the sandbox's probe. A job that was skipped passes the step
-      # above; a smoke that did not run, or dropped a guard, fails this one. A gate run that
-      # did not run the smoke is red (docs/harness.md, "The smoke's guards").
-      - if: needs.changes.outputs.tier != 'none'
-        uses: actions/checkout@v7
-      - if: needs.changes.outputs.tier != 'none'
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
-          enable-cache: false
-      - if: needs.changes.outputs.tier != 'none'
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: budgets-smoke-linux-arm64
-          path: ${{ runner.temp }}/budgets-smoke
-      - name: the budget smoke's guards ran and held
-        if: needs.changes.outputs.tier != 'none'
-        run: |
-          uv run --frozen --no-dev python harness/v2/guards.py "{\"command\": \"held\", \"result\": \"$RUNNER_TEMP/budgets-smoke/budgets-smoke.json\"}"
